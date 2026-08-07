@@ -1,0 +1,61 @@
+// codegraph telemetry ingest — see README.md and docs/design/telemetry.md.
+// Accepted events go straight into the bound D1 database and the worker makes no
+// outbound requests. The only secret is ADMIN_TOKEN, which guards the manual rollup
+// trigger (`wrangler secret put ADMIN_TOKEN`); leave it unset and that route 404s.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "codegraph-telemetry",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-12",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // First-party endpoint. The custom domain auto-provisions DNS + cert when the
+  // getcodegraph.com zone is on the deploying account. workers.dev stays off so
+  // the only public surface is the documented one.
+  "routes": [{ "pattern": "telemetry.getcodegraph.com", "custom_domain": true }],
+  "workers_dev": false,
+
+  "observability": { "enabled": true, "head_sampling_rate": 1 },
+
+  // Nightly rollup + retention purge (src/rollup.ts). 00:30 UTC — half an hour after
+  // the day it rolls up closed, so straggling writes for it have landed. It also
+  // re-runs the two days before that, because offline clients ship completed-day
+  // rollups late; the writes are idempotent upserts, so re-running is free.
+  "triggers": { "crons": ["30 0 * * *"] },
+
+  // How many days of RAW events are kept. Rollups are kept forever, so shortening
+  // this costs ad-hoc drill-back, never a chart. 90 is a storage limit, not a policy
+  // one: raw events grow ≈74 MB/day, so 90 days ≈ 6.7 GB against D1's 10 GB
+  // per-database cap — the arithmetic is in migrations/0001_init.sql's footer.
+  // Measure real row size after cutover before widening it.
+  "vars": { "RETENTION_DAYS": 90 },
+
+  // Telemetry storage. Schema + the chart each table serves: migrations/0001_init.sql.
+  // Apply with `npm run db:migrate:local` (local state) / `npm run db:migrate` (remote).
+  // The admin dashboard worker binds this same database read-mostly, also as `DB`.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "codegraph-telemetry",
+      "database_id": "5ed36dfb-d2d7-4e35-9e63-a1b99d0b1ed3",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  // Per-machine_id rate limit. Legit clients flush a handful of times per day;
+  // 6/min absorbs install+index bursts while capping abuse.
+  "ratelimits": [
+    {
+      "name": "MACHINE_RATE_LIMITER",
+      "namespace_id": "1001",
+      "simple": { "limit": 6, "period": 60 }
+    },
+    // POST /admin/rollup. The ADMIN_TOKEN secret is the real guard; this only caps
+    // how fast it can be guessed at, with enough room for a chunked backfill loop.
+    {
+      "name": "ADMIN_RATE_LIMITER",
+      "namespace_id": "1002",
+      "simple": { "limit": 10, "period": 60 }
+    }
+  ]
+}

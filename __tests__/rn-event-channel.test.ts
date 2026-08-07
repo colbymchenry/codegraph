@@ -123,4 +123,38 @@ export function onMessage(listener: (m: any) => void) {
     expect(edge.target_name).toBe('onMessage');
     expect(['function', 'method']).toContain(edge.target_kind);
   });
+  it('synthesizes an edge from a Java sendEvent(ctx, "X", body) wrapper to a JS handler', async () => {
+    fs.writeFileSync(path.join(dir, 'package.json'), '{"dependencies":{"react-native":"^0.74.0"}}');
+    // The literal event name lives in the WRAPPER CALL, not in `.emit` (whose
+    // first arg is the `eventName` VARIABLE) — the common react-native-device-info
+    // shape that RN_JVM_EMIT_RE alone misses.
+    fs.writeFileSync(path.join(dir, 'BatteryModule.java'),
+      'public class BatteryModule extends ReactContextBaseJavaModule {\n' +
+      '  @Override public String getName() { return "BatteryModule"; }\n' +
+      '  public void onBatteryChanged() {\n' +
+      '    sendEvent(getReactApplicationContext(),\n' +
+      '      "myWrapperBatteryEvent", null);\n' +
+      '  }\n' +
+      '  private void sendEvent(ReactContext ctx, String eventName, Object data) {\n' +
+      '    ctx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class).emit(eventName, data);\n' +
+      '  }\n' +
+      '}\n');
+    fs.writeFileSync(path.join(dir, 'index.ts'),
+      "function onBattery() {}\n" +
+      "emitter.addListener('myWrapperBatteryEvent', onBattery);\n");
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const db = (cg as any).db.db;
+    const rows = db.prepare(
+      "SELECT s.name source_name, s.language sl, t.name target_name FROM edges e " +
+      "JOIN nodes s ON s.id=e.source JOIN nodes t ON t.id=e.target " +
+      "WHERE json_extract(e.metadata,'$.synthesizedBy')='rn-event-channel' AND json_extract(e.metadata,'$.event')='myWrapperBatteryEvent'"
+    ).all();
+    cg.close?.();
+    expect(rows.length).toBeGreaterThanOrEqual(1);
+    expect(rows[0].sl).toBe('java');
+    expect(rows[0].source_name).toBe('onBatteryChanged');
+    expect(rows[0].target_name).toBe('onBattery');
+  });
 });

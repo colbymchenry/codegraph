@@ -24,7 +24,7 @@ import { QueryBuilder } from '../db/queries';
 import { GraphTraverser } from '../graph';
 import { formatContextAsMarkdown, formatContextAsJson } from './formatter';
 import { logDebug } from '../errors';
-import { validatePathWithinRoot } from '../utils';
+import { validatePathWithinRoot, isConfigLeafNode } from '../utils';
 import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants, isDistinctiveIdentifier } from '../search/query-utils';
 import { LOW_CONFIDENCE_MARKER } from './markers';
 
@@ -265,7 +265,14 @@ export class ContextBuilder {
 
     // Return formatted output or raw context
     if (opts.format === 'markdown') {
-      return formatContextAsMarkdown(context)
+      // Bounded candidate set (entry points + subgraph + code blocks), so the
+      // DB-backed generated check is one probe, not a per-comparison query.
+      const isGenerated = this.queries.generatedPredicateFor([
+        ...entryPoints.map((n) => n.filePath),
+        ...Array.from(subgraph.nodes.values(), (n) => n.filePath),
+        ...codeBlocks.map((b) => b.filePath),
+      ]);
+      return formatContextAsMarkdown(context, isGenerated)
         + this.buildCallPathsSection(subgraph)
         + (subgraph.confidence === 'low' ? this.buildLowConfidenceNote(entryPoints) : '');
     } else if (opts.format === 'json') {
@@ -749,6 +756,13 @@ export class ContextBuilder {
     if (symbolsFromQuery.length > 0) {
       const camelDefinitionKinds: NodeKind[] = ['class', 'interface', 'struct', 'trait',
         'protocol', 'enum', 'type_alias'];
+      // Callable kinds participate too: in service-layer codebases the
+      // camel-infix definers of a queried FIELD are methods/functions
+      // (`profileInfo` → `getProfileInfoV2`), not classes — the type-only
+      // whitelist made this whole step dead code there (#1196). Fetched as a
+      // SEPARATE LIKE batch so one hot single-word term can't crowd classes
+      // out of the length-ordered 200-row batch.
+      const camelCallableKinds: NodeKind[] = ['function', 'method', 'component'];
       const camelSearchedTerms = new Set<string>();
       const searchIdSet = new Set(searchResults.map(r => r.node.id));
       // Track per-node term hits for multi-term boosting
@@ -766,18 +780,32 @@ export class ContextBuilder {
         // have hundreds of substring matches. The LIKE scan cost is the same
         // regardless of LIMIT (SQLite scans all matches to sort), so we fetch
         // generously and let path-relevance scoring pick the best ones.
-        const likeResults = this.queries.findNodesByNameSubstring(titleCased, {
-          limit: 200,
-          kinds: camelDefinitionKinds,
-          excludePrefix: true,
-        });
+        const likeResults = [
+          ...this.queries.findNodesByNameSubstring(titleCased, {
+            limit: 200,
+            kinds: camelDefinitionKinds,
+            excludePrefix: true,
+          }),
+          ...this.queries.findNodesByNameSubstring(titleCased, {
+            limit: 200,
+            kinds: camelCallableKinds,
+            excludePrefix: true,
+          }),
+        ];
 
         // Filter to CamelCase boundaries, score by path relevance, and take top N
         const termCandidates: SearchResult[] = [];
         for (const r of likeResults) {
           const name = r.node.name;
-          const idx = name.indexOf(titleCased);
+          // Case-INSENSITIVE hump lookup: title-casing lowercases interior
+          // humps (`profileInfo` → `Profileinfo`), which SQLite's LIKE still
+          // matched but a case-sensitive indexOf here silently dropped —
+          // making every multi-hump query term unfindable by this step
+          // (#1196). The match must still LAND on an uppercase char, so a
+          // plain lowercase infix can't slip through.
+          const idx = name.toLowerCase().indexOf(termKey);
           if (idx <= 0) continue;
+          if (!/[A-Z]/.test(name.charAt(idx))) continue;
           // Accept CamelCase boundary (lowercase before match) OR
           // acronym boundary (uppercase before match, e.g., RPCProtocol)
           if (!/[a-zA-Z]/.test(name.charAt(idx - 1))) continue;
@@ -841,11 +869,19 @@ export class ContextBuilder {
           const titleCased = sym.charAt(0).toUpperCase() + sym.slice(1).toLowerCase();
           if (titleCased.length < 3) continue;
 
-          const likeResults = this.queries.findNodesByNameSubstring(titleCased, {
-            limit: 200,
-            kinds: camelDefinitionKinds,
-            excludePrefix: false,
-          });
+          const likeResults = [
+            ...this.queries.findNodesByNameSubstring(titleCased, {
+              limit: 200,
+              kinds: camelDefinitionKinds,
+              excludePrefix: false,
+            }),
+            // Same separate callable batch as Step 5b (#1196).
+            ...this.queries.findNodesByNameSubstring(titleCased, {
+              limit: 200,
+              kinds: camelCallableKinds,
+              excludePrefix: false,
+            }),
+          ];
 
           for (const r of likeResults) {
             if (searchIdSet.has(r.node.id)) continue;
@@ -1161,6 +1197,14 @@ export class ContextBuilder {
    * Extract code from a node's source file
    */
   private async extractNodeCode(node: Node): Promise<string | null> {
+    // SECURITY (#383): a config-leaf node's on-disk line is `key = <secret>`.
+    // Return the KEY only — never read the value off disk. This closes the
+    // includeCode / buildContext code-block path, mirroring the explore source
+    // renderer; an agent that genuinely needs a value can read the file itself.
+    if (isConfigLeafNode(node)) {
+      return node.signature || node.qualifiedName || node.name;
+    }
+
     const filePath = validatePathWithinRoot(this.projectRoot, node.filePath);
 
     if (!filePath || !fs.existsSync(filePath)) {

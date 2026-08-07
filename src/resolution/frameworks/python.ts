@@ -48,10 +48,14 @@ export const djangoResolver: FrameworkResolver = {
     return null;
   },
 
-  // Let the ORM dynamic-dispatch ref reach resolve() despite no symbol being
-  // named `_iterable_class` (it's a QuerySet attribute, not a declared method).
+  // Let two ref shapes past resolveOne's "no possible match" pre-filter so they
+  // reach resolution: the ORM dynamic-dispatch `_iterable_class` (a QuerySet
+  // attribute, not a declared symbol), and a Django `include('app.urls')` module
+  // path — a dotted module name with no symbol/import to match, which resolution
+  // (resolvePythonAbsoluteModule) then maps to its `urls.py` file so the included
+  // URLconf records a dependency on the root urlconf.
   claimsReference(name) {
-    return name === '_iterable_class';
+    return name === '_iterable_class' || name.endsWith('.urls');
   },
 
   extract(filePath, content) {

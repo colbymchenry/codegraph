@@ -1,7 +1,11 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import type { Node, Language } from '../src/types';
 import type { ResolutionContext, UnresolvedRef } from '../src/resolution/types';
 import { reactNativeBridgeResolver } from '../src/resolution/frameworks/react-native';
+import { CodeGraph } from '../src';
 
 /**
  * Mock ResolutionContext for the React Native bridge resolver.
@@ -290,5 +294,49 @@ describe('React Native bridge resolver', () => {
         reactNativeBridgeResolver.resolve(ref('remove', 'typescript', 'App.ts'), ctx)
       ).toBeNull();
     });
+  });
+});
+
+describe('React Native cross-platform pairing — end to end', () => {
+  let dir: string;
+  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rn-xplat-')); });
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
+
+  it('links the Android (@ReactMethod) and iOS (RCT_EXPORT_METHOD) impls of a JS-called method', async () => {
+    fs.writeFileSync(path.join(dir, 'package.json'), '{"dependencies":{"react-native":"^0.74.0"}}');
+    fs.writeFileSync(path.join(dir, 'index.ts'),
+      "import { NativeModules } from 'react-native';\n" +
+      "export function ping() { return NativeModules.RNThing.uniquePingMethod(); }\n");
+    fs.writeFileSync(path.join(dir, 'RNThing.java'),
+      "public class RNThing extends ReactContextBaseJavaModule {\n" +
+      "  @Override public String getName() { return \"RNThing\"; }\n" +
+      "  @ReactMethod public void uniquePingMethod(Callback cb) {}\n}\n");
+    fs.writeFileSync(path.join(dir, 'RNThing.m'),
+      "@implementation RNThing\n" +
+      "RCT_EXPORT_MODULE()\n" +
+      "RCT_EXPORT_METHOD(uniquePingMethod:(RCTResponseSenderBlock)cb) {}\n@end\n");
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const db = (cg as any).db.db;
+
+    // The iOS `RCT_EXPORT_METHOD` is extracted as an ObjC method node (the macro
+    // parses as a macro-expression, not a method, so it had no node before).
+    const objc = db.prepare(
+      "SELECT * FROM nodes WHERE name='uniquePingMethod' AND language='objc' AND id LIKE 'rn-export:%'"
+    ).all();
+    expect(objc).toHaveLength(1);
+
+    // The Java and ObjC impls of `uniquePingMethod` are linked to each other, so
+    // a JS call that resolves to one platform reaches the other.
+    const pair = db.prepare(
+      `SELECT count(*) c FROM edges e
+       JOIN nodes s ON s.id=e.source JOIN nodes t ON t.id=e.target
+       WHERE json_extract(e.metadata,'$.synthesizedBy')='rn-cross-platform'
+         AND s.name LIKE 'uniquePingMethod%' AND t.name LIKE 'uniquePingMethod%'
+         AND s.language != t.language`
+    ).get();
+    cg.close?.();
+    expect(pair.c).toBeGreaterThanOrEqual(2); // java<->objc both directions
   });
 });

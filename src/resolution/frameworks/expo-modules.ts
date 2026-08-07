@@ -54,9 +54,14 @@ import {
  * line as the keyword, which matches every real Expo Module declaration
  * style. Multi-line `AsyncFunction(\n"x"\n)` forms aren't a real shape in
  * the SDK; if any appear we'd extend the regex.
+ *
+ * The optional `<…>` covers Kotlin's GENERIC-typed declarations
+ * (`AsyncFunction<Float>("getBatteryLevelAsync")`, `AsyncFunction<Int, String>(…)`)
+ * — without it, every Android Expo Module method was silently dropped, so a JS
+ * callsite resolved only to the iOS Swift impl and never the Android one.
  */
 const EXPO_DECL_RE =
-  /\b(Function|AsyncFunction|Property|Constants)\s*\(\s*["']([A-Za-z_][A-Za-z0-9_]*)["']/g;
+  /\b(Function|AsyncFunction|Property|Constants)\s*(?:<[^(]*>)?\s*\(\s*["']([A-Za-z_][A-Za-z0-9_]*)["']/g;
 
 /**
  * Match the module name literal `Name("ExpoX")`. Used to enrich each emitted

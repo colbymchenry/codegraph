@@ -10,6 +10,7 @@ import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src/index';
 import { Node, Edge } from '../src/types';
+import { GraphTraverser } from '../src/graph/traversal';
 
 describe('Graph Queries', () => {
   let testDir: string;
@@ -293,6 +294,25 @@ export { main };
 
       expect(Array.isArray(callees)).toBe(true);
     });
+
+    it('treats class instantiation as a caller/callee of the class (#774)', () => {
+      // main() does `new DerivedClass(10, 'test')`. Constructing a class is
+      // calling its constructor, so main is a caller of DerivedClass and
+      // DerivedClass is a callee of main. Before #774 the `instantiates` edge
+      // was excluded from the caller/callee traversal, so `callers <Class>`
+      // returned the importing file (or nothing) and missed every
+      // construction site.
+      const derived = cg.getNodesByKind('class').find((n) => n.name === 'DerivedClass');
+      const main = cg.getNodesByKind('function').find((n) => n.name === 'main');
+      expect(derived).toBeDefined();
+      expect(main).toBeDefined();
+
+      const callerNames = cg.getCallers(derived!.id).map((c) => c.node.name);
+      expect(callerNames).toContain('main');
+
+      const calleeNames = cg.getCallees(main!.id).map((c) => c.node.name);
+      expect(calleeNames).toContain('DerivedClass');
+    });
   });
 
   describe('getImpactRadius()', () => {
@@ -388,16 +408,37 @@ export { main };
   });
 
   describe('File dependency analysis', () => {
-    it('should get file dependencies', () => {
+    // Regression: getFileDependents/getFileDependencies used to follow
+    // ONLY `imports` edges, which in this engine are same-file (a file → its
+    // own local import declarations). That made both return [] for EVERY file,
+    // so `codegraph affected` found no dependents on any language/framework.
+    // They must follow the cross-file symbol graph instead (calls / references
+    // / instantiates / extends / implements / ...).
+    it('reports cross-file dependencies via the symbol graph, not just imports', () => {
       const deps = cg.getFileDependencies('src/main.ts');
-
-      expect(Array.isArray(deps)).toBe(true);
+      // main() instantiates DerivedClass (derived.ts) and calls
+      // processValue/doubleValue (utils.ts) — both are real dependencies.
+      expect(deps).toContain('src/utils.ts');
+      expect(deps).toContain('src/derived.ts');
     });
 
-    it('should get file dependents', () => {
-      const dependents = cg.getFileDependents('src/utils.ts');
+    it('reports cross-file dependents via the symbol graph, not just imports', () => {
+      // utils.ts is used by main.ts (processValue/doubleValue calls); the old
+      // imports-only implementation returned [] here.
+      expect(cg.getFileDependents('src/utils.ts')).toContain('src/main.ts');
+    });
 
-      expect(Array.isArray(dependents)).toBe(true);
+    it('counts extends/implements as a dependency edge', () => {
+      // derived.ts extends BaseClass / implements Printable, both in base.ts.
+      expect(cg.getFileDependencies('src/derived.ts')).toContain('src/base.ts');
+      expect(cg.getFileDependents('src/base.ts')).toContain('src/derived.ts');
+    });
+
+    it('never lists a file as its own dependent or dependency', () => {
+      for (const f of ['src/main.ts', 'src/utils.ts', 'src/base.ts', 'src/derived.ts']) {
+        expect(cg.getFileDependents(f)).not.toContain(f);
+        expect(cg.getFileDependencies(f)).not.toContain(f);
+      }
     });
   });
 
@@ -444,5 +485,131 @@ export { main };
       expect(typeof metrics.incomingEdgeCount).toBe('number');
       expect(typeof metrics.outgoingEdgeCount).toBe('number');
     });
+  });
+});
+
+// =============================================================================
+// Traversal edge-completeness & node-limit regressions (#1086–#1090)
+//
+// These drive GraphTraverser directly against an in-memory graph (the same
+// approach the reporter used), so the exact parallel-edge / high-degree
+// topologies can be constructed deterministically without round-tripping
+// through extraction.
+// =============================================================================
+
+/** Minimal Node stub — the traversal code only reads id/kind/name. */
+function tNode(id: string, kind: Node['kind'] = 'function'): Node {
+  return {
+    id,
+    kind,
+    name: id,
+    qualifiedName: id,
+    filePath: `src/${id}.ts`,
+    language: 'typescript',
+    startLine: 1,
+    endLine: 10,
+    startColumn: 0,
+    endColumn: 0,
+  } as unknown as Node;
+}
+
+/** Build a GraphTraverser over a fixed node/edge set, honoring the `kinds` filter. */
+function tGraph(nodes: Node[], edges: Edge[]): GraphTraverser {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const q = {
+    getNodeById: (id: string) => byId.get(id) ?? null,
+    getNodesByIds: (ids: readonly string[]) => {
+      const m = new Map<string, Node>();
+      for (const id of ids) {
+        const n = byId.get(id);
+        if (n) m.set(id, n);
+      }
+      return m;
+    },
+    getOutgoingEdges: (source: string, kinds?: string[]) =>
+      edges.filter((e) => e.source === source && (!kinds || kinds.includes(e.kind))),
+    getIncomingEdges: (target: string, kinds?: string[]) =>
+      edges.filter((e) => e.target === target && (!kinds || kinds.includes(e.kind))),
+  };
+  return new GraphTraverser(q as never);
+}
+
+describe('Traversal edge-completeness & limits (#1086–#1090)', () => {
+  it('traverseBFS keeps every parallel edge to the same target (#1090)', () => {
+    // A reaches B via both `calls` and `references` — two distinct edges.
+    const edges: Edge[] = [
+      { source: 'A', target: 'B', kind: 'calls', line: 1 },
+      { source: 'A', target: 'B', kind: 'references', line: 2 },
+    ];
+    const sub = tGraph([tNode('A'), tNode('B')], edges).traverseBFS('A', { direction: 'outgoing' });
+
+    const ab = sub.edges.filter((e) => e.source === 'A' && e.target === 'B');
+    // Pre-fix: only the higher-priority `calls` edge survived; `references` was dropped.
+    expect(ab.map((e) => e.kind).sort()).toEqual(['calls', 'references']);
+    expect(sub.nodes.has('B')).toBe(true);
+  });
+
+  it('traverseBFS keeps two same-kind edges on different lines (#1090)', () => {
+    const edges: Edge[] = [
+      { source: 'A', target: 'B', kind: 'calls', line: 3 },
+      { source: 'A', target: 'B', kind: 'calls', line: 7 },
+    ];
+    const sub = tGraph([tNode('A'), tNode('B')], edges).traverseBFS('A', { direction: 'outgoing' });
+    expect(sub.edges.filter((e) => e.source === 'A' && e.target === 'B')).toHaveLength(2);
+  });
+
+  it('traverseBFS does not overshoot opts.limit on a high-degree node (#1087)', () => {
+    const neighbors = ['B', 'C', 'D', 'E', 'F'];
+    const nodes = [tNode('A'), ...neighbors.map((n) => tNode(n))];
+    const edges: Edge[] = neighbors.map((n) => ({ source: 'A', target: n, kind: 'calls' as const }));
+    const sub = tGraph(nodes, edges).traverseBFS('A', { limit: 3, direction: 'outgoing' });
+    // Pre-fix: all 5 neighbors were added in one pass → 6 nodes despite limit 3.
+    expect(sub.nodes.size).toBeLessThanOrEqual(3);
+  });
+
+  it('traverseDFS does not overshoot opts.limit on a high-degree node (#1088)', () => {
+    const neighbors = ['B', 'C', 'D', 'E', 'F'];
+    const nodes = [tNode('A'), ...neighbors.map((n) => tNode(n))];
+    const edges: Edge[] = neighbors.map((n) => ({ source: 'A', target: n, kind: 'calls' as const }));
+    const sub = tGraph(nodes, edges).traverseDFS('A', { limit: 2, direction: 'outgoing' });
+    expect(sub.nodes.size).toBeLessThanOrEqual(2);
+  });
+
+  it('getCallers returns each caller once when reached via multiple edges (#1086)', () => {
+    // Y calls X at two sites and also references it — three incoming edges.
+    const edges: Edge[] = [
+      { source: 'Y', target: 'X', kind: 'calls', line: 1 },
+      { source: 'Y', target: 'X', kind: 'calls', line: 2 },
+      { source: 'Y', target: 'X', kind: 'references', line: 3 },
+    ];
+    const callers = tGraph([tNode('X'), tNode('Y')], edges).getCallers('X'); // default maxDepth = 1
+    // Pre-fix: Y appeared three times (depth guard returned before visited.add).
+    expect(callers.map((c) => c.node.id)).toEqual(['Y']);
+  });
+
+  it('getCallees returns each callee once when reached via multiple edges (#1086)', () => {
+    const edges: Edge[] = [
+      { source: 'X', target: 'Y', kind: 'calls', line: 1 },
+      { source: 'X', target: 'Y', kind: 'calls', line: 2 },
+    ];
+    const callees = tGraph([tNode('X'), tNode('Y')], edges).getCallees('X');
+    expect(callees.map((c) => c.node.id)).toEqual(['Y']);
+  });
+
+  it('getImpactRadius keeps a direct edge into a node already collected via another path (#1089)', () => {
+    // Class P contains method M. Q calls both M and P. Reaching M first collects
+    // Q; the pre-fix `!nodes.has()` gate then dropped the direct Q→P edge.
+    const nodes = [tNode('P', 'class'), tNode('M', 'method'), tNode('Q')];
+    const edges: Edge[] = [
+      { source: 'P', target: 'M', kind: 'contains' },
+      { source: 'Q', target: 'M', kind: 'calls', line: 1 },
+      { source: 'Q', target: 'P', kind: 'calls', line: 2 },
+    ];
+    const sub = tGraph(nodes, edges).getImpactRadius('P', 2);
+
+    expect(sub.nodes.has('Q')).toBe(true);
+    expect(sub.edges.some((e) => e.source === 'Q' && e.target === 'M' && e.kind === 'calls')).toBe(true);
+    // The regression: this direct dependency edge used to vanish.
+    expect(sub.edges.some((e) => e.source === 'Q' && e.target === 'P' && e.kind === 'calls')).toBe(true);
   });
 });

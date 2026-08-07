@@ -19,9 +19,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { ALL_TARGETS, getTarget, resolveTargetFlag } from '../src/installer/targets/registry';
-import { uninstallTargets } from '../src/installer';
+import { uninstallTargets, refreshTargets } from '../src/installer';
 import { upsertTomlTable, removeTomlTable, buildTomlTable } from '../src/installer/targets/toml';
-import { cleanupLegacyHooks } from '../src/installer/targets/claude';
+import { cleanupLegacyHooks, writePromptHookEntry, removePromptHookEntry } from '../src/installer/targets/claude';
 
 function mkTmpDir(label: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `cg-targets-${label}-`));
@@ -192,20 +192,23 @@ describe('Installer targets — partial-state idempotency', () => {
     fs.rmSync(tmpCwd, { recursive: true, force: true });
   });
 
-  it('codex: install writes config.toml but never an AGENTS.md instructions file (#529)', () => {
+  it('codex: install writes config.toml AND the AGENTS.md codegraph block (#704)', () => {
     const codex = getTarget('codex')!;
     const first = codex.install('global', { autoAllow: false });
     const agentsMd = path.join(tmpHome, '.codex', 'AGENTS.md');
-    // No instructions file is created, and no file action references it.
-    expect(fs.existsSync(agentsMd)).toBe(false);
-    expect(first.files.some((f) => f.path.endsWith('AGENTS.md'))).toBe(false);
     expect(first.files.some((f) => f.path.endsWith('config.toml'))).toBe(true);
-    // Re-install is fully unchanged (config.toml only, nothing to strip).
+    // The short instructions block IS written (subagents / non-MCP
+    // harnesses read AGENTS.md but never the MCP initialize instructions).
+    expect(fs.existsSync(agentsMd)).toBe(true);
+    const body = fs.readFileSync(agentsMd, 'utf-8');
+    expect(body).toContain('## CodeGraph');
+    expect(body).toContain('codegraph explore');
+    // Re-install is fully unchanged (byte-equal block → idempotent).
     const second = codex.install('global', { autoAllow: false });
     for (const f of second.files) expect(f.action).toBe('unchanged');
   });
 
-  it('codex: install strips a legacy AGENTS.md codegraph block, keeping user content (#529)', () => {
+  it('codex: install replaces a legacy AGENTS.md codegraph block with the current one, keeping user content', () => {
     const codex = getTarget('codex')!;
     const dir = path.join(tmpHome, '.codex');
     fs.mkdirSync(dir, { recursive: true });
@@ -217,10 +220,11 @@ describe('Installer targets — partial-state idempotency', () => {
     const body = fs.readFileSync(agentsMd, 'utf-8');
     expect(body).toContain('# My codex notes');
     expect(body).toContain('Be terse.');
-    expect(body).not.toContain('CODEGRAPH_START');
-    // The strip is reported as a 'removed' action on AGENTS.md.
+    // Self-heal: the stale pre-#529 body is gone, the current block is in.
+    expect(body).not.toContain('Prefer `codegraph_search`');
+    expect(body).toContain('codegraph explore');
     const mdEntry = result.files.find((f) => f.path.endsWith('AGENTS.md'));
-    expect(mdEntry?.action).toBe('removed');
+    expect(mdEntry?.action).toBe('updated');
   });
 
   it('opencode: prefers .jsonc when both .json and .jsonc exist', () => {
@@ -290,15 +294,16 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(fs.readFileSync(file, 'utf-8')).toBe(afterInstall);
   });
 
-  it('opencode: install does NOT write an AGENTS.md instructions file (#529)', () => {
+  it('opencode: install writes the AGENTS.md codegraph block (#704)', () => {
     const opencode = getTarget('opencode')!;
     const result = opencode.install('global', { autoAllow: true });
     const agentsMd = path.join(tmpHome, '.config', 'opencode', 'AGENTS.md');
-    expect(fs.existsSync(agentsMd)).toBe(false);
-    expect(result.files.some((f) => f.path.endsWith('AGENTS.md'))).toBe(false);
+    expect(fs.existsSync(agentsMd)).toBe(true);
+    expect(fs.readFileSync(agentsMd, 'utf-8')).toContain('codegraph explore');
+    expect(result.files.find((f) => f.path.endsWith('AGENTS.md'))?.action).toBe('created');
   });
 
-  it('opencode: install strips a legacy AGENTS.md codegraph block, preserving user content (#529)', () => {
+  it('opencode: install replaces a legacy AGENTS.md codegraph block, preserving user content', () => {
     const opencode = getTarget('opencode')!;
     const dir = path.join(tmpHome, '.config', 'opencode');
     fs.mkdirSync(dir, { recursive: true });
@@ -310,8 +315,9 @@ describe('Installer targets — partial-state idempotency', () => {
     const body = fs.readFileSync(agentsMd, 'utf-8');
     expect(body).toContain('# My personal opencode instructions');
     expect(body).toContain('Always respond in pirate.');
-    expect(body).not.toContain('CODEGRAPH_START');
-    expect(result.files.find((f) => f.path.endsWith('AGENTS.md'))?.action).toBe('removed');
+    expect(body).not.toContain('Prefer `codegraph_search`');
+    expect(body).toContain('codegraph explore');
+    expect(result.files.find((f) => f.path.endsWith('AGENTS.md'))?.action).toBe('updated');
   });
 
   it('opencode: uninstall strips a leftover codegraph block from AGENTS.md, keeping user content', () => {
@@ -329,24 +335,25 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(body).not.toContain('CODEGRAPH_START');
   });
 
-  it('opencode: local install writes ./opencode.jsonc and never an ./AGENTS.md (#529)', () => {
+  it('opencode: local install writes ./opencode.jsonc and the ./AGENTS.md block (#704)', () => {
     const opencode = getTarget('opencode')!;
     const result = opencode.install('local', { autoAllow: true });
     const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
     // macOS realpath shenanigans (/var vs /private/var) — suffix match.
     expect(paths.some((p) => p.endsWith('/opencode.jsonc'))).toBe(true);
-    expect(paths.some((p) => p.endsWith('/AGENTS.md'))).toBe(false);
-    expect(fs.existsSync(path.join(process.cwd(), 'AGENTS.md'))).toBe(false);
+    expect(paths.some((p) => p.endsWith('/AGENTS.md'))).toBe(true);
+    expect(fs.existsSync(path.join(process.cwd(), 'AGENTS.md'))).toBe(true);
   });
 
-  it('gemini: install writes settings.json (mcpServers.codegraph) and no GEMINI.md (#529)', () => {
+  it('gemini: install writes settings.json (mcpServers.codegraph) and the GEMINI.md block (#704)', () => {
     const gemini = getTarget('gemini')!;
     const result = gemini.install('global', { autoAllow: true });
     const settings = path.join(tmpHome, '.gemini', 'settings.json');
     const geminiMd = path.join(tmpHome, '.gemini', 'GEMINI.md');
     expect(result.files.some((f) => f.path === settings)).toBe(true);
-    expect(result.files.some((f) => f.path === geminiMd)).toBe(false);
-    expect(fs.existsSync(geminiMd)).toBe(false);
+    expect(result.files.some((f) => f.path === geminiMd)).toBe(true);
+    expect(fs.existsSync(geminiMd)).toBe(true);
+    expect(fs.readFileSync(geminiMd, 'utf-8')).toContain('codegraph explore');
 
     const cfg = JSON.parse(fs.readFileSync(settings, 'utf-8'));
     expect(cfg.mcpServers.codegraph).toEqual({ type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] });
@@ -383,13 +390,13 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(after.mcpServers).toBeUndefined();
   });
 
-  it('gemini: local install writes ./.gemini/settings.json and never a ./GEMINI.md (#529)', () => {
+  it('gemini: local install writes ./.gemini/settings.json and the project-root ./GEMINI.md block (#704)', () => {
     const gemini = getTarget('gemini')!;
     const result = gemini.install('local', { autoAllow: true });
     const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
     expect(paths.some((p) => p.endsWith('/.gemini/settings.json'))).toBe(true);
-    expect(paths.some((p) => p.endsWith('/GEMINI.md'))).toBe(false);
-    expect(fs.existsSync(path.join(process.cwd(), 'GEMINI.md'))).toBe(false);
+    expect(paths.some((p) => p.endsWith('/GEMINI.md'))).toBe(true);
+    expect(fs.existsSync(path.join(process.cwd(), 'GEMINI.md'))).toBe(true);
   });
 
   it('gemini: uninstall strips a leftover GEMINI.md codegraph block, keeping user content', () => {
@@ -869,6 +876,48 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(after).not.toContain('enabled = true');
   });
 
+  it('codex: install, re-install, and uninstall preserve trailing array-of-tables siblings', () => {
+    const codex = getTarget('codex')!;
+    const tomlPath = path.join(tmpHome, '.codex', 'config.toml');
+    fs.mkdirSync(path.dirname(tomlPath), { recursive: true });
+    const historyTables = [
+      '[[history]]',
+      'id = 1',
+      'note = "keep first"',
+      '',
+      '[[history]]',
+      'id = 2',
+      'note = "keep second"',
+      '',
+    ].join('\n');
+    fs.writeFileSync(tomlPath, [
+      '[mcp_servers.codegraph]',
+      'command = "old-codegraph"',
+      'args = ["old"]',
+      'description = """',
+      'header-shaped text inside a multiline string:',
+      '[[not-a-table]]',
+      'still part of the string',
+      '"""',
+      '',
+      historyTables,
+    ].join('\n'));
+
+    const first = codex.install('global', { autoAllow: false });
+    expect(first.files.find((f) => f.path === tomlPath)?.action).toBe('updated');
+    const afterInstall = fs.readFileSync(tomlPath, 'utf-8');
+    expect(afterInstall).toContain('command = "codegraph"');
+    expect(afterInstall).not.toContain('[[not-a-table]]');
+    expect(afterInstall.endsWith(historyTables)).toBe(true);
+
+    const second = codex.install('global', { autoAllow: false });
+    expect(second.files.find((f) => f.path === tomlPath)?.action).toBe('unchanged');
+    expect(fs.readFileSync(tomlPath, 'utf-8')).toBe(afterInstall);
+
+    codex.uninstall('global');
+    expect(fs.readFileSync(tomlPath, 'utf-8')).toBe(historyTables);
+  });
+
   it('claude: local install writes ./.mcp.json (project scope), not ./.claude.json', () => {
     const claude = getTarget('claude')!;
     const result = claude.install('local', { autoAllow: false });
@@ -880,15 +929,18 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(cfg.mcpServers.codegraph).toBeDefined();
   });
 
-  it('claude: install does NOT create a CLAUDE.md instructions file (#529)', () => {
+  it('claude: install creates the CLAUDE.md codegraph block (#704)', () => {
     const claude = getTarget('claude')!;
     const result = claude.install('local', { autoAllow: false });
     const claudeMd = path.join(tmpCwd, '.claude', 'CLAUDE.md');
-    expect(fs.existsSync(claudeMd)).toBe(false);
-    expect(result.files.some((f) => f.path.endsWith('CLAUDE.md'))).toBe(false);
+    expect(fs.existsSync(claudeMd)).toBe(true);
+    const body = fs.readFileSync(claudeMd, 'utf-8');
+    expect(body).toContain('## CodeGraph');
+    expect(body).toContain('codegraph explore');
+    expect(result.files.find((f) => f.path.endsWith('CLAUDE.md'))?.action).toBe('created');
   });
 
-  it('claude: install strips a legacy CLAUDE.md codegraph block, keeping user content (#529)', () => {
+  it('claude: install replaces a legacy CLAUDE.md codegraph block, keeping user content', () => {
     const claude = getTarget('claude')!;
     const claudeMd = path.join(tmpCwd, '.claude', 'CLAUDE.md');
     fs.mkdirSync(path.dirname(claudeMd), { recursive: true });
@@ -899,8 +951,9 @@ describe('Installer targets — partial-state idempotency', () => {
     const body = fs.readFileSync(claudeMd, 'utf-8');
     expect(body).toContain('# My project rules');
     expect(body).toContain('Use tabs.');
-    expect(body).not.toContain('CODEGRAPH_START');
-    expect(result.files.find((f) => f.path.endsWith('CLAUDE.md'))?.action).toBe('removed');
+    expect(body).not.toContain('Prefer `codegraph_search`');
+    expect(body).toContain('codegraph explore');
+    expect(result.files.find((f) => f.path.endsWith('CLAUDE.md'))?.action).toBe('updated');
   });
 
   it('claude: global install targets ~/.claude.json (user scope)', () => {
@@ -1020,7 +1073,7 @@ describe('Installer targets — partial-state idempotency', () => {
     // The unrelated GitKraken hook survives untouched.
     expect(stopCommands.some((c: string) => c.includes('gk') && c.includes('ai hook run'))).toBe(true);
     // Permissions still written as normal alongside the cleanup.
-    expect(after.permissions?.allow).toContain('mcp__codegraph__codegraph_search');
+    expect(after.permissions?.allow).toContain('mcp__codegraph__*');
   });
 
   it('claude: cleanupLegacyHooks preserves a sibling hook sharing our matcher group', () => {
@@ -1085,6 +1138,123 @@ describe('Installer targets — partial-state idempotency', () => {
     const after = JSON.parse(fs.readFileSync(file, 'utf-8'));
     // Both events emptied → the whole `hooks` object is removed.
     expect(after.hooks).toBeUndefined();
+  });
+
+  // ---- Front-load prompt hook (UserPromptSubmit) — #841 follow-up ----
+  // Opt-in (default-yes in the installer) UserPromptSubmit hook that runs
+  // `codegraph prompt-hook`. Must write/remove surgically, be idempotent, and
+  // round-trip an opt-out — without disturbing the user's own hooks.
+  // Platform-aware since #1466: Windows writes `codegraph.cmd prompt-hook`
+  // (Git Bash applies no PATHEXT, so the bare form is exit 127 there), and
+  // install self-heals the other platform's spelling in place.
+  const HOOK_CMD = process.platform === 'win32' ? 'codegraph.cmd prompt-hook' : 'codegraph prompt-hook';
+  const OTHER_PLATFORM_HOOK_CMD = process.platform === 'win32' ? 'codegraph prompt-hook' : 'codegraph.cmd prompt-hook';
+  const promptCommands = (s: any): string[] =>
+    (s.hooks?.UserPromptSubmit ?? []).flatMap((g: any) => (g.hooks ?? []).map((h: any) => h.command));
+
+  it('claude: install with promptHook:true writes the UserPromptSubmit hook (alongside permissions)', () => {
+    const claude = getTarget('claude')!;
+    claude.install('global', { autoAllow: true, promptHook: true });
+    const s = JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude', 'settings.json'), 'utf-8'));
+    expect(promptCommands(s)).toContain(HOOK_CMD);
+    expect(s.permissions?.allow).toContain('mcp__codegraph__*');
+  });
+
+  it('claude: install without promptHook does NOT add the hook', () => {
+    const claude = getTarget('claude')!;
+    claude.install('global', { autoAllow: true });
+    const s = JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude', 'settings.json'), 'utf-8'));
+    expect(promptCommands(s)).not.toContain(HOOK_CMD);
+  });
+
+  it('claude: install with promptHook:true is idempotent (no duplicate, byte-identical re-run)', () => {
+    const claude = getTarget('claude')!;
+    const file = path.join(tmpHome, '.claude', 'settings.json');
+    claude.install('global', { autoAllow: true, promptHook: true });
+    const first = fs.readFileSync(file, 'utf-8');
+    claude.install('global', { autoAllow: true, promptHook: true });
+    expect(fs.readFileSync(file, 'utf-8')).toBe(first);
+    const s = JSON.parse(first);
+    expect(promptCommands(s).filter((c: string) => c === HOOK_CMD)).toHaveLength(1);
+  });
+
+  it('claude: install with promptHook:false strips a hook a prior install wrote (opt-out round-trips)', () => {
+    const claude = getTarget('claude')!;
+    claude.install('global', { autoAllow: true, promptHook: true });
+    claude.install('global', { autoAllow: true, promptHook: false });
+    const s = JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude', 'settings.json'), 'utf-8'));
+    expect(promptCommands(s)).not.toContain(HOOK_CMD);
+  });
+
+  it('claude: writePromptHookEntry preserves a sibling UserPromptSubmit hook', () => {
+    const file = seedSettings('global', {
+      hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'my-own-hook' }] }] },
+    });
+    expect(writePromptHookEntry('global').action).toBe('updated');
+    const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(promptCommands(s)).toEqual(['my-own-hook', HOOK_CMD]);
+  });
+
+  it('claude: writePromptHookEntry migrates the other platform\'s spelling in place (#1466 self-heal)', () => {
+    const file = seedSettings('global', {
+      hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: OTHER_PLATFORM_HOOK_CMD }] }] },
+    });
+    expect(writePromptHookEntry('global').action).toBe('updated');
+    const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(promptCommands(s)).toEqual([HOOK_CMD]);
+    // A re-run after migration is byte-identical.
+    const healed = fs.readFileSync(file, 'utf-8');
+    expect(writePromptHookEntry('global').action).toBe('unchanged');
+    expect(fs.readFileSync(file, 'utf-8')).toBe(healed);
+  });
+
+  it('claude: writePromptHookEntry leaves an npx-form hook untouched (no duplicate, no rewrite)', () => {
+    const npxCmd = 'npx @colbymchenry/codegraph prompt-hook';
+    const file = seedSettings('global', {
+      hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: npxCmd }] }] },
+    });
+    expect(writePromptHookEntry('global').action).toBe('unchanged');
+    const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(promptCommands(s)).toEqual([npxCmd]);
+  });
+
+  it('claude: uninstall removes the prompt hook but keeps the user\'s sibling', () => {
+    const file = seedSettings('global', {
+      hooks: {
+        UserPromptSubmit: [
+          { hooks: [{ type: 'command', command: HOOK_CMD }] },
+          { hooks: [{ type: 'command', command: 'my-own-hook' }] },
+        ],
+      },
+    });
+    getTarget('claude')!.uninstall('global');
+    const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(promptCommands(s)).toEqual(['my-own-hook']);
+  });
+
+  it('claude: removePromptHookEntry removes the other platform\'s spelling too', () => {
+    const file = seedSettings('global', {
+      hooks: {
+        UserPromptSubmit: [{ hooks: [{ type: 'command', command: OTHER_PLATFORM_HOOK_CMD }] }],
+      },
+    });
+    expect(removePromptHookEntry('global').action).toBe('removed');
+    const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(promptCommands(s)).toEqual([]);
+  });
+
+  it('claude: removePromptHookEntry leaves the legacy auto-sync hook untouched', () => {
+    const file = seedSettings('global', {
+      hooks: {
+        UserPromptSubmit: [{ hooks: [{ type: 'command', command: HOOK_CMD }] }],
+        Stop: [{ hooks: [{ type: 'command', command: 'codegraph sync-if-dirty' }] }],
+      },
+    });
+    expect(removePromptHookEntry('global').action).toBe('removed');
+    const s = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(promptCommands(s)).not.toContain(HOOK_CMD);
+    const stopCmds = (s.hooks?.Stop ?? []).flatMap((g: any) => (g.hooks ?? []).map((h: any) => h.command));
+    expect(stopCmds).toContain('codegraph sync-if-dirty');
   });
 });
 
@@ -1203,6 +1373,113 @@ describe('Installer targets — TOML serializer (Codex backbone)', () => {
     expect(content.match(/\[\[foo\]\]/g)?.length).toBe(2);
     expect(content).toContain('[mcp_servers.codegraph]');
   });
+
+  it('upsert replaces the managed table without consuming trailing array-of-tables siblings', () => {
+    const historyTables = [
+      '[[history]]',
+      'id = 1',
+      'note = "keep first"',
+      '',
+      '[[history]]',
+      'id = 2',
+      'note = "keep second"',
+      '',
+    ].join('\n');
+    const existing = [
+      '[mcp_servers.codegraph]',
+      'command = "old-codegraph"',
+      'args = ["old"]',
+      '',
+      historyTables,
+    ].join('\n');
+    const block = buildTomlTable('mcp_servers.codegraph', {
+      command: 'codegraph',
+      args: ['serve', '--mcp'],
+    });
+
+    const { content, action } = upsertTomlTable(existing, 'mcp_servers.codegraph', block);
+
+    expect(action).toBe('replaced');
+    expect(content).toBe(`${block}\n\n${historyTables}`);
+  });
+
+  it('remove preserves trailing array-of-tables siblings byte-for-byte', () => {
+    const historyTables = [
+      '[[history]]',
+      'id = 1',
+      'note = "keep first"',
+      '',
+      '[[history]]',
+      'id = 2',
+      'note = "keep second"',
+      '',
+    ].join('\n');
+    const existing = [
+      '[mcp_servers.codegraph]',
+      'command = "codegraph"',
+      'args = ["serve", "--mcp"]',
+      '',
+      historyTables,
+    ].join('\n');
+
+    const { content, action } = removeTomlTable(existing, 'mcp_servers.codegraph');
+
+    expect(action).toBe('removed');
+    expect(content).toBe(historyTables);
+  });
+
+  it.each([
+    ['table', '[ mcp_servers.other ]'],
+    ['array-of-tables', '[[ history ]]'],
+  ])('preserves a trailing %s header with inner whitespace', (_kind, siblingHeader) => {
+    const siblingTable = `${siblingHeader}\nvalue = "keep"\n`;
+    const existing = [
+      '[mcp_servers.codegraph]',
+      'command = "old-codegraph"',
+      'args = ["old"]',
+      '',
+      siblingTable,
+    ].join('\n');
+    const block = buildTomlTable('mcp_servers.codegraph', {
+      command: 'codegraph',
+      args: ['serve', '--mcp'],
+    });
+
+    const upserted = upsertTomlTable(existing, 'mcp_servers.codegraph', block);
+    const removed = removeTomlTable(existing, 'mcp_servers.codegraph');
+
+    expect(upserted.content).toBe(`${block}\n\n${siblingTable}`);
+    expect(removed.content).toBe(siblingTable);
+  });
+
+  it.each([
+    ['basic', '"""'],
+    ['literal', "'''"],
+  ])('ignores header-shaped text inside a multiline %s string', (_kind, delimiter) => {
+    const historyTable = '[[history]]\nid = 1\n';
+    const existing = [
+      '[mcp_servers.codegraph]',
+      'command = "old-codegraph"',
+      'args = [',
+      `  ${delimiter}first line`,
+      '[[not-a-table]]',
+      `last line${delimiter},`,
+      '  "serve",',
+      ']',
+      '',
+      historyTable,
+    ].join('\n');
+    const block = buildTomlTable('mcp_servers.codegraph', {
+      command: 'codegraph',
+      args: ['serve', '--mcp'],
+    });
+
+    const upserted = upsertTomlTable(existing, 'mcp_servers.codegraph', block);
+    const removed = removeTomlTable(existing, 'mcp_servers.codegraph');
+
+    expect(upserted.content).toBe(`${block}\n\n${historyTable}`);
+    expect(removed.content).toBe(historyTable);
+  });
 });
 
 describe('Installer — uninstallTargets sweep (codegraph uninstall)', () => {
@@ -1307,6 +1584,89 @@ describe('Installer — uninstallTargets sweep (codegraph uninstall)', () => {
   });
 });
 
+describe('Installer — refreshTargets sweep (codegraph install --refresh)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('rf-home');
+    tmpCwd = mkTmpDir('rf-cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  it('rewrites a stale instructions block a previous version left, and reports refreshed', () => {
+    const claude = getTarget('claude')!;
+    claude.install('global', { autoAllow: true });
+
+    // Simulate the file as an old install left it: same markers, the old
+    // multi-tool wording.
+    const claudeMd = path.join(tmpHome, '.claude', 'CLAUDE.md');
+    fs.writeFileSync(claudeMd, LEGACY_BLOCK + '\n');
+
+    const reports = refreshTargets([claude], 'global');
+    expect(reports[0].status).toBe('refreshed');
+    expect(reports[0].changedPaths).toContain(claudeMd);
+
+    const md = fs.readFileSync(claudeMd, 'utf-8');
+    expect(md).not.toContain('codegraph_search');
+    expect(md).toContain('codegraph_explore');
+  });
+
+  it('never performs a first install — unconfigured agents stay untouched', () => {
+    const reports = refreshTargets(ALL_TARGETS, 'global');
+    for (const t of ALL_TARGETS) {
+      const r = reports.find((x) => x.id === t.id)!;
+      expect(r.status).toBe(t.supportsLocation('global') ? 'not-configured' : 'unsupported');
+      expect(r.changedPaths).toEqual([]);
+      expect(t.detect('global').alreadyConfigured).toBe(false);
+    }
+  });
+
+  it('preserves the user\'s permission choices (refresh never writes permissions)', () => {
+    const claude = getTarget('claude')!;
+    claude.install('global', { autoAllow: true });
+
+    // The user has since trimmed the allowlist by hand.
+    const settingsPath = path.join(tmpHome, '.claude', 'settings.json');
+    const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+    settings.permissions.allow = [];
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+
+    refreshTargets([claude], 'global');
+
+    const after = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+    expect(after.permissions.allow).toEqual([]);
+  });
+
+  it('is idempotent — a second sweep on a current machine reports unchanged everywhere', () => {
+    for (const t of ALL_TARGETS) {
+      if (t.supportsLocation('global')) t.install('global', { autoAllow: true });
+    }
+    const first = refreshTargets(ALL_TARGETS, 'global');
+    // Fresh installs are already current, so even the first sweep may be
+    // all-unchanged; what matters is the second definitely is.
+    const second = refreshTargets(ALL_TARGETS, 'global');
+    for (const r of [...first, ...second]) {
+      expect(['unchanged', 'refreshed']).toContain(r.status);
+    }
+    for (const r of second) {
+      expect(r.status).toBe('unchanged');
+      expect(r.changedPaths).toEqual([]);
+    }
+  });
+});
+
 describe('Installer — Cursor rules file cleanup on uninstall', () => {
   let tmpHome: string;
   let tmpCwd: string;
@@ -1388,3 +1748,152 @@ function listAllFiles(dir: string): string[] {
   }
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// opencode global config path — XDG on every platform (#535)
+//
+// opencode resolves its config dir with `xdg-basedir`: XDG_CONFIG_HOME if
+// set, else ~/.config — on ALL platforms, Windows included. It never reads
+// %APPDATA%; we used to write there on Windows, so opencode never saw the
+// entry. The suite-wide setHome() points APPDATA and XDG_CONFIG_HOME at the
+// SAME directory (which is exactly how this bug stayed invisible), so these
+// tests deliberately split them.
+// ---------------------------------------------------------------------------
+describe('Installer targets — opencode XDG config path (#535)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+  let appDataDir: string; // distinct from ~/.config, like real Windows
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('home');
+    tmpCwd = mkTmpDir('cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+    appDataDir = path.join(tmpHome, 'AppData', 'Roaming');
+    process.env.APPDATA = appDataDir; // realistic split: APPDATA ≠ ~/.config
+    delete process.env.XDG_CONFIG_HOME; // default resolution: ~/.config
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  const xdgConfigFile = () => path.join(tmpHome, '.config', 'opencode', 'opencode.jsonc');
+  const legacyDir = () => path.join(appDataDir, 'opencode');
+  // NOTE: never match on an 'AppData' substring — on Windows os.tmpdir()
+  // itself lives under AppData\Local\Temp, so EVERY harness path contains
+  // it. Match on the legacy dir prefix instead.
+  const inLegacyDir = (p: string) => path.resolve(p).startsWith(path.resolve(legacyDir()) + path.sep);
+
+  it('global install writes to ~/.config/opencode, never %APPDATA% (#535)', () => {
+    const opencode = getTarget('opencode')!;
+    const result = opencode.install('global', { autoAllow: true });
+
+    const written = result.files.find((f) => f.path.endsWith('opencode.jsonc'))!;
+    expect(written.action).toBe('created');
+    expect(path.resolve(written.path)).toBe(path.resolve(xdgConfigFile()));
+    expect(fs.existsSync(xdgConfigFile())).toBe(true);
+    // Nothing of ours may land in the legacy location.
+    expect(fs.existsSync(legacyDir())).toBe(false);
+  });
+
+  it('greenfield: targets ~/.config/opencode even when the dir does not exist yet (#535)', () => {
+    // The rejected fallback design (#670) would send this install to
+    // %APPDATA% — where opencode would never find it. opencode creates
+    // ~/.config/opencode itself on first run; installing codegraph FIRST
+    // must land where opencode will look.
+    expect(fs.existsSync(path.join(tmpHome, '.config', 'opencode'))).toBe(false);
+    const opencode = getTarget('opencode')!;
+    const result = opencode.install('global', { autoAllow: true });
+    expect(path.resolve(result.files[0]!.path)).toBe(path.resolve(xdgConfigFile()));
+    expect(fs.existsSync(xdgConfigFile())).toBe(true);
+    expect(fs.existsSync(legacyDir())).toBe(false);
+  });
+
+  it('honors XDG_CONFIG_HOME for the global path, like opencode does', () => {
+    const custom = path.join(tmpHome, 'xdg-custom');
+    process.env.XDG_CONFIG_HOME = custom;
+    const opencode = getTarget('opencode')!;
+    const result = opencode.install('global', { autoAllow: true });
+    expect(path.resolve(result.files[0]!.path))
+      .toBe(path.resolve(path.join(custom, 'opencode', 'opencode.jsonc')));
+  });
+
+  it('install self-heals a pre-#535 %APPDATA% entry, preserving siblings and comments', () => {
+    // A previous codegraph version wrote into %APPDATA%/opencode. The user
+    // also has another MCP server and a comment there — those must survive.
+    fs.mkdirSync(legacyDir(), { recursive: true });
+    fs.writeFileSync(path.join(legacyDir(), 'opencode.jsonc'), [
+      '{',
+      '  // my servers',
+      '  "$schema": "https://opencode.ai/config.json",',
+      '  "mcp": {',
+      '    "codegraph": { "type": "local", "command": ["codegraph", "serve", "--mcp"], "enabled": true },',
+      '    "other": { "type": "local", "command": ["other"], "enabled": true }',
+      '  }',
+      '}',
+      '',
+    ].join('\n'));
+    fs.writeFileSync(path.join(legacyDir(), 'AGENTS.md'), LEGACY_BLOCK + '\n');
+
+    const opencode = getTarget('opencode')!;
+    const result = opencode.install('global', { autoAllow: true });
+
+    // New entry in the right place…
+    expect(fs.existsSync(xdgConfigFile())).toBe(true);
+    // …stale entry swept out of the legacy file, siblings + comment intact.
+    const legacyText = fs.readFileSync(path.join(legacyDir(), 'opencode.jsonc'), 'utf-8');
+    expect(legacyText).not.toContain('codegraph');
+    expect(legacyText).toContain('"other"');
+    expect(legacyText).toContain('// my servers');
+    // …and the legacy AGENTS.md — block-only, so emptied — removed outright
+    // (removeMarkedSection unlinks a file it leaves empty).
+    expect(fs.existsSync(path.join(legacyDir(), 'AGENTS.md'))).toBe(false);
+    // Both cleanups are reported.
+    const removed = result.files.filter((f) => f.action === 'removed').map((f) => f.path);
+    expect(removed.some((p) => inLegacyDir(p) && p.endsWith('opencode.jsonc'))).toBe(true);
+    expect(removed.some((p) => inLegacyDir(p) && p.endsWith('AGENTS.md'))).toBe(true);
+  });
+
+  it('uninstall sweeps the legacy %APPDATA% entry too (no prior re-install needed)', () => {
+    // A user on the broken version goes straight to `codegraph uninstall`:
+    // the only entry that exists is the stale %APPDATA% one.
+    fs.mkdirSync(legacyDir(), { recursive: true });
+    fs.writeFileSync(path.join(legacyDir(), 'opencode.json'),
+      '{\n  "mcp": {\n    "codegraph": { "type": "local", "command": ["codegraph", "serve", "--mcp"], "enabled": true }\n  }\n}\n');
+
+    const opencode = getTarget('opencode')!;
+    const result = opencode.uninstall('global');
+
+    expect(fs.readFileSync(path.join(legacyDir(), 'opencode.json'), 'utf-8')).not.toContain('codegraph');
+    expect(result.files.some((f) => f.action === 'removed' && inLegacyDir(f.path))).toBe(true);
+  });
+
+  it('install after install sweeps only once — second run reports no legacy changes', () => {
+    fs.mkdirSync(legacyDir(), { recursive: true });
+    fs.writeFileSync(path.join(legacyDir(), 'opencode.json'),
+      '{\n  "mcp": {\n    "codegraph": { "type": "local", "command": ["codegraph", "serve", "--mcp"], "enabled": true }\n  }\n}\n');
+
+    const opencode = getTarget('opencode')!;
+    const first = opencode.install('global', { autoAllow: true });
+    expect(first.files.some((f) => f.action === 'removed' && inLegacyDir(f.path))).toBe(true);
+
+    const second = opencode.install('global', { autoAllow: true });
+    expect(second.files.some((f) => inLegacyDir(f.path))).toBe(false);
+    expect(second.files.find((f) => f.path.endsWith('opencode.jsonc'))!.action).toBe('unchanged');
+  });
+
+  it('detects opencode as installed from a legacy-only %APPDATA% dir (so install can heal it)', () => {
+    fs.mkdirSync(legacyDir(), { recursive: true });
+    const opencode = getTarget('opencode')!;
+    expect(opencode.detect('global').installed).toBe(true);
+    // But configuration state is read from the REAL path only.
+    expect(opencode.detect('global').alreadyConfigured).toBe(false);
+  });
+});

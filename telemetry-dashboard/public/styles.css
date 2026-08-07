@@ -1,0 +1,345 @@
+/* Flat and editorial: square corners, hairline rules, sentence-case headings,
+   one oxblood accent. Matches getcodegraph.com.
+
+   No tiny all-caps tracked-out labels anywhere — panel titles are real headings
+   at a readable size, and the fine print under them is sentence case. */
+
+:root {
+  --paper: #f7f6f2;
+  --surface: #ffffff;
+  --ink: #16150f;
+  --secondary: #56534a;
+  --muted: #807d74;
+  --oxblood: #7a201a;
+  --rule: #d8d5cb;
+  --hairline: #e7e5de;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 24px;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: 'Archivo', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+.masthead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--rule);
+}
+
+h1 {
+  margin: 0 0 4px;
+  font-size: 22px;
+  font-weight: 600;
+}
+
+h2 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.subtitle {
+  margin: 0;
+  color: var(--secondary);
+}
+
+/* --- filter row --------------------------------------------------------- */
+
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 20px;
+  padding: 16px 0;
+  border-bottom: 1px solid var(--rule);
+}
+
+.filter-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.filter-end {
+  margin-left: auto;
+}
+
+.custom-range label {
+  color: var(--secondary);
+}
+
+.custom-range input {
+  padding: 7px 10px;
+  font: inherit;
+  font-size: 15px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 0;
+}
+
+.custom-range input:focus-visible,
+button:focus-visible {
+  outline: 2px solid var(--oxblood);
+  outline-offset: 1px;
+}
+
+.filter-status {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.filter-status .dot {
+  padding: 0 4px;
+}
+
+/* --- buttons ------------------------------------------------------------ */
+
+button {
+  padding: 8px 14px;
+  font: inherit;
+  font-size: 15px;
+  color: var(--paper);
+  background: var(--oxblood);
+  border: 1px solid var(--oxblood);
+  border-radius: 0;
+  cursor: pointer;
+}
+
+button.secondary,
+button.range {
+  color: var(--ink);
+  background: transparent;
+  border-color: var(--rule);
+}
+
+button.secondary:hover,
+button.range:hover {
+  border-color: var(--ink);
+}
+
+button.range.is-selected {
+  color: var(--paper);
+  background: var(--oxblood);
+  border-color: var(--oxblood);
+}
+
+button.link {
+  align-self: flex-start;
+  margin-top: 12px;
+  padding: 0;
+  color: var(--oxblood);
+  background: none;
+  border: none;
+  font-size: 14px;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* --- grid --------------------------------------------------------------- */
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(12, 1fr);
+  gap: 16px;
+  margin-top: 24px;
+}
+
+.span-3 { grid-column: span 3; }
+.span-4 { grid-column: span 4; }
+.span-6 { grid-column: span 6; }
+.span-8 { grid-column: span 8; }
+.span-12 { grid-column: span 12; }
+
+/* A laptop is the target; below that the columns just widen rather than
+   pretending to be a phone layout. */
+@media (max-width: 1180px) {
+  .span-3 { grid-column: span 6; }
+  .span-4,
+  .span-8 { grid-column: span 6; }
+}
+
+@media (max-width: 760px) {
+  .span-3,
+  .span-4,
+  .span-6,
+  .span-8 { grid-column: span 12; }
+}
+
+/* --- panels ------------------------------------------------------------- */
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+}
+
+.panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.panel-figure {
+  margin: 0;
+  color: var(--secondary);
+  font-size: 14px;
+  white-space: nowrap;
+}
+
+.panel-note {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.panel-body {
+  flex: 1;
+  margin-top: 12px;
+  /* Refetch dims the previous render instead of tearing it down — no skeleton
+     flash, no layout jump. */
+  transition: opacity 120ms ease-out;
+}
+
+.panel[data-stale='true'] .panel-body {
+  opacity: 0.55;
+}
+
+.panel-state {
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.panel[data-state='ready'] .panel-state {
+  display: none;
+}
+
+.panel[data-state='error'] .panel-state {
+  color: var(--oxblood);
+}
+
+/* Until a panel has data there is nothing to show but its state line. */
+.panel:not([data-state='ready']) .chart-wrap,
+.panel:not([data-state='ready']) .stat,
+.panel:not([data-state='ready']) .funnel {
+  display: none;
+}
+
+/* Height covers the plot AND the axis band, so a panel never grows its own
+   little scrollbar. */
+.chart-wrap {
+  position: relative;
+  height: 232px;
+}
+
+/* --- stat tiles --------------------------------------------------------- */
+
+.stat-value {
+  margin: 4px 0 0;
+  font-size: 40px;
+  font-weight: 600;
+  line-height: 1.1;
+  /* Proportional figures on purpose: tabular-nums makes a number like 121 look
+     loose at display sizes. Tabular is for the table below. */
+}
+
+.stat-caption {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+/* --- funnel ------------------------------------------------------------- */
+
+.funnel-stage + .funnel-stage {
+  margin-top: 16px;
+}
+
+.funnel-label {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--secondary);
+  font-size: 14px;
+}
+
+.funnel-value {
+  color: var(--ink);
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.funnel-track {
+  height: 10px;
+  margin-top: 6px;
+  background: var(--hairline);
+}
+
+.funnel-fill {
+  height: 100%;
+  background: var(--oxblood);
+}
+
+.funnel-summary {
+  margin: 16px 0 0;
+  color: var(--secondary);
+  font-size: 14px;
+}
+
+/* --- table twins -------------------------------------------------------- */
+
+.table-wrap {
+  margin-top: 12px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.table-wrap table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+  /* Columns of numbers that align vertically — the one place tabular figures
+     are the right call. */
+  font-variant-numeric: tabular-nums;
+}
+
+.table-wrap th,
+.table-wrap td {
+  padding: 5px 8px 5px 0;
+  text-align: left;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.table-wrap thead th {
+  position: sticky;
+  top: 0;
+  background: var(--surface);
+  color: var(--secondary);
+  font-weight: 600;
+}
+
+.table-wrap tbody th {
+  font-weight: 400;
+}
+
+.table-wrap td {
+  color: var(--secondary);
+}

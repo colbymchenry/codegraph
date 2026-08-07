@@ -1,0 +1,11 @@
+<?php
+
+const MODULE_MAX = 25;
+
+/**
+ * @Implements hook_cron().
+ */
+function torture_cron() {
+  $v = MODULE_MAX;
+  other_module_call();
+}
