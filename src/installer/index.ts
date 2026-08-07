@@ -147,8 +147,8 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
       const sel = await clack.select({
         message: 'Apply agent configs to all your projects, or just this one?',
         options: [
-          { value: 'global' as const, label: 'All projects', hint: '~/.claude, ~/.cursor, etc.' },
-          { value: 'local'  as const, label: 'Just this project', hint: './.claude, ./.cursor, etc.' },
+          { value: 'global' as const, label: 'All projects', hint: '~/.claude, ~/.cursor, ~/.copilot, etc.' },
+          { value: 'local'  as const, label: 'Just this project', hint: './.claude, ./.cursor, ./.mcp.json, etc.' },
         ],
         initialValue: 'global' as const,
       });

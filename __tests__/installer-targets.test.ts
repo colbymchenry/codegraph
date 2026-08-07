@@ -1120,6 +1120,127 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(fs.readFileSync(file, 'utf-8')).toBe(firstPass);
   });
 
+  it('copilot: global install writes ~/.copilot/mcp-config.json with type "local" + tools ["*"]', () => {
+    const copilot = getTarget('copilot')!;
+    const result = copilot.install('global', { autoAllow: true });
+    const mcp = path.join(tmpHome, '.copilot', 'mcp-config.json');
+    expect(result.files.some((f) => f.path === mcp)).toBe(true);
+
+    const cfg = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toEqual({
+      type: 'local',
+      command: 'codegraph',
+      args: ['serve', '--mcp'],
+      tools: ['*'],
+    });
+  });
+
+  it('copilot: local install writes ./.mcp.json with type "stdio" (no tools field)', () => {
+    const copilot = getTarget('copilot')!;
+    const result = copilot.install('local', { autoAllow: true });
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    // macOS realpath: use suffix match like the kiro local test.
+    expect(paths.some((p) => p.endsWith('/.mcp.json'))).toBe(true);
+
+    const mcpFile = path.join(tmpCwd, '.mcp.json');
+    const cfg = JSON.parse(fs.readFileSync(mcpFile, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toEqual({
+      type: 'stdio',
+      command: 'codegraph',
+      args: ['serve', '--mcp'],
+    });
+    // No `tools` field in local config — it's shared with Claude Code.
+    expect(cfg.mcpServers.codegraph.tools).toBeUndefined();
+  });
+
+  it('copilot: global install creates ~/.copilot/ directory if missing', () => {
+    const copilot = getTarget('copilot')!;
+    const copilotDir = path.join(tmpHome, '.copilot');
+    expect(fs.existsSync(copilotDir)).toBe(false);
+
+    copilot.install('global', { autoAllow: true });
+
+    expect(fs.existsSync(copilotDir)).toBe(true);
+    expect(fs.existsSync(path.join(copilotDir, 'mcp-config.json'))).toBe(true);
+  });
+
+  it('copilot: install preserves a pre-existing sibling MCP server in mcp-config.json', () => {
+    const copilot = getTarget('copilot')!;
+    const mcp = path.join(tmpHome, '.copilot', 'mcp-config.json');
+    fs.mkdirSync(path.dirname(mcp), { recursive: true });
+    fs.writeFileSync(mcp, JSON.stringify({
+      mcpServers: { 'other-server': { type: 'local', command: 'other', args: [] } },
+    }, null, 2) + '\n');
+
+    copilot.install('global', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    expect(after.mcpServers['other-server']).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeDefined();
+  });
+
+  it('copilot: uninstall strips codegraph but leaves sibling MCP servers intact', () => {
+    const copilot = getTarget('copilot')!;
+    const mcp = path.join(tmpHome, '.copilot', 'mcp-config.json');
+    fs.mkdirSync(path.dirname(mcp), { recursive: true });
+    fs.writeFileSync(mcp, JSON.stringify({
+      mcpServers: { 'other-server': { type: 'local', command: 'other', args: [] } },
+    }, null, 2) + '\n');
+
+    copilot.install('global', { autoAllow: true });
+    copilot.uninstall('global');
+
+    const after = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    expect(after.mcpServers['other-server']).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeUndefined();
+  });
+
+  it('copilot: re-running global install is idempotent', () => {
+    const copilot = getTarget('copilot')!;
+    copilot.install('global', { autoAllow: true });
+    const first = fs.readFileSync(path.join(tmpHome, '.copilot', 'mcp-config.json'), 'utf-8');
+
+    const second = copilot.install('global', { autoAllow: true });
+    for (const f of second.files) {
+      expect(f.action).toBe('unchanged');
+    }
+    expect(fs.readFileSync(path.join(tmpHome, '.copilot', 'mcp-config.json'), 'utf-8')).toBe(first);
+  });
+
+  it('copilot: re-running local install is idempotent', () => {
+    const copilot = getTarget('copilot')!;
+    copilot.install('local', { autoAllow: true });
+    const first = fs.readFileSync(path.join(tmpCwd, '.mcp.json'), 'utf-8');
+
+    const second = copilot.install('local', { autoAllow: true });
+    for (const f of second.files) {
+      expect(f.action).toBe('unchanged');
+    }
+    expect(fs.readFileSync(path.join(tmpCwd, '.mcp.json'), 'utf-8')).toBe(first);
+  });
+
+  it('copilot: uninstall on a clean slate reports not-found', () => {
+    const copilot = getTarget('copilot')!;
+    const result = copilot.uninstall('global');
+    expect(result.files[0].action).toBe('not-found');
+  });
+
+  it('copilot: printConfig outputs valid JSON with the correct entry shape', () => {
+    const copilot = getTarget('copilot')!;
+    const globalOut = copilot.printConfig('global');
+    // printConfig uses os.homedir() → absolute path in tests; just check suffix.
+    expect(globalOut).toContain('.copilot/mcp-config.json');
+    const globalJson = JSON.parse(globalOut.split('\n').filter((l) => !l.startsWith('#')).join('\n').trim());
+    expect(globalJson.mcpServers.codegraph.type).toBe('local');
+    expect(globalJson.mcpServers.codegraph.tools).toEqual(['*']);
+
+    const localOut = copilot.printConfig('local');
+    expect(localOut).toContain('.mcp.json');
+    const localJson = JSON.parse(localOut.split('\n').filter((l) => !l.startsWith('#')).join('\n').trim());
+    expect(localJson.mcpServers.codegraph.type).toBe('stdio');
+    expect(localJson.mcpServers.codegraph.tools).toBeUndefined();
+  });
+
   it('claude: uninstall strips stale hooks written in the npx form (local)', () => {
     const claude = getTarget('claude')!;
     const file = seedSettings('local', {
@@ -1268,6 +1389,7 @@ describe('Installer targets — registry', () => {
     expect(getTarget('gemini')?.id).toBe('gemini');
     expect(getTarget('antigravity')?.id).toBe('antigravity');
     expect(getTarget('kiro')?.id).toBe('kiro');
+    expect(getTarget('copilot')?.id).toBe('copilot');
     expect(getTarget('not-a-real-target')).toBeUndefined();
   });
 
