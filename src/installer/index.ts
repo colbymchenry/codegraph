@@ -16,8 +16,8 @@ import { execSync } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import {
-  ALL_TARGETS,
   detectAll,
+  getAllTargets,
   getTarget,
   resolveTargetFlag,
 } from './targets/registry';
@@ -487,7 +487,7 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
   if (opts.target !== undefined) {
     targets = resolveTargetFlag(opts.target, location);
   } else {
-    targets = [...ALL_TARGETS];
+    targets = getAllTargets();
   }
   if (targets.length === 0) {
     clack.outro('No agent targets selected — nothing to do.');
@@ -624,7 +624,7 @@ async function resolveTargets(
 
   const choice = await clack.multiselect<string>({
     message: 'Which agents should CodeGraph configure?',
-    options: ALL_TARGETS.map((t) => {
+    options: getAllTargets().map((t) => {
       const det = detected.find(({ target }) => target.id === t.id)!.detection;
       const flag = det.installed ? '(detected)' : '(not found)';
       const globalOnly = !t.supportsLocation('local') ? ' — global only' : '';

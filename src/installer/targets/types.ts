@@ -15,11 +15,20 @@
 export type Location = 'global' | 'local';
 
 /**
- * Stable string id used in the `--target` CLI flag and the registry
- * lookup. New targets add a value here when they're added to the
- * registry. Keep these short and lowercase.
+ * Ids of the targets compiled into the registry. New built-in targets
+ * add a value here when they're added to `registry.ts`. Keep these
+ * short and lowercase.
  */
-export type TargetId = 'claude' | 'cursor' | 'codex' | 'opencode' | 'hermes' | 'gemini' | 'antigravity' | 'kiro';
+export type BuiltinTargetId = 'claude' | 'cursor' | 'codex' | 'opencode' | 'hermes' | 'gemini' | 'antigravity' | 'kiro';
+
+/**
+ * Stable string id used in the `--target` CLI flag and the registry
+ * lookup. Widened from the builtin union to `string` for user-defined
+ * custom targets (`targets/custom.ts`) — validation of custom ids
+ * (shape, reserved words, builtin collisions) happens at spec load,
+ * not in the type system.
+ */
+export type TargetId = string;
 
 /**
  * Result of `target.detect(location)`.

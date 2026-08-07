@@ -15,6 +15,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `codegraph_explore` no longer re-sends source it already returned earlier in the same conversation. A file it has already shown you comes back as a short pointer — the path, the symbols and the exact line range, with confirmation that the file hasn't changed since — and the space that frees is spent on code you haven't seen yet, so a follow-up call covers new ground instead of repeating the last one. If a file was edited in between, its source is always shown again in full. Set `CODEGRAPH_EXPLORE_DEDUP=0` to turn this off.
 
+- You can now wire CodeGraph into agents that don't have a built-in installer target. `codegraph targets add <spec.json>` registers a custom target from a small declarative spec — pick one of three supported config styles (opencode-style `.jsonc`, Codex-style TOML, or the standard `mcpServers` JSON used by Claude Code / Cursor / Gemini) and name the agent's config paths — and from then on `codegraph install --target <id>`, auto-detection, the interactive agent picker, and `codegraph uninstall` all treat it exactly like a built-in. `codegraph targets list` and `codegraph targets remove` manage registrations. This covers opencode forks such as CoDev Code (#1272), TOML-config agents such as Grok Build (#1324, #1396), and Gemini-style agents such as Qwen Code (#968) without waiting for a new CodeGraph release.
+- Custom `mcpServers`-style targets can now omit the `type` field from the server entry, covering agents such as Windsurf whose config expects a `command`/`args`-only entry (#952).
+
 ### Fixes
 
 - `codegraph_explore` now concentrates its answer on the code that actually answers your question instead of spreading it across files that merely share a word with it, so more of the answer arrives in a single call. Thanks @LeDuyViet for the detailed measurements and reproduction. (#1500)
