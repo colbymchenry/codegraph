@@ -27,7 +27,12 @@ import { supervisionLostReason } from './ppid-watchdog';
 import { armStartupHandshakeTimeout } from './startup-handshake';
 import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { CodeGraphPackageVersion } from './version';
-import { SERVER_INFO, PROTOCOL_VERSION, initializeInstructions } from './session';
+import {
+  SERVER_INFO,
+  STDIO_PROTOCOL_VERSION,
+  initializeInstructions,
+  negotiateProtocolVersion,
+} from './session';
 import { SERVER_INSTRUCTIONS } from './server-instructions';
 import { getStaticTools } from './tools';
 import { ExploreSessionState } from './explore-session-state';
@@ -307,14 +312,26 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
       let msg: JsonRpc; try { msg = JSON.parse(line) as JsonRpc; } catch { routeToDaemon(line); continue; }
       if (msg.method === 'initialize') {
         clientInitId = msg.id;
-        const initParams = (msg.params ?? {}) as { clientInfo?: { name?: unknown; version?: unknown } };
+        const initParams = (msg.params ?? {}) as {
+          protocolVersion?: unknown;
+          clientInfo?: { name?: unknown; version?: unknown };
+        };
         if (initParams.clientInfo) {
           telemetryClient = {
             name: typeof initParams.clientInfo.name === 'string' ? initParams.clientInfo.name : undefined,
             version: typeof initParams.clientInfo.version === 'string' ? initParams.clientInfo.version : undefined,
           };
         }
-        writeClient({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: SERVER_INFO, instructions: initializeInstructions(SERVER_INSTRUCTIONS) } });
+        writeClient({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: {
+            protocolVersion: negotiateProtocolVersion(initParams.protocolVersion, STDIO_PROTOCOL_VERSION),
+            capabilities: { tools: {} },
+            serverInfo: SERVER_INFO,
+            instructions: initializeInstructions(SERVER_INSTRUCTIONS),
+          },
+        });
         routeToDaemon(line); // prime the daemon so it resolves the project (its reply is suppressed below)
       } else if (msg.method === 'tools/list') {
         writeClient({ jsonrpc: '2.0', id: msg.id, result: { tools: getStaticTools() } });

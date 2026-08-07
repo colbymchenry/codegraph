@@ -18,6 +18,13 @@ The interactive installer auto-detects and configures each supported agent — w
 
 Run `npx @colbymchenry/codegraph` and pick your agent(s); see [Installation](/codegraph/getting-started/installation/) for the non-interactive flags.
 
+To configure agents for an already-running Streamable HTTP MCP server instead
+of stdio, run:
+
+```bash
+codegraph install --target=all --transport=http --mcp-url=http://127.0.0.1:3333/mcp
+```
+
 ## Manual setup
 
 If you'd rather wire it up yourself, install globally:
@@ -35,6 +42,25 @@ Add the MCP server to `~/.claude.json`:
       "type": "stdio",
       "command": "codegraph",
       "args": ["serve", "--mcp"]
+    }
+  }
+}
+```
+
+For HTTP MCP, start the server with a fixed indexed project path:
+
+```bash
+codegraph serve --mcp --transport http --path /absolute/path/to/project
+```
+
+Then configure the client with its HTTP form. For example, Claude Code uses:
+
+```json
+{
+  "mcpServers": {
+    "codegraph": {
+      "type": "http",
+      "url": "http://127.0.0.1:3333/mcp"
     }
   }
 }

@@ -21,7 +21,7 @@ import {
   getTarget,
   resolveTargetFlag,
 } from './targets/registry';
-import type { AgentTarget, Location, TargetId } from './targets/types';
+import type { AgentTarget, Location, McpInstallOptions, TargetId } from './targets/types';
 // Import the lightweight submodules directly (not the ../sync barrel, which
 // re-exports FileWatcher and would transitively pull in ../extraction — the
 // installer must stay importable even when native modules can't load).
@@ -71,6 +71,8 @@ export interface RunInstallerOptions {
    * autoAllow=true, target=auto. For scripting / CI.
    */
   yes?: boolean;
+  /** MCP transport/config written into agent configs. Defaults to stdio. */
+  mcp?: McpInstallOptions;
 }
 
 /**
@@ -105,7 +107,9 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
   // matches existing behavior). Skipped when --yes (assume present).
   if (!useDefaults) {
     const shouldInstallGlobally = await clack.confirm({
-      message: 'Install the codegraph CLI on your PATH? (Required so agents can launch the MCP server)',
+      message: opts.mcp?.transport === 'http'
+        ? 'Install the codegraph CLI on your PATH? (Useful for starting the HTTP MCP server)'
+        : 'Install the codegraph CLI on your PATH? (Required so agents can launch the MCP server)',
       initialValue: true,
     });
     if (clack.isCancel(shouldInstallGlobally)) {
@@ -240,7 +244,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
       );
       continue;
     }
-    const result = target.install(location, { autoAllow, promptHook });
+    const result = target.install(location, { autoAllow, promptHook, mcp: opts.mcp });
     installedIds.push(target.id);
     for (const file of result.files) {
       if (file.action === 'created') sawCreated = true;
@@ -263,8 +267,16 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     getTelemetry().recordLifecycle('install', {
       targets: installedIds,
       scope: location,
+      transport: opts.mcp?.transport ?? 'stdio',
       kind: sawCreated ? 'fresh' : sawUpdated ? 'upgrade' : 'reinstall',
     });
+  }
+
+  if (opts.mcp?.transport === 'http') {
+    clack.note(
+      `codegraph serve --mcp --transport http --path <indexed-project> --port 3333`,
+      'Start the HTTP MCP server',
+    );
   }
 
   // Step 5½: CodeGraph Pro beta opt-in — the same waitlist as the
@@ -417,6 +429,7 @@ export interface RefreshReport {
 export function refreshTargets(
   targets: readonly AgentTarget[],
   location: Location,
+  opts: { mcp?: McpInstallOptions } = {},
 ): RefreshReport[] {
   return targets.map((target) => {
     const base = { id: target.id, displayName: target.displayName, location };
@@ -426,7 +439,7 @@ export function refreshTargets(
     if (!target.detect(location).alreadyConfigured) {
       return { ...base, status: 'not-configured' as const, changedPaths: [] };
     }
-    const result = target.install(location, { autoAllow: false, promptHook: undefined });
+    const result = target.install(location, { autoAllow: false, promptHook: undefined, mcp: opts.mcp });
     const changedPaths = result.files
       .filter((f) => f.action === 'created' || f.action === 'updated' || f.action === 'removed')
       .map((f) => f.path);

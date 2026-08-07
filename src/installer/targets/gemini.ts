@@ -33,8 +33,10 @@ import {
   WriteResult,
 } from './types';
 import {
+  authHeaders,
   getMcpServerConfig,
   jsonDeepEqual,
+  normalizeMcpInstallOptions,
   readJsonFile,
   removeMarkedSection,
   writeJsonFile,
@@ -81,9 +83,9 @@ class GeminiTarget implements AgentTarget {
     return { installed, alreadyConfigured, configPath: file };
   }
 
-  install(loc: Location, _opts: InstallOptions): WriteResult {
+  install(loc: Location, opts: InstallOptions): WriteResult {
     const files: WriteResult['files'] = [];
-    files.push(writeMcpEntry(loc));
+    files.push(writeMcpEntry(loc, opts));
 
     // GEMINI.md gets the short marker-fenced CodeGraph block (#704):
     // subagents and non-MCP harnesses read GEMINI.md but never the MCP
@@ -117,9 +119,9 @@ class GeminiTarget implements AgentTarget {
     return { files };
   }
 
-  printConfig(loc: Location): string {
+  printConfig(loc: Location, opts?: { mcp?: InstallOptions['mcp'] }): string {
     const target = settingsJsonPath(loc);
-    const snippet = JSON.stringify({ mcpServers: { codegraph: getMcpServerConfig() } }, null, 2);
+    const snippet = JSON.stringify({ mcpServers: { codegraph: buildGeminiMcpConfig(opts?.mcp) } }, null, 2);
     return `# Add to ${target}\n\n${snippet}\n`;
   }
 
@@ -128,14 +130,25 @@ class GeminiTarget implements AgentTarget {
   }
 }
 
-function writeMcpEntry(loc: Location): WriteResult['files'][number] {
+function buildGeminiMcpConfig(opts?: InstallOptions['mcp']): Record<string, any> {
+  const normalized = normalizeMcpInstallOptions(opts);
+  if (normalized.transport === 'http') {
+    return {
+      httpUrl: normalized.url,
+      ...(normalized.tokenEnvVar ? { headers: authHeaders(normalized.tokenEnvVar) } : {}),
+    };
+  }
+  return getMcpServerConfig(opts);
+}
+
+function writeMcpEntry(loc: Location, opts: InstallOptions): WriteResult['files'][number] {
   const file = settingsJsonPath(loc);
   const dir = path.dirname(file);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
   const existing = readJsonFile(file);
   const before = existing.mcpServers?.codegraph;
-  const after = getMcpServerConfig();
+  const after = buildGeminiMcpConfig(opts.mcp);
 
   if (jsonDeepEqual(before, after)) {
     return { path: file, action: 'unchanged' };

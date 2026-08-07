@@ -55,8 +55,28 @@ export function initializeInstructions(base: string, notice: string | null = get
   );
 }
 
-/** MCP Protocol Version (latest the server claims). */
-export const PROTOCOL_VERSION = '2024-11-05';
+export const STDIO_PROTOCOL_VERSION = '2024-11-05';
+export const STREAMABLE_HTTP_PROTOCOL_VERSION = '2025-03-26';
+export const SUPPORTED_STDIO_PROTOCOL_VERSIONS = [
+  STREAMABLE_HTTP_PROTOCOL_VERSION,
+  STDIO_PROTOCOL_VERSION,
+] as const;
+export const SUPPORTED_STREAMABLE_HTTP_PROTOCOL_VERSIONS = [
+  STREAMABLE_HTTP_PROTOCOL_VERSION,
+] as const;
+
+/** Back-compat alias for the stdio/default protocol version. */
+export const PROTOCOL_VERSION = STDIO_PROTOCOL_VERSION;
+
+export function negotiateProtocolVersion(
+  requested: unknown,
+  defaultVersion = STDIO_PROTOCOL_VERSION,
+  supported: readonly string[] = SUPPORTED_STDIO_PROTOCOL_VERSIONS,
+): string {
+  return typeof requested === 'string' && supported.includes(requested)
+    ? requested
+    : defaultVersion;
+}
 
 /**
  * How long to wait for the client's `roots/list` response before giving up
@@ -98,6 +118,20 @@ export interface MCPSessionOptions {
    * where the project lives.
    */
   explicitProjectPath?: string | null;
+  /**
+   * Prefer the server-provided explicit project path over client workspace
+   * hints from initialize/rootUri and roots/list. This is for remote/gateway
+   * transports where the client's local filesystem paths do not exist on the
+   * server and would otherwise steer queries away from the indexed project.
+   */
+  preferExplicitProjectPath?: boolean;
+  /**
+   * Transport-specific protocol negotiation defaults. stdio keeps the legacy
+   * 2024-11-05 default; Streamable HTTP defaults to 2025-03-26 because its
+   * session header semantics do not exist in the 2024 HTTP+SSE transport.
+   */
+  defaultProtocolVersion?: string;
+  supportedProtocolVersions?: readonly string[];
 }
 
 /**
@@ -111,6 +145,12 @@ export class MCPSession {
   private rootsAttempted = false;
   private resolvePromise: Promise<void> | null = null;
   private explicitProjectPath: string | null;
+
+  private preferExplicitProjectPath: boolean;
+  private defaultProtocolVersion: string;
+  private supportedProtocolVersions: readonly string[];
+  private protocolVersion: string;
+
   /**
    * What `codegraph_explore` has already returned to THIS client, per project
    * (CG-17). Owned by the session, not the engine: the daemon shares one engine
@@ -127,6 +167,10 @@ export class MCPSession {
     opts: MCPSessionOptions = {},
   ) {
     this.explicitProjectPath = opts.explicitProjectPath ?? null;
+    this.preferExplicitProjectPath = opts.preferExplicitProjectPath ?? false;
+    this.defaultProtocolVersion = opts.defaultProtocolVersion ?? STDIO_PROTOCOL_VERSION;
+    this.supportedProtocolVersions = opts.supportedProtocolVersions ?? SUPPORTED_STDIO_PROTOCOL_VERSIONS;
+    this.protocolVersion = this.defaultProtocolVersion;
   }
 
   /**
@@ -150,6 +194,8 @@ export class MCPSession {
     return this.transport;
   }
 
+  getProtocolVersion(): string {
+    return this.protocolVersion;
   /**
    * This session's explore call history (CG-17). Exposed so tests can assert
    * that two sessions on one daemon keep separate state; nothing in the server
@@ -205,9 +251,16 @@ export class MCPSession {
     const params = request.params as {
       rootUri?: string;
       workspaceFolders?: Array<{ uri: string; name: string }>;
+      protocolVersion?: unknown;
       capabilities?: { roots?: unknown };
       clientInfo?: { name?: unknown; version?: unknown };
     } | undefined;
+
+    this.protocolVersion = negotiateProtocolVersion(
+      params?.protocolVersion,
+      this.defaultProtocolVersion,
+      this.supportedProtocolVersions,
+    );
 
     this.clientSupportsRoots = !!params?.capabilities?.roots;
     if (params?.clientInfo) {
@@ -222,7 +275,9 @@ export class MCPSession {
     // with. cwd is NOT used here — we defer it so a roots/list answer can
     // win over it. See issue #196.
     let explicitPath: string | null = null;
-    if (params?.rootUri) {
+    if (this.preferExplicitProjectPath && this.explicitProjectPath) {
+      explicitPath = this.explicitProjectPath;
+    } else if (params?.rootUri) {
       explicitPath = fileUriToPath(params.rootUri);
     } else if (params?.workspaceFolders?.[0]?.uri) {
       explicitPath = fileUriToPath(params.workspaceFolders[0].uri);
@@ -245,7 +300,7 @@ export class MCPSession {
 
     // Respond to the handshake BEFORE doing any heavy init — see issue #172.
     this.transport.sendResult(request.id, {
-      protocolVersion: PROTOCOL_VERSION,
+      protocolVersion: this.protocolVersion,
       capabilities: { tools: {} },
       serverInfo: SERVER_INFO,
       instructions: initializeInstructions(indexed ? SERVER_INSTRUCTIONS : SERVER_INSTRUCTIONS_NO_ROOT_INDEX),

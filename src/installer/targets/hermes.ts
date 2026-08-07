@@ -24,7 +24,7 @@ import {
   Location,
   WriteResult,
 } from './types';
-import { atomicWriteFileSync } from './shared';
+import { atomicWriteFileSync, normalizeMcpInstallOptions } from './shared';
 
 type LineRange = { start: number; end: number };
 
@@ -51,7 +51,7 @@ class HermesTarget implements AgentTarget {
     };
   }
 
-  install(loc: Location, _opts: InstallOptions): WriteResult {
+  install(loc: Location, opts: InstallOptions): WriteResult {
     if (loc !== 'global') {
       return {
         files: [],
@@ -59,7 +59,7 @@ class HermesTarget implements AgentTarget {
       };
     }
     return {
-      files: [writeHermesConfig()],
+      files: [writeHermesConfig(opts)],
       notes: ['Start a new Hermes session for MCP changes to take effect.'],
     };
   }
@@ -80,14 +80,14 @@ class HermesTarget implements AgentTarget {
     return { files: [{ path: file, action: 'removed' }] };
   }
 
-  printConfig(loc: Location): string {
+  printConfig(loc: Location, opts?: { mcp?: InstallOptions['mcp'] }): string {
     if (loc !== 'global') {
       return '# Hermes Agent uses $HERMES_HOME/config.yaml; use --location=global.\n';
     }
     return [
       `# Add to ${configPath()}`,
       '',
-      renderCodeGraphMcpBlock().join('\n'),
+      renderCodeGraphMcpBlock(opts?.mcp).join('\n'),
       '',
       'platform_toolsets:',
       '  cli:',
@@ -120,11 +120,11 @@ function readText(file: string): string {
   }
 }
 
-function writeHermesConfig(): WriteResult['files'][number] {
+function writeHermesConfig(opts: InstallOptions): WriteResult['files'][number] {
   const file = configPath();
   const existed = fs.existsSync(file);
   const before = readText(file);
-  const afterMcp = upsertCodeGraphMcpServer(before);
+  const afterMcp = upsertCodeGraphMcpServer(before, opts.mcp);
   const after = upsertCodeGraphToolset(afterMcp);
 
   if (after === before) {
@@ -249,7 +249,21 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function renderCodeGraphMcpChild(): string[] {
+function renderCodeGraphMcpChild(opts?: InstallOptions['mcp']): string[] {
+  const normalized = normalizeMcpInstallOptions(opts);
+  if (normalized.transport === 'http') {
+    const lines = [
+      '  codegraph:',
+      `    url: "${normalized.url}"`,
+      '    timeout: 120',
+      '    connect_timeout: 60',
+      '    enabled: true',
+    ];
+    if (normalized.tokenEnvVar) {
+      lines.splice(2, 0, '    headers:', `      Authorization: "Bearer \${${normalized.tokenEnvVar}}"`);
+    }
+    return lines;
+  }
   return [
     '  codegraph:',
     '    command: codegraph',
@@ -262,8 +276,8 @@ function renderCodeGraphMcpChild(): string[] {
   ];
 }
 
-function renderCodeGraphMcpBlock(): string[] {
-  return ['mcp_servers:', ...renderCodeGraphMcpChild()];
+function renderCodeGraphMcpBlock(opts?: InstallOptions['mcp']): string[] {
+  return ['mcp_servers:', ...renderCodeGraphMcpChild(opts)];
 }
 
 function hasCodeGraphMcpServer(content: string): boolean {
@@ -272,16 +286,16 @@ function hasCodeGraphMcpServer(content: string): boolean {
   return !!parent && !!childRange(lines, parent, 'codegraph');
 }
 
-function upsertCodeGraphMcpServer(content: string): string {
+function upsertCodeGraphMcpServer(content: string, opts?: InstallOptions['mcp']): string {
   const lines = splitLines(content);
   const parent = topLevelRange(lines, 'mcp_servers');
   const child = parent ? childRange(lines, parent, 'codegraph') : null;
-  const replacement = renderCodeGraphMcpChild();
+  const replacement = renderCodeGraphMcpChild(opts);
 
   if (!parent) {
     if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
     if (lines.length > 0) lines.push('');
-    lines.push(...renderCodeGraphMcpBlock());
+    lines.push(...renderCodeGraphMcpBlock(opts));
     return joinLines(lines);
   }
 

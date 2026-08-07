@@ -25,11 +25,13 @@
  * supported: string, string[]. Other types throw — the codex MCP
  * config only needs these two.
  */
-export function serializeTomlTableBody(values: Record<string, string | string[]>): string {
+export function serializeTomlTableBody(values: Record<string, string | boolean | string[]>): string {
   const lines: string[] = [];
   for (const [key, value] of Object.entries(values)) {
     if (typeof value === 'string') {
       lines.push(`${key} = ${quoteString(value)}`);
+    } else if (typeof value === 'boolean') {
+      lines.push(`${key} = ${value ? 'true' : 'false'}`);
     } else if (Array.isArray(value) && value.every((v) => typeof v === 'string')) {
       const parts = value.map(quoteString).join(', ');
       lines.push(`${key} = [${parts}]`);
@@ -50,7 +52,7 @@ function quoteString(s: string): string {
  * Build a full table block: header line + body. Suitable for direct
  * insertion into a TOML file.
  */
-export function buildTomlTable(header: string, values: Record<string, string | string[]>): string {
+export function buildTomlTable(header: string, values: Record<string, string | boolean | string[]>): string {
   return `[${header}]\n${serializeTomlTableBody(values)}`;
 }
 

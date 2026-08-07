@@ -528,6 +528,7 @@ function sleep(ms: number): Promise<void> {
 // Export for use in CLI
 export { StdioTransport } from './transport';
 export { tools, ToolHandler } from './tools';
+export { HttpMCPServer } from './http-server';
 // Surface a few daemon-mode bits for tests + diagnostics.
 export { Daemon } from './daemon';
 export { CodeGraphPackageVersion } from './version';

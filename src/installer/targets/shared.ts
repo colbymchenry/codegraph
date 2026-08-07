@@ -15,18 +15,63 @@ import {
   CODEGRAPH_SECTION_START,
   CODEGRAPH_SECTION_END,
 } from '../instructions-template';
+import type { McpInstallOptions, McpTransport } from './types';
+
+export const DEFAULT_MCP_HTTP_URL = 'http://127.0.0.1:3333/mcp';
+
+export type StdioMcpServerConfig = {
+  type: 'stdio';
+  command: string;
+  args: string[];
+};
+
+export type HttpMcpServerConfig = {
+  type: 'http';
+  url: string;
+  headers?: Record<string, string>;
+};
+
+export type McpServerConfig = StdioMcpServerConfig | HttpMcpServerConfig;
+
+export function normalizeMcpInstallOptions(opts?: McpInstallOptions): Required<Pick<McpInstallOptions, 'transport' | 'url'>> & Pick<McpInstallOptions, 'tokenEnvVar'> {
+  return {
+    transport: opts?.transport ?? 'stdio',
+    url: opts?.url ?? DEFAULT_MCP_HTTP_URL,
+    tokenEnvVar: opts?.tokenEnvVar,
+  };
+}
+
+export function authHeaders(tokenEnvVar: string | undefined): Record<string, string> | undefined {
+  return tokenEnvVar ? { Authorization: `Bearer \${${tokenEnvVar}}` } : undefined;
+}
 
 /**
  * The MCP-server config block codegraph injects. Same shape across
  * all JSON-shaped agent configs (Claude, Cursor, opencode), only the
  * surrounding wrapper differs. Codex (TOML) builds its own block.
  */
-export function getMcpServerConfig(): { type: string; command: string; args: string[] } {
+export function getMcpServerConfig(opts?: McpInstallOptions): McpServerConfig {
+  const mcp = normalizeMcpInstallOptions(opts);
+  if (mcp.transport === 'http') {
+    return {
+      type: 'http',
+      url: mcp.url,
+      ...(mcp.tokenEnvVar ? { headers: authHeaders(mcp.tokenEnvVar) } : {}),
+    };
+  }
   return {
     type: 'stdio',
     command: 'codegraph',
     args: ['serve', '--mcp'],
   };
+}
+
+export function parseMcpTransport(value: string | undefined): McpTransport {
+  const transport = (value ?? 'stdio').toLowerCase();
+  if (transport !== 'stdio' && transport !== 'http') {
+    throw new Error(`--transport must be "stdio" or "http" (got "${value}")`);
+  }
+  return transport;
 }
 
 /**

@@ -27,6 +27,7 @@ import {
 import {
   atomicWriteFileSync,
   getMcpServerConfig,
+  normalizeMcpInstallOptions,
   removeMarkedSection,
   upsertInstructionsEntry,
 } from './shared';
@@ -73,7 +74,7 @@ class CodexTarget implements AgentTarget {
     return { installed, alreadyConfigured, configPath: tomlPath };
   }
 
-  install(loc: Location, _opts: InstallOptions): WriteResult {
+  install(loc: Location, opts: InstallOptions): WriteResult {
     if (loc !== 'global') {
       return {
         files: [],
@@ -82,7 +83,7 @@ class CodexTarget implements AgentTarget {
     }
     const files: WriteResult['files'] = [];
 
-    files.push(writeMcpEntry());
+    files.push(writeMcpEntry(opts));
 
     // AGENTS.md gets the short marker-fenced CodeGraph block (#704):
     // subagents and non-MCP harnesses read AGENTS.md but never the MCP
@@ -119,11 +120,11 @@ class CodexTarget implements AgentTarget {
     return { files };
   }
 
-  printConfig(loc: Location): string {
+  printConfig(loc: Location, opts?: { mcp?: InstallOptions['mcp'] }): string {
     if (loc !== 'global') {
       return '# Codex CLI has no project-local config — use --location=global.\n';
     }
-    const block = buildCodegraphBlock();
+    const block = buildCodegraphBlock(opts);
     return `# Add to ${tomlConfigPath()}\n\n${block}\n`;
   }
 
@@ -133,20 +134,32 @@ class CodexTarget implements AgentTarget {
   }
 }
 
-function buildCodegraphBlock(): string {
-  const mcp = getMcpServerConfig();
+function buildCodegraphBlock(opts?: { mcp?: InstallOptions['mcp'] }): string {
+  const normalized = normalizeMcpInstallOptions(opts?.mcp);
+  if (normalized.transport === 'http') {
+    return buildTomlTable(TOML_HEADER, {
+      url: normalized.url,
+      enabled: true,
+      ...(normalized.tokenEnvVar ? { bearer_token_env_var: normalized.tokenEnvVar } : {}),
+    });
+  }
+
+  const mcp = getMcpServerConfig(opts?.mcp);
+  if (mcp.type !== 'stdio') {
+    throw new Error('Codex stdio config builder received a non-stdio MCP config');
+  }
   return buildTomlTable(TOML_HEADER, {
     command: mcp.command,
     args: mcp.args,
   });
 }
 
-function writeMcpEntry(): WriteResult['files'][number] {
+function writeMcpEntry(opts: InstallOptions): WriteResult['files'][number] {
   const file = tomlConfigPath();
   const dir = path.dirname(file);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-  const block = buildCodegraphBlock();
+  const block = buildCodegraphBlock(opts);
   // Single read — `existing === ''` derives both "is the file empty
   // or absent" and "what was its content," avoiding a TOCTOU window
   // between two `fs.existsSync` calls.
