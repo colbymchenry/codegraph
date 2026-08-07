@@ -16,7 +16,48 @@ import { hermesTarget } from './hermes';
 import { geminiTarget } from './gemini';
 import { antigravityTarget } from './antigravity';
 import { kiroTarget } from './kiro';
+import { ampTarget } from './amp';
+import { augmentTarget } from './augment';
+import { bobTarget } from './bob';
+import { openclawTarget } from './openclaw';
+import { clineTarget } from './cline';
+import { codeartsTarget } from './codearts';
+import { codebuddyTarget } from './codebuddy';
+import { codemakerTarget } from './codemaker';
+import { codestudioTarget } from './codestudio';
+import { commandCodeTarget } from './command-code';
+import { continueTarget } from './continue';
+import { cortexTarget } from './cortex';
+import { crushTarget } from './crush';
+import { deepagentsTarget } from './deepagents';
+import { devinTarget } from './devin';
+import { droidTarget } from './droid';
+import { firebenderTarget } from './firebender';
+import { forgecodeTarget } from './forgecode';
+import { githubCopilotTarget } from './github-copilot';
+import { gooseTarget } from './goose';
+import { junieTarget } from './junie';
+import { iflowTarget } from './iflow';
+import { kilocodeTarget } from './kilocode';
+import { mcpjamTarget } from './mcpjam';
+import { mistralVibeTarget } from './mistral-vibe';
+import { muxTarget } from './mux';
+import { openhandsTarget } from './openhands';
+import { pipiTarget } from './pipi';
+import { qoderTarget } from './qoder';
+import { qwenTarget } from './qwen';
+import { rovodevTarget } from './rovodev';
+import { rooTarget } from './roo';
+import { tabnineTarget } from './tabnine';
+import { traeTarget } from './trae';
+import { traeCnTarget } from './trae-cn';
+import { windsurfTarget } from './windsurf';
+import { zencoderTarget } from './zencoder';
+import { neovateTarget } from './neovate';
+import { pochipochiTarget } from './pochipochi';
+import { adalTarget } from './adal';
 
+import { aiderTarget } from './aider';
 export const ALL_TARGETS: readonly AgentTarget[] = Object.freeze([
   claudeTarget,
   cursorTarget,
@@ -26,6 +67,47 @@ export const ALL_TARGETS: readonly AgentTarget[] = Object.freeze([
   geminiTarget,
   antigravityTarget,
   kiroTarget,
+  aiderTarget,
+  ampTarget,
+  augmentTarget,
+  bobTarget,
+  openclawTarget,
+  clineTarget,
+  codeartsTarget,
+  codebuddyTarget,
+  codemakerTarget,
+  codestudioTarget,
+  commandCodeTarget,
+  continueTarget,
+  cortexTarget,
+  crushTarget,
+  deepagentsTarget,
+  devinTarget,
+  droidTarget,
+  firebenderTarget,
+  forgecodeTarget,
+  githubCopilotTarget,
+  gooseTarget,
+  junieTarget,
+  iflowTarget,
+  kilocodeTarget,
+  mcpjamTarget,
+  mistralVibeTarget,
+  muxTarget,
+  openhandsTarget,
+  pipiTarget,
+  qoderTarget,
+  qwenTarget,
+  rovodevTarget,
+  rooTarget,
+  tabnineTarget,
+  traeTarget,
+  traeCnTarget,
+  windsurfTarget,
+  zencoderTarget,
+  neovateTarget,
+  pochipochiTarget,
+  adalTarget,
 ]);
 
 export function getTarget(id: string): AgentTarget | undefined {

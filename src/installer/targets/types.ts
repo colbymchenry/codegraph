@@ -19,7 +19,7 @@ export type Location = 'global' | 'local';
  * lookup. New targets add a value here when they're added to the
  * registry. Keep these short and lowercase.
  */
-export type TargetId = 'claude' | 'cursor' | 'codex' | 'opencode' | 'hermes' | 'gemini' | 'antigravity' | 'kiro';
+export type TargetId = 'claude' | 'cursor' | 'codex' | 'opencode' | 'hermes' | 'gemini' | 'antigravity' | 'kiro' | 'aider' | 'amp' | 'augment' | 'bob' | 'openclaw' | 'cline' | 'codearts' | 'codebuddy' | 'codemaker' | 'codestudio' | 'command-code' | 'continue' | 'cortex' | 'crush' | 'deepagents' | 'devin' | 'droid' | 'firebender' | 'forgecode' | 'github-copilot' | 'goose' | 'junie' | 'iflow' | 'kilocode' | 'mcpjam' | 'mistral-vibe' | 'mux' | 'openhands' | 'pipi' | 'qoder' | 'qwen' | 'rovodev' | 'roo' | 'tabnine' | 'trae' | 'trae-cn' | 'windsurf' | 'zencoder' | 'neovate' | 'pochipochi' | 'adal';
 
 /**
  * Result of `target.detect(location)`.

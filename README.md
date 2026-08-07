@@ -29,6 +29,10 @@ Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 
 [![Claude Code](https://img.shields.io/badge/Claude_Code-supported-blueviolet.svg)](#supported-agents)
 [![Cursor](https://img.shields.io/badge/Cursor-supported-blueviolet.svg)](#supported-agents)
+[![Windsurf](https://img.shields.io/badge/Windsurf-supported-blueviolet.svg)](#supported-agents)
+[![Aider](https://img.shields.io/badge/Aider-supported-blueviolet.svg)](#supported-agents)
+[![Cline](https://img.shields.io/badge/Cline-supported-blueviolet.svg)](#supported-agents)
+[![Roo Code](https://img.shields.io/badge/Roo_Code-supported-blueviolet.svg)](#supported-agents)
 [![Codex](https://img.shields.io/badge/Codex-supported-blueviolet.svg)](#supported-agents)
 [![opencode](https://img.shields.io/badge/opencode-supported-blueviolet.svg)](#supported-agents)
 [![Hermes Agent](https://img.shields.io/badge/Hermes_Agent-supported-blueviolet.svg)](#supported-agents)
@@ -375,7 +379,7 @@ npx @colbymchenry/codegraph
 ```
 
 The installer will:
-- Ask which agent(s) to configure — auto-detects installed ones from: **Claude Code**, **Cursor**, **Codex CLI**, **opencode**, **Hermes Agent**, **Gemini CLI**, **Antigravity IDE**, **Kiro**
+- Ask which agent(s) to configure — auto-detects installed ones from 50+ supported agents (Claude Code, Cursor, Aider, Cline, Windsurf, Roo Code, etc.)
 - Prompt to install `codegraph` on your PATH (so agents can launch the MCP server)
 - Ask whether configs apply to all your projects or just this one
 - Write each chosen agent's MCP server config, plus a small marker-fenced CodeGraph section in the agent's instructions file (`CLAUDE.md` / `AGENTS.md` / `GEMINI.md`) — that's how subagents and non-MCP agents learn the `codegraph explore` command, since the MCP server's own guidance only reaches the main agent. Removed cleanly by `codegraph uninstall`.
@@ -402,7 +406,7 @@ codegraph install --print-config codex               # print snippet, no file wr
 
 ### 2. Restart Your Agent
 
-Restart your agent (Claude Code / Cursor / Codex CLI / opencode / Hermes Agent / Gemini CLI / Antigravity IDE / Kiro) for the MCP server to load.
+Restart your agent for the MCP server to load.
 
 ### 3. Initialize Projects
 
@@ -752,14 +756,60 @@ The interactive installer auto-detects and configures each of these — wiring u
 the MCP server (which delivers its own usage guidance, so no instructions file
 is written):
 
-- **Claude Code**
-- **Cursor**
-- **Codex CLI**
-- **opencode**
-- **Hermes Agent**
-- **Gemini CLI**
+<details>
+<summary><strong>View all 50+ Supported Agents</strong></summary>
+
+- **Ada L**
+- **Aider Desk**
+- **Amp / Kimi / Replit / Universal**
 - **Antigravity IDE**
+- **Augment**
+- **Claude Code**
+- **Cline / Dexto / Warp**
+- **Code Studio**
+- **CodeArts Agent**
+- **CodeBuddy**
+- **Codemaker**
+- **Codex CLI**
+- **Command Code**
+- **Continue**
+- **Cortex Code**
+- **Crush**
+- **Cursor**
+- **Deep Agents**
+- **Devin for Terminal**
+- **Droid**
+- **Firebender**
+- **ForgeCode**
+- **Gemini CLI**
+- **GitHub Copilot**
+- **Goose**
+- **Hermes Agent**
+- **IBM Bob**
+- **iFlow CLI**
+- **Junie**
+- **Kilo Code**
 - **Kiro**
+- **MCPJam**
+- **Mistral Vibe**
+- **Mux**
+- **Neovate**
+- **OpenClaw**
+- **opencode**
+- **OpenHands**
+- **Pi**
+- **Pochi**
+- **Qoder**
+- **Qwen Code**
+- **Roo Code**
+- **Rovo Dev**
+- **Tabnine CLI**
+- **Trae**
+- **Trae CN**
+- **Windsurf**
+- **Zencoder**
+
+</details>
 
 ## Supported Languages
 

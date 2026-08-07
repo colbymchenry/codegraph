@@ -19,55 +19,28 @@ import { INSTRUCTIONS_TEMPLATE } from '../instructions-template';
 
 function configDir(loc: Location): string {
   const targetPath = loc === 'local'
-    ? path.join(process.cwd(), '.agents/skills'.replace(/\/skills$/, ''))
-    : path.join(os.homedir(), '~/.gemini/antigravity/skills'.replace(/^~\//, '').replace(/\/skills$/, ''));
+    ? path.join(process.cwd(), 'qoder.qoder/skills'.replace(/\/skills$/, ''))
+    : path.join(os.homedir(), '~/.qoder/skills'.replace(/^~\//, '').replace(/\/skills$/, ''));
   return targetPath;
 }
 
 function skillsDir(loc: Location): string {
   return loc === 'local'
-    ? path.join(process.cwd(), '.agents/skills')
-    : path.join(os.homedir(), '~/.gemini/antigravity/skills'.replace(/^~\//, ''));
+    ? path.join(process.cwd(), 'qoder.qoder/skills')
+    : path.join(os.homedir(), '~/.qoder/skills'.replace(/^~\//, ''));
 }
 
-/**
- * Resolve the on-disk path of the `codegraph` binary so a Mac GUI app
- * launched from Dock/Finder (with a stripped PATH) can find it. Falls
- * back to the bare `codegraph` name when:
- *
- *  - we're not on macOS (Linux GUI apps inherit user PATH; Windows
- *    uses env PATH directly), OR
- *  - the lookup fails for any reason (preserving install in restricted
- *    environments where `which`/`command -v` aren't available).
- *
- * Resolution prefers `command -v` (built-in, no PATH manipulation),
- * with `which` as a fallback. Both are read via the user's interactive
- * shell PATH at install time — that's the right PATH for finding
- * nvm-managed tools like ours.
- */
-function resolveCodegraphCommand(): string {
-  if (process.platform !== 'darwin') return 'codegraph';
-  try {
-    const resolved = execSync('command -v codegraph || which codegraph', {
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      shell: '/bin/bash',
-      windowsHide: true,
-    }).trim();
-    if (resolved && fs.existsSync(resolved)) return resolved;
-  } catch {
-    /* fall through to bare name */
-  }
-  return 'codegraph';
+function mcpJsonPath(loc: Location): string {
+  return path.join(configDir(loc), 'mcp.json');
 }
 
 function steeringPath(loc: Location): string {
   return path.join(skillsDir(loc), 'codegraph.md');
 }
 
-class AntigravityTarget implements AgentTarget {
-  readonly id = 'antigravity' as const;
-  readonly displayName = 'Antigravity';
+class QoderTarget implements AgentTarget {
+  readonly id = 'qoder' as const;
+  readonly displayName = 'Qoder';
 
   supportsLocation(_loc: Location): boolean {
     return true;
@@ -88,7 +61,7 @@ class AntigravityTarget implements AgentTarget {
     return {
       files,
       notes: [
-        'Restart Antigravity for MCP changes to take effect.'
+        'Restart Qoder for MCP changes to take effect.'
       ],
     };
   }
@@ -170,4 +143,4 @@ function removeSteeringEntry(loc: Location): WriteResult['files'][number] {
   return { path: file, action: 'removed' };
 }
 
-export const antigravityTarget: AgentTarget = new AntigravityTarget();
+export const qoderTarget: AgentTarget = new QoderTarget();
