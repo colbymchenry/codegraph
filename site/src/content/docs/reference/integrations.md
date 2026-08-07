@@ -8,6 +8,7 @@ The interactive installer auto-detects and configures each supported agent — w
 ## Supported agents
 
 - **Claude Code**
+- **CodeBuddy**
 - **Cursor**
 - **Codex CLI**
 - **opencode**
@@ -25,6 +26,8 @@ If you'd rather wire it up yourself, install globally:
 ```bash
 npm install -g @colbymchenry/codegraph
 ```
+
+### Claude Code
 
 Add the MCP server to `~/.claude.json`:
 
@@ -52,6 +55,39 @@ Optionally auto-allow CodeGraph's tools in `~/.claude/settings.json`:
 }
 ```
 
+### CodeBuddy
+
+Add the MCP server to `~/.codebuddy/.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "codegraph": {
+      "type": "stdio",
+      "command": "codegraph",
+      "args": ["serve", "--mcp"]
+    }
+  }
+}
+```
+
+Optionally auto-allow the read-only tools in `~/.codebuddy/settings.json`:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "mcp__codegraph__codegraph_search",
+      "mcp__codegraph__codegraph_context",
+      "mcp__codegraph__codegraph_callers",
+      "mcp__codegraph__codegraph_callees",
+      "mcp__codegraph__codegraph_impact",
+      "mcp__codegraph__codegraph_node",
+      "mcp__codegraph__codegraph_status"
+    ]
+  }
+}
+```
 One wildcard auto-approves every CodeGraph tool. The server lists a single tool by default — `codegraph_explore` — but if you re-enable others via the `CODEGRAPH_MCP_TOOLS` environment variable, they're already permitted with no prompt.
 
 :::tip
