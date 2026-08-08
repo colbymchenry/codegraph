@@ -1020,6 +1020,105 @@ def bootstrap():
       expect(callsToUserService).toHaveLength(0);
     });
 
+    it('promotes calls→instantiates when target resolves to a C++ union', async () => {
+      // `Packet()` value-initializes the union. The extractor emits a calls
+      // reference for that expression, so resolution must preserve the
+      // class-like promotion that unions received when they were structs.
+      fs.writeFileSync(
+        path.join(tempDir, 'packet.cpp'),
+        `union Packet { unsigned int raw; };
+
+void initialize() { Packet(); }
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const packet = cg.getNodesByKind('union').find((n) => n.name === 'Packet');
+      const initialize = cg.getNodesByKind('function').find((n) => n.name === 'initialize');
+      expect(packet).toBeDefined();
+      expect(initialize).toBeDefined();
+
+      const outgoing = cg.getOutgoingEdges(initialize!.id);
+      expect(outgoing.some((e) => e.kind === 'instantiates' && e.target === packet!.id)).toBe(true);
+      expect(outgoing.some((e) => e.kind === 'calls' && e.target === packet!.id)).toBe(false);
+    });
+
+    it('resolves a static call through an imported C++ union to its member', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'ops.hpp'),
+        `union Ops {
+  static int run() { return 1; }
+};
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'main.cpp'),
+        `#include "ops.hpp"
+
+int invoke() { return Ops::run(); }
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const invoke = cg.getNodesByKind('function').find((n) => n.name === 'invoke');
+      const run = cg.getNodesByKind('method').find((n) => n.name === 'run');
+      expect(invoke).toBeDefined();
+      expect(run).toBeDefined();
+
+      const outgoing = cg.getOutgoingEdges(invoke!.id);
+      expect(outgoing.some((e) => e.kind === 'calls' && e.target === run!.id)).toBe(true);
+    });
+
+    it('bridges a Rust trait method to a union implementor (interface-impl)', async () => {
+      // A Rust union can `impl Trait` exactly as a struct can. Trait-dispatch
+      // synthesis enumerates concrete kinds explicitly, so a union implementor
+      // only becomes a candidate if `union` is in that list. Making unions
+      // first-class nodes is not enough on its own: without this, `Reg` has an
+      // `implements` edge and is still silently dropped from the fan-out, so
+      // "who implements this trait" answers wrongly rather than incompletely
+      // — the struct beside it resolves and the union does not (#1515).
+      fs.writeFileSync(
+        path.join(tempDir, 'lib.rs'),
+        `pub union Reg { pub raw: u32 }
+pub struct Ctl { pub n: u32 }
+
+pub trait Describe { fn describe(&self) -> String; }
+
+impl Describe for Reg { fn describe(&self) -> String { "reg".into() } }
+impl Describe for Ctl { fn describe(&self) -> String { "ctl".into() } }
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const methods = cg.getNodesByKind('method');
+      const traitMethod = methods.find((n) => n.qualifiedName === 'Describe::describe');
+      const unionImpl = methods.find((n) => n.qualifiedName === 'Reg::describe');
+      const structImpl = methods.find((n) => n.qualifiedName === 'Ctl::describe');
+      expect(traitMethod, 'trait method should be in the graph').toBeDefined();
+      expect(unionImpl, 'union impl method should be in the graph').toBeDefined();
+      expect(structImpl, 'struct impl method should be in the graph').toBeDefined();
+
+      const synth = cg
+        .getOutgoingEdges(traitMethod!.id)
+        .filter((e) => e.kind === 'calls' && e.provenance === 'heuristic');
+      const targets = new Set(synth.map((e) => e.target));
+
+      // The struct implementor bridged before unions were nodes at all; it is
+      // the control that proves the synthesizer ran for this trait.
+      expect(targets.has(structImpl!.id), 'struct implementor should bridge').toBe(true);
+      expect(targets.has(unionImpl!.id), 'union implementor should bridge').toBe(true);
+
+      const unionEdge = synth.find((e) => e.target === unionImpl!.id);
+      expect(
+        (unionEdge!.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy
+      ).toBe('interface-impl');
+    });
+
     it('records instantiates for C++ stack/brace construction, targeting the class (#1035)', async () => {
       // `Calculator calc(0)` (direct-init) and `Widget w{1, 2}` (brace-init)
       // carry the constructor args directly on the declarator — there's no
@@ -2167,6 +2266,28 @@ func main() {
 
       const result = matchReference(ref, baseContext([fn, cls]));
       expect(result?.targetNodeId).toBe('class:logger.ts:Logger:10');
+    });
+
+    it('prefers a union candidate over a function for `instantiates` refs', () => {
+      const fn: Node = {
+        id: 'func:packet.cpp:Packet:5', kind: 'function', name: 'Packet',
+        qualifiedName: 'packet.cpp::Packet', filePath: 'packet.cpp', language: 'cpp',
+        startLine: 5, endLine: 7, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+      };
+      const union: Node = {
+        id: 'union:packet.hpp:Packet:10', kind: 'union', name: 'Packet',
+        qualifiedName: 'packet.hpp::Packet', filePath: 'packet.hpp', language: 'cpp',
+        startLine: 10, endLine: 14, startColumn: 0, endColumn: 0, updatedAt: Date.now(),
+      };
+      const ref = {
+        fromNodeId: 'func:main.cpp:initialize:1',
+        referenceName: 'Packet',
+        referenceKind: 'instantiates' as const,
+        line: 5, column: 0, filePath: 'main.cpp', language: 'cpp' as const,
+      };
+
+      const result = matchReference(ref, baseContext([fn, union]));
+      expect(result?.targetNodeId).toBe('union:packet.hpp:Packet:10');
     });
 
     it('prefers a function candidate over a non-function for `decorates` refs', () => {

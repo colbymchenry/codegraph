@@ -157,7 +157,7 @@ const DEFAULT_BUILD_OPTIONS: Required<BuildContextOptions> = {
  * they tell you something exists, not how it works.
  */
 const HIGH_VALUE_NODE_KINDS: NodeKind[] = [
-  'function', 'method', 'class', 'interface', 'type_alias', 'struct', 'trait',
+  'function', 'method', 'class', 'interface', 'type_alias', 'struct', 'union', 'trait',
   'component', 'route', 'variable', 'constant', 'enum', 'module', 'namespace',
 ];
 
@@ -503,7 +503,7 @@ export class ContextBuilder {
     // like RestController, BulkRequest, AllocationService — not nodes named exactly that.
     // Also tries stem variants: "caching" → "cache" finds Cache, CacheBuilder.
     if (symbolsFromQuery.length > 0) {
-      const definitionKinds: NodeKind[] = ['class', 'interface', 'struct', 'trait',
+      const definitionKinds: NodeKind[] = ['class', 'interface', 'struct', 'union', 'trait',
         'protocol', 'enum', 'type_alias'];
       // Expand symbols with stem variants for broader definition matching
       const expandedSymbols = new Set(symbolsFromQuery);
@@ -559,7 +559,7 @@ export class ContextBuilder {
         // but are almost never what exploration queries want.
         const searchKinds = opts.nodeKinds && opts.nodeKinds.length > 0
           ? opts.nodeKinds
-          : ['file', 'module', 'class', 'struct', 'interface', 'trait', 'protocol',
+          : ['file', 'module', 'class', 'struct', 'union', 'interface', 'trait', 'protocol',
              'function', 'method', 'property', 'field', 'variable', 'constant',
              'enum', 'enum_member', 'type_alias', 'namespace', 'export',
              'route', 'component'] as NodeKind[];
@@ -754,7 +754,7 @@ export class ContextBuilder {
     // LIKE reliably finds these substring matches. Results are appended with
     // guaranteed slots so they don't compete with higher-scoring prefix matches.
     if (symbolsFromQuery.length > 0) {
-      const camelDefinitionKinds: NodeKind[] = ['class', 'interface', 'struct', 'trait',
+      const camelDefinitionKinds: NodeKind[] = ['class', 'interface', 'struct', 'union', 'trait',
         'protocol', 'enum', 'type_alias'];
       // Callable kinds participate too: in service-layer codebases the
       // camel-infix definers of a queried FIELD are methods/functions
@@ -977,7 +977,7 @@ export class ContextBuilder {
     // before reaching extends/implements neighbors. This dedicated step
     // ensures subclasses and superclasses always appear in results.
     // Budget: up to maxNodes/4 hierarchy nodes to avoid flooding.
-    const typeHierarchyKinds = new Set<string>(['class', 'interface', 'struct', 'trait', 'protocol']);
+    const typeHierarchyKinds = new Set<string>(['class', 'interface', 'struct', 'union', 'trait', 'protocol']);
     const maxHierarchyNodes = Math.ceil(opts.maxNodes / 4);
     let hierarchyNodesAdded = 0;
     for (const result of filteredResults) {

@@ -297,14 +297,35 @@ export function parseSession(files) {
   // FIXED occupancy — its tool schema and MCP `initialize` instructions — which
   // it pays whether or not the agent ever calls it.
   const ctxBase = reqIdx.length ? timeline[reqIdx[0]].ctx : 0;
-  // Multi-turn: duration/cost/tokens are per-segment, so sum them. `result.usage`
-  // is cumulative WITHIN a segment (verified: its in+cache+out equals the sum of
-  // that segment's per-request prompts), so summing segments is correct and does
-  // NOT double-count. It is a "tokens processed" figure — every request re-counts
-  // the whole prefix — which is exactly why it can't answer the occupancy question.
-  const sumUsage = (k) => results.reduce((s, r) => s + (r.usage?.[k] || 0), 0);
-  const processed = sumUsage('input_tokens') + sumUsage('cache_read_input_tokens')
-    + sumUsage('cache_creation_input_tokens') + sumUsage('output_tokens');
+  // "Tokens processed" = the SUM of every assistant request's whole prompt. Every
+  // request re-counts the prefix, which is what makes this a throughput figure and
+  // why it cannot answer the occupancy question (that is `residual`, above).
+  //
+  // It must be summed PER TURN, not read off `result.usage`. The comment that used
+  // to sit here asserted result.usage was "cumulative WITHIN a segment"; that was
+  // true when the README figures were measured and is NOT true in current Claude
+  // Code, where it reports the LAST turn only. Nothing in this repo changed — the
+  // host did, silently, and the harness kept reporting the smaller number.
+  //
+  // The damage is one-sided and therefore worse than noise: it under-counts
+  // whichever arm takes more turns, which is always the WITHOUT arm. Measured on
+  // the 2026-08-05 campaign it turned a real 62% token saving into 19%, and
+  // manufactured a token REGRESSION on tokio (-41%) and alamofire (-25%) that does
+  // not exist. CLAUDE.md already warned about this field; the code did not follow.
+  //
+  // Dedupe by message.id: Claude Code emits one assistant event per content block,
+  // each carrying the same `usage`, so summing per EVENT double-counts (~1.7x on a
+  // real run). Same rule the occupancy timeline above uses.
+  const seenUsageIds = new Set();
+  let processed = 0;
+  for (const ev of events) {
+    if (ev.type !== 'assistant' || !ev.message?.id) continue;
+    if (seenUsageIds.has(ev.message.id)) continue;
+    seenUsageIds.add(ev.message.id);
+    const u = ev.message.usage || {};
+    processed += (u.input_tokens || 0) + (u.cache_read_input_tokens || 0)
+      + (u.cache_creation_input_tokens || 0) + (u.output_tokens || 0);
+  }
 
   return {
     files, toolCalls, counts, initTools, result, results, raced, cliCalls, cliContaminated,

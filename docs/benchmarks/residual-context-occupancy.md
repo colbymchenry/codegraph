@@ -246,34 +246,44 @@ Reported for completeness and because the occupancy finding only means anything
 read against it. **These are not the README's numbers and must not be quoted as
 such.**
 
+> **Corrected 2026-08-05.** The token column first published here was wrong, and
+> wrong in one direction. It came off `result.usage`, which reports only the last
+> turn in current Claude Code, so it under-counted whichever arm took more turns —
+> always the without-arm. It reported a 23% token saving where the real figure is
+> **56%**, and showed **vscode processing 98% *more* tokens with codegraph** when
+> it in fact processes **41% fewer**. Re-derived below from the same raw logs
+> (`/tmp/ab-readme-sonnet3turn`) with tokens summed per assistant turn.
+> **Cost, time and tool calls were never affected** — they are unchanged.
+> Occupancy is measured off the timeline, not this field, so every number in the
+> table above stands.
+
 ```
 repo        time W→WO        tools W→WO   tokens W→WO (saved)   cost W→WO (saved)
-vscode      2m 59s→1m 59s    8→60         949k→478k  (-98%)     $1.21→$1.62  (25%)
-excalidraw  1m 45s→2m 1s     5→44         557k→869k   (36%)     $0.78→$1.03  (24%)
-django      1m 4s→1m 30s     3→13         366k→686k   (47%)     $0.52→$0.45 (-17%)
-tokio       1m 47s→4m 35s    5→43         574k→793k   (28%)     $0.67→$1.25  (47%)
-okhttp      49s→1m 25s       2→11         302k→704k   (57%)     $0.35→$0.48  (27%)
-gin         1m 6s→1m 43s     2→12         290k→660k   (56%)     $0.38→$0.43  (12%)
-alamofire   1m 35s→1m 47s    6→29         545k→870k   (37%)     $0.67→$1.30  (49%)
+vscode      2m 59s→1m 59s    8→60         940k→1.6M   (41%)     $1.21→$1.62  (25%)
+excalidraw  1m 45s→2m 1s     5→44         549k→1.3M   (57%)     $0.78→$1.03  (24%)
+django      1m 4s→1m 30s     3→13         362k→715k   (49%)     $0.52→$0.45 (-17%)
+tokio       1m 47s→4m 35s    5→43         568k→1.6M   (65%)     $0.67→$1.25  (47%)
+okhttp      49s→1m 25s       2→11         299k→698k   (57%)     $0.35→$0.48  (27%)
+gin         1m 6s→1m 43s     2→12         285k→652k   (56%)     $0.38→$0.43  (12%)
+alamofire   1m 35s→1m 47s    6→29         539k→1.5M   (64%)     $0.67→$1.30  (49%)
 
-AVERAGE saved: cost 24% · tokens 23% · time 20% · tool calls 84%
+AVERAGE saved: cost 24% · tokens 56% · time 20% · tool calls 84%
 ```
 
 | | this campaign (sonnet, 3-turn) | README (Opus 4.8, 1-question) |
 |---|---|---|
-| cost saved | **24%** | 60% |
-| tokens saved | **23%** | 69% |
-| time saved | **20%** | 20% |
-| tool calls saved | **84%** | 89% |
+| cost saved | **24%** | 44% |
+| tokens saved | **56%** | 62% |
+| time saved | **20%** | 53% |
+| tool calls saved | **84%** | 88% |
 
-Tool-call reduction and wall-clock survive the regime change almost intact; the
-cost and token savings roughly halve. Two repos invert outright — **vscode
-processes 98% *more* tokens with codegraph** (8 calls of dense source against a
-without-arm that mostly greps), and **django costs 17% more**. Neither is hidden
-here. The with-arm is also not read-free in this regime: 4 of 28 with-arm
-sessions still touched Read (vscode run4 `rd5 bs7`, tokio run2 `rd3 bs2`,
-django run4 `rd1`, alamofire run2 `rd1`), against the README's "zero file reads
-on all seven repos" under Opus.
+Tokens and tool-call reduction survive the regime change nearly intact. What the
+harder regime costs is **cost and wall-clock**: three turns of follow-ups on a
+weaker model give the with-arm less headroom to win, and **django costs 17% more**
+— not hidden here. The with-arm is also not read-free in this regime: 4 of 28
+with-arm sessions still touched Read (vscode run4 `rd5 bs7`, tokio run2 `rd3 bs2`,
+django run4 `rd1`, alamofire run2 `rd1`), against the README's "zero file reads on
+all seven repos" under Opus on a single question.
 
 ### Contamination gate: clean, and the channel is real
 

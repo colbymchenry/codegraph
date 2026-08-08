@@ -1066,6 +1066,11 @@ export class TreeSitterExtractor {
       this.extractStruct(node);
       skipChildren = true; // extractStruct visits body children
     }
+    // Check for union declarations
+    else if (this.extractor.unionTypes?.includes(nodeType)) {
+      this.extractUnion(node);
+      skipChildren = true; // extractUnion visits body children
+    }
     // Check for enum declarations
     else if (this.extractor.enumTypes.includes(nodeType)) {
       this.extractEnum(node);
@@ -1487,7 +1492,7 @@ export class TreeSitterExtractor {
 
   /**
    * Check if the current node stack indicates we are inside a class-like node
-   * (class, struct, interface, trait). File nodes do not count as class-like.
+   * (class, struct, union, interface, trait). File nodes do not count as class-like.
    */
   private isInsideClassLikeNode(): boolean {
     if (this.nodeStack.length === 0) return false;
@@ -1498,6 +1503,7 @@ export class TreeSitterExtractor {
     return (
       parentNode.kind === 'class' ||
       parentNode.kind === 'struct' ||
+      parentNode.kind === 'union' ||
       parentNode.kind === 'interface' ||
       parentNode.kind === 'trait' ||
       parentNode.kind === 'enum' ||
@@ -1807,7 +1813,7 @@ export class TreeSitterExtractor {
         (n) =>
           n.name === receiverType &&
           n.filePath === this.filePath &&
-          (n.kind === 'struct' || n.kind === 'class' || n.kind === 'enum' || n.kind === 'trait')
+          (n.kind === 'struct' || n.kind === 'union' || n.kind === 'class' || n.kind === 'enum' || n.kind === 'trait')
       );
       if (ownerNode) {
         this.edges.push({
@@ -1873,6 +1879,16 @@ export class TreeSitterExtractor {
    * Extract a struct
    */
   private extractStruct(node: SyntaxNode): void {
+    this.extractAggregate(node, 'struct');
+  }
+
+  /** Extract a union while sharing the member-walk behavior of aggregate types. */
+  private extractUnion(node: SyntaxNode): void {
+    this.extractAggregate(node, 'union');
+  }
+
+  /** Extract a struct-like declaration without conflating its semantic kind. */
+  private extractAggregate(node: SyntaxNode, kind: 'struct' | 'union'): void {
     if (!this.extractor) return;
 
     // Skip forward declarations and type references (no body = not a definition)
@@ -1886,24 +1902,24 @@ export class TreeSitterExtractor {
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
 
-    const structNode = this.createNode('struct', name, node, {
+    const aggregateNode = this.createNode(kind, name, node, {
       docstring,
       visibility,
       isExported,
     });
-    if (!structNode) return;
+    if (!aggregateNode) return;
 
     // Extract inheritance (e.g. Swift: struct HTTPMethod: RawRepresentable)
-    this.extractInheritance(node, structNode.id);
+    this.extractInheritance(node, aggregateNode.id);
 
     // C# primary-constructor parameter dependencies (`struct P(int x)`, and
     // `record struct M(decimal Amount)` which the grammar nests here).
-    this.extractCsharpPrimaryCtorParamRefs(node, structNode.id);
+    this.extractCsharpPrimaryCtorParamRefs(node, aggregateNode.id);
 
     // Push to stack for field extraction (bodiless positional records have
     // no members to visit)
     if (body) {
-      this.nodeStack.push(structNode.id);
+      this.nodeStack.push(aggregateNode.id);
       for (let i = 0; i < body.namedChildCount; i++) {
         const child = body.namedChild(i);
         if (child) {
@@ -2957,17 +2973,20 @@ export class TreeSitterExtractor {
     // (e.g. Go: `type Foo struct { ... }` is a type_spec wrapping struct_type)
     const resolvedKind = this.extractor.resolveTypeAliasKind?.(node, this.source);
 
-    if (resolvedKind === 'struct') {
-      const structNode = this.createNode('struct', name, node, { docstring, isExported });
-      if (!structNode) return true;
+    if (resolvedKind === 'struct' || resolvedKind === 'union') {
+      const aggregateNode = this.createNode(resolvedKind, name, node, { docstring, isExported });
+      if (!aggregateNode) return true;
       // Visit body children for field extraction
-      this.nodeStack.push(structNode.id);
-      // Try Go-style 'type' field first, then find inner struct child (C typedef struct)
+      this.nodeStack.push(aggregateNode.id);
+      // Try Go-style 'type' field first, then find the matching inner aggregate child.
       const typeChild = getChildByField(node, 'type')
-        || this.findChildByTypes(node, this.extractor.structTypes);
+        || this.findChildByTypes(
+          node,
+          resolvedKind === 'union' ? (this.extractor.unionTypes ?? []) : this.extractor.structTypes
+        );
       if (typeChild) {
         // Extract struct embedding (e.g. Go: `type DB struct { *Head; Queryable }`)
-        this.extractInheritance(typeChild, structNode.id);
+        this.extractInheritance(typeChild, aggregateNode.id);
         const body = getChildByField(typeChild, this.extractor.bodyField) || typeChild;
         for (let i = 0; i < body.namedChildCount; i++) {
           const child = body.namedChild(i);
@@ -5323,6 +5342,10 @@ export class TreeSitterExtractor {
         this.extractStruct(node);
         return;
       }
+      if (this.extractor!.unionTypes?.includes(nodeType)) {
+        this.extractUnion(node);
+        return;
+      }
       if (this.extractor!.enumTypes.includes(nodeType)) {
         this.extractEnum(node);
         return;
@@ -5797,7 +5820,7 @@ export class TreeSitterExtractor {
    */
   private findNodeByName(name: string): string | undefined {
     for (const node of this.nodes) {
-      if (node.name === name && (node.kind === 'struct' || node.kind === 'enum' || node.kind === 'class')) {
+      if (node.name === name && (node.kind === 'struct' || node.kind === 'union' || node.kind === 'enum' || node.kind === 'class')) {
         return node.id;
       }
     }

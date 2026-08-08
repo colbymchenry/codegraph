@@ -217,7 +217,7 @@ impl<'t> Walker<'t> {
     fn inside_class_like(&self) -> bool {
         self.stack
             .last()
-            .map(|s| matches!(s.kind, "class" | "struct" | "interface" | "trait" | "enum" | "module"))
+            .map(|s| matches!(s.kind, "class" | "struct" | "union" | "interface" | "trait" | "enum" | "module"))
             .unwrap_or(false)
     }
 
@@ -326,7 +326,7 @@ impl<'t> Walker<'t> {
             let parent_ok = self
                 .stack
                 .last()
-                .map(|s| matches!(s.kind, "file" | "class" | "module" | "struct" | "enum"))
+                .map(|s| matches!(s.kind, "file" | "class" | "module" | "struct" | "union" | "enum"))
                 .unwrap_or(false);
             if parent_ok {
                 self.fs_values.insert(name.to_string(), row);
@@ -447,7 +447,10 @@ impl<'t> Walker<'t> {
             self.extract_interface(node);
             skip_children = true;
         } else if kind == "struct_item" {
-            self.extract_struct(node);
+            self.extract_aggregate(node, "struct");
+            skip_children = true;
+        } else if kind == "union_item" {
+            self.extract_aggregate(node, "union");
             skip_children = true;
         } else if kind == "enum_item" {
             self.extract_enum(node);
@@ -529,7 +532,7 @@ impl<'t> Walker<'t> {
                     .iter()
                     .position(|m| {
                         m.name == *receiver
-                            && matches!(m.kind, "struct" | "class" | "enum" | "trait")
+                            && matches!(m.kind, "struct" | "union" | "class" | "enum" | "trait")
                     })
                     .map(|i| i as u32);
                 if let Some(owner_row) = owner_row {
@@ -579,9 +582,8 @@ impl<'t> Walker<'t> {
         self.stack.pop();
     }
 
-    /// extractStruct — body field REQUIRED (unit structs mint no node; tuple
-    /// structs' ordered_field_declaration_list is a body).
-    fn extract_struct(&mut self, node: Node<'t>) {
+    /// Extract a Rust struct or union with a body; unit structs remain skipped.
+    fn extract_aggregate(&mut self, node: Node<'t>, kind: &'static str) {
         let Some(body) = node.child_by_field_name("body") else { return };
         let name = self.extract_name(node);
         let extra = Extra {
@@ -589,10 +591,10 @@ impl<'t> Walker<'t> {
             visibility: Some(self.visibility_of(node)),
             ..Extra::default()
         };
-        let Some(row) = self.create_node("struct", &name, node, extra) else { return };
+        let Some(row) = self.create_node(kind, &name, node, extra) else { return };
         self.extract_inheritance(node, row);
 
-        self.stack.push(Scope { row, kind: "struct", name });
+        self.stack.push(Scope { row, kind, name });
         for i in 0..body.named_child_count() {
             if let Some(c) = body.named_child(i) {
                 self.visit_node(c);
@@ -1079,7 +1081,7 @@ impl<'t> Walker<'t> {
         let target_row = self
             .nodes_meta
             .iter()
-            .position(|m| m.name == type_name && matches!(m.kind, "struct" | "enum" | "class"))
+            .position(|m| m.name == type_name && matches!(m.kind, "struct" | "union" | "enum" | "class"))
             .map(|i| i as u32);
         if let Some(target_row) = target_row {
             self.push_ref_at(target_row, &trait_name, edge_kind_index("implements").unwrap(), trait_node);
@@ -1153,7 +1155,11 @@ impl<'t> Walker<'t> {
 
         // Structural nodes inside bodies.
         if kind == "struct_item" {
-            self.extract_struct(node);
+            self.extract_aggregate(node, "struct");
+            return;
+        }
+        if kind == "union_item" {
+            self.extract_aggregate(node, "union");
             return;
         }
         if kind == "enum_item" {
