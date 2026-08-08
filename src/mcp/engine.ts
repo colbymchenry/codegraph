@@ -16,6 +16,8 @@ import { findNearestCodeGraphRoot } from '../directory';
 import { watchDisabledReason } from '../sync';
 import { ToolHandler } from './tools';
 import { QueryPool, resolvePoolSize } from './query-pool';
+import { FileLock } from '../utils';
+import { acquireDatabaseWriterLease } from '../db/writer-lease';
 
 // Lazy-load the heavy CodeGraph chain (sqlite + query/graph/context layers) OFF
 // the MCP startup path. It's only needed once a tool actually opens a project —
@@ -65,6 +67,10 @@ export class MCPEngine {
   // Off-loop read-tool pool (daemon mode only). Created lazily once the default
   // project is open — workers each hold their own WAL read connection.
   private queryPool: QueryPool | null = null;
+  // Held for the engine lifetime so watcher writes and maintenance commands
+  // can never become independent SQLite writers for the same project.
+  private writerLease: FileLock | null = null;
+  private writerLeaseRoot: string | null = null;
 
   constructor(opts: MCPEngineOptions = {}) {
     this.opts = { watch: opts.watch ?? true, queryPool: opts.queryPool ?? false };
@@ -161,6 +167,7 @@ export class MCPEngine {
     const resolvedRoot = findNearestCodeGraphRoot(searchFrom);
     if (!resolvedRoot) return;
     try {
+      this.ensureWriterLease(resolvedRoot);
       // Close any previously failed instance to avoid leaking resources.
       if (this.cg) {
         try { this.cg.close(); } catch { /* ignore */ }
@@ -173,6 +180,7 @@ export class MCPEngine {
       this.catchUpSync();
       this.maybeStartPool(resolvedRoot);
     } catch {
+      this.releaseWriterLease();
       // Still failing — caller will try again on the next tool call.
     }
   }
@@ -196,6 +204,7 @@ export class MCPEngine {
       try { this.cg.close(); } catch { /* ignore */ }
       this.cg = null;
     }
+    this.releaseWriterLease();
   }
 
   private async doInitialize(searchFrom: string): Promise<void> {
@@ -210,15 +219,38 @@ export class MCPEngine {
 
     this.projectPath = resolvedRoot;
     try {
+      this.ensureWriterLease(resolvedRoot);
       this.cg = await loadCodeGraph().open(resolvedRoot);
       this.toolHandler.setDefaultCodeGraph(this.cg);
       this.startWatching();
       this.catchUpSync();
       this.maybeStartPool(resolvedRoot);
     } catch (err) {
+      this.releaseWriterLease();
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(`[CodeGraph MCP] Failed to open project at ${resolvedRoot}: ${msg}\n`);
     }
+  }
+
+  private ensureWriterLease(projectRoot: string): void {
+    if (this.writerLease) {
+      if (this.writerLeaseRoot !== projectRoot) {
+        throw new Error(
+          `CodeGraph MCP writer lease already belongs to ${this.writerLeaseRoot}; ` +
+          `refusing to switch to ${projectRoot}`
+        );
+      }
+      return;
+    }
+    this.writerLease = acquireDatabaseWriterLease(projectRoot);
+    this.writerLeaseRoot = projectRoot;
+  }
+
+  private releaseWriterLease(): void {
+    if (!this.writerLease) return;
+    this.writerLease.release();
+    this.writerLease = null;
+    this.writerLeaseRoot = null;
   }
 
   /**
@@ -265,8 +297,8 @@ export class MCPEngine {
       },
       onDegraded: (reason) => {
         // Live watching gave up permanently (watch-resource exhaustion or a
-        // write lock held past the retry budget). Say so loudly and ONCE — the
-        // graph will no longer auto-update, so a long-running MCP session must
+        // persistent generic sync failure). Say so loudly and ONCE — the graph
+        // will no longer auto-update, so a long-running MCP session must
         // not keep assuming it's fresh. The reason already names the remedy
         // (`codegraph sync` / git sync hooks).
         process.stderr.write(`[CodeGraph MCP] File watcher degraded — ${reason}\n`);

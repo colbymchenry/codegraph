@@ -224,9 +224,6 @@ export class FileLock {
   private lockPath: string;
   private held = false;
 
-  /** Locks older than this are considered stale regardless of PID status */
-  private static readonly STALE_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
-
   constructor(lockPath: string) {
     this.lockPath = lockPath;
   }
@@ -235,47 +232,59 @@ export class FileLock {
    * Acquire the lock. Throws if the lock is held by another live process.
    */
   acquire(): void {
-    // Check for existing lock
-    if (fs.existsSync(this.lockPath)) {
-      try {
-        const content = fs.readFileSync(this.lockPath, 'utf-8').trim();
-        const pid = parseInt(content, 10);
-        const stat = fs.statSync(this.lockPath);
-        const lockAge = Date.now() - stat.mtimeMs;
+    if (this.held) {
+      throw new Error(`CodeGraph lock is already held by this instance: ${this.lockPath}`);
+    }
 
-        // Treat locks older than the timeout as stale, regardless of PID
-        if (lockAge < FileLock.STALE_TIMEOUT_MS && !isNaN(pid) && this.isProcessAlive(pid)) {
+    // Try the atomic create first. This keeps the uncontended path free of a
+    // check-then-create race and makes the existing-file branch contention-only.
+    try {
+      fs.writeFileSync(this.lockPath, String(process.pid), { flag: 'wx' });
+      this.held = true;
+      return;
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    }
+
+    // A live writer owns the lock for as long as its operation takes. The old
+    // two-minute timeout let an MCP watcher steal a healthy full-index lock,
+    // which reintroduced concurrent SQLite writers on large repositories.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const observed = fs.readFileSync(this.lockPath, 'utf-8').trim();
+        const pid = parseInt(observed, 10);
+        if (isNaN(pid) || pid <= 0) {
+          throw new Error(
+            `CodeGraph lock record is malformed. ` +
+            `Run 'codegraph unlock' after verifying no CodeGraph writer is active: ${this.lockPath}`
+          );
+        }
+        if (this.isProcessAlive(pid)) {
           throw new Error(
             `CodeGraph database is locked by another process (PID ${pid}). ` +
             `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
           );
         }
 
-        // Stale lock (dead process or timed out) - remove it
+        // Compare immediately before delete. If another writer replaced the
+        // record after our liveness check, retry instead of deleting its lock.
+        if (fs.readFileSync(this.lockPath, 'utf-8').trim() !== observed) continue;
         fs.unlinkSync(this.lockPath);
-      } catch (err) {
-        if (err instanceof Error && err.message.includes('locked by another')) {
-          throw err;
-        }
-        // Other errors reading lock file - try to remove it
-        try { fs.unlinkSync(this.lockPath); } catch { /* ignore */ }
+      } catch (err: unknown) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT') throw err;
+      }
+
+      try {
+        fs.writeFileSync(this.lockPath, String(process.pid), { flag: 'wx' });
+        this.held = true;
+        return;
+      } catch (err: unknown) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
       }
     }
 
-    // Write our PID to the lock file using exclusive create flag
-    try {
-      fs.writeFileSync(this.lockPath, String(process.pid), { flag: 'wx' });
-      this.held = true;
-    } catch (err: any) {
-      if (err.code === 'EEXIST') {
-        // Race condition: another process grabbed the lock between our check and write
-        throw new Error(
-          'CodeGraph database is locked by another process. ' +
-          `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
-        );
-      }
-      throw err;
-    }
+    throw new Error(`CodeGraph database lock changed repeatedly while acquiring: ${this.lockPath}`);
   }
 
   /**
@@ -326,7 +335,8 @@ export class FileLock {
     try {
       process.kill(pid, 0);
       return true;
-    } catch {
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code === 'EPERM') return true;
       return false;
     }
   }

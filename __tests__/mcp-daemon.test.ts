@@ -163,12 +163,54 @@ function countListeningLines(root: string): number {
 
 function killTree(...procs: ChildProcessWithoutNullStreams[]): void {
   for (const p of procs) {
-    if (!p.killed) { try { p.kill('SIGKILL'); } catch { /* gone */ } }
+    if (p.exitCode === null && p.signalCode === null) {
+      try { p.kill('SIGKILL'); } catch { /* gone */ }
+    }
   }
 }
 
 async function waitProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
   return waitFor(() => !isAlive(pid), timeoutMs).then(() => true).catch(() => false);
+}
+
+function waitChildClose(
+  child: ChildProcessWithoutNullStreams,
+  timeoutMs: number,
+): Promise<boolean> {
+  if ((child.exitCode !== null || child.signalCode !== null)
+    && child.stdin.destroyed && child.stdout.destroyed && child.stderr.destroyed) {
+    return Promise.resolve(true);
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer: NodeJS.Timeout;
+    const finish = (closed: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.removeListener('close', onClose);
+      resolve(closed);
+    };
+    const onClose = () => finish(true);
+    child.once('close', onClose);
+    timer = setTimeout(() => finish(false), timeoutMs);
+  });
+}
+
+async function removeTempDirWhenReleased(dir: string, timeoutMs: number): Promise<void> {
+  const started = Date.now();
+  let lastError: NodeJS.ErrnoException | null = null;
+  do {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      lastError = error as NodeJS.ErrnoException;
+      if (!['EBUSY', 'EPERM', 'ENOTEMPTY'].includes(lastError.code ?? '')) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  } while (Date.now() - started <= timeoutMs);
+  throw lastError ?? new Error(`Timed out removing ${dir}`);
 }
 
 describe('Shared MCP daemon (issue #411)', () => {
@@ -184,18 +226,35 @@ describe('Shared MCP daemon (issue #411)', () => {
   });
 
   afterEach(async () => {
+    // Register close listeners before kill so already-fast Windows exits cannot
+    // race past the event that proves child stdio/process handles were released.
+    const proxyCloseWaits = servers.map((server) => waitChildClose(server.child, 5000));
+    // Capture the detached daemon before killing proxies: some shutdown
+    // paths remove the pidfile while Windows still owns process/CWD handles.
+    const daemonPid = readLockPid(realRoot);
     killTree(...servers.map((s) => s.child));
+    const proxyClosed = await Promise.all(proxyCloseWaits);
+    const failedProxyIndex = proxyClosed.findIndex((closed) => !closed);
     // The daemon is detached (not a tracked child) — reap it explicitly via the
     // pid it recorded, so a test can't leak a background daemon. Guard against
     // our own pid: the version-mismatch test plants `pid: process.pid` in the
     // lockfile, and we must never SIGKILL the vitest worker.
-    const daemonPid = readLockPid(realRoot);
     if (daemonPid && daemonPid !== process.pid && isAlive(daemonPid)) {
       try { process.kill(daemonPid, 'SIGKILL'); } catch { /* race */ }
+      if (!(await waitProcessExit(daemonPid, 5000))) {
+        throw new Error(`Detached daemon ${daemonPid} did not exit during teardown`);
+      }
     }
-    await new Promise((r) => setTimeout(r, 50));
+    const failedProxyPid = failedProxyIndex === -1
+      ? null
+      : servers[failedProxyIndex].child.pid ?? 'unknown';
     servers.length = 0;
-    fs.rmSync(tempDir, { recursive: true, force: true });
+    if (failedProxyIndex !== -1) {
+      throw new Error(`Proxy process ${failedProxyPid} did not close during teardown`);
+    }
+    // A detached daemon is not a ChildProcess we can await for `close`. Retry
+    // only transient Windows directory-handle races after its PID is gone.
+    await removeTempDirWhenReleased(tempDir, 5000);
   });
 
   it('two invocations share ONE detached daemon; both attach as proxies', async () => {

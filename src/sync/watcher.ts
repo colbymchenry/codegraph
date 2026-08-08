@@ -41,11 +41,11 @@ import { isCodeGraphDataDir } from '../directory';
 import { watchDisabledReason } from './watch-policy';
 
 /**
- * Number of consecutive lock-contention retries the watcher tolerates before
- * it gives up and degrades auto-sync. Brief contention (another writer for a
- * few cycles) stays under this; a long-lived external writer crosses it.
+ * Maximum exponential-backoff step for lock contention. A competing writer is
+ * recoverable no matter how long it holds the lock, so retries continue at the
+ * capped interval until a clean sync resets the counter.
  */
-const MAX_LOCK_RETRIES = 5;
+const MAX_LOCK_BACKOFF_STEPS = 5;
 /**
  * Number of consecutive GENERIC (non-lock) sync failures the watcher tolerates
  * before it degrades auto-sync. A deterministic failure — a tree-sitter
@@ -193,9 +193,9 @@ export interface WatchOptions {
 
   /**
    * Callback fired ONCE when live watching degrades permanently and auto-sync
-   * is disabled — OS watch-resource exhaustion (EMFILE/ENFILE), a write lock
-   * held past the retry budget, or a generic sync failure that persists past
-   * the retry budget (#1127). The string is an actionable, human-readable
+   * is disabled — OS watch-resource exhaustion (EMFILE/ENFILE), or a generic
+   * sync failure that persists past the retry budget (#1127). The string is an
+   * actionable, human-readable
    * reason. Lets a host (MCP server, daemon, CLI) tell the user that the index
    * will no longer auto-update instead of silently serving stale results.
    */
@@ -277,8 +277,8 @@ export class FileWatcher {
   private inotifyLimitWarned = false;
   /**
    * One-way latch: the reason live watching was permanently disabled at runtime
-   * (watch-resource exhaustion, lock contention past the retry budget, or a
-   * persistent generic sync failure past the retry budget), or null while
+   * (watch-resource exhaustion or a persistent generic sync failure past the
+   * retry budget), or null while
    * healthy. Set by {@link degrade}; cleared only by a fresh start().
    */
   private degradedReason: string | null = null;
@@ -661,8 +661,8 @@ export class FileWatcher {
 
   /**
    * Permanently disable live watching after a terminal runtime failure
-   * (watch-resource exhaustion, lock contention past the retry budget, or a
-   * persistent generic sync failure past the retry budget).
+   * (watch-resource exhaustion or a persistent generic sync failure past the
+   * retry budget).
    * Idempotent: logs one actionable warning, fires {@link WatchOptions.onDegraded}
    * once, and stops the watcher. A subsequent start() clears the latch.
    */
@@ -872,24 +872,16 @@ export class FileWatcher {
       this.onSyncComplete?.(result);
     } catch (err) {
       if (err instanceof LockUnavailableError) {
-        this.lockRetryCount += 1;
+        this.lockRetryCount = Math.min(this.lockRetryCount + 1, MAX_LOCK_BACKOFF_STEPS);
         // Lock-failure no-op (another writer holds the lock). pendingFiles
-        // stays intact and the `finally` block reschedules with backoff. Keep
-        // brief contention quiet (debug-only — a long external index would
-        // otherwise spam stderr every cycle), but stop retrying forever: once a
-        // writer holds the lock past the budget, degrade auto-sync explicitly.
+        // stays intact and the `finally` block reschedules with bounded
+        // backoff. Keep contention quiet (debug-only — a long external index
+        // would otherwise spam stderr every cycle) and keep retrying: a writer
+        // that eventually releases the lock must not permanently disable sync.
         logDebug('Watch sync skipped: file lock unavailable', {
           pendingFiles: this.pendingFiles.size,
           retryCount: this.lockRetryCount,
         });
-        if (this.lockRetryCount > MAX_LOCK_RETRIES) {
-          this.degrade(
-            'CodeGraph file lock held by another process past the retry budget; ' +
-              'auto-sync disabled. Run `codegraph sync` once the other writer finishes ' +
-              '(or install git sync hooks) to refresh the graph.',
-            { pendingFiles: this.pendingFiles.size, retryCount: this.lockRetryCount }
-          );
-        }
       } else {
         this.lockRetryCount = 0; // a non-lock failure isn't contention; reset that streak
         this.syncFailureRetryCount += 1;
@@ -926,8 +918,8 @@ export class FileWatcher {
       // generic sync failure — back off exponentially (debounceMs · 2^(n-1),
       // capped) instead of retrying at the normal debounce cadence; a clean
       // sync resets both counters so normal edits keep the fast debounce. Use
-      // the larger streak so interleaved failures still back off. A degrade()
-      // above already set `stopped`, so this won't reschedule a watcher that
+      // the larger streak so interleaved failures still back off. A generic-
+      // failure degrade() above already set `stopped`, so this won't reschedule a watcher that
       // has given up.
       if (this.pendingFiles.size > 0 && !this.stopped) {
         const retryCount = Math.max(this.lockRetryCount, this.syncFailureRetryCount);
