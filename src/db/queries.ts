@@ -1223,6 +1223,18 @@ export class QueryBuilder {
       // results despite the DB having plenty of matches.
       : this.searchAllByFilters({ kinds, languages, limit: limit * 5 });
 
+    // FTS unicode61 keeps camelCase/PascalCase identifiers as opaque tokens,
+    // so a query like `checkout` misses `getShippingMethodIdFromCheckout`.
+    // name_segment_vocab already stores those sub-words at index time — merge
+    // them into the candidate set before falling through to LIKE (#1520).
+    if (text) {
+      results = this.supplementWithSegmentMatches(results, text, {
+        kinds,
+        languages,
+        limit: Math.max(limit * 5, 100),
+      });
+    }
+
     // If no FTS results, try LIKE-based substring search
     if (results.length === 0 && text.length >= 2) {
       results = this.searchNodesLike(text, { kinds, languages, limit, offset });
@@ -1394,6 +1406,58 @@ export class QueryBuilder {
         // exact-match fallbacks (dist 0) outrank dist-2 typos.
         results.push({ node: rowToNode(row), score: 1 / (1 + c.dist) });
         if (results.length >= limit) break;
+      }
+    }
+    return results;
+  }
+
+  /**
+   * Merge camelCase/PascalCase sub-word hits from `name_segment_vocab` into an
+   * FTS candidate set. FTS5's default tokenizer does not split case boundaries,
+   * so queries like `checkout` otherwise miss `getShippingMethodIdFromCheckout`
+   * even though that segment was materialized at index time (#1520).
+   */
+  private supplementWithSegmentMatches(
+    results: SearchResult[],
+    text: string,
+    options: { kinds?: NodeKind[]; languages?: Language[]; limit: number },
+  ): SearchResult[] {
+    const { kinds, languages, limit } = options;
+    const terms = text
+      .replace(/::/g, ' ')
+      .replace(/['"*():^]/g, '')
+      .split(/\s+/)
+      .map((t) => t.toLowerCase())
+      .filter((t) => t.length >= 2)
+      .filter((t) => !/^(and|or|not|near)$/i.test(t));
+    if (terms.length === 0) return results;
+
+    const existingIds = new Set(results.map((r) => r.node.id));
+    const baseScore =
+      results.length > 0 ? Math.max(...results.map((r) => r.score)) : 1;
+    const perTerm = Math.max(20, Math.ceil(limit / Math.max(terms.length, 1)));
+
+    for (const term of terms) {
+      const names = this.getNamesForSegment(term, perTerm);
+      if (names.length === 0) continue;
+      const placeholders = names.map(() => '?').join(', ');
+      let sql = `SELECT * FROM nodes WHERE name IN (${placeholders})`;
+      const params: (string | number)[] = [...names];
+      if (kinds && kinds.length > 0) {
+        sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
+        params.push(...kinds);
+      }
+      if (languages && languages.length > 0) {
+        sql += ` AND language IN (${languages.map(() => '?').join(',')})`;
+        params.push(...languages);
+      }
+      sql += ' LIMIT ?';
+      params.push(perTerm * 3);
+      const rows = this.db.prepare(sql).all(...params) as NodeRow[];
+      for (const row of rows) {
+        if (existingIds.has(row.id)) continue;
+        results.push({ node: rowToNode(row), score: baseScore });
+        existingIds.add(row.id);
       }
     }
     return results;
