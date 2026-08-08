@@ -883,6 +883,32 @@ export class CodeGraph {
           }
         }
 
+        // Re-open resolution edges this sync may have invalidated ELSEWHERE in
+        // the repo (CG-33). Everything above re-resolves references in the
+        // changed files; this covers the opposite direction — references in
+        // files the sync never touched whose answer depended on a definition
+        // that just appeared or disappeared. Without it a synced index never
+        // converges to a full rebuild: measured at 4.3% of distinct edges wrong
+        // on codegraph's own index, in both directions, mostly `calls`. The
+        // resurrected refs are pending rows, so the orphan sweep immediately
+        // below is what resolves them — batched, yielding, multi-pass, exactly
+        // as a full index resolves.
+        //
+        // `definitionDelta` is empty for a body-only edit, so the overwhelmingly
+        // common sync pays one branch. CODEGRAPH_NO_REBIND=1 disables it.
+        if (result.definitionDelta && process.env.CODEGRAPH_NO_REBIND !== '1') {
+          const tRebind = Date.now();
+          const rebound = this.orchestrator.resurrectStaleResolutionEdges(
+            result.definitionDelta,
+            result.changedFilePaths ?? []
+          );
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+            console.error(
+              `[phase-timing] sync-rebind: ${Date.now() - tRebind}ms (${result.definitionDelta.length} changed names, ${rebound} edges re-opened)`
+            );
+          }
+        }
+
         // Orphan sweep (#1187). A resolution pass that dies mid-run — the #850
         // daemon liveness watchdog's SIGKILL (#1122), Ctrl-C, a crash — leaves
         // the refs it never reached in unresolved_refs, and the git-scoped fast
@@ -1548,6 +1574,19 @@ export class CodeGraph {
    */
   generatedFilePredicate(filePaths: Iterable<string>): (filePath: string) => boolean {
     return this.queries.generatedPredicateFor(filePaths);
+  }
+
+  /**
+   * A `(path) => boolean` ambient-declaration test over a BOUNDED candidate
+   * list: true for a file that declares nothing but types, originates no call
+   * edge, and that nothing in the index depends on — an ambient `.d.ts` of
+   * global shims, vendored typings, module augmentation (CG-28). Structural
+   * rather than extension-based, and deliberately narrow: see
+   * `QueryBuilder.getAmbientDeclarationPathsAmong` for why each condition is
+   * there, in particular why a `types.ts` the codebase imports is NOT flagged.
+   */
+  ambientDeclarationFilePredicate(filePaths: Iterable<string>): (filePath: string) => boolean {
+    return this.queries.ambientDeclarationPredicateFor(filePaths);
   }
 
   /** How many indexed files are flagged tool-generated. Reported by `status`. */

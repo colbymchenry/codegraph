@@ -150,6 +150,28 @@ function evaluate(fixture, report, text) {
       `answer ${pct(share('answer'))} delivered (${pct(allocated.get('answer') ?? 0)} allocated)`,
     );
   }
+  // Same question against the SOURCE the response delivered rather than the
+  // whole envelope (CG-26). The envelope-denominated gate above moves whenever
+  // the response's prose does — the epilogue surviving instead of being
+  // discarded costs it a point, and every additional admitted file that gets
+  // paid dilutes it further — so it cannot tell "the answer was starved" from
+  // "everything else was also delivered". Allocation is about source bytes;
+  // measure it in source bytes.
+  if (want.answerShareOfSourceAtLeast !== undefined) {
+    const sourceBy = new Map();
+    let totalSource = 0;
+    for (const f of report.files) {
+      const g = groupOf(f.path, groups);
+      sourceBy.set(g, (sourceBy.get(g) ?? 0) + f.finalChars);
+      totalSource += f.finalChars;
+    }
+    const answerSource = totalSource > 0 ? (sourceBy.get('answer') ?? 0) / totalSource : 0;
+    add(
+      `answer group takes >= ${pct(want.answerShareOfSourceAtLeast)} of DELIVERED SOURCE`,
+      answerSource >= want.answerShareOfSourceAtLeast,
+      `answer ${num(sourceBy.get('answer') ?? 0)} of ${num(totalSource)} source chars (${pct(answerSource)})`,
+    );
+  }
   if (want.incidentalShareAtMost !== undefined) {
     add(
       `incidental group takes <= ${pct(want.incidentalShareAtMost)} of the envelope`,
@@ -174,6 +196,23 @@ function evaluate(fixture, report, text) {
         ? `${num(rec.finalChars)} delivered of ${num(rec.emittedChars)} allocated` +
           (rec.finalChars === 0 && rec.emittedChars > 0 ? ' — hard ceiling dropped the whole section' : '') +
           (rec.emittedChars === 0 ? ` — never rendered (${rec.skipped ?? 'not reached'}, rank #${rec.rank})` : '')
+        : 'not among the ranked candidates',
+    );
+  }
+  // Reservation-vs-delivered, per file (CG-36). The share gates above ask which
+  // files won the envelope; this asks whether a file that WON its share then
+  // actually spent it. A file can rank #1, be reserved the largest slice, and
+  // still deliver a quarter of it because the cluster carrying the answer was
+  // dropped whole instead of shrunk — and the share gates read that as a pass,
+  // since the unspent bytes carry forward and the envelope stays full.
+  for (const [path, floor] of Object.entries(want.spendShareAtLeast ?? {})) {
+    const rec = report.files.find((f) => f.path === path);
+    const spent = rec && rec.allowance ? rec.finalChars / rec.allowance : 0;
+    add(
+      `${path} spends >= ${pct(floor)} of its reservation`,
+      !!rec && rec.allowance > 0 && spent >= floor,
+      rec
+        ? `${num(rec.finalChars)} delivered of a ${num(rec.allowance ?? 0)} reservation (${pct(spent)})`
         : 'not among the ranked candidates',
     );
   }
