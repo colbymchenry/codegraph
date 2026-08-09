@@ -20,6 +20,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
 import { DatabaseConnection } from '../src/db';
+import { encodeLockInfo, getDaemonPidPath } from '../src/mcp/daemon-paths';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
@@ -47,6 +48,27 @@ function graphCounts(dir: string): { nodes: number; edges: number } {
   } finally {
     cg.close();
   }
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function startDetachedProcess(): number {
+  const source = [
+    "const { spawn } = require('child_process');",
+    "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });",
+    'child.unref();',
+    'console.log(child.pid);',
+  ].join(' ');
+  const pid = Number(execFileSync(process.execPath, ['-e', source], { encoding: 'utf8' }).trim());
+  if (!Number.isInteger(pid) || pid <= 0) throw new Error('could not start daemon fixture');
+  return pid;
 }
 
 describe('codegraph index — full re-index keeps the graph populated (#874)', () => {
@@ -111,6 +133,29 @@ describe('codegraph index — full re-index keeps the graph populated (#874)', (
 
     expect(afterIndex.nodes).toBe(afterInit.nodes);
     expect(afterIndex.edges).toBe(afterInit.edges);
+  });
+
+  it('refuses to recreate while a live daemon cannot be verified (#1325)', () => {
+    runCodegraph(['init'], tempDir);
+    const daemonPid = startDetachedProcess();
+    const lockPath = getDaemonPidPath(fs.realpathSync(tempDir));
+    fs.writeFileSync(
+      lockPath,
+      encodeLockInfo({
+        pid: daemonPid,
+        version: 'test',
+        socketPath: path.join(tempDir, '.codegraph', 'missing.sock'),
+        startedAt: Date.now(),
+      }),
+    );
+
+    try {
+      expect(() => runCodegraph(['index', '--quiet'], tempDir)).toThrow(/could not verify.*daemon/i);
+      expect(isAlive(daemonPid)).toBe(true);
+      expect(fs.existsSync(lockPath)).toBe(true);
+    } finally {
+      if (isAlive(daemonPid)) process.kill(daemonPid, 'SIGKILL');
+    }
   });
 });
 

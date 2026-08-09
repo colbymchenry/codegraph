@@ -19,6 +19,7 @@
  * TerminateProcess). Validated live on all three.
  */
 import * as fs from 'fs';
+import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import * as crypto from 'crypto';
@@ -142,35 +143,48 @@ async function waitForDeath(pid: number, timeoutMs: number): Promise<boolean> {
 export interface StopResult {
   root: string;
   pid: number | null;
-  /** 'term' graceful, 'kill' force, 'not-running' stale lock, 'no-daemon' none found. */
-  outcome: 'term' | 'kill' | 'not-running' | 'no-daemon';
+  /** 'term' graceful, 'kill' force, 'still-running' failed stop, 'not-running' stale lock, 'unverified' foreign PID, 'no-daemon' none found. */
+  outcome: 'term' | 'kill' | 'still-running' | 'not-running' | 'unverified' | 'no-daemon';
 }
 
-/**
- * Stop the daemon serving `root`: SIGTERM, wait, then SIGKILL if it won't go,
- * then sweep its artifacts. `root` must be realpath'd (match how the daemon
- * keys its socket/lockfile). Resolves the pid from the authoritative lockfile,
- * falling back to the registry.
- */
-export async function stopDaemonAt(root: string): Promise<StopResult> {
-  let pid: number | null = null;
-  try {
-    const info = decodeLockInfo(fs.readFileSync(getDaemonPidPath(root), 'utf8'));
-    pid = info?.pid ?? null;
-  } catch {
-    /* no lockfile */
-  }
-  if (pid == null) {
-    const rec = listDaemons({ prune: false }).find(
-      (r) => path.resolve(r.root) === path.resolve(root)
-    );
-    pid = rec?.pid ?? null;
-  }
+type DaemonIdentity = { pid: number; version: string; socketPath: string; startedAt: number };
 
-  if (pid == null) {
-    cleanupDaemonArtifacts(root);
-    return { root, pid: null, outcome: 'no-daemon' };
-  }
+/** Confirm the pidfile points at a live CodeGraph daemon before signalling its PID. */
+async function verifiesDaemonIdentity(info: DaemonIdentity): Promise<boolean> {
+  if (!info.socketPath || info.version === 'unknown') return false;
+  return new Promise((resolve) => {
+    const socket = net.createConnection(info.socketPath);
+    let buffer = '';
+    let settled = false;
+    const finish = (matches: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(matches);
+    };
+    const timer = setTimeout(() => finish(false), 500);
+    socket.on('error', () => finish(false));
+    socket.on('data', (chunk: Buffer | string) => {
+      buffer += chunk.toString();
+      if (buffer.length > 8192) return finish(false);
+      const newline = buffer.indexOf('\n');
+      if (newline < 0) return;
+      try {
+        const hello = JSON.parse(buffer.slice(0, newline));
+        finish(
+          hello?.codegraph === info.version &&
+          hello?.pid === info.pid &&
+          hello?.socketPath === info.socketPath,
+        );
+      } catch {
+        finish(false);
+      }
+    });
+  });
+}
+
+async function stopLiveDaemon(root: string, pid: number): Promise<StopResult> {
   if (!isProcessAlive(pid)) {
     cleanupDaemonArtifacts(root);
     return { root, pid, outcome: 'not-running' };
@@ -182,11 +196,47 @@ export async function stopDaemonAt(root: string): Promise<StopResult> {
   let outcome: StopResult['outcome'] = 'term';
   if (!(await waitForDeath(pid, 3000))) {
     try { process.kill(pid, 'SIGKILL'); } catch { /* raced to exit */ }
-    await waitForDeath(pid, 2000);
+    if (!(await waitForDeath(pid, 2000))) {
+      return { root, pid, outcome: 'still-running' };
+    }
     outcome = 'kill';
   }
   cleanupDaemonArtifacts(root);
   return { root, pid, outcome };
+}
+
+/**
+ * Stop the daemon serving `root`: SIGTERM, wait, then SIGKILL if it won't go,
+ * then sweep its artifacts. `root` must be realpath'd (match how the daemon
+ * keys its socket/lockfile). Resolves the pid from the authoritative lockfile,
+ * falling back to the registry.
+ */
+export async function stopDaemonAt(root: string): Promise<StopResult> {
+  let identity: DaemonIdentity | null = null;
+  try {
+    const info = decodeLockInfo(fs.readFileSync(getDaemonPidPath(root), 'utf8'));
+    if (info) identity = info;
+  } catch {
+    /* no lockfile */
+  }
+  if (identity == null) {
+    const rec = listDaemons({ prune: false }).find(
+      (r) => path.resolve(r.root) === path.resolve(root)
+    );
+    if (rec) identity = rec;
+  }
+
+  if (identity == null) {
+    cleanupDaemonArtifacts(root);
+    return { root, pid: null, outcome: 'no-daemon' };
+  }
+  if (!isProcessAlive(identity.pid)) {
+    return stopLiveDaemon(root, identity.pid);
+  }
+  if (!(await verifiesDaemonIdentity(identity))) {
+    return { root, pid: identity.pid, outcome: 'unverified' };
+  }
+  return stopLiveDaemon(root, identity.pid);
 }
 
 /** Stop every registered, live daemon. */

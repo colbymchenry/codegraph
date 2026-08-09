@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { spawn } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import * as fs from 'fs';
+import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import {
@@ -9,8 +10,10 @@ import {
   registerDaemon,
   deregisterDaemon,
   listDaemons,
+  stopDaemonAt,
   type DaemonRecord,
 } from '../src/mcp/daemon-registry';
+import { encodeLockInfo, getDaemonPidPath, getDaemonSocketPath } from '../src/mcp/daemon-paths';
 
 /** A pid that's guaranteed dead: spawn a trivial process, let it exit, reap it. */
 async function deadPid(): Promise<number> {
@@ -23,6 +26,24 @@ async function deadPid(): Promise<number> {
 
 function rec(root: string, pid: number, startedAt = Date.now()): DaemonRecord {
   return { root, pid, version: '1.0.0', socketPath: `${root}/.codegraph/daemon.sock`, startedAt };
+}
+
+function waitForExit(child: ReturnType<typeof spawn>): Promise<void> {
+  return child.exitCode !== null
+    ? Promise.resolve()
+    : new Promise((resolve) => child.once('exit', () => resolve()));
+}
+
+function startDetachedProcess(): number {
+  const source = [
+    "const { spawn } = require('child_process');",
+    "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });",
+    'child.unref();',
+    'console.log(child.pid);',
+  ].join(' ');
+  const pid = Number(execFileSync(process.execPath, ['-e', source], { encoding: 'utf8' }).trim());
+  if (!Number.isInteger(pid) || pid <= 0) throw new Error('could not start daemon fixture');
+  return pid;
 }
 
 describe('daemon-registry', () => {
@@ -55,6 +76,54 @@ describe('daemon-registry', () => {
       expect(isProcessAlive(NaN)).toBe(false);
       expect(isProcessAlive(await deadPid())).toBe(false);
     });
+  });
+
+  it('does not signal a live PID unless its socket identifies a CodeGraph daemon', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-foreign-daemon-'));
+    fs.mkdirSync(path.join(root, '.codegraph'));
+    const pid = startDetachedProcess();
+    fs.writeFileSync(
+      getDaemonPidPath(root),
+      encodeLockInfo({ pid, version: 'test', socketPath: path.join(root, '.codegraph', 'missing.sock'), startedAt: Date.now() }),
+    );
+
+    try {
+      const result = await stopDaemonAt(root);
+      expect(result.outcome).toBe('unverified');
+      expect(isProcessAlive(pid)).toBe(true);
+      expect(fs.existsSync(getDaemonPidPath(root))).toBe(true);
+    } finally {
+      if (isProcessAlive(pid)) process.kill(pid, 'SIGKILL');
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('stops a daemon whose socket hello matches its pidfile', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-daemon-identity-'));
+    fs.mkdirSync(path.join(root, '.codegraph'));
+    const socketPath = getDaemonSocketPath(root);
+    const pid = startDetachedProcess();
+    const server = net.createServer((socket) => {
+      socket.end(`${JSON.stringify({ codegraph: 'test', pid, socketPath })}\n`);
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(socketPath, resolve);
+    });
+    fs.writeFileSync(
+      getDaemonPidPath(root),
+      encodeLockInfo({ pid, version: 'test', socketPath, startedAt: Date.now() }),
+    );
+
+    try {
+      const result = await stopDaemonAt(root);
+      expect(result.outcome).toMatch(/term|kill/);
+      expect(isProcessAlive(pid)).toBe(false);
+    } finally {
+      if (isProcessAlive(pid)) process.kill(pid, 'SIGKILL');
+      server.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('listDaemons returns [] when nothing is registered (no dir yet)', () => {

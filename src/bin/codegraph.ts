@@ -768,6 +768,15 @@ program
         process.exit(1);
       }
 
+      // A live MCP daemon keeps SQLite handles open. Verify it by its socket
+      // before stopping it so a stale pidfile can never signal another process.
+      const { stopDaemonAt } = await import('../mcp/daemon-registry');
+      const daemonStop = await stopDaemonAt(fs.realpathSync(projectPath));
+      if (daemonStop.outcome === 'unverified' || daemonStop.outcome === 'still-running') {
+        error('Could not verify that the active CodeGraph daemon has stopped. Run `codegraph daemon` to stop it, then retry `codegraph index`.');
+        process.exit(1);
+      }
+
       const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
       // `index` is a FULL re-index — identical to a fresh `init`. RECREATE the
       // database from scratch (discard .codegraph/codegraph.db + its WAL) rather
