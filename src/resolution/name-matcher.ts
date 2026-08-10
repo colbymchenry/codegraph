@@ -5,7 +5,7 @@
  */
 
 import { Language, Node } from '../types';
-import { UnresolvedRef, ResolvedRef, ResolutionContext, SUPERTYPE_TARGET_KINDS, isInheritanceRef } from './types';
+import { UnresolvedRef, ResolvedRef, ResolutionContext, SUPERTYPE_TARGET_KINDS, isInheritanceRef, isImportableKind } from './types';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -415,7 +415,11 @@ export function matchByExactName(
     // the real `trait`, and as the sole candidate was adopted outright by the
     // single-match shortcut. Restricting the pool BEFORE ranking lets the
     // legitimate supertype win instead of merely dropping the false edge.
-    .filter((n) => !isInheritanceRef(ref) || SUPERTYPE_TARGET_KINDS.has(n.kind));
+    .filter((n) => !isInheritanceRef(ref) || SUPERTYPE_TARGET_KINDS.has(n.kind))
+    // Likewise for `imports`: a member that only exists inside a type is not
+    // importable, so it is not a candidate. Without this a `path`/`id`/`url`
+    // import resolved to some interface's same-named property.
+    .filter((n) => ref.referenceKind !== 'imports' || isImportableKind(n.kind));
 
   if (candidates.length === 0) {
     return null;

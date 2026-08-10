@@ -307,3 +307,20 @@ export const SUPERTYPE_TARGET_KINDS = new Set<Node['kind']>([
 export function isInheritanceRef(ref: UnresolvedRef): boolean {
   return ref.referenceKind === 'extends' || ref.referenceKind === 'implements';
 }
+
+/**
+ * Node kinds an `imports` edge may never TARGET: members that only exist
+ * INSIDE a type. No language lets you import a class's property, an
+ * interface's method or an enum's variant — you import the type that
+ * contains it. The name-matcher has no kind filter, so a bare
+ * `import path from 'node:path'` (unresolvable, since the module is external)
+ * name-matched an interface property called `path` in an unrelated file.
+ */
+const NON_IMPORTABLE_KINDS = new Set<Node['kind']>([
+  'property', 'field', 'method', 'enum_member', 'parameter',
+]);
+
+/** Can an `imports` reference legally resolve to this node kind? */
+export function isImportableKind(kind: Node['kind']): boolean {
+  return !NON_IMPORTABLE_KINDS.has(kind);
+}

@@ -17,6 +17,7 @@ import {
   ImportMapping,
   SUPERTYPE_TARGET_KINDS,
   isInheritanceRef,
+  isImportableKind,
 } from './types';
 import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
 import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos } from './import-resolver';
@@ -2431,11 +2432,15 @@ export class ReferenceResolver {
   }
 
   /**
-   * Drop an `extends`/`implements` resolution that cannot be describing a real
-   * supertype. Applied at the `resolveOne` seam so it covers every strategy
-   * uniformly — framework, import, name-match, chain, CFML component path.
+   * Drop a resolution whose target cannot be what the reference names.
+   * Applied at the `resolveOne` seam so it covers every strategy uniformly —
+   * framework, import, name-match, chain, CFML component path.
    *
-   * Two independent reasons to drop, and BOTH are needed:
+   * For `imports`: the target must be importable. A member that only exists
+   * inside a type never is.
+   *
+   * For `extends`/`implements`, it cannot be describing a real supertype when:
+   *
    *  1. The target's kind can never be a supertype (an enum member, a method,
    *     a variable). `matchByExactName` additionally narrows its candidate
    *     pool by the same set, so a legitimate supertype outranks a same-named
@@ -2450,6 +2455,14 @@ export class ReferenceResolver {
    */
   private gateTargetKind(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
     if (!result) return result;
+
+    // An `imports` reference names something importable — never a member that
+    // only exists inside a type.
+    if (ref.referenceKind === 'imports') {
+      const target = this.queries.getNodeById(result.targetNodeId);
+      return target && !isImportableKind(target.kind) ? null : result;
+    }
+
     if (!isInheritanceRef(ref)) return result;
     const target = this.queries.getNodeById(result.targetNodeId);
     if (target && !SUPERTYPE_TARGET_KINDS.has(target.kind)) return null;
