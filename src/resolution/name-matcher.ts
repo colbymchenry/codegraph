@@ -5,7 +5,7 @@
  */
 
 import { Language, Node } from '../types';
-import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
+import { UnresolvedRef, ResolvedRef, ResolutionContext, SUPERTYPE_TARGET_KINDS, isInheritanceRef } from './types';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -407,7 +407,15 @@ export function matchByExactName(
   const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref)
     .filter((n) => n.kind !== 'import')
     // Nested locals are only reachable from inside their container (#1230).
-    .filter((n) => isLexicallyReachable(n, ref, context));
+    .filter((n) => isLexicallyReachable(n, ref, context))
+    // An `extends`/`implements` ref names a supertype, so anything that can't
+    // BE one is not a candidate at all. This is eligibility, not
+    // ranking: kind is only a scoring bonus below (and none is awarded for
+    // inheritance refs), so without this a same-named `enum_member` outranked
+    // the real `trait`, and as the sole candidate was adopted outright by the
+    // single-match shortcut. Restricting the pool BEFORE ranking lets the
+    // legitimate supertype win instead of merely dropping the false edge.
+    .filter((n) => !isInheritanceRef(ref) || SUPERTYPE_TARGET_KINDS.has(n.kind));
 
   if (candidates.length === 0) {
     return null;

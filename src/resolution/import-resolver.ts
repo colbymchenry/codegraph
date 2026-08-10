@@ -2274,3 +2274,130 @@ function resolveStaticMember(
   }
   return candidates[0];
 }
+
+/**
+ * Rust `use` declarations, flattened to `localName → full path`.
+ *
+ * Rust is the one supported language with NO `ImportMapping` extraction (see
+ * `extractImportMappings`), so this is the only channel that can tell whether
+ * a bare type name in a Rust file was brought in by a `use`. Handles nested
+ * groups (`use a::{b::C, d as E}`), globs (skipped — they bind no single
+ * name), and `as` aliases.
+ */
+function collectRustUseBindings(content: string): Map<string, string> {
+  const out = new Map<string, string>();
+
+  // Expand one level of `{...}` at a time so `a::{b::{C, D}, E}` flattens.
+  const expand = (spec: string): string[] => {
+    const open = spec.indexOf('{');
+    if (open === -1) return [spec.trim()];
+    const prefix = spec.slice(0, open);
+    let depth = 0;
+    let close = -1;
+    for (let i = open; i < spec.length; i++) {
+      if (spec[i] === '{') depth++;
+      else if (spec[i] === '}') {
+        depth--;
+        if (depth === 0) { close = i; break; }
+      }
+    }
+    if (close === -1) return [];
+    const suffix = spec.slice(close + 1);
+    const inner = spec.slice(open + 1, close);
+    const parts: string[] = [];
+    let depth2 = 0;
+    let start = 0;
+    for (let i = 0; i <= inner.length; i++) {
+      const ch = inner[i];
+      if (ch === '{') depth2++;
+      else if (ch === '}') depth2--;
+      if (i === inner.length || (ch === ',' && depth2 === 0)) {
+        const seg = inner.slice(start, i).trim();
+        if (seg) parts.push(seg);
+        start = i + 1;
+      }
+    }
+    return parts.flatMap((p) => expand(prefix + p + suffix));
+  };
+
+  // `use` items end at the first `;`. Attributes/visibility (`pub use`) are
+  // irrelevant to the binding itself.
+  const useRe = /(^|\n)\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([^;]+);/g;
+  let m: RegExpExecArray | null;
+  while ((m = useRe.exec(content)) !== null) {
+    for (const spec of expand(m[2]!.replace(/\s+/g, ' '))) {
+      const aliasMatch = /^(.*?)\s+as\s+([A-Za-z_]\w*)$/.exec(spec);
+      const rawPath = (aliasMatch ? aliasMatch[1]! : spec).trim();
+      if (!rawPath || rawPath.endsWith('*')) continue;
+      const segments = rawPath.split('::').map((s) => s.trim()).filter(Boolean);
+      const leaf = segments[segments.length - 1];
+      if (!leaf) continue;
+      const local = aliasMatch ? aliasMatch[2]! : leaf;
+      out.set(local, segments.join('::'));
+    }
+  }
+  return out;
+}
+
+/**
+ * Is `name`, as used in `ref`'s file, bound by an import whose module lives
+ * OUTSIDE the repository?
+ *
+ * When it is, no in-repo node can be the referent: the symbol is defined in a
+ * third-party crate/package, and any same-named local symbol the name-matcher
+ * finds is a coincidence. Rust `use std::error::Error;` + `impl Error for
+ * MapperError {}` bound to a local `MapperError::Error` variant, and once
+ * non-type kinds were filtered out it simply moved to an unrelated local
+ * `type Error` alias — restricting kinds alone RELOCATES the false edge
+ * instead of removing it, so locality has to be checked too.
+ *
+ * Answers only when it can be CERTAIN, because a false "yes" deletes a real
+ * edge. Two languages qualify, each with an oracle that cannot be wrong:
+ *
+ *  - **Rust** — the `use` path is rooted at a standard-library crate
+ *    (`std`/`core`/`alloc`/`proc_macro`), which by definition ships outside
+ *    any repository. Deliberately NOT generalized to "the module path doesn't
+ *    resolve to a file": a crate can re-export another workspace crate's
+ *    modules (`pub use pupil_core::{ports, domain};`), so `crate::ports::X`
+ *    has no `src/ports/` directory to walk yet is entirely in-repo — that
+ *    generalization measured 13 real trait implementations deleted.
+ *  - **ES modules** — `isExternalImport`, which already accounts for tsconfig
+ *    path aliases and monorepo workspace packages.
+ *
+ * Everything else returns false and resolves exactly as before. JVM and Python
+ * imports notably do NOT go through `resolveImportPath` (they have dedicated
+ * FQN/module matchers), so there is no trustworthy oracle to consult here.
+ */
+const ESM_IMPORT_LANGUAGES = new Set<Language>([
+  'typescript', 'tsx', 'javascript', 'jsx', 'arkts', 'svelte', 'vue', 'astro',
+]);
+
+/** Rust path roots that always name a standard-library crate. */
+const RUST_STDLIB_ROOTS = new Set(['std', 'core', 'alloc', 'proc_macro']);
+
+export function isBoundToOutOfRepoImport(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): boolean {
+  const name = ref.referenceName;
+  if (name.includes('::') || name.includes('.')) return false; // qualified refs resolve by path
+
+  if (ref.language === 'rust') {
+    const content = context.readFile(ref.filePath);
+    if (!content) return false;
+    const usePath = collectRustUseBindings(content).get(name);
+    if (!usePath) return false;
+    const segments = usePath.split('::');
+    if (segments.length < 2 || !RUST_STDLIB_ROOTS.has(segments[0]!)) return false;
+    // 2015-edition crate-relative paths can shadow a stdlib root with a local
+    // module of the same name — if the path walks to a real file, it's local.
+    return resolveRustModuleFile(segments.slice(0, -1), ref.filePath, context) === null;
+  }
+
+  if (!ESM_IMPORT_LANGUAGES.has(ref.language)) return false;
+  for (const imp of context.getImportMappings(ref.filePath, ref.language)) {
+    if (imp.localName !== name) continue;
+    return isExternalImport(imp.source, ref.language, context);
+  }
+  return false;
+}
