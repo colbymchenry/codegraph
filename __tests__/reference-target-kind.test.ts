@@ -149,6 +149,35 @@ describe('reference target-kind gate', () => {
     expect(has(edges, 'LocalSearch', 'SearchApi', 'type_alias')).toBe(true);
   });
 
+  it.each([
+    ['svelte', 'src/Box.svelte', '<script lang="ts">\n$IMPORT$\nexport class SfcBox implements Serializable {\n  n = 1;\n}\n</script>\n<div>hi</div>\n'],
+    ['vue', 'src/Box.vue', '<script lang="ts">\n$IMPORT$\nexport class SfcBox implements Serializable {\n  n = 1;\n}\n</script>\n<template><div/></template>\n'],
+    ['astro', 'src/Box.astro', '---\n$IMPORT$\nexport class SfcBox implements Serializable {\n  n = 1;\n}\n---\n<div/>\n'],
+  ])('drops an npm supertype in a %s single-file component', async (_lang, file, body) => {
+    // An SFC imports inside its <script> block (Astro: the `---` frontmatter)
+    // with ordinary ES module syntax, so a bare specifier there is external for
+    // exactly the same reason it is in a .ts file. Missing that, the npm
+    // supertype name-matched the local class below.
+    write('package.json', `{"name":"sfc","version":"1.0.0"}\n`);
+    write('src/models.ts', `export class Serializable {\n  a = 1;\n}\n`);
+    write(file, body.replace('$IMPORT$', `import { Serializable } from 'some-npm-pkg';\n`));
+    const { edges, failed } = await load();
+    expect(edges.filter((e) => e.tgt === 'Serializable')).toEqual([]);
+    expect(failed.some((r) => r.name === 'Serializable')).toBe(true);
+  });
+
+  it('keeps an SFC supertype imported from a relative path', async () => {
+    write('package.json', `{"name":"sfc","version":"1.0.0"}\n`);
+    write('src/models.ts', `export class Serializable {\n  a = 1;\n}\n`);
+    write(
+      'src/Box.svelte',
+      `<script lang="ts">\nimport { Serializable } from './models';\n\n` +
+        `export class SfcBox implements Serializable {\n  n = 1;\n}\n</script>\n<div>hi</div>\n`
+    );
+    const { edges } = await load();
+    expect(has(edges, 'SfcBox', 'Serializable', 'class')).toBe(true);
+  });
+
   it('does not resolve an import to a type member that shares its name', async () => {
     // `import * as path from 'node:path'` is unresolvable — the module is
     // external — so the name-matcher looked for any node called `path` and

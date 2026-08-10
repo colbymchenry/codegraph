@@ -288,6 +288,21 @@ const C_CPP_STDLIB_HEADERS = new Set([
 ]);
 
 /**
+ * Languages whose imports are ES-module specifiers, extracted by
+ * `extractJSImports` and therefore classified by the same bare-specifier /
+ * alias / workspace rules. Svelte, Vue and Astro belong here: an SFC imports
+ * inside its `<script>` block (Astro: the `---` frontmatter) with exactly the
+ * same syntax, and leaving them out made `isExternalImport` answer "not
+ * external" for every npm specifier in an SFC.
+ */
+const ESM_IMPORT_LANGUAGES = new Set<Language>([
+  'typescript', 'tsx', 'javascript', 'jsx', 'arkts', 'svelte', 'vue', 'astro',
+]);
+
+/** Rust path roots that always name a standard-library crate. */
+const RUST_STDLIB_ROOTS = new Set(['std', 'core', 'alloc', 'proc_macro']);
+
+/**
  * Check if an import is external (npm package, etc.)
  *
  * `context` is consulted for project-defined path aliases
@@ -315,7 +330,7 @@ function isExternalImport(
   }
 
   // Common external patterns
-  if (language === 'typescript' || language === 'javascript' || language === 'tsx' || language === 'jsx' || language === 'arkts') {
+  if (ESM_IMPORT_LANGUAGES.has(language)) {
     // Node built-ins
     if (['fs', 'path', 'os', 'crypto', 'http', 'https', 'url', 'util', 'events', 'stream', 'child_process', 'buffer'].includes(importPath)) {
       return true;
@@ -2368,13 +2383,6 @@ function collectRustUseBindings(content: string): Map<string, string> {
  * imports notably do NOT go through `resolveImportPath` (they have dedicated
  * FQN/module matchers), so there is no trustworthy oracle to consult here.
  */
-const ESM_IMPORT_LANGUAGES = new Set<Language>([
-  'typescript', 'tsx', 'javascript', 'jsx', 'arkts', 'svelte', 'vue', 'astro',
-]);
-
-/** Rust path roots that always name a standard-library crate. */
-const RUST_STDLIB_ROOTS = new Set(['std', 'core', 'alloc', 'proc_macro']);
-
 export function isBoundToOutOfRepoImport(
   ref: UnresolvedRef,
   context: ResolutionContext
