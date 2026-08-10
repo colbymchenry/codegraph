@@ -221,6 +221,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Symbols, tests and the viewer
 
+- Imports from Node built-ins or npm packages no longer connect to unrelated type members with matching names; re-index after upgrading to clear existing false dependencies. Thanks @ctype-lab. (#1537)
+
 - Inheritance relationships no longer attach external Rust or npm supertypes to unrelated local symbols with the same name; re-index after upgrading to clear existing false relationships. Thanks @ctype-lab. (#1536)
 
 - PHP static calls through imported class aliases now reach the correct class when services and repositories share method names, so callers and impact analysis show the right dependencies after re-indexing. (#1545)

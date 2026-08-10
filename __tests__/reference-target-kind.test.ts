@@ -1,5 +1,5 @@
 /**
- * `extends`/`implements` target-kind gate.
+ * Reference target-kind gate — `extends`/`implements` and `imports`.
  *
  * The name-matcher treats node kind as a scoring BONUS, never a filter, and
  * awards no bonus at all for inheritance refs. When exactly one same-named
@@ -23,7 +23,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { CodeGraph } from '../src';
 
-describe('inheritance target-kind gate', () => {
+describe('reference target-kind gate', () => {
   let dir: string;
   beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'inh-kind-')); });
   afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
@@ -147,6 +147,29 @@ describe('inheritance target-kind gate', () => {
     );
     const { edges } = await load();
     expect(has(edges, 'LocalSearch', 'SearchApi', 'type_alias')).toBe(true);
+  });
+
+  it('does not resolve an import to a type member that shares its name', async () => {
+    // `import * as path from 'node:path'` is unresolvable — the module is
+    // external — so the name-matcher looked for any node called `path` and
+    // found a class property. No language lets you import a type's member.
+    write('src/types.ts', `export class Request {\n  path = '';\n  url = '';\n}\n`);
+    write(
+      'src/run.ts',
+      `import * as path from 'node:path';\n\nexport function run() {\n  return path.join('a', 'b');\n}\n`
+    );
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const db = (cg as any).db.db;
+    const rows: { tgt: string; tgtKind: string }[] = db
+      .prepare(
+        `SELECT t.name tgt, t.kind tgtKind
+           FROM edges e JOIN nodes t ON t.id = e.target
+          WHERE e.kind = 'imports'`
+      )
+      .all();
+    cg.close?.();
+    expect(rows.filter((r) => r.tgtKind === 'property' || r.tgtKind === 'field')).toEqual([]);
   });
 
   it('keeps class extends class and class implements interface', async () => {
