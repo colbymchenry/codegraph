@@ -54,7 +54,9 @@ Types: functionTypes=[`function_item`, **`function_signature_item`**] (the
 latter = a trait method DECLARATION `fn render(&self);` — extracted so a
 trait's method set is first-class); classTypes=[] (impl blocks instead);
 methodTypes = same two; interfaceTypes=[`trait_item`] with
-**interfaceKind:'trait'**; structTypes=[`struct_item`]; enumTypes=[`enum_item`];
+**interfaceKind:'trait'**; structTypes=[`struct_item`];
+unionTypes=[`union_item`] (same body walk, distinct `union` node kind);
+enumTypes=[`enum_item`];
 enumMemberTypes=[`enum_variant`]; typeAliasTypes=[`type_item`];
 importTypes=[`use_declaration`]; callTypes=[`call_expression`];
 variableTypes=[`let_declaration`, `const_item`, `static_item`].

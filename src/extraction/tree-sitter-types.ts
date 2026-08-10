@@ -102,6 +102,8 @@ export interface LanguageExtractor {
   interfaceTypes: string[];
   /** Node types that represent structs */
   structTypes: string[];
+  /** Node types that represent unions */
+  unionTypes?: string[];
   /** Node types that represent enums */
   enumTypes: string[];
   /** Node types that represent enum members/cases (e.g. Swift: 'enum_entry', Rust: 'enum_variant') */

@@ -209,3 +209,10 @@ fn mount() {
 }
 
 routes![top_level_h];
+
+pub union Reg {
+    pub raw: u32,
+    pub halves: [u16; 2],
+}
+
+impl Base for Reg {}

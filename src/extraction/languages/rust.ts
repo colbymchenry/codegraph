@@ -45,6 +45,9 @@ export const rustExtractor: LanguageExtractor = {
   // `struct Unit;` is a unit struct — a complete definition with no body
   // field, not a forward declaration. Rust has no forward declarations.
   allowBodilessStruct: true,
+  // Unions share struct member syntax and impl attachment, but retain their
+  // distinct semantic kind in the graph.
+  unionTypes: ['union_item'],
   enumTypes: ['enum_item'],
   enumMemberTypes: ['enum_variant'],
   typeAliasTypes: ['type_item'], // Rust type aliases

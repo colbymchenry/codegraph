@@ -798,12 +798,12 @@ function lookupCalleeReturnType(
   return candidates.find((n) => n.kind === 'function')?.returnType ?? null;
 }
 
-/** Does the graph contain a class/struct named `name`'s last segment? */
+/** Does the graph contain an aggregate type named `name`'s last segment? */
 function cppClassExists(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const last = cppLastSegment(name);
   return context
     .getNodesByName(last)
-    .some((n) => (n.kind === 'class' || n.kind === 'struct') && n.language === ref.language);
+    .some((n) => (n.kind === 'class' || n.kind === 'struct' || n.kind === 'union') && n.language === ref.language);
 }
 
 /**
@@ -1771,7 +1771,7 @@ export function matchMethodCall(
     );
 
     for (const classNode of classCandidates) {
-      if (classNode.kind === 'class' || classNode.kind === 'struct' || classNode.kind === 'interface') {
+      if (classNode.kind === 'class' || classNode.kind === 'struct' || classNode.kind === 'union' || classNode.kind === 'interface') {
         // Skip cross-language class matches
         if (classNode.language !== ref.language) continue;
 
@@ -1807,7 +1807,7 @@ export function matchMethodCall(
         ref.filePath,
       );
       for (const classNode of fuzzyClassCandidates) {
-        if (classNode.kind === 'class' || classNode.kind === 'struct' || classNode.kind === 'interface') {
+        if (classNode.kind === 'class' || classNode.kind === 'struct' || classNode.kind === 'union' || classNode.kind === 'interface') {
           // Skip cross-language class matches
           if (classNode.language !== ref.language) continue;
 
@@ -2107,6 +2107,7 @@ function findBestMatch(
       if (
         candidate.kind === 'class' ||
         candidate.kind === 'struct' ||
+        candidate.kind === 'union' ||
         candidate.kind === 'interface'
       ) {
         score += 25;

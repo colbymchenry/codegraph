@@ -140,6 +140,8 @@ walker mirrors, with file:line anchors (as of `705e501`). Read WITH
 
 **cExtractor (line 180):** functionTypes=[function_definition]; NO
 class/method/interface types; structTypes=[struct_specifier];
+unionTypes=[union_specifier] (a named `union U { … };` is a definition, and
+`typedef union { … } N;` resolves to a first-class `union` node);
 enumTypes=[enum_specifier]; enumMemberTypes=[enumerator];
 typeAliasTypes=[type_definition]; importTypes=[preproc_include];
 callTypes=[call_expression]; variableTypes=[declaration];

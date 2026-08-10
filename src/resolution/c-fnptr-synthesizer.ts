@@ -296,7 +296,7 @@ function resolveTypeName(name: string, objEnv: Map<string, string> | undefined):
   let n = name;
   for (let i = 0; objEnv && i < 5; i++) {
     const v = objEnv.get(n);
-    const t = v?.trim().match(/^(?:struct\s+)?(\w+)$/);
+    const t = v?.trim().match(/^(?:(?:struct|union)\s+)?(\w+)$/);
     if (!t) break;
     n = t[1]!;
   }
@@ -370,20 +370,20 @@ const INCLUDABLE_EXT = /\.(def|inc|h|hh|hpp|hxx|c|cc|cpp|cxx|ipp|tcc|tbl)$/i;
  *  are excluded: `resolveTypeName` would rewrite to a dead-end token that can
  *  never name a struct, so skipping them is exact, and it drops the register
  *  flood. */
-const OBJ_ALIAS_RE = /^[ \t]*#[ \t]*define[ \t]+(\w+)[ \t]+(?:struct[ \t]+)*[A-Za-z_]\w*[ \t\r]*$/gm;
+const OBJ_ALIAS_RE = /^[ \t]*#[ \t]*define[ \t]+(\w+)[ \t]+(?:(?:struct|union)[ \t]+)*[A-Za-z_]\w*[ \t\r]*$/gm;
 
 /** `(?:struct )?TYPE name[opt] = {` initializers, where TYPE is a struct that
  *  has ≥1 fn-pointer field. Handles both single (`= {…}`) and array
  *  (`[] = { {…}, {…} }`) forms. Macro calls inside an element are expanded first. */
 const INIT_RE =
-  /(?:^|[;{}])\s*(?:(?:static|const|extern|register|volatile)\s+)*(?:struct\s+)?(\w+)\s+(\w+)\s*(\[[^\]]*\])?\s*=\s*\{/g;
+  /(?:^|[;{}])\s*(?:(?:static|const|extern|register|volatile)\s+)*(?:(?:struct|union)\s+)?(\w+)\s+(\w+)\s*(\[[^\]]*\])?\s*=\s*\{/g;
 /** `struct TAG { … } var[opt] [= {…}]` — the struct is defined INLINE with the
  *  table (vim's `cmdname`/`nv_cmd`); its layout never became a node, so parse it
  *  here and register it before reading the entries. No leading anchor: a
  *  `struct TAG {` with a brace body is always a definition (it may be preceded
  *  by a `#define …` line ending in a digit, as in vim), and the trailing
  *  `var … = {` check below is what distinguishes a TABLE from a plain type. */
-const INLINE_STRUCT_RE = /\bstruct\s+(\w+)\s*\{/g;
+const INLINE_STRUCT_RE = /\b(?:struct|union)\s+(\w+)\s*\{/g;
 /** `(?:static …)* ELEMTYPE [*] name[…] = { … }` — a bare array of function
  *  pointers (no struct wrapper). The optional `*` covers a function-TYPE
  *  typedef element (`opcode_t *opcodes[]`); a function-pointer typedef element
@@ -703,7 +703,7 @@ export async function cFnPointerDispatchEdges(
       if (prof) { prof.nodesMs += Date.now() - tN; prof.nodesN++; }
       const structs: CfnptrFileIn['structs'] = [];
       for (const st of fileNodes) {
-        if (st.kind !== 'struct') continue;
+        if (st.kind !== 'struct' && st.kind !== 'union') continue;
         // sliceLinesPre semantics ride along: falsy startLine never parses,
         // and `endLine ?? startLine` is applied here so the kernel sees the
         // exact slice bounds the JS sweep would use.
@@ -740,7 +740,7 @@ export async function cFnPointerDispatchEdges(
     if (prof) { prof.nodesMs += Date.now() - tN; prof.nodesN++; }
     let lines: string[] | null = null;
     for (const st of fileNodes) {
-      if (st.kind !== 'struct') continue;
+      if (st.kind !== 'struct' && st.kind !== 'union') continue;
       lines ??= s.split('\n');
       const body = sliceLinesPre(lines, st.startLine, st.endLine);
       const open = body.indexOf('{');
@@ -854,12 +854,14 @@ export async function cFnPointerDispatchEdges(
     if (fields.some((f) => f.isFnPtr)) structLayout.set(name, fields);
   };
 
-  for (const st of (ctx.iterateNodesByKind?.('struct') ?? ctx.getNodesByKind('struct'))) {
-    if ((++scannedFiles & 255) === 0) await onYield();
-    if (!C_CPP_EXT.test(st.filePath)) continue;
-    const rawFields = rawFieldsByNode.get(st.id);
-    if (!rawFields) continue; // file unreadable or body unparsable at sweep time — the old pass skipped it too
-    registerStructLayout(st.name, classifyFields(rawFields));
+  for (const kind of ['struct', 'union'] as const) {
+    for (const st of (ctx.iterateNodesByKind?.(kind) ?? ctx.getNodesByKind(kind))) {
+      if ((++scannedFiles & 255) === 0) await onYield();
+      if (!C_CPP_EXT.test(st.filePath)) continue;
+      const rawFields = rawFieldsByNode.get(st.id);
+      if (!rawFields) continue; // file unreadable or body unparsable at sweep time — the old pass skipped it too
+      registerStructLayout(st.name, classifyFields(rawFields));
+    }
   }
   rawFieldsByNode.clear();
   if (prof) { prof.B = Date.now() - tPass; tPass = Date.now(); }
@@ -1211,7 +1213,7 @@ export async function cFnPointerDispatchEdges(
   const recvTypeIn = (fnSrc: string, recv: string): string | null => {
     let re = recvReCache.get(recv);
     if (!re) {
-      re = new RegExp(`(?:struct\\s+)?(\\w+)\\s*\\*?\\s*\\b${recv}\\b\\s*(?:[,)=;]|\\[)`, 'g');
+      re = new RegExp(`(?:(?:struct|union)\\s+)?(\\w+)\\s*\\*?\\s*\\b${recv}\\b\\s*(?:[,)=;]|\\[)`, 'g');
       recvReCache.set(recv, re);
     }
     re.lastIndex = 0;
@@ -1230,7 +1232,7 @@ export async function cFnPointerDispatchEdges(
   const varTypeIn = (fnSrc: string, v: string): string | null => {
     let re = varReCache.get(v);
     if (!re) {
-      re = new RegExp(`(?:struct\\s+)?(\\w+)\\s*\\*?\\s*\\b${escapeRe(v)}\\b\\s*(?:[,)=;]|\\[)`, 'g');
+      re = new RegExp(`(?:(?:struct|union)\\s+)?(\\w+)\\s*\\*?\\s*\\b${escapeRe(v)}\\b\\s*(?:[,)=;]|\\[)`, 'g');
       varReCache.set(v, re);
     }
     re.lastIndex = 0;

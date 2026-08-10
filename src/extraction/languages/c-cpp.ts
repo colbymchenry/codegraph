@@ -187,6 +187,9 @@ export const cExtractor: LanguageExtractor = {
   methodTypes: [],
   interfaceTypes: [],
   structTypes: ['struct_specifier'],
+  // A bodiless `union U;` is a forward declaration; the aggregate extractor
+  // applies the same body requirement it uses for C structs.
+  unionTypes: ['union_specifier'],
   enumTypes: ['enum_specifier'],
   enumMemberTypes: ['enumerator'],
   typeAliasTypes: ['type_definition'], // typedef
@@ -207,12 +210,19 @@ export const cExtractor: LanguageExtractor = {
   resolveTypeAliasKind: (node, _source) => {
     // C typedef: `typedef enum { ... } name;` or `typedef struct { ... } name;`
     // The inner enum_specifier/struct_specifier is anonymous, but we want the typedef name
-    // to become the enum/struct node name.
+    // to become the enum/struct node name. `typedef union { ... } name;` takes the
+    // same route — otherwise the union body would mint a second, `<anonymous>` node
+    // beside the alias.
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
       if (!child) continue;
       if (child.type === 'enum_specifier' && getChildByField(child, 'body')) return 'enum';
-      if (child.type === 'struct_specifier' && getChildByField(child, 'body')) return 'struct';
+      if (
+        child.type === 'struct_specifier' &&
+        getChildByField(child, 'body')
+      )
+        return 'struct';
+      if (child.type === 'union_specifier' && getChildByField(child, 'body')) return 'union';
     }
     return undefined;
   },
@@ -1552,6 +1562,9 @@ export const cppExtractor: LanguageExtractor = {
   methodTypes: ['function_definition'],
   interfaceTypes: [],
   structTypes: ['struct_specifier'],
+  // C++ unions additionally carry member functions, which extract through the
+  // same aggregate-body walk as structs while preserving their distinct kind.
+  unionTypes: ['union_specifier'],
   enumTypes: ['enum_specifier'],
   enumMemberTypes: ['enumerator'],
   typeAliasTypes: ['type_definition', 'alias_declaration'], // typedef and using
@@ -1581,12 +1594,18 @@ export const cppExtractor: LanguageExtractor = {
     return undefined;
   },
   resolveTypeAliasKind: (node, _source) => {
-    // C++ typedef: `typedef enum { ... } name;` or `typedef struct { ... } name;`
+    // C++ typedef: `typedef enum { ... } name;`, `typedef struct { ... } name;`,
+    // or `typedef union { ... } name;` — see the C extractor.
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
       if (!child) continue;
       if (child.type === 'enum_specifier' && getChildByField(child, 'body')) return 'enum';
-      if (child.type === 'struct_specifier' && getChildByField(child, 'body')) return 'struct';
+      if (
+        child.type === 'struct_specifier' &&
+        getChildByField(child, 'body')
+      )
+        return 'struct';
+      if (child.type === 'union_specifier' && getChildByField(child, 'body')) return 'union';
     }
     return undefined;
   },

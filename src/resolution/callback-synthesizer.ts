@@ -1061,7 +1061,7 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
   // Concrete-side kinds vary by language: `class` covers Java / Kotlin /
   // C# / TS / Swift-classes / Scala-classes; `struct` covers Swift value
   // types that conform to protocols. Iterate both.
-  const concreteKinds = ['class', 'struct'] as const;
+  const concreteKinds = ['class', 'struct', 'union'] as const;
   for (const kind of concreteKinds) {
   for (const cls of queries.iterateNodesByKind(kind)) {
     if ((++scanned255 & 63) === 0) await onYield();

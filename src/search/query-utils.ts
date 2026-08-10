@@ -393,6 +393,7 @@ export function kindBonus(kind: Node['kind']): number {
     interface: 9,
     type_alias: 6,
     struct: 6,
+    union: 6,
     trait: 9,
     enum: 5,
     component: 8,

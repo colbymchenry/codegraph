@@ -564,7 +564,7 @@ export class GraphTraverser {
     // into their children so that callers of contained methods appear in impact
     const focalNode = this.queries.getNodeById(nodeId);
     if (focalNode) {
-      const containerKinds = new Set(['class', 'interface', 'struct', 'trait', 'protocol', 'module', 'enum']);
+      const containerKinds = new Set(['class', 'interface', 'struct', 'union', 'trait', 'protocol', 'module', 'enum']);
       if (containerKinds.has(focalNode.kind)) {
         const containsEdges = this.queries.getOutgoingEdges(nodeId, ['contains']);
         if (containsEdges.length > 0) {

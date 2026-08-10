@@ -152,3 +152,19 @@ static void ratelimited_warn(void) {
   static DEFINE_RATELIMIT_STATE(ratelimit, 5 * HZ, 5);
   use_ptr(&ratelimit, 0);
 }
+
+/* named union definition, forward declaration, and anonymous typedef union —
+   the definition is a node, the forward decl is not (#UNION) */
+union packet_hdr {
+  unsigned int raw;
+  struct { unsigned char ver, flags; } parts;
+};
+
+union opaque_hdr;
+
+typedef union {
+  unsigned int u;
+  float f;
+} word_t;
+
+static unsigned int hdr_raw(union packet_hdr *h) { return h->raw; }
