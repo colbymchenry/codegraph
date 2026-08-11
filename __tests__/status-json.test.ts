@@ -86,6 +86,29 @@ describe('codegraph status --json — CI fields (#329)', () => {
     expect(ms).toBeGreaterThanOrEqual(before - 1000);
     expect(ms).toBeLessThanOrEqual(after + 1000);
   });
+
+  it('status --json reports source files added by a clean commit', async () => {
+    execFileSync('git', ['init'], { cwd: tempDir, stdio: 'pipe' });
+    execFileSync('git', ['config', 'user.email', 'test@test.com'], { cwd: tempDir });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: tempDir });
+    fs.writeFileSync(path.join(tempDir, 'a.ts'), 'export const x = 1;\n');
+    execFileSync('git', ['add', '-A'], { cwd: tempDir });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: tempDir, stdio: 'pipe' });
+
+    const cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.close();
+
+    fs.writeFileSync(path.join(tempDir, 'new.ts'), 'export const newlyCommitted = 2;\n');
+    execFileSync('git', ['add', '-A'], { cwd: tempDir });
+    execFileSync('git', ['commit', '-m', 'add source'], { cwd: tempDir, stdio: 'pipe' });
+    expect(
+      execFileSync('git', ['status', '--porcelain'], { cwd: tempDir, encoding: 'utf-8' })
+    ).toBe('');
+
+    const out = runStatusJson(tempDir);
+    expect(out.pendingChanges).toEqual({ added: 1, modified: 0, removed: 0 });
+  });
 });
 
 describe('index completeness marker (index_state)', () => {

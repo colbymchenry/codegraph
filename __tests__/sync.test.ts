@@ -302,13 +302,49 @@ describe('Sync Module', () => {
       expect(result.filesRemoved).toBe(0);
       expect(result.changedFilePaths).toBeUndefined();
     });
+
+    it('should detect changes introduced by clean commits', async () => {
+      fs.writeFileSync(
+        path.join(testDir, 'src', 'new.ts'),
+        `export function newFunc() { return 42; }`
+      );
+      fs.writeFileSync(
+        path.join(testDir, 'src', 'index.ts'),
+        `export function hello() { return 'committed'; }`
+      );
+      git('add', '-A');
+      git('commit', '-m', 'add and modify sources');
+
+      expect(
+        execFileSync('git', ['status', '--porcelain'], { cwd: testDir, encoding: 'utf-8' })
+      ).toBe('');
+      expect(cg.getChangedFiles()).toEqual({
+        added: ['src/new.ts'],
+        modified: ['src/index.ts'],
+        removed: [],
+      });
+
+      await cg.sync();
+      fs.unlinkSync(path.join(testDir, 'src', 'index.ts'));
+      git('add', '-A');
+      git('commit', '-m', 'remove source');
+
+      expect(
+        execFileSync('git', ['status', '--porcelain'], { cwd: testDir, encoding: 'utf-8' })
+      ).toBe('');
+      expect(cg.getChangedFiles()).toEqual({
+        added: [],
+        modified: [],
+        removed: ['src/index.ts'],
+      });
+    });
   });
 
-  // Incremental sync's git fast path used to consume `git status` output without
-  // the ignore matcher the full index applies — so a committed dependency dir
-  // (built-in default exclude) or a tracked file under a .gitignored dir would
-  // leak into the index via `sync`, then vanish on the next `index --force`. The
-  // git fast path must exclude exactly what the full scan does. (#766)
+  // Change detection once consumed `git status` through a separate path without
+  // the full index's ignore matcher. A committed dependency dir or tracked file
+  // under a .gitignored dir could then appear as pending even though filesystem
+  // reconciliation would not index it. Both paths must use the same visibility
+  // rules. (#766)
   describe('Incremental sync honors the ignore matcher (#766)', () => {
     let testDir: string;
     let cg: CodeGraph;
