@@ -2,6 +2,8 @@
 
 # CodeGraph
 
+[![MCP Toplist](https://mcptoplist.com/badge/glama%2Fcolbymchenry%2Fcodegraph.svg)](https://mcptoplist.com/server/glama%2Fcolbymchenry%2Fcodegraph)
+
 Already installed? Run `codegraph upgrade`
 
 Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
