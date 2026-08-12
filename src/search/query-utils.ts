@@ -356,8 +356,26 @@ export interface NameCorpusStats {
   countForName(name: string): number;
 }
 
-/** Floor for {@link nameMatchIdfScale}: a common name is discounted, never erased. */
-const NAME_MATCH_IDF_FLOOR = 0.25;
+/**
+ * Floor for {@link nameMatchIdfScale}: a common name is discounted, never erased.
+ *
+ * Measured, not chosen. Swept 0→1 over the top-25 corpus-common names of five
+ * indexed repos (gin 2.5k nodes, Alamofire 4.5k, codegraph 9.2k, excalidraw
+ * 11k, django 62k), scoring two things: whether a query that IS a common name
+ * still returns that name first, and how much of a mixed query's top-10 the
+ * common name crowds out.
+ *
+ * Real corpora never drive the raw scale below ~0.36 (django's commonest name
+ * spans 1097 of 62080 nodes → 0.367), so any floor at or under 0.35 is inert —
+ * an earlier 0.25 was dead code. The binding cases are milder and real:
+ * searching Alamofire for `alamofire` (scale 0.551) or `request` (0.392)
+ * demoted the symbol with that exact name below a mere *prefix* match
+ * (`AlamofireExtended`, `requests`), which is never right — the user typed the
+ * name. 0.60 is the lowest value clearing the worst such case (0.551) with
+ * margin; it restores exact-name recall@1 to the undiscounted baseline on all
+ * five repos while keeping ~95% of the crowd-out relief.
+ */
+export const NAME_MATCH_IDF_FLOOR = 0.6;
 
 /**
  * IDF-style scale for an exact-name bonus, in [NAME_MATCH_IDF_FLOOR, 1].

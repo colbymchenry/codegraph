@@ -30,7 +30,11 @@ import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
 import { initGrammars, loadAllGrammars } from '../src/extraction/grammars';
-import { nameMatchBonus, nameMatchIdfScale } from '../src/search/query-utils';
+import {
+  nameMatchBonus,
+  nameMatchIdfScale,
+  NAME_MATCH_IDF_FLOOR as FLOOR,
+} from '../src/search/query-utils';
 
 describe('nameMatchIdfScale', () => {
   it('leaves a unique name at full weight', () => {
@@ -41,14 +45,43 @@ describe('nameMatchIdfScale', () => {
     const total = 10_000;
     const scales = [1, 2, 10, 100, 1000].map((df) => nameMatchIdfScale(df, total));
     for (let i = 1; i < scales.length; i++) {
-      expect(scales[i]).toBeLessThan(scales[i - 1]);
+      // Non-increasing throughout; strictly decreasing until the floor binds.
+      expect(scales[i]).toBeLessThanOrEqual(scales[i - 1]);
+      if (scales[i - 1] > FLOOR) expect(scales[i]).toBeLessThan(scales[i - 1]);
     }
   });
 
   it('discounts a very common name without erasing it', () => {
     const scale = nameMatchIdfScale(9_000, 10_000);
-    expect(scale).toBeGreaterThan(0);
-    expect(scale).toBeLessThan(0.5);
+    expect(scale).toBe(FLOOR);
+    expect(scale).toBeLessThan(1);
+  });
+
+  it('never lets a discounted whole-query exact match lose to a prefix match', () => {
+    // The invariant that sets the floor. The prefix arm pays `10 + 30 * ratio`
+    // with ratio < 1, so it approaches but never reaches 40. An exact whole-query
+    // match floors at 80 * FLOOR = 48 — clear of it for any corpus frequency.
+    //
+    // This is not hypothetical: with the floor at 0.25 it did not hold. Searching
+    // Alamofire for `request` (df 173 / 4512 nodes → scale 0.392) paid the exact
+    // match 80 * 0.392 = 31 and lost the top slot to `requests`, a prefix match
+    // worth 36. The user typed the name; hiding it behind a longer one is wrong.
+    const PREFIX_ARM_SUPREMUM = 40;
+    expect(80 * FLOOR).toBeGreaterThan(PREFIX_ARM_SUPREMUM);
+
+    const crowded = { total: 4512, countForName: () => 173 };
+    expect(nameMatchBonus('request', 'request', crowded)).toBeGreaterThan(
+      nameMatchBonus('requests', 'request')
+    );
+  });
+
+  it('keeps the floor above every scale real corpora reach', () => {
+    // Swept on five indexed repos; the lowest raw scale observed was django's
+    // commonest name (1097 of 62080 nodes). A floor at or below that is inert —
+    // an earlier 0.25 never once bound. The floor must be chosen above this line
+    // to do anything at all.
+    expect(nameMatchIdfScale(1097, 62_080)).toBe(FLOOR);
+    expect(nameMatchIdfScale(173, 4_512)).toBe(FLOOR);
   });
 
   it('is degenerate-input safe', () => {
