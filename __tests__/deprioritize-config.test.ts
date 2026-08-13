@@ -23,7 +23,8 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { initGrammars, loadAllGrammars } from '../src/extraction/grammars';
 import { loadDeprioritizePatterns } from '../src/project-config';
-import { scorePathRelevance } from '../src/search/query-utils';
+import { nameMatchBonus, scorePathRelevance } from '../src/search/query-utils';
+import { DEPRIORITIZED_NAME_BONUS_SCALE } from '../src/db/queries';
 
 const QUERY = 'desktop status bar context window usage';
 
@@ -255,5 +256,25 @@ describe('scorePathRelevance — the two deliberate asymmetries (#982)', () => {
     const builtIn = scorePathRelevance('example/a/foo.ts', 'foo test');
     const userDeclared = scorePathRelevance('optional-skills/a/foo.ts', 'foo test', undefined, true);
     expect(userDeclared).toBe(builtIn - 15);
+  });
+});
+
+describe('the name-bonus damping constant is derived, not picked (#982)', () => {
+  it('keeps a damped exact match above the prefix arm, so it cannot lose to one', () => {
+    // A de-prioritized node keeps `80 * SCALE` of the whole-query exact bonus
+    // and also takes the -15 path penalty. The prefix arm tops out below 40, so
+    // `80 * SCALE - 15 > 40` is what guarantees the exact match still wins —
+    // "discount, don't erase" stated as arithmetic instead of taste.
+    expect(nameMatchBonus('child', 'child')).toBe(80);
+    expect(nameMatchBonus('children', 'child')).toBeLessThan(40);
+    expect(80 * DEPRIORITIZED_NAME_BONUS_SCALE - 15).toBeGreaterThan(40);
+  });
+
+  it('would fail at the originally proposed 0.25, which is why it moved', () => {
+    // Measured on a 62k-node django index with `deprioritize: ["tests/"]`: at
+    // 0.25 the exact-name queries `child`, `parent` and `method` lost rank 1 to
+    // the prefix matches `children`, `all_parents` and `method_decorator`.
+    // Asserted so nobody lowers the constant back without meeting the bound.
+    expect(80 * 0.25 - 15).toBeLessThan(40);
   });
 });

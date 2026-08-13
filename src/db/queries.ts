@@ -54,8 +54,18 @@ const SQLITE_PARAM_CHUNK_SIZE = 500;
  * How much of the exact-name bonus a `deprioritize`d path keeps (#982). Damped
  * rather than zeroed: a query that genuinely targets that tree must still rank
  * it, the same "discount, don't erase" rule the path penalty follows.
+ *
+ * Derived rather than picked. `nameMatchBonus`'s prefix arm tops out below
+ * `10 + 30 = 40`, and a de-prioritized node also takes the -15 path penalty, so
+ * `80 * SCALE - 15 > 40` is what stops a damped WHOLE-QUERY exact match from
+ * losing to a mere prefix match. 0.75 clears it (45). Measured on a 62k-node
+ * django index: at 0.25 that invariant breaks in practice — `child`, `parent`
+ * and `method` lose rank 1 to `children`, `all_parents` and `method_decorator`
+ * — while crowd-out removal is almost flat between 0.75 and 0.5 (39 vs 40 of 88
+ * peripheral top-10 slots cleared), so a deeper discount buys little and costs
+ * the invariant. Pinned by a test.
  */
-const DEPRIORITIZED_NAME_BONUS_SCALE = 0.25;
+export const DEPRIORITIZED_NAME_BONUS_SCALE = 0.75;
 
 /**
  * Database row types (snake_case from SQLite)
