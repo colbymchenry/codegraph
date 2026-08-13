@@ -367,7 +367,17 @@ export const vaporResolver: FrameworkResolver = {
     // (`BlogUser.parameter`, `:id`, a path constant) so accept any comma-separated
     // args before `use:` — the label keeps only the string parts. `use:`
     // discriminates a real route from Environment.get("X")/req.parameters.get("X").
-    const routeRegex = /\b(\w+)\.(get|post|put|patch|delete|head|options)\s*\(\s*((?:[^,()]+,\s*)*)use:\s*([A-Za-z_][\w.]*)/g;
+    // Each arg repetition must end at a comma, and `,` is outside the char class,
+    // so the split is unique and matching stays linear. The earlier
+    // `(?:[^,()]+,\s*)*` was ambiguous — the trailing `\s*` and the next
+    // iteration's `[^,()]+` could both claim the same spaces — which backtracked
+    // exponentially on a long arg list that never reaches `use:`.
+    // The tail is `\s*` rather than a lazy `[^,()]*?` on purpose: both are
+    // linear, but the lazy form drops the "`use:` is preceded by a comma"
+    // requirement and widens the match set — `req.get(foo.use: bar)` would then
+    // be indexed as a route (groups `["req","get","foo.","bar"]`) where both
+    // this pattern and the original match nothing.
+    const routeRegex = /\b(\w+)\.(get|post|put|patch|delete|head|options)\s*\(\s*((?:[^,()]+,)*\s*)use:\s*([A-Za-z_][\w.]*)/g;
     let match: RegExpExecArray | null;
     while ((match = routeRegex.exec(safe)) !== null) {
       const [, receiver, method, segsStr, handlerExpr] = match;
