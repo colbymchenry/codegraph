@@ -2031,10 +2031,22 @@ export class ReferenceResolver {
         }
         // Filter built-in methods on non-class receivers
         // (e.g., items.append where items is a local list variable)
-        // But allow if the capitalized receiver matches a known codebase class
+        // But allow if the capitalized receiver matches a known codebase class,
+        // OR the receiver is itself an imported module in this file — a module
+        // can export a top-level function sharing a common collection-method
+        // name (`ledger.append`, `import ledger`/`from . import ledger`), and
+        // that call is a real project dependency, not `list.append` (#66).
+        // Without this, the qualified ref never reaches resolveViaImport /
+        // resolvePythonModuleMember, which already resolves it correctly.
         if (PYTHON_BUILT_IN_METHODS.has(method)) {
           const capitalized = receiver.charAt(0).toUpperCase() + receiver.slice(1);
-          if (!this.knownNames?.has(capitalized)) {
+          const isKnownClass = this.knownNames?.has(capitalized) ?? false;
+          const isImportedModule =
+            !isKnownClass &&
+            this.context
+              .getImportMappings(ref.filePath, ref.language)
+              .some((imp) => imp.localName === receiver);
+          if (!isKnownClass && !isImportedModule) {
             return true;
           }
         }
