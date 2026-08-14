@@ -2212,8 +2212,8 @@ export class ReferenceResolver {
         // OR the receiver is itself an imported project module — a module can
         // export a top-level function sharing a common collection-method name
         // (`ledger.append`, `from . import ledger`), and that call is a real
-        // project dependency, not `list.append` (#1681). Without this, the
-        // qualified ref never reaches resolveViaImport / resolvePythonModuleMember.
+        // project dependency, not `list.append` (#1681, same class as #66).
+        // Without this, the qualified ref never reaches resolveViaImport / resolvePythonModuleMember.
         if (PYTHON_BUILT_IN_METHODS.has(method)) {
           // A module-scope collection binding is stronger evidence than a
           // coincidentally matching class name (#1652). Only use this file's
