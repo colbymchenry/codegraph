@@ -240,6 +240,42 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(mdEntry?.action).toBe('updated');
   });
 
+  it('codex: local install writes ./.codex/config.toml and the project-root ./AGENTS.md block (#1531)', () => {
+    const codex = getTarget('codex')!;
+    const result = codex.install('local', { autoAllow: false });
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    // macOS realpath shenanigans (/var vs /private/var) — suffix match.
+    expect(paths.some((p) => p.endsWith('/.codex/config.toml'))).toBe(true);
+    // AGENTS.md sits at the project root, NOT under .codex/ — that's the
+    // file Codex reads for repo instructions.
+    expect(paths.some((p) => p.endsWith('/AGENTS.md') && !p.includes('/.codex/'))).toBe(true);
+
+    const toml = fs.readFileSync(path.join(process.cwd(), '.codex', 'config.toml'), 'utf-8');
+    expect(toml).toContain('[mcp_servers.codegraph]');
+    expect(fs.readFileSync(path.join(process.cwd(), 'AGENTS.md'), 'utf-8')).toContain('codegraph explore');
+
+    // The project layer is only applied in a trusted project, so say so
+    // instead of reporting a silent success.
+    expect(result.notes?.join(' ')).toMatch(/trusted/);
+
+    // Global config is untouched by a local install.
+    expect(fs.existsSync(path.join(tmpHome, '.codex', 'config.toml'))).toBe(false);
+  });
+
+  it('codex: local uninstall reverses the local install and leaves the global entry alone (#1531)', () => {
+    const codex = getTarget('codex')!;
+    codex.install('global', { autoAllow: false });
+    codex.install('local', { autoAllow: false });
+    expect(codex.detect('local').alreadyConfigured).toBe(true);
+
+    codex.uninstall('local');
+
+    expect(codex.detect('local').alreadyConfigured).toBe(false);
+    expect(codex.detect('global').alreadyConfigured).toBe(true);
+    expect(fs.readFileSync(path.join(tmpHome, '.codex', 'config.toml'), 'utf-8'))
+      .toContain('[mcp_servers.codegraph]');
+  });
+
   it('opencode: prefers .jsonc when both .json and .jsonc exist', () => {
     const opencode = getTarget('opencode')!;
     const dir = path.join(tmpHome, '.config', 'opencode');
