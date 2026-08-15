@@ -387,6 +387,21 @@ const LITERAL_RECEIVER_TYPES = new Set([
   'dictionary', 'dict_literal', 'object', 'tuple', 'set',
 ]);
 
+/**
+ * Haskell infix operators that are always built-in (never a user-defined
+ * function), so a call edge would never resolve. User-defined operators
+ * (declared via `prefix_id` in `signature` nodes, e.g. `(<) :: a -> a -> Bool`)
+ * are NOT in this set and DO get a call edge.
+ */
+const HASKELL_BUILTIN_OPS = new Set([
+  '+', '-', '*', '/', '^', '^^', '**',
+  '==', '/=', '<', '>', '<=', '>=',
+  '&&', '||', 'not',
+  '>>', '>>=', '<<', '<$>', '<*>', '<|', '|$', '$', '$!',
+  '.', '..', '++', '!!', ':', '++',
+  '<>', '<$',
+]);
+
 export class TreeSitterExtractor {
   private filePath: string;
   private language: Language;
@@ -3925,6 +3940,60 @@ export class TreeSitterExtractor {
         });
       }
       return;
+    }
+
+    // Haskell: three call shapes the generic fallback doesn't handle correctly:
+    //   - `infix` — `a + b`, `n * factorial (n-1)`, `f <$> g <*> h`. The operator
+    //     is the callee; built-in operators (`+`, `-`, `*`, `/`, `==`, `/=`, `<`,
+    //     `>`, `<=`, `>=`, `&&`, `||`, `>>`, `>>=`, `<<`, `<$>`, `<*>`, `<|`, `|$`,
+    //     `$`, `.`, `++`, `:`) have no project definition, so emit a call edge
+    //     only for operators NOT in the builtin set (user-defined operators via
+    //     `prefix_id` in signatures, e.g. `(<) :: ...`).
+    //   - `apply` with a `constructor` function — `Circle 5.0`, `Node val l r`.
+    //     Data constructor usage; emit an `instantiates` reference so usage
+    //     links to the `enum_member` node.
+    //   - `apply` with a `variable` or `qualified` function — the generic
+    //     fallback (`getNodeText(func)`) already handles these, so the Haskell
+    //     branch only intercepts `infix` and constructor `apply`.
+    if (this.language === 'haskell') {
+      const line = node.startPosition.row + 1;
+      const column = node.startPosition.column;
+
+      if (node.type === 'infix') {
+        const opNode = getChildByField(node, 'operator');
+        if (opNode && opNode.type === 'operator') {
+          const opText = getNodeText(opNode, this.source);
+          if (opText && !HASKELL_BUILTIN_OPS.has(opText)) {
+            this.unresolvedReferences.push({
+              fromNodeId: callerId,
+              referenceName: opText,
+              referenceKind: 'calls',
+              line,
+              column,
+            });
+          }
+        }
+        return;
+      }
+
+      if (node.type === 'apply') {
+        const func = getChildByField(node, 'function');
+        if (func?.type === 'constructor') {
+          // Data constructor application — `Circle 5.0`, `Just x`.
+          const ctorName = getNodeText(func, this.source);
+          if (ctorName) {
+            this.unresolvedReferences.push({
+              fromNodeId: callerId,
+              referenceName: ctorName,
+              referenceKind: 'instantiates',
+              line,
+              column,
+            });
+          }
+          return;
+        }
+        // `variable` / `qualified` callees fall through to the generic path.
+      }
     }
 
     // Ruby `call` nodes use `receiver` + `method` fields (tree-sitter-ruby), not
