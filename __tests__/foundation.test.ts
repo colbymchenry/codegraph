@@ -120,6 +120,24 @@ describe('CodeGraph Foundation', () => {
       cg.close();
     });
 
+    it('restores every secondary index after a crash inside bulk parse load (#1556)', () => {
+      const dbPath = getDatabasePath(tempDir);
+      const first = DatabaseConnection.initialize(dbPath);
+      const before = (first.getDb()
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+        .all() as Array<{ name: string }>).map((r) => r.name);
+      first.beginBulkParseLoad();
+      first.close();
+
+      const reopened = DatabaseConnection.open(dbPath);
+      const after = (reopened.getDb()
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+        .all() as Array<{ name: string }>).map((r) => r.name);
+      reopened.close();
+
+      expect(after).toEqual(before);
+    });
+
     it('should return correct database size', () => {
       const cg = CodeGraph.initSync(tempDir);
       const stats = cg.getStats();

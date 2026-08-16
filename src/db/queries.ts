@@ -2359,7 +2359,10 @@ export class QueryBuilder {
       const chunkRows = this.db
         .prepare(`SELECT * FROM unresolved_refs WHERE status = 'pending' AND file_path IN (${placeholders})`)
         .all(...chunk) as UnresolvedRefRow[];
-      rows.push(...chunkRows);
+      // A dense 500-file chunk can return hundreds of thousands of rows. Spread
+      // passes every row as a function argument and exceeds V8's argument/stack
+      // limit even though the SQL parameter count itself is bounded (#1558).
+      for (const row of chunkRows) rows.push(row);
     }
 
     return rows.map((row) => ({

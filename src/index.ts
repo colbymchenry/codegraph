@@ -976,6 +976,14 @@ export class CodeGraph {
           }
         } catch { /* vocab is advisory — never fail a sync over it */ }
 
+        // A killed full index leaves this marker at `indexing`. Sync repairs
+        // missing files, pending refs, and (on open) dropped indexes, so a
+        // successful recovery must also close the metadata state (#1556).
+        const fullReconcile = !options.paths || options.paths.length === 0;
+        if (fullReconcile && this.getIndexState() === 'indexing') {
+          try { this.queries.setMetadata('index_state', 'complete'); } catch { /* advisory */ }
+        }
+
         return result;
       } finally {
         // Mirror indexAll's teardown: stop the valve, then restore the

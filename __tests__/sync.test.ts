@@ -149,6 +149,28 @@ describe('Sync Module', () => {
         expect(result.filesRemoved).toBe(0);
         expect(result.filesChecked).toBeGreaterThan(0);
       });
+
+      it('persists an oversized skipped file so later syncs do not retry it (#1557)', async () => {
+        const filePath = path.join(testDir, 'src', 'oversized.ts');
+        fs.writeFileSync(filePath, 'const value = 1;\n'.repeat(70_000));
+
+        const first = await cg.sync();
+        expect(first.filesAdded).toBe(1);
+        expect(cg.getFiles().find((f) => f.path === 'src/oversized.ts')?.errors?.[0]?.code).toBe('size_exceeded');
+
+        const second = await cg.sync();
+        expect(second.filesAdded).toBe(0);
+        expect(second.filesModified).toBe(0);
+      });
+
+      it('marks a successfully recovered indexing state complete (#1556)', async () => {
+        (cg as any).queries.setMetadata('index_state', 'indexing');
+        await cg.sync({ paths: ['src/index.ts'] });
+        expect(cg.getIndexState()).toBe('indexing');
+
+        await cg.sync();
+        expect(cg.getIndexState()).toBe('complete');
+      });
     });
   });
 

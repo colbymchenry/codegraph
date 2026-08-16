@@ -1691,10 +1691,10 @@ program
   .aliases(['daemons'])
   .description('Manage running CodeGraph background daemons — pick one and press enter to stop it')
   .action(async () => {
-    const { listDaemons, stopDaemonAt, stopAllDaemons } = await import('../mcp/daemon-registry');
+    const { listVerifiedDaemons, stopDaemonAt, stopAllDaemons } = await import('../mcp/daemon-registry');
     const { runDaemonPicker } = await import('../mcp/daemon-manager');
 
-    const daemons = listDaemons();
+    const daemons = await listVerifiedDaemons();
     if (daemons.length === 0) {
       info('No CodeGraph daemons running.');
       return;
@@ -1717,7 +1717,7 @@ program
     const clack = await importESM('@clack/prompts');
     clack.intro('CodeGraph daemons');
     await runDaemonPicker({
-      list: listDaemons,
+      list: listVerifiedDaemons,
       stop: stopDaemonAt,
       stopAll: stopAllDaemons,
       cwdRoot,
@@ -1823,14 +1823,15 @@ program
       }
 
       const lockPath = path.join(getCodeGraphDir(projectPath), 'codegraph.lock');
-
-      if (!fs.existsSync(lockPath)) {
-        info(`No lock file found ${getGlyphs().dash} nothing to do`);
-        return;
+      let removed = false;
+      if (fs.existsSync(lockPath)) {
+        fs.unlinkSync(lockPath);
+        removed = true;
       }
-
-      fs.unlinkSync(lockPath);
-      success('Removed lock file. You can now run indexing again.');
+      const { clearStaleDaemonArtifacts } = await import('../mcp/daemon-registry');
+      removed = await clearStaleDaemonArtifacts(projectPath) || removed;
+      if (removed) success('Removed stale lock artifacts. You can now run indexing again.');
+      else info(`No stale lock files found ${getGlyphs().dash} nothing to do`);
     } catch (err) {
       error(`Failed to remove lock: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);

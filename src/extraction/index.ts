@@ -1709,7 +1709,7 @@ export class ExtractionOrchestrator {
     const inFlight = new Set<Promise<void>>();
     const completed = new Map<number,
       | { ok: true; filePath: string; content: string; stats: fs.Stats; result: ExtractionResult }
-      | { ok: false; filePath: string; err: unknown }>();
+      | { ok: false; filePath: string; content: string; stats: fs.Stats; err: unknown }>();
     let nextSeq = 0;       // file-order sequence assigned at dispatch
     let nextToStore = 0;   // cursor: next sequence to commit
     let aborted = false;
@@ -1737,27 +1737,25 @@ export class ExtractionOrchestrator {
       // Store: on the writer thread when active (fresh DB — bundles applied
       // in the same file order this chain dispatches them), else on the main
       // thread (SQLite connections are per-thread).
-      if (nodeCount > 0 || result.errors.length === 0) {
-        const language = detectLanguage(filePath, content, overrides);
-        if (storeWriter) {
-          if (result.kernelBuffers) {
-            // Buffers go to the writer as-is; the worker decodes + finalizes.
-            // The main thread's only per-file work stays O(1) + the content hash.
-            storeWriter.send({
-              kernel: true,
-              filePath,
-              language,
-              buffers: result.kernelBuffers,
-              file: this.buildFileRecord(filePath, content, language, stats, nodeCount, result.errors),
-            });
-          } else {
-            storeWriter.send(this.buildFreshStoreBundle(filePath, content, language, stats, result));
-          }
-          await storeWriter.waitBelow(STORE_WRITER_WINDOW);
+      const language = detectLanguage(filePath, content, overrides);
+      if (storeWriter) {
+        if (result.kernelBuffers) {
+          // Buffers go to the writer as-is; the worker decodes + finalizes.
+          // The main thread's only per-file work stays O(1) + the content hash.
+          storeWriter.send({
+            kernel: true,
+            filePath,
+            language,
+            buffers: result.kernelBuffers,
+            file: this.buildFileRecord(filePath, content, language, stats, nodeCount, result.errors),
+          });
         } else {
-          const materialized = materializeKernelResult(result, filePath, language);
-          await this.storeExtractionResult(filePath, content, language, stats, materialized, commitYield);
+          storeWriter.send(this.buildFreshStoreBundle(filePath, content, language, stats, result));
         }
+        await storeWriter.waitBelow(STORE_WRITER_WINDOW);
+      } else {
+        const materialized = materializeKernelResult(result, filePath, language);
+        await this.storeExtractionResult(filePath, content, language, stats, materialized, commitYield);
       }
 
       if (result.errors.length > 0) {
@@ -1788,16 +1786,19 @@ export class ExtractionOrchestrator {
       onProgress?.({ phase: 'parsing', current: processed, total, currentFile: filePath });
     };
 
-    const recordParseFailure = (filePath: string, err: unknown): void => {
-      processed++;
-      filesErrored++;
-      errors.push({
-        message: err instanceof Error ? err.message : String(err),
-        filePath,
-        severity: 'error',
-        code: 'parse_error',
+    const recordParseFailure = async (filePath: string, content: string, stats: fs.Stats, err: unknown): Promise<void> => {
+      await storeResult(filePath, content, stats, {
+        nodes: [],
+        edges: [],
+        unresolvedReferences: [],
+        errors: [{
+          message: err instanceof Error ? err.message : String(err),
+          filePath,
+          severity: 'error',
+          code: 'parse_error',
+        }],
+        durationMs: 0,
       });
-      onProgress?.({ phase: 'parsing', current: processed, total });
     };
 
     // Commit buffered parses to the DB in file order, advancing the cursor over
@@ -1820,7 +1821,7 @@ export class ExtractionOrchestrator {
             completed.delete(nextToStore);
             nextToStore++;
             if (item.ok) await storeResult(item.filePath, item.content, item.stats, item.result);
-            else recordParseFailure(item.filePath, item.err);
+            else await recordParseFailure(item.filePath, item.content, item.stats, item.err);
           }
         } catch (err) {
           flushError = err;
@@ -1839,7 +1840,7 @@ export class ExtractionOrchestrator {
           const result = await parseFile(filePath, content);
           completed.set(seq, { ok: true, filePath, content, stats, result });
         } catch (parseErr) {
-          completed.set(seq, { ok: false, filePath, err: parseErr });
+          completed.set(seq, { ok: false, filePath, content, stats, err: parseErr });
         }
         flushOrdered();
       })();
@@ -1910,15 +1911,18 @@ export class ExtractionOrchestrator {
         // useful symbols. The single-file extractFile path already enforces
         // this; the bulk path used to silently skip the check.
         if (stats.size > MAX_FILE_SIZE) {
-          processed++;
-          filesSkipped++;
-          errors.push({
-            message: `File exceeds max size (${stats.size} > ${MAX_FILE_SIZE})`,
-            filePath,
-            severity: 'warning',
-            code: 'size_exceeded',
+          await storeResult(filePath, content, stats, {
+            nodes: [],
+            edges: [],
+            unresolvedReferences: [],
+            errors: [{
+              message: `File exceeds max size (${stats.size} > ${MAX_FILE_SIZE})`,
+              filePath,
+              severity: 'warning',
+              code: 'size_exceeded',
+            }],
+            durationMs: 0,
           });
-          onProgress?.({ phase: 'parsing', current: processed, total });
           continue;
         }
 
@@ -2220,9 +2224,11 @@ export class ExtractionOrchestrator {
       };
     }
 
+    const language = detectLanguage(relativePath, content, loadExtensionOverrides(this.rootDir));
+
     // Check file size
     if (stats.size > MAX_FILE_SIZE) {
-      return {
+      const result: ExtractionResult = {
         nodes: [],
         edges: [],
         unresolvedReferences: [],
@@ -2236,10 +2242,11 @@ export class ExtractionOrchestrator {
         ],
         durationMs: 0,
       };
+      await this.storeExtractionResult(relativePath, content, language, stats, result, createYielder());
+      return result;
     }
 
     // Detect language (honoring the project's codegraph.json extension overrides)
-    const language = detectLanguage(relativePath, content, loadExtensionOverrides(this.rootDir));
     if (!isLanguageSupported(language)) {
       return {
         nodes: [],
@@ -2257,9 +2264,7 @@ export class ExtractionOrchestrator {
     const result = extractFromSource(relativePath, content, language, frameworkNames);
 
     // Store in database
-    if (result.nodes.length > 0 || result.errors.length === 0) {
-      await this.storeExtractionResult(relativePath, content, language, stats, result, createYielder());
-    }
+    await this.storeExtractionResult(relativePath, content, language, stats, result, createYielder());
 
     return result;
   }
