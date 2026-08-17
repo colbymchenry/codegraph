@@ -138,6 +138,23 @@ describe('CodeGraph Foundation', () => {
       expect(after).toEqual(before);
     });
 
+    it('skips secondary-index DDL when the schema is already healthy', () => {
+      const dbPath = getDatabasePath(tempDir);
+      const connection = DatabaseConnection.initialize(dbPath);
+      const db = connection.getDb();
+      const originalExec = db.exec.bind(db);
+      let execCalls = 0;
+      db.exec = (sql: string) => {
+        execCalls++;
+        originalExec(sql);
+      };
+
+      (connection as any).healBulkSecondaryIndexes();
+      connection.close();
+
+      expect(execCalls).toBe(0);
+    });
+
     it('should return correct database size', () => {
       const cg = CodeGraph.initSync(tempDir);
       const stats = cg.getStats();

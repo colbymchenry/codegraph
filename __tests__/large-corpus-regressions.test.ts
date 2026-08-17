@@ -41,6 +41,23 @@ describe('large-corpus regression fixes', () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('records an oversized file through the single-file indexing path (#1557)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-single-skipped-file-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'oversized.py'), 'value = 1\n'.repeat(120_000));
+      const cg = await CodeGraph.init(dir, { silent: true });
+      const indexed = await cg.indexFiles(['oversized.py']);
+      expect(indexed.filesSkipped).toBe(1);
+      expect(cg.getFiles().find((f) => f.path === 'oversized.py')?.errors?.[0]?.code).toBe('size_exceeded');
+      const synced = await cg.sync();
+      expect(synced.filesAdded).toBe(0);
+      expect(synced.filesModified).toBe(0);
+      cg.close();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('JSX synthesis language boundary (#1560)', () => {
@@ -62,18 +79,26 @@ describe('JSX synthesis language boundary (#1560)', () => {
     expect(rows.c).toBe(0);
   });
 
-  it('does not scan a C parent as JSX merely because the project also contains JavaScript', async () => {
+  it('runs for JavaScript while excluding C parents in the same project', async () => {
     fs.writeFileSync(
       path.join(dir, 'native.c'),
-      'void Foo(void) {}\nvoid parent(void) { const char *s = "<Foo/>"; }\n'
+      'void Widget(void) {}\nvoid native_parent(void) { const char *s = "<Widget/>"; }\n'
     );
-    fs.writeFileSync(path.join(dir, 'marker.js'), 'export const marker = true;\n');
+    fs.writeFileSync(
+      path.join(dir, 'ui.jsx'),
+      'export function Widget() { return <span/>; }\nexport function App() { return <Widget/>; }\n'
+    );
     const cg = await CodeGraph.init(dir, { silent: true });
     await cg.indexAll();
-    const rows = (cg as any).db.db.prepare(
-      "SELECT count(*) AS c FROM edges WHERE json_extract(metadata, '$.synthesizedBy') = 'jsx-render'"
-    ).get() as { c: number };
+    const rows = (cg as any).db.db.prepare(`
+      SELECT source.file_path AS source_file, target.name AS target_name
+      FROM edges e
+      JOIN nodes source ON source.id = e.source
+      JOIN nodes target ON target.id = e.target
+      WHERE json_extract(e.metadata, '$.synthesizedBy') = 'jsx-render'
+    `).all() as Array<{ source_file: string; target_name: string }>;
     cg.close();
-    expect(rows.c).toBe(0);
+    expect(rows).toContainEqual({ source_file: 'ui.jsx', target_name: 'Widget' });
+    expect(rows.some((row) => row.source_file === 'native.c')).toBe(false);
   });
 });

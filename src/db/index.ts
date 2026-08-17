@@ -366,13 +366,19 @@ export class DatabaseConnection {
 
   /** Recreate every secondary index a killed bulk parse/ref/edge window may leave dropped. */
   private healBulkSecondaryIndexes(): void {
-    const schemaPath = path.join(__dirname, 'schema.sql');
-    const schema = fs.readFileSync(schemaPath, 'utf-8');
-    const names = new Set<string>([
+    const names = [...new Set<string>([
       ...DatabaseConnection.BULK_PARSE_INDEX_NAMES,
       ...DatabaseConnection.BULK_REF_INDEX_NAMES,
       ...DatabaseConnection.BULK_EDGE_INDEX_NAMES,
-    ]);
+    ])];
+    const placeholders = names.map(() => '?').join(',');
+    const row = this.db
+      .prepare(`SELECT count(*) AS c FROM sqlite_master WHERE type = 'index' AND name IN (${placeholders})`)
+      .get(...names) as { c: number } | undefined;
+    if ((row?.c ?? 0) >= names.length) return;
+
+    const schemaPath = path.join(__dirname, 'schema.sql');
+    const schema = fs.readFileSync(schemaPath, 'utf-8');
     for (const idx of names) {
       const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
       if (!m) throw new Error(`schema.sql: index ${idx} not found for crash recovery`);
