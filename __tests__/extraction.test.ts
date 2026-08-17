@@ -11757,6 +11757,43 @@ instance Shape Circle where
       const implRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'implements');
       expect(implRefs.some((r) => r.referenceName === 'Shape')).toBe(true);
     });
+
+    it('should not merge same-named methods across different instances', () => {
+      const code = `module M where
+
+data Circle = Circle { radius :: Double }
+data Square = Square { side :: Double }
+
+class Shape s where
+  area :: s -> Double
+
+instance Shape Circle where
+  area (Circle r) = pi * r * r
+
+instance Shape Square where
+  area (Square s) = s * s
+`;
+      const result = extractFromSource('src/M.hs', code);
+      const areas = result.nodes.filter((n) => n.kind === 'function' && n.name === 'area');
+      expect(areas).toHaveLength(2);
+      const circleInst = result.nodes.find((n) => n.kind === 'class' && n.name === 'Shape.Circle');
+      const squareInst = result.nodes.find((n) => n.kind === 'class' && n.name === 'Shape.Square');
+      expect(circleInst).toBeDefined();
+      expect(squareInst).toBeDefined();
+      // Each area method must be contained by its own instance, not both
+      // collapsed onto one.
+      const containsArea = (instId: string | undefined) =>
+        result.edges.some(
+          (e) =>
+            e.kind === 'contains' &&
+            e.source === instId &&
+            areas.some((a) => a.id === e.target),
+        );
+      expect(containsArea(circleInst!.id)).toBe(true);
+      expect(containsArea(squareInst!.id)).toBe(true);
+      // The two area nodes must be distinct (not the same id merged).
+      expect(areas[0]!.id).not.toBe(areas[1]!.id);
+    });
   });
 
   describe('Type synonym and newtype extraction', () => {

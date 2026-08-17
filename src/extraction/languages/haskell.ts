@@ -70,15 +70,20 @@ function precedingSignature(node: SyntaxNode, name: string, source: string): Syn
 // --- Per-file memos. Extraction is file-sequential within a worker, so a
 // single-entry memo keyed by filePath is safe (and resets naturally). ---
 
-/** Clause-merge state: consecutive same-name function/bind nodes merge into one. */
+/** Clause-merge state: consecutive same-name function/bind nodes *in the same
+ * enclosing scope* merge into one. The scope key is the top of the node stack
+ * (the instance/class/top-level container) so two `instance` blocks each
+ * defining `show` don't collapse into one node. */
 let lastFnFile = '';
 let lastFnName = '';
+let lastFnScope = '';
 let lastFnId = '';
 
 function resetFnMemo(filePath: string): void {
   if (lastFnFile !== filePath) {
     lastFnFile = filePath;
     lastFnName = '';
+    lastFnScope = '';
     lastFnId = '';
   }
 }
@@ -105,9 +110,12 @@ function handleFunctionLike(node: SyntaxNode, ctx: ExtractorContext): boolean {
 
   resetFnMemo(ctx.filePath);
 
-  // Continuation clause: same-name consecutive function — extend the existing
-  // node and attribute this clause's calls to it.
-  if (name === lastFnName && lastFnId) {
+  // Continuation clause: same-name consecutive function *in the same enclosing
+  // scope* — extend the existing node and attribute this clause's calls to it.
+  // The scope key (top of nodeStack) distinguishes methods of different
+  // type-class instances that happen to share a name (e.g. two `show` impls).
+  const currentScope = ctx.nodeStack[ctx.nodeStack.length - 1] ?? '';
+  if (name === lastFnName && lastFnId && currentScope === lastFnScope) {
     for (let i = ctx.nodes.length - 1; i >= 0; i--) {
       const n = ctx.nodes[i];
       if (n && n.id === lastFnId) {
@@ -138,6 +146,7 @@ function handleFunctionLike(node: SyntaxNode, ctx: ExtractorContext): boolean {
   });
   if (!fn) return true;
   lastFnName = name;
+  lastFnScope = currentScope;
   lastFnId = fn.id;
 
   const match = getChildByField(node, 'match');
