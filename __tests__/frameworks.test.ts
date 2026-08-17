@@ -1436,6 +1436,19 @@ describe('vaporResolver.extract', () => {
     expect(references[0].referenceName).toBe('listUsers');
   });
 
+  it('does not backtrack exponentially on a call that never reaches use: (#1544)', () => {
+    // `app.get(a, b, c, ... )` with no `use:` label: the route regex must fail
+    // fast. The previous pattern had `\s*` inside the repeated group, which
+    // overlapped `[^,()]+`, so each extra argument roughly quadrupled the work
+    // and a generated file could hang indexing for minutes.
+    const args = Array.from({ length: 40 }, (_, i) => `arg${i}, `).join('');
+    const src = `app.get(${args}x)\n`;
+    const started = Date.now();
+    const { nodes } = vaporResolver.extract!('routes.swift', src);
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(nodes).toEqual([]);
+  });
+
   it('extracts grouped RouteCollection routes with the group prefix and no path arg', () => {
     const src = `
 func boot(routes: RoutesBuilder) throws {

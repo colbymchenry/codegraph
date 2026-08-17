@@ -367,7 +367,14 @@ export const vaporResolver: FrameworkResolver = {
     // (`BlogUser.parameter`, `:id`, a path constant) so accept any comma-separated
     // args before `use:` — the label keeps only the string parts. `use:`
     // discriminates a real route from Environment.get("X")/req.parameters.get("X").
-    const routeRegex = /\b(\w+)\.(get|post|put|patch|delete|head|options)\s*\(\s*((?:[^,()]+,\s*)*)use:\s*([A-Za-z_][\w.]*)/g;
+    // The `\s*` that used to sit inside the repeated group overlapped
+    // `[^,()]+` (which also matches whitespace), so every space after a comma
+    // could be consumed by either branch. On a call whose argument list never
+    // reaches `use:` that ambiguity backtracks exponentially — ~4x per extra
+    // argument, seconds by 28 — hanging index/sync/MCP on generated files.
+    // Keeping the group purely `<run>,` and matching the gap before `use:`
+    // once, outside the loop, leaves exactly one way to split the input.
+    const routeRegex = /\b(\w+)\.(get|post|put|patch|delete|head|options)\s*\(\s*((?:[^,()]+,)*)\s*use:\s*([A-Za-z_][\w.]*)/g;
     let match: RegExpExecArray | null;
     while ((match = routeRegex.exec(safe)) !== null) {
       const [, receiver, method, segsStr, handlerExpr] = match;
