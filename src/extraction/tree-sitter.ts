@@ -6581,6 +6581,30 @@ export class TreeSitterExtractor {
    * exprDot in assignment LHS/RHS or a condition is left alone — there it really
    * can be a field/property read.)
    */
+  /**
+   * A statement that is nothing but an identifier: `DoWork;` — an unqualified
+   * call to a parameterless routine. The parenthesised form `DoWork();` is
+   * legal Pascal but the paren-less one is the convention, so without this the
+   * majority of intra-unit calls in a Delphi codebase are invisible to
+   * callers/callees/impact.
+   */
+  private extractPascalUnqualifiedParenlessCall(node: SyntaxNode): void {
+    if (this.nodeStack.length === 0) return;
+    const callerId = this.nodeStack[this.nodeStack.length - 1];
+    if (!callerId) return;
+
+    const calleeName = getNodeText(node, this.source).trim();
+    if (!calleeName) return;
+
+    this.unresolvedReferences.push({
+      fromNodeId: callerId,
+      referenceName: calleeName,
+      referenceKind: 'calls',
+      line: node.startPosition.row + 1,
+      column: node.startPosition.column,
+    });
+  }
+
   private extractPascalParenlessCall(node: SyntaxNode): void {
     if (this.nodeStack.length === 0) return;
     const callerId = this.nodeStack[this.nodeStack.length - 1];
@@ -6666,6 +6690,18 @@ export class TreeSitterExtractor {
             }
           }
         }
+      } else if (
+        child.type === 'identifier' &&
+        node.type === 'statement' &&
+        node.namedChildCount === 1
+      ) {
+        // An UNQUALIFIED paren-less call (`Initialize;`, `inherited Create;`'s
+        // sibling idiom): the statement is nothing but an identifier. Same
+        // convention as the exprDot case above, one step less qualified — and
+        // the dominant one in Delphi, where a no-arg routine is normally called
+        // without parens. Gated on the identifier BEING the whole statement:
+        // anywhere else a bare identifier is a variable read, not a call.
+        this.extractPascalUnqualifiedParenlessCall(child);
       } else {
         this.visitPascalBlock(child);
       }

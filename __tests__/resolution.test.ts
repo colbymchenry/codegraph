@@ -4818,6 +4818,65 @@ end.
       expect(isCalled('TFoo::Reset')).toBe(true);
     });
 
+    it('extracts UNQUALIFIED paren-less calls (`Reset;`, the dominant Delphi idiom)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.pas'),
+        `unit Main;
+interface
+type
+  TFoo = class
+    procedure DoThing;
+    procedure Reset;
+    procedure Refresh;
+  end;
+implementation
+procedure TFoo.Reset; begin end;
+procedure TFoo.Refresh; begin end;
+procedure TFoo.DoThing;
+var
+  Total: Integer;
+begin
+  Reset;
+  Refresh;
+  Total := 1;
+end;
+end.
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(isCalled('TFoo::Reset')).toBe(true);
+      expect(isCalled('TFoo::Refresh')).toBe(true);
+    });
+
+    it('does not turn a bare identifier that is NOT a whole statement into a call', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'main.pas'),
+        `unit Main;
+interface
+type
+  TFoo = class
+    procedure DoThing;
+    procedure Total;
+  end;
+implementation
+procedure TFoo.Total; begin end;
+procedure TFoo.DoThing;
+var
+  Total, Other: Integer;
+begin
+  Other := Total;
+  if Total > 0 then Other := 0;
+end;
+end.
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // `Total` here is a variable read on an assignment RHS and inside a
+      // condition, never a statement of its own: without type info the two are
+      // indistinguishable, so only the statement form counts as a call.
+      expect(isCalled('TFoo::Total')).toBe(false);
+    });
+
     it('resolves a PAREN-LESS chained factory call TFoo.GetInstance.DoIt via the return type', async () => {
       fs.writeFileSync(
         path.join(tempDir, 'main.pas'),
