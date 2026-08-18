@@ -28,7 +28,8 @@ export interface UserConfigDeps {
 }
 
 function configPath(deps: UserConfigDeps = {}): string {
-  return path.join(deps.dir ?? path.join(os.homedir(), '.codegraph'), 'config.json');
+  const home = deps.dir ?? process.env.CODEGRAPH_HOME ?? path.join(os.homedir(), '.codegraph');
+  return path.join(home, 'config.json');
 }
 
 function readConfig(deps: UserConfigDeps = {}): UserConfigFile {

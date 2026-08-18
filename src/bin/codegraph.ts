@@ -2469,6 +2469,43 @@ program
   });
 
 /**
+ * codegraph config get|set auto-init
+ */
+program
+  .command('config <action> [key] [value]')
+  .description('Get or set CodeGraph settings (currently: auto-init)')
+  .action(async (action: string, key?: string, value?: string) => {
+    const { getAutoInit, setAutoInit } = await import('../installer/user-config');
+
+    if (key !== 'auto-init') {
+      error(`Unknown setting: ${key ?? '(none)'} (expected auto-init)`);
+      process.exit(1);
+    }
+
+    if (action === 'get') {
+      console.log(getAutoInit() ? 'on' : 'off');
+      return;
+    }
+
+    if (action === 'set') {
+      if (value !== 'on' && value !== 'off') {
+        error(`Expected "on" or "off", got: ${value ?? '(none)'}`);
+        process.exit(1);
+      }
+      setAutoInit(value === 'on');
+      success(
+        value === 'on'
+          ? 'Auto-init enabled — the MCP server will index a new project the first time it\'s opened, instead of asking you to run `codegraph init`.'
+          : 'Auto-init disabled — the MCP server will go back to asking you to run `codegraph init` for a new project.',
+      );
+      return;
+    }
+
+    error(`Unknown action: ${action} (expected get or set)`);
+    process.exit(1);
+  });
+
+/**
  * codegraph upgrade [version]
  *
  * Self-update, however CodeGraph was installed (bundle via install.sh/.ps1,
