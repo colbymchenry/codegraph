@@ -712,11 +712,15 @@ program
     clack.intro('Initializing CodeGraph');
     try {
       const result = await initOneProject(projectPath, options, clack, 'single');
-      if (result.status === 'error') {
+      if (result.status === 'error' || result.status === 'refused') {
         clack.outro('');
         process.exit(1);
       }
-      clack.outro('Done');
+      if (result.status === 'already-initialized') {
+        clack.outro('');
+      } else {
+        clack.outro('Done');
+      }
     } catch (err) {
       clack.log.error(`Failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);

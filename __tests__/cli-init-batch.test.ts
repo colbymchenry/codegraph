@@ -26,6 +26,20 @@ function initAll(dirs: string[]): { stdout: string; status: number } {
   }
 }
 
+function initSingle(dir: string): { stdout: string; status: number } {
+  try {
+    const stdout = execFileSync(process.execPath, [BIN, 'init', dir], {
+      encoding: 'utf-8',
+      env: { ...process.env, CODEGRAPH_NO_DAEMON: '1', CODEGRAPH_WASM_RELAUNCHED: '1' },
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return { stdout, status: 0 };
+  } catch (err) {
+    const e = err as { stdout?: Buffer; status?: number };
+    return { stdout: e.stdout?.toString('utf-8') ?? '', status: e.status ?? 1 };
+  }
+}
+
 function makeRepo(root: string, name: string): string {
   const dir = path.join(root, name);
   fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
@@ -80,5 +94,14 @@ describe('codegraph init --all', () => {
     expect(status).toBe(1); // batch exit code reflects the refusal
     expect(stdout).toContain('refused');
     expect(fs.existsSync(path.join(repoB, '.codegraph'))).toBe(true); // but repo-b still got indexed
+  });
+});
+
+describe('codegraph init (single-path regression)', () => {
+  it('refuses to index home directory and exits with code 1', () => {
+    const { stdout, status } = initSingle(os.homedir());
+
+    expect(status).toBe(1);
+    expect(stdout).toContain('Refusing');
   });
 });
