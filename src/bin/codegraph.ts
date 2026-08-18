@@ -600,7 +600,7 @@ interface InitOutcome {
 
 async function initOneProject(
   projectPath: string,
-  options: { force?: boolean; verbose?: boolean },
+  options: { force?: boolean; verbose?: boolean; gitHooks?: boolean },
   clack: Awaited<ReturnType<typeof importESM>>,
   mode: 'single' | 'batch',
 ): Promise<InitOutcome> {
@@ -623,7 +623,7 @@ async function initOneProject(
     }
     try {
       const { offerWatchFallback } = await import('../installer');
-      await offerWatchFallback(clack, projectPath, { yes: mode === 'batch' });
+      await offerWatchFallback(clack, projectPath, { yes: mode === 'batch', force: options.gitHooks });
     } catch { /* non-fatal */ }
     return { projectPath, status: 'already-initialized', detail: 'already initialized' };
   }
@@ -668,7 +668,7 @@ async function initOneProject(
 
     try {
       const { offerWatchFallback } = await import('../installer');
-      await offerWatchFallback(clack, projectPath, { yes: mode === 'batch' });
+      await offerWatchFallback(clack, projectPath, { yes: mode === 'batch', force: options.gitHooks });
     } catch { /* non-fatal */ }
 
     cg.destroy();
@@ -687,7 +687,8 @@ program
   .option('-f, --force', 'Initialize even if the path looks like your home directory or a filesystem root')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
   .option('--all <dirs...>', 'Initialize every directory listed, one after another, and print a summary table')
-  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean; all?: string[] }) => {
+  .option('--git-hooks', 'Install git sync hooks (commit/pull/checkout) to keep the index fresh even when no CodeGraph session is open')
+  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean; all?: string[]; gitHooks?: boolean }) => {
     const clack = await importESM('@clack/prompts');
 
     if (options.all && options.all.length > 0) {
