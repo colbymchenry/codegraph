@@ -592,88 +592,131 @@ async function recordIndexTelemetry(
 /**
  * codegraph init [path]
  */
+interface InitOutcome {
+  projectPath: string;
+  status: 'indexed' | 'already-initialized' | 'refused' | 'error';
+  detail: string;
+}
+
+async function initOneProject(
+  projectPath: string,
+  options: { force?: boolean; verbose?: boolean },
+  clack: Awaited<ReturnType<typeof importESM>>,
+  mode: 'single' | 'batch',
+): Promise<InitOutcome> {
+  // Refuse to index your home directory / a filesystem root — it pulls in
+  // caches, other projects, and your whole tree (a multi-GB index + watcher
+  // churn, and on pre-1.0 macOS a machine-crashing fd blowup, #845).
+  const unsafe = unsafeIndexRootReason(projectPath);
+  if (unsafe && !options.force) {
+    if (mode === 'single') {
+      clack.log.error(`Refusing to initialize in ${projectPath} — it looks like ${unsafe}.`);
+      clack.log.info('Run this inside a specific project directory, or pass --force if you really mean to index everything under it.');
+    }
+    return { projectPath, status: 'refused', detail: `looks like ${unsafe}` };
+  }
+
+  if (isInitialized(projectPath)) {
+    if (mode === 'single') {
+      clack.log.warn(`Already initialized in ${projectPath}`);
+      clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
+    }
+    try {
+      const { offerWatchFallback } = await import('../installer');
+      await offerWatchFallback(clack, projectPath, { yes: mode === 'batch' });
+    } catch { /* non-fatal */ }
+    return { projectPath, status: 'already-initialized', detail: 'already initialized' };
+  }
+
+  try {
+    const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
+    const cg = await CodeGraph.init(projectPath, { index: false });
+    if (mode === 'single') clack.log.success(`Initialized in ${projectPath}`);
+
+    const dbPath = getDatabasePath(projectPath);
+    const runIndex = async (): Promise<IndexResult> => {
+      const supervision = installCommandSupervision('init', { progressPaths: [dbPath, `${dbPath}-wal`] });
+      try {
+        if (mode === 'single' && options.verbose) {
+          return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
+        }
+        if (mode === 'single') {
+          process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
+          const progress = createShimmerProgress();
+          const r = await cg.indexAll({ onProgress: progress.onProgress });
+          await progress.stop();
+          return r;
+        }
+        // Batch mode: no per-file progress UI — N repos would mean N progress
+        // renders. A one-line summary per repo prints after the loop instead.
+        return await cg.indexAll();
+      } finally {
+        supervision.stop();
+      }
+    };
+    const result = await runIndex();
+    if (mode === 'single') printIndexResult(clack, result, projectPath);
+    await recordIndexTelemetry(cg, result);
+
+    if (result.nodesCreated === 0) {
+      if (mode === 'single') {
+        await offerIndexIgnoredRepos(clack, projectPath, runIndex, { interactive: true });
+      } else {
+        clack.log.warn(`${projectPath}: indexed 0 nodes — .gitignore may be excluding the code (run "codegraph init" there directly for the interactive fix).`);
+      }
+    }
+
+    try {
+      const { offerWatchFallback } = await import('../installer');
+      await offerWatchFallback(clack, projectPath, { yes: mode === 'batch' });
+    } catch { /* non-fatal */ }
+
+    cg.destroy();
+    return { projectPath, status: 'indexed', detail: `${result.nodesCreated} nodes` };
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    if (mode === 'single') clack.log.error(`Failed: ${detail}`);
+    return { projectPath, status: 'error', detail };
+  }
+}
+
 program
   .command('init [path]')
   .description('Initialize CodeGraph in a project directory and build the initial index')
   .option('-i, --index', 'Deprecated: indexing now runs by default; flag accepted for backward compatibility')
   .option('-f, --force', 'Initialize even if the path looks like your home directory or a filesystem root')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
-  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean }) => {
-    const projectPath = path.resolve(pathArg || process.cwd());
+  .option('--all <dirs...>', 'Initialize every directory listed, one after another, and print a summary table')
+  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean; all?: string[] }) => {
     const clack = await importESM('@clack/prompts');
 
-    clack.intro('Initializing CodeGraph');
-
-    try {
-      // Refuse to index your home directory / a filesystem root — it pulls in
-      // caches, other projects, and your whole tree (a multi-GB index + watcher
-      // churn, and on pre-1.0 macOS a machine-crashing fd blowup, #845).
-      const unsafe = unsafeIndexRootReason(projectPath);
-      if (unsafe && !options.force) {
-        clack.log.error(`Refusing to initialize in ${projectPath} — it looks like ${unsafe}.`);
-        clack.log.info('Run this inside a specific project directory, or pass --force if you really mean to index everything under it.');
-        clack.outro('');
-        process.exitCode = 1;
-        return;
+    if (options.all && options.all.length > 0) {
+      clack.intro(`Initializing CodeGraph in ${options.all.length} project${options.all.length > 1 ? 's' : ''}`);
+      const outcomes: InitOutcome[] = [];
+      for (const dir of options.all) {
+        outcomes.push(await initOneProject(path.resolve(dir), options, clack, 'batch'));
       }
-
-      if (isInitialized(projectPath)) {
-        clack.log.warn(`Already initialized in ${projectPath}`);
-        clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
-        try {
-          const { offerWatchFallback } = await import('../installer');
-          await offerWatchFallback(clack, projectPath);
-        } catch { /* non-fatal */ }
-        clack.outro('');
-        return;
+      for (const o of outcomes) {
+        const line = `${o.projectPath} — ${o.status} (${o.detail})`;
+        if (o.status === 'error' || o.status === 'refused') clack.log.warn(line);
+        else clack.log.success(line);
       }
-
-      const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
-      const cg = await CodeGraph.init(projectPath, { index: false });
-      clack.log.success(`Initialized in ${projectPath}`);
-
-      // Indexing runs by default now. The legacy -i/--index flag is still
-      // accepted (so existing muscle memory and scripts don't break) but is a
-      // no-op — initializing always builds the initial index.
-      // Supervise the index: self-terminate if orphaned or wedged (#999).
-      // The DB + WAL paths let the liveness watchdog tell a slow store on
-      // degraded storage from a true wedge (#1231).
-      // A closure so we can re-run the exact same supervised, progress-rendered
-      // index if the user opts gitignored child repos in below (#1156).
-      const dbPath = getDatabasePath(projectPath);
-      const runIndex = async (): Promise<IndexResult> => {
-        const supervision = installCommandSupervision('init', { progressPaths: [dbPath, `${dbPath}-wal`] });
-        try {
-          if (options.verbose) {
-            return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
-          }
-          process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-          const progress = createShimmerProgress();
-          const r = await cg.indexAll({ onProgress: progress.onProgress });
-          await progress.stop();
-          return r;
-        } finally {
-          supervision.stop();
-        }
-      };
-      const result = await runIndex();
-      printIndexResult(clack, result, projectPath);
-      await recordIndexTelemetry(cg, result);
-
-      // An empty graph at a git super-repo usually means `.gitignore` excludes
-      // the child repos that hold the code — surface them and offer to opt in
-      // rather than leaving the user with a silent 0-node "Done". (#1156)
-      if (result.nodesCreated === 0) {
-        await offerIndexIgnoredRepos(clack, projectPath, runIndex, { interactive: true });
-      }
-
-      try {
-        const { offerWatchFallback } = await import('../installer');
-        await offerWatchFallback(clack, projectPath);
-      } catch { /* non-fatal */ }
-
       clack.outro('Done');
-      cg.destroy();
+      if (outcomes.some((o) => o.status === 'error' || o.status === 'refused')) {
+        process.exitCode = 1;
+      }
+      return;
+    }
+
+    const projectPath = path.resolve(pathArg || process.cwd());
+    clack.intro('Initializing CodeGraph');
+    try {
+      const result = await initOneProject(projectPath, options, clack, 'single');
+      if (result.status === 'error') {
+        clack.outro('');
+        process.exit(1);
+      }
+      clack.outro('Done');
     } catch (err) {
       clack.log.error(`Failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
