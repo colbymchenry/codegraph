@@ -623,7 +623,7 @@ async function initOneProject(
     }
     try {
       const { offerWatchFallback } = await import('../installer');
-      await offerWatchFallback(clack, projectPath, { yes: mode === 'batch', force: options.gitHooks });
+      await offerWatchFallback(clack, projectPath, { yes: mode === 'batch' || options.gitHooks === true, force: options.gitHooks });
     } catch { /* non-fatal */ }
     return { projectPath, status: 'already-initialized', detail: 'already initialized' };
   }
@@ -668,7 +668,7 @@ async function initOneProject(
 
     try {
       const { offerWatchFallback } = await import('../installer');
-      await offerWatchFallback(clack, projectPath, { yes: mode === 'batch', force: options.gitHooks });
+      await offerWatchFallback(clack, projectPath, { yes: mode === 'batch' || options.gitHooks === true, force: options.gitHooks });
     } catch { /* non-fatal */ }
 
     cg.destroy();

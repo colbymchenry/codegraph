@@ -70,6 +70,82 @@ describe('MCP auto-init (opt-in)', () => {
     expect(res.content[0]!.text).toMatch(/main/);
   });
 
+  it("a losing pool worker never deletes the winning worker's in-progress index", async () => {
+    setAutoInit(true, { dir: configDir });
+
+    // Every query-pool worker (src/mcp/query-worker.ts) builds its OWN
+    // ToolHandler, so autoInitProject's in-flight de-dup map -- a per-instance
+    // field -- does NOT de-dupe across workers. Two workers really can both
+    // observe "not indexed" and both run CodeGraph.init + indexAll on the same
+    // path. One wins the index file lock; the loser's indexAll RESOLVES
+    // `{ success: false, errors: ['Could not acquire file lock ...'] }`
+    // (src/index.ts) rather than throwing. Pre-fix, the loser's catch block
+    // then rmSync'd the entire .codegraph/ -- the WINNER's live index, out
+    // from under the winner's open SQLite handle.
+
+    // --- The winner: a real, complete, queryable index. ---
+    const won = await handler.execute('codegraph_explore', { query: 'main', projectPath: repo });
+    expect(won.content[0]!.text).toMatch(/main/);
+    const cgDir = path.join(repo, '.codegraph');
+
+    // ...and it is still indexing. FileLock (src/utils.ts) is a lock FILE
+    // holding the owner's pid; it treats a lock whose pid is alive as held.
+    // Writing our own live pid is byte-for-byte what the winner's FileLock
+    // writes while indexAll runs, so the loser below hits the real lock via
+    // the real acquire() path -- nothing about the contention is faked.
+    fs.writeFileSync(path.join(cgDir, 'codegraph.lock'), String(process.pid));
+
+    const beforeLoser = fs.readdirSync(cgDir).sort();
+    expect(beforeLoser).toContain('codegraph.db');
+
+    // --- The loser: a second ToolHandler, i.e. a second pool worker. ---
+    const handlerB = new ToolHandler(null);
+
+    // One JS thread cannot produce the single interleave that matters: both
+    // workers passing `isInitialized` before either created the directory
+    // (CodeGraph.init throws "already initialized" for whoever checks second,
+    // and a real Promise.all of two execute() calls just serializes). So stub
+    // ONLY that step -- the loser's init hands back a real CodeGraph opened on
+    // the same on-disk .codegraph/, exactly what its racing init would have
+    // produced on a second thread. Everything downstream is unstubbed: the
+    // real indexAll, the real FileLock contention, the real failure shape, and
+    // the real cleanup branch under review.
+    class RacingCodeGraph extends CodeGraph {
+      static async init(root: string): Promise<CodeGraph> {
+        return CodeGraph.openSync(root);
+      }
+    }
+    __setLoadCodeGraphForTests(RacingCodeGraph as unknown as typeof CodeGraph);
+
+    try {
+      await expect(
+        (handlerB as unknown as { autoInitProject(p: string): Promise<unknown> }).autoInitProject(repo),
+      ).rejects.toThrow(/file lock|another process/i);
+
+      // The winner's index is untouched -- not one file removed. Asserting the
+      // whole directory listing rather than just codegraph.db matters on
+      // Windows, where rmSync cannot unlink the open .db but WOULD still have
+      // taken out every unopened sibling before failing.
+      expect(fs.readdirSync(cgDir).sort()).toEqual(beforeLoser);
+    } finally {
+      __setLoadCodeGraphForTests(CodeGraph);
+      try { handlerB.closeAll(); } catch { /* ignore */ }
+      try { fs.unlinkSync(path.join(cgDir, 'codegraph.lock')); } catch { /* ignore */ }
+    }
+
+    // And it is still a REAL index on disk, not an unlinked inode the winner's
+    // handle merely still points at: a fresh handler opens it from scratch.
+    const verifier = new ToolHandler(null);
+    try {
+      const after = await verifier.execute('codegraph_explore', { query: 'main', projectPath: repo });
+      expect(after.isError).toBeUndefined();
+      expect(after.content[0]!.text).not.toMatch(/codegraph init/);
+      expect(after.content[0]!.text).toMatch(/main/);
+    } finally {
+      try { verifier.closeAll(); } catch { /* ignore */ }
+    }
+  });
+
   it('still refuses to auto-init an unsafe path (home directory) even when autoInit is on', async () => {
     setAutoInit(true, { dir: configDir });
 

@@ -105,3 +105,43 @@ describe('codegraph init (single-path regression)', () => {
     expect(stdout).toContain('Refusing');
   });
 });
+
+describe('codegraph init --git-hooks (single path)', () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-init-githooks-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('installs the hooks without prompting when --git-hooks is passed to a single-path init', () => {
+    const repo = makeRepo(root, 'repo-a');
+    execFileSync('git', ['init', '-q'], { cwd: repo, stdio: 'ignore' });
+
+    // The flag's whole point is "yes, install them" — but single mode passed
+    // `yes: mode === 'batch'`, i.e. always false, so offerWatchFallback still
+    // ran clack.select() and the user could answer "manual" and get no hooks
+    // at all. In a non-interactive context (setup script, CI) that prompt has
+    // nobody to answer it.
+    //
+    // stdin is /dev/null here and nothing stubs `select`, so a surviving
+    // prompt cannot resolve to 'hook' by accident: the only way the hooks get
+    // installed is the non-interactive `yes` path.
+    const stdout = execFileSync(
+      process.execPath,
+      [BIN, 'init', repo, '--git-hooks'],
+      {
+        encoding: 'utf-8',
+        env: { ...process.env, CODEGRAPH_NO_DAEMON: '1', CODEGRAPH_WASM_RELAUNCHED: '1' },
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 120_000,
+      },
+    );
+
+    expect(stdout).not.toContain('How should CodeGraph keep its index fresh?');
+    expect(fs.existsSync(path.join(repo, '.git', 'hooks', 'post-commit'))).toBe(true);
+  });
+});

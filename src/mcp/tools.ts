@@ -1641,10 +1641,21 @@ export class ToolHandler {
    *    resolves rather than throws on a contended lock) — an unsuccessful
    *    index is never cached or returned as if it were real, which would
    *    otherwise leave a permanently "indexed but empty" project on disk.
-   *  - On ANY failure, closes the opened DB connection (so the write handle
-   *    never leaks for the process lifetime) and removes the partially
-   *    created `.codegraph/` directory, so the next call gets a clean
-   *    retry instead of tripping "already initialized" or a stuck lock.
+   *  - On a failure this call OWNS, closes the opened DB connection (so the
+   *    write handle never leaks for the process lifetime) and removes the
+   *    partially created `.codegraph/` directory, so the next call gets a
+   *    clean retry instead of tripping "already initialized" or a stuck lock.
+   *  - On a CONTENDED failure — `indexAll` reporting that another process
+   *    holds the index file lock — closes the connection but deliberately
+   *    does NOT delete `.codegraph/`. The de-dup map above is per-instance,
+   *    and every query-pool worker (src/mcp/query-worker.ts) builds its own
+   *    `ToolHandler`, so two workers CAN reach `CodeGraph.init` on the same
+   *    unindexed path before either created the directory. The loser must
+   *    walk away quietly: the directory it would delete is the WINNER's
+   *    live, in-progress index, and unlinking it out from under the winner's
+   *    open SQLite handle corrupts a healthy index to "fix" a failure that
+   *    isn't ours. Falling through to NotIndexedError is correct and
+   *    self-healing — the next call re-resolves and finds the finished index.
    */
   private async autoInitProject(projectPath: string): Promise<CodeGraph> {
     const key = resolvePath(projectPath);
@@ -1658,19 +1669,31 @@ export class ToolHandler {
         cg = await CodeGraphClass.init(projectPath, { index: false });
         const result = await cg.indexAll();
         if (!result.success) {
-          throw new Error(
+          // Lock contention means SOMEONE ELSE owns this .codegraph/ and is
+          // actively indexing it — this call is not the sole owner, so the
+          // cleanup below must not touch the directory. See src/index.ts's
+          // indexAll: a failed `fileLock.acquire()` resolves with exactly this
+          // message rather than throwing.
+          const contended = (result.errors ?? []).some((e) =>
+            /file lock|another process/i.test(e.message)
+          );
+          const failure = new Error(
             `auto-init indexAll failed for ${projectPath}: ` +
             (result.errors[0]?.message ?? 'unknown error')
-          );
+          ) as Error & { skipCleanup?: boolean };
+          failure.skipCleanup = contended;
+          throw failure;
         }
         this.projectCache.set(cg.getProjectRoot(), cg);
         return this.freshen(cg);
       } catch (err) {
         if (cg) {
           try { cg.close(); } catch { /* best-effort — already failing */ }
-          try {
-            rmSync(getCodeGraphDir(projectPath), { recursive: true, force: true });
-          } catch { /* best-effort cleanup so the next call can retry cleanly */ }
+          if (!(err as { skipCleanup?: boolean } | null)?.skipCleanup) {
+            try {
+              rmSync(getCodeGraphDir(projectPath), { recursive: true, force: true });
+            } catch { /* best-effort cleanup so the next call can retry cleanly */ }
+          }
         }
         throw err;
       }

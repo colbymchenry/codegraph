@@ -509,7 +509,7 @@ The exact text is `src/mcp/server-instructions.ts` — the single source of trut
 codegraph                         # Run interactive installer
 codegraph install                 # Run installer (explicit)
 codegraph uninstall               # Remove CodeGraph from your agents AND the CLI (--keep-cli for configs only)
-codegraph init [path]             # Initialize a project + build its graph (one step)
+codegraph init [path]             # Initialize a project + build its graph (--all <dirs...> for many repos, --git-hooks for git sync hooks)
 codegraph uninit [path]           # Remove CodeGraph from a project (--force to skip prompt)
 codegraph index [path]            # Full index (--force to re-index, --quiet for less output)
 codegraph sync [path]             # Incremental update
@@ -524,6 +524,7 @@ codegraph callees <symbol>        # Find what a function/method calls (--limit, 
 codegraph impact <symbol>         # Analyze what code is affected by changing a symbol (--depth, --json)
 codegraph affected [files...]     # Find test files affected by changes (see below)
 codegraph daemon                  # Manage background daemons — pick one to stop (alias: daemons)
+codegraph config get|set <key>    # Show or change a global setting (auto-init on|off)
 codegraph telemetry [on|off]      # Show or change anonymous usage telemetry
 codegraph upgrade [version]       # Update to the latest release (--check, --force)
 codegraph version                 # Print the installed version (also -v, --version)
