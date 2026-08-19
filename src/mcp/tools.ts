@@ -6,7 +6,7 @@
 
 import type CodeGraph from '../index';
 import type { QueryPool } from './query-pool';
-import { findNearestCodeGraphRoot, unsafeIndexRootReason } from '../directory';
+import { findNearestCodeGraphRoot, unsafeIndexRootReason, getCodeGraphDir } from '../directory';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
 // helper in engine.ts. ToolHandler must load to answer tools/list (static
 // schemas), but it must NOT drag in sqlite/query layers before the daemon binds;
@@ -45,6 +45,7 @@ import {
   existsSync,
   readFileSync,
   statSync,
+  rmSync,
 } from 'fs';
 import { createHash } from 'crypto';
 import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
@@ -1303,6 +1304,12 @@ const DEFAULT_MCP_TOOLS = new Set(['explore']);
 export class ToolHandler {
   // Cache of opened CodeGraph instances for cross-project queries
   private projectCache: Map<string, CodeGraph> = new Map();
+  // In-flight auto-init attempts keyed by resolved projectPath, so two
+  // concurrent tool calls against the same unindexed path await the SAME
+  // init/indexAll run instead of racing two independent ones (which would
+  // both open a DatabaseConnection and contend for the file lock — feeding
+  // straight into the indexAll-failure and leaked-handle cases below).
+  private autoInitInFlight: Map<string, Promise<CodeGraph>> = new Map();
   // The directory the server last searched for a default project. Surfaced in
   // the "not initialized" error so users can see why detection missed.
   private defaultProjectHint: string | null = null;
@@ -1566,14 +1573,24 @@ export class ToolHandler {
 
     if (!resolvedRoot) {
       if (getAutoInit(autoInitDirForTests ? { dir: autoInitDirForTests } : {})) {
-        const unsafe = unsafeIndexRootReason(projectPath);
-        if (!unsafe) {
+        // Auto-init only ever INDEXES a directory the user already has —
+        // never CREATES one. Before this feature, this branch was read-only
+        // (no .codegraph/ found ⇒ throw), so skipping validateProjectPath on
+        // a nonexistent path was safe: it existed only to let a not-yet-real
+        // sub-path still walk UP to a real ancestor's .codegraph/ (#238).
+        // CodeGraph.init on a nonexistent path calls mkdirSync on the whole
+        // missing chain, which could land under a sensitive path (~/.ssh,
+        // ~/.aws, ~/.config, ...) that validateProjectPath exists to refuse —
+        // so require the path to already exist AND pass validation (in
+        // addition to unsafeIndexRootReason) before ever attempting to
+        // create anything.
+        const canAutoInit =
+          existsSync(projectPath) &&
+          !validateProjectPath(projectPath) &&
+          !unsafeIndexRootReason(projectPath);
+        if (canAutoInit) {
           try {
-            const CodeGraphClass = loadCodeGraph();
-            const cg = await CodeGraphClass.init(projectPath, { index: false });
-            await cg.indexAll();
-            this.projectCache.set(cg.getProjectRoot(), cg);
-            return this.freshen(cg);
+            return await this.autoInitProject(projectPath);
           } catch {
             // Auto-init must never turn a query failure into a worse, unexplained
             // one — fall through to the standard NotIndexedError below.
@@ -1608,6 +1625,63 @@ export class ToolHandler {
     const cg = loadCodeGraph().openSync(resolvedRoot);
     this.projectCache.set(resolvedRoot, cg);
     return cg;
+  }
+
+  /**
+   * Auto-init a project's `.codegraph/` and index it, for `getCodeGraph`'s
+   * opt-in `autoInit` path. Callers must already have verified the path is
+   * existing/safe (`validateProjectPath` + `unsafeIndexRootReason`) — this
+   * method only handles the init/index/failure-cleanup mechanics:
+   *
+   *  - De-dupes concurrent callers on the same path onto one in-flight
+   *    attempt, so two simultaneous tool calls against the same unindexed
+   *    project never race two separate `CodeGraph.init` + `indexAll` runs
+   *    (which would contend for the same file lock).
+   *  - Treats `indexAll`'s `{ success: false }` result as a failure (it
+   *    resolves rather than throws on a contended lock) — an unsuccessful
+   *    index is never cached or returned as if it were real, which would
+   *    otherwise leave a permanently "indexed but empty" project on disk.
+   *  - On ANY failure, closes the opened DB connection (so the write handle
+   *    never leaks for the process lifetime) and removes the partially
+   *    created `.codegraph/` directory, so the next call gets a clean
+   *    retry instead of tripping "already initialized" or a stuck lock.
+   */
+  private async autoInitProject(projectPath: string): Promise<CodeGraph> {
+    const key = resolvePath(projectPath);
+    const inFlight = this.autoInitInFlight.get(key);
+    if (inFlight) return inFlight;
+
+    const attempt = (async (): Promise<CodeGraph> => {
+      let cg: CodeGraph | undefined;
+      try {
+        const CodeGraphClass = loadCodeGraph();
+        cg = await CodeGraphClass.init(projectPath, { index: false });
+        const result = await cg.indexAll();
+        if (!result.success) {
+          throw new Error(
+            `auto-init indexAll failed for ${projectPath}: ` +
+            (result.errors[0]?.message ?? 'unknown error')
+          );
+        }
+        this.projectCache.set(cg.getProjectRoot(), cg);
+        return this.freshen(cg);
+      } catch (err) {
+        if (cg) {
+          try { cg.close(); } catch { /* best-effort — already failing */ }
+          try {
+            rmSync(getCodeGraphDir(projectPath), { recursive: true, force: true });
+          } catch { /* best-effort cleanup so the next call can retry cleanly */ }
+        }
+        throw err;
+      }
+    })();
+
+    this.autoInitInFlight.set(key, attempt);
+    try {
+      return await attempt;
+    } finally {
+      this.autoInitInFlight.delete(key);
+    }
   }
 
   /**

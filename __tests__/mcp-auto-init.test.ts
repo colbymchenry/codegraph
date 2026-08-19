@@ -63,6 +63,11 @@ describe('MCP auto-init (opt-in)', () => {
     expect(res.isError).toBeUndefined();
     expect(res.content[0]!.text).not.toMatch(/codegraph init/);
     expect(fs.existsSync(path.join(repo, '.codegraph'))).toBe(true);
+    // Not just "a .codegraph/ dir exists" — the index must actually have
+    // real content. A failed/empty indexAll would still create the
+    // directory (and, pre-fix, was being cached and returned as if it had
+    // succeeded), so assert the query resolved the real symbol.
+    expect(res.content[0]!.text).toMatch(/main/);
   });
 
   it('still refuses to auto-init an unsafe path (home directory) even when autoInit is on', async () => {
@@ -78,5 +83,33 @@ describe('MCP auto-init (opt-in)', () => {
     // is codegraph.db, the same marker `isInitialized` (src/directory.ts)
     // checks.
     expect(fs.existsSync(path.join(os.homedir(), '.codegraph', 'codegraph.db'))).toBe(false);
+  });
+
+  it('does not create anything under a sensitive, NONEXISTENT path even when autoInit is on', async () => {
+    setAutoInit(true, { dir: configDir });
+
+    // Pre-fix, getCodeGraph's auto-init branch only ran unsafeIndexRootReason
+    // (home dir / parent-of-home / filesystem root) and — critically — skipped
+    // validateProjectPath entirely for a path that doesn't exist yet (that skip
+    // was safe before auto-init existed, when this branch was read-only: it let
+    // a not-yet-real sub-path of a REAL project still walk up to a real
+    // ancestor's .codegraph/, #238). unsafeIndexRootReason does NOT cover
+    // ~/.ssh, ~/.aws, ~/.gnupg, ~/.config — only validateProjectPath does. So a
+    // hallucinated projectPath under one of those (agents supply these
+    // routinely) would have sailed past both checks and CodeGraph.init would
+    // mkdirSync the whole missing chain into existence.
+    const sensitiveTarget = path.join(os.homedir(), '.ssh', `codegraph-auto-init-attack-${Date.now()}`);
+    expect(fs.existsSync(sensitiveTarget)).toBe(false);
+
+    try {
+      const res = await handler.execute('codegraph_explore', { query: 'main', projectPath: sensitiveTarget });
+
+      expect(res.content[0]!.text).toMatch(/codegraph init/);
+      expect(fs.existsSync(sensitiveTarget)).toBe(false);
+    } finally {
+      // Defensive cleanup in case this guard ever regresses — never leave
+      // anything behind under the real ~/.ssh.
+      fs.rmSync(sensitiveTarget, { recursive: true, force: true });
+    }
   });
 });
