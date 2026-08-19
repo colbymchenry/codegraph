@@ -139,6 +139,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- `codegraph_explore` now makes clear that suggested call counts are advisory, so agents keep exploring when an answer is incomplete; thanks @rongbc. (#1504, #1570)
+
 - C++ functions following anonymous namespaces containing raw-string templates are now indexed correctly, even when template text resembles an unfinished macro call. (#1505)
 
 - Indexing now warns when parser errors leave a file with no symbols, including C++ raw strings with 16-character delimiters, so missing code is no longer silent. (#1522)
