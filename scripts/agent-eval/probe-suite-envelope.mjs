@@ -85,7 +85,7 @@ try {
       epilogueCut: text.includes('omitted for size'),
       sectionCut: text.includes('output truncated to budget'),
       notShown: text.includes('Not shown above'),
-      budgetNote: text.includes('**Explore budget:'),
+      budgetNote: text.includes('advisory only, NOT a quota'),
     });
   }
 } finally {
