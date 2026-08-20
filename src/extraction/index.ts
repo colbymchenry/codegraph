@@ -2102,6 +2102,7 @@ export class ExtractionOrchestrator {
             // on, and a silently "clean" file here is how an index quietly
             // disagrees with a later per-file sync of the same bytes (#1565).
             errEntry.severity = 'warning';
+            errEntry.code = 'salvaged_stripped';
             errEntry.message = `Indexed from comment-stripped source after repeated parse failures (symbols may be incomplete until the file is re-indexed): ${errEntry.message}`;
             filesErrored--;
             filesIndexed++;

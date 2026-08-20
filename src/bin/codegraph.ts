@@ -405,6 +405,16 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
     for (const w of result.errors.filter((e) => e.code === 'index_partial')) {
       clack.log.warn(w.message);
     }
+    // Files salvaged from comment-stripped source after repeated parser
+    // failures are indexed but possibly incomplete — say so here, or the run
+    // reads as fully clean and the index quietly disagrees with a later
+    // re-parse of the same bytes (#1565).
+    const salvaged = result.errors.filter((e) => e.code === 'salvaged_stripped');
+    if (salvaged.length > 0) {
+      const sample = salvaged.slice(0, 3).map((e) => e.filePath).filter(Boolean).join(', ');
+      const more = salvaged.length > 3 ? ', ...' : '';
+      clack.log.warn(`${formatNumber(salvaged.length)} file(s) indexed from comment-stripped source after repeated parse failures ${getGlyphs().dash} symbols may be incomplete (${sample}${more})`);
+    }
   } else if (hasErrors) {
     clack.log.error(`Indexing failed ${getGlyphs().dash} all ${formatNumber(result.filesErrored)} files had errors`);
   } else {
@@ -443,9 +453,16 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
       clack.log.info(`The index is fully usable ${getGlyphs().dash} only the failed files are missing.`);
     }
   } else if (projectPath) {
-    const logPath = path.join(getCodeGraphDir(projectPath), 'errors.log');
-    if (fs.existsSync(logPath)) {
-      fs.unlinkSync(logPath);
+    // No hard errors. Salvaged-file warnings still belong in the log — it
+    // carries the per-file detail behind the one-line summary above.
+    if (result.errors.some((e) => e.code === 'salvaged_stripped')) {
+      writeErrorLog(projectPath, result.errors);
+      clack.log.info('See .codegraph/errors.log for details');
+    } else {
+      const logPath = path.join(getCodeGraphDir(projectPath), 'errors.log');
+      if (fs.existsSync(logPath)) {
+        fs.unlinkSync(logPath);
+      }
     }
   }
 }
