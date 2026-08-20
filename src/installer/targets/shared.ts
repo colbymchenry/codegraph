@@ -128,6 +128,40 @@ export function jsonDeepEqual(a: unknown, b: unknown): boolean {
 }
 
 /**
+ * Read a text file, returning `''` when missing or unreadable. Shared by the
+ * line-based YAML targets (Hermes, DeepSeek Harness) which treat an absent
+ * config file the same as an empty one.
+ */
+export function readTextFile(filePath: string): string {
+  try {
+    return fs.readFileSync(filePath, 'utf-8');
+  } catch {
+    return '';
+  }
+}
+
+/** Split file content into lines, normalizing CRLF / CR to LF. */
+export function splitLines(content: string): string[] {
+  return content.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+}
+
+/** Re-join lines, dropping a single trailing blank line and ending with `\n`. */
+export function joinLines(lines: string[]): string {
+  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  return lines.join('\n') + '\n';
+}
+
+/** Escape a string so it is literal inside a RegExp. */
+export function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Order-insensitive array equality by value (element-wise `===`). */
+export function arrayEqual(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((value, idx) => value === b[idx]);
+}
+
+/**
  * Replace or append a marker-delimited section in a markdown-ish file.
  *
  * Used by Claude / Codex for the `<!-- CODEGRAPH_START --> ... <!--
