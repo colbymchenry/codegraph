@@ -1577,6 +1577,11 @@ export class ExtractionOrchestrator {
     });
     if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] scan: ${Date.now() - tScan}ms (${files.length} files)`);
 
+    // A re-index over an existing DB skips unchanged-hash files at the store,
+    // which would preserve wiped zero-node rows (#1541) — drop them first so
+    // this run stores their files fresh. No-op on a fresh DB.
+    this.healZeroNodeRows();
+
     // Detect frameworks once per indexAll run using the scanned file list.
     // Names are passed to each parse call so framework-specific extractors
     // (route nodes, middleware, etc.) run after the tree-sitter pass.
@@ -2025,8 +2030,16 @@ export class ExtractionOrchestrator {
           continue;
         }
 
+        // The pool hands kernel results back as an undecoded buffer transport
+        // (`nodes`/`edges` EMPTY, tables in kernelBuffers). The main loop
+        // decodes or forwards to the store worker; this path stores directly,
+        // so decode here — otherwise a kernel-language retry passes the gate
+        // below via `errors.length === 0`, stores nothing, and the file is
+        // permanently recorded as "(0 symbols)" with the error erased (#1541).
+        const language = detectLanguage(filePath, content, overrides);
+        result = materializeKernelResult(result, filePath, language);
+
         if (result.nodes.length > 0 || result.errors.length === 0) {
-          const language = detectLanguage(filePath, content, overrides);
           const stats = await fsp.stat(path.join(this.rootDir, filePath));
           await this.storeExtractionResult(filePath, content, language, stats, result, commitYield);
 
@@ -2075,13 +2088,21 @@ export class ExtractionOrchestrator {
             continue;
           }
 
+          // Same undecoded-transport hazard as the first retry pass (#1541).
+          const language = detectLanguage(filePath, fullContent, overrides);
+          result = materializeKernelResult(result, filePath, language);
+
           if (result.nodes.length > 0 || result.errors.length === 0) {
-            const language = detectLanguage(filePath, fullContent, overrides);
             const stats = await fsp.stat(path.join(this.rootDir, filePath));
             await this.storeExtractionResult(filePath, fullContent, language, stats, result, commitYield);
 
-            const idx = errors.indexOf(errEntry);
-            if (idx >= 0) errors.splice(idx, 1);
+            // Salvaged from comment-stripped source: keep a visible trace in
+            // the summary instead of erasing the failure outright — the
+            // stored result may be missing whatever the failing parse choked
+            // on, and a silently "clean" file here is how an index quietly
+            // disagrees with a later per-file sync of the same bytes (#1565).
+            errEntry.severity = 'warning';
+            errEntry.message = `Indexed from comment-stripped source after repeated parse failures (symbols may be incomplete until the file is re-indexed): ${errEntry.message}`;
             filesErrored--;
             filesIndexed++;
             totalNodes += result.nodes.length;
@@ -2267,6 +2288,26 @@ export class ExtractionOrchestrator {
   /**
    * Store extraction result in database
    */
+  /**
+   * Delete file rows recorded with ZERO nodes so their files re-index.
+   *
+   * No extraction path stores an empty, error-free result for a
+   * symbol-bearing language — even an empty file keeps its file node — so a
+   * zero-node row is a wiped one (#1541: an interrupted parse's retry stored
+   * an undecoded kernel transport). The wiped row's content hash matches the
+   * on-disk bytes, so every hash-based reconcile skips the file forever;
+   * deleting the row lets the normal add path repair it. File-level-only
+   * languages (yaml, twig, properties) are left alone. Deleting a zero-node
+   * row cascades nothing: it has no nodes, so no edges or refs either.
+   */
+  private healZeroNodeRows(): void {
+    for (const f of this.queries.getAllFiles()) {
+      if (f.nodeCount === 0 && !isFileLevelOnlyLanguage(f.language)) {
+        this.queries.deleteFile(f.path);
+      }
+    }
+  }
+
   private async storeExtractionResult(
     filePath: string,
     content: string,
@@ -2275,6 +2316,12 @@ export class ExtractionOrchestrator {
     result: ExtractionResult,
     onYield?: MaybeYield
   ): Promise<void> {
+    // A kernel result can arrive as an undecoded buffer transport (empty
+    // node/edge arrays, tables riding in kernelBuffers). Decode it before
+    // storing — persisting the transport as-is records the file as having no
+    // symbols at all (#1541). No-op for already-decoded results.
+    result = materializeKernelResult(result, filePath, language);
+
     // Bulk inserts run in bounded sub-transactions with a yield between, so a
     // giant generated file (tens of thousands of symbols) can't block the
     // event loop — and the #850 watchdog heartbeat — for the whole store.
@@ -2635,6 +2682,10 @@ export class ExtractionOrchestrator {
       currentFiles = await scanDirectoryAsync(this.rootDir);
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-scan: ${Date.now() - tSyncScan}ms (${currentFiles.length} files)`);
       filesChecked = currentFiles.length;
+
+      // Full reconcile only (scoped syncs must not touch rows outside their
+      // scope): drop zero-node rows so the wiped files re-index as adds below.
+      this.healZeroNodeRows();
 
       const tTracked = Date.now();
       trackedFiles = this.queries.getAllFiles();
