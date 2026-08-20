@@ -6,7 +6,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { Language, Node } from '../types';
+import { Language, Node, ReferenceKind } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport } from './types';
 import { applyAliases } from './path-aliases';
 import { resolveWorkspaceImport } from './workspace-packages';
@@ -46,6 +46,7 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   ruby: ['.rb'],
   objc: ['.h', '.m', '.mm'],
   nix: ['.nix', '/default.nix'],
+  gleam: ['.gleam'],
 };
 
 export function isNixPathImportRef(ref: UnresolvedRef): boolean {
@@ -55,6 +56,68 @@ export function isNixPathImportRef(ref: UnresolvedRef): boolean {
     (ref.referenceName.startsWith('./') || ref.referenceName.startsWith('../')) &&
     !/[\s{}()[\];"'<>$]/.test(ref.referenceName)
   );
+}
+
+/** Whether a Gleam module path belongs to the compiler-provided standard library. */
+export function isGleamStdlibPath(importPath: string): boolean {
+  return importPath === 'gleam' || importPath.startsWith('gleam/');
+}
+
+/** Identify Gleam references bound to imports with no indexed project module. */
+export function isExternalGleamReference(
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): boolean {
+  if (ref.language !== 'gleam') return false;
+  if (ref.referenceKind === 'imports') {
+    return resolveImportPath(ref.referenceName, ref.filePath, ref.language, context) === null;
+  }
+  return context.getImportMappings(ref.filePath, ref.language).some(
+    (imp) =>
+      (imp.localName === ref.referenceName || ref.referenceName.startsWith(imp.localName + '.')) &&
+      resolveImportPath(imp.source, ref.filePath, ref.language, context) === null,
+  );
+}
+
+const GLEAM_PRELUDE_NAMES = new Set([
+  'True',
+  'False',
+  'Nil',
+  'Ok',
+  'Error',
+  'Some',
+  'None',
+]);
+
+/** True for an unshadowed constructor supplied by Gleam's prelude. */
+export function isGleamPreludeReference(
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): boolean {
+  if (ref.language !== 'gleam' || !GLEAM_PRELUDE_NAMES.has(ref.referenceName)) return false;
+
+  const localConstructor = context.getNodesInFile(ref.filePath).some(
+    (node) =>
+      node.language === 'gleam' &&
+      node.kind === 'enum_member' &&
+      node.name === ref.referenceName,
+  );
+  if (localConstructor) return false;
+
+  const importedConstructor = context.getImportMappings(ref.filePath, ref.language).some((imp) => {
+    if (imp.isNamespace || imp.localName !== ref.referenceName) return false;
+    const importedFile = resolveImportPath(imp.source, ref.filePath, ref.language, context);
+    if (!importedFile) return false;
+    return context.getNodesInFile(importedFile).some(
+      (node) =>
+        node.language === 'gleam' &&
+        node.kind === 'enum_member' &&
+        node.isExported &&
+        node.name === imp.exportedName,
+    );
+  });
+
+  return !importedConstructor;
 }
 
 /**
@@ -160,7 +223,7 @@ function resolveImportPathUncached(
   }
 
   // Handle absolute/aliased imports (like @/ or src/)
-  const aliased = resolveAliasedImport(importPath, projectRoot, language, context);
+  const aliased = resolveAliasedImport(importPath, fromFile, language, context);
   if (aliased) return aliased;
 
   // C/C++ include directory search: when neither relative nor aliased
@@ -363,6 +426,12 @@ function isExternalImport(
     return true;
   }
 
+  if (language === 'gleam') {
+    // Gleam's standard library and OTP bindings use the `gleam/...` namespace.
+    // Project modules such as `app/io` are source paths and must remain local.
+    return isGleamStdlibPath(importPath);
+  }
+
   if (language === 'c' || language === 'cpp') {
     // C/C++ standard library headers — both C-style (<stdio.h>) and
     // C++-style (<cstdio>, <vector>) forms. Checked against the import
@@ -439,10 +508,11 @@ function resolveRelativeImport(
  */
 function resolveAliasedImport(
   importPath: string,
-  projectRoot: string,
+  fromFile: string,
   language: Language,
   context: ResolutionContext
 ): string | null {
+  const projectRoot = context.getProjectRoot();
   const extensions = EXTENSION_RESOLUTION[language] || [];
   const tryWithExt = (basePath: string): string | null => {
     for (const ext of extensions) {
@@ -452,6 +522,21 @@ function resolveAliasedImport(
     if (context.fileExists(basePath)) return basePath;
     return null;
   };
+
+  // Gleam module names are package-relative and omit their source-root prefix.
+  // A repository may contain multiple packages, so anchor lookup at the nearest
+  // gleam.toml instead of assuming the repository root is the package root.
+  if (language === 'gleam') {
+    const packageRoot = gleamPackageRoot(fromFile, context);
+    for (const sourceDir of ['src', 'test']) {
+      const base = packageRoot
+        ? path.posix.join(packageRoot, sourceDir, importPath)
+        : path.posix.join(sourceDir, importPath);
+      const hit = tryWithExt(base);
+      if (hit) return hit;
+    }
+    if (packageRoot !== null) return null;
+  }
 
   // 1. Project tsconfig/jsconfig paths.
   const aliasMap = context.getProjectAliases?.();
@@ -494,6 +579,22 @@ function resolveAliasedImport(
 
   // 3. Direct path.
   return tryWithExt(importPath);
+}
+
+/** Find the package containing a Gleam source file, supporting monorepos. */
+function gleamPackageRoot(fromFile: string, context: ResolutionContext): string | null {
+  let directory = path.posix.dirname(fromFile.replace(/\\/g, '/'));
+
+  while (directory && directory !== '.') {
+    if (context.fileExists(path.posix.join(directory, 'gleam.toml'))) {
+      return directory;
+    }
+    const parent = path.posix.dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
+  }
+
+  return context.fileExists('gleam.toml') ? '' : null;
 }
 
 /**
@@ -787,6 +888,8 @@ export function extractImportMappings(
     mappings.push(...extractPHPImports(content));
   } else if (language === 'c' || language === 'cpp') {
     mappings.push(...extractCppImports(content));
+  } else if (language === 'gleam') {
+    mappings.push(...extractGleamImports(content));
   }
 
   return mappings;
@@ -1089,6 +1192,56 @@ function extractCppImports(content: string): ImportMapping[] {
       isDefault: false,
       isNamespace: true,
     });
+  }
+
+  return mappings;
+}
+
+/**
+ * Extract Gleam import mappings.
+ *
+ * Gleam imports bind the module namespace (`import app/io`), optionally under
+ * an alias (`as io`), and can selectively bind names from that module:
+ * `import app/list.{map, filter as keep, type User}`. The resolver needs both
+ * the coarse namespace mapping and each selective local-to-exported mapping.
+ */
+function extractGleamImports(content: string): ImportMapping[] {
+  const mappings: ImportMapping[] = [];
+  const importSource = content.replace(/\/\/.*$/gm, '');
+  const importRegex = /^\s*import\s+([a-zA-Z0-9_/]+)(?:\s*\.\{\s*([^}]*?)\s*\})?(?:\s+as\s+(\w+))?\s*$/gm;
+  let match: RegExpExecArray | null;
+
+  while ((match = importRegex.exec(importSource)) !== null) {
+    const source = match[1]!;
+    const selective = match[2];
+    const alias = match[3];
+    const namespaceName = alias || source.split('/').pop()!;
+
+    mappings.push({
+      localName: namespaceName,
+      exportedName: '*',
+      source,
+      isDefault: false,
+      isNamespace: true,
+    });
+
+    if (!selective) continue;
+    for (const rawItem of selective.split(',')) {
+      const item = rawItem.trim();
+      if (!item) continue;
+      const withoutType = item.replace(/^type\s+/, '').trim();
+      if (!withoutType) continue;
+      const aliasMatch = withoutType.match(/^([A-Za-z0-9_]+)\s+as\s+([A-Za-z0-9_]+)$/);
+      const exportedName = aliasMatch?.[1] ?? withoutType;
+      const localName = aliasMatch?.[2] ?? withoutType;
+      mappings.push({
+        localName,
+        exportedName,
+        source,
+        isDefault: false,
+        isNamespace: false,
+      });
+    }
   }
 
   return mappings;
@@ -1427,6 +1580,20 @@ export function resolveViaImport(
   }
 
   // Use cached import mappings (avoids re-reading and re-parsing per ref)
+  // Gleam module imports are file dependencies even when no imported symbol is
+  // referenced. Resolve the module path directly to its indexed file node;
+  // standard-library paths intentionally remain unresolved.
+  if (ref.language === 'gleam' && ref.referenceKind === 'imports') {
+    const resolvedPath = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
+    if (!resolvedPath || resolvedPath === ref.filePath) return null;
+    const fileNode = context.getNodesInFile(resolvedPath).find((n) => n.kind === 'file');
+    if (fileNode) {
+      return { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' };
+    }
+    return null;
+  }
+
+  // Use cached import mappings (avoids re-reading and re-parsing per ref)
   const imports = context.getImportMappings(ref.filePath, ref.language);
   if (imports.length === 0 && !context.readFile(ref.filePath)) {
     return null;
@@ -1521,7 +1688,13 @@ export function resolveViaImport(
 
         const targetNode = findExportedSymbol(
           resolvedPath,
-          { isDefault: imp.isDefault, isNamespace: imp.isNamespace, exportedName, memberName },
+          {
+            isDefault: imp.isDefault,
+            isNamespace: imp.isNamespace,
+            exportedName,
+            memberName,
+            referenceKind: ref.referenceKind,
+          },
           ref.language,
           context,
           new Set()
@@ -2084,6 +2257,7 @@ function findExportedSymbol(
     isNamespace: boolean;
     exportedName: string;
     memberName: string | null;
+    referenceKind: ReferenceKind;
   },
   language: Language,
   context: ResolutionContext,
@@ -2101,7 +2275,7 @@ function findExportedSymbol(
       memo = new Map();
       exportedSymbolMemos.set(context, memo);
     }
-    const key = `${filePath}\0${want.isDefault ? 1 : 0}${want.isNamespace ? 1 : 0}\0${want.exportedName}\0${want.memberName ?? ''}\0${language}`;
+    const key = `${filePath}\0${want.isDefault ? 1 : 0}${want.isNamespace ? 1 : 0}\0${want.exportedName}\0${want.memberName ?? ''}\0${want.referenceKind}\0${language}`;
     if (memo.has(key)) return memo.get(key);
     const result = findExportedSymbolWalk(filePath, want, language, context, visited, depth);
     memo.set(key, result);
@@ -2117,6 +2291,7 @@ function findExportedSymbolWalk(
     isNamespace: boolean;
     exportedName: string;
     memberName: string | null;
+    referenceKind: ReferenceKind;
   },
   language: Language,
   context: ResolutionContext,
@@ -2128,6 +2303,20 @@ function findExportedSymbolWalk(
   visited.add(filePath);
 
   const exportIndex = getFileExportIndex(filePath, context);
+
+  const wantedName = want.isNamespace && want.memberName
+    ? want.memberName
+    : want.exportedName;
+  if (language === 'gleam' && want.referenceKind === 'calls') {
+    const callable = context.getNodesInFile(filePath).find(
+      (node) =>
+        node.isExported &&
+        (node.kind === 'function' || node.kind === 'enum_member') &&
+        node.name === wantedName,
+    );
+    if (callable) return callable;
+    return undefined;
+  }
 
   // 1. Direct hit: the symbol is declared in this file.
   if (want.isDefault) {
@@ -2166,6 +2355,7 @@ function findExportedSymbolWalk(
           isNamespace: false,
           exportedName: rex.originalName,
           memberName: null,
+          referenceKind: want.referenceKind,
         },
         language,
         context,

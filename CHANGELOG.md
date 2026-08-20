@@ -19,6 +19,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - GitHub Copilot is now a supported agent: `codegraph install` can configure Copilot Chat in VS Code (`copilot-vscode`), the GitHub Copilot CLI (`copilot-cli`), and the Copilot plugin in JetBrains IDEs (`copilot-jetbrains`). Installed Copilot surfaces are auto-detected like every other agent, existing MCP server entries in their config files are preserved, and `codegraph uninstall` reverses the setup cleanly. Restart VS Code or your JetBrains IDE after installing so Copilot picks up the server.
 
+- Added full Gleam language support for `.gleam` files, including the vendored
+  tree-sitter grammar, functions, types, constants, imports, call references,
+  and cross-file module resolution.
+
 ### Fixes
 
 - Naming a file by its path in a `codegraph_explore` query now works reliably: the path is resolved against the index and that file is guaranteed a place at the top of the answer. Previously the path was broken into fragments — bracketed route segments like SvelteKit's `[id]` made this worst — and pieces like `page` or `runs` matched every sibling file, so the file you actually named could be crowded out of the answer entirely. A path that doesn't match any indexed file is now called out instead of silently ignored.

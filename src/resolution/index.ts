@@ -6,7 +6,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { Language, Node, UnresolvedReference, Edge } from '../types';
+import { Language, Node, UnresolvedReference, Edge, ForeignFunctionMetadata } from '../types';
 import { QueryBuilder } from '../db/queries';
 import {
   UnresolvedRef,
@@ -17,7 +17,7 @@ import {
   ImportMapping,
 } from './types';
 import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
-import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos } from './import-resolver';
+import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isExternalGleamReference, isGleamPreludeReference, clearImportResolverMemos } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -47,6 +47,23 @@ const CHAIN_SHAPE = /^(.+)\(\)\.(\w+)$/;
 
 /** PHP `$this->prop->method()` encoded as `this->prop.method` — no `()`, so CHAIN_SHAPE misses it. */
 const PHP_PROP_SHAPE = /^this->\w+\.\w+$/;
+
+function gleamErlangFfiMetadata(ref: UnresolvedRef): ForeignFunctionMetadata | null {
+  const metadata = ref.metadata;
+  if (
+    ref.language !== 'gleam' ||
+    ref.referenceKind !== 'calls' ||
+    metadata?.ffi !== true ||
+    metadata.targetLanguage !== 'erlang' ||
+    typeof metadata.module !== 'string' ||
+    typeof metadata.function !== 'string' ||
+    !Number.isInteger(metadata.arity) ||
+    (metadata.arity as number) < 0
+  ) {
+    return null;
+  }
+  return metadata as ForeignFunctionMetadata;
+}
 
 /**
  * Cache size limits. Each per-resolver cache is bounded so memory
@@ -849,12 +866,42 @@ export class ReferenceResolver {
     return false;
   }
 
+  private resolveGleamErlangFfi(
+    ref: UnresolvedRef,
+    ffi: ForeignFunctionMetadata,
+  ): ResolvedRef | null {
+    const arityDecorator = `erlang-arity:${ffi.arity}`;
+    const targets = this.context
+      .getNodesByQualifiedName(`${ffi.module}::${ffi.function}`)
+      .filter(
+        (node) =>
+          node.language === 'erlang' &&
+          node.kind === 'function' &&
+          node.decorators?.includes(arityDecorator),
+      );
+    if (targets.length !== 1) return null;
+    return {
+      original: ref,
+      targetNodeId: targets[0]!.id,
+      confidence: 1,
+      resolvedBy: 'foreign-function',
+    };
+  }
+
   /**
    * Resolve a single reference
    */
   resolveOne(ref: UnresolvedRef): ResolvedRef | null {
+    const ffi = gleamErlangFfiMetadata(ref);
+    if (ffi) {
+      // An explicit foreign target is exact. A miss must stay unresolved and
+      // must never fall through to same-named project symbols.
+      return this.resolveGleamErlangFfi(ref, ffi);
+    }
+
     // Skip built-in/external references
     if (this.isBuiltInOrExternal(ref)) {
+      ref.disposition = 'external';
       return null;
     }
 
@@ -1100,6 +1147,7 @@ export class ReferenceResolver {
         line: ref.original.line,
         column: ref.original.column,
         metadata: {
+          ...(ref.original.metadata ?? {}),
           confidence: ref.confidence,
           resolvedBy: ref.resolvedBy,
           // The ORIGINAL reference text (and kind, when edge-kind promotion
@@ -1157,21 +1205,34 @@ export class ReferenceResolver {
    * outcome can differ per call site (receiver-type inference reads the
    * ref's line), so a sibling must not inherit this row's failure (#1269).
    */
-  private static partitionFailedCleanup(unresolved: UnresolvedRef[]): {
-    byRowId: Array<{ rowId: number; referenceName: string }>;
-    legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>;
+  private static partitionUnresolvedCleanup(unresolved: UnresolvedRef[]): {
+    failed: {
+      byRowId: Array<{ rowId: number; referenceName: string }>;
+      legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>;
+    };
+    external: {
+      byRowId: Array<{ rowId: number; referenceName: string }>;
+      legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>;
+    };
   } {
-    const byRowId: Array<{ rowId: number; referenceName: string }> = [];
-    const legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }> = [];
+    const failed = {
+      byRowId: [] as Array<{ rowId: number; referenceName: string }>,
+      legacyKeys: [] as Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>,
+    };
+    const external = {
+      byRowId: [] as Array<{ rowId: number; referenceName: string }>,
+      legacyKeys: [] as Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>,
+    };
     for (const r of unresolved) {
-      if (r.rowId != null) byRowId.push({ rowId: r.rowId, referenceName: r.referenceName });
-      else legacyKeys.push({
+      const target = r.disposition === 'external' ? external : failed;
+      if (r.rowId != null) target.byRowId.push({ rowId: r.rowId, referenceName: r.referenceName });
+      else target.legacyKeys.push({
         fromNodeId: r.fromNodeId,
         referenceName: r.referenceName,
         referenceKind: r.referenceKind,
       });
     }
-    return { byRowId, legacyKeys };
+    return { failed, external };
   }
 
   /**
@@ -1208,9 +1269,11 @@ export class ReferenceResolver {
     // is still 'pending', so any pending row at rest belongs to an
     // interrupted run and the sweep can key off the pending count.
     if (result.unresolved.length > 0) {
-      const { byRowId, legacyKeys } = ReferenceResolver.partitionFailedCleanup(result.unresolved);
-      this.queries.markReferencesFailedByRowIds(byRowId);
-      this.queries.markReferencesFailed(legacyKeys);
+      const cleanup = ReferenceResolver.partitionUnresolvedCleanup(result.unresolved);
+      this.queries.markReferencesFailedByRowIds(cleanup.failed.byRowId);
+      this.queries.markReferencesFailed(cleanup.failed.legacyKeys);
+      this.queries.markReferencesExternalByRowIds(cleanup.external.byRowId);
+      this.queries.markReferencesExternal(cleanup.external.legacyKeys);
     }
 
     return result;
@@ -1246,13 +1309,21 @@ export class ReferenceResolver {
       await maybeYield();
     }
 
-    const failedCleanup = ReferenceResolver.partitionFailedCleanup(result.unresolved);
-    for (let i = 0; i < failedCleanup.byRowId.length; i += PERSIST_CHUNK) {
-      this.queries.markReferencesFailedByRowIds(failedCleanup.byRowId.slice(i, i + PERSIST_CHUNK));
+    const cleanup = ReferenceResolver.partitionUnresolvedCleanup(result.unresolved);
+    for (let i = 0; i < cleanup.failed.byRowId.length; i += PERSIST_CHUNK) {
+      this.queries.markReferencesFailedByRowIds(cleanup.failed.byRowId.slice(i, i + PERSIST_CHUNK));
       await maybeYield();
     }
-    for (let i = 0; i < failedCleanup.legacyKeys.length; i += PERSIST_CHUNK) {
-      this.queries.markReferencesFailed(failedCleanup.legacyKeys.slice(i, i + PERSIST_CHUNK));
+    for (let i = 0; i < cleanup.failed.legacyKeys.length; i += PERSIST_CHUNK) {
+      this.queries.markReferencesFailed(cleanup.failed.legacyKeys.slice(i, i + PERSIST_CHUNK));
+      await maybeYield();
+    }
+    for (let i = 0; i < cleanup.external.byRowId.length; i += PERSIST_CHUNK) {
+      this.queries.markReferencesExternalByRowIds(cleanup.external.byRowId.slice(i, i + PERSIST_CHUNK));
+      await maybeYield();
+    }
+    for (let i = 0; i < cleanup.external.legacyKeys.length; i += PERSIST_CHUNK) {
+      this.queries.markReferencesExternal(cleanup.external.legacyKeys.slice(i, i + PERSIST_CHUNK));
       await maybeYield();
     }
 
@@ -1343,6 +1414,7 @@ export class ReferenceResolver {
         column: raw.column,
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
+        metadata: raw.metadata,
         rowId: raw.rowId,
       };
       const result = this.resolveOneTimed(ref);
@@ -1463,6 +1535,7 @@ export class ReferenceResolver {
         column: raw.column,
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
+        metadata: raw.metadata,
         rowId: raw.rowId,
       };
       const result = this.resolveOneTimed(ref);
@@ -1838,13 +1911,21 @@ export class ReferenceResolver {
       // only see pending rows) but stay retryable when a later sync adds a
       // symbol that could satisfy them (#1240).
       tLp = Date.now();
-      const failedCleanup = ReferenceResolver.partitionFailedCleanup(result.unresolved);
-      for (let i = 0; i < failedCleanup.byRowId.length; i += PERSIST_CHUNK) {
-        removedThisBatch += this.queries.markReferencesFailedByRowIds(failedCleanup.byRowId.slice(i, i + PERSIST_CHUNK));
+      const cleanup = ReferenceResolver.partitionUnresolvedCleanup(result.unresolved);
+      for (let i = 0; i < cleanup.failed.byRowId.length; i += PERSIST_CHUNK) {
+        removedThisBatch += this.queries.markReferencesFailedByRowIds(cleanup.failed.byRowId.slice(i, i + PERSIST_CHUNK));
         await maybeYield();
       }
-      for (let i = 0; i < failedCleanup.legacyKeys.length; i += PERSIST_CHUNK) {
-        removedThisBatch += this.queries.markReferencesFailed(failedCleanup.legacyKeys.slice(i, i + PERSIST_CHUNK));
+      for (let i = 0; i < cleanup.failed.legacyKeys.length; i += PERSIST_CHUNK) {
+        removedThisBatch += this.queries.markReferencesFailed(cleanup.failed.legacyKeys.slice(i, i + PERSIST_CHUNK));
+        await maybeYield();
+      }
+      for (let i = 0; i < cleanup.external.byRowId.length; i += PERSIST_CHUNK) {
+        removedThisBatch += this.queries.markReferencesExternalByRowIds(cleanup.external.byRowId.slice(i, i + PERSIST_CHUNK));
+        await maybeYield();
+      }
+      for (let i = 0; i < cleanup.external.legacyKeys.length; i += PERSIST_CHUNK) {
+        removedThisBatch += this.queries.markReferencesExternal(cleanup.external.legacyKeys.slice(i, i + PERSIST_CHUNK));
         await maybeYield();
       }
       lp('marks', tLp);
@@ -1976,6 +2057,14 @@ export class ReferenceResolver {
    */
   private isBuiltInOrExternal(ref: UnresolvedRef): boolean {
     const name = ref.referenceName;
+
+    // Gleam's `gleam/*` modules are compiler-provided and are not indexed as
+    // project files. Keep their bindings from falling through to global name
+    // matching when a project happens to define a same-named symbol.
+    if (isExternalGleamReference(ref, this.context) || isGleamPreludeReference(ref, this.context)) {
+      return true;
+    }
+
     const isJsTs = ref.language === 'typescript' || ref.language === 'javascript'
       || ref.language === 'tsx' || ref.language === 'jsx' || ref.language === 'arkts';
 

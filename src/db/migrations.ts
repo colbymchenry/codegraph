@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 9;
+export const CURRENT_SCHEMA_VERSION = 10;
 
 /**
  * Migration definition
@@ -175,6 +175,19 @@ const migrations: Migration[] = [
       db.exec(
         'CREATE INDEX IF NOT EXISTS idx_files_generated ON files(path) WHERE generated = 1'
       );
+    },
+  },
+  {
+    version: 10,
+    description: 'Persist structured metadata on unresolved references for explicit FFI targets',
+    up: (db) => {
+      const cols = db.prepare('PRAGMA table_info(unresolved_refs)').all() as Array<{ name: string }>;
+      // Some migration tests intentionally exercise a partial legacy schema.
+      // A real CodeGraph database always has unresolved_refs; when it is absent,
+      // leave the unrelated fixture alone instead of issuing ALTER TABLE on it.
+      if (cols.length > 0 && !cols.some((column) => column.name === 'metadata')) {
+        db.exec('ALTER TABLE unresolved_refs ADD COLUMN metadata TEXT');
+      }
     },
   },
 ];

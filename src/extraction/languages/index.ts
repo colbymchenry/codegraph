@@ -23,6 +23,7 @@ import { kotlinExtractor } from './kotlin';
 import { dartExtractor } from './dart';
 import { pascalExtractor } from './pascal';
 import { scalaExtractor } from './scala';
+import { gleamExtractor } from './gleam';
 import { luaExtractor } from './lua';
 import { rExtractor } from './r';
 import { luauExtractor } from './luau';
@@ -56,6 +57,7 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   dart: dartExtractor,
   pascal: pascalExtractor,
   scala: scalaExtractor,
+  gleam: gleamExtractor,
   lua: luaExtractor,
   r: rExtractor,
   luau: luauExtractor,

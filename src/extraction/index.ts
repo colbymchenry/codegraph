@@ -139,6 +139,10 @@ export function hashContent(content: string): string {
   return crypto.createHash('sha256').update(content).digest('hex');
 }
 
+function isMissingFileError(error: unknown): boolean {
+  return error instanceof Error && (error as NodeJS.ErrnoException).code === 'ENOENT';
+}
+
 /**
  * Skip files larger than this (bytes). Generated bundles, minified JS, and
  * vendored blobs blow the WASM heap and the worker-recycle budget for no useful
@@ -169,7 +173,7 @@ const DEFAULT_IGNORE_DIRS: ReadonlySet<string> = new Set([
   '.docusaurus', 'storybook-static', '.vinxi', '.nitro', 'out-tsc',
   '.vercel', '.netlify', '.wrangler',
   // Build output (common across ecosystems)
-  'dist', 'build', 'out', '.output',
+  'dist', 'build', 'out', '.output', '_build',
   // Test / coverage
   'coverage', '.nyc_output',
   // Python
@@ -1418,6 +1422,20 @@ function resurrectRefFromDroppedEdge(
   const refName = e.metadata?.refName;
   if (typeof refName !== 'string' || refName.length === 0) return null;
   const refKind = typeof e.metadata?.refKind === 'string' ? (e.metadata.refKind as ReferenceKind) : e.kind;
+  const ffiMetadata =
+    e.metadata?.ffi === true &&
+    e.metadata.targetLanguage === 'erlang' &&
+    typeof e.metadata.module === 'string' &&
+    typeof e.metadata.function === 'string' &&
+    typeof e.metadata.arity === 'number'
+      ? {
+          ffi: true,
+          targetLanguage: 'erlang',
+          module: e.metadata.module,
+          function: e.metadata.function,
+          arity: e.metadata.arity,
+        }
+      : undefined;
   return {
     fromNodeId: e.source,
     referenceName: refName,
@@ -1426,6 +1444,7 @@ function resurrectRefFromDroppedEdge(
     column: e.column ?? 0,
     filePath: e.sourceFilePath,
     language: e.sourceLanguage,
+    metadata: ffiMetadata,
   };
 }
 
@@ -1898,6 +1917,22 @@ export class ExtractionOrchestrator {
         if (signal?.aborted) { aborted = true; break; }
 
         if (error || content === null || stats === null) {
+          if (isMissingFileError(error)) {
+            processed++;
+            filesSkipped++;
+            if (!storeWriter) {
+              const incoming = this.queries.getCrossFileIncomingEdgesWithTarget(filePath);
+              if (incoming.length > 0) {
+                const resurrected = incoming
+                  .map((edge) => resurrectRefFromDroppedEdge(edge))
+                  .filter((ref): ref is UnresolvedReference => ref !== null);
+                if (resurrected.length > 0) this.queries.insertUnresolvedRefsBatch(resurrected);
+              }
+              this.queries.deleteFile(filePath);
+            }
+            onProgress?.({ phase: 'parsing', current: processed, total });
+            continue;
+          }
           processed++;
           filesErrored++;
           errors.push({

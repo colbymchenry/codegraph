@@ -1609,6 +1609,7 @@ export class TreeSitterExtractor {
     // present in Python `@decorator def f():` and Java/Kotlin
     // annotations on free functions).
     this.extractDecoratorsFor(node, funcNode.id);
+    this.extractor.afterExtractFunction?.(node, funcNode, this.makeExtractorContext());
 
     // Push to stack and visit body
     this.nodeStack.push(funcNode.id);

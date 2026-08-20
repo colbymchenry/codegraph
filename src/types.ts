@@ -100,6 +100,7 @@ export const LANGUAGES = [
   'liquid',
   'pascal',
   'scala',
+  'gleam',
   'lua',
   'luau',
   'objc',
@@ -336,6 +337,15 @@ export interface ExtractionError {
  */
 export type ReferenceKind = EdgeKind | 'function_ref';
 
+/** Structured target information for an explicit foreign-function declaration. */
+export interface ForeignFunctionMetadata extends Record<string, unknown> {
+  ffi: true;
+  targetLanguage: Language;
+  module: string;
+  function: string;
+  arity: number;
+}
+
 /**
  * A reference that couldn't be resolved during extraction
  */
@@ -361,6 +371,9 @@ export interface UnresolvedReference {
 
   /** Possible qualified names it might resolve to */
   candidates?: string[];
+
+  /** Additive metadata retained through persistence and copied to the resolved edge. */
+  metadata?: Record<string, unknown>;
 
   /**
    * `unresolved_refs.id` when this ref was loaded from the database. Post-pass

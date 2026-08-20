@@ -114,6 +114,7 @@ interface UnresolvedRefRow {
   line: number;
   col: number;
   candidates: string | null;
+  metadata: string | null;
   file_path: string;
   language: string;
   status: string;
@@ -130,6 +131,22 @@ interface UnresolvedRefRow {
 function referenceNameTail(referenceName: string): string {
   const idx = Math.max(referenceName.lastIndexOf('.'), referenceName.lastIndexOf(':'));
   return idx >= 0 ? referenceName.slice(idx + 1) : referenceName;
+}
+
+/** Convert an unresolved-reference database row to its public representation. */
+function rowToUnresolvedReference(row: UnresolvedRefRow): UnresolvedReference {
+  return {
+    fromNodeId: row.from_node_id,
+    referenceName: row.reference_name,
+    referenceKind: row.reference_kind as EdgeKind,
+    line: row.line,
+    column: row.col,
+    candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+    metadata: row.metadata ? safeJsonParse(row.metadata, undefined) : undefined,
+    filePath: row.file_path,
+    language: row.language as Language,
+    rowId: row.id,
+  };
 }
 
 /**
@@ -2131,8 +2148,8 @@ export class QueryBuilder {
   insertUnresolvedRef(ref: UnresolvedReference): void {
     if (!this.stmts.insertUnresolved) {
       this.stmts.insertUnresolved = this.db.prepare(`
-        INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language)
-        VALUES (@fromNodeId, @referenceName, @referenceKind, @line, @col, @candidates, @filePath, @language)
+        INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, metadata, file_path, language)
+        VALUES (@fromNodeId, @referenceName, @referenceKind, @line, @col, @candidates, @metadata, @filePath, @language)
       `);
     }
 
@@ -2143,6 +2160,7 @@ export class QueryBuilder {
       line: ref.line,
       col: ref.column,
       candidates: ref.candidates ? JSON.stringify(ref.candidates) : null,
+      metadata: ref.metadata ? JSON.stringify(ref.metadata) : null,
       filePath: ref.filePath ?? '',
       language: ref.language ?? 'unknown',
     });
@@ -2163,14 +2181,15 @@ export class QueryBuilder {
           ref.line,
           ref.column,
           ref.candidates ? JSON.stringify(ref.candidates) : null,
+          ref.metadata ? JSON.stringify(ref.metadata) : null,
           ref.filePath ?? '',
           ref.language ?? 'unknown',
         ]);
       }
       this.runBatched(
         'insertUnresolvedRefs',
-        'INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language) VALUES ',
-        '(?,?,?,?,?,?,?,?)',
+        'INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, metadata, file_path, language) VALUES ',
+        '(?,?,?,?,?,?,?,?,?)',
         rows
       );
     });
@@ -2199,17 +2218,7 @@ export class QueryBuilder {
       );
     }
     const rows = this.stmts.getUnresolvedByName.all(name) as UnresolvedRefRow[];
-    return rows.map((row) => ({
-      fromNodeId: row.from_node_id,
-      referenceName: row.reference_name,
-      referenceKind: row.reference_kind as EdgeKind,
-      line: row.line,
-      column: row.col,
-      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
-      filePath: row.file_path,
-      language: row.language as Language,
-      rowId: row.id,
-    }));
+    return rows.map(rowToUnresolvedReference);
   }
 
   /**
@@ -2217,17 +2226,7 @@ export class QueryBuilder {
    */
   getUnresolvedReferences(): UnresolvedReference[] {
     const rows = this.db.prepare('SELECT * FROM unresolved_refs').all() as UnresolvedRefRow[];
-    return rows.map((row) => ({
-      fromNodeId: row.from_node_id,
-      referenceName: row.reference_name,
-      referenceKind: row.reference_kind as EdgeKind,
-      line: row.line,
-      column: row.col,
-      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
-      filePath: row.file_path,
-      language: row.language as Language,
-      rowId: row.id,
-    }));
+    return rows.map(rowToUnresolvedReference);
   }
 
   /**
@@ -2265,17 +2264,7 @@ export class QueryBuilder {
       );
     }
     const rows = this.stmts.getUnresolvedBatch.all(limit, offset) as UnresolvedRefRow[];
-    return rows.map((row) => ({
-      fromNodeId: row.from_node_id,
-      referenceName: row.reference_name,
-      referenceKind: row.reference_kind as EdgeKind,
-      line: row.line,
-      column: row.col,
-      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
-      filePath: row.file_path,
-      language: row.language as Language,
-      rowId: row.id,
-    }));
+    return rows.map(rowToUnresolvedReference);
   }
 
   /**
@@ -2293,17 +2282,7 @@ export class QueryBuilder {
       );
     }
     const rows = this.stmts.getUnresolvedBatchAfter.all(afterRowId, limit) as UnresolvedRefRow[];
-    return rows.map((row) => ({
-      fromNodeId: row.from_node_id,
-      referenceName: row.reference_name,
-      referenceKind: row.reference_kind as EdgeKind,
-      line: row.line,
-      column: row.col,
-      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
-      filePath: row.file_path,
-      language: row.language as Language,
-      rowId: row.id,
-    }));
+    return rows.map(rowToUnresolvedReference);
   }
 
   /**
@@ -2367,17 +2346,7 @@ export class QueryBuilder {
       for (const row of chunkRows) rows.push(row);
     }
 
-    return rows.map((row) => ({
-      fromNodeId: row.from_node_id,
-      referenceName: row.reference_name,
-      referenceKind: row.reference_kind as EdgeKind,
-      line: row.line,
-      column: row.col,
-      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
-      filePath: row.file_path,
-      language: row.language as Language,
-      rowId: row.id,
-    }));
+    return rows.map(rowToUnresolvedReference);
   }
 
   /**
@@ -2510,6 +2479,40 @@ export class QueryBuilder {
     return changed;
   }
 
+  /** Mark terminal built-in or external refs so sync never retries them by name. */
+  markReferencesExternal(
+    refs: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>,
+  ): number {
+    if (refs.length === 0) return 0;
+    const stmt = this.db.prepare(
+      "UPDATE unresolved_refs SET status = 'external', name_tail = '' WHERE from_node_id = ? AND reference_name = ? AND reference_kind = ?",
+    );
+    let changed = 0;
+    const markMany = this.db.transaction((items: typeof refs) => {
+      for (const ref of items) {
+        changed += stmt.run(ref.fromNodeId, ref.referenceName, ref.referenceKind).changes;
+      }
+    });
+    markMany(refs);
+    return changed;
+  }
+
+  /** Row-precise counterpart of markReferencesExternal. */
+  markReferencesExternalByRowIds(refs: Array<{ rowId: number }>): number {
+    if (refs.length === 0) return 0;
+    const stmt = this.db.prepare(
+      "UPDATE unresolved_refs SET status = 'external', name_tail = '' WHERE id = ?",
+    );
+    let changed = 0;
+    const markMany = this.db.transaction((items: typeof refs) => {
+      for (const ref of items) {
+        changed += stmt.run(ref.rowId).changes;
+      }
+    });
+    markMany(refs);
+    return changed;
+  }
+
   /**
    * Failed refs whose name tail matches one of the given symbol names — the
    * candidates a sync should retry after files carrying those names changed
@@ -2552,17 +2555,7 @@ export class QueryBuilder {
       for (const row of chunkRows) rows.push(row);
     }
 
-    return rows.map((row) => ({
-      fromNodeId: row.from_node_id,
-      referenceName: row.reference_name,
-      referenceKind: row.reference_kind as EdgeKind,
-      line: row.line,
-      column: row.col,
-      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
-      filePath: row.file_path,
-      language: row.language as Language,
-      rowId: row.id,
-    }));
+    return rows.map(rowToUnresolvedReference);
   }
 
   /**
