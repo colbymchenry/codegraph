@@ -171,6 +171,7 @@ const DEFAULT_FIND_OPTIONS: Required<FindRelevantContextOptions> = {
   minScore: 0.3,
   edgeKinds: [],
   nodeKinds: HIGH_VALUE_NODE_KINDS, // Filter out imports/exports by default
+  seedNames: [],         // Segment-vocab supplement — filled by the facade
 };
 
 // Re-export the low-confidence sentinel (defined in a dependency-free leaf so
@@ -460,13 +461,37 @@ export class ContextBuilder {
 
     // Step 2: Look up exact matches for extracted symbols
     let exactMatches: SearchResult[] = [];
-    if (symbolsFromQuery.length > 0) {
+    if (symbolsFromQuery.length > 0 || opts.seedNames.length > 0) {
       try {
-        // Get more results so we can apply co-location boosting before trimming
-        exactMatches = this.queries.findNodesByExactName(symbolsFromQuery, {
-          limit: Math.ceil(opts.searchLimit * 5),
-          kinds: opts.nodeKinds && opts.nodeKinds.length > 0 ? opts.nodeKinds : undefined,
-        });
+        if (symbolsFromQuery.length > 0) {
+          // Get more results so we can apply co-location boosting before trimming
+          exactMatches = this.queries.findNodesByExactName(symbolsFromQuery, {
+            limit: Math.ceil(opts.searchLimit * 5),
+            kinds: opts.nodeKinds && opts.nodeKinds.length > 0 ? opts.nodeKinds : undefined,
+          });
+        }
+
+        // Step 2a: segment-vocabulary seeds. Word-level query terms cannot
+        // reach camelCase names through FTS (one token per name), so the
+        // caller resolves query words → names via the segment vocab and hands
+        // them in as seedNames. Merged at a dampened score — a symbol the
+        // query names outright must outrank a segment-derived one — but
+        // BEFORE the co-location boost below, because several seeds landing
+        // in one file (pinFeedIfNearBottom + feedAtBottom + handleFeedScroll)
+        // is exactly the evidence that file is the answer.
+        if (opts.seedNames.length > 0) {
+          const seedResults = this.queries.findNodesByExactName(opts.seedNames, {
+            limit: Math.ceil(opts.searchLimit * 3),
+            kinds: opts.nodeKinds && opts.nodeKinds.length > 0 ? opts.nodeKinds : undefined,
+          });
+          const known = new Set(exactMatches.map((r) => r.node.id));
+          for (const r of seedResults) {
+            if (known.has(r.node.id)) continue;
+            known.add(r.node.id);
+            exactMatches.push({ ...r, score: r.score * 0.6 });
+          }
+          logDebug('Segment seed matches', { seedNames: opts.seedNames, added: known.size });
+        }
 
         // Co-location boost: when multiple extracted symbols appear in the same file,
         // those results are much more likely to be what the user is looking for.

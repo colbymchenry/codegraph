@@ -54,7 +54,7 @@ import { EXTRACTION_VERSION } from './extraction/extraction-version';
 import { getCodeGraphDir } from './directory';
 import { deriveProjectNameTokens } from './search/query-utils';
 import { CodeGraphPackageVersion } from './mcp/version';
-import { segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
+import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
 import { minRefsForPool } from './resolution/resolver-pool';
 
@@ -1831,7 +1831,23 @@ export class CodeGraph {
     query: string,
     options?: FindRelevantContextOptions
   ): Promise<Subgraph> {
-    return this.contextBuilder.findRelevantContext(query, options);
+    // Segment-vocab supplement: FTS keeps camelCase names as single tokens,
+    // so a word-level query ("auto-scroll to bottom") can never reach
+    // `pinFeedIfNearBottom` through search alone. Resolve the query's words
+    // against name_segment_vocab (same precision rules as the prompt hook:
+    // co-occurrence, else rare singles, verified against live nodes) and hand
+    // the names down as dampened exact-name seeds. Callers that pass their
+    // own seedNames keep them; failures degrade to no supplement.
+    let seedNames = options?.seedNames;
+    if (seedNames === undefined) {
+      try {
+        seedNames = this.getSegmentMatches(extractSegmentSearchWords(query), 8)
+          .map((m) => m.name);
+      } catch {
+        seedNames = [];
+      }
+    }
+    return this.contextBuilder.findRelevantContext(query, { ...options, seedNames });
   }
 
   /**
