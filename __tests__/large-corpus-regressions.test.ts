@@ -102,3 +102,42 @@ describe('JSX synthesis language boundary (#1560)', () => {
     expect(rows.some((row) => row.source_file === 'native.c')).toBe(false);
   });
 });
+
+describe('failure markers vs later real results (#1557 × #1541)', () => {
+  it('a failure marker never blocks storing a later successful parse of the same bytes', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-marker-override-'));
+    try {
+      const rel = 'flaky.py';
+      const content = 'def real_fn():\n    return 1\n\nclass RealClass:\n    def m(self):\n        return 2\n';
+      fs.writeFileSync(path.join(dir, rel), content);
+      const cg = await CodeGraph.init(dir, { silent: true });
+      const { initGrammars, loadGrammarsForLanguages } = await import('../src/extraction/grammars');
+      await initGrammars();
+      await loadGrammarsForLanguages(['python']);
+      const orch = (cg as any).orchestrator;
+      const stats = fs.statSync(path.join(dir, rel));
+
+      // What recordParseFailure persists when a parse worker dies: a marker
+      // row under the SAME content hash the retry will store with.
+      await orch.storeExtractionResult(rel, content, 'python', stats, {
+        nodes: [], edges: [], unresolvedReferences: [],
+        errors: [{ message: 'Worker exited with code 1', filePath: rel, severity: 'error', code: 'parse_error' }],
+        durationMs: 0,
+      });
+      expect(cg.getFile(rel)?.nodeCount).toBe(0);
+
+      // The retry pass succeeds with identical bytes — the marker must be
+      // replaced, not treated as "no changes".
+      const { extractFromSource } = await import('../src/extraction/tree-sitter');
+      const real = extractFromSource(rel, content, 'python');
+      expect(real.nodes.length).toBeGreaterThan(0);
+      await orch.storeExtractionResult(rel, content, 'python', stats, real);
+
+      expect(cg.getFile(rel)?.nodeCount).toBe(real.nodes.length);
+      expect(cg.getNodesInFile(rel).map((n: { name: string }) => n.name)).toContain('real_fn');
+      cg.close();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
