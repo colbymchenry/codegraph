@@ -14,6 +14,13 @@ export interface SqliteStatement {
   run(...params: any[]): { changes: number; lastInsertRowid: number | bigint };
   get(...params: any[]): any;
   all(...params: any[]): any[];
+  /**
+   * Lazily yield result rows one at a time instead of materializing the whole
+   * set with `all()`. Use for unbounded scans (e.g. every function/method node)
+   * so memory stays O(1) in the row count rather than O(rows) — see #610, where
+   * `all()`-ing every symbol on a dense project spiked the heap into an OOM.
+   */
+  iterate(...params: any[]): IterableIterator<any>;
 }
 
 export interface SqliteDatabase {
@@ -42,11 +49,12 @@ export type SqliteBackend = 'node-sqlite';
  */
 class NodeSqliteAdapter implements SqliteDatabase {
   private _db: any;
+  private _txDepth = 0;
 
-  constructor(dbPath: string) {
+  constructor(dbPath: string, opts?: { readOnly?: boolean }) {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { DatabaseSync } = require('node:sqlite');
-    this._db = new DatabaseSync(dbPath);
+    this._db = opts?.readOnly ? new DatabaseSync(dbPath, { readOnly: true }) : new DatabaseSync(dbPath);
   }
 
   get open(): boolean {
@@ -71,6 +79,9 @@ class NodeSqliteAdapter implements SqliteDatabase {
       },
       all(...params: any[]) {
         return stmt.all(...params);
+      },
+      iterate(...params: any[]) {
+        return stmt.iterate(...params);
       },
     };
   }
@@ -98,13 +109,29 @@ class NodeSqliteAdapter implements SqliteDatabase {
 
   transaction<T>(fn: (...args: any[]) => T): (...args: any[]) => T {
     return (...args: any[]) => {
+      // Nested call (a transaction()-wrapped helper invoked from inside another
+      // transaction): run the body directly inside the enclosing transaction.
+      // BEGIN would throw "cannot start a transaction within a transaction",
+      // so no existing caller ever relied on nested rollback granularity —
+      // flattening is behavior-preserving and free.
+      if (this._txDepth > 0) {
+        this._txDepth++;
+        try {
+          return fn(...args);
+        } finally {
+          this._txDepth--;
+        }
+      }
       this._db.exec('BEGIN');
+      this._txDepth = 1;
       try {
         const result = fn(...args);
         this._db.exec('COMMIT');
+        this._txDepth = 0;
         return result;
       } catch (error) {
         this._db.exec('ROLLBACK');
+        this._txDepth = 0;
         throw error;
       }
     };
@@ -124,9 +151,9 @@ class NodeSqliteAdapter implements SqliteDatabase {
  * report it per-instance — MCP can open multiple project DBs in one process, so
  * a process-global would race.
  */
-export function createDatabase(dbPath: string): { db: SqliteDatabase; backend: SqliteBackend } {
+export function createDatabase(dbPath: string, opts?: { readOnly?: boolean }): { db: SqliteDatabase; backend: SqliteBackend } {
   try {
-    return { db: new NodeSqliteAdapter(dbPath), backend: 'node-sqlite' };
+    return { db: new NodeSqliteAdapter(dbPath, opts), backend: 'node-sqlite' };
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     throw new Error(

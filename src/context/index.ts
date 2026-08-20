@@ -24,8 +24,9 @@ import { QueryBuilder } from '../db/queries';
 import { GraphTraverser } from '../graph';
 import { formatContextAsMarkdown, formatContextAsJson } from './formatter';
 import { logDebug } from '../errors';
-import { validatePathWithinRoot } from '../utils';
-import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants } from '../search/query-utils';
+import { validatePathWithinRoot, isConfigLeafNode } from '../utils';
+import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants, isDistinctiveIdentifier } from '../search/query-utils';
+import { LOW_CONFIDENCE_MARKER } from './markers';
 
 /**
  * Extract likely symbol names from a natural language query
@@ -156,7 +157,7 @@ const DEFAULT_BUILD_OPTIONS: Required<BuildContextOptions> = {
  * they tell you something exists, not how it works.
  */
 const HIGH_VALUE_NODE_KINDS: NodeKind[] = [
-  'function', 'method', 'class', 'interface', 'type_alias', 'struct', 'trait',
+  'function', 'method', 'class', 'interface', 'type_alias', 'struct', 'union', 'trait',
   'component', 'route', 'variable', 'constant', 'enum', 'module', 'namespace',
 ];
 
@@ -171,6 +172,11 @@ const DEFAULT_FIND_OPTIONS: Required<FindRelevantContextOptions> = {
   edgeKinds: [],
   nodeKinds: HIGH_VALUE_NODE_KINDS, // Filter out imports/exports by default
 };
+
+// Re-export the low-confidence sentinel (defined in a dependency-free leaf so
+// the MCP layer can import it without pulling this module's deps onto the
+// cold-start path). Builder code below uses the imported binding directly.
+export { LOW_CONFIDENCE_MARKER } from './markers';
 
 /**
  * Context Builder
@@ -259,12 +265,51 @@ export class ContextBuilder {
 
     // Return formatted output or raw context
     if (opts.format === 'markdown') {
-      return formatContextAsMarkdown(context) + this.buildCallPathsSection(subgraph);
+      // Bounded candidate set (entry points + subgraph + code blocks), so the
+      // DB-backed generated check is one probe, not a per-comparison query.
+      const isGenerated = this.queries.generatedPredicateFor([
+        ...entryPoints.map((n) => n.filePath),
+        ...Array.from(subgraph.nodes.values(), (n) => n.filePath),
+        ...codeBlocks.map((b) => b.filePath),
+      ]);
+      return formatContextAsMarkdown(context, isGenerated)
+        + this.buildCallPathsSection(subgraph)
+        + (subgraph.confidence === 'low' ? this.buildLowConfidenceNote(entryPoints) : '');
     } else if (opts.format === 'json') {
       return formatContextAsJson(context);
     }
 
     return context;
+  }
+
+  /**
+   * Honest handoff appended when retrieval confidence is low (the query matched
+   * mostly common words). Instead of the usual "this covers the surface" framing
+   * — which, when wrong, sends the agent off to Read/Grep — it admits the
+   * uncertainty and routes the agent to the precise tools (explore with real
+   * symbol names, search, or files to browse the closest areas we *did* surface).
+   */
+  private buildLowConfidenceNote(entryPoints: Node[]): string {
+    const dirs: string[] = [];
+    const seen = new Set<string>();
+    for (const n of entryPoints) {
+      const slash = n.filePath.lastIndexOf('/');
+      const dir = slash > 0 ? n.filePath.slice(0, slash) : n.filePath;
+      if (!seen.has(dir)) { seen.add(dir); dirs.push(dir); }
+      if (dirs.length >= 4) break;
+    }
+    const dirLine = dirs.length
+      ? `\n- \`codegraph_files\` a likely area: ${dirs.map(d => `\`${d}\``).join(', ')}`
+      : '';
+    return `\n\n${LOW_CONFIDENCE_MARKER}\n\n`
+      + 'This query matched mostly on common words, so the entry points above may '
+      + 'be off-target — treat them as a starting point, not a complete answer. '
+      + 'For a reliable result:\n'
+      + '- `codegraph_explore` with the **exact symbol names** you are after '
+      + '(class / function / method names), or\n'
+      + '- `codegraph_search <name>` for one specific symbol'
+      + dirLine
+      + '\n\nDo not assume the list above is comprehensive.';
   }
 
   /**
@@ -458,7 +503,7 @@ export class ContextBuilder {
     // like RestController, BulkRequest, AllocationService — not nodes named exactly that.
     // Also tries stem variants: "caching" → "cache" finds Cache, CacheBuilder.
     if (symbolsFromQuery.length > 0) {
-      const definitionKinds: NodeKind[] = ['class', 'interface', 'struct', 'trait',
+      const definitionKinds: NodeKind[] = ['class', 'interface', 'struct', 'union', 'trait',
         'protocol', 'enum', 'type_alias'];
       // Expand symbols with stem variants for broader definition matching
       const expandedSymbols = new Set(symbolsFromQuery);
@@ -514,7 +559,7 @@ export class ContextBuilder {
         // but are almost never what exploration queries want.
         const searchKinds = opts.nodeKinds && opts.nodeKinds.length > 0
           ? opts.nodeKinds
-          : ['file', 'module', 'class', 'struct', 'interface', 'trait', 'protocol',
+          : ['file', 'module', 'class', 'struct', 'union', 'interface', 'trait', 'protocol',
              'function', 'method', 'property', 'field', 'variable', 'constant',
              'enum', 'enum_member', 'type_alias', 'namespace', 'export',
              'route', 'component'] as NodeKind[];
@@ -587,6 +632,37 @@ export class ContextBuilder {
       }
     }
 
+    // Iter7 — Core-directory boost. On projects with one file that holds
+    // the dense majority of internal call edges (e.g. sinatra's
+    // `lib/sinatra/base.rb` at 85% of all in-file edges), the agent's
+    // task usually asks about the framework's core. Without this boost,
+    // ranking favors small focused extension files (e.g. text search
+    // picks `sinatra-contrib/lib/sinatra/multi_route.rb`'s 10-line
+    // `route` method over `base.rb`'s `route!` because the extension
+    // file's `route` matches the query verbatim AND the file is small,
+    // dwarfing the longer name `route!` in a 1500-line file). Boost
+    // results that share a directory prefix with the dominant file's
+    // directory so the core file's siblings outrank sibling-package
+    // extensions.
+    try {
+      const dominant = this.queries.getDominantFile?.();
+      if (dominant && dominant.edgeCount >= 3 * dominant.nextEdgeCount) {
+        // Take the directory of the dominant file (everything up to the
+        // last slash). For `lib/sinatra/base.rb` → `lib/sinatra/`.
+        const slash = dominant.filePath.lastIndexOf('/');
+        if (slash > 0) {
+          const coreDir = dominant.filePath.slice(0, slash + 1);
+          for (const result of searchResults) {
+            if (result.node.filePath.startsWith(coreDir)) {
+              result.score += 25;
+            }
+          }
+        }
+      }
+    } catch {
+      // SQL failure — fall through, scoring works without the boost
+    }
+
     // Step 5a: Multi-term co-occurrence re-ranking (applied BEFORE truncation).
     // For multi-word queries like "search execution from request to shard",
     // nodes matching 2+ query terms in their name or path are far more relevant
@@ -622,6 +698,21 @@ export class ContextBuilder {
       // term group is counter-productive.
       const exactMatchIds = new Set(exactMatches.map(r => r.node.id));
 
+      // ...but only exempt exact matches the user *named as an identifier*
+      // (camelCase/snake_case/acronym). A plain dictionary word that happens to
+      // exact-match an unrelated symbol — query "flat object" → a constant named
+      // FLAT — must NOT be exempt, or the +exact-name bonus floats it to the top
+      // of a prose query with zero corroboration from any other term. Classify by
+      // the QUERY token (what the user typed), not the matched symbol's name.
+      const distinctiveTokens = new Set(
+        symbolsFromQuery.filter(isDistinctiveIdentifier).map(s => s.toLowerCase())
+      );
+      const distinctiveExactMatchIds = new Set(
+        exactMatches
+          .filter(r => distinctiveTokens.has(r.node.name.toLowerCase()))
+          .map(r => r.node.id)
+      );
+
       for (const result of searchResults) {
         // Check term matches in name (substring) and path DIRECTORIES (exact).
         // Directory segments must match exactly — "search" matches directory
@@ -641,10 +732,17 @@ export class ContextBuilder {
         if (matchCount >= 2) {
           // Multiplicative boost — 2 terms → 2x, 3 terms → 2.5x
           result.score *= 1 + matchCount * 0.5;
-        } else if (!exactMatchIds.has(result.node.id)) {
-          // Mild dampen for single-term matches — they might be generic
+        } else if (distinctiveExactMatchIds.has(result.node.id)) {
+          // Exact match on a distinctive identifier the user explicitly named —
+          // keep full score (e.g. "LiveEditMode DevServerPreview").
+        } else if (exactMatchIds.has(result.node.id)) {
+          // Exact match on a COMMON word (e.g. "flat" → FLAT): high-scoring noise
+          // inflated by the +exact-name bonus, corroborated by no other query
+          // term. Demote hard so corroborated matches win.
+          result.score *= 0.3;
+        } else {
+          // Mild dampen for generic single-term matches — they might be generic
           // but could also be the right result (e.g., "Protocol" class for an IPC query).
-          // Exempt exact name matches: they are specific symbols the user queried for.
           result.score *= 0.6;
         }
       }
@@ -656,8 +754,15 @@ export class ContextBuilder {
     // LIKE reliably finds these substring matches. Results are appended with
     // guaranteed slots so they don't compete with higher-scoring prefix matches.
     if (symbolsFromQuery.length > 0) {
-      const camelDefinitionKinds: NodeKind[] = ['class', 'interface', 'struct', 'trait',
+      const camelDefinitionKinds: NodeKind[] = ['class', 'interface', 'struct', 'union', 'trait',
         'protocol', 'enum', 'type_alias'];
+      // Callable kinds participate too: in service-layer codebases the
+      // camel-infix definers of a queried FIELD are methods/functions
+      // (`profileInfo` → `getProfileInfoV2`), not classes — the type-only
+      // whitelist made this whole step dead code there (#1196). Fetched as a
+      // SEPARATE LIKE batch so one hot single-word term can't crowd classes
+      // out of the length-ordered 200-row batch.
+      const camelCallableKinds: NodeKind[] = ['function', 'method', 'component'];
       const camelSearchedTerms = new Set<string>();
       const searchIdSet = new Set(searchResults.map(r => r.node.id));
       // Track per-node term hits for multi-term boosting
@@ -675,18 +780,32 @@ export class ContextBuilder {
         // have hundreds of substring matches. The LIKE scan cost is the same
         // regardless of LIMIT (SQLite scans all matches to sort), so we fetch
         // generously and let path-relevance scoring pick the best ones.
-        const likeResults = this.queries.findNodesByNameSubstring(titleCased, {
-          limit: 200,
-          kinds: camelDefinitionKinds,
-          excludePrefix: true,
-        });
+        const likeResults = [
+          ...this.queries.findNodesByNameSubstring(titleCased, {
+            limit: 200,
+            kinds: camelDefinitionKinds,
+            excludePrefix: true,
+          }),
+          ...this.queries.findNodesByNameSubstring(titleCased, {
+            limit: 200,
+            kinds: camelCallableKinds,
+            excludePrefix: true,
+          }),
+        ];
 
         // Filter to CamelCase boundaries, score by path relevance, and take top N
         const termCandidates: SearchResult[] = [];
         for (const r of likeResults) {
           const name = r.node.name;
-          const idx = name.indexOf(titleCased);
+          // Case-INSENSITIVE hump lookup: title-casing lowercases interior
+          // humps (`profileInfo` → `Profileinfo`), which SQLite's LIKE still
+          // matched but a case-sensitive indexOf here silently dropped —
+          // making every multi-hump query term unfindable by this step
+          // (#1196). The match must still LAND on an uppercase char, so a
+          // plain lowercase infix can't slip through.
+          const idx = name.toLowerCase().indexOf(termKey);
           if (idx <= 0) continue;
+          if (!/[A-Z]/.test(name.charAt(idx))) continue;
           // Accept CamelCase boundary (lowercase before match) OR
           // acronym boundary (uppercase before match, e.g., RPCProtocol)
           if (!/[a-zA-Z]/.test(name.charAt(idx - 1))) continue;
@@ -750,11 +869,19 @@ export class ContextBuilder {
           const titleCased = sym.charAt(0).toUpperCase() + sym.slice(1).toLowerCase();
           if (titleCased.length < 3) continue;
 
-          const likeResults = this.queries.findNodesByNameSubstring(titleCased, {
-            limit: 200,
-            kinds: camelDefinitionKinds,
-            excludePrefix: false,
-          });
+          const likeResults = [
+            ...this.queries.findNodesByNameSubstring(titleCased, {
+              limit: 200,
+              kinds: camelDefinitionKinds,
+              excludePrefix: false,
+            }),
+            // Same separate callable batch as Step 5b (#1196).
+            ...this.queries.findNodesByNameSubstring(titleCased, {
+              limit: 200,
+              kinds: camelCallableKinds,
+              excludePrefix: false,
+            }),
+          ];
 
           for (const r of likeResults) {
             if (searchIdSet.has(r.node.id)) continue;
@@ -810,6 +937,35 @@ export class ContextBuilder {
       filteredResults = filteredResults.slice(0, opts.searchLimit);
     }
 
+    // Confidence signal for the honest-handoff footer (consumed in buildContext).
+    // A multi-term prose query that resolves only to isolated common-word matches
+    // — no entry point corroborated by 2+ distinct query terms, and none a
+    // distinctive identifier the user explicitly named — is LOW confidence: the
+    // results are best-effort, not a located answer, so the agent should be told
+    // to drill in with explore/trace rather than trust the list as comprehensive.
+    // Single-keyword and symbol-name queries are exempt (their single match IS the
+    // answer), so the handoff never fires on them.
+    let confidence: 'high' | 'low' = 'high';
+    const confTerms = extractSearchTerms(query, { stems: false }).filter(t => t.length >= 3);
+    if (confTerms.length >= 2 && filteredResults.length > 0) {
+      const distinctive = new Set(
+        symbolsFromQuery.filter(isDistinctiveIdentifier).map(s => s.toLowerCase())
+      );
+      const anyStrong = filteredResults.some(r => {
+        if (distinctive.has(r.node.name.toLowerCase())) return true;
+        const nameLower = r.node.name.toLowerCase();
+        const dirSegs = path.dirname(r.node.filePath).toLowerCase().split('/');
+        let hits = 0;
+        for (const t of confTerms) {
+          if (nameLower.includes(t) || dirSegs.includes(t)) {
+            if (++hits >= 2) return true;
+          }
+        }
+        return false;
+      });
+      if (!anyStrong) confidence = 'low';
+    }
+
     // Add entry points to subgraph
     for (const result of filteredResults) {
       nodes.set(result.node.id, result.node);
@@ -821,7 +977,7 @@ export class ContextBuilder {
     // before reaching extends/implements neighbors. This dedicated step
     // ensures subclasses and superclasses always appear in results.
     // Budget: up to maxNodes/4 hierarchy nodes to avoid flooding.
-    const typeHierarchyKinds = new Set<string>(['class', 'interface', 'struct', 'trait', 'protocol']);
+    const typeHierarchyKinds = new Set<string>(['class', 'interface', 'struct', 'union', 'trait', 'protocol']);
     const maxHierarchyNodes = Math.ceil(opts.maxNodes / 4);
     let hierarchyNodesAdded = 0;
     for (const result of filteredResults) {
@@ -1017,7 +1173,7 @@ export class ContextBuilder {
       }
     }
 
-    return { nodes: finalNodes, edges: finalEdges, roots };
+    return { nodes: finalNodes, edges: finalEdges, roots, confidence };
   }
 
   /**
@@ -1041,6 +1197,14 @@ export class ContextBuilder {
    * Extract code from a node's source file
    */
   private async extractNodeCode(node: Node): Promise<string | null> {
+    // SECURITY (#383): a config-leaf node's on-disk line is `key = <secret>`.
+    // Return the KEY only — never read the value off disk. This closes the
+    // includeCode / buildContext code-block path, mirroring the explore source
+    // renderer; an agent that genuinely needs a value can read the file itself.
+    if (isConfigLeafNode(node)) {
+      return node.signature || node.qualifiedName || node.name;
+    }
+
     const filePath = validatePathWithinRoot(this.projectRoot, node.filePath);
 
     if (!filePath || !fs.existsSync(filePath)) {

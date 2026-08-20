@@ -1,64 +1,51 @@
 /**
- * Agent-instructions template — the markdown body each agent target
- * writes into its conventional instructions file (CLAUDE.md /
- * AGENTS.md / codegraph.mdc / etc.).
+ * The marker-fenced agent-instructions block the installer writes into each
+ * agent's instructions file (CLAUDE.md / AGENTS.md / GEMINI.md).
  *
- * The body content is identical across agents because the codegraph
- * usage advice is agent-agnostic — only the destination filename and
- * any optional frontmatter (Cursor `.mdc`) varies per target.
+ * History: pre-#529 the installer wrote a full usage playbook here, which
+ * duplicated the MCP `initialize` instructions for the main agent — so it
+ * was removed and `mcp/server-instructions.ts` became the single source of
+ * truth. A much smaller block returned for #704, because the MCP
+ * instructions cannot reach two audiences that the instructions FILE does
+ * reach:
  *
- * The legacy `claude-md-template.ts` re-exports these names for
- * backwards compatibility with downstream importers.
+ *  - **Task-tool subagents** — they receive the project instructions file
+ *    in their context but NOT the MCP initialize instructions. They hold
+ *    the codegraph MCP tools only as deferred names and rarely think to
+ *    load them: measured on a forced-delegation flow question (excalidraw,
+ *    sonnet, high effort), subagents loaded + used codegraph in ~1 of 9
+ *    runs without this block, and consistently with it — including runs
+ *    with zero Read/grep fallback.
+ *  - **Non-MCP harnesses** — agents with no MCP client at all can still
+ *    run the `codegraph explore` CLI, which prints the same output as the
+ *    MCP tool.
+ *
+ * Keep this block SHORT. The main agent reads it every turn on top of the
+ * server instructions — the #529 duplication-cost argument still bounds
+ * its size. Command names and the two surfaces, nothing more.
  */
 
-/** Markers used by the marker-based section replacement. */
+/** Markers used by the marker-based section write/removal. */
 export const CODEGRAPH_SECTION_START = '<!-- CODEGRAPH_START -->';
 export const CODEGRAPH_SECTION_END = '<!-- CODEGRAPH_END -->';
 
 /**
- * The full marker-delimited block written into each agent's
- * instructions file. Includes the start/end markers so the section
- * can be detected and replaced on re-install.
+ * The full block, markers included, exactly as written to disk.
+ *
+ * The wording is deliberately CONDITIONAL ("in repositories indexed by…"):
+ * a global install writes this into a user-scope file (~/.claude/CLAUDE.md,
+ * ~/.codex/AGENTS.md) that applies to every project the user opens —
+ * including unindexed ones, where an unconditional "this repository is
+ * indexed" claim would send subagents into failing codegraph calls (the
+ * noise the unindexed-session policy exists to prevent).
  */
-export const INSTRUCTIONS_TEMPLATE = `${CODEGRAPH_SECTION_START}
+export const CODEGRAPH_INSTRUCTIONS_BLOCK = `${CODEGRAPH_SECTION_START}
 ## CodeGraph
 
-This project has a CodeGraph MCP server (\`codegraph_*\` tools) configured. CodeGraph is a tree-sitter-parsed knowledge graph of every symbol, edge, and file. Reads are sub-millisecond and return structural information grep cannot.
+In repositories indexed by CodeGraph (a \`.codegraph/\` directory exists at the repo root), reach for it BEFORE grep/find or reading files when you need to understand or locate code:
 
-### When to prefer codegraph over native search
+- **MCP tool** (when available): \`codegraph_explore\` answers most code questions in one call — the relevant symbols' verbatim source plus the call paths between them, including dynamic-dispatch hops grep can't follow. Name a file or symbol in the query to read its current line-numbered source. If it's listed but deferred, load it by name via tool search.
+- **Shell** (always works): \`codegraph explore "<symbol names or question>"\` prints the same output.
 
-Use codegraph for **structural** questions — what calls what, what would break, where is X defined, what is X's signature. Use native grep/read only for **literal text** queries (string contents, comments, log messages) or after you already have a specific file open.
-
-| Question | Tool |
-|---|---|
-| "Where is X defined?" / "Find symbol named X" | \`codegraph_search\` |
-| "What calls function Y?" | \`codegraph_callers\` |
-| "What does Y call?" | \`codegraph_callees\` |
-| "How does X reach/become Y? / trace the flow from X to Y" | \`codegraph_trace\` (one call = the whole path, incl. callback/React/JSX dynamic hops) |
-| "What would break if I changed Z?" | \`codegraph_impact\` |
-| "Show me Y's signature / source / docstring" | \`codegraph_node\` |
-| "Give me focused context for a task/area" | \`codegraph_context\` |
-| "See several related symbols' source at once" | \`codegraph_explore\` |
-| "What files exist under path/" | \`codegraph_files\` |
-| "Is the index healthy?" | \`codegraph_status\` |
-
-### Rules of thumb
-
-- **Answer directly — don't delegate exploration.** For "how does X work" / architecture questions, answer with 2-3 codegraph calls: \`codegraph_context\` first, then ONE \`codegraph_explore\` for the source of the symbols it surfaces. For a specific **flow** ("how does X reach Y") start with \`codegraph_trace\` from→to — one call returns the whole path with dynamic hops bridged — then ONE \`codegraph_explore\` for the bodies; don't rebuild the path with \`codegraph_search\` + \`codegraph_callers\`. Codegraph IS the pre-built index, so spawning a separate file-reading sub-task/agent — or running a grep + read loop — repeats work codegraph already did and costs more for the same answer.
-- **Trust codegraph results.** They come from a full AST parse. Do NOT re-verify them with grep — that's slower, less accurate, and wastes context.
-- **Don't grep first** when looking up a symbol by name. \`codegraph_search\` is faster and returns kind + location + signature in one call.
-- **Don't chain \`codegraph_search\` + \`codegraph_node\`** when you just want context — \`codegraph_context\` is one call.
-- **Don't loop \`codegraph_node\` over many symbols** — one \`codegraph_explore\` call returns several symbols' source grouped in a single capped call, while each separate node/Read call re-reads the whole context and costs far more.
-- **Index lag**: the file watcher debounces ~500ms behind writes; don't re-query immediately after editing a file in the same turn.
-
-### If \`.codegraph/\` doesn't exist
-
-The MCP server returns "not initialized." Ask the user: *"I notice this project doesn't have CodeGraph initialized. Want me to run \`codegraph init -i\` to build the index?"*
+If there is no \`.codegraph/\` directory, skip CodeGraph entirely — indexing is the user's decision.
 ${CODEGRAPH_SECTION_END}`;
-
-/**
- * Backwards-compat alias. Existing downstream code may import
- * `CLAUDE_MD_TEMPLATE` from this module via the re-export shim in
- * `claude-md-template.ts`.
- */
-export const CLAUDE_MD_TEMPLATE = INSTRUCTIONS_TEMPLATE;

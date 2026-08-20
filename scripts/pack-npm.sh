@@ -64,7 +64,10 @@ for archive in "${archives[@]}"; do
         description: `CodeGraph self-contained bundle for ${process.env.TARGET}`,
         os: [process.env.OSV], cpu: [process.env.ARCHV],
         files: [process.env.NODEFILE, "lib", "bin"],
-        license: "MIT"
+        license: "MIT",
+        // npm --provenance refuses to publish unless this matches the repo
+        // the release workflow runs in.
+        repository: { type: "git", url: "git+https://github.com/colbymchenry/codegraph.git" }
       }, null, 2) + "\n");
     ' "$pkgdir/package.json"
   targets+=("$target")
@@ -72,8 +75,26 @@ for archive in "${archives[@]}"; do
 done
 
 # Main shim package.
+#   npm-shim.js  CLI/MCP launcher (execs the bundled Node) — the `bin`.
+#   npm-sdk.js   programmatic/embedded entry (#354): re-exports the installed
+#                platform bundle's compiled library — the `main`.
+#   dist/        the .d.ts tree only (types). The runtime .js stays in the
+#                per-platform bundle so its deps aren't duplicated here.
 cp "$ROOT/scripts/npm-shim.js" "$NPM/main/npm-shim.js"
+cp "$ROOT/scripts/npm-sdk.js" "$NPM/main/npm-sdk.js"
 [ -f "$ROOT/README.md" ] && cp "$ROOT/README.md" "$NPM/main/README.md"
+
+# Ship the type declarations so `types`/`exports.types` resolve. Built from this
+# same release, so they can't skew from the runtime npm-sdk.js re-exports.
+[ -f "$ROOT/dist/index.d.ts" ] || ( echo "[pack-npm] building dist for .d.ts" >&2 && cd "$ROOT" && npm run build >/dev/null )
+ROOT="$ROOT" DEST="$NPM/main" node -e '
+  const fs=require("fs"), path=require("path");
+  const src=path.join(process.env.ROOT,"dist"), dest=path.join(process.env.DEST,"dist");
+  fs.cpSync(src, dest, { recursive:true, filter(s){
+    try { return fs.statSync(s).isDirectory() || s.endsWith(".d.ts"); } catch (e) { return false; }
+  }});
+'
+
 VERSION="$VERSION" SCOPE="$SCOPE" TARGETS="${targets[*]}" \
   node -e '
     const fs=require("fs");
@@ -85,9 +106,16 @@ VERSION="$VERSION" SCOPE="$SCOPE" TARGETS="${targets[*]}" \
       version: process.env.VERSION,
       description: "Local-first code intelligence for AI agents (MCP). Self-contained — bundles its own runtime.",
       bin: { codegraph: "npm-shim.js" },
+      main: "npm-sdk.js",
+      types: "dist/index.d.ts",
+      exports: {
+        ".": { types: "./dist/index.d.ts", default: "./npm-sdk.js" },
+        "./package.json": "./package.json"
+      },
       optionalDependencies: opt,
-      files: ["npm-shim.js","README.md"],
-      license: "MIT"
+      files: ["npm-shim.js","npm-sdk.js","dist","README.md"],
+      license: "MIT",
+      repository: { type: "git", url: "git+https://github.com/colbymchenry/codegraph.git" }
     }, null, 2) + "\n");
   ' "$NPM/main/package.json"
 

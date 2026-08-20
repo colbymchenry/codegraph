@@ -1,23 +1,31 @@
 # CodeGraph A/B benchmark — with vs without, every language × S/M/L
 
-**Date:** 2026-05-23 · **Branch:** `architectural-improvements`
+**Date:** 2026-05-24 · **Branch:** `main` · **codegraph 0.9.4**
 
 A headless agent (Claude Opus, `--permission-mode bypassPermissions`) answers one
 **canonical flow question** per repo — twice: **with** the codegraph MCP server, and
 **without** any MCP (built-in Read/Grep/Glob/Bash only). Same model, same prompt; codegraph
-is the only variable. Each cell was **re-indexed fresh** first, so the "with" arm reflects the
-current resolvers.
+is the only variable. Each cell was **re-indexed fresh** first (against a `dist/` build of the
+current `main` HEAD), so the "with" arm reflects the shipped 0.9.4 resolvers.
 
 ## Headline
 
-**Across 37 cells, codegraph cut total file reads from 158 → 40 — 75% fewer.** It never
-*increased* reads in any cell. The mechanism: a few sub-millisecond codegraph calls replace a
-read-and-grep exploration. Token cost stays roughly flat (codegraph calls trade for reads) —
-the win is **fewer tool calls + lower wall-clock**, which is the design target.
+**Across 37 cells, codegraph cut total file reads from 159 → 38 — 76% fewer.** It never
+*increased* reads in any cell (0 regressions). The mechanism: a few sub-millisecond codegraph
+calls replace a read-and-grep exploration.
+
+**Cost stays roughly flat — marginally higher on the with-arm here** (summed across the 37
+cells: with `$15.4` vs without `$13.8`). On these short single-flow questions the without-arm
+resolves in <10 calls and never balloons, so it doesn't reach the regime where codegraph's cost
+savings compound, while the with-arm pays fixed MCP overhead (tool definitions in context +
+tool-loading) that short tasks don't amortize. The win is **fewer tool calls (189 vs 321, −41%)
++ lower wall-clock** (mean **38s vs 48s**), which is the design target. On harder multi-turn
+investigations cost flips to a net saving as the without-arm's accumulated context balloons —
+see `docs/benchmarks/call-sequence-analysis.md`.
 
 The gap widens with repo size and flow complexity: on medium/large repos the without-codegraph
 arm often **thrashes** — many greps/globs, shell `find`/`grep` (Bash), and occasionally spawning
-a **sub-agent** — while the with-codegraph arm answers in 2–6 calls. On tiny repos (a handful of
+a **sub-agent** — while the with-codegraph arm answers in 2–8 calls. On tiny repos (a handful of
 files) the two arms tie or codegraph is marginally slower (MCP/index overhead doesn't pay off
 when the whole flow fits in one or two files) — but reads still drop.
 
@@ -35,66 +43,70 @@ when the whole flow fits in one or two files) — but reads still drop.
 
 | Language | Size | Repo | files | **with** R/G | cg-calls | dur | **without** R/G | dur | reads saved |
 |---|---|---|--:|---|--:|--:|---|--:|--:|
-| C | L | `c-redis` | 884 | 0R / 4G | 4 | 48s | 4R / 9G / 1Gl | 50s | 4 |
-| C# | S | `aspnet-realworld` | 78 | 0R / 0G | 2 | 40s | 2R / 1G / 2Gl | 31s | 2 |
-| C# | M | `aspnet-eshop` | 262 | 0R / 0G | 5 | 39s | 6R / 2G / 3Gl / 1B | 61s | 6 |
-| C# | L | `aspnet-jellyfin` | 2081 | 4R / 0G | 2 | 61s | 13R / 0G / 4Gl / 21B / 1Ag | 132s | 9 |
-| C++ | M | `cpp-leveldb` | 134 | 0R / 0G | 3 | 40s | 2R / 3G | 52s | 2 |
-| Dart | S | `flutter_module_books` | 6 | 1R / 0G | 2 | 37s | 1R / 0G / 1Gl | 20s | 0 |
-| Dart | M | `compass_app` | 212 | 2R / 0G | 2 | 31s | 3R / 1G / 3Gl | 47s | 1 |
-| Go | S | `gin-realworld` | 21 | 2R / 1G | 3 | 31s | 4R / 0G / 1B | 44s | 2 |
-| Go | M | `gin-vueadmin` | 625 | 0R / 0G | 2 | 31s | 3R / 3G / 2Gl | 47s | 3 |
-| Go | L | `gin-gitness` | 4438 | 3R / 3G | 4 | 52s | 7R / 4G / 3Gl | 60s | 4 |
-| Java | S | `spring-realworld` | 117 | 0R / 0G | 4 | 31s | 8R / 1G / 1Gl | 50s | 8 |
-| Java | M | `spring-mall` | 536 | 1R / 0G | 5 | 51s | 5R / 0G / 4Gl | 64s | 4 |
-| Java | L | `spring-halo` | 2444 | 0R / 1G | 8 | 75s | 9R / 5G / 8B | 148s | 9 |
-| Kotlin | S | `kotlin-petclinic` | 43 | 1R / 0G | 1 | 23s | 3R / 0G / 2Gl | 26s | 2 |
-| Kotlin | M | `Jetcaster` | 166 | 1R / 0G | 3 | 36s | 1R / 0G / 2Gl | 34s | 0 |
-| Lua | S | `lualine.nvim` | 123 | 1R / 0G | 4 | 48s | 4R / 0G / 1Gl | 45s | 3 |
-| Lua | M | `telescope.nvim` | 84 | 0R / 0G | 2 | 33s | 2R / 0G / 1Gl | 26s | 2 |
-| Luau | S | `Knit` | 11 | 0R / 0G | 4 | 36s | 5R / 0G / 2Gl | 57s | 5 |
-| PHP | S | `laravel-realworld` | 114 | 3R / 0G / 1Gl | 2 | 41s | 6R / 2G / 3Gl | 38s | 3 |
-| PHP | M | `laravel-firefly` | 2047 | 4R / 4G | 5 | 79s | 5R / 3G / 3Gl / 2B | 70s | 1 |
-| PHP | L | `laravel-bookstack` | 2160 | 0R / 1G | 5 | 42s | 3R / 2G / 2Gl | 46s | 3 |
-| Python | S | `django-realworld` | 44 | 1R / 1G | 2 | 30s | 8R / 0G / 1Gl | 35s | 7 |
-| Python | M | `django-wagtail` | 1672 | 3R / 0G | 5 | 73s | 7R / 5G / 2Gl / 1B | 63s | 4 |
-| Python | L | `django-saleor` | 4429 | 1R / 2G | 3 | 59s | 6R / 5G / 2Gl / 1B | 72s | 5 |
-| Ruby | S | `rails-realworld` | 59 | 0R / 0G | 2 | 34s | 4R / 0G / 3Gl | 40s | 4 |
-| Ruby | M | `rails-spree` | 2905 | 1R / 2G | 8 | 60s | 3R / 4G / 3Gl | 56s | 2 |
-| Ruby | L | `rails-forem` | 4658 | 3R / 1G | 3 | 54s | 3R / 2G / 1Gl | 49s | 0 |
-| Rust | S | `rust-axum-realworld` | 13 | 1R / 0G | 4 | 28s | 3R / 1G / 1Gl | 49s | 2 |
-| Rust | M | `rust-actix-examples` | 176 | 1R / 0G | 5 | 42s | 4R / 1G / 2B | 35s | 3 |
-| Rust | L | `rust-cratesio` | 1053 | 0R / 0G | 3 | 20s | 1R / 2G | 15s | 1 |
-| Scala | S | `computer-database` | 10 | 1R / 0G | 4 | 47s | 2R / 0G / 1B | 28s | 1 |
-| Swift | S | `vapor-template` | 14 | 0R / 0G | 1 | 16s | 2R / 0G / 1Gl | 22s | 2 |
-| Swift | M | `vapor-steampress` | 100 | 1R / 0G | 8 | 53s | 3R / 3G / 2B | 57s | 2 |
-| Swift | L | `vapor-spi` | 542 | 2R / 0G | 5 | 49s | 2R / 3G / 2Gl | 36s | 0 |
-| TypeScript/JS | S | `express-realworld` | 39 | 1R / 0G | 1 | 16s | 2R / 1G / 1Gl | 27s | 1 |
-| TypeScript/JS | M | `excalidraw` | 643 | 0R / 0G | 4 | 53s | 9R / 7G | 98s | 9 |
-| TypeScript/JS | L | `nest-immich` | 2759 | 1R / 1G | 6 | 50s | 3R / 1G / 2Gl | 57s | 2 |
+| C | L | `c-redis` | 884 | 0R / 2G | 4 | 42s | 5R / 6G | 51s | 5 |
+| C# | S | `aspnet-realworld` | 78 | 0R / 0G | 2 | 27s | 5R / 3G / 2Gl | 54s | 5 |
+| C# | M | `aspnet-eshop` | 262 | 0R / 1G | 5 | 39s | 9R / 2G / 5Gl | 58s | 9 |
+| C# | L | `aspnet-jellyfin` | 2081 | 3R / 0G | 4 | 51s | 17R / 1G / 2Gl / 17B / 1Ag | 212s | 14 |
+| C++ | M | `cpp-leveldb` | 134 | 0R / 0G | 3 | 26s | 4R / 2G | 37s | 4 |
+| Dart | S | `flutter_module_books` | 6 | 1R / 0G | 2 | 24s | 2R / 0G / 1Gl | 29s | 1 |
+| Dart | M | `compass_app` | 212 | 2R / 0G / 1Gl | 2 | 42s | 3R / 0G / 2Gl | 30s | 1 |
+| Go | S | `gin-realworld` | 21 | 0R / 0G | 5 | 35s | 4R / 3G / 1Gl | 57s | 4 |
+| Go | M | `gin-vueadmin` | 625 | 1R / 1G | 4 | 47s | 3R / 3G / 1Gl | 44s | 2 |
+| Go | L | `gin-gitness` | 4438 | 4R / 3G | 4 | 64s | 8R / 7G / 2Gl | 57s | 4 |
+| Java | S | `spring-realworld` | 117 | 2R / 0G | 3 | 35s | 8R / 1G / 5B | 57s | 6 |
+| Java | M | `spring-mall` | 536 | 1R / 0G | 5 | 39s | 2R / 4G / 2Gl | 49s | 1 |
+| Java | L | `spring-halo` | 2444 | 1R / 2G | 8 | 60s | 4R / 1G / 6B | 52s | 3 |
+| Kotlin | S | `kotlin-petclinic` | 43 | 0R / 0G | 2 | 37s | 3R / 0G / 1Gl | 23s | 3 |
+| Kotlin | M | `Jetcaster` | 166 | 1R / 0G | 3 | 36s | 1R / 0G / 2Gl | 46s | 0 |
+| Lua | S | `lualine.nvim` | 123 | 1R / 1G | 4 | 48s | 4R / 0G / 2Gl | 49s | 3 |
+| Lua | M | `telescope.nvim` | 84 | 0R / 0G | 1 | 15s | 1R / 0G / 1Gl | 20s | 1 |
+| Luau | S | `Knit` | 11 | 0R / 0G | 2 | 30s | 5R / 0G / 2Gl | 37s | 5 |
+| PHP | S | `laravel-realworld` | 114 | 1R / 0G | 6 | 40s | 5R / 1G / 3Gl | 39s | 4 |
+| PHP | M | `laravel-firefly` | 2047 | 2R / 1G | 4 | 47s | 4R / 5G / 3Gl | 75s | 2 |
+| PHP | L | `laravel-bookstack` | 2160 | 1R / 2G | 2 | 41s | 2R / 4G / 1Gl | 50s | 1 |
+| Python | S | `django-realworld` | 44 | 2R / 1G | 2 | 47s | 9R / 0G / 1B | 38s | 7 |
+| Python | M | `django-wagtail` | 1672 | 2R / 0G | 4 | 45s | 8R / 3G / 3Gl / 1B | 66s | 6 |
+| Python | L | `django-saleor` | 4429 | 2R / 2G | 4 | 52s | 4R / 6G / 1Gl | 64s | 2 |
+| Ruby | S | `rails-realworld` | 59 | 0R / 0G | 2 | 30s | 3R / 0G / 2B | 33s | 3 |
+| Ruby | M | `rails-spree` | 2905 | 2R / 3G / 1Gl | 5 | 43s | 3R / 3G / 2Gl / 1B | 55s | 1 |
+| Ruby | L | `rails-forem` | 4658 | 3R / 1G | 3 | 43s | 4R / 2G / 3Gl | 48s | 1 |
+| Rust | S | `rust-axum-realworld` | 13 | 0R / 0G | 2 | 21s | 3R / 0G / 1Gl | 38s | 3 |
+| Rust | M | `rust-actix-examples` | 176 | 0R / 1G | 3 | 42s | 3R / 0G / 3B | 36s | 3 |
+| Rust | L | `rust-cratesio` | 1053 | 1R / 0G | 3 | 22s | 1R / 2G | 18s | 0 |
+| Scala | S | `computer-database` | 10 | 1R / 0G | 2 | 27s | 3R / 0G / 1Gl | 25s | 2 |
+| Swift | S | `vapor-template` | 14 | 0R / 0G | 2 | 21s | 2R / 0G / 2Gl | 22s | 2 |
+| Swift | M | `vapor-steampress` | 100 | 0R / 0G | 5 | 49s | 3R / 1G / 2Gl | 39s | 3 |
+| Swift | L | `vapor-spi` | 542 | 1R / 1G | 4 | 27s | 2R / 5G | 34s | 1 |
+| TypeScript/JS | S | `express-realworld` | 39 | 1R / 0G | 1 | 25s | 2R / 2G | 19s | 1 |
+| TypeScript/JS | M | `excalidraw` | 643 | 1R / 0G | 3 | 55s | 7R / 5G / 3Gl / 1B | 87s | 6 |
+| TypeScript/JS | L | `nest-immich` | 2759 | 1R / 0G | 7 | 50s | 3R / 0G / 1Gl | 44s | 2 |
 
-**Totals (37 cells):** with codegraph **40 reads / 21 greps**, without **158 reads / 71 greps** —
-**75% fewer reads, ~70% fewer greps.** Codegraph never increased reads in any cell, and the
-without-arm additionally ran shell `find`/`grep` (Bash) and a sub-agent that the with-arm never
-needed. (74 agent runs, ~$29 total.)
+**Totals (37 cells):** with codegraph **38 reads / 22 greps**, without **159 reads / 72 greps** —
+**76% fewer reads, ~69% fewer greps.** Codegraph never increased reads in any cell, and the
+without-arm additionally ran **52 globs + 37 shell `find`/`grep` (Bash) + 1 sub-agent** that the
+with-arm (**0 Bash, 0 sub-agents**) never needed. (74 agent runs, $29.18 total.)
 
 ## Observations
 
-- **Biggest wins are medium/large backends with a real route→handler→service flow:** excalidraw
-  (0R vs 9R/7G), spring-halo (0R vs 9R + 8 Bash), spring-realworld (0R vs 8R), django-realworld
-  (1R vs 8R), aspnet-jellyfin (4R vs 13R + 21 Bash + a spawned sub-agent), aspnet-eshop (0R vs 6R).
+- **Biggest wins are medium/large backends with a real route→handler→service flow:** aspnet-jellyfin
+  (3R / 51s vs **17R + 17 Bash + a spawned sub-agent / 212s** — the single most dramatic cell),
+  aspnet-eshop (0R vs 9R), django-realworld (2R vs 9R), spring-realworld (2R vs 8R + 5 Bash),
+  django-wagtail (2R vs 8R), excalidraw (1R / 55s vs 7R / 87s), Luau Knit (0R vs 5R), aspnet-realworld
+  (0R vs 5R), c-redis (0R vs 5R).
 - **Without codegraph, large repos make the agent thrash:** it falls back to shell `find`/`grep`
-  (Bash) and on jellyfin even spawned a sub-agent — exactly the behavior codegraph is meant to
-  prevent. The with-arm answers those in 2–6 codegraph calls.
-- **Tie zone = tiny repos** (Dart books 6 files, Kotlin Jetcaster, Ruby forem, Swift spi): the whole
-  flow fits in 1–2 files, so reading is already cheap; codegraph ties on reads and is sometimes a
-  few seconds slower (MCP + index overhead). This matches the design note that codegraph's value
-  scales with repo size.
-- **Duration tracks reads on the big repos** (jellyfin 61s vs 132s, spring-halo 75s vs 148s,
-  excalidraw 53s vs 98s) and is noise on small ones.
-- Some "with" cells still read 2–4 files (jellyfin, gitness, laravel-firefly, forem) — the residual
-  is the documented frontier (anonymous handlers, deep service chains, dynamic finders); codegraph
-  gets the agent to the right file, then it reads one to confirm a detail.
+  (37 Bash calls across the matrix) and on jellyfin even spawned a sub-agent — exactly the behavior
+  codegraph is meant to prevent. The with-arm answers those in 2–8 codegraph calls and used **0 Bash
+  and 0 sub-agents** anywhere.
+- **Tie zone = tiny repos** (Kotlin Jetcaster 1R/1R, Rust cratesio 1R/1R, express 1R/2R, Swift template
+  0R/2R): the whole flow fits in 1–2 files, so reading is already cheap; codegraph ties on reads and is
+  sometimes a few seconds slower (MCP + index overhead — Kotlin petclinic 37s vs 23s, cratesio 22s vs
+  18s). This matches the design note that codegraph's value scales with repo size.
+- **Duration tracks reads on the big repos** (jellyfin 51s vs 212s, excalidraw 55s vs 87s, aspnet-eshop
+  39s vs 58s, django-wagtail 45s vs 66s) and is noise on small ones; mean wall-clock is 38s with vs 48s
+  without.
+- Some "with" cells still read 2–4 files (jellyfin, gitness, forem, saleor, django) — the residual is
+  the documented frontier (anonymous handlers, deep service chains, dynamic finders); codegraph gets the
+  agent to the right file, then it reads one to confirm a detail.
 
 ## Coverage note
 
@@ -105,7 +117,9 @@ than faked.
 
 ## Reproduce
 
-Driver + parser: `/tmp/ab-matrix/run.sh` (matrix of `lang|size|repo|question`) and
-`/tmp/ab-matrix/parse-matrix.mjs`. Each cell: `rm -rf .codegraph && codegraph init -i`, then
-`scripts/agent-eval/run-all.sh <repo> "<question>" headless` (with = codegraph-only MCP, without =
-empty MCP), parsed from the stream-json logs.
+Canonical harness: `scripts/agent-eval/run-all.sh <repo> "<question>" headless` (with = codegraph-only
+MCP, without = empty MCP), parsed from the stream-json logs. The throwaway matrix driver + parser used
+for this table live in `/tmp/ab-matrix/`: `run.sh` (the `lang|size|repo|question` matrix — each cell does
+`rm -rf .codegraph && codegraph init -i` then both arms), `parse-matrix.mjs` (cells → this table), and
+`compare.mjs` (old-vs-new diff + aggregates). Build `dist/` from the target commit first so the MCP
+server loads the code under test (`codegraph` on PATH is `npm link`ed to the dev `dist/`).

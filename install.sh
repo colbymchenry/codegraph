@@ -8,7 +8,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh
 #
-# Upgrade:   re-run the same command.
+# Upgrade:   run `codegraph upgrade` (or just re-run the same command).
 # Uninstall: curl -fsSL .../install.sh | sh -s -- --uninstall
 #
 # Environment:
@@ -83,13 +83,64 @@ ln -sfn "$dest" "$INSTALL_DIR/current"
 
 echo "Installed to $dest"
 echo "Linked     $BIN_DIR/codegraph"
-case ":$PATH:" in
-  *":$BIN_DIR:"*) ;;
-  *)
-    echo ""
-    echo "$BIN_DIR is not on your PATH. Add it:"
-    echo "  export PATH=\"$BIN_DIR:\$PATH\""
-    ;;
-esac
+
+# 5. Prune older bundles so they don't pile up across upgrades (issue #1074).
+# Each release lives in its own versions/<v> dir (~50 MB with the vendored Node
+# runtime). `codegraph upgrade` re-runs this script, which drops in a new dir
+# and re-points `current` + the launcher — but it never removed the old dirs, so
+# they accumulated indefinitely. Keep only what we just installed ($dest) and
+# delete the rest. Safe even if a daemon is still executing an older bundle: on
+# POSIX the inode stays alive until that process exits, so removing the dir can't
+# break a running process. (Windows installs overwrite a single dir in place and
+# never reach this.) The markers below let a unit test run this exact block.
+# >>> CODEGRAPH_PRUNE_OLD_VERSIONS
+pruned=0
+if [ -d "$INSTALL_DIR/versions" ]; then
+  for d in "$INSTALL_DIR/versions"/*; do
+    [ -d "$d" ] || continue
+    if [ "$d" != "$dest" ]; then
+      if rm -rf "$d"; then
+        pruned=$((pruned + 1))
+      fi
+    fi
+  done
+fi
+if [ "$pruned" -gt 0 ]; then
+  echo "Removed    $pruned older version(s)"
+fi
+# <<< CODEGRAPH_PRUNE_OLD_VERSIONS
+
+# 6. PATH sanity. Two ways this install can fail to be the codegraph that runs:
+#   1. $BIN_DIR isn't on PATH at all.
+#   2. A *different* codegraph sits earlier on PATH and shadows ours — most
+#      often a stale `npm i -g @colbymchenry/codegraph`, whose launcher keeps
+#      running its own version-pinned bundle, so `codegraph --version` disagrees
+#      with what we just installed (issue #1071).
+# Walk PATH once: note whether $BIN_DIR is present and which codegraph wins.
+on_path=0
+winner=""
+oldifs="$IFS"; IFS=:
+for dir in $PATH; do
+  [ -n "$dir" ] || continue
+  if [ "$dir" = "$BIN_DIR" ]; then on_path=1; fi
+  if [ -z "$winner" ] && [ -x "$dir/codegraph" ] && [ ! -d "$dir/codegraph" ]; then
+    winner="$dir/codegraph"
+  fi
+done
+IFS="$oldifs"
+
+if [ "$on_path" -eq 0 ]; then
+  echo ""
+  echo "$BIN_DIR is not on your PATH. Add it:"
+  echo "  export PATH=\"$BIN_DIR:\$PATH\""
+elif [ -n "$winner" ] && [ "$winner" != "$BIN_DIR/codegraph" ]; then
+  echo ""
+  echo "Warning: another codegraph is earlier on your PATH and will run instead:"
+  echo "  $winner"
+  echo "  (this install: $BIN_DIR/codegraph)"
+  echo "If 'codegraph --version' shows an unexpected version, remove the other copy"
+  echo "(e.g. 'npm rm -g @colbymchenry/codegraph') or put $BIN_DIR first on PATH."
+fi
+
 echo ""
 echo "Done. Run: codegraph --help"

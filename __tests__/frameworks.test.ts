@@ -528,6 +528,271 @@ describe('nestjsResolver.resolve', () => {
   });
 });
 
+describe('nestjsResolver.postExtract — RouterModule', () => {
+  function mkClass(name: string, filePath: string, startLine: number, endLine: number): Node {
+    return {
+      id: `class:${filePath}:${startLine}:${name}`,
+      kind: 'class',
+      name,
+      qualifiedName: `${filePath}::${name}`,
+      filePath,
+      language: 'typescript',
+      startLine,
+      endLine,
+      startColumn: 0,
+      endColumn: 0,
+      updatedAt: 0,
+    };
+  }
+
+  function mkRoute(
+    filePath: string,
+    line: number,
+    method: string,
+    path: string,
+    nameOverride?: string
+  ): Node {
+    return {
+      id: `route:${filePath}:${line}:${method}:${path}`,
+      kind: 'route',
+      name: nameOverride ?? `${method} ${path}`,
+      qualifiedName: `${filePath}::${method}:${path}`,
+      filePath,
+      language: 'typescript',
+      startLine: line,
+      endLine: line,
+      startColumn: 0,
+      endColumn: 0,
+      updatedAt: 0,
+    };
+  }
+
+  function makeContext(opts: {
+    files?: Record<string, string>;
+    nodes?: Node[];
+  }) {
+    const files = opts.files ?? {};
+    const all = opts.nodes ?? [];
+    return {
+      getNodesInFile: (fp: string) => all.filter((n) => n.filePath === fp),
+      getNodesByName: (name: string) => all.filter((n) => n.name === name),
+      getNodesByQualifiedName: () => [],
+      getNodesByKind: (kind: Node['kind']) => all.filter((n) => n.kind === kind),
+      fileExists: (fp: string) => files[fp] !== undefined,
+      readFile: (fp: string) => files[fp] ?? null,
+      getProjectRoot: () => '/test',
+      getAllFiles: () => Object.keys(files),
+      getNodesByLowerName: () => [],
+      getImportMappings: () => [],
+    } as any;
+  }
+
+  it('prepends RouterModule prefix to a controller route (top-level register)', () => {
+    const ctx = makeContext({
+      files: {
+        'src/app.module.ts': `
+          @Module({
+            imports: [
+              RouterModule.register([
+                { path: 'admin', module: AdminModule },
+              ]),
+            ],
+          })
+          export class AppModule {}
+
+          @Module({ controllers: [AdminController] })
+          export class AdminModule {}
+        `,
+      },
+      nodes: [
+        mkClass('AdminController', 'src/admin/admin.controller.ts', 1, 10),
+        mkRoute('src/admin/admin.controller.ts', 3, 'GET', '/'),
+      ],
+    });
+
+    const updates = nestjsResolver.postExtract!(ctx);
+    expect(updates).toHaveLength(1);
+    expect(updates[0]!.name).toBe('GET /admin');
+    // id and qualifiedName must be preserved so existing route→handler edges
+    // stay intact and the pass remains idempotent on a second run.
+    expect(updates[0]!.id).toBe('route:src/admin/admin.controller.ts:3:GET:/');
+    expect(updates[0]!.qualifiedName).toBe('src/admin/admin.controller.ts::GET:/');
+  });
+
+  it('resolves nested children — the issue #459 example', () => {
+    const ctx = makeContext({
+      files: {
+        'src/app.module.ts': `
+          @Module({
+            imports: [
+              AdminModule,
+              UsersModule,
+              RouterModule.register([
+                {
+                  path: 'admin',
+                  module: AdminModule,
+                  children: [
+                    { path: 'users', module: UsersModule },
+                  ],
+                },
+              ]),
+            ],
+          })
+          export class AppModule {}
+        `,
+        'src/users/users.module.ts': `
+          @Module({ controllers: [UsersController] })
+          export class UsersModule {}
+        `,
+      },
+      nodes: [
+        mkClass('UsersController', 'src/users/users.controller.ts', 1, 10),
+        mkRoute('src/users/users.controller.ts', 3, 'GET', '/'),
+      ],
+    });
+
+    const updates = nestjsResolver.postExtract!(ctx);
+    expect(updates).toHaveLength(1);
+    expect(updates[0]!.name).toBe('GET /admin/users');
+  });
+
+  it('joins module prefix with a non-empty @Controller path and method params', () => {
+    const ctx = makeContext({
+      files: {
+        'src/app.module.ts': `
+          RouterModule.register([{ path: 'admin', module: UsersModule }])
+
+          @Module({ controllers: [UsersController] })
+          export class UsersModule {}
+        `,
+      },
+      nodes: [
+        mkClass('UsersController', 'src/users.controller.ts', 1, 10),
+        // Existing extract emitted GET /users/:id from @Controller('users') + @Get(':id')
+        mkRoute('src/users.controller.ts', 3, 'GET', '/users/:id'),
+      ],
+    });
+
+    const updates = nestjsResolver.postExtract!(ctx);
+    expect(updates).toHaveLength(1);
+    expect(updates[0]!.name).toBe('GET /admin/users/:id');
+  });
+
+  it('is idempotent — a second run returns no updates', () => {
+    // Simulate the state after one round of postExtract: name is already
+    // 'GET /admin', but qualifiedName still encodes the original 'GET:/'.
+    const ctx = makeContext({
+      files: {
+        'src/app.module.ts': `
+          RouterModule.register([{ path: 'admin', module: UsersModule }])
+          @Module({ controllers: [UsersController] })
+          export class UsersModule {}
+        `,
+      },
+      nodes: [
+        mkClass('UsersController', 'src/users.controller.ts', 1, 10),
+        mkRoute('src/users.controller.ts', 3, 'GET', '/', 'GET /admin'),
+      ],
+    });
+
+    const updates = nestjsResolver.postExtract!(ctx);
+    expect(updates).toHaveLength(0);
+  });
+
+  it('is a no-op when the project does not use RouterModule', () => {
+    const ctx = makeContext({
+      files: {
+        'src/app.module.ts': `
+          @Module({ controllers: [UsersController] })
+          export class AppModule {}
+        `,
+      },
+      nodes: [
+        mkClass('UsersController', 'src/users.controller.ts', 1, 10),
+        mkRoute('src/users.controller.ts', 3, 'GET', '/'),
+      ],
+    });
+
+    const updates = nestjsResolver.postExtract!(ctx);
+    expect(updates).toHaveLength(0);
+  });
+
+  it('attributes routes to the right controller when one file has two', () => {
+    // Two controllers in one file, declared in two different modules with
+    // two different module prefixes. The route's startLine has to match the
+    // class scope, not just the file path.
+    const ctx = makeContext({
+      files: {
+        'src/app.module.ts': `
+          RouterModule.register([
+            { path: 'p1', module: AModule },
+            { path: 'p2', module: BModule },
+          ])
+          @Module({ controllers: [AController] }) export class AModule {}
+          @Module({ controllers: [BController] }) export class BModule {}
+        `,
+      },
+      nodes: [
+        mkClass('AController', 'src/multi.controller.ts', 1, 5),
+        mkClass('BController', 'src/multi.controller.ts', 7, 12),
+        mkRoute('src/multi.controller.ts', 3, 'GET', '/a/x'),
+        mkRoute('src/multi.controller.ts', 9, 'GET', '/b/y'),
+      ],
+    });
+
+    const updates = nestjsResolver.postExtract!(ctx);
+    expect(updates).toHaveLength(2);
+    const byId = new Map(updates.map((u) => [u.id, u.name]));
+    expect(byId.get('route:src/multi.controller.ts:3:GET:/a/x')).toBe('GET /p1/a/x');
+    expect(byId.get('route:src/multi.controller.ts:9:GET:/b/y')).toBe('GET /p2/b/y');
+  });
+
+  it('merges RouterModule registrations spread across multiple module files', () => {
+    const ctx = makeContext({
+      files: {
+        'src/app.module.ts': `
+          RouterModule.register([{ path: 'a', module: AModule }])
+          @Module({ controllers: [AController] }) export class AModule {}
+        `,
+        'src/feature.module.ts': `
+          RouterModule.forChild([{ path: 'b', module: BModule }])
+          @Module({ controllers: [BController] }) export class BModule {}
+        `,
+      },
+      nodes: [
+        mkClass('AController', 'src/a.controller.ts', 1, 5),
+        mkClass('BController', 'src/b.controller.ts', 1, 5),
+        mkRoute('src/a.controller.ts', 3, 'GET', '/'),
+        mkRoute('src/b.controller.ts', 3, 'GET', '/'),
+      ],
+    });
+
+    const updates = nestjsResolver.postExtract!(ctx);
+    expect(updates).toHaveLength(2);
+    const byId = new Map(updates.map((u) => [u.id, u.name]));
+    expect(byId.get('route:src/a.controller.ts:3:GET:/')).toBe('GET /a');
+    expect(byId.get('route:src/b.controller.ts:3:GET:/')).toBe('GET /b');
+  });
+
+  it('silently skips controllers whose class node is not in the graph', () => {
+    // RouterModule declares a prefix for a module, but the @Module that
+    // would link it to a controller is missing — common during partial
+    // re-extraction. Must not throw.
+    const ctx = makeContext({
+      files: {
+        'src/app.module.ts': `
+          RouterModule.register([{ path: 'orphans', module: GhostModule }])
+          @Module({ controllers: [GhostController] }) export class GhostModule {}
+        `,
+      },
+      nodes: [], // no class or route nodes
+    });
+
+    const updates = nestjsResolver.postExtract!(ctx);
+    expect(updates).toHaveLength(0);
+  });
+});
+
 import { laravelResolver } from '../src/resolution/frameworks/laravel';
 
 describe('laravelResolver.extract', () => {
@@ -676,6 +941,109 @@ describe('goResolver.extract', () => {
     const src = `s.HandleFunc("/users/{id}", listUsers).Methods("GET")\n`;
     const { references } = goResolver.extract!('routes.go', src);
     expect(references[0].referenceName).toBe('listUsers');
+  });
+
+  it('does NOT treat verb-named method calls with non-path args as routes (#1259)', () => {
+    // The issue's repro: a generic cache type whose Put/Get share router verb
+    // names. First args are keys, not URL paths — no route nodes.
+    const src = [
+      `c.Put("a", 1)`,
+      `c.Put("user:123", value)`,
+      `store.Get("config", out)`,
+      `bus.Handle("user.created", onUserCreated)`,
+      `m.HandleFunc("shutdown", hook)`,
+    ].join('\n');
+    const { nodes } = goResolver.extract!('cache.go', src);
+    expect(nodes).toHaveLength(0);
+  });
+
+  it('keeps real registrations whose paths start with "/" for every router style', () => {
+    const src = [
+      `r.Put("/users/{id}", updateUser)`, // chi
+      `v1.GET("/ping", ping)`, // gin group
+      `mux.HandleFunc("/healthz", health)`, // net/http
+    ].join('\n');
+    const { nodes } = goResolver.extract!('routes.go', src);
+    expect(nodes.map((n) => n.name)).toEqual(['PUT /users/{id}', 'GET /ping', 'ANY /healthz']);
+  });
+
+  it('recognizes Go 1.22 "METHOD /path" patterns on HandleFunc and extracts the method', () => {
+    const src = `mux.HandleFunc("GET /api/users/{id}", getUser)\n`;
+    const { nodes, references } = goResolver.extract!('main.go', src);
+    expect(nodes[0].name).toBe('GET /api/users/{id}');
+    expect(references[0].referenceName).toBe('getUser');
+  });
+});
+
+import { goframeResolver } from '../src/resolution/frameworks/goframe';
+
+describe('goframeResolver', () => {
+  it('detects GoFrame from a gogf/gf dependency in go.mod', () => {
+    const ctx: any = {
+      readFile: (f: string) =>
+        f === 'go.mod' ? 'module example.com/app\nrequire github.com/gogf/gf/v2 v2.7.0\n' : null,
+    };
+    expect(goframeResolver.detect(ctx)).toBe(true);
+    const noGf: any = { readFile: (f: string) => (f === 'go.mod' ? 'module example.com/app\n' : null) };
+    expect(goframeResolver.detect(noGf)).toBe(false);
+  });
+
+  it('extracts a route node from a g.Meta request struct (method upper-cased)', () => {
+    const src = `package v1
+import "github.com/gogf/gf/v2/frame/g"
+type SignInReq struct {
+	g.Meta   \`path:"/user/sign-in" method:"post" tags:"User" summary:"Sign in"\`
+	Passport string
+}
+type SignInRes struct{}
+`;
+    const { nodes } = goframeResolver.extract!('api/user/v1/user_sign_in.go', src);
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0].kind).toBe('route');
+    expect(nodes[0].name).toBe('POST /user/sign-in');
+    // The package-qualified request type is encoded for the synthesizer join.
+    expect(nodes[0].qualifiedName).toContain('::goframe-route:v1.SignInReq');
+  });
+
+  it('is independent of g.Meta tag attribute order', () => {
+    const src = `type DeptSearchReq struct {
+	g.Meta \`path:"/dept/list" tags:"Dept" method:"get" summary:"列表"\`
+}`;
+    const { nodes } = goframeResolver.extract!('api/system/dept.go', src);
+    expect(nodes[0].name).toBe('GET /dept/list');
+    expect(nodes[0].qualifiedName).toContain('::goframe-route:DeptSearchReq');
+  });
+
+  it('skips a response g.Meta that has no path (mime-only) and other non-route metadata', () => {
+    const src = `type ListRes struct {
+	g.Meta \`mime:"application/json"\`
+	Items []string
+}`;
+    const { nodes } = goframeResolver.extract!('api/x.go', src);
+    expect(nodes).toHaveLength(0);
+  });
+
+  it('defaults method to ANY when method: is omitted', () => {
+    const src = `type PingReq struct {
+	g.Meta \`path:"/ping"\`
+}`;
+    const { nodes } = goframeResolver.extract!('api/ping.go', src);
+    expect(nodes[0].name).toBe('ANY /ping');
+  });
+
+  it('extracts every request struct in a multi-route api file', () => {
+    const src = `type DeptListReq struct { g.Meta \`path:"/dept/list" method:"get"\` }
+type DeptListRes struct { g.Meta \`mime:"application/json"\` }
+type DeptAddReq struct { g.Meta \`path:"/dept/add" method:"post"\` }
+type DeptAddRes struct {}
+`;
+    const { nodes } = goframeResolver.extract!('api/dept.go', src);
+    expect(nodes.map((n) => n.name).sort()).toEqual(['GET /dept/list', 'POST /dept/add']);
+  });
+
+  it('returns nothing for a non-go file or a file without g.Meta', () => {
+    expect(goframeResolver.extract!('main.ts', 'const x = 1').nodes).toHaveLength(0);
+    expect(goframeResolver.extract!('main.go', 'package main\nfunc main() {}\n').nodes).toHaveLength(0);
   });
 });
 
@@ -1108,6 +1476,7 @@ func boot(routes: RoutesBuilder) throws {
 
 import { reactResolver } from '../src/resolution/frameworks/react';
 import { svelteResolver } from '../src/resolution/frameworks/svelte';
+import { astroResolver } from '../src/resolution/frameworks/astro';
 
 describe('reactResolver.extract — React Router', () => {
   it('extracts a v6 <Route path element={<Comp/>}>', () => {
@@ -1160,6 +1529,77 @@ describe('svelteResolver.extract (smoke)', () => {
     const result = svelteResolver.extract!('+page.svelte', '');
     expect(result).toHaveProperty('nodes');
     expect(result).toHaveProperty('references');
+  });
+});
+
+describe('astroResolver.extract — src/pages file-based routing', () => {
+  const routeNames = (filePath: string): string[] =>
+    astroResolver.extract!(filePath, '').nodes.filter((n) => n.kind === 'route').map((n) => n.name);
+
+  it('maps index.astro to /', () => {
+    expect(routeNames('src/pages/index.astro')).toEqual(['/']);
+  });
+
+  it('maps nested index and plain pages', () => {
+    expect(routeNames('src/pages/blog/index.astro')).toEqual(['/blog']);
+    expect(routeNames('src/pages/about.astro')).toEqual(['/about']);
+  });
+
+  it('converts [param] and [...rest] syntax', () => {
+    expect(routeNames('src/pages/blog/[slug].astro')).toEqual(['/blog/:slug']);
+    expect(routeNames('src/pages/[...path].astro')).toEqual(['/*path']);
+  });
+
+  it('maps .ts endpoints under src/pages to routes', () => {
+    expect(routeNames('src/pages/api/posts.ts')).toEqual(['/api/posts']);
+    expect(routeNames('src/pages/rss.xml.js')).toEqual(['/rss.xml']);
+  });
+
+  it('excludes underscore-prefixed segments and config files', () => {
+    expect(routeNames('src/pages/_partial.astro')).toEqual([]);
+    expect(routeNames('src/pages/blog/_components/Card.astro')).toEqual([]);
+    expect(routeNames('src/pages/vite.config.ts')).toEqual([]);
+  });
+
+  it('ignores .astro files outside src/pages', () => {
+    expect(routeNames('src/components/Button.astro')).toEqual([]);
+    expect(routeNames('docs/pages/guide.astro')).toEqual([]);
+  });
+});
+
+describe('astroResolver.resolve — Astro global and virtual modules', () => {
+  const ctx = {} as never;
+  const baseRef = {
+    fromNodeId: 'component:a',
+    line: 1,
+    column: 0,
+    filePath: 'src/pages/index.astro',
+    language: 'astro',
+  };
+
+  it('claims Astro.* global references as framework-provided', () => {
+    const res = astroResolver.resolve(
+      { ...baseRef, referenceName: 'Astro.props', referenceKind: 'references' } as never,
+      ctx
+    );
+    expect(res?.resolvedBy).toBe('framework');
+    expect(res?.confidence).toBe(1.0);
+  });
+
+  it('claims astro:content virtual module imports', () => {
+    const res = astroResolver.resolve(
+      { ...baseRef, referenceName: 'astro:content', referenceKind: 'imports' } as never,
+      ctx
+    );
+    expect(res?.resolvedBy).toBe('framework');
+  });
+
+  it('leaves ordinary names alone', () => {
+    const res = astroResolver.resolve(
+      { ...baseRef, referenceName: 'astrolabe', referenceKind: 'calls' } as never,
+      { getNodesByName: () => [] } as never
+    );
+    expect(res).toBeNull();
   });
 });
 

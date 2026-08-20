@@ -4,7 +4,7 @@
  * Types for the reference resolution system.
  */
 
-import { EdgeKind, Language, Node } from '../types';
+import { Language, Node, ReferenceKind } from '../types';
 
 /**
  * An unresolved reference from extraction
@@ -15,7 +15,7 @@ export interface UnresolvedRef {
   /** The name being referenced */
   referenceName: string;
   /** Type of reference */
-  referenceKind: EdgeKind;
+  referenceKind: ReferenceKind;
   /** Line where reference occurs */
   line: number;
   /** Column where reference occurs */
@@ -26,6 +26,9 @@ export interface UnresolvedRef {
   language: Language;
   /** Possible qualified names it might resolve to */
   candidates?: string[];
+  /** `unresolved_refs.id` when loaded from the database — post-pass cleanup
+   * targets exactly this row instead of every same-key sibling (#1269). */
+  rowId?: number;
 }
 
 /**
@@ -39,7 +42,7 @@ export interface ResolvedRef {
   /** Confidence score (0-1) */
   confidence: number;
   /** How it was resolved */
-  resolvedBy: 'exact-match' | 'import' | 'qualified-name' | 'framework' | 'fuzzy' | 'instance-method' | 'file-path';
+  resolvedBy: 'exact-match' | 'import' | 'qualified-name' | 'framework' | 'fuzzy' | 'instance-method' | 'file-path' | 'function-ref';
 }
 
 /**
@@ -71,16 +74,62 @@ export interface ResolutionContext {
   getNodesByQualifiedName(qualifiedName: string): Node[];
   /** Get all nodes of a kind */
   getNodesByKind(kind: Node['kind']): Node[];
+  /**
+   * Stream nodes of a kind one at a time instead of materializing (and, unlike
+   * `getNodesByKind`, without populating the resolver's per-kind array cache).
+   * For unbounded kinds (`function`, `method`, `struct`) on a symbol-dense
+   * project the full array is gigabytes — the dynamic-edge synthesizers must
+   * use this so their memory stays O(1) in node count (#610, #1212). Optional
+   * so minimal test contexts compile; callers fall back to getNodesByKind.
+   */
+  iterateNodesByKind?(kind: Node['kind']): IterableIterator<Node>;
   /** Check if a file exists */
   fileExists(filePath: string): boolean;
   /** Read file content */
   readFile(filePath: string): string | null;
+  /**
+   * `readFile(filePath)` split into lines, LRU-cached per file. Receiver-type
+   * inference scans source lines for EVERY `receiver.method()` ref; splitting
+   * the whole file per ref made that O(refs-in-file × file-size) — ~20% of
+   * total index CPU on a Java-heavy repo and a driver of the #1122 watchdog
+   * kill on large ones. Optional so external/test contexts compile without it;
+   * callers fall back to splitting `readFile` themselves.
+   */
+  getFileLines?(filePath: string): string[] | null;
+  /**
+   * The method-definition nodes matching `typeName::methodName` in `language` —
+   * exactly `resolveMethodOnType`'s kind/language/qualifiedName-suffix filter,
+   * LRU-cached per (language, type, method). The uncached path re-fetches every
+   * node sharing the METHOD name (unbounded — tens of thousands on a collision-
+   * heavy Java repo) and re-scans it per ref, the dominant term in the #1122
+   * watchdog kill. Cached entries hold only the small filtered result; per-ref
+   * disambiguation (import FQN, call-site file) stays in the caller so a cached
+   * entry is valid from any call site. Optional for external/test contexts.
+   */
+  getMethodMatches?(typeName: string, methodName: string, language: Language): Node[];
   /** Get project root */
   getProjectRoot(): string;
   /** Get all files */
   getAllFiles(): string[];
   /** Get nodes by lowercase name (O(1) lookup for fuzzy matching) */
   getNodesByLowerName(lowerName: string): Node[];
+  /**
+   * Direct supertypes of the type named `typeName` (same language): the classes
+   * it extends and the interfaces / protocols / traits it implements/conforms to,
+   * by simple name. Backed by the resolved `implements`/`extends` edges, so it is
+   * EMPTY during the first resolution pass (edges aren't built yet) and populated
+   * afterward — the conformance pass uses it to resolve a chained method defined
+   * on a supertype the receiver type conforms to (e.g. a protocol-extension
+   * method). Optional so external/test contexts compile without it.
+   */
+  getSupertypes?(typeName: string, language: Language): string[];
+  /**
+   * Look up a node by its id. Lets matchers derive the FROM-symbol's
+   * enclosing-class scope (Swift implicit-self method scoping, `this.X`
+   * member resolution). Optional so external/test contexts compile
+   * without it.
+   */
+  getNodeById?(id: string): Node | null;
   /** Get cached import mappings for a file */
   getImportMappings(filePath: string, language: Language): ImportMapping[];
   /**
@@ -91,6 +140,21 @@ export interface ResolutionContext {
    * compile without modification; production resolver implements it.
    */
   getProjectAliases?(): import('./path-aliases').AliasMap | null;
+  /**
+   * Go module info from `go.mod` at the project root. Returns `null`
+   * when the project has no `go.mod` (non-Go projects, pre-modules
+   * Go code, or projects whose modules live in subdirectories). Used
+   * by the Go branch of import resolution to distinguish in-module
+   * cross-package imports from third-party packages.
+   */
+  getGoModule?(): import('./go-module').GoModule | null;
+  /**
+   * Monorepo workspace member packages, keyed by declared package name.
+   * Returns `null` for single-package repos (no `workspaces` field).
+   * Lets the resolver treat `@scope/ui/sub` as a local import into the
+   * member's directory instead of an external npm package (#629).
+   */
+  getWorkspacePackages?(): import('./workspace-packages').WorkspacePackages | null;
   /**
    * Re-exports declared by a file (`export { x } from './other'`,
    * `export * from './other'`). Empty array when the file has none.
@@ -107,6 +171,13 @@ export interface ResolutionContext {
    * without modification.
    */
   listDirectories?(relativePath: string): string[];
+  /**
+   * C/C++ include search directories (relative to project root),
+   * extracted from compile_commands.json or discovered by heuristic.
+   * Used by resolveCppIncludePath to search -I directories when
+   * relative resolution fails. Optional so existing callers compile.
+   */
+  getCppIncludeDirs?(): string[];
 }
 
 /**
@@ -148,6 +219,20 @@ export interface FrameworkResolver {
    * pipeline; the framework's own `resolve()` is one of the strategies tried.
    */
   extract?(filePath: string, content: string): FrameworkExtractionResult;
+  /**
+   * Cross-file finalization pass, called once after all per-file extraction
+   * completes (and again on every incremental sync). Used by frameworks where
+   * a symbol's final representation depends on a sibling file the per-file
+   * `extract()` never saw — e.g. NestJS's `RouterModule.register([...])`
+   * sets route prefixes for controllers declared elsewhere.
+   *
+   * Implementations return route/etc. nodes with mutated fields (typically
+   * `name`); the orchestrator persists each via `updateNode`. The node `id`
+   * MUST be preserved so existing edges (route → handler, etc.) stay intact;
+   * `qualifiedName` SHOULD be preserved so the pass stays idempotent — a
+   * second run can recover the original in-file form from `qualifiedName`.
+   */
+  postExtract?(context: ResolutionContext): Node[];
 }
 
 /**

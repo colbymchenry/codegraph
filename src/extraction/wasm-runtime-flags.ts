@@ -41,6 +41,31 @@ import { spawnSync } from 'child_process';
 export const WASM_RUNTIME_FLAGS: readonly string[] = ['--liftoff-only'];
 
 /**
+ * Node CLI options (not V8 flags) passed alongside the WASM flags on every
+ * launch path. `--disable-warning=ExperimentalWarning` mutes node:sqlite's
+ * "SQLite is an experimental feature" warning, which is emitted once per
+ * THREAD — the main process plus every parse worker — so during indexing it
+ * prints repeatedly, interleaved with the progress UI. Node options apply
+ * process-wide (workers inherit them), so the command line covers everything.
+ *
+ * Deliberately NOT part of the {@link processHasWasmRuntimeFlags} re-exec
+ * gate: a launcher passing only the WASM flags (an older installed bundle
+ * running a newer dist) must not trigger a whole re-exec over a cosmetic
+ * warning.
+ */
+export function nodeRuntimeFlagsFor(nodeVersion: string): readonly string[] {
+  // `--disable-warning` landed in Node 20.11 / 21.3; older nodes treat it as
+  // a fatal "bad option" at spawn. Those runtimes can't run codegraph anyway
+  // (node:sqlite needs >= 22.5), but let them reach our own version messaging
+  // instead of a cryptic spawn failure.
+  const [major = 0, minor = 0] = nodeVersion.split('.').map(Number);
+  const supported = major > 21 || (major === 21 && minor >= 3) || (major === 20 && minor >= 11);
+  return supported ? ['--disable-warning=ExperimentalWarning'] : [];
+}
+
+export const NODE_RUNTIME_FLAGS: readonly string[] = nodeRuntimeFlagsFor(process.versions.node);
+
+/**
  * Env var set on the relaunched child so a detection slip can never cause an
  * infinite re-exec loop. Also lets users force-disable the relaunch.
  */
@@ -76,8 +101,10 @@ export function buildRelaunchArgv(
   scriptArgs: readonly string[],
   execArgv: readonly string[] = process.execArgv
 ): string[] {
-  const preserved = execArgv.filter((arg) => !WASM_RUNTIME_FLAGS.includes(arg));
-  return [...WASM_RUNTIME_FLAGS, ...preserved, scriptPath, ...scriptArgs];
+  const preserved = execArgv.filter(
+    (arg) => !WASM_RUNTIME_FLAGS.includes(arg) && !NODE_RUNTIME_FLAGS.includes(arg)
+  );
+  return [...NODE_RUNTIME_FLAGS, ...WASM_RUNTIME_FLAGS, ...preserved, scriptPath, ...scriptArgs];
 }
 
 /**
@@ -98,6 +125,7 @@ export function relaunchWithWasmRuntimeFlagsIfNeeded(scriptPath: string): void {
   const result = spawnSync(process.execPath, argv, {
     stdio: 'inherit',
     env: { ...process.env, [RELAUNCH_GUARD_ENV]: '1', [HOST_PPID_ENV]: String(process.ppid) },
+    windowsHide: true,
   });
 
   if (result.error) {

@@ -36,5 +36,5 @@ console.log(text);
 console.error('\n--- PROBE STATS ---');
 console.error('output chars:', text.length);
 console.error('triggerRender body present (-> setState({})):', /triggerRender[\s\S]{0,400}setState\(\{\}\)/.test(text));
-console.error('App.tsx in source section:', /#### .*App\.tsx —/.test(text));
+console.error('App.tsx in source section:', /\*\*`.*App\.tsx`\*\* —/.test(text));
 try { cg.close?.(); } catch {}

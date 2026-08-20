@@ -161,6 +161,111 @@ describe('C++ end-to-end — virtual override synthesis', () => {
     tmpDir = undefined;
   });
 
+  it('resolves callers through typed object pointers', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-'));
+    let cg: CodeGraph | undefined;
+    try {
+      fs.writeFileSync(
+        path.join(tmpDir, 'detect.hpp'),
+        'class CDetect {\n' +
+          ' public:\n' +
+          '  int Processing();\n' +
+          '};\n' +
+          'class CDetector {\n' +
+          ' private:\n' +
+          '  CDetect* m_cpAlg = nullptr;\n' +
+          ' public:\n' +
+          '  int Run();\n' +
+          '  int Flush();\n' +
+          '};\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'detect.cpp'),
+        '#include "detect.hpp"\n' +
+          'int CDetector::Run() { return m_cpAlg->Processing(); }\n' +
+          'int CDetector::Flush() { return m_cpAlg->Processing(); }\n' +
+          'int CDetect::Processing() { return 0; }\n'
+      );
+
+      cg = CodeGraph.initSync(tmpDir);
+      await cg.indexAll();
+
+      const processing = cg
+        .getNodesByKind('method')
+        .find((n) => n.qualifiedName.endsWith('CDetect::Processing'));
+      expect(processing).toBeDefined();
+
+      const callers = cg.getCallers(processing!.id).map((c) => c.node.qualifiedName);
+      expect(callers).toContain('CDetector::Run');
+      expect(callers).toContain('CDetector::Flush');
+
+      const runMethod = cg
+        .getNodesByKind('method')
+        .find((n) => n.qualifiedName.endsWith('CDetector::Run'));
+      expect(runMethod).toBeDefined();
+      const callees = cg.getCallees(runMethod!.id).map((c) => c.node.qualifiedName);
+      expect(callees).toContain('CDetect::Processing');
+    } finally {
+      cg?.close();
+    }
+  });
+
+  it('resolves typed pointer callers when the method name is ambiguous and the call sits inside a return/declaration', async () => {
+    // Regression: an earlier version of the C++ receiver-type inference matched
+    // the call line itself (`return m_cpAlg->Processing()`) and treated `return`
+    // as the type, OR grabbed `int r =` as a type from the prefix. With Strategy
+    // 3's "unique method name" fallback, the original issue example resolved
+    // anyway — but as soon as two classes share a method name (very common in
+    // real C++), both calls go unresolved.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-'));
+    let cg: CodeGraph | undefined;
+    try {
+      fs.writeFileSync(
+        path.join(tmpDir, 'detect.hpp'),
+        'class CDetect { public: int Processing(); };\n' +
+          'class CWidget { public: int Processing(); };\n' +
+          'class CDetector {\n' +
+          ' private:\n' +
+          '  CDetect* m_cpAlg = nullptr;\n' +
+          ' public:\n' +
+          '  int RunReturn();\n' +
+          '  int RunAssign();\n' +
+          '};\n'
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'detect.cpp'),
+        '#include "detect.hpp"\n' +
+          'int CDetector::RunReturn() { return m_cpAlg->Processing(); }\n' +
+          'int CDetector::RunAssign() { int r = m_cpAlg->Processing(); return r; }\n' +
+          'int CDetect::Processing() { return 0; }\n' +
+          'int CWidget::Processing() { return 0; }\n'
+      );
+
+      cg = CodeGraph.initSync(tmpDir);
+      await cg.indexAll();
+
+      const detectProc = cg
+        .getNodesByKind('method')
+        .find((n) => n.qualifiedName === 'CDetect::Processing');
+      const widgetProc = cg
+        .getNodesByKind('method')
+        .find((n) => n.qualifiedName === 'CWidget::Processing');
+      expect(detectProc).toBeDefined();
+      expect(widgetProc).toBeDefined();
+
+      const detectCallers = cg.getCallers(detectProc!.id).map((c) => c.node.qualifiedName);
+      expect(detectCallers).toContain('CDetector::RunReturn');
+      expect(detectCallers).toContain('CDetector::RunAssign');
+
+      // CWidget::Processing is never called — calls must NOT misroute here.
+      const widgetCallers = cg.getCallers(widgetProc!.id).map((c) => c.node.qualifiedName);
+      expect(widgetCallers).not.toContain('CDetector::RunReturn');
+      expect(widgetCallers).not.toContain('CDetector::RunAssign');
+    } finally {
+      cg?.close();
+    }
+  });
+
   it('bridges a base virtual method to the subclass override', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-'));
     fs.writeFileSync(
@@ -195,5 +300,1039 @@ describe('C++ end-to-end — virtual override synthesis', () => {
     expect(edge, 'Iterator::Next should reach DBIter::Next via override synthesis').toBeDefined();
 
     cg.close();
+  });
+});
+
+describe('Java end-to-end — field-injected bean trace (issue #389)', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  // Mirrors the issue's Spring MVC pattern:
+  //   UserAction(@Resource UserBO userbo).toLogin2() -> this.userbo.toLogin2()
+  //     -> UserBO.toLogin2() -> userService.toLogin() -> UserService.toLogin (iface)
+  //     -> UserServiceImpl.toLogin() via interface→impl synthesis.
+  // Without the extractor `this.` strip + field-typed receiver lookup, the very
+  // first hop (controller -> bean) was missing entirely, breaking trace.
+  it('connects controller -> @Resource bean -> interface -> impl end-to-end', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-spring-bean-'));
+    const javaDir = path.join(tmpDir, 'src/main/java/com/example/user');
+    fs.mkdirSync(path.join(javaDir, 'action'), { recursive: true });
+    fs.mkdirSync(path.join(javaDir, 'bo'), { recursive: true });
+    fs.mkdirSync(path.join(javaDir, 'service'), { recursive: true });
+    fs.mkdirSync(path.join(javaDir, 'service/impl'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'pom.xml'),
+      '<project><dependencies><dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency></dependencies></project>\n'
+    );
+    fs.writeFileSync(
+      path.join(javaDir, 'action/UserAction.java'),
+      'package com.example.user.action;\n' +
+        'import com.example.user.bo.UserBO;\n' +
+        'import javax.annotation.Resource;\n' +
+        '@org.springframework.stereotype.Controller\n' +
+        'public class UserAction {\n' +
+        '  @Resource(name = "userBO") private UserBO userbo;\n' +
+        '  public void toLogin2() { this.userbo.toLogin2(); }\n' +
+        '}\n'
+    );
+    fs.writeFileSync(
+      path.join(javaDir, 'bo/UserBO.java'),
+      'package com.example.user.bo;\n' +
+        'import com.example.user.service.UserService;\n' +
+        'import javax.annotation.Resource;\n' +
+        '@org.springframework.stereotype.Component("userBO")\n' +
+        'public class UserBO {\n' +
+        '  @Resource private UserService userService;\n' +
+        '  public void toLogin2() { userService.toLogin(); }\n' +
+        '}\n'
+    );
+    fs.writeFileSync(
+      path.join(javaDir, 'service/UserService.java'),
+      'package com.example.user.service;\n' +
+        'public interface UserService { void toLogin(); }\n'
+    );
+    fs.writeFileSync(
+      path.join(javaDir, 'service/impl/UserServiceImpl.java'),
+      'package com.example.user.service.impl;\n' +
+        'import com.example.user.service.UserService;\n' +
+        '@org.springframework.stereotype.Service("userService")\n' +
+        'public class UserServiceImpl implements UserService {\n' +
+        '  public void toLogin() { }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const methods = cg.getNodesByKind('method');
+    const find = (cls: string, name: string) =>
+      methods.find((m) => m.name === name && m.filePath.endsWith(`${cls}.java`));
+
+    const action = find('UserAction', 'toLogin2');
+    const bo = find('UserBO', 'toLogin2');
+    const svc = find('UserService', 'toLogin');
+    const impl = find('UserServiceImpl', 'toLogin');
+    expect(action).toBeDefined();
+    expect(bo).toBeDefined();
+    expect(svc).toBeDefined();
+    expect(impl).toBeDefined();
+
+    // UserAction.toLogin2 -> UserBO.toLogin2 (the regressed hop — `this.userbo`
+    // receiver was emitted verbatim and the field-type lookup didn't exist).
+    const actionToBo = cg.getOutgoingEdges(action!.id).find((e) => e.target === bo!.id);
+    expect(actionToBo, 'controller `this.userbo.toLogin2()` should reach UserBO.toLogin2').toBeDefined();
+    expect(actionToBo!.kind).toBe('calls');
+
+    // UserBO.toLogin2 -> UserService.toLogin (plain identifier receiver, works pre-fix).
+    const boToSvc = cg.getOutgoingEdges(bo!.id).find((e) => e.target === svc!.id);
+    expect(boToSvc).toBeDefined();
+
+    // UserService.toLogin -> UserServiceImpl.toLogin (interface->impl synth).
+    const svcToImpl = cg.getOutgoingEdges(svc!.id).find((e) => e.target === impl!.id);
+    expect(svcToImpl).toBeDefined();
+
+    cg.close();
+  });
+
+  it('bridges a Java mapper interface method to its MyBatis XML statement (incl. SQL fragments)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-mybatis-'));
+    const javaDir = path.join(tmpDir, 'src/main/java/com/example/dao');
+    const xmlDir = path.join(tmpDir, 'src/main/resources/mappers');
+    fs.mkdirSync(javaDir, { recursive: true });
+    fs.mkdirSync(xmlDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'pom.xml'),
+      '<project><dependencies><dependency><groupId>org.mybatis</groupId><artifactId>mybatis</artifactId></dependency></dependencies></project>\n'
+    );
+    fs.writeFileSync(
+      path.join(javaDir, 'UserDAOMapper.java'),
+      'package com.example.dao;\n' +
+        'public interface UserDAOMapper {\n' +
+        '  Object getById(int id);\n' +
+        '  int updateUser(Object u);\n' +
+        '}\n'
+    );
+    fs.writeFileSync(
+      path.join(xmlDir, 'UserDAOMapper.xml'),
+      '<?xml version="1.0" encoding="UTF-8"?>\n' +
+        '<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">\n' +
+        '<mapper namespace="com.example.dao.UserDAOMapper">\n' +
+        '  <sql id="userCols">id, name, email</sql>\n' +
+        '  <select id="getById" parameterType="int" resultType="User">\n' +
+        '    SELECT <include refid="userCols"/> FROM users WHERE id = #{id}\n' +
+        '  </select>\n' +
+        '  <update id="updateUser" parameterType="User">\n' +
+        '    UPDATE users SET name=#{name}, email=#{email} WHERE id=#{id}\n' +
+        '  </update>\n' +
+        '</mapper>\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const methods = cg.getNodesByKind('method');
+    const getByIdJava = methods.find((m) => m.name === 'getById' && m.language === 'java');
+    const getByIdXml = methods.find((m) => m.name === 'getById' && m.language === 'xml');
+    const updateJava = methods.find((m) => m.name === 'updateUser' && m.language === 'java');
+    const updateXml = methods.find((m) => m.name === 'updateUser' && m.language === 'xml');
+    const sqlFrag = methods.find((m) => m.name === 'userCols' && m.language === 'xml');
+    expect(getByIdJava).toBeDefined();
+    expect(getByIdXml).toBeDefined();
+    expect(updateJava).toBeDefined();
+    expect(updateXml).toBeDefined();
+    expect(sqlFrag).toBeDefined();
+
+    // XML statement qualified name must be `<namespace>::<id>` so the
+    // synthesizer can match against the Java method's `<Class>::<method>`
+    // suffix — this is the load-bearing contract between extractor + synthesis.
+    expect(getByIdXml!.qualifiedName).toBe('com.example.dao.UserDAOMapper::getById');
+
+    // Bridge: Java mapper method -> XML statement, kind 'calls'.
+    const j2xGet = cg.getOutgoingEdges(getByIdJava!.id).find((e) => e.target === getByIdXml!.id);
+    expect(j2xGet, 'Java getById should reach the XML <select id="getById">').toBeDefined();
+    expect(j2xGet!.kind).toBe('calls');
+    const j2xUpd = cg.getOutgoingEdges(updateJava!.id).find((e) => e.target === updateXml!.id);
+    expect(j2xUpd, 'Java updateUser should reach the XML <update id="updateUser">').toBeDefined();
+
+    // <include refid="userCols"/> inside <select> -> <sql id="userCols"> in same mapper.
+    const incEdge = cg.getOutgoingEdges(getByIdXml!.id).find((e) => e.target === sqlFrag!.id);
+    expect(incEdge, '<include refid="userCols"/> should reach the <sql> fragment').toBeDefined();
+
+    cg.close();
+  });
+
+  it('covers legacy iBatis <sqlMap> statements and keeps same-line vendor-split pairs (#1182)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ibatis-'));
+    const xmlDir = path.join(tmpDir, 'src/main/resources/sqlmaps');
+    fs.mkdirSync(xmlDir, { recursive: true });
+
+    // iBatis 2 sqlMap with an explicit namespace.
+    fs.writeFileSync(
+      path.join(xmlDir, 'Account.xml'),
+      '<?xml version="1.0" encoding="UTF-8"?>\n' +
+        '<!DOCTYPE sqlMap PUBLIC "-//iBATIS.com//DTD SQL Map 2.0//EN" "http://ibatis.apache.org/dtd/sql-map-2.dtd">\n' +
+        "<sqlMap namespace='Account'>\n" +
+        "  <sql id='cols'>id, name, email</sql>\n" +
+        "  <select id='getById' resultClass='Account'>SELECT <include refid='cols'/> FROM account WHERE id = #id#</select>\n" +
+        "  <insert id='insert' parameterClass='Account'>INSERT INTO account (id) VALUES (#id#)</insert>\n" +
+        '  <!-- <select id="disabled">SELECT 0</select> -->\n' +
+        '</sqlMap>\n'
+    );
+    // Namespace-less sqlMap whose ids carry the qualifier as `Map.statement`.
+    fs.writeFileSync(
+      path.join(xmlDir, 'LegacyDao.xml'),
+      '<sqlMap>\n' +
+        '  <select id="LegacyDao.findAll" resultClass="Row">SELECT * FROM t</select>\n' +
+        '</sqlMap>\n'
+    );
+    // MyBatis mapper with a vendor-split databaseId pair written on ONE line —
+    // same qualifiedName + same start line. Before the id-hash fold both nodes
+    // hashed identically and INSERT OR REPLACE dropped one.
+    fs.writeFileSync(
+      path.join(xmlDir, 'VendorMapper.xml'),
+      '<mapper namespace="com.example.VendorMapper">\n' +
+        '<select id="findUser" databaseId="oracle">SELECT 1 FROM dual</select><select id="findUser" databaseId="mysql">SELECT 1</select>\n' +
+        '</mapper>\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const xmlMethods = cg.getNodesByKind('method').filter((n) => n.language === 'xml');
+    const qnames = xmlMethods.map((n) => n.qualifiedName);
+
+    // iBatis statements now land in the graph (was zero coverage before #1182).
+    expect(qnames).toContain('Account::getById');
+    expect(qnames).toContain('Account::insert');
+    expect(qnames).toContain('Account::cols');
+    expect(qnames).toContain('LegacyDao::findAll');
+    // The commented-out statement produced no node.
+    expect(qnames).not.toContain('Account::disabled');
+
+    // <include refid='cols'/> resolves to the <sql> fragment in the same map.
+    const getById = xmlMethods.find((n) => n.qualifiedName === 'Account::getById');
+    const cols = xmlMethods.find((n) => n.qualifiedName === 'Account::cols');
+    expect(getById).toBeDefined();
+    expect(cols).toBeDefined();
+    const incEdge = cg.getOutgoingEdges(getById!.id).find((e) => e.target === cols!.id);
+    expect(incEdge, "iBatis <include refid='cols'/> should reach the <sql> fragment").toBeDefined();
+
+    // Both vendor-split statements survive the DB write (the collision fix).
+    const findUser = xmlMethods.filter((n) => n.name === 'findUser');
+    expect(findUser, 'both databaseId variants of findUser should survive').toHaveLength(2);
+    expect(new Set(findUser.map((n) => n.id)).size).toBe(2);
+
+    cg.close();
+  });
+
+  it('binds @Value / @ConfigurationProperties to YAML + .properties keys (incl. relaxed binding)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-spring-config-'));
+    const javaDir = path.join(tmpDir, 'src/main/java/com/example');
+    const resDir = path.join(tmpDir, 'src/main/resources');
+    fs.mkdirSync(javaDir, { recursive: true });
+    fs.mkdirSync(resDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'pom.xml'),
+      '<project><dependencies><dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter</artifactId></dependency></dependencies></project>\n'
+    );
+    fs.writeFileSync(
+      path.join(resDir, 'application.yml'),
+      'app:\n' +
+        '  cache:\n' +
+        '    name:\n' +
+        '      user-token: "example-service:auth:token"\n' +
+        '    enabled: true\n' +
+        'db:\n' +
+        '  url: "jdbc:mysql://localhost/x"\n'
+    );
+    fs.writeFileSync(
+      path.join(resDir, 'application.properties'),
+      'app.retry-count=3\n'
+    );
+    fs.writeFileSync(
+      path.join(javaDir, 'CacheConfig.java'),
+      'package com.example;\n' +
+        'import org.springframework.beans.factory.annotation.Value;\n' +
+        'public class CacheConfig {\n' +
+        '  @Value("${app.cache.name.user-token}") private String tokenCacheName;\n' +
+        '  @Value("${app.cache.enabled:true}") private boolean enabled;\n' +
+        '  // relaxed binding: java camelCase, properties kebab-case\n' +
+        '  @Value("${app.retryCount}") private int retry;\n' +
+        '}\n'
+    );
+    fs.writeFileSync(
+      path.join(javaDir, 'CacheProperties.java'),
+      'package com.example;\n' +
+        'import org.springframework.boot.context.properties.ConfigurationProperties;\n' +
+        '@ConfigurationProperties(prefix = "app.cache")\n' +
+        'public class CacheProperties { private boolean enabled; }\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    // YAML/properties leaf keys: one constant node per dotted path.
+    const cfgKeys = cg
+      .getNodesByKind('constant')
+      .filter((n) => n.language === 'yaml' || n.language === 'properties');
+    const cfgByQn = (qn: string) => cfgKeys.find((n) => n.qualifiedName === qn);
+    expect(cfgByQn('app.cache.name.user-token')).toBeDefined();
+    expect(cfgByQn('app.cache.enabled')).toBeDefined();
+    expect(cfgByQn('db.url')).toBeDefined();
+    expect(cfgByQn('app.retry-count')).toBeDefined();
+
+    // @Value("${app.cache.name.user-token}") -> the YAML leaf key.
+    const valueBindings = cg
+      .getNodesByKind('constant')
+      .filter((n) => n.id.startsWith('spring-value:'));
+    const userToken = valueBindings.find((n) => n.name === 'app.cache.name.user-token');
+    expect(userToken).toBeDefined();
+    const userTokenEdges = cg.getOutgoingEdges(userToken!.id);
+    const userTokenTarget = userTokenEdges.find((e) =>
+      cfgKeys.some((c) => c.id === e.target && c.qualifiedName === 'app.cache.name.user-token'),
+    );
+    expect(userTokenTarget, '@Value should reference the YAML leaf key').toBeDefined();
+
+    // Default-value form `${k:default}` — strip the `:default` and bind the key.
+    const enabledBind = valueBindings.find((n) => n.name === 'app.cache.enabled');
+    expect(enabledBind).toBeDefined();
+    expect(cg.getOutgoingEdges(enabledBind!.id).some((e) => {
+      const t = cfgByQn('app.cache.enabled');
+      return t && e.target === t.id;
+    })).toBe(true);
+
+    // Relaxed binding: `app.retryCount` (camel) -> `app.retry-count` (kebab).
+    const retryBind = valueBindings.find((n) => n.name === 'app.retryCount');
+    expect(retryBind).toBeDefined();
+    expect(cg.getOutgoingEdges(retryBind!.id).some((e) => {
+      const t = cfgByQn('app.retry-count');
+      return t && e.target === t.id;
+    })).toBe(true);
+
+    // @ConfigurationProperties(prefix="app.cache") -> a key under that prefix.
+    const cpBindings = cg
+      .getNodesByKind('constant')
+      .filter((n) => n.id.startsWith('spring-cp:'));
+    const cpAppCache = cpBindings.find((n) => n.name === 'app.cache');
+    expect(cpAppCache).toBeDefined();
+    const cpEdges = cg.getOutgoingEdges(cpAppCache!.id);
+    expect(cpEdges.length).toBeGreaterThan(0);
+
+    cg.close();
+  });
+
+  it('binds a config key only for `references` refs, never a same-named method call (#1180)', async () => {
+    // `service.process` is BOTH a yaml key and a `service.process()` method call.
+    // canonicalConfigKey collapses them to the same token, so before #1180 the
+    // method call (kind `calls`) fell into the Spring config-key branch and
+    // mis-resolved to the YAML constant at 0.9 confidence — a wrong edge, and the
+    // uncached constant scan that made large Java/Kotlin indexes take ~1h. The
+    // branch is now gated to `references` (only @Value/@ConfigurationProperties).
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-spring-kindgate-'));
+    const javaDir = path.join(tmpDir, 'src/main/java/com/example');
+    const resDir = path.join(tmpDir, 'src/main/resources');
+    fs.mkdirSync(javaDir, { recursive: true });
+    fs.mkdirSync(resDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'pom.xml'),
+      '<project><dependencies><dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter</artifactId></dependency></dependencies></project>\n'
+    );
+    fs.writeFileSync(path.join(resDir, 'application.yml'), 'service:\n  process: "enabled"\n');
+    fs.writeFileSync(
+      path.join(javaDir, 'Worker.java'),
+      'package com.example;\n' +
+        'import org.springframework.beans.factory.annotation.Value;\n' +
+        'class Processor { void process() {} }\n' +
+        'public class Worker {\n' +
+        '  private Processor service;\n' +
+        '  @Value("${service.process}") private String sp;\n' +
+        '  void run() { service.process(); }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const yamlKey = cg
+      .getNodesByKind('constant')
+      .find((n) => n.language === 'yaml' && n.qualifiedName === 'service.process');
+    expect(yamlKey, 'yaml key service.process should be indexed').toBeDefined();
+
+    // `references` ref (@Value) DOES bind to the config key.
+    const valueBind = cg
+      .getNodesByKind('constant')
+      .find((n) => n.id.startsWith('spring-value:') && n.name === 'service.process');
+    expect(valueBind).toBeDefined();
+    expect(
+      cg.getOutgoingEdges(valueBind!.id).some((e) => e.target === yamlKey!.id),
+      '@Value should still bind to the yaml key',
+    ).toBe(true);
+
+    // `calls` ref (service.process()) must NOT bind to the config key.
+    const run = cg.getNodesByKind('method').find((n) => n.name === 'run');
+    expect(run).toBeDefined();
+    expect(
+      cg.getOutgoingEdges(run!.id).some((e) => e.target === yamlKey!.id),
+      'a method call must never resolve to a config-key constant',
+    ).toBe(false);
+
+    cg.close();
+  });
+
+  it('emits only a file node for non-MyBatis XML (pom.xml, beans.xml, log4j.xml)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-xml-non-mybatis-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'pom.xml'),
+      '<project><groupId>x</groupId><artifactId>y</artifactId></project>\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'log4j.xml'),
+      '<?xml version="1.0"?><Configuration><Loggers><Root level="info"/></Loggers></Configuration>\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+    // No method nodes — non-mapper XML produces no symbols (just file rows).
+    expect(cg.getNodesByKind('method').filter((n) => n.language === 'xml').length).toBe(0);
+    cg.close();
+  });
+
+  it('resolves a `this.field.method()` call to a unique implementation class', async () => {
+    // Standalone test of the extractor `this.` strip: even without Spring annotations,
+    // `this.svc.run()` where `svc` is typed as a concrete class should route to that
+    // class's method. This is the general Java fix, Spring is only one consumer.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-java-this-field-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'App.java'),
+      'class Svc { public void run() { } }\n' +
+        'class App {\n' +
+        '  private Svc svc;\n' +
+        '  public void go() { this.svc.run(); }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const methods = cg.getNodesByKind('method');
+    const go = methods.find((m) => m.name === 'go');
+    const run = methods.find((m) => m.name === 'run');
+    expect(go && run).toBeTruthy();
+
+    const edge = cg.getOutgoingEdges(go!.id).find((e) => e.target === run!.id);
+    expect(edge, '`this.svc.run()` should resolve to Svc.run').toBeDefined();
+
+    cg.close();
+  });
+});
+
+describe('JVM FQN imports — end-to-end', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('resolves a Kotlin import when the file name differs from the class name', async () => {
+    // Bar lives in Models.kt — the filesystem-based Java-style path lookup
+    // (com/example/Bar.kt) misses this; only FQN-via-qualifiedName finds it.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-jvm-imp-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Models.kt'),
+      'package com.example\n\nclass Bar {\n  fun greet(): String = "hi"\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Caller.kt'),
+      'package com.example.app\n\nimport com.example.Bar\n\nclass App {\n  fun run() { Bar().greet() }\n}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const bar = cg.getNodesByKind('class').find((n) => n.qualifiedName === 'com.example::Bar');
+    expect(bar, 'Bar should be extracted with package-qualified name').toBeDefined();
+
+    const importNode = cg.getNodesByKind('import').find((n) => n.name === 'com.example.Bar');
+    expect(importNode, 'import statement node should exist').toBeDefined();
+
+    // The imports edge may originate from the import node OR from a parent
+    // scope (file / namespace) — accept either, but require that an
+    // imports-kind edge to Bar exists.
+    const reachesBar = cg
+      .getIncomingEdges(bar!.id)
+      .find((e) => e.kind === 'imports');
+    expect(reachesBar, 'an imports edge should resolve to Bar via FQN').toBeDefined();
+
+    cg.close();
+  });
+
+  it('resolves a Kotlin top-level function import', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-jvm-imp-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Utils.kt'),
+      'package com.example\n\nfun util(): Int = 42\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Caller.kt'),
+      'package com.example.app\n\nimport com.example.util\n\nfun main() { util() }\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const util = cg.getNodesByKind('function').find((n) => n.qualifiedName === 'com.example::util');
+    expect(util, 'top-level util() should be extracted under com.example').toBeDefined();
+
+    const edge = cg.getIncomingEdges(util!.id).find((e) => e.kind === 'imports');
+    expect(edge, 'imports edge should reach the top-level function by FQN').toBeDefined();
+  });
+
+  it('resolves cross-language: Kotlin importing a Java class', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-jvm-imp-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'JavaBar.java'),
+      'package com.example;\n\npublic class JavaBar {\n  public String greet() { return "hi"; }\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Caller.kt'),
+      'package com.example.app\n\nimport com.example.JavaBar\n\nfun main() { JavaBar().greet() }\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const javaBar = cg.getNodesByKind('class').find((n) => n.qualifiedName === 'com.example::JavaBar');
+    expect(javaBar, 'JavaBar should be extracted under com.example regardless of language').toBeDefined();
+
+    const edge = cg.getIncomingEdges(javaBar!.id).find((e) => e.kind === 'imports');
+    expect(edge, 'Kotlin caller should resolve its import to the Java class').toBeDefined();
+  });
+
+  it('disambiguates a class-name collision across packages', async () => {
+    // Two `Bar` classes in different packages — each importer should reach
+    // ITS Bar, not the other one. This is the central failure mode that
+    // name-matcher alone cannot disambiguate.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-jvm-imp-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'AlphaBar.kt'),
+      'package com.example.alpha\n\nclass Bar { fun who() = "alpha" }\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'BetaBar.kt'),
+      'package com.example.beta\n\nclass Bar { fun who() = "beta" }\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'CallerA.kt'),
+      'package app\n\nimport com.example.alpha.Bar\n\nfun a() { Bar().who() }\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'CallerB.kt'),
+      'package app\n\nimport com.example.beta.Bar\n\nfun b() { Bar().who() }\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const alphaBar = cg.getNodesByKind('class').find((n) => n.qualifiedName === 'com.example.alpha::Bar');
+    const betaBar = cg.getNodesByKind('class').find((n) => n.qualifiedName === 'com.example.beta::Bar');
+    expect(alphaBar).toBeDefined();
+    expect(betaBar).toBeDefined();
+    expect(alphaBar!.id).not.toBe(betaBar!.id);
+
+    // Each Bar receives exactly one imports edge — from its own caller.
+    const alphaIncoming = cg.getIncomingEdges(alphaBar!.id).filter((e) => e.kind === 'imports');
+    const betaIncoming = cg.getIncomingEdges(betaBar!.id).filter((e) => e.kind === 'imports');
+    expect(alphaIncoming.length).toBeGreaterThan(0);
+    expect(betaIncoming.length).toBeGreaterThan(0);
+
+    // Sanity: the edges don't cross — alpha's incoming sources don't include
+    // beta's filePath and vice versa.
+    const sourceFiles = (edges: typeof alphaIncoming) =>
+      edges.map((e) => cg.getNode(e.source)?.filePath).filter(Boolean);
+    expect(sourceFiles(alphaIncoming).some((p) => p?.includes('CallerA.kt'))).toBe(true);
+    expect(sourceFiles(betaIncoming).some((p) => p?.includes('CallerB.kt'))).toBe(true);
+  });
+});
+
+describe('Java anonymous-class override synthesis — end-to-end', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('bridges an abstract base method to overrides inside `new Base() { ... }`', async () => {
+    // Mirrors guava Splitter: a factory returns `new BaseIter() {
+    // @Override int separatorStart(...) { ... } }`. Without anon-class
+    // extraction the override is invisible — Phase 5.5 interface-impl
+    // has no class to bridge — and an agent investigating `BaseIter.separatorStart`
+    // can't see its real implementation without reading the file.
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-anon-java-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'Splitter.java'),
+      'package com.example;\n' +
+        '\n' +
+        'abstract class BaseIter {\n' +
+        '  abstract int separatorStart(int start);\n' +
+        '}\n' +
+        '\n' +
+        'public class Splitter {\n' +
+        '  public BaseIter make() {\n' +
+        '    return new BaseIter() {\n' +
+        '      @Override\n' +
+        '      int separatorStart(int start) { return start + 1; }\n' +
+        '    };\n' +
+        '  }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    // The anon class is extracted and contains the override.
+    const anonClass = cg
+      .getNodesByKind('class')
+      .find((n) => /BaseIter\$anon@/.test(n.name));
+    expect(anonClass, 'anonymous BaseIter subclass should be a class node').toBeDefined();
+
+    const baseAbstract = cg
+      .getNodesByKind('method')
+      .find((n) => n.qualifiedName === 'com.example::BaseIter::separatorStart');
+    const anonOverride = cg
+      .getNodesByKind('method')
+      .find(
+        (n) =>
+          n.name === 'separatorStart' &&
+          n.qualifiedName.includes('$anon@') &&
+          n.qualifiedName.startsWith('com.example::Splitter::make::')
+      );
+    expect(baseAbstract, 'base abstract method should be in the graph').toBeDefined();
+    expect(anonOverride, 'anon-class override should be in the graph').toBeDefined();
+
+    // Phase 5.5 interface-impl: the abstract method has a synthesized
+    // `calls` edge to the anon override. Without this hop the agent
+    // would have to Read the file to discover the implementation.
+    const synthEdge = cg
+      .getOutgoingEdges(baseAbstract!.id)
+      .find((e) => e.target === anonOverride!.id && e.kind === 'calls');
+    expect(synthEdge, 'BaseIter.separatorStart should bridge to anon.separatorStart').toBeDefined();
+    expect(synthEdge!.provenance).toBe('heuristic');
+    expect((synthEdge!.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy).toBe(
+      'interface-impl'
+    );
+
+    cg.close();
+  });
+});
+
+describe('Go gRPC stub→impl synthesis', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('bridges UnimplementedMsgServer methods to the hand-written keeper impl', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-go-grpc-'));
+    // Mimic protoc-gen-go-grpc output: `*_grpc.pb.go` carrying the
+    // UnimplementedMsgServer stub.
+    fs.writeFileSync(
+      path.join(tmpDir, 'tx_grpc.pb.go'),
+      'package banktypes\n\n' +
+        'type UnimplementedMsgServer struct{}\n\n' +
+        'func (UnimplementedMsgServer) Send(ctx context.Context, req *MsgSend) (*MsgSendResponse, error) { return nil, nil }\n' +
+        'func (UnimplementedMsgServer) MultiSend(ctx context.Context, req *MsgMultiSend) (*MsgMultiSendResponse, error) { return nil, nil }\n' +
+        'func (UnimplementedMsgServer) mustEmbedUnimplementedMsgServer() {}\n' +
+        'func (UnimplementedMsgServer) testEmbeddedByValue() {}\n'
+    );
+    // Hand-written impl in a non-generated file — what an agent actually
+    // wants the trace to land on.
+    fs.writeFileSync(
+      path.join(tmpDir, 'msg_server.go'),
+      'package keeper\n\n' +
+        'type msgServer struct{ k Keeper }\n\n' +
+        'func (m msgServer) Send(ctx context.Context, req *MsgSend) (*MsgSendResponse, error) {\n' +
+        '  return m.k.SendCoins(ctx, req.From, req.To, req.Amount)\n' +
+        '}\n' +
+        'func (m msgServer) MultiSend(ctx context.Context, req *MsgMultiSend) (*MsgMultiSendResponse, error) {\n' +
+        '  return nil, nil\n' +
+        '}\n'
+    );
+
+    let cg: CodeGraph | undefined;
+    try {
+      cg = CodeGraph.initSync(tmpDir);
+      await cg.indexAll();
+
+      const stubSend = cg
+        .getNodesByKind('method')
+        .find((n) => n.qualifiedName.endsWith('UnimplementedMsgServer::Send'));
+      const implSend = cg
+        .getNodesByKind('method')
+        .find((n) => n.qualifiedName.endsWith('msgServer::Send'));
+      expect(stubSend, 'UnimplementedMsgServer.Send should be indexed').toBeDefined();
+      expect(implSend, 'msgServer.Send should be indexed').toBeDefined();
+
+      const bridge = cg
+        .getOutgoingEdges(stubSend!.id)
+        .find((e) => e.target === implSend!.id && e.kind === 'calls');
+      expect(bridge, 'stub Send should bridge to impl Send').toBeDefined();
+      expect(bridge!.provenance).toBe('heuristic');
+      expect((bridge!.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy).toBe(
+        'go-grpc-stub-impl'
+      );
+    } finally {
+      cg?.close();
+    }
+  });
+
+  it('does not bridge to candidates living in another generated file', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-go-grpc-sib-'));
+    // `*_grpc.pb.go` also contains a sibling `msgClient` struct that
+    // happens to satisfy the same method set. We must NOT bridge to it —
+    // it's not the hand-written impl, just the gRPC client wrapper.
+    fs.writeFileSync(
+      path.join(tmpDir, 'tx_grpc.pb.go'),
+      'package banktypes\n\n' +
+        'type UnimplementedMsgServer struct{}\n' +
+        'func (UnimplementedMsgServer) Send() {}\n' +
+        'func (UnimplementedMsgServer) MultiSend() {}\n\n' +
+        'type msgClient struct{}\n' +
+        'func (m msgClient) Send() {}\n' +
+        'func (m msgClient) MultiSend() {}\n'
+    );
+
+    let cg: CodeGraph | undefined;
+    try {
+      cg = CodeGraph.initSync(tmpDir);
+      await cg.indexAll();
+
+      const stub = cg
+        .getNodesByKind('struct')
+        .find((n) => n.name === 'UnimplementedMsgServer');
+      expect(stub).toBeDefined();
+      const bridges = cg
+        .getNodesByKind('method')
+        .filter((n) => n.qualifiedName.endsWith('UnimplementedMsgServer::Send'))
+        .flatMap((stubSend) => cg!.getOutgoingEdges(stubSend.id))
+        .filter(
+          (e) =>
+            e.kind === 'calls' &&
+            (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy ===
+              'go-grpc-stub-impl',
+        );
+      expect(bridges, 'no bridge to msgClient (also generated)').toHaveLength(0);
+    } finally {
+      cg?.close();
+    }
+  });
+});
+
+describe('React Router end-to-end route extraction (.tsx/.jsx)', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  // Regression for the resolver language-gate bug: the `react` resolver's
+  // `extract()` was filtered out of the .tsx/.jsx grammars, so `<Route>` routes
+  // — which only live in JSX files — were never indexed through the real
+  // indexing path (the unit tests call extract() directly and so missed this).
+  it('indexes <Route element={<X/>}> routes from a .tsx file and links them to the component', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-rr-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'package.json'),
+      '{"dependencies":{"react":"^18.0.0","react-router-dom":"^6.0.0"}}'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'Home.tsx'),
+      'export function Home() { return null; }\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'routes.tsx'),
+      `import { Routes, Route } from 'react-router-dom';
+import { Home } from './Home';
+export function AppRoutes() {
+  return (
+    <Routes>
+      <Route path="/home" element={<Home/>} />
+    </Routes>
+  );
+}
+`
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+    try {
+      // The route node from the .tsx file exists (the bug: it didn't).
+      const route = cg.getNodesByKind('route').find((n) => n.name === '/home');
+      expect(route, '/home route from .tsx should be indexed').toBeDefined();
+
+      // ...and it links to the Home component.
+      const home = cg.getNodesByName('Home').find((n) => n.kind === 'function');
+      expect(home).toBeDefined();
+      const toHome = cg.getOutgoingEdges(route!.id).find((e) => e.target === home!.id);
+      expect(toHome, 'route → Home component edge').toBeDefined();
+    } finally {
+      cg.close();
+    }
+  });
+});
+
+describe('Terraform end-to-end module-boundary resolution', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  function writeMultiModuleRepo(root: string) {
+    fs.mkdirSync(path.join(root, 'modules/vpc'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'modules/other'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'envs'), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, 'main.tf'),
+      'variable "vpc_cidr" {\n  type = string\n}\n\n' +
+        'module "vpc" {\n  source = "./modules/vpc"\n  cidr   = var.vpc_cidr\n}\n\n' +
+        'module "registry_thing" {\n  source  = "terraform-aws-modules/s3-bucket/aws"\n  bucket  = "x"\n}\n\n' +
+        'output "vpc_id" {\n  value = module.vpc.vpc_id\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(root, 'modules/vpc/variables.tf'),
+      'variable "cidr" {\n  type = string\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(root, 'modules/vpc/main.tf'),
+      'resource "aws_vpc" "this" {\n  cidr_block = var.cidr\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(root, 'modules/vpc/outputs.tf'),
+      'output "vpc_id" {\n  value = aws_vpc.this.id\n}\n'
+    );
+    // Same-named variable in an UNRELATED module — must never receive edges
+    // from outside its own directory.
+    fs.writeFileSync(
+      path.join(root, 'modules/other/variables.tf'),
+      'variable "cidr" {\n  type = string\n}\nvariable "orphan_ref_target" {}\n'
+    );
+    // References a variable that has no same-dir declaration: must stay unlinked.
+    fs.writeFileSync(
+      path.join(root, 'modules/other/main.tf'),
+      'resource "aws_eip" "e" {\n  tags = { Name = var.undeclared_here_elsewhere_yes }\n}\n'
+    );
+    fs.writeFileSync(path.join(root, 'envs/prod.tfvars'), 'vpc_cidr = "10.0.0.0/16"\n');
+  }
+
+  it('bridges module inputs/outputs/source and enforces directory scoping', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-terraform-'));
+    writeMultiModuleRepo(tmpDir);
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+    try {
+      const byQname = (q: string, file?: string) =>
+        cg
+          .getNodesByName(q.split('.').pop()!)
+          .filter((n) => n.qualifiedName === q && (!file || n.filePath === file));
+
+      const moduleDecl = byQname('module.vpc')[0];
+      expect(moduleDecl, 'module.vpc declaration node').toBeDefined();
+      const childCidr = byQname('var.cidr', 'modules/vpc/variables.tf')[0];
+      expect(childCidr, "child module's var.cidr").toBeDefined();
+      const childOutput = byQname('output.vpc_id', 'modules/vpc/outputs.tf')[0];
+      expect(childOutput, "child module's output.vpc_id").toBeDefined();
+      const rootOutput = byQname('output.vpc_id', 'main.tf')[0];
+      expect(rootOutput, 'root output.vpc_id').toBeDefined();
+
+      const declEdges = cg.getOutgoingEdges(moduleDecl!.id);
+      // Input wiring: module block → child variable (cross-directory).
+      expect(
+        declEdges.find((e) => e.target === childCidr!.id),
+        'module.vpc → child var.cidr input edge'
+      ).toBeDefined();
+      // Source wiring: module block → child entry file.
+      const fileNode = cg
+        .getNodesInFile('modules/vpc/main.tf')
+        .find((n) => n.kind === 'file');
+      expect(fileNode).toBeDefined();
+      const importEdge = declEdges.find((e) => e.target === fileNode!.id);
+      expect(importEdge, 'module.vpc → modules/vpc/main.tf imports edge').toBeDefined();
+      expect(importEdge!.kind).toBe('imports');
+
+      // Output bridge: root output → child output (not just the declaration).
+      const rootOutEdges = cg.getOutgoingEdges(rootOutput!.id);
+      expect(
+        rootOutEdges.find((e) => e.target === childOutput!.id),
+        'root output.vpc_id → child output.vpc_id'
+      ).toBeDefined();
+      expect(
+        rootOutEdges.find((e) => e.target === moduleDecl!.id),
+        'root output.vpc_id → module.vpc declaration'
+      ).toBeDefined();
+
+      // tfvars assignment walks up to the ROOT variable.
+      const rootVar = byQname('var.vpc_cidr', 'main.tf')[0];
+      expect(rootVar).toBeDefined();
+      const tfvarsFile = cg.getNodesInFile('envs/prod.tfvars').find((n) => n.kind === 'file');
+      expect(tfvarsFile).toBeDefined();
+      expect(
+        cg.getOutgoingEdges(tfvarsFile!.id).find((e) => e.target === rootVar!.id),
+        'envs/prod.tfvars → var.vpc_cidr'
+      ).toBeDefined();
+
+      // Directory scoping: the unrelated module's same-named var.cidr gets
+      // NO incoming edges from outside its own directory…
+      const otherCidr = byQname('var.cidr', 'modules/other/variables.tf')[0];
+      expect(otherCidr).toBeDefined();
+      const incomingOther = cg.getIncomingEdges(otherCidr!.id).filter((e) => e.kind !== 'contains');
+      expect(incomingOther, 'unrelated module var.cidr must stay isolated').toHaveLength(0);
+
+      // …and a reference with no same-dir declaration stays unlinked rather
+      // than borrowing another module's declaration.
+      const orphanEdges = cg
+        .getNodesInFile('modules/other/main.tf')
+        .filter((n) => n.qualifiedName === 'aws_eip.e')
+        .flatMap((n) => cg.getOutgoingEdges(n.id))
+        .filter((e) => e.kind === 'references');
+      const orphanTargets = orphanEdges.map((e) => cg.getNode(e.target)?.qualifiedName);
+      expect(orphanTargets).not.toContain('var.undeclared_here_elsewhere_yes');
+
+      // Registry-sourced module: inputs stay unresolved (no guessed edges).
+      const registryDecl = byQname('module.registry_thing')[0];
+      expect(registryDecl).toBeDefined();
+      const registryEdges = cg
+        .getOutgoingEdges(registryDecl!.id)
+        .filter((e) => e.kind !== 'contains');
+      expect(registryEdges, 'registry module must not link anywhere').toHaveLength(0);
+    } finally {
+      cg.close();
+    }
+  });
+});
+
+describe('Terraform follow-ups: remote-state bridge, provider alias, moved blocks', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('bridges atmos remote-state to the target component, resolves provider aliases up the tree, links moved blocks', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-terraform-fu-'));
+    // Component producing state.
+    fs.mkdirSync(path.join(tmpDir, 'components/terraform/vpc'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'components/terraform/vpc/outputs.tf'),
+      'output "vpc_id" {\n  value = "vpc-123"\n}\n'
+    );
+    // Component consuming it via the cloudposse remote-state module.
+    fs.mkdirSync(path.join(tmpDir, 'components/terraform/eks/cluster'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'components/terraform/eks/cluster/remote-state.tf'),
+      'module "vpc" {\n' +
+        '  source    = "cloudposse/stack-config/yaml//modules/remote-state"\n' +
+        '  component = var.vpc_component_name\n' +
+        '}\n' +
+        'variable "vpc_component_name" {\n' +
+        '  type    = string\n' +
+        '  default = "vpc"\n' +
+        '}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'components/terraform/eks/cluster/main.tf'),
+      'resource "aws_eks_cluster" "this" {\n  vpc_id = module.vpc.outputs.vpc_id\n}\n'
+    );
+    // Ambiguous component name — two directories called "dns" with the same
+    // output; the bridge must refuse to pick one.
+    fs.mkdirSync(path.join(tmpDir, 'components/terraform/dns'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'legacy/dns'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'components/terraform/dns/outputs.tf'), 'output "zone_id" {\n  value = "z1"\n}\n');
+    fs.writeFileSync(path.join(tmpDir, 'legacy/dns/outputs.tf'), 'output "zone_id" {\n  value = "z2"\n}\n');
+    fs.writeFileSync(
+      path.join(tmpDir, 'components/terraform/eks/cluster/dns.tf'),
+      'module "dns" {\n' +
+        '  source    = "cloudposse/stack-config/yaml//modules/remote-state"\n' +
+        '  component = "dns"\n' +
+        '}\n' +
+        'output "zone" {\n  value = module.dns.outputs.zone_id\n}\n'
+    );
+    // Provider alias declared at the root, selected inside a module dir.
+    fs.writeFileSync(
+      path.join(tmpDir, 'providers.tf'),
+      'provider "aws" {\n  region = "us-east-1"\n}\n' +
+        'provider "aws" {\n  alias  = "east"\n  region = "us-east-2"\n}\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'modules/app'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'modules/app/main.tf'),
+      'resource "aws_s3_bucket" "b" {\n  provider = aws.east\n  bucket   = "x"\n}\n'
+    );
+    // Moved block referencing a live resource.
+    fs.writeFileSync(
+      path.join(tmpDir, 'main.tf'),
+      'resource "aws_instance" "renamed" {}\n' +
+        'moved {\n  from = aws_instance.old\n  to   = aws_instance.renamed\n}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+    try {
+      const byQname = (q: string, file?: string) =>
+        cg
+          .getNodesByName(q.split('.').pop()!)
+          .filter((n) => n.qualifiedName === q && (!file || n.filePath === file));
+
+      // 1. remote-state bridge: consumer resource → producer component's output.
+      const consumer = byQname('aws_eks_cluster.this')[0] ??
+        cg.getNodesInFile('components/terraform/eks/cluster/main.tf').find((n) => n.qualifiedName === 'aws_eks_cluster.this');
+      expect(consumer, 'consumer resource').toBeDefined();
+      const producerOut = byQname('output.vpc_id', 'components/terraform/vpc/outputs.tf')[0];
+      expect(producerOut, "producer component's output").toBeDefined();
+      expect(
+        cg.getOutgoingEdges(consumer!.id).find((e) => e.target === producerOut!.id),
+        'remote-state bridge edge eks/cluster → vpc output'
+      ).toBeDefined();
+
+      // 2. Ambiguous component name → no bridge edge to either candidate.
+      const zoneOut = byQname('output.zone', 'components/terraform/eks/cluster/dns.tf')[0];
+      expect(zoneOut).toBeDefined();
+      const zoneTargets = cg
+        .getOutgoingEdges(zoneOut!.id)
+        .map((e) => cg.getNode(e.target))
+        .filter((n) => n?.qualifiedName === 'output.zone_id');
+      expect(zoneTargets, 'ambiguous component must not be guessed').toHaveLength(0);
+
+      // 3. Provider alias: nodes are distinct, and the selection inside the
+      //    module resolves up the tree to the aliased configuration.
+      const provNodes = cg.getNodesInFile('providers.tf');
+      const aliased = provNodes.find((n) => n.qualifiedName === 'provider.aws.east');
+      const defaultProv = provNodes.find((n) => n.qualifiedName === 'provider.aws');
+      expect(aliased, 'aliased provider node').toBeDefined();
+      expect(defaultProv, 'default provider node').toBeDefined();
+      const bucket = cg.getNodesInFile('modules/app/main.tf').find((n) => n.qualifiedName === 'aws_s3_bucket.b');
+      expect(bucket).toBeDefined();
+      const bucketEdges = cg.getOutgoingEdges(bucket!.id);
+      expect(
+        bucketEdges.find((e) => e.target === aliased!.id),
+        'provider = aws.east → aliased provider (ancestor walk)'
+      ).toBeDefined();
+      expect(bucketEdges.find((e) => e.target === defaultProv!.id), 'must not link the default provider').toBeUndefined();
+
+      // 4. moved block: the file references the live resource.
+      const renamed = cg.getNodesInFile('main.tf').find((n) => n.qualifiedName === 'aws_instance.renamed');
+      expect(renamed).toBeDefined();
+      const rootFile = cg.getNodesInFile('main.tf').find((n) => n.kind === 'file');
+      expect(
+        cg.getOutgoingEdges(rootFile!.id).find((e) => e.target === renamed!.id),
+        'moved block → live resource edge'
+      ).toBeDefined();
+    } finally {
+      cg.close();
+    }
   });
 });
