@@ -11,6 +11,7 @@ import * as os from 'os';
 import CodeGraph from '../src/index';
 import { Node, Edge } from '../src/types';
 import { GraphTraverser } from '../src/graph/traversal';
+import { ToolHandler } from '../src/mcp/tools';
 
 describe('Graph Queries', () => {
   let testDir: string;
@@ -680,6 +681,29 @@ describe('Traversal edge-completeness & limits (#1086–#1090)', () => {
     ];
     const callees = tGraph(depthNodes, edges).getCallees('t', 2);
     expect(callees.map((c) => c.node.id).sort()).toEqual(['a', 'b', 'c']);
+  });
+
+  it('getImpactRadius stops at node/edge budgets and marks truncation', () => {
+    const dependents = ['B', 'C', 'D', 'E', 'F'];
+    const nodes = [tNode('A'), ...dependents.map((id) => tNode(id))];
+    const edges: Edge[] = dependents.map((source) => ({ source, target: 'A', kind: 'calls' }));
+    const sub = tGraph(nodes, edges).getImpactRadius('A', 2, { maxNodes: 3, maxEdges: 2 });
+
+    expect(sub.nodes.size).toBe(3);
+    expect(sub.edges).toHaveLength(2);
+    expect(sub.truncated).toBe(true);
+    expect(sub.edges.every((edge) => sub.nodes.has(edge.source) && sub.nodes.has(edge.target))).toBe(true);
+  });
+
+  it('surfaces impact truncation explicitly in MCP output', () => {
+    const formatted = (new ToolHandler(null) as any).formatImpact('A', {
+      nodes: new Map([['A', tNode('A')]]),
+      edges: [],
+      roots: ['A'],
+      truncated: true,
+    });
+    expect(formatted).toMatch(/truncated at safety limit/i);
+    expect(formatted).toMatch(/reduce `depth`/i);
   });
 });
 
