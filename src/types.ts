@@ -399,6 +399,17 @@ export interface Subgraph {
    * for graph traversals that don't run the search-ranking path.
    */
   confidence?: 'high' | 'low';
+
+  /** True when a traversal stopped at its node/edge safety budget. */
+  truncated?: boolean;
+}
+
+/** Safety budgets for impact traversal on high-fanout graphs. */
+export interface ImpactOptions {
+  /** Maximum nodes retained, including the focal node. Default: 10,000. */
+  maxNodes?: number;
+  /** Maximum edges retained. Default: 50,000. */
+  maxEdges?: number;
 }
 
 /**
