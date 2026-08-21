@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- GDScript (`.gd`) is now a supported language: functions and typed signatures, `_init` constructors, inner classes with methods, the full `var`/`const`/`@export`/`@onready` variable family, signals (extracted as properties with their parameter lists), enums with members, `static func` detection, and call edges — including calls inside initializers like `preload(...)`. Grammar: PrestonKnopp/tree-sitter-gdscript v6.1.0, vendored as an ABI-15 wasm rebuilt from upstream source.
+
 
 ## [1.6.0] - 2026-08-26
 
