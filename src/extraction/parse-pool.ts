@@ -89,6 +89,23 @@ const MAX_CONCURRENT_SPAWN = 2;
  * orchestrator's retry pass and shouldn't trip this on a merely-crashy repo.
  */
 const CRASH_BUDGET = 100;
+/**
+ * Native stack for each parse worker. Node's default worker stack is 4MB (the
+ * main thread gets 8MB), and the kernel walkers recurse once per tree level —
+ * ~450 bytes of native stack per level for c/cpp — so a deeply nested source
+ * file overflows it. That overflow is a SIGSEGV inside the addon: it never
+ * becomes a JS exception, so neither the worker's catch nor the kernel's
+ * per-file `defer:` fallback can see it, and because worker threads share the
+ * process it takes the whole `codegraph index` down with no diagnostic.
+ * Observed on clang's `test/Parser/parser_overflow.c` (16,384 nested braces):
+ * segfaults at 4MB and 6MB, parses at 8MB. 16MB leaves headroom without
+ * committing memory — a thread stack is reserved lazily, page by page.
+ *
+ * This raises the cliff rather than removing it; a depth cap in the kernel
+ * walkers that raises `defer:` (so the file lands on the wasm extractor, which
+ * handles this input today) is the complete fix.
+ */
+export const PARSE_WORKER_STACK_MB = 16;
 
 /**
  * Resolve the pool size from the `CODEGRAPH_PARSE_WORKERS` override and the
@@ -214,7 +231,8 @@ export class ParseWorkerPool {
       this.createWorker = opts.createWorker;
     } else if (opts.workerScriptPath) {
       const scriptPath = opts.workerScriptPath;
-      this.createWorker = () => new Worker(scriptPath);
+      this.createWorker = () =>
+        new Worker(scriptPath, { resourceLimits: { stackSizeMb: PARSE_WORKER_STACK_MB } });
     } else {
       throw new Error('ParseWorkerPool requires workerScriptPath or createWorker');
     }
