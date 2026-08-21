@@ -61,7 +61,7 @@ export function buildPickItems(daemons: DaemonRecord[], cwdRoot: string | null, 
 }
 
 export interface PickerDeps {
-  list: () => DaemonRecord[];
+  list: () => DaemonRecord[] | Promise<DaemonRecord[]>;
   stop: (root: string) => Promise<StopResult>;
   stopAll: () => Promise<StopResult[]>;
   /** Realpath'd root of the current project's daemon, or null. */
@@ -82,7 +82,7 @@ export interface PickerDeps {
  */
 export async function runDaemonPicker(deps: PickerDeps): Promise<void> {
   for (;;) {
-    const daemons = deps.list();
+    const daemons = await deps.list();
     if (daemons.length === 0) {
       deps.done('All daemons stopped.');
       return;

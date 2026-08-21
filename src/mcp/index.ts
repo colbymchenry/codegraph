@@ -48,7 +48,7 @@ import {
   tryAcquireDaemonLock,
 } from './daemon';
 import { connectWithHello, runLocalHandshakeProxy } from './proxy';
-import { getDaemonSocketCandidates } from './daemon-paths';
+import { getDaemonSocketCandidates, probeDaemonIdentity } from './daemon-paths';
 import { getTelemetry } from '../telemetry';
 import { checkForUpdateInBackground } from '../upgrade/update-check';
 import { EARLY_PPID } from './early-ppid';
@@ -423,15 +423,22 @@ export class MCPServer {
       // binding) — we're redundant; exit cleanly so the launcher proxies to it.
       const existing = lock.existing;
       if (existing && existing.pid > 0 && isProcessAlive(existing.pid)) {
-        process.stderr.write(
-          `[CodeGraph daemon] Another daemon (pid ${existing.pid}) already holds the lock; exiting.\n`
-        );
-        process.exit(0);
+        // Give a newly-elected daemon time to bind, then require its socket hello
+        // to match the lock PID/version. PID existence alone accepts an unrelated
+        // process after OS PID reuse and permanently wedges startup (#1553).
+        const age = Date.now() - existing.startedAt;
+        const stillStarting = existing.startedAt > 0 && age >= 0 && age < 10_000;
+        if (stillStarting || await probeDaemonIdentity(existing)) {
+          process.stderr.write(
+            `[CodeGraph daemon] Another daemon (pid ${existing.pid}) already holds the lock; exiting.\n`
+          );
+          process.exit(0);
+        }
       }
 
       // Holder is dead (or the record is unreadable) — clear it (pid-verified,
       // so we never delete a live daemon's lock) and retry the acquire.
-      clearStaleDaemonLock(lock.pidPath, existing?.pid);
+      clearStaleDaemonLock(lock.pidPath, existing?.pid, { allowLivePid: true });
       await sleep(TAKEOVER_RETRY_DELAY_MS);
     }
 

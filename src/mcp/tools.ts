@@ -32,6 +32,7 @@ import {
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
 import { isTestFile, normalizeNameToken } from '../search/query-utils';
+import { extractQueryPaths, queryMightContainPaths } from '../search/query-paths';
 import {
   existsSync,
   readFileSync,
@@ -631,6 +632,13 @@ export interface ExploreAllocationCandidate {
   worth: number;
   /** Carries a symbol on the rendered flow spine. */
   spine: boolean;
+  /**
+   * The query named this file by PATH (see query-paths.ts). Pinned files are
+   * never cliffed or trimmed, and weigh at least as much as the strongest
+   * candidate — the agent asked for the file itself, so starving it on text/
+   * graph scores (which a pure-path query doesn't produce) defeats the ask.
+   */
+  pinned?: boolean;
 }
 
 export interface ExploreAllocation {
@@ -676,7 +684,16 @@ export function allocateExploreBudget(
     return Number.isFinite(w) ? w : 0;
   };
 
-  const weights = new Map(candidates.map((c) => [c.path, weightOf(c)]));
+  // Pinned files weigh at least as much as the strongest raw candidate: their
+  // score is whatever the stripped query happened to match (for a pure-path
+  // query, nearly nothing), and a proportional split on that would fund the
+  // named file worst of all. Floor of 1 covers the all-pinned/zero-score case.
+  const rawWeights = new Map(candidates.map((c) => [c.path, weightOf(c)]));
+  const topRaw = Math.max(...rawWeights.values());
+  const weights = new Map(candidates.map((c) => [
+    c.path,
+    c.pinned ? Math.max(rawWeights.get(c.path) ?? 0, topRaw, 1) : (rawWeights.get(c.path) ?? 0),
+  ]));
   const topWeight = Math.max(...weights.values());
   if (!(topWeight > 0)) return empty;
 
@@ -686,7 +703,7 @@ export function allocateExploreBudget(
   const cliffed: string[] = [];
   let admitted: ExploreAllocationCandidate[] = [];
   for (const c of candidates) {
-    if (!c.spine && (weights.get(c.path) ?? 0) < cliffAt) cliffed.push(c.path);
+    if (!c.spine && !c.pinned && (weights.get(c.path) ?? 0) < cliffAt) cliffed.push(c.path);
     else admitted.push(c);
   }
   // Never cliff every candidate: an empty response costs a whole round-trip.
@@ -705,7 +722,7 @@ export function allocateExploreBudget(
   if (admitted.length > affordable) {
     const byWeight = [...admitted].sort((a, b) => (weights.get(b.path) ?? 0) - (weights.get(a.path) ?? 0));
     const keep = new Set(byWeight.slice(0, affordable).map((c) => c.path));
-    for (const c of admitted) if (c.spine) keep.add(c.path);
+    for (const c of admitted) if (c.spine || c.pinned) keep.add(c.path);
     for (const c of admitted) if (!keep.has(c.path)) cliffed.push(c.path);
     admitted = admitted.filter((c) => keep.has(c.path));
   }
@@ -3223,6 +3240,34 @@ export class ToolHandler {
     }
     const maxFiles = clamp((args.maxFiles as number) || budget.defaultMaxFiles, 1, 20);
 
+    // File paths named in the query become PINNED files: guaranteed admission,
+    // top of the rank order, funded first — and their span is REMOVED from the
+    // matching query. Runs on the RAW query (normalizeQuerySpelling strips
+    // `/digits` tails, which would mangle numeric path segments). Without this,
+    // a SvelteKit path like `runs/[runId]/+page.svelte` was shredded by the
+    // seeding tokenizer (splits on brackets → `runId` seeded as a "named
+    // symbol") and by FTS (`page`/`runs` fragments admitted every sibling
+    // `+page.svelte`), starving the very files the agent asked for.
+    let pinnedFiles: string[] = [];
+    let unresolvedPathSpans: string[] = [];
+    let matchQuery = query;
+    if (queryMightContainPaths(rawQuery)) {
+      try {
+        const extraction = extractQueryPaths(
+          rawQuery,
+          cg.getFiles().map((f) => f.path),
+          { maxPins: maxFiles },
+        );
+        if (extraction.pinnedFiles.length > 0 || extraction.unresolvedPathSpans.length > 0) {
+          pinnedFiles = extraction.pinnedFiles;
+          unresolvedPathSpans = extraction.unresolvedPathSpans;
+          matchQuery = normalizeQuerySpelling(extraction.strippedQuery);
+        }
+      } catch { /* path pinning must never fail an explore call */ }
+    }
+    const pinnedSet = new Set(pinnedFiles);
+    const pinnedOrder = new Map(pinnedFiles.map((p, i) => [p, i]));
+
     // Per-file allocation diagnostic (CG-4). `null` unless CODEGRAPH_EXPLORE_DEBUG
     // is set — every `diag?.` below is then a no-op and the response is
     // byte-identical. It only OBSERVES: it must never feed back into rendering.
@@ -3279,16 +3324,34 @@ export class ToolHandler {
     // Use a large maxNodes budget — explore has its own 35k char output limit
     // that prevents context bloat, so more nodes just means better coverage
     // across entry points (especially for large files like Svelte components).
-    const subgraph = await cg.findRelevantContext(query, {
+    // Matching runs on the path-stripped query; `query` stays for display.
+    const subgraph = await cg.findRelevantContext(matchQuery, {
       searchLimit: 8,
       traversalDepth: 3,
       maxNodes: 200,
       minScore: 0.2,
     });
 
+    // Pinned files' symbols enter the gather unconditionally — the agent named
+    // the file itself, so its contents ARE the answer regardless of what the
+    // stripped query text matched (which, for a pure-path query, is nothing).
+    const PINNED_FILE_NODE_CAP = 300;
+    for (const fp of pinnedFiles) {
+      let fileNodes: Node[] = [];
+      try { fileNodes = cg.getNodesInFile(fp); } catch { continue; }
+      fileNodes
+        .filter((n) => n.kind !== 'file' && n.kind !== 'import' && n.kind !== 'export')
+        .sort((a, b) => a.startLine - b.startLine)
+        .slice(0, PINNED_FILE_NODE_CAP)
+        .forEach((n) => { if (!subgraph.nodes.has(n.id)) subgraph.nodes.set(n.id, n); });
+    }
+
     if (subgraph.nodes.size === 0) {
       diag?.finishEmpty('no relevant code found — empty subgraph');
-      const empty = `No relevant code found for "${query}"`;
+      const missNote = unresolvedPathSpans.length > 0
+        ? ` (no indexed file uniquely matches ${unresolvedPathSpans.map((s) => `\`${s}\``).join(', ')})`
+        : '';
+      const empty = `No relevant code found for "${query}"${missNote}`;
       // Still an explore call, so it is still recorded: an empty answer spends a
       // call against the tier budget even though it emits no source.
       return this.exploreResult(empty, {
@@ -3351,11 +3414,18 @@ export class ToolHandler {
     {
       const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl)$/i;
       const CALLABLE = new Set(['method', 'function', 'component', 'constructor']);
+      // Variables/constants seed too: in Svelte/React a `$state` variable
+      // (`chatAtBottom`, `feedAtBottom`) is exactly the kind of symbol an agent
+      // names in a query, and the exact-name search channel already returns
+      // them — only this seeding tier was callable-only. The NL-stopword guard
+      // below applies unchanged, so bare English words still can't seed a
+      // same-named local. Callables keep priority via the body-size sort.
+      const SEEDABLE = new Set([...CALLABLE, 'variable', 'constant']);
       const isTestPath = (p: string) => /(^|\/)(tests?|specs?|__tests__|testdata|mocks?|fixtures?)\//i.test(p) || /\.(test|spec)\.[a-z]+$/i.test(p);
       const bodyLines = (n: Node) => Math.max(0, (n.endLine ?? n.startLine) - n.startLine);
       const callerCount = (n: Node) => { try { return cg.getCallers(n.id).length; } catch { return 0; } };
       const tokens = [...new Set(
-        query.split(/[\s,()[\]]+/)
+        matchQuery.split(/[\s,()[\]]+/)
           .map((t) => t.replace(FILE_EXT, '').trim())
           .filter((t) => t.length >= 3 && /^[A-Za-z_$][\w$]*(?:(?:::|\.)[\w$]+)*$/.test(t))
       )].slice(0, 16);
@@ -3430,24 +3500,26 @@ export class ToolHandler {
           }
         }
         let cands = raw
-          .filter((n) => CALLABLE.has(n.kind) && !isTestPath(n.filePath))
+          .filter((n) => SEEDABLE.has(n.kind) && !isTestPath(n.filePath))
           .sort((a, b) => (bodyLines(b) > 1 ? 1 : 0) - (bodyLines(a) > 1 ? 1 : 0) || bodyLines(b) - bodyLines(a));
         // Field-name seeding fallback (#1196): a camelCase token that names NO
         // definition of its own is usually an object-literal key / API field
         // (`profileInfo`) — no node exists, so it contributed zero seeds and
         // the files that DEFINE it (`getProfileInfoV2` in profileController)
-        // never surfaced. Seed its camel-infix definers instead: callables
-        // whose name contains the token at a hump boundary or as a prefix.
+        // never surfaced. Seed its camel-infix definers instead: seedable
+        // symbols (callables + variables — `atBottom` must reach the `$state`
+        // variables `feedAtBottom`/`chatAtBottom`) whose name contains the
+        // token at a hump boundary or as a prefix.
         // Exact-empty + camel-shaped only (bare words keep the NL-stopword
         // guard below), shortest-first, capped so a hot infix can't flood.
         if (cands.length === 0 && !isQual && /[a-z][A-Z]/.test(t)) {
           const lcToken = t.toLowerCase();
           cands = cg
             .getNodesByNameSubstring(t, {
-              kinds: ['function', 'method', 'component'],
+              kinds: ['function', 'method', 'component', 'variable', 'constant'],
               limit: 60,
             })
-            .filter((n) => CALLABLE.has(n.kind) && !isTestPath(n.filePath))
+            .filter((n) => SEEDABLE.has(n.kind) && !isTestPath(n.filePath))
             .filter((n) => {
               const idx = n.name.toLowerCase().indexOf(lcToken);
               if (idx < 0) return false;
@@ -3624,8 +3696,9 @@ export class ToolHandler {
       fileGroups.set(node.filePath, group);
     }
 
-    // Extract query terms for relevance checking
-    const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length >= 3);
+    // Extract query terms for relevance checking (path-stripped: a pinned
+    // file's own path fragments must not count as "term hits" everywhere)
+    const queryTerms = matchQuery.toLowerCase().split(/\s+/).filter(t => t.length >= 3);
 
     // Test/spec/icon/i18n file detector — used by the pre-floor hard filter, the
     // rank penalty, and the comparator deprioritization.
@@ -3715,9 +3788,10 @@ export class ToolHandler {
     // keep-minimum then pulled two test files back in as the "spread".
     let candidateFiles = [...fileGroups.entries()];
     {
-      const queryMentionsTests = /\b(test|tests|testing|spec|verify|verifies)\b/i.test(query);
+      const queryMentionsTests = /\b(test|tests|testing|spec|verify|verifies)\b/i.test(matchQuery);
       if (!queryMentionsTests) {
-        const nonLow = candidateFiles.filter(([p]) => !isLowValue(p));
+        // A pinned file is exempt: naming a test file by path IS asking for it.
+        const nonLow = candidateFiles.filter(([p]) => !isLowValue(p) || pinnedSet.has(p));
         if (nonLow.length >= 2) {
           candidateFiles = nonLow;
         }
@@ -3732,7 +3806,9 @@ export class ToolHandler {
       SCORE_FLOOR_ABSOLUTE,
       Math.min(SCORE_FLOOR_MAX, topScore * SCORE_FLOOR_FRACTION_OF_TOP),
     );
-    let relevantFiles = candidateFiles.filter(([, group]) => group.score >= scoreFloor);
+    let relevantFiles = candidateFiles.filter(
+      ([fp, group]) => group.score >= scoreFloor || pinnedSet.has(fp),
+    );
     if (relevantFiles.length < SCORE_FLOOR_KEEP_MIN) {
       // Backfill from what the RELATIVE floor cut, best first, at two strengths:
       //
@@ -3747,8 +3823,11 @@ export class ToolHandler {
       //    worst outcome on the board — the agent falls straight back to grep.
       const minEvidence = relevantFiles.length === 0 ? Number.EPSILON : SCORE_FLOOR_ABSOLUTE;
       relevantFiles = candidateFiles
-        .filter(([, group]) => group.score >= minEvidence)
-        .sort((a, b) => b[1].score - a[1].score || b[1].nodes.length - a[1].nodes.length)
+        .filter(([fp, group]) => group.score >= minEvidence || pinnedSet.has(fp))
+        .sort((a, b) =>
+          (pinnedSet.has(b[0]) ? 1 : 0) - (pinnedSet.has(a[0]) ? 1 : 0)
+          || b[1].score - a[1].score
+          || b[1].nodes.length - a[1].nodes.length)
         .slice(0, Math.max(SCORE_FLOOR_KEEP_MIN, relevantFiles.length));
     }
     diag?.setScoreFloor(scoreFloor, relevantFiles.length);
@@ -3852,7 +3931,8 @@ export class ToolHandler {
     // never prunes below 2.
     if (maxGraph > 0) {
       const gated = relevantFiles.filter(([fp]) =>
-        (fileGraphScore.get(fp) ?? 0) >= maxGraph * 0.06
+        pinnedSet.has(fp)
+        || (fileGraphScore.get(fp) ?? 0) >= maxGraph * 0.06
         || centralFiles.has(fp)
         || entryFiles.has(fp)
         || changeSurfaceFiles.has(fp)
@@ -3908,7 +3988,15 @@ export class ToolHandler {
       const aPath = a[0].toLowerCase();
       const bPath = b[0].toLowerCase();
 
-      // Agent-named files first (it asked for a symbol defined here by name).
+      // Pinned files first of all — the agent named the FILE by path, which is
+      // even more explicit than naming a symbol in it. Among pins, keep the
+      // order they appeared in the query.
+      const aPin = pinnedSet.has(a[0]) ? 1 : 0;
+      const bPin = pinnedSet.has(b[0]) ? 1 : 0;
+      if (aPin !== bPin) return bPin - aPin;
+      if (aPin && bPin) return (pinnedOrder.get(a[0]) ?? 0) - (pinnedOrder.get(b[0]) ?? 0);
+
+      // Agent-named files next (it asked for a symbol defined here by name).
       const aNamed = namedSeedFiles.has(a[0]) ? 1 : 0;
       const bNamed = namedSeedFiles.has(b[0]) ? 1 : 0;
       if (aNamed !== bNamed) return bNamed - aNamed;
@@ -4010,7 +4098,7 @@ export class ToolHandler {
     // Compute the flow spine once — used both to prepend the Flow section (below)
     // and to gate adaptive source sizing: files on the spine get full source,
     // off-spine peers skeletonize.
-    const flow = this.buildFlowFromNamedSymbols(cg, query);
+    const flow = this.buildFlowFromNamedSymbols(cg, matchQuery);
 
     // Snapshot every ranked candidate's scoring inputs, in final sort order, so
     // the diagnostic can show what each file's share of the envelope was BOUGHT
@@ -4031,6 +4119,7 @@ export class ToolHandler {
           graphScore: fileGraphScore.get(fp) ?? 0,
           termHits: fileTermHits.get(fp) ?? 0,
           nodes: group.nodes.length,
+          pinned: pinnedSet.has(fp),
           named: namedSeedFiles.has(fp),
           central: centralFiles.has(fp),
           entry: entryFiles.has(fp),
@@ -4051,8 +4140,11 @@ export class ToolHandler {
       sortedFiles.map(([fp, group]) => ({
         path: fp,
         score: group.score,
-        worth: rankPenalty(fp),
+        // A pinned file's bytes are worth full price by definition — the agent
+        // asked for the file itself, generated/test or not.
+        worth: pinnedSet.has(fp) ? 1 : rankPenalty(fp),
         spine: group.nodes.some((n) => flow.pathNodeIds.has(n.id)),
+        pinned: pinnedSet.has(fp),
       })),
       budget,
       maxFiles,
@@ -5804,9 +5896,19 @@ export class ToolHandler {
         g.nodes.filter((n) => n.kind !== 'import' && n.kind !== 'export').map((n) => n.id),
       ).size;
     }, 0);
-    const summaryLine = survivors.length > 0
+    let summaryLine = survivors.length > 0
       ? `Found ${shownSymbols} symbol${shownSymbols === 1 ? '' : 's'} across ${survivors.length} file${survivors.length === 1 ? '' : 's'}.`
       : `Found ${subgraph.nodes.size} symbol${subgraph.nodes.size === 1 ? '' : 's'} across ${fileGroups.size} file${fileGroups.size === 1 ? '' : 's'}.`;
+    // Path pinning is visible, not silent: say which query-named files were
+    // honored, and which path spans matched nothing so the agent can correct
+    // them instead of trusting a response that quietly ignored the path.
+    const pinnedShown = pinnedFiles.filter((fp) => survivors.includes(fp)).length;
+    if (pinnedShown > 0) {
+      summaryLine += ` ${pinnedShown} file${pinnedShown === 1 ? '' : 's'} pinned from the query.`;
+    }
+    if (unresolvedPathSpans.length > 0) {
+      summaryLine += ` No indexed file uniquely matches ${unresolvedPathSpans.map((s) => `\`${s}\``).join(', ')}.`;
+    }
     finalText = finalText.replace(SUMMARY_SENTINEL, summaryLine);
 
     // Emit the allocation diagnostic from the FINAL text, so per-file bytes and

@@ -629,25 +629,31 @@ export function acquireLockViaExclusiveOpen(pidPath: string, info: DaemonLockInf
 }
 
 /**
- * Remove a stale pidfile, but only if it still names a dead process. Re-reads
- * the file immediately before unlinking so we never delete a lock that a live
- * daemon (re)acquired in the meantime.
+ * Remove a stale pidfile. Re-reads the file immediately before unlinking so a
+ * different daemon that acquired the lock in the meantime is never disturbed.
  *
  * must-fix 1 (issue #411 review): the original unconditionally `unlink`'d,
  * which let a racing candidate delete a healthy daemon's lock. Passing
  * `expectedDeadPid` (the pid the caller believed was dead) makes the clear a
- * compare-and-delete: bail if the file now holds a different pid, or any live
- * pid. Returns true when the stale lock is gone (or was already gone).
+ * compare-and-delete: bail if the file now holds a different pid. By default a
+ * live pid is also preserved; `allowLivePid` is reserved for callers that have
+ * already disproved daemon identity with the socket hello (#1553). Returns true
+ * when the stale lock is gone (or was already gone).
  */
-export function clearStaleDaemonLock(pidPath: string, expectedDeadPid?: number): boolean {
+export function clearStaleDaemonLock(
+  pidPath: string,
+  expectedDeadPid?: number,
+  opts: { allowLivePid?: boolean } = {}
+): boolean {
   try {
     const raw = fs.readFileSync(pidPath, 'utf8');
     const info = decodeLockInfo(raw);
     if (info) {
       // A different pid took over since we read it — not ours to clear.
       if (expectedDeadPid !== undefined && info.pid !== expectedDeadPid) return false;
-      // Holder is actually alive — never clear a live daemon's lock.
-      if (info.pid > 0 && isProcessAlive(info.pid)) return false;
+      // PID liveness is normally sufficient. The takeover caller may override
+      // it only after a failed identity handshake proves PID reuse.
+      if (!opts.allowLivePid && info.pid > 0 && isProcessAlive(info.pid)) return false;
     }
     fs.unlinkSync(pidPath);
     return true;

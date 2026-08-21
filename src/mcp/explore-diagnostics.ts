@@ -60,6 +60,8 @@ export interface ExploreCandidateMeta {
   graphScore: number;
   termHits: number;
   nodes: number;
+  /** The query named this file by PATH — pinned rank/allocation treatment. */
+  pinned?: boolean;
   named: boolean;
   central: boolean;
   entry: boolean;
@@ -579,6 +581,7 @@ export class ExploreDiagnostics {
           graphScore: round6(r.graphScore),
           termHits: r.termHits,
           nodes: r.nodes,
+          pinned: r.pinned ?? false,
           named: r.named,
           central: r.central,
           entry: r.entry,
@@ -797,6 +800,7 @@ export function renderTable(report: ExploreDiagnosticReport): string {
 
 function flagString(f: ExploreDiagnosticFile): string {
   const flags: string[] = [];
+  if (f.pinned) flags.push('pinned');
   if (f.named) flags.push('named');
   if (f.entry) flags.push('entry');
   if (f.central) flags.push('central');
