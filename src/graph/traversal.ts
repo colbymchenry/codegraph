@@ -626,23 +626,30 @@ export class GraphTraverser {
       return null;
     }
 
-    // BFS to find shortest path
-    const visited = new Set<string>();
-    const queue: Array<{ nodeId: string; path: Array<{ node: Node; edge: Edge | null }> }> = [
-      { nodeId: fromId, path: [{ node: fromNode, edge: null }] },
-    ];
+    // BFS to find the shortest path. Keep one predecessor per discovered node
+    // instead of copying the full path into every queue entry; use a head index
+    // so dequeues stay O(1), and mark on enqueue so converging edges cannot
+    // multiply queued work.
+    const enqueued = new Set<string>([fromId]);
+    const parents = new Map<string, { parentId: string; node: Node; edge: Edge }>();
+    const queue: string[] = [fromId];
+    let head = 0;
 
-    while (queue.length > 0) {
-      const { nodeId, path } = queue.shift()!;
+    while (head < queue.length) {
+      const nodeId = queue[head++]!;
 
       if (nodeId === toId) {
+        const path: Array<{ node: Node; edge: Edge | null }> = [];
+        let currentId = toId;
+        while (currentId !== fromId) {
+          const step = parents.get(currentId)!;
+          path.push({ node: step.node, edge: step.edge });
+          currentId = step.parentId;
+        }
+        path.push({ node: fromNode, edge: null });
+        path.reverse();
         return path;
       }
-
-      if (visited.has(nodeId)) {
-        continue;
-      }
-      visited.add(nodeId);
 
       // Get outgoing edges
       const outgoingEdges = this.queries.getOutgoingEdges(
@@ -651,22 +658,20 @@ export class GraphTraverser {
       );
       if (outgoingEdges.length === 0) continue;
 
-      // Batch-fetch only the unvisited targets (was N+1 per BFS frontier).
-      const wantIds = outgoingEdges
-        .map((e) => e.target)
-        .filter((id) => !visited.has(id));
+      // Batch-fetch only undiscovered targets, once each even when parallel
+      // edges point at the same node.
+      const wantIds = [...new Set(
+        outgoingEdges.map((e) => e.target).filter((id) => !enqueued.has(id))
+      )];
       const nextNodes = wantIds.length > 0 ? this.queries.getNodesByIds(wantIds) : new Map();
 
       for (const edge of outgoingEdges) {
-        if (!visited.has(edge.target)) {
-          const nextNode = nextNodes.get(edge.target);
-          if (nextNode) {
-            queue.push({
-              nodeId: edge.target,
-              path: [...path, { node: nextNode, edge }],
-            });
-          }
-        }
+        if (enqueued.has(edge.target)) continue;
+        const nextNode = nextNodes.get(edge.target);
+        if (!nextNode) continue;
+        enqueued.add(edge.target);
+        parents.set(edge.target, { parentId: nodeId, node: nextNode, edge });
+        queue.push(edge.target);
       }
     }
 

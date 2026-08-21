@@ -535,6 +535,37 @@ function tGraph(nodes: Node[], edges: Edge[]): GraphTraverser {
 }
 
 describe('Traversal edge-completeness & limits (#1086–#1090)', () => {
+  it('findPath keeps shortest-path order without duplicate frontier entries', () => {
+    const nodes = ['A', 'B', 'C', 'D', 'E'].map((id) => tNode(id));
+    const edges: Edge[] = [
+      { source: 'A', target: 'B', kind: 'calls', line: 1 },
+      { source: 'A', target: 'B', kind: 'references', line: 2 },
+      { source: 'A', target: 'C', kind: 'calls', line: 3 },
+      { source: 'B', target: 'D', kind: 'calls', line: 4 },
+      { source: 'C', target: 'D', kind: 'calls', line: 5 },
+      { source: 'D', target: 'E', kind: 'calls', line: 6 },
+    ];
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const batches: string[][] = [];
+    const q = {
+      getNodeById: (id: string) => byId.get(id) ?? null,
+      getNodesByIds: (ids: readonly string[]) => {
+        batches.push([...ids]);
+        expect(new Set(ids).size).toBe(ids.length);
+        return new Map(ids.flatMap((id) => {
+          const node = byId.get(id);
+          return node ? [[id, node] as const] : [];
+        }));
+      },
+      getOutgoingEdges: (source: string) => edges.filter((e) => e.source === source),
+    };
+
+    const path = new GraphTraverser(q as never).findPath('A', 'E');
+    expect(path?.map((step) => step.node.id)).toEqual(['A', 'B', 'D', 'E']);
+    expect(path?.map((step) => step.edge?.line ?? null)).toEqual([null, 1, 4, 6]);
+    expect(batches[0]).toEqual(['B', 'C']);
+  });
+
   it('traverseBFS keeps every parallel edge to the same target (#1090)', () => {
     // A reaches B via both `calls` and `references` — two distinct edges.
     const edges: Edge[] = [
