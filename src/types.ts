@@ -688,4 +688,13 @@ export interface FindRelevantContextOptions {
 
   /** Node types to include */
   nodeKinds?: NodeKind[];
+
+  /**
+   * Extra symbol names to merge in as exact-name search candidates, at a
+   * dampened score. Fed by the segment-vocabulary supplement (CodeGraph.
+   * findRelevantContext): word-level query terms can't reach camelCase names
+   * through FTS — `pinFeedIfNearBottom` is one FTS token — so names whose
+   * SEGMENTS the query's words name are seeded here instead.
+   */
+  seedNames?: string[];
 }

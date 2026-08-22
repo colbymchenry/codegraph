@@ -1168,15 +1168,26 @@ export class QueryBuilder {
   }
 
   /**
-   * Get nodes by lowercase name match (uses idx_nodes_lower_name expression index)
+   * Get nodes by name, case-insensitively (seeks the idx_nodes_lower_name
+   * expression index).
+   *
+   * The parameter is lowered in SQL rather than trusted to arrive lowered, so
+   * the lookup means the same thing whatever casing a caller hands it. Written
+   * as a bare `lower(name) = ?` it silently returned nothing for any input
+   * carrying an uppercase letter, and — because SQLite's `lower()` folds ASCII
+   * only while JavaScript's `.toLowerCase()` folds Unicode — a caller that
+   * pre-lowered in JavaScript could not match a non-ASCII name at all.
+   *
+   * Note this hardens the query, not its one caller: `matchFuzzy` still lowers
+   * in JavaScript before calling, so the non-ASCII gap remains open there.
    */
-  getNodesByLowerName(lowerName: string): Node[] {
+  getNodesByLowerName(name: string): Node[] {
     if (!this.stmts.getNodesByLowerName) {
       this.stmts.getNodesByLowerName = this.db.prepare(
-        'SELECT * FROM nodes WHERE lower(name) = ?'
+        'SELECT * FROM nodes WHERE lower(name) = lower(?)'
       );
     }
-    const rows = this.stmts.getNodesByLowerName.all(lowerName) as NodeRow[];
+    const rows = this.stmts.getNodesByLowerName.all(name) as NodeRow[];
     return rows.map(rowToNode);
   }
 
@@ -1242,12 +1253,25 @@ export class QueryBuilder {
     // pushing them past the FTS fetch limit before post-hoc scoring can help.
     // Use the max BM25 score as the base so the nameMatchBonus (exact=30 vs
     // prefix=20) actually differentiates them after rescoring.
+    //
+    // Whole-name equality MUST be written as `lower(name) = lower(?)` so it
+    // seeks `idx_nodes_lower_name`. The equivalent `name = ? COLLATE NOCASE`
+    // matches no index — `idx_nodes_name` is BINARY-collated and the expression
+    // index only matches the same expression — and degrades to a full table
+    // scan. The `LIMIT 20` does not rescue it: SQLite can only stop early once
+    // it has produced 20 rows, and this runs once per query term, most of which
+    // name nothing in the corpus. Measured per term on an unmatched term:
+    // 0.08ms on gin (2.5k nodes), 0.39ms on excalidraw (11k), 2.4ms on django
+    // (62k) — and growing with the corpus, where the seek is flat at ~0.002ms.
+    // Lowering the parameter in SQL rather than in JS is deliberate: SQLite's
+    // `lower()` and NOCASE both fold ASCII only, while JS `.toLowerCase()`
+    // folds Unicode, which would silently stop matching non-ASCII names.
     if (results.length > 0 && query) {
       const existingIds = new Set(results.map(r => r.node.id));
       const maxFtsScore = Math.max(...results.map(r => r.score));
       const terms = query.split(/\s+/).filter(t => t.length >= 2);
       for (const term of terms) {
-        let sql = 'SELECT * FROM nodes WHERE name = ? COLLATE NOCASE';
+        let sql = 'SELECT * FROM nodes WHERE lower(name) = lower(?)';
         const params: (string | number)[] = [term];
         if (kinds && kinds.length > 0) {
           sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
@@ -1547,9 +1571,16 @@ export class QueryBuilder {
     // Pass 2: Query each name, boosting results that co-locate with distinctive symbols.
 
     // Pass 1: Find files containing each queried name, identify distinctive names
+    //
+    // Both passes spell whole-name equality as `lower(name) = lower(?)` so they
+    // seek `idx_nodes_lower_name` — see the note in `searchNodes` for why the
+    // `name = ? COLLATE NOCASE` form full-scans instead. This path is the one
+    // that hurts most: it runs both passes for every symbol extracted from the
+    // query, and extraction is generous, so most of those names are absent from
+    // the corpus and never reach either LIMIT.
     const nameToFiles = new Map<string, Set<string>>();
     for (const name of names) {
-      let sql = 'SELECT DISTINCT file_path FROM nodes WHERE name COLLATE NOCASE = ?';
+      let sql = 'SELECT DISTINCT file_path FROM nodes WHERE lower(name) = lower(?)';
       const params: (string | number)[] = [name];
       if (kinds && kinds.length > 0) {
         sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
@@ -1577,7 +1608,7 @@ export class QueryBuilder {
       let sql = `
         SELECT nodes.*, 1.0 as score
         FROM nodes
-        WHERE name COLLATE NOCASE = ?
+        WHERE lower(name) = lower(?)
       `;
       const params: (string | number)[] = [name];
 
@@ -2359,7 +2390,12 @@ export class QueryBuilder {
       const chunkRows = this.db
         .prepare(`SELECT * FROM unresolved_refs WHERE status = 'pending' AND file_path IN (${placeholders})`)
         .all(...chunk) as UnresolvedRefRow[];
-      rows.push(...chunkRows);
+      // Append with a loop, never a spread: the INPUT chunk is bounded, but
+      // the RESULT rows per chunk are not — a dense recovery sync (e.g. the
+      // #1541 self-heal re-indexing hundreds of files) returns more rows than
+      // V8 allows as arguments, and `push(...chunkRows)` dies with "Maximum
+      // call stack size exceeded", aborting resolution mid-sync (#1558).
+      for (const row of chunkRows) rows.push(row);
     }
 
     return rows.map((row) => ({
@@ -2541,7 +2577,10 @@ export class QueryBuilder {
       const chunkRows = this.db
         .prepare(`SELECT * FROM unresolved_refs WHERE status = 'failed' AND name_tail IN (${placeholders})`)
         .all(...chunk) as UnresolvedRefRow[];
-      rows.push(...chunkRows);
+      // Loop, not spread — same V8 argument-limit hazard as
+      // getUnresolvedReferencesByFiles (#1558): a large definition delta can
+      // select an unbounded number of failed rows per chunk.
+      for (const row of chunkRows) rows.push(row);
     }
 
     return rows.map((row) => ({

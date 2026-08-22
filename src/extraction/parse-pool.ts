@@ -61,6 +61,8 @@ const MAX_PARSE_POOL_SIZE = 16;
 const DEFAULT_RECYCLE_INTERVAL = 250;
 /** Base per-parse timeout; scaled up for large files by the caller's formula. */
 const DEFAULT_PARSE_TIMEOUT_MS = 10_000;
+/** Keep the default large-file budget bounded; the hard-kill window is 3× this. */
+const MAX_SCALED_PARSE_TIMEOUT_MS = 20_000;
 /**
  * A worker is only killed once a parse has gone this many × its budget with no
  * result. The base timer firing is NOT proof the parse is still running: after
@@ -107,6 +109,17 @@ export function resolveParseTimeoutMs(envVal: string | undefined): number {
     if (Number.isFinite(n) && n > 0) return Math.floor(n);
   }
   return DEFAULT_PARSE_TIMEOUT_MS;
+}
+
+/**
+ * Per-file soft timeout. Size scaling helps legitimate large sources, but an
+ * uncapped linear budget gave data-only headers near the 1 MiB file limit a
+ * 4.5–5 minute hard-kill window (#1555). Explicit larger base overrides remain
+ * respected for slow storage.
+ */
+export function resolveParseBudgetMs(baseMs: number, contentLength: number): number {
+  const scaled = baseMs + Math.floor(contentLength / 100_000) * 10_000;
+  return Math.min(scaled, Math.max(baseMs, MAX_SCALED_PARSE_TIMEOUT_MS));
 }
 
 export function resolveParsePoolSize(envVal: string | undefined, cpuCount: number): number {
@@ -344,7 +357,7 @@ export class ParseWorkerPool {
     this.parseCounts.set(w, (this.parseCounts.get(w) ?? 0) + 1);
     // Scale the timeout for large files: base + 10s per 100KB (matches the
     // original single-worker formula so pathological-file behaviour is unchanged).
-    const timeoutMs = this.parseTimeoutMs + Math.floor(job.task.content.length / 100_000) * 10_000;
+    const timeoutMs = resolveParseBudgetMs(this.parseTimeoutMs, job.task.content.length);
     job.budgetMs = timeoutMs;
     job.timer = setTimeout(() => this.onTimeout(w, job, timeoutMs), timeoutMs);
     job.timer.unref?.();

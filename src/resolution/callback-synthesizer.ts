@@ -1241,7 +1241,12 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
     if ((++scanned & 255) === 0) await onYield(); // #1091: yield mid-scan on huge graphs
     const content = ctx.readFile(file);
     if (!content || (!content.includes('</') && !content.includes('/>'))) continue; // JSX-file gate
-    const parents = ctx.getNodesInFile(file).filter((n) => PARENT_KINDS.has(n.kind));
+    // File-level language gate, not merely a project-level one: mixed C/JS
+    // monorepos must not interpret `"<Foo/>"` inside C as JSX (#1560).
+    const parents = ctx.getNodesInFile(file).filter(
+      (n) => PARENT_KINDS.has(n.kind) && JS_FAMILY.includes(n.language)
+    );
+    if (parents.length === 0) continue;
     for (const parent of parents) {
       const src = sliceLines(content, parent.startLine, parent.endLine);
       if (!src || (!src.includes('</') && !src.includes('/>'))) continue;
@@ -3533,7 +3538,7 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'closureCollEdges', gate: ALWAYS, run: (q, c, y) => closureCollectionEdges(q, c, y) },
   { name: 'emitterEdges', gate: ALWAYS, run: (_q, c, y) => eventEmitterEdges(c, y) },
   { name: 'renderEdges', gate: ALWAYS, run: (q, c, y) => reactRenderEdges(q, c, y) },
-  { name: 'jsxEdges', gate: ALWAYS, run: (_q, c, y) => reactJsxChildEdges(c, y) },
+  { name: 'jsxEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => reactJsxChildEdges(c, y) },
   { name: 'vueEdges', gate: (has) => has('vue'), run: (_q, c, y) => vueTemplateEdges(c, y) },
   { name: 'svelteKitEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitLoadEdges(c, y) },
   { name: 'pascalEdges', gate: ALWAYS, run: (_q, c, y) => pascalFormEdges(c, y) },
