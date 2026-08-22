@@ -908,3 +908,99 @@ describe('Go gRPC stub→impl synthesis', () => {
     }
   });
 });
+
+describe('Godot end-to-end — engine virtuals, string dispatch, scene connections', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('synthesizes class → engine-virtual entry edges (godot-engine-virtual)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-gdvirtual-'));
+    let cg: CodeGraph | undefined;
+    try {
+      fs.writeFileSync(
+        path.join(tmpDir, 'player_controller.gd'),
+        [
+          'extends CharacterBody2D',
+          '',
+          'func _physics_process(delta: float) -> void:',
+          '\tmove_and_slide()',
+          '',
+          'func apply_gravity() -> void:',
+          '\tpass',
+          '',
+        ].join('\n')
+      );
+
+      cg = CodeGraph.initSync(tmpDir);
+      await cg.indexAll();
+      cg.resolveReferences();
+
+      // Implicit script class from the filename is the owner hub.
+      const cls = cg.getNodesByKind('class').find((n) => n.name === 'PlayerController');
+      expect(cls).toBeDefined();
+      const virtuals = cg
+        .getOutgoingEdges(cls!.id)
+        .filter((e) => e.kind === 'calls')
+        .filter((e) => (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy === 'godot-engine-virtual')
+        .map((e) => cg.getNode(e.target)?.name);
+      expect(virtuals).toContain('_physics_process');
+      expect(virtuals).not.toContain('apply_gravity');
+    } finally {
+      cg?.close();
+    }
+  });
+
+  it('bridges .tscn signal connections to handler methods across files (godot-scene-connection)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-gdscene-'));
+    let cg: CodeGraph | undefined;
+    try {
+      fs.writeFileSync(
+        path.join(tmpDir, 'main.gd'),
+        [
+          'extends Control',
+          '',
+          'func _on_start_pressed() -> void:',
+          '\tstart_game()',
+          '',
+          'func start_game() -> void:',
+          '\tpass',
+          '',
+        ].join('\n')
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'main.tscn'),
+        [
+          '[gd_scene load_steps=2 format=3]',
+          '[ext_resource type="Script" path="res://main.gd" id="1_main"]',
+          '[node name="Main" type="Control"]',
+          'script = ExtResource("1_main")',
+          '[node name="StartButton" type="Button" parent="."]',
+          '[connection signal="pressed" from="StartButton" to="." method="_on_start_pressed"]',
+          '',
+        ].join('\n')
+      );
+
+      cg = CodeGraph.initSync(tmpDir);
+      await cg.indexAll();
+      cg.resolveReferences();
+
+      const handler = cg.getNodesByKind('method').find((n) => n.name === '_on_start_pressed');
+      expect(handler).toBeDefined();
+      const inbound = cg.getIncomingEdges(handler!.id).filter((e) => e.kind === 'calls');
+      const bridged = inbound.some(
+        (e) =>
+          (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy === 'godot-scene-connection'
+      );
+      expect(bridged).toBe(true);
+
+      // The full flow must connect: handler → start_game via the plain call.
+      const callees = cg.getCallees(handler!.id).map((c) => c.node.name);
+      expect(callees).toContain('start_game');
+    } finally {
+      cg?.close();
+    }
+  });
+});

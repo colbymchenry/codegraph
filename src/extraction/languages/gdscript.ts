@@ -828,6 +828,13 @@ function runReferencePasses(ctx: ExtractorContext, state: ExtractorState): void 
       emitRef(ctx, owner, match[1]!, 'calls', lineNumber, match.index, state);
     }
 
+    // String-keyed dispatch family — has_method gates on the same names
+    // call()/Callable() invoke, so bridge them identically.
+    const hasMethodRegex = /\bhas_method\s*\(\s*["']([A-Za-z_]\w*)["']\s*\)/g;
+    while ((match = hasMethodRegex.exec(code)) !== null) {
+      emitRef(ctx, owner, match[1]!, 'calls', lineNumber, match.index, state);
+    }
+
     const groupRegex = /\b(?:add_to_group|remove_from_group)\s*\(\s*["']([^"']+)["']/g;
     while ((match = groupRegex.exec(code)) !== null) {
       emitRef(ctx, owner, match[1]!, 'references', lineNumber, match.index, state);

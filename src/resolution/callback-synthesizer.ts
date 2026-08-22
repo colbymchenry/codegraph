@@ -1534,6 +1534,101 @@ function goHandlerIdent(expr: string): string | null {
   return m ? m[1]! : null;
 }
 
+/**
+ * Godot engine-invoked virtuals: `_ready()`, `_process(delta)`,
+ * `_unhandled_input(event)` and friends are called by the runtime, never by
+ * user code — so they have zero inbound `calls` edges in any static graph and
+ * every flow that routes through them dead-ends. Bridge owner class → virtual
+ * method so explore/trace can ENTER a flow through the script's hub node.
+ * Provenance: `heuristic`, `synthesizedBy: 'godot-engine-virtual'`.
+ */
+const GODOT_ENGINE_VIRTUALS = new Set([
+  '_init', '_ready', '_enter_tree', '_exit_tree', '_process',
+  '_physics_process', '_input', '_shortcut_input', '_unhandled_input',
+  '_unhandled_key_input', '_draw', '_notification',
+]);
+
+function godotEngineVirtualEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  for (const cls of queries.getNodesByKind('class')) {
+    if (cls.language !== 'gdscript') continue;
+    const members = queries
+      .getOutgoingEdges(cls.id, ['contains'])
+      .map((e) => queries.getNodeById(e.target))
+      .filter((n): n is Node => !!n && n.language === 'gdscript' && GODOT_ENGINE_VIRTUALS.has(n.name));
+    for (const m of members) {
+      edges.push({
+        source: cls.id,
+        target: m.id,
+        kind: 'calls',
+        line: m.startLine,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'godot-engine-virtual', via: m.name, registeredAt: `${m.filePath}:${m.startLine}` },
+      });
+    }
+  }
+  return edges;
+}
+
+/**
+ * Godot scene-signal wiring, end-to-end. `.tscn` `[connection signal="pressed"
+ * from="X" to="Y" method="_on_pressed"]` emits (at extraction) a heuristic
+ * references edge scene-node → toNode carrying `{signal, method, scriptResPath}`
+ * metadata — but the handler METHOD usually lives in the script attached to
+ * `toNode`, a different file, so the flow stops at the scene boundary. Bridge
+ * it: source scene node → the script's class → same-name method. Only
+ * unambiguous candidates link; anything else stays silent (silent beats wrong).
+ */
+function godotSceneConnectionEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  for (const e of queries.getEdgesByProvenance('heuristic')) {
+    const method = e.metadata?.method as string | undefined;
+    const scriptResPath = e.metadata?.scriptResPath as string | undefined;
+    if (!e.metadata?.signal || !method || !scriptResPath || !scriptResPath.startsWith('res://')) continue;
+
+    // file node ids are `file:<project-relative-path>` — exactly what the
+    // res:// path holds after stripping the protocol.
+    const fileId = `file:${scriptResPath.replace(/^res:\/\//, '')}`;
+    const candidates: Node[] = [];
+    const walk = (nodeId: string, depth: number): void => {
+      if (depth > 4) return;
+      for (const contains of queries.getOutgoingEdges(nodeId, ['contains'])) {
+        const child = queries.getNodeById(contains.target);
+        if (!child) continue;
+        if (
+          child.language === 'gdscript' &&
+          child.name === method &&
+          (child.kind === 'method' || child.kind === 'function')
+        ) {
+          candidates.push(child);
+        }
+        walk(child.id, depth + 1);
+      }
+    };
+    walk(fileId, 0);
+    if (candidates.length !== 1) continue; // ambiguous or missing — stay silent
+
+    const target = candidates[0]!;
+    const key = `${e.source}>${target.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    edges.push({
+      source: e.source,
+      target: target.id,
+      kind: 'calls',
+      line: target.startLine,
+      provenance: 'heuristic',
+      metadata: {
+        synthesizedBy: 'godot-scene-connection',
+        via: e.metadata.signal,
+        registeredAt: `${target.filePath}:${target.startLine}`,
+      },
+    });
+  }
+  return edges;
+}
+
 function ginMiddlewareChainEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
   // 1. Find the chain dispatcher(s): a Go method that invokes a `handlers` slice by index.
   const dispatchers: Node[] = [];
@@ -1714,6 +1809,11 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const rnXPlatEdges = rnCrossPlatformEdges(queries);
   const mybatisEdges = mybatisJavaXmlEdges(queries);
   const ginEdges = ginMiddlewareChainEdges(queries, ctx);
+  const godotVirtualEdges = godotEngineVirtualEdges(queries);
+  // Scene-connection bridging reads heuristic wiring persisted by extraction,
+  // so it must run BEFORE the merged batch insert — its own edges are added to
+  // the same batch below.
+  const godotSceneEdges = godotSceneConnectionEdges(queries);
 
   const merged: Edge[] = [];
   const seen = new Set<string>();
@@ -1737,6 +1837,8 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     ...rnXPlatEdges,
     ...mybatisEdges,
     ...ginEdges,
+    ...godotVirtualEdges,
+    ...godotSceneEdges,
   ]) {
     const key = `${e.source}>${e.target}`;
     if (seen.has(key)) continue;

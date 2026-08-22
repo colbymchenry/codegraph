@@ -432,6 +432,19 @@ func real_call_target() -> void:
     // Comment-stripped lines never contribute references.
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'ghost_call')).toBe(false);
   });
+
+  it('should extract has_method() string-dispatch targets as calls', () => {
+    const code = `
+extends Node
+
+func interact(target: Node) -> void:
+  if target.has_method("take_hit"):
+    target.call("take_hit")
+`;
+    const result = extractFromSource('interactor.gd', code);
+    // has_method AND call() both bridge to the same method name.
+    expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'calls' && r.referenceName === 'take_hit').length).toBeGreaterThanOrEqual(2);
+  });
 });
 
 describe('Godot Resource Extraction', () => {

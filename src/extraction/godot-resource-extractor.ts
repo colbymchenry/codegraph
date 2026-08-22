@@ -20,6 +20,8 @@ export class GodotResourceExtractor {
   private uniqueNameToNode = new Map<string, Node>();
   private rootNode: Node | null = null;
   private inAutoloadSection = false;
+  /** Scene node id → attached script res:// path (`script = ExtResource(...)`). */
+  private scriptByNodeId = new Map<string, string>();
 
   constructor(filePath: string, source: string) {
     this.filePath = filePath;
@@ -194,6 +196,9 @@ export class GodotResourceExtractor {
       if (resourcePath) {
         this.addReference(owner.id, resourcePath, 'references', lineNumber, line.indexOf('ExtResource'));
         this.addGodotResourceAliasReference(owner.id, resourcePath, 'references', lineNumber, line.indexOf('ExtResource'));
+        // Remember which script drives this scene node — [connection] wiring
+        // needs it to find handler methods in another file.
+        this.scriptByNodeId.set(owner.id, resourcePath);
       }
       return;
     }
@@ -246,6 +251,10 @@ export class GodotResourceExtractor {
         metadata: {
           signal: attrs.get('signal'),
           method,
+          // The handler usually lives in the script attached to the TO node —
+          // carry the path so the scene-connection synthesizer can bridge the
+          // flow across files without relying on name resolution.
+          scriptResPath: this.scriptByNodeId.get(toNode.id),
         },
       });
     }
