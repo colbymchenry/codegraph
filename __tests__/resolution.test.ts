@@ -204,6 +204,67 @@ describe('Resolution Module', () => {
       expect(trackResult.content[0]?.text ?? '').toContain('TrackPanel');
     });
 
+    it('should resolve autoload singleton receivers to their script methods', async () => {
+      fs.mkdirSync(path.join(tempDir, 'autoload'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'project.godot'),
+        [
+          '[application]',
+          'config/name="Demo"',
+          '',
+          '[autoload]',
+          '',
+          'GameState="*res://autoload/game_state.gd"',
+          '',
+        ].join('\n')
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'autoload/game_state.gd'),
+        [
+          'extends Node',
+          'var score := 0',
+          '',
+          'func reset() -> void:',
+          '\tscore = 0',
+          '',
+        ].join('\n')
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'hud.gd'),
+        [
+          'extends Control',
+          '',
+          'func _ready() -> void:',
+          '\tGameState.reset()',
+          '\tGameState.queue_free()',
+          '',
+        ].join('\n')
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      // The autoload marker component must exist and reference its script file.
+      const autoloadMarker = cg.getNodesByKind('component').find(
+        (n) => n.name === 'GameState' && n.decorators?.includes('autoload')
+      );
+      expect(autoloadMarker).toBeDefined();
+
+      // _ready's calls must reach game_state.gd's reset() — but NOT queue_free()
+      // (an engine method that doesn't exist in the script stays unresolved).
+      const ready = cg
+        .getNodesByKind('method')
+        .find((n) => n.name === '_ready' && n.filePath!.endsWith('hud.gd'));
+      expect(ready).toBeDefined();
+      const targets = cg
+        .getOutgoingEdges(ready!.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.target));
+      const reset = targets.find((t) => t?.name === 'reset');
+      expect(reset).toBeDefined();
+      expect(reset?.filePath).toContain('game_state.gd');
+    });
+
     it('should include Godot scene instances when querying callers by instance node name', async () => {
       fs.writeFileSync(
         path.join(tempDir, 'battle_status.gd'),

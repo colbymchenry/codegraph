@@ -14,6 +14,9 @@ export const godotResolver: FrameworkResolver = {
     const result = tryResolveResPath(ref, context);
     if (result) return result;
 
+    const autoload = tryResolveAutoload(ref, context);
+    if (autoload) return autoload;
+
     const result2 = tryResolveUniqueName(ref, context);
     if (result2) return result2;
 
@@ -77,8 +80,59 @@ function tryResolveUniqueName(ref: UnresolvedRef, context: ResolutionContext): R
   return null;
 }
 
-function tryResolveSignal(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
-  const name = ref.referenceName;
+/**
+ * `[autoload]` singletons are bare globals in GDScript (`GameState.reset()`)
+ * with no import statement to resolve through. Bridge them: the marker
+ * component emitted from project.godot carries the script's res:// path in its
+ * signature — map receiver → that file's gdscript class, and a dotted
+ * `Name.method` reference straight onto the same-name method inside it.
+ */
+function tryResolveAutoload(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const dot = ref.referenceName.indexOf('.');
+  const receiver = dot > 0 ? ref.referenceName.slice(0, dot) : ref.referenceName;
+  const methodName = dot > 0 ? ref.referenceName.slice(dot + 1) : null;
+  if (!receiver || (methodName !== null && !/^[A-Za-z_]\w*$/.test(methodName))) return null;
+
+  for (const node of context.getNodesByName(receiver)) {
+    if (node.kind !== 'component' || node.language !== 'godot_resource') continue;
+    if (!node.decorators?.includes('autoload')) continue;
+
+    const resMatch = node.signature?.match(/res:\/\/[^\s"]+\.gd/);
+    if (!resMatch) continue;
+    const fsPath = path.join(context.getProjectRoot(), resMatch[0].replace(/^res:\/\//, ''));
+    if (!context.fileExists(fsPath)) continue;
+
+    const scriptNodes = context.getNodesInFile(fsPath).filter((n) => n.language === 'gdscript');
+    const scriptClass = scriptNodes.find((n) => n.kind === 'class');
+    if (!scriptClass) continue;
+
+    if (methodName) {
+      const method = scriptNodes.find(
+        (n) => (n.kind === 'method' || n.kind === 'function') && n.name === methodName
+      );
+      // Unknown method on the autoload script: stay silent rather than guess
+      // (silent beats wrong).
+      if (!method || method.id === ref.fromNodeId) continue;
+      return {
+        original: ref,
+        targetNodeId: method.id,
+        confidence: 0.85,
+        resolvedBy: 'framework',
+      };
+    }
+
+    if (scriptClass.id === ref.fromNodeId) continue;
+    return {
+      original: ref,
+      targetNodeId: scriptClass.id,
+      confidence: 0.85,
+      resolvedBy: 'framework',
+    };
+  }
+  return null;
+}
+
+function tryResolveSignal(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {  const name = ref.referenceName;
   if (!name || ref.referenceKind !== 'calls') return null;
 
   const target = context.getNodesByName(name).find(
