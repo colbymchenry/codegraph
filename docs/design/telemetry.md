@@ -20,7 +20,7 @@ Answer, in aggregate and anonymously:
 - Which install targets people pick, local vs global, fresh vs upgrade.
 - Which MCP tools and CLI commands get used, how often, and how often they error.
 - Which languages people index (prioritize extractor/framework work by real usage).
-- Version adoption speed, OS/arch/Node mix, native-vs-wasm SQLite backend share.
+- Version adoption speed, OS/arch/Node mix. (The SQLite backend is always the built-in `node:sqlite` now — there is no native-vs-wasm split left to measure.)
 
 ## Non-goals / never collected
 
@@ -63,16 +63,28 @@ Common envelope on every batch (computed once per process):
 Event types:
 
 - **`install`** — one per installer run. Props: `targets` (e.g. `["claude","cursor"]`),
-  `scope` (`local`/`global`), `kind` (`fresh`/`upgrade`/`reinstall`), `sqlite_backend`
-  (`native`/`wasm`).
+  `scope` (`local`/`global`), `kind` (`fresh`/`upgrade`/`reinstall`).
 - **`index`** — one per full index (`init`/`index`, not per `sync`). Props: `languages`
   (names only, e.g. `["typescript","go"]`), `file_count_bucket` (`<100`, `100-1k`, `1k-10k`,
-  `10k+`), `duration_bucket` (`<10s`, `10-60s`, `1-5m`, `5m+`), `sqlite_backend`.
+  `10k+`), `duration_bucket` (`<10s`, `10-60s`, `1-5m`, `5m+`).
 - **`usage_rollup`** — the workhorse. One event per `(day, kind, name)` per machine,
   aggregated locally. Props: `kind` (`mcp_tool`/`cli_command`), `name`
   (e.g. `codegraph_explore`, `affected`), `count`, `error_count`, and for MCP:
   `client_name`/`client_version` from the `initialize` handshake (`src/mcp/session.ts`
   `case 'initialize'` — plumbing to add; currently unread).
+  The prompt hook additionally rolls up its gate DECISION as `cli_command`
+  counters named `prompt-hook-gate-<outcome>`, outcome ∈ `high-keyword` /
+  `high-token` / `medium-segment` / `nudge-projects` / `noop-shape` /
+  `noop-no-index` / `noop-unverified` / `noop-explore-keyword` /
+  `noop-explore-token` / `noop-vocab-empty` — decision names only, never
+  prompt content. This is the gate's measured recall/precision funnel: a
+  rising `noop-*` share against the `high`/`medium` tiers is the signal that
+  the gate (keyword table or segment matching) is missing real questions.
+  A `high-*` outcome means context was actually injected — a gate decision
+  whose `codegraph_explore` errored or returned nothing records
+  `noop-explore-<trigger>` instead (#1143), and a MEDIUM-eligible prompt
+  hitting a not-yet-backfilled segment vocabulary records `noop-vocab-empty`
+  rather than polluting `noop-unverified` (#1142).
 - **`uninstall`** — one per `uninstall`/`uninit` run (churn signal). Props: `targets`.
 
 Volume math: rollups mean monthly events ≈ active machines × active days × distinct

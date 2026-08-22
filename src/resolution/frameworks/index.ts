@@ -19,6 +19,7 @@ import { railsResolver } from './ruby';
 import { springResolver } from './java';
 import { playResolver } from './play';
 import { goResolver } from './go';
+import { goframeResolver } from './goframe';
 import { rustResolver } from './rust';
 import { aspnetResolver } from './csharp';
 import { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
@@ -27,6 +28,8 @@ import { reactNativeBridgeResolver } from './react-native';
 import { expoModulesResolver } from './expo-modules';
 import { fabricViewResolver } from './fabric';
 import { godotResolver } from './godot';
+import { cicsResolver } from './cics';
+import { terraformResolver } from './terraform';
 
 /**
  * All registered framework resolvers
@@ -53,6 +56,7 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   playResolver,
   // Go
   goResolver,
+  goframeResolver,
   // Rust
   rustResolver,
   // C#
@@ -71,6 +75,10 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   fabricViewResolver,
   // Godot — res:// path resolution, %UniqueName, class alias matching
   godotResolver,
+  // CICS pseudo-conversational TRANSID hops (COBOL)
+  cicsResolver,
+  // Terraform / OpenTofu — disambiguate var/local/module/resource refs to same-dir module
+  terraformResolver,
 ];
 
 /**
@@ -139,6 +147,7 @@ export { railsResolver } from './ruby';
 export { springResolver } from './java';
 export { playResolver } from './play';
 export { goResolver } from './go';
+export { goframeResolver } from './goframe';
 export { rustResolver } from './rust';
 export { aspnetResolver } from './csharp';
 export { swiftUIResolver, uikitResolver, vaporResolver } from './swift';

@@ -25,6 +25,6 @@ Static parsing misses computed and indirect calls, so flows can break at dynamic
 - `EventEmitter` channels
 - React re-render (`setState` → `render`)
 - JSX child (`render` → child component)
-- Django ORM descriptors
+- Interface → implementation dispatch
 
 Every synthesized edge is marked `provenance: 'heuristic'` with the site that wired it, and is shown inline wherever a path crosses it.

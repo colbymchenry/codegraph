@@ -121,6 +121,18 @@ class ClaudeCodeTarget implements AgentTarget {
     const hookCleanup = cleanupLegacyHooks(loc);
     if (hookCleanup.action === 'removed') files.push(hookCleanup);
 
+    // 2c. Front-load prompt hook (Claude UserPromptSubmit). Opt-in via the
+    // installer prompt (default-yes): `promptHook === true` writes it;
+    // `=== false` strips any a prior install wrote so opting out round-trips
+    // (and an upgrade re-run honors the new choice); `undefined` leaves it
+    // untouched for callers that don't manage it.
+    if (opts.promptHook === true) {
+      files.push(writePromptHookEntry(loc));
+    } else if (opts.promptHook === false) {
+      const removed = removePromptHookEntry(loc);
+      if (removed.action === 'removed') files.push(removed);
+    }
+
     // 3. CLAUDE.md instructions — the short marker-fenced CodeGraph
     // block (#704). The MCP initialize instructions reach only the main
     // agent; CLAUDE.md is what Task-tool subagents (and non-MCP
@@ -186,6 +198,10 @@ class ClaudeCodeTarget implements AgentTarget {
     // reverses a legacy install.
     const hookCleanup = cleanupLegacyHooks(loc);
     if (hookCleanup.action === 'removed') files.push(hookCleanup);
+
+    // 2c. Remove the front-load prompt hook this installer may have written.
+    const promptHookCleanup = removePromptHookEntry(loc);
+    if (promptHookCleanup.action === 'removed') files.push(promptHookCleanup);
 
     // 3. Instructions — strip the legacy CodeGraph block if present.
     files.push(removeInstructionsEntry(loc));
@@ -279,6 +295,16 @@ function isLegacyCodegraphHookCommand(command: unknown): boolean {
 }
 
 /**
+ * The front-load prompt-hook command the installer writes into Claude's
+ * `UserPromptSubmit` (see writePromptHookEntry). Matched by substring so an
+ * `npx @colbymchenry/codegraph prompt-hook` form is recognized too.
+ */
+const PROMPT_HOOK_COMMAND = 'codegraph prompt-hook';
+function isPromptHookCommand(command: unknown): boolean {
+  return typeof command === 'string' && command.includes(PROMPT_HOOK_COMMAND);
+}
+
+/**
  * Remove stale codegraph auto-sync hooks from Claude `settings.json`.
  *
  * Surgical at the individual-command level: only entries matching
@@ -293,7 +319,10 @@ function isLegacyCodegraphHookCommand(command: unknown): boolean {
  * Exported so it can be unit-tested directly and reused by both
  * `install` (an upgrade self-heals) and `uninstall`.
  */
-export function cleanupLegacyHooks(loc: Location): WriteResult['files'][number] {
+function removeHookCommandsMatching(
+  loc: Location,
+  match: (command: unknown) => boolean,
+): WriteResult['files'][number] {
   const file = settingsJsonPath(loc);
   if (!fs.existsSync(file)) return { path: file, action: 'not-found' };
 
@@ -303,7 +332,7 @@ export function cleanupLegacyHooks(loc: Location): WriteResult['files'][number] 
     return { path: file, action: 'unchanged' };
   }
 
-  // Pass 1: drop the legacy command(s) from inside every matcher group.
+  // Pass 1: drop matching command(s) from inside every matcher group.
   let removedAny = false;
   for (const event of Object.keys(hooks)) {
     const groups = hooks[event];
@@ -311,18 +340,17 @@ export function cleanupLegacyHooks(loc: Location): WriteResult['files'][number] 
     for (const group of groups) {
       if (!group || !Array.isArray(group.hooks)) continue;
       const before = group.hooks.length;
-      group.hooks = group.hooks.filter(
-        (h: any) => !isLegacyCodegraphHookCommand(h?.command),
-      );
+      group.hooks = group.hooks.filter((h: any) => !match(h?.command));
       if (group.hooks.length !== before) removedAny = true;
     }
   }
 
   if (!removedAny) return { path: file, action: 'unchanged' };
 
-  // Pass 2: prune empty matcher groups, then events with no groups
-  // left, then an empty top-level `hooks`. Guarded by `removedAny` so
-  // we never restructure a settings.json that had no codegraph hooks.
+  // Pass 2: prune empty matcher groups, then events with no groups left,
+  // then an empty top-level `hooks`. Guarded by `removedAny` so we never
+  // restructure a settings.json that had no matching hooks. Sibling hooks
+  // (a different command in the group, or a different event) survive.
   for (const event of Object.keys(hooks)) {
     const groups = hooks[event];
     if (!Array.isArray(groups)) continue;
@@ -335,6 +363,24 @@ export function cleanupLegacyHooks(loc: Location): WriteResult['files'][number] 
 
   writeJsonFile(file, settings);
   return { path: file, action: 'removed' };
+}
+
+/**
+ * Remove stale codegraph auto-sync hooks (`mark-dirty` / `sync-if-dirty`) that a
+ * pre-0.8 install wrote. Exported for direct unit-testing; reused by both
+ * `install` (an upgrade self-heals) and `uninstall`.
+ */
+export function cleanupLegacyHooks(loc: Location): WriteResult['files'][number] {
+  return removeHookCommandsMatching(loc, isLegacyCodegraphHookCommand);
+}
+
+/**
+ * Remove the front-load `UserPromptSubmit` hook this installer writes (see
+ * writePromptHookEntry). Used by `uninstall`, and by `install` when the user
+ * opts out, so the choice round-trips.
+ */
+export function removePromptHookEntry(loc: Location): WriteResult['files'][number] {
+  return removeHookCommandsMatching(loc, isPromptHookCommand);
 }
 
 export function writePermissionsEntry(loc: Location): WriteResult['files'][number] {
@@ -355,6 +401,37 @@ export function writePermissionsEntry(loc: Location): WriteResult['files'][numbe
   if (jsonDeepEqual(before, settings.permissions.allow) && !created) {
     return { path: file, action: 'unchanged' };
   }
+  writeJsonFile(file, settings);
+  return { path: file, action: created ? 'created' : 'updated' };
+}
+
+/**
+ * Write the front-load `UserPromptSubmit` hook into Claude `settings.json` —
+ * a `command` hook that runs `codegraph prompt-hook`, which injects
+ * codegraph_explore context for structural prompts so the agent reliably uses
+ * the graph. Idempotent: if our command is already wired under UserPromptSubmit
+ * the file is left byte-for-byte untouched and reported `unchanged`. Sibling
+ * hooks (the user's own, or other events) are preserved. Opt-in — the installer
+ * only calls this when the user accepts the prompt (default-yes).
+ */
+export function writePromptHookEntry(loc: Location): WriteResult['files'][number] {
+  const file = settingsJsonPath(loc);
+  const created = !fs.existsSync(file);
+  const settings = readJsonFile(file);
+
+  if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) {
+    settings.hooks = {};
+  }
+  if (!Array.isArray(settings.hooks.UserPromptSubmit)) settings.hooks.UserPromptSubmit = [];
+
+  const already = settings.hooks.UserPromptSubmit.some(
+    (g: any) => g && Array.isArray(g.hooks) && g.hooks.some((h: any) => isPromptHookCommand(h?.command)),
+  );
+  if (already) return { path: file, action: 'unchanged' };
+
+  settings.hooks.UserPromptSubmit.push({
+    hooks: [{ type: 'command', command: PROMPT_HOOK_COMMAND }],
+  });
   writeJsonFile(file, settings);
   return { path: file, action: created ? 'created' : 'updated' };
 }

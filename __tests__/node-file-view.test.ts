@@ -99,7 +99,7 @@ describe('codegraph_node file-view (Read replacement)', () => {
 
   it('symbolsOnly returns the structural map, not the source', async () => {
     const out = await text({ file: 'a.ts', symbolsOnly: true });
-    expect(out).toContain('### Symbols');
+    expect(out).toContain('**Symbols');
     expect(out).toContain('helper');
     expect(out).toContain('Widget');
     expect(out).not.toContain('return x + 1'); // bodies are NOT included in the map

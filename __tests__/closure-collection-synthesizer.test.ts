@@ -106,7 +106,9 @@ describe('closure-collection synthesizer', () => {
     );
     expect(validatorsEdge).toBeTruthy();
     expect(validatorsEdge.source_name).toBe('didCompleteTask');
-    expect(validatorsEdge.registeredAt).toMatch(/DataRequest\.swift:\d+/);
+    // Exact wiring-site line, not just shape: pins the binary-search line
+    // resolver (#1235) to the same answer as the old per-match slice+split.
+    expect(validatorsEdge.registeredAt).toBe('DataRequest.swift:4');
 
     // The handlers flow: runHandlers → onEvent, via the direct `prop.append`
     // form — proves both registrar shapes are covered.
@@ -120,5 +122,38 @@ describe('closure-collection synthesizer', () => {
     // so `names` is not a closure collection — no edge, and addName is never a target.
     expect(rows.some((r: any) => r.field === 'names')).toBe(false);
     expect(rows.some((r: any) => r.target_name === 'addName')).toBe(false);
+  });
+
+  it('is a no-op on non-Swift/Kotlin code even when the text patterns occur (#1235)', async () => {
+    // JS that contains every textual trigger the scanner looks for —
+    // `.forEach`, `.push(`, even a `{ $0(` lookalike inside a string — but
+    // `{ $0( ` / `{ it( ` element-invocation is Swift/Kotlin trailing-closure
+    // syntax, so the pass must skip the language entirely (this scan running
+    // ungated over `.push(`-heavy JS/PHP was the #1235 25-minute index).
+    fs.writeFileSync(
+      path.join(dir, 'queue.js'),
+      `class Queue {
+  constructor() { this.tasks = []; }
+  register(fn) { this.tasks.push(fn); }
+  drain() { this.tasks.forEach(function (t) { t(); }); }
+  weird() { const s = "tasks.forEach { $0( } tasks.push("; return s; }
+}
+module.exports = Queue;
+`
+    );
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+
+    const db = (cg as any).db.db;
+    const count = db
+      .prepare(
+        `SELECT count(*) c FROM edges
+         WHERE json_extract(metadata,'$.synthesizedBy') = 'closure-collection'`
+      )
+      .get();
+    cg.close?.();
+
+    expect(count.c).toBe(0);
   });
 });

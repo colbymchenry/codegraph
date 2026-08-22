@@ -22,14 +22,14 @@ import {
   resolveTargetFlag,
 } from './targets/registry';
 import type { AgentTarget, Location, TargetId } from './targets/types';
-import { getGlyphs } from '../ui/glyphs';
 // Import the lightweight submodules directly (not the ../sync barrel, which
 // re-exports FileWatcher and would transitively pull in ../extraction — the
 // installer must stay importable even when native modules can't load).
 import { watchDisabledReason } from '../sync/watch-policy';
 import { isGitRepo, isSyncHookInstalled, installGitSyncHook } from '../sync/git-hooks';
-import { getCodeGraphDir, codeGraphDirName, unsafeIndexRootReason } from '../directory';
-import { getTelemetry, recordIndexEvent, TELEMETRY_DOCS } from '../telemetry';
+import { getCodeGraphDir, codeGraphDirName } from '../directory';
+import { getTelemetry, TELEMETRY_DOCS } from '../telemetry';
+import { maybeOfferBetaSignup } from './beta-signup';
 
 // Backwards-compat: keep these named exports — downstream code may
 // import them. The shim in `config-writer.ts` continues to re-export
@@ -48,9 +48,6 @@ export type { InstallLocation } from './config-writer';
 const importESM = new Function('specifier', 'return import(specifier)') as
   (specifier: string) => Promise<typeof import('@clack/prompts')>;
 
-function formatNumber(n: number): string {
-  return n.toLocaleString();
-}
 
 function getVersion(): string {
   try {
@@ -119,7 +116,9 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
       const s = clack.spinner();
       s.start('Installing codegraph CLI...');
       try {
-        execSync('npm install -g @colbymchenry/codegraph', { stdio: 'pipe', windowsHide: true });
+        // Generous bound (slow networks / cold npm cache) — but bounded, so a
+        // wedged npm can't hang the interactive installer forever (#1139).
+        execSync('npm install -g @colbymchenry/codegraph', { stdio: 'pipe', windowsHide: true, timeout: 120_000 });
         s.stop('Installed codegraph CLI on PATH');
       } catch {
         s.stop('Could not install (permission denied)');
@@ -205,6 +204,31 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     }
   }
 
+  // Step 4¾: front-load prompt hook (Claude Code only). A UserPromptSubmit hook
+  // that runs `codegraph prompt-hook` — it injects codegraph_explore context on
+  // structural ("how / where / trace / impact") prompts so the agent reliably
+  // reaches for the graph instead of grepping. Opt-in, default-yes. Only Claude
+  // Code has UserPromptSubmit, so it's offered only when Claude is a target;
+  // other targets ignore the option. `undefined` (no Claude / not asked) leaves
+  // any existing hook untouched.
+  let promptHook: boolean | undefined;
+  if (targets.some((t) => t.id === 'claude')) {
+    if (useDefaults) {
+      promptHook = true; // --yes → on
+    } else {
+      const ans = await clack.confirm({
+        message:
+          'Front-load CodeGraph on “how / where / trace” prompts? Auto-injects structural context so answers need fewer steps (adds a moment to those prompts; Claude Code only).',
+        initialValue: true,
+      });
+      if (clack.isCancel(ans)) {
+        clack.cancel('Installation cancelled.');
+        process.exit(0);
+      }
+      promptHook = ans; // false → opt out; install() strips any prior hook
+    }
+  }
+
   // Step 5: per-target install loop.
   const installedIds: TargetId[] = [];
   let sawCreated = false;
@@ -216,7 +240,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
       );
       continue;
     }
-    const result = target.install(location, { autoAllow });
+    const result = target.install(location, { autoAllow, promptHook });
     installedIds.push(target.id);
     for (const file of result.files) {
       if (file.action === 'created') sawCreated = true;
@@ -243,14 +267,28 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
     });
   }
 
-  // Step 6: for local install, initialize the project.
-  if (location === 'local') {
-    await initializeLocalProject(clack, useDefaults);
+  // Step 5½: CodeGraph Pro beta opt-in — the same waitlist as the
+  // getcodegraph.com homepage form, offered once per machine at the end of a
+  // successful install (and after `codegraph upgrade` — the shared gate in
+  // maybeOfferBetaSignup means whichever asks first is the ONLY ask ever).
+  // Strictly opt-in (user answers yes AND types an email), never shown under
+  // --yes, and any yes/no answer is stored so nothing re-asks. Cancel or a
+  // failed submit stores nothing, so a later install/upgrade may offer again.
+  if (!useDefaults && installedIds.length > 0) {
+    await maybeOfferBetaSignup({ source: 'cli-install' });
   }
 
-  if (location === 'global') {
-    clack.note('cd your-project\ncodegraph init -i', 'Quick start');
-  }
+  // Step 6: install wires up agents only — it deliberately does NOT index.
+  // Building the per-project graph is the user's explicit `codegraph init`
+  // (or `index`), so they choose what gets indexed and when, and we never
+  // index a surprise directory (e.g. a shell sitting in $HOME). Same next step
+  // regardless of global/local scope.
+  clack.note(
+    location === 'local'
+      ? 'codegraph init        # build this project’s graph (one time; auto-syncs after)'
+      : 'cd <your-project>\ncodegraph init        # build a project’s graph (one time; auto-syncs after)',
+    'Next: index a project',
+  );
 
   // Deliver buffered telemetry while we're already in a long interactive
   // command — bounded (~1.5s worst case), invisible after a multi-second install.
@@ -274,6 +312,13 @@ export interface RunUninstallerOptions {
   location?: Location;
   /** Non-interactive: location=global, target=all, no prompts. */
   yes?: boolean;
+  /** Remove agent configs only — leave the CLI binary installed. */
+  keepCli?: boolean;
+  /**
+   * `__filename` of the CLI entry (dist/bin/codegraph.js) — install-method
+   * detection is keyed off the running binary's real location.
+   */
+  cliFilename?: string;
 }
 
 export type UninstallStatus = 'removed' | 'not-configured' | 'unsupported';
@@ -329,6 +374,66 @@ export function uninstallTargets(
       status: removedPaths.length > 0 ? ('removed' as const) : ('not-configured' as const),
       removedPaths,
       notes: result.notes ?? [],
+    };
+  });
+}
+
+export type RefreshStatus = 'refreshed' | 'unchanged' | 'not-configured' | 'unsupported';
+
+/**
+ * Per-target outcome of a refresh sweep. `refreshed` means at least one
+ * filesystem entry was created, updated, or removed; `unchanged` means the target was
+ * already current (every write reported byte-identical); the other two
+ * mirror `UninstallStatus`.
+ */
+export interface RefreshReport {
+  id: TargetId;
+  displayName: string;
+  location: Location;
+  status: RefreshStatus;
+  /** Absolute paths created, updated, or removed by the refresh. */
+  changedPaths: string[];
+}
+
+/**
+ * Pure refresh sweep — re-runs `install()` for every target that is
+ * ALREADY configured at `location`, so the surfaces a previous version
+ * wrote (the marker-fenced instructions section, the MCP server entry,
+ * the legacy-hook cleanups) match the binary that will serve them.
+ * Without this, those files keep the wording — and the tool names — of
+ * whatever version first wrote them, no matter how many upgrades later.
+ *
+ * Strictly a refresh, never a first install:
+ *   - targets that aren't `alreadyConfigured` are skipped untouched;
+ *   - permissions are not written (`autoAllow: false`) and the prompt
+ *     hook is left as-is (`promptHook: undefined`), so choices the user
+ *     made at install time — or by hand since — are preserved.
+ *
+ * Every write underneath is the targets' own idempotent upsert, so a
+ * re-run on an already-current machine reports `unchanged` everywhere.
+ * Exposed (and unit-tested) separately from the CLI wiring, same as
+ * `uninstallTargets`.
+ */
+export function refreshTargets(
+  targets: readonly AgentTarget[],
+  location: Location,
+): RefreshReport[] {
+  return targets.map((target) => {
+    const base = { id: target.id, displayName: target.displayName, location };
+    if (!target.supportsLocation(location)) {
+      return { ...base, status: 'unsupported' as const, changedPaths: [] };
+    }
+    if (!target.detect(location).alreadyConfigured) {
+      return { ...base, status: 'not-configured' as const, changedPaths: [] };
+    }
+    const result = target.install(location, { autoAllow: false, promptHook: undefined });
+    const changedPaths = result.files
+      .filter((f) => f.action === 'created' || f.action === 'updated' || f.action === 'removed')
+      .map((f) => f.path);
+    return {
+      ...base,
+      status: changedPaths.length > 0 ? ('refreshed' as const) : ('unchanged' as const),
+      changedPaths,
     };
   });
 }
@@ -411,6 +516,55 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
     clack.log.info(`The ${codeGraphDirName()}/ index for this project is still here. Run \`codegraph uninit\` to delete it.`);
   }
 
+  // Step 4b: the CLI binary itself (global uninstall only — a project-scoped
+  // uninstall must not touch the machine-wide install). Before this step,
+  // `codegraph uninstall` removed agent configs but left every installed
+  // binary — bundle AND npm global — so `codegraph` still resolved afterward
+  // (the #1071 shadow, uninstall edition). Plan every install present on the
+  // machine, confirm, then remove them all. Skippable with --keep-cli.
+  let cliRemoved = false;
+  if (location === 'global' && opts.keepCli !== true && opts.cliFilename) {
+    const { planBinaryRemoval, executeBinaryRemoval, defaultProbes } =
+      await import('../upgrade/remove-binary');
+    const plan = planBinaryRemoval(defaultProbes(opts.cliFilename));
+
+    if (plan.sourceRoot) {
+      clack.log.info(`Running from a source checkout (${tildify(plan.sourceRoot)}) — leaving it untouched.`);
+    }
+    if (plan.summary.length > 0) {
+      let removeBinaries = useDefaults;
+      if (!useDefaults) {
+        const sel = await clack.confirm({
+          message: `Also remove the CodeGraph CLI from this machine?\n${plan.summary.map((s) => `     - ${s}`).join('\n')}`,
+          initialValue: true,
+        });
+        if (clack.isCancel(sel)) {
+          clack.cancel('Uninstall cancelled.');
+          process.exit(0);
+        }
+        removeBinaries = sel;
+      }
+      if (removeBinaries) {
+        const result = executeBinaryRemoval(plan);
+        for (const p of result.removed) clack.log.success(`Removed ${tildify(p)}`);
+        if (result.npm === 'removed') {
+          clack.log.success('Removed the npm global package (npm uninstall -g).');
+        } else if (result.npm === 'failed') {
+          clack.log.warn('npm uninstall failed — run `npm uninstall -g @colbymchenry/codegraph` yourself (EACCES usually means it needs sudo).');
+        }
+        for (const p of result.leftovers) {
+          clack.log.warn(`Could not remove ${tildify(p)} — delete it manually${process.platform === 'win32' ? ' after this window closes' : ''}.`);
+        }
+        cliRemoved = result.removed.length > 0 || result.npm === 'removed';
+        if (cliRemoved && process.platform === 'win32') {
+          clack.log.info('If your PATH still lists a codegraph bin directory, remove that entry from your user PATH.');
+        }
+      } else {
+        clack.log.info('Kept the CLI. Remove it later with `codegraph uninstall` or `npm uninstall -g @colbymchenry/codegraph`.');
+      }
+    }
+  }
+
   // Telemetry churn signal (agent IDs only) — flush now, since after an
   // uninstall there is usually no "next run" to deliver it.
   if (removed.length > 0) {
@@ -419,12 +573,15 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
   }
 
   // Step 5: summary.
+  const cliNote = cliRemoved ? ' The CLI is removed too — this was its last run.' : '';
   if (removed.length > 0) {
     const names = removed.map((r) => r.displayName).join(', ');
     clack.outro(
       `Removed CodeGraph from ${removed.length} agent${removed.length > 1 ? 's' : ''}: ${names}. ` +
-      `Restart ${removed.length > 1 ? 'them' : 'it'} to apply.`,
+      `Restart ${removed.length > 1 ? 'them' : 'it'} to apply.` + cliNote,
     );
+  } else if (cliRemoved) {
+    clack.outro(`No ${location} agent had CodeGraph configured.` + cliNote);
   } else {
     clack.outro(`CodeGraph was not configured in any ${location} agent — nothing to remove.`);
   }
@@ -490,73 +647,6 @@ async function resolveTargets(
     .filter((t): t is AgentTarget => t !== undefined);
 }
 
-/**
- * Initialize CodeGraph in the current project (for local installs), then
- * offer the watch fallback when the live watcher won't run here (see
- * offerWatchFallback). Agent-agnostic by nature.
- */
-async function initializeLocalProject(
-  clack: typeof import('@clack/prompts'),
-  useDefaults = false,
-): Promise<void> {
-  const projectPath = process.cwd();
-
-  // Never auto-index the home directory or a filesystem root. Running the
-  // installer from `$HOME` would otherwise index the entire home tree — a
-  // multi-GB index, constant watcher churn, and (pre-1.0 on macOS) fd
-  // exhaustion that crashed the machine (#845). The install itself still
-  // completes; we just skip the auto-index and point them at a real project.
-  const unsafe = unsafeIndexRootReason(projectPath);
-  if (unsafe) {
-    clack.log.warn(`Skipping automatic indexing — ${projectPath} looks like ${unsafe}.`);
-    clack.log.info('Indexing it would pull in caches, other projects, and your whole tree. Run "codegraph init" inside a specific project instead.');
-    return;
-  }
-
-  let CodeGraph: typeof import('../index').default;
-  try {
-    CodeGraph = (await import('../index')).default;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    clack.log.error(`Could not load native modules: ${msg}`);
-    clack.log.info('Skipping project initialization. Run "codegraph init -i" later.');
-    return;
-  }
-
-  // Check if already initialized
-  if (CodeGraph.isInitialized(projectPath)) {
-    clack.log.info('CodeGraph already initialized in this project');
-    await offerWatchFallback(clack, projectPath, { yes: useDefaults });
-    return;
-  }
-
-  // Initialize
-  const cg = await CodeGraph.init(projectPath);
-  clack.log.success('Created .codegraph/ directory');
-
-  // Index the project with shimmer progress (worker thread for smooth animation)
-  const { createShimmerProgress } = await import('../ui/shimmer-progress');
-  process.stdout.write(`\x1b[2m${getGlyphs().rail}\x1b[0m\n`);
-  const progress = createShimmerProgress();
-
-  const result = await cg.indexAll({
-    onProgress: progress.onProgress,
-  });
-
-  await progress.stop();
-
-  if (result.filesErrored > 0) {
-    clack.log.success(`Indexed ${formatNumber(result.filesIndexed)} files (${formatNumber(result.filesErrored)} failed, ${formatNumber(result.nodesCreated)} symbols)`);
-  } else {
-    clack.log.success(`Indexed ${formatNumber(result.filesIndexed)} files (${formatNumber(result.nodesCreated)} symbols)`);
-  }
-
-  recordIndexEvent(cg, result); // buffered; the installer flushes at the end
-
-  cg.close();
-
-  await offerWatchFallback(clack, projectPath, { yes: useDefaults });
-}
 
 /**
  * When the live file watcher will be disabled for this project (e.g. WSL2

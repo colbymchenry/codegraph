@@ -56,4 +56,36 @@ if (($userPath -split ';') -notcontains $binDir) {
 }
 
 Write-Host "Installed to $dest"
+
+# 5. Warn if a different codegraph earlier on PATH will shadow this install.
+# Most often a stale `npm i -g @colbymchenry/codegraph`, whose launcher keeps
+# running its own version-pinned bundle — so `codegraph --version` disagrees
+# with what we just installed (issue #1071). Check both the persisted PATH a
+# fresh shell sees (Machine + User) and this session's PATH (catches dirs a
+# shell profile injects, e.g. conda / npm).
+$expected = Join-Path $binDir 'codegraph.cmd'
+function Find-FirstCodegraph([string]$pathStr) {
+  foreach ($dir in ($pathStr -split ';')) {
+    if (-not $dir) { continue }
+    foreach ($leaf in @('codegraph.cmd', 'codegraph.exe', 'codegraph.bat', 'codegraph.ps1')) {
+      $cand = Join-Path $dir $leaf
+      if (Test-Path -LiteralPath $cand) { return $cand }
+    }
+  }
+  return $null
+}
+$machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+$freshPath = ((@($machinePath, [Environment]::GetEnvironmentVariable('Path', 'User')) | Where-Object { $_ }) -join ';')
+$shadow = $null
+foreach ($winner in @((Find-FirstCodegraph $env:Path), (Find-FirstCodegraph $freshPath))) {
+  if ($winner -and ($winner -ne $expected)) { $shadow = $winner; break }
+}
+if ($shadow) {
+  Write-Warning "Another codegraph is earlier on your PATH and will run instead of this install:"
+  Write-Warning "  $shadow"
+  Write-Warning "  (this install: $expected)"
+  Write-Warning "If 'codegraph --version' shows an unexpected version, remove the other copy"
+  Write-Warning "(e.g. 'npm rm -g @colbymchenry/codegraph') or put '$binDir' first on your PATH."
+}
+
 Write-Host "Run: codegraph --help"

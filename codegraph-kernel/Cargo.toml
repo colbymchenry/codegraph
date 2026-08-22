@@ -1,0 +1,72 @@
+[package]
+name = "codegraph-kernel"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Native extraction kernel for CodeGraph — tree-sitter parse+extract with one JS boundary crossing per file"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "3", default-features = false, features = ["napi8"] }
+napi-derive = "3"
+tree-sitter = "0.25"
+sha2 = "0.10"
+regex = "1"
+
+# Grammars — MUST stay revision-matched with the wasm grammars the fallback
+# path loads (tree-sitter-wasms npm package / src/extraction/wasm/). The
+# kernel-grammar-parity test asserts node-kind-table equality at test time;
+# bump these together with the wasm side or that gate fails.
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-java = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-go = "0.23"
+# Pinned exact: the vendored wasm (src/extraction/wasm/) was built from these
+# tags' checked-in parser.c, sha-matched against these registry tarballs
+# (R7a prep, #1345). A patch bump here without re-vendoring breaks the match.
+tree-sitter-c = "=0.24.2"
+tree-sitter-cpp = "=0.23.4"
+tree-sitter-rust = "=0.24.2"
+# csharp: the vendored wasm (#717) predates the kernel and was verified
+# table-identical to this crate's tarball (ABI 15, STATE_COUNT 8053, node-kind
+# and field tables — csharp checklist header). Bump crate + wasm together.
+tree-sitter-c-sharp = "=0.23.5"
+# ruby: content bump, ABI stays 14 (the v0.23.1 tag predates the ABI-15
+# generator) — kernel-grammar-parity asserts same-revision, not same-ABI.
+tree-sitter-ruby = "=0.23.1"
+# php: the walker calls LANGUAGE_PHP (the full HTML-interleaving variant the
+# wasm ships) — NEVER LANGUAGE_PHP_ONLY, which errors on leading HTML.
+tree-sitter-php = "=0.24.2"
+# swift: the vendored wasm is built from THIS crate's tarball src/ (the tag's
+# checked-in parser.c is an older ABI-14 generation that can never sha-match;
+# grammar.json rules are JSON-equal — swift checklist header). parser.c is
+# ~20MB generated — expect slow compiles.
+tree-sitter-swift = "=0.7.3"
+# r: the vendored wasm IS r-lib v1.2.0 and this crate's tarball ships both
+# generated artifacts sha-identical to the tag (parser.c 6221657347…,
+# scanner.c 1209d11076… — r checklist §Grammar prep). ABI 14 (the tag
+# predates the ABI-15 generator) — parity asserts same-revision, not
+# same-ABI (ruby precedent). Bump crate + wasm together.
+tree-sitter-r = "=1.2.0"
+# luau: the vendored wasm IS tree-sitter-grammars v1.2.0 and this crate's
+# tarball ships parser.c/scanner.c sha-identical to the tag (8f25bc17… /
+# a157bb52… — lua-luau checklist §Grammar prep). ABI 14. Lua itself is
+# vendored C (build.rs) — its v0.4.1 revision is not on crates.io.
+tree-sitter-luau = "=1.2.0"
+
+# tree-sitter-language: the version-agnostic LanguageFn shim for the vendored
+# kotlin grammar C (see build.rs — no kotlin crate dep is possible).
+tree-sitter-language = "0.1"
+
+[build-dependencies]
+napi-build = "2"
+cc = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
