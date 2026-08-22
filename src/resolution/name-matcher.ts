@@ -1731,6 +1731,19 @@ export function matchMethodCall(
     return matchGoFieldChainCall(objectOrClass!, methodName!, ref, context);
   }
 
+  // Rust field receiver `self.field.method`: the enclosing type comes from the
+  // caller's own qualified name, the field's declared type from that type's
+  // declaration lines, and the method is VALIDATED on it by resolveMethodOnType.
+  // EXCLUSIVE, for the same reason as Go's chain above — when the field's type
+  // cannot be established or is external (`items: Vec<usize>`, `cmd: Command` —
+  // no project node), the ref stays unresolved rather than falling through to
+  // the bare-name strategies, which is what bound `self.items.len()` to an
+  // unrelated same-named method. These receivers were never emitted before this
+  // change, so there is no prior recall on the fallback path to preserve.
+  if (ref.language === 'rust' && dotMatch && /^self\.\w+$/.test(objectOrClass!)) {
+    return matchRustSelfFieldCall(objectOrClass!, methodName!, ref, context);
+  }
+
   // Java/Kotlin: receiver may be a field whose name doesn't match the type by
   // Java naming convention (`userbo` → class `UserBO`, abbreviated). Look up
   // the field in the enclosing class to get its declared type, then resolve
@@ -1987,6 +2000,176 @@ function matchGoFieldChainCall(
       if (!fieldType || !/^[A-Za-z_]/.test(fieldType) || GO_BUILTIN_FIELD_TYPES.has(fieldType)) continue;
       const resolved = resolveMethodOnType(fieldType, methodName, ref, context, 0.85, 'instance-method');
       if (resolved) return resolved;
+    }
+  }
+  return null;
+}
+
+/**
+ * Smart pointers whose `Deref` target receives the method call, so the type
+ * ARGUMENT is the receiver rather than the pointer: `inner: Box<Inner>` answers
+ * `self.inner.run()` with `Inner::run`. Deliberately just these three. The other
+ * common single-argument generics do NOT forward — `Option<T>::as_ref`,
+ * `Mutex<T>::lock` and `Vec<T>::len` are the container's own methods, and
+ * following their argument is exactly the fabrication this matcher exists to
+ * prevent (`self.err.as_ref()` on an `Option<Error>` bound to an unrelated
+ * `as_ref` before this change).
+ */
+const RUST_DEREF_WRAPPERS = new Set(['Box', 'Rc', 'Arc']);
+
+/**
+ * The type a Rust field declaration hands the method call, or null when it
+ * names none we can follow.
+ *
+ * The outer constructor is normally the receiver: a field declared
+ * `core: Core<'s, M, S>` answers `self.core.roll()` with `Core::roll`, and its
+ * type arguments are parameters of that type, not a wrapper around it. The
+ * exception is a `Deref` smart pointer, whose argument is unwrapped instead
+ * (one level at a time, so `Arc<Mutex<Inner>>` lands on `Mutex` and stops —
+ * `Mutex` does not forward).
+ *
+ * A field whose receiver type is not a project type (`items: Vec<usize>`,
+ * `cmd: Command`) yields a name with no node in the graph, so resolveMethodOnType
+ * finds no method and the ref stays unresolved — the intended outcome. Shapes
+ * with no single constructor (tuples, slices, function pointers, `impl Trait`)
+ * are declined outright; `dyn Trait` resolves to the trait, which is where the
+ * graph records the method.
+ */
+function rustFieldTypeName(decl: string): string | null {
+  // The capture runs to end of line: keep only this field's own type, cutting
+  // at the first comma that is not inside the type's own brackets, then drop a
+  // trailing `}` from a single-line struct body.
+  let t = (splitRustTypeArgs(decl)[0] ?? '').replace(/\}.*$/, '').trim();
+  t = t.replace(/^pub(\s*\([^)]*\))?\s+/, ''); // `pub` / `pub(crate)` on the field
+  for (let depth = 0; depth < 8; depth++) {
+    t = t.trim().replace(/^&(\s*'\w+)?\s*(mut\s+)?/, '').trim(); // `&`, `&'a `, `&mut `
+    t = t.replace(/^dyn\s+/, '').trim(); // `dyn Trait` — the trait owns the method
+    const generic = t.match(/^([A-Za-z_][\w:]*)\s*<(.+)>$/s);
+    if (!generic) break;
+    const ctor = generic[1]!.split('::').pop()!;
+    if (!RUST_DEREF_WRAPPERS.has(ctor)) {
+      t = generic[1]!; // ordinary generic type: the constructor receives the call
+      break;
+    }
+    // A smart pointer forwards to its ONLY type argument; `Box<T, A>` (custom
+    // allocator) and any multi-argument form are left to the constructor.
+    const args = splitRustTypeArgs(generic[2]!).filter((a) => !/^'/.test(a.trim()));
+    if (args.length !== 1) { t = generic[1]!; break; }
+    t = args[0]!;
+  }
+  t = t.trim();
+  if (!/^[A-Za-z_][\w:]*$/.test(t)) return null; // tuples, slices, fn ptrs, impl Trait
+  const last = t.split('::').pop();
+  return last && /^[A-Za-z_]\w*$/.test(last) ? last : null;
+}
+
+/** Split a Rust type-argument list on top-level commas (`K, Vec<(A, B)>`). */
+function splitRustTypeArgs(args: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < args.length; i++) {
+    const ch = args[i];
+    if (ch === '<' || ch === '(' || ch === '[') depth++;
+    else if (ch === '>' || ch === ')' || ch === ']') depth--;
+    else if (ch === ',' && depth === 0) { out.push(args.slice(start, i)); start = i + 1; }
+  }
+  out.push(args.slice(start));
+  return out;
+}
+
+/**
+ * Rust field receiver `self.field.method` (see the extraction-side comment on
+ * `field_expression` receivers). The enclosing type comes from the CALLER's own
+ * qualified name (`Outer::go` → `Outer`), the field's declared type from that
+ * struct's own declaration lines, and the method is VALIDATED on that type by
+ * resolveMethodOnType — so a mis-read declaration produces no edge rather than
+ * a wrong one.
+ *
+ * Returns null whenever any hop is uncertain: the caller is not type-qualified
+ * (a free function, or a generic `impl<T> Trait for X<T>` whose methods carry
+ * the TRAIT as their qualifier), the struct is not in the graph, the field is
+ * not declared on it, or its type is one we do not follow. Null leaves the ref
+ * unresolved, which is the point — the bare method name it would otherwise fall
+ * back to carries no receiver information at all.
+ */
+function matchRustSelfFieldCall(
+  receiver: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  const field = receiver.slice('self.'.length);
+  if (!field) return null;
+
+  // `self` names the type the enclosing method is defined on.
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  const qualified = caller?.qualifiedName ?? '';
+  const sep = qualified.lastIndexOf('::');
+  if (sep <= 0) return null;
+  const selfType = qualified.slice(0, sep);
+  if (!/^[A-Za-z_]\w*$/.test(selfType)) return null;
+
+  const fieldType = rustFieldDeclaredType(selfType, field, ref, context);
+  if (!fieldType) return null;
+  return resolveMethodOnType(fieldType, methodName, ref, context, 0.85, 'instance-method');
+}
+
+/**
+ * The type of `field` as declared on `ownerType`, or null when the type is not
+ * in the graph, the field is not declared on it, or its declaration names a
+ * type we do not follow (see rustFieldTypeName).
+ */
+function rustFieldDeclaredType(
+  ownerType: string,
+  field: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): string | null {
+  const positional = /^\d+$/.test(field) ? Number(field) : -1;
+  const fieldEsc = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // A field line is `name: Type,`. Capture to end of line and cut at the first
+  // TOP-LEVEL comma below, so a type that contains commas of its own
+  // (`map: HashMap<String, usize>`) survives, and a second field declared on
+  // the same line still does not bleed in.
+  const fieldTypeRe = new RegExp(`(?:^|[{,\\s])${fieldEsc}\\s*:\\s*(.+)$`);
+
+  const owners = preferCallSiteFile(context.getNodesByName(ownerType), ref.filePath).filter(
+    (n) => (n.kind === 'struct' || n.kind === 'union' || n.kind === 'enum') && n.language === 'rust'
+  );
+  for (const owner of owners) {
+    // Only the type's own declaration lines: a same-named binding elsewhere in
+    // the file cannot donate a field type. Comments are stripped per line, as
+    // a doc comment above a field otherwise donates a word from its prose.
+    // Lines come from the context's per-file cache — this runs for every
+    // `self.field.method()` ref, and re-splitting the file each time is the
+    // cost getFileLines exists to avoid.
+    const lines = context.getFileLines
+      ? context.getFileLines(owner.filePath)
+      : context.readFile(owner.filePath)?.split('\n') ?? null;
+    if (!lines) continue;
+    const declLines = lines
+      .slice(Math.max(0, owner.startLine - 1), owner.endLine)
+      .map((l) => l.replace(/\/\/.*$/, ''));
+
+    // A tuple struct — `struct Wrapper(pub Inner, Other);` — names its fields
+    // by position, so `self.0` reads the Nth type out of the declaration
+    // instead of matching `name: Type`.
+    if (positional >= 0) {
+      const decl = declLines.join(' ').match(/\bstruct\s+\w+\s*(?:<[^>]*>)?\s*\(([^;]*)\)/);
+      if (!decl || !decl[1]) continue;
+      const raw = splitRustTypeArgs(decl[1])[positional];
+      if (raw === undefined) continue;
+      const fieldType = rustFieldTypeName(raw);
+      if (fieldType) return fieldType;
+      continue;
+    }
+
+    for (const line of declLines) {
+      const m = line.match(fieldTypeRe);
+      if (!m || !m[1]) continue;
+      const fieldType = rustFieldTypeName(m[1]);
+      if (fieldType) return fieldType;
     }
   }
   return null;

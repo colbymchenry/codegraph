@@ -2858,6 +2858,298 @@ func (mx *Mux) dispatch() {
     }, 30000);
   });
 
+  describe('Rust field receiver calls (#1585)', () => {
+    // `self.inner.run()` used to emit a BARE `run` ref: the receiver is a
+    // field_expression, not a plain identifier, so it never reached the
+    // qualified branch. Rust has no implicit `self`, so EVERY call on a field
+    // takes that shape, and the bare name exact-matched whatever same-named
+    // method sat nearest — including the calling method itself, fabricating a
+    // self-recursive edge. Field receivers now resolve exclusively via
+    // validated field inference: external field types produce NO edge,
+    // in-project ones produce the correct edge.
+    it('an external field type produces no edge; an in-project one resolves past a same-file decoy', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1585-'));
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'Cargo.toml'),
+          '[package]\nname = "repro"\nversion = "0.1.0"\nedition = "2021"\n'
+        );
+        fs.mkdirSync(path.join(tmpDir, 'src'));
+        fs.writeFileSync(path.join(tmpDir, 'src', 'lib.rs'), 'pub mod inner;\npub mod outer;\n');
+        fs.writeFileSync(
+          path.join(tmpDir, 'src', 'inner.rs'),
+          `pub struct Inner {
+    pub n: usize,
+}
+
+impl Inner {
+    pub fn run(&mut self) {
+        self.n += 1;
+    }
+}
+`
+        );
+        // Decoy::run sits in the CALLER's file, so file proximity elects it
+        // over Inner::run — the exact wrong answer this resolves away from.
+        fs.writeFileSync(
+          path.join(tmpDir, 'src', 'outer.rs'),
+          `use crate::inner::Inner;
+
+pub struct Decoy {
+    pub flag: bool,
+}
+
+impl Decoy {
+    pub fn run(&mut self) {
+        self.flag = true;
+    }
+}
+
+pub struct Outer {
+    pub inner: Inner,
+    pub items: Vec<usize>,
+}
+
+impl Outer {
+    pub fn go(&mut self) {
+        self.inner.run();
+    }
+
+    pub fn count(&self) -> usize {
+        self.items.len()
+    }
+}
+`
+        );
+
+        const cg = CodeGraph.initSync(tmpDir);
+        await cg.indexAll();
+
+        // The in-project field resolves to ITS type's method, not the decoy's.
+        const innerRun = (await cg.searchNodes('run', { limit: 10 })).find(
+          (r) => r.node.kind === 'method' && r.node.qualifiedName === 'Inner::run'
+        );
+        expect(innerRun).toBeDefined();
+        expect((await cg.getCallers(innerRun!.node.id)).map((c) => c.node.name)).toContain('go');
+
+        const decoyRun = (await cg.searchNodes('run', { limit: 10 })).find(
+          (r) => r.node.kind === 'method' && r.node.qualifiedName === 'Decoy::run'
+        );
+        expect(decoyRun).toBeDefined();
+        expect((await cg.getCallers(decoyRun!.node.id)).map((c) => c.node.name)).not.toContain('go');
+
+        // `items: Vec<usize>` is external: `self.items.len()` must bind to
+        // nothing rather than to the enclosing type's own `count`.
+        const count = (await cg.searchNodes('count', { limit: 10 })).find(
+          (r) => r.node.kind === 'method'
+        );
+        expect(count).toBeDefined();
+        expect((await cg.getCallees(count!.node.id)).map((c) => c.node.name)).toHaveLength(0);
+        cg.close();
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    // The receiver is the field's type CONSTRUCTOR — `Core<'a, u8>` answers
+    // with `Core`'s method — except for the smart pointers that Deref, whose
+    // single type argument is unwrapped. Containers that own their methods
+    // (`Option`, `Mutex`, `Vec`) must NOT be unwrapped: their method belongs to
+    // the container, and following the argument would fabricate an edge.
+    it('deref wrappers unwrap to their argument; containers and generics keep their constructor', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1585b-'));
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'Cargo.toml'),
+          '[package]\nname = "wrappers"\nversion = "0.1.0"\nedition = "2021"\n'
+        );
+        fs.mkdirSync(path.join(tmpDir, 'src'));
+        fs.writeFileSync(path.join(tmpDir, 'src', 'lib.rs'), 'pub mod inner;\npub mod outer;\n');
+        fs.writeFileSync(
+          path.join(tmpDir, 'src', 'inner.rs'),
+          `pub struct Inner {
+    pub n: usize,
+}
+
+impl Inner {
+    pub fn tick(&self) -> usize {
+        self.n
+    }
+
+    pub fn lock(&self) -> usize {
+        self.n
+    }
+}
+
+pub struct Core<'a, T> {
+    pub tag: &'a str,
+    pub item: T,
+}
+
+impl<'a, T> Core<'a, T> {
+    pub fn roll(&self) -> usize {
+        0
+    }
+}
+`
+        );
+        fs.writeFileSync(
+          path.join(tmpDir, 'src', 'outer.rs'),
+          `use crate::inner::{Core, Inner};
+use std::sync::{Arc, Mutex};
+
+pub struct Outer<'a> {
+    pub boxed: Box<Inner>,
+    pub guarded: Arc<Mutex<Inner>>,
+    pub core: Core<'a, u8>,
+}
+
+impl<'a> Outer<'a> {
+    pub fn via_box(&self) -> usize {
+        self.boxed.tick()
+    }
+
+    pub fn via_mutex(&self) -> usize {
+        self.guarded.lock()
+    }
+
+    pub fn via_generic(&self) -> usize {
+        self.core.roll()
+    }
+}
+`
+        );
+
+        const cg = CodeGraph.initSync(tmpDir);
+        await cg.indexAll();
+
+        const find = async (qualified: string) =>
+          (await cg.searchNodes(qualified.split('::').pop()!, { limit: 10 })).find(
+            (r) => r.node.kind === 'method' && r.node.qualifiedName === qualified
+          );
+
+        // Box<Inner> derefs: the call reaches Inner.
+        const tick = await find('Inner::tick');
+        expect(tick).toBeDefined();
+        expect((await cg.getCallers(tick!.node.id)).map((c) => c.node.name)).toContain('via_box');
+
+        // Arc<Mutex<Inner>> stops at Mutex, which owns `lock` — Inner::lock is
+        // a same-named decoy that must not be bound.
+        const lock = await find('Inner::lock');
+        expect(lock).toBeDefined();
+        expect((await cg.getCallers(lock!.node.id)).map((c) => c.node.name)).not.toContain(
+          'via_mutex'
+        );
+
+        // A plain generic keeps its constructor: Core<'a, u8> answers with Core.
+        const roll = await find('Core::roll');
+        expect(roll).toBeDefined();
+        expect((await cg.getCallers(roll!.node.id)).map((c) => c.node.name)).toContain(
+          'via_generic'
+        );
+        cg.close();
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    // A tuple struct names its fields by position, so `self.0` reads the first
+    // type out of the declaration. Positions must not be interchangeable: two
+    // fields of different types answer their own methods.
+    it('tuple-struct fields resolve by position', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1585c-'));
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'Cargo.toml'),
+          '[package]\nname = "tuples"\nversion = "0.1.0"\nedition = "2021"\n'
+        );
+        fs.mkdirSync(path.join(tmpDir, 'src'));
+        fs.writeFileSync(path.join(tmpDir, 'src', 'lib.rs'), 'pub mod def;\npub mod imp;\n');
+        fs.writeFileSync(
+          path.join(tmpDir, 'src', 'def.rs'),
+          `pub struct First {
+    pub n: usize,
+}
+
+impl First {
+    pub fn go(&self) -> usize {
+        1
+    }
+}
+
+pub struct Second {
+    pub n: usize,
+}
+
+impl Second {
+    pub fn go(&self) -> usize {
+        2
+    }
+}
+
+pub struct Pair(pub First, pub Second);
+
+pub struct Opaque(pub Vec<usize>);
+`
+        );
+        fs.writeFileSync(
+          path.join(tmpDir, 'src', 'imp.rs'),
+          `use crate::def::{Opaque, Pair};
+
+pub struct Decoy;
+
+impl Decoy {
+    pub fn go(&self) -> usize {
+        99
+    }
+
+    pub fn len(&self) -> usize {
+        99
+    }
+}
+
+impl Pair {
+    pub fn take_first(&self) -> usize {
+        self.0.go()
+    }
+
+    pub fn take_second(&self) -> usize {
+        self.1.go()
+    }
+}
+
+impl Opaque {
+    pub fn size(&self) -> usize {
+        self.0.len()
+    }
+}
+`
+        );
+
+        const cg = CodeGraph.initSync(tmpDir);
+        await cg.indexAll();
+
+        const callersOf = async (qualified: string) => {
+          const node = (await cg.searchNodes(qualified.split('::').pop()!, { limit: 10 })).find(
+            (r) => r.node.kind === 'method' && r.node.qualifiedName === qualified
+          );
+          expect(node).toBeDefined();
+          return (await cg.getCallers(node!.node.id)).map((c) => c.node.name);
+        };
+
+        expect(await callersOf('First::go')).toEqual(['take_first']);
+        expect(await callersOf('Second::go')).toEqual(['take_second']);
+        // A same-named method in the calling file stays out of both.
+        expect(await callersOf('Decoy::go')).toHaveLength(0);
+        // `Opaque(Vec<usize>)` is external: no edge rather than the decoy's len.
+        expect(await callersOf('Decoy::len')).toHaveLength(0);
+        cg.close();
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+  });
+
   describe('Imported singleton instance-method calls (#1292)', () => {
     // `reproStore.notifyJoinGuildStatus()` after `import { reproStore }` used
     // to emit its calls edge to the CONSTANT (resolvedBy:'import'), while the

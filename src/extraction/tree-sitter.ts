@@ -4517,6 +4517,32 @@ export class TreeSitterExtractor {
               // Go receivers resolve strictly via validated field-hop
               // inference (see matchGoFieldChainCall) or stay unresolved.
               calleeName = `${getNodeText(receiver, this.source).replace(/\s+/g, '')}.${methodName}`;
+            } else if (
+              this.language === 'rust' &&
+              receiver &&
+              receiver.type === 'field_expression' &&
+              /^self\.(?:[A-Za-z_]\w*|\d+)$/.test(getNodeText(receiver, this.source).replace(/\s+/g, ''))
+            ) {
+              // Rust field receiver `self.inner.run(...)`, or `self.0.run(...)`
+              // on a tuple struct: keep the receiver so resolution can infer the
+              // field's declared type from the enclosing type's declaration.
+              // Rust has no implicit `self`, so EVERY call on a field is written
+              // this way — and the receiver, being a field_expression rather
+              // than a plain identifier, never reached the qualified branch
+              // above. The bare method name that remained exact-matched an
+              // unrelated same-named method whenever the field's type is
+              // external (`Vec`, `Arc<…>`) or simply lives elsewhere,
+              // fabricating internal dependencies — including self-recursive
+              // edges the source never had. These receivers resolve strictly
+              // via validated field inference (see matchRustSelfFieldCall) or
+              // stay unresolved.
+              //
+              // A DEEPER chain (`self.a.b.run()`) keeps the bare-name behavior:
+              // every hop would have to type, and measured on tokio the hops
+              // that fail are mostly ones the bare name happened to get right,
+              // so making them exclusive costs more correct edges than it
+              // removes wrong ones.
+              calleeName = `${getNodeText(receiver, this.source).replace(/\s+/g, '')}.${methodName}`;
             } else {
               calleeName = methodName;
             }
