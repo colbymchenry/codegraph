@@ -661,13 +661,17 @@ async function resolveTargets(
 export async function offerWatchFallback(
   clack: typeof import('@clack/prompts'),
   projectPath: string,
-  opts: { yes?: boolean } = {},
+  opts: { yes?: boolean; force?: boolean } = {},
 ): Promise<void> {
   const reason = watchDisabledReason(projectPath);
-  if (!reason) return; // Watcher runs normally — nothing to set up.
+  if (!reason && !opts.force) return; // Watcher runs normally and hooks weren't explicitly requested.
 
-  clack.log.warn(`Live file watching is disabled here — ${reason}.`);
-  clack.log.info('Until you re-sync, the CodeGraph index stays frozen — it will not pick up edits on its own.');
+  if (reason) {
+    clack.log.warn(`Live file watching is disabled here — ${reason}.`);
+    clack.log.info('Until you re-sync, the CodeGraph index stays frozen — it will not pick up edits on its own.');
+  } else {
+    clack.log.info('Setting up git sync hooks as a freshness backstop for when no CodeGraph session is open.');
+  }
 
   // No git repo → the commit-hook path doesn't apply; point at manual sync.
   if (!isGitRepo(projectPath)) {

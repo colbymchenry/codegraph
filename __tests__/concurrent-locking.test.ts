@@ -112,13 +112,13 @@ describe('issue #238 — ToolHandler reuses the default instance (#2)', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('getCodeGraph(defaultRoot) returns the default instance, not a new connection', () => {
+  it('getCodeGraph(defaultRoot) returns the default instance, not a new connection', async () => {
     const openSpy = vi.spyOn(CodeGraph, 'openSync');
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const resolved = (handler as any).getCodeGraph(root);
+      const resolved = await (handler as any).getCodeGraph(root);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const nested = (handler as any).getCodeGraph(path.join(root, 'does', 'not', 'exist'));
+      const nested = await (handler as any).getCodeGraph(path.join(root, 'does', 'not', 'exist'));
       expect(resolved).toBe(cg);
       expect(nested).toBe(cg); // a sub-path resolves up to the same default project
       expect(openSpy).not.toHaveBeenCalled(); // no second connection opened

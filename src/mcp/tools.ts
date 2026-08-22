@@ -6,7 +6,7 @@
 
 import type CodeGraph from '../index';
 import type { QueryPool } from './query-pool';
-import { findNearestCodeGraphRoot } from '../directory';
+import { findNearestCodeGraphRoot, unsafeIndexRootReason, getCodeGraphDir } from '../directory';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
 // helper in engine.ts. ToolHandler must load to answer tools/list (static
 // schemas), but it must NOT drag in sqlite/query layers before the daemon binds;
@@ -23,6 +23,15 @@ let loadCodeGraphForTests: typeof import('../index').default | null = null;
 export function __setLoadCodeGraphForTests(cls: typeof import('../index').default | null): void {
   loadCodeGraphForTests = cls;
 }
+import { getAutoInit } from '../installer/user-config';
+
+// Test seam (same pattern as __setLoadCodeGraphForTests above): points
+// getAutoInit at a temp config dir instead of the real ~/.codegraph.
+// Never set outside tests.
+let autoInitDirForTests: string | null = null;
+export function __setAutoInitDirForTests(dir: string | null): void {
+  autoInitDirForTests = dir;
+}
 import {
   detectWorktreeIndexMismatch,
   worktreeMismatchWarning,
@@ -37,6 +46,7 @@ import {
   existsSync,
   readFileSync,
   statSync,
+  rmSync,
 } from 'fs';
 import { createHash } from 'crypto';
 import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
@@ -1311,6 +1321,12 @@ const DEFAULT_MCP_TOOLS = new Set(['explore']);
 export class ToolHandler {
   // Cache of opened CodeGraph instances for cross-project queries
   private projectCache: Map<string, CodeGraph> = new Map();
+  // In-flight auto-init attempts keyed by resolved projectPath, so two
+  // concurrent tool calls against the same unindexed path await the SAME
+  // init/indexAll run instead of racing two independent ones (which would
+  // both open a DatabaseConnection and contend for the file lock — feeding
+  // straight into the indexAll-failure and leaked-handle cases below).
+  private autoInitInFlight: Map<string, Promise<CodeGraph>> = new Map();
   // The directory the server last searched for a default project. Surfaced in
   // the "not initialized" error so users can see why detection missed.
   private defaultProjectHint: string | null = null;
@@ -1526,7 +1542,7 @@ export class ToolHandler {
    * Walks up parent directories to find the nearest .codegraph/ folder,
    * similar to how git finds .git/ directories.
    */
-  private getCodeGraph(projectPath?: string): CodeGraph {
+  private async getCodeGraph(projectPath?: string): Promise<CodeGraph> {
     if (!projectPath) {
       if (!this.cg) {
         const searched = this.defaultProjectHint ?? process.cwd();
@@ -1573,6 +1589,31 @@ export class ToolHandler {
     const resolvedRoot = findNearestCodeGraphRoot(projectPath);
 
     if (!resolvedRoot) {
+      if (getAutoInit(autoInitDirForTests ? { dir: autoInitDirForTests } : {})) {
+        // Auto-init only ever INDEXES a directory the user already has —
+        // never CREATES one. Before this feature, this branch was read-only
+        // (no .codegraph/ found ⇒ throw), so skipping validateProjectPath on
+        // a nonexistent path was safe: it existed only to let a not-yet-real
+        // sub-path still walk UP to a real ancestor's .codegraph/ (#238).
+        // CodeGraph.init on a nonexistent path calls mkdirSync on the whole
+        // missing chain, which could land under a sensitive path (~/.ssh,
+        // ~/.aws, ~/.config, ...) that validateProjectPath exists to refuse —
+        // so require the path to already exist AND pass validation (in
+        // addition to unsafeIndexRootReason) before ever attempting to
+        // create anything.
+        const canAutoInit =
+          existsSync(projectPath) &&
+          !validateProjectPath(projectPath) &&
+          !unsafeIndexRootReason(projectPath);
+        if (canAutoInit) {
+          try {
+            return await this.autoInitProject(projectPath);
+          } catch {
+            // Auto-init must never turn a query failure into a worse, unexplained
+            // one — fall through to the standard NotIndexedError below.
+          }
+        }
+      }
       throw new NotIndexedError(
         `The project at ${projectPath} isn't indexed with codegraph (no .codegraph/ directory found ` +
         'walking up from it), so codegraph cannot query it. Use your built-in tools (Read/Grep/Glob) ' +
@@ -1601,6 +1642,86 @@ export class ToolHandler {
     const cg = loadCodeGraph().openSync(resolvedRoot);
     this.projectCache.set(resolvedRoot, cg);
     return cg;
+  }
+
+  /**
+   * Auto-init a project's `.codegraph/` and index it, for `getCodeGraph`'s
+   * opt-in `autoInit` path. Callers must already have verified the path is
+   * existing/safe (`validateProjectPath` + `unsafeIndexRootReason`) — this
+   * method only handles the init/index/failure-cleanup mechanics:
+   *
+   *  - De-dupes concurrent callers on the same path onto one in-flight
+   *    attempt, so two simultaneous tool calls against the same unindexed
+   *    project never race two separate `CodeGraph.init` + `indexAll` runs
+   *    (which would contend for the same file lock).
+   *  - Treats `indexAll`'s `{ success: false }` result as a failure (it
+   *    resolves rather than throws on a contended lock) — an unsuccessful
+   *    index is never cached or returned as if it were real, which would
+   *    otherwise leave a permanently "indexed but empty" project on disk.
+   *  - On a failure this call OWNS, closes the opened DB connection (so the
+   *    write handle never leaks for the process lifetime) and removes the
+   *    partially created `.codegraph/` directory, so the next call gets a
+   *    clean retry instead of tripping "already initialized" or a stuck lock.
+   *  - On a CONTENDED failure — `indexAll` reporting that another process
+   *    holds the index file lock — closes the connection but deliberately
+   *    does NOT delete `.codegraph/`. The de-dup map above is per-instance,
+   *    and every query-pool worker (src/mcp/query-worker.ts) builds its own
+   *    `ToolHandler`, so two workers CAN reach `CodeGraph.init` on the same
+   *    unindexed path before either created the directory. The loser must
+   *    walk away quietly: the directory it would delete is the WINNER's
+   *    live, in-progress index, and unlinking it out from under the winner's
+   *    open SQLite handle corrupts a healthy index to "fix" a failure that
+   *    isn't ours. Falling through to NotIndexedError is correct and
+   *    self-healing — the next call re-resolves and finds the finished index.
+   */
+  private async autoInitProject(projectPath: string): Promise<CodeGraph> {
+    const key = resolvePath(projectPath);
+    const inFlight = this.autoInitInFlight.get(key);
+    if (inFlight) return inFlight;
+
+    const attempt = (async (): Promise<CodeGraph> => {
+      let cg: CodeGraph | undefined;
+      try {
+        const CodeGraphClass = loadCodeGraph();
+        cg = await CodeGraphClass.init(projectPath, { index: false });
+        const result = await cg.indexAll();
+        if (!result.success) {
+          // Lock contention means SOMEONE ELSE owns this .codegraph/ and is
+          // actively indexing it — this call is not the sole owner, so the
+          // cleanup below must not touch the directory. See src/index.ts's
+          // indexAll: a failed `fileLock.acquire()` resolves with exactly this
+          // message rather than throwing.
+          const contended = (result.errors ?? []).some((e) =>
+            /file lock|another process/i.test(e.message)
+          );
+          const failure = new Error(
+            `auto-init indexAll failed for ${projectPath}: ` +
+            (result.errors[0]?.message ?? 'unknown error')
+          ) as Error & { skipCleanup?: boolean };
+          failure.skipCleanup = contended;
+          throw failure;
+        }
+        this.projectCache.set(cg.getProjectRoot(), cg);
+        return this.freshen(cg);
+      } catch (err) {
+        if (cg) {
+          try { cg.close(); } catch { /* best-effort — already failing */ }
+          if (!(err as { skipCleanup?: boolean } | null)?.skipCleanup) {
+            try {
+              rmSync(getCodeGraphDir(projectPath), { recursive: true, force: true });
+            } catch { /* best-effort cleanup so the next call can retry cleanly */ }
+          }
+        }
+        throw err;
+      }
+    })();
+
+    this.autoInitInFlight.set(key, attempt);
+    try {
+      return await attempt;
+    } finally {
+      this.autoInitInFlight.delete(key);
+    }
   }
 
   /**
@@ -1693,7 +1814,7 @@ export class ToolHandler {
    * (e.g. nothing initialized yet), it reports "no mismatch" so a tool is never
    * broken by this check.
    */
-  private worktreeMismatchFor(projectPath?: string): WorktreeIndexMismatch | null {
+  private async worktreeMismatchFor(projectPath?: string): Promise<WorktreeIndexMismatch | null> {
     const startPath = projectPath ?? this.defaultProjectHint ?? process.cwd();
 
     // The verdict depends on BOTH the start path AND the index root it resolves
@@ -1707,7 +1828,7 @@ export class ToolHandler {
     // that first verdict until restart (#926).
     let indexRoot: string;
     try {
-      indexRoot = this.getCodeGraph(projectPath).getProjectRoot();
+      indexRoot = (await this.getCodeGraph(projectPath)).getProjectRoot();
     } catch {
       // No resolvable project (or any other resolution error) → nothing to warn.
       return null;
@@ -1730,9 +1851,9 @@ export class ToolHandler {
    * is no mismatch. `codegraph_status` is excluded — it embeds its own verbose
    * warning — so it stays out of this path.
    */
-  private withWorktreeNotice(result: ToolResult, projectPath?: string): ToolResult {
+  private async withWorktreeNotice(result: ToolResult, projectPath?: string): Promise<ToolResult> {
     if (result.isError) return result;
-    const mismatch = this.worktreeMismatchFor(projectPath);
+    const mismatch = await this.worktreeMismatchFor(projectPath);
     if (!mismatch) return result;
 
     const notice = worktreeMismatchNotice(mismatch);
@@ -1817,12 +1938,12 @@ export class ToolHandler {
     return stale;
   }
 
-  private withStalenessNotice(result: ToolResult, projectPath?: string): ToolResult {
+  private async withStalenessNotice(result: ToolResult, projectPath?: string): Promise<ToolResult> {
     if (result.isError) return result;
 
     let cg: CodeGraph;
     try {
-      cg = this.getCodeGraph(projectPath);
+      cg = await this.getCodeGraph(projectPath);
     } catch {
       return result; // no default project — leave as is
     }
@@ -1997,8 +2118,8 @@ export class ToolHandler {
       // internal bookkeeping and must never reach the client, whether or not a
       // caller passed session state.
       const result = this.takeExploreEmission(raw, sessionState);
-      const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
-      return this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
+      const withWorktree = await this.withWorktreeNotice(result, args.projectPath as string | undefined);
+      return await this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
     } catch (err) {
       // Expected condition, not a malfunction: answer as a SUCCESS so the
       // agent keeps trusting the toolset for projects that ARE indexed.
@@ -2126,7 +2247,7 @@ export class ToolHandler {
     const query = this.validateString(args.query, 'query');
     if (typeof query !== 'string') return query;
 
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = await this.getCodeGraph(args.projectPath as string | undefined);
     const rawKind = args.kind as string | undefined;
     // The schema enum says 'type' (what agents naturally reach for); the
     // NodeKind is 'type_alias'. Without the mapping, kind: "type" silently
@@ -2206,7 +2327,7 @@ export class ToolHandler {
     const symbol = this.validateString(args.symbol, 'symbol');
     if (typeof symbol !== 'string') return symbol;
 
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = await this.getCodeGraph(args.projectPath as string | undefined);
     const limit = clamp((args.limit as number) || 20, 1, 100);
     const fileFilter = typeof args.file === 'string' ? args.file : undefined;
 
@@ -2279,7 +2400,7 @@ export class ToolHandler {
     const symbol = this.validateString(args.symbol, 'symbol');
     if (typeof symbol !== 'string') return symbol;
 
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = await this.getCodeGraph(args.projectPath as string | undefined);
     const limit = clamp((args.limit as number) || 20, 1, 100);
     const fileFilter = typeof args.file === 'string' ? args.file : undefined;
 
@@ -2349,7 +2470,7 @@ export class ToolHandler {
     const symbol = this.validateString(args.symbol, 'symbol');
     if (typeof symbol !== 'string') return symbol;
 
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = await this.getCodeGraph(args.projectPath as string | undefined);
     const depth = clamp((args.depth as number) || 2, 1, 10);
     const fileFilter = typeof args.file === 'string' ? args.file : undefined;
 
@@ -3224,7 +3345,7 @@ export class ToolHandler {
     // ranking all see the same canonical spelling (Erlang `mod:fn/arity`).
     const query = normalizeQuerySpelling(rawQuery);
 
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = await this.getCodeGraph(args.projectPath as string | undefined);
     const projectRoot = cg.getProjectRoot();
 
     // Resolve adaptive output budget from project size. Falls back to the
@@ -5960,7 +6081,7 @@ export class ToolHandler {
    * Handle codegraph_node
    */
   private async handleNode(args: Record<string, unknown>): Promise<ToolResult> {
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = await this.getCodeGraph(args.projectPath as string | undefined);
     // Default to false to minimize context usage
     const includeCode = args.includeCode === true;
     const fileHint = typeof args.file === 'string' && args.file.trim() ? args.file.trim() : undefined;
@@ -6348,7 +6469,7 @@ export class ToolHandler {
    * Handle codegraph_status
    */
   private async handleStatus(args: Record<string, unknown>): Promise<ToolResult> {
-    let cg = this.getCodeGraph(args.projectPath as string | undefined);
+    let cg = await this.getCodeGraph(args.projectPath as string | undefined);
     // Same trick as withStalenessNotice — when an explicit projectPath
     // resolves to the same project as the default session cg, prefer the
     // default so getPendingFiles() (only populated by the default's watcher)
@@ -6367,7 +6488,7 @@ export class ToolHandler {
     // Queries then reflect that tree's branch, not the worktree being edited.
     // status shows the verbose, multi-line form; the read tools get the compact
     // one-liner via withWorktreeNotice. Both share the cached detection.
-    const mismatch = this.worktreeMismatchFor(args.projectPath as string | undefined);
+    const mismatch = await this.worktreeMismatchFor(args.projectPath as string | undefined);
 
     const lines: string[] = [
       '**CodeGraph Status**',
@@ -6472,7 +6593,7 @@ export class ToolHandler {
    * Handle codegraph_files - get project file structure from the index
    */
   private async handleFiles(args: Record<string, unknown>): Promise<ToolResult> {
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = await this.getCodeGraph(args.projectPath as string | undefined);
     const pathFilter = args.path as string | undefined;
     const pattern = args.pattern as string | undefined;
     const format = (args.format as 'tree' | 'flat' | 'grouped') || 'tree';
