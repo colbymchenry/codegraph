@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+- **GDScript** is now parsed with a real tree-sitter grammar: classes, methods, signals, enums with members, constants, inner classes, static functions, and lambdas — with no phantom symbols from code-like text inside strings or comments.
+- Godot flows now connect end-to-end through dynamic dispatch: autoload singletons (`GameState.reset()`), engine callbacks (`_ready`, `_process`, `_input`, …), string-keyed dispatch (`call("x")`, `Callable(self, "x")`, `has_method("x")`), and scene-signal connections — a button press links to its handler method even when that handler lives in another file.
+
 
 ## [1.0.1] - 2026-06-13
 
