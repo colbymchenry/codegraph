@@ -50,6 +50,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  odin: 'tree-sitter-odin.wasm',
 };
 
 /**
@@ -170,6 +171,8 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.tf': 'terraform',
   '.tfvars': 'terraform',
   '.tofu': 'terraform',
+  // Odin: one extension, and a package is the DIRECTORY holding the files.
+  '.odin': 'odin',
 };
 
 /**
@@ -271,6 +274,16 @@ export async function initGrammars(): Promise<void> {
  * nix-community/tree-sitter-nix @ 3d0173d (MIT) with tree-sitter-cli 0.25.10
  * (`generate` + `build --wasm`, ABI 15 — upstream's checked-in parser.c is
  * still ABI 13; all 54 upstream corpus tests pass on the regenerated parser).
+ * Odin: tree-sitter-wasms doesn't ship it either; we vendor a wasm built from
+ * tree-sitter-grammars/tree-sitter-odin @ v1.3.0 (e8adc73, MIT, Copyright (c)
+ * 2023 Amaan Qureshi) from the tag's CHECKED-IN parser.c (no `generate`) with
+ * tree-sitter-cli 0.26.11 `build --wasm`, ABI 14 — the tag's parser.c predates
+ * the ABI-15 generator, and regenerating would diverge the tables from the tag.
+ * Pin the TAG, not master: master's one unreleased commit (d2ca8ef) regresses
+ * multi-value return types (`f :: proc() -> (string, bool)` becomes an ERROR),
+ * which is pervasive in real Odin. Odin is wasm-only — the native kernel has no
+ * Odin counterpart, so there is no crate revision to match. See
+ * docs/grammars/tree-sitter-odin.md for the sha256 and the measured parse health.
  *
  * TypeScript/TSX/JavaScript (+jsx, which shares the javascript grammar): the
  * tree-sitter-wasms builds are 2023-era (^0.20.x); we vendor wasm built from
@@ -290,7 +303,7 @@ export async function initGrammars(): Promise<void> {
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
-  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
+  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix', 'odin',
   'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
   // R7a (C/C++ kernel port prep): tree-sitter-c v0.24.2 (b780e47) +
   // tree-sitter-cpp v0.23.4 (f41e1a0), parser.c/scanner.c sha-matched against
@@ -643,6 +656,7 @@ export function getLanguageDisplayName(language: Language): string {
     objc: 'Objective-C',
     solidity: 'Solidity',
     nix: 'Nix',
+    odin: 'Odin',
     yaml: 'YAML',
     twig: 'Twig',
     xml: 'XML',

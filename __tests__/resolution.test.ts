@@ -5099,4 +5099,100 @@ in
       expect(importedFilePaths('main.nix')).toEqual([]);
     });
   });
+
+  describe('Odin package scoping', () => {
+    it('never links an Odin builtin or a bare cross-package call', async () => {
+      // `len`/`cap`/`append`/`max` are `base:builtin` — unqualified by
+      // language, so without the emit-time filter they name-match ANY
+      // same-named symbol, including a struct FIELD (`calls -> Ring::len
+      // [field]`) in a package `app` never imports. And a bare `helper()`
+      // cannot bind outside its own package, which in Odin is the DIRECTORY.
+      fs.mkdirSync(path.join(tempDir, 'app'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'util'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'app', 'a.odin'),
+        `package app
+
+use_it :: proc(xs: []int) -> int {
+	ys := make([]int, 4)
+	append(&ys, 1)
+	return len(xs) + cap(ys) + max(1, 2) + helper()
+}
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'util', 'u.odin'),
+        `package util
+
+Ring :: struct {
+	len: int,
+	cap: int,
+}
+
+max :: proc(a: int, b: int) -> int {return a}
+append :: proc(r: ^Ring, v: int) {}
+helper :: proc() -> int {return 0}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const caller = cg
+        .getNodesByKind('function')
+        .find((n) => n.language === 'odin' && n.name === 'use_it');
+      expect(caller).toBeDefined();
+      const outgoing = cg
+        .getOutgoingEdges(caller!.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.target))
+        .map((n) => `${n?.filePath}:${n?.name}:${n?.kind}`);
+      expect(outgoing).toEqual([]);
+    });
+
+    it('still links a same-package call and a qualified cross-package call', async () => {
+      // The gate must not cost the two edges Odin genuinely has: a bare name
+      // inside one package directory, and a `pkg.fn()` call across two.
+      fs.mkdirSync(path.join(tempDir, 'app'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'shared'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'app', 'a.odin'),
+        `package app
+
+import "../shared"
+
+run :: proc() -> int {
+	shared.record(1)
+	return local_helper()
+}
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'app', 'b.odin'),
+        `package app
+
+local_helper :: proc() -> int {return 7}
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'shared', 's.odin'),
+        `package shared
+
+record :: proc(v: int) {}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const run = cg.getNodesByKind('function').find((n) => n.language === 'odin' && n.name === 'run');
+      expect(run).toBeDefined();
+      const callees = cg
+        .getOutgoingEdges(run!.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.target)?.name)
+        .sort();
+      expect(callees).toEqual(['local_helper', 'record']);
+    });
+  });
 });

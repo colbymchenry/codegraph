@@ -22,6 +22,7 @@ import { isGeneratedFile } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
 import { stripCppTemplateArgs } from './languages/c-cpp';
+import { ODIN_BUILTINS, odinDeclarationParts, odinLiteralTypeNames } from './languages/odin';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -2882,6 +2883,59 @@ export class TreeSitterExtractor {
           isExported,
         });
       }
+    } else if (this.language === 'odin') {
+      // Odin declares everything positionally — `[attributes] NAME :: value`,
+      // `NAME := value`, `NAME: T = value` — with no `name:` field anywhere in
+      // the grammar, and it allows a COMMA-SEPARATED name list on both the `::`
+      // and the `:` form (`A, B :: 1, 2`, `x, y: int = 3, 4`). The generic
+      // fallback below takes EVERY identifier child, so `Alias :: Other` and
+      // `Handle :: SomeConst` minted a second, bogus symbol named after the
+      // right-hand side; odinDeclarationParts bounds the name run on the commas
+      // that separate it, so every declared name is indexed and no value is.
+      const { names, typeNode, values } = odinDeclarationParts(node);
+      const typeText = typeNode ? getNodeText(typeNode, this.source).trim() : '';
+      // Positional pairing: `x, y: int = 3, 4` gives each name its own value,
+      // while `a, b := f()` gives them one call to share.
+      const valueFor = (i: number): SyntaxNode | null =>
+        (values.length === names.length ? values[i] : values.length === 1 ? values[0] : null) ?? null;
+      const createdIds: (string | null)[] = names.map((nameNode, i) => {
+        const value = valueFor(i);
+        const initValue = value ? getNodeText(value, this.source).slice(0, 100) : '';
+        // A trailing `type` child is the declared TYPE, not an initializer —
+        // `g: Registry` has no value at all.
+        const signature = [
+          typeText ? `: ${typeText}` : '',
+          initValue ? ` = ${initValue}${initValue.length >= 100 ? '...' : ''}` : '',
+        ].join('').trim();
+        const varNode = this.createNode(kind, getNodeText(nameNode, this.source), node, {
+          docstring,
+          signature: signature || undefined,
+          isExported,
+        });
+        return varNode?.id ?? null;
+      });
+      // The dispatcher sets skipChildren for variableTypes, so a call in a
+      // top-level initializer (`Table := build_table()`) is only seen here.
+      values.forEach((value, i) => {
+        const ownerId = (values.length === names.length ? createdIds[i] : createdIds[0]) ?? '';
+        // A composite literal's HEAD is the declaration's dependency on the
+        // types it is built out of — `FAULT := [Fault]string{…}` on the enum it
+        // keys on, which the compiler makes it change with. visitFunctionBody
+        // walks the literal for calls and reads no types at all.
+        for (const typeName of odinLiteralTypeNames(value)) {
+          if (!ownerId) break;
+          this.unresolvedReferences.push({
+            fromNodeId: ownerId,
+            referenceName: getNodeText(typeName, this.source),
+            referenceKind: 'references',
+            line: typeName.startPosition.row + 1,
+            column: typeName.startPosition.column,
+          });
+        }
+        if (ownerId) this.nodeStack.push(ownerId);
+        this.visitFunctionBody(value, ownerId);
+        if (ownerId) this.nodeStack.pop();
+      });
     } else {
       // Generic fallback for other languages
       // Try to find identifier children
@@ -3981,6 +4035,69 @@ export class TreeSitterExtractor {
           column: receiverNode.startPosition.column,
         });
       }
+      return;
+    }
+
+    // Odin puts a call's package qualifier OUTSIDE the call: `fmt.println(x)`
+    // is member_expression(identifier `fmt`, call_expression(function:
+    // `println`)). The generic path below reads only the `function` field, so
+    // every qualified call collapsed to its bare member name — `fmt.println`
+    // became a `calls` ref to `println`, which then linked to whatever
+    // same-named procedure the repo happened to define — the same wrong-edge
+    // class #1079/#1107 fixed for same-named methods, one step earlier. (Ruby's
+    // `call` branch above is the structural sibling: a grammar whose call node
+    // hides part of the callee name from the generic path.)
+    // Re-attach the qualifier as `pkg::callee`, which is
+    // byte-identical to the qualifiedName the package namespace gives every
+    // top-level symbol (see packageTypes in languages/odin.ts), so a repo-local
+    // cross-package call resolves via matchByQualifiedName while a `core:` /
+    // `vendor:` call resolves to nothing rather than to a wrong local.
+    //
+    // A `->` call is the one shape that must NOT be qualified: `h->run()` is
+    // selector_call_expression(function: `h`, call_expression), where `h` is a
+    // RECEIVER VARIABLE and not a package. Qualifying it emits `h::run`, which
+    // is byte-identical in shape to a genuine cross-package call, so a receiver
+    // sharing a name with a repo package mints exactly the wrong edge this
+    // branch exists to prevent. It gets the bare member name instead, scoped to
+    // its own directory by the resolver like any other same-package call.
+    if (this.language === 'odin' && node.type === 'call_expression') {
+      // A compiler directive occupies a `function` field too, and it comes
+      // FIRST: `#force_inline f()` gives the call TWO of them (the `tag`, then
+      // the identifier) and `#assert(x < y)` gives it only the tag. Read the
+      // LAST one — `childForFieldName` returns the first, which emitted
+      // `#force_inline` as the callee and lost the real one.
+      const fnChildren = node.childrenForFieldName('function');
+      const fn = fnChildren.length > 0 ? fnChildren[fnChildren.length - 1] : null;
+      // Nothing but the directive: `#assert(MAX < 19)`, `#load("x.bin")`. The
+      // callee is the compiler's, not the repo's — no symbol can carry the name,
+      // so emitting one is a dead reference on every file that asserts.
+      if (!fn || fn.type === 'tag') return;
+      const calleeName = getNodeText(fn, this.source).trim();
+      if (!calleeName) return;
+      const parent = node.parent;
+      let qualifier = '';
+      if (parent?.type === 'member_expression') {
+        const receiver = parent.namedChild(0);
+        // `deep.pkg.fn()` nests member_expressions — the LAST segment is the
+        // package that owns the callee.
+        if (receiver && !receiver.equals(node)) {
+          qualifier = getNodeText(receiver, this.source).split('.').pop()?.trim() ?? '';
+        }
+      }
+      // An UNQUALIFIED call can be a builtin — `len(xs)`, `append(&ys, 1)`,
+      // `max(1, 2)` are spelled exactly like a call to a procedure of your own.
+      // Emitting them would name-match any same-named symbol in the repo,
+      // including a struct FIELD (`calls … -> Ring::len [field]`) and a package
+      // that is never imported. Suppress at emit, as terraform's BUILTIN_HEADS
+      // and SCALA_BUILTIN_TYPES do.
+      if (!qualifier && ODIN_BUILTINS.has(calleeName)) return;
+      this.unresolvedReferences.push({
+        fromNodeId: callerId,
+        referenceName: qualifier ? `${qualifier}::${calleeName}` : calleeName,
+        referenceKind: 'calls',
+        line: node.startPosition.row + 1,
+        column: node.startPosition.column,
+      });
       return;
     }
 

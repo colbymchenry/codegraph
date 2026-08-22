@@ -1019,6 +1019,21 @@ export class ReferenceResolver {
         // linkable symbol) — without this, a Python script's `split()` lands
         // on some module's `split = ...` binding as a low-confidence match.
         nameResult = null;
+      } else if (
+        ref.language === 'odin' &&
+        ref.referenceKind === 'calls' &&
+        !ref.referenceName.includes('::')
+      ) {
+        // An Odin package IS a directory, and an unqualified callee can only
+        // bind inside its own package — a cross-package call carries its
+        // qualifier (`fmt::println`, `shared::record`) and resolves by
+        // qualified name above. So a bare name matching a symbol in another
+        // directory is wrong by construction, the same way a cross-file nix
+        // match is. Odin's builtins are already suppressed at emit; this is
+        // what stops a plain `helper()` linking to an unimported package's.
+        if (!target || path.dirname(target.filePath) !== path.dirname(ref.filePath)) {
+          nameResult = null;
+        }
       }
     }
     if (nameResult) {
