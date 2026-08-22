@@ -19,6 +19,9 @@ export class GodotResourceExtractor {
   private nodesByScenePath = new Map<string, Node>();
   private uniqueNameToNode = new Map<string, Node>();
   private rootNode: Node | null = null;
+  private inAutoloadSection = false;
+  /** Scene node id → attached script res:// path (`script = ExtResource(...)`). */
+  private scriptByNodeId = new Map<string, string>();
 
   constructor(filePath: string, source: string) {
     this.filePath = filePath;
@@ -70,18 +73,24 @@ export class GodotResourceExtractor {
 
   private extractSections(fileNodeId: string): void {
     let currentOwner: Node | null = null;
+    this.inAutoloadSection = false;
 
     for (let i = 0; i < this.lines.length; i++) {
       const line = this.lines[i] ?? '';
       const lineNumber = i + 1;
       const section = line.match(/^\[([A-Za-z_]+)([^\]]*)\]/);
       if (!section) {
-        if (currentOwner) this.extractSectionProperty(currentOwner, line, lineNumber);
+        if (this.inAutoloadSection) {
+          this.extractAutoloadEntry(fileNodeId, line, lineNumber);
+        } else if (currentOwner) {
+          this.extractSectionProperty(currentOwner, line, lineNumber);
+        }
         continue;
       }
 
       const type = section[1]!;
       const attrs = this.parseAttributes(section[2] ?? '');
+      this.inAutoloadSection = type === 'autoload';
       if (type === 'node') {
         const name = attrs.get('name') || '<unnamed_node>';
         const nodeType = attrs.get('type');
@@ -134,6 +143,28 @@ export class GodotResourceExtractor {
     this.extractInlineResourcePaths(fileNodeId);
   }
 
+  /**
+   * `[autoload]` entry in project.godot: `GameState="*res://core/game_state.gd"`.
+   * The singleton name is a bare global in every GDScript file, with no import
+   * to hang resolution on — emit a marker component (decorators: ['autoload'])
+   * whose signature carries the res:// path so the framework resolver can link
+   * receiver references to the script's class. The emitted reference also links
+   * the project file → script through the normal res:// file-path resolution.
+   */
+  private extractAutoloadEntry(fileNodeId: string, line: string, lineNumber: number): void {
+    const match = line.match(/^\s*([A-Za-z_]\w*)\s*=\s*"([^"]+)"/);
+    if (!match) return;
+    const [, name, rawPath] = match;
+    const resPath = rawPath!.replace(/^\*/, '');
+    if (!resPath.startsWith('res://')) return;
+
+    const node = this.createNode('component', name!, `${this.filePath}::autoload:${name}`, lineNumber, 0, line.length);
+    node.signature = line.trim();
+    node.decorators = ['autoload'];
+    this.addContains(fileNodeId, node.id);
+    this.addReference(fileNodeId, resPath, 'references', lineNumber, line.indexOf(resPath));
+  }
+
   private extractNodeInstanceReference(owner: Node, attrs: Map<string, string>, line: string, lineNumber: number): void {
     const instance = attrs.get('instance');
     if (!instance) return;
@@ -165,6 +196,9 @@ export class GodotResourceExtractor {
       if (resourcePath) {
         this.addReference(owner.id, resourcePath, 'references', lineNumber, line.indexOf('ExtResource'));
         this.addGodotResourceAliasReference(owner.id, resourcePath, 'references', lineNumber, line.indexOf('ExtResource'));
+        // Remember which script drives this scene node — [connection] wiring
+        // needs it to find handler methods in another file.
+        this.scriptByNodeId.set(owner.id, resourcePath);
       }
       return;
     }
@@ -217,6 +251,10 @@ export class GodotResourceExtractor {
         metadata: {
           signal: attrs.get('signal'),
           method,
+          // The handler usually lives in the script attached to the TO node —
+          // carry the path so the scene-connection synthesizer can bridge the
+          // flow across files without relying on name resolution.
+          scriptResPath: this.scriptByNodeId.get(toNode.id),
         },
       });
     }

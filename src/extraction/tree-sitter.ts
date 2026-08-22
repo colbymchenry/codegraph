@@ -27,7 +27,6 @@ import { SvelteExtractor } from './svelte-extractor';
 import { AstroExtractor } from './astro-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
-import { GDScriptExtractor } from './gdscript-extractor';
 import { GodotResourceExtractor } from './godot-resource-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
 import {
@@ -4771,10 +4770,6 @@ export function extractFromSource(
   } else if (detectedLanguage === 'razor') {
     // Use custom extractor for ASP.NET Razor (.cshtml) / Blazor (.razor) markup
     const extractor = new RazorExtractor(filePath, source);
-    result = extractor.extract();
-  } else if (detectedLanguage === 'gdscript') {
-    // Use custom extractor for GDScript
-    const extractor = new GDScriptExtractor(filePath, source);
     result = extractor.extract();
   } else if (detectedLanguage === 'godot_resource') {
     // Use custom extractor for Godot text scenes/resources

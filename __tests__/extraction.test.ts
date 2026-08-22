@@ -336,6 +336,115 @@ func _ready() -> void:
     const result = extractFromSource('tween_test.gd', code);
     expect(result.unresolvedReferences.some((r) => r.referenceKind === 'references' && r.referenceName === 'modulate:a')).toBe(true);
   });
+
+  it('should mark static funcs and not create symbols for lambdas', () => {
+    const code = `
+extends Node
+
+class_name FactoryScript
+
+static func build_handler(prefix: String) -> Callable:
+  return func(item: String) -> void:
+    deliver(prefix, item)
+
+func deliver(prefix: String, item: String) -> void:
+  pass
+`;
+    const result = extractFromSource('factory_script.gd', code);
+
+    const builder = result.nodes.find((n) => n.kind === 'method' && n.name === 'build_handler');
+    expect(builder?.isStatic).toBe(true);
+    expect(result.nodes.find((n) => n.kind === 'method' && n.name === 'deliver')?.isStatic).toBeFalsy();
+
+    // The lambda body's call still resolves through the enclosing method…
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'deliver')).toBe(true);
+    // …and the anonymous function itself produced NO symbol nodes.
+    const methodNames = result.nodes.filter((n) => n.kind === 'method' || n.kind === 'function').map((n) => n.name).sort();
+    expect(methodNames).toEqual(['build_handler', 'deliver']);
+  });
+
+  it('should extract calls inside match statement branches', () => {
+    const code = `
+extends Node
+
+func handle_event(event_type: int) -> void:
+  match event_type:
+    0:
+      start_game()
+    1:
+      show_menu()
+    _:
+      log_unknown(event_type)
+
+func start_game() -> void:
+  pass
+`;
+    const result = extractFromSource('event_router.gd', code);
+    for (const callee of ['start_game', 'show_menu', 'log_unknown']) {
+      expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === callee)).toBe(true);
+    }
+  });
+
+  it('should extract enum members and inner class containment', () => {
+    const code = `
+@tool
+class_name OuterPanel
+extends MarginContainer
+
+enum Rarity { COMMON, RARE }
+
+class InnerPanel extends Control:
+  func render() -> void:
+    pass
+`;
+    const result = extractFromSource('outer_panel_new.gd', code);
+
+    expect(result.nodes.some((n) => n.kind === 'enum' && n.name === 'Rarity')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'enum_member' && n.name === 'COMMON')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'enum_member' && n.name === 'RARE')).toBe(true);
+
+    const outer = result.nodes.find((n) => n.kind === 'class' && n.name === 'OuterPanel');
+    expect(outer?.decorators).toContain('tool');
+    const inner = result.nodes.find((n) => n.kind === 'class' && n.name === 'InnerPanel');
+    const render = result.nodes.find((n) => n.kind === 'method' && n.name === 'render');
+    expect(inner).toBeDefined();
+    expect(render).toBeDefined();
+    expect(result.edges.some((e) => e.kind === 'contains' && e.source === inner?.id && e.target === render?.id)).toBe(true);
+  });
+
+  it('should not create symbols from code-like text inside strings or comments', () => {
+    const code = `
+extends Node
+
+func _ready() -> void:
+  var snippet := "func phantom_method(): pass"
+  # ghost_call() mentioned only in a comment stays inert
+  real_call_target()
+
+func real_call_target() -> void:
+  pass
+`;
+    const result = extractFromSource('robustness_check.gd', code);
+
+    // AST-driven symbol extraction ignores string contents entirely.
+    expect(result.nodes.some((n) => (n.kind === 'method' || n.kind === 'function') && n.name === 'phantom_method')).toBe(false);
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'real_call_target')).toBe(true);
+    // Comment-stripped lines never contribute references.
+    expect(result.unresolvedReferences.some((r) => r.referenceKind === 'calls' && r.referenceName === 'ghost_call')).toBe(false);
+  });
+
+  it('should extract has_method() string-dispatch targets as calls', () => {
+    const code = `
+extends Node
+
+func interact(target: Node) -> void:
+  if target.has_method("take_hit"):
+    target.call("take_hit")
+`;
+    const result = extractFromSource('interactor.gd', code);
+    // has_method AND call() both bridge to the same method name.
+    expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'calls' && r.referenceName === 'take_hit').length).toBeGreaterThanOrEqual(2);
+  });
 });
 
 describe('Godot Resource Extraction', () => {

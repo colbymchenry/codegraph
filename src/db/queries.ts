@@ -1354,6 +1354,16 @@ export class QueryBuilder {
   }
 
   /**
+   * Get all edges with the given provenance (e.g. 'heuristic'). Used by
+   * synthesizers that re-read extraction-time heuristic wiring (scene-signal
+   * connections carrying {signal, method} metadata).
+   */
+  getEdgesByProvenance(provenance: string): Edge[] {
+    const rows = this.db.prepare('SELECT * FROM edges WHERE provenance = ?').all(provenance) as EdgeRow[];
+    return rows.map(rowToEdge);
+  }
+
+  /**
    * Find all edges where both source and target are in the given node set.
    * Useful for recovering inter-node connectivity after BFS.
    */
