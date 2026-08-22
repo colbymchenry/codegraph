@@ -269,6 +269,18 @@ function extractFile(root: SyntaxNode, ctx: ExtractorContext, state: ExtractorSt
   if (createdClass && hasToolAnnotation) createdClass.decorators = ['tool'];
   state.scriptClass = createdClass;
 
+  // Inline `@tool class_name X extends Y`: the extends_statement nests INSIDE
+  // class_name_statement — emit it here (the dispatch case swallows that node).
+  if (classNameNode) {
+    const inlineExtends = getChildByField(classNameNode, 'extends');
+    if (inlineExtends && state.scriptClass) {
+      const target = textOfType(inlineExtends, 'type', source);
+      if (target) {
+        emitRef(ctx, state.scriptClass.id, target, 'extends', inlineExtends.startPosition.row + 1, inlineExtends.startPosition.column, state);
+      }
+    }
+  }
+
   ctx.pushScope(state.scriptClass?.id ?? state.fileId);
   for (const child of children) {
     dispatch(child, ctx, state);
@@ -336,6 +348,7 @@ function dispatch(node: SyntaxNode, ctx: ExtractorContext, state: ExtractorState
       return extractVariableDeclaration(node, ctx, state, 'variable');
 
     case 'function_definition':
+    case 'constructor_definition': // `func _init(...)` — Godot's constructor
       return extractFunctionDefinition(node, ctx, state);
 
     case 'lambda': {
@@ -367,13 +380,17 @@ function dispatch(node: SyntaxNode, ctx: ExtractorContext, state: ExtractorState
     }
 
     default:
+      // Unclaimed construct (expression wrappers, if/for/match bodies, …):
+      // signal "not handled" so dispatchChildren keeps descending — symbols
+      // can nest arbitrarily deep (locals inside control flow).
       return false;
   }
 }
 
 function dispatchChildren(parent: SyntaxNode, ctx: ExtractorContext, state: ExtractorState): void {
   for (const child of childrenOf(parent)) {
-    dispatch(child, ctx, state);
+    const handled = dispatch(child, ctx, state);
+    if (!handled) dispatchChildren(child, ctx, state);
   }
 }
 
@@ -411,12 +428,19 @@ function emitRef(
 
 function extractFunctionDefinition(node: SyntaxNode, ctx: ExtractorContext, state: ExtractorState): boolean {
   const source = ctx.source;
-  const name = textOfField(node, 'name', source);
+  // constructor_definition has no name field — the name is implied `_init`.
+  const name = node.type === 'constructor_definition' ? '_init' : textOfField(node, 'name', source);
   const params = textOfField(node, 'parameters', source);
   const returnType = textOfField(node, 'return_type', source);
   const isStatic = node.namedChildren.some((c) => c.type === 'static_keyword');
 
-  const method = ctx.createNode('method', name, node, {
+  // Parity with the old extractor: funcs in a script WITHOUT class_name or
+  // extends (no script class at all) extract as plain 'function' kind.
+  const parentId = currentOwner(ctx);
+  const parentNode = ctx.nodes.find((n) => n.id === parentId);
+  const kind: 'method' | 'function' = parentNode && parentNode.kind !== 'file' ? 'method' : 'function';
+
+  const method = ctx.createNode(kind, name, node, {
     signature: `${params || '()'}${returnType ? ` -> ${returnType.trim()}` : ''}`,
     isStatic,
   });
@@ -790,10 +814,9 @@ function runReferencePasses(ctx: ExtractorContext, state: ExtractorState): void 
 
     let match: RegExpExecArray | null;
 
-    const extendsMatch = code.match(/^\s*(?:@\w+(?:\([^)]*\))?\s+)*(?:(?:class_name|class)\s+[A-Za-z_]\w*\s+)?extends\s+(?:"([^"]+)"|'([^']+)'|([A-Za-z_][\w.]*))/);
-    if (extendsMatch) {
-      emitRef(ctx, owner, extendsMatch[1] || extendsMatch[2] || extendsMatch[3]!, 'extends', lineNumber, code.indexOf('extends'), state);
-    }
+    // NOTE: extends targets are emitted from the AST walk (extends_statement /
+    // class_definition children) — deliberately NOT matched here, or every
+    // extends would double-count (beehave parity-diff finding).
 
     const resourceRegex = /\b(?:preload|load)\s*\(\s*["']([^"']+)["']\s*\)/g;
     while ((match = resourceRegex.exec(code)) !== null) {
