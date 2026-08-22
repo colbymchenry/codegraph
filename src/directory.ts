@@ -584,35 +584,56 @@ export function planFrontload(cwd: string, prompt: string): FrontloadPlan {
 
 /**
  * Contents of `.codegraph/.gitignore`. A single wildcard ignore keeps every
- * transient file in the index dir — the database, `daemon.pid`, the socket,
- * logs, cache, and anything future versions add — out of git, without having
- * to enumerate each name (issues #788, #492, #484). Older versions wrote an
- * explicit allowlist that never listed `daemon.pid` or the socket, so those
- * runtime files were silently committed.
+ * file in the index dir — the database, `daemon.pid`, the socket, logs,
+ * cache, this ignore file itself, and anything future versions add — out of
+ * git, without having to enumerate each name (issues #788, #492, #484).
+ *
+ * The wildcard deliberately covers `.gitignore` too. An earlier default added
+ * `!.gitignore`, which re-exposed the generated file: in any repository whose
+ * root `.gitignore` doesn't already mask `.codegraph/`, that one un-ignored
+ * file made the whole generated index dir surface as untracked work
+ * (`?? .codegraph/`). Git still reads and honors an ignore file that ignores
+ * itself, so self-ignoring is what makes the index local-only everywhere
+ * — no edit to the consumer's root `.gitignore` required.
  */
 const GITIGNORE_CONTENT = `# CodeGraph data files — local to each machine, not for committing.
-# Ignore everything in .codegraph/ except this file itself, so transient
-# files (the database, daemon.pid, sockets, logs) never show up in git.
+# Ignore everything in .codegraph/, including this file itself, so the
+# generated index (database, daemon.pid, sockets, logs) stays invisible to
+# git without touching the repository's own .gitignore.
 *
-!.gitignore
 `;
 
 /** Header line that prefixes every .gitignore CodeGraph has auto-generated. */
 const GITIGNORE_MARKER = '# CodeGraph data files';
 
 /**
+ * The self-negation line the previous default emitted. Its presence under our
+ * header marks a generated file that still leaks `.codegraph/.gitignore` into
+ * `git status` as untracked.
+ */
+const GITIGNORE_SELF_NEGATION = '!.gitignore';
+
+/**
  * Is `content` a stale CodeGraph-generated `.gitignore` that should be
- * regenerated in place? True when it carries our header but predates the
- * wildcard ignore (it has no bare `*` line) — i.e. one of the old explicit
- * allowlists (`*.db`, `cache/`, `.dirty`, …) that never ignored `daemon.pid`
- * or the socket (issue #788). A file WITHOUT our header is user-authored and
- * is left untouched; one that already has the wildcard is current. Matching
+ * regenerated in place? Two generations qualify, both gated on our header:
+ *
+ *  1. No bare `*` line — one of the old explicit allowlists (`*.db`,
+ *     `cache/`, `.dirty`, …) that never ignored `daemon.pid` or the socket
+ *     (issue #788).
+ *  2. A bare `*` plus `!.gitignore` — the wildcard default that re-exposed
+ *     the generated ignore file, so `.codegraph/` showed up as untracked in
+ *     any repo without a root rule for it.
+ *
+ * A file WITHOUT our header is user-authored and is left untouched; so is a
+ * headered file that customizes the default with some other negation. Matching
  * on the header (not a byte-exact list of past defaults) heals every old
- * variant — v0.7.x through 0.9.9 — and is idempotent once upgraded.
+ * variant — v0.7.x onward — and is idempotent once upgraded.
  */
 function isStaleDefaultGitignore(content: string): boolean {
   if (!content.trimStart().startsWith(GITIGNORE_MARKER)) return false;
-  return !content.split('\n').some((line) => line.trim() === '*');
+  const lines = content.split('\n').map((line) => line.trim());
+  if (!lines.includes('*')) return true;
+  return lines.includes(GITIGNORE_SELF_NEGATION);
 }
 
 /**

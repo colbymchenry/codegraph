@@ -25,6 +25,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- The index CodeGraph generates no longer shows up as untracked work in `git status`. `.codegraph/` now hides itself completely in every repository, so `codegraph init` leaves your working tree exactly as clean as it was before and you don't need to add anything to your own `.gitignore`. Projects initialized by an earlier version are corrected automatically the next time you run any CodeGraph command, and a `.codegraph/.gitignore` you wrote yourself is still left untouched. (#492)
+
 - Indexing no longer hangs on a Swift Vapor project containing a call with a long argument list. A single `.get(...)`-style call with many labeled arguments and no `use:` handler — the shape generated request builders produce — could stall `codegraph index`, `codegraph sync`, and the MCP server indefinitely. Route detection now handles such files in milliseconds, and every previously-recognized route shape still parses exactly as before. Thanks @maxmilian. (#1544) (Swift)
 
 - `codegraph status` now sees new files inside brand-new directories. Git reports an entirely-untracked directory as a single collapsed entry, so source files created there — a freshly scaffolded `frontend/`, for example — were missing from the pending-changes report, which could claim everything was up to date while those files had not yet been indexed. Thanks @maxmilian. (#1213)

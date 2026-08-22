@@ -114,7 +114,7 @@ cd your-project
 codegraph init
 ```
 
-<sub>`codegraph init` creates the local `.codegraph/` directory and builds the full graph in the same step — one command, done.</sub>
+<sub>`codegraph init` creates the local `.codegraph/` directory and builds the full graph in the same step — one command, done. `.codegraph/` is local to your machine and ignores itself, so it never shows up in `git status` and you don't have to add anything to your project's `.gitignore`.</sub>
 
 <div align="center">
 
@@ -495,7 +495,7 @@ The exact text is `src/mcp/server-instructions.ts` — the single source of trut
 
 1. **Extraction** — a native **Rust kernel** parses source with [tree-sitter](https://tree-sitter.github.io/) grammars compiled into it, extracting nodes (functions, classes, methods) and edges (calls, imports, extends, implements) for 20 languages; remaining languages and per-file fallbacks use the same extraction logic on the portable engine, producing identical graphs.
 
-2. **Storage** — Everything goes into a local SQLite database (`.codegraph/codegraph.db`) with FTS5 full-text search.
+2. **Storage** — Everything goes into a local SQLite database (`.codegraph/codegraph.db`) with FTS5 full-text search. The whole `.codegraph/` directory is generated, machine-local, and safe to delete — it carries a nested ignore file that hides the directory and itself from git, so nothing in it is ever offered up for commit.
 
 3. **Resolution** — After extraction, references are resolved: function calls → definitions, imports → source files, class inheritance, and framework-specific patterns.
 

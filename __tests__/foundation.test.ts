@@ -5,6 +5,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -62,10 +63,11 @@ describe('CodeGraph Foundation', () => {
       expect(fs.existsSync(gitignorePath)).toBe(true);
 
       const content = fs.readFileSync(gitignorePath, 'utf-8');
-      // Ignore everything in .codegraph/ except this file itself, so transient
-      // files (db, daemon.pid, sockets, logs) never show up in git. (#492, #484)
-      expect(content).toContain('*');
-      expect(content).toContain('!.gitignore');
+      // Ignore everything in .codegraph/ — db, daemon.pid, sockets, logs, and
+      // this file itself — so the generated index never shows up in git in a
+      // consumer repo that has no root rule for it. (#492, #484)
+      expect(content.split('\n').map((l) => l.trim())).toContain('*');
+      expect(content).not.toContain('!.gitignore');
 
       cg.close();
     });
@@ -305,8 +307,36 @@ describe('CodeGraph Foundation', () => {
 
       const upgraded = fs.readFileSync(gitignorePath, 'utf-8');
       expect(upgraded).toContain('\n*\n'); // wildcard ignores everything…
-      expect(upgraded).toContain('!.gitignore'); // …except this file
+      expect(upgraded).not.toContain('!.gitignore'); // …including this file
       expect(upgraded).not.toContain('.dirty'); // old explicit list is gone
+    });
+
+    it('upgrades the wildcard-plus-!.gitignore default in place', () => {
+      const cg = CodeGraph.initSync(tempDir);
+      cg.close();
+
+      const gitignorePath = path.join(getCodeGraphDir(tempDir), '.gitignore');
+      // The default shipped between #788 and this change: it ignored every
+      // transient file but re-exposed itself, so `.codegraph/` still surfaced
+      // as untracked work in any repo without a root rule for it.
+      const staleWildcard =
+        '# CodeGraph data files — local to each machine, not for committing.\n' +
+        '# Ignore everything in .codegraph/ except this file itself, so transient\n' +
+        '# files (the database, daemon.pid, sockets, logs) never show up in git.\n' +
+        '*\n!.gitignore\n';
+      fs.writeFileSync(gitignorePath, staleWildcard, 'utf-8');
+
+      const cg2 = CodeGraph.openSync(tempDir);
+      cg2.close();
+
+      const upgraded = fs.readFileSync(gitignorePath, 'utf-8');
+      expect(upgraded).toContain('\n*\n');
+      expect(upgraded).not.toContain('!.gitignore');
+
+      // Idempotent: a second open must not rewrite the now-current default.
+      const cg3 = CodeGraph.openSync(tempDir);
+      cg3.close();
+      expect(fs.readFileSync(gitignorePath, 'utf-8')).toBe(upgraded);
     });
 
     it('leaves a user-customized .codegraph/.gitignore untouched', () => {
@@ -322,6 +352,25 @@ describe('CodeGraph Foundation', () => {
       cg2.close();
 
       expect(fs.readFileSync(gitignorePath, 'utf-8')).toBe(custom);
+    });
+
+    it('leaves a headered .gitignore with a non-self negation untouched', () => {
+      const cg = CodeGraph.initSync(tempDir);
+      cg.close();
+
+      const gitignorePath = path.join(getCodeGraphDir(tempDir), '.gitignore');
+      // Our header + wildcard, but the user un-ignored a file of their own.
+      // Only the exact `!.gitignore` self-negation marks a stale default, so
+      // this deliberate customization survives.
+      const customized =
+        '# CodeGraph data files — local to each machine, not for committing.\n' +
+        '*\n!notes.md\n';
+      fs.writeFileSync(gitignorePath, customized, 'utf-8');
+
+      const cg2 = CodeGraph.openSync(tempDir);
+      cg2.close();
+
+      expect(fs.readFileSync(gitignorePath, 'utf-8')).toBe(customized);
     });
   });
 
@@ -560,5 +609,132 @@ describe('CODEGRAPH_DIR override (#636)', () => {
     } finally {
       win.close();
     }
+  });
+});
+
+/**
+ * The generated index must be invisible to git in EVERY consumer repository,
+ * without CodeGraph editing the repo's own root `.gitignore`.
+ *
+ * The nested `.codegraph/.gitignore` used to end with `!.gitignore`, which
+ * re-exposed itself: in a repo whose root ignore file has no rule for
+ * `.codegraph/` (i.e. every repo but this one), `git status` reported
+ * `?? .codegraph/` as untracked work. Ignoring the generated file with the
+ * same wildcard closes that hole — git still reads and honors an ignore file
+ * that ignores itself.
+ *
+ * These drive real `git` against real temp repos — the only way to prove what
+ * git actually reports.
+ */
+describe('generated index is invisible to git', () => {
+  let repo: string;
+  const savedDirName = process.env.CODEGRAPH_DIR;
+
+  /** Run git with the developer's global/system config out of the way, so a
+   *  personal `core.excludesFile` can neither mask nor cause a failure. */
+  function git(...args: string[]): string {
+    const none = path.join(repo, 'no-such-gitconfig');
+    return execFileSync('git', args, {
+      cwd: repo,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, GIT_CONFIG_GLOBAL: none, GIT_CONFIG_SYSTEM: none },
+    });
+  }
+
+  /** Everything `git status` would surface, including files inside untracked dirs. */
+  function untracked(): string {
+    return git('status', '--porcelain', '--untracked-files=all').trim();
+  }
+
+  /** Simulate a live index: the runtime files a real session leaves behind. */
+  function plantRuntimeFiles(dataDir: string): void {
+    fs.writeFileSync(path.join(dataDir, 'daemon.pid'), '12345\n');
+    fs.writeFileSync(path.join(dataDir, 'codegraph.db-wal'), '');
+    fs.mkdirSync(path.join(dataDir, 'cache'), { recursive: true });
+    fs.writeFileSync(path.join(dataDir, 'cache', 'entry.json'), '{}');
+  }
+
+  beforeEach(() => {
+    repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-gitvis-')));
+    execFileSync('git', ['init'], { cwd: repo, stdio: ['ignore', 'ignore', 'ignore'] });
+    // A consumer repo with real content and NO rule for .codegraph/ anywhere.
+    fs.writeFileSync(path.join(repo, 'README.md'), '# consumer\n');
+    fs.writeFileSync(path.join(repo, '.gitignore'), 'node_modules/\ndist/\n');
+  });
+
+  afterEach(() => {
+    if (savedDirName === undefined) delete process.env.CODEGRAPH_DIR;
+    else process.env.CODEGRAPH_DIR = savedDirName;
+    fs.rmSync(repo, { recursive: true, force: true });
+  });
+
+  it('fresh init leaves nothing from .codegraph in git status', () => {
+    const before = untracked();
+    expect(before).toContain('README.md'); // the repo's own files still show
+
+    const cg = CodeGraph.initSync(repo);
+    cg.close();
+    plantRuntimeFiles(getCodeGraphDir(repo));
+
+    // Not one path under the data dir is reported — not even its .gitignore.
+    expect(untracked()).not.toMatch(/\.codegraph/);
+    expect(untracked()).toBe(before); // status is byte-identical to pre-init
+
+    // …and git agrees the generated ignore file ignores itself.
+    expect(
+      git('check-ignore', '-v', path.join('.codegraph', '.gitignore'))
+    ).toContain(path.join('.codegraph', '.gitignore'));
+  });
+
+  it('migrating a pre-existing !.gitignore index clears it from git status', () => {
+    const cg = CodeGraph.initSync(repo);
+    cg.close();
+    const gitignorePath = path.join(getCodeGraphDir(repo), '.gitignore');
+    // Roll the index back to the previously shipped default.
+    fs.writeFileSync(
+      gitignorePath,
+      '# CodeGraph data files — local to each machine, not for committing.\n' +
+        '# Ignore everything in .codegraph/ except this file itself, so transient\n' +
+        '# files (the database, daemon.pid, sockets, logs) never show up in git.\n' +
+        '*\n!.gitignore\n',
+      'utf-8'
+    );
+    plantRuntimeFiles(getCodeGraphDir(repo));
+
+    // Pre-condition: this is exactly the leak being fixed.
+    expect(untracked()).toContain(path.join('.codegraph', '.gitignore'));
+
+    // Any CodeGraph command runs validateDirectory, which self-heals.
+    const cg2 = CodeGraph.openSync(repo);
+    cg2.close();
+
+    expect(untracked()).not.toMatch(/\.codegraph/);
+  });
+
+  it('an alternate CODEGRAPH_DIR is hidden the same way (#636)', () => {
+    process.env.CODEGRAPH_DIR = '.codegraph-win';
+    const cg = CodeGraph.initSync(repo);
+    cg.close();
+    plantRuntimeFiles(getCodeGraphDir(repo));
+
+    expect(fs.existsSync(path.join(repo, '.codegraph-win', 'codegraph.db'))).toBe(true);
+    expect(untracked()).not.toMatch(/\.codegraph-win/);
+  });
+
+  it('a user-authored .codegraph/.gitignore keeps its own git semantics', () => {
+    const cg = CodeGraph.initSync(repo);
+    cg.close();
+    const gitignorePath = path.join(getCodeGraphDir(repo), '.gitignore');
+    // No CodeGraph header → user-authored → never rewritten, so whatever the
+    // user chose to expose stays exposed. CodeGraph does not police this.
+    const custom = '# my own rules\n*\n!.gitignore\n';
+    fs.writeFileSync(gitignorePath, custom, 'utf-8');
+
+    const cg2 = CodeGraph.openSync(repo);
+    cg2.close();
+
+    expect(fs.readFileSync(gitignorePath, 'utf-8')).toBe(custom);
+    expect(untracked()).toContain(path.join('.codegraph', '.gitignore'));
   });
 });
