@@ -40,6 +40,7 @@ function setHome(dir: string): { restore: () => void } {
     XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
     HERMES_HOME: process.env.HERMES_HOME,
     COPILOT_HOME: process.env.COPILOT_HOME,
+    DSH_HOME: process.env.DSH_HOME,
   };
   process.env.HOME = dir;
   process.env.USERPROFILE = dir;
@@ -47,6 +48,7 @@ function setHome(dir: string): { restore: () => void } {
   process.env.XDG_CONFIG_HOME = path.join(dir, '.config');
   delete process.env.HERMES_HOME;
   delete process.env.COPILOT_HOME;
+  delete process.env.DSH_HOME;
   return {
     restore() {
       if (prev.HOME === undefined) delete process.env.HOME; else process.env.HOME = prev.HOME;
@@ -55,6 +57,7 @@ function setHome(dir: string): { restore: () => void } {
       if (prev.XDG_CONFIG_HOME === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = prev.XDG_CONFIG_HOME;
       if (prev.HERMES_HOME === undefined) delete process.env.HERMES_HOME; else process.env.HERMES_HOME = prev.HERMES_HOME;
       if (prev.COPILOT_HOME === undefined) delete process.env.COPILOT_HOME; else process.env.COPILOT_HOME = prev.COPILOT_HOME;
+      if (prev.DSH_HOME === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prev.DSH_HOME;
     },
   };
 }
@@ -1269,6 +1272,466 @@ describe('Installer targets — partial-state idempotency', () => {
     const stopCmds = (s.hooks?.Stop ?? []).flatMap((g: any) => (g.hooks ?? []).map((h: any) => h.command));
     expect(stopCmds).toContain('codegraph sync-if-dirty');
   });
+
+  // ---- DeepSeek Harness (dsh) -----------------------------------------
+  //
+  // dsh configures MCP servers as plugin rows in layered YAML patch
+  // files; the home-level $DSH_HOME/cordis.patch.yml applies to every
+  // profile. The file must stay a valid top-level YAML array — dsh
+  // fails its boot on a comments-only or mixed-indent file.
+
+  const DSH_ENTRY_4 = [
+    '    - id: mcp-codegraph',
+    "      name: '@deepseek-ai/dsh-mcp-client'",
+    '      config:',
+    '        serverName: codegraph',
+    '        transport: stdio',
+    '        command: codegraph',
+    '        args:',
+    '          - serve',
+    '          - --mcp',
+    '        failOnStartupError: false',
+  ].join('\n');
+  const DSH_BLOCK_4 = ['- insert:', DSH_ENTRY_4].join('\n');
+
+  it('dsh: install writes the home-level MCP entry, detects it, and is idempotent', () => {
+    const dsh = getTarget('dsh')!;
+    // DeepSeek Harness keeps all config under $DSH_HOME — no project-local.
+    expect(dsh.supportsLocation('local')).toBe(false);
+    expect(dsh.describePaths('local')).toEqual([]);
+    const file = path.join(tmpHome, '.dsh', 'cordis.patch.yml');
+    expect(dsh.detect('global').alreadyConfigured).toBe(false);
+
+    const first = dsh.install('global', { autoAllow: true });
+    const mcp = first.files.find((f) => f.path === file)!;
+    expect(mcp.action).toBe('created');
+    const body = fs.readFileSync(file, 'utf-8');
+    expect(body).toContain(DSH_BLOCK_4);
+    expect(dsh.detect('global').alreadyConfigured).toBe(true);
+    expect(dsh.detect('global').configPath).toBe(file);
+
+    const second = dsh.install('global', { autoAllow: true });
+    expect(second.files.find((f) => f.path === file)?.action).toBe('unchanged');
+    expect(fs.readFileSync(file, 'utf-8')).toBe(body);
+  });
+
+  it('dsh: install replaces a lone [] line, preserving the user\'s comments; uninstall restores them + []', () => {
+    const dsh = getTarget('dsh')!;
+    const file = path.join(tmpHome, '.dsh', 'cordis.patch.yml');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '# my patch layer\n[]\n');
+
+    const result = dsh.install('global', { autoAllow: true });
+    expect(result.files.find((f) => f.path === file)?.action).toBe('updated');
+    expect(fs.readFileSync(file, 'utf-8')).toBe(`# my patch layer\n${DSH_BLOCK_4}\n`);
+
+    dsh.uninstall('global');
+    // The user created this file — never delete it; restore their
+    // comments plus the documented empty state.
+    expect(fs.existsSync(file)).toBe(true);
+    expect(fs.readFileSync(file, 'utf-8')).toBe('# my patch layer\n[]\n');
+    expect(dsh.detect('global').alreadyConfigured).toBe(false);
+  });
+
+  it('dsh: user []-only file round-trips back to []', () => {
+    const dsh = getTarget('dsh')!;
+    const file = path.join(tmpHome, '.dsh', 'cordis.patch.yml');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '[]\n');
+
+    dsh.install('global', { autoAllow: true });
+    expect(fs.readFileSync(file, 'utf-8')).toBe(`${DSH_BLOCK_4}\n`);
+
+    dsh.uninstall('global');
+    expect(fs.readFileSync(file, 'utf-8')).toBe('[]\n');
+  });
+
+  it('dsh: install repairs a comments-only file (which dsh cannot boot)', () => {
+    const dsh = getTarget('dsh')!;
+    const file = path.join(tmpHome, '.dsh', 'cordis.patch.yml');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '# only comments, no array\n');
+
+    const result = dsh.install('global', { autoAllow: true });
+    expect(result.files.find((f) => f.path === file)?.action).toBe('updated');
+    expect(fs.readFileSync(file, 'utf-8')).toBe(`# only comments, no array\n${DSH_BLOCK_4}\n`);
+  });
+
+  it('dsh: install appends into a 2-space-style insert block AT THAT INDENT (mixed-indent regression, cf. hermes #456)', () => {
+    const dsh = getTarget('dsh')!;
+    const file = path.join(tmpHome, '.dsh', 'cordis.patch.yml');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, [
+      '# my patch layer',
+      '- insert:',
+      '  - id: my-plugin',
+      '    name: "./plugins/my-plugin.mjs"',
+      '    config:',
+      '      enabled: true',
+      '',
+    ].join('\n'));
+
+    dsh.install('global', { autoAllow: true });
+    const body = fs.readFileSync(file, 'utf-8');
+
+    // Our entry landed INSIDE the block, at the block's own 2-space
+    // item indent — never at our canonical 4-space (js-yaml rejects
+    // mixed item indents in one sequence, and a parse failure aborts
+    // the dsh boot).
+    expect(body).toContain('      enabled: true\n  - id: mcp-codegraph');
+    expect(body).not.toContain('\n    - id: mcp-codegraph');
+    expect(body).toContain('  - id: my-plugin');
+
+    // Idempotent: the byte-equal 2-space entry is left alone.
+    const second = dsh.install('global', { autoAllow: true });
+    expect(second.files.find((f) => f.path === file)?.action).toBe('unchanged');
+    expect(fs.readFileSync(file, 'utf-8')).toBe(body);
+
+    // Uninstall strips only our entry, in the user's style file.
+    dsh.uninstall('global');
+    const after = fs.readFileSync(file, 'utf-8');
+    expect(after).not.toContain('mcp-codegraph');
+    expect(after).toContain('  - id: my-plugin');
+    expect(after).toContain('      enabled: true');
+    expect(after).toContain('# my patch layer');
+  });
+
+  it('dsh: install appends a fresh block after sibling id-patches when no insert block exists', () => {
+    const dsh = getTarget('dsh')!;
+    const file = path.join(tmpHome, '.dsh', 'cordis.patch.yml');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, [
+      '# my patch layer',
+      '- id: telemetry-otel',
+      '  disabled: true',
+      '',
+    ].join('\n'));
+
+    const result = dsh.install('global', { autoAllow: true });
+    expect(result.files.find((f) => f.path === file)?.action).toBe('updated');
+    const body = fs.readFileSync(file, 'utf-8');
+    expect(body).toBe(`# my patch layer\n- id: telemetry-otel\n  disabled: true\n\n${DSH_BLOCK_4}\n`);
+
+    dsh.uninstall('global');
+    expect(fs.readFileSync(file, 'utf-8')).toBe('# my patch layer\n- id: telemetry-otel\n  disabled: true\n');
+  });
+
+  it('dsh: install rewrites a user-edited entry in place at its own indent, keeping siblings', () => {
+    const dsh = getTarget('dsh')!;
+    const file = path.join(tmpHome, '.dsh', 'cordis.patch.yml');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, [
+      '- insert:',
+      '  - id: mcp-codegraph',
+      "    name: '@deepseek-ai/dsh-mcp-client'",
+      '    config:',
+      '      serverName: codegraph',
+      '      transport: stdio',
+      '      command: /custom/path/codegraph',
+      '      args:',
+      '        - serve',
+      '        - --mcp',
+      '      failOnStartupError: false',
+      '  - id: other',
+      "    name: './plugins/other.mjs'",
+      '',
+    ].join('\n'));
+
+    const result = dsh.install('global', { autoAllow: true });
+    expect(result.files.find((f) => f.path === file)?.action).toBe('updated');
+    const body = fs.readFileSync(file, 'utf-8');
+    // Canonical command restored, sibling preserved, still 2-space style.
+    expect(body).toContain('  - id: other');
+    expect(body).toContain('      command: codegraph');
+    expect(body).not.toContain('/custom/path/');
+    expect(body).not.toContain('\n    - id: mcp-codegraph');
+    // Idempotent afterwards.
+    const second = dsh.install('global', { autoAllow: true });
+    expect(second.files.find((f) => f.path === file)?.action).toBe('unchanged');
+  });
+
+  it('dsh: an id-targeted override patch is never confused with our entry', () => {
+    const dsh = getTarget('dsh')!;
+    const file = path.join(tmpHome, '.dsh', 'cordis.patch.yml');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    // A user patch that targets our (or any) mcp-codegraph row — a
+    // bare id row, no plugin name. Detection requires BOTH markers.
+    const override = [
+      '# my patch layer',
+      '- insert:',
+      '  - id: other',
+      "    name: './plugins/other.mjs'",
+      '- id: mcp-codegraph',
+      '  disabled: true',
+      '',
+    ].join('\n');
+    fs.writeFileSync(file, override);
+
+    dsh.install('global', { autoAllow: true });
+    const body = fs.readFileSync(file, 'utf-8');
+    // The override row survives byte-identical…
+    expect(body).toContain('- id: mcp-codegraph\n  disabled: true');
+    // …our insert entry was appended into the block at its indent.
+    expect(body).toContain('  - id: mcp-codegraph');
+    expect(body).toContain("  name: '@deepseek-ai/dsh-mcp-client'");
+
+    // Uninstall removes only the inserted entry — the override row is
+    // user content and stays.
+    dsh.uninstall('global');
+    const after = fs.readFileSync(file, 'utf-8');
+    expect(after).toContain('- id: mcp-codegraph\n  disabled: true');
+    expect(after).not.toContain('@deepseek-ai/dsh-mcp-client');
+    expect(after).toContain('  - id: other');
+  });
+
+  it('dsh: uninstall removes only our entry, preserving siblings and comments', () => {
+    const dsh = getTarget('dsh')!;
+    const file = path.join(tmpHome, '.dsh', 'cordis.patch.yml');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, [
+      '# my patch layer',
+      '- insert:',
+      ...DSH_ENTRY_4.split('\n'),
+      '    - id: graphify',
+      "      name: './plugins/graphify.mjs'",
+      '      config:',
+      '        enabled: true',
+      '',
+    ].join('\n'));
+
+    const result = dsh.uninstall('global');
+    expect(result.files.find((f) => f.path === file)?.action).toBe('removed');
+    const body = fs.readFileSync(file, 'utf-8');
+    expect(body).not.toContain('mcp-codegraph');
+    expect(body).not.toContain('serverName: codegraph');
+    expect(body).toContain('# my patch layer');
+    expect(body).toContain('    - id: graphify');
+    expect(dsh.detect('global').alreadyConfigured).toBe(false);
+  });
+
+  it('dsh: uninstall deletes the patch file when the installer created it', () => {
+    const dsh = getTarget('dsh')!;
+    const file = path.join(tmpHome, '.dsh', 'cordis.patch.yml');
+    dsh.install('global', { autoAllow: true });
+    expect(fs.existsSync(file)).toBe(true);
+
+    dsh.uninstall('global');
+    expect(fs.existsSync(file)).toBe(false);
+    expect(dsh.detect('global').alreadyConfigured).toBe(false);
+  });
+
+  it('dsh: install migrates a per-profile codegraph entry up to the home layer (duplicate serverName self-heal)', () => {
+    const dsh = getTarget('dsh')!;
+    const profileDir = path.join(tmpHome, '.dsh', 'profiles', 'web');
+    fs.mkdirSync(profileDir, { recursive: true });
+    const profileFile = path.join(profileDir, 'cordis.patch.yml');
+    fs.writeFileSync(profileFile, [
+      '- insert:',
+      '    - id: mcp-codegraph',
+      "      name: '@deepseek-ai/dsh-mcp-client'",
+      '      config:',
+      '        serverName: codegraph',
+      '        transport: stdio',
+      '        command: /manual/path/codegraph',
+      '        args:',
+      '          - serve',
+      '          - --mcp',
+      '        failOnStartupError: false',
+      '    - id: graphify',
+      "      name: './plugins/graphify.mjs'",
+      '      config:',
+      '        enabled: true',
+      '',
+    ].join('\n'));
+
+    // A per-profile entry alone counts as configured…
+    expect(dsh.detect('global').alreadyConfigured).toBe(true);
+
+    const result = dsh.install('global', { autoAllow: true });
+    // …and install migrates it: home layer created, profile entry swept,
+    // sibling profile plugin kept (never deleted — we didn't create it).
+    const homeFile = path.join(tmpHome, '.dsh', 'cordis.patch.yml');
+    expect(result.files.find((f) => f.path === homeFile)?.action).toBe('created');
+    expect(result.files.find((f) => f.path === profileFile)?.action).toBe('removed');
+    expect(fs.readFileSync(homeFile, 'utf-8')).toContain(DSH_BLOCK_4);
+    const profileBody = fs.readFileSync(profileFile, 'utf-8');
+    expect(profileBody).not.toContain('mcp-codegraph');
+    expect(profileBody).not.toContain('/manual/path/');
+    expect(profileBody).toContain('    - id: graphify');
+    expect(fs.existsSync(profileFile)).toBe(true);
+  });
+
+  it('dsh: uninstall fully removes a profile-only install (detect/uninstall symmetry)', () => {
+    const dsh = getTarget('dsh')!;
+    const profileDir = path.join(tmpHome, '.dsh', 'profiles', 'headless');
+    fs.mkdirSync(profileDir, { recursive: true });
+    const profileFile = path.join(profileDir, 'cordis.patch.yml');
+    fs.writeFileSync(profileFile, `${DSH_BLOCK_4}\n`);
+
+    // A profile-only entry is "configured"…
+    expect(dsh.detect('global').alreadyConfigured).toBe(true);
+
+    const result = dsh.uninstall('global');
+    // …and uninstall removes it (home file absent → not-found, profile
+    // swept back to a valid empty patch list — never deleted).
+    expect(result.files.find((f) => f.path === path.join(tmpHome, '.dsh', 'cordis.patch.yml'))?.action).toBe('not-found');
+    expect(result.files.find((f) => f.path === profileFile)?.action).toBe('removed');
+    expect(fs.existsSync(profileFile)).toBe(true);
+    expect(fs.readFileSync(profileFile, 'utf-8')).toBe('[]\n');
+    expect(dsh.detect('global').alreadyConfigured).toBe(false);
+  });
+
+  it('dsh: an unclassifiable flow-style file is left untouched with a note', () => {
+    const dsh = getTarget('dsh')!;
+    const file = path.join(tmpHome, '.dsh', 'cordis.patch.yml');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const flow = '[{id: my-thing, disabled: true}]\n';
+    fs.writeFileSync(file, flow);
+
+    const result = dsh.install('global', { autoAllow: true });
+    expect(result.files.find((f) => f.path === file)?.action).toBe('kept');
+    expect(result.notes?.[0]).toContain('print-config');
+    expect(fs.readFileSync(file, 'utf-8')).toBe(flow);
+    expect(dsh.detect('global').alreadyConfigured).toBe(false);
+
+    // Uninstall is equally conservative.
+    const un = dsh.uninstall('global');
+    expect(un.files.find((f) => f.path === file)?.action).toBe('not-found');
+    expect(fs.readFileSync(file, 'utf-8')).toBe(flow);
+  });
+
+  // A hand-written FLOW-STYLE codegraph entry nested in a block: detected
+  // as configured, but the line editor cannot rewrite flow style, so
+  // install must NEVER append a block-style duplicate (a second
+  // serverName:codegraph row makes the later dsh-mcp-client instance
+  // fail at load) and uninstall must never claim it removed one.
+  const FLOW_OURS = [
+    '- insert:',
+    "    - { id: mcp-codegraph, name: '@deepseek-ai/dsh-mcp-client', config: { serverName: codegraph, transport: stdio, command: codegraph, args: [serve, --mcp], failOnStartupError: false } }",
+    '',
+  ].join('\n');
+
+  it('dsh: a flow-style codegraph entry in a block is detected as configured but never rewritten (install keeps it)', () => {
+    const dsh = getTarget('dsh')!;
+    const file = path.join(tmpHome, '.dsh', 'cordis.patch.yml');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, FLOW_OURS);
+
+    // Detection recognizes the flow-style entry as ours.
+    expect(dsh.detect('global').alreadyConfigured).toBe(true);
+
+    // Kept + note, file byte-identical, no duplicate appended.
+    const result = dsh.install('global', { autoAllow: true });
+    expect(result.files.find((f) => f.path === file)?.action).toBe('kept');
+    expect(result.notes?.[0]).toContain('print-config');
+    expect(fs.readFileSync(file, 'utf-8')).toBe(FLOW_OURS);
+
+    // Re-running behaves identically — nothing accumulates.
+    const again = dsh.install('global', { autoAllow: true });
+    expect(again.files.find((f) => f.path === file)?.action).toBe('kept');
+    expect(fs.readFileSync(file, 'utf-8')).toBe(FLOW_OURS);
+  });
+
+  it('dsh: uninstall on a flow-style codegraph entry reports kept (detected but not strippable), file byte-identical', () => {
+    const dsh = getTarget('dsh')!;
+    const file = path.join(tmpHome, '.dsh', 'cordis.patch.yml');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, FLOW_OURS);
+    expect(dsh.detect('global').alreadyConfigured).toBe(true);
+
+    const result = dsh.uninstall('global');
+    expect(result.files.find((f) => f.path === file)?.action).toBe('kept');
+    expect(result.notes?.length).toBe(1);
+    expect(result.notes?.[0]).toContain('flow style');
+    expect(fs.readFileSync(file, 'utf-8')).toBe(FLOW_OURS);
+    // We refused to strip what we cannot classify — still configured.
+    expect(dsh.detect('global').alreadyConfigured).toBe(true);
+  });
+
+  it('dsh: a flow-style entry in a per-profile patch blocks the install (kept + note, nothing written anywhere)', () => {
+    const dsh = getTarget('dsh')!;
+    const profileDir = path.join(tmpHome, '.dsh', 'profiles', 'web');
+    fs.mkdirSync(profileDir, { recursive: true });
+    const profileFile = path.join(profileDir, 'cordis.patch.yml');
+    fs.writeFileSync(profileFile, FLOW_OURS);
+
+    // Profile-level flow entry counts as configured…
+    expect(dsh.detect('global').alreadyConfigured).toBe(true);
+
+    // …and install refuses wholesale: writing the home-level entry would
+    // double-mount serverName:codegraph across the two layers.
+    const homeFile = path.join(tmpHome, '.dsh', 'cordis.patch.yml');
+    const result = dsh.install('global', { autoAllow: true });
+    expect(result.files.find((f) => f.path === homeFile)?.action).toBe('kept');
+    expect(result.notes?.[0]).toContain('flow style');
+    expect(result.notes?.[0]).toContain('print-config');
+    expect(fs.existsSync(homeFile)).toBe(false);
+    expect(fs.readFileSync(profileFile, 'utf-8')).toBe(FLOW_OURS);
+  });
+
+  it('dsh: uninstall sweeps a profile-only flow-style entry as kept, never mangling it', () => {
+    const dsh = getTarget('dsh')!;
+    const profileDir = path.join(tmpHome, '.dsh', 'profiles', 'headless');
+    fs.mkdirSync(profileDir, { recursive: true });
+    const profileFile = path.join(profileDir, 'cordis.patch.yml');
+    fs.writeFileSync(profileFile, FLOW_OURS);
+
+    const result = dsh.uninstall('global');
+    expect(result.files.find((f) => f.path === path.join(tmpHome, '.dsh', 'cordis.patch.yml'))?.action).toBe('not-found');
+    expect(result.files.find((f) => f.path === profileFile)?.action).toBe('kept');
+    expect(result.notes?.[0]).toContain('flow style');
+    expect(fs.readFileSync(profileFile, 'utf-8')).toBe(FLOW_OURS);
+  });
+
+  it('dsh: local install is rejected with a note; printConfig writes nothing', () => {
+    const dsh = getTarget('dsh')!;
+    const r = dsh.install('local', { autoAllow: true });
+    expect(r.files.length).toBe(0);
+    expect(r.notes?.length).toBe(1);
+
+    const before = listAllFiles(tmpHome).concat(listAllFiles(tmpCwd));
+    const out = dsh.printConfig('global');
+    expect(out).toContain('- insert:');
+    expect(out).toContain('- id: mcp-codegraph');
+    expect(out).toContain('serverName: codegraph');
+    expect(out).toContain('failOnStartupError: false');
+    const after = listAllFiles(tmpHome).concat(listAllFiles(tmpCwd));
+    expect(after.sort()).toEqual(before.sort());
+  });
+
+  it('dsh: honors DSH_HOME over ~/.dsh (non-empty env only)', () => {
+    const dsh = getTarget('dsh')!;
+    const custom = path.join(tmpHome, 'custom-dsh');
+    process.env.DSH_HOME = custom;
+    try {
+      const result = dsh.install('global', { autoAllow: true });
+      const file = path.join(custom, 'cordis.patch.yml');
+      expect(result.files.some((f) => f.path === file)).toBe(true);
+      expect(fs.existsSync(file)).toBe(true);
+      expect(dsh.detect('global').configPath).toBe(file);
+      expect(fs.existsSync(path.join(tmpHome, '.dsh'))).toBe(false);
+    } finally {
+      delete process.env.DSH_HOME;
+    }
+
+    // An empty-string DSH_HOME falls back to ~/.dsh.
+    process.env.DSH_HOME = '';
+    try {
+      expect(dsh.detect('global').configPath).toBe(path.join(tmpHome, '.dsh', 'cordis.patch.yml'));
+    } finally {
+      delete process.env.DSH_HOME;
+    }
+  });
+
+  it('dsh: CRLF patch files are handled (normalized to LF on write)', () => {
+    const dsh = getTarget('dsh')!;
+    const file = path.join(tmpHome, '.dsh', 'cordis.patch.yml');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '# my patch layer\r\n[]\r\n');
+
+    dsh.install('global', { autoAllow: true });
+    expect(fs.readFileSync(file, 'utf-8')).toBe(`# my patch layer\n${DSH_BLOCK_4}\n`);
+  });
 });
 
 describe('Installer targets — registry', () => {
@@ -1284,6 +1747,7 @@ describe('Installer targets — registry', () => {
     expect(getTarget('copilot-vscode')?.id).toBe('copilot-vscode');
     expect(getTarget('copilot-cli')?.id).toBe('copilot-cli');
     expect(getTarget('copilot-jetbrains')?.id).toBe('copilot-jetbrains');
+    expect(getTarget('dsh')?.id).toBe('dsh');
     expect(getTarget('not-a-real-target')).toBeUndefined();
   });
 
@@ -1299,6 +1763,7 @@ describe('Installer targets — registry', () => {
     expect(ids).toContain('copilot-vscode');
     expect(ids).toContain('copilot-cli');
     expect(ids).toContain('copilot-jetbrains');
+    expect(ids).toContain('dsh');
   });
 
   it('resolveTargetFlag resolves the Copilot ids from a csv list', () => {
