@@ -6936,6 +6936,54 @@ export function multiply(a: number, b: number): number {
     cg.close();
   });
 
+  it('should resolve an ES import from a .xsjs file to a .xsjslib file (#556)', async () => {
+    // Exercises the JS import-path resolution list: `./helpers` must resolve to
+    // `helpers.xsjslib`. `decoy.js` exports the same symbol name and is never
+    // imported — without .xsjs/.xsjslib in the list the import resolves to
+    // nothing and the call falls back to same-name matching, which binds the
+    // edge to the decoy. The decoy is what makes this test fail on a regression:
+    // with a lone helpers.xsjslib the fallback happens to pick the right file.
+    fs.writeFileSync(
+      path.join(tempDir, 'helpers.xsjslib'),
+      'export function buildQuery(table) {\n  return "SELECT * FROM " + table;\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'decoy.js'),
+      'export function buildQuery(table) {\n  return "DECOY " + table;\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'service.xsjs'),
+      'import { buildQuery } from "./helpers";\n\nfunction run() {\n  return buildQuery("users");\n}\n'
+    );
+
+    const cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+
+    const run = cg.getNodesInFile('service.xsjs').find((n) => n.name === 'run');
+    const buildQuery = cg.getNodesInFile('helpers.xsjslib').find((n) => n.name === 'buildQuery');
+    const decoy = cg.getNodesInFile('decoy.js').find((n) => n.name === 'buildQuery');
+    expect(run).toBeDefined();
+    expect(buildQuery).toBeDefined();
+    expect(decoy).toBeDefined();
+
+    expect(
+      cg.getFileDependencies('service.xsjs'),
+      "'./helpers' should resolve to helpers.xsjslib, not the same-named decoy"
+    ).toEqual(['helpers.xsjslib']);
+
+    const outgoing = cg.getOutgoingEdges(run!.id);
+    expect(
+      outgoing.find((e) => e.target === buildQuery!.id),
+      'run() should resolve buildQuery across the .xsjs -> .xsjslib import'
+    ).toBeDefined();
+    expect(
+      outgoing.find((e) => e.target === decoy!.id),
+      'run() must not bind to the unrelated same-named export in decoy.js'
+    ).toBeUndefined();
+
+    cg.close();
+  });
+
   it('should count the full file-level tracked class (yaml/twig/properties) in indexFiles()', async () => {
     fs.writeFileSync(path.join(tempDir, 'app.yaml'), 'name: test\n');
     fs.writeFileSync(path.join(tempDir, 'view.twig'), '{{ title }}\n');

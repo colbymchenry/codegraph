@@ -87,10 +87,10 @@ export interface AgentTarget {
   /**
    * Whether this target supports the given install location.
    *
-   * Some agents (Codex CLI as of 2026-05) have no project-local
-   * config concept — only a single `~/.codex/` dir. Returning false
-   * for an unsupported (target, location) pair lets the orchestrator
-   * skip cleanly with a clear message.
+   * Some agents (GitHub Copilot CLI, the Copilot JetBrains plugin)
+   * have no project-local config concept — only a single per-user
+   * config dir. Returning false for an unsupported (target, location)
+   * pair lets the orchestrator skip cleanly with a clear message.
    */
   supportsLocation(loc: Location): boolean;
   detect(loc: Location): DetectionResult;

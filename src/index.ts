@@ -53,6 +53,8 @@ import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './
 import { EXTRACTION_VERSION } from './extraction/extraction-version';
 import { getCodeGraphDir } from './directory';
 import { deriveProjectNameTokens } from './search/query-utils';
+import ignore from 'ignore';
+import { loadDeprioritizePatterns } from './project-config';
 import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
@@ -186,6 +188,39 @@ export class CodeGraph {
     } catch {
       // Best-effort: ranking still works without it.
     }
+    // Down-weight the peripheral trees the project named in `codegraph.json`
+    // `deprioritize` — indexed and findable, but never outranking real code
+    // (#982). Ranking-only, so a bad pattern costs relevance, never recall.
+    //
+    // Read LAZILY, not once here: `wireLayers` runs from the constructor and
+    // from `reopenIfReplaced`, so a matcher built here would freeze at whatever
+    // the config said when the project opened. The MCP server caches one
+    // CodeGraph per root for its whole lifetime, so editing `codegraph.json`
+    // would appear to do nothing until the process restarted — `exclude` and
+    // `include` do not behave that way. `loadDeprioritizePatterns` is
+    // mtime-cached, so this costs one `stat`; the compiled matcher is memoized
+    // on the pattern array's identity, which the cache keeps stable.
+    let cachedPatterns: string[] | undefined;
+    let cachedMatcher: ReturnType<typeof ignore> | undefined;
+    this.queries.setDeprioritizedPathMatcher((filePath: string): boolean => {
+      try {
+        const patterns = loadDeprioritizePatterns(this.projectRoot);
+        if (patterns.length === 0) return false;
+        if (patterns !== cachedPatterns) {
+          cachedPatterns = patterns;
+          cachedMatcher = ignore().add(patterns);
+        }
+        const rel = path.isAbsolute(filePath)
+          ? path.relative(this.projectRoot, filePath)
+          : filePath;
+        if (!rel || rel.startsWith('..')) return false;
+        return cachedMatcher!.ignores(rel.split(path.sep).join('/'));
+      } catch {
+        // Ranking must never take the search down with it.
+        return false;
+      }
+    });
+
     this.orchestrator = new ExtractionOrchestrator(this.projectRoot, this.queries);
     this.resolver = createResolver(this.projectRoot, this.queries);
     this.graphManager = new GraphQueryManager(this.queries);

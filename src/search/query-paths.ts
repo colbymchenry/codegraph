@@ -15,10 +15,13 @@
  *     sibling `+page.svelte` in the repo, which ate the output envelope and
  *     truncated the files the agent actually asked for.
  *
- * `extractQueryPaths` finds path-like spans, resolves them against the
- * INDEXED file list (resolution IS the detector — `and/or`, `gen_server:call/2`
- * and other slash-bearing non-paths match nothing and are left alone), and
- * returns the matches as pinned files plus the query with those spans removed.
+ * `extractQueryPaths` finds path-like spans — slashed paths, dotted basenames,
+ * and extension-less kebab basenames (`background-image-table`, the spelling
+ * import paths and prose actually use) — resolves them against the INDEXED
+ * file list (resolution IS the detector — `and/or`, `gen_server:call/2`,
+ * `non-blocking` and other path-shaped non-paths match nothing and are left
+ * alone), and returns the matches as pinned files plus the query with those
+ * spans removed.
  * Callers treat pinned files as first-class: guaranteed admission, top rank,
  * funded first. Pure string work — no DB, no fs — so it is trivially testable
  * and safe inside the query-pool workers.
@@ -40,12 +43,18 @@ export interface QueryPathExtraction {
 
 /**
  * Cheap pre-gate so callers only fetch the indexed file list when the query
- * could possibly contain a path: a slash, or a dot-extension-shaped tail
- * (`chat-manager.ts`). Extensions cap at 8 chars, which keeps `Class.method`
- * spans (`app.isPackaged`) from qualifying.
+ * could possibly contain a path: a slash, a dot-extension-shaped tail
+ * (`chat-manager.ts`), or a hyphen-joined word (`background-image-table` —
+ * kebab files are named WITHOUT their extension more often than with, so the
+ * shape must open the gate on its own). Extensions cap at 8 chars, which
+ * keeps `Class.method` spans (`app.isPackaged`) from qualifying; the kebab
+ * alternative requires clean non-word boundaries, which keeps `--flags` and
+ * snake_case-with-a-dash hybrids from firing it.
  */
 export function queryMightContainPaths(query: string): boolean {
-  return /[/\\]/.test(query) || /\.[A-Za-z][A-Za-z0-9]{0,7}(?=[\s,;:)\]'"`]|$)/.test(query);
+  return /[/\\]/.test(query)
+    || /\.[A-Za-z][A-Za-z0-9]{0,7}(?=[\s,;:)\]'"`]|$)/.test(query)
+    || /(?:^|[^-\w])[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+(?=[^-\w]|$)/.test(query);
 }
 
 /**
@@ -59,6 +68,39 @@ const MAX_CANDIDATE_SPANS = 8;
 
 /** `name.ext` shape with a plausible source extension (no slash required). */
 const DOTTED_BASENAME = /^[^\s/\\]+\.[A-Za-z][A-Za-z0-9]{0,7}$/;
+
+/**
+ * Extension-less kebab basename (`background-image-table`). Hyphens are
+ * illegal in identifiers, so consuming these tokens can never steal one from
+ * the named-symbol seeder; ≥2 segments keeps single words out.
+ */
+const KEBAB_BASENAME = /^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+$/;
+
+/** A basename's last dot-extension, same shape DOTTED_BASENAME accepts. */
+const LAST_EXTENSION = /\.[A-Za-z][A-Za-z0-9]{0,7}$/;
+
+/**
+ * Lowercased basename stems of the hyphen-named indexed files, stem → paths.
+ * A stem drops only the LAST extension (`a-b.module.scss` → `a-b.module`), so
+ * a bare kebab token can't accidentally pin a same-named stylesheet or
+ * `.d.ts` sibling of the source file it names; an extension-less basename
+ * (`pre-commit`) is its own stem. Hyphen-free basenames are skipped — a
+ * KEBAB_BASENAME token can never equal one, and the filter keeps the map
+ * near-empty in repos that don't name files this way.
+ */
+function buildBasenameStems(indexedPaths: readonly string[]): Map<string, string[]> {
+  const stems = new Map<string, string[]>();
+  for (const p of indexedPaths) {
+    const basename = p.slice(Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\')) + 1);
+    if (!basename.includes('-')) continue;
+    const stem = basename.replace(LAST_EXTENSION, '').toLowerCase();
+    if (!stem) continue;
+    const existing = stems.get(stem);
+    if (existing) existing.push(p);
+    else stems.set(stem, [p]);
+  }
+  return stems;
+}
 
 /**
  * Strip prose punctuation wrapped around a token without eating punctuation
@@ -202,6 +244,38 @@ export function extractQueryPaths(
     }
     // Anything else (`and/or`, `call/2`, `foo.Bar`) is not a path reference:
     // leave the token for the normal matching pipeline.
+  }
+
+  // Second pass — extension-less kebab basenames. `background-image-table`
+  // opens no door above (no slash, no dotted tail), the hyphens disqualify it
+  // from the named-symbol seeder downstream, and FTS shreds it into the most
+  // common words in a kebab-cased repo (`background`, `image`, `table`) —
+  // which admit look-alike SIBLINGS that crowd out the named file. Resolution
+  // stays the detector: a token pins only when its whole lowercased form is
+  // the stem of an indexed basename. Two deliberate asymmetries vs the first
+  // pass: prose that resolves to nothing (`non-blocking`, `cross-call`) is
+  // LEFT IN the query — unlike a slashed span it may be legitimate wording,
+  // so it keeps feeding FTS and is not reported as an unresolved path — and a
+  // stem hotter than maxMatchesPerSpan is likewise left alone (pinning half a
+  // monorepo off one hot name trades precision the wrong way; a directory
+  // segment, which the first pass handles, disambiguates). Runs after the
+  // slashed/dotted pass so explicit paths win the shared maxPins budget, and
+  // examines every remaining token: lookups are O(1) map hits, so the
+  // scan-cost rationale behind MAX_CANDIDATE_SPANS doesn't apply.
+  let basenameStems: Map<string, string[]> | null = null;
+  for (let i = 0; i < tokens.length && pinned.length < maxPins; i++) {
+    if (consumed.has(i)) continue;
+    const stripped = stripWrapping(tokens[i]!);
+    if (stripped.length < 4 || !KEBAB_BASENAME.test(stripped)) continue;
+    basenameStems ??= buildBasenameStems(indexedPaths);
+    const matches = basenameStems.get(stripped.toLowerCase());
+    if (!matches || matches.length > maxMatchesPerSpan) continue;
+    consumed.add(i);
+    for (const m of matches) {
+      if (pinnedSeen.has(m) || pinned.length >= maxPins) continue;
+      pinnedSeen.add(m);
+      pinned.push(m);
+    }
   }
 
   if (consumed.size === 0) return passthrough;

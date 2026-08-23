@@ -26,7 +26,7 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   // module-entry convention, hit when a bare workspace import ("data") is
   // rewritten to the member's directory; lowercase variants for safety.
   arkts: ['.ets', '.ts', '.d.ts', '.js', '/Index.ets', '/index.ets', '/index.ts', '/index.js'],
-  javascript: ['.js', '.jsx', '.mjs', '.cjs', '/index.js', '/index.jsx'],
+  javascript: ['.js', '.jsx', '.mjs', '.cjs', '.xsjs', '.xsjslib', '/index.js', '/index.jsx'],
   tsx: ['.tsx', '.ts', '.d.ts', '.js', '.jsx', '/index.tsx', '/index.ts', '/index.js'],
   jsx: ['.jsx', '.js', '/index.jsx', '/index.js'],
   // SFC consumers import plain TS/JS, sibling components, and barrels

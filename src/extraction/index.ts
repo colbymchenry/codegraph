@@ -1104,7 +1104,7 @@ interface GitChanges {
  * case this cannot see (the child status that would report the deletions is gone
  * with it); a full `codegraph index` reconciles that.
  */
-function getGitChangedFiles(rootDir: string): GitChanges | null {
+export function getGitChangedFiles(rootDir: string): GitChanges | null {
   try {
     const changes: GitChanges = { modified: [], added: [], deleted: [] };
     // Custom extension → language overrides from the project's codegraph.json,
@@ -1120,7 +1120,13 @@ function getGitChangedFiles(rootDir: string): GitChanges | null {
 function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, overrides?: Record<string, Language>, includeIgnored: Ignore | null = null, exclude: Ignore | null = null): void {
   const output = execFileSync(
     'git',
-    ['status', '--porcelain', '--no-renames'],
+    // `-uall` lists individual untracked files instead of collapsing an
+    // entirely-untracked directory into one `?? dir/` entry, which would
+    // otherwise be dropped here (only embedded git repos are recursed into
+    // below). Nested untracked git repos still collapse to `?? repo/` even
+    // with `-uall` — git never crosses a repo boundary — so the recursion
+    // still handles them. (#1213)
+    ['status', '--porcelain', '--no-renames', '-uall'],
     { cwd: repoDir, encoding: 'utf-8', timeout: 10000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
   );
 
