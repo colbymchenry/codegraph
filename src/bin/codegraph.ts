@@ -371,6 +371,8 @@ type IndexResult = {
   edgesCreated: number;
   errors: Array<{ message: string; filePath?: string; severity: string; code?: string }>;
   durationMs: number;
+  filesSkippedUnsupported?: number;
+  topUnsupportedExtensions?: { ext: string; count: number }[];
 };
 
 /**
@@ -423,6 +425,20 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
     }
   } else if (hasErrors) {
     clack.log.error(`Indexing failed ${getGlyphs().dash} all ${formatNumber(result.filesErrored)} files had errors`);
+  } else if (result.filesSkippedUnsupported) {
+    // A project CodeGraph has no grammar for used to be indistinguishable from
+    // an empty one: same message, same `complete` state, same exit 0. Say which
+    // files were there and that the graph is empty on purpose, so nobody — and
+    // no agent trusting the graph — reads silence as "this code doesn't exist"
+    // (#1502).
+    const top = (result.topUnsupportedExtensions ?? [])
+      .map(e => `${e.ext} (${formatNumber(e.count)})`)
+      .join(', ');
+    clack.log.warn(
+      `No supported source files found ${getGlyphs().dash} ${formatNumber(result.filesSkippedUnsupported)} file(s) present, none in a language CodeGraph indexes`
+      + (top ? `: ${top}` : '')
+    );
+    clack.log.info('CodeGraph is inactive for this workspace — searches will return nothing. Use your own file tools here.');
   } else {
     clack.log.warn('No files found to index');
   }

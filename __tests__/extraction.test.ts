@@ -8,8 +8,9 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { execFileSync } from 'child_process';
 import { CodeGraph } from '../src';
-import { extractFromSource, scanDirectory, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore } from '../src/extraction';
+import { extractFromSource, scanDirectory, scanDirectoryAsync, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore, type ScanSkipStats } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
 import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, blankCLeadingAttrMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
@@ -11917,5 +11918,65 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     expect(result.errors).toEqual([]);
     expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'Widget')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'size')).toBe(true);
+  });
+});
+
+// `init` on a project CodeGraph has no grammar for used to look identical to a
+// successful index of an empty repo: 0 files, `index_state: complete`, exit 0.
+// Nothing said "there are 24k files here and I understood none of them", so an
+// agent told to trust the graph concluded the code did not exist (#1502).
+//
+// The scan already visits every file, so the count comes from the walk it
+// already does — no second pass.
+describe('Unsupported-language projects report what they skipped (#1502)', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  it('counts files it could not index, by extension, on the git path', async () => {
+    const runGit = (...args: string[]) =>
+      execFileSync('git', args, { cwd: tempDir, stdio: 'pipe' });
+    fs.mkdirSync(tempDir, { recursive: true });
+    runGit('init', '-q');
+    runGit('config', 'user.email', 'test@test.com');
+    runGit('config', 'user.name', 'Test');
+    fs.writeFileSync(path.join(tempDir, 'a.move'), 'module a {}');
+    fs.writeFileSync(path.join(tempDir, 'b.move'), 'module b {}');
+    fs.writeFileSync(path.join(tempDir, 'c.pl'), 'print 1;');
+    runGit('add', '-A');
+    runGit('commit', '-q', '-m', 'unsupported only');
+
+    const stats: ScanSkipStats = { unsupportedByExtension: new Map() };
+    const files = await scanDirectoryAsync(tempDir, undefined, stats);
+
+    expect(files).toEqual([]);
+    expect(stats.unsupportedByExtension.get('.move')).toBe(2);
+    expect(stats.unsupportedByExtension.get('.pl')).toBe(1);
+  });
+
+  it('counts them on the filesystem-walk path too (non-git project)', async () => {
+    fs.mkdirSync(tempDir, { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'a.move'), 'module a {}');
+    fs.writeFileSync(path.join(tempDir, 'b.pl'), 'print 1;');
+
+    const stats: ScanSkipStats = { unsupportedByExtension: new Map() };
+    const files = await scanDirectoryAsync(tempDir, undefined, stats);
+
+    expect(files).toEqual([]);
+    expect(stats.unsupportedByExtension.get('.move')).toBe(1);
+    expect(stats.unsupportedByExtension.get('.pl')).toBe(1);
+  });
+
+  it('stays silent when every file was indexable', async () => {
+    fs.mkdirSync(tempDir, { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'a.ts'), 'export const a = 1;');
+
+    const stats: ScanSkipStats = { unsupportedByExtension: new Map() };
+    const files = await scanDirectoryAsync(tempDir, undefined, stats);
+
+    expect(files).toEqual(['a.ts']);
+    expect(stats.unsupportedByExtension.size).toBe(0);
   });
 });
