@@ -23,6 +23,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - A new `deprioritize` setting in `codegraph.json` keeps the paths you name from outranking your product code in search and `codegraph_explore` answers, without removing anything from the index. It takes gitignore-style patterns just like `exclude`, but is ranking-only: helper-script trees, generated output, or optional add-on directories whose generic symbol names (`usage`, `run`, `status`) would otherwise crowd out the code that actually answers a query stay fully indexed and findable — and a query that genuinely targets such a tree still returns it. Thanks @maxmilian. (#982)
 
+- The DeepSeek Harness (`dsh`) is now a supported agent: `codegraph install` can configure it (`dsh`), it is auto-detected like every other agent, and `codegraph uninstall` reverses the setup cleanly. One configuration covers every dsh profile at once, and a running dsh session picks the change up without a restart. Existing entries in the patch file are preserved, and an entry added by hand to a single profile is migrated to the shared location so it doesn't conflict with itself.
+
 ### Fixes
 
 - Indexing no longer hangs on a Swift Vapor project containing a call with a long argument list. A single `.get(...)`-style call with many labeled arguments and no `use:` handler — the shape generated request builders produce — could stall `codegraph index`, `codegraph sync`, and the MCP server indefinitely. Route detection now handles such files in milliseconds, and every previously-recognized route shape still parses exactly as before. Thanks @maxmilian. (#1544) (Swift)

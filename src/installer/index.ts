@@ -3,8 +3,9 @@
  *
  * Multi-target: writes MCP server config + instructions for the
  * agents the user picks (Claude Code, Cursor, Codex CLI, opencode,
- * Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, and GitHub
- * Copilot in VS Code / the Copilot CLI / JetBrains IDEs).
+ * Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, GitHub
+ * Copilot in VS Code / the Copilot CLI / JetBrains IDEs, and the
+ * DeepSeek Harness).
  * Defaults to the Claude-only behavior for backwards compatibility
  * when no targets are explicitly chosen and nothing else is detected.
  *
@@ -250,7 +251,8 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
         ? 'Unchanged'
         : file.action === 'created' ? 'Created'
           : file.action === 'removed' ? 'Removed'
-            : 'Updated';
+            : file.action === 'kept' ? 'Kept'
+              : 'Updated';
       clack.log.success(`${target.displayName}: ${verb} ${tildify(file.path)}`);
     }
     for (const note of result.notes ?? []) {
@@ -468,7 +470,7 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
     const sel = await clack.select({
       message: 'Remove CodeGraph from all your projects, or just this one?',
       options: [
-        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro, ~/.copilot, ~/.config/github-copilot' },
+        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro, ~/.copilot, ~/.config/github-copilot, ~/.dsh' },
         { value: 'local'  as const, label: 'Just this project (local)', hint: './.claude, ./.cursor, ./.vscode, ./opencode.jsonc, ./.gemini, ./.kiro' },
       ],
       initialValue: 'global' as const,
