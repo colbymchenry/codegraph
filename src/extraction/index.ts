@@ -791,9 +791,7 @@ export function discoverEmbeddedRepoRoots(rootDir: string): string[] {
     // same way collectGitFiles does, keeping watcher scope == indexer scope.
     // (#1031, #1033)
     try {
-      const staged = execFileSync(
-        'git',
-        ['ls-files', '-z', '-s', '--recurse-submodules'],
+      const staged = lsFilesStaged(
         { cwd: repoAbs, encoding: 'utf-8', timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
       );
       const repoIgnore = buildDefaultIgnore(repoAbs);
@@ -925,6 +923,30 @@ function findIgnoredEmbeddedRepos(repoDir: string, includeIgnored: Ignore | null
  * found) is recorded in `embeddedRoots` so callers can exempt its files from the
  * parent's own gitignore rules.
  */
+/**
+ * `git ls-files -z -s`, expanding submodules where git allows it.
+ *
+ * `--recurse-submodules` could not be combined with `-s` before git 2.36:
+ * `builtin/ls-files.c` listed `show_stage` among the modes that die, and the
+ * check is unconditional — it does not look at whether the repo actually has
+ * submodules, so every call fails on older git. Ubuntu 22.04 LTS (2.34.1) and
+ * Debian 11 (2.30.2) are both below that line.
+ *
+ * Letting the throw escape cost far more than submodule expansion: it unwound
+ * the whole git-visible pass, so `includeIgnored`, gitlink recursion and the
+ * `codegraph.json` include allowlist silently stopped applying and files went
+ * missing from the index with no error (#1549). Retry without the flag instead
+ * — `-s` is the part that matters here, since gitlink detection reads the mode
+ * bits, and embedded repos are reached through the gitlink recursion anyway.
+ */
+function lsFilesStaged(gitOpts: Parameters<typeof execFileSync>[2]): string {
+  try {
+    return execFileSync('git', ['ls-files', '-z', '-s', '--recurse-submodules'], gitOpts) as unknown as string;
+  } catch {
+    return execFileSync('git', ['ls-files', '-z', '-s'], gitOpts) as unknown as string;
+  }
+}
+
 function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, embeddedRoots?: Set<string>, includeIgnored: Ignore | null = null): void {
   const gitOpts = { cwd: repoDir, encoding: 'utf-8' as const, timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'], windowsHide: true };
 
@@ -951,7 +973,7 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, em
   // on disk → those files are silently dropped from the index. (#541) With -s the
   // path follows a TAB after the `<mode> <object> <stage>` prefix.
   const gitlinkRels: string[] = [];
-  const tracked = execFileSync('git', ['ls-files', '-z', '-s', '--recurse-submodules'], gitOpts);
+  const tracked = lsFilesStaged(gitOpts);
   for (const entry of tracked.split('\0')) {
     if (!entry) continue;
     const tab = entry.indexOf('\t');
