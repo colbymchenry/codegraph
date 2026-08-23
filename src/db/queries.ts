@@ -70,7 +70,10 @@ const SQLITE_PARAM_CHUNK_SIZE = 500;
  * peripheral top-10 slots cleared), so a deeper discount buys little and costs
  * the invariant. Pinned by a test.
  */
-export const DEPRIORITIZED_NAME_BONUS_SCALE = 0.75;
+// Re-exported from the scorer, which now owns it: the constant composes with
+// the corpus-frequency discount and only that module can hold their shared
+// bound (#1462). Kept exported here for the existing importers.
+export { DEPRIORITIZED_NAME_BONUS_SCALE } from '../search/query-utils';
 
 /**
  * Database row types (snake_case from SQLite)
@@ -1373,15 +1376,18 @@ export class QueryBuilder {
         // product symbol — -15 lands at 59.8, still ahead). Damped, not zeroed,
         // so the tree stays findable when it genuinely is what you asked for.
         // Evaluated once and reused: the predicate stats the config file.
+        //
+        // The damping is passed in rather than applied to the return value: it
+        // composes with the corpus-frequency discount, and only nameMatchBonus
+        // can floor the COMBINED multiplier so a name that is both common and
+        // de-prioritized still outranks a mere prefix match (#1462).
         const deprioritized = this.isDeprioritizedPath?.(r.node.filePath) ?? false;
         return {
           ...r,
           score: r.score
             + kindBonus(r.node.kind)
             + scorePathRelevance(r.node.filePath, scoringQuery, this.projectNameTokens, deprioritized)
-            + (deprioritized
-              ? Math.round(nameMatchBonus(r.node.name, scoringQuery, corpus) * DEPRIORITIZED_NAME_BONUS_SCALE)
-              : nameMatchBonus(r.node.name, scoringQuery, corpus)),
+            + nameMatchBonus(r.node.name, scoringQuery, corpus, deprioritized),
         };
       });
       results.sort((a, b) => b.score - a.score);
