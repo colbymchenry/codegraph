@@ -787,7 +787,7 @@ is written):
 - **Antigravity IDE**
 - **Kiro**
 - **GitHub Copilot** — Copilot Chat in VS Code (`copilot-vscode`), the Copilot CLI (`copilot-cli`), and the Copilot plugin in JetBrains IDEs (`copilot-jetbrains`)
-- **DeepSeek Harness** (`dsh`) — writes the MCP server into `~/.dsh/cordis.patch.yml`, which applies to every dsh profile at once. dsh doesn't pass a workspace root to MCP servers, so point CodeGraph at your project with `projectPath` (the server's own guidance covers this; `codegraph init` still needs to run once in each project)
+- **DeepSeek Harness** (`dsh`) — writes the MCP server into `~/.dsh/cordis.patch.yml`, which applies to every dsh profile at once. dsh doesn't pass a workspace root to MCP servers, so point CodeGraph at your project with `projectPath` (the server's own guidance covers this), or pin `cwd` / `--path` on the entry for a single-project setup. `codegraph init` still needs to run once in each project
 
 ## Supported Languages
 

@@ -38,6 +38,13 @@
  * missing/unlaunchable codegraph binary never blocks the harness from
  * booting.
  *
+ * Project root: dsh never sends a workspace root to MCP servers
+ * (dsh-mcp-client connects with no roots capability), so the agent
+ * reaches the graph by passing `projectPath` — the server's
+ * no-root-index guidance points at it. A user who wants a
+ * single-project setup can instead pin `cwd` (a dsh-mcp-client field)
+ * or `--path` on the entry by hand; the installer writes neither.
+ *
  * dsh requires the file to be a valid top-level YAML array: a missing
  * file is fine, but a comments-only file fails to boot (it parses to
  * nothing, not to a list) and `[]` is the documented empty state. This
