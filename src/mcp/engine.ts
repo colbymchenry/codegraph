@@ -11,8 +11,9 @@
  */
 
 import * as os from 'os';
+import * as path from 'path';
 import type CodeGraph from '../index';
-import { findNearestCodeGraphRoot } from '../directory';
+import { resolveDefaultCodeGraphRoot } from '../directory';
 import { watchDisabledReason } from '../sync';
 import { ToolHandler } from './tools';
 import { QueryPool, resolvePoolSize } from './query-pool';
@@ -65,6 +66,7 @@ export class MCPEngine {
   // Off-loop read-tool pool (daemon mode only). Created lazily once the default
   // project is open — workers each hold their own WAL read connection.
   private queryPool: QueryPool | null = null;
+  private lastResolutionDiagnostic: string | null = null;
 
   constructor(opts: MCPEngineOptions = {}) {
     this.opts = { watch: opts.watch ?? true, queryPool: opts.queryPool ?? false };
@@ -158,7 +160,7 @@ export class MCPEngine {
     if (this.closed) return;
     if (this.toolHandler.hasDefaultCodeGraph()) return;
     this.toolHandler.setDefaultProjectHint(searchFrom);
-    const resolvedRoot = findNearestCodeGraphRoot(searchFrom);
+    const resolvedRoot = resolveDefaultCodeGraphRoot(searchFrom).root;
     if (!resolvedRoot) return;
     try {
       // Close any previously failed instance to avoid leaking resources.
@@ -201,10 +203,13 @@ export class MCPEngine {
   private async doInitialize(searchFrom: string): Promise<void> {
     this.toolHandler.setDefaultProjectHint(searchFrom);
 
-    const resolvedRoot = findNearestCodeGraphRoot(searchFrom);
+    const resolution = resolveDefaultCodeGraphRoot(searchFrom);
+    const resolvedRoot = resolution.root;
     if (!resolvedRoot) {
-      // No .codegraph/ above searchFrom. Sessions may still discover one later via roots/list
+      // No unambiguous default. Sessions can still query an indexed project by
+      // projectPath or discover one later via roots/list.
       this.projectPath = searchFrom;
+      this.reportMissingDefault(searchFrom, resolution.indexedSubprojects);
       return;
     }
 
@@ -219,6 +224,20 @@ export class MCPEngine {
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(`[CodeGraph MCP] Failed to open project at ${resolvedRoot}: ${msg}\n`);
     }
+  }
+
+  private reportMissingDefault(searchFrom: string, indexedSubprojects: string[]): void {
+    const base = path.resolve(searchFrom);
+    const diagnostic = indexedSubprojects.length > 1
+      ? `[CodeGraph MCP] No default project: multiple indexed sub-projects were found under ${base}: ` +
+        `${indexedSubprojects.map((root) => path.relative(base, root) || '.').join(', ')}. ` +
+        'Live sync is disabled; pass projectPath per tool call or launch with --path.\n'
+      : `[CodeGraph MCP] No default project: no .codegraph/ was found at or above ${base}, ` +
+        'and no indexed sub-project was found. Live sync is disabled; pass projectPath per tool call, ' +
+        'launch with --path, or run codegraph init.\n';
+    if (diagnostic === this.lastResolutionDiagnostic) return;
+    this.lastResolutionDiagnostic = diagnostic;
+    process.stderr.write(diagnostic);
   }
 
   /**

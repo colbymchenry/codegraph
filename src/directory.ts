@@ -194,7 +194,11 @@ const WORKSPACE_ROOT_MANIFESTS = [
 ];
 
 function looksLikeProjectRoot(dir: string): boolean {
-  return WORKSPACE_ROOT_MANIFESTS.some((m) => fs.existsSync(path.join(dir, m)));
+  // `.git` may be a directory (normal checkout) or a file (worktree). Some
+  // polyglot/legacy workspaces have no manifest at their root, but are still a
+  // deliberate project boundary and therefore safe to scan below.
+  return fs.existsSync(path.join(dir, '.git')) ||
+    WORKSPACE_ROOT_MANIFESTS.some((m) => fs.existsSync(path.join(dir, m)));
 }
 
 function escapeRegExp(s: string): string {
@@ -231,6 +235,38 @@ export function findIndexedSubprojectRoots(
   };
   walk(root, 1);
   return out;
+}
+
+export interface DefaultCodeGraphRootResolution {
+  /** The unambiguous default root, or null when none can be selected safely. */
+  root: string | null;
+  /** Indexed children discovered by the bounded down-scan. */
+  indexedSubprojects: string[];
+}
+
+/**
+ * Resolve the default project for long-lived integrations such as MCP.
+ *
+ * The nearest indexed ancestor always wins. If there is none, a bounded
+ * down-scan is allowed only from a recognizable workspace/git root — never
+ * from `$HOME` or an arbitrary directory. Exactly one indexed child is safe
+ * to adopt; several are returned to the caller for actionable diagnostics
+ * rather than choosing the wrong repository.
+ */
+export function resolveDefaultCodeGraphRoot(startPath: string): DefaultCodeGraphRootResolution {
+  const nearest = findNearestCodeGraphRoot(startPath);
+  if (nearest) return { root: nearest, indexedSubprojects: [] };
+
+  const base = path.resolve(startPath);
+  if (unsafeIndexRootReason(base) || !looksLikeProjectRoot(base)) {
+    return { root: null, indexedSubprojects: [] };
+  }
+
+  const indexedSubprojects = findIndexedSubprojectRoots(base);
+  return {
+    root: indexedSubprojects.length === 1 ? indexedSubprojects[0]! : null,
+    indexedSubprojects,
+  };
 }
 
 /**
