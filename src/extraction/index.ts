@@ -2653,7 +2653,13 @@ export class ExtractionOrchestrator {
      * set is not exactly known (directory removals, event overflow): the full
      * scan-diff remains the ground truth those cases need (#1285).
      */
-    scopedPaths?: string[]
+    scopedPaths?: string[],
+    /**
+     * Writer-side WAL pressure valve. Called after every changed file is
+     * stored, when no extraction transaction is open, so a checkpoint can
+     * safely catch up before the next file grows the WAL further.
+     */
+    backpressure?: () => Promise<void> | null
   ): Promise<SyncResult> {
     await initGrammars(); // Initialize WASM runtime (grammars loaded lazily below)
     const startTime = Date.now();
@@ -2837,6 +2843,9 @@ export class ExtractionOrchestrator {
 
       const result = await this.indexFile(filePath);
       nodesUpdated += result.nodes.length;
+
+      const pause = backpressure?.();
+      if (pause) await pause;
     }
 
     // Names whose definition set this sync changed: a `file\0name` pair present
