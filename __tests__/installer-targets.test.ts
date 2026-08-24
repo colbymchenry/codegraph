@@ -40,6 +40,7 @@ function setHome(dir: string): { restore: () => void } {
     XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
     HERMES_HOME: process.env.HERMES_HOME,
     COPILOT_HOME: process.env.COPILOT_HOME,
+    DSH_HOME: process.env.DSH_HOME,
   };
   process.env.HOME = dir;
   process.env.USERPROFILE = dir;
@@ -47,6 +48,10 @@ function setHome(dir: string): { restore: () => void } {
   process.env.XDG_CONFIG_HOME = path.join(dir, '.config');
   delete process.env.HERMES_HOME;
   delete process.env.COPILOT_HOME;
+  // DSH resolves its global instructions via $DSH_HOME before falling
+  // back to ~, so an ambient value would leak the real ~/.dsh into
+  // every redirect.
+  delete process.env.DSH_HOME;
   return {
     restore() {
       if (prev.HOME === undefined) delete process.env.HOME; else process.env.HOME = prev.HOME;
@@ -55,6 +60,7 @@ function setHome(dir: string): { restore: () => void } {
       if (prev.XDG_CONFIG_HOME === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = prev.XDG_CONFIG_HOME;
       if (prev.HERMES_HOME === undefined) delete process.env.HERMES_HOME; else process.env.HERMES_HOME = prev.HERMES_HOME;
       if (prev.COPILOT_HOME === undefined) delete process.env.COPILOT_HOME; else process.env.COPILOT_HOME = prev.COPILOT_HOME;
+      if (prev.DSH_HOME === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prev.DSH_HOME;
     },
   };
 }
@@ -2479,5 +2485,92 @@ describe('Installer targets — Copilot family', () => {
     expect(cli.detect('global').alreadyConfigured).toBe(false);
     expect(vscode.detect('global').alreadyConfigured).toBe(true);
     expect(jetbrains.detect('global').alreadyConfigured).toBe(true);
+  });
+});
+
+describe('Installer targets — DSH (instructions-only)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('home');
+    tmpCwd = mkTmpDir('cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+    delete process.env.DSH_HOME;
+  });
+
+  it('local install writes only the AGENTS.md block — no MCP config anywhere', () => {
+    const dsh = getTarget('dsh')!;
+    const result = dsh.install('local', { autoAllow: true });
+
+    // Instructions-only: the one file written IS the workspace AGENTS.md.
+    expect(result.files).toHaveLength(1);
+    expect(fs.realpathSync(result.files[0].path)).toBe(
+      fs.realpathSync(path.join(tmpCwd, 'AGENTS.md')),
+    );
+    expect(fs.readFileSync(result.files[0].path, 'utf-8')).toContain('## CodeGraph');
+    // No MCP config surface exists for DSH.
+    for (const p of dsh.describePaths('local')) {
+      expect(p).not.toMatch(/mcp|\.json|\.toml/i);
+    }
+    expect(dsh.detect('local').alreadyConfigured).toBe(true);
+  });
+
+  it('global install honors $DSH_HOME and defaults to ~/.dsh', () => {
+    const dsh = getTarget('dsh')!;
+
+    // Default: ~/.dsh/AGENTS.md under the redirected HOME.
+    const result = dsh.install('global', { autoAllow: false });
+    expect(fs.realpathSync(result.files[0].path)).toBe(
+      fs.realpathSync(path.join(tmpHome, '.dsh', 'AGENTS.md')),
+    );
+    expect(fs.existsSync(path.join(tmpHome, '.dsh', 'AGENTS.md'))).toBe(true);
+
+    // $DSH_HOME override wins over the default.
+    const alt = path.join(tmpHome, 'alt-dsh-home');
+    fs.mkdirSync(alt, { recursive: true });
+    process.env.DSH_HOME = alt;
+    expect(dsh.describePaths('global')[0]).toBe(path.join(alt, 'AGENTS.md'));
+    dsh.install('global', { autoAllow: false });
+    expect(fs.existsSync(path.join(alt, 'AGENTS.md'))).toBe(true);
+    expect(dsh.detect('global').alreadyConfigured).toBe(true);
+  });
+
+  it('install preserves user content around the marker block; uninstall removes only the block', () => {
+    const dsh = getTarget('dsh')!;
+    fs.writeFileSync(
+      path.join(tmpCwd, 'AGENTS.md'),
+      '# My repo rules\n\nBe terse.\n',
+    );
+
+    dsh.install('local', { autoAllow: false });
+    let body = fs.readFileSync(path.join(tmpCwd, 'AGENTS.md'), 'utf-8');
+    expect(body).toContain('# My repo rules');
+    expect(body).toContain('## CodeGraph');
+
+    dsh.uninstall('local');
+    body = fs.readFileSync(path.join(tmpCwd, 'AGENTS.md'), 'utf-8');
+    expect(body).toContain('# My repo rules');
+    expect(body).not.toContain('CODEGRAPH_START');
+    expect(dsh.detect('local').alreadyConfigured).toBe(false);
+  });
+
+  it('printConfig explains the no-MCP CLI wiring without touching disk', () => {
+    const dsh = getTarget('dsh')!;
+    const out = dsh.printConfig('global');
+    expect(out).toContain('no MCP config');
+    expect(out).toContain('.dsh');
+    expect(out).toContain('codegraph explore');
   });
 });

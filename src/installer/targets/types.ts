@@ -19,7 +19,7 @@ export type Location = 'global' | 'local';
  * lookup. New targets add a value here when they're added to the
  * registry. Keep these short and lowercase.
  */
-export type TargetId = 'claude' | 'cursor' | 'codex' | 'opencode' | 'hermes' | 'gemini' | 'antigravity' | 'kiro' | 'copilot-vscode' | 'copilot-cli' | 'copilot-jetbrains';
+export type TargetId = 'claude' | 'cursor' | 'codex' | 'opencode' | 'hermes' | 'gemini' | 'antigravity' | 'kiro' | 'copilot-vscode' | 'copilot-cli' | 'copilot-jetbrains' | 'dsh';
 
 /**
  * Result of `target.detect(location)`.
@@ -84,6 +84,14 @@ export interface AgentTarget {
   readonly displayName: string;
   /** Optional URL for "where do I learn more about this agent." */
   readonly docsUrl?: string;
+  /**
+   * Whether the agent must be restarted after install/uninstall for
+   * the wiring change to apply (MCP-server configs load at startup).
+   * Defaults to true. Instructions-only targets whose harness re-reads
+   * its instructions file every turn set false so the final summary
+   * doesn't tell users to restart for nothing.
+   */
+  readonly requiresRestart?: boolean;
   /**
    * Whether this target supports the given install location.
    *
