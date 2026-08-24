@@ -38,6 +38,7 @@ try {
 } catch { /* cache is best-effort */ }
 
 import { Command } from 'commander';
+import { execFileSync } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, hasStructuralKeyword, extractCodeTokens } from '../directory';
@@ -289,6 +290,15 @@ function formatDuration(ms: number): string {
   const minutes = Math.floor(seconds / 60);
   const remainingSeconds = seconds % 60;
   return `${minutes}m ${remainingSeconds.toFixed(0)}s`;
+}
+
+/**
+ * Format a byte count for CLI output.
+ */
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
 // Shimmer progress renderer (runs in a worker thread for smooth animation)
@@ -754,6 +764,91 @@ program
       } catch { /* non-fatal */ }
     } catch (err) {
       error(`Failed to uninitialize: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph clone [target]
+ */
+program
+  .command('clone [target]')
+  .description('Copy a CodeGraph index from another project or worktree')
+  .option('-s, --source <path>', 'Source project with an existing .codegraph index')
+  .option('-f, --force', 'Overwrite if target already has an index')
+  .option('--auto', 'Auto-detect source from git worktree parent')
+  .action(async (targetArg: string | undefined, options: { source?: string; force?: boolean; auto?: boolean }) => {
+    const targetPath = path.resolve(targetArg || process.cwd());
+    let sourcePath: string | undefined;
+
+    if (options.source) {
+      sourcePath = path.resolve(options.source);
+    } else if (options.auto) {
+      try {
+        const output = execFileSync('git', ['worktree', 'list', '--porcelain'], {
+          cwd: targetPath,
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+          timeout: 5000,
+        }).trim();
+        const mainLine = output.split('\n').find((line) => line.startsWith('worktree '));
+        if (mainLine) {
+          const mainWorktree = mainLine.slice('worktree '.length).trim();
+          const resolvedMainWorktree = path.isAbsolute(mainWorktree)
+            ? mainWorktree
+            : path.resolve(targetPath, mainWorktree);
+          if (isInitialized(resolvedMainWorktree)) {
+            sourcePath = resolvedMainWorktree;
+          }
+        }
+      } catch {
+        // Report the same actionable error below when git or the worktree is unavailable.
+      }
+    } else {
+      error('A source is required. Pass --source <path> or use --auto.');
+      info('Usage: codegraph clone --source <path> [target]');
+      process.exit(1);
+    }
+
+    if (!sourcePath || !isInitialized(sourcePath)) {
+      error(`No CodeGraph index found in the source${sourcePath ? ` at ${sourcePath}` : ''}.`);
+      if (options.auto) {
+        info('Auto-detection looks for an initialized index in the main git worktree.');
+      }
+      process.exit(1);
+    }
+
+    if (isInitialized(targetPath) && !options.force) {
+      warn(`Target already has a CodeGraph index at ${getCodeGraphDir(targetPath)}; skipping.`);
+      info('Pass --force to overwrite it.');
+      return;
+    }
+
+    try {
+      const targetCodeGraphDir = getCodeGraphDir(targetPath);
+      fs.mkdirSync(targetCodeGraphDir, { recursive: true });
+
+      const gitignorePath = path.join(targetCodeGraphDir, '.gitignore');
+      if (!fs.existsSync(gitignorePath)) {
+        fs.writeFileSync(
+          gitignorePath,
+          '# CodeGraph data files — local to each machine, not for committing.\n' +
+            '# Ignore everything in .codegraph/ except this file itself, so transient\n' +
+            '# files (the database, daemon.pid, sockets, logs) never show up in git.\n' +
+            '*\n' +
+            '!.gitignore\n',
+          'utf8'
+        );
+      }
+
+      const sourceDbPath = path.join(getCodeGraphDir(sourcePath), 'codegraph.db');
+      const targetDbPath = path.join(targetCodeGraphDir, 'codegraph.db');
+      fs.copyFileSync(sourceDbPath, targetDbPath);
+      const size = fs.statSync(targetDbPath).size;
+
+      success(`Copied CodeGraph index to ${targetPath} (${formatBytes(size)})`);
+    } catch (err) {
+      error(`Failed to clone CodeGraph index: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
   });
