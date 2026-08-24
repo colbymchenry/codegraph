@@ -669,6 +669,26 @@ CodeGraph discovers those files off disk, overriding `.gitignore`, on index,
 sync, and watch. An explicit `exclude` still wins, and built-in skips
 (`node_modules`, `dist`, `.git`) are never re-included.
 
+Sometimes a directory shouldn't leave the index — you still want to find things
+in it — it just shouldn't *outrank* your real code. A `scripts/` or
+`optional-skills/` tree whose helpers use generic names (`usage`, `status`,
+`run`) can win on an exact name match and crowd out the product code that
+actually answers the query. Name those trees under `deprioritize`:
+
+```json
+{
+  "deprioritize": ["optional-skills/", "scripts/"]
+}
+```
+
+This is the ranking counterpart to `exclude`: those paths stay indexed and
+findable — searching for them directly still works — they just stop winning
+against first-party code. It applies to `query` / `search` and to `explore`'s
+ranking. It is *not* a filter: unlike the built-in `example/`, `sample/`,
+`fixture/`, `benchmark/` and `demo/` handling — which also drops those files
+from some result sets outright — `deprioritize` only ever changes rank. Reach
+for `exclude` when you want something gone.
+
 ### Custom file extensions
 
 If your project uses a non-standard extension for a [supported

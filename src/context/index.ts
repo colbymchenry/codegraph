@@ -188,6 +188,7 @@ export { LOW_CONFIDENCE_MARKER } from './markers';
 export class ContextBuilder {
   private projectRoot: string;
   private queries: QueryBuilder;
+
   private traverser: GraphTraverser;
 
   constructor(
@@ -198,6 +199,21 @@ export class ContextBuilder {
     this.projectRoot = projectRoot;
     this.queries = queries;
     this.traverser = traverser;
+  }
+
+  /**
+   * Whether the project's `codegraph.json` `deprioritize` patterns cover this
+   * path (#982). Explore ranks through its own path scorer as well as through
+   * `searchNodes`, so the lever has to be applied here too or the setting would
+   * only half-work — and explore is the surface #982 actually reports on.
+   *
+   * Only the -15 relevance penalty is shared. Explore's hard `continue` filters
+   * and its non-production budget cap are deliberately NOT joined: those REMOVE
+   * content, and `deprioritize` is a ranking lever by definition — `exclude` is
+   * the lever for taking things out of reach.
+   */
+  private isDeprioritized(filePath: string): boolean {
+    return this.queries.getDeprioritizedPathMatcher()?.(filePath) ?? false;
   }
 
   /**
@@ -837,7 +853,12 @@ export class ContextBuilder {
           if (searchIdSet.has(r.node.id)) continue;
           if (isTestFile(r.node.filePath) && !isTestQuery) continue;
 
-          const pathScore = scorePathRelevance(r.node.filePath, query);
+          const pathScore = scorePathRelevance(
+            r.node.filePath,
+            query,
+            undefined,
+            this.isDeprioritized(r.node.filePath),
+          );
           const brevityBonus = Math.max(0, 6 - (name.length - titleCased.length) / 4);
           termCandidates.push({ node: r.node, score: 8 + brevityBonus + pathScore });
         }
@@ -924,7 +945,12 @@ export class ContextBuilder {
         const compoundResults: SearchResult[] = [];
         for (const [, entry] of compoundTermMap) {
           if (entry.terms.size >= 2) {
-            const pathScore = scorePathRelevance(entry.node.filePath, query);
+            const pathScore = scorePathRelevance(
+              entry.node.filePath,
+              query,
+              undefined,
+              this.isDeprioritized(entry.node.filePath),
+            );
             const brevityBonus = Math.max(0, 6 - entry.node.name.length / 8);
             compoundResults.push({
               node: entry.node,

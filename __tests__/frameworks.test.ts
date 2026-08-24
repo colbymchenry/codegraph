@@ -1472,6 +1472,47 @@ func boot(routes: RoutesBuilder) throws {
     const { nodes } = vaporResolver.extract!('configure.swift', src);
     expect(nodes).toHaveLength(0);
   });
+
+  // A `.METHOD(...)` call with many comma-separated args and no `use:` used to
+  // make the route regex backtrack exponentially (60 args hung for minutes).
+  it('does not backtrack exponentially on a long arg list without use:', () => {
+    const args = Array.from({ length: 60 }, (_, i) => `arg${i}: value${i}`).join(', ');
+    const src = `app.get(${args})\n`;
+    const start = performance.now();
+    const { nodes } = vaporResolver.extract!('routes.swift', src);
+    const elapsed = performance.now() - start;
+    expect(nodes).toHaveLength(0);
+    expect(elapsed).toBeLessThan(250);
+  });
+
+  it('still parses every Vapor route shape after the arg-list rewrite', () => {
+    const src = `
+admin.get(use: self.list)
+app.get("users", use: listUsers)
+router.post("users", User.parameter, "edit", use: UserController.edit)
+app.patch(":id" ,  "meta" ,  use: update)
+app.get(
+  "multi",
+  "line",
+  use: multiLine
+)
+`;
+    const { nodes, references } = vaporResolver.extract!('routes.swift', src);
+    expect(nodes.map((n) => n.name)).toEqual([
+      'GET /',
+      'GET /users',
+      'POST /users/edit',
+      'PATCH /:id/meta',
+      'GET /multi/line',
+    ]);
+    expect(references.map((r) => r.referenceName)).toEqual([
+      'list',
+      'listUsers',
+      'edit',
+      'update',
+      'multiLine',
+    ]);
+  });
 });
 
 import { reactResolver } from '../src/resolution/frameworks/react';
