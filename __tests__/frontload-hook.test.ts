@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { planFrontload, findIndexedSubprojectRoots, resolveDefaultCodeGraphRoot, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens } from '../src/directory';
+import { planFrontload, findIndexedSubprojectRoots, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens } from '../src/directory';
 
 /** Make `dir` look indexed (isInitialized needs `.codegraph/codegraph.db`). */
 function mkIndexed(dir: string): string {
@@ -126,38 +126,6 @@ describe('findIndexedSubprojectRoots', () => {
   it('respects the depth bound', () => {
     mkIndexed(path.join(tmp, 'a', 'b', 'c', 'd', 'e', 'deep'));
     expect(findIndexedSubprojectRoots(tmp, { maxDepth: 2 })).toEqual([]);
-  });
-});
-
-describe('resolveDefaultCodeGraphRoot', () => {
-  let tmp: string;
-  beforeEach(() => { tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-default-root-'))); });
-  afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
-
-  it('adopts one indexed child beneath a manifest workspace', () => {
-    mkWorkspaceRoot(tmp);
-    const api = mkIndexed(path.join(tmp, 'packages', 'api'));
-    expect(resolveDefaultCodeGraphRoot(tmp)).toEqual({ root: api, indexedSubprojects: [api] });
-  });
-
-  it('treats a git-only checkout as a deliberate scan boundary', () => {
-    fs.mkdirSync(path.join(tmp, '.git'));
-    const service = mkIndexed(path.join(tmp, 'service'));
-    expect(resolveDefaultCodeGraphRoot(tmp).root).toBe(service);
-  });
-
-  it('does not guess when several indexed children exist', () => {
-    mkWorkspaceRoot(tmp);
-    const api = mkIndexed(path.join(tmp, 'packages', 'api'));
-    const web = mkIndexed(path.join(tmp, 'packages', 'web'));
-    const resolution = resolveDefaultCodeGraphRoot(tmp);
-    expect(resolution.root).toBeNull();
-    expect(resolution.indexedSubprojects.sort()).toEqual([api, web].sort());
-  });
-
-  it('does not scan down from an arbitrary directory', () => {
-    mkIndexed(path.join(tmp, 'some', 'project'));
-    expect(resolveDefaultCodeGraphRoot(tmp)).toEqual({ root: null, indexedSubprojects: [] });
   });
 });
 

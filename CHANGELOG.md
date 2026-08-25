@@ -25,7 +25,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
-- MCP now adopts a single indexed child project when launched from an unindexed workspace root. If no unambiguous default exists, startup diagnostics say whether no index was found or list the indexed sub-projects that require an explicit `projectPath`. (#1606, #1607)
+- The MCP server now finds your project when it's launched from a workspace folder above it: if the launch directory has no index of its own but exactly one indexed project sits below it (a repo container, an agent workspace, a monorepo root), that project becomes the session's default — live file watching and the shared daemon included — instead of every tool call failing until a `projectPath` or `--path` is supplied. Thanks @nakisen. (#1606)
+
+- When no project can be resolved at all, the MCP server now says so instead of starting silently: a startup log line names the directory it searched, and tool calls list the indexed sub-projects it can see nearby so you can pass one as `projectPath`. Previously the server looked healthy from the outside while every tool quietly had no project to answer from. Thanks @nakisen. (#1607)
+
 - Incremental sync now applies WAL backpressure during changed-file storage and batched reference resolution, keeping long-lived readers from allowing the WAL to grow past its configured cap on large projects. (#1539)
 - Resolution no longer reads oversized dependency archives such as HarmonyOS `.har` packages as source text, preventing a single package target from exhausting the JavaScript heap during indexing or sync.
 - Dynamic-dispatch analysis no longer repeatedly copies every source prefix while scanning match-dense files, avoiding quadratic work and excessive peak memory during the final resolution pass.
