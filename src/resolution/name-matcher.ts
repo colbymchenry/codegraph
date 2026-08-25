@@ -2551,11 +2551,10 @@ export function matchReference(
   // Erlang call/fun refs carry the call-site arity (`f/1` — #1610) because
   // arity is part of the function's identity and every erlang function's
   // qualifiedName carries it (`mod::f/1`). Resolve ONLY to a definition of
-  // that exact arity: the call site's own file first (a local call targets its
-  // own module by language semantics; `-import`ed functions ride the
-  // cross-file branch), and when no definition of that arity exists anywhere,
-  // resolve to NOTHING rather than a sibling arity — the real target may be
-  // macro-generated or out of repo, and a wrong-arity edge is worse than none.
+  // that exact arity in the call site's own module. Explicit `-import`s are
+  // handled by resolveViaImport before this matcher. A bare call can otherwise
+  // only be a local function or an auto-imported BIF, so it must never fall
+  // through to a same-named function in another module.
   if (
     ref.language === 'erlang' &&
     !ref.referenceName.includes('::') &&
@@ -2565,30 +2564,17 @@ export function matchReference(
     if (am) {
       // endsWith is length-anchored, so `/1` cannot match `…/11`.
       const arityTail = `/${am[2]}`;
-      const candidates = context
-        .getNodesByName(am[1]!)
-        .filter(
+      const sameFile = context
+        .getNodesInFile(ref.filePath)
+        .find(
           (n) =>
-            n.language === 'erlang' && n.kind === 'function' && n.qualifiedName.endsWith(arityTail),
+            n.language === 'erlang' &&
+            n.kind === 'function' &&
+            n.name === am[1] &&
+            n.qualifiedName.endsWith(arityTail),
         );
-      if (candidates.length > 0) {
-        const sameFile = candidates.find((n) => n.filePath === ref.filePath);
-        if (sameFile) {
-          return { original: ref, targetNodeId: sameFile.id, confidence: 0.95, resolvedBy: 'exact-match' };
-        }
-        if (candidates.length === 1) {
-          return { original: ref, targetNodeId: candidates[0]!.id, confidence: 0.8, resolvedBy: 'exact-match' };
-        }
-        const best = findBestMatch(ref, candidates, context);
-        if (best) {
-          const proximity = computePathProximity(ref.filePath, best.filePath);
-          return {
-            original: ref,
-            targetNodeId: best.id,
-            confidence: proximity >= 30 ? 0.7 : 0.4,
-            resolvedBy: 'exact-match',
-          };
-        }
+      if (sameFile) {
+        return { original: ref, targetNodeId: sameFile.id, confidence: 0.95, resolvedBy: 'exact-match' };
       }
       return null;
     }

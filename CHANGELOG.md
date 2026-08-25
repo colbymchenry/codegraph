@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Erlang selective imports now resolve a bare call to the exact exported module, function, and arity, while unqualified calls stay within their own module instead of binding to an unrelated same-named project function. Re-index Erlang projects after upgrading. (#1610) (Erlang)
 
 ## [1.6.0] - 2026-08-26
 
