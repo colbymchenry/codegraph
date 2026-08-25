@@ -50,6 +50,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  bash: 'tree-sitter-bash.wasm',
 };
 
 /**
@@ -120,6 +121,15 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.scala': 'scala',
   '.sc': 'scala',
   '.lua': 'lua',
+  // Shell: one grammar covers sh/bash/ksh dialects, and zsh scripts parse
+  // close enough that functions and calls extract (zsh-only syntax degrades to
+  // ERROR nodes locally rather than failing the file). `.bats` is bats-core
+  // test suites, which are plain bash plus `@test` blocks.
+  '.sh': 'bash',
+  '.bash': 'bash',
+  '.zsh': 'bash',
+  '.ksh': 'bash',
+  '.bats': 'bash',
   '.luau': 'luau',
   '.m': 'objc',
   '.mm': 'objc',
@@ -338,6 +348,12 @@ const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   // kernel compiles the same-commit vendored C (codegraph-kernel/grammars/
   // dart); crates.io tree-sitter-dart is a different-lineage fork (rejected).
   'dart',
+  // Bash: the tree-sitter-wasms build is ABI 14 and traps on `case` statements
+  // under web-tree-sitter 0.25 (a missing dynamic-linking stub aborts the whole
+  // parse), so any real script dies on its first `case`. We vendor the prebuilt
+  // tree-sitter-bash.wasm from the tree-sitter-bash 0.25.1 npm package (MIT) —
+  // byte-identical to the npm tarball's artifact, ABI 15, parses `case` cleanly.
+  'bash',
 ]);
 
 /** Absolute path of a language's grammar WASM (vendored or tree-sitter-wasms). */
@@ -654,6 +670,7 @@ export function getLanguageDisplayName(language: Language): string {
     vbnet: 'Visual Basic .NET',
     erlang: 'Erlang',
     terraform: 'Terraform',
+    bash: 'Shell',
     arkts: 'ArkTS',
     unknown: 'Unknown',
   };

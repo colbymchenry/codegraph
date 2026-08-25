@@ -22,6 +22,7 @@ import { isGeneratedFile } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
 import { stripCppTemplateArgs } from './languages/c-cpp';
+import { bashCallee } from './languages/bash';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -3749,6 +3750,27 @@ export class TreeSitterExtractor {
         this.unresolvedReferences.push({
           fromNodeId: callerId,
           referenceName: calleeName,
+          referenceKind: 'calls',
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column,
+        });
+      }
+      return;
+    }
+
+    // Shell: every `command` node is a call site, and the callee is the command
+    // word itself (`log_info "x"` → log_info). The generic path below would read
+    // namedChild(0), which is the variable_assignment in a `FOO=1 cmd` prefix,
+    // and it cannot drop builtins — `echo`/`printf`/`local` outnumber real calls
+    // by an order of magnitude in shell and would bury them. bashCallee does
+    // both; it returns null when there is nothing linkable (an expansion callee
+    // like `"$RUNNER" x`, a path invocation, or a builtin).
+    if (this.language === 'bash') {
+      const callee = bashCallee(node, this.source);
+      if (callee) {
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: callee,
           referenceKind: 'calls',
           line: node.startPosition.row + 1,
           column: node.startPosition.column,

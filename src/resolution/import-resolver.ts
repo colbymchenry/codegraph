@@ -1485,6 +1485,13 @@ export function resolveViaImport(
     if (luaResult) return luaResult;
   }
 
+  // Shell `source` / `.`: the reference is a literal path tail, so match it
+  // against indexed files directly — there is no module system to go through.
+  if (ref.language === 'bash' && ref.referenceKind === 'imports') {
+    const bashResult = resolveBashSource(ref, context);
+    if (bashResult) return bashResult;
+  }
+
   // Whole-module / namespace imports → link the importing file to the module
   // file. Python `from . import certs` / `import mod`, and TS/JS `import * as ns
   // from './x'` (so a namespace touched only via a value-member read still
@@ -1700,6 +1707,37 @@ function resolveLuaRequire(ref: UnresolvedRef, context: ResolutionContext): Reso
     }
   }
   return null;
+}
+
+/**
+ * Shell `source lib/_log.sh` / `. "$DIR/lib/_log.sh"` — link the sourcing file
+ * to the sourced file.
+ *
+ * The reference name is the literal tail of the sourced path, because the
+ * directory is almost always an expansion the extractor cannot evaluate
+ * (`"$SCRIPT_DIR/lib/_log.sh"` → `lib/_log.sh`). Match that tail against
+ * indexed paths, preferring the candidate sharing the longest prefix with the
+ * sourcing file, which is what picks the right `_log.sh` in a repo that has
+ * several.
+ */
+function resolveBashSource(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const name = ref.referenceName;
+  if (!name) return null;
+  const byBasename = luaBasenameIndex(context);
+  const candidates = byBasename.get(name.split('/').pop() ?? '') ?? [];
+  const matches = candidates.filter((f) => f === name || f.endsWith('/' + name));
+  if (matches.length === 0) return null;
+  const shared = (a: string, b: string): number => {
+    let i = 0;
+    while (i < a.length && i < b.length && a[i] === b[i]) i++;
+    return i;
+  };
+  matches.sort((x, y) => shared(y, ref.filePath) - shared(x, ref.filePath));
+  const best = matches[0]!;
+  if (best === ref.filePath) return null;
+  const fileNode = context.getNodesInFile(best).find((n) => n.kind === 'file');
+  if (!fileNode) return null;
+  return { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' };
 }
 
 function resolveModuleImportToFile(

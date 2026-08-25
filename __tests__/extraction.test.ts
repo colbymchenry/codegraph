@@ -43,6 +43,13 @@ describe('Language Detection', () => {
     expect(detectLanguage('config.mjs')).toBe('javascript');
   });
 
+  it('should detect shell scripts', () => {
+    expect(detectLanguage('hooks/pre-commit.sh')).toBe('bash');
+    expect(detectLanguage('lib/_log.bash')).toBe('bash');
+    expect(detectLanguage('setup.zsh')).toBe('bash');
+    expect(detectLanguage('test/run.bats')).toBe('bash');
+  });
+
   it('should detect Python files', () => {
     expect(detectLanguage('main.py')).toBe('python');
   });
@@ -11635,5 +11642,120 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     expect(result.errors).toEqual([]);
     expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'Widget')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'size')).toBe(true);
+  });
+});
+
+describe('Shell (bash) Extraction', () => {
+  it('should extract both function definition forms', () => {
+    const code = `#!/usr/bin/env bash
+log_info() {
+  printf '%s\\n' "$1" >&2
+}
+
+function log_error {
+  log_info "error: $*"
+  return 1
+}
+`;
+    const result = extractFromSource('lib/_log.sh', code);
+
+    expect(result.errors).toEqual([]);
+    const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+    expect(fns).toContain('log_info');
+    expect(fns).toContain('log_error');
+  });
+
+  it('should extract calls to shell functions and external tools, but not builtins', () => {
+    const code = `#!/usr/bin/env bash
+resolve_repo() {
+  git -C "$1" rev-parse --show-toplevel
+}
+
+main() {
+  local repo
+  repo="$(resolve_repo "$@")"
+  echo "$repo"
+  printf '%s\\n' "$repo"
+}
+`;
+    const result = extractFromSource('main.sh', code);
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+
+    expect(calls).toContain('resolve_repo');
+    expect(calls).toContain('git');
+    // Builtins can never resolve to a definition and would bury the real edges.
+    expect(calls).not.toContain('echo');
+    expect(calls).not.toContain('printf');
+    expect(calls).not.toContain('local');
+  });
+
+  it('should extract `source` and `.` as imports, keeping the literal path tail', () => {
+    const code = `#!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+source "$(dirname "\${BASH_SOURCE[0]}")/lib/_recover-cwd.sh"
+. "$SCRIPT_DIR/lib/_log.sh"
+source "\${SCRIPT_DIR}/lib/_git.sh"
+`;
+    const result = extractFromSource('hook.sh', code);
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+
+    expect(imports).toContain('lib/_recover-cwd.sh');
+    expect(imports).toContain('lib/_log.sh');
+    expect(imports).toContain('lib/_git.sh');
+  });
+
+  it('should find a `source` inside a function body', () => {
+    const code = `#!/usr/bin/env bash
+load() {
+  source "$HERE/lib/_late.sh"
+}
+`;
+    const result = extractFromSource('late.sh', code);
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    expect(imports).toContain('lib/_late.sh');
+  });
+
+  it('should extract file-scope variables and readonly constants, not locals', () => {
+    const code = `#!/usr/bin/env bash
+TOP_LEVEL=1
+readonly CONST_X=5
+export EXPORTED_Y="a"
+
+f() {
+  local inner_a=1
+  echo "$inner_a"
+}
+`;
+    const result = extractFromSource('vars.sh', code);
+    const vars = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
+    const consts = result.nodes.filter((n) => n.kind === 'constant').map((n) => n.name);
+
+    expect(vars).toContain('TOP_LEVEL');
+    expect(vars).toContain('EXPORTED_Y');
+    expect(consts).toContain('CONST_X');
+    expect(vars).not.toContain('inner_a');
+  });
+
+  it('should parse a case statement without erroring', () => {
+    // The tree-sitter-wasms bash build (ABI 14) traps on `case` under
+    // web-tree-sitter 0.25 and takes the whole file with it; this pins the
+    // vendored ABI-15 grammar.
+    const code = `#!/usr/bin/env bash
+route() {
+  case "$1" in
+    fast) run_fast ;;
+    *) run_slow ;;
+  esac
+}
+`;
+    const result = extractFromSource('route.sh', code);
+    expect(result.errors).toEqual([]);
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+    expect(calls).toContain('run_fast');
+    expect(calls).toContain('run_slow');
   });
 });
