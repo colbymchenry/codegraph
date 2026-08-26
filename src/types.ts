@@ -104,6 +104,7 @@ export const LANGUAGES = [
   'luau',
   'objc',
   'r',
+  'magik',
   'solidity',
   'nix',
   'yaml',

@@ -11919,3 +11919,119 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'size')).toBe(true);
   });
 });
+
+// ─── Magik ──────────────────────────────────────────────────────────────────
+
+describe('Magik Extraction', () => {
+  describe('Language detection', () => {
+    it('detects .magik files', () => {
+      expect(detectLanguage('my_class.magik')).toBe('magik');
+    });
+  });
+
+  it('extracts an exemplar as a class node', () => {
+    const code = `
+_package sw
+
+define_slotted_exemplar(:my_class,
+\t{:slot_a, _unset},
+\t{})
+$
+`;
+    const result = extractFromSource('my_class.magik', code);
+    const cls = result.nodes.find((n) => n.kind === 'class');
+    expect(cls).toBeDefined();
+    expect(cls?.name).toBe('my_class');
+    // Namespace from _package declaration
+    const ns = result.nodes.find((n) => n.kind === 'namespace');
+    expect(ns?.name).toBe('sw');
+    expect(cls?.qualifiedName).toContain('my_class');
+  });
+
+  it('extracts methods with exemplar receiver', () => {
+    const code = `
+_package sw
+
+_method my_class.my_method(x, y)
+\t## Adds two numbers.
+\t_local z << x + y
+\t_return z
+_endmethod
+$
+
+_method my_class.init(a_name)
+\t_return _self
+_endmethod
+$
+`;
+    const result = extractFromSource('my_class.magik', code);
+    const methods = result.nodes.filter((n) => n.kind === 'method');
+    expect(methods.length).toBe(2);
+
+    const myMethod = methods.find((n) => n.name === 'my_method');
+    expect(myMethod).toBeDefined();
+    expect(myMethod?.qualifiedName).toBe('my_class::my_method');
+    expect(myMethod?.signature).toBe('(x, y)');
+    expect(myMethod?.docstring).toBe('Adds two numbers.');
+
+    const initMethod = methods.find((n) => n.name === 'init');
+    expect(initMethod).toBeDefined();
+    expect(initMethod?.qualifiedName).toBe('my_class::init');
+    expect(initMethod?.signature).toBe('(a_name)');
+  });
+
+  it('extracts a named procedure as a function', () => {
+    const code = `
+_package sw
+
+_proc @my_procedure(a, b)
+\t## A standalone procedure.
+\t_return a * b
+_endproc
+$
+`;
+    const result = extractFromSource('utils.magik', code);
+    const fn = result.nodes.find((n) => n.kind === 'function');
+    expect(fn).toBeDefined();
+    expect(fn?.name).toBe('my_procedure');
+    expect(fn?.signature).toBe('(a, b)');
+    expect(fn?.docstring).toBe('A standalone procedure.');
+    expect(fn?.qualifiedName).toContain('my_procedure');
+  });
+
+  it('extracts call edges from method bodies', () => {
+    const code = `
+_package sw
+
+_method my_class.another_method()
+\t_return _self.my_method(1, 2)
+_endmethod
+$
+`;
+    const result = extractFromSource('my_class.magik', code);
+    const callRef = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'calls' && r.referenceName === 'my_method'
+    );
+    expect(callRef).toBeDefined();
+  });
+
+  it('extracts a private method', () => {
+    const code = `
+_package sw
+
+_method my_class.do_internal()
+\t_return 42
+_endmethod
+$
+
+_private _method my_class.secret()
+\t_return _self.do_internal()
+_endmethod
+$
+`;
+    const result = extractFromSource('my_class.magik', code);
+    const secretMethod = result.nodes.find((n) => n.name === 'secret');
+    expect(secretMethod).toBeDefined();
+    expect(secretMethod?.visibility).toBe('private');
+  });
+});

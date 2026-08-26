@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- CodeGraph now indexes **Magik** (`.magik`) — the SmallWorld/GE Smallworld language used in GIS and asset management platforms. Exemplar definitions (`define_slotted_exemplar`, `define_mixin`, and related forms) are extracted as class nodes, `_method` declarations as methods with their exemplar as the receiver type, named `_proc` blocks as functions, `_package` declarations as namespaces, and inline `##` docstrings are preserved. Call edges are tracked across methods and procedures.
 
 ## [1.6.0] - 2026-08-26
 
