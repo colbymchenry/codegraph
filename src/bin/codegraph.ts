@@ -20,6 +20,7 @@
  *   codegraph callees <symbol>   Find what a function/method calls
  *   codegraph impact <symbol>    Analyze what code is affected by changing a symbol
  *   codegraph affected [files]   Find test files affected by changes
+ *   codegraph cycles [path]      Find circular file dependencies
  *   codegraph upgrade [version]  Update CodeGraph to the latest release
  */
 
@@ -1205,6 +1206,45 @@ program
       cg.destroy();
     } catch (err) {
       error(`Search failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph cycles [path]
+ */
+program
+  .command('cycles [path]')
+  .description('Find circular file dependencies in the indexed project')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (pathArg: string | undefined, options: { json?: boolean }) => {
+    const projectPath = resolveProjectPath(pathArg);
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      const cycles = cg.findCircularDependencies();
+
+      if (options.json) {
+        console.log(JSON.stringify({ cycles, count: cycles.length }, null, 2));
+      } else if (cycles.length === 0) {
+        success('No circular dependencies found');
+      } else {
+        console.log(chalk.bold(`\nCircular Dependencies (${cycles.length}):\n`));
+        cycles.forEach((cycle, index) => {
+          const closed = cycle.length > 0 ? [...cycle, cycle[0]] : cycle;
+          console.log(chalk.cyan(`${index + 1}. `) + closed.join(' -> '));
+        });
+      }
+
+      cg.destroy();
+    } catch (err) {
+      error(`Cycle detection failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
   });
