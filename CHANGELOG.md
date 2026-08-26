@@ -137,6 +137,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- `codegraph_explore` now re-serves source to fresh subagents and after context compaction, with cross-call dedup available only through an explicit `CODEGRAPH_EXPLORE_DEDUP=1` opt-in; thanks @danusha2345. (#1620, #1624)
+
 - **Watcher scope now matches `git ls-files --exclude-standard` (#1728).** `buildDefaultIgnore` / `buildScopeIgnore` read `.git/info/exclude` and `core.excludesFile` (not only the root `.gitignore`), and seed directories git reports as ignored-untracked so nested `.gitignore` effects prune the live watcher the same way the indexer skips them. Single-file auto-sync was already incremental (`pendingFiles` → scoped `sync({ paths })`); the remaining gap was watching trees git had excluded.
 
 - **Live sync no longer lets the write-ahead log grow without a bound when a reader is holding it open (#1539).** Incremental sync now uses the same writer pause that full indexing already used, and if checkpointing still cannot finish once the log is past its documented size limit — typically because the query pool is reading at the same time — sync stops with a clear error instead of keeping writing until the disk fills. The previous behaviour could leave a multi-tens-of-gigabyte log beside a few-gigabyte index on a large project. Close concurrent readers and retry, or raise `CODEGRAPH_WAL_VALVE_MB` if the limit is too tight for the project.
