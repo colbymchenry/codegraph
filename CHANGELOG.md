@@ -12,6 +12,17 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph now indexes Zig projects, including container types, generic type
+  factories, tests, imports, cross-file calls, callbacks, and comptime dispatch
+  tables, with grammar support for current Zig 0.16 syntax. (#1037)
+
+### Fixes
+
+- Zig functions stored in local aliases are now linked as function references,
+  so callers and dead-code analysis can follow callback and comptime dispatch
+  flows instead of treating the referenced implementation as unused.
 
 ## [1.6.0] - 2026-08-26
 

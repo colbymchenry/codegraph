@@ -144,6 +144,17 @@ function resolveImportPathUncached(
     return resolveCobolCopybook(importPath, fromFile, context);
   }
 
+  // Zig: an @import path with a `.zig` extension (or a `./` / `../` prefix) is
+  // a FILE resolved relative to the importing file's directory — and Zig allows
+  // the relative path WITHOUT a leading `./` (`@import("util/widget.zig")`),
+  // which the generic `.`-prefix check below would miss. A bare name (`std`,
+  // `builtin`, a build.zig.zon package) names no project file → external.
+  if (language === 'zig') {
+    if (!importPath.endsWith('.zig') && !importPath.startsWith('.')) return null;
+    const zigFromDir = path.dirname(path.join(context.getProjectRoot(), fromFile));
+    return resolveRelativeImport(importPath, zigFromDir, language, context);
+  }
+
   // Skip external/npm packages — but pass the context so the
   // bare-specifier heuristic can consult the project's tsconfig
   // alias map first (custom prefixes like `@components/*` would
@@ -788,6 +799,8 @@ export function extractImportMappings(
     mappings.push(...extractPHPImports(content));
   } else if (language === 'c' || language === 'cpp') {
     mappings.push(...extractCppImports(content));
+  } else if (language === 'zig') {
+    mappings.push(...extractZigImports(content));
   }
 
   return mappings;
@@ -1095,6 +1108,33 @@ function extractCppImports(content: string): ImportMapping[] {
   return mappings;
 }
 
+/**
+ * Extract Zig import mappings.
+ *
+ * Zig binds an imported module to a const: `const widget =
+ * @import("../ui/widget.zig");`. That bound name is the namespace through
+ * which the file's `pub` declarations are called (`widget.draw(...)`),
+ * so each mapping is a namespace import (isNamespace: true) whose `source` is
+ * the raw import path. `resolveImportPath` maps a `.zig`/relative path to the
+ * file and leaves bare names (`std`, `builtin`, packages) external.
+ */
+function extractZigImports(content: string): ImportMapping[] {
+  const mappings: ImportMapping[] = [];
+  const re = /\b(?:pub\s+)?const\s+(\w+)\s*=\s*@import\s*\(\s*"([^"]+)"\s*\)/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(content)) !== null) {
+    const [, localName, source] = match;
+    mappings.push({
+      localName: localName!,
+      exportedName: '*',
+      source: source!,
+      isDefault: false,
+      isNamespace: true,
+    });
+  }
+  return mappings;
+}
+
 // Cache import mappings per file to avoid re-reading and re-parsing
 const importMappingCache = new Map<string, ImportMapping[]>();
 
@@ -1316,7 +1356,7 @@ export function resolveViaImport(
   // include-dir scan path inside resolveImportPath never produces an
   // edge — resolveViaImport's symbol lookup below would search the
   // resolved file for a symbol named like the file extension and fail.
-  if ((ref.language === 'c' || ref.language === 'cpp') && ref.referenceKind === 'imports') {
+  if ((ref.language === 'c' || ref.language === 'cpp' || ref.language === 'zig') && ref.referenceKind === 'imports') {
     // C/C++ quoted includes (`#include "X.h"`) resolve relative to the
     // INCLUDING file's own directory first (the C standard's quoted-include
     // search order). Prefer a same-directory header over an -I directory or a
