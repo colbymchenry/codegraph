@@ -83,10 +83,17 @@ export class DatabaseConnection {
    */
   private openedInode: string | null;
 
-  private constructor(db: SqliteDatabase, dbPath: string, backend: SqliteBackend) {
+  /**
+   * Whether FTS5 is available in this Node.js build. When false, search
+   * falls back to LIKE + fuzzy matching (#1532).
+   */
+  readonly fts5Available: boolean;
+
+  private constructor(db: SqliteDatabase, dbPath: string, backend: SqliteBackend, fts5Available: boolean) {
     this.db = db;
     this.dbPath = dbPath;
     this.backend = backend;
+    this.fts5Available = fts5Available;
     this.openedInode = statInode(dbPath);
   }
 
@@ -105,10 +112,35 @@ export class DatabaseConnection {
 
     configureConnection(db);
 
-    // Run schema initialization
+    // Run schema initialization, splitting FTS5 from the rest so
+    // codegraph still works when Node.js was built without FTS5 (#1532).
     const schemaPath = path.join(__dirname, 'schema.sql');
     const schema = fs.readFileSync(schemaPath, 'utf-8');
-    db.exec(schema);
+
+    const FTS5_MARKER = '-- Full-text search index on node names, docstrings, and signatures';
+    const ftsIdx = schema.indexOf(FTS5_MARKER);
+    let fts5Available = true;
+
+    if (ftsIdx >= 0) {
+      const preFts = schema.slice(0, ftsIdx);
+      const ftsSection = schema.slice(ftsIdx);
+      // Execute everything before FTS5 first
+      db.exec(preFts);
+      // Try FTS5; if it fails, skip it and continue with LIKE-only search
+      try {
+        db.exec(ftsSection);
+      } catch (err: any) {
+        fts5Available = false;
+        const msg = err?.message ?? String(err);
+        console.warn(
+          `[codegraph] FTS5 not available in this Node.js build (${msg}). ` +
+          `Search will fall back to LIKE + fuzzy matching. ` +
+          `For full-text search, use a Node.js build with FTS5 enabled.`
+        );
+      }
+    } else {
+      db.exec(schema);
+    }
 
     // Record current schema version so migrations aren't re-applied on open
     const currentVersion = getCurrentVersion(db);
@@ -118,7 +150,7 @@ export class DatabaseConnection {
       ).run(CURRENT_SCHEMA_VERSION, Date.now(), 'Initial schema includes all migrations');
     }
 
-    return new DatabaseConnection(db, dbPath, backend);
+    return new DatabaseConnection(db, dbPath, backend, fts5Available);
   }
 
   /**
@@ -133,8 +165,16 @@ export class DatabaseConnection {
 
     configureConnection(db);
 
+    // Detect FTS5 availability for search fallback (#1532)
+    let fts5Available = true;
+    try {
+      db.exec("SELECT * FROM nodes_fts LIMIT 0");
+    } catch {
+      fts5Available = false;
+    }
+
     // Check and run migrations if needed
-    const conn = new DatabaseConnection(db, dbPath, backend);
+    const conn = new DatabaseConnection(db, dbPath, backend, fts5Available);
     const currentVersion = getCurrentVersion(db);
 
     if (currentVersion < CURRENT_SCHEMA_VERSION) {
@@ -169,6 +209,7 @@ export class DatabaseConnection {
    * row written by anyone during the window is captured by the rebuild.
    */
   beginBulkNodeLoad(): void {
+    if (!this.fts5Available) return;
     for (const t of DatabaseConnection.FTS_TRIGGER_NAMES) {
       this.db.exec(`DROP TRIGGER IF EXISTS ${t}`);
     }
@@ -181,6 +222,7 @@ export class DatabaseConnection {
    * IF NOT EXISTS).
    */
   endBulkNodeLoad(): void {
+    if (!this.fts5Available) return;
     this.db.exec(`INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')`);
     this.recreateFtsTriggers();
   }
@@ -355,6 +397,7 @@ export class DatabaseConnection {
 
   /** Recreate the FTS triggers + rebuild if a bulk-load window never closed. */
   private healBulkNodeLoad(): void {
+    if (!this.fts5Available) return;
     const row = this.db
       .prepare(
         `SELECT count(*) AS c FROM sqlite_master WHERE type = 'trigger' AND name IN ('nodes_ai','nodes_ad','nodes_au')`
