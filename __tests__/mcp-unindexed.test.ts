@@ -21,11 +21,12 @@ import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
 import { ToolHandler } from '../src/mcp/tools';
+import { WASM_RUNTIME_FLAGS } from '../src/extraction/wasm-runtime-flags';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
 function spawnServer(cwd: string): ChildProcessWithoutNullStreams {
-  return spawn(process.execPath, [BIN, 'serve', '--mcp'], {
+  return spawn(process.execPath, [...WASM_RUNTIME_FLAGS, BIN, 'serve', '--mcp'], {
     cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
     // Direct (in-process) mode — the unindexed path never has a daemon
@@ -38,6 +39,23 @@ function spawnServer(cwd: string): ChildProcessWithoutNullStreams {
     // the mcp-initialize/mcp-roots suites).
     env: { ...process.env, CODEGRAPH_NO_DAEMON: '1', CODEGRAPH_WASM_RELAUNCHED: '1' },
   }) as ChildProcessWithoutNullStreams;
+}
+
+function stopChild(child: ChildProcessWithoutNullStreams): Promise<void> {
+  return new Promise((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+    }, 1000);
+    child.once('exit', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    child.kill('SIGTERM');
+  });
 }
 
 /** Send a JSON-RPC request and resolve with the response matching its id. */
@@ -96,15 +114,7 @@ describe('No-root-index session policy', () => {
 
   afterEach(async () => {
     if (child) {
-      // Wait for the child to actually exit before removing its cwd — on
-      // Windows a just-killed process briefly holds the directory/SQLite
-      // handles, and an immediate rmSync fails the teardown with EPERM
-      // (the documented file-locking class that fails the sibling
-      // mcp-initialize/mcp-roots suites). kill + await exit + retried
-      // removal keeps this suite green on Windows.
-      const exited = new Promise<void>((resolve) => child!.once('exit', () => resolve()));
-      child.kill('SIGKILL');
-      await Promise.race([exited, new Promise((r) => setTimeout(r, 3000))]);
+      await stopChild(child);
       child = null;
     }
     fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });

@@ -16,11 +16,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
+import { WASM_RUNTIME_FLAGS } from '../src/extraction/wasm-runtime-flags';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
 function spawnServer(cwd: string): ChildProcessWithoutNullStreams {
-  return spawn(process.execPath, [BIN, 'serve', '--mcp'], {
+  return spawn(process.execPath, [...WASM_RUNTIME_FLAGS, BIN, 'serve', '--mcp'], {
     cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
     // Pin to direct (in-process) mode. #172 is a contract about the in-process
@@ -32,6 +33,23 @@ function spawnServer(cwd: string): ChildProcessWithoutNullStreams {
     // detached daemon from this suite.
     env: { ...process.env, CODEGRAPH_NO_DAEMON: '1' },
   }) as ChildProcessWithoutNullStreams;
+}
+
+function stopChild(child: ChildProcessWithoutNullStreams): Promise<void> {
+  return new Promise((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+    }, 1000);
+    child.once('exit', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    child.kill('SIGTERM');
+  });
 }
 
 function sendInitialize(child: ChildProcessWithoutNullStreams, projectPath: string) {
@@ -107,9 +125,9 @@ describe('MCP initialize handshake (issue #172)', () => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-init-'));
   });
 
-  afterEach(() => {
-    if (child && !child.killed) {
-      child.kill('SIGKILL');
+  afterEach(async () => {
+    if (child) {
+      await stopChild(child);
       child = null;
     }
     fs.rmSync(tempDir, { recursive: true, force: true });

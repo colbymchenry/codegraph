@@ -1,5 +1,7 @@
 import { defineConfig } from 'vitest/config';
 
+const wasmRuntimeFlags = ['--liftoff-only'];
+
 export default defineConfig({
   test: {
     globals: true,
@@ -27,6 +29,10 @@ export default defineConfig({
        * they inject their own `env` via the Telemetry constructor.
        */
       CODEGRAPH_TELEMETRY: '0',
+    },
+    poolOptions: {
+      forks: { execArgv: wasmRuntimeFlags },
+      threads: { execArgv: wasmRuntimeFlags },
     },
     coverage: {
       provider: 'v8',

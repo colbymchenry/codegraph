@@ -3611,6 +3611,8 @@ int run() {
           (r) => r.dstKind === 'file' && r.dstPath && r.dstPath.endsWith('vector')
         );
         expect(stdlibFile).toBeUndefined();
+        db.close();
+        cg.close();
       } finally {
         fs.rmSync(tempProject, { recursive: true, force: true });
       }
@@ -3715,6 +3717,8 @@ class Both : public Base<char>, public Plain {}; // templated + plain in one cla
           (r) => r.dstKind === 'file' && r.dstPath === 'src/lib.php'
         );
         expect(resolved, 'page.php → src/lib.php imports edge missing').toBeDefined();
+        db.close();
+        cg.close();
       } finally {
         fs.rmSync(tempProject, { recursive: true, force: true });
       }
@@ -3749,6 +3753,8 @@ class Both : public Base<char>, public Plain {}; // templated + plain in one cla
           rows.find((r) => r.dstKind === 'file' && r.dstPath === 'inc/db.php'),
           'index.php → inc/db.php imports edge missing'
         ).toBeDefined();
+        db.close();
+        cg.close();
       } finally {
         fs.rmSync(tempProject, { recursive: true, force: true });
       }
@@ -3788,6 +3794,8 @@ class Both : public Base<char>, public Plain {}; // templated + plain in one cla
           rows.find((r) => r.dstKind === 'file' && r.dstPath === 'lib/inc/db.php'),
           'app/page.php must NOT mis-connect to unrelated lib/inc/db.php'
         ).toBeUndefined();
+        db.close();
+        cg.close();
       } finally {
         fs.rmSync(tempProject, { recursive: true, force: true });
       }

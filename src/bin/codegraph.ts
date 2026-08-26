@@ -1825,6 +1825,15 @@ program
 /**
  * codegraph serve
  */
+function parseHttpPort(raw: string | undefined): number {
+  if (raw === undefined || raw === '') return 3000;
+  const port = Number(raw);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new Error(`Invalid HTTP port: ${raw}`);
+  }
+  return port;
+}
+
 program
   // Hidden from `--help`: this is the stdio entry point an AI agent launches
   // for itself (the installer wires `args: ['serve','--mcp']` into every
@@ -1834,9 +1843,12 @@ program
   .command('serve', { hidden: true })
   .description('Start CodeGraph as an MCP server for AI assistants')
   .option('-p, --path <path>', 'Project path (optional for MCP mode, uses rootUri from client)')
-  .option('--mcp', 'Run as MCP server (stdio transport)')
+  .option('--mcp', 'Run as MCP server')
+  .option('--http', 'Run MCP server over Streamable HTTP instead of stdio')
+  .option('--host <host>', 'Host for HTTP MCP mode (default: 127.0.0.1)')
+  .option('--port <port>', 'Port for HTTP MCP mode (default: 3000, use 0 for a random free port)')
   .option('--no-watch', 'Disable the file watcher (no auto-sync; useful on slow filesystems like WSL2 /mnt drives)')
-  .action(async (options: { path?: string; mcp?: boolean; watch?: boolean }) => {
+  .action(async (options: { path?: string; mcp?: boolean; http?: boolean; host?: string; port?: string; watch?: boolean }) => {
     const projectPath = options.path ? resolveProjectPath(options.path) : undefined;
 
     // Commander sets watch=false when --no-watch is passed. Route it through
@@ -1847,27 +1859,41 @@ program
 
     try {
       if (options.mcp) {
-        // `serve --mcp` is the stdio MCP server an AI agent launches for itself,
-        // not a command to run by hand. A human in a terminal would otherwise
-        // see it hang waiting for JSON-RPC on stdin, which reads as broken. If
-        // stdin is an interactive TTY, explain instead of hanging. The agent's
-        // pipe and the detached daemon both have a non-TTY stdin, so this only
-        // ever fires for a person who typed it.
-        if (process.stdin.isTTY && !process.env.CODEGRAPH_DAEMON_INTERNAL) {
-          console.error(chalk.bold('\nCodeGraph MCP server\n'));
-          console.error("This is the MCP server your AI agent (Claude Code, Cursor, Codex, opencode, …)");
-          console.error("starts automatically — you don't run it yourself.");
-          console.error(`\nIt's already wired up by ${chalk.cyan('codegraph install')}. To check on things:`);
-          console.error(`  ${chalk.cyan('codegraph status')}   ${chalk.dim('— is this project indexed and healthy?')}`);
-          console.error(`  ${chalk.cyan('codegraph daemon')}   ${chalk.dim('— list or stop background MCP servers')}`);
-          console.error(chalk.dim('\n(Running it directly only does something when an MCP client drives it over stdin.)'));
-          return;
+        if (options.http) {
+          const parsedPort = parseHttpPort(options.port);
+          const { MCPHttpServer } = await import('../mcp/http-server');
+          const server = new MCPHttpServer({
+            projectPath,
+            host: options.host,
+            port: parsedPort,
+          });
+          const url = await server.start();
+          process.stderr.write(`CodeGraph MCP HTTP server listening on ${url}\n`);
+          process.on('SIGINT', () => server.stop());
+          process.on('SIGTERM', () => server.stop());
+        } else {
+          // `serve --mcp` is the stdio MCP server an AI agent launches for itself,
+          // not a command to run by hand. A human in a terminal would otherwise
+          // see it hang waiting for JSON-RPC on stdin, which reads as broken. If
+          // stdin is an interactive TTY, explain instead of hanging. The agent's
+          // pipe and the detached daemon both have a non-TTY stdin, so this only
+          // ever fires for a person who typed it.
+          if (process.stdin.isTTY && !process.env.CODEGRAPH_DAEMON_INTERNAL) {
+            console.error(chalk.bold('\nCodeGraph MCP server\n'));
+            console.error("This is the MCP server your AI agent (Claude Code, Cursor, Codex, opencode, …)");
+            console.error("starts automatically — you don't run it yourself.");
+            console.error(`\nIt's already wired up by ${chalk.cyan('codegraph install')}. To check on things:`);
+            console.error(`  ${chalk.cyan('codegraph status')}   ${chalk.dim('— is this project indexed and healthy?')}`);
+            console.error(`  ${chalk.cyan('codegraph daemon')}   ${chalk.dim('— list or stop background MCP servers')}`);
+            console.error(chalk.dim('\n(Running it directly only does something when an MCP client drives it over stdin.)'));
+            return;
+          }
+          // Start MCP server - it handles initialization lazily based on rootUri from client
+          const { MCPServer } = await import('../mcp/index');
+          const server = new MCPServer(projectPath);
+          await server.start();
+          // Server will run until terminated
         }
-        // Start MCP server - it handles initialization lazily based on rootUri from client
-        const { MCPServer } = await import('../mcp/index');
-        const server = new MCPServer(projectPath);
-        await server.start();
-        // Server will run until terminated
       } else {
         // Default: show info about MCP mode.
         // Use stderr so stdout stays clean for any piped/stdio usage.

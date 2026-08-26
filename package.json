@@ -23,9 +23,9 @@
     "dev": "tsc --watch",
     "build:kernel": "bash scripts/build-kernel.sh",
     "cli": "npm run build && node dist/bin/codegraph.js",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "test:eval": "vitest run __tests__/evaluation/",
+    "test": "node --liftoff-only ./node_modules/vitest/vitest.mjs run",
+    "test:watch": "node --liftoff-only ./node_modules/vitest/vitest.mjs",
+    "test:eval": "node --liftoff-only ./node_modules/vitest/vitest.mjs run __tests__/evaluation/",
     "eval": "npm run build && npx tsx __tests__/evaluation/runner.ts",
     "clean": "node -e \"const fs=require('fs');fs.rmSync('dist',{recursive:true,force:true})\""
   },

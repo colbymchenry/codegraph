@@ -38,6 +38,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
+import { WASM_RUNTIME_FLAGS } from '../src/extraction/wasm-runtime-flags';
 import { getDaemonSocketPath } from '../src/mcp/daemon-paths';
 import { CodeGraphPackageVersion } from '../src/mcp/version';
 
@@ -50,7 +51,7 @@ interface SpawnedServer {
 }
 
 function spawnServer(cwd: string, env: NodeJS.ProcessEnv = {}): SpawnedServer {
-  const child = spawn(process.execPath, [BIN, 'serve', '--mcp'], {
+  const child = spawn(process.execPath, [...WASM_RUNTIME_FLAGS, BIN, 'serve', '--mcp'], {
     cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
     // #618: the daemon-attach log line is now off by default; opt the test
@@ -168,8 +169,34 @@ function killTree(...procs: ChildProcessWithoutNullStreams[]): void {
   }
 }
 
+async function waitForProcessTreeExit(...procs: ChildProcessWithoutNullStreams[]): Promise<void> {
+  await Promise.all(procs.map((p) => {
+    if (!p.pid || p.exitCode !== null || p.signalCode !== null) return Promise.resolve(false);
+    return waitProcessExit(p.pid, 3000);
+  }));
+}
+
 async function waitProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
   return waitFor(() => !isAlive(pid), timeoutMs).then(() => true).catch(() => false);
+}
+
+async function rmDirWhenUnlocked(dir: string, timeoutMs = 5000): Promise<void> {
+  const started = Date.now();
+  let lastError: unknown;
+  while (Date.now() - started <= timeoutMs) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'EPERM' && code !== 'EBUSY' && code !== 'ENOTEMPTY') {
+        throw err;
+      }
+      lastError = err;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+  throw lastError;
 }
 
 describe('Shared MCP daemon (issue #411)', () => {
@@ -186,6 +213,7 @@ describe('Shared MCP daemon (issue #411)', () => {
 
   afterEach(async () => {
     killTree(...servers.map((s) => s.child));
+    await waitForProcessTreeExit(...servers.map((s) => s.child));
     // The daemon is detached (not a tracked child) — reap it explicitly via the
     // pid it recorded, so a test can't leak a background daemon. Guard against
     // our own pid: the version-mismatch test plants `pid: process.pid` in the
@@ -193,10 +221,10 @@ describe('Shared MCP daemon (issue #411)', () => {
     const daemonPid = readLockPid(realRoot);
     if (daemonPid && daemonPid !== process.pid && isAlive(daemonPid)) {
       try { process.kill(daemonPid, 'SIGKILL'); } catch { /* race */ }
+      await waitProcessExit(daemonPid, 3000);
     }
-    await new Promise((r) => setTimeout(r, 50));
     servers.length = 0;
-    fs.rmSync(tempDir, { recursive: true, force: true });
+    await rmDirWhenUnlocked(tempDir);
   });
 
   it('two invocations share ONE detached daemon; both attach as proxies', async () => {
