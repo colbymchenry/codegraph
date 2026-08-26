@@ -13,6 +13,7 @@ import { Node, UnresolvedReference } from '../src/types';
 import { ReferenceResolver, createResolver, ResolutionContext } from '../src/resolution';
 import { matchReference, resolveMethodOnType, matchByQualifiedName, preferCallSiteFile, matchMethodCall } from '../src/resolution/name-matcher';
 import { resolveImportPath, extractImportMappings, resolveJvmImport, loadCppIncludeDirs, clearCppIncludeDirCache, isPhpIncludePathRef } from '../src/resolution/import-resolver';
+import { loadGoModules } from '../src/resolution/go-module';
 import type { UnresolvedRef } from '../src/resolution/types';
 import { detectFrameworks, getAllFrameworkResolvers } from '../src/resolution/frameworks';
 import { QueryBuilder } from '../src/db/queries';
@@ -1412,6 +1413,290 @@ func UsePkga() {
       // not pkgb's. With the broken (pre-fix) resolver this lands on
       // whichever Convert happens to be cheaper under path proximity.
       expect(target?.filePath.replace(/\\/g, '/')).toBe('pkga/conv.go');
+    });
+
+    describe('Go multi-module (side-by-side modules) resolution', () => {
+      // A monorepo layout where several independent Go modules sit as siblings
+      // under one root (no root go.mod). Pre-fix, loadGoModule read only the
+      // (absent) root go.mod → null → every cross-module import was treated as
+      // third-party and calls fell through to global name-matching (4% recall).
+      // These tests pin the multi-module index behavior. No mocks: every case
+      // writes real .go files and resolves through a real SQLite index.
+
+      it('1. resolves a cross-module call between two side-by-side modules', async () => {
+        fs.mkdirSync(path.join(tempDir, 'a', 'pkg'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'b', 'pkg'), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, 'a', 'go.mod'), 'module example.com/a\n\ngo 1.21\n');
+        fs.writeFileSync(path.join(tempDir, 'a', 'pkg', 'shared.go'), 'package pkg\n\nfunc SharedFn() int { return 1 }\n');
+        fs.writeFileSync(path.join(tempDir, 'b', 'go.mod'), 'module example.com/b\n\ngo 1.21\n');
+        // Decoy with the SAME name in b's own sub-package: under the broken
+        // (global name-match) resolver this is the closer hit, so resolving to
+        // a/pkg is what proves import-based cross-module resolution fired.
+        fs.writeFileSync(path.join(tempDir, 'b', 'pkg', 'other.go'), 'package pkg\n\nfunc SharedFn() int { return 2 }\n');
+        fs.writeFileSync(path.join(tempDir, 'b', 'use.go'),
+          `package main
+
+import apkg "example.com/a/pkg"
+
+func UseShared() {
+  apkg.SharedFn()
+}
+`);
+
+        cg = await CodeGraph.init(tempDir, { index: true });
+        const useShared = cg.getNodesByKind('function').filter((n) => n.name === 'UseShared')[0];
+        expect(useShared).toBeDefined();
+        const calls = cg.getOutgoingEdges(useShared!.id).filter((e) => e.kind === 'calls');
+        const targets = calls.map((e) => cg.getNode(e.target)?.filePath.replace(/\\/g, '/'));
+        expect(targets).toContain('a/pkg/shared.go');
+        expect(targets).not.toContain('b/pkg/other.go');
+      });
+
+      it('2. does not cross-wire a same-named symbol to a non-imported module', async () => {
+        // Mirrors a real mis-wire: a call to a same-named helper (Init) that the
+        // index wired to an unrelated module. b imports a ONLY; its apkg.Init()
+        // must resolve to a's Init, never c's decoy Init.
+        fs.mkdirSync(path.join(tempDir, 'a', 'pkg'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'b'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'c', 'pkg'), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, 'a', 'go.mod'), 'module example.com/a\n\ngo 1.21\n');
+        fs.writeFileSync(path.join(tempDir, 'a', 'pkg', 'init.go'), 'package pkg\n\nfunc Init() int { return 1 }\n');
+        fs.writeFileSync(path.join(tempDir, 'c', 'go.mod'), 'module example.com/c\n\ngo 1.21\n');
+        fs.writeFileSync(path.join(tempDir, 'c', 'pkg', 'init.go'), 'package pkg\n\nfunc Init() int { return 2 }\n');
+        fs.writeFileSync(path.join(tempDir, 'b', 'go.mod'), 'module example.com/b\n\ngo 1.21\n');
+        fs.writeFileSync(path.join(tempDir, 'b', 'use.go'),
+          `package main
+
+import apkg "example.com/a/pkg"
+
+func UseInit() {
+  apkg.Init()
+}
+`);
+
+        cg = await CodeGraph.init(tempDir, { index: true });
+        const useInit = cg.getNodesByKind('function').filter((n) => n.name === 'UseInit')[0];
+        expect(useInit).toBeDefined();
+        const calls = cg.getOutgoingEdges(useInit!.id).filter((e) => e.kind === 'calls');
+        const targets = calls.map((e) => cg.getNode(e.target)?.filePath.replace(/\\/g, '/'));
+        expect(targets).toContain('a/pkg/init.go');
+        expect(targets).not.toContain('c/pkg/init.go');
+      });
+
+      it('3. resolves the longest matching module path prefix first', async () => {
+        // example.com/x/commons and example.com/x/commons/sdk coexist. An import
+        // of .../sdk/pkg must bind to the SDK module, never the shorter commons
+        // prefix (which would map it to lib/sdk/pkg where no symbol lives).
+        fs.mkdirSync(path.join(tempDir, 'lib'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'sdk', 'pkg'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'app'), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, 'lib', 'go.mod'), 'module example.com/x/commons\n\ngo 1.21\n');
+        fs.writeFileSync(path.join(tempDir, 'sdk', 'go.mod'), 'module example.com/x/commons/sdk\n\ngo 1.21\n');
+        fs.writeFileSync(path.join(tempDir, 'sdk', 'pkg', 'thing.go'), 'package pkg\n\nfunc SdkThing() int { return 1 }\n');
+        fs.writeFileSync(path.join(tempDir, 'app', 'go.mod'), 'module example.com/x/app\n\ngo 1.21\n');
+        fs.writeFileSync(path.join(tempDir, 'app', 'use.go'),
+          `package main
+
+import sdkpkg "example.com/x/commons/sdk/pkg"
+
+func UseSdk() {
+  sdkpkg.SdkThing()
+}
+`);
+
+        // Direct index check: SDK wins the prefix race → sdk/pkg, not lib/sdk/pkg.
+        const idx = loadGoModules(tempDir);
+        expect(idx).not.toBeNull();
+        expect(idx!.packageDir('example.com/x/commons/sdk/pkg')).toBe('sdk/pkg');
+        // The shorter module is still itself resolvable at its own path.
+        expect(idx!.packageDir('example.com/x/commons')).toBe('lib');
+
+        cg = await CodeGraph.init(tempDir, { index: true });
+        const useSdk = cg.getNodesByKind('function').filter((n) => n.name === 'UseSdk')[0];
+        expect(useSdk).toBeDefined();
+        const calls = cg.getOutgoingEdges(useSdk!.id).filter((e) => e.kind === 'calls');
+        const targets = calls.map((e) => cg.getNode(e.target)?.filePath.replace(/\\/g, '/'));
+        expect(targets).toContain('sdk/pkg/thing.go');
+      });
+
+      it('4. matches the old algorithm for a single root module with no nested modules', async () => {
+        // A single go.mod at the project root: the new index path must reproduce
+        // the exact packageDir the old single-module code produced (table rows
+        // for relDir=''). This is the backward-compat guarantee.
+        fs.writeFileSync(path.join(tempDir, 'go.mod'), 'module example.com/app\n\ngo 1.21\n');
+        fs.mkdirSync(path.join(tempDir, 'pkga'));
+        fs.writeFileSync(path.join(tempDir, 'pkga', 'helper.go'), 'package pkga\n\nfunc Helper() int { return 1 }\n');
+        fs.writeFileSync(path.join(tempDir, 'main.go'),
+          `package main
+
+import "example.com/app/pkga"
+
+func UseHelper() {
+  pkga.Helper()
+}
+`);
+
+        const idx = loadGoModules(tempDir);
+        expect(idx).not.toBeNull();
+        expect(idx!.packageDir('example.com/app')).toBe('');
+        expect(idx!.packageDir('example.com/app/pkga')).toBe('pkga');
+        expect(idx!.packageDir('example.com/other')).toBeNull();
+
+        cg = await CodeGraph.init(tempDir, { index: true });
+        const useHelper = cg.getNodesByKind('function').filter((n) => n.name === 'UseHelper')[0];
+        expect(useHelper).toBeDefined();
+        const calls = cg.getOutgoingEdges(useHelper!.id).filter((e) => e.kind === 'calls');
+        const targets = calls.map((e) => cg.getNode(e.target)?.filePath.replace(/\\/g, '/'));
+        expect(targets).toContain('pkga/helper.go');
+      });
+
+      it('5. returns null and stays a no-op when there is no go.mod', async () => {
+        // No go.mod anywhere → loadGoModules is null and downstream behaves as today.
+        expect(loadGoModules(tempDir)).toBeNull();
+        // A non-Go project must still index normally (absence of go.mod never throws).
+        fs.writeFileSync(path.join(tempDir, 'app.ts'), 'export function hi(): number { return 1; }\n');
+        cg = await CodeGraph.init(tempDir, { index: true });
+        const hi = cg.getNodesByKind('function').filter((n) => n.name === 'hi')[0];
+        expect(hi).toBeDefined();
+      });
+
+      it('6. does not match a symbol in a sub-package of the imported package', async () => {
+        // pkga.FuncX must land on pkga/top.go, never pkga/subpkg/sub.go. This is
+        // the `fileDir === pkgDir` (exact parent) guard, not startsWith.
+        fs.writeFileSync(path.join(tempDir, 'go.mod'), 'module example.com/app\n\ngo 1.21\n');
+        fs.mkdirSync(path.join(tempDir, 'pkga', 'subpkg'), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, 'pkga', 'top.go'), 'package pkga\n\nfunc FuncX() int { return 1 }\n');
+        fs.writeFileSync(path.join(tempDir, 'pkga', 'subpkg', 'sub.go'), 'package subpkg\n\nfunc FuncX() int { return 2 }\n');
+        fs.writeFileSync(path.join(tempDir, 'main.go'),
+          `package main
+
+import "example.com/app/pkga"
+
+func UseFuncX() {
+  pkga.FuncX()
+}
+`);
+
+        cg = await CodeGraph.init(tempDir, { index: true });
+        const useFuncX = cg.getNodesByKind('function').filter((n) => n.name === 'UseFuncX')[0];
+        expect(useFuncX).toBeDefined();
+        const calls = cg.getOutgoingEdges(useFuncX!.id).filter((e) => e.kind === 'calls');
+        const targets = calls.map((e) => cg.getNode(e.target)?.filePath.replace(/\\/g, '/'));
+        expect(targets).toContain('pkga/top.go');
+        expect(targets).not.toContain('pkga/subpkg/sub.go');
+      });
+
+      it('7. marks exported methods isExported (Go) with no cross-language regression (Rust)', async () => {
+        // Go: a receiver method's isExported must reflect the leading-case rule,
+        // matching extractFunction. Before this fix extractMethod never set it.
+        fs.writeFileSync(path.join(tempDir, 'go.mod'), 'module example.com/app\n\ngo 1.21\n');
+        fs.writeFileSync(path.join(tempDir, 'thing.go'),
+          `package main
+
+type T struct {}
+
+func (r *T) Exported() int { return 1 }
+func (r *T) unexported() int { return 2 }
+`);
+        // Rust: no isExported predicate exists, so methods stay not-exported —
+        // unchanged by the Go-focused fix. Both methods must still extract.
+        fs.writeFileSync(path.join(tempDir, 'lib.rs'),
+          `pub struct Counter { count: i32 }
+
+impl Counter {
+    pub fn increment(&mut self) { self.count += 1; }
+    fn decrement(&mut self) { self.count -= 1; }
+}
+`);
+
+        cg = await CodeGraph.init(tempDir, { index: true });
+
+        const goMethods = cg.getNodesByKind('method').filter((m) => m.language === 'go' && m.filePath.replace(/\\/g, '/') === 'thing.go');
+        const exp = goMethods.find((m) => m.name === 'Exported');
+        const unexp = goMethods.find((m) => m.name === 'unexported');
+        expect(exp).toBeDefined();
+        expect(unexp).toBeDefined();
+        expect(exp!.isExported).toBe(true);
+        expect(unexp!.isExported).toBe(false);
+
+        const rustMethods = cg.getNodesByKind('method').filter((m) => m.language === 'rust' && m.filePath.replace(/\\/g, '/') === 'lib.rs');
+        expect(rustMethods.find((m) => m.name === 'increment')).toBeDefined();
+        expect(rustMethods.find((m) => m.name === 'decrement')).toBeDefined();
+      });
+
+      it('8. loadGoModules respects the scan-depth cap without throwing', () => {
+        // Nest go.mod files deeper than the MAX_DEPTH (8) safety cap. The scan
+        // must not throw, must collect the in-range modules, and must stop before
+        // the out-of-range ones.
+        let dir = tempDir;
+        for (let i = 0; i < 12; i++) {
+          dir = path.join(dir, `d${i}`);
+          fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(path.join(dir, 'go.mod'), `module example.com/deep${i}\n\ngo 1.21\n`);
+        }
+        expect(() => loadGoModules(tempDir)).not.toThrow();
+        const idx = loadGoModules(tempDir);
+        expect(idx).not.toBeNull();
+        const modulePaths = idx!.entries.map((e) => e.modulePath);
+        expect(modulePaths).toContain('example.com/deep0');
+        expect(modulePaths).not.toContain('example.com/deep11');
+      });
+
+      it('resolves a same-file package-constant reference (cross-module value refs need separate extraction)', async () => {
+        // Defect A makes exported Go const/var isExported=true so they pass the
+        // resolver's `if (!node.isExported) continue` guard. The const-reference
+        // edge that exists today is the SAME-FILE value-ref path (flushValueRefs);
+        // a cross-module `alias.Const` value reference is not yet EXTRACTED as a
+        // reference at all, so it cannot resolve here — that is a separate
+        // extraction gap, tracked outside this change. This test pins the path
+        // that works and the defect-A eligibility fix.
+        fs.writeFileSync(path.join(tempDir, 'go.mod'), 'module example.com/app\n\ngo 1.21\n');
+        fs.writeFileSync(path.join(tempDir, 'main.go'),
+          `package main
+
+const SharedCode = "x"
+
+func UseCode() string {
+  return SharedCode
+}
+`);
+
+        cg = await CodeGraph.init(tempDir, { index: true });
+        const code = cg.getNodesByKind('constant').filter((n) => n.name === 'SharedCode')[0];
+        const useCode = cg.getNodesByKind('function').filter((n) => n.name === 'UseCode')[0];
+        expect(code?.isExported).toBe(true); // defect A: exported const no longer guard-blocked
+        const refsToCode = cg.getOutgoingEdges(useCode!.id).filter(
+          (e) => e.kind === 'references' && cg.getNode(e.target)?.name === 'SharedCode'
+        );
+        expect(refsToCode.length).toBeGreaterThan(0);
+      });
+
+      it('builds a calls edge for a cross-module call inside a package-level grouped var initializer', async () => {
+        // Defect B consequence: a grouped-var initializer had no source node,
+        // so the call inside it (`apkg.NewLogger`) got no edge. Now `logger`
+        // is a node and its initializer call resolves to module a.
+        fs.mkdirSync(path.join(tempDir, 'a', 'pkg'), { recursive: true });
+        fs.mkdirSync(path.join(tempDir, 'b'), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, 'a', 'go.mod'), 'module example.com/a\n\ngo 1.21\n');
+        fs.writeFileSync(path.join(tempDir, 'a', 'pkg', 'logger.go'), 'package pkg\n\ntype Logger struct{}\n\nfunc NewLogger(name string) *Logger { return nil }\n');
+        fs.writeFileSync(path.join(tempDir, 'b', 'go.mod'), 'module example.com/b\n\ngo 1.21\n');
+        fs.writeFileSync(path.join(tempDir, 'b', 'use.go'),
+          `package main
+
+import apkg "example.com/a/pkg"
+
+var (
+  logger = apkg.NewLogger("x")
+)
+`);
+
+        cg = await CodeGraph.init(tempDir, { index: true });
+        const loggerVar = cg.getNodesByKind('variable').filter((n) => n.name === 'logger' && n.filePath.replace(/\\/g, '/') === 'b/use.go')[0];
+        expect(loggerVar).toBeDefined();
+        const calls = cg.getOutgoingEdges(loggerVar!.id).filter((e) => e.kind === 'calls');
+        const targets = calls.map((e) => cg.getNode(e.target)?.filePath.replace(/\\/g, '/'));
+        expect(targets).toContain('a/pkg/logger.go');
+      });
     });
 
     it('resolves Go aliased imports across packages (#388)', async () => {

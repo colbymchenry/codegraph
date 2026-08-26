@@ -12,6 +12,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- In a Go project with several modules placed side by side under one directory (a common monorepo layout), a call from one module into another now resolves to the correct definition instead of being dropped or wired to the wrong symbol (#388).
+- Exported Go methods are now correctly marked as exported, so cross-package method calls resolve.
+- In a Go project, variables declared in a grouped `var (...)` block are now indexed, and exported package-level constants and variables are now correctly marked as exported.
+
 
 ## [1.6.0] - 2026-08-26
 

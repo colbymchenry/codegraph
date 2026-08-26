@@ -1789,6 +1789,7 @@ export class TreeSitterExtractor {
     const docstring = getPrecedingDocstring(node, this.source);
     const signature = this.extractor.getSignature?.(node, this.source);
     const visibility = this.extractor.getVisibility?.(node);
+    const isExported = this.extractor.isExported?.(node, this.source);
     const isAsync = this.extractor.isAsync?.(node);
     const isStatic = this.extractor.isStatic?.(node);
     const returnType = this.extractor.getReturnType?.(node, this.source);
@@ -1796,6 +1797,7 @@ export class TreeSitterExtractor {
       docstring,
       signature,
       visibility,
+      isExported,
       isAsync,
       isStatic,
       returnType,
@@ -2749,11 +2751,22 @@ export class TreeSitterExtractor {
         });
       }
     } else if (this.language === 'go') {
-      // Go: var_declaration, short_var_declaration, const_declaration
-      // These can have multiple identifiers on the left
-      const specs = node.namedChildren.filter(c =>
-        c.type === 'var_spec' || c.type === 'const_spec'
-      );
+      // Go: var_declaration, short_var_declaration, const_declaration.
+      // Collect every var_spec/const_spec. A grouped `var ( … )` wraps its
+      // specs in a `var_spec_list` node, while a grouped `const ( … )` does
+      // NOT (its specs are direct children) — a tree-sitter-go grammar
+      // asymmetry. Filter only direct children and grouped var produces zero
+      // nodes, so flatten the *_spec_list wrapper too.
+      const specs: SyntaxNode[] = [];
+      for (const child of node.namedChildren) {
+        if (child.type === 'var_spec' || child.type === 'const_spec') {
+          specs.push(child);
+        } else if (child.type === 'var_spec_list' || child.type === 'const_spec_list') {
+          for (const inner of child.namedChildren) {
+            if (inner.type === 'var_spec' || inner.type === 'const_spec') specs.push(inner);
+          }
+        }
+      }
 
       for (const spec of specs) {
         const nameNode = spec.namedChild(0);
@@ -2763,10 +2776,17 @@ export class TreeSitterExtractor {
           const valueNode = spec.namedChildCount > 1 ? spec.namedChild(spec.namedChildCount - 1) : null;
           const initValue = valueNode ? getNodeText(valueNode, this.source).slice(0, 100) : undefined;
           const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
+          // Go export rule = leading uppercase. The isExported hook reads
+          // `getChildByField(node, 'name')`, so feed it the SPEC (whose `name`
+          // field IS the identifier) — NOT the declaration node (no `name`
+          // field → always false). Recompute per-spec here; do NOT touch the
+          // shared declaration-level isExported above (other languages use it).
+          const isExported = this.extractor.isExported?.(spec, this.source) ?? false;
 
           varNode = this.createNode(node.type === 'const_declaration' ? 'constant' : 'variable', name, spec, {
             docstring,
             signature: initSignature,
+            isExported,
           });
         }
         // Walk the initializer so composite literals and calls in a

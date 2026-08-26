@@ -394,6 +394,73 @@ in
   });
 });
 
+describe('Go const/var extraction (grouped var + isExported)', () => {
+  it('extracts every entry in a grouped var (…) block', () => {
+    // Defect B: a grouped `var ( … )` wraps its specs in a `var_spec_list`
+    // node (tree-sitter-go asymmetry vs grouped const), so they were skipped.
+    const code = `package main
+
+var (
+  A = 1
+  b = 2
+)`;
+    const result = extractFromSource('main.go', code);
+    const names = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
+    expect(names).toContain('A');
+    expect(names).toContain('b');
+  });
+
+  it('does not regress grouped const (…) extraction', () => {
+    const code = `package main
+
+const (
+  C = 1
+  D = 2
+)`;
+    const result = extractFromSource('main.go', code);
+    const names = result.nodes.filter((n) => n.kind === 'constant').map((n) => n.name).sort();
+    expect(names).toEqual(['C', 'D']);
+  });
+
+  it('sets isExported by leading-case for all Go var/const forms', () => {
+    // Defect A: Go const/variable isExported was always 0. All four forms here.
+    const code = `package main
+
+var SingleVar = 1
+var (
+  GroupedA = 1
+  groupedB = 2
+)
+const SingleConst = 1
+const (
+  ConstA = 1
+  constB = 2
+)`;
+    const result = extractFromSource('main.go', code);
+    const node = (kind: string, name: string) =>
+      result.nodes.find((n) => n.kind === kind && n.name === name);
+    expect(node('variable', 'SingleVar')?.isExported).toBe(true);
+    expect(node('variable', 'GroupedA')?.isExported).toBe(true);
+    expect(node('variable', 'groupedB')?.isExported).toBe(false);
+    expect(node('constant', 'SingleConst')?.isExported).toBe(true);
+    expect(node('constant', 'ConstA')?.isExported).toBe(true);
+    expect(node('constant', 'constB')?.isExported).toBe(false);
+  });
+
+  it('does not change isExported behavior for TypeScript or Python (Go-only fix)', () => {
+    // TypeScript: export-marked const is exported, plain const is not.
+    const ts = extractFromSource('a.ts', 'export const Exp = 1;\nconst priv = 2;\n');
+    expect(ts.nodes.find((n) => n.kind === 'constant' && n.name === 'Exp')?.isExported).toBe(true);
+    expect(ts.nodes.find((n) => n.kind === 'constant' && n.name === 'priv')?.isExported).toBeFalsy();
+
+    // Python has no isExported predicate — symbols stay not-exported (unchanged).
+    const py = extractFromSource('a.py', 'MAX = 100\ncounter = 0\n');
+    const pyMax = py.nodes.find((n) => (n.kind === 'constant' || n.kind === 'variable') && n.name === 'MAX');
+    expect(pyMax).toBeDefined();
+    expect(pyMax?.isExported).toBeFalsy();
+  });
+});
+
 describe('TypeScript Extraction', () => {
   it('should extract function declarations', () => {
     const code = `
