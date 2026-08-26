@@ -43,7 +43,7 @@
     "fast-wrap-ansi": "^0.2.0",
     "ignore": "^7.0.5",
     "jsonc-parser": "^3.3.1",
-    "picomatch": "^4.0.3",
+    "picomatch": "^4.0.4",
     "sisteransi": "^1.0.5",
     "tree-sitter-wasms": "^0.1.11",
     "web-tree-sitter": "^0.25.3"
