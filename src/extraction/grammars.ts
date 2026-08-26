@@ -50,6 +50,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  crystal: 'tree-sitter-crystal.wasm',
 };
 
 /**
@@ -102,6 +103,7 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.twig': 'twig',
   '.rb': 'ruby',
   '.rake': 'ruby',
+  '.cr': 'crystal',
   '.swift': 'swift',
   '.kt': 'kotlin',
   '.kts': 'kotlin',
@@ -271,6 +273,11 @@ export async function initGrammars(): Promise<void> {
  * nix-community/tree-sitter-nix @ 3d0173d (MIT) with tree-sitter-cli 0.25.10
  * (`generate` + `build --wasm`, ABI 15 — upstream's checked-in parser.c is
  * still ABI 13; all 54 upstream corpus tests pass on the regenerated parser).
+ * Crystal: no npm/tree-sitter-wasms build exists at all; we vendor a wasm built
+ * from crystal-lang-tools/tree-sitter-crystal @ 50ca9e6 (MIT) with
+ * tree-sitter-cli 0.25.10 (`build --wasm` on the repo's CHECKED-IN parser.c —
+ * no `generate`), ABI 15. Crystal is not kernel-routed, so this is the only
+ * grammar artifact for the language.
  *
  * TypeScript/TSX/JavaScript (+jsx, which shares the javascript grammar): the
  * tree-sitter-wasms builds are 2023-era (^0.20.x); we vendor wasm built from
@@ -290,7 +297,7 @@ export async function initGrammars(): Promise<void> {
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
-  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
+  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix', 'crystal',
   'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
   // R7a (C/C++ kernel port prep): tree-sitter-c v0.24.2 (b780e47) +
   // tree-sitter-cpp v0.23.4 (f41e1a0), parser.c/scanner.c sha-matched against
@@ -694,6 +701,7 @@ export function getLanguageDisplayName(language: Language): string {
     erlang: 'Erlang',
     terraform: 'Terraform',
     arkts: 'ArkTS',
+    crystal: 'Crystal',
     unknown: 'Unknown',
   };
   return names[language] || language;
