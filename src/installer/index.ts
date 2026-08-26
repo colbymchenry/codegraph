@@ -297,7 +297,9 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
   await getTelemetry().flushNow();
 
   const finalNote = targets.length > 0
-    ? `Done! Restart your agent${targets.length > 1 ? 's' : ''} to use CodeGraph.`
+    ? targets.every((t) => t.requiresRestart === false)
+      ? 'Done! CodeGraph is wired — instructions-file targets pick it up on the agent’s next turn, no restart needed.'
+      : `Done! Restart your agent${targets.length > 1 ? 's' : ''} to use CodeGraph.`
     : 'Done!';
   clack.outro(finalNote);
 }
@@ -578,9 +580,10 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
   const cliNote = cliRemoved ? ' The CLI is removed too — this was its last run.' : '';
   if (removed.length > 0) {
     const names = removed.map((r) => r.displayName).join(', ');
+    const allNoRestart = targets.every((t) => t.requiresRestart === false);
     clack.outro(
       `Removed CodeGraph from ${removed.length} agent${removed.length > 1 ? 's' : ''}: ${names}. ` +
-      `Restart ${removed.length > 1 ? 'them' : 'it'} to apply.` + cliNote,
+      (allNoRestart ? 'No restart needed.' : `Restart ${removed.length > 1 ? 'them' : 'it'} to apply.`) + cliNote,
     );
   } else if (cliRemoved) {
     clack.outro(`No ${location} agent had CodeGraph configured.` + cliNote);
