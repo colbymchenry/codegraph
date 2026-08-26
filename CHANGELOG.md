@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Lua and Luau function expressions assigned to locals, table members, or keyed table fields are now indexed as callable nodes. Calls from `local f = function() ... end`, `M.f = function() ... end`, and callback tables such as `M.handlers = { onClick = function() ... end }` are attributed to the named function or method instead of collapsing onto the file node, so callers and impact no longer omit these handlers. Re-index after upgrading. (#1616)
 
 ## [1.6.0] - 2026-08-26
 

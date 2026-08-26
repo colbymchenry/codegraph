@@ -24,7 +24,7 @@ local function localFn(...)
 	return select("#", ...)
 end
 
--- doc for anonAssigned (variable, initializer invisible)
+-- doc for anonAssigned (function named from its local binding)
 local anonAssigned = function(v)
 	return hidden(v)
 end
@@ -67,6 +67,15 @@ end
 M.assigned = function(z)
 	return topFn(z)
 end
+
+M.callbacks = {
+	on_start = function()
+		return topFn(17)
+	end,
+	["on_stop"] = function()
+		return topFn(18)
+	end,
+}
 
 M.handlers = { on_start = topFn, on_stop = localFn, skipped = missing }
 local tbl = { cb = topFn, [1] = localFn, nested = { deep_cb = topFn } }
