@@ -150,6 +150,15 @@ describe('Language Detection', () => {
     expect(isSourceFile('default.nix')).toBe(true);
   });
 
+  it('should detect Haskell files', () => {
+    expect(detectLanguage('src/Main.hs')).toBe('haskell');
+    expect(detectLanguage('app/Lib.lhs')).toBe('haskell');
+    expect(detectLanguage('src/Data/Map.hs')).toBe('haskell');
+    expect(isSourceFile('app/Main.hs')).toBe(true);
+    expect(isSourceFile('app/Main.lhs')).toBe(true);
+    expect(isSourceFile('README.md')).toBe(false);
+  });
+
   it('should detect a .h whose only C++ signal is an export-macro class as cpp', () => {
     // Lean Unreal-Engine style header: the class is annotated with an export
     // macro and carries no explicit `public:`/`virtual`/`namespace`/`template`,
@@ -11917,5 +11926,296 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     expect(result.errors).toEqual([]);
     expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'Widget')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'size')).toBe(true);
+  });
+});
+
+describe('Haskell Extraction', () => {
+  describe('Language detection', () => {
+    it('should report Haskell as supported', () => {
+      expect(isLanguageSupported('haskell')).toBe(true);
+      expect(getSupportedLanguages()).toContain('haskell');
+      expect(isSourceFile('app/Main.hs')).toBe(true);
+      expect(isSourceFile('app/Main.lhs')).toBe(true);
+    });
+  });
+
+  describe('Function extraction', () => {
+    it('should extract simple functions', () => {
+      const code = `module M where
+
+double :: Int -> Int
+double x = x * 2
+
+identity x = x
+`;
+      const result = extractFromSource('src/M.hs', code);
+      const double = result.nodes.find((n) => n.kind === 'function' && n.name === 'double');
+      expect(double).toBeDefined();
+      expect(double?.signature).toBe('double :: Int -> Int');
+      expect(double?.language).toBe('haskell');
+      const identity = result.nodes.find((n) => n.kind === 'function' && n.name === 'identity');
+      expect(identity).toBeDefined();
+    });
+
+    it('should merge multi-clause functions into one node spanning all clauses', () => {
+      const code = `module M where
+
+factorial :: Int -> Int
+factorial 0 = 1
+factorial n = n * factorial (n - 1)
+`;
+      const result = extractFromSource('src/M.hs', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function' && n.name === 'factorial');
+      expect(fns).toHaveLength(1);
+      expect(fns[0]!.startLine).toBe(4);
+      expect(fns[0]!.endLine).toBe(5);
+    });
+
+    it('should extract functions with guards', () => {
+      const code = `module M where
+
+bar :: Int -> Int
+bar x
+  | x > 0 = x
+  | otherwise = 0
+`;
+      const result = extractFromSource('src/M.hs', code);
+      const bar = result.nodes.find((n) => n.kind === 'function' && n.name === 'bar');
+      expect(bar).toBeDefined();
+      expect(bar?.startLine).toBe(4);
+      expect(bar?.endLine).toBe(6);
+    });
+
+    it('should use the preceding signature as the function signature', () => {
+      const code = `module M where
+
+-- | Computes the area.
+area :: Double -> Double
+area r = pi * r * r
+`;
+      const result = extractFromSource('src/M.hs', code);
+      const area = result.nodes.find((n) => n.kind === 'function' && n.name === 'area');
+      expect(area?.signature).toBe('area :: Double -> Double');
+      expect(area?.docstring).toBe('Computes the area.');
+    });
+
+    it('should qualify functions with the module namespace', () => {
+      const code = `module MyModule where
+
+start :: IO ()
+start = pure ()
+`;
+      const result = extractFromSource('src/MyModule.hs', code);
+      const ns = result.nodes.find((n) => n.kind === 'namespace');
+      expect(ns?.name).toBe('MyModule');
+      const start = result.nodes.find((n) => n.kind === 'function' && n.name === 'start');
+      expect(start?.qualifiedName).toBe('MyModule::start');
+    });
+  });
+
+  describe('Data type extraction', () => {
+    it('should extract simple ADTs as structs with constructors as enum_members', () => {
+      const code = `module M where
+
+data Color = Red | Green | Blue
+`;
+      const result = extractFromSource('src/M.hs', code);
+      const color = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Color');
+      expect(color).toBeDefined();
+      const ctors = result.nodes.filter((n) => n.kind === 'enum_member').map((n) => n.name);
+      expect(ctors).toContain('Red');
+      expect(ctors).toContain('Green');
+      expect(ctors).toContain('Blue');
+    });
+
+    it('should extract record ADTs with fields', () => {
+      const code = `module M where
+
+data Point = Point { x :: Double, y :: Double }
+`;
+      const result = extractFromSource('src/M.hs', code);
+      const point = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Point');
+      expect(point).toBeDefined();
+      const ctor = result.nodes.find((n) => n.kind === 'enum_member' && n.name === 'Point');
+      expect(ctor).toBeDefined();
+      const fields = result.nodes.filter((n) => n.kind === 'field').map((n) => n.name);
+      expect(fields).toContain('x');
+      expect(fields).toContain('y');
+    });
+
+    it('should extract parameterized ADTs', () => {
+      const code = `module M where
+
+data Tree a = Leaf | Node a (Tree a) (Tree a)
+`;
+      const result = extractFromSource('src/M.hs', code);
+      const tree = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Tree');
+      expect(tree).toBeDefined();
+      const ctors = result.nodes.filter((n) => n.kind === 'enum_member').map((n) => n.name);
+      expect(ctors).toContain('Leaf');
+      expect(ctors).toContain('Node');
+    });
+  });
+
+  describe('Type class and instance extraction', () => {
+    it('should extract type classes as traits', () => {
+      const code = `module M where
+
+class Shape s where
+  area :: s -> Double
+  perimeter :: s -> Double
+`;
+      const result = extractFromSource('src/M.hs', code);
+      const shape = result.nodes.find((n) => n.kind === 'trait' && n.name === 'Shape');
+      expect(shape).toBeDefined();
+    });
+
+    it('should extract instances with implements reference', () => {
+      const code = `module M where
+
+data Circle = Circle { radius :: Double }
+
+class Shape s where
+  area :: s -> Double
+
+instance Shape Circle where
+  area (Circle r) = pi * r * r
+`;
+      const result = extractFromSource('src/M.hs', code);
+      const inst = result.nodes.find((n) => n.kind === 'class' && n.name === 'Shape.Circle');
+      expect(inst).toBeDefined();
+      const implRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'implements');
+      expect(implRefs.some((r) => r.referenceName === 'Shape')).toBe(true);
+    });
+
+    it('should not merge same-named methods across different instances', () => {
+      const code = `module M where
+
+data Circle = Circle { radius :: Double }
+data Square = Square { side :: Double }
+
+class Shape s where
+  area :: s -> Double
+
+instance Shape Circle where
+  area (Circle r) = pi * r * r
+
+instance Shape Square where
+  area (Square s) = s * s
+`;
+      const result = extractFromSource('src/M.hs', code);
+      const areas = result.nodes.filter((n) => n.kind === 'function' && n.name === 'area');
+      expect(areas).toHaveLength(2);
+      const circleInst = result.nodes.find((n) => n.kind === 'class' && n.name === 'Shape.Circle');
+      const squareInst = result.nodes.find((n) => n.kind === 'class' && n.name === 'Shape.Square');
+      expect(circleInst).toBeDefined();
+      expect(squareInst).toBeDefined();
+      // Each area method must be contained by its own instance, not both
+      // collapsed onto one.
+      const containsArea = (instId: string | undefined) =>
+        result.edges.some(
+          (e) =>
+            e.kind === 'contains' &&
+            e.source === instId &&
+            areas.some((a) => a.id === e.target),
+        );
+      expect(containsArea(circleInst!.id)).toBe(true);
+      expect(containsArea(squareInst!.id)).toBe(true);
+      // The two area nodes must be distinct (not the same id merged).
+      expect(areas[0]!.id).not.toBe(areas[1]!.id);
+    });
+  });
+
+  describe('Type synonym and newtype extraction', () => {
+    it('should extract type synonyms as type aliases', () => {
+      const code = `module M where
+
+type Point2D = (Double, Double)
+type Synonym = [Int]
+`;
+      const result = extractFromSource('src/M.hs', code);
+      const p2d = result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'Point2D');
+      expect(p2d).toBeDefined();
+      const syn = result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'Synonym');
+      expect(syn).toBeDefined();
+    });
+
+    it('should extract newtypes as structs', () => {
+      const code = `module M where
+
+newtype Score = Score Int
+`;
+      const result = extractFromSource('src/M.hs', code);
+      const score = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Score');
+      expect(score).toBeDefined();
+    });
+  });
+
+  describe('Import extraction', () => {
+    it('should extract simple imports', () => {
+      const code = `module M where
+
+import Data.List (sort)
+`;
+      const result = extractFromSource('src/M.hs', code);
+      const imp = result.nodes.find((n) => n.kind === 'import' && n.name === 'Data.List');
+      expect(imp).toBeDefined();
+    });
+
+    it('should extract qualified imports with alias', () => {
+      const code = `module M where
+
+import qualified Data.Map as Map
+`;
+      const result = extractFromSource('src/M.hs', code);
+      const imp = result.nodes.find((n) => n.kind === 'import' && n.name === 'Data.Map');
+      expect(imp).toBeDefined();
+    });
+  });
+
+  describe('Call edges', () => {
+    it('should extract local function calls', () => {
+      const code = `module M where
+
+factorial :: Int -> Int
+factorial 0 = 1
+factorial n = n * factorial (n - 1)
+`;
+      const result = extractFromSource('src/M.hs', code);
+      const refs = result.unresolvedReferences.filter(
+        (r) => r.referenceName === 'factorial' && r.referenceKind === 'calls',
+      );
+      expect(refs.length).toBeGreaterThan(0);
+    });
+
+    it('should extract qualified calls', () => {
+      const code = `module M where
+
+import qualified Data.Text as T
+
+main :: IO ()
+main = T.putStrLn "hello"
+`;
+      const result = extractFromSource('src/M.hs', code);
+      const refs = result.unresolvedReferences.filter(
+        (r) => r.referenceName === 'T.putStrLn' && r.referenceKind === 'calls',
+      );
+      expect(refs.length).toBeGreaterThan(0);
+    });
+
+    it('should extract data constructor applications as instantiates', () => {
+      const code = `module M where
+
+data Maybe a = Nothing | Just a
+
+main :: IO ()
+main = print (Just 42)
+`;
+      const result = extractFromSource('src/M.hs', code);
+      const refs = result.unresolvedReferences.filter(
+        (r) => r.referenceName === 'Just' && r.referenceKind === 'instantiates',
+      );
+      expect(refs.length).toBeGreaterThan(0);
+    });
   });
 });
