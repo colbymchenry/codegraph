@@ -607,5 +607,28 @@
       "files": "~3390",
       "question": "How does programs.git.enable produce the final git config file in the user's home directory? Trace the flow from the git program module to the home-files machinery that links generated files into place."
     }
+  ],
+  "Julia": [
+    {
+      "name": "UnicodePlots.jl",
+      "repo": "https://github.com/JuliaPlots/UnicodePlots.jl",
+      "size": "Small",
+      "files": "~66",
+      "question": "How does a high-level plotting call like lineplot dispatch down to the Canvas code that draws characters into the terminal grid?"
+    },
+    {
+      "name": "Distributions.jl",
+      "repo": "https://github.com/JuliaStats/Distributions.jl",
+      "size": "Medium",
+      "files": "~256",
+      "question": "How does calling rand(d) on an abstract Distribution resolve to the concrete sampling method for a specific distribution type? Trace the dispatch from the abstract interface to a concrete implementation."
+    },
+    {
+      "name": "Oceananigans.jl",
+      "repo": "https://github.com/CliMA/Oceananigans.jl",
+      "size": "Large",
+      "files": "~753",
+      "question": "How does a time_step! call reach the tendency and solver kernels that actually update the model's velocity and tracer fields? Trace the flow from the top-level time-stepping entry point through the model abstraction to the low-level kernels."
+    }
   ]
 }

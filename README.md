@@ -825,6 +825,7 @@ is written):
 | Solidity | `.sol` | Full support (contracts, libraries, interfaces, structs, enums, modifiers, events, errors, state variables, `import`/`using` directives, `emit`/`revert` calls) |
 | Terraform / OpenTofu | `.tf`, `.tfvars`, `.tofu` | Full support (resources, data sources, modules, variables, outputs, providers incl. aliases, `locals`; `var.`/`local.`/`module.`/resource references with Terraform's per-directory scoping enforced; module calls bridged across the boundary — inputs to the child module's variables, `module.M.out` to the child's output, `source` to the module's files; cloudposse/atmos `remote-state` cross-component wiring when the component is statically named; `provider = aws.east` selections resolved up the module tree; `moved`/`import`/`removed`/`check` block references; `.tfvars` assignments linked to the variables they set) |
 | Nix | `.nix` | Full support (functions with simple/destructured/curried params, `let`/attrset bindings, `inherit`, `import ./path` file edges — `./dir` resolving through `default.nix` — plus NixOS module `imports = [ ./x.nix ]` lists and `callPackage ./pkg.nix` file edges; call edges; module-system option wiring — a config write like `launchd.user.agents.x = { ... }` links to the module declaring `options.launchd.user.agents`, so option flows trace across modules) |
+| Julia | `.jl` | Full support (functions, `struct`/`mutable struct` with typed fields, modules, `using`/`import` statements) |
 
 ## Measured cross-file coverage
 

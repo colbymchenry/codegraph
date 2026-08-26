@@ -99,6 +99,11 @@ function extractName(node: SyntaxNode, source: string, extractor: LanguageExtrac
 function extractNameRaw(node: SyntaxNode, source: string, extractor: LanguageExtractor): string {
   const hookName = extractor.resolveName?.(node, source);
   if (hookName) return hookName;
+  // Language-specific name extraction hook
+  if (extractor.getName) {
+    const customName = extractor.getName(node, source);
+    if (customName !== null) return customName || '<anonymous>';
+  }
 
   // Try field name first
   const nameNode = getChildByField(node, extractor.nameField);
@@ -1895,7 +1900,8 @@ export class TreeSitterExtractor {
     // Skip forward declarations and type references (no body = not a definition)
     // — EXCEPT C# positional records (`record struct M(decimal Amount);`),
     // complete definitions with no body block. (#831)
-    const body = getChildByField(node, this.extractor.bodyField);
+    const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+      ?? getChildByField(node, this.extractor.bodyField);
     if (!body && node.type !== 'record_declaration') return;
 
     const name = extractName(node, this.source, this.extractor);
@@ -2882,6 +2888,23 @@ export class TreeSitterExtractor {
           docstring,
           isExported,
         });
+      }
+    } else if (this.language === 'julia') {
+      // Julia: const_statement → assignment → identifier (name) [op] value
+      const assignment = node.namedChild(0);
+      if (assignment) {
+        const nameNode = assignment.namedChild(0);
+        if (nameNode?.type === 'identifier') {
+          const name = getNodeText(nameNode, this.source);
+          const valueNode = assignment.namedChildCount > 1
+            ? assignment.namedChild(assignment.namedChildCount - 1)
+            : null;
+          const initValue = valueNode && valueNode !== nameNode
+            ? getNodeText(valueNode, this.source).slice(0, 100)
+            : undefined;
+          const initSignature = initValue ? `= ${initValue}` : undefined;
+          this.createNode('constant', name, nameNode, { docstring, signature: initSignature, isExported });
+        }
       }
     } else {
       // Generic fallback for other languages

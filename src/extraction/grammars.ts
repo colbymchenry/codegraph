@@ -50,6 +50,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  julia: 'tree-sitter-julia.wasm',
 };
 
 /**
@@ -170,6 +171,7 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.tf': 'terraform',
   '.tfvars': 'terraform',
   '.tofu': 'terraform',
+  '.jl': 'julia',
 };
 
 /**
@@ -226,6 +228,7 @@ export function isPlayRoutesFile(filePath: string): boolean {
     filePath.endsWith('.routes')
   );
 }
+
 
 /**
  * Caches for loaded grammars and parsers
@@ -338,6 +341,9 @@ const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   // kernel compiles the same-commit vendored C (codegraph-kernel/grammars/
   // dart); crates.io tree-sitter-dart is a different-lineage fork (rejected).
   'dart',
+  // Julia: not shipped by tree-sitter-wasms; we vendor the prebuilt
+  // tree-sitter-julia.wasm from PR #373 (kongdd:julia).
+  'julia',
 ]);
 
 /** Absolute path of a language's grammar WASM (vendored or tree-sitter-wasms). */
@@ -694,6 +700,7 @@ export function getLanguageDisplayName(language: Language): string {
     erlang: 'Erlang',
     terraform: 'Terraform',
     arkts: 'ArkTS',
+    julia: 'Julia',
     unknown: 'Unknown',
   };
   return names[language] || language;
