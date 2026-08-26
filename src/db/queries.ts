@@ -223,6 +223,9 @@ export class QueryBuilder {
   private projectNameTokens: Set<string> = new Set();
   private isDeprioritizedPath: ((filePath: string) => boolean) | undefined;
 
+  // FTS5 availability flag — detected once at construction time (#1532)
+  private _fts5Available: boolean | undefined;
+
   // Node cache for frequently accessed nodes (LRU-style, max 1000 entries)
   private nodeCache: Map<string, Node> = new Map();
   private readonly maxCacheSize = 1000;
@@ -315,6 +318,13 @@ export class QueryBuilder {
 
   constructor(db: SqliteDatabase) {
     this.db = db;
+    // Detect FTS5 availability once (#1532)
+    try {
+      db.prepare("SELECT * FROM nodes_fts LIMIT 0").get();
+      this._fts5Available = true;
+    } catch {
+      this._fts5Available = false;
+    }
   }
 
   /**
@@ -1258,9 +1268,9 @@ export class QueryBuilder {
     const kinds = mergedKinds;
     const languages = mergedLanguages;
 
-    // First try FTS5 with prefix matching
+    // First try FTS5 with prefix matching (skip if FTS5 not available, #1532)
     let results = text
-      ? this.searchNodesFTS(text, { kinds, languages, limit, offset })
+      ? (this._fts5Available !== false ? this.searchNodesFTS(text, { kinds, languages, limit, offset }) : [])
       // Over-fetch by 5× when running filter-only (no text). The
       // post-scoring path: + name: filters can be very selective, so
       // a smaller multiplier risks returning fewer than `limit`
