@@ -12,6 +12,14 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- CodeGraph now indexes **Clojure** (`.clj`, `.cljc`, `.cljs`, `.edn`) — namespaces,
+  functions, multimethods, protocols, records, constants, `:require`/`:import`
+  edges, call edges (including alias-qualified `alias/fn` calls), and `#'var`
+  quoted references, so private vars reached from test suites still show up as
+  callers.
+
 
 ## [1.6.0] - 2026-08-26
 
