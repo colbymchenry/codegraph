@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- `codegraph_explore` no longer tells a fresh subagent, or an agent after context compaction, to reuse source that only an earlier context received. Cross-call source suppression now requires explicit `CODEGRAPH_EXPLORE_DEDUP=1`; without a reliable host-provided context lifecycle, the default safely re-serves source on every call. (#1620)
 
 ## [1.6.0] - 2026-08-26
 
