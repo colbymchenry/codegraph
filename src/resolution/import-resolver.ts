@@ -9,6 +9,7 @@ import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport } from './types';
 import { applyAliases } from './path-aliases';
+import { extractLocalExportAliases } from './alias-binding';
 import { resolveWorkspaceImport } from './workspace-packages';
 import {
   resolveMethodOnType,
@@ -91,11 +92,26 @@ function getFileExportIndex(filePath: string, context: ResolutionContext): FileE
   let idx = perFile.get(filePath);
   if (!idx) {
     idx = { byName: new Map(), defaultComponent: undefined, defaultFnClass: undefined };
+    // Every declaration, exported or not: a local `export { impl as alias }`
+    // clause exports a declaration the extractor never flagged isExported.
+    const declared = new Map<string, Node>();
     for (const n of context.getNodesInFile(filePath)) {
+      if (!declared.has(n.name)) declared.set(n.name, n);
       if (!n.isExported) continue;
       if (!idx.byName.has(n.name)) idx.byName.set(n.name, n);
       if (idx.defaultComponent === undefined && n.kind === 'component') idx.defaultComponent = n;
       if (idx.defaultFnClass === undefined && (n.kind === 'function' || n.kind === 'class')) idx.defaultFnClass = n;
+    }
+    // Bind names introduced by a local export clause to their declarations, so
+    // an importer asking for the renamed name gets the real symbol instead of
+    // falling through to the name-matcher (which cannot cross the rename).
+    const content = context.readFile(filePath);
+    if (content && content.includes('export')) {
+      for (const { exportedName, localName } of extractLocalExportAliases(content)) {
+        if (idx.byName.has(exportedName)) continue;
+        const decl = declared.get(localName);
+        if (decl) idx.byName.set(exportedName, decl);
+      }
     }
     perFile.set(filePath, idx);
   }

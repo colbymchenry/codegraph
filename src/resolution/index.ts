@@ -19,6 +19,7 @@ import {
 import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
 import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
+import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
@@ -852,7 +853,35 @@ export class ReferenceResolver {
   /**
    * Resolve a single reference
    */
+  /**
+   * Resolve one reference, then forward calls that landed on an alias binding
+   * to the symbol the alias names (see ./alias-binding).
+   *
+   * The strategies below resolve `alias()` to the BINDING, which is one hop
+   * short of the truth: the real function then reports zero callers even though
+   * the edge was built. Applied here rather than inside each strategy because
+   * every strategy can produce such a target — import, name-match, or framework.
+   */
   resolveOne(ref: UnresolvedRef): ResolvedRef | null {
+    const resolved = this.resolveOneStrategies(ref);
+    if (!resolved || ref.referenceKind !== 'calls') return resolved;
+
+    const target = this.queries.getNodeById(resolved.targetNodeId);
+    if (!target) return resolved;
+
+    const dot = ref.referenceName.lastIndexOf('.');
+    const memberName = dot >= 0 ? ref.referenceName.slice(dot + 1) : null;
+    const forwarded = resolveAliasBinding(target, memberName, this.context);
+    if (!forwarded || forwarded.id === resolved.targetNodeId) return resolved;
+
+    return {
+      ...resolved,
+      targetNodeId: forwarded.id,
+      confidence: Math.min(resolved.confidence, 0.85),
+    };
+  }
+
+  private resolveOneStrategies(ref: UnresolvedRef): ResolvedRef | null {
     // Skip built-in/external references
     if (this.isBuiltInOrExternal(ref)) {
       return null;
