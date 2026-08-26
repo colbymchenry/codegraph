@@ -59,8 +59,16 @@ describe('FileWatcher', () => {
 
   // Inert by default — unit tests drive events via __emitWatchEventForTests
   // and never depend on real OS watch delivery.
-  const newWatcher = (syncFn: SyncFn, opts: WatchOptions = {}) =>
-    new FileWatcher(testDir, syncFn, { inertForTests: true, ...opts });
+  const newWatcher = (
+    syncFn: SyncFn,
+    opts: WatchOptions = {},
+    isFileStateCurrent?: (relativePath: string) => boolean
+  ) => new FileWatcher(
+    testDir,
+    syncFn,
+    { inertForTests: true, ...opts },
+    isFileStateCurrent
+  );
 
   beforeEach(() => {
     testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-watcher-'));
@@ -674,6 +682,47 @@ describe('FileWatcher', () => {
   });
 
   describe('pending file tracking (#403)', () => {
+    it('should ignore events whose filesystem metadata is already indexed (#1451)', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const isFileStateCurrent = vi.fn().mockReturnValue(true);
+      const watcher = newWatcher(
+        syncFn,
+        { debounceMs: 100 },
+        isFileStateCurrent
+      );
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      __emitWatchEventForTests(testDir, 'src/index.ts');
+
+      expect(isFileStateCurrent).toHaveBeenCalledWith('src/index.ts');
+      expect(watcher.getPendingFiles()).toEqual([]);
+      await new Promise((r) => setTimeout(r, 200));
+      expect(syncFn).not.toHaveBeenCalled();
+
+      watcher.stop();
+    });
+
+    it('should keep an event when the metadata check fails open (#1451)', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 1, durationMs: 10 });
+      const isFileStateCurrent = vi.fn(() => {
+        throw new Error('database busy');
+      });
+      const watcher = newWatcher(
+        syncFn,
+        { debounceMs: 2000 },
+        isFileStateCurrent
+      );
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      __emitWatchEventForTests(testDir, 'src/index.ts');
+
+      expect(watcher.getPendingFiles().map((p) => p.path)).toContain('src/index.ts');
+
+      watcher.stop();
+    });
+
     it('should expose edited paths via getPendingFiles before sync fires', async () => {
       // Slow debounce — pending entries are visible until the debounce fires.
       // The synthetic event is synchronous, so we can assert immediately.
@@ -897,6 +946,37 @@ describe('FileWatcher', () => {
 
       cg.unwatch();
     });
+
+    it.runIf(process.platform === 'win32')(
+      'should ignore an NTFS access-only event but retain a real edit (#1451)',
+      async () => {
+        const filePath = path.join(testDir, 'src', 'index.ts');
+        cg = CodeGraph.initSync(testDir, {
+          config: { include: ['**/*.ts'], exclude: [] },
+        });
+        await cg.indexAll();
+
+        cg.watch({ debounceMs: 2000, inertForTests: true });
+        await cg.waitUntilWatcherReady();
+
+        const before = fs.statSync(filePath);
+        fs.utimesSync(
+          filePath,
+          new Date(before.atimeMs + 2000),
+          new Date(before.mtimeMs)
+        );
+        __emitWatchEventForTests(testDir, 'src/index.ts');
+
+        expect(cg.getPendingFiles()).toEqual([]);
+
+        fs.appendFileSync(filePath, '\nexport const changed = true;\n');
+        __emitWatchEventForTests(testDir, 'src/index.ts');
+
+        expect(cg.getPendingFiles().map((p) => p.path)).toContain('src/index.ts');
+
+        cg.unwatch();
+      }
+    );
   });
 
   describe('scoped sync fast path (#watcher-scoped)', () => {

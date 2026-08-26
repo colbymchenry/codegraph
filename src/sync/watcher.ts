@@ -344,11 +344,19 @@ export class FileWatcher {
   private readonly onSyncError?: WatchOptions['onSyncError'];
   private readonly onDegraded?: WatchOptions['onDegraded'];
   private readonly inertForTests: boolean;
+  /**
+   * Optional metadata guard supplied by the CodeGraph facade. Windows'
+   * ReadDirectoryChangesW stream includes last-access updates, so a read can
+   * otherwise look exactly like an edit. Returning true means the file's
+   * current size/mtime still match the indexed record and the event is noise.
+   */
+  private readonly isFileStateCurrent?: (relativePath: string) => boolean;
 
   constructor(
     projectRoot: string,
     syncFn: (paths?: string[]) => Promise<{ filesChanged: number; durationMs: number }>,
-    options: WatchOptions = {}
+    options: WatchOptions = {},
+    isFileStateCurrent?: (relativePath: string) => boolean
   ) {
     this.projectRoot = projectRoot;
     this.syncFn = syncFn;
@@ -357,6 +365,7 @@ export class FileWatcher {
     this.onSyncError = options.onSyncError;
     this.onDegraded = options.onDegraded;
     this.inertForTests = options.inertForTests ?? false;
+    this.isFileStateCurrent = isFileStateCurrent;
   }
 
   /**
@@ -596,6 +605,20 @@ export class FileWatcher {
     if (!isSourceFile(rel, loadExtensionOverrides(this.projectRoot))) {
       this.maybeScheduleForRemovedDir(rel);
       return;
+    }
+
+    try {
+      if (this.isFileStateCurrent?.(rel)) {
+        logDebug('Ignoring file event with unchanged indexed metadata', { file: rel });
+        return;
+      }
+    } catch (error) {
+      // The guard is an optimization, never a correctness boundary. If the
+      // stat/DB lookup fails, keep the event so a sync can reconcile it.
+      logDebug('Could not verify file event metadata; treating it as a change', {
+        file: rel,
+        error: String(error),
+      });
     }
 
     logDebug('File change detected', { file: rel });
