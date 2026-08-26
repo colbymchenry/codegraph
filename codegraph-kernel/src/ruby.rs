@@ -5,19 +5,19 @@
 //! The authoritative quirk list is docs/design/ruby-kernel-port-checklist.md —
 //! including the load-bearing oddities this file preserves on purpose:
 //! `importTypes: ['call']` funnels EVERY non-body call into extractImport (so
-//! class-body DSL like `attr_accessor`, `has_many`, `define_method` and its
-//! whole block emit NOTHING), hook-handled modules MULTIPLY-CAPTURE fn-ref
-//! containers (each nesting level re-scans its subtree after popping), the
-//! sibling-scan visibility trio (bare `private` is invisible; `private :sym` /
-//! `private def x` poison every later sibling def; the def inside
-//! `private def` stays public), brace-block bodies (`block_body`) are
-//! invisible to bare-call extraction while `do…end` bodies emit, and the
-//! value-ref DFS visits statements in REVERSE source order. Positions in
-//! UTF-16 code units. Files with parse errors defer to wasm (~0% incidence).
+//! class-body DSL like `has_many`, `define_method` and its whole block emit
+//! NOTHING — `attr_accessor`/`attr_reader`/`attr_writer` are the one carved-out
+//! exception, synthesized as method nodes by `synthesize_attr_members`),
+//! hook-handled modules MULTIPLY-CAPTURE fn-ref containers (each nesting level
+//! re-scans its subtree after popping), the sibling-scan visibility trio (bare
+//! `private` is invisible; `private :sym` / `private def x` poison every later
+//! sibling def; the def inside `private def` stays public), and the value-ref
+//! DFS visits statements in REVERSE source order. Positions in UTF-16 code
+//! units. Files with parse errors defer to wasm (~0% incidence).
 
 use crate::buffers::{
     build_meta, edge_kind_index, node_kind_index, Arena, BoolFlags, EdgeRow, EmitOut, NodeRow,
-    RefRow, StrRef, Tables, FLAG_IS_EXPORTED, FUNCTION_REF_CODE, NONE, NONE_STR,
+    RefRow, StrRef, Tables, FLAG_IS_EXPORTED, FLAG_IS_STATIC, FUNCTION_REF_CODE, NONE, NONE_STR,
     REF_FLAG_FILE_PATH,
 };
 use crate::docstring::preceding_docstring;
@@ -97,6 +97,7 @@ struct Extra {
     docstring: Option<String>,
     signature: Option<String>,
     visibility: Option<u8>,
+    is_static: Option<bool>,
 }
 
 struct ValueScope<'t> {
@@ -280,10 +281,14 @@ impl<'t> Walker<'t> {
         let id_ref = self.arena.put(&id);
         let doc_ref = opt_str(&mut self.arena, extra.docstring.as_deref());
         let sig_ref = opt_str(&mut self.arena, extra.signature.as_deref());
+        let mut flags = BoolFlags::default(); // no isExported/isAsync hooks
+        if let Some(v) = extra.is_static {
+            flags.set(FLAG_IS_STATIC, v);
+        }
         let row = self.tables.push_node(&NodeRow {
             kind: node_kind_index(kind).unwrap(),
             visibility: extra.visibility.unwrap_or(0),
-            flags: BoolFlags::default(), // no isExported/isAsync/isStatic hooks
+            flags,
             start_line,
             end_line,
             start_column: self.col_of(node),
@@ -350,6 +355,32 @@ impl<'t> Walker<'t> {
             }
         }
         "<anonymous>".to_string()
+    }
+
+    /// rubyExtractor.isStatic (languages/ruby.ts) — `def self.x`/`def Foo.x`
+    /// (singleton_method's `object` field text is `self`), or a plain `method`
+    /// directly inside `class << self ... end` (no dedicated singleton_class
+    /// branch exists, so these extract as ordinary methods of the enclosing
+    /// class; isStatic is the only signal distinguishing them).
+    fn is_static_of(&self, node: Node<'t>) -> bool {
+        if node.kind() == "singleton_method" {
+            return node
+                .child_by_field_name("object")
+                .map(|o| self.text(o) == "self")
+                .unwrap_or(false);
+        }
+        if node.kind() == "method" {
+            if let Some(body_statement) = node.parent() {
+                if let Some(singleton_class) = body_statement.parent() {
+                    return singleton_class.kind() == "singleton_class"
+                        && singleton_class
+                            .child_by_field_name("value")
+                            .map(|v| self.text(v) == "self")
+                            .unwrap_or(false);
+                }
+            }
+        }
+        false
     }
 
     /// rubyExtractor.getVisibility — walk the previousNamedSibling chain
@@ -445,6 +476,11 @@ impl<'t> Walker<'t> {
                 }
             }
         }
+        // Modules bypass extract_class entirely (this hook returns before
+        // reaching it), so synthesize_attr_members is never reached the way
+        // it is for `class` nodes — call it explicitly so attr_accessor
+        // inside a Rails-style Concern module still synthesizes accessors.
+        self.synthesize_attr_members(node);
         self.stack.pop();
         true
     }
@@ -537,8 +573,9 @@ impl<'t> Walker<'t> {
             self.extract_call(node);
         } else if let Some(bare) = self.bare_call_name(node) {
             // extractBareCall: statement-level identifiers in BLOCK_PARENTS
-            // bodies (`do…end` = body_statement; brace blocks are block_body —
-            // NOT in the set, so `5.times { beep }` emits nothing for beep).
+            // bodies — `do…end` (body_statement) and brace blocks `{ }`
+            // (block_body) both emit; `5.times { beep }` and
+            // `5.times do beep end` are equivalent.
             let name = bare.to_string();
             let from = self.top_row();
             self.push_ref_at(from, &name, edge_kind_index("calls").unwrap(), node);
@@ -578,7 +615,8 @@ impl<'t> Walker<'t> {
         let parent = node.parent()?;
         if !matches!(
             parent.kind(),
-            "body_statement" | "then" | "else" | "do" | "begin" | "rescue" | "ensure" | "when"
+            "body_statement" | "block_body" | "then" | "else" | "do" | "begin" | "rescue"
+                | "ensure" | "when"
         ) {
             return None;
         }
@@ -612,6 +650,7 @@ impl<'t> Walker<'t> {
             docstring: preceding_docstring(node, self.src),
             signature: None, // no getSignature hook
             visibility: Some(self.visibility_of(node)),
+            is_static: Some(self.is_static_of(node)),
         };
         let Some(row) = self.create_node("function", &name, node, extra) else { return };
         // (ruby ∉ TYPE_ANNOTATION_LANGUAGES; decorators are a structural no-op)
@@ -630,6 +669,7 @@ impl<'t> Walker<'t> {
             docstring: preceding_docstring(node, self.src),
             signature: None,
             visibility: Some(self.visibility_of(node)),
+            is_static: Some(self.is_static_of(node)),
         };
         let Some(row) = self.create_node("method", &name, node, extra) else { return };
         self.stack.push(Scope { row, kind: "method", name });
@@ -639,6 +679,81 @@ impl<'t> Walker<'t> {
         self.stack.pop();
     }
 
+    /// languages/ruby.ts's `synthesizeRubyAttrMembers` — `attr_accessor`/
+    /// `attr_reader`/`attr_writer` parse as a bare `call` with no receiver,
+    /// otherwise invisible under the `importTypes:['call']` funnel. Synthesize
+    /// the corresponding getter/setter `method` nodes so `obj.name` /
+    /// `obj.name = x` call sites resolve. An explicit hand-written method with
+    /// the same name always wins. Scoped to this class/module's OWN body
+    /// (direct children only, not nested classes); called while the
+    /// class/module is still the top-of-stack scope so containment attaches.
+    fn synthesize_attr_members(&mut self, scope_node: Node<'t>) {
+        let Some(body) = scope_node.child_by_field_name("body") else { return };
+
+        let mut taken: HashSet<String> = HashSet::new();
+        for i in 0..body.named_child_count() {
+            let Some(c) = body.named_child(i) else { continue };
+            if matches!(c.kind(), "method" | "singleton_method") {
+                taken.insert(self.extract_name(c));
+            }
+        }
+
+        for i in 0..body.named_child_count() {
+            let Some(call) = body.named_child(i) else { continue };
+            if call.kind() != "call" || call.child_by_field_name("receiver").is_some() {
+                continue;
+            }
+            let Some(method) = call.child_by_field_name("method") else { continue };
+            let mname = self.text(method);
+            if !matches!(mname, "attr_accessor" | "attr_reader" | "attr_writer") {
+                continue;
+            }
+            let args = call.child_by_field_name("arguments").or_else(|| {
+                (0..call.named_child_count())
+                    .filter_map(|j| call.named_child(j))
+                    .find(|c| c.kind() == "argument_list")
+            });
+            let Some(args) = args else { continue };
+
+            let want_getter = mname == "attr_accessor" || mname == "attr_reader";
+            let want_setter = mname == "attr_accessor" || mname == "attr_writer";
+
+            for j in 0..args.named_child_count() {
+                let Some(arg) = args.named_child(j) else { continue };
+                if arg.kind() != "simple_symbol" {
+                    continue;
+                }
+                let sym = self.text(arg).trim_start_matches(':').to_string();
+                if sym.is_empty() {
+                    continue;
+                }
+                if want_getter && !taken.contains(&sym) {
+                    taken.insert(sym.clone());
+                    let sig = format!("{sym}()");
+                    self.create_node(
+                        "method",
+                        &sym,
+                        arg,
+                        Extra { docstring: None, signature: Some(sig), visibility: Some(1), is_static: None },
+                    );
+                }
+                if want_setter {
+                    let setter = format!("{sym}=");
+                    if !taken.contains(&setter) {
+                        taken.insert(setter.clone());
+                        let sig = format!("{setter}(value)");
+                        self.create_node(
+                            "method",
+                            &setter,
+                            arg,
+                            Extra { docstring: None, signature: Some(sig), visibility: Some(1), is_static: None },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn extract_class(&mut self, node: Node<'t>) {
         stack_guard!();
         let name = self.extract_name(node);
@@ -646,6 +761,7 @@ impl<'t> Walker<'t> {
             docstring: preceding_docstring(node, self.src),
             signature: None,
             visibility: Some(self.visibility_of(node)),
+            is_static: None,
         };
         let Some(row) = self.create_node("class", &name, node, extra) else { return };
 
@@ -672,6 +788,10 @@ impl<'t> Walker<'t> {
                 self.visit_node(c);
             }
         }
+        // synthesizeMembers (languages/ruby.ts) — after the body so it can
+        // dedup against hand-written members, while still on the stack so
+        // containment/QNs attach.
+        self.synthesize_attr_members(node);
         self.stack.pop();
     }
 
@@ -689,7 +809,12 @@ impl<'t> Walker<'t> {
         }
         let name = self.text(left).to_string();
         let signature = right.map(|r| util::init_signature(self.text(r)));
-        self.create_node("variable", &name, node, Extra { docstring, signature, visibility: None });
+        self.create_node(
+            "variable",
+            &name,
+            node,
+            Extra { docstring, signature, visibility: None, is_static: None },
+        );
     }
 
     /// extractImport — every non-body `call` lands here (importTypes:['call']).

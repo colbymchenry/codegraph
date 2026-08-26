@@ -3052,6 +3052,157 @@ end
     });
   });
 
+  describe('Ruby isStatic (def self.x / class << self)', () => {
+    it('marks def self.x inside a class as static', () => {
+      const code = `
+class Widget
+  def self.build(arg)
+    new(arg)
+  end
+
+  def instance_method
+  end
+end
+`;
+      const result = extractFromSource('widget.rb', code);
+      const build = result.nodes.find((n) => n.name === 'build' && n.kind === 'method');
+      expect(build?.isStatic).toBe(true);
+
+      const instanceMethod = result.nodes.find((n) => n.name === 'instance_method' && n.kind === 'method');
+      expect(instanceMethod?.isStatic).toBe(false);
+    });
+
+    it('marks a top-level def self.x as a static function', () => {
+      const code = `
+def self.top_singleton
+  1
+end
+`;
+      const result = extractFromSource('top.rb', code);
+      const fn = result.nodes.find((n) => n.name === 'top_singleton');
+      expect(fn?.kind).toBe('function');
+      expect(fn?.isStatic).toBe(true);
+    });
+
+    it('marks methods inside class << self as static', () => {
+      const code = `
+class Widget
+  class << self
+    def singleton_style
+      1
+    end
+  end
+end
+`;
+      const result = extractFromSource('widget.rb', code);
+      const method = result.nodes.find((n) => n.name === 'singleton_style' && n.kind === 'method');
+      expect(method).toBeDefined();
+      expect(method?.qualifiedName).toBe('Widget::singleton_style');
+      expect(method?.isStatic).toBe(true);
+    });
+
+    it('does not mark def obj.x (non-self singleton receiver) as static', () => {
+      const code = `def obj.weird_singleton; end`;
+      const result = extractFromSource('top.rb', code);
+      const fn = result.nodes.find((n) => n.name === 'weird_singleton');
+      expect(fn?.isStatic).toBe(false);
+    });
+  });
+
+  describe('Ruby attr_accessor/attr_reader/attr_writer synthesis', () => {
+    it('synthesizes a getter and setter for attr_accessor', () => {
+      const code = `
+class Person
+  attr_accessor :name
+end
+`;
+      const result = extractFromSource('person.rb', code);
+      const getter = result.nodes.find((n) => n.name === 'name' && n.kind === 'method');
+      const setter = result.nodes.find((n) => n.name === 'name=' && n.kind === 'method');
+      expect(getter).toBeDefined();
+      expect(setter).toBeDefined();
+      expect(getter?.qualifiedName).toBe('Person::name');
+    });
+
+    it('synthesizes only a getter for attr_reader', () => {
+      const code = `
+class Person
+  attr_reader :created_at
+end
+`;
+      const result = extractFromSource('person.rb', code);
+      expect(result.nodes.find((n) => n.name === 'created_at' && n.kind === 'method')).toBeDefined();
+      expect(result.nodes.find((n) => n.name === 'created_at=' && n.kind === 'method')).toBeUndefined();
+    });
+
+    it('synthesizes only a setter for attr_writer', () => {
+      const code = `
+class Person
+  attr_writer :password
+end
+`;
+      const result = extractFromSource('person.rb', code);
+      expect(result.nodes.find((n) => n.name === 'password=' && n.kind === 'method')).toBeDefined();
+      expect(result.nodes.find((n) => n.name === 'password' && n.kind === 'method')).toBeUndefined();
+    });
+
+    it('does not override an explicit hand-written method of the same name', () => {
+      const code = `
+class Person
+  attr_reader :name
+
+  def name
+    @name.upcase
+  end
+end
+`;
+      const result = extractFromSource('person.rb', code);
+      const nameMethods = result.nodes.filter((n) => n.name === 'name' && n.kind === 'method');
+      expect(nameMethods.length).toBe(1);
+      expect(nameMethods[0]?.signature).not.toBe('name()');
+    });
+
+    it('synthesizes accessors for a Concern-style module', () => {
+      const code = `
+module Trackable
+  attr_accessor :tracked_at
+end
+`;
+      const result = extractFromSource('trackable.rb', code);
+      const getter = result.nodes.find((n) => n.name === 'tracked_at' && n.kind === 'method');
+      expect(getter).toBeDefined();
+      expect(getter?.qualifiedName).toBe('Trackable::tracked_at');
+    });
+  });
+
+  describe('Ruby brace-block calls (do...end vs { })', () => {
+    it('emits a calls ref for a bare identifier in a do...end block', () => {
+      const code = `
+def run
+  5.times do
+    beep
+  end
+end
+`;
+      const result = extractFromSource('runner.rb', code);
+      const ref = result.unresolvedReferences.find((r) => r.referenceName === 'beep');
+      expect(ref).toBeDefined();
+      expect(ref?.referenceKind).toBe('calls');
+    });
+
+    it('emits a calls ref for a bare identifier in a brace block, same as do...end', () => {
+      const code = `
+def run
+  5.times { beep }
+end
+`;
+      const result = extractFromSource('runner.rb', code);
+      const ref = result.unresolvedReferences.find((r) => r.referenceName === 'beep');
+      expect(ref).toBeDefined();
+      expect(ref?.referenceKind).toBe('calls');
+    });
+  });
+
   describe('PHP return type capture (#608)', () => {
     it('captures self/static factory returns as the `self` marker; primitives as undefined', () => {
       const code = `<?php
