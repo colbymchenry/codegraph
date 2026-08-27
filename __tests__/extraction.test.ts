@@ -150,6 +150,13 @@ describe('Language Detection', () => {
     expect(isSourceFile('default.nix')).toBe(true);
   });
 
+  it('should detect OpenSCAD files', () => {
+    expect(detectLanguage('parts/bracket.scad')).toBe('openscad');
+    // isSourceFile is the file-scan allowlist. Detection without it means a
+    // project of .scad files indexes as zero files.
+    expect(isSourceFile('parts/bracket.scad')).toBe(true);
+  });
+
   it('should detect a .h whose only C++ signal is an export-macro class as cpp', () => {
     // Lean Unreal-Engine style header: the class is annotated with an export
     // macro and carries no explicit `public:`/`virtual`/`namespace`/`template`,
@@ -11917,5 +11924,150 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     expect(result.errors).toEqual([]);
     expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'Widget')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'size')).toBe(true);
+  });
+});
+
+describe('OpenSCAD Extraction', () => {
+  it('should extract modules and functions as function symbols', () => {
+    const code = `
+module bracket(width, height=10) {
+    cube([width, height, 2]);
+}
+
+function area(w, h) = w * h;
+`;
+    const result = extractFromSource('parts.scad', code);
+
+    // A module is a named, parameterised, callable definition whose result is
+    // geometry — structurally a function. Both map to the `function` kind.
+    const bracket = result.nodes.find((n) => n.kind === 'function' && n.name === 'bracket');
+    const area = result.nodes.find((n) => n.kind === 'function' && n.name === 'area');
+
+    expect(bracket).toBeDefined();
+    expect(bracket?.signature).toBe('(width, height=10)');
+    expect(area).toBeDefined();
+    expect(area?.signature).toBe('(w, h)');
+  });
+
+  it('should extract calls from a function expression body', () => {
+    // A named `function` has no `body` field — its body is an unnamed
+    // expression child. Without the extractor's resolveBody hook these calls
+    // produce no edges at all.
+    const code = `function total(v) = sum(scale(v));`;
+    const result = extractFromSource('math.scad', code);
+
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+
+    expect(calls).toContain('sum');
+    expect(calls).toContain('scale');
+  });
+
+  it('should extract a call edge per operator in a transform chain', () => {
+    // `translate(...) rotate(...) cube(...)` nests as transform_chain →
+    // module_call + transform_chain, so every operator must yield an edge —
+    // not just the outermost one. A `#`/`!`/`%`/`*` modifier must not hide the
+    // call it decorates.
+    const code = `
+module part() {
+    translate([1,0,0]) rotate([0,0,90]) cube(5);
+    #sphere(3);
+}
+`;
+    const result = extractFromSource('part.scad', code);
+
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+
+    expect(calls).toContain('translate');
+    expect(calls).toContain('rotate');
+    expect(calls).toContain('cube');
+    expect(calls).toContain('sphere');
+  });
+
+  it('should extract include and use directives as imports, without resolving them', () => {
+    const code = `
+include <BOSL2/std.scad>
+use <../lib/gears.scad>
+`;
+    const result = extractFromSource('parts.scad', code);
+
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    // The path text keeps its angle brackets in the grammar; the import name
+    // must not.
+    expect(imports).toContain('BOSL2/std.scad');
+    expect(imports).toContain('../lib/gears.scad');
+  });
+
+  it('should record a traversal-shaped include path verbatim and never dereference it', () => {
+    // Import path text is attacker-controlled: an indexed repository can carry
+    // any `.scad` file. Resolution is deliberately not implemented, so the path
+    // is stored as a name and nothing else. This guards the day someone adds
+    // resolution without the containment that belongs with it.
+    const result = extractFromSource('evil.scad', 'include <../../../../etc/passwd>\n');
+
+    // Stored exactly as written: not normalized, not joined onto the importing
+    // file's directory, not resolved to anything.
+    const imported = result.nodes.find((n) => n.kind === 'import');
+    expect(imported?.name).toBe('../../../../etc/passwd');
+    // The `../` sequences are still there — nothing collapsed them into an
+    // absolute path, which is what resolving would have produced.
+    expect(result.nodes.every((n) => !n.name.startsWith('/'))).toBe(true);
+
+    // And the extractor cannot dereference a path even if it wanted to — it
+    // holds no filesystem capability. This is the assertion that fails first if
+    // someone adds resolution here instead of in the resolver, where the
+    // containment belongs.
+    const extractorSource = fs.readFileSync(
+      path.join(__dirname, '..', 'src', 'extraction', 'languages', 'openscad.ts'),
+      'utf8'
+    );
+    expect(extractorSource).not.toMatch(/from\s+'(node:)?fs'|require\(\s*'(node:)?fs'/);
+  });
+
+  it('should extract top-level assignments as variables, keeping the $ sigil', () => {
+    // `assignment` is NOT the variable node type here: the grammar reuses it
+    // for default parameter values and named call arguments. Only a
+    // var_declaration is a real declaration, so `center` below must not
+    // become a variable.
+    const code = `
+$fn = 64;
+wall_thickness = 2.4;
+
+module plate() { cube(10, center = true); }
+`;
+    const result = extractFromSource('vars.scad', code);
+
+    const variables = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
+    expect(variables).toContain('$fn');
+    expect(variables).toContain('wall_thickness');
+    expect(variables).not.toContain('center');
+  });
+
+  it('should not invent node kinds OpenSCAD has no concept of', () => {
+    // Empty mappings are deliberate. An approximated class is wrong in a way
+    // the caller cannot detect; an empty one is honestly empty.
+    const code = `
+include <BOSL2/std.scad>
+thickness = 3;
+function area(w, h) = w * h;
+module plate() { cube(10); }
+`;
+    const result = extractFromSource('parts.scad', code);
+
+    const absent = ['class', 'method', 'interface', 'struct', 'enum', 'enum_member', 'type_alias'];
+    expect(result.nodes.filter((n) => absent.includes(n.kind))).toEqual([]);
+  });
+
+  it('should survive a truncated file and still extract what parsed', () => {
+    // The parser is reached by file content CodeGraph does not control, so a
+    // tree carrying ERROR/MISSING nodes must degrade rather than throw.
+    const code = `module a() { cube(5); } module b(`;
+
+    let result!: ReturnType<typeof extractFromSource>;
+    expect(() => { result = extractFromSource('broken.scad', code); }).not.toThrow();
+    expect(result.nodes.some((n) => n.kind === 'function' && n.name === 'a')).toBe(true);
   });
 });

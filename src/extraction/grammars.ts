@@ -50,6 +50,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  openscad: 'tree-sitter-openscad.wasm',
 };
 
 /**
@@ -170,6 +171,9 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.tf': 'terraform',
   '.tfvars': 'terraform',
   '.tofu': 'terraform',
+  // OpenSCAD parametric CAD scripts. `module`/`function` definitions and
+  // `include`/`use` directives; no classes or types in the language.
+  '.scad': 'openscad',
 };
 
 /**
@@ -338,6 +342,13 @@ const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   // kernel compiles the same-commit vendored C (codegraph-kernel/grammars/
   // dart); crates.io tree-sitter-dart is a different-lineage fork (rejected).
   'dart',
+  // OpenSCAD: @openscad/tree-sitter-openscad 0.6.1, the grammar published by
+  // the OpenSCAD org itself. ABI 15, no external scanner. Vendored because
+  // tree-sitter-wasms ships no openscad build and the upstream package
+  // publishes no prebuilt wasm — only grammar.js + the checked-in parser.c,
+  // which is what `tree-sitter-cli 0.25.10 build --wasm` compiles here (no
+  // `generate`), matching how every other language above was vendored.
+  'openscad',
 ]);
 
 /** Absolute path of a language's grammar WASM (vendored or tree-sitter-wasms). */
@@ -694,6 +705,7 @@ export function getLanguageDisplayName(language: Language): string {
     erlang: 'Erlang',
     terraform: 'Terraform',
     arkts: 'ArkTS',
+    openscad: 'OpenSCAD',
     unknown: 'Unknown',
   };
   return names[language] || language;
