@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Bash and shell scripts are now indexed, including extensionless executable files with a shell shebang, so CodeGraph can follow functions, calls, and sourced scripts across a shell project.
 
 ## [1.6.0] - 2026-08-26
 

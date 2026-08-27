@@ -21,6 +21,8 @@ import {
 
 function gitInit(dir: string): void {
   execFileSync('git', ['init', '-q'], { cwd: dir, stdio: 'ignore' });
+  // Keep the fixture independent of a user's global core.hooksPath setting.
+  execFileSync('git', ['config', 'core.hooksPath', '.git/hooks'], { cwd: dir, stdio: 'ignore' });
 }
 
 function isExecutable(file: string): boolean {

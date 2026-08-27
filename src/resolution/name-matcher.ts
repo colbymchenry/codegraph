@@ -6,6 +6,7 @@
 
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
+import { buildSourceClosure, gateBashNameMatch, selectReachableBashFunction } from './bash-scope';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -2489,6 +2490,33 @@ export function matchReference(
   // worse than none).
   if (ref.referenceKind === 'function_ref') {
     return matchFunctionRef(ref, context);
+  }
+
+  // Bash calls bind ONLY through reachability: a call names a function in the
+  // same file or in the transitive source closure of the calling file. The
+  // generic single-winner matcher would pick whichever same-named function was
+  // indexed first — nearly every script defines log/die/usage — so this branch
+  // enumerates candidates itself and gates each through gateBashNameMatch.
+  // Nothing reachable → null; the fuzzy and qualified-name fallbacks must
+  // never connect a shell call to an arbitrary same-named symbol.
+  if (ref.language === 'bash' && ref.referenceKind === 'calls' && !ref.referenceName.includes('/')) {
+    const candidates = context
+      .getNodesByName(ref.referenceName)
+      .filter((n) => n.language === 'bash' && n.kind === 'function');
+    if (candidates.length > 0) {
+      const closures = buildSourceClosure(context);
+      const chosen = selectReachableBashFunction(ref.filePath, candidates, closures);
+      if (chosen) {
+        const verdict = gateBashNameMatch(ref.filePath, chosen.filePath, closures);
+        return {
+          original: ref,
+          targetNodeId: chosen.id,
+          confidence: verdict.accept ? verdict.confidence : 0.75,
+          resolvedBy: 'exact-match',
+        };
+      }
+    }
+    return null;
   }
 
   // ArkTS chained UI attributes — emitted with a leading dot (`.titleStyle`,

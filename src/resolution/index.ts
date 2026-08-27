@@ -17,7 +17,7 @@ import {
   ImportMapping,
 } from './types';
 import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
-import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos } from './import-resolver';
+import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBashScriptPathRef, clearImportResolverMemos } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -884,8 +884,9 @@ export class ReferenceResolver {
     // ArkTS chained-attribute refs carry a leading dot (`.titleStyle`) that
     // routes them to the decorator-gated matcher; the symbol itself is
     // indexed under the bare name, so the existence check strips the dot.
-    // Nix static path imports (`import ./x.nix`) name a FILE, not a symbol —
-    // they bypass the symbol-existence check and resolve via resolveViaImport.
+    // Nix static path imports (`import ./x.nix`) and bash sourced/executed
+    // script paths name a FILE, not a symbol — they bypass the symbol-
+    // existence check and resolve via resolveViaImport.
     let existenceName =
       ref.language === 'arkts' && ref.referenceName.startsWith('.')
         ? ref.referenceName.slice(1)
@@ -896,6 +897,7 @@ export class ReferenceResolver {
     const tPre = this.profileStages ? process.hrtime.bigint() : 0n;
     const preFilterPass =
       isNixPathImportRef(ref) ||
+      isBashScriptPathRef(ref) ||
       this.hasAnyPossibleMatch(existenceName) ||
       this.matchesAnyImport(ref) ||
       this.frameworks.some((f) => f.claimsReference?.(ref.referenceName));
@@ -992,7 +994,10 @@ export class ReferenceResolver {
     // qualified-name fallback would only ever add wrong cross-module edges.
     // Nix static path imports are file references for the same reason —
     // falling through would let "./x.nix" name-match an unrelated node.
-    if (isPhpIncludePathRef(ref) || isCobolCopybookRef(ref) || isNixPathImportRef(ref) || ref.language === 'terraform') {
+    // Bash sourced/executed script paths are file references too: the
+    // name-match decision they must never reach lives in matchReference's
+    // bash branch (reachability goal), not in this gate.
+    if (isPhpIncludePathRef(ref) || isCobolCopybookRef(ref) || isNixPathImportRef(ref) || isBashScriptPathRef(ref) || ref.language === 'terraform') {
       return candidates.length > 0
         ? candidates.reduce((best, curr) =>
             curr.confidence > best.confidence ? curr : best
@@ -2419,6 +2424,10 @@ export class ReferenceResolver {
 
   private gateLanguage(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
     if (!result) return result;
+    // A Bash script-path reference can deliberately launch an indexed Python,
+    // Node, PHP, or other executable through its interpreter. This is a
+    // file-to-file execution edge, not a language-family symbol binding.
+    if (isBashScriptPathRef(ref)) return result;
     const tgt = this.getLanguageFromNodeId(result.targetNodeId);
     if (!tgt || !ref.language) return result;
     if ((ref.referenceKind === 'references' || ref.referenceKind === 'function_ref') && !sameLanguageFamily(tgt, ref.language)) return null;
