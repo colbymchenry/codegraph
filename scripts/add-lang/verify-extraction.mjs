@@ -4,8 +4,8 @@
 // can drive a write-extractor -> build -> re-check loop.
 //
 // Usage: node scripts/add-lang/verify-extraction.mjs <repo-path> <lang>
-// Reads `codegraph status <repo> --json` using whatever codegraph is on PATH,
-// so it reflects the binary that built the index.
+// Reads `codegraph status <repo> --json`; CG_BIN selects the binary that built
+// the index without requiring a PATH change.
 //
 // Exit codes: 0 = pass or soft-warn, 1 = critical fail, 2 = could not run.
 
@@ -19,7 +19,8 @@ if (!repo || !lang) {
 
 let status;
 try {
-  const out = execFileSync('codegraph', ['status', repo, '--json'], { encoding: 'utf8' });
+  const cgParts = process.env.CG_BIN ? process.env.CG_BIN.trim().split(/\s+/) : ['codegraph'];
+  const out = execFileSync(cgParts[0], [...cgParts.slice(1), 'status', repo, '--json'], { encoding: 'utf8' });
   status = JSON.parse(out);
 } catch (e) {
   console.error(`[verify] could not read codegraph status for ${repo}: ${e.message}`);
