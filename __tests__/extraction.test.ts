@@ -55,6 +55,15 @@ describe('Language Detection', () => {
     expect(detectLanguage('lib.rs')).toBe('rust');
   });
 
+  it('should detect shell script extensions as bash', () => {
+    expect(detectLanguage('deploy.sh')).toBe('bash');
+    expect(detectLanguage('rc.bash')).toBe('bash');
+    expect(detectLanguage('job.ksh')).toBe('bash');
+    expect(detectLanguage('job.dash')).toBe('bash');
+    expect(detectLanguage('suite.bats')).toBe('bash');
+    expect(detectLanguage('interactive.zsh')).not.toBe('bash');
+  });
+
   it('should detect Java files', () => {
     expect(detectLanguage('Main.java')).toBe('java');
   });
@@ -391,6 +400,88 @@ in
     expect(node('package')?.isExported).toBe(true);
     expect(node('privateNested')?.isExported).toBe(false);
     expect(node('licenses')?.isExported).toBe(true);
+  });
+});
+
+describe('Bash Extraction', () => {
+  it('should extract functions, top-level variables and constants', () => {
+    const code = `
+#!/usr/bin/env bash
+APP_NAME="fixture"
+readonly LIB_VERSION="2.0"
+declare -r MAX=5
+export PATH="/usr/bin"
+greet() { printf 'hello\\n'; }
+function kwfn { greet; }
+`;
+    const result = extractFromSource('tool.sh', code);
+
+    expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 'APP_NAME')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'constant' && n.name === 'LIB_VERSION')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'constant' && n.name === 'MAX')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 'PATH')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'function' && n.name === 'greet')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'function' && n.name === 'kwfn')).toBeDefined();
+
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toContain('printf');
+    expect(calls.filter((name) => name === 'greet')).toHaveLength(1);
+  });
+
+  it('surfaces only the declarations inside a function that assign in the global scope', () => {
+    // Which builtin localizes is not guessable — it was measured:
+    //   f() { declare X=1; }; f   -> X unset afterwards (local)
+    //   f() { readonly X=1; }; f  -> X=1 afterwards    (global)
+    // `declare`/`declare -r` localize exactly like `local`, so they are
+    // suppressed for the same reason; `declare -g`, `readonly` and `export`
+    // assign globally even inside a function, so they are kept. No other
+    // language in the index emits function-local variables either.
+    const code = `
+#!/usr/bin/env bash
+TOP="kept"
+run_all() {
+    local inner="declared"
+    inner="reassigned"
+    declare d_local="local"
+    declare -r d_local_ro="local"
+    declare -g d_global="global"
+    declare -gr d_global_ro="global"
+    typeset t_local="local"
+    typeset -g t_global="global"
+    typeset -gr t_global_ro="global"
+    export EXPORTED="surfaced"
+    readonly FROZEN="surfaced"
+    global GVAL="command-form"
+}
+`;
+    const result = extractFromSource('tool.sh', code);
+    const names = result.nodes.map((n) => n.name);
+
+    expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 'TOP')).toBeDefined();
+
+    // Function-local, in every spelling: absent.
+    for (const local of ['inner', 'd_local', 'd_local_ro', 't_local']) {
+      expect(names, `${local} is function-local and must not be a node`).not.toContain(local);
+    }
+
+    // Assigned in the global scope despite sitting inside the function: present.
+    expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 'd_global')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'constant' && n.name === 'd_global_ro')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 't_global')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'constant' && n.name === 't_global_ro')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 'EXPORTED')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'constant' && n.name === 'FROZEN')).toBeDefined();
+  });
+
+  it('keeps a top-level declare, which is not function-local', () => {
+    const code = `
+#!/usr/bin/env bash
+declare TOP_DECLARE=3
+declare -r TOP_DECLARE_RO=4
+`;
+    const result = extractFromSource('tool.sh', code);
+    expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 'TOP_DECLARE')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'constant' && n.name === 'TOP_DECLARE_RO')).toBeDefined();
   });
 });
 

@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Add-lang benchmark for ONE repo:
-#   clone -> wipe+index (with the codegraph on PATH) -> verify extraction ->
+#   clone -> wipe+index (with the configured dev binary) -> verify extraction ->
 #   with/without retrieval A/B (reuses scripts/agent-eval/run-all.sh).
 #
-# Assumes the codegraph dev build is already built + linked on PATH — the skill
-# runs `npm run build && ./scripts/local-install.sh` ONCE before looping repos.
+# Assumes the codegraph dev build is already built. Set CG_BIN to its entrypoint
+# so the benchmark never depends on, or changes, the maintainer's PATH.
 # The A/B is skipped if extraction fails its critical checks (don't burn $ on a
 # broken extractor); set FORCE_AB=1 to run it anyway.
 #
 # Usage: bench.sh <lang> <repo-name> <repo-url> "<question>" [headless|tmux|all]
-# Env:   CORPUS   corpus dir (default /tmp/codegraph-corpus, shared with agent-eval)
+# Env:   CG_BIN   codegraph entrypoint (default: codegraph resolved on PATH)
+#        CORPUS   corpus dir (default /tmp/codegraph-corpus, shared with agent-eval)
 set -uo pipefail
 
 LANG_TOKEN="${1:?usage: bench.sh <lang> <repo-name> <repo-url> \"<question>\" [mode]}"
@@ -23,10 +24,11 @@ AGENT_EVAL="$(cd "$HARNESS/../agent-eval" && pwd)"
 CORPUS="${CORPUS:-/tmp/codegraph-corpus}"
 REPO="$CORPUS/$NAME"
 
-command -v codegraph >/dev/null || { echo "no codegraph on PATH (build + ./scripts/local-install.sh first)"; exit 1; }
+CG_BIN="${CG_BIN:-$(command -v codegraph 2>/dev/null || true)}"
+[ -n "$CG_BIN" ] || { echo "no codegraph binary (set CG_BIN to the dev entrypoint)"; exit 1; }
 
 echo "==================== add-lang bench: $NAME ($LANG_TOKEN) ===================="
-echo "codegraph: $(command -v codegraph) -> $(codegraph --version 2>/dev/null || echo '?')"
+echo "codegraph: $CG_BIN -> $($CG_BIN --version 2>/dev/null || echo '?')"
 
 # 1. Ensure the repo (shallow clone, reuse if present).
 mkdir -p "$CORPUS"
@@ -40,7 +42,7 @@ fi
 # 2. Wipe + index with the binary under test.
 echo "→ wiping .codegraph and indexing"
 rm -rf "$REPO/.codegraph"
-( cd "$REPO" && codegraph init -i ) || { echo "indexing failed"; exit 1; }
+( cd "$REPO" && "$CG_BIN" init -i ) || { echo "indexing failed"; exit 1; }
 
 # 3. Verify extraction (cheap guard before the paid A/B).
 echo "→ verifying extraction"

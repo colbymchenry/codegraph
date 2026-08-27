@@ -10,6 +10,7 @@ import * as path from 'path';
 import * as fsp from 'fs/promises';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { Language } from '../types';
+import { looksLikeShellScript, looksLikeShellScriptFile } from './shebang';
 
 export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
 
@@ -50,6 +51,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  bash: 'tree-sitter-bash.wasm',
 };
 
 /**
@@ -111,6 +113,13 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.vue': 'vue',
   '.astro': 'astro',
   '.r': 'r',
+  // .zsh excluded: zsh-only syntax yields ERROR trees, silently dropping
+  // every symbol inside them.
+  '.sh': 'bash',
+  '.bash': 'bash',
+  '.ksh': 'bash',
+  '.dash': 'bash',
+  '.bats': 'bash',
   '.pas': 'pascal',
   '.dpr': 'pascal',
   '.dpk': 'pascal',
@@ -173,22 +182,28 @@ export const EXTENSION_MAP: Record<string, Language> = {
 };
 
 /**
- * Whether a file is one CodeGraph can parse, based purely on its extension.
- * This is the single source of truth for "should we index this file" — derived
- * from EXTENSION_MAP so parser support and indexing selection never drift.
+ * Whether a file is one CodeGraph can parse. Extensionless files are accepted
+ * only when `rootDir` is supplied and their bounded prefix has a shell shebang.
+ * This is the single source of truth for "should we index this file".
  *
- * `overrides` is the project's validated custom extension → language map (from
- * `codegraph.json`); when present its extensions count as indexable in addition
- * to the built-ins. Omitting it is byte-identical to the zero-config behavior.
+ * `rootDirOrOverrides` keeps the pre-shebang two-argument API compatible while
+ * allowing scanners to provide the root needed for content-based detection.
  */
-export function isSourceFile(filePath: string, overrides?: Record<string, Language>): boolean {
+export function isSourceFile(
+  filePath: string,
+  rootDirOrOverrides?: string | Record<string, Language>,
+  overrides?: Record<string, Language>,
+): boolean {
+  const rootDir = typeof rootDirOrOverrides === 'string' ? rootDirOrOverrides : undefined;
+  const extensionOverrides = typeof rootDirOrOverrides === 'object' ? rootDirOrOverrides : overrides;
   if (isPlayRoutesFile(filePath)) return true; // Play `conf/routes` is extensionless
   if (isShopifyLiquidJson(filePath)) return true; // Shopify OS 2.0 JSON templates / section groups
   if (isErlangAppFile(filePath)) return true; // OTP `.app`/`.app.src` resource files
-  const dot = filePath.lastIndexOf('.');
-  if (dot < 0) return false;
-  const ext = filePath.slice(dot).toLowerCase();
-  return ext in EXTENSION_MAP || (!!overrides && ext in overrides);
+  const basename = filePath.slice(filePath.lastIndexOf('/') + 1);
+  const dot = basename.lastIndexOf('.');
+  if (dot < 0) return rootDir ? looksLikeShellScriptFile(filePath, rootDir) : false;
+  const ext = basename.slice(dot).toLowerCase();
+  return ext in EXTENSION_MAP || (!!extensionOverrides && ext in extensionOverrides);
 }
 
 /**
@@ -289,6 +304,10 @@ export async function initGrammars(): Promise<void> {
  * the vendored wasm together.
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
+  // Bash: upstream tree-sitter-bash v0.25.1 prebuilt wasm (ABI 15), copied
+  // byte-identical from the npm tarball. The tree-sitter-wasms artifact (ABI
+  // 14) crashes the shared WASM heap on any `case` statement.
+  'bash',
   'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
   'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
   'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
@@ -478,13 +497,15 @@ export function detectLanguage(filePath: string, source?: string, overrides?: Re
   // Play `conf/routes` has no grammar — route through the no-symbol path; the
   // Play framework resolver extracts route nodes from it.
   if (isPlayRoutesFile(filePath)) return 'yaml';
-  const ext = filePath.substring(filePath.lastIndexOf('.')).toLowerCase();
+  const basename = filePath.slice(filePath.lastIndexOf('/') + 1);
+  const ext = basename.substring(basename.lastIndexOf('.')).toLowerCase();
   // Shopify OS 2.0 JSON templates / section groups → the Liquid extractor (it
   // links each section `"type"` to its `sections/<type>.liquid`).
   if (isShopifyLiquidJson(filePath)) return 'liquid';
   // OTP `.app`/`.app.src` resource files — Erlang terms the grammar parses as
   // top-level expressions (last-dot ext `.src` is too generic for the map).
   if (isErlangAppFile(filePath)) return 'erlang';
+  if (!basename.includes('.') && source && looksLikeShellScript(source)) return 'bash';
   const lang = (overrides && overrides[ext]) || EXTENSION_MAP[ext] || 'unknown';
 
   // .h files could be C, C++, or Objective-C — check source content
@@ -693,8 +714,9 @@ export function getLanguageDisplayName(language: Language): string {
     vbnet: 'Visual Basic .NET',
     erlang: 'Erlang',
     terraform: 'Terraform',
-    arkts: 'ArkTS',
-    unknown: 'Unknown',
+  arkts: 'ArkTS',
+  bash: 'Bash',
+  unknown: 'Unknown',
   };
   return names[language] || language;
 }

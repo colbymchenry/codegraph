@@ -102,6 +102,7 @@ export const LANGUAGES = [
   'scala',
   'lua',
   'luau',
+  'bash',
   'objc',
   'r',
   'solidity',

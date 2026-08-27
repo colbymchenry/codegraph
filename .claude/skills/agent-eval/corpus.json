@@ -585,6 +585,29 @@
       "question": "In the OrangeShopping sample app, how does the product detail page's bottom bar (add to cart / buy) lead to the order placement flow? Trace from the bottom navigation component to where the order is created."
     }
   ],
+  "Bash": [
+    {
+      "name": "nvm",
+      "repo": "https://github.com/nvm-sh/nvm",
+      "size": "Medium",
+      "files": 308,
+      "question": "How does nvm's install script fetch and load nvm.sh before invoking the nvm command? Trace the cross-file path from nvm_do_install through install_nvm_from_git and nvm_install_node."
+    },
+    {
+      "name": "bash-completion",
+      "repo": "https://github.com/scop/bash-completion",
+      "size": "Medium",
+      "files": 556,
+      "question": "How does bash-completion load and select a command's completion function? Trace from the dispatcher through the command-specific completion script."
+    },
+    {
+      "name": "shunit2",
+      "repo": "https://github.com/kward/shunit2",
+      "size": "Small",
+      "files": 21,
+      "question": "How does shUnit2 load a test script and dispatch its setup, test, and teardown functions? Trace from the test runner entrypoint through the lifecycle helper."
+    }
+  ],
   "Nix": [
     {
       "name": "agenix",

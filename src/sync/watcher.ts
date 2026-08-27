@@ -406,7 +406,7 @@ export class FileWatcher {
       this.ready = true;
       for (const cb of this.readyWaiters) cb();
       this.readyWaiters.length = 0;
-      if (IS_TEST_RUNTIME) liveWatchersForTests.set(this.projectRoot, this);
+      if (IS_TEST_RUNTIME || this.inertForTests) liveWatchersForTests.set(this.projectRoot, this);
 
       logDebug('File watcher started', {
         projectRoot: this.projectRoot,
@@ -593,7 +593,7 @@ export class FileWatcher {
       this.refreshScope(rel);
       return;
     }
-    if (!isSourceFile(rel, loadExtensionOverrides(this.projectRoot))) {
+    if (!isSourceFile(rel, this.projectRoot, loadExtensionOverrides(this.projectRoot))) {
       this.maybeScheduleForRemovedDir(rel);
       return;
     }
@@ -788,7 +788,7 @@ export class FileWatcher {
     this.pendingFiles.clear();
     this.ready = false;
     this.ignoreMatcher = null;
-    if (IS_TEST_RUNTIME) liveWatchersForTests.delete(this.projectRoot);
+    if (IS_TEST_RUNTIME || this.inertForTests) liveWatchersForTests.delete(this.projectRoot);
     logDebug('File watcher stopped');
   }
 

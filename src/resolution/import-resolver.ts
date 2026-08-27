@@ -47,7 +47,22 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   ruby: ['.rb'],
   objc: ['.h', '.m', '.mm'],
   nix: ['.nix', '/default.nix'],
+  // Shell extensions the grammar health check parsed cleanly, plus the empty
+  // suffix: sourcing an extensionless helper by bare name is common.
+  bash: ['.sh', '.bash', '.ksh', '.dash', '.bats', ''],
 };
+
+export function isBashScriptPathRef(ref: UnresolvedRef): boolean {
+  if (ref.language !== 'bash') return false;
+  if (ref.referenceKind !== 'imports' && ref.referenceKind !== 'references') return false;
+  const name = ref.referenceName;
+  if (/[\s"'`$;&|<>(){}[\]*?!]/.test(name)) return false;
+  // Bash emits repository-relative candidates for conventional root anchors
+  // (for example `$REPO_ROOT/bin/deploy`), so a path with a directory segment
+  // is eligible even when it has no shell extension. Bare command words stay
+  // excluded: they belong to PATH/name resolution, not file-path resolution.
+  return name.startsWith('./') || name.startsWith('../') || (name.includes('/') && !name.startsWith('/')) || /\.(sh|bash|ksh|dash|bats)$/.test(name);
+}
 
 export function isNixPathImportRef(ref: UnresolvedRef): boolean {
   return (
@@ -1408,6 +1423,30 @@ export function resolveViaImport(
   // angle-bracket channels, attribute expressions, variables, or other dynamic
   // expressions as project files.
   if (isNixPathImportRef(ref)) {
+    const resolvedPath = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
+    if (!resolvedPath) return null;
+
+    const basename = resolvedPath.split('/').pop()!;
+    const fileNode = context
+      .getNodesByName(basename)
+      .find((n) => n.kind === 'file' && n.filePath === resolvedPath);
+
+    if (fileNode) {
+      return {
+        original: ref,
+        targetNodeId: fileNode.id,
+        confidence: 0.9,
+        resolvedBy: 'import',
+      };
+    }
+    return null;
+  }
+
+  // Bash sourced/executed script paths resolve to file nodes only, mirroring
+  // the nix branch. The classifier normalizes interpolated paths
+  // (SCRIPT_DIR anchors, dirname/cd-print substitutions) to dot-slash-prefixed
+  // relative paths; a dynamic path never becomes a reference at all.
+  if (isBashScriptPathRef(ref)) {
     const resolvedPath = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
     if (!resolvedPath) return null;
 

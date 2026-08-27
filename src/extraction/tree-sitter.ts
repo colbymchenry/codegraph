@@ -23,6 +23,7 @@ import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
 import { stripCppTemplateArgs } from './languages/c-cpp';
 import { rustImplTypeName } from './languages/rust';
+import { extractBashVariables } from './languages/bash';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -2883,6 +2884,21 @@ export class TreeSitterExtractor {
           isExported,
         });
       }
+    } else if (this.language === 'bash') {
+      // Bash: `variable_assignment` carries its name in a nested
+      // `variable_name` child, and a `declaration_command` wraps the builtin's
+      // assignments — neither matches the generic identifier walk. A plain
+      // assignment inside a function body is suppressed (deliberate
+      // simplification); export/readonly/declare forms surface anywhere,
+      // readonly / declare -r as constants.
+      for (const v of extractBashVariables(node, this.source)) {
+        const initValue = v.valueNode ? getNodeText(v.valueNode, this.source).slice(0, 100) : undefined;
+        const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
+        this.createNode(v.kind, v.name, v.positionNode, { docstring, signature: initSignature });
+        if (v.valueNode) {
+          this.visitFunctionBody(v.valueNode, '');
+        }
+      }
     } else {
       // Generic fallback for other languages
       // Try to find identifier children
@@ -5198,6 +5214,19 @@ export class TreeSitterExtractor {
 
     const visitForCallsAndStructure = (node: SyntaxNode): void => {
       const nodeType = node.type;
+
+      // Bash: the body walker is the ONLY path into function bodies (the main
+      // visitNode walker stops at function_definitions), and both commands and
+      // declaration forms must flow through the same extractor hooks the
+      // top-level walk uses — one seam for every command node.
+      if (this.language === 'bash' && this.extractor) {
+        if (this.extractor.visitNode && nodeType === 'command') {
+          const ctx = this.makeExtractorContext();
+          this.extractor.visitNode(node, ctx);
+        } else if (this.extractor.variableTypes.includes(nodeType)) {
+          this.extractVariable(node);
+        }
+      }
 
       // Function-as-value capture (#756) — function bodies are walked here,
       // not in visitNode, so the capture hook must fire in both walkers.

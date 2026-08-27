@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="104" height="104" viewBox="0 0 104 104" role="img" aria-label="Bash">
+  <title>Bash</title>
+  <rect x="0.5" y="0.5" width="103" height="103" rx="8" fill="#f7f6f2" stroke="#d6d3c8"/>
+  <rect x="20" y="19" width="64" height="45" rx="5" fill="#171717"/>
+  <path d="M30 33l10 8-10 8M45 49h16" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M26 73h52" stroke="#4eaa25" stroke-width="6" stroke-linecap="round"/>
+  <text x="52" y="90" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="700" fill="#16150f">Bash</text>
+</svg>
