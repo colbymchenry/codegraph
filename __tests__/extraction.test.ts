@@ -144,6 +144,12 @@ describe('Language Detection', () => {
     expect(detectLanguage('entry/src/main/ets/common/utils.ts')).toBe('typescript');
   });
 
+  it('should detect GDScript files', () => {
+    expect(detectLanguage('player.gd')).toBe('gdscript');
+    expect(detectLanguage('scripts/enemies/boss_ai.gd')).toBe('gdscript');
+    expect(isSourceFile('player.gd')).toBe(true);
+  });
+
   it('should detect Nix files', () => {
     expect(detectLanguage('default.nix')).toBe('nix');
     expect(detectLanguage('pkgs/development/tools/misc/codegraph/default.nix')).toBe('nix');
@@ -252,6 +258,7 @@ describe('Language Support', () => {
     expect(languages).toContain('dart');
     expect(languages).toContain('solidity');
     expect(languages).toContain('nix');
+    expect(languages).toContain('gdscript');
   });
 });
 
@@ -391,6 +398,112 @@ in
     expect(node('package')?.isExported).toBe(true);
     expect(node('privateNested')?.isExported).toBe(false);
     expect(node('licenses')?.isExported).toBe(true);
+  });
+});
+
+describe('GDScript Extraction', () => {
+  it('should extract functions, constructor, and signatures', () => {
+    const code = `extends Node2D
+
+func _ready() -> void:
+	set_process(true)
+
+func _init(width: int, height: int = 32):
+	pass
+
+static func clamp_value(v: float, lo: float, hi: float) -> float:
+	return clampf(v, lo, hi)
+`;
+
+    const result = extractFromSource('player.gd', code);
+
+    const ready = result.nodes.find((n) => n.kind === 'function' && n.name === '_ready');
+    expect(ready?.signature).toBe('() -> void');
+
+    // constructor_definition has no name field; resolveName supplies _init
+    const init = result.nodes.find((n) => n.name === '_init');
+    expect(init).toBeDefined();
+    expect(init?.signature).toBe('(width: int, height: int = 32)');
+
+    const clampValue = result.nodes.find((n) => n.name === 'clamp_value');
+    expect(clampValue?.signature).toBe('(v: float, lo: float, hi: float) -> float');
+    expect(clampValue?.isStatic).toBe(true);
+
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toContain('set_process');
+    expect(calls).toContain('clampf');
+  });
+
+  it('should extract the var/const family and walk initializers for calls', () => {
+    const code = `extends Node
+
+const MAX_SPEED := 300.0
+var health: int = 100
+@export var display_name: String = "Player"
+@onready var sprite = get_node("Sprite2D")
+var scene = preload("res://enemy.tscn")
+`;
+
+    const result = extractFromSource('stats.gd', code);
+
+    const maxSpeed = result.nodes.find((n) => n.kind === 'constant' && n.name === 'MAX_SPEED');
+    expect(maxSpeed).toBeDefined();
+
+    const health = result.nodes.find((n) => n.kind === 'variable' && n.name === 'health');
+    expect(health?.signature).toBe(': int = 100');
+
+    expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 'display_name')).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'variable' && n.name === 'sprite')).toBeDefined();
+
+    // Initializers are walked, so calls inside them are captured.
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toContain('get_node');
+    expect(calls).toContain('preload');
+  });
+
+  it('should extract signals as properties with their parameter list', () => {
+    const code = `extends Node
+
+signal died
+signal health_changed(old_value, new_value)
+`;
+
+    const result = extractFromSource('events.gd', code);
+
+    const died = result.nodes.find((n) => n.kind === 'property' && n.name === 'died');
+    expect(died).toBeDefined();
+
+    const healthChanged = result.nodes.find((n) => n.kind === 'property' && n.name === 'health_changed');
+    expect(healthChanged?.signature).toBe('(old_value, new_value)');
+  });
+
+  it('should extract enums with members and inner classes with methods', () => {
+    const code = `extends Node
+
+enum State { IDLE, RUNNING = 10, DEAD }
+
+class Inventory:
+	var items := []
+
+	func add(item) -> void:
+		items.append(item)
+`;
+
+    const result = extractFromSource('game.gd', code);
+
+    expect(result.nodes.find((n) => n.kind === 'enum' && n.name === 'State')).toBeDefined();
+    const members = result.nodes.filter((n) => n.kind === 'enum_member').map((n) => n.name);
+    expect(members).toContain('IDLE');
+    expect(members).toContain('RUNNING');
+    expect(members).toContain('DEAD');
+
+    expect(result.nodes.find((n) => n.kind === 'class' && n.name === 'Inventory')).toBeDefined();
+    const add = result.nodes.find((n) => n.kind === 'method' && n.name === 'add');
+    expect(add?.signature).toBe('(item) -> void');
+
+    // obj.method(args) parses as attribute_call — the bare method name is emitted.
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    expect(calls).toContain('append');
   });
 });
 
