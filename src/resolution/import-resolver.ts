@@ -10,6 +10,7 @@ import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport } from './types';
 import { applyAliases } from './path-aliases';
 import { resolveWorkspaceImport } from './workspace-packages';
+import { validatePathWithinRoot } from '../utils';
 import {
   resolveMethodOnType,
   resolveObjectLiteralMember,
@@ -47,6 +48,10 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   ruby: ['.rb'],
   objc: ['.h', '.m', '.mm'],
   nix: ['.nix', '/default.nix'],
+  // OpenSCAD `include <p>` / `use <p>` always spells the extension, so this
+  // list only backs the trailing-extension probe; the path is tried as-is
+  // first and normally matches there.
+  openscad: ['.scad'],
 };
 
 export function isNixPathImportRef(ref: UnresolvedRef): boolean {
@@ -56,6 +61,23 @@ export function isNixPathImportRef(ref: UnresolvedRef): boolean {
     (ref.referenceName.startsWith('./') || ref.referenceName.startsWith('../')) &&
     !/[\s{}()[\];"'<>$]/.test(ref.referenceName)
   );
+}
+
+/**
+ * Is this an OpenSCAD `include <p>` / `use <p>` directive? The text between the
+ * angle brackets is a PATH, not a symbol name, so these resolve to files only —
+ * never to a same-named module or function via the name-matcher.
+ *
+ * Without this, OpenSCAD imports fell through to the name-matcher, which picks
+ * a candidate by basename similarity. That resolved 1627 of 1633 imports
+ * correctly on a three-library fixture — but it also invented an edge for
+ * `include <math.scad>` where no search root holds a `math.scad` and OpenSCAD
+ * itself reports "Can't open include file", and it declined
+ * `include <../polyhedra.scad>` whose written path is unambiguous but whose
+ * basename is not. A wrong edge is worse than none (#660).
+ */
+export function isOpenscadIncludeRef(ref: UnresolvedRef): boolean {
+  return ref.language === 'openscad' && ref.referenceKind === 'imports';
 }
 
 /**
@@ -155,6 +177,14 @@ function resolveImportPathUncached(
   const projectRoot = context.getProjectRoot();
   const fromDir = path.dirname(path.join(projectRoot, fromFile));
 
+  // OpenSCAD resolves EVERY import path against the including file's directory
+  // first, not only the dot-prefixed ones — `include <parts/shell.scad>` is
+  // relative too. It also has its own library roots, and its own containment.
+  // So it takes the whole path rather than the generic relative/aliased pair.
+  if (language === 'openscad') {
+    return resolveOpenscadImport(importPath, fromFile, context);
+  }
+
   // Handle relative imports
   if (importPath.startsWith('.')) {
     return resolveRelativeImport(importPath, fromDir, language, context);
@@ -169,6 +199,114 @@ function resolveImportPathUncached(
   // compile_commands.json or heuristic probing.
   if (language === 'c' || language === 'cpp') {
     return resolveCppIncludePath(importPath, language, context);
+  }
+
+  return null;
+}
+
+/**
+ * OpenSCAD library roots for a project, relative to the project root.
+ *
+ * Discovery deliberately UNDER-reaches. Measured on a three-library fixture,
+ * five imports in dotSCAD's own `examples/`/`test/` name paths that would
+ * resolve if `dotSCAD/src` were treated as a library root — and real OpenSCAD
+ * does not resolve them either, because nothing puts it on OPENSCADPATH. A
+ * probe that accepted any directory containing `.scad` files would assert five
+ * edges the actual build does not have. So this follows what the project
+ * declares, not what the tree suggests.
+ *
+ * Roots outside the project root are dropped here, at discovery time rather
+ * than at use, so the invariant lives in one place.
+ */
+const openscadLibraryRootCache = new Map<string, string[]>();
+
+/** Clear the OpenSCAD library-root cache (call between indexing runs). */
+export function clearOpenscadLibraryRootCache(): void {
+  openscadLibraryRootCache.clear();
+}
+
+export function loadOpenscadLibraryRoots(projectRoot: string): string[] {
+  const cached = openscadLibraryRootCache.get(projectRoot);
+  if (cached) return cached;
+
+  const roots: string[] = [];
+  const add = (absolute: string) => {
+    // Every root is validated as it is discovered. `allowSymlinkEscape` matches
+    // the indexing tier: an in-root symlink to a vendored library is legitimate
+    // and the directory walk already followed it (#935).
+    if (!validatePathWithinRoot(projectRoot, absolute, { allowSymlinkEscape: true })) return;
+    const rel = path.relative(projectRoot, absolute).replace(/\\/g, '/');
+    if (rel && !roots.includes(rel)) roots.push(rel);
+  };
+
+  // The vendoring convention: a `lib/` beside the sources, which is what a
+  // project pointing OPENSCADPATH at its own tree uses.
+  for (const name of ['lib', 'libraries']) {
+    const candidate = path.join(projectRoot, name);
+    try {
+      if (fs.statSync(candidate).isDirectory()) add(candidate);
+    } catch {
+      // absent — nothing to add
+    }
+  }
+
+  // OPENSCADPATH is set by the user running the indexer and cannot be set by an
+  // indexed file, so it is a legitimate hint — but it never widens resolution
+  // beyond the project root: entries outside are dropped by `add`.
+  const declared = process.env.OPENSCADPATH;
+  if (declared) {
+    for (const entry of declared.split(path.delimiter)) {
+      if (entry) add(path.resolve(projectRoot, entry));
+    }
+  }
+
+  openscadLibraryRootCache.set(projectRoot, roots);
+  return roots;
+}
+
+/**
+ * Resolve an OpenSCAD `include <p>` / `use <p>` to a file.
+ *
+ * Search order is the language's own: the directory of the including file
+ * first, then the project's library roots. The order is normative — a sibling
+ * must beat a same-named file in a library, because that is what the renderer
+ * does, and an edge the renderer contradicts is worse than no edge.
+ *
+ * Returns null when nothing matches. It does NOT fall back to picking a
+ * basename candidate; that fallback is what invented an edge for a path
+ * OpenSCAD itself cannot open.
+ */
+function resolveOpenscadImport(
+  importPath: string,
+  fromFile: string,
+  context: ResolutionContext
+): string | null {
+  const projectRoot = context.getProjectRoot();
+  const searchRoots = [
+    path.dirname(path.join(projectRoot, fromFile)),
+    ...loadOpenscadLibraryRoots(projectRoot).map((r) => path.join(projectRoot, r)),
+  ];
+  const extensions = EXTENSION_RESOLUTION.openscad ?? [];
+
+  for (const root of searchRoots) {
+    // Lexical resolution first, then the host's own validator. The lexical
+    // `../` guard inside it applies on every tier, so a path climbing out of
+    // the project is rejected here; an in-root symlink to a vendored library
+    // is allowed through, matching the indexing read sites.
+    const candidateAbs = path.resolve(root, importPath);
+    if (!validatePathWithinRoot(projectRoot, candidateAbs, { allowSymlinkEscape: true })) {
+      continue;
+    }
+
+    // Look the file up by its LOGICAL project-relative path, not the realpath
+    // the validator returns: a library reached through a symlink is indexed
+    // under the path the walk saw, which is the logical one.
+    const rel = path.relative(projectRoot, candidateAbs).replace(/\\/g, '/');
+    if (!rel) continue;
+    if (context.fileExists(rel)) return rel;
+    for (const ext of extensions) {
+      if (context.fileExists(rel + ext)) return rel + ext;
+    }
   }
 
   return null;
@@ -1348,6 +1486,24 @@ export function resolveViaImport(
       };
     }
     return null;
+  }
+
+  // OpenSCAD `include <p>` / `use <p>` resolve directly to the included FILE,
+  // for the same reason as the C/C++ branch above: the symbol lookup below
+  // would search the resolved file for a symbol named like the path and fail.
+  // The search order (including file's directory, then library roots) lives in
+  // resolveOpenscadImport, so no separate sibling probe is needed here.
+  if (ref.language === 'openscad' && ref.referenceKind === 'imports') {
+    const resolvedPath = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
+    if (!resolvedPath) return null;
+    const basename = resolvedPath.split('/').pop()!;
+    const fileNode = context
+      .getNodesByName(basename)
+      .find((n) => n.kind === 'file' && n.filePath === resolvedPath);
+    if (!fileNode) return null;
+    // Path-exact: the file was found by walking the language's own search
+    // order, not by name similarity, so this outranks the 0.9 early-return bar.
+    return { original: ref, targetNodeId: fileNode.id, confidence: 0.95, resolvedBy: 'import' };
   }
 
   // COBOL COPY / EXEC SQL INCLUDE — resolve the copybook member to a
