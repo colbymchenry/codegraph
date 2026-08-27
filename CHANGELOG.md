@@ -12,6 +12,23 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **OpenSCAD support** (`.scad`) — CodeGraph now indexes parametric CAD projects.
+  `module` and `function` definitions become symbols with their parameters,
+  module instantiations and function calls become call edges (including every
+  operator in a `translate(…) rotate(…) cube(…)` transform chain), top-level
+  assignments become variables with `$fn`-style special variables keeping their
+  sigil, and `include <…>` / `use <…>` resolve **by path** — the including
+  file's directory first, then the project's library roots — so a sibling wins
+  over a same-named file in a vendored library, and a path nothing satisfies
+  produces no edge instead of a guess.
+
+  Measured on KeyV2, NopSCADlib and dotSCAD (sonnet/high, 2 runs per arm,
+  18 runs): an agent answering a flow question with CodeGraph read **0 files in
+  15 of 18 runs** (0–1 overall, against 1–5 without) and finished **faster in
+  18 of 18**, usually from a single `codegraph_explore` call.
+
 
 ## [1.6.0] - 2026-08-26
 
