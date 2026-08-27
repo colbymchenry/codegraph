@@ -30,6 +30,7 @@ import {
   ExploreSessionState,
   coalesceRanges,
   exploreProjectKey,
+  normalizeExploreSessionId,
   rangesCover,
   readExploreSessionView,
   viewForProject,
@@ -155,6 +156,112 @@ describe('ExploreSessionState — the container', () => {
     // not untracked — only a missing view (nobody tracking) is null.
     expect(viewForProject(view, '/repo/other')?.callCount).toBe(0);
     expect(viewForProject(null, '/repo/a')).toBeNull();
+  });
+});
+
+describe('per-caller buckets', () => {
+  /**
+   * The record is per MCP connection, but a connection can carry several agent
+   * contexts (Claude Code subagents dispatch over the parent's). A caller id
+   * buckets the history so no context is ever told it already holds source that
+   * went to a sibling — the failure that costs a Read.
+   */
+  it('keeps two callers on one session from seeing each other\'s calls', () => {
+    const state = new ExploreSessionState();
+    state.record(emission('/repo/a'), 'A');
+    state.record(emission('/repo/a'), 'A');
+
+    expect(state.view('A').projects).toHaveLength(1);
+    expect(state.view('A').projects[0]!.callCount).toBe(2);
+    expect(state.callCount('/repo/a', 'A')).toBe(2);
+    // B and the unidentified bucket have been served nothing.
+    expect(state.view('B').projects).toEqual([]);
+    expect(state.view().projects).toEqual([]);
+    expect(state.callCount('/repo/a')).toBe(0);
+  });
+
+  it('files a call with no caller id under the default bucket, as before', () => {
+    const state = new ExploreSessionState();
+    state.record(emission('/repo/a'));
+    expect(state.view().projects[0]?.callCount).toBe(1);
+    expect(state.forProject('/repo/a')?.callCount).toBe(1);
+    expect(state.view('A').projects).toEqual([]);
+  });
+
+  it('treats an unusable caller id as no id rather than as its own bucket', () => {
+    const state = new ExploreSessionState();
+    state.record(emission('/repo/a'), 42 as unknown as string);
+    state.record(emission('/repo/a'), '   ');
+    expect(state.view().projects[0]?.callCount).toBe(2);
+    expect(state.snapshot()).toHaveLength(1);
+  });
+
+  it('normalizes a caller id to an opaque, bounded label', () => {
+    expect(normalizeExploreSessionId('  main:abc  ')).toBe('main:abc');
+    expect(normalizeExploreSessionId('')).toBeUndefined();
+    expect(normalizeExploreSessionId('   ')).toBeUndefined();
+    expect(normalizeExploreSessionId(undefined)).toBeUndefined();
+    expect(normalizeExploreSessionId(42)).toBeUndefined();
+    expect(normalizeExploreSessionId({ id: 'A' })).toBeUndefined();
+    // Past the cap the id is hashed, not cut: a fixed-size label that is still
+    // the same one every time.
+    const long = normalizeExploreSessionId('x'.repeat(200));
+    expect(long).toMatch(/^[0-9a-f]{64}$/);
+    expect(normalizeExploreSessionId('x'.repeat(200))).toBe(long);
+  });
+
+  it('keeps two over-long ids apart when they differ only past the cap', () => {
+    // Truncating would collapse these into ONE bucket — a record shared between
+    // two contexts, which is the very bug bucketing exists to fix.
+    expect(normalizeExploreSessionId('x'.repeat(200)))
+      .not.toBe(normalizeExploreSessionId('x'.repeat(129)));
+    expect(normalizeExploreSessionId(`${'x'.repeat(128)}A`))
+      .not.toBe(normalizeExploreSessionId(`${'x'.repeat(128)}B`));
+  });
+
+  it('serves an over-long id from its own bucket, never its 128-char prefix', () => {
+    const state = new ExploreSessionState();
+    state.record(emission('/repo/a'), 'x'.repeat(200));
+    expect(state.view('x'.repeat(200)).projects[0]?.callCount).toBe(1);
+    // A caller whose id IS the truncation must not be handed the other's record.
+    expect(state.view('x'.repeat(128)).projects).toEqual([]);
+    expect(state.snapshot()).toHaveLength(1);
+  });
+
+  it('clears one caller\'s record without touching another\'s', () => {
+    const state = new ExploreSessionState();
+    state.record(emission('/repo/a'), 'A');
+    state.record(emission('/repo/b'), 'A');
+    state.record(emission('/repo/a'), 'B');
+
+    expect(state.clearSessionRecord('A')).toBe(2);
+    expect(state.view('A').projects).toEqual([]);
+    expect(state.view('B').projects[0]?.callCount).toBe(1);
+    expect(state.clearSessionRecord('A')).toBe(0);
+  });
+
+  it('never lets an unusable id clear the bucket everyone else shares', () => {
+    const state = new ExploreSessionState();
+    state.record(emission('/repo/a'));
+    expect(state.clearSessionRecord('')).toBe(0);
+    expect(state.clearSessionRecord('   ')).toBe(0);
+    expect(state.clearSessionRecord(undefined as unknown as string)).toBe(0);
+    expect(state.view().projects[0]?.callCount).toBe(1);
+  });
+
+  it('bounds (caller, project) entries together — eviction spans buckets', () => {
+    // Accepted cost of one shared bound: a wide fan-out evicts the least
+    // recently active caller's record, which re-serves (safe) rather than
+    // pointing anyone at source they never received.
+    const state = new ExploreSessionState();
+    for (let i = 0; i < EXPLORE_SESSION_LIMITS.MAX_PROJECTS; i++) {
+      state.record(emission('/repo/a'), `caller-${i}`);
+    }
+    expect(state.snapshot()).toHaveLength(EXPLORE_SESSION_LIMITS.MAX_PROJECTS);
+    state.record(emission('/repo/a'), 'caller-last');
+    expect(state.snapshot()).toHaveLength(EXPLORE_SESSION_LIMITS.MAX_PROJECTS);
+    expect(state.view('caller-0').projects).toEqual([]);
+    expect(state.view('caller-last').projects[0]?.callCount).toBe(1);
   });
 });
 

@@ -16,7 +16,12 @@
  *   1. **Per session, never persisted.** One instance is owned by an
  *      {@link ../mcp/session.MCPSession} and dies with the socket. A new agent
  *      session starts clean — dedup across sessions would suppress source the
- *      new agent has never seen.
+ *      new agent has never seen. One MCP connection is not always one agent
+ *      CONTEXT, though: Claude Code subagents dispatch over the parent's
+ *      connection, so the record is additionally bucketed by an optional
+ *      caller-supplied `sessionId` (see {@link normalizeExploreSessionId}) —
+ *      without it a subagent is told source was "already sent" to a context
+ *      that never received it, and it Reads the file.
  *   2. **Per project inside the session.** A session can query several projects
  *      by `projectPath`, so state is keyed by the RESOLVED project root
  *      (`cg.getProjectRoot()`), not by whatever path the agent typed.
@@ -39,6 +44,7 @@
  */
 
 import * as path from 'path';
+import { createHash } from 'crypto';
 
 /**
  * Property on a {@link ../mcp/tools.ToolResult} carrying what an explore call
@@ -156,6 +162,42 @@ export function exploreProjectKey(projectRoot: string): string {
 }
 
 /**
+ * Longest caller-supplied session id used verbatim as a bucket label. The cap
+ * exists to bound what a client can make the server hold as a key; beyond it
+ * the id is HASHED, never truncated.
+ *
+ * Truncating would be a correctness hole, not a size trade: two distinct ids
+ * sharing a 128-char prefix would collapse into ONE bucket — a record shared
+ * between two contexts, which is exactly the bug this bucketing exists to fix,
+ * and the pointers it would hand the second context name source only the first
+ * received. A digest keeps distinct ids distinct at a fixed size.
+ */
+const MAX_SESSION_ID_CHARS = 128;
+
+/** Bucket shared by every caller that supplies no `sessionId`. */
+const DEFAULT_BUCKET = '';
+
+/**
+ * Normalize a caller-supplied `sessionId` into a bucket label.
+ *
+ * CLIENT-CONTROLLED DATA: this value is a Map key and nothing else. It must
+ * never reach a response, a log line, or a path. Anything that is not a
+ * non-empty string collapses to `undefined` — the default bucket, which is
+ * byte-for-byte the behaviour of a host that injects no id at all.
+ *
+ * Deterministic in both branches: one id always lands in one bucket, and two
+ * ids that differ anywhere — including only past {@link MAX_SESSION_ID_CHARS} —
+ * land in different ones.
+ */
+export function normalizeExploreSessionId(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.length <= MAX_SESSION_ID_CHARS) return trimmed;
+  return createHash('sha256').update(trimmed).digest('hex');
+}
+
+/**
  * Merge overlapping / adjacent spans into the smallest equivalent set, then cap
  * it. Adjacency (`next.start <= cur.end + 1`) counts as overlap: two ranges that
  * touch describe one contiguous block of emitted source.
@@ -195,10 +237,22 @@ export function rangesCover(ranges: ReadonlyArray<ExploreLineRange>, line: numbe
 }
 
 interface MutableProjectState {
+  /** Caller bucket this project's history belongs to; `''` = no `sessionId`. */
+  bucket: string;
   projectRoot: string;
   callCount: number;
   responseBytes: number;
   calls: ExploreCallRecord[];
+}
+
+/**
+ * Map key for one (bucket, project) pair. A resolved project root can never
+ * contain NUL, so the separator keeps the pair unambiguous whatever a client
+ * spells as its session id. Bucket membership is still tested against the
+ * stored {@link MutableProjectState.bucket}, never by prefix-matching this key.
+ */
+function bucketedKey(bucket: string, projectKey: string): string {
+  return `${bucket}\u0000${projectKey}`;
 }
 
 /**
@@ -210,17 +264,20 @@ interface MutableProjectState {
  * the tool-call path and a bookkeeping bug must never fail an explore.
  */
 export class ExploreSessionState {
-  /** Insertion-ordered; a touched project is re-inserted, so the head is the LRU. */
+  /**
+   * Keyed by (caller bucket, project). Insertion-ordered; a touched entry is
+   * re-inserted, so the head is the LRU.
+   */
   private readonly projects = new Map<string, MutableProjectState>();
 
   /**
-   * File an emission. Returns the record as stored (with its session call
-   * index), or `null` if the emission was unusable.
+   * File an emission under the caller's bucket. Returns the record as stored
+   * (with its session call index), or `null` if the emission was unusable.
    */
-  record(emission: ExploreEmission): ExploreCallRecord | null {
+  record(emission: ExploreEmission, sessionId?: string): ExploreCallRecord | null {
     if (!emission || typeof emission.projectRoot !== 'string' || !emission.projectRoot) return null;
-    const key = exploreProjectKey(emission.projectRoot);
-    const state = this.touch(key, emission.projectRoot);
+    const bucket = normalizeExploreSessionId(sessionId) ?? DEFAULT_BUCKET;
+    const state = this.touch(bucket, exploreProjectKey(emission.projectRoot), emission.projectRoot);
 
     state.callCount += 1;
     state.responseBytes += Math.max(0, emission.responseBytes || 0);
@@ -240,18 +297,18 @@ export class ExploreSessionState {
     return record;
   }
 
-  /** Full state for one project, or `null` if it was never queried this session. */
-  forProject(projectRoot: string): ExploreProjectState | null {
-    const state = this.projects.get(exploreProjectKey(projectRoot));
+  /** Full state for one project in one bucket, or `null` if never queried. */
+  forProject(projectRoot: string, sessionId?: string): ExploreProjectState | null {
+    const state = this.projects.get(this.keyFor(sessionId, projectRoot));
     return state ? cloneProject(state) : null;
   }
 
-  /** Explore calls made this session against a project (including evicted ones). */
-  callCount(projectRoot: string): number {
-    return this.projects.get(exploreProjectKey(projectRoot))?.callCount ?? 0;
+  /** Explore calls one bucket made against a project (including evicted ones). */
+  callCount(projectRoot: string, sessionId?: string): number {
+    return this.projects.get(this.keyFor(sessionId, projectRoot))?.callCount ?? 0;
   }
 
-  /** Every project this session has queried, least-recently-used first. */
+  /** Every project this session has queried, across all buckets, LRU first. */
   snapshot(): ExploreProjectState[] {
     return [...this.projects.values()].map(cloneProject);
   }
@@ -261,10 +318,15 @@ export class ExploreSessionState {
    * {@link EXPLORE_SESSION_LIMITS.MAX_VIEW_CALLS} calls per project: it crosses a
    * worker boundary on every explore, so it carries what a dedup/decay decision
    * needs and not the whole history.
+   *
+   * Scoped to ONE bucket: a caller may only be told it already holds source its
+   * own context was served. Everything a different `sessionId` (or none) was
+   * sent is invisible here.
    */
-  view(): ExploreSessionView {
+  view(sessionId?: string): ExploreSessionView {
+    const bucket = normalizeExploreSessionId(sessionId) ?? DEFAULT_BUCKET;
     return {
-      projects: [...this.projects.values()].map((state) => ({
+      projects: [...this.projects.values()].filter((state) => state.bucket === bucket).map((state) => ({
         projectRoot: state.projectRoot,
         callCount: state.callCount,
         responseBytes: state.responseBytes,
@@ -275,25 +337,58 @@ export class ExploreSessionState {
     };
   }
 
-  /** Drop everything. Used by tests; a real session just goes away instead. */
+  /** Drop everything, every bucket. Used by tests; a real session just goes away. */
   clear(): void {
     this.projects.clear();
   }
 
   /**
-   * Fetch a project's state, creating it if new, and mark it most-recently-used.
-   * Evicts the LRU project past the bound — dropping a project entirely (rather
-   * than its detail) is right here: a session that has moved on to four other
-   * repos is not about to re-ask the first one.
+   * Forget one caller's history and nothing else — the reset a host hook fires
+   * when that context is discarded (a compact, a finished subagent), after
+   * which its next call is served as a first call again.
+   *
+   * Returns how many project entries were dropped. An id that normalizes away
+   * clears NOTHING: the default bucket is shared by every caller that sends no
+   * `sessionId`, so a malformed id must never be able to wipe it.
    */
-  private touch(key: string, projectRoot: string): MutableProjectState {
+  clearSessionRecord(sessionId: string): number {
+    const bucket = normalizeExploreSessionId(sessionId);
+    if (bucket === undefined) return 0;
+    let removed = 0;
+    for (const [key, state] of [...this.projects]) {
+      if (state.bucket !== bucket) continue;
+      this.projects.delete(key);
+      removed += 1;
+    }
+    return removed;
+  }
+
+  /** Where one bucket's copy of a project is filed. */
+  private keyFor(sessionId: string | undefined, projectRoot: string): string {
+    return bucketedKey(normalizeExploreSessionId(sessionId) ?? DEFAULT_BUCKET, exploreProjectKey(projectRoot));
+  }
+
+  /**
+   * Fetch a bucket's project state, creating it if new, and mark it
+   * most-recently-used. Evicts the LRU project past the bound — dropping a
+   * project entirely (rather than its detail) is right here: a session that has
+   * moved on to four other repos is not about to re-ask the first one.
+   *
+   * The bound spans buckets: {@link EXPLORE_SESSION_LIMITS.MAX_PROJECTS} caps
+   * (bucket, project) entries, not projects per bucket, so a wide subagent
+   * fan-out over one repo evicts the least recently active caller's record. That
+   * costs a re-serve for whoever was evicted — the safe direction (see the
+   * module header); it can never point a caller at source it did not receive.
+   */
+  private touch(bucket: string, projectKey: string, projectRoot: string): MutableProjectState {
+    const key = bucketedKey(bucket, projectKey);
     const existing = this.projects.get(key);
     if (existing) {
       this.projects.delete(key);
       this.projects.set(key, existing);
       return existing;
     }
-    const created: MutableProjectState = { projectRoot, callCount: 0, responseBytes: 0, calls: [] };
+    const created: MutableProjectState = { bucket, projectRoot, callCount: 0, responseBytes: 0, calls: [] };
     this.projects.set(key, created);
     while (this.projects.size > EXPLORE_SESSION_LIMITS.MAX_PROJECTS) {
       const lru = this.projects.keys().next().value as string | undefined;

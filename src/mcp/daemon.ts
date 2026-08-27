@@ -367,6 +367,13 @@ export class Daemon {
     // timeout, a non-hello first line, an early close — yields null pids and we
     // fall back to the socket-close lifecycle exactly as before (#692).
     void readClientHello(socket).then((peers) => {
+      // A control command claims the connection: one line in, one line out, no
+      // session. It is deliberately never added to `clients`, so a control
+      // caller neither counts as a client nor holds the idle timer off.
+      if (peers.control) {
+        this.handleControl(socket, peers.control);
+        return;
+      }
       const transport = new SocketTransport(socket);
       const session = new MCPSession(transport, this.engine, {
         explicitProjectPath: this.projectRoot,
@@ -381,6 +388,31 @@ export class Daemon {
       // unshifted client-hello tail reaches the transport intact.
       socket.on('data', () => { this.lastActivityAt = Date.now(); });
     });
+  }
+
+  /**
+   * Answer a one-shot control connection.
+   *
+   * Total by design: an unknown op or a malformed field replies `{"ok":false}`
+   * instead of throwing, because a daemon that dies on a bad control line takes
+   * every connected session down with it.
+   *
+   * `clear-session-record` sweeps EVERY live session: the caller knows its own
+   * context id, never which connection carries it (subagents dispatch over the
+   * parent's). The id is an opaque bucket label — never logged, never echoed.
+   */
+  private handleControl(socket: net.Socket, command: DaemonControlCommand): void {
+    let reply: { ok: boolean; cleared?: number } = { ok: false };
+    if (command.op === 'clear-session-record' && typeof command.sessionId === 'string') {
+      let cleared = 0;
+      for (const session of [...this.clients]) {
+        try {
+          cleared += session.clearSessionRecord(command.sessionId);
+        } catch { /* one wedged session must not sink the sweep */ }
+      }
+      reply = { ok: true, cleared };
+    }
+    try { socket.end(JSON.stringify(reply) + '\n'); } catch { /* peer already gone */ }
   }
 
   private dropClient(session: MCPSession): void {
@@ -773,6 +805,35 @@ export function parseClientHelloLine(
 }
 
 /**
+ * A one-shot control command, as it arrived on the wire. Fields stay `unknown`
+ * because they are unvalidated client data — {@link Daemon.handleControl} is
+ * the single place that decides whether a command is answerable.
+ */
+export interface DaemonControlCommand {
+  op: unknown;
+  sessionId: unknown;
+}
+
+/**
+ * Read the first line of a connection as a control command, or `null` when it
+ * is not one.
+ *
+ * The `codegraph_control` marker is what CLAIMS the connection: without it the
+ * line belongs to a proxy hello or a direct MCP client and must reach the
+ * transport verbatim, so a junk first line stays MCP's problem exactly as it
+ * was. With it, the connection is a control caller and is answered as one even
+ * if the rest of the command is nonsense.
+ */
+export function parseDaemonControlLine(line: string): DaemonControlCommand | null {
+  let parsed: unknown;
+  try { parsed = JSON.parse(line); } catch { return null; }
+  if (!parsed || typeof parsed !== 'object') return null;
+  const o = parsed as Record<string, unknown>;
+  if (o.codegraph_control !== 1) return null;
+  return { op: o.op, sessionId: o.sessionId };
+}
+
+/**
  * A client's peer is dead when its proxy process is gone, or when its known
  * host process is gone. Unknown pid (no client-hello) is never "dead" on this
  * basis — those clients rely on the socket-close path. Exported for testing.
@@ -787,6 +848,14 @@ export function peerIsDead(
   return false;
 }
 
+/** Outcome of reading a connection's first line. */
+interface ClientHelloResult {
+  pid: number | null;
+  hostPid: number | null;
+  /** Set when that line claimed the connection as a one-shot control command. */
+  control?: DaemonControlCommand;
+}
+
 /**
  * Read the optional client-hello line a proxy sends after the daemon hello.
  * Always resolves (never rejects) — fail-safe by design, since every connection
@@ -796,15 +865,13 @@ export function peerIsDead(
  * Accumulates as Buffers and splits on the newline byte so a UTF-8 sequence
  * straddling a chunk boundary in the unshifted tail is never corrupted.
  */
-function readClientHello(
-  socket: net.Socket,
-): Promise<{ pid: number | null; hostPid: number | null }> {
+function readClientHello(socket: net.Socket): Promise<ClientHelloResult> {
   return new Promise((resolve) => {
     let chunks: Buffer[] = [];
     let total = 0;
     let settled = false;
     const finish = (
-      peers: { pid: number | null; hostPid: number | null },
+      peers: ClientHelloResult,
       putBack?: Buffer,
     ) => {
       if (settled) return;
@@ -845,15 +912,24 @@ function readClientHello(
         else chunks = [all];
         return;
       }
-      const peers = parseClientHelloLine(all.subarray(0, nl).toString('utf8'));
+      const line = all.subarray(0, nl).toString('utf8');
+      const peers = parseClientHelloLine(line);
       if (peers) {
         const tail = all.subarray(nl + 1);
         finish(peers, tail.length > 0 ? tail : undefined);
-      } else {
-        // First line is not a client-hello (legacy/direct client) — hand the
-        // whole buffer back so the transport sees the message verbatim.
-        finish({ pid: null, hostPid: null }, all);
+        return;
       }
+      const control = parseDaemonControlLine(line);
+      if (control) {
+        // One line in, one line out: nothing after it is application data, so
+        // the tail is dropped rather than handed to a transport that will
+        // never exist for this connection.
+        finish({ pid: null, hostPid: null, control });
+        return;
+      }
+      // First line is not a client-hello (legacy/direct client) — hand the
+      // whole buffer back so the transport sees the message verbatim.
+      finish({ pid: null, hostPid: null }, all);
     };
     const onEnd = () => finish({ pid: null, hostPid: null });
     // On timeout, hand back whatever partial bytes accumulated — discarding

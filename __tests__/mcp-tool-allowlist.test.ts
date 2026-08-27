@@ -4,7 +4,7 @@
  * Filtering happens in ListTools (getTools) and is enforced again on execute().
  */
 import { describe, it, expect, afterEach } from 'vitest';
-import { ToolHandler } from '../src/mcp/tools';
+import { ToolHandler, getStaticTools } from '../src/mcp/tools';
 
 const ENV = 'CODEGRAPH_MCP_TOOLS';
 
@@ -60,4 +60,54 @@ describe('CODEGRAPH_MCP_TOOLS allowlist', () => {
     const res = await new ToolHandler(null).execute('codegraph_search', { query: 'x' });
     expect(res.content[0].text).not.toMatch(/disabled via CODEGRAPH_MCP_TOOLS/);
   });
+});
+
+/**
+ * CODEGRAPH_MCP_EXPLORE_SESSION_PARAM — whether explore's `sessionId` is DECLARED.
+ *
+ * A host hook's `updatedInput` reaches the server whether or not the property is
+ * in the schema, so the declaration is off by default: it would buy the hook
+ * path nothing while exposing a knob an agent could set by hand. It exists for a
+ * host that validates arguments against the schema, or a harness passing it as
+ * an explicit tool argument. The HANDLER is unaffected either way — the bucketing
+ * tests in explore-session-state / explore-cross-call-dedup drive it directly and
+ * never touch this flag.
+ */
+describe('CODEGRAPH_MCP_EXPLORE_SESSION_PARAM', () => {
+  const PARAM = 'CODEGRAPH_MCP_EXPLORE_SESSION_PARAM';
+  const original = process.env[PARAM];
+  afterEach(() => {
+    if (original === undefined) delete process.env[PARAM];
+    else process.env[PARAM] = original;
+  });
+
+  const exploreProps = (defs: { name: string; inputSchema: { properties: Record<string, unknown> } }[]) =>
+    defs.find((t) => t.name === 'codegraph_explore')!.inputSchema.properties;
+
+  it('does not declare sessionId by default', () => {
+    delete process.env[PARAM];
+    expect(exploreProps(new ToolHandler(null).getTools())).not.toHaveProperty('sessionId');
+    expect(exploreProps(getStaticTools())).not.toHaveProperty('sessionId');
+  });
+
+  it('declares it when the flag is set, on both served surfaces', () => {
+    process.env[PARAM] = '1';
+    for (const props of [exploreProps(new ToolHandler(null).getTools()), exploreProps(getStaticTools())]) {
+      expect(props.sessionId).toEqual({
+        type: 'string',
+        description: 'Caller-context id, injected by the host\'s hooks — not set manually.',
+      });
+    }
+    // The rest of the schema is untouched.
+    expect(exploreProps(getStaticTools())).toHaveProperty('query');
+    expect(exploreProps(getStaticTools())).toHaveProperty('maxFiles');
+  });
+
+  it('treats the OFF values and an empty setting as unset', () => {
+    for (const value of ['0', 'false', 'off', 'no', 'OFF', '  ', '']) {
+      process.env[PARAM] = value;
+      expect(exploreProps(getStaticTools()), `value: ${JSON.stringify(value)}`).not.toHaveProperty('sessionId');
+    }
+  });
+
 });

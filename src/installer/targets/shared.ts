@@ -15,6 +15,7 @@ import {
   CODEGRAPH_SECTION_START,
   CODEGRAPH_SECTION_END,
 } from '../instructions-template';
+import { detectInstallMethod } from '../../upgrade';
 
 /**
  * The MCP-server config block codegraph injects. Same shape across
@@ -46,6 +47,150 @@ export function getMcpServerConfig(): { type: string; command: string; args: str
  */
 export function getCodeGraphPermissions(): string[] {
   return ['mcp__codegraph__*'];
+}
+
+/**
+ * The `codegraph` spelling to write into a hook command.
+ *
+ * Prefer the ABSOLUTE launcher — same discipline as Cursor's `--path`: resolve
+ * at install time what the agent would otherwise have to find at run time. A
+ * hook runs under whatever environment the host hands it, and Claude Code
+ * executes hooks through Git Bash on Windows, so a PATH lookup is the fragile
+ * half of the contract (#1466).
+ *
+ * Only a bundle install HAS an absolute launcher to point at; npm/npx put a
+ * shim on PATH and a source checkout has no installed binary at all, so those
+ * keep the PATH spelling. A path that has since moved is not a trap: hooks are
+ * recognized by their `hooks <subcommand>` substring, so a re-install rewrites
+ * a stale one in place (see {@link mergeHookEntries}).
+ */
+export function codegraphBinary(): string {
+  const fallback = process.platform === 'win32' ? 'codegraph.cmd' : 'codegraph';
+  try {
+    const method = detectInstallMethod({
+      filename: process.argv[1] ?? '',
+      platform: process.platform,
+      cwd: process.cwd(),
+    });
+    if (method.kind !== 'bundle' || !method.bundleRoot) return fallback;
+    const launcher = path.join(method.bundleRoot, 'bin', fallback);
+    if (!fs.existsSync(launcher)) return fallback;
+    // Hook commands are shell strings, so a launcher under "C:\Users\A B\…"
+    // has to survive word-splitting.
+    return /\s/.test(launcher) ? `"${launcher}"` : launcher;
+  } catch {
+    return fallback;
+  }
+}
+
+/** One hook to wire: which event, an optional matcher, and our subcommand. */
+export interface HookEntry {
+  event: string;
+  matcher?: string;
+  subcommand: string;
+}
+
+/**
+ * The `codegraph hooks` subcommands the installer wires into a host. Shared by
+ * every target: recognition has to be spelling-independent, so it keys on the
+ * subcommand rather than on the binary path or the host's event names.
+ */
+const SESSION_HOOK_SUBCOMMANDS = ['hooks pre-tool-use', 'hooks post-compact'];
+
+/**
+ * Recognizes a session hook this installer wrote, whatever binary spelling it
+ * was written with. The `codegraph`-scoped subcommand is the stable part —
+ * matching on it keeps an absolute path, a `.cmd`, or an `npx …` form all
+ * recognizable, and cannot collide with an unrelated user hook.
+ */
+export function isSessionHookCommand(command: unknown): boolean {
+  if (typeof command !== 'string' || !command.includes('codegraph')) return false;
+  return SESSION_HOOK_SUBCOMMANDS.some((s) => command.includes(s));
+}
+
+/**
+ * Merge hook entries into a host's event→matcher-groups map, in place. Returns
+ * whether anything actually changed, so the caller can leave a byte-identical
+ * file alone.
+ *
+ * Ours is always APPENDED as its own group rather than folded into a user's:
+ * hosts identify a hook by its position (codex keys its trust record on the
+ * group and handler index), so inserting ahead of existing groups renumbers
+ * them. An entry we already wrote is re-pointed at the binary we resolve now
+ * instead of being duplicated.
+ *
+ * Structure-only: every target reads and writes its own file, because their
+ * policies for a malformed one differ.
+ */
+export function mergeHookEntries(
+  hooks: Record<string, any>,
+  entries: HookEntry[],
+  binary: string,
+): boolean {
+  let changed = false;
+  for (const { event, matcher, subcommand } of entries) {
+    // A non-array under an event is not a shape any host reads, but it is the
+    // user's — overwriting it would destroy config we don't understand.
+    if (event in hooks && !Array.isArray(hooks[event])) continue;
+    const command = `${binary} ${subcommand}`;
+    // Recognize on the subcommand WITHOUT its flags: an entry whose flags have
+    // since changed is still the same entry, and must be re-pointed rather than
+    // joined by a second copy of itself.
+    const stable = subcommand.split(' --')[0];
+    const groups: any[] = hooks[event] ?? [];
+    const ours = groups
+      .flatMap((g: any) => (g && Array.isArray(g.hooks) ? g.hooks : []))
+      .filter((h: any) => isSessionHookCommand(h?.command) && h.command.includes(stable));
+    if (ours.length > 0) {
+      for (const h of ours) {
+        if (h.command !== command) { h.command = command; changed = true; }
+      }
+      continue;
+    }
+    groups.push({ ...(matcher ? { matcher } : {}), hooks: [{ type: 'command', command }] });
+    hooks[event] = groups;
+    changed = true;
+  }
+  return changed;
+}
+
+/**
+ * Drop every hook command matching `match` from a host's event→groups map, in
+ * place, then prune what that emptied. Returns whether anything was removed.
+ *
+ * Surgical at the individual-command level: a sibling hook sharing a group (or
+ * an event) with ours survives. A group is pruned only once its `hooks` array
+ * is empty and an event only once it has no groups left — and none of that runs
+ * unless a command was actually removed, so a file with none of ours is left
+ * byte-for-byte untouched. The caller owns the now-possibly-empty `hooks` key
+ * itself, since where it hangs differs by host.
+ */
+export function pruneHookCommands(
+  hooks: Record<string, any>,
+  match: (command: unknown) => boolean,
+): boolean {
+  let removedAny = false;
+  for (const event of Object.keys(hooks)) {
+    const groups = hooks[event];
+    if (!Array.isArray(groups)) continue;
+    for (const group of groups) {
+      if (!group || !Array.isArray(group.hooks)) continue;
+      const before = group.hooks.length;
+      group.hooks = group.hooks.filter((h: any) => !match(h?.command));
+      if (group.hooks.length !== before) removedAny = true;
+    }
+  }
+  if (!removedAny) return false;
+
+  for (const event of Object.keys(hooks)) {
+    const groups = hooks[event];
+    if (!Array.isArray(groups)) continue;
+    hooks[event] = groups.filter(
+      (g: any) => !(g && Array.isArray(g.hooks) && g.hooks.length === 0),
+    );
+    if (hooks[event].length === 0) delete hooks[event];
+  }
+  return true;
 }
 
 /**

@@ -313,6 +313,51 @@ describe('a second call against a real index', () => {
     expect(await explore(QUERY, b)).toBe(firstForA);
   }, 180_000);
 
+  /**
+   * Per-caller bucketing (`sessionId`).
+   *
+   * One MCP connection is not one agent context: Claude Code subagents dispatch
+   * over the parent's connection, so an unbucketed record hands a subagent a
+   * pointer to source only the parent was ever sent — the exact "codegraph
+   * doesn't have it" shape that costs a Read. A host hook injects a distinct id
+   * per context; calls that carry none share the default bucket and behave
+   * exactly as they did before it existed.
+   */
+  it('serves a second context in full — a subagent never got the first call', async () => {
+    const session = new ExploreSessionState();
+    const firstForA = await explore(QUERY, session, { sessionId: 'A' });
+    const firstForB = await explore(QUERY, session, { sessionId: 'B' });
+    expect(firstForB).toBe(firstForA);
+    expect(firstForB).not.toContain(POINTER);
+  }, 180_000);
+
+  it('still dedups the second call of ONE context', async () => {
+    const session = new ExploreSessionState();
+    await explore(QUERY, session, { sessionId: 'A' });
+    expect(await explore(QUERY, session, { sessionId: 'A' })).toContain(POINTER);
+  }, 180_000);
+
+  it('does not dedup an identified call against the unidentified bucket', async () => {
+    const session = new ExploreSessionState();
+    const unidentified = await explore(QUERY, session);
+    const identified = await explore(QUERY, session, { sessionId: 'A' });
+    expect(identified).toBe(unidentified);
+    expect(identified).not.toContain(POINTER);
+  }, 180_000);
+
+  it('clearSessionRecord drops one context\'s history and leaves its siblings', async () => {
+    const session = new ExploreSessionState();
+    const firstForA = await explore(QUERY, session, { sessionId: 'A' });
+    await explore(QUERY, session, { sessionId: 'B' });
+
+    expect(session.clearSessionRecord('A')).toBe(1);
+
+    // A was reset: its next call is a first call again, byte for byte.
+    expect(await explore(QUERY, session, { sessionId: 'A' })).toBe(firstForA);
+    // B never lost anything.
+    expect(await explore(QUERY, session, { sessionId: 'B' })).toContain(POINTER);
+  }, 240_000);
+
   it('is off entirely under CODEGRAPH_EXPLORE_DEDUP=0', async () => {
     const session = new ExploreSessionState();
     const previous = process.env.CODEGRAPH_EXPLORE_DEDUP;

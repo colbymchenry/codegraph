@@ -40,6 +40,7 @@ try {
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as net from 'net';
 import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, hasStructuralKeyword, extractCodeTokens } from '../directory';
 import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
@@ -1470,6 +1471,230 @@ program
       }
     } catch {
       // Degradable by contract: never surface an error to the prompt pipeline.
+    }
+  });
+
+/**
+ * codegraph hooks …  (hidden)
+ *
+ * Host-agent hook entry points. A host (Claude Code today) invokes these with
+ * its hook payload on stdin; their whole job is to tell the server WHICH agent
+ * context a call belongs to, because one MCP connection carries several — a
+ * subagent dispatches over its parent's — and cross-call dedup must not tell a
+ * fresh context that source was "already sent" to a sibling.
+ *
+ * LOAD-BEARING, same contract as `prompt-hook`: a non-zero exit or a stray byte
+ * on stdout disrupts the host. Every failure path here exits 0 and prints
+ * nothing; stdout carries the hook protocol and nothing else, notes go to
+ * stderr.
+ */
+
+/** The hook payload on stdin, or `{}` when there isn't one. Never rejects. */
+async function readHookPayload(): Promise<Record<string, unknown>> {
+  if (process.stdin.isTTY) return {}; // invoked by hand — nothing is coming
+  const raw = await new Promise<string>((resolve) => {
+    let data = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (c) => { data += c; });
+    process.stdin.on('end', () => resolve(data));
+    process.stdin.on('error', () => resolve(data));
+  });
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * The caller-context id for a hook payload: the host session, plus the agent id
+ * when a subagent is calling.
+ *
+ * Composite rather than the agent id alone, because a bare `agent_id` assumes
+ * the host numbers its agents uniquely across ALL sessions — a host whose ids
+ * are only unique within a session would put two sessions' subagents in one
+ * bucket on a shared connection, which is the bug this whole mechanism exists
+ * to prevent. Scoping every agent id to its session removes the assumption, and
+ * a main context is never confused with a subagent of the same session: one is
+ * the session id alone, the other always carries the separator and a suffix.
+ *
+ * Both hooks derive through here — the injecting hook and the resetting hook
+ * MUST agree on the spelling or a reset clears a bucket nobody is filling.
+ */
+function hookSessionId(payload: Record<string, unknown>): string | null {
+  const agentId = typeof payload.agent_id === 'string' ? payload.agent_id.trim() : '';
+  const sessionId = typeof payload.session_id === 'string' ? payload.session_id.trim() : '';
+  if (sessionId && agentId) return `${sessionId}:${agentId}`;
+  // A payload carrying only one of the two still identifies a context; only a
+  // payload with neither is unusable.
+  return sessionId || agentId || null;
+}
+
+/** Cap on what a control reply may stream before we stop reading it. */
+const MAX_CONTROL_REPLY_BYTES = 64 * 1024;
+
+/**
+ * One-shot control round-trip against a daemon socket. The daemon greets every
+ * connection with its own hello, so the reply is the first line carrying an
+ * `ok` field. Resolves `null` on ANY failure — no listener, wrong socket,
+ * timeout, malformed reply — because the only callers are hooks that must
+ * degrade silently.
+ */
+function sendDaemonControl(
+  socketPath: string,
+  command: Record<string, unknown>,
+  timeoutMs = 2_000,
+): Promise<{ ok?: boolean; cleared?: number } | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (value: { ok?: boolean; cleared?: number } | null): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { socket.destroy(); } catch { /* already gone */ }
+      resolve(value);
+    };
+    const socket = net.createConnection(socketPath);
+    const timer = setTimeout(() => done(null), timeoutMs);
+    timer.unref?.();
+    let buffered = '';
+    socket.setEncoding('utf8');
+    socket.on('connect', () => { socket.write(`${JSON.stringify(command)}\n`); });
+    socket.on('data', (chunk: string) => {
+      buffered += chunk;
+      if (buffered.length > MAX_CONTROL_REPLY_BYTES) { done(null); return; }
+      let nl: number;
+      while ((nl = buffered.indexOf('\n')) !== -1) {
+        const line = buffered.slice(0, nl);
+        buffered = buffered.slice(nl + 1);
+        try {
+          const parsed: unknown = JSON.parse(line);
+          if (parsed && typeof parsed === 'object' && 'ok' in parsed) {
+            done(parsed as { ok?: boolean; cleared?: number });
+            return;
+          }
+        } catch { /* the daemon hello, or noise before the reply */ }
+      }
+    });
+    socket.on('error', () => done(null));
+    socket.on('close', () => done(null));
+  });
+}
+
+const hooks = program
+  .command('hooks', { hidden: true })
+  .description('Host-agent hook entry points (payload on stdin)');
+
+/**
+ * codegraph hooks post-compact  (hidden)
+ *
+ * PostCompact hook: the context this caller had is gone, so the server's record
+ * of what it was already sent has to go with it — otherwise the next call is
+ * answered with pointers to source the compacted context no longer holds, and
+ * the agent Reads the file.
+ *
+ * Both Claude Code and codex wire this to their PostCompact event, which fires
+ * only once the compacted history has been committed. That is the one moment a
+ * reset is correct: a compaction that failed returns before rewriting anything,
+ * leaving the agent still holding the source the record describes, and a reset
+ * there would throw away a ledger that is still valid. Only `session_id` /
+ * `agent_id` and the payload cwd are read, so either host's payload shape works
+ * unchanged; `hook_event_name` and the rest are ignored.
+ */
+hooks
+  .command('post-compact')
+  .description('Drop this caller context\'s already-sent record after a compact')
+  .option('--path <dir>', 'Project whose daemon to signal (default: the payload cwd)')
+  .option('--session-id <id>', 'Caller context id, when there is no hook payload to derive it from')
+  .action(async (options: { path?: string; sessionId?: string }) => {
+    try {
+      // An explicit --session-id means there is no hook payload to wait for —
+      // a relay caller's stdin may be a pipe that never closes.
+      const payload = options.sessionId?.trim() ? {} : await readHookPayload();
+      const sessionId = options.sessionId?.trim() || hookSessionId(payload);
+      if (!sessionId) return;
+
+      const cwd = options.path || (typeof payload.cwd === 'string' ? payload.cwd : '') || process.cwd();
+      const found = findNearestCodeGraphRoot(cwd);
+      if (!found) return; // nothing indexed here — no daemon can be holding a record
+      // Realpath'd to match how the daemon keys its socket and lockfile: a
+      // symlinked cwd would otherwise resolve to a socket nobody is serving.
+      let root = found;
+      try { root = fs.realpathSync(found); } catch { /* keep the un-resolved path */ }
+
+      const { getDaemonPidPath, getDaemonSocketCandidates, decodeLockInfo } = await import('../mcp/daemon-paths');
+      // The lockfile is authoritative — a daemon that relocated past an
+      // unusable in-project filesystem is bound somewhere the candidate list
+      // only guesses at — but it may be stale or missing, so the candidates
+      // still follow it.
+      const fromLock = (() => {
+        try { return decodeLockInfo(fs.readFileSync(getDaemonPidPath(root), 'utf8'))?.socketPath ?? null; }
+        catch { return null; }
+      })();
+      const candidates = [...new Set([fromLock, ...getDaemonSocketCandidates(root)].filter((c): c is string => !!c))];
+
+      for (const candidate of candidates) {
+        const reply = await sendDaemonControl(candidate, {
+          codegraph_control: 1,
+          op: 'clear-session-record',
+          sessionId,
+        });
+        if (reply?.ok) return;
+      }
+      // No daemon answered. Nothing to reset — a fresh one starts with no record.
+    } catch {
+      // Degradable by contract: never surface an error to the host's hook pipeline.
+    }
+  });
+
+/**
+ * codegraph hooks pre-tool-use  (hidden)
+ *
+ * PreToolUse hook: stamps the calling context's id onto a codegraph_explore
+ * call so the server buckets its already-sent record per context instead of per
+ * connection. Only explore is touched; every other tool passes through
+ * untouched (no stdout at all, which the host reads as "no change").
+ */
+hooks
+  .command('pre-tool-use')
+  .description('Stamp the calling context id onto a codegraph_explore call')
+  .option('--agent <name>', 'Agent whose hook protocol to emit for (an installer target name, e.g. codex)')
+  .action(async (options: { agent?: string }) => {
+    try {
+      const payload = await readHookPayload();
+      const toolName = typeof payload.tool_name === 'string' ? payload.tool_name : '';
+      if (!toolName.includes('codegraph_explore')) return;
+      const sessionId = hookSessionId(payload);
+      if (!sessionId) return;
+      const toolInput = payload.tool_input && typeof payload.tool_input === 'object'
+        ? payload.tool_input as Record<string, unknown>
+        : {};
+      // `permissionDecision` is emitted only for an agent that REQUIRES it.
+      // Codex treats it and `updatedInput` as mutually required and silently
+      // discards an unpaired rewrite, and its decision is inert for approvals
+      // — it gates the rewrite inside the hooks crate and never reaches core
+      // dispatch. Claude Code needs no pairing and ACTS on the field: "allow"
+      // auto-approves, overriding a user who deliberately did not allowlist
+      // codegraph (and explore's `projectPath` reaches any indexed project),
+      // while "ask" would force a prompt on every call even for users who did.
+      // Emitting nothing leaves Claude's own permission flow in charge, which
+      // is the correct output there.
+      //
+      // The agent is declared by the wiring that installed the hook, never
+      // sniffed from the payload: a guess that lands on "allow" is a privilege
+      // escalation, so any other --agent omits the field.
+      const pairsPermissionDecision = options.agent === 'codex';
+      process.stdout.write(`${JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          ...(pairsPermissionDecision ? { permissionDecision: 'allow' } : {}),
+          updatedInput: { ...toolInput, sessionId },
+        },
+      })}\n`);
+    } catch {
+      // Degradable by contract: an un-stamped call still works, it just dedups
+      // against the connection-wide bucket.
     }
   });
 

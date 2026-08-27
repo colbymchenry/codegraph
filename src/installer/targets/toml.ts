@@ -103,6 +103,26 @@ export function upsertTomlTable(
 }
 
 /**
+ * The body lines of an existing dotted-key table, or `null` when the table
+ * isn't there. Uses the same lexer-backed block scan as upsert/remove, so a
+ * bracket inside a string value can't be mistaken for the next table.
+ *
+ * Lets a caller rewrite ONE key of a table it does not own outright, keeping
+ * every sibling key the user or another tool put there.
+ */
+export function readTomlTableBody(fileContent: string, header: string): string[] | null {
+  const headerLine = `[${header}]`;
+  const headerIdx = findHeaderIndex(fileContent, headerLine);
+  if (headerIdx === -1) return null;
+  const blockEnd = findNextTableHeader(fileContent, headerIdx + headerLine.length);
+  return fileContent
+    .substring(headerIdx + headerLine.length, blockEnd)
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter((line) => line.length > 0);
+}
+
+/**
  * Remove a top-level dotted-key TOML table block. Returns the
  * possibly-empty new content + an action flag.
  */

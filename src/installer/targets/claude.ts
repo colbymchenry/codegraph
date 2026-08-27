@@ -28,13 +28,18 @@ import {
   WriteResult,
 } from './types';
 import {
+  codegraphBinary,
   getCodeGraphPermissions,
   getMcpServerConfig,
+  isSessionHookCommand,
   jsonDeepEqual,
+  mergeHookEntries,
+  pruneHookCommands,
   readJsonFile,
   removeMarkedSection,
   writeJsonFile,
   upsertInstructionsEntry,
+  type HookEntry,
 } from './shared';
 import {
   CODEGRAPH_SECTION_END,
@@ -133,6 +138,14 @@ class ClaudeCodeTarget implements AgentTarget {
       if (removed.action === 'removed') files.push(removed);
     }
 
+    // 2d. Per-context session hooks. Unconditional: they are what tells the
+    // server WHICH agent context a call belongs to, and without them the
+    // cross-call dedup record stays keyed per MCP connection — so a subagent,
+    // which dispatches over its parent's, is told source was "already sent" to
+    // a context that never received it. Both hooks are inert to a user who
+    // never triggers them.
+    files.push(writeSessionHookEntries(loc));
+
     // 3. CLAUDE.md instructions — the short marker-fenced CodeGraph
     // block (#704). The MCP initialize instructions reach only the main
     // agent; CLAUDE.md is what Task-tool subagents (and non-MCP
@@ -202,6 +215,10 @@ class ClaudeCodeTarget implements AgentTarget {
     // 2c. Remove the front-load prompt hook this installer may have written.
     const promptHookCleanup = removePromptHookEntry(loc);
     if (promptHookCleanup.action === 'removed') files.push(promptHookCleanup);
+
+    // 2d. Remove the per-context session hooks.
+    const sessionHookCleanup = removeSessionHookEntries(loc);
+    if (sessionHookCleanup.action === 'removed') files.push(sessionHookCleanup);
 
     // 3. Instructions — strip the legacy CodeGraph block if present.
     files.push(removeInstructionsEntry(loc));
@@ -344,33 +361,7 @@ function removeHookCommandsMatching(
     return { path: file, action: 'unchanged' };
   }
 
-  // Pass 1: drop matching command(s) from inside every matcher group.
-  let removedAny = false;
-  for (const event of Object.keys(hooks)) {
-    const groups = hooks[event];
-    if (!Array.isArray(groups)) continue;
-    for (const group of groups) {
-      if (!group || !Array.isArray(group.hooks)) continue;
-      const before = group.hooks.length;
-      group.hooks = group.hooks.filter((h: any) => !match(h?.command));
-      if (group.hooks.length !== before) removedAny = true;
-    }
-  }
-
-  if (!removedAny) return { path: file, action: 'unchanged' };
-
-  // Pass 2: prune empty matcher groups, then events with no groups left,
-  // then an empty top-level `hooks`. Guarded by `removedAny` so we never
-  // restructure a settings.json that had no matching hooks. Sibling hooks
-  // (a different command in the group, or a different event) survive.
-  for (const event of Object.keys(hooks)) {
-    const groups = hooks[event];
-    if (!Array.isArray(groups)) continue;
-    hooks[event] = groups.filter(
-      (g: any) => !(g && Array.isArray(g.hooks) && g.hooks.length === 0),
-    );
-    if (hooks[event].length === 0) delete hooks[event];
-  }
+  if (!pruneHookCommands(hooks, match)) return { path: file, action: 'unchanged' };
   if (Object.keys(hooks).length === 0) delete settings.hooks;
 
   writeJsonFile(file, settings);
@@ -393,6 +384,67 @@ export function cleanupLegacyHooks(loc: Location): WriteResult['files'][number] 
  */
 export function removePromptHookEntry(loc: Location): WriteResult['files'][number] {
   return removeHookCommandsMatching(loc, isPromptHookCommand);
+}
+
+/**
+ * The per-context session hooks, as Claude Code spells them.
+ *
+ * `PreToolUse` stamps the calling agent's id onto a `codegraph_explore` call so
+ * the server's already-sent record is bucketed per agent context rather than
+ * per MCP connection — without it a subagent, which dispatches over its
+ * parent's connection, is told source was "already sent" to a context that
+ * never received it. The matcher is a regex over the tool name, and the MCP
+ * server name is the user's to rename, so it matches the tool SUFFIX rather
+ * than a fixed `mcp__codegraph__` prefix. The command names its agent so the
+ * hook emits Claude's protocol and not another's — here that means NO
+ * `permissionDecision`, since Claude acts on the field and would auto-approve
+ * a call the user's own permission flow should decide.
+ *
+ * `PostCompact` fires once compaction has completed and before the resumed
+ * session's first turn, which is the only moment a reset is correct —
+ * `PreCompact` runs while the agent still holds the source. It covers manual
+ * `/compact` and auto-compact alike, and takes no matcher: events without
+ * matcher support omit the key rather than carrying an empty one.
+ */
+const SESSION_HOOKS: HookEntry[] = [
+  { event: 'PreToolUse', matcher: 'mcp__.*__codegraph_explore', subcommand: 'hooks pre-tool-use --agent claude' },
+  { event: 'PostCompact', subcommand: 'hooks post-compact' },
+];
+
+/**
+ * Wire the per-context session hooks into Claude `settings.json`.
+ *
+ * Surgical: each entry is appended as its own matcher group, so the user's own
+ * hooks — including other groups under the same event — are untouched. An
+ * entry we already wrote is rewritten in place when the binary spelling has
+ * drifted (a moved bundle, a settings.json synced from another platform) and
+ * otherwise left alone, so a re-run on an unchanged file reports `unchanged`
+ * and the bytes never move.
+ */
+export function writeSessionHookEntries(loc: Location): WriteResult['files'][number] {
+  const file = settingsJsonPath(loc);
+  const created = !fs.existsSync(file);
+  const settings = readJsonFile(file);
+
+  if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) {
+    settings.hooks = {};
+  }
+
+  const changed = mergeHookEntries(settings.hooks, SESSION_HOOKS, codegraphBinary());
+
+  if (!changed && !created) return { path: file, action: 'unchanged' };
+  writeJsonFile(file, settings);
+  return { path: file, action: created ? 'created' : 'updated' };
+}
+
+/**
+ * Remove the per-context session hooks this installer writes. Reuses the
+ * command-level surgery `removeHookCommandsMatching` already does: a sibling
+ * hook sharing our event survives, and the structures we created are pruned
+ * only once they are empty.
+ */
+export function removeSessionHookEntries(loc: Location): WriteResult['files'][number] {
+  return removeHookCommandsMatching(loc, isSessionHookCommand);
 }
 
 export function writePermissionsEntry(loc: Location): WriteResult['files'][number] {

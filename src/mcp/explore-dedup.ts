@@ -81,6 +81,27 @@ export function exploreDedupEnabled(): boolean {
 }
 
 /**
+ * Whether the explore schema ADVERTISES its `sessionId` parameter. Off by
+ * default: a host hook's `updatedInput` reaches the server whether or not the
+ * property is declared, so declaring it buys the hook path nothing and only
+ * exposes a knob an agent could set by hand.
+ * `CODEGRAPH_MCP_EXPLORE_SESSION_PARAM=1` declares it for a host that validates
+ * arguments against the schema, or a harness that passes it as an explicit tool
+ * argument. `MCP_`-prefixed like `CODEGRAPH_MCP_TOOLS`, because it shapes the
+ * MCP surface only — unlike the `CODEGRAPH_EXPLORE_*` family, which changes
+ * behaviour everywhere.
+ *
+ * The HANDLER accepts `sessionId` either way — this gates the advertisement
+ * alone, never the bucketing. Read per call (not memoized) so a test can toggle it.
+ */
+export function exploreSessionParamAdvertised(): boolean {
+  const raw = process.env.CODEGRAPH_MCP_EXPLORE_SESSION_PARAM;
+  if (raw === undefined) return false;
+  const value = raw.trim().toLowerCase();
+  return value !== '' && !OFF.has(value);
+}
+
+/**
  * Identity of the bytes a call served for one file.
  *
  * This — not the index's drift flag — is what gates dedup. `isFileStaleOnDisk`

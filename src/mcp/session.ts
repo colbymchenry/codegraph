@@ -159,6 +159,15 @@ export class MCPSession {
     return this.exploreSession;
   }
 
+  /**
+   * Forget one caller context's explore history (the daemon's control line
+   * relays a host hook's compact/subagent-teardown reset). Narrow on purpose:
+   * the daemon selects buckets, it never handles the state itself.
+   */
+  clearSessionRecord(sessionId: string): number {
+    return this.exploreSession.clearSessionRecord(sessionId);
+  }
+
   private async handleMessage(message: JsonRpcRequest | JsonRpcNotification): Promise<void> {
     const isRequest = 'id' in message;
     switch (message.method) {

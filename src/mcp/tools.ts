@@ -47,6 +47,7 @@ import {
   EXPLORE_EMISSION_KEY,
   EXPLORE_SESSION_VIEW_ARG,
   ExploreSessionState,
+  normalizeExploreSessionId,
   readExploreSessionView,
   viewForProject,
   type ExploreEmission,
@@ -57,6 +58,7 @@ import {
   EXPLORE_DEDUP,
   dedupeRange,
   exploreDedupEnabled,
+  exploreSessionParamAdvertised,
   fileFingerprint,
   formatBackReference,
   mergeRanges,
@@ -1280,6 +1282,32 @@ function withRequiredProjectPath(defs: ToolDefinition[]): ToolDefinition[] {
 }
 
 /**
+ * Declare explore's `sessionId` parameter, when the host needs it declared to
+ * let it through (see {@link exploreSessionParamAdvertised}). Applied where tool
+ * definitions are SERVED, not at module load, so the env var can be toggled for
+ * one server without rebuilding the static list.
+ */
+function withSessionIdParam(defs: ToolDefinition[]): ToolDefinition[] {
+  if (!exploreSessionParamAdvertised()) return defs;
+  return defs.map((tool) => {
+    if (tool.name !== 'codegraph_explore') return tool;
+    return {
+      ...tool,
+      inputSchema: {
+        ...tool.inputSchema,
+        properties: {
+          ...tool.inputSchema.properties,
+          sessionId: {
+            type: 'string',
+            description: 'Caller-context id, injected by the host\'s hooks — not set manually.',
+          },
+        },
+      },
+    };
+  });
+}
+
+/**
  * Allowlist-filtered tool definitions WITHOUT an engine — the static surface the
  * proxy answers `tools/list` with before any project is open. Mirrors
  * `ToolHandler.getTools()` in the no-CodeGraph case (the dynamic per-repo budget
@@ -1288,10 +1316,10 @@ function withRequiredProjectPath(defs: ToolDefinition[]): ToolDefinition[] {
 export function getStaticTools(): ToolDefinition[] {
   const raw = process.env.CODEGRAPH_MCP_TOOLS;
   if (!raw || !raw.trim()) {
-    return tools.filter(t => DEFAULT_MCP_TOOLS.has(t.name.replace(/^codegraph_/, '')));
+    return withSessionIdParam(tools.filter(t => DEFAULT_MCP_TOOLS.has(t.name.replace(/^codegraph_/, ''))));
   }
   const allow = new Set(raw.split(',').map(s => s.trim().replace(/^codegraph_/, '')).filter(Boolean));
-  return allow.size ? tools.filter(t => allow.has(t.name.replace(/^codegraph_/, ''))) : tools;
+  return withSessionIdParam(allow.size ? tools.filter(t => allow.has(t.name.replace(/^codegraph_/, ''))) : tools);
 }
 
 /**
@@ -1484,9 +1512,9 @@ export class ToolHandler {
     // No explicit allowlist → the default 4-tool surface (see
     // DEFAULT_MCP_TOOLS for the evidence). An allowlist replaces the
     // default entirely, so any defined tool can be re-enabled.
-    let visible = allow
+    let visible = withSessionIdParam(allow
       ? tools.filter(t => allow.has(t.name.replace(/^codegraph_/, '')))
-      : tools.filter(t => DEFAULT_MCP_TOOLS.has(t.name.replace(/^codegraph_/, '')));
+      : tools.filter(t => DEFAULT_MCP_TOOLS.has(t.name.replace(/^codegraph_/, ''))));
     // No default project loaded → no-root-index case (#993): a gateway server
     // started outside any repo, or a monorepo root whose indexes live in
     // sub-projects. With nothing to fall back to, EVERY call needs an explicit
@@ -2023,14 +2051,20 @@ export class ToolHandler {
       // object down, on the ToolResult up — because either leg may cross a
       // structured-clone boundary into a worker, where a closure or a handler
       // field could not follow.
-      const dispatchArgs = this.withSessionView(toolName, args, sessionState);
+      // One MCP connection can carry several agent contexts (Claude Code
+      // subagents dispatch over the parent's), so the session record is bucketed
+      // by the caller id a host hook injects. Derived ONCE and threaded to both
+      // the read and the write side: a call must record into the same bucket it
+      // was answered from. CLIENT-CONTROLLED — an opaque bucket label only.
+      const exploreSessionId = normalizeExploreSessionId(args.sessionId);
+      const dispatchArgs = this.withSessionView(toolName, args, sessionState, exploreSessionId);
       const raw = (this.queryPool && this.queryPool.healthy && this.queryPool.ready)
         ? await this.queryPool.run(toolName, dispatchArgs)
         : await this.executeReadTool(toolName, dispatchArgs);
       // Record + STRIP before anything else touches the result: the emission is
       // internal bookkeeping and must never reach the client, whether or not a
       // caller passed session state.
-      const result = this.takeExploreEmission(raw, sessionState);
+      const result = this.takeExploreEmission(raw, sessionState, exploreSessionId);
       const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
       return this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
     } catch (err) {
@@ -2066,6 +2100,7 @@ export class ToolHandler {
     toolName: string,
     args: Record<string, unknown>,
     sessionState: ExploreSessionState | undefined,
+    sessionId?: string,
   ): Record<string, unknown> {
     if (!(EXPLORE_SESSION_VIEW_ARG in args) && (!sessionState || toolName !== 'codegraph_explore')) {
       return args;
@@ -2073,7 +2108,10 @@ export class ToolHandler {
     const copy = { ...args };
     delete copy[EXPLORE_SESSION_VIEW_ARG];
     if (sessionState && toolName === 'codegraph_explore') {
-      copy[EXPLORE_SESSION_VIEW_ARG] = sessionState.view();
+      // Only this caller's bucket: what a sibling context was served is not
+      // this one's to be told it already holds. `sessionId` itself stays on the
+      // args — declared or not, dispatch ignores it.
+      copy[EXPLORE_SESSION_VIEW_ARG] = sessionState.view(sessionId);
     }
     return copy;
   }
@@ -2091,13 +2129,14 @@ export class ToolHandler {
   private takeExploreEmission(
     result: ToolResult,
     sessionState: ExploreSessionState | undefined,
+    sessionId?: string,
   ): ToolResult {
     const emission = result?.[EXPLORE_EMISSION_KEY];
     if (emission === undefined) return result;
     delete result[EXPLORE_EMISSION_KEY];
     if (sessionState) {
       try {
-        sessionState.record(emission);
+        sessionState.record(emission, sessionId);
       } catch { /* bookkeeping only — never fail a served call */ }
     }
     return result;
