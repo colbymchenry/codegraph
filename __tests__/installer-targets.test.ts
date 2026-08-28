@@ -40,6 +40,7 @@ function setHome(dir: string): { restore: () => void } {
     XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
     HERMES_HOME: process.env.HERMES_HOME,
     COPILOT_HOME: process.env.COPILOT_HOME,
+    CODEX_HOME: process.env.CODEX_HOME,
   };
   process.env.HOME = dir;
   process.env.USERPROFILE = dir;
@@ -47,6 +48,7 @@ function setHome(dir: string): { restore: () => void } {
   process.env.XDG_CONFIG_HOME = path.join(dir, '.config');
   delete process.env.HERMES_HOME;
   delete process.env.COPILOT_HOME;
+  delete process.env.CODEX_HOME;
   return {
     restore() {
       if (prev.HOME === undefined) delete process.env.HOME; else process.env.HOME = prev.HOME;
@@ -55,6 +57,7 @@ function setHome(dir: string): { restore: () => void } {
       if (prev.XDG_CONFIG_HOME === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = prev.XDG_CONFIG_HOME;
       if (prev.HERMES_HOME === undefined) delete process.env.HERMES_HOME; else process.env.HERMES_HOME = prev.HERMES_HOME;
       if (prev.COPILOT_HOME === undefined) delete process.env.COPILOT_HOME; else process.env.COPILOT_HOME = prev.COPILOT_HOME;
+      if (prev.CODEX_HOME === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prev.CODEX_HOME;
     },
   };
 }
@@ -2479,5 +2482,89 @@ describe('Installer targets — Copilot family', () => {
     expect(cli.detect('global').alreadyConfigured).toBe(false);
     expect(vscode.detect('global').alreadyConfigured).toBe(true);
     expect(jetbrains.detect('global').alreadyConfigured).toBe(true);
+  });
+});
+
+describe('Installer targets — Codex CODEX_HOME override (#1627)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('home');
+    tmpCwd = mkTmpDir('cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  const defaultDir = () => path.join(tmpHome, '.codex');
+
+  it('global install writes to $CODEX_HOME, not ~/.codex', () => {
+    const custom = path.join(tmpHome, 'codex-profile');
+    process.env.CODEX_HOME = custom;
+
+    const codex = getTarget('codex')!;
+    const result = codex.install('global', { autoAllow: false });
+
+    const toml = result.files.find((f) => f.path.endsWith('config.toml'))!;
+    expect(path.resolve(toml.path)).toBe(path.resolve(path.join(custom, 'config.toml')));
+    expect(fs.readFileSync(path.join(custom, 'config.toml'), 'utf-8')).toContain('[mcp_servers.codegraph]');
+    // The global AGENTS.md follows the config dir.
+    expect(fs.existsSync(path.join(custom, 'AGENTS.md'))).toBe(true);
+    // Nothing of ours may land in the default profile Codex is not reading.
+    expect(fs.existsSync(defaultDir())).toBe(false);
+  });
+
+  it('detect and uninstall follow $CODEX_HOME too', () => {
+    const custom = path.join(tmpHome, 'codex-profile');
+    process.env.CODEX_HOME = custom;
+    const codex = getTarget('codex')!;
+
+    expect(codex.detect('global').alreadyConfigured).toBe(false);
+    codex.install('global', { autoAllow: false });
+
+    const detected = codex.detect('global');
+    expect(detected.alreadyConfigured).toBe(true);
+    expect(path.resolve(detected.configPath!)).toBe(path.resolve(path.join(custom, 'config.toml')));
+
+    const removed = codex.uninstall('global');
+    expect(path.resolve(removed.files.find((f) => f.path.endsWith('config.toml'))!.path))
+      .toBe(path.resolve(path.join(custom, 'config.toml')));
+    // Our table was the only content, so the file goes with it.
+    expect(fs.existsSync(path.join(custom, 'config.toml'))).toBe(false);
+  });
+
+  it('falls back to ~/.codex when CODEX_HOME is unset or blank', () => {
+    const codex = getTarget('codex')!;
+    codex.install('global', { autoAllow: false });
+    expect(fs.existsSync(path.join(defaultDir(), 'config.toml'))).toBe(true);
+
+    fs.rmSync(defaultDir(), { recursive: true, force: true });
+    process.env.CODEX_HOME = '   '; // set-but-empty must not become the config dir
+    codex.install('global', { autoAllow: false });
+    expect(fs.existsSync(path.join(defaultDir(), 'config.toml'))).toBe(true);
+  });
+
+  it('leaves the local install alone — CODEX_HOME is the user layer only (#1531)', () => {
+    const custom = path.join(tmpHome, 'codex-profile');
+    process.env.CODEX_HOME = custom;
+
+    const codex = getTarget('codex')!;
+    const result = codex.install('local', { autoAllow: false });
+
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    expect(paths.some((p) => p.endsWith('/.codex/config.toml'))).toBe(true);
+    expect(fs.existsSync(path.join(process.cwd(), '.codex', 'config.toml'))).toBe(true);
+    // The project layer lives beside the project, never under the user profile.
+    expect(fs.existsSync(path.join(custom, 'config.toml'))).toBe(false);
   });
 });
