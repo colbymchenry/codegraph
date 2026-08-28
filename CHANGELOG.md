@@ -251,6 +251,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Fixed a long-running `codegraph ui` session serving a symbol that a sync had already deleted. The viewer keeps one connection to your index open, and its in-memory lookup didn't notice when another process — your agent's sync, or `codegraph sync` — rewrote the file underneath it, so a symbol screen could keep showing a body with no callers while search correctly reported it had moved. Because a symbol's identity includes the line it starts on, this happened after almost any edit above it.
 
+- Python calls made through a renamed import are no longer missing from the graph. After `from package import module as alias`, a call like `alias.func()` produced no call edge, so `codegraph_callers` could report a function as uncalled while a live caller reached it under the alias — the same wrong answer to "is this dead code?" that the unaliased form used to give. Thanks @JoeyNPP. (#1626)
+
 ## [1.6.0] - 2026-08-26
 
 ### Highlights
