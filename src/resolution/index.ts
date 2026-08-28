@@ -26,6 +26,7 @@ import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { loadGoModule, type GoModule } from './go-module';
 import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
+import { lexicalPathWithinRoot } from '../utils';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
 
@@ -538,8 +539,18 @@ export class ReferenceResolver {
             return true;
           }
         }
-        // Fall back to filesystem for files not yet indexed
-        const fullPath = path.join(this.projectRoot, filePath);
+        // Fall back to filesystem for files not yet indexed. `path.join` does
+        // not clamp, and relative-import resolution hands us paths carrying
+        // `../` segments, so the probe has to be contained (#1631): a path
+        // outside the root can never be an indexed project file, and the
+        // `knownFiles` check above already answered for everything that is.
+        // Lexical containment only: this is a per-candidate hot path, and the
+        // symlink half of `validatePathWithinRoot` costs two `realpathSync`
+        // calls per probe (~70x slower here). It would also be wrong to apply
+        // — indexing deliberately follows in-root symlinks whose targets live
+        // outside the root (#935), so only the `../` escape is refused.
+        const fullPath = lexicalPathWithinRoot(this.projectRoot, filePath);
+        if (fullPath === null) return false;
         try {
           return fs.existsSync(fullPath);
         } catch (error) {
