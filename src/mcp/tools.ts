@@ -122,6 +122,12 @@ const CONTAINER_NODE_KINDS = new Set<NodeKind>([
   'class', 'struct', 'union', 'interface', 'trait', 'protocol', 'enum', 'namespace', 'module',
 ]);
 
+/** Normalize engine/framework path aliases users commonly type into tools. */
+function normalizeSymbolQuery(symbol: string): string {
+  if (symbol.startsWith('res://')) return symbol.slice('res://'.length);
+  return symbol;
+}
+
 /**
  * Last `::` / `.` / `/`-separated segment of a qualified symbol. An Erlang
  * arity tail (`mod::fn/3`, `fn/3`) is stripped first — the useful last segment
@@ -129,6 +135,8 @@ const CONTAINER_NODE_KINDS = new Set<NodeKind>([
  */
 function lastQualifierPart(symbol: string): string {
   const noArity = symbol.replace(/\/\d{1,3}$/, '') || symbol;
+  const slashIndex = noArity.lastIndexOf('/');
+  if (slashIndex >= 0) return noArity.slice(slashIndex + 1);
   const parts = noArity.split(/::|[./]/).filter((p) => p.length > 0);
   return parts[parts.length - 1] ?? symbol;
 }
@@ -2259,6 +2267,10 @@ export class ToolHandler {
       const callers: Node[] = [];
       const labels = new Map<string, string>();
       for (const node of defNodes) {
+        if (this.isGodotSceneInstanceComponent(node) && !seen.has(node.id)) {
+          seen.add(node.id);
+          callers.push(node);
+        }
         for (const c of cg.getCallers(node.id)) {
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
@@ -2304,6 +2316,13 @@ export class ToolHandler {
       }
     }
     return this.textResult(this.truncateOutput(lines.join('\n') + filterNote));
+  }
+
+  private isGodotSceneInstanceComponent(node: Node): boolean {
+    return node.kind === 'component'
+      && node.language === 'godot_resource'
+      && node.filePath.endsWith('.tscn')
+      && (node.signature ?? '').includes('instance=ExtResource');
   }
 
   /**
@@ -6728,21 +6747,25 @@ export class ToolHandler {
    *      Python — `stage_apply::run` matches a `run` in `stage_apply.rs`)
    */
   private matchesSymbol(node: Node, symbol: string): boolean {
+    symbol = normalizeSymbolQuery(symbol);
+
     // Erlang arity spelling (`fn/3`, `mod:fn/3` → normalized `mod.fn/3`): when
     // the node's qualifiedName carries an arity (`mod::fn/3`, #1610), the
     // written arity must match it exactly; the remaining comparison then runs
     // on the arity-less spelling. A node with no arity in its qualifiedName
     // keeps the original symbol (a `/` there means a path-ish name instead).
-    const aritySpelling = /^(.+)\/(\d{1,3})$/.exec(symbol);
-    if (aritySpelling) {
-      const nodeArity = /\/(\d{1,3})$/.exec(node.qualifiedName ?? '')?.[1];
-      if (nodeArity !== undefined) {
-        if (nodeArity !== aritySpelling[2]) return false;
-        symbol = aritySpelling[1]!;
-      }
+  const aritySpelling = /^(.+)\/(\d{1,3})$/.exec(symbol);
+  if (aritySpelling) {
+    const nodeArity = /\/(\d{1,3})$/.exec(node.qualifiedName ?? '')?.[1];
+    if (nodeArity !== undefined) {
+      if (nodeArity !== aritySpelling[2]) return false;
+      symbol = aritySpelling[1]!;
     }
+  }
     // Simple name match
     if (node.name === symbol) return true;
+    // File path match (e.g., Godot `res://runtime/run_state.gd`)
+    if (node.kind === 'file' && (node.filePath === symbol || node.qualifiedName === symbol)) return true;
     // File basename match (e.g., "product-card" matches "product-card.liquid")
     if (node.kind === 'file' && node.name.replace(/\.[^.]+$/, '') === symbol) return true;
 
@@ -6840,6 +6863,8 @@ export class ToolHandler {
    * results across all matching symbols (e.g., multiple classes with an `execute` method).
    */
   private findAllSymbols(cg: CodeGraph, symbol: string): { nodes: Node[]; note: string } {
+    const normalizedSymbol = normalizeSymbolQuery(symbol);
+
     // Nix option paths: the declaration is stored as `options.<path>` and
     // config writes carry longer/quoted tails (`<path>."git/config".text`),
     // so a dotted option token (`xdg.configFile`, `launchd.user.agents`) has
@@ -6848,11 +6873,11 @@ export class ToolHandler {
     // convention directly: declaration first, then the exact write, then a
     // capped prefix scan of write sites. Three index hits; non-nix graphs
     // fall straight through.
-    if (/^[a-z][\w'-]*(?:\.[\w'-]+)+$/.test(symbol)) {
+    if (/^[a-z][\w'-]*(?:\.[\w'-]+)+$/.test(normalizedSymbol)) {
       const optionHits = [
-        ...cg.getNodesByName(`options.${symbol}`),
-        ...cg.getNodesByName(symbol),
-        ...cg.getNodesByNamePrefix(`${symbol}.`, 12),
+        ...cg.getNodesByName(`options.${normalizedSymbol}`),
+        ...cg.getNodesByName(normalizedSymbol),
+        ...cg.getNodesByNamePrefix(`${normalizedSymbol}.`, 12),
       ].filter((n) => n.language === 'nix');
       if (optionHits.length > 0) {
         const seen = new Set<string>();
@@ -6860,21 +6885,21 @@ export class ToolHandler {
         return { nodes, note: '' };
       }
     }
-    let results = cg.searchNodes(symbol, { limit: 50 });
+    let results = cg.searchNodes(normalizedSymbol, { limit: 50 });
 
     // Mirror the fallback in `findSymbol` for qualified queries — FTS
     // strips colons, so a module-qualified lookup needs a second pass
     // by the bare last part.
-    if (results.length === 0 && /[.\/]|::/.test(symbol)) {
-      const tail = lastQualifierPart(symbol);
-      if (tail && tail !== symbol) results = cg.searchNodes(tail, { limit: 50 });
+    if (results.length === 0 && /[.\/]|::/.test(normalizedSymbol)) {
+      const tail = lastQualifierPart(normalizedSymbol);
+      if (tail && tail !== normalizedSymbol) results = cg.searchNodes(tail, { limit: 50 });
     }
 
     if (results.length === 0) {
       return { nodes: [], note: '' };
     }
 
-    const exactMatches = results.filter(r => this.matchesSymbol(r.node, symbol));
+    const exactMatches = results.filter(r => this.matchesSymbol(r.node, normalizedSymbol));
 
     if (exactMatches.length <= 1) {
       const node = exactMatches[0]?.node ?? results[0]!.node;

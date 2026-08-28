@@ -102,6 +102,8 @@ export const LANGUAGES = [
   'scala',
   'lua',
   'luau',
+  'gdscript',
+  'godot_resource',
   'objc',
   'r',
   'solidity',

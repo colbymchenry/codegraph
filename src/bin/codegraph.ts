@@ -76,6 +76,56 @@ async function loadCodeGraph(): Promise<typeof import('../index')> {
 // Dynamic import helper — tsc compiles import() to require() in CJS mode,
 // which fails for ESM-only packages. This bypasses the transformation.
 // eslint-disable-next-line @typescript-eslint/no-implied-eval
+function normalizeSymbolQuery(symbol: string): string {
+  if (symbol.startsWith('res://')) return symbol.slice('res://'.length);
+  return symbol;
+}
+
+function lastSymbolQueryPart(symbol: string): string {
+  const slashIndex = symbol.lastIndexOf('/');
+  if (slashIndex >= 0) return symbol.slice(slashIndex + 1);
+  const parts = symbol.split(/::|[./]/).filter((p) => p.length > 0);
+  return parts[parts.length - 1] ?? symbol;
+}
+
+type CliSearchNode = {
+  id: string;
+  name: string;
+  kind: string;
+  filePath: string;
+  qualifiedName: string;
+  startLine?: number;
+  signature?: string;
+  language?: string;
+};
+
+function nodeMatchesSymbol(node: CliSearchNode, symbol: string): boolean {
+  const normalizedSymbol = normalizeSymbolQuery(symbol);
+  if (node.name === normalizedSymbol) return true;
+  if (node.kind === 'file' && (node.filePath === normalizedSymbol || node.qualifiedName === normalizedSymbol)) return true;
+  if (node.kind === 'file' && node.name.replace(/\.[^.]+$/, '') === normalizedSymbol) return true;
+  return node.name.endsWith(`.${normalizedSymbol}`) || node.name.endsWith(`::${normalizedSymbol}`);
+}
+
+function findCliSymbolMatches(
+  cg: { searchNodes: (query: string, options: { limit: number }) => Array<{ node: CliSearchNode }> },
+  symbol: string
+) {
+  const normalizedSymbol = normalizeSymbolQuery(symbol);
+  let matches = cg.searchNodes(normalizedSymbol, { limit: 50 });
+  if (matches.length === 0 && /[.\/]|::/.test(normalizedSymbol)) {
+    const tail = lastSymbolQueryPart(normalizedSymbol);
+    if (tail && tail !== normalizedSymbol) matches = cg.searchNodes(tail, { limit: 50 });
+  }
+  const exactMatches = matches.filter((match) => nodeMatchesSymbol(match.node, normalizedSymbol));
+  return exactMatches.length > 0 ? exactMatches : matches;
+}
+
+function isGodotSceneInstanceComponent(node: CliSearchNode): boolean {
+  const signature = 'signature' in node && typeof node.signature === 'string' ? node.signature : '';
+  return node.kind === 'component' && node.language === 'godot_resource' && node.filePath.endsWith('.tscn') && signature.includes('instance=ExtResource');
+}
+
 const importESM = new Function('specifier', 'return import(specifier)') as
   (specifier: string) => Promise<typeof import('@clack/prompts')>;
 
@@ -1957,7 +2007,7 @@ program
       const cg = await CodeGraph.open(projectPath);
       const limit = parseInt(options.limit || '20', 10);
 
-      const matches = cg.searchNodes(symbol, { limit: 50 });
+      const matches = findCliSymbolMatches(cg, symbol);
       if (matches.length === 0) {
         info(`Symbol "${symbol}" not found`);
         cg.destroy();
@@ -1968,8 +2018,12 @@ program
       const allCallers: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
 
       for (const match of matches) {
-        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
+        const exactMatch = nodeMatchesSymbol(match.node, symbol);
         if (!exactMatch && matches.length > 1) continue;
+        if (exactMatch && isGodotSceneInstanceComponent(match.node) && !seen.has(match.node.id)) {
+          seen.add(match.node.id);
+          allCallers.push({ name: match.node.name, kind: match.node.kind, filePath: match.node.filePath, startLine: match.node.startLine });
+        }
         for (const c of cg.getCallers(match.node.id)) {
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
@@ -2036,7 +2090,7 @@ program
       const cg = await CodeGraph.open(projectPath);
       const limit = parseInt(options.limit || '20', 10);
 
-      const matches = cg.searchNodes(symbol, { limit: 50 });
+      const matches = findCliSymbolMatches(cg, symbol);
       if (matches.length === 0) {
         info(`Symbol "${symbol}" not found`);
         cg.destroy();
@@ -2047,7 +2101,7 @@ program
       const allCallees: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
 
       for (const match of matches) {
-        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
+        const exactMatch = nodeMatchesSymbol(match.node, symbol);
         if (!exactMatch && matches.length > 1) continue;
         for (const c of cg.getCallees(match.node.id)) {
           if (!seen.has(c.node.id)) {
@@ -2114,7 +2168,7 @@ program
       const cg = await CodeGraph.open(projectPath);
       const depth = Math.min(Math.max(parseInt(options.depth || '2', 10), 1), 10);
 
-      const matches = cg.searchNodes(symbol, { limit: 50 });
+      const matches = findCliSymbolMatches(cg, symbol);
       if (matches.length === 0) {
         info(`Symbol "${symbol}" not found`);
         cg.destroy();
@@ -2127,7 +2181,7 @@ program
       let edgeCount = 0;
 
       for (const match of matches) {
-        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
+        const exactMatch = nodeMatchesSymbol(match.node, symbol);
         if (!exactMatch && matches.length > 1) continue;
         const impact = cg.getImpactRadius(match.node.id, depth);
         for (const [id, n] of impact.nodes) {

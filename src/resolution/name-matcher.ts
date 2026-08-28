@@ -42,16 +42,17 @@ export function matchByFilePath(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  const referencePath = normalizePathReference(ref.referenceName);
   // Path-like (`a/b.liquid`) OR a bare filename ending in a short extension
   // (`Foo.h` — an Objective-C `#import "Foo.h"`, resolved to the header by
   // basename). A bare ref WITHOUT an extension is a symbol name, not a file, so
   // leave it to the symbol-matching strategies.
-  if (!ref.referenceName.includes('/') && !/\.[A-Za-z][A-Za-z0-9]{0,3}$/.test(ref.referenceName)) {
+  if (!referencePath.includes('/') && !/\.[A-Za-z][A-Za-z0-9]{0,3}$/.test(referencePath)) {
     return null;
   }
 
   // Extract the filename from the path
-  const fileName = ref.referenceName.split('/').pop();
+  const fileName = referencePath.split('/').pop();
   if (!fileName) return null;
 
   // Search for file nodes with this name
@@ -61,7 +62,7 @@ export function matchByFilePath(
   if (fileNodes.length === 0) return null;
 
   // Prefer exact path match on qualified_name
-  const exactMatch = fileNodes.find(n => n.qualifiedName === ref.referenceName || n.filePath === ref.referenceName);
+  const exactMatch = fileNodes.find(n => n.qualifiedName === referencePath || n.filePath === referencePath);
   if (exactMatch) {
     return {
       original: ref,
@@ -79,7 +80,7 @@ export function matchByFilePath(
   // bare-filename import) resolves relative to the including file, not to an
   // arbitrary same-named header elsewhere in the tree.
   const suffixMatches = fileNodes.filter(
-    n => n.qualifiedName.endsWith(ref.referenceName) || n.filePath.endsWith(ref.referenceName)
+    n => n.qualifiedName.endsWith(referencePath) || n.filePath.endsWith(referencePath)
   );
   if (suffixMatches.length > 0) {
     return {
@@ -101,6 +102,11 @@ export function matchByFilePath(
   }
 
   return null;
+}
+
+function normalizePathReference(referenceName: string): string {
+  if (referenceName.startsWith('res://')) return referenceName.slice('res://'.length);
+  return referenceName;
 }
 
 /**
@@ -147,6 +153,10 @@ const LANGUAGE_FAMILY: Record<string, string> = {
   // Razor/Blazor markup names C# types — same family so `@model Foo` /
   // `<MyComponent/>` resolve to their `.cs` class through the cross-family gate.
   csharp: 'dotnet', razor: 'dotnet',
+  // A GDScript node-path reference (`$MarginContainer/StatusIconTemplate`)
+  // names a node declared in a `.tscn` scene — same family so it resolves
+  // through the cross-family gate instead of being dropped as unrelated.
+  gdscript: 'godot', godot_resource: 'godot',
 };
 export function sameLanguageFamily(a: string, b: string): boolean {
   if (a === b) return true;
@@ -457,8 +467,8 @@ export function matchByQualifiedName(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
-  // Check if the reference name looks qualified (contains :: or .)
-  if (!ref.referenceName.includes('::') && !ref.referenceName.includes('.')) {
+  // Check if the reference name looks qualified (contains ::, ., or a path segment)
+  if (!ref.referenceName.includes('::') && !ref.referenceName.includes('.') && !ref.referenceName.includes('/')) {
     return null;
   }
 
@@ -534,7 +544,10 @@ export function matchByQualifiedName(
 
   // Try partial qualified name match — again preferring the call site's own
   // file when more than one symbol's qualifiedName ends with the reference.
-  const parts = ref.referenceName.split(/[:.]/);
+  // Upstream and local path-segment styles: use dot for module-like refs,
+  // slash for path-like imports (`pkg/path::fn`) that should still
+  // prefer same-file matches before arity-only fallbacks.
+  const parts = ref.referenceName.split(/[:./]/);
   const lastName = parts[parts.length - 1];
   if (lastName) {
     const partialCandidates = keepForRef(context.getNodesByName(lastName))

@@ -54,6 +54,7 @@ calls; a grep/read exploration is dozens.
 - **Almost any question — "how does X work", architecture, a bug, "what/where is X", or surveying an area** → \`codegraph_explore\` with a natural-language question or the relevant names. ONE capped call returns the verbatim source grouped by file; most often the ONLY call you need.
 - **"How does X reach/become Y? / the flow / the path from X to Y"** → \`codegraph_explore\`, naming the symbols that span the flow (e.g. \`mutateElement renderScene\`) — it surfaces the call path among them, riding dynamic-dispatch hops, and returns their source.
 - **Reading or editing a file/symbol you can name** → put its name or file path in the \`codegraph_explore\` query — it returns that current line-numbered source (safe to \`Edit\` from) with the call path and blast radius attached, so you don't Read it separately. For an overloaded name it returns every matching definition's body in one call.
+- **Godot projects** — \`res://...\` resource paths and scene node names are valid query targets too: \`codegraph_explore\` resolves them alongside regular symbols.
 - **Need more?** Call \`codegraph_explore\` again with more specific names — treat the source it returns as already Read.
 
 ## Anti-patterns
