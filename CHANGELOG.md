@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Go calls made through a package-level accessor — `service.Order().Create(...)`, the shape `gf gen service` generates for every GoFrame project — now resolve to the method the accessor's return type actually declares. Previously the chain was dropped while reading the code and only the method name was matched, so any same-named method on an unrelated type could win. In a layered Go app, where the controller, the service interface, and the implementation deliberately share one method name, the call landed on the controller: the path from a route down to the business logic was never joined up, and blast radius credited the implementation's tests to the wrong function. An accessor returning an interface now lands on the interface's method, which the dynamic-dispatch pass already bridges to the implementation. Instance chains (`obj.Method().Other()`), whose receiver type isn't recoverable, keep the name-based behaviour they had.
+
 
 ## [1.6.0] - 2026-08-26
 
