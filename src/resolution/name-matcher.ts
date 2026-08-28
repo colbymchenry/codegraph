@@ -914,6 +914,54 @@ function lookupCalleeReturnType(
   return candidates.find((n) => n.kind === 'function')?.returnType ?? null;
 }
 
+/**
+ * Go: the declared return type of a package-qualified factory — `pkg.Factory()`.
+ *
+ * Go package-level functions are indexed with a BARE qualifiedName (`Order`, not
+ * `service.Order`), so the `Class::method` lookup that serves the dot-notation
+ * languages can never match `service::Order`. A dotted prefix at a Go call site
+ * is a PACKAGE qualifier, not a receiver type (Go has no `Class.staticMethod()`
+ * form), so resolve it as one: among the package-level functions sharing the
+ * factory's name, prefer those declared in the qualifying package's directory.
+ * Ambiguity — several plausible candidates disagreeing on their return type —
+ * yields null, so a guess produces no edge rather than a wrong one (#750).
+ */
+function lookupGoPackageFuncReturnType(
+  pkg: string,
+  funcName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  const candidates = context
+    .getNodesByName(funcName)
+    .filter((n) => n.kind === 'function' && n.language === 'go' && !!n.returnType);
+  if (candidates.length === 0) return null;
+  // `pkg` is the name at the CALL SITE, which an alias detaches from the
+  // directory (`ctrlcart "app/internal/controller/order/cart"`). Map it back
+  // through the file's imports; a plain import maps to itself. A package whose
+  // name differs from its directory (legal) is covered too — the import PATH is
+  // what's matched, never the package clause.
+  const importPath =
+    context.getImportMappings(ref.filePath, ref.language).find((i) => i.localName === pkg)
+      ?.source ?? pkg;
+  // Go requires one package per directory, so the import path's tail IS the
+  // declaring directory. Match the longest tail available — the candidate's full
+  // directory path — which separates same-named packages under different parents.
+  const byDir = candidates.filter((n) => {
+    const dir = goDirOf(n.filePath);
+    return dir.length > 0 && (importPath === dir || importPath.endsWith(`/${dir}`));
+  });
+  const pool = byDir.length > 0 ? byDir : candidates;
+  const types = new Set(pool.map((n) => n.returnType!));
+  return types.size === 1 ? (pool[0]!.returnType ?? null) : null;
+}
+
+/** The directory path a file lives in — the package scope for Go. */
+function goDirOf(filePath: string): string {
+  const i = filePath.lastIndexOf('/');
+  return i > 0 ? filePath.slice(0, i) : '';
+}
+
 /** Does the graph contain an aggregate type named `name`'s last segment? */
 function cppClassExists(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const last = cppLastSegment(name);
@@ -1108,6 +1156,22 @@ export function matchDottedCallChain(
     // whose type we can't recover — bail.
     if (!CONSTRUCTS_VIA_BARE_CALL.has(ref.language) || !/^[A-Z]/.test(inner)) return null;
     return resolveMethodOnType(inner, method, ref, context, 0.85, 'instance-method', importedFqnOf(inner, ref, context));
+  }
+
+  // Go: `pkg.Factory().Method()`. The dotted prefix is a package qualifier, so
+  // the `Class::method` lookup below can never match it; resolve the factory as a
+  // package-level function instead and VALIDATE the method on its declared return
+  // type. An interface return (`func Order() IOrder` — the `gf gen service`
+  // accessor every GoFrame app has) lands on the interface's method, which the
+  // dynamic-dispatch pass already bridges to the implementation, closing the
+  // caller -> interface -> impl chain. Without this the ref falls through to the
+  // bare-name fallback, which matches any same-named method on an unrelated type.
+  if (ref.language === 'go') {
+    const pkgName = inner.slice(0, lastDot).split('.').pop()!;
+    const factoryFn = inner.slice(lastDot + 1);
+    const goRet = lookupGoPackageFuncReturnType(pkgName, factoryFn, ref, context);
+    if (!goRet) return null;
+    return resolveMethodOnType(goRet, method, ref, context, 0.85, 'instance-method', importedFqnOf(goRet, ref, context));
   }
 
   // Factory/fluent receiver `Receiver.factory(args).method()`: the receiver's

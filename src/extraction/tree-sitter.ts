@@ -396,6 +396,51 @@ export class TreeSitterExtractor {
   private nodes: Node[] = [];
   private edges: Edge[] = [];
   private unresolvedReferences: UnresolvedReference[] = [];
+
+  /**
+   * Go: the package identifiers this file imports — the alias when one is given,
+   * otherwise the import path's last segment. Memoized; the extractor instance is
+   * per-file. Used to tell a package-qualified factory chain from an instance chain,
+   * which share the `selector_expression` inner-callee shape.
+   */
+  private goImportedPkgsMemo: Set<string> | null = null;
+  private goImportedPackages(from: SyntaxNode): Set<string> {
+    if (this.goImportedPkgsMemo) return this.goImportedPkgsMemo;
+    const pkgs = new Set<string>();
+    let root: SyntaxNode = from;
+    while (root.parent) root = root.parent;
+    const walk = (n: SyntaxNode): void => {
+      if (n.type === 'import_spec') {
+        const alias = n.namedChildren.find(
+          (c) => c.type === 'package_identifier' || c.type === 'identifier',
+        );
+        if (alias) {
+          pkgs.add(getNodeText(alias, this.source));
+          return;
+        }
+        const path = n.namedChildren.find(
+          (c) => c.type === 'interpreted_string_literal' || c.type === 'raw_string_literal',
+        );
+        if (path) {
+          const last = getNodeText(path, this.source).replace(/['"`]/g, '').split('/').pop();
+          if (last) pkgs.add(last);
+        }
+        return;
+      }
+      for (const c of n.namedChildren) {
+        if (
+          n.type === 'source_file' ||
+          n.type === 'import_declaration' ||
+          n.type === 'import_spec_list'
+        ) {
+          walk(c);
+        }
+      }
+    };
+    walk(root);
+    this.goImportedPkgsMemo = pkgs;
+    return pkgs;
+  }
   // Value-reference edges (default ON; set CODEGRAPH_VALUE_REFS=0 to disable; see flushValueRefs).
   // Same-file reads of file-scope const/var symbols → `references` edges so impact analysis catches
   // value consumers ("change this constant/table, affect its readers").
@@ -4520,7 +4565,22 @@ export class TreeSitterExtractor {
                 // the resolver can't recover a variable's type, so re-encoding would
                 // only drop the edge. C/C++ re-encode any inner.
                 if (this.language === 'rust') reencode = innerFn?.type === 'scoped_identifier';
-                else if (this.language === 'go') reencode = innerFn?.type === 'identifier';
+                else if (this.language === 'go') {
+                  // Bare package-level factory (`New().Method()`): inner callee is an
+                  // `identifier`. Package-qualified factory (`service.Order().Method()` —
+                  // the `gf gen service` accessor every GoFrame app has): inner callee is
+                  // a `selector_expression`, the SAME node type as an instance chain
+                  // (`obj.Method().Other()`), which must stay bare because a variable's
+                  // type isn't recoverable here. The file's import set separates the two.
+                  if (innerFn?.type === 'identifier') reencode = true;
+                  else if (innerFn?.type === 'selector_expression') {
+                    const operand = getChildByField(innerFn, 'operand');
+                    reencode =
+                      !!operand &&
+                      operand.type === 'identifier' &&
+                      this.goImportedPackages(innerFn).has(getNodeText(operand, this.source));
+                  } else reencode = false;
+                }
                 // Scala: only a companion-factory / case-class-apply chain whose
                 // receiver chain starts with a capitalized type (`Foo.create().bar()`,
                 // `Foo(args).bar()`). An instance chain (`list.map().filter()`) has a
