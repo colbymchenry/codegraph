@@ -31,7 +31,7 @@ import {
 } from '../src/sync/watcher';
 import CodeGraph from '../src/index';
 
-type SyncFn = () => Promise<{ filesChanged: number; durationMs: number }>;
+type SyncFn = (paths?: string[]) => Promise<{ filesChanged: number; durationMs: number }>;
 
 /**
  * Helper to wait for a condition with timeout. Used for assertions that depend
@@ -324,6 +324,71 @@ describe('FileWatcher', () => {
     });
   });
 
+  describe('persistent sync-failure degradation (#1127)', () => {
+    it('disables auto-sync after a persistent non-lock sync failure, with bounded retries', async () => {
+      // A deterministic pipeline failure (broken extractor on a file, DB
+      // corruption, SQLITE_FULL, OOM) recurs every cycle. Unbounded it retried
+      // forever at the debounce cadence; it must now back off and degrade.
+      const syncFn = vi.fn().mockRejectedValue(new Error('extractor crashed on src/bad.ts'));
+      const onSyncComplete = vi.fn();
+      const onSyncError = vi.fn();
+      const onDegraded = vi.fn();
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const watcher = newWatcher(syncFn, {
+        debounceMs: 25,
+        onSyncComplete,
+        onSyncError,
+        onDegraded,
+      });
+      watcher.start();
+      await watcher.waitUntilReady();
+      __emitWatchEventForTests(testDir, 'src/persistent-fail.ts');
+
+      // 5 backoff retries (25·1,2,4,8,16 ms), then degrade on the 6th attempt.
+      await waitFor(() => !watcher.isActive(), 8000, 20);
+
+      expect(syncFn.mock.calls.length).toBeGreaterThanOrEqual(6); // MAX_SYNC_FAILURE_RETRIES + 1
+      expect(watcher.isDegraded()).toBe(true);
+      expect(onDegraded).toHaveBeenCalledTimes(1);
+      expect(onDegraded).toHaveBeenCalledWith(expect.stringContaining('auto-sync disabled'));
+      // The degrade reason carries the underlying error so the user can act.
+      expect(onDegraded).toHaveBeenCalledWith(expect.stringContaining('extractor crashed'));
+      // Unlike a held lock, a generic failure IS surfaced per-attempt.
+      expect(onSyncError.mock.calls.length).toBeGreaterThanOrEqual(6);
+      expect(onSyncComplete).not.toHaveBeenCalled();
+      // Degrade stops the watcher, which clears pending state.
+      expect(watcher.getPendingFiles()).toEqual([]);
+      const disableWarnings = warnSpy.mock.calls.filter(
+        (c) => typeof c[0] === 'string' && c[0].includes('File watcher disabled')
+      );
+      expect(disableWarnings).toHaveLength(1);
+    });
+
+    it('does NOT degrade on a transient sync failure — backoff resets after a clean sync', async () => {
+      const syncFn = vi
+        .fn()
+        .mockRejectedValueOnce(new Error('transient blip'))
+        .mockRejectedValueOnce(new Error('transient blip'))
+        .mockRejectedValueOnce(new Error('transient blip'))
+        .mockResolvedValue({ filesChanged: 1, durationMs: 5 });
+      const onDegraded = vi.fn();
+      const onSyncComplete = vi.fn();
+      const watcher = newWatcher(syncFn, { debounceMs: 25, onDegraded, onSyncComplete });
+      watcher.start();
+      await watcher.waitUntilReady();
+      __emitWatchEventForTests(testDir, 'src/transient-fail.ts');
+
+      await waitFor(() => onSyncComplete.mock.calls.length > 0, 4000, 20);
+
+      expect(onDegraded).not.toHaveBeenCalled();
+      expect(watcher.isDegraded()).toBe(false);
+      expect(watcher.isActive()).toBe(true);
+      expect(watcher.getPendingFiles().some((p) => p.path === 'src/transient-fail.ts')).toBe(false);
+
+      watcher.stop();
+    });
+  });
+
   describe('debounced sync', () => {
     it('should trigger sync after file change', async () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 1, durationMs: 10 });
@@ -373,8 +438,11 @@ describe('FileWatcher', () => {
       watcher.start();
       await watcher.waitUntilReady();
 
-      // A non-source-file event — FileWatcher's `isSourceFile` gate must drop
-      // it before scheduling sync.
+      // An EXISTING non-source file changing — FileWatcher's `isSourceFile`
+      // gate must drop it before scheduling sync. (It must exist on disk:
+      // a VANISHED non-source path is the deleted-directory shape, which
+      // deliberately schedules a sync — #1285.)
+      fs.writeFileSync(path.join(testDir, 'src', 'readme.md'), '# docs\n');
       __emitWatchEventForTests(testDir, 'src/readme.md');
 
       // Wait a bit longer than debounce — sync should NOT trigger.
@@ -382,6 +450,64 @@ describe('FileWatcher', () => {
       expect(syncFn).not.toHaveBeenCalled();
 
       watcher.stop();
+    });
+
+    it('a deleted directory schedules a sync so child records get removed (#1285)', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = newWatcher(syncFn, { debounceMs: 100 });
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      // A directory deletion arrives as ONE event on the directory path —
+      // no extension, nothing on disk anymore. Must schedule a sync (the
+      // sync's scan-diff removes the children), not be dropped as
+      // "non-source".
+      const sub = path.join(testDir, 'docs');
+      fs.mkdirSync(path.join(sub, 'nested'), { recursive: true });
+      fs.writeFileSync(path.join(sub, 'nested', 'mod.ts'), 'export const q = 1;');
+      fs.rmSync(sub, { recursive: true, force: true });
+      __emitWatchEventForTests(testDir, 'docs');
+
+      await waitFor(() => syncFn.mock.calls.length > 0);
+      expect(syncFn).toHaveBeenCalled();
+
+      watcher.stop();
+    });
+
+    it('end-to-end: deleting a subdirectory removes its files from the index via watch sync (#1285)', async () => {
+      // Real CodeGraph as the sync target; the watcher is inert and driven
+      // by the synthetic event seam for determinism.
+      fs.writeFileSync(path.join(testDir, 'root.ts'), 'export const r = 1;');
+      const deep = path.join(testDir, 'docs', 'a', 'b');
+      fs.mkdirSync(deep, { recursive: true });
+      fs.writeFileSync(path.join(deep, 'inner.ts'), 'export const i = 2;');
+
+      const cg = CodeGraph.initSync(testDir);
+      await cg.indexAll();
+      const before = cg.getFiles().map((f) => f.path);
+      expect(before).toContain('docs/a/b/inner.ts');
+
+      const syncFn = vi.fn(async () => {
+        const r = await cg.sync();
+        return { filesChanged: r.filesAdded + r.filesModified + r.filesRemoved, durationMs: r.durationMs };
+      });
+      const watcher = newWatcher(syncFn, { debounceMs: 100 });
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      fs.rmSync(path.join(testDir, 'docs'), { recursive: true, force: true });
+      __emitWatchEventForTests(testDir, 'docs');
+
+      await waitFor(() => syncFn.mock.calls.length > 0, 5000);
+      // The sync body is async — poll the DB until the removal commits.
+      await waitFor(() => !cg.getFiles().some((f) => f.path.startsWith('docs/')), 5000);
+
+      const after = cg.getFiles().map((f) => f.path);
+      expect(after).toContain('root.ts');
+      expect(after.some((p) => p.startsWith('docs/'))).toBe(false);
+
+      watcher.stop();
+      cg.close();
     });
 
     it('should ignore .codegraph directory changes', async () => {
@@ -414,6 +540,134 @@ describe('FileWatcher', () => {
       __emitWatchEventForTests(testDir, 'src/live.ts');
       await waitFor(() => syncFn.mock.calls.length > 0);
       expect(syncFn).toHaveBeenCalled();
+
+      watcher.stop();
+    });
+  });
+
+  describe('scope config refresh (#1590)', () => {
+    // The matcher used to be built once in start() and kept for the watcher's
+    // lifetime, so a `codegraph.json` written AFTER the daemon started was
+    // invisible to the live watcher while `codegraph sync` honoured it: the
+    // CLI removed a newly excluded file and the watcher re-added it.
+    it('a codegraph.json edit rebuilds the matcher and forces a full sync', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = newWatcher(syncFn, { debounceMs: 100 });
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      // Scope the project after the watcher is already running.
+      fs.mkdirSync(path.join(testDir, 'skipme'));
+      fs.writeFileSync(path.join(testDir, 'skipme', 'b.ts'), 'export const b = 1;\n');
+      fs.writeFileSync(path.join(testDir, 'codegraph.json'), JSON.stringify({ exclude: ['skipme/'] }));
+      __emitWatchEventForTests(testDir, 'codegraph.json');
+
+      // The config edit schedules a FULL sync (no scoped path list): only the
+      // scan-diff can find the files the new scope drops or admits.
+      await waitFor(() => syncFn.mock.calls.length > 0);
+      expect(syncFn.mock.calls.length).toBe(1);
+      expect(syncFn.mock.calls[0]![0]).toBeUndefined();
+      expect(watcher.getPendingFiles()).toEqual([]);
+      await new Promise((r) => setTimeout(r, 50)); // let runSync settle
+
+      // An edit inside the newly excluded tree is dropped by the LIVE matcher:
+      // not pending, and no sync scheduled for it.
+      __emitWatchEventForTests(testDir, 'skipme/b.ts');
+      expect(watcher.getPendingFiles().map((p) => p.path)).not.toContain('skipme/b.ts');
+      await new Promise((r) => setTimeout(r, 300)); // > debounce
+      expect(syncFn.mock.calls.length).toBe(1);
+
+      // In-scope edits still sync, scoped to the edited path as before.
+      __emitWatchEventForTests(testDir, 'src/index.ts');
+      await waitFor(() => syncFn.mock.calls.length > 1);
+      expect(syncFn.mock.calls[1]![0]).toEqual(['src/index.ts']);
+
+      watcher.stop();
+    });
+
+    it('a root .gitignore edit is a scope change too', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = newWatcher(syncFn, { debounceMs: 100 });
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      fs.mkdirSync(path.join(testDir, 'gen'));
+      fs.writeFileSync(path.join(testDir, 'gen', 'out.ts'), 'export const g = 1;\n');
+      fs.writeFileSync(path.join(testDir, '.gitignore'), 'gen/\n');
+      __emitWatchEventForTests(testDir, '.gitignore');
+
+      await waitFor(() => syncFn.mock.calls.length > 0);
+      expect(syncFn.mock.calls[0]![0]).toBeUndefined();
+      await new Promise((r) => setTimeout(r, 50));
+
+      __emitWatchEventForTests(testDir, 'gen/out.ts');
+      expect(watcher.getPendingFiles().map((p) => p.path)).not.toContain('gen/out.ts');
+      await new Promise((r) => setTimeout(r, 300));
+      expect(syncFn.mock.calls.length).toBe(1);
+
+      watcher.stop();
+    });
+
+    it('a nested .gitignore inside the scope forces a full sync', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = newWatcher(syncFn, { debounceMs: 100 });
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      fs.mkdirSync(path.join(testDir, 'sub'));
+      fs.writeFileSync(path.join(testDir, 'sub', '.gitignore'), 'build/\n');
+      __emitWatchEventForTests(testDir, 'sub/.gitignore');
+
+      await waitFor(() => syncFn.mock.calls.length > 0);
+      expect(syncFn.mock.calls[0]![0]).toBeUndefined();
+
+      watcher.stop();
+    });
+
+    it('a .gitignore under an ignored tree (npm install churn) schedules nothing', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = newWatcher(syncFn, { debounceMs: 100 });
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      fs.mkdirSync(path.join(testDir, 'node_modules', 'pkg'), { recursive: true });
+      fs.writeFileSync(path.join(testDir, 'node_modules', 'pkg', '.gitignore'), 'lib/\n');
+      __emitWatchEventForTests(testDir, 'node_modules/pkg/.gitignore');
+
+      await new Promise((r) => setTimeout(r, 300));
+      expect(syncFn).not.toHaveBeenCalled();
+
+      watcher.stop();
+    });
+
+    it('removing the exclude again readmits the tree', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = newWatcher(syncFn, { debounceMs: 100 });
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      fs.mkdirSync(path.join(testDir, 'skipme'));
+      fs.writeFileSync(path.join(testDir, 'skipme', 'b.ts'), 'export const b = 1;\n');
+      const cfg = path.join(testDir, 'codegraph.json');
+      fs.writeFileSync(cfg, JSON.stringify({ exclude: ['skipme/'] }));
+      __emitWatchEventForTests(testDir, 'codegraph.json');
+      await waitFor(() => syncFn.mock.calls.length > 0);
+      await new Promise((r) => setTimeout(r, 50));
+      __emitWatchEventForTests(testDir, 'skipme/b.ts');
+      expect(watcher.getPendingFiles().map((p) => p.path)).not.toContain('skipme/b.ts');
+
+      // Drop the exclude. The loader is mtime-keyed, so make sure the second
+      // write carries a distinct mtime even on a coarse-timestamp filesystem.
+      fs.writeFileSync(cfg, JSON.stringify({}));
+      const later = new Date(Date.now() + 5000);
+      fs.utimesSync(cfg, later, later);
+      __emitWatchEventForTests(testDir, 'codegraph.json');
+      await waitFor(() => syncFn.mock.calls.length > 1);
+      expect(syncFn.mock.calls[1]![0]).toBeUndefined();
+      await new Promise((r) => setTimeout(r, 50));
+
+      __emitWatchEventForTests(testDir, 'skipme/b.ts');
+      expect(watcher.getPendingFiles().map((p) => p.path)).toContain('skipme/b.ts');
 
       watcher.stop();
     });
@@ -642,6 +896,58 @@ describe('FileWatcher', () => {
       expect(results.length).toBeGreaterThan(0);
 
       cg.unwatch();
+    });
+  });
+
+  describe('scoped sync fast path (#watcher-scoped)', () => {
+    it('passes the exact pending paths to syncFn for plain file events', async () => {
+      const calls: (string[] | undefined)[] = [];
+      const syncFn: SyncFn = async (paths?: string[]) => {
+        calls.push(paths);
+        return { filesChanged: 1, durationMs: 5 };
+      };
+      const watcher = newWatcher(syncFn, { debounceMs: 30 });
+      expect(watcher.start()).toBe(true);
+      fs.writeFileSync(path.join(testDir, 'src', 'a.ts'), 'export const a = 1;');
+      __emitWatchEventForTests(testDir, 'src/a.ts');
+      await new Promise((r) => setTimeout(r, 500));
+      watcher.stop();
+      expect(calls.length).toBeGreaterThan(0);
+      expect(calls[0]).toEqual(['src/a.ts']);
+    });
+
+    it('falls back to a full sync (undefined paths) after a directory removal event', async () => {
+      const calls: (string[] | undefined)[] = [];
+      const syncFn: SyncFn = async (paths?: string[]) => {
+        calls.push(paths);
+        return { filesChanged: 0, durationMs: 5 };
+      };
+      const watcher = newWatcher(syncFn, { debounceMs: 30 });
+      expect(watcher.start()).toBe(true);
+      // A non-source path that does not exist on disk = the #1285 dir-removal shape.
+      __emitWatchEventForTests(testDir, 'src/removed-dir');
+      await new Promise((r) => setTimeout(r, 500));
+      watcher.stop();
+      expect(calls.length).toBeGreaterThan(0);
+      expect(calls[0]).toBeUndefined();
+    });
+
+    it('a lone file event fires on the quick window, well before the full debounce', async () => {
+      const calls: (string[] | undefined)[] = [];
+      const syncFn: SyncFn = async (paths?: string[]) => {
+        calls.push(paths);
+        return { filesChanged: 1, durationMs: 1 };
+      };
+      // Full debounce is deliberately huge; the quick window (300ms) must win
+      // for a single pending file.
+      const watcher = newWatcher(syncFn, { debounceMs: 30_000 });
+      expect(watcher.start()).toBe(true);
+      fs.writeFileSync(path.join(testDir, 'src', 'quick.ts'), 'export const q = 1;');
+      __emitWatchEventForTests(testDir, 'src/quick.ts');
+      await new Promise((r) => setTimeout(r, 1500));
+      watcher.stop();
+      expect(calls.length).toBe(1);
+      expect(calls[0]).toEqual(['src/quick.ts']);
     });
   });
 });

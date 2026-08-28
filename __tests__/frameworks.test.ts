@@ -942,6 +942,37 @@ describe('goResolver.extract', () => {
     const { references } = goResolver.extract!('routes.go', src);
     expect(references[0].referenceName).toBe('listUsers');
   });
+
+  it('does NOT treat verb-named method calls with non-path args as routes (#1259)', () => {
+    // The issue's repro: a generic cache type whose Put/Get share router verb
+    // names. First args are keys, not URL paths — no route nodes.
+    const src = [
+      `c.Put("a", 1)`,
+      `c.Put("user:123", value)`,
+      `store.Get("config", out)`,
+      `bus.Handle("user.created", onUserCreated)`,
+      `m.HandleFunc("shutdown", hook)`,
+    ].join('\n');
+    const { nodes } = goResolver.extract!('cache.go', src);
+    expect(nodes).toHaveLength(0);
+  });
+
+  it('keeps real registrations whose paths start with "/" for every router style', () => {
+    const src = [
+      `r.Put("/users/{id}", updateUser)`, // chi
+      `v1.GET("/ping", ping)`, // gin group
+      `mux.HandleFunc("/healthz", health)`, // net/http
+    ].join('\n');
+    const { nodes } = goResolver.extract!('routes.go', src);
+    expect(nodes.map((n) => n.name)).toEqual(['PUT /users/{id}', 'GET /ping', 'ANY /healthz']);
+  });
+
+  it('recognizes Go 1.22 "METHOD /path" patterns on HandleFunc and extracts the method', () => {
+    const src = `mux.HandleFunc("GET /api/users/{id}", getUser)\n`;
+    const { nodes, references } = goResolver.extract!('main.go', src);
+    expect(nodes[0].name).toBe('GET /api/users/{id}');
+    expect(references[0].referenceName).toBe('getUser');
+  });
 });
 
 import { goframeResolver } from '../src/resolution/frameworks/goframe';
@@ -1440,6 +1471,47 @@ func boot(routes: RoutesBuilder) throws {
     const src = `let host = Environment.get("DATABASE_HOST") ?? "localhost"\n`;
     const { nodes } = vaporResolver.extract!('configure.swift', src);
     expect(nodes).toHaveLength(0);
+  });
+
+  // A `.METHOD(...)` call with many comma-separated args and no `use:` used to
+  // make the route regex backtrack exponentially (60 args hung for minutes).
+  it('does not backtrack exponentially on a long arg list without use:', () => {
+    const args = Array.from({ length: 60 }, (_, i) => `arg${i}: value${i}`).join(', ');
+    const src = `app.get(${args})\n`;
+    const start = performance.now();
+    const { nodes } = vaporResolver.extract!('routes.swift', src);
+    const elapsed = performance.now() - start;
+    expect(nodes).toHaveLength(0);
+    expect(elapsed).toBeLessThan(250);
+  });
+
+  it('still parses every Vapor route shape after the arg-list rewrite', () => {
+    const src = `
+admin.get(use: self.list)
+app.get("users", use: listUsers)
+router.post("users", User.parameter, "edit", use: UserController.edit)
+app.patch(":id" ,  "meta" ,  use: update)
+app.get(
+  "multi",
+  "line",
+  use: multiLine
+)
+`;
+    const { nodes, references } = vaporResolver.extract!('routes.swift', src);
+    expect(nodes.map((n) => n.name)).toEqual([
+      'GET /',
+      'GET /users',
+      'POST /users/edit',
+      'PATCH /:id/meta',
+      'GET /multi/line',
+    ]);
+    expect(references.map((r) => r.referenceName)).toEqual([
+      'list',
+      'listUsers',
+      'edit',
+      'update',
+      'multiLine',
+    ]);
   });
 });
 

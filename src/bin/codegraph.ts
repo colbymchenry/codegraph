@@ -23,13 +23,29 @@
  *   codegraph upgrade [version]  Update CodeGraph to the latest release
  */
 
+// FIRST import, before anything else loads: capture process.ppid while our
+// launcher is (almost certainly) still alive. A launcher killed mid-startup
+// otherwise blinds the PPID watchdog forever (#1185) — see early-ppid.ts.
+import '../mcp/early-ppid';
+
+// Persist V8 compile artifacts across runs (Node ≥22.8). Every invocation —
+// and every worker thread, which re-requires the whole extraction module
+// graph — skips recompiling unchanged sources. Worth hundreds of ms of
+// worker-boot latency per bulk index; harmless no-op when unavailable.
+try {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  (require('node:module') as { enableCompileCache?: () => void }).enableCompileCache?.();
+} catch { /* cache is best-effort */ }
+
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
 import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, hasStructuralKeyword, extractCodeTokens } from '../directory';
+import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
+import { ansiColorsEnabled } from '../ui/color';
 
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
 import { installFatalHandlers } from './fatal-handler';
@@ -38,13 +54,18 @@ import { installCommandSupervision } from './command-supervision';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
 import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
 
+// Decided once, before `--color`/`--no-color` are stripped from argv below
+// (#1281). Piped/redirected stdout, NO_COLOR, or --no-color -> plain output.
+const COLORS_ENABLED = ansiColorsEnabled();
+
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
 async function loadCodeGraph(): Promise<typeof import('../index')> {
   try {
     return await import('../index');
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`\x1b[31m${getGlyphs().err}\x1b[0m Failed to load CodeGraph modules.`);
+    const [red, reset] = COLORS_ENABLED ? ['\x1b[31m', '\x1b[0m'] : ['', ''];
+    console.error(`${red}${getGlyphs().err}${reset} Failed to load CodeGraph modules.`);
     console.error(`\n  Node: ${process.version}  Platform: ${process.platform} ${process.arch}`);
     console.error(`\n  Error: ${msg}`);
     console.error('\n  Try reinstalling with: npm install -g @colbymchenry/codegraph\n');
@@ -187,18 +208,36 @@ if (firstArg === '-v' || firstArg === '-version') {
 // ANSI Color Helpers (avoid chalk ESM issues)
 // =============================================================================
 
-const colors = {
-  reset: '\x1b[0m',
-  bold: '\x1b[1m',
-  dim: '\x1b[2m',
-  red: '\x1b[31m',
-  green: '\x1b[32m',
-  yellow: '\x1b[33m',
-  blue: '\x1b[34m',
-  cyan: '\x1b[36m',
-  white: '\x1b[37m',
-  gray: '\x1b[90m',
-};
+// `--color` / `--no-color` are global and position-independent — they were
+// already read by ansiColorsEnabled() at module load, so strip them before
+// commander parses (a subcommand would otherwise reject the unknown flag).
+process.argv = process.argv.filter((a) => a !== '--color' && a !== '--no-color');
+
+const colors = COLORS_ENABLED
+  ? {
+      reset: '\x1b[0m',
+      bold: '\x1b[1m',
+      dim: '\x1b[2m',
+      red: '\x1b[31m',
+      green: '\x1b[32m',
+      yellow: '\x1b[33m',
+      blue: '\x1b[34m',
+      cyan: '\x1b[36m',
+      white: '\x1b[37m',
+      gray: '\x1b[90m',
+    }
+  : {
+      reset: '',
+      bold: '',
+      dim: '',
+      red: '',
+      green: '',
+      yellow: '',
+      blue: '',
+      cyan: '',
+      white: '',
+      gray: '',
+    };
 
 const chalk = {
   bold: (s: string) => `${colors.bold}${s}${colors.reset}`,
@@ -215,7 +254,12 @@ const chalk = {
 program
   .name('codegraph')
   .description('Code intelligence and knowledge graph for any codebase')
-  .version(packageJson.version);
+  .version(packageJson.version)
+  // Parsed manually before commander runs (any argv position works); declared
+  // here so they show up in --help. NO_COLOR / FORCE_COLOR env vars are also
+  // honored, and piped output defaults to no color (#1281).
+  .option('--color', 'force ANSI colors even when stdout is not a TTY')
+  .option('--no-color', 'disable ANSI colors (NO_COLOR env is also honored)');
 
 // Anonymous usage telemetry (see TELEMETRY.md): record the invoked subcommand
 // NAME only — never arguments or paths. Counts buffer locally; network sends
@@ -403,6 +447,24 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
       clack.log.success(`Indexed ${formatNumber(result.filesIndexed)} files`);
     }
     clack.log.info(`${formatNumber(result.nodesCreated)} nodes, ${formatNumber(result.edgesCreated)} edges in ${formatDuration(result.durationMs)}`);
+    // A PARTIAL index (files silently dropped mid-pipeline) must not pass
+    // as a clean run — it's the difference between "indexed the repo" and
+    // "indexed most of the repo, quietly". Only the completeness
+    // reconciliation warning; per-file extractor warnings stay in the
+    // error-code summary below.
+    for (const w of result.errors.filter((e) => e.code === 'index_partial')) {
+      clack.log.warn(w.message);
+    }
+    // Files salvaged from comment-stripped source after repeated parser
+    // failures are indexed but possibly incomplete — say so here, or the run
+    // reads as fully clean and the index quietly disagrees with a later
+    // re-parse of the same bytes (#1565).
+    const salvaged = result.errors.filter((e) => e.code === 'salvaged_stripped');
+    if (salvaged.length > 0) {
+      const sample = salvaged.slice(0, 3).map((e) => e.filePath).filter(Boolean).join(', ');
+      const more = salvaged.length > 3 ? ', ...' : '';
+      clack.log.warn(`${formatNumber(salvaged.length)} file(s) indexed from comment-stripped source after repeated parse failures ${getGlyphs().dash} symbols may be incomplete (${sample}${more})`);
+    }
   } else if (hasErrors) {
     clack.log.error(`Indexing failed ${getGlyphs().dash} all ${formatNumber(result.filesErrored)} files had errors`);
   } else {
@@ -441,11 +503,94 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
       clack.log.info(`The index is fully usable ${getGlyphs().dash} only the failed files are missing.`);
     }
   } else if (projectPath) {
-    const logPath = path.join(getCodeGraphDir(projectPath), 'errors.log');
-    if (fs.existsSync(logPath)) {
-      fs.unlinkSync(logPath);
+    // No hard errors. Salvaged-file warnings still belong in the log — it
+    // carries the per-file detail behind the one-line summary above.
+    if (result.errors.some((e) => e.code === 'salvaged_stripped')) {
+      writeErrorLog(projectPath, result.errors);
+      clack.log.info('See .codegraph/errors.log for details');
+    } else {
+      const logPath = path.join(getCodeGraphDir(projectPath), 'errors.log');
+      if (fs.existsSync(logPath)) {
+        fs.unlinkSync(logPath);
+      }
     }
   }
+}
+
+/**
+ * When an `init`/`index` produced an EMPTY graph and the reason is that the
+ * project's own `.gitignore` excludes nested git repositories — the "super-repo
+ * gitignores its child repos" layout (#1156), where `init` at the parent
+ * correctly indexes ~nothing while `init` inside each child works — name those
+ * repos and offer to index them. An interactive terminal gets a yes/no prompt
+ * that writes `includeIgnored` to codegraph.json and re-indexes; a
+ * non-interactive run just prints the one-line opt-in snippet. The caller gates
+ * this on `nodesCreated === 0`, so a project that DID index real content is
+ * never nagged about the gitignored reference clones it deliberately keeps out
+ * (#970, #1065). Best-effort throughout: detection never breaks the command.
+ */
+async function offerIndexIgnoredRepos(
+  clack: typeof import('@clack/prompts'),
+  projectPath: string,
+  reindex: () => Promise<IndexResult>,
+  opts: { interactive: boolean },
+): Promise<IndexResult | undefined> {
+  let repos: string[];
+  try {
+    const { findUnindexedIgnoredRepos } = await import('../extraction');
+    repos = findUnindexedIgnoredRepos(projectPath);
+  } catch {
+    return; // detection is advisory — never let it break the command
+  }
+  if (repos.length === 0) return;
+
+  const { PROJECT_CONFIG_FILENAME } = await import('../project-config');
+  const isOne = repos.length === 1;
+  const SHOWN = 6;
+  const names = repos.slice(0, SHOWN).map((r) => r.replace(/\/$/, ''));
+  const extra = repos.length > SHOWN ? ` (+${formatNumber(repos.length - SHOWN)} more)` : '';
+  const snippet = `{ "includeIgnored": [${repos.map((p) => JSON.stringify(p)).join(', ')}] }`;
+
+  clack.log.warn(
+    `Your .gitignore excludes ${isOne ? 'a nested git repository' : `${formatNumber(repos.length)} nested git repositories`} here, ` +
+    `so ${isOne ? 'it was' : 'they were'} not indexed: ${names.join(', ')}${extra}.`,
+  );
+
+  const manualHint = () => {
+    clack.log.info(
+      `If ${isOne ? "it's" : "they're"} your code, add ${isOne ? 'it' : 'them'} to ${PROJECT_CONFIG_FILENAME} and re-index:`,
+    );
+    clack.log.info(`  ${snippet}`);
+  };
+
+  if (!opts.interactive || !process.stdin.isTTY) {
+    manualHint();
+    return;
+  }
+
+  const yes = await clack.confirm({
+    message: `Index ${isOne ? 'it' : `these ${formatNumber(repos.length)}`} now? Adds ${isOne ? 'it' : 'them'} to ${PROJECT_CONFIG_FILENAME}.`,
+    initialValue: true,
+  });
+  if (clack.isCancel(yes) || !yes) {
+    manualHint();
+    return;
+  }
+
+  let added: number;
+  try {
+    const { addIncludeIgnoredPatterns } = await import('../project-config');
+    added = addIncludeIgnoredPatterns(projectPath, repos);
+  } catch (err) {
+    clack.log.error(`Could not update ${PROJECT_CONFIG_FILENAME}: ${err instanceof Error ? err.message : String(err)}`);
+    manualHint();
+    return;
+  }
+  clack.log.success(`Added ${formatNumber(added)} ${added === 1 ? 'entry' : 'entries'} to ${PROJECT_CONFIG_FILENAME} ${getGlyphs().dash} re-indexing…`);
+
+  const result = await reindex();
+  printIndexResult(clack, result, projectPath);
+  return result;
 }
 
 /**
@@ -512,6 +657,100 @@ async function recordIndexTelemetry(
 // =============================================================================
 
 /**
+ * The `init` flow — shared by `codegraph init` and `codegraph install --init`
+ * (#1578): refuse an unsafe root, create `.codegraph/`, build the initial
+ * index under supervision, then the post-index offers. `yes` makes every
+ * offer non-interactive (defaults only), so a container / CI bootstrap never
+ * blocks on a prompt. An unsafe root sets `process.exitCode = 1` and returns
+ * (no `--force` is implied by any caller); an index failure exits 1.
+ */
+async function runInit(
+  projectPath: string,
+  options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean },
+): Promise<void> {
+  const clack = await importESM('@clack/prompts');
+
+  clack.intro('Initializing CodeGraph');
+
+  try {
+    // Refuse to index your home directory / a filesystem root — it pulls in
+    // caches, other projects, and your whole tree (a multi-GB index + watcher
+    // churn, and on pre-1.0 macOS a machine-crashing fd blowup, #845).
+    const unsafe = unsafeIndexRootReason(projectPath);
+    if (unsafe && !options.force) {
+      clack.log.error(`Refusing to initialize in ${projectPath} — it looks like ${unsafe}.`);
+      clack.log.info('Run this inside a specific project directory, or pass --force if you really mean to index everything under it.');
+      clack.outro('');
+      process.exitCode = 1;
+      return;
+    }
+
+    if (isInitialized(projectPath)) {
+      clack.log.warn(`Already initialized in ${projectPath}`);
+      clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
+      try {
+        const { offerWatchFallback } = await import('../installer');
+        await offerWatchFallback(clack, projectPath, { yes: options.yes });
+      } catch { /* non-fatal */ }
+      clack.outro('');
+      return;
+    }
+
+    const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
+    const cg = await CodeGraph.init(projectPath, { index: false });
+    clack.log.success(`Initialized in ${projectPath}`);
+
+    // Indexing runs by default now. The legacy -i/--index flag is still
+    // accepted (so existing muscle memory and scripts don't break) but is a
+    // no-op — initializing always builds the initial index.
+    // Supervise the index: self-terminate if orphaned or wedged (#999).
+    // The DB + WAL paths let the liveness watchdog tell a slow store on
+    // degraded storage from a true wedge (#1231).
+    // A closure so we can re-run the exact same supervised, progress-rendered
+    // index if the user opts gitignored child repos in below (#1156).
+    const dbPath = getDatabasePath(projectPath);
+    const runIndex = async (): Promise<IndexResult> => {
+      const supervision = installCommandSupervision('init', { progressPaths: [dbPath, `${dbPath}-wal`] });
+      try {
+        if (options.verbose) {
+          return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
+        }
+        process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
+        const progress = createShimmerProgress();
+        const r = await cg.indexAll({ onProgress: progress.onProgress });
+        await progress.stop();
+        return r;
+      } finally {
+        supervision.stop();
+      }
+    };
+    const result = await runIndex();
+    printIndexResult(clack, result, projectPath);
+    await recordIndexTelemetry(cg, result);
+
+    // An empty graph at a git super-repo usually means `.gitignore` excludes
+    // the child repos that hold the code — surface them and offer to opt in
+    // rather than leaving the user with a silent 0-node "Done". (#1156)
+    // Under --yes the offer prints its one-line opt-in snippet instead of
+    // prompting (same as a non-TTY run).
+    if (result.nodesCreated === 0) {
+      await offerIndexIgnoredRepos(clack, projectPath, runIndex, { interactive: !options.yes });
+    }
+
+    try {
+      const { offerWatchFallback } = await import('../installer');
+      await offerWatchFallback(clack, projectPath, { yes: options.yes });
+    } catch { /* non-fatal */ }
+
+    clack.outro('Done');
+    cg.destroy();
+  } catch (err) {
+    clack.log.error(`Failed: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+}
+
+/**
  * codegraph init [path]
  */
 program
@@ -520,77 +759,9 @@ program
   .option('-i, --index', 'Deprecated: indexing now runs by default; flag accepted for backward compatibility')
   .option('-f, --force', 'Initialize even if the path looks like your home directory or a filesystem root')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
-  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean }) => {
-    const projectPath = path.resolve(pathArg || process.cwd());
-    const clack = await importESM('@clack/prompts');
-
-    clack.intro('Initializing CodeGraph');
-
-    try {
-      // Refuse to index your home directory / a filesystem root — it pulls in
-      // caches, other projects, and your whole tree (a multi-GB index + watcher
-      // churn, and on pre-1.0 macOS a machine-crashing fd blowup, #845).
-      const unsafe = unsafeIndexRootReason(projectPath);
-      if (unsafe && !options.force) {
-        clack.log.error(`Refusing to initialize in ${projectPath} — it looks like ${unsafe}.`);
-        clack.log.info('Run this inside a specific project directory, or pass --force if you really mean to index everything under it.');
-        clack.outro('');
-        process.exitCode = 1;
-        return;
-      }
-
-      if (isInitialized(projectPath)) {
-        clack.log.warn(`Already initialized in ${projectPath}`);
-        clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
-        try {
-          const { offerWatchFallback } = await import('../installer');
-          await offerWatchFallback(clack, projectPath);
-        } catch { /* non-fatal */ }
-        clack.outro('');
-        return;
-      }
-
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.init(projectPath, { index: false });
-      clack.log.success(`Initialized in ${projectPath}`);
-
-      // Indexing runs by default now. The legacy -i/--index flag is still
-      // accepted (so existing muscle memory and scripts don't break) but is a
-      // no-op — initializing always builds the initial index.
-      // Supervise the index: self-terminate if orphaned or wedged (#999).
-      const supervision = installCommandSupervision('init');
-      let result: IndexResult;
-      try {
-        if (options.verbose) {
-          result = await cg.indexAll({
-            onProgress: createVerboseProgress(),
-            verbose: true,
-          });
-        } else {
-          process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-          const progress = createShimmerProgress();
-          result = await cg.indexAll({
-            onProgress: progress.onProgress,
-          });
-          await progress.stop();
-        }
-      } finally {
-        supervision.stop();
-      }
-      printIndexResult(clack, result, projectPath);
-      await recordIndexTelemetry(cg, result);
-
-      try {
-        const { offerWatchFallback } = await import('../installer');
-        await offerWatchFallback(clack, projectPath);
-      } catch { /* non-fatal */ }
-
-      clack.outro('Done');
-      cg.destroy();
-    } catch (err) {
-      clack.log.error(`Failed: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
-    }
+  .option('-y, --yes', 'Non-interactive: skip every prompt and take the defaults (for scripts / CI / container bootstraps)')
+  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean }) => {
+    await runInit(path.resolve(pathArg || process.cwd()), options);
   });
 
 /**
@@ -681,7 +852,7 @@ program
         process.exit(1);
       }
 
-      const { default: CodeGraph } = await loadCodeGraph();
+      const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
       // `index` is a FULL re-index — identical to a fresh `init`. RECREATE the
       // database from scratch (discard .codegraph/codegraph.db + its WAL) rather
       // than opening the old graph and DELETE-ing every row. The clear-then-index
@@ -695,7 +866,10 @@ program
 
       // Supervise the indexer: self-terminate if orphaned (parent shim killed)
       // or if the main thread wedges — neither was guarded on this path (#999).
-      const supervision = installCommandSupervision('index');
+      // The DB + WAL paths let the liveness watchdog tell a slow store on
+      // degraded storage from a true wedge (#1231).
+      const dbPath = getDatabasePath(projectPath);
+      const supervision = installCommandSupervision('index', { progressPaths: [dbPath, `${dbPath}-wal`] });
       try {
         if (options.quiet) {
           // Quiet mode: no UI, just run against the freshly-recreated graph.
@@ -708,26 +882,32 @@ program
         const clack = await importESM('@clack/prompts');
         clack.intro('Indexing project');
 
-        let result: IndexResult;
-
-        if (options.verbose) {
-          result = await cg.indexAll({
-            onProgress: createVerboseProgress(),
-            verbose: true,
-          });
-        } else {
+        // A closure so a re-index (after opting gitignored child repos in, #1156)
+        // renders identically. Supervision already wraps the whole command.
+        const renderIndex = async (): Promise<IndexResult> => {
+          if (options.verbose) {
+            return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
+          }
           process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
           const progress = createShimmerProgress();
-          result = await cg.indexAll({
-            onProgress: progress.onProgress,
-          });
+          const r = await cg.indexAll({ onProgress: progress.onProgress });
           await progress.stop();
-        }
+          return r;
+        };
+
+        const result = await renderIndex();
 
         printIndexResult(clack, result, projectPath);
         await recordIndexTelemetry(cg, result);
 
-        if (!result.success) {
+        // Empty graph at a git super-repo → likely `.gitignore`d child repos;
+        // name them and offer to opt in instead of a silent 0-node result (#1156).
+        let finalResult = result;
+        if (result.nodesCreated === 0) {
+          finalResult = (await offerIndexIgnoredRepos(clack, projectPath, renderIndex, { interactive: true })) ?? result;
+        }
+
+        if (!finalResult.success) {
           process.exit(1);
         }
 
@@ -847,6 +1027,10 @@ program
 
       const buildInfo = cg.getIndexBuildInfo();
       const reindexRecommended = cg.isIndexStale();
+      const indexState = cg.getIndexState();
+      // Zero on a healthy index; non-zero at rest means a resolution pass was
+      // interrupted, so some files' call edges are missing (#1187).
+      const pendingRefs = cg.getPendingReferenceCount();
 
       // JSON output mode
       if (options.json) {
@@ -861,6 +1045,7 @@ program
           nodeCount: stats.nodeCount,
           edgeCount: stats.edgeCount,
           dbSizeBytes: stats.dbSizeBytes,
+          walSizeBytes: stats.walSizeBytes,
           backend,
           journalMode,
           nodesByKind: stats.nodesByKind,
@@ -878,6 +1063,14 @@ program
             builtWithExtractionVersion: buildInfo.extractionVersion,
             currentExtractionVersion: EXTRACTION_VERSION,
             reindexRecommended,
+            // 'complete' | 'partial' (files silently dropped) | 'indexing'
+            // (a run was killed mid-index — the index is truncated) |
+            // 'failed' | null (predates the marker).
+            state: indexState,
+            // References awaiting resolution. Non-zero at rest means an
+            // interrupted resolution pass left edges missing; the next
+            // sync sweeps them (#1187).
+            pendingRefs,
           },
         }));
         cg.destroy();
@@ -891,6 +1084,16 @@ program
       if (worktreeMismatch) {
         warn(worktreeMismatchWarning(worktreeMismatch));
       }
+      if (indexState === 'indexing') {
+        warn('The last index run never finished (killed mid-index?) — the index is truncated. Re-run "codegraph index".');
+      } else if (indexState === 'partial') {
+        warn('The last index run silently dropped files — the index is partial. Re-run "codegraph index".');
+      } else if (indexState === 'failed') {
+        warn('The last index run failed — results may be incomplete. Re-run "codegraph index".');
+      }
+      if (pendingRefs > 0) {
+        warn(`${formatNumber(pendingRefs)} references from an interrupted run are awaiting resolution — some callers/impact edges are missing. Run "codegraph sync" to resolve them.`);
+      }
       console.log();
 
       // Index stats
@@ -899,6 +1102,19 @@ program
       console.log(`  Nodes:     ${formatNumber(stats.nodeCount)}`);
       console.log(`  Edges:     ${formatNumber(stats.edgeCount)}`);
       console.log(`  DB Size:   ${(stats.dbSizeBytes / 1024 / 1024).toFixed(2)} MB`);
+      // Surface the WAL sidecar (#1431): a WAL that dwarfs the DB at rest is
+      // the killed-session leak — invisible before this line, it only showed
+      // up as a mysteriously full disk. open() above already kicked off the
+      // automatic heal for the oversized case.
+      if (stats.walSizeBytes > 0) {
+        const { WAL_HEAL_THRESHOLD_BYTES } = await import('../db/index');
+        const oversized = stats.walSizeBytes > Math.max(WAL_HEAL_THRESHOLD_BYTES, stats.dbSizeBytes);
+        const walLabel = `${(stats.walSizeBytes / 1024 / 1024).toFixed(2)} MB`;
+        console.log(`  WAL Size:  ${oversized ? chalk.yellow(walLabel) : walLabel}`);
+        if (oversized) {
+          warn('The write-ahead log is larger than the database — killed sessions left it behind. It is reclaimed automatically on open; if it persists across runs, another live CodeGraph process is holding it.');
+        }
+      }
       // Surface the active SQLite backend (node:sqlite — Node's built-in real
       // SQLite, full WAL + FTS5, no native build).
       const backendLabel = chalk.green(`node:sqlite ${getGlyphs().dash} built-in (full WAL)`);
@@ -999,10 +1215,10 @@ program
       // Mirror the MCP search down-rank so the CLI also surfaces the
       // hand-written implementation before protobuf/gRPC scaffolding
       // when both share a name. See extraction/generated-detection.ts.
-      const { isGeneratedFile } = await import('../extraction/generated-detection');
+      const isGen = cg.generatedFilePredicate(rawResults.map((r) => r.node.filePath));
       const results = [...rawResults].sort((a, b) => {
-        const aGen = isGeneratedFile(a.node.filePath) ? 1 : 0;
-        const bGen = isGeneratedFile(b.node.filePath) ? 1 : 0;
+        const aGen = isGen(a.node.filePath) ? 1 : 0;
+        const bGen = isGen(b.node.filePath) ? 1 : 0;
         return aGen - bGen;
       });
 
@@ -1085,6 +1301,65 @@ program
   });
 
 /**
+ * codegraph context <task...>
+ *
+ * The CLI face of the public `buildContext` API (ContextBuilder): FTS entry
+ * points + graph expansion + code blocks, formatted as markdown or JSON.
+ * Advertised in the usage header since the first release but never actually
+ * registered (#1611); external integrations (e.g. Memorix) invoke it as
+ * `codegraph context --path <root> --format json --max-nodes 8 --no-code <task>`.
+ */
+program
+  .command('context <task...>')
+  .description('Build context for a task: relevant symbols, relationships, and code blocks')
+  .option('-p, --path <path>', 'Project path')
+  .option('-f, --format <format>', 'Output format: markdown or json', 'markdown')
+  .option('-n, --max-nodes <number>', 'Maximum number of symbols to include')
+  .option('--no-code', 'Omit code blocks (structure only)')
+  .action(async (taskParts: string[], options: { path?: string; format?: string; maxNodes?: string; code?: boolean }) => {
+    const projectPath = resolveProjectPath(options.path);
+
+    const format = options.format ?? 'markdown';
+    if (format !== 'markdown' && format !== 'json') {
+      error(`Unknown format "${options.format}" — use "markdown" or "json".`);
+      process.exit(1);
+    }
+    let maxNodes: number | undefined;
+    if (options.maxNodes !== undefined) {
+      maxNodes = parseInt(options.maxNodes, 10);
+      if (Number.isNaN(maxNodes) || maxNodes < 1) {
+        error(`--max-nodes expects a positive integer, got "${options.maxNodes}".`);
+        process.exit(1);
+      }
+    }
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+
+      const result = await cg.buildContext(taskParts.join(' '), {
+        format,
+        includeCode: options.code !== false,
+        ...(maxNodes !== undefined ? { maxNodes } : {}),
+      });
+
+      // Both supported formats return a formatted string; print it verbatim so
+      // `--format json` stays machine-parseable on stdout (error()/warnings go
+      // to stderr only).
+      console.log(typeof result === 'string' ? result : JSON.stringify(result, null, 2));
+      cg.destroy();
+    } catch (err) {
+      error(`Context build failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
  * codegraph prompt-hook  (hidden)
  *
  * A Claude Code `UserPromptSubmit` hook entry point. Reads `{prompt, cwd}` JSON
@@ -1120,15 +1395,30 @@ program
       try { input = JSON.parse(raw); } catch { return; }
       const prompt = String(input.prompt || '');
 
-      // Gate: only structural / flow / impact / where-how prompts get context, so
-      // every other prompt ("fix this typo") stays a zero-cost no-op. Language-aware
-      // (English + CJK keywords, plus code-shaped tokens) so it fires for non-English
-      // prompts too (issue #994). A keyword fires on its own; a code-token is only a
-      // CANDIDATE — verified against the graph below, so a tech brand ("JavaScript")
-      // that looks like a symbol but isn't one here doesn't inject spurious context.
+      // Gate telemetry: how often each tier fires vs. no-ops — counter names
+      // only, NEVER prompt content (see TELEMETRY.md). This is the data that
+      // turns "is the gate any good" from vibes into a measured recall rate.
+      const gate = (outcome: string): void => {
+        try { getTelemetry().recordUsage('cli_command', `prompt-hook-gate-${outcome}`, true); } catch { /* never break the hook */ }
+      };
+
+      // Gate, tiered by confidence (#994, #1126):
+      //   HIGH   — a structural keyword (any covered language), or a code-shaped
+      //            token verified in the index → full explore injection.
+      //   MEDIUM — no keyword/token, but prose words match indexed symbol-name
+      //            SEGMENTS ("state machine" → OrderStateMachine, in any
+      //            language): inject a short list of the matching symbols and
+      //            let the AGENT write the explore query — the graph-derived
+      //            tier, no vocabulary involved.
+      //   silent — nothing verified. Every other prompt ("fix this typo")
+      //            stays a zero-cost no-op.
+      // Keywords fire on their own; a token or prose word is only a CANDIDATE
+      // verified against the graph below, so a tech brand ("JavaScript") that
+      // merely looks like code doesn't inject spurious context.
       const keyworded = hasStructuralKeyword(prompt);
       const codeTokens = keyworded ? [] : extractCodeTokens(prompt);
-      if (!keyworded && codeTokens.length === 0) return;
+      const proseWords = keyworded ? [] : extractProseCandidates(prompt);
+      if (!keyworded && codeTokens.length === 0 && proseWords.length === 0) { gate('noop-shape'); return; }
 
       // Decide what to inject, shaped by WHERE the index(es) are: the nearest
       // indexed ancestor of cwd, or — when cwd is an un-indexed workspace root
@@ -1138,7 +1428,7 @@ program
       // root (it only walked up), so the validated adoption lever never fired
       // exactly where the agent most needs it.
       const plan = planFrontload(String(input.cwd || process.cwd()), prompt);
-      if (!plan.exploreRoot && plan.nudgeProjects.length === 0) return; // nothing reachable — the agent's normal tools apply
+      if (!plan.exploreRoot && plan.nudgeProjects.length === 0) { gate('noop-no-index'); return; } // nothing reachable — the agent's normal tools apply
 
       // A "pass projectPath" line for indexed sub-projects we did NOT front-load.
       // Follow-up codegraph_explore calls against a sub-project (cwd isn't its
@@ -1150,31 +1440,71 @@ program
         const { default: CodeGraph } = await loadCodeGraph();
         const cg = await CodeGraph.open(plan.exploreRoot);
         try {
-          // Code-token-only prompt: require that at least one token is a REAL symbol
-          // in THIS index before front-loading. Without it, a brand name or common
-          // word that merely looks like code ("JavaScript", "GitHub") would run
-          // explore and inject ~16KB of low-relevance context (issue #994 follow-up).
-          // A keyword-bearing prompt skips this — the keyword is signal enough.
-          if (!keyworded && !codeTokens.some((t) => cg.getNodesByName(t).length > 0)) return;
-          const { ToolHandler } = await import('../mcp/tools');
-          const handler = new ToolHandler(cg);
-          const result = await handler.execute('codegraph_explore', { query: prompt });
-          const text = result.content[0]?.text ?? '';
-          if (!result.isError && text.trim()) {
-            // Cap the injection so a large-repo explore can't flood the prompt.
-            const MAX = 16000;
-            const body = text.length > MAX ? `${text.slice(0, MAX)}\n…(truncated; call codegraph_explore for the rest)` : text;
-            // For a front-loaded SUB-project, a follow-up explore needs its path.
-            const more = plan.viaSubScan
-              ? `call codegraph_explore with projectPath: "${plan.exploreRoot}" for more`
-              : 'call codegraph_explore for more';
-            const others = plan.nudgeProjects.length
-              ? `\n${nudge(plan.nudgeProjects, 'Other indexed projects in this workspace — pass projectPath to query them:')}`
-              : '';
-            process.stdout.write(
-              `<codegraph_context note="Structural context from CodeGraph for this prompt — treat returned source as already read; ${more}.">\n${body}${others}\n</codegraph_context>\n`,
-            );
+          const others = plan.nudgeProjects.length
+            ? `\n${nudge(plan.nudgeProjects, 'Other indexed projects in this workspace — pass projectPath to query them:')}`
+            : '';
+
+          // Tier decision against THIS index (issue #994 follow-up: candidates
+          // must be real here — a brand name or prose about another domain
+          // must not inject). Keyword-bearing prompts skip verification — the
+          // keyword is signal enough.
+          const tokenVerified = !keyworded && codeTokens.some((t) => cg.getNodesByName(t).length > 0);
+          if (keyworded || tokenVerified) {
+            const { ToolHandler } = await import('../mcp/tools');
+            const handler = new ToolHandler(cg);
+            const result = await handler.execute('codegraph_explore', { query: prompt });
+            const text = result.content[0]?.text ?? '';
+            if (!result.isError && text.trim()) {
+              // Cap the injection so a large-repo explore can't flood the prompt.
+              const MAX = 16000;
+              const body = text.length > MAX ? `${text.slice(0, MAX)}\n…(truncated; call codegraph_explore for the rest)` : text;
+              // For a front-loaded SUB-project, a follow-up explore needs its path.
+              const more = plan.viaSubScan
+                ? `call codegraph_explore with projectPath: "${plan.exploreRoot}" for more`
+                : 'call codegraph_explore for more';
+              process.stdout.write(
+                `<codegraph_context note="Structural context from CodeGraph for this prompt — treat returned source as already read; ${more}.">\n${body}${others}\n</codegraph_context>\n`,
+              );
+              gate(keyworded ? 'high-keyword' : 'high-token');
+            } else {
+              // A high-* outcome must mean context was actually delivered —
+              // the funnel's noop-vs-high split is how gate recall is
+              // measured (#1143). An explore error or empty result is a
+              // delivery failure, not a gate success.
+              gate(keyworded ? 'noop-explore-keyword' : 'noop-explore-token');
+            }
+            return;
           }
+
+          // MEDIUM: prose words → symbol-name segments, co-occurrence/rarity
+          // scored, each hit re-verified to exist (see getSegmentMatches). The
+          // payload names the symbols but does NOT run explore — the agent owns
+          // the query where the hook's confidence is only "these are related".
+          //
+          // A database indexed before the vocab table existed starts with it
+          // EMPTY, and only sync() backfills it — which this hook never runs
+          // (#1142). Heal it here: on a populated vocab this is one SELECT;
+          // the actual backfill is a one-time batched pass whose cost the MCP
+          // server's own catch-up sync usually pays first (it runs at every
+          // session start). A distinct noop outcome keeps a dormant vocab
+          // from polluting the noop-unverified recall signal.
+          const vocabReady = await cg.healSegmentVocabIfEmpty().catch(() => false);
+          if (!vocabReady) { gate('noop-vocab-empty'); return; }
+          const related = cg.getSegmentMatches(proseWords);
+          if (related.length === 0) { gate('noop-unverified'); return; }
+          const lines = related
+            .map((m) => `  - ${m.name} (${m.kind} — ${m.filePath}:${m.startLine})`)
+            .join('\n');
+          const exampleQuery = related.slice(0, 3).map((m) => m.name).join(' ');
+          const projectHint = plan.viaSubScan ? ` with projectPath: "${plan.exploreRoot}"` : '';
+          process.stdout.write(
+            `<codegraph_context note="CodeGraph found indexed symbols matching this prompt — query the graph before searching files.">\n` +
+            `This project's CodeGraph index contains symbols matching this request:\n${lines}\n` +
+            `Call codegraph_explore ONCE${projectHint} with the relevant names in one query (e.g. "${exampleQuery}") ` +
+            `to get their source, call paths, and blast radius — cheaper and more complete than Read/Grep.\n${others}` +
+            `</codegraph_context>\n`,
+          );
+          gate('medium-segment');
         } finally {
           cg.destroy();
         }
@@ -1186,6 +1516,7 @@ program
           nudge(plan.nudgeProjects, "This workspace's CodeGraph indexes live in sub-projects. To use CodeGraph, call codegraph_explore with the projectPath of the relevant one:") +
           `</codegraph_context>\n`,
         );
+        gate('nudge-projects');
       }
     } catch {
       // Degradable by contract: never surface an error to the prompt pipeline.
@@ -1240,7 +1571,14 @@ program
       const args: Record<string, unknown> = {};
       if (options.file) {
         args.file = options.file;
-        if (name && name !== options.file) args.symbol = name;
+        if (name && name !== options.file) {
+          args.symbol = name;
+          // Symbol mode pinned to a file is still symbol mode — the CLI
+          // always wants the body, exactly like the bare-symbol branch
+          // below. Omitting this printed location + trail with no source
+          // (#1284).
+          args.includeCode = true;
+        }
       } else if (name && (name.includes('/') || name.includes('\\'))) {
         args.file = name.replace(/\\/g, '/');
       } else if (name) {
@@ -1496,10 +1834,10 @@ program
   .aliases(['daemons'])
   .description('Manage running CodeGraph background daemons — pick one and press enter to stop it')
   .action(async () => {
-    const { listDaemons, stopDaemonAt, stopAllDaemons } = await import('../mcp/daemon-registry');
+    const { listVerifiedDaemons, stopDaemonAt, stopAllDaemons } = await import('../mcp/daemon-registry');
     const { runDaemonPicker } = await import('../mcp/daemon-manager');
 
-    const daemons = listDaemons();
+    const daemons = await listVerifiedDaemons();
     if (daemons.length === 0) {
       info('No CodeGraph daemons running.');
       return;
@@ -1522,7 +1860,7 @@ program
     const clack = await importESM('@clack/prompts');
     clack.intro('CodeGraph daemons');
     await runDaemonPicker({
-      list: listDaemons,
+      list: listVerifiedDaemons,
       stop: stopDaemonAt,
       stopAll: stopAllDaemons,
       cwdRoot,
@@ -1628,14 +1966,15 @@ program
       }
 
       const lockPath = path.join(getCodeGraphDir(projectPath), 'codegraph.lock');
-
-      if (!fs.existsSync(lockPath)) {
-        info(`No lock file found ${getGlyphs().dash} nothing to do`);
-        return;
+      let removed = false;
+      if (fs.existsSync(lockPath)) {
+        fs.unlinkSync(lockPath);
+        removed = true;
       }
-
-      fs.unlinkSync(lockPath);
-      success('Removed lock file. You can now run indexing again.');
+      const { clearStaleDaemonArtifacts } = await import('../mcp/daemon-registry');
+      removed = await clearStaleDaemonArtifacts(projectPath) || removed;
+      if (removed) success('Removed stale lock artifacts. You can now run indexing again.');
+      else info(`No stale lock files found ${getGlyphs().dash} nothing to do`);
     } catch (err) {
       error(`Failed to remove lock: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
@@ -2055,18 +2394,22 @@ program
  */
 program
   .command('install')
-  .description('Install codegraph MCP server into one or more agents (Claude Code, Cursor, Codex CLI, opencode, Hermes Agent)')
+  .description('Install codegraph MCP server into one or more agents (Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, GitHub Copilot)')
   .option('-t, --target <ids>', 'Target agent(s): comma-separated ids, or "auto"|"all"|"none". Default: prompt')
   .option('-l, --location <where>', 'Install location: "global" or "local". Default: prompt')
   .option('-y, --yes', 'Non-interactive: defaults to --location=global --target=auto, auto-allow on')
+  .option('-i, --init', 'After wiring agents, also run `codegraph init` in the current directory — builds this project’s index, so install + index is one command (combine with --yes for an unattended bootstrap)')
   .option('--no-permissions', 'Skip writing the auto-allow permissions list (Claude Code only)')
   .option('--print-config <id>', 'Print MCP config snippet for the named agent and exit (no file writes)')
+  .option('--refresh', 'Rewrite what previous installs configured, for already-configured agents only (never adds new ones). Run automatically by `codegraph upgrade`')
   .action(async (opts: {
     target?: string;
     location?: string;
     yes?: boolean;
+    init?: boolean;
     permissions?: boolean;
     printConfig?: string;
+    refresh?: boolean;
   }) => {
     if (opts.printConfig) {
       const { getTarget, listTargetIds } = await import('../installer/targets/registry');
@@ -2078,6 +2421,37 @@ program
       }
       const loc = (opts.location === 'local' ? 'local' : 'global') as 'global' | 'local';
       process.stdout.write(target.printConfig(loc));
+      return;
+    }
+
+    // --refresh: non-interactive sweep that re-writes what previous
+    // installs configured (instructions section, MCP entry, legacy-hook
+    // cleanups) for already-configured agents, so those surfaces match
+    // THIS binary's templates. Skips everything else — never a first
+    // install, never touches permissions or the prompt hook. Sweeps both
+    // locations unless --location narrows it.
+    if (opts.refresh) {
+      const { refreshTargets } = await import('../installer');
+      const { ALL_TARGETS } = await import('../installer/targets/registry');
+      if (opts.location && opts.location !== 'global' && opts.location !== 'local') {
+        error(`--location must be "global" or "local" (got "${opts.location}").`);
+        process.exit(1);
+      }
+      const locs: Array<'global' | 'local'> = opts.location
+        ? [opts.location as 'global' | 'local']
+        : ['global', 'local'];
+      let changed = 0;
+      for (const loc of locs) {
+        for (const report of refreshTargets(ALL_TARGETS, loc)) {
+          for (const p of report.changedPaths) {
+            changed += 1;
+            console.log(`  ${report.displayName}: refreshed ${p}`);
+          }
+        }
+      }
+      if (changed === 0) {
+        console.log('All configured agent surfaces are already current.');
+      }
       return;
     }
 
@@ -2110,6 +2484,18 @@ program
       error(err instanceof Error ? err.message : String(err));
       process.exit(1);
     }
+
+    // --init: the one-shot "wire agents AND build this project's index"
+    // bootstrap (#1578). The installer itself never indexes implicitly (a
+    // surprise index of $HOME is the thing we refuse) — an explicit flag is
+    // the user choosing. Runs after a successful install, including the
+    // `--target none` / nothing-detected case (the installer returns normally
+    // there), and shares every guard with `codegraph init`: an unsafe root
+    // is refused (exit 1, no implied --force), an already-initialized
+    // project just says so. `--yes` flows through so no offer prompts.
+    if (opts.init) {
+      await runInit(process.cwd(), { yes: opts.yes });
+    }
   });
 
 /**
@@ -2122,14 +2508,16 @@ program
  */
 program
   .command('uninstall')
-  .description('Remove codegraph from your agents (Claude Code, Cursor, Codex CLI, opencode, Hermes Agent)')
+  .description('Remove codegraph from your agents (Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, GitHub Copilot)')
   .option('-t, --target <ids>', 'Target agent(s): comma-separated ids, or "all". Default: all')
   .option('-l, --location <where>', 'Uninstall location: "global" or "local". Default: prompt')
   .option('-y, --yes', 'Non-interactive: defaults to --location=global --target=all')
+  .option('--keep-cli', 'Remove agent configs only — leave the codegraph CLI installed')
   .action(async (opts: {
     target?: string;
     location?: string;
     yes?: boolean;
+    keepCli?: boolean;
   }) => {
     const { runUninstaller } = await import('../installer');
     if (opts.location && opts.location !== 'global' && opts.location !== 'local') {
@@ -2141,6 +2529,8 @@ program
         target: opts.target,
         location: opts.location as 'global' | 'local' | undefined,
         yes: opts.yes,
+        keepCli: opts.keepCli,
+        cliFilename: __filename,
       });
     } catch (err) {
       error(err instanceof Error ? err.message : String(err));
@@ -2219,11 +2609,16 @@ program
         method,
         resolveLatest: () => up.resolveLatestVersion(),
         run: up.defaultRun,
+        capture: up.defaultCapture,
         hasCommand: up.hasCommand,
         log: (m: string) => console.log(m),
         warn: (m: string) => warn(m),
         error: (m: string) => error(m),
         platform: process.platform,
+        offerBetaSignup: async () => {
+          const { maybeOfferBetaSignup } = await import('../installer/beta-signup');
+          await maybeOfferBetaSignup({ source: 'cli-upgrade' });
+        },
       }
     );
     process.exit(code);

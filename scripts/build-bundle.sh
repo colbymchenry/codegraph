@@ -68,6 +68,26 @@ echo "[bundle] installing production dependencies"
 ( cd "$STAGE/lib" && npm ci --omit=dev --ignore-scripts >/dev/null 2>&1 )
 rm -f "$STAGE/lib/package-lock.json"
 
+# 3b. Native extraction kernel (optional). Included when a prebuilt .node for
+#     the target exists — release/kernel/<target>/codegraph-kernel.node (the
+#     release workflow's prebuild artifacts) or the locally staged
+#     codegraph-kernel/prebuilds/<target>/ (scripts/build-kernel.sh). Absent →
+#     the bundle simply runs the wasm extraction path; the kernel is a
+#     per-language speedup, never a requirement (see
+#     docs/design/rust-kernel-migration-plan.md).
+KERNEL_NODE=""
+for candidate in "$ROOT/release/kernel/${TARGET}/codegraph-kernel.node" \
+                 "$ROOT/codegraph-kernel/prebuilds/${TARGET}/codegraph-kernel.node"; do
+  if [ -f "$candidate" ]; then KERNEL_NODE="$candidate"; break; fi
+done
+if [ -n "$KERNEL_NODE" ]; then
+  mkdir -p "$STAGE/lib/kernel"
+  cp "$KERNEL_NODE" "$STAGE/lib/kernel/codegraph-kernel.node"
+  echo "[bundle] native kernel included ($KERNEL_NODE)"
+else
+  echo "[bundle] no native kernel for ${TARGET} — bundle uses the wasm extraction path"
+fi
+
 # 4. Vendored Node + launcher (the launcher uses the bundled Node by relative
 #    path, so no system Node is ever needed).
 #
@@ -81,7 +101,7 @@ rm -f "$STAGE/lib/package-lock.json"
 # runs are covered too; passing it here avoids that extra spawn.)
 if [ "$OSFAM" = "win32" ]; then
   cp "$NODE_BIN" "$STAGE/node.exe"
-  printf '@"%%~dp0..\\node.exe" --liftoff-only "%%~dp0..\\lib\\dist\\bin\\codegraph.js" %%*\r\n' \
+  printf '@"%%~dp0..\\node.exe" --liftoff-only --disable-warning=ExperimentalWarning "%%~dp0..\\lib\\dist\\bin\\codegraph.js" %%*\r\n' \
     > "$STAGE/bin/codegraph.cmd"
 else
   cp "$NODE_BIN" "$STAGE/node"
@@ -98,8 +118,15 @@ while [ -L "$SELF" ]; do
   esac
 done
 DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+# Thread the MCP host's pid to the server's orphan watchdog (issue #1185).
+# $PPID is our parent — the host itself when it launched this script directly;
+# an already-threaded value (the npm shim sets the true host pid) wins.
+CODEGRAPH_HOST_PPID="${CODEGRAPH_HOST_PPID:-$PPID}"
+export CODEGRAPH_HOST_PPID
 # --liftoff-only: avoid the V8 turboshaft WASM Zone OOM (issues #293/#298).
-exec "$DIR/node" --liftoff-only "$DIR/lib/dist/bin/codegraph.js" "$@"
+# --disable-warning=ExperimentalWarning: mute node:sqlite's per-thread
+# "experimental feature" warning that otherwise interleaves with the progress UI.
+exec "$DIR/node" --liftoff-only --disable-warning=ExperimentalWarning "$DIR/lib/dist/bin/codegraph.js" "$@"
 LAUNCH
   chmod +x "$STAGE/bin/codegraph"
 fi

@@ -16,7 +16,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { DatabaseConnection } from '../src/db';
 import { QueryBuilder } from '../src/db/queries';
-import { runMigrations, getCurrentVersion } from '../src/db/migrations';
+import { runMigrations, getCurrentVersion, CURRENT_SCHEMA_VERSION } from '../src/db/migrations';
 import { Node, Edge } from '../src/types';
 
 function makeNode(id: string, name = id): Node {
@@ -233,21 +233,22 @@ describe('runMaintenance', () => {
     if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('runs without throwing on a fresh database', () => {
-    expect(() => db.runMaintenance()).not.toThrow();
+  it('runs without throwing on a fresh database', async () => {
+    await expect(db.runMaintenance()).resolves.toBeUndefined();
   });
 
-  it('runs without throwing after writes', () => {
+  it('runs without throwing after writes', async () => {
     const q = new QueryBuilder(db.getDb());
     q.insertNodes([makeNode('n1'), makeNode('n2')]);
-    expect(() => db.runMaintenance()).not.toThrow();
+    await expect(db.runMaintenance()).resolves.toBeUndefined();
   });
 
-  it('swallows failures rather than propagating (best-effort)', () => {
+  it('swallows failures rather than propagating (best-effort)', async () => {
     // Close the DB so the underlying handle would normally throw on any
-    // exec(). runMaintenance must still not propagate.
+    // exec(). runMaintenance (worker on its own connection, or the in-line
+    // fallback) must still not propagate.
     db.close();
-    expect(() => db.runMaintenance()).not.toThrow();
+    await expect(db.runMaintenance()).resolves.toBeUndefined();
   });
 });
 
@@ -343,7 +344,11 @@ describe('migration v6: dedup edges + add identity index on upgrade (#1034)', ()
     runMigrations(raw, 5);
 
     expect(count()).toBe(2); // duplicate collapsed, the distinct `calls` edge kept
-    expect(getCurrentVersion(raw)).toBe(6);
+    // Migrations ran to completion. Tracked against the constant, not a
+    // literal, so adding a migration doesn't require editing this assertion —
+    // and so replaying every migration over a current-schema database (which
+    // is what this test does) stays covered as new ones land.
+    expect(getCurrentVersion(raw)).toBe(CURRENT_SCHEMA_VERSION);
     const idx = raw
       .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_edges_identity'")
       .get();

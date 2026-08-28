@@ -85,8 +85,10 @@ export interface LanguageExtractor {
    * grammar mis-parses inside enum bodies). MUST preserve byte offsets (replace
    * removed text with spaces, keep newlines) so node positions and getNodeText
    * stay correct; the returned string is used for both parsing and extraction.
+   * `filePath` lets a transform key off the concrete file extension when one
+   * language id serves several dialects (C++ also parses `.metal` shaders).
    */
-  preParse?: (source: string) => string;
+  preParse?: (source: string, filePath?: string) => string;
 
   // --- Node type mappings ---
 
@@ -100,6 +102,8 @@ export interface LanguageExtractor {
   interfaceTypes: string[];
   /** Node types that represent structs */
   structTypes: string[];
+  /** Node types that represent unions */
+  unionTypes?: string[];
   /** Node types that represent enums */
   enumTypes: string[];
   /** Node types that represent enum members/cases (e.g. Swift: 'enum_entry', Rust: 'enum_variant') */
@@ -132,6 +136,16 @@ export interface LanguageExtractor {
 
   /** Override symbol name extraction (e.g. ObjC multi-part selectors). */
   resolveName?: (node: SyntaxNode, source: string) => string | undefined;
+
+  /**
+   * Post-process an already-extracted name to recover a real identifier from a
+   * name still mangled by a macro the pre-parse didn't blank (C/C++:
+   * `MACRO Ret name(` misparses to the name "Ret name"). Applied to every name
+   * this extractor produces, so it MUST be a no-op on a well-formed name — only
+   * C/C++ set it, because a mangled name there is unambiguous (an internal space),
+   * whereas e.g. Kotlin/Scala backtick identifiers legitimately contain spaces.
+   */
+  recoverMangledName?: (name: string) => string;
 
   /** Extract property name when the generic name walk fails (e.g. ObjC @property). */
   extractPropertyName?: (node: SyntaxNode, source: string) => string | null;

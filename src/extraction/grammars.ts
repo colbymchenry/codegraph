@@ -7,6 +7,7 @@
  */
 
 import * as path from 'path';
+import * as fsp from 'fs/promises';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
 import { Language } from '../types';
 
@@ -39,6 +40,16 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   r: 'tree-sitter-r.wasm',
   luau: 'tree-sitter-luau.wasm',
   objc: 'tree-sitter-objc.wasm',
+  cfml: 'tree-sitter-cfml.wasm',
+  cfscript: 'tree-sitter-cfscript.wasm',
+  cfquery: 'tree-sitter-cfquery.wasm',
+  cobol: 'tree-sitter-cobol.wasm',
+  vbnet: 'tree-sitter-vbnet.wasm',
+  erlang: 'tree-sitter-erlang.wasm',
+  solidity: 'tree-sitter-solidity.wasm',
+  terraform: 'tree-sitter-terraform.wasm',
+  arkts: 'tree-sitter-arkts.wasm',
+  nix: 'tree-sitter-nix.wasm',
 };
 
 /**
@@ -50,6 +61,10 @@ export const EXTENSION_MAP: Record<string, Language> = {
   // ESM/CJS TypeScript module extensions — parsed as TS (no JSX). (#366)
   '.mts': 'typescript',
   '.cts': 'typescript',
+  // ArkTS (HarmonyOS / OpenHarmony) — a TypeScript superset with declarative
+  // UI (`@Component struct` + `build()`). Own grammar (a tree-sitter-typescript
+  // -style fork); plain `.ts` in an ArkTS project stays TypeScript. (#648)
+  '.ets': 'arkts',
   '.js': 'javascript',
   '.mjs': 'javascript',
   '.cjs': 'javascript',
@@ -112,13 +127,53 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.godot': 'godot_resource',
   '.m': 'objc',
   '.mm': 'objc',
+  '.sol': 'solidity',
+  // CFML: .cfc/.cfm parse with the tag-aware `cfml` grammar (custom CfmlExtractor
+  // dialect-switches to cfscript for bare-script content); .cfs is pure CFScript.
+  '.cfc': 'cfml',
+  '.cfm': 'cfml',
+  '.cfs': 'cfscript',
+  // Metal Shading Language ≈ C++14: the C++ grammar extracts its functions,
+  // structs, and calls. MSL-specific `[[attribute]]` annotations are blanked
+  // pre-parse for `.metal` files (see blankMetalAttributes in c-cpp.ts). (#1121)
+  '.metal': 'cpp',
+  // CUDA ≈ C++ plus execution-space specifiers (`__global__` …) and
+  // `<<<grid, block>>>` kernel-launch syntax: the C++ grammar extracts its
+  // functions/structs/classes/calls once blankCudaConstructs (pre-parse; gated
+  // by these extensions OR by content for CUDA living in `.h`/`.hpp` headers —
+  // see c-cpp.ts) blanks the CUDA-only tokens. (#387)
+  '.cu': 'cpp',
+  '.cuh': 'cpp',
+  '.nix': 'nix',
   // XML: file-level tracking; the MyBatis extractor matches `<mapper namespace="...">`
   // shape and emits SQL-statement nodes (other XML returns empty).
   '.xml': 'xml',
+  // COBOL: programs (.cbl/.cob) and copybooks (.cpy). Vendored grammar
+  // (patched yutaro-sakamoto/tree-sitter-cobol) handles fixed-format column
+  // rules, EXEC CICS/SQL blocks, and standalone copybook fragments.
+  '.cbl': 'cobol',
+  '.cob': 'cobol',
+  '.cobol': 'cobol',
+  '.cpy': 'cobol',
+  // VB.NET: vendored grammar (patched govindbanura/tree-sitter-vbnet) — classes,
+  // modules, interfaces, structures, properties, events, Handles clauses, LINQ.
+  '.vb': 'vbnet',
+  // Erlang: modules (.erl) and header files (.hrl). Vendored WhatsApp/
+  // tree-sitter-erlang grammar (the ELP grammar).
+  '.erl': 'erlang',
+  '.hrl': 'erlang',
+  // escripts parse natively — the grammar has a first-class `shebang` node.
+  // (`.app`/`.app.src` resource files route via isErlangAppFile below: their
+  // last-dot extension is too generic for this map.)
+  '.escript': 'erlang',
   // Spring config: `application.properties` / `application-*.properties`. Same
   // shape as the `.yml` variants — the YAML/properties extractor emits one node
   // per leaf key, and the Spring resolver links `@Value("${k}")` references.
   '.properties': 'properties',
+  // Terraform / OpenTofu / HCL config — tree-sitter-terraform dialect of HCL.
+  '.tf': 'terraform',
+  '.tfvars': 'terraform',
+  '.tofu': 'terraform',
 };
 
 /**
@@ -133,6 +188,7 @@ export const EXTENSION_MAP: Record<string, Language> = {
 export function isSourceFile(filePath: string, overrides?: Record<string, Language>): boolean {
   if (isPlayRoutesFile(filePath)) return true; // Play `conf/routes` is extensionless
   if (isShopifyLiquidJson(filePath)) return true; // Shopify OS 2.0 JSON templates / section groups
+  if (isErlangAppFile(filePath)) return true; // OTP `.app`/`.app.src` resource files
   const dot = filePath.lastIndexOf('.');
   if (dot < 0) return false;
   const ext = filePath.slice(dot).toLowerCase();
@@ -148,6 +204,18 @@ export function isShopifyLiquidJson(filePath: string): boolean {
   // Allow nested template dirs (`templates/customers/login.json`), not just
   // top-level (`templates/product.json`).
   return /(^|\/)(templates|sections)\/.+\.json$/i.test(filePath);
+}
+
+/**
+ * OTP application resource file: `<app>.app.src` (checked into every rebar3/
+ * erlang.mk app) or its compiled `<app>.app`. Erlang TERMS, not forms — the
+ * grammar parses them as top-level expressions, and the Erlang extractor's
+ * application-tuple handler turns `{mod, {Mod, _}}` and `{applications, […]}`
+ * into entry-module and dependency edges. Routed by full suffix because the
+ * last-dot extension (`.src`) is far too generic for EXTENSION_MAP.
+ */
+export function isErlangAppFile(filePath: string): boolean {
+  return /\.app(?:\.src)?$/i.test(filePath);
 }
 
 /**
@@ -186,22 +254,163 @@ export async function initGrammars(): Promise<void> {
 }
 
 /**
+ * Grammars that ship their own vendored WASMs under `dist/extraction/wasm/`
+ * (not in tree-sitter-wasms, or the tree-sitter-wasms build is too old).
+ * Lua: tree-sitter-wasms ships an ABI-13 build that corrupts the shared WASM
+ * heap under web-tree-sitter 0.25 (drops nested calls/imports on every file
+ * after the first); we vendor the upstream ABI-15 wasm instead. C#: the
+ * tree-sitter-wasms build (ABI 13) has no primary-constructor support and
+ * parses `class Foo(...)` as an ERROR that swallows the whole class (#237); we
+ * vendor the upstream ABI-15 tree-sitter-c-sharp 0.23.5 wasm, which parses
+ * primary constructors natively. Terraform: tree-sitter-wasms does not ship
+ * HCL/Terraform at all, so we vendor the prebuilt tree-sitter-terraform.wasm
+ * from @tree-sitter-grammars/tree-sitter-hcl 1.2.0 (Apache-2.0) —
+ * byte-identical to the npm package's artifact. ArkTS: tree-sitter-wasms
+ * doesn't ship it either; we vendor the prebuilt tree-sitter-arkts.wasm from
+ * the tree-sitter-arkts 0.2.0 npm package (harmony-contrib/tree-sitter-arkts,
+ * MIT) — byte-identical to the npm tarball's artifact. It extends the
+ * tree-sitter-javascript grammar the same way tree-sitter-typescript does,
+ * adding `struct_declaration` and the `arkui_component_expression` build()
+ * DSL. Nix: tree-sitter-wasms doesn't ship it; we vendor a wasm built from
+ * nix-community/tree-sitter-nix @ 3d0173d (MIT) with tree-sitter-cli 0.25.10
+ * (`generate` + `build --wasm`, ABI 15 — upstream's checked-in parser.c is
+ * still ABI 13; all 54 upstream corpus tests pass on the regenerated parser).
+ *
+ * TypeScript/TSX/JavaScript (+jsx, which shares the javascript grammar): the
+ * tree-sitter-wasms builds are 2023-era (^0.20.x); we vendor wasm built from
+ * the SAME grammar revisions the native extraction kernel compiles
+ * (codegraph-kernel/Cargo.toml), so the kernel path and the wasm fallback
+ * parse identically and per-language routing stays graph-neutral:
+ *   - tree-sitter/tree-sitter-typescript v0.23.2 (f975a62) → typescript + tsx
+ *   - tree-sitter/tree-sitter-javascript v0.25.0 (44c892e) → javascript + jsx
+ *   - tree-sitter/tree-sitter-java v0.23.5 (94703d5) → java
+ *   - tree-sitter/tree-sitter-python v0.23.6 (bffb65a) → python
+ *   - tree-sitter/tree-sitter-go v0.23.4 (3c3775f) → go
+ * Built from each repo's CHECKED-IN parser.c (no `generate`) with
+ * tree-sitter-cli 0.25.10 `build --wasm` — the same tables crates.io compiles
+ * (parser.c sha-matched against the crates.io tarball).
+ * The kernel-grammar-parity test asserts this alignment; bump the crate and
+ * the vendored wasm together.
+ */
+const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
+  'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
+  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
+  'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
+  // R7a (C/C++ kernel port prep): tree-sitter-c v0.24.2 (b780e47) +
+  // tree-sitter-cpp v0.23.4 (f41e1a0), parser.c/scanner.c sha-matched against
+  // the crates.io tarballs. `.metal`/`.cu` map to language 'cpp', so the
+  // dialects ride the same (single, coherent) upgraded grammar.
+  'c', 'cpp',
+  // R7b (Rust kernel port prep): tree-sitter-rust v0.24.2 (77a3747),
+  // parser.c/scanner.c sha-matched against the crates.io tarball. Replaces the
+  // 2023-era tree-sitter-wasms build (ABI 14 → 15).
+  'rust',
+  // R7b (Ruby kernel port prep): tree-sitter-ruby v0.23.1 (71bd32f),
+  // parser.c/scanner.c sha-matched against the crates.io tarball. Replaces the
+  // ^0.20.1 tree-sitter-wasms build. Content bump only — the tag's checked-in
+  // parser.c is still ABI 14 (predates the ABI-15 generator).
+  'ruby',
+  // R7b (PHP kernel port prep): tree-sitter-php v0.24.2 (5b5627f), the FULL
+  // `php` grammar variant (HTML interleaving — php_only errors on leading
+  // HTML), built from the tag's checked-in php/src/parser.c + scanner.c
+  // (+ shared common/scanner.h), all sha-matched against the crates.io
+  // tarball. Replaces the ^0.22 tree-sitter-wasms build (ABI 14 → 15). NOT
+  // graph-neutral — the classified delta list lives in the php checklist doc.
+  'php',
+  // R7b (Swift kernel port prep): tree-sitter-swift crate 0.7.3. Built from
+  // the CRATE TARBALL's src/ (NOT a tag sha-match: alex-pinkus keeps
+  // generated files off main and the 0.7.3-with-generated-files tag ships an
+  // older ABI-14 generation; grammar.json rules are JSON-equal, and the crate
+  // tarball is byte-for-byte what the kernel's cargo build compiles — table
+  // identity by construction). Replaces the ^0.4.0 tree-sitter-wasms build
+  // (ABI 13 → 15). NOT graph-neutral — delta is error-set membership only;
+  // classified list in the swift checklist doc.
+  'swift',
+  // R7b (Kotlin kernel port prep): fwcd tree-sitter-kotlin 0.3.8 (tag
+  // e1a2d5a), parser.c/scanner.c sha-matched crate↔tag; behavior-IDENTICAL
+  // to the tree-sitter-wasms build (0 CST/error disagreements across the
+  // gate repos) — a reproducibility re-vendor, ABI stays 14. The crates.io
+  // crate is UNUSABLE by the kernel (pins tree-sitter <0.23) and
+  // tree-sitter-kotlin-ng is a different grammar — the kernel compiles the
+  // same vendored C sources instead (codegraph-kernel/grammars/kotlin).
+  'kotlin',
+  // R7b batch 4 (Dart kernel port prep): the byte-copied tree-sitter-wasms
+  // 0.1.13 artifact (sha256 7f5364e4…, built from UserNobody14/
+  // tree-sitter-dart master@d4d8f3e337d8). tree-sitter-wasms' dart dep is an
+  // UNPINNED github ref, so a routine tree-sitter-wasms update would have
+  // silently changed dart's grammar — vendoring kills that hazard. The
+  // kernel compiles the same-commit vendored C (codegraph-kernel/grammars/
+  // dart); crates.io tree-sitter-dart is a different-lineage fork (rejected).
+  'dart',
+]);
+
+/** Absolute path of a language's grammar WASM (vendored or tree-sitter-wasms). */
+function resolveWasmPath(lang: GrammarLanguage): string {
+  const wasmFile = WASM_GRAMMAR_FILES[lang];
+  return VENDORED_WASM_LANGS.has(lang)
+    ? path.join(__dirname, 'wasm', wasmFile)
+    : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
+}
+
+/**
+ * Expand an index set's languages to the grammars actually needed to parse it.
+ * SFC languages (svelte/vue/astro) have no grammar of their own — their
+ * extractors delegate <script>/frontmatter content to the TS/JS extractor, so
+ * those grammars must be loaded even when no plain .ts/.js file is in the index
+ * set (e.g. a pure-.astro content site). CFML (.cfc/.cfm) likewise delegates
+ * bare-script content, <cfscript> tag bodies, and <cfquery> SQL bodies to the
+ * cfscript/cfquery grammars (see injections.scm in tree-sitter-cfml).
+ */
+function expandGrammarLanguages(languages: Language[]): Language[] {
+  if (languages.some((l) => l === 'svelte' || l === 'vue' || l === 'astro')) {
+    languages = [...languages, 'typescript', 'javascript'];
+  }
+  if (languages.some((l) => l === 'cfml')) {
+    languages = [...languages, 'cfscript', 'cfquery'];
+  }
+  return languages;
+}
+
+/**
+ * Pre-read the grammar WASM bytes for an index set, keyed by language. The
+ * orchestrator reads each grammar ONCE and hands the bytes to every parse
+ * worker via its `load-grammars` message, so worker spawns/respawns load
+ * grammars from memory instead of re-reading them from disk — on slow storage
+ * (HDD, issue #1231) each respawn's grammar re-read otherwise amplifies the
+ * I/O contention that caused the respawn. Best-effort: a language whose WASM
+ * can't be read here is simply omitted, and the worker falls back to its own
+ * disk load (which surfaces the real error/warning path).
+ */
+export async function readGrammarWasmBytes(languages: Language[]): Promise<Record<string, Uint8Array>> {
+  const out: Record<string, Uint8Array> = {};
+  const toRead = [...new Set(expandGrammarLanguages(languages))].filter(
+    (lang): lang is GrammarLanguage => lang in WASM_GRAMMAR_FILES
+  );
+  for (const lang of toRead) {
+    try {
+      out[lang] = await fsp.readFile(resolveWasmPath(lang));
+    } catch {
+      // fall through — the worker's own load reports the failure
+    }
+  }
+  return out;
+}
+
+/**
  * Load grammar WASM files for specific languages only.
  * Skips languages that are already loaded or have no WASM grammar.
  * Must be called after initGrammars().
+ *
+ * `wasmBytes` (optional) holds pre-read grammar bytes keyed by language (from
+ * {@link readGrammarWasmBytes}, forwarded through the parse pool); when a
+ * language's bytes are present they're loaded from memory instead of disk.
  */
-export async function loadGrammarsForLanguages(languages: Language[]): Promise<void> {
+export async function loadGrammarsForLanguages(languages: Language[], wasmBytes?: Record<string, Uint8Array>): Promise<void> {
   if (!parserInitialized) {
     await initGrammars();
   }
 
-  // SFC languages (svelte/vue/astro) have no grammar of their own — their
-  // extractors delegate <script>/frontmatter content to the TS/JS extractor,
-  // so those grammars must be loaded even when no plain .ts/.js file is in
-  // the index set (e.g. a pure-.astro content site).
-  if (languages.some((l) => l === 'svelte' || l === 'vue' || l === 'astro')) {
-    languages = [...languages, 'typescript', 'javascript'];
-  }
+  languages = expandGrammarLanguages(languages);
 
   // Deduplicate and filter to languages that have WASM grammars and aren't already loaded
   const toLoad = [...new Set(languages)].filter(
@@ -214,21 +423,9 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
   // Load grammars sequentially to avoid web-tree-sitter WASM race condition on Node 20+
   // See: https://github.com/tree-sitter/tree-sitter/issues/2338
   for (const lang of toLoad) {
-    const wasmFile = WASM_GRAMMAR_FILES[lang];
     try {
-      // Some grammars ship their own WASMs (not in tree-sitter-wasms, or the
-      // tree-sitter-wasms build is too old). Lua: tree-sitter-wasms ships an
-      // ABI-13 build that corrupts the shared WASM heap under web-tree-sitter
-      // 0.25 (drops nested calls/imports on every file after the first); we
-      // vendor the upstream ABI-15 wasm instead. C#: the tree-sitter-wasms
-      // build (ABI 13) has no primary-constructor support and parses
-      // `class Foo(...)` as an ERROR that swallows the whole class (#237); we
-      // vendor the upstream ABI-15 tree-sitter-c-sharp 0.23.5 wasm, which parses
-      // primary constructors natively.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r')
-        ? path.join(__dirname, 'wasm', wasmFile)
-        : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
-      const language = await WasmLanguage.load(wasmPath);
+      const bytes = wasmBytes?.[lang];
+      const language = await WasmLanguage.load(bytes ?? resolveWasmPath(lang));
       languageCache.set(lang, language);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -289,6 +486,9 @@ export function detectLanguage(filePath: string, source?: string, overrides?: Re
   // Shopify OS 2.0 JSON templates / section groups → the Liquid extractor (it
   // links each section `"type"` to its `sections/<type>.liquid`).
   if (isShopifyLiquidJson(filePath)) return 'liquid';
+  // OTP `.app`/`.app.src` resource files — Erlang terms the grammar parses as
+  // top-level expressions (last-dot ext `.src` is too generic for the map).
+  if (isErlangAppFile(filePath)) return 'erlang';
   const lang = (overrides && overrides[ext]) || EXTENSION_MAP[ext] || 'unknown';
 
   // .h files could be C, C++, or Objective-C — check source content
@@ -301,12 +501,60 @@ export function detectLanguage(filePath: string, source?: string, overrides?: Re
 }
 
 /**
+ * A class/struct BASE CLAUSE — `struct Derived : Base {`, `class Foo final :
+ * public Bar, private Baz {`, `struct D : ns::B<T> {` — which is never valid
+ * C. In C the only thing that can follow `struct <tag>` is `{`, `;`, `*`, an
+ * identifier (declarator), or a closing `)`: a bit-field's `:` sits after a
+ * member NAME inside the body (`unsigned a : 3;`), a ternary's `:` is
+ * separated from the tag by `)` / `*` / a declarator (`sizeof(struct foo) :
+ * 0`), and a label such as `struct_end:` has no whitespace after `struct`. An
+ * optional access specifier / `virtual` after the colon and an optional
+ * `final` before it cover the spelled-out forms; the base may be scoped
+ * (`ns::Base`) and carry template arguments, and must be followed by the
+ * body's `{` or a `,` introducing the next base — prose like
+ * `struct timeval: seconds and microseconds` inside a string never has that
+ * terminator. Comments are stripped before the scan (see `looksLikeCpp`).
+ */
+const CPP_BASE_CLAUSE_RE =
+  /\b(?:class|struct)\s+\w+\s*(?:final\s*)?:\s*(?:(?:public|protected|private|virtual)\s+)*[A-Za-z_][\w:]*(?:\s*<[^{};]*>)?\s*[{,]/;
+
+/** Block and line comments, for a code-only scan. Lazy block match → linear. */
+const C_COMMENT_RE = /\/\*[\s\S]*?\*\/|\/\/[^\n]*/g;
+
+/**
  * Heuristic: does a .h file contain C++ constructs?
- * Checks the first ~8KB for patterns that are unique to C++ and never valid C.
+ *
+ * Two passes. The first checks the first ~8KB for patterns that are unique to
+ * C++ and never valid C. The second scans the FULL source for a class/struct
+ * base clause (`CPP_BASE_CLAUSE_RE`): a large header with a long C-compatible
+ * preamble — include guards, `#define`s, plain C typedefs — can put its only
+ * C++ signal past the sample, and the cost of that miss is the C extractor
+ * (classTypes: []) dropping the derived type entirely and minting a phantom
+ * `function Base` from the base clause instead (#1592). The base-clause regex
+ * is anchored on a `struct`/`class` keyword followed by a tag and a colon, a
+ * shape with no C reading, so widening it to the whole file cannot drag a C
+ * header over to C++.
  */
 function looksLikeCpp(source: string): boolean {
   const sample = source.substring(0, 8192);
-  return /\bnamespace\b|\bclass\s+\w+\s*[:{]|\btemplate\s*<|\b(?:public|private|protected)\s*:|\bvirtual\b|\busing\s+(?:namespace\b|\w+\s*=)/.test(sample);
+  // The `class MACRO Name : Base` / `class MACRO Name { … }` branch mirrors what
+  // `blankCppExportMacros` recovers: an ALL-CAPS export/visibility macro
+  // (`ENGINE_API`, `MYMODULE_API`, `*_EXPORT`, …) sitting between `class`/`struct`
+  // and the type name. Without it, a header whose ONLY C++ signal is such a
+  // macro-annotated class — common for lean Unreal-Engine types that carry just
+  // `GENERATED_BODY()` and no explicit `public:`/`virtual` — is misdetected as C,
+  // routed through the C extractor (which extracts no classes), and its class
+  // definition silently vanishes. The two-token shape (`<KW> <MACRO> <Name>`
+  // before a `[:{]`) never occurs in valid C, so this can't misclassify C headers.
+  if (/\bnamespace\b|\bclass\s+\w+\s*[:{]|\b(?:class|struct)\s+[A-Z][A-Z0-9_]+\s+\w+\s*(?:final\s*)?[:{]|\btemplate\s*<|\b(?:public|private|protected)\s*:|\bvirtual\b|\busing\s+(?:namespace\b|\w+\s*=)/.test(sample)) {
+    return true;
+  }
+  // Plain `struct Derived : Base` (no export macro, no `class` keyword, no
+  // explicit access section) — the #1159 branch above only recognizes the
+  // macro-annotated form. Scanned over the whole file, not the sample, with
+  // comments removed so a doc comment's prose (`struct foo: x, y`) can't
+  // flip a C header.
+  return CPP_BASE_CLAUSE_RE.test(source.replace(C_COMMENT_RE, ' '));
 }
 
 /**
@@ -440,10 +688,20 @@ export function getLanguageDisplayName(language: Language): string {
     gdscript: 'GDScript',
     godot_resource: 'Godot Resource',
     objc: 'Objective-C',
+    solidity: 'Solidity',
+    nix: 'Nix',
     yaml: 'YAML',
     twig: 'Twig',
     xml: 'XML',
     properties: 'Java properties',
+    cfml: 'CFML',
+    cfscript: 'CFScript',
+    cfquery: 'CFQuery (SQL)',
+    cobol: 'COBOL',
+    vbnet: 'Visual Basic .NET',
+    erlang: 'Erlang',
+    terraform: 'Terraform',
+    arkts: 'ArkTS',
     unknown: 'Unknown',
   };
   return names[language] || language;

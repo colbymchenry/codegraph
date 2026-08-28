@@ -12,6 +12,7 @@ import { CodeGraph } from '../src';
 import { Node, Edge } from '../src/types';
 import { isInitialized, getCodeGraphDir, validateDirectory, codeGraphDirName, isCodeGraphDataDir } from '../src/directory';
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from '../src/db';
+import { CURRENT_SCHEMA_VERSION } from '../src/db/migrations';
 
 // Create a temporary directory for each test
 function createTempDir(): string {
@@ -117,6 +118,41 @@ describe('CodeGraph Foundation', () => {
       expect(stats.fileCount).toBe(0);
 
       cg.close();
+    });
+
+    it('restores every secondary index after a crash inside bulk parse load (#1556)', () => {
+      const dbPath = getDatabasePath(tempDir);
+      const first = DatabaseConnection.initialize(dbPath);
+      const before = (first.getDb()
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+        .all() as Array<{ name: string }>).map((r) => r.name);
+      first.beginBulkParseLoad();
+      first.close();
+
+      const reopened = DatabaseConnection.open(dbPath);
+      const after = (reopened.getDb()
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+        .all() as Array<{ name: string }>).map((r) => r.name);
+      reopened.close();
+
+      expect(after).toEqual(before);
+    });
+
+    it('skips secondary-index DDL when the schema is already healthy', () => {
+      const dbPath = getDatabasePath(tempDir);
+      const connection = DatabaseConnection.initialize(dbPath);
+      const db = connection.getDb();
+      const originalExec = db.exec.bind(db);
+      let execCalls = 0;
+      db.exec = (sql: string) => {
+        execCalls++;
+        originalExec(sql);
+      };
+
+      (connection as any).healBulkSecondaryIndexes();
+      connection.close();
+
+      expect(execCalls).toBe(0);
     });
 
     it('should return correct database size', () => {
@@ -370,7 +406,9 @@ describe('Database Connection', () => {
 
     const version = db.getSchemaVersion();
     expect(version).not.toBeNull();
-    expect(version?.version).toBe(6);
+    // A freshly initialized database records the current version outright
+    // (schema.sql already contains every migration's end state).
+    expect(version?.version).toBe(CURRENT_SCHEMA_VERSION);
 
     db.close();
   });

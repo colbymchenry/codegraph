@@ -57,6 +57,15 @@ function writeLauncher(binDir: string): void {
   fs.chmodSync(p, 0o755);
 }
 
+// A fake bundle launcher that echoes the threaded host pid, so we can prove the
+// shim passed CODEGRAPH_HOST_PPID down to the server (#1185).
+function writeHostPpidLauncher(binDir: string): void {
+  fs.mkdirSync(binDir, { recursive: true });
+  const p = path.join(binDir, 'codegraph');
+  fs.writeFileSync(p, '#!/bin/sh\necho "HOST_PPID=[${CODEGRAPH_HOST_PPID}]"\n');
+  fs.chmodSync(p, 0o755);
+}
+
 // Launch the shim with async spawn so the in-process HTTPS server can respond
 // while it runs (spawnSync would block this event loop and deadlock).
 function runShim(pkgDir: string, args: string[], env: Record<string, string>) {
@@ -70,6 +79,23 @@ function runShim(pkgDir: string, args: string[], env: Record<string, string>) {
     child.on('close', (status) => resolve({ status, stdout, stderr }));
   });
 }
+
+// Static source guard (all platforms): every child spawn in the shim must set
+// windowsHide, or a console (conhost) window flashes when the shim runs as a
+// background MCP server on Windows (issue #1092). windowsHide is a Windows-only
+// spawn behavior that can't be observed from these POSIX-only subprocess tests,
+// so we assert it at the source level instead — and this also catches any new
+// spawn site added to the shim later.
+describe('npm-shim windowsHide (#1092)', () => {
+  it('sets windowsHide: true on every spawn in the shim', () => {
+    const src = fs.readFileSync(SHIM_SRC, 'utf8');
+    const spawnLines = src.split('\n').filter((l) => /\.spawn(Sync)?\(/.test(l));
+    expect(spawnLines.length).toBeGreaterThan(0); // guard against a false pass if the calls move
+    for (const line of spawnLines) {
+      expect(line, `spawn without windowsHide: ${line.trim()}`).toContain('windowsHide: true');
+    }
+  });
+});
 
 describe.skipIf(isWindows)('npm-shim launcher', () => {
   it('runs the installed optional-dependency bundle without any download', async () => {
@@ -142,6 +168,39 @@ describe.skipIf(isWindows)('npm-shim launcher', () => {
     expect(r.stderr).toContain(`@colbymchenry/codegraph-${target}`);
     expect(r.stderr).toContain('--registry=https://registry.npmjs.org');
     expect(r.stderr).toContain('install.sh');
+  });
+
+  // #1185: the shim threads the MCP host's pid (its own parent) down to the
+  // bundled server so the server's orphan watchdog can poll the host directly
+  // — the fix for a server left orphaned when the launcher is killed during its
+  // startup. The shim's own parent here is the vitest runner (a real live pid).
+  it('threads CODEGRAPH_HOST_PPID to the bundled server (#1185)', async () => {
+    const pkg = makePkg();
+    const platformPkg = path.join(pkg, 'node_modules', '@colbymchenry', `codegraph-${target}`);
+    writeHostPpidLauncher(path.join(platformPkg, 'bin'));
+    fs.writeFileSync(path.join(platformPkg, 'package.json'),
+      JSON.stringify({ name: `@colbymchenry/codegraph-${target}`, version: '9.9.9-test' }) + '\n');
+    const r = await runShim(pkg, [], { CODEGRAPH_INSTALL_DIR: mkTmp('cache') });
+
+    expect(r.status).toBe(0);
+    // Non-empty and numeric — the shim's parent pid was passed through.
+    const m = r.stdout.match(/HOST_PPID=\[(\d+)\]/);
+    expect(m, `expected a numeric HOST_PPID, got: ${r.stdout}`).not.toBeNull();
+    expect(Number(m![1])).toBeGreaterThan(0);
+  });
+
+  it('does not clobber an already-set CODEGRAPH_HOST_PPID (#1185)', async () => {
+    const pkg = makePkg();
+    const platformPkg = path.join(pkg, 'node_modules', '@colbymchenry', `codegraph-${target}`);
+    writeHostPpidLauncher(path.join(platformPkg, 'bin'));
+    fs.writeFileSync(path.join(platformPkg, 'package.json'),
+      JSON.stringify({ name: `@colbymchenry/codegraph-${target}`, version: '9.9.9-test' }) + '\n');
+    // An outer launcher already threaded the true host pid — it must win over
+    // the shim's own parent, or a chain of launchers would each overwrite it.
+    const r = await runShim(pkg, [], { CODEGRAPH_INSTALL_DIR: mkTmp('cache'), CODEGRAPH_HOST_PPID: '424242' });
+
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('HOST_PPID=[424242]');
   });
 });
 

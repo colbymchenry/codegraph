@@ -418,9 +418,11 @@ export class Daemon {
   /**
    * Defense-in-depth against a daemon that outlives its clients (#692), for the
    * cases the refcount + idle timer miss because a socket close never arrives:
-   *   - **Inactivity backstop:** exit if no inbound traffic for `maxIdleMs` while
-   *     clients are still (nominally) connected. A phantom client sends nothing,
-   *     so it can't pin the daemon past this window.
+   *   - **Inactivity backstop:** after `maxIdleMs` with no inbound traffic, reap
+   *     the daemon — but ONLY if no connected client can be proven alive (see
+   *     {@link backstopShouldExit}). This is the sole phantom class the sweep
+   *     below can't catch: a client whose client-hello never arrived, so we have
+   *     no pid to check.
    *   - **Liveness sweep:** drop any client whose peer process has died (per the
    *     client-hello pids), which re-arms the idle timer once the last real
    *     client is gone. Catches a dead peer within one sweep instead of waiting
@@ -432,10 +434,7 @@ export class Daemon {
     if (this.maxIdleMs > 0) {
       const tick = Math.min(this.maxIdleMs, 60_000);
       this.maxIdleTimer = setInterval(() => {
-        if (this.stopping || this.clients.size === 0) return; // idle timer owns the no-client case
-        if (Date.now() - this.lastActivityAt >= this.maxIdleMs) {
-          void this.stop('inactivity backstop');
-        }
+        if (this.backstopShouldExit(isProcessAlive)) void this.stop('inactivity backstop');
       }, tick);
       this.maxIdleTimer.unref?.();
     }
@@ -444,6 +443,37 @@ export class Daemon {
       this.clientSweepTimer = setInterval(() => this.reapDeadClients(isProcessAlive), sweepMs);
       this.clientSweepTimer.unref?.();
     }
+  }
+
+  /**
+   * Decide whether the inactivity backstop should reap the daemon right now.
+   * Public + `isAlive`-injected for deterministic tests; the timer calls it each
+   * tick with the real liveness probe.
+   *
+   * The backstop exists ONLY to catch a **phantom** client (#692) — one counted
+   * but actually gone, whose socket-close was never delivered. It must never
+   * reap a **live-but-quiet** session (connected, alive peer, just not querying):
+   * doing so silently severed the shared daemon and degraded that session — and
+   * any others sharing it — to an in-process engine. `lastActivityAt` only tracks
+   * inbound query bytes, and MCP has no keepalive, so a genuinely-live session
+   * trips the raw inactivity window after ~30 min of not being queried.
+   *
+   * So: once the inactivity window elapses, drop provably-dead peers (the same
+   * check the periodic sweep runs), then reap the daemon only when NOT ONE
+   * remaining client can be proven alive — i.e. every client left is an
+   * unknown-pid connection the sweep can't verify. A single provably-alive
+   * client keeps the daemon up. Has the sweep's side effect (drops dead peers).
+   */
+  backstopShouldExit(isAlive: (pid: number) => boolean): boolean {
+    if (this.stopping || this.clients.size === 0) return false; // idle timer owns the no-client case
+    if (Date.now() - this.lastActivityAt < this.maxIdleMs) return false; // still within the window
+    this.reapDeadClients(isAlive);
+    if (this.clients.size === 0) return false; // sweep cleared them — idle timer takes over
+    const anyProvablyAlive = [...this.clients].some((session) => {
+      const peers = this.clientPeers.get(session);
+      return peers != null && peers.pid !== null && !peerIsDead(peers, isAlive);
+    });
+    return !anyProvablyAlive;
   }
 
   /**
@@ -599,25 +629,31 @@ export function acquireLockViaExclusiveOpen(pidPath: string, info: DaemonLockInf
 }
 
 /**
- * Remove a stale pidfile, but only if it still names a dead process. Re-reads
- * the file immediately before unlinking so we never delete a lock that a live
- * daemon (re)acquired in the meantime.
+ * Remove a stale pidfile. Re-reads the file immediately before unlinking so a
+ * different daemon that acquired the lock in the meantime is never disturbed.
  *
  * must-fix 1 (issue #411 review): the original unconditionally `unlink`'d,
  * which let a racing candidate delete a healthy daemon's lock. Passing
  * `expectedDeadPid` (the pid the caller believed was dead) makes the clear a
- * compare-and-delete: bail if the file now holds a different pid, or any live
- * pid. Returns true when the stale lock is gone (or was already gone).
+ * compare-and-delete: bail if the file now holds a different pid. By default a
+ * live pid is also preserved; `allowLivePid` is reserved for callers that have
+ * already disproved daemon identity with the socket hello (#1553). Returns true
+ * when the stale lock is gone (or was already gone).
  */
-export function clearStaleDaemonLock(pidPath: string, expectedDeadPid?: number): boolean {
+export function clearStaleDaemonLock(
+  pidPath: string,
+  expectedDeadPid?: number,
+  opts: { allowLivePid?: boolean } = {}
+): boolean {
   try {
     const raw = fs.readFileSync(pidPath, 'utf8');
     const info = decodeLockInfo(raw);
     if (info) {
       // A different pid took over since we read it — not ours to clear.
       if (expectedDeadPid !== undefined && info.pid !== expectedDeadPid) return false;
-      // Holder is actually alive — never clear a live daemon's lock.
-      if (info.pid > 0 && isProcessAlive(info.pid)) return false;
+      // PID liveness is normally sufficient. The takeover caller may override
+      // it only after a failed identity handshake proves PID reuse.
+      if (!opts.allowLivePid && info.pid > 0 && isProcessAlive(info.pid)) return false;
     }
     fs.unlinkSync(pidPath);
     return true;
@@ -773,10 +809,24 @@ function readClientHello(
     ) => {
       if (settled) return;
       settled = true;
+      // PAUSE before detaching: removing the last 'data' listener does NOT
+      // stop a flowing stream, so bytes arriving (or unshifted) in the gap
+      // between this handler and the session transport attaching were emitted
+      // to zero listeners and silently DISCARDED — and the listener swap left
+      // the socket's flow state wedged, never delivering to the new listener.
+      // A proxy whose client-hello arrived glued to the initialize hit this
+      // ~1-in-5 under load: the daemon answered nothing for the whole session
+      // (the #662 test flake, and real dead sessions behind it). Paused, the
+      // unshifted tail and any new bytes buffer; SocketTransport.start()
+      // resumes explicitly.
+      try { socket.pause(); } catch { /* stream already gone */ }
       socket.removeListener('data', onData);
       socket.removeListener('error', onEnd);
       socket.removeListener('close', onEnd);
       clearTimeout(timer);
+      if (process.env.CODEGRAPH_MCP_DEBUG) {
+        process.stderr.write(`[mcp-debug] clientHello finish pid=${String(peers.pid)} putBack=${putBack ? putBack.length : 0} flowing=${String(socket.readableFlowing)}\n`);
+      }
       if (putBack && putBack.length > 0 && !socket.destroyed) {
         try { socket.unshift(putBack); } catch { /* stream already gone */ }
       }
@@ -806,7 +856,12 @@ function readClientHello(
       }
     };
     const onEnd = () => finish({ pid: null, hostPid: null });
-    const timer = setTimeout(() => finish({ pid: null, hostPid: null }), CLIENT_HELLO_TIMEOUT_MS);
+    // On timeout, hand back whatever partial bytes accumulated — discarding
+    // them would tear the first message the transport parses.
+    const timer = setTimeout(() => {
+      const partial = chunks.length === 0 ? undefined : (chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, total));
+      finish({ pid: null, hostPid: null }, partial);
+    }, CLIENT_HELLO_TIMEOUT_MS);
     timer.unref?.();
     socket.on('data', onData);
     socket.on('error', onEnd);

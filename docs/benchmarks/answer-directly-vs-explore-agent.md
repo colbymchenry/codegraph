@@ -12,6 +12,15 @@ balloon on a 16× larger repo. Answering directly wins at **every** scale: same-
 context than the delegation path, **zero file reads**, and ~28% fewer tokens. The
 delegation-for-hygiene advantage stays marginal even on a large codebase.
 
+> **Token figures here are unverified** (flagged 2026-08-05). This run predates the
+> `result.usage` fix in `parse-run.mjs` (`04c0f8e`), so its "~28% fewer tokens" was
+> likely measured off a field that reports only the last turn — see the gotcha in
+> [`call-sequence-analysis.md`](call-sequence-analysis.md). The error under-counts
+> whichever arm takes more turns, so if the delegation arm ran longer the real gap is
+> *wider* than 28%; if turn counts were similar the figure is roughly right. The raw
+> logs are gone, so this cannot be re-derived — treat the token number as indicative
+> and the turn/read/context findings, which don't depend on that field, as sound.
+
 ## Methodology
 
 - **Harness:** interactive Claude Code TUI driven via `scripts/agent-eval/itrun.sh` (tmux),

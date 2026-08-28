@@ -26,7 +26,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { execFileSync } from 'child_process';
 import CodeGraph from '../src/index';
-import { scanDirectory, buildScopeIgnore, discoverEmbeddedRepoRoots } from '../src/extraction';
+import { scanDirectory, buildScopeIgnore, discoverEmbeddedRepoRoots, findUnindexedIgnoredRepos } from '../src/extraction';
 import { clearProjectConfigCache } from '../src/project-config';
 
 function git(cwd: string, ...args: string[]): void {
@@ -118,6 +118,45 @@ describe('multi-repo workspaces (#514) + .gitignore-respect default (#970, #976)
       expect(files).toContain('packages/proj-a/src/auth.ts');
       expect(files).toContain('packages/proj-b/src/billing.ts');
       expect(files).toContain('tools.ts'); // the parent's own tracked code still indexes
+    });
+
+    it('child-pattern spelling revives repos whose PARENT dir carries the gitignore rule (#1295)', () => {
+      // `.gitignore: /repos/` lists `repos/` as ONE ignored entry, while the
+      // CLI hint suggests `includeIgnored: ["repos/a/", "repos/b/"]` — the
+      // child spelling. That never matched the parent path, so the documented
+      // opt-in silently indexed nothing.
+      write(path.join(ws, 'repos/a/a.ts'), 'export const a = 1;\n');
+      write(path.join(ws, 'repos/b/b.ts'), 'export const b = 2;\n');
+      makeRepo(path.join(ws, 'repos/a'));
+      makeRepo(path.join(ws, 'repos/b'));
+      write(path.join(ws, '.gitignore'), '/repos/\n');
+      writeConfig({ includeIgnored: ['repos/a/', 'repos/b/'] });
+      makeRepo(ws);
+
+      const files = scanDirectory(ws);
+      expect(files).toContain('repos/a/a.ts');
+      expect(files).toContain('repos/b/b.ts');
+      // Discovery (the watcher path) agrees with the scanner.
+      expect(discoverEmbeddedRepoRoots(ws).sort()).toEqual(['repos/a/', 'repos/b/']);
+      // And the CLI hint has nothing left to nag about.
+      expect(findUnindexedIgnoredRepos(ws)).toEqual([]);
+    });
+
+    it('child-pattern spelling opts in ONLY the named repo; siblings stay out and stay hinted (#1295)', () => {
+      write(path.join(ws, 'repos/a/a.ts'), 'export const a = 1;\n');
+      write(path.join(ws, 'repos/b/b.ts'), 'export const b = 2;\n');
+      makeRepo(path.join(ws, 'repos/a'));
+      makeRepo(path.join(ws, 'repos/b'));
+      write(path.join(ws, '.gitignore'), '/repos/\n');
+      writeConfig({ includeIgnored: ['repos/a/'] });
+      makeRepo(ws);
+
+      const files = scanDirectory(ws);
+      expect(files).toContain('repos/a/a.ts');
+      expect(files.some((f) => f.startsWith('repos/b/'))).toBe(false);
+      expect(discoverEmbeddedRepoRoots(ws)).toEqual(['repos/a/']);
+      // The unopted sibling is still worth hinting about.
+      expect(findUnindexedIgnoredRepos(ws)).toEqual(['repos/b/']);
     });
 
     it('only re-includes the opted-in dir, not every gitignored dir', () => {
@@ -359,6 +398,83 @@ describe('multi-repo workspaces (#514) + .gitignore-respect default (#970, #976)
       expect(scope.ignores('src/a.ts')).toBe(false);
       // And the `./` self entry must not be mistaken for a nested embedded repo.
       expect(discoverEmbeddedRepoRoots(child)).toEqual([]);
+    });
+  });
+
+  describe('findUnindexedIgnoredRepos: the skipped-child-repos hint (#1156)', () => {
+    // The reported layout: a super-repo whose `.gitignore` excludes its child
+    // repos, so `init` at the parent correctly indexes ~nothing. This detector
+    // is the inverse of `discoverEmbeddedRepoRoots` — it names exactly the repos
+    // the default scan skipped so the CLI can offer to opt them in.
+    it('names the gitignored child repos a default index skipped', () => {
+      write(path.join(ws, 'mtc-activity/src/a.ts'), 'export const a = 1;\n');
+      write(path.join(ws, 'mtc-admin/src/b.ts'), 'export const b = 2;\n');
+      makeRepo(path.join(ws, 'mtc-activity'));
+      makeRepo(path.join(ws, 'mtc-admin'));
+      write(path.join(ws, '.gitignore'), 'mtc-*/\n');
+      write(path.join(ws, 'AGENTS.md'), '# docs\n');
+      makeRepo(ws);
+
+      // Nothing of the child repos indexes by default — the symptom being fixed.
+      expect(scanDirectory(ws).some((f) => f.startsWith('mtc-'))).toBe(false);
+      // ...but the detector names them (trailing-slashed, valid includeIgnored patterns).
+      expect(findUnindexedIgnoredRepos(ws).sort()).toEqual(['mtc-activity/', 'mtc-admin/']);
+    });
+
+    it('excludes repos already opted in via includeIgnored (only the rest remain)', () => {
+      write(path.join(ws, 'mtc-activity/src/a.ts'), 'export const a = 1;\n');
+      write(path.join(ws, 'mtc-admin/src/b.ts'), 'export const b = 2;\n');
+      makeRepo(path.join(ws, 'mtc-activity'));
+      makeRepo(path.join(ws, 'mtc-admin'));
+      write(path.join(ws, '.gitignore'), 'mtc-*/\n');
+      writeConfig({ includeIgnored: ['mtc-activity/'] });
+      makeRepo(ws);
+
+      expect(findUnindexedIgnoredRepos(ws)).toEqual(['mtc-admin/']);
+    });
+
+    it('returns [] when every gitignored repo is already opted in (nothing to nag)', () => {
+      write(path.join(ws, 'pkgs/a/src/a.ts'), 'export const a = 1;\n');
+      makeRepo(path.join(ws, 'pkgs/a'));
+      write(path.join(ws, '.gitignore'), '/pkgs/\n');
+      writeConfig({ includeIgnored: ['pkgs/'] });
+      makeRepo(ws);
+
+      expect(findUnindexedIgnoredRepos(ws)).toEqual([]);
+    });
+
+    it('does NOT report nested repos that are NOT gitignored (they already index)', () => {
+      // Scenario A: an untracked, non-ignored nested repo is indexed via the
+      // untracked-embedded path, so there is nothing to hint about.
+      write(path.join(ws, 'sub/src/a.ts'), 'export const a = 1;\n');
+      makeRepo(path.join(ws, 'sub'));
+      write(path.join(ws, 'app.ts'), 'export const app = 0;\n');
+      makeRepo(ws); // sub/ stays untracked, not ignored
+
+      expect(findUnindexedIgnoredRepos(ws)).toEqual([]);
+    });
+
+    it('skips a gitignored node_modules even when it holds a git repo', () => {
+      write(path.join(ws, 'node_modules/dep/index.js'), 'module.exports = 1;\n');
+      makeRepo(path.join(ws, 'node_modules/dep'));
+      write(path.join(ws, '.gitignore'), 'node_modules/\n');
+      makeRepo(ws);
+
+      expect(findUnindexedIgnoredRepos(ws)).toEqual([]);
+    });
+
+    it('finds repos nested inside a gitignored data dir, not just top-level ones', () => {
+      write(path.join(ws, 'refs/lib-a/x.ts'), 'export const x = 1;\n');
+      makeRepo(path.join(ws, 'refs/lib-a'));
+      write(path.join(ws, '.gitignore'), '/refs/\n');
+      makeRepo(ws);
+
+      expect(findUnindexedIgnoredRepos(ws)).toEqual(['refs/lib-a/']);
+    });
+
+    it('returns [] for a non-git directory', () => {
+      write(path.join(ws, 'a.ts'), 'export const a = 1;\n'); // no git init at all
+      expect(findUnindexedIgnoredRepos(ws)).toEqual([]);
     });
   });
 });

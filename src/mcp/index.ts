@@ -37,7 +37,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { spawn, StdioOptions } from 'child_process';
-import { findNearestCodeGraphRoot, getCodeGraphDir } from '../directory';
+import { resolveServerRoot, getCodeGraphDir } from '../directory';
 import { StdioTransport } from './transport';
 import { MCPEngine } from './engine';
 import { MCPSession } from './session';
@@ -48,10 +48,13 @@ import {
   tryAcquireDaemonLock,
 } from './daemon';
 import { connectWithHello, runLocalHandshakeProxy } from './proxy';
-import { getDaemonSocketCandidates } from './daemon-paths';
+import { getDaemonSocketCandidates, probeDaemonIdentity } from './daemon-paths';
 import { getTelemetry } from '../telemetry';
+import { checkForUpdateInBackground } from '../upgrade/update-check';
+import { EARLY_PPID } from './early-ppid';
 import { supervisionLostReason, parsePpidPollMs, parseHostPpid } from './ppid-watchdog';
 import { installMainThreadWatchdog, WatchdogHandle } from './liveness-watchdog';
+import { armStartupHandshakeTimeout } from './startup-handshake';
 import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
 
@@ -101,10 +104,57 @@ function daemonInternalSet(): boolean {
 }
 
 /**
+ * Prefix every `process.stderr.write` chunk with an ISO-8601 timestamp. Called
+ * once, only when this process becomes the detached daemon — whose stderr is
+ * appended to `.codegraph/daemon.log`. Before #1431 no log line carried a
+ * timestamp, so watchdog kills and restarts could be counted but never placed
+ * in time. (The watchdog child writes its kill notice through its own
+ * inherited fd 2, bypassing this wrapper — it stamps that line itself.)
+ */
+export function timestampStderrLines(): void {
+  const orig = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
+    return (orig as (...args: unknown[]) => boolean)(stampLogChunk(chunk), ...rest);
+  }) as typeof process.stderr.write;
+}
+
+/** Prepend `[<ISO-8601>] ` to a log chunk; unknown chunk types pass through. */
+export function stampLogChunk(chunk: string | Uint8Array): string | Uint8Array {
+  try {
+    const stamp = `[${new Date().toISOString()}] `;
+    if (typeof chunk === 'string') return stamp + chunk;
+    if (Buffer.isBuffer(chunk)) return Buffer.concat([Buffer.from(stamp), chunk]);
+  } catch { /* stamping is best-effort; never block the write */ }
+  return chunk;
+}
+
+/**
+ * Watchdog `progressPaths` for a server keyed on `root`'s index: the SQLite DB
+ * + its WAL. With these, the #850 liveness watchdog only kills on heartbeat
+ * silence when the DB files are NOT advancing — the same slow-disk deferral
+ * the CLI `index`/`init` path got in #1231. Without it, one >timeout
+ * synchronous statement on a big DB (multi-GB index behind Windows Defender)
+ * SIGKILLs a perfectly healthy daemon — and a daemon SIGKILL'd at the end of
+ * nearly every session is what ratcheted the WAL leak in #1431. A true wedge
+ * still dies: a wedged loop writes nothing, so the files stay still.
+ */
+export function watchdogProgressPaths(root: string | null): { progressPaths?: string[] } {
+  if (!root) return {};
+  const dbPath = path.join(getCodeGraphDir(root), 'codegraph.db');
+  return { progressPaths: [dbPath, `${dbPath}-wal`] };
+}
+
+/**
  * Resolve the project root the daemon machinery should key on. Returns
  * `null` when no `.codegraph/` is reachable from the candidate path — in
  * that case the caller must run in direct mode, since the daemon lockfile
  * and socket both live under `.codegraph/`.
+ *
+ * Uses the same resolution as the engine (#1606): up-walk first, then the
+ * bounded workspace down-scan that adopts a SINGLE indexed sub-project. A
+ * workspace root above one indexed child therefore gets the shared daemon
+ * (one watcher, one writer, keyed on the child) instead of a direct-mode
+ * server per host.
  *
  * The result is canonicalized with `realpathSync` so every client converges on
  * the same socket/lock path regardless of how it expressed the path: a client
@@ -115,7 +165,7 @@ function daemonInternalSet(): boolean {
  */
 function resolveDaemonRoot(explicitPath: string | null): string | null {
   const candidate = explicitPath ?? process.cwd();
-  const root = findNearestCodeGraphRoot(candidate);
+  const root = resolveServerRoot(candidate).root;
   if (!root) return null;
   try { return fs.realpathSync(root); } catch { return root; }
 }
@@ -148,6 +198,11 @@ function spawnDetachedDaemon(root: string): void {
     stdio = 'ignore'; // no log file — discard daemon output rather than fail
   }
   try {
+    // The daemon has no host: scrub the threaded host pid so it can't leak
+    // into the daemon's env (and from there into anything the daemon spawns),
+    // where a long-dead session's host pid would trigger spurious shutdowns.
+    const env: NodeJS.ProcessEnv = { ...process.env, [DAEMON_INTERNAL_ENV]: '1' };
+    delete env[HOST_PPID_ENV];
     const child = spawn(
       process.execPath,
       [...process.execArgv, scriptPath, 'serve', '--mcp', '--path', root],
@@ -155,7 +210,7 @@ function spawnDetachedDaemon(root: string): void {
         detached: true,
         stdio,
         windowsHide: true,
-        env: { ...process.env, [DAEMON_INTERNAL_ENV]: '1' },
+        env,
       },
     );
     child.unref();
@@ -189,9 +244,10 @@ export class MCPServer {
   // Worker-thread liveness watchdog (#850). Long-lived modes only; SIGKILLs the
   // process if the main thread wedges in a non-yielding sync loop.
   private livenessWatchdog: WatchdogHandle | null = null;
-  // PPID watchdog baseline — captured at construction so we always have a
-  // baseline, even if start() runs after a fork-style reparent.
-  private originalPpid: number = process.ppid;
+  // PPID watchdog baseline — from the CLI entry's earliest-possible capture
+  // (early-ppid.ts). Capturing here (construction) already lost the race when
+  // the launcher was killed during module loading (#1185).
+  private originalPpid: number = EARLY_PPID;
   private hostPpid: number | null = parseHostPpid(process.env[HOST_PPID_ENV]);
   // Idempotency guard for stop().
   private stopped = false;
@@ -219,6 +275,14 @@ export class MCPServer {
     // telemetry opportunistically. Fire-and-forget + unref'd — adds nothing
     // to the handshake path and never keeps the process alive.
     getTelemetry().startInterval();
+
+    // #1243: the MCP config launches the local binary, so a server left
+    // running drifts behind releases with no signal. Refresh the shared
+    // update-check cache in the background and log ONE stderr notice when a
+    // newer version exists (stderr only — stdout is the protocol channel).
+    // The notice also reaches the agent via the initialize instructions and
+    // codegraph_status. Fire-and-forget: adds nothing to the handshake path.
+    checkForUpdateInBackground();
 
     // The detached daemon process itself. Checked before the opt-out so the
     // daemon honors the same env it was spawned with (it never sets NO_DAEMON).
@@ -314,11 +378,22 @@ export class MCPServer {
     // ECONNRESET/hangup instead of a clean close) as shutdown, and destroy the
     // stream so a hung fd can't busy-spin the event loop (#799).
     treatStdinFailureAsShutdown(() => this.stop());
+    // Backstop for a launch abandoned during startup (#1185): launcher killed
+    // before EARLY_PPID could see it + host holding our pipes open. A server
+    // that never receives a byte of MCP traffic isn't serving anyone. Armed
+    // after session.start() attached the real stdin consumer.
+    armStartupHandshakeTimeout(() => {
+      process.stderr.write(
+        '[CodeGraph MCP] No MCP traffic since startup; assuming an abandoned launch and shutting down (#1185). ' +
+        'Tune with CODEGRAPH_STARTUP_HANDSHAKE_TIMEOUT_MS (0 disables).\n'
+      );
+      this.stop();
+    });
 
     this.mode = 'direct';
     this.installSignalHandlers();
     this.installPpidWatchdog();
-    this.livenessWatchdog = installMainThreadWatchdog();
+    this.livenessWatchdog = installMainThreadWatchdog(watchdogProgressPaths(resolveDaemonRoot(this.projectPath)));
   }
 
   /**
@@ -331,6 +406,9 @@ export class MCPServer {
    * and reaps itself via client-refcount + idle timeout (see {@link Daemon}).
    */
   private async startDaemonProcess(): Promise<void> {
+    // In daemon mode stderr IS `.codegraph/daemon.log`; stamp every line so
+    // kills/restarts can be placed in time (#1431 — the log was undatable).
+    timestampStderrLines();
     const root = resolveDaemonRoot(this.projectPath) ?? this.projectPath ?? process.cwd();
     for (let attempt = 0; attempt < TAKEOVER_MAX_RETRIES; attempt++) {
       const lock = tryAcquireDaemonLock(root);
@@ -343,7 +421,7 @@ export class MCPServer {
         // The detached daemon has no PPID watchdog or stdin lifeline, so a
         // wedged main thread would pin a core forever (#850). The liveness
         // watchdog is its only recovery path.
-        this.livenessWatchdog = installMainThreadWatchdog();
+        this.livenessWatchdog = installMainThreadWatchdog(watchdogProgressPaths(root));
         return; // the net.Server keeps the process alive
       }
 
@@ -351,15 +429,22 @@ export class MCPServer {
       // binding) — we're redundant; exit cleanly so the launcher proxies to it.
       const existing = lock.existing;
       if (existing && existing.pid > 0 && isProcessAlive(existing.pid)) {
-        process.stderr.write(
-          `[CodeGraph daemon] Another daemon (pid ${existing.pid}) already holds the lock; exiting.\n`
-        );
-        process.exit(0);
+        // Give a newly-elected daemon time to bind, then require its socket hello
+        // to match the lock PID/version. PID existence alone accepts an unrelated
+        // process after OS PID reuse and permanently wedges startup (#1553).
+        const age = Date.now() - existing.startedAt;
+        const stillStarting = existing.startedAt > 0 && age >= 0 && age < 10_000;
+        if (stillStarting || await probeDaemonIdentity(existing)) {
+          process.stderr.write(
+            `[CodeGraph daemon] Another daemon (pid ${existing.pid}) already holds the lock; exiting.\n`
+          );
+          process.exit(0);
+        }
       }
 
       // Holder is dead (or the record is unreadable) — clear it (pid-verified,
       // so we never delete a live daemon's lock) and retry the acquire.
-      clearStaleDaemonLock(lock.pidPath, existing?.pid);
+      clearStaleDaemonLock(lock.pidPath, existing?.pid, { allowLivePid: true });
       await sleep(TAKEOVER_RETRY_DELAY_MS);
     }
 

@@ -10,13 +10,24 @@ import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport } from './types';
 import { applyAliases } from './path-aliases';
 import { resolveWorkspaceImport } from './workspace-packages';
+import {
+  resolveMethodOnType,
+  resolveObjectLiteralMember,
+  localReceiverTypePatterns,
+  normalizeInferredTypeName,
+} from './name-matcher';
 
 /**
  * Extension resolution order by language
  */
 const EXTENSION_RESOLUTION: Record<string, string[]> = {
   typescript: ['.ts', '.tsx', '.d.ts', '.js', '.jsx', '/index.ts', '/index.tsx', '/index.js'],
-  javascript: ['.js', '.jsx', '.mjs', '.cjs', '/index.js', '/index.jsx'],
+  // ArkTS imports both `.ets` components and plain `.ts` logic modules —
+  // HarmonyOS projects are always a mix. `/Index.ets` (capital I) is ohpm's
+  // module-entry convention, hit when a bare workspace import ("data") is
+  // rewritten to the member's directory; lowercase variants for safety.
+  arkts: ['.ets', '.ts', '.d.ts', '.js', '/Index.ets', '/index.ets', '/index.ts', '/index.js'],
+  javascript: ['.js', '.jsx', '.mjs', '.cjs', '.xsjs', '.xsjslib', '/index.js', '/index.jsx'],
   tsx: ['.tsx', '.ts', '.d.ts', '.js', '.jsx', '/index.tsx', '/index.ts', '/index.js'],
   jsx: ['.jsx', '.js', '/index.jsx', '/index.js'],
   // SFC consumers import plain TS/JS, sibling components, and barrels
@@ -35,17 +46,104 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   php: ['.php'],
   ruby: ['.rb'],
   objc: ['.h', '.m', '.mm'],
+  nix: ['.nix', '/default.nix'],
 };
+
+export function isNixPathImportRef(ref: UnresolvedRef): boolean {
+  return (
+    ref.language === 'nix' &&
+    ref.referenceKind === 'imports' &&
+    (ref.referenceName.startsWith('./') || ref.referenceName.startsWith('../')) &&
+    !/[\s{}()[\];"'<>$]/.test(ref.referenceName)
+  );
+}
 
 /**
  * Resolve an import path to an actual file
  */
+// Per-context memos for the two hottest pure lookups on the resolution path:
+// import-specifier → file resolution and exported-symbol lookup. Both are pure
+// given a stable file set + node table, which is exactly the window between
+// ReferenceResolver.clearCaches() calls — clearImportResolverMemos() is invoked
+// there, so the staleness discipline matches the resolver's own caches.
+const importPathMemos = new WeakMap<ResolutionContext, Map<string, string | null>>();
+const exportedSymbolMemos = new WeakMap<ResolutionContext, Map<string, Node | undefined>>();
+
+/**
+ * Per-file index of exported symbols, replacing repeated linear `.find`s over
+ * `getNodesInFile` arrays (a barrel-heavy repo scans its biggest files once
+ * per referencing symbol otherwise). First-wins insertion preserves exactly
+ * the array-order semantics of the `.find` calls it replaces.
+ */
+interface FileExportIndex {
+  byName: Map<string, Node>;
+  defaultComponent: Node | undefined;
+  defaultFnClass: Node | undefined;
+}
+const fileExportIndexes = new WeakMap<ResolutionContext, Map<string, FileExportIndex>>();
+
+function getFileExportIndex(filePath: string, context: ResolutionContext): FileExportIndex {
+  let perFile = fileExportIndexes.get(context);
+  if (!perFile) {
+    perFile = new Map();
+    fileExportIndexes.set(context, perFile);
+  }
+  let idx = perFile.get(filePath);
+  if (!idx) {
+    idx = { byName: new Map(), defaultComponent: undefined, defaultFnClass: undefined };
+    for (const n of context.getNodesInFile(filePath)) {
+      if (!n.isExported) continue;
+      if (!idx.byName.has(n.name)) idx.byName.set(n.name, n);
+      if (idx.defaultComponent === undefined && n.kind === 'component') idx.defaultComponent = n;
+      if (idx.defaultFnClass === undefined && (n.kind === 'function' || n.kind === 'class')) idx.defaultFnClass = n;
+    }
+    perFile.set(filePath, idx);
+  }
+  return idx;
+}
+
+/** Drop the per-context memo tables (see ReferenceResolver.clearCaches). */
+export function clearImportResolverMemos(context: ResolutionContext): void {
+  importPathMemos.delete(context);
+  exportedSymbolMemos.delete(context);
+  fileExportIndexes.delete(context);
+  luaFileBasenameIndexes.delete(context);
+  cobolCopybookIndexes.delete(context);
+}
+
 export function resolveImportPath(
   importPath: string,
   fromFile: string,
   language: Language,
   context: ResolutionContext
 ): string | null {
+  let memo = importPathMemos.get(context);
+  if (!memo) {
+    memo = new Map();
+    importPathMemos.set(context, memo);
+  }
+  const key = `${language}\0${fromFile}\0${importPath}`;
+  const hit = memo.get(key);
+  if (hit !== undefined || memo.has(key)) return hit ?? null;
+  const resolved = resolveImportPathUncached(importPath, fromFile, language, context);
+  memo.set(key, resolved);
+  return resolved;
+}
+
+function resolveImportPathUncached(
+  importPath: string,
+  fromFile: string,
+  language: Language,
+  context: ResolutionContext
+): string | null {
+  // COBOL COPY/EXEC SQL INCLUDE names a copybook member, not a path — the
+  // compiler searches a library, so we match against indexed file basenames.
+  // Must run before isExternalImport: a bare member name would otherwise be
+  // misclassified as an external package.
+  if (language === 'cobol') {
+    return resolveCobolCopybook(importPath, fromFile, context);
+  }
+
   // Skip external/npm packages — but pass the context so the
   // bare-specifier heuristic can consult the project's tsconfig
   // alias map first (custom prefixes like `@components/*` would
@@ -74,6 +172,83 @@ export function resolveImportPath(
   }
 
   return null;
+}
+
+/**
+ * COBOL copybook lookup: `COPY CVACT01Y` (or `EXEC SQL INCLUDE X`) names a
+ * library member resolved by the compiler's copybook search path, so we match
+ * the member against indexed file basenames, case-insensitively. `.cpy` wins
+ * over a same-named program; a same-directory hit wins within a tier. The
+ * stem index is built once per resolution context (a per-ref scan of every
+ * file node would go quadratic on copybook-heavy repos).
+ */
+const cobolCopybookIndexes = new WeakMap<ResolutionContext, Map<string, string[]>>();
+
+/**
+ * Per-context basename → file-paths index for Lua/Luau require resolution
+ * (cobolCopybookIndexes pattern). resolveLuaRequire previously ran
+ * `getAllFiles().filter(endsWith)` FOUR times per require ref — ~7.5k string
+ * suffix scans each, measured at ~0.9ms/ref (2.7s combined on kong's 3k
+ * requires). Buckets preserve getAllFiles() iteration order so the per-suffix
+ * candidate list filters to exactly the array the full scan produced —
+ * identical matches, identical stable sort, identical winner.
+ */
+const luaFileBasenameIndexes = new WeakMap<ResolutionContext, Map<string, string[]>>();
+
+function luaBasenameIndex(context: ResolutionContext): Map<string, string[]> {
+  let index = luaFileBasenameIndexes.get(context);
+  if (!index) {
+    index = new Map();
+    for (const f of context.getAllFiles()) {
+      const base = f.split('/').pop() ?? '';
+      const paths = index.get(base);
+      if (paths) paths.push(f);
+      else index.set(base, [f]);
+    }
+    luaFileBasenameIndexes.set(context, index);
+  }
+  return index;
+}
+
+function resolveCobolCopybook(
+  member: string,
+  fromFile: string,
+  context: ResolutionContext
+): string | null {
+  let index = cobolCopybookIndexes.get(context);
+  if (!index) {
+    index = new Map();
+    for (const fileNode of context.getNodesByKind('file')) {
+      const normalized = fileNode.filePath.replace(/\\/g, '/');
+      const base = normalized.split('/').pop() ?? '';
+      const dot = base.lastIndexOf('.');
+      const stem = (dot > 0 ? base.slice(0, dot) : base).toLowerCase();
+      const paths = index.get(stem);
+      if (paths) paths.push(fileNode.filePath);
+      else index.set(stem, [fileNode.filePath]);
+    }
+    cobolCopybookIndexes.set(context, index);
+  }
+
+  const candidates = index.get(member.toLowerCase());
+  if (!candidates || candidates.length === 0) return null;
+
+  const fromDir = fromFile.replace(/\\/g, '/').split('/').slice(0, -1).join('/');
+  let best: string | null = null;
+  let bestScore = -1;
+  for (const candidate of candidates) {
+    const normalized = candidate.replace(/\\/g, '/');
+    const ext = normalized.slice(normalized.lastIndexOf('.')).toLowerCase();
+    let score = 0;
+    if (ext === '.cpy') score += 4;
+    else if (ext === '.cbl' || ext === '.cob' || ext === '.cobol') score += 2;
+    if (normalized.split('/').slice(0, -1).join('/') === fromDir) score += 1;
+    if (score > bestScore) {
+      bestScore = score;
+      best = candidate;
+    }
+  }
+  return best;
 }
 
 /**
@@ -141,7 +316,7 @@ function isExternalImport(
   }
 
   // Common external patterns
-  if (language === 'typescript' || language === 'javascript' || language === 'tsx' || language === 'jsx') {
+  if (language === 'typescript' || language === 'javascript' || language === 'tsx' || language === 'jsx' || language === 'arkts') {
     // Node built-ins
     if (['fs', 'path', 'os', 'crypto', 'http', 'https', 'url', 'util', 'events', 'stream', 'child_process', 'buffer'].includes(importPath)) {
       return true;
@@ -548,6 +723,15 @@ export function isPhpIncludePathRef(ref: UnresolvedRef): boolean {
 }
 
 /**
+ * Is this a COBOL COPY / EXEC SQL INCLUDE copybook reference? These resolve
+ * to files only (or stay unresolved for compiler-supplied members) — never
+ * to a same-named symbol via the name-matcher.
+ */
+export function isCobolCopybookRef(ref: UnresolvedRef): boolean {
+  return ref.language === 'cobol' && ref.referenceKind === 'imports';
+}
+
+/**
  * Resolve a PHP include/require path to a project-relative file path.
  *
  * PHP resolves includes relative to the including file's directory (the
@@ -581,7 +765,7 @@ export function extractImportMappings(
 ): ImportMapping[] {
   const mappings: ImportMapping[] = [];
 
-  if (language === 'typescript' || language === 'javascript' || language === 'tsx' || language === 'jsx') {
+  if (language === 'typescript' || language === 'javascript' || language === 'tsx' || language === 'jsx' || language === 'arkts') {
     mappings.push(...extractJSImports(content));
   } else if (language === 'svelte' || language === 'vue' || language === 'astro') {
     // Svelte/Vue single-file components import via plain ES6 inside their
@@ -993,7 +1177,8 @@ export function extractReExports(content: string, language: Language): ReExport[
     language !== 'typescript' &&
     language !== 'javascript' &&
     language !== 'tsx' &&
-    language !== 'jsx'
+    language !== 'jsx' &&
+    language !== 'arkts'
   ) {
     return [];
   }
@@ -1165,6 +1350,29 @@ export function resolveViaImport(
     return null;
   }
 
+  // COBOL COPY / EXEC SQL INCLUDE — resolve the copybook member to a
+  // file→file edge, mirroring the C/C++ include branch above. A member that
+  // matches no indexed file (compiler-supplied copybooks like SQLCA/DFHAID)
+  // stays unresolved — callers must not fall back to the symbol name-matcher,
+  // which would connect it to a same-named import symbol elsewhere.
+  if (isCobolCopybookRef(ref)) {
+    const resolvedPath = resolveImportPath(ref.referenceName, ref.filePath, ref.language!, context);
+    if (!resolvedPath) return null;
+    const basename = resolvedPath.split('/').pop()!;
+    const fileNode = context
+      .getNodesByName(basename)
+      .find((n) => n.kind === 'file' && n.filePath === resolvedPath);
+    if (fileNode) {
+      return {
+        original: ref,
+        targetNodeId: fileNode.id,
+        confidence: 0.9,
+        resolvedBy: 'import',
+      };
+    }
+    return null;
+  }
+
   // PHP include/require — resolve the static string path to a file→file
   // edge, mirroring the C/C++ branch above. Distinguish include PATHS from
   // namespace `use` symbols by shape: an include path contains a slash or a
@@ -1192,6 +1400,30 @@ export function resolveViaImport(
     // dead end. Return unresolved rather than falling through to the symbol
     // name-matcher, which would mis-connect e.g. "inc/db.php" to an unrelated
     // db.php elsewhere in the tree — a wrong edge is worse than a missing one.
+    return null;
+  }
+
+  // Nix static project-path imports (`import ./x.nix`, `builtins.import ./dir`,
+  // `import ./x.nix {}`) resolve to file nodes only. Do not resolve
+  // angle-bracket channels, attribute expressions, variables, or other dynamic
+  // expressions as project files.
+  if (isNixPathImportRef(ref)) {
+    const resolvedPath = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
+    if (!resolvedPath) return null;
+
+    const basename = resolvedPath.split('/').pop()!;
+    const fileNode = context
+      .getNodesByName(basename)
+      .find((n) => n.kind === 'file' && n.filePath === resolvedPath);
+
+    if (fileNode) {
+      return {
+        original: ref,
+        targetNodeId: fileNode.id,
+        confidence: 0.9,
+        resolvedBy: 'import',
+      };
+    }
     return null;
   }
 
@@ -1264,7 +1496,8 @@ export function resolveViaImport(
     ref.language === 'typescript' ||
     ref.language === 'tsx' ||
     ref.language === 'javascript' ||
-    ref.language === 'jsx'
+    ref.language === 'jsx' ||
+    ref.language === 'arkts'
   ) {
     const moduleFile = resolveModuleImportToFile(ref, imports, context);
     if (moduleFile) return moduleFile;
@@ -1313,6 +1546,32 @@ export function resolveViaImport(
                 resolvedBy: 'import',
               };
             }
+            // An imported object literal used as a namespace (#1573):
+            // `api.call()` after `import { api } from './api'` where `api` is
+            // `export const api = { call() {…} }`. Its members have bare
+            // qualified names inside the constant's extent, so the
+            // `Container::member` lookup above can't see them and the edge
+            // landed on the constant — every cross-file caller of the method
+            // went missing. Resolve the member by containment instead.
+            if (targetNode.kind === 'constant' || targetNode.kind === 'variable') {
+              const member = ref.referenceName.slice(imp.localName.length + 1).split('.')[0];
+              if (member) {
+                const literalMember = resolveObjectLiteralMember(targetNode, member, ref, context, 0.9, 'import');
+                if (literalMember) return literalMember;
+              }
+            }
+            // An imported VALUE (singleton constant / shared instance) called
+            // through a member: `reproStore.notifyJoinGuildStatus()` after
+            // `import { reproStore } from './store'`. findExportedSymbol
+            // resolved the CONSTANT itself; linking the CALL there hides the
+            // real callee — callers of the method miss every cross-file use
+            // and the method can look unused (#1292). Infer the value's type
+            // from its own declaration in the exporting file and resolve the
+            // member on that type. resolveMethodOnType VALIDATES the type
+            // declares the method, so a mis-inference falls through to the
+            // constant edge below rather than fabricating a wrong one.
+            const instanceMember = resolveImportedInstanceMember(targetNode, ref, imp.localName, context);
+            if (instanceMember) return instanceMember;
           }
 
           return {
@@ -1431,14 +1690,18 @@ function resolveLuaRequire(ref: UnresolvedRef, context: ResolutionContext): Reso
   if (!name) return null;
   const base = name.includes('.') ? name.replace(/\./g, '/') : name;
   const suffixes = [`${base}.lua`, `${base}.luau`, `${base}/init.lua`, `${base}/init.luau`];
-  const files = context.getAllFiles();
+  const byBasename = luaBasenameIndex(context);
   const shared = (a: string, b: string): number => {
     let i = 0;
     while (i < a.length && i < b.length && a[i] === b[i]) i++;
     return i;
   };
   for (const suffix of suffixes) {
-    const matches = files.filter((f) => f === suffix || f.endsWith('/' + suffix));
+    // Only files sharing the suffix's basename can match — the bucket is in
+    // getAllFiles() order, so this filter yields exactly what the full-list
+    // scan did.
+    const candidates = byBasename.get(suffix.split('/').pop() ?? '') ?? [];
+    const matches = candidates.filter((f) => f === suffix || f.endsWith('/' + suffix));
     if (matches.length === 0) continue;
     matches.sort((x, y) => shared(y, ref.filePath) - shared(x, ref.filePath));
     const best = matches[0]!;
@@ -1579,6 +1842,7 @@ function resolveRustPathReference(
       n.name === leaf &&
       (n.kind === 'function' ||
         n.kind === 'struct' ||
+        n.kind === 'union' ||
         n.kind === 'enum' ||
         n.kind === 'trait' ||
         n.kind === 'type_alias' ||
@@ -1841,11 +2105,44 @@ function findExportedSymbol(
   visited: Set<string>,
   depth = 0
 ): Node | undefined {
+  // Memoize fresh (top-level) lookups only: recursive re-export steps carry a
+  // populated `visited` set, whose contents change the reachable answer.
+  // Every ref to the same imported symbol repeats this exact walk, so the
+  // top-level memo removes the re-export chase + per-file linear scans from
+  // all but the first occurrence.
+  if (depth === 0 && visited.size === 0) {
+    let memo = exportedSymbolMemos.get(context);
+    if (!memo) {
+      memo = new Map();
+      exportedSymbolMemos.set(context, memo);
+    }
+    const key = `${filePath}\0${want.isDefault ? 1 : 0}${want.isNamespace ? 1 : 0}\0${want.exportedName}\0${want.memberName ?? ''}\0${language}`;
+    if (memo.has(key)) return memo.get(key);
+    const result = findExportedSymbolWalk(filePath, want, language, context, visited, depth);
+    memo.set(key, result);
+    return result;
+  }
+  return findExportedSymbolWalk(filePath, want, language, context, visited, depth);
+}
+
+function findExportedSymbolWalk(
+  filePath: string,
+  want: {
+    isDefault: boolean;
+    isNamespace: boolean;
+    exportedName: string;
+    memberName: string | null;
+  },
+  language: Language,
+  context: ResolutionContext,
+  visited: Set<string>,
+  depth: number
+): Node | undefined {
   if (depth > REEXPORT_MAX_DEPTH) return undefined;
   if (visited.has(filePath)) return undefined;
   visited.add(filePath);
 
-  const nodesInFile = context.getNodesInFile(filePath);
+  const exportIndex = getFileExportIndex(filePath, context);
 
   // 1. Direct hit: the symbol is declared in this file.
   if (want.isDefault) {
@@ -1855,21 +2152,13 @@ function findExportedSymbol(
     // `.ts`/`.tsx` `export default fn`/`class` case. Without the component
     // branch, an `export { default as X } from './X.svelte'` barrel never
     // resolves and the component shows a false 0 callers (#629).
-    const direct =
-      nodesInFile.find((n) => n.isExported && n.kind === 'component') ??
-      nodesInFile.find(
-        (n) => n.isExported && (n.kind === 'function' || n.kind === 'class')
-      );
+    const direct = exportIndex.defaultComponent ?? exportIndex.defaultFnClass;
     if (direct) return direct;
   } else if (want.isNamespace && want.memberName) {
-    const direct = nodesInFile.find(
-      (n) => n.name === want.memberName && n.isExported
-    );
+    const direct = exportIndex.byName.get(want.memberName);
     if (direct) return direct;
   } else {
-    const direct = nodesInFile.find(
-      (n) => n.name === want.exportedName && n.isExported
-    );
+    const direct = exportIndex.byName.get(want.exportedName);
     if (direct) return direct;
   }
 
@@ -1918,7 +2207,7 @@ function findExportedSymbol(
 
 /** Node kinds that own static members reachable as `Container.member`. */
 const STATIC_MEMBER_CONTAINERS = new Set<Node['kind']>([
-  'class', 'struct', 'interface', 'enum', 'trait', 'protocol',
+  'class', 'struct', 'union', 'interface', 'enum', 'trait', 'protocol',
 ]);
 
 /**
@@ -1934,6 +2223,48 @@ const STATIC_MEMBER_CONTAINERS = new Set<Node['kind']>([
  * languages whose members aren't `::`-qualified, and genuine class references,
  * are unaffected. See #825.
  */
+/**
+ * Resolve a CALL through an imported value to the method on the value's own
+ * type: `reproStore.notifyJoinGuildStatus()` where `reproStore` is
+ * `export const reproStore = new ReproStore()` in the imported file (#1292).
+ * The same-file form of this call already resolves via local-variable
+ * receiver inference (#1108); this is the cross-file/import half. The type is
+ * recovered from the VALUE'S OWN declaration lines in the exporting file
+ * (initializer `= new T(...)` or a type annotation, per the shared #1108
+ * pattern table), then the member is resolved AND VALIDATED on that type by
+ * resolveMethodOnType — a failed inference or validation returns null so the
+ * caller keeps its existing constant-edge behavior.
+ */
+function resolveImportedInstanceMember(
+  value: Node,
+  ref: UnresolvedRef,
+  localName: string,
+  context: ResolutionContext
+): ResolvedRef | null {
+  if (ref.referenceKind !== 'calls') return null;
+  if (value.kind !== 'constant' && value.kind !== 'variable') return null;
+  const member = ref.referenceName.slice(localName.length + 1).split('.')[0];
+  if (!member) return null;
+
+  const source = context.readFile(value.filePath);
+  if (!source) return null;
+  // Only the value's own declaration lines — never the whole file, so a
+  // same-named identifier elsewhere can't donate a type.
+  const lines = source.split('\n');
+  const declSlice = lines.slice(Math.max(0, value.startLine - 1), value.endLine).join('\n');
+
+  const receiver = value.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  for (const pattern of localReceiverTypePatterns(value.language as Language, receiver)) {
+    const m = declSlice.match(pattern);
+    if (!m || !m[1]) continue;
+    const typeName = normalizeInferredTypeName(m[1]);
+    if (!typeName) continue;
+    const resolved = resolveMethodOnType(typeName, member, ref, context, 0.85, 'instance-method');
+    if (resolved) return resolved;
+  }
+  return null;
+}
+
 function resolveStaticMember(
   container: Node,
   ref: UnresolvedRef,

@@ -464,6 +464,70 @@ describe('Java end-to-end — field-injected bean trace (issue #389)', () => {
     cg.close();
   });
 
+  it('covers legacy iBatis <sqlMap> statements and keeps same-line vendor-split pairs (#1182)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ibatis-'));
+    const xmlDir = path.join(tmpDir, 'src/main/resources/sqlmaps');
+    fs.mkdirSync(xmlDir, { recursive: true });
+
+    // iBatis 2 sqlMap with an explicit namespace.
+    fs.writeFileSync(
+      path.join(xmlDir, 'Account.xml'),
+      '<?xml version="1.0" encoding="UTF-8"?>\n' +
+        '<!DOCTYPE sqlMap PUBLIC "-//iBATIS.com//DTD SQL Map 2.0//EN" "http://ibatis.apache.org/dtd/sql-map-2.dtd">\n' +
+        "<sqlMap namespace='Account'>\n" +
+        "  <sql id='cols'>id, name, email</sql>\n" +
+        "  <select id='getById' resultClass='Account'>SELECT <include refid='cols'/> FROM account WHERE id = #id#</select>\n" +
+        "  <insert id='insert' parameterClass='Account'>INSERT INTO account (id) VALUES (#id#)</insert>\n" +
+        '  <!-- <select id="disabled">SELECT 0</select> -->\n' +
+        '</sqlMap>\n'
+    );
+    // Namespace-less sqlMap whose ids carry the qualifier as `Map.statement`.
+    fs.writeFileSync(
+      path.join(xmlDir, 'LegacyDao.xml'),
+      '<sqlMap>\n' +
+        '  <select id="LegacyDao.findAll" resultClass="Row">SELECT * FROM t</select>\n' +
+        '</sqlMap>\n'
+    );
+    // MyBatis mapper with a vendor-split databaseId pair written on ONE line —
+    // same qualifiedName + same start line. Before the id-hash fold both nodes
+    // hashed identically and INSERT OR REPLACE dropped one.
+    fs.writeFileSync(
+      path.join(xmlDir, 'VendorMapper.xml'),
+      '<mapper namespace="com.example.VendorMapper">\n' +
+        '<select id="findUser" databaseId="oracle">SELECT 1 FROM dual</select><select id="findUser" databaseId="mysql">SELECT 1</select>\n' +
+        '</mapper>\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const xmlMethods = cg.getNodesByKind('method').filter((n) => n.language === 'xml');
+    const qnames = xmlMethods.map((n) => n.qualifiedName);
+
+    // iBatis statements now land in the graph (was zero coverage before #1182).
+    expect(qnames).toContain('Account::getById');
+    expect(qnames).toContain('Account::insert');
+    expect(qnames).toContain('Account::cols');
+    expect(qnames).toContain('LegacyDao::findAll');
+    // The commented-out statement produced no node.
+    expect(qnames).not.toContain('Account::disabled');
+
+    // <include refid='cols'/> resolves to the <sql> fragment in the same map.
+    const getById = xmlMethods.find((n) => n.qualifiedName === 'Account::getById');
+    const cols = xmlMethods.find((n) => n.qualifiedName === 'Account::cols');
+    expect(getById).toBeDefined();
+    expect(cols).toBeDefined();
+    const incEdge = cg.getOutgoingEdges(getById!.id).find((e) => e.target === cols!.id);
+    expect(incEdge, "iBatis <include refid='cols'/> should reach the <sql> fragment").toBeDefined();
+
+    // Both vendor-split statements survive the DB write (the collision fix).
+    const findUser = xmlMethods.filter((n) => n.name === 'findUser');
+    expect(findUser, 'both databaseId variants of findUser should survive').toHaveLength(2);
+    expect(new Set(findUser.map((n) => n.id)).size).toBe(2);
+
+    cg.close();
+  });
+
   it('binds @Value / @ConfigurationProperties to YAML + .properties keys (incl. relaxed binding)', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-spring-config-'));
     const javaDir = path.join(tmpDir, 'src/main/java/com/example');
@@ -556,6 +620,64 @@ describe('Java end-to-end — field-injected bean trace (issue #389)', () => {
     expect(cpAppCache).toBeDefined();
     const cpEdges = cg.getOutgoingEdges(cpAppCache!.id);
     expect(cpEdges.length).toBeGreaterThan(0);
+
+    cg.close();
+  });
+
+  it('binds a config key only for `references` refs, never a same-named method call (#1180)', async () => {
+    // `service.process` is BOTH a yaml key and a `service.process()` method call.
+    // canonicalConfigKey collapses them to the same token, so before #1180 the
+    // method call (kind `calls`) fell into the Spring config-key branch and
+    // mis-resolved to the YAML constant at 0.9 confidence — a wrong edge, and the
+    // uncached constant scan that made large Java/Kotlin indexes take ~1h. The
+    // branch is now gated to `references` (only @Value/@ConfigurationProperties).
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-spring-kindgate-'));
+    const javaDir = path.join(tmpDir, 'src/main/java/com/example');
+    const resDir = path.join(tmpDir, 'src/main/resources');
+    fs.mkdirSync(javaDir, { recursive: true });
+    fs.mkdirSync(resDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'pom.xml'),
+      '<project><dependencies><dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter</artifactId></dependency></dependencies></project>\n'
+    );
+    fs.writeFileSync(path.join(resDir, 'application.yml'), 'service:\n  process: "enabled"\n');
+    fs.writeFileSync(
+      path.join(javaDir, 'Worker.java'),
+      'package com.example;\n' +
+        'import org.springframework.beans.factory.annotation.Value;\n' +
+        'class Processor { void process() {} }\n' +
+        'public class Worker {\n' +
+        '  private Processor service;\n' +
+        '  @Value("${service.process}") private String sp;\n' +
+        '  void run() { service.process(); }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const yamlKey = cg
+      .getNodesByKind('constant')
+      .find((n) => n.language === 'yaml' && n.qualifiedName === 'service.process');
+    expect(yamlKey, 'yaml key service.process should be indexed').toBeDefined();
+
+    // `references` ref (@Value) DOES bind to the config key.
+    const valueBind = cg
+      .getNodesByKind('constant')
+      .find((n) => n.id.startsWith('spring-value:') && n.name === 'service.process');
+    expect(valueBind).toBeDefined();
+    expect(
+      cg.getOutgoingEdges(valueBind!.id).some((e) => e.target === yamlKey!.id),
+      '@Value should still bind to the yaml key',
+    ).toBe(true);
+
+    // `calls` ref (service.process()) must NOT bind to the config key.
+    const run = cg.getNodesByKind('method').find((n) => n.name === 'run');
+    expect(run).toBeDefined();
+    expect(
+      cg.getOutgoingEdges(run!.id).some((e) => e.target === yamlKey!.id),
+      'a method call must never resolve to a config-key constant',
+    ).toBe(false);
 
     cg.close();
   });
@@ -956,6 +1078,259 @@ export function AppRoutes() {
       expect(home).toBeDefined();
       const toHome = cg.getOutgoingEdges(route!.id).find((e) => e.target === home!.id);
       expect(toHome, 'route → Home component edge').toBeDefined();
+    } finally {
+      cg.close();
+    }
+  });
+});
+
+describe('Terraform end-to-end module-boundary resolution', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  function writeMultiModuleRepo(root: string) {
+    fs.mkdirSync(path.join(root, 'modules/vpc'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'modules/other'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'envs'), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, 'main.tf'),
+      'variable "vpc_cidr" {\n  type = string\n}\n\n' +
+        'module "vpc" {\n  source = "./modules/vpc"\n  cidr   = var.vpc_cidr\n}\n\n' +
+        'module "registry_thing" {\n  source  = "terraform-aws-modules/s3-bucket/aws"\n  bucket  = "x"\n}\n\n' +
+        'output "vpc_id" {\n  value = module.vpc.vpc_id\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(root, 'modules/vpc/variables.tf'),
+      'variable "cidr" {\n  type = string\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(root, 'modules/vpc/main.tf'),
+      'resource "aws_vpc" "this" {\n  cidr_block = var.cidr\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(root, 'modules/vpc/outputs.tf'),
+      'output "vpc_id" {\n  value = aws_vpc.this.id\n}\n'
+    );
+    // Same-named variable in an UNRELATED module — must never receive edges
+    // from outside its own directory.
+    fs.writeFileSync(
+      path.join(root, 'modules/other/variables.tf'),
+      'variable "cidr" {\n  type = string\n}\nvariable "orphan_ref_target" {}\n'
+    );
+    // References a variable that has no same-dir declaration: must stay unlinked.
+    fs.writeFileSync(
+      path.join(root, 'modules/other/main.tf'),
+      'resource "aws_eip" "e" {\n  tags = { Name = var.undeclared_here_elsewhere_yes }\n}\n'
+    );
+    fs.writeFileSync(path.join(root, 'envs/prod.tfvars'), 'vpc_cidr = "10.0.0.0/16"\n');
+  }
+
+  it('bridges module inputs/outputs/source and enforces directory scoping', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-terraform-'));
+    writeMultiModuleRepo(tmpDir);
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+    try {
+      const byQname = (q: string, file?: string) =>
+        cg
+          .getNodesByName(q.split('.').pop()!)
+          .filter((n) => n.qualifiedName === q && (!file || n.filePath === file));
+
+      const moduleDecl = byQname('module.vpc')[0];
+      expect(moduleDecl, 'module.vpc declaration node').toBeDefined();
+      const childCidr = byQname('var.cidr', 'modules/vpc/variables.tf')[0];
+      expect(childCidr, "child module's var.cidr").toBeDefined();
+      const childOutput = byQname('output.vpc_id', 'modules/vpc/outputs.tf')[0];
+      expect(childOutput, "child module's output.vpc_id").toBeDefined();
+      const rootOutput = byQname('output.vpc_id', 'main.tf')[0];
+      expect(rootOutput, 'root output.vpc_id').toBeDefined();
+
+      const declEdges = cg.getOutgoingEdges(moduleDecl!.id);
+      // Input wiring: module block → child variable (cross-directory).
+      expect(
+        declEdges.find((e) => e.target === childCidr!.id),
+        'module.vpc → child var.cidr input edge'
+      ).toBeDefined();
+      // Source wiring: module block → child entry file.
+      const fileNode = cg
+        .getNodesInFile('modules/vpc/main.tf')
+        .find((n) => n.kind === 'file');
+      expect(fileNode).toBeDefined();
+      const importEdge = declEdges.find((e) => e.target === fileNode!.id);
+      expect(importEdge, 'module.vpc → modules/vpc/main.tf imports edge').toBeDefined();
+      expect(importEdge!.kind).toBe('imports');
+
+      // Output bridge: root output → child output (not just the declaration).
+      const rootOutEdges = cg.getOutgoingEdges(rootOutput!.id);
+      expect(
+        rootOutEdges.find((e) => e.target === childOutput!.id),
+        'root output.vpc_id → child output.vpc_id'
+      ).toBeDefined();
+      expect(
+        rootOutEdges.find((e) => e.target === moduleDecl!.id),
+        'root output.vpc_id → module.vpc declaration'
+      ).toBeDefined();
+
+      // tfvars assignment walks up to the ROOT variable.
+      const rootVar = byQname('var.vpc_cidr', 'main.tf')[0];
+      expect(rootVar).toBeDefined();
+      const tfvarsFile = cg.getNodesInFile('envs/prod.tfvars').find((n) => n.kind === 'file');
+      expect(tfvarsFile).toBeDefined();
+      expect(
+        cg.getOutgoingEdges(tfvarsFile!.id).find((e) => e.target === rootVar!.id),
+        'envs/prod.tfvars → var.vpc_cidr'
+      ).toBeDefined();
+
+      // Directory scoping: the unrelated module's same-named var.cidr gets
+      // NO incoming edges from outside its own directory…
+      const otherCidr = byQname('var.cidr', 'modules/other/variables.tf')[0];
+      expect(otherCidr).toBeDefined();
+      const incomingOther = cg.getIncomingEdges(otherCidr!.id).filter((e) => e.kind !== 'contains');
+      expect(incomingOther, 'unrelated module var.cidr must stay isolated').toHaveLength(0);
+
+      // …and a reference with no same-dir declaration stays unlinked rather
+      // than borrowing another module's declaration.
+      const orphanEdges = cg
+        .getNodesInFile('modules/other/main.tf')
+        .filter((n) => n.qualifiedName === 'aws_eip.e')
+        .flatMap((n) => cg.getOutgoingEdges(n.id))
+        .filter((e) => e.kind === 'references');
+      const orphanTargets = orphanEdges.map((e) => cg.getNode(e.target)?.qualifiedName);
+      expect(orphanTargets).not.toContain('var.undeclared_here_elsewhere_yes');
+
+      // Registry-sourced module: inputs stay unresolved (no guessed edges).
+      const registryDecl = byQname('module.registry_thing')[0];
+      expect(registryDecl).toBeDefined();
+      const registryEdges = cg
+        .getOutgoingEdges(registryDecl!.id)
+        .filter((e) => e.kind !== 'contains');
+      expect(registryEdges, 'registry module must not link anywhere').toHaveLength(0);
+    } finally {
+      cg.close();
+    }
+  });
+});
+
+describe('Terraform follow-ups: remote-state bridge, provider alias, moved blocks', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('bridges atmos remote-state to the target component, resolves provider aliases up the tree, links moved blocks', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-terraform-fu-'));
+    // Component producing state.
+    fs.mkdirSync(path.join(tmpDir, 'components/terraform/vpc'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'components/terraform/vpc/outputs.tf'),
+      'output "vpc_id" {\n  value = "vpc-123"\n}\n'
+    );
+    // Component consuming it via the cloudposse remote-state module.
+    fs.mkdirSync(path.join(tmpDir, 'components/terraform/eks/cluster'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'components/terraform/eks/cluster/remote-state.tf'),
+      'module "vpc" {\n' +
+        '  source    = "cloudposse/stack-config/yaml//modules/remote-state"\n' +
+        '  component = var.vpc_component_name\n' +
+        '}\n' +
+        'variable "vpc_component_name" {\n' +
+        '  type    = string\n' +
+        '  default = "vpc"\n' +
+        '}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'components/terraform/eks/cluster/main.tf'),
+      'resource "aws_eks_cluster" "this" {\n  vpc_id = module.vpc.outputs.vpc_id\n}\n'
+    );
+    // Ambiguous component name — two directories called "dns" with the same
+    // output; the bridge must refuse to pick one.
+    fs.mkdirSync(path.join(tmpDir, 'components/terraform/dns'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'legacy/dns'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'components/terraform/dns/outputs.tf'), 'output "zone_id" {\n  value = "z1"\n}\n');
+    fs.writeFileSync(path.join(tmpDir, 'legacy/dns/outputs.tf'), 'output "zone_id" {\n  value = "z2"\n}\n');
+    fs.writeFileSync(
+      path.join(tmpDir, 'components/terraform/eks/cluster/dns.tf'),
+      'module "dns" {\n' +
+        '  source    = "cloudposse/stack-config/yaml//modules/remote-state"\n' +
+        '  component = "dns"\n' +
+        '}\n' +
+        'output "zone" {\n  value = module.dns.outputs.zone_id\n}\n'
+    );
+    // Provider alias declared at the root, selected inside a module dir.
+    fs.writeFileSync(
+      path.join(tmpDir, 'providers.tf'),
+      'provider "aws" {\n  region = "us-east-1"\n}\n' +
+        'provider "aws" {\n  alias  = "east"\n  region = "us-east-2"\n}\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'modules/app'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, 'modules/app/main.tf'),
+      'resource "aws_s3_bucket" "b" {\n  provider = aws.east\n  bucket   = "x"\n}\n'
+    );
+    // Moved block referencing a live resource.
+    fs.writeFileSync(
+      path.join(tmpDir, 'main.tf'),
+      'resource "aws_instance" "renamed" {}\n' +
+        'moved {\n  from = aws_instance.old\n  to   = aws_instance.renamed\n}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+    try {
+      const byQname = (q: string, file?: string) =>
+        cg
+          .getNodesByName(q.split('.').pop()!)
+          .filter((n) => n.qualifiedName === q && (!file || n.filePath === file));
+
+      // 1. remote-state bridge: consumer resource → producer component's output.
+      const consumer = byQname('aws_eks_cluster.this')[0] ??
+        cg.getNodesInFile('components/terraform/eks/cluster/main.tf').find((n) => n.qualifiedName === 'aws_eks_cluster.this');
+      expect(consumer, 'consumer resource').toBeDefined();
+      const producerOut = byQname('output.vpc_id', 'components/terraform/vpc/outputs.tf')[0];
+      expect(producerOut, "producer component's output").toBeDefined();
+      expect(
+        cg.getOutgoingEdges(consumer!.id).find((e) => e.target === producerOut!.id),
+        'remote-state bridge edge eks/cluster → vpc output'
+      ).toBeDefined();
+
+      // 2. Ambiguous component name → no bridge edge to either candidate.
+      const zoneOut = byQname('output.zone', 'components/terraform/eks/cluster/dns.tf')[0];
+      expect(zoneOut).toBeDefined();
+      const zoneTargets = cg
+        .getOutgoingEdges(zoneOut!.id)
+        .map((e) => cg.getNode(e.target))
+        .filter((n) => n?.qualifiedName === 'output.zone_id');
+      expect(zoneTargets, 'ambiguous component must not be guessed').toHaveLength(0);
+
+      // 3. Provider alias: nodes are distinct, and the selection inside the
+      //    module resolves up the tree to the aliased configuration.
+      const provNodes = cg.getNodesInFile('providers.tf');
+      const aliased = provNodes.find((n) => n.qualifiedName === 'provider.aws.east');
+      const defaultProv = provNodes.find((n) => n.qualifiedName === 'provider.aws');
+      expect(aliased, 'aliased provider node').toBeDefined();
+      expect(defaultProv, 'default provider node').toBeDefined();
+      const bucket = cg.getNodesInFile('modules/app/main.tf').find((n) => n.qualifiedName === 'aws_s3_bucket.b');
+      expect(bucket).toBeDefined();
+      const bucketEdges = cg.getOutgoingEdges(bucket!.id);
+      expect(
+        bucketEdges.find((e) => e.target === aliased!.id),
+        'provider = aws.east → aliased provider (ancestor walk)'
+      ).toBeDefined();
+      expect(bucketEdges.find((e) => e.target === defaultProv!.id), 'must not link the default provider').toBeUndefined();
+
+      // 4. moved block: the file references the live resource.
+      const renamed = cg.getNodesInFile('main.tf').find((n) => n.qualifiedName === 'aws_instance.renamed');
+      expect(renamed).toBeDefined();
+      const rootFile = cg.getNodesInFile('main.tf').find((n) => n.kind === 'file');
+      expect(
+        cg.getOutgoingEdges(rootFile!.id).find((e) => e.target === renamed!.id),
+        'moved block → live resource edge'
+      ).toBeDefined();
     } finally {
       cg.close();
     }

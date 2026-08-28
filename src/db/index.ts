@@ -35,6 +35,35 @@ function configureConnection(db: SqliteDatabase): void {
   db.pragma('cache_size = -64000');      // 64 MB page cache
   db.pragma('temp_store = MEMORY');      // temp tables in memory
   db.pragma('mmap_size = 268435456');    // 256 MB memory-mapped I/O
+  // Without a journal_size_limit the -wal file never shrinks below its
+  // high-water mark while a connection lives: checkpoints fold frames back but
+  // leave the file at full size, so one giant deferred-sync WAL stays giant
+  // forever. With the limit set, any checkpoint that resets the WAL truncates
+  // the file back down. Killed-process leftovers are handled separately by
+  // healOversizedWal() at open. (#1431)
+  db.pragma(`journal_size_limit = ${WAL_HEAL_THRESHOLD_BYTES}`);
+}
+
+/**
+ * WAL size past which `healOversizedWal` (run at every `open`) checkpoints and
+ * truncates the file, and to which `journal_size_limit` clips the WAL after any
+ * resetting checkpoint. A SIGKILL'd process (the #850 liveness watchdog, OOM,
+ * crash) can leave an arbitrarily large WAL behind — a whole deferred-sync
+ * run's worth (#1248) — and before #1431 no later session ever shrank it: the
+ * file just grew, killed session after killed session, until the disk filled
+ * (25.6 GB observed). 64 MB is far above anything a healthy open ever sees
+ * (a clean close deletes the WAL) yet small enough to cap the leak.
+ * Override with `CODEGRAPH_WAL_HEAL_MB` (also feeds `journal_size_limit`).
+ */
+export const WAL_HEAL_THRESHOLD_BYTES = resolveWalHealBytes(process.env.CODEGRAPH_WAL_HEAL_MB);
+
+/** Resolve the heal threshold from the env override (MB); invalid ⇒ 64 MB. */
+export function resolveWalHealBytes(envVal: string | undefined): number {
+  if (envVal !== undefined && envVal !== '') {
+    const n = Number(envVal);
+    if (Number.isFinite(n) && n > 0) return Math.floor(n * 1024 * 1024);
+  }
+  return 64 * 1024 * 1024;
 }
 
 /**
@@ -112,7 +141,271 @@ export class DatabaseConnection {
       runMigrations(db, currentVersion);
     }
 
+    // Self-heal a bulk-load window that never closed (crash between
+    // beginBulkNodeLoad and endBulkNodeLoad): the FTS triggers are missing and
+    // nodes_fts is stale. Rebuild + recreate so search stays in sync.
+    conn.healBulkNodeLoad();
+    conn.healBulkSecondaryIndexes();
+
+    // Self-heal a killed session's leftover oversized WAL (#1431) — one
+    // statSync when healthy, off-thread checkpoint+truncate when not.
+    void conn.healOversizedWal();
+
     return conn;
+  }
+
+  /**
+   * FTS maintenance triggers dropped/recreated around a bulk load.
+   * Names must match schema.sql.
+   */
+  private static readonly FTS_TRIGGER_NAMES = ['nodes_ai', 'nodes_ad', 'nodes_au'] as const;
+
+  /**
+   * Enter bulk-load mode: drop the per-row FTS sync triggers so mass node
+   * inserts skip per-row tokenization. MUST be paired with endBulkNodeLoad()
+   * (use try/finally); a crash inside the window is healed on the next open().
+   * The window is DB-wide (triggers are schema objects), which is safe because
+   * endBulkNodeLoad() rebuilds nodes_fts from the nodes table wholesale — any
+   * row written by anyone during the window is captured by the rebuild.
+   */
+  beginBulkNodeLoad(): void {
+    for (const t of DatabaseConnection.FTS_TRIGGER_NAMES) {
+      this.db.exec(`DROP TRIGGER IF EXISTS ${t}`);
+    }
+  }
+
+  /**
+   * Leave bulk-load mode: rebuild the whole FTS index from the nodes table in
+   * one pass (far cheaper than per-row trigger firings), then recreate the
+   * triggers by re-running schema.sql (idempotent — everything in it is
+   * IF NOT EXISTS).
+   */
+  endBulkNodeLoad(): void {
+    this.db.exec(`INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')`);
+    this.recreateFtsTriggers();
+  }
+
+  /**
+   * NON-UNIQUE secondary indexes maintained per-row during the parse phase's
+   * bulk inserts — the store-architecture arc's first lever (plan §4d: dubbo's
+   * parse-loop wall is 94% store-writer busy, and the #1320 post-mortem showed
+   * statement batching and sorted inserts are ~zero on this path because
+   * B-TREE MAINTENANCE is the floor). A fresh init writes every row of
+   * nodes/unresolved_refs/files exactly once and reads none of them until
+   * resolution, so the parse window can drop all of these and rebuild each in
+   * one table scan afterwards — the same measured trade as the resolution
+   * phase's edge-index window (2.8s → 1.1s inserting, ~0.3s recreating).
+   * Primary keys and UNIQUE constraints stay (upserts and OR-IGNORE dedup
+   * conflict on them).
+   */
+  private static readonly BULK_PARSE_INDEX_NAMES = [
+    'idx_nodes_kind',
+    'idx_nodes_name',
+    'idx_nodes_qualified_name',
+    'idx_nodes_file_path',
+    'idx_nodes_language',
+    'idx_nodes_file_line',
+    'idx_nodes_lower_name',
+    'idx_unresolved_from_node',
+    'idx_unresolved_name',
+    'idx_unresolved_file_path',
+    'idx_unresolved_from_name',
+    'idx_unresolved_status',
+    'idx_unresolved_failed_tail',
+    'idx_files_language',
+    'idx_files_modified_at',
+  ] as const;
+
+  /**
+   * Enter bulk-parse-load mode (FRESH-INIT ONLY — the caller gates on a fresh
+   * DB, because an incremental index deletes per-file rows mid-phase and needs
+   * the file_path indexes): drop every parse-lane secondary index, including
+   * the four non-unique edge indexes (parse inserts contains-edges too; the
+   * UNIQUE identity index stays for INSERT OR IGNORE dedup, and its `source`
+   * prefix keeps source-keyed reads indexed, as in the edge window). MUST be
+   * paired with endBulkParseLoad(); a crash inside the window is healed on the
+   * next DatabaseConnection open (schema.sql re-applies CREATE INDEX IF NOT
+   * EXISTS).
+   */
+  beginBulkParseLoad(): void {
+    for (const idx of DatabaseConnection.BULK_PARSE_INDEX_NAMES) {
+      this.db.exec(`DROP INDEX IF EXISTS ${idx}`);
+    }
+    this.beginBulkEdgeLoad();
+  }
+
+  /**
+   * Leave bulk-parse-load mode: recreate everything the window dropped, one
+   * table scan per index, with a yield between statements (same
+   * liveness-watchdog rationale as endBulkEdgeLoad — at kernel scale each
+   * build is a long synchronous scan). The edge indexes are rebuilt here too,
+   * so paths that never enter the resolution phase's own bulk-edge window
+   * (small runs) are left with a complete schema; the batched resolver's
+   * beginBulkEdgeLoad simply re-drops them (DROP IF EXISTS — idempotent).
+   */
+  async endBulkParseLoad(): Promise<void> {
+    const schemaPath = path.join(__dirname, 'schema.sql');
+    const schema = fs.readFileSync(schemaPath, 'utf-8');
+    for (const idx of DatabaseConnection.BULK_PARSE_INDEX_NAMES) {
+      const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
+      if (!m) throw new Error(`schema.sql: parse index ${idx} not found for bulk-load recreation`);
+      this.db.exec(m[0]);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    await this.endBulkEdgeLoad();
+  }
+
+  /**
+   * unresolved_refs secondary indexes NOT read by the batched resolution
+   * loop. The loop pages pending refs by keyset (`status='pending' AND id>?`
+   * — the status index + PK), deletes resolved rows by id, and parks failures
+   * with a status UPDATE; every other ref index serves SYNC-time paths
+   * (per-file re-index deletes, name-keyed retry, failed-tail heal). Each
+   * per-batch DELETE maintains all of them — the biggest single main-thread
+   * stage on the dubbo profile (deletes 1.2s of a 5.4s resolution phase) —
+   * so the batched loop drops them and rebuilds at the end, where the table
+   * holds only the surviving FAILED refs (resolved rows are gone), making
+   * the recreate near-free.
+   */
+  private static readonly BULK_REF_INDEX_NAMES = [
+    'idx_unresolved_from_node',
+    'idx_unresolved_name',
+    'idx_unresolved_file_path',
+    'idx_unresolved_from_name',
+    'idx_unresolved_failed_tail',
+  ] as const;
+
+  /**
+   * Enter bulk-ref mode for the batched resolution loop — see
+   * BULK_REF_INDEX_NAMES. MUST be paired with endBulkRefLoad(); a crash
+   * inside the window heals on the next open (schema.sql re-applies
+   * CREATE INDEX IF NOT EXISTS).
+   */
+  beginBulkRefLoad(): void {
+    for (const idx of DatabaseConnection.BULK_REF_INDEX_NAMES) {
+      this.db.exec(`DROP INDEX IF EXISTS ${idx}`);
+    }
+  }
+
+  /** Leave bulk-ref mode: recreate each index in one scan (yield between). */
+  async endBulkRefLoad(): Promise<void> {
+    const schemaPath = path.join(__dirname, 'schema.sql');
+    const schema = fs.readFileSync(schemaPath, 'utf-8');
+    for (const idx of DatabaseConnection.BULK_REF_INDEX_NAMES) {
+      const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
+      if (!m) throw new Error(`schema.sql: ref index ${idx} not found for bulk-load recreation`);
+      this.db.exec(m[0]);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+
+  /**
+   * Names of the NON-UNIQUE edge indexes dropped for a bulk edge load.
+   * idx_edges_identity deliberately stays: INSERT OR IGNORE's dedup conflicts
+   * on it (#1034), and its leftmost column is `source`, so the source-keyed
+   * reads resolution makes mid-window (supertype walks over
+   * `implements`/`extends`) keep an index via its prefix — verified with
+   * EXPLAIN QUERY PLAN. Target-keyed and kind-keyed reads (traversal,
+   * synthesis) happen only after endBulkEdgeLoad().
+   */
+  private static readonly BULK_EDGE_INDEX_NAMES = [
+    'idx_edges_kind',
+    'idx_edges_source_kind',
+    'idx_edges_target_kind',
+    'idx_edges_provenance',
+  ] as const;
+
+  /**
+   * Enter bulk-edge-load mode: drop the non-unique edge indexes so the mass
+   * INSERT OR IGNORE stream pays one B-tree (the identity index) instead of
+   * five — measured 2.8s → 1.1s inserting a 224k-edge resolution set, with
+   * recreation costing ~0.3s. MUST be paired with endBulkEdgeLoad(); a crash
+   * inside the window is healed on the next DatabaseConnection open (schema.sql
+   * re-applies CREATE INDEX IF NOT EXISTS).
+   */
+  beginBulkEdgeLoad(): void {
+    for (const idx of DatabaseConnection.BULK_EDGE_INDEX_NAMES) {
+      this.db.exec(`DROP INDEX IF EXISTS ${idx}`);
+    }
+  }
+
+  /**
+   * Leave bulk-edge-load mode: recreate the dropped indexes in one pass each
+   * over the (now fully loaded) edges table — far cheaper than maintaining
+   * them per-insert. DDL is extracted from schema.sql so it cannot drift.
+   *
+   * Async with a yield BETWEEN the four CREATE INDEX statements: each build is
+   * a synchronous scan of the whole edges table (~20s apiece at Linux-kernel
+   * scale, 79s total measured), and running them back-to-back is a single
+   * event-loop stall longer than the #850 liveness watchdog's 60s window — a
+   * daemon-triggered re-index would be SIGKILLed right after doing the work.
+   * One yield per statement keeps every stall to a single index build, which
+   * stays inside the window.
+   */
+  async endBulkEdgeLoad(): Promise<void> {
+    const schemaPath = path.join(__dirname, 'schema.sql');
+    const schema = fs.readFileSync(schemaPath, 'utf-8');
+    for (const idx of DatabaseConnection.BULK_EDGE_INDEX_NAMES) {
+      const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
+      if (!m) throw new Error(`schema.sql: edge index ${idx} not found for bulk-load recreation`);
+      this.db.exec(m[0]);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+
+  /** Recreate the FTS triggers + rebuild if a bulk-load window never closed. */
+  private healBulkNodeLoad(): void {
+    const row = this.db
+      .prepare(
+        `SELECT count(*) AS c FROM sqlite_master WHERE type = 'trigger' AND name IN ('nodes_ai','nodes_ad','nodes_au')`
+      )
+      .get() as { c: number } | undefined;
+    if ((row?.c ?? 0) >= DatabaseConnection.FTS_TRIGGER_NAMES.length) return;
+    this.endBulkNodeLoad();
+  }
+
+  /** Recreate every secondary index a killed bulk parse/ref/edge window may leave dropped. */
+  private healBulkSecondaryIndexes(): void {
+    const names = [...new Set<string>([
+      ...DatabaseConnection.BULK_PARSE_INDEX_NAMES,
+      ...DatabaseConnection.BULK_REF_INDEX_NAMES,
+      ...DatabaseConnection.BULK_EDGE_INDEX_NAMES,
+    ])];
+    const placeholders = names.map(() => '?').join(',');
+    const row = this.db
+      .prepare(`SELECT count(*) AS c FROM sqlite_master WHERE type = 'index' AND name IN (${placeholders})`)
+      .get(...names) as { c: number } | undefined;
+    if ((row?.c ?? 0) >= names.length) return;
+
+    const schemaPath = path.join(__dirname, 'schema.sql');
+    const schema = fs.readFileSync(schemaPath, 'utf-8');
+    for (const idx of names) {
+      const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
+      if (!m) throw new Error(`schema.sql: index ${idx} not found for crash recovery`);
+      this.db.exec(m[0]);
+    }
+  }
+
+  /**
+   * Recreate the FTS sync triggers from schema.sql — extracted from the file
+   * rather than duplicated here so the DDL cannot drift from the schema.
+   * (Re-execing the whole schema is not an option: it contains data INSERTs
+   * that are not idempotent, e.g. schema_versions.)
+   */
+  private recreateFtsTriggers(): void {
+    const schemaPath = path.join(__dirname, 'schema.sql');
+    const schema = fs.readFileSync(schemaPath, 'utf-8');
+    const triggerDdls = schema.match(
+      /CREATE TRIGGER IF NOT EXISTS nodes_a[idu]\b[\s\S]*?END;/g
+    );
+    if (!triggerDdls || triggerDdls.length !== DatabaseConnection.FTS_TRIGGER_NAMES.length) {
+      throw new Error(
+        `schema.sql: expected ${DatabaseConnection.FTS_TRIGGER_NAMES.length} nodes FTS triggers, found ${triggerDdls?.length ?? 0}`
+      );
+    }
+    for (const ddl of triggerDdls) {
+      this.db.exec(ddl);
+    }
   }
 
   /**
@@ -190,6 +483,186 @@ export class DatabaseConnection {
   }
 
   /**
+   * Size of the `-wal` sidecar file in bytes. 0 when it doesn't exist (non-WAL
+   * journal mode, in-memory DB, or no write since the last checkpoint+reset).
+   */
+  getWalSizeBytes(): number {
+    if (!this.dbPath || this.dbPath === ':memory:') return 0;
+    try {
+      return fs.statSync(`${this.dbPath}-wal`).size;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** Size of the main DB file in bytes (0 for in-memory/unknown) — the WAL
+   * valve scales its fold caps with it (resolveWalValveMb). */
+  getDbFileSizeBytes(): number {
+    if (!this.dbPath || this.dbPath === ':memory:') return 0;
+    try {
+      return fs.statSync(this.dbPath).size;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** Current `wal_autocheckpoint` interval in pages (0 = disabled). */
+  getWalAutocheckpoint(): number {
+    const v = this.db.pragma('wal_autocheckpoint', { simple: true });
+    const n = Number(v);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  /**
+   * Set the connection's `wal_autocheckpoint` interval (pages; 0 disables).
+   * Bulk indexing defers checkpoints entirely (#1231): the default 1000-page
+   * auto-checkpoint re-writes hot B-tree/FTS pages into the main DB file over
+   * and over — measured at ~95% of ALL disk I/O during a bulk index, and the
+   * difference between 45s and 19+ minutes on HDD-class storage. During
+   * deferral a {@link WalCheckpointValve} bounds WAL growth off-thread.
+   */
+  setWalAutocheckpoint(pages: number): void {
+    this.db.pragma(`wal_autocheckpoint = ${Math.max(0, Math.floor(pages))}`);
+  }
+
+  /**
+   * `PRAGMA wal_checkpoint(PASSIVE)` on a worker thread with its own
+   * connection. PASSIVE never blocks the writer, and running it off-thread
+   * means the main thread — and the #850 watchdog heartbeat — keep turning
+   * even when the backfill is minutes of I/O on slow storage (a synchronous
+   * checkpoint that exceeds the watchdog's 60s window gets a healthy index
+   * SIGKILLed — observed in the #1231 repro).
+   *
+   * Returns SQLite's checkpoint result row — `log === checkpointed` with
+   * `busy === 0` means the ENTIRE WAL was backfilled, so the writer's next
+   * commit restarts the WAL from the top and the file stops growing. The
+   * WAL valve needs that signal because a WAL file's SIZE never shrinks:
+   * after the first wrap, raw file size says nothing about the un-backfilled
+   * backlog. Best-effort: returns null on any failure (including worker
+   * threads being unavailable — a potentially minutes-long checkpoint must
+   * never run inline on the main thread).
+   */
+  async checkpointWalPassive(): Promise<{ busy: number; log: number; checkpointed: number } | null> {
+    return this.checkpointWal('PASSIVE');
+  }
+
+  /**
+   * `PRAGMA wal_checkpoint(TRUNCATE)` — same off-thread pattern as PASSIVE,
+   * but on success the WAL FILE is chopped to zero. A completed passive
+   * backfill bounds the un-checkpointed backlog, yet the FILE only stops
+   * growing when a commit finds ZERO readers holding WAL marks — rare while
+   * pool workers cycle, so at kernel scale a fully-backfilled WAL still
+   * accreted the phase's whole write volume on disk (§7a.1: 22GB). The valve
+   * calls this exactly at a parked barrier (writer parked, pool drained,
+   * backfill complete) where the no-reader condition is guaranteed rather
+   * than lucky. The worker sets a short busy_timeout so a racing reader
+   * degrades this to a no-op (busy=1) instead of a stall.
+   */
+  async checkpointWalTruncate(): Promise<{ busy: number; log: number; checkpointed: number } | null> {
+    return this.checkpointWal('TRUNCATE');
+  }
+
+  /**
+   * Shrink a leftover oversized WAL (#1431). A SIGKILL'd session — the #850
+   * liveness watchdog, OOM, a crash — leaves its WAL on disk, the next session
+   * appends to the same file, and (pre-#1431) nothing ever truncated it:
+   * PASSIVE checkpoints fold frames but keep the file at its high-water mark,
+   * and the one shrinking path (a clean last-connection close) is exactly what
+   * the killed world never takes. Unbounded growth until the disk fills.
+   *
+   * Called fire-and-forget from every `open()`: cost is one statSync when the
+   * WAL is small (the overwhelmingly common case). Past the threshold it runs
+   * the off-thread PASSIVE fold then TRUNCATE — both on worker connections
+   * with a busy_timeout, so a racing writer degrades this to a no-op that the
+   * next open retries rather than a stall.
+   */
+  async healOversizedWal(): Promise<{ healed: boolean; beforeBytes: number; afterBytes: number }> {
+    const beforeBytes = this.getWalSizeBytes();
+    if (beforeBytes <= WAL_HEAL_THRESHOLD_BYTES) {
+      return { healed: false, beforeBytes, afterBytes: beforeBytes };
+    }
+    // Single-flight: open() fires this fire-and-forget and callers may also
+    // invoke it explicitly. Two concurrent passes DEFEAT each other — each
+    // checkpoint worker sees the other as a busy reader and no-ops — so share
+    // one in-flight pass instead of racing.
+    this.walHeal ??= this.runWalHeal(beforeBytes).finally(() => { this.walHeal = null; });
+    return this.walHeal;
+  }
+
+  private walHeal: Promise<{ healed: boolean; beforeBytes: number; afterBytes: number }> | null = null;
+
+  private async runWalHeal(beforeBytes: number): Promise<{ healed: boolean; beforeBytes: number; afterBytes: number }> {
+    // A racing reader/writer (another session healing the same file, a query
+    // pool warming up) degrades a checkpoint pass to a busy no-op — retry a
+    // few times before leaving the rest to the next open.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 300));
+      await this.checkpointWalPassive();
+      await this.checkpointWalTruncate();
+      if (this.getWalSizeBytes() <= WAL_HEAL_THRESHOLD_BYTES) break;
+    }
+    const afterBytes = this.getWalSizeBytes();
+    if (process.env.CODEGRAPH_WAL_VALVE_DEBUG) {
+      console.error(`[wal-heal] oversized WAL at open: ${Math.round(beforeBytes / (1024 * 1024))}MB -> ${Math.round(afterBytes / (1024 * 1024))}MB`);
+    }
+    return { healed: afterBytes < beforeBytes, beforeBytes, afterBytes };
+  }
+
+  private async checkpointWal(mode: 'PASSIVE' | 'TRUNCATE'): Promise<{ busy: number; log: number; checkpointed: number } | null> {
+    if (!this.dbPath || this.dbPath === ':memory:') {
+      try {
+        const row = this.db.prepare(`PRAGMA wal_checkpoint(${mode})`).get() as Record<string, number> | undefined;
+        return row ? { busy: Number(row.busy), log: Number(row.log), checkpointed: Number(row.checkpointed) } : null;
+      } catch {
+        return null;
+      }
+    }
+    try {
+      const { Worker } = await import('node:worker_threads');
+      const workerSource = `
+        const { workerData, parentPort } = require('node:worker_threads');
+        let row = null;
+        let err = null;
+        try {
+          const { DatabaseSync } = require('node:sqlite');
+          const db = new DatabaseSync(workerData.dbPath);
+          const mode = workerData.mode === 'TRUNCATE' ? 'TRUNCATE' : 'PASSIVE';
+          try {
+            if (mode === 'TRUNCATE') db.exec('PRAGMA busy_timeout = 2000');
+            row = db.prepare('PRAGMA wal_checkpoint(' + mode + ')').get();
+          } catch (e) { err = String(e && e.message || e); }
+          try { db.close(); } catch {}
+        } catch (e) { err = err || String(e && e.message || e); }
+        parentPort.postMessage({ row, err });
+      `;
+      return await new Promise((resolve) => {
+        let settled = false;
+        const finish = (row?: Record<string, number> | null): void => {
+          if (settled) return;
+          settled = true;
+          resolve(row ? { busy: Number(row.busy), log: Number(row.log), checkpointed: Number(row.checkpointed) } : null);
+        };
+        try {
+          const worker = new Worker(workerSource, { eval: true, workerData: { dbPath: this.dbPath, mode } });
+          worker.once('message', (m: { row?: Record<string, number> | null; err?: string | null }) => {
+            if (m?.err && process.env.CODEGRAPH_WAL_VALVE_DEBUG) {
+              console.error(`[wal-valve] checkpoint worker (${mode}): ${m.err}`);
+            }
+            void worker.terminate();
+            finish(m?.row ?? null);
+          });
+          worker.once('error', () => { void worker.terminate(); finish(null); });
+          worker.once('exit', () => finish(null));
+        } catch {
+          finish(null);
+        }
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Optimize database (vacuum and analyze)
    */
   optimize(): void {
@@ -198,8 +671,8 @@ export class DatabaseConnection {
   }
 
   /**
-   * Lightweight, non-blocking maintenance to run after bulk writes
-   * (indexAll, sync). Two operations:
+   * Lightweight maintenance to run after bulk writes (indexAll, sync).
+   * Two operations:
    *
    *   - `PRAGMA optimize` — incremental ANALYZE; SQLite only re-analyzes
    *     tables whose row counts changed materially since the last
@@ -211,19 +684,74 @@ export class DatabaseConnection {
    *     unboundedly between automatic checkpoints (auto-fires at 1000
    *     pages by default; large indexAll runs blow past that).
    *
-   * Both operations are silently swallowed on failure — they're a
-   * best-effort optimization, never load-bearing for correctness.
+   * Runs on a WORKER THREAD with its own connection: on a multi-GB index
+   * these pragmas are minutes of synchronous IO (a 95k-file kernel index
+   * left a 593MB WAL whose checkpoint alone blew the #850 watchdog's 60s
+   * window and got a COMPLETED index SIGKILLed at the finish line). WAL
+   * checkpointing from a second connection is standard SQLite; `PRAGMA
+   * optimize` persists its statistics in sqlite_stat tables, so the main
+   * connection benefits the same. The main thread just awaits a message,
+   * so the event loop — and the watchdog heartbeat — keep turning.
+   *
+   * Everything is silently swallowed on failure — best-effort
+   * optimization, never load-bearing for correctness. If worker threads
+   * are unavailable, falls back to a bounded in-line `PRAGMA optimize`
+   * and SKIPS the checkpoint (the final close() checkpoints after the
+   * CLI has already disarmed its watchdog).
    */
-  runMaintenance(): void {
-    try {
-      this.db.exec('PRAGMA optimize');
-    } catch {
-      // ignore
+  async runMaintenance(): Promise<void> {
+    // In-memory / test databases: nothing worth a worker round-trip.
+    if (!this.dbPath || this.dbPath === ':memory:') {
+      try { this.db.exec('PRAGMA optimize'); } catch { /* ignore */ }
+      try { this.db.exec('PRAGMA wal_checkpoint(PASSIVE)'); } catch { /* ignore */ }
+      return;
     }
+    await this.runPragmasOffThread(
+      ['PRAGMA analysis_limit=1000', 'PRAGMA optimize', 'PRAGMA wal_checkpoint(PASSIVE)'],
+      // Worker threads unavailable — bounded in-line fallback, no checkpoint.
+      ['PRAGMA analysis_limit=1000', 'PRAGMA optimize']
+    );
+  }
+
+  /**
+   * Run pragmas on a worker thread against its own connection to this DB
+   * (shared machinery for {@link runMaintenance} and
+   * {@link checkpointWalPassive}). Each pragma is individually best-effort;
+   * the whole call is best-effort. `inlineFallback` (if any) runs on THIS
+   * connection only when worker threads are unavailable — keep it to pragmas
+   * that are safe to run synchronously on the main thread.
+   */
+  private async runPragmasOffThread(pragmas: string[], inlineFallback: string[] = []): Promise<void> {
     try {
-      this.db.exec('PRAGMA wal_checkpoint(PASSIVE)');
+      const { Worker } = await import('node:worker_threads');
+      const workerSource = `
+        const { workerData, parentPort } = require('node:worker_threads');
+        try {
+          const { DatabaseSync } = require('node:sqlite');
+          const db = new DatabaseSync(workerData.dbPath);
+          for (const p of workerData.pragmas) { try { db.exec(p); } catch {} }
+          try { db.close(); } catch {}
+        } catch {}
+        parentPort.postMessage('done');
+      `;
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = (): void => {
+          if (!settled) { settled = true; resolve(); }
+        };
+        try {
+          const worker = new Worker(workerSource, { eval: true, workerData: { dbPath: this.dbPath, pragmas } });
+          worker.once('message', () => { void worker.terminate(); finish(); });
+          worker.once('error', () => { void worker.terminate(); finish(); });
+          worker.once('exit', finish);
+        } catch {
+          finish();
+        }
+      });
     } catch {
-      // ignore (e.g., not in WAL mode)
+      for (const p of inlineFallback) {
+        try { this.db.exec(p); } catch { /* ignore */ }
+      }
     }
   }
 
