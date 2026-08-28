@@ -1025,6 +1025,55 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, em
 }
 
 /**
+ * Where `dir` sits inside its git repository, as a normalized '/'-terminated
+ * prefix — '' when `dir` IS the repo root. Throws when `dir` is not in a repo,
+ * which the git fast paths already read as "fall back to a filesystem walk".
+ *
+ * Every caller of `git status --porcelain` needs this: porcelain prints
+ * REPOSITORY-relative paths from any cwd (the format deliberately ignores
+ * `status.relativePaths`) and reports the whole repo, while `git ls-files`
+ * prints cwd-relative paths scoped to cwd. A project indexed from a
+ * subdirectory must strip this prefix itself or its paths land outside the
+ * project root.
+ */
+function gitPathPrefix(dir: string): string {
+  const prefix = execFileSync(
+    'git',
+    ['rev-parse', '--show-prefix'],
+    { cwd: dir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
+  ).trim();
+  return prefix ? normalizePath(prefix) : '';
+}
+
+/**
+ * True when a parent repo GITIGNORES `rootDir`. Git then reports nothing inside
+ * it — no `ls-files` entries, no `status` lines — so both git fast paths must
+ * decline and let the filesystem walk answer. Enumeration and change detection
+ * have to make this call identically: if only one of them declines, `status`
+ * reports a clean index for a project `sync` keeps reindexing.
+ */
+function gitScopeIsIgnored(rootDir: string): boolean {
+  const gitRoot = execFileSync(
+    'git',
+    ['rev-parse', '--show-toplevel'],
+    { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
+  ).trim();
+
+  if (path.resolve(gitRoot) === path.resolve(rootDir)) return false;
+  try {
+    // git check-ignore exits 0 if the path IS ignored, 1 if not
+    execFileSync(
+      'git',
+      ['check-ignore', '-q', path.resolve(rootDir)],
+      { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Get all files visible to git (tracked + untracked but not ignored).
  * Respects .gitignore at all levels (root, subdirectories) and descends into
  * embedded (nested, non-submodule) git repos. Returns null on failure
@@ -1032,29 +1081,7 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, em
  */
 function getGitVisibleFiles(rootDir: string): Set<string> | null {
   try {
-    // Check if the project directory is gitignored by a parent repo.
-    // When rootDir lives inside a parent git repo that ignores it,
-    // `git ls-files` returns nothing — fall back to filesystem walk.
-    const gitRoot = execFileSync(
-      'git',
-      ['rev-parse', '--show-toplevel'],
-      { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
-    ).trim();
-
-    if (path.resolve(gitRoot) !== path.resolve(rootDir)) {
-      try {
-        // git check-ignore exits 0 if the path IS ignored, 1 if not
-        execFileSync(
-          'git',
-          ['check-ignore', '-q', path.resolve(rootDir)],
-          { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
-        );
-        // Directory is gitignored by parent repo — fall back to filesystem walk
-        return null;
-      } catch {
-        // Not ignored — safe to use git ls-files
-      }
-    }
+    if (gitScopeIsIgnored(rootDir)) return null;
 
     const files = new Set<string>();
     const embeddedRoots = new Set<string>();
@@ -1106,6 +1133,9 @@ interface GitChanges {
  */
 export function getGitChangedFiles(rootDir: string): GitChanges | null {
   try {
+    // Same scope call getGitVisibleFiles makes, so status and the index agree
+    // about which projects git can speak for at all.
+    if (gitScopeIsIgnored(rootDir)) return null;
     const changes: GitChanges = { modified: [], added: [], deleted: [] };
     // Custom extension → language overrides from the project's codegraph.json,
     // so change detection sees the same custom-extension files the full index does.
@@ -1117,7 +1147,22 @@ export function getGitChangedFiles(rootDir: string): GitChanges | null {
   }
 }
 
-function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, overrides?: Record<string, Language>, includeIgnored: Ignore | null = null, exclude: Ignore | null = null): void {
+/**
+ * Collect `git status` changes for the tree rooted at `dir`, which is a repo
+ * root only in the recursive calls — the top-level one passes the PROJECT root,
+ * which may be any subdirectory of its repository.
+ *
+ * `git status --porcelain` is indifferent to cwd in both directions: it reports
+ * the whole repository, and it prints repository-relative paths. So a project
+ * below the repo root has to scope the report to its own subtree and rebase the
+ * paths onto itself — `repoPrefix` is that subtree's path inside the repo, and
+ * everything outside it belongs to another project. (Left unconverted, every
+ * path resolved to `<root>/<sub>/<sub>/…`, which no read could open, so change
+ * detection reported a permanently clean index while `sync` — a filesystem
+ * reconcile — kept finding the same edits.)
+ */
+function collectGitStatus(dir: string, prefix: string, out: GitChanges, overrides?: Record<string, Language>, includeIgnored: Ignore | null = null, exclude: Ignore | null = null): void {
+  const repoPrefix = gitPathPrefix(dir);
   const output = execFileSync(
     'git',
     // `-uall` lists individual untracked files instead of collapsing an
@@ -1126,8 +1171,13 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, over
     // below). Nested untracked git repos still collapse to `?? repo/` even
     // with `-uall` — git never crosses a repo boundary — so the recursion
     // still handles them. (#1213)
-    ['status', '--porcelain', '--no-renames', '-uall'],
-    { cwd: repoDir, encoding: 'utf-8', timeout: 10000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
+    // The `-- .` pathspec (only when below the repo root, so a repo-root
+    // project keeps the exact command it had) makes git skip the rest of the
+    // repository instead of us reporting and then discarding it.
+    repoPrefix
+      ? ['status', '--porcelain', '--no-renames', '-uall', '--', '.']
+      : ['status', '--porcelain', '--no-renames', '-uall'],
+    { cwd: dir, encoding: 'utf-8', timeout: 10000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
   );
 
   // This repo's own ignore rules — built-in defaults (#407) plus its .gitignore.
@@ -1137,17 +1187,26 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, over
   // vendor/ dir, or a tracked file under a .gitignored dir, surfaces here as a
   // change — so `codegraph status` (which reads getChangedFiles) reports a
   // pending edit the full index never tracks and `sync` never clears. Matching
-  // repo-relative `rel` at each recursion level mirrors getGitVisibleFiles'
+  // `dir`-relative `rel` at each recursion level mirrors getGitVisibleFiles'
   // ScopeIgnore: every embedded repo is judged by ITS OWN rules, never the
-  // parent's. (#766)
-  const ig = buildDefaultIgnore(repoDir);
+  // parent's — and a subdirectory project by its own .gitignore, not the
+  // enclosing repo's. (#766)
+  const ig = buildDefaultIgnore(dir);
 
   const untrackedDirs: string[] = [];
   for (const line of output.split('\n')) {
     if (line.length < 4) continue; // Minimum: "XY file"
 
     const statusCode = line.substring(0, 2);
-    const rel = normalizePath(line.substring(3));
+    let rel = normalizePath(line.substring(3));
+
+    // Porcelain paths are repository-relative — rebase them onto `dir` and drop
+    // whatever lies outside it (a sibling project in the same repo).
+    if (repoPrefix) {
+      if (!rel.startsWith(repoPrefix)) continue;
+      rel = rel.slice(repoPrefix.length);
+      if (!rel) continue; // the project dir itself, reported as one opaque entry
+    }
 
     // Untracked directory entries (trailing slash) may hide an embedded repo —
     // collect for the recursion below instead of treating as a file.
@@ -1168,7 +1227,7 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, over
     }
 
     // Added (`??`) / modified files inside an excluded dir must not enter the
-    // index — match against the repo-relative path, same as the full scan. (#766)
+    // index — match against the `dir`-relative path, same as the full scan. (#766)
     if (ig.ignores(rel)) continue;
     // User `codegraph.json` `exclude` (#999) is project-root-relative, so it's
     // matched against the full path — sync must not re-add a tracked file the
@@ -1189,12 +1248,12 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, over
   // project opted in via `includeIgnored`; by default `.gitignore` is respected
   // and they are left alone (#970, #976), mirroring the full-index scan.
   for (const rel of untrackedDirs) {
-    for (const repoRel of findNestedGitRepos(path.join(repoDir, rel), rel)) {
-      collectGitStatus(path.join(repoDir, repoRel), prefix + repoRel, out, overrides, includeIgnored, exclude);
+    for (const repoRel of findNestedGitRepos(path.join(dir, rel), rel)) {
+      collectGitStatus(path.join(dir, repoRel), prefix + repoRel, out, overrides, includeIgnored, exclude);
     }
   }
-  for (const rel of findIgnoredEmbeddedRepos(repoDir, includeIgnored, prefix)) {
-    collectGitStatus(path.join(repoDir, rel), prefix + rel, out, overrides, includeIgnored, exclude);
+  for (const rel of findIgnoredEmbeddedRepos(dir, includeIgnored, prefix)) {
+    collectGitStatus(path.join(dir, rel), prefix + rel, out, overrides, includeIgnored, exclude);
   }
 }
 
