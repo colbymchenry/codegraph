@@ -639,6 +639,30 @@ function findNestedGitRepos(absDir: string, relPrefix: string): string[] {
  *
  * Single source of truth for indexer and watcher scope — they must not diverge.
  */
+
+/**
+ * The grammars to preload for a file set.
+ *
+ * Path-only detection calls every `.h` file C, but parse-time detection reads
+ * the source and can reclassify it as C++ or Objective-C (`detectLanguage`
+ * with a `source` argument). Workers only ever get the grammars named here, so
+ * a header that turns out to be Objective-C in a project with no `.m` file
+ * found no parser and failed with `Failed to get parser for language: objc`
+ * (#1628). C++ was already covered; Objective-C was not.
+ */
+export function preloadLanguagesForFiles(
+  files: string[],
+  overrides?: Record<string, Language>
+): Language[] {
+  const languages = [...new Set(files.map((f) => detectLanguage(f, undefined, overrides)))];
+  if (languages.includes('c')) {
+    for (const ambiguous of ['cpp', 'objc'] as const) {
+      if (!languages.includes(ambiguous)) languages.push(ambiguous);
+    }
+  }
+  return languages;
+}
+
 export class ScopeIgnore {
   private embedded: Array<{ root: string; matcher: Ignore }>;
   private defaults: Ignore = defaultsOnlyIgnore();
@@ -1662,11 +1686,7 @@ export class ExtractionOrchestrator {
     await new Promise(resolve => setImmediate(resolve));
 
     // Detect needed languages and load grammars in the parse worker
-    const neededLanguages = [...new Set(files.map((f) => detectLanguage(f, undefined, overrides)))];
-    // .h files default to 'c' but may be C++ — ensure cpp grammar is loaded when c is needed
-    if (neededLanguages.includes('c') && !neededLanguages.includes('cpp')) {
-      neededLanguages.push('cpp');
-    }
+    const neededLanguages = preloadLanguagesForFiles(files, overrides);
 
     // Parse files on a pool of worker threads (keeps the main thread free for UI
     // and uses every core). Falls back to in-process parsing when the compiled
@@ -2874,12 +2894,7 @@ export class ExtractionOrchestrator {
     // Load only grammars needed for changed files
     if (filesToIndex.length > 0) {
       const overrides = loadExtensionOverrides(this.rootDir);
-      const neededLanguages = [...new Set(filesToIndex.map((f) => detectLanguage(f, undefined, overrides)))];
-      // .h files default to 'c' but may be C++ — ensure cpp grammar is loaded
-      if (neededLanguages.includes('c') && !neededLanguages.includes('cpp')) {
-        neededLanguages.push('cpp');
-      }
-      await loadGrammarsForLanguages(neededLanguages);
+      await loadGrammarsForLanguages(preloadLanguagesForFiles(filesToIndex, overrides));
     }
 
     // Index changed files
