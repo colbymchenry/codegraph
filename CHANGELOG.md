@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Grok is now a supported agent: `codegraph install` wires the CodeGraph MCP server into Grok (user-wide or per project), existing MCP servers in its config are preserved, and `codegraph uninstall` reverses the setup. Start a new Grok session — or press `r` in `/mcps` — after installing so Grok picks up the server.
 
 ## [1.6.0] - 2026-08-26
 

@@ -3,7 +3,7 @@ title: Integrations
 description: Supported agents, and manual MCP setup.
 ---
 
-The interactive installer auto-detects and configures each supported agent — wiring the CodeGraph MCP server into each. For the agents that use an instructions file, it also writes a short marker-fenced CodeGraph section (`CLAUDE.md`, `AGENTS.md`, or `GEMINI.md`) so subagents and non-MCP harnesses learn the `codegraph explore` command; `codegraph uninstall` removes it.
+The interactive installer auto-detects and configures each supported agent — wiring the CodeGraph MCP server into each. For the agents that use an instructions file, it also writes a short marker-fenced CodeGraph section (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, or Grok's `rules/codegraph.md`) so subagents and non-MCP harnesses learn the `codegraph explore` command; `codegraph uninstall` removes it.
 
 ## Supported agents
 
@@ -15,6 +15,7 @@ The interactive installer auto-detects and configures each supported agent — w
 - **Gemini CLI**
 - **Antigravity IDE**
 - **Kiro**
+- **Grok**
 
 Run `npx @colbymchenry/codegraph` and pick your agent(s); see [Installation](/codegraph/getting-started/installation/) for the non-interactive flags.
 
@@ -57,3 +58,15 @@ One wildcard auto-approves every CodeGraph tool. The server lists a single tool 
 :::tip
 Cursor launches MCP subprocesses with the wrong working directory. The installer handles this for you by injecting a `--path` argument; if you wire Cursor up by hand, pass the project path explicitly.
 :::
+
+### Grok
+
+Add to `~/.grok/config.toml` (or `.grok/config.toml` in a project):
+
+```toml
+[mcp_servers.codegraph]
+command = "codegraph"
+args = ["serve", "--mcp"]
+```
+
+Start a new Grok session, or press `r` in `/mcps`, so Grok picks up the server.
