@@ -1,7 +1,7 @@
 /**
  * Tiny TOML helpers — just enough to inject / replace / remove a
  * single dotted-key table block (`[mcp_servers.codegraph]`) inside an
- * existing `~/.codex/config.toml`. We deliberately do NOT try to be a
+ * existing Codex or Grok `config.toml`. We deliberately do NOT try to be a
  * general TOML parser/serializer; that would mean pulling in a
  * dependency (~50KB) for ~6 lines of output.
  *

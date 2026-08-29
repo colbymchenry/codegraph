@@ -39,6 +39,7 @@ function setHome(dir: string): { restore: () => void } {
     APPDATA: process.env.APPDATA,
     XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
     HERMES_HOME: process.env.HERMES_HOME,
+    GROK_HOME: process.env.GROK_HOME,
     COPILOT_HOME: process.env.COPILOT_HOME,
   };
   process.env.HOME = dir;
@@ -46,6 +47,7 @@ function setHome(dir: string): { restore: () => void } {
   process.env.APPDATA = path.join(dir, '.config');
   process.env.XDG_CONFIG_HOME = path.join(dir, '.config');
   delete process.env.HERMES_HOME;
+  delete process.env.GROK_HOME;
   delete process.env.COPILOT_HOME;
   return {
     restore() {
@@ -54,6 +56,7 @@ function setHome(dir: string): { restore: () => void } {
       if (prev.APPDATA === undefined) delete process.env.APPDATA; else process.env.APPDATA = prev.APPDATA;
       if (prev.XDG_CONFIG_HOME === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = prev.XDG_CONFIG_HOME;
       if (prev.HERMES_HOME === undefined) delete process.env.HERMES_HOME; else process.env.HERMES_HOME = prev.HERMES_HOME;
+      if (prev.GROK_HOME === undefined) delete process.env.GROK_HOME; else process.env.GROK_HOME = prev.GROK_HOME;
       if (prev.COPILOT_HOME === undefined) delete process.env.COPILOT_HOME; else process.env.COPILOT_HOME = prev.COPILOT_HOME;
     },
   };
@@ -967,6 +970,125 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(fs.readFileSync(tomlPath, 'utf-8')).toBe(historyTables);
   });
 
+  it('grok: install writes config.toml AND the rules/codegraph.md block (#704)', () => {
+    const grok = getTarget('grok')!;
+    const first = grok.install('global', { autoAllow: false });
+    const rulesMd = path.join(tmpHome, '.grok', 'rules', 'codegraph.md');
+    expect(first.files.some((f) => f.path.endsWith('config.toml'))).toBe(true);
+    expect(fs.existsSync(rulesMd)).toBe(true);
+    const body = fs.readFileSync(rulesMd, 'utf-8');
+    expect(body).toContain('## CodeGraph');
+    expect(body).toContain('codegraph explore');
+    const toml = fs.readFileSync(path.join(tmpHome, '.grok', 'config.toml'), 'utf-8');
+    expect(toml).toContain('[mcp_servers.codegraph]');
+    expect(toml).toContain('command = "codegraph"');
+    expect(toml).toContain('args = ["serve", "--mcp"]');
+    expect(first.notes?.join(' ')).toMatch(/\/mcps/);
+    const second = grok.install('global', { autoAllow: false });
+    for (const f of second.files) expect(f.action).toBe('unchanged');
+  });
+
+  it('grok: install replaces a legacy rules/codegraph.md block with the current one, keeping user content', () => {
+    const grok = getTarget('grok')!;
+    const dir = path.join(tmpHome, '.grok', 'rules');
+    fs.mkdirSync(dir, { recursive: true });
+    const rulesMd = path.join(dir, 'codegraph.md');
+    fs.writeFileSync(rulesMd, `# My grok notes\n\nBe terse.\n\n${LEGACY_BLOCK}\n`);
+
+    const result = grok.install('global', { autoAllow: false });
+
+    const body = fs.readFileSync(rulesMd, 'utf-8');
+    expect(body).toContain('# My grok notes');
+    expect(body).toContain('Be terse.');
+    expect(body).not.toContain('Prefer `codegraph_search`');
+    expect(body).toContain('codegraph explore');
+    const mdEntry = result.files.find((f) => f.path.endsWith('codegraph.md'));
+    expect(mdEntry?.action).toBe('updated');
+  });
+
+  it('grok: local install writes ./.grok/config.toml and ./.grok/rules/codegraph.md', () => {
+    const grok = getTarget('grok')!;
+    const result = grok.install('local', { autoAllow: false });
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    expect(paths.some((p) => p.endsWith('/.grok/config.toml'))).toBe(true);
+    expect(paths.some((p) => p.endsWith('/.grok/rules/codegraph.md'))).toBe(true);
+
+    const toml = fs.readFileSync(path.join(process.cwd(), '.grok', 'config.toml'), 'utf-8');
+    expect(toml).toContain('[mcp_servers.codegraph]');
+    expect(fs.readFileSync(path.join(process.cwd(), '.grok', 'rules', 'codegraph.md'), 'utf-8'))
+      .toContain('codegraph explore');
+
+    expect(result.notes?.join(' ')).toMatch(/trusted/);
+
+    expect(fs.existsSync(path.join(tmpHome, '.grok', 'config.toml'))).toBe(false);
+  });
+
+  it('grok: local uninstall reverses the local install and leaves the global entry alone', () => {
+    const grok = getTarget('grok')!;
+    grok.install('global', { autoAllow: false });
+    grok.install('local', { autoAllow: false });
+    expect(grok.detect('local').alreadyConfigured).toBe(true);
+
+    grok.uninstall('local');
+
+    expect(grok.detect('local').alreadyConfigured).toBe(false);
+    expect(grok.detect('global').alreadyConfigured).toBe(true);
+    expect(fs.readFileSync(path.join(tmpHome, '.grok', 'config.toml'), 'utf-8'))
+      .toContain('[mcp_servers.codegraph]');
+  });
+
+  it('grok: install preserves a sibling [mcp_servers.other] table', () => {
+    const grok = getTarget('grok')!;
+    const tomlPath = path.join(tmpHome, '.grok', 'config.toml');
+    fs.mkdirSync(path.dirname(tomlPath), { recursive: true });
+    fs.writeFileSync(tomlPath, [
+      '[models]',
+      'default = "grok-4"',
+      '',
+      '[mcp_servers.other]',
+      'command = "other"',
+      'args = ["serve"]',
+      '',
+    ].join('\n'));
+
+    grok.install('global', { autoAllow: false });
+    const afterInstall = fs.readFileSync(tomlPath, 'utf-8');
+    expect(afterInstall).toContain('[models]');
+    expect(afterInstall).toContain('default = "grok-4"');
+    expect(afterInstall).toContain('[mcp_servers.other]');
+    expect(afterInstall).toContain('command = "other"');
+    expect(afterInstall).toContain('[mcp_servers.codegraph]');
+
+    grok.uninstall('global');
+    const afterUninstall = fs.readFileSync(tomlPath, 'utf-8');
+    expect(afterUninstall).toContain('[models]');
+    expect(afterUninstall).toContain('[mcp_servers.other]');
+    expect(afterUninstall).not.toContain('[mcp_servers.codegraph]');
+  });
+
+  it('grok: GROK_HOME redirects the global config dir', () => {
+    const custom = path.join(tmpHome, 'custom-grok');
+    process.env.GROK_HOME = custom;
+    const grok = getTarget('grok')!;
+    grok.install('global', { autoAllow: false });
+    expect(fs.existsSync(path.join(custom, 'config.toml'))).toBe(true);
+    expect(fs.existsSync(path.join(tmpHome, '.grok', 'config.toml'))).toBe(false);
+    expect(fs.readFileSync(path.join(custom, 'config.toml'), 'utf-8'))
+      .toContain('[mcp_servers.codegraph]');
+    expect(fs.existsSync(path.join(custom, 'rules', 'codegraph.md'))).toBe(true);
+  });
+
+  it('grok: printConfig names config.toml and does not write', () => {
+    const grok = getTarget('grok')!;
+    const before = listAllFiles(tmpHome).concat(listAllFiles(tmpCwd));
+    const out = grok.printConfig('global');
+    expect(out).toContain('[mcp_servers.codegraph]');
+    expect(out).toContain('command = "codegraph"');
+    expect(out).toMatch(/config\.toml/);
+    const after = listAllFiles(tmpHome).concat(listAllFiles(tmpCwd));
+    expect(after.sort()).toEqual(before.sort());
+  });
+
   it('claude: local install writes ./.mcp.json (project scope), not ./.claude.json', () => {
     const claude = getTarget('claude')!;
     const result = claude.install('local', { autoAllow: false });
@@ -1317,6 +1439,7 @@ describe('Installer targets — registry', () => {
     expect(getTarget('gemini')?.id).toBe('gemini');
     expect(getTarget('antigravity')?.id).toBe('antigravity');
     expect(getTarget('kiro')?.id).toBe('kiro');
+    expect(getTarget('grok')?.id).toBe('grok');
     expect(getTarget('copilot-vscode')?.id).toBe('copilot-vscode');
     expect(getTarget('copilot-cli')?.id).toBe('copilot-cli');
     expect(getTarget('copilot-jetbrains')?.id).toBe('copilot-jetbrains');
@@ -1328,6 +1451,11 @@ describe('Installer targets — registry', () => {
     expect(resolveTargetFlag('all', 'global').length).toBe(ALL_TARGETS.length);
     const csv = resolveTargetFlag('claude,cursor', 'global');
     expect(csv.map((t) => t.id)).toEqual(['claude', 'cursor']);
+  });
+
+  it("resolveTargetFlag('all') includes grok", () => {
+    const ids = resolveTargetFlag('all', 'global').map((t) => t.id);
+    expect(ids).toContain('grok');
   });
 
   it("resolveTargetFlag('all') includes every Copilot target", () => {

@@ -16,6 +16,7 @@ import { hermesTarget } from './hermes';
 import { geminiTarget } from './gemini';
 import { antigravityTarget } from './antigravity';
 import { kiroTarget } from './kiro';
+import { grokTarget } from './grok';
 import { copilotVscodeTarget } from './copilot-vscode';
 import { copilotCliTarget } from './copilot-cli';
 import { copilotJetbrainsTarget } from './copilot-jetbrains';
@@ -29,6 +30,7 @@ export const ALL_TARGETS: readonly AgentTarget[] = Object.freeze([
   geminiTarget,
   antigravityTarget,
   kiroTarget,
+  grokTarget,
   copilotVscodeTarget,
   copilotCliTarget,
   copilotJetbrainsTarget,
