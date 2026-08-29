@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph now indexes **Elixir** (`.ex`, `.exs`). Modules, functions, macros, guards, protocols and their implementations, structs, module attributes and typespecs all become part of the graph, with `@doc` and `@spec` carried through so a function's documentation and types come back with it. Multi-clause functions are grouped into one symbol per arity instead of one per clause, and `alias` — including `alias Foo.{Bar, Baz}` and `alias Foo, as: Bar` — is expanded, so a call written `Repo.insert(...)` links to the real `MyApp.Repo` across files.
+- Elixir projects get their framework conventions traced too: **Phoenix** routes become searchable symbols linked to the controller action they dispatch to (nested `scope` paths and aliases, `resources`, `forward` and `live` included), **Plug** pipeline entries link to the function or plug that actually runs, and **Ecto** schema fields and associations are extracted — so "how does this request reach the database" traces end to end without opening the router.
 
 ## [1.6.0] - 2026-08-26
 

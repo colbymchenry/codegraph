@@ -127,6 +127,15 @@ describe('Language Detection', () => {
     expect(isSourceFile('legacy/module.src')).toBe(false);
   });
 
+  it('should detect Elixir files', () => {
+    expect(detectLanguage('lib/my_app/accounts.ex')).toBe('elixir');
+    // `.exs` scripts are where mix config and every ExUnit suite live.
+    expect(detectLanguage('mix.exs')).toBe('elixir');
+    expect(detectLanguage('test/my_app/accounts_test.exs')).toBe('elixir');
+    expect(isSourceFile('lib/my_app/accounts.ex')).toBe(true);
+    expect(isSourceFile('config/runtime.exs')).toBe(true);
+  });
+
   it('should detect Solidity files', () => {
     expect(detectLanguage('contracts/Vault.sol')).toBe('solidity');
   });
@@ -10935,6 +10944,386 @@ init(_) -> {ok, #{}}.
       const result = extractFromSource('src/b.erl', code);
       const fns = result.nodes.filter((n) => n.kind === 'function');
       expect(fns).toHaveLength(0);
+    });
+  });
+});
+
+describe('Elixir Extraction', () => {
+  const refNames = (result: ReturnType<typeof extractFromSource>, kind: string) =>
+    result.unresolvedReferences.filter((r) => r.referenceKind === kind).map((r) => r.referenceName);
+
+  describe('Language detection', () => {
+    it('should report Elixir as supported', () => {
+      expect(isLanguageSupported('elixir')).toBe(true);
+      expect(getSupportedLanguages()).toContain('elixir');
+    });
+  });
+
+  describe('Modules and functions', () => {
+    it('should extract modules, public/private functions and their qualified names', () => {
+      const code = `defmodule MyApp.Accounts do
+  @moduledoc "The Accounts context."
+
+  @doc "List every user."
+  @spec list_users() :: [User.t()]
+  def list_users do
+    Repo.all(User)
+  end
+
+  defp normalize(email) when is_binary(email) do
+    String.downcase(email)
+  end
+end
+`;
+      const result = extractFromSource('lib/my_app/accounts.ex', code);
+      const mod = result.nodes.find((n) => n.kind === 'module');
+      expect(mod?.name).toBe('MyApp.Accounts');
+      expect(mod?.qualifiedName).toBe('MyApp.Accounts');
+      expect(mod?.docstring).toBe('The Accounts context.');
+      expect(mod?.language).toBe('elixir');
+
+      const list = result.nodes.find((n) => n.kind === 'function' && n.name === 'list_users');
+      expect(list?.qualifiedName).toBe('MyApp.Accounts::list_users');
+      expect(list?.isExported).toBe(true);
+      expect(list?.docstring).toBe('List every user.');
+      // The @spec is the only place the types are written — it leads the signature.
+      expect(list?.signature).toContain('@spec list_users() :: [User.t()]');
+
+      const norm = result.nodes.find((n) => n.kind === 'function' && n.name === 'normalize');
+      expect(norm?.visibility).toBe('private');
+      expect(norm?.isExported).toBe(false);
+      expect(norm?.signature).toBe('defp normalize(email) when is_binary(email)');
+    });
+
+    it('should merge adjacent same-arity clauses into one node but split by arity', () => {
+      const code = `defmodule Server do
+  def handle_call({:get, k}, _from, state), do: {:reply, k, state}
+  def handle_call({:put, k}, _from, state), do: {:reply, k, state}
+  def handle_call({:del, k}, _from, state), do: {:reply, k, state}
+
+  def sum(a), do: sum(a, 0)
+  def sum(a, b), do: a + b
+end
+`;
+      const result = extractFromSource('lib/server.ex', code);
+      const handlers = result.nodes.filter((n) => n.name === 'handle_call');
+      expect(handlers).toHaveLength(1);
+      expect([handlers[0]!.startLine, handlers[0]!.endLine]).toEqual([2, 4]);
+      // Different arity is a different function, so it gets its own node.
+      expect(result.nodes.filter((n) => n.name === 'sum')).toHaveLength(2);
+    });
+
+    it('should not leak clause-merge state when the same file is re-extracted', () => {
+      // An incremental sync re-parses the same path; without a hard reset on
+      // the root node the second run would merge onto the FIRST run's node id,
+      // which no longer exists — a dangling scope and an edge to nothing.
+      const code = `defmodule M do
+  def handle(:a), do: :ok
+  def handle(:b), do: :ok
+end
+`;
+      const first = extractFromSource('lib/m.ex', code);
+      const second = extractFromSource('lib/m.ex', code);
+      expect(second.nodes.map((n) => n.qualifiedName)).toEqual(
+        first.nodes.map((n) => n.qualifiedName)
+      );
+      const ids = new Set(second.nodes.map((n) => n.id));
+      for (const edge of second.edges) {
+        expect(ids.has(edge.source)).toBe(true);
+        expect(ids.has(edge.target)).toBe(true);
+      }
+    });
+
+    it('should name a nested defmodule with its parent prefix', () => {
+      const code = `defmodule Outer do
+  defmodule Inner do
+    def deep, do: :ok
+  end
+end
+`;
+      const result = extractFromSource('lib/outer.ex', code);
+      expect(result.nodes.map((n) => n.qualifiedName)).toContain('Outer.Inner');
+      expect(result.nodes.map((n) => n.qualifiedName)).toContain('Outer.Inner::deep');
+    });
+
+    it('should extract defmacro, defguard and operator definitions', () => {
+      const code = `defmodule M do
+  defmacro __using__(_opts), do: :ok
+  defguard is_adult(age) when age >= 18
+  def left ++ right, do: nil
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const byName = (n: string) => result.nodes.find((x) => x.name === n);
+      expect(byName('__using__')?.decorators).toContain('macro');
+      expect(byName('is_adult')?.decorators).toContain('guard');
+      // An operator definition's name IS the operator — that is how it is called.
+      expect(byName('++')?.qualifiedName).toBe('M::++');
+    });
+  });
+
+  describe('Calls and aliases', () => {
+    it('should expand aliases so remote calls carry the full module name', () => {
+      const code = `defmodule MyApp.Accounts do
+  alias MyApp.Repo
+  alias MyApp.Accounts.{User, Credential}
+  alias MyApp.Mailer, as: Post
+
+  def create(attrs) do
+    %User{}
+    |> User.changeset(attrs)
+    |> Repo.insert()
+    Credential.new()
+    Post.deliver()
+  end
+end
+`;
+      const result = extractFromSource('lib/my_app/accounts.ex', code);
+      const calls = refNames(result, 'calls');
+      expect(calls).toContain('MyApp.Accounts.User::changeset');
+      expect(calls).toContain('MyApp.Repo::insert');
+      expect(calls).toContain('MyApp.Accounts.Credential::new');
+      // `as:` rebinds the short name — `Post` here is the Mailer, not a Post schema.
+      expect(calls).toContain('MyApp.Mailer::deliver');
+      expect(refNames(result, 'instantiates')).toContain('MyApp.Accounts.User');
+      expect(refNames(result, 'imports')).toEqual(
+        expect.arrayContaining(['MyApp.Repo', 'MyApp.Accounts.User', 'MyApp.Accounts.Credential'])
+      );
+    });
+
+    it('should link function captures — the way Elixir registers callbacks', () => {
+      const code = `defmodule M do
+  def run(items) do
+    Enum.map(items, &double/1)
+    Enum.each(items, &String.upcase/1)
+  end
+
+  def double(x), do: x * 2
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const refs = refNames(result, 'references');
+      expect(refs).toContain('double');
+      expect(refs).toContain('String::upcase');
+    });
+
+    it('should not emit call refs for special forms', () => {
+      const code = `defmodule M do
+  def run(x) do
+    if x do
+      case x do
+        1 -> raise "boom"
+        _ -> send(self(), :ok)
+      end
+    end
+    real_work(x)
+  end
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const calls = refNames(result, 'calls');
+      expect(calls).toContain('real_work');
+      for (const form of ['if', 'case', 'raise', 'send', 'self']) {
+        expect(calls).not.toContain(form);
+      }
+    });
+
+    it('should not mint call refs from typespec bodies', () => {
+      const code = `defmodule M do
+  @type t :: %{name: String.t(), size: non_neg_integer()}
+  @spec fetch(String.t()) :: {:ok, t()}
+  def fetch(id), do: {:ok, id}
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const calls = refNames(result, 'calls');
+      expect(calls).not.toContain('String::t');
+      expect(calls).not.toContain('non_neg_integer');
+      const alias = result.nodes.find((n) => n.kind === 'type_alias');
+      expect(alias?.name).toBe('t');
+      expect(alias?.qualifiedName).toBe('M::t');
+    });
+
+    it('should link defdelegate to its target', () => {
+      const code = `defmodule M do
+  defdelegate encode(data), to: Jason
+  defdelegate run(x), to: Worker, as: :perform
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const calls = refNames(result, 'calls');
+      expect(calls).toContain('Jason::encode');
+      expect(calls).toContain('Worker::perform');
+    });
+  });
+
+  describe('Attributes, structs and protocols', () => {
+    it('should extract module attributes as constants and link their reads', () => {
+      const code = `defmodule M do
+  @timeout 5_000
+  @doc "not a constant"
+  def wait, do: @timeout
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const consts = result.nodes.filter((n) => n.kind === 'constant');
+      expect(consts.map((n) => n.name)).toEqual(['timeout']);
+      expect(consts[0]!.qualifiedName).toBe('M::timeout');
+      expect(refNames(result, 'references')).toContain('timeout');
+    });
+
+    it('should extract defstruct and Ecto schema fields', () => {
+      const code = `defmodule MyApp.User do
+  use Ecto.Schema
+  defstruct [:id, :name]
+
+  schema "users" do
+    field :email, :string
+    has_many :posts, MyApp.Post
+    timestamps()
+  end
+end
+`;
+      const result = extractFromSource('lib/my_app/user.ex', code);
+      const fields = result.nodes.filter((n) => n.kind === 'field').map((n) => n.name);
+      expect(fields).toEqual(expect.arrayContaining(['id', 'name', 'email', 'posts']));
+      // The association names the related schema — a real cross-file dependency.
+      expect(refNames(result, 'references')).toContain('MyApp.Post');
+      // Schema macros are not function calls.
+      expect(refNames(result, 'calls')).not.toContain('field');
+    });
+
+    it('should extract protocols and implementations with an implements edge', () => {
+      const code = `defprotocol MyApp.Sizeable do
+  def size(data)
+end
+
+defimpl MyApp.Sizeable, for: List do
+  def size(data), do: length(data)
+end
+`;
+      const result = extractFromSource('lib/sizeable.ex', code);
+      const proto = result.nodes.find((n) => n.kind === 'interface');
+      expect(proto?.qualifiedName).toBe('MyApp.Sizeable');
+      // defimpl compiles to the module `Protocol.Type` — name it what it is.
+      const impl = result.nodes.find((n) => n.qualifiedName === 'MyApp.Sizeable.List');
+      expect(impl?.kind).toBe('module');
+      expect(refNames(result, 'implements')).toContain('MyApp.Sizeable');
+    });
+
+    it('should link @behaviour to the behaviour module', () => {
+      const code = `defmodule M do
+  @behaviour MyApp.Storage
+  def fetch(_k), do: :ok
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      expect(refNames(result, 'implements')).toContain('MyApp.Storage');
+    });
+  });
+
+  describe('Phoenix router and Plug pipelines', () => {
+    it('should emit route nodes linked to their controller actions', () => {
+      const code = `defmodule MyAppWeb.Router do
+  scope "/", MyAppWeb do
+    get "/", PageController, :home
+    resources "/posts", PostController
+  end
+
+  scope "/api", MyAppWeb do
+    scope "/admin", Admin do
+      post "/users", UserController, :create
+    end
+    forward "/health", HealthPlug
+  end
+end
+`;
+      const result = extractFromSource('lib/my_app_web/router.ex', code);
+      const routes = result.nodes.filter((n) => n.kind === 'route').map((n) => n.name);
+      expect(routes).toContain('GET /');
+      expect(routes).toContain('RESOURCES /posts');
+      // Nested scopes compose both the path and the controller alias.
+      expect(routes).toContain('POST /api/admin/users');
+      expect(routes).toContain('FORWARD /api/health');
+
+      const refs = refNames(result, 'references');
+      expect(refs).toContain('MyAppWeb.PageController::home');
+      expect(refs).toContain('MyAppWeb.Admin.UserController::create');
+      expect(refs).toContain('MyAppWeb.HealthPlug::call');
+      // `resources` expands to the REST seven.
+      expect(refs).toContain('MyAppWeb.PostController::index');
+      expect(refs).toContain('MyAppWeb.PostController::delete');
+    });
+
+    it('should link plug pipeline entries to the function or plug that runs', () => {
+      const code = `defmodule MyAppWeb.Auth do
+  use Plug.Builder
+
+  plug :fetch_session
+  plug MyAppWeb.RequireUser
+
+  def fetch_session(conn, _opts), do: conn
+end
+`;
+      const result = extractFromSource('lib/my_app_web/auth.ex', code);
+      const calls = refNames(result, 'calls');
+      expect(calls).toContain('fetch_session');
+      expect(calls).toContain('MyAppWeb.RequireUser::call');
+    });
+
+    it('should leave a same-named ordinary function alone', () => {
+      // `get`/`plug` are only route macros in the `verb "path", Module` shape.
+      const code = `defmodule M do
+  def run(cache, key) do
+    get(cache, key)
+  end
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      expect(refNames(result, 'calls')).toContain('get');
+      expect(result.nodes.filter((n) => n.kind === 'route')).toHaveLength(0);
+    });
+  });
+
+  describe('Cross-file resolution', () => {
+    let tempDir: string;
+    beforeEach(() => { tempDir = createTempDir(); });
+    afterEach(() => { cleanupTempDir(tempDir); });
+
+    it('resolves an aliased remote call to the definition in another file', async () => {
+      fs.mkdirSync(path.join(tempDir, 'lib', 'my_app'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'lib', 'my_app', 'repo.ex'),
+        `defmodule MyApp.Repo do
+  def insert(struct), do: {:ok, struct}
+end
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'lib', 'my_app', 'accounts.ex'),
+        `defmodule MyApp.Accounts do
+  alias MyApp.Repo
+
+  def create(attrs) do
+    Repo.insert(attrs)
+  end
+end
+`
+      );
+
+      const graph = await CodeGraph.init(tempDir, { silent: true });
+      await graph.indexAll();
+
+      const db = (graph as any).db.db;
+      const edge = db
+        .prepare(
+          `SELECT s.qualified_name src, t.qualified_name tgt
+             FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+            WHERE e.kind = 'calls' AND s.qualified_name = 'MyApp.Accounts::create'`
+        )
+        .all();
+      expect(edge.map((r: any) => r.tgt)).toContain('MyApp.Repo::insert');
+      graph.destroy();
     });
   });
 });
