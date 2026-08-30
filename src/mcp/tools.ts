@@ -110,6 +110,51 @@ const MAX_PATH_LENGTH = 4_096;
  */
 
 /**
+ * Order same-named definitions so a truncating render cannot hide a whole
+ * language or a whole file behind one crowded source.
+ *
+ * The definitions arrive in index order — `(file_path, start_line)` — so a name
+ * defined many times under an early-sorting directory fills the render budget
+ * before a definition under a late-sorting one is ever reached. In a repository
+ * where one name exists in several languages that is not a ranking nicety: with
+ * 40 definitions under `assets/` and one under `lib/`, the `lib/` definition
+ * lands past both the body cap AND the overflow list, so the answer names only
+ * one language and never says the other exists.
+ *
+ * Round-robin across languages, and within a language across files, keeping the
+ * original order inside each bucket. Every language that defines the name is
+ * then represented in the first few entries regardless of how the paths sort.
+ */
+function diversifyBySource(nodes: Node[]): Node[] {
+  if (nodes.length < 2) return nodes;
+  const byLanguage = new Map<string, Map<string, Node[]>>();
+  for (const node of nodes) {
+    let files = byLanguage.get(node.language);
+    if (!files) { files = new Map(); byLanguage.set(node.language, files); }
+    const bucket = files.get(node.filePath);
+    if (bucket) bucket.push(node);
+    else files.set(node.filePath, [node]);
+  }
+  if (byLanguage.size === 1 && byLanguage.values().next().value!.size === 1) return nodes;
+
+  const out: Node[] = [];
+  const languages = [...byLanguage.values()].map((files) => ({ files: [...files.values()], next: 0 }));
+  while (out.length < nodes.length) {
+    let progressed = false;
+    for (const lang of languages) {
+      // Take one from this language's next non-empty file, then move on.
+      for (let tried = 0; tried < lang.files.length; tried++) {
+        const bucket = lang.files[lang.next % lang.files.length]!;
+        lang.next++;
+        if (bucket.length > 0) { out.push(bucket.shift()!); progressed = true; break; }
+      }
+    }
+    if (!progressed) break; // defensive: every bucket drained
+  }
+  return out;
+}
+
+/**
  * Node kinds that contain other symbols. For these, `codegraph_node` with
  * `includeCode=true` returns a structural outline (member names + signatures
  * + line numbers) instead of the full body, which for a large class is a
@@ -6049,6 +6094,10 @@ export class ToolHandler {
     // FULL bodies as fit a char budget (the agent gets the one it needs in this
     // one call, no follow-up parameter to learn), and list any remainder by
     // file:line so a large overload set can't overflow the per-tool cap.
+    // Interleave by language/file BEFORE anything truncates, so no source can
+    // be pushed past the caps below and vanish from the answer entirely.
+    matches = diversifyBySource(matches);
+
     const header = `**${matches.length} definitions named "${symbol}"**`;
     if (!includeCode) {
       const list = matches.map((n) => `- \`${n.name}\` (${n.kind}) — ${n.filePath}:${n.startLine}`);
@@ -6092,7 +6141,16 @@ export class ToolHandler {
         '**Other definitions**',
         ...shownList.map((n) => `- \`${n.name}\` (${n.kind}) — ${n.filePath}:${n.startLine}`),
       );
-      if (listed.length > LIST_CAP) out.push(`- … +${listed.length - LIST_CAP} more`);
+      if (listed.length > LIST_CAP) {
+        // Name what fell off. An unqualified "+N more" reads as "nothing you
+        // care about", which is exactly wrong when the tail is the only
+        // definition in some language.
+        const dropped = listed.slice(LIST_CAP);
+        const byLang = new Map<string, number>();
+        for (const n of dropped) byLang.set(n.language, (byLang.get(n.language) ?? 0) + 1);
+        const summary = [...byLang.entries()].map(([lang, n]) => `${n} ${lang}`).join(', ');
+        out.push(`- … +${dropped.length} more (${summary})`);
+      }
       out.push(
         '',
         `> Need one of these in full? Call codegraph_node again with \`file\` (e.g. \`"${listed[0]!.filePath.split('/').pop()}"\`) or \`line\` — do NOT Read it.`,

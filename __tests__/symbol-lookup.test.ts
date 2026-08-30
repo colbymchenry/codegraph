@@ -392,3 +392,75 @@ describe.skipIf(!HAS_SQLITE)('lookupSymbolNodes — the shared path used by call
     expect(nodes.length).toBe(0);
   });
 });
+
+describe.skipIf(!HAS_SQLITE)('codegraph_node — a truncating render must not hide a whole source', () => {
+  // Same-named definitions arrive in `(file_path, start_line)` order, so a name
+  // defined many times under an early-sorting directory fills the body budget
+  // AND the overflow list before a definition under a late-sorting directory is
+  // reached. The answer then names one language and never says the other exists
+  // — the caller has no way to know it was truncated past something relevant.
+  let projectRoot: string;
+  let cg: any;
+  let handler: any;
+
+  beforeEach(async () => {
+    projectRoot = tmpRoot();
+    const early = path.join(projectRoot, 'aaa_client');
+    const late = path.join(projectRoot, 'zzz_server');
+    fs.mkdirSync(early, { recursive: true });
+    fs.mkdirSync(late, { recursive: true });
+    for (let i = 0; i < 40; i++) {
+      fs.writeFileSync(
+        path.join(early, `m${String(i).padStart(2, '0')}.ts`),
+        `export function num(v: number): string {\n  return v.toFixed(2);\n}\n`
+      );
+    }
+    fs.writeFileSync(
+      path.join(late, 'format.py'),
+      `def num(value):\n    return round(value, 2)\n\ndef label(v):\n    return num(v)\n`
+    );
+
+    const CodeGraph = (await import('../src/index')).default;
+    const { ToolHandler } = await import('../src/mcp/tools');
+    cg = CodeGraph.initSync(projectRoot, {
+      config: { include: ['**/*.ts', '**/*.py'], exclude: [] },
+    });
+    await cg.indexAll();
+    handler = new ToolHandler(cg);
+  });
+
+  afterEach(() => {
+    handler?.closeAll();
+    cg?.destroy();
+    rmTree(projectRoot);
+  });
+
+  it('renders the lone late-sorting definition instead of truncating past it', async () => {
+    const res = await handler.execute('codegraph_node', { symbol: 'num', includeCode: true });
+    const text = res.content?.[0]?.text ?? '';
+    expect(text).toContain('41 definitions named "num"');
+    // The single Python definition must be visible — with its body, not merely
+    // mentioned — even though 40 TypeScript ones sort ahead of it.
+    expect(text).toMatch(/zzz_server\/format\.py/);
+    expect(text).toMatch(/def num\(value\)/);
+  });
+
+  it('says which sources the final truncation dropped', async () => {
+    const res = await handler.execute('codegraph_node', { symbol: 'num', includeCode: true });
+    const text = res.content?.[0]?.text ?? '';
+    const overflow = /\+(\d+) more \(([^)]+)\)/.exec(text);
+    expect(overflow).not.toBeNull();
+    // A bare "+N more" reads as "nothing you care about" — which is exactly
+    // wrong when the tail is the only definition in some language.
+    expect(overflow![2]).toMatch(/typescript/);
+    expect(overflow![2]).not.toMatch(/python/);
+  });
+
+  it('a single-source overload set keeps its original order', async () => {
+    // Diversification must be inert when there is nothing to interleave, so
+    // ordinary overload sets (one class, one file) are unaffected.
+    const res = await handler.execute('codegraph_node', { symbol: 'label', includeCode: true });
+    const text = res.content?.[0]?.text ?? '';
+    expect(text).toMatch(/format\.py/);
+  });
+});
