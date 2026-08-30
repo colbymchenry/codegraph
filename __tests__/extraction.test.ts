@@ -7637,6 +7637,39 @@ describe('Nested non-submodule git repos', () => {
     expect(ig.ignores('dist/')).toBe(true); // valid rule survives
     expect(ig.ignores('src/app.ts')).toBe(false);
   });
+
+  it('keeps Java packages named build while excluding build output (#1642)', () => {
+    const sourceFile = 'module/src/main/java/com/acme/build/RealtimePlusService.java';
+    const testFile = 'module/src/test/java/com/acme/build/RealtimePlusServiceTest.java';
+    const outputFile = 'module/build/generated/Generated.java';
+
+    for (const rel of [sourceFile, testFile, outputFile]) {
+      const abs = path.join(tempDir, rel);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, 'class Example {}\n');
+    }
+
+    const scope = buildScopeIgnore(tempDir);
+    expect(scope.ignores(sourceFile)).toBe(false);
+    expect(scope.ignores(testFile)).toBe(false);
+    expect(scope.ignores(outputFile)).toBe(true);
+
+    const files = scanDirectory(tempDir);
+    expect(files).toContain(sourceFile);
+    expect(files).toContain(testFile);
+    expect(files).not.toContain(outputFile);
+  });
+
+  it('lets an explicit .gitignore exclude a Java package named build (#1642)', () => {
+    const sourceFile = 'src/main/java/com/acme/build/Hidden.java';
+    const abs = path.join(tempDir, sourceFile);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, 'class Hidden {}\n');
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), 'src/main/java/**/build/\n');
+
+    expect(buildScopeIgnore(tempDir).ignores(sourceFile)).toBe(true);
+    expect(scanDirectory(tempDir)).not.toContain(sourceFile);
+  });
 });
 
 // =============================================================================

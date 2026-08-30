@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Java packages named `build` under standard main and test source roots are now indexed without pulling Gradle or Maven build output into the graph. (#1642)
+
 
 ## [1.6.0] - 2026-08-26
 
