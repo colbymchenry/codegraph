@@ -1247,7 +1247,62 @@ export const tools: ToolDefinition[] = [
     },
     annotations: READ_ONLY_ANNOTATIONS,
   },
+  {
+    name: 'codegraph_export',
+    description: 'Export code knowledge graph or symbol call graph to Mermaid, DOT, or JSON format for visualization.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        symbol: {
+          type: 'string',
+          description: 'Optional symbol name to export its call/impact graph. If omitted, exports top project structure.',
+        },
+        format: {
+          type: 'string',
+          description: 'Export format: "mermaid" (default), "dot", "json"',
+          enum: ['mermaid', 'dot', 'json'],
+          default: 'mermaid',
+        },
+        direction: {
+          type: 'string',
+          description: 'Mermaid/DOT layout direction: "TD" (default) or "LR"',
+          enum: ['TD', 'LR'],
+          default: 'TD',
+        },
+        depth: {
+          type: 'number',
+          description: 'Traversal depth for symbol mode (default: 2)',
+          default: 2,
+        },
+        mode: {
+          type: 'string',
+          description: 'Symbol export mode: "callgraph" (default) or "impact"',
+          enum: ['callgraph', 'impact'],
+          default: 'callgraph',
+        },
+        projectPath: projectPathProperty,
+      },
+    },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
+    name: 'codegraph_metrics',
+    description: 'Get architectural metrics (Afferent/Efferent coupling, Instability index, and top structural hotspots).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: {
+          type: 'number',
+          description: 'Number of hotspots to return (default: 10)',
+          default: 10,
+        },
+        projectPath: projectPathProperty,
+      },
+    },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
 ];
+
 
 /**
  * Return `defs` with `projectPath` marked `required` in each tool's inputSchema.
@@ -2149,14 +2204,86 @@ export class ToolHandler {
       case 'codegraph_explore': return await this.handleExplore(args);
       case 'codegraph_node': return await this.handleNode(args);
       case 'codegraph_files': return await this.handleFiles(args);
+      case 'codegraph_export': return await this.handleExport(args);
+      case 'codegraph_metrics': return await this.handleMetrics(args);
       default: return this.errorResult(`Unknown tool: ${toolName}`);
     }
+
+  }
+
+  /**
+   * Handle codegraph_export
+   */
+  private async handleExport(args: Record<string, unknown>): Promise<ToolResult> {
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const symbol = typeof args.symbol === 'string' && args.symbol.trim() ? args.symbol.trim() : undefined;
+    const format = (args.format as 'mermaid' | 'dot' | 'json') || 'mermaid';
+    const direction = (args.direction as 'TD' | 'LR') || 'TD';
+    const depth = clamp(Number(args.depth) || 2, 1, 10);
+    const mode = (args.mode as 'callgraph' | 'impact') || 'callgraph';
+
+    try {
+      let output: string;
+      if (symbol) {
+        output = cg.exportSymbolGraph(symbol, { format, direction, depth, mode });
+      } else {
+        const files = cg.getFiles();
+        const fullSubgraph = {
+          nodes: new Map(),
+          edges: [] as any[],
+          roots: [] as string[],
+        };
+        for (const f of files) {
+          const fnodes = cg.getNodesInFile(f.path);
+          for (const fn of fnodes) {
+            fullSubgraph.nodes.set(fn.id, fn);
+            for (const oe of cg.getOutgoingEdges(fn.id)) {
+              fullSubgraph.edges.push(oe);
+            }
+          }
+        }
+        output = cg.exportGraph(fullSubgraph, { format, direction, title: 'Project Structure' });
+      }
+      return this.textResult(this.truncateOutput(output));
+    } catch (err) {
+      return this.textResult(`Export failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * Handle codegraph_metrics
+   */
+  private async handleMetrics(args: Record<string, unknown>): Promise<ToolResult> {
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const limit = clamp(Number(args.limit) || 10, 1, 50);
+    const metrics = cg.getMetrics(limit);
+
+    const lines: string[] = [
+      `### Project Architecture Metrics`,
+      `- **Total Files:** ${metrics.summary.totalFiles}`,
+      `- **Total Symbols:** ${metrics.summary.totalSymbols}`,
+      `- **Total Edges:** ${metrics.summary.totalEdges}`,
+      `- **Avg Afferent Coupling (Ca):** ${metrics.summary.avgAfferentCoupling} (incoming dependencies)`,
+      `- **Avg Efferent Coupling (Ce):** ${metrics.summary.avgEfferentCoupling} (outgoing dependencies)`,
+      `- **Avg Instability Index (I):** ${metrics.summary.avgInstability} (0.0=stable, 1.0=volatile)`,
+    ];
+
+    if (metrics.topHotspots.length > 0) {
+      lines.push('', '### Top Structural Hotspots (High Fan-in / Blast Radius):');
+      for (const h of metrics.topHotspots) {
+        const loc = h.startLine ? `:${h.startLine}` : '';
+        lines.push(`- **${h.name}** (${h.kind}) — \`${h.filePath}${loc}\` | Fan-in: ${h.fanIn}, Fan-out: ${h.fanOut}, Blast Radius: ${h.blastRadius}`);
+      }
+    }
+
+    return this.textResult(this.truncateOutput(lines.join('\n')));
   }
 
   /**
    * Handle codegraph_search
    */
   private async handleSearch(args: Record<string, unknown>): Promise<ToolResult> {
+
     const query = this.validateString(args.query, 'query');
     if (typeof query !== 'string') return query;
 

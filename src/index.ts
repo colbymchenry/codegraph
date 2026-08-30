@@ -46,8 +46,17 @@ import {
   createResolver,
   ResolutionResult,
 } from './resolution';
-import { GraphTraverser, GraphQueryManager } from './graph';
+import {
+  GraphTraverser,
+  GraphQueryManager,
+  MetricsAnalyzer,
+  exportGraph,
+  type ExportOptions,
+  type ProjectMetrics,
+} from './graph';
 import { ContextBuilder, createContextBuilder } from './context';
+
+
 import { Mutex, FileLock } from './utils';
 import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 import { EXTRACTION_VERSION } from './extraction/extraction-version';
@@ -94,6 +103,19 @@ export {
 export { Mutex, FileLock, processInBatches, debounce, throttle, MemoryMonitor } from './utils';
 export { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 export { MCPServer } from './mcp';
+export {
+  MetricsAnalyzer,
+  exportGraph,
+  exportToMermaid,
+  exportToDot,
+  exportToJson,
+  ExportFormat,
+  ExportOptions,
+  ProjectMetrics,
+  FileCouplingMetric,
+  SymbolHotspotMetric,
+} from './graph';
+
 
 /**
  * Options for initializing a new CodeGraph project
@@ -1836,8 +1858,73 @@ export class CodeGraph {
     return this.graphManager.getNodeMetrics(nodeId);
   }
 
-  // ===========================================================================
-  // Context Building
+  /**
+   * Get project architectural and coupling metrics
+   *
+   * @param hotspotLimit - Number of hotspot symbols to return (default: 15)
+   */
+  getMetrics(hotspotLimit: number = 15): ProjectMetrics {
+    const analyzer = new MetricsAnalyzer(this.queries);
+    return analyzer.getProjectMetrics(hotspotLimit);
+  }
+
+  /**
+   * Audit project for code health issues (dead code & circular dependencies)
+   */
+  auditProject(options?: { kinds?: Node['kind'][] }): {
+    deadCode: Node[];
+    circularDependencies: string[][];
+    totalIssues: number;
+  } {
+    const deadCode = this.findDeadCode(options?.kinds);
+    const circularDependencies = this.findCircularDependencies();
+    return {
+      deadCode,
+      circularDependencies,
+      totalIssues: deadCode.length + circularDependencies.length,
+    };
+  }
+
+  /**
+   * Export a subgraph to Mermaid, Graphviz DOT, or JSON
+   *
+   * @param subgraph - Subgraph to export
+   * @param options - Export options (format, direction, title)
+   */
+  exportGraph(subgraph: Subgraph, options?: ExportOptions): string {
+    return exportGraph(subgraph, options);
+  }
+
+  /**
+   * Export the call graph or impact subgraph of a symbol to Mermaid, DOT, or JSON
+   *
+   * @param symbol - Symbol name to visualize
+   * @param options - Export options
+   */
+  exportSymbolGraph(
+    symbol: string,
+    options?: ExportOptions & { depth?: number; mode?: 'callgraph' | 'impact' }
+  ): string {
+    const matches = this.queries.getNodesByName(symbol);
+    const node = matches[0] ?? this.queries.searchNodes(symbol, { limit: 1 })[0]?.node;
+
+    if (!node) {
+      throw new Error(`Symbol "${symbol}" not found in index.`);
+    }
+
+    const depth = options?.depth ?? 2;
+    const mode = options?.mode ?? 'callgraph';
+    const subgraph = mode === 'impact'
+      ? this.getImpactRadius(node.id, depth)
+      : this.getCallGraph(node.id, depth);
+
+    return exportGraph(subgraph, {
+      title: options?.title || `${symbol} (${mode})`,
+      ...options,
+    });
+  }
+
+
   // ===========================================================================
 
   /**

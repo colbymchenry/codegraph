@@ -2336,7 +2336,211 @@ program
   });
 
 /**
+ * codegraph export [symbol]
+ */
+program
+  .command('export [symbol]')
+  .description('Export code knowledge graph or symbol call graph to Mermaid, DOT, or JSON')
+  .option('-p, --path <path>', 'Project path')
+  .option('-f, --format <format>', 'Export format: "mermaid", "dot", "json"', 'mermaid')
+  .option('-d, --direction <dir>', 'Mermaid/DOT direction (TD, LR)', 'TD')
+  .option('--depth <number>', 'Depth for symbol export', '2')
+  .option('--mode <mode>', 'Symbol mode: "callgraph" or "impact"', 'callgraph')
+  .option('-o, --output <file>', 'Output file path')
+  .action(async (symbol: string | undefined, options: {
+    path?: string;
+    format?: 'mermaid' | 'dot' | 'json';
+    direction?: 'TD' | 'LR';
+    depth?: string;
+    mode?: 'callgraph' | 'impact';
+    output?: string;
+  }) => {
+    const projectPath = resolveProjectPath(options.path);
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const { default: CodeGraph, exportGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      const depth = parseInt(options.depth || '2', 10);
+      const format = options.format || 'mermaid';
+      const direction = options.direction || 'TD';
+
+      let outputText: string;
+
+      if (symbol) {
+        outputText = cg.exportSymbolGraph(symbol, {
+          format,
+          direction,
+          depth,
+          mode: options.mode || 'callgraph',
+        });
+      } else {
+        const files = cg.getFiles();
+        const fullSubgraph = {
+          nodes: new Map(),
+          edges: [] as any[],
+          roots: [] as string[],
+        };
+        for (const f of files) {
+          const fnodes = cg.getNodesInFile(f.path);
+          for (const fn of fnodes) {
+            fullSubgraph.nodes.set(fn.id, fn);
+            const outEdges = cg.getOutgoingEdges(fn.id);
+            for (const oe of outEdges) {
+              fullSubgraph.edges.push(oe);
+            }
+          }
+        }
+        outputText = exportGraph(fullSubgraph, {
+          format,
+          direction,
+          title: path.basename(projectPath),
+        });
+      }
+
+      if (options.output) {
+        fs.writeFileSync(options.output, outputText, 'utf-8');
+        success(`Exported graph to ${options.output}`);
+      } else {
+        console.log(outputText);
+      }
+
+      cg.destroy();
+    } catch (err) {
+      error(`Export failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph metrics
+ */
+program
+  .command('metrics')
+  .description('Analyze architectural coupling, instability, and symbol hotspots')
+  .option('-p, --path <path>', 'Project path')
+  .option('-l, --limit <number>', 'Top hotspots to show', '10')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (options: { path?: string; limit?: string; json?: boolean }) => {
+    const projectPath = resolveProjectPath(options.path);
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      const limit = parseInt(options.limit || '10', 10);
+      const metrics = cg.getMetrics(limit);
+
+      if (options.json) {
+        console.log(JSON.stringify(metrics, null, 2));
+      } else {
+        console.log(chalk.bold(`\nArchitectural Metrics Summary:`));
+        console.log(`  Total Files:             ${formatNumber(metrics.summary.totalFiles)}`);
+        console.log(`  Total Symbols:           ${formatNumber(metrics.summary.totalSymbols)}`);
+        console.log(`  Total Edges:             ${formatNumber(metrics.summary.totalEdges)}`);
+        console.log(`  Avg Afferent Coupling:   ${metrics.summary.avgAfferentCoupling} (incoming)`);
+        console.log(`  Avg Efferent Coupling:   ${metrics.summary.avgEfferentCoupling} (outgoing)`);
+        console.log(`  Avg Instability Index:   ${metrics.summary.avgInstability} (0.0=stable, 1.0=volatile)`);
+
+        if (metrics.topHotspots.length > 0) {
+          console.log(chalk.bold(`\nTop Structural Hotspots (High Fan-in / Fan-out / Blast Radius):`));
+          for (const h of metrics.topHotspots) {
+            const loc = h.startLine ? `:${h.startLine}` : '';
+            console.log(`  ${chalk.cyan(h.name.padEnd(28))} ${chalk.dim(h.kind.padEnd(10))} Fan-in: ${chalk.yellow(String(h.fanIn))} | Fan-out: ${chalk.yellow(String(h.fanOut))} | Blast Radius: ${chalk.red(String(h.blastRadius))}`);
+            console.log(`    ${chalk.dim(`${h.filePath}${loc}`)}`);
+          }
+        }
+
+        console.log();
+      }
+
+      cg.destroy();
+    } catch (err) {
+      error(`Metrics analysis failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph audit
+ */
+program
+  .command('audit')
+  .description('Audit codebase for dead code (unreferenced non-exported symbols) and circular dependencies')
+  .option('-p, --path <path>', 'Project path')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (options: { path?: string; json?: boolean }) => {
+    const projectPath = resolveProjectPath(options.path);
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      const audit = cg.auditProject();
+
+      if (options.json) {
+        console.log(JSON.stringify({
+          totalIssues: audit.totalIssues,
+          deadCodeCount: audit.deadCode.length,
+          circularDependencyCount: audit.circularDependencies.length,
+          deadCode: audit.deadCode.map((n) => ({
+            name: n.name,
+            kind: n.kind,
+            filePath: n.filePath,
+            startLine: n.startLine,
+          })),
+          circularDependencies: audit.circularDependencies,
+        }, null, 2));
+      } else {
+        console.log(chalk.bold(`\nCode Health Audit Results (${audit.totalIssues} issues found):\n`));
+
+        if (audit.circularDependencies.length > 0) {
+          console.log(chalk.yellow(`Circular Dependencies (${audit.circularDependencies.length}):`));
+          for (const cycle of audit.circularDependencies) {
+            console.log(`  ${cycle.join(' ──> ')}`);
+          }
+          console.log();
+        } else {
+          console.log(chalk.green(`${getGlyphs().ok} No circular dependencies detected.`));
+        }
+
+        if (audit.deadCode.length > 0) {
+          console.log(chalk.yellow(`\nUnreferenced Non-Exported Symbols (${audit.deadCode.length}):`));
+          for (const n of audit.deadCode.slice(0, 30)) {
+            const loc = n.startLine ? `:${n.startLine}` : '';
+            console.log(`  ${chalk.dim(n.kind.padEnd(10))} ${chalk.cyan(n.name)} ${chalk.dim(`(${n.filePath}${loc})`)}`);
+          }
+          if (audit.deadCode.length > 30) {
+            console.log(chalk.dim(`  ... and ${audit.deadCode.length - 30} more.`));
+          }
+          console.log();
+        } else {
+          console.log(chalk.green(`${getGlyphs().ok} No dead/unreferenced internal symbols detected.`));
+        }
+      }
+
+      cg.destroy();
+    } catch (err) {
+      error(`Audit failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
  * codegraph install
+
  */
 program
   .command('install')
