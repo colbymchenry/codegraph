@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph now indexes **Protocol Buffers** (`.proto`). Messages, nested messages, enums and their values, fields, `oneof` members, services and their `rpc`s all become symbols, named the way protobuf names them — so `acme.reporting.v1.Measurement.observed_at` is something you can look up, and asking what depends on a message lists the fields and RPCs that use it. Two details are modelled on purpose: a field keeps its **tag number**, because renaming a field at the same tag is harmless while changing its type at the same tag is a silent wire break; and `reserved` numbers, ranges and names are kept as symbols, so a retired field is still findable instead of vanishing from the graph.
+
 ### Fixes
 
 - `codegraph callers`, `codegraph callees` and `codegraph impact` now understand qualified symbol names. Asking for something like `Accounts.Format.group` used to match nothing, so the command quietly fell back to whichever symbol full-text search happened to rank first — or reported "not found" for a symbol that plainly exists. Qualified names now select exactly the definition you named, including in languages whose module names themselves contain dots.
