@@ -53,6 +53,8 @@ import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime
 import { installCommandSupervision } from './command-supervision';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
 import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
+// Type-only: erased at runtime, so it adds nothing to CLI startup.
+import type { Language } from '../types';
 
 // Decided once, before `--color`/`--no-color` are stripped from argv below
 // (#1281). Piped/redirected stdout, NO_COLOR, or --no-color -> plain output.
@@ -941,7 +943,8 @@ program
   .command('status [path]')
   .description('Show index status and statistics')
   .option('-j, --json', 'Output as JSON')
-  .action(async (pathArg: string | undefined, options: { json?: boolean }) => {
+  .option('--strict', 'Exit non-zero when a language was indexed but parsed no files')
+  .action(async (pathArg: string | undefined, options: { json?: boolean; strict?: boolean }) => {
     const projectPath = resolveProjectPath(pathArg);
     // The directory the user actually ran from, before walking up to the index
     // root. Used to detect when the resolved index lives in a different git
@@ -975,6 +978,26 @@ program
       const backend = cg.getBackend();
       const journalMode = cg.getJournalMode();
 
+      // Languages whose files were all indexed and none parsed. The headline
+      // file count is keyed on the extension, so it stays reassuringly
+      // non-zero when a language's grammar is missing entirely — every obvious
+      // check (init succeeds, status lists the language, a symbol lookup
+      // "runs") stays green while the language contributes nothing to the
+      // graph. Restricted to grammar-backed languages: config formats are
+      // tracked at file level ON PURPOSE and must not raise this.
+      // Imported here rather than at module scope: grammars.ts pulls in
+      // web-tree-sitter, which every other command would then pay for at
+      // startup.
+      const { hasGrammar } = await import('../extraction/grammars');
+      const parsedByLanguage = stats.parsedFilesByLanguage ?? ({} as Record<Language, number>);
+      const unparsedLanguages = Object.entries(stats.filesByLanguage)
+        .filter(([lang, count]) =>
+          count > 0 &&
+          (parsedByLanguage[lang as Language] ?? 0) === 0 &&
+          hasGrammar(lang as Language)
+        )
+        .map(([lang]) => lang);
+
       const buildInfo = cg.getIndexBuildInfo();
       const reindexRecommended = cg.isIndexStale();
       const indexState = cg.getIndexState();
@@ -1000,6 +1023,10 @@ program
           journalMode,
           nodesByKind: stats.nodesByKind,
           languages: Object.entries(stats.filesByLanguage).filter(([, count]) => count > 0).map(([lang]) => lang),
+          filesByLanguage: stats.filesByLanguage,
+          // Files that yielded a symbol, vs the extension-keyed count above.
+          parsedFilesByLanguage: stats.parsedFilesByLanguage,
+          unparsedLanguages,
           pendingChanges: {
             added: changes.added.length,
             modified: changes.modified.length,
@@ -1089,15 +1116,29 @@ program
       }
       console.log();
 
-      // Language breakdown
+      // Language breakdown. The file count comes from the EXTENSION, so it says
+      // nothing about whether anything parsed — show the parsed count beside it
+      // so a language that produced no symbols is visible at a glance.
       console.log(chalk.bold('Files by Language:'));
       const filesByLang = Object.entries(stats.filesByLanguage)
         .filter(([, count]) => count > 0)
         .sort((a, b) => b[1] - a[1]);
       for (const [lang, count] of filesByLang) {
-        console.log(`  ${lang.padEnd(15)} ${formatNumber(count)}`);
+        const parsed = parsedByLanguage[lang as Language] ?? 0;
+        const detail = parsed === count ? '' : `  ${parsed} parsed`;
+        const line = `  ${lang.padEnd(15)} ${formatNumber(count)}`;
+        console.log(unparsedLanguages.includes(lang) ? chalk.yellow(line + detail) : line + chalk.dim(detail));
       }
       console.log();
+
+      if (unparsedLanguages.length > 0) {
+        warn(
+          `no symbols were extracted from any ${unparsedLanguages.join(' / ')} file. ` +
+            'Those files are indexed but their contents are not searchable — usually a ' +
+            'missing or failed grammar for that language.'
+        );
+        console.log();
+      }
 
       // Pending changes
       const totalChanges = changes.added.length + changes.modified.length + changes.removed.length;
@@ -1128,6 +1169,10 @@ program
       }
 
       cg.destroy();
+      // Opt-in gate for packaging/CI: a language that parsed nothing is a
+      // broken build, but making it fail by default would break every existing
+      // caller of `status`.
+      if (options.strict && unparsedLanguages.length > 0) process.exit(1);
     } catch (err) {
       error(`Failed to get status: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);

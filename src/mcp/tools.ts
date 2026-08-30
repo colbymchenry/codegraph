@@ -6464,10 +6464,19 @@ export class ToolHandler {
       }
     }
 
+    // The file count is keyed on the EXTENSION, so it stays non-zero for a
+    // language nothing could parse. Show the parsed count whenever it differs,
+    // so "indexed" is never mistaken for "searchable".
     lines.push('', '**Languages:**');
+    const parsedByLanguage = stats.parsedFilesByLanguage ?? {};
     for (const [lang, count] of Object.entries(stats.filesByLanguage)) {
       if ((count as number) > 0) {
-        lines.push(`- ${lang}: ${count}`);
+        const parsed = (parsedByLanguage as Record<string, number>)[lang] ?? 0;
+        lines.push(
+          parsed === count
+            ? `- ${lang}: ${count}`
+            : `- ${lang}: ${count} files, ${parsed} with extracted symbols`
+        );
       }
     }
 

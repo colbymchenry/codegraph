@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph status` now shows how many files of each language actually produced symbols, not just how many were found. The file count is based on the file extension, so a language whose parser is missing or failing still reported its full count and looked healthy — indexing succeeded, the language was listed, and symbol lookups still ran, while nothing from those files was in the graph. When a language yields no symbols at all, status now says so in plain terms, and `codegraph status --strict` exits non-zero so packaging and CI can gate on it. The same seen-versus-parsed breakdown is shown to connected agents.
 
 ## [1.6.0] - 2026-08-26
 

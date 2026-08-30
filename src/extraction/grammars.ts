@@ -173,6 +173,20 @@ export const EXTENSION_MAP: Record<string, Language> = {
 };
 
 /**
+ * Whether this language is backed by a grammar, i.e. whether files of this
+ * language are EXPECTED to yield symbols.
+ *
+ * Several indexed languages track files without extracting symbols from them
+ * (yaml/twig/xml config, and the SFC wrappers that delegate their script
+ * content elsewhere). Distinguishing them matters for any check on "this
+ * language produced nothing": for a grammar language that is a broken parse,
+ * for the others it is business as usual.
+ */
+export function hasGrammar(language: Language): boolean {
+  return language in WASM_GRAMMAR_FILES;
+}
+
+/**
  * Whether a file is one CodeGraph can parse, based purely on its extension.
  * This is the single source of truth for "should we index this file" — derived
  * from EXTENSION_MAP so parser support and indexing selection never drift.

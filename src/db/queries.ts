@@ -2834,6 +2834,23 @@ export class QueryBuilder {
       filesByLanguage[row.language as Language] = row.count;
     }
 
+    // Files that produced a symbol. Every indexed file gets a `file` node
+    // whether or not it parsed, so that one is excluded — the presence of
+    // anything else is what distinguishes a parsed file from a merely seen one.
+    const parsedFilesByLanguage = {} as Record<Language, number>;
+    const parsedRows = this.db
+      .prepare(
+        `SELECT f.language, COUNT(*) as count FROM files f
+          WHERE EXISTS (
+            SELECT 1 FROM nodes n WHERE n.file_path = f.path AND n.kind <> 'file'
+          )
+          GROUP BY f.language`
+      )
+      .all() as Array<{ language: string; count: number }>;
+    for (const row of parsedRows) {
+      parsedFilesByLanguage[row.language as Language] = row.count;
+    }
+
     return {
       nodeCount: counts.node_count,
       edgeCount: counts.edge_count,
@@ -2841,6 +2858,7 @@ export class QueryBuilder {
       nodesByKind,
       edgesByKind,
       filesByLanguage,
+      parsedFilesByLanguage,
       dbSizeBytes: 0, // Set by caller using DatabaseConnection.getSize()
       walSizeBytes: 0, // Set by caller using DatabaseConnection.getWalSizeBytes()
       lastUpdated: Date.now(),

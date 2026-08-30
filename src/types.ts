@@ -578,8 +578,19 @@ export interface GraphStats {
   /** Edge counts by kind */
   edgesByKind: Record<EdgeKind, number>;
 
-  /** File counts by language */
+  /** File counts by language, keyed on the file's detected language. */
   filesByLanguage: Record<Language, number>;
+
+  /**
+   * Files that actually yielded a symbol, by language.
+   *
+   * `filesByLanguage` is derived from the file EXTENSION, so it counts a file
+   * the parser never understood exactly the same as one it parsed perfectly —
+   * a language whose grammar is missing still reports its full file count. This
+   * is the count that separates *seen* from *parsed*, and the gap between the
+   * two is the only cheap signal that a language's extraction is broken.
+   */
+  parsedFilesByLanguage: Record<Language, number>;
 
   /** Database size in bytes */
   dbSizeBytes: number;
