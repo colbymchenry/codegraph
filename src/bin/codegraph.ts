@@ -53,6 +53,7 @@ import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime
 import { installCommandSupervision } from './command-supervision';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
 import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
+import { lookupSymbolNodes, describeSymbolNode } from '../graph/symbol-lookup';
 
 // Decided once, before `--color`/`--no-color` are stripped from argv below
 // (#1281). Piped/redirected stdout, NO_COLOR, or --no-color -> plain output.
@@ -354,6 +355,56 @@ function info(message: string): void {
  */
 function warn(message: string): void {
   console.log(chalk.yellow(getGlyphs().warn) + ' ' + message);
+}
+
+/**
+ * Disclose that a name resolved to several DISTINCT definitions, whose results
+ * were merged into the list just printed.
+ *
+ * `callers` / `callees` / `impact` aggregate across every definition a name
+ * matches. That is the useful default — an interface method and its overrides
+ * are usually all wanted — but presenting the union under one heading, with
+ * nothing saying the name was ambiguous, is how a query for a common
+ * identifier ends up reporting callers that belong to an entirely unrelated
+ * symbol (often in another language, since collisions cluster on short generic
+ * names like `group`, `num`, `parse`). Naming the targets keeps the aggregate
+ * useful and makes the widening visible, and tells the user the qualified
+ * spelling that would narrow it.
+ */
+function printAmbiguityNote(
+  symbol: string,
+  targets: Array<{ qualifiedName: string; kind: string; language: string; filePath: string; startLine: number }>,
+  ambiguous: boolean
+): void {
+  if (!ambiguous || targets.length < 2) return;
+  const languages = new Set(targets.map((t) => t.language));
+  console.log(
+    chalk.yellow(getGlyphs().warn) +
+      ` "${symbol}" names ${targets.length} definitions` +
+      (languages.size > 1 ? ` across ${languages.size} languages` : '') +
+      ' — the results above are the union of all of them:'
+  );
+  for (const t of targets.slice(0, 10)) {
+    console.log(chalk.dim(`    ${describeSymbolNode(t as never)}`));
+  }
+  if (targets.length > 10) console.log(chalk.dim(`    … +${targets.length - 10} more`));
+  console.log(chalk.dim(`  Narrow it with a qualified name, e.g. "${narrowingExample(targets[0]!)}".`));
+}
+
+/**
+ * A qualified spelling that would select exactly this definition. Languages
+ * that carry the container in `qualifiedName` (Elixir, Java, C++, class-scoped
+ * methods) can offer it directly; the ones that encode their module in the
+ * FILE PATH instead (Python, Rust) have a bare qualifiedName, so suggesting it
+ * would just echo the ambiguous name back. For those, `<file>.<name>` is the
+ * spelling that resolves — it is what the file-path stage of `matchesSymbol`
+ * matches on.
+ */
+function narrowingExample(target: { qualifiedName: string; name?: string; filePath: string }): string {
+  const qualified = target.qualifiedName.replace(/::/g, '.');
+  if (qualified.includes('.')) return qualified;
+  const basename = target.filePath.split('/').pop()?.replace(/\.[^.]+$/, '');
+  return basename ? `${basename}.${qualified}` : qualified;
 }
 
 type IndexResult = {
@@ -1957,8 +2008,8 @@ program
       const cg = await CodeGraph.open(projectPath);
       const limit = parseInt(options.limit || '20', 10);
 
-      const matches = cg.searchNodes(symbol, { limit: 50 });
-      if (matches.length === 0) {
+      const { nodes: targets, ambiguous } = lookupSymbolNodes(cg, symbol);
+      if (targets.length === 0) {
         info(`Symbol "${symbol}" not found`);
         cg.destroy();
         return;
@@ -1967,20 +2018,8 @@ program
       const seen = new Set<string>();
       const allCallers: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
 
-      for (const match of matches) {
-        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
-        if (!exactMatch && matches.length > 1) continue;
-        for (const c of cg.getCallers(match.node.id)) {
-          if (!seen.has(c.node.id)) {
-            seen.add(c.node.id);
-            allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
-          }
-        }
-      }
-
-      // Fallback: if exact filter removed everything, use the top match
-      if (allCallers.length === 0 && matches[0]) {
-        for (const c of cg.getCallers(matches[0].node.id)) {
+      for (const target of targets) {
+        for (const c of cg.getCallers(target.id)) {
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
             allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
@@ -1991,7 +2030,17 @@ program
       const limited = allCallers.slice(0, limit);
 
       if (options.json) {
-        console.log(JSON.stringify({ symbol, callers: limited }, null, 2));
+        console.log(JSON.stringify({
+          symbol,
+          // Which definitions the name resolved to. An aggregate over several
+          // distinct symbols has to say so — see graph/symbol-lookup.
+          targets: targets.map((t) => ({
+            qualifiedName: t.qualifiedName, kind: t.kind, language: t.language,
+            filePath: t.filePath, startLine: t.startLine,
+          })),
+          ambiguous,
+          callers: limited,
+        }, null, 2));
       } else if (limited.length === 0) {
         info(`No callers found for "${symbol}"`);
       } else {
@@ -2005,6 +2054,7 @@ program
           console.log(chalk.dim(`  ${node.filePath}${loc}`));
           console.log();
         }
+        printAmbiguityNote(symbol, targets, ambiguous);
       }
 
       cg.destroy();
@@ -2036,8 +2086,8 @@ program
       const cg = await CodeGraph.open(projectPath);
       const limit = parseInt(options.limit || '20', 10);
 
-      const matches = cg.searchNodes(symbol, { limit: 50 });
-      if (matches.length === 0) {
+      const { nodes: targets, ambiguous } = lookupSymbolNodes(cg, symbol);
+      if (targets.length === 0) {
         info(`Symbol "${symbol}" not found`);
         cg.destroy();
         return;
@@ -2046,19 +2096,8 @@ program
       const seen = new Set<string>();
       const allCallees: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
 
-      for (const match of matches) {
-        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
-        if (!exactMatch && matches.length > 1) continue;
-        for (const c of cg.getCallees(match.node.id)) {
-          if (!seen.has(c.node.id)) {
-            seen.add(c.node.id);
-            allCallees.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
-          }
-        }
-      }
-
-      if (allCallees.length === 0 && matches[0]) {
-        for (const c of cg.getCallees(matches[0].node.id)) {
+      for (const target of targets) {
+        for (const c of cg.getCallees(target.id)) {
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
             allCallees.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
@@ -2069,7 +2108,15 @@ program
       const limited = allCallees.slice(0, limit);
 
       if (options.json) {
-        console.log(JSON.stringify({ symbol, callees: limited }, null, 2));
+        console.log(JSON.stringify({
+          symbol,
+          targets: targets.map((t) => ({
+            qualifiedName: t.qualifiedName, kind: t.kind, language: t.language,
+            filePath: t.filePath, startLine: t.startLine,
+          })),
+          ambiguous,
+          callees: limited,
+        }, null, 2));
       } else if (limited.length === 0) {
         info(`No callees found for "${symbol}"`);
       } else {
@@ -2083,6 +2130,7 @@ program
           console.log(chalk.dim(`  ${node.filePath}${loc}`));
           console.log();
         }
+        printAmbiguityNote(symbol, targets, ambiguous);
       }
 
       cg.destroy();
@@ -2114,22 +2162,20 @@ program
       const cg = await CodeGraph.open(projectPath);
       const depth = Math.min(Math.max(parseInt(options.depth || '2', 10), 1), 10);
 
-      const matches = cg.searchNodes(symbol, { limit: 50 });
-      if (matches.length === 0) {
+      const { nodes: targets, ambiguous } = lookupSymbolNodes(cg, symbol);
+      if (targets.length === 0) {
         info(`Symbol "${symbol}" not found`);
         cg.destroy();
         return;
       }
 
-      // Merge impact subgraphs across all exact-matching symbols
+      // Merge impact subgraphs across every definition the name resolved to.
       const mergedNodes = new Map<string, { name: string; kind: string; filePath: string; startLine?: number }>();
       const seenEdges = new Set<string>();
       let edgeCount = 0;
 
-      for (const match of matches) {
-        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
-        if (!exactMatch && matches.length > 1) continue;
-        const impact = cg.getImpactRadius(match.node.id, depth);
+      for (const target of targets) {
+        const impact = cg.getImpactRadius(target.id, depth);
         for (const [id, n] of impact.nodes) {
           mergedNodes.set(id, { name: n.name, kind: n.kind, filePath: n.filePath, startLine: n.startLine });
         }
@@ -2142,19 +2188,15 @@ program
         }
       }
 
-      // Fallback to top match if exact filter removed everything
-      if (mergedNodes.size === 0 && matches[0]) {
-        const impact = cg.getImpactRadius(matches[0].node.id, depth);
-        for (const [id, n] of impact.nodes) {
-          mergedNodes.set(id, { name: n.name, kind: n.kind, filePath: n.filePath, startLine: n.startLine });
-        }
-        edgeCount = impact.edges.length;
-      }
-
       if (options.json) {
         console.log(JSON.stringify({
           symbol,
           depth,
+          targets: targets.map((t) => ({
+            qualifiedName: t.qualifiedName, kind: t.kind, language: t.language,
+            filePath: t.filePath, startLine: t.startLine,
+          })),
+          ambiguous,
           nodeCount: mergedNodes.size,
           edgeCount,
           affected: Array.from(mergedNodes.values()),
@@ -2180,6 +2222,7 @@ program
           }
           console.log();
         }
+        printAmbiguityNote(symbol, targets, ambiguous);
       }
 
       cg.destroy();

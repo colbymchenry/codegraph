@@ -32,6 +32,7 @@ import {
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
 import { isTestFile, normalizeNameToken } from '../search/query-utils';
+import { lastQualifierPart, matchesSymbol as matchesSymbolShared } from '../graph/symbol-lookup';
 import { extractQueryPaths, queryMightContainPaths } from '../search/query-paths';
 import {
   existsSync,
@@ -104,13 +105,9 @@ const MAX_INPUT_LENGTH = 10_000;
 const MAX_PATH_LENGTH = 4_096;
 
 /**
- * Rust path roots that have no file-system equivalent — `crate` is the
- * current crate, `super` is the parent module, `self` is the current
- * module. Used by `matchesSymbol` to strip these before file-path
- * matching so `crate::configurator::stage_apply::run` resolves the
- * same as `configurator::stage_apply::run`.
+ * (Rust path roots — `crate`/`super`/`self` — moved to
+ * ../graph/symbol-lookup along with `matchesSymbol`.)
  */
-const RUST_PATH_PREFIXES = new Set(['crate', 'super', 'self']);
 
 /**
  * Node kinds that contain other symbols. For these, `codegraph_node` with
@@ -123,15 +120,10 @@ const CONTAINER_NODE_KINDS = new Set<NodeKind>([
 ]);
 
 /**
- * Last `::` / `.` / `/`-separated segment of a qualified symbol. An Erlang
- * arity tail (`mod::fn/3`, `fn/3`) is stripped first — the useful last segment
- * is the function name, never the digits (#1610).
+ * Symbol-name resolution lives in ../graph/symbol-lookup so the CLI verbs and
+ * these tools share one path. `lastQualifierPart` and `matchesSymbol` are
+ * re-exported through this module's own call sites unchanged.
  */
-function lastQualifierPart(symbol: string): string {
-  const noArity = symbol.replace(/\/\d{1,3}$/, '') || symbol;
-  const parts = noArity.split(/::|[./]/).filter((p) => p.length > 0);
-  return parts[parts.length - 1] ?? symbol;
-}
 
 /**
  * Normalize Erlang-native symbol spellings in an explore query into the shapes
@@ -6728,53 +6720,7 @@ export class ToolHandler {
    *      Python — `stage_apply::run` matches a `run` in `stage_apply.rs`)
    */
   private matchesSymbol(node: Node, symbol: string): boolean {
-    // Erlang arity spelling (`fn/3`, `mod:fn/3` → normalized `mod.fn/3`): when
-    // the node's qualifiedName carries an arity (`mod::fn/3`, #1610), the
-    // written arity must match it exactly; the remaining comparison then runs
-    // on the arity-less spelling. A node with no arity in its qualifiedName
-    // keeps the original symbol (a `/` there means a path-ish name instead).
-    const aritySpelling = /^(.+)\/(\d{1,3})$/.exec(symbol);
-    if (aritySpelling) {
-      const nodeArity = /\/(\d{1,3})$/.exec(node.qualifiedName ?? '')?.[1];
-      if (nodeArity !== undefined) {
-        if (nodeArity !== aritySpelling[2]) return false;
-        symbol = aritySpelling[1]!;
-      }
-    }
-    // Simple name match
-    if (node.name === symbol) return true;
-    // File basename match (e.g., "product-card" matches "product-card.liquid")
-    if (node.kind === 'file' && node.name.replace(/\.[^.]+$/, '') === symbol) return true;
-
-    // Qualified-name lookups: split on any supported separator. `\w` keeps
-    // identifier chars (incl. `_`) intact; everything else is treated as
-    // a separator we tolerate.
-    if (!/[.\/]|::/.test(symbol)) return false;
-    const parts = symbol.split(/::|[./]/).filter((p) => p.length > 0);
-    if (parts.length < 2) return false;
-
-    const lastPart = parts[parts.length - 1]!;
-    if (node.name !== lastPart) return false;
-
-    // Stage 1: qualified-name suffix match. The extractor joins the
-    // semantic hierarchy with `::`, so `Session.request` and
-    // `Session::request` both become `Session::request` here.
-    const colonSuffix = parts.join('::');
-    if (node.qualifiedName.includes(colonSuffix)) return true;
-
-    // Stage 2: file-path containment. Rust modules and Python packages
-    // are not in `qualifiedName` — they're encoded in the file path. So
-    // `stage_apply::run` matches a `run` in any file whose path
-    // contains a `stage_apply` segment (with or without an extension).
-    //
-    // Filter out Rust path prefixes that have no file-system equivalent.
-    const containerHints = parts.slice(0, -1).filter((p) => !RUST_PATH_PREFIXES.has(p));
-    if (containerHints.length === 0) return false;
-
-    const segments = node.filePath.split('/').filter((s) => s.length > 0);
-    return containerHints.every((hint) =>
-      segments.some((seg) => seg === hint || seg.replace(/\.[^.]+$/, '') === hint)
-    );
+    return matchesSymbolShared(node, symbol);
   }
 
   /**

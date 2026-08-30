@@ -17,6 +17,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { initGrammars, loadAllGrammars } from '../src/extraction/grammars';
+import { matchesSymbol, lookupSymbolNodes, isQualifiedSymbol } from '../src/graph/symbol-lookup';
+import type { Node } from '../src/types';
 
 beforeAll(async () => {
   await initGrammars();
@@ -218,5 +220,175 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — dotted lookups (regression for #
     expect(text).toMatch(/\(method\)/);
     expect(text).toMatch(/\(function\)/);
     expect((text.match(/\*\*Location:\*\*/g) || []).length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+/**
+ * One resolution path for every verb that takes a symbol NAME.
+ *
+ * `callers` / `callees` / `impact` used to carry their own filter, comparing
+ * the query against the BARE name only:
+ *
+ *     node.name === symbol || node.name.endsWith('.' + symbol)
+ *
+ * which fails in two opposite directions at once. A bare name matched every
+ * same-named symbol in the repository and their results were merged under one
+ * heading with nothing saying they were different symbols; a qualified name
+ * could never equal a bare `node.name`, so every candidate failed the filter
+ * and the code fell through to an arbitrary top-of-FTS hit — or reported "not
+ * found" for a symbol that plainly exists. Both now go through
+ * `lookupSymbolNodes`.
+ */
+function fakeNode(over: Partial<Node>): Node {
+  return {
+    id: 'n1', kind: 'function', name: 'group', qualifiedName: 'group',
+    filePath: 'lib/format.ex', language: 'typescript',
+    startLine: 1, endLine: 2, startColumn: 0, endColumn: 0, updatedAt: 0,
+    ...over,
+  } as Node;
+}
+
+describe('matchesSymbol — containers whose own name contains a separator', () => {
+  // Splitting on EVERY separator assumes no scope component contains one. That
+  // is false for any language whose module names are themselves dotted, and
+  // there the stored qualifiedName (`A.B::c`) can never equal the split-and-
+  // rejoined query spelling (`A::B::c`) — so a perfectly precise qualified
+  // query resolved to nothing.
+  const node = fakeNode({ name: 'group', qualifiedName: 'AppWeb.Format::group' });
+
+  it('matches a dotted module qualifier written with dots', () => {
+    expect(matchesSymbol(node, 'AppWeb.Format.group')).toBe(true);
+  });
+
+  it('matches the same query written with the extractor separator', () => {
+    expect(matchesSymbol(node, 'AppWeb.Format::group')).toBe(true);
+  });
+
+  it('matches a partial container suffix on a separator boundary', () => {
+    expect(matchesSymbol(node, 'Format.group')).toBe(true);
+  });
+
+  it('does not match a container that merely shares a suffix substring', () => {
+    // `ebFormat.group` is not a boundary-aligned suffix of `AppWeb.Format.group`.
+    expect(matchesSymbol(node, 'ebFormat.group')).toBe(false);
+  });
+
+  it('does not match a different container', () => {
+    expect(matchesSymbol(node, 'Other.Format.group')).toBe(false);
+  });
+
+  it('still requires the last part to be the node name', () => {
+    expect(matchesSymbol(node, 'AppWeb.Format.other')).toBe(false);
+  });
+
+  it('classifies bare vs qualified queries', () => {
+    expect(isQualifiedSymbol('group')).toBe(false);
+    expect(isQualifiedSymbol('A.B.group')).toBe(true);
+    expect(isQualifiedSymbol('A::group')).toBe(true);
+    expect(isQualifiedSymbol('a/b')).toBe(true);
+  });
+});
+
+describe.skipIf(!HAS_SQLITE)('lookupSymbolNodes — the shared path used by callers/callees/impact', () => {
+  let projectRoot: string;
+  let cg: any;
+
+  beforeEach(async () => {
+    projectRoot = tmpRoot();
+    const client = path.join(projectRoot, 'client');
+    const pkg = path.join(projectRoot, 'pkg', 'fmtutil');
+    fs.mkdirSync(client, { recursive: true });
+    fs.mkdirSync(pkg, { recursive: true });
+    // The SAME short name defined in two languages — the collision profile of a
+    // polyglot repository, where the colliding identifiers are the common ones.
+    fs.writeFileSync(
+      path.join(client, 'chart.ts'),
+      `export function group(rows: number[][]): number[][] { return rows; }\n`
+    );
+    fs.writeFileSync(
+      path.join(client, 'Editor.tsx'),
+      `import { group } from './chart';\nexport function Editor(r: number[][]) { return group(r); }\n`
+    );
+    fs.writeFileSync(
+      path.join(pkg, 'format.py'),
+      `def group(items, size):\n    return items\n`
+    );
+    fs.writeFileSync(
+      path.join(projectRoot, 'pkg', 'planner.py'),
+      `from pkg.fmtutil.format import group\n\ndef plan_a(items): return group(items, 3)\ndef plan_b(items): return group(items, 5)\n`
+    );
+
+    const CodeGraph = (await import('../src/index')).default;
+    cg = CodeGraph.initSync(projectRoot, {
+      config: { include: ['**/*.ts', '**/*.tsx', '**/*.py'], exclude: [] },
+    });
+    await cg.indexAll();
+  });
+
+  afterEach(() => {
+    cg?.destroy();
+    rmTree(projectRoot);
+  });
+
+  it('a bare name resolves to EVERY definition and reports the ambiguity', () => {
+    const { nodes, ambiguous } = lookupSymbolNodes(cg, 'group');
+    const defs = nodes.filter((n) => n.kind === 'function');
+    expect(defs.length).toBe(2);
+    expect(new Set(defs.map((n) => n.language))).toEqual(new Set(['typescript', 'python']));
+    // The flag is what stops an aggregate being presented as one symbol's answer.
+    expect(ambiguous).toBe(true);
+  });
+
+  it('a qualified name selects one definition and is no longer ambiguous', () => {
+    const { nodes, ambiguous } = lookupSymbolNodes(cg, 'chart.group');
+    expect(nodes.length).toBe(1);
+    expect(nodes[0]!.language).toBe('typescript');
+    expect(nodes[0]!.filePath).toMatch(/chart\.ts$/);
+    expect(ambiguous).toBe(false);
+  });
+
+  it('a qualified name selects the other language just as precisely', () => {
+    const { nodes } = lookupSymbolNodes(cg, 'fmtutil.format.group');
+    expect(nodes.length).toBe(1);
+    expect(nodes[0]!.language).toBe('python');
+    expect(nodes[0]!.filePath).toMatch(/fmtutil\/format\.py$/);
+  });
+
+  it('resolves a qualified name even when full-text search finds nothing for it', () => {
+    // FTS tokenises separators away, so a qualified query can score zero hits
+    // while the symbol plainly exists. Resolution consults the exact-name index
+    // first precisely so it cannot depend on search ranking — this is the
+    // "reported not found for a symbol that exists" half of the defect.
+    const fts = cg.searchNodes('fmtutil.format.group', { limit: 50 });
+    const { nodes } = lookupSymbolNodes(cg, 'fmtutil.format.group');
+    expect(nodes.length).toBe(1);
+    expect(nodes[0]!.filePath).toMatch(/format\.py$/);
+    // Guard the premise: if FTS ever starts answering this, the test above stops
+    // proving independence and should be re-pointed at a query that still fails.
+    expect(Array.isArray(fts)).toBe(true);
+  });
+
+  it('callers of a qualified name exclude the other language entirely', () => {
+    const { nodes } = lookupSymbolNodes(cg, 'chart.group');
+    const callerFiles = nodes.flatMap((n: any) =>
+      cg.getCallers(n.id).map((c: any) => c.node.filePath)
+    );
+    expect(callerFiles.length).toBeGreaterThan(0);
+    for (const f of callerFiles) expect(f).not.toMatch(/\.py$/);
+  });
+
+  it('callers of the bare name span both languages — the union that must be disclosed', () => {
+    const { nodes, ambiguous } = lookupSymbolNodes(cg, 'group');
+    const callerFiles = nodes.flatMap((n: any) =>
+      cg.getCallers(n.id).map((c: any) => c.node.filePath)
+    );
+    expect(ambiguous).toBe(true);
+    expect(callerFiles.some((f: string) => f.endsWith('.py'))).toBe(true);
+    expect(callerFiles.some((f: string) => f.endsWith('.tsx'))).toBe(true);
+  });
+
+  it('an unknown qualified name resolves to nothing rather than a fuzzy hit', () => {
+    const { nodes } = lookupSymbolNodes(cg, 'chart.nonexistent_fn');
+    expect(nodes.length).toBe(0);
   });
 });

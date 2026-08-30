@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- `codegraph callers`, `codegraph callees` and `codegraph impact` now understand qualified symbol names. Asking for something like `Accounts.Format.group` used to match nothing, so the command quietly fell back to whichever symbol full-text search happened to rank first — or reported "not found" for a symbol that plainly exists. Qualified names now select exactly the definition you named, including in languages whose module names themselves contain dots.
+- Those same commands now tell you when a plain name matches several different definitions. Previously the results for every same-named symbol — often in different languages, since collisions cluster on short names like `group`, `num` or `parse` — were merged into a single list with nothing saying they came from different symbols. The list still aggregates, but it now names what it aggregated and shows you the qualified spelling that narrows it.
 
 ## [1.6.0] - 2026-08-26
 
