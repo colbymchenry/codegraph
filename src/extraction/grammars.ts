@@ -74,6 +74,11 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.jsx': 'jsx',
   '.py': 'python',
   '.pyw': 'python',
+  // Type stubs. Real, checked-in API surface — and for protobuf specifically
+  // the ONLY place per-field Python declarations exist, since a modern
+  // `_pb2.py` is a serialized descriptor blob with no per-field symbols while
+  // its `_pb2.pyi` sibling declares every one.
+  '.pyi': 'python',
   '.go': 'go',
   '.rs': 'rust',
   '.java': 'java',

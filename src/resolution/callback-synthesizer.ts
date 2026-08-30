@@ -28,6 +28,7 @@ import { isGeneratedFile } from '../extraction/generated-detection';
 import { stripCommentsForRegex } from './strip-comments';
 import { cFnPointerDispatchEdges } from './c-fnptr-synthesizer';
 import { goframeRouteEdges } from './goframe-synthesizer';
+import { protobufContractEdges } from './protobuf-contract-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
@@ -3611,6 +3612,10 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   },
   { name: 'goframeEdges', gate: (has) => has('go'), run: (_q, c, y) => goframeRouteEdges(c, y) },
   { name: 'nixOptionEdges', gate: (has) => has('nix'), run: (q, _c, y) => nixOptionPathEdges(q, y) },
+  // A `.proto` field to the generated code implementing it in each target
+  // language. Gated on the project having protos at all; the join is
+  // stem-to-stem, so a repo with no generated peers is a no-op.
+  { name: 'protobufContractEdges', gate: (has) => has('proto'), run: (_q, c, y) => protobufContractEdges(c, y) },
 ];
 
 /** Fixed non-registry steps: goMethodContains, goImplements, dedupe-merge, insertMergedEdges. */

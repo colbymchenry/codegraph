@@ -14,6 +14,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- A `.proto` declaration is now linked to the code generated from it. Messages, enums and services link to their generated type in every language the project generates for, and each `rpc` links to the generated method itself — so asking what a field or message affects lists the Python, TypeScript, Go or Elixir files that implement it, which are exactly the files a change has to regenerate. Discovery uses the naming conventions the generators already follow (`foo_pb2.py`, `foo.pb.ex`, `foo.pb.go`, `foo_pb.ts`), so nothing needs configuring, and matching is confined to a proto's own generated outputs — a field called `id` is never linked to an unrelated `id` elsewhere in the repo.
+- Python type stubs (`.pyi`) are now indexed. They are real, checked-in API surface, and for protobuf they are the only place per-field Python declarations exist at all.
 - CodeGraph now indexes **Protocol Buffers** (`.proto`). Messages, nested messages, enums and their values, fields, `oneof` members, services and their `rpc`s all become symbols, named the way protobuf names them — so `acme.reporting.v1.Measurement.observed_at` is something you can look up, and asking what depends on a message lists the fields and RPCs that use it. Two details are modelled on purpose: a field keeps its **tag number**, because renaming a field at the same tag is harmless while changing its type at the same tag is a silent wire break; and `reserved` numbers, ranges and names are kept as symbols, so a retired field is still findable instead of vanishing from the graph.
 
 ### Fixes
