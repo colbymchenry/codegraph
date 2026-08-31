@@ -28,6 +28,7 @@ import { isGeneratedFile } from '../extraction/generated-detection';
 import { stripCommentsForRegex } from './strip-comments';
 import { cFnPointerDispatchEdges } from './c-fnptr-synthesizer';
 import { goframeRouteEdges } from './goframe-synthesizer';
+import { inertiaPropEdges } from './inertia-prop-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
@@ -3611,6 +3612,10 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   },
   { name: 'goframeEdges', gate: (has) => has('go'), run: (_q, c, y) => goframeRouteEdges(c, y) },
   { name: 'nixOptionEdges', gate: (has) => has('nix'), run: (q, _c, y) => nixOptionPathEdges(q, y) },
+  // Inertia prop map to the page component that reads it. ALWAYS gated: the
+  // server half may be PHP, Ruby or Elixir and the client half TSX/Vue/Svelte,
+  // and the pass is a no-op unless the framework resolver emitted prop nodes.
+  { name: 'inertiaPropEdges', gate: ALWAYS, run: (_q, c, y) => inertiaPropEdges(c, y) },
 ];
 
 /** Fixed non-registry steps: goMethodContains, goImplements, dedupe-merge, insertMergedEdges. */

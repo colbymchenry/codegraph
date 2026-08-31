@@ -29,6 +29,7 @@ import { expoModulesResolver } from './expo-modules';
 import { fabricViewResolver } from './fabric';
 import { cicsResolver } from './cics';
 import { terraformResolver } from './terraform';
+import { inertiaResolver } from './inertia';
 
 /**
  * All registered framework resolvers
@@ -76,6 +77,8 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   cicsResolver,
   // Terraform / OpenTofu — disambiguate var/local/module/resource refs to same-dir module
   terraformResolver,
+  // Inertia (Laravel / Rails / Phoenix) — server prop map to the page component
+  inertiaResolver,
 ];
 
 /**

@@ -327,6 +327,7 @@ CodeGraph detects web-framework routing files and emits `route` nodes linked by 
 | **Drupal** | `*.routing.yml` routes (`_controller`, `_form`, entity handlers); `hook_*` implementations in `.module`/`.theme`/`.install`/`.inc` |
 | **Rails** | `get '/x', to: 'users#index'`, hash-rocket `=>` syntax |
 | **Spring** | `@GetMapping`, `@PostMapping`, `@RequestMapping` on methods |
+| **Inertia** | `Inertia::render`, `render inertia:`, `render_inertia` — server prop keys become symbols linked to the page component that reads them, across the adapter's camelize transform (Laravel / Rails / Phoenix) |
 | **Play** | `GET`/`POST`/… verb routes in `conf/routes` → `Controller.method` actions (Scala + Java) |
 | **Gin / chi / gorilla / mux** | `r.GET(...)`, `router.HandleFunc(...)` |
 | **Axum / actix / Rocket** | `.route("/x", get(handler))` |
