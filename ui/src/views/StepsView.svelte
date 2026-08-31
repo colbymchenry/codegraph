@@ -120,19 +120,6 @@
     }
   });
 
-  /**
-   * The fit. A picture of a few boxes is centred — and the key, bottom left,
-   * would sit on its second row; it is fitted to the right of the key instead.
-   * A picture of many boxes is fitted to the whole stage, as the Screens view's
-   * — and a picture laid out by region may fit far out: the regions and their
-   * captions are the overview, and the reader zooms into one, where a 0.4
-   * floor on a big screen's picture opened on a window torn out of its middle.
-   */
-  const fitOptions = $derived(
-    model !== null && model.layout.nodes.length <= 24 && legendOpen
-      ? { padding: { left: '440px', top: '32px', right: '32px', bottom: '32px' }, maxZoom: 1, minZoom: 0.4 }
-      : { padding: 0.1, maxZoom: 1, minZoom: model !== null && model.regions !== null ? 0.2 : 0.4 }
-  );
   const nodeTypes = { step: StepNode, region: RegionCaption, fork: ForkPoint, decision: DecisionCaption };
 
   /** Two clicks on one box closer than this are a double-click. */
@@ -217,6 +204,27 @@
   );
   /** The order can be asked for and have nothing to read: the view then says so. */
   const orderReadable = $derived(payload?.program != null);
+
+  /**
+   * The fit. A picture of a few boxes is centred — and the key, bottom left,
+   * would sit on its second row; it is fitted to the right of the key instead.
+   * A picture of many boxes is fitted to the whole stage, as the Screens view's
+   * — and a picture laid out by region may fit far out: the regions and their
+   * captions are the overview, and the reader zooms into one, where a 0.4
+   * floor on a big screen's picture opened on a window torn out of its middle.
+   *
+   * Declared AFTER the model it reads: `$derived` is lazy, so the forward
+   * reference ran, but it is a forward reference all the same and the checker
+   * was right to say so. The per-side padding keeps its literal types (`as
+   * const`), because the canvas types a side as `` `${number}px` `` — widened
+   * to `string` it silently fails to typecheck against the very option it is
+   * written for.
+   */
+  const fitOptions = $derived(
+    model !== null && model.layout.nodes.length <= 24 && legendOpen
+      ? { padding: { left: '440px', top: '32px', right: '32px', bottom: '32px' } as const, maxZoom: 1, minZoom: 0.4 }
+      : { padding: 0.1, maxZoom: 1, minZoom: model !== null && model.regions !== null ? 0.2 : 0.4 }
+  );
 
   /** The selection with the decision points it touches — what the edge filter and the dimming reason over. */
   const reach = $derived(model === null || selected === null ? null : selectionReach(model, selected));
