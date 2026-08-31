@@ -17,7 +17,7 @@ import {
   ImportMapping,
   DeferredTypedReceiverRef,
 } from './types';
-import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, buildTypedReceiverDeferral, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
+import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, getDirectCallableCandidatesOnTypeNode, buildTypedReceiverDeferral, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
 import { resolveViaImport, resolveJvmImport, resolveImportPath, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { detectFrameworks } from './frameworks';
@@ -2481,8 +2481,10 @@ export class ReferenceResolver {
             seenNodeIds.add(superNode.id);
             if (!SUPERTYPE_BEARING_KINDS.has(superNode.kind)) continue;
 
+            const perSuperTargets: Node[] = [];
+
             // Direct member lookup on the exact supertype node:
-            // 1. Through 'contains' edges
+            // 1. Through 'contains' edges (strongest node-level ownership evidence)
             for (const c of this.queries.getOutgoingEdges(superNode.id, ['contains'])) {
               const m = this.queries.getNodeById(c.target);
               if (
@@ -2491,24 +2493,23 @@ export class ReferenceResolver {
                 (m.kind === 'function' || m.kind === 'method') &&
                 (m.language === item.ref.language || sameLanguageFamily(m.language, item.ref.language))
               ) {
-                depthTargets.push(m);
+                perSuperTargets.push(m);
               }
             }
 
-            // 2. Direct matches in supertype file / qualified name
-            if (depthTargets.length === 0) {
-              const directMatches = this.context.getNodesByName(item.methodName).filter(
-                (m) =>
-                  (m.kind === 'function' || m.kind === 'method') &&
-                  m.filePath === superNode.filePath &&
-                  (m.language === item.ref.language || sameLanguageFamily(m.language, item.ref.language)) &&
-                  (m.qualifiedName === `${superNode.qualifiedName}::${item.methodName}` ||
-                    m.qualifiedName === `${superNode.qualifiedName}.${item.methodName}` ||
-                    (m.startLine >= superNode.startLine &&
-                      (m.endLine ?? m.startLine) <= (superNode.endLine ?? superNode.startLine)))
-              );
-              depthTargets.push(...directMatches);
-            }
+            // 2. Direct exact qualified ownership fallback (reusing canonical direct ownership helper)
+            perSuperTargets.push(
+              ...getDirectCallableCandidatesOnTypeNode(
+                superNode,
+                item.methodName,
+                item.ref,
+                this.context,
+              )
+            );
+
+            // Deduplicate targets found for this specific supertype node
+            const uniquePerSuper = [...new Map(perSuperTargets.map((t) => [t.id, t])).values()];
+            depthTargets.push(...uniquePerSuper);
 
             nextFrontier.push(superNode);
           }

@@ -3648,6 +3648,119 @@ export class Service {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
     }, 30000);
+
+    it('inherited BaseService with nested Local::run must not resolve (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-inherited-local-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'service.ts'),
+          `export class BaseService {
+  setup(): void {
+    class Local {
+      run(): void {}
+    }
+  }
+}
+
+export class DerivedService extends BaseService {}
+
+export function useDerived(service: DerivedService): void {
+  service.run();
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('service.ts');
+        const localRun = allNodes.find((n) => n.kind === 'method' && n.name === 'run');
+        expect(localRun).toBeDefined();
+
+        const callers = await cg.getCallers(localRun!.id);
+        expect(callers.map((c) => c.node.name)).not.toContain('useDerived');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('inherited BaseService with nested function run must not resolve (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-inherited-fn-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'service.ts'),
+          `export class BaseService {
+  setup(): void {
+    function run(): void {}
+  }
+}
+
+export class DerivedService extends BaseService {}
+
+export function useDerived(service: DerivedService): void {
+  service.run();
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('service.ts');
+        const nestedRun = allNodes.find((n) => (n.kind === 'function' || n.kind === 'method') && n.name === 'run');
+        expect(nestedRun).toBeDefined();
+
+        const callers = await cg.getCallers(nestedRun!.id);
+        expect(callers.map((c) => c.node.name)).not.toContain('useDerived');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('deeper nested Worker inside inner function is not visible to outer use (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-deeper-worker-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'worker.ts'),
+          `export class Worker {
+  run(): void {}
+}
+
+export function use(): void {
+  function inner(): void {
+    class Worker {
+      stop(): void {}
+    }
+  }
+
+  const worker = new Worker();
+  worker.stop();
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('worker.ts');
+        const innerStop = allNodes.find((n) => n.kind === 'method' && n.name === 'stop');
+        expect(innerStop).toBeDefined();
+
+        const callers = await cg.getCallers(innerStop!.id);
+        expect(callers.map((c) => c.node.name)).not.toContain('use');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
   });
 
   describe('Object-literal namespace members (#1573)', () => {

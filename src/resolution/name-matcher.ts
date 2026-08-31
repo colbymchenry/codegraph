@@ -1383,21 +1383,6 @@ export function bindProjectReceiverType(
     if (sameFileCandidates.length === 1) {
       return sameFileCandidates[0]!;
     } else if (sameFileCandidates.length > 1) {
-      // Disambiguate if ref.fromNodeId is inside exactly one candidate's enclosing scope
-      if (ref.fromNodeId) {
-        const fromNode = context.getNodesInFile(ref.filePath).find((n) => n.id === ref.fromNodeId);
-        if (fromNode) {
-          const fromEnd = fromNode.endLine ?? fromNode.startLine;
-          const scopedCandidates = sameFileCandidates.filter(
-            (c) =>
-              c.startLine >= fromNode.startLine &&
-              (c.endLine ?? c.startLine) <= fromEnd
-          );
-          if (scopedCandidates.length === 1) {
-            return scopedCandidates[0]!;
-          }
-        }
-      }
       return null;
     }
 
@@ -1479,6 +1464,33 @@ export function bindProjectReceiverType(
 }
 
 /**
+ * Find all callable candidate nodes directly owned by a specific type node (no supertype walk) (#1566).
+ * Direct ownership is strictly verified via exact qualifiedName (`${typeNode.qualifiedName}::${methodName}`
+ * or `${typeNode.qualifiedName}.${methodName}`).
+ */
+export function getDirectCallableCandidatesOnTypeNode(
+  typeNode: Node,
+  methodName: string,
+  _ref: UnresolvedRef,
+  context: ResolutionContext,
+): Node[] {
+  const acceptedQualifiedNames = new Set([
+    `${typeNode.qualifiedName}::${methodName}`,
+    `${typeNode.qualifiedName}.${methodName}`,
+  ]);
+
+  return context
+    .getNodesByName(methodName)
+    .filter(
+      (m) =>
+        (m.kind === 'method' || m.kind === 'function') &&
+        m.filePath === typeNode.filePath &&
+        (m.language === typeNode.language || sameLanguageFamily(m.language, typeNode.language)) &&
+        acceptedQualifiedNames.has(m.qualifiedName)
+    );
+}
+
+/**
  * Resolve a method directly declared on a specific type node (no supertype walk) (#1566).
  */
 export function resolveMethodOnTypeNode(
@@ -1489,35 +1501,13 @@ export function resolveMethodOnTypeNode(
   confidence: number = 0.9,
   resolvedBy: ResolvedRef['resolvedBy'] = 'instance-method',
 ): ResolvedRef | null {
-  const acceptedQualifiedNames = new Set([
-    `${typeNode.qualifiedName}::${methodName}`,
-    `${typeNode.qualifiedName}.${methodName}`,
-  ]);
+  const candidates = getDirectCallableCandidatesOnTypeNode(typeNode, methodName, ref, context);
+  const unique = [...new Map(candidates.map((m) => [m.id, m])).values()];
 
-  const methodCandidates = context
-    .getNodesByName(methodName)
-    .filter(
-      (m) =>
-        (m.kind === 'method' || m.kind === 'function') &&
-        m.filePath === typeNode.filePath &&
-        (m.language === typeNode.language || sameLanguageFamily(m.language, typeNode.language)) &&
-        acceptedQualifiedNames.has(m.qualifiedName)
-    );
-
-  if (methodCandidates.length === 1) {
+  if (unique.length === 1) {
     return {
       original: ref,
-      targetNodeId: methodCandidates[0]!.id,
-      confidence,
-      resolvedBy,
-    };
-  }
-
-  const uniqueIds = new Set(methodCandidates.map((m) => m.id));
-  if (uniqueIds.size === 1) {
-    return {
-      original: ref,
-      targetNodeId: methodCandidates[0]!.id,
+      targetNodeId: unique[0]!.id,
       confidence,
       resolvedBy,
     };
