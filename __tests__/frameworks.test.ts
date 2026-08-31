@@ -992,6 +992,77 @@ class OwnerController {
   });
 });
 
+describe('springResolver.resolve — DI heuristics are gated to Java/Kotlin non-inheritance refs', () => {
+  // A polyglot repo (Scala + a sibling Java module) detects Spring globally.
+  // The DI/convention patterns (bare-name Pattern 4 especially) must then not
+  // hijack a Scala `extends X` to a same-named class found via directory
+  // heuristics — inheritance must resolve through imports/name matching.
+  const decoyNode: Node = {
+    id: 'class:src/test/model/ExtCustomer.java:ExtCustomer:3',
+    kind: 'class',
+    name: 'ExtCustomer',
+    qualifiedName: 'src/test/model/ExtCustomer.java::ExtCustomer',
+    filePath: 'src/test/model/ExtCustomer.java',
+    language: 'java',
+    startLine: 3,
+    endLine: 10,
+    startColumn: 0,
+    endColumn: 0,
+    updatedAt: Date.now(),
+  };
+  const context = {
+    getNodesInFile: () => [],
+    getNodesByName: (n: string) => (n === 'ExtCustomer' ? [decoyNode] : []),
+    getNodesByQualifiedName: () => [],
+    getNodesByKind: () => [],
+    fileExists: () => false,
+    readFile: () => null,
+    getProjectRoot: () => '/test',
+    getAllFiles: () => [],
+    getNodesByLowerName: () => [],
+    getImportMappings: () => [],
+  };
+  const baseRef = {
+    fromNodeId: 'class:A.scala:MExtCustomer:5',
+    referenceName: 'ExtCustomer',
+    line: 5,
+    column: 10,
+    filePath: 'A.scala',
+  };
+
+  it('does NOT resolve a Scala extends reference (Pattern 4 bare-name fallback)', () => {
+    const ref = { ...baseRef, referenceKind: 'extends' as const, language: 'scala' as const };
+    expect(springResolver.resolve(ref, context as any)).toBeNull();
+  });
+
+  it('does NOT resolve a non-Java/Kotlin plain reference either', () => {
+    const ref = { ...baseRef, referenceKind: 'references' as const, language: 'scala' as const };
+    expect(springResolver.resolve(ref, context as any)).toBeNull();
+  });
+
+  it('does NOT resolve a Java extends reference — inheritance is never a DI pattern', () => {
+    const ref = {
+      ...baseRef,
+      filePath: 'B.java',
+      referenceKind: 'extends' as const,
+      language: 'java' as const,
+    };
+    expect(springResolver.resolve(ref, context as any)).toBeNull();
+  });
+
+  it('still resolves a Java DI reference through the entity pattern', () => {
+    const ref = {
+      ...baseRef,
+      filePath: 'B.java',
+      referenceKind: 'references' as const,
+      language: 'java' as const,
+    };
+    const result = springResolver.resolve(ref, context as any);
+    expect(result?.targetNodeId).toBe(decoyNode.id);
+    expect(result?.resolvedBy).toBe('framework');
+  });
+});
+
 import { playResolver } from '../src/resolution/frameworks/play';
 import { isSourceFile, isPlayRoutesFile } from '../src/extraction/grammars';
 
