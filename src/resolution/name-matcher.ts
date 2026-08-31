@@ -1563,6 +1563,142 @@ export function parseMethodCallReference(ref: UnresolvedRef): ParsedMethodCall |
   return null;
 }
 
+export interface ParsedCallResultMember {
+  calleeChain: string;
+  methodName: string;
+}
+
+/**
+ * Parse call-result member references like `useStore.getState().reset`, `get().reset`, `factory().get` (#1566/#647).
+ */
+export function parseCallResultMemberReference(ref: UnresolvedRef): ParsedCallResultMember | null {
+  if (ref.referenceKind !== 'calls') return null;
+  const m = ref.referenceName.match(/^(.+)\(\)\.([A-Za-z_$][\w$]*)$/);
+  if (!m || !m[1] || !m[2]) return null;
+  const calleeChain = m[1];
+  const methodName = m[2];
+
+  // calleeChain must be a simple identifier or a dotted chain of identifiers (e.g. `useStore.getState` or `get` or `factory`)
+  if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(calleeChain)) {
+    return null;
+  }
+  return { calleeChain, methodName };
+}
+
+/**
+ * Resolve a call-result member chain (`useStore.getState().reset` or `get().reset`)
+ * in TypeScript/JavaScript/TSX/JSX/ArkTS (#1566/#647).
+ * Strictly scoped to proven object-literal / store containers; never falls back to generic name guessing.
+ */
+export function resolveTsJsCallResultMember(
+  parsed: ParsedCallResultMember,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  const { calleeChain, methodName } = parsed;
+
+  // Case 1: Dotted root call, e.g. `useStore.getState().reset` or `api.client().call`
+  if (calleeChain.includes('.')) {
+    const rootName = calleeChain.split('.')[0]!;
+
+    // Find the container constant/variable named rootName
+    // A: Same file
+    let container: Node | null = null;
+    const inFile = context.getNodesInFile(ref.filePath);
+    container =
+      inFile.find(
+        (n) =>
+          (n.kind === 'constant' || n.kind === 'variable') &&
+          n.name === rootName &&
+          (n.language === ref.language || sameLanguageFamily(n.language, ref.language))
+      ) ?? null;
+
+    // B: Imported from another file
+    if (!container) {
+      const imports = context.getImportMappings ? context.getImportMappings(ref.filePath, ref.language) : [];
+      const mapping = imports.find((i) => i.localName === rootName);
+      if (mapping) {
+        const resolvedPath =
+          mapping.resolvedPath ||
+          resolveImportPath(mapping.source, ref.filePath, ref.language, context);
+        if (resolvedPath) {
+          const normResolved = normalizePathForComparison(resolvedPath);
+          const targetNodes = context.getNodesInFile(resolvedPath).concat(
+            context.getNodesByName(mapping.exportedName || mapping.localName)
+          );
+          container =
+            targetNodes.find(
+              (n) =>
+                (n.kind === 'constant' || n.kind === 'variable') &&
+                (n.name === mapping.exportedName || n.name === mapping.localName || mapping.isDefault) &&
+                normalizePathForComparison(n.filePath) === normResolved &&
+                (n.language === ref.language || sameLanguageFamily(n.language, ref.language))
+            ) ?? null;
+        }
+      }
+    }
+
+    if (container) {
+      return resolveObjectLiteralMember(container, methodName, ref, context, 0.9, 'instance-method');
+    }
+    return null;
+  }
+
+  // Case 2: Bare root call, e.g. `get().reset` or `factory().get`
+  const rootName = calleeChain;
+
+  // Check if rootName is a defined project callable in caller's scope (e.g. `function factory() {}`)
+  // If so, `factory().reset()` is a call on the result of an external/declared factory function,
+  // NOT a store-internal callback like `get()`, so it must NOT resolve to a sibling store action.
+  const inFile = context.getNodesInFile(ref.filePath);
+  const isDeclaredFunction = inFile.some(
+    (n) => (n.kind === 'function' || n.kind === 'method') && n.name === rootName
+  );
+  if (isDeclaredFunction) {
+    return null;
+  }
+
+  // If rootName is not a declared function (e.g. `get` from store factory callback parameter),
+  // locate the tightest enclosing constant/variable container around ref.fromNodeId
+  let fromNode: Node | null = null;
+  if (ref.fromNodeId) {
+    fromNode = inFile.find((n) => n.id === ref.fromNodeId) ?? null;
+  }
+  if (!fromNode) {
+    // Fallback by line if fromNodeId not in file nodes list
+    for (const n of inFile) {
+      const end = n.endLine ?? n.startLine;
+      if (n.startLine <= ref.line && end >= ref.line) {
+        if (!fromNode || n.startLine >= fromNode.startLine) {
+          fromNode = n;
+        }
+      }
+    }
+  }
+  if (!fromNode) return null;
+
+  // Find all constant/variable containers in the same file that enclose fromNode
+  const fromEnd = fromNode.endLine ?? fromNode.startLine;
+  const containingContainers = inFile.filter(
+    (n) =>
+      (n.kind === 'constant' || n.kind === 'variable') &&
+      n.startLine <= fromNode!.startLine &&
+      (n.endLine ?? n.startLine) >= fromEnd
+  );
+
+  if (containingContainers.length === 0) return null;
+
+  // Sort by smallest range (tightest enclosing container)
+  containingContainers.sort((a, b) => {
+    const rangeA = (a.endLine ?? a.startLine) - a.startLine;
+    const rangeB = (b.endLine ?? b.startLine) - b.startLine;
+    return rangeA - rangeB;
+  });
+
+  const tightestContainer = containingContainers[0]!;
+  return resolveObjectLiteralMember(tightestContainer, methodName, ref, context, 0.9, 'instance-method');
+}
+
 /**
  * Builds a structured deferred typed receiver record for the conformance second pass (#1566).
  */
@@ -3027,6 +3163,24 @@ export function matchReference(
 
   // 1d. Dotted chained static-factory / fluent call (Java / Kotlin / C# / Swift /
   // Go / Scala / Dart / Objective-C) — `Foo.getInstance().bar()` encoded as
+  // Web-family call-result member chain (`useStore.getState().reset`, `get().reset`, `factory().get`)
+  // Must resolve exclusively against proven store/object-literal containers; unproven chains stay
+  // unlinked and must NEVER fall through to generic name guessing (#1566/#647).
+  const isWebFamily =
+    ref.language === 'typescript' ||
+    ref.language === 'javascript' ||
+    ref.language === 'tsx' ||
+    ref.language === 'jsx' ||
+    ref.language === 'arkts';
+
+  const callResult = parseCallResultMemberReference(ref);
+  if (callResult) {
+    if (isWebFamily) {
+      return nmTimed('tsjsCallResult', ref, () => resolveTsJsCallResultMember(callResult, ref, context));
+    }
+  }
+
+  // 1b. Dotted call chain with factory / singleton receiver (Java, Kotlin, C#, Swift, Go...)
   // `Foo.getInstance().bar`, Go's bare-factory `New().Method()` as `New().Method`,
   // Scala's companion factory, Dart's static factory / factory-constructor, or
   // ObjC's chained message send `[[Foo create] doIt]` encoded as `Foo.create().doIt`

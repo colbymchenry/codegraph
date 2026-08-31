@@ -422,6 +422,22 @@ function getStaticMemberChain(node: SyntaxNode, source: string): string | null {
   return null;
 }
 
+/**
+ * Extract a static call-result chain (`factory()`, `useStore.getState()`, `a.b.c()`)
+ * from an AST node, or return null if any part of the chain is dynamic, computed,
+ * nested call-of-call, or has no static syntax identity (#1566/#647).
+ */
+function getStaticCallResultChain(node: SyntaxNode, source: string): string | null {
+  if (node.type !== 'call_expression') return null;
+  const fn = getChildByField(node, 'function') || node.namedChild(0);
+  if (!fn) return null;
+  const fnChain = getStaticMemberChain(fn, source);
+  if (fnChain) {
+    return `${fnChain}()`;
+  }
+  return null;
+}
+
 export class TreeSitterExtractor {
   private filePath: string;
   private language: Language;
@@ -4489,10 +4505,11 @@ export class TreeSitterExtractor {
             ) {
               // TS/JS/ArkTS: preserve static member expression chains
               // (`holder.values.get`, `this.store.get`, `this.mailer.send`)
-              // so resolution does not lose receiver context and fall back to
-              // bare-name guessing (#1566/#1496). Dynamic/computed/call-result
-              // receivers have no static receiver identity and do NOT degrade
-              // to a bare method name that could fabricate a project edge.
+              // and static call-result member chains (`useStore.getState().reset`,
+              // `get().reset`, `factory().get`) so resolution does not lose
+              // receiver context and fall back to bare-name guessing (#1566/#1496/#647).
+              // Dynamic / computed receivers (e.g. `holder[key].get()`) have no
+              // static receiver identity and return early to avoid fabricating project edges.
               const chain = getStaticMemberChain(receiver, this.source);
               if (chain) {
                 if (!SKIP_RECEIVERS.has(chain)) {
@@ -4501,7 +4518,12 @@ export class TreeSitterExtractor {
                   calleeName = methodName;
                 }
               } else {
-                return;
+                const callResultChain = getStaticCallResultChain(receiver, this.source);
+                if (callResultChain) {
+                  calleeName = `${callResultChain}.${methodName}`;
+                } else {
+                  return;
+                }
               }
             } else if (receiver && (receiver.type === 'identifier' || receiver.type === 'simple_identifier' || receiver.type === 'field_identifier')) {
               const receiverName = getNodeText(receiver, this.source);

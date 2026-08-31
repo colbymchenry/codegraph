@@ -1070,8 +1070,10 @@ impl<'t> Walker<'t> {
                             } else {
                                 callee_name = method_name.to_string();
                             }
+                        } else if let Some(call_chain) = get_static_call_result_chain(r, self.src) {
+                            callee_name = format!("{call_chain}.{method_name}");
                         } else {
-                            // Dynamic/computed/call-result receiver has no static receiver identity.
+                            // Dynamic/computed receiver has no static receiver identity.
                             // DO NOT degrade to bare method name (#1566).
                             return;
                         }
@@ -1365,4 +1367,18 @@ fn get_static_member_chain<'t>(node: Node<'t>, source: &'t str) -> Option<String
         }
         _ => None,
     }
+}
+
+/// Extract a static call-result chain (`factory()`, `useStore.getState()`, `a.b.c()`)
+/// from an AST node, or return None if any part of the chain is dynamic, computed,
+/// nested call-of-call, or has no static syntax identity (#1566/#647).
+fn get_static_call_result_chain<'t>(node: Node<'t>, source: &'t str) -> Option<String> {
+    if node.kind() != "call_expression" {
+        return None;
+    }
+    let func = node
+        .child_by_field_name("function")
+        .or_else(|| node.named_child(0))?;
+    let fn_chain = get_static_member_chain(func, source)?;
+    Some(format!("{fn_chain}()"))
 }

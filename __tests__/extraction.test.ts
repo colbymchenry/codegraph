@@ -11955,9 +11955,10 @@ export class TestClass {
       expect(refNames).toContain('a.b.c.d');
       expect(refNames).toContain('testMethod'); // direct this.testMethod -> bare method
 
-      // Dynamic / computed expressions do not emit bare methodName refs (#1566 Blocker A)
+      // Dynamic / computed expressions do not emit bare methodName refs (#1566/#647)
+      expect(refNames).toContain('factory().get');
+      expect(refNames).toContain('factory');
       expect(refNames).not.toContain('get');
-      expect(refNames.some((r) => r.includes('factory().'))).toBe(false);
       expect(refNames.some((r) => r.includes('key]'))).toBe(false);
     });
   });

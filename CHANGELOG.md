@@ -14,7 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
-- Calls on built-in and external TypeScript/JavaScript receivers (such as `Map.get`, `Map.set`, `Map.has`) no longer resolve to unrelated same-named project methods, static nested member calls (`holder.values.get()`, `this.store.get()`) preserve context rather than fabricating self-edges, dynamic/computed receivers remain unlinked when their target cannot be proven, and inherited methods on typed instances continue to resolve accurately — re-index after upgrading. (#1566)
+- Calls on built-in and external TypeScript/JavaScript receivers (such as `Map.get`, `Map.set`, `Map.has`) no longer resolve to unrelated same-named project methods; static and call-result receiver context is preserved so proven project members still resolve, while computed or otherwise unproven receivers stay unlinked — re-index after upgrading. (#1566)
 
 
 ## [1.6.0] - 2026-08-26

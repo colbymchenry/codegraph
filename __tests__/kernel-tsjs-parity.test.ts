@@ -110,7 +110,7 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
     }
   });
 
-  it('dynamic receiver extraction parity and silence (#1566)', () => {
+  it('dynamic receiver extraction parity and silence (#1566/#647)', () => {
     const src = `
 function factory() { return { get: () => 1 }; }
 export function dynamic(holder: any, key: string) {
@@ -120,6 +120,9 @@ export function dynamic(holder: any, key: string) {
 export function staticChain(holder: any) {
   holder.values.get("x");
 }
+export function storeCall(useStore: any) {
+  useStore.getState().reset();
+}
 `;
     assertParity('fixtures/dynamic-parity.ts', src, 'typescript');
     const wasmRes = extractFromSource('fixtures/dynamic-parity.ts', src, 'typescript');
@@ -128,9 +131,11 @@ export function staticChain(holder: any) {
       const calls = res.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
       const names = calls.map((c) => c.referenceName);
       expect(names).toContain('holder.values.get');
+      expect(names).toContain('factory().get');
       expect(names).toContain('factory');
+      expect(names).toContain('useStore.getState().reset');
       expect(names).not.toContain('get');
-      expect(names.some((n) => n.includes('factory().'))).toBe(false);
+      expect(names).not.toContain('reset');
       expect(names.some((n) => n.includes('key]'))).toBe(false);
     }
   });
