@@ -265,3 +265,50 @@ fun labeledLambda() {
 }
 
 fun whereClause(): Int where Int : Comparable<Int> = 1
+
+// --- annotation extraction (@Composable component classification) -------------
+// Both arms must agree on: the `component` kind, the persisted `decorators`
+// list AND its order, and the decorates refs. The arg-bearing form used to be
+// dropped entirely (constructor_invocation was not unwrapped).
+@Composable
+fun AnnoComposable() {
+    AnnoQualified()
+}
+
+@Preview(showBackground = true, name = "dark")
+@Composable
+fun AnnoPreviewComposable() {}
+
+@androidx.compose.runtime.Composable
+fun AnnoQualified() {}
+
+@[Suppress("unused") JvmStatic]
+fun annoBracketed() {}
+
+@Deprecated("gone", ReplaceWith("annoBracketed"))
+fun annoNestedArgs() {}
+
+@receiver:Fancy
+fun String.annoUseSite(): String = this.uppercase()
+
+@HiltViewModel
+class AnnoAnnotatedClass {
+    @Composable
+    fun AnnoMember() {}
+}
+
+fun annoHolder(content: @Composable () -> Unit) {
+    content()
+}
+
+@JvmStatic
+expect fun annoExpectPlatform(): String
+
+@Dao
+interface AnnoDao {
+    @Query("SELECT * FROM t")
+    fun annoGetAll(): List<String>
+}
+
+@Serializable
+enum class AnnoSyncKind { FULL, DELTA }

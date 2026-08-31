@@ -303,7 +303,7 @@ export class GraphQueryManager {
    * @returns Array of unreferenced nodes
    */
   findDeadCode(kinds?: Node['kind'][]): Node[] {
-    const targetKinds = kinds || ['function', 'method', 'class'];
+    const targetKinds = kinds || ['function', 'method', 'class', 'component'];
     const deadCode: Node[] = [];
 
     for (const kind of targetKinds) {

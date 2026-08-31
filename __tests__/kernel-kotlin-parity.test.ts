@@ -10,7 +10,8 @@
  * fallback, expect/actual → node DECORATORS (the KMP synthesizer feed),
  * the bodiless-vs-bodied class header asymmetry, comment-glued
  * import/package extents, KDoc dropped-and-chain-breaking docstrings,
- * `@Marker` decorates vs `@Anno(args)` nothing, zero type-annotation refs,
+ * `@Marker` and `@Anno(args)` both emitting decorates and a persisted node
+ * decorator name, zero type-annotation refs,
  * zero instantiates, the #750 capitalized-chain re-encode, paren-then-
  * lambda garbage callees, `${X}`-reads-vs-`$X`-non-reads value refs and the
  * packaged-file target drop) plus a `.kts` script fixture (file-attributed

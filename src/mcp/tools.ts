@@ -6305,6 +6305,14 @@ export class ToolHandler {
     if (node.signature) {
       lines.push(`**Signature:** \`${node.signature}\``);
     }
+    // Annotations/decorators the symbol carries. Framework annotations
+    // (@Composable, @HiltViewModel, @Inject, @app.route) are declared in
+    // libraries outside the index, so their `decorates` edges never resolve —
+    // the name recorded on the node is the only trace, and it answers
+    // "is this injected / a Compose UI / an entity" without reading the file.
+    if (node.decorators && node.decorators.length > 0) {
+      lines.push(`**Annotations:** ${node.decorators.map((d) => `\`@${d}\``).join(' ')}`);
+    }
     lines.push('');
     let embedded = false;
     if (includeCode) {
@@ -7020,6 +7028,14 @@ export class ToolHandler {
 
     if (node.signature) {
       lines.push(`**Signature:** \`${node.signature}\``);
+    }
+    // Annotations/decorators the symbol carries. Framework annotations
+    // (@Composable, @HiltViewModel, @Inject, @app.route) are declared in
+    // libraries outside the index, so their `decorates` edges never resolve —
+    // the name recorded on the node is the only trace, and it answers
+    // "is this injected / a Compose UI / an entity" without reading the file.
+    if (node.decorators && node.decorators.length > 0) {
+      lines.push(`**Annotations:** ${node.decorators.map((d) => `\`@${d}\``).join(' ')}`);
     }
 
     // Only include docstring if it's short and useful

@@ -239,6 +239,11 @@ export const kotlinExtractor: LanguageExtractor = {
     }
     return null;
   },
+  // `@Composable` functions are Jetpack Compose UI components — the Kotlin
+  // analogue of the function-level 'component' nodes the React resolver
+  // creates for JSX-returning functions.
+  annotationKinds: { Composable: 'component' },
+  extendedAnnotations: true,
   classifyClassNode: (node) => {
     // Kotlin reuses class_declaration for classes, interfaces, and enums.
     // Detect by checking for keyword children:

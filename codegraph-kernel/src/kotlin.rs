@@ -13,7 +13,8 @@
 //! initializers emitting nothing, the bodiless-class header re-walk asymmetry,
 //! enum-entry bodies being invisible, KDoc (`multiline_comment`) never being
 //! a docstring AND chain-breaking, comment-gluing into import/package extents,
-//! `@Anno(args)` emitting nothing while `@Anno` emits decorates, zero
+//! `@Anno(args)` and `@Anno` both emitting decorates + a persisted node
+//! decorator name (see ANNOTATION_KINDS / collect_decorator_entries), zero
 //! instantiates refs (constructors are capitalized `calls`), the qualified-
 //! receiver `com::qext` bug, the paren-then-lambda `trailing()` garbage
 //! callee, and the packaged-file value-ref target drop (namespace parents are
@@ -110,6 +111,36 @@ struct Extra {
     /// composeReceiverQualifiedName override (extension methods) — the id
     /// still hashes the bare NAME; only the qualifiedName column changes.
     qualified_override: Option<String>,
+    /// Annotation simple names collected by the caller BEFORE create_node, so
+    /// they can land in the node's `decorators` list (and, for functions and
+    /// methods, decide the node kind). See `collect_decorator_entries`.
+    annotations: Vec<String>,
+}
+
+/// One annotation applied to a declaration. Collected once per declaration and
+/// then read by all three consumers — the kind decision, the node's
+/// `decorators` list, and the `decorates` refs — so they cannot drift apart.
+struct DecoEntry {
+    name: String,
+    line: u32,
+    col: u32,
+}
+
+/// Declarative annotation -> NodeKind map; the Rust mirror of the Kotlin
+/// extractor's `annotationKinds` (src/extraction/languages/kotlin.ts).
+/// `@Composable` functions are Jetpack Compose UI components — the Kotlin
+/// analogue of the function-level `component` nodes the React resolver creates
+/// for JSX-returning functions.
+const ANNOTATION_KINDS: &[(&'static str, &'static str)] = &[("Composable", "component")];
+
+/// First annotation on the declaration that maps to a NodeKind, if any.
+fn annotation_kind_for(entries: &[DecoEntry]) -> Option<&'static str> {
+    entries.iter().find_map(|e| {
+        ANNOTATION_KINDS
+            .iter()
+            .find(|(anno, _)| e.name == *anno)
+            .map(|(_, kind)| *kind)
+    })
 }
 
 struct ValueScope<'t> {
@@ -328,7 +359,10 @@ impl<'t> Walker<'t> {
         // kinds (in-range for this grammar, so practically a no-op — but the
         // hook is part of the contract).
         let mut end_line = node.end_position().row as u32 + 1;
-        if kind == "function" || kind == "method" {
+        // createNode's endLine extension (tree-sitter.ts:1381) — 'component'
+        // included: ANNOTATION_KINDS can reclassify a function or method
+        // (@Composable) and those nodes still have bodies to span.
+        if kind == "function" || kind == "method" || kind == "component" {
             if let Some(body) = self.resolve_body(node) {
                 let be = body.end_position().row as u32 + 1;
                 if be > end_line {
@@ -364,11 +398,18 @@ impl<'t> Walker<'t> {
         }
         // extractModifiers merge (tree-sitter.ts:1355) — runs for EVERY
         // created node: expect/actual platform modifiers → decorators.
-        let mods = self.extract_modifiers(node);
-        let dec_ref: StrRef = match &mods {
-            Some(list) if !list.is_empty() => self.arena.put_list(list),
-            _ => NONE_STR,
-        };
+        let mut deco: Vec<String> = self.extract_modifiers(node).unwrap_or_default();
+        // Annotation names append after the platform modifiers, deduped —
+        // mirroring extractDecoratorsFor's merge on the wasm arm. Framework
+        // annotations (@Composable, @HiltViewModel, @Inject) are declared in
+        // external libraries outside the index, so their `decorates` refs never
+        // resolve; the name on the node is the only queryable trace that lasts.
+        for a in &extra.annotations {
+            if !deco.contains(a) {
+                deco.push(a.clone());
+            }
+        }
+        let dec_ref: StrRef = if deco.is_empty() { NONE_STR } else { self.arena.put_list(&deco) };
         let name_ref = self.arena.put(name);
         let qn_ref = self.arena.put(&qualified);
         let id_ref = self.arena.put(&id);
@@ -409,7 +450,10 @@ impl<'t> Walker<'t> {
             target_id_str: NONE_STR,
         });
 
-        if kind == "function" || kind == "method" {
+        // flushFnRefCandidates' definedHere gate (tree-sitter.ts:684) —
+        // 'component' included: a @Composable is referenced as a plain function
+        // value (`::Header`), so it must pass the fn-ref gate.
+        if kind == "function" || kind == "method" || kind == "component" {
             self.defined_fn_names.insert(name.to_string());
         }
         // captureValueRefScope — namespace parents are NOT accepted, so
@@ -429,7 +473,11 @@ impl<'t> Walker<'t> {
                 *self.fs_value_counts.entry(name.to_string()).or_insert(0) += 1;
             }
         }
-        if matches!(kind, "function" | "method" | "constant" | "variable") {
+        // captureValueRefScope (tree-sitter.ts:808) — 'component' included:
+        // ANNOTATION_KINDS reclassifies @Composable functions and methods, and
+        // their bodies still bound a value-ref scope. Both arms must agree here
+        // or the parity gate fails.
+        if matches!(kind, "function" | "method" | "constant" | "variable" | "component") {
             self.value_scopes.push(ValueScope { row, node, name: name.to_string() });
         }
         Some(row)
@@ -793,6 +841,10 @@ impl<'t> Walker<'t> {
             }
             return;
         }
+        // Annotations are collected BEFORE create_node: they decide the node
+        // kind (@Composable -> component) and ride along into `decorators`.
+        let entries = self.collect_decorator_entries(node);
+        let kind = annotation_kind_for(&entries).unwrap_or("function");
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
             signature: None, // dead hook (zero fields)
@@ -800,13 +852,14 @@ impl<'t> Walker<'t> {
             is_async: Some(self.is_async(node)),
             is_static: Some(false), // kotlin isStatic is always false
             return_type: self.return_type_of(node),
+            annotations: entries.iter().map(|e| e.name.clone()).collect(),
             ..Extra::default()
         };
-        let Some(row) = self.create_node("function", &name, node, extra) else { return };
+        let Some(row) = self.create_node(kind, &name, node, extra) else { return };
         // extractTypeAnnotations: the generic path's field lookups all miss
         // (zero fields) — kotlin emits ZERO type-annotation refs.
-        self.extract_decorators_for(node, row);
-        self.stack.push(Scope { row, kind: "function", name });
+        self.emit_decorator_refs(&entries, row);
+        self.stack.push(Scope { row, kind, name });
         if let Some(body) = self.resolve_body(node) {
             self.visit_function_body(body);
         }
@@ -818,6 +871,8 @@ impl<'t> Walker<'t> {
         let receiver = self.receiver_type_of(node);
         let name = self.extract_name(node);
         let qualified_override = receiver.as_ref().map(|r| format!("{r}::{name}"));
+        let entries = self.collect_decorator_entries(node);
+        let kind = annotation_kind_for(&entries).unwrap_or("method");
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
             signature: None,
@@ -826,8 +881,9 @@ impl<'t> Walker<'t> {
             is_static: Some(false),
             return_type: self.return_type_of(node),
             qualified_override,
+            annotations: entries.iter().map(|e| e.name.clone()).collect(),
         };
-        let Some(row) = self.create_node("method", &name, node, extra) else { return };
+        let Some(row) = self.create_node(kind, &name, node, extra) else { return };
         // Owner-contains fallback (1799): receiver present, not class-like →
         // the FIRST same-file node named like the receiver with kind ∈
         // {struct, class, enum, trait} (interface EXCLUDED; source-order
@@ -857,8 +913,8 @@ impl<'t> Walker<'t> {
             }
         }
         // Type annotations: dead. Decorators: live.
-        self.extract_decorators_for(node, row);
-        self.stack.push(Scope { row, kind: "method", name });
+        self.emit_decorator_refs(&entries, row);
+        self.stack.push(Scope { row, kind, name });
         if let Some(body) = self.resolve_body(node) {
             self.visit_function_body(body);
         }
@@ -869,15 +925,20 @@ impl<'t> Walker<'t> {
         stack_guard!();
         let resolved_body = self.resolve_body(node);
         let name = self.extract_name(node);
+        // Classes persist annotation names (@HiltViewModel, @Entity, …) but are
+        // NOT reclassified by ANNOTATION_KINDS — the wasm arm applies the kind
+        // map to functions and methods only.
+        let entries = self.collect_decorator_entries(node);
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
             visibility: Some(self.visibility_of(node)),
+            annotations: entries.iter().map(|e| e.name.clone()).collect(),
             ..Extra::default()
         };
         let Some(row) = self.create_node("class", &name, node, extra) else { return };
         self.extract_inheritance(node, row);
         // primaryCtor refs: csharp-gated no-op.
-        self.extract_decorators_for(node, row);
+        self.emit_decorator_refs(&entries, row);
         self.stack.push(Scope { row, kind: "class", name });
         // Bodied: ONLY class_body children (primary-ctor properties/defaults
         // invisible). Bodiless: the class node itself → header children
@@ -895,11 +956,16 @@ impl<'t> Walker<'t> {
     fn extract_interface(&mut self, node: Node<'t>) {
         stack_guard!();
         let name = self.extract_name(node);
+        // extractInterface's gated decorator call (tree-sitter.ts:1909) — Room's
+        // `@Dao interface`. Interfaces are NOT reclassified by ANNOTATION_KINDS.
+        let entries = self.collect_decorator_entries(node);
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
+            annotations: entries.iter().map(|e| e.name.clone()).collect(),
             ..Extra::default() // NO visibility
         };
         let Some(row) = self.create_node("interface", &name, node, extra) else { return };
+        self.emit_decorator_refs(&entries, row);
         self.extract_inheritance(node, row);
         self.stack.push(Scope { row, kind: "interface", name });
         let body = self.resolve_body(node).unwrap_or(node);
@@ -915,12 +981,17 @@ impl<'t> Walker<'t> {
         stack_guard!();
         let Some(body) = self.resolve_body(node) else { return };
         let name = self.extract_name(node);
+        // extractEnum's gated decorator call (tree-sitter.ts:2013) —
+        // `@Serializable enum class`. Same gating rationale as interfaces.
+        let entries = self.collect_decorator_entries(node);
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
             visibility: Some(self.visibility_of(node)),
+            annotations: entries.iter().map(|e| e.name.clone()).collect(),
             ..Extra::default()
         };
         let Some(row) = self.create_node("enum", &name, node, extra) else { return };
+        self.emit_decorator_refs(&entries, row);
         self.extract_inheritance(node, row);
         self.stack.push(Scope { row, kind: "enum", name });
         for i in 0..body.named_child_count() {
@@ -1159,23 +1230,31 @@ impl<'t> Walker<'t> {
         }
     }
 
-    /// extractDecoratorsFor — kotlin annotations inside `modifiers`:
-    /// `@Marker` (user_type child) → decorates ref; `@Anno(args)`
-    /// (constructor_invocation) → NOTHING. Runs for functions/methods/classes
-    /// only (hook properties never call it).
-    fn extract_decorators_for(&mut self, decl: Node<'t>, decorated_row: u32) {
+    /// extractDecoratorsFor — gather kotlin annotations from `modifiers` and
+    /// from decorator-position preceding siblings. PURE, so the kind decision,
+    /// the node's `decorators` list and the `decorates` refs all read the same
+    /// entries. Runs for functions/methods/classes only (hook properties never
+    /// call it).
+    ///
+    /// Mirrors the wasm arm's `extendedAnnotations` opt-in (kotlin.ts):
+    /// `constructor_invocation` is unwrapped so `@Preview(showBackground =
+    /// true)` is no longer silently dropped, and EVERY target under one
+    /// annotation node is collected, for bracket syntax
+    /// (`@[Suppress("x") JvmStatic]`).
+    fn collect_decorator_entries(&self, decl: Node<'t>) -> Vec<DecoEntry> {
+        let mut out: Vec<DecoEntry> = Vec::new();
         for i in 0..decl.named_child_count() {
             let Some(child) = decl.named_child(i) else { continue };
-            self.consider_decorator(child, decorated_row);
+            self.consider_decorator_into(child, &mut out);
             if child.kind() == "modifiers" {
                 for j in 0..child.named_child_count() {
                     if let Some(m) = child.named_child(j) {
-                        self.consider_decorator(m, decorated_row);
+                        self.consider_decorator_into(m, &mut out);
                     }
                 }
             }
         }
-        let Some(parent) = decl.parent() else { return };
+        let Some(parent) = decl.parent() else { return out };
         let decl_start = decl.start_byte();
         let mut decl_idx: isize = -1;
         for i in 0..parent.named_child_count() {
@@ -1196,40 +1275,53 @@ impl<'t> Walker<'t> {
                 if !matches!(sib.kind(), "decorator" | "annotation" | "marker_annotation") {
                     break;
                 }
-                self.consider_decorator(sib, decorated_row);
+                self.consider_decorator_into(sib, &mut out);
                 j -= 1;
             }
         }
+        out
     }
 
-    fn consider_decorator(&mut self, n: Node<'t>, decorated_row: u32) {
+    /// Emit one `decorates` ref per collected entry, from the node the
+    /// annotations were collected for.
+    fn emit_decorator_refs(&mut self, entries: &[DecoEntry], decorated_row: u32) {
+        let code = edge_kind_index("decorates").unwrap();
+        for e in entries {
+            let (name, line, col) = (e.name.clone(), e.line, e.col);
+            self.push_ref(decorated_row, &name, code, line, col);
+        }
+    }
+
+    fn consider_decorator_into(&self, n: Node<'t>, out: &mut Vec<DecoEntry>) {
         if !matches!(n.kind(), "decorator" | "annotation" | "marker_annotation" | "attribute") {
             return;
         }
-        let mut target: Option<Node> = None;
+        let line = self.line_of(n);
+        let col = self.col_of(n);
         for i in 0..n.named_child_count() {
             let Some(child) = n.named_child(i) else { continue };
-            if child.kind() == "call_expression" {
-                target = child.child_by_field_name("function").or_else(|| child.named_child(0));
-                if target.is_some() {
-                    break;
-                }
-            }
-            if matches!(
+            let target: Option<Node> = if child.kind() == "call_expression" {
+                child.child_by_field_name("function").or_else(|| child.named_child(0))
+            } else if child.kind() == "constructor_invocation" {
+                (0..child.named_child_count())
+                    .filter_map(|j| child.named_child(j))
+                    .find(|c| c.kind() == "user_type")
+            } else if matches!(
                 child.kind(),
                 "identifier" | "member_expression" | "scoped_identifier" | "navigation_expression"
                     | "user_type" | "type_identifier"
             ) {
-                target = Some(child);
-                break;
+                Some(child)
+            } else {
+                None
+            };
+            let Some(target) = target else { continue };
+            let name = strip_generic_and_qualifier(self.text(target));
+            if name.is_empty() {
+                continue;
             }
+            out.push(DecoEntry { name, line, col });
         }
-        let Some(target) = target else { return };
-        let name = strip_generic_and_qualifier(self.text(target));
-        if name.is_empty() {
-            return;
-        }
-        self.push_ref_at(decorated_row, &name, edge_kind_index("decorates").unwrap(), n);
     }
 
     // --- function-as-value refs (KOTLIN_SPEC, function-ref.ts:240) ------------------
