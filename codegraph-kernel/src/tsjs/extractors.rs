@@ -1064,20 +1064,16 @@ impl<'t> Walker<'t> {
                         if is_literal_receiver(r.kind()) {
                             return;
                         }
-                    }
-                    let recv_ident = receiver.filter(|r| {
-                        matches!(r.kind(), "identifier" | "simple_identifier" | "field_identifier")
-                    });
-                    if let Some(r) = recv_ident {
-                        let receiver_name = self.text(r);
-                        if !matches!(receiver_name, "self" | "this" | "cls" | "super") {
-                            callee_name = format!("{receiver_name}.{method_name}");
+                        if let Some(chain) = get_static_member_chain(r, self.src) {
+                            if !matches!(chain.as_str(), "self" | "this" | "cls" | "super") {
+                                callee_name = format!("{chain}.{method_name}");
+                            } else {
+                                callee_name = method_name.to_string();
+                            }
                         } else {
                             callee_name = method_name.to_string();
                         }
                     } else {
-                        // (the call-receiver re-encode branches are other
-                        // languages'; TS/JS keeps the bare method name)
                         callee_name = method_name.to_string();
                     }
                 }
@@ -1335,3 +1331,37 @@ fn collapse_ws(s: &str) -> String {
     }
     out
 }
+
+/// Recursively extract a static dotted member chain (`a.b.c`, `this.field`, `holder.values`)
+/// from an AST node, or return None if any part of the chain is dynamic, computed,
+/// or a call expression (#1566).
+fn get_static_member_chain<'t>(node: Node<'t>, source: &'t str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "property_identifier" | "simple_identifier" | "field_identifier"
+        | "this" | "super" => {
+            source.get(node.byte_range()).map(|s| s.to_string())
+        }
+        "member_expression" => {
+            let object = node
+                .child_by_field_name("object")
+                .or_else(|| node.named_child(0))?;
+            let property = node
+                .child_by_field_name("property")
+                .or_else(|| node.child_by_field_name("field"))
+                .or_else(|| node.named_child(1))?;
+            let obj_text = get_static_member_chain(object, source)?;
+            let prop_kind = property.kind();
+            if matches!(
+                prop_kind,
+                "property_identifier" | "identifier" | "private_property_identifier"
+            ) {
+                let prop_text = source.get(property.byte_range())?;
+                Some(format!("{obj_text}.{prop_text}"))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+

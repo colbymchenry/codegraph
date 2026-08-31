@@ -388,6 +388,40 @@ const LITERAL_RECEIVER_TYPES = new Set([
   'dictionary', 'dict_literal', 'object', 'tuple', 'set',
 ]);
 
+/**
+ * Recursively extract a static dotted member chain (`a.b.c`, `this.field`, `holder.values`)
+ * from an AST node, or return null if any part of the chain is dynamic, computed,
+ * or a call expression (#1566).
+ */
+function getStaticMemberChain(node: SyntaxNode, source: string): string | null {
+  if (
+    node.type === 'identifier' ||
+    node.type === 'property_identifier' ||
+    node.type === 'simple_identifier' ||
+    node.type === 'field_identifier' ||
+    node.type === 'this' ||
+    node.type === 'super'
+  ) {
+    return getNodeText(node, source);
+  }
+  if (node.type === 'member_expression') {
+    const object = getChildByField(node, 'object') || node.namedChild(0);
+    const property = getChildByField(node, 'property') || getChildByField(node, 'field') || node.namedChild(1);
+    if (!object || !property) return null;
+    const objText = getStaticMemberChain(object, source);
+    const propText =
+      property.type === 'property_identifier' ||
+      property.type === 'identifier' ||
+      property.type === 'private_property_identifier'
+        ? getNodeText(property, source)
+        : null;
+    if (objText && propText) {
+      return `${objText}.${propText}`;
+    }
+  }
+  return null;
+}
+
 export class TreeSitterExtractor {
   private filePath: string;
   private language: Language;
@@ -4445,7 +4479,30 @@ export class TreeSitterExtractor {
               return;
             }
             const SKIP_RECEIVERS = new Set(['self', 'this', 'cls', 'super']);
-            if (receiver && (receiver.type === 'identifier' || receiver.type === 'simple_identifier' || receiver.type === 'field_identifier')) {
+            if (
+              (this.language === 'typescript' ||
+                this.language === 'javascript' ||
+                this.language === 'tsx' ||
+                this.language === 'jsx' ||
+                this.language === 'arkts') &&
+              receiver
+            ) {
+              // TS/JS/ArkTS: preserve static member expression chains
+              // (`holder.values.get`, `this.store.get`, `this.mailer.send`)
+              // so resolution does not lose receiver context and fall back to
+              // bare-name guessing (#1566/#1496). Dynamic/computed/call-result
+              // receivers keep the bare method name.
+              const chain = getStaticMemberChain(receiver, this.source);
+              if (chain) {
+                if (!SKIP_RECEIVERS.has(chain)) {
+                  calleeName = `${chain}.${methodName}`;
+                } else {
+                  calleeName = methodName;
+                }
+              } else {
+                calleeName = methodName;
+              }
+            } else if (receiver && (receiver.type === 'identifier' || receiver.type === 'simple_identifier' || receiver.type === 'field_identifier')) {
               const receiverName = getNodeText(receiver, this.source);
               if (!SKIP_RECEIVERS.has(receiverName)) {
                 calleeName = `${receiverName}.${methodName}`;

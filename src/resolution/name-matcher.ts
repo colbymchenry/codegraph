@@ -1826,9 +1826,12 @@ export function matchMethodCall(
         'instance-method',
         importedFqn,
       ));
-      if (typedMatch) {
-        return typedMatch;
-      }
+      // Precision boundary: when receiver typing identifies a concrete type for
+      // the receiver variable, resolution must succeed on that type. If the type
+      // does not declare the method in the project (e.g. built-in Map/Set, an
+      // external package, or non-matching class), the call stays unresolved
+      // rather than falling through to bare-name method guessing (#1566/#1108).
+      return typedMatch;
     }
   }
 
@@ -1881,10 +1884,26 @@ export function matchMethodCall(
         'instance-method',
         importedFqn,
       ));
-      if (typedMatch) {
-        return typedMatch;
-      }
+      return typedMatch;
     }
+  }
+
+  // TypeScript / JavaScript / ArkTS chained receiver `a.b.method()` / `this.field.method()` (#1566):
+  // When the receiver is a multi-segment chain, resolve only through validated
+  // type inference or exact object/class match above. Chained TS/JS receivers must
+  // never fall through to the bare-name / method-name uniqueness guessing in
+  // Strategy 2/3 below — that is how `holder.values.get()` or `this.store.get()`
+  // fabricated dependencies on unrelated project methods (or self-edges).
+  if (
+    (ref.language === 'typescript' ||
+      ref.language === 'javascript' ||
+      ref.language === 'tsx' ||
+      ref.language === 'jsx' ||
+      ref.language === 'arkts') &&
+    dotMatch &&
+    objectOrClass!.includes('.')
+  ) {
+    return null;
   }
 
   // Object-literal namespace receiver (#1573): `api.call()` where `api` is a

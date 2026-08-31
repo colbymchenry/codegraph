@@ -3075,6 +3075,131 @@ export function callFromImportedFile(): void {
     }, 30000);
   });
 
+  describe('TypeScript built-in receiver resolution and nested receiver safety (#1566)', () => {
+    // Calls to built-in Map.get/set/has (and other external/standard types) must
+    // not resolve to unrelated same-named project methods when the project
+    // defines a single method with each name.
+    // - Simple local receiver `values.get()`: once receiver typing identifies `Map`,
+    //   failure to find a project method stays unresolved rather than falling
+    //   through to confidence-0.7 unique method name guessing.
+    // - Nested receiver `holder.values.get()` / `this.store.get()`: the static member
+    //   chain is preserved and multi-segment TS/JS receivers stay unresolved
+    //   when receiver type cannot be proven, eliminating false edges and self-edges.
+    // - Positive controls: `cache.get()` on constructed `new LRUCache()` and typed
+    //   parameter `cache: LRUCache` continue to resolve correctly to `LRUCache::get`.
+    it('built-in Map methods and nested receivers do not link to LRUCache, while true project instances resolve correctly', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'repro.ts'),
+          `export class LRUCache {
+  private store = new Map<string, string>();
+
+  get(key: string): string | undefined {
+    return this.store.get(key);
+  }
+
+  set(key: string, value: string): void {
+    this.store.set(key, value);
+  }
+
+  has(key: string): boolean {
+    return this.store.has(key);
+  }
+}
+
+export function useLocalMap(): boolean {
+  const values = new Map<string, string>();
+  values.set("answer", "42");
+  values.get("answer");
+  return values.has("answer");
+}
+
+export function useNestedMap(
+  holder: { values: Map<string, string> },
+): string | undefined {
+  return holder.values.get("answer");
+}
+
+export function useProjectCache(cache: LRUCache): boolean {
+  cache.set("answer", "42");
+  cache.get("answer");
+  return cache.has("answer");
+}
+
+export function useConstructedProjectCache(): boolean {
+  const cache = new LRUCache();
+  cache.set("answer", "42");
+  cache.get("answer");
+  return cache.has("answer");
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('repro.ts');
+        const lruGet = allNodes.find((n) => n.kind === 'method' && n.name === 'get');
+        const lruSet = allNodes.find((n) => n.kind === 'method' && n.name === 'set');
+        const lruHas = allNodes.find((n) => n.kind === 'method' && n.name === 'has');
+
+        expect(lruGet).toBeDefined();
+        expect(lruSet).toBeDefined();
+        expect(lruHas).toBeDefined();
+
+        // 1. Callers of LRUCache::get: only true project callers (positive controls)
+        const callersGet = await cg.getCallers(lruGet!.id);
+        const getCallerNames = callersGet.map((c) => c.node.name).sort();
+        expect(getCallerNames).toEqual(['useConstructedProjectCache', 'useProjectCache']);
+        expect(getCallerNames).not.toContain('useLocalMap');
+        expect(getCallerNames).not.toContain('useNestedMap');
+        expect(getCallerNames).not.toContain('get'); // No self-edge from this.store.get
+
+        // 2. Callers of LRUCache::set
+        const callersSet = await cg.getCallers(lruSet!.id);
+        const setCallerNames = callersSet.map((c) => c.node.name).sort();
+        expect(setCallerNames).toEqual(['useConstructedProjectCache', 'useProjectCache']);
+        expect(setCallerNames).not.toContain('useLocalMap');
+        expect(setCallerNames).not.toContain('set');
+
+        // 3. Callers of LRUCache::has
+        const callersHas = await cg.getCallers(lruHas!.id);
+        const hasCallerNames = callersHas.map((c) => c.node.name).sort();
+        expect(hasCallerNames).toEqual(['useConstructedProjectCache', 'useProjectCache']);
+        expect(hasCallerNames).not.toContain('useLocalMap');
+        expect(hasCallerNames).not.toContain('has');
+
+        // 4. Callees of useLocalMap and useNestedMap: zero calls to LRUCache methods
+        const useLocalMapFn = allNodes.find((n) => n.kind === 'function' && n.name === 'useLocalMap');
+        const useNestedMapFn = allNodes.find((n) => n.kind === 'function' && n.name === 'useNestedMap');
+
+        const localMapCallees = await cg.getCallees(useLocalMapFn!.id);
+        expect(localMapCallees.filter((c) => c.node.qualifiedName.startsWith('LRUCache'))).toHaveLength(0);
+
+        const nestedMapCallees = await cg.getCallees(useNestedMapFn!.id);
+        expect(nestedMapCallees.filter((c) => c.node.qualifiedName.startsWith('LRUCache'))).toHaveLength(0);
+
+        // 5. Positive recall controls: useConstructedProjectCache and useProjectCache have method call edges
+        const useProjectCacheFn = allNodes.find((n) => n.kind === 'function' && n.name === 'useProjectCache');
+        const projectCacheCallees = await cg.getCallees(useProjectCacheFn!.id);
+        const projectMethodCallees = projectCacheCallees.filter((c) => c.node.kind === 'method').map((c) => c.node.name).sort();
+        expect(projectMethodCallees).toEqual(['get', 'has', 'set']);
+
+        const constructedCacheCallees = await cg.getCallees(
+          allNodes.find((n) => n.kind === 'function' && n.name === 'useConstructedProjectCache')!.id
+        );
+        const constructedMethodCallees = constructedCacheCallees.filter((c) => c.node.kind === 'method').map((c) => c.node.name).sort();
+        expect(constructedMethodCallees).toEqual(['get', 'has', 'set']);
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+  });
+
   describe('Object-literal namespace members (#1573)', () => {
     // `export const api = { call() {…}, get: () => {…} }` used as the module's
     // API surface: the members are plain functions with bare names inside the

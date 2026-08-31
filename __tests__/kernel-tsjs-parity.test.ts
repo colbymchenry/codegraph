@@ -97,7 +97,17 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
 
   it('torture fixture (tsx): components, stores, RTK, fn-refs, value-refs, decorators', () => {
     const file = path.join(FIXTURE_DIR, 'torture.tsx');
-    assertParity('fixtures/torture.tsx', fs.readFileSync(file, 'utf8'), 'tsx');
+    const content = fs.readFileSync(file, 'utf8');
+    assertParity('fixtures/torture.tsx', content, 'tsx');
+
+    // Semantic check (#1566): BaseService::list preserves `this.cache.get` instead of bare `get`
+    const wasmRes = extractFromSource('fixtures/torture.tsx', content, 'tsx');
+    const kernelRes = tryKernelExtract('fixtures/torture.tsx', content, 'tsx')!;
+    for (const res of [wasmRes, kernelRes]) {
+      const calls = res.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+      expect(calls.map((c) => c.referenceName)).toContain('this.cache.get');
+      expect(calls.map((c) => c.referenceName)).not.toContain('get');
+    }
   });
 
   it('torture fixture (js): field methods, wrappers, vuex module shape', () => {

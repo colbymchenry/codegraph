@@ -11918,4 +11918,48 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'Widget')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'size')).toBe(true);
   });
+
+  describe('TypeScript/JavaScript nested receiver extraction (#1566)', () => {
+    it('preserves static receiver chains and leaves dynamic expressions as bare method names', () => {
+      const src = `
+export class TestClass {
+  private store = new Map<string, string>();
+  testMethod(holder: any) {
+    // Simple local receiver
+    const values = new Map<string, string>();
+    values.get("key");
+
+    // Nested member chains
+    holder.values.get("key");
+    this.store.get("key");
+    this.mailer.send("msg");
+    a.b.c.d("call");
+
+    // Direct this call
+    this.testMethod(null);
+
+    // Dynamic / computed / call-result expressions
+    holder[key].get("key");
+    factory().get("key");
+  }
+}
+`;
+      const result = extractFromSource('test.ts', src, 'typescript');
+      const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+      const refNames = refs.map((r) => r.referenceName);
+
+      expect(refNames).toContain('values.get');
+      expect(refNames).toContain('holder.values.get');
+      expect(refNames).toContain('this.store.get');
+      expect(refNames).toContain('this.mailer.send');
+      expect(refNames).toContain('a.b.c.d');
+      expect(refNames).toContain('testMethod'); // direct this.testMethod -> bare method
+
+      // Dynamic / computed expressions do not fabricate static chains
+      expect(refNames.filter((r) => r === 'get').length).toBe(2); // holder[key].get and factory().get
+      expect(refNames.some((r) => r.includes('factory().'))).toBe(false);
+      expect(refNames.some((r) => r.includes('key]'))).toBe(false);
+    });
+  });
 });
+
