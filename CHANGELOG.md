@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Calls on built-in and external TypeScript/JavaScript receivers (such as `Map.get`, `Map.set`, `Map.has`) no longer resolve to unrelated same-named project methods; static and call-result receiver context is preserved so proven project members still resolve, while computed or otherwise unproven receivers stay unlinked — re-index after upgrading. (#1566)
+
 
 ## [1.6.0] - 2026-08-26
 

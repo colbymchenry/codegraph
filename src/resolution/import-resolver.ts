@@ -13,6 +13,7 @@ import { resolveWorkspaceImport } from './workspace-packages';
 import {
   resolveMethodOnType,
   resolveObjectLiteralMember,
+  parseCallResultMemberReference,
   localReceiverTypePatterns,
   normalizeInferredTypeName,
 } from './name-matcher';
@@ -1554,6 +1555,12 @@ export function resolveViaImport(
             // landed on the constant — every cross-file caller of the method
             // went missing. Resolve the member by containment instead.
             if (targetNode.kind === 'constant' || targetNode.kind === 'variable') {
+              const callResult = parseCallResultMemberReference(ref);
+              if (callResult) {
+                const literalMember = resolveObjectLiteralMember(targetNode, callResult.methodName, ref, context, 0.9, 'import');
+                if (literalMember) return literalMember;
+                return null;
+              }
               const member = ref.referenceName.slice(imp.localName.length + 1).split('.')[0];
               if (member) {
                 const literalMember = resolveObjectLiteralMember(targetNode, member, ref, context, 0.9, 'import');

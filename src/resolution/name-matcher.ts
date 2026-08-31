@@ -5,7 +5,7 @@
  */
 
 import { Language, Node } from '../types';
-import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
+import { UnresolvedRef, ResolvedRef, ResolutionContext, DeferredTypedReceiverRef } from './types';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -1222,6 +1222,560 @@ function inferJavaFieldReceiverType(
   return lastPart;
 }
 
+const SUPERTYPE_BEARING_KINDS = new Set<Node['kind']>([
+  'class',
+  'struct',
+  'interface',
+  'trait',
+  'protocol',
+  'enum',
+  'union',
+  'type_alias',
+]);
+
+function normalizePathForComparison(p: string): string {
+  return p.replace(/\\/g, '/').toLowerCase();
+}
+
+/**
+ * Infer the declared or initialized type of a `this.<field>` receiver in TypeScript/JavaScript (#1566/#1496).
+ * Looks up the property/field on the enclosing class within the call site's file, verifying direct ownership.
+ */
+export function inferTsJsFieldReceiverType(
+  receiverName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  if (!receiverName.startsWith('this.')) return null;
+  const fieldName = receiverName.slice('this.'.length);
+  if (!fieldName || fieldName.includes('.')) return null;
+
+  const inFile = context.getNodesInFile(ref.filePath);
+  if (inFile.length === 0) return null;
+
+  // Find the class enclosing the call line (tightest match by latest start).
+  let enclosing: Node | null = null;
+  for (const n of inFile) {
+    if (n.kind !== 'class' && n.kind !== 'interface') continue;
+    if (n.language !== ref.language && !sameLanguageFamily(n.language, ref.language)) continue;
+    const end = n.endLine ?? n.startLine;
+    if (n.startLine <= ref.line && end >= ref.line) {
+      if (!enclosing || n.startLine >= enclosing.startLine) enclosing = n;
+    }
+  }
+  if (!enclosing) return null;
+
+  const enclosingEnd = enclosing.endLine ?? enclosing.startLine;
+  const field = inFile.find(
+    (n) =>
+      (n.kind === 'property' || n.kind === 'field') &&
+      n.name === fieldName &&
+      (n.language === ref.language || sameLanguageFamily(n.language, ref.language)) &&
+      (n.qualifiedName === `${enclosing!.qualifiedName}::${fieldName}` ||
+        n.qualifiedName === `${enclosing!.qualifiedName}.${fieldName}` ||
+        (n.startLine >= enclosing!.startLine &&
+          (n.endLine ?? n.startLine) <= enclosingEnd &&
+          !inFile.some(
+            (other) =>
+              other.id !== enclosing!.id &&
+              (other.kind === 'class' || other.kind === 'interface') &&
+              other.startLine >= enclosing!.startLine &&
+              (other.endLine ?? other.startLine) <= enclosingEnd &&
+              n.startLine >= other.startLine &&
+              (n.endLine ?? n.startLine) <= (other.endLine ?? other.startLine)
+          )))
+  );
+  const lines = context.getFileLines ? context.getFileLines(ref.filePath) : null;
+  if (!field) {
+    if (lines) {
+      const constructors = inFile.filter(
+        (n) =>
+          (n.kind === 'method' || n.kind === 'function') &&
+          n.name === 'constructor' &&
+          (n.qualifiedName === `${enclosing!.qualifiedName}::constructor` ||
+            n.qualifiedName === `${enclosing!.qualifiedName}.constructor`)
+      );
+
+      if (constructors.length === 1) {
+        const ctor = constructors[0]!;
+        const ctorStart = Math.max(0, ctor.startLine - 1);
+        const ctorEnd = Math.min(lines.length, ctor.endLine ?? ctor.startLine);
+        const paramPropRegex = new RegExp(
+          `\\b(?:private|protected|public|readonly)\\s+(?:(?:private|protected|public|readonly)\\s+)?${fieldName}\\s*:\\s*([A-Z][a-zA-Z0-9_$]*)`,
+        );
+        for (let i = ctorStart; i < ctorEnd; i++) {
+          const line = lines[i];
+          if (line && line.length <= 10_000) {
+            const m = line.match(paramPropRegex);
+            if (m && m[1]) return m[1];
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  if (field.signature && field.signature !== field.name) {
+    // Signature format: "<TypeName> <fieldName>" (from TS property extraction)
+    const beforeName = field.signature.slice(0, field.signature.lastIndexOf(field.name)).trim();
+    if (beforeName) {
+      const typeNoGenerics = beforeName.replace(/<[^>]*>/g, '').trim();
+      const typeNoArray = typeNoGenerics.replace(/\[\s*\]/g, '').trim();
+      const parts = typeNoArray.split(/[.\s]+/).filter(Boolean);
+      const lastPart = parts[parts.length - 1];
+      if (lastPart && /^[A-Z]/.test(lastPart)) {
+        return lastPart;
+      }
+    }
+  }
+
+  // If un-annotated, check field declaration line for `= new Type(...)`
+  if (lines && field.startLine <= lines.length) {
+    const lineText = lines[field.startLine - 1];
+    if (lineText) {
+      const initMatch = lineText.match(/=\s*new\s+([A-Z][a-zA-Z0-9_$]*)/);
+      if (initMatch && initMatch[1]) {
+        return initMatch[1];
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Bind an inferred type name to an authoritative visible project type node in the project graph (#1566).
+ * Returns the exact Node or null if external / unresolvable / ambiguous.
+ */
+export function bindProjectReceiverType(
+  inferredType: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): Node | null {
+  const isWebFamily =
+    ref.language === 'typescript' ||
+    ref.language === 'tsx' ||
+    ref.language === 'javascript' ||
+    ref.language === 'jsx' ||
+    ref.language === 'arkts';
+
+  if (isWebFamily) {
+    // Case A: same-file aggregate node (checked in file or by name with matching filePath)
+    const normCallerPath = normalizePathForComparison(ref.filePath);
+    const inFileCandidates = context
+      .getNodesInFile(ref.filePath)
+      .filter(
+        (n) =>
+          SUPERTYPE_BEARING_KINDS.has(n.kind) &&
+          n.name === inferredType &&
+          (n.language === ref.language || sameLanguageFamily(n.language, ref.language))
+      );
+    const sameFileCandidates =
+      inFileCandidates.length > 0
+        ? inFileCandidates
+        : context.getNodesByName(inferredType).filter(
+            (n) =>
+              SUPERTYPE_BEARING_KINDS.has(n.kind) &&
+              normalizePathForComparison(n.filePath) === normCallerPath &&
+              (n.language === ref.language || sameLanguageFamily(n.language, ref.language))
+          );
+
+    if (sameFileCandidates.length === 1) {
+      return sameFileCandidates[0]!;
+    } else if (sameFileCandidates.length > 1) {
+      return null;
+    }
+
+    // Case B / C: check imports in caller file
+    const imports = context.getImportMappings ? context.getImportMappings(ref.filePath, ref.language) : [];
+    const mapping = imports.find((i) => i.localName === inferredType);
+    if (mapping) {
+      const resolvedPath =
+        mapping.resolvedPath ??
+        context.resolveImportPath?.(mapping.source, ref.filePath, ref.language);
+      if (resolvedPath) {
+        const normResolved = normalizePathForComparison(resolvedPath);
+        const targetNodes = context.getNodesInFile(resolvedPath).concat(
+          context.getNodesByName(mapping.exportedName || mapping.localName)
+        );
+        const importedNode = targetNodes.find(
+          (n) =>
+            SUPERTYPE_BEARING_KINDS.has(n.kind) &&
+            (n.name === mapping.exportedName || n.name === mapping.localName || mapping.isDefault) &&
+            normalizePathForComparison(n.filePath) === normResolved &&
+            (n.language === ref.language || sameLanguageFamily(n.language, ref.language))
+        );
+        if (importedNode) return importedNode;
+      }
+      // Case C: External SDK import (resolvedPath is null / undefined)
+      return null;
+    }
+
+    // Case D: Built-in / unimported global type (e.g. `new Map()`)
+    return null;
+  }
+
+  // Non-web languages (Java, Kotlin, C++, C#, Go, Rust, Swift, etc.):
+  const inFile = context.getNodesInFile(ref.filePath);
+  const sameFileCandidates = inFile.filter(
+    (n) =>
+      SUPERTYPE_BEARING_KINDS.has(n.kind) &&
+      n.name === inferredType &&
+      (n.language === ref.language || sameLanguageFamily(n.language, ref.language))
+  );
+  if (sameFileCandidates.length === 1) {
+    return sameFileCandidates[0]!;
+  } else if (sameFileCandidates.length > 1) {
+    return null;
+  }
+
+  const imports = context.getImportMappings ? context.getImportMappings(ref.filePath, ref.language) : [];
+  const mapping = imports.find((i) => i.localName === inferredType);
+  if (mapping) {
+    const resolvedPath =
+      mapping.resolvedPath ??
+      context.resolveImportPath?.(mapping.source, ref.filePath, ref.language);
+    if (resolvedPath) {
+      const normResolved = normalizePathForComparison(resolvedPath);
+      const importedNode = context
+        .getNodesByName(mapping.exportedName || mapping.localName)
+        .find(
+          (n) =>
+            SUPERTYPE_BEARING_KINDS.has(n.kind) &&
+            normalizePathForComparison(n.filePath) === normResolved &&
+            (n.language === ref.language || sameLanguageFamily(n.language, ref.language))
+        );
+      if (importedNode) return importedNode;
+    }
+  }
+
+  const candidates = context
+    .getNodesByName(inferredType)
+    .filter(
+      (n) =>
+        SUPERTYPE_BEARING_KINDS.has(n.kind) &&
+        (n.language === ref.language || sameLanguageFamily(n.language, ref.language))
+    );
+  if (candidates.length === 1) {
+    return candidates[0]!;
+  }
+
+  return null;
+}
+
+/**
+ * Find all callable candidate nodes directly owned by a specific type node (no supertype walk) (#1566).
+ * Direct ownership is strictly verified via exact qualifiedName (`${typeNode.qualifiedName}::${methodName}`
+ * or `${typeNode.qualifiedName}.${methodName}`).
+ */
+export function getDirectCallableCandidatesOnTypeNode(
+  typeNode: Node,
+  methodName: string,
+  _ref: UnresolvedRef,
+  context: ResolutionContext,
+): Node[] {
+  const acceptedQualifiedNames = new Set([
+    `${typeNode.qualifiedName}::${methodName}`,
+    `${typeNode.qualifiedName}.${methodName}`,
+  ]);
+
+  const exactCandidates = context
+    .getNodesByName(methodName)
+    .filter(
+      (m) =>
+        (m.kind === 'method' || m.kind === 'function') &&
+        (m.language === typeNode.language || sameLanguageFamily(m.language, typeNode.language)) &&
+        acceptedQualifiedNames.has(m.qualifiedName)
+    );
+
+  const sameFileCandidates = exactCandidates.filter((m) => m.filePath === typeNode.filePath);
+  if (sameFileCandidates.length > 0) {
+    return sameFileCandidates;
+  }
+
+  return exactCandidates;
+}
+
+/**
+ * Resolve a method directly declared on a specific type node (no supertype walk) (#1566).
+ */
+export function resolveMethodOnTypeNode(
+  typeNode: Node,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  confidence: number = 0.9,
+  resolvedBy: ResolvedRef['resolvedBy'] = 'instance-method',
+): ResolvedRef | null {
+  const candidates = getDirectCallableCandidatesOnTypeNode(typeNode, methodName, ref, context);
+  const unique = [...new Map(candidates.map((m) => [m.id, m])).values()];
+
+  if (unique.length === 1) {
+    return {
+      original: ref,
+      targetNodeId: unique[0]!.id,
+      confidence,
+      resolvedBy,
+    };
+  }
+
+  return null;
+}
+
+export interface ParsedMethodCall {
+  receiver: string;
+  methodName: string;
+  syntax: 'dot' | 'cpp-operator' | 'scope' | 'lua-colon' | 'r-dollar';
+  inferableReceiver: boolean;
+}
+
+/**
+ * Canonical parser for method call reference shapes (#1566).
+ */
+export function parseMethodCallReference(ref: UnresolvedRef): ParsedMethodCall | null {
+  if (ref.referenceKind !== 'calls') return null;
+
+  // C++ explicit operator call `a.operator+(b)` reaches the resolver as `a.operator+` (#1247)
+  if (ref.language === 'cpp') {
+    const opMatch = ref.referenceName.match(/^([\w.]+)\.(operator[^\w\s.]+)$/);
+    if (opMatch && opMatch[1] && opMatch[2]) {
+      return {
+        receiver: opMatch[1],
+        methodName: opMatch[2],
+        syntax: 'cpp-operator',
+        inferableReceiver: true,
+      };
+    }
+  }
+
+  // Lua/Luau method calls use a single colon (`lg:log`)
+  if (ref.language === 'lua' || ref.language === 'luau') {
+    const luaMatch = ref.referenceName.match(/^([\w.]+):(\w+)$/);
+    if (luaMatch && luaMatch[1] && luaMatch[2]) {
+      return {
+        receiver: luaMatch[1],
+        methodName: luaMatch[2],
+        syntax: 'lua-colon',
+        inferableReceiver: true,
+      };
+    }
+  }
+
+  // R uses `$` (`lg$log`)
+  if (ref.language === 'r') {
+    const rMatch = ref.referenceName.match(/^([\w.]+)\$(\w+)$/);
+    if (rMatch && rMatch[1] && rMatch[2]) {
+      return {
+        receiver: rMatch[1],
+        methodName: rMatch[2],
+        syntax: 'r-dollar',
+        inferableReceiver: true,
+      };
+    }
+  }
+
+  // Plain dot: `obj.method`, `builder.Services.AddCoreServices`, or Objective-C selectors `setX:y:`
+  const dotMatch = ref.referenceName.match(/^([\w.]+)\.(\w+:?(?:\w+:)*)$/);
+  if (dotMatch && dotMatch[1] && dotMatch[2]) {
+    return {
+      receiver: dotMatch[1],
+      methodName: dotMatch[2],
+      syntax: 'dot',
+      inferableReceiver: true,
+    };
+  }
+
+  // Scope: `Class::method`
+  const colonMatch = ref.referenceName.match(/^(\w+)::(\w+)$/);
+  if (colonMatch && colonMatch[1] && colonMatch[2]) {
+    return {
+      receiver: colonMatch[1],
+      methodName: colonMatch[2],
+      syntax: 'scope',
+      inferableReceiver: false,
+    };
+  }
+
+  return null;
+}
+
+export interface ParsedCallResultMember {
+  calleeChain: string;
+  methodName: string;
+}
+
+/**
+ * Parse call-result member references like `useStore.getState().reset`, `get().reset`, `factory().get` (#1566/#647).
+ */
+export function parseCallResultMemberReference(ref: UnresolvedRef): ParsedCallResultMember | null {
+  if (ref.referenceKind !== 'calls') return null;
+  const m = ref.referenceName.match(/^(.+)\(\)\.([A-Za-z_$][\w$]*)$/);
+  if (!m || !m[1] || !m[2]) return null;
+  const calleeChain = m[1];
+  const methodName = m[2];
+
+  // calleeChain must be a simple identifier or a dotted chain of identifiers (e.g. `useStore.getState` or `get` or `factory`)
+  if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(calleeChain)) {
+    return null;
+  }
+  return { calleeChain, methodName };
+}
+
+/**
+ * Resolve a call-result member chain (`useStore.getState().reset` or `get().reset`)
+ * in TypeScript/JavaScript/TSX/JSX/ArkTS (#1566/#647).
+ * Strictly scoped to proven object-literal / store containers; never falls back to generic name guessing.
+ */
+export function resolveTsJsCallResultMember(
+  parsed: ParsedCallResultMember,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  const { calleeChain, methodName } = parsed;
+
+  // Case 1: Dotted root call, e.g. `useStore.getState().reset` or `api.client().call`
+  if (calleeChain.includes('.')) {
+    const rootName = calleeChain.split('.')[0]!;
+
+    // Find the container constant/variable named rootName
+    // A: Same file
+    let container: Node | null = null;
+    const inFile = context.getNodesInFile(ref.filePath);
+    container =
+      inFile.find(
+        (n) =>
+          (n.kind === 'constant' || n.kind === 'variable') &&
+          n.name === rootName &&
+          (n.language === ref.language || sameLanguageFamily(n.language, ref.language))
+      ) ?? null;
+
+    // B: Imported from another file
+    if (!container) {
+      const imports = context.getImportMappings ? context.getImportMappings(ref.filePath, ref.language) : [];
+      const mapping = imports.find((i) => i.localName === rootName);
+      if (mapping) {
+        const resolvedPath =
+          mapping.resolvedPath ??
+          context.resolveImportPath?.(mapping.source, ref.filePath, ref.language);
+        if (resolvedPath) {
+          const normResolved = normalizePathForComparison(resolvedPath);
+          const targetNodes = context.getNodesInFile(resolvedPath).concat(
+            context.getNodesByName(mapping.exportedName || mapping.localName)
+          );
+          container =
+            targetNodes.find(
+              (n) =>
+                (n.kind === 'constant' || n.kind === 'variable') &&
+                (n.name === mapping.exportedName || n.name === mapping.localName || mapping.isDefault) &&
+                normalizePathForComparison(n.filePath) === normResolved &&
+                (n.language === ref.language || sameLanguageFamily(n.language, ref.language))
+            ) ?? null;
+        }
+      }
+    }
+
+    if (container) {
+      return resolveObjectLiteralMember(container, methodName, ref, context, 0.9, 'instance-method');
+    }
+    return null;
+  }
+
+  // Case 2: Bare root call, e.g. `get().reset` or `factory().get`
+  const rootName = calleeChain;
+
+  // Check if rootName is a defined project callable in caller's scope (e.g. `function factory() {}`)
+  // If so, `factory().reset()` is a call on the result of an external/declared factory function,
+  // NOT a store-internal callback like `get()`, so it must NOT resolve to a sibling store action.
+  const inFile = context.getNodesInFile(ref.filePath);
+  const isDeclaredFunction = inFile.some(
+    (n) => (n.kind === 'function' || n.kind === 'method') && n.name === rootName
+  );
+  if (isDeclaredFunction) {
+    return null;
+  }
+
+  // If rootName is not a declared function (e.g. `get` from store factory callback parameter),
+  // locate the tightest enclosing constant/variable container around ref.fromNodeId
+  let fromNode: Node | null = null;
+  if (ref.fromNodeId) {
+    fromNode = inFile.find((n) => n.id === ref.fromNodeId) ?? null;
+  }
+  if (!fromNode) {
+    // Fallback by line if fromNodeId not in file nodes list
+    for (const n of inFile) {
+      const end = n.endLine ?? n.startLine;
+      if (n.startLine <= ref.line && end >= ref.line) {
+        if (!fromNode || n.startLine >= fromNode.startLine) {
+          fromNode = n;
+        }
+      }
+    }
+  }
+  if (!fromNode) return null;
+
+  // Find all constant/variable containers in the same file that enclose fromNode
+  const fromEnd = fromNode.endLine ?? fromNode.startLine;
+  const containingContainers = inFile.filter(
+    (n) =>
+      (n.kind === 'constant' || n.kind === 'variable') &&
+      n.startLine <= fromNode!.startLine &&
+      (n.endLine ?? n.startLine) >= fromEnd
+  );
+
+  if (containingContainers.length === 0) return null;
+
+  // Sort by smallest range (tightest enclosing container)
+  containingContainers.sort((a, b) => {
+    const rangeA = (a.endLine ?? a.startLine) - a.startLine;
+    const rangeB = (b.endLine ?? b.startLine) - b.startLine;
+    return rangeA - rangeB;
+  });
+
+  const tightestContainer = containingContainers[0]!;
+  return resolveObjectLiteralMember(tightestContainer, methodName, ref, context, 0.9, 'instance-method');
+}
+
+/**
+ * Builds a structured deferred typed receiver record for the conformance second pass (#1566).
+ */
+export function buildTypedReceiverDeferral(
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): DeferredTypedReceiverRef | null {
+  const parsed = parseMethodCallReference(ref);
+  if (!parsed || !parsed.inferableReceiver) return null;
+
+  let inferredType: string | null = null;
+  const isWebFamily =
+    ref.language === 'typescript' ||
+    ref.language === 'javascript' ||
+    ref.language === 'tsx' ||
+    ref.language === 'jsx' ||
+    ref.language === 'arkts';
+
+  if (isWebFamily && parsed.receiver.startsWith('this.')) {
+    inferredType = inferTsJsFieldReceiverType(parsed.receiver, ref, context);
+  } else if (ref.language === 'cpp') {
+    inferredType = inferCppReceiverType(parsed.receiver, ref, context);
+  } else if (ref.language === 'java' || ref.language === 'kotlin') {
+    inferredType = inferLocalReceiverType(parsed.receiver, ref, context) ?? inferJavaFieldReceiverType(parsed.receiver, ref, context);
+  } else {
+    inferredType = inferLocalReceiverType(parsed.receiver, ref, context);
+  }
+
+  if (!inferredType) return null;
+
+  const typeNode = bindProjectReceiverType(inferredType, ref, context);
+  if (!typeNode || !SUPERTYPE_BEARING_KINDS.has(typeNode.kind)) return null;
+
+  return {
+    ref,
+    receiverTypeNodeId: typeNode.id,
+    receiverTypeName: typeNode.name,
+    methodName: parsed.methodName,
+  };
+}
+
 // ── Local-variable receiver-type inference (#1108) ──────────────────────────
 //
 // Instance calls through a local variable (`const lg = new Logger(); lg.log()`)
@@ -1729,38 +2283,6 @@ export function matchMethodCall(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
-  // Parse method call patterns like "obj.method" or "Class::method". The method
-  // part allows trailing `:` keywords so Objective-C selectors resolve
-  // (`SDImageCache.storeImage:`, `obj.setX:y:`); colons never appear in other
-  // languages' method refs, so this is a no-op for them.
-  // The receiver allows dots (`builder.Services.AddCoreServices`) so a CHAINED
-  // call resolves by its last segment — Strategy 3 below name-matches the method
-  // (with its existing single-candidate / receiver-overlap guards). Without this
-  // a multi-dot extension-method call (C# DI `builder.Services.AddCoreServices()`,
-  // `Guard.Against.X()`) matched no pattern and never resolved.
-  // C++ explicit operator call `a.operator+(b)` reaches the resolver as
-  // `a.operator+` (#1247) — the operator's symbol chars (`+`, `==`, `[]`, `()`)
-  // fail the \w method part of the plain pattern, so admit them explicitly.
-  // Names like `operatorTable` stay on the plain pattern (tried first); the
-  // operator form requires at least one non-word char after `operator`, and
-  // every downstream strategy compares the method part by exact string
-  // equality, so a stray match can't invent an edge.
-  const dotMatch =
-    ref.referenceName.match(/^([\w.]+)\.(\w+:?(?:\w+:)*)$/) ??
-    (ref.language === 'cpp'
-      ? ref.referenceName.match(/^([\w.]+)\.(operator[^\w\s.]+)$/)
-      : null);
-  const colonMatch = ref.referenceName.match(/^(\w+)::(\w+)$/);
-  // Lua/Luau method calls use a single colon (`lg:log`); R uses `$` (`lg$log`).
-  // Recognize these receiver/method separators so local-variable receiver-type
-  // inference (#1108) applies to them too — extraction already emits the ref in
-  // this shape, but the resolver otherwise only understood `.` and `::`.
-  const luaColonMatch = (ref.language === 'lua' || ref.language === 'luau')
-    ? ref.referenceName.match(/^([\w.]+):(\w+)$/)
-    : null;
-  const rDollarMatch = ref.language === 'r'
-    ? ref.referenceName.match(/^([\w.]+)\$(\w+)$/)
-    : null;
 
   // PHP property receiver: `$this->prop->method()` reaches the resolver as
   // `this->prop.method` (the extractor records the receiver's raw text with the
@@ -1788,15 +2310,22 @@ export function matchMethodCall(
     );
   }
 
-  const match = dotMatch || colonMatch || luaColonMatch || rDollarMatch;
-  if (!match) {
+  const parsed = parseMethodCallReference(ref);
+  if (!parsed) {
     return null;
   }
 
-  const [, objectOrClass, methodName] = match;
-  // A simple `receiver.method` / `receiver:method` / `receiver$method` shape whose
-  // receiver type we can try to infer from its local declaration.
-  const inferableReceiver = dotMatch || luaColonMatch || rDollarMatch;
+  const objectOrClass = parsed.receiver;
+  const methodName = parsed.methodName;
+  const dotMatch = parsed.syntax === 'dot' || parsed.syntax === 'cpp-operator';
+  const inferableReceiver = parsed.inferableReceiver;
+
+  const isWebFamily =
+    ref.language === 'typescript' ||
+    ref.language === 'javascript' ||
+    ref.language === 'tsx' ||
+    ref.language === 'jsx' ||
+    ref.language === 'arkts';
 
   // Infer the receiver's type from its local declaration/initializer in the
   // enclosing scope, then resolve the method on that type (#1108). C++ keeps its
@@ -1806,9 +2335,20 @@ export function matchMethodCall(
   if (inferableReceiver) {
     const inferredType = nmTimedT('mc-infer', ref, () =>
       ref.language === 'cpp'
-        ? inferCppReceiverType(objectOrClass!, ref, context)
-        : inferLocalReceiverType(objectOrClass!, ref, context));
+        ? inferCppReceiverType(objectOrClass, ref, context)
+        : inferLocalReceiverType(objectOrClass, ref, context));
     if (inferredType) {
+      if (isWebFamily) {
+        const typeNode = bindProjectReceiverType(inferredType, ref, context);
+        if (!typeNode) {
+          return null;
+        }
+        const typedMatch = nmTimedT('mc-rmot', ref, () =>
+          resolveMethodOnTypeNode(typeNode, methodName, ref, context, 0.9, 'instance-method')
+        );
+        return typedMatch;
+      }
+
       // Java/Kotlin: when two classes share the simple name, the file's import
       // pins WHICH one (#314). Other languages disambiguate by call-site file.
       const importedFqn =
@@ -1819,16 +2359,19 @@ export function matchMethodCall(
           : undefined;
       const typedMatch = nmTimedT('mc-rmot', ref, () => resolveMethodOnType(
         inferredType,
-        methodName!,
+        methodName,
         ref,
         context,
         0.9,
         'instance-method',
         importedFqn,
       ));
-      if (typedMatch) {
-        return typedMatch;
-      }
+      // Precision boundary: when receiver typing identifies a concrete type for
+      // the receiver variable, resolution must succeed on that type. If the type
+      // does not declare the method in the project (e.g. built-in Map/Set, an
+      // external package, or non-matching class), the call stays unresolved
+      // rather than falling through to bare-name method guessing (#1566/#1108).
+      return typedMatch;
     }
   }
 
@@ -1843,8 +2386,8 @@ export function matchMethodCall(
   // fabricated a dependency on an unrelated local interface's same-named
   // method. Chained Go receivers were never emitted before #1276, so there
   // is no prior recall to preserve on the fallback path.
-  if (ref.language === 'go' && dotMatch && objectOrClass!.includes('.')) {
-    return matchGoFieldChainCall(objectOrClass!, methodName!, ref, context);
+  if (ref.language === 'go' && dotMatch && objectOrClass.includes('.')) {
+    return matchGoFieldChainCall(objectOrClass, methodName, ref, context);
   }
 
   // Rust call through a field of the enclosing type — `self.inner.run()`,
@@ -1855,8 +2398,8 @@ export function matchMethodCall(
   // type — or to the calling method itself, a self-edge the source doesn't
   // contain — whenever the field's type was external or merely shared a
   // method name with something nearby.
-  if (ref.language === 'rust' && dotMatch && objectOrClass!.startsWith('self.')) {
-    return matchRustSelfFieldCall(objectOrClass!.slice('self.'.length), methodName!, ref, context);
+  if (ref.language === 'rust' && dotMatch && objectOrClass.startsWith('self.')) {
+    return matchRustSelfFieldCall(objectOrClass.slice('self.'.length), methodName, ref, context);
   }
 
   // Java/Kotlin: receiver may be a field whose name doesn't match the type by
@@ -1865,7 +2408,7 @@ export function matchMethodCall(
   // the method on that type. Covers Spring `@Resource`/`@Autowired` field
   // injection where the field type is the concrete bean class.
   if ((ref.language === 'java' || ref.language === 'kotlin') && dotMatch) {
-    const inferredType = inferJavaFieldReceiverType(objectOrClass!, ref, context);
+    const inferredType = inferJavaFieldReceiverType(objectOrClass, ref, context);
     if (inferredType) {
       // When two classes share the same simple name, the caller file's
       // import is the only signal that names WHICH one — pass the
@@ -1874,17 +2417,49 @@ export function matchMethodCall(
       const importedFqn = imports.find((i) => i.localName === inferredType)?.source;
       const typedMatch = nmTimedT('mc-rmot', ref, () => resolveMethodOnType(
         inferredType,
-        methodName!,
+        methodName,
         ref,
         context,
         0.9,
         'instance-method',
         importedFqn,
       ));
-      if (typedMatch) {
-        return typedMatch;
-      }
+      return typedMatch;
     }
+  }
+
+  // TypeScript / JavaScript / ArkTS: receiver may be `this.<field>` (#1566/#1496).
+  // Look up the declared/initialized type of the field on the enclosing class.
+  if (isWebFamily && dotMatch && objectOrClass.startsWith('this.')) {
+    const inferredType = inferTsJsFieldReceiverType(objectOrClass, ref, context);
+    if (inferredType) {
+      const typeNode = bindProjectReceiverType(inferredType, ref, context);
+      if (!typeNode) {
+        return null;
+      }
+      const typedMatch = nmTimedT('mc-rmot', ref, () =>
+        resolveMethodOnTypeNode(typeNode, methodName, ref, context, 0.9, 'instance-method')
+      );
+      return typedMatch;
+    }
+  }
+
+  // TypeScript / JavaScript / ArkTS chained receiver `a.b.method()` / `this.field.method()` (#1566):
+  // When the receiver is a multi-segment chain, resolve only through validated
+  // type inference or exact object/class match above. Chained TS/JS receivers must
+  // never fall through to the bare-name / method-name uniqueness guessing in
+  // Strategy 2/3 below — that is how `holder.values.get()` or `this.store.get()`
+  // fabricated dependencies on unrelated project methods (or self-edges).
+  if (
+    (ref.language === 'typescript' ||
+      ref.language === 'javascript' ||
+      ref.language === 'tsx' ||
+      ref.language === 'jsx' ||
+      ref.language === 'arkts') &&
+    dotMatch &&
+    objectOrClass!.includes('.')
+  ) {
+    return null;
   }
 
   // Object-literal namespace receiver (#1573): `api.call()` where `api` is a
@@ -2624,6 +3199,24 @@ export function matchReference(
 
   // 1d. Dotted chained static-factory / fluent call (Java / Kotlin / C# / Swift /
   // Go / Scala / Dart / Objective-C) — `Foo.getInstance().bar()` encoded as
+  // Web-family call-result member chain (`useStore.getState().reset`, `get().reset`, `factory().get`)
+  // Must resolve exclusively against proven store/object-literal containers; unproven chains stay
+  // unlinked and must NEVER fall through to generic name guessing (#1566/#647).
+  const isWebFamily =
+    ref.language === 'typescript' ||
+    ref.language === 'javascript' ||
+    ref.language === 'tsx' ||
+    ref.language === 'jsx' ||
+    ref.language === 'arkts';
+
+  const callResult = parseCallResultMemberReference(ref);
+  if (callResult) {
+    if (isWebFamily) {
+      return nmTimed('tsjsCallResult', ref, () => resolveTsJsCallResultMember(callResult, ref, context));
+    }
+  }
+
+  // 1b. Dotted call chain with factory / singleton receiver (Java, Kotlin, C#, Swift, Go...)
   // `Foo.getInstance().bar`, Go's bare-factory `New().Method()` as `New().Method`,
   // Scala's companion factory, Dart's static factory / factory-constructor, or
   // ObjC's chained message send `[[Foo create] doIt]` encoded as `Foo.create().doIt`

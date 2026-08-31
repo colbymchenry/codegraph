@@ -97,7 +97,47 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
 
   it('torture fixture (tsx): components, stores, RTK, fn-refs, value-refs, decorators', () => {
     const file = path.join(FIXTURE_DIR, 'torture.tsx');
-    assertParity('fixtures/torture.tsx', fs.readFileSync(file, 'utf8'), 'tsx');
+    const content = fs.readFileSync(file, 'utf8');
+    assertParity('fixtures/torture.tsx', content, 'tsx');
+
+    // Semantic check (#1566): BaseService::list preserves `this.cache.get` instead of bare `get`
+    const wasmRes = extractFromSource('fixtures/torture.tsx', content, 'tsx');
+    const kernelRes = tryKernelExtract('fixtures/torture.tsx', content, 'tsx')!;
+    for (const res of [wasmRes, kernelRes]) {
+      const calls = res.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+      expect(calls.map((c) => c.referenceName)).toContain('this.cache.get');
+      expect(calls.map((c) => c.referenceName)).not.toContain('get');
+    }
+  });
+
+  it('dynamic receiver extraction parity and silence (#1566/#647)', () => {
+    const src = `
+function factory() { return { get: () => 1 }; }
+export function dynamic(holder: any, key: string) {
+  holder[key].get("x");
+  factory().get("x");
+}
+export function staticChain(holder: any) {
+  holder.values.get("x");
+}
+export function storeCall(useStore: any) {
+  useStore.getState().reset();
+}
+`;
+    assertParity('fixtures/dynamic-parity.ts', src, 'typescript');
+    const wasmRes = extractFromSource('fixtures/dynamic-parity.ts', src, 'typescript');
+    const kernelRes = tryKernelExtract('fixtures/dynamic-parity.ts', src, 'typescript')!;
+    for (const res of [wasmRes, kernelRes]) {
+      const calls = res.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+      const names = calls.map((c) => c.referenceName);
+      expect(names).toContain('holder.values.get');
+      expect(names).toContain('factory().get');
+      expect(names).toContain('factory');
+      expect(names).toContain('useStore.getState().reset');
+      expect(names).not.toContain('get');
+      expect(names).not.toContain('reset');
+      expect(names.some((n) => n.includes('key]'))).toBe(false);
+    }
   });
 
   it('torture fixture (js): field methods, wrappers, vuex module shape', () => {

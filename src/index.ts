@@ -655,6 +655,10 @@ export class CodeGraph {
           const tDeferred = Date.now();
           await this.resolver.resolveDeferredThisMemberRefs();
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[synth-timing] deferredThisMember: ${Date.now() - tDeferred}ms`);
+          // Same lifecycle for typed receiver calls whose method lives on a supertype (#1566).
+          const tTypedReceiver = Date.now();
+          await this.resolver.resolveTypedReceiverCallsViaConformance();
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[synth-timing] typedReceiverConformance: ${Date.now() - tTypedReceiver}ms`);
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
@@ -991,6 +995,8 @@ export class CodeGraph {
           // Same lifecycle for `this.<member>` callback registrations whose
           // member is inherited from a supertype (#808).
           await this.resolver.resolveDeferredThisMemberRefs();
+          // Same lifecycle for typed receiver calls whose method lives on a supertype (#1566).
+          await this.resolver.resolveTypedReceiverCallsViaConformance();
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.

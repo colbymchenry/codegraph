@@ -46,6 +46,16 @@ export interface ResolvedRef {
 }
 
 /**
+ * Deferred typed-receiver call reference for node-anchored conformance post-pass (#1566)
+ */
+export interface DeferredTypedReceiverRef {
+  ref: UnresolvedRef;
+  receiverTypeNodeId: string;
+  receiverTypeName: string;
+  methodName: string;
+}
+
+/**
  * Result of resolution attempt
  */
 export interface ResolutionResult {
@@ -132,6 +142,11 @@ export interface ResolutionContext {
   getNodeById?(id: string): Node | null;
   /** Get cached import mappings for a file */
   getImportMappings(filePath: string, language: Language): ImportMapping[];
+  /**
+   * Resolve an import specifier to an on-disk file path.
+   * Optional so minimal test contexts compile without it.
+   */
+  resolveImportPath?(importPath: string, fromFile: string, language: Language): string | null;
   /**
    * Project import-path aliases (tsconfig/jsconfig `paths`). Returns
    * `null` when the project doesn't define any. Cached per resolver

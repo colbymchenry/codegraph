@@ -51,17 +51,17 @@ describe('object-literal method extraction', () => {
     expect(fnNames).toContain('switchOrganization');
     expect(fnNames).toContain('reset');
 
-    // Each action's body was walked: fetchUser references its sibling `reset`,
+    // Each action's body was walked: fetchUser references its sibling `reset` via `get().reset`,
     // so an in-store calls edge will resolve once the pipeline runs.
     const fetchUser = result.nodes.find((n) => n.name === 'fetchUser')!;
     const fetchUserRefs = result.unresolvedReferences.filter((r) => r.fromNodeId === fetchUser.id);
-    expect(fetchUserRefs.map((r) => r.referenceName)).toContain('reset');
+    expect(fetchUserRefs.map((r) => r.referenceName)).toContain('get().reset');
 
     // The action's body wasn't mis-attributed to the file scope (the reason we
     // skip the generic body-visit for the store-factory call).
     const fileNode = result.nodes.find((n) => n.kind === 'file')!;
     const fileRefs = result.unresolvedReferences.filter((r) => r.fromNodeId === fileNode.id);
-    expect(fileRefs.map((r) => r.referenceName)).not.toContain('reset');
+    expect(fileRefs.map((r) => r.referenceName)).not.toContain('get().reset');
   });
 
   it('extracts actions through a middleware wrapper (create(persist(...)))', () => {
@@ -170,6 +170,137 @@ describe('object-literal method resolution (end-to-end)', () => {
     const resetCallers = cg.getCallers(reset!.id).map((c) => c.node.name);
     expect(resetCallers).toContain('hardReset');
     expect(resetCallers).toContain('fetchUser');
+
+    cg.close();
+  });
+
+  it('isolates store actions from top-level and sibling store decoys (#1566/#647)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-store-decoy-'));
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"t","dependencies":{"zustand":"^4"}}\n');
+    fs.writeFileSync(
+      path.join(tmpDir, 'store.ts'),
+      `import { create } from 'zustand'\n` +
+        `export function reset() { return 'top-level decoy'; }\n` +
+        `export const otherStore = create<any>(() => ({\n` +
+        `  reset: () => {},\n` +
+        `}))\n` +
+        `export const useStore = create<any>((set, get) => ({\n` +
+        `  fetchUser: async () => { get().reset() },\n` +
+        `  reset: () => set({}),\n` +
+        `}))\n`
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'caller.ts'),
+      `import { useStore } from './store'\n` +
+        `export function hardReset() {\n` +
+        `  useStore.getState().reset()\n` +
+        `}\n`
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const storeFns = fns.filter((n) => n.filePath.endsWith('store.ts'));
+    const topLevelReset = storeFns.find((n) => n.name === 'reset' && n.startLine === 2);
+    const otherStoreReset = storeFns.find((n) => n.name === 'reset' && n.startLine === 4);
+    const useStoreReset = storeFns.find((n) => n.name === 'reset' && n.startLine === 8);
+
+    expect(topLevelReset).toBeDefined();
+    expect(otherStoreReset).toBeDefined();
+    expect(useStoreReset).toBeDefined();
+
+    const useStoreResetCallers = cg.getCallers(useStoreReset!.id).map((c) => c.node.name);
+    expect(useStoreResetCallers).toContain('hardReset');
+    expect(useStoreResetCallers).toContain('fetchUser');
+
+    const topLevelCallers = cg.getCallers(topLevelReset!.id).map((c) => c.node.name);
+    expect(topLevelCallers).not.toContain('hardReset');
+    expect(topLevelCallers).not.toContain('fetchUser');
+
+    const otherStoreCallers = cg.getCallers(otherStoreReset!.id).map((c) => c.node.name);
+    expect(otherStoreCallers).not.toContain('hardReset');
+    expect(otherStoreCallers).not.toContain('fetchUser');
+
+    cg.close();
+  });
+
+  it('isolates declared factory inside store action from sibling actions (#1566/#647)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-store-factory-'));
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"t","dependencies":{"zustand":"^4"}}\n');
+    fs.writeFileSync(
+      path.join(tmpDir, 'store.ts'),
+      `import { create } from 'zustand'\n` +
+        `function factory() {\n` +
+        `  return { reset() {} }\n` +
+        `}\n` +
+        `export const useStore = create<any>((set, get) => ({\n` +
+        `  reset: () => set({}),\n` +
+        `  run: () => {\n` +
+        `    factory().reset()\n` +
+        `  },\n` +
+        `}))\n`
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const storeReset = fns.find((n) => n.name === 'reset' && n.startLine === 6);
+    const runFn = fns.find((n) => n.name === 'run');
+    const factoryFn = fns.find((n) => n.name === 'factory');
+
+    expect(storeReset).toBeDefined();
+    expect(runFn).toBeDefined();
+    expect(factoryFn).toBeDefined();
+
+    // run calls factory()
+    const factoryCallers = cg.getCallers(factoryFn!.id).map((c) => c.node.name);
+    expect(factoryCallers).toContain('run');
+
+    // run does NOT call useStore.reset
+    const storeResetCallers = cg.getCallers(storeReset!.id).map((c) => c.node.name);
+    expect(storeResetCallers).not.toContain('run');
+
+    cg.close();
+  });
+
+  it('isolates generic call-result receivers without store container (#1566/#647)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-generic-call-result-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'service.ts'),
+      `class Decoy {\n` +
+        `  get() { return 1; }\n` +
+        `  reset() {}\n` +
+        `}\n` +
+        `function factory() {\n` +
+        `  return {};\n` +
+        `}\n` +
+        `export function useFactory() {\n` +
+        `  factory().get();\n` +
+        `}\n`
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const fns = cg.getNodesByKind('function');
+    const methods = cg.getNodesByKind('method');
+    const useFactory = fns.find((n) => n.name === 'useFactory');
+    const factory = fns.find((n) => n.name === 'factory');
+    const decoyGet = methods.find((n) => n.name === 'get');
+
+    expect(useFactory).toBeDefined();
+    expect(factory).toBeDefined();
+    expect(decoyGet).toBeDefined();
+
+    // useFactory calls factory()
+    const factoryCallers = cg.getCallers(factory!.id).map((c) => c.node.name);
+    expect(factoryCallers).toContain('useFactory');
+
+    // useFactory does NOT call Decoy.get
+    const decoyGetCallers = cg.getCallers(decoyGet!.id).map((c) => c.node.name);
+    expect(decoyGetCallers).not.toContain('useFactory');
 
     cg.close();
   });

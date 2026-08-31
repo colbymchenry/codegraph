@@ -15,9 +15,10 @@ import {
   ResolutionContext,
   FrameworkResolver,
   ImportMapping,
+  DeferredTypedReceiverRef,
 } from './types';
-import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
-import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos } from './import-resolver';
+import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, getDirectCallableCandidatesOnTypeNode, buildTypedReceiverDeferral, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
+import { resolveViaImport, resolveJvmImport, resolveImportPath, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -217,6 +218,11 @@ export class ReferenceResolver {
   // same reason as deferredChainRefs and drained by
   // resolveDeferredThisMemberRefs once implements/extends edges exist (#808).
   private deferredThisMemberRefs: UnresolvedRef[] = [];
+  // Typed receiver call refs whose inferred receiver is a project aggregate type
+  // (class/interface/struct), whose method was not on the class itself and may be
+  // inherited. Drained by resolveTypedReceiverCallsViaConformance once
+  // implements/extends edges exist (#1566).
+  private deferredTypedReceiverRefs: DeferredTypedReceiverRef[] = [];
   // Per-`.razor`/`.cshtml`-file `@using` namespace set (own directives + folder
   // `_Imports.razor`, cascading to the project root). Used to disambiguate a
   // markup type ref to the right C# namespace.
@@ -643,6 +649,9 @@ export class ReferenceResolver {
         return mappings;
       },
 
+      resolveImportPath: (importPath: string, fromFile: string, language: Language) =>
+        resolveImportPath(importPath, fromFile, language, this.context),
+
       getProjectAliases: () => {
         if (this.projectAliases === undefined) {
           this.projectAliases = loadProjectAliases(this.projectRoot);
@@ -1047,6 +1056,15 @@ export class ReferenceResolver {
         PHP_PROP_SHAPE.test(ref.referenceName)
       ) {
         this.deferredChainRefs.push(ref);
+      } else if (ref.referenceKind === 'calls') {
+        // Typed local receiver / field receiver call whose declared receiver type
+        // is a project aggregate type (class, interface, struct, etc.): its method
+        // may be inherited from a supertype, resolvable once implements/extends
+        // edges exist (#1566).
+        const deferral = buildTypedReceiverDeferral(ref, this.context);
+        if (deferral) {
+          this.deferredTypedReceiverRefs.push(deferral);
+        }
       }
       return null;
     }
@@ -1450,6 +1468,7 @@ export class ReferenceResolver {
     unresolved: UnresolvedRef[];
     deferredChain: UnresolvedRef[];
     deferredThisMember: UnresolvedRef[];
+    deferredTypedReceiver: DeferredTypedReceiverRef[];
     byMethod: Record<string, number>;
   } {
     this.warmCaches();
@@ -1481,6 +1500,7 @@ export class ReferenceResolver {
       unresolved,
       deferredChain: this.deferredChainRefs.splice(0),
       deferredThisMember: this.deferredThisMemberRefs.splice(0),
+      deferredTypedReceiver: this.deferredTypedReceiverRefs.splice(0),
       byMethod,
     };
   }
@@ -1496,12 +1516,17 @@ export class ReferenceResolver {
   /**
    * Re-queue deferred post-pass refs produced by resolver workers, preserving
    * their admission order so resolveChainedCallsViaConformance /
-   * resolveDeferredThisMemberRefs process them exactly as the sequential path
-   * would have.
+   * resolveDeferredThisMemberRefs / resolveTypedReceiverCallsViaConformance
+   * process them exactly as the sequential path would have.
    */
-  appendDeferredFromWorkers(deferredChain: UnresolvedRef[], deferredThisMember: UnresolvedRef[]): void {
+  appendDeferredFromWorkers(
+    deferredChain: UnresolvedRef[],
+    deferredThisMember: UnresolvedRef[],
+    deferredTypedReceiver: DeferredTypedReceiverRef[]
+  ): void {
     this.deferredChainRefs.push(...deferredChain);
     this.deferredThisMemberRefs.push(...deferredThisMember);
+    this.deferredTypedReceiverRefs.push(...deferredTypedReceiver);
   }
 
   /**
@@ -1661,7 +1686,7 @@ export class ReferenceResolver {
       if (inFlight.mode === 'pool') {
         const settled = await inFlight.settled;
         if (settled.ok) {
-          this.appendDeferredFromWorkers(settled.out.deferredChain, settled.out.deferredThisMember);
+          this.appendDeferredFromWorkers(settled.out.deferredChain, settled.out.deferredThisMember, settled.out.deferredTypedReceiver);
           return {
             resolved: settled.out.resolved,
             unresolved: settled.out.unresolved,
@@ -2407,6 +2432,112 @@ export class ReferenceResolver {
         });
       }
     }
+    if (resolved.length === 0) return 0;
+
+    const edges = this.createEdges(resolved);
+    if (edges.length > 0) {
+      this.queries.insertEdges(edges);
+      this.clearCaches();
+    }
+    return edges.length;
+  }
+
+  /**
+   * Second resolution pass for typed receiver calls whose method is inherited
+   * from a supertype the receiver extends/implements (#1566).
+   * Operates on leftover unresolved calls whose receiver type was bound to a specific
+   * project aggregate node (e.g. `Derived extends Base`, `const d = new Derived()`, `d.run()`).
+   * Runs after implements/extends edges exist, performing a NODE-anchored BFS
+   * strictly along the type node's graph edges without name-based supertype merging.
+   * Returns the number of newly-created edges.
+   */
+  async resolveTypedReceiverCallsViaConformance(): Promise<number> {
+    const deferred = this.deferredTypedReceiverRefs;
+    this.deferredTypedReceiverRefs = [];
+    if (deferred.length === 0) return 0;
+
+    this.clearCaches();
+    const maybeYield = createYielder();
+    const resolved: ResolvedRef[] = [];
+
+    for (const item of deferred) {
+      await maybeYield();
+      const rootNode = this.queries.getNodeById(item.receiverTypeNodeId);
+      if (!rootNode) continue;
+
+      let frontierNodes: Node[] = [rootNode];
+      const seenNodeIds = new Set<string>([rootNode.id]);
+      let targetMethod: Node | null = null;
+      let ambiguous = false;
+
+      for (let depth = 0; depth < 5 && frontierNodes.length > 0 && !targetMethod && !ambiguous; depth++) {
+        const nextFrontier: Node[] = [];
+        const depthTargets: Node[] = [];
+
+        for (const typeNode of frontierNodes) {
+          for (const edge of this.queries.getOutgoingEdges(typeNode.id, ['implements', 'extends'])) {
+            const superNode = this.queries.getNodeById(edge.target);
+            if (!superNode || seenNodeIds.has(superNode.id)) continue;
+            seenNodeIds.add(superNode.id);
+            if (!SUPERTYPE_BEARING_KINDS.has(superNode.kind)) continue;
+
+            const perSuperTargets: Node[] = [];
+
+            // Direct member lookup on the exact supertype node:
+            // 1. Through 'contains' edges (strongest node-level ownership evidence)
+            for (const c of this.queries.getOutgoingEdges(superNode.id, ['contains'])) {
+              const m = this.queries.getNodeById(c.target);
+              if (
+                m &&
+                m.name === item.methodName &&
+                (m.kind === 'function' || m.kind === 'method') &&
+                (m.language === item.ref.language || sameLanguageFamily(m.language, item.ref.language))
+              ) {
+                perSuperTargets.push(m);
+              }
+            }
+
+            // 2. Direct exact qualified ownership fallback (reusing canonical direct ownership helper)
+            perSuperTargets.push(
+              ...getDirectCallableCandidatesOnTypeNode(
+                superNode,
+                item.methodName,
+                item.ref,
+                this.context,
+              )
+            );
+
+            // Deduplicate targets found for this specific supertype node
+            const uniquePerSuper = [...new Map(perSuperTargets.map((t) => [t.id, t])).values()];
+            depthTargets.push(...uniquePerSuper);
+
+            nextFrontier.push(superNode);
+          }
+        }
+
+        // Deduplicate targets found at this depth
+        const uniqueTargets = [...new Map(depthTargets.map((t) => [t.id, t])).values()];
+        if (uniqueTargets.length === 1) {
+          targetMethod = uniqueTargets[0]!;
+          break;
+        } else if (uniqueTargets.length > 1) {
+          ambiguous = true;
+          break;
+        }
+
+        frontierNodes = nextFrontier;
+      }
+
+      if (targetMethod && !ambiguous) {
+        resolved.push({
+          original: item.ref,
+          targetNodeId: targetMethod.id,
+          confidence: 0.9,
+          resolvedBy: 'instance-method',
+        });
+      }
+    }
+
     if (resolved.length === 0) return 0;
 
     const edges = this.createEdges(resolved);

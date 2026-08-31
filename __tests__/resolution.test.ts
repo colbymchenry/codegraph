@@ -3075,6 +3075,781 @@ export function callFromImportedFile(): void {
     }, 30000);
   });
 
+  describe('TypeScript built-in receiver resolution and nested receiver safety (#1566)', () => {
+    // Calls to built-in Map.get/set/has (and other external/standard types) must
+    // not resolve to unrelated same-named project methods when the project
+    // defines a single method with each name.
+    // - Simple local receiver `values.get()`: once receiver typing identifies `Map`,
+    //   failure to find a project method stays unresolved rather than falling
+    //   through to confidence-0.7 unique method name guessing.
+    // - Nested receiver `holder.values.get()` / `this.store.get()`: the static member
+    //   chain is preserved and multi-segment TS/JS receivers stay unresolved
+    //   when receiver type cannot be proven, eliminating false edges and self-edges.
+    // - Positive controls: `cache.get()` on constructed `new LRUCache()` and typed
+    //   parameter `cache: LRUCache` continue to resolve correctly to `LRUCache::get`.
+    it('built-in Map methods and nested receivers do not link to LRUCache, while true project instances resolve correctly', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'repro.ts'),
+          `export class LRUCache {
+  private store = new Map<string, string>();
+
+  get(key: string): string | undefined {
+    return this.store.get(key);
+  }
+
+  set(key: string, value: string): void {
+    this.store.set(key, value);
+  }
+
+  has(key: string): boolean {
+    return this.store.has(key);
+  }
+}
+
+export function useLocalMap(): boolean {
+  const values = new Map<string, string>();
+  values.set("answer", "42");
+  values.get("answer");
+  return values.has("answer");
+}
+
+export function useNestedMap(
+  holder: { values: Map<string, string> },
+): string | undefined {
+  return holder.values.get("answer");
+}
+
+export function useDynamicReceivers(
+  holder: Record<string, any>,
+  key: string,
+): void {
+  holder[key].get("answer");
+  factory().get("answer");
+}
+
+export function useProjectCache(cache: LRUCache): boolean {
+  cache.set("answer", "42");
+  cache.get("answer");
+  return cache.has("answer");
+}
+
+export function useConstructedProjectCache(): boolean {
+  const cache = new LRUCache();
+  cache.set("answer", "42");
+  cache.get("answer");
+  return cache.has("answer");
+}
+
+export class Mailer {
+  send(message: string): void {}
+}
+
+export class Service {
+  private mailer: Mailer;
+  private store = new Map<string, string>();
+
+  run(): void {
+    this.mailer.send("hello");
+    this.store.get("key");
+  }
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('repro.ts');
+        const lruGet = allNodes.find((n) => n.kind === 'method' && n.name === 'get');
+        const lruSet = allNodes.find((n) => n.kind === 'method' && n.name === 'set');
+        const lruHas = allNodes.find((n) => n.kind === 'method' && n.name === 'has');
+
+        expect(lruGet).toBeDefined();
+        expect(lruSet).toBeDefined();
+        expect(lruHas).toBeDefined();
+
+        // 1. Callers of LRUCache::get: only true project callers (positive controls)
+        const callersGet = await cg.getCallers(lruGet!.id);
+        const getCallerNames = callersGet.map((c) => c.node.name).sort();
+        expect(getCallerNames).toEqual(['useConstructedProjectCache', 'useProjectCache']);
+        expect(getCallerNames).not.toContain('useLocalMap');
+        expect(getCallerNames).not.toContain('useNestedMap');
+        expect(getCallerNames).not.toContain('useDynamicReceivers');
+        expect(getCallerNames).not.toContain('get'); // No self-edge from this.store.get
+        expect(getCallerNames).not.toContain('run'); // Service.run calling this.store.get does NOT link to LRUCache
+
+        // 2. Callers of LRUCache::set
+        const callersSet = await cg.getCallers(lruSet!.id);
+        const setCallerNames = callersSet.map((c) => c.node.name).sort();
+        expect(setCallerNames).toEqual(['useConstructedProjectCache', 'useProjectCache']);
+        expect(setCallerNames).not.toContain('useLocalMap');
+        expect(setCallerNames).not.toContain('set');
+
+        // 3. Callers of LRUCache::has
+        const callersHas = await cg.getCallers(lruHas!.id);
+        const hasCallerNames = callersHas.map((c) => c.node.name).sort();
+        expect(hasCallerNames).toEqual(['useConstructedProjectCache', 'useProjectCache']);
+        expect(hasCallerNames).not.toContain('useLocalMap');
+        expect(hasCallerNames).not.toContain('has');
+
+        // 4. Callees of useLocalMap, useNestedMap, useDynamicReceivers: zero calls to LRUCache methods
+        const useLocalMapFn = allNodes.find((n) => n.kind === 'function' && n.name === 'useLocalMap');
+        const useNestedMapFn = allNodes.find((n) => n.kind === 'function' && n.name === 'useNestedMap');
+        const useDynamicFn = allNodes.find((n) => n.kind === 'function' && n.name === 'useDynamicReceivers');
+
+        const localMapCallees = await cg.getCallees(useLocalMapFn!.id);
+        expect(localMapCallees.filter((c) => c.node.qualifiedName.startsWith('LRUCache'))).toHaveLength(0);
+
+        const nestedMapCallees = await cg.getCallees(useNestedMapFn!.id);
+        expect(nestedMapCallees.filter((c) => c.node.qualifiedName.startsWith('LRUCache'))).toHaveLength(0);
+
+        const dynamicCallees = await cg.getCallees(useDynamicFn!.id);
+        expect(dynamicCallees.filter((c) => c.node.qualifiedName.startsWith('LRUCache'))).toHaveLength(0);
+
+        // 5. Positive recall controls: useConstructedProjectCache and useProjectCache have method call edges
+        const useProjectCacheFn = allNodes.find((n) => n.kind === 'function' && n.name === 'useProjectCache');
+        const projectCacheCallees = await cg.getCallees(useProjectCacheFn!.id);
+        const projectMethodCallees = projectCacheCallees.filter((c) => c.node.kind === 'method').map((c) => c.node.name).sort();
+        expect(projectMethodCallees).toEqual(['get', 'has', 'set']);
+
+        const constructedCacheCallees = await cg.getCallees(
+          allNodes.find((n) => n.kind === 'function' && n.name === 'useConstructedProjectCache')!.id
+        );
+        const constructedMethodCallees = constructedCacheCallees.filter((c) => c.node.kind === 'method').map((c) => c.node.name).sort();
+        expect(constructedMethodCallees).toEqual(['get', 'has', 'set']);
+
+        // 6. Scoped typed field recall: this.mailer.send() -> Mailer::send (#1566/#1496)
+        const mailerSend = allNodes.find((n) => n.kind === 'method' && n.name === 'send' && n.qualifiedName.startsWith('Mailer'));
+        expect(mailerSend).toBeDefined();
+        const mailerSendCallers = await cg.getCallers(mailerSend!.id);
+        expect(mailerSendCallers.map((c) => c.node.name)).toContain('run');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('retries unresolved project typed receiver calls via conformance second pass (#1566 Blocker B)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-conformance-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'service.ts'),
+          `export class BaseService {
+  run(): void {
+    console.log("running base service");
+  }
+}
+
+export class DerivedService extends BaseService {}
+
+export function useDerived(): void {
+  const svc = new DerivedService();
+  svc.run();
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('service.ts');
+        const baseRun = allNodes.find((n) => n.kind === 'method' && n.name === 'run' && n.qualifiedName.startsWith('BaseService'));
+        expect(baseRun).toBeDefined();
+
+        const callers = await cg.getCallers(baseRun!.id);
+        const callerNames = callers.map((c) => c.node.name);
+        expect(callerNames).toContain('useDerived');
+
+        const useDerivedFn = allNodes.find((n) => n.kind === 'function' && n.name === 'useDerived');
+        const callees = await cg.getCallees(useDerivedFn!.id);
+        const calleeMethods = callees.filter((c) => c.node.kind === 'method').map((c) => c.node.name);
+        expect(calleeMethods).toContain('run');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('built-in Map receiver does not resolve to unrelated same-named project class Map decoy (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-map-decoy-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'decoy.ts'),
+          `export class BaseMap {
+  get(key: string): string | undefined {
+    return undefined;
+  }
+}
+export class Map extends BaseMap {}
+`
+        );
+        fs.writeFileSync(
+          path.join(tmpDir, 'use.ts'),
+          `export function useBuiltinMap(): string | undefined {
+  const values = new Map<string, string>();
+  return values.get("x");
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('use.ts');
+        const useFn = allNodes.find((n) => n.kind === 'function' && n.name === 'useBuiltinMap');
+        expect(useFn).toBeDefined();
+
+        const callees = await cg.getCallees(useFn!.id);
+        expect(callees.filter((c) => c.node.name === 'get')).toHaveLength(0);
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('external SDK import does not bind to unrelated project same-named class decoy (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-sdk-decoy-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'decoy.ts'),
+          `export class BaseClient {
+  run(): void {}
+}
+export class ExternalClient extends BaseClient {
+  send(): void {}
+}
+`
+        );
+        fs.writeFileSync(
+          path.join(tmpDir, 'use.ts'),
+          `import { ExternalClient } from "external-sdk";
+export function useExternal(client: ExternalClient): void {
+  client.send();
+  client.run();
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('use.ts');
+        const useFn = allNodes.find((n) => n.kind === 'function' && n.name === 'useExternal');
+        expect(useFn).toBeDefined();
+
+        const callees = await cg.getCallees(useFn!.id);
+        expect(callees.filter((c) => c.node.name === 'send' || c.node.name === 'run')).toHaveLength(0);
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('distinct same-named Engine classes maintain node-anchored conformance paths (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-engine-paths-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.mkdirSync(path.join(tmpDir, 'a'), { recursive: true });
+        fs.mkdirSync(path.join(tmpDir, 'b'), { recursive: true });
+        fs.writeFileSync(
+          path.join(tmpDir, 'a', 'engine.ts'),
+          `export class BaseA {
+  run(): void {}
+}
+export class Engine extends BaseA {}
+`
+        );
+        fs.writeFileSync(
+          path.join(tmpDir, 'b', 'engine.ts'),
+          `export class BaseB {
+  run(): void {}
+}
+export class Engine extends BaseB {}
+`
+        );
+        fs.writeFileSync(
+          path.join(tmpDir, 'use.ts'),
+          `import { Engine } from "./a/engine";
+export function useEngineA(): void {
+  const engine = new Engine();
+  engine.run();
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodesA = cg.getNodesInFile('a/engine.ts');
+        const baseARun = allNodesA.find((n) => n.kind === 'method' && n.name === 'run' && n.qualifiedName.startsWith('BaseA'));
+        expect(baseARun).toBeDefined();
+
+        const allNodesB = cg.getNodesInFile('b/engine.ts');
+        const baseBRun = allNodesB.find((n) => n.kind === 'method' && n.name === 'run' && n.qualifiedName.startsWith('BaseB'));
+        expect(baseBRun).toBeDefined();
+
+        const callersA = await cg.getCallers(baseARun!.id);
+        expect(callersA.map((c) => c.node.name)).toContain('useEngineA');
+
+        const callersB = await cg.getCallers(baseBRun!.id);
+        expect(callersB.map((c) => c.node.name)).not.toContain('useEngineA');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('nested class field within method does not hijack outer class this.field receiver (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-nested-class-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'service.ts'),
+          `export class Mailer {
+  send(message: string): void {}
+}
+export class Decoy {
+  send(message: string): void {}
+}
+export class Service {
+  run(): void {
+    class Local {
+      mailer: Decoy;
+    }
+    this.mailer.send("hello");
+  }
+  mailer: Mailer;
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('service.ts');
+        const mailerSend = allNodes.find((n) => n.kind === 'method' && n.name === 'send' && n.qualifiedName.startsWith('Mailer'));
+        const decoySend = allNodes.find((n) => n.kind === 'method' && n.name === 'send' && n.qualifiedName.startsWith('Decoy'));
+        expect(mailerSend).toBeDefined();
+        expect(decoySend).toBeDefined();
+
+        const mailerCallers = await cg.getCallers(mailerSend!.id);
+        expect(mailerCallers.map((c) => c.node.name)).toContain('run');
+
+        const decoyCallers = await cg.getCallers(decoySend!.id);
+        expect(decoyCallers.map((c) => c.node.name)).not.toContain('run');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('typed Service receiver must not resolve to Local::send (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-local-method-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'service.ts'),
+          `export class Service {
+  setup(): void {
+    class Local {
+      send(): void {}
+    }
+  }
+}
+
+export function useService(service: Service): void {
+  service.send();
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('service.ts');
+        const localSend = allNodes.find((n) => n.kind === 'method' && n.name === 'send');
+        expect(localSend).toBeDefined();
+
+        const callers = await cg.getCallers(localSend!.id);
+        expect(callers.map((c) => c.node.name)).not.toContain('useService');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('typed Service receiver must not resolve nested function save (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-nested-fn-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'service.ts'),
+          `export class Service {
+  setup(): void {
+    function save(): void {}
+  }
+}
+
+export function useService(service: Service): void {
+  service.save();
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('service.ts');
+        const nestedSave = allNodes.find((n) => (n.kind === 'function' || n.kind === 'method') && n.name === 'save');
+        expect(nestedSave).toBeDefined();
+
+        const callers = await cg.getCallers(nestedSave!.id);
+        expect(callers.map((c) => c.node.name)).not.toContain('useService');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('same-file local Worker must not bind top-level Worker (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-shadow-worker-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'worker.ts'),
+          `export class Worker {
+  run(): void {}
+}
+
+export function use(): void {
+  class Worker {
+    stop(): void {}
+  }
+
+  const worker = new Worker();
+  worker.run();
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('worker.ts');
+        const topLevelRun = allNodes.find((n) => n.kind === 'method' && n.name === 'run' && n.qualifiedName.startsWith('Worker'));
+        expect(topLevelRun).toBeDefined();
+
+        const callers = await cg.getCallers(topLevelRun!.id);
+        expect(callers.map((c) => c.node.name)).not.toContain('use');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('nested Local constructor parameter property does not hijack Service constructor (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-nested-ctor-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'service.ts'),
+          `export class Mailer {
+  send(): void {}
+}
+
+export class Decoy {
+  send(): void {}
+}
+
+export class Service {
+  run(): void {
+    class Local {
+      constructor(private mailer: Decoy) {}
+    }
+
+    this.mailer.send();
+  }
+
+  constructor(private mailer: Mailer) {}
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('service.ts');
+        const mailerSend = allNodes.find((n) => n.kind === 'method' && n.name === 'send' && n.qualifiedName.startsWith('Mailer'));
+        const decoySend = allNodes.find((n) => n.kind === 'method' && n.name === 'send' && n.qualifiedName.startsWith('Decoy'));
+        expect(mailerSend).toBeDefined();
+        expect(decoySend).toBeDefined();
+
+        const mailerCallers = await cg.getCallers(mailerSend!.id);
+        expect(mailerCallers.map((c) => c.node.name)).toContain('run');
+
+        const decoyCallers = await cg.getCallers(decoySend!.id);
+        expect(decoyCallers.map((c) => c.node.name)).not.toContain('run');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('nested Local constructor parameter property alone does not fabricate Service.mailer (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-nested-ctor-alone-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'service.ts'),
+          `export class Decoy {
+  send(): void {}
+}
+
+export class Service {
+  run(): void {
+    class Local {
+      constructor(private mailer: Decoy) {}
+    }
+
+    this.mailer.send();
+  }
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('service.ts');
+        const decoySend = allNodes.find((n) => n.kind === 'method' && n.name === 'send' && n.qualifiedName.startsWith('Decoy'));
+        expect(decoySend).toBeDefined();
+
+        const decoyCallers = await cg.getCallers(decoySend!.id);
+        expect(decoyCallers.map((c) => c.node.name)).not.toContain('run');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('inherited BaseService with nested Local::run must not resolve (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-inherited-local-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'service.ts'),
+          `export class BaseService {
+  setup(): void {
+    class Local {
+      run(): void {}
+    }
+  }
+}
+
+export class DerivedService extends BaseService {}
+
+export function useDerived(service: DerivedService): void {
+  service.run();
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('service.ts');
+        const localRun = allNodes.find((n) => n.kind === 'method' && n.name === 'run');
+        expect(localRun).toBeDefined();
+
+        const callers = await cg.getCallers(localRun!.id);
+        expect(callers.map((c) => c.node.name)).not.toContain('useDerived');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('inherited BaseService with nested function run must not resolve (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-inherited-fn-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'service.ts'),
+          `export class BaseService {
+  setup(): void {
+    function run(): void {}
+  }
+}
+
+export class DerivedService extends BaseService {}
+
+export function useDerived(service: DerivedService): void {
+  service.run();
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('service.ts');
+        const nestedRun = allNodes.find((n) => (n.kind === 'function' || n.kind === 'method') && n.name === 'run');
+        expect(nestedRun).toBeDefined();
+
+        const callers = await cg.getCallers(nestedRun!.id);
+        expect(callers.map((c) => c.node.name)).not.toContain('useDerived');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('deeper nested Worker inside inner function is not visible to outer use (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-deeper-worker-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'worker.ts'),
+          `export class Worker {
+  run(): void {}
+}
+
+export function use(): void {
+  function inner(): void {
+    class Worker {
+      stop(): void {}
+    }
+  }
+
+  const worker = new Worker();
+  worker.stop();
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('worker.ts');
+        const innerStop = allNodes.find((n) => n.kind === 'method' && n.name === 'stop');
+        expect(innerStop).toBeDefined();
+
+        const callers = await cg.getCallers(innerStop!.id);
+        expect(callers.map((c) => c.node.name)).not.toContain('use');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('C++ out-of-line inherited method resolves through conformance postpass (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-cpp-inherit-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'base.hpp'),
+          `#pragma once
+class Base {
+public:
+    void run();
+};
+class Derived : public Base {};
+`
+        );
+        fs.writeFileSync(
+          path.join(tmpDir, 'base.cpp'),
+          `#include "base.hpp"
+void Base::run() {}
+`
+        );
+        fs.writeFileSync(
+          path.join(tmpDir, 'use.cpp'),
+          `#include "base.hpp"
+void use() {
+    Derived d;
+    d.run();
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('base.cpp');
+        const baseRun = allNodes.find((n) => n.kind === 'method' && n.name === 'run' && n.qualifiedName === 'Base::run');
+        expect(baseRun).toBeDefined();
+
+        const callers = await cg.getCallers(baseRun!.id);
+        expect(callers.map((c) => c.node.name)).toContain('use');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('multiple same-depth inherited targets decline resolution due to ambiguity (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-depth-ambiguity-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'test.ts'),
+          `export class SuperA {
+  run(): void {}
+}
+export class SuperB {
+  run(): void {}
+}
+export class Derived implements SuperA, SuperB {
+  // no run of its own
+}
+export function use(d: Derived): void {
+  d.run();
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('test.ts');
+        const runA = allNodes.find((n) => n.kind === 'method' && n.name === 'run' && n.qualifiedName.startsWith('SuperA'));
+        const runB = allNodes.find((n) => n.kind === 'method' && n.name === 'run' && n.qualifiedName.startsWith('SuperB'));
+        expect(runA).toBeDefined();
+        expect(runB).toBeDefined();
+
+        const callersA = await cg.getCallers(runA!.id);
+        const callersB = await cg.getCallers(runB!.id);
+        expect(callersA.map((c) => c.node.name)).not.toContain('use');
+        expect(callersB.map((c) => c.node.name)).not.toContain('use');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+  });
+
   describe('Object-literal namespace members (#1573)', () => {
     // `export const api = { call() {…}, get: () => {…} }` used as the module's
     // API surface: the members are plain functions with bare names inside the
