@@ -140,8 +140,73 @@ describe('inertia resolver — extraction from each adapter', () => {
     expect(extract('app/models/user.rb', 'class User\nend\n')).toEqual([]);
   });
 
+  it('extracts props from the piped Phoenix form, where conn is not an argument', () => {
+    // Idiomatic Elixir pipes the conn in, so the render call carries only the
+    // page and the props. A pattern that requires a positional conn matches
+    // none of these — which is most of them in a real Phoenix codebase.
+    const nodes = extract('lib/app_web/controllers/page_controller.ex',
+      'conn\n|> put_status(404)\n|> Inertia.Controller.render_inertia("Errors/NotFound", %{requested_path: p, suggestion: s})\n');
+    expect(nodes.map((n) => n.name)).toEqual(['requested_path', 'suggestion']);
+    expect(nodes[0]!.decorators).toContain('page=Errors/NotFound');
+  });
+
   it('ignores a computed page name — it names no component we could find', () => {
     expect(extract('lib/x.ex', 'render_inertia(conn, page_name, %{a: 1})')).toEqual([]);
+    // The piped form of the same thing is equally unusable.
+    expect(extract('lib/x.ex', 'conn |> render_inertia(page_name, %{a: 1})')).toEqual([]);
+  });
+});
+
+describe('inertia resolver — detection', () => {
+  // Inertia is a server+client framework, so the app that uses it is often not
+  // the root of the repo it lives in. Reading only root manifests means the
+  // resolver silently never activates on that layout, and a silent
+  // non-activation is indistinguishable from a project that has no Inertia.
+  const contextWith = (files: Record<string, string>): any => ({
+    readFile: (p: string) => files[p] ?? null,
+    getAllFiles: () => Object.keys(files),
+  });
+
+  it('detects an adapter declared in a root manifest', () => {
+    expect(inertiaResolver.detect!(contextWith({
+      'mix.exs': 'defp deps do [{:inertia, "~> 2.0"}] end',
+    }))).toBe(true);
+  });
+
+  it('detects an adapter declared in a nested app manifest', () => {
+    expect(inertiaResolver.detect!(contextWith({
+      'package.json': '{"devDependencies":{"prettier":"^3"}}',
+      'app/mix.exs': 'defp deps do [{:inertia, "~> 2.0"}] end',
+      'app/lib/app_web/router.ex': 'defmodule R do end',
+    }))).toBe(true);
+  });
+
+  it('detects a client-only adapter under a workspace', () => {
+    expect(inertiaResolver.detect!(contextWith({
+      'app/assets/package.json': '{"dependencies":{"@inertiajs/react":"^2"}}',
+    }))).toBe(true);
+  });
+
+  it('stays off for a project with manifests but no Inertia', () => {
+    expect(inertiaResolver.detect!(contextWith({
+      'package.json': '{"dependencies":{"react":"^19"}}',
+      'app/mix.exs': 'defp deps do [{:phoenix, "~> 1.7"}] end',
+      'app/composer.json': '{"require":{"laravel/framework":"^11"}}',
+    }))).toBe(false);
+  });
+
+  it('does not read every file in the repo looking for one', () => {
+    // The scan is over manifests by name, not content — a large repo must not
+    // pay a whole-index read for a framework it does not use.
+    const read: string[] = [];
+    const files: Record<string, string> = {};
+    for (let i = 0; i < 500; i++) files[`src/mod_${i}.ts`] = 'export const x = 1;';
+    files['app/mix.exs'] = 'defp deps do [{:phoenix, "~> 1.7"}] end';
+    inertiaResolver.detect!({
+      readFile: (p: string) => { read.push(p); return files[p] ?? null; },
+      getAllFiles: () => Object.keys(files),
+    } as any);
+    expect(read.filter((p) => p.endsWith('.ts'))).toEqual([]);
   });
 });
 

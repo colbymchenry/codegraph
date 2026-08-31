@@ -55,8 +55,12 @@ const RENDER_PATTERNS: RegExp[] = [
   /(?:Inertia::render|inertia)\s*\(\s*['"]([^'"]+)['"]\s*,\s*(\[)/g,
   // Rails: render inertia: 'Page/Name', props: { ... }
   /render\s+inertia:\s*['"]([^'"]+)['"]\s*,\s*props:\s*(\{)/g,
-  // Phoenix: render_inertia(conn, "Page/Name", %{ ... })
-  /render_inertia\s*\([^,]+,\s*['"]([^'"]+)['"]\s*,\s*(%\{|\{)/g,
+  // Phoenix: render_inertia(conn, "Page/Name", %{ ... }), and the pipe form
+  // `conn |> render_inertia("Page/Name", %{ ... })` — which is how Elixir
+  // actually writes it, and where the conn is not an argument at the call site
+  // at all. The leading conn is therefore optional; excluding quotes from it
+  // keeps the page name itself from being mistaken for one.
+  /render_inertia\s*\(\s*(?:[^,()'"]+,\s*)?['"]([^'"]+)['"]\s*,\s*(%\{|\{)/g,
 ];
 
 /** Balanced-delimiter slice starting at `open`, so a nested map does not truncate it. */
@@ -134,10 +138,39 @@ export function clientCandidates(key: string, preserved: boolean): string[] {
   return camel && camel !== key ? [key, camel] : [key];
 }
 
-/** Signals that a project uses Inertia at all. */
+/** The dependency manifests an Inertia adapter can be declared in. */
+const MANIFESTS = new Set(['package.json', 'composer.json', 'Gemfile', 'mix.exs']);
+
+/**
+ * Backstop for a repo carrying an unusual number of manifests; a real project
+ * declares its server and client adapters in a handful.
+ */
+const MANIFEST_SCAN_CAP = 64;
+
+/**
+ * Signals that a project uses Inertia at all.
+ *
+ * Manifests are looked for ANYWHERE in the index, not just at the project
+ * root. Inertia is a server+client framework, so the app that uses it is
+ * frequently not the root of the repository it lives in — `app/mix.exs` beside
+ * `app/assets/`, or a `package.json` under a client workspace, with the root
+ * holding only tooling. Reading the root alone means the resolver silently
+ * never activates on exactly the layout Inertia projects tend to have, and a
+ * silent non-activation looks identical to a project that does not use it.
+ */
 function usesInertia(context: ResolutionContext): boolean {
-  for (const manifest of ['package.json', 'composer.json', 'Gemfile', 'mix.exs']) {
+  const rootFirst = ['package.json', 'composer.json', 'Gemfile', 'mix.exs'];
+  for (const manifest of rootFirst) {
     const content = context.readFile(manifest);
+    if (content && /inertia/i.test(content)) return true;
+  }
+
+  let scanned = 0;
+  for (const filePath of context.getAllFiles()) {
+    const base = filePath.slice(filePath.lastIndexOf('/') + 1);
+    if (!MANIFESTS.has(base) || !filePath.includes('/')) continue;
+    if (++scanned > MANIFEST_SCAN_CAP) break;
+    const content = context.readFile(filePath);
     if (content && /inertia/i.test(content)) return true;
   }
   return false;
