@@ -16,7 +16,7 @@ import {
   FrameworkResolver,
   ImportMapping,
 } from './types';
-import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
+import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, shouldDeferTypedReceiver, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
 import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { detectFrameworks } from './frameworks';
@@ -217,6 +217,11 @@ export class ReferenceResolver {
   // same reason as deferredChainRefs and drained by
   // resolveDeferredThisMemberRefs once implements/extends edges exist (#808).
   private deferredThisMemberRefs: UnresolvedRef[] = [];
+  // Typed receiver call refs whose inferred receiver is a project aggregate type
+  // (class/interface/struct), whose method was not on the class itself and may be
+  // inherited. Drained by resolveTypedReceiverCallsViaConformance once
+  // implements/extends edges exist (#1566).
+  private deferredTypedReceiverRefs: UnresolvedRef[] = [];
   // Per-`.razor`/`.cshtml`-file `@using` namespace set (own directives + folder
   // `_Imports.razor`, cascading to the project root). Used to disambiguate a
   // markup type ref to the right C# namespace.
@@ -1047,6 +1052,16 @@ export class ReferenceResolver {
         PHP_PROP_SHAPE.test(ref.referenceName)
       ) {
         this.deferredChainRefs.push(ref);
+      } else if (
+        // Typed local receiver / field receiver call whose declared receiver type
+        // is a project aggregate type (class, interface, struct, etc.): its method
+        // may be inherited from a supertype, resolvable once implements/extends
+        // edges exist (#1566). Definitive misses (built-in / external types like
+        // Map, Promise, URL) are not project aggregates and do not defer.
+        ref.referenceKind === 'calls' &&
+        shouldDeferTypedReceiver(ref, this.context)
+      ) {
+        this.deferredTypedReceiverRefs.push(ref);
       }
       return null;
     }
@@ -1450,6 +1465,7 @@ export class ReferenceResolver {
     unresolved: UnresolvedRef[];
     deferredChain: UnresolvedRef[];
     deferredThisMember: UnresolvedRef[];
+    deferredTypedReceiver: UnresolvedRef[];
     byMethod: Record<string, number>;
   } {
     this.warmCaches();
@@ -1481,6 +1497,7 @@ export class ReferenceResolver {
       unresolved,
       deferredChain: this.deferredChainRefs.splice(0),
       deferredThisMember: this.deferredThisMemberRefs.splice(0),
+      deferredTypedReceiver: this.deferredTypedReceiverRefs.splice(0),
       byMethod,
     };
   }
@@ -1496,12 +1513,17 @@ export class ReferenceResolver {
   /**
    * Re-queue deferred post-pass refs produced by resolver workers, preserving
    * their admission order so resolveChainedCallsViaConformance /
-   * resolveDeferredThisMemberRefs process them exactly as the sequential path
-   * would have.
+   * resolveDeferredThisMemberRefs / resolveTypedReceiverCallsViaConformance
+   * process them exactly as the sequential path would have.
    */
-  appendDeferredFromWorkers(deferredChain: UnresolvedRef[], deferredThisMember: UnresolvedRef[]): void {
+  appendDeferredFromWorkers(
+    deferredChain: UnresolvedRef[],
+    deferredThisMember: UnresolvedRef[],
+    deferredTypedReceiver: UnresolvedRef[] = []
+  ): void {
     this.deferredChainRefs.push(...deferredChain);
     this.deferredThisMemberRefs.push(...deferredThisMember);
+    this.deferredTypedReceiverRefs.push(...deferredTypedReceiver);
   }
 
   /**
@@ -1661,7 +1683,7 @@ export class ReferenceResolver {
       if (inFlight.mode === 'pool') {
         const settled = await inFlight.settled;
         if (settled.ok) {
-          this.appendDeferredFromWorkers(settled.out.deferredChain, settled.out.deferredThisMember);
+          this.appendDeferredFromWorkers(settled.out.deferredChain, settled.out.deferredThisMember, settled.out.deferredTypedReceiver);
           return {
             resolved: settled.out.resolved,
             unresolved: settled.out.unresolved,
@@ -2406,6 +2428,38 @@ export class ReferenceResolver {
           resolvedBy: 'function-ref',
         });
       }
+    }
+    if (resolved.length === 0) return 0;
+
+    const edges = this.createEdges(resolved);
+    if (edges.length > 0) {
+      this.queries.insertEdges(edges);
+      this.clearCaches();
+    }
+    return edges.length;
+  }
+
+  /**
+   * Second resolution pass for typed receiver calls whose method may be defined
+   * on a supertype the receiver extends/implements (#1566).
+   * Operates on leftover unresolved calls whose receiver type is a project aggregate
+   * (e.g. `Derived extends Base`, `const d = new Derived()`, `d.run()`).
+   * Runs after implements/extends edges exist, so resolveMethodOnType can walk them.
+   * Returns the number of newly-created edges.
+   */
+  async resolveTypedReceiverCallsViaConformance(): Promise<number> {
+    const deferred = this.deferredTypedReceiverRefs;
+    this.deferredTypedReceiverRefs = [];
+    if (deferred.length === 0) return 0;
+
+    this.clearCaches();
+    const maybeYield = createYielder();
+    const resolved: ResolvedRef[] = [];
+    for (const ref of deferred) {
+      await maybeYield();
+      const match = matchMethodCall(ref, this.context);
+      const gated = this.gateLanguage(match, ref);
+      if (gated) resolved.push(gated);
     }
     if (resolved.length === 0) return 0;
 

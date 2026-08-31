@@ -4491,7 +4491,8 @@ export class TreeSitterExtractor {
               // (`holder.values.get`, `this.store.get`, `this.mailer.send`)
               // so resolution does not lose receiver context and fall back to
               // bare-name guessing (#1566/#1496). Dynamic/computed/call-result
-              // receivers keep the bare method name.
+              // receivers have no static receiver identity and do NOT degrade
+              // to a bare method name that could fabricate a project edge.
               const chain = getStaticMemberChain(receiver, this.source);
               if (chain) {
                 if (!SKIP_RECEIVERS.has(chain)) {
@@ -4500,7 +4501,7 @@ export class TreeSitterExtractor {
                   calleeName = methodName;
                 }
               } else {
-                calleeName = methodName;
+                return;
               }
             } else if (receiver && (receiver.type === 'identifier' || receiver.type === 'simple_identifier' || receiver.type === 'field_identifier')) {
               const receiverName = getNodeText(receiver, this.source);

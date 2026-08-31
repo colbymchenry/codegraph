@@ -28,6 +28,7 @@ export interface ChunkResult {
   unresolved: UnresolvedRef[];
   deferredChain: UnresolvedRef[];
   deferredThisMember: UnresolvedRef[];
+  deferredTypedReceiver: UnresolvedRef[];
   byMethod: Record<string, number>;
 }
 
@@ -168,6 +169,7 @@ export class ResolverPool {
             unresolved: msg.unresolved!,
             deferredChain: msg.deferredChain!,
             deferredThisMember: msg.deferredThisMember!,
+            deferredTypedReceiver: msg.deferredTypedReceiver ?? [],
             byMethod: msg.byMethod!,
           });
         } else if (msg.type === 'synth-result' && msg.id !== undefined) {
@@ -254,12 +256,13 @@ export class ResolverPool {
       );
     }
     const chunks = await Promise.all(chunkPromises);
-    const out: ChunkResult = { resolved: [], unresolved: [], deferredChain: [], deferredThisMember: [], byMethod: {} };
+    const out: ChunkResult = { resolved: [], unresolved: [], deferredChain: [], deferredThisMember: [], deferredTypedReceiver: [], byMethod: {} };
     for (const c of chunks) {
       out.resolved.push(...c.resolved);
       out.unresolved.push(...c.unresolved);
       out.deferredChain.push(...c.deferredChain);
       out.deferredThisMember.push(...c.deferredThisMember);
+      out.deferredTypedReceiver.push(...c.deferredTypedReceiver);
       for (const [k, v] of Object.entries(c.byMethod)) out.byMethod[k] = (out.byMethod[k] || 0) + v;
     }
     return out;

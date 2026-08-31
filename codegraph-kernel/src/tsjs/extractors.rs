@@ -1071,7 +1071,9 @@ impl<'t> Walker<'t> {
                                 callee_name = method_name.to_string();
                             }
                         } else {
-                            callee_name = method_name.to_string();
+                            // Dynamic/computed/call-result receiver has no static receiver identity.
+                            // DO NOT degrade to bare method name (#1566).
+                            return;
                         }
                     } else {
                         callee_name = method_name.to_string();

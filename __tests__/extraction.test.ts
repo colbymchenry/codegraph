@@ -11920,7 +11920,7 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
   });
 
   describe('TypeScript/JavaScript nested receiver extraction (#1566)', () => {
-    it('preserves static receiver chains and leaves dynamic expressions as bare method names', () => {
+    it('preserves static receiver chains and leaves dynamic expressions silent', () => {
       const src = `
 export class TestClass {
   private store = new Map<string, string>();
@@ -11955,8 +11955,8 @@ export class TestClass {
       expect(refNames).toContain('a.b.c.d');
       expect(refNames).toContain('testMethod'); // direct this.testMethod -> bare method
 
-      // Dynamic / computed expressions do not fabricate static chains
-      expect(refNames.filter((r) => r === 'get').length).toBe(2); // holder[key].get and factory().get
+      // Dynamic / computed expressions do not emit bare methodName refs (#1566 Blocker A)
+      expect(refNames).not.toContain('get');
       expect(refNames.some((r) => r.includes('factory().'))).toBe(false);
       expect(refNames.some((r) => r.includes('key]'))).toBe(false);
     });

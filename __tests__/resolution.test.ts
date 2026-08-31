@@ -3122,6 +3122,14 @@ export function useNestedMap(
   return holder.values.get("answer");
 }
 
+export function useDynamicReceivers(
+  holder: Record<string, any>,
+  key: string,
+): void {
+  holder[key].get("answer");
+  factory().get("answer");
+}
+
 export function useProjectCache(cache: LRUCache): boolean {
   cache.set("answer", "42");
   cache.get("answer");
@@ -3133,6 +3141,20 @@ export function useConstructedProjectCache(): boolean {
   cache.set("answer", "42");
   cache.get("answer");
   return cache.has("answer");
+}
+
+export class Mailer {
+  send(message: string): void {}
+}
+
+export class Service {
+  private mailer: Mailer;
+  private store = new Map<string, string>();
+
+  run(): void {
+    this.mailer.send("hello");
+    this.store.get("key");
+  }
 }
 `
         );
@@ -3154,7 +3176,9 @@ export function useConstructedProjectCache(): boolean {
         expect(getCallerNames).toEqual(['useConstructedProjectCache', 'useProjectCache']);
         expect(getCallerNames).not.toContain('useLocalMap');
         expect(getCallerNames).not.toContain('useNestedMap');
+        expect(getCallerNames).not.toContain('useDynamicReceivers');
         expect(getCallerNames).not.toContain('get'); // No self-edge from this.store.get
+        expect(getCallerNames).not.toContain('run'); // Service.run calling this.store.get does NOT link to LRUCache
 
         // 2. Callers of LRUCache::set
         const callersSet = await cg.getCallers(lruSet!.id);
@@ -3170,15 +3194,19 @@ export function useConstructedProjectCache(): boolean {
         expect(hasCallerNames).not.toContain('useLocalMap');
         expect(hasCallerNames).not.toContain('has');
 
-        // 4. Callees of useLocalMap and useNestedMap: zero calls to LRUCache methods
+        // 4. Callees of useLocalMap, useNestedMap, useDynamicReceivers: zero calls to LRUCache methods
         const useLocalMapFn = allNodes.find((n) => n.kind === 'function' && n.name === 'useLocalMap');
         const useNestedMapFn = allNodes.find((n) => n.kind === 'function' && n.name === 'useNestedMap');
+        const useDynamicFn = allNodes.find((n) => n.kind === 'function' && n.name === 'useDynamicReceivers');
 
         const localMapCallees = await cg.getCallees(useLocalMapFn!.id);
         expect(localMapCallees.filter((c) => c.node.qualifiedName.startsWith('LRUCache'))).toHaveLength(0);
 
         const nestedMapCallees = await cg.getCallees(useNestedMapFn!.id);
         expect(nestedMapCallees.filter((c) => c.node.qualifiedName.startsWith('LRUCache'))).toHaveLength(0);
+
+        const dynamicCallees = await cg.getCallees(useDynamicFn!.id);
+        expect(dynamicCallees.filter((c) => c.node.qualifiedName.startsWith('LRUCache'))).toHaveLength(0);
 
         // 5. Positive recall controls: useConstructedProjectCache and useProjectCache have method call edges
         const useProjectCacheFn = allNodes.find((n) => n.kind === 'function' && n.name === 'useProjectCache');
@@ -3191,6 +3219,55 @@ export function useConstructedProjectCache(): boolean {
         );
         const constructedMethodCallees = constructedCacheCallees.filter((c) => c.node.kind === 'method').map((c) => c.node.name).sort();
         expect(constructedMethodCallees).toEqual(['get', 'has', 'set']);
+
+        // 6. Scoped typed field recall: this.mailer.send() -> Mailer::send (#1566/#1496)
+        const mailerSend = allNodes.find((n) => n.kind === 'method' && n.name === 'send' && n.qualifiedName.startsWith('Mailer'));
+        expect(mailerSend).toBeDefined();
+        const mailerSendCallers = await cg.getCallers(mailerSend!.id);
+        expect(mailerSendCallers.map((c) => c.node.name)).toContain('run');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('retries unresolved project typed receiver calls via conformance second pass (#1566 Blocker B)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-conformance-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'service.ts'),
+          `export class BaseService {
+  run(): void {
+    console.log("running base service");
+  }
+}
+
+export class DerivedService extends BaseService {}
+
+export function useDerived(): void {
+  const svc = new DerivedService();
+  svc.run();
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('service.ts');
+        const baseRun = allNodes.find((n) => n.kind === 'method' && n.name === 'run' && n.qualifiedName.startsWith('BaseService'));
+        expect(baseRun).toBeDefined();
+
+        const callers = await cg.getCallers(baseRun!.id);
+        const callerNames = callers.map((c) => c.node.name);
+        expect(callerNames).toContain('useDerived');
+
+        const useDerivedFn = allNodes.find((n) => n.kind === 'function' && n.name === 'useDerived');
+        const callees = await cg.getCallees(useDerivedFn!.id);
+        const calleeMethods = callees.filter((c) => c.node.kind === 'method').map((c) => c.node.name);
+        expect(calleeMethods).toContain('run');
       } finally {
         if (cg) {
           cg.close();

@@ -1222,6 +1222,148 @@ function inferJavaFieldReceiverType(
   return lastPart;
 }
 
+/**
+ * Infer the declared or initialized type of a `this.<field>` receiver in TypeScript/JavaScript (#1566/#1496).
+ * Looks up the property/field on the enclosing class within the call site's file.
+ */
+export function inferTsJsFieldReceiverType(
+  receiverName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  if (!receiverName.startsWith('this.')) return null;
+  const fieldName = receiverName.slice('this.'.length);
+  if (!fieldName || fieldName.includes('.')) return null;
+
+  const inFile = context.getNodesInFile(ref.filePath);
+  if (inFile.length === 0) return null;
+
+  // Find the class enclosing the call line (tightest match by latest start).
+  let enclosing: Node | null = null;
+  for (const n of inFile) {
+    if (n.kind !== 'class' && n.kind !== 'interface') continue;
+    if (n.language !== ref.language && !sameLanguageFamily(n.language, ref.language)) continue;
+    const end = n.endLine ?? n.startLine;
+    if (n.startLine <= ref.line && end >= ref.line) {
+      if (!enclosing || n.startLine >= enclosing.startLine) enclosing = n;
+    }
+  }
+  if (!enclosing) return null;
+
+  const enclosingEnd = enclosing.endLine ?? enclosing.startLine;
+  const field = inFile.find(
+    (n) =>
+      (n.kind === 'property' || n.kind === 'field') &&
+      n.name === fieldName &&
+      (n.language === ref.language || sameLanguageFamily(n.language, ref.language)) &&
+      n.startLine >= enclosing.startLine &&
+      (n.endLine ?? n.startLine) <= enclosingEnd,
+  );
+  if (!field) return null;
+
+  if (field.signature && field.signature !== field.name) {
+    // Signature format: "<TypeName> <fieldName>" (from TS property extraction)
+    const beforeName = field.signature.slice(0, field.signature.lastIndexOf(field.name)).trim();
+    if (beforeName) {
+      const typeNoGenerics = beforeName.replace(/<[^>]*>/g, '').trim();
+      const typeNoArray = typeNoGenerics.replace(/\[\s*\]/g, '').trim();
+      const parts = typeNoArray.split(/[.\s]+/).filter(Boolean);
+      const lastPart = parts[parts.length - 1];
+      if (lastPart && /^[A-Z]/.test(lastPart)) {
+        return lastPart;
+      }
+    }
+  }
+
+  // If un-annotated, check field declaration line for `= new Type(...)`
+  const lines = context.getFileLines ? context.getFileLines(ref.filePath) : null;
+  if (lines && field.startLine <= lines.length) {
+    const lineText = lines[field.startLine - 1];
+    if (lineText) {
+      const initMatch = lineText.match(/=\s*new\s+([A-Z][a-zA-Z0-9_$]*)/);
+      if (initMatch && initMatch[1]) {
+        return initMatch[1];
+      }
+    }
+  }
+
+  return null;
+}
+
+const PROJECT_AGGREGATE_KINDS = new Set([
+  'class',
+  'interface',
+  'struct',
+  'trait',
+  'protocol',
+  'union',
+  'enum',
+]);
+
+/**
+ * Check if a type name corresponds to a project aggregate type (class, interface, struct, etc.)
+ * in the project graph (#1566).
+ */
+export function isProjectAggregateType(
+  typeName: string,
+  language: string,
+  context: ResolutionContext,
+): boolean {
+  const nodes = context.getNodesByName(typeName);
+  return nodes.some(
+    (n) => PROJECT_AGGREGATE_KINDS.has(n.kind) && (n.language === language || sameLanguageFamily(n.language, language))
+  );
+}
+
+/**
+ * Extract the inferred type of a call receiver from local variables or class fields (#1566).
+ */
+export function getInferredReceiverType(ref: UnresolvedRef, context: ResolutionContext): string | null {
+  if (ref.referenceKind !== 'calls') return null;
+  const dotMatch = ref.referenceName.match(/^([a-zA-Z0-9_$.]+)\.([a-zA-Z0-9_$]+)$/);
+  const luaColonMatch = ref.language === 'lua' ? ref.referenceName.match(/^([a-zA-Z0-9_]+):([a-zA-Z0-9_]+)$/) : null;
+  const rDollarMatch = ref.language === 'r' ? ref.referenceName.match(/^([a-zA-Z0-9_.]+)\$([a-zA-Z0-9_.]+)$/) : null;
+  const match = dotMatch || luaColonMatch || rDollarMatch;
+  if (!match) return null;
+  const [, objectOrClass] = match;
+  if (!objectOrClass) return null;
+
+  if (
+    (ref.language === 'typescript' ||
+      ref.language === 'javascript' ||
+      ref.language === 'tsx' ||
+      ref.language === 'jsx' ||
+      ref.language === 'arkts') &&
+    dotMatch &&
+    objectOrClass.startsWith('this.')
+  ) {
+    return inferTsJsFieldReceiverType(objectOrClass, ref, context);
+  }
+
+  if (dotMatch || luaColonMatch || rDollarMatch) {
+    if (ref.language === 'cpp') {
+      return inferCppReceiverType(objectOrClass, ref, context);
+    }
+    if (ref.language === 'java' || ref.language === 'kotlin') {
+      const local = inferLocalReceiverType(objectOrClass, ref, context);
+      if (local) return local;
+      return inferJavaFieldReceiverType(objectOrClass, ref, context);
+    }
+    return inferLocalReceiverType(objectOrClass, ref, context);
+  }
+  return null;
+}
+
+/**
+ * Returns true if a call reference was typed with a project aggregate type and should be retried
+ * during the conformance second pass after inheritance edges exist (#1566).
+ */
+export function shouldDeferTypedReceiver(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const inferred = getInferredReceiverType(ref, context);
+  if (!inferred) return false;
+  return isProjectAggregateType(inferred, ref.language, context);
+}
+
 // ── Local-variable receiver-type inference (#1108) ──────────────────────────
 //
 // Instance calls through a local variable (`const lg = new Logger(); lg.log()`)
@@ -1883,6 +2025,31 @@ export function matchMethodCall(
         0.9,
         'instance-method',
         importedFqn,
+      ));
+      return typedMatch;
+    }
+  }
+
+  // TypeScript / JavaScript / ArkTS: receiver may be `this.<field>` (#1566/#1496).
+  // Look up the declared/initialized type of the field on the enclosing class.
+  if (
+    (ref.language === 'typescript' ||
+      ref.language === 'javascript' ||
+      ref.language === 'tsx' ||
+      ref.language === 'jsx' ||
+      ref.language === 'arkts') &&
+    dotMatch &&
+    objectOrClass!.startsWith('this.')
+  ) {
+    const inferredType = inferTsJsFieldReceiverType(objectOrClass!, ref, context);
+    if (inferredType) {
+      const typedMatch = nmTimedT('mc-rmot', ref, () => resolveMethodOnType(
+        inferredType,
+        methodName!,
+        ref,
+        context,
+        0.9,
+        'instance-method',
       ));
       return typedMatch;
     }
