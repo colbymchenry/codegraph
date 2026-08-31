@@ -111,7 +111,15 @@ export function nameVariants(name: string): string[] {
 function indexByVariant(nodes: Node[]): Map<string, Node[]> {
   const out = new Map<string, Node[]>();
   for (const node of nodes) {
-    for (const variant of nameVariants(node.name)) {
+    // Generators for languages with dotted module names emit the FULL name as
+    // the declaration's own name — protobuf-elixir writes
+    // `defmodule Acme.V1.Interval`, so the node is named `Acme.V1.Interval` while
+    // the proto message is `Interval`. Index the trailing segment too, or every
+    // such peer is invisible to a simple-name match.
+    const spellings = new Set(nameVariants(node.name));
+    const dot = node.name.lastIndexOf('.');
+    if (dot > 0) for (const v of nameVariants(node.name.slice(dot + 1))) spellings.add(v);
+    for (const variant of spellings) {
       let bucket = out.get(variant);
       if (!bucket) { bucket = []; out.set(variant, bucket); }
       bucket.push(node);

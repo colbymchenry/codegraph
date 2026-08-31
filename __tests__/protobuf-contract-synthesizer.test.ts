@@ -243,3 +243,24 @@ export function render(m: Measurement) { return m.id; }
     }
   }, 120000);
 });
+
+describe('generated peers whose declaration name is fully qualified', () => {
+  // Generators for languages with dotted module names emit the FULL name as the
+  // declaration's own name: protobuf-elixir writes `defmodule Acme.V1.Interval`,
+  // so the node is named `Acme.V1.Interval` while the proto message is
+  // `Interval`. Matching only the simple name made every such peer invisible,
+  // and silently: a target language whose generator emits a bare name links
+  // normally, so the result looks like a working feature with one language's
+  // generator simply absent from the output.
+  it('matches a dotted declaration name by its trailing segment', async () => {
+    const { nameVariants } = await import('../src/resolution/protobuf-contract-synthesizer');
+    // The synthesizer indexes a candidate under both its own spellings and its
+    // trailing segment's; this is the property that makes that work.
+    const dotted = 'Acme.V1.Interval';
+    const trailing = dotted.slice(dotted.lastIndexOf('.') + 1);
+    expect(trailing).toBe('Interval');
+    expect(nameVariants(trailing)).toContain('Interval');
+    // The full dotted name alone never yields the simple name.
+    expect(nameVariants(dotted)).not.toContain('Interval');
+  });
+});
