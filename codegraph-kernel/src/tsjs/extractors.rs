@@ -1366,4 +1366,3 @@ fn get_static_member_chain<'t>(node: Node<'t>, source: &'t str) -> Option<String
         _ => None,
     }
 }
-

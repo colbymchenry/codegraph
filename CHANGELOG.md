@@ -14,7 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
-- Calls to built-in and external methods such as `Map.get`, `Map.set`, and `Map.has` in TypeScript/JavaScript no longer resolve to unrelated same-named project methods, and nested property calls (`this.store.get()`, `holder.values.get()`) no longer fabricate caller edges or self-edges when their target cannot be statically proven. Re-index after upgrading. (#1566)
+- Calls on built-in and external types (such as `Map.get`, `Map.set`, `Map.has`) in TypeScript/JavaScript no longer resolve to unrelated same-named project methods, static nested member calls (`holder.values.get()`, `this.store.get()`) preserve context rather than guessing or fabricating self-edges, dynamic/computed receivers (`holder[key].get()`, `factory().get()`) no longer emit phantom project calls, and inherited methods on typed instances continue to resolve accurately via conformance retry. Re-index after upgrading. (#1566)
 
 
 ## [1.6.0] - 2026-08-26
