@@ -11,7 +11,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { Node, UnresolvedReference } from '../src/types';
 import { ReferenceResolver, createResolver, ResolutionContext } from '../src/resolution';
-import { matchReference, resolveMethodOnType, matchByQualifiedName, preferCallSiteFile, matchMethodCall } from '../src/resolution/name-matcher';
+import { matchReference, resolveMethodOnType, matchByQualifiedName, preferCallSiteFile, matchMethodCall, isRunnerNamedTestFile } from '../src/resolution/name-matcher';
 import { resolveImportPath, extractImportMappings, resolveJvmImport, loadCppIncludeDirs, clearCppIncludeDirCache, isPhpIncludePathRef } from '../src/resolution/import-resolver';
 import type { UnresolvedRef } from '../src/resolution/types';
 import { detectFrameworks, getAllFrameworkResolvers } from '../src/resolution/frameworks';
@@ -34,6 +34,174 @@ describe('Resolution Module', () => {
     } else if (fs.existsSync(tempDir)) {
       fs.rmSync(tempDir, { recursive: true });
     }
+  });
+
+
+  describe('Production code never resolves into a test file', () => {
+    // Tests depend on the code they exercise; the code never depends on its
+    // tests. A production symbol resolving INTO a test file is therefore always
+    // wrong — and it happens constantly, because the names that reach the
+    // name-matching fallback are precisely the ones with no real definition to
+    // bind to.
+    const node = (over: Partial<Node>): Node => ({
+      id: 'n', kind: 'function', name: 'x', qualifiedName: 'x',
+      filePath: 'a.ts', language: 'typescript',
+      startLine: 1, endLine: 2, startColumn: 0, endColumn: 0,
+      updatedAt: Date.now(), ...over,
+    });
+    const contextOf = (nodes: Node[]): ResolutionContext => ({
+      getNodesInFile: () => nodes,
+      getNodesByName: (name: string) => nodes.filter((n) => n.name === name),
+      getNodesByQualifiedName: () => [],
+      getNodesByKind: () => [],
+      getNodesByLowerName: (lower: string) =>
+        nodes.filter((n) => n.name.toLowerCase() === lower),
+      getImportMappings: () => [],
+      fileExists: () => true,
+      readFile: () => null,
+      getProjectRoot: () => '/test',
+      getAllFiles: () => nodes.map((n) => n.filePath),
+    } as any);
+    const callFrom = (filePath: string, name: string, language = 'tsx') => ({
+      fromNodeId: `caller:${filePath}:c:1`,
+      referenceName: name,
+      referenceKind: 'calls' as const,
+      line: 5, column: 0, filePath, language: language as any,
+    });
+
+    it('declines a component call whose only candidate is a test stub', () => {
+      // `const { t } = useTranslation()` binds `t` from a package, so there is
+      // no local definition and no exported one — the only same-named symbol
+      // anywhere is a stub inside a test.
+      const nodes = [node({
+        id: 'stub:t', name: 't', qualifiedName: 'merge-dialog.test.tsx::t',
+        filePath: 'src/page-tests/merge-dialog.test.tsx', language: 'tsx',
+      })];
+      expect(matchReference(callFrom('src/pages/Planner.tsx', 't'), contextOf(nodes)))
+        .toBeNull();
+    });
+
+    it('prefers the production definition when both exist', () => {
+      const nodes = [
+        node({ id: 'test:format', name: 'format', qualifiedName: 'x.test.ts::format',
+               filePath: 'src/lib/x.test.ts' }),
+        node({ id: 'prod:format', name: 'format', qualifiedName: 'fmt.ts::format',
+               filePath: 'src/lib/fmt.ts' }),
+      ];
+      const result = matchReference(callFrom('src/pages/Row.tsx', 'format'), contextOf(nodes));
+      expect(result?.targetNodeId).toBe('prod:format');
+    });
+
+    it('leaves a call made BY a test alone', () => {
+      // Tests calling shared fixtures is the normal direction.
+      const nodes = [node({
+        id: 'stub:renderPage', name: 'renderPage',
+        qualifiedName: 'helpers.test.ts::renderPage',
+        filePath: 'src/page-tests/helpers.test.ts',
+      })];
+      const result = matchReference(
+        callFrom('src/page-tests/planner.test.tsx', 'renderPage'), contextOf(nodes));
+      expect(result?.targetNodeId).toBe('stub:renderPage');
+    });
+
+    it('identifies a test by the name its runner enforces, not by its directory', () => {
+      // Which directories hold tests is a project's own decision — `spec/` is an
+      // OpenAPI document in one repo and RSpec in another, and `testing/` is
+      // often a shipped utility library. Deleting edges on that guess would be
+      // silently wrong, so only runner-enforced filenames count.
+      expect(isRunnerNamedTestFile('src/lib/panel.test.ts')).toBe(true);
+      expect(isRunnerNamedTestFile('tests/test_collect.py')).toBe(true);
+      expect(isRunnerNamedTestFile('internal/server_test.go')).toBe(true);
+      expect(isRunnerNamedTestFile('src/main/java/app/OrderTest.java')).toBe(true);
+      expect(isRunnerNamedTestFile('spec/models/user_spec.rb')).toBe(true);
+
+      // Directory alone is never enough.
+      expect(isRunnerNamedTestFile('spec/openapi.yaml')).toBe(false);
+      expect(isRunnerNamedTestFile('src/testing/harness.ts')).toBe(false);
+      expect(isRunnerNamedTestFile('tests/helpers.ts')).toBe(false);
+      // And a lowercase "test" inside an ordinary word is not a match.
+      expect(isRunnerNamedTestFile('src/latest.ts')).toBe(false);
+      expect(isRunnerNamedTestFile('src/manifest.ts')).toBe(false);
+      expect(isRunnerNamedTestFile('src/protest.py')).toBe(false);
+
+      // The bare CamelCase suffix belongs to the JVM/.NET/Swift runners that
+      // collect on it. vitest and jest do not — they want `.test.`/`.spec.` —
+      // so `useTests.ts` is an ordinary hook and must stay resolvable.
+      expect(isRunnerNamedTestFile('src/hooks/useTests.ts')).toBe(false);
+      expect(isRunnerNamedTestFile('src/RequestSpec.tsx')).toBe(false);
+      expect(isRunnerNamedTestFile('app/OrderTests.java')).toBe(true);
+      expect(isRunnerNamedTestFile('app/OrderTest.kt')).toBe(true);
+    });
+
+    it('applies to a method resolved through an inferred receiver type', () => {
+      // This path reaches a candidate through a receiver type rather than a
+      // bare name, but fails the same way: an unpinned receiver settles for a
+      // same-named method, and a test class's method is as good a match as any.
+      const nodes = [node({
+        id: 'test:say', kind: 'method', name: 'say',
+        qualifiedName: 'Reporter::say', filePath: 'src/tests/test_report.py',
+        language: 'python',
+      })];
+      const ctx = contextOf(nodes);
+      const ref = { ...callFrom('src/tools/collect.py', 'say', 'python') };
+      expect(resolveMethodOnType('Reporter', 'say', ref as any, ctx, 0.9, 'instance-method'))
+        .toBeNull();
+      // A test calling the same method still resolves.
+      const fromTest = { ...callFrom('src/tests/test_collect.py', 'say', 'python') };
+      expect(resolveMethodOnType('Reporter', 'say', fromTest as any, ctx, 0.9, 'instance-method')
+        ?.targetNodeId).toBe('test:say');
+    });
+
+    it('applies to the receiver-name overlap fallback, which needs it most', () => {
+      // That strategy scores a receiver NAME against a class name, so a short
+      // receiver (`rep.say()`) matches a test's stand-in class (`_Rep`) on one
+      // shared word — and stand-ins are precisely the classes that share a name
+      // with the real collaborator they replace.
+      const nodes = [node({
+        id: 'test:_Rep.say', kind: 'method', name: 'say',
+        qualifiedName: 'test_collect::_Rep::say',
+        filePath: 'src/tests/test_collect.py', language: 'python',
+      })];
+      const ref = { ...callFrom('src/tools/answer.py', 'rep.say', 'python') };
+      expect(matchMethodCall(ref as any, contextOf(nodes))).toBeNull();
+    });
+
+    it('can be switched off for a project that relies on the old behaviour', async () => {
+      // The gate removes edges, so it carries the same escape hatch the
+      // ambiguity ceiling does. Read at module load, hence the reimport.
+      const prev = process.env.CODEGRAPH_TEST_TREE_GATE;
+      process.env.CODEGRAPH_TEST_TREE_GATE = '0';
+      try {
+        vi.resetModules();
+        const fresh = await import('../src/resolution/name-matcher');
+        const nodes = [node({
+          id: 'stub:t', name: 't', qualifiedName: 'merge.test.tsx::t',
+          filePath: 'src/page-tests/merge.test.tsx', language: 'tsx',
+        })];
+        expect(fresh.matchReference(
+          callFrom('src/pages/Planner.tsx', 't') as any, contextOf(nodes))
+        ).not.toBeNull();
+      } finally {
+        if (prev === undefined) delete process.env.CODEGRAPH_TEST_TREE_GATE;
+        else process.env.CODEGRAPH_TEST_TREE_GATE = prev;
+        vi.resetModules();
+      }
+    });
+
+    it('declines rather than falling back when the only candidate is a test', () => {
+      // The fabricated edges are precisely the ones with no production
+      // alternative, so a "keep it if nothing else matches" fallback would
+      // leave the entire defect in place. Production cannot depend on a test
+      // file — it would not build — so no match is the truthful answer.
+      const nodes = [node({
+        id: 'only:assertGolden', name: 'assertGolden',
+        qualifiedName: 'golden.test.ts::assertGolden',
+        filePath: 'src/lib/golden.test.ts',
+      })];
+      expect(matchReference(
+        callFrom('src/lib/report.ts', 'assertGolden', 'typescript'), contextOf(nodes)))
+        .toBeNull();
+    });
   });
 
   describe('Name Matcher', () => {

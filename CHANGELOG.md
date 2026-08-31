@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Calls from your code no longer resolve into your tests. Tests depend on the code they exercise, never the other way round, but a name with no real definition to bind to — a value destructured from a hook, a helper that lives in a package — would land on any same-named helper inside a test file. On one project every `t(...)` call across 137 page components pointed at a translation stub defined in a single test, making it the second most-called symbol in the codebase and its callers and impact almost entirely fictional. Test files are recognised by the names their test runner enforces (`test_*.py`, `*.test.ts`, `*_test.go`, `*Test.java`), never by which folder they sit in, so a `spec/` directory holding an API document or a `testing/` utility library is left alone. Set `CODEGRAPH_TEST_TREE_GATE=0` to restore the old behaviour.
+
 
 ## [1.6.0] - 2026-08-26
 

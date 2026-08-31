@@ -389,6 +389,81 @@ function isLexicallyReachable(
 }
 
 /**
+ * Whether to withhold test-file definitions from production references.
+ * On by default; `CODEGRAPH_TEST_TREE_GATE=0` restores the old behaviour, the
+ * same escape hatch `CODEGRAPH_AMBIGUOUS_NAME_CEILING` gives its own gate.
+ */
+const TEST_TREE_GATE = process.env.CODEGRAPH_TEST_TREE_GATE !== '0';
+
+/**
+ * Files a test RUNNER will collect, identified by the naming its own toolchain
+ * enforces — not by where they sit.
+ *
+ * The distinction matters because this gate DELETES edges, and a wrong deletion
+ * is silent. Which directories hold a project's tests is a project's own
+ * decision (`spec/` is an OpenAPI document in one repo and RSpec in another;
+ * `testing/` is often a shipped utility library), so guessing at it would
+ * remove real edges from projects that merely name a folder unluckily. A
+ * FILENAME, by contrast, is not a preference: pytest collects `test_*.py` and
+ * `*_test.py` and nothing else, `go test` requires `_test.go`, vitest and jest
+ * default to `*.test.*` / `*.spec.*`, surefire to `*Test.java`. A file named
+ * this way IS a test, in every project, by the runner's own rule.
+ *
+ * Measured on a mixed Elixir/TypeScript/Python repository: of the impossible
+ * production→test call edges, the runner-enforced names accounted for all but
+ * one. Directory guessing would have added the risk without the reward.
+ */
+export function isRunnerNamedTestFile(filePath: string): boolean {
+  const fileName = filePath.slice(filePath.lastIndexOf('/') + 1);
+  const lower = fileName.toLowerCase();
+  if (
+    // pytest: test_foo.py
+    lower.startsWith('test_') ||
+    // vitest/jest/go/pytest/rspec: foo.test.ts, foo_test.go, foo-spec.rb, bar_spec.py
+    /[._-](test|tests|spec|specs)\.[a-z0-9]+$/.test(lower)
+  ) {
+    return true;
+  }
+
+  // The bare CamelCase suffix — `OrderTest.java` — is a JVM/.NET/Swift
+  // convention (Maven surefire collects `**/*Test.java`, `**/*Tests.java`),
+  // NOT a JavaScript one: vitest and jest collect `*.test.ts` and would never
+  // pick up `useTests.ts`, which is an ordinary hook. Applying the suffix
+  // everywhere misreads any identifier that happens to end in "Test" or
+  // "Tests", so it is scoped to the languages whose runners actually use it.
+  return /\.(java|kt|kts|scala|cs|swift)$/i.test(fileName)
+    && /(?:Test|Tests|TestCase|Spec|Specs)\.[A-Za-z0-9]+$/.test(fileName);
+}
+
+/**
+ * Drop test-file definitions when the reference comes from production code.
+ *
+ * Tests depend on the code they exercise; the code never depends on its tests.
+ * So a production symbol resolving INTO a test file is always wrong — and it
+ * happens constantly, because the names that reach this fallback are the ones
+ * with no real definition to bind to. A React component calling `t(...)` from a
+ * `const { t } = useTranslation()` destructure has no local `t` node and no
+ * exported one either (the hook comes from a package), so the only candidates
+ * anywhere are same-named helpers inside test files, and proximity picks one.
+ * Measured on one repository: 2,820 calls across 137 production page components
+ * all resolved to a single i18n stub defined in one test file.
+ *
+ * A reference from a test is left alone — tests calling test helpers is the
+ * normal direction, and shared fixtures legitimately live in the test tree.
+ */
+function applyTestTreeGate(candidates: Node[], ref: UnresolvedRef): Node[] {
+  if (!TEST_TREE_GATE) return candidates;
+  if (isRunnerNamedTestFile(ref.filePath)) return candidates;
+  // Unconditional, including when it empties the set. A production symbol that
+  // matches ONLY inside tests is the exact shape of the defect: production code
+  // cannot depend on a test file — it would not build or run — so a lone
+  // test-file candidate is a coincidence of naming, never the real target.
+  // Keeping it as a fallback would leave the whole defect in place, since the
+  // fabricated edges are precisely the ones with no production alternative.
+  return candidates.filter((c) => !isRunnerNamedTestFile(c.filePath));
+}
+
+/**
  * Try to resolve a reference by exact name match
  */
 export function matchByExactName(
@@ -404,7 +479,8 @@ export function matchByExactName(
   // unresolved import refs each scored K same-named import candidates through
   // findBestMatch — O(K²) per package, the dominant cost of "Resolving refs" on
   // large import-heavy (front-end + back-end) repos (#915).
-  const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref)
+  const candidates = applyTestTreeGate(
+    applyLanguageGate(context.getNodesByName(ref.referenceName), ref), ref)
     .filter((n) => n.kind !== 'import')
     // Nested locals are only reachable from inside their container (#1230).
     .filter((n) => isLexicallyReachable(n, ref, context));
@@ -706,6 +782,13 @@ export function resolveMethodOnType(
       }
     }
   }
+  // Same rule as the name-based strategies: production code cannot depend on a
+  // test file, so a method that only matches inside one is a naming coincidence.
+  // This path reaches it through an inferred receiver type rather than a bare
+  // name, but the failure is identical — an unpinned receiver settles for a
+  // same-named method, and a test's class method is as good a match as any.
+  matches = applyTestTreeGate(matches, ref);
+
   if (matches.length === 0) {
     // Conformance fallback: the method may be defined on a supertype `typeName`
     // extends, or on a protocol / trait it conforms to (e.g. a Swift protocol-
@@ -1998,8 +2081,14 @@ export function matchMethodCall(
     if (methodCandidates.length > AMBIGUOUS_NAME_CEILING) {
       return null;
     }
-    const methods = methodCandidates.filter(
-      (n) => n.kind === 'method' && n.name === methodName
+    // Same rule as every other strategy: production code cannot depend on a
+    // test file. This one needs it most — it scores a receiver NAME against a
+    // class name, so a short receiver (`rep.say()`) matches any test's stand-in
+    // class (`_Rep`) on one shared word, and the stand-ins that tests define
+    // are exactly the classes that share a name with the real collaborator.
+    const methods = applyTestTreeGate(
+      methodCandidates.filter((n) => n.kind === 'method' && n.name === methodName),
+      ref
     );
 
     // Filter to same-language candidates first
@@ -2412,7 +2501,8 @@ export function matchFuzzy(
 
   // Filter to callable kinds only (function, method, class)
   const callableKinds = new Set(['function', 'method', 'class']);
-  const callableCandidates = applyLanguageGate(candidates.filter((n) => callableKinds.has(n.kind)), ref);
+  const callableCandidates = applyTestTreeGate(
+    applyLanguageGate(candidates.filter((n) => callableKinds.has(n.kind)), ref), ref);
 
   // Prefer same-language matches
   const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);
