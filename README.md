@@ -595,6 +595,7 @@ codegraph query <search>          # Search symbols (--kind, --limit, --json)
 codegraph explore <query>         # Relevant symbols' source + call paths in one shot (same output as the codegraph_explore MCP tool)
 codegraph node <symbol|file>      # One symbol's source + callers, or read a file with line numbers (same output as codegraph_node)
 codegraph files [path]            # Show file structure (--format, --filter, --max-depth, --json)
+codegraph view                    # Render the index as an interactive HTML graph and open your browser (--symbol, --file, --no-open, --max-nodes)
 codegraph callers <symbol>        # Find what calls a function/method (--limit, --json)
 codegraph callees <symbol>        # Find what a function/method calls (--limit, --json)
 codegraph impact <symbol>         # Analyze what code is affected by changing a symbol (--depth, --json)
@@ -605,6 +606,30 @@ codegraph upgrade [version]       # Update to the latest release (--check, --for
 codegraph version                 # Print the installed version (also -v, --version)
 codegraph help [command]          # Show help, optionally for one command
 ```
+
+### `codegraph view`
+
+CodeGraph is otherwise terminal/MCP-only. `view` renders the same index as an
+interactive, zoomable, searchable graph — nodes colored by kind, sized by how
+connected they are — in a single self-contained HTML file. vis-network is
+bundled and inlined, so the page works fully offline (no CDN, matching
+CodeGraph's 100%-local design).
+
+```bash
+codegraph view                       # whole graph — opens in your browser automatically
+codegraph view --no-open             # write the HTML file without opening a browser
+codegraph view --file campaign.ts    # only this file's symbols + their 1-hop neighbors
+codegraph view --symbol run_campaign # only this symbol + its immediate neighborhood
+codegraph view --include-imports     # show import/export/reference edges too (noisy on real repos)
+codegraph view --max-nodes 400       # raise the whole-graph node cap (default 250)
+codegraph view -o graph.html         # choose the output file
+```
+
+By default the HTML is written to `<project>/.codegraph/codegraph_view.html`
+(inside the gitignored index directory, so it never litters your working tree)
+and opened in your browser via a loopback-only HTTP server; press Ctrl+C to stop.
+Pass `--no-open` to skip the browser and just write the file, or `-o` to
+override the output path.
 
 ### `codegraph affected`
 

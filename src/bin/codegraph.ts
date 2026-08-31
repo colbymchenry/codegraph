@@ -15,6 +15,7 @@
  *   codegraph status [path]      Show index status
  *   codegraph query <search>     Search for symbols
  *   codegraph files [options]    Show project file structure
+ *   codegraph view [options]     Render the index as an interactive HTML graph
  *   codegraph context <task>     Build context for a task
  *   codegraph callers <symbol>   Find what calls a function/method
  *   codegraph callees <symbol>   Find what a function/method calls
@@ -1680,6 +1681,157 @@ program
       process.exit(1);
     }
   });
+
+/**
+ * codegraph view
+ *
+ * Render the index as an interactive, zoomable, searchable graph in a single
+ * self-contained HTML file (vis-network bundled locally, works offline).
+ * Opens the default browser automatically unless `--no-open` is passed.
+ */
+program
+  .command('view')
+  .description('Render the index as an interactive HTML graph and open it in your browser')
+  .option('-p, --path <path>', 'Project path')
+  .option('-o, --output <file>', 'Output HTML file (default: <project>/.codegraph/codegraph_view.html)')
+  .option('--file <substring>', 'Only show symbols from files matching this substring, plus 1-hop neighbors')
+  .option('--symbol <name>', 'Only show this symbol and its immediate neighborhood')
+  .option('--include-imports', 'Include import/export/reference edges (noisy on real repos, off by default)')
+  .option('--max-nodes <number>', 'Cap on nodes for whole-graph / file view (highest-degree kept)', '250')
+  .option('--no-open', 'Write the HTML file without opening a browser')
+  .action(async (options: {
+    path?: string;
+    output?: string;
+    file?: string;
+    symbol?: string;
+    includeImports?: boolean;
+    maxNodes?: string;
+    open?: boolean;
+  }) => {
+    const projectPath = resolveProjectPath(options.path);
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const maxNodes = options.maxNodes ? parseInt(options.maxNodes, 10) : 250;
+      if (Number.isNaN(maxNodes) || maxNodes < 1) {
+        error(`--max-nodes must be a positive integer (got "${options.maxNodes}")`);
+        process.exit(1);
+      }
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      const { renderViewerHtml, EmptyGraphViewError } = await import('../graph/viewer');
+      const cg = await CodeGraph.open(projectPath);
+
+      let data;
+      try {
+        data = cg.getGraphView({
+          symbol: options.symbol,
+          file: options.file,
+          includeImports: options.includeImports,
+          maxNodes,
+        });
+      } catch (err) {
+        cg.destroy();
+        if (err instanceof EmptyGraphViewError) {
+          info(err.message);
+          return;
+        }
+        throw err;
+      }
+      cg.destroy();
+
+      const titleSuffix = options.symbol
+        ? ` — ${options.symbol}`
+        : options.file
+          ? ` — ${options.file}`
+          : '';
+      const html = renderViewerHtml(data, titleSuffix);
+
+      // Default output lives inside the project's .codegraph/ directory (which
+      // is gitignored), so a `view` never litters the working tree. An explicit
+      // -o is honored as-is, resolved against the current directory.
+      const outPath = options.output
+        ? path.resolve(options.output)
+        : path.join(getCodeGraphDir(projectPath), 'codegraph_view.html');
+      fs.writeFileSync(outPath, html, 'utf-8');
+      success(
+        `Wrote ${data.stats.totalNodes} nodes / ${data.stats.totalEdges} edges to ${outPath}`
+      );
+
+      if (options.open !== false) {
+        await serveAndOpen(html, outPath);
+        return;
+      }
+
+      info(`Open it in a browser: file://${outPath}`);
+    } catch (err) {
+      error(`Failed to build graph view: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * Serve a pre-rendered graph HTML on a loopback port and open the default
+ * browser at it, then block until the user stops the process (Ctrl+C). Used by
+ * `codegraph view` (default). Loopback-only bind so nothing is exposed off-box,
+ * matching CodeGraph's local-first stance.
+ */
+async function serveAndOpen(html: string, outPath: string): Promise<void> {
+  const http = await import('http');
+  const { spawn } = await import('child_process');
+  const body = Buffer.from(html, 'utf-8');
+
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Content-Length': String(body.length),
+    });
+    res.end(body);
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+
+  const addr = server.address();
+  const port = addr && typeof addr === 'object' ? addr.port : 0;
+  const url = `http://127.0.0.1:${port}/`;
+
+  // Best-effort browser launch; if the opener is missing we still print the URL.
+  try {
+    const [cmd, args] =
+      process.platform === 'darwin'
+        ? ['open', [url]]
+        : process.platform === 'win32'
+          ? ['cmd', ['/c', 'start', '', url]]
+          : ['xdg-open', [url]];
+    const child = spawn(cmd as string, args as string[], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.on('error', () => {});
+    child.unref();
+  } catch {
+    // ignore — URL is printed below regardless
+  }
+
+  success(`Serving graph at ${url}`);
+  info(`Also saved to file://${outPath}`);
+  console.log(chalk.dim('Press Ctrl+C to stop the server.'));
+
+  await new Promise<void>((resolve) => {
+    const shutdown = () => {
+      server.close(() => resolve());
+    };
+    process.once('SIGINT', shutdown);
+    process.once('SIGTERM', shutdown);
+  });
+}
 
 /**
  * Normalize a user-supplied file path to the project-relative, forward-slash

@@ -28,6 +28,7 @@ import {
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
 import { QueryBuilder } from './db/queries';
+import { buildGraphViewData, GraphViewData, GraphViewOptions } from './graph/viewer';
 import {
   isInitialized,
   createDirectory,
@@ -1329,6 +1330,15 @@ export class CodeGraph {
     stats.dbSizeBytes = this.db.getSize();
     stats.walSizeBytes = this.db.getWalSizeBytes();
     return stats;
+  }
+
+  /**
+   * Assemble the node/edge payload for the interactive graph viewer
+   * (`codegraph view`). Keeps the raw SQLite handle internal — callers get a
+   * typed, render-ready projection rather than direct DB access.
+   */
+  getGraphView(options: GraphViewOptions = {}): GraphViewData {
+    return buildGraphViewData(this.db.getDb(), options);
   }
 
   /**
