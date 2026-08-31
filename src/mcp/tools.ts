@@ -208,7 +208,10 @@ export interface ExploreOutputBudget {
   includeAdditionalFiles: boolean;
   /** Include the "Complete source code is included above…" reminder. */
   includeCompletenessSignal: boolean;
-  /** Include the explore-budget reminder at the end. */
+  /**
+   * Include the advisory exploration-guidance note at the end. Purely
+   * advisory — the server NEVER rejects or rate-limits extra explore calls.
+   */
   includeBudgetNote: boolean;
 }
 
@@ -1535,7 +1538,7 @@ export class ToolHandler {
         if (tool.name === 'codegraph_explore') {
           return {
             ...tool,
-            description: `${tool.description} Budget: make at most ${budget} calls for this project (${stats.fileCount.toLocaleString()} files indexed).`,
+            description: `${tool.description} Exploration guidance — advisory only, NOT a quota: ~${budget} focused calls usually cover this project (${stats.fileCount.toLocaleString()} files indexed), and extra calls are never rejected or rate-limited.`,
           };
         }
         return tool;
@@ -5687,13 +5690,17 @@ export class ToolHandler {
         ? ['', `> Some file sections were trimmed for size. For a specific symbol you still need, run another \`codegraph_explore\` (or \`codegraph_node\`) with its exact name — line-numbered source, cheaper and more complete than Read.`]
         : [];
 
-    // Explore budget note based on project size.
+    // Advisory exploration-guidance note based on project size. Deliberately
+    // phrased as guidance, NOT a quota: agents read "budget / remaining calls /
+    // Synthesize once" as a hard cap and stop exploring early, falling back to
+    // grep + Read (which costs more tokens). The server never rejects or
+    // rate-limits extra explore calls, and the note says so explicitly.
     let budgetBlock: string[] = [];
     if (budget.includeBudgetNote) {
       try {
         const stats = cg.getStats();
         const callBudget = getExploreBudget(stats.fileCount);
-        budgetBlock = ['', `> **Explore budget: ${callBudget} calls for this project (${stats.fileCount.toLocaleString()} files indexed).** Each call covers ~6 files; if your question spans more, spend your remaining calls on the uncovered area BEFORE falling back to Read — another explore is cheaper and more complete than reading those files. Synthesize once you've used ${callBudget}.`];
+        budgetBlock = ['', `> **Exploration guidance — advisory only, NOT a quota: this project (~${stats.fileCount.toLocaleString()} files indexed) is usually covered in ≈${callBudget} focused explore calls, and extra calls are never rejected or rate-limited. If the response above does not fully cover your question, run another codegraph_explore on the uncovered symbols — it is cheaper and more complete than Read. Only stop exploring when the response actually covers the flow you asked about.`];
       } catch {
         // Stats unavailable — skip budget note
       }

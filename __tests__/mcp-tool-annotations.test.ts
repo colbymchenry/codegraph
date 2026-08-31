@@ -95,11 +95,12 @@ describe('Live tool surface keeps annotations with a project open (#1018)', () =
     expect(got.length).toBeGreaterThan(0);
     for (const tool of got) expectReadOnly(tool);
 
-    // explore's description is regenerated with a per-repo budget suffix via
-    // object spread; the annotation must survive that rewrite.
+    // explore's description is regenerated with a per-repo advisory-guidance
+    // suffix via object spread; the annotation must survive that rewrite.
     const explore = got.find((t) => t.name === 'codegraph_explore');
     expect(explore).toBeDefined();
-    expect(explore!.description).toMatch(/Budget: make at most/);
+    expect(explore!.description).toMatch(/advisory only, NOT a quota/);
+    expect(explore!.description).not.toMatch(/make at most/);
     expectReadOnly(explore!);
   });
 });
