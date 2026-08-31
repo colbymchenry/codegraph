@@ -46,6 +46,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   cobol: 'tree-sitter-cobol.wasm',
   vbnet: 'tree-sitter-vbnet.wasm',
   erlang: 'tree-sitter-erlang.wasm',
+  elixir: 'tree-sitter-elixir.wasm',
   solidity: 'tree-sitter-solidity.wasm',
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
@@ -162,6 +163,12 @@ export const EXTENSION_MAP: Record<string, Language> = {
   // (`.app`/`.app.src` resource files route via isErlangAppFile below: their
   // last-dot extension is too generic for this map.)
   '.escript': 'erlang',
+  // Elixir: modules (.ex) and scripts (.exs — mix.exs, config/*.exs, and every
+  // *_test.exs, which is where ExUnit test suites live). Same grammar, same
+  // extractor; `.exs` is compiled-on-load rather than precompiled, which the
+  // graph doesn't distinguish.
+  '.ex': 'elixir',
+  '.exs': 'elixir',
   // Spring config: `application.properties` / `application-*.properties`. Same
   // shape as the `.yml` variants — the YAML/properties extractor emits one node
   // per leaf key, and the Spring resolver links `@Value("${k}")` references.
@@ -692,6 +699,7 @@ export function getLanguageDisplayName(language: Language): string {
     cobol: 'COBOL',
     vbnet: 'Visual Basic .NET',
     erlang: 'Erlang',
+    elixir: 'Elixir',
     terraform: 'Terraform',
     arkts: 'ArkTS',
     unknown: 'Unknown',

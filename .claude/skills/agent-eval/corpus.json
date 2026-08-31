@@ -470,6 +470,29 @@
       "question": "When a job finishes video encoding, how does staxrip decide which muxer runs and how does the muxer command line get built and executed? Trace from job processing to the mkvmerge invocation."
     }
   ],
+  "Elixir": [
+    {
+      "name": "plug",
+      "repo": "https://github.com/elixir-plug/plug",
+      "size": "Small",
+      "files": "~80",
+      "question": "How does an incoming request travel through a Plug.Builder pipeline? Trace the path from Plug.Conn through the builder's compiled plug chain to an individual plug's call/2, and explain how halting works."
+    },
+    {
+      "name": "phoenix",
+      "repo": "https://github.com/phoenixframework/phoenix",
+      "size": "Medium",
+      "files": "~210",
+      "question": "How does an incoming HTTP request reach a controller action in Phoenix? Trace the path from the Endpoint through the Router's dispatch and pipelines into the controller, and show where the response is rendered."
+    },
+    {
+      "name": "firezone",
+      "repo": "https://github.com/firezone/firezone",
+      "size": "Large",
+      "files": "~2110",
+      "question": "How does an API request to list clients flow through the system? Trace the path from the router's route definition through the controller action into the Portal context and down to the Ecto query that loads them."
+    }
+  ],
   "Erlang": [
     {
       "name": "cowboy",
