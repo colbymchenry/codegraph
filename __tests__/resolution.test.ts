@@ -4,7 +4,7 @@
  * Tests for Phase 3: Reference Resolution
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -34,6 +34,120 @@ describe('Resolution Module', () => {
     } else if (fs.existsSync(tempDir)) {
       fs.rmSync(tempDir, { recursive: true });
     }
+  });
+
+
+  describe('Cross-family call confidence', () => {
+    // A `calls` edge is deliberately allowed to cross language families — FFI
+    // bindings, a React Native bridge method, a pybind entry point are all real
+    // calls, which is why the language gate covers `references` and `imports`
+    // but not `calls`. What is not real is a cross-family edge whose only
+    // evidence is that some symbol somewhere carries the same name: nothing in
+    // Python can call a function in Elixir, and an unresolved language builtin
+    // or test macro has no definition in its own language to bind to, so the
+    // lone same-named foreign symbol used to win by default.
+    const node = (over: Partial<Node>): Node => ({
+      id: 'n', kind: 'function', name: 'x', qualifiedName: 'x',
+      filePath: 'a.ts', language: 'typescript',
+      startLine: 1, endLine: 2, startColumn: 0, endColumn: 0,
+      updatedAt: Date.now(), ...over,
+    });
+    const contextOf = (nodes: Node[]): ResolutionContext => ({
+      getNodesInFile: () => nodes,
+      getNodesByName: (name: string) => nodes.filter((n) => n.name === name),
+      getNodesByQualifiedName: () => [],
+      getNodesByKind: () => [],
+      getNodesByLowerName: (lower: string) =>
+        nodes.filter((n) => n.name.toLowerCase() === lower),
+      getImportMappings: () => [],
+      fileExists: () => true,
+      readFile: () => null,
+      getProjectRoot: () => '/test',
+      getAllFiles: () => nodes.map((n) => n.filePath),
+    } as any);
+    const refFrom = (language: string, filePath: string, name: string) => ({
+      fromNodeId: `caller:${filePath}:c:1`,
+      referenceName: name,
+      referenceKind: 'calls' as const,
+      line: 5, column: 0, filePath, language: language as any,
+    });
+
+    it('declines a lone same-named match in an unrelated language', () => {
+      // `test` is an ExUnit macro: it has no Elixir definition to bind to, so
+      // the only candidate anywhere is a test runner's fixture in TypeScript.
+      const nodes = [node({
+        id: 'ts:test', name: 'test', qualifiedName: 'fixtures.ts::test',
+        filePath: 'e2e/fixtures.ts', language: 'typescript',
+      })];
+      expect(matchReference(refFrom('elixir', 'lib/app/user_test.exs', 'test'), contextOf(nodes)))
+        .toBeNull();
+    });
+
+    it('still resolves a lone same-named match inside one family', () => {
+      // `.tsx` calling a `.ts` helper is the same runtime, and is most calls in
+      // a React codebase — it must keep both its edge and a high confidence.
+      const nodes = [node({
+        id: 'ts:formatDate', name: 'formatDate', qualifiedName: 'fmt.ts::formatDate',
+        filePath: 'src/lib/fmt.ts', language: 'typescript',
+      })];
+      const result = matchReference(
+        refFrom('tsx', 'src/components/Row.tsx', 'formatDate'), contextOf(nodes));
+      expect(result?.targetNodeId).toBe('ts:formatDate');
+      // Scored on the family, not the raw language tag — `tsx` vs `typescript`
+      // is not a boundary crossing.
+      expect(result!.confidence).toBeGreaterThan(0.5);
+    });
+
+    it('prefers a same-language definition over a foreign same-named one', () => {
+      const nodes = [
+        node({ id: 'ex:parse', name: 'parse', qualifiedName: 'App.Parser::parse',
+               filePath: 'lib/app/parser.ex', language: 'elixir' }),
+        node({ id: 'ts:parse', name: 'parse', qualifiedName: 'p.ts::parse',
+               filePath: 'src/p.ts', language: 'typescript' }),
+      ];
+      const result = matchReference(
+        refFrom('elixir', 'lib/app/reader.ex', 'parse'), contextOf(nodes));
+      expect(result?.targetNodeId).toBe('ex:parse');
+    });
+
+    it('keeps a cross-family match that a precise strategy resolved', () => {
+      // A real FFI binding resolves by qualified name, well above the floor —
+      // the floor only declines matches whose sole evidence is the bare name.
+      const nodes = [node({
+        id: 'cpp:Engine.step', name: 'step', qualifiedName: 'Engine::step',
+        filePath: 'native/engine.cpp', language: 'cpp', kind: 'method',
+      })];
+      const context = {
+        ...contextOf(nodes),
+        getNodesByQualifiedName: (q: string) =>
+          nodes.filter((n) => n.qualifiedName === q),
+      } as ResolutionContext;
+      const result = matchReference(refFrom('python', 'py/sim.py', 'Engine::step'), context);
+      expect(result?.targetNodeId).toBe('cpp:Engine.step');
+      expect(result!.confidence).toBeGreaterThan(0.5);
+    });
+
+    it('can be switched off for a project that relies on the old behaviour', async () => {
+      // The gate removes edges, so it needs an escape hatch — read at module
+      // load, which is why this reimports rather than mutating in place.
+      const prev = process.env.CODEGRAPH_CROSS_FAMILY_CALL_FLOOR;
+      process.env.CODEGRAPH_CROSS_FAMILY_CALL_FLOOR = '0';
+      try {
+        vi.resetModules();
+        const fresh = await import('../src/resolution/name-matcher');
+        const nodes = [node({
+          id: 'ts:test', name: 'test', qualifiedName: 'fixtures.ts::test',
+          filePath: 'e2e/fixtures.ts', language: 'typescript',
+        })];
+        expect(fresh.matchReference(
+          refFrom('elixir', 'lib/app/user_test.exs', 'test'), contextOf(nodes))
+        ).not.toBeNull();
+      } finally {
+        if (prev === undefined) delete process.env.CODEGRAPH_CROSS_FAMILY_CALL_FLOOR;
+        else process.env.CODEGRAPH_CROSS_FAMILY_CALL_FLOOR = prev;
+        vi.resetModules();
+      }
+    });
   });
 
   describe('Name Matcher', () => {

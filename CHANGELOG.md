@@ -12,6 +12,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Calls no longer resolve to a same-named symbol in an unrelated language on the strength of the name alone. Nothing in Python can call a function in Elixir, but a language's own builtins and test macros — `test`, `describe`, `apply`, `max`, `field` — have no definition of their own to bind to, so a lone same-named symbol in another language was winning by default. On a mixed-language repository that produced thousands of impossible call edges, and the symbols they landed on reported callers and impact that were mostly or entirely fictional. Genuine cross-language calls — FFI bindings, native bridges — are unaffected, because those resolve through an import or a qualified name rather than a bare one. Set `CODEGRAPH_CROSS_FAMILY_CALL_FLOOR=0` to restore the old behaviour.
+- A `.tsx` file calling a `.ts` helper is no longer treated as crossing a language boundary. The two are the same runtime, but they were compared by file type rather than by language family, so ordinary calls throughout a React codebase were scored as low-confidence guesses.
+
 
 ## [1.6.0] - 2026-08-26
 

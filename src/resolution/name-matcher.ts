@@ -35,6 +35,49 @@ function resolveAmbiguousNameCeiling(): number {
 const AMBIGUOUS_NAME_CEILING = resolveAmbiguousNameCeiling();
 
 /**
+ * Confidence a name match must EXCEED to be believed across language families.
+ *
+ * A `calls` edge is deliberately allowed to cross families — an FFI binding, a
+ * React Native bridge method, a pybind entry point are all real calls, which is
+ * why `applyLanguageGate` gates `references` and `imports` but not `calls`.
+ * What is not real is a cross-family edge whose only evidence is that some
+ * symbol somewhere carries the same name. Nothing in Python can call a function
+ * in Elixir, and an unresolved language builtin or test macro — `test`,
+ * `describe`, `apply`, `max`, `field` — has no definition in its own language to
+ * bind to, so the lone same-named symbol in another language wins by default.
+ *
+ * Those matches were already recognised: this is exactly the branch that scores
+ * a lone cross-family candidate 0.5 instead of 0.9, and fuzzy 0.3. The verdict
+ * was recorded in the edge's metadata and then believed anyway by every
+ * consumer, so `callers` and `impact` reported it as fact. Declining below the
+ * floor keeps the precise strategies — qualified-name, import-based, class-name
+ * — which is how a genuine FFI binding resolves, and how it keeps its edge.
+ *
+ * Set `CODEGRAPH_CROSS_FAMILY_CALL_FLOOR=0` to restore the old behaviour.
+ */
+const DEFAULT_CROSS_FAMILY_CALL_FLOOR = 0.5;
+function resolveCrossFamilyCallFloor(): number {
+  const raw = process.env.CODEGRAPH_CROSS_FAMILY_CALL_FLOOR;
+  if (!raw) return DEFAULT_CROSS_FAMILY_CALL_FLOOR;
+  const parsed = Number.parseFloat(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_CROSS_FAMILY_CALL_FLOOR;
+}
+const CROSS_FAMILY_CALL_FLOOR = resolveCrossFamilyCallFloor();
+
+/**
+ * Drop a name match that crosses a language family on weak evidence. Same-family
+ * matches (and anything above the floor) pass through untouched.
+ */
+function declineWeakCrossFamily(
+  match: ResolvedRef,
+  target: Node,
+  ref: UnresolvedRef
+): ResolvedRef | null {
+  if (sameLanguageFamily(target.language, ref.language)) return match;
+  return match.confidence > CROSS_FAMILY_CALL_FLOOR ? match : null;
+}
+
+/**
  * Try to resolve a path-like reference (e.g., "snippets/drawer-menu.liquid")
  * by matching the filename against file nodes.
  */
@@ -413,15 +456,19 @@ export function matchByExactName(
     return null;
   }
 
-  // If only one match, use it — but penalize cross-language matches
+  // If only one match, use it — but penalize matches from another language
+  // FAMILY. Comparing the raw language tag instead treats `.tsx` calling a
+  // `.ts` helper as cross-language and marks a perfectly ordinary same-runtime
+  // call 0.5, which is most calls in any React codebase; the family is what
+  // decides whether the two halves can reach each other at all.
   if (candidates.length === 1) {
-    const isCrossLanguage = candidates[0]!.language !== ref.language;
-    return {
+    const isCrossFamily = !sameLanguageFamily(candidates[0]!.language, ref.language);
+    return declineWeakCrossFamily({
       original: ref,
       targetNodeId: candidates[0]!.id,
-      confidence: isCrossLanguage ? 0.5 : 0.9,
+      confidence: isCrossFamily ? 0.5 : 0.9,
       resolvedBy: 'exact-match',
-    };
+    }, candidates[0]!, ref);
   }
 
   // Ubiquitous-name ceiling (#999): above it, picking one target among K
@@ -439,12 +486,12 @@ export function matchByExactName(
     // Lower confidence when the match is from a distant/unrelated module
     const proximity = computePathProximity(ref.filePath, bestMatch.filePath);
     const confidence = proximity >= 30 ? 0.7 : 0.4;
-    return {
+    return declineWeakCrossFamily({
       original: ref,
       targetNodeId: bestMatch.id,
       confidence,
       resolvedBy: 'exact-match',
-    };
+    }, bestMatch, ref);
   }
 
   return null;
@@ -2419,13 +2466,16 @@ export function matchFuzzy(
   const finalCandidates = sameLanguageCandidates.length > 0 ? sameLanguageCandidates : callableCandidates;
 
   if (finalCandidates.length === 1) {
-    const isCrossLanguage = finalCandidates[0]!.language !== ref.language;
-    return {
+    // Family, not raw language tag: a `.tsx` ref matching a `.ts` definition is
+    // the same runtime, and scoring it as though it crossed a boundary
+    // understates every call in a React codebase.
+    const isCrossFamily = !sameLanguageFamily(finalCandidates[0]!.language, ref.language);
+    return declineWeakCrossFamily({
       original: ref,
       targetNodeId: finalCandidates[0]!.id,
-      confidence: isCrossLanguage ? 0.3 : 0.5,
+      confidence: isCrossFamily ? 0.3 : 0.5,
       resolvedBy: 'fuzzy',
-    };
+    }, finalCandidates[0]!, ref);
   }
 
   return null;
