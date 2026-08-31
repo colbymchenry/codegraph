@@ -1286,8 +1286,8 @@ export function inferTsJsFieldReceiverType(
               (n.endLine ?? n.startLine) <= (other.endLine ?? other.startLine)
           )))
   );
+  const lines = context.getFileLines ? context.getFileLines(ref.filePath) : null;
   if (!field) {
-    const lines = context.getFileLines ? context.getFileLines(ref.filePath) : null;
     if (lines) {
       const start = Math.max(0, enclosing.startLine - 1);
       const end = Math.min(lines.length, enclosingEnd);
@@ -1320,7 +1320,6 @@ export function inferTsJsFieldReceiverType(
   }
 
   // If un-annotated, check field declaration line for `= new Type(...)`
-  const lines = context.getFileLines ? context.getFileLines(ref.filePath) : null;
   if (lines && field.startLine <= lines.length) {
     const lineText = lines[field.startLine - 1];
     if (lineText) {
