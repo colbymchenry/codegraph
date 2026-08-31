@@ -4860,6 +4860,51 @@ object Main {
     });
   });
 
+  describe('Scala companion object vs extends resolution', () => {
+    it('resolves `extends X` to the trait, not the same-named companion object', async () => {
+      // The trait+companion idiom: both nodes share name AND file. Without a
+      // kind-aware tie-breaker the winner is arbitrary, and when the companion
+      // wins, every subtype is detached from the trait's inheritance chain.
+      fs.writeFileSync(
+        path.join(tempDir, 'ExtAgreement.scala'),
+        `trait ExtAgreement {
+  def extId: String = "x"
+}
+object ExtAgreement {
+  val Kind = "agreement"
+}
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'MExtAgreement.scala'),
+        `class MExtAgreement extends ExtAgreement {
+  def render(): String = extId
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const traitNode = cg.getNodesByKind('trait').find((n) => n.name === 'ExtAgreement');
+      const moduleNode = cg.getNodesByKind('module').find((n) => n.name === 'ExtAgreement');
+      expect(traitNode).toBeDefined();
+      expect(moduleNode).toBeDefined();
+
+      const traitExtends = cg
+        .getIncomingEdges(traitNode!.id)
+        .filter((e) => e.kind === 'extends');
+      const moduleExtends = cg
+        .getIncomingEdges(moduleNode!.id)
+        .filter((e) => e.kind === 'extends');
+      expect(traitExtends.length).toBe(1);
+      expect(moduleExtends.length).toBe(0);
+
+      // Impact must now traverse THROUGH the trait to the subtype.
+      const impact = cg.getImpactRadius(traitNode!.id, 5);
+      const impactNames = [...impact.nodes.values()].map((n) => n.name);
+      expect(impactNames).toContain('MExtAgreement');
+    });
+  });
+
   describe('Dart chained static-factory / factory-constructor call resolution (#645/#608 mechanism)', () => {
     function callerNamesOf(qualifiedName: string): string[] {
       const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);

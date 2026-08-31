@@ -2896,6 +2896,17 @@ function findBestMatch(
       }
     }
 
+    // For inheritance references (`extends X` / `implements X`), penalize
+    // `module` candidates — a Scala companion `object` shares its name (and
+    // file) with the trait/class it accompanies, but `extends` can never
+    // target a singleton. `module` stays in SUPERTYPE_TARGET_KINDS (Ruby
+    // `include`, TS namespaces), so it is still eligible; without this the
+    // trait and its companion tie and the winner is arbitrary, which detaches
+    // subtypes from the inheritance chain (impact analysis breaks).
+    if (isInheritanceRef(ref) && candidate.kind === 'module') {
+      score -= 50;
+    }
+
     // For decorator references (`@Foo`), prefer functions. Class
     // decorators (Python `@SomeClass`, Java annotation interfaces)
     // also resolve here, hence the smaller class bonus.
