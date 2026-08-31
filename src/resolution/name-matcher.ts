@@ -1479,15 +1479,21 @@ export function getDirectCallableCandidatesOnTypeNode(
     `${typeNode.qualifiedName}.${methodName}`,
   ]);
 
-  return context
+  const exactCandidates = context
     .getNodesByName(methodName)
     .filter(
       (m) =>
         (m.kind === 'method' || m.kind === 'function') &&
-        m.filePath === typeNode.filePath &&
         (m.language === typeNode.language || sameLanguageFamily(m.language, typeNode.language)) &&
         acceptedQualifiedNames.has(m.qualifiedName)
     );
+
+  const sameFileCandidates = exactCandidates.filter((m) => m.filePath === typeNode.filePath);
+  if (sameFileCandidates.length > 0) {
+    return sameFileCandidates;
+  }
+
+  return exactCandidates;
 }
 
 /**

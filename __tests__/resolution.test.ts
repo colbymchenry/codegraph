@@ -3761,6 +3761,93 @@ export function use(): void {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
     }, 30000);
+
+    it('C++ out-of-line inherited method resolves through conformance postpass (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-cpp-inherit-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'base.hpp'),
+          `#pragma once
+class Base {
+public:
+    void run();
+};
+class Derived : public Base {};
+`
+        );
+        fs.writeFileSync(
+          path.join(tmpDir, 'base.cpp'),
+          `#include "base.hpp"
+void Base::run() {}
+`
+        );
+        fs.writeFileSync(
+          path.join(tmpDir, 'use.cpp'),
+          `#include "base.hpp"
+void use() {
+    Derived d;
+    d.run();
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('base.cpp');
+        const baseRun = allNodes.find((n) => n.kind === 'method' && n.name === 'run' && n.qualifiedName === 'Base::run');
+        expect(baseRun).toBeDefined();
+
+        const callers = await cg.getCallers(baseRun!.id);
+        expect(callers.map((c) => c.node.name)).toContain('use');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('multiple same-depth inherited targets decline resolution due to ambiguity (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-depth-ambiguity-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'test.ts'),
+          `export class SuperA {
+  run(): void {}
+}
+export class SuperB {
+  run(): void {}
+}
+export class Derived implements SuperA, SuperB {
+  // no run of its own
+}
+export function use(d: Derived): void {
+  d.run();
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('test.ts');
+        const runA = allNodes.find((n) => n.kind === 'method' && n.name === 'run' && n.qualifiedName.startsWith('SuperA'));
+        const runB = allNodes.find((n) => n.kind === 'method' && n.name === 'run' && n.qualifiedName.startsWith('SuperB'));
+        expect(runA).toBeDefined();
+        expect(runB).toBeDefined();
+
+        const callersA = await cg.getCallers(runA!.id);
+        const callersB = await cg.getCallers(runB!.id);
+        expect(callersA.map((c) => c.node.name)).not.toContain('use');
+        expect(callersB.map((c) => c.node.name)).not.toContain('use');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
   });
 
   describe('Object-literal namespace members (#1573)', () => {
