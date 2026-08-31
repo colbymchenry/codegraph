@@ -6,7 +6,6 @@
 
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, DeferredTypedReceiverRef } from './types';
-import { resolveImportPath } from './import-resolver';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -1289,16 +1288,27 @@ export function inferTsJsFieldReceiverType(
   const lines = context.getFileLines ? context.getFileLines(ref.filePath) : null;
   if (!field) {
     if (lines) {
-      const start = Math.max(0, enclosing.startLine - 1);
-      const end = Math.min(lines.length, enclosingEnd);
-      const paramPropRegex = new RegExp(
-        `\\b(?:private|protected|public|readonly)\\s+(?:(?:private|protected|public|readonly)\\s+)?${fieldName}\\s*:\\s*([A-Z][a-zA-Z0-9_$]*)`,
+      const constructors = inFile.filter(
+        (n) =>
+          (n.kind === 'method' || n.kind === 'function') &&
+          n.name === 'constructor' &&
+          (n.qualifiedName === `${enclosing!.qualifiedName}::constructor` ||
+            n.qualifiedName === `${enclosing!.qualifiedName}.constructor`)
       );
-      for (let i = start; i < end; i++) {
-        const line = lines[i];
-        if (line && line.length <= 10_000) {
-          const m = line.match(paramPropRegex);
-          if (m && m[1]) return m[1];
+
+      if (constructors.length === 1) {
+        const ctor = constructors[0]!;
+        const ctorStart = Math.max(0, ctor.startLine - 1);
+        const ctorEnd = Math.min(lines.length, ctor.endLine ?? ctor.startLine);
+        const paramPropRegex = new RegExp(
+          `\\b(?:private|protected|public|readonly)\\s+(?:(?:private|protected|public|readonly)\\s+)?${fieldName}\\s*:\\s*([A-Z][a-zA-Z0-9_$]*)`,
+        );
+        for (let i = ctorStart; i < ctorEnd; i++) {
+          const line = lines[i];
+          if (line && line.length <= 10_000) {
+            const m = line.match(paramPropRegex);
+            if (m && m[1]) return m[1];
+          }
         }
       }
     }
@@ -1351,21 +1361,44 @@ export function bindProjectReceiverType(
 
   if (isWebFamily) {
     // Case A: same-file aggregate node (checked in file or by name with matching filePath)
-    const sameFileMatch =
-      context.getNodesInFile(ref.filePath).find(
+    const normCallerPath = normalizePathForComparison(ref.filePath);
+    const inFileCandidates = context
+      .getNodesInFile(ref.filePath)
+      .filter(
         (n) =>
           SUPERTYPE_BEARING_KINDS.has(n.kind) &&
           n.name === inferredType &&
           (n.language === ref.language || sameLanguageFamily(n.language, ref.language))
-      ) ??
-      context.getNodesByName(inferredType).find(
-        (n) =>
-          SUPERTYPE_BEARING_KINDS.has(n.kind) &&
-          normalizePathForComparison(n.filePath) === normalizePathForComparison(ref.filePath) &&
-          (n.language === ref.language || sameLanguageFamily(n.language, ref.language))
       );
-    if (sameFileMatch) {
-      return sameFileMatch;
+    const sameFileCandidates =
+      inFileCandidates.length > 0
+        ? inFileCandidates
+        : context.getNodesByName(inferredType).filter(
+            (n) =>
+              SUPERTYPE_BEARING_KINDS.has(n.kind) &&
+              normalizePathForComparison(n.filePath) === normCallerPath &&
+              (n.language === ref.language || sameLanguageFamily(n.language, ref.language))
+          );
+
+    if (sameFileCandidates.length === 1) {
+      return sameFileCandidates[0]!;
+    } else if (sameFileCandidates.length > 1) {
+      // Disambiguate if ref.fromNodeId is inside exactly one candidate's enclosing scope
+      if (ref.fromNodeId) {
+        const fromNode = context.getNodesInFile(ref.filePath).find((n) => n.id === ref.fromNodeId);
+        if (fromNode) {
+          const fromEnd = fromNode.endLine ?? fromNode.startLine;
+          const scopedCandidates = sameFileCandidates.filter(
+            (c) =>
+              c.startLine >= fromNode.startLine &&
+              (c.endLine ?? c.startLine) <= fromEnd
+          );
+          if (scopedCandidates.length === 1) {
+            return scopedCandidates[0]!;
+          }
+        }
+      }
+      return null;
     }
 
     // Case B / C: check imports in caller file
@@ -1373,8 +1406,8 @@ export function bindProjectReceiverType(
     const mapping = imports.find((i) => i.localName === inferredType);
     if (mapping) {
       const resolvedPath =
-        mapping.resolvedPath ||
-        resolveImportPath(mapping.source, ref.filePath, ref.language, context);
+        mapping.resolvedPath ??
+        context.resolveImportPath?.(mapping.source, ref.filePath, ref.language);
       if (resolvedPath) {
         const normResolved = normalizePathForComparison(resolvedPath);
         const targetNodes = context.getNodesInFile(resolvedPath).concat(
@@ -1399,20 +1432,24 @@ export function bindProjectReceiverType(
 
   // Non-web languages (Java, Kotlin, C++, C#, Go, Rust, Swift, etc.):
   const inFile = context.getNodesInFile(ref.filePath);
-  const sameFileMatch = inFile.find(
+  const sameFileCandidates = inFile.filter(
     (n) =>
       SUPERTYPE_BEARING_KINDS.has(n.kind) &&
       n.name === inferredType &&
       (n.language === ref.language || sameLanguageFamily(n.language, ref.language))
   );
-  if (sameFileMatch) return sameFileMatch;
+  if (sameFileCandidates.length === 1) {
+    return sameFileCandidates[0]!;
+  } else if (sameFileCandidates.length > 1) {
+    return null;
+  }
 
   const imports = context.getImportMappings ? context.getImportMappings(ref.filePath, ref.language) : [];
   const mapping = imports.find((i) => i.localName === inferredType);
   if (mapping) {
     const resolvedPath =
-      mapping.resolvedPath ||
-      resolveImportPath(mapping.source, ref.filePath, ref.language, context);
+      mapping.resolvedPath ??
+      context.resolveImportPath?.(mapping.source, ref.filePath, ref.language);
     if (resolvedPath) {
       const normResolved = normalizePathForComparison(resolvedPath);
       const importedNode = context
@@ -1452,6 +1489,11 @@ export function resolveMethodOnTypeNode(
   confidence: number = 0.9,
   resolvedBy: ResolvedRef['resolvedBy'] = 'instance-method',
 ): ResolvedRef | null {
+  const acceptedQualifiedNames = new Set([
+    `${typeNode.qualifiedName}::${methodName}`,
+    `${typeNode.qualifiedName}.${methodName}`,
+  ]);
+
   const methodCandidates = context
     .getNodesByName(methodName)
     .filter(
@@ -1459,9 +1501,7 @@ export function resolveMethodOnTypeNode(
         (m.kind === 'method' || m.kind === 'function') &&
         m.filePath === typeNode.filePath &&
         (m.language === typeNode.language || sameLanguageFamily(m.language, typeNode.language)) &&
-        (m.qualifiedName === `${typeNode.qualifiedName}::${methodName}` ||
-          m.qualifiedName === `${typeNode.qualifiedName}.${methodName}` ||
-          (m.startLine >= typeNode.startLine && (m.endLine ?? m.startLine) <= (typeNode.endLine ?? typeNode.startLine)))
+        acceptedQualifiedNames.has(m.qualifiedName)
     );
 
   if (methodCandidates.length === 1) {
@@ -1473,11 +1513,11 @@ export function resolveMethodOnTypeNode(
     };
   }
 
-  const exact = methodCandidates.find((m) => m.qualifiedName === `${typeNode.qualifiedName}::${methodName}`);
-  if (exact) {
+  const uniqueIds = new Set(methodCandidates.map((m) => m.id));
+  if (uniqueIds.size === 1) {
     return {
       original: ref,
-      targetNodeId: exact.id,
+      targetNodeId: methodCandidates[0]!.id,
       confidence,
       resolvedBy,
     };
@@ -1619,8 +1659,8 @@ export function resolveTsJsCallResultMember(
       const mapping = imports.find((i) => i.localName === rootName);
       if (mapping) {
         const resolvedPath =
-          mapping.resolvedPath ||
-          resolveImportPath(mapping.source, ref.filePath, ref.language, context);
+          mapping.resolvedPath ??
+          context.resolveImportPath?.(mapping.source, ref.filePath, ref.language);
         if (resolvedPath) {
           const normResolved = normalizePathForComparison(resolvedPath);
           const targetNodes = context.getNodesInFile(resolvedPath).concat(

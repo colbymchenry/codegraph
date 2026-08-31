@@ -3454,6 +3454,200 @@ export class Service {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
     }, 30000);
+
+    it('typed Service receiver must not resolve to Local::send (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-local-method-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'service.ts'),
+          `export class Service {
+  setup(): void {
+    class Local {
+      send(): void {}
+    }
+  }
+}
+
+export function useService(service: Service): void {
+  service.send();
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('service.ts');
+        const localSend = allNodes.find((n) => n.kind === 'method' && n.name === 'send');
+        expect(localSend).toBeDefined();
+
+        const callers = await cg.getCallers(localSend!.id);
+        expect(callers.map((c) => c.node.name)).not.toContain('useService');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('typed Service receiver must not resolve nested function save (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-nested-fn-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'service.ts'),
+          `export class Service {
+  setup(): void {
+    function save(): void {}
+  }
+}
+
+export function useService(service: Service): void {
+  service.save();
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('service.ts');
+        const nestedSave = allNodes.find((n) => (n.kind === 'function' || n.kind === 'method') && n.name === 'save');
+        expect(nestedSave).toBeDefined();
+
+        const callers = await cg.getCallers(nestedSave!.id);
+        expect(callers.map((c) => c.node.name)).not.toContain('useService');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('same-file local Worker must not bind top-level Worker (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-shadow-worker-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'worker.ts'),
+          `export class Worker {
+  run(): void {}
+}
+
+export function use(): void {
+  class Worker {
+    stop(): void {}
+  }
+
+  const worker = new Worker();
+  worker.run();
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('worker.ts');
+        const topLevelRun = allNodes.find((n) => n.kind === 'method' && n.name === 'run' && n.qualifiedName.startsWith('Worker'));
+        expect(topLevelRun).toBeDefined();
+
+        const callers = await cg.getCallers(topLevelRun!.id);
+        expect(callers.map((c) => c.node.name)).not.toContain('use');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('nested Local constructor parameter property does not hijack Service constructor (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-nested-ctor-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'service.ts'),
+          `export class Mailer {
+  send(): void {}
+}
+
+export class Decoy {
+  send(): void {}
+}
+
+export class Service {
+  run(): void {
+    class Local {
+      constructor(private mailer: Decoy) {}
+    }
+
+    this.mailer.send();
+  }
+
+  constructor(private mailer: Mailer) {}
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('service.ts');
+        const mailerSend = allNodes.find((n) => n.kind === 'method' && n.name === 'send' && n.qualifiedName.startsWith('Mailer'));
+        const decoySend = allNodes.find((n) => n.kind === 'method' && n.name === 'send' && n.qualifiedName.startsWith('Decoy'));
+        expect(mailerSend).toBeDefined();
+        expect(decoySend).toBeDefined();
+
+        const mailerCallers = await cg.getCallers(mailerSend!.id);
+        expect(mailerCallers.map((c) => c.node.name)).toContain('run');
+
+        const decoyCallers = await cg.getCallers(decoySend!.id);
+        expect(decoyCallers.map((c) => c.node.name)).not.toContain('run');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('nested Local constructor parameter property alone does not fabricate Service.mailer (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-nested-ctor-alone-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'service.ts'),
+          `export class Decoy {
+  send(): void {}
+}
+
+export class Service {
+  run(): void {
+    class Local {
+      constructor(private mailer: Decoy) {}
+    }
+
+    this.mailer.send();
+  }
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('service.ts');
+        const decoySend = allNodes.find((n) => n.kind === 'method' && n.name === 'send' && n.qualifiedName.startsWith('Decoy'));
+        expect(decoySend).toBeDefined();
+
+        const decoyCallers = await cg.getCallers(decoySend!.id);
+        expect(decoyCallers.map((c) => c.node.name)).not.toContain('run');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
   });
 
   describe('Object-literal namespace members (#1573)', () => {

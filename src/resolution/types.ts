@@ -143,6 +143,11 @@ export interface ResolutionContext {
   /** Get cached import mappings for a file */
   getImportMappings(filePath: string, language: Language): ImportMapping[];
   /**
+   * Resolve an import specifier to an on-disk file path.
+   * Optional so minimal test contexts compile without it.
+   */
+  resolveImportPath?(importPath: string, fromFile: string, language: Language): string | null;
+  /**
    * Project import-path aliases (tsconfig/jsconfig `paths`). Returns
    * `null` when the project doesn't define any. Cached per resolver
    * instance — safe to call from any resolver code path. Optional so

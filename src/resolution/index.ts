@@ -18,7 +18,7 @@ import {
   DeferredTypedReceiverRef,
 } from './types';
 import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, buildTypedReceiverDeferral, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
-import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos } from './import-resolver';
+import { resolveViaImport, resolveJvmImport, resolveImportPath, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -648,6 +648,9 @@ export class ReferenceResolver {
         this.importMappingCache.set(cacheKey, mappings);
         return mappings;
       },
+
+      resolveImportPath: (importPath: string, fromFile: string, language: Language) =>
+        resolveImportPath(importPath, fromFile, language, this.context),
 
       getProjectAliases: () => {
         if (this.projectAliases === undefined) {
