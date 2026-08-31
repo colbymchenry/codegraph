@@ -55,6 +55,7 @@ Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 - [Key Features](#key-features)
 - [Framework-aware Routes](#framework-aware-routes)
 - [Mixed iOS / React Native / Expo bridging](#mixed-ios--react-native--expo-bridging)
+- [Android: Jetpack Compose, Hilt, and Room](#android-jetpack-compose-hilt-and-room)
 - [Quick Start](#quick-start)
 - [How It Works](#how-it-works)
 - [CLI Reference](#cli-reference)
@@ -364,6 +365,24 @@ Real iOS and React Native codebases live across multiple languages — a Swift c
 | Fabric / Paper views | [react-native-segmented-control](https://github.com/react-native-segmented-control/segmented-control) | [react-native-screens](https://github.com/software-mansion/react-native-screens) | [react-native-skia](https://github.com/Shopify/react-native-skia) |
 
 Each bridge emits edges tagged `provenance:'heuristic'` with `metadata.synthesizedBy:` set to a stable channel name (e.g. `swift-objc-bridge`, `rn-event-channel`, `fabric-native-impl`, `expo-module-extract`), so the agent can tell at a glance how a hop got into the graph.
+
+---
+
+## Android: Jetpack Compose, Hilt, and Room
+
+Modern Android leans on annotations for structure, and those annotations come from libraries that aren't part of your project — so on their own they leave nothing behind to search. CodeGraph records them on the symbol they annotate:
+
+- **`@Composable` functions are indexed as UI components**, so `codegraph_search` with `kind=component` finds your Compose UI the same way it finds React components.
+- **Annotations are shown by `codegraph_node`**, so your agent can see that a class is `@HiltViewModel` or `@Entity`, or a function is `@Composable`, without opening the file.
+
+**Measured on real Android codebases:**
+
+| Repo | Kotlin files | Compose components | Annotated symbols | Most common annotations |
+|---|---|---|---|---|
+| [Now in Android](https://github.com/android/nowinandroid) (Compose + Room + Hilt) | 310 | 151 | 617 | `@Composable` 151 · `@Binds` 27 · `@Provides` 23 · `@Module` 22 |
+| [compose-samples](https://github.com/android/compose-samples) | 355 | 545 | 750 | `@Composable` 545 · `@Preview` 89 · `@Query` 19 |
+
+Annotations written with arguments — `@Preview(showBackground = true)`, `@Entity(tableName = "users")`, `@Query("SELECT …")` — used to be skipped entirely, as were annotations on interfaces and enums, which is where Room puts `@Dao`. All of them are now captured, which is most of what Room and Hilt are made of. On non-Compose Kotlin libraries the same fix recovers annotation coverage without inventing components: [OkHttp](https://github.com/square/okhttp) picks up 3,895 annotated symbols and [okio](https://github.com/square/okio) 1,957, with zero component nodes, because neither uses Compose.
 
 ---
 

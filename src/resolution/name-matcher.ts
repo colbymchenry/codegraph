@@ -275,6 +275,7 @@ export function matchFunctionRef(
     .filter(
       (n) =>
         (n.kind === 'function' ||
+          n.kind === 'component' || // function-level components are callable
           (!bareFnOnly && n.kind === 'method') ||
           (bareClassOk && n.kind === 'class')) &&
         sameLanguageFamily(n.language, ref.language) &&
@@ -1469,7 +1470,12 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
 function enclosingScopeStartLine(ref: UnresolvedRef, context: ResolutionContext): number {
   let start = 1;
   for (const n of context.getNodesInFile(ref.filePath)) {
-    if (n.kind !== 'function' && n.kind !== 'method') continue;
+    // 'component' counts: it is a function-level kind (Kotlin @Composable,
+    // React HOC-wrapped) whose body bounds a scope exactly like a function's,
+    // so omitting it would widen the scan to the whole file. Consistency, not a
+    // observed defect — Kotlin's scan takes the nearest preceding declaration,
+    // so no fixture we could build resolves differently either way.
+    if (n.kind !== 'function' && n.kind !== 'method' && n.kind !== 'component') continue;
     if (n.language !== ref.language) continue;
     const end = n.endLine ?? n.startLine;
     if (n.startLine <= ref.line && end >= ref.line && n.startLine >= start) {
@@ -2346,9 +2352,16 @@ function findBestMatch(
       score -= 80;
     }
 
-    // For call references, prefer functions/methods
+    // For call references, prefer functions/methods. 'component' is included
+    // because function-level components (Kotlin @Composable) are invoked as
+    // plain calls — without it, every call edge into a composable loses the
+    // bonus and can be outscored by a same-named non-callable.
     if (ref.referenceKind === 'calls') {
-      if (candidate.kind === 'function' || candidate.kind === 'method') {
+      if (
+        candidate.kind === 'function' ||
+        candidate.kind === 'method' ||
+        candidate.kind === 'component'
+      ) {
         score += 25;
       }
     }
@@ -2411,7 +2424,7 @@ export function matchFuzzy(
   const candidates = context.getNodesByLowerName(lowerName);
 
   // Filter to callable kinds only (function, method, class)
-  const callableKinds = new Set(['function', 'method', 'class']);
+  const callableKinds = new Set(['function', 'method', 'class', 'component']);
   const callableCandidates = applyLanguageGate(candidates.filter((n) => callableKinds.has(n.kind)), ref);
 
   // Prefer same-language matches

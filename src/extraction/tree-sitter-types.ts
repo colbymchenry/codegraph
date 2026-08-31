@@ -226,6 +226,46 @@ export interface LanguageExtractor {
   classifyMethodNode?: (node: SyntaxNode) => 'method' | 'property';
 
   /**
+   * Declarative decorator/annotation → NodeKind map for function/method
+   * declarations. When a declaration carries a decorator whose simple name is
+   * a key here, the node is created with the mapped kind instead of the
+   * default 'function'/'method' (e.g. Kotlin `{ Composable: 'component' }`
+   * classifies Jetpack Compose UI components). Names are matched against the
+   * same decorator entries the engine already extracts for `decorates` edges,
+   * so a language adds classification with data only — no parsing logic.
+   */
+  annotationKinds?: Record<string, NodeKind>;
+
+  /**
+   * Opt in to extended annotation extraction. Off by default, and deliberately
+   * per-language: it changes extraction output, so the language's native kernel
+   * walker must mirror it exactly or the kernel<->wasm parity gate fails.
+   *
+   * Three behaviors, all needed for Kotlin annotations:
+   *  1. persist annotation simple names onto each node's `decorators` list —
+   *     framework annotations live in external libraries outside the index, so
+   *     their `decorates` refs never resolve and the name on the node is the
+   *     only queryable trace that survives;
+   *  2. unwrap `constructor_invocation` so arg-bearing annotations
+   *     (`@Preview(showBackground = true)`) are not silently dropped;
+   *  3. collect EVERY target under one annotation node, for Kotlin's bracket
+   *     syntax (`@[Suppress("x") JvmStatic]`).
+   *
+   * (3) is why this is opt-in rather than universal: Swift attributes carry
+   * argument expressions in the same node (`@Siblings(from: \.$left)`), so
+   * collecting past the first target harvests `self`/`$left` as annotation
+   * names. Languages that don't opt in keep the stop-at-first behavior.
+   *
+   * Scope: functions, methods and classes. Properties and fields deliberately
+   * do NOT persist names — Kotlin handles `property_declaration` in its own
+   * `visitNode` hook and never reaches `extractProperty`/`extractField`, and the
+   * kernel walkers document the same restriction, so wiring it on this arm alone
+   * would break parity. `@field:Inject` on a property is therefore captured as a
+   * `decorates` ref but not as a queryable name; closing that needs both arms.
+   */
+  extendedAnnotations?: boolean;
+
+  /**
    * Resolve the body node for a function/method/class when it's not a child field.
    * (e.g. Dart puts function_body as a sibling, not a child.)
    */

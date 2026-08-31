@@ -388,6 +388,19 @@ const LITERAL_RECEIVER_TYPES = new Set([
   'dictionary', 'dict_literal', 'object', 'tuple', 'set',
 ]);
 
+/**
+ * One decorator/annotation/attribute applied to a declaration, as gathered by
+ * `collectDecoratorEntries`. `kind` is the EdgeKind the entry becomes: normal
+ * annotations emit `decorates`, while Solidity `modifier_invocation` emits
+ * `calls` (its body really does execute around the function).
+ */
+interface DecoratorEntry {
+  name: string;
+  kind: 'decorates' | 'calls';
+  line: number;
+  column: number;
+}
+
 export class TreeSitterExtractor {
   private filePath: string;
   private language: Language;
@@ -407,6 +420,19 @@ export class TreeSitterExtractor {
   private valueRefScopes: Array<{ id: string; node: SyntaxNode; name: string }> = [];
   private errors: ExtractionError[] = [];
   private extractor: LanguageExtractor | null = null;
+  /**
+   * True when this language's `annotationKinds` map produces 'component' nodes
+   * (Kotlin @Composable). Such a node was going to be a function or method, so
+   * every engine gate that keys on those kinds must accept it too — otherwise
+   * reclassifying silently drops its function-ref edges and its value-ref
+   * scope. Derived, not a separate flag, so a language opting into
+   * `annotationKinds` can't forget to set it.
+   *
+   * Scoped to opted-in languages on purpose: the same gates exist in all 13
+   * native kernel walkers, so widening them for a language whose Rust walker
+   * was not changed in lockstep would break the kernel<->wasm parity gate.
+   */
+  private componentIsFunctionLike = false;
   private nodeStack: string[] = []; // Stack of parent node IDs
   // C/C++ enclosing `namespace ns { … }` names, prepended to every contained
   // symbol's qualifiedName (see visitNode). Prefix-only by design — no
@@ -445,6 +471,9 @@ export class TreeSitterExtractor {
     this.source = source;
     this.language = language || detectLanguage(filePath, source);
     this.extractor = EXTRACTORS[this.language] || null;
+    this.componentIsFunctionLike = Object.values(this.extractor?.annotationKinds ?? {}).includes(
+      'component'
+    );
     this.fnRefSpec = FN_REF_SPECS[this.language];
     this.sourceIsPreParsed = options?.sourceIsPreParsed === true;
   }
@@ -650,6 +679,9 @@ export class TreeSitterExtractor {
     const definedHere = new Set<string>();
     for (const n of this.nodes) {
       if (n.kind === 'function' || n.kind === 'method') definedHere.add(n.name);
+      // Kotlin @Composable functions are 'component' but are referenced as
+      // plain function values (`::Header`), so they must pass the gate too.
+      else if (this.componentIsFunctionLike && n.kind === 'component') definedHere.add(n.name);
       // Python only (#1478): class-as-value is a first-class idiom (DRF
       // get_serializer_class, Meta.model, registry dicts), so same-file CLASS
       // names pass the gate too. Other languages keep the function/method
@@ -768,7 +800,13 @@ export class TreeSitterExtractor {
         this.fileScopeValueCounts.set(name, (this.fileScopeValueCounts.get(name) ?? 0) + 1);
       }
     }
-    if (kind === 'function' || kind === 'method' || kind === 'constant' || kind === 'variable') {
+    if (
+      kind === 'function' ||
+      kind === 'method' ||
+      kind === 'constant' ||
+      kind === 'variable' ||
+      (this.componentIsFunctionLike && kind === 'component')
+    ) {
       this.valueRefScopes.push({ id, node, name });
     }
   }
@@ -1338,7 +1376,9 @@ export class TreeSitterExtractor {
     // (callees, the callback synthesizer's body scan, context slices). Guarded to
     // only ever extend: for child-body grammars the body is within range (no-op).
     let endLine = node.endPosition.row + 1;
-    if (kind === 'function' || kind === 'method') {
+    // 'component' included: annotationKinds can reclassify a function/method
+    // (e.g. Kotlin @Composable) and those nodes still have bodies to span.
+    if (kind === 'function' || kind === 'method' || kind === 'component') {
       const body = this.extractor?.resolveBody?.(node, this.extractor.bodyField);
       if (body && body.endPosition.row + 1 > endLine) {
         endLine = body.endPosition.row + 1;
@@ -1592,7 +1632,8 @@ export class TreeSitterExtractor {
     const isStatic = this.extractor.isStatic?.(node);
     const returnType = this.extractor.getReturnType?.(node, this.source);
 
-    const funcNode = this.createNode('function', name, node, {
+    const funcKind = this.annotationKindFor(node) ?? 'function';
+    const funcNode = this.createNode(funcKind, name, node, {
       docstring,
       signature,
       visibility,
@@ -1609,7 +1650,7 @@ export class TreeSitterExtractor {
     // Extract decorators applied to the function (rare in JS/TS but
     // present in Python `@decorator def f():` and Java/Kotlin
     // annotations on free functions).
-    this.extractDecoratorsFor(node, funcNode.id);
+    this.extractDecoratorsFor(node, funcNode.id, funcNode);
 
     // Push to stack and visit body
     this.nodeStack.push(funcNode.id);
@@ -1720,7 +1761,7 @@ export class TreeSitterExtractor {
     this.extractCsharpPrimaryCtorParamRefs(node, classNode.id);
 
     // Extract decorators applied to the class (`@Foo class X {}`).
-    this.extractDecoratorsFor(node, classNode.id);
+    this.extractDecoratorsFor(node, classNode.id, classNode);
 
     // Push to stack and visit body
     this.nodeStack.push(classNode.id);
@@ -1804,7 +1845,8 @@ export class TreeSitterExtractor {
       extraProps.qualifiedName = this.composeReceiverQualifiedName(receiverType, name);
     }
 
-    const methodNode = this.createNode('method', name, node, extraProps);
+    const methodKind = this.annotationKindFor(node) ?? 'method';
+    const methodNode = this.createNode(methodKind, name, node, extraProps);
     if (!methodNode) return;
 
     // For methods with a receiver type but no class-like parent on the stack
@@ -1829,7 +1871,7 @@ export class TreeSitterExtractor {
     this.extractTypeAnnotations(node, methodNode.id);
 
     // Extract decorators (`@Get('/list') list() {}`).
-    this.extractDecoratorsFor(node, methodNode.id);
+    this.extractDecoratorsFor(node, methodNode.id, methodNode);
 
     // Push to stack and visit body
     this.nodeStack.push(methodNode.id);
@@ -1858,6 +1900,15 @@ export class TreeSitterExtractor {
       isExported,
     });
     if (!interfaceNode) return;
+
+    // Annotations on the declaration (Room's `@Dao interface`, `@Serializable
+    // enum class`). Gated on the language opt-in: these two paths emitted NO
+    // decorates refs before, so calling this unconditionally would change
+    // output for every other decorator-using language and break its kernel
+    // parity gate.
+    if (this.extractor.extendedAnnotations) {
+      this.extractDecoratorsFor(node, interfaceNode.id, interfaceNode);
+    }
 
     // Extract extends (interface inheritance)
     this.extractInheritance(node, interfaceNode.id);
@@ -1953,6 +2004,15 @@ export class TreeSitterExtractor {
       isExported,
     });
     if (!enumNode) return;
+
+    // Annotations on the declaration (Room's `@Dao interface`, `@Serializable
+    // enum class`). Gated on the language opt-in: these two paths emitted NO
+    // decorates refs before, so calling this unconditionally would change
+    // output for every other decorator-using language and break its kernel
+    // parity gate.
+    if (this.extractor.extendedAnnotations) {
+      this.extractDecoratorsFor(node, enumNode.id, enumNode);
+    }
 
     // Extract inheritance (e.g. Swift: enum AFError: Error)
     this.extractInheritance(node, enumNode.id);
@@ -4947,9 +5007,11 @@ export class TreeSitterExtractor {
   }
 
   /**
-   * Scan `declNode` and its preceding siblings (within the parent's
-   * named children) for decorator nodes, emitting a `decorates`
-   * reference from `decoratedId` to each decorator's function name.
+   * Gather every decorator/annotation/attribute applied to `declNode` as
+   * (simple name, position) entries. Shared by `extractDecoratorsFor`
+   * (decorates edges + persisting names onto the node) and
+   * `annotationKindFor` (declarative kind classification), so the
+   * grammar-specific shapes are parsed exactly once, in one place.
    *
    * Why preceding siblings: in TypeScript, `@Foo class Bar {}` parses
    * as an `export_statement` (or top-level wrapper) with the
@@ -4959,9 +5021,35 @@ export class TreeSitterExtractor {
    * so we also scan declNode.namedChildren.
    *
    * Idempotent across grammars: if neither location yields decorators
-   * (most non-decorator-using languages), the function is a no-op.
+   * (most non-decorator-using languages), the result is empty.
    */
-  private extractDecoratorsFor(declNode: SyntaxNode, decoratedId: string): void {
+  private collectDecoratorEntries(declNode: SyntaxNode): DecoratorEntry[] {
+    const entries: DecoratorEntry[] = [];
+
+    const pushTarget = (
+      target: SyntaxNode,
+      anno: SyntaxNode,
+      kind: DecoratorEntry['kind'] = 'decorates'
+    ): void => {
+      let name = getNodeText(target, this.source);
+      const lt = name.indexOf('<'); // strip generic args: `@Argument<T>` → `Argument`
+      if (lt > 0) name = name.slice(0, lt);
+      const lastDot = Math.max(name.lastIndexOf('.'), name.lastIndexOf('::'));
+      if (lastDot >= 0) name = name.slice(lastDot + 1).replace(/^[:.]/, '');
+      name = name.trim();
+      if (!name) return;
+      entries.push({
+        name,
+        kind,
+        line: anno.startPosition.row + 1,
+        column: anno.startPosition.column,
+      });
+    };
+
+    // Gated: see LanguageExtractor.extendedAnnotations. Without the opt-in this
+    // function reproduces the stop-at-first-target behavior exactly.
+    const extended = this.extractor?.extendedAnnotations === true;
+
     const consider = (n: SyntaxNode | null): void => {
       if (!n) return;
       // Solidity `modifier_invocation` (unique to that grammar) sits
@@ -4974,16 +5062,7 @@ export class TreeSitterExtractor {
       // traversal rides it.
       if (n.type === 'modifier_invocation') {
         const target = n.namedChild(0);
-        const name = target?.type === 'identifier' ? getNodeText(target, this.source) : undefined;
-        if (name) {
-          this.unresolvedReferences.push({
-            fromNodeId: decoratedId,
-            referenceName: name,
-            referenceKind: 'calls',
-            line: n.startPosition.row + 1,
-            column: n.startPosition.column,
-          });
-        }
+        if (target?.type === 'identifier') pushTarget(target, n, 'calls');
         return;
       }
       // `marker_annotation` is Java's grammar for arg-less annotations
@@ -4998,16 +5077,29 @@ export class TreeSitterExtractor {
       ) {
         return;
       }
-      // Find the leading identifier: skip the `@` punct, unwrap
-      // a call_expression if the decorator is invoked with args.
-      let target: SyntaxNode | null = null;
+      // Find the leading identifier(s): skip the `@` punct, unwrap a
+      // call_expression / constructor_invocation if the decorator is invoked
+      // with args. Kotlin bracket syntax (`@[Suppress("x") JvmStatic]`) puts
+      // SEVERAL entries under one annotation node, so collect every match
+      // instead of stopping at the first.
       for (let i = 0; i < n.namedChildCount; i++) {
         const child = n.namedChild(i);
         if (!child) continue;
         if (child.type === 'call_expression') {
           const fn = getChildByField(child, 'function') ?? child.namedChild(0);
-          if (fn) target = fn;
-          if (target) break;
+          if (fn) {
+            pushTarget(fn, n);
+            if (!extended) return;
+          }
+          continue;
+        }
+        // Kotlin arg-bearing annotations (`@Preview(showBackground = true)`)
+        // wrap the type in a constructor_invocation — without unwrapping it the
+        // annotation is silently dropped.
+        if (extended && child.type === 'constructor_invocation') {
+          const ut = child.namedChildren.find((c: SyntaxNode) => c.type === 'user_type');
+          if (ut) pushTarget(ut, n);
+          continue;
         }
         if (
           child.type === 'identifier' ||
@@ -5017,25 +5109,12 @@ export class TreeSitterExtractor {
           child.type === 'user_type' ||      // swift attribute → user_type (`@Argument`)
           child.type === 'type_identifier'
         ) {
-          target = child;
-          break;
+          pushTarget(child, n);
+          // Kotlin bracket syntax puts SEVERAL entries under one annotation
+          // node; every other language stops at the first target.
+          if (!extended) return;
         }
       }
-      if (!target) return;
-      let name = getNodeText(target, this.source);
-      const lt = name.indexOf('<'); // strip generic args: `@Argument<T>` → `Argument`
-      if (lt > 0) name = name.slice(0, lt);
-      const lastDot = Math.max(name.lastIndexOf('.'), name.lastIndexOf('::'));
-      if (lastDot >= 0) name = name.slice(lastDot + 1).replace(/^[:.]/, '');
-      name = name.trim();
-      if (!name) return;
-      this.unresolvedReferences.push({
-        fromNodeId: decoratedId,
-        referenceName: name,
-        referenceKind: 'decorates',
-        line: n.startPosition.row + 1,
-        column: n.startPosition.column,
-      });
     };
 
     // 1. Decorators that are direct children of the declaration
@@ -5088,6 +5167,60 @@ export class TreeSitterExtractor {
         }
       }
     }
+
+    return entries;
+  }
+
+  /**
+   * Emit a `decorates` reference from `decoratedId` to each decorator applied
+   * to `declNode`. When `intoNode` is provided, the decorator simple names are
+   * also persisted onto that node's `decorators` list — framework decorators
+   * (`@Composable`, `@Inject`, `@app.route`, …) are declared in external
+   * libraries outside the index, so their `decorates` references never resolve;
+   * the name on the node is the only queryable trace that survives.
+   * (`intoNode` is omitted where the edges are attributed to a DIFFERENT node
+   * than the decorated declaration, e.g. Swift property wrappers attributed to
+   * the enclosing type.)
+   */
+  private extractDecoratorsFor(declNode: SyntaxNode, decoratedId: string, intoNode?: Node): void {
+    const entries = this.collectDecoratorEntries(declNode);
+    if (entries.length === 0) return;
+    for (const entry of entries) {
+      this.unresolvedReferences.push({
+        fromNodeId: decoratedId,
+        referenceName: entry.name,
+        referenceKind: entry.kind,
+        line: entry.line,
+        column: entry.column,
+      });
+    }
+    if (intoNode && this.extractor?.extendedAnnotations) {
+      const merged = [...(intoNode.decorators ?? [])];
+      for (const entry of entries) {
+        // Solidity `modifier_invocation` entries are call-flow hops, not
+        // annotations — they must not show up as decorators on the node.
+        if (entry.kind !== 'decorates') continue;
+        if (!merged.includes(entry.name)) merged.push(entry.name);
+      }
+      if (merged.length > 0) intoNode.decorators = merged;
+    }
+  }
+
+  /**
+   * Resolve a declaration's NodeKind from the language's declarative
+   * `annotationKinds` map (e.g. Kotlin `@Composable` → 'component').
+   * Returns undefined when the language declares no map or no decorator
+   * on the declaration matches.
+   */
+  private annotationKindFor(declNode: SyntaxNode): NodeKind | undefined {
+    const map = this.extractor?.annotationKinds;
+    if (!map) return undefined;
+    for (const entry of this.collectDecoratorEntries(declNode)) {
+      if (entry.kind !== 'decorates') continue;
+      const kind = map[entry.name];
+      if (kind) return kind;
+    }
+    return undefined;
   }
 
   /**

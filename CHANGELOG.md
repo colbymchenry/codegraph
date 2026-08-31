@@ -12,6 +12,20 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Jetpack Compose functions are now indexed as UI components: any Kotlin function or method annotated `@Composable` is recorded with the `component` kind, so `codegraph_search` with `kind=component` finds your Compose UI the same way it already finds React components.
+
+- Kotlin annotations are now recorded on the symbol they annotate and shown by `codegraph_node`, so your agent can see that a class is `@HiltViewModel` or `@Entity`, or that a function is `@Composable`, without opening the file. Framework annotations come from libraries outside your project, so previously they left no trace on the graph at all.
+
+### Fixes
+
+- Kotlin annotations written with arguments (`@Preview(showBackground = true)`, `@Entity(tableName = "users")`) were ignored entirely — only bare annotations like `@Override` were picked up. Both forms are now captured, as is Kotlin's bracket form (`@[Suppress("x") JvmStatic]`).
+
+- Annotations on Kotlin interfaces and enums were dropped, so a Room `@Dao` interface or a `@Serializable` enum showed nothing. Both are now recorded.
+
+- Kotlin functions referenced as values (`register(::Header)`) kept their reference edge when the target is a Compose composable, instead of dropping it.
+
 
 ## [1.6.0] - 2026-08-26
 

@@ -995,8 +995,18 @@ async function goCrossFileMethodContainsEdges(queries: QueryBuilder, onYield: Ma
 // `actual` marker already gates out unrelated symbols, so widening to the
 // type-like kinds is safe.
 const KMP_TYPE_KINDS = new Set(['class', 'interface', 'struct', 'enum', 'type_alias']);
+// A @Composable expect/actual pair can be annotated asymmetrically — the actual
+// carries @Composable, the expect declaration doesn't (or vice versa) — which
+// makes one side 'component' and the other 'function'/'method'. Same-FQN plus the
+// `actual` marker already gates out unrelated symbols, so treat the callable
+// kinds as interchangeable rather than dropping the edge.
+const KMP_CALLABLE_KINDS = new Set(['function', 'method', 'component']);
 function kmpKindsCompatible(a: string, b: string): boolean {
-  return a === b || (KMP_TYPE_KINDS.has(a) && KMP_TYPE_KINDS.has(b));
+  return (
+    a === b ||
+    (KMP_TYPE_KINDS.has(a) && KMP_TYPE_KINDS.has(b)) ||
+    (KMP_CALLABLE_KINDS.has(a) && KMP_CALLABLE_KINDS.has(b))
+  );
 }
 
 async function kotlinExpectActualEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
