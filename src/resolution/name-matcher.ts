@@ -5,7 +5,8 @@
  */
 
 import { Language, Node } from '../types';
-import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
+import { UnresolvedRef, ResolvedRef, ResolutionContext, DeferredTypedReceiverRef } from './types';
+import { resolveImportPath } from './import-resolver';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -1222,9 +1223,24 @@ function inferJavaFieldReceiverType(
   return lastPart;
 }
 
+const SUPERTYPE_BEARING_KINDS = new Set<Node['kind']>([
+  'class',
+  'struct',
+  'interface',
+  'trait',
+  'protocol',
+  'enum',
+  'union',
+  'type_alias',
+]);
+
+function normalizePathForComparison(p: string): string {
+  return p.replace(/\\/g, '/').toLowerCase();
+}
+
 /**
  * Infer the declared or initialized type of a `this.<field>` receiver in TypeScript/JavaScript (#1566/#1496).
- * Looks up the property/field on the enclosing class within the call site's file.
+ * Looks up the property/field on the enclosing class within the call site's file, verifying direct ownership.
  */
 export function inferTsJsFieldReceiverType(
   receiverName: string,
@@ -1256,10 +1272,38 @@ export function inferTsJsFieldReceiverType(
       (n.kind === 'property' || n.kind === 'field') &&
       n.name === fieldName &&
       (n.language === ref.language || sameLanguageFamily(n.language, ref.language)) &&
-      n.startLine >= enclosing.startLine &&
-      (n.endLine ?? n.startLine) <= enclosingEnd,
+      (n.qualifiedName === `${enclosing!.qualifiedName}::${fieldName}` ||
+        n.qualifiedName === `${enclosing!.qualifiedName}.${fieldName}` ||
+        (n.startLine >= enclosing!.startLine &&
+          (n.endLine ?? n.startLine) <= enclosingEnd &&
+          !inFile.some(
+            (other) =>
+              other.id !== enclosing!.id &&
+              (other.kind === 'class' || other.kind === 'interface') &&
+              other.startLine >= enclosing!.startLine &&
+              (other.endLine ?? other.startLine) <= enclosingEnd &&
+              n.startLine >= other.startLine &&
+              (n.endLine ?? n.startLine) <= (other.endLine ?? other.startLine)
+          )))
   );
-  if (!field) return null;
+  if (!field) {
+    const lines = context.getFileLines ? context.getFileLines(ref.filePath) : null;
+    if (lines) {
+      const start = Math.max(0, enclosing.startLine - 1);
+      const end = Math.min(lines.length, enclosingEnd);
+      const paramPropRegex = new RegExp(
+        `\\b(?:private|protected|public|readonly)\\s+(?:(?:private|protected|public|readonly)\\s+)?${fieldName}\\s*:\\s*([A-Z][a-zA-Z0-9_$]*)`,
+      );
+      for (let i = start; i < end; i++) {
+        const line = lines[i];
+        if (line && line.length <= 10_000) {
+          const m = line.match(paramPropRegex);
+          if (m && m[1]) return m[1];
+        }
+      }
+    }
+    return null;
+  }
 
   if (field.signature && field.signature !== field.name) {
     // Signature format: "<TypeName> <fieldName>" (from TS property extraction)
@@ -1290,78 +1334,275 @@ export function inferTsJsFieldReceiverType(
   return null;
 }
 
-const PROJECT_AGGREGATE_KINDS = new Set([
-  'class',
-  'interface',
-  'struct',
-  'trait',
-  'protocol',
-  'union',
-  'enum',
-]);
-
 /**
- * Check if a type name corresponds to a project aggregate type (class, interface, struct, etc.)
- * in the project graph (#1566).
+ * Bind an inferred type name to an authoritative visible project type node in the project graph (#1566).
+ * Returns the exact Node or null if external / unresolvable / ambiguous.
  */
-export function isProjectAggregateType(
-  typeName: string,
-  language: string,
+export function bindProjectReceiverType(
+  inferredType: string,
+  ref: UnresolvedRef,
   context: ResolutionContext,
-): boolean {
-  const nodes = context.getNodesByName(typeName);
-  return nodes.some(
-    (n) => PROJECT_AGGREGATE_KINDS.has(n.kind) && (n.language === language || sameLanguageFamily(n.language, language))
+): Node | null {
+  const isWebFamily =
+    ref.language === 'typescript' ||
+    ref.language === 'tsx' ||
+    ref.language === 'javascript' ||
+    ref.language === 'jsx' ||
+    ref.language === 'arkts';
+
+  if (isWebFamily) {
+    // Case A: same-file aggregate node (checked in file or by name with matching filePath)
+    const sameFileMatch =
+      context.getNodesInFile(ref.filePath).find(
+        (n) =>
+          SUPERTYPE_BEARING_KINDS.has(n.kind) &&
+          n.name === inferredType &&
+          (n.language === ref.language || sameLanguageFamily(n.language, ref.language))
+      ) ??
+      context.getNodesByName(inferredType).find(
+        (n) =>
+          SUPERTYPE_BEARING_KINDS.has(n.kind) &&
+          normalizePathForComparison(n.filePath) === normalizePathForComparison(ref.filePath) &&
+          (n.language === ref.language || sameLanguageFamily(n.language, ref.language))
+      );
+    if (sameFileMatch) {
+      return sameFileMatch;
+    }
+
+    // Case B / C: check imports in caller file
+    const imports = context.getImportMappings ? context.getImportMappings(ref.filePath, ref.language) : [];
+    const mapping = imports.find((i) => i.localName === inferredType);
+    if (mapping) {
+      const resolvedPath =
+        mapping.resolvedPath ||
+        resolveImportPath(mapping.source, ref.filePath, ref.language, context);
+      if (resolvedPath) {
+        const normResolved = normalizePathForComparison(resolvedPath);
+        const targetNodes = context.getNodesInFile(resolvedPath).concat(
+          context.getNodesByName(mapping.exportedName || mapping.localName)
+        );
+        const importedNode = targetNodes.find(
+          (n) =>
+            SUPERTYPE_BEARING_KINDS.has(n.kind) &&
+            (n.name === mapping.exportedName || n.name === mapping.localName || mapping.isDefault) &&
+            normalizePathForComparison(n.filePath) === normResolved &&
+            (n.language === ref.language || sameLanguageFamily(n.language, ref.language))
+        );
+        if (importedNode) return importedNode;
+      }
+      // Case C: External SDK import (resolvedPath is null / undefined)
+      return null;
+    }
+
+    // Case D: Built-in / unimported global type (e.g. `new Map()`)
+    return null;
+  }
+
+  // Non-web languages (Java, Kotlin, C++, C#, Go, Rust, Swift, etc.):
+  const inFile = context.getNodesInFile(ref.filePath);
+  const sameFileMatch = inFile.find(
+    (n) =>
+      SUPERTYPE_BEARING_KINDS.has(n.kind) &&
+      n.name === inferredType &&
+      (n.language === ref.language || sameLanguageFamily(n.language, ref.language))
   );
-}
+  if (sameFileMatch) return sameFileMatch;
 
-/**
- * Extract the inferred type of a call receiver from local variables or class fields (#1566).
- */
-export function getInferredReceiverType(ref: UnresolvedRef, context: ResolutionContext): string | null {
-  if (ref.referenceKind !== 'calls') return null;
-  const dotMatch = ref.referenceName.match(/^([a-zA-Z0-9_$.]+)\.([a-zA-Z0-9_$]+)$/);
-  const luaColonMatch = ref.language === 'lua' ? ref.referenceName.match(/^([a-zA-Z0-9_]+):([a-zA-Z0-9_]+)$/) : null;
-  const rDollarMatch = ref.language === 'r' ? ref.referenceName.match(/^([a-zA-Z0-9_.]+)\$([a-zA-Z0-9_.]+)$/) : null;
-  const match = dotMatch || luaColonMatch || rDollarMatch;
-  if (!match) return null;
-  const [, objectOrClass] = match;
-  if (!objectOrClass) return null;
-
-  if (
-    (ref.language === 'typescript' ||
-      ref.language === 'javascript' ||
-      ref.language === 'tsx' ||
-      ref.language === 'jsx' ||
-      ref.language === 'arkts') &&
-    dotMatch &&
-    objectOrClass.startsWith('this.')
-  ) {
-    return inferTsJsFieldReceiverType(objectOrClass, ref, context);
+  const imports = context.getImportMappings ? context.getImportMappings(ref.filePath, ref.language) : [];
+  const mapping = imports.find((i) => i.localName === inferredType);
+  if (mapping) {
+    const resolvedPath =
+      mapping.resolvedPath ||
+      resolveImportPath(mapping.source, ref.filePath, ref.language, context);
+    if (resolvedPath) {
+      const normResolved = normalizePathForComparison(resolvedPath);
+      const importedNode = context
+        .getNodesByName(mapping.exportedName || mapping.localName)
+        .find(
+          (n) =>
+            SUPERTYPE_BEARING_KINDS.has(n.kind) &&
+            normalizePathForComparison(n.filePath) === normResolved &&
+            (n.language === ref.language || sameLanguageFamily(n.language, ref.language))
+        );
+      if (importedNode) return importedNode;
+    }
   }
 
-  if (dotMatch || luaColonMatch || rDollarMatch) {
-    if (ref.language === 'cpp') {
-      return inferCppReceiverType(objectOrClass, ref, context);
-    }
-    if (ref.language === 'java' || ref.language === 'kotlin') {
-      const local = inferLocalReceiverType(objectOrClass, ref, context);
-      if (local) return local;
-      return inferJavaFieldReceiverType(objectOrClass, ref, context);
-    }
-    return inferLocalReceiverType(objectOrClass, ref, context);
+  const candidates = context
+    .getNodesByName(inferredType)
+    .filter(
+      (n) =>
+        SUPERTYPE_BEARING_KINDS.has(n.kind) &&
+        (n.language === ref.language || sameLanguageFamily(n.language, ref.language))
+    );
+  if (candidates.length === 1) {
+    return candidates[0]!;
   }
+
   return null;
 }
 
 /**
- * Returns true if a call reference was typed with a project aggregate type and should be retried
- * during the conformance second pass after inheritance edges exist (#1566).
+ * Resolve a method directly declared on a specific type node (no supertype walk) (#1566).
  */
-export function shouldDeferTypedReceiver(ref: UnresolvedRef, context: ResolutionContext): boolean {
-  const inferred = getInferredReceiverType(ref, context);
-  if (!inferred) return false;
-  return isProjectAggregateType(inferred, ref.language, context);
+export function resolveMethodOnTypeNode(
+  typeNode: Node,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  confidence: number = 0.9,
+  resolvedBy: ResolvedRef['resolvedBy'] = 'instance-method',
+): ResolvedRef | null {
+  const methodCandidates = context
+    .getNodesByName(methodName)
+    .filter(
+      (m) =>
+        (m.kind === 'method' || m.kind === 'function') &&
+        m.filePath === typeNode.filePath &&
+        (m.language === typeNode.language || sameLanguageFamily(m.language, typeNode.language)) &&
+        (m.qualifiedName === `${typeNode.qualifiedName}::${methodName}` ||
+          m.qualifiedName === `${typeNode.qualifiedName}.${methodName}` ||
+          (m.startLine >= typeNode.startLine && (m.endLine ?? m.startLine) <= (typeNode.endLine ?? typeNode.startLine)))
+    );
+
+  if (methodCandidates.length === 1) {
+    return {
+      original: ref,
+      targetNodeId: methodCandidates[0]!.id,
+      confidence,
+      resolvedBy,
+    };
+  }
+
+  const exact = methodCandidates.find((m) => m.qualifiedName === `${typeNode.qualifiedName}::${methodName}`);
+  if (exact) {
+    return {
+      original: ref,
+      targetNodeId: exact.id,
+      confidence,
+      resolvedBy,
+    };
+  }
+
+  return null;
+}
+
+export interface ParsedMethodCall {
+  receiver: string;
+  methodName: string;
+  syntax: 'dot' | 'cpp-operator' | 'scope' | 'lua-colon' | 'r-dollar';
+  inferableReceiver: boolean;
+}
+
+/**
+ * Canonical parser for method call reference shapes (#1566).
+ */
+export function parseMethodCallReference(ref: UnresolvedRef): ParsedMethodCall | null {
+  if (ref.referenceKind !== 'calls') return null;
+
+  // C++ explicit operator call `a.operator+(b)` reaches the resolver as `a.operator+` (#1247)
+  if (ref.language === 'cpp') {
+    const opMatch = ref.referenceName.match(/^([\w.]+)\.(operator[^\w\s.]+)$/);
+    if (opMatch && opMatch[1] && opMatch[2]) {
+      return {
+        receiver: opMatch[1],
+        methodName: opMatch[2],
+        syntax: 'cpp-operator',
+        inferableReceiver: true,
+      };
+    }
+  }
+
+  // Lua/Luau method calls use a single colon (`lg:log`)
+  if (ref.language === 'lua' || ref.language === 'luau') {
+    const luaMatch = ref.referenceName.match(/^([\w.]+):(\w+)$/);
+    if (luaMatch && luaMatch[1] && luaMatch[2]) {
+      return {
+        receiver: luaMatch[1],
+        methodName: luaMatch[2],
+        syntax: 'lua-colon',
+        inferableReceiver: true,
+      };
+    }
+  }
+
+  // R uses `$` (`lg$log`)
+  if (ref.language === 'r') {
+    const rMatch = ref.referenceName.match(/^([\w.]+)\$(\w+)$/);
+    if (rMatch && rMatch[1] && rMatch[2]) {
+      return {
+        receiver: rMatch[1],
+        methodName: rMatch[2],
+        syntax: 'r-dollar',
+        inferableReceiver: true,
+      };
+    }
+  }
+
+  // Plain dot: `obj.method`, `builder.Services.AddCoreServices`, or Objective-C selectors `setX:y:`
+  const dotMatch = ref.referenceName.match(/^([\w.]+)\.(\w+:?(?:\w+:)*)$/);
+  if (dotMatch && dotMatch[1] && dotMatch[2]) {
+    return {
+      receiver: dotMatch[1],
+      methodName: dotMatch[2],
+      syntax: 'dot',
+      inferableReceiver: true,
+    };
+  }
+
+  // Scope: `Class::method`
+  const colonMatch = ref.referenceName.match(/^(\w+)::(\w+)$/);
+  if (colonMatch && colonMatch[1] && colonMatch[2]) {
+    return {
+      receiver: colonMatch[1],
+      methodName: colonMatch[2],
+      syntax: 'scope',
+      inferableReceiver: false,
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Builds a structured deferred typed receiver record for the conformance second pass (#1566).
+ */
+export function buildTypedReceiverDeferral(
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): DeferredTypedReceiverRef | null {
+  const parsed = parseMethodCallReference(ref);
+  if (!parsed || !parsed.inferableReceiver) return null;
+
+  let inferredType: string | null = null;
+  const isWebFamily =
+    ref.language === 'typescript' ||
+    ref.language === 'javascript' ||
+    ref.language === 'tsx' ||
+    ref.language === 'jsx' ||
+    ref.language === 'arkts';
+
+  if (isWebFamily && parsed.receiver.startsWith('this.')) {
+    inferredType = inferTsJsFieldReceiverType(parsed.receiver, ref, context);
+  } else if (ref.language === 'cpp') {
+    inferredType = inferCppReceiverType(parsed.receiver, ref, context);
+  } else if (ref.language === 'java' || ref.language === 'kotlin') {
+    inferredType = inferLocalReceiverType(parsed.receiver, ref, context) ?? inferJavaFieldReceiverType(parsed.receiver, ref, context);
+  } else {
+    inferredType = inferLocalReceiverType(parsed.receiver, ref, context);
+  }
+
+  if (!inferredType) return null;
+
+  const typeNode = bindProjectReceiverType(inferredType, ref, context);
+  if (!typeNode || !SUPERTYPE_BEARING_KINDS.has(typeNode.kind)) return null;
+
+  return {
+    ref,
+    receiverTypeNodeId: typeNode.id,
+    receiverTypeName: typeNode.name,
+    methodName: parsed.methodName,
+  };
 }
 
 // ── Local-variable receiver-type inference (#1108) ──────────────────────────
@@ -1871,38 +2112,6 @@ export function matchMethodCall(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
-  // Parse method call patterns like "obj.method" or "Class::method". The method
-  // part allows trailing `:` keywords so Objective-C selectors resolve
-  // (`SDImageCache.storeImage:`, `obj.setX:y:`); colons never appear in other
-  // languages' method refs, so this is a no-op for them.
-  // The receiver allows dots (`builder.Services.AddCoreServices`) so a CHAINED
-  // call resolves by its last segment — Strategy 3 below name-matches the method
-  // (with its existing single-candidate / receiver-overlap guards). Without this
-  // a multi-dot extension-method call (C# DI `builder.Services.AddCoreServices()`,
-  // `Guard.Against.X()`) matched no pattern and never resolved.
-  // C++ explicit operator call `a.operator+(b)` reaches the resolver as
-  // `a.operator+` (#1247) — the operator's symbol chars (`+`, `==`, `[]`, `()`)
-  // fail the \w method part of the plain pattern, so admit them explicitly.
-  // Names like `operatorTable` stay on the plain pattern (tried first); the
-  // operator form requires at least one non-word char after `operator`, and
-  // every downstream strategy compares the method part by exact string
-  // equality, so a stray match can't invent an edge.
-  const dotMatch =
-    ref.referenceName.match(/^([\w.]+)\.(\w+:?(?:\w+:)*)$/) ??
-    (ref.language === 'cpp'
-      ? ref.referenceName.match(/^([\w.]+)\.(operator[^\w\s.]+)$/)
-      : null);
-  const colonMatch = ref.referenceName.match(/^(\w+)::(\w+)$/);
-  // Lua/Luau method calls use a single colon (`lg:log`); R uses `$` (`lg$log`).
-  // Recognize these receiver/method separators so local-variable receiver-type
-  // inference (#1108) applies to them too — extraction already emits the ref in
-  // this shape, but the resolver otherwise only understood `.` and `::`.
-  const luaColonMatch = (ref.language === 'lua' || ref.language === 'luau')
-    ? ref.referenceName.match(/^([\w.]+):(\w+)$/)
-    : null;
-  const rDollarMatch = ref.language === 'r'
-    ? ref.referenceName.match(/^([\w.]+)\$(\w+)$/)
-    : null;
 
   // PHP property receiver: `$this->prop->method()` reaches the resolver as
   // `this->prop.method` (the extractor records the receiver's raw text with the
@@ -1930,15 +2139,22 @@ export function matchMethodCall(
     );
   }
 
-  const match = dotMatch || colonMatch || luaColonMatch || rDollarMatch;
-  if (!match) {
+  const parsed = parseMethodCallReference(ref);
+  if (!parsed) {
     return null;
   }
 
-  const [, objectOrClass, methodName] = match;
-  // A simple `receiver.method` / `receiver:method` / `receiver$method` shape whose
-  // receiver type we can try to infer from its local declaration.
-  const inferableReceiver = dotMatch || luaColonMatch || rDollarMatch;
+  const objectOrClass = parsed.receiver;
+  const methodName = parsed.methodName;
+  const dotMatch = parsed.syntax === 'dot' || parsed.syntax === 'cpp-operator';
+  const inferableReceiver = parsed.inferableReceiver;
+
+  const isWebFamily =
+    ref.language === 'typescript' ||
+    ref.language === 'javascript' ||
+    ref.language === 'tsx' ||
+    ref.language === 'jsx' ||
+    ref.language === 'arkts';
 
   // Infer the receiver's type from its local declaration/initializer in the
   // enclosing scope, then resolve the method on that type (#1108). C++ keeps its
@@ -1948,9 +2164,20 @@ export function matchMethodCall(
   if (inferableReceiver) {
     const inferredType = nmTimedT('mc-infer', ref, () =>
       ref.language === 'cpp'
-        ? inferCppReceiverType(objectOrClass!, ref, context)
-        : inferLocalReceiverType(objectOrClass!, ref, context));
+        ? inferCppReceiverType(objectOrClass, ref, context)
+        : inferLocalReceiverType(objectOrClass, ref, context));
     if (inferredType) {
+      if (isWebFamily) {
+        const typeNode = bindProjectReceiverType(inferredType, ref, context);
+        if (!typeNode) {
+          return null;
+        }
+        const typedMatch = nmTimedT('mc-rmot', ref, () =>
+          resolveMethodOnTypeNode(typeNode, methodName, ref, context, 0.9, 'instance-method')
+        );
+        return typedMatch;
+      }
+
       // Java/Kotlin: when two classes share the simple name, the file's import
       // pins WHICH one (#314). Other languages disambiguate by call-site file.
       const importedFqn =
@@ -1961,7 +2188,7 @@ export function matchMethodCall(
           : undefined;
       const typedMatch = nmTimedT('mc-rmot', ref, () => resolveMethodOnType(
         inferredType,
-        methodName!,
+        methodName,
         ref,
         context,
         0.9,
@@ -1988,8 +2215,8 @@ export function matchMethodCall(
   // fabricated a dependency on an unrelated local interface's same-named
   // method. Chained Go receivers were never emitted before #1276, so there
   // is no prior recall to preserve on the fallback path.
-  if (ref.language === 'go' && dotMatch && objectOrClass!.includes('.')) {
-    return matchGoFieldChainCall(objectOrClass!, methodName!, ref, context);
+  if (ref.language === 'go' && dotMatch && objectOrClass.includes('.')) {
+    return matchGoFieldChainCall(objectOrClass, methodName, ref, context);
   }
 
   // Rust call through a field of the enclosing type — `self.inner.run()`,
@@ -2000,8 +2227,8 @@ export function matchMethodCall(
   // type — or to the calling method itself, a self-edge the source doesn't
   // contain — whenever the field's type was external or merely shared a
   // method name with something nearby.
-  if (ref.language === 'rust' && dotMatch && objectOrClass!.startsWith('self.')) {
-    return matchRustSelfFieldCall(objectOrClass!.slice('self.'.length), methodName!, ref, context);
+  if (ref.language === 'rust' && dotMatch && objectOrClass.startsWith('self.')) {
+    return matchRustSelfFieldCall(objectOrClass.slice('self.'.length), methodName, ref, context);
   }
 
   // Java/Kotlin: receiver may be a field whose name doesn't match the type by
@@ -2010,7 +2237,7 @@ export function matchMethodCall(
   // the method on that type. Covers Spring `@Resource`/`@Autowired` field
   // injection where the field type is the concrete bean class.
   if ((ref.language === 'java' || ref.language === 'kotlin') && dotMatch) {
-    const inferredType = inferJavaFieldReceiverType(objectOrClass!, ref, context);
+    const inferredType = inferJavaFieldReceiverType(objectOrClass, ref, context);
     if (inferredType) {
       // When two classes share the same simple name, the caller file's
       // import is the only signal that names WHICH one — pass the
@@ -2019,7 +2246,7 @@ export function matchMethodCall(
       const importedFqn = imports.find((i) => i.localName === inferredType)?.source;
       const typedMatch = nmTimedT('mc-rmot', ref, () => resolveMethodOnType(
         inferredType,
-        methodName!,
+        methodName,
         ref,
         context,
         0.9,
@@ -2032,25 +2259,16 @@ export function matchMethodCall(
 
   // TypeScript / JavaScript / ArkTS: receiver may be `this.<field>` (#1566/#1496).
   // Look up the declared/initialized type of the field on the enclosing class.
-  if (
-    (ref.language === 'typescript' ||
-      ref.language === 'javascript' ||
-      ref.language === 'tsx' ||
-      ref.language === 'jsx' ||
-      ref.language === 'arkts') &&
-    dotMatch &&
-    objectOrClass!.startsWith('this.')
-  ) {
-    const inferredType = inferTsJsFieldReceiverType(objectOrClass!, ref, context);
+  if (isWebFamily && dotMatch && objectOrClass.startsWith('this.')) {
+    const inferredType = inferTsJsFieldReceiverType(objectOrClass, ref, context);
     if (inferredType) {
-      const typedMatch = nmTimedT('mc-rmot', ref, () => resolveMethodOnType(
-        inferredType,
-        methodName!,
-        ref,
-        context,
-        0.9,
-        'instance-method',
-      ));
+      const typeNode = bindProjectReceiverType(inferredType, ref, context);
+      if (!typeNode) {
+        return null;
+      }
+      const typedMatch = nmTimedT('mc-rmot', ref, () =>
+        resolveMethodOnTypeNode(typeNode, methodName, ref, context, 0.9, 'instance-method')
+      );
       return typedMatch;
     }
   }

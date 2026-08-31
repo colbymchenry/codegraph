@@ -46,6 +46,16 @@ export interface ResolvedRef {
 }
 
 /**
+ * Deferred typed-receiver call reference for node-anchored conformance post-pass (#1566)
+ */
+export interface DeferredTypedReceiverRef {
+  ref: UnresolvedRef;
+  receiverTypeNodeId: string;
+  receiverTypeName: string;
+  methodName: string;
+}
+
+/**
  * Result of resolution attempt
  */
 export interface ResolutionResult {

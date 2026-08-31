@@ -880,4 +880,31 @@ describe('Scoped sync parity (#watcher-scoped)', () => {
     expect(readmitted.filesAdded).toBe(1);
     expect(cg.searchNodes('gamma').length).toBe(1);
   });
+
+  it('incremental sync resolves deferred typed receiver calls to inherited methods (#1566)', async () => {
+    // Initial index has BaseService
+    fs.writeFileSync(
+      path.join(testDir, 'src', 'base.ts'),
+      `export class BaseService { run(): number { return 1; } }`
+    );
+    await cg.sync();
+
+    // Then add derived.ts with DerivedService extends BaseService and call d.run()
+    fs.writeFileSync(
+      path.join(testDir, 'src', 'derived.ts'),
+      `import { BaseService } from './base';
+export class DerivedService extends BaseService {}
+export function useDerived(): number {
+  const d = new DerivedService();
+  return d.run();
+}`
+    );
+    await cg.sync();
+
+    const useDerivedFn = cg.getNodesByName('useDerived')[0];
+    expect(useDerivedFn).toBeDefined();
+    const callees = await cg.getCallees(useDerivedFn!.id);
+    const calleeMethods = callees.filter((c) => c.node.kind === 'method').map((c) => c.node.name);
+    expect(calleeMethods).toContain('run');
+  });
 });

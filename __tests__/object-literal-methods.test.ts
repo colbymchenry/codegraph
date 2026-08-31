@@ -51,11 +51,12 @@ describe('object-literal method extraction', () => {
     expect(fnNames).toContain('switchOrganization');
     expect(fnNames).toContain('reset');
 
-    // Each action's body was walked: fetchUser references its sibling `reset`,
-    // so an in-store calls edge will resolve once the pipeline runs.
+    // Each action's body was walked: inner call `get()` is extracted, while
+    // the dynamic chained `.reset()` on a call-result receiver is safely silenced (#1566).
     const fetchUser = result.nodes.find((n) => n.name === 'fetchUser')!;
     const fetchUserRefs = result.unresolvedReferences.filter((r) => r.fromNodeId === fetchUser.id);
-    expect(fetchUserRefs.map((r) => r.referenceName)).toContain('reset');
+    expect(fetchUserRefs.map((r) => r.referenceName)).toContain('get');
+    expect(fetchUserRefs.map((r) => r.referenceName)).not.toContain('reset');
 
     // The action's body wasn't mis-attributed to the file scope (the reason we
     // skip the generic body-visit for the store-factory call).
@@ -166,10 +167,9 @@ describe('object-literal method resolution (end-to-end)', () => {
     const fetchUserCallers = cg.getCallers(fetchUser!.id).map((c) => c.node.name);
     expect(fetchUserCallers).toContain('loginFlow');
 
-    // Chained getState() call: hardReset -> reset, AND in-store sibling: fetchUser -> reset
+    // Dynamic chained getState().reset() and get().reset() calls do not emit bare references (#1566)
     const resetCallers = cg.getCallers(reset!.id).map((c) => c.node.name);
-    expect(resetCallers).toContain('hardReset');
-    expect(resetCallers).toContain('fetchUser');
+    expect(resetCallers).not.toContain('hardReset');
 
     cg.close();
   });

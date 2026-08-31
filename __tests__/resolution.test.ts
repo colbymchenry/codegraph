@@ -3275,6 +3275,185 @@ export function useDerived(): void {
         fs.rmSync(tmpDir, { recursive: true, force: true });
       }
     }, 30000);
+
+    it('built-in Map receiver does not resolve to unrelated same-named project class Map decoy (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-map-decoy-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'decoy.ts'),
+          `export class BaseMap {
+  get(key: string): string | undefined {
+    return undefined;
+  }
+}
+export class Map extends BaseMap {}
+`
+        );
+        fs.writeFileSync(
+          path.join(tmpDir, 'use.ts'),
+          `export function useBuiltinMap(): string | undefined {
+  const values = new Map<string, string>();
+  return values.get("x");
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('use.ts');
+        const useFn = allNodes.find((n) => n.kind === 'function' && n.name === 'useBuiltinMap');
+        expect(useFn).toBeDefined();
+
+        const callees = await cg.getCallees(useFn!.id);
+        expect(callees.filter((c) => c.node.name === 'get')).toHaveLength(0);
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('external SDK import does not bind to unrelated project same-named class decoy (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-sdk-decoy-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'decoy.ts'),
+          `export class BaseClient {
+  run(): void {}
+}
+export class ExternalClient extends BaseClient {
+  send(): void {}
+}
+`
+        );
+        fs.writeFileSync(
+          path.join(tmpDir, 'use.ts'),
+          `import { ExternalClient } from "external-sdk";
+export function useExternal(client: ExternalClient): void {
+  client.send();
+  client.run();
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('use.ts');
+        const useFn = allNodes.find((n) => n.kind === 'function' && n.name === 'useExternal');
+        expect(useFn).toBeDefined();
+
+        const callees = await cg.getCallees(useFn!.id);
+        expect(callees.filter((c) => c.node.name === 'send' || c.node.name === 'run')).toHaveLength(0);
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('distinct same-named Engine classes maintain node-anchored conformance paths (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-engine-paths-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.mkdirSync(path.join(tmpDir, 'a'), { recursive: true });
+        fs.mkdirSync(path.join(tmpDir, 'b'), { recursive: true });
+        fs.writeFileSync(
+          path.join(tmpDir, 'a', 'engine.ts'),
+          `export class BaseA {
+  run(): void {}
+}
+export class Engine extends BaseA {}
+`
+        );
+        fs.writeFileSync(
+          path.join(tmpDir, 'b', 'engine.ts'),
+          `export class BaseB {
+  run(): void {}
+}
+export class Engine extends BaseB {}
+`
+        );
+        fs.writeFileSync(
+          path.join(tmpDir, 'use.ts'),
+          `import { Engine } from "./a/engine";
+export function useEngineA(): void {
+  const engine = new Engine();
+  engine.run();
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodesA = cg.getNodesInFile('a/engine.ts');
+        const baseARun = allNodesA.find((n) => n.kind === 'method' && n.name === 'run' && n.qualifiedName.startsWith('BaseA'));
+        expect(baseARun).toBeDefined();
+
+        const allNodesB = cg.getNodesInFile('b/engine.ts');
+        const baseBRun = allNodesB.find((n) => n.kind === 'method' && n.name === 'run' && n.qualifiedName.startsWith('BaseB'));
+        expect(baseBRun).toBeDefined();
+
+        const callersA = await cg.getCallers(baseARun!.id);
+        expect(callersA.map((c) => c.node.name)).toContain('useEngineA');
+
+        const callersB = await cg.getCallers(baseBRun!.id);
+        expect(callersB.map((c) => c.node.name)).not.toContain('useEngineA');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('nested class field within method does not hijack outer class this.field receiver (#1566)', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1566-nested-class-'));
+      let cg: CodeGraph | undefined;
+      try {
+        fs.writeFileSync(
+          path.join(tmpDir, 'service.ts'),
+          `export class Mailer {
+  send(message: string): void {}
+}
+export class Decoy {
+  send(message: string): void {}
+}
+export class Service {
+  run(): void {
+    class Local {
+      mailer: Decoy;
+    }
+    this.mailer.send("hello");
+  }
+  mailer: Mailer;
+}
+`
+        );
+
+        cg = await CodeGraph.init(tmpDir, { index: true });
+
+        const allNodes = cg.getNodesInFile('service.ts');
+        const mailerSend = allNodes.find((n) => n.kind === 'method' && n.name === 'send' && n.qualifiedName.startsWith('Mailer'));
+        const decoySend = allNodes.find((n) => n.kind === 'method' && n.name === 'send' && n.qualifiedName.startsWith('Decoy'));
+        expect(mailerSend).toBeDefined();
+        expect(decoySend).toBeDefined();
+
+        const mailerCallers = await cg.getCallers(mailerSend!.id);
+        expect(mailerCallers.map((c) => c.node.name)).toContain('run');
+
+        const decoyCallers = await cg.getCallers(decoySend!.id);
+        expect(decoyCallers.map((c) => c.node.name)).not.toContain('run');
+      } finally {
+        if (cg) {
+          cg.close();
+        }
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
   });
 
   describe('Object-literal namespace members (#1573)', () => {

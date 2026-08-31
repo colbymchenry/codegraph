@@ -14,7 +14,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import type { Edge, UnresolvedReference } from '../types';
-import type { ResolvedRef, UnresolvedRef } from './types';
+import type { ResolvedRef, UnresolvedRef, DeferredTypedReceiverRef } from './types';
 import { memoryBudgetBytes } from './memory-budget';
 
 /** One synthesis pass's output: its edge list + worker-measured wall clock. */
@@ -28,7 +28,7 @@ export interface ChunkResult {
   unresolved: UnresolvedRef[];
   deferredChain: UnresolvedRef[];
   deferredThisMember: UnresolvedRef[];
-  deferredTypedReceiver: UnresolvedRef[];
+  deferredTypedReceiver: DeferredTypedReceiverRef[];
   byMethod: Record<string, number>;
 }
 
@@ -169,7 +169,7 @@ export class ResolverPool {
             unresolved: msg.unresolved!,
             deferredChain: msg.deferredChain!,
             deferredThisMember: msg.deferredThisMember!,
-            deferredTypedReceiver: msg.deferredTypedReceiver ?? [],
+            deferredTypedReceiver: msg.deferredTypedReceiver!,
             byMethod: msg.byMethod!,
           });
         } else if (msg.type === 'synth-result' && msg.id !== undefined) {

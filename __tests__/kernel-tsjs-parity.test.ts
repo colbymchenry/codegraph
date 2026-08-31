@@ -110,6 +110,31 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
     }
   });
 
+  it('dynamic receiver extraction parity and silence (#1566)', () => {
+    const src = `
+function factory() { return { get: () => 1 }; }
+export function dynamic(holder: any, key: string) {
+  holder[key].get("x");
+  factory().get("x");
+}
+export function staticChain(holder: any) {
+  holder.values.get("x");
+}
+`;
+    assertParity('fixtures/dynamic-parity.ts', src, 'typescript');
+    const wasmRes = extractFromSource('fixtures/dynamic-parity.ts', src, 'typescript');
+    const kernelRes = tryKernelExtract('fixtures/dynamic-parity.ts', src, 'typescript')!;
+    for (const res of [wasmRes, kernelRes]) {
+      const calls = res.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+      const names = calls.map((c) => c.referenceName);
+      expect(names).toContain('holder.values.get');
+      expect(names).toContain('factory');
+      expect(names).not.toContain('get');
+      expect(names.some((n) => n.includes('factory().'))).toBe(false);
+      expect(names.some((n) => n.includes('key]'))).toBe(false);
+    }
+  });
+
   it('torture fixture (js): field methods, wrappers, vuex module shape', () => {
     const file = path.join(FIXTURE_DIR, 'torture.js');
     assertParity('fixtures/torture.js', fs.readFileSync(file, 'utf8'), 'javascript');
