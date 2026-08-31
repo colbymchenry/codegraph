@@ -220,6 +220,67 @@ export function render(m: Measurement) { return m.id; }
     expect(files).not.toContain('ts/app/widget.ts');
   }, 120000);
 
+  it('resolves each target language on its own, so a precise one does not mute a coarse one', async () => {
+    // Whether a generator emits a symbol per field is a fact about THAT
+    // generator: protoc-gen-js writes an accessor per field, protoc's Python
+    // stubs write only a class annotation. Deciding the declaring-type
+    // fallback once for the whole declaration lets any language that DOES emit
+    // one suppress the fallback for every language that does not — and those
+    // languages then contribute no edge at all. The failure is silent and
+    // inverted: adding a language that resolves precisely DELETES the coverage
+    // of the ones that cannot.
+    const mixed = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-proto-mixed-'));
+    try {
+      const write = (rel: string, body: string) => {
+        const full = path.join(mixed, rel);
+        fs.mkdirSync(path.dirname(full), { recursive: true });
+        fs.writeFileSync(full, body);
+      };
+      write('proto/reading.proto', `syntax = "proto3";
+package acme.v1;
+
+message Reading {
+  string observed_at = 2;
+}
+`);
+      // protoc-gen-js shape: an accessor method per field, so `observed_at`
+      // has a real member-level peer here.
+      write('ts/gen/reading_pb.ts', `export class Reading {
+  getObservedAt(): string { return this.observedAt; }
+  setObservedAt(v: string): void { this.observedAt = v; }
+}
+`);
+      // protoc stub shape: a class annotation, which is not extracted as a
+      // node — so this language has no member peer and must still fall back.
+      write('py/gen/reading_pb2.pyi', `class Reading:
+    observed_at: str
+`);
+
+      const CodeGraph = (await import('../src/index')).default;
+      const g = CodeGraph.initSync(mixed, {
+        config: { include: ['**/*.proto', '**/*.pyi', '**/*.ts'], exclude: [] },
+      });
+      await g.indexAll();
+      const rows = (g as any).db.db
+        .prepare(
+          `SELECT s.language slang, json_extract(e.metadata,'$.match') matchKind
+             FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+            WHERE json_extract(e.metadata,'$.synthesizedBy') = 'protobuf-contract'
+              AND t.qualified_name = 'acme.v1.Reading.observed_at'`
+        )
+        .all();
+      const byLang = new Map(rows.map((r: any) => [r.slang, r.matchKind]));
+      // TypeScript resolves precisely, via its accessor.
+      expect(byLang.get('typescript')).toBe('symbol');
+      // Python still gets its coarser edge — the assertion that fails when the
+      // fallback is decided once for the whole declaration.
+      expect(byLang.get('python')).toBe('declaring-type');
+      g.destroy();
+    } finally {
+      fs.rmSync(mixed, { recursive: true, force: true });
+    }
+  }, 120000);
+
   it('produces nothing when a proto has no generated peers', async () => {
     const bare = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-proto-bare-'));
     try {

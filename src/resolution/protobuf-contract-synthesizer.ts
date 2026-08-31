@@ -201,80 +201,102 @@ export async function protobufContractEdges(
       }
     }
     if (peerNodes.length === 0) continue;
-    const byVariant = indexByVariant(peerNodes);
 
-    const lookup = (name: string, allowed: Set<Node['kind']>): Node[] => {
-      const found: Node[] = [];
-      for (const variant of nameVariants(name)) {
-        for (const candidate of byVariant.get(variant) ?? []) {
-          if (!allowed.has(candidate.kind)) continue;
-          if (candidate.language === 'proto') continue;
-          found.push(candidate);
-        }
-      }
-      return found;
-    };
+    // Indexed PER TARGET LANGUAGE, and matched per target language below.
+    // Whether a generator emits a symbol for each field is a fact about THAT
+    // generator — protobuf-elixir writes one per field, protoc's Python stubs
+    // write none — so the declaring-type fallback has to be decided for each
+    // language separately. Deciding it once for the whole declaration lets one
+    // language's member match suppress every other language's fallback, and
+    // those languages then contribute no edge at all: adding a language that
+    // resolves precisely silently deletes the coarser coverage of the ones
+    // that cannot.
+    const peersByLanguage = new Map<string, Node[]>();
+    for (const node of peerNodes) {
+      if (node.language === 'proto') continue;
+      let bucket = peersByLanguage.get(node.language);
+      if (!bucket) { bucket = []; peersByLanguage.set(node.language, bucket); }
+      bucket.push(node);
+    }
+    if (peersByLanguage.size === 0) continue;
+    const variantsByLanguage = new Map<string, Map<string, Node[]>>();
+    for (const [language, nodes] of peersByLanguage) {
+      variantsByLanguage.set(language, indexByVariant(nodes));
+    }
 
     for (const protoNode of protoNodes) {
       const isMember = protoNode.kind === 'field' || protoNode.kind === 'enum_member'
         || protoNode.kind === 'method';
       const bare = simpleName(protoNode.qualifiedName) || protoNode.name;
-
-      let matches = lookup(bare, isMember ? MEMBER_KINDS : TYPE_KINDS);
-      // How the match was made, so a consumer can tell an exact peer from the
-      // coarser fallback below.
-      let match: 'symbol' | 'declaring-type' = 'symbol';
-
-      // Fall back to the generated TYPE that declares this member.
-      //
-      // An rpc DOES find its generated method (every generator emits one), but
-      // a message FIELD generally does not: Go struct fields, Python class
-      // annotations and TypeScript interface members are all deliberately not
-      // extracted as their own nodes, to keep the graph from exploding on
-      // member-dense code. Without this fallback a field therefore has no edge
-      // at all — and "I am changing this field, what else moves" is exactly the
-      // question the contract is supposed to answer. Containment does not
-      // rescue it either: dependents are traversed along incoming edges, and
-      // `contains` points message → field, so a field's impact never climbs to
-      // its message. Linking it to the declaring type is coarser than a member
-      // edge but it is true — regenerating that type IS what the change
-      // requires — and it names the right files.
-      if (matches.length === 0 && isMember) {
-        const owner = declaringName(protoNode.qualifiedName);
-        if (owner) {
-          matches = lookup(owner, TYPE_KINDS);
-          match = 'declaring-type';
-        }
-      }
-      if (matches.length === 0) continue;
-
       const tag = tagOf(protoNode);
-      for (const target of matches) {
-        const key = `${protoNode.id}>${target.id}`;
-        if (seen.has(key) || edges.length >= FANOUT_CAP) continue;
-        seen.add(key);
-        // Direction: GENERATED → PROTO. Generated code is derived from the
-        // `.proto`, so it is the dependent, and that is the direction impact
-        // analysis traverses — "what else moves when I change this field"
-        // walks a symbol's INCOMING edges. Emitting it the other way round
-        // records the same relationship but leaves the question unanswered.
-        edges.push({
-          source: target.id,
-          target: protoNode.id,
-          kind: 'references',
-          line: target.startLine,
-          provenance: 'heuristic',
-          metadata: {
-            synthesizedBy: 'protobuf-contract',
-            // What was matched and how, so a wrong edge is diagnosable and the
-            // generated side is identifiable as generated.
-            protoName: protoNode.qualifiedName,
-            ...(tag !== undefined ? { tag } : {}),
-            generatedIn: target.language,
-            match,
-            registeredAt: `${target.filePath}:${target.startLine}`,
-          },
-        });
+
+      for (const byVariant of variantsByLanguage.values()) {
+        const lookup = (name: string, allowed: Set<Node['kind']>): Node[] => {
+          const found: Node[] = [];
+          for (const variant of nameVariants(name)) {
+            for (const candidate of byVariant.get(variant) ?? []) {
+              if (allowed.has(candidate.kind)) found.push(candidate);
+            }
+          }
+          return found;
+        };
+
+        let matches = lookup(bare, isMember ? MEMBER_KINDS : TYPE_KINDS);
+        // How the match was made, so a consumer can tell an exact peer from the
+        // coarser fallback below.
+        let match: 'symbol' | 'declaring-type' = 'symbol';
+
+        // Fall back to the generated TYPE that declares this member.
+        //
+        // An rpc DOES find its generated method (every generator emits one),
+        // and so does a field in a language whose generator declares one. But
+        // several do not: Go struct fields, Python class annotations and
+        // TypeScript interface members are all deliberately not extracted as
+        // their own nodes, to keep the graph from exploding on member-dense
+        // code. Without this fallback a field has no edge at all in those
+        // languages — and "I am changing this field, what else moves" is
+        // exactly the question the contract is supposed to answer. Containment
+        // does not rescue it either: dependents are traversed along incoming
+        // edges, and `contains` points message → field, so a field's impact
+        // never climbs to its message. Linking it to the declaring type is
+        // coarser than a member edge but it is true — regenerating that type
+        // IS what the change requires — and it names the right files.
+        if (matches.length === 0 && isMember) {
+          const owner = declaringName(protoNode.qualifiedName);
+          if (owner) {
+            matches = lookup(owner, TYPE_KINDS);
+            match = 'declaring-type';
+          }
+        }
+        if (matches.length === 0) continue;
+
+        for (const target of matches) {
+          const key = `${protoNode.id}>${target.id}`;
+          if (seen.has(key) || edges.length >= FANOUT_CAP) continue;
+          seen.add(key);
+          // Direction: GENERATED → PROTO. Generated code is derived from the
+          // `.proto`, so it is the dependent, and that is the direction impact
+          // analysis traverses — "what else moves when I change this field"
+          // walks a symbol's INCOMING edges. Emitting it the other way round
+          // records the same relationship but leaves the question unanswered.
+          edges.push({
+            source: target.id,
+            target: protoNode.id,
+            kind: 'references',
+            line: target.startLine,
+            provenance: 'heuristic',
+            metadata: {
+              synthesizedBy: 'protobuf-contract',
+              // What was matched and how, so a wrong edge is diagnosable and
+              // the generated side is identifiable as generated.
+              protoName: protoNode.qualifiedName,
+              ...(tag !== undefined ? { tag } : {}),
+              generatedIn: target.language,
+              match,
+              registeredAt: `${target.filePath}:${target.startLine}`,
+            },
+          });
+        }
       }
     }
   }
