@@ -11326,6 +11326,136 @@ end
       graph.destroy();
     });
   });
+
+  describe('Generated protobuf modules', () => {
+    // A protobuf generator writes a module's shape as bare macro calls in the
+    // module body, with no block around them. Ecto's `schema do … end` gives
+    // its fields a block to be found in; these have nothing but the `use`
+    // marker at the top of the module, so without reading it the generated
+    // declarations are invisible AND every one of them resolves as a call to
+    // whatever function the repo happens to have named `field`.
+    const MESSAGE = `defmodule Acme.V1.Run do
+  @moduledoc false
+
+  use Protobuf, full_name: "acme.v1.Run", protoc_gen_elixir_version: "0.17.0", syntax: :proto3
+
+  oneof :kind, 0
+
+  field :id, 1, type: :string
+  field :observed_at, 3, type: Google.Protobuf.Timestamp, json_name: "observedAt"
+end
+`;
+
+    it('extracts a generated message’s fields, with their wire tags', () => {
+      const result = extractFromSource('lib/acme_proto/acme/v1/run.pb.ex', MESSAGE);
+      const fields = result.nodes.filter((n) => n.kind === 'field');
+      expect(fields.map((f) => f.name).sort()).toEqual(['id', 'kind', 'observed_at']);
+
+      // The tag is the field's identity on the wire — renaming a field at the
+      // same tag is harmless, changing its type is a silent break — so it is
+      // recorded as a marker, matching how the `.proto` side records it.
+      expect(fields.find((f) => f.name === 'observed_at')?.decorators).toContain('tag=3');
+      expect(fields.find((f) => f.name === 'id')?.decorators).toContain('tag=1');
+      // A `oneof`'s second argument is a group index, not a tag.
+      expect(fields.find((f) => f.name === 'kind')?.decorators ?? []).not.toContain('tag=0');
+    });
+
+    it('does not mint call refs for the generator’s own macros', () => {
+      // The defect this guards: `field`/`oneof` resolving by name, so a
+      // project that defines its own `field/2` collects every generated field
+      // in the repo as a caller of it.
+      const result = extractFromSource('lib/acme_proto/acme/v1/run.pb.ex', MESSAGE);
+      const called = refNames(result, 'calls');
+      expect(called).not.toContain('field');
+      expect(called).not.toContain('oneof');
+    });
+
+    it('extracts a generated enum’s values as enum members, not fields', () => {
+      const code = `defmodule Acme.V1.Status do
+  @moduledoc false
+
+  use Protobuf, enum: true, full_name: "acme.v1.Status", syntax: :proto3
+
+  field :STATUS_UNSPECIFIED, 0
+  field :STATUS_QUEUED, 1
+end
+`;
+      const result = extractFromSource('lib/acme_proto/acme/v1/status.pb.ex', code);
+      const members = result.nodes.filter((n) => n.kind === 'enum_member');
+      expect(members.map((m) => m.name)).toEqual(['STATUS_UNSPECIFIED', 'STATUS_QUEUED']);
+      expect(members[1]?.decorators).toContain('number=1');
+      expect(result.nodes.filter((n) => n.kind === 'field')).toHaveLength(0);
+    });
+
+    it('extracts a generated service’s rpcs and links their message types', () => {
+      const code = `defmodule Acme.V1.RunService.Service do
+  @moduledoc false
+
+  use GRPC.Service, name: "acme.v1.RunService", protoc_gen_elixir_version: "0.17.0"
+
+  rpc :GetRun, Acme.V1.GetRunRequest, Acme.V1.GetRunResponse
+  rpc :StreamRuns, Acme.V1.StreamRunsRequest, stream(Acme.V1.Run)
+end
+`;
+      const result = extractFromSource('lib/acme_proto/acme/v1/run.pb.ex', code);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      expect(methods.map((m) => m.name)).toEqual(['GetRun', 'StreamRuns']);
+
+      // The rpc line is the only place the service-to-message binding is
+      // written, including through a `stream(...)` wrapper.
+      const referenced = refNames(result, 'references');
+      expect(referenced).toEqual(expect.arrayContaining([
+        'Acme.V1.GetRunRequest', 'Acme.V1.GetRunResponse',
+        'Acme.V1.StreamRunsRequest', 'Acme.V1.Run',
+      ]));
+      expect(refNames(result, 'calls')).not.toContain('rpc');
+    });
+
+    it('leaves an ordinary module’s field/rpc calls alone', () => {
+      // The `use` marker is what makes the macros declarations. Without it
+      // these are function calls, and turning them into declarations would
+      // invent members on any module that happens to call `field/2`.
+      const code = `defmodule Acme.Report do
+  def build(row) do
+    field(row, :name)
+    rpc(:fetch)
+  end
+end
+`;
+      const result = extractFromSource('lib/acme/report.ex', code);
+      expect(result.nodes.filter((n) => n.kind === 'field')).toHaveLength(0);
+      expect(result.nodes.filter((n) => n.kind === 'method')).toHaveLength(0);
+      expect(refNames(result, 'calls')).toEqual(expect.arrayContaining(['field', 'rpc']));
+    });
+
+    it('keeps each generated module’s members under that module', () => {
+      // Generators put every message from one `.proto` in ONE file, so the
+      // marker has to stop applying at the end of the module that carried it.
+      const code = `defmodule Acme.V1.Status do
+  use Protobuf, enum: true, syntax: :proto3
+
+  field :STATUS_QUEUED, 1
+end
+
+defmodule Acme.V1.Run do
+  use Protobuf, syntax: :proto3
+
+  field :id, 1, type: :string
+end
+
+defmodule Acme.V1.Helper do
+  def field(a, b), do: {a, b}
+end
+`;
+      const result = extractFromSource('lib/acme_proto/acme/v1/run.pb.ex', code);
+      const byName = (n: string) => result.nodes.find((x) => x.name === n);
+      expect(byName('STATUS_QUEUED')?.qualifiedName).toBe('Acme.V1.Status::STATUS_QUEUED');
+      expect(byName('id')?.qualifiedName).toBe('Acme.V1.Run::id');
+      // The third module never said `use Protobuf`, so its `field` is a
+      // function definition and stays one.
+      expect(byName('field')?.kind).toBe('function');
+    });
+  });
 });
 
 describe('Terraform Extraction', () => {

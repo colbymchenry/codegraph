@@ -119,6 +119,15 @@ const SCHEMA_ASSOCS = new Set([
   'belongs_to', 'has_many', 'has_one', 'many_to_many', 'embeds_one', 'embeds_many',
 ]);
 
+/**
+ * What `use Protobuf` / `use GRPC.Service` says the generated module is. The
+ * three shapes take different macros and mint different kinds of member.
+ */
+type GeneratedProtoShape = 'message' | 'enum' | 'service';
+
+/** The macros a protobuf-generated module body is made of. */
+const GENERATED_PROTO_MACROS = new Set(['field', 'oneof', 'rpc']);
+
 function collapseWs(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
 }
@@ -191,6 +200,16 @@ let moduleStack: string[] = [];
 let routeScopes: { path: string; alias: string }[] = [];
 
 /**
+ * Modules whose body was written by a protobuf generator, by full module name,
+ * and which shape the generator gave them. `use Protobuf` / `use GRPC.Service`
+ * is the ONLY thing marking the macro calls that follow as declarations rather
+ * than function calls, so it has to be remembered for the rest of the module.
+ * Keyed by name rather than stacked because a module name is unique per file
+ * and the marker always precedes the macros it governs.
+ */
+let generatedProtoModules = new Map<string, GeneratedProtoShape>();
+
+/**
  * Clause-merge state. Elixir spells multi-clause functions as repeated `def`s
  * of the same name and arity (`def handle_call({:get, k}, _from, s)` ×N — the
  * whole GenServer idiom), so without merging, a 6-clause handler indexes as 6
@@ -220,6 +239,7 @@ function resetFileState(filePath: string, force = false): void {
   aliasMap = new Map();
   moduleStack = [];
   routeScopes = [];
+  generatedProtoModules = new Map();
   lastDefFile = '';
   lastDefModule = '';
   lastDefName = '';
@@ -707,11 +727,111 @@ function handleSchema(node: SyntaxNode, ctx: ExtractorContext): boolean {
   return true;
 }
 
+/**
+ * Whether a `use` names a protobuf generator's runtime, and which shape it
+ * gives the module: `use Protobuf` (a message), `use Protobuf, enum: true` (an
+ * enum), `use GRPC.Service` (a service). protoc-gen-elixir emits exactly one
+ * of these at the top of every module it writes, and nothing else in the
+ * generated body identifies it — so this marker is what the field/rpc macros
+ * below are recognised by.
+ */
+function generatedProtoShape(args: SyntaxNode, ctx: ExtractorContext): GeneratedProtoShape | null {
+  const first = args.namedChild(0);
+  if (first?.type !== 'alias') return null;
+  const used = getNodeText(first, ctx.source).trim();
+  if (used === 'GRPC.Service' || used.endsWith('.GRPC.Service')) return 'service';
+  if (used !== 'Protobuf' && !used.endsWith('.Protobuf')) return null;
+
+  for (const arg of args.namedChildren) {
+    if (arg.type !== 'keywords') continue;
+    for (const pair of arg.namedChildren) {
+      const key = getChildByField(pair, 'key');
+      const value = getChildByField(pair, 'value');
+      if (key && keywordName(key, ctx.source) === 'enum'
+          && value && getNodeText(value, ctx.source).trim() === 'true') {
+        return 'enum';
+      }
+    }
+  }
+  return 'message';
+}
+
+/**
+ * A protobuf generator writes a module's shape as bare macro calls in the
+ * module BODY — `field :observed_at, 3, type: :string`, `oneof :kind, 0`,
+ * `rpc :GetRun, Req, Resp` — with no enclosing block. Ecto's `schema do … end`
+ * gives its fields a block to be recognised by; these have none, so without
+ * this they fall through to ordinary call handling and do two kinds of damage
+ * at once. The declarations go missing, which is what leaves a generated
+ * message with zero members and forces anything matching against it to settle
+ * for the enclosing module. And the calls are then resolved by name: a project
+ * that happens to define its own `field/2` collects every generated field in
+ * the repo as a caller (observed on a real codebase: ~1,000 edges landing on
+ * one unrelated private helper, making it the third most-called symbol there).
+ *
+ * Gated on the `use` marker, so a hand-written `field(x)` call in an ordinary
+ * module still resolves as the call it is.
+ */
+function handleGeneratedProtoMacro(
+  node: SyntaxNode,
+  macro: string,
+  shape: GeneratedProtoShape,
+  ctx: ExtractorContext
+): boolean {
+  // A service takes `rpc` and nothing else; a message/enum takes the rest.
+  if ((macro === 'rpc') !== (shape === 'service')) return false;
+  const args = argsOf(node);
+  const nameArg = args ? args.namedChild(0) : null;
+  if (!args || nameArg?.type !== 'atom') return false;
+
+  const name = atomName(nameArg, ctx.source);
+  const signature = collapseWs(getNodeText(node, ctx.source)).slice(0, 200);
+
+  if (macro === 'rpc') {
+    const method = ctx.createNode('method', name, node, { signature, isExported: true });
+    // The request and response messages are a real dependency of the service,
+    // and this line is the only place the binding is written.
+    const from = method?.id ?? scopeHead(ctx);
+    if (from) {
+      for (let i = 1; i < args.namedChildCount; i++) {
+        const arg = args.namedChild(i)!;
+        // `stream(Acme.V1.Run)` wraps the message in a call of its own.
+        const alias = arg.type === 'alias' ? arg : namedChildOfType(argsOf(arg) ?? arg, 'alias');
+        if (alias) addRef(ctx, from, expandAlias(getNodeText(alias, ctx.source)), 'references', alias);
+      }
+    }
+    return true;
+  }
+
+  // The number in second position is the field's identity on the wire (or the
+  // enum value), recorded as a marker the way the `.proto` side records it so
+  // a "same number, changed type" check can read it without re-parsing. A
+  // `oneof`'s second argument is a group index, not a tag, so it carries none.
+  const numArg = args.namedChild(1);
+  const number = macro !== 'oneof' && numArg?.type === 'integer'
+    ? getNodeText(numArg, ctx.source).trim()
+    : null;
+  const isEnumValue = shape === 'enum' && macro === 'field';
+  ctx.createNode(isEnumValue ? 'enum_member' : 'field', name, node, {
+    signature,
+    isExported: true,
+    ...(number !== null
+      ? { decorators: [isEnumValue ? `number=${number}` : `tag=${number}`] }
+      : {}),
+  });
+  return true;
+}
+
 /** `alias` / `import` / `require` / `use` — module dependencies. */
 function handleDirective(node: SyntaxNode, directive: string, ctx: ExtractorContext): boolean {
   const args = argsOf(node);
   if (!args) return true;
   const parentId = scopeHead(ctx);
+  if (directive === 'use') {
+    const shape = generatedProtoShape(args, ctx);
+    const mod = currentModule();
+    if (shape && mod) generatedProtoModules.set(mod, shape);
+  }
   const first = args.namedChild(0);
   if (!first) return true;
 
@@ -1086,6 +1206,14 @@ export const elixirExtractor: LanguageExtractor = {
     }
     // `defoverridable [foo: 1]` / `quote`d fragments name no new symbol.
     if (form === 'defoverridable') return true;
+
+    // A generated protobuf module's members. Checked before ordinary call
+    // handling and only inside a module the `use` marker claimed, so an
+    // unrelated `field(…)` call elsewhere is untouched.
+    if (GENERATED_PROTO_MACROS.has(form)) {
+      const shape = generatedProtoModules.get(currentModule());
+      if (shape && handleGeneratedProtoMacro(node, form, shape, ctx)) return true;
+    }
 
     // Macro-driven dispatch (Phoenix router, Plug pipelines). Each handler
     // returns false when the call doesn't actually match the framework shape,
