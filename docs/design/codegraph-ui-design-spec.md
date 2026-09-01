@@ -568,9 +568,16 @@ lead nowhere still share one line (a screen's handlers are siblings, not a hiera
 a flat region into a column). Rows-then-wrap was the alternative and it failed for a measurable reason: it put every
 step of one distance on the same rows and wrapped them at a fixed 720px, so a box and the thing it fires ended up
 seven lines apart — 70 of 113 lines on `/capture` joined boxes ONE step apart and rendered seven lines apart, which is
-what the 652 crossings were made of. A region's line width is now earned rather than fixed (`regionLineMax` =
-`sqrt(total * pitch)`, clamped to 720..2600), so a region comes out about as wide as it is tall: `/capture` went from
-a 1,227x5,588 ribbon to 2,279x4,356.
+what the 652 crossings were made of. The width a picture's lines run to is **tried, not estimated** (`REGION_WIDTHS`,
+scored by `canvasCost` against `CANVAS_ASPECT` 1.4): a cluster spends lines on its own structure, so `total / width`
+undercounts a region's lines badly and a formula tuned on that estimate wrapped 98 boxes into a 4,356px column. Laying
+a region out is cheap (~2ms for the whole model, eight widths included) and exact, so `layoutAt` runs the whole pack at
+each width and the best finished CANVAS wins. It has to be the canvas, not each region: squaring each region off
+individually leaves fewer of them side by side, so `/home` went 3,584px -> 5,624px while every region looked better.
+Within a region the clusters STACK — dropping them side by side as the regions drop onto the canvas was measured
+(total height 42,084 -> 39,756px, -6%) and rejected, because two clusters side by side run each other's lines through
+the other: lines-over-boxes 120 -> 134, crossings 5 -> 8. Regions differ, being far enough apart that few lines run
+between them. `/capture` went from a 1,227x5,588 ribbon to 3,417x3,348.
 Each region wears a caption (`RegionCaption.svelte` — its component's name over a hairline spanning its width)
 and the key explains it. **At rest the picture hides exactly two things** (`stepEdgeVisible`): the anchor's own fan —
 the anchor leads to everything *by definition*, `/home`'s 104 ways of saying so were the moiré, so one line into each

@@ -624,19 +624,22 @@ const REGION_GAP_Y = 72;
 const REGION_PITCH = NODE_HEIGHT + REGION_GAP_Y;
 /** The least width a region's line of boxes runs to before it wraps. */
 const REGION_LINE_MIN = 720;
-/** …and the most, so a wide screen still reads as a column of lines. */
-const REGION_LINE_MAX = 2600;
 /**
- * How wide a region lets its lines run before wrapping — enough that the
- * region comes out about as wide as it is tall.
- *
- * Solving `lineMax = (total / lineMax) * pitch` for a square region gives
- * `sqrt(total * pitch)`. A fixed 720 was the whole reason a big screen became
- * a 6,500px ribbon: ninety-eight boxes of about 300px wrap into forty-one
- * lines at 720, and into sixteen at the width they actually deserve.
+ * The widths a region's lines are tried at, narrowest first — a tie keeps the
+ * narrowest, so a small region never sprawls. A fixed 720 was the whole reason
+ * a big screen came out a 6,500px ribbon.
  */
-function regionLineMax(totalWidth: number): number {
-  return Math.max(REGION_LINE_MIN, Math.min(REGION_LINE_MAX, Math.ceil(Math.sqrt(totalWidth * REGION_PITCH))));
+const REGION_WIDTHS = [REGION_LINE_MIN, 1000, 1300, 1600, 1900, 2200, 2600, 3000];
+/**
+ * The shape the whole picture is aimed at: a little wider than tall. Boxes are
+ * wide and short, and so is the window a reader has, so a landscape picture
+ * wastes less of both than a square one — and a reader scrolls a tall picture
+ * far more than they pan a wide one.
+ */
+const CANVAS_ASPECT = 1.4;
+/** How far a finished canvas is from {@link CANVAS_ASPECT}, in log space so wide and tall cost alike. */
+function canvasCost(laid: { width: number; height: number }): number {
+  return Math.abs(Math.log(Math.max(1, laid.width) / Math.max(1, laid.height) / CANVAS_ASPECT));
 }
 /** How far a cluster's boxes sit in from the step that fires them. */
 const CLUSTER_INDENT = 26;
@@ -699,7 +702,7 @@ function forwardLinks(links: readonly WireMapLink[]): WireMapLink[] {
 /**
  * The layout of a screen's picture: each region a small column of lines —
  * a box above what it sets in motion, a line wrapping when it grows past the
- * width its size earns ({@link regionLineMax}) — and the regions tiled left to right, wrapping
+ * width its shape earns ({@link REGION_WIDTHS}) — and the regions tiled left to right, wrapping
  * into bands, in the order the walk met them: the screen's own source order.
  * The anchor sits alone on top. Everything downstream — the tracked curves,
  * the pills, the pointer — is the same machinery over the same shapes.
@@ -805,133 +808,217 @@ function packRegions(
     width: number;
     entry: string;
   }
-  const packed = new Map<string, Packed>();
-  for (const region of regions.values()) {
-    // A region is drawn as CLUSTERS, not as rows: a step, then the steps it
-    // sets in motion on the line under it, indented. Rows-then-wrap put every
-    // step of one distance on the same rows and wrapped them at a fixed width,
-    // so a box and the thing it fires ended up seven
-    // lines apart and their line crossed everything between — 70 of 113 lines
-    // on one real screen joined boxes ONE step apart and rendered seven lines
-    // apart. Under a cluster the same line is one line long.
-    const ids = new Set(region.members.map((m) => m.id));
-    const kidsOf = (id: string): string[] => (childrenOf.get(id) ?? []).filter((k) => ids.has(k));
-    const pos = new Map<string, { x: number; line: number }>();
-    let line = 0;
-    let width = 0;
-    const lineMax = regionLineMax(region.members.reduce((a, m) => a + widthOf(m.id) + NODE_GAP, 0));
-    /** Steps that fire nothing of their own, side by side, wrapping past {@link regionLineMax}. */
-    const spread = (list: string[], left: number): void => {
-      if (list.length === 0) return;
-      let lx = left;
-      for (const id of list) {
-        const bw = widthOf(id);
-        if (lx > left && lx + bw - left > lineMax) {
-          line += 1;
-          lx = left;
-        }
-        pos.set(id, { x: lx, line });
-        width = Math.max(width, lx + bw);
-        lx += bw + NODE_GAP;
-      }
-      line += 1;
-    };
-    const place = (id: string, depth: number): void => {
-      const x = Math.min(depth, CLUSTER_DEPTH_MAX) * CLUSTER_INDENT;
-      pos.set(id, { x, line });
-      width = Math.max(width, x + widthOf(id));
-      line += 1;
-      const kids = kidsOf(id);
-      // What this step fires and that fires nothing of its own shares the line
-      // under it; anything that leads on gets a cluster of its own beneath.
-      spread(kids.filter((k) => kidsOf(k).length === 0), x + CLUSTER_INDENT);
-      for (const hub of kids.filter((k) => kidsOf(k).length > 0)) place(hub, depth + 1);
-    };
-    // The region's own starting points: the ones that fire nothing share a
-    // line as they always did — a screen's handlers are siblings, not a
-    // hierarchy, and giving each its own line made a flat region a column.
-    // Only a step that sets something in motion earns a cluster of its own.
-    const starts = region.members.filter((m) => (parentsOf.get(m.id) ?? []).length === 0).map((m) => m.id);
-    spread(starts.filter((id) => kidsOf(id).length === 0), 0);
-    for (const id of starts) if (!pos.has(id)) place(id, 0);
-    // A cycle can leave a member with no reachable start; it stands on its own.
-    for (const m of region.members) if (!pos.has(m.id)) place(m.id, 0);
-    // Where the screen's own line into this region lands: the box nearest the
-    // region's top-left that the screen actually leads to. The walk's first
-    // member used to stand for the region, but clustering moves a step that
-    // fires something below the ones that fire nothing, so that box could sit
-    // lines down inside the region and the line from the start had to reach
-    // past everything above it to get there.
-    const topmost = (ids: string[]): string | null =>
-      ids
-        .filter((id) => pos.has(id))
-        .sort((a, b) => pos.get(a)!.line - pos.get(b)!.line || pos.get(a)!.x - pos.get(b)!.x)[0] ?? null;
-    const entry =
-      topmost(region.members.filter((m) => fromAnchor.has(m.id)).map((m) => m.id)) ??
-      topmost(region.members.map((m) => m.id)) ??
-      region.members[0]!.id;
-    packed.set(region.id, { pos, lines: line, width, entry });
-  }
-
-  // How wide the picture may run before a region has to go underneath.
-  let area = 0;
-  let widest = 0;
-  for (const region of regions.values()) {
-    const p = packed.get(region.id)!;
-    area += p.width * p.lines * REGION_PITCH;
-    widest = Math.max(widest, p.width);
-  }
-  const budget = bandBudget(area, widest);
-
-  // Place everything. The anchor is alone on top; each region, in the order
-  // the walk met them, goes as high as it can and then as far left as it can.
-  //
-  // Squaring the regions off into bands — a row at a time, the row as tall as
-  // its tallest member — left a screen's canvas 55% region and 45% nothing
-  // (`/home` 44%: 4,860px tall to hold 2,160px of picture), and that emptiness
-  // is what a reader scrolls through. Going highest-then-leftmost keeps the
-  // reading order (an earlier region is placed first, so it is never pushed
-  // below a later one) while a short region tucks under another short one
-  // instead of waiting for the tall one beside it.
-  const at = new Map<string, { x: number; y: number; line: number }>();
-  const zones: StepRegionZone[] = [];
   const anchorY = PADDING;
-  const topY = anchorY + NODE_HEIGHT + SCREEN_LAYER_GAP + BAND_GAP;
-  /** What each stretch of the canvas is filled to, so far. */
-  const sky: { x0: number; x1: number; y: number }[] = [];
-  const floorAt = (x0: number, x1: number): number => {
-    let f = topY;
-    for (const s of sky) if (s.x1 > x0 + 1 && s.x0 < x1 - 1) f = Math.max(f, s.y);
-    return f;
+  /**
+   * The whole picture at one line width: every region packed with its lines
+   * allowed to run that wide, then the regions dropped onto the canvas.
+   *
+   * The width cannot be estimated from the boxes alone — a cluster spends
+   * lines on its own structure, so `total / width` badly under-counts what a
+   * region takes — and it cannot be chosen per region either: widening one
+   * region to square it off leaves fewer of them side by side, so the CANVAS
+   * gets taller even as each region looks better (`/home` went 3,584px to
+   * 5,624px that way). One width, scored on the finished canvas.
+   */
+  const layoutAt = (lineMax: number) => {
+    const packed = new Map<string, Packed>();
+    for (const region of regions.values()) {
+      // A region is drawn as CLUSTERS, not as rows: a step, then the steps it
+      // sets in motion on the line under it, indented. Rows-then-wrap put every
+      // step of one distance on the same rows and wrapped them at a fixed width,
+      // so a box and the thing it fires ended up seven
+      // lines apart and their line crossed everything between — 70 of 113 lines
+      // on one real screen joined boxes ONE step apart and rendered seven lines
+      // apart. Under a cluster the same line is one line long.
+      const ids = new Set(region.members.map((m) => m.id));
+      const kidsOf = (id: string): string[] => (childrenOf.get(id) ?? []).filter((k) => ids.has(k));
+      const starts = region.members.filter((m) => (parentsOf.get(m.id) ?? []).length === 0).map((m) => m.id);
+
+      /** Lay the region out with its lines allowed to run this wide. */
+      const layAt = (lineMax: number): { pos: Map<string, { x: number; line: number }>; lines: number; width: number } => {
+        /**
+         * One cluster, in its own coordinates: a step, then the steps it sets
+         * in motion on the line under it, stepped in, and a cluster of its own
+         * for anything that leads on further.
+         */
+        const cluster = (root: string): { pos: Map<string, { x: number; line: number }>; lines: number; width: number } => {
+          const pos = new Map<string, { x: number; line: number }>();
+          let line = 0;
+          let width = 0;
+          const spread = (list: string[], left: number): void => {
+            if (list.length === 0) return;
+            let lx = left;
+            for (const id of list) {
+              const bw = widthOf(id);
+              if (lx > left && lx + bw - left > lineMax) {
+                line += 1;
+                lx = left;
+              }
+              pos.set(id, { x: lx, line });
+              width = Math.max(width, lx + bw);
+              lx += bw + NODE_GAP;
+            }
+            line += 1;
+          };
+          const place = (id: string, depth: number): void => {
+            const x = Math.min(depth, CLUSTER_DEPTH_MAX) * CLUSTER_INDENT;
+            pos.set(id, { x, line });
+            width = Math.max(width, x + widthOf(id));
+            line += 1;
+            const kids = kidsOf(id);
+            spread(kids.filter((k) => kidsOf(k).length === 0), x + CLUSTER_INDENT);
+            for (const hub of kids.filter((k) => kidsOf(k).length > 0)) place(hub, depth + 1);
+          };
+          place(root, 0);
+          return { pos, lines: line, width };
+        };
+
+        /** The steps that fire nothing, side by side — a screen's handlers are siblings, not a hierarchy. */
+        const flat = (list: string[]): { pos: Map<string, { x: number; line: number }>; lines: number; width: number } => {
+          const pos = new Map<string, { x: number; line: number }>();
+          let line = 0;
+          let width = 0;
+          let lx = 0;
+          for (const id of list) {
+            const bw = widthOf(id);
+            if (lx > 0 && lx + bw > lineMax) {
+              line += 1;
+              lx = 0;
+            }
+            pos.set(id, { x: lx, line });
+            width = Math.max(width, lx + bw);
+            lx += bw + NODE_GAP;
+          }
+          return { pos, lines: list.length === 0 ? 0 : line + 1, width };
+        };
+
+        // The region's blocks, in the walk's order: everything that fires
+        // nothing first, as one spread, then a cluster per step that does.
+        const blocks: { pos: Map<string, { x: number; line: number }>; lines: number; width: number }[] = [];
+        const bare = starts.filter((id) => kidsOf(id).length === 0);
+        if (bare.length > 0) blocks.push(flat(bare));
+        const placed = new Set(bare);
+        for (const id of starts) {
+          if (placed.has(id)) continue;
+          const b = cluster(id);
+          for (const k of b.pos.keys()) placed.add(k);
+          blocks.push(b);
+        }
+        // A cycle can leave a member with no reachable start; it stands alone.
+        for (const m of region.members) {
+          if (placed.has(m.id)) continue;
+          const b = cluster(m.id);
+          for (const k of b.pos.keys()) placed.add(k);
+          blocks.push(b);
+        }
+
+        // The blocks stack, one under the next, in the walk's order.
+        //
+        // Dropping them side by side the way the REGIONS drop onto the canvas
+        // was tried and measured across a real app's 51 screens, and it is a
+        // bad trade: total height 42,084px -> 39,756px (-6%), but lines running
+        // over other boxes 120 -> 134 and lines crossing each other 5 -> 8,
+        // because two clusters side by side put each one's lines through the
+        // other. Height is cheap to scroll; a crossed line is what made this
+        // picture unreadable in the first place. Regions differ — they are far
+        // enough apart that few lines run between them.
+        const pos = new Map<string, { x: number; line: number }>();
+        let width = 0;
+        let lines = 0;
+        for (const b of blocks) {
+          for (const [id, at2] of b.pos) pos.set(id, { x: at2.x, line: lines + at2.line });
+          width = Math.max(width, b.width);
+          lines += b.lines;
+        }
+        return { pos, lines, width };
+      };
+
+      const { pos, lines: line, width } = layAt(lineMax);
+      // Where the screen's own line into this region lands: the box nearest the
+      // region's top-left that the screen actually leads to. The walk's first
+      // member used to stand for the region, but clustering moves a step that
+      // fires something below the ones that fire nothing, so that box could sit
+      // lines down inside the region and the line from the start had to reach
+      // past everything above it to get there.
+      const topmost = (ids: string[]): string | null =>
+        ids
+          .filter((id) => pos.has(id))
+          .sort((a, b) => pos.get(a)!.line - pos.get(b)!.line || pos.get(a)!.x - pos.get(b)!.x)[0] ?? null;
+      const entry =
+        topmost(region.members.filter((m) => fromAnchor.has(m.id)).map((m) => m.id)) ??
+        topmost(region.members.map((m) => m.id)) ??
+        region.members[0]!.id;
+      packed.set(region.id, { pos, lines: line, width, entry });
+    }
+
+    // How wide the picture may run before a region has to go underneath.
+    let area = 0;
+    let widest = 0;
+    for (const region of regions.values()) {
+      const p = packed.get(region.id)!;
+      area += p.width * p.lines * REGION_PITCH;
+      widest = Math.max(widest, p.width);
+    }
+    const budget = bandBudget(area, widest);
+
+    // Place everything. The anchor is alone on top; each region, in the order
+    // the walk met them, goes as high as it can and then as far left as it can.
+    //
+    // Squaring the regions off into bands — a row at a time, the row as tall as
+    // its tallest member — left a screen's canvas 55% region and 45% nothing
+    // (`/home` 44%: 4,860px tall to hold 2,160px of picture), and that emptiness
+    // is what a reader scrolls through. Going highest-then-leftmost keeps the
+    // reading order (an earlier region is placed first, so it is never pushed
+    // below a later one) while a short region tucks under another short one
+    // instead of waiting for the tall one beside it.
+    const at = new Map<string, { x: number; y: number; line: number }>();
+    const zones: StepRegionZone[] = [];
+    const topY = anchorY + NODE_HEIGHT + SCREEN_LAYER_GAP + BAND_GAP;
+    /** What each stretch of the canvas is filled to, so far. */
+    const sky: { x0: number; x1: number; y: number }[] = [];
+    const floorAt = (x0: number, x1: number): number => {
+      let f = topY;
+      for (const s of sky) if (s.x1 > x0 + 1 && s.x0 < x1 - 1) f = Math.max(f, s.y);
+      return f;
+    };
+    for (const region of regions.values()) {
+      const p = packed.get(region.id)!;
+      const rh = Math.max(0, p.lines - 1) * REGION_PITCH + NODE_HEIGHT;
+      // Somewhere to start, plus the right-hand edge of everything already down.
+      const spots = [PADDING, ...sky.map((s) => s.x1 + REGION_GUTTER)]
+        .filter((x, i, all) => all.indexOf(x) === i && x + p.width <= PADDING + Math.max(budget, p.width))
+        .sort((m, n) => m - n);
+      let best = { x: PADDING, y: floorAt(PADDING, PADDING + p.width) };
+      for (const x of spots) {
+        const y = floorAt(x, x + p.width);
+        if (y < best.y - 1) best = { x, y };
+      }
+      const { x, y } = best;
+      // A cluster reads from its left edge, not from the region's centre: the
+      // indent is what says which step fired which.
+      for (const [id, at2] of p.pos) {
+        at.set(id, { x: x + at2.x, y: y + at2.line * REGION_PITCH, line: 0 });
+      }
+      zones.push({ id: region.id, label: region.label, x, y, width: p.width, height: rh, entry: p.entry });
+      // The gap under a region carries the next one's caption.
+      sky.push({ x0: x, x1: x + p.width, y: y + rh + BAND_GAP });
+    }
+    const contentWidth = Math.max(widthOf(anchor.id), ...zones.map((z) => z.x + z.width - PADDING));
+    // The layering comes from the finished geometry, not from a band counter:
+    // once regions drop independently, what a reader sees as one row IS one row.
+    for (const spot of at.values()) spot.line = Math.round((spot.y - topY) / REGION_PITCH);
+    const globalLine = Math.max(0, ...[...at.values()].map((v) => v.line)) + 1;
+    const height = Math.max(anchorY + NODE_HEIGHT, ...zones.map((z) => z.y + z.height)) + PADDING;
+    return { at, zones, contentWidth, globalLine, height, width: contentWidth + PADDING * 2 };
   };
-  for (const region of regions.values()) {
-    const p = packed.get(region.id)!;
-    const rh = Math.max(0, p.lines - 1) * REGION_PITCH + NODE_HEIGHT;
-    // Somewhere to start, plus the right-hand edge of everything already down.
-    const spots = [PADDING, ...sky.map((s) => s.x1 + REGION_GUTTER)]
-      .filter((x, i, all) => all.indexOf(x) === i && x + p.width <= PADDING + Math.max(budget, p.width))
-      .sort((m, n) => m - n);
-    let best = { x: PADDING, y: floorAt(PADDING, PADDING + p.width) };
-    for (const x of spots) {
-      const y = floorAt(x, x + p.width);
-      if (y < best.y - 1) best = { x, y };
-    }
-    const { x, y } = best;
-    // A cluster reads from its left edge, not from the region's centre: the
-    // indent is what says which step fired which.
-    for (const [id, at2] of p.pos) {
-      at.set(id, { x: x + at2.x, y: y + at2.line * REGION_PITCH, line: 0 });
-    }
-    zones.push({ id: region.id, label: region.label, x, y, width: p.width, height: rh, entry: p.entry });
-    // The gap under a region carries the next one's caption.
-    sky.push({ x0: x, x1: x + p.width, y: y + rh + BAND_GAP });
-  }
-  const contentWidth = Math.max(widthOf(anchor.id), ...zones.map((z) => z.x + z.width - PADDING));
-  // The layering comes from the finished geometry, not from a band counter:
-  // once regions drop independently, what a reader sees as one row IS one row.
-  for (const spot of at.values()) spot.line = Math.round((spot.y - topY) / REGION_PITCH);
-  const globalLine = Math.max(0, ...[...at.values()].map((v) => v.line)) + 1;
-  const height = Math.max(anchorY + NODE_HEIGHT, ...zones.map((z) => z.y + z.height)) + PADDING;
+
+  // Try the widths and keep the picture that comes out closest to the shape a
+  // window has. A tie keeps the narrowest, so a small picture never sprawls.
+  const tries = REGION_WIDTHS.map((w) => layoutAt(w));
+  const { at, zones, contentWidth, globalLine, height } = tries.reduce((a, b) =>
+    canvasCost(a) <= canvasCost(b) ? a : b
+  );
+
 
   // Layers count from the bottom, as the Map's do: the route of an edge and
   // which sides it uses fall out of the comparison alone.

@@ -490,3 +490,26 @@ describe('regions fill the canvas instead of squaring off into rows', () => {
     expect(H).toBeLessThan(tall.y + tall.height + 200);
   });
 });
+
+describe('the width a picture wraps at is tried, not estimated', () => {
+  it('lets a wide spread run wide instead of wrapping into a column', () => {
+    // A cluster spends lines on its own structure, so `total width / line
+    // width` badly under-counts the lines a region takes: a formula tuned on
+    // that estimate wrapped a 98-box region into a 4,356px column. The widths
+    // are cheap to try exactly, so they are tried.
+    const R = { id: 'component:Wide', label: 'Wide' };
+    const anchor = step('/', 'screen', 0, { anchor: true });
+    const hub = step('startEverything', 'trigger', 1, { order: 0, region: R, node: ref('startEverything', 'src/w.tsx') });
+    const leaves = Array.from({ length: 24 }, (_, i) =>
+      step(`writeSomeValue${i}`, 'store', 2, { order: i + 1, region: R, node: ref(`writeSomeValue${i}`, 'src/w.storage.ts') })
+    );
+    const m = buildStepsModel(
+      payload([anchor, hub, ...leaves], [link(anchor, hub), ...leaves.map((l) => link(hub, l, { kind: 'store' }))])
+    );
+    const W = Math.max(...m.layout.nodes.map((n) => n.x + n.width));
+    const H = Math.max(...m.layout.nodes.map((n) => n.y + n.height));
+    // At a fixed 720px these twenty-four boxes wrapped into eight lines and the
+    // picture came out taller than wide; it should now be at least as wide.
+    expect(W).toBeGreaterThan(H);
+  });
+});
