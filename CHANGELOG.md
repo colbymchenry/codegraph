@@ -814,6 +814,9 @@ Full details in the entries below.
 - `codegraph_explore` now spells out the dynamic-dispatch relationships of the symbols you ask about — e.g. "the closures registered here are run by `didCompleteTask`" — so the indirect hops you'd otherwise grep to reconstruct are listed alongside the call flow.
 - `codegraph_explore` answers multi-phase questions that span a large "god file" far more completely. For a flow like "build, send, and validate a request" — where one big file holds the build chain and the validate logic lives in others — it now keeps every method *on the flow path* in full, collapses the file's off-path methods to one-line signatures, and guarantees each phase's defining file is shown (instead of truncating at a fixed size and dropping whichever phase came last, which sent you to read it by hand). Incidental files that merely name-drop the flow are still trimmed, so the response stays focused on the code that answers the question.
 - CodeGraph is usable as an embedded library again: `require("@colbymchenry/codegraph")` and `import` now resolve the programmatic API — the `CodeGraph` class plus building blocks like `DatabaseConnection`, `QueryBuilder`, `initGrammars`, and `FileLock` — so you can drive the graph directly from your own app (for example an Electron process) instead of only through the CLI or MCP server. Embedding runs on your own runtime, so it needs Node 22.5+ for the built-in SQLite. (#354)
+- Symfony: compiled DI containers now have routes extracted from `$routes->add(...)` calls using tree-sitter AST — route paths, names, controller references, and HTTP methods captured from the compiled router cache.
+- Symfony: `methods:` on `#[Route]` now handles PHP constant references like `[Request::METHOD_GET]` (extracts `GET` from the constant name).
+- Symfony: `defaults:` and `requirements:` on `#[Route]` now handle PHP short array syntax (`['key' => 'val']`) alongside the existing `{key: val}` dict syntax.
 
 ### Fixes
 
