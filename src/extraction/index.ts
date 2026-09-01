@@ -227,6 +227,12 @@ const DEFAULT_IGNORE_PATTERNS: string[] = [
   'bazel-*/',        // Bazel output symlink trees
   // Android resource dirs at any depth, with their qualifier variants (#1047).
   ...ANDROID_RES_TYPES.map((t) => `**/res/${t}*/`),
+  // `build` is also a legal Java package segment. Keep it under conventional
+  // Java source roots while continuing to exclude module/build output (#1642).
+  '!**/src/main/java/**/build/',
+  '!**/src/main/java/**/build/**',
+  '!**/src/test/java/**/build/',
+  '!**/src/test/java/**/build/**',
 ];
 
 /** True if `buf` decodes as strict UTF-8 (no invalid byte sequences). */
