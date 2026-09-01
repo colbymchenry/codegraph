@@ -683,14 +683,15 @@ export class FileWatcher {
 
   /** Our own dirs are always ignored, regardless of .gitignore. */
   private isAlwaysIgnored(rel: string): boolean {
-    // First path segment. Ignore any CodeGraph data dir — the active one AND a
-    // sibling like `.codegraph-win` a second environment (Windows/WSL) created
-    // in the same tree, so neither side watches the other's index (#636).
-    const top = rel.split('/')[0] ?? rel;
-    return (
-      isCodeGraphDataDir(top) ||
-      rel === '.git' || rel.startsWith('.git/')
-    );
+    // Check EVERY path segment, not just the root one. A monorepo with git
+    // subtrees/submodules has nested `.git` directories; on Linux the
+    // per-directory walk would otherwise descend into each one and burn the
+    // inotify watch budget, and on macOS/Windows the recursive watcher would
+    // stream their churn through handleChange (#517). isCodeGraphDataDir is
+    // applied per-segment so a sibling data dir like `.codegraph-win` a second
+    // environment (Windows/WSL) created is still matched at depth (#636).
+    const parts = rel.split('/');
+    return parts.some(isCodeGraphDataDir) || parts.includes('.git');
   }
 
   /**
