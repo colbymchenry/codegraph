@@ -45,7 +45,7 @@ leaves behind, and asserts the seam: nothing outside `lib/adapter.js` may reach 
 package is **prepared, not published** — `ui/package.json` carries `"private": true` deliberately,
 and `scripts/pack-npm.sh` only packs a tarball when `CODEGRAPH_PACK_UI=1`.
 
-Tests run as **two vitest projects** (`vitest.workspace.mts`): `engine` (node) and `ui` (jsdom, the
+Tests run as **two Vitest projects** (`test.projects` in `vitest.config.mts`): `engine` (node) and `ui` (jsdom, the
 Svelte plugin, `resolve.conditions: ['browser']`) for the single `__tests__/ui-package.test.ts`.
 `npm test` still runs both. The split is not cosmetic — `browser` is a package-resolution
 condition, and applied globally it hands the engine's suites the browser builds of
