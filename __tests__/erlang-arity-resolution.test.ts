@@ -120,6 +120,39 @@ go(Args) ->
     expect(edges.some((e) => e.sq === 'spawner::go/1' && e.tq.startsWith('multi::job'))).toBe(false);
   });
 
+  it('counts arity past comments written inside a parameter or argument list', async () => {
+    fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'src', 'noted.erl'),
+      `-module(noted).
+-export([run/0, plain/2, spaced/2]).
+
+plain(X, Y) -> X + Y.
+
+spaced(X, % why this one is special
+       Y) ->
+    X * Y.
+
+run() ->
+    A = plain( % leading note
+        1, 2),
+    B = plain(1, % separating note
+              2),
+    C = spaced(1, 2),
+    D = erlang:spawn(noted, plain, [1, % note inside the MFA list
+                                    2]),
+    {A, B, C, D}.
+`
+    );
+    const edges = await callEdges(dir);
+    // A comment is a NAMED child, but it is not an argument: every call below
+    // is arity 2, and `spaced` is defined with arity 2.
+    expect(edges).toContainEqual({ sq: 'noted::run/0', tq: 'noted::plain/2' });
+    expect(edges).toContainEqual({ sq: 'noted::run/0', tq: 'noted::spaced/2' });
+    // Nothing resolved to a phantom arity the comments would have produced.
+    expect(edges.some((e) => /::(plain|spaced)\/[^2]$/.test(e.tq))).toBe(false);
+  });
+
   it('lands `fun mod:f/1` references on the written arity', async () => {
     fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
     fs.writeFileSync(

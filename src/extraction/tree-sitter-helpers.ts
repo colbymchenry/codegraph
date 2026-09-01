@@ -90,6 +90,19 @@ function cleanCommentMarkers(comment: string): string {
 }
 
 /**
+ * Number of ARGUMENTS in an `args` node — its named children minus comments.
+ *
+ * tree-sitter reports `comment` as a NAMED child, so a comment written at the
+ * top level of a parameter or argument list (`f(A, % why\n B)`) inflates a
+ * plain `namedChildCount`. Anywhere that count is an arity — and arity is part
+ * of an Erlang function's identity (#1610) — the comment must not be counted.
+ */
+export function namedArgCount(argsNode: SyntaxNode | null | undefined): number {
+  if (!argsNode) return 0;
+  return argsNode.namedChildren.filter((c) => c.type !== 'comment').length;
+}
+
+/**
  * Get the docstring/comment preceding a node
  */
 export function getPrecedingDocstring(node: SyntaxNode, source: string): string | undefined {

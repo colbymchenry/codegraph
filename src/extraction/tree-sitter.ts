@@ -16,7 +16,13 @@ import {
   UnresolvedReference,
 } from '../types';
 import { getParser, detectLanguage, isLanguageSupported, isFileLevelOnlyLanguage } from './grammars';
-import { generateNodeId, getNodeText, getChildByField, getPrecedingDocstring } from './tree-sitter-helpers';
+import {
+  generateNodeId,
+  getNodeText,
+  getChildByField,
+  getPrecedingDocstring,
+  namedArgCount,
+} from './tree-sitter-helpers';
 import { FN_REF_SPECS, captureFnRefCandidates, type FnRefSpec, type FnRefCandidate } from './function-ref';
 import { isGeneratedFile } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
@@ -3834,8 +3840,7 @@ export class TreeSitterExtractor {
           }
           // Arity from the call site's own argument list — part of the callee's
           // identity, and what disambiguates `f/1` from `f/2` (#1610).
-          const callArgsNode = getChildByField(node, 'args');
-          const callArity = callArgsNode ? callArgsNode.namedChildCount : 0;
+          const callArity = namedArgCount(getChildByField(node, 'args'));
           this.unresolvedReferences.push({
             fromNodeId: callerId,
             referenceName: `${calleeName}/${callArity}`,
@@ -3902,7 +3907,7 @@ export class TreeSitterExtractor {
               // qualified matcher then resolves it only when the module
               // defines exactly one arity of that name.
               const mfaList = argExprs[i + 2];
-              const arityTail = mfaList?.type === 'list' ? `/${mfaList.namedChildCount}` : '';
+              const arityTail = mfaList?.type === 'list' ? `/${namedArgCount(mfaList)}` : '';
               this.unresolvedReferences.push({
                 fromNodeId: callerId,
                 referenceName: (isLocalModule ? erlAtom(f) : `${erlAtom(m)}::${erlAtom(f)}`) + arityTail,
