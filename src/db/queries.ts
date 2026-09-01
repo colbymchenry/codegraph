@@ -245,6 +245,8 @@ export class QueryBuilder {
     deleteEdgesByTarget?: SqliteStatement;
     getEdgesBySource?: SqliteStatement;
     getEdgesByTarget?: SqliteStatement;
+    getUnresolvedFromNode?: SqliteStatement;
+    getUnresolvedInFile?: SqliteStatement;
     insertFile?: SqliteStatement;
     updateFile?: SqliteStatement;
     deleteFile?: SqliteStatement;
@@ -1022,7 +1024,17 @@ export class QueryBuilder {
    * mapping AND the handler implementations.
    */
   getRoutingManifest(limit: number = 40): {
-    entries: Array<{ url: string; handler: string; handlerFile: string; handlerLine: number; handlerKind: string }>;
+    entries: Array<{
+      url: string;
+      handler: string;
+      handlerFile: string;
+      handlerLine: number;
+      handlerKind: string;
+      /** The route node itself: where the URL is REGISTERED, not where it is served. */
+      routeId: string;
+      routeFile: string;
+      routeLine: number;
+    }>;
     topHandlerFile: string | null;
     topHandlerFileCount: number;
     totalRoutes: number;
@@ -1034,6 +1046,9 @@ export class QueryBuilder {
       this.stmts.getRoutingManifest = this.db.prepare(`
         SELECT
           r.name AS url,
+          r.id AS route_id,
+          r.file_path AS route_file,
+          r.start_line AS route_line,
           h.name AS handler,
           h.file_path AS handler_file,
           h.start_line AS handler_line,
@@ -1043,13 +1058,14 @@ export class QueryBuilder {
         JOIN nodes h ON e.target = h.id
         WHERE r.kind = 'route'
           AND e.kind IN ('references', 'calls')
-          AND h.kind IN ('function', 'method', 'class')
+          AND h.kind IN ('function', 'method', 'class', 'constant', 'variable')
         ORDER BY r.file_path, r.start_line
         LIMIT ?
       `);
     }
     const rows = this.stmts.getRoutingManifest.all(limit) as Array<{
-      url: string; handler: string; handler_file: string; handler_line: number; handler_kind: string;
+      url: string; route_id: string; route_file: string; route_line: number;
+      handler: string; handler_file: string; handler_line: number; handler_kind: string;
     }>;
     // Drop test/generated handlers — same hygiene as elsewhere.
     const generated = this.getGeneratedPathsAmong(rows.map(r => r.handler_file));
@@ -1075,6 +1091,9 @@ export class QueryBuilder {
         handlerFile: r.handler_file,
         handlerLine: r.handler_line,
         handlerKind: r.handler_kind,
+        routeId: r.route_id,
+        routeFile: r.route_file,
+        routeLine: r.route_line,
       })),
       topHandlerFile,
       topHandlerFileCount,
@@ -1863,6 +1882,655 @@ export class QueryBuilder {
   }
 
   /**
+   * Outgoing edges for MANY source nodes in one query.
+   *
+   * The batch form of {@link getOutgoingEdges}. Building a nested outline needs
+   * the `contains` edges of every container in a file at once; doing that one
+   * source at a time is a query per symbol on files that have hundreds.
+   */
+  getOutgoingEdgesFrom(sourceIds: readonly string[], kinds?: EdgeKind[]): Edge[] {
+    if (sourceIds.length === 0) return [];
+    const unique = [...new Set(sourceIds)];
+    const out: Edge[] = [];
+    for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      let sql = `SELECT * FROM edges WHERE source IN (${placeholders})`;
+      const params: string[] = [...chunk];
+      if (kinds && kinds.length > 0) {
+        sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
+        params.push(...kinds);
+      }
+      const rows = this.db.prepare(sql).all(...params) as EdgeRow[];
+      for (const row of rows) out.push(rowToEdge(row));
+    }
+    return out;
+  }
+
+  /**
+   * Fan-in (total incoming edge count) for MANY nodes in one query.
+   *
+   * The per-node alternative — `getIncomingEdges(id).length` — is an indexed
+   * lookup each, but a symbol screen rendering a couple of hundred callees
+   * would issue a couple of hundred of them. Ids with no incoming edges are
+   * absent from the map rather than present as 0, so callers can tell "no
+   * edges" from "not asked about".
+   */
+  countIncomingEdges(ids: readonly string[]): Map<string, number> {
+    const out = new Map<string, number>();
+    if (ids.length === 0) return out;
+    const unique = [...new Set(ids)];
+    for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(
+          `SELECT target, COUNT(*) AS count FROM edges WHERE target IN (${placeholders}) GROUP BY target`
+        )
+        .all(...chunk) as Array<{ target: string; count: number }>;
+      for (const row of rows) out.set(row.target, row.count);
+    }
+    return out;
+  }
+
+  /**
+   * Incoming edges for MANY target nodes in one query — the mirror of
+   * {@link getOutgoingEdgesFrom}. Needed wherever a whole file's inbound edges
+   * are wanted at once ("which files import anything in this one?").
+   */
+  getIncomingEdgesTo(targetIds: readonly string[], kinds?: EdgeKind[]): Edge[] {
+    if (targetIds.length === 0) return [];
+    const unique = [...new Set(targetIds)];
+    const out: Edge[] = [];
+    for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      let sql = `SELECT * FROM edges WHERE target IN (${placeholders})`;
+      const params: string[] = [...chunk];
+      if (kinds && kinds.length > 0) {
+        sql += ` AND kind IN (${kinds.map(() => '?').join(',')})`;
+        params.push(...kinds);
+      }
+      const rows = this.db.prepare(sql).all(...params) as EdgeRow[];
+      for (const row of rows) out.push(rowToEdge(row));
+    }
+    return out;
+  }
+
+  /**
+   * Fan-out (total outgoing edge count) for MANY nodes in one query — the
+   * mirror of {@link countIncomingEdges}. Ids with no outgoing edges are absent
+   * from the map rather than present as 0.
+   */
+  countOutgoingEdges(ids: readonly string[]): Map<string, number> {
+    const out = new Map<string, number>();
+    if (ids.length === 0) return out;
+    const unique = [...new Set(ids)];
+    for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(
+          `SELECT source, COUNT(*) AS count FROM edges WHERE source IN (${placeholders}) GROUP BY source`
+        )
+        .all(...chunk) as Array<{ source: string; count: number }>;
+      for (const row of rows) out.set(row.source, row.count);
+    }
+    return out;
+  }
+
+  /**
+   * Symbols nothing in the index points at — the candidate set behind the dead
+   * code list (`src/graph/dead-code.ts`).
+   *
+   * "Points at" is every edge kind EXCEPT `contains`: a class containing a
+   * method is structure, not use, and counting it would make every member look
+   * reached by its own container. A self-edge is excluded for the same reason
+   * a recursive function is not its own caller.
+   *
+   * One scan, one index probe per candidate. `NOT EXISTS` over
+   * `idx_edges_target_kind` is what keeps it that way — the alternative
+   * (`LEFT JOIN edges … GROUP BY`) builds a row per edge for the whole table
+   * before discarding all but the empty groups. Ordered by position so the
+   * answer is stable across runs and groups by file without a second sort.
+   *
+   * The result is deliberately NOT called dead code: an unreferenced symbol is
+   * a symbol with no STATIC reference, and the caller applies the exclusions
+   * (tests, generated files, overrides, unresolved names) that turn the
+   * candidate set into a claim worth making.
+   */
+  getUnreferencedNodes(
+    kinds: readonly string[],
+    limit: number
+  ): Array<{ node: Node; generated: boolean }> {
+    if (kinds.length === 0 || limit <= 0) return [];
+    const placeholders = kinds.map(() => '?').join(',');
+    const rows = this.db
+      .prepare(
+        `SELECT n.*, COALESCE(f.generated, 0) AS file_generated
+           FROM nodes n
+           LEFT JOIN files f ON f.path = n.file_path
+          WHERE n.kind IN (${placeholders})
+            AND NOT EXISTS (
+                  SELECT 1 FROM edges e
+                   WHERE e.target = n.id
+                     AND e.kind != 'contains'
+                     AND e.source != n.id
+                )
+       ORDER BY n.file_path, n.start_line, n.name
+          LIMIT ?`
+      )
+      .all(...kinds, limit) as Array<NodeRow & { file_generated: number }>;
+    return rows.map((row) => ({ node: rowToNode(row), generated: row.file_generated === 1 }));
+  }
+
+  /**
+   * Which of `names` the index holds an UNRESOLVED reference to.
+   *
+   * The point is honesty about our own blind spots. A `failed` row in
+   * `unresolved_refs` records that some file referenced a name and the resolver
+   * could not decide what it meant — so a symbol with that name cannot be
+   * called unreferenced, whatever the edge table says. It is deliberately
+   * matched loosely, on the reference name AND on its tail (`util.greet` →
+   * `greet`), because the question being asked is "could this name be the one
+   * we failed to follow", and a maybe has to count as a yes.
+   *
+   * Bounded-lookup like {@link getGeneratedPathsAmong}: the caller holds a
+   * candidate list, so this is a chunked probe over `idx_unresolved_name`, not
+   * a scan of the table.
+   */
+  getUnresolvedNamesAmong(names: Iterable<string>): Set<string> {
+    const unique = [...new Set(names)].filter((name) => name.length > 0);
+    const found = new Set<string>();
+    if (unique.length === 0) return found;
+
+    for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(
+          `SELECT DISTINCT reference_name AS name FROM unresolved_refs
+            WHERE reference_name IN (${placeholders})
+            UNION
+           SELECT DISTINCT name_tail AS name FROM unresolved_refs
+            WHERE name_tail IN (${placeholders})`
+        )
+        .all(...chunk, ...chunk) as Array<{ name: string }>;
+      for (const row of rows) found.add(row.name);
+    }
+    return found;
+  }
+
+  /**
+   * Which of `names` are carried by MORE THAN ONE symbol, at least one of which
+   * something points at.
+   *
+   * The false positive this exists to kill: `CodeGraph.getTopRouteFile` calls
+   * `this.queries.getTopRouteFile()`, and the resolver — which prefers a
+   * same-name definition in the call site's own file — attaches that edge to
+   * the *calling* method. One of the two ends up with a self-edge and the other
+   * with nothing at all, and neither is unreferenced. From the edge table the
+   * mis-resolution and a genuinely unused twin are the same picture, so the
+   * claim is not made about either.
+   *
+   * Both halves of the condition are load-bearing. **More than one symbol**:
+   * a uniquely-named function that only calls itself is genuinely dead, and
+   * excluding every recursive function would gut the list. **Self-edges
+   * counted**: the self-edge IS the fingerprint of the mis-resolution above, so
+   * it has to count as evidence that this name resolves somewhere.
+   *
+   * Chunked probe over `idx_nodes_name`, bounded by the caller's candidate list.
+   */
+  getAmbiguousReferencedNames(names: Iterable<string>): Set<string> {
+    const unique = [...new Set(names)].filter((name) => name.length > 0);
+    const found = new Set<string>();
+    if (unique.length === 0) return found;
+
+    for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(
+          `SELECT name FROM (
+             SELECT n.name AS name,
+                    EXISTS (
+                      SELECT 1 FROM edges e
+                       WHERE e.target = n.id AND e.kind != 'contains'
+                    ) AS referenced
+               FROM nodes n
+              WHERE n.name IN (${placeholders})
+           )
+         GROUP BY name
+           HAVING COUNT(*) > 1 AND SUM(referenced) > 0`
+        )
+        .all(...chunk) as Array<{ name: string }>;
+      for (const row of rows) found.add(row.name);
+    }
+    return found;
+  }
+
+  /**
+   * Which of the given languages the index records an EXPORT marker for.
+   *
+   * A self-measurement, and the honest basis for a whole class of exclusion.
+   * The dead code report's strongest filter is "exported symbols may be reached
+   * from outside this repository" — and that filter silently does nothing for a
+   * language whose exports are not recorded, either because the extractor does
+   * not record them (Rust `pub`) or because the language has no such concept at
+   * all (Python, C, Ruby: the header or the module IS the surface). Rather than
+   * carry a table of which is which, ask the index: if nothing in this language
+   * is marked exported, the filter did not run, and no claim about outside
+   * reachability can be made for it.
+   *
+   * `idx_nodes_language` covers the grouping; the caller passes the handful of
+   * languages its candidates are actually in.
+   */
+  getLanguagesWithExports(languages: Iterable<string>): Set<string> {
+    const unique = [...new Set(languages)].filter((language) => language.length > 0);
+    const found = new Set<string>();
+    if (unique.length === 0) return found;
+
+    for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(
+          `SELECT language, MAX(is_exported) AS any_exported
+             FROM nodes
+            WHERE language IN (${placeholders})
+         GROUP BY language`
+        )
+        .all(...chunk) as Array<{ language: string; any_exported: number }>;
+      for (const row of rows) if (row.any_exported === 1) found.add(row.language);
+    }
+    return found;
+  }
+
+  /**
+   * The nodes with the most DISTINCT dependents, most first.
+   *
+   * "Distinct" is the difference that matters: a helper called forty times from
+   * one function has a fan-in of 40 but exactly one dependent. This counts the
+   * second thing — the number a reader means by "N callers" — so the top of
+   * this list is the set of symbols a change actually radiates furthest from.
+   *
+   * `contains` is excluded because it is structure, not dependency: counting it
+   * would rank every file and class above the code they hold.
+   */
+  getTopDependedOn(limit: number): Array<{ nodeId: string; dependents: number }> {
+    if (limit <= 0) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT target AS nodeId, COUNT(DISTINCT source) AS dependents
+           FROM edges
+          WHERE kind != 'contains' AND source != target
+       GROUP BY target
+       ORDER BY dependents DESC
+          LIMIT ?`
+      )
+      .all(limit) as Array<{ nodeId: string; dependents: number }>;
+    return rows;
+  }
+
+  /**
+   * The graph's executable roots — files that RUN something at module level,
+   * ranked by how much of the project they set in motion.
+   *
+   * The engine records a statement at the top level of a file as an edge from
+   * the *file* node, so `src/bin/codegraph.ts` calling `program.parse()` at
+   * module scope is a `calls` edge out of a `file`. That set is what makes the
+   * roots of a dependency graph visible: a library module holds definitions and
+   * runs nothing until someone imports it, while a CLI, a worker entry or a
+   * build script does its work on the way down the file. `instantiates` counts
+   * the same way — `new Server(...)` at module scope is the same act.
+   *
+   * Ranking multiplies the two things an entry point does: it runs (calls), and
+   * it wires the project together (distinct other files its symbols reach). One
+   * alone is misleading — a registration table makes hundreds of module-level
+   * calls into itself, and a barrel file imports everything and runs nothing.
+   * The product puts the file that does both at the top.
+   */
+  getTopCallingFiles(
+    limit: number
+  ): Array<{ nodeId: string; filePath: string; calls: number; reaches: number; score: number }> {
+    if (limit <= 0) return [];
+    return this.db
+      .prepare(
+        `WITH runs AS (
+             SELECT e.source AS id, COUNT(*) AS calls
+               FROM edges e
+               JOIN nodes n ON n.id = e.source
+              WHERE n.kind = 'file' AND e.kind IN ('calls', 'instantiates')
+           GROUP BY e.source
+         ),
+         cand AS (
+             SELECT r.id AS id, n.file_path AS fp, r.calls AS calls
+               FROM runs r JOIN nodes n ON n.id = r.id
+         ),
+         wires AS (
+             SELECT sn.file_path AS fp, COUNT(DISTINCT tn.file_path) AS reaches
+               FROM edges e
+               JOIN nodes sn ON sn.id = e.source
+               JOIN nodes tn ON tn.id = e.target
+              WHERE e.kind != 'contains'
+                AND sn.file_path <> tn.file_path
+                AND sn.file_path IN (SELECT fp FROM cand)
+           GROUP BY sn.file_path
+         )
+         SELECT c.id AS nodeId,
+                c.fp AS filePath,
+                c.calls AS calls,
+                COALESCE(w.reaches, 0) AS reaches,
+                c.calls * (1 + COALESCE(w.reaches, 0)) AS score
+           FROM cand c LEFT JOIN wires w ON w.fp = c.fp
+       ORDER BY score DESC, calls DESC, filePath
+          LIMIT ?`
+      )
+      .all(limit) as Array<{
+      nodeId: string;
+      filePath: string;
+      calls: number;
+      reaches: number;
+      score: number;
+    }>;
+  }
+
+  /**
+   * How many OTHER files depend on each of the given files.
+   *
+   * Counted through the symbols, not the file nodes: an `imports` edge points
+   * at the imported symbol, so a file node almost never receives one and
+   * counting edges into it would report every file as depended on by nobody.
+   * Same-file edges are excluded, which is what makes zero mean "nothing else
+   * in the index reaches into this file" — the honest reading of a root.
+   */
+  getFileDependentCounts(filePaths: string[]): Array<{ filePath: string; dependents: number }> {
+    if (filePaths.length === 0) return [];
+    return this.db
+      .prepare(
+        `SELECT tn.file_path AS filePath, COUNT(DISTINCT sn.file_path) AS dependents
+           FROM edges e
+           JOIN nodes tn ON tn.id = e.target
+           JOIN nodes sn ON sn.id = e.source
+          WHERE e.kind != 'contains'
+            AND tn.file_path IN (SELECT value FROM json_each(?))
+            AND sn.file_path <> tn.file_path
+       GROUP BY tn.file_path`
+      )
+      .all(JSON.stringify(filePaths)) as Array<{ filePath: string; dependents: number }>;
+  }
+
+  /**
+   * How far each of the given files reaches OUT: distinct other files its
+   * symbols touch, and how many references that is.
+   *
+   * The mirror of {@link getFileDependentCounts}, and the same reasoning about
+   * `contains` and same-file edges applies. It is driven from `nodes` rather
+   * than from `edges` so the work is proportional to the files asked about —
+   * the entry-points endpoint asks it about every test file in the index, and
+   * an edge-first plan would scan the whole table to answer a question about a
+   * tenth of it.
+   */
+  getFileReachCounts(filePaths: string[]): Array<{ filePath: string; reaches: number; refs: number }> {
+    if (filePaths.length === 0) return [];
+    return this.db
+      .prepare(
+        `SELECT sn.file_path AS filePath,
+                COUNT(DISTINCT tn.file_path) AS reaches,
+                COUNT(*) AS refs
+           FROM nodes sn
+           JOIN edges e ON e.source = sn.id
+           JOIN nodes tn ON tn.id = e.target
+          WHERE sn.file_path IN (SELECT value FROM json_each(?))
+            AND e.kind != 'contains'
+            AND tn.file_path <> sn.file_path
+       GROUP BY sn.file_path`
+      )
+      .all(JSON.stringify(filePaths)) as Array<{
+      filePath: string;
+      reaches: number;
+      refs: number;
+    }>;
+  }
+
+  /**
+   * The `file` nodes for the given paths, in one query.
+   *
+   * A file's own node is what makes a file row navigable, and looking it up
+   * with {@link getNodesInFile} means materialising every symbol in the file to
+   * throw all but one away.
+   */
+  getFileNodes(filePaths: string[]): Node[] {
+    if (filePaths.length === 0) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM nodes
+          WHERE kind = 'file'
+            AND file_path IN (SELECT value FROM json_each(?))`
+      )
+      .all(JSON.stringify(filePaths)) as NodeRow[];
+    return rows.map(rowToNode);
+  }
+
+  /**
+   * Roll the whole edge table up to module granularity in one pass.
+   *
+   * The caller decides what a module IS — it hands in a file → module
+   * assignment and gets back the cross-module traffic. That split is
+   * deliberate: naming modules is a *policy* (top-level directories, a façade
+   * file kept separate, a monorepo root) that belongs where the reader lives,
+   * while grouping a million edges by it is *mechanics* that must happen in
+   * SQLite. Doing the fold in JavaScript instead means materialising every
+   * cross-file edge in memory; doing the naming in SQL means a tower of
+   * `instr`/`substr` no one can read.
+   *
+   * The assignment lands in a TEMP table with a primary key, so the join is
+   * indexed and the result set is bounded by modules², not by edges. Temp
+   * tables live in SQLite's own temp database, so this stays valid against a
+   * read-only main.
+   *
+   * Two result sets, because they need two different groupings over the same
+   * join: `links` counts edges per (module, module, kind), and `pairs` names
+   * the busiest symbol pairs behind each link (the map's tooltip). `pairs` is
+   * ranked and cut inside SQLite — the un-cut grouping is the one thing here
+   * that scales with distinct symbol names rather than with modules. Pairs are
+   * ranked by `declared` before raw count, so a link's tooltip names the
+   * symbols the source actually points at rather than whichever `has`/`get`
+   * happened to name-match most often.
+   *
+   * `declared` is the subset of a link's edges that came from something the
+   * source *writes down*: an import, a qualified name, an inheritance clause,
+   * or a call through a typed receiver. It exists because bare name matching
+   * (`resolvedBy: 'exact-match'`) is what invents cross-module links out of
+   * common method names — `run`, `push`, `finish` — and a map that lets those
+   * decide the layering puts the storage layer above the CLI.
+   */
+  aggregateModuleGraph(
+    assignments: ReadonlyArray<{ filePath: string; module: string }>,
+    options: {
+      kinds: readonly EdgeKind[];
+      minConfidence: number;
+      topPairsPerLink: number;
+      pairKinds: readonly EdgeKind[];
+    }
+  ): {
+    links: Array<{
+      source: string;
+      target: string;
+      kind: EdgeKind;
+      count: number;
+      declared: number;
+      uncertain: number;
+    }>;
+    pairs: Array<{
+      source: string;
+      target: string;
+      from: string;
+      to: string;
+      count: number;
+      declared: number;
+    }>;
+  } {
+    if (assignments.length === 0 || options.kinds.length === 0) return { links: [], pairs: [] };
+
+    const CONFIDENCE = `COALESCE(json_extract(e.metadata, '$.confidence'), 1)`;
+    const DECLARED = `(json_extract(e.metadata, '$.resolvedBy') IN ('import', 'qualified-name')
+                       OR e.kind IN ('extends', 'implements')
+                       OR (json_extract(e.metadata, '$.resolvedBy') = 'instance-method'
+                           AND ${CONFIDENCE} >= 0.9))`;
+
+    this.db.exec('DROP TABLE IF EXISTS temp.cg_module_map');
+    this.db.exec('CREATE TEMP TABLE cg_module_map (path TEXT PRIMARY KEY, mod TEXT NOT NULL)');
+    try {
+      const insert = this.db.prepare(
+        'INSERT OR REPLACE INTO cg_module_map (path, mod) VALUES (?, ?)'
+      );
+      this.db.exec('BEGIN');
+      try {
+        for (const row of assignments) insert.run(row.filePath, row.module);
+        this.db.exec('COMMIT');
+      } catch (err) {
+        this.db.exec('ROLLBACK');
+        throw err;
+      }
+
+      // ONE pass over the edge table. Grouping by the symbol names as well as
+      // the modules costs nothing extra in scan time — the join is what is
+      // expensive — and it buys both results from a single scan. Measured on
+      // this index inflated to 1.6M edges: 1.66s for this query against 3.0s
+      // for the module-level and name-level queries run separately, which is
+      // the difference between meeting and missing the map's cold budget on a
+      // ten-thousand-file repository.
+      const rows = this.db
+        .prepare(
+          `SELECT ms.mod AS source, mt.mod AS target, e.kind AS kind,
+                  sn.name AS "from", tn.name AS "to",
+                  SUM(CASE WHEN ${CONFIDENCE} >= ? THEN 1 ELSE 0 END) AS count,
+                  SUM(CASE WHEN ${CONFIDENCE} >= ? AND ${DECLARED} THEN 1 ELSE 0 END) AS declared,
+                  SUM(CASE WHEN ${CONFIDENCE} <  ? THEN 1 ELSE 0 END) AS uncertain
+             FROM edges e
+             JOIN nodes sn ON sn.id = e.source
+             JOIN nodes tn ON tn.id = e.target
+             JOIN cg_module_map ms ON ms.path = sn.file_path
+             JOIN cg_module_map mt ON mt.path = tn.file_path
+            WHERE e.kind IN (SELECT value FROM json_each(?))
+              AND ms.mod <> mt.mod
+         GROUP BY ms.mod, mt.mod, e.kind, sn.name, tn.name`
+        )
+        .all(
+          options.minConfidence,
+          options.minConfidence,
+          options.minConfidence,
+          JSON.stringify(options.kinds)
+        ) as Array<{
+        source: string;
+        target: string;
+        kind: EdgeKind;
+        from: string;
+        to: string;
+        count: number;
+        declared: number;
+        uncertain: number;
+      }>;
+
+      return foldModuleRows(rows, options);
+    } finally {
+      this.db.exec('DROP TABLE IF EXISTS temp.cg_module_map');
+    }
+  }
+
+  /**
+   * Every ordered pair of files where one reaches into the other, once each.
+   *
+   * The input a cycle finder wants: file-level circular dependencies are the
+   * strongly connected components of this graph. One query instead of the
+   * dependency lookup per file that {@link GraphQueryManager.findCircularDependencies}
+   * does — which matters because a cycle report is only interesting on a large
+   * repo, and that is exactly where a query per file stops being affordable.
+   *
+   * `contains` is excluded (a file "contains" its own symbols, which is not a
+   * dependency), and so are same-file edges and low-confidence name matches:
+   * a cycle conjured by a common method name is a false alarm a reader cannot
+   * check.
+   */
+  getCrossFileDependencyPairs(minConfidence: number): Array<{ source: string; target: string }> {
+    return this.db
+      .prepare(
+        `SELECT DISTINCT sn.file_path AS source, tn.file_path AS target
+           FROM edges e
+           JOIN nodes sn ON sn.id = e.source
+           JOIN nodes tn ON tn.id = e.target
+          WHERE e.kind <> 'contains'
+            AND sn.file_path <> tn.file_path
+            AND COALESCE(json_extract(e.metadata, '$.confidence'), 1) >= ?`
+      )
+      .all(minConfidence) as Array<{ source: string; target: string }>;
+  }
+
+  /**
+   * Every unresolved reference recorded in one FILE, ordered by line.
+   *
+   * The per-symbol form above answers "what does this body reach that the
+   * index does not hold". A whole-file reader asks the same question of every
+   * line at once, and asking it one symbol at a time is a query per symbol —
+   * 153 of them on this repo's largest file. `unresolved_refs.file_path` is
+   * indexed, so this is one lookup whatever the file holds.
+   *
+   * `limit` bounds the answer rather than the work: the caller draws a marker
+   * per row, and a generated file with fifty thousand of them would ship
+   * megabytes to say something a count already says. Rows come back in line
+   * order, so a cap trims the END of the file, which is at least legible.
+   */
+  getUnresolvedReferencesInFile(filePath: string, limit = 5000): UnresolvedReference[] {
+    if (!this.stmts.getUnresolvedInFile) {
+      this.stmts.getUnresolvedInFile = this.db.prepare(
+        'SELECT * FROM unresolved_refs WHERE file_path = ? ORDER BY line, col LIMIT ?'
+      );
+    }
+    const rows = this.stmts.getUnresolvedInFile.all(filePath, limit) as UnresolvedRefRow[];
+    return rows.map((row) => ({
+      fromNodeId: row.from_node_id,
+      referenceName: row.reference_name,
+      referenceKind: row.reference_kind as EdgeKind,
+      line: row.line,
+      column: row.col,
+      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+      filePath: row.file_path,
+      language: row.language as Language,
+      rowId: row.id,
+    }));
+  }
+
+  /**
+   * References recorded against a symbol that never resolved to a node — the
+   * calls and type mentions that leave the index (a third-party package, a
+   * runtime builtin, a language construct extraction doesn't model).
+   *
+   * Read-only. It exists so a reader can say "N calls into symbols outside the
+   * index" instead of silently showing a callee list shorter than the body's
+   * call sites, which reads as "nothing else happens here".
+   */
+  getUnresolvedReferencesFrom(fromNodeId: string): UnresolvedReference[] {
+    if (!this.stmts.getUnresolvedFromNode) {
+      this.stmts.getUnresolvedFromNode = this.db.prepare(
+        'SELECT * FROM unresolved_refs WHERE from_node_id = ?'
+      );
+    }
+    const rows = this.stmts.getUnresolvedFromNode.all(fromNodeId) as UnresolvedRefRow[];
+    return rows.map((row) => ({
+      fromNodeId: row.from_node_id,
+      referenceName: row.reference_name,
+      referenceKind: row.reference_kind as EdgeKind,
+      line: row.line,
+      column: row.col,
+      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+      filePath: row.file_path,
+      language: row.language as Language,
+      rowId: row.id,
+    }));
+  }
+
+  /**
    * Find all edges where both source and target are in the given node set.
    * Useful for recovering inter-node connectivity after BFS.
    */
@@ -2186,6 +2854,42 @@ export class QueryBuilder {
       .prepare('SELECT MAX(indexed_at) AS last FROM files')
       .get() as { last: number | null } | undefined;
     return row?.last ?? null;
+  }
+
+  /**
+   * The index's revision marker: how far the last sync got, and how many files
+   * it left behind — one query, both numbers.
+   *
+   * This is the cheapest honest answer to "has the index moved since I last
+   * looked". `MAX(indexed_at)` alone is not enough: a sync that only DELETES
+   * files (a branch checkout that removed a directory) advances nothing, and
+   * the graph the viewer is showing has still changed underneath it. The row
+   * count catches exactly that case.
+   */
+  getIndexRevision(): { lastIndexedAt: number | null; fileCount: number } {
+    const row = this.db
+      .prepare('SELECT MAX(indexed_at) AS last, COUNT(*) AS files FROM files')
+      .get() as { last: number | null; files: number } | undefined;
+    return { lastIndexedAt: row?.last ?? null, fileCount: row?.files ?? 0 };
+  }
+
+  /**
+   * Files re-indexed strictly after `since` (ms since epoch), newest first.
+   *
+   * `total` is the real count; `paths` is capped at `limit`. Used by the
+   * viewer's live channel to name what a sync just picked up. A file the same
+   * sync DELETED cannot appear here — it has no row left — which is why the
+   * caller compares {@link getIndexRevision} as well rather than treating an
+   * empty list as "nothing happened".
+   */
+  getFilesIndexedSince(since: number, limit: number): { paths: string[]; total: number } {
+    const count = this.db
+      .prepare('SELECT COUNT(*) AS n FROM files WHERE indexed_at > ?')
+      .get(since) as { n: number } | undefined;
+    const rows = this.db
+      .prepare('SELECT path FROM files WHERE indexed_at > ? ORDER BY indexed_at DESC, path LIMIT ?')
+      .all(since, Math.max(0, limit)) as Array<{ path: string }>;
+    return { paths: rows.map((r) => r.path), total: count?.n ?? rows.length };
   }
 
   /**
@@ -2892,4 +3596,119 @@ export class QueryBuilder {
       this.db.exec('DELETE FROM files');
     })();
   }
+}
+
+/**
+ * Turn the module aggregation's one result set into its two answers.
+ *
+ * The query groups by module pair AND kind AND symbol names, because the join
+ * is what costs and a finer grouping rides along free. That leaves two folds:
+ * counts per (module, module, kind) for the map's link weights, and the busiest
+ * symbol pairs per link for its tooltip.
+ *
+ * Pairs are ranked `declared` first and only then by raw count, so a link's
+ * tooltip names the symbols the source actually points at rather than whichever
+ * `has`/`get`/`run` happened to name-match most often. Only `pairKinds` are
+ * eligible: "Config to Config" is real traffic but not an interesting row.
+ */
+interface ModuleGroupRow {
+  source: string;
+  target: string;
+  kind: EdgeKind;
+  from: string;
+  to: string;
+  count: number;
+  declared: number;
+  uncertain: number;
+}
+
+interface ModuleLinkTotal {
+  source: string;
+  target: string;
+  kind: EdgeKind;
+  count: number;
+  declared: number;
+  uncertain: number;
+}
+
+interface ModulePairTotal {
+  source: string;
+  target: string;
+  from: string;
+  to: string;
+  count: number;
+  declared: number;
+}
+
+function foldModuleRows(
+  rows: ReadonlyArray<ModuleGroupRow>,
+  options: { topPairsPerLink: number; pairKinds: readonly EdgeKind[] }
+): { links: ModuleLinkTotal[]; pairs: ModulePairTotal[] } {
+  // A module id is a path and may contain anything printable, so the key
+  // separator has to be something a path cannot hold.
+  const SEP = '\u0000';
+  const links = new Map<string, ModuleLinkTotal>();
+  const pairKinds = new Set(options.pairKinds);
+  const wantPairs = options.topPairsPerLink > 0 && pairKinds.size > 0;
+  const pairTotals = new Map<string, ModulePairTotal>();
+
+  for (const row of rows) {
+    const linkKey = `${row.source}${SEP}${row.target}${SEP}${row.kind}`;
+    const link = links.get(linkKey);
+    if (link) {
+      link.count += row.count;
+      link.declared += row.declared;
+      link.uncertain += row.uncertain;
+    } else {
+      links.set(linkKey, {
+        source: row.source,
+        target: row.target,
+        kind: row.kind,
+        count: row.count,
+        declared: row.declared,
+        uncertain: row.uncertain,
+      });
+    }
+
+    // Only the confident half of a row can be named: an uncertain edge is a
+    // guess, and printing "a to b, 12" for twelve guesses is the map claiming
+    // something it does not know.
+    if (!wantPairs || row.count === 0 || !pairKinds.has(row.kind)) continue;
+    const pairKey = `${row.source}${SEP}${row.target}${SEP}${row.from}${SEP}${row.to}`;
+    const pair = pairTotals.get(pairKey);
+    if (pair) {
+      pair.count += row.count;
+      pair.declared += row.declared;
+    } else {
+      pairTotals.set(pairKey, {
+        source: row.source,
+        target: row.target,
+        from: row.from,
+        to: row.to,
+        count: row.count,
+        declared: row.declared,
+      });
+    }
+  }
+
+  const byLink = new Map<string, ModulePairTotal[]>();
+  for (const pair of pairTotals.values()) {
+    const key = `${pair.source}${SEP}${pair.target}`;
+    let list = byLink.get(key);
+    if (!list) byLink.set(key, (list = []));
+    list.push(pair);
+  }
+  const pairs: ModulePairTotal[] = [];
+  for (const list of byLink.values()) {
+    list.sort(
+      (a, b) =>
+        b.declared - a.declared ||
+        b.count - a.count ||
+        a.from.localeCompare(b.from) ||
+        a.to.localeCompare(b.to)
+    );
+    for (const pair of list.slice(0, options.topPairsPerLink)) pairs.push(pair);
+  }
+
+  return { links: [...links.values()], pairs };
 }

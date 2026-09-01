@@ -562,6 +562,19 @@ function looksLikeObjc(source: string): boolean {
 }
 
 /**
+ * Whether a language has a tree-sitter grammar of its own.
+ *
+ * Narrower than {@link isLanguageSupported}, which also answers true for the
+ * formats handled by custom extractors (SFCs, Liquid, Razor, YAML, XML,
+ * properties) — those have extraction but no grammar, so anything that needs to
+ * PARSE the file (the viewer's syntax classification, for one) has to ask this
+ * instead.
+ */
+export function hasTreeSitterGrammar(language: string | undefined | null): boolean {
+  return !!language && language in WASM_GRAMMAR_FILES;
+}
+
+/**
  * Check if a language is supported (has a grammar defined).
  * Returns true if the grammar exists, even if not yet loaded.
  */
