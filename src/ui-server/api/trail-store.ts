@@ -28,7 +28,6 @@
  */
 
 import * as fs from 'fs';
-import * as path from 'path';
 import { randomUUID } from 'crypto';
 import { CODEGRAPH_DIR } from '../../directory';
 import { resolveProjectFile } from '../security';
@@ -163,6 +162,9 @@ export function parseTrail(id: string, text: string): StoredTrail | null {
   }
   if (typeof raw !== 'object' || raw === null) return null;
   const value = raw as Record<string, unknown>;
+  // Unversioned hand-written trails predate the stored format marker and are
+  // treated as v1. A declared future/unknown version must not be guessed at.
+  if (value.version !== undefined && value.version !== TRAIL_FORMAT_VERSION) return null;
   if (typeof value.name !== 'string' || value.name.trim() === '') return null;
   if (!Array.isArray(value.hops) || value.hops.length === 0) return null;
 
@@ -231,7 +233,15 @@ export function listStoredTrails(projectRoot: string): StoredTrailList {
       skipped += 1;
       continue;
     }
-    const trail = readTrailFile(path.join(dir, name), id);
+    let trail: StoredTrail | null = null;
+    try {
+      // Use the same per-file chokepoint as direct reads. Checking only the
+      // directory lets `trails/x.json -> /outside/secret.json` escape it.
+      trail = readStoredTrail(projectRoot, id);
+    } catch {
+      // A linked or otherwise refused entry is an unreadable trail, not a reason
+      // to hide every valid trail beside it.
+    }
     if (trail) trails.push(trail);
     else skipped += 1;
   }
@@ -242,14 +252,20 @@ export function listStoredTrails(projectRoot: string): StoredTrailList {
 }
 
 function readTrailFile(absolute: string, id: string): StoredTrail | null {
+  let fd: number | null = null;
   try {
-    const stat = fs.statSync(absolute);
+    // O_NOFOLLOW closes the race between path validation and the actual open:
+    // replacing a checked file with a symlink must fail rather than follow it.
+    fd = fs.openSync(absolute, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    const stat = fs.fstatSync(fd);
     // A file too big to be a trail is skipped rather than read: this directory
     // is inside the project, and something else may one day put a log in it.
     if (!stat.isFile() || stat.size > MAX_TRAIL_FILE_BYTES) return null;
-    return parseTrail(id, fs.readFileSync(absolute, 'utf-8'));
+    return parseTrail(id, fs.readFileSync(fd, 'utf-8'));
   } catch {
     return null;
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
   }
 }
 
