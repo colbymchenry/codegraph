@@ -293,6 +293,29 @@ impl<'t> Walker<'t> {
 
     // --- extractVariable (TS/JS branch) ------------------------------------------------
 
+    /// A top-level binding exported by a LATER statement rather than at its
+    /// declaration: `export default NAME`, `export { NAME }`, `export { NAME as
+    /// default }`. The declaration's own `is_exported` (an `export_statement`
+    /// ancestor) cannot see these. One anchored regex over the file source.
+    /// Mirrors TreeSitterExtractor.isExportedLater.
+    pub(super) fn is_exported_later(&self, name: &str) -> bool {
+        if name.is_empty()
+            || !name.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_' || c == '$').unwrap_or(false)
+            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        {
+            return false;
+        }
+        let n = regex::escape(name);
+        let pattern = format!(
+            r"(?m)^[ \t]*export\s+(?:default\s+{n}\s*;?[ \t]*$|\{{[^}}]*\b{n}\b[^}}]*\}})",
+            n = n
+        );
+        match regex::Regex::new(&pattern) {
+            Ok(re) => re.is_match(self.src),
+            Err(_) => false,
+        }
+    }
+
     pub(super) fn extract_variable(&mut self, node: Node<'t>) {
         let is_const = self.is_const_decl(node);
         let kind: &'static str = if is_const { "constant" } else { "variable" };
@@ -373,7 +396,12 @@ impl<'t> Walker<'t> {
             let has_inline_fns = object_of_fns
                 .map(|o| self.object_has_inline_functions(o))
                 .unwrap_or(false);
-            let extract_object_methods = is_exported && object_of_fns.is_some() && has_inline_fns;
+            // "Exported" includes the two-statement form `const useStore =
+            // create(…)` … `export default useStore` (is_exported_later), the
+            // shape most React Native stores are written in. Mirrors
+            // TreeSitterExtractor.isExportedLater.
+            let extract_object_methods =
+                (is_exported || self.is_exported_later(&name)) && object_of_fns.is_some() && has_inline_fns;
 
             let rtk_endpoints = match value {
                 Some(v) if v.kind() == "call_expression" => self.find_rtk_endpoints_object(v),
