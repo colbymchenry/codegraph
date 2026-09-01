@@ -656,8 +656,18 @@ const GITIGNORE_CONTENT = `# CodeGraph data files — local to each machine, not
 !.gitignore
 `;
 
+const LOCAL_GITIGNORE_CONTENT = `# CodeGraph data files — local to this machine, not for committing.
+# Ignore everything in .codegraph/, including this file itself.
+*
+`;
+
 /** Header line that prefixes every .gitignore CodeGraph has auto-generated. */
 const GITIGNORE_MARKER = '# CodeGraph data files';
+
+function localGitignoreEnabled(): boolean {
+  const raw = process.env.CODEGRAPH_LOCAL_GITIGNORE?.trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'yes';
+}
 
 /**
  * Is `content` a stale CodeGraph-generated `.gitignore` that should be
@@ -689,7 +699,7 @@ function ensureGitignore(gitignorePath: string): boolean {
   // Current default or a user-authored file: nothing to do.
   if (existing !== null && !isStaleDefaultGitignore(existing)) return true;
   try {
-    fs.writeFileSync(gitignorePath, GITIGNORE_CONTENT, 'utf-8');
+    fs.writeFileSync(gitignorePath, localGitignoreEnabled() ? LOCAL_GITIGNORE_CONTENT : GITIGNORE_CONTENT, 'utf-8');
     return true;
   } catch {
     return false;
