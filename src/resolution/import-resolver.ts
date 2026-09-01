@@ -406,6 +406,44 @@ function isExternalImport(
 }
 
 /**
+ * TypeScript's ESM/NodeNext rule: a relative specifier carries the EMITTED
+ * extension while the file on disk is the TS source — `import './x.js'`
+ * resolves to `x.ts`. `EXTENSION_RESOLUTION` only ever APPENDS a suffix, so a
+ * specifier that already ends in `.js` is tried as `x.js.ts`, `x.js.tsx`, …
+ * and then bare `x.js`, none of which exist in a TS project. Import resolution
+ * then returns null for EVERY relative import in the repo and the resolver
+ * falls through to the name-matcher, which cannot cross a rename — so an
+ * aliased or default export silently reports a false 0 callers.
+ *
+ * This is not an edge case: `"moduleResolution": "NodeNext"` REQUIRES the `.js`
+ * suffix, so an entire class of modern TS codebases resolves nothing (a 16k-file
+ * project measured 32,732 `.js` specifiers and 0 extensionless ones).
+ *
+ * Tried only AFTER the literal path, so a real emitted `.js` sitting on disk
+ * still wins and no currently-resolving import changes target.
+ */
+const TS_SOURCE_REWRITES: Array<[RegExp, string[]]> = [
+  [/\.js$/, ['.ts', '.tsx', '.d.ts']],
+  [/\.jsx$/, ['.tsx', '.jsx', '.d.ts']],
+  [/\.mjs$/, ['.mts', '.d.mts']],
+  [/\.cjs$/, ['.cts', '.d.cts']],
+];
+
+/** Languages whose specifiers may name emitted JS for an on-disk TS source. */
+const TS_SOURCE_LANGUAGES = new Set<string>(['typescript', 'tsx', 'arkts', 'svelte', 'vue', 'astro']);
+
+/** The TS source paths a JS-suffixed specifier may legally denote. */
+function tsSourceCandidates(candidatePath: string, language: Language): string[] {
+  if (!TS_SOURCE_LANGUAGES.has(language)) return [];
+  for (const [suffix, replacements] of TS_SOURCE_REWRITES) {
+    if (suffix.test(candidatePath)) {
+      return replacements.map((ext) => candidatePath.replace(suffix, ext));
+    }
+  }
+  return [];
+}
+
+/**
  * Resolve a relative import
  */
 function resolveRelativeImport(
@@ -452,6 +490,13 @@ function resolveRelativeImport(
     return relativePath;
   }
 
+  // `./x.js` naming the on-disk `./x.ts` (see TS_SOURCE_REWRITES).
+  for (const candidate of tsSourceCandidates(relativePath, language)) {
+    if (context.fileExists(candidate)) {
+      return candidate;
+    }
+  }
+
   return null;
 }
 
@@ -479,6 +524,9 @@ function resolveAliasedImport(
       if (context.fileExists(candidate)) return candidate;
     }
     if (context.fileExists(basePath)) return basePath;
+    for (const candidate of tsSourceCandidates(basePath, language)) {
+      if (context.fileExists(candidate)) return candidate;
+    }
     return null;
   };
 
