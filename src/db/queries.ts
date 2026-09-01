@@ -2184,6 +2184,12 @@ export class QueryBuilder {
    * build script does its work on the way down the file. `instantiates` counts
    * the same way — `new Server(...)` at module scope is the same act.
    *
+   * A call made while initializing a module-level `variable` / `constant` —
+   * `const service = new Service()`, `app = FastAPI()` — is attributed to the
+   * declared name (#693), not to the file, so the file's own edges alone would
+   * miss most of what a real entry point runs. Those names are the file's
+   * top-level code too, so `tops` counts them alongside the file node.
+   *
    * Ranking multiplies the two things an entry point does: it runs (calls), and
    * it wires the project together (distinct other files its symbols reach). One
    * alone is misleading — a registration table makes hundreds of module-level
@@ -2196,12 +2202,25 @@ export class QueryBuilder {
     if (limit <= 0) return [];
     return this.db
       .prepare(
-        `WITH runs AS (
-             SELECT e.source AS id, COUNT(*) AS calls
-               FROM edges e
-               JOIN nodes n ON n.id = e.source
-              WHERE n.kind = 'file' AND e.kind IN ('calls', 'instantiates')
-           GROUP BY e.source
+        `WITH tops AS (
+             SELECT n.id AS file_id, n.id AS src
+               FROM nodes n
+              WHERE n.kind = 'file'
+             UNION ALL
+             SELECT c.source AS file_id, c.target AS src
+               FROM edges c
+               JOIN nodes f ON f.id = c.source
+               JOIN nodes v ON v.id = c.target
+              WHERE c.kind = 'contains'
+                AND f.kind = 'file'
+                AND v.kind IN ('variable', 'constant')
+         ),
+         runs AS (
+             SELECT t.file_id AS id, COUNT(*) AS calls
+               FROM tops t
+               JOIN edges e ON e.source = t.src
+              WHERE e.kind IN ('calls', 'instantiates')
+           GROUP BY t.file_id
          ),
          cand AS (
              SELECT r.id AS id, n.file_path AS fp, r.calls AS calls
