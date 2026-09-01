@@ -150,6 +150,11 @@ describe('Language Detection', () => {
     expect(isSourceFile('default.nix')).toBe(true);
   });
 
+  it('should detect AL files', () => {
+    expect(detectLanguage('src/CustomerCard.al')).toBe('al');
+    expect(isSourceFile('src/CustomerCard.al')).toBe(true);
+  });
+
   it('should detect a .h whose only C++ signal is an export-macro class as cpp', () => {
     // Lean Unreal-Engine style header: the class is annotated with an export
     // macro and carries no explicit `public:`/`virtual`/`namespace`/`template`,
