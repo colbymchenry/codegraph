@@ -1079,6 +1079,31 @@ describe.runIf(CodeGraph.isInitialized(path.resolve(__dirname, '..')))(
       expect(body.blast.direct).toBe(body.counts.callers);
       expect(body.tests.reached).toBe(true);
     });
+
+    it.runIf(
+      process.env.CODEGRAPH_PERF_TESTS === '1' || process.env.npm_lifecycle_event === 'test:perf'
+    )(
+      'keeps the warmed busiest-symbol response under 100 ms at the median',
+      async () => {
+        const search = JSON.parse(
+          (await repoGet('/api/search?q=' + encodeURIComponent('LRUCache.get'))).body
+        );
+        const hit = search.results.items.find(
+          (r: any) => r.name === 'get' && r.file.endsWith('src/resolution/lru-cache.ts')
+        );
+        expect(hit, 'LRUCache.get should be in the engine\'s own index').toBeTruthy();
+
+        await repoGet(`/api/node/${hit.id}`);
+        const samples: number[] = [];
+        for (let i = 0; i < 5; i += 1) {
+          const started = performance.now();
+          await repoGet(`/api/node/${hit.id}`);
+          samples.push(performance.now() - started);
+        }
+        samples.sort((a, b) => a - b);
+        expect(samples[2]).toBeLessThan(100);
+      }
+    );
   }
 );
 

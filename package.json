@@ -22,7 +22,7 @@
   "devEngines": {
     "runtime": {
       "name": "node",
-      "version": ">=22.12.0 <25.0.0",
+      "version": ">=22.12.0",
       "onFail": "error"
     }
   },
@@ -36,6 +36,7 @@
     "build:kernel": "bash scripts/build-kernel.sh",
     "cli": "npm run build && node dist/bin/codegraph.js",
     "test": "vitest run",
+    "test:perf": "vitest run __tests__/ui-server-api.test.ts --maxWorkers=1 --no-file-parallelism",
     "test:watch": "vitest",
     "test:eval": "vitest run __tests__/evaluation/",
     "eval": "npm run build && npx tsx __tests__/evaluation/runner.ts",
