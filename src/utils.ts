@@ -31,6 +31,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { gitCommonDir, gitWorktreeRoot } from './sync/worktree';
 
 // ============================================================
 // SECURITY UTILITIES
@@ -45,6 +46,8 @@ const SENSITIVE_PATHS = new Set([
   '/root', '/boot', '/lib', '/lib64', '/opt',
   'c:\\', 'c:\\windows', 'c:\\windows\\system32',
 ]);
+
+const SENSITIVE_HOME_DIRS = ['.ssh', '.gnupg', '.aws', '.config'];
 
 /**
  * Config "languages" whose nodes are pure key/value DATA lifted from a config
@@ -78,6 +81,32 @@ function isWithinDir(child: string, parent: string): boolean {
     p = p.toLowerCase();
   }
   return c === p || c.startsWith(p + path.sep);
+}
+
+/**
+ * Allow the narrow linked-worktree case used by agent harnesses that place
+ * task worktrees below ~/.config while keeping ordinary config directories
+ * blocked. The linked tree must point to a different checkout through Git's
+ * shared .git directory.
+ */
+function isVerifiedLinkedWorktreeUnderConfig(
+  resolved: string,
+  configPath: string,
+): boolean {
+  const worktreeRoot = gitWorktreeRoot(resolved);
+  const commonDir = gitCommonDir(resolved);
+  if (!worktreeRoot || !commonDir) return false;
+  if (!isWithinDir(resolved, worktreeRoot)) return false;
+  if (!isWithinDir(worktreeRoot, configPath)) return false;
+  if (path.basename(commonDir) !== '.git') return false;
+
+  try {
+    if (!fs.statSync(path.join(worktreeRoot, '.git')).isFile()) return false;
+  } catch {
+    return false;
+  }
+
+  return path.dirname(commonDir) !== worktreeRoot;
 }
 
 /**
@@ -165,10 +194,15 @@ export function validateProjectPath(dirPath: string): string | null {
 
   // Also block common sensitive home subdirectories
   const homeDir = require('os').homedir();
-  const sensitiveHomeDirs = ['.ssh', '.gnupg', '.aws', '.config'];
-  for (const dir of sensitiveHomeDirs) {
+  for (const dir of SENSITIVE_HOME_DIRS) {
     const sensitivePath = path.join(homeDir, dir);
     if (resolved === sensitivePath || resolved.startsWith(sensitivePath + path.sep)) {
+      if (
+        dir === '.config'
+        && isVerifiedLinkedWorktreeUnderConfig(resolved, sensitivePath)
+      ) {
+        continue;
+      }
       return `Refusing to operate on sensitive directory: ${resolved}`;
     }
   }

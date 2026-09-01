@@ -9,6 +9,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -312,6 +313,47 @@ describe('validateProjectPath — sensitive directory blocking', () => {
       expect(validateProjectPath(dir)).toBeNull();
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('allows a verified linked worktree under .config without allowing ordinary config repositories', () => {
+    const configRoot = path.join(os.homedir(), '.config');
+    fs.mkdirSync(configRoot, { recursive: true });
+    const configSandbox = fs.mkdtempSync(path.join(configRoot, 'codegraph-worktree-test-'));
+    const mainRepo = path.join(configSandbox, 'main-repo');
+    const worktree = path.join(configSandbox, 'superpowers', 'worktrees', 'project');
+    const ordinaryConfigRepo = path.join(configSandbox, 'ordinary-project');
+    fs.mkdirSync(mainRepo, { recursive: true });
+    fs.mkdirSync(ordinaryConfigRepo, { recursive: true });
+
+    try {
+      execFileSync('git', ['init', '-q'], { cwd: mainRepo, stdio: 'ignore' });
+      fs.writeFileSync(path.join(mainRepo, 'README.md'), '# main\n');
+      execFileSync('git', ['add', '.'], { cwd: mainRepo, stdio: 'ignore' });
+      execFileSync(
+        'git',
+        ['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '-qm', 'init'],
+        { cwd: mainRepo, stdio: 'ignore' },
+      );
+      fs.mkdirSync(path.dirname(worktree), { recursive: true });
+      execFileSync('git', ['worktree', 'add', '-q', '-b', 'feature', worktree], {
+        cwd: mainRepo,
+        stdio: 'ignore',
+      });
+      execFileSync('git', ['init', '-q'], { cwd: ordinaryConfigRepo, stdio: 'ignore' });
+
+      expect(validateProjectPath(worktree)).toBeNull();
+      expect(validateProjectPath(ordinaryConfigRepo)).toMatch(/sensitive directory/i);
+    } finally {
+      try {
+        execFileSync('git', ['worktree', 'remove', '--force', worktree], {
+          cwd: mainRepo,
+          stdio: 'ignore',
+        });
+      } catch {
+        // best-effort cleanup
+      }
+      cleanupTempDir(configSandbox);
     }
   });
 
