@@ -27,7 +27,7 @@ import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes } from './grammars';
-import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns } from '../project-config';
+import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
@@ -1442,10 +1442,46 @@ export class ExtractionOrchestrator {
    * hasn't run yet so single-file re-index paths can detect on the spot.
    */
   private detectedFrameworkNames: string[] | null = null;
+  /**
+   * Scope matcher for SCOPED syncs, memoized on the mtimes of the two root
+   * files it is derived from (`codegraph.json`, `.gitignore`). See
+   * {@link scopedSyncMatcher}.
+   */
+  private scopedMatcher: { key: string; matcher: ScopeIgnore } | null = null;
 
   constructor(rootDir: string, queries: QueryBuilder) {
     this.rootDir = rootDir;
     this.queries = queries;
+  }
+
+  /**
+   * The scope matcher a scoped sync applies to the paths it was handed — the
+   * same `buildScopeIgnore` the full scan uses, so an explicitly-passed path
+   * that is OUT of scope (a user `exclude` in `codegraph.json`, a `.gitignore`
+   * rule, a built-in default) is treated exactly as the full walk would treat
+   * it: absent, hence removed if tracked, never parsed (#1590).
+   *
+   * Memoized on the root config + root `.gitignore` mtimes: building the
+   * matcher runs embedded-repo discovery (`git ls-files`), which would defeat
+   * the scoped path's whole point (skipping O(repo) work) if paid per sync.
+   * Two `stat`s per sync while nothing changed. An embedded repo created
+   * between config edits joins the scoped matcher on the next full sync, the
+   * same lifecycle the watcher's own matcher already has.
+   */
+  private scopedSyncMatcher(): ScopeIgnore {
+    const key = [PROJECT_CONFIG_FILENAME, '.gitignore']
+      .map((name) => {
+        try {
+          return String(fs.statSync(path.join(this.rootDir, name)).mtimeMs);
+        } catch {
+          return '-';
+        }
+      })
+      .join('|');
+    if (this.scopedMatcher && this.scopedMatcher.key === key) return this.scopedMatcher.matcher;
+    const matcher = buildScopeIgnore(this.rootDir);
+    this.scopedMatcher = { key, matcher };
+    return matcher;
   }
 
   /**
@@ -2700,7 +2736,23 @@ export class ExtractionOrchestrator {
       // reads `filesChecked === 0 && durationMs === 0` as the
       // lock-unavailable signature (#449).
       const unique = [...new Set(scopedPaths)];
-      currentFiles = unique.filter((p) => fs.existsSync(path.join(this.rootDir, p)));
+      // A scoped path is "present" only if it exists AND is in scope — the
+      // same two gates the full walk applies (source extension, scope
+      // matcher). Without the scope gate a caller's stale view of scope
+      // leaked straight into the index: the watcher re-parsed a file the
+      // user had just excluded in `codegraph.json` while `codegraph sync`
+      // removed it (#1590). Out-of-scope paths fall out of `currentFiles`,
+      // so a tracked one takes the removal branch below, exactly as a full
+      // sync would treat it. (`include`-forced paths pass: ScopeIgnore
+      // applies the include precedence itself.)
+      const scope = this.scopedSyncMatcher();
+      const overrides = loadExtensionOverrides(this.rootDir);
+      currentFiles = unique.filter(
+        (p) =>
+          isSourceFile(p, overrides) &&
+          !scope.ignores(p) &&
+          fs.existsSync(path.join(this.rootDir, p))
+      );
       trackedFiles = [];
       for (const p of unique) {
         const rec = this.queries.getFileByPath(p);

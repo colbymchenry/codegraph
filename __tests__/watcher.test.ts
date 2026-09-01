@@ -545,6 +545,134 @@ describe('FileWatcher', () => {
     });
   });
 
+  describe('scope config refresh (#1590)', () => {
+    // The matcher used to be built once in start() and kept for the watcher's
+    // lifetime, so a `codegraph.json` written AFTER the daemon started was
+    // invisible to the live watcher while `codegraph sync` honoured it: the
+    // CLI removed a newly excluded file and the watcher re-added it.
+    it('a codegraph.json edit rebuilds the matcher and forces a full sync', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = newWatcher(syncFn, { debounceMs: 100 });
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      // Scope the project after the watcher is already running.
+      fs.mkdirSync(path.join(testDir, 'skipme'));
+      fs.writeFileSync(path.join(testDir, 'skipme', 'b.ts'), 'export const b = 1;\n');
+      fs.writeFileSync(path.join(testDir, 'codegraph.json'), JSON.stringify({ exclude: ['skipme/'] }));
+      __emitWatchEventForTests(testDir, 'codegraph.json');
+
+      // The config edit schedules a FULL sync (no scoped path list): only the
+      // scan-diff can find the files the new scope drops or admits.
+      await waitFor(() => syncFn.mock.calls.length > 0);
+      expect(syncFn.mock.calls.length).toBe(1);
+      expect(syncFn.mock.calls[0]![0]).toBeUndefined();
+      expect(watcher.getPendingFiles()).toEqual([]);
+      await new Promise((r) => setTimeout(r, 50)); // let runSync settle
+
+      // An edit inside the newly excluded tree is dropped by the LIVE matcher:
+      // not pending, and no sync scheduled for it.
+      __emitWatchEventForTests(testDir, 'skipme/b.ts');
+      expect(watcher.getPendingFiles().map((p) => p.path)).not.toContain('skipme/b.ts');
+      await new Promise((r) => setTimeout(r, 300)); // > debounce
+      expect(syncFn.mock.calls.length).toBe(1);
+
+      // In-scope edits still sync, scoped to the edited path as before.
+      __emitWatchEventForTests(testDir, 'src/index.ts');
+      await waitFor(() => syncFn.mock.calls.length > 1);
+      expect(syncFn.mock.calls[1]![0]).toEqual(['src/index.ts']);
+
+      watcher.stop();
+    });
+
+    it('a root .gitignore edit is a scope change too', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = newWatcher(syncFn, { debounceMs: 100 });
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      fs.mkdirSync(path.join(testDir, 'gen'));
+      fs.writeFileSync(path.join(testDir, 'gen', 'out.ts'), 'export const g = 1;\n');
+      fs.writeFileSync(path.join(testDir, '.gitignore'), 'gen/\n');
+      __emitWatchEventForTests(testDir, '.gitignore');
+
+      await waitFor(() => syncFn.mock.calls.length > 0);
+      expect(syncFn.mock.calls[0]![0]).toBeUndefined();
+      await new Promise((r) => setTimeout(r, 50));
+
+      __emitWatchEventForTests(testDir, 'gen/out.ts');
+      expect(watcher.getPendingFiles().map((p) => p.path)).not.toContain('gen/out.ts');
+      await new Promise((r) => setTimeout(r, 300));
+      expect(syncFn.mock.calls.length).toBe(1);
+
+      watcher.stop();
+    });
+
+    it('a nested .gitignore inside the scope forces a full sync', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = newWatcher(syncFn, { debounceMs: 100 });
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      fs.mkdirSync(path.join(testDir, 'sub'));
+      fs.writeFileSync(path.join(testDir, 'sub', '.gitignore'), 'build/\n');
+      __emitWatchEventForTests(testDir, 'sub/.gitignore');
+
+      await waitFor(() => syncFn.mock.calls.length > 0);
+      expect(syncFn.mock.calls[0]![0]).toBeUndefined();
+
+      watcher.stop();
+    });
+
+    it('a .gitignore under an ignored tree (npm install churn) schedules nothing', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = newWatcher(syncFn, { debounceMs: 100 });
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      fs.mkdirSync(path.join(testDir, 'node_modules', 'pkg'), { recursive: true });
+      fs.writeFileSync(path.join(testDir, 'node_modules', 'pkg', '.gitignore'), 'lib/\n');
+      __emitWatchEventForTests(testDir, 'node_modules/pkg/.gitignore');
+
+      await new Promise((r) => setTimeout(r, 300));
+      expect(syncFn).not.toHaveBeenCalled();
+
+      watcher.stop();
+    });
+
+    it('removing the exclude again readmits the tree', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = newWatcher(syncFn, { debounceMs: 100 });
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      fs.mkdirSync(path.join(testDir, 'skipme'));
+      fs.writeFileSync(path.join(testDir, 'skipme', 'b.ts'), 'export const b = 1;\n');
+      const cfg = path.join(testDir, 'codegraph.json');
+      fs.writeFileSync(cfg, JSON.stringify({ exclude: ['skipme/'] }));
+      __emitWatchEventForTests(testDir, 'codegraph.json');
+      await waitFor(() => syncFn.mock.calls.length > 0);
+      await new Promise((r) => setTimeout(r, 50));
+      __emitWatchEventForTests(testDir, 'skipme/b.ts');
+      expect(watcher.getPendingFiles().map((p) => p.path)).not.toContain('skipme/b.ts');
+
+      // Drop the exclude. The loader is mtime-keyed, so make sure the second
+      // write carries a distinct mtime even on a coarse-timestamp filesystem.
+      fs.writeFileSync(cfg, JSON.stringify({}));
+      const later = new Date(Date.now() + 5000);
+      fs.utimesSync(cfg, later, later);
+      __emitWatchEventForTests(testDir, 'codegraph.json');
+      await waitFor(() => syncFn.mock.calls.length > 1);
+      expect(syncFn.mock.calls[1]![0]).toBeUndefined();
+      await new Promise((r) => setTimeout(r, 50));
+
+      __emitWatchEventForTests(testDir, 'skipme/b.ts');
+      expect(watcher.getPendingFiles().map((p) => p.path)).toContain('skipme/b.ts');
+
+      watcher.stop();
+    });
+  });
+
   describe('pending file tracking (#403)', () => {
     it('should expose edited paths via getPendingFiles before sync fires', async () => {
       // Slow debounce — pending entries are visible until the debounce fires.

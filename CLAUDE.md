@@ -11,7 +11,8 @@ Distributed as `@colbymchenry/codegraph` on npm; same binary serves as installer
 ## Build, Test, Run
 
 ```bash
-npm run build           # tsc + copy schema.sql and *.wasm into dist/; chmods dist/bin/codegraph.js
+npm run build           # tsc + copy schema.sql and *.wasm + build the viewer into dist/; chmods dist/bin/codegraph.js
+npm run build:lib       # the viewer's components as @colbymchenry/codegraph-ui (ui/dist) — NOT part of `build`
 npm run dev             # tsc --watch
 npm run clean           # rm -rf dist
 
@@ -28,6 +29,29 @@ npx vitest run __tests__/extraction.test.ts -t "TypeScript"
 ```
 
 `copy-assets` (called from `build`) copies `src/db/schema.sql` and all `src/extraction/wasm/*.wasm` files into `dist/`. **Any new SQL or grammar wasm must be copied or it won't ship.**
+
+One other build step writes into `dist/` and is subject to the same rule: `build:ui` builds the
+browser viewer into `dist/viewer/` (never `dist/ui/` — that's the terminal ui).
+`scripts/check-ui-build.mjs` asserts both `dist/viewer/` and the copied grammars in
+`dist/extraction/wasm/` after every build and inside every release archive — the viewer's syntax
+highlighting reads a file with the same grammar the engine indexed it with, so a missing wasm is an
+unhighlighted screen as well as an extraction gap.
+
+`npm run build:lib` is separate and does NOT run as part of `npm run build`: it compiles the same
+`ui/src` tree a second way, with `svelte-package`, into `ui/dist` — the `@colbymchenry/codegraph-ui`
+component library the Pro app imports (task CG-61). `scripts/check-ui-package.mjs` then prunes the
+standalone app's shell out of it, resolves the extensionless import specifiers `svelte-package`
+leaves behind, and asserts the seam: nothing outside `lib/adapter.js` may reach the network. The
+package is **prepared, not published** — `ui/package.json` carries `"private": true` deliberately,
+and `scripts/pack-npm.sh` only packs a tarball when `CODEGRAPH_PACK_UI=1`.
+
+Tests run as **two vitest projects** (`vitest.workspace.mts`): `engine` (node) and `ui` (jsdom, the
+Svelte plugin, `resolve.conditions: ['browser']`) for the single `__tests__/ui-package.test.ts`.
+`npm test` still runs both. The split is not cosmetic — `browser` is a package-resolution
+condition, and applied globally it hands the engine's suites the browser builds of
+`web-tree-sitter` and friends. The root config (`vitest.config.mts`, `.mts` because the plugin is
+ESM-only and the repo is CJS) is the shared base; note that a workspace project **concatenates**
+the base's `include` with its own, which is why the `ui` project does not `extends` it.
 
 Node engines: `>=20.0.0 <25.0.0`. There is a hard exit on Node 25.x and below 20 (see `src/bin/node-version-check.ts`).
 
@@ -52,8 +76,9 @@ The public API surface is `src/index.ts` — the `CodeGraph` class wires all the
 - `src/index.ts` — `CodeGraph` class: `init`/`open`/`close`, `indexAll`, `sync`, `searchNodes`, `getCallers`/`getCallees`, `getImpactRadius`, `buildContext`, `watch`/`unwatch`.
 - `src/db/` — `DatabaseConnection`, `QueryBuilder` (prepared statements), `schema.sql`, `sqlite-adapter.ts`. Backed by Node's built-in **`node:sqlite`** (`DatabaseSync`) — real SQLite with WAL + FTS5, exposed through a thin better-sqlite3-shaped adapter. The bundled runtime always ships Node ≥22.5, so `node:sqlite` is always available: **no native build step and no wasm fallback**. (Running from source needs Node ≥22.5.) `codegraph status` reports the live backend (`node-sqlite`, the sole backend).
 - `src/extraction/` — `ExtractionOrchestrator`, tree-sitter wrappers, per-language extractors under `languages/` (one file per language), plus standalone extractors for non-tree-sitter formats (`svelte-extractor.ts`, `vue-extractor.ts`, `liquid-extractor.ts`, `dfm-extractor.ts` for Delphi). `parse-worker.ts` runs heavy parsing off the main thread.
-- `src/resolution/` — `ReferenceResolver` orchestrates `import-resolver.ts` (with `path-aliases.ts` for tsconfig path aliases + cargo workspace member globs), `name-matcher.ts`, and `frameworks/` (Express, Laravel, Rails, FastAPI, Django, Flask, Spring, Gin, Axum, ASP.NET, Vapor, React Router, SvelteKit, Vue/Nuxt, Cargo workspaces). Frameworks emit `route` nodes and `references` edges.
-- `src/graph/` — `GraphTraverser` (BFS/DFS, impact radius, path finding) and `GraphQueryManager` (high-level queries).
+- `src/resolution/` — `ReferenceResolver` orchestrates `import-resolver.ts` (with `path-aliases.ts` for tsconfig path aliases + cargo workspace member globs), `name-matcher.ts`, and `frameworks/` (Express, Laravel, Rails, FastAPI, Django, Flask, Spring, Gin, Axum, ASP.NET, Vapor, React Router, Next.js — `nextjs.ts`: pages and `route.ts` handlers from files, `router.push` / `redirect` / `NextResponse.redirect` as `navigates` edges, with `next-router-synthesizer.ts` for `<Link href>` — Expo Router, SvelteKit, Vue/Nuxt, Cargo workspaces). Frameworks emit `route` nodes and `references` edges. `callback-synthesizer.ts` holds the whole-graph synthesis passes (`SYNTH_PASSES`, merged in registry order — first-seen wins a duplicate pair) with the language gates; `tier-synthesizer.ts` is the cross-tier pass (a client's literal `fetch`/`axios` path onto its own route, a queue job onto its consumer, a bus / socket event onto its handler — `channel`, `tier`, `registeredAt` on every edge; registered before the in-process emitter pass so its more specific edge wins); `synth-utils.ts` has the helpers they share (`enclosingFn`, `enclosingValue`, `makeLineAt`). Express's `postExtract` composes `app.use('/prefix', router)` mounts onto a mounted file's route names, idempotently (the original path stays in `qualifiedName`).
+- `src/graph/` — `GraphTraverser` (BFS/DFS, impact radius, path finding) and `GraphQueryManager` (high-level queries), plus the shared query-time derivations more than one surface renders: `named-symbol-flow.ts` (the one path finder, behind `codegraph_explore`'s Flow section and the viewer's Flow strip), `dynamic-boundary-report.ts` (where the graph stops), `type-hierarchy.ts` (ancestors/subtypes and the implementation count explore prints and the viewer draws),
+  `dead-code.ts` (unreferenced symbols, and every reason a candidate is NOT claimed). A derivation that two callers render must live here, not in `ToolHandler` — two derivations eventually disagree.
 - `src/context/` — `ContextBuilder` + formatter for markdown/JSON output.
 - `src/search/` — full-text query parser and helpers for FTS5.
 - `src/sync/` — `FileWatcher` (native FSEvents/inotify/RDCW) with debounce + filter, and git-hook helpers.
@@ -61,6 +86,7 @@ The public API surface is `src/index.ts` — the `CodeGraph` class wires all the
 - `src/installer/` — see below.
 - `src/bin/codegraph.ts` — CLI (commander). Subcommands: `install`, `init`, `uninit`, `index`, `sync`, `status`, `query`, `files`, `context`, `affected`, `serve --mcp`.
 - `src/ui/` — terminal UI (shimmer progress, worker).
+- `src/ui-server/` — the `codegraph ui` browser viewer's read-only JSON API (`api/`: one module per endpoint — `node`, `flow`, `map`, `screens`, `steps`, `deadcode`, `trails`…) and static server; the Svelte viewer itself lives in `ui/` (see `docs/design/codegraph-ui-design-spec.md`). `api/screens.ts` (the app as screens and transitions) and `api/steps.ts` (what happens from a screen, an endpoint or a symbol, as typed steps — screens, handlers, native bridge calls and events, store actions, calls that leave the index) share one fold: everything between two boxes is `via`, and the branch guards along it join into `when` (`graph/branch-guards.ts`, read at request time). `api/program.ts` is the SECOND reading of that same walk (spec §3.13.1): the anchor's body as a block tree — items in source order, a fork wherever two sites are arms of one decision, a helper drawn in place, an arm that answers or leaves ending there — which `ui/src/lib/program-model.ts` turns into the canvas's graph of what happens NEXT (a line means "and then", a row down is one more thing already done). It is pure over the records `steps.ts` keeps while it walks (`ProgramSite`), so the rail and the tree can never hold different steps; what makes the fold possible is that a guard names the DECISION it belongs to (`BranchGuard.branch`), not only its own words. Two helpers sit beside them: `api/route-roots.ts` (where a route's code starts — the handler a resolver named, the page a screen file exports, or the route itself for an inline handler; one rule for every framework) and `api/effects.ts` (the curated table of calls that leave the index — database / response / queue / email / payments / cache / auth / process / network / storage / device / telemetry — matched on the call **as written**, per language family, plus the model / read-write and the response status). `graph/branch-guards.ts` reads, from one cached tree per file, the conditions a site runs under (each with the branching construct it belongs to and how its arm leaves), the loops it is written inside, what it passes, the call as written (the index keeps only the last segment of a deep member chain), the decorators on a definition and the declared types of a class's members — for JS/TS, Swift, Python, Java, Kotlin, C#, Go and C; a language without rules yields nothing, never a wrong label. `steps.ts`'s `crossing()` reads an edge's `tier` / `channel` marker before the languages, so a synthesized cross-tier hop between two TS files draws as a bridge (an endpoint reached over HTTP — a boundary like another screen, entered with `through=1`) or an event (a job, an event, a message arriving); a Next server action is marked at request time from its `'use server'` directive (`api/when.ts`'s `directive`).
 
 ### NodeKind / EdgeKind
 
@@ -127,7 +153,7 @@ Two functions in `src/mcp/tools.ts` scale explore with indexed file count. This 
 
 ### Dynamic-dispatch coverage — the flow must EXIST in the graph end-to-end
 
-Static tree-sitter extraction misses computed/indirect calls, so flows break at dynamic dispatch and the agent reads to reconstruct them. Synthesizers/resolvers bridge these so `codegraph_explore` connects them end-to-end (`src/resolution/callback-synthesizer.ts`, `src/resolution/frameworks/`). Channels today: callback/observer, EventEmitter, **React re-render** (`setState`→`render`), **JSX child** (`render`→child component), django ORM descriptor. All synthesized edges are `provenance:'heuristic'` with `metadata.synthesizedBy` + `registeredAt` (the wiring site), surfaced inline in `codegraph_explore`'s Flow section and the `codegraph_node` trail.
+Static tree-sitter extraction misses computed/indirect calls, so flows break at dynamic dispatch and the agent reads to reconstruct them. Synthesizers/resolvers bridge these so `codegraph_explore` connects them end-to-end (`src/resolution/callback-synthesizer.ts`, `src/resolution/frameworks/`). Channels today: callback/observer, EventEmitter, **React re-render** (`setState`→`render`), **JSX child** (`render`→child component), **React Native native→JS events** (`sendEvent(withName:)` / JVM `emit` → the `addListener` handler, named or inline, `rn-event-channel`), django ORM descriptor. The JS→native direction is a *resolver* (`frameworks/react-native.ts`: `RCT_EXPORT_METHOD`, `RCT_EXTERN_MODULE` Swift shims, TurboModules), which trusts receiver evidence — an alias bound to `NativeModules.X` — over the import resolver. All synthesized edges are `provenance:'heuristic'` with `metadata.synthesizedBy` + `registeredAt` (the wiring site), surfaced inline in `codegraph_explore`'s Flow section and the `codegraph_node` trail.
 
 **Principle: partial coverage is WORSE than none.** Bridging one boundary but not the next reveals a hop the agent then drills + reads to finish. Measured on excalidraw: react-render alone *raised* reads to 5–7; only completing the flow (adding the jsx-child hop) dropped it to 0–1. **Always close the flow end-to-end and re-measure** — never ship a half-bridged flow.
 
@@ -217,6 +243,7 @@ Formatting rules for any entry (anywhere — `[Unreleased]` or otherwise):
 3. **Strip the internals.** No internal file paths (`src/...`), no internal symbol / function / class names, no benchmark numbers / percentages / node-or-edge counts. **Keep:** language & framework names (Go, Spring, NestJS, …), things a user types or sets (`codegraph install`, `codegraph_explore`, the `CODEGRAPH_*` env vars), agent / IDE names (Claude Code, Cursor, opencode, Kiro, …), and a brief `Thanks @user` when a contributor is credited.
 4. Issue / PR references in entries are by number (`(#403)` etc.); the GitHub renderer auto-links them in the published release notes.
 5. **Don't add a `[X.Y.Z]: https://...` link reference yourself** — `prepare-release.mjs` appends it automatically when it promotes the version (idempotent: a re-run is a no-op if it already exists).
+6. **Every release opens with a `### Highlights` block — the only part most people read.** At most ~8 one-line bullets, in plain language for someone who doesn't read code, ordered by what a typical user notices first (new agent/IDE support and setup changes, then answer quality, then reliability), plus a one-sentence upgrade note when a re-index is needed. Write or refresh it in `[Unreleased]` when a release is being prepared — not per PR — and keep the detailed `### New Features` / `### Fixes` entries below it. When `### Fixes` grows past ~15 entries, group them under `####` sub-headings (`Better answers from codegraph_explore`, `Finding your project, live updates, and the CLI`, `Indexing reliability and disk usage`, `Language and framework accuracy`) so a skimmer can find their area.
 
 Multi-word headings like `### New Features` are safe on the normal release path: `prepare-release.mjs` **Case A** moves the whole `[Unreleased]` body verbatim into `[X.Y.Z]`. (Only its rarely-used **Case B** *merge* splits sub-sections with a single-word `^### (\w+)$` regex that wouldn't match them — and Case B fires only if a `[X.Y.Z]` block was pre-created, which rule above already forbids.)
 
@@ -262,6 +289,7 @@ publish actions on shared state. Write the files, hand the user the commands.
 
 - The `0.7.x` line is in active multi-agent rollout. Any change to `src/installer/` (especially `targets/`) needs corresponding test coverage and a CHANGELOG entry — installer regressions break every new install silently.
 - When changing what the MCP tools do or how agents should use them, edit `src/mcp/server-instructions.ts` — it is the **single source of truth** for agent-facing tool guidance (issue #529). The installer no longer writes a duplicate instructions block into `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` / `.cursor/rules/codegraph.mdc` / Kiro steering, so there's nothing to keep in sync anymore. (The repo's own checked-in `.cursor/rules/codegraph.mdc` is dogfooding config — update it too if you use Cursor on this repo, but it ships nowhere.)
+- **Before adding or extending a router, a web framework, or a language's `WHEN` rules, read `docs/design/framework-coverage.md`.** It is the standing answer to "what is supported and what is left" across the three axes (route nodes → Entry points, `navigates` edges → Screens, branch-guard rules → the `WHEN` labels), with what each remaining item needs, the traps that have already cost debugging time, and the queries to re-verify it. Update it in the same change that moves a row.
 - CodeGraph provides **code context**, not product requirements. For new features, ask the user about UX, edge cases, and acceptance criteria — the graph won't tell you.
 - **When the user references issues, PR comments, or external reports, anchor them to a date and version before drawing conclusions.** Check the comment's `createdAt` against:
   - The **last released version** — `grep -m1 '^## \[' CHANGELOG.md` shows the top-of-file version (older releases follow). A comment dated before the latest `## [X.Y.Z] - YYYY-MM-DD` is reacting to *released* state — work that's only on `main` or on an unmerged branch doesn't apply.

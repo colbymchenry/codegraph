@@ -53,6 +53,7 @@ Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 - [Language Support](#language-support)
 - [Why CodeGraph?](#why-codegraph)
 - [Key Features](#key-features)
+- [Read your graph in the browser](#read-your-graph-in-the-browser)
 - [Framework-aware Routes](#framework-aware-routes)
 - [Mixed iOS / React Native / Expo bridging](#mixed-ios--react-native--expo-bridging)
 - [Quick Start](#quick-start)
@@ -125,6 +126,16 @@ codegraph init
 ### 4. No more syncing!
 
 Auto-sync is enabled by default. CodeGraph watches the project and updates the graph on every file change — while your agent edits code, or you add, modify, or delete files. **The index is never stale, and there is nothing to re-run.**
+
+### 5. See what your agent sees
+
+```bash
+codegraph ui
+```
+
+Opens the graph in your browser at `http://127.0.0.1:4747` — callers on the left, the symbol's
+source in the middle, what it calls on the right. See
+[Read your graph in the browser](#read-your-graph-in-the-browser).
 
 ### Uninstall
 
@@ -312,6 +323,55 @@ The handful of cases where manual `codegraph sync` makes sense: the watcher is d
 
 ---
 
+## Read your graph in the browser
+
+`codegraph ui` opens a viewer for a project you have already indexed. It is the same graph
+your agent reads, on screen: pick a symbol and you see **who calls it on the left**, its
+**verbatim source in the middle**, and **what it calls on the right — each one drawn level
+with the line that calls it**.
+
+```bash
+codegraph init          # once per project, if you haven't already
+codegraph ui            # opens http://127.0.0.1:4747 in your browser
+```
+
+<img src="https://raw.githubusercontent.com/colbymchenry/codegraph/main/assets/codegraph-ui-symbol-view.png?v=1" alt="The CodeGraph viewer: callers on the left, the symbol's source in the middle with a marker on every calling line, and the symbols it calls on the right, each level with its call site" width="100%">
+
+What you get on that screen:
+
+- **Callers, grouped by file**, each with the exact line it calls from — click one to jump there. Test callers fold into a single line so real callers stay in view.
+- **The real source**, syntax-highlighted, with a marker in the gutter on every line that calls something.
+- **Callees on the right**, positioned at the line that calls them, joined by a hairline. Hover either end and both light up.
+- **Blast radius** — direct dependents, everything within three hops, and how many files and test files that touches.
+- **Honest edges.** A guess CodeGraph isn't sure about is folded away as "uncertain" rather than shown as fact, and a symbol no test reaches within three hops says so.
+- **Search** (`/` or ⌘K) over every symbol and file, and a **trail** of the path you walked that lives in the URL, so you can send someone the exact route you took. Typing a name also surfaces matching **entry points** under their own heading, so a URL comes back with the symbol that serves it rather than on its own.
+- **Entry points** — the first screen on a codebase you have never opened, and the answer to "where does anything start". Every route with its handler and the line it is registered on, grouped by router file and named with the framework it was detected from; the files that run something at import time (a CLI, a worker entry, a script); the tests, ranked by how much of the project each one exercises; and the symbols the most code depends on. Nothing is guessed from a filename — it is all read out of the graph, and a project with no routes says so instead of drawing an empty list. Any row that names a symbol can start a **flow**: pick a second symbol and you get the path between them, so "how does `POST /v1/payroll/cycles/{cycleID}/run` reach the database" is two clicks.
+- Click any file path to open the **file view**: everything that file depends on, its outline in source order, and everything that depends on it. Its **Source** tab shows the whole file with the same gutter markers, plus an arc in the left margin for every call that stays inside the file — the one place a file's internal call structure is legible, because source order does the layout. A 6,800-line file scrolls at full speed.
+- **Ask for a path.** Type "how does execute reach getFile" (or `execute -> getFile`) and you get the **flow**: one card per hop, each opened at the line that makes the next call. Hops that no static edge records — a callback, an interface dispatch, a React re-render — are drawn dashed and name where the handler was wired. "Read as flow" turns a walk you did by hand into the same strip.
+- **And when the path runs out, it says where.** A flow that doesn't get there ends in "Where the graph stops": the kind of dispatch that ended it (a computed member call, a `getattr`, a reflective invoke, a message bus), its line, the key when the source spells one out, and a shortlist of what could be on the other side — plus the name-only matches CodeGraph refused to follow, with their confidence. Nothing is guessed, and a flow that does connect never shows it.
+- **What happens from here.** On an app with screens, the **Screens** tab draws one box per screen and an arrow for every way of getting from one to another, each labelled with the condition under which it happens. The **Steps** tab does the same for what happens *on* a screen: pick one (or any symbol) and you get its handlers, the calls that cross into native code, the native events that come back, the store actions it writes and the requests that leave the app, as typed steps with the plumbing between them folded into the arrows — the whole capture-to-upload flow of a React Native app on one picture, with every step a click from the next anchor or a Flow strip.
+- **The map**: the whole project at module granularity, laid out from the graph with dependencies pointing down — never drawn by hand, and the same picture every time. Cycles are listed rather than straightened away.
+- **Take the picture with you.** A flow strip or a map can be copied as an image straight into a pull-request comment, or saved as an SVG for a README — always in the light theme, whichever one you are reading in, with a caption saying what the picture is. The SVG is real text, so it stays sharp at any size and the names in it are selectable.
+- **Keep a walk.** Press **Save trail** on the trail bar, name it, and the path is kept — listed on the empty screen and on Entry points, above the suggestions, and reopened at the symbol you left with the whole walk restored. Steps are remembered by what they are, not where they sat, so a saved trail survives editing the code it describes; when something does move it says which step moved, which was renamed away, and how much of the walk still opens. Trails are plain JSON under `.codegraph/ui/trails/` (git already ignores it), and **Export** hands you the file if you would rather commit one.
+- **It keeps up.** Save a file and a banner appears within about a third of a second saying the index hasn't caught up yet — and the screen switches to the file's current source rather than a body sliced at lines it no longer has. When something re-indexes, whatever is on screen refetches itself and says "Index updated · reloaded". A symbol that moved because you added a line above it is followed, not lost. Nothing polls: the viewer watches, and if it loses touch with the server it retries a few times and then says so instead of hammering it.
+
+Options: `--port <n>` to pin a port (without it the viewer takes 4747, or the next free one),
+`--no-open` to just print the URL for a headless box or an SSH session, and
+`CODEGRAPH_BROWSER=<command>` to choose the browser (`CODEGRAPH_BROWSER=none` never opens one).
+`codegraph web` is an alias for the same command.
+
+**Privacy:** the viewer listens on `127.0.0.1` only, so nothing on your network can reach it,
+and requests claiming to come from any other host are refused. It opens an index that already
+exists, never creates one, and never changes your graph or a line of your code. The one thing
+it writes is a trail you asked it to save, into `.codegraph/ui/trails/`; `codegraph ui
+--read-only` refuses even that. **It sends nothing anywhere**: no code, no paths, no analytics.
+There is no account and no cloud in this feature at all.
+
+The viewer reads an index that already exists — it never creates one — so `codegraph init` has
+to have run first. `codegraph ui /path/to/project` points it at a project you indexed elsewhere.
+
+---
+
 ## Framework-aware Routes
 
 CodeGraph detects web-framework routing files and emits `route` nodes linked by `references` edges to their handler classes or functions. Querying callers of a view/controller now surfaces the URL pattern that binds it.
@@ -332,9 +392,22 @@ CodeGraph detects web-framework routing files and emits `route` nodes linked by 
 | **Axum / actix / Rocket** | `.route("/x", get(handler))` |
 | **ASP.NET** | `[HttpGet("/x")]` attributes on action methods |
 | **Vapor** | `app.get("x", use: handler)` |
-| **React Router** / **SvelteKit** | Route component nodes |
-| **Vue Router** / **Nuxt** | `pages/` file-based routes, `server/api/` endpoints, route middleware |
 | **Astro** | `src/pages/` file-based routes (`.astro` pages + `.ts` endpoints, `[param]`/`[...rest]` syntax) |
+
+### Routers — routes *and* the navigation between them
+
+These frameworks additionally emit **`navigates`** edges: the function that sends a user somewhere is linked to the screen it names, so "where does tapping this go" is one hop in the graph rather than a search. Each reads a literal destination — a computed one, or a path no route serves, is left unresolved rather than guessed — and a link written in markup is marked as inferred.
+
+| Router | Routes from | Navigation from |
+|---|---|---|
+| **Expo Router** | Every screen file under `app/` (`app/item/[id].tsx` → `/item/[id]`, groups stripped), bound to its default-export component | `router.push` / `replace` / `navigate`, template hrefs, `{ pathname }` objects, and a helper's returned href |
+| **Next.js** | App Router `app/**/page.tsx` and Pages Router pages (`(group)` stripped, `[slug]` → `:slug`); `app/api/**/route.ts` exports and `pages/api/*` are endpoints, not screens | `router.push` / `replace` / `prefetch`, `redirect()` / `permanentRedirect()` in a server action or page, `NextResponse.redirect(new URL(…))` in middleware, `<Link href>` and internal `<a href>` |
+| **React Router** | `<Route path component/element>` (v5 and v6) and `createBrowserRouter([{ path, element }])` | `history.push` / `replace`, `useNavigate`'s `navigate`, a loader's `redirect`, `<Link to>` / `<NavLink to>` / `<Navigate to>` / react-router-bootstrap's `<LinkContainer to>` |
+| **TanStack Router** | `createFileRoute('/posts/$postId')` (file-based) and `createRoute({ path, getParentRoute })` composed up its parent chain (code-based); `_pathless` segments, `(group)` folders, `__root` and `<Outlet/>` layouts are not addresses | `navigate({ to })`, a thrown `redirect({ to })`, `<Link to>` / `<Navigate to>` — where `to` is the route PATTERN and the values ride beside it in `params` |
+| **Vue Router** / **Nuxt** | `createRouter({ routes: [...] })` with the view each entry names, plus Nuxt `pages/` file-based routes, `server/api/` endpoints and route middleware | `router.push` / `replace`, `$router.push`, Nuxt's `navigateTo`, `<router-link>` / `<RouterLink>` / `<NuxtLink>` — **by route name** (`push({ name: 'profile' })`) as well as by path |
+| **SvelteKit** | `src/routes/**/+page.svelte` (`[slug]` → `:slug`, `[[opt]]` → `:opt?`), joined to the `+page.server.js` beside it so a loader's guard belongs to its page | `goto('/x')`, `redirect(status, '/x')` from a load or form action, and the plain `<a href>` that is a link in a SvelteKit app |
+
+In a repository holding several apps, each app's routes are matched only against navigation written inside that app.
 
 ---
 
@@ -388,6 +461,7 @@ The installer **wires up your agents only — it does not index your code.** Aft
 
 ```bash
 codegraph install --yes                              # auto-detect agents, install global
+codegraph install --yes --init                       # same, then build the current project's index (one-shot bootstrap)
 codegraph install --target=cursor,claude --yes       # explicit target list
 codegraph install --target=auto --location=local     # detected agents, project-local
 codegraph install --target=copilot-vscode,copilot-cli,copilot-jetbrains --yes  # GitHub Copilot everywhere
@@ -400,6 +474,7 @@ codegraph install --print-config copilot-vscode      # same, for Copilot in VS C
 | `--target` | `auto`, `all`, `none`, or csv (`claude,cursor,...`) | prompt |
 | `--location` | `global`, `local` | prompt |
 | `--yes` | (boolean) | prompt every step |
+| `--init` | (boolean) run `codegraph init` in the current directory after wiring agents | — |
 | `--no-permissions` | (boolean) skip Claude auto-allow list | permissions on |
 | `--print-config <id>` | dump snippet for one agent and exit | — |
 
@@ -414,7 +489,7 @@ cd your-project
 codegraph init
 ```
 
-Builds the per-project knowledge graph index, which then auto-syncs on every file change. A single global `codegraph install` works in every project you open — no need to re-run the installer per project.
+Builds the per-project knowledge graph index, which then auto-syncs on every file change. A single global `codegraph install` works in every project you open — no need to re-run the installer per project. Add `--yes` to skip every prompt (scripts / CI / container bootstraps).
 
 That's it — your agent will use CodeGraph tools automatically when a `.codegraph/` directory exists.
 
@@ -514,6 +589,7 @@ codegraph uninit [path]           # Remove CodeGraph from a project (--force to 
 codegraph index [path]            # Full index (--force to re-index, --quiet for less output)
 codegraph sync [path]             # Incremental update
 codegraph status [path]           # Show statistics
+codegraph ui [path]               # Open the browser viewer for an indexed project (alias: web; --port, --no-open, --read-only)
 codegraph unlock [path]           # Remove a stale lock file that's blocking indexing
 codegraph query <search>          # Search symbols (--kind, --limit, --json)
 codegraph explore <query>         # Relevant symbols' source + call paths in one shot (same output as the codegraph_explore MCP tool)
@@ -873,6 +949,8 @@ Framework routing is validated the same way, on a canonical app per framework: E
 **Missing symbols** — The MCP server auto-syncs on save (wait a couple seconds). Run `codegraph sync` manually if needed. Check that the file's language is supported and isn't inside a `.gitignore`d or default-excluded directory (e.g. `node_modules`, `dist`).
 
 **Sharing one checkout between Windows and WSL** — Don't point both at the same `.codegraph/`: the background-server lock and the SQLite index are tied to the OS that wrote them, and SQLite locking across the WSL2/Windows filesystem boundary is unreliable. Give each side its own index in the same tree by setting `CODEGRAPH_DIR` to a distinct name on one of them — e.g. `CODEGRAPH_DIR=.codegraph-win` on Windows, leaving WSL on the default `.codegraph`. CodeGraph skips any sibling `.codegraph-*` directory when indexing and watching, so the two never trip over each other.
+
+**Very large repositories (hundreds of thousands of files), or a large `.codegraph/codegraph.db-wal` file** — The `-wal` file is SQLite's write-ahead log: writes waiting to be folded into `codegraph.db`. While a big index is being built, CodeGraph lets it grow in proportion to the index (soft threshold = the larger of 256 MB and a quarter of the index size, up to 2 GB) before folding it back, because folding too often is what made large indexes slow on ordinary disks. At rest it is trimmed to 64 MB, and a leftover from a killed session is folded and trimmed the next time the project opens — the index itself has no size limit. Two environment variables tune this: `CODEGRAPH_WAL_VALVE_MB` (the soft threshold during indexing) and `CODEGRAPH_WAL_HEAL_MB` (the resting size and the trim threshold). `CODEGRAPH_WAL_VALVE_DEBUG=1` prints every decision to stderr.
 
 ## License
 

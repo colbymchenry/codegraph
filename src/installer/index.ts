@@ -285,9 +285,10 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
   // index a surprise directory (e.g. a shell sitting in $HOME). Same next step
   // regardless of global/local scope.
   clack.note(
-    location === 'local'
+    (location === 'local'
       ? 'codegraph init        # build this project’s graph (one time; auto-syncs after)'
-      : 'cd <your-project>\ncodegraph init        # build a project’s graph (one time; auto-syncs after)',
+      : 'cd <your-project>\ncodegraph init        # build a project’s graph (one time; auto-syncs after)') +
+      '\n# (codegraph install --init does both steps in one command)',
     'Next: index a project',
   );
 

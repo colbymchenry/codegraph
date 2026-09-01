@@ -296,7 +296,7 @@ export class GraphTraverser {
     // caller of the class. Without it, `callers <Class>` surfaced only the
     // importing file (via `imports`) and missed every construction site —
     // the opposite of "what breaks if I change this class?" (#774).
-    const incomingEdges = this.queries.getIncomingEdges(nodeId, ['calls', 'references', 'imports', 'instantiates']);
+    const incomingEdges = this.queries.getIncomingEdges(nodeId, ['calls', 'references', 'imports', 'instantiates', 'navigates']);
     if (incomingEdges.length === 0) return;
 
     // Batch-fetch all caller nodes in one round-trip instead of one
@@ -351,7 +351,7 @@ export class GraphTraverser {
     // (`Foo(...)` / `new Foo()`) has that class as a callee, so callers and
     // callees stay inverses of each other and `trace` can cross the
     // instantiation boundary (function → class → its methods) (#774).
-    const outgoingEdges = this.queries.getOutgoingEdges(nodeId, ['calls', 'references', 'imports', 'instantiates']);
+    const outgoingEdges = this.queries.getOutgoingEdges(nodeId, ['calls', 'references', 'imports', 'instantiates', 'navigates']);
     if (outgoingEdges.length === 0) return;
 
     // Batch-fetch callee nodes (was N+1 — see getCallersRecursive note).

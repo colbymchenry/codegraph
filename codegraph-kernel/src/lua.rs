@@ -418,6 +418,7 @@ impl<'t> Walker<'t> {
     // --- the main walk (visitNode, tree-sitter.ts:936-1303) ---------------
 
     fn visit(&mut self, node: Node<'t>) {
+        stack_guard!();
         let kind = node.kind();
 
         // The visitNode hook (lua.ts:105-151) runs FIRST.
@@ -487,6 +488,7 @@ impl<'t> Walker<'t> {
     // --- extractFunction / extractMethod (1517 / 1737) --------------------
 
     fn extract_function(&mut self, node: Node<'t>) {
+        stack_guard!();
         // :1522 receiver short-circuit IS the method routing.
         if let Some(receiver) = self.receiver_type(node) {
             let receiver = receiver.to_string();
@@ -522,6 +524,7 @@ impl<'t> Walker<'t> {
     }
 
     fn extract_method(&mut self, node: Node<'t>, receiver: String) {
+        stack_guard!();
         let name = self.extract_name(node);
         let docstring = preceding_docstring(node, self.src);
         let signature = self.signature_of(node);
@@ -654,6 +657,7 @@ impl<'t> Walker<'t> {
     // --- visitFunctionBody (5129-5286) — the hook-free body walk ----------
 
     fn visit_body(&mut self, node: Node<'t>) {
+        stack_guard!();
         // maybeCaptureFnRefs (5137) fires in the body walker too.
         self.maybe_capture_fn_refs(node);
 
@@ -750,6 +754,7 @@ impl<'t> Walker<'t> {
     /// normalizeValue with LUA_SPEC's one transparent layer (expression_list
     /// fans out to named children).
     fn normalize_fn_ref_value(&mut self, v: Node<'t>, from: u32, depth: u32) {
+        stack_guard!();
         if depth > 4 {
             return;
         }
@@ -780,6 +785,7 @@ impl<'t> Walker<'t> {
     }
 
     fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32) {
+        stack_guard!();
         if depth > 12 {
             return;
         }

@@ -65,6 +65,18 @@ And one of four events:
 Usage is **aggregated locally into daily totals** before anything is sent — there is no
 per-call event stream, and nothing is sent in real time.
 
+### The browser viewer sends nothing
+
+`codegraph ui` (the local viewer) has no telemetry of its own. The server it starts
+makes no outbound connections at all, and the page in your browser talks only to that
+server on `127.0.0.1`: nothing about the symbols you open, the searches you type, or the
+path you walk leaves your machine, and none of it is recorded anywhere. The only thing
+telemetry ever learns about the viewer is what it learns about every command: that a
+command named `ui` was run, once, on a day, in the daily `usage_rollup` above. The
+command never triggers a send of its own, and `codegraph telemetry off`,
+`CODEGRAPH_TELEMETRY=0`, or `DO_NOT_TRACK=1` switches off even that count, as it does
+everything else on this page.
+
 ## What is never collected
 
 - **No source code.** No file paths, file names, directory names, repository names or

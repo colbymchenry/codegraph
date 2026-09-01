@@ -851,4 +851,33 @@ describe('Scoped sync parity (#watcher-scoped)', () => {
     // b.ts untouched and still present
     expect(cg.searchNodes('beta').length).toBeGreaterThan(0);
   });
+
+  it('a scoped path that codegraph.json now excludes is removed, never re-parsed (#1590)', async () => {
+    // The daemon's watcher hands sync the exact edited path. If the project's
+    // scope changed underneath it, that path must be treated the way the full
+    // scan treats it — out of scope, hence gone — never parsed on trust.
+    const cfg = path.join(testDir, 'codegraph.json');
+    fs.writeFileSync(cfg, JSON.stringify({ exclude: ['src/b.ts'] }));
+    fs.writeFileSync(path.join(testDir, 'src', 'b.ts'), `export function beta() { return 2; }\nexport function gamma() { return 3; }`);
+    const scoped = await cg.sync({ paths: ['src/b.ts'] });
+    expect(scoped.filesRemoved).toBe(1);
+    expect(scoped.filesModified).toBe(0);
+    expect(scoped.filesAdded).toBe(0);
+    expect(cg.searchNodes('gamma').length).toBe(0);
+    expect(cg.searchNodes('beta').filter((r) => r.node.filePath === 'src/b.ts').length).toBe(0);
+    // Idempotent: the file stays out on a repeat scoped sync.
+    const again = await cg.sync({ paths: ['src/b.ts'] });
+    expect(again.filesRemoved).toBe(0);
+    expect(again.filesAdded).toBe(0);
+
+    // Dropping the exclude readmits it through the same scoped path. The
+    // scope matcher is mtime-keyed, so give the rewrite a distinct mtime even
+    // on a coarse-timestamp filesystem.
+    fs.writeFileSync(cfg, JSON.stringify({}));
+    const later = new Date(Date.now() + 5000);
+    fs.utimesSync(cfg, later, later);
+    const readmitted = await cg.sync({ paths: ['src/b.ts'] });
+    expect(readmitted.filesAdded).toBe(1);
+    expect(cg.searchNodes('gamma').length).toBe(1);
+  });
 });

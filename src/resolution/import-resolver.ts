@@ -12,6 +12,7 @@ import { applyAliases } from './path-aliases';
 import { resolveWorkspaceImport } from './workspace-packages';
 import {
   resolveMethodOnType,
+  resolveObjectLiteralMember,
   localReceiverTypePatterns,
   normalizeInferredTypeName,
 } from './name-matcher';
@@ -78,6 +79,27 @@ interface FileExportIndex {
   byName: Map<string, Node>;
   defaultComponent: Node | undefined;
   defaultFnClass: Node | undefined;
+  /**
+   * The node an `export default NAME` statement names, exported at its
+   * declaration or not — the precise answer where `defaultFnClass` is a
+   * guess. `const Home = () => …; export default Home` and the namespace
+   * object `const UploadApi = { uploadARCapture }; export default UploadApi`
+   * are both invisible to the `isExported` index above: neither declaration
+   * has an `export_statement` ancestor.
+   */
+  defaultBinding: Node | undefined;
+}
+
+const DEFAULT_BINDING_KINDS = new Set<string>(['function', 'class', 'component', 'constant', 'variable']);
+const DEFAULT_EXPORT_BINDING_RE = /^[ \t]*export\s+default\s+([A-Za-z_$][\w$]*)\s*;?[ \t]*$/m;
+const JS_FAMILY_FILE = /\.(?:[cm]?[jt]sx?)$/;
+
+/** The identifier `export default NAME` names in a JS-family file, or null. */
+function defaultExportBinding(filePath: string, context: ResolutionContext): string | null {
+  if (!JS_FAMILY_FILE.test(filePath)) return null;
+  const source = context.readFile(filePath);
+  if (!source || !source.includes('export default')) return null;
+  return source.match(DEFAULT_EXPORT_BINDING_RE)?.[1] ?? null;
 }
 const fileExportIndexes = new WeakMap<ResolutionContext, Map<string, FileExportIndex>>();
 
@@ -89,12 +111,19 @@ function getFileExportIndex(filePath: string, context: ResolutionContext): FileE
   }
   let idx = perFile.get(filePath);
   if (!idx) {
-    idx = { byName: new Map(), defaultComponent: undefined, defaultFnClass: undefined };
-    for (const n of context.getNodesInFile(filePath)) {
+    idx = { byName: new Map(), defaultComponent: undefined, defaultFnClass: undefined, defaultBinding: undefined };
+    const nodesInFile = context.getNodesInFile(filePath);
+    for (const n of nodesInFile) {
       if (!n.isExported) continue;
       if (!idx.byName.has(n.name)) idx.byName.set(n.name, n);
       if (idx.defaultComponent === undefined && n.kind === 'component') idx.defaultComponent = n;
       if (idx.defaultFnClass === undefined && (n.kind === 'function' || n.kind === 'class')) idx.defaultFnClass = n;
+    }
+    const bound = defaultExportBinding(filePath, context);
+    if (bound !== null) {
+      idx.defaultBinding = nodesInFile
+        .filter((n) => n.name === bound && DEFAULT_BINDING_KINDS.has(n.kind))
+        .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0];
     }
     perFile.set(filePath, idx);
   }
@@ -1545,6 +1574,22 @@ export function resolveViaImport(
                 resolvedBy: 'import',
               };
             }
+            // An imported object literal used as a namespace (#1573):
+            // `api.call()` after `import { api } from './api'` where `api` is
+            // `export const api = { call() {…} }`. Its members have bare
+            // qualified names inside the constant's extent, so the
+            // `Container::member` lookup above can't see them and the edge
+            // landed on the constant — every cross-file caller of the method
+            // went missing. Resolve the member by containment instead.
+            if (targetNode.kind === 'constant' || targetNode.kind === 'variable') {
+              const member = ref.referenceName.slice(imp.localName.length + 1).split('.')[0];
+              if (member) {
+                const literalMember = resolveObjectLiteralMember(targetNode, member, ref, context, 0.9, 'import');
+                if (literalMember) return literalMember;
+                const aliasMember = resolveObjectLiteralAlias(targetNode, member, ref, context);
+                if (aliasMember) return aliasMember;
+              }
+            }
             // An imported VALUE (singleton constant / shared instance) called
             // through a member: `reproStore.notifyJoinGuildStatus()` after
             // `import { reproStore } from './store'`. findExportedSymbol
@@ -1697,6 +1742,80 @@ function resolveLuaRequire(ref: UnresolvedRef, context: ResolutionContext): Reso
       // name-matching, which otherwise resolves the require to the import node
       // itself (a same-name self-match).
       return { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' };
+    }
+  }
+  return null;
+}
+
+/**
+ * `UploadApi.uploadARCapture()` where `UploadApi` is a NAMESPACE OBJECT — the
+ * default-export façade most React Native API layers are written as:
+ *
+ *   import { uploadARCapture } from './frames'
+ *   const UploadApi = { uploadARCapture, createFolder }
+ *   export default UploadApi
+ *
+ * The member is a shorthand (or `key: ident`) property whose value is a
+ * binding of the object's file, not a function defined inside the literal,
+ * so containment (`resolveObjectLiteralMember`) finds nothing and the call
+ * landed on the constant — every cross-file caller of the API function went
+ * missing. Read the literal's source, take the binding the member names, and
+ * resolve it where the object's file would: a symbol declared there, else
+ * through its own imports. Calls accept callable targets only.
+ */
+function resolveObjectLiteralAlias(
+  container: Node,
+  member: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  if (container.kind !== 'constant' && container.kind !== 'variable') return null;
+  if (!JS_FAMILY_FILE.test(container.filePath)) return null;
+  if (!/^[A-Za-z_$][\w$]*$/.test(member)) return null;
+  const lines = context.getFileLines?.(container.filePath) ?? context.readFile(container.filePath)?.split('\n');
+  if (!lines) return null;
+  const extent = lines.slice(container.startLine - 1, container.endLine).join('\n');
+  const brace = extent.indexOf('{');
+  if (brace < 0) return null;
+  const body = extent.slice(brace);
+  const keyed = new RegExp(`[{,\\s]${member}\\s*:\\s*([A-Za-z_$][\\w$]*)\\s*[,}]`);
+  const shorthand = new RegExp(`[{,\\s]${member}\\s*[,}]`);
+  const k = body.match(keyed);
+  const binding = k ? k[1]! : shorthand.test(body) ? member : null;
+  if (binding === null) return null;
+
+  const callable = (n: Node) => n.kind === 'function' || n.kind === 'method' || n.kind === 'class';
+  const accepts =
+    ref.referenceKind === 'calls'
+      ? callable
+      : (n: Node) => callable(n) || n.kind === 'constant' || n.kind === 'variable' || n.kind === 'component';
+
+  // Declared in the object's own file, outside the literal.
+  const local = context
+    .getNodesInFile(container.filePath)
+    .filter((n) => n.name === binding && n.id !== container.id && accepts(n))
+    .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0];
+  if (local) return { original: ref, targetNodeId: local.id, confidence: 0.9, resolvedBy: 'import' };
+
+  // Imported into the object's file.
+  for (const imp of context.getImportMappings(container.filePath, container.language)) {
+    if (imp.localName !== binding || imp.isNamespace) continue;
+    const resolvedPath = resolveImportPath(imp.source, container.filePath, container.language, context);
+    if (!resolvedPath) continue;
+    const target = findExportedSymbol(
+      resolvedPath,
+      {
+        isDefault: imp.isDefault,
+        isNamespace: false,
+        exportedName: imp.isDefault ? 'default' : imp.exportedName,
+        memberName: null,
+      },
+      container.language,
+      context,
+      new Set()
+    );
+    if (target && accepts(target)) {
+      return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
     }
   }
   return null;
@@ -2137,7 +2256,9 @@ function findExportedSymbolWalk(
     // `.ts`/`.tsx` `export default fn`/`class` case. Without the component
     // branch, an `export { default as X } from './X.svelte'` barrel never
     // resolves and the component shows a false 0 callers (#629).
-    const direct = exportIndex.defaultComponent ?? exportIndex.defaultFnClass;
+    // A component file IS its default export; otherwise the statement that
+    // names the binding beats the first-exported-function guess.
+    const direct = exportIndex.defaultComponent ?? exportIndex.defaultBinding ?? exportIndex.defaultFnClass;
     if (direct) return direct;
   } else if (want.isNamespace && want.memberName) {
     const direct = exportIndex.byName.get(want.memberName);

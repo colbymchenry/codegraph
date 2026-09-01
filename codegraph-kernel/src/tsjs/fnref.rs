@@ -39,6 +39,11 @@ pub fn dispatch(kind: &str) -> Option<Mode> {
         "variable_declarator" => Some(Mode::VarInit),
         "pair" => Some(Mode::Value),
         "array" => Some(Mode::List),
+        // A JSX attribute value or child (`onPress={handleSubmit}`): the
+        // expression's one named child is the value. Mirrors TS_JS_SPEC.
+        "jsx_expression" => Some(Mode::List),
+        // An object literal's shorthand members (`return { handleApprove }`).
+        "object" => Some(Mode::List),
         _ => None,
     }
 }
@@ -117,7 +122,7 @@ pub fn capture(container: Node, mode: Mode, src: &str) -> Vec<(Candidate, Mode)>
 /// `this.<member>` member_expression special form (object EXACTLY `this`).
 fn normalize<'t>(node: Node<'t>, src: &str) -> Vec<(String, Node<'t>)> {
     match node.kind() {
-        "identifier" => vec![(src[node.byte_range()].to_string(), node)],
+        "identifier" | "shorthand_property_identifier" => vec![(src[node.byte_range()].to_string(), node)],
         "member_expression" => {
             let obj = node.child_by_field_name("object");
             let prop = node.child_by_field_name("property");
