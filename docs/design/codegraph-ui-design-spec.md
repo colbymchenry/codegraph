@@ -569,7 +569,11 @@ a 1,227x5,588 ribbon to 2,279x4,356.
 Each region wears a caption (`RegionCaption.svelte` — its component's name over a hairline spanning its width)
 and the key explains it. **At rest the picture hides exactly two things** (`stepEdgeVisible`): the anchor's own fan —
 the anchor leads to everything *by definition*, `/home`'s 104 ways of saying so were the moiré, so one line into each
-region's first box stands in for it — and, as everywhere on the canvas, what points back up the layering. Every other
+region stands in for it, landing on the box nearest that region's top-left the anchor actually leads to (the walk's
+first member used to stand for the region, but clustering moves a step that fires something BELOW the ones that fire
+nothing, so that box could sit lines down inside the region and the line had to reach past everything above it); those
+stand-in lines are themselves subject to the stub rule, since on a ten-region screen the ones reaching into a lower
+band were 17% of all lines drawn and **79% of every crossing left** — and, as everywhere on the canvas, what points back up the layering. Every other
 lead-to draws, a line between two regions included: the empty state's prompt firing the same handler as the header's IS
 the picture, and an earlier cut that reserved cross-region lines for selection made a box that leads three places read
 as wired to nothing. The two hidings compose well: a shared step fed from below — the toast action every handler calls
@@ -588,7 +592,8 @@ thousand pixels — on `/capture` the 113 lines drawn at rest crossed each other
 boxes' names, so no line could be followed and the boxes could not be read either. So `packStubs` (over the finished
 layout, since this is a question about geometry) keeps a link as a line only when it runs down the layering and its two
 boxes are within `STUB_SPAN_LINES` (3) lines and `REGION_LINE_MIN` (720px) across; everything else — back edges
-included, which drew nothing at all before — becomes a `StepStub` at **both** ends: `→ resumeInference` under the box
+included, which drew nothing at all before, **and the screen's own line into a region**, which has no exception —
+becomes a `StepStub` at **both** ends: `→ resumeInference` under the box
 that leads there, `← CaptureView` under the box it arrives at, rendered by `StepStubs.svelte` in the gap under the box,
 capped at three with `+N more`. This is not a hiding: the link is *stated*, which says more than a line vanishing off
 the edge of the screen does, and it is the one at-rest cut that does not produce the "box that leads somewhere and

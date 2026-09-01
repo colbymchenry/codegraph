@@ -324,10 +324,14 @@ describe('a screen laid out by region', () => {
   });
 
   it('at rest hides only the screen’s own fan and what points back up; every other lead-to draws', () => {
-    expect(model.regionEntries).toEqual(new Set([a1.id, b1.id]));
+    // The screen's one line into a region lands on the box nearest the region's
+    // top-left that the screen leads to — `tapUndo`, which fires nothing and so
+    // sits on the region's first line, not `tapSave`, which clustering moves
+    // below it because it fires the store.
+    expect(model.regionEntries).toEqual(new Set([a2.id, b1.id]));
     // One line from the screen into each region stands in for its whole fan.
-    expect(stepEdgeVisible(model, edge(anchor.id, a1.id), null)).toBe(true);
-    expect(stepEdgeVisible(model, edge(anchor.id, a2.id), null)).toBe(false);
+    expect(stepEdgeVisible(model, edge(anchor.id, a2.id), null)).toBe(true);
+    expect(stepEdgeVisible(model, edge(anchor.id, a1.id), null)).toBe(false);
     expect(stepEdgeVisible(model, edge(anchor.id, b1.id), null)).toBe(true);
     // A region's internal line, and another region's way into a shared step.
     expect(stepEdgeVisible(model, edge(a1.id, a3.id), null)).toBe(true);
@@ -336,7 +340,7 @@ describe('a screen laid out by region', () => {
     expect(stepEdgeVisible(model, edge(a1.id, b1.id), null)).toBe(false);
     // Selecting a step brings out everything that touches it, and only that.
     expect(stepEdgeVisible(model, edge(a1.id, b1.id), a1.id)).toBe(true);
-    expect(stepEdgeVisible(model, edge(anchor.id, a2.id), a1.id)).toBe(false);
+    expect(stepEdgeVisible(model, edge(anchor.id, b1.id), a1.id)).toBe(false);
   });
 
   it('stacks a handler above the store it calls, even when both are one hop from the screen', () => {

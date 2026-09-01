@@ -504,7 +504,8 @@ export function buildStepsModel(payload: WireStepsPayload): StepsModel {
   const curves = trackedCurves(layout, layerGap);
   const polylines = new Map<string, Point[]>();
   for (const [id, curve] of curves) polylines.set(id, samplePolyline(curve, HIT_SAMPLES));
-  const { stubs, stubbed } = packStubs(layout, nodes, layerGap);
+  const entries = zones === null ? null : new Set(zones.map((z) => z.entry));
+  const { stubs, stubbed } = packStubs(layout, nodes, layerGap, entries);
   return {
     layout,
     nodes,
@@ -514,7 +515,7 @@ export function buildStepsModel(payload: WireStepsPayload): StepsModel {
     polylines,
     counts,
     regions: zones,
-    regionEntries: zones === null ? null : new Set(zones.map((z) => z.entry)),
+    regionEntries: entries,
     forks: null,
     stubs,
     stubbed,
@@ -540,9 +541,10 @@ const STUB_SPAN_LINES = 3;
  * within {@link STUB_SPAN_LINES} lines, and no further across than a region's
  * own lines start out running ({@link REGION_LINE_MIN}), so a drawn line stays
  * inside one column of reading — and it runs down the layering. Everything else becomes a
- * {@link StepStub} at both ends. Nothing touching the anchor is stubbed: the
- * anchor leads to everything by definition and its fan is already held back to
- * one line per region.
+ * {@link StepStub} at both ends — the one link into each region included, so a
+ * region tiled into a lower band no longer reaches back up to the start with a
+ * line across the whole picture. Those 96 lines were 17% of what a real app's
+ * 51 screens drew and 79% of everything they crossed.
  */
 /**
  * The name a stub points at, without the mark its box wears for its kind: the
@@ -556,7 +558,8 @@ function stubLabel(label: string): string {
 function packStubs(
   layout: MapLayout,
   infos: Map<string, StepNodeInfo>,
-  layerGap: number
+  layerGap: number,
+  entries: ReadonlySet<string> | null
 ): { stubs: Map<string, StepStub[]>; stubbed: ReadonlySet<string> } {
   const stubs = new Map<string, StepStub[]>();
   const stubbed = new Set<string>();
@@ -569,7 +572,12 @@ function packStubs(
     const from = nodeById.get(edge.source);
     const to = nodeById.get(edge.target);
     if (!from || !to) continue;
-    if (infos.get(edge.source)?.step.anchor || infos.get(edge.target)?.step.anchor) continue;
+    // On a regioned picture the anchor's fan is already stood in for by one
+    // link into each region ({@link StepsModel.regionEntries}); only THAT link
+    // is a line worth keeping or words worth saying, and the rest of the fan
+    // stays quiet as it was. An unregioned picture has no stand-in, so its
+    // anchor's links follow the same rule as every other.
+    if (entries !== null && infos.get(edge.source)?.step.anchor && !entries.has(edge.target)) continue;
     const lines = Math.abs(to.y - from.y) / pitch;
     const across = Math.abs(to.x + to.width / 2 - (from.x + from.width / 2));
     // A back edge points up the layering: it is not a local hop however near
@@ -755,6 +763,8 @@ function packRegions(
       l.source !== l.target &&
       regionOf.get(l.source) === regionOf.get(l.target)
   );
+  /** The steps the screen itself leads to — where its one line into a region can land. */
+  const fromAnchor = new Set(links.filter((l) => l.source === anchor.id).map((l) => l.target));
   const parentsOf = new Map<string, string[]>();
   for (const l of forwardLinks(intra)) {
     const list = parentsOf.get(l.target) ?? [];
@@ -846,7 +856,21 @@ function packRegions(
     for (const id of starts) if (!pos.has(id)) place(id, 0);
     // A cycle can leave a member with no reachable start; it stands on its own.
     for (const m of region.members) if (!pos.has(m.id)) place(m.id, 0);
-    packed.set(region.id, { pos, lines: line, width, entry: region.members[0]!.id });
+    // Where the screen's own line into this region lands: the box nearest the
+    // region's top-left that the screen actually leads to. The walk's first
+    // member used to stand for the region, but clustering moves a step that
+    // fires something below the ones that fire nothing, so that box could sit
+    // lines down inside the region and the line from the start had to reach
+    // past everything above it to get there.
+    const topmost = (ids: string[]): string | null =>
+      ids
+        .filter((id) => pos.has(id))
+        .sort((a, b) => pos.get(a)!.line - pos.get(b)!.line || pos.get(a)!.x - pos.get(b)!.x)[0] ?? null;
+    const entry =
+      topmost(region.members.filter((m) => fromAnchor.has(m.id)).map((m) => m.id)) ??
+      topmost(region.members.map((m) => m.id)) ??
+      region.members[0]!.id;
+    packed.set(region.id, { pos, lines: line, width, entry });
   }
 
   // Tile the regions into bands under a width budget.
