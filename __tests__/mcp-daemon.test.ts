@@ -39,6 +39,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
 import { getDaemonSocketPath } from '../src/mcp/daemon-paths';
+import { deregisterDaemon } from '../src/mcp/daemon-registry';
 import { CodeGraphPackageVersion } from '../src/mcp/version';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
@@ -195,6 +196,11 @@ describe('Shared MCP daemon (issue #411)', () => {
       try { process.kill(daemonPid, 'SIGKILL'); } catch { /* race */ }
     }
     await new Promise((r) => setTimeout(r, 50));
+    // SIGKILL deliberately bypasses Daemon.stop(), so its global discovery
+    // record cannot self-remove. Clean it explicitly before deleting the temp
+    // project; otherwise every full suite leaves one dead registry file per
+    // test under ~/.codegraph/daemons.
+    deregisterDaemon(realRoot);
     servers.length = 0;
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
