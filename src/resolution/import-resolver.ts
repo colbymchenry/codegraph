@@ -1535,12 +1535,27 @@ export function resolveViaImport(
   for (const imp of imports) {
     if (imp.localName === ref.referenceName || ref.referenceName.startsWith(imp.localName + '.')) {
       // Resolve the import path
-      const resolvedPath = resolveImportPath(
+      let resolvedPath = resolveImportPath(
         imp.source,
         ref.filePath,
         ref.language,
         context
       );
+
+      // Python ABSOLUTE dotted source (`from scripts.lire_fec import summarize
+      // as fec_summary`, source `scripts.lire_fec`) — resolveImportPath only
+      // maps RELATIVE dotted paths (`.mod`, `..pkg.mod`) for Python, so it
+      // returns null here and the whole block used to no-op, dropping the
+      // call edge for a directly-called (non-member, non-namespace) name
+      // imported through an absolute module. resolvePythonModuleMember and
+      // resolveModuleImportToFile already carry this exact fallback for the
+      // qualified-member and whole-module cases (#578); this loop needs it
+      // too for a bare aliased-function call (found on a real project:
+      // `from scripts.lire_fec import summarize as fec_summary`, then a
+      // bare `fec_summary()`).
+      if (!resolvedPath && ref.language === 'python') {
+        resolvedPath = findPythonModuleFile(imp.source, context, ref.filePath)?.filePath ?? null;
+      }
 
       if (resolvedPath) {
         const exportedName = imp.isDefault ? 'default' : imp.exportedName;

@@ -1504,6 +1504,62 @@ def external_caller():
       expect(externalCalls).toHaveLength(0);
     });
 
+    it('resolves a direct call through an aliased Python function import (`from mod import fn as alias; alias()`)', async () => {
+      // Two compounding gaps, both surfaced on a real project via a
+      // `from scripts.lire_fec import summarize as fec_summary` import,
+      // then a bare `fec_summary()` call:
+      //
+      // 1. resolveViaImport's generic "reference name matches an import"
+      //    loop resolved `imp.source` through resolveImportPath, which for
+      //    Python only maps RELATIVE dotted paths (`.mod`, `..pkg.mod`).
+      //    An ABSOLUTE dotted source (`scripts.lire_fec`, from `from
+      //    scripts.lire_fec import ...`) returned null there, and unlike
+      //    resolvePythonModuleMember / resolveModuleImportToFile (#578),
+      //    this loop had no findPythonModuleFile fallback — so it silently
+      //    produced no edge for ANY direct (non-member) call through an
+      //    absolute-module import, aliased or not.
+      //
+      // 2. Even once the file resolved, findExportedSymbol filters
+      //    candidates on `n.isExported` — and the Python extractor never
+      //    implemented `isExported`, so it was `undefined`/falsy for every
+      //    Python symbol. This normally went unnoticed because an unaliased
+      //    call (`from mod import summarize; summarize()`) still resolves
+      //    via unrelated same-name fuzzy matching when the name is globally
+      //    unique — but an ALIASED direct call has no name to fuzzy-match
+      //    on (`fec_summary` isn't declared anywhere), so this was its only
+      //    path, and it always failed.
+      fs.mkdirSync(path.join(tempDir, 'scripts'));
+      fs.writeFileSync(path.join(tempDir, 'scripts', '__init__.py'), '');
+      fs.writeFileSync(
+        path.join(tempDir, 'scripts', 'lire_fec.py'),
+        'def summarize():\n    return 1\n'
+      );
+      fs.mkdirSync(path.join(tempDir, 'services'));
+      fs.writeFileSync(path.join(tempDir, 'services', '__init__.py'), '');
+      fs.writeFileSync(
+        path.join(tempDir, 'services', 'assistant.py'),
+        `from scripts.lire_fec import summarize as fec_summary
+
+
+def build_context():
+    fec = fec_summary()
+    return fec
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const buildContext = cg
+        .getNodesByKind('function')
+        .filter((n) => n.name === 'build_context')[0];
+      expect(buildContext).toBeDefined();
+      const calls = cg.getOutgoingEdges(buildContext!.id).filter((e) => e.kind === 'calls');
+      expect(calls).toHaveLength(1);
+      const target = cg.getNode(calls[0]!.target);
+      expect(target?.name).toBe('summarize');
+      expect(target?.filePath.replace(/\\/g, '/')).toBe('scripts/lire_fec.py');
+    });
+
     it('attaches Go methods to their receiver type across files (#583, cross-file half)', async () => {
       // In Go a type's methods are commonly declared in a different file from the
       // `type` declaration (`type Box` in box.go, `func (b *Box) Get()` in
