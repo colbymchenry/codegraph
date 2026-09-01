@@ -336,6 +336,7 @@ After upgrading, run `codegraph index` once in each project so your existing gra
 - C/C++ function-pointer analysis now bounds its compiled-pattern caches, so very large repositories can no longer exhaust the JavaScript engine's regular-expression code space during indexing. (#1559)
 
 - JSX rendering analysis now runs only on JavaScript-family files, so JSX-looking strings in C/C++ (or any other language) no longer create impossible call edges — in pure-C projects and in mixed-language monorepos alike. (#1560)
+- `codegraph install` no longer replaces symlinked config files with regular files — writes now follow the symlink and update its real target. Setups that share one `AGENTS.md` across agents via symlinks (for example `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md` both pointing at one file), and dotfiles-managed configs, keep receiving edits; installing several agents wired to the same shared file writes its guidance block exactly once. If a previous install already turned your symlink into a regular file, restore the link once and future runs will preserve it. Thanks @0x1306a94 for first diagnosing this and proposing a fix in #433. (#1503)
 
 #### Language and framework accuracy
 
