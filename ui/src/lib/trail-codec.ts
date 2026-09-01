@@ -64,4 +64,3 @@ export function decodeTrail(encoded: string | null): TrailHop[] {
   }
   return hops;
 }
-
