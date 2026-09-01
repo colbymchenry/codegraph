@@ -873,12 +873,7 @@ function packRegions(
     packed.set(region.id, { pos, lines: line, width, entry });
   }
 
-  // Tile the regions into bands under a width budget.
-  interface Band {
-    regions: Region[];
-    lines: number;
-    width: number;
-  }
+  // How wide the picture may run before a region has to go underneath.
   let area = 0;
   let widest = 0;
   for (const region of regions.values()) {
@@ -887,51 +882,56 @@ function packRegions(
     widest = Math.max(widest, p.width);
   }
   const budget = bandBudget(area, widest);
-  const bands: Band[] = [];
-  let band: Band | null = null;
-  for (const region of regions.values()) {
-    const p = packed.get(region.id)!;
-    if (band === null || band.width + REGION_GUTTER + p.width > budget) {
-      band = { regions: [], lines: 0, width: -REGION_GUTTER };
-      bands.push(band);
-    }
-    band.regions.push(region);
-    band.lines = Math.max(band.lines, p.lines);
-    band.width += REGION_GUTTER + p.width;
-  }
-  const contentWidth = Math.max(widthOf(anchor.id), ...bands.map((b) => b.width));
 
-  // Place everything. The anchor is alone on top; each band's regions centre
-  // as a row of columns; a region's lines centre within its own width.
+  // Place everything. The anchor is alone on top; each region, in the order
+  // the walk met them, goes as high as it can and then as far left as it can.
+  //
+  // Squaring the regions off into bands — a row at a time, the row as tall as
+  // its tallest member — left a screen's canvas 55% region and 45% nothing
+  // (`/home` 44%: 4,860px tall to hold 2,160px of picture), and that emptiness
+  // is what a reader scrolls through. Going highest-then-leftmost keeps the
+  // reading order (an earlier region is placed first, so it is never pushed
+  // below a later one) while a short region tucks under another short one
+  // instead of waiting for the tall one beside it.
   const at = new Map<string, { x: number; y: number; line: number }>();
   const zones: StepRegionZone[] = [];
   const anchorY = PADDING;
-  let y = anchorY + NODE_HEIGHT + SCREEN_LAYER_GAP + BAND_GAP;
-  let globalLine = 0;
-  for (const b of bands) {
-    let x = PADDING + (contentWidth - b.width) / 2;
-    for (const region of b.regions) {
-      const p = packed.get(region.id)!;
-      // A cluster reads from its left edge, not from the region's centre: the
-      // indent is what says which step fired which.
-      for (const [id, at2] of p.pos) {
-        at.set(id, { x: x + at2.x, y: y + at2.line * REGION_PITCH, line: globalLine + at2.line });
-      }
-      zones.push({
-        id: region.id,
-        label: region.label,
-        x,
-        y,
-        width: p.width,
-        height: Math.max(0, p.lines - 1) * REGION_PITCH + NODE_HEIGHT,
-        entry: p.entry,
-      });
-      x += p.width + REGION_GUTTER;
+  const topY = anchorY + NODE_HEIGHT + SCREEN_LAYER_GAP + BAND_GAP;
+  /** What each stretch of the canvas is filled to, so far. */
+  const sky: { x0: number; x1: number; y: number }[] = [];
+  const floorAt = (x0: number, x1: number): number => {
+    let f = topY;
+    for (const s of sky) if (s.x1 > x0 + 1 && s.x0 < x1 - 1) f = Math.max(f, s.y);
+    return f;
+  };
+  for (const region of regions.values()) {
+    const p = packed.get(region.id)!;
+    const rh = Math.max(0, p.lines - 1) * REGION_PITCH + NODE_HEIGHT;
+    // Somewhere to start, plus the right-hand edge of everything already down.
+    const spots = [PADDING, ...sky.map((s) => s.x1 + REGION_GUTTER)]
+      .filter((x, i, all) => all.indexOf(x) === i && x + p.width <= PADDING + Math.max(budget, p.width))
+      .sort((m, n) => m - n);
+    let best = { x: PADDING, y: floorAt(PADDING, PADDING + p.width) };
+    for (const x of spots) {
+      const y = floorAt(x, x + p.width);
+      if (y < best.y - 1) best = { x, y };
     }
-    y += b.lines * REGION_PITCH + BAND_GAP;
-    globalLine += b.lines;
+    const { x, y } = best;
+    // A cluster reads from its left edge, not from the region's centre: the
+    // indent is what says which step fired which.
+    for (const [id, at2] of p.pos) {
+      at.set(id, { x: x + at2.x, y: y + at2.line * REGION_PITCH, line: 0 });
+    }
+    zones.push({ id: region.id, label: region.label, x, y, width: p.width, height: rh, entry: p.entry });
+    // The gap under a region carries the next one's caption.
+    sky.push({ x0: x, x1: x + p.width, y: y + rh + BAND_GAP });
   }
-  const height = y - REGION_PITCH - BAND_GAP + NODE_HEIGHT + PADDING;
+  const contentWidth = Math.max(widthOf(anchor.id), ...zones.map((z) => z.x + z.width - PADDING));
+  // The layering comes from the finished geometry, not from a band counter:
+  // once regions drop independently, what a reader sees as one row IS one row.
+  for (const spot of at.values()) spot.line = Math.round((spot.y - topY) / REGION_PITCH);
+  const globalLine = Math.max(0, ...[...at.values()].map((v) => v.line)) + 1;
+  const height = Math.max(anchorY + NODE_HEIGHT, ...zones.map((z) => z.y + z.height)) + PADDING;
 
   // Layers count from the bottom, as the Map's do: the route of an edge and
   // which sides it uses fall out of the comparison alone.

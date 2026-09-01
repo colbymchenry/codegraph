@@ -455,3 +455,38 @@ describe('a stub names the box without its kind mark', () => {
     );
   });
 });
+
+describe('regions fill the canvas instead of squaring off into rows', () => {
+  it('lets a short region tuck under another short one, without reordering them', () => {
+    // Squaring the regions into rows made every row as tall as its tallest
+    // member: one real screen's canvas came out 44% region and 56% nothing.
+    const anchor = step('/', 'screen', 0, { anchor: true });
+    const region = (n: string) => ({ id: `component:${n}`, label: n });
+    const short = (n: string, order: number) =>
+      step(n, 'trigger', 1, { order, region: region('R' + n), node: ref(n, `src/${n}.tsx`) });
+    // One tall region (a chain), then several short ones beside it.
+    const tallR = region('Tall');
+    const chain = [0, 1, 2, 3, 4, 5].map((i) =>
+      step(`t${i}`, 'trigger', i + 1, { order: i, region: tallR, node: ref(`t${i}`, 'src/t.tsx') })
+    );
+    const a = short('alpha', 10), b = short('beta', 11), c = short('gamma', 12);
+    const steps = [anchor, ...chain, a, b, c];
+    const links = [
+      ...[chain[0]!, a, b, c].map((s) => link(anchor, s)),
+      ...chain.slice(1).map((s, i) => link(chain[i]!, s)),
+    ];
+    const m = buildStepsModel(payload(steps, links));
+    const zone = (n: string) => m.regions!.find((z) => z.label === n)!;
+    const tall = zone('Tall');
+    // The short regions are laid out after the tall one and do not wait for it.
+    for (const n of ['Ralpha', 'Rbeta', 'Rgamma']) {
+      expect(zone(n).y).toBeLessThan(tall.y + tall.height);
+    }
+    // …and the order still reads left to right: an earlier region is never
+    // pushed below a later one.
+    expect(zone('Ralpha').y).toBeLessThanOrEqual(zone('Rgamma').y);
+    // The canvas is not taller than the tall region needs it to be.
+    const H = Math.max(...m.layout.nodes.map((n) => n.y + n.height));
+    expect(H).toBeLessThan(tall.y + tall.height + 200);
+  });
+});

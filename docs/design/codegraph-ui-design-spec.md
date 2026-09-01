@@ -552,7 +552,12 @@ shared store is one box in the region that got there first and every other regio
 functions carry none: their rows already read in the code's order, and `view=order` is untouched. The viewer
 (`steps-model.ts`'s `packRegions`) then lays each region out as its own small column, and tiles the columns into bands
 under a width budget aimed at a readable aspect, in the order the walk met them: the screen's own source order, top of
-the screen to the left. **Within a region the rows come from the region's own links**, never from distance to the
+the screen to the left. Regions are **not** squared off into rows — that made every row as tall as its tallest member,
+leaving the median screen's canvas 55% region and 45% nothing (`/home` 44%: 4,860px to hold ~2,160px of picture, all of
+it scrolled through). Each region instead goes as HIGH as it can and then as far LEFT as it can (a skyline over the
+regions already placed, `floorAt`), which keeps the reading order — regions are placed in source order, so an earlier
+one is never pushed below a later one — while a short region tucks under another short one. `/home`: 4,860px -> 3,584px,
+aspect 0.59 -> 0.94. **Within a region the rows come from the region's own links**, never from distance to the
 anchor, which is flat inside a region: a handler and the store it calls are both one hop from the screen, and side by
 side their line was a level arch, hidden at rest — the store looked wired to nothing. Cycle-closing links are set
 aside before the rows are settled (`forwardLinks`, the twin of the order reading's `withoutBackEdges`): relaxation
