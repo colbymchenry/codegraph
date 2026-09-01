@@ -875,6 +875,38 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(body).toContain('  telegram:\n  - hermes-telegram');
   });
 
+  it('hermes: install matches existing sibling list-item indent when creating new cli block (issue #507)', () => {
+    const hermes = getTarget('hermes')!;
+    const config = path.join(tmpHome, '.hermes', 'config.yaml');
+    fs.mkdirSync(path.dirname(config), { recursive: true });
+    // platform_toolsets exists but has no cli key; siblings use 2-space (PyYAML) item style
+    const original = [
+      'platform_toolsets:',
+      '  discord:',
+      '  - hermes-discord',
+      '  telegram:',
+      '  - hermes-telegram',
+      '',
+    ].join('\n');
+    fs.writeFileSync(config, original);
+
+    hermes.install('global', { autoAllow: true });
+    const body = fs.readFileSync(config, 'utf-8');
+
+    // New cli block must use the same 2-space item indent as discord/telegram
+    expect(body).toContain('  cli:\n  - hermes-cli\n  - mcp-codegraph');
+    // Existing sections untouched
+    expect(body).toContain('  discord:\n  - hermes-discord');
+    expect(body).toContain('  telegram:\n  - hermes-telegram');
+    // No 4-space item indent leaked in
+    expect(body).not.toMatch(/^ {4}- hermes-cli/m);
+    expect(body).not.toMatch(/^ {4}- mcp-codegraph/m);
+
+    // Idempotent
+    const second = hermes.install('global', { autoAllow: true });
+    expect(second.files[0]?.action).toBe('unchanged');
+  });
+
   it('opencode: uninstall removes only mcp.codegraph, preserves comments and siblings', () => {
     const opencode = getTarget('opencode')!;
     const dir = path.join(tmpHome, '.config', 'opencode');

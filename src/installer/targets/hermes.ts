@@ -305,6 +305,14 @@ function removeCodeGraphMcpServer(content: string): string {
   return joinLines(lines);
 }
 
+function detectItemIndent(lines: string[], range: LineRange): string {
+  for (let i = range.start + 1; i < range.end; i++) {
+    const m = (lines[i] ?? '').match(/^( +)- /);
+    if (m && m[1]) return m[1];
+  }
+  return '    ';
+}
+
 function upsertCodeGraphToolset(content: string): string {
   const lines = splitLines(content);
   const parent = topLevelRange(lines, 'platform_toolsets');
@@ -318,7 +326,8 @@ function upsertCodeGraphToolset(content: string): string {
   }
 
   if (!cli) {
-    lines.splice(parent.end, 0, '  cli:', '    - hermes-cli', '    - mcp-codegraph');
+    const itemIndent = detectItemIndent(lines, parent);
+    lines.splice(parent.end, 0, '  cli:', `${itemIndent}- hermes-cli`, `${itemIndent}- mcp-codegraph`);
     return joinLines(lines);
   }
 
