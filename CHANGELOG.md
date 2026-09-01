@@ -201,6 +201,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Symbols, tests and the viewer
 
+- **Saved trails stay inside the indexed project even when a parent directory is a symlink.** The viewer now refuses a trail path whose nearest existing directory resolves outside the project, and creates its atomic temporary file exclusively so a pre-planted link cannot capture the write.
+
 - **Files under an `e2e/` directory count as tests.** Their calls no longer appear as production callers in Steps, dead-code and test badges.
 
 - **Production code under a `samples` or `examples` package path is no longer treated as test code.** A Kotlin or Java project whose package path runs through `com/google/samples/…` (Now in Android, for one) had nearly every file counted as a fixture, so the Map opened on `build-logic`, the entry points hid the app, and dead-code and test badges were wrong. Only the project layout above a `src/` folder decides now; the package path below it never does.
