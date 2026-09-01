@@ -7,6 +7,7 @@
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
+import { generateNodeId } from '../../extraction/tree-sitter-helpers';
 
 export const springResolver: FrameworkResolver = {
   name: 'spring',
@@ -300,6 +301,10 @@ export const springResolver: FrameworkResolver = {
     // binding (kebab/camel/snake collapse).
     extractSpringValueBindings(filePath, safe, lang, now, nodes, references);
 
+    // Spring DI: detect @Autowired and @RequiredArgsConstructor injection
+    // patterns and emit instantiates edges (Controller→Service→Repository).
+    extractSpringDI(filePath, safe, lang, references);
+
     return { nodes, references };
   },
 };
@@ -488,6 +493,81 @@ function extractSpringValueBindings(
       referenceName: `${prefix}:prefix`,
       referenceKind: 'references',
       line,
+      column: 0,
+      filePath,
+      language: lang,
+    });
+  }
+}
+
+/** Scan for Spring DI injection patterns — `@Autowired` fields and
+ * `@RequiredArgsConstructor` classes with `private final` fields — and emit
+ * `instantiates` references (Controller→Service→Repository wiring). */
+function extractSpringDI(
+  filePath: string,
+  safe: string,
+  lang: 'java' | 'kotlin',
+  references: UnresolvedRef[],
+): void {
+  const findEnclosingClass = (pos: number): { name: string; line: number; charIndex: number } | null => {
+    const before = safe.slice(0, pos);
+    const classRe = /class\s+(\w+)/g;
+    let result: { name: string; line: number; charIndex: number } | null = null;
+    let m: RegExpExecArray | null;
+    while ((m = classRe.exec(before)) !== null) {
+      const classLine = before.slice(0, m.index).split('\n').length;
+      // Walk backwards from the class line to find the FIRST class-level
+      // annotation, matching tree-sitter's class_declaration start line.
+      const lines = before.split('\n');
+      let annoLine = classLine;
+      for (let i = classLine - 2; i >= 0 && i >= classLine - 15; i--) {
+        const ln = lines[i] ?? '';
+        if (/^\s*@[A-Z]\w+/.test(ln)) {
+          annoLine = i + 1;
+        } else if (ln.trim() && !/^\s*(?:public|private|protected|final|abstract|static)\b/.test(ln)) {
+          break;
+        }
+      }
+      result = { name: m[1]!, line: annoLine, charIndex: m.index };
+    }
+    return result;
+  };
+
+  const hasRequiredArgsConstructor = (classCharIndex: number): boolean => {
+    // Search backwards from the class match for the annotation
+    return /@RequiredArgsConstructor\b/.test(
+      safe.slice(Math.max(0, classCharIndex - 800), classCharIndex),
+    );
+  };
+
+  // Pattern A: @Autowired fields — matches `@Autowired\n    private Type name;`
+  const autowiredRe = /@Autowired\s+(?:(?:private|protected|public)\s+)?(?:final\s+)?(\w+(?:<[^>]*>)?)\s+(\w+)\s*[;=]/g;
+  let am: RegExpExecArray | null;
+  while ((am = autowiredRe.exec(safe)) !== null) {
+    const klass = findEnclosingClass(am.index);
+    if (!klass) continue;
+    references.push({
+      fromNodeId: generateNodeId(filePath, 'class', klass.name, klass.line),
+      referenceName: am[1]!,
+      referenceKind: 'instantiates',
+      line: safe.slice(0, am.index).split('\n').length,
+      column: 0,
+      filePath,
+      language: lang,
+    });
+  }
+
+  // Pattern B: private final fields in @RequiredArgsConstructor classes
+  const finalFieldRe = /private\s+final\s+(\w+(?:<[^>]*>)?)\s+(\w+)\s*[;=]/g;
+  let fm: RegExpExecArray | null;
+  while ((fm = finalFieldRe.exec(safe)) !== null) {
+    const klass = findEnclosingClass(fm.index);
+    if (!klass || !hasRequiredArgsConstructor(klass.charIndex)) continue;
+    references.push({
+      fromNodeId: generateNodeId(filePath, 'class', klass.name, klass.line),
+      referenceName: fm[1]!,
+      referenceKind: 'instantiates',
+      line: safe.slice(0, fm.index).split('\n').length,
       column: 0,
       filePath,
       language: lang,
