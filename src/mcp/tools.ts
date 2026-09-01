@@ -2613,9 +2613,16 @@ export class ToolHandler {
         const synthSeen = new Set<string>();
         for (const n of [...named.values(), ...dynNamed.values()]) {
           if (synthLines.length >= 6) break;
-          for (const { node: other, edge } of [...cg.getCallers(n.id), ...cg.getCallees(n.id)]) {
+          // RAW edges for the same reason as hasHeuristicEdge above — a static
+          // edge over the same pair hides the synthesized one from getCallers.
+          const incident = [...cg.getIncomingEdges(n.id), ...cg.getOutgoingEdges(n.id)];
+          for (const edge of incident) {
             if (synthLines.length >= 6) break;
-            if (edge.provenance !== 'heuristic' || other.id === n.id) continue;
+            if (edge.provenance !== 'heuristic') continue;
+            const otherId = edge.source === n.id ? edge.target : edge.source;
+            if (otherId === n.id) continue;
+            const other = cg.getNode(otherId);
+            if (!other) continue;
             if (skipInChain && skipInChain(edge)) continue;
             const src = edge.source === n.id ? n : other;
             const tgt = edge.source === n.id ? other : n;

@@ -360,8 +360,16 @@ export function resolveNamedTokens(
   const segPool = new Set<string>();
   for (const t of tokens) for (const s of t.toLowerCase().split(/::|\./)) if (s) segPool.add(s);
 
+  // RAW edges, not getCallers/getCallees: those return one row per NEIGHBOUR
+  // (the #1086 de-dup), so when a pair is joined by BOTH a static and a
+  // synthesized edge the static one wins and the synthesized one becomes
+  // invisible — which is exactly what happens once a thunk's `dispatch(x)`
+  // is walked statically. The question here is about the graph, not about
+  // callers, so ask the edges directly.
   const hasHeuristicEdge = (id: string): boolean =>
-    [...cg.getCallers(id), ...cg.getCallees(id)].some(({ edge }) => edge.provenance === 'heuristic');
+    [...cg.getIncomingEdges(id), ...cg.getOutgoingEdges(id)].some(
+      (e) => e.provenance === 'heuristic'
+    );
 
   for (const t of tokens) {
     const hits = findAllSymbols(cg, t).nodes;
