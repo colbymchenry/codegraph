@@ -11,6 +11,11 @@ import { laravelResolver } from './laravel';
 import { expressResolver } from './express';
 import { nestjsResolver } from './nestjs';
 import { reactResolver } from './react';
+import { nextjsResolver } from './nextjs';
+import { reactRouterResolver } from './react-router';
+import { tanstackRouterResolver } from './tanstack-router';
+import { vueRouterResolver } from './vue-router';
+import { svelteKitRouterResolver } from './sveltekit-router';
 import { svelteResolver } from './svelte';
 import { vueResolver } from './vue';
 import { astroResolver } from './astro';
@@ -26,6 +31,7 @@ import { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
 import { swiftObjcBridgeResolver } from './swift-objc';
 import { reactNativeBridgeResolver } from './react-native';
 import { expoModulesResolver } from './expo-modules';
+import { expoRouterResolver } from './expo-router';
 import { fabricViewResolver } from './fabric';
 import { cicsResolver } from './cics';
 import { terraformResolver } from './terraform';
@@ -41,8 +47,18 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   expressResolver,
   nestjsResolver,
   reactResolver,
+  // React Router — `<Route path>` routes are `reactResolver`'s; `history.push('/x')` / `navigate('/x')` → navigates edges
+  reactRouterResolver,
+  // TanStack Router — `createFileRoute('/x')` / `createRoute({ path })` → route nodes; `navigate({ to })` → navigates edges
+  tanstackRouterResolver,
+  // Next.js — `app/**/page.tsx` + `pages/**` → route nodes; `route.ts` exports → endpoints; `router.push('/x')` / `redirect('/x')` → navigates edges
+  nextjsResolver,
   svelteResolver,
+  // SvelteKit — `src/routes/**/+page.svelte` routes are `svelteResolver`'s; `goto('/x')` / `redirect(303, '/x')` → navigates edges
+  svelteKitRouterResolver,
   vueResolver,
+  // Vue Router — `createRouter({ routes })` → route nodes; `router.push({ name })` / `router.push('/x')` → navigates edges
+  vueRouterResolver,
   astroResolver,
   // Python
   djangoResolver,
@@ -70,6 +86,8 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   reactNativeBridgeResolver,
   // Expo Modules — Function/AsyncFunction/Property DSL on Swift/Kotlin
   expoModulesResolver,
+  // Expo Router — `app/` screen files → route nodes; `router.push('/x')` → navigates edges
+  expoRouterResolver,
   // React Native Fabric / Codegen view components — TS spec → component nodes
   fabricViewResolver,
   // CICS pseudo-conversational TRANSID hops (COBOL)
@@ -136,6 +154,10 @@ export { laravelResolver, FACADE_MAPPINGS } from './laravel';
 export { expressResolver } from './express';
 export { nestjsResolver } from './nestjs';
 export { reactResolver } from './react';
+export { reactRouterResolver } from './react-router';
+export { tanstackRouterResolver } from './tanstack-router';
+export { vueRouterResolver } from './vue-router';
+export { svelteKitRouterResolver } from './sveltekit-router';
 export { svelteResolver } from './svelte';
 export { vueResolver } from './vue';
 export { astroResolver } from './astro';
@@ -151,4 +173,5 @@ export { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
 export { swiftObjcBridgeResolver } from './swift-objc';
 export { reactNativeBridgeResolver } from './react-native';
 export { expoModulesResolver } from './expo-modules';
+export { expoRouterResolver } from './expo-router';
 export { fabricViewResolver } from './fabric';

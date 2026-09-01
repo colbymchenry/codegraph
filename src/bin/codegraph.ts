@@ -20,6 +20,7 @@
  *   codegraph callees <symbol>   Find what a function/method calls
  *   codegraph impact <symbol>    Analyze what code is affected by changing a symbol
  *   codegraph affected [files]   Find test files affected by changes
+ *   codegraph ui [path]          Open the browser viewer for an indexed project (alias: web)
  *   codegraph upgrade [version]  Update CodeGraph to the latest release
  */
 
@@ -53,6 +54,11 @@ import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime
 import { installCommandSupervision } from './command-supervision';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
 import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
+// Value import, but dependency-free by design so `--help` text can name the
+// default port without dragging node:http into every other subcommand; the
+// server itself is loaded lazily inside the `ui` action. See ui-server/constants.
+import { BROWSER_ENV, DEFAULT_UI_PORT } from '../ui-server/constants';
+import type { UiServerHandle } from '../ui-server';
 
 // Decided once, before `--color`/`--no-color` are stripped from argv below
 // (#1281). Piped/redirected stdout, NO_COLOR, or --no-color -> plain output.
@@ -1827,6 +1833,191 @@ program
       note: (m) => clack.log.success(m),
       done: (m) => clack.outro(m),
     });
+  });
+
+/**
+ * Print the "no index here" guidance.
+ *
+ * The viewer READS an index; it never builds one — indexing stays the user's
+ * decision, exactly as it is for the MCP tools. So a missing index is normal
+ * input, not a failure to apologize for: say what is missing, say the one
+ * command that fixes it, and never print a stack trace.
+ */
+function printNoIndexGuidance(projectPath: string): void {
+  error(`No CodeGraph index found for ${projectPath}`);
+  console.error('');
+  // getGlyphs() (not a literal em dash): a legacy Windows console decodes raw
+  // UTF-8 with its OEM codepage and renders one as mojibake (#168).
+  console.error(`  The viewer reads an index that already exists ${getGlyphs().dash} it never creates one.`);
+  console.error('  To index this project:');
+  console.error('');
+  console.error(`    ${chalk.cyan('codegraph init')}`);
+  console.error('');
+  console.error('  Already indexed somewhere else? Point the viewer at it:');
+  console.error('');
+  console.error(`    ${chalk.cyan('codegraph ui /path/to/indexed/project')}`);
+  console.error('');
+}
+
+/**
+ * codegraph ui [path]  (alias: web)
+ *
+ * The browser reader: serves the built viewer (`dist/viewer/`) over loopback
+ * and opens it. It opens the index for reading and never writes to it, never
+ * indexes, and never changes a line of the project's code. The single thing it
+ * writes is a trail the reader saved, as JSON under `.codegraph/ui/trails/`;
+ * `--read-only` turns even that off.
+ *
+ * Deliberately absent from TELEMETRY_FLUSH_COMMANDS above: the command's own
+ * banner tells the user nothing leaves their machine, so it must not be the
+ * thing that triggers a telemetry send. The usage count still buffers locally
+ * like every other quick command.
+ */
+program
+  .command('ui [path]')
+  .alias('web')
+  .description('Open the CodeGraph viewer in your browser — read your indexed project as a graph')
+  .option('--port <number>', `Port to listen on (default: ${DEFAULT_UI_PORT}, or the next free one)`)
+  .option('--no-open', 'Print the URL instead of opening a browser')
+  .option('--read-only', 'Refuse every write — saved trails can be opened but not saved or deleted')
+  .addHelpText(
+    'after',
+    `
+Examples:
+  $ codegraph ui                    Read the project you're standing in
+  $ codegraph ui ~/code/my-app      Read a specific indexed project
+  $ codegraph ui --port 8080        Use one specific port (fails if it's taken)
+  $ codegraph ui --no-open          Just print the URL (headless boxes, SSH)
+  $ codegraph web                   Same command under its alias
+
+Pick a symbol and you see who calls it on the left, its source in the middle,
+and what it calls on the right at the height of the line that calls it. Search
+with / (or Cmd-K), click a file path for the file's outline and its imports.
+
+Ask "how does execute reach getFile" (or "execute -> getFile") in the search
+box for the flow between two symbols: one card per hop, opened at the line that
+makes the next call, with dynamic-dispatch hops drawn dashed and named. The Map
+tab draws the whole project by module, with dependencies pointing down.
+
+Never opened this codebase before? The Entry points tab lists the routes with
+the symbols that serve them, the files that run something when they load, the
+tests, and what the most code depends on — and starts a flow from any of them.
+
+The page keeps up with the project while it is open: save a file and it says so
+within about a third of a second, and whatever is on screen re-reads the graph
+when something re-indexes it. It watches for that; it never polls.
+
+Save a walk you want to keep: name the trail and it is written to
+.codegraph/ui/trails/ (already gitignored) as plain JSON, listed on the empty
+screen, and reopened at the symbol you left. Hops are remembered by name rather
+than by position, so a saved trail survives re-indexing and says which hop moved
+when one does. Pass --read-only to refuse every write.
+
+The viewer listens on 127.0.0.1 only, so nothing on your network can reach it.
+It opens an index that already exists, never indexes, and never changes a line
+of your code — the one thing it writes is a trail you asked it to save.
+Requests from any other host are refused, and nothing is sent anywhere: no code,
+no paths, no analytics.
+
+Without --port it takes ${DEFAULT_UI_PORT}, or the next free port if that one is busy.
+
+Set ${BROWSER_ENV}=<command> to choose which browser opens, or
+${BROWSER_ENV}=none to never open one.
+`
+  )
+  .action(async (pathArg: string | undefined, options: { port?: string; open?: boolean; readOnly?: boolean }) => {
+    // An explicit --port stays explicit: a scripted `--port 8080` that quietly
+    // lands on 8081 is worse than one that says the port is busy. The default
+    // port is the only one we're free to walk away from.
+    let requestedPort: number | undefined;
+    if (options.port !== undefined) {
+      requestedPort = Number(options.port);
+      if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65535) {
+        error(`--port must be a whole number between 0 and 65535 (got "${options.port}").`);
+        process.exit(1);
+      }
+    }
+
+    const projectPath = resolveProjectPath(pathArg);
+
+    // Sensitive-directory refusal before anything opens: the same guard the MCP
+    // entry points use, so `codegraph ui /etc` is turned away here rather than
+    // becoming a browsable view of the system.
+    const { validateProjectPath } = await import('../utils');
+    const rootError = validateProjectPath(projectPath);
+    if (rootError) {
+      error(rootError);
+      process.exit(1);
+    }
+
+    if (!isInitialized(projectPath)) {
+      printNoIndexGuidance(projectPath);
+      process.exit(1);
+    }
+
+    const { startUiServer, openBrowser, createGraphApi, ViewerMissingError } = await import(
+      '../ui-server'
+    );
+
+    // The JSON API the viewer reads its screens from. It opens the index lazily
+    // on the first request, so a slow first paint is the only cost of mounting
+    // it here rather than after the browser connects.
+    const readOnly = options.readOnly === true;
+    const api = createGraphApi({
+      projectRoot: projectPath,
+      readOnly,
+      readOnlyReason: readOnly
+        ? 'This viewer was started with --read-only, so trails cannot be saved.'
+        : undefined,
+    });
+
+    let handle: UiServerHandle;
+    try {
+      handle = await startUiServer({
+        projectRoot: projectPath,
+        port: requestedPort,
+        portFallback: requestedPort === undefined,
+        api: api.handler,
+      });
+    } catch (err) {
+      api.close();
+      // Both failure modes here (viewer assets missing, no port available) carry
+      // their own remediation — print it plainly, never a stack trace.
+      error(err instanceof ViewerMissingError || err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+
+    console.log('');
+    console.log(chalk.bold('CodeGraph viewer'));
+    console.log('');
+    console.log(`  ${chalk.dim('Reading')}  ${projectPath}`);
+    console.log(`  ${chalk.dim('URL')}      ${chalk.cyan(handle.url)}`);
+    console.log(
+      `  ${chalk.dim('Access')}   this machine only ${getGlyphs().dash} ` +
+        (readOnly
+          ? 'read-only, nothing leaves your computer'
+          : 'nothing leaves your computer; saved trails are the only thing written')
+    );
+    console.log('');
+
+    const opened = options.open === false ? false : openBrowser(handle.url);
+    console.log(
+      opened
+        ? chalk.dim('  Opening your browser... press Ctrl+C to stop.')
+        : chalk.dim('  Open that URL in a browser. Press Ctrl+C to stop.')
+    );
+    console.log('');
+
+    // The http server keeps the event loop alive on its own; these just make
+    // Ctrl-C hang up live sockets instead of waiting on browser keep-alives.
+    const shutdown = (): void => {
+      // Release the SQLite handle before the socket: the process should never
+      // exit with a live connection to the user's index.
+      api.close();
+      void handle.close().then(() => process.exit(0));
+    };
+    process.once('SIGINT', shutdown);
+    process.once('SIGTERM', shutdown);
   });
 
 /**

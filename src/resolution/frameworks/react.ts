@@ -1,11 +1,13 @@
 /**
  * React Framework Resolver
  *
- * Handles React and Next.js patterns.
+ * Handles React patterns: React Router routes, components, hooks, contexts.
+ * Next.js pages, route handlers and navigation are `nextjs.ts`'s.
  */
 
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
+import { dependsOn } from './package-deps';
 
 export const reactResolver: FrameworkResolver = {
   name: 'react',
@@ -17,19 +19,8 @@ export const reactResolver: FrameworkResolver = {
   languages: ['javascript', 'typescript', 'tsx', 'jsx'],
 
   detect(context: ResolutionContext): boolean {
-    // Check for React in package.json
-    const packageJson = context.readFile('package.json');
-    if (packageJson) {
-      try {
-        const pkg = JSON.parse(packageJson);
-        const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-        if (deps.react || deps.next || deps['react-native']) {
-          return true;
-        }
-      } catch {
-        // Invalid JSON
-      }
-    }
+    // React in a package.json — the root's, or a workspace's (`frontend/`, `apps/web/`).
+    if (dependsOn(context, 'react', 'next', 'react-native')) return true;
 
     // Check for .jsx/.tsx files
     const allFiles = context.getAllFiles();
@@ -190,31 +181,7 @@ export const reactResolver: FrameworkResolver = {
       }
     }
 
-    // Extract Next.js pages/routes (pages directory convention)
-    if (filePath.includes('pages/') || filePath.includes('app/')) {
-      // Default export in pages becomes a route
-      if (content.includes('export default')) {
-        const routePath = filePathToRoute(filePath);
-        if (routePath) {
-          const line = content.indexOf('export default');
-          const lineNum = content.slice(0, line).split('\n').length;
-
-          nodes.push({
-            id: `route:${filePath}:${routePath}:${lineNum}`,
-            kind: 'route',
-            name: routePath,
-            qualifiedName: `${filePath}::route:${routePath}`,
-            filePath,
-            startLine: lineNum,
-            endLine: lineNum,
-            startColumn: 0,
-            endColumn: 0,
-            language: filePath.endsWith('.tsx') ? 'tsx' : filePath.endsWith('.ts') ? 'typescript' : 'javascript',
-            updatedAt: now,
-          });
-        }
-      }
-    }
+    // Next.js pages and route handlers are `frameworks/nextjs.ts`'s.
 
     return { nodes, references };
   },
@@ -317,53 +284,4 @@ function resolveContext(name: string, context: ResolutionContext): string | null
   if (preferred.length > 0) return preferred[0]!.id;
 
   return candidates[0]!.id;
-}
-
-/**
- * Convert file path to Next.js route
- */
-function filePathToRoute(filePath: string): string | null {
-  // pages/index.tsx -> /
-  // pages/about.tsx -> /about
-  // pages/blog/[slug].tsx -> /blog/:slug
-  // app/page.tsx -> /
-  // app/about/page.tsx -> /about
-
-  // Only real page-component files are routes. Exclude non-page extensions
-  // (.mjs/.json/.cjs), config files (next.config.ts, vite.config.ts…), and
-  // Next.js special files (_app/_document). This also stops a `*.config.mjs`
-  // with `export default` in a dir like `nextjs-pages/` from being a "route".
-  const base = filePath.split('/').pop() ?? '';
-  if (!/\.(tsx?|jsx?)$/.test(base)) return null;
-  if (base.startsWith('_') || /\.config\.[a-z]+$/.test(base)) return null;
-
-  // Match pages/ and app/ as PATH SEGMENTS (not a substring — `nextjs-pages/`
-  // must not count as a `pages/` router dir).
-  if (/(?:^|\/)pages\//.test(filePath)) {
-    let route = filePath
-      .replace(/^.*pages\//, '/')
-      .replace(/\/index\.(tsx?|jsx?)$/, '')
-      .replace(/\.(tsx?|jsx?)$/, '')
-      .replace(/\[([^\]]+)\]/g, ':$1');
-
-    if (route === '') route = '/';
-    return route;
-  }
-
-  if (/(?:^|\/)app\//.test(filePath)) {
-    // App router - only page.tsx files are routes
-    if (!filePath.includes('page.')) {
-      return null;
-    }
-
-    let route = filePath
-      .replace(/^.*app\//, '/')
-      .replace(/\/page\.(tsx?|jsx?)$/, '')
-      .replace(/\[([^\]]+)\]/g, ':$1');
-
-    if (route === '') route = '/';
-    return route;
-  }
-
-  return null;
 }
