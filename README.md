@@ -530,6 +530,39 @@ npm install -g @colbymchenry/codegraph
 </details>
 
 <details>
+<summary><strong>GitHub Copilot CLI (manual setup)</strong></summary>
+
+The interactive installer doesn't auto-configure [GitHub Copilot CLI](https://docs.github.com/copilot/concepts/agents/about-copilot-cli) yet, so wire it up by hand — it takes about a minute.
+
+**1. Install the `codegraph` CLI** (if you haven't already) — see [Get Started](#get-started).
+
+**2. Add the MCP server to `~/.copilot/mcp-config.json`:**
+```json
+{
+  "mcpServers": {
+    "codegraph": {
+      "type": "stdio",
+      "command": "codegraph",
+      "args": ["serve", "--mcp"],
+      "tools": ["*"]
+    }
+  }
+}
+```
+
+<sub>Unlike Claude Code, Copilot CLI **requires the `tools` key** — without it, none of CodeGraph's tools are enabled. `["*"]` enables them all; to allowlist explicitly instead, list the tool names (`codegraph_search`, `codegraph_explore`, `codegraph_callers`, `codegraph_callees`, `codegraph_impact`, `codegraph_node`, `codegraph_status`, `codegraph_files`). The config file lives in `~/.copilot` by default — set `COPILOT_HOME` to relocate it. You can also add the server interactively with the `/mcp add` slash command instead of editing the file.</sub>
+
+**3. Reload MCP servers** — run `/mcp` in an interactive session (or `/restart`) so Copilot CLI launches `codegraph serve --mcp`. Confirm it connected with `/mcp` or `/env`.
+
+**4. Initialize the project** so the server has an index to answer against:
+```bash
+cd your-project
+codegraph init -i
+```
+
+</details>
+
+<details>
 <summary><strong>Agent Tool Guidance</strong></summary>
 
 CodeGraph's MCP server delivers its usage guidance to your agent **automatically**, in the MCP `initialize` response. In short, it tells the agent to:
@@ -860,6 +893,8 @@ is written):
 - **Antigravity IDE**
 - **Kiro**
 - **GitHub Copilot** — Copilot Chat in VS Code (`copilot-vscode`), the Copilot CLI (`copilot-cli`), and the Copilot plugin in JetBrains IDEs (`copilot-jetbrains`)
+
+> **GitHub Copilot CLI** is also supported via a quick manual config — see [GitHub Copilot CLI (manual setup)](#quick-start) under Quick Start.
 
 ## Supported Languages
 
