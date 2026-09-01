@@ -23,6 +23,7 @@ import {
   TaskContext,
   BuildContextOptions,
   FindRelevantContextOptions,
+  ImpactOptions,
   UnresolvedReference,
 } from './types';
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
@@ -816,7 +817,8 @@ export class CodeGraph {
           try { return this.queries.isNameSegmentVocabEmpty(); } catch { return false; }
         })();
 
-        const result = await this.orchestrator.sync(options.onProgress, options.paths);
+        const backpressure = walValve ? () => walValve!.backpressure() : undefined;
+        const result = await this.orchestrator.sync(options.onProgress, options.paths, backpressure);
 
         // Fold the store phase's WAL BEFORE the post-store reads below
         // (resolution reads on the main thread) — same rationale as
@@ -914,7 +916,8 @@ export class CodeGraph {
                   current: done,
                   total: totalPasses,
                 });
-              }
+              },
+              backpressure
             );
           }
         }
@@ -980,7 +983,8 @@ export class CodeGraph {
                 current: done,
                 total: totalPasses,
               });
-            }
+            },
+            backpressure
           );
         }
 
@@ -1986,8 +1990,8 @@ export class CodeGraph {
    * @param maxDepth - Maximum depth to traverse (default: 3)
    * @returns Subgraph containing potentially impacted nodes
    */
-  getImpactRadius(nodeId: string, maxDepth: number = 3): Subgraph {
-    return this.traverser.getImpactRadius(nodeId, maxDepth);
+  getImpactRadius(nodeId: string, maxDepth: number = 3, options: ImpactOptions = {}): Subgraph {
+    return this.traverser.getImpactRadius(nodeId, maxDepth, options);
   }
 
   /**

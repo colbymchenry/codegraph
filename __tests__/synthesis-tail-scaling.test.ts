@@ -9,7 +9,7 @@
  * SQL-side, and language-gates passes off the files table.
  *
  * These tests pin the query-level building blocks and the end-to-end kotlin
- * bridge so the memory fix can't silently change what gets synthesized.
+ * bridge so the memory fixes can't silently change what gets synthesized.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
@@ -99,5 +99,20 @@ class C {
     expect(langs.has('python')).toBe(true);
     expect(langs.has('kotlin')).toBe(false);
     cg.close();
+  });
+
+  it('does not rescan source prefixes to locate every synthesized edge', () => {
+    const source = fs.readFileSync(
+      path.resolve('src/resolution/callback-synthesizer.ts'),
+      'utf8'
+    );
+    const prefixRescans = source
+      .split('\n')
+      .filter((line) => !/^(?:\/\/|\*)/.test(line.trimStart()))
+      .filter((line) => line.includes('.slice(0,') && line.includes(".split('\\n').length"));
+
+    // Repeating this expression for every regex match makes a match-dense file O(n²).
+    // Wall-clock thresholds are too noisy for CI, so pin the allocation pattern directly.
+    expect(prefixRescans).toEqual([]);
   });
 });

@@ -2393,23 +2393,39 @@ export class ToolHandler {
       : '';
 
     const impactOf = (defNodes: Node[]) => {
+      const maxNodes = 1_000;
+      const maxEdges = 5_000;
       const mergedNodes = new Map<string, Node>();
       const mergedEdges: Edge[] = [];
       const seenEdges = new Set<string>();
+      let truncated = false;
       for (const node of defNodes) {
-        const impact = cg.getImpactRadius(node.id, depth);
+        const impact = cg.getImpactRadius(node.id, depth, { maxNodes, maxEdges });
+        truncated ||= impact.truncated === true;
         for (const [id, n] of impact.nodes) {
+          if (!mergedNodes.has(id) && mergedNodes.size >= maxNodes) {
+            truncated = true;
+            continue;
+          }
           mergedNodes.set(id, n);
         }
         for (const e of impact.edges) {
+          if (!mergedNodes.has(e.source) || !mergedNodes.has(e.target)) {
+            truncated = true;
+            continue;
+          }
           const key = `${e.source}->${e.target}:${e.kind}`;
           if (!seenEdges.has(key)) {
+            if (mergedEdges.length >= maxEdges) {
+              truncated = true;
+              continue;
+            }
             seenEdges.add(key);
             mergedEdges.push(e);
           }
         }
       }
-      return { nodes: mergedNodes, edges: mergedEdges, roots: defNodes.map((n) => n.id) };
+      return { nodes: mergedNodes, edges: mergedEdges, roots: defNodes.map((n) => n.id), truncated };
     };
 
     // Single definition (or same-file overloads): the familiar merged report.
@@ -6727,9 +6743,12 @@ export class ToolHandler {
 
     // Compact format: just list affected symbols grouped by file
     const lines: string[] = [
-      `**Impact: "${symbol}" affects ${nodeCount} symbols**`,
+      `**Impact: "${symbol}" affects ${nodeCount} symbols${impact.truncated ? ' (truncated at safety limit)' : ''}**`,
       '',
     ];
+    if (impact.truncated) {
+      lines.push('> Result truncated to protect the MCP process on a high-fanout graph. Narrow with `file` or reduce `depth`.', '');
+    }
 
     // Group by file
     const byFile = new Map<string, Node[]>();

@@ -13,13 +13,25 @@
  */
 export class LRUCache<K, V> {
   private readonly max: number;
+  private readonly maxWeight: number | null;
+  private readonly weightOf: ((value: V, key: K) => number) | null;
   private readonly store = new Map<K, V>();
+  private readonly weights = new Map<K, number>();
+  private totalWeight = 0;
 
-  constructor(max: number) {
+  constructor(
+    max: number,
+    opts: { maxWeight: number; weightOf: (value: V, key: K) => number } | null = null
+  ) {
     if (!Number.isFinite(max) || max <= 0) {
       throw new Error(`LRUCache max must be a positive finite number, got ${max}`);
     }
+    if (opts && (!Number.isFinite(opts.maxWeight) || opts.maxWeight <= 0)) {
+      throw new Error(`LRUCache maxWeight must be a positive finite number, got ${opts.maxWeight}`);
+    }
     this.max = Math.floor(max);
+    this.maxWeight = opts ? Math.floor(opts.maxWeight) : null;
+    this.weightOf = opts?.weightOf ?? null;
   }
 
   get size(): number {
@@ -45,18 +57,35 @@ export class LRUCache<K, V> {
 
   set(key: K, value: V): void {
     if (this.store.has(key)) {
+      this.totalWeight -= this.weights.get(key) ?? 0;
       this.store.delete(key);
-    } else if (this.store.size >= this.max) {
+      this.weights.delete(key);
+    }
+
+    const weight = this.weightOf ? Math.max(0, Math.ceil(this.weightOf(value, key))) : 0;
+    if (this.maxWeight !== null && weight > this.maxWeight) return;
+
+    while (
+      this.store.size >= this.max ||
+      (this.maxWeight !== null && this.totalWeight + weight > this.maxWeight)
+    ) {
       // Evict the oldest entry — first key in iteration order.
       const oldest = this.store.keys().next().value;
-      if (oldest !== undefined) {
-        this.store.delete(oldest);
-      }
+      if (oldest === undefined) break;
+      this.totalWeight -= this.weights.get(oldest) ?? 0;
+      this.weights.delete(oldest);
+      this.store.delete(oldest);
     }
     this.store.set(key, value);
+    if (this.maxWeight !== null) {
+      this.weights.set(key, weight);
+      this.totalWeight += weight;
+    }
   }
 
   clear(): void {
     this.store.clear();
+    this.weights.clear();
+    this.totalWeight = 0;
   }
 }

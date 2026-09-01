@@ -932,6 +932,42 @@ describe('FileWatcher', () => {
       expect(calls[0]).toBeUndefined();
     });
 
+    it.skipIf(process.platform !== 'linux')('closes descendant watches when a watched directory is removed', async () => {
+      const calls: (string[] | undefined)[] = [];
+      const callbacks = new Map<string, (event: string, filename: string | Buffer | null) => void>();
+      const closeCounts = new Map<string, number>();
+      __setFsWatchForTests(((dir: fs.PathLike, _opts: unknown, cb: (event: string, filename: string | Buffer | null) => void) => {
+        const key = String(dir);
+        callbacks.set(key, cb);
+        const watcher = new EventEmitter() as fs.FSWatcher;
+        watcher.close = () => closeCounts.set(key, (closeCounts.get(key) ?? 0) + 1);
+        return watcher;
+      }) as typeof fs.watch);
+      const watcher = new FileWatcher(
+        testDir,
+        async (paths?: string[]) => {
+          calls.push(paths);
+          return { filesChanged: 1, durationMs: 1 };
+        },
+        { debounceMs: 30 }
+      );
+
+      const nestedDir = path.join(testDir, 'src', 'nested');
+      fs.mkdirSync(nestedDir);
+      expect(watcher.start()).toBe(true);
+      const srcDir = path.join(testDir, 'src');
+      expect(callbacks.has(srcDir)).toBe(true);
+      expect(callbacks.has(nestedDir)).toBe(true);
+      fs.rmSync(srcDir, { recursive: true });
+      callbacks.get(testDir)!('rename', 'src');
+      await new Promise((r) => setTimeout(r, 500));
+
+      expect(closeCounts.get(srcDir)).toBe(1);
+      expect(closeCounts.get(nestedDir)).toBe(1);
+      expect(calls[0]).toBeUndefined();
+      watcher.stop();
+    });
+
     it('a lone file event fires on the quick window, well before the full debounce', async () => {
       const calls: (string[] | undefined)[] = [];
       const syncFn: SyncFn = async (paths?: string[]) => {

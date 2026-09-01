@@ -516,7 +516,8 @@ export class FileWatcher {
       if (isInotifyWatchExhaustion(err)) {
         this.warnInotifyLimit({ error: String(err), dir });
       }
-      this.unwatchDir(dir);
+      this.unwatchSubtree(dir);
+      this.maybeScheduleForRemovedDir(normalizePath(path.relative(this.projectRoot, dir)));
     });
     this.dirWatchers.set(dir, w);
 
@@ -556,7 +557,15 @@ export class FileWatcher {
         return;
       }
     } catch {
-      // deleted/inaccessible — treat as a normal change below
+      // If this path used to own a watch, it was a directory. Linux often emits
+      // only the parent's rename event and no watcher error for the removed
+      // subtree, so close every descendant watch here and force a scan-diff.
+      if (this.unwatchSubtree(full) > 0) {
+        this.needsFullScan = true;
+        this.scheduleSync();
+        return;
+      }
+      // Deleted/inaccessible ordinary file — treat as a normal change below.
     }
 
     this.handleChange(normalizePath(path.relative(this.projectRoot, full)));
@@ -668,17 +677,21 @@ export class FileWatcher {
     this.scheduleSync();
   }
 
-  /** Close and forget the watch for a directory that errored/was removed. */
-  private unwatchDir(dir: string): void {
-    const w = this.dirWatchers.get(dir);
-    if (w) {
+  /** Close and forget a removed directory and every watched descendant. */
+  private unwatchSubtree(dir: string): number {
+    let removed = 0;
+    const prefix = dir.endsWith(path.sep) ? dir : dir + path.sep;
+    for (const [watchedDir, w] of [...this.dirWatchers]) {
+      if (watchedDir !== dir && !watchedDir.startsWith(prefix)) continue;
       try {
         w.close();
       } catch {
         /* already closed */
       }
-      this.dirWatchers.delete(dir);
+      this.dirWatchers.delete(watchedDir);
+      removed++;
     }
+    return removed;
   }
 
   /** Our own dirs are always ignored, regardless of .gitignore. */

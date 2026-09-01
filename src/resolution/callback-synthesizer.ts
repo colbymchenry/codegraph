@@ -575,6 +575,7 @@ async function arkuiEmitterEdges(ctx: ResolutionContext, onYield: MaybeYield): P
     const content = ctx.readFile(file);
     if (!content || !content.includes('emitter.')) continue;
     const safe = stripCommentsForRegex(content, 'typescript');
+    const lineAt = makeLineAt(safe, 1);
     const nodes = ctx.getNodesInFile(file)
       .filter((n) => n.kind === 'method' || n.kind === 'function');
 
@@ -583,7 +584,7 @@ async function arkuiEmitterEdges(ctx: ResolutionContext, onYield: MaybeYield): P
     while ((m = ARKUI_EMITTER_CALL_RE.exec(safe))) {
       const verb = m[1]!;
       const arg = m[2]!.trim();
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineAt(m.index);
       const encl = nodes
         .filter((n) => n.startLine <= line && n.endLine >= line)
         .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
@@ -680,6 +681,7 @@ async function arkuiRouterEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
     const content = ctx.readFile(file);
     if (!content || !content.includes('router.')) continue;
     const safe = stripCommentsForRegex(content, 'typescript');
+    const lineAt = makeLineAt(safe, 1);
     const nodes = ctx.getNodesInFile(file)
       .filter((n) => n.kind === 'method' || n.kind === 'function');
 
@@ -687,7 +689,7 @@ async function arkuiRouterEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
     let m: RegExpExecArray | null;
     while ((m = ARKUI_ROUTER_RE.exec(safe))) {
       const url = m[1]!;
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineAt(m.index);
       const encl = nodes
         .filter((n) => n.startLine <= line && n.endLine >= line)
         .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
@@ -1950,13 +1952,14 @@ async function ginMiddlewareChainEdges(queries: QueryBuilder, ctx: ResolutionCon
     const content = ctx.readFile(file);
     if (!content || (!content.includes('.Use(') && !/\.(?:GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD|Any|Handle)\(/.test(content))) continue;
     const safe = stripCommentsForRegex(content, 'go');
+    const lineAt = makeLineAt(safe, 1);
     GIN_REG_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = GIN_REG_RE.exec(safe))) {
       const parenIdx = m.index + m[0].length - 1;
       const argStr = goBalancedArgs(safe, parenIdx);
       if (!argStr) continue;
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineAt(m.index);
       for (const arg of goSplitArgs(argStr)) {
         const name = goHandlerIdent(arg);
         if (name && !registered.has(name)) registered.set(name, `${file}:${line}`);
@@ -2109,6 +2112,7 @@ async function reduxThunkEdges(queries: QueryBuilder, ctx: ResolutionContext, on
     if (!src) continue;
     // Thunks are TS/JS-family (same // and /* */ comment syntax); map to a CommentLang.
     const safe = stripCommentsForRegex(src, node.language === 'javascript' || node.language === 'jsx' ? 'javascript' : 'typescript');
+    const lineAt = makeLineAt(safe, node.startLine);
     THUNK_DISPATCH_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
     let added = 0;
@@ -2133,7 +2137,7 @@ async function reduxThunkEdges(queries: QueryBuilder, ctx: ResolutionContext, on
       const key = `${node.id}>${target.id}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      const line = node.startLine + safe.slice(0, m.index).split('\n').length - 1;
+      const line = lineAt(m.index);
       edges.push({
         source: node.id,
         target: target.id,
@@ -2242,6 +2246,7 @@ async function objectRegistryEdges(ctx: ResolutionContext, onYield: MaybeYield):
     const newlines = (content.match(/\n/g)?.length ?? 0) + 1;
     if (content.length / newlines > 200) continue;
     const safe = stripCommentsForRegex(content, /\.(?:jsx?|mjs|cjs)$/.test(file) ? 'javascript' : 'typescript');
+    const lineAt = makeLineAt(safe, 1);
 
     // 1. Dispatch sites: `(new )?<ref>[<ident-key>]` followed by a call or a chained method.
     //    A quoted-string key (`['save']`) does NOT match — that's a static access, not dispatch.
@@ -2251,7 +2256,7 @@ async function objectRegistryEdges(ctx: ResolutionContext, onYield: MaybeYield):
     while ((dm = REGISTRY_DISPATCH_RE.exec(safe))) {
       const win = safe.slice(dm.index, dm.index + 160);
       const cm = /\]\s*\([^)]*\)\s*\.\s*([A-Za-z_$][\w$]*)/.exec(win) || /\]\s*\.\s*([A-Za-z_$][\w$]*)/.exec(win);
-      dispatches.push({ ref: dm[1]!, line: safe.slice(0, dm.index).split('\n').length, chained: cm ? cm[1]! : null });
+      dispatches.push({ ref: dm[1]!, line: lineAt(dm.index), chained: cm ? cm[1]! : null });
     }
     if (!dispatches.length) continue;
     // Normalize a leading `this.` so a class FIELD-INITIALIZER registry (`commands = {…}`)
@@ -2270,7 +2275,7 @@ async function objectRegistryEdges(ctx: ResolutionContext, onYield: MaybeYield):
       if (!body) continue;
       const names = registryEntryNames(body); // depth-0 `key: Identifier` entries only
       if (names.length >= REGISTRY_MIN_ENTRIES) {
-        registries.set(lhs, { names, line: safe.slice(0, am.index).split('\n').length });
+        registries.set(lhs, { names, line: lineAt(am.index) });
       }
     }
     if (!registries.size) continue;
@@ -2402,6 +2407,7 @@ async function piniaStoreEdges(ctx: ResolutionContext, onYield: MaybeYield): Pro
     const content = ctx.readFile(file);
     if (!content || !content.includes('Store')) continue;
     const safe = stripCommentsForRegex(content, /\.(?:jsx?|mjs|cjs)$/.test(file) ? 'javascript' : 'typescript');
+    const lineAt = makeLineAt(safe, 1);
 
     // 2. Bind store vars in this file: `const <var> = <known-factory>(...)`.
     const varStore = new Map<string, string>();
@@ -2423,7 +2429,7 @@ async function piniaStoreEdges(ctx: ResolutionContext, onYield: MaybeYield): Pro
       const storeFile = varStore.get(cm[1]!);
       if (!storeFile) continue;
       const method = cm[2]!;
-      const line = safe.slice(0, cm.index).split('\n').length;
+      const line = lineAt(cm.index);
       const disp = enclosingFn(nodesInFile, line) ?? fallbackDispatcher;
       if (!disp) continue;
       const target = ctx
@@ -2508,6 +2514,7 @@ async function vuexDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield): P
     const content = ctx.readFile(file);
     if (!content || (!content.includes('dispatch(') && !content.includes('commit('))) continue;
     const safe = stripCommentsForRegex(content, /\.(?:jsx?|mjs|cjs)$/.test(file) ? 'javascript' : 'typescript');
+    const lineAt = makeLineAt(safe, 1);
     const nodesInFile = ctx.getNodesInFile(file);
     const fallback = nodesInFile.find((n) => n.kind === 'component'); // .vue top-level
     VUEX_DISPATCH_RE.lastIndex = 0;
@@ -2515,7 +2522,7 @@ async function vuexDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield): P
     let added = 0;
     while ((m = VUEX_DISPATCH_RE.exec(safe)) && added < VUEX_FANOUT_CAP) {
       const key = m[1]!;
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineAt(m.index);
       const disp = enclosingFn(nodesInFile, line) ?? fallback;
       if (!disp) continue;
       const target = resolve(key, file);
@@ -2605,13 +2612,14 @@ async function celeryDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield):
     const content = ctx.readFile(file);
     if (!content || (!content.includes('.delay(') && !content.includes('.apply_async('))) continue;
     const safe = stripCommentsForRegex(content, 'python');
+    const lineAt = makeLineAt(safe, 1);
     const nodesInFile = ctx.getNodesInFile(file);
     CELERY_DISPATCH_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
     let added = 0;
     while ((m = CELERY_DISPATCH_RE.exec(safe)) && added < CELERY_FANOUT_CAP) {
       const name = m[1]!;
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineAt(m.index);
       const disp = enclosingFn(nodesInFile, line);
       if (!disp) continue; // module-level dispatch — no source symbol to attribute
       const target = resolve(name, file);
@@ -2726,6 +2734,7 @@ async function springEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
     const content = ctx.readFile(file);
     if (!content || !content.includes('.publishEvent(')) continue;
     const safe = stripCommentsForRegex(content, 'java');
+    const lineAt = makeLineAt(safe, 1);
     const nodesInFile = ctx.getNodesInFile(file);
     SPRING_PUBLISH_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
@@ -2733,7 +2742,7 @@ async function springEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
     while ((m = SPRING_PUBLISH_RE.exec(safe)) && added < SPRING_FANOUT_CAP) {
       const targets = listeners.get(m[1]!);
       if (!targets || !targets.length) continue;
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineAt(m.index);
       const disp = enclosingFn(nodesInFile, line);
       if (!disp) continue;
       for (const target of targets) {
@@ -2839,6 +2848,7 @@ async function mediatrDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield)
     const content = ctx.readFile(file);
     if (!content || (!content.includes('.Send(') && !content.includes('.Publish('))) continue;
     const safe = stripCommentsForRegex(content, 'csharp');
+    const lineAt = makeLineAt(safe, 1);
     const safeLines = safe.split('\n');
     const nodesInFile = ctx.getNodesInFile(file);
     MEDIATR_DISPATCH_RE.lastIndex = 0;
@@ -2846,7 +2856,7 @@ async function mediatrDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield)
     let added = 0;
     while ((m = MEDIATR_DISPATCH_RE.exec(safe)) && added < MEDIATR_FANOUT_CAP) {
       if (!MEDIATR_RECEIVER_RE.test(m[1]!)) continue; // not a mediator (MessagingCenter, HttpClient, …)
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineAt(m.index);
       const disp = enclosingFn(nodesInFile, line);
       if (!disp) continue;
       const type = resolveMediatrArgType(m[2]!, safeLines, disp.startLine, line);
@@ -2937,12 +2947,13 @@ async function sidekiqDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield)
     const content = ctx.readFile(file);
     if (!content || !/\.perform_(?:async|in|at)\b/.test(content)) continue;
     const safe = stripCommentsForRegex(content, 'ruby');
+    const lineAt = makeLineAt(safe, 1);
     const nodesInFile = ctx.getNodesInFile(file);
     SIDEKIQ_DISPATCH_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
     let added = 0;
     while ((m = SIDEKIQ_DISPATCH_RE.exec(safe)) && added < SIDEKIQ_FANOUT_CAP) {
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineAt(m.index);
       const disp = enclosingFn(nodesInFile, line);
       if (!disp) continue;
       const target = resolve(m[1]!);
@@ -3308,6 +3319,7 @@ async function erlangBehaviourDispatchEdges(queries: QueryBuilder, ctx: Resoluti
     const content = ctx.readFile(file);
     if (!content || !/[A-Z][A-Za-z0-9_@]*:[a-z]/.test(content)) continue;
     const safe = stripCommentsForRegex(content, 'erlang');
+    const lineAt = makeLineAt(safe, 1);
     const nodesInFile = ctx.getNodesInFile(file);
     ERLANG_DISPATCH_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
@@ -3322,7 +3334,7 @@ async function erlangBehaviourDispatchEdges(queries: QueryBuilder, ctx: Resoluti
       const behaviour = behaviours[0]!;
       const targets = targetsOf(behaviour, fn, arity);
       if (targets.length === 0 || targets.length > ERLANG_BEHAVIOUR_FANOUT_CAP) continue;
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineAt(m.index);
       const disp = enclosingFn(nodesInFile, line);
       if (!disp) continue;
       for (const target of targets) {
@@ -3462,6 +3474,7 @@ async function laravelEventEdges(ctx: ResolutionContext, onYield: MaybeYield): P
     const content = ctx.readFile(file);
     if (!content || !content.includes('event(')) continue;
     const safe = stripCommentsForRegex(content, 'php');
+    const lineAt = makeLineAt(safe, 1);
     const nodesInFile = ctx.getNodesInFile(file);
     LARAVEL_DISPATCH_RE.lastIndex = 0;
     let m: RegExpExecArray | null;
@@ -3469,7 +3482,7 @@ async function laravelEventEdges(ctx: ResolutionContext, onYield: MaybeYield): P
     while ((m = LARAVEL_DISPATCH_RE.exec(safe)) && added < LARAVEL_FANOUT_CAP) {
       const targets = listeners.get(phpSimpleName(m[1]!));
       if (!targets) continue;
-      const line = safe.slice(0, m.index).split('\n').length;
+      const line = lineAt(m.index);
       const disp = enclosingFn(nodesInFile, line);
       if (!disp) continue;
       for (const target of targets.values()) {
@@ -3735,7 +3748,17 @@ export async function synthesizeCallbackEdges(
   // fan out across its read-only workers and the per-pass wall-clock comes from
   // the worker; a pass that fails on a worker falls back to running on the main
   // thread, so a worker crash isolates to a retry instead of failing synthesis.
-  const passEdges: Edge[][] = new Array<Edge[]>(SYNTH_PASSES.length).fill(NONE);
+  const passEdges: Array<Edge[] | undefined> = new Array(SYNTH_PASSES.length);
+  const merged: Edge[] = [];
+  const seen = new Set<string>();
+  const mergeEdges = (edges: Edge[]): void => {
+    for (const e of edges) {
+      const key = `${e.source}>${e.target}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      merged.push(e);
+    }
+  };
   const markPass = (label: string, dt: number): void => {
     if (process.env.CODEGRAPH_SYNTH_TIMINGS && (dt > 250 || process.env.CODEGRAPH_SYNTH_TIMINGS === 'all')) {
       console.error(`[synth-timing] ${label}: ${dt}ms`);
@@ -3743,10 +3766,12 @@ export async function synthesizeCallbackEdges(
     passesDone++;
     emit(passesDone);
   };
-  const runPassOnMain = async (i: number): Promise<void> => {
+  const runPassOnMain = async (i: number, retainForOrderedMerge: boolean): Promise<void> => {
     const pass = SYNTH_PASSES[i]!;
     const t0 = Date.now();
-    passEdges[i] = await pass.run(queries, ctx, yieldToLoop, subProgress);
+    const edges = await pass.run(queries, ctx, yieldToLoop, subProgress);
+    if (retainForOrderedMerge) passEdges[i] = edges;
+    else mergeEdges(edges);
     await yieldToLoop();
     markPass(pass.name, Date.now() - t0);
   };
@@ -3786,23 +3811,25 @@ export async function synthesizeCallbackEdges(
           }
           // Worker-side failure (crash, OOM, unknown pass after a version
           // mismatch): retry this one pass on the main thread.
-          await runPassOnMain(i);
+          await runPassOnMain(i, true);
         }
       })
     );
   } else {
     for (const i of gatedIn) {
-      await runPassOnMain(i);
+      // Merge before starting the next pass so the just-produced array can be
+      // reclaimed instead of retaining every pass result until the end.
+      await runPassOnMain(i, false);
     }
   }
 
-  const merged: Edge[] = [];
-  const seen = new Set<string>();
-  for (const e of passEdges.flat()) {
-    const key = `${e.source}>${e.target}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    merged.push(e);
+  markT.t = Date.now();
+  if (pool && gatedIn.length > 1) {
+    // Worker results arrive out of order, so merge them in registry order to
+    // preserve which duplicate edge wins while releasing each array promptly.
+    for (const edges of passEdges) {
+      if (edges) mergeEdges(edges);
+    }
   }
   __mark('dedupe-merge');
   // Chunked insert with yields: on the Linux kernel the merged synthesized

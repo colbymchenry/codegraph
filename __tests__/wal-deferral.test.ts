@@ -9,7 +9,7 @@
  * the valve's trigger/dedupe/backpressure logic, and the end-to-end indexAll
  * behavior (identical graph with and without deferral; interval restored).
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -193,6 +193,19 @@ function writeFixtureProject(): void {
   }
 }
 
+async function seedPendingRefs(cg: CodeGraph): Promise<void> {
+  const raw = (cg as unknown as { db: DatabaseConnection }).db.getDb();
+  const node = raw.prepare("SELECT id, file_path FROM nodes WHERE kind = 'function' LIMIT 1").get() as
+    | { id: string; file_path: string }
+    | undefined;
+  expect(node).toBeDefined();
+  const ins = raw.prepare(
+    "INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, file_path, language, status) VALUES (?, ?, 'calls', 1, 0, ?, 'typescript', 'pending')"
+  );
+  ins.run(node!.id, 'helper0', node!.file_path);
+  ins.run(node!.id, 'helper1', node!.file_path);
+}
+
 describe('indexAll WAL deferral end-to-end', () => {
 
   it('produces the same graph with and without deferral, and restores the interval', async () => {
@@ -298,6 +311,35 @@ describe('sync WAL deferral end-to-end (#1248)', () => {
       delete process.env.CODEGRAPH_NO_WAL_DEFER;
     }
   });
+
+  it('applies WAL backpressure during changed-file storage and orphan resolution (#1539)', async () => {
+    writeFixtureProject();
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+    const backpressure = vi
+      .spyOn(WalCheckpointValve.prototype, 'backpressure')
+      .mockReturnValue(null);
+
+    try {
+      fs.writeFileSync(
+        path.join(tmpDir, 'src', 'mod0.ts'),
+        `export function fn0(x: number): number { return helper0(x) + 100; }\n` +
+        `function helper0(x: number): number { return x * 100; }\n`
+      );
+      const changed = await cg.sync();
+      expect(changed.filesModified).toBe(1);
+      expect(backpressure).toHaveBeenCalled();
+
+      backpressure.mockClear();
+      await seedPendingRefs(cg);
+      const recovered = await cg.sync();
+      expect(recovered.filesAdded + recovered.filesModified + recovered.filesRemoved).toBe(0);
+      expect(backpressure).toHaveBeenCalled();
+    } finally {
+      backpressure.mockRestore();
+      await cg.close();
+    }
+  });
 });
 
 describe('resolution-phase WAL backpressure plumbing (§7a.1)', () => {
@@ -307,19 +349,6 @@ describe('resolution-phase WAL backpressure plumbing (§7a.1)', () => {
   // a backfill and let the WAL wrap — a kernel-scale run without it grew a
   // 22GB WAL on a 4.6GB DB. These pin that the batch loop (a) calls the hook
   // at the pool-idle boundary and (b) actually parks on a returned promise.
-
-  async function seedPendingRefs(cg: CodeGraph): Promise<void> {
-    const raw = (cg as unknown as { db: DatabaseConnection }).db.getDb();
-    const node = raw.prepare("SELECT id, file_path FROM nodes WHERE kind = 'function' LIMIT 1").get() as
-      | { id: string; file_path: string }
-      | undefined;
-    expect(node).toBeDefined();
-    const ins = raw.prepare(
-      "INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, file_path, language, status) VALUES (?, ?, 'calls', 1, 0, ?, 'typescript', 'pending')"
-    );
-    ins.run(node!.id, 'helper0', node!.file_path);
-    ins.run(node!.id, 'helper1', node!.file_path);
-  }
 
   it('calls the backpressure hook once per settled batch', async () => {
     writeFixtureProject();

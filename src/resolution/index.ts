@@ -22,12 +22,14 @@ import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
+import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
 import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { loadGoModule, type GoModule } from './go-module';
 import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
+import { memoryBudgetBytes } from './memory-budget';
 
 /** Node kinds that can declare supertypes (extends/implements). */
 const SUPERTYPE_BEARING_KINDS = new Set<Node['kind']>([
@@ -288,8 +290,15 @@ export class ReferenceResolver {
     // The content cache is heavier (full file text), so we give it a
     // smaller budget than the metadata caches.
     const contentLimit = Math.max(64, Math.floor(limit / 5));
+    const contentBudget = Math.max(
+      8 * 1024 * 1024,
+      Math.min(64 * 1024 * 1024, Math.floor(memoryBudgetBytes() * 0.02))
+    );
     this.nodeCache = new LRUCache(limit);
-    this.fileCache = new LRUCache(contentLimit);
+    this.fileCache = new LRUCache(contentLimit, {
+      maxWeight: Math.floor(contentBudget / 4),
+      weightOf: (value) => value === null ? 1 : Math.max(64, value.length * 2),
+    });
     this.importMappingCache = new LRUCache(limit);
     this.reExportCache = new LRUCache(limit);
     this.nameCache = new LRUCache(limit);
@@ -297,7 +306,12 @@ export class ReferenceResolver {
     this.qualifiedNameCache = new LRUCache(limit);
     // Split-lines arrays are heavier than content strings; refs arrive
     // file-ordered, so a small cache still hits nearly always.
-    this.fileLinesCache = new LRUCache(contentLimit);
+    this.fileLinesCache = new LRUCache(contentLimit, {
+      maxWeight: Math.floor(contentBudget * 3 / 4),
+      weightOf: (value) => value === null
+        ? 1
+        : Math.max(64, value.length * 8 + value.reduce((sum, line) => sum + line.length * 2, 0)),
+    });
     this.methodMatchCache = new LRUCache(limit);
 
     this.context = this.createContext();
@@ -417,6 +431,14 @@ export class ReferenceResolver {
     }
     const fullPath = path.join(this.projectRoot, filePath);
     try {
+      // Import resolvers may follow package metadata to an archive (`file:*.har`,
+      // for example). Reject anything extraction would not accept before UTF-8
+      // decoding can multiply a large binary blob into gigabytes of V8 heap.
+      const stats = fs.statSync(fullPath);
+      if (!stats.isFile() || stats.size > MAX_SOURCE_FILE_SIZE_BYTES) {
+        this.fileCache.set(filePath, null);
+        return null;
+      }
       const content = fs.readFileSync(fullPath, 'utf-8');
       this.fileCache.set(filePath, content);
       return content;
