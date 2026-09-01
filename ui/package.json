@@ -16,6 +16,9 @@
     "directory": "ui"
   },
   "license": "MIT",
+  "engines": {
+    "node": ">=22.12.0 <25.0.0"
+  },
   "files": [
     "dist",
     "README.md"
