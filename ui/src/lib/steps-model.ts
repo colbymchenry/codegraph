@@ -544,6 +544,15 @@ const STUB_SPAN_LINES = 3;
  * anchor leads to everything by definition and its fan is already held back to
  * one line per region.
  */
+/**
+ * The name a stub points at, without the mark its box wears for its kind: the
+ * stub already leads with a direction, and `← ⇠ onCaptureProgress` reads as
+ * two arrows arguing. The box itself keeps its mark, where nothing competes.
+ */
+function stubLabel(label: string): string {
+  return label.startsWith('⇢ ') || label.startsWith('⇠ ') ? label.slice(2) : label;
+}
+
 function packStubs(
   layout: MapLayout,
   infos: Map<string, StepNodeInfo>,
@@ -571,13 +580,13 @@ function packStubs(
     add(edge.source, {
       edge: edge.id,
       other: edge.target,
-      label: infos.get(edge.target)?.label ?? edge.target,
+      label: stubLabel(infos.get(edge.target)?.label ?? edge.target),
       dir: 'out',
     });
     add(edge.target, {
       edge: edge.id,
       other: edge.source,
-      label: infos.get(edge.source)?.label ?? edge.source,
+      label: stubLabel(infos.get(edge.source)?.label ?? edge.source),
       dir: 'in',
     });
   }

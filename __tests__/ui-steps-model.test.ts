@@ -424,3 +424,30 @@ describe('a link too far to draw is said in words', () => {
     expect(plain.stubs.size).toBe(0);
   });
 });
+
+describe('a stub names the box without its kind mark', () => {
+  it('drops the ⇢ / ⇠ a bridge or an event wears, so the direction reads alone', () => {
+    const H = { id: 'component:PanelH', label: 'PanelH' };
+    const anchor = step('/', 'screen', 0, { anchor: true });
+    const mk = (p: string) => [
+      step(`${p}0`, 'trigger', 1, { order: 0, region: H, node: ref(`${p}0`, 'src/h.tsx') }),
+      step(`${p}1`, 'trigger', 2, { order: 1, region: H, node: ref(`${p}1`, 'src/h.tsx') }),
+      step(`${p}2`, 'trigger', 3, { order: 2, region: H, node: ref(`${p}2`, 'src/h.tsx') }),
+      step(`${p}3`, 'bridge', 4, { order: 3, region: H, node: ref(`${p}3`, 'ios/H.swift', 'swift') }),
+    ];
+    const a = mk('a');
+    const b = mk('b');
+    const links = [
+      link(anchor, a[0]!),
+      link(anchor, b[0]!),
+      ...a.slice(1).map((s, i) => link(a[i]!, s)),
+      ...b.slice(1).map((s, i) => link(b[i]!, s)),
+      link(a[3]!, b[3]!),
+    ];
+    const m = buildStepsModel(payload([anchor, ...a, ...b], links));
+    expect(stepLabel(b[3]!)).toBe('⇢ b3');
+    expect(m.stubs.get(a[3]!.id) ?? []).toContainEqual(
+      expect.objectContaining({ dir: 'out', label: 'b3' })
+    );
+  });
+});
