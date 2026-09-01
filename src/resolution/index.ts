@@ -57,6 +57,16 @@ const PHP_PROP_SHAPE = /^this->\w+\.\w+$/;
  * caches) when tuning for very large or very small projects.
  */
 const DEFAULT_CACHE_LIMIT = 5_000;
+
+/**
+ * Skip resolution-side file reads above this size (bytes). Matches
+ * extraction's MAX_FILE_SIZE: anything larger was never parsed into the
+ * graph, so its content can't answer an import/re-export chase — but a
+ * `import intro from "./intro.mp4"` ref would otherwise pull the whole
+ * asset into the V8 heap and OOM the index (a single ~240 MB binary is
+ * enough to kill an 8 GB heap once decoded and regex-scanned).
+ */
+const MAX_RESOLUTION_FILE_SIZE = 1024 * 1024;
 function resolveCacheLimit(): number {
   const raw = process.env.CODEGRAPH_RESOLVER_CACHE_SIZE;
   if (!raw) return DEFAULT_CACHE_LIMIT;
@@ -417,6 +427,18 @@ export class ReferenceResolver {
     }
     const fullPath = path.join(this.projectRoot, filePath);
     try {
+      // Mirror extraction's MAX_FILE_SIZE guard. Resolution follows import
+      // targets verbatim, so `import video from "./intro.mp4"` (or any large
+      // asset/bundle an alias resolves to) lands here — extraction never
+      // indexed a file this large, so it can't contain resolvable symbols or
+      // re-exports, but decoding hundreds of MB as UTF-8 and regex-scanning
+      // it for re-exports OOMs the whole index at "Resolving refs".
+      const stats = fs.statSync(fullPath);
+      if (stats.size > MAX_RESOLUTION_FILE_SIZE) {
+        logDebug('Skipping oversized file for resolution', { filePath, size: stats.size });
+        this.fileCache.set(filePath, null);
+        return null;
+      }
       const content = fs.readFileSync(fullPath, 'utf-8');
       this.fileCache.set(filePath, content);
       return content;
