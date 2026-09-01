@@ -2953,7 +2953,15 @@ export class ExtractionOrchestrator {
       // files stay untracked in git even after indexing, so they must be
       // hash-compared like modified files instead of always counting as added —
       // otherwise status reports them as pending forever. (See issue #206.)
+      //
+      // Filter through the same ignore matcher used by getGitVisibleFiles so
+      // tracked files in excluded dirs (e.g. a committed `vendor/`) don't leak
+      // back into the index. git status reports changes to tracked files even
+      // when they match DEFAULT_IGNORE_PATTERNS or a .gitignore entry. (#766)
+      const ig = buildDefaultIgnore(this.rootDir);
       for (const filePath of [...gitChanges.modified, ...gitChanges.added]) {
+        if (ig.ignores(filePath)) continue;
+
         const fullPath = path.join(this.rootDir, filePath);
         let content: string;
         try {
