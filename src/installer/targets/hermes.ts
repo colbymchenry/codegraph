@@ -24,7 +24,14 @@ import {
   Location,
   WriteResult,
 } from './types';
-import { atomicWriteFileSync } from './shared';
+import {
+  arrayEqual,
+  atomicWriteFileSync,
+  escapeRegExp,
+  joinLines,
+  readTextFile,
+  splitLines,
+} from './shared';
 
 type LineRange = { start: number; end: number };
 
@@ -42,7 +49,7 @@ class HermesTarget implements AgentTarget {
       return { installed: false, alreadyConfigured: false };
     }
     const file = configPath();
-    const content = readText(file);
+    const content = readTextFile(file);
     const installed = fs.existsSync(hermesHome()) || fs.existsSync(file);
     return {
       installed,
@@ -71,7 +78,7 @@ class HermesTarget implements AgentTarget {
       return { files: [{ path: file, action: 'not-found' }] };
     }
 
-    const before = readText(file);
+    const before = readTextFile(file);
     const after = removeCodeGraphToolset(removeCodeGraphMcpServer(before));
     if (after === before) {
       return { files: [{ path: file, action: 'not-found' }] };
@@ -112,18 +119,10 @@ function configPath(): string {
   return path.join(hermesHome(), 'config.yaml');
 }
 
-function readText(file: string): string {
-  try {
-    return fs.readFileSync(file, 'utf-8');
-  } catch {
-    return '';
-  }
-}
-
 function writeHermesConfig(): WriteResult['files'][number] {
   const file = configPath();
   const existed = fs.existsSync(file);
-  const before = readText(file);
+  const before = readTextFile(file);
   const afterMcp = upsertCodeGraphMcpServer(before);
   const after = upsertCodeGraphToolset(afterMcp);
 
@@ -136,15 +135,6 @@ function writeHermesConfig(): WriteResult['files'][number] {
 
 function ensureTrailingNewline(text: string): string {
   return text.endsWith('\n') ? text : text + '\n';
-}
-
-function splitLines(content: string): string[] {
-  return content.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
-}
-
-function joinLines(lines: string[]): string {
-  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
-  return lines.join('\n') + '\n';
 }
 
 function topLevelRange(lines: string[], key: string): LineRange | null {
@@ -245,10 +235,6 @@ function listChildBlock(
   return { start, end, itemIndent };
 }
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 function renderCodeGraphMcpChild(): string[] {
   return [
     '  codegraph:',
@@ -347,10 +333,6 @@ function removeCodeGraphToolset(content: string): string {
     return line.trim() !== '- mcp-codegraph';
   });
   return joinLines(next);
-}
-
-function arrayEqual(a: string[], b: string[]): boolean {
-  return a.length === b.length && a.every((value, idx) => value === b[idx]);
 }
 
 export const hermesTarget: AgentTarget = new HermesTarget();

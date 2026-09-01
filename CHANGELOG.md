@@ -247,6 +247,8 @@ After upgrading, run `codegraph index` once in each project so your existing gra
 
 - Anonymous usage telemetry is now stored entirely on CodeGraph's own first-party infrastructure — no third-party analytics vendor receives any of it, and the endpoint that receives it makes no outbound requests at all. Individual events are deleted after 90 days, leaving only anonymous daily totals. Nothing about what is collected changed, your IP address is still never read or stored, and every off-switch works exactly as before (`codegraph telemetry off`, `CODEGRAPH_TELEMETRY=0`, `DO_NOT_TRACK=1`). `TELEMETRY.md` remains the complete field-by-field list.
 
+- The DeepSeek Harness (`dsh`) is now a supported agent: `codegraph install` wires the CodeGraph MCP server into `~/.dsh/cordis.patch.yml`, which applies to every dsh profile — the web GUI, headless one-shot runs, and custom profiles — and the harness hot-swaps the change in live via HMR. If an earlier install had put a codegraph entry into a single profile's patch file, it is migrated up to the shared layer automatically so the same server never mounts twice, and `codegraph uninstall` reverses the setup cleanly.
+
 ### Fixes
 
 #### Better answers from `codegraph_explore`

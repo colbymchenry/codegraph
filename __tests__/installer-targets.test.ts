@@ -40,6 +40,7 @@ function setHome(dir: string): { restore: () => void } {
     XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
     HERMES_HOME: process.env.HERMES_HOME,
     COPILOT_HOME: process.env.COPILOT_HOME,
+    DSH_HOME: process.env.DSH_HOME,
   };
   process.env.HOME = dir;
   process.env.USERPROFILE = dir;
@@ -47,6 +48,7 @@ function setHome(dir: string): { restore: () => void } {
   process.env.XDG_CONFIG_HOME = path.join(dir, '.config');
   delete process.env.HERMES_HOME;
   delete process.env.COPILOT_HOME;
+  delete process.env.DSH_HOME;
   return {
     restore() {
       if (prev.HOME === undefined) delete process.env.HOME; else process.env.HOME = prev.HOME;
@@ -55,6 +57,7 @@ function setHome(dir: string): { restore: () => void } {
       if (prev.XDG_CONFIG_HOME === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = prev.XDG_CONFIG_HOME;
       if (prev.HERMES_HOME === undefined) delete process.env.HERMES_HOME; else process.env.HERMES_HOME = prev.HERMES_HOME;
       if (prev.COPILOT_HOME === undefined) delete process.env.COPILOT_HOME; else process.env.COPILOT_HOME = prev.COPILOT_HOME;
+      if (prev.DSH_HOME === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prev.DSH_HOME;
     },
   };
 }
@@ -1305,6 +1308,238 @@ describe('Installer targets — partial-state idempotency', () => {
     const stopCmds = (s.hooks?.Stop ?? []).flatMap((g: any) => (g.hooks ?? []).map((h: any) => h.command));
     expect(stopCmds).toContain('codegraph sync-if-dirty');
   });
+
+  it('dsh: install writes the home-level MCP entry, detects it, and is idempotent', () => {
+    const dsh = getTarget('dsh')!;
+    // DeepSeek Harness keeps all config under $DSH_HOME — no project-local.
+    expect(dsh.supportsLocation('local')).toBe(false);
+    const file = path.join(tmpHome, '.dsh', 'cordis.patch.yml');
+    expect(dsh.detect('global').alreadyConfigured).toBe(false);
+
+    const first = dsh.install('global', { autoAllow: true });
+    const mcp = first.files.find((f) => f.path === file)!;
+    expect(mcp.action).toBe('created');
+    expect(fs.existsSync(file)).toBe(true);
+    const body = fs.readFileSync(file, 'utf-8');
+    expect(body).toContain('- insert:');
+    expect(body).toContain('- id: mcp-codegraph');
+    expect(body).toContain("name: '@deepseek-ai/dsh-mcp-client'");
+    expect(body).toContain('serverName: codegraph');
+    expect(body).toContain('transport: stdio');
+    expect(body).toContain('command: codegraph');
+    expect(body).toContain('- serve');
+    expect(body).toContain('- --mcp');
+    expect(body).toContain('failOnStartupError: false');
+    expect(dsh.detect('global').alreadyConfigured).toBe(true);
+
+    const second = dsh.install('global', { autoAllow: true });
+    const mcp2 = second.files.find((f) => f.path === file)!;
+    expect(mcp2.action).toBe('unchanged');
+    expect(fs.readFileSync(file, 'utf-8')).toBe(body);
+  });
+
+  it('dsh: install preserves sibling entries in an existing home patch', () => {
+    const dsh = getTarget('dsh')!;
+    const dir = path.join(tmpHome, '.dsh');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'cordis.patch.yml');
+    fs.writeFileSync(file, [
+      '# my patch layer',
+      '- insert:',
+      '    - id: my-plugin',
+      '      name: "./plugins/my-plugin.mjs"',
+      '      config:',
+      '        enabled: true',
+      '',
+    ].join('\n'));
+
+    const result = dsh.install('global', { autoAllow: true });
+    expect(result.files.find((f) => f.path === file)?.action).toBe('updated');
+    const body = fs.readFileSync(file, 'utf-8');
+    expect(body).toContain('# my patch layer');
+    expect(body).toContain('- id: my-plugin');
+    expect(body).toContain('- id: mcp-codegraph');
+
+    const second = dsh.install('global', { autoAllow: true });
+    expect(second.files.find((f) => f.path === file)?.action).toBe('unchanged');
+  });
+
+  it('dsh: install rewrites a user-edited home entry to the canonical form, keeping the rest', () => {
+    const dsh = getTarget('dsh')!;
+    const dir = path.join(tmpHome, '.dsh');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'cordis.patch.yml');
+    fs.writeFileSync(file, [
+      '- insert:',
+      '    - id: mcp-codegraph',
+      "      name: '@deepseek-ai/dsh-mcp-client'",
+      '      config:',
+      '        serverName: codegraph',
+      '        transport: stdio',
+      "        command: 'C:\\pinned\\node.exe'",
+      '        args:',
+      "          - 'C:\\pinned\\codegraph'",
+      '          - serve',
+      '          - --mcp',
+      "        cwd: 'D:\\proj'",
+      '        failOnStartupError: false',
+      '    - id: other',
+      "      name: './plugins/other.mjs'",
+      '',
+    ].join('\n'));
+
+    const result = dsh.install('global', { autoAllow: true });
+    expect(result.files.find((f) => f.path === file)?.action).toBe('updated');
+    const body = fs.readFileSync(file, 'utf-8');
+    // Canonical command, pinned cwd dropped, sibling preserved.
+    expect(body).toContain('        command: codegraph');
+    expect(body).not.toContain('pinned');
+    expect(body).not.toContain('cwd:');
+    expect(body).toContain('- id: other');
+  });
+
+  it('dsh: install self-heals a per-profile codegraph entry into the home layer', () => {
+    const dsh = getTarget('dsh')!;
+    const profileDir = path.join(tmpHome, '.dsh', 'profiles', 'web');
+    fs.mkdirSync(profileDir, { recursive: true });
+    const profileFile = path.join(profileDir, 'cordis.patch.yml');
+    fs.writeFileSync(profileFile, [
+      '- insert:',
+      '    - id: mcp-codegraph',
+      "      name: '@deepseek-ai/dsh-mcp-client'",
+      '      config:',
+      '        serverName: codegraph',
+      '        transport: stdio',
+      "        command: 'C:\\manual\\node.exe'",
+      '        args:',
+      "          - 'C:\\manual\\codegraph'",
+      '          - serve',
+      '          - --mcp',
+      '        failOnStartupError: false',
+      '    - id: graphify',
+      "      name: './plugins/graphify.mjs'",
+      '      config:',
+      '        enabled: true',
+      '',
+    ].join('\n'));
+
+    // A per-profile entry alone counts as configured...
+    expect(dsh.detect('global').alreadyConfigured).toBe(true);
+
+    const result = dsh.install('global', { autoAllow: true });
+    // ...and install migrates it: home layer created, profile entry swept,
+    // sibling profile plugin kept.
+    expect(result.files.some((f) => f.path === path.join(tmpHome, '.dsh', 'cordis.patch.yml'))).toBe(true);
+    expect(result.files.find((f) => f.path === profileFile)?.action).toBe('removed');
+    const profileBody = fs.readFileSync(profileFile, 'utf-8');
+    expect(profileBody).not.toContain('mcp-codegraph');
+    expect(profileBody).not.toContain('manual');
+    expect(profileBody).toContain('graphify');
+  });
+
+  it('dsh: uninstall removes only the codegraph entry, preserving siblings', () => {
+    const dsh = getTarget('dsh')!;
+    const dir = path.join(tmpHome, '.dsh');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'cordis.patch.yml');
+    fs.writeFileSync(file, [
+      '# my patch layer',
+      '- insert:',
+      '    - id: mcp-codegraph',
+      "      name: '@deepseek-ai/dsh-mcp-client'",
+      '      config:',
+      '        serverName: codegraph',
+      '        transport: stdio',
+      '        command: codegraph',
+      '        args:',
+      '          - serve',
+      '          - --mcp',
+      '        failOnStartupError: false',
+      '    - id: graphify',
+      "      name: './plugins/graphify.mjs'",
+      '      config:',
+      '        enabled: true',
+      '',
+    ].join('\n'));
+
+    const result = dsh.uninstall('global');
+    expect(result.files.find((f) => f.path === file)?.action).toBe('removed');
+    const body = fs.readFileSync(file, 'utf-8');
+    expect(body).not.toContain('mcp-codegraph');
+    expect(body).not.toContain('serverName: codegraph');
+    expect(body).toContain('# my patch layer');
+    expect(body).toContain('graphify');
+    expect(dsh.detect('global').alreadyConfigured).toBe(false);
+  });
+
+  it('dsh: uninstall deletes the patch file when it only held codegraph', () => {
+    const dsh = getTarget('dsh')!;
+    const file = path.join(tmpHome, '.dsh', 'cordis.patch.yml');
+    dsh.install('global', { autoAllow: true });
+    expect(fs.existsSync(file)).toBe(true);
+
+    dsh.uninstall('global');
+    expect(fs.existsSync(file)).toBe(false);
+    expect(dsh.detect('global').alreadyConfigured).toBe(false);
+  });
+
+  it('dsh: uninstall fully removes a profile-only install (detect/uninstall symmetric)', () => {
+    const dsh = getTarget('dsh')!;
+    const profileDir = path.join(tmpHome, '.dsh', 'profiles', 'headless');
+    fs.mkdirSync(profileDir, { recursive: true });
+    const profileFile = path.join(profileDir, 'cordis.patch.yml');
+    fs.writeFileSync(profileFile, [
+      '- insert:',
+      '    - id: mcp-codegraph',
+      "      name: '@deepseek-ai/dsh-mcp-client'",
+      '      config:',
+      '        serverName: codegraph',
+      '        transport: stdio',
+      '        command: codegraph',
+      '        args:',
+      '          - serve',
+      '          - --mcp',
+      '        failOnStartupError: false',
+      '',
+    ].join('\n'));
+
+    // A profile-only entry is "configured"...
+    expect(dsh.detect('global').alreadyConfigured).toBe(true);
+
+    const result = dsh.uninstall('global');
+    // ...and uninstall removes it (home file absent → not-found, profile swept).
+    expect(result.files.find((f) => f.path === path.join(tmpHome, '.dsh', 'cordis.patch.yml'))?.action).toBe('not-found');
+    expect(result.files.find((f) => f.path === profileFile)?.action).toBe('removed');
+    expect(fs.existsSync(profileFile)).toBe(false);
+    expect(dsh.detect('global').alreadyConfigured).toBe(false);
+  });
+
+  it('dsh: honors DSH_HOME over ~/.dsh', () => {
+    const dsh = getTarget('dsh')!;
+    const custom = path.join(tmpHome, 'custom-dsh');
+    process.env.DSH_HOME = custom;
+    try {
+      const result = dsh.install('global', { autoAllow: true });
+      const file = path.join(custom, 'cordis.patch.yml');
+      expect(result.files.some((f) => f.path === file)).toBe(true);
+      expect(fs.existsSync(file)).toBe(true);
+      expect(dsh.detect('global').configPath).toBe(file);
+    } finally {
+      delete process.env.DSH_HOME;
+    }
+  });
+
+  it('dsh: printConfig prints a parseable YAML insert block without writing anything', () => {
+    const dsh = getTarget('dsh')!;
+    const before = listAllFiles(tmpHome).concat(listAllFiles(tmpCwd));
+    const out = dsh.printConfig('global');
+    expect(out.length).toBeGreaterThan(0);
+    expect(out).toContain('- insert:');
+    expect(out).toContain('- id: mcp-codegraph');
+    expect(out).toContain('serverName: codegraph');
+    const after = listAllFiles(tmpHome).concat(listAllFiles(tmpCwd));
+    expect(after.sort()).toEqual(before.sort());
+  });
 });
 
 describe('Installer targets — registry', () => {
@@ -1320,6 +1555,7 @@ describe('Installer targets — registry', () => {
     expect(getTarget('copilot-vscode')?.id).toBe('copilot-vscode');
     expect(getTarget('copilot-cli')?.id).toBe('copilot-cli');
     expect(getTarget('copilot-jetbrains')?.id).toBe('copilot-jetbrains');
+    expect(getTarget('dsh')?.id).toBe('dsh');
     expect(getTarget('not-a-real-target')).toBeUndefined();
   });
 
