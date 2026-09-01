@@ -388,6 +388,13 @@ const LITERAL_RECEIVER_TYPES = new Set([
   'dictionary', 'dict_literal', 'object', 'tuple', 'set',
 ]);
 
+/**
+ * React hooks that bind a NAME to a handler function (`const onPress =
+ * useCallback(() => {…}, [])`). The arrow inside is extracted as a function
+ * node named by the declarator — see `reactHookBoundName`.
+ */
+const REACT_HANDLER_HOOKS = /^(?:React\.)?use(?:Callback|EffectEvent|Event)$/;
+
 export class TreeSitterExtractor {
   private filePath: string;
   private language: Language;
@@ -2205,6 +2212,24 @@ export class TreeSitterExtractor {
     }
   }
 
+  /**
+   * A top-level binding exported by a LATER statement rather than at its
+   * declaration: `export default NAME`, `export { NAME }`, `export { NAME as
+   * default }`. The declaration's own `isExported` (an `export_statement`
+   * ancestor) cannot see these, so a store written as `const useStore =
+   * create(…)` + `export default useStore` read as unexported and its actions
+   * were never extracted. One anchored regex over the file source; JS-family
+   * callers only.
+   */
+  private isExportedLater(name: string): boolean {
+    if (!/^[A-Za-z_$][\w$]*$/.test(name)) return false;
+    const re = new RegExp(
+      `^[ \\t]*export\\s+(?:default\\s+${name}\\s*;?[ \\t]*$|\\{[^}]*\\b${name}\\b[^}]*\\})`,
+      'm'
+    );
+    return re.test(this.source);
+  }
+
   /** Property-key text with surrounding quotes stripped (`'foo'` → `foo`). */
   private objectKeyName(key: SyntaxNode): string {
     return getNodeText(key, this.source).replace(/^['"`]|['"`]$/g, '');
@@ -2653,7 +2678,10 @@ export class TreeSitterExtractor {
             //     never nodes — so `node`/`callers` on `fetchUser` return "not
             //     found" and the agent Reads the store to reconstruct the flow.
             // Scoped to EXPORTED consts to exclude inline-object noise
-            // (`ctx.set({...})`) the object-method skip deliberately avoids.
+            // (`ctx.set({...})`) the object-method skip deliberately avoids —
+            // where "exported" includes the two-statement form `const useStore
+            // = create(…)` … `export default useStore` (see isExportedLater),
+            // the shape most React Native stores are written in.
             const objectOfFns =
               valueNode && (valueNode.type === 'object' || valueNode.type === 'object_expression')
                 ? valueNode
@@ -2666,7 +2694,8 @@ export class TreeSitterExtractor {
             // whose functions are body-local consts — it must fall through to a
             // normal body walk (extracting those consts), not be skipped here.
             const hasInlineFns = !!objectOfFns && this.objectHasInlineFunctions(objectOfFns);
-            const extractObjectMethods = isExported && !!objectOfFns && hasInlineFns;
+            const extractObjectMethods =
+              (isExported || this.isExportedLater(name)) && !!objectOfFns && hasInlineFns;
 
             // RTK Query: `createApi`/`injectEndpoints` define endpoints as
             // object-literal properties whose values are `build.query/mutation(...)`
@@ -5193,6 +5222,36 @@ export class TreeSitterExtractor {
     targets.add(target);
   }
 
+  /**
+   * The declarator name a React handler hook binds an anonymous function to —
+   * `const NAME = useCallback(<node>, [...])` — or null for any other shape.
+   * JS-family only; the node must be the hook call's FIRST argument, and the
+   * call's value must be bound directly by a `variable_declarator`.
+   */
+  private reactHookBoundName(node: SyntaxNode): string | null {
+    if (
+      this.language !== 'typescript' &&
+      this.language !== 'javascript' &&
+      this.language !== 'tsx' &&
+      this.language !== 'jsx'
+    ) {
+      return null;
+    }
+    if (node.type !== 'arrow_function' && node.type !== 'function_expression') return null;
+    const args = node.parent;
+    if (!args || args.type !== 'arguments') return null;
+    const first = args.namedChild(0);
+    if (!first || first.startIndex !== node.startIndex || first.endIndex !== node.endIndex) return null;
+    const call = args.parent;
+    if (!call || call.type !== 'call_expression') return null;
+    const callee = getChildByField(call, 'function');
+    if (!callee || !REACT_HANDLER_HOOKS.test(getNodeText(callee, this.source))) return null;
+    const declarator = call.parent;
+    if (!declarator || declarator.type !== 'variable_declarator') return null;
+    const nameNode = getChildByField(declarator, 'name');
+    return nameNode?.type === 'identifier' ? getNodeText(nameNode, this.source) : null;
+  }
+
   private visitFunctionBody(body: SyntaxNode, _functionId: string): void {
     if (!this.extractor) return;
 
@@ -5313,6 +5372,21 @@ export class TreeSitterExtractor {
         const nestedName = extractName(node, this.source, this.extractor!);
         if (nestedName && nestedName !== '<anonymous>') {
           this.extractFunction(node);
+          return;
+        }
+        // `const handleSubmit = useCallback(() => {…}, [deps])` — React's
+        // memoised handler. The function is anonymous only syntactically: the
+        // arrow is the first argument of a call whose result the declarator
+        // binds, and that binding is the name every `onPress={handleSubmit}`
+        // and `addListener('x', handleSubmit)` uses. Without a node of its own
+        // the handler's calls attribute to the component and the JSX prop or
+        // event registration has nothing to resolve to — the trigger of a flow
+        // is invisible. Bounded to the hooks React documents for handlers
+        // (`useCallback`, `useEffectEvent`, the experimental `useEvent`):
+        // `useMemo` / `useEffect` callbacks are computations, not handlers.
+        const hookBound = this.reactHookBoundName(node);
+        if (hookBound) {
+          this.extractFunction(node, hookBound);
           return;
         }
       }
