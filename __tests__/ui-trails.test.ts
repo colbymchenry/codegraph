@@ -29,8 +29,10 @@ import {
   parseTrail,
   slugify,
   TRAILS_RELATIVE_DIR,
+  type StoredTrail,
   type WireTrailHop,
 } from '../src/ui-server/api';
+import { writeStoredTrail } from '../src/ui-server/api/trail-store';
 
 interface Res {
   status: number;
@@ -113,6 +115,29 @@ async function idOf(name: string): Promise<string> {
 
 function trailsDir(): string {
   return path.join(projectRoot, TRAILS_RELATIVE_DIR);
+}
+
+function storedTrail(id: string): StoredTrail {
+  return {
+    version: 1,
+    id,
+    name: 'Must stay inside',
+    note: '',
+    author: 'test',
+    createdAt: new Date(0).toISOString(),
+    updatedAt: new Date(0).toISOString(),
+    hops: [
+      {
+        dir: 'start',
+        name: 'start',
+        qualifiedName: 'start',
+        kind: 'function',
+        file: 'src/start.ts',
+        line: 1,
+        id: 'function:start',
+      },
+    ],
+  };
 }
 
 /** Re-index in place, the way a `codegraph sync` would after an edit. */
@@ -214,6 +239,49 @@ describe('trail ids', () => {
       expect(isTrailId(bad), bad).toBe(false);
     }
   });
+});
+
+describe('trail write containment', () => {
+  it.runIf(process.platform !== 'win32')(
+    'refuses a missing trail directory below a symlink that leaves the project',
+    () => {
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-trail-symlink-'));
+      const project = path.join(base, 'project');
+      const outside = path.join(base, 'outside');
+      fs.mkdirSync(path.join(project, '.codegraph'), { recursive: true });
+      fs.mkdirSync(outside, { recursive: true });
+      fs.symlinkSync(outside, path.join(project, '.codegraph', 'ui'), 'dir');
+
+      try {
+        expect(() => writeStoredTrail(project, storedTrail('must-stay-inside'))).toThrow(
+          /outside the project/
+        );
+        expect(fs.existsSync(path.join(outside, 'trails'))).toBe(false);
+      } finally {
+        fs.rmSync(base, { recursive: true, force: true });
+      }
+    }
+  );
+
+  it.runIf(process.platform !== 'win32')(
+    'allows a project root reached through a symlink when the real path stays inside it',
+    () => {
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-trail-root-link-'));
+      const project = path.join(base, 'project');
+      const alias = path.join(base, 'project-link');
+      fs.mkdirSync(path.join(project, '.codegraph'), { recursive: true });
+      fs.symlinkSync(project, alias, 'dir');
+
+      try {
+        expect(() => writeStoredTrail(alias, storedTrail('safe-root-link'))).not.toThrow();
+        expect(
+          fs.existsSync(path.join(project, TRAILS_RELATIVE_DIR, 'safe-root-link.json'))
+        ).toBe(true);
+      } finally {
+        fs.rmSync(base, { recursive: true, force: true });
+      }
+    }
+  );
 });
 
 describe('parseTrail', () => {
