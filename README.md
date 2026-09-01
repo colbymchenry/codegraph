@@ -900,6 +900,8 @@ is written):
 | Terraform / OpenTofu | `.tf`, `.tfvars`, `.tofu` | Full support (resources, data sources, modules, variables, outputs, providers incl. aliases, `locals`; `var.`/`local.`/`module.`/resource references with Terraform's per-directory scoping enforced; module calls bridged across the boundary — inputs to the child module's variables, `module.M.out` to the child's output, `source` to the module's files; cloudposse/atmos `remote-state` cross-component wiring when the component is statically named; `provider = aws.east` selections resolved up the module tree; `moved`/`import`/`removed`/`check` block references; `.tfvars` assignments linked to the variables they set) |
 | Nix | `.nix` | Full support (functions with simple/destructured/curried params, `let`/attrset bindings, `inherit`, `import ./path` file edges — `./dir` resolving through `default.nix` — plus NixOS module `imports = [ ./x.nix ]` lists and `callPackage ./pkg.nix` file edges; call edges; module-system option wiring — a config write like `launchd.user.agents.x = { ... }` links to the module declaring `options.launchd.user.agents`, so option flows trace across modules) |
 
+Want to add another language? See [`docs/ADDING-A-LANGUAGE.md`](docs/ADDING-A-LANGUAGE.md) — it walks through sourcing a tree-sitter grammar, probing the AST, choosing between the OO and self-contained extractor patterns, and the worked examples in the existing extractors.
+
 ## Measured cross-file coverage
 
 Impact and blast-radius queries are only as good as the dependency graph behind them, so coverage is measured rather than asserted. **Fair coverage** = the share of symbol-bearing source files that have at least one *resolved cross-file dependent* — something that imports, calls, references, or (through a framework convention) routes to them — on a real-world benchmark repo per language. The residual is always a genuine static-analysis frontier (runtime dynamic dispatch, reflection / DI containers, framework-convention entry points, vendored third-party code), never hidden by gaming the denominator.
@@ -951,6 +953,12 @@ Framework routing is validated the same way, on a canonical app per framework: E
 **Sharing one checkout between Windows and WSL** — Don't point both at the same `.codegraph/`: the background-server lock and the SQLite index are tied to the OS that wrote them, and SQLite locking across the WSL2/Windows filesystem boundary is unreliable. Give each side its own index in the same tree by setting `CODEGRAPH_DIR` to a distinct name on one of them — e.g. `CODEGRAPH_DIR=.codegraph-win` on Windows, leaving WSL on the default `.codegraph`. CodeGraph skips any sibling `.codegraph-*` directory when indexing and watching, so the two never trip over each other.
 
 **Very large repositories (hundreds of thousands of files), or a large `.codegraph/codegraph.db-wal` file** — The `-wal` file is SQLite's write-ahead log: writes waiting to be folded into `codegraph.db`. While a big index is being built, CodeGraph lets it grow in proportion to the index (soft threshold = the larger of 256 MB and a quarter of the index size, up to 2 GB) before folding it back, because folding too often is what made large indexes slow on ordinary disks. At rest it is trimmed to 64 MB, and a leftover from a killed session is folded and trimmed the next time the project opens — the index itself has no size limit. Two environment variables tune this: `CODEGRAPH_WAL_VALVE_MB` (the soft threshold during indexing) and `CODEGRAPH_WAL_HEAL_MB` (the resting size and the trim threshold). `CODEGRAPH_WAL_VALVE_DEBUG=1` prints every decision to stderr.
+
+## Contributing
+
+Contributions are welcome! See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development setup, testing conventions, and PR guidelines.
+
+Want to add a new language? See [`docs/ADDING-A-LANGUAGE.md`](docs/ADDING-A-LANGUAGE.md) — it walks through sourcing a tree-sitter grammar, probing the AST, choosing an extractor pattern, and the worked examples in the existing extractors.
 
 ## License
 
