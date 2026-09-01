@@ -13,6 +13,7 @@ import { Node, UnresolvedReference } from '../src/types';
 import { ReferenceResolver, createResolver, ResolutionContext } from '../src/resolution';
 import { matchReference, resolveMethodOnType, matchByQualifiedName, preferCallSiteFile, matchMethodCall } from '../src/resolution/name-matcher';
 import { resolveImportPath, extractImportMappings, resolveJvmImport, loadCppIncludeDirs, clearCppIncludeDirCache, isPhpIncludePathRef } from '../src/resolution/import-resolver';
+import { applyAliases, type AliasMap } from '../src/resolution/path-aliases';
 import type { UnresolvedRef } from '../src/resolution/types';
 import { detectFrameworks, getAllFrameworkResolvers } from '../src/resolution/frameworks';
 import { QueryBuilder } from '../src/db/queries';
@@ -2477,6 +2478,23 @@ func main() {
   });
 
   describe('tsconfig path aliases', () => {
+    it('keeps dot-prefixed in-project alias targets while rejecting parent escapes', () => {
+      const aliases: AliasMap = {
+        baseUrl: tempDir,
+        patterns: [{
+          prefix: '@generated/',
+          suffix: '',
+          hasWildcard: true,
+          replacements: ['..generated/*', 'src/generated/*', '../outside/*'],
+        }],
+      };
+
+      expect(applyAliases('@generated/client', aliases, tempDir)).toEqual([
+        '..generated/client',
+        'src/generated/client',
+      ]);
+    });
+
     it('resolves an aliased import to the alias-mapped file (not a same-named file elsewhere)', async () => {
       // Two same-named exports in different directories. Without alias
       // resolution, name-matcher would pick whichever it finds first;
