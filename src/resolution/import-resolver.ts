@@ -931,12 +931,18 @@ function extractJSImports(content: string): ImportMapping[] {
 function extractPythonImports(content: string): ImportMapping[] {
   const mappings: ImportMapping[] = [];
 
-  // from X import Y
-  const fromImportRegex = /from\s+([\w.]+)\s+import\s+([^#\n]+)/g;
+  // from X import Y  — either a parenthesized list, which PEP 8 line-wrapping
+  // routinely spreads across multiple physical lines (`from pkg import (\n    a,\n    b as c,\n)`),
+  // or a single-line list. `[^#\n]+` alone stops at the first line break, so a
+  // wrapped list silently lost every name after line one — including aliased
+  // ones, which is why real trees (which wrap) kept reporting no callers
+  // for names imported anywhere but a statement's first line.
+  const fromImportRegex = /from\s+([\w.]+)\s+import\s+(?:\(([\s\S]*?)\)|([^#\n]+))/g;
   let match;
 
   while ((match = fromImportRegex.exec(content)) !== null) {
-    const [, source, imports] = match;
+    const [, source, parenImports, plainImports] = match;
+    const imports = parenImports !== undefined ? parenImports : plainImports;
     const names = imports!.split(',').map((s) => s.trim());
 
     for (const name of names) {
