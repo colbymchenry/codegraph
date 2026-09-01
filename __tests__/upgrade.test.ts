@@ -204,10 +204,12 @@ describe('version helpers', () => {
     expect(parseLatestTagFromLocation('https://github.com/o/r/releases')).toBeNull();
   });
 
-  it('reindexAdvisory mentions the refresh commands', () => {
+  it('reindexAdvisory requires a full rebuild for extraction improvements', () => {
     const a = reindexAdvisory();
-    expect(a).toContain('codegraph sync');
-    expect(a).toContain('codegraph index -f');
+    expect(a).toContain('codegraph index');
+    expect(a).toMatch(/full rebuild/i);
+    expect(a).not.toContain('codegraph sync');
+    expect(a).not.toContain('codegraph index -f');
   });
 
   it('buildWindowsUpgradeScript targets the right asset per arch and renames-not-deletes the exe', () => {
@@ -300,7 +302,8 @@ describe('runUpgrade', () => {
     expect(calls.runs[0].args[1]).toContain('curl -fsSL');
     expect(calls.runs[0].args[1]).toContain('| sh');
     expect(calls.runs[0].env?.CODEGRAPH_INSTALL_DIR).toBe('/h/.codegraph');
-    expect(calls.logs.join('\n')).toMatch(/codegraph sync/); // re-index advisory printed
+    expect(calls.logs.join('\n')).toMatch(/codegraph index/); // re-index advisory printed
+    expect(calls.logs.join('\n')).not.toMatch(/codegraph sync/);
   });
 
   it('unix bundle: falls back to wget, and errors when neither downloader exists', async () => {
