@@ -816,9 +816,73 @@ export function extractImportMappings(
     mappings.push(...extractPHPImports(content));
   } else if (language === 'c' || language === 'cpp') {
     mappings.push(...extractCppImports(content));
+  } else if (language === 'erlang') {
+    mappings.push(...extractErlangImports(content));
   }
 
   return mappings;
+}
+
+/**
+ * Extract Erlang's selective imports: `-import(module, [f/1, g/2]).`
+ *
+ * The arity stays in the local/exported name because it is part of an Erlang
+ * function's identity. The module name is an atom, not a filesystem path; the
+ * Erlang branch in resolveViaImport uses it to form the qualified name.
+ */
+function extractErlangImports(content: string): ImportMapping[] {
+  const mappings: ImportMapping[] = [];
+  const atom = String.raw`(?:'(?:\\.|[^'])*'|[a-z][A-Za-z0-9_@]*)`;
+  const importRe = new RegExp(
+    String.raw`^\s*-import\s*\(\s*(${atom})\s*,\s*\[([\s\S]*?)\]\s*\)\s*\.`,
+    'gm',
+  );
+  const bindingRe = new RegExp(String.raw`(${atom})\s*\/\s*(\d{1,3})`, 'g');
+  const unquoteAtom = (value: string): string => value.replace(/^'([\s\S]*)'$/, '$1');
+
+  let importMatch: RegExpExecArray | null;
+  while ((importMatch = importRe.exec(content)) !== null) {
+    const source = unquoteAtom(importMatch[1]!);
+    const bindings = stripErlangLineComments(importMatch[2]!);
+    bindingRe.lastIndex = 0;
+    let bindingMatch: RegExpExecArray | null;
+    while ((bindingMatch = bindingRe.exec(bindings)) !== null) {
+      const name = `${unquoteAtom(bindingMatch[1]!)}/${bindingMatch[2]}`;
+      mappings.push({
+        localName: name,
+        exportedName: name,
+        source,
+        isDefault: false,
+        isNamespace: false,
+      });
+    }
+  }
+
+  return mappings;
+}
+
+/** Strip `%` comments without treating a percent inside a quoted atom/string as a comment. */
+function stripErlangLineComments(value: string): string {
+  let result = '';
+  let quote: "'" | '"' | null = null;
+  let escaped = false;
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i]!;
+    if (quote) {
+      result += ch;
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === quote) quote = null;
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+      result += ch;
+    } else if (ch === '%') {
+      while (i + 1 < value.length && value[i + 1] !== '\n') i++;
+    } else {
+      result += ch;
+    }
+  }
+  return result;
 }
 
 /**
@@ -1458,6 +1522,31 @@ export function resolveViaImport(
   // Use cached import mappings (avoids re-reading and re-parsing per ref)
   const imports = context.getImportMappings(ref.filePath, ref.language);
   if (imports.length === 0 && !context.readFile(ref.filePath)) {
+    return null;
+  }
+
+  // Erlang selective imports name a module rather than a filesystem path, and
+  // the imported binding includes its arity (`-import(a, [f/1])`). Resolve the
+  // exact module::function/arity identity before the generic path-based import
+  // logic. Ambiguous duplicate module definitions are left unresolved.
+  if (ref.language === 'erlang' && /^.+\/\d{1,3}$/.test(ref.referenceName)) {
+    const imp = imports.find((candidate) => candidate.localName === ref.referenceName);
+    if (imp) {
+      const candidates = context
+        .getNodesByQualifiedName(`${imp.source}::${imp.exportedName}`)
+        .filter(
+          (node) =>
+            node.language === 'erlang' && node.kind === 'function' && node.isExported,
+        );
+      if (candidates.length === 1) {
+        return {
+          original: ref,
+          targetNodeId: candidates[0]!.id,
+          confidence: 0.95,
+          resolvedBy: 'import',
+        };
+      }
+    }
     return null;
   }
 

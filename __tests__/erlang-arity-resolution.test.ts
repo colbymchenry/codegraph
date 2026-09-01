@@ -144,4 +144,60 @@ run(L) ->
     expect(edges).toContainEqual({ sq: 'user_m::run/1', tq: 'lib_m::bump/1' });
     expect(edges.some((e) => e.sq === 'user_m::run/1' && e.tq === 'lib_m::bump/2')).toBe(false);
   });
+
+  it('resolves a selective import to its named module, not a nearer same-named function', async () => {
+    fs.mkdirSync(path.join(dir, 'deps'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'app'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'deps', 'imported.erl'),
+      `-module(imported).
+-export([pick/1]).
+
+pick(X) -> {imported, X}.
+`
+    );
+    fs.writeFileSync(
+      path.join(dir, 'app', 'wrong.erl'),
+      `-module(wrong).
+-export([pick/1]).
+
+pick(X) -> {wrong, X}.
+`
+    );
+    fs.writeFileSync(
+      path.join(dir, 'app', 'client.erl'),
+      `-module(client).
+-import(imported, [
+    pick/1 % imported selectively
+]).
+-export([run/1]).
+
+run(X) -> pick(X).
+`
+    );
+    const edges = await callEdges(dir);
+    expect(edges).toContainEqual({ sq: 'client::run/1', tq: 'imported::pick/1' });
+    expect(edges).not.toContainEqual({ sq: 'client::run/1', tq: 'wrong::pick/1' });
+  });
+
+  it('does not bind an auto-imported BIF to a same-named project function', async () => {
+    fs.writeFileSync(
+      path.join(dir, 'other.erl'),
+      `-module(other).
+-export([length/1]).
+
+length(X) -> X.
+`
+    );
+    fs.writeFileSync(
+      path.join(dir, 'client.erl'),
+      `-module(client).
+-export([run/1]).
+
+run(X) -> length(X).
+`
+    );
+    const edges = await callEdges(dir);
+    expect(edges).not.toContainEqual({ sq: 'client::run/1', tq: 'other::length/1' });
+  });
 });
