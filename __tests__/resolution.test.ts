@@ -1504,6 +1504,57 @@ def external_caller():
       expect(externalCalls).toHaveLength(0);
     });
 
+    it('resolves Python module-attribute calls after `from pkg import module as alias` (#899)', async () => {
+      // #578 fixed the unaliased form; the aliased one still dropped its edge.
+      // resolvePythonModuleMember joined `imp.source` with `imp.localName` to
+      // name the submodule, but under `from pkg import module as alias`
+      // `localName` is the alias — so it looked for `pkg.alias`, which names no
+      // module, and the member never resolved. The two names coincide only when
+      // the import is unaliased, which is why the unaliased case passed on a
+      // scratch project while real trees (which alias) kept reporting no callers.
+      fs.mkdirSync(path.join(tempDir, 'pkg'));
+      fs.writeFileSync(path.join(tempDir, 'pkg', '__init__.py'), '');
+      fs.writeFileSync(
+        path.join(tempDir, 'pkg', 'module.py'),
+        'def func():\n    return 1\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'main.py'),
+        `from pkg import module as mod_alias
+import os as operating_system
+
+
+def caller():
+    return mod_alias.func()
+
+
+def external_caller():
+    return operating_system.getcwd()
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const caller = cg.getNodesByKind('function').filter((n) => n.name === 'caller')[0];
+      expect(caller).toBeDefined();
+      const calls = cg.getOutgoingEdges(caller!.id).filter((e) => e.kind === 'calls');
+      expect(calls).toHaveLength(1);
+      const target = cg.getNode(calls[0]!.target);
+      expect(target?.name).toBe('func');
+      expect(target?.filePath.replace(/\\/g, '/')).toBe('pkg/module.py');
+
+      // An aliased *stdlib* module must still produce no edge — resolution only
+      // matches real in-repo module files, alias or not.
+      const externalCaller = cg
+        .getNodesByKind('function')
+        .filter((n) => n.name === 'external_caller')[0];
+      expect(externalCaller).toBeDefined();
+      const externalCalls = cg
+        .getOutgoingEdges(externalCaller!.id)
+        .filter((e) => e.kind === 'calls');
+      expect(externalCalls).toHaveLength(0);
+    });
+
     it('attaches Go methods to their receiver type across files (#583, cross-file half)', async () => {
       // In Go a type's methods are commonly declared in a different file from the
       // `type` declaration (`type Box` in box.go, `func (b *Box) Get()` in
