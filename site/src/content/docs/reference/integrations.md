@@ -15,6 +15,7 @@ The interactive installer auto-detects and configures each supported agent — w
 - **Gemini CLI**
 - **Antigravity IDE**
 - **Kiro**
+- **pi**
 
 Run `npx @colbymchenry/codegraph` and pick your agent(s); see [Installation](/codegraph/getting-started/installation/) for the non-interactive flags.
 
