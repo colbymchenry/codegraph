@@ -550,12 +550,22 @@ the server names it on the step (`WireStep.region` — the fold's first node; th
 in the screen body; the first-reaching parent's region for everything deeper — first reach wins, as `first` does, so a
 shared store is one box in the region that got there first and every other region's way in is a link). Endpoints and
 functions carry none: their rows already read in the code's order, and `view=order` is untouched. The viewer
-(`steps-model.ts`'s `packRegions`) then lays each region out as its own small column — a box above what it sets in
-motion, a line wrapping past ~720px — and tiles the columns into bands under a width budget aimed at a readable aspect,
-in the order the walk met them: the screen's own source order, top of the screen to the left. **Within a region the
-rows come from the region's own links** (longest lead-to path, settled by relaxation as the order reading's rows are),
-never from distance to the anchor, which is flat inside a region: a handler and the store it calls are both one hop
-from the screen, and side by side their line was a level arch, hidden at rest — the store looked wired to nothing.
+(`steps-model.ts`'s `packRegions`) then lays each region out as its own small column, and tiles the columns into bands
+under a width budget aimed at a readable aspect, in the order the walk met them: the screen's own source order, top of
+the screen to the left. **Within a region the rows come from the region's own links**, never from distance to the
+anchor, which is flat inside a region: a handler and the store it calls are both one hop from the screen, and side by
+side their line was a level arch, hidden at rest — the store looked wired to nothing. Cycle-closing links are set
+aside before the rows are settled (`forwardLinks`, the twin of the order reading's `withoutBackEdges`): relaxation
+never converges on a cyclic graph, and one screen's 65 boxes had been pushed to rows 294-301 while the rest sat at
+0-2. **A region is packed as CLUSTERS, not as rows**: a step, then the steps it sets in motion on the line under it,
+stepped in by `CLUSTER_INDENT`; a step that fires nothing needs no cluster, so the region's own starting points that
+lead nowhere still share one line (a screen's handlers are siblings, not a hierarchy — giving each its own line turned
+a flat region into a column). Rows-then-wrap was the alternative and it failed for a measurable reason: it put every
+step of one distance on the same rows and wrapped them at a fixed 720px, so a box and the thing it fires ended up
+seven lines apart — 70 of 113 lines on `/capture` joined boxes ONE step apart and rendered seven lines apart, which is
+what the 652 crossings were made of. A region's line width is now earned rather than fixed (`regionLineMax` =
+`sqrt(total * pitch)`, clamped to 720..2600), so a region comes out about as wide as it is tall: `/capture` went from
+a 1,227x5,588 ribbon to 2,279x4,356.
 Each region wears a caption (`RegionCaption.svelte` — its component's name over a hairline spanning its width)
 and the key explains it. **At rest the picture hides exactly two things** (`stepEdgeVisible`): the anchor's own fan —
 the anchor leads to everything *by definition*, `/home`'s 104 ways of saying so were the moiré, so one line into each
@@ -570,6 +580,22 @@ an effect) — and the key says so; selecting it lights its line from the anchor
 tracked curves (over a tighter in-region gap), same pills, pointer and panel. Result across the app's 52 screens: widest
 picture ~3,400px (was 28,452), at-rest lines on `/home` 80 of 190 — the region-local structure plus 11 lines between
 regions — with zero boxes that lead somewhere while drawing nothing.
+
+**Stubs — a link too far to follow is said in words, not drawn.** Clustering makes most links local, but not all: a
+step reached from two places is drawn under whichever reached it first, so the *other* way in has to cross the picture.
+A line is a good drawing of a hop between two boxes a reader takes in at once and a bad one of a hop across two
+thousand pixels — on `/capture` the 113 lines drawn at rest crossed each other **652 times** and each ran over ~5 other
+boxes' names, so no line could be followed and the boxes could not be read either. So `packStubs` (over the finished
+layout, since this is a question about geometry) keeps a link as a line only when it runs down the layering and its two
+boxes are within `STUB_SPAN_LINES` (3) lines and `REGION_LINE_MIN` (720px) across; everything else — back edges
+included, which drew nothing at all before — becomes a `StepStub` at **both** ends: `→ resumeInference` under the box
+that leads there, `← CaptureView` under the box it arrives at, rendered by `StepStubs.svelte` in the gap under the box,
+capped at three with `+N more`. This is not a hiding: the link is *stated*, which says more than a line vanishing off
+the edge of the screen does, and it is the one at-rest cut that does not produce the "box that leads somewhere and
+draws nothing" every earlier cut produced (§ the arc above). Selecting the box draws every one of its real lines, as
+before, and the stub block steps aside while it is selected. The anchor's fan is never stubbed — it is already one line
+per region. Result on `/capture`: 48 lines drawn at rest crossing each other **once** (was 652), lines-over-boxes 553 →
+26, with every quiet box still one the screen itself fires directly.
 
 **Decisions — a choice made inside a box, said under it.** A fork the tree can see is written *inside* a box and its
 arms *leave* that box: `resolvePostLoginRoute` ends `return (await hasSeenWelcome(id)) ? '/home/' : '/welcome/'`, so two

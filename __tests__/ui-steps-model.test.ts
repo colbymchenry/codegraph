@@ -278,8 +278,49 @@ describe('a screen laid out by region', () => {
 
   it('keeps a step above what it sets in motion, inside its region', () => {
     expect(at(anchor.id).y).toBeLessThan(at(a1.id).y);
-    expect(at(a1.id).y).toBe(at(a2.id).y);
     expect(at(a3.id).y).toBeGreaterThan(at(a1.id).y);
+    // A step that fires something is drawn as a cluster of its own — itself,
+    // then what it fires under it, stepped in. A step that fires nothing does
+    // not need one, so the two are no longer on the same line.
+    expect(at(a3.id).x).toBeGreaterThan(at(a1.id).x);
+  });
+
+  it('spreads the steps that fire nothing along one line, and clusters the ones that do', () => {
+    // A screen's handlers are siblings, not a hierarchy: giving each its own
+    // line turned a flat region into a column. Only a step that sets something
+    // in motion earns a cluster.
+    const D = { id: 'component:PanelD', label: 'PanelD' };
+    const root = step('/', 'screen', 0, { anchor: true });
+    const flat = [0, 1, 2].map((i) => step(`tap${i}`, 'trigger', 1, { order: i, region: D }));
+    const hub = step('tapRun', 'trigger', 1, { order: 3, region: D });
+    const under = step('runThing', 'store', 2, { order: 4, region: D, node: ref('runThing', 'src/d.storage.ts') });
+    const m = buildStepsModel(
+      payload(
+        [root, ...flat, hub, under],
+        [...[...flat, hub].map((s) => link(root, s)), link(hub, under, { kind: 'store' })]
+      )
+    );
+    const y = (id: string) => m.layout.nodes.find((n) => n.id === id)!.y;
+    expect(new Set(flat.map((s) => y(s.id))).size).toBe(1);
+    expect(y(hub.id)).toBeGreaterThan(y(flat[0]!.id));
+    expect(y(under.id)).toBeGreaterThan(y(hub.id));
+  });
+
+  it('settles a region that holds a cycle instead of running to the bound', () => {
+    // Relaxation over a cyclic graph never stops moving: one real screen sent
+    // sixty-five of its boxes to rows 294-301 while the rest sat at 0-2.
+    const E = { id: 'component:PanelE', label: 'PanelE' };
+    const root = step('/', 'screen', 0, { anchor: true });
+    const p1 = step('one', 'trigger', 1, { order: 0, region: E });
+    const p2 = step('two', 'trigger', 2, { order: 1, region: E });
+    const p3 = step('three', 'trigger', 3, { order: 2, region: E });
+    const m = buildStepsModel(
+      payload([root, p1, p2, p3], [link(root, p1), link(p1, p2), link(p2, p3), link(p3, p1)])
+    );
+    const ys = [p1, p2, p3].map((s) => m.layout.nodes.find((n) => n.id === s.id)!.y);
+    const pitch = 40 + m.layerGap;
+    // Three boxes, so at most three lines of them — not one line per pass.
+    expect((Math.max(...ys) - Math.min(...ys)) / pitch).toBeLessThanOrEqual(2);
   });
 
   it('at rest hides only the screen’s own fan and what points back up; every other lead-to draws', () => {
@@ -318,5 +359,68 @@ describe('a screen laid out by region', () => {
     const plain = buildStepsModel(payload([step('/x', 'screen', 0, { anchor: true }), step('go', 'trigger', 1)], [link(step('/x', 'screen', 0, { anchor: true }), step('go', 'trigger', 1))]));
     expect(plain.regions).toBeNull();
     expect(plain.regionEntries).toBeNull();
+  });
+});
+
+describe('a link too far to draw is said in words', () => {
+  // Two chains in one region, and a link from the tail of the first to the
+  // tail of the second. The clusters are drawn one under the other, so that
+  // one link has to cross the whole region — the kind of line that, times a
+  // hundred, crossed itself six hundred and fifty-two times on a real screen.
+  const G = { id: 'component:PanelG', label: 'PanelG' };
+  const anchor = step('/', 'screen', 0, { anchor: true });
+  const chain = (p: string) =>
+    [0, 1, 2, 3].map((i) => step(`${p}${i}`, 'trigger', i + 1, { order: i, region: G, node: ref(`${p}${i}`, 'src/g.tsx') }));
+  const a = chain('a');
+  const b = chain('b');
+  const links = [
+    link(anchor, a[0]!),
+    link(anchor, b[0]!),
+    ...a.slice(1).map((s, i) => link(a[i]!, s)),
+    ...b.slice(1).map((s, i) => link(b[i]!, s)),
+    // The long one, from the bottom of the first cluster to the bottom of the second.
+    link(a[3]!, b[3]!),
+  ];
+  const model = buildStepsModel(payload([anchor, ...a, ...b], links));
+  const far = model.layout.edges.find((e) => e.source === a[3]!.id && e.target === b[3]!.id)!;
+  const near = model.layout.edges.find((e) => e.source === a[0]!.id && e.target === a[1]!.id)!;
+
+  it('draws the hop a reader can follow and words the one they cannot', () => {
+    expect(stepEdgeVisible(model, near, null)).toBe(true);
+    expect(stepEdgeVisible(model, far, null)).toBe(false);
+    expect(model.stubbed.has(far.id)).toBe(true);
+    expect(model.stubbed.has(near.id)).toBe(false);
+  });
+
+  it('says it at BOTH ends, so neither box reads as wired to nothing', () => {
+    expect(model.stubs.get(a[3]!.id) ?? []).toContainEqual(
+      expect.objectContaining({ edge: far.id, dir: 'out', label: 'b3' })
+    );
+    expect(model.stubs.get(b[3]!.id) ?? []).toContainEqual(
+      expect.objectContaining({ edge: far.id, dir: 'in', label: 'a3' })
+    );
+  });
+
+  it('draws every one of a box\u2019s real lines again when it is selected', () => {
+    expect(stepEdgeVisible(model, far, a[3]!.id)).toBe(true);
+    expect(stepEdgeVisible(model, far, b[3]!.id)).toBe(true);
+    // ...and still not for an unrelated selection.
+    expect(stepEdgeVisible(model, far, a[1]!.id)).toBe(false);
+  });
+
+  it('never words the screen\u2019s own fan \u2014 that is already one line per region', () => {
+    for (const list of model.stubs.values()) {
+      for (const stub of list) expect(stub.other).not.toBe(anchor.id);
+    }
+  });
+
+  it('leaves a picture whose every line is local alone', () => {
+    const plain = buildStepsModel(
+      payload([step('/x', 'screen', 0, { anchor: true }), step('go', 'trigger', 1)], [
+        link(step('/x', 'screen', 0, { anchor: true }), step('go', 'trigger', 1)),
+      ])
+    );
+    expect(plain.stubbed.size).toBe(0);
+    expect(plain.stubs.size).toBe(0);
   });
 });

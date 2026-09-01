@@ -58,6 +58,16 @@
           >
         </div>
       {/if}
+      {#if !order}
+        <div class="lrow">
+          <span class="k-label mono">→ name</span>
+          <span
+            >What a box leads to, or what reaches it (←), when the two are too far apart for a line to be followed — said
+            in words under the box rather than drawn across the picture. Select the box and every one of its real lines
+            draws</span
+          >
+        </div>
+      {/if}
       {#if project === 'api'}
         <div class="lrow">
           <span class="k-box mono">POST /x</span>
