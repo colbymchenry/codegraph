@@ -183,6 +183,8 @@ These describe `codegraph ui` and its screens. They were taken out of `## [Unrel
 
 - **Entry points and the Symbol view no longer go blank.** The Symbol view of every Vue, Svelte and Astro component stayed on "Loading…", because its member list held the component's script symbols twice, along with the component and its file. Entry points went blank on apps with inline route handlers like `app.get('/x', async (c) => { … })`, which came back once per call in the handler, each call listed as if it were the handler. Each member is now listed once, and each route is one row: the handler it is bound to, or "inline handler" when the handler is written at the registration.
 
+- **Saved trails stay inside the indexed project even when a parent directory is a symlink.** The viewer now refuses a trail path whose nearest existing directory resolves outside the project, and creates its atomic temporary file exclusively so a pre-planted link cannot capture the write.
+
 - **Entry points' most-depended-on list shows your code, not a vendored bundle's.** A minified library or bundled docs script (`n`, `t`, `Buffer` with thousands of callers, all from inside the bundle) could top the list. Symbols in generated files are now left out of it, like test files.
 
 - **Stopping `codegraph ui` stops the server.** Killing the command by its process id, as a process manager, an editor task or `kill` does, left the server running on its port with no way to reach it, until the machine restarted. The server now notices it has been left behind and shuts down, closing the index first. Ctrl+C was never affected.

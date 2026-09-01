@@ -29,6 +29,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { randomUUID } from 'crypto';
 import { CODEGRAPH_DIR } from '../../directory';
 import { resolveProjectFile } from '../security';
 import { ApiError, badRequest } from './respond';
@@ -263,9 +264,9 @@ export function readStoredTrail(projectRoot: string, id: string): StoredTrail | 
  * Write a trail, atomically.
  *
  * Temp file beside the target then `rename`, so a reader either sees the
- * previous trail or the new one and never a partial file. The temp name carries
- * the pid: two `codegraph ui` processes on one project is unusual but not
- * forbidden, and two writers sharing a temp name would corrupt each other's.
+ * previous trail or the new one and never a partial file. A random suffix plus
+ * exclusive creation means neither another viewer nor a pre-planted symlink can
+ * capture the temporary write.
  */
 export function writeStoredTrail(projectRoot: string, trail: StoredTrail): void {
   const dir = trailsDirectory(projectRoot);
@@ -274,10 +275,18 @@ export function writeStoredTrail(projectRoot: string, trail: StoredTrail): void 
   } catch (err) {
     throw writeFailure(err);
   }
+  // The directory did not necessarily exist during the first check. Resolve it
+  // again now that mkdir completed, so an existing parent symlink cannot turn a
+  // not-yet-existing trail directory into an out-of-project write.
+  trailsDirectory(projectRoot);
   const target = trailPath(projectRoot, trail.id);
-  const temp = `${target}.${process.pid}.tmp`;
+  const temp = `${target}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    fs.writeFileSync(temp, `${JSON.stringify(trail, null, 2)}\n`, 'utf-8');
+    fs.writeFileSync(temp, `${JSON.stringify(trail, null, 2)}\n`, {
+      encoding: 'utf-8',
+      flag: 'wx',
+      mode: 0o600,
+    });
     fs.renameSync(temp, target);
   } catch (err) {
     try {
