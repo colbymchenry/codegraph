@@ -1307,6 +1307,76 @@ describe('Installer targets — partial-state idempotency', () => {
   });
 });
 
+describe('Installer targets — Hermes query skill', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('hermes-home');
+    tmpCwd = mkTmpDir('hermes-cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  function hermesPaths(): { config: string; skill: string } {
+    return {
+      config: path.join(tmpHome, '.hermes', 'config.yaml'),
+      skill: path.join(tmpHome, '.hermes', 'skills', 'codegraph-query', 'SKILL.md'),
+    };
+  }
+
+  it('installs a codegraph-query skill alongside existing Hermes MCP config', () => {
+    const hermes = getTarget('hermes')!;
+    const { config, skill } = hermesPaths();
+    fs.mkdirSync(path.dirname(config), { recursive: true });
+    fs.writeFileSync(config, 'mcp_servers:\n  other:\n    command: other\n\nplatform_toolsets:\n  cli:\n    - hermes-cli\n');
+
+    const result = hermes.install('global', { autoAllow: true });
+
+    expect(result.files.map((f) => f.path)).toContain(config);
+    expect(result.files.map((f) => f.path)).toContain(skill);
+    const configText = fs.readFileSync(config, 'utf-8');
+    expect(configText).toContain('  other:');
+    expect(configText).toContain('  codegraph:');
+    expect(configText).toContain('    - mcp-codegraph');
+
+    const skillText = fs.readFileSync(skill, 'utf-8');
+    expect(skillText).toContain('name: codegraph-query');
+    expect(skillText).toContain('mcp-codegraph');
+    expect(skillText).toContain('projectPath');
+    expect(skillText).toContain('stale or pending index updates');
+    expect(skillText).toContain('worktree/index mismatch');
+    expect(skillText).toContain('not-initialized projects');
+    expect(skillText).toContain('codegraph query <question>');
+    expect(hermes.detect('global').alreadyConfigured).toBe(true);
+  });
+
+  it('is idempotent and uninstalls the query skill without breaking sibling config', () => {
+    const hermes = getTarget('hermes')!;
+    const { config, skill } = hermesPaths();
+    hermes.install('global', { autoAllow: true });
+
+    const second = hermes.install('global', { autoAllow: true });
+    expect(second.files.every((f) => f.action === 'unchanged')).toBe(true);
+
+    const removed = hermes.uninstall('global');
+    expect(removed.files.some((f) => f.path === skill && f.action === 'removed')).toBe(true);
+    expect(fs.existsSync(skill)).toBe(false);
+    expect(fs.readFileSync(config, 'utf-8')).not.toContain('mcp-codegraph');
+    expect(hermes.detect('global').alreadyConfigured).toBe(false);
+  });
+});
+
 describe('Installer targets — registry', () => {
   it('getTarget returns the right target for each id', () => {
     expect(getTarget('claude')?.id).toBe('claude');
