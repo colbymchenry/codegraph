@@ -40,6 +40,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   r: 'tree-sitter-r.wasm',
   luau: 'tree-sitter-luau.wasm',
   objc: 'tree-sitter-objc.wasm',
+  odin: 'tree-sitter-odin.wasm',
   cfml: 'tree-sitter-cfml.wasm',
   cfscript: 'tree-sitter-cfscript.wasm',
   cfquery: 'tree-sitter-cfquery.wasm',
@@ -166,10 +167,14 @@ export const EXTENSION_MAP: Record<string, Language> = {
   // shape as the `.yml` variants — the YAML/properties extractor emits one node
   // per leaf key, and the Spring resolver links `@Value("${k}")` references.
   '.properties': 'properties',
+<<<<<<< HEAD
+
+=======
   // Terraform / OpenTofu / HCL config — tree-sitter-terraform dialect of HCL.
   '.tf': 'terraform',
   '.tfvars': 'terraform',
   '.tofu': 'terraform',
+>>>>>>> upstream/main
 };
 
 /**
@@ -420,8 +425,24 @@ export async function loadGrammarsForLanguages(languages: Language[], wasmBytes?
   // See: https://github.com/tree-sitter/tree-sitter/issues/2338
   for (const lang of toLoad) {
     try {
+<<<<<<< HEAD
+      // Some grammars ship their own WASMs (not in tree-sitter-wasms, or the
+      // tree-sitter-wasms build is too old). Lua: tree-sitter-wasms ships an
+      // ABI-13 build that corrupts the shared WASM heap under web-tree-sitter
+      // 0.25 (drops nested calls/imports on every file after the first); we
+      // vendor the upstream ABI-15 wasm instead. C#: the tree-sitter-wasms
+      // build (ABI 13) has no primary-constructor support and parses
+      // `class Foo(...)` as an ERROR that swallows the whole class (#237); we
+      // vendor the upstream ABI-15 tree-sitter-c-sharp 0.23.5 wasm, which parses
+      // primary constructors natively.
+       const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'csharp' || lang === 'r' || lang === 'cfml' || lang === 'cfscript' || lang === 'cfquery' || lang === 'cobol')
+        ? path.join(__dirname, 'wasm', wasmFile)
+        : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
+      const language = await WasmLanguage.load(wasmPath);
+=======
       const bytes = wasmBytes?.[lang];
       const language = await WasmLanguage.load(bytes ?? resolveWasmPath(lang));
+>>>>>>> upstream/main
       languageCache.set(lang, language);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -699,6 +720,7 @@ export function getLanguageDisplayName(language: Language): string {
     twig: 'Twig',
     xml: 'XML',
     properties: 'Java properties',
+    odin: 'Odin',
     cfml: 'CFML',
     cfscript: 'CFScript',
     cfquery: 'CFQuery (SQL)',
