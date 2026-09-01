@@ -730,6 +730,23 @@ export function resolveMethodOnType(
   }
 
   if (matches.length > 1 && preferredFqn) {
+    // Prefer the candidate whose namespace-qualified name matches the imported
+    // FQN. #412 indexes JVM declarations as `<pkg>::<Class>` from the file's
+    // `package` directive — independent of the file name — so this disambiguates
+    // Kotlin (where `FooConverter` can live in `Converters.kt`) that the
+    // file-path-suffix heuristic below can't. `com.example.b.FooConverter`
+    // → expected method qn `com.example.b::FooConverter::convert`.
+    const lastDot = preferredFqn.lastIndexOf('.');
+    if (lastDot > 0) {
+      const expectedQn = `${preferredFqn.slice(0, lastDot)}::${preferredFqn.slice(lastDot + 1)}::${methodName}`;
+      const byQn = matches.find((m) => m.qualifiedName === expectedQn);
+      if (byQn) {
+        return { original: ref, targetNodeId: byQn.id, confidence, resolvedBy };
+      }
+    }
+    // Fall back to file-path-suffix match for Java's class-name = file-name
+    // layout (covers files indexed before the namespace wrapper, or any case
+    // the qn match misses).
     const ext = ref.language === 'kotlin' ? '.kt' : '.java';
     const fqnPath = preferredFqn.replace(/\./g, '/') + ext;
     const chosen = matches.find((m) => {

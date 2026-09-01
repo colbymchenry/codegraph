@@ -2133,6 +2133,42 @@ export class TreeSitterExtractor {
       }
     }
 
+    // Kotlin property_declaration: `private val x: Foo = ...` parses as
+    // variable_declaration → simple_identifier (name) + user_type (type).
+    // It reuses the `variable_declaration` wrapper C# uses but holds a bare
+    // `simple_identifier`, not a `variable_declarator`, so neither branch
+    // above matches and the identifier-only fallback below misses it too
+    // (Kotlin's grammar has no field names). Without this branch Kotlin class
+    // properties produce NO node, so receiver-type inference can't see the
+    // field's declared type and same-name cross-package calls mis-resolve (#314).
+    if (declarators.length === 0 && this.language === 'kotlin') {
+      const varDecl = node.namedChildren.find(c => c.type === 'variable_declaration');
+      const nameNode = varDecl?.namedChildren.find(c => c.type === 'simple_identifier');
+      if (varDecl && nameNode) {
+        const name = getNodeText(nameNode, this.source);
+        // The type sits as a sibling of the name inside variable_declaration.
+        // Emit a "<Type> <name>" signature (matching extractField's Java/C#
+        // shape) so inferJavaFieldReceiverType can read the declared type;
+        // strip Kotlin's nullable `?` so `Foo?` resolves like `Foo`.
+        const typeNode = varDecl.namedChildren.find(c => c.type !== 'simple_identifier');
+        const typeText = typeNode
+          ? getNodeText(typeNode, this.source).replace(/\?$/, '').trim()
+          : undefined;
+        const signature = typeText ? `${typeText} ${name}` : name;
+        const fieldNode = this.createNode('field', name, node, {
+          docstring,
+          signature,
+          visibility,
+          isStatic,
+        });
+        if (fieldNode) {
+          this.extractDecoratorsFor(node, fieldNode.id);
+          this.extractTypeAnnotations(node, fieldNode.id);
+        }
+        return;
+      }
+    }
+
     if (declarators.length > 0) {
       // Get field type from the type child
       // Java: type is a direct child of field_declaration

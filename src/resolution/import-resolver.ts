@@ -1043,8 +1043,14 @@ function extractJavaImports(content: string): ImportMapping[] {
   const stripped = content
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/\/\/[^\n]*/g, '');
-  // `import [static] <fqn>[.*];`
-  const re = /^\s*import\s+(static\s+)?([\w.]+(?:\.\*)?)\s*;/gm;
+  // `import [static] <fqn>[.*][;]` — the trailing `;` is optional because
+  // Kotlin imports omit it (`import com.example.Foo`). Without this, Kotlin
+  // produced ZERO import mappings, so receiver-FQN disambiguation (the
+  // `importedFqn` passed to resolveMethodOnType) never fired for Kotlin and
+  // same-name classes fell back to lexical order (#314). A bare `import …` with
+  // a Kotlin `as Alias` suffix still captures the FQN (alias unhandled, as in
+  // the Java path). Java's mandatory `;` keeps matching unchanged.
+  const re = /^\s*import\s+(static\s+)?([\w.]+(?:\.\*)?)\s*;?/gm;
   let match: RegExpExecArray | null;
   while ((match = re.exec(stripped)) !== null) {
     const fqn = match[2]!;

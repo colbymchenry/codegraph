@@ -2150,6 +2150,38 @@ fun util(): Int = 42
     expect(util?.qualifiedName).toBe('com.example.foo::util');
   });
 
+  it('extracts class properties with a typed field signature', () => {
+    // Kotlin `property_declaration` parses as variable_declaration →
+    // simple_identifier (+ user_type), not the `variable_declarator` shape
+    // Java/C# use, so before the fix class properties produced NO field node
+    // at all — which broke receiver-type inference for `field.method()` calls
+    // (#314).
+    const code = `
+package com.example.web
+
+class Handler {
+  private val fooConverter: FooConverter = FooConverter()
+  var count: Int = 0
+  private val nullable: Bar? = null
+}
+`;
+    const result = extractFromSource('Handler.kt', code);
+
+    const fooField = result.nodes.find((n) => n.kind === 'field' && n.name === 'fooConverter');
+    expect(fooField).toBeDefined();
+    // Signature must be "<Type> <name>" so inferJavaFieldReceiverType reads it.
+    expect(fooField?.signature).toBe('FooConverter fooConverter');
+    expect(fooField?.qualifiedName).toBe('com.example.web::Handler::fooConverter');
+
+    const countField = result.nodes.find((n) => n.kind === 'field' && n.name === 'count');
+    expect(countField?.signature).toBe('Int count');
+
+    // Kotlin nullable `Bar?` is normalized to `Bar` so it resolves like the
+    // non-null type.
+    const nullableField = result.nodes.find((n) => n.kind === 'field' && n.name === 'nullable');
+    expect(nullableField?.signature).toBe('Bar nullable');
+  });
+
   it('handles a single-segment package', () => {
     const code = `
 package foo

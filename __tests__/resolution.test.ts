@@ -1680,6 +1680,64 @@ public class Handler {
       );
     });
 
+    it('Kotlin import disambiguates same-name classes in non-eponymous files (#314)', async () => {
+      // The Kotlin twist on #314: the class lives in a file NOT named after
+      // it (`Converters.kt`, the idiomatic Kotlin layout), so the file-path
+      // suffix heuristic (`com/example/b/FooConverter.kt`) can't match — only
+      // the namespace `qualifiedName` (`com.example.b::FooConverter`, from the
+      // package directive) disambiguates. Two prerequisites had to hold:
+      // (1) the `val fooConverter: FooConverter` property must extract as a
+      //     field so the receiver type is known (Kotlin property extraction);
+      // (2) resolveMethodOnType must prefer the candidate whose qn matches the
+      //     imported FQN, not the path suffix.
+      const aDir = path.join(tempDir, 'module-a/src/main/kotlin/com/example/a');
+      const bDir = path.join(tempDir, 'module-b/src/main/kotlin/com/example/b');
+      const webDir = path.join(tempDir, 'web/src/main/kotlin/com/example/web');
+      fs.mkdirSync(aDir, { recursive: true });
+      fs.mkdirSync(bDir, { recursive: true });
+      fs.mkdirSync(webDir, { recursive: true });
+
+      fs.writeFileSync(
+        path.join(aDir, 'Converters.kt'),
+        `package com.example.a
+class FooConverter { fun convert(x: String): String { return "a:" + x } }
+`
+      );
+      fs.writeFileSync(
+        path.join(bDir, 'Converters.kt'),
+        `package com.example.b
+class FooConverter { fun convert(x: String): String { return "b:" + x } }
+`
+      );
+      // Caller imports the module-b converter; module-a is lexically first in
+      // the candidate list, so a correct result proves the import wins.
+      fs.writeFileSync(
+        path.join(webDir, 'Handler.kt'),
+        `package com.example.web
+
+import com.example.b.FooConverter
+
+class Handler {
+  private val fooConverter: FooConverter = FooConverter()
+  fun use(): String { return fooConverter.convert("input") }
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const use = cg
+        .getNodesByKind('method')
+        .find((n) => n.qualifiedName.endsWith('Handler::use'));
+      expect(use).toBeDefined();
+      const calls = cg.getOutgoingEdges(use!.id).filter((e) => e.kind === 'calls');
+      expect(calls.length).toBeGreaterThanOrEqual(1);
+
+      const target = cg.getNode(calls[0]!.target);
+      expect(target?.name).toBe('convert');
+      expect(target?.qualifiedName).toBe('com.example.b::FooConverter::convert');
+    });
+
     it('C# extracts references from method/property/field types (#381)', async () => {
       // Pre-#381, every C# project produced ZERO `references` edges:
       // csharp.ts was missing returnField, and the type-leaf walker
