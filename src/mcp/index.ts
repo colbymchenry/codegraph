@@ -37,7 +37,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { spawn, StdioOptions } from 'child_process';
-import { findNearestCodeGraphRoot, getCodeGraphDir } from '../directory';
+import { resolveServerRoot, getCodeGraphDir } from '../directory';
 import { StdioTransport } from './transport';
 import { MCPEngine } from './engine';
 import { MCPSession } from './session';
@@ -48,7 +48,7 @@ import {
   tryAcquireDaemonLock,
 } from './daemon';
 import { connectWithHello, runLocalHandshakeProxy } from './proxy';
-import { getDaemonSocketCandidates } from './daemon-paths';
+import { getDaemonSocketCandidates, probeDaemonIdentity } from './daemon-paths';
 import { getTelemetry } from '../telemetry';
 import { checkForUpdateInBackground } from '../upgrade/update-check';
 import { EARLY_PPID } from './early-ppid';
@@ -150,6 +150,12 @@ export function watchdogProgressPaths(root: string | null): { progressPaths?: st
  * that case the caller must run in direct mode, since the daemon lockfile
  * and socket both live under `.codegraph/`.
  *
+ * Uses the same resolution as the engine (#1606): up-walk first, then the
+ * bounded workspace down-scan that adopts a SINGLE indexed sub-project. A
+ * workspace root above one indexed child therefore gets the shared daemon
+ * (one watcher, one writer, keyed on the child) instead of a direct-mode
+ * server per host.
+ *
  * The result is canonicalized with `realpathSync` so every client converges on
  * the same socket/lock path regardless of how it expressed the path: a client
  * launched with cwd under a symlink (e.g. macOS `/var` → `/private/var`, where
@@ -159,7 +165,7 @@ export function watchdogProgressPaths(root: string | null): { progressPaths?: st
  */
 function resolveDaemonRoot(explicitPath: string | null): string | null {
   const candidate = explicitPath ?? process.cwd();
-  const root = findNearestCodeGraphRoot(candidate);
+  const root = resolveServerRoot(candidate).root;
   if (!root) return null;
   try { return fs.realpathSync(root); } catch { return root; }
 }
@@ -423,15 +429,22 @@ export class MCPServer {
       // binding) — we're redundant; exit cleanly so the launcher proxies to it.
       const existing = lock.existing;
       if (existing && existing.pid > 0 && isProcessAlive(existing.pid)) {
-        process.stderr.write(
-          `[CodeGraph daemon] Another daemon (pid ${existing.pid}) already holds the lock; exiting.\n`
-        );
-        process.exit(0);
+        // Give a newly-elected daemon time to bind, then require its socket hello
+        // to match the lock PID/version. PID existence alone accepts an unrelated
+        // process after OS PID reuse and permanently wedges startup (#1553).
+        const age = Date.now() - existing.startedAt;
+        const stillStarting = existing.startedAt > 0 && age >= 0 && age < 10_000;
+        if (stillStarting || await probeDaemonIdentity(existing)) {
+          process.stderr.write(
+            `[CodeGraph daemon] Another daemon (pid ${existing.pid}) already holds the lock; exiting.\n`
+          );
+          process.exit(0);
+        }
       }
 
       // Holder is dead (or the record is unreadable) — clear it (pid-verified,
       // so we never delete a live daemon's lock) and retry the acquire.
-      clearStaleDaemonLock(lock.pidPath, existing?.pid);
+      clearStaleDaemonLock(lock.pidPath, existing?.pid, { allowLivePid: true });
       await sleep(TAKEOVER_RETRY_DELAY_MS);
     }
 

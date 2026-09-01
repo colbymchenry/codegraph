@@ -32,6 +32,45 @@ function extractRustReturnType(node: SyntaxNode, source: string): string | undef
   return last === 'Self' ? 'self' : last;
 }
 
+/**
+ * The implementing type's simple name for an `impl` block, read from the
+ * grammar's `type` field (#1588). Mirrored byte-for-byte by the native
+ * kernel's `impl_type_name` (codegraph-kernel/src/rustlang.rs) — change both.
+ *
+ * `impl<T> Source for BufSource<T>`, `impl<'a> Iterator for Parents<'a>`,
+ * `impl Trait for &Foo`, `impl Trait for m::Foo` all yield the implementing
+ * TYPE (`BufSource`, `Parents`, `Foo`, `Foo`). The previous rule took the last
+ * bare `type_identifier` child of the `impl_item`; once the implementing type
+ * carries parameters it parses as a `generic_type`, so the only bare
+ * identifier left was the TRAIT's — every parameterized impl's methods were
+ * qualified by the trait (`Source::read`), unaddressable by their type and
+ * colliding with the trait's own declaration.
+ *
+ * Shapes that name no single type (tuples, `dyn Trait`, pointers, primitives,
+ * function types…) yield undefined: no receiver, and the fn is extracted
+ * exactly as before.
+ */
+export function rustImplTypeName(typeNode: SyntaxNode | null, source: string): string | undefined {
+  if (!typeNode) return undefined;
+  switch (typeNode.type) {
+    case 'type_identifier':
+    case 'identifier':
+      return getNodeText(typeNode, source);
+    // `Foo<T>` — the `type` field is the bare (or scoped) name, never the args.
+    case 'generic_type':
+      return rustImplTypeName(getChildByField(typeNode, 'type'), source);
+    // `m::Foo` — the last segment is the type's name.
+    case 'scoped_type_identifier':
+    case 'scoped_identifier':
+      return rustImplTypeName(getChildByField(typeNode, 'name'), source);
+    // `&Foo` / `&'a mut Foo` — the referenced type.
+    case 'reference_type':
+      return rustImplTypeName(getChildByField(typeNode, 'type'), source);
+    default:
+      return undefined;
+  }
+}
+
 export const rustExtractor: LanguageExtractor = {
   // `function_signature_item` is a trait method DECLARATION (`fn render(&self);`,
   // no body). Extracting it makes a trait's method set first-class, which
@@ -88,32 +127,10 @@ export const rustExtractor: LanguageExtractor = {
     let parent = node.parent;
     while (parent) {
       if (parent.type === 'impl_item') {
-        // For `impl Type { ... }` — the type is a direct type_identifier child
-        // For `impl Trait for Type { ... }` — the type is the LAST type_identifier
-        // (the first is part of the trait path)
-        const children = parent.namedChildren;
-        // Find all direct type_identifier children (not nested in scoped paths)
-        const typeIdents = children.filter(
-          (c: SyntaxNode) => c.type === 'type_identifier'
-        );
-        if (typeIdents.length > 0) {
-          // Last type_identifier is always the implementing type
-          const typeNode = typeIdents[typeIdents.length - 1]!;
-          return source.substring(typeNode.startIndex, typeNode.endIndex);
-        }
-        // Handle generic types: impl<T> MyStruct<T> { ... }
-        const genericType = children.find(
-          (c: SyntaxNode) => c.type === 'generic_type'
-        );
-        if (genericType) {
-          const innerType = genericType.namedChildren.find(
-            (c: SyntaxNode) => c.type === 'type_identifier'
-          );
-          if (innerType) {
-            return source.substring(innerType.startIndex, innerType.endIndex);
-          }
-        }
-        return undefined;
+        // The grammar names the implementing type directly (the `type` field)
+        // for both `impl Type { … }` and `impl Trait for Type { … }` — see
+        // rustImplTypeName for why the old positional scan was wrong (#1588).
+        return rustImplTypeName(getChildByField(parent, 'type'), source);
       }
       parent = parent.parent;
     }

@@ -39,6 +39,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
 import { getDaemonSocketPath } from '../src/mcp/daemon-paths';
+import { CodeGraphPackageVersion } from '../src/mcp/version';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
@@ -335,6 +336,44 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(livePid).not.toBe(999_999);
     expect(isAlive(livePid!)).toBe(true);
   }, 40000);
+
+  it('takes over after SIGKILL even when the stale PID has been reused (#1553)', async () => {
+    const env = { CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '30000' };
+    const first = spawnServer(tempDir, env);
+    servers.push(first);
+    sendInitialize(first.child, `file://${tempDir}`, 1);
+    await waitFor(() => findResponse(first.stdout, 1), 10000);
+    await waitFor(() => countListeningLines(realRoot) >= 1, 10000);
+    const killedPid = readLockPid(realRoot)!;
+
+    process.kill(killedPid, 'SIGKILL');
+    expect(await waitProcessExit(killedPid, 8000)).toBe(true);
+
+    // Model OS PID reuse without risking another process: the stale lock now
+    // names this live vitest worker, but no daemon answers the leftover socket.
+    fs.writeFileSync(
+      path.join(realRoot, '.codegraph', 'daemon.pid'),
+      JSON.stringify({
+        pid: process.pid,
+        version: CodeGraphPackageVersion,
+        socketPath: getDaemonSocketPath(realRoot),
+        startedAt: Date.now() - 60_000,
+      }),
+    );
+
+    const second = spawnServer(tempDir, env);
+    servers.push(second);
+    sendInitialize(second.child, `file://${tempDir}`, 2);
+    const response = await waitFor(() => findResponse(second.stdout, 2), 12000);
+    expect(response.result.serverInfo.name).toBe('codegraph');
+    await waitFor(() => countListeningLines(realRoot) >= 2, 10000);
+
+    const replacementPid = readLockPid(realRoot)!;
+    expect(replacementPid).not.toBe(killedPid);
+    expect(replacementPid).not.toBe(process.pid);
+    expect(isAlive(replacementPid)).toBe(true);
+    expect(isAlive(process.pid)).toBe(true);
+  }, 50000);
 
   it('proxy falls back to direct mode on a daemon version mismatch', async () => {
     const net = await import('net');

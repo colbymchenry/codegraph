@@ -34,7 +34,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { isSourceFile, buildScopeIgnore, type ScopeIgnore } from '../extraction';
-import { loadExtensionOverrides } from '../project-config';
+import { loadExtensionOverrides, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { logDebug, logWarn } from '../errors';
 import { normalizePath } from '../utils';
 import { isCodeGraphDataDir } from '../directory';
@@ -328,11 +328,13 @@ export class FileWatcher {
    * deterministically gate on watcher readiness.
    */
   private readyWaiters: Array<() => void> = [];
-  // The shared scope matcher (built-in defaults + project .gitignore, with
-  // embedded child repos matched by their OWN rules — #514), built once at
-  // start(). Same source of truth the indexer uses, so watcher scope can
-  // never diverge from index scope. An embedded repo created after start()
-  // joins the scope on the next watcher restart / re-index.
+  // The shared scope matcher (built-in defaults + project .gitignore + the
+  // `codegraph.json` exclude/include rules, with embedded child repos matched
+  // by their OWN rules — #514), built at start() and REBUILT whenever one of
+  // the files it is derived from changes (see `refreshScope`, #1590). Same
+  // source of truth the indexer uses, so watcher scope can never diverge from
+  // index scope. An embedded repo created after start() joins the scope on
+  // the next scope refresh / watcher restart / re-index.
   private ignoreMatcher: ScopeIgnore | null = null;
 
   private readonly projectRoot: string;
@@ -573,7 +575,24 @@ export class FileWatcher {
   private handleChange(rel: string): void {
     if (!rel || rel === '.' || rel.startsWith('..')) return;
     if (this.isAlwaysIgnored(rel)) return;
+    // The two root files the scope matcher is derived from are handled BEFORE
+    // the matcher is consulted: a user `exclude` pattern that happens to cover
+    // them (`*.json`, `.*`) must not be able to hide their own edits (#1590).
+    if (rel === PROJECT_CONFIG_FILENAME || rel === '.gitignore') {
+      this.refreshScope(rel);
+      return;
+    }
     if (this.ignoreMatcher && this.ignoreMatcher.ignores(rel)) return;
+    // A nested `.gitignore` (an embedded child repo's own rules, #514, or a
+    // subdirectory rule the git-backed full scan honors) is only a scope
+    // change when it sits INSIDE the current scope — checked after the matcher
+    // on purpose, so the thousands of package-local `.gitignore`s an
+    // `npm install` writes under an ignored `node_modules/` never trigger a
+    // rebuild storm.
+    if (rel.endsWith('/.gitignore')) {
+      this.refreshScope(rel);
+      return;
+    }
     if (!isSourceFile(rel, loadExtensionOverrides(this.projectRoot))) {
       this.maybeScheduleForRemovedDir(rel);
       return;
@@ -588,6 +607,34 @@ export class FileWatcher {
         lastSeenMs: now,
       });
     }
+    this.scheduleSync();
+  }
+
+  /**
+   * A scope-defining file changed (`codegraph.json`, a `.gitignore`): rebuild
+   * the ignore matcher and make the next sync a FULL reconcile (#1590).
+   *
+   * The matcher used to be built once in `start()` and kept for the watcher's
+   * lifetime — in a long-lived MCP daemon that meant a `codegraph.json`
+   * created or edited after startup was invisible to the live watcher, while
+   * `codegraph sync` (a fresh process) honoured it immediately: the CLI
+   * removed a newly excluded file and the watcher re-added it seconds later.
+   * `loadExtensionOverrides()` on the same filter line was already read live
+   * (mtime-cached), so two fields of the same config file disagreed.
+   *
+   * Rebuilding costs one `git ls-files` pass (embedded-repo discovery), which
+   * is fine per config edit — never per event. Replacing the field is enough
+   * for both strategies: the recursive handler and the per-directory
+   * `shouldIgnoreDir` walk read `this.ignoreMatcher` on every call. The full
+   * scan is required because a scope change has no per-file events: newly
+   * excluded files must be REMOVED from the index and newly included ones
+   * added, and only the scan-diff (which builds its own fresh matcher) knows
+   * which those are.
+   */
+  private refreshScope(rel: string): void {
+    logDebug('Scope config changed; rebuilding watcher scope', { file: rel });
+    this.ignoreMatcher = buildScopeIgnore(this.projectRoot);
+    this.needsFullScan = true;
     this.scheduleSync();
   }
 

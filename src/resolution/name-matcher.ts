@@ -503,6 +503,35 @@ export function matchByQualifiedName(
     }
   }
 
+  // Erlang qualified refs (#1610): every erlang function's qualifiedName
+  // carries its arity (`mod::f/2`), and refs carry the call-site arity when it
+  // is statically known.
+  if (ref.language === 'erlang' && ref.referenceName.includes('::')) {
+    // A ref WITH arity that missed the exact lookup names an arity that isn't
+    // defined (or a module out of repo). Never fall through to the partial
+    // match — its "last segment" would be the arity digits — and never settle
+    // for a sibling arity: silent beats wrong.
+    if (/\/\d{1,3}$/.test(ref.referenceName)) return null;
+    // An arity-LESS qualified ref (dynamic MFA whose args list wasn't a
+    // static literal): resolve only when the module defines exactly ONE arity
+    // of that function; several arities with no signal is a guess.
+    const base = ref.referenceName.slice(ref.referenceName.lastIndexOf('::') + 2);
+    const prefix = `${ref.referenceName}/`;
+    const arityCands = keepForRef(context.getNodesByName(base)).filter(
+      (n) =>
+        n.qualifiedName.startsWith(prefix) && /^\d{1,3}$/.test(n.qualifiedName.slice(prefix.length)),
+    );
+    if (arityCands.length === 1) {
+      return {
+        original: ref,
+        targetNodeId: arityCands[0]!.id,
+        confidence: 0.85,
+        resolvedBy: 'qualified-name',
+      };
+    }
+    return null;
+  }
+
   // Try partial qualified name match — again preferring the call site's own
   // file when more than one symbol's qualifiedName ends with the reference.
   const parts = ref.referenceName.split(/[:.]/);
@@ -541,6 +570,93 @@ export function preferCallSiteFile(nodes: Node[], callSiteFile: string): Node[] 
     else other.push(n);
   }
   return same.length ? [...same, ...other] : nodes;
+}
+
+/**
+ * Languages whose object literals declare callable members — `export const
+ * api = { call() {…}, get: () => {…} }` used as a namespace (#1573).
+ */
+const OBJECT_LITERAL_LANGUAGES = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx', 'arkts']);
+
+/** True when `inner`'s source range lies within `outer`'s (lines, then columns on a shared line). */
+function rangeWithin(inner: Node, outer: Node): boolean {
+  const innerEnd = inner.endLine ?? inner.startLine;
+  const outerEnd = outer.endLine ?? outer.startLine;
+  if (inner.startLine < outer.startLine || innerEnd > outerEnd) return false;
+  if (inner.startLine === outer.startLine && inner.startColumn < outer.startColumn) return false;
+  if (innerEnd === outerEnd && inner.endColumn > outer.endColumn) return false;
+  return true;
+}
+
+function sameRange(a: Node, b: Node): boolean {
+  return (
+    a.startLine === b.startLine &&
+    a.startColumn === b.startColumn &&
+    (a.endLine ?? a.startLine) === (b.endLine ?? b.startLine) &&
+    a.endColumn === b.endColumn
+  );
+}
+
+/**
+ * Resolve `container.member` where `container` is a VALUE holding an object
+ * literal — `export const api = { call() {…}, get: () => {…} }` used as the
+ * module's namespace (#1573). The members are extracted as plain functions
+ * with BARE qualified names inside the constant's source extent (there is no
+ * `api::call`), so neither the `Container::member` lookup the class-shaped
+ * kinds use (#825) nor the declared-type inference for singleton instances
+ * (#1292) can reach them, and every such call resolved to nothing — or, via
+ * an import, to the constant itself. This looks the member up by CONTAINMENT:
+ * a node named `member` whose range lies inside the container's, in the
+ * container's own file. A helper declared inside a member's body is not a
+ * member and is skipped; nothing else in the file can donate a match. Calls
+ * take callable kinds only; other references accept value members too.
+ */
+export function resolveObjectLiteralMember(
+  container: Node,
+  member: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  confidence: number,
+  resolvedBy: ResolvedRef['resolvedBy'],
+): ResolvedRef | null {
+  if (container.kind !== 'constant' && container.kind !== 'variable') return null;
+  if (!OBJECT_LITERAL_LANGUAGES.has(container.language)) return null;
+  if (!sameLanguageFamily(container.language, ref.language)) return null;
+
+  const inFile = context.getNodesInFile(container.filePath);
+  const callable = (n: Node) => n.kind === 'function' || n.kind === 'method';
+  const valueMember = (n: Node) =>
+    callable(n) || n.kind === 'property' || n.kind === 'variable' || n.kind === 'constant';
+  const accepts = ref.referenceKind === 'calls' ? callable : valueMember;
+
+  const inside = inFile.filter((n) => n.id !== container.id && rangeWithin(n, container));
+  let candidates = inside.filter((n) => n.name === member && accepts(n));
+  if (candidates.length === 0) return null;
+
+  // Drop a candidate nested inside ANOTHER callable's body within the literal
+  // (`{ run() { const call = () => {}; } }` — `call` is `run`'s local, not a
+  // member). Strict containment: an identically-ranged sibling node for the
+  // same member (a property node over an arrow function) is not a body.
+  const bodies = inside.filter(callable);
+  candidates = candidates.filter(
+    (c) => !bodies.some((b) => b.id !== c.id && !sameRange(b, c) && rangeWithin(c, b))
+  );
+  if (candidates.length === 0) return null;
+
+  // Several survivors (a property AND a function for one arrow member, say):
+  // a callable first, then the earliest in source order.
+  candidates.sort((a, b) => {
+    const ca = callable(a) ? 0 : 1;
+    const cb = callable(b) ? 0 : 1;
+    if (ca !== cb) return ca - cb;
+    return a.startLine - b.startLine || a.startColumn - b.startColumn;
+  });
+  return {
+    original: ref,
+    targetNodeId: candidates[0]!.id,
+    confidence,
+    resolvedBy,
+  };
 }
 
 // Exported for the precedence unit tests (#1079): they assert the
@@ -1731,6 +1847,18 @@ export function matchMethodCall(
     return matchGoFieldChainCall(objectOrClass!, methodName!, ref, context);
   }
 
+  // Rust call through a field of the enclosing type — `self.inner.run()`,
+  // emitted as `self.inner.run` (#1585). Same discipline as the Go branch
+  // above, and EXCLUSIVE for the same reason: validated field-type inference
+  // or nothing. Letting this shape reach the bare-name strategies below is
+  // how `self.inner.run()` resolved to a same-named method on an unrelated
+  // type — or to the calling method itself, a self-edge the source doesn't
+  // contain — whenever the field's type was external or merely shared a
+  // method name with something nearby.
+  if (ref.language === 'rust' && dotMatch && objectOrClass!.startsWith('self.')) {
+    return matchRustSelfFieldCall(objectOrClass!.slice('self.'.length), methodName!, ref, context);
+  }
+
   // Java/Kotlin: receiver may be a field whose name doesn't match the type by
   // Java naming convention (`userbo` → class `UserBO`, abbreviated). Look up
   // the field in the enclosing class to get its declared type, then resolve
@@ -1757,6 +1885,27 @@ export function matchMethodCall(
         return typedMatch;
       }
     }
+  }
+
+  // Object-literal namespace receiver (#1573): `api.call()` where `api` is a
+  // same-file `const api = { call() {…}, get: () => {…} }`. Its members are
+  // plain functions with bare names inside the constant's extent — no
+  // `Container::member` qualified name — so none of the class-shaped
+  // strategies below can see them (Strategy 3 only considers `method`
+  // kinds) and the call resolved to nothing at all. Same file only: a
+  // cross-file use reaches the same helper through the import path.
+  if (dotMatch && !objectOrClass!.includes('.') && OBJECT_LITERAL_LANGUAGES.has(ref.language)) {
+    const literalMatch = nmTimedT('mc-literal', ref, (): ResolvedRef | null => {
+      const holders = preferCallSiteFile(context.getNodesByName(objectOrClass!), ref.filePath).filter(
+        (n) => (n.kind === 'constant' || n.kind === 'variable') && n.filePath === ref.filePath
+      );
+      for (const holder of holders) {
+        const hit = resolveObjectLiteralMember(holder, methodName!, ref, context, 0.85, 'instance-method');
+        if (hit) return hit;
+      }
+      return null;
+    });
+    if (literalMatch) return literalMatch;
   }
 
   // Strategy 1: Direct class name match (existing logic). When the receiver
@@ -1987,6 +2136,110 @@ function matchGoFieldChainCall(
       if (!fieldType || !/^[A-Za-z_]/.test(fieldType) || GO_BUILTIN_FIELD_TYPES.has(fieldType)) continue;
       const resolved = resolveMethodOnType(fieldType, methodName, ref, context, 0.85, 'instance-method');
       if (resolved) return resolved;
+    }
+  }
+  return null;
+}
+
+// Rust primitives and the prelude's own types: a field of one of these never
+// names a project type, so a `self.<field>.<method>()` on it stays unresolved.
+const RUST_NON_PROJECT_FIELD_TYPES = new Set([
+  'bool', 'char', 'str', 'String',
+  'i8', 'i16', 'i32', 'i64', 'i128', 'isize',
+  'u8', 'u16', 'u32', 'u64', 'u128', 'usize',
+  'f32', 'f64',
+  'Self', 'self',
+]);
+
+/**
+ * Reduce a Rust field's declared type text to the simple name of the type a
+ * method call on that field auto-derefs to, or null when there is none we can
+ * name. Only the layers Rust's method-call auto-deref looks through are
+ * unwrapped: references (`&`, `&'a mut`) and the owning smart pointers
+ * (`Box`, `Rc`, `Arc`) — `self.inner.run()` with `inner: Box<Inner>` calls
+ * `Inner::run`. Containers that do NOT auto-deref to their parameter
+ * (`Option<Inner>`, `Vec<Inner>`, `Mutex<Inner>`, `RefCell<Inner>`) keep their
+ * own name and, having no project node, resolve to nothing — `self.items.push()`
+ * must never become `Inner::push`. A trait object (`Box<dyn Source>`) yields
+ * the trait, whose method node the interface-impl synthesizer fans out. A
+ * generic parameter (`T`), a primitive, a tuple / array / raw pointer / fn
+ * type, or a non-identifier yields null.
+ */
+export function rustFieldTypeName(raw: string): string | null {
+  let t = raw.trim();
+  for (;;) {
+    const before = t;
+    t = t.replace(/^&\s*(?:'\w+\s+)?(?:mut\s+)?/, '');
+    t = t.replace(/^(?:Box|Rc|Arc)\s*<\s*/, '');
+    t = t.replace(/^(?:dyn|impl)\s+/, '');
+    if (t === before) break;
+  }
+  // Drop generic args, the closing `>`s of unwrapped pointers, and trait-object
+  // bounds (`dyn Source + Send`); keep the last path segment.
+  t = t.replace(/[<>+].*$/, '').trim();
+  const seg = t.split('::').filter(Boolean).pop();
+  if (!seg || !/^[A-Za-z_]\w*$/.test(seg)) return null;
+  if (RUST_NON_PROJECT_FIELD_TYPES.has(seg)) return null;
+  if (/^[A-Z]$/.test(seg)) return null; // bare single-letter generic parameter
+  return seg;
+}
+
+/**
+ * Resolve a Rust call through a field of the enclosing type —
+ * `self.inner.run()`, emitted by the extractor as `self.inner.run` (#1585).
+ * Mirrors the Go 2-hop precedent above (#1276): the owner type is the calling
+ * method's qualified-name prefix (`Outer::run` → `Outer`), the field's declared
+ * type comes from the owner struct's OWN declaration lines, and the method is
+ * resolved AND VALIDATED on that type by resolveMethodOnType. The caller
+ * treats this branch as exclusive for `self.<field>` receivers: a field whose
+ * type is external (`std::vec::IntoIter`, `regex::Regex`), a generic
+ * parameter, or not declared where we can see it yields null and the ref stays
+ * unresolved. Rust struct fields are not graph nodes, so the declaration text
+ * is the only place the type lives.
+ */
+function matchRustSelfFieldCall(
+  field: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  // The extractor only ever emits a single field hop; anything else is not ours.
+  if (!field || field.includes('.')) return null;
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  if (!caller) return null;
+  const sep = caller.qualifiedName.lastIndexOf('::');
+  if (sep <= 0) return null; // a free fn has no `self`
+  const owner = caller.qualifiedName.slice(0, sep).split('::').pop();
+  if (!owner) return null;
+
+  const owners = preferCallSiteFile(context.getNodesByName(owner), ref.filePath).filter(
+    (n) =>
+      (n.kind === 'struct' || n.kind === 'union' || n.kind === 'class') &&
+      n.language === 'rust'
+  );
+  const fieldEsc = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // `pub inner: Inner,` / `inner: Box<dyn Source>,` / `pub(crate) inner: T }` —
+  // the type text runs to the field separator. A comma inside generic args
+  // (`HashMap<K, V>`) truncates the capture, which rustFieldTypeName then
+  // reduces to the container's own name — exactly the non-deref case it
+  // refuses anyway.
+  const fieldRe = new RegExp(`\\b${fieldEsc}\\s*:\\s*([^,{}]+)`);
+  for (const s of owners) {
+    const source = context.readFile(s.filePath);
+    if (!source) continue;
+    // Only the struct's own declaration lines, comment-stripped line by line —
+    // same discipline as the Go helper: prose or a same-named identifier
+    // elsewhere in the file can never donate a type.
+    const declLines = source.split('\n').slice(Math.max(0, s.startLine - 1), s.endLine);
+    for (const rawLine of declLines) {
+      const line = rawLine.replace(/\/\/.*$/, '').replace(/\/\*.*?\*\//g, '');
+      const m = line.match(fieldRe);
+      if (!m || !m[1]) continue;
+      const fieldType = rustFieldTypeName(m[1]);
+      // The field is declared here; whether or not its type names a project
+      // symbol, this owner is the answer — no other same-named struct applies.
+      if (!fieldType) return null;
+      return resolveMethodOnType(fieldType, methodName, ref, context, 0.85, 'instance-method');
     }
   }
   return null;
@@ -2293,6 +2546,52 @@ export function matchReference(
       confidence: 0.9,
       resolvedBy: 'exact-match',
     };
+  }
+
+  // Erlang call/fun refs carry the call-site arity (`f/1` — #1610) because
+  // arity is part of the function's identity and every erlang function's
+  // qualifiedName carries it (`mod::f/1`). Resolve ONLY to a definition of
+  // that exact arity: the call site's own file first (a local call targets its
+  // own module by language semantics; `-import`ed functions ride the
+  // cross-file branch), and when no definition of that arity exists anywhere,
+  // resolve to NOTHING rather than a sibling arity — the real target may be
+  // macro-generated or out of repo, and a wrong-arity edge is worse than none.
+  if (
+    ref.language === 'erlang' &&
+    !ref.referenceName.includes('::') &&
+    (ref.referenceKind === 'calls' || ref.referenceKind === 'references')
+  ) {
+    const am = /^(.+)\/(\d{1,3})$/.exec(ref.referenceName);
+    if (am) {
+      // endsWith is length-anchored, so `/1` cannot match `…/11`.
+      const arityTail = `/${am[2]}`;
+      const candidates = context
+        .getNodesByName(am[1]!)
+        .filter(
+          (n) =>
+            n.language === 'erlang' && n.kind === 'function' && n.qualifiedName.endsWith(arityTail),
+        );
+      if (candidates.length > 0) {
+        const sameFile = candidates.find((n) => n.filePath === ref.filePath);
+        if (sameFile) {
+          return { original: ref, targetNodeId: sameFile.id, confidence: 0.95, resolvedBy: 'exact-match' };
+        }
+        if (candidates.length === 1) {
+          return { original: ref, targetNodeId: candidates[0]!.id, confidence: 0.8, resolvedBy: 'exact-match' };
+        }
+        const best = findBestMatch(ref, candidates, context);
+        if (best) {
+          const proximity = computePathProximity(ref.filePath, best.filePath);
+          return {
+            original: ref,
+            targetNodeId: best.id,
+            confidence: proximity >= 30 ? 0.7 : 0.4,
+            resolvedBy: 'exact-match',
+          };
+        }
+      }
+      return null;
+    }
   }
 
   // Try strategies in order of confidence

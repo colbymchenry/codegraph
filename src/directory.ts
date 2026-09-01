@@ -233,6 +233,65 @@ export function findIndexedSubprojectRoots(
   return out;
 }
 
+/** Result of {@link resolveServerRoot}. */
+export interface ServerRootResolution {
+  /** The project root to serve as the default, or null when none resolved. */
+  root: string | null;
+  /** True when `root` was adopted from the down-scan rather than the up-walk. */
+  viaSubScan: boolean;
+  /**
+   * Indexed sub-projects the down-scan saw when it ran but could NOT adopt
+   * (zero or several candidates). Empty when the up-walk resolved or the scan
+   * was skipped. Callers surface these so "no default project" errors can say
+   * what IS reachable (#1607).
+   */
+  candidates: string[];
+}
+
+/**
+ * Whether `base` is a plausible workspace root for the sub-project down-scan.
+ * Mirrors `planFrontload`'s manifest gate, widened to accept a bare `.git`
+ * entry — the #1606 shape is a workspace container holding only agent config
+ * and a `.git`, with every build manifest living in the indexed children. The
+ * user's home directory and the filesystem root are never eligible: a stray
+ * manifest there must not turn server startup into a scan that could adopt an
+ * unrelated project (#1454 documents that failure mode for the prompt-hook).
+ */
+function eligibleForSubprojectScan(base: string): boolean {
+  if (base === path.parse(base).root) return false;
+  let home: string | null = null;
+  try { home = os.homedir(); } catch { home = null; }
+  if (home && (base === home || base === path.resolve(home))) return false;
+  if (looksLikeProjectRoot(base)) return true;
+  return fs.existsSync(path.join(base, '.git'));
+}
+
+/**
+ * Resolve the project root an MCP server should serve as its DEFAULT project
+ * (#1606). Up-walk first (`findNearestCodeGraphRoot` — the common case, and
+ * cheap). When nothing is indexed at or above `searchFrom`, run the bounded
+ * sub-project down-scan `planFrontload` already uses, behind the workspace
+ * gate above: EXACTLY ONE indexed sub-project is unambiguous and is adopted
+ * as the root; zero or several yield no root, with the candidates carried so
+ * the caller can name them instead of failing silently (#1607).
+ *
+ * `opts.subprojectScan: false` skips the down-scan entirely (the per-tool-call
+ * retry path throttles it; the up-walk always runs).
+ */
+export function resolveServerRoot(
+  searchFrom: string,
+  opts: { subprojectScan?: boolean } = {},
+): ServerRootResolution {
+  const up = findNearestCodeGraphRoot(searchFrom);
+  if (up) return { root: up, viaSubScan: false, candidates: [] };
+  if (opts.subprojectScan === false) return { root: null, viaSubScan: false, candidates: [] };
+  const base = path.resolve(searchFrom);
+  if (!eligibleForSubprojectScan(base)) return { root: null, viaSubScan: false, candidates: [] };
+  const subs = findIndexedSubprojectRoots(base);
+  if (subs.length === 1) return { root: subs[0]!, viaSubScan: true, candidates: subs };
+  return { root: null, viaSubScan: false, candidates: subs };
+}
+
 /**
  * Unicode-aware word-boundary emulation for the keyword lists below. JS's `\b`
  * is ASCII-only — it fires only at `[A-Za-z0-9_]` edges — so it can never bound

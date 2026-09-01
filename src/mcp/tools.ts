@@ -32,6 +32,7 @@ import {
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
 import { isTestFile, normalizeNameToken } from '../search/query-utils';
+import { extractQueryPaths, queryMightContainPaths } from '../search/query-paths';
 import {
   existsSync,
   readFileSync,
@@ -39,7 +40,15 @@ import {
 } from 'fs';
 import { createHash } from 'crypto';
 import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
-import { scanDynamicDispatch } from './dynamic-boundaries';
+import { guardLabel, guardsForFileSync, siteKey, supportsBranchGuards, warmBranchGuardGrammars } from '../graph/branch-guards';
+import { findDynamicBoundaries, type BoundarySite } from '../graph/dynamic-boundary-report';
+import { countImplementers } from '../graph/type-hierarchy';
+import {
+  lastQualifierPart,
+  matchesSymbol,
+  findAllSymbols,
+  resolveNamedSymbolFlow,
+} from '../graph/named-symbol-flow';
 import { getUpdateNotice } from '../upgrade/update-check';
 import { ExploreDiagnostics } from './explore-diagnostics';
 import {
@@ -79,9 +88,14 @@ export class NotIndexedError extends Error {}
 /**
  * A security refusal (sensitive system path). Stays `isError: true` WITHOUT
  * retry guidance — abandoning this path is the desired agent reaction.
+ *
+ * Defined in `../errors` so non-MCP read sinks (the `codegraph ui` server) can
+ * enforce the same refusal without importing this module; re-exported here
+ * because this is where every existing caller imports it from.
  */
-export class PathRefusalError extends Error {}
-import { resolve as resolvePath } from 'path';
+export { PathRefusalError } from '../errors';
+import { PathRefusalError } from '../errors';
+import { resolve as resolvePath, relative as relativePath } from 'path';
 
 /** Maximum output length to prevent context bloat (characters) */
 const MAX_OUTPUT_LENGTH = 15000;
@@ -102,14 +116,6 @@ const MAX_INPUT_LENGTH = 10_000;
  */
 const MAX_PATH_LENGTH = 4_096;
 
-/**
- * Rust path roots that have no file-system equivalent — `crate` is the
- * current crate, `super` is the parent module, `self` is the current
- * module. Used by `matchesSymbol` to strip these before file-path
- * matching so `crate::configurator::stage_apply::run` resolves the
- * same as `configurator::stage_apply::run`.
- */
-const RUST_PATH_PREFIXES = new Set(['crate', 'super', 'self']);
 
 /**
  * Node kinds that contain other symbols. For these, `codegraph_node` with
@@ -121,11 +127,6 @@ const CONTAINER_NODE_KINDS = new Set<NodeKind>([
   'class', 'struct', 'union', 'interface', 'trait', 'protocol', 'enum', 'namespace', 'module',
 ]);
 
-/** Last `::` / `.` / `/`-separated segment of a qualified symbol. */
-function lastQualifierPart(symbol: string): string {
-  const parts = symbol.split(/::|[./]/).filter((p) => p.length > 0);
-  return parts[parts.length - 1] ?? symbol;
-}
 
 /**
  * Normalize Erlang-native symbol spellings in an explore query into the shapes
@@ -377,7 +378,7 @@ const ISOLATED_WEAK_KIND_WEIGHT = 0.08;
  */
 const RELEVANCE_USAGE_EDGES: ReadonlySet<string> = new Set([
   'calls', 'references', 'extends', 'implements', 'overrides',
-  'instantiates', 'returns', 'type_of', 'decorates',
+  'instantiates', 'returns', 'type_of', 'decorates', 'navigates',
 ]);
 
 /**
@@ -631,6 +632,13 @@ export interface ExploreAllocationCandidate {
   worth: number;
   /** Carries a symbol on the rendered flow spine. */
   spine: boolean;
+  /**
+   * The query named this file by PATH (see query-paths.ts). Pinned files are
+   * never cliffed or trimmed, and weigh at least as much as the strongest
+   * candidate — the agent asked for the file itself, so starving it on text/
+   * graph scores (which a pure-path query doesn't produce) defeats the ask.
+   */
+  pinned?: boolean;
 }
 
 export interface ExploreAllocation {
@@ -676,7 +684,16 @@ export function allocateExploreBudget(
     return Number.isFinite(w) ? w : 0;
   };
 
-  const weights = new Map(candidates.map((c) => [c.path, weightOf(c)]));
+  // Pinned files weigh at least as much as the strongest raw candidate: their
+  // score is whatever the stripped query happened to match (for a pure-path
+  // query, nearly nothing), and a proportional split on that would fund the
+  // named file worst of all. Floor of 1 covers the all-pinned/zero-score case.
+  const rawWeights = new Map(candidates.map((c) => [c.path, weightOf(c)]));
+  const topRaw = Math.max(...rawWeights.values());
+  const weights = new Map(candidates.map((c) => [
+    c.path,
+    c.pinned ? Math.max(rawWeights.get(c.path) ?? 0, topRaw, 1) : (rawWeights.get(c.path) ?? 0),
+  ]));
   const topWeight = Math.max(...weights.values());
   if (!(topWeight > 0)) return empty;
 
@@ -686,7 +703,7 @@ export function allocateExploreBudget(
   const cliffed: string[] = [];
   let admitted: ExploreAllocationCandidate[] = [];
   for (const c of candidates) {
-    if (!c.spine && (weights.get(c.path) ?? 0) < cliffAt) cliffed.push(c.path);
+    if (!c.spine && !c.pinned && (weights.get(c.path) ?? 0) < cliffAt) cliffed.push(c.path);
     else admitted.push(c);
   }
   // Never cliff every candidate: an empty response costs a whole round-trip.
@@ -705,7 +722,7 @@ export function allocateExploreBudget(
   if (admitted.length > affordable) {
     const byWeight = [...admitted].sort((a, b) => (weights.get(b.path) ?? 0) - (weights.get(a.path) ?? 0));
     const keep = new Set(byWeight.slice(0, affordable).map((c) => c.path));
-    for (const c of admitted) if (c.spine) keep.add(c.path);
+    for (const c of admitted) if (c.spine || c.pinned) keep.add(c.path);
     for (const c of admitted) if (!keep.has(c.path)) cliffed.push(c.path);
     admitted = admitted.filter((c) => keep.has(c.path));
   }
@@ -1297,6 +1314,13 @@ export class ToolHandler {
   // The directory the server last searched for a default project. Surfaced in
   // the "not initialized" error so users can see why detection missed.
   private defaultProjectHint: string | null = null;
+  // Indexed sub-projects the engine's bounded down-scan saw below the search
+  // base when no default project resolved (#1607). Listed in the "not
+  // initialized" error so the fact is reachable through the protocol, not just
+  // the host's stderr capture. Engine-maintained (initial resolve + throttled
+  // retry) — tool calls themselves never scan.
+  private knownSubprojects: string[] = [];
+  private knownSubprojectsBase: string | null = null;
   // Per-start-path cache of the git worktree/index mismatch (issue #155). The
   // mismatch is a fixed property of (where the request came from → which
   // .codegraph/ it resolves to), so the up-to-two `git rev-parse` spawns run
@@ -1392,6 +1416,27 @@ export class ToolHandler {
    */
   setDefaultProjectHint(searchedPath: string): void {
     this.defaultProjectHint = searchedPath;
+  }
+
+  /**
+   * Engine-only: record the indexed sub-projects the workspace down-scan saw
+   * when it could not adopt a default project (#1606/#1607). An empty list
+   * clears any previous note.
+   */
+  setKnownSubprojects(roots: string[], base: string): void {
+    this.knownSubprojects = roots;
+    this.knownSubprojectsBase = base;
+  }
+
+  /** One message line naming the indexed sub-projects, or '' when none known. */
+  private formatKnownSubprojects(): string {
+    if (this.knownSubprojects.length === 0) return '';
+    const base = this.knownSubprojectsBase;
+    const rels = this.knownSubprojects.map((r) => (base ? relativePath(base, r) || '.' : r));
+    return (
+      `Indexed sub-projects were found below it: ${rels.join(', ')} — ` +
+      'pass one of them (absolute, or resolved against that directory) as projectPath.\n'
+    );
   }
 
   /**
@@ -1516,6 +1561,7 @@ export class ToolHandler {
         throw new NotIndexedError(
           'No CodeGraph project is loaded for this session.\n' +
           `Searched for a .codegraph/ directory starting from: ${searched}\n` +
+          this.formatKnownSubprojects() +
           'Either the server root has no index of its own (e.g. a monorepo where only ' +
           "sub-projects are indexed), or the MCP client launched the server outside your " +
           'project without reporting the workspace root. Either way, target the project ' +
@@ -2395,6 +2441,29 @@ export class ToolHandler {
    * for ordinary static edges. Used by trace + the node trail so a synthesized
    * hop reads as "registered via onUpdate at App.tsx:3148", not a bare arrow.
    */
+  /**
+   * The branch conditions a flow hop's call site runs under, read from the
+   * caller's source now (`graph/branch-guards.ts`); '' when unconditional,
+   * unreadable, or the grammar for that language is not loaded.
+   */
+  private whenLabel(cg: CodeGraph, caller: Node, edge: Edge): string {
+    if (!edge.line || !supportsBranchGuards(caller.language)) return '';
+    try {
+      const rec = cg.getFile(caller.filePath);
+      if (!rec) return '';
+      const abs = validatePathWithinRoot(cg.getProjectRoot(), caller.filePath);
+      if (!abs) return '';
+      const st = statSync(abs);
+      // Drifted since the index: the recorded line may point elsewhere.
+      if (st.size !== rec.size || Math.floor(st.mtimeMs) !== Math.floor(rec.modifiedAt)) return '';
+      const site = { line: edge.line, column: typeof edge.column === 'number' ? edge.column : null };
+      const g = guardsForFileSync(abs, caller.language, [site]).get(siteKey(site));
+      return g ? guardLabel(g) : '';
+    } catch {
+      return '';
+    }
+  }
+
   private synthEdgeNote(edge: Edge | null): { label: string; compact: string; registeredAt?: string } | null {
     if (!edge || edge.provenance !== 'heuristic') return null;
     const m = edge.metadata as Record<string, unknown> | undefined;
@@ -2406,6 +2475,33 @@ export class ToolHandler {
       return {
         label: `callback — registered via ${via}${field} (dynamic dispatch)`,
         compact: `dynamic: callback via ${via}${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'http-client') {
+      const req = `${String(m.method ?? 'GET')} ${String(m.href ?? '')}`.trim();
+      return {
+        label: `HTTP request \`${req}\` — the client's call onto its own route (cross-tier)`,
+        compact: `dynamic: HTTP ${req}${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'queue-job') {
+      const job = m.event ? `\`${String(m.event)}\`` : 'a job';
+      const queue = m.queue ? ` on queue \`${String(m.queue)}\`` : '';
+      return {
+        label: `queue job ${job}${queue} — producer → consumer (cross-tier)`,
+        compact: `dynamic: queue job ${job}${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'event-bus') {
+      const ev = m.event ? `\`${String(m.event)}\`` : 'an event';
+      const what = m.channel === 'socket' ? 'socket message' : 'bus event';
+      const dir = m.tier === 'client→server' ? ', client → server' : m.tier === 'server→client' ? ', server → client' : '';
+      return {
+        label: `${what} ${ev} — emit → handler${dir} (dynamic dispatch)`,
+        compact: `dynamic: ${what} ${ev}${at}`,
         registeredAt,
       };
     }
@@ -2501,106 +2597,13 @@ export class ToolHandler {
     // processRunExecutionData) to the call site instead of dumping the whole body.
     const EMPTY = { text: '', pathNodeIds: new Set<string>(), namedNodeIds: new Set<string>(), uniqueNamedNodeIds: new Set<string>(), spineCallSites: new Map<string, number>() };
     try {
-      const CALLABLE = new Set(['method', 'function', 'component', 'constructor']);
-      // Strip only a REAL file extension (Create.cs → Create); KEEP qualified
-      // names (Class.method / Class::method) — the agent's most precise input,
-      // resolved exactly by findAllSymbols. (The old strip mangled Class.method
-      // into Class, throwing the method away.)
-      const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl)$/i;
-      const tokens = [...new Set(
-        query.split(/[\s,()[\]]+/)
-          .map((t) => t.replace(FILE_EXT, '').trim())
-          .filter((t) => t.length >= 3 && /^[A-Za-z_$][\w$]*(?:(?:::|\.)[\w$]+)*$/.test(t))
-      )].slice(0, 16);
-      if (tokens.length < 2) return EMPTY;
-      // Pool of name SEGMENTS (Class + method from every token) used to
-      // disambiguate an ambiguous SIMPLE name: keep a candidate only if its
-      // CONTAINER class is itself named in the query.
-      const segPool = new Set<string>();
-      for (const t of tokens) for (const s of t.toLowerCase().split(/::|\./)) if (s) segPool.add(s);
-      const named = new Map<string, Node>();
-      // Nodes whose token is SPECIFIC — a (near-)unique callable name (<=3 defs in
-      // the whole graph). These are safe to SPARE a file on: the agent named THIS
-      // method (`getResponseWithInterceptorChain`, 1 def). A hyper-polymorphic name
-      // (`as_sql`, 110 defs across every Expression/Compiler subclass) is NOT here,
-      // so naming it doesn't keep every backend variant full and flood the budget.
-      const uniqueNamedNodeIds = new Set<string>();
-      // token → resolved node ids: drives the token-coverage check that gates
-      // the dynamic-boundary scan (a token is covered when ANY of its nodes
-      // lands on the main chain — overloads off the chain don't count against).
-      const tokenNodes = new Map<string, string[]>();
-      // token → its full same-name callable family (before the container filter).
-      // A LARGE family that fails to connect on the chain is a polymorphic
-      // interface/registry dispatch — surfaced by buildPolymorphicBoundaries below.
-      const tokenFamily = new Map<string, Node[]>();
-      // Non-callable endpoints (CONSTANT/VARIABLE/FIELD) connected by a SYNTHESIZED
-      // edge. RTK thunks are `const X = createAsyncThunk(...)`, so a thunk→thunk hop
-      // is constant→constant — the CALLABLE-only `named` set can't hold it, and
-      // without this the hop is invisible to the Flow path at every tier (the
-      // Relationships section catches it only on repos ≥500 files). Kept SEPARATE
-      // from `named` (which drives the call-chain + source sizing, callable-only);
-      // fed only to the dynamic-dispatch-links scan below.
-      const dynNamed = new Map<string, Node>();
-      const DYN_KINDS = new Set(['constant', 'variable', 'field', 'property']);
-      // Nodes resolved from a SHAPE-PRECISE token (camelCase / PascalCase /
-      // snake_case / qualified) — the same test the gather path uses. It is the
-      // difference between "the agent named this symbol" and "an ordinary English
-      // word in a prose question collided with a callable", and it is what makes
-      // the narrative-less return below safe (see `identityOnly`).
-      const isPreciseToken = (x: string) =>
-        /[._$]|::|\//.test(x) || /[a-z][A-Z]/.test(x) || /^[A-Z]/.test(x);
-      const preciseNamedIds = new Set<string>();
-      // RAW edges, not getCallers/getCallees: those return one row per NEIGHBOUR
-      // (the #1086 de-dup), so when a pair is joined by BOTH a static and a
-      // synthesized edge the static one wins and the synthesized one becomes
-      // invisible — which is exactly what happens once a thunk's `dispatch(x)`
-      // is walked statically. The question here is about the graph, not about
-      // callers, so ask the edges directly.
-      const hasHeuristicEdge = (id: string): boolean =>
-        [...cg.getIncomingEdges(id), ...cg.getOutgoingEdges(id)].some(
-          (e) => e.provenance === 'heuristic'
-        );
-      for (const t of tokens) {
-        const hits = this.findAllSymbols(cg, t).nodes;
-        const cands = hits.filter((n) => CALLABLE.has(n.kind));
-        tokenFamily.set(t, cands);
-        // A qualified or otherwise-specific name (<=3 hits) keeps all; an
-        // ambiguous simple name keeps only candidates whose container is named.
-        const specific = cands.length <= 3;
-        const pick = specific
-          ? cands
-          : cands.filter((n) => {
-              const segs = (n.qualifiedName || '').toLowerCase().split(/::|\./).filter(Boolean);
-              const container = segs.length >= 2 ? segs[segs.length - 2] : '';
-              return !!container && segPool.has(container);
-            });
-        const kept = pick.slice(0, 6);
-        tokenNodes.set(t, kept.map((n) => n.id));
-        const precise = isPreciseToken(t);
-        for (const n of kept) {
-          named.set(n.id, n);
-          if (specific) uniqueNamedNodeIds.add(n.id);
-          if (precise) preciseNamedIds.add(n.id);
-        }
-        // Same token, non-callable synth endpoints (capped, precision-gated on an
-        // actual heuristic edge so plain config constants never qualify).
-        // Per-token sub-cap so one token's many endpoints (10 nix option writes
-        // of `programs.git.enable` across test configs) can't fill the pool
-        // before later tokens (`home.file`) get a slot.
-        if (dynNamed.size < 12) {
-          let tokenDyn = 0;
-          for (const n of hits) {
-            if (CALLABLE.has(n.kind) || !DYN_KINDS.has(n.kind) || dynNamed.has(n.id)) continue;
-            if (hasHeuristicEdge(n.id)) {
-              dynNamed.set(n.id, n);
-              if (precise) preciseNamedIds.add(n.id);
-              tokenDyn++;
-            }
-            if (dynNamed.size >= 12 || tokenDyn >= 4) break;
-          }
-        }
-        if (named.size > 40) break;
-      }
+      // Token resolution — parsing, overload disambiguation, the CONSTANT/
+      // VARIABLE synth endpoints — is shared with `/api/flow`, so a name written
+      // in the viewer's search box resolves to the same nodes it does here.
+      const flow = resolveNamedSymbolFlow(cg, query);
+      const { named, dynNamed, tokenNodes, tokenFamily, uniqueNamedNodeIds, preciseNamedIds } =
+        flow;
+      if (flow.tokens.length < 2) return EMPTY;
       // Surface synthesized (heuristic) edges incident to a named symbol — INCLUDING
       // the non-callable CONSTANT endpoints in `dynNamed`. `skipInChain` drops a hop
       // already shown in the rendered main chain (a 2-node chain renders nothing, so a
@@ -2679,47 +2682,16 @@ export class ToolHandler {
         out.push('> Full source for these symbols is below.\n');
         return { text: out.join('\n'), pathNodeIds: new Set(), namedNodeIds: new Set<string>([...named.keys(), ...dynNamed.keys()]), uniqueNamedNodeIds, spineCallSites: new Map<string, number>() };
       }
-      const MAX_HOPS = 7;
-      let best: Array<{ node: Node; edge: Edge | null }> | null = null;
-      // BFS the full call graph (incl. synth edges) from each named seed, but
-      // only ACCEPT a sink that is also named — both ends anchored to symbols the
-      // agent named, so the chain stays on-topic while bridging intermediates
-      // (e.g. the exact interface overload) that the token resolution missed.
-      for (const seed of [...named.values()].slice(0, 8)) {
-        const parent = new Map<string, { prev: string | null; edge: Edge | null; node: Node }>();
-        parent.set(seed.id, { prev: null, edge: null, node: seed });
-        const q: Array<{ id: string; depth: number; streak: number }> = [{ id: seed.id, depth: 0, streak: 0 }];
-        let deep: string | null = null, deepDepth = 0;
-        const MAX_BRIDGE = 1; // ≤1 consecutive UNNAMED hop: bridge one missing intermediate, never wander a god-function's fan-out
-        for (let h = 0; h < q.length && parent.size < 1500; h++) {
-          const { id, depth, streak } = q[h]!;
-          if (id !== seed.id && named.has(id) && depth > deepDepth) { deep = id; deepDepth = depth; }
-          if (depth >= MAX_HOPS - 1) continue;
-          for (const c of cg.getCallees(id)) {
-            if (c.edge.kind !== 'calls' || parent.has(c.node.id)) continue;
-            const newStreak = named.has(c.node.id) ? 0 : streak + 1;
-            if (newStreak > MAX_BRIDGE) continue;
-            parent.set(c.node.id, { prev: id, edge: c.edge, node: c.node });
-            q.push({ id: c.node.id, depth: depth + 1, streak: newStreak });
-          }
-        }
-        if (!deep) continue;
-        const chain: Array<{ node: Node; edge: Edge | null }> = [];
-        let cur: string | null = deep;
-        while (cur) { const p = parent.get(cur); if (!p) break; chain.push({ node: p.node, edge: p.edge }); cur = p.prev; }
-        chain.reverse();
-        if (!best || chain.length > best.length) best = chain;
-      }
+      // The search itself lives in `../graph/named-symbol-flow`, so the viewer's
+      // Flow strip rides exactly this path finder rather than a second one that
+      // could disagree with it. What stays here is the PROSE — the narrative,
+      // the dynamic-dispatch links, the boundary announcements.
+      const best = flow.chains[0]?.steps ?? null;
       const hasMain = !!best && best.length >= 3;
       const pathIds = new Set((best ?? []).map((s) => s.node.id));
-      // Where each spine node calls the NEXT hop (best[i+1].edge is the edge from
-      // best[i] → best[i+1]; its line is the call site inside best[i]'s body). Lets
-      // the assembler window an oversize spine method to the call instead of dumping it.
-      const spineCallSites = new Map<string, number>();
-      if (best) for (let i = 0; i < best.length - 1; i++) {
-        const ln = best[i + 1]?.edge?.line;
-        if (ln && ln > 0 && !spineCallSites.has(best[i]!.node.id)) spineCallSites.set(best[i]!.node.id, ln);
-      }
+      // Where each spine node calls the NEXT hop — lets the assembler window an
+      // oversize spine method to the call instead of dumping the whole body.
+      const spineCallSites = flow.chains[0]?.callSites ?? new Map<string, number>();
 
       // Dynamic-boundary scan (#687) — fires ONLY when the flow the agent
       // asked about did not fully connect: some token resolved to nodes but
@@ -2790,7 +2762,11 @@ export class ToolHandler {
         out.push('**Flow (call path among the symbols you queried)**', '');
         for (let i = 0; i < best!.length; i++) {
           const step = best![i]!;
-          if (step.edge) { const sy = this.synthEdgeNote(step.edge); out.push(`   ↓ ${sy ? sy.compact : step.edge.kind}`); }
+          if (step.edge) {
+            const sy = this.synthEdgeNote(step.edge);
+            const when = i > 0 ? this.whenLabel(cg, best![i - 1]!.node, step.edge) : '';
+            out.push(`   ↓ ${sy ? sy.compact : step.edge.kind}${when ? ` (when ${when})` : ''}`);
+          }
           out.push(`${i + 1}. ${step.node.name} (${step.node.filePath}:${step.node.startLine})`);
         }
         out.push('');
@@ -2830,37 +2806,22 @@ export class ToolHandler {
    * connected flow never reaches this method.
    */
   private buildDynamicBoundaries(cg: CodeGraph, scanList: Node[], named: Map<string, Node>): string {
-    const MAX_NOTES = 4;       // boundary bullets per explore
-    const MAX_SCAN = 8;        // bodies scanned
-    const MAX_TOTAL_CHARS = 200_000;
-    let projectRoot: string;
-    try { projectRoot = cg.getProjectRoot(); } catch { return ''; }
+    const MAX_NOTES = 4; // boundary bullets per explore
+    // The verdict is not derived here — `findDynamicBoundaries` produces it and
+    // the viewer's end cap renders the same object, so the two can never
+    // disagree about where a flow stops. What is left here is the prose.
+    const reports = findDynamicBoundaries(cg, scanList, { named, maxSites: MAX_NOTES });
     const notes: string[] = [];
-    const seenNode = new Set<string>();
-    const seenSite = new Set<string>();
-    let scanned = 0, charsScanned = 0;
-    for (const node of scanList) {
-      if (notes.length >= MAX_NOTES || scanned >= MAX_SCAN || charsScanned > MAX_TOTAL_CHARS) break;
-      if (seenNode.has(node.id) || !node.startLine || !node.endLine) continue;
-      seenNode.add(node.id);
-      const absPath = validatePathWithinRoot(projectRoot, node.filePath);
-      if (!absPath || !existsSync(absPath)) continue;
-      let content: string;
-      try { content = readFileSync(absPath, 'utf-8'); } catch { continue; }
-      const body = content.split('\n').slice(node.startLine - 1, node.endLine).join('\n');
-      scanned++;
-      charsScanned += body.length;
-      for (const m of scanDynamicDispatch(body, node.language || '', node.startLine)) {
+    for (const report of reports) {
+      if (notes.length >= MAX_NOTES) break;
+      for (const site of report.sites) {
         if (notes.length >= MAX_NOTES) break;
-        const siteKey = `${node.filePath}:${m.line}:${m.form}`;
-        if (seenSite.has(siteKey)) continue;
-        seenSite.add(siteKey);
-        const more = m.moreSites ? ` (+${m.moreSites} more such site${m.moreSites > 1 ? 's' : ''} in this body)` : '';
-        notes.push(`- \`${node.name}\` (${node.filePath}:${m.line}) — ${m.label}: \`${m.snippet}\`${more}`);
-        if (m.key) {
-          const cand = this.boundaryCandidates(cg, m.key, !!m.keyIsType, named, node.id);
-          if (cand) notes.push(`  ${cand}`);
-        }
+        const more = site.moreSites
+          ? ` (+${site.moreSites} more such site${site.moreSites > 1 ? 's' : ''} in this body)`
+          : '';
+        notes.push(`- \`${report.node.name}\` (${report.node.filePath}:${site.line}) — ${site.label}: \`${site.snippet}\`${more}`);
+        const cand = this.boundaryCandidates(site);
+        if (cand) notes.push(`  ${cand}`);
       }
     }
     if (notes.length === 0) return '';
@@ -2932,9 +2893,12 @@ export class ToolHandler {
       let best: { node: Node; impl: number; targets: Node[] } | null = null;
       for (const { node, count, targets } of supers.values()) {
         if (count < MIN_SUPPORT) continue;
-        let impl = 0;
-        try { impl = cg.getIncomingEdges(node.id).filter((e) => e.kind === 'implements' || e.kind === 'extends').length; }
-        catch { /* leave 0 — gated out below */ }
+        // The implementer count is `countImplementers` — the same function the
+        // viewer's type-hierarchy fan counts with, so "dispatch to N types
+        // implementing X" is the same N on both surfaces (CG-58). Distinct
+        // types, not edges: a class tied to its supertype by both a parsed
+        // `extends` and a synthesized `implements` is one implementation.
+        const impl = countImplementers(cg, node.id);
         if (impl < MIN_IMPL) continue;
         if (!best || impl > best.impl) best = { node, impl, targets };
       }
@@ -2962,70 +2926,20 @@ export class ToolHandler {
   }
 
   /**
-   * Shortlist candidate runtime targets for a dispatch key surfaced by
-   * {@link buildDynamicBoundaries}. Exact conventional names first (`save` →
-   * `onSave`/`handleSave`; `CreateCmd` → `CreateCmdHandler`), then FTS, with a
-   * normalized-containment post-filter (FTS camel-splitting is fuzzier than a
-   * candidate list should be). Symbols the agent already named sort first and
-   * are marked — that's the "you were right, here's the wiring" case.
+   * Render the candidate shortlist for a dispatch site as one line.
+   *
+   * The shortlist itself is `shortlistBoundaryCandidates` in
+   * `../graph/dynamic-boundary-report` — shared with the viewer's end cap, so
+   * "candidates for key `save`" names the same symbols in both places. Symbols
+   * the agent already named are marked: that is the "you were right, here's the
+   * wiring" case.
    */
-  private boundaryCandidates(cg: CodeGraph, key: string, keyIsType: boolean, named: Map<string, Node>, selfId: string): string {
-    const CALLABLE = new Set(['method', 'function', 'component', 'constructor', 'class']);
-    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
-    const keyNorm = norm(key);
-    if (keyNorm.length < 3) return '';
-    const cands = new Map<string, Node>();
-    const consider = (n: Node | undefined | null) => {
-      if (!n || n.id === selfId || !CALLABLE.has(n.kind) || cands.has(n.id)) return;
-      const nameNorm = norm(n.name || '');
-      if (nameNorm.length < 3) return;
-      if (!nameNorm.includes(keyNorm) && !keyNorm.includes(nameNorm)) return;
-      cands.set(n.id, n);
-    };
-    const cap = key.charAt(0).toUpperCase() + key.slice(1);
-    const probes = keyIsType
-      ? [`${key}Handler`, key]
-      : [key, `on${cap}`, `handle${cap}`, `${key}Handler`, `handle_${key}`];
-    for (const p of probes) {
-      try { for (const n of cg.getNodesByName(p)) consider(n); } catch { /* exact probe miss is fine */ }
-    }
-    let raw = 0;
-    try {
-      const results = cg.searchNodes(key, { limit: 12 });
-      raw = results.length;
-      for (const r of results) consider(r.node);
-    } catch { /* FTS syntax edge — exact probes already ran */ }
-    if (cands.size === 0) {
-      return raw >= 12 && key.length < 5 ? `key \`${key}\` is too generic to shortlist (${raw}+ matches)` : '';
-    }
-    // A constructor candidate duplicates its class: extractors emit ctors as
-    // METHOD nodes named like the class (C#/Java `Foo::Foo`) — keep the class.
-    const all = [...cands.values()];
-    const classKey = new Set(all.filter((n) => n.kind === 'class').map((n) => `${n.name}|${n.filePath}`));
-    const namedNames = new Set([...named.values()].map((n) => n.name));
-    const isNamed = (n: Node) => named.has(n.id) || namedNames.has(n.name); // the flow's named set holds callables only — transfer the mark to the class
-    const list = all
-      .filter((n) => !(n.kind !== 'class' && classKey.has(`${n.name}|${n.filePath}`)))
-      .sort((a, b) => (isNamed(b) ? 1 : 0) - (isNamed(a) ? 1 : 0))
-      .slice(0, 4)
-      .map((n) => {
-        // Typed-bus convention: the runtime target is the candidate class's
-        // Handle/Execute/Consume method — name the exact node, not just the class.
-        let display = n.qualifiedName || n.name;
-        let at = `${n.filePath}:${n.startLine}`;
-        if (keyIsType && n.kind === 'class') {
-          try {
-            const HANDLER_METHODS = /^(handle|handleAsync|execute|executeAsync|consume|consumeAsync|run|__invoke)$/i;
-            const method = cg.getOutgoingEdges(n.id)
-              .filter((e) => e.kind === 'contains')
-              .map((e) => { try { return cg.getNode(e.target); } catch { return null; } })
-              .find((c): c is Node => !!c && c.kind === 'method' && HANDLER_METHODS.test(c.name));
-            if (method) { display = `${n.name}.${method.name}`; at = `${method.filePath}:${method.startLine}`; }
-          } catch { /* class without resolvable members — show the class itself */ }
-        }
-        return `\`${display}\` (${at})${isNamed(n) ? ' ← you named this' : ''}`;
-      });
-    return `candidates for key \`${key}\`: ${list.join(', ')}`;
+  private boundaryCandidates(site: BoundarySite): string {
+    if (site.candidates.length === 0) return site.candidateNote ?? '';
+    const list = site.candidates.map((c) =>
+      `\`${c.display}\` (${c.node.filePath}:${c.node.startLine})${c.named ? ' ← you named this' : ''}`
+    );
+    return `candidates for key \`${site.key}\`: ${list.join(', ')}`;
   }
 
   /**
@@ -3162,7 +3076,7 @@ export class ToolHandler {
 
     const RANK_EDGES = new Set<string>([
       'calls', 'references', 'extends', 'implements', 'overrides',
-      'instantiates', 'returns', 'type_of', 'imports',
+      'instantiates', 'returns', 'type_of', 'imports', 'navigates',
     ]);
     const adj: number[][] = Array.from({ length: n }, () => []);
     for (const e of edges) {
@@ -3238,6 +3152,34 @@ export class ToolHandler {
     }
     const maxFiles = clamp((args.maxFiles as number) || budget.defaultMaxFiles, 1, 20);
 
+    // File paths named in the query become PINNED files: guaranteed admission,
+    // top of the rank order, funded first — and their span is REMOVED from the
+    // matching query. Runs on the RAW query (normalizeQuerySpelling strips
+    // `/digits` tails, which would mangle numeric path segments). Without this,
+    // a SvelteKit path like `runs/[runId]/+page.svelte` was shredded by the
+    // seeding tokenizer (splits on brackets → `runId` seeded as a "named
+    // symbol") and by FTS (`page`/`runs` fragments admitted every sibling
+    // `+page.svelte`), starving the very files the agent asked for.
+    let pinnedFiles: string[] = [];
+    let unresolvedPathSpans: string[] = [];
+    let matchQuery = query;
+    if (queryMightContainPaths(rawQuery)) {
+      try {
+        const extraction = extractQueryPaths(
+          rawQuery,
+          cg.getFiles().map((f) => f.path),
+          { maxPins: maxFiles },
+        );
+        if (extraction.pinnedFiles.length > 0 || extraction.unresolvedPathSpans.length > 0) {
+          pinnedFiles = extraction.pinnedFiles;
+          unresolvedPathSpans = extraction.unresolvedPathSpans;
+          matchQuery = normalizeQuerySpelling(extraction.strippedQuery);
+        }
+      } catch { /* path pinning must never fail an explore call */ }
+    }
+    const pinnedSet = new Set(pinnedFiles);
+    const pinnedOrder = new Map(pinnedFiles.map((p, i) => [p, i]));
+
     // Per-file allocation diagnostic (CG-4). `null` unless CODEGRAPH_EXPLORE_DEBUG
     // is set — every `diag?.` below is then a no-op and the response is
     // byte-identical. It only OBSERVES: it must never feed back into rendering.
@@ -3294,16 +3236,34 @@ export class ToolHandler {
     // Use a large maxNodes budget — explore has its own 35k char output limit
     // that prevents context bloat, so more nodes just means better coverage
     // across entry points (especially for large files like Svelte components).
-    const subgraph = await cg.findRelevantContext(query, {
+    // Matching runs on the path-stripped query; `query` stays for display.
+    const subgraph = await cg.findRelevantContext(matchQuery, {
       searchLimit: 8,
       traversalDepth: 3,
       maxNodes: 200,
       minScore: 0.2,
     });
 
+    // Pinned files' symbols enter the gather unconditionally — the agent named
+    // the file itself, so its contents ARE the answer regardless of what the
+    // stripped query text matched (which, for a pure-path query, is nothing).
+    const PINNED_FILE_NODE_CAP = 300;
+    for (const fp of pinnedFiles) {
+      let fileNodes: Node[] = [];
+      try { fileNodes = cg.getNodesInFile(fp); } catch { continue; }
+      fileNodes
+        .filter((n) => n.kind !== 'file' && n.kind !== 'import' && n.kind !== 'export')
+        .sort((a, b) => a.startLine - b.startLine)
+        .slice(0, PINNED_FILE_NODE_CAP)
+        .forEach((n) => { if (!subgraph.nodes.has(n.id)) subgraph.nodes.set(n.id, n); });
+    }
+
     if (subgraph.nodes.size === 0) {
       diag?.finishEmpty('no relevant code found — empty subgraph');
-      const empty = `No relevant code found for "${query}"`;
+      const missNote = unresolvedPathSpans.length > 0
+        ? ` (no indexed file uniquely matches ${unresolvedPathSpans.map((s) => `\`${s}\``).join(', ')})`
+        : '';
+      const empty = `No relevant code found for "${query}"${missNote}`;
       // Still an explore call, so it is still recorded: an empty answer spends a
       // call against the tier budget even though it emits no source.
       return this.exploreResult(empty, {
@@ -3366,11 +3326,18 @@ export class ToolHandler {
     {
       const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl)$/i;
       const CALLABLE = new Set(['method', 'function', 'component', 'constructor']);
+      // Variables/constants seed too: in Svelte/React a `$state` variable
+      // (`chatAtBottom`, `feedAtBottom`) is exactly the kind of symbol an agent
+      // names in a query, and the exact-name search channel already returns
+      // them — only this seeding tier was callable-only. The NL-stopword guard
+      // below applies unchanged, so bare English words still can't seed a
+      // same-named local. Callables keep priority via the body-size sort.
+      const SEEDABLE = new Set([...CALLABLE, 'variable', 'constant']);
       const isTestPath = (p: string) => /(^|\/)(tests?|specs?|__tests__|testdata|mocks?|fixtures?)\//i.test(p) || /\.(test|spec)\.[a-z]+$/i.test(p);
       const bodyLines = (n: Node) => Math.max(0, (n.endLine ?? n.startLine) - n.startLine);
       const callerCount = (n: Node) => { try { return cg.getCallers(n.id).length; } catch { return 0; } };
       const tokens = [...new Set(
-        query.split(/[\s,()[\]]+/)
+        matchQuery.split(/[\s,()[\]]+/)
           .map((t) => t.replace(FILE_EXT, '').trim())
           .filter((t) => t.length >= 3 && /^[A-Za-z_$][\w$]*(?:(?:::|\.)[\w$]+)*$/.test(t))
       )].slice(0, 16);
@@ -3445,24 +3412,26 @@ export class ToolHandler {
           }
         }
         let cands = raw
-          .filter((n) => CALLABLE.has(n.kind) && !isTestPath(n.filePath))
+          .filter((n) => SEEDABLE.has(n.kind) && !isTestPath(n.filePath))
           .sort((a, b) => (bodyLines(b) > 1 ? 1 : 0) - (bodyLines(a) > 1 ? 1 : 0) || bodyLines(b) - bodyLines(a));
         // Field-name seeding fallback (#1196): a camelCase token that names NO
         // definition of its own is usually an object-literal key / API field
         // (`profileInfo`) — no node exists, so it contributed zero seeds and
         // the files that DEFINE it (`getProfileInfoV2` in profileController)
-        // never surfaced. Seed its camel-infix definers instead: callables
-        // whose name contains the token at a hump boundary or as a prefix.
+        // never surfaced. Seed its camel-infix definers instead: seedable
+        // symbols (callables + variables — `atBottom` must reach the `$state`
+        // variables `feedAtBottom`/`chatAtBottom`) whose name contains the
+        // token at a hump boundary or as a prefix.
         // Exact-empty + camel-shaped only (bare words keep the NL-stopword
         // guard below), shortest-first, capped so a hot infix can't flood.
         if (cands.length === 0 && !isQual && /[a-z][A-Z]/.test(t)) {
           const lcToken = t.toLowerCase();
           cands = cg
             .getNodesByNameSubstring(t, {
-              kinds: ['function', 'method', 'component'],
+              kinds: ['function', 'method', 'component', 'variable', 'constant'],
               limit: 60,
             })
-            .filter((n) => CALLABLE.has(n.kind) && !isTestPath(n.filePath))
+            .filter((n) => SEEDABLE.has(n.kind) && !isTestPath(n.filePath))
             .filter((n) => {
               const idx = n.name.toLowerCase().indexOf(lcToken);
               if (idx < 0) return false;
@@ -3639,8 +3608,9 @@ export class ToolHandler {
       fileGroups.set(node.filePath, group);
     }
 
-    // Extract query terms for relevance checking
-    const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length >= 3);
+    // Extract query terms for relevance checking (path-stripped: a pinned
+    // file's own path fragments must not count as "term hits" everywhere)
+    const queryTerms = matchQuery.toLowerCase().split(/\s+/).filter(t => t.length >= 3);
 
     // Test/spec/icon/i18n file detector — used by the pre-floor hard filter, the
     // rank penalty, and the comparator deprioritization.
@@ -3730,9 +3700,10 @@ export class ToolHandler {
     // keep-minimum then pulled two test files back in as the "spread".
     let candidateFiles = [...fileGroups.entries()];
     {
-      const queryMentionsTests = /\b(test|tests|testing|spec|verify|verifies)\b/i.test(query);
+      const queryMentionsTests = /\b(test|tests|testing|spec|verify|verifies)\b/i.test(matchQuery);
       if (!queryMentionsTests) {
-        const nonLow = candidateFiles.filter(([p]) => !isLowValue(p));
+        // A pinned file is exempt: naming a test file by path IS asking for it.
+        const nonLow = candidateFiles.filter(([p]) => !isLowValue(p) || pinnedSet.has(p));
         if (nonLow.length >= 2) {
           candidateFiles = nonLow;
         }
@@ -3747,7 +3718,9 @@ export class ToolHandler {
       SCORE_FLOOR_ABSOLUTE,
       Math.min(SCORE_FLOOR_MAX, topScore * SCORE_FLOOR_FRACTION_OF_TOP),
     );
-    let relevantFiles = candidateFiles.filter(([, group]) => group.score >= scoreFloor);
+    let relevantFiles = candidateFiles.filter(
+      ([fp, group]) => group.score >= scoreFloor || pinnedSet.has(fp),
+    );
     if (relevantFiles.length < SCORE_FLOOR_KEEP_MIN) {
       // Backfill from what the RELATIVE floor cut, best first, at two strengths:
       //
@@ -3762,8 +3735,11 @@ export class ToolHandler {
       //    worst outcome on the board — the agent falls straight back to grep.
       const minEvidence = relevantFiles.length === 0 ? Number.EPSILON : SCORE_FLOOR_ABSOLUTE;
       relevantFiles = candidateFiles
-        .filter(([, group]) => group.score >= minEvidence)
-        .sort((a, b) => b[1].score - a[1].score || b[1].nodes.length - a[1].nodes.length)
+        .filter(([fp, group]) => group.score >= minEvidence || pinnedSet.has(fp))
+        .sort((a, b) =>
+          (pinnedSet.has(b[0]) ? 1 : 0) - (pinnedSet.has(a[0]) ? 1 : 0)
+          || b[1].score - a[1].score
+          || b[1].nodes.length - a[1].nodes.length)
         .slice(0, Math.max(SCORE_FLOOR_KEEP_MIN, relevantFiles.length));
     }
     diag?.setScoreFloor(scoreFloor, relevantFiles.length);
@@ -3867,7 +3843,8 @@ export class ToolHandler {
     // never prunes below 2.
     if (maxGraph > 0) {
       const gated = relevantFiles.filter(([fp]) =>
-        (fileGraphScore.get(fp) ?? 0) >= maxGraph * 0.06
+        pinnedSet.has(fp)
+        || (fileGraphScore.get(fp) ?? 0) >= maxGraph * 0.06
         || centralFiles.has(fp)
         || entryFiles.has(fp)
         || changeSurfaceFiles.has(fp)
@@ -3923,7 +3900,15 @@ export class ToolHandler {
       const aPath = a[0].toLowerCase();
       const bPath = b[0].toLowerCase();
 
-      // Agent-named files first (it asked for a symbol defined here by name).
+      // Pinned files first of all — the agent named the FILE by path, which is
+      // even more explicit than naming a symbol in it. Among pins, keep the
+      // order they appeared in the query.
+      const aPin = pinnedSet.has(a[0]) ? 1 : 0;
+      const bPin = pinnedSet.has(b[0]) ? 1 : 0;
+      if (aPin !== bPin) return bPin - aPin;
+      if (aPin && bPin) return (pinnedOrder.get(a[0]) ?? 0) - (pinnedOrder.get(b[0]) ?? 0);
+
+      // Agent-named files next (it asked for a symbol defined here by name).
       const aNamed = namedSeedFiles.has(a[0]) ? 1 : 0;
       const bNamed = namedSeedFiles.has(b[0]) ? 1 : 0;
       if (aNamed !== bNamed) return bNamed - aNamed;
@@ -4025,7 +4010,10 @@ export class ToolHandler {
     // Compute the flow spine once — used both to prepend the Flow section (below)
     // and to gate adaptive source sizing: files on the spine get full source,
     // off-spine peers skeletonize.
-    const flow = this.buildFlowFromNamedSymbols(cg, query);
+    // The Flow section labels each hop with its branch conditions; that read
+    // is synchronous, so the grammars it needs are loaded here, once.
+    await warmBranchGuardGrammars();
+    const flow = this.buildFlowFromNamedSymbols(cg, matchQuery);
 
     // Snapshot every ranked candidate's scoring inputs, in final sort order, so
     // the diagnostic can show what each file's share of the envelope was BOUGHT
@@ -4046,6 +4034,7 @@ export class ToolHandler {
           graphScore: fileGraphScore.get(fp) ?? 0,
           termHits: fileTermHits.get(fp) ?? 0,
           nodes: group.nodes.length,
+          pinned: pinnedSet.has(fp),
           named: namedSeedFiles.has(fp),
           central: centralFiles.has(fp),
           entry: entryFiles.has(fp),
@@ -4066,8 +4055,11 @@ export class ToolHandler {
       sortedFiles.map(([fp, group]) => ({
         path: fp,
         score: group.score,
-        worth: rankPenalty(fp),
+        // A pinned file's bytes are worth full price by definition — the agent
+        // asked for the file itself, generated/test or not.
+        worth: pinnedSet.has(fp) ? 1 : rankPenalty(fp),
         spine: group.nodes.some((n) => flow.pathNodeIds.has(n.id)),
+        pinned: pinnedSet.has(fp),
       })),
       budget,
       maxFiles,
@@ -5819,9 +5811,19 @@ export class ToolHandler {
         g.nodes.filter((n) => n.kind !== 'import' && n.kind !== 'export').map((n) => n.id),
       ).size;
     }, 0);
-    const summaryLine = survivors.length > 0
+    let summaryLine = survivors.length > 0
       ? `Found ${shownSymbols} symbol${shownSymbols === 1 ? '' : 's'} across ${survivors.length} file${survivors.length === 1 ? '' : 's'}.`
       : `Found ${subgraph.nodes.size} symbol${subgraph.nodes.size === 1 ? '' : 's'} across ${fileGroups.size} file${fileGroups.size === 1 ? '' : 's'}.`;
+    // Path pinning is visible, not silent: say which query-named files were
+    // honored, and which path spans matched nothing so the agent can correct
+    // them instead of trusting a response that quietly ignored the path.
+    const pinnedShown = pinnedFiles.filter((fp) => survivors.includes(fp)).length;
+    if (pinnedShown > 0) {
+      summaryLine += ` ${pinnedShown} file${pinnedShown === 1 ? '' : 's'} pinned from the query.`;
+    }
+    if (unresolvedPathSpans.length > 0) {
+      summaryLine += ` No indexed file uniquely matches ${unresolvedPathSpans.map((s) => `\`${s}\``).join(', ')}.`;
+    }
     finalText = finalText.replace(SUMMARY_SENTINEL, summaryLine);
 
     // Emit the allocation diagnostic from the FINAL text, so per-file bytes and
@@ -6589,58 +6591,11 @@ export class ToolHandler {
    * Returns the best match and a note about alternatives if any.
    */
   /**
-   * Check if a node matches a symbol query.
-   *
-   * Accepts simple names (`run`) and three flavors of qualifier:
-   *   - dotted     `Session.request`         (TS/JS/Python)
-   *   - colon-pair `stage_apply::run`        (Rust, C++, Ruby)
-   *   - slash      `configurator/stage_apply` (path-ish)
-   *
-   * Multi-level qualifiers compose: `crate::configurator::stage_apply::run`
-   * works. Rust path prefixes (`crate`, `super`, `self`) are stripped so
-   * the canonical `crate::module::symbol` form resolves.
-   *
-   * Resolution order, last part must always equal `node.name`:
-   *   1. Suffix-match against `qualifiedName` (handles class-scoped methods
-   *      where the extractor builds the qualified name from the AST stack)
-   *   2. File-path containment (handles file-derived modules in Rust/
-   *      Python — `stage_apply::run` matches a `run` in `stage_apply.rs`)
+   * Check if a node matches a symbol query — see `matchesSymbol` in
+   * `../graph/named-symbol-flow`, which owns the rules.
    */
   private matchesSymbol(node: Node, symbol: string): boolean {
-    // Simple name match
-    if (node.name === symbol) return true;
-    // File basename match (e.g., "product-card" matches "product-card.liquid")
-    if (node.kind === 'file' && node.name.replace(/\.[^.]+$/, '') === symbol) return true;
-
-    // Qualified-name lookups: split on any supported separator. `\w` keeps
-    // identifier chars (incl. `_`) intact; everything else is treated as
-    // a separator we tolerate.
-    if (!/[.\/]|::/.test(symbol)) return false;
-    const parts = symbol.split(/::|[./]/).filter((p) => p.length > 0);
-    if (parts.length < 2) return false;
-
-    const lastPart = parts[parts.length - 1]!;
-    if (node.name !== lastPart) return false;
-
-    // Stage 1: qualified-name suffix match. The extractor joins the
-    // semantic hierarchy with `::`, so `Session.request` and
-    // `Session::request` both become `Session::request` here.
-    const colonSuffix = parts.join('::');
-    if (node.qualifiedName.includes(colonSuffix)) return true;
-
-    // Stage 2: file-path containment. Rust modules and Python packages
-    // are not in `qualifiedName` — they're encoded in the file path. So
-    // `stage_apply::run` matches a `run` in any file whose path
-    // contains a `stage_apply` segment (with or without an extension).
-    //
-    // Filter out Rust path prefixes that have no file-system equivalent.
-    const containerHints = parts.slice(0, -1).filter((p) => !RUST_PATH_PREFIXES.has(p));
-    if (containerHints.length === 0) return false;
-
-    const segments = node.filePath.split('/').filter((s) => s.length > 0);
-    return containerHints.every((hint) =>
-      segments.some((seg) => seg === hint || seg.replace(/\.[^.]+$/, '') === hint)
-    );
+    return matchesSymbol(node, symbol);
   }
 
   /**
@@ -6704,64 +6659,12 @@ export class ToolHandler {
   /**
    * Find ALL symbols matching a name. Used by callers/callees/impact to aggregate
    * results across all matching symbols (e.g., multiple classes with an `execute` method).
+   *
+   * The resolution itself lives in `../graph/named-symbol-flow`, so the Flow
+   * strip and `codegraph_explore` resolve a written name to the same nodes.
    */
   private findAllSymbols(cg: CodeGraph, symbol: string): { nodes: Node[]; note: string } {
-    // Nix option paths: the declaration is stored as `options.<path>` and
-    // config writes carry longer/quoted tails (`<path>."git/config".text`),
-    // so a dotted option token (`xdg.configFile`, `launchd.user.agents`) has
-    // no exact-name node and would degrade to bare-tail FTS soup — burying
-    // the declaration hub the nix-option-path edges hang off. Resolve the
-    // convention directly: declaration first, then the exact write, then a
-    // capped prefix scan of write sites. Three index hits; non-nix graphs
-    // fall straight through.
-    if (/^[a-z][\w'-]*(?:\.[\w'-]+)+$/.test(symbol)) {
-      const optionHits = [
-        ...cg.getNodesByName(`options.${symbol}`),
-        ...cg.getNodesByName(symbol),
-        ...cg.getNodesByNamePrefix(`${symbol}.`, 12),
-      ].filter((n) => n.language === 'nix');
-      if (optionHits.length > 0) {
-        const seen = new Set<string>();
-        const nodes = optionHits.filter((n) => !seen.has(n.id) && !!seen.add(n.id)).slice(0, 10);
-        return { nodes, note: '' };
-      }
-    }
-    let results = cg.searchNodes(symbol, { limit: 50 });
-
-    // Mirror the fallback in `findSymbol` for qualified queries — FTS
-    // strips colons, so a module-qualified lookup needs a second pass
-    // by the bare last part.
-    if (results.length === 0 && /[.\/]|::/.test(symbol)) {
-      const tail = lastQualifierPart(symbol);
-      if (tail && tail !== symbol) results = cg.searchNodes(tail, { limit: 50 });
-    }
-
-    if (results.length === 0) {
-      return { nodes: [], note: '' };
-    }
-
-    const exactMatches = results.filter(r => this.matchesSymbol(r.node, symbol));
-
-    if (exactMatches.length <= 1) {
-      const node = exactMatches[0]?.node ?? results[0]!.node;
-      return { nodes: [node], note: '' };
-    }
-
-    // Same generated-file down-rank as findSymbol — keeps callers/callees
-    // /impact aggregation aligned (a query against "Send" returns the
-    // hand-written implementations before the protobuf scaffold).
-    const isGen = cg.generatedFilePredicate(exactMatches.map((r) => r.node.filePath));
-    const ranked = [...exactMatches].sort((a, b) => {
-      const aGen = isGen(a.node.filePath) ? 1 : 0;
-      const bGen = isGen(b.node.filePath) ? 1 : 0;
-      return aGen - bGen;
-    });
-
-    const locations = ranked.map(r =>
-      `${r.node.kind} at ${r.node.filePath}:${r.node.startLine}`
-    );
-    const note = `\n\n> **Note:** Aggregated results across ${ranked.length} symbols named "${symbol}": ${locations.join(', ')}`;
-    return { nodes: ranked.map(r => r.node), note };
+    return findAllSymbols(cg, symbol);
   }
 
   /**

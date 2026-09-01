@@ -1,5 +1,11 @@
 import { defineConfig } from 'vitest/config';
 
+/**
+ * The SHARED base. `vitest.workspace.mts` extends it twice — once for the
+ * engine's node-environment suites and once for the viewer package's jsdom
+ * one — so the environment, the plugins and the module-resolution conditions
+ * a browser test needs cannot leak into the other 200-odd suites.
+ */
 export default defineConfig({
   test: {
     globals: true,

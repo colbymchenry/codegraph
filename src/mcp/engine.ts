@@ -11,8 +11,9 @@
  */
 
 import * as os from 'os';
+import * as path from 'path';
 import type CodeGraph from '../index';
-import { findNearestCodeGraphRoot } from '../directory';
+import { resolveServerRoot } from '../directory';
 import { watchDisabledReason } from '../sync';
 import { ToolHandler } from './tools';
 import { QueryPool, resolvePoolSize } from './query-pool';
@@ -25,6 +26,9 @@ import { QueryPool, resolvePoolSize } from './query-pool';
 // agents flounder. require() is sync + cached on the CommonJS build.
 const loadCodeGraph = (): typeof import('../index').default =>
   (require('../index') as typeof import('../index')).default;
+
+/** How often the per-tool-call retry may re-run the sub-project down-scan. */
+const RETRY_SUBSCAN_TTL_MS = 5_000;
 
 export interface MCPEngineOptions {
   /**
@@ -59,6 +63,9 @@ export class MCPEngine {
   private projectPath: string | null = null;
   // Set on first `ensureInitialized` so subsequent sessions don't redo work.
   private initPromise: Promise<void> | null = null;
+  // Throttle for the retry path's sub-project down-scan (#1606) — the scan is
+  // bounded but shouldn't run on every tool call in the no-default state.
+  private lastRetrySubScanAt = 0;
   private watcherStarted = false;
   private opts: Required<MCPEngineOptions>;
   private closed = false;
@@ -158,8 +165,20 @@ export class MCPEngine {
     if (this.closed) return;
     if (this.toolHandler.hasDefaultCodeGraph()) return;
     this.toolHandler.setDefaultProjectHint(searchFrom);
-    const resolvedRoot = findNearestCodeGraphRoot(searchFrom);
+    // Same resolution `doInitialize` used: up-walk, then the bounded workspace
+    // down-scan (#1606) — this retry is exactly the path that picks up a
+    // project (root or child) `codegraph init`'d after the server started. The
+    // down-scan is throttled so the persistent no-default state doesn't pay a
+    // directory walk on every tool call; the up-walk always runs.
+    const scanDue = Date.now() - this.lastRetrySubScanAt >= RETRY_SUBSCAN_TTL_MS;
+    const res = resolveServerRoot(searchFrom, { subprojectScan: scanDue });
+    if (scanDue) {
+      this.lastRetrySubScanAt = Date.now();
+      if (!res.root) this.toolHandler.setKnownSubprojects(res.candidates, searchFrom);
+    }
+    const resolvedRoot = res.root;
     if (!resolvedRoot) return;
+    if (res.viaSubScan) this.logSubprojectAdoption(searchFrom, resolvedRoot);
     try {
       // Close any previously failed instance to avoid leaking resources.
       if (this.cg) {
@@ -201,12 +220,32 @@ export class MCPEngine {
   private async doInitialize(searchFrom: string): Promise<void> {
     this.toolHandler.setDefaultProjectHint(searchFrom);
 
-    const resolvedRoot = findNearestCodeGraphRoot(searchFrom);
+    // Up-walk first; when nothing is indexed at or above searchFrom, a bounded
+    // down-scan may adopt a SINGLE indexed sub-project as the default (#1606 —
+    // the workspace-container shape where only children are indexed). Zero or
+    // several candidates → no default project, but SAY so (#1607): the silent
+    // variant of this state read as "CodeGraph is broken" and was diagnosable
+    // only by knowing to look for a missing ~/.codegraph/daemons/ entry.
+    const res = resolveServerRoot(searchFrom);
+    const resolvedRoot = res.root;
     if (!resolvedRoot) {
-      // No .codegraph/ above searchFrom. Sessions may still discover one later via roots/list
+      // Sessions may still discover a project later via roots/list, and the
+      // per-call retry re-resolves — this state is recoverable, hence stderr
+      // (not a failure) + candidates surfaced through the tool-call error.
       this.projectPath = searchFrom;
+      this.toolHandler.setKnownSubprojects(res.candidates, searchFrom);
+      process.stderr.write(
+        `[CodeGraph MCP] No .codegraph/ at or above ${searchFrom}: no default project, live sync disabled.\n`
+      );
+      if (res.candidates.length > 0) {
+        const rels = res.candidates.map((c) => path.relative(searchFrom, c) || '.');
+        process.stderr.write(
+          `[CodeGraph MCP] Indexed sub-projects found: ${rels.join(', ')}. Pass \`projectPath\` per call, or launch with --path.\n`
+        );
+      }
       return;
     }
+    if (res.viaSubScan) this.logSubprojectAdoption(searchFrom, resolvedRoot);
 
     this.projectPath = resolvedRoot;
     try {
@@ -219,6 +258,14 @@ export class MCPEngine {
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(`[CodeGraph MCP] Failed to open project at ${resolvedRoot}: ${msg}\n`);
     }
+  }
+
+  /** One stderr line when the default project came from the down-scan (#1606). */
+  private logSubprojectAdoption(searchFrom: string, root: string): void {
+    const rel = path.relative(searchFrom, root) || root;
+    process.stderr.write(
+      `[CodeGraph MCP] No .codegraph/ at ${searchFrom}; adopted the single indexed sub-project ${rel} as the default project.\n`
+    );
   }
 
   /**

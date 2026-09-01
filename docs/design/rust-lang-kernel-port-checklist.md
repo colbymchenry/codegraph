@@ -89,18 +89,21 @@ Hooks PRESENT (port each exactly):
 - **getVisibility (rust.ts:74)** — direct child of type `visibility_modifier`:
   text `.includes('pub')` → `'public'` else `'private'`; no modifier →
   `'private'` (so `pub(crate)`/`pub(super)` are all `'public'`).
-- **getReceiverType (rust.ts:83)** — walk PARENT chain to the nearest
-  `impl_item`; there: filter DIRECT namedChildren of type `type_identifier`;
-  if ≥1, return the LAST one's source text (`source.substring(startIndex,
-  endIndex)` — UTF-16 units). If none, find the first `generic_type` child and
-  return its inner `type_identifier` text; else undefined. Never an impl parent
-  → undefined. QUIRK/BUG, PRESERVE: for `impl Trait for Generic<T>` the only
-  direct type_identifier is the TRAIT (probe: `impl Render for Container<T>` →
-  typeIdents=[`Render`] → receiver = **`Render`**, the trait name — methods get
-  qualifiedName `Render::render` and a contains edge from the trait node if one
-  exists in-file). `impl fmt::Display for Fields` is fine
-  (scoped_type_identifier isn't type_identifier → [Fields]). `impl<T>
-  Container<T>` → no direct type_identifiers → generic branch → `Container`.
+- **getReceiverType (rust.ts)** — walk PARENT chain to the nearest
+  `impl_item`; there, read the grammar's `type` field through
+  `rustImplTypeName` (kernel: `impl_type_name`): `type_identifier`/`identifier`
+  → text; `generic_type` → its `type` field (bare name, never the args);
+  `scoped_type_identifier`/`scoped_identifier` → its `name` field (last
+  segment); `reference_type` → its `type` field; anything else (tuple, `dyn`,
+  pointer, primitive, fn type) → undefined. Never an impl parent → undefined.
+  **Changed in #1588 on both sides together**: the original rule took the LAST
+  direct `type_identifier` child, so for `impl Trait for Generic<T>` /
+  `Parents<'a>` / `&Foo` the only bare identifier was the TRAIT's (probe:
+  `impl Render for Container<T>` → receiver **`Render`** → methods
+  `Render::render`, colliding with the trait declaration and feeding the
+  interface-impl synthesizer a phantom declaration). Now `Container`.
+  `impl fmt::Display for Fields` → `Fields`; `impl<T> Container<T>` →
+  `Container`; `impl Tr for m::Foo` → `Foo` (was: no receiver).
   Note `<T>` type_parameters is its own child, its inner T is NOT a direct
   impl child.
 - **extractImport (rust.ts:120)** — signature = trimmed full `use …;` text.
@@ -187,8 +190,9 @@ undefined; **no isConst means `const_item`/`static_item` extract as kind
   present AND not class-like — finds the FIRST node in `this.nodes` with
   `name === receiverType && filePath === this.filePath && kind ∈
   {struct,class,enum,trait}`. Source-order dependent: an impl ABOVE its struct
-  gets no contains edge. `impl Trait for Generic<T>` (receiver=trait bug) links
-  to the TRAIT node if it's in-file.** Then type annotations, decorators
+  gets no contains edge. Since #1588 `impl Trait for Generic<T>` links to the
+  implementing TYPE's node (it used to link to the TRAIT node, the receiver
+  bug).** Then type annotations, decorators
   (no-op), body walk with the method pushed.
 - **Nested `fn` inside an impl-method's body**: visitFunctionBody:5245 →
   named → extractFunction → getReceiverType walks parents THROUGH the outer fn
@@ -222,9 +226,13 @@ Generic else-branch (4312+), `func = childForFieldName('function') ?? namedChild
      (4455) → `Foo::new().bar()` → ref `Foo::new().bar`; an instance chain
      `x.foo().bar()` (innerFn field_expression) → bare `bar`. When not
      re-encoding, calleeName = bare methodName.
-   - receiver anything else (`field_expression` 2-hop `v.field.method()`,
-     `parenthesized_expression`, `await_expression`, `self`) → bare
-     methodName (probed all four).
+   - receiver `field_expression` whose `value` is `self` and whose `field` is
+     a `field_identifier` (`self.inner.run()`) → `self.inner.run` — the
+     owner-field shape the resolver types from the struct declaration
+     (#1585, both sides together).
+   - receiver anything else (`field_expression` with a non-self base
+     `v.field.method()` / deeper `self.a.b.m()`, `parenthesized_expression`,
+     `await_expression`, `self`) → bare methodName (probed all four).
 2. `func.type === 'scoped_identifier'` (4499) → calleeName = FULL text
    (`Foo::new`, `m::helper2`, `std::mem::swap` — whatever the source spells,
    whitespace included).
