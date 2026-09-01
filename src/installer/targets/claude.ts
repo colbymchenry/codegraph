@@ -41,18 +41,36 @@ import {
   CODEGRAPH_SECTION_START,
 } from '../instructions-template';
 
+/**
+ * Root of the global Claude Code profile. Honors CLAUDE_CONFIG_DIR so
+ * non-default profiles (e.g. `~/.claude-gc`) get configured instead of
+ * `~/.claude` — Claude Code reads settings.json, CLAUDE.md, and (when
+ * the env var is set) .claude.json from this directory. Only affects the
+ * global location; project-local files are unaffected by the env var.
+ */
+function globalConfigDir(): string {
+  const cfg = process.env.CLAUDE_CONFIG_DIR;
+  return cfg && cfg.trim().length > 0
+    ? path.resolve(cfg)
+    : path.join(os.homedir(), '.claude');
+}
 function configDir(loc: Location): string {
   return loc === 'global'
-    ? path.join(os.homedir(), '.claude')
+    ? globalConfigDir()
     : path.join(process.cwd(), '.claude');
 }
 function mcpJsonPath(loc: Location): string {
-  // global → ~/.claude.json (user scope: visible in every project).
+  // global → $CLAUDE_CONFIG_DIR/.claude.json when that env var is set
+  //   (Claude Code keeps .claude.json inside a custom profile dir), else
+  //   ~/.claude.json in HOME (the default profile keeps it beside, not
+  //   inside, ~/.claude). User scope: visible in every project.
   // local  → ./.mcp.json (project scope: the ONLY project-level MCP
-  // file Claude Code reads — NOT ./.claude.json, which it ignores).
-  return loc === 'global'
-    ? path.join(os.homedir(), '.claude.json')
-    : path.join(process.cwd(), '.mcp.json');
+  //   file Claude Code reads — NOT ./.claude.json, which it ignores).
+  if (loc !== 'global') return path.join(process.cwd(), '.mcp.json');
+  const cfg = process.env.CLAUDE_CONFIG_DIR;
+  return cfg && cfg.trim().length > 0
+    ? path.join(path.resolve(cfg), '.claude.json')
+    : path.join(os.homedir(), '.claude.json');
 }
 /**
  * Where pre-#207 installers wrote the local MCP entry. Claude Code
