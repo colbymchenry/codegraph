@@ -6393,6 +6393,31 @@ describe('Razor / Blazor markup extraction', () => {
     const deps = [...cg.getImpactRadius(svc!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
     expect(deps.some((p) => p.endsWith('List.razor')), '@code usage links the component to the service').toBe(true);
   });
+
+  it('links inline <script> JS in a .cshtml to a repo JS module/function', async () => {
+    // Traditional MVC view: front-end logic lives in an inline <script> that
+    // imports + calls a shared JS helper. The helper must show the view as a
+    // dependent — proving the JS ref isn't dropped by the dotnet family gate
+    // (the ref must stay in the `javascript` family, not be tagged `razor`).
+    fs.writeFileSync(
+      path.join(tempDir, 'site.js'),
+      `export function showToast(msg) { return msg; }\n`
+    );
+    fs.mkdirSync(path.join(tempDir, 'Views'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, 'Views/Order.cshtml'),
+      `@model OrderViewModel\n<div>Order</div>\n<script>\n  import { showToast } from '../site.js';\n  function save() { showToast('saved'); }\n</script>\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const helper = cg.getNodesByKind('function').find((n) => n.name === 'showToast');
+    expect(helper, 'showToast function').toBeDefined();
+    const deps = [...cg.getImpactRadius(helper!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(deps.some((p) => p.endsWith('Order.cshtml')), 'inline <script> links the view to the JS helper').toBe(true);
+  });
 });
 
 describe('Default import resolution (renamed default export)', () => {
