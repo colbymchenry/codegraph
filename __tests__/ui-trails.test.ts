@@ -18,6 +18,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import * as http from 'http';
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -26,6 +27,7 @@ import { createGraphApi, startUiServer, type GraphApi, type UiServerHandle } fro
 import {
   encodeResolvedRun,
   isTrailId,
+  listStoredTrails,
   parseTrail,
   slugify,
   TRAILS_RELATIVE_DIR,
@@ -33,6 +35,7 @@ import {
   type WireTrailHop,
 } from '../src/ui-server/api';
 import { writeStoredTrail } from '../src/ui-server/api/trail-store';
+import { resetTrailAuthor, trailAuthor } from '../src/ui-server/api/trails';
 
 interface Res {
   status: number;
@@ -284,6 +287,56 @@ describe('trail write containment', () => {
   );
 });
 
+describe('trail read containment', () => {
+  it.runIf(process.platform !== 'win32')(
+    'skips a trail file symlinked outside the project instead of reading it',
+    () => {
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-trail-read-link-'));
+      const project = path.join(base, 'project');
+      const outside = path.join(base, 'outside');
+      const dir = path.join(project, TRAILS_RELATIVE_DIR);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.mkdirSync(outside, { recursive: true });
+      fs.writeFileSync(
+        path.join(outside, 'secret.json'),
+        JSON.stringify({ ...storedTrail('outside'), note: 'must not be read' })
+      );
+      fs.symlinkSync(path.join(outside, 'secret.json'), path.join(dir, 'linked.json'));
+
+      try {
+        expect(listStoredTrails(project)).toEqual({ trails: [], skipped: 1 });
+      } finally {
+        fs.rmSync(base, { recursive: true, force: true });
+      }
+    }
+  );
+});
+
+describe('trail author cache', () => {
+  it('keeps git user names separate for projects served by one process', () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-trail-authors-'));
+    const first = path.join(base, 'first');
+    const second = path.join(base, 'second');
+
+    try {
+      for (const [dir, author] of [
+        [first, 'Alice Project'],
+        [second, 'Bob Project'],
+      ] as const) {
+        fs.mkdirSync(dir, { recursive: true });
+        execFileSync('git', ['init', '-q'], { cwd: dir });
+        execFileSync('git', ['config', 'user.name', author], { cwd: dir });
+      }
+      resetTrailAuthor();
+      expect(trailAuthor(first)).toBe('Alice Project');
+      expect(trailAuthor(second)).toBe('Bob Project');
+    } finally {
+      resetTrailAuthor();
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('parseTrail', () => {
   it('rejects a file that is not a trail rather than half-reading it', () => {
     expect(parseTrail('x', 'not json')).toBeNull();
@@ -291,6 +344,12 @@ describe('parseTrail', () => {
     expect(parseTrail('x', '{"name":"a"}')).toBeNull();
     expect(parseTrail('x', '{"name":"a","hops":[]}')).toBeNull();
     expect(parseTrail('x', '{"name":"","hops":[{"qualifiedName":"a"}]}')).toBeNull();
+  });
+
+  it('rejects a declared format version this build does not understand', () => {
+    expect(
+      parseTrail('future', JSON.stringify({ ...storedTrail('future'), version: 2 }))
+    ).toBeNull();
   });
 
   it('takes its id from the FILE, not from the field inside it', () => {
