@@ -2001,6 +2001,32 @@ func main() {
     });
   });
 
+  describe('Lua function-expression resolution (#1616)', () => {
+    it('attributes helper calls to each assigned callable instead of the file node', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'util.lua'),
+        `util = {}\nfunction util.helper() return 1 end\nreturn util\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'handlers.lua'),
+        `local M = {}\nfunction M.namedFn() return util.helper() end\nM.assignedFn = function() return util.helper() end\nM.callbacks = { onStart = function() return util.helper() end }\nreturn M\n`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const helper = cg
+        .getNodesByKind('method')
+        .find((n) => n.qualifiedName === 'util::helper');
+      expect(helper).toBeDefined();
+      const callers = cg.getCallers(helper!.id).map((c) => c.node);
+      expect(callers.some((n) => n.qualifiedName === 'M::namedFn')).toBe(true);
+      expect(callers.some((n) => n.qualifiedName === 'M::assignedFn')).toBe(true);
+      expect(callers.some((n) => n.qualifiedName === 'M.callbacks::onStart')).toBe(true);
+      expect(callers.some((n) => n.kind === 'file' && n.filePath === 'handlers.lua')).toBe(false);
+    });
+  });
+
   describe('Watchdog-safe resolution on collision-heavy repos (#1122)', () => {
     // On a large Java-style repo, per-ref resolution cost is unbounded in the
     // worst case (a colliding method name whose candidate set misses the LRU

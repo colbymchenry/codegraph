@@ -8486,6 +8486,58 @@ function M:send(data) return self end
       const send = methods.find((m) => m.name === 'send');
       expect(send?.qualifiedName).toBe('M::send');
     });
+
+    it('should name function expressions from local, member, and table-field bindings', () => {
+      const code = `
+local function helper() return 1 end
+local localFn = function() return helper() end
+local M = {
+  callbacks = {
+    onStart = function() return helper() end,
+    ["onStop"] = function() return helper() end,
+    [DYNAMIC] = function() return helper() end,
+  },
+}
+M.assignedFn = function() return helper() end
+M["bracketFn"] = function() return helper() end
+localFn()
+`;
+      const result = extractFromSource('handlers.lua', code);
+      const localFn = result.nodes.find((n) => n.kind === 'function' && n.name === 'localFn');
+      const assignedFn = result.nodes.find(
+        (n) => n.kind === 'method' && n.qualifiedName === 'M::assignedFn'
+      );
+      const onStart = result.nodes.find(
+        (n) => n.kind === 'method' && n.qualifiedName === 'M.callbacks::onStart'
+      );
+      const onStop = result.nodes.find(
+        (n) => n.kind === 'method' && n.qualifiedName === 'M.callbacks::onStop'
+      );
+      const bracketFn = result.nodes.find(
+        (n) => n.kind === 'method' && n.qualifiedName === 'M::bracketFn'
+      );
+
+      expect(localFn).toBeDefined();
+      expect(assignedFn).toBeDefined();
+      expect(onStart).toBeDefined();
+      expect(onStop).toBeDefined();
+      expect(bracketFn).toBeDefined();
+      expect(result.nodes.some((n) => n.name === 'DYNAMIC')).toBe(false);
+      expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'localFn')).toBe(false);
+
+      for (const callable of [localFn, assignedFn, onStart, onStop, bracketFn]) {
+        expect(
+          result.unresolvedReferences.some(
+            (r) => r.fromNodeId === callable!.id && r.referenceKind === 'calls' && r.referenceName === 'helper'
+          )
+        ).toBe(true);
+      }
+      expect(
+        result.unresolvedReferences.some(
+          (r) => r.referenceKind === 'calls' && r.referenceName === 'localFn'
+        )
+      ).toBe(true);
+    });
   });
 
   describe('Variable extraction', () => {

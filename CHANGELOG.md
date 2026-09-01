@@ -201,6 +201,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Symbols, tests and the viewer
 
+- Lua and Luau function expressions assigned to locals, table members, or keyed table fields are now indexed as callable nodes. Calls from `local f = function() ... end`, `M.f = function() ... end`, and callback tables such as `M.handlers = { onClick = function() ... end }` are attributed to the named function or method instead of collapsing onto the file node, so callers and impact no longer omit these handlers. Re-index after upgrading. (#1616)
+
 - **Files under an `e2e/` directory count as tests.** Their calls no longer appear as production callers in Steps, dead-code and test badges.
 
 - **Production code under a `samples` or `examples` package path is no longer treated as test code.** A Kotlin or Java project whose package path runs through `com/google/samples/…` (Now in Android, for one) had nearly every file counted as a fixture, so the Map opened on `build-logic`, the entry points hid the app, and dead-code and test badges were wrong. Only the project layout above a `src/` folder decides now; the package path below it never does.
