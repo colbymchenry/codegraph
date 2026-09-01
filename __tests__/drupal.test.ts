@@ -529,6 +529,461 @@ describe('drupalResolver.resolve', () => {
 });
 
 // ---------------------------------------------------------------------------
+// extract() — services.yml (DI container wiring)
+// ---------------------------------------------------------------------------
+
+describe('drupalResolver.extract — services.yml', () => {
+  const services = `
+services:
+
+  # A custom service.
+  weller_localization.domain_alias:
+    class: Drupal\\weller_localization\\DomainAlias
+    arguments: [ '@domain.negotiator' ]
+
+  # Overrides a core service.
+  path_alias.manager:
+    class: Drupal\\weller_localization\\AliasManager
+    arguments: ['@path_alias.repository', '@language_manager']
+    tags:
+      - { name: backend_overridable }
+`;
+
+  it('emits a component node for each service id', () => {
+    const { nodes } = drupalResolver.extract!(
+      'weller_localization/weller_localization.services.yml',
+      services,
+    );
+    const names = nodes.map((n) => n.name);
+    expect(names).toContain('weller_localization.domain_alias');
+    expect(names).toContain('path_alias.manager');
+    expect(nodes.every((n) => n.kind === 'component')).toBe(true);
+  });
+
+  it('sets qualifiedName to filePath::service:<id>', () => {
+    const { nodes } = drupalResolver.extract!(
+      'weller_localization/weller_localization.services.yml',
+      services,
+    );
+    const node = nodes.find((n) => n.name === 'weller_localization.domain_alias');
+    expect(node!.qualifiedName).toBe(
+      'weller_localization/weller_localization.services.yml::service:weller_localization.domain_alias',
+    );
+  });
+
+  it('emits a references edge from the service to its class FQCN', () => {
+    const { nodes, references } = drupalResolver.extract!(
+      'weller_localization/weller_localization.services.yml',
+      services,
+    );
+    const svc = nodes.find((n) => n.name === 'weller_localization.domain_alias')!;
+    const classRef = references.find(
+      (r) => r.fromNodeId === svc.id && r.referenceName === 'Drupal\\weller_localization\\DomainAlias',
+    );
+    expect(classRef).toBeDefined();
+    expect(classRef!.referenceKind).toBe('references');
+  });
+
+  it('emits service→service references for @arguments', () => {
+    const { nodes, references } = drupalResolver.extract!(
+      'weller_localization/weller_localization.services.yml',
+      services,
+    );
+    const svc = nodes.find((n) => n.name === 'path_alias.manager')!;
+    const argRefs = references.filter((r) => r.fromNodeId === svc.id);
+    const argNames = argRefs.map((r) => r.referenceName);
+    // class ref + the two @service args (without the @)
+    expect(argNames).toContain('path_alias.repository');
+    expect(argNames).toContain('language_manager');
+  });
+
+  it('does not treat the top-level "services" key as a service id', () => {
+    const { nodes } = drupalResolver.extract!('m/m.services.yml', services);
+    expect(nodes.map((n) => n.name)).not.toContain('services');
+  });
+
+  it('returns empty result for a services.yml with no services', () => {
+    const { nodes, references } = drupalResolver.extract!(
+      'm/m.services.yml',
+      'services:\n',
+    );
+    expect(nodes).toHaveLength(0);
+    expect(references).toHaveLength(0);
+  });
+});
+
+describe('drupalResolver.resolve — services', () => {
+  it('resolves a bare service-class FQCN to the class node', () => {
+    const classNode = {
+      id: 'class:da',
+      kind: 'class' as const,
+      name: 'DomainAlias',
+      qualifiedName: 'DomainAlias',
+      filePath: 'weller_localization/src/DomainAlias.php',
+      language: 'php' as const,
+      startLine: 1,
+      endLine: 10,
+      startColumn: 0,
+      endColumn: 0,
+      updatedAt: 0,
+    };
+    const ctx = makeContext({
+      getNodesByName: (name) => (name === 'DomainAlias' ? [classNode] : []),
+    });
+    const ref = {
+      fromNodeId: 'service:x',
+      referenceName: 'Drupal\\weller_localization\\DomainAlias',
+      referenceKind: 'references' as const,
+      line: 1,
+      column: 0,
+      filePath: 'weller_localization/weller_localization.services.yml',
+      language: 'yaml' as const,
+    };
+    const resolved = drupalResolver.resolve(ref, ctx);
+    expect(resolved).not.toBeNull();
+    expect(resolved!.targetNodeId).toBe('class:da');
+  });
+
+  it('resolves a service-argument id to the referenced service node', () => {
+    const svcNode = {
+      id: 'component:svc-repo',
+      kind: 'component' as const,
+      name: 'path_alias.repository',
+      qualifiedName: 'm/m.services.yml::service:path_alias.repository',
+      filePath: 'm/m.services.yml',
+      language: 'yaml' as const,
+      startLine: 3,
+      endLine: 3,
+      startColumn: 0,
+      endColumn: 0,
+      updatedAt: 0,
+    };
+    const ctx = makeContext({
+      getNodesByName: (name) => (name === 'path_alias.repository' ? [svcNode] : []),
+    });
+    const ref = {
+      fromNodeId: 'component:svc-mgr',
+      referenceName: 'path_alias.repository',
+      referenceKind: 'references' as const,
+      line: 1,
+      column: 0,
+      filePath: 'm/m.services.yml',
+      language: 'yaml' as const,
+    };
+    const resolved = drupalResolver.resolve(ref, ctx);
+    expect(resolved).not.toBeNull();
+    expect(resolved!.targetNodeId).toBe('component:svc-repo');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extract()/resolve() — services.yml edge cases (code-review regressions)
+// ---------------------------------------------------------------------------
+
+describe('drupalResolver.extract — services.yml edge cases', () => {
+  it('parses @service arguments written as a multi-line block list', () => {
+    const src = `
+services:
+  my.service:
+    class: Drupal\\my\\Service
+    arguments:
+      - '@path_alias.repository'
+      - '@language_manager'
+`;
+    const { nodes, references } = drupalResolver.extract!('m/m.services.yml', src);
+    const svc = nodes.find((n) => n.name === 'my.service')!;
+    const argNames = references.filter((r) => r.fromNodeId === svc.id).map((r) => r.referenceName);
+    expect(argNames).toContain('path_alias.repository');
+    expect(argNames).toContain('language_manager');
+  });
+
+  it('ignores Symfony/Drupal DI directive keys (_defaults, _instanceof)', () => {
+    const src = `
+services:
+  _defaults:
+    autowire: true
+  _instanceof:
+    Drupal\\Foo: ~
+  my.service:
+    class: Drupal\\my\\Service
+`;
+    const { nodes } = drupalResolver.extract!('m/m.services.yml', src);
+    const names = nodes.map((n) => n.name);
+    expect(names).toContain('my.service');
+    expect(names).not.toContain('_defaults');
+    expect(names).not.toContain('_instanceof');
+  });
+
+  it('recognizes a service id that carries a trailing comment', () => {
+    const src = `
+services:
+  my.service: # the main service
+    class: Drupal\\my\\Service
+`;
+    const { nodes } = drupalResolver.extract!('m/m.services.yml', src);
+    expect(nodes.map((n) => n.name)).toContain('my.service');
+  });
+
+  it('does not capture @tokens from a trailing comment on the arguments line', () => {
+    const src = `
+services:
+  my.service:
+    class: Drupal\\my\\Service
+    arguments: ['@real.dep'] # see @bogus.from.comment
+`;
+    const { nodes, references } = drupalResolver.extract!('m/m.services.yml', src);
+    const svc = nodes.find((n) => n.name === 'my.service')!;
+    const argNames = references.filter((r) => r.fromNodeId === svc.id).map((r) => r.referenceName);
+    expect(argNames).toContain('real.dep');
+    expect(argNames).not.toContain('bogus.from.comment');
+  });
+});
+
+describe('drupalResolver.resolve — services edge cases', () => {
+  const svcNode = {
+    id: 'component:svc-db',
+    kind: 'component' as const,
+    name: 'database',
+    qualifiedName: 'm/m.services.yml::service:database',
+    filePath: 'm/m.services.yml',
+    language: 'yaml' as const,
+    startLine: 1,
+    endLine: 1,
+    startColumn: 0,
+    endColumn: 0,
+    updatedAt: 0,
+  };
+
+  it('resolves a dotless core-service argument id (e.g. "database")', () => {
+    const ctx = makeContext({
+      getNodesByName: (name) => (name === 'database' ? [svcNode] : []),
+    });
+    const ref = {
+      fromNodeId: 'component:caller',
+      referenceName: 'database',
+      referenceKind: 'references' as const,
+      line: 1,
+      column: 0,
+      filePath: 'm/m.services.yml',
+      language: 'yaml' as const,
+    };
+    const resolved = drupalResolver.resolve(ref, ctx);
+    expect(resolved).not.toBeNull();
+    expect(resolved!.targetNodeId).toBe('component:svc-db');
+  });
+
+  it('does NOT hijack a dotted entity-handler route ref to a same-named service', () => {
+    // A route's `_entity_form: node.default` previously stayed unresolved; it must not
+    // now mis-resolve to a DI service component that happens to share the dotted name.
+    const svc = { ...svcNode, id: 'component:nd', name: 'node.default', qualifiedName: 'm/m.services.yml::service:node.default' };
+    const ctx = makeContext({
+      getNodesByName: (name) => (name === 'node.default' ? [svc] : []),
+    });
+    const ref = {
+      fromNodeId: 'route:x',
+      referenceName: 'node.default',
+      referenceKind: 'references' as const,
+      line: 1,
+      column: 0,
+      filePath: 'mymodule/mymodule.routing.yml', // NOT a services.yml
+      language: 'yaml' as const,
+    };
+    expect(drupalResolver.resolve(ref, ctx)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extract() — plugin definitions (PHP 8 attributes + legacy annotations)
+// ---------------------------------------------------------------------------
+
+describe('drupalResolver.extract — plugin attributes (Drupal 11)', () => {
+  it('emits a plugin component for a multi-line #[Block(...)] attribute', () => {
+    const src = `<?php
+
+namespace Drupal\\shortcut\\Plugin\\Block;
+
+use Drupal\\Core\\Block\\BlockBase;
+
+/**
+ * Provides a 'Shortcut' block.
+ */
+#[Block(
+  id: "shortcuts",
+  admin_label: new TranslatableMarkup("Shortcuts"),
+  category: new TranslatableMarkup("Menus")
+)]
+class ShortcutsBlock extends BlockBase {
+}
+`;
+    const { nodes, references } = drupalResolver.extract!(
+      'shortcut/src/Plugin/Block/ShortcutsBlock.php',
+      src,
+    );
+    const plugin = nodes.find((n) => n.name === 'shortcuts');
+    expect(plugin).toBeDefined();
+    expect(plugin!.kind).toBe('component');
+    expect(plugin!.qualifiedName).toContain('plugin:Block:shortcuts');
+    // references edge plugin → annotated class
+    const ref = references.find(
+      (r) => r.fromNodeId === plugin!.id && r.referenceName === 'ShortcutsBlock',
+    );
+    expect(ref).toBeDefined();
+  });
+
+  it('emits a plugin component for a single-line attribute with single quotes', () => {
+    const src = `<?php
+#[SectionStorage(id: 'layout_builder_test_state')]
+class TestState {
+}
+`;
+    const { nodes } = drupalResolver.extract!('m/src/Plugin/X/TestState.php', src);
+    const plugin = nodes.find((n) => n.name === 'layout_builder_test_state');
+    expect(plugin).toBeDefined();
+    expect(plugin!.qualifiedName).toContain('plugin:SectionStorage:layout_builder_test_state');
+  });
+
+  it('emits a plugin component for a #[FieldType(...)] attribute', () => {
+    const src = `<?php
+#[FieldType(
+  id: "list_string",
+  label: new TranslatableMarkup("List (text)"),
+)]
+class ListStringItem {
+}
+`;
+    const { nodes, references } = drupalResolver.extract!(
+      'options/src/Plugin/Field/FieldType/ListStringItem.php',
+      src,
+    );
+    const plugin = nodes.find((n) => n.name === 'list_string')!;
+    expect(plugin.qualifiedName).toContain('plugin:FieldType:list_string');
+    expect(
+      references.some((r) => r.fromNodeId === plugin.id && r.referenceName === 'ListStringItem'),
+    ).toBe(true);
+  });
+
+  it('ignores non-plugin attributes like #[DataProvider(...)]', () => {
+    const src = `<?php
+class FooTest {
+  #[DataProvider('provide')]
+  public function testThing() {}
+}
+`;
+    const { nodes } = drupalResolver.extract!('m/tests/FooTest.php', src);
+    expect(nodes).toHaveLength(0);
+  });
+});
+
+describe('drupalResolver.extract — plugin annotations (legacy)', () => {
+  it('emits a plugin component for an @Block(...) annotation', () => {
+    const src = `<?php
+
+namespace Drupal\\weller_theme_components\\Plugin\\Block;
+
+use Drupal\\Core\\Block\\BlockBase;
+
+/**
+ * Provides a 'Hero' block based on the basic page hero field.
+ *
+ * @Block(
+ *   id = "weller_hero",
+ *   admin_label = @Translation("Weller Hero"),
+ * )
+ */
+class Hero extends BlockBase {
+}
+`;
+    const { nodes, references } = drupalResolver.extract!(
+      'weller_theme_components/src/Plugin/Block/Hero.php',
+      src,
+    );
+    const plugin = nodes.find((n) => n.name === 'weller_hero');
+    expect(plugin).toBeDefined();
+    expect(plugin!.kind).toBe('component');
+    expect(plugin!.qualifiedName).toContain('plugin:Block:weller_hero');
+    expect(
+      references.some((r) => r.fromNodeId === plugin!.id && r.referenceName === 'Hero'),
+    ).toBe(true);
+  });
+
+  it('emits a plugin component for an @FieldType(...) annotation', () => {
+    const src = `<?php
+/**
+ * Plugin implementation of the 'social_links_field' field type.
+ *
+ * @FieldType(
+ *   id = "social_links_field",
+ *   label = @Translation("Social Media Links Field"),
+ *   default_widget = "social_links_field_default",
+ * )
+ */
+class SocialMediaLinksFieldItem extends FieldItemBase {
+}
+`;
+    const { nodes } = drupalResolver.extract!(
+      'social_links_field/src/Plugin/Field/FieldType/SocialMediaLinksFieldItem.php',
+      src,
+    );
+    const plugin = nodes.find((n) => n.name === 'social_links_field');
+    expect(plugin).toBeDefined();
+    expect(plugin!.qualifiedName).toContain('plugin:FieldType:social_links_field');
+  });
+
+  it('does not treat the nested @Translation() as a plugin', () => {
+    const src = `<?php
+/**
+ * @Block(
+ *   id = "weller_hero",
+ *   admin_label = @Translation("Weller Hero"),
+ * )
+ */
+class Hero {}
+`;
+    const { nodes } = drupalResolver.extract!('m/src/Plugin/Block/Hero.php', src);
+    expect(nodes.map((n) => n.name)).not.toContain('Translation');
+    expect(nodes).toHaveLength(1);
+  });
+
+  it('captures the id when it appears AFTER a nested annotation (label first)', () => {
+    // Drupal core commonly orders `label = @Translation(...)` before `id = ...`.
+    const src = `<?php
+/**
+ * @FieldType(
+ *   label = @Translation("List (text)"),
+ *   id = "list_string",
+ * )
+ */
+class ListStringItem {}
+`;
+    const { nodes } = drupalResolver.extract!(
+      'options/src/Plugin/Field/FieldType/ListStringItem.php',
+      src,
+    );
+    const plugin = nodes.find((n) => n.name === 'list_string');
+    expect(plugin).toBeDefined();
+    expect(plugin!.qualifiedName).toContain('plugin:FieldType:list_string');
+  });
+
+  it('does not bind a stray plugin-type token to a far-away class', () => {
+    // A plugin-shaped token deep in a method body, with the next class far below it,
+    // must not produce a plugin edge (the proximity bound rejects the distant class).
+    const filler = '\n    // padding padding padding padding padding padding\n'.repeat(20);
+    const src = `<?php
+class Helper {
+  public function describe() {
+    $msg = 'mentions @Block(id = "fake")';${filler}
+    return $msg;
+  }
+}
+
+class UnrelatedLater {}
+`;
+    const { nodes } = drupalResolver.extract!('m/src/Helper.php', src);
+    expect(nodes).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // End-to-end integration test
 // ---------------------------------------------------------------------------
 

@@ -247,6 +247,8 @@ After upgrading, run `codegraph index` once in each project so your existing gra
 
 - Anonymous usage telemetry is now stored entirely on CodeGraph's own first-party infrastructure — no third-party analytics vendor receives any of it, and the endpoint that receives it makes no outbound requests at all. Individual events are deleted after 90 days, leaving only anonymous daily totals. Nothing about what is collected changed, your IP address is still never read or stored, and every off-switch works exactly as before (`codegraph telemetry off`, `CODEGRAPH_TELEMETRY=0`, `DO_NOT_TRACK=1`). `TELEMETRY.md` remains the complete field-by-field list.
 
+- CodeGraph now understands Drupal's service container and plugin definitions. Service definitions in `*.services.yml` are linked to the PHP class that implements them and to the other services they depend on, so `codegraph_explore` can trace Drupal's dependency injection — which was previously invisible. Plugin definitions are also picked up by their plugin id, covering both the Drupal 11 PHP 8 attribute style (`#[Block(...)]`, `#[FieldType(...)]`, …) and the legacy docblock annotation style (`@Block(...)`, `@FieldType(...)`, …), each linked to the class it decorates.
+
 ### Fixes
 
 #### Better answers from `codegraph_explore`
