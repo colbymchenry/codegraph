@@ -861,6 +861,10 @@ is written):
 - **Kiro**
 - **GitHub Copilot** — Copilot Chat in VS Code (`copilot-vscode`), the Copilot CLI (`copilot-cli`), and the Copilot plugin in JetBrains IDEs (`copilot-jetbrains`)
 
+> **Note on Codex support:** CodeGraph currently supports **Codex CLI** via
+> `~/.codex/config.toml` (global config). If you're using a separate **Codex VS
+> Code extension**, that setup path is not documented here yet.
+
 ## Supported Languages
 
 | Language | Extension | Status |
