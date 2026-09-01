@@ -18,7 +18,7 @@ import {
   SearchResult,
 } from '../types';
 import { safeJsonParse } from '../utils';
-import { kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-utils';
+import { kindBonus, nameMatchBonus, scorePathRelevance, type NameCorpusStats } from '../search/query-utils';
 import { parseQuery, boundedEditDistance } from '../search/query-parser';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { splitIdentifierSegments } from '../search/identifier-segments';
@@ -70,7 +70,10 @@ const SQLITE_PARAM_CHUNK_SIZE = 500;
  * peripheral top-10 slots cleared), so a deeper discount buys little and costs
  * the invariant. Pinned by a test.
  */
-export const DEPRIORITIZED_NAME_BONUS_SCALE = 0.75;
+// Re-exported from the scorer, which now owns it: the constant composes with
+// the corpus-frequency discount and only that module can hold their shared
+// bound (#1462). Kept exported here for the existing importers.
+export { DEPRIORITIZED_NAME_BONUS_SCALE } from '../search/query-utils';
 
 /**
  * Database row types (snake_case from SQLite)
@@ -364,6 +367,42 @@ export class QueryBuilder {
   /** The `deprioritize` predicate (#982), so other rankers apply the same lever. */
   getDeprioritizedPathMatcher(): ((filePath: string) => boolean) | undefined {
     return this.isDeprioritizedPath;
+  }
+
+  /**
+   * Corpus stats for the exact-name bonus discount (#982, the #746 follow-up).
+   *
+   * A fresh object per search, so name counts are memoized for the duration of
+   * one scoring pass but never held across an index write.
+   *
+   * The per-name lookup MUST be written as `lower(name) = ?` so it hits
+   * `idx_nodes_lower_name`. The equivalent `name = ? COLLATE NOCASE` matches no
+   * index — neither `idx_nodes_name` (BINARY collation) nor the expression index
+   * — and degrades to a full scan per distinct candidate name: measured 3.2ms on
+   * gin (2.5k nodes), 14ms on excalidraw (11k), 79ms on django (62k) per search,
+   * growing with the corpus. Seeking the index is flat at ~0.08ms on all four.
+   */
+  private nameCorpusStats(): NameCorpusStats {
+    const total = (this.db.prepare('SELECT COUNT(*) AS n FROM nodes').get() as { n: number }).n;
+    const counts = new Map<string, number>();
+    // Both sides lowered in SQL: lowering the parameter in JS and comparing it
+    // against SQLite's `lower(name)` is the ASCII-vs-Unicode asymmetry #1542
+    // documents, so the raw name goes in and SQLite lowers both sides (#1462).
+    // `lower(?)` is a constant expression, so this still seeks the index below
+    // rather than scanning.
+    const stmt = this.db.prepare('SELECT COUNT(*) AS n FROM nodes WHERE lower(name) = lower(?)');
+    return {
+      total,
+      countForName: (name: string): number => {
+        const key = name.toLowerCase();
+        const cached = counts.get(key);
+        if (cached !== undefined) return cached;
+        // The raw name goes to SQLite; `key` is only the memo key.
+        const n = (stmt.get(name) as { n: number } | undefined)?.n ?? 0;
+        counts.set(key, n);
+        return n;
+      },
+    };
   }
 
   // ===========================================================================
@@ -1350,6 +1389,7 @@ export class QueryBuilder {
     // Apply multi-signal scoring
     if (results.length > 0 && (text || query)) {
       const scoringQuery = text || query;
+      const corpus = this.nameCorpusStats();
       results = results.map(r => {
         // A path the project de-prioritized is saying its symbol NAMES are not
         // the answer, so the exact-name bonus has to be damped too. The -15 path
@@ -1358,14 +1398,18 @@ export class QueryBuilder {
         // product symbol — -15 lands at 59.8, still ahead). Damped, not zeroed,
         // so the tree stays findable when it genuinely is what you asked for.
         // Evaluated once and reused: the predicate stats the config file.
+        //
+        // The damping is passed in rather than applied to the return value: it
+        // composes with the corpus-frequency discount, and only nameMatchBonus
+        // can floor the COMBINED multiplier so a name that is both common and
+        // de-prioritized still outranks a mere prefix match (#1462).
         const deprioritized = this.isDeprioritizedPath?.(r.node.filePath) ?? false;
-        const nameBonus = nameMatchBonus(r.node.name, scoringQuery);
         return {
           ...r,
           score: r.score
             + kindBonus(r.node.kind)
             + scorePathRelevance(r.node.filePath, scoringQuery, this.projectNameTokens, deprioritized)
-            + (deprioritized ? Math.round(nameBonus * DEPRIORITIZED_NAME_BONUS_SCALE) : nameBonus),
+            + nameMatchBonus(r.node.name, scoringQuery, corpus, deprioritized),
         };
       });
       results.sort((a, b) => b.score - a.score);
