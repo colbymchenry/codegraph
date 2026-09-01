@@ -183,7 +183,9 @@ These describe `codegraph ui` and its screens. They were taken out of `## [Unrel
 
 - **Entry points and the Symbol view no longer go blank.** The Symbol view of every Vue, Svelte and Astro component stayed on "Loading…", because its member list held the component's script symbols twice, along with the component and its file. Entry points went blank on apps with inline route handlers like `app.get('/x', async (c) => { … })`, which came back once per call in the handler, each call listed as if it were the handler. Each member is now listed once, and each route is one row: the handler it is bound to, or "inline handler" when the handler is written at the registration.
 
-- **Saved trails stay inside the indexed project even when a parent directory is a symlink.** The viewer now refuses a trail path whose nearest existing directory resolves outside the project, and creates its atomic temporary file exclusively so a pre-planted link cannot capture the write.
+- **Saved trails stay inside the indexed project even when a directory or trail file is a symlink.** The viewer refuses paths whose nearest existing directory resolves outside the project, opens trail files without following links, and creates its atomic temporary file exclusively so a pre-planted link cannot capture a read or write.
+
+- **Saved-trail authors are now resolved per project.** An embedded host serving several projects in one process no longer reuses the first repository's Git user name for every later trail.
 
 - **Entry points' most-depended-on list shows your code, not a vendored bundle's.** A minified library or bundled docs script (`n`, `t`, `Buffer` with thousands of callers, all from inside the bundle) could top the list. Symbols in generated files are now left out of it, like test files.
 
