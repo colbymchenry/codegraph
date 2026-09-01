@@ -1301,6 +1301,24 @@ export function getStaticTools(): ToolDefinition[] {
  * untouched, and `CODEGRAPH_MCP_TOOLS=explore,node,...` re-enables any of them.
  */
 const DEFAULT_MCP_TOOLS = new Set(['explore']);
+const REQUIRE_PROJECT_PATH_ENV = 'CODEGRAPH_MCP_REQUIRE_PROJECT_PATH';
+
+function requiresProjectPath(): boolean {
+  return /^(1|true|yes|on)$/i.test(process.env[REQUIRE_PROJECT_PATH_ENV]?.trim() ?? '');
+}
+
+function withEnvRequiredProjectPath(tool: ToolDefinition): ToolDefinition {
+  if (!requiresProjectPath()) return tool;
+  const required = new Set(tool.inputSchema.required ?? []);
+  required.add('projectPath');
+  return {
+    ...tool,
+    inputSchema: {
+      ...tool.inputSchema,
+      required: [...required],
+    },
+  };
+}
 
 /**
  * Tool handler that executes tools against a CodeGraph instance
@@ -1533,15 +1551,15 @@ export class ToolHandler {
 
       return visible.map(tool => {
         if (tool.name === 'codegraph_explore') {
-          return {
+          return withEnvRequiredProjectPath({
             ...tool,
             description: `${tool.description} Budget: make at most ${budget} calls for this project (${stats.fileCount.toLocaleString()} files indexed).`,
-          };
+          });
         }
-        return tool;
+        return withEnvRequiredProjectPath(tool);
       });
     } catch {
-      return visible;
+      return visible.map(withEnvRequiredProjectPath);
     }
   }
 
@@ -1969,6 +1987,12 @@ export class ToolHandler {
       // surface rejects ablated tools defensively even if a client cached them.
       if (!this.isToolAllowed(toolName)) {
         return this.errorResult(`Tool ${toolName} is disabled via CODEGRAPH_MCP_TOOLS`);
+      }
+      if (requiresProjectPath() && (args.projectPath === undefined || args.projectPath === null)) {
+        return this.errorResult(
+          `projectPath is required because ${REQUIRE_PROJECT_PATH_ENV}=true. ` +
+          'Pass an absolute project path, or unset the env var to allow the session default project.'
+        );
       }
       // Cross-cutting input validation. All tools accept an optional
       // `projectPath` and most accept either `query`, `task`, or

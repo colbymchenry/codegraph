@@ -5,14 +5,19 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { ToolHandler } from '../src/mcp/tools';
+import type CodeGraph from '../src';
 
 const ENV = 'CODEGRAPH_MCP_TOOLS';
+const REQUIRE_PROJECT_PATH_ENV = 'CODEGRAPH_MCP_REQUIRE_PROJECT_PATH';
 
 describe('CODEGRAPH_MCP_TOOLS allowlist', () => {
   const original = process.env[ENV];
+  const originalRequireProjectPath = process.env[REQUIRE_PROJECT_PATH_ENV];
   afterEach(() => {
     if (original === undefined) delete process.env[ENV];
     else process.env[ENV] = original;
+    if (originalRequireProjectPath === undefined) delete process.env[REQUIRE_PROJECT_PATH_ENV];
+    else process.env[REQUIRE_PROJECT_PATH_ENV] = originalRequireProjectPath;
   });
 
   const listed = () => new ToolHandler(null).getTools().map(t => t.name).sort();
@@ -59,5 +64,48 @@ describe('CODEGRAPH_MCP_TOOLS allowlist', () => {
     // "disabled" message must NOT appear, proving the guard passed it through.
     const res = await new ToolHandler(null).execute('codegraph_search', { query: 'x' });
     expect(res.content[0].text).not.toMatch(/disabled via CODEGRAPH_MCP_TOOLS/);
+  });
+});
+
+describe('CODEGRAPH_MCP_REQUIRE_PROJECT_PATH', () => {
+  const original = process.env[REQUIRE_PROJECT_PATH_ENV];
+  const cgStub = {
+    getStats: () => ({ fileCount: 10 }),
+  } as unknown as CodeGraph;
+
+  afterEach(() => {
+    if (original === undefined) delete process.env[REQUIRE_PROJECT_PATH_ENV];
+    else process.env[REQUIRE_PROJECT_PATH_ENV] = original;
+    delete process.env[ENV];
+  });
+
+  it('marks projectPath required in exposed tool schemas', () => {
+    process.env[REQUIRE_PROJECT_PATH_ENV] = 'true';
+    const explore = new ToolHandler(null).getTools().find((tool) => tool.name === 'codegraph_explore');
+    expect(explore?.inputSchema.required).toContain('query');
+    expect(explore?.inputSchema.required).toContain('projectPath');
+  });
+
+  it('marks projectPath required even when a default project exists', () => {
+    process.env[REQUIRE_PROJECT_PATH_ENV] = 'true';
+    const explore = new ToolHandler(cgStub).getTools().find((tool) => tool.name === 'codegraph_explore');
+    expect(explore?.inputSchema.required).toContain('query');
+    expect(explore?.inputSchema.required).toContain('projectPath');
+  });
+
+  it('rejects tool calls that omit projectPath when required', async () => {
+    process.env[REQUIRE_PROJECT_PATH_ENV] = 'true';
+    const res = await new ToolHandler(null).execute('codegraph_explore', { query: 'alpha' });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toMatch(/projectPath is required/);
+  });
+
+  it('keeps normal validation after projectPath is provided', async () => {
+    process.env[REQUIRE_PROJECT_PATH_ENV] = 'true';
+    const res = await new ToolHandler(null).execute('codegraph_explore', {
+      query: 'alpha',
+      projectPath: '/tmp/project',
+    });
+    expect(res.content[0].text).not.toMatch(/projectPath is required/);
   });
 });
