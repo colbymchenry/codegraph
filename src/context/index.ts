@@ -412,6 +412,12 @@ export class ContextBuilder {
         ? `renders <${String(m.via || 'child')}>`
         : m.synthesizedBy === 'vue-handler'
         ? `Vue @${String(m.event || 'event')} handler`
+        : m.synthesizedBy === 'http-client'
+        ? `HTTP ${String(m.method || 'GET')} ${String(m.href || '')} — the client's call onto its own route${at}`
+        : m.synthesizedBy === 'queue-job'
+        ? `queue job ${m.event ? `\`${String(m.event)}\`` : ''}${m.queue ? ` on \`${String(m.queue)}\`` : ''}${at}`
+        : m.synthesizedBy === 'event-bus' && m.channel === 'socket'
+        ? `socket message ${m.event ? `\`${String(m.event)}\`` : ''}${m.tier === 'client→server' ? ' → server' : m.tier === 'server→client' ? ' → client' : ''}${at}`
         : `event ${m.event ? `\`${String(m.event)}\`` : ''}${at}`;
       synthByPair.set(`${e.source}>${e.target}`, label);
     }
@@ -1208,7 +1214,7 @@ export class ContextBuilder {
 
     // Edge recovery: BFS with many entry points leaves most nodes disconnected.
     // Discover edges between already-selected nodes to recover connectivity.
-    const recoveryKinds: EdgeKind[] = ['calls', 'extends', 'implements', 'references', 'overrides'];
+    const recoveryKinds: EdgeKind[] = ['calls', 'extends', 'implements', 'references', 'overrides', 'navigates'];
     const recoveredEdges = this.queries.findEdgesBetweenNodes(
       [...finalNodes.keys()],
       recoveryKinds,

@@ -704,11 +704,18 @@ impl<'t> Walker<'t> {
             self.extract_variable_type_annotation(node, owner);
         }
 
-        // Nested NAMED functions become their own nodes.
+        // Nested NAMED functions become their own nodes — and so does the
+        // function a React handler hook binds a name to (`const onPress =
+        // useCallback(() => {…}, [])`). Mirrors TreeSitterExtractor's
+        // reactHookBoundName.
         if is_function_type(kind) {
             let name = self.extract_name(node);
             if name != "<anonymous>" {
                 self.extract_function(node, None);
+                return;
+            }
+            if let Some(bound) = self.react_hook_bound_name(node) {
+                self.extract_function(node, Some(bound));
                 return;
             }
         }
@@ -734,6 +741,44 @@ impl<'t> Walker<'t> {
     }
 
     // --- name / signature / modifier helpers ------------------------------------
+
+    /// The declarator name a React handler hook binds an anonymous function
+    /// to — `const NAME = useCallback(<node>, [...])` (also `React.useCallback`,
+    /// `useEffectEvent`, `useEvent`) — or None for any other shape. The node
+    /// must be the call's FIRST argument and the call's value must be bound
+    /// directly by a `variable_declarator`.
+    fn react_hook_bound_name(&self, node: Node<'t>) -> Option<String> {
+        if !matches!(node.kind(), "arrow_function" | "function_expression") {
+            return None;
+        }
+        let args = node.parent()?;
+        if args.kind() != "arguments" {
+            return None;
+        }
+        let first = args.named_child(0)?;
+        if first.start_byte() != node.start_byte() || first.end_byte() != node.end_byte() {
+            return None;
+        }
+        let call = args.parent()?;
+        if call.kind() != "call_expression" {
+            return None;
+        }
+        let callee = call.child_by_field_name("function")?;
+        let callee_text = self.text(callee);
+        let hook = callee_text.strip_prefix("React.").unwrap_or(callee_text);
+        if !matches!(hook, "useCallback" | "useEffectEvent" | "useEvent") {
+            return None;
+        }
+        let declarator = call.parent()?;
+        if declarator.kind() != "variable_declarator" {
+            return None;
+        }
+        let name_node = declarator.child_by_field_name("name")?;
+        if name_node.kind() != "identifier" {
+            return None;
+        }
+        Some(self.text(name_node).to_string())
+    }
 
     /// extractName / extractNameRaw for the TS/JS configs.
     fn extract_name(&self, node: Node) -> String {
