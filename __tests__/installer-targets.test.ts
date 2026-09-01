@@ -1320,6 +1320,7 @@ describe('Installer targets — registry', () => {
     expect(getTarget('copilot-vscode')?.id).toBe('copilot-vscode');
     expect(getTarget('copilot-cli')?.id).toBe('copilot-cli');
     expect(getTarget('copilot-jetbrains')?.id).toBe('copilot-jetbrains');
+    expect(getTarget('grok')?.id).toBe('grok');
     expect(getTarget('not-a-real-target')).toBeUndefined();
   });
 
@@ -1823,6 +1824,214 @@ function listAllFiles(dir: string): string[] {
 // SAME directory (which is exactly how this bug stayed invisible), so these
 // tests deliberately split them.
 // ---------------------------------------------------------------------------
+describe('Installer targets — Grok Build', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('home');
+    tmpCwd = mkTmpDir('cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  it('grok: install writes [mcp_servers.codegraph] to ~/.grok/config.toml AND the AGENTS.md codegraph block', () => {
+    const grok = getTarget('grok')!;
+    const first = grok.install('global', { autoAllow: false });
+    const tomlPath = path.join(tmpHome, '.grok', 'config.toml');
+    const agentsMd = path.join(tmpHome, '.grok', 'AGENTS.md');
+    expect(first.files.some((f) => f.path.endsWith('config.toml'))).toBe(true);
+    expect(fs.existsSync(tomlPath)).toBe(true);
+    const toml = fs.readFileSync(tomlPath, 'utf-8');
+    expect(toml).toContain('[mcp_servers.codegraph]');
+    expect(toml).toContain('command = "codegraph"');
+    expect(toml).toContain('args = ["serve", "--mcp"]');
+    // The short instructions block IS written (subagents / non-MCP
+    // harnesses read AGENTS.md but never the MCP initialize instructions).
+    expect(fs.existsSync(agentsMd)).toBe(true);
+    const body = fs.readFileSync(agentsMd, 'utf-8');
+    expect(body).toContain('## CodeGraph');
+    expect(body).toContain('codegraph explore');
+    // Re-install is fully unchanged (byte-equal block → idempotent).
+    const second = grok.install('global', { autoAllow: false });
+    for (const f of second.files) expect(f.action).toBe('unchanged');
+  });
+
+  it('grok: install preserves a pre-existing sibling MCP server in config.toml', () => {
+    const grok = getTarget('grok')!;
+    const dir = path.join(tmpHome, '.grok');
+    fs.mkdirSync(dir, { recursive: true });
+    const tomlPath = path.join(dir, 'config.toml');
+    fs.writeFileSync(tomlPath, [
+      '[mcp_servers.github]',
+      'command = "npx"',
+      'args = ["-y", "@modelcontextprotocol/server-github"]',
+      '',
+    ].join('\n'));
+
+    grok.install('global', { autoAllow: false });
+
+    const after = fs.readFileSync(tomlPath, 'utf-8');
+    expect(after).toContain('[mcp_servers.github]');
+    expect(after).toContain('server-github');
+    expect(after).toContain('[mcp_servers.codegraph]');
+  });
+
+  it('grok: install preserves other top-level TOML sections (cli, models, features)', () => {
+    const grok = getTarget('grok')!;
+    const dir = path.join(tmpHome, '.grok');
+    fs.mkdirSync(dir, { recursive: true });
+    const tomlPath = path.join(dir, 'config.toml');
+    fs.writeFileSync(tomlPath, [
+      '[cli]',
+      'auto_update = true',
+      '',
+      '[models]',
+      'default = "grok-build"',
+      '',
+    ].join('\n'));
+
+    grok.install('global', { autoAllow: false });
+
+    const after = fs.readFileSync(tomlPath, 'utf-8');
+    expect(after).toContain('auto_update = true');
+    expect(after).toContain('default = "grok-build"');
+    expect(after).toContain('[mcp_servers.codegraph]');
+  });
+
+  it('grok: install replaces a legacy AGENTS.md codegraph block with the current one, keeping user content', () => {
+    const grok = getTarget('grok')!;
+    const dir = path.join(tmpHome, '.grok');
+    fs.mkdirSync(dir, { recursive: true });
+    const agentsMd = path.join(dir, 'AGENTS.md');
+    fs.writeFileSync(agentsMd, `# My grok notes\n\nBe terse.\n\n${LEGACY_BLOCK}\n`);
+
+    const result = grok.install('global', { autoAllow: false });
+
+    const body = fs.readFileSync(agentsMd, 'utf-8');
+    expect(body).toContain('# My grok notes');
+    expect(body).toContain('Be terse.');
+    // Self-heal: the stale pre-#529 body is gone, the current block is in.
+    expect(body).not.toContain('Prefer `codegraph_search`');
+    expect(body).toContain('codegraph explore');
+    const mdEntry = result.files.find((f) => f.path.endsWith('AGENTS.md'));
+    expect(mdEntry?.action).toBe('updated');
+  });
+
+  it('grok: uninstall strips [mcp_servers.codegraph] but leaves siblings intact', () => {
+    const grok = getTarget('grok')!;
+    const dir = path.join(tmpHome, '.grok');
+    fs.mkdirSync(dir, { recursive: true });
+    const tomlPath = path.join(dir, 'config.toml');
+    // Pre-seed with a sibling MCP server.
+    fs.writeFileSync(tomlPath, [
+      '[mcp_servers.github]',
+      'command = "npx"',
+      'args = ["-y", "@modelcontextprotocol/server-github"]',
+      '',
+      '[mcp_servers.codegraph]',
+      'command = "codegraph"',
+      'args = ["serve", "--mcp"]',
+      '',
+    ].join('\n'));
+
+    grok.uninstall('global');
+
+    const after = fs.readFileSync(tomlPath, 'utf-8');
+    expect(after).not.toContain('[mcp_servers.codegraph]');
+    expect(after).toContain('[mcp_servers.github]');
+  });
+
+  it('grok: local install writes ./.grok/config.toml (project scope)', () => {
+    const grok = getTarget('grok')!;
+    const result = grok.install('local', { autoAllow: false });
+    const tomlPath = path.join(tmpCwd, '.grok', 'config.toml');
+    // macOS symlinks /var → /private/var; fs.realpathSync normalizes both.
+    expect(result.files.some((f) => fs.realpathSync(f.path) === fs.realpathSync(tomlPath))).toBe(true);
+    expect(fs.existsSync(tomlPath)).toBe(true);
+    const toml = fs.readFileSync(tomlPath, 'utf-8');
+    expect(toml).toContain('[mcp_servers.codegraph]');
+    // Local install does NOT write AGENTS.md (that's global only).
+    expect(result.files.some((f) => f.path.endsWith('AGENTS.md'))).toBe(false);
+  });
+
+  it('grok: local uninstall removes config.toml when it becomes empty', () => {
+    const grok = getTarget('grok')!;
+    grok.install('local', { autoAllow: false });
+    const tomlPath = path.join(tmpCwd, '.grok', 'config.toml');
+    expect(fs.existsSync(tomlPath)).toBe(true);
+
+    grok.uninstall('local');
+
+    // The only entry was codegraph, so the file is removed entirely.
+    expect(fs.existsSync(tomlPath)).toBe(false);
+    // The .grok/ dir should also be cleaned up.
+    expect(fs.existsSync(path.join(tmpCwd, '.grok'))).toBe(false);
+  });
+
+  it('grok: local uninstall keeps config.toml when sibling servers exist', () => {
+    const grok = getTarget('grok')!;
+    grok.install('local', { autoAllow: false });
+    const tomlPath = path.join(tmpCwd, '.grok', 'config.toml');
+    // Add a sibling server.
+    const content = fs.readFileSync(tomlPath, 'utf-8');
+    const withSibling = content.replace(
+      /\n*$/,
+      '\n\n[mcp_servers.github]\ncommand = "npx"\nargs = ["-y", "@modelcontextprotocol/server-github"]\n',
+    );
+    fs.writeFileSync(tomlPath, withSibling);
+
+    grok.uninstall('local');
+
+    expect(fs.existsSync(tomlPath)).toBe(true);
+    const after = fs.readFileSync(tomlPath, 'utf-8');
+    expect(after).not.toContain('[mcp_servers.codegraph]');
+    expect(after).toContain('[mcp_servers.github]');
+  });
+
+  it('grok: detect before install shows alreadyConfigured=false', () => {
+    const grok = getTarget('grok')!;
+    expect(grok.detect('global').alreadyConfigured).toBe(false);
+    expect(grok.detect('local').alreadyConfigured).toBe(false);
+  });
+
+  it('grok: detect after install shows alreadyConfigured=true', () => {
+    const grok = getTarget('grok')!;
+    grok.install('global', { autoAllow: false });
+    expect(grok.detect('global').alreadyConfigured).toBe(true);
+    // Local was not installed, so it should still be false.
+    expect(grok.detect('local').alreadyConfigured).toBe(false);
+  });
+
+  it('grok: GROK_HOME env var overrides default config dir', () => {
+    const grok = getTarget('grok')!;
+    const customHome = mkTmpDir('grok-home');
+    process.env.GROK_HOME = customHome;
+    try {
+      grok.install('global', { autoAllow: false });
+      const tomlPath = path.join(customHome, 'config.toml');
+      expect(fs.existsSync(tomlPath)).toBe(true);
+      const toml = fs.readFileSync(tomlPath, 'utf-8');
+      expect(toml).toContain('[mcp_servers.codegraph]');
+      // Default location should NOT have been written.
+      expect(fs.existsSync(path.join(tmpHome, '.grok', 'config.toml'))).toBe(false);
+    } finally {
+      delete process.env.GROK_HOME;
+      fs.rmSync(customHome, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('Installer targets — opencode XDG config path (#535)', () => {
   let tmpHome: string;
   let tmpCwd: string;
