@@ -133,6 +133,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- `codegraph index` now says so when a project is written in a language it doesn't support, instead of finishing quietly. A repository of, say, Move or Perl sources used to look exactly like an empty one — "No files found to index", a successful exit, and an index recorded as complete — so there was nothing to distinguish "there is no code here" from "there is code here I can't read", and an agent trusting the graph would conclude the code didn't exist. It now reports how many files it found, which extensions they carried, and that CodeGraph is inactive for that workspace. The count comes from the scan already being performed, so indexing does no extra work. Thanks @netbrah. (#1502)
+
 #### Screens, links and navigation
 
 - **Where the app goes after login is a fork, not two always-es.** A navigation whose destination comes back from a helper — `router.replace(await resolvePostLoginRoute())` over `return (await hasSeenWelcome(…)) ? '/home/' : '/welcome/'` — drew both screens with no condition, reading as if the welcome screen always shows. The two arms share a line, and only a column can tell them apart; each synthesized edge now carries its literal's own position, so the guard reader says which arm it is: `WHEN await hasSeenWelcome(…)` → home, and its negation → welcome. And the scan starts at the helper's body, so a literal-union return type — `Promise<'/welcome/' | '/home/'>`, whose routes are string literals too, written first — no longer stands in for the navigation itself. Re-index after upgrading to pick the positions up.
