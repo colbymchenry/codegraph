@@ -1,6 +1,8 @@
 # Plugin API — surfaces, config, trust, compat
 
-**Status:** design, awaiting review (CG-63). Nothing here is implemented yet.
+**Status:** design; independent review pass applied 2026-09-02 — five findings
+amended in place (§4.3 rules 4 & 7, §6.5, §7.3 graph equivalence, Windows notes).
+Awaiting maintainer sign-off. Nothing here is implemented yet.
 **Implements:** GH [#1376](https://github.com/colbymchenry/codegraph/issues/1376) · epic CG-62.
 **Gates:** CG-64 (internal registry), CG-65 (config), CG-66 (types package), CG-67
 (loader), CG-68 (end-to-end), CG-69 (example + harness), CG-70 (docs), CG-71
@@ -232,18 +234,40 @@ Promoted from in-tree convention to public contract:
    `metadata.synthesizedBy = '<plugin id>'` and, where the wiring site is known,
    `metadata.registeredAt = 'file:line'` — the same shape the built-in
    synthesizers use.
-4. **A plugin edge must say what it means.** `ContextBuilder` renders a
-   synthesized hop from a **closed** `synthesizedBy` switch
-   (`src/context/index.ts:405-421`) whose fallback is the string `event …`. An
-   unknown plugin value would therefore render as a fabricated "event" hop — the
-   exact overclaiming CLAUDE.md forbids. So the contract requires
-   `metadata.label` (a short human phrase, e.g. `"Acme route → handler"`) on any
-   plugin-synthesized edge, and CG-68 must make the renderer prefer
-   `metadata.label` and fall back to `via <plugin id>` — never to `event`.
+4. **A plugin edge must say what it means — derived in ONE place.** The label
+   of a synthesized hop is derived in **five** renderers today, across three
+   packages: `ContextBuilder`'s closed `synthesizedBy` switch
+   (`src/context/index.ts:405-421`, fallback the string `event …` — an unknown
+   plugin value renders as a fabricated "event" hop, the exact overclaiming
+   CLAUDE.md forbids), the steps fold (`src/ui-server/api/steps.ts:1605-1618`,
+   fallback `via <synthesizedBy>`), the flow endpoint
+   (`src/ui-server/api/flow.ts:315-316`, dash-stripped mechanism words), and
+   the viewer inventing its own (`ui/src/lib/symbol-model.ts:98-101`, fallback
+   `'synthesized'`) from the raw `synthesizedBy` the wire payload passes
+   through (`src/ui-server/api/wire.ts:200`). Per this repo's own rule — a
+   derivation more than one surface renders lives in `src/graph/`, because two
+   derivations eventually disagree — CG-68 must not patch each switch. It adds
+   one helper in `src/graph/` (`synthEdgeLabel(edge)`): prefer
+   `metadata.label` — required on every plugin-synthesized edge, a short human
+   phrase like `"Acme route → handler"` — else the built-in mechanism words,
+   else `via <plugin id>`, **never** `event`. Every engine-side renderer calls
+   it, and the wire payload carries the resolved label so the viewer renders it
+   verbatim instead of coining words of its own.
 5. **Purity.** No wall clock, no randomness, no network, no dependence on file
    visit order or on state carried between files. See §7.3.
 6. **No direct DB writes.** Contributions return data; the engine persists it.
    `ResolutionContext` is a read interface and stays one.
+7. **Contributions are validated before persistence.** The types package
+   constrains TypeScript authors at compile time; the engine trusts nothing at
+   run time. Every contributed node and edge is checked at the persistence
+   boundary: `kind` must be an existing `NodeKind`/`EdgeKind` (the unions stay
+   closed — a plugin invents no kinds in v1), `filePath` must resolve inside
+   the project root, spans must be sane, `id`/`qualifiedName` non-empty with
+   the id namespaced per rule 2. An invalid item is dropped with a warning and
+   counted in the plugin's diagnostics (§9.2) — the config parser's
+   warn-and-skip posture, applied to data. This is the failure class §9.1
+   cannot see: a plugin that throws gets disabled, but a plugin that returns
+   plausible garbage would otherwise corrupt the graph silently.
 
 ### 4.4 One resolved plugin set per run
 
@@ -391,7 +415,10 @@ noted in [Open questions](#open-questions) as the natural v2 lever.
    resolution paths (§7.1) — i.e. something the user installed. A path specifier
    must stay inside the project root; absolute paths and `../` escapes are rejected
    at parse time, consistent with the engine's existing path-refusal posture
-   (`validatePathWithinRoot`).
+   (`validatePathWithinRoot`). The check normalizes separators **before**
+   judging: `..\` must be caught on Windows exactly as `../` is on POSIX, and
+   drive-absolute (`C:\…`) is rejected with the absolute paths — enforced by
+   Windows-gated tests (`it.runIf(process.platform === 'win32')`), not assumed.
 
 ### 6.3 The hostile-repo case, and the trust stamp
 
@@ -420,9 +447,13 @@ Proposal — **workspace-trust, machine-local**:
 Note the split: a **bare package** specifier can only load if the user already ran
 `npm install`, which already executes that package's install scripts — the marginal
 risk is small. A **path specifier** ships inside the repo, so it is the case the
-prompt exists for. If the prompt is judged too much UX for v1, the fallback is
-"path specifiers require the stamp, bare specifiers do not" — listed in
-[Open questions](#open-questions).
+prompt exists for. A second argument for that split: the stamp hashes resolved
+ids **and versions**, so stamping bare packages means every routine
+`npm update` invalidates it — and a non-interactive daemon then silently drops
+all plugins until someone re-trusts. That is recurring churn with no security
+payoff for code `npm install` already executed. If the prompt is judged too
+much UX for v1, the fallback is "path specifiers require the stamp, bare
+specifiers do not" — listed in [Open questions](#open-questions).
 
 ### 6.4 Interaction with the ui-server loopback boundary
 
@@ -433,6 +464,16 @@ code, and no plugin hook runs per HTTP request. The boundary in
 v1 grants plugins **no network capability of any kind**: no listener, no route, no
 outbound helper in `PluginContext`. A plugin that dials out is doing it with raw
 Node APIs, which is exactly what §6.1 says the trust model is for.
+
+### 6.5 Plugin identity never enters telemetry
+
+Telemetry today reports language names on an `index` event (TELEMETRY.md). The
+audience for this feature is teams with **proprietary** frameworks — the plugin's
+name can itself be confidential. So: a plugin's id, package name, options, error
+text, and timings are never transmitted. At most an aggregate count ("2 plugins
+loaded"), and only if a real product question ever needs it. Pinned here so a
+future "which plugins are popular" dashboard idea meets a written rule instead of
+a review comment.
 
 ---
 
@@ -479,6 +520,11 @@ put a real `package.json` in `tools/codegraph/` and list
 `./tools/codegraph/node_modules/@acme/plugin` — no new mechanism needed. (Open
 question 2 if the maintainer wants a first-class install dir anyway.)
 
+Everything in this section is path arithmetic and therefore Windows-sensitive:
+resolution anchors, specifier confinement (§6.2), and the trust-stamp path all
+get Windows-gated tests, and CG-67/CG-71 include a real run on the Parallels
+Windows VM per CLAUDE.md's cross-platform rule — validated, not guessed.
+
 ### 7.2 Registry order and duplicates
 
 - **Built-ins first, in their current array order; then plugins, in config order.**
@@ -522,6 +568,17 @@ What the plugin must guarantee: no clock, no randomness, no network, no
 cross-file mutable state, no dependence on visit order. The plugin test harness
 (CG-69) enforces it the only way that is honest — index twice and diff — and
 CG-71's validation gate includes a double-index diff on a real repo.
+
+**Graph equivalence for the CG-71 port.** §4.3 rule 2 makes a byte-identical
+diff impossible *on purpose*: the ported plugin's node ids carry the
+`plugin:<id>:` prefix; the in-tree resolver's do not. CG-71 therefore compares
+graphs **modulo id scheme**: node sets keyed on `(kind, qualifiedName,
+filePath, span)` — `qualifiedName` carries no plugin prefix and is what saved
+trails and the read surfaces key on — and edge sets keyed on the endpoints'
+qualified names plus edge `kind`. Counts, provenance metadata, and labels must
+match exactly; only the id text may differ. (Double-index determinism, same
+plugin set, stays byte-for-byte — this relaxation applies only to the
+in-tree-vs-ported comparison.)
 
 ---
 
@@ -608,6 +665,8 @@ problem: it belongs in `status` and in the index summary, never in a tool respon
   exports `CodeGraphPlugin`, `PluginContext`, `PluginContributions`,
   `FrameworkResolver`, `SynthPass`, `ResolutionContext`, and the graph types
   (`Node`, `Edge`, `UnresolvedRef`, `NodeKind`, `EdgeKind`, `Language`).
+  (`SynthPass` is the public name of the in-tree `SynthPassDef`,
+  `callback-synthesizer.ts:3528` — the package renames it; core keeps its name.)
 - **`apiVersion` is an integer major.** The engine declares which majors it
   accepts. v1 accepts `1` only. When a breaking change ships as major 2, the engine
   accepts `{1, 2}` for **at least two engine minor releases**, warning in `status`
@@ -714,11 +773,11 @@ richer per-language matrix.
 | **CG-64** internal registry | §2 (the three contexts), §7.2 (order, duplicate rejection, `replaces`, namespaced pass names, `SYNTH_PROGRESS_STEPS` becomes per-run) |
 | **CG-65** config | §5 (file choice + schema + `loadPluginEntries` + warn-and-skip posture + `indexed_with_plugins`) |
 | **CG-66** types package | §4 (module shape, manifest, contribution guarantees), §9.3 (what is and is not in the contract, publishing model) |
-| **CG-67** loader + lifecycle | §4.4 (resolved set), §6 (trust), §7.1 (resolution, ESM/CJS, native ban), §9.1–9.2 (failure policy, diagnostics) |
-| **CG-68** end-to-end | §3 (write-path only), §4.3.4 (renderer must honour `metadata.label`, never fall back to `event`), §5.4 |
+| **CG-67** loader + lifecycle | §4.4 (resolved set), §6 (trust), §7.1 (resolution, ESM/CJS, native ban, Windows path rules — VM-validated), §9.1–9.2 (failure policy, diagnostics) |
+| **CG-68** end-to-end | §3 (write-path only), §4.3 rule 4 (ONE `synthEdgeLabel` helper in `src/graph/`, label carried through the wire payload), §4.3 rule 7 (contribution validation), §5.4 |
 | **CG-69** example + harness | §7.3 (double-index determinism check), §4.1 (`ctx.log`, no stdout) |
 | **CG-70** docs | §6.1 (say plainly that plugins are unsandboxed), §5.4 (no hot reload), §8 (cooperative yield), §10 (a new *language* is still a core contribution) |
-| **CG-71** validation | §7.2 (`replaces` makes the built-in port possible), §8.5 (the perf gate) |
+| **CG-71** validation | §7.2 (`replaces` makes the built-in port possible), §7.3 (graph equivalence modulo id scheme), §8 item 5 (the perf gate), Windows VM run |
 | **CG-72** language spike | §10 |
 
 ## References
