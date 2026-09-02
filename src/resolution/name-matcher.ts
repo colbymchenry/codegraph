@@ -2480,6 +2480,22 @@ export function dumpNameMatcherProfile(label: string): void {
   }
 }
 
+/**
+ * The Elixir module a node belongs to, or `null` when it can't be determined.
+ * Function/method nodes carry a `Full.Module::fun` qualifiedName, so the module
+ * is everything before the last `::`. A `namespace` node IS a module, so its
+ * whole qualifiedName is the module name (calls in module-attribute values
+ * report the namespace node as their from-node — c4c0eec). A top-level function
+ * with no enclosing module (no `::`) yields `null`, so its bare calls stay
+ * unresolved rather than guess a module.
+ */
+function elixirModuleOf(node: Node | null | undefined): string | null {
+  if (!node) return null;
+  if (node.kind === 'namespace') return node.qualifiedName || null;
+  const sep = node.qualifiedName.lastIndexOf('::');
+  return sep > 0 ? node.qualifiedName.slice(0, sep) : null;
+}
+
 export function matchReference(
   ref: UnresolvedRef,
   context: ResolutionContext
@@ -2531,13 +2547,65 @@ export function matchReference(
   // ref an `.app`/`.app.src` resource file emits — its `{mod, …}` callback and
   // `{applications, …}` dependency names can only mean modules, and on emqx
   // the `ssl` OTP app otherwise resolved to a test helper FUNCTION named ssl.
+  // Elixir bare (unqualified, lowercase-initial) call/reference names — local
+  // calls, `__MODULE__.fun`, `&local/arity` captures. In Elixir a bare call can
+  // only legitimately target the same module — which lives in the same file —
+  // or an `import`ed function (deliberately unexpanded in v1: a wrong edge is
+  // worse than none). Letting these fall through to bare-name matching grabbed
+  // arbitrary same-named functions across the repo: on a Phoenix app, every
+  // Mix `config :app, …` DSL call resolved to some module's `config/0`, and
+  // every ConnTest `get(conn, path)` to an unrelated HTTP client's `get`.
+  // Resolve same-file only; no same-file match → stay unresolved. Function
+  // names in Elixir always start with a lowercase letter or underscore, so
+  // module references (`Foo`, `Foo.Bar` — capitalized) are unaffected.
   if (
-    ref.language === 'erlang' &&
-    (ref.referenceKind === 'implements' || /\.app(?:\.src)?$/i.test(ref.filePath))
+    ref.language === 'elixir' &&
+    (ref.referenceKind === 'calls' || ref.referenceKind === 'references') &&
+    !ref.referenceName.includes('::') &&
+    /^[a-z_]/.test(ref.referenceName)
+  ) {
+    // Same-file is necessary but NOT sufficient: one file can hold two+ modules,
+    // and a bare call may only legitimately target a function of the CALLER's own
+    // module. Without qualifying by module, a bare `helper()` in module B would
+    // grab module A's same-named `helper` (whichever getNodesByName returns
+    // first) — a wrong cross-module edge, worse than none. Derive the caller's
+    // module from its node (`Mod.Sub::fun` → `Mod.Sub`; a namespace caller, for
+    // calls in module-attribute values (c4c0eec), IS the module) and keep only
+    // candidates in that module. Caller module indeterminable, or no same-module
+    // candidate → stay unresolved.
+    const callerModule = elixirModuleOf(context.getNodeById?.(ref.fromNodeId));
+    if (!callerModule) return null;
+    const sameModule = context
+      .getNodesByName(ref.referenceName)
+      .filter(
+        (n) =>
+          n.language === 'elixir' &&
+          n.kind === 'function' &&
+          n.filePath === ref.filePath &&
+          elixirModuleOf(n) === callerModule
+      );
+    const chosen = sameModule[0];
+    if (!chosen) return null;
+    return {
+      original: ref,
+      targetNodeId: chosen.id,
+      confidence: 0.9,
+      resolvedBy: 'exact-match',
+    };
+  }
+
+  // Elixir `@behaviour Mod` / `use Mod` implements refs also target a MODULE
+  // (namespace). Same rationale as erlang: bare-name matching would grab any
+  // same-named symbol, and an out-of-repo behaviour (GenServer, …) must stay
+  // unresolved rather than guessed.
+  if (
+    (ref.language === 'erlang' &&
+      (ref.referenceKind === 'implements' || /\.app(?:\.src)?$/i.test(ref.filePath))) ||
+    (ref.language === 'elixir' && ref.referenceKind === 'implements')
   ) {
     const modules = context
       .getNodesByName(ref.referenceName)
-      .filter((n) => n.language === 'erlang' && n.kind === 'namespace');
+      .filter((n) => n.language === ref.language && n.kind === 'namespace');
     const chosen = preferCallSiteFile(modules, ref.filePath)[0];
     if (!chosen) return null;
     return {
