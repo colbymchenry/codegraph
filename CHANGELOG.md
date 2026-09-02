@@ -133,6 +133,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Files opted back in through `includeIgnored` are no longer dropped on older git. On git before 2.36 — which includes Ubuntu 22.04 LTS and Debian 11 — the command CodeGraph used to list tracked files refused to run at all, and the failure quietly took the whole git-aware scan with it: `includeIgnored`, submodule and embedded-repo recursion, and the `include` allowlist in `codegraph.json` all stopped applying, so files went missing from the index with no error and no warning. CodeGraph now falls back to a form those versions accept, and every one of those settings works there as it does on newer git. Thanks @newshowardz777. (#1549)
+
 #### Screens, links and navigation
 
 - **Where the app goes after login is a fork, not two always-es.** A navigation whose destination comes back from a helper — `router.replace(await resolvePostLoginRoute())` over `return (await hasSeenWelcome(…)) ? '/home/' : '/welcome/'` — drew both screens with no condition, reading as if the welcome screen always shows. The two arms share a line, and only a column can tell them apart; each synthesized edge now carries its literal's own position, so the guard reader says which arm it is: `WHEN await hasSeenWelcome(…)` → home, and its negation → welcome. And the scan starts at the helper's body, so a literal-union return type — `Promise<'/welcome/' | '/home/'>`, whose routes are string literals too, written first — no longer stands in for the navigation itself. Re-index after upgrading to pick the positions up.
