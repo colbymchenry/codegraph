@@ -1,8 +1,10 @@
 # Plugin API — surfaces, config, trust, compat
 
-**Status:** design; independent review pass applied 2026-09-02 — five findings
-amended in place (§4.3 rules 4 & 7, §6.5, §7.3 graph equivalence, Windows notes).
-Awaiting maintainer sign-off. Nothing here is implemented yet.
+**Status:** design, **signed off**. Independent review pass applied 2026-09-02 —
+five findings amended in place (§4.3 rules 4 & 7, §6.5, §7.3 graph equivalence,
+Windows notes); the maintainer resolved all six [open questions](#open-questions)
+the same day, each as recommended — the *Decision* lines there are binding.
+Nothing here is implemented yet.
 **Implements:** GH [#1376](https://github.com/colbymchenry/codegraph/issues/1376) · epic CG-62.
 **Gates:** CG-64 (internal registry), CG-65 (config), CG-66 (types package), CG-67
 (loader), CG-68 (end-to-end), CG-69 (example + harness), CG-70 (docs), CG-71
@@ -455,6 +457,11 @@ payoff for code `npm install` already executed. If the prompt is judged too
 much UX for v1, the fallback is "path specifiers require the stamp, bare
 specifiers do not" — listed in [Open questions](#open-questions).
 
+**Decision (2026-09-02): that split IS the v1 behavior.** The stamp-and-prompt
+flow above applies to **path-specifier entries only**; bare package entries load
+without a stamp. Consequently a non-interactive context (daemon, MCP serve, CI)
+skips only *unstamped path-specifier* plugins — bare packages still load there.
+
 ### 6.4 Interaction with the ui-server loopback boundary
 
 None, by construction (§3): `codegraph ui` is a read surface, it never loads plugin
@@ -733,36 +740,40 @@ richer per-language matrix.
 
 ## Open questions
 
+**All six resolved by the maintainer on 2026-09-02 — each as recommended.** Kept
+in question form for the reasoning; the *Decision* line on each item is the
+binding part.
+
 1. **Trust prompt in v1?** §6.3 proposes a machine-local trust stamp plus an
    interactive prompt, with non-interactive contexts skipping plugins. It is the
    right security posture and it is real UX work. Alternative: require the stamp
    only for **path** specifiers (code shipped inside the repo) and let bare
    installed packages load unprompted, on the grounds that installing them already
-   executed their install scripts. *Recommendation: ship the stamp, prompt only for
-   path specifiers in v1.*
+   executed their install scripts. *Decision (2026-09-02): prompt for path
+   specifiers only; bare installed packages load unprompted.*
 2. **A first-class install dir for non-Node repos?** §7.1 recommends committed path
    specifiers and no new mechanism. If the maintainer wants `codegraph plugins
    install` with its own dir, it must live somewhere committed (`tools/codegraph/`,
    not `.codegraph/`), and it is a new sub-project's worth of npm plumbing.
-   *Recommendation: no; revisit if plugin authorship actually takes off.*
+   *Decision (2026-09-02): no first-class install dir; committed path specifiers.*
 3. **Do plugin synth passes run in resolver workers in v1?** §4.4 says yes, since
    parse workers already need plugin loading for `extract()` and the fallback path
    (a pass that fails on a worker retries on the main thread) already exists.
    Main-thread-only would be simpler but serializes plugin passes on exactly the
-   repos where synthesis is expensive. *Recommendation: worker-side.*
+   repos where synthesis is expensive. *Decision (2026-09-02): worker-side.*
 4. **`replaces` on the config entry vs the manifest.** Config (§7.2) puts the
    decision with the person who owns the repo; a manifest field would let a plugin
-   author displace a built-in for every user who installs it. *Recommendation:
-   config only.*
+   author displace a built-in for every user who installs it. *Decision (2026-09-02): config only.*
 5. **Publish the types package in v1?** §9.3 recommends prepared-not-published
    until CG-71 passes, mirroring `codegraph-ui`. The counter-argument is that an
    unpublished package makes external authorship awkward (plugin authors would
-   vendor the types). *Recommendation: unpublished through CG-71, publish with the
-   release that ships CG-68.*
+   vendor the types). *Decision (2026-09-02): unpublished through CG-71;
+   publish with the release that ships plugin support.*
 6. **Per-plugin sandboxing** (§6.1) is out of scope for v1. If it ever becomes a
    requirement, the shape is a separate process with an IPC contribution protocol —
    which the file/batch-grained boundary in CG-72 would also want. Worth keeping
-   the two in the same conversation.
+   the two in the same conversation. *Decision (2026-09-02): confirmed out of
+   scope for v1; revisit alongside CG-72.*
 
 ---
 
