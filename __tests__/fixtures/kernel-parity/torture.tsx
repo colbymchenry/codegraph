@@ -212,3 +212,13 @@ import('./dynamic-module');
 new NS.Widget(makeArg());
 new Map<string, number>();
 super_weird?.();
+
+// --- const-bound functions inside a body (#1669) -----------------------------
+export function NestedHandlers({ items, onPick }: { items: string[]; onPick: (a: unknown, b: unknown) => void }) {
+  const handleClear = () => { onPick(null, null); };
+  const describe = function (item: string) { return formatLabel(item); };
+  let later = (x: string) => parseLabel(x);
+  const count = items.length;
+  const [a, b] = [() => 1, () => 2];
+  return items.map((i) => <button onClick={handleClear} onDoubleClick={() => describe(i)}>{later(i)}{count}{a()}{b()}</button>);
+}

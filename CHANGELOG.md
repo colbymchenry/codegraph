@@ -201,6 +201,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Symbols, tests and the viewer
 
+- **Functions bound with `const` inside another function are symbols now.** `const handleClear = () => {…}` inside a React component — every handler that skips `useCallback` — was invisible to `callers`, `callees` and impact, answering "Symbol not found" exactly the way a function with no callers would. It is indexed like its module-level twin, contained by the enclosing function, with its own calls. Re-index after upgrading. (#1669)
+
 - **Files under an `e2e/` directory count as tests.** Their calls no longer appear as production callers in Steps, dead-code and test badges.
 
 - **Production code under a `samples` or `examples` package path is no longer treated as test code.** A Kotlin or Java project whose package path runs through `com/google/samples/…` (Now in Android, for one) had nearly every file counted as a fixture, so the Map opened on `build-logic`, the entry points hid the app, and dead-code and test badges were wrong. Only the project layout above a `src/` folder decides now; the package path below it never does.
