@@ -2275,7 +2275,12 @@ export class ToolHandler {
       // A successful `file` narrowing makes the multi-symbol aggregation note
       // stale — suppress it.
       const note = fileFilter && !filteredOut ? '' : allMatches.note;
-      const formatted = this.formatNodeList(callers.slice(0, limit), `Callers of ${symbol}`, labels) + note + filterNote;
+      // Say when the cap cut the list (#1639, #1674): a truncated answer with
+      // no marker reads as the complete set, and an agent under-counts from it.
+      const cut = callers.length > limit
+        ? `\n\n> Showing ${limit} of ${callers.length} callers; pass \`limit\` (up to 100) to widen.`
+        : '';
+      const formatted = this.formatNodeList(callers.slice(0, limit), `Callers of ${symbol}`, labels) + cut + note + filterNote;
       return this.textResult(this.truncateOutput(formatted));
     }
 
@@ -2296,6 +2301,9 @@ export class ToolHandler {
         const location = node.startLine ? `:${node.startLine}` : '';
         const label = labels.get(node.id);
         lines.push(`- ${node.name} (${node.kind}) - ${node.filePath}${location}${label ? ` — via ${label}` : ''}`);
+      }
+      if (callers.length > limit) {
+        lines.push(`- … +${callers.length - limit} more (pass \`limit\` to widen)`);
       }
     }
     return this.textResult(this.truncateOutput(lines.join('\n') + filterNote));
@@ -2347,7 +2355,12 @@ export class ToolHandler {
       // A successful `file` narrowing makes the multi-symbol aggregation note
       // stale — suppress it.
       const note = fileFilter && !filteredOut ? '' : allMatches.note;
-      const formatted = this.formatNodeList(callees.slice(0, limit), `Callees of ${symbol}`, labels) + note + filterNote;
+      // Say when the cap cut the list (#1639, #1674): a truncated answer with
+      // no marker reads as the complete set, and an agent under-counts from it.
+      const cut = callees.length > limit
+        ? `\n\n> Showing ${limit} of ${callees.length} callees; pass \`limit\` (up to 100) to widen.`
+        : '';
+      const formatted = this.formatNodeList(callees.slice(0, limit), `Callees of ${symbol}`, labels) + cut + note + filterNote;
       return this.textResult(this.truncateOutput(formatted));
     }
 
@@ -2366,6 +2379,9 @@ export class ToolHandler {
         const location = node.startLine ? `:${node.startLine}` : '';
         const label = labels.get(node.id);
         lines.push(`- ${node.name} (${node.kind}) - ${node.filePath}${location}${label ? ` — via ${label}` : ''}`);
+      }
+      if (callees.length > limit) {
+        lines.push(`- … +${callees.length - limit} more (pass \`limit\` to widen)`);
       }
     }
     return this.textResult(this.truncateOutput(lines.join('\n') + filterNote));
