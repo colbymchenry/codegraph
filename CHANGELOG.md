@@ -201,7 +201,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Symbols, tests and the viewer
 
-- `codegraph callers`, `callees`, and `query` now clearly report when their result limit hides additional matches, including exact totals in callers/callees JSON output. (#1639)
+- `codegraph callers`, `callees`, and `query` now clearly report when their result limit hides additional matches, including exact totals in callers/callees JSON output; the `codegraph_callers` and `codegraph_callees` MCP answers carry the same "showing N of M" note. (#1639, #1674)
 
 - **Files under an `e2e/` directory count as tests.** Their calls no longer appear as production callers in Steps, dead-code and test badges.
 
