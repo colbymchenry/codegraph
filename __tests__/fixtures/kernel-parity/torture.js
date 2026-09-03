@@ -73,3 +73,9 @@ export default {
     },
   },
 };
+
+// --- CommonJS export assignments (#1675) -----------------------------------
+exports.getItems = async (req, res) => { res.json(await findItems()); };
+module.exports.deleteItem = function (req, res) { removeItem(req.params.id); res.end(); };
+exports.plain = 42;
+handlers.onSave = () => { persist(); };
