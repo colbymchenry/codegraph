@@ -20,7 +20,10 @@ impl<'t> Walker<'t> {
             .unwrap_or_else(|| self.extract_name(node));
 
         // Arrow/function-expression values: resolve the name from the parent
-        // variable_declarator (`export const useAuth = () => {}`).
+        // variable_declarator (`export const useAuth = () => {}`), or from a
+        // CommonJS export assignment (`exports.getItems = async () => {}`,
+        // #1675). Mirrors TreeSitterExtractor.extractFunction.
+        let mut common_js_export = false;
         if name_override.is_none()
             && name == "<anonymous>"
             && matches!(node.kind(), "arrow_function" | "function_expression")
@@ -29,6 +32,11 @@ impl<'t> Walker<'t> {
                 if parent.kind() == "variable_declarator" {
                     if let Some(var_name) = parent.child_by_field_name("name") {
                         name = self.text(var_name).to_string();
+                    }
+                } else if parent.kind() == "assignment_expression" {
+                    if let Some(export_name) = self.common_js_export_name(parent, node) {
+                        name = export_name;
+                        common_js_export = true;
                     }
                 }
             }
@@ -46,7 +54,7 @@ impl<'t> Walker<'t> {
             docstring: crate::docstring::preceding_docstring(node, self.src),
             signature: self.signature_of(node),
             visibility: self.visibility_of(node),
-            is_exported: Some(self.is_exported(node)),
+            is_exported: Some(common_js_export || self.is_exported(node)),
             is_async: Some(self.is_async(node)),
             is_static: self.is_static(node),
             ..Extra::default()
@@ -63,6 +71,30 @@ impl<'t> Walker<'t> {
             self.visit_function_body(body);
         }
         self.stack.pop();
+    }
+
+    /// The property a CommonJS export assignment binds a function to —
+    /// `exports.NAME = <node>` / `module.exports.NAME = <node>` — or None for
+    /// any other assignment. The node must be the assignment's whole
+    /// right-hand side. Mirrors TreeSitterExtractor.commonJsExportName.
+    fn common_js_export_name(&self, assignment: Node<'t>, value: Node<'t>) -> Option<String> {
+        let right = assignment.child_by_field_name("right")?;
+        if right.start_byte() != value.start_byte() || right.end_byte() != value.end_byte() {
+            return None;
+        }
+        let left = assignment.child_by_field_name("left")?;
+        if left.kind() != "member_expression" {
+            return None;
+        }
+        let object = left.child_by_field_name("object")?;
+        let property = left.child_by_field_name("property")?;
+        if property.kind() != "property_identifier" {
+            return None;
+        }
+        if !matches!(self.text(object), "exports" | "module.exports") {
+            return None;
+        }
+        Some(self.text(property).to_string())
     }
 
     // --- reactComponentHoc / extractReactComponentNode (#841) --------------------
