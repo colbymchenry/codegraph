@@ -560,7 +560,8 @@ describe('expo-router: end-to-end', () => {
     const detail = screens.screens.find((s) => s.path === '/object-detail')!;
     const tap = screens.links.find((l) => l.from === home.id && l.to === detail.id)!;
     expect(tap).toBeDefined();
-    expect(tap.via.map((v) => v.name)).toEqual(['ItemCard', 'openObjectDetail']);
+    // `handlePress` is a symbol of its own (#1669), so the tap passes through it.
+    expect(tap.via.map((v) => v.name)).toEqual(['ItemCard', 'handlePress', 'openObjectDetail']);
     expect(tap.when).toBe('props.collected');
     expect(tap.sites[0]!.href).toBe('/object-detail?detectionItem=${…}');
     // Navigation nothing on a screen reaches is an origin, not dropped: the

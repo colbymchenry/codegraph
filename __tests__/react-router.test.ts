@@ -229,6 +229,14 @@ describe('react-router: a routed app end to end', () => {
     if (!n) throw new Error(`no symbol ${name}`);
     return n;
   };
+  // A handler written as `const submitHandler = () => {…}` inside a screen is a
+  // symbol of its own (#1669), so a navigation it makes is ITS edge — the same
+  // shape a `useCallback` handler has — and the screen reaches it by calling it.
+  const symIn = (name: string, file: string): Node => {
+    const n = cg.getNodesByName(name).find((n) => n.kind !== 'route' && n.kind !== 'file' && n.kind !== 'import' && n.filePath.endsWith(file));
+    if (!n) throw new Error(`no symbol ${name} in ${file}`);
+    return n;
+  };
   const navs = (from: Node) => cg.getOutgoingEdges(from.id).filter((e) => e.kind === 'navigates');
   const hrefs = (from: Node) =>
     navs(from)
@@ -250,17 +258,24 @@ describe('react-router: a routed app end to end', () => {
 
   it('the payment screen pushes to both pages it leads to — the bounce out and the one on submit', () => {
     const payment = sym('PaymentScreen');
-    expect(hrefs(payment)).toEqual(['/placeorder', '/shipping']);
-    const byHref = new Map(navs(payment).map((e) => [(e.metadata as Record<string, unknown>).href, e]));
+    const submit = symIn('submitHandler', 'PaymentScreen.js');
+    // The bounce-out is the component's own; the push on submit belongs to its handler.
+    expect(hrefs(payment)).toEqual(['/shipping']);
+    expect(hrefs(submit)).toEqual(['/placeorder']);
+    // `onSubmit={submitHandler}` is the screen's reference to it; the Screens
+    // walk below rides that hop.
+    expect(cg.getOutgoingEdges(payment.id).some((e) => e.target === submit.id && e.kind === 'references')).toBe(true);
+    const byHref = new Map([...navs(payment), ...navs(submit)].map((e) => [(e.metadata as Record<string, unknown>).href, e]));
     expect(byHref.get('/shipping')!.target).toBe(route('/shipping').id);
     expect(byHref.get('/placeorder')!.target).toBe(route('/placeorder').id);
     expect(byHref.get('/placeorder')!.metadata).toMatchObject({ navMethod: 'push' });
   });
 
   it('history.replace navigates, and v6’s navigate() with a template hole reaches the :id route', () => {
-    expect(navs(sym('ShippingScreen'))[0]!.target).toBe(route('/payment').id);
-    expect(navs(sym('ShippingScreen'))[0]!.metadata).toMatchObject({ href: '/payment', navMethod: 'replace' });
-    const product = navs(sym('ProductScreen'));
+    const shippingSubmit = symIn('submitHandler', 'ShippingScreen.js');
+    expect(navs(shippingSubmit)[0]!.target).toBe(route('/payment').id);
+    expect(navs(shippingSubmit)[0]!.metadata).toMatchObject({ href: '/payment', navMethod: 'replace' });
+    const product = navs(sym('addToCart'));
     expect(product).toHaveLength(1);
     expect(product[0]!.target).toBe(route('/cart/:id?').id);
     expect(product[0]!.metadata).toMatchObject({ href: '/cart/${…}', navMethod: 'navigate' });
@@ -288,7 +303,8 @@ describe('react-router: a routed app end to end', () => {
     const link = screens.links.find((l) => l.from === at('/payment').id && l.to === at('/placeorder').id)!;
     expect(link).toBeDefined();
     expect(link.sites[0]).toMatchObject({ href: '/placeorder', method: 'push' });
-    expect(link.via).toEqual([]);
+    // The submit handler is the hop between the screen and the push.
+    expect(link.via.map((v) => v.name)).toEqual(['submitHandler']);
     expect(screens.links.find((l) => l.from === at('/shipping').id && l.to === at('/payment').id)).toBeDefined();
     expect(screens.links.find((l) => l.from === at('/product/:id').id && l.to === at('/cart/:id?').id)).toBeDefined();
   });
