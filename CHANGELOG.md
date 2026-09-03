@@ -131,6 +131,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   Trails are plain JSON, one file per trail, under `.codegraph/ui/trails/` — already ignored by git, so they stay yours by default. **Export** hands you the file if you'd rather commit one for the team. This is the only thing the viewer writes: it still never indexes, never changes your graph, and never touches a line of your code. Start it with `codegraph ui --read-only` and it won't write even that — saved trails can still be opened, just not saved or deleted.
 
+- **Haskell projects now get code intelligence:** CodeGraph indexes modules, declarations, imports, re-exports, operators, Template Haskell, Unicode identifiers, and Cabal/Stack workspaces so `codegraph_explore` can follow many real flows within a workspace.
+
 ### Fixes
 
 #### Screens, links and navigation
@@ -198,6 +200,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **ASP.NET Minimal API endpoint groups are routes.** The handler-first form — `groupBuilder.MapPost(CreateTodoItem)`, `MapPut(UpdateTodoItem, "{id}")` inside an `IEndpointGroup` / `EndpointGroupBase` class (the Clean Architecture template and its descendants) — now registers `POST /api/TodoItems` and `PUT /api/TodoItems/{id}`, with the `/api/` head read from the app's own `MapGroup($"/api/{groupName}")` and a class's `RoutePrefix` honoured, each bound to its handler so the Steps tab starts there and lists its `TypedResults` replies by status code.
 
 - **A FastAPI service that lives in one directory of a monorepo is detected.** `backend/pyproject.toml` and `backend/app/main.py` count, not only files at the repository root — the official full-stack template's routes now appear in Entry points and the Steps tab.
+
+#### Haskell indexing
+
+- Haskell identifiers written in Chinese, Hangul, Tangut and other Unicode letter scripts now parse and resolve in ordinary, qualified and Template Haskell expressions instead of silently disappearing from the graph.
+
+- External imports in headerless Haskell scripts now stay unresolved instead of incorrectly pointing back to their own import declaration.
 
 #### Symbols, tests and the viewer
 

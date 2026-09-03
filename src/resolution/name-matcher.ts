@@ -200,7 +200,7 @@ function applyLanguageGate(candidates: Node[], ref: UnresolvedRef): Node[] {
  * Resolve a function-as-value reference (#756) — a function name used as a
  * callback/function-pointer value (`register(handler)`, `o->cb = handler`,
  * `{ .cb = handler }`, `signal(SIGINT, handler)`). The ONLY strategy allowed
- * for `function_ref` refs: exact name, function/method targets only, same
+ * for `function_ref` refs: exact name, callable targets only, same
  * language family, same-file first, and cross-file only when the match is
  * UNIQUE. No fuzzy fallback, no qualified-name walking — a wrong callback
  * edge is worse than none.
@@ -231,6 +231,12 @@ export function matchFunctionRef(
     ref.language === 'arkts' ||
     ref.language === 'cpp' || ref.language === 'python' ||
     ref.language === 'php';
+  const isCallable = (node: Node, explicitlyQualified = false): boolean =>
+    node.kind === 'function'
+    || ((explicitlyQualified || !bareFnOnly) && node.kind === 'method')
+    // Algebraic-data constructors are ordinary first-class functions in
+    // Haskell (`map Just xs`, `EventDelete . deleteRow`).
+    || (ref.language === 'haskell' && node.kind === 'enum_member');
 
   // Python additionally accepts CLASS targets for bare identifiers (#1478):
   // class-as-value is a core Python idiom (`return SomeSerializer`,
@@ -251,7 +257,7 @@ export function matchFunctionRef(
       .getNodesByName(memberName)
       .filter(
         (n) =>
-          (n.kind === 'function' || n.kind === 'method') &&
+          isCallable(n, true) &&
           sameLanguageFamily(n.language, ref.language) &&
           n.id !== ref.fromNodeId &&
           (n.qualifiedName === ref.referenceName ||
@@ -274,9 +280,7 @@ export function matchFunctionRef(
     .getNodesByName(ref.referenceName)
     .filter(
       (n) =>
-        (n.kind === 'function' ||
-          (!bareFnOnly && n.kind === 'method') ||
-          (bareClassOk && n.kind === 'class')) &&
+        (isCallable(n) || (bareClassOk && n.kind === 'class')) &&
         sameLanguageFamily(n.language, ref.language) &&
         n.id !== ref.fromNodeId // a function registering itself is not a dependency edge
     );

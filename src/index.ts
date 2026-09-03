@@ -763,8 +763,19 @@ export class CodeGraph {
         return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
       }
       try {
-        return this.orchestrator.indexFiles(filePaths);
+        const beforePairs = this.queries.getNodeNamePairsByFiles(filePaths);
+        const result = await this.orchestrator.indexFiles(filePaths);
+        if (filePaths.length > 0) {
+          const afterPairs = this.queries.getNodeNamePairsByFiles(filePaths);
+          const delta = new Set<string>();
+          const nameOf = (pair: string) => pair.slice(pair.indexOf('\0') + 1);
+          for (const pair of beforePairs) if (!afterPairs.has(pair)) delta.add(nameOf(pair));
+          for (const pair of afterPairs) if (!beforePairs.has(pair)) delta.add(nameOf(pair));
+          this.orchestrator.resurrectStaleResolutionEdges([...delta], []);
+        }
+        return result;
       } finally {
+        this.resolver.clearCaches();
         this.fileLock.release();
       }
     });
@@ -837,6 +848,12 @@ export class CodeGraph {
           // warmed against the pre-removal graph; drop them so resolution
           // sees the post-removal state. (runPostExtract above clears caches
           // itself, so the changed-files branch is already covered.)
+          this.resolver.clearCaches();
+        }
+        if (result.haskellImportInvalidationRecovered) {
+          // The recovered sync may have no filesystem delta, so neither branch
+          // above clears resolver/import caches. Its replayed pending refs must
+          // see the already-committed post-crash module topology.
           this.resolver.clearCaches();
         }
 

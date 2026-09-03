@@ -6,7 +6,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { Language, Node, UnresolvedReference, Edge } from '../types';
+import { Language, Node, UnresolvedReference, Edge, HASKELL_EFFECT_ALIAS_HEAD_PREFIX } from '../types';
 import { QueryBuilder } from '../db/queries';
 import {
   UnresolvedRef,
@@ -17,7 +17,7 @@ import {
   ImportMapping,
 } from './types';
 import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
-import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos } from './import-resolver';
+import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos, normalizeHaskellReferenceName, parseHaskellReferenceName, haskellNodeOwnedBy, haskellEffectHeadHasCanonicalOrigin, HASKELL_ID_CONTINUE_SOURCE, HASKELL_VARID_SOURCE, HASKELL_CONID_SOURCE } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -47,6 +47,7 @@ const CHAIN_SHAPE = /^(.+)\(\)\.(\w+)$/;
 
 /** PHP `$this->prop->method()` encoded as `this->prop.method` — no `()`, so CHAIN_SHAPE misses it. */
 const PHP_PROP_SHAPE = /^this->\w+\.\w+$/;
+const HASKELL_VARID_RE = new RegExp(`^${HASKELL_VARID_SOURCE}$`, 'u');
 
 /**
  * Cache size limits. Each per-resolver cache is bounded so memory
@@ -714,6 +715,7 @@ export class ReferenceResolver {
       column: ref.column,
       filePath: ref.filePath || this.getFilePathFromNodeId(ref.fromNodeId),
       language: ref.language || this.getLanguageFromNodeId(ref.fromNodeId),
+      candidates: ref.candidates,
       rowId: ref.rowId,
     }));
 
@@ -830,6 +832,17 @@ export class ReferenceResolver {
     return false;
   }
 
+  /** Haskell operators are declared under either `op` or `(op)` node names. */
+  private hasAnyPossibleHaskellMatch(name: string): boolean {
+    const parsed = parseHaskellReferenceName(name);
+    const normalized = parsed.normalized;
+    if (this.hasAnyPossibleMatch(normalized)) return true;
+    const leaf = parsed.member;
+    return !/^[A-Za-z_][A-Za-z0-9_']*$/.test(leaf)
+      && (this.hasAnyPossibleMatch(`(${leaf})`)
+        || (parsed.qualifier === null && this.hasAnyPossibleMatch(`(${normalized})`)));
+  }
+
   /**
    * Does `ref.referenceName` match an import declared in its containing
    * file? Used as a pre-filter escape so re-export chain resolution
@@ -838,15 +851,464 @@ export class ReferenceResolver {
   private matchesAnyImport(ref: UnresolvedRef): boolean {
     const imports = this.context.getImportMappings(ref.filePath, ref.language);
     if (imports.length === 0) return false;
+    const referenceName = ref.language === 'haskell' && ref.referenceKind !== 'imports'
+      ? normalizeHaskellReferenceName(ref.referenceName)
+      : ref.referenceName;
     for (const imp of imports) {
       if (
-        imp.localName === ref.referenceName ||
-        ref.referenceName.startsWith(imp.localName + '.')
+        imp.localName === referenceName ||
+        referenceName.startsWith(imp.localName + '.') ||
+        (ref.language === 'haskell' && referenceName.startsWith(imp.localName + '::'))
       ) {
         return true;
       }
     }
     return false;
+  }
+
+  /**
+   * Recognize a simple OverloadedRecordDot projection at the unresolved ref's
+   * source position. `undefined` means this is not projection syntax; `null`
+   * means it is a projection whose immediate receiver cannot be inferred
+   * safely (for example the second field in `value.user.email`).
+   */
+  private getHaskellProjectionReceiver(ref: UnresolvedRef): string | null | undefined {
+    if (
+      ref.language !== 'haskell'
+      || ref.referenceKind !== 'references'
+      || ref.referenceName.includes('::')
+      || !HASKELL_VARID_RE.test(ref.referenceName)
+    ) return undefined;
+
+    const lines = this.context.getFileLines?.(ref.filePath)
+      ?? this.context.readFile(ref.filePath)?.split(/\r?\n/)
+      ?? null;
+    if (!lines || ref.line < 1 || ref.line > lines.length) return undefined;
+    const sourceLine = lines[ref.line - 1]!;
+    const atReference = sourceLine.slice(ref.column);
+    const escapedReference = ref.referenceName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const identifierBoundary = `(?!${HASKELL_ID_CONTINUE_SOURCE}|#)`;
+    if (new RegExp(`^${escapedReference}${identifierBoundary}`, 'u').test(atReference)) {
+      const prefix = sourceLine.slice(0, ref.column);
+      if (/\.\s*$/.test(prefix)) {
+        const preceding = prefix.match(new RegExp(`(${HASKELL_VARID_SOURCE})\\s*\\.\\s*$`, 'u'));
+        if (preceding?.index !== undefined) {
+          // In `value.user.email`, `email`'s immediate receiver is itself a
+          // projection with an unknown result type. Only the first member can
+          // be related safely to the annotated base parameter.
+          const beforeReceiver = prefix.slice(0, preceding.index).trimEnd();
+          return beforeReceiver.endsWith('.') ? null : preceding[1]!;
+        }
+        // Parenthesized, applied, or multiline receivers are still definitely
+        // projection syntax. Claim them conservatively so they cannot fall
+        // through to an arbitrary same-named record selector.
+        return null;
+      }
+    }
+    const fragment = lines.slice(ref.line - 1, Math.min(lines.length, ref.line + 2));
+    fragment[0] = fragment[0]!.slice(ref.column);
+    const projection = fragment.join('\n').match(new RegExp(
+      `^\\s*(${HASKELL_VARID_SOURCE})((?:\\s*\\.\\s*${HASKELL_VARID_SOURCE})+)`,
+      'u',
+    ));
+    if (!projection) return undefined;
+    const members = [...projection[2]!.matchAll(new RegExp(
+      `\\.\\s*(${HASKELL_VARID_SOURCE})`,
+      'gu',
+    ))]
+      .map((match) => match[1]!);
+    const memberIndex = members.indexOf(ref.referenceName);
+    if (memberIndex < 0) return undefined;
+    return memberIndex === 0 ? projection[1]! : null;
+  }
+
+  /** Infer the record parent for the narrow, reliable `f :: T -> ...; f x = x.field` case. */
+  private inferHaskellProjectionParent(
+    ref: UnresolvedRef,
+    from: Node,
+    receiver: string,
+  ): string | null {
+    const signature = from.signature;
+    const marker = signature?.indexOf('::') ?? -1;
+    if (!signature || marker < 0) return null;
+
+    const splitTopLevel = (input: string, separator: string): string[] => {
+      const parts: string[] = [];
+      let depth = 0;
+      let start = 0;
+      for (let index = 0; index <= input.length - separator.length; index++) {
+        const char = input[index]!;
+        if (char === '(' || char === '[' || char === '{') depth++;
+        else if (char === ')' || char === ']' || char === '}') depth = Math.max(0, depth - 1);
+        if (depth === 0 && input.startsWith(separator, index)) {
+          parts.push(input.slice(start, index).trim());
+          start = index + separator.length;
+          index += separator.length - 1;
+        }
+      }
+      parts.push(input.slice(start).trim());
+      return parts;
+    };
+
+    let declaredType = signature.slice(marker + 2).trim()
+      .replace(/^forall\b[^.]*\.\s*/, '');
+    const constrained = splitTopLevel(declaredType, '=>');
+    declaredType = constrained[constrained.length - 1] ?? declaredType;
+    const typeParts = splitTopLevel(declaredType, '->');
+    if (typeParts.length < 2) return null;
+
+    const lines = this.context.getFileLines?.(ref.filePath)
+      ?? this.context.readFile(ref.filePath)?.split(/\r?\n/)
+      ?? null;
+    if (!lines) return null;
+    const escapedName = from.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const identifierBoundary = `(?!${HASKELL_ID_CONTINUE_SOURCE}|#)`;
+    let parameters: string[] | null = null;
+    for (let line = Math.min(ref.line, lines.length); line >= from.startLine; line--) {
+      const equation = lines[line - 1]?.match(new RegExp(
+        `^\\s*${escapedName}${identifierBoundary}(.*?)(?:=|\\|)`,
+        'u',
+      ));
+      if (!equation) continue;
+      const raw = equation[1]!.trim();
+      parameters = raw === '' ? [] : raw.split(/\s+/);
+      break;
+    }
+    if (!parameters || parameters.some((parameter) => !HASKELL_VARID_RE.test(parameter))) {
+      return null;
+    }
+    const argumentIndex = parameters.indexOf(receiver);
+    if (argumentIndex < 0 || argumentIndex >= typeParts.length - 1) return null;
+    let argumentType = typeParts[argumentIndex]!.trim();
+    while (argumentType.startsWith('(') && argumentType.endsWith(')')) {
+      argumentType = argumentType.slice(1, -1).trim();
+    }
+    // A qualified `O.B` must retain `O` to distinguish it from a same-named
+    // local `B`. This narrow inference intentionally handles only the simple
+    // unqualified case until qualifier-aware type lookup is available.
+    if (!new RegExp(`^${HASKELL_CONID_SOURCE}$`, 'u').test(argumentType)) return null;
+    return argumentType;
+  }
+
+  /**
+   * Resolve record-dot only when a simple receiver annotation identifies one
+   * parent type. An untyped/ambiguous projection is claimed but deliberately
+   * left unresolved so lexical bare-name matching cannot pick an arbitrary
+   * DuplicateRecordFields selector.
+   */
+  private resolveHaskellProjection(ref: UnresolvedRef): {
+    claimed: boolean;
+    result: ResolvedRef | null;
+  } {
+    const receiver = this.getHaskellProjectionReceiver(ref);
+    if (receiver === undefined) return { claimed: false, result: null };
+    if (receiver === null) return { claimed: true, result: null };
+    const from = this.queries.getNodeById(ref.fromNodeId);
+    if (!from) return { claimed: true, result: null };
+    const parent = this.inferHaskellProjectionParent(ref, from, receiver);
+    if (!parent) return { claimed: true, result: null };
+
+    const ownedByParent = (node: Node): boolean => {
+      return haskellNodeOwnedBy(node, parent);
+    };
+    const targets = this.context.getNodesByName(ref.referenceName)
+      .filter((node) => node.language === 'haskell'
+        && node.kind === 'field'
+        && node.filePath === ref.filePath
+        && ownedByParent(node));
+    const imported = this.gateLanguage(resolveViaImport(ref, this.context), ref);
+    if (imported) {
+      const target = this.queries.getNodeById(imported.targetNodeId);
+      if (target?.kind === 'field' && ownedByParent(target)) targets.push(target);
+    }
+    const unique = [...new Map(targets.map((node) => [node.id, node])).values()];
+    if (unique.length !== 1) return { claimed: true, result: null };
+    return {
+      claimed: true,
+      result: {
+        original: ref,
+        targetNodeId: unique[0]!.id,
+        confidence: 0.99,
+        resolvedBy: imported?.targetNodeId === unique[0]!.id ? 'import' : 'qualified-name',
+      },
+    };
+  }
+
+  /**
+   * Resolve Haskell's lexical/module scope before imports. Local declarations
+   * shadow imports, and nested helpers are visible only from their owner,
+   * siblings, and descendants — a same-file global name match is not enough.
+   */
+  private resolveHaskellLexical(ref: UnresolvedRef): {
+    claimed: boolean;
+    result: ResolvedRef | null;
+  } {
+    if (
+      ref.language !== 'haskell'
+      || (ref.referenceKind !== 'calls'
+        && ref.referenceKind !== 'function_ref'
+        && ref.referenceKind !== 'references'
+        && ref.referenceKind !== 'extends'
+        && ref.referenceKind !== 'implements')
+    ) return { claimed: false, result: null };
+
+    const from = this.queries.getNodeById(ref.fromNodeId);
+    if (!from) return { claimed: false, result: null };
+    const moduleNode = this.context.getNodesInFile(ref.filePath)
+      .find((node) => node.kind === 'namespace' && node.language === 'haskell');
+    const moduleScope = moduleNode?.qualifiedName ?? moduleNode?.name;
+    const parsedReference = parseHaskellReferenceName(ref.referenceName);
+    const localName = parsedReference.member;
+    let selfQualified = false;
+    if (parsedReference.qualifier !== null) {
+      const receiver = parsedReference.qualifier;
+      selfQualified = !!moduleNode
+        && (receiver === moduleNode.name || receiver === moduleNode.qualifiedName);
+      // A qualifier other than this file's own module belongs to import
+      // resolution. In particular, do not let a same-file leaf accidentally
+      // capture `Other.foo`.
+      if (!selfQualified) return { claimed: false, result: null };
+    }
+
+    const names = /^[A-Za-z_][A-Za-z0-9_']*$/.test(localName)
+      ? [localName]
+      : [localName, `(${localName})`];
+    const candidates = [...new Map(names.flatMap((name) => this.context.getNodesByName(name))
+      .filter((node) => node.filePath === ref.filePath && node.language === 'haskell')
+      .map((node) => [node.id, node])).values()];
+    const qualifierIsImportAlias = selfQualified && this.context
+      .getImportMappings(ref.filePath, 'haskell')
+      .some((mapping) => mapping.isNamespace && mapping.localName === parsedReference.qualifier);
+    if (candidates.length === 0) {
+      return { claimed: selfQualified && !qualifierIsImportAlias, result: null };
+    }
+
+    if (ref.referenceKind === 'extends' || ref.referenceKind === 'implements') {
+      // Instance declaration nodes are `class` graph nodes and can share the
+      // trait's exact qname (`class C` / `instance C`), so they are never a
+      // target. A superclass may additionally be a ConstraintKinds type alias;
+      // an instance head itself still has to denote a real class/trait.
+      const typeCandidates = candidates.filter((node) =>
+        node.id !== from.id
+        && (node.kind === 'trait'
+          || (ref.referenceKind === 'extends' && node.kind === 'type_alias'))
+      );
+      if (typeCandidates.length !== 1) {
+        return {
+          claimed: typeCandidates.length > 1 || (selfQualified && !qualifierIsImportAlias),
+          result: null,
+        };
+      }
+      return {
+        claimed: true,
+        result: {
+          original: ref,
+          targetNodeId: typeCandidates[0]!.id,
+          confidence: 0.99,
+          resolvedBy: 'qualified-name',
+        },
+      };
+    }
+
+    const qualifiedOwner = (node: Node): string => {
+      const suffix = `::${node.name}`;
+      return node.qualifiedName.endsWith(suffix)
+        ? node.qualifiedName.slice(0, -suffix.length)
+        : '';
+    };
+
+    const visibleFunctionParents = new Map<string, number>();
+    let scopeNode: Node | null = from;
+    let rank = 100;
+    const visitedScopes = new Set<string>();
+    while (scopeNode && !visitedScopes.has(scopeNode.id)) {
+      visitedScopes.add(scopeNode.id);
+      visibleFunctionParents.set(scopeNode.qualifiedName, rank--);
+      if (scopeNode.qualifiedName === moduleScope) break;
+      const containmentEdge: Edge | undefined = this.queries
+        .getIncomingEdges(scopeNode.id, ['contains'])[0];
+      scopeNode = containmentEdge ? this.queries.getNodeById(containmentEdge.source) : null;
+    }
+    if (moduleScope && !visibleFunctionParents.has(moduleScope)) {
+      visibleFunctionParents.set(moduleScope, 1);
+    }
+
+    const methodOwnerIsInstance = (node: Node): boolean => {
+      // A nullary class (`class C`) and its instance (`instance C`) can have
+      // the same qualified spelling. Follow THIS method's containment edge;
+      // looking up every owner by qualifiedName misclassifies the selector as
+      // an instance implementation and erases otherwise valid calls.
+      return this.queries.getIncomingEdges(node.id, ['contains']).some((edge) =>
+        this.queries.getNodeById(edge.source)?.decorators?.includes('haskell-instance') === true
+      );
+    };
+
+    const ranked = candidates.flatMap((node): Array<{ node: Node; rank: number }> => {
+      if (node.kind === 'function' || node.kind === 'constant') {
+        const parent = qualifiedOwner(node);
+        if (selfQualified) {
+          // A module qualifier exposes only module-scope declarations, never a
+          // let/where helper that happens to share the same leaf name.
+          return parent === moduleScope ? [{ node, rank: 300 }] : [];
+        }
+        const lexicalRank = visibleFunctionParents.get(parent);
+        return lexicalRank === undefined ? [] : [{ node, rank: 200 + lexicalRank }];
+      }
+      // Constructors, pattern synonyms, and record selectors occupy the module
+      // value namespace even though their graph qualifiedName includes the
+      // owning type.
+      if (node.kind === 'enum_member') return [{ node, rank: 100 }];
+      if (node.kind === 'field') return [{ node, rank: 100 }];
+      if (node.kind === 'method') {
+        if (methodOwnerIsInstance(node)) {
+          // An instance implementation is not a module-scope binding. It is
+          // visible recursively from its own equation/helpers only; elsewhere
+          // the imported/local class selector owns the name.
+          const recursive = node.id === from.id
+            || from.qualifiedName.startsWith(`${node.qualifiedName}::`);
+          return recursive && !selfQualified ? [{ node, rank: 400 }] : [];
+        }
+        // Class methods are module-scope selectors even when the module export
+        // list keeps them private; export status matters only cross-file.
+        return [{ node, rank: 100 }];
+      }
+      return [];
+    });
+    if (ranked.length === 0) return { claimed: selfQualified, result: null };
+
+    const bestRank = Math.max(...ranked.map((entry) => entry.rank));
+    let best = ranked.filter((entry) => entry.rank === bestRank);
+
+    // Recursive/self references are exact even when another lexical scope
+    // materialized a helper with the same qualifiedName.
+    const exactSelf = best.filter((entry) => entry.node.id === from.id);
+    if (exactSelf.length === 1) best = exactSelf;
+
+    if (best.length > 1) {
+      // Separate equations/branches may each declare `where`/`let helper`, but
+      // graph qualified names intentionally omit synthetic scope ids. Position
+      // is the remaining safe discriminator: apply it only to same-qualified
+      // local functions/constants, never to duplicate fields or methods whose
+      // selection would require type inference.
+      const sameQualifiedLocal = best.every((entry) =>
+        (entry.node.kind === 'function' || entry.node.kind === 'constant')
+        && entry.node.qualifiedName === best[0]!.node.qualifiedName
+        && qualifiedOwner(entry.node) !== moduleScope
+      );
+      if (sameQualifiedLocal) {
+        const sourceLine = this.context.getFileLines?.(ref.filePath)?.[ref.line - 1];
+        if (sourceLine) {
+          const visible = best.filter(({ node }) => !(
+            node.startLine === ref.line
+            && node.startColumn > ref.column
+            // A later sibling/nested `let` is outside this call's scope. Keep
+            // ordinary forward references within the same recursive let group:
+            // their shared `let` keyword precedes the reference, not the node.
+            && /\blet\b/.test(sourceLine.slice(ref.column, node.startColumn))
+          ));
+          if (visible.length > 0) best = visible;
+        }
+        const lexicalRange = (node: Node): [number, number] | null => {
+          const decorator = node.decorators?.find((value) => value.startsWith('haskell-lexical-range:'));
+          const match = decorator?.match(/^haskell-lexical-range:(\d+):(\d+)$/);
+          return match ? [Number(match[1]), Number(match[2])] : null;
+        };
+        const containing = best.filter(({ node }) => {
+          const range = lexicalRange(node);
+          return range !== null && ref.line >= range[0] && ref.line <= range[1];
+        });
+        if (containing.length > 0) best = containing;
+
+        const distance = (node: Node): [number, number] => {
+          const lineDistance = ref.line < node.startLine
+            ? node.startLine - ref.line
+            : ref.line > node.endLine
+              ? ref.line - node.endLine
+              : 0;
+          const columnDistance = lineDistance === 0
+            ? Math.abs(ref.column - node.startColumn)
+            : 0;
+          return [lineDistance, columnDistance];
+        };
+        const ordered = best.map((entry) => ({ entry, distance: distance(entry.node) }))
+          .sort((a, b) => a.distance[0] - b.distance[0] || a.distance[1] - b.distance[1]);
+        if (
+          ordered.length === 1
+          || ordered[0]!.distance[0] !== ordered[1]!.distance[0]
+          || ordered[0]!.distance[1] !== ordered[1]!.distance[1]
+        ) {
+          best = [ordered[0]!.entry];
+        } else {
+          const tied = ordered.filter((candidate) =>
+            candidate.distance[0] === ordered[0]!.distance[0]
+            && candidate.distance[1] === ordered[0]!.distance[1]
+          );
+          // `let` binders precede their `in` use. When two sibling scopes are
+          // exactly equidistant (the common then/else layout), this positional
+          // direction safely rejects the not-yet-visible later branch.
+          const preceding = tied.filter(({ entry }) =>
+            entry.node.endLine < ref.line
+            || (entry.node.endLine === ref.line && entry.node.endColumn <= ref.column)
+          );
+          if (preceding.length === 1) best = [preceding[0]!.entry];
+        }
+      }
+    }
+    if (best.length !== 1) return { claimed: true, result: null };
+    return {
+      claimed: true,
+      result: {
+        original: ref,
+        targetNodeId: best[0]!.node.id,
+        confidence: 0.99,
+        resolvedBy: 'qualified-name',
+      },
+    };
+  }
+
+  /**
+   * Resolve a whole-RHS Haskell effect candidate as a value first, then decide
+   * its graph semantics from the independently persisted result-type head.
+   * The callee's node kind is deliberately not evidence that the source result
+   * is a computation: a custom `ExceptT` can alias an ordinary function too.
+   */
+  private resolveHaskellEffectAlias(ref: UnresolvedRef): ResolvedRef | null {
+    if (ref.language !== 'haskell' || ref.referenceKind !== 'haskell_effect_alias') return null;
+    const valueRef: UnresolvedRef = { ...ref, referenceKind: 'function_ref' };
+    const lexical = this.resolveHaskellLexical(valueRef);
+    let resolved = lexical.claimed
+      ? lexical.result
+      : this.gateLanguage(resolveViaImport(valueRef, this.context), valueRef);
+    if (!resolved) return null;
+
+    const target = this.queries.getNodeById(resolved.targetNodeId);
+    if (!target || !(
+      target.kind === 'function'
+      || target.kind === 'method'
+      || target.kind === 'enum_member'
+      || target.kind === 'field'
+      || target.kind === 'constant'
+    )) return null;
+
+    const effectHeads = ref.candidates?.map((marker) =>
+      typeof marker === 'string' && marker.startsWith(HASKELL_EFFECT_ALIAS_HEAD_PREFIX)
+        ? marker.slice(HASKELL_EFFECT_ALIAS_HEAD_PREFIX.length)
+        : null
+    );
+    const isCanonical = effectHeads !== undefined
+      && effectHeads.length > 0
+      && effectHeads.every((head): head is string => head !== null && head.length > 0)
+      && effectHeads.every((head) =>
+        haskellEffectHeadHasCanonicalOrigin(ref.filePath, head, this.context)
+      );
+    resolved = {
+      ...resolved,
+      original: ref,
+      // A failed provenance proof is still a real whole-RHS value dependency;
+      // preserve it as a reference instead of dropping useful graph coverage.
+      edgeKind: isCanonical ? 'calls' : 'references',
+    };
+    return resolved;
   }
 
   /**
@@ -857,6 +1319,16 @@ export class ReferenceResolver {
     if (this.isBuiltInOrExternal(ref)) {
       return null;
     }
+
+    if (ref.referenceKind === 'haskell_effect_alias') {
+      return this.resolveHaskellEffectAlias(ref);
+    }
+
+    const haskellProjection = this.resolveHaskellProjection(ref);
+    if (haskellProjection.claimed) return haskellProjection.result;
+
+    const haskellLexical = this.resolveHaskellLexical(ref);
+    if (haskellLexical.claimed) return haskellLexical.result;
 
     // CFML component paths in inheritance (#1152): `extends="coldbox.system.web.
     // Controller"` names the supertype by its dot-separated path (or `extends=
@@ -872,7 +1344,7 @@ export class ReferenceResolver {
       (ref.referenceKind === 'extends' || ref.referenceKind === 'implements') &&
       (ref.referenceName.includes('.') || ref.referenceName.includes('/'))
     ) {
-      return this.resolveCfmlComponentPath(ref);
+      return this.gateLanguage(this.resolveCfmlComponentPath(ref), ref);
     }
 
     // Fast pre-filter: skip if no symbol with this name exists anywhere
@@ -889,14 +1361,18 @@ export class ReferenceResolver {
     let existenceName =
       ref.language === 'arkts' && ref.referenceName.startsWith('.')
         ? ref.referenceName.slice(1)
-        : ref.referenceName;
+        : ref.language === 'haskell' && ref.referenceKind !== 'imports'
+          ? normalizeHaskellReferenceName(ref.referenceName)
+          : ref.referenceName;
     // Erlang refs carry the call-site arity (`f/1`, `mod::f/2` — #1610); the
     // name index stores bare names, so existence is checked arity-less.
     if (ref.language === 'erlang') existenceName = existenceName.replace(/\/\d{1,3}$/, '');
     const tPre = this.profileStages ? process.hrtime.bigint() : 0n;
     const preFilterPass =
       isNixPathImportRef(ref) ||
-      this.hasAnyPossibleMatch(existenceName) ||
+      (ref.language === 'haskell' && ref.referenceKind !== 'imports'
+        ? this.hasAnyPossibleHaskellMatch(existenceName)
+        : this.hasAnyPossibleMatch(existenceName)) ||
       this.matchesAnyImport(ref) ||
       this.frameworks.some((f) => f.claimsReference?.(ref.referenceName));
     if (this.profileStages) this.stageAdd('preFilter', ref, preFilterPass, tPre);
@@ -925,11 +1401,19 @@ export class ReferenceResolver {
             // Python (#1478): an imported class used as a value (`return
             // OrgSerializerFull`) resolves through its import like any
             // callback — mirrors matchFunctionRef's bareClassOk.
-            (ref.language === 'python' && target.kind === 'class'))
+            (ref.language === 'python' && target.kind === 'class') ||
+            (ref.language === 'haskell' && target.kind === 'enum_member') ||
+            (ref.language === 'haskell' && target.kind === 'field') ||
+            (ref.language === 'haskell' && target.kind === 'constant'))
         ) {
           return viaImport;
         }
       }
+      // Haskell has no ambient cross-file namespace. If an import did not
+      // authorize this function value, a unique project-wide match is still
+      // out of scope (notably after `hiding`). Lexical same-file matches were
+      // already handled above.
+      if (ref.language === 'haskell') return null;
       return this.gateLanguage(matchFunctionRef(ref, this.context), ref);
     }
 
@@ -937,7 +1421,7 @@ export class ReferenceResolver {
     // resolves directly through the qualifiedName index, which is unambiguous
     // even when several `Bar` classes exist in different packages.
     const tJvm = this.profileStages ? process.hrtime.bigint() : 0n;
-    const jvmImport = resolveJvmImport(ref, this.context);
+    const jvmImport = this.gateLanguage(resolveJvmImport(ref, this.context), ref);
     if (this.profileStages) this.stageAdd('jvmImport', ref, !!jvmImport, tJvm);
     if (jvmImport) return jvmImport;
 
@@ -947,7 +1431,7 @@ export class ReferenceResolver {
     // `CatalogBrand` resolving to `BlazorShared.Models::CatalogBrand` (the DTO,
     // which the `.razor` `@using`s) rather than the same-named domain entity.
     if (ref.language === 'razor') {
-      const razorResult = this.resolveRazorUsing(ref);
+      const razorResult = this.gateLanguage(this.resolveRazorUsing(ref), ref);
       if (razorResult) return razorResult;
     }
 
@@ -955,9 +1439,9 @@ export class ReferenceResolver {
 
     // Strategy 1: Try framework-specific resolution. Cross-language bridges
     // are deliberately preserved (Drupal `routing.yml` → PHP controller, RN
-    // JS → native `calls`) — `gateFrameworkLanguage` only drops a type/import
-    // edge between two KNOWN families (see its doc), never a `calls` bridge or
-    // a config↔code edge.
+    // JS → native `calls`) — `gateFrameworkLanguage` drops type/import edges
+    // between two KNOWN families and all accidental Haskell crossings (there
+    // is no supported Haskell framework/FFI bridge).
     const tFw = this.profileStages ? process.hrtime.bigint() : 0n;
     let fwEarly: ResolvedRef | null = null;
     for (const framework of this.frameworks) {
@@ -992,7 +1476,11 @@ export class ReferenceResolver {
     // qualified-name fallback would only ever add wrong cross-module edges.
     // Nix static path imports are file references for the same reason —
     // falling through would let "./x.nix" name-match an unrelated node.
-    if (isPhpIncludePathRef(ref) || isCobolCopybookRef(ref) || isNixPathImportRef(ref) || ref.language === 'terraform') {
+    // Haskell module imports likewise must not name-match their own import
+    // declaration when the module is external or unavailable.
+    if (isPhpIncludePathRef(ref) || isCobolCopybookRef(ref) || isNixPathImportRef(ref)
+      || ref.language === 'terraform'
+      || (ref.language === 'haskell' && ref.referenceKind === 'imports')) {
       return candidates.length > 0
         ? candidates.reduce((best, curr) =>
             curr.confidence > best.confidence ? curr : best
@@ -1014,6 +1502,14 @@ export class ReferenceResolver {
       const target = this.queries.getNodeById(nameResult.targetNodeId);
       if (ref.language === 'nix') {
         if (!target || target.filePath !== ref.filePath) {
+          nameResult = null;
+        }
+      } else if (ref.language === 'haskell') {
+        // Haskell has no ambient project-wide namespace: a bare name is local
+        // or brought into scope by an import. Cross-file import matches were
+        // already handled above; accepting a global name-only fallback here
+        // fabricates edges for Prelude names such as `pure` and `length`.
+        if (!target || target.filePath !== ref.filePath || ref.referenceKind === 'calls') {
           nameResult = null;
         }
       } else if (target && target.language === 'nix') {
@@ -1069,7 +1565,10 @@ export class ReferenceResolver {
       // graph-layer changes.
       let kind: Edge['kind'] =
         ref.edgeKind ??
-        (ref.original.referenceKind === 'function_ref' ? 'references' : ref.original.referenceKind);
+        (ref.original.referenceKind === 'function_ref'
+          || ref.original.referenceKind === 'haskell_effect_alias'
+          ? 'references'
+          : ref.original.referenceKind);
 
       // Promote "extends" to "implements" when a class/struct targets an interface
       if (kind === 'extends') {
@@ -1102,7 +1601,12 @@ export class ReferenceResolver {
       // edge, sharing this resolution's kind and confidence.
       const targets = [
         { targetNodeId: ref.targetNodeId, metadata: ref.metadata },
-        ...(ref.alsoTargets ?? []),
+        ...(ref.alsoTargets ?? []).filter((target) =>
+          !this.isUnsupportedHaskellBoundary(
+            this.getLanguageFromNodeId(target.targetNodeId),
+            ref.original.language,
+          )
+        ),
       ];
       return targets.map((t) => ({
         source: ref.original.fromNodeId,
@@ -1126,11 +1630,16 @@ export class ReferenceResolver {
           // deliberately NOT resurrected for the same reason.
           refName: ref.original.referenceName,
           ...(ref.original.referenceKind !== kind ? { refKind: ref.original.referenceKind } : {}),
+          ...(ref.original.referenceKind === 'haskell_effect_alias'
+            && ref.original.candidates
+            ? { refCandidates: ref.original.candidates }
+            : {}),
           // Uniform marker for function-as-value edges (#756), regardless of
           // which strategy resolved them (import vs matchFunctionRef) — lets
           // tooling label "callback registration" and lets validation diff
           // exactly the edges this feature added.
           ...(ref.original.referenceKind === 'function_ref' ? { fnRef: true } : {}),
+          ...(ref.original.referenceKind === 'haskell_effect_alias' ? { haskellEffectAlias: true } : {}),
         },
       }));
     });
@@ -1355,6 +1864,7 @@ export class ReferenceResolver {
         column: raw.column,
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
+        candidates: raw.candidates,
         rowId: raw.rowId,
       };
       const result = this.resolveOneTimed(ref);
@@ -1475,6 +1985,7 @@ export class ReferenceResolver {
         column: raw.column,
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
+        candidates: raw.candidates,
         rowId: raw.rowId,
       };
       const result = this.resolveOneTimed(ref);
@@ -2430,30 +2941,47 @@ export class ReferenceResolver {
     if (!result) return result;
     const tgt = this.getLanguageFromNodeId(result.targetNodeId);
     if (!tgt || !ref.language) return result;
+    // No Haskell FFI/framework bridge is modelled. A result crossing this
+    // boundary is therefore always a coincidental symbol-name match, whether
+    // it came from a generic matcher or a specialized JVM/Razor/import path.
+    if (this.isUnsupportedHaskellBoundary(tgt, ref.language)) return null;
     if ((ref.referenceKind === 'references' || ref.referenceKind === 'function_ref') && !sameLanguageFamily(tgt, ref.language)) return null;
     if (ref.referenceKind === 'imports' && crossesKnownFamily(tgt, ref.language)) return null;
     return result;
   }
 
   /**
-   * Drop a FRAMEWORK-strategy resolution that crosses two *known* language
-   * families for a type-usage (`references`) or import-binding (`imports`)
-   * edge. The framework strategy is intentionally ungated for cross-language
-   * bridges, but those legitimate bridges are either `calls` edges (RN/Expo
-   * JS → native) or config↔code edges whose config side (`yaml`/`blade`/…) is
-   * not a known programming-language family. A `references`/`imports` edge
-   * between two *known* families is always a coincidental name collision — the
-   * React/Svelte/Vue PascalCase component resolvers name-match `getNodesByName`
-   * without a language check, so a TS `<TestRunner>` ref happily matched a
-   * Kotlin `class TestRunner`. Gating only the both-known-cross-family case
-   * lets config bridges and `calls` bridges through untouched.
+   * Drop a FRAMEWORK-strategy resolution that crosses an unsupported language
+   * boundary. Haskell has no framework or FFI resolver, so any Haskell↔other
+   * language result here is a name collision, including `calls` accidentally
+   * claimed by React's hook matcher. For other languages, keep the historical
+   * behavior: legitimate bridges are `calls` (RN/Expo JS → native) or
+   * config↔code edges, while a type/import edge between two known families is
+   * always coincidental.
    */
   private gateFrameworkLanguage(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
     if (!result) return result;
-    if (ref.referenceKind !== 'references' && ref.referenceKind !== 'imports') return result;
+    // No framework resolver models Haskell. Letting React/Vue/etc. inspect a
+    // Haskell `use*`/component-shaped name would bypass Haskell's import,
+    // hiding, and ambiguity rules even when the eventual target is Haskell.
+    // Lexical Haskell resolution already ran above; imports run immediately
+    // after frameworks, so reject this strategy wholesale for Haskell sources.
+    if (ref.language === 'haskell') return null;
     const tgt = this.getLanguageFromNodeId(result.targetNodeId);
+    if (this.isUnsupportedHaskellBoundary(tgt, ref.language)) return null;
+    if (ref.referenceKind !== 'references' && ref.referenceKind !== 'imports') return result;
     if (tgt && ref.language && crossesKnownFamily(tgt, ref.language)) return null;
     return result;
+  }
+
+  private isUnsupportedHaskellBoundary(
+    targetLanguage: UnresolvedRef['language'],
+    sourceLanguage: UnresolvedRef['language'],
+  ): boolean {
+    return !!targetLanguage
+      && !!sourceLanguage
+      && targetLanguage !== sourceLanguage
+      && (targetLanguage === 'haskell' || sourceLanguage === 'haskell');
   }
 }
 

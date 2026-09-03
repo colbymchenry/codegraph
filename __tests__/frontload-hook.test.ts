@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { planFrontload, findIndexedSubprojectRoots, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens } from '../src/directory';
+import { planFrontload, resolveServerRoot, findIndexedSubprojectRoots, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens } from '../src/directory';
 
 /** Make `dir` look indexed (isInitialized needs `.codegraph/codegraph.db`). */
 function mkIndexed(dir: string): string {
@@ -54,6 +54,58 @@ describe('planFrontload — front-load hook project resolution (#964)', () => {
     expect(plan.exploreRoot).toBe(api);
     expect(plan.viaSubScan).toBe(true);
     expect(plan.nudgeProjects).toEqual([]);
+  });
+
+  it.each(['cabal.project', 'stack.yaml', 'package.yaml'])(
+    'recognizes a Haskell %s workspace before scanning for an indexed child',
+    (manifest) => {
+      fs.writeFileSync(path.join(tmp, manifest), '');
+      const service = mkIndexed(path.join(tmp, 'packages', 'service'));
+
+      const plan = planFrontload(tmp, 'how does the Haskell service run?');
+
+      expect(plan.exploreRoot).toBe(service);
+      expect(plan.viaSubScan).toBe(true);
+      expect(plan.nudgeProjects).toEqual([]);
+    },
+  );
+
+  it('recognizes a plain *.cabal package root before scanning for an indexed child', () => {
+    fs.writeFileSync(path.join(tmp, 'example.cabal'), 'name: example\n');
+    const service = mkIndexed(path.join(tmp, 'packages', 'service'));
+
+    const plan = planFrontload(tmp, 'how does the Haskell service run?');
+
+    expect(plan.exploreRoot).toBe(service);
+    expect(plan.viaSubScan).toBe(true);
+    expect(plan.nudgeProjects).toEqual([]);
+  });
+
+  it('lets the MCP root resolver adopt an indexed child below a plain *.cabal root', () => {
+    fs.writeFileSync(path.join(tmp, 'example.cabal'), 'name: example\n');
+    const service = mkIndexed(path.join(tmp, 'packages', 'service'));
+
+    expect(resolveServerRoot(tmp)).toEqual({
+      root: service,
+      viaSubScan: true,
+      candidates: [service],
+    });
+  });
+
+  it('does not treat a directory ending in .cabal as a workspace manifest', () => {
+    fs.mkdirSync(path.join(tmp, 'fake.cabal'));
+    mkIndexed(path.join(tmp, 'packages', 'service'));
+
+    expect(planFrontload(tmp, 'how does the Haskell service run?')).toEqual({
+      exploreRoot: null,
+      nudgeProjects: [],
+      viaSubScan: false,
+    });
+    expect(resolveServerRoot(tmp)).toEqual({
+      root: null,
+      viaSubScan: false,
+      candidates: [],
+    });
   });
 
   it('multiple indexed sub-projects, prompt names one by path → front-load it, nudge the rest', () => {
@@ -114,6 +166,13 @@ describe('findIndexedSubprojectRoots', () => {
     mkIndexed(path.join(tmp, '.git', 'x'));
     const found = findIndexedSubprojectRoots(tmp).map((p) => path.relative(tmp, p)).sort();
     expect(found).toEqual([path.join('packages', 'api'), path.join('services', 'auth')].sort());
+  });
+
+  it('does not discover generated Cabal projects under dist-newstyle', () => {
+    const source = mkIndexed(path.join(tmp, 'packages', 'service'));
+    mkIndexed(path.join(tmp, 'dist-newstyle', 'build', 'generated'));
+
+    expect(findIndexedSubprojectRoots(tmp)).toEqual([source]);
   });
 
   it('does not descend INTO an indexed project (a project\'s sub-dirs are not separate projects)', () => {

@@ -1,0 +1,31 @@
+diff --git a/src/unicode.h b/src/unicode.h
+--- a/src/unicode.h
++++ b/src/unicode.h
+@@ -885,0 +886,23 @@
++/*
++ * UnicodeData.txt compresses large Other_Letter blocks into `<..., First>` /
++ * `<..., Last>` sentinel pairs. The original bitmap generator retained only
++ * those endpoints, so the external scanner rejected every interior CJK,
++ * Hangul, and Tangut codepoint even though grammar/lexeme.js accepts \p{Lo}.
++ */
++static bool is_compressed_other_letter_char(int32_t c) {
++  return
++    (c >= 0x3400 && c <= 0x4dbf) ||
++    (c >= 0x4e00 && c <= 0x9fff) ||
++    (c >= 0xac00 && c <= 0xd7a3) ||
++    (c >= 0x17000 && c <= 0x187f7) ||
++    (c >= 0x18d00 && c <= 0x18d08) ||
++    (c >= 0x20000 && c <= 0x2a6df) ||
++    (c >= 0x2a700 && c <= 0x2b739) ||
++    (c >= 0x2b740 && c <= 0x2b81d) ||
++    (c >= 0x2b820 && c <= 0x2cea1) ||
++    (c >= 0x2ceb0 && c <= 0x2ebe0) ||
++    (c >= 0x2ebf0 && c <= 0x2ee5d) ||
++    (c >= 0x30000 && c <= 0x3134a) ||
++    (c >= 0x31350 && c <= 0x323af);
++}
++
+@@ -886,0 +910 @@
++  if (is_compressed_other_letter_char(c)) return true;
+@@ -1769,0 +1794 @@
++  if (is_compressed_other_letter_char(c)) return true;

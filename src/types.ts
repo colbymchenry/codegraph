@@ -118,6 +118,7 @@ export const LANGUAGES = [
   'vbnet',
   'erlang',
   'terraform',
+  'haskell',
   'unknown',
 ] as const;
 
@@ -252,6 +253,9 @@ export interface FileRecord {
   /** Number of nodes extracted */
   nodeCount: number;
 
+  /** Haskell module/import/export topology fingerprint for incremental sync */
+  haskellTopologyHash?: string;
+
   /** Any extraction errors */
   errors?: ExtractionError[];
 
@@ -330,12 +334,19 @@ export interface ExtractionError {
 }
 
 /**
- * Kinds an unresolved reference can carry. `function_ref` is internal-only —
- * a function name used as a VALUE (callback registration, #756). It never
- * becomes an edge kind: resolution maps it to a `references` edge targeting
- * function/method nodes only (see `matchFunctionRef`).
+ * Kinds an unresolved reference can carry. The two extra kinds are
+ * internal-only and never become edge kinds:
+ * - `function_ref` is a function name used as a VALUE (callback registration,
+ *   #756); resolution maps it to a `references` edge.
+ * - `haskell_effect_alias` is a whole-RHS Haskell value whose result type has
+ *   the structural shape of a computation. Resolution checks every required
+ *   type head's import/re-export origin before choosing `calls` or
+ *   `references`.
  */
-export type ReferenceKind = EdgeKind | 'function_ref';
+export type ReferenceKind = EdgeKind | 'function_ref' | 'haskell_effect_alias';
+
+/** Internal payload tag stored in `UnresolvedReference.candidates`. */
+export const HASKELL_EFFECT_ALIAS_HEAD_PREFIX = 'haskell-effect-head:';
 
 /**
  * A reference that couldn't be resolved during extraction

@@ -13,7 +13,8 @@
  * where tsc puts the TERMINAL ui, so a mis-pointed outDir silently deletes
  * modules the CLI requires at startup.
  *
- * The tree-sitter grammars in dist/extraction/wasm/ are checked the same way
+ * The tree-sitter grammars and their required third-party license notices in
+ * dist/extraction/wasm/ are checked the same way
  * and for the same reason. They are copied by `npm run copy-assets`, they are
  * what both indexing and the viewer's syntax classification parse with, and
  * their absence is survivable at runtime — source is served unhighlighted —
@@ -102,10 +103,10 @@ for (const compiled of [join('bin', 'codegraph.js'), 'index.js', join('ui', 'shi
 const wasmDir = join(root, 'dist', 'extraction', 'wasm');
 
 /**
- * The grammars the syntax classification is gated on — the eight languages
- * CG-57 measured parity against, plus the two the TS family needs. Every one is
- * vendored (see VENDORED_WASM_LANGS), so all of them must be in this directory
- * rather than resolved out of node_modules.
+ * The core syntax-classification gate (the CG-57 languages plus the TS family)
+ * and Haskell, which has no fallback in the installed grammar dependency.
+ * Every one is vendored (see VENDORED_WASM_LANGS), so all of them must be in
+ * this directory rather than resolved out of node_modules.
  */
 const GATE_GRAMMARS = [
   'tree-sitter-typescript.wasm',
@@ -118,7 +119,14 @@ const GATE_GRAMMARS = [
   'tree-sitter-c_sharp.wasm',
   'tree-sitter-ruby.wasm',
   'tree-sitter-php.wasm',
+  // Haskell is WASM-only, so a staged bundle without this artifact cannot
+  // index any .hs file even when the source build was complete.
+  'tree-sitter-haskell.wasm',
 ];
+
+// Haskell's grammar is built directly from upstream rather than copied from
+// tree-sitter-wasms. Keep its MIT notice beside the shipped artifact.
+const REQUIRED_WASM_LICENSES = ['tree-sitter-haskell.LICENSE'];
 
 if (!existsSync(wasmDir)) {
   fail(
@@ -139,13 +147,29 @@ if (!staged && existsSync(srcWasmDir)) {
   }
 }
 
-const missingGrammars = [...expectedGrammars].filter(
-  (name) => !existsSync(join(wasmDir, name))
-);
-if (missingGrammars.length > 0) {
+const invalidGrammars = [...expectedGrammars].filter((name) => {
+  const file = join(wasmDir, name);
+  if (!existsSync(file) || !statSync(file).isFile() || statSync(file).size < 10_000) return true;
+  const bytes = readFileSync(file);
+  return bytes[0] !== 0x00 || bytes[1] !== 0x61 || bytes[2] !== 0x73 || bytes[3] !== 0x6d;
+});
+if (invalidGrammars.length > 0) {
   fail(
-    `dist/extraction/wasm is missing ${missingGrammars.length} grammar(s): ${missingGrammars.join(', ')}`,
+    `dist/extraction/wasm has ${invalidGrammars.length} missing or invalid grammar(s): ${invalidGrammars.join(', ')}`,
     'the copy-assets step was interrupted or dist/extraction/wasm was copied incompletely'
+  );
+}
+
+const missingLicenses = REQUIRED_WASM_LICENSES.filter(
+  (name) => {
+    const file = join(wasmDir, name);
+    return !existsSync(file) || !statSync(file).isFile() || statSync(file).size === 0;
+  }
+);
+if (missingLicenses.length > 0) {
+  fail(
+    `dist/extraction/wasm is missing ${missingLicenses.length} required license notice(s): ${missingLicenses.join(', ')}`,
+    'the copy-assets step was interrupted or the staged bundle omitted a third-party license'
   );
 }
 
@@ -153,5 +177,5 @@ const grammarCount = readdirSync(wasmDir).filter((n) => n.endsWith('.wasm')).len
 
 console.log(
   `[check-ui-build] dist/viewer ok (index.html + ${assets} referenced asset(s)); ` +
-    `dist/extraction/wasm ok (${grammarCount} grammars); dist/ engine intact`
+    `dist/extraction/wasm ok (${grammarCount} grammars + ${REQUIRED_WASM_LICENSES.length} required license notice(s)); dist/ engine intact`
 );
