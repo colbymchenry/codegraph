@@ -566,6 +566,55 @@ interface Hprops {
     expect(refs.some((r) => r.referenceName === 'IOrderField')).toBe(true);
   });
 
+  it('indexes interface members, not just the interface itself', () => {
+    // tree-sitter-typescript spells interface members `method_signature` /
+    // `property_signature`, distinct from the class-member types the extractor
+    // listed, so they were never captured (#1638). Java/C# are unaffected —
+    // their grammars reuse `method_declaration`, already in their methodTypes.
+    // The cost lands on `.d.ts` platform APIs: with no declaration node, call
+    // sites through the interface have nothing to attach an edge to.
+    const code = `
+export interface PlatformApi {
+  fetchPage(id: string): Promise<string>;
+  version: string;
+}
+`;
+    const result = extractFromSource('api.d.ts', code);
+
+    const iface = result.nodes.find((n) => n.kind === 'interface' && n.name === 'PlatformApi');
+    const method = result.nodes.find((n) => n.kind === 'method' && n.name === 'fetchPage');
+    const prop = result.nodes.find((n) => n.kind === 'property' && n.name === 'version');
+    expect(iface).toBeDefined();
+    expect(method).toBeDefined();
+    expect(prop).toBeDefined();
+
+    // Attached to the interface, not merely present. A member the graph holds
+    // but hangs off the file is not a declaration a call edge can be resolved
+    // through, which is the whole point of extracting it.
+    const contained = result.edges
+      .filter((e) => e.kind === 'contains' && e.source === iface!.id)
+      .map((e) => e.target);
+    expect(contained).toContain(method!.id);
+    expect(contained).toContain(prop!.id);
+  });
+
+  it('does not mint a top-level function from a type literal method signature', () => {
+    // The failure mode the class-like guard on `method_signature` exists for
+    // (#1638). `extractMethod` treats a method node with no class-like parent
+    // as a free function — right for `method_definition`, wrong for a bodiless
+    // signature, whose only home outside an interface is a type literal. Those
+    // members are already extracted onto the alias (#359), so without the guard
+    // the file gains a phantom `function stop` beside the real `Handle::stop`.
+    const result = extractFromSource('t.ts', `
+export type Handle = { stop(): void; label: string };
+`);
+
+    const alias = result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'Handle');
+    expect(alias).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'method' && n.name === 'stop')).toBeDefined();
+    expect(result.nodes.filter((n) => n.kind === 'function' && n.name === 'stop')).toEqual([]);
+  });
+
   it('should extract type references from interface method signatures', () => {
     const code = `
 import type { IPage } from '../PromoterList';
@@ -842,10 +891,20 @@ export type Names = ['alpha', 'beta'];
 `;
     const result = extractFromSource('noise.ts', code);
 
+    // Since #1638 the fixture's own interfaces legitimately declare `id` / `name`
+    // (`User::id`, `User::name`, `Service::name`), so membership in the name list
+    // no longer implies a leak. What #634 guards is the *source*: a node minted
+    // from a string literal in `Pick<User, 'id'>` or a tuple has no declaring
+    // interface, so exclude anything a `contains` edge ties to one.
+    const ifaceIds = new Set(result.nodes.filter((n) => n.kind === 'interface').map((n) => n.id));
+    const declaredInInterface = new Set(
+      result.edges.filter((e) => e.kind === 'contains' && ifaceIds.has(e.source)).map((e) => e.target)
+    );
     const leaked = result.nodes.filter(
       (n) =>
         (n.kind === 'method' || n.kind === 'property') &&
-        ['id', 'name', 'foo', 'bar', 'alpha', 'beta'].includes(n.name)
+        ['id', 'name', 'foo', 'bar', 'alpha', 'beta'].includes(n.name) &&
+        !declaredInInterface.has(n.id)
     );
     expect(leaked).toEqual([]);
   });

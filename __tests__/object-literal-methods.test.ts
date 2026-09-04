@@ -53,7 +53,11 @@ describe('object-literal method extraction', () => {
 
     // Each action's body was walked: fetchUser references its sibling `reset`,
     // so an in-store calls edge will resolve once the pipeline runs.
-    const fetchUser = result.nodes.find((n) => n.name === 'fetchUser')!;
+    // By KIND as well as name: the fixture's `Store` interface declares a
+    // `fetchUser` too, and since #1638 that signature is a node of its own —
+    // one that appears FIRST in the file, so a name-only lookup finds the
+    // declaration and reads its return type where the action's body was meant.
+    const fetchUser = result.nodes.find((n) => n.kind === 'function' && n.name === 'fetchUser')!;
     const fetchUserRefs = result.unresolvedReferences.filter((r) => r.fromNodeId === fetchUser.id);
     expect(fetchUserRefs.map((r) => r.referenceName)).toContain('reset');
 
