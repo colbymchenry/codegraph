@@ -3,11 +3,15 @@ title: Reading Your Graph in the Browser
 description: codegraph ui opens a local viewer for an indexed project — callers, source, and callees on one screen.
 ---
 
+:::caution
+`codegraph ui` is **not** in the latest release (v1.6.0). The published CLI does not have this command. It is on `main` and will ship in the next release. See [issue #1666](https://github.com/colbymchenry/codegraph/issues/1666).
+:::
+
 `codegraph ui` opens a viewer for a project you have already indexed. It is the same graph your agent reads, on screen.
 
 ```bash
 codegraph init          # once per project, if you haven't already
-codegraph ui            # opens http://127.0.0.1:4747 in your browser
+codegraph ui            # opens http://127.0.0.1:4747 in your browser (next release / main)
 ```
 
 ![The CodeGraph viewer: callers on the left, the symbol's source in the middle with a marker on every calling line, and the symbols it calls on the right, each level with its call site](https://raw.githubusercontent.com/colbymchenry/codegraph/main/assets/codegraph-ui-symbol-view.png?v=1)

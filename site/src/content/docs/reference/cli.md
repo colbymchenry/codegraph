@@ -12,7 +12,6 @@ codegraph uninit [path]           # Remove CodeGraph from a project (--force to 
 codegraph index [path]            # Full re-index from scratch (--force, --quiet, --verbose)
 codegraph sync [path]             # Incremental update (--quiet)
 codegraph status [path]           # Show statistics (--json)
-codegraph ui [path]               # Open the browser viewer for an indexed project (alias: web; --port, --no-open)
 codegraph unlock [path]           # Remove a stale lock file that's blocking indexing
 codegraph query <search>          # Search symbols (--kind, --limit, --json)
 codegraph explore <query>         # Relevant symbols' source + call paths in one shot (same output as the codegraph_explore MCP tool)
@@ -52,6 +51,10 @@ codegraph impact AuthMiddleware --depth 3
 Traces import dependencies transitively to find which test files are affected by changed source files. See [Affected Tests in CI](/codegraph/guides/affected-tests/) for options and a CI example.
 
 ## ui
+
+:::caution
+`codegraph ui` is **not** in the latest release (v1.6.0). The published CLI does not have this command. It is on `main` and will ship in the next release. See [issue #1666](https://github.com/colbymchenry/codegraph/issues/1666).
+:::
 
 `codegraph ui` opens the [browser viewer](/codegraph/guides/viewer/) for a project you have already indexed: callers on the left, the symbol's source in the middle, and what it calls on the right at the height of the line that calls it.
 
