@@ -974,6 +974,19 @@ export class ReferenceResolver {
     if (fwEarly) return fwEarly;
 
     // Strategy 2: Try import-based resolution
+    // A TS/JS/Python call-receiver chain (`useStore.getState().reset`, #1683)
+    // names the ROOT's import, not the method's: letting resolveViaImport see
+    // it binds the call to the imported store constant and the method is
+    // never looked up. The name-matcher owns the chain shape for these
+    // languages — the Java/Kotlin/C++ chains keep their existing path.
+    if (
+      ref.referenceKind === 'calls' &&
+      CHAIN_SHAPE.test(ref.referenceName) &&
+      (ref.language === 'typescript' || ref.language === 'javascript' || ref.language === 'tsx' || ref.language === 'jsx' || ref.language === 'python')
+    ) {
+      return this.gateLanguage(matchReference(ref, this.context), ref);
+    }
+
     const tImp = this.profileStages ? process.hrtime.bigint() : 0n;
     const importResult = this.gateLanguage(resolveViaImport(ref, this.context), ref);
     if (this.profileStages) this.stageAdd('viaImport', ref, !!importResult, tImp);
