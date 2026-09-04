@@ -976,6 +976,22 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(fs.existsSync(path.join(tmpCwd, '.claude.json'))).toBe(false);
     const cfg = JSON.parse(fs.readFileSync(path.join(tmpCwd, '.mcp.json'), 'utf-8'));
     expect(cfg.mcpServers.codegraph).toBeDefined();
+    // Exempt from Claude Code's tool-search deferral (#1696).
+    expect(cfg.mcpServers.codegraph.alwaysLoad).toBe(true);
+  });
+
+  it('claude: re-running install on an entry that predates alwaysLoad adds the key (#1696)', () => {
+    const claude = getTarget('claude')!;
+    fs.writeFileSync(
+      path.join(tmpCwd, '.mcp.json'),
+      JSON.stringify({ mcpServers: { codegraph: { type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] } } }, null, 2),
+    );
+    const result = claude.install('local', { autoAllow: false });
+    const mcp = result.files.find((f) => f.path.replace(/\\/g, '/').endsWith('/.mcp.json'));
+    expect(mcp?.action).toBe('updated');
+    const cfg = JSON.parse(fs.readFileSync(path.join(tmpCwd, '.mcp.json'), 'utf-8'));
+    expect(cfg.mcpServers.codegraph.alwaysLoad).toBe(true);
+    expect(cfg.mcpServers.codegraph.args).toEqual(['serve', '--mcp']);
   });
 
   it('claude: install creates the CLAUDE.md codegraph block (#704)', () => {
@@ -1010,6 +1026,7 @@ describe('Installer targets — partial-state idempotency', () => {
     claude.install('global', { autoAllow: false });
     const cfg = JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude.json'), 'utf-8'));
     expect(cfg.mcpServers.codegraph).toBeDefined();
+    expect(cfg.mcpServers.codegraph.alwaysLoad).toBe(true);
   });
 
   it('claude: local install migrates a legacy ./.claude.json codegraph entry into ./.mcp.json', () => {
@@ -2180,7 +2197,7 @@ describe('Installer targets — Copilot family', () => {
 
   // ---- copilot-cli ----
 
-  it('copilot-cli: global install writes ~/.copilot/mcp-config.json with the documented entry shape (tools: ["*"])', () => {
+  it('copilot-cli: global install writes ~/.copilot/mcp-config.json with the documented entry shape (tools: ["*"], deferTools: "never")', () => {
     const t = getTarget('copilot-cli')!;
     const result = t.install('global', { autoAllow: true });
 
@@ -2193,7 +2210,24 @@ describe('Installer targets — Copilot family', () => {
       command: 'codegraph',
       args: ['serve', '--mcp'],
       tools: ['*'],
+      // Exempt from Copilot CLI's tool search, the same way `alwaysLoad` exempts it in Claude Code (#1696).
+      deferTools: 'never',
     });
+  });
+
+  it('copilot-cli: re-running install on an entry that predates deferTools adds the key (#1696)', () => {
+    const t = getTarget('copilot-cli')!;
+    const file = path.join(tmpHome, '.copilot', 'mcp-config.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ mcpServers: { codegraph: { type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'], tools: ['*'] } } }, null, 2),
+    );
+    const result = t.install('global', { autoAllow: true });
+    expect(result.files[0].action).toBe('updated');
+    const cfg = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(cfg.mcpServers.codegraph.deferTools).toBe('never');
+    expect(cfg.mcpServers.codegraph.tools).toEqual(['*']);
   });
 
   it('copilot-cli: is global-only — local install skips with a clear note, uninstall is a no-op', () => {
