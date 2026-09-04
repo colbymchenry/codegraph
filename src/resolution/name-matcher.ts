@@ -503,15 +503,47 @@ export function matchByQualifiedName(
     }
   }
 
-  // Erlang qualified refs (#1610): every erlang function's qualifiedName
-  // carries its arity (`mod::f/2`), and refs carry the call-site arity when it
-  // is statically known.
-  if (ref.language === 'erlang' && ref.referenceName.includes('::')) {
+  // Erlang / Elixir qualified refs: every function's qualifiedName carries
+  // its arity (`mod::f/2`, `Foo.Bar::baz/1`), and refs carry the call-site
+  // arity when it is statically known.
+  if (
+    (ref.language === 'erlang' || ref.language === 'elixir') &&
+    ref.referenceName.includes('::')
+  ) {
     // A ref WITH arity that missed the exact lookup names an arity that isn't
     // defined (or a module out of repo). Never fall through to the partial
     // match — its "last segment" would be the arity digits — and never settle
-    // for a sibling arity: silent beats wrong.
-    if (/\/\d{1,3}$/.test(ref.referenceName)) return null;
+    // for a sibling arity: silent beats wrong. Elixir default args
+    // (`def foo(a, b \\ 1)`) index as the MAX arity; a shorter call is the
+    // same def when this module defines exactly one function of that name.
+    if (/\/\d{1,3}$/.test(ref.referenceName)) {
+      if (ref.language === 'elixir') {
+        const q = /^(.*)::(.+)\/(\d{1,3})$/.exec(ref.referenceName);
+        if (q) {
+          const prefix = `${q[1]}::${q[2]}/`;
+          const callArity = Number(q[3]);
+          const sameName = keepForRef(context.getNodesByName(q[2]!)).filter(
+            (n) =>
+              n.language === 'elixir' &&
+              n.kind === 'function' &&
+              n.qualifiedName.startsWith(prefix) &&
+              /^\d{1,3}$/.test(n.qualifiedName.slice(prefix.length)),
+          );
+          if (sameName.length === 1) {
+            const defArity = Number(sameName[0]!.qualifiedName.slice(prefix.length));
+            if (defArity >= callArity) {
+              return {
+                original: ref,
+                targetNodeId: sameName[0]!.id,
+                confidence: 0.8,
+                resolvedBy: 'qualified-name',
+              };
+            }
+          }
+        }
+      }
+      return null;
+    }
     // An arity-LESS qualified ref (dynamic MFA whose args list wasn't a
     // static literal): resolve only when the module defines exactly ONE arity
     // of that function; several arities with no signal is a guess.
@@ -2548,16 +2580,16 @@ export function matchReference(
     };
   }
 
-  // Erlang call/fun refs carry the call-site arity (`f/1` — #1610) because
-  // arity is part of the function's identity and every erlang function's
+  // Erlang / Elixir call/fun refs carry the call-site arity (`f/1`) because
+  // arity is part of the function's identity and every function's
   // qualifiedName carries it (`mod::f/1`). Resolve ONLY to a definition of
   // that exact arity: the call site's own file first (a local call targets its
-  // own module by language semantics; `-import`ed functions ride the
-  // cross-file branch), and when no definition of that arity exists anywhere,
-  // resolve to NOTHING rather than a sibling arity — the real target may be
-  // macro-generated or out of repo, and a wrong-arity edge is worse than none.
+  // own module by language semantics), and when no definition of that arity
+  // exists anywhere, resolve to NOTHING rather than a sibling arity — except
+  // Elixir default-args (`def foo(a, b \\ 1)` indexes as foo/2): a shorter
+  // local call matches when the file defines exactly one function of that name.
   if (
-    ref.language === 'erlang' &&
+    (ref.language === 'erlang' || ref.language === 'elixir') &&
     !ref.referenceName.includes('::') &&
     (ref.referenceKind === 'calls' || ref.referenceKind === 'references')
   ) {
@@ -2565,11 +2597,12 @@ export function matchReference(
     if (am) {
       // endsWith is length-anchored, so `/1` cannot match `…/11`.
       const arityTail = `/${am[2]}`;
+      const lang = ref.language;
       const candidates = context
         .getNodesByName(am[1]!)
         .filter(
           (n) =>
-            n.language === 'erlang' && n.kind === 'function' && n.qualifiedName.endsWith(arityTail),
+            n.language === lang && n.kind === 'function' && n.qualifiedName.endsWith(arityTail),
         );
       if (candidates.length > 0) {
         const sameFile = candidates.find((n) => n.filePath === ref.filePath);
@@ -2588,6 +2621,18 @@ export function matchReference(
             confidence: proximity >= 30 ? 0.7 : 0.4,
             resolvedBy: 'exact-match',
           };
+        }
+      }
+      if (lang === 'elixir') {
+        const callArity = Number(am[2]);
+        const sameFile = context
+          .getNodesByName(am[1]!)
+          .filter((n) => n.language === 'elixir' && n.kind === 'function' && n.filePath === ref.filePath);
+        if (sameFile.length === 1) {
+          const defArity = Number(/\/(\d{1,3})$/.exec(sameFile[0]!.qualifiedName)?.[1]);
+          if (Number.isFinite(defArity) && defArity >= callArity) {
+            return { original: ref, targetNodeId: sameFile[0]!.id, confidence: 0.8, resolvedBy: 'exact-match' };
+          }
         }
       }
       return null;

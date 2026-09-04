@@ -97,7 +97,19 @@ gets no Screens picture at all today:
 The Vue name-index (`VueAppRoutes.byName`) is the closest existing precedent for
 all of these.
 
-### 3. Native UI — no route nodes at all
+### 3. Phoenix — Elixir now indexes, the router does not
+
+Elixir extraction is in (`defmodule` / `def` / `alias` / `Mod.fun` / `|>` /
+`GenServer.call`). **Missing:** Phoenix and Phoenix LiveView **route nodes**.
+`scope "/", AppWeb do get "/", PageController, :index end`, `live "/x", FooLive`,
+and `push_navigate(to: "/x")` / `<.link navigate={...}>` are unread, so a Phoenix
+app has no Entry points and no Screens tab. Same shape as Rails `routes.rb`: a
+router DSL whose destinations are controller-or-LiveView modules, not file paths.
+
+**Validate on:** `phoenixframework/phoenix` (the framework itself) and any
+`phx.new` app, or BlockScout / Plausible.
+
+### 4. Native UI — no route nodes at all
 
 | Platform | Routes would come from | Navigation would come from |
 |---|---|---|
@@ -110,7 +122,7 @@ All three are named in `scripts/try-repo.sh`'s presets as not modelled
 both name routes with string literals, which is the same shape every router
 above reads.
 
-### 4. ArkTS / HarmonyOS — closest to done of anything here
+### 5. ArkTS / HarmonyOS — closest to done of anything here
 
 **Has:** the hard half already. `arkuiRouterEdges` in
 `callback-synthesizer.ts` resolves `router.pushUrl('/pages/Detail')` to the
@@ -136,7 +148,7 @@ Objective-C.
 the first two inherit the C rules and the third has none.)
 
 **No rules** — boxes draw, arrows carry no condition, and no arguments or
-trigger labels are read: PHP, Ruby, Rust, Scala, Dart, Erlang, Lua, Luau, R,
+trigger labels are read: PHP, Ruby, Rust, Scala, Dart, Erlang, Elixir, Lua, Luau, R,
 Solidity, COBOL, CFML, VB.NET, Nix, Terraform, Pascal/Delphi, Liquid, Razor,
 Twig, ArkTS, and the `.svelte` / `.vue` / `.astro` template languages.
 

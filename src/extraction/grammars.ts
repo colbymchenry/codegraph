@@ -46,6 +46,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   cobol: 'tree-sitter-cobol.wasm',
   vbnet: 'tree-sitter-vbnet.wasm',
   erlang: 'tree-sitter-erlang.wasm',
+  elixir: 'tree-sitter-elixir.wasm',
   solidity: 'tree-sitter-solidity.wasm',
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
@@ -162,6 +163,11 @@ export const EXTENSION_MAP: Record<string, Language> = {
   // (`.app`/`.app.src` resource files route via isErlangAppFile below: their
   // last-dot extension is too generic for this map.)
   '.escript': 'erlang',
+  // Elixir: modules (.ex) and scripts/tests/config (.exs). Mix + Phoenix.
+  // Vendored elixir-lang/tree-sitter-elixir 0.3.5 (Apache-2.0, ABI 14) —
+  // tree-sitter-wasms does not ship it; the npm package includes the wasm.
+  '.ex': 'elixir',
+  '.exs': 'elixir',
   // Spring config: `application.properties` / `application-*.properties`. Same
   // shape as the `.yml` variants — the YAML/properties extractor emits one node
   // per leaf key, and the Spring resolver links `@Value("${k}")` references.
@@ -267,7 +273,10 @@ export async function initGrammars(): Promise<void> {
  * MIT) — byte-identical to the npm tarball's artifact. It extends the
  * tree-sitter-javascript grammar the same way tree-sitter-typescript does,
  * adding `struct_declaration` and the `arkui_component_expression` build()
- * DSL. Nix: tree-sitter-wasms doesn't ship it; we vendor a wasm built from
+ * DSL. Elixir: tree-sitter-wasms doesn't ship it; we vendor the prebuilt
+ * tree-sitter-elixir.wasm from elixir-lang/tree-sitter-elixir 0.3.5
+ * (Apache-2.0, ABI 14) — byte-identical to the npm tarball's artifact.
+ * Nix: tree-sitter-wasms doesn't ship it; we vendor a wasm built from
  * nix-community/tree-sitter-nix @ 3d0173d (MIT) with tree-sitter-cli 0.25.10
  * (`generate` + `build --wasm`, ABI 15 — upstream's checked-in parser.c is
  * still ABI 13; all 54 upstream corpus tests pass on the regenerated parser).
@@ -290,7 +299,7 @@ export async function initGrammars(): Promise<void> {
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
-  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
+  'cobol', 'vbnet', 'erlang', 'elixir', 'terraform', 'arkts', 'nix',
   'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
   // R7a (C/C++ kernel port prep): tree-sitter-c v0.24.2 (b780e47) +
   // tree-sitter-cpp v0.23.4 (f41e1a0), parser.c/scanner.c sha-matched against
@@ -705,6 +714,7 @@ export function getLanguageDisplayName(language: Language): string {
     cobol: 'COBOL',
     vbnet: 'Visual Basic .NET',
     erlang: 'Erlang',
+    elixir: 'Elixir',
     terraform: 'Terraform',
     arkts: 'ArkTS',
     unknown: 'Unknown',

@@ -23,6 +23,7 @@ import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
 import { stripCppTemplateArgs } from './languages/c-cpp';
 import { rustImplTypeName } from './languages/rust';
+import { elixirCallRefs } from './languages/elixir';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -3782,6 +3783,31 @@ export class TreeSitterExtractor {
           referenceKind: 'calls',
           line: node.startPosition.row + 1,
           column: node.startPosition.column,
+        });
+      }
+      return;
+    }
+
+    // Elixir: `defmodule`/`def`/`alias`/`if` and ordinary calls are the same
+    // `call` node (target: identifier or dot). Definitions are consumed by
+    // visitNode; this branch sees the rest — local `foo/2`, remote
+    // `Foo.Bar::baz/1` (aliases expanded, `__MODULE__` → this module),
+    // `|> ident` (binary_operator), `&fun/arity` (unary_operator), plus
+    // GenServer.call/cast → handle_call/handle_cast and static apply/spawn MFA
+    // when the target is an alias or `__MODULE__`. Arity is part of identity,
+    // matching the qualifiedName suffix the extractor stamps on every def.
+    if (this.language === 'elixir') {
+      const refs = elixirCallRefs(node, this.source, this.filePath);
+      if (!refs) return;
+      const line = node.startPosition.row + 1;
+      const column = node.startPosition.column;
+      for (const r of refs) {
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: r.referenceName,
+          referenceKind: r.referenceKind,
+          line: r.line ?? line,
+          column: r.column ?? column,
         });
       }
       return;

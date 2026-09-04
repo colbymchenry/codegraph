@@ -108,6 +108,13 @@ export function matchesSymbol(node: Node, symbol: string): boolean {
   // `Session::request` both become `Session::request` here.
   const colonSuffix = parts.join('::');
   if (node.qualifiedName.includes(colonSuffix)) return true;
+  // Elixir (and similar) modules keep dots in the module name
+  // (`MyApp.Accounts::get_user/2`); a query `MyApp.Accounts.get_user` splits
+  // into three parts whose `::` join would be `MyApp::Accounts::get_user`.
+  if (parts.length >= 3) {
+    const dottedMod = `${parts.slice(0, -1).join('.')}::${lastPart}`;
+    if (node.qualifiedName.includes(dottedMod)) return true;
+  }
 
   // Stage 2: file-path containment. Rust modules and Python packages
   // are not in `qualifiedName` — they're encoded in the file path. So

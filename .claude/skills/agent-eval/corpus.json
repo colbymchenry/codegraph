@@ -493,6 +493,29 @@
       "question": "How does a PUBLISH packet from an MQTT client reach the sessions of matching subscribers? Trace the flow from the connection/channel layer through the broker's routing to session delivery."
     }
   ],
+  "Elixir": [
+    {
+      "name": "plug",
+      "repo": "https://github.com/elixir-plug/plug",
+      "size": "Small",
+      "files": "~80",
+      "question": "How does Plug.Builder compile a plug pipeline so a Conn reaches each plug's call/2 in order? Trace from use Plug.Builder through the compiled call/2."
+    },
+    {
+      "name": "phoenix",
+      "repo": "https://github.com/phoenixframework/phoenix",
+      "size": "Medium",
+      "files": "~240",
+      "question": "How does an HTTP request arriving at Phoenix.Endpoint reach a controller action through the router and the controller pipeline?"
+    },
+    {
+      "name": "blockscout",
+      "repo": "https://github.com/blockscout/blockscout",
+      "size": "Large",
+      "files": "~2500",
+      "question": "How does BlockScout fetch a newly imported block from the Ethereum JSON-RPC client and persist it so the block page can serve it? Trace from the indexer fetcher through the import pipeline to the schema."
+    }
+  ],
   "Solidity": [
     {
       "name": "solmate",

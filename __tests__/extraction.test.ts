@@ -150,6 +150,17 @@ describe('Language Detection', () => {
     expect(isSourceFile('default.nix')).toBe(true);
   });
 
+  it('should detect Elixir files', () => {
+    expect(detectLanguage('lib/my_app/accounts.ex')).toBe('elixir');
+    expect(detectLanguage('mix.exs')).toBe('elixir');
+    expect(detectLanguage('test/my_app_test.exs')).toBe('elixir');
+    expect(detectLanguage('config/config.exs')).toBe('elixir');
+    expect(isSourceFile('lib/my_app.ex')).toBe(true);
+    expect(isSourceFile('mix.exs')).toBe(true);
+    expect(isLanguageSupported('elixir')).toBe(true);
+    expect(getSupportedLanguages()).toContain('elixir');
+  });
+
   it('should detect a .h whose only C++ signal is an export-macro class as cpp', () => {
     // Lean Unreal-Engine style header: the class is annotated with an export
     // macro and carries no explicit `public:`/`virtual`/`namespace`/`template`,
@@ -252,6 +263,8 @@ describe('Language Support', () => {
     expect(languages).toContain('dart');
     expect(languages).toContain('solidity');
     expect(languages).toContain('nix');
+    expect(languages).toContain('elixir');
+    expect(languages).toContain('erlang');
   });
 });
 
@@ -10935,6 +10948,303 @@ init(_) -> {ok, #{}}.
       const result = extractFromSource('src/b.erl', code);
       const fns = result.nodes.filter((n) => n.kind === 'function');
       expect(fns).toHaveLength(0);
+    });
+  });
+});
+
+describe('Elixir Extraction', () => {
+  describe('Language detection', () => {
+    it('should report Elixir as supported', () => {
+      expect(isLanguageSupported('elixir')).toBe(true);
+      expect(getSupportedLanguages()).toContain('elixir');
+      expect(isSourceFile('lib/foo.ex')).toBe(true);
+      expect(isSourceFile('mix.exs')).toBe(true);
+    });
+  });
+
+  describe('Module and function extraction', () => {
+    it('should extract defmodule, public and private functions with arity-qualified names', () => {
+      const code = `defmodule MyApp.Accounts do
+  def get_user(id) do
+    id
+  end
+
+  defp normalize(name) do
+    name
+  end
+end
+`;
+      const result = extractFromSource('lib/accounts.ex', code);
+      const mod = result.nodes.find((n) => n.kind === 'module');
+      expect(mod?.name).toBe('MyApp.Accounts');
+      const getUser = result.nodes.find((n) => n.kind === 'function' && n.name === 'get_user');
+      const normalize = result.nodes.find((n) => n.kind === 'function' && n.name === 'normalize');
+      expect(getUser?.qualifiedName).toBe('MyApp.Accounts::get_user/1');
+      expect(getUser?.isExported).toBe(true);
+      expect(normalize?.qualifiedName).toBe('MyApp.Accounts::normalize/1');
+      expect(normalize?.isExported).toBe(false);
+      expect(normalize?.visibility).toBe('private');
+      expect(getUser?.language).toBe('elixir');
+    });
+
+    it('should nest an inner defmodule under its parent', () => {
+      const code = `defmodule Foo do
+  defmodule Bar do
+    def baz, do: :ok
+  end
+end
+`;
+      const result = extractFromSource('lib/foo.ex', code);
+      const mods = result.nodes.filter((n) => n.kind === 'module').map((n) => n.name).sort();
+      expect(mods).toEqual(['Foo', 'Foo.Bar']);
+      const baz = result.nodes.find((n) => n.name === 'baz');
+      expect(baz?.qualifiedName).toBe('Foo.Bar::baz/0');
+    });
+
+    it('should merge multi-clause functions of the same arity into one node', () => {
+      const code = `defmodule M do
+  def classify(:a), do: :atom
+  def classify(:b), do: :atom
+  def classify(_), do: :other
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function' && n.name === 'classify');
+      expect(fns).toHaveLength(1);
+      expect(fns[0]!.startLine).toBe(2);
+      expect(fns[0]!.endLine).toBe(4);
+      expect(fns[0]!.qualifiedName).toBe('M::classify/1');
+    });
+
+    it('should give same-name different-arity functions separate nodes', () => {
+      const code = `defmodule Gap do
+  def f(x), do: x + 1
+  def f(x, y), do: x + y
+end
+`;
+      const result = extractFromSource('lib/gap.ex', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function' && n.name === 'f');
+      expect(fns).toHaveLength(2);
+      expect(fns.map((n) => n.qualifiedName).sort()).toEqual(['Gap::f/1', 'Gap::f/2']);
+    });
+
+    it('should attach @spec and @doc to the following function', () => {
+      const code = `defmodule M do
+  @doc "Fetches a value by key."
+  @spec fetch(binary()) :: {:ok, term()} | :not_found
+  def fetch(key) do
+    lookup(key)
+  end
+
+  defp lookup(_k), do: :not_found
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const fetch = result.nodes.find((n) => n.name === 'fetch');
+      expect(fetch?.signature).toContain('@spec fetch(binary())');
+      expect(fetch?.docstring).toBe('Fetches a value by key.');
+    });
+
+    it('should fall back to the clause header as the signature', () => {
+      const code = `defmodule M do
+  def resize(w, h) when w > 0 and h > 0 do
+    {w, h}
+  end
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const resize = result.nodes.find((n) => n.name === 'resize');
+      expect(resize?.signature).toContain('def resize(w, h) when w > 0 and h > 0');
+    });
+  });
+
+  describe('Types, structs, protocols', () => {
+    it('should extract defstruct fields onto the enclosing module', () => {
+      const code = `defmodule User do
+  defstruct [:name, age: 0]
+end
+`;
+      const result = extractFromSource('lib/user.ex', code);
+      const fields = result.nodes.filter((n) => n.kind === 'field').map((n) => n.name).sort();
+      expect(fields).toEqual(['age', 'name']);
+    });
+
+    it('should extract @type / @typep / @opaque as type aliases', () => {
+      const code = `defmodule M do
+  @type t :: atom() | binary()
+  @typep internal :: reference()
+  @opaque handle() :: reference()
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const aliases = result.nodes.filter((n) => n.kind === 'type_alias').map((n) => n.name).sort();
+      expect(aliases).toEqual(['handle', 'internal', 't']);
+    });
+
+    it('should extract defprotocol as an interface and defimpl as implements', () => {
+      const code = `defprotocol Drawable do
+  def draw(data)
+end
+
+defimpl Drawable, for: User do
+  def draw(user), do: user.name
+end
+`;
+      const result = extractFromSource('lib/drawable.ex', code);
+      const proto = result.nodes.find((n) => n.kind === 'interface');
+      expect(proto?.name).toBe('Drawable');
+      const draw = result.nodes.filter((n) => n.name === 'draw');
+      expect(draw.length).toBeGreaterThanOrEqual(1);
+      const impl = result.unresolvedReferences.find((r) => r.referenceKind === 'implements');
+      expect(impl?.referenceName).toBe('Drawable');
+    });
+  });
+
+  describe('Import extraction', () => {
+    it('should extract alias, import, require, and use', () => {
+      const code = `defmodule M do
+  use GenServer
+  alias MyApp.Repo
+  alias MyApp.Accounts.User
+  import Ecto.Query
+  require Logger
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('GenServer');
+      expect(imports).toContain('MyApp.Repo');
+      expect(imports).toContain('MyApp.Accounts.User');
+      expect(imports).toContain('Ecto.Query');
+      expect(imports).toContain('Logger');
+      const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports').map((r) => r.referenceName);
+      expect(refs).toContain('MyApp.Repo');
+    });
+  });
+
+  describe('Call extraction', () => {
+    it('should record local calls with arity and remote calls module-qualified', () => {
+      const code = `defmodule M do
+  def run(x) do
+    y = prepare(x)
+    Other.process(y)
+  end
+
+  defp prepare(x), do: x
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls).toContain('prepare/1');
+      expect(calls).toContain('Other::process/1');
+    });
+
+    it('should expand aliases on remote calls', () => {
+      const code = `defmodule M do
+  alias MyApp.Repo
+  alias Foo.Bar, as: Baz
+
+  def go(id) do
+    Repo.get(User, id)
+    Baz.qux()
+  end
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls).toContain('MyApp.Repo::get/2');
+      expect(calls).toContain('Foo.Bar::qux/0');
+    });
+
+    it('should count piped calls with +1 arity and capture &fun/arity', () => {
+      const code = `defmodule M do
+  def piped(list) do
+    list
+    |> Enum.map(&String.upcase/1)
+    |> join()
+  end
+
+  defp join(s), do: s
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const refs = result.unresolvedReferences;
+      const calls = refs.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      const captures = refs.filter((r) => r.referenceKind === 'references').map((r) => r.referenceName);
+      expect(calls).toContain('Enum::map/2');
+      expect(calls).toContain('join/1');
+      expect(captures).toContain('String::upcase/1');
+    });
+
+    it('should treat __MODULE__.fun as a local call and link GenServer.dispatch', () => {
+      const code = `defmodule Kv do
+  def get(key) do
+    GenServer.call(__MODULE__, {:get, key})
+  end
+
+  def handle_call({:get, k}, _from, state), do: {:reply, k, state}
+
+  def kick, do: __MODULE__.get(:x)
+end
+`;
+      const result = extractFromSource('lib/kv.ex', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls).toContain('handle_call/3');
+      expect(calls).toContain('get/1');
+    });
+
+    it('should lift static apply/spawn MFA arguments into call refs', () => {
+      const code = `defmodule M do
+  def boot(req) do
+    apply(Other, :handle, [req])
+    spawn(M, :work, [req, :ok])
+  end
+
+  def work(_a, _b), do: :ok
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls).toContain('Other::handle/1');
+      expect(calls).toContain('work/2');
+    });
+
+    it('should stay silent on dynamic remote calls', () => {
+      const code = `defmodule M do
+  def run(mod) do
+    mod.handle(x)
+  end
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls.some((c) => c.includes('handle'))).toBe(false);
+    });
+
+    it('should emit a calls ref for defdelegate targets', () => {
+      const code = `defmodule M do
+  defdelegate count(), to: Repo
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const count = result.nodes.find((n) => n.name === 'count');
+      expect(count?.qualifiedName).toBe('M::count/0');
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls).toContain('Repo::count/0');
+    });
+  });
+
+  describe('Behaviours', () => {
+    it('should emit an implements reference for @behaviour', () => {
+      const code = `defmodule M do
+  @behaviour MyApp.Worker
+
+  def init(_), do: {:ok, %{}}
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const impl = result.unresolvedReferences.find((r) => r.referenceKind === 'implements');
+      expect(impl?.referenceName).toBe('MyApp.Worker');
     });
   });
 });

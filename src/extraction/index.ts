@@ -194,6 +194,10 @@ const DEFAULT_IGNORE_DIRS: ReadonlySet<string> = new Set([
   'lua_modules', '.luarocks',
   // Delphi / RAD Studio IDE backups (duplicate .pas source — would double-count)
   '__history', '__recovery',
+  // Elixir / Mix — compiled beam output and language-server cache. Mix
+  // dependencies live in `deps/`, which is deliberately NOT listed (the name
+  // is first-party-prone); Mix projects gitignore it.
+  '_build', '.elixir_ls',
   // Generic cache
   '.cache',
 ]);

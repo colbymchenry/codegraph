@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="104" height="104" viewBox="0 0 104 104" role="img" aria-label="Elixir">
+  <title>Elixir</title>
+  <rect x="0.5" y="0.5" width="103" height="103" rx="8" fill="#f7f6f2" stroke="#d6d3c8"/>
+  <path fill="#4B275F" d="M52 18c-1.4 9.8-14 18.6-14 32.4C38 60.6 44.2 68 52 68s14-7.4 14-17.6C66 36.6 53.4 27.8 52 18z"/>
+  <path fill="#A48DFF" d="M52 26c-.8 6.2-8.5 12-8.5 20.8 0 5.8 3.3 10.5 8.5 10.5s8.5-4.7 8.5-10.5C60.5 38 52.8 32.2 52 26z"/>
+  <text x="52" y="88" text-anchor="middle" fill="#16150f" font-family="ui-sans-serif, system-ui, sans-serif" font-size="11" font-weight="600" letter-spacing="0.12em">ELIXIR</text>
+</svg>

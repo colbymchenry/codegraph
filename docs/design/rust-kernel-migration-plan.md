@@ -644,6 +644,7 @@ parity before porting the language.
 | vbnet | `languages/vbnet.ts` | T2 | **vendored, patched + external scanner** | Our wasm is a patched grammar WITH a C external scanner — the kernel must build that scanner; ts-cli 0.24 dropped `\p{...}` classes during the original build (#1164). Highest grammar-build risk of any language. | ☐ |
 | cobol | `languages/cobol.ts` | T2 | **vendored fork** | Paragraph-extent reconstruction + copybook resolution are extraction logic (#1161, CardDemo 43/44). Port carefully or keep TS post-pass. | ☐ |
 | erlang | `languages/erlang.ts` | T2 | **vendored (WhatsApp/ELP)** | npm `tree-sitter-erlang` is HIJACKED — never source from it (#1165). gen_server dispatch is synthesis-side (fine). | ☐ |
+| elixir | `languages/elixir.ts` | T2 | **vendored (elixir-lang 0.3.5)** | Everything is a `call` node — defs/directives live in visitNode, calls in extractCall; alias maps are per-module. GenServer/MFA is extraction-side. | ☐ |
 | nix | `languages/nix.ts` | T2 | **vendored (ABI-15 rebuild)** | Option-path synthesizer is synthesis-side; the `===`-always-false → `.equals()` lesson (#1190) is wasm-binding-specific and disappears natively — still gate on nixpkgs (44k files). | ☐ |
 | solidity | `languages/solidity.ts` | T2 | **vendored** | `modifier_invocation` outside body walk (#1170) is extraction-side; port it. | ☐ |
 | terraform | `languages/terraform.ts` | T2 | **vendored** | `:`-scoped refs for module-boundary bridging (#1173); metadata does NOT persist — re-read source (#1174). | ☐ |
