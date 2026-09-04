@@ -492,6 +492,39 @@ impl<'t> Walker<'t> {
     /// extractKotlinReturnType — positional: the first user_type/nullable_type
     /// AFTER function_value_parameters; function_body/type_constraints first →
     /// None; Unit/Nothing → None; `: T` generic params leak (preserve).
+    /// `(params): ReturnType` — the positional read TreeSitterExtractor's
+    /// kotlin getSignature does (#1495): the `function_value_parameters` child,
+    /// then the type node that follows it before the body. Verbatim source text,
+    /// so it round-trips through parity byte-for-byte.
+    fn signature_of(&self, node: Node) -> Option<String> {
+        let mut params: Option<Node> = None;
+        let mut return_type: Option<Node> = None;
+        for i in 0..node.named_child_count() {
+            let Some(child) = node.named_child(i) else { continue };
+            if child.kind() == "function_value_parameters" {
+                params = Some(child);
+                continue;
+            }
+            if params.is_none() {
+                continue;
+            }
+            if matches!(child.kind(), "function_body" | "type_constraints") {
+                break;
+            }
+            if matches!(child.kind(), "user_type" | "nullable_type" | "function_type") {
+                return_type = Some(child);
+                break;
+            }
+        }
+        let params = params?;
+        let mut sig = self.text(params).to_string();
+        if let Some(rt) = return_type {
+            sig.push_str(": ");
+            sig.push_str(self.text(rt));
+        }
+        Some(sig)
+    }
+
     fn return_type_of(&self, node: Node) -> Option<String> {
         let mut seen_params = false;
         for i in 0..node.named_child_count() {
@@ -795,7 +828,7 @@ impl<'t> Walker<'t> {
         }
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
-            signature: None, // dead hook (zero fields)
+            signature: self.signature_of(node),
             visibility: Some(self.visibility_of(node)),
             is_async: Some(self.is_async(node)),
             is_static: Some(false), // kotlin isStatic is always false
@@ -820,7 +853,7 @@ impl<'t> Walker<'t> {
         let qualified_override = receiver.as_ref().map(|r| format!("{r}::{name}"));
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
-            signature: None,
+            signature: self.signature_of(node),
             visibility: Some(self.visibility_of(node)),
             is_async: Some(self.is_async(node)),
             is_static: Some(false),
