@@ -95,9 +95,15 @@ function copilotOnPath(): boolean {
   return false;
 }
 
-function buildCopilotMcpConfig(): { type: string; command: string; args: string[]; tools: string[] } {
+/**
+ * The shared stdio entry, every tool allowed, and `deferTools: 'never'`: Copilot CLI's tool
+ * search (on by default from ~30 connected tools on Claude and GPT-5.4+ models) otherwise holds
+ * MCP tools back until the model searches for them, so `codegraph_explore` would be a name the
+ * model has to go looking for before it can follow the "call it instead of Read" instruction.
+ */
+function buildCopilotMcpConfig(): { type: string; command: string; args: string[]; tools: string[]; deferTools: 'never' } {
   const base = getMcpServerConfig();
-  return { ...base, tools: ['*'] };
+  return { ...base, tools: ['*'], deferTools: 'never' };
 }
 
 class CopilotCliTarget implements AgentTarget {

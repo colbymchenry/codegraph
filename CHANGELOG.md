@@ -213,6 +213,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **The Map covers a multi-root project.** A React Native app's `ios/` beside its `src/` — or any second root holding a fifth of the code — is now on the picture, one level deeper, instead of the map silently drawing only the larger root.
 
+- **`codegraph_explore` is loaded from the first prompt in Claude Code.** Claude Code defers every MCP tool behind a tool-search step, so a fresh session saw only the tool's name until the model searched for it, and the server's "call `codegraph_explore` instead of Read" had nothing loaded to act on. The tool now carries `anthropic/alwaysLoad` in its `_meta`, which exempts it on existing installs, and `codegraph install` writes `alwaysLoad: true` on the Claude Code server entry (re-run it to add the key). Copilot CLI's tool search holds MCP tools back the same way once ~30 tools are connected, so its entry now carries `deferTools: "never"`. (#1696)
+
 - Fixed a long-running `codegraph ui` session serving a symbol that a sync had already deleted. The viewer keeps one connection to your index open, and its in-memory lookup didn't notice when another process — your agent's sync, or `codegraph sync` — rewrote the file underneath it, so a symbol screen could keep showing a body with no callers while search correctly reported it had moved. Because a symbol's identity includes the line it starts on, this happened after almost any edit above it.
 
 ## [1.6.0] - 2026-08-26

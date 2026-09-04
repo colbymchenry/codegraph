@@ -508,11 +508,14 @@ npm install -g @colbymchenry/codegraph
     "codegraph": {
       "type": "stdio",
       "command": "codegraph",
-      "args": ["serve", "--mcp"]
+      "args": ["serve", "--mcp"],
+      "alwaysLoad": true
     }
   }
 }
 ```
+
+`alwaysLoad` keeps `codegraph_explore` loaded from the first prompt. Claude Code otherwise defers every MCP tool behind a tool-search step, so a fresh session sees only the tool's name until the model searches for it.
 
 **Add to `~/.claude/settings.json` (optional, for auto-allow):**
 ```json

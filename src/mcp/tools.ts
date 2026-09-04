@@ -942,6 +942,12 @@ export interface ToolDefinition {
   };
   /** Behavioral hints for clients (see {@link ToolAnnotations}). */
   annotations?: ToolAnnotations;
+  /**
+   * MCP `_meta` on the tool definition. `anthropic/alwaysLoad: true` makes
+   * Claude Code load the tool at session start instead of deferring it behind
+   * its tool search (https://code.claude.com/docs/en/mcp#exempt-a-server-from-deferral).
+   */
+  _meta?: Record<string, unknown>;
 }
 
 /**
@@ -1196,6 +1202,9 @@ export const tools: ToolDefinition[] = [
       required: ['query'],
     },
     annotations: READ_ONLY_ANNOTATIONS,
+    // Loaded from the first prompt in Claude Code, which otherwise defers every
+    // MCP tool behind a ToolSearch step (#1696).
+    _meta: { 'anthropic/alwaysLoad': true },
   },
   {
     name: 'codegraph_status',

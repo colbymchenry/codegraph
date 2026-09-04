@@ -12,6 +12,9 @@
  * rewrites codegraph_explore's description via spread), and the no-default-
  * project surface (`withRequiredProjectPath`, which clones the schema). A drop in
  * any of those would silently re-block the tools in Ask mode.
+ *
+ * `codegraph_explore`'s `_meta` (`anthropic/alwaysLoad`, #1696) rides the same
+ * spreads, so each surface is checked for it here too.
  */
 import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import * as fs from 'fs';
@@ -34,6 +37,13 @@ function expectReadOnly(tool: ToolDefinition): void {
   expect(tool.annotations!.openWorldHint).toBe(false);
 }
 
+/** Assert the explore tool in a `tools/list` surface is marked always-load for Claude Code (#1696). */
+function expectExploreAlwaysLoad(surface: ToolDefinition[]): void {
+  const explore = surface.find((t) => t.name === 'codegraph_explore');
+  expect(explore, 'codegraph_explore is missing from the surface').toBeDefined();
+  expect(explore!._meta).toEqual({ 'anthropic/alwaysLoad': true });
+}
+
 describe('Read-only annotations on the codegraph MCP tools (#1018)', () => {
   const original = process.env[ENV];
   afterEach(() => {
@@ -44,6 +54,7 @@ describe('Read-only annotations on the codegraph MCP tools (#1018)', () => {
   it('every tool in the master array is annotated read-only', () => {
     expect(tools.length).toBeGreaterThan(0);
     for (const tool of tools) expectReadOnly(tool);
+    expectExploreAlwaysLoad(tools);
   });
 
   it('the static proxy surface carries annotations on every exposed tool', () => {
@@ -52,6 +63,7 @@ describe('Read-only annotations on the codegraph MCP tools (#1018)', () => {
     const got = getStaticTools();
     expect(got.map((t) => t.name).sort()).toEqual(tools.map((t) => t.name).sort());
     for (const tool of got) expectReadOnly(tool);
+    expectExploreAlwaysLoad(got);
   });
 
   it('the no-default-project surface keeps annotations through the schema clone', () => {
@@ -65,6 +77,7 @@ describe('Read-only annotations on the codegraph MCP tools (#1018)', () => {
       // Sanity: this IS the clone path (projectPath got marked required).
       expect(tool.inputSchema.required ?? []).toContain('projectPath');
     }
+    expectExploreAlwaysLoad(got);
   });
 });
 
@@ -101,5 +114,6 @@ describe('Live tool surface keeps annotations with a project open (#1018)', () =
     expect(explore).toBeDefined();
     expect(explore!.description).toMatch(/Budget: make at most/);
     expectReadOnly(explore!);
+    expectExploreAlwaysLoad(got);
   });
 });
