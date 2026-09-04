@@ -94,6 +94,49 @@ end
     expect(edges).toContainEqual({ sq: 'Opts::run/1', tq: 'Opts::get/2' });
   });
 
+  it('resolves a local call to the enclosing module when the file has two modules', async () => {
+    fs.mkdirSync(path.join(dir, 'lib'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'lib', 'pair.ex'),
+      `defmodule First do
+  def work(x), do: {:first, x}
+  def run(x), do: work(x)
+end
+
+defmodule Second do
+  def work(x), do: {:second, x}
+  def run(x), do: work(x)
+end
+`
+    );
+    const edges = await callEdges(dir);
+    expect(edges).toContainEqual({ sq: 'First::run/1', tq: 'First::work/1' });
+    expect(edges).toContainEqual({ sq: 'Second::run/1', tq: 'Second::work/1' });
+    expect(edges.some((e) => e.sq === 'Second::run/1' && e.tq === 'First::work/1')).toBe(false);
+    expect(edges.some((e) => e.sq === 'First::run/1' && e.tq === 'Second::work/1')).toBe(false);
+  });
+
+  it('does not resolve an explicit import to an unrelated same-named function', async () => {
+    fs.mkdirSync(path.join(dir, 'lib'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'lib', 'other.ex'),
+      `defmodule Other do
+  def work(x), do: {:other, x}
+end
+`
+    );
+    fs.writeFileSync(
+      path.join(dir, 'lib', 'client.ex'),
+      `defmodule Client do
+  import Foo, only: [work: 1]
+  def go(x), do: work(x)
+end
+`
+    );
+    const edges = await callEdges(dir);
+    expect(edges.some((e) => e.sq === 'Client::go/1' && e.tq === 'Other::work/1')).toBe(false);
+  });
+
   it('resolves aliased remote calls across files', async () => {
     fs.mkdirSync(path.join(dir, 'lib'), { recursive: true });
     fs.writeFileSync(

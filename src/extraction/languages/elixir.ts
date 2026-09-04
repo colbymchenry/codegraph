@@ -154,6 +154,17 @@ function importOnly(): Map<string, string> {
   return importOnlyStack[importOnlyStack.length - 1]!;
 }
 
+/** Copy of the current maps — function-local alias/import must not leak. */
+function pushCopiedDirectives(): void {
+  aliasStack.push(new Map(aliases()));
+  importOnlyStack.push(new Map(importOnly()));
+}
+
+function popDirectives(): void {
+  aliasStack.pop();
+  importOnlyStack.pop();
+}
+
 function currentModule(): string | null {
   return moduleStack[moduleStack.length - 1] ?? null;
 }
@@ -342,13 +353,10 @@ function collectImportOnly(call: SyntaxNode, source: string): void {
   }
 }
 
-function collectDirectives(body: SyntaxNode, source: string): void {
+function visitNamedChildren(body: SyntaxNode, ctx: ExtractorContext): void {
   for (let i = 0; i < body.namedChildCount; i++) {
     const child = body.namedChild(i);
-    if (!child || child.type !== 'call') continue;
-    const ident = targetIdent(child, source);
-    if (ident === 'alias') collectAlias(child, source);
-    else if (ident === 'import') collectImportOnly(child, source);
+    if (child) ctx.visitNode(child);
   }
 }
 
@@ -380,13 +388,10 @@ function handleDefmodule(node: SyntaxNode, ctx: ExtractorContext, kind: 'module'
   importOnlyStack.push(new Map());
   moduleStack.push(name);
   ctx.pushScope(mod.id);
-  if (body) {
-    collectDirectives(body, ctx.source);
-    for (let i = 0; i < body.namedChildCount; i++) {
-      const child = body.namedChild(i);
-      if (child) ctx.visitNode(child);
-    }
-  }
+  // Visit in source order so alias/import bindings apply only after they
+  // appear (Elixir aliases are lexical). Pre-collecting every directive
+  // left the last binding active for the whole module.
+  if (body) visitNamedChildren(body, ctx);
   ctx.popScope();
   moduleStack.pop();
   aliasStack.pop();
@@ -410,7 +415,9 @@ function handleDefun(node: SyntaxNode, ctx: ExtractorContext): boolean {
       }
     }
     ctx.pushScope(lastFnId);
+    pushCopiedDirectives();
     visitBody(node, ctx);
+    popDirectives();
     ctx.popScope();
     return true;
   }
@@ -427,6 +434,7 @@ function handleDefun(node: SyntaxNode, ctx: ExtractorContext): boolean {
   const modName = currentModule();
   fn.qualifiedName = modName ? `${modName}::${name}/${arity}` : `${name}/${arity}`;
   ctx.pushScope(fn.id);
+  pushCopiedDirectives();
   visitBody(node, ctx);
   if (ident === 'defdelegate') {
     const to = keywordValue(keywordsNode(node), 'to', ctx.source);
@@ -443,6 +451,7 @@ function handleDefun(node: SyntaxNode, ctx: ExtractorContext): boolean {
       });
     }
   }
+  popDirectives();
   ctx.popScope();
   lastFnName = name;
   lastFnArity = arity;
@@ -474,45 +483,62 @@ function handleDefstruct(node: SyntaxNode, ctx: ExtractorContext): boolean {
   return true;
 }
 
-function handleDefimpl(node: SyntaxNode, ctx: ExtractorContext): boolean {
-  const args = argumentsNode(node);
-  const protocol = args?.namedChildren.find((c) => c.type === 'alias');
-  const forType = keywordValue(keywordsNode(node), 'for', ctx.source);
-  const parentId = ctx.nodeStack[ctx.nodeStack.length - 1];
-  const fromId = parentId;
-  if (protocol && fromId) {
-    const targets: SyntaxNode[] = [];
-    if (forType?.type === 'alias') targets.push(forType);
-    else if (forType?.type === 'list') {
-      for (const c of forType.namedChildren) if (c.type === 'alias') targets.push(c);
-    }
-    // No `for:` — the impl sits inside the target module.
-    if (targets.length === 0 && currentModule()) {
-      ctx.addUnresolvedReference({
-        fromNodeId: fromId,
-        referenceName: getNodeText(protocol, ctx.source),
-        referenceKind: 'implements',
-        line: node.startPosition.row + 1,
-        column: node.startPosition.column,
-      });
-    } else {
-      for (const t of targets) {
-        ctx.addUnresolvedReference({
-          fromNodeId: fromId,
-          referenceName: getNodeText(protocol, ctx.source),
-          referenceKind: 'implements',
-          line: t.startPosition.row + 1,
-          column: t.startPosition.column,
-        });
-      }
+function implTargetTypes(forType: SyntaxNode | null, source: string): string[] {
+  const names: string[] = [];
+  if (forType?.type === 'alias') names.push(expandAlias(getNodeText(forType, source)));
+  else if (forType?.type === 'list') {
+    for (const c of forType.namedChildren) {
+      if (c.type === 'alias') names.push(expandAlias(getNodeText(c, source)));
     }
   }
+  if (names.length === 0 && currentModule()) names.push(currentModule()!);
+  return names;
+}
+
+function implModuleName(protocol: string, types: string[]): string {
+  if (types.length === 0) return protocol;
+  if (types.length === 1) return `${protocol}.${types[0]}`;
+  return `${protocol}.{${types.join(', ')}}`;
+}
+
+function handleDefimpl(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  const args = argumentsNode(node);
+  const protocolNode = args?.namedChildren.find((c) => c.type === 'alias');
+  const protocol = protocolNode ? expandAlias(getNodeText(protocolNode, ctx.source)) : null;
+  const types = implTargetTypes(keywordValue(keywordsNode(node), 'for', ctx.source), ctx.source);
+  const implName = protocol ? implModuleName(protocol, types) : null;
+  const impl = implName
+    ? ctx.createNode('module', implName, node, {
+        signature: defSignature(node, undefined, ctx.source),
+        isExported: true,
+      })
+    : null;
+  if (impl && implName) impl.qualifiedName = implName;
+
+  const fromId = impl?.id ?? ctx.nodeStack[ctx.nodeStack.length - 1];
+  if (protocol && fromId) {
+    ctx.addUnresolvedReference({
+      fromNodeId: fromId,
+      referenceName: protocol,
+      referenceKind: 'implements',
+      line: node.startPosition.row + 1,
+      column: node.startPosition.column,
+    });
+  }
+
+  if (impl && implName) {
+    aliasStack.push(new Map());
+    importOnlyStack.push(new Map());
+    moduleStack.push(implName);
+    ctx.pushScope(impl.id);
+  }
   const body = doBlock(node);
-  if (body) {
-    for (let i = 0; i < body.namedChildCount; i++) {
-      const child = body.namedChild(i);
-      if (child) ctx.visitNode(child);
-    }
+  if (body) visitNamedChildren(body, ctx);
+  if (impl) {
+    ctx.popScope();
+    moduleStack.pop();
+    aliasStack.pop();
+    importOnlyStack.pop();
   }
   return true;
 }
@@ -620,15 +646,17 @@ function handleAttribute(node: SyntaxNode, ctx: ExtractorContext): boolean {
 
 type CallRef = Pick<UnresolvedReference, 'referenceName' | 'referenceKind' | 'line' | 'column'>;
 
-function emitImported(fun: string, arity: number, node: SyntaxNode, out: CallRef[]): void {
+/** True when an explicit `import Mod, only: [fun: N]` covers this call. */
+function emitImported(fun: string, arity: number, node: SyntaxNode, out: CallRef[]): boolean {
   const mod = importOnly().get(`${fun}/${arity}`);
-  if (!mod) return;
+  if (!mod) return false;
   out.push({
     referenceName: `${expandAlias(mod)}::${fun}/${arity}`,
     referenceKind: 'calls',
     line: node.startPosition.row + 1,
     column: node.startPosition.column,
   });
+  return true;
 }
 
 /**
@@ -693,13 +721,10 @@ export function elixirCallRefs(
     const right = getChildByField(node, 'right');
     if (right?.type === 'identifier') {
       const fun = getNodeText(right, source);
-      const refs: Array<Pick<UnresolvedReference, 'referenceName' | 'referenceKind' | 'line' | 'column'>> = [
-        { referenceName: `${fun}/1`, referenceKind: 'calls', line: right.startPosition.row + 1, column: right.startPosition.column },
-      ];
-      const mod = importOnly().get(`${fun}/1`);
-      if (mod) {
+      const refs: Array<Pick<UnresolvedReference, 'referenceName' | 'referenceKind' | 'line' | 'column'>> = [];
+      if (!emitImported(fun, 1, right, refs)) {
         refs.push({
-          referenceName: `${expandAlias(mod)}::${fun}/1`,
+          referenceName: `${fun}/1`,
           referenceKind: 'calls',
           line: right.startPosition.row + 1,
           column: right.startPosition.column,
@@ -714,6 +739,11 @@ export function elixirCallRefs(
 
   const ident = targetIdent(node, source);
   if (ident && (SPECIAL_FORMS.has(ident) || DEF_FUN.has(ident) || DEF_MOD.has(ident) || ident === 'defimpl' || ident === 'defstruct' || ident === 'defexception')) {
+    // Function bodies are walked via extractCall, not visitNode, so alias/
+    // import inside a def never hit handleImport. Record them here against
+    // the function-scoped maps pushed around visitBody.
+    if (ident === 'alias') collectAlias(node, source);
+    else if (ident === 'import') collectImportOnly(node, source);
     return null;
   }
 
@@ -722,8 +752,9 @@ export function elixirCallRefs(
   const refs: Array<Pick<UnresolvedReference, 'referenceName' | 'referenceKind' | 'line' | 'column'>> = [];
 
   if (target?.type === 'identifier' && ident) {
-    refs.push({ referenceName: `${ident}/${arity}`, referenceKind: 'calls', line, column });
-    emitImported(ident, arity, node, refs);
+    if (!emitImported(ident, arity, node, refs)) {
+      refs.push({ referenceName: `${ident}/${arity}`, referenceKind: 'calls', line, column });
+    }
     maybeMfa(node, source, ident, null, refs);
   } else if (target?.type === 'dot') {
     const q = qualifyDot(target, source);
@@ -841,10 +872,6 @@ export const elixirExtractor: LanguageExtractor = {
 
   visitNode: (node, ctx) => {
     resetState(ctx.filePath);
-    if (node.type === 'source') {
-      collectDirectives(node, ctx.source);
-      return false;
-    }
     if (node.type === 'unary_operator' && operatorOf(node, ctx.source) === '@') {
       return handleAttribute(node, ctx);
     }

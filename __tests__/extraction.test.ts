@@ -11093,10 +11093,39 @@ end
       const result = extractFromSource('lib/drawable.ex', code);
       const proto = result.nodes.find((n) => n.kind === 'interface');
       expect(proto?.name).toBe('Drawable');
-      const draw = result.nodes.filter((n) => n.name === 'draw');
-      expect(draw.length).toBeGreaterThanOrEqual(1);
+      const implMod = result.nodes.find((n) => n.kind === 'module' && n.name === 'Drawable.User');
+      expect(implMod?.qualifiedName).toBe('Drawable.User');
+      const draw = result.nodes.find((n) => n.kind === 'function' && n.name === 'draw' && n.qualifiedName !== 'Drawable::draw/1');
+      expect(draw?.qualifiedName).toBe('Drawable.User::draw/1');
       const impl = result.unresolvedReferences.find((r) => r.referenceKind === 'implements');
       expect(impl?.referenceName).toBe('Drawable');
+      expect(impl?.fromNodeId).toBe(implMod?.id);
+    });
+
+    it('should give each top-level defimpl its own scope so callbacks do not share qnames', () => {
+      const code = `defprotocol Drawable do
+  def draw(data)
+end
+
+defimpl Drawable, for: User do
+  def draw(user), do: user.name
+end
+
+defimpl Drawable, for: Post do
+  def draw(post), do: post.title
+end
+`;
+      const result = extractFromSource('lib/drawable.ex', code);
+      const draws = result.nodes
+        .filter((n) => n.kind === 'function' && n.name === 'draw' && n.qualifiedName.startsWith('Drawable.'))
+        .map((n) => n.qualifiedName)
+        .sort();
+      expect(draws).toEqual(['Drawable.Post::draw/1', 'Drawable.User::draw/1']);
+      const impls = result.unresolvedReferences.filter((r) => r.referenceKind === 'implements');
+      expect(impls).toHaveLength(2);
+      const userMod = result.nodes.find((n) => n.qualifiedName === 'Drawable.User');
+      const postMod = result.nodes.find((n) => n.qualifiedName === 'Drawable.Post');
+      expect(impls.map((r) => r.fromNodeId).sort()).toEqual([postMod?.id, userMod?.id].sort());
     });
   });
 
@@ -11154,6 +11183,104 @@ end
       const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
       expect(calls).toContain('MyApp.Repo::get/2');
       expect(calls).toContain('Foo.Bar::qux/0');
+    });
+
+    it('should apply aliases in source order, not the final binding for the whole module', () => {
+      const code = `defmodule M do
+  def early(id), do: Repo.get(id)
+
+  alias A.Repo
+
+  def mid(id), do: Repo.get(id)
+
+  alias B.Repo
+
+  def late(id), do: Repo.get(id)
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const byFn = (name: string) => {
+        const fn = result.nodes.find((n) => n.kind === 'function' && n.name === name);
+        return result.unresolvedReferences
+          .filter((r) => r.referenceKind === 'calls' && r.fromNodeId === fn?.id)
+          .map((r) => r.referenceName);
+      };
+      expect(byFn('early')).toContain('Repo::get/1');
+      expect(byFn('early').some((c) => c.startsWith('A.Repo') || c.startsWith('B.Repo'))).toBe(false);
+      expect(byFn('mid')).toContain('A.Repo::get/1');
+      expect(byFn('late')).toContain('B.Repo::get/1');
+    });
+
+    it('should expand aliases and imports declared inside a function without leaking them', () => {
+      const code = `defmodule M do
+  def one(id) do
+    alias MyApp.Repo
+    Repo.get(id)
+  end
+
+  def two(id) do
+    Repo.get(id)
+  end
+
+  def three(x) do
+    import Foo, only: [work: 1]
+    work(x)
+  end
+
+  def four(x), do: work(x)
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const byFn = (name: string) => {
+        const fn = result.nodes.find((n) => n.kind === 'function' && n.name === name);
+        return result.unresolvedReferences
+          .filter((r) => r.referenceKind === 'calls' && r.fromNodeId === fn?.id)
+          .map((r) => r.referenceName);
+      };
+      expect(byFn('one')).toContain('MyApp.Repo::get/1');
+      expect(byFn('two')).toContain('Repo::get/1');
+      expect(byFn('two').some((c) => c.startsWith('MyApp.Repo'))).toBe(false);
+      expect(byFn('three')).toEqual(['Foo::work/1']);
+      expect(byFn('four')).toEqual(['work/1']);
+    });
+
+    it('should not leak function-local aliases across multi-clause heads', () => {
+      const code = `defmodule M do
+  def foo(:a) do
+    alias A.Repo
+    Repo.get(1)
+  end
+  def foo(:b) do
+    Repo.get(2)
+  end
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const foo = result.nodes.find((n) => n.kind === 'function' && n.name === 'foo');
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls' && r.fromNodeId === foo?.id)
+        .map((r) => r.referenceName);
+      expect(calls).toContain('A.Repo::get/1');
+      expect(calls).toContain('Repo::get/1');
+    });
+
+    it('should emit only the qualified target for an explicit import only: list', () => {
+      const code = `defmodule M do
+  import Foo, only: [work: 1]
+
+  def go(x) do
+    work(x)
+    x |> work()
+  end
+end
+`;
+      const result = extractFromSource('lib/m.ex', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(calls.filter((c) => c === 'Foo::work/1' || c === 'work/1').sort()).toEqual([
+        'Foo::work/1',
+        'Foo::work/1',
+      ]);
+      expect(calls).not.toContain('work/1');
     });
 
     it('should count piped calls with +1 arity and capture &fun/arity', () => {

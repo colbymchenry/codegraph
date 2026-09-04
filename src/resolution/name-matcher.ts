@@ -2512,6 +2512,42 @@ export function dumpNameMatcherProfile(label: string): void {
   }
 }
 
+/** `Mod::fun/N` → `Mod`; a file-level def with no module prefix yields null. */
+function elixirEnclosingModule(qn: string | undefined): string | null {
+  if (!qn) return null;
+  const sep = qn.indexOf('::');
+  return sep > 0 ? qn.slice(0, sep) : null;
+}
+
+function elixirCallerModule(ref: UnresolvedRef, context: ResolutionContext): string | null {
+  return elixirEnclosingModule(context.getNodeById?.(ref.fromNodeId)?.qualifiedName);
+}
+
+/**
+ * Same-file Elixir defs of `name`, restricted to the caller's module when
+ * we know it. A later module in the same `.ex` file is not a local call.
+ */
+function elixirSameFileFns(context: ResolutionContext, name: string, ref: UnresolvedRef): Node[] {
+  const callerMod = elixirCallerModule(ref, context);
+  return context.getNodesByName(name).filter((n) => {
+    if (n.language !== 'elixir' || n.kind !== 'function' || n.filePath !== ref.filePath) return false;
+    if (!callerMod) return true;
+    return elixirEnclosingModule(n.qualifiedName) === callerMod;
+  });
+}
+
+function pickElixirEnclosingModuleDef(
+  candidates: Node[],
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): Node | undefined {
+  const sameFile = candidates.filter((n) => n.filePath === ref.filePath);
+  if (sameFile.length === 0) return undefined;
+  const callerMod = elixirCallerModule(ref, context);
+  if (!callerMod) return sameFile[0];
+  return sameFile.find((n) => elixirEnclosingModule(n.qualifiedName) === callerMod);
+}
+
 export function matchReference(
   ref: UnresolvedRef,
   context: ResolutionContext
@@ -2588,6 +2624,9 @@ export function matchReference(
   // exists anywhere, resolve to NOTHING rather than a sibling arity — except
   // Elixir default-args (`def foo(a, b \\ 1)` indexes as foo/2): a shorter
   // local call matches when the file defines exactly one function of that name.
+  // Elixir files may hold several modules; a local call is scoped to the
+  // caller's enclosing module (`Mod::fun/N`), not the first same-name def
+  // in the file.
   if (
     (ref.language === 'erlang' || ref.language === 'elixir') &&
     !ref.referenceName.includes('::') &&
@@ -2605,9 +2644,16 @@ export function matchReference(
             n.language === lang && n.kind === 'function' && n.qualifiedName.endsWith(arityTail),
         );
       if (candidates.length > 0) {
-        const sameFile = candidates.find((n) => n.filePath === ref.filePath);
-        if (sameFile) {
-          return { original: ref, targetNodeId: sameFile.id, confidence: 0.95, resolvedBy: 'exact-match' };
+        if (lang === 'elixir') {
+          const local = pickElixirEnclosingModuleDef(candidates, ref, context);
+          if (local) {
+            return { original: ref, targetNodeId: local.id, confidence: 0.95, resolvedBy: 'exact-match' };
+          }
+        } else {
+          const sameFile = candidates.find((n) => n.filePath === ref.filePath);
+          if (sameFile) {
+            return { original: ref, targetNodeId: sameFile.id, confidence: 0.95, resolvedBy: 'exact-match' };
+          }
         }
         if (candidates.length === 1) {
           return { original: ref, targetNodeId: candidates[0]!.id, confidence: 0.8, resolvedBy: 'exact-match' };
@@ -2625,9 +2671,7 @@ export function matchReference(
       }
       if (lang === 'elixir') {
         const callArity = Number(am[2]);
-        const sameFile = context
-          .getNodesByName(am[1]!)
-          .filter((n) => n.language === 'elixir' && n.kind === 'function' && n.filePath === ref.filePath);
+        const sameFile = elixirSameFileFns(context, am[1]!, ref);
         if (sameFile.length === 1) {
           const defArity = Number(/\/(\d{1,3})$/.exec(sameFile[0]!.qualifiedName)?.[1]);
           if (Number.isFinite(defArity) && defArity >= callArity) {
