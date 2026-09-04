@@ -41,8 +41,15 @@ export function classifyTsClassMember(node: SyntaxNode): 'method' | 'property' {
 export const typescriptExtractor: LanguageExtractor = {
   functionTypes: ['function_declaration', 'arrow_function', 'function_expression'],
   classTypes: ['class_declaration', 'abstract_class_declaration'],
-  methodTypes: ['method_definition', 'public_field_definition'],
+  // `method_signature` is the interface/type-literal form of a method; without it
+  // an interface's members never enter the graph, so a `.d.ts` platform API has
+  // no declaration node for call sites to attach to (#1638). Java/C# don't need
+  // an equivalent — their grammars reuse `method_declaration`.
+  methodTypes: ['method_definition', 'public_field_definition', 'method_signature'],
   classifyMethodNode: classifyTsClassMember,
+  // The interface counterpart of `public_field_definition`. It carries no value,
+  // so it is always a property and never needs classifyMethodNode.
+  propertyTypes: ['property_signature'],
   interfaceTypes: ['interface_declaration'],
   structTypes: [],
   enumTypes: ['enum_declaration'],
