@@ -137,6 +137,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- `codegraph index <path>` now refuses uninitialized paths and names the nearest initialized parent instead of silently rebuilding it; thanks @danusha2345. (#1524, #1689)
+
 - Sync now recovers the same connections as a clean index after interrupted reference resolution, including inherited calls and callbacks that previously stayed missing. (#1577)
 
 - `codegraph_explore` now re-serves source to fresh subagents and after context compaction, with cross-call dedup available only through an explicit `CODEGRAPH_EXPLORE_DEDUP=1` opt-in; thanks @danusha2345. (#1620, #1624)
