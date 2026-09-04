@@ -213,6 +213,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **The Map covers a multi-root project.** A React Native app's `ios/` beside its `src/` — or any second root holding a fifth of the code — is now on the picture, one level deeper, instead of the map silently drawing only the larger root.
 
+- **The Claude Code prompt hook's context now arrives inline.** The hook capped its injection at 16,000 characters, but Claude Code shows hook output inline only up to 10,000 and otherwise persists it to a file with a 2 KB preview, so on any repo where explore filled the cap the model saw a file path and the first 2 KB. The cap is now 9,000 characters, under the limit with room for the wrapper. (#1694)
+
 - Fixed a long-running `codegraph ui` session serving a symbol that a sync had already deleted. The viewer keeps one connection to your index open, and its in-memory lookup didn't notice when another process — your agent's sync, or `codegraph sync` — rewrote the file underneath it, so a symbol screen could keep showing a body with no callers while search correctly reported it had moved. Because a symbol's identity includes the line it starts on, this happened after almost any edit above it.
 
 ## [1.6.0] - 2026-08-26

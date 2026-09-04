@@ -1412,7 +1412,11 @@ program
             const text = result.content[0]?.text ?? '';
             if (!result.isError && text.trim()) {
               // Cap the injection so a large-repo explore can't flood the prompt.
-              const MAX = 16000;
+              // Claude Code shows hook stdout inline only up to 10,000 characters;
+              // above that it persists the output to a file and the model sees a
+              // 2 KB preview (#1694). 9,000 leaves room for the wrapper and the
+              // projectPath nudge lines below.
+              const MAX = 9000;
               const body = text.length > MAX ? `${text.slice(0, MAX)}\n…(truncated; call codegraph_explore for the rest)` : text;
               // For a front-loaded SUB-project, a follow-up explore needs its path.
               const more = plan.viaSubScan
