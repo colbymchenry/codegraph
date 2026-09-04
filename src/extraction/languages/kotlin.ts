@@ -1,5 +1,5 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getNodeText, getChildByField } from '../tree-sitter-helpers';
+import { getNodeText } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
 /** Kotlin return types that can't be a chained-call receiver (no class to chain on). */
@@ -275,9 +275,26 @@ export const kotlinExtractor: LanguageExtractor = {
     return undefined;
   },
   getSignature: (node, source) => {
-    // Kotlin function signature: fun name(params): ReturnType
-    const params = getChildByField(node, 'function_value_parameters');
-    const returnType = getChildByField(node, 'type');
+    // Kotlin function signature: fun name(params): ReturnType. tree-sitter-kotlin
+    // exposes no field names, so both parts are found positionally, the way
+    // extractKotlinReturnType does (#1495): the `function_value_parameters`
+    // child, then the type node that follows it before the body.
+    let params: SyntaxNode | null = null;
+    let returnType: SyntaxNode | null = null;
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (!child) continue;
+      if (child.type === 'function_value_parameters') {
+        params = child;
+        continue;
+      }
+      if (!params) continue;
+      if (child.type === 'function_body' || child.type === 'type_constraints') break;
+      if (child.type === 'user_type' || child.type === 'nullable_type' || child.type === 'function_type') {
+        returnType = child;
+        break;
+      }
+    }
     if (!params) return undefined;
     let sig = getNodeText(params, source);
     if (returnType) {
