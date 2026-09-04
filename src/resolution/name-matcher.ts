@@ -2246,6 +2246,30 @@ function matchRustSelfFieldCall(
 }
 
 /**
+ * The one fallback a TS/JS/Python call-receiver chain keeps (#1683): a STORE
+ * ACCESSOR. Zustand's `get()` inside the store factory and
+ * `useStore.getState()` outside it hand back the store whose actions are
+ * indexed as functions (#1573), so a unique callable of the method's name in
+ * the same language family is what `get().reset()` reaches. Nothing else
+ * qualifies: a chain rooted in a project value still says nothing about what
+ * the inner call RETURNS — `db.prepare(sql).all()` would bind to any project
+ * function named `all` — so it resolves to nothing, exactly like a chain
+ * rooted in a parameter (`d.setdefault(k, []).append(v)`).
+ */
+function matchStoreAccessorChain(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const m = ref.referenceName.match(/^([\w$.]+)\(\)\.(\w+)$/);
+  if (!m || !m[1] || !m[2]) return null;
+  const inner = m[1];
+  const method = m[2];
+  if (!(inner === 'get' || inner === 'getState' || inner.endsWith('.getState'))) return null;
+  const callables = context
+    .getNodesByName(method)
+    .filter((n) => (n.kind === 'function' || n.kind === 'method') && sameLanguageFamily(n.language, ref.language) && n.id !== ref.fromNodeId);
+  if (callables.length !== 1) return null;
+  return { original: ref, targetNodeId: callables[0]!.id, confidence: 0.6, resolvedBy: 'exact-match' };
+}
+
+/**
  * Split a camelCase or PascalCase string into words.
  */
 function splitCamelCase(str: string): string[] {
@@ -2642,6 +2666,19 @@ export function matchReference(
   ) {
     result = nmTimed('dottedChain', ref, () => matchDottedCallChain(ref, context));
     if (result) return result;
+  }
+
+  // A call-receiver chain the extractor encoded as `<inner>().<method>` for a
+  // language with no chain resolver above (TS/JS, Python — #1683) is a
+  // receiver whose type is unknown. Nothing below may guess for it: the
+  // method-call pattern rejects the parens, exact name never matches, but the
+  // fuzzy strategy splits on `.` and would hand `make().run` to any `run` —
+  // the fabricated edge the encoding exists to prevent.
+  if (
+    ref.referenceName.includes('().') &&
+    (ref.language === 'typescript' || ref.language === 'javascript' || ref.language === 'tsx' || ref.language === 'jsx' || ref.language === 'python')
+  ) {
+    return nmTimed('storeAccessorChain', ref, () => matchStoreAccessorChain(ref, context));
   }
 
   // 2. Method call pattern
