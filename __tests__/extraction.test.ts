@@ -1408,6 +1408,73 @@ impl Describe for Reg {
   });
 });
 
+// =============================================================================
+// Interv — a small self-hosting functional language (v2)
+// =============================================================================
+
+describe('Interv Extraction', () => {
+  it('should detect Interv files', () => {
+    expect(detectLanguage('src/util.iv')).toBe('interv');
+    expect(detectLanguage('nested/path/module.iv')).toBe('interv');
+    expect(isSourceFile('src/main.iv')).toBe(true);
+    expect(isLanguageSupported('interv')).toBe(true);
+  });
+
+  it('should extract function definitions from `name :: fn(...)`', () => {
+    const code = `
+area :: fn (s) {
+  case s {
+    Circle(r) -> 3 * r * r;
+    Rect(w, h) -> w * h
+  }
+}
+`;
+    const result = extractFromSource('shapes.iv', code);
+    const funcNode = result.nodes.find((n) => n.kind === 'function');
+    expect(funcNode).toBeDefined();
+    expect(funcNode?.name).toBe('area');
+    expect(funcNode?.signature).toContain('s');
+  });
+
+  it('should extract data types as enums with constructors as members', () => {
+    const code = `
+data shape {
+  Circle(r);
+  Rect(w, h)
+}
+`;
+    const result = extractFromSource('shapes.iv', code);
+    const enumNode = result.nodes.find((n) => n.kind === 'enum');
+    expect(enumNode).toBeDefined();
+    expect(enumNode?.name).toBe('shape');
+    const members = result.nodes.filter((n) => n.kind === 'enum_member');
+    expect(members.map((m) => m.name).sort()).toEqual(['Circle', 'Rect']);
+  });
+
+  it('should extract import statements', () => {
+    const code = `
+import std/string
+main :: fn () { 1 }
+`;
+    const result = extractFromSource('mod.iv', code);
+    const imp = result.nodes.find((n) => n.kind === 'import');
+    expect(imp).toBeDefined();
+    expect(imp?.name).toBe('std/string');
+  });
+
+  it('should record intra-file calls as resolvable references', () => {
+    const code = `
+helper :: fn (x) { x }
+run :: fn (y) { helper(y) }
+`;
+    const result = extractFromSource('calls.iv', code);
+    const call = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'calls' && r.referenceName === 'helper'
+    );
+    expect(call).toBeDefined();
+  });
+});
+
 describe('Java Extraction', () => {
   it('should extract class declarations', () => {
     const code = `
