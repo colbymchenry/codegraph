@@ -1338,6 +1338,12 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
     case 'python':
       return [
         new RegExp(`\\b${r}\\b\\s*=\\s*([A-Z][\\w.]*)\\s*\\(`), // lg = Logger(...)
+        // A quoted forward reference (`lg: "Logger"`, `lg: 'pkg.Logger'`) is the
+        // same annotation — and what every file under `from __future__ import
+        // annotations` or with a not-yet-defined class writes. The unquoted
+        // pattern below stopped at the quote and read no type at all, so the
+        // call produced no edge (#1684). Tried first: it is the stricter shape.
+        new RegExp(`\\b${r}\\b\\s*:\\s*["']([A-Z][\\w.]*)["']`), // lg: "Logger"
         new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.]*)`), // lg: Logger  (PEP 526)
       ];
     case 'java':
