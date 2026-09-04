@@ -1859,6 +1859,21 @@ export function matchMethodCall(
     return matchRustSelfFieldCall(objectOrClass!.slice('self.'.length), methodName!, ref, context);
   }
 
+  // TS/JS call through a field of the enclosing class — `this.mailer.send()`,
+  // emitted as `this.mailer.send` (#1496). Same discipline as the Rust branch
+  // above, and EXCLUSIVE for the same reason: the field's declared type off
+  // the class's own declaration, validated by resolveMethodOnType, or nothing.
+  // Letting the bare name through is how `this.mailer.send()` inside
+  // `Notifier.send()` resolved to the calling method itself — a self-edge the
+  // source does not contain — whenever the two shared a name.
+  if (
+    (ref.language === 'typescript' || ref.language === 'javascript' || ref.language === 'tsx' || ref.language === 'jsx') &&
+    dotMatch &&
+    objectOrClass!.startsWith('this.')
+  ) {
+    return matchTsThisFieldCall(objectOrClass!.slice('this.'.length), methodName!, ref, context);
+  }
+
   // Java/Kotlin: receiver may be a field whose name doesn't match the type by
   // Java naming convention (`userbo` → class `UserBO`, abbreviated). Look up
   // the field in the enclosing class to get its declared type, then resolve
@@ -2240,6 +2255,86 @@ function matchRustSelfFieldCall(
       // symbol, this owner is the answer — no other same-named struct applies.
       if (!fieldType) return null;
       return resolveMethodOnType(fieldType, methodName, ref, context, 0.85, 'instance-method');
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve a TS/JS `this.<field>.<method>()` call (#1496) through the field's
+ * declared type, read off the ENCLOSING class's own declaration lines:
+ * a field or constructor-parameter property (`private mailer: Mailer`,
+ * `mailer?: Mailer`, `readonly mailer: Mailer`) or an initializer
+ * (`mailer = new Mailer()`, `this.mailer = new Mailer()`). The method is then
+ * VALIDATED on that type by resolveMethodOnType. Null — never a bare-name
+ * fallback — when the field is not declared there or its type is external,
+ * a builtin (`this.items.push()`) or not spelled out.
+ */
+function matchTsThisFieldCall(
+  field: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  if (!field || field.includes('.')) return null;
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  if (!caller) return null;
+  const sep = caller.qualifiedName.lastIndexOf('::');
+  if (sep <= 0) return null; // not inside a class
+  const owner = caller.qualifiedName.slice(0, sep).split('::').pop();
+  if (!owner) return null;
+
+  const owners = preferCallSiteFile(context.getNodesByName(owner), ref.filePath).filter(
+    (n) => (n.kind === 'class' || n.kind === 'component') && sameLanguageFamily(n.language, ref.language)
+  );
+  const fieldEsc = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const patterns = [
+    // `private readonly mailer?: Mailer` — a class field or a constructor
+    // parameter property; the capture stops at `<`, `[` or `|`, so a generic
+    // or union type yields its head and resolveMethodOnType decides.
+    new RegExp(`\\b${fieldEsc}\\b\\s*[?!]?\\s*:\\s*(?:readonly\\s+)?([A-Za-z_$][\\w.$]*)`),
+    // `mailer = new Mailer()` / `this.mailer = new Mailer()`
+    new RegExp(`\\b${fieldEsc}\\b\\s*=\\s*new\\s+([A-Za-z_$][\\w.$]*)`),
+  ];
+  for (const cls of owners) {
+    const source = context.readFile(cls.filePath);
+    if (!source) continue;
+    const declLines = source.split('\n').slice(Math.max(0, cls.startLine - 1), cls.endLine);
+    for (const rawLine of declLines) {
+      const line = rawLine.replace(/\/\/.*$/, '').replace(/\/\*.*?\*\//g, '');
+      for (const re of patterns) {
+        const m = line.match(re);
+        if (!m || !m[1]) continue;
+        // `ns.Mailer` → `Mailer`; a primitive or builtin names no project type.
+        const typeName = m[1].split('.').pop()!;
+        if (!/^[A-Z]/.test(typeName)) return null;
+        // Two apps in one repo may each declare a `UserService`. The bare-name
+        // path this replaces broke that tie by directory proximity, so keep the
+        // same signal: among the type's declarations of the method, prefer the
+        // one closest to the call site's directory (its own app), never index
+        // order. resolveMethodOnType still answers the single-declaration and
+        // supertype cases.
+        const declared = context
+          .getNodesByName(methodName)
+          .filter(
+            (n) =>
+              n.kind === 'method' &&
+              sameLanguageFamily(n.language, ref.language) &&
+              (n.qualifiedName === `${typeName}::${methodName}` || n.qualifiedName.endsWith(`::${typeName}::${methodName}`))
+          );
+        if (declared.length > 1) {
+          const callDirs = ref.filePath.split('/').slice(0, -1);
+          const shared = (fp: string) => {
+            const dirs = fp.split('/').slice(0, -1);
+            let i = 0;
+            while (i < dirs.length && i < callDirs.length && dirs[i] === callDirs[i]) i++;
+            return i;
+          };
+          const nearest = [...declared].sort((a, b) => shared(b.filePath) - shared(a.filePath) || a.filePath.localeCompare(b.filePath))[0]!;
+          return { original: ref, targetNodeId: nearest.id, confidence: 0.85, resolvedBy: 'instance-method' };
+        }
+        return resolveMethodOnType(typeName, methodName, ref, context, 0.85, 'instance-method');
+      }
     }
   }
   return null;
