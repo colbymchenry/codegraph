@@ -2412,7 +2412,10 @@ export function matchFuzzy(
 
   // Filter to callable kinds only (function, method, class)
   const callableKinds = new Set(['function', 'method', 'class']);
-  const callableCandidates = applyLanguageGate(candidates.filter((n) => callableKinds.has(n.kind)), ref);
+  const callableCandidates = applyLanguageGate(
+    candidates.filter((n) => callableKinds.has(n.kind) && isLexicallyReachable(n, ref, context)),
+    ref
+  );
 
   // Prefer same-language matches
   const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);

@@ -201,6 +201,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Symbols, tests and the viewer
 
+- **Fuzzy matching no longer lands on a closure it cannot reach.** A function nested inside another function is only callable from inside its container, and exact-name matching already filtered such candidates; the fuzzy fallback did not, so a builtin method call (`res.text()`, `items.push()`) whose only same-named project symbol was some file's closure resolved onto that closure at confidence 0.5. The fallback now applies the same reachability filter. On a 584-file repo that removed the 11 fuzzy edges onto nested functions and nothing else. Re-index after upgrading.
 - **Files under an `e2e/` directory count as tests.** Their calls no longer appear as production callers in Steps, dead-code and test badges.
 
 - **Production code under a `samples` or `examples` package path is no longer treated as test code.** A Kotlin or Java project whose package path runs through `com/google/samples/…` (Now in Android, for one) had nearly every file counted as a fixture, so the Map opened on `build-logic`, the entry points hid the app, and dead-code and test badges were wrong. Only the project layout above a `src/` folder decides now; the package path below it never does.
