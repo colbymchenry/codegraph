@@ -30,6 +30,12 @@ import {
 
 export const SESSIONS_DB_FILENAME = 'sessions.db';
 
+/** How long a connection waits for another's write before giving up. */
+export const BUSY_TIMEOUT_MS = 5000;
+
+/** Bump when the readers' notion of prose changes, so existing indexes rebuild. */
+const INDEX_VERSION = 2;
+
 export interface SessionsIndexStats {
   /** Transcript files seen. */
   files: number;
@@ -79,6 +85,7 @@ interface FileRow {
 }
 
 export class SessionsIndex {
+  private readonly fileRow: SqliteStatement;
   private readonly putFile: SqliteStatement;
   private readonly dropDocs: SqliteStatement;
   private readonly addDoc: SqliteStatement;
@@ -92,6 +99,12 @@ export class SessionsIndex {
         text, file UNINDEXED, role UNINDEXED, ts UNINDEXED, tokenize = 'porter unicode61'
       );
     `);
+    // A reader change (what counts as prose) only reaches transcripts that
+    // change afterwards; bumping INDEX_VERSION re-reads every file once.
+    if (db.pragma('user_version', { simple: true }) !== INDEX_VERSION) {
+      db.exec(`DELETE FROM docs; DELETE FROM files; PRAGMA user_version = ${INDEX_VERSION}`);
+    }
+    this.fileRow = db.prepare('SELECT mtime, size FROM files WHERE path = ?');
     this.putFile = db.prepare(
       'INSERT OR REPLACE INTO files (path, session, title, mtime, size) VALUES (?, ?, ?, ?, ?)',
     );
@@ -104,6 +117,11 @@ export class SessionsIndex {
     if (dbPath !== ':memory:') fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     const { db } = createDatabase(dbPath);
     if (dbPath !== ':memory:') db.pragma('journal_mode = WAL');
+    // Parallel tool calls run on worker threads, one connection each, and all
+    // of them see the same changed transcript. node:sqlite's busy timeout is
+    // zero, so without this the losers fail with "database is locked" instead
+    // of waiting the few hundred milliseconds the winner's write takes.
+    db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
     return new SessionsIndex(db);
   }
 
@@ -119,19 +137,14 @@ export class SessionsIndex {
     );
     const stats: SessionsIndexStats = { files: files.length, refreshed: 0, docs: 0 };
     const present = new Set(files);
-    const replaceFile = this.db.transaction((file: string, st: fs.Stats) => {
-      const entries = parseEntries(file);
-      const docs = transcriptDocs(entries);
-      this.dropDocs.run(file);
-      for (const d of docs) this.addDoc.run(d.text, file, d.role, d.ts);
-      this.putFile.run(file, sessionIdOf(file), transcriptTitle(entries), st.mtimeMs, st.size);
-      return docs.length;
-    });
+    const unchanged = (row: Omit<FileRow, 'path'> | undefined, st: fs.Stats): boolean =>
+      row !== undefined && row.mtime === st.mtimeMs && row.size === st.size;
     for (const file of files) {
       const st = fs.statSync(file);
-      const prev = known.get(file);
-      if (prev && prev.mtime === st.mtimeMs && prev.size === st.size) continue;
-      stats.docs += replaceFile(file, st);
+      if (unchanged(known.get(file), st)) continue;
+      const docs = this.replaceFile(file, st, unchanged);
+      if (docs === null) continue;
+      stats.docs += docs;
       stats.refreshed += 1;
     }
     const forget = this.db.transaction((gone: string[]) => {
@@ -144,6 +157,37 @@ export class SessionsIndex {
     const gone = [...known.keys()].filter((p) => !present.has(p));
     if (gone.length) forget(gone);
     return stats;
+  }
+
+  /**
+   * Re-index one file, or return null when another connection already did.
+   * `BEGIN IMMEDIATE` takes the write lock first (waiting out `busy_timeout`),
+   * then the file row is read again under it: a deferred transaction that read
+   * first and wrote second would fail with SQLITE_BUSY_SNAPSHOT the moment the
+   * other connection committed, and the busy handler never retries that.
+   */
+  private replaceFile(
+    file: string,
+    st: fs.Stats,
+    unchanged: (row: Omit<FileRow, 'path'> | undefined, st: fs.Stats) => boolean,
+  ): number | null {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (unchanged(this.fileRow.get(file) as Omit<FileRow, 'path'> | undefined, st)) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      const entries = parseEntries(file);
+      const docs = transcriptDocs(entries);
+      this.dropDocs.run(file);
+      for (const d of docs) this.addDoc.run(d.text, file, d.role, d.ts);
+      this.putFile.run(file, sessionIdOf(file), transcriptTitle(entries), st.mtimeMs, st.size);
+      this.db.exec('COMMIT');
+      return docs.length;
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
   }
 
   search(raw: string, opts: SessionSearchOptions = {}): SessionHit[] {

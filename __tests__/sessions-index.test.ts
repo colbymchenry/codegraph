@@ -12,6 +12,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { Worker } from 'worker_threads';
 import {
   claudeProjectSlug,
   claudeSessionsDir,
@@ -27,6 +28,7 @@ import {
   formatSessionHits,
 } from '../src/sessions';
 import { clearProjectConfigCache } from '../src/project-config';
+import { createDatabase } from '../src/db/sqlite-adapter';
 
 const at = '2026-09-04T20:00:00.000Z';
 const user = (text: unknown, extra: Record<string, unknown> = {}) => ({
@@ -80,6 +82,22 @@ describe('Claude Code reader', () => {
     ]);
     expect(docs.map((d) => d.role)).toEqual(['user', 'summary', 'assistant']);
     expect(docs[2]!.text).toMatch(/^Merged:/);
+  });
+
+  it('indexes a prompt sent mid-turn (a queued_command attachment) as the user', () => {
+    const docs = transcriptDocs([
+      {
+        type: 'attachment',
+        timestamp: at,
+        attachment: {
+          type: 'queued_command',
+          prompt: [{ type: 'text', text: 'follow-up: retest Node vs Bun performance metrics' }],
+        },
+        rendered: [{ content: [{ type: 'text', text: '<system-reminder>The user sent a new message…' }] }],
+      },
+      { type: 'attachment', timestamp: at, attachment: { type: 'file', content: 'a file attachment is not prose' } },
+    ]);
+    expect(docs).toEqual([{ ts: at, role: 'user', text: 'follow-up: retest Node vs Bun performance metrics' }]);
   });
 
   it('transcriptTitle returns the last stored title or null', () => {
@@ -152,6 +170,40 @@ describe('SessionsIndex', () => {
     expect(index.search('ring cap')).toEqual([]);
     index.close();
   });
+
+  it('waits for another connection mid-write and skips a file it already indexed', async () => {
+    // Parallel MCP calls run on worker threads, one connection each, and all
+    // see the same changed transcript. Another thread holds the write lock and
+    // indexes the file while this thread's refresh is under way: the refresh
+    // must wait rather than throw "database is locked", then find the row the
+    // other thread wrote and leave the file alone instead of indexing it twice.
+    const dir = fixtureDir();
+    const file = path.join(dir, 'aaaa-1111.jsonl');
+    writeJsonl(file, [user('the pool sees one transcript from two threads')], 1_700_000_000);
+    const dbPath = path.join(fixtureDir(), 'sessions.db');
+    const index = SessionsIndex.open(dbPath);
+    const st = fs.statSync(file);
+    const other = new Worker(
+      `const { workerData, parentPort } = require('worker_threads');
+       const { DatabaseSync } = require('node:sqlite');
+       const db = new DatabaseSync(workerData.dbPath);
+       db.exec('BEGIN IMMEDIATE');
+       parentPort.postMessage('locked');
+       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+       db.prepare('INSERT INTO docs (text, file, role, ts) VALUES (?, ?, ?, ?)')
+         .run('the pool sees one transcript from two threads', workerData.file, 'user', workerData.ts);
+       db.prepare('INSERT OR REPLACE INTO files (path, session, title, mtime, size) VALUES (?, ?, ?, ?, ?)')
+         .run(workerData.file, 'aaaa-1111', null, workerData.mtime, workerData.size);
+       db.exec('COMMIT');
+       db.close();`,
+      { eval: true, workerData: { dbPath, file, ts: at, mtime: st.mtimeMs, size: st.size } },
+    );
+    await new Promise((resolve) => other.once('message', resolve));
+    expect(index.refresh(dir)).toEqual({ files: 1, refreshed: 0, docs: 0 });
+    await new Promise((resolve) => other.once('exit', resolve));
+    expect(index.search('pool transcript threads')).toHaveLength(1);
+    index.close();
+  });
 });
 
 describe('querySessions (project entry point)', () => {
@@ -165,6 +217,13 @@ describe('querySessions (project entry point)', () => {
     const result = querySessions(project, 'deciding dedupe');
     expect(result.index).toEqual({ files: 1, refreshed: 1, docs: 1 });
     expect(result.hits.map((h) => h.session)).toEqual(['s1']);
+    // Same reader version: the file is not re-read. An index written by an
+    // older reader (user_version behind) is re-read once in full.
+    expect(querySessions(project, 'deciding dedupe').index.refreshed).toBe(0);
+    const { db } = createDatabase(path.join(project, '.codegraph', 'sessions.db'));
+    db.exec('PRAGMA user_version = 1');
+    db.close();
+    expect(querySessions(project, 'deciding dedupe').index).toEqual({ files: 1, refreshed: 1, docs: 1 });
     expect(fs.existsSync(path.join(project, '.codegraph', 'sessions.db'))).toBe(true);
     expect(formatSessionHits('deciding dedupe', result)).toMatch(/^Sessions matching "deciding dedupe" — 1 hit across 1 transcript:/);
     expect(formatSessionHits('nothing', { index: result.index, hits: [] })).toMatch(/any=true/);

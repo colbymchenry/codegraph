@@ -10,10 +10,11 @@
  * replaced by `-`; on Windows the drive letter may be stored lowercased, so
  * the lookup tries both spellings and takes the one that exists.
  *
- * What counts as prose: the user's prompts, the assistant's text blocks and
- * compaction summaries. Tool calls, tool results and thinking blocks are not
- * text blocks and stay out, as do meta entries and anything shorter than
- * `MIN_DOC_CHARS` ("ok").
+ * What counts as prose: the user's prompts (including one sent mid-turn, which
+ * Claude Code stores as a `queued_command` attachment rather than a user
+ * message), the assistant's text blocks and compaction summaries. Tool calls,
+ * tool results and thinking blocks are not text blocks and stay out, as do
+ * meta entries and anything shorter than `MIN_DOC_CHARS` ("ok").
  */
 import * as fs from 'fs';
 import * as os from 'os';
@@ -33,6 +34,7 @@ interface Entry {
   isCompactSummary?: boolean;
   customTitle?: string;
   message?: { content?: unknown };
+  attachment?: { type?: string; prompt?: unknown };
 }
 
 /** Shorter text is a "yes"/"ok" turn — noise in a prose index. */
@@ -103,14 +105,27 @@ function textBlocks(content: unknown): string {
     .join('\n');
 }
 
+/** Which role an entry's prose belongs to, or null when the entry carries none. */
+function docRole(e: Entry): { role: SessionDoc['role']; content: unknown } | null {
+  if (e.type === 'user' || e.type === 'assistant') {
+    return { role: e.isCompactSummary ? 'summary' : e.type, content: e.message?.content };
+  }
+  if (e.type === 'attachment' && e.attachment?.type === 'queued_command') {
+    return { role: 'user', content: e.attachment.prompt };
+  }
+  return null;
+}
+
 /** The prose of a transcript, one doc per prompt, reply or compaction summary. */
 export function transcriptDocs(entries: Entry[]): SessionDoc[] {
   const docs: SessionDoc[] = [];
   for (const e of entries) {
-    if (!e.timestamp || e.isMeta || (e.type !== 'user' && e.type !== 'assistant')) continue;
-    const text = textBlocks(e.message?.content).trim();
+    if (!e.timestamp || e.isMeta) continue;
+    const doc = docRole(e);
+    if (!doc) continue;
+    const text = textBlocks(doc.content).trim();
     if (text.length < MIN_DOC_CHARS) continue;
-    docs.push({ ts: e.timestamp, role: e.isCompactSummary ? 'summary' : e.type, text });
+    docs.push({ ts: e.timestamp, role: doc.role, text });
   }
   return docs;
 }
