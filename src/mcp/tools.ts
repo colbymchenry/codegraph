@@ -33,6 +33,7 @@ import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
 import { isTestFile, normalizeNameToken } from '../search/query-utils';
 import { extractQueryPaths, queryMightContainPaths } from '../search/query-paths';
+import { querySessions, formatSessionHits, NoSessionsError } from '../sessions';
 import {
   existsSync,
   readFileSync,
@@ -1198,6 +1199,45 @@ export const tools: ToolDefinition[] = [
     annotations: READ_ONLY_ANNOTATIONS,
   },
   {
+    name: 'codegraph_sessions',
+    description: 'Search this project\'s earlier agent sessions — what a previous session asked, decided, tried or was told — when the question is about rationale or history rather than code ("why is X like this", "what did the last session do about Y", "did we already try Z"). Full-text search (stemmed, ranked) over the prose of every transcript: prompts, replies, compaction summaries; tool traffic stays out. Each hit names its session id, role, time and the matching passage. Words are ANDed; fewer words return more. Not for code questions — codegraph_explore answers those.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Words to find, e.g. "turn readiness dedupe" or "why liftoff flag". Stems match ("merging" finds "merged"); punctuation is ignored.',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum hits (default: 10)',
+          default: 10,
+        },
+        role: {
+          type: 'string',
+          description: 'Only one kind of doc: "user" (prompts), "assistant" (replies) or "summary" (compaction summaries).',
+          enum: ['user', 'assistant', 'summary'],
+        },
+        sinceDays: {
+          type: 'number',
+          description: 'Only docs from the last N days.',
+        },
+        session: {
+          type: 'string',
+          description: 'Only one session: its id or a prefix of it.',
+        },
+        any: {
+          type: 'boolean',
+          description: 'OR the words instead of requiring all of them (default: false).',
+          default: false,
+        },
+        projectPath: projectPathProperty,
+      },
+      required: ['query'],
+    },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
     name: 'codegraph_status',
     description: 'Index health check (files / nodes / edges). Skip unless debugging.',
     inputSchema: {
@@ -1290,17 +1330,20 @@ export function getStaticTools(): ToolDefinition[] {
 }
 
 /**
- * The MCP tools served by DEFAULT (short names). Pared to ONLY `codegraph_explore`
- * — the single tool that reliably earns its place: one capped call returns the
- * verbatim source of the relevant symbols grouped by file. Every other tool is a
+ * The MCP tools served by DEFAULT (short names). `codegraph_explore` is the one
+ * code tool that reliably earns its place: one capped call returns the verbatim
+ * source of the relevant symbols grouped by file. Every other code tool is a
  * narrower slice of what explore already does, and presence itself steers
- * mis-picks, so they are no longer LISTED to agents.
+ * mis-picks, so they are no longer LISTED to agents. `codegraph_sessions` is
+ * listed beside it because it answers a different question (what an earlier
+ * session decided) from a different corpus (transcripts, not code) — nothing in
+ * explore covers it, so it cannot cause a mis-pick against explore.
  *
  * The other defined tools (`node`, `search`, `callers`, plus callees/impact/files/
  * status) remain fully functional — handlers stay, the library API and CLI are
  * untouched, and `CODEGRAPH_MCP_TOOLS=explore,node,...` re-enables any of them.
  */
-const DEFAULT_MCP_TOOLS = new Set(['explore']);
+const DEFAULT_MCP_TOOLS = new Set(['explore', 'sessions']);
 
 /**
  * Tool handler that executes tools against a CodeGraph instance
@@ -1526,6 +1569,8 @@ export class ToolHandler {
         'codegraph_explore',
         'codegraph_search',
         'codegraph_node',
+        // Not a code tool; a small repo's session history is as searchable as a large one's.
+        'codegraph_sessions',
       ]);
       if (stats.fileCount < TINY_REPO_FILE_THRESHOLD) {
         visible = visible.filter(t => TINY_REPO_CORE_TOOLS.has(t.name));
@@ -2142,6 +2187,7 @@ export class ToolHandler {
       case 'codegraph_callees': return await this.handleCallees(args);
       case 'codegraph_impact': return await this.handleImpact(args);
       case 'codegraph_explore': return await this.handleExplore(args);
+      case 'codegraph_sessions': return this.handleSessions(args);
       case 'codegraph_node': return await this.handleNode(args);
       case 'codegraph_files': return await this.handleFiles(args);
       default: return this.errorResult(`Unknown tool: ${toolName}`);
@@ -3122,6 +3168,34 @@ export class ToolHandler {
    * `getExploreOutputBudget` — see #185 for why a fixed 35k cap was a
    * tax on small projects while earning its keep on large ones.
    */
+  /**
+   * Handle codegraph_sessions: refresh the project's session index (its own
+   * `.codegraph/sessions.db`, see src/sessions) and search it. A project with
+   * no transcripts, or one that opted out, answers as guidance rather than an
+   * error, like an unindexed projectPath does.
+   */
+  private handleSessions(args: Record<string, unknown>): ToolResult {
+    const query = this.validateString(args.query, 'query');
+    if (typeof query !== 'string') return query;
+    const projectRoot = this.getCodeGraph(args.projectPath as string | undefined).getProjectRoot();
+    const sinceDays = Number(args.sinceDays);
+    const role = typeof args.role === 'string' ? args.role : undefined;
+    const session = typeof args.session === 'string' ? args.session : undefined;
+    try {
+      const result = querySessions(projectRoot, query, {
+        limit: clamp(Number(args.limit) || 10, 1, 100),
+        role,
+        sinceIso: sinceDays > 0 ? new Date(Date.now() - sinceDays * 86_400_000).toISOString() : undefined,
+        session,
+        any: args.any === true,
+      });
+      return this.textResult(formatSessionHits(query, result));
+    } catch (err) {
+      if (err instanceof NoSessionsError) return this.textResult(err.message);
+      throw err;
+    }
+  }
+
   private async handleExplore(args: Record<string, unknown>): Promise<ToolResult> {
     const rawQuery = this.validateString(args.query, 'query');
     if (typeof rawQuery !== 'string') return rawQuery;
