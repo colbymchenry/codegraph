@@ -116,12 +116,13 @@ export class SessionsIndex {
   static open(dbPath: string): SessionsIndex {
     if (dbPath !== ':memory:') fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     const { db } = createDatabase(dbPath);
-    if (dbPath !== ':memory:') db.pragma('journal_mode = WAL');
     // Parallel tool calls run on worker threads, one connection each, and all
     // of them see the same changed transcript. node:sqlite's busy timeout is
     // zero, so without this the losers fail with "database is locked" instead
-    // of waiting the few hundred milliseconds the winner's write takes.
+    // of waiting the few hundred milliseconds the winner's write takes. Set
+    // before the constructor's schema and version writes, which race the same way.
     db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
+    if (dbPath !== ':memory:') db.pragma('journal_mode = WAL');
     return new SessionsIndex(db);
   }
 
