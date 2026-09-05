@@ -452,8 +452,48 @@ function resolveRelativeImport(
     return relativePath;
   }
 
+  return findSourceForEmittedSpecifier(relativePath, language, context);
+}
+
+/**
+ * TypeScript under `moduleResolution: node16 | nodenext | bundler` writes the
+ * EMITTED extension in the specifier (`import x from './util.js'` for
+ * `util.ts`, `.mjs` for `.mts`, `.cjs` for `.cts`), and the source file with that
+ * exact name never exists in the repo. Without this remap the import resolver
+ * returned null for every such import, so each imported name fell through to
+ * bare-name matching: a method wrapping the same-named helper it imports
+ * (`renderDockStyles() { return renderDockStyles() }`) resolved to ITSELF, and
+ * any repo-wide same-named symbol could win the cross-module edge.
+ */
+const EMITTED_TO_SOURCE_EXTENSIONS: ReadonlyArray<readonly [RegExp, readonly string[]]> = [
+  [/\.js$/, ['.ts', '.tsx', '.d.ts']],
+  [/\.jsx$/, ['.tsx']],
+  [/\.mjs$/, ['.mts', '.d.mts']],
+  [/\.cjs$/, ['.cts', '.d.cts']],
+];
+
+function findSourceForEmittedSpecifier(
+  relativePath: string,
+  language: Language,
+  context: ResolutionContext
+): string | null {
+  if (!EMITTED_SPECIFIER_LANGUAGES.has(language)) return null;
+  for (const [emitted, sources] of EMITTED_TO_SOURCE_EXTENSIONS) {
+    if (!emitted.test(relativePath)) continue;
+    const stem = relativePath.replace(emitted, '');
+    for (const ext of sources) {
+      const candidate = stem + ext;
+      if (context.fileExists(candidate)) return candidate;
+    }
+    return null;
+  }
   return null;
 }
+
+/** Languages whose import specifiers can name the emitted `.js` of a `.ts` source. */
+const EMITTED_SPECIFIER_LANGUAGES: ReadonlySet<string> = new Set([
+  'typescript', 'tsx', 'javascript', 'jsx', 'vue', 'svelte', 'astro', 'arkts',
+]);
 
 /**
  * Resolve an aliased/absolute import.
@@ -479,7 +519,7 @@ function resolveAliasedImport(
       if (context.fileExists(candidate)) return candidate;
     }
     if (context.fileExists(basePath)) return basePath;
-    return null;
+    return findSourceForEmittedSpecifier(basePath, language, context);
   };
 
   // 1. Project tsconfig/jsconfig paths.
