@@ -111,6 +111,7 @@ export const LANGUAGES = [
   'twig',
   'xml',
   'properties',
+  'markdown',
   'cfml',
   'cfscript',
   'cfquery',

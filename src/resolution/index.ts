@@ -765,9 +765,11 @@ export class ReferenceResolver {
    */
   private hasAnyPossibleMatch(name: string): boolean {
     if (!this.knownNames) return true; // no pre-filter available
+    const pathName = name.replace(/\\/g, '/').split('#')[0] ?? name;
 
     // Direct name match
     if (this.knownNames.has(name)) return true;
+    if (pathName !== name && this.knownNames.has(pathName)) return true;
 
     // For qualified names like "obj.method" or "Class::method", check the parts
     const dotIdx = name.indexOf('.');
@@ -821,11 +823,12 @@ export class ReferenceResolver {
     }
 
     // For path-like references (e.g., "snippets/drawer-menu.liquid"), check the filename
-    const slashIdx = name.lastIndexOf('/');
+    const slashIdx = pathName.lastIndexOf('/');
     if (slashIdx > 0) {
-      const fileName = name.substring(slashIdx + 1);
+      const fileName = pathName.substring(slashIdx + 1);
       if (this.knownNames.has(fileName)) return true;
     }
+    if (slashIdx < 0 && /\.[A-Za-z0-9]+$/.test(pathName) && this.knownNames.has(pathName)) return true;
 
     return false;
   }
@@ -2430,6 +2433,12 @@ export class ReferenceResolver {
     if (!result) return result;
     const tgt = this.getLanguageFromNodeId(result.targetNodeId);
     if (!tgt || !ref.language) return result;
+    // Documentation links are an intentional cross-language bridge: a code
+    // string referencing `docs/guide.md#install`, or a Markdown doc pointing at
+    // a symbol, is never a coincidental same-name collision (the case this gate
+    // defends against between two programming languages). Exempt Markdown so
+    // these doc edges survive.
+    if (tgt === 'markdown' || ref.language === 'markdown') return result;
     if ((ref.referenceKind === 'references' || ref.referenceKind === 'function_ref') && !sameLanguageFamily(tgt, ref.language)) return null;
     if (ref.referenceKind === 'imports' && crossesKnownFamily(tgt, ref.language)) return null;
     return result;
