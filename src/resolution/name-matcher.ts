@@ -2288,13 +2288,25 @@ function matchTsThisFieldCall(
     (n) => (n.kind === 'class' || n.kind === 'component') && sameLanguageFamily(n.language, ref.language)
   );
   const fieldEsc = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const patterns = [
+  const patterns: Array<{ re: RegExp; valueType: boolean }> = [
+    // `storage: typeof DraftHubStorage` — the type OF a value: an object
+    // literal used as a namespace. Its members are bare-named functions inside
+    // the constant's extent (#1573), so they are found by containment, not by
+    // `Type::method`. Tried first: the declared-type pattern below would
+    // otherwise capture the word `typeof`.
+    {
+      re: new RegExp(`\\b${fieldEsc}\\b\\s*[?!]?\\s*:\\s*(?:readonly\\s+)?typeof\\s+([A-Za-z_$][\\w.$]*)`),
+      valueType: true,
+    },
     // `private readonly mailer?: Mailer` — a class field or a constructor
     // parameter property; the capture stops at `<`, `[` or `|`, so a generic
     // or union type yields its head and resolveMethodOnType decides.
-    new RegExp(`\\b${fieldEsc}\\b\\s*[?!]?\\s*:\\s*(?:readonly\\s+)?([A-Za-z_$][\\w.$]*)`),
+    {
+      re: new RegExp(`\\b${fieldEsc}\\b\\s*[?!]?\\s*:\\s*(?:readonly\\s+)?([A-Za-z_$][\\w.$]*)`),
+      valueType: false,
+    },
     // `mailer = new Mailer()` / `this.mailer = new Mailer()`
-    new RegExp(`\\b${fieldEsc}\\b\\s*=\\s*new\\s+([A-Za-z_$][\\w.$]*)`),
+    { re: new RegExp(`\\b${fieldEsc}\\b\\s*=\\s*new\\s+([A-Za-z_$][\\w.$]*)`), valueType: false },
   ];
   for (const cls of owners) {
     const source = context.readFile(cls.filePath);
@@ -2302,9 +2314,22 @@ function matchTsThisFieldCall(
     const declLines = source.split('\n').slice(Math.max(0, cls.startLine - 1), cls.endLine);
     for (const rawLine of declLines) {
       const line = rawLine.replace(/\/\/.*$/, '').replace(/\/\*.*?\*\//g, '');
-      for (const re of patterns) {
+      for (const { re, valueType } of patterns) {
         const m = line.match(re);
         if (!m || !m[1]) continue;
+        if (valueType) {
+          // The value's declaration may live in another file (it is imported);
+          // the call site's file is preferred when several share the name.
+          const holderName = m[1].split('.').pop()!;
+          const holders = preferCallSiteFile(context.getNodesByName(holderName), ref.filePath).filter(
+            (n) => (n.kind === 'constant' || n.kind === 'variable') && sameLanguageFamily(n.language, ref.language)
+          );
+          for (const holder of holders) {
+            const hit = resolveObjectLiteralMember(holder, methodName, ref, context, 0.85, 'instance-method');
+            if (hit) return hit;
+          }
+          return null;
+        }
         // `ns.Mailer` → `Mailer`; a primitive or builtin names no project type.
         const typeName = m[1].split('.').pop()!;
         if (!/^[A-Z]/.test(typeName)) return null;

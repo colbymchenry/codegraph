@@ -48,6 +48,23 @@ beforeAll(async () => {
       '}\n' +
       'module.exports = { LegacyNotifier };\n'
   );
+  // A field typed as the type OF a value: an object literal used as a namespace.
+  w(
+    'storage.ts',
+    'export const DraftHubStorage = {\n' +
+      '  async get(key: string): Promise<string> { return key; },\n' +
+      '  async getSettings(): Promise<object> { return {}; },\n' +
+      '};\n'
+  );
+  w(
+    'keeper.ts',
+    "import { DraftHubStorage } from './storage';\n" +
+      'export class Keeper {\n' +
+      '  constructor(private readonly storage: typeof DraftHubStorage) {}\n' +
+      '  async get(key: string): Promise<string> { return this.storage.get(key); }\n' +
+      '  async settings(): Promise<object> { return this.storage.getSettings(); }\n' +
+      '}\n'
+  );
   cg = CodeGraph.initSync(dir);
   await cg.indexAll();
 });
@@ -77,5 +94,13 @@ describe('this.<field>.<method>() (#1496)', () => {
     // `this.items.push()` — `string[]` names no project type; the wrapper `push`
     // must not become its own callee.
     expect(calleesOf('Notifier::push')).toEqual([]);
+  });
+
+  it('resolves a field typed `typeof <objectLiteral>` onto the literal\'s member', () => {
+    // The members are bare-named functions inside the constant's extent (#1573).
+    expect(calleesOf('Keeper::settings')).toEqual(['getSettings']);
+    expect(calleesOf('Keeper::get')).toEqual(['get']);
+    const self = cg.getCallers(method('Keeper::get').id).some(({ node }) => node.id === method('Keeper::get').id);
+    expect(self).toBe(false);
   });
 });
