@@ -201,6 +201,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Symbols, tests and the viewer
 
+- **An import that names the emitted extension resolves to its source.** Under `moduleResolution: node16 | nodenext | bundler` TypeScript requires `import { x } from './util.js'` for `util.ts`, and no file of that name exists, so the import resolver returned nothing and every name imported that way fell through to bare-name matching: a method wrapping the same-named helper it imports (`renderDockStyles() { return renderDockStyles(); }`) resolved to itself, and cross-module edges in such projects were name guesses. `.js` / `.jsx` / `.mjs` / `.cjs` specifiers now retry with the source extensions TypeScript compiles from when the emitted file is absent; a real `.js` beside the `.ts` still wins. On a 582-file repo whose `.ts` files import this way, import-backed `calls`/`imports` edges went from 4,002 to 7,312 and the eight wrapper-method self-edges disappeared. Re-index after upgrading.
+
 - **Files under an `e2e/` directory count as tests.** Their calls no longer appear as production callers in Steps, dead-code and test badges.
 
 - **Production code under a `samples` or `examples` package path is no longer treated as test code.** A Kotlin or Java project whose package path runs through `com/google/samples/…` (Now in Android, for one) had nearly every file counted as a fixture, so the Map opened on `build-logic`, the entry points hid the app, and dead-code and test badges were wrong. Only the project layout above a `src/` folder decides now; the package path below it never does.
