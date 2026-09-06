@@ -2418,7 +2418,16 @@ export function matchFuzzy(
   const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);
   const finalCandidates = sameLanguageCandidates.length > 0 ? sameLanguageCandidates : callableCandidates;
 
-  if (finalCandidates.length === 1) {
+  // A function nested inside another function is only callable from inside
+  // its container (#1230), so a builtin method call (`res.text()`) whose only
+  // same-named project symbol is some file's closure must decline (#1708).
+  // The check sits on the ONE candidate this strategy would commit to, not on
+  // the candidate set: filtering the unreachable ones out of a crowd would
+  // leave a single survivor and hand it every call of that name — on vite,
+  // `import { resolve } from 'node:path'` in a dozen playground configs onto
+  // the one reachable `resolve` method (#1709). Reachability may reject a
+  // unique guess; it must never manufacture one.
+  if (finalCandidates.length === 1 && isLexicallyReachable(finalCandidates[0]!, ref, context)) {
     const isCrossLanguage = finalCandidates[0]!.language !== ref.language;
     return {
       original: ref,
