@@ -53,6 +53,8 @@ describe('exact-name matching declines a name bound to a bare import', () => {
   ])('%s does not bind to the only project symbol of that name', async (declaration, name) => {
     project({
       'plugin.ts': `export function ${name}() { return 'plugin'; }`,
+      // A root directory must not turn the Node builtin path into a local import.
+      'path/marker.ts': 'export const marker = true;',
       'config.ts': `${declaration}\nexport function configure() { return ${name}('src'); }`,
     });
     const targets = await callTargets('configure');
