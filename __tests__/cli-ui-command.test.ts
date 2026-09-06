@@ -221,11 +221,23 @@ describe('codegraph ui — serving', () => {
 
   const markerFile = (): string => path.join(markerDir, 'opened.txt');
 
-  /** The opener is async (detached); give it a moment before concluding. */
+  /**
+   * The opener is async (detached); give it a moment before concluding.
+   *
+   * Waits for CONTENT, not merely for the file to appear. Shell redirection
+   * creates the target before the command writes into it — `cmd.exe` opens the
+   * `>` target as it parses the line, ahead of `echo` — so an existence check
+   * can return a file that is real but still empty. Callers that expect no
+   * launch still get null: a file that never gains content times out the same
+   * as one that never appears.
+   */
   async function waitForMarker(timeoutMs: number): Promise<string | null> {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
-      if (fs.existsSync(markerFile())) return fs.readFileSync(markerFile(), 'utf-8');
+      if (fs.existsSync(markerFile())) {
+        const body = fs.readFileSync(markerFile(), 'utf-8');
+        if (body.trim() !== '') return body;
+      }
       if (Date.now() > deadline) return null;
       await new Promise((r) => setTimeout(r, 50));
     }
