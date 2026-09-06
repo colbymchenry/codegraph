@@ -5447,34 +5447,69 @@ function parser() {
 export { parser }
 `
       );
+      // `exports["x"]` is a CommonJS export too, and a file declaring globals
+      // offers them to every other file whether or not it exports anything of
+      // its own. Both would read as sealed on a test that looked only for
+      // `export …`, `module.exports` and `exports.x`.
+      fs.writeFileSync(
+        path.join(tmpDir, 'bracket.js'),
+        `import urlp from 'node:url'
+
+function bracketed() {
+  return urlp
+}
+
+exports["bracketed"] = bracketed
+`
+      );
+      // A module with imports and no export of its own still contributes every
+      // name in `declare global` to every other file, and the extractor does
+      // emit nodes for them (a `var` and an `interface` here).
+      fs.writeFileSync(
+        path.join(tmpDir, 'ambient.ts'),
+        `import './later'
+
+declare global {
+  var strayVar: string
+}
+`
+      );
       // Every name here is bound by a BARE import, so none resolves through the
-      // import resolver and all four fall through to exact name matching.
+      // import resolver and all of them fall through to exact name matching.
       fs.writeFileSync(
         path.join(tmpDir, 'consumer.js'),
-        `import { widget, gadget, helper, parser } from 'some-external-pkg'
+        `import { widget, gadget, helper, parser, bracketed, strayVar } from 'some-external-pkg'
 
 widget()
 gadget()
 helper()
 parser()
+bracketed()
+console.log(strayVar)
 `
       );
 
       cg = await CodeGraph.init(tmpDir, { index: true });
       cg.resolveReferences();
 
-      const calledFromConsumer = (name: string): boolean => {
+      // Incoming edges rather than callers, so a non-callable node (the ambient
+      // `var`) is asked the same question as the functions.
+      const reachedFromConsumer = (name: string): boolean => {
         const target = cg
           .searchNodes(name, { limit: 10 })
           .find((r) => r.node.name === name && r.node.filePath !== 'consumer.js');
         expect(target, `no node named ${name}`).toBeDefined();
-        return cg.getCallers(target!.node.id).some((c) => c.node.filePath === 'consumer.js');
+        return cg
+          .getIncomingEdges(target!.node.id)
+          .some((e) => cg.getNode(e.source)?.filePath === 'consumer.js');
       };
 
-      expect(calledFromConsumer('widget')).toBe(false);
-      expect(calledFromConsumer('gadget')).toBe(true);
-      expect(calledFromConsumer('helper')).toBe(true);
-      expect(calledFromConsumer('parser')).toBe(true);
+      expect(reachedFromConsumer('widget')).toBe(false);
+      expect(reachedFromConsumer('gadget')).toBe(true);
+      expect(reachedFromConsumer('helper')).toBe(true);
+      expect(reachedFromConsumer('parser')).toBe(true);
+      expect(reachedFromConsumer('bracketed')).toBe(true);
+      expect(reachedFromConsumer('strayVar')).toBe(true);
     }, 30000);
   });
 });

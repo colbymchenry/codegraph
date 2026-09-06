@@ -400,15 +400,18 @@ const ESM_FAMILY = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx', 'a
 const HAS_IMPORT_STATEMENT = /^[ \t]*import[\s{*'"]/m;
 
 /**
- * Any export the file could offer, in every form the extractor's own
+ * Anything the file could offer another file, in every form the extractor's own
  * `isExported` flag misses. `^export` covers the declaration and later forms
- * (`export const`, `export { x }`, `export default x`, `export *`); the two
- * CommonJS shapes cover files that never use ESM syntax at all. Kept as a
- * source test rather than a node scan precisely because `isExported` is set
- * only from an `export_statement` ancestor, so `const x = …; export { x }` and
+ * (`export const`, `export { x }`, `export default x`, `export *`); the
+ * CommonJS shapes cover files that never use ESM syntax at all, in both the dot
+ * and the bracket form; and `declare global` contributes names to every file
+ * whether or not the module exports anything of its own. Kept as a source test
+ * rather than a node scan precisely because `isExported` is set only from an
+ * `export_statement` ancestor, so `const x = …; export { x }` and
  * `module.exports = { x }` both read as unexported on the node.
  */
-const HAS_ANY_EXPORT = /^[ \t]*export[\s{*]|\bmodule\.exports\b|\bexports\.[A-Za-z_$]/m;
+const HAS_ANY_EXPORT =
+  /^[ \t]*export[\s{*]|^[ \t]*declare\s+global\b|\bmodule\.exports\b|\bexports\s*[.[]/m;
 
 /**
  * Per-context memo of "this file is a module that exports nothing", asked once
