@@ -322,12 +322,35 @@ describe('trail read containment', () => {
       execFileSync('mkfifo', [path.join(dir, 'blocked.json')]);
 
       try {
-        expect(listStoredTrails(project)).toEqual({ trails: [], skipped: 1 });
+        // Run current TS source in a child: a synchronous open blocks Vitest's
+        // own timeout, but the parent's execFileSync timeout can kill the child.
+        const script = `
+          const fs = require('fs');
+          const ts = require('typescript');
+          require.extensions['.ts'] = (module, filename) => {
+            const source = fs.readFileSync(filename, 'utf8');
+            const { outputText } = ts.transpileModule(source, {
+              compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+            });
+            module._compile(outputText, filename);
+          };
+          const { listStoredTrails } = require(process.argv[1]);
+          process.stdout.write(JSON.stringify(listStoredTrails(process.argv[2])));
+        `;
+        const result = execFileSync(process.execPath, [
+          '-e', script, path.resolve(__dirname, '../src/ui-server/api/trail-store.ts'), project,
+        ], {
+          cwd: path.resolve(__dirname, '..'),
+          encoding: 'utf8',
+          timeout: 5_000,
+          killSignal: 'SIGKILL',
+        });
+        expect(JSON.parse(result)).toEqual({ trails: [], skipped: 1 });
       } finally {
         fs.rmSync(base, { recursive: true, force: true });
       }
     },
-    5_000
+    10_000
   );
 });
 
