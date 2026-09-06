@@ -3819,8 +3819,33 @@ export class ToolHandler {
     // (org-user.storage.ts, call-connected to the matches) accrues mass; a lone
     // text match (LensSwitcher.swift, matched "switch" but calls nothing in the
     // flow) gets only its restart probability → ~0, and is dropped by the gate.
+    //
+    // A file the ambient-declaration penalty has already damped is a candidate,
+    // but not a place a walk STARTS. The restart vector is uniform over seeds,
+    // so every seed divides the restart mass the implementation files compete
+    // for — and since #1638 a platform `.d.ts` contributes one seed per member,
+    // whose names (`body`, `stream`, `metadata`) are exactly what a prose flow
+    // query matches. That is what halves an implementation file's graph mass
+    // while the shim's holds steady: dilution of the restart vector, not
+    // connectivity. `contains` is not a RANK_EDGE, so these members carry almost
+    // no walk mass of their own; seeding is the whole of their effect on rank.
+    //
+    // `isDampedDeclaration` and not a bare ambient test: it already exempts a
+    // file whose declared type the query NAMED, so a query genuinely about the
+    // declared type keeps its seeds and the shim still ranks first. Damped files
+    // stay in the candidate set, stay reachable, and keep their `score`
+    // contribution — this changes only where the walk starts.
+    const rwrSeedIds = new Set<string>();
+    for (const id of entryNodeIds) {
+      const seed = subgraph.nodes.get(id);
+      if (seed && isDampedDeclaration(seed.filePath)) continue;
+      rwrSeedIds.add(id);
+    }
     const nodeRwr = this.computeGraphRelevance(
-      [...subgraph.nodes.keys()], subgraph.edges, entryNodeIds,
+      // Fall back to the unfiltered seeds when EVERY seed is damped: the walk
+      // must not lose its restart vector and return all-uniform.
+      [...subgraph.nodes.keys()], subgraph.edges,
+      rwrSeedIds.size > 0 ? rwrSeedIds : entryNodeIds,
     );
     //
     // Carries `rankPenalty` too, so generated/low-value files are demoted on the
