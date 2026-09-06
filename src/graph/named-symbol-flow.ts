@@ -108,6 +108,15 @@ export function matchesSymbol(node: Node, symbol: string): boolean {
   // `Session::request` both become `Session::request` here.
   const colonSuffix = parts.join('::');
   if (node.qualifiedName.includes(colonSuffix)) return true;
+  // A CDS namespace is ONE dotted qualifiedName segment
+  // (`sap.capire.bookshop::Books`), so the fully qualified name a model writes
+  // (`sap.capire.bookshop.Books`) splits into four parts whose `::` join is
+  // `sap::capire::bookshop::Books` and misses. Re-join everything before the
+  // last part with dots and try that spelling too.
+  if (parts.length >= 3) {
+    const dottedContainer = `${parts.slice(0, -1).join('.')}::${lastPart}`;
+    if (node.qualifiedName.includes(dottedContainer)) return true;
+  }
 
   // Stage 2: file-path containment. Rust modules and Python packages
   // are not in `qualifiedName` — they're encoded in the file path. So

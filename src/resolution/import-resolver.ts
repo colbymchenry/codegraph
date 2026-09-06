@@ -47,7 +47,22 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   ruby: ['.rb'],
   objc: ['.h', '.m', '.mm'],
   nix: ['.nix', '/default.nix'],
+  // CDS `using ... from './db/schema'` names a model file WITHOUT an
+  // extension, and a directory specifier (`./common`) means that
+  // directory's `index.cds`. Pre-compiled `.csn`/`.json` models are not
+  // indexed as source, so a specifier naming one stays unresolved.
+  cds: ['.cds', '/index.cds'],
 };
+
+/**
+ * A CDS `using ... from '<spec>'` reference. The specifier names a model FILE
+ * (relative path) or a reuse package (`@sap/cds/common`), never a symbol, so
+ * these resolve to a file node or to nothing: falling through to the symbol
+ * name-matcher would let `./common` land on any same-named node in the tree.
+ */
+export function isCdsUsingRef(ref: UnresolvedRef): boolean {
+  return ref.language === 'cds' && ref.referenceKind === 'imports';
+}
 
 export function isNixPathImportRef(ref: UnresolvedRef): boolean {
   return (
@@ -341,6 +356,14 @@ function isExternalImport(
   const workspaces = context?.getWorkspacePackages?.();
   if (workspaces && resolveWorkspaceImport(importPath, workspaces)) {
     return false;
+  }
+
+  // CDS: `using ... from` takes either a relative path (handled above) or a
+  // node module specifier (`@sap/cds/common`, a reuse package). Anything not
+  // relative is therefore outside the project. Ordered after the workspace
+  // check so a monorepo member (`@capire/bookshop`) stays local.
+  if (language === 'cds') {
+    return true;
   }
 
   // Common external patterns
@@ -1428,6 +1451,31 @@ export function resolveViaImport(
     // dead end. Return unresolved rather than falling through to the symbol
     // name-matcher, which would mis-connect e.g. "inc/db.php" to an unrelated
     // db.php elsewhere in the tree — a wrong edge is worse than a missing one.
+    return null;
+  }
+
+  // CDS `using ... from '<spec>'` resolves to the imported MODEL FILE, mirroring
+  // the C/C++ include branch above: a file-to-file edge, no symbol lookup. The
+  // specifier is extensionless by convention (`../db/schema` -> `db/schema.cds`,
+  // `./common` -> `common/index.cds`), so it only ever resolves through
+  // EXTENSION_RESOLUTION. A reuse package (`@sap/cds/common`) resolves to
+  // nothing and stays unresolved rather than falling through to the symbol
+  // name-matcher, which would connect it to an unrelated same-named node.
+  if (isCdsUsingRef(ref)) {
+    const resolvedPath = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
+    if (!resolvedPath) return null;
+    const basename = resolvedPath.split('/').pop()!;
+    const fileNode = context
+      .getNodesByName(basename)
+      .find((n) => n.kind === 'file' && n.filePath === resolvedPath);
+    if (fileNode) {
+      return {
+        original: ref,
+        targetNodeId: fileNode.id,
+        confidence: 0.9,
+        resolvedBy: 'import',
+      };
+    }
     return null;
   }
 

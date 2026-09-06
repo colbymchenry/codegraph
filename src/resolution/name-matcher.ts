@@ -2480,6 +2480,153 @@ export function dumpNameMatcherProfile(label: string): void {
   }
 }
 
+/**
+ * Node kinds a CDS type reference can name: entities/views (`class`), events
+ * (`struct`), aspects (`interface`), types and annotation declarations
+ * (`type_alias`), enums, services (`module`), namespaces/contexts
+ * (`namespace`) and actions/functions (`function`, `method`), which
+ * `annotate srv.criticalAction with ...` and `extend` target as readily as an
+ * entity. Elements (`field`) are never the target of a CDS reference name, so
+ * leaving them out keeps `Books` off a same-named column.
+ */
+const CDS_DEFINITION_KINDS = new Set<Node['kind']>([
+  'class',
+  'struct',
+  'interface',
+  'type_alias',
+  'enum',
+  'module',
+  'namespace',
+  'function',
+  'method',
+]);
+
+/**
+ * Reference kinds the CDS branch owns: exactly the two the extractor emits.
+ * CDS is declarative, so there are no calls, and a `using ... from` specifier
+ * is a file path the import resolver handles rather than a name.
+ *
+ * `implements` is deliberately absent. No CDS reference is ever emitted with
+ * that kind; an `implements` EDGE on a CDS node appears only later, when
+ * createEdges promotes a RESOLVED `extends` whose target turned out to be an
+ * aspect (an `interface` node), long after the matcher has run.
+ */
+const CDS_REFERENCE_KINDS = new Set<string>(['references', 'extends']);
+
+/**
+ * The CDS fully qualified name spelling of a `::`-joined qualifiedName or
+ * reference name: `sap.capire.bookshop::CatalogService::Books` becomes
+ * `sap.capire.bookshop.CatalogService.Books`, which is exactly what a CDS
+ * model writes. Comparison happens in this one normalized form so a namespace
+ * (one dotted segment) and a nested scope (a `::` step) are interchangeable.
+ */
+function cdsDotted(name: string): string {
+  return name.replace(/::/g, '.');
+}
+
+/**
+ * Resolve a CDS type reference (association/composition target, include,
+ * projection source, element type, extend/annotate target, `using` artifact).
+ *
+ * CDS name resolution is lexical: a name is looked up in the enclosing scope
+ * first (a service's own projection shadows a same-named db entity), then
+ * outward to the file's top level, where it must be a fully qualified name.
+ * The extractor already expands `using` aliases, so the reference name is
+ * either bare (`Authors`) or the FQN with its last segment split off
+ * (`sap.capire.bookshop::Books`).
+ *
+ * Returns definitively: a CDS ref that finds no scoped or unique target stays
+ * unresolved instead of falling through to the fuzzy strategies. Entity names
+ * are short and ordinary (`Books`, `Currency`, `Status`), so a partial or
+ * lowercase match would link half a CAP model to the wrong artifact.
+ */
+function matchCdsReference(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const sep = ref.referenceName.lastIndexOf('::');
+  const lastSegment = sep >= 0 ? ref.referenceName.slice(sep + 2) : ref.referenceName;
+  const refDotted = cdsDotted(ref.referenceName);
+
+  // A namespace is ONE dotted node name (`sap.capire.bookshop`), so a reference
+  // to a namespace splits in the wrong place: `using { sap.capire.bookshop as
+  // my }` reaches here as `sap.capire::bookshop`, whose last segment names
+  // nothing. Looking the FULL dotted name up as well is what lets a namespace
+  // be a candidate; for every other reference the two lookups coincide or the
+  // second returns nothing.
+  const byLastSegment = context.getNodesByName(lastSegment);
+  const byFullDotted = refDotted === lastSegment ? [] : context.getNodesByName(refDotted);
+  const seen = new Set<string>();
+  const candidates = [...byLastSegment, ...byFullDotted].filter((n) => {
+    if (seen.has(n.id)) return false;
+    seen.add(n.id);
+    return n.language === 'cds' && CDS_DEFINITION_KINDS.has(n.kind) && n.id !== ref.fromNodeId;
+  });
+  if (candidates.length === 0) return null;
+
+  // The caller's scope chain, innermost first: its own qualifiedName, then one
+  // enclosing scope at a time, ending at the file's top level (empty prefix,
+  // where the reference must be an FQN). `entity Books as projection on Books`
+  // inside a service means the db entity, never itself, which is why the
+  // candidate filter above drops the FROM node.
+  const callerQn = context.getNodeById?.(ref.fromNodeId)?.qualifiedName;
+  const scopes: string[] = [];
+  for (let scope = callerQn ?? ''; scope; ) {
+    scopes.push(scope);
+    const cut = scope.lastIndexOf('::');
+    scope = cut > 0 ? scope.slice(0, cut) : '';
+  }
+  scopes.push('');
+
+  for (const scope of scopes) {
+    const want = scope ? `${cdsDotted(scope)}.${refDotted}` : refDotted;
+    const hits = candidates.filter((n) => cdsDotted(n.qualifiedName) === want);
+    if (hits.length === 0) continue;
+    if (hits.length === 1) {
+      return {
+        original: ref,
+        targetNodeId: hits[0]!.id,
+        confidence: 0.95,
+        resolvedBy: 'qualified-name',
+      };
+    }
+    // One FQN, several definitions (the same model compiled into two files, or
+    // a duplicated namespace): the reference's own file is the only signal.
+    const preferred = preferCallSiteFile(hits, ref.filePath);
+    if (preferred[0]!.filePath === ref.filePath) {
+      return {
+        original: ref,
+        targetNodeId: preferred[0]!.id,
+        confidence: 0.95,
+        resolvedBy: 'qualified-name',
+      };
+    }
+    return null;
+  }
+
+  // A dotted reference names an exact FQN. Missing it means the artifact is
+  // out of repo (a reuse model such as `sap.common.CodeList`) or the namespace
+  // differs, so a bare-name fallback would be a guess.
+  if (ref.referenceName.includes('::')) return null;
+
+  // Bare name with no scope hit: resolve only when the project leaves no doubt.
+  if (candidates.length === 1) {
+    return {
+      original: ref,
+      targetNodeId: candidates[0]!.id,
+      confidence: 0.8,
+      resolvedBy: 'exact-match',
+    };
+  }
+  const sameFile = candidates.filter((n) => n.filePath === ref.filePath);
+  if (sameFile.length === 1) {
+    return {
+      original: ref,
+      targetNodeId: sameFile[0]!.id,
+      confidence: 0.85,
+      resolvedBy: 'exact-match',
+    };
+  }
+  return null;
+}
+
 export function matchReference(
   ref: UnresolvedRef,
   context: ResolutionContext
@@ -2489,6 +2636,14 @@ export function matchReference(
   // worse than none).
   if (ref.referenceKind === 'function_ref') {
     return matchFunctionRef(ref, context);
+  }
+
+  // CDS type references resolve through the CDS scope chain ONLY (see
+  // matchCdsReference). The branch is terminal in both directions: it never
+  // falls through to the fuzzy strategies, and it only ever returns a CDS
+  // node, so a `Books` entity cannot land on a same-named TypeScript class.
+  if (ref.language === 'cds' && CDS_REFERENCE_KINDS.has(ref.referenceKind)) {
+    return matchCdsReference(ref, context);
   }
 
   // ArkTS chained UI attributes — emitted with a leading dot (`.titleStyle`,
