@@ -5,6 +5,7 @@
  */
 
 import * as path from 'path';
+import { builtinModules } from 'module';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
@@ -654,6 +655,8 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   // rejection here cannot fall through to a promoted runner-up.
   return isCrossFileReachable(candidate, ref, context);
 }
+const NODE_BUILTIN_SPECIFIERS = new Set(builtinModules);
+const ROOT_IMPORT_PATHS = new WeakMap<ResolutionContext, Map<string, boolean>>();
 
 const JS_FAMILY = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx']);
 
@@ -790,6 +793,20 @@ export function isBoundToBareImport(ref: UnresolvedRef, context: ResolutionConte
   // which its `test/*` globs stop short of. The name is local even though it
   // is spelled exactly like a scoped registry package.
   if (workspaces?.localLinkNames?.has(packageNameOf(source))) return false;
+  // A nested tsconfig may define baseUrl while the project-root alias map
+  // knows nothing about it. A root path such as lib/utils is still local.
+  // Builtins keep their meaning even when a same-named directory exists.
+  if (!source.startsWith('node:') && !NODE_BUILTIN_SPECIFIERS.has(source)) {
+    const head = packageNameOf(source);
+    let memo = ROOT_IMPORT_PATHS.get(context);
+    if (!memo) { memo = new Map(); ROOT_IMPORT_PATHS.set(context, memo); }
+    let local = memo.get(head);
+    if (local === undefined) {
+      local = context.fileExists(head);
+      memo.set(head, local);
+    }
+    if (local) return false;
+  }
   return true;
 }
 
@@ -1738,6 +1755,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   RUST_TRAIT_IMPL_MEMO.delete(context);
   SEALED_MODULES.delete(context);
   LOCAL_BINDING_MEMO.delete(context);
+  ROOT_IMPORT_PATHS.delete(context);
 }
 
 function memoPatterns(key: string, build: () => RegExp[]): RegExp[] {

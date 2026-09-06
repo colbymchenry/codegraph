@@ -144,6 +144,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A second `codegraph serve --mcp` on the same project no longer silently kills auto-sync (#1740).** Direct mode (`CODEGRAPH_NO_DAEMON=1` or proxy→in-process fallback) now takes an exclusive `.codegraph/writer.pid` lock; a second writer exits immediately with guidance to stop the other server or unset `CODEGRAPH_NO_DAEMON` so clients share the daemon. The shared daemon already multiplexes N clients onto one watcher — this closes the same-OS dual-direct gap the docs warned about for Windows/WSL but did not guard.
 
 - Indexing no longer checks whether files outside your project exist. A relative import that points above the project directory (`../../something`) made CodeGraph probe that location on disk while resolving it. Nothing outside the project was ever read, and no such file was ever added to the index or linked to, but the check itself should not have happened — such an import now simply resolves to nothing. Symlinks inside your project that point at code kept elsewhere are unaffected and still index as before. Thanks @ErQrYfkrju. (#1631)
+- Local JavaScript and TypeScript calls stay connected through linked packages and imports configured by a nested `baseUrl` (#1715).
 
 #### Screens, links and navigation
 
