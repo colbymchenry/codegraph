@@ -337,7 +337,6 @@ function expandWorkspaceGlob(projectRoot: string, pattern: string): string[] {
   return out;
 }
 
-/** Read the `name` field from a member directory's package.json. */
 /**
  * Dependency names this manifest declares with a `link:` or `file:` specifier
  * — the two protocols npm, yarn, pnpm and bun all read as "this package is a
@@ -364,6 +363,7 @@ function readLinkDepNames(dirAbs: string): string[] {
   return names;
 }
 
+/** Read the `name` field from a member directory's package.json. */
 function readPackageName(dirAbs: string): string | null {
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(dirAbs, 'package.json'), 'utf-8'));
