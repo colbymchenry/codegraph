@@ -11,6 +11,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
+import { cdsReferenceName, isCdsBuiltinType, CDS_BUILTIN_TYPES } from '../src/extraction/languages/cds';
 import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, blankCLeadingAttrMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
 
@@ -53,6 +54,11 @@ describe('Language Detection', () => {
 
   it('should detect Rust files', () => {
     expect(detectLanguage('lib.rs')).toBe('rust');
+  });
+
+  it('should detect CDS files', () => {
+    expect(detectLanguage('db/schema.cds')).toBe('cds');
+    expect(detectLanguage('srv/cat-service.cds')).toBe('cds');
   });
 
   it('should detect Java files', () => {
@@ -10935,6 +10941,869 @@ init(_) -> {ok, #{}}.
       const result = extractFromSource('src/b.erl', code);
       const fns = result.nodes.filter((n) => n.kind === 'function');
       expect(fns).toHaveLength(0);
+    });
+  });
+});
+
+describe('CDS Extraction', () => {
+  // One model file exercised by most of the assertions below: a namespaced db
+  // schema with includes, associations, a composition, types, an aspect, a
+  // context and an annotation definition.
+  const SCHEMA = `namespace sap.capire.bookshop;
+using { Currency, managed, cuid } from '@sap/cds/common';
+using { sap.common.CodeList } from './common';
+
+/** A book in the catalog */
+@title: 'Books'
+entity Books : cuid, managed {
+  key ID : Integer;
+  title  : localized String(111) @mandatory;
+  author : Association to Authors;
+  price  : Decimal;
+  currency : Currency;
+  items : Composition of many OrderItems on items.parent = $self;
+  virtual stock : Integer;
+  address : { street : String; city : String; };
+  status : String enum { open; closed = 'C'; };
+}
+
+entity Authors : cuid {
+  name : String;
+}
+
+type Amount : Decimal(10,2);
+type Kind : String enum { hard; soft = 'S'; }
+type TitleOf : type of Books:title;
+
+aspect Trackable {
+  changedAt : Timestamp;
+} actions {
+  action touch();
+}
+
+context Nested {
+  entity Inner { key ID : UUID; }
+}
+
+annotation myAnno : String;
+`;
+
+  describe('Language detection', () => {
+    it('should report CDS as supported', () => {
+      expect(isLanguageSupported('cds')).toBe(true);
+      expect(getSupportedLanguages()).toContain('cds');
+      expect(isSourceFile('db/schema.cds')).toBe(true);
+    });
+  });
+
+  describe('Namespace and qualified names', () => {
+    it('should turn the namespace directive into one dotted namespace node', () => {
+      const result = extractFromSource('db/schema.cds', SCHEMA);
+      const ns = result.nodes.find((n) => n.kind === 'namespace' && n.name === 'sap.capire.bookshop');
+      expect(ns).toBeDefined();
+      expect(ns!.language).toBe('cds');
+    });
+
+    it('should scope definitions under the namespace so dotting gives the CDS FQN', () => {
+      const result = extractFromSource('db/schema.cds', SCHEMA);
+      const books = result.nodes.find((n) => n.kind === 'class' && n.name === 'Books');
+      expect(books!.qualifiedName).toBe('sap.capire.bookshop::Books');
+      const title = result.nodes.find((n) => n.kind === 'field' && n.name === 'title');
+      expect(title!.qualifiedName).toBe('sap.capire.bookshop::Books::title');
+    });
+
+    it('should leave definitions unqualified in a file without a namespace', () => {
+      const code = `service CatalogService {
+  entity Books { key ID : UUID; }
+}
+`;
+      const result = extractFromSource('srv/cat-service.cds', code);
+      expect(result.nodes.some((n) => n.kind === 'namespace')).toBe(false);
+      const books = result.nodes.find((n) => n.kind === 'class' && n.name === 'Books');
+      expect(books!.qualifiedName).toBe('CatalogService::Books');
+    });
+
+    it('should nest a context as a namespace scope', () => {
+      const result = extractFromSource('db/schema.cds', SCHEMA);
+      const nested = result.nodes.find((n) => n.name === 'Nested');
+      expect(nested!.kind).toBe('namespace');
+      const inner = result.nodes.find((n) => n.name === 'Inner');
+      expect(inner!.kind).toBe('class');
+      expect(inner!.qualifiedName).toBe('sap.capire.bookshop::Nested::Inner');
+    });
+  });
+
+  describe('Dotted definition names', () => {
+    // A definition may be DECLARED with a dotted name, which is what SAP's
+    // OData-to-CDS import tooling emits. The node is named by the last segment
+    // so a name lookup finds it, and the prefix becomes one qualifiedName
+    // segment so dot-normalizing still spells the CDS fully qualified name.
+    it('should name a dotted top-level entity by its last segment', () => {
+      const code = `entity sap.common.Regions : CodeList {
+  key code : String(3);
+}
+
+type a.b.T : String;
+`;
+      const result = extractFromSource('db/common.cds', code);
+      const regions = result.nodes.find((n) => n.kind === 'class')!;
+      expect(regions.name).toBe('Regions');
+      expect(regions.qualifiedName).toBe('sap.common::Regions');
+      const alias = result.nodes.find((n) => n.kind === 'type_alias')!;
+      expect(alias.name).toBe('T');
+      expect(alias.qualifiedName).toBe('a.b::T');
+    });
+
+    it('should keep a dotted entity and its elements under the file namespace', () => {
+      const code = `namespace sap.fe.showcase;
+
+entity CV_ATTACHMENT_SRV.OriginalContentSet {
+  key ID  : UUID;
+  content : LargeBinary;
+}
+`;
+      const result = extractFromSource('db/schema.cds', code);
+      const entity = result.nodes.find((n) => n.kind === 'class')!;
+      expect(entity.name).toBe('OriginalContentSet');
+      expect(entity.qualifiedName).toBe(
+        'sap.fe.showcase::CV_ATTACHMENT_SRV::OriginalContentSet'
+      );
+      // The element hangs off the entity's REAL qualifiedName, not off a name
+      // the scope stack recomposes from the last segment alone.
+      const content = result.nodes.find((n) => n.name === 'content')!;
+      expect(content.qualifiedName).toBe(
+        'sap.fe.showcase::CV_ATTACHMENT_SRV::OriginalContentSet::content'
+      );
+    });
+
+    it('should name a dotted action inside a service by its last segment', () => {
+      const code = `service LROPODataService {
+  action a.b.c(x : Integer);
+}
+`;
+      const result = extractFromSource('srv/list-report-srv.cds', code);
+      const action = result.nodes.find((n) => n.kind === 'function')!;
+      expect(action.name).toBe('c');
+      expect(action.qualifiedName).toBe('LROPODataService::a.b::c');
+    });
+
+    it('should never split a delimited identifier that contains a dot', () => {
+      const code = `entity ![My.Odd Name] {
+  key ID : UUID;
+}
+`;
+      const result = extractFromSource('db/delimited.cds', code);
+      const entity = result.nodes.find((n) => n.kind === 'class')!;
+      expect(entity.name).toBe('My.Odd Name');
+      expect(entity.qualifiedName).toBe('My.Odd Name');
+      expect(result.nodes.find((n) => n.name === 'ID')!.qualifiedName).toBe('My.Odd Name::ID');
+    });
+  });
+
+  describe('Artifact kinds', () => {
+    it('should map each CDS artifact to its node kind', () => {
+      const result = extractFromSource('db/schema.cds', SCHEMA);
+      const kindOf = (name: string): string | undefined =>
+        result.nodes.find((n) => n.name === name && n.kind !== 'import')?.kind;
+      expect(kindOf('Books')).toBe('class');
+      expect(kindOf('Amount')).toBe('type_alias');
+      expect(kindOf('Kind')).toBe('enum');
+      expect(kindOf('TitleOf')).toBe('type_alias');
+      expect(kindOf('Trackable')).toBe('interface');
+      expect(kindOf('myAnno')).toBe('type_alias');
+    });
+
+    it('should mark an annotation definition with the annotation decorator', () => {
+      const result = extractFromSource('db/schema.cds', SCHEMA);
+      const anno = result.nodes.find((n) => n.name === 'myAnno');
+      expect(anno!.decorators).toContain('annotation');
+      expect(anno!.signature).toBe('annotation myAnno : String');
+    });
+
+    it('should extract a view as a class', () => {
+      const code = `view Cheap as select from Books { ID } where price < 10;
+`;
+      const result = extractFromSource('db/views.cds', code);
+      const view = result.nodes.find((n) => n.name === 'Cheap');
+      expect(view!.kind).toBe('class');
+      expect(view!.signature).toBe('view Cheap as select from Books');
+    });
+
+    it('should extract an event as a struct with its elements as fields', () => {
+      const code = `service S {
+  event OrderedBook : { book : UUID; quantity : Integer; }
+}
+`;
+      const result = extractFromSource('srv/cat-service.cds', code);
+      const event = result.nodes.find((n) => n.name === 'OrderedBook');
+      expect(event!.kind).toBe('struct');
+      expect(event!.qualifiedName).toBe('S::OrderedBook');
+      expect(result.nodes.filter((n) => n.kind === 'field').map((n) => n.name)).toEqual([
+        'book',
+        'quantity',
+      ]);
+    });
+
+    it('should keep the header, not the body, as an artifact signature', () => {
+      const result = extractFromSource('db/schema.cds', SCHEMA);
+      const books = result.nodes.find((n) => n.kind === 'class' && n.name === 'Books');
+      expect(books!.signature).toBe('entity Books : cuid, managed');
+      const aspect = result.nodes.find((n) => n.name === 'Trackable');
+      expect(aspect!.signature).toBe('aspect Trackable');
+    });
+  });
+
+  describe('Elements', () => {
+    it('should extract elements as fields with their source line as signature', () => {
+      const result = extractFromSource('db/schema.cds', SCHEMA);
+      const title = result.nodes.find((n) => n.kind === 'field' && n.name === 'title');
+      expect(title!.signature).toBe('title : localized String(111) @mandatory');
+    });
+
+    it('should record key and virtual as decorators', () => {
+      const result = extractFromSource('db/schema.cds', SCHEMA);
+      const id = result.nodes.find((n) => n.kind === 'field' && n.name === 'ID');
+      expect(id!.decorators).toContain('key');
+      const stock = result.nodes.find((n) => n.kind === 'field' && n.name === 'stock');
+      expect(stock!.decorators).toContain('virtual');
+    });
+
+    it('should nest a structured element under its parent element', () => {
+      const result = extractFromSource('db/schema.cds', SCHEMA);
+      const street = result.nodes.find((n) => n.kind === 'field' && n.name === 'street');
+      expect(street!.qualifiedName).toBe('sap.capire.bookshop::Books::address::street');
+    });
+
+    it('should extract enum symbols of a type and of an element', () => {
+      const result = extractFromSource('db/schema.cds', SCHEMA);
+      const members = result.nodes.filter((n) => n.kind === 'enum_member');
+      expect(members.map((n) => n.qualifiedName).sort()).toEqual([
+        'sap.capire.bookshop::Books::status::closed',
+        'sap.capire.bookshop::Books::status::open',
+        'sap.capire.bookshop::Kind::hard',
+        'sap.capire.bookshop::Kind::soft',
+      ]);
+      expect(members.find((n) => n.name === 'soft')!.signature).toBe("soft = 'S'");
+    });
+
+    it('should attach elements to their artifact with contains edges', () => {
+      const result = extractFromSource('db/schema.cds', SCHEMA);
+      const books = result.nodes.find((n) => n.kind === 'class' && n.name === 'Books')!;
+      const title = result.nodes.find((n) => n.kind === 'field' && n.name === 'title')!;
+      expect(result.edges).toContainEqual({ source: books.id, target: title.id, kind: 'contains' });
+    });
+
+    // `Composition of many { ... }` declares an anonymous aspect INLINE as the
+    // target: the elements between those braces belong to the composed entity,
+    // and the wrapper the grammar puts them under is not a member itself. It
+    // has to be walked through, or the nested elements are never visited.
+    it('should extract the anonymous aspect of an inline composition as nested fields', () => {
+      const code = `entity Orders {
+  key ID : UUID;
+  items : Composition of many {
+    key pos : Integer;
+    qty : Integer;
+  }
+}
+`;
+      const result = extractFromSource('db/inline-composition.cds', code);
+      expect(result.errors).toEqual([]);
+      expect(result.nodes.filter((n) => n.kind === 'field').map((n) => n.qualifiedName)).toEqual([
+        'Orders::ID',
+        'Orders::items',
+        'Orders::items::pos',
+        'Orders::items::qty',
+      ]);
+      expect(result.nodes.find((n) => n.name === 'pos')!.decorators).toContain('key');
+    });
+
+    it('should extract the anonymous aspect of an inline association as nested fields', () => {
+      const code = `entity Orders {
+  key ID : UUID;
+  items : Association to many {
+    key pos : Integer;
+    qty : Integer;
+  }
+}
+`;
+      const result = extractFromSource('db/inline-association.cds', code);
+      expect(result.errors).toEqual([]);
+      expect(result.nodes.filter((n) => n.kind === 'field').map((n) => n.qualifiedName)).toEqual([
+        'Orders::ID',
+        'Orders::items',
+        'Orders::items::pos',
+        'Orders::items::qty',
+      ]);
+      expect(result.nodes.find((n) => n.name === 'pos')!.decorators).toContain('key');
+    });
+  });
+
+  describe('Services, actions and functions', () => {
+    const SERVICE = `using sap.capire.bookshop as my from '../db/schema';
+
+service CatalogService @(path: '/browse') {
+  @readonly entity ListOfBooks as projection on my.Books { *, author.name as authorName };
+  entity BooksView as select from my.Books { ID, title } where price > 10;
+  action submitOrder(book : my.Books:ID, quantity : Integer) returns { stock : Integer };
+  function getStock(id : UUID) returns my.Books;
+  entity Orders { key ID : UUID; } actions {
+    action cancel();
+    function status() returns String;
+  }
+}
+`;
+
+    it('should extract a service as a module', () => {
+      const result = extractFromSource('srv/cat-service.cds', SERVICE);
+      const service = result.nodes.find((n) => n.name === 'CatalogService');
+      expect(service!.kind).toBe('module');
+      expect(service!.signature).toBe("service CatalogService @(path: '/browse')");
+    });
+
+    it('should mark service members as exported and top-level artifacts as not', () => {
+      const result = extractFromSource('srv/cat-service.cds', SERVICE);
+      expect(result.nodes.find((n) => n.name === 'ListOfBooks')!.isExported).toBe(true);
+      expect(result.nodes.find((n) => n.name === 'submitOrder')!.isExported).toBe(true);
+      const schema = extractFromSource('db/schema.cds', SCHEMA);
+      expect(schema.nodes.find((n) => n.name === 'Books')!.isExported).toBe(false);
+    });
+
+    it('should extract an unbound action as a function and a bound one as a method', () => {
+      const result = extractFromSource('srv/cat-service.cds', SERVICE);
+      const submit = result.nodes.find((n) => n.name === 'submitOrder');
+      expect(submit!.kind).toBe('function');
+      expect(submit!.qualifiedName).toBe('CatalogService::submitOrder');
+      const cancel = result.nodes.find((n) => n.name === 'cancel');
+      expect(cancel!.kind).toBe('method');
+      expect(cancel!.qualifiedName).toBe('CatalogService::Orders::cancel');
+      expect(result.nodes.find((n) => n.name === 'status')!.kind).toBe('method');
+    });
+
+    it('should keep the whole declaration as an action signature', () => {
+      const result = extractFromSource('srv/cat-service.cds', SERVICE);
+      const getStock = result.nodes.find((n) => n.name === 'getStock');
+      expect(getStock!.signature).toBe('function getStock(id : UUID) returns my.Books');
+    });
+
+    it('should export the service itself and whatever an extend adds to it', () => {
+      // A service IS the exposed API, so the module node is exported even
+      // though nothing encloses it, while a db entity next to it is not. The
+      // same split reaches members added from outside: `extend
+      // AdminService.Exposed` adds to a service, `extend Books` does not.
+      const code = `namespace srv;
+
+service AdminService { entity Exposed { key ID : Integer; } }
+
+entity Books { key ID : UUID; }
+
+extend AdminService.Exposed with { extra : String; }
+extend Books with { isbn : String; }
+`;
+      const result = extractFromSource('srv/extend-exported.cds', code);
+      const nodeOf = (qualifiedName: string): (typeof result.nodes)[number] =>
+        result.nodes.find((n) => n.qualifiedName === qualifiedName)!;
+      expect(nodeOf('srv::AdminService').kind).toBe('module');
+      expect(nodeOf('srv::AdminService').isExported).toBe(true);
+      expect(nodeOf('srv::Books').isExported).toBe(false);
+      expect(nodeOf('srv::AdminService::Exposed::extra').isExported).toBe(true);
+      expect(nodeOf('srv::Books::isbn').isExported).toBe(false);
+    });
+  });
+
+  describe('Annotations and doc comments', () => {
+    it('should collect prefix and inline annotations as decorators', () => {
+      const code = `@cds.persistence.skip
+@(UI.HeaderInfo: { TypeName: 'Book' }, Common.Label: 'Books')
+entity Books {
+  title : String @mandatory @title: 'Title';
+}
+`;
+      const result = extractFromSource('db/schema.cds', code);
+      const books = result.nodes.find((n) => n.kind === 'class' && n.name === 'Books');
+      expect(books!.decorators).toEqual([
+        '@cds.persistence.skip',
+        '@UI.HeaderInfo',
+        '@Common.Label',
+      ]);
+      const title = result.nodes.find((n) => n.kind === 'field' && n.name === 'title');
+      expect(title!.decorators).toEqual(['@mandatory', '@title']);
+    });
+
+    it('should not read a member prefix annotation as the enclosing service inline one', () => {
+      const code = `service S @(requires: 'authenticated-user') {
+  @readonly entity Books { key ID : UUID; }
+}
+`;
+      const result = extractFromSource('srv/s.cds', code);
+      expect(result.nodes.find((n) => n.name === 'S')!.decorators).toEqual(['@requires']);
+      expect(result.nodes.find((n) => n.name === 'Books')!.decorators).toEqual(['@readonly']);
+    });
+
+    it('should read the doc comment above a definition, annotations included', () => {
+      const result = extractFromSource('db/schema.cds', SCHEMA);
+      const books = result.nodes.find((n) => n.kind === 'class' && n.name === 'Books');
+      expect(books!.docstring).toBe('A book in the catalog');
+      expect(books!.decorators).toContain('@title');
+    });
+
+    it('should read a line-comment doc block', () => {
+      const code = `// Everything a reader can borrow.
+entity Books { key ID : UUID; }
+`;
+      const result = extractFromSource('db/schema.cds', code);
+      const books = result.nodes.find((n) => n.kind === 'class' && n.name === 'Books');
+      expect(books!.docstring).toBe('Everything a reader can borrow.');
+    });
+
+    it('should keep both annotations when a comment sits between them', () => {
+      // The prefix-annotation scan walks back over comments, so a note written
+      // between two annotations does not cut the run in half.
+      const code = `@readonly
+// note
+@title: 'x'
+entity E { key ID : UUID; }
+`;
+      const result = extractFromSource('db/comment-between-annotations.cds', code);
+      expect(result.nodes.find((n) => n.name === 'E')!.decorators).toEqual(['@readonly', '@title']);
+    });
+
+    it('should not let an annotation value brace cut a service signature short', () => {
+      // `@(UI.HeaderInfo: { TypeName: 'Book' })` carries braces of its own. The
+      // signature stops at the SERVICE body, so the annotation stays whole and
+      // the members stay out.
+      const code = `service S @(UI.HeaderInfo: { TypeName: 'Book' }) {
+  entity E { key ID : UUID; }
+}
+`;
+      const result = extractFromSource('srv/header-annotation.cds', code);
+      const service = result.nodes.find((n) => n.name === 'S')!;
+      expect(service.signature).toBe("service S @(UI.HeaderInfo: { TypeName: 'Book' })");
+      expect(service.signature).not.toContain('entity E');
+      expect(service.decorators).toEqual(['@UI.HeaderInfo']);
+    });
+
+    it('should keep a prefix annotation out of an entity signature', () => {
+      // A prefix annotation is a SIBLING of the definition, so an entity's
+      // header starts at `entity` however much annotation sits above it.
+      const code = `@UI.HeaderInfo: { TypeName: 'Book' }
+entity Books { key ID : UUID; }
+`;
+      const result = extractFromSource('db/header-prefix-annotation.cds', code);
+      const books = result.nodes.find((n) => n.kind === 'class' && n.name === 'Books')!;
+      expect(books.signature).toBe('entity Books');
+      expect(books.decorators).toEqual(['@UI.HeaderInfo']);
+    });
+  });
+
+  describe('Imports and using aliases', () => {
+    it('should emit one import node and one imports ref per using file', () => {
+      const result = extractFromSource('db/schema.cds', SCHEMA);
+      const imports = result.nodes.filter((n) => n.kind === 'import');
+      expect(imports.map((n) => n.name)).toEqual(['@sap/cds/common', './common']);
+      const importRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'imports');
+      expect(importRefs.map((r) => r.referenceName)).toEqual(['@sap/cds/common', './common']);
+    });
+
+    it('should keep a relative specifier verbatim for the import resolver', () => {
+      const code = `using from '../db/schema';
+`;
+      const result = extractFromSource('srv/cat-service.cds', code);
+      const ref = result.unresolvedReferences.find((r) => r.referenceKind === 'imports');
+      expect(ref!.referenceName).toBe('../db/schema');
+    });
+
+    it('should reference every imported artifact even when the file never names it', () => {
+      const result = extractFromSource('db/schema.cds', SCHEMA);
+      const names = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'references')
+        .map((r) => r.referenceName);
+      expect(names).toContain('managed');
+      expect(names).toContain('cuid');
+      expect(names).toContain('sap.common::CodeList');
+    });
+
+    it('should expand an alias bound by `using ... as` into the full artifact path', () => {
+      const code = `using sap.capire.bookshop as my from '../db/schema';
+
+service CatalogService {
+  entity ListOfBooks as projection on my.Books;
+}
+`;
+      const result = extractFromSource('srv/cat-service.cds', code);
+      const list = result.nodes.find((n) => n.name === 'ListOfBooks')!;
+      const ref = result.unresolvedReferences.find(
+        (r) => r.fromNodeId === list.id && r.referenceKind === 'references'
+      );
+      expect(ref!.referenceName).toBe('sap.capire.bookshop::Books');
+    });
+
+    it('should expand an unaliased using through its last segment', () => {
+      const code = `using sap.capire.bookshop.Books from '../db/schema';
+
+entity Loans { book : Association to Books; }
+`;
+      const result = extractFromSource('db/loans.cds', code);
+      const book = result.nodes.find((n) => n.kind === 'field' && n.name === 'book')!;
+      const ref = result.unresolvedReferences.find((r) => r.fromNodeId === book.id);
+      expect(ref!.referenceName).toBe('sap.capire.bookshop::Books');
+    });
+
+    it('should expose the reference-name formatter and the builtin set', () => {
+      const aliases = new Map([['my', 'sap.capire.bookshop']]);
+      expect(cdsReferenceName('my.Books', aliases)).toBe('sap.capire.bookshop::Books');
+      expect(cdsReferenceName('Authors')).toBe('Authors');
+      expect(cdsReferenceName('sap.common.CodeList')).toBe('sap.common::CodeList');
+      expect(isCdsBuiltinType('String')).toBe(true);
+      expect(isCdsBuiltinType('cds.Integer')).toBe(true);
+      expect(isCdsBuiltinType('hana.SMALLINT')).toBe(true);
+      expect(isCdsBuiltinType('Books')).toBe(false);
+      expect(CDS_BUILTIN_TYPES.has('UUID')).toBe(true);
+    });
+  });
+
+  describe('References', () => {
+    const refsFrom = (
+      result: ReturnType<typeof extractFromSource>,
+      name: string,
+      kind = 'references'
+    ): string[] => {
+      const owner = result.nodes.find((n) => n.name === name && n.kind !== 'import')!;
+      return result.unresolvedReferences
+        .filter((r) => r.fromNodeId === owner.id && r.referenceKind === kind)
+        .map((r) => r.referenceName);
+    };
+
+    it('should emit an extends ref per include', () => {
+      const result = extractFromSource('db/schema.cds', SCHEMA);
+      expect(refsFrom(result, 'Books', 'extends')).toEqual(['cuid', 'managed']);
+    });
+
+    it('should reference association and composition targets from the element', () => {
+      const result = extractFromSource('db/schema.cds', SCHEMA);
+      expect(refsFrom(result, 'author')).toEqual(['Authors']);
+      expect(refsFrom(result, 'items')).toEqual(['OrderItems']);
+    });
+
+    it('should reference a non-builtin element type and skip the builtins', () => {
+      const result = extractFromSource('db/schema.cds', SCHEMA);
+      expect(refsFrom(result, 'currency')).toEqual(['Currency']);
+      expect(refsFrom(result, 'price')).toEqual([]);
+      expect(refsFrom(result, 'title')).toEqual([]);
+      const all = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(all).not.toContain('String');
+      expect(all).not.toContain('Timestamp');
+    });
+
+    it('should reference the entity behind a `type of` element type', () => {
+      const result = extractFromSource('db/schema.cds', SCHEMA);
+      expect(refsFrom(result, 'TitleOf')).toEqual(['Books']);
+    });
+
+    it('should see through `type of`, `array of` and `many` on an element', () => {
+      const code = `entity Books {
+  borrowed : type of Loans:since;
+  tags     : array of Tag;
+  copies   : many Copy;
+}
+`;
+      const result = extractFromSource('db/schema.cds', code);
+      expect(refsFrom(result, 'borrowed')).toEqual(['Loans']);
+      expect(refsFrom(result, 'tags')).toEqual(['Tag']);
+      expect(refsFrom(result, 'copies')).toEqual(['Copy']);
+    });
+
+    it('should reference every source of a projection, a select and a join', () => {
+      const code = `using sap.capire.bookshop as my from '../db/schema';
+
+service CatalogService {
+  entity ListOfBooks as projection on my.Books;
+  entity Sales as select from my.Books as b
+    join my.Authors as a on b.author.ID = a.ID
+    { b.ID as id, a.name as author };
+}
+`;
+      const result = extractFromSource('srv/cat-service.cds', code);
+      expect(refsFrom(result, 'ListOfBooks')).toEqual(['sap.capire.bookshop::Books']);
+      expect(refsFrom(result, 'Sales')).toEqual([
+        'sap.capire.bookshop::Books',
+        'sap.capire.bookshop::Authors',
+      ]);
+    });
+
+    it('should reference a redirected-to target from the projecting entity', () => {
+      const code = `service S {
+  entity Books as projection on db.Books { *, author : redirected to Authors };
+  entity Authors as projection on db.Authors;
+}
+`;
+      const result = extractFromSource('srv/s.cds', code);
+      expect(refsFrom(result, 'Books')).toEqual(['db::Books', 'Authors']);
+    });
+
+    it('should reference parameter and return types from the operation node', () => {
+      const code = `using sap.capire.bookshop as my from '../db/schema';
+
+service CatalogService {
+  action submitOrder(book : my.Books:ID, quantity : Integer) returns my.Orders;
+  function ping() returns String;
+}
+`;
+      const result = extractFromSource('srv/cat-service.cds', code);
+      expect(refsFrom(result, 'submitOrder')).toEqual([
+        'sap.capire.bookshop::Books',
+        'sap.capire.bookshop::Orders',
+      ]);
+      expect(refsFrom(result, 'ping')).toEqual([]);
+    });
+
+    it('should emit the projection source from the projecting entity, not its service', () => {
+      const code = `service CatalogService {
+  entity ListOfBooks as projection on Books;
+}
+`;
+      const result = extractFromSource('srv/cat-service.cds', code);
+      const list = result.nodes.find((n) => n.name === 'ListOfBooks')!;
+      const ref = result.unresolvedReferences.find((r) => r.referenceName === 'Books')!;
+      expect(ref.fromNodeId).toBe(list.id);
+    });
+
+    it('should emit one reference per artifact however many directives name it', () => {
+      // `using`, `extend service` and `annotate` each name CatalogService from
+      // the same file scope, so three refs would be emitted with the same
+      // from/kind/name. They collapse to one, and the graph carries one edge
+      // instead of three copies of it.
+      const code = `using { CatalogService } from './srv';
+
+extend service CatalogService with { entity Extra { key ID : UUID; } }
+
+annotate CatalogService with @requires: 'admin';
+`;
+      const result = extractFromSource('app/duplicate-directives.cds', code);
+      const fileNode = result.nodes.find((n) => n.kind === 'file')!;
+      const refs = result.unresolvedReferences.filter(
+        (r) => r.referenceKind === 'references' && r.referenceName === 'CatalogService'
+      );
+      expect(refs).toHaveLength(1);
+      expect(refs[0]!.fromNodeId).toBe(fileNode.id);
+      // Deduping the reference must not drop the member the extend adds.
+      expect(result.nodes.find((n) => n.name === 'Extra')!.qualifiedName).toBe(
+        'CatalogService::Extra'
+      );
+    });
+  });
+
+  describe('Extend and annotate', () => {
+    const EXTENSIONS = `using sap.capire.bookshop as my from '../db/schema';
+
+extend my.Books with { isbn : String; }
+extend service CatalogService with { entity Extra as projection on my.Authors; }
+extend my.Books with actions { action reprint(); }
+annotate CatalogService.ListOfBooks with @UI.HeaderInfo: { TypeName: 'Book' } {
+  title @title: 'Title';
+};
+`;
+
+    it('should create no node for the extend or annotate directive itself', () => {
+      const result = extractFromSource('app/annotations.cds', EXTENSIONS);
+      const names = result.nodes.map((n) => n.name);
+      expect(names).not.toContain('my.Books');
+      expect(names).not.toContain('CatalogService.ListOfBooks');
+    });
+
+    it('should reference the extend and annotate targets from the enclosing scope', () => {
+      const result = extractFromSource('app/annotations.cds', EXTENSIONS);
+      const fileNode = result.nodes.find((n) => n.kind === 'file')!;
+      const names = result.unresolvedReferences
+        .filter((r) => r.fromNodeId === fileNode.id && r.referenceKind === 'references')
+        .map((r) => r.referenceName);
+      expect(names).toContain('sap.capire.bookshop::Books');
+      expect(names).toContain('CatalogService');
+      expect(names).toContain('CatalogService::ListOfBooks');
+    });
+
+    it('should root members added by extend at the extended artifact', () => {
+      const result = extractFromSource('app/annotations.cds', EXTENSIONS);
+      const isbn = result.nodes.find((n) => n.name === 'isbn');
+      expect(isbn!.kind).toBe('field');
+      expect(isbn!.qualifiedName).toBe('sap.capire.bookshop::Books::isbn');
+      const reprint = result.nodes.find((n) => n.name === 'reprint');
+      expect(reprint!.kind).toBe('method');
+      expect(reprint!.qualifiedName).toBe('sap.capire.bookshop::Books::reprint');
+      const extra = result.nodes.find((n) => n.name === 'Extra');
+      expect(extra!.kind).toBe('class');
+      expect(extra!.qualifiedName).toBe('CatalogService::Extra');
+      expect(extra!.isExported).toBe(true);
+    });
+
+    it('should root a nested definition added by extend context at the context', () => {
+      const code = `extend context Nested with { entity Later { key ID : UUID; } }
+`;
+      const result = extractFromSource('db/more.cds', code);
+      expect(result.nodes.find((n) => n.name === 'Later')!.qualifiedName).toBe('Nested::Later');
+      expect(result.nodes.find((n) => n.name === 'ID')!.qualifiedName).toBe('Nested::Later::ID');
+    });
+
+    it('should root a bare extend or annotate target in the file namespace', () => {
+      // CDS looks a bare target up in the current namespace first, so `Books`
+      // here is `sap.capire.bookshop.Books` and the added element belongs to
+      // that entity rather than to a new top-level artifact.
+      const code = `namespace sap.capire.bookshop;
+
+extend Books with { isbn : String; }
+annotate Authors with @readonly;
+`;
+      const result = extractFromSource('db/extensions.cds', code);
+      expect(result.nodes.find((n) => n.name === 'isbn')!.qualifiedName).toBe(
+        'sap.capire.bookshop::Books::isbn'
+      );
+      const names = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'references')
+        .map((r) => r.referenceName);
+      expect(names).toContain('sap.capire.bookshop::Books');
+      expect(names).toContain('sap.capire.bookshop::Authors');
+    });
+
+    it('should leave a bare extend target bound by `using` outside the namespace', () => {
+      // `managed` names a reuse aspect from another model, so the file's own
+      // namespace says nothing about it and the target stays as written.
+      const code = `namespace sap.capire.bookshop;
+using { managed } from '@sap/cds/common';
+
+extend managed with { changedBy : String; }
+`;
+      const result = extractFromSource('db/extensions.cds', code);
+      expect(result.nodes.find((n) => n.name === 'changedBy')!.qualifiedName).toBe(
+        'managed::changedBy'
+      );
+      const names = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'references')
+        .map((r) => r.referenceName);
+      expect(names).toContain('managed');
+      expect(names).not.toContain('sap.capire.bookshop::managed');
+    });
+
+    it('should add no member node for `extend ... with columns`', () => {
+      const code = `extend Books with columns { extra, more };
+`;
+      const result = extractFromSource('db/more.cds', code);
+      expect(result.nodes.filter((n) => n.kind === 'field')).toHaveLength(0);
+      expect(result.unresolvedReferences.map((r) => r.referenceName)).toEqual(['Books']);
+    });
+
+    it('should spell a dotted extend target by where the target lives', () => {
+      // Three dotted-or-bare targets in one namespaced file, each resolving a
+      // different way: `AdminService.Exposed` starts at an artifact THIS file
+      // defines, so it is namespace-local and spelled as the nested scopes the
+      // definition itself got; `sap.common.Regions` is a global name written
+      // out in full; `Countries` is bare but bound by `using`, so the file's
+      // namespace says nothing about it and the alias expansion stands.
+      const code = `namespace srv;
+using { sap.common.Countries } from '@sap/cds/common';
+
+service AdminService { entity Exposed { key ID : Integer; } }
+
+extend AdminService.Exposed with { extra : String; }
+extend sap.common.Regions with { flag : Boolean; }
+extend Countries with { code2 : String; }
+`;
+      const result = extractFromSource('srv/extend-targets.cds', code);
+      const qnOf = (name: string): string | undefined =>
+        result.nodes.find((n) => n.name === name)?.qualifiedName;
+      expect(qnOf('extra')).toBe('srv::AdminService::Exposed::extra');
+      expect(qnOf('flag')).toBe('sap.common::Regions::flag');
+      expect(qnOf('code2')).toBe('sap.common::Countries::code2');
+      const names = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'references')
+        .map((r) => r.referenceName);
+      expect(names).toContain('srv::AdminService::Exposed');
+      expect(names).toContain('sap.common::Regions');
+      expect(names).toContain('sap.common::Countries');
+    });
+  });
+
+  describe('Per-file state', () => {
+    // A file's `using` aliases, its namespace and the references already
+    // emitted for it live in state reset when the file path changes. Each case
+    // below uses a path of its own so a stale reset cannot be masked by a
+    // neighbouring test having left the right state behind.
+    it('should not leak a using alias into the next file extracted', () => {
+      const owner = `using { sap.capire.bookshop as my } from './schema';
+
+entity X { b : Association to my.Books; }
+`;
+      const first = extractFromSource('db/alias-owner.cds', owner);
+      const x = first.nodes.find((n) => n.kind === 'field' && n.name === 'b')!;
+      expect(first.unresolvedReferences.find((r) => r.fromNodeId === x.id)!.referenceName).toBe(
+        'sap.capire.bookshop::Books'
+      );
+
+      // No `using` here, so `my` is an ordinary first path segment.
+      const second = extractFromSource(
+        'db/alias-free.cds',
+        `entity Y { b : Association to my.Books; }\n`
+      );
+      const y = second.nodes.find((n) => n.kind === 'field' && n.name === 'b')!;
+      expect(second.unresolvedReferences.find((r) => r.fromNodeId === y.id)!.referenceName).toBe(
+        'my::Books'
+      );
+    });
+
+    it('should extract the same file twice with identical nodes and references', () => {
+      const code = `namespace sap.capire.bookshop;
+using { sap.common.CodeList } from './common';
+
+entity Books : CodeList { key ID : UUID; author : Association to Authors; }
+`;
+      const first = extractFromSource('db/repeat-extraction.cds', code);
+      const second = extractFromSource('db/repeat-extraction.cds', code);
+      expect(first.unresolvedReferences.length).toBeGreaterThan(0);
+      expect(second.nodes.map((n) => `${n.kind}:${n.qualifiedName}`)).toEqual(
+        first.nodes.map((n) => `${n.kind}:${n.qualifiedName}`)
+      );
+      expect(
+        second.unresolvedReferences.map((r) => `${r.referenceKind}:${r.referenceName}`)
+      ).toEqual(first.unresolvedReferences.map((r) => `${r.referenceKind}:${r.referenceName}`));
+    });
+
+    it('should skip a definition with no name and still extract its neighbour', () => {
+      const code = `entity { key ID : UUID; }
+
+entity Ok { key ID : UUID; }
+`;
+      const result = extractFromSource('db/nameless-entity.cds', code);
+      expect(result.nodes.find((n) => n.name === 'Ok')!.qualifiedName).toBe('Ok');
+      expect(result.nodes.every((n) => n.name.length > 0)).toBe(true);
+      // The unnamed entity has no qualifiedName to hang its elements off, so
+      // they are dropped rather than rooted at an empty prefix.
+      expect(result.nodes.filter((n) => n.kind === 'field').map((n) => n.qualifiedName)).toEqual([
+        'Ok::ID',
+      ]);
+    });
+  });
+
+  describe('Robustness', () => {
+    it('should still extract the parseable definitions of a file the grammar trips on', () => {
+      // `event X : SomeType;` (an event typed by an artifact rather than an
+      // inline structure) is a grammar gap: it parses to an ERROR node. The
+      // error stays contained, so everything around it must still be indexed.
+      const code = `namespace sap.capire.bookshop;
+
+entity Books { key ID : UUID; }
+
+service CatalogService {
+  entity ListOfBooks as projection on Books;
+  event Ping : Books;
+}
+
+entity Authors { key ID : UUID; }
+`;
+      const result = extractFromSource('srv/cat-service.cds', code);
+      expect(result.errors).toEqual([]);
+      const names = result.nodes.filter((n) => n.kind === 'class').map((n) => n.name);
+      expect(names).toContain('Books');
+      expect(names).toContain('ListOfBooks');
+      expect(names).toContain('Authors');
+      expect(result.nodes.find((n) => n.name === 'CatalogService')!.kind).toBe('module');
     });
   });
 });
