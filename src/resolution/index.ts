@@ -17,7 +17,7 @@ import {
   ImportMapping,
 } from './types';
 import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
-import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos } from './import-resolver';
+import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isCdsUsingRef, clearImportResolverMemos } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -886,6 +886,9 @@ export class ReferenceResolver {
     // indexed under the bare name, so the existence check strips the dot.
     // Nix static path imports (`import ./x.nix`) name a FILE, not a symbol —
     // they bypass the symbol-existence check and resolve via resolveViaImport.
+    // CDS `using ... from './db/schema'` names a file the same way; its
+    // extensionless specifier matches no indexed symbol name, so without the
+    // bypass the ref dies here and no model file ever gets its import edge.
     let existenceName =
       ref.language === 'arkts' && ref.referenceName.startsWith('.')
         ? ref.referenceName.slice(1)
@@ -893,9 +896,15 @@ export class ReferenceResolver {
     // Erlang refs carry the call-site arity (`f/1`, `mod::f/2` — #1610); the
     // name index stores bare names, so existence is checked arity-less.
     if (ref.language === 'erlang') existenceName = existenceName.replace(/\/\d{1,3}$/, '');
+    // A CDS ref is `A.B::C`, and its target is indexed either under the leaf
+    // (`C`, an artifact) or under the whole dotted path (`A.B.C`, a namespace,
+    // which is ONE node name). The dotted spelling covers both: the leaf check
+    // inside hasAnyPossibleMatch still finds `C`.
+    if (ref.language === 'cds') existenceName = existenceName.replace(/::/g, '.');
     const tPre = this.profileStages ? process.hrtime.bigint() : 0n;
     const preFilterPass =
       isNixPathImportRef(ref) ||
+      isCdsUsingRef(ref) ||
       this.hasAnyPossibleMatch(existenceName) ||
       this.matchesAnyImport(ref) ||
       this.frameworks.some((f) => f.claimsReference?.(ref.referenceName));
@@ -992,7 +1001,9 @@ export class ReferenceResolver {
     // qualified-name fallback would only ever add wrong cross-module edges.
     // Nix static path imports are file references for the same reason —
     // falling through would let "./x.nix" name-match an unrelated node.
-    if (isPhpIncludePathRef(ref) || isCobolCopybookRef(ref) || isNixPathImportRef(ref) || ref.language === 'terraform') {
+    // A CDS `using ... from` specifier is a model file path (or a reuse
+    // package that is out of repo by definition), so the same rule applies.
+    if (isPhpIncludePathRef(ref) || isCobolCopybookRef(ref) || isNixPathImportRef(ref) || isCdsUsingRef(ref) || ref.language === 'terraform') {
       return candidates.length > 0
         ? candidates.reduce((best, curr) =>
             curr.confidence > best.confidence ? curr : best
@@ -1021,6 +1032,13 @@ export class ReferenceResolver {
         // symbolically call into a .nix binding (interop is eval/CLI, never a
         // linkable symbol) — without this, a Python script's `split()` lands
         // on some module's `split = ...` binding as a low-confidence match.
+        nameResult = null;
+      } else if (target && target.language === 'cds' && ref.language !== 'cds') {
+        // A CDS artifact is a model definition, never a symbol another
+        // language links to by name: a CAP handler reaches its action through
+        // `srv.on('submitOrder', ...)`, a string, and a TS/JS call spelled
+        // like one is some other function. Without this a stray
+        // `submitOrder(x)` call lands on the CDS action at confidence 0.5.
         nameResult = null;
       }
     }

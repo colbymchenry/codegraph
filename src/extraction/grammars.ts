@@ -50,6 +50,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  cds: 'tree-sitter-cds.wasm',
 };
 
 /**
@@ -170,6 +171,9 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.tf': 'terraform',
   '.tfvars': 'terraform',
   '.tofu': 'terraform',
+  // SAP CAP CDS models (db schemas, service definitions, annotation files).
+  // Vendored cap-js-community/tree-sitter-cds grammar.
+  '.cds': 'cds',
 };
 
 /**
@@ -271,6 +275,16 @@ export async function initGrammars(): Promise<void> {
  * nix-community/tree-sitter-nix @ 3d0173d (MIT) with tree-sitter-cli 0.25.10
  * (`generate` + `build --wasm`, ABI 15 — upstream's checked-in parser.c is
  * still ABI 13; all 54 upstream corpus tests pass on the regenerated parser).
+ * CDS (SAP CAP): not in tree-sitter-wasms; we vendor a wasm built from
+ * cap-js-community/tree-sitter-cds @ 66bc383 (v2.0.0, Apache-2.0) with the
+ * patch in docs/grammars/tree-sitter-cds.patch (empty `[]` / `{}` annotation
+ * values and annotations after `default` / `not null`, which broke 9 of 247
+ * real-repo files). SAP archived that repo on 2026-06-12, so the grammar is
+ * frozen at that commit plus our patch. Built with tree-sitter-cli 0.25.10
+ * (`generate` + `build --wasm --docker`, emscripten/emsdk 4.0.4, ABI 15);
+ * upstream's checked-in parser.c is ABI 14 and all 60 upstream corpus tests
+ * pass on the regenerated parser. The external scanner (unchanged) only
+ * supplies automatic semicolons. Rebuild steps: docs/grammars/tree-sitter-cds.md.
  *
  * TypeScript/TSX/JavaScript (+jsx, which shares the javascript grammar): the
  * tree-sitter-wasms builds are 2023-era (^0.20.x); we vendor wasm built from
@@ -290,7 +304,7 @@ export async function initGrammars(): Promise<void> {
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
-  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
+  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix', 'cds',
   'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
   // R7a (C/C++ kernel port prep): tree-sitter-c v0.24.2 (b780e47) +
   // tree-sitter-cpp v0.23.4 (f41e1a0), parser.c/scanner.c sha-matched against
@@ -707,6 +721,7 @@ export function getLanguageDisplayName(language: Language): string {
     erlang: 'Erlang',
     terraform: 'Terraform',
     arkts: 'ArkTS',
+    cds: 'CDS',
     unknown: 'Unknown',
   };
   return names[language] || language;

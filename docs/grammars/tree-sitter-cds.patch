@@ -1,0 +1,189 @@
+diff --git a/grammar.js b/grammar.js
+index 075b064..6a53a38 100644
+--- a/grammar.js
++++ b/grammar.js
+@@ -560,9 +560,15 @@ module.exports = grammar({
+       ),
+     ),
+ 
+-    _element_properties: $ => choice(
+-      $.default_and_nullability,
+-      $.calc_element_assignment,
++    _element_properties: $ => seq(
++      choice(
++        $.default_and_nullability,
++        $.calc_element_assignment,
++      ),
++      // Annotations may follow `default`/`not null`, e.g.
++      //   TravelID : Integer default 0 @readonly;
++      //   PRICE    : Decimal(15, 2) not null @title : 'PRICE';
++      repeat($.annotation),
+     ),
+ 
+     element_enum_definition: $ => seq(
+@@ -724,8 +730,11 @@ module.exports = grammar({
+           seq(
+             kw('localized'),
+             $.type_reference,
+-            optional($._element_properties),
+-            repeat($.annotation),
++            // `_element_properties` already allows trailing annotations.
++            choice(
++              $._element_properties,
++              repeat($.annotation),
++            ),
+             $._required_semicolon,
+           ),
+           seq(
+@@ -1325,9 +1334,11 @@ module.exports = grammar({
+     ),
+ 
+     annotation_value: $ => choice(
+-      seq('{', list_of_trailing($.annotation_named_value), '}'),
++      // Records and arrays may be empty, e.g. `@requires: []`,
++      // `@UI: { SelectionFields: [], LineItem: [ ... ] }`.
++      seq('{', optional_list_of_trailing($.annotation_named_value), '}'),
+       seq('[',
+-        list_of_trailing(choice($.annotation_ellipsis_up_to, $.annotation_value)),
++        optional_list_of_trailing(choice($.annotation_ellipsis_up_to, $.annotation_value)),
+         ']',
+       ),
+       $._literal,
+diff --git a/test/corpus/annotations.txt b/test/corpus/annotations.txt
+index 9eabaa9..884584e 100644
+--- a/test/corpus/annotations.txt
++++ b/test/corpus/annotations.txt
+@@ -165,3 +165,46 @@ type T;
+   (type_definition
+     (name
+       (identifier))))
++
++================================================================================
++Annotation Values: Empty Structures and Arrays
++================================================================================
++
++@anno: []
++@(anno1: {}, anno2: { val: [], sub: { val: [ 1 ] } })
++type T;
++
++--------------------------------------------------------------------------------
++
++(cds
++  (annotation
++    (annotation_path
++      (identifier))
++    (annotation_value))
++  (annotation
++    (annotation_group
++      (annotation_group_item
++        (annotation_path
++          (identifier))
++        (annotation_value))
++      (annotation_group_item
++        (annotation_path
++          (identifier))
++        (annotation_value
++          (annotation_named_value
++            (annotation_path
++              (identifier))
++            (annotation_value))
++          (annotation_named_value
++            (annotation_path
++              (identifier))
++            (annotation_value
++              (annotation_named_value
++                (annotation_path
++                  (identifier))
++                (annotation_value
++                  (annotation_value
++                    (number))))))))))
++  (type_definition
++    (name
++      (identifier))))
+diff --git a/test/corpus/entity.txt b/test/corpus/entity.txt
+index 63c64f1..0a9fd4b 100644
+--- a/test/corpus/entity.txt
++++ b/test/corpus/entity.txt
+@@ -75,3 +75,82 @@ entity E(P : String(length: 100), P2: Integer) {
+         (name)
+         (simple_path
+           (identifier))))))
++
++================================================================================
++Entity With Annotations After Element Properties
++================================================================================
++
++entity E {
++  key code   : Integer default 0 @Common.Text: name @Common.TextArrangement: #TextFirst;
++  ![price]   : Decimal(15, 2) not null @title: 'PRICE';
++  descr      : localized String not null @title: 'DESCR';
++  calculated : Integer = 1 + 2 @readonly;
++};
++
++--------------------------------------------------------------------------------
++
++(cds
++  (entity_definition
++    (name
++      (identifier))
++    (element_definitions
++      (element_definition
++        (name)
++        (simple_path
++          (identifier))
++        (default_and_nullability
++          (default_value
++            (number)))
++        (annotation
++          (annotation_path
++            (identifier)
++            (identifier))
++          (annotation_value
++            (annotation_path
++              (identifier))))
++        (annotation
++          (annotation_path
++            (identifier)
++            (identifier))
++          (annotation_value
++            (identifier))))
++      (element_definition
++        (name)
++        (simple_path
++          (identifier))
++        (type_argument
++          (number))
++        (type_argument
++          (number))
++        (default_and_nullability
++          (nullability
++            (null)))
++        (annotation
++          (annotation_path
++            (identifier))
++          (annotation_value
++            (single_quote_string))))
++      (element_definition
++        (name)
++        (type_reference
++          (simple_path
++            (identifier)))
++        (default_and_nullability
++          (nullability
++            (null)))
++        (annotation
++          (annotation_path
++            (identifier))
++          (annotation_value
++            (single_quote_string))))
++      (element_definition
++        (name)
++        (simple_path
++          (identifier))
++        (calc_element_assignment
++          (binary_expression
++            (number)
++            (number)))
++        (annotation
++          (annotation_path
++            (identifier)))))))

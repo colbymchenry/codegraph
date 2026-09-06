@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="104" height="104" viewBox="0 0 104 104" role="img" aria-label="CDS">
+  <title>CDS</title>
+  <rect x="0.5" y="0.5" width="103" height="103" rx="8" fill="#f7f6f2" stroke="#d6d3c8"/>
+  <rect x="30" y="18" width="44" height="44" rx="6" fill="#2f5aa8"/>
+  <rect x="34" y="24" width="15" height="10" rx="2" fill="#f7f6f2"/>
+  <rect x="55" y="24" width="15" height="10" rx="2" fill="#f7f6f2"/>
+  <rect x="42" y="44" width="20" height="10" rx="2" fill="#f7f6f2"/>
+  <line x1="49" y1="29" x2="55" y2="29" stroke="#f7f6f2" stroke-width="1.6"/>
+  <rect x="50.5" y="27.5" width="3" height="3" fill="#f7f6f2" transform="rotate(45 52 29)"/>
+  <line x1="41.5" y1="34" x2="47" y2="44" stroke="#f7f6f2" stroke-width="1.6"/>
+  <line x1="62.5" y1="34" x2="57" y2="44" stroke="#f7f6f2" stroke-width="1.6"/>
+  <text x="52" y="83" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-weight="700" font-size="17" fill="#16150f">CDS</text>
+</svg>
