@@ -6,6 +6,7 @@
 
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
+import { resolveWorkspaceImport } from './workspace-packages';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -386,6 +387,50 @@ function isLexicallyReachable(
     ref.filePath === candidate.filePath &&
     containers.some((p) => ref.line >= p.startLine && ref.line <= p.endLine)
   );
+}
+
+/**
+ * Whether the call site's own name is bound by an import of a BARE specifier —
+ * a Node builtin or an npm package. Such a binding names a symbol that is not
+ * in the graph at all, so no project node is the right target for it, however
+ * few candidates are left standing. That is the trap the name-based strategies
+ * fall into: filtering narrows a crowd of same-named symbols but says nothing
+ * about whether the true target was ever in the crowd, so when one survives it
+ * inherits the call. `import { resolve } from 'node:path'` is the case that
+ * matters — a common name, many project definitions, and the real target
+ * external.
+ *
+ * Relative, alias, and workspace imports are deliberately not treated this way:
+ * those point at project files, so a name match is a reasonable recovery when
+ * the import resolver could not follow the path.
+ *
+ * Only the JS/TS family is checked. There, a project-internal import is
+ * distinguishable by shape — it is relative, aliased, or a workspace member —
+ * so "bare" really does mean external. In Java, Kotlin, Go and Python a
+ * project's own modules are imported by absolute name too, and the same test
+ * would reject the internal case along with the external one.
+ */
+function isBoundToBareImport(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (
+    ref.language !== 'typescript' &&
+    ref.language !== 'javascript' &&
+    ref.language !== 'tsx' &&
+    ref.language !== 'jsx' &&
+    ref.language !== 'arkts'
+  ) {
+    return false;
+  }
+  const source = context
+    .getImportMappings(ref.filePath, ref.language)
+    .find((i) => i.localName === ref.referenceName)?.source;
+  if (source === undefined) return false;
+  if (source.startsWith('.') || source.startsWith('/')) return false;
+  if (source.startsWith('@/') || source.startsWith('~/') || source.startsWith('src/')) return false;
+  const aliases = context.getProjectAliases?.();
+  if (aliases?.patterns.some((p) => source.startsWith(p.prefix))) return false;
+  const workspaces = context.getWorkspacePackages?.();
+  if (workspaces && resolveWorkspaceImport(source, workspaces)) return false;
+  return true;
 }
 
 /**
@@ -2405,6 +2450,7 @@ export function matchFuzzy(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  if (isBoundToBareImport(ref, context)) return null;
   const lowerName = ref.referenceName.toLowerCase();
 
   // Use pre-built lowercase index for O(1) lookup instead of scanning all nodes
