@@ -908,6 +908,13 @@ function collectDocSeeds(cg: CodeGraph, query: string, maxFiles = 2): DocSeed[] 
   for (const fp of candidates) {
     const lp = fp.toLowerCase();
     const named = namedPaths.some((p) => lp.endsWith(p) || lp.endsWith('/' + p.split('/').pop()!));
+    // `readme` names README.md as surely as `README.md` does, but carries no
+    // `.md` for MD_PATH to see. A term equal to the file's own stem is the
+    // same statement of intent, so it unlocks the two-hit gate and the section
+    // fallback below — but NOT the DOC_LOW_PATH bypass, which stays the
+    // privilege of an explicitly spelled path: `readme` should not surface a
+    // fixture copy.
+    const namedStem = terms.includes(lp.split('/').pop()!.replace(/\.md$/, ''));
     if (!named && DOC_LOW_PATH.test(fp)) continue;
     let nodes: Node[] = [];
     try { nodes = cg.getNodesInFile(fp); } catch { continue; }
@@ -915,7 +922,11 @@ function collectDocSeeds(cg: CodeGraph, query: string, maxFiles = 2): DocSeed[] 
       .filter((n) => n.kind === 'module' && n.language === 'markdown')
       .sort((a, b) => a.startLine - b.startLine);
     const hits = termScore(lp + ' ' + headings.map((h) => h.name).join(' '));
-    if (!named && hits < 2) continue;
+    // The two-hit rule keeps a code question that merely shares a word ("War
+    // Room popout") from pulling a plan file above the code. A query with one
+    // significant term cannot reach 2, and having passed DOC_WORD that term IS
+    // the doc word, so there is no code question left to protect against.
+    if (!named && !namedStem && hits < Math.min(2, terms.length)) continue;
     // Sections are scored on the file's own lines, not on what the index holds
     // for them: a heading's docstring is a 600-char snippet, and the extractor
     // indexes table rows but not checkbox items, so a plan's step rows would be
@@ -1010,11 +1021,11 @@ function collectDocSeeds(cg: CodeGraph, query: string, maxFiles = 2): DocSeed[] 
     // who types a filename has already said which file they want.
     const chosen = sections.length > 0
       ? sections
-      : named
+      : named || namedStem
         ? headings.filter((h) => !isWrapper(h)).slice(0, 3).map((h) => ({ node: h, matchLines: [], score: 0 }))
         : [];
     if (chosen.length === 0) continue;
-    seeds.push({ filePath: fp, named, hits, sections: chosen });
+    seeds.push({ filePath: fp, named: named || namedStem, hits, sections: chosen });
   }
   seeds.sort((a, b) => (b.named ? 1 : 0) - (a.named ? 1 : 0) || b.hits - a.hits);
   // A second doc earns its slot only by matching as well as the first.
