@@ -133,6 +133,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Local JavaScript and TypeScript calls stay connected through linked packages and imports configured by a nested `baseUrl` (#1715).
+
 #### Screens, links and navigation
 
 - **Where the app goes after login is a fork, not two always-es.** A navigation whose destination comes back from a helper — `router.replace(await resolvePostLoginRoute())` over `return (await hasSeenWelcome(…)) ? '/home/' : '/welcome/'` — drew both screens with no condition, reading as if the welcome screen always shows. The two arms share a line, and only a column can tell them apart; each synthesized edge now carries its literal's own position, so the guard reader says which arm it is: `WHEN await hasSeenWelcome(…)` → home, and its negation → welcome. And the scan starts at the helper's body, so a literal-union return type — `Promise<'/welcome/' | '/home/'>`, whose routes are string literals too, written first — no longer stands in for the navigation itself. Re-index after upgrading to pick the positions up.
@@ -200,6 +202,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A FastAPI service that lives in one directory of a monorepo is detected.** `backend/pyproject.toml` and `backend/app/main.py` count, not only files at the repository root — the official full-stack template's routes now appear in Entry points and the Steps tab.
 
 #### Symbols, tests and the viewer
+
+- **A name imported from a package no longer fuzzy-matches a project symbol.** `import type { EvaluatedModules } from 'vite/module-runner'` names a symbol that is not in the graph at all, but the fuzzy fallback matched it by name anyway — and the match is case-insensitive, so on vitest it landed on the unrelated method `VitestMocker::evaluatedModules`. Fuzzy matching now declines when the call site's binding is a bare specifier (a builtin or an npm package); relative, alias, workspace and `link:`/`file:` imports still fall through, and only JS/TS is affected, since elsewhere a project's own modules are imported by absolute name too. Across vitest, svelte, vite and rollup this removed 46 wrong edges and added none. Re-index after upgrading.
+
+- **A name imported from a package no longer exact-matches a project symbol either.** `import { test } from 'vitest'` used to link every `test(...)` in a spec to whichever project file defined a function called `test` — on vite, a fixture, 1,747 times — and `import { resolve } from 'node:path'` to a plugin container's `resolve` method. The exact-name strategy now applies the same rule as the fuzzy one: a name bound to a builtin or an npm package binds to no other file's symbol. A definition in the same file still wins, as a local declaration shadows the import; and a name imported through an alias the resolver cannot see (`~utils`, `#types/x`, `$lib`) still reaches its local target by name, as before. Re-index after upgrading.
 
 - **Files under an `e2e/` directory count as tests.** Their calls no longer appear as production callers in Steps, dead-code and test badges.
 
