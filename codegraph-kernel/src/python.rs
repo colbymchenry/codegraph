@@ -608,6 +608,27 @@ impl<'t> Walker<'t> {
                         } else {
                             callee_name = method_name.to_string();
                         }
+                    } else if let Some(r) = receiver {
+                        // Any other receiver shape — attribute chain (`self.data`),
+                        // subscript (`d[k]`), call chain (`rows.setdefault(k, []).append(x)`)
+                        // — used to fall through to a BARE method_name. A bare name
+                        // matching a common list/dict/str method (`append`, `get`,
+                        // `update`, ...) exact-matches an unrelated top-level project
+                        // function sharing that name, fabricating a call edge (#66,
+                        // same class as #1230/#1276). Keep the receiver's source text
+                        // as a qualifier so the ref can only resolve through
+                        // import/module-member resolution, never the bare-name
+                        // fallback; an unresolvable qualifier is a silent miss, never
+                        // a wrong edge. Mirrors TreeSitterExtractor.extractCall's
+                        // python branch — the whitespace collapse is JS `\s`
+                        // semantics, not `char::is_whitespace`, so both arms emit the
+                        // same bytes for the parity sweep.
+                        let receiver_text = collapse_js_whitespace(self.text(r));
+                        callee_name = if receiver_text.is_empty() {
+                            method_name.to_string()
+                        } else {
+                            format!("{receiver_text}.{method_name}")
+                        };
                     } else {
                         callee_name = method_name.to_string();
                     }
@@ -965,6 +986,35 @@ fn is_stoplisted(name: &str) -> bool {
         "this" | "self" | "super" | "null" | "nil" | "true" | "false" | "undefined" | "new"
             | "NULL" | "nullptr" | "None"
     )
+}
+
+/// `s.replace(/\s+/g, ' ').trim()` with JavaScript's `\s` class, so a receiver
+/// qualifier is byte-identical to the one TreeSitterExtractor emits. Rust's
+/// `char::is_whitespace` is NOT the same set: it counts U+0085 (NEL), which JS
+/// `\s` does not, and omits U+FEFF (ZWNBSP), which JS `\s` includes.
+fn collapse_js_whitespace(s: &str) -> String {
+    fn is_js_space(c: char) -> bool {
+        matches!(
+            c,
+            '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' ' | '\u{a0}' | '\u{feff}'
+                | '\u{2028}' | '\u{2029}'
+                | '\u{1680}' | '\u{2000}'..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}'
+        )
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut in_space = false;
+    for c in s.chars() {
+        if is_js_space(c) {
+            in_space = true;
+        } else {
+            if in_space && !out.is_empty() {
+                out.push(' ');
+            }
+            in_space = false;
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// LITERAL_RECEIVER_TYPES membership (shared table; python names among them).
