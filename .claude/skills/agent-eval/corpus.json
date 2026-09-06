@@ -607,5 +607,28 @@
       "files": "~3390",
       "question": "How does programs.git.enable produce the final git config file in the user's home directory? Trace the flow from the git program module to the home-files machinery that links generated files into place."
     }
+  ],
+  "CDS": [
+    {
+      "name": "fiori-elements-feature-showcase",
+      "repo": "https://github.com/SAP-samples/fiori-elements-feature-showcase",
+      "size": "Small",
+      "files": "~110",
+      "question": "How does LROPODataService's RootEntities entity (a projection on persistence.RootEntities in db/schema.cds) reach the Criticality code list entity? Trace from the service projection through db.RootEntities, its rootBasis aspect's criticality association, to the Criticality entity in db/common.cds."
+    },
+    {
+      "name": "btp-cap-multitenant-saas",
+      "repo": "https://github.com/SAP-samples/btp-cap-multitenant-saas",
+      "size": "Medium",
+      "files": "~1076",
+      "question": "How does AdminService's Members entity (code/srv/srv/admin-service.cds) reach the Roles entity? Trace from the projection on db.Members (code/db/data-model.cds, context susaas.db) through Members' association to Users, then Users' association to Roles."
+    },
+    {
+      "name": "bookshop-demo",
+      "repo": "https://github.com/gregorwolf/bookshop-demo",
+      "size": "Large",
+      "files": "~1462",
+      "question": "How does AdminService's Books entity (srv/admin-service.cds) reach the Genres entity? Trace through the projection on db.Books (db/schema.cds) and its genre association to Genres, noting the managed aspect Books includes and the sap.common.CodeList aspect Genres includes."
+    }
   ]
 }
