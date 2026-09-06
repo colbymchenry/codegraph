@@ -755,7 +755,7 @@ function isLocallyBoundJsName(name: string, filePath: string, context: Resolutio
  * project's own modules are imported by absolute name too, and the same test
  * would reject the internal case along with the external one.
  */
-function isBoundToBareImport(ref: UnresolvedRef, context: ResolutionContext): boolean {
+export function isBoundToBareImport(ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (
     ref.language !== 'typescript' &&
     ref.language !== 'javascript' &&
@@ -765,9 +765,11 @@ function isBoundToBareImport(ref: UnresolvedRef, context: ResolutionContext): bo
   ) {
     return false;
   }
+  // Optional-called: a minimal context (tests, embedders) may not carry
+  // import mappings, and without them nothing is known to be bare.
   const source = context
-    .getImportMappings(ref.filePath, ref.language)
-    .find((i) => i.localName === ref.referenceName)?.source;
+    .getImportMappings?.(ref.filePath, ref.language)
+    ?.find((i) => i.localName === ref.referenceName)?.source;
   if (source === undefined) return false;
   if (source.startsWith('.') || source.startsWith('/')) return false;
   // `~`, `#` and `$` cannot begin an npm package name, so the prefix alone
@@ -802,7 +804,7 @@ export function matchByExactName(
   // findBestMatch — O(K²) per package, the dominant cost of "Resolving refs" on
   // large import-heavy (front-end + back-end) repos (#915).
   const bareJs = isBareJsCall(ref, context);
-  const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref)
+  let candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref)
     .filter((n) => n.kind !== 'import')
     // Nested locals are only reachable from inside their container (#1230).
     .filter((n) => isLexicallyReachable(n, ref, context))
@@ -814,6 +816,17 @@ export function matchByExactName(
     // A name the file binds itself (a parameter, a const) shadows every other
     // file's symbol of that name, so a bare call has no cross-file candidate.
     .filter((n) => !(bareJs && n.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context)));
+
+  // A name bound to a bare import (`import { test } from 'vitest'`) has its
+  // target outside the graph: no other file's `test` is it, however unique.
+  // A same-file definition stays eligible — a local declaration shadows the
+  // file-level import, and that is what the reference then means.
+  if (
+    candidates.some((n) => n.filePath !== ref.filePath) &&
+    isBoundToBareImport(ref, context)
+  ) {
+    candidates = candidates.filter((n) => n.filePath === ref.filePath);
+  }
 
   if (candidates.length === 0) {
     return null;
