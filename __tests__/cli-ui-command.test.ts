@@ -12,7 +12,7 @@
  * observable fact rather than a promise.
  */
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { execFileSync, spawn, type ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as http from 'http';
@@ -290,11 +290,11 @@ describe('codegraph ui — serving', () => {
   }, 60_000);
 
   it('CODEGRAPH_BROWSER=none suppresses the launch like --no-open', async () => {
-    fs.rmSync(markerFile(), { force: true });
     const viewer = await startViewer(['--port', '0', projectDir], { CODEGRAPH_BROWSER: 'none' });
     try {
       expect((await get(viewer.port, '/')).status).toBe(200);
-      expect(await waitForMarker(1_000)).toBeNull();
+      await vi.waitFor(() => expect(viewer.output()).toContain('Open that URL in a browser'));
+      expect(viewer.output()).not.toContain('Opening your browser');
     } finally {
       await stopViewer(viewer.child);
     }
