@@ -6,6 +6,7 @@
 
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
+import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -410,8 +411,8 @@ const HAS_IMPORT_STATEMENT = /^[ \t]*import[\s{*'"]/m;
  * `export_statement` ancestor, so `const x = …; export { x }` and
  * `module.exports = { x }` both read as unexported on the node.
  */
-const HAS_ANY_EXPORT =
-  /^[ \t]*export[\s{*]|^[ \t]*declare\s+global\b|\bmodule\.exports\b|\bexports\s*[.[]/m;
+const HAS_ESM_EXPORT = /^[ \t]*export[\s{*]|^[ \t]*declare\s+global\b/m;
+const HAS_CJS_EXPORT = /\bmodule\.exports\b|\bexports\s*[.[]/;
 
 /**
  * Per-context memo of "this file is a module that exports nothing", asked once
@@ -457,25 +458,32 @@ function isSealedModule(filePath: string, context: ResolutionContext): boolean {
   const hit = memo.get(filePath);
   if (hit !== undefined) return hit;
   const source = context.readFile(filePath);
+  const code = source === null ? '' : blankStringContents(stripCommentsForRegex(source, 'typescript'));
+  // CommonJS assignments can execute inside template interpolations, which the
+  // masker blanks. Keep the conservative raw-source exemption for those forms.
   const sealed =
-    source !== null && HAS_IMPORT_STATEMENT.test(source) && !HAS_ANY_EXPORT.test(source);
+    source !== null && HAS_IMPORT_STATEMENT.test(code) &&
+    !context.getNodesInFile(filePath).some((n) => n.isExported) &&
+    !HAS_ESM_EXPORT.test(code) && !HAS_CJS_EXPORT.test(source);
   memo.set(filePath, sealed);
   return sealed;
 }
 
 /**
  * Whether `candidate` can be named by a reference in `ref`'s file at all.
- * Applied by BOTH name-based strategies: declining in exact-match alone just
- * hands the same wrong target to matchFuzzy, which resolves a unique candidate
- * on its own at confidence 0.5. It filters the candidate set in
- * `matchByExactName`, whose ambiguity handling ranks a crowd rather than
- * declining it, and tests only the survivor in `matchFuzzy`, whose does.
+ * Both name-based strategies validate their chosen candidate. Removing an
+ * unreachable candidate before ranking can promote an unrelated runner-up;
+ * rejecting the chosen target must leave the reference unresolved instead.
  */
 function isCrossFileReachable(
   candidate: Node,
   ref: UnresolvedRef,
   context: ResolutionContext
 ): boolean {
+  if ((ref.language as string) !== 'markdown' && (candidate.language as string) === 'markdown') return false;
+  if (ref.referenceKind === 'calls' && ESM_FAMILY.has(candidate.language) &&
+    (candidate.kind === 'constant' || candidate.kind === 'variable') &&
+    /^=\s*require\s*\(\s*(['"])[^'"]+\.json\1\s*\)\s*;?\s*$/.test(candidate.signature ?? '')) return false;
   return (
     candidate.filePath === ref.filePath ||
     !ESM_FAMILY.has(candidate.language) ||
@@ -503,9 +511,9 @@ export function matchByExactName(
     .filter((n) => n.kind !== 'import')
     // Nested locals are only reachable from inside their container (#1230).
     .filter((n) => isLexicallyReachable(n, ref, context))
-    // A binding in a JS/TS module that exports nothing is unreachable from any
-    // other file, whatever its name (#1719 — see isSealedModule).
-    .filter((n) => isCrossFileReachable(n, ref, context));
+    // Preserve import ranking; calls reject the winner without promoting another.
+    .filter((n) => ref.referenceKind !== 'imports' || n.filePath === ref.filePath ||
+      !ESM_FAMILY.has(n.language) || !isSealedModule(n.filePath, context));
 
   if (candidates.length === 0) {
     return null;
@@ -513,6 +521,7 @@ export function matchByExactName(
 
   // If only one match, use it — but penalize cross-language matches
   if (candidates.length === 1) {
+    if (!isCrossFileReachable(candidates[0]!, ref, context)) return null;
     const isCrossLanguage = candidates[0]!.language !== ref.language;
     return {
       original: ref,
@@ -533,7 +542,7 @@ export function matchByExactName(
 
   // Multiple matches - try to narrow down
   const bestMatch = findBestMatch(ref, candidates, context);
-  if (bestMatch) {
+  if (bestMatch && isCrossFileReachable(bestMatch, ref, context)) {
     // Lower confidence when the match is from a distant/unrelated module
     const proximity = computePathProximity(ref.filePath, bestMatch.filePath);
     const confidence = proximity >= 30 ? 0.7 : 0.4;
