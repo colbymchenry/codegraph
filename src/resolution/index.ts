@@ -15,9 +15,12 @@ import {
   ResolutionContext,
   FrameworkResolver,
   ImportMapping,
+  SUPERTYPE_TARGET_KINDS,
+  isInheritanceRef,
+  isImportableKind,
 } from './types';
 import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
-import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos } from './import-resolver';
+import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -33,6 +36,11 @@ import { LRUCache } from './lru-cache';
 const SUPERTYPE_BEARING_KINDS = new Set<Node['kind']>([
   'class', 'struct', 'interface', 'trait', 'protocol', 'enum',
 ]);
+
+// SUPERTYPE_TARGET_KINDS (the kinds an extends/implements edge may TARGET)
+// lives in ./types — the name-matcher needs the same set to restrict its
+// candidate pool before ranking. It is deliberately wider than
+// SUPERTYPE_BEARING_KINDS above, which is about the DECLARING side.
 
 /**
  * Languages whose chained static-factory/fluent calls defer to the conformance
@@ -850,9 +858,18 @@ export class ReferenceResolver {
   }
 
   /**
-   * Resolve a single reference
+   * Resolve a single reference.
+   *
+   * Thin decorator over `resolveOneInner` so every strategy — framework,
+   * import, name-match, chain, CFML component path — passes through the
+   * inheritance target-kind gate at ONE seam. Filtering inside the
+   * name-matcher would have covered `matchByExactName` only.
    */
   resolveOne(ref: UnresolvedRef): ResolvedRef | null {
+    return this.gateTargetKind(this.resolveOneInner(ref), ref);
+  }
+
+  private resolveOneInner(ref: UnresolvedRef): ResolvedRef | null {
     // Skip built-in/external references
     if (this.isBuiltInOrExternal(ref)) {
       return null;
@@ -2424,6 +2441,45 @@ export class ReferenceResolver {
       this.clearCaches();
     }
     return edges.length;
+  }
+
+  /**
+   * Drop a resolution whose target cannot be what the reference names.
+   * Applied at the `resolveOne` seam so it covers every strategy uniformly —
+   * framework, import, name-match, chain, CFML component path.
+   *
+   * For `imports`: the target must be importable. A member that only exists
+   * inside a type never is.
+   *
+   * For `extends`/`implements`, it cannot be describing a real supertype when:
+   *
+   *  1. The target's kind can never be a supertype (an enum member, a method,
+   *     a variable). `matchByExactName` additionally narrows its candidate
+   *     pool by the same set, so a legitimate supertype outranks a same-named
+   *     non-type rather than merely losing its edge.
+   *  2. The name is imported from outside the repo, so NO local node is the
+   *     referent. Without this, filtering by kind alone just relocates the
+   *     false edge onto the next same-named local type.
+   *
+   * Direction is one-way: this only ever REMOVES an edge, never adds one. A
+   * dropped ref stays in `unresolved_refs` as `failed`, which is the honest
+   * record for a supertype that lives outside the repo — silent beats wrong.
+   */
+  private gateTargetKind(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
+    if (!result) return result;
+
+    // An `imports` reference names something importable — never a member that
+    // only exists inside a type.
+    if (ref.referenceKind === 'imports') {
+      const target = this.queries.getNodeById(result.targetNodeId);
+      return target && !isImportableKind(target.kind) ? null : result;
+    }
+
+    if (!isInheritanceRef(ref)) return result;
+    const target = this.queries.getNodeById(result.targetNodeId);
+    if (target && !SUPERTYPE_TARGET_KINDS.has(target.kind)) return null;
+    if (isBoundToOutOfRepoImport(ref, this.context)) return null;
+    return result;
   }
 
   private gateLanguage(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
