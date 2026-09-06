@@ -6,6 +6,7 @@
 
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
+import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -388,6 +389,108 @@ function isLexicallyReachable(
   );
 }
 
+/** Languages whose module boundary is `import`/`export` (or CommonJS). */
+const ESM_FAMILY = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx', 'arkts']);
+
+/**
+ * A line-initial `import` statement — the marker that a JS/TS file is a MODULE
+ * rather than a classic script. Line-anchored and followed by a name, brace,
+ * star or quote, so a dynamic `import(` and the word inside a comment or string
+ * do not match.
+ */
+const HAS_IMPORT_STATEMENT = /^[ \t]*import[\s{*'"]/m;
+
+/**
+ * Anything the file could offer another file, in every form the extractor's own
+ * `isExported` flag misses. `^export` covers the declaration and later forms
+ * (`export const`, `export { x }`, `export default x`, `export *`); the
+ * CommonJS shapes cover files that never use ESM syntax at all, in both the dot
+ * and the bracket form; and `declare global` contributes names to every file
+ * whether or not the module exports anything of its own. Kept as a source test
+ * rather than a node scan precisely because `isExported` is set only from an
+ * `export_statement` ancestor, so `const x = …; export { x }` and
+ * `module.exports = { x }` both read as unexported on the node.
+ */
+const HAS_ESM_EXPORT = /^[ \t]*export[\s{*]|^[ \t]*declare\s+global\b/m;
+const HAS_CJS_EXPORT = /\bmodule\.exports\b|\bexports\s*[.[]/;
+
+/**
+ * Per-context memo of "this file is a module that exports nothing", asked once
+ * per candidate FILE rather than once per reference. Derived from file source,
+ * so it drops with the context's file caches — clearNameMatcherMemos deletes it
+ * alongside INFER_SCAN_STATES.
+ */
+const SEALED_MODULES = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * Whether `filePath` is a JS/TS module that exports NOTHING — an import
+ * statement present, no export of any form. No reference from another file can
+ * reach any binding in such a file, so every one of its symbols is a false
+ * candidate for a cross-file name match.
+ *
+ * This is the general case behind a package name capturing a same-named local:
+ * on `vitejs/vite`, 157 cross-file `imports` refs — every `import { defineConfig
+ * } from 'vite'` in the playground and the create-vite templates — resolved onto
+ * `playground/ssr-html/test-stacktrace.js::vite`, which is `const vite = await
+ * createServer(…)` at module scope in a file with zero exports. The existing
+ * guards cannot see it: `isLexicallyReachable` returns early for any candidate
+ * that is not a `function`, and the bare-import guard correctly declines because
+ * `vite` IS a workspace member, so the specifier really is project-local. What
+ * is wrong is only which node the name lands on.
+ *
+ * Deliberately narrow on three axes, because each is a class this would
+ * otherwise resolve wrongly in the opposite direction:
+ *
+ * - **A classic script is exempt.** Requiring an `import` statement means a
+ *   non-module `.js` file — concatenated globals, a browser `<script>` — keeps
+ *   its cross-file matches, where a top-level binding genuinely is reachable.
+ * - **CommonJS is exempt.** `module.exports` and `exports.x` are matched as
+ *   exports, so a CJS file is never sealed.
+ * - **Other languages are exempt.** Go, Python, Java and the rest have no
+ *   equivalent boundary, and several extractors hardcode `isExported`.
+ */
+function isSealedModule(filePath: string, context: ResolutionContext): boolean {
+  let memo = SEALED_MODULES.get(context);
+  if (!memo) {
+    memo = new Map();
+    SEALED_MODULES.set(context, memo);
+  }
+  const hit = memo.get(filePath);
+  if (hit !== undefined) return hit;
+  const source = context.readFile(filePath);
+  const code = source === null ? '' : blankStringContents(stripCommentsForRegex(source, 'typescript'));
+  // CommonJS assignments can execute inside template interpolations, which the
+  // masker blanks. Keep the conservative raw-source exemption for those forms.
+  const sealed =
+    source !== null && HAS_IMPORT_STATEMENT.test(code) &&
+    !context.getNodesInFile(filePath).some((n) => n.isExported) &&
+    !HAS_ESM_EXPORT.test(code) && !HAS_CJS_EXPORT.test(source);
+  memo.set(filePath, sealed);
+  return sealed;
+}
+
+/**
+ * Whether `candidate` can be named by a reference in `ref`'s file at all.
+ * Both name-based strategies validate their chosen candidate. Removing an
+ * unreachable candidate before ranking can promote an unrelated runner-up;
+ * rejecting the chosen target must leave the reference unresolved instead.
+ */
+function isCrossFileReachable(
+  candidate: Node,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): boolean {
+  if ((ref.language as string) !== 'markdown' && (candidate.language as string) === 'markdown') return false;
+  if (ref.referenceKind === 'calls' && ESM_FAMILY.has(candidate.language) &&
+    (candidate.kind === 'constant' || candidate.kind === 'variable') &&
+    /^=\s*require\s*\(\s*(['"])[^'"]+\.json\1\s*\)\s*;?\s*$/.test(candidate.signature ?? '')) return false;
+  return (
+    candidate.filePath === ref.filePath ||
+    !ESM_FAMILY.has(candidate.language) ||
+    !isSealedModule(candidate.filePath, context)
+  );
+}
+
 /**
  * Try to resolve a reference by exact name match
  */
@@ -407,7 +510,10 @@ export function matchByExactName(
   const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref)
     .filter((n) => n.kind !== 'import')
     // Nested locals are only reachable from inside their container (#1230).
-    .filter((n) => isLexicallyReachable(n, ref, context));
+    .filter((n) => isLexicallyReachable(n, ref, context))
+    // Preserve import ranking; calls reject the winner without promoting another.
+    .filter((n) => ref.referenceKind !== 'imports' || n.filePath === ref.filePath ||
+      !ESM_FAMILY.has(n.language) || !isSealedModule(n.filePath, context));
 
   if (candidates.length === 0) {
     return null;
@@ -415,6 +521,7 @@ export function matchByExactName(
 
   // If only one match, use it — but penalize cross-language matches
   if (candidates.length === 1) {
+    if (!isCrossFileReachable(candidates[0]!, ref, context)) return null;
     const isCrossLanguage = candidates[0]!.language !== ref.language;
     return {
       original: ref,
@@ -435,7 +542,7 @@ export function matchByExactName(
 
   // Multiple matches - try to narrow down
   const bestMatch = findBestMatch(ref, candidates, context);
-  if (bestMatch) {
+  if (bestMatch && isCrossFileReachable(bestMatch, ref, context)) {
     // Lower confidence when the match is from a distant/unrelated module
     const proximity = computePathProximity(ref.filePath, bestMatch.filePath);
     const confidence = proximity >= 30 ? 0.7 : 0.4;
@@ -1299,6 +1406,7 @@ function getInferScanStates(context: ResolutionContext): Map<string, InferScanSt
 /** Drop the per-context scan states (see ReferenceResolver.clearCaches). */
 export function clearNameMatcherMemos(context: ResolutionContext): void {
   INFER_SCAN_STATES.delete(context);
+  SEALED_MODULES.delete(context);
 }
 
 function memoPatterns(key: string, build: () => RegExp[]): RegExp[] {
@@ -2412,13 +2520,19 @@ export function matchFuzzy(
 
   // Filter to callable kinds only (function, method, class)
   const callableKinds = new Set(['function', 'method', 'class']);
-  const callableCandidates = applyLanguageGate(candidates.filter((n) => callableKinds.has(n.kind)), ref);
+  const callableCandidates = applyLanguageGate(
+    candidates.filter((n) => callableKinds.has(n.kind)),
+    ref
+  );
 
   // Prefer same-language matches
   const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);
   const finalCandidates = sameLanguageCandidates.length > 0 ? sameLanguageCandidates : callableCandidates;
 
-  if (finalCandidates.length === 1) {
+  // The sealed-module test rejects the survivor, and never filters the set that
+  // produced it (#1719): removing a sealed candidate from a crowd would leave a
+  // lone one and manufacture a 0.5 guess out of an ambiguity fuzzy declines.
+  if (finalCandidates.length === 1 && isCrossFileReachable(finalCandidates[0]!, ref, context)) {
     const isCrossLanguage = finalCandidates[0]!.language !== ref.language;
     return {
       original: ref,

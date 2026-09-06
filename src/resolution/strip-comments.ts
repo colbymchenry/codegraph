@@ -23,6 +23,52 @@
  * framework extractors scan for.
  */
 
+/**
+ * Blank string contents while preserving quotes and offsets. Template
+ * interpolations are blanked too; callers checking executable expressions
+ * must conservatively inspect those expressions in the original source.
+ */
+export function blankStringContents(text: string): string {
+  const out = text.split('');
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const c = text[i]!;
+    // A quote inside a JS regex is data, not the beginning of a string.
+    // Expression-start punctuation and keywords distinguish these from division.
+    if (c === '/' && /(?:^|[=(:,)!&|?;{}\[\]+*%~^<>-]|\b(?:return|throw|case|yield|await|else|do|typeof|void|delete|new|in|of|instanceof))\s*$/.test(text.slice(Math.max(0, i - 32), i))) {
+      let end = i + 1;
+      let inClass = false;
+      for (; end < n && text[end] !== '\n'; end++) {
+        if (text[end] === '\\') { end++; continue; }
+        if (text[end] === '[') inClass = true;
+        if (text[end] === ']') inClass = false;
+        if (text[end] === '/' && !inClass) break;
+      }
+      if (end < n && text[end] === '/') { i = end + 1; continue; }
+    }
+    if (c === '"' || c === "'" || c === '`') {
+      const quote = c;
+      i++;
+      while (i < n && text[i] !== quote) {
+        if (text[i] === '\\' && i + 1 < n) {
+          out[i] = ' ';
+          out[i + 1] = ' ';
+          i += 2;
+          continue;
+        }
+        if (quote !== '`' && text[i] === '\n') break;
+        if (text[i] !== '\n') out[i] = ' ';
+        i++;
+      }
+      if (i < n && text[i] === quote) i++;
+      continue;
+    }
+    i++;
+  }
+  return out.join('');
+}
+
 export type CommentLang =
   | 'python'
   | 'javascript'

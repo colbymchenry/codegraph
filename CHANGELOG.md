@@ -201,6 +201,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Symbols, tests and the viewer
 
+- **A binding in a module that exports nothing is no longer a cross-file target.** On vite, every `import { defineConfig } from 'vite'` across the playground resolved onto a `const vite = await createServer(…)` sitting at module scope in `playground/ssr-html/test-stacktrace.js` — a file with an import and no export, so that binding is reachable from nowhere but itself. Name matching commits as soon as one candidate survives, and nothing asked whether an import could reach the survivor; that one binding took 157 edges. A JS/TS file holding an `import` and no export of any kind now offers its locals to no other file. Classic scripts, CommonJS (including `exports["x"] = …`), a later `export { … }`, and names contributed through `declare global` are all unaffected. Across vite this removed 320 wrong edges and added 18, each addition a reference that was previously ambiguous rather than newly invented. Re-index after upgrading.
+
 - **Files under an `e2e/` directory count as tests.** Their calls no longer appear as production callers in Steps, dead-code and test badges.
 
 - **Production code under a `samples` or `examples` package path is no longer treated as test code.** A Kotlin or Java project whose package path runs through `com/google/samples/…` (Now in Android, for one) had nearly every file counted as a fixture, so the Map opened on `build-logic`, the entry points hid the app, and dead-code and test badges were wrong. Only the project layout above a `src/` folder decides now; the package path below it never does.
