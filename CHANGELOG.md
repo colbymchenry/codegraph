@@ -201,6 +201,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Symbols, tests and the viewer
 
+- **A name imported from a package no longer fuzzy-matches a project symbol.** `import type { EvaluatedModules } from 'vite/module-runner'` names a symbol that is not in the graph at all, but the fuzzy fallback matched it by name anyway — and the match is case-insensitive, so on vitest it landed on the unrelated method `VitestMocker::evaluatedModules`. Fuzzy matching now declines when the call site's binding is a bare specifier (a builtin or an npm package); relative, alias, workspace and `link:`/`file:` imports still fall through, and only JS/TS is affected, since elsewhere a project's own modules are imported by absolute name too. Across vitest, svelte, vite and rollup this removed 46 wrong edges and added none. Re-index after upgrading.
+
 - **Files under an `e2e/` directory count as tests.** Their calls no longer appear as production callers in Steps, dead-code and test badges.
 
 - **Production code under a `samples` or `examples` package path is no longer treated as test code.** A Kotlin or Java project whose package path runs through `com/google/samples/…` (Now in Android, for one) had nearly every file counted as a fixture, so the Map opened on `build-logic`, the entry points hid the app, and dead-code and test badges were wrong. Only the project layout above a `src/` folder decides now; the package path below it never does.
