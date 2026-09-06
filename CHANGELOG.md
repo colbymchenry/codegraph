@@ -201,6 +201,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Symbols, tests and the viewer
 
+- TypeScript/JavaScript: a call through a field of the enclosing class — `this.mailer.send()` — now resolves on the field's declared type, so a delegating wrapper that shares the method's name no longer records itself as its own callee and `callers`, `impact` and trace stop lying on that shape. A field whose type is external or a builtin stays unresolved rather than guessed. Re-index after upgrading. (#1496)
+
 - **Files under an `e2e/` directory count as tests.** Their calls no longer appear as production callers in Steps, dead-code and test badges.
 
 - **Production code under a `samples` or `examples` package path is no longer treated as test code.** A Kotlin or Java project whose package path runs through `com/google/samples/…` (Now in Android, for one) had nearly every file counted as a fixture, so the Map opened on `build-logic`, the entry points hid the app, and dead-code and test badges were wrong. Only the project layout above a `src/` folder decides now; the package path below it never does.

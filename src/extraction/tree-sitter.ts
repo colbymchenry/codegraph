@@ -4574,6 +4574,29 @@ export class TreeSitterExtractor {
               // name, which either failed to resolve or resolved ambiguously.
               calleeName = `${getNodeText(receiver, this.source)}.${methodName}`;
             } else if (
+              (this.language === 'typescript' ||
+                this.language === 'javascript' ||
+                this.language === 'tsx' ||
+                this.language === 'jsx') &&
+              receiver &&
+              receiver.type === 'member_expression' &&
+              getChildByField(receiver, 'object')?.type === 'this' &&
+              getChildByField(receiver, 'property')?.type === 'property_identifier'
+            ) {
+              // TS/JS call through a field of the enclosing class —
+              // `this.mailer.send()` (#1496). Keep the `this.<field>` prefix:
+              // the resolver reads the field's declared type off the class's
+              // own declaration (`private mailer: Mailer`, `mailer = new
+              // Mailer()`) and resolves the method on THAT type — or leaves the
+              // ref unresolved when the type is external or unknown. Previously
+              // this collapsed to the bare method name, which exact-matched
+              // whichever same-named method was nearest — the calling method
+              // itself when the two share a name, a self-edge not in the
+              // source. Same discipline as Rust's `self.<field>` (#1585).
+              // Mirrored in the kernel's extract_call (tsjs/extractors.rs).
+              const fieldName = getNodeText(getChildByField(receiver, 'property')!, this.source);
+              calleeName = `this.${fieldName}.${methodName}`;
+            } else if (
               this.language === 'go' &&
               receiver &&
               receiver.type === 'selector_expression' &&

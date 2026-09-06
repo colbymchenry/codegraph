@@ -212,3 +212,11 @@ import('./dynamic-module');
 new NS.Widget(makeArg());
 new Map<string, number>();
 super_weird?.();
+
+// --- call through a field of the enclosing class (#1496) ---------------------
+export class FieldDelegator {
+  constructor(private readonly mailer: { send(m: string): string }, private items: string[]) {}
+  send(msg: string): string { return this.mailer.send(msg); }
+  push(msg: string): void { this.items.push(msg); this.mailer.send(msg).trim(); }
+  direct(): void { this.send('x'); super.toString(); }
+}
