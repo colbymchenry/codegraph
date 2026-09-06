@@ -21,6 +21,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
+import { rmTempDir } from './rm-temp';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
@@ -84,13 +85,21 @@ describe('MCP project resolution via roots/list (issue #196)', () => {
     projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-proj-'));
   });
 
-  afterEach(() => {
-    if (child && !child.killed) {
-      child.kill('SIGKILL');
+  afterEach(async () => {
+    // kill() only asks; the child is still holding its cwd and the project's
+    // database when it returns. Windows will not delete either while a live
+    // process owns them, so the exit has to be awaited before the temp trees
+    // go — on POSIX the removal succeeds regardless, which is why CI is green.
+    if (child) {
+      if (child.exitCode === null && child.signalCode === null) {
+        const exited = new Promise<void>((resolve) => child!.once('exit', () => resolve()));
+        child.kill('SIGKILL');
+        await exited;
+      }
       child = null;
     }
-    fs.rmSync(cwdDir, { recursive: true, force: true });
-    fs.rmSync(projectDir, { recursive: true, force: true });
+    await rmTempDir(cwdDir);
+    await rmTempDir(projectDir);
   });
 
   it('resolves the project from the client roots/list when no rootUri is sent', async () => {
