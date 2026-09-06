@@ -256,7 +256,12 @@ function readTrailFile(absolute: string, id: string): StoredTrail | null {
   try {
     // O_NOFOLLOW closes the race between path validation and the actual open:
     // replacing a checked file with a symlink must fail rather than follow it.
-    fd = fs.openSync(absolute, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    // O_NONBLOCK keeps a FIFO with no writer from parking the whole server on
+    // this open; a regular file ignores it, and `isFile()` below rejects the rest.
+    fd = fs.openSync(
+      absolute,
+      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0)
+    );
     const stat = fs.fstatSync(fd);
     // A file too big to be a trail is skipped rather than read: this directory
     // is inside the project, and something else may one day put a log in it.

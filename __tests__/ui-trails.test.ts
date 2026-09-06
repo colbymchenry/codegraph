@@ -310,6 +310,25 @@ describe('trail read containment', () => {
       }
     }
   );
+
+  it.runIf(process.platform !== 'win32')(
+    'skips a FIFO in the trails directory without blocking on it',
+    () => {
+      const base = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-trail-read-fifo-'));
+      const project = path.join(base, 'project');
+      const dir = path.join(project, TRAILS_RELATIVE_DIR);
+      fs.mkdirSync(dir, { recursive: true });
+      // A FIFO with no writer: a blocking open would hang here until one showed up.
+      execFileSync('mkfifo', [path.join(dir, 'blocked.json')]);
+
+      try {
+        expect(listStoredTrails(project)).toEqual({ trails: [], skipped: 1 });
+      } finally {
+        fs.rmSync(base, { recursive: true, force: true });
+      }
+    },
+    5_000
+  );
 });
 
 describe('trail author cache', () => {
