@@ -76,6 +76,18 @@ describe('matchFuzzy declines a lone survivor bound to a bare import', () => {
     expect(res?.resolvedBy).toBe('fuzzy');
   });
 
+  // vite's playground/tsconfig.json declares `"paths": { "~utils": [...] }` —
+  // a nested tsconfig the alias loader never reads — so shape is the only
+  // signal that these are local. npm names cannot start with any of them.
+  it.each(['~utils', '~/utils', '#types/hmrPayload', '$lib/stores'])(
+    'still matches a local specifier with no slash after its prefix: %s',
+    (source) => {
+      const res = matchFuzzy(callTo('javascript'), contextWith(imported(source)));
+      expect(res?.targetNodeId).toBe('m:resolve');
+      expect(res?.resolvedBy).toBe('fuzzy');
+    },
+  );
+
   it('still matches when the name is bound by no import at all', () => {
     const res = matchFuzzy(callTo('javascript'), contextWith([]));
     expect(res?.targetNodeId).toBe('m:resolve');
