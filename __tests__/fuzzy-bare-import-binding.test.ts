@@ -7,8 +7,10 @@
  * matchFuzzy is driven directly. Which strategy reaches a given ref depends on
  * how many same-named symbols the repo holds and on what the earlier stages of
  * matchReference make of them, so a source fixture pins the pipeline rather
- * than this guard; the shape that routes through fuzzy on a real tree is vite's
- * playground configs, and the guard removes 44 of its wrong edges there.
+ * than this guard. On real trees the shape routes through fuzzy as a
+ * case-insensitive match — `EvaluatedModules` from `vite/module-runner` onto
+ * vitest's `VitestMocker::evaluatedModules`, `Bundle` from `magic-string` onto
+ * a svelte build script's `bundle`.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -31,8 +33,13 @@ const SURVIVOR: Node = {
   updatedAt: 0,
 };
 
-function contextWith(imports: ImportMapping[], candidate = SURVIVOR): ResolutionContext {
+function contextWith(
+  imports: ImportMapping[],
+  candidate = SURVIVOR,
+  localLinkNames?: Set<string>
+): ResolutionContext {
   return {
+    getWorkspacePackages: () => (localLinkNames ? { byName: new Map(), localLinkNames } : null),
     getNodesInFile: () => [],
     getNodesByName: () => [candidate],
     getNodesByLowerName: () => [candidate],
@@ -87,6 +94,26 @@ describe('matchFuzzy declines a lone survivor bound to a bare import', () => {
       expect(res?.resolvedBy).toBe('fuzzy');
     },
   );
+
+  // vitest's `test/browser/package.json` declares `"@vitest/bundled-lib":
+  // "link:./bundled-lib"`, a directory its `test/*` workspace globs do not
+  // reach, so the workspace map cannot vouch for the name and only the
+  // dependency protocol shows it is local.
+  it('still matches a link: dependency, which is local despite its package spelling', () => {
+    const linked = new Set(['@vitest/bundled-lib']);
+    const res = matchFuzzy(
+      callTo('javascript'),
+      contextWith(imported('@vitest/bundled-lib'), SURVIVOR, linked)
+    );
+    expect(res?.targetNodeId).toBe('m:resolve');
+  });
+
+  it('declines a scoped package that is not linked into the project', () => {
+    const linked = new Set(['@vitest/bundled-lib']);
+    expect(
+      matchFuzzy(callTo('javascript'), contextWith(imported('@vitest/mocker'), SURVIVOR, linked))
+    ).toBeNull();
+  });
 
   it('still matches when the name is bound by no import at all', () => {
     const res = matchFuzzy(callTo('javascript'), contextWith([]));
