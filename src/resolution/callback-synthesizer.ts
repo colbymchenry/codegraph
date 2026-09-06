@@ -37,6 +37,7 @@ import { svelteKitLinkEdges, svelteKitPageComponentEdges } from './sveltekit-syn
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { crossTierEdges } from './tier-synthesizer';
 import { enclosingFn, makeLineAt } from './synth-utils';
+import { fivemDispatchEdges } from './fivem-synthesizer';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -3554,6 +3555,8 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   // keeps the more specific edge — the one that says which tier it crosses.
   { name: 'tierEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => crossTierEdges(c, y) },
   { name: 'emitterEdges', gate: ALWAYS, run: (_q, c, y) => eventEmitterEdges(c, y) },
+  // FiveM string-keyed dispatch (TriggerServerEvent/exports/lib.callback/…) → the resolver's handler nodes. Exits at once with no fxmanifest.
+  { name: 'fivemEdges', gate: (has) => has('lua', 'luau', ...JS_FAMILY), run: (_q, c, y) => fivemDispatchEdges(c, y) },
   { name: 'renderEdges', gate: ALWAYS, run: (q, c, y) => reactRenderEdges(q, c, y) },
   { name: 'jsxEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => reactJsxChildEdges(c, y) },
   { name: 'vueEdges', gate: (has) => has('vue'), run: (_q, c, y) => vueTemplateEdges(c, y) },

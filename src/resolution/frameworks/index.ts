@@ -15,6 +15,7 @@ import { nextjsResolver } from './nextjs';
 import { reactRouterResolver } from './react-router';
 import { tanstackRouterResolver } from './tanstack-router';
 import { vueRouterResolver } from './vue-router';
+import { fivemResolver } from './fivem';
 import { svelteKitRouterResolver } from './sveltekit-router';
 import { svelteResolver } from './svelte';
 import { vueResolver } from './vue';
@@ -60,6 +61,8 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   // Vue Router — `createRouter({ routes })` → route nodes; `router.push({ name })` / `router.push('/x')` → navigates edges
   vueRouterResolver,
   astroResolver,
+  // FiveM — `fxmanifest.lua` resources; RegisterNetEvent/exports/lib.callback/RegisterCommand/RegisterNUICallback('literal', fn) → handler nodes; string-keyed dispatch bridged by `fivem-synthesizer.ts`
+  fivemResolver,
   // Python
   djangoResolver,
   flaskResolver,
@@ -157,6 +160,7 @@ export { reactResolver } from './react';
 export { reactRouterResolver } from './react-router';
 export { tanstackRouterResolver } from './tanstack-router';
 export { vueRouterResolver } from './vue-router';
+export { fivemResolver } from './fivem';
 export { svelteKitRouterResolver } from './sveltekit-router';
 export { svelteResolver } from './svelte';
 export { vueResolver } from './vue';
