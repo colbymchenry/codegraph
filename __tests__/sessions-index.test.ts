@@ -21,6 +21,7 @@ import {
 } from '../src/sessions/claude-code';
 import {
   SessionsIndex,
+  enterWalMode,
   ftsQuery,
   querySessions,
   sessionsSourceDir,
@@ -203,6 +204,59 @@ describe('SessionsIndex', () => {
     await new Promise((resolve) => other.once('exit', resolve));
     expect(index.search('pool transcript threads')).toHaveLength(1);
     index.close();
+  });
+
+  it('opens a fresh database while another connection holds it, converting to WAL once free', async () => {
+    // An ordinary lock wait on the conversion is covered by busy_timeout: the
+    // holder commits and this open then converts, rather than throwing.
+    const dbPath = path.join(fixtureDir(), 'sessions.db');
+    const other = new Worker(
+      `const { workerData, parentPort } = require('worker_threads');
+       const { DatabaseSync } = require('node:sqlite');
+       const db = new DatabaseSync(workerData.dbPath);
+       db.exec('BEGIN EXCLUSIVE');
+       parentPort.postMessage('locked');
+       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+       db.exec('COMMIT');
+       db.close();`,
+      { eval: true, workerData: { dbPath } },
+    );
+    await new Promise((resolve) => other.once('message', resolve));
+    const index = SessionsIndex.open(dbPath);
+    await new Promise((resolve) => other.once('exit', resolve));
+    const db = createDatabase(dbPath).db;
+    expect(String(db.pragma('journal_mode', { simple: true })).toLowerCase()).toBe('wal');
+    db.close();
+    index.close();
+  });
+
+  it('retries a WAL conversion that collides with another process converting the same fresh file', () => {
+    // What busy_timeout does NOT cover: several processes converting one
+    // brand-new database at the same moment collide inside the conversion
+    // rather than queueing on a lock, and it surfaces as either of these two
+    // transient errors. That collision only reproduces probabilistically, so
+    // the retry is driven directly here.
+    for (const message of ['database is locked', 'disk I/O error']) {
+      let calls = 0;
+      const db = {
+        pragma(sql: string) {
+          if (!/journal_mode\s*=/i.test(sql)) return 'delete';
+          if (++calls < 3) throw new Error(message);
+          return 'wal';
+        },
+      };
+      expect(() => enterWalMode(db as never)).not.toThrow();
+      expect(calls).toBe(3);
+    }
+  });
+
+  it('gives up on a WAL conversion error that is not the transient collision', () => {
+    const db = {
+      pragma() {
+        throw new Error('unable to open database file');
+      },
+    };
+    expect(() => enterWalMode(db as never)).toThrow(/unable to open database file/);
   });
 });
 
