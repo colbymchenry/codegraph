@@ -195,8 +195,14 @@ function listeningPids(root: string): number[] {
  * passes with nothing alive, which covers the spawn window rather than assuming
  * it has closed. Guards our own pid: the version-mismatch test plants
  * `pid: process.pid` in the lockfile, and we must never SIGKILL the worker.
+ *
+ * Returns whether the root actually went quiet. The two exits mean opposite
+ * things — quiet reached is a clean reap, `maxPasses` burned is a daemon that
+ * kept respawning or refused SIGKILL — and a caller that cannot tell them apart
+ * reads the second as the first, so the reap can report success on the exact
+ * run where it did nothing.
  */
-async function reapDaemons(root: string, quietPasses = 6, maxPasses = 200): Promise<void> {
+async function reapDaemons(root: string, quietPasses = 6, maxPasses = 200): Promise<boolean> {
   let quiet = 0;
   for (let pass = 0; pass < maxPasses && quiet < quietPasses; pass++) {
     const lockPid = readLockPid(root);
@@ -209,6 +215,7 @@ async function reapDaemons(root: string, quietPasses = 6, maxPasses = 200): Prom
     quiet = alive.length === 0 ? quiet + 1 : 0;
     await new Promise((r) => setTimeout(r, 25));
   }
+  return quiet >= quietPasses;
 }
 
 function killTree(...procs: ChildProcessWithoutNullStreams[]): void {
@@ -242,9 +249,14 @@ describe('Shared MCP daemon (issue #411)', () => {
     );
     killTree(...servers.map((s) => s.child));
     await Promise.all(exits);
-    await reapDaemons(realRoot);
+    const reaped = await reapDaemons(realRoot);
     servers.length = 0;
     await rmTempDir(tempDir);
+    // Asserted after the removal so a failed reap still cleans up what it can,
+    // and surfaces as itself rather than as the EPERM it would cause next.
+    if (!reaped) {
+      throw new Error(`reapDaemons exhausted its pass budget on ${realRoot} — a daemon is still alive`);
+    }
   });
 
   it('two invocations share ONE detached daemon; both attach as proxies', async () => {

@@ -3570,6 +3570,7 @@ int run() {
     // feature can't silently regress to a no-op in the indexing flow.
     it('connects #include to the real header file via include-dir scan (end-to-end)', async () => {
       const tempProject = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cpp-e2e-'));
+      let db: ReturnType<typeof DatabaseConnection.open> | undefined;
       try {
         fs.mkdirSync(path.join(tempProject, 'include'), { recursive: true });
         fs.mkdirSync(path.join(tempProject, 'src'), { recursive: true });
@@ -3592,7 +3593,7 @@ int run() {
         // The `#include "utils.h"` edge should target the real
         // `include/utils.h` file node — not a floating `import` node
         // living inside main.cpp.
-        const db = DatabaseConnection.open(path.join(tempProject, '.codegraph', 'codegraph.db'));
+        db = DatabaseConnection.open(path.join(tempProject, '.codegraph', 'codegraph.db'));
         const rows = db.getDb().prepare(`
           select dst.kind as dstKind, dst.file_path as dstPath
           from edges e
@@ -3602,7 +3603,6 @@ int run() {
             and src.kind = 'file'
             and src.file_path = 'src/main.cpp'
         `).all() as Array<{ dstKind: string; dstPath: string }>;
-        db.close();
         const resolvedToHeader = rows.find(
           (r) => r.dstKind === 'file' && r.dstPath === 'include/utils.h'
         );
@@ -3615,8 +3615,10 @@ int run() {
       } finally {
         // Windows will not delete a file that still has an open handle. Both
         // holders have to go: the graph's own connection, and the direct one
-        // this test opens to read edges back. close() is idempotent, so the
-        // outer afterEach's destroy() stays safe.
+        // this test opens to read edges back. Closing here rather than after
+        // the query keeps that true when a query or an assertion throws.
+        // close() is idempotent, so the outer afterEach's destroy() stays safe.
+        db?.close();
         cg?.close();
         fs.rmSync(tempProject, { recursive: true, force: true });
       }
@@ -3691,6 +3693,7 @@ class Both : public Base<char>, public Plain {}; // templated + plain in one cla
 
     it('resolves require_once to a file→file imports edge (#660)', async () => {
       const tempProject = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-php-e2e-'));
+      let db: ReturnType<typeof DatabaseConnection.open> | undefined;
       try {
         fs.mkdirSync(path.join(tempProject, 'src'), { recursive: true });
         fs.writeFileSync(
@@ -3707,7 +3710,7 @@ class Both : public Base<char>, public Plain {}; // templated + plain in one cla
         // reporter's repro: page.php's `require_once("lib.php")` must resolve
         // to the real src/lib.php file node — a file→file `imports` edge, so
         // callers(lib.php) now includes page.php.
-        const db = DatabaseConnection.open(path.join(tempProject, '.codegraph', 'codegraph.db'));
+        db = DatabaseConnection.open(path.join(tempProject, '.codegraph', 'codegraph.db'));
         const rows = db.getDb().prepare(`
           select dst.kind as dstKind, dst.file_path as dstPath
           from edges e
@@ -3717,12 +3720,12 @@ class Both : public Base<char>, public Plain {}; // templated + plain in one cla
             and src.kind = 'file'
             and src.file_path = 'src/page.php'
         `).all() as Array<{ dstKind: string; dstPath: string }>;
-        db.close();
         const resolved = rows.find(
           (r) => r.dstKind === 'file' && r.dstPath === 'src/lib.php'
         );
         expect(resolved, 'page.php → src/lib.php imports edge missing').toBeDefined();
       } finally {
+        db?.close();
         cg?.close();
         fs.rmSync(tempProject, { recursive: true, force: true });
       }
@@ -3730,6 +3733,7 @@ class Both : public Base<char>, public Plain {}; // templated + plain in one cla
 
     it('resolves a subdirectory include path to the correct file (#660)', async () => {
       const tempProject = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-php-subdir-'));
+      let db: ReturnType<typeof DatabaseConnection.open> | undefined;
       try {
         fs.mkdirSync(path.join(tempProject, 'inc'), { recursive: true });
         fs.writeFileSync(
@@ -3743,7 +3747,7 @@ class Both : public Base<char>, public Plain {}; // templated + plain in one cla
 
         cg = await CodeGraph.init(tempProject, { index: true });
 
-        const db = DatabaseConnection.open(path.join(tempProject, '.codegraph', 'codegraph.db'));
+        db = DatabaseConnection.open(path.join(tempProject, '.codegraph', 'codegraph.db'));
         const rows = db.getDb().prepare(`
           select dst.kind as dstKind, dst.file_path as dstPath
           from edges e
@@ -3753,12 +3757,12 @@ class Both : public Base<char>, public Plain {}; // templated + plain in one cla
             and src.kind = 'file'
             and src.file_path = 'index.php'
         `).all() as Array<{ dstKind: string; dstPath: string }>;
-        db.close();
         expect(
           rows.find((r) => r.dstKind === 'file' && r.dstPath === 'inc/db.php'),
           'index.php → inc/db.php imports edge missing'
         ).toBeDefined();
       } finally {
+        db?.close();
         cg?.close();
         fs.rmSync(tempProject, { recursive: true, force: true });
       }
@@ -3766,6 +3770,7 @@ class Both : public Base<char>, public Plain {}; // templated + plain in one cla
 
     it('does not mis-connect an unresolvable include to a same-named file elsewhere (#660)', async () => {
       const tempProject = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-php-misresolve-'));
+      let db: ReturnType<typeof DatabaseConnection.open> | undefined;
       try {
         // app/page.php's `require "inc/db.php"` resolves relative to app/, where
         // inc/db.php does NOT exist. A same-named lib/inc/db.php exists elsewhere
@@ -3784,7 +3789,7 @@ class Both : public Base<char>, public Plain {}; // templated + plain in one cla
 
         cg = await CodeGraph.init(tempProject, { index: true });
 
-        const db = DatabaseConnection.open(path.join(tempProject, '.codegraph', 'codegraph.db'));
+        db = DatabaseConnection.open(path.join(tempProject, '.codegraph', 'codegraph.db'));
         const rows = db.getDb().prepare(`
           select dst.kind as dstKind, dst.file_path as dstPath
           from edges e
@@ -3794,12 +3799,12 @@ class Both : public Base<char>, public Plain {}; // templated + plain in one cla
             and src.kind = 'file'
             and src.file_path = 'app/page.php'
         `).all() as Array<{ dstKind: string; dstPath: string }>;
-        db.close();
         expect(
           rows.find((r) => r.dstKind === 'file' && r.dstPath === 'lib/inc/db.php'),
           'app/page.php must NOT mis-connect to unrelated lib/inc/db.php'
         ).toBeUndefined();
       } finally {
+        db?.close();
         cg?.close();
         fs.rmSync(tempProject, { recursive: true, force: true });
       }
