@@ -213,6 +213,8 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
 }
 
 impl<'t> Walker<'t> {
+    markdown_refs_impl!();
+
     fn text(&self, node: Node) -> &'t str {
         &self.src[node.byte_range()]
     }
@@ -621,6 +623,8 @@ impl<'t> Walker<'t> {
 
         // maybeCaptureFnRefs (:990) — the double-walk fn-ref twin source.
         self.maybe_capture_fn_refs(node);
+        let md_owner = self.top_row();
+        self.markdown_refs_from_string(node, md_owner);
 
         match node.kind() {
             "function_signature" => {
@@ -1246,6 +1250,8 @@ impl<'t> Walker<'t> {
     fn visit_body(&mut self, node: Node<'t>) {
         stack_guard!();
         self.maybe_capture_fn_refs(node);
+        let md_owner = self.top_row();
+        self.markdown_refs_from_string(node, md_owner);
 
         let kind = node.kind();
         if kind == "new_expression" {

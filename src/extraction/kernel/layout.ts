@@ -96,6 +96,7 @@ export const FUNCTION_REF_CODE = 200;
  * parameter, which is byte-identical.
  */
 export const REF_FLAG_FILE_PATH = 1;
+export const REF_FLAG_LANGUAGE = 2;
 
 /** Node bool-flag bit pairs: bit(2n) = present, bit(2n+1) = value. */
 export const FLAG = {

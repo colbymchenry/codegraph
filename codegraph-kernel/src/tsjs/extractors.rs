@@ -385,6 +385,12 @@ impl<'t> Walker<'t> {
             );
             if let Some(row) = var_row {
                 self.extract_variable_type_annotation(child, row);
+                // The declarator's walk stops here (visit_node skips a
+                // variable's children), so the initializer's string literals
+                // are reached from this side, owned by the declared symbol.
+                if let Some(v) = value {
+                    self.markdown_refs_from_subtree(v, row);
+                }
             }
 
             // Exported const object-of-functions / store shapes.

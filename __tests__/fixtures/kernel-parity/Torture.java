@@ -100,3 +100,20 @@ interface Shape extends Comparable<Shape>, Cloneable {
 @interface Marker {
   String value() default "";
 }
+
+// Markdown path references: code -> documentation edges. Every shape the
+// normalizer branches on, so the two arms have to agree about the rejections
+// (URL, escape above the root) as well as the emissions.
+class MarkdownPaths {
+  static final String GUIDE = "../docs/guide.md#install";
+  static final String BARE = "README.md";
+  static final String ROOTED = "/docs/rooted.md";
+  static final String ESCAPES = "../../../../outside.md";
+  static final String REMOTE = "https://example.com/remote.md";
+  static final String QUERIED = "./notes.md?raw=1#top";
+  static final String TWO_IN_ONE = "see a.md and also sub/b.mdx";
+
+  void load() {
+    loadDoc("docs/deep/nested.markdown");
+  }
+}

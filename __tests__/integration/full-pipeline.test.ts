@@ -82,6 +82,97 @@ describe('Integration: full pipeline', () => {
     cleanupTempDir(tempDir);
   });
 
+  it('indexes Markdown headings and resolves Markdown links to script files', async () => {
+    fs.mkdirSync(path.join(tempDir, 'docs'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'scripts'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, 'README.md'),
+      `# Project Guide
+
+See [Setup](docs/setup.md#install).
+
+## Release
+
+\`\`\`bash
+node scripts/release.mjs
+\`\`\`
+`
+    );
+    fs.writeFileSync(path.join(tempDir, 'docs', 'setup.md'), '# Install\n');
+    fs.writeFileSync(path.join(tempDir, 'scripts', 'release.mjs'), 'export function release() { return true; }\n');
+
+    const cg = await CodeGraph.init(tempDir);
+    try {
+      await cg.indexAll();
+
+      const guide = cg.searchNodes('Project Guide').find((r) => r.node.language === 'markdown');
+      expect(guide).toBeDefined();
+
+      const releaseCommand = cg
+        .searchNodes('release.mjs')
+        .find((r) => r.node.language === 'markdown' && r.node.kind === 'function');
+      expect(releaseCommand).toBeDefined();
+
+      const guideEdges = cg.getOutgoingEdges(guide!.node.id).filter((e) => e.kind === 'imports');
+      const guideTargets = guideEdges.map((e) => cg.getNode(e.target));
+      const setupHeading = guideTargets.find((n) => n?.qualifiedName === 'docs/setup.md#install');
+      expect(setupHeading).toMatchObject({
+        kind: 'module',
+        name: 'Install',
+        filePath: 'docs/setup.md',
+        startLine: 1,
+      });
+
+      const commandEdges = cg.getOutgoingEdges(releaseCommand!.node.id).filter((e) => e.kind === 'calls');
+      const commandTargets = commandEdges.map((e) => cg.getNode(e.target)?.filePath);
+      expect(commandTargets).toContain('scripts/release.mjs');
+    } finally {
+      cg.destroy();
+    }
+  });
+
+  it('indexes Markdown template tables and resolves file-symbol references to implementation functions', async () => {
+    fs.mkdirSync(path.join(tempDir, 'phases'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'scripts'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, 'phases', 'phase4.md'),
+      `# Phase 4
+
+## Fixed Script Templates
+
+| Template | CLI Entry | Dispatcher | Implementation |
+| --- | --- | --- | --- |
+| P4-S1 | \`python "{script_path}" p4 "{csv_file}" s1 "{conditions_or_-}" "{probe_cols}"\` | \`scripts/csv_search.py::run_p4\` | \`scripts/csv_search.py::_p4_stage1\` |
+| P4-S2 | \`python "{script_path}" p4 "{csv_file}" s2 "{stage1_rows}" "{condition_or_-}" "{detail_cols}"\` | \`scripts/csv_search.py::run_p4\` | \`scripts/csv_search.py::_p4_stage2\` |
+`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'scripts', 'csv_search.py'),
+      `def _p4_stage1(filepath, condition_spec, probe_cols_spec):\n    return 's1'\n\n` +
+        `def _p4_stage2(filepath, stage1_rows, condition_spec, detail_cols_spec):\n    return 's2'\n\n` +
+        `def run_p4(filepath, args):\n    return _p4_stage1(filepath, '-', 'MPN')\n`
+    );
+
+    const cg = await CodeGraph.init(tempDir);
+    try {
+      await cg.indexAll();
+
+      const p4s1Row = cg.searchNodes('P4-S1').find((r) => r.node.language === 'markdown');
+      expect(p4s1Row?.node.kind).toBe('constant');
+
+      const edges = cg.getOutgoingEdges(p4s1Row!.node.id).filter((e) => e.kind === 'references');
+      const targets = edges.map((e) => cg.getNode(e.target));
+      expect(targets).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ name: 'run_p4', filePath: 'scripts/csv_search.py' }),
+          expect.objectContaining({ name: '_p4_stage1', filePath: 'scripts/csv_search.py' }),
+        ])
+      );
+    } finally {
+      cg.destroy();
+    }
+  });
+
   it('runs init → index → resolve → search → callers → context → sync', async () => {
     const MODULE_COUNT = 120;
     generateSyntheticProject(tempDir, MODULE_COUNT);
@@ -269,4 +360,46 @@ describe('Integration: full pipeline', () => {
       cg.destroy();
     }
   }, 30_000);
+
+  it('resolves code string references to Markdown headings', async () => {
+    fs.mkdirSync(path.join(tempDir, 'docs'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'scripts'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tempDir, 'docs', 'guide.md'),
+      `# Guide
+
+## Install
+
+Run the setup command.
+`
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'scripts', 'load_docs.py'),
+      `GUIDE = "docs/guide.md"\n\n` +
+        `def load_docs():\n` +
+        `    return open("docs/guide.md#install", encoding="utf-8").read()\n`
+    );
+
+    const cg = await CodeGraph.init(tempDir);
+    try {
+      await cg.indexAll();
+
+      const loadDocs = cg.searchNodes('load_docs').find((r) => r.node.language === 'python');
+      expect(loadDocs).toBeDefined();
+
+      const edges = cg.getOutgoingEdges(loadDocs!.node.id).filter((e) => e.kind === 'references');
+      const targets = edges.map((e) => cg.getNode(e.target));
+      expect(targets).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: 'module',
+            name: 'Install',
+            qualifiedName: 'docs/guide.md#install',
+          }),
+        ])
+      );
+    } finally {
+      cg.destroy();
+    }
+  });
 });

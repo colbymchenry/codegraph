@@ -31,6 +31,7 @@ import {
   PROVENANCES,
   REF,
   REF_FLAG_FILE_PATH,
+  REF_FLAG_LANGUAGE,
   REF_ROW_SIZE,
   VISIBILITIES,
 } from './layout';
@@ -155,7 +156,9 @@ export function decodeExtractBuffers(
     // exactly. The ONE exception is flagged (REF_FLAG_FILE_PATH): the
     // ruby/php visitNode hooks set `filePath: ctx.filePath` on their
     // mixin/trait `implements` refs — re-attach the decode call's own
-    // filePath, which is that exact value.
+    // filePath, which is that exact value. Markdown path refs go through
+    // `addReference`, which denormalizes BOTH fields, so they carry the
+    // language flag as well.
     const ref: UnresolvedReference = {
       fromNodeId: fromIdx === NONE ? str(arena, row, REF.fromIdStr)! : idByRow[fromIdx]!,
       referenceName: str(arena, row, REF.referenceName)!,
@@ -166,7 +169,9 @@ export function decodeExtractBuffers(
       line: row.readUInt32LE(REF.line),
       column: row.readUInt32LE(REF.column),
     };
-    if ((row.readUInt8(REF.flags) & REF_FLAG_FILE_PATH) !== 0) ref.filePath = filePath;
+    const refFlags = row.readUInt8(REF.flags);
+    if ((refFlags & REF_FLAG_FILE_PATH) !== 0) ref.filePath = filePath;
+    if ((refFlags & REF_FLAG_LANGUAGE) !== 0) ref.language = language;
     const candidates = strList(arena, row, REF.candidates);
     if (candidates !== undefined) ref.candidates = candidates;
     unresolvedReferences[i] = ref;

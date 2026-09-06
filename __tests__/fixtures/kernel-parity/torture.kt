@@ -265,3 +265,18 @@ fun labeledLambda() {
 }
 
 fun whereClause(): Int where Int : Comparable<Int> = 1
+
+// Markdown path references: code -> documentation edges. Every shape the
+// normalizer branches on, so the two arms have to agree about the rejections
+// (URL, escape above the root) as well as the emissions.
+val mdGuide = "../docs/guide.md#install"
+val mdBare = "README.md"
+val mdRooted = "/docs/rooted.md"
+val mdEscapes = "../../../../outside.md"
+val mdRemote = "https://example.com/remote.md"
+val mdQueried = "./notes.md?raw=1#top"
+val mdTwoInOne = "see a.md and also sub/b.mdx"
+
+fun mdLoad() {
+    loadDoc("docs/deep/nested.markdown")
+}

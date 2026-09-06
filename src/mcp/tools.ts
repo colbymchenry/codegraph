@@ -30,8 +30,8 @@ import {
   type WorktreeIndexMismatch,
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
-import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
-import { isTestFile, normalizeNameToken } from '../search/query-utils';
+import type { Node, Edge, SearchResult, Subgraph, NodeKind, GraphStats } from '../types';
+import { isTestFile, normalizeNameToken, STOP_WORDS } from '../search/query-utils';
 import { extractQueryPaths, queryMightContainPaths } from '../search/query-paths';
 import {
   existsSync,
@@ -156,6 +156,15 @@ export function normalizeQuerySpelling(query: string): string {
       /(^|[\s,()[\]])(?!(?:kind|lang|language|path|name):)([a-z_][\w@]*):([A-Za-z_][\w@]*)(?=$|[\s,()[\]])/g,
       '$1$2.$3'
     );
+}
+
+/**
+ * Project size for the budget tiers, counting code files only. Markdown is
+ * indexed for the doc tier, and the tiers were calibrated on code, so a
+ * README-heavy repo must not cross a breakpoint and change its code answers.
+ */
+export function codeFileCount(stats: GraphStats): number {
+  return stats.fileCount - (stats.filesByLanguage.markdown ?? 0);
 }
 
 /**
@@ -836,6 +845,193 @@ const FILE_SECTION_PREFIX = '**`';
 // at the very end. This bracketed token never occurs in rendered source or a
 // file path, so the final string-replace can't collide.
 const SUMMARY_SENTINEL = '[[codegraph-explore-summary]]';
+
+/**
+ * Doc tier for codegraph_explore (markdown indexing). A documentation question
+ * — one that names a `.md` file, or uses a doc word (plan, rule, research,
+ * tracker, backlog, runbook, readme…) AND matches ≥2 distinct query terms in a
+ * markdown file's path or headings — seeds that file's best-matching SECTIONS.
+ * Why a separate pass: the general FTS gather spends each term's small result
+ * budget on code symbols (`warRoom*` for "War Room"), so the doc never enters
+ * the candidate pool; and when it does, the ranker's first real key is random-
+ * walk mass over call edges, which markdown never has, so a code file sharing
+ * one word outranks the named doc. A markdown-scoped search per term keeps code
+ * names from crowding the doc out; the doc-word + ≥2-term guard keeps a code
+ * question that merely shares a word ("War Room popout") from pulling a plan
+ * file above the code. Sections, not files, are the seeds so the render shows
+ * the answer section first instead of a whole 25k-char file.
+ */
+const DOC_WORD = /\b(docs?|documentation|markdown|readme|plans?|rules?|research|tracker|backlog|runbook|guide|notes?|changelog|skills?|section|checklist)\b/i;
+const MD_PATH = /([\w./-]+\.md)\b/gi;
+// Query words that name the question's shape, not its subject; the FTS stop
+// list covers English function words, this covers the prompt boilerplate.
+const DOC_QUERY_NOISE = new Set(['repo', 'repos', 'one', 'line', 'must', 'next', 'per', 'point', 'name', 'names', 'two', 'each']);
+
+// Fixture copies and archived cycles restate a live doc; they render only when named.
+const DOC_LOW_PATH = /(^|\/)(tests?|__tests__|fixtures?|archive|node_modules)\//i;
+
+/** A chosen heading plus the lines under it that match the question, best first. */
+interface DocSection { node: Node; matchLines: number[]; score: number }
+interface DocSeed { filePath: string; named: boolean; hits: number; sections: DocSection[] }
+
+function collectDocSeeds(cg: CodeGraph, query: string, maxFiles = 2): DocSeed[] {
+  const projectRoot = cg.getProjectRoot();
+  const namedPaths = [...query.matchAll(MD_PATH)].map((m) => m[1]!.toLowerCase());
+  if (namedPaths.length === 0 && !DOC_WORD.test(query)) return [];
+  const terms = [...new Set(
+    query.toLowerCase().replace(/[`'"]/g, ' ').split(/[^a-z0-9]+/)
+      .filter((t) => t.length >= 3 && !STOP_WORDS.has(t) && !DOC_QUERY_NOISE.has(t)),
+  )];
+  if (terms.length === 0) return [];
+  const termScore = (text: string) => {
+    const lc = text.toLowerCase();
+    return terms.filter((t) => lc.includes(t)).length;
+  };
+  const MD_KINDS: NodeKind[] = ['file', 'module', 'constant'];
+  const candidates = new Set<string>();
+  for (const term of terms) {
+    try {
+      for (const r of cg.searchNodes(term, { languages: ['markdown'], kinds: MD_KINDS, limit: 30 })) {
+        candidates.add(r.node.filePath);
+      }
+    } catch { /* a term FTS cannot parse contributes no candidates */ }
+  }
+  for (const p of namedPaths) {
+    const base = p.split('/').pop()!;
+    try {
+      for (const r of cg.searchNodes(base.replace(/\.md$/, ''), { languages: ['markdown'], kinds: ['file'], limit: 10 })) {
+        if (r.node.filePath.toLowerCase().endsWith(base)) candidates.add(r.node.filePath);
+      }
+    } catch { /* no file node by that name — the term candidates still apply */ }
+  }
+  const seeds: DocSeed[] = [];
+  for (const fp of candidates) {
+    const lp = fp.toLowerCase();
+    const named = namedPaths.some((p) => lp.endsWith(p) || lp.endsWith('/' + p.split('/').pop()!));
+    // `readme` names README.md as surely as `README.md` does, but carries no
+    // `.md` for MD_PATH to see. A term equal to the file's own stem is the
+    // same statement of intent, so it unlocks the two-hit gate and the section
+    // fallback below — but NOT the DOC_LOW_PATH bypass, which stays the
+    // privilege of an explicitly spelled path: `readme` should not surface a
+    // fixture copy.
+    const namedStem = terms.includes(lp.split('/').pop()!.replace(/\.md$/, ''));
+    if (!named && DOC_LOW_PATH.test(fp)) continue;
+    let nodes: Node[] = [];
+    try { nodes = cg.getNodesInFile(fp); } catch { continue; }
+    const headings = nodes
+      .filter((n) => n.kind === 'module' && n.language === 'markdown')
+      .sort((a, b) => a.startLine - b.startLine);
+    const hits = termScore(lp + ' ' + headings.map((h) => h.name).join(' '));
+    // The two-hit rule keeps a code question that merely shares a word ("War
+    // Room popout") from pulling a plan file above the code. A query with one
+    // significant term cannot reach 2, and having passed DOC_WORD that term IS
+    // the doc word, so there is no code question left to protect against.
+    if (!named && !namedStem && hits < Math.min(2, terms.length)) continue;
+    // Sections are scored on the file's own lines, not on what the index holds
+    // for them: a heading's docstring is a 600-char snippet, and the extractor
+    // indexes table rows but not checkbox items, so a plan's step rows would be
+    // invisible. Each line credits the DEEPEST heading containing it, so a leaf
+    // section beats the H1 wrapper whose range is the whole file.
+    const abs = validatePathWithinRoot(projectRoot, fp);
+    if (!abs || !existsSync(abs)) continue;
+    let fileLines: string[];
+    try { fileLines = readFileSync(abs, 'utf-8').split('\n'); } catch { continue; }
+    const fileSpan = Math.max(1, ...headings.map((h) => h.endLine));
+    const isWrapper = (h: Node) => headings.length >= 4 && (h.endLine - h.startLine) > fileSpan * 0.6;
+    // A term is worth its rarity in this file ("room" on every line of a War
+    // Room tracker says nothing; "blocker" on three lines points at the answer),
+    // and a line counts only when two distinct terms meet on it. A term that
+    // names the file ("war", "sync" against PLAN-war-room-sync-validation.md)
+    // located the file and says nothing about which line: agents echo the file
+    // name into the query, and those tokens would outvote the one that matters.
+    const lower = fileLines.map((l) => l.toLowerCase());
+    const weight = new Map(terms.map((t) => {
+      if (lp.includes(t)) return [t, 0];
+      const df = lower.filter((l) => l.includes(t)).length;
+      return [t, Math.log(1 + lower.length / (1 + df))];
+    }));
+    const lineScore = (text: string) => {
+      const lc = text.toLowerCase();
+      const hit = terms.filter((t) => lc.includes(t));
+      return hit.length >= 2 ? hit.reduce((s, t) => s + (weight.get(t) ?? 0), 0) : 0;
+    };
+    const score = new Map<string, number>();
+    const lineHits = new Map<string, Array<[number, number]>>();
+    // A heading carrying two of the question's words names the section the
+    // question is about ("Deliberately not installed" for "which tools were
+    // deliberately not installed"); it outranks any sum of line matches, since
+    // a long neighbour full of one-line hits would otherwise starve it, and
+    // between two named sections the better heading match wins on its own:
+    // line volume says how long a section is, not which one was asked about.
+    const HEADING_MATCH = 1000;
+    const namedSection = new Set<string>();
+    // A heading is also named when the query covers every significant word of
+    // it ("Backlog" for "the tracker backlog"): the two-term line rule cannot
+    // see a one-word heading, and its rows rarely repeat the heading's word.
+    // Every term is path-zeroed when the query is just the file's name, and the
+    // weighted test below would then reject every heading. Presence stands in
+    // for weight in that case: the rarity signal is meaningless when there is
+    // only the one term, but "the query covers this heading" still is.
+    const anyWeighted = terms.some((t) => (weight.get(t) ?? 0) > 0);
+    const coveredHeading = (name: string): number => {
+      // DOC_QUERY_NOISE words are stripped from `terms`, so demanding them of a
+      // heading makes it uncoverable by any query at all ("Cloning the repo on
+      // Windows" can never have `repo` covered). Filtered on both sides or
+      // neither.
+      const words = name.toLowerCase().split(/[^a-z0-9]+/)
+        .filter((w) => w.length >= 3 && !STOP_WORDS.has(w) && !DOC_QUERY_NOISE.has(w));
+      if (words.length === 0) return 0;
+      let sum = 0;
+      for (const w of words) {
+        const t = terms.find((q) => (anyWeighted ? (weight.get(q) ?? 0) > 0 : true) && w.includes(q));
+        if (!t) return 0;
+        sum += anyWeighted ? (weight.get(t) ?? 0) : 1;
+      }
+      return sum;
+    };
+    for (const h of headings) {
+      const hs = isWrapper(h) ? 0 : Math.max(lineScore(h.name), coveredHeading(h.name));
+      score.set(h.id, hs > 0 ? HEADING_MATCH + hs : 0);
+      if (hs > 0) namedSection.add(h.id);
+    }
+    for (let ln = 1; ln <= fileLines.length; ln++) {
+      const s = lineScore(fileLines[ln - 1] ?? '');
+      if (s === 0) continue;
+      const owner = [...headings].reverse().find((h) => h.startLine < ln && ln <= h.endLine);
+      if (!owner || isWrapper(owner)) continue;
+      if (!namedSection.has(owner.id)) score.set(owner.id, (score.get(owner.id) ?? 0) + s);
+      const arr = lineHits.get(owner.id) ?? [];
+      arr.push([ln, s]);
+      lineHits.set(owner.id, arr);
+    }
+    const sections = headings
+      .filter((h) => (score.get(h.id) ?? 0) > 0)
+      .sort((a, b) => (score.get(b.id) ?? 0) - (score.get(a.id) ?? 0) || a.startLine - b.startLine)
+      .slice(0, 3)
+      .sort((a, b) => a.startLine - b.startLine)
+      .map((h) => ({
+        node: h,
+        matchLines: (lineHits.get(h.id) ?? []).sort((a, b) => b[1] - a[1] || a[0] - b[0]).map(([ln]) => ln),
+        score: score.get(h.id) ?? 0,
+      }));
+    // A named file that scores no section still answers the question it was
+    // named in: `named` is what carries it past the two-hit file gate above,
+    // and dropping it here for want of a scoring line is the same file lost one
+    // layer later. Its opening sections are the best available answer — a user
+    // who types a filename has already said which file they want.
+    const chosen = sections.length > 0
+      ? sections
+      : named || namedStem
+        ? headings.filter((h) => !isWrapper(h)).slice(0, 3).map((h) => ({ node: h, matchLines: [], score: 0 }))
+        : [];
+    if (chosen.length === 0) continue;
+    seeds.push({ filePath: fp, named: named || namedStem, hits, sections: chosen });
+  }
+  seeds.sort((a, b) => (b.named ? 1 : 0) - (a.named ? 1 : 0) || b.hits - a.hits);
+  // A second doc earns its slot only by matching as well as the first.
+  return seeds.filter((s, i) => i === 0 || s.named || s.hits >= seeds[0]!.hits).slice(0, maxFiles);
+}
+
 function fileSectionHeader(filePath: string, suffix: string): string {
   return suffix
     ? `${FILE_SECTION_PREFIX}${filePath}\`** — ${suffix}`
@@ -1495,8 +1691,8 @@ export class ToolHandler {
     if (!this.cg) return withRequiredProjectPath(visible);
 
     try {
-      const stats = this.cg.getStats();
-      const budget = getExploreBudget(stats.fileCount);
+      const fileCount = codeFileCount(this.cg.getStats());
+      const budget = getExploreBudget(fileCount);
 
       // Tiny-repo tool gating: on projects under TINY_REPO_FILE_THRESHOLD
       // files, only expose the core trio (search, node, explore) — one
@@ -1527,7 +1723,7 @@ export class ToolHandler {
         'codegraph_search',
         'codegraph_node',
       ]);
-      if (stats.fileCount < TINY_REPO_FILE_THRESHOLD) {
+      if (fileCount < TINY_REPO_FILE_THRESHOLD) {
         visible = visible.filter(t => TINY_REPO_CORE_TOOLS.has(t.name));
       }
 
@@ -1535,7 +1731,7 @@ export class ToolHandler {
         if (tool.name === 'codegraph_explore') {
           return {
             ...tool,
-            description: `${tool.description} Budget: make at most ${budget} calls for this project (${stats.fileCount.toLocaleString()} files indexed).`,
+            description: `${tool.description} Budget: make at most ${budget} calls for this project (${fileCount.toLocaleString()} files indexed).`,
           };
         }
         return tool;
@@ -3138,7 +3334,7 @@ export class ToolHandler {
     let budget: ExploreOutputBudget;
     let indexedFileCount = -1;
     try {
-      indexedFileCount = cg.getStats().fileCount;
+      indexedFileCount = codeFileCount(cg.getStats());
       budget = getExploreOutputBudget(indexedFileCount);
     } catch {
       budget = getExploreOutputBudget(Infinity);
@@ -3249,6 +3445,26 @@ export class ToolHandler {
         .sort((a, b) => a.startLine - b.startLine)
         .slice(0, PINNED_FILE_NODE_CAP)
         .forEach((n) => { if (!subgraph.nodes.has(n.id)) subgraph.nodes.set(n.id, n); });
+    }
+
+    // Doc tier (see collectDocSeeds): the best sections of the markdown file a
+    // doc-shaped question names join the subgraph here, and earn the named tier
+    // below, so they survive the gate and render first.
+    const docSeeds = collectDocSeeds(cg, query);
+    const docTierFiles = new Set(docSeeds.map((d) => d.filePath));
+    const docSections = new Map(docSeeds.map((d) => [d.filePath, d.sections]));
+    for (const d of docSeeds) {
+      for (const s of d.sections) {
+        if (!subgraph.nodes.has(s.node.id)) subgraph.nodes.set(s.node.id, s.node);
+      }
+    }
+    // Markdown reaches an answer only through that tier: a section body in
+    // FTS matches any English word, so a README line about "symbols" would
+    // otherwise join a code query, or a nonsense one, as rendered source.
+    if (docSeeds.length === 0) {
+      for (const [id, n] of subgraph.nodes) {
+        if (n.language === 'markdown') subgraph.nodes.delete(id);
+      }
     }
 
     if (subgraph.nodes.size === 0) {
@@ -3476,6 +3692,15 @@ export class ToolHandler {
           namedSeedIds.add(n.id);
         }
         for (const n of tierPicks) tierSeedIds.add(n.id);
+      }
+    }
+    // Code symbols the query named, kept apart from the doc seeds added next: with
+    // a doc tier, a code file renders only when it defines one of these.
+    const codeNamedIds = new Set(tierSeedIds);
+    for (const sections of docSections.values()) {
+      for (const s of sections) {
+        namedSeedIds.add(s.node.id);
+        tierSeedIds.add(s.node.id);
       }
     }
 
@@ -3901,6 +4126,13 @@ export class ToolHandler {
       if (aPin !== bPin) return bPin - aPin;
       if (aPin && bPin) return (pinnedOrder.get(a[0]) ?? 0) - (pinnedOrder.get(b[0]) ?? 0);
 
+      // Doc tier next: the doc a doc-shaped question names is the answer, and
+      // it has no graph mass to compete on (collectDocSeeds).
+      const aDoc = docTierFiles.has(a[0]) ? 1 : 0;
+      const bDoc = docTierFiles.has(b[0]) ? 1 : 0;
+      if (aDoc !== bDoc) return bDoc - aDoc;
+      if (aDoc && bDoc) return docSeeds.findIndex((d) => d.filePath === a[0]) - docSeeds.findIndex((d) => d.filePath === b[0]);
+
       // Agent-named files next (it asked for a symbol defined here by name).
       const aNamed = namedSeedFiles.has(a[0]) ? 1 : 0;
       const bNamed = namedSeedFiles.has(b[0]) ? 1 : 0;
@@ -3961,8 +4193,11 @@ export class ToolHandler {
     // Blast radius (always-on, compact): for the entry symbols, who depends on
     // them + which tests cover them — locations only, no source — so the agent
     // knows what to update/verify before editing without a separate call.
+    // With a doc tier the answer is the section, so the graph sections trail the
+    // source instead of preceding it, and are dropped when no code file renders.
+    const graphLines: string[] = docTierFiles.size > 0 ? [] : lines;
     const blastRadius = this.buildBlastRadiusSection(cg, subgraph);
-    if (blastRadius) lines.push(blastRadius);
+    if (blastRadius) graphLines.push(blastRadius);
 
     // Relationship map — show how symbols connect
     const significantEdges = subgraph.edges.filter(e =>
@@ -3970,6 +4205,7 @@ export class ToolHandler {
     );
 
     if (budget.includeRelationships && significantEdges.length > 0) {
+      const lines = graphLines;
       lines.push('**Relationships**');
       lines.push('');
 
@@ -4529,6 +4765,69 @@ export class ToolHandler {
       // slices fileContent (CURRENT bytes) at INDEXED line ranges. Content is
       // already in hand, so the check costs one stat (hash only on mismatch).
       const fileStale = this.isFileStaleOnDisk(cg, filePath, fileContent);
+
+      // Doc tier: the matched sections, whole and in file order, never the whole
+      // file — a 300-line plan is ~25k chars and the answer is one section of it.
+      // Whole lines only, so a cut never splits a table row. The cap holds two
+      // typical sections whole (a tool table and its neighbour run ~3k each):
+      // an answer that is a list or a table only reads as one when every row
+      // is present, and its rows rarely carry the question's words.
+      const docSecs = docSections.get(filePath);
+      if (docSecs) {
+        const DOC_FILE_CAP = 8000;
+        const numbered = (ln: number) =>
+          exploreLineNumbersEnabled() ? `${ln}\t${fileLines[ln - 1] ?? ''}` : (fileLines[ln - 1] ?? '');
+        // The cap is spent in section-score order (the best-matching section
+        // must never be starved by an earlier one), then rendered in file order.
+        const picked = new Map<string, number[]>();
+        let used = 0;
+        let elided = false;
+        for (const { node: s, matchLines } of [...docSecs].sort((a, b) => b.score - a.score)) {
+          const end = Math.min(s.endLine, fileLines.length);
+          const whole = fileLines.slice(s.startLine - 1, end).join('\n');
+          let chosen: number[];
+          if (used + whole.length <= DOC_FILE_CAP) {
+            chosen = Array.from({ length: end - s.startLine + 1 }, (_, i) => s.startLine + i);
+          } else {
+            // Too long to show whole (a backlog table, a step list): the heading,
+            // then the lines that match the question, best first until the cap.
+            const keep = new Set<number>([s.startLine]);
+            let size = (fileLines[s.startLine - 1] ?? '').length;
+            for (const ln of matchLines) {
+              const len = (fileLines[ln - 1] ?? '').length + 1;
+              if (used + size + len > DOC_FILE_CAP) break;
+              keep.add(ln);
+              size += len;
+            }
+            chosen = [...keep].sort((a, b) => a - b);
+            elided = true;
+          }
+          if (chosen.length === 0 || (chosen.length === 1 && used > 0)) continue;
+          picked.set(s.id, chosen);
+          used += chosen.reduce((n, ln) => n + (fileLines[ln - 1] ?? '').length + 1, 0) + 2;
+          if (used >= DOC_FILE_CAP) break;
+        }
+        const parts: string[] = [];
+        const shown: string[] = [];
+        for (const { node: s } of docSecs) {
+          const chosen = picked.get(s.id);
+          if (!chosen) continue;
+          parts.push(chosen.map(numbered).join('\n'));
+          shown.push(s.name);
+        }
+        if (parts.length > 0) {
+          const suffix = `sections: ${shown.join(' · ')}${elided ? ' (long sections show only the rows that match the question)' : ''} — the rest of the file is not shown`;
+          lines.push(fileSectionHeader(filePath, suffix), '', '```' + lang, parts.join('\n\n'), '```', '');
+          totalChars += used + 120;
+          renderedFilePaths.push(filePath);
+          filesIncluded++;
+          if (elided) anyFileTrimmed = true;
+        }
+        continue;
+      }
+      // A doc answer keeps its budget: a code file joins it only when the query
+      // named a symbol the file defines.
+      if (docTierFiles.size > 0 && !group.nodes.some((n) => codeNamedIds.has(n.id))) continue;
 
       // Adaptive sizing (CODEGRAPH_ADAPTIVE_EXPLORE, default on): collapse a file
       // to a per-symbol view when it's a redundant member of a polymorphic family.
@@ -5623,6 +5922,12 @@ export class ToolHandler {
       );
     }
 
+    // Doc tier: the graph sections follow the source, and only when a code file
+    // rendered alongside the doc (a doc-only answer has no callers to list).
+    if (graphLines !== lines && renderedFilePaths.some((fp) => !docTierFiles.has(fp))) {
+      lines.push(...graphLines);
+    }
+
     // Everything pushed from here on is EPILOGUE — meta-text ABOUT the response
     // rather than part of it. Marked so the hard-ceiling cut at the end can
     // spend it before it spends a rendered file section (CG-31): a section is
@@ -5648,6 +5953,7 @@ export class ToolHandler {
     // CLIFFED file is source we deliberately withheld, so the list is forced on
     // whenever there is one: withholding a file's bytes is only cheap if the agent
     // can still name it in a follow-up call (CG-12).
+    // A doc answer lists no leftover code files: they were skipped on purpose.
     // The epilogue's three blocks are BUILT here and FITTED below (CG-26) —
     // they are not pushed straight into `lines` any more. The render loop
     // budgets for the epilogue floor it committed to (`EPILOGUE_FLOOR`); what
@@ -5656,7 +5962,7 @@ export class ToolHandler {
     // order, instead of being emitted whole and then discarded whole.
     const pointerEntries: string[] = [];
     let pointerOmitted = 0;
-    if (budget.includeAdditionalFiles || cliffedFiles.size > 0) {
+    if ((budget.includeAdditionalFiles || cliffedFiles.size > 0) && docTierFiles.size === 0) {
       // Everything ranked that didn't render, in rank order — cliffed files first,
       // since they outrank whatever the file cap cut. (Indexing by `filesIncluded`
       // would be wrong now that cliffed files are skipped without consuming a slot.)
@@ -5691,9 +5997,9 @@ export class ToolHandler {
     let budgetBlock: string[] = [];
     if (budget.includeBudgetNote) {
       try {
-        const stats = cg.getStats();
-        const callBudget = getExploreBudget(stats.fileCount);
-        budgetBlock = ['', `> **Explore budget: ${callBudget} calls for this project (${stats.fileCount.toLocaleString()} files indexed).** Each call covers ~6 files; if your question spans more, spend your remaining calls on the uncovered area BEFORE falling back to Read — another explore is cheaper and more complete than reading those files. Synthesize once you've used ${callBudget}.`];
+        const fileCount = codeFileCount(cg.getStats());
+        const callBudget = getExploreBudget(fileCount);
+        budgetBlock = ['', `> **Explore budget: ${callBudget} calls for this project (${fileCount.toLocaleString()} files indexed).** Each call covers ~6 files; if your question spans more, spend your remaining calls on the uncovered area BEFORE falling back to Read — another explore is cheaper and more complete than reading those files. Synthesize once you've used ${callBudget}.`];
       } catch {
         // Stats unavailable — skip budget note
       }
