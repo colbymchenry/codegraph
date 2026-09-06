@@ -425,7 +425,14 @@ function isBoundToBareImport(ref: UnresolvedRef, context: ResolutionContext): bo
     .find((i) => i.localName === ref.referenceName)?.source;
   if (source === undefined) return false;
   if (source.startsWith('.') || source.startsWith('/')) return false;
-  if (source.startsWith('@/') || source.startsWith('~/') || source.startsWith('src/')) return false;
+  // `~`, `#` and `$` cannot begin an npm package name, so the prefix alone
+  // proves a local binding and no resolver lookup is needed: `~utils` (a
+  // tsconfig `paths` entry, which a nested tsconfig the alias loader never
+  // reads still declares), `#types/hmrPayload` (a package.json `imports`
+  // subpath), `$lib/...` (SvelteKit). Matching only `~/` classed the slashless
+  // spellings as bare and sent real project edges out with the wrong ones.
+  if (source.startsWith('~') || source.startsWith('#') || source.startsWith('$')) return false;
+  if (source.startsWith('@/') || source.startsWith('src/')) return false;
   const aliases = context.getProjectAliases?.();
   if (aliases?.patterns.some((p) => source.startsWith(p.prefix))) return false;
   const workspaces = context.getWorkspacePackages?.();
