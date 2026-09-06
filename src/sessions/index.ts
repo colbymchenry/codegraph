@@ -36,6 +36,40 @@ export const BUSY_TIMEOUT_MS = 5000;
 /** Bump when the readers' notion of prose changes, so existing indexes rebuild. */
 const INDEX_VERSION = 2;
 
+/**
+ * `busy_timeout` does cover an ordinary lock wait on this pragma: a connection
+ * that merely holds the database is waited out and the conversion then
+ * succeeds. What it does not cover is several processes converting the SAME
+ * brand-new database at the same moment — they collide inside the conversion
+ * itself rather than queueing on a lock. That is only ever the first run: WAL
+ * is persistent, so once the file is in WAL nobody converts it again.
+ *
+ * Both errors that collision raises are transient and clear on their own.
+ * `database is locked` is the conversion losing the race; `disk I/O error` is
+ * the shared-memory `-shm` file being created underneath a concurrent opener,
+ * seen on Windows. Retrying either inside the existing budget is enough.
+ * Tolerating a failed conversion is not an option: the connection does not
+ * survive one, and the next statement on it fails too.
+ *
+ * Exported for the test that drives the retry directly — the collision itself
+ * only reproduces probabilistically, so the retry is asserted here instead.
+ */
+export function enterWalMode(db: SqliteDatabase): void {
+  const deadline = Date.now() + BUSY_TIMEOUT_MS;
+  for (;;) {
+    try {
+      db.pragma('journal_mode = WAL');
+      return;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const transient = /database is locked|database is busy|disk i\/o error/i.test(message);
+      if (!transient || Date.now() >= deadline) throw err;
+      // Jittered, so the losers of one collision do not retry in lockstep.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5 + Math.random() * 20);
+    }
+  }
+}
+
 export interface SessionsIndexStats {
   /** Transcript files seen. */
   files: number;
@@ -122,7 +156,7 @@ export class SessionsIndex {
     // of waiting the few hundred milliseconds the winner's write takes. Set
     // before the constructor's schema and version writes, which race the same way.
     db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
-    if (dbPath !== ':memory:') db.pragma('journal_mode = WAL');
+    if (dbPath !== ':memory:') enterWalMode(db);
     return new SessionsIndex(db);
   }
 
