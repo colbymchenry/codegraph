@@ -157,6 +157,8 @@ pub fn extract(file_path: &str, source: &str, language: &str) -> Result<EmitOut,
 }
 
 impl<'t> Walker<'t> {
+    markdown_refs_impl!();
+
     fn text(&self, node: Node) -> &'t str {
         &self.src[node.byte_range()]
     }
@@ -454,6 +456,8 @@ impl<'t> Walker<'t> {
 
         // maybeCaptureFnRefs (tree-sitter.ts:990).
         self.maybe_capture_fn_refs(node);
+        let md_owner = self.top_row();
+        self.markdown_refs_from_string(node, md_owner);
 
         // The dispatch ladder — lua/luau rows only.
         if kind == "function_declaration" {
@@ -593,7 +597,7 @@ impl<'t> Walker<'t> {
             // Positional value pairing; a missing value → NO signature key.
             let signature = values.get(i).map(|v| util::init_signature(self.text(*v)));
             let name = name.to_string();
-            self.create_node(
+            let row = self.create_node(
                 "variable",
                 &name,
                 *name_node, // positioned at the IDENTIFIER
@@ -604,6 +608,12 @@ impl<'t> Walker<'t> {
                     ..Default::default()
                 },
             );
+            // The ladder skips a declaration's children, so the positionally
+            // paired value's string literals are reached here. A name with no
+            // value contributes nothing, as the wasm arm's undefined does.
+            if let (Some(row), Some(v)) = (row, values.get(i)) {
+                self.markdown_refs_from_subtree(*v, row);
+            }
         }
     }
 
@@ -660,6 +670,8 @@ impl<'t> Walker<'t> {
         stack_guard!();
         // maybeCaptureFnRefs (5137) fires in the body walker too.
         self.maybe_capture_fn_refs(node);
+        let md_owner = self.top_row();
+        self.markdown_refs_from_string(node, md_owner);
 
         let kind = node.kind();
         if kind == "function_call" {

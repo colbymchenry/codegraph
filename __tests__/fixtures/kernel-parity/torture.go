@@ -59,3 +59,18 @@ func shadowed() {
 func reads() int {
 	return MAX_ITEMS
 }
+
+// Markdown path references: code -> documentation edges. Every shape the
+// normalizer branches on, so the two arms have to agree about the rejections
+// (URL, escape above the root) as well as the emissions.
+var mdGuide = "../docs/guide.md#install"
+var mdBare = "README.md"
+var mdRooted = "/docs/rooted.md"
+var mdEscapes = "../../../../outside.md"
+var mdRemote = "https://example.com/remote.md"
+var mdQueried = "./notes.md?raw=1#top"
+var mdTwoInOne = "see a.md and also sub/b.mdx"
+
+func mdLoad() {
+	loadDoc("docs/deep/nested.markdown")
+}

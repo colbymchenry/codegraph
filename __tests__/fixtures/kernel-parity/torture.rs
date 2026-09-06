@@ -291,3 +291,18 @@ pub union Reg {
 }
 
 impl Base for Reg {}
+
+// Markdown path references: code -> documentation edges. Every shape the
+// normalizer branches on, so the two arms have to agree about the rejections
+// (URL, escape above the root) as well as the emissions.
+const MD_GUIDE: &str = "../docs/guide.md#install";
+const MD_BARE: &str = "README.md";
+const MD_ROOTED: &str = "/docs/rooted.md";
+const MD_ESCAPES: &str = "../../../../outside.md";
+const MD_REMOTE: &str = "https://example.com/remote.md";
+const MD_QUERIED: &str = "./notes.md?raw=1#top";
+const MD_TWO_IN_ONE: &str = "see a.md and also sub/b.mdx";
+
+fn md_load() {
+    load_doc("docs/deep/nested.markdown");
+}

@@ -437,6 +437,8 @@ pub fn extract(file_path: &str, source: &str, language: &str) -> Result<EmitOut,
 }
 
 impl<'t> Walker<'t> {
+    markdown_refs_impl!();
+
     fn text(&self, node: Node) -> &'t str {
         &self.src[node.byte_range()]
     }
@@ -800,6 +802,8 @@ impl<'t> Walker<'t> {
         }
 
         self.maybe_capture_fn_refs(node);
+        let md_owner = self.top_row();
+        self.markdown_refs_from_string(node, md_owner);
 
         if kind == "function_definition" {
             // functionTypes for both; cpp's methodTypes also lists it, so
@@ -1517,6 +1521,8 @@ impl<'t> Walker<'t> {
         stack_guard!();
         let kind = node.kind();
         self.maybe_capture_fn_refs(node);
+        let md_owner = self.top_row();
+        self.markdown_refs_from_string(node, md_owner);
 
         if kind == "call_expression" {
             self.extract_call(node);

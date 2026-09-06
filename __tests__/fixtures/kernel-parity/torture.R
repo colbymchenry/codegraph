@@ -202,3 +202,16 @@ piped <- x |> f_ph(y = _)
 # --- UTF-16 columns ----------------------------------------------------------
 msg <- "héllo 🎉"
 emoji_caller <- function() after_emoji("🎉🎉", target_fn())
+
+# --- Markdown path references ------------------------------------------------
+# Code -> documentation edges. Every shape the normalizer branches on, so the
+# two arms have to agree about the rejections (URL, escape above the root) as
+# well as the emissions.
+md_guide <- "../docs/guide.md#install"
+md_bare <- "README.md"
+md_rooted <- "/docs/rooted.md"
+md_escapes <- "../../../../outside.md"
+md_remote <- "https://example.com/remote.md"
+md_queried <- "./notes.md?raw=1#top"
+md_two_in_one <- "see a.md and also sub/b.mdx"
+md_load <- function() load_doc("docs/deep/nested.markdown")

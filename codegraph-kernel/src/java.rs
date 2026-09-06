@@ -247,6 +247,8 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
 }
 
 impl<'t> Walker<'t> {
+    markdown_refs_impl!();
+
     fn text(&self, node: Node) -> &'t str {
         &self.src[node.byte_range()]
     }
@@ -490,6 +492,8 @@ impl<'t> Walker<'t> {
         let mut skip_children = false;
 
         self.maybe_capture_fn_refs(node);
+        let md_owner = self.top_row();
+        self.markdown_refs_from_string(node, md_owner);
 
         if kind == "class_declaration" {
             self.extract_class(node);
@@ -543,6 +547,8 @@ impl<'t> Walker<'t> {
         stack_guard!();
         let kind = node.kind();
         self.maybe_capture_fn_refs(node);
+        let md_owner = self.top_row();
+        self.markdown_refs_from_string(node, md_owner);
 
         if kind == "method_invocation" {
             self.extract_call(node);
@@ -759,6 +765,9 @@ impl<'t> Walker<'t> {
                 if let Some(row) = row {
                     self.extract_decorators_for(node, row);
                     self.extract_type_annotations(node, row);
+                    // The ladder skips a field's children, so the declarator's
+                    // string literals are reached here, owned by the field.
+                    self.markdown_refs_from_subtree(decl, row);
                 }
             }
         } else {
@@ -769,12 +778,15 @@ impl<'t> Walker<'t> {
             });
             if let Some(name_node) = name_node {
                 let name = self.text(name_node).to_string();
-                self.create_node(
+                let row = self.create_node(
                     field_kind,
                     &name,
                     node,
                     Extra { docstring, visibility, is_static, ..Extra::default() },
                 );
+                if let Some(row) = row {
+                    self.markdown_refs_from_subtree(node, row);
+                }
             }
         }
     }

@@ -325,6 +325,8 @@ impl<'t> Walker<'t> {
         let mut skip_children = false;
 
         self.maybe_capture_fn_refs(node);
+        let md_owner = self.top_row();
+        self.markdown_refs_from_string(node, md_owner);
 
         if kind == "function_definition" {
             // functionTypes ∩ methodTypes: inside a class-like ⇒ method.
@@ -365,6 +367,8 @@ impl<'t> Walker<'t> {
         stack_guard!();
         let kind = node.kind();
         self.maybe_capture_fn_refs(node);
+        let md_owner = self.top_row();
+        self.markdown_refs_from_string(node, md_owner);
 
         if kind == "call" {
             self.extract_call(node);
@@ -470,6 +474,8 @@ impl<'t> Walker<'t> {
         self.stack.pop();
     }
 
+    markdown_refs_impl!();
+
     /// extractVariable's python branch: `left = right` at module scope.
     fn extract_variable(&mut self, node: Node<'t>) {
         let docstring = preceding_docstring(node, self.src);
@@ -482,7 +488,12 @@ impl<'t> Walker<'t> {
         let name = self.text(left).to_string();
         let signature = right.map(|r| util::init_signature(self.text(r)));
         // No isConst hook ⇒ always `variable` (UPPER_CASE constants included).
-        self.create_node("variable", &name, node, Extra { docstring, signature, ..Extra::default() });
+        let row = self.create_node("variable", &name, node, Extra { docstring, signature, ..Extra::default() });
+        // visit_node skips an assignment's children, so the right-hand side's
+        // string literals are reached here, owned by the assigned name.
+        if let (Some(row), Some(r)) = (row, right) {
+            self.markdown_refs_from_subtree(r, row);
+        }
     }
 
     fn extract_import(&mut self, node: Node<'t>) {
