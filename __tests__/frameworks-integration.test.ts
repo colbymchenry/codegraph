@@ -788,6 +788,8 @@ describe('JVM FQN imports — end-to-end', () => {
 
     const edge = cg.getIncomingEdges(util!.id).find((e) => e.kind === 'imports');
     expect(edge, 'imports edge should reach the top-level function by FQN').toBeDefined();
+
+    cg.close();
   });
 
   it('resolves cross-language: Kotlin importing a Java class', async () => {
@@ -809,6 +811,8 @@ describe('JVM FQN imports — end-to-end', () => {
 
     const edge = cg.getIncomingEdges(javaBar!.id).find((e) => e.kind === 'imports');
     expect(edge, 'Kotlin caller should resolve its import to the Java class').toBeDefined();
+
+    cg.close();
   });
 
   it('disambiguates a class-name collision across packages', async () => {
@@ -854,6 +858,8 @@ describe('JVM FQN imports — end-to-end', () => {
       edges.map((e) => cg.getNode(e.source)?.filePath).filter(Boolean);
     expect(sourceFiles(alphaIncoming).some((p) => p?.includes('CallerA.kt'))).toBe(true);
     expect(sourceFiles(betaIncoming).some((p) => p?.includes('CallerB.kt'))).toBe(true);
+
+    cg.close();
   });
 });
 
