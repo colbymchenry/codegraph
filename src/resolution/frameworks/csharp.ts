@@ -48,14 +48,17 @@ export const aspnetResolver: FrameworkResolver = {
     // root-only checks above miss (e.g. realworld: Features/*/FooController.cs).
     // `.csproj` often isn't in the indexed source set, so source-scan is the
     // reliable signal.
+    // Endpoint-group apps (`Endpoints/TodoItems.cs : IEndpointGroup`) have
+    // none of those names: their files, and the extension that maps them, count.
     for (const file of allFiles) {
-      if (!/(?:Controller|Program|Startup)\.cs$/.test(file)) continue;
+      if (!/(?:Controller|Program|Startup|Endpoints?|Extensions)\.cs$/.test(file) && !/(?:^|\/)Endpoints\/[^/]+\.cs$/.test(file)) continue;
       const c = context.readFile(file);
       if (c && (
         /\[(?:ApiController|Route|Http(?:Get|Post|Put|Patch|Delete))\b/.test(c) ||
         c.includes('ControllerBase') || c.includes(': Controller') ||
         c.includes('MapControllers') || c.includes('WebApplication') ||
-        c.includes('Microsoft.AspNetCore')
+        c.includes('Microsoft.AspNetCore') || c.includes('IEndpointGroup') ||
+        c.includes('EndpointGroupBase') || c.includes('RouteGroupBuilder')
       )) return true;
     }
     return false;
@@ -221,7 +224,91 @@ export const aspnetResolver: FrameworkResolver = {
       }
     }
 
+    // Minimal APIs, handler first — the endpoint-group idiom (Jason Taylor's
+    // Clean Architecture template and its descendants):
+    //
+    //   public class TodoItems : IEndpointGroup {
+    //     public static void Map(RouteGroupBuilder group) {
+    //       group.MapPost(CreateTodoItem);
+    //       group.MapPut(UpdateTodoItem, "{id}");
+    //
+    // The class is the group, the handler is the first argument, the path the
+    // optional second. The group's prefix is the app's convention
+    // (`$"/api/{groupName}"`, read repo-wide in postExtract) or the class's own
+    // `RoutePrefix` literal; here the route is named under the class.
+    const groupRegex = /\.Map(Get|Post|Put|Patch|Delete)\s*\(\s*([A-Za-z_]\w*)\s*(?:,\s*"([^"]*)")?\s*\)/g;
+    const routePrefixLiteral = /\bRoutePrefix\s*(?:=>|=)\s*"([^"]+)"/.exec(safe);
+    while ((match = groupRegex.exec(safe)) !== null) {
+      const [, verb, handlerName, sub] = match;
+      const method = verb!.toUpperCase();
+      const line = safe.slice(0, match.index).split('\n').length;
+      const before = safe.slice(0, match.index);
+      const classMatch = [...before.matchAll(/\bclass\s+([A-Za-z_]\w*)/g)].pop();
+      if (!classMatch) continue;
+      const group = classMatch[1]!;
+      const routePath = joinCsPath(routePrefixLiteral ? routePrefixLiteral[1]! : `/${group}`, sub ?? '');
+      const routeNode: Node = {
+        id: `route:${filePath}:${line}:${method}:${routePath}`,
+        kind: 'route',
+        name: `${method} ${routePath}`,
+        qualifiedName: `${filePath}::group:${group}:${method}:${sub ?? ''}`,
+        filePath,
+        startLine: line,
+        endLine: line,
+        startColumn: 0,
+        endColumn: match[0].length,
+        language: 'csharp',
+        updatedAt: now,
+      };
+      nodes.push(routeNode);
+      references.push({
+        fromNodeId: routeNode.id,
+        referenceName: handlerName!,
+        referenceKind: 'references',
+        line,
+        column: 0,
+        filePath,
+        language: 'csharp',
+      });
+    }
+
     return { nodes, references };
+  },
+
+  /**
+   * The endpoint-group prefix convention, read once from the app: the
+   * `MapGroup($"/api/{groupName}")` that registers every `IEndpointGroup`
+   * (or `EndpointGroupBase`) under a head — `/api/` — before the class name.
+   * A group route extracted as `POST /TodoItems` becomes `POST /api/TodoItems`;
+   * a class with its own `RoutePrefix` literal already has its path. Idempotent:
+   * `qualifiedName` keeps the group and the sub-path.
+   */
+  postExtract(context: ResolutionContext): Node[] {
+    let head: string | null = null;
+    let looked = 0;
+    for (const file of context.getAllFiles()) {
+      if (!file.endsWith('.cs')) continue;
+      const content = context.readFile(file);
+      if (!content || !content.includes('MapGroup')) continue;
+      if (++looked > 400) break;
+      const m = /\$"([^"{]*)\{\s*(?:groupName|type\.Name|name|prefix)\s*\}"/.exec(content) ?? /MapGroup\(\s*\$"([^"{]*)\{/.exec(content);
+      if (m) {
+        head = m[1]!;
+        break;
+      }
+    }
+    if (!head || head === '/' || head === '') return [];
+    const updates: Node[] = [];
+    for (const route of context.getNodesByKind('route')) {
+      if (route.language !== 'csharp') continue;
+      const q = /::group:([A-Za-z_]\w*):([A-Z]+):(.*)$/.exec(route.qualifiedName);
+      if (!q) continue;
+      const content = context.readFile(route.filePath);
+      if (content && /\bRoutePrefix\s*(?:=>|=)\s*"/.test(content)) continue;
+      const name = `${q[2]} ${joinCsPath(head.replace(/\/+$/, '') + '/' + q[1], q[3]!)}`;
+      if (name !== route.name) updates.push({ ...route, name });
+    }
+    return updates;
   },
 };
 

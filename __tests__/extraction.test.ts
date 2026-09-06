@@ -175,6 +175,53 @@ class ENGINE_API UNetConnectionRepControl : public UObject
     expect(detectLanguage('cfoo.h', '#ifndef CFOO_H\nstruct Point { int x; int y; };\nvoid f(struct Point p);\n#endif\n')).toBe('c');
   });
 
+  it('should detect a .h whose only C++ signal is a plain base clause as cpp (#1592)', () => {
+    // No export macro, no `class` keyword, no access section, no `virtual`:
+    // the derived struct's base clause is the only C++ construct, and the
+    // #1159 branch only knows the macro-annotated form. Misdetected as C, the
+    // C extractor drops `Derived` and mints a phantom `function Base`.
+    expect(detectLanguage('min.h', 'struct Base {};\nstruct Derived : Base {};\n')).toBe('cpp');
+    expect(detectLanguage('pub.h', 'struct Derived : public Base {};\n')).toBe('cpp');
+    expect(detectLanguage('scoped.h', 'struct Derived : ns::Base {};\n')).toBe('cpp');
+    expect(detectLanguage('tmpl.h', 'struct Derived : Base<int, Foo<T>> {};\n')).toBe('cpp');
+    expect(detectLanguage('final.h', 'struct Derived final : Base {};\n')).toBe('cpp');
+    expect(detectLanguage('multi.h', 'class Derived : public A, private B\n{\n};\n')).toBe('cpp');
+    expect(detectLanguage('virt.h', 'struct Derived : virtual Base {};\n')).toBe('cpp');
+
+    // The base clause sits PAST the 8 KB sample, behind a long C-compatible
+    // preamble (guards, defines, plain typedefs) — the second pass must scan
+    // the whole file, not just the sample.
+    const preamble = '#ifndef BIG_H\n#define BIG_H\n' + '#define VALUE_0 0\n'.repeat(700);
+    expect(preamble.length).toBeGreaterThan(8192);
+    expect(detectLanguage('big.h', `${preamble}struct Base {};\nstruct Derived : Base {};\n#endif\n`)).toBe('cpp');
+
+    // Controls — all genuine C, none may flip to C++:
+    // a bit-field (`:` after a member name inside the body),
+    expect(detectLanguage('bits.h', 'struct S { unsigned int a : 3; unsigned int b : 5; };\n')).toBe('c');
+    // a ternary whose `:` follows a `sizeof(struct …)` / cast,
+    expect(detectLanguage('tern.h', 'static inline int sz(int x) { return x ? sizeof(struct foo) : 0; }\n#define P(a,b) ((a) ? (struct foo *)(a) : (b))\n')).toBe('c');
+    // a label / identifier that merely starts with `struct`,
+    expect(detectLanguage('label.h', 'static void g(void) {\nstruct_end:\n  return;\n}\nint struct_a, struct_b;\n')).toBe('c');
+    // a doc comment whose prose reads like a base clause,
+    expect(detectLanguage('doc.h', '/* struct timeval: seconds, microseconds */\nstruct timeval { long tv_sec; long tv_usec; };\n// struct foo: x, y\n')).toBe('c');
+    // and the two existing controls.
+    expect(detectLanguage('cfoo.h', '#ifndef CFOO_H\nstruct Point { int x; int y; };\nvoid f(struct Point p);\n#endif\n')).toBe('c');
+    expect(detectLanguage('stdio.h', '#ifndef STDIO_H\nvoid printf();\n#endif\n')).toBe('c');
+  });
+
+  it('should extract a derived struct from a plain base-clause .h, with no phantom function (#1592)', () => {
+    const result = extractFromSource('src/min.h', 'struct Base {};\nstruct Derived : Base {};\n');
+    const derived = result.nodes.find((n) => n.name === 'Derived');
+    expect(derived).toBeDefined();
+    expect(derived?.kind).toBe('struct');
+    expect(derived?.language).toBe('cpp');
+    // The C mis-route read `Derived : Base {}` as a K&R-ish function `Base`
+    // returning `Derived` — that phantom must be gone.
+    expect(result.nodes.some((n) => n.name === 'Base' && n.kind === 'function')).toBe(false);
+    expect(result.nodes.filter((n) => n.name === 'Base')).toHaveLength(1);
+    expect(result.nodes.find((n) => n.name === 'Base')?.kind).toBe('struct');
+  });
+
   it('should return unknown for unsupported extensions', () => {
     expect(detectLanguage('styles.css')).toBe('unknown');
     expect(detectLanguage('data.json')).toBe('unknown');
@@ -1129,6 +1176,146 @@ impl Cache for MyCache {
     const myCacheNode = result.nodes.find((n) => n.name === 'MyCache' && n.kind === 'struct');
     expect(myCacheNode).toBeDefined();
     expect(implRef?.fromNodeId).toBe(myCacheNode?.id);
+  });
+
+  it('qualifies methods of a generic or lifetime impl by the implementing type, not the trait (#1588)', () => {
+    const code = `
+pub trait Source {
+    fn read(&mut self) -> usize;
+}
+
+pub struct FileSource { pub n: usize }
+impl Source for FileSource {
+    fn read(&mut self) -> usize { self.n }
+}
+
+pub struct BufSource<T> { pub inner: T }
+impl<T> Source for BufSource<T> {
+    fn read(&mut self) -> usize { 0 }
+}
+
+pub struct Parents<'a> { cur: &'a u32 }
+impl<'a> Iterator for Parents<'a> {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> { None }
+}
+
+pub struct Wrapper { pub n: usize }
+impl Source for &Wrapper {
+    fn read(&mut self) -> usize { 1 }
+}
+
+pub mod m { pub struct Scoped { pub n: usize } }
+impl Source for m::Scoped {
+    fn read(&mut self) -> usize { 2 }
+}
+
+pub struct Own { pub n: usize }
+impl From<u32> for Own {
+    fn from(n: u32) -> Self { Own { n: n as usize } }
+}
+`;
+    const result = extractFromSource('src.rs', code);
+
+    // Every impl method is qualified by the IMPLEMENTING type. Before, a
+    // parameterized implementing type (`BufSource<T>`, `Parents<'a>`, `&Wrapper`)
+    // left the trait's identifier as the only bare type_identifier child of the
+    // impl, so those methods were recorded as `Source::read` / `Iterator::next`.
+    const methodQns = result.nodes
+      .filter((n) => n.kind === 'method')
+      .map((n) => n.qualifiedName)
+      .sort();
+    expect(methodQns).toEqual([
+      'BufSource::read',
+      'FileSource::read',
+      'Own::from',
+      'Parents::next',
+      'Scoped::read',
+      'Source::read',
+      'Wrapper::read',
+    ]);
+    // The trait's qualified name now names exactly one node: its declaration.
+    const traitRead = result.nodes.filter((n) => n.qualifiedName === 'Source::read');
+    expect(traitRead).toHaveLength(1);
+    expect(traitRead[0]!.startLine).toBe(3);
+
+    // The implements back-reference comes FROM the implementing type's node
+    // for every impl shape, named by the trait's full text.
+    const implementsFrom = (typeName: string): string[] => {
+      const typeNode = result.nodes.find((n) => n.name === typeName && n.kind === 'struct');
+      expect(typeNode, typeName).toBeDefined();
+      return result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'implements' && r.fromNodeId === typeNode!.id)
+        .map((r) => r.referenceName);
+    };
+    expect(implementsFrom('FileSource')).toEqual(['Source']);
+    expect(implementsFrom('BufSource')).toEqual(['Source']);
+    expect(implementsFrom('Parents')).toEqual(['Iterator']);
+    expect(implementsFrom('Wrapper')).toEqual(['Source']);
+    expect(implementsFrom('Scoped')).toEqual(['Source']);
+    expect(implementsFrom('Own')).toEqual(['From<u32>']);
+
+    // …and the owner `contains` edge lands on the implementing type too.
+    const buf = result.nodes.find((n) => n.name === 'BufSource' && n.kind === 'struct')!;
+    const bufRead = result.nodes.find((n) => n.qualifiedName === 'BufSource::read')!;
+    expect(
+      result.edges.some((e) => e.kind === 'contains' && e.source === buf.id && e.target === bufRead.id)
+    ).toBe(true);
+  });
+
+  it('keeps the owner-field shape for `self.<field>.<method>()` and collapses every other receiver (#1585)', () => {
+    const code = `
+pub struct Outer { pub inner: Inner, pub deep: Deep }
+impl Outer {
+    pub fn run(&mut self) {
+        self.inner.run();
+        self.deep.inner.run();
+        self.make().run();
+        (self.inner).run();
+        self.run();
+        let local = Inner { n: 0 };
+        local.run();
+    }
+}
+`;
+    const result = extractFromSource('outer.rs', code);
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+    // Exactly one call keeps the `self.<field>` prefix — the single-hop field
+    // receiver whose type the resolver can read off the owner struct.
+    expect(calls.filter((c) => c.startsWith('self.'))).toEqual(['self.inner.run']);
+    // A local receiver keeps its name as before…
+    expect(calls).toContain('local.run');
+    // …and the deeper chain, the call receiver, the parenthesized receiver and
+    // the bare `self` receiver all still collapse to the method name.
+    expect(calls.filter((c) => c === 'run')).toHaveLength(4);
+    expect(calls).toContain('make');
+    const outerRun = result.nodes.find((n) => n.qualifiedName === 'Outer::run');
+    expect(outerRun).toBeDefined();
+    const fieldRef = result.unresolvedReferences.find((r) => r.referenceName === 'self.inner.run');
+    expect(fieldRef?.fromNodeId).toBe(outerRun!.id);
+    expect(fieldRef?.line).toBe(5);
+  });
+
+  it('gives no receiver to an impl whose target names no single type', () => {
+    // A tuple / `dyn Trait` / primitive implementing type has no struct to
+    // hang the methods off, so they are extracted as plain functions — the
+    // pre-#1588 behavior for these shapes, minus the trait mis-qualification.
+    const code = `
+pub trait Base { fn id(&self) -> u32; }
+impl Base for (u32, u32) {
+    fn id(&self) -> u32 { 0 }
+}
+impl Base for dyn Base {
+    fn id(&self) -> u32 { 1 }
+}
+`;
+    const result = extractFromSource('src.rs', code);
+    const ids = result.nodes.filter((n) => n.name === 'id');
+    expect(ids.map((n) => n.qualifiedName).sort()).toEqual(['Base::id', 'id', 'id']);
+    expect(ids.filter((n) => n.kind === 'function')).toHaveLength(2);
+    expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'implements')).toHaveLength(0);
   });
 
   it('should extract trait supertraits as extends references', () => {
@@ -6936,6 +7123,54 @@ export function multiply(a: number, b: number): number {
     cg.close();
   });
 
+  it('should resolve an ES import from a .xsjs file to a .xsjslib file (#556)', async () => {
+    // Exercises the JS import-path resolution list: `./helpers` must resolve to
+    // `helpers.xsjslib`. `decoy.js` exports the same symbol name and is never
+    // imported — without .xsjs/.xsjslib in the list the import resolves to
+    // nothing and the call falls back to same-name matching, which binds the
+    // edge to the decoy. The decoy is what makes this test fail on a regression:
+    // with a lone helpers.xsjslib the fallback happens to pick the right file.
+    fs.writeFileSync(
+      path.join(tempDir, 'helpers.xsjslib'),
+      'export function buildQuery(table) {\n  return "SELECT * FROM " + table;\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'decoy.js'),
+      'export function buildQuery(table) {\n  return "DECOY " + table;\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'service.xsjs'),
+      'import { buildQuery } from "./helpers";\n\nfunction run() {\n  return buildQuery("users");\n}\n'
+    );
+
+    const cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+
+    const run = cg.getNodesInFile('service.xsjs').find((n) => n.name === 'run');
+    const buildQuery = cg.getNodesInFile('helpers.xsjslib').find((n) => n.name === 'buildQuery');
+    const decoy = cg.getNodesInFile('decoy.js').find((n) => n.name === 'buildQuery');
+    expect(run).toBeDefined();
+    expect(buildQuery).toBeDefined();
+    expect(decoy).toBeDefined();
+
+    expect(
+      cg.getFileDependencies('service.xsjs'),
+      "'./helpers' should resolve to helpers.xsjslib, not the same-named decoy"
+    ).toEqual(['helpers.xsjslib']);
+
+    const outgoing = cg.getOutgoingEdges(run!.id);
+    expect(
+      outgoing.find((e) => e.target === buildQuery!.id),
+      'run() should resolve buildQuery across the .xsjs -> .xsjslib import'
+    ).toBeDefined();
+    expect(
+      outgoing.find((e) => e.target === decoy!.id),
+      'run() must not bind to the unrelated same-named export in decoy.js'
+    ).toBeUndefined();
+
+    cg.close();
+  });
+
   it('should count the full file-level tracked class (yaml/twig/properties) in indexFiles()', async () => {
     fs.writeFileSync(path.join(tempDir, 'app.yaml'), 'name: test\n');
     fs.writeFileSync(path.join(tempDir, 'view.twig'), '{{ title }}\n');
@@ -10131,7 +10366,81 @@ helper() -> ok.
       const ns = result.nodes.find((n) => n.kind === 'namespace');
       expect(ns?.name).toBe('my_server');
       const start = result.nodes.find((n) => n.kind === 'function' && n.name === 'start');
-      expect(start?.qualifiedName).toBe('my_server::start');
+      // Arity is part of an Erlang function's identity — qualifiedName carries it (#1610).
+      expect(start?.qualifiedName).toBe('my_server::start/0');
+    });
+
+    it('should give same-name different-arity functions separate arity-qualified nodes (#1610)', () => {
+      const code = `-module(gap).
+-export([f/1, f/2]).
+
+f(X)    -> X + 1.
+f(X, Y) -> X + Y.
+`;
+      const result = extractFromSource('src/gap.erl', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function' && n.name === 'f');
+      expect(fns).toHaveLength(2);
+      expect(fns.map((n) => n.qualifiedName).sort()).toEqual(['gap::f/1', 'gap::f/2']);
+      const f1 = fns.find((n) => n.qualifiedName === 'gap::f/1')!;
+      const f2 = fns.find((n) => n.qualifiedName === 'gap::f/2')!;
+      expect([f1.startLine, f1.endLine]).toEqual([4, 4]);
+      expect([f2.startLine, f2.endLine]).toEqual([5, 5]);
+      expect(f1.signature).toBe('f(X)');
+      expect(f2.signature).toBe('f(X, Y)');
+    });
+
+    it('should split interleaved same-name defs by arity with distinct qualified names', () => {
+      const code = `-module(inter).
+
+f(X)    -> X + 1;
+f(Y)    -> Y.
+g()     -> ok.
+f(X, Y) -> X + Y.
+`;
+      const result = extractFromSource('src/inter.erl', code);
+      const fs = result.nodes.filter((n) => n.kind === 'function' && n.name === 'f');
+      expect(fs).toHaveLength(2);
+      expect(fs.map((n) => n.qualifiedName).sort()).toEqual(['inter::f/1', 'inter::f/2']);
+      // Clauses of the same arity still merge into one span.
+      const f1 = fs.find((n) => n.qualifiedName === 'inter::f/1')!;
+      expect([f1.startLine, f1.endLine]).toEqual([3, 4]);
+    });
+
+    it('should flag exported per arity (#1610)', () => {
+      const code = `-module(m).
+-export([f/1]).
+
+f(X) -> X.
+f(X, Y) -> {X, Y}.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      expect(result.nodes.find((n) => n.qualifiedName === 'm::f/1')?.isExported).toBe(true);
+      expect(result.nodes.find((n) => n.qualifiedName === 'm::f/2')?.isExported).toBe(false);
+    });
+
+    it('should attach a -spec sitting between two arities to the arity it names (#1610)', () => {
+      const code = `-module(deleg).
+-export([header/2, header/3]).
+
+header(Name, Req) ->
+    header(Name, Req, undefined).
+
+-spec header(binary(), map(), any()) -> any().
+header(Name, Headers, Default) ->
+    maps:get(Name, Headers, Default).
+`;
+      const result = extractFromSource('src/deleg.erl', code);
+      const h2 = result.nodes.find((n) => n.qualifiedName === 'deleg::header/2')!;
+      const h3 = result.nodes.find((n) => n.qualifiedName === 'deleg::header/3')!;
+      expect(h2.signature).toBe('header(Name, Req)');
+      expect(h3.signature).toBe('-spec header(binary(), map(), any()) -> any().');
+      expect([h2.startLine, h2.endLine]).toEqual([4, 5]);
+      expect(h3.startLine).toBe(8);
+      // The delegation call carries the callee's arity — no more self-loop.
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(calls).toContain('header/3');
     });
 
     it('should flag exported functions and honor -compile(export_all)', () => {
@@ -10266,11 +10575,31 @@ prepare(X) -> X.
 `;
       const result = extractFromSource('src/m.erl', code);
       const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
-      expect(calls).toContain('prepare');
-      // `mod:fn(...)` is emitted as `mod::fn` — the same shape the module
-      // namespace gives every function's qualifiedName, so it resolves via
-      // the qualified-name matcher.
-      expect(calls).toContain('other_mod::process');
+      expect(calls).toContain('prepare/1');
+      // `mod:fn(...)` is emitted as `mod::fn/arity` — the same shape the
+      // module namespace + arity suffix gives every function's qualifiedName,
+      // so it resolves via the qualified-name matcher (#1610).
+      expect(calls).toContain('other_mod::process/1');
+    });
+
+    it('should carry written arity on fun references and static MFA lists (#1610)', () => {
+      const code = `-module(m).
+-export([go/0]).
+
+go() ->
+    lists:map(fun bump/1, [1]),
+    Prod = fun other_mod:produce/2,
+    proc_lib:spawn_link(?MODULE, work, [a, b]),
+    Prod.
+
+bump(X) -> X + 1.
+work(_A, _B) -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const refs = result.unresolvedReferences;
+      expect(refs.some((r) => r.referenceKind === 'references' && r.referenceName === 'bump/1')).toBe(true);
+      expect(refs.some((r) => r.referenceKind === 'references' && r.referenceName === 'other_mod::produce/2')).toBe(true);
+      expect(refs.some((r) => r.referenceKind === 'calls' && r.referenceName === 'work/2')).toBe(true);
     });
 
     it('should not emit calls for dynamic dispatch (var module / var fun)', () => {
@@ -10283,9 +10612,9 @@ run(Mod, F) ->
 `;
       const result = extractFromSource('src/m.erl', code);
       const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
-      expect(calls).not.toContain('handle');
-      expect(calls).not.toContain('Mod::handle');
-      expect(calls).not.toContain('F');
+      expect(calls.some((c) => c.startsWith('handle'))).toBe(false);
+      expect(calls.some((c) => c.startsWith('Mod::'))).toBe(false);
+      expect(calls.some((c) => c === 'F' || c.startsWith('F/'))).toBe(false);
     });
 
     it('should connect gen_server self-calls to the module handlers', () => {
@@ -10313,9 +10642,10 @@ handle_cast({put, K, V}, S) -> {noreply, maps:put(K, V, S)}.
       const result = extractFromSource('src/kv_store.erl', code);
       const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
       // ?SERVER (defined as ?MODULE), ?MODULE, and the module's own atom all
-      // count as self — public API wrappers connect to their handlers.
-      expect(calls.filter((c) => c === 'kv_store::handle_call')).toHaveLength(2);
-      expect(calls).toContain('kv_store::handle_cast');
+      // count as self — public API wrappers connect to their handlers, at
+      // OTP's fixed handler arities (#1610).
+      expect(calls.filter((c) => c === 'kv_store::handle_call/3')).toHaveLength(2);
+      expect(calls).toContain('kv_store::handle_cast/2');
     });
 
     it('should connect gen_server calls to a registered-name module, directly or via an atom macro', () => {
@@ -10335,8 +10665,8 @@ evict(Key) ->
       // OTP's {local, ?MODULE} convention names a server after its module —
       // a cross-module registered name targets that module's handlers. A name
       // matching no module simply never resolves downstream.
-      expect(calls).toContain('kv_store::handle_call');
-      expect(calls).toContain('kv_store::handle_cast');
+      expect(calls).toContain('kv_store::handle_call/3');
+      expect(calls).toContain('kv_store::handle_cast/2');
     });
 
     it('should not connect gen_server calls with dynamic targets', () => {
@@ -10369,10 +10699,10 @@ monitor_loop(_P) -> ok.
 `;
       const result = extractFromSource('src/m.erl', code);
       const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
-      expect(calls).toContain('request_process'); // ?MODULE → bare, same-file resolution
-      expect(calls).toContain('monitor_loop');
-      expect(calls).toContain('other_mod::handle');
-      expect(calls).toContain('other_mod::tick');
+      expect(calls).toContain('request_process/2'); // ?MODULE → bare-with-arity, same-file resolution
+      expect(calls).toContain('monitor_loop/1');
+      expect(calls).toContain('other_mod::handle/1');
+      expect(calls).toContain('other_mod::tick/0');
     });
 
     it('should stay silent on dynamic spawn/apply (var module, fun value, or plain fun)', () => {
@@ -10389,8 +10719,8 @@ helper() -> ok.
       const result = extractFromSource('src/m.erl', code);
       const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
       // The fun body's call is still walked; no phantom MFA targets appear.
-      expect(calls).toContain('helper');
-      expect(calls.filter((c) => c !== 'spawn' && c !== 'apply' && c !== 'helper')).toHaveLength(0);
+      expect(calls).toContain('helper/0');
+      expect(calls.filter((c) => !['spawn/3', 'spawn/1', 'apply/3', 'helper/0'].includes(c))).toHaveLength(0);
     });
 
     it('should treat ?MODULE:fn calls as local calls', () => {
@@ -10404,7 +10734,7 @@ work() -> ok.
 `;
       const result = extractFromSource('src/m.erl', code);
       const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
-      expect(calls).toContain('work');
+      expect(calls).toContain('work/0');
     });
 
     it('should capture fun name/arity values as function references', () => {
@@ -10419,8 +10749,8 @@ notify(_P) -> ok.
 `;
       const result = extractFromSource('src/m.erl', code);
       const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references').map((r) => r.referenceName);
-      expect(refs).toContain('notify');
-      expect(refs).toContain('m::notify');
+      expect(refs).toContain('notify/1');
+      expect(refs).toContain('m::notify/1');
     });
 
     it('should reference records used in bodies and argument patterns', () => {
@@ -10456,8 +10786,8 @@ second(X) -> X.
       const calls = result.unresolvedReferences.filter(
         (r) => r.referenceKind === 'calls' && r.fromNodeId === handle?.id
       ).map((r) => r.referenceName);
-      expect(calls).toContain('first');
-      expect(calls).toContain('second');
+      expect(calls).toContain('first/1');
+      expect(calls).toContain('second/1');
     });
   });
 
@@ -10479,8 +10809,8 @@ analyze(Path) ->
       expect(fns).toContain('main');
       expect(fns).toContain('analyze');
       const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
-      expect(calls).toContain('analyze');
-      expect(calls).toContain('io::format');
+      expect(calls).toContain('analyze/1');
+      expect(calls).toContain('io::format/2');
     });
 
     it('should link an app resource file to its callback module and dependency apps', () => {
@@ -10526,7 +10856,7 @@ do_thing(X) ->
       const refsFrom = (id?: string) =>
         result.unresolvedReferences.filter((r) => r.fromNodeId === id).map((r) => `${r.referenceKind}:${r.referenceName}`);
       // The body's remote call belongs to the macro node — true exactly once.
-      expect(refsFrom(macro?.id)).toContain('calls:audit_logger::log');
+      expect(refsFrom(macro?.id)).toContain('calls:audit_logger::log/2');
       // The use site joins the call chain: do_thing -calls→ LOG_AUDIT.
       expect(refsFrom(doThing?.id)).toContain('calls:LOG_AUDIT');
     });
@@ -10559,7 +10889,7 @@ prepare() -> ok.
       const result = extractFromSource('src/m.erl', code);
       const refs = result.unresolvedReferences.map((r) => r.referenceName);
       // The nested call inside the macro's arguments still attributes to check/0.
-      expect(refs).toContain('prepare');
+      expect(refs).toContain('prepare/0');
       // ?assertEqual (an OTP header macro) is emitted and simply never resolves…
       expect(refs).toContain('assertEqual');
       // …but predefined macros have no definition to link.
@@ -10579,7 +10909,7 @@ prepare() -> ok.
       const alias = result.nodes.find((n) => n.kind === 'constant' && n.name === 'ALIAS');
       const refsFrom = (id?: string) =>
         result.unresolvedReferences.filter((r) => r.fromNodeId === id).map((r) => `${r.referenceKind}:${r.referenceName}`);
-      expect(refsFrom(target?.id)).toContain('calls:target_fn');
+      expect(refsFrom(target?.id)).toContain('calls:target_fn/0');
       expect(refsFrom(alias?.id)).toContain('references:TARGET');
     });
   });

@@ -485,6 +485,7 @@ impl<'t> Walker<'t> {
     // --- the dispatcher (visitNode, Java-relevant branches) -----------------------
 
     fn visit_node(&mut self, node: Node<'t>) {
+        stack_guard!();
         let kind = node.kind();
         let mut skip_children = false;
 
@@ -534,10 +535,12 @@ impl<'t> Walker<'t> {
     // --- visitFunctionBody ----------------------------------------------------------
 
     fn visit_function_body(&mut self, body: Node<'t>) {
+        stack_guard!();
         self.visit_for_calls_and_structure(body);
     }
 
     fn visit_for_calls_and_structure(&mut self, node: Node<'t>) {
+        stack_guard!();
         let kind = node.kind();
         self.maybe_capture_fn_refs(node);
 
@@ -577,6 +580,7 @@ impl<'t> Walker<'t> {
     // --- extractors --------------------------------------------------------------
 
     fn extract_class(&mut self, node: Node<'t>) {
+        stack_guard!();
         let name = self.extract_name(node);
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
@@ -600,6 +604,7 @@ impl<'t> Walker<'t> {
     }
 
     fn extract_method(&mut self, node: Node<'t>) {
+        stack_guard!();
         if !self.inside_class_like() {
             // (object-literal parents don't exist in Java; a stray top-level
             // method extracts as a function, mirroring extractMethod's tail)
@@ -627,6 +632,7 @@ impl<'t> Walker<'t> {
 
     /// extractFunction — only reachable for a method outside any class.
     fn extract_function(&mut self, node: Node<'t>) {
+        stack_guard!();
         let name = self.extract_name(node);
         if name == "<anonymous>" {
             if let Some(body) = node.child_by_field_name("body") {
@@ -653,6 +659,7 @@ impl<'t> Walker<'t> {
     }
 
     fn extract_interface(&mut self, node: Node<'t>) {
+        stack_guard!();
         let name = self.extract_name(node);
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
@@ -671,6 +678,7 @@ impl<'t> Walker<'t> {
     }
 
     fn extract_enum(&mut self, node: Node<'t>) {
+        stack_guard!();
         let Some(body) = node.child_by_field_name("body") else { return };
         let name = self.extract_name(node);
         let extra = Extra {
@@ -902,6 +910,7 @@ impl<'t> Walker<'t> {
 
     /// extractAnonymousClass — `new T() { ... }`.
     fn extract_anonymous_class(&mut self, node: Node<'t>, body: Node<'t>) {
+        stack_guard!();
         let type_node = node
             .child_by_field_name("constructor")
             .or_else(|| node.child_by_field_name("type"))
@@ -1101,6 +1110,7 @@ impl<'t> Walker<'t> {
     }
 
     fn extract_type_refs_from_subtree(&mut self, node: Node<'t>, from_row: u32) {
+        stack_guard!();
         if node.kind() == "type_identifier" {
             let type_name = self.text(node).to_string();
             if !type_name.is_empty() && !is_builtin_type(&type_name) {
@@ -1193,6 +1203,7 @@ impl<'t> Walker<'t> {
     }
 
     fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32) {
+        stack_guard!();
         if depth > 12 {
             return;
         }

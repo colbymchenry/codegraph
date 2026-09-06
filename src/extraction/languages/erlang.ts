@@ -9,8 +9,11 @@ import type { LanguageExtractor, ExtractorContext } from '../tree-sitter-types';
 // extractor, so every symbol-bearing top-level form is dispatched through the
 // visitNode hook below instead:
 //   - a function's name lives on its CLAUSE, not the fun_decl, and the grammar
-//     emits one fun_decl PER CLAUSE — consecutive same-name fun_decl forms are
-//     merged into a single function node here;
+//     emits one fun_decl PER CLAUSE — consecutive same-name same-ARITY
+//     fun_decl forms (clauses of one function) are merged into a single
+//     function node here. Arity is part of an Erlang function's identity
+//     (`f/1` and `f/2` are unrelated definitions — #1610), so each arity gets
+//     its own node, qualified `mod::f/1` / `mod::f/2`;
 //   - type-position expressions (-spec/-type/-callback bodies, record field
 //     types) parse as `call` nodes, so descending into them would mint bogus
 //     call refs to type names (`pid()`, `term()`); the hook consumes those
@@ -19,9 +22,10 @@ import type { LanguageExtractor, ExtractorContext } from '../tree-sitter-types';
 //     the generic extractStruct would skip as a forward declaration.
 // Calls (local `f(X)`, remote `mod:f(X)`, `fun f/1` references, and record
 // usages) are handled by the erlang branch in extractCall — remote calls are
-// emitted as `mod::f`, which matches the qualifiedName the module namespace
-// produces (see packageTypes below), so cross-module resolution rides the
-// standard qualified-name matcher.
+// emitted as `mod::f/2` (arity counted at the call site), byte-identical to
+// the qualifiedName above, so cross-module resolution rides the standard
+// qualified-name matcher; local calls are emitted `f/2` and resolved by the
+// erlang arity step in matchReference.
 
 /** Text of an atom with quoted-atom quotes stripped (`'EXIT'` → `EXIT`). */
 function atomText(node: SyntaxNode, source: string): string {
@@ -35,19 +39,27 @@ function collapseWs(text: string): string {
 // --- Per-file memos. Extraction is file-sequential within a worker, so a
 // single-entry memo keyed by filePath is safe (and resets naturally). ---
 
-/** Exported function names for the current file ('all' for -compile(export_all)). */
+/**
+ * Exported `name/arity` keys for the current file ('all' for
+ * -compile(export_all)). Keyed by arity because `-export([f/1])` exports
+ * exactly f/1 — f/2 in the same module stays private (#1610). A malformed
+ * `fa` with no arity node falls back to the bare name key.
+ */
 let exportsFile = '';
 let exportsMemo: Set<string> | 'all' = new Set();
 
 /**
- * Clause-merge state: the previous fun_decl's name and node id. A fun_decl
- * whose clause repeats that name is a continuation clause (or a same-name
- * different-arity definition — deliberately grouped under one node, the way
- * overloads are elsewhere) and attaches to the existing node instead of
- * creating a duplicate.
+ * Clause-merge state: the previous fun_decl's name, arity, and node id. A
+ * fun_decl whose clause repeats that (name, arity) is a continuation clause of
+ * the SAME function and attaches to the existing node instead of creating a
+ * duplicate. A same-name DIFFERENT-arity fun_decl is an unrelated function
+ * (Erlang identity is `name/arity`) and gets its own node (#1610). Keying on
+ * adjacency stays safe: clauses of one function must be adjacent in Erlang —
+ * a non-adjacent redefinition of the same name/arity is a compile error.
  */
 let lastFnFile = '';
 let lastFnName = '';
+let lastFnArity = -1;
 let lastFnId = '';
 
 function moduleExports(node: SyntaxNode, source: string, filePath: string): Set<string> | 'all' {
@@ -69,7 +81,12 @@ function moduleExports(node: SyntaxNode, source: string, filePath: string): Set<
       for (const fa of form.namedChildren) {
         if (fa.type !== 'fa') continue;
         const fun = getChildByField(fa, 'fun');
-        if (fun) result.add(atomText(fun, source));
+        if (!fun) continue;
+        const name = atomText(fun, source);
+        const arityNode = getChildByField(fa, 'arity');
+        const arityValue = arityNode ? getChildByField(arityNode, 'value') : null;
+        const arity = arityValue ? getNodeText(arityValue, source) : null;
+        result.add(arity !== null ? `${name}/${arity}` : name);
       }
     }
   }
@@ -78,13 +95,27 @@ function moduleExports(node: SyntaxNode, source: string, filePath: string): Set<
   return result;
 }
 
-/** The -spec directly above a function (comments may sit between), if it names it. */
-function precedingSpec(node: SyntaxNode, name: string, source: string): SyntaxNode | null {
+/** Argument count of a clause/sig: the `args` (expr_args) field's named-child count. */
+function nodeArity(withArgs: SyntaxNode): number {
+  const args = getChildByField(withArgs, 'args');
+  return args ? args.namedChildCount : 0;
+}
+
+/**
+ * The -spec directly above a function (comments may sit between), if it names
+ * it AND matches its arity — the spec for `header/3` sitting between the
+ * `header/2` and `header/3` definitions must attach to /3 only (#1610). A
+ * spec whose sigs can't be read (defensive) is accepted on the name alone.
+ */
+function precedingSpec(node: SyntaxNode, name: string, arity: number, source: string): SyntaxNode | null {
   let prev = node.previousNamedSibling;
   while (prev && prev.type === 'comment') prev = prev.previousNamedSibling;
   if (prev?.type === 'spec') {
     const specFun = getChildByField(prev, 'fun');
-    if (specFun && atomText(specFun, source) === name) return prev;
+    if (specFun && atomText(specFun, source) === name) {
+      const sigs = prev.namedChildren.filter((c) => c.type === 'type_sig');
+      if (sigs.length === 0 || sigs.some((sig) => nodeArity(sig) === arity)) return prev;
+    }
   }
   return null;
 }
@@ -104,10 +135,11 @@ function handleFunDecl(node: SyntaxNode, ctx: ExtractorContext): boolean {
   if (!nameNode) return true;
   const name = atomText(nameNode, ctx.source);
   if (!name) return true;
+  const arity = nodeArity(first);
 
-  // Continuation clause: extend the existing node's span and attribute this
-  // clause's calls to it.
-  if (ctx.filePath === lastFnFile && name === lastFnName && lastFnId) {
+  // Continuation clause of the SAME function (same name AND arity): extend the
+  // existing node's span and attribute this clause's calls to it.
+  if (ctx.filePath === lastFnFile && name === lastFnName && arity === lastFnArity && lastFnId) {
     for (let i = ctx.nodes.length - 1; i >= 0; i--) {
       const n = ctx.nodes[i];
       if (n && n.id === lastFnId) {
@@ -121,16 +153,20 @@ function handleFunDecl(node: SyntaxNode, ctx: ExtractorContext): boolean {
     return true;
   }
 
-  const spec = precedingSpec(node, name, ctx.source);
+  const spec = precedingSpec(node, name, arity, ctx.source);
   const exports = moduleExports(node, ctx.source, ctx.filePath);
   const fn = ctx.createNode('function', name, node, {
     docstring: getPrecedingDocstring(spec ?? node, ctx.source),
     signature: spec
       ? collapseWs(getNodeText(spec, ctx.source)).slice(0, 300)
       : clauseHeader(first, ctx.source),
-    isExported: exports === 'all' || exports.has(name),
+    isExported: exports === 'all' || exports.has(`${name}/${arity}`) || exports.has(name),
   });
   if (!fn) return true;
+  // Arity is part of the function's identity — carry it on the qualified name
+  // (`mod::f/2`), the canonical Erlang spelling and the only persisted slot.
+  // The node NAME stays bare so name search and bare-name matching still work.
+  fn.qualifiedName = `${fn.qualifiedName}/${arity}`;
   ctx.pushScope(fn.id);
   // The whole clause is walked (not just the body) so record patterns in the
   // arguments and guard calls contribute references too.
@@ -138,6 +174,7 @@ function handleFunDecl(node: SyntaxNode, ctx: ExtractorContext): boolean {
   ctx.popScope();
   lastFnFile = ctx.filePath;
   lastFnName = name;
+  lastFnArity = arity;
   lastFnId = fn.id;
   return true;
 }

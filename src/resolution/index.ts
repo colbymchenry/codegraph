@@ -903,10 +903,13 @@ export class ReferenceResolver {
     // indexed under the bare name, so the existence check strips the dot.
     // Nix static path imports (`import ./x.nix`) name a FILE, not a symbol —
     // they bypass the symbol-existence check and resolve via resolveViaImport.
-    const existenceName =
+    let existenceName =
       ref.language === 'arkts' && ref.referenceName.startsWith('.')
         ? ref.referenceName.slice(1)
         : ref.referenceName;
+    // Erlang refs carry the call-site arity (`f/1`, `mod::f/2` — #1610); the
+    // name index stores bare names, so existence is checked arity-less.
+    if (ref.language === 'erlang') existenceName = existenceName.replace(/\/\d{1,3}$/, '');
     const tPre = this.profileStages ? process.hrtime.bigint() : 0n;
     const preFilterPass =
       isNixPathImportRef(ref) ||
@@ -1075,14 +1078,15 @@ export class ReferenceResolver {
    * Create edges from resolved references
    */
   createEdges(resolved: ResolvedRef[]): Edge[] {
-    return resolved.map((ref) => {
+    return resolved.flatMap((ref) => {
       // `function_ref` (#756) is internal-only: it persists as a `references`
       // edge (the registration site depends on the callback), distinguishable
       // by metadata.resolvedBy === 'function-ref'. callers/impact already
       // traverse `references`, so registration sites surface with no
       // graph-layer changes.
       let kind: Edge['kind'] =
-        ref.original.referenceKind === 'function_ref' ? 'references' : ref.original.referenceKind;
+        ref.edgeKind ??
+        (ref.original.referenceKind === 'function_ref' ? 'references' : ref.original.referenceKind);
 
       // Promote "extends" to "implements" when a class/struct targets an interface
       if (kind === 'extends') {
@@ -1110,13 +1114,21 @@ export class ReferenceResolver {
         }
       }
 
-      return {
+      // One reference can name several targets — a navigation whose
+      // destination is a conditional reaches every arm. Each becomes its own
+      // edge, sharing this resolution's kind and confidence.
+      const targets = [
+        { targetNodeId: ref.targetNodeId, metadata: ref.metadata },
+        ...(ref.alsoTargets ?? []),
+      ];
+      return targets.map((t) => ({
         source: ref.original.fromNodeId,
-        target: ref.targetNodeId,
+        target: t.targetNodeId,
         kind,
         line: ref.original.line,
         column: ref.original.column,
         metadata: {
+          ...(t.metadata ?? {}),
           confidence: ref.confidence,
           resolvedBy: ref.resolvedBy,
           // The ORIGINAL reference text (and kind, when edge-kind promotion
@@ -1137,7 +1149,7 @@ export class ReferenceResolver {
           // exactly the edges this feature added.
           ...(ref.original.referenceKind === 'function_ref' ? { fnRef: true } : {}),
         },
-      };
+      }));
     });
   }
 

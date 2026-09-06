@@ -1119,6 +1119,168 @@ impl Describe for Ctl { fn describe(&self) -> String { "ctl".into() } }
       ).toBe('interface-impl');
     });
 
+    it('qualifies a generic impl by its type, so trait dispatch reaches it and no edge is invented from its body (#1588)', async () => {
+      // `impl<T> Source for BufSource<T>`: the implementing type parses as a
+      // generic_type, so the old positional receiver scan picked the TRAIT.
+      // The impl's `read` was recorded as `Source::read` — unaddressable as
+      // `BufSource::read` — and, carrying the trait's name, the interface-impl
+      // synthesizer treated its body (`{ 0 }`, no call at all) as a second
+      // declaration and gave it a dispatch edge to FileSource's implementation.
+      fs.writeFileSync(
+        path.join(tempDir, 'lib.rs'),
+        `pub trait Source {
+    fn read(&mut self) -> usize;
+}
+
+pub struct FileSource { pub n: usize }
+impl Source for FileSource {
+    fn read(&mut self) -> usize { self.n }
+}
+
+pub struct BufSource<T> { pub inner: T }
+impl<T> Source for BufSource<T> {
+    fn read(&mut self) -> usize { 0 }
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const methods = cg.getNodesByKind('method');
+      const traitDecls = methods.filter((n) => n.qualifiedName === 'Source::read');
+      expect(traitDecls, 'only the declaration carries the trait-qualified name').toHaveLength(1);
+      const traitMethod = traitDecls[0]!;
+      expect(traitMethod.startLine).toBe(2);
+      const fileImpl = methods.find((n) => n.qualifiedName === 'FileSource::read');
+      const bufImpl = methods.find((n) => n.qualifiedName === 'BufSource::read');
+      expect(fileImpl).toBeDefined();
+      expect(bufImpl, 'the generic impl is addressable by its type').toBeDefined();
+
+      const synth = (id: string) =>
+        cg.getOutgoingEdges(id).filter((e) => e.kind === 'calls' && e.provenance === 'heuristic');
+      // Dispatch fans out from the declaration to BOTH implementations…
+      const fromTrait = synth(traitMethod.id);
+      expect(new Set(fromTrait.map((e) => e.target))).toEqual(new Set([fileImpl!.id, bufImpl!.id]));
+      for (const e of fromTrait) {
+        expect(
+          (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy
+        ).toBe('interface-impl');
+        expect(e.line, 'registered at the declaration, never at an impl body').toBe(2);
+      }
+      // …and neither implementation body sprouts a synthesized call of its own.
+      expect(synth(fileImpl!.id)).toHaveLength(0);
+      expect(synth(bufImpl!.id)).toHaveLength(0);
+    });
+
+    // ── Rust `self.<field>.<method>()` receivers (#1585) ───────────────────
+    // A Cargo layout (Cargo.toml + src/) so `use crate::…` paths resolve.
+    function writeRustCrate(root: string, files: Record<string, string>): void {
+      fs.writeFileSync(
+        path.join(root, 'Cargo.toml'),
+        '[package]\nname = "repro"\nversion = "0.1.0"\nedition = "2021"\n'
+      );
+      fs.mkdirSync(path.join(root, 'src'), { recursive: true });
+      for (const [rel, content] of Object.entries(files)) {
+        fs.writeFileSync(path.join(root, 'src', rel), content);
+      }
+    }
+    const callsFrom = (qualifiedName: string) => {
+      const from = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      expect(from, qualifiedName).toBeDefined();
+      return cg
+        .getOutgoingEdges(from!.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => ({
+          target: cg.getNode(e.target)?.qualifiedName,
+          resolvedBy: (e.metadata as { resolvedBy?: string } | undefined)?.resolvedBy,
+          provenance: e.provenance ?? undefined, // a resolved (non-synthesized) edge stores NULL
+        }));
+    };
+
+    it("resolves `self.field.method()` to the method on the field's declared type, never to the caller itself (#1585)", async () => {
+      // The issue's repro: `Outer::run` forwards to `Inner::run` through the
+      // typed field `inner`. The call used to collapse to the bare name `run`
+      // and exact-match the nearest same-named method — the calling method —
+      // recording recursion the source does not contain.
+      writeRustCrate(tempDir, {
+        'lib.rs': 'pub mod inner;\npub mod outer;\n',
+        'inner.rs': 'pub struct Inner {\n    pub n: usize,\n}\n\nimpl Inner {\n    pub fn run(&mut self) {\n        self.n += 1;\n    }\n}\n',
+        'outer.rs': 'use crate::inner::Inner;\n\npub struct Outer {\n    pub inner: Inner,\n}\n\nimpl Outer {\n    pub fn run(&mut self) {\n        self.inner.run();\n    }\n}\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callsFrom('Outer::run')).toEqual([
+        { target: 'Inner::run', resolvedBy: 'instance-method', provenance: undefined },
+      ]);
+    });
+
+    it('leaves a `self.field.method()` call unresolved when the field type is external, instead of guessing a same-named local method', async () => {
+      // `its` is a std type with no project node. Before, `self.its.next()`
+      // became the bare `next`, which exact-matched a local `next` — the
+      // calling method (self-edge) or the unrelated `Other::next` decoy.
+      writeRustCrate(tempDir, {
+        'lib.rs':
+          'pub struct Scanner {\n    its: std::vec::IntoIter<u8>,\n}\n\nimpl Scanner {\n    pub fn next(&mut self) -> Option<u8> {\n        self.its.next()\n    }\n}\n\n' +
+          'pub struct Other { pub n: u8 }\nimpl Other {\n    pub fn next(&mut self) -> Option<u8> {\n        None\n    }\n}\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callsFrom('Scanner::next')).toEqual([]);
+    });
+
+    it('looks through references and owning smart pointers, but not through containers (#1585)', async () => {
+      // Method-call auto-deref reaches the pointee of `Box`/`&mut`, so those
+      // fields resolve to `Inner::run`. `Option<Inner>` does not auto-deref —
+      // `self.inner.take()` is Option's method, so it must NOT become
+      // `Inner::take` even though Inner declares a `take` too.
+      writeRustCrate(tempDir, {
+        'lib.rs':
+          'pub struct Inner { pub n: usize }\nimpl Inner {\n    pub fn run(&mut self) { self.n += 1; }\n    pub fn take(&mut self) {}\n}\n\n' +
+          'pub struct Boxed { inner: Box<Inner> }\nimpl Boxed {\n    pub fn go(&mut self) { self.inner.run(); }\n}\n\n' +
+          "pub struct Borrowed<'a> { inner: &'a mut Inner }\nimpl<'a> Borrowed<'a> {\n    pub fn go(&mut self) { self.inner.run(); }\n}\n\n" +
+          'pub struct Optional { inner: Option<Inner> }\nimpl Optional {\n    pub fn go(&mut self) { self.inner.take(); }\n}\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callsFrom('Boxed::go').map((c) => c.target)).toEqual(['Inner::run']);
+      expect(callsFrom('Borrowed::go').map((c) => c.target)).toEqual(['Inner::run']);
+      expect(callsFrom('Optional::go')).toEqual([]);
+    });
+
+    it('leaves a call through a generic-typed field unresolved, and keeps genuine `self.method()` recursion (#1585)', async () => {
+      writeRustCrate(tempDir, {
+        'lib.rs':
+          'pub struct Inner { pub n: usize }\nimpl Inner {\n    pub fn run(&mut self) {}\n}\n\n' +
+          'pub struct Holder<T> { item: T }\nimpl<T> Holder<T> {\n    pub fn go(&mut self) { self.item.run(); }\n}\n\n' +
+          'pub struct Countdown { pub n: usize }\nimpl Countdown {\n    pub fn run(&mut self) {\n        if self.n > 0 {\n            self.n -= 1;\n            self.run();\n        }\n    }\n}\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // `T` names no project type: no edge, and in particular not `Inner::run`.
+      expect(callsFrom('Holder::go')).toEqual([]);
+      // A bare `self` receiver is untouched — real recursion stays a self-edge.
+      expect(callsFrom('Countdown::run').map((c) => c.target)).toEqual(['Countdown::run']);
+    });
+
+    it('resolves a trait-object field to the trait method and typed fields to the right implementation (#1585, #1588)', async () => {
+      // The #1588 repro's second half: `UsesFile::go` / `UsesBuf::go` each
+      // forward through a typed field, and a `Box<dyn Source>` field lands on
+      // the trait's declaration — from which the interface-impl synthesizer
+      // fans out to every implementation.
+      writeRustCrate(tempDir, {
+        'lib.rs':
+          'pub trait Source {\n    fn read(&mut self) -> usize;\n}\n\n' +
+          'pub struct FileSource { pub n: usize }\nimpl Source for FileSource {\n    fn read(&mut self) -> usize { self.n }\n}\n\n' +
+          'pub struct BufSource<T> { pub inner: T }\nimpl<T> Source for BufSource<T> {\n    fn read(&mut self) -> usize { 0 }\n}\n\n' +
+          'pub struct UsesFile { pub src: FileSource }\nimpl UsesFile {\n    pub fn go(&mut self) -> usize { self.src.read() }\n}\n\n' +
+          'pub struct UsesBuf { pub src: BufSource<u8> }\nimpl UsesBuf {\n    pub fn go(&mut self) -> usize { self.src.read() }\n}\n\n' +
+          'pub struct UsesDyn { pub src: Box<dyn Source> }\nimpl UsesDyn {\n    pub fn go(&mut self) -> usize { self.src.read() }\n}\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callsFrom('UsesFile::go').map((c) => c.target)).toEqual(['FileSource::read']);
+      expect(callsFrom('UsesBuf::go').map((c) => c.target)).toEqual(['BufSource::read']);
+      expect(callsFrom('UsesDyn::go').map((c) => c.target)).toEqual(['Source::read']);
+      // …and dispatch continues from the trait declaration to both impls.
+      const fanOut = callsFrom('Source::read').filter((c) => c.provenance === 'heuristic').map((c) => c.target).sort();
+      expect(fanOut).toEqual(['BufSource::read', 'FileSource::read']);
+    });
+
     it('records instantiates for C++ stack/brace construction, targeting the class (#1035)', async () => {
       // `Calculator calc(0)` (direct-init) and `Widget w{1, 2}` (brace-init)
       // carry the constructor args directly on the declarator — there's no
@@ -2906,6 +3068,131 @@ export function callFromImportedFile(): void {
         const callerNames = callers.map((c) => c.node.name).sort();
         expect(callerNames).toContain('callInDefinitionFile');
         expect(callerNames).toContain('callFromImportedFile');
+        cg.close();
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+  });
+
+  describe('Object-literal namespace members (#1573)', () => {
+    // `export const api = { call() {…}, get: () => {…} }` used as the module's
+    // API surface: the members are plain functions with bare names inside the
+    // constant's extent, so `api.call()` resolved to nothing in the defining
+    // file and to the CONSTANT through an import — zero callers everywhere.
+    const setup = (files: Record<string, string>) => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1573-'));
+      for (const [name, content] of Object.entries(files)) {
+        fs.mkdirSync(path.dirname(path.join(tmpDir, name)), { recursive: true });
+        fs.writeFileSync(path.join(tmpDir, name), content);
+      }
+      return tmpDir;
+    };
+    const callersOf = async (cg: CodeGraph, name: string, kind: string, filePath?: string) => {
+      const target = (await cg.searchNodes(name, { limit: 20 })).find(
+        (r) => r.node.kind === kind && r.node.name === name && (!filePath || r.node.filePath === filePath)
+      );
+      expect(target).toBeDefined();
+      return (await cg.getCallers(target!.node.id)).map((c) => c.node.name).sort();
+    };
+
+    it('resolves same-file and imported calls to the literal member, never to the constant (#1573)', async () => {
+      const tmpDir = setup({
+        'a.ts': `export const obj = { m() { return 1; } };
+export class C { static s() { return 2; } }
+export function sameFileCallers() { return obj.m() + C.s(); }
+`,
+        'b.ts': `import { obj, C } from "./a";
+export function crossFileCaller() { return obj.m() + C.s(); }
+`,
+        // A same-named top-level function elsewhere must never be chosen.
+        'decoy.ts': `export function m() { return 'decoy'; }
+`,
+      });
+      try {
+        const cg = CodeGraph.initSync(tmpDir);
+        await cg.indexAll();
+
+        expect(await callersOf(cg, 'm', 'function', 'a.ts')).toEqual(['crossFileCaller', 'sameFileCallers']);
+        expect(await callersOf(cg, 'm', 'function', 'decoy.ts')).toEqual([]);
+        // The class static next to it resolves exactly as before (#825).
+        expect(await callersOf(cg, 's', 'method')).toEqual(['crossFileCaller', 'sameFileCallers']);
+
+        // The import edge no longer lands on the constant itself.
+        const obj = (await cg.searchNodes('obj', { limit: 5 })).find((r) => r.node.kind === 'constant');
+        expect(obj).toBeDefined();
+        const caller = (await cg.searchNodes('crossFileCaller', { limit: 5 })).find((r) => r.node.kind === 'function');
+        const toConstant = cg
+          .getOutgoingEdges(caller!.node.id)
+          .filter((e) => e.kind === 'calls' && e.target === obj!.node.id);
+        expect(toConstant).toHaveLength(0);
+        cg.close();
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('covers method and arrow-property members, and skips a declaration nested in a member body', async () => {
+      const tmpDir = setup({
+        'src/api.ts': `export const api = {
+  call: () => { return 1; },
+  get() {
+    function call() { return 'nested in get, not a member'; }
+    return call();
+  },
+};
+`,
+        'src/use.ts': `import { api } from './api';
+export function useCall() { return api.call(); }
+export function useGet() { return api.get(); }
+`,
+      });
+      try {
+        const cg = CodeGraph.initSync(tmpDir);
+        await cg.indexAll();
+
+        const calls = (await cg.searchNodes('call', { limit: 20 }))
+          .map((r) => r.node)
+          .filter((n) => n.name === 'call' && n.filePath === 'src/api.ts' && (n.kind === 'function' || n.kind === 'method'));
+        // The member is the arrow on line 2; the nested declaration sits
+        // inside `get`'s body on line 4 and must never be taken for it.
+        const member = calls.find((n) => n.startLine === 2);
+        const nested = calls.find((n) => n.startLine === 4);
+        expect(member).toBeDefined();
+        expect(nested).toBeDefined();
+        expect((await cg.getCallers(member!.id)).map((c) => c.node.name)).toContain('useCall');
+        expect((await cg.getCallers(nested!.id)).map((c) => c.node.name)).not.toContain('useCall');
+        expect(await callersOf(cg, 'get', 'function')).toEqual(['useGet']);
+        cg.close();
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('leaves a non-literal value receiver on its existing path', async () => {
+      const tmpDir = setup({
+        'src/mk.ts': `export function m() { return 'top-level, unrelated to obj'; }
+export const obj = makeObj();
+export function makeObj(): { m(): number } { return { m: () => 1 } as { m(): number }; }
+export function localUse() { return obj.m(); }
+`,
+        'src/use.ts': `import { obj } from './mk';
+export function remoteUse() { return obj.m(); }
+`,
+      });
+      try {
+        const cg = CodeGraph.initSync(tmpDir);
+        await cg.indexAll();
+        // `obj` holds a call result, not a literal: the same-named top-level
+        // `m` lies outside its declaration, so containment finds nothing and
+        // both calls keep today's behavior (unresolved in the defining file;
+        // the constant edge through the import) rather than guessing.
+        expect(await callersOf(cg, 'm', 'function')).toEqual([]);
+        const obj = (await cg.searchNodes('obj', { limit: 5 })).find((r) => r.node.kind === 'constant');
+        const remote = (await cg.searchNodes('remoteUse', { limit: 5 })).find((r) => r.node.kind === 'function');
+        expect(
+          cg.getOutgoingEdges(remote!.node.id).some((e) => e.kind === 'calls' && e.target === obj!.node.id)
+        ).toBe(true);
         cg.close();
       } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });

@@ -497,8 +497,39 @@ export function detectLanguage(filePath: string, source?: string, overrides?: Re
 }
 
 /**
+ * A class/struct BASE CLAUSE — `struct Derived : Base {`, `class Foo final :
+ * public Bar, private Baz {`, `struct D : ns::B<T> {` — which is never valid
+ * C. In C the only thing that can follow `struct <tag>` is `{`, `;`, `*`, an
+ * identifier (declarator), or a closing `)`: a bit-field's `:` sits after a
+ * member NAME inside the body (`unsigned a : 3;`), a ternary's `:` is
+ * separated from the tag by `)` / `*` / a declarator (`sizeof(struct foo) :
+ * 0`), and a label such as `struct_end:` has no whitespace after `struct`. An
+ * optional access specifier / `virtual` after the colon and an optional
+ * `final` before it cover the spelled-out forms; the base may be scoped
+ * (`ns::Base`) and carry template arguments, and must be followed by the
+ * body's `{` or a `,` introducing the next base — prose like
+ * `struct timeval: seconds and microseconds` inside a string never has that
+ * terminator. Comments are stripped before the scan (see `looksLikeCpp`).
+ */
+const CPP_BASE_CLAUSE_RE =
+  /\b(?:class|struct)\s+\w+\s*(?:final\s*)?:\s*(?:(?:public|protected|private|virtual)\s+)*[A-Za-z_][\w:]*(?:\s*<[^{};]*>)?\s*[{,]/;
+
+/** Block and line comments, for a code-only scan. Lazy block match → linear. */
+const C_COMMENT_RE = /\/\*[\s\S]*?\*\/|\/\/[^\n]*/g;
+
+/**
  * Heuristic: does a .h file contain C++ constructs?
- * Checks the first ~8KB for patterns that are unique to C++ and never valid C.
+ *
+ * Two passes. The first checks the first ~8KB for patterns that are unique to
+ * C++ and never valid C. The second scans the FULL source for a class/struct
+ * base clause (`CPP_BASE_CLAUSE_RE`): a large header with a long C-compatible
+ * preamble — include guards, `#define`s, plain C typedefs — can put its only
+ * C++ signal past the sample, and the cost of that miss is the C extractor
+ * (classTypes: []) dropping the derived type entirely and minting a phantom
+ * `function Base` from the base clause instead (#1592). The base-clause regex
+ * is anchored on a `struct`/`class` keyword followed by a tag and a colon, a
+ * shape with no C reading, so widening it to the whole file cannot drag a C
+ * header over to C++.
  */
 function looksLikeCpp(source: string): boolean {
   const sample = source.substring(0, 8192);
@@ -511,7 +542,15 @@ function looksLikeCpp(source: string): boolean {
   // routed through the C extractor (which extracts no classes), and its class
   // definition silently vanishes. The two-token shape (`<KW> <MACRO> <Name>`
   // before a `[:{]`) never occurs in valid C, so this can't misclassify C headers.
-  return /\bnamespace\b|\bclass\s+\w+\s*[:{]|\b(?:class|struct)\s+[A-Z][A-Z0-9_]+\s+\w+\s*(?:final\s*)?[:{]|\btemplate\s*<|\b(?:public|private|protected)\s*:|\bvirtual\b|\busing\s+(?:namespace\b|\w+\s*=)/.test(sample);
+  if (/\bnamespace\b|\bclass\s+\w+\s*[:{]|\b(?:class|struct)\s+[A-Z][A-Z0-9_]+\s+\w+\s*(?:final\s*)?[:{]|\btemplate\s*<|\b(?:public|private|protected)\s*:|\bvirtual\b|\busing\s+(?:namespace\b|\w+\s*=)/.test(sample)) {
+    return true;
+  }
+  // Plain `struct Derived : Base` (no export macro, no `class` keyword, no
+  // explicit access section) — the #1159 branch above only recognizes the
+  // macro-annotated form. Scanned over the whole file, not the sample, with
+  // comments removed so a doc comment's prose (`struct foo: x, y`) can't
+  // flip a C header.
+  return CPP_BASE_CLAUSE_RE.test(source.replace(C_COMMENT_RE, ' '));
 }
 
 /**
@@ -520,6 +559,19 @@ function looksLikeCpp(source: string): boolean {
 function looksLikeObjc(source: string): boolean {
   const sample = source.substring(0, 8192);
   return /@(?:interface|implementation|protocol|synthesize)\b/.test(sample);
+}
+
+/**
+ * Whether a language has a tree-sitter grammar of its own.
+ *
+ * Narrower than {@link isLanguageSupported}, which also answers true for the
+ * formats handled by custom extractors (SFCs, Liquid, Razor, YAML, XML,
+ * properties) — those have extraction but no grammar, so anything that needs to
+ * PARSE the file (the viewer's syntax classification, for one) has to ask this
+ * instead.
+ */
+export function hasTreeSitterGrammar(language: string | undefined | null): boolean {
+  return !!language && language in WASM_GRAMMAR_FILES;
 }
 
 /**
