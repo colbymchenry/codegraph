@@ -201,7 +201,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Symbols, tests and the viewer
 
-- **A name imported from a package no longer fuzzy-matches a project symbol.** `import { scan } from 'rolldown/experimental'` names a symbol that is not in the graph at all, but the fuzzy fallback matched it by name anyway — in that case onto the importing file's own `scan`, a self-edge. Fuzzy matching now declines when the call site's binding is a bare specifier (a builtin or an npm package); relative, alias and workspace imports still fall through, and only JS/TS is affected, since elsewhere a project's own modules are imported by absolute name too. On vite this removed 4 wrong edges and added none. Re-index after upgrading.
+- **A name imported from a package no longer fuzzy-matches a project symbol.** `import type { EvaluatedModules } from 'vite/module-runner'` names a symbol that is not in the graph at all, but the fuzzy fallback matched it by name anyway — and the match is case-insensitive, so on vitest it landed on the unrelated method `VitestMocker::evaluatedModules`. Fuzzy matching now declines when the call site's binding is a bare specifier (a builtin or an npm package); relative, alias, workspace and `link:`/`file:` imports still fall through, and only JS/TS is affected, since elsewhere a project's own modules are imported by absolute name too. Across vitest, svelte, vite and rollup this removed 46 wrong edges and added none. Re-index after upgrading.
 
 - **Files under an `e2e/` directory count as tests.** Their calls no longer appear as production callers in Steps, dead-code and test badges.
 
