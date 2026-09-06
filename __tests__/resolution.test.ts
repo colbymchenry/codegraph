@@ -5392,11 +5392,13 @@ in
     // playground resolved onto `playground/ssr-html/test-stacktrace.js::vite`
     // — `const vite = await createServer(…)` at module scope in a file with
     // zero exports — because exact-match commits whenever one candidate
-    // survives, and nothing asked whether an import could reach it. The three
-    // files below the sealed one are the classes that must NOT be filtered:
-    // a classic script (a top-level binding really is a reachable global), a
-    // CommonJS module, and an ESM file whose export is a later `export { … }`
-    // statement, which leaves `isExported` false on the declaration's node.
+    // survives, and nothing asked whether an import could reach it. Only
+    // `sealed.js` may be filtered; every other file here is a class that must
+    // NOT be — a classic script (a top-level binding really is a reachable
+    // global), a CommonJS module, one exporting through `exports["x"]`, an ESM
+    // file whose export is a later `export { … }` statement (which leaves
+    // `isExported` false on the declaration's node), and one contributing a
+    // name through `declare global` while exporting nothing of its own.
     let tmpDir: string;
     let cg: CodeGraph;
 
@@ -5463,53 +5465,82 @@ exports["bracketed"] = bracketed
 `
       );
       // A module with imports and no export of its own still contributes every
-      // name in `declare global` to every other file, and the extractor does
-      // emit nodes for them (a `var` and an `interface` here).
+      // name in `declare global` to every other file. `plain.ts` is the control
+      // that makes the assertion mean something: it is the same "import, no
+      // export" shape holding the same kind of declaration, so the pair differs
+      // only by the `declare global`, and an assertion on StrayFace alone would
+      // pass whatever the guard did.
       fs.writeFileSync(
         path.join(tmpDir, 'ambient.ts'),
         `import './later'
 
 declare global {
-  var strayVar: string
+  interface StrayFace {
+    a: number
+  }
 }
 `
       );
-      // Every name here is bound by a BARE import, so none resolves through the
-      // import resolver and all of them fall through to exact name matching.
+      fs.writeFileSync(
+        path.join(tmpDir, 'plain.ts'),
+        `import './later'
+
+interface HiddenFace {
+  a: number
+}
+
+const unused: HiddenFace = { a: 1 }
+`
+      );
+      // A type annotation is the reference here, so this consumer must be .ts.
+      fs.writeFileSync(
+        path.join(tmpDir, 'consumer.ts'),
+        `const face: StrayFace = { a: 1 }
+const hidden: HiddenFace = { a: 2 }
+
+export function use(): number {
+  return face.a + hidden.a
+}
+`
+      );
+      // Nothing here is bound by an import, so every name is a free reference
+      // that falls through to exact name matching — the path this rule sits on.
+      // A bare import would reach that path too, but a bare specifier names a
+      // package outside the graph, so no project node is the right target for
+      // it and such a fixture would assert a resolution nothing should make.
       fs.writeFileSync(
         path.join(tmpDir, 'consumer.js'),
-        `import { widget, gadget, helper, parser, bracketed, strayVar } from 'some-external-pkg'
-
-widget()
+        `widget()
 gadget()
 helper()
 parser()
 bracketed()
-console.log(strayVar)
 `
       );
 
       cg = await CodeGraph.init(tmpDir, { index: true });
       cg.resolveReferences();
 
-      // Incoming edges rather than callers, so a non-callable node (the ambient
-      // `var`) is asked the same question as the functions.
-      const reachedFromConsumer = (name: string): boolean => {
+      // Incoming edges rather than callers, so the interfaces are asked the
+      // same question as the functions: a type annotation is a reference, not
+      // a call.
+      const reachedFrom = (consumer: string, name: string): boolean => {
         const target = cg
           .searchNodes(name, { limit: 10 })
-          .find((r) => r.node.name === name && r.node.filePath !== 'consumer.js');
+          .find((r) => r.node.name === name && r.node.filePath !== consumer);
         expect(target, `no node named ${name}`).toBeDefined();
         return cg
           .getIncomingEdges(target!.node.id)
-          .some((e) => cg.getNode(e.source)?.filePath === 'consumer.js');
+          .some((e) => cg.getNode(e.source)?.filePath === consumer);
       };
 
-      expect(reachedFromConsumer('widget')).toBe(false);
-      expect(reachedFromConsumer('gadget')).toBe(true);
-      expect(reachedFromConsumer('helper')).toBe(true);
-      expect(reachedFromConsumer('parser')).toBe(true);
-      expect(reachedFromConsumer('bracketed')).toBe(true);
-      expect(reachedFromConsumer('strayVar')).toBe(true);
+      expect(reachedFrom('consumer.js', 'widget')).toBe(false);
+      expect(reachedFrom('consumer.js', 'gadget')).toBe(true);
+      expect(reachedFrom('consumer.js', 'helper')).toBe(true);
+      expect(reachedFrom('consumer.js', 'parser')).toBe(true);
+      expect(reachedFrom('consumer.js', 'bracketed')).toBe(true);
+      expect(reachedFrom('consumer.ts', 'StrayFace')).toBe(true);
+      expect(reachedFrom('consumer.ts', 'HiddenFace')).toBe(false);
     }, 30000);
   });
 });
