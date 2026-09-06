@@ -437,7 +437,22 @@ function isBoundToBareImport(ref: UnresolvedRef, context: ResolutionContext): bo
   if (aliases?.patterns.some((p) => source.startsWith(p.prefix))) return false;
   const workspaces = context.getWorkspacePackages?.();
   if (workspaces && resolveWorkspaceImport(source, workspaces)) return false;
+  // A `link:` / `file:` dependency is a directory in the project that no
+  // workspace glob need cover, so the workspace map above cannot see it:
+  // vitest imports `@vitest/bundled-lib` from `test/browser/bundled-lib`,
+  // which its `test/*` globs stop short of. The name is local even though it
+  // is spelled exactly like a scoped registry package.
+  if (workspaces?.localLinkNames?.has(packageNameOf(source))) return false;
   return true;
+}
+
+/**
+ * The package a specifier names, without its subpath: `@scope/pkg/sub` →
+ * `@scope/pkg`, `pkg/sub` → `pkg`. Scoped names keep two segments.
+ */
+function packageNameOf(source: string): string {
+  const parts = source.split('/');
+  return source.startsWith('@') ? parts.slice(0, 2).join('/') : parts[0]!;
 }
 
 /**
