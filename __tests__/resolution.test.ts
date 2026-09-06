@@ -5386,4 +5386,95 @@ in
       expect(importedFilePaths('main.nix')).toEqual([]);
     });
   });
+
+  describe('Bindings in a module that exports nothing (#1719)', () => {
+    // On vitejs/vite, every `import { defineConfig } from 'vite'` across the
+    // playground resolved onto `playground/ssr-html/test-stacktrace.js::vite`
+    // — `const vite = await createServer(…)` at module scope in a file with
+    // zero exports — because exact-match commits whenever one candidate
+    // survives, and nothing asked whether an import could reach it. The three
+    // files below the sealed one are the classes that must NOT be filtered:
+    // a classic script (a top-level binding really is a reachable global), a
+    // CommonJS module, and an ESM file whose export is a later `export { … }`
+    // statement, which leaves `isExported` false on the declaration's node.
+    let tmpDir: string;
+    let cg: CodeGraph;
+
+    afterEach(() => {
+      cg?.close();
+      if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it('drops them as cross-file candidates, and keeps scripts, CJS and later exports', async () => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1719-'));
+      fs.writeFileSync(
+        path.join(tmpDir, 'sealed.js'),
+        `import fsp from 'node:fs/promises'
+
+function widget() {
+  return fsp
+}
+
+widget()
+`
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'script.js'),
+        `function gadget() {
+  return 1
+}
+`
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'cjs.js'),
+        `import osp from 'node:os'
+
+function helper() {
+  return osp
+}
+
+module.exports = { helper }
+`
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'later.js'),
+        `import pathp from 'node:path'
+
+function parser() {
+  return pathp
+}
+
+export { parser }
+`
+      );
+      // Every name here is bound by a BARE import, so none resolves through the
+      // import resolver and all four fall through to exact name matching.
+      fs.writeFileSync(
+        path.join(tmpDir, 'consumer.js'),
+        `import { widget, gadget, helper, parser } from 'some-external-pkg'
+
+widget()
+gadget()
+helper()
+parser()
+`
+      );
+
+      cg = await CodeGraph.init(tmpDir, { index: true });
+      cg.resolveReferences();
+
+      const calledFromConsumer = (name: string): boolean => {
+        const target = cg
+          .searchNodes(name, { limit: 10 })
+          .find((r) => r.node.name === name && r.node.filePath !== 'consumer.js');
+        expect(target, `no node named ${name}`).toBeDefined();
+        return cg.getCallers(target!.node.id).some((c) => c.node.filePath === 'consumer.js');
+      };
+
+      expect(calledFromConsumer('widget')).toBe(false);
+      expect(calledFromConsumer('gadget')).toBe(true);
+      expect(calledFromConsumer('helper')).toBe(true);
+      expect(calledFromConsumer('parser')).toBe(true);
+    }, 30000);
+  });
 });
