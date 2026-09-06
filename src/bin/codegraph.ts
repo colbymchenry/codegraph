@@ -1257,6 +1257,57 @@ program
   });
 
 /**
+ * codegraph sessions <words...>
+ *
+ * The CLI face of the codegraph_sessions MCP tool: full-text search over the
+ * agent-session transcripts that belong to the project (Claude Code's
+ * ~/.claude/projects/<slug>/), refreshed on every call. Same text as the tool
+ * so a subagent without MCP gets the same answer through the shell.
+ */
+program
+  .command('sessions <words...>')
+  .description('Search the project\'s agent-session transcripts: what an earlier session asked, decided or was told (same output as the codegraph_sessions MCP tool)')
+  .option('-p, --path <path>', 'Project path')
+  .option('-l, --limit <number>', 'Maximum hits', '10')
+  .option('-r, --role <role>', 'Only user, assistant or summary docs')
+  .option('--since <days>', 'Only docs from the last N days')
+  .option('--session <id-prefix>', 'Only one session (id prefix)')
+  .option('--any', 'OR the words instead of requiring all of them')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (words: string[], options: { path?: string; limit?: string; role?: string; since?: string; session?: string; any?: boolean; json?: boolean }) => {
+    const projectPath = resolveProjectPath(options.path);
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+      const { querySessions, formatSessionHits, NoSessionsError } = await import('../sessions');
+      const sinceDays = Number(options.since);
+      const query = words.join(' ');
+      let result;
+      try {
+        result = querySessions(projectPath, query, {
+          limit: parseInt(options.limit || '10', 10),
+          role: options.role,
+          sinceIso: sinceDays > 0 ? new Date(Date.now() - sinceDays * 86_400_000).toISOString() : undefined,
+          session: options.session,
+          any: options.any,
+        });
+      } catch (err) {
+        if (err instanceof NoSessionsError) {
+          info(err.message);
+          return;
+        }
+        throw err;
+      }
+      console.log(options.json ? JSON.stringify(result, null, 2) : formatSessionHits(query, result));
+    } catch (err) {
+      error(`Sessions search failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
  * codegraph context <task...>
  *
  * The CLI face of the public `buildContext` API (ContextBuilder): FTS entry

@@ -12,10 +12,11 @@
  *   - Anti-patterns (don't re-verify with grep; don't hand-reconstruct flows)
  *
  * Keep it tight. The agent reads this every session — long instructions
- * burn tokens. The DEFAULT MCP surface is `codegraph_explore` ALONE (see
- * DEFAULT_MCP_TOOLS in tools.ts) — reference only that tool here. The other
- * tools (node/search/callers/…) stay defined and are re-enablable via
- * CODEGRAPH_MCP_TOOLS, but they are NOT listed to agents, so don't name them.
+ * burn tokens. The DEFAULT MCP surface is `codegraph_explore` plus
+ * `codegraph_sessions` (see DEFAULT_MCP_TOOLS in tools.ts) — reference only
+ * those here. The other tools (node/search/callers/…) stay defined and are
+ * re-enablable via CODEGRAPH_MCP_TOOLS, but they are NOT listed to agents, so
+ * don't name them.
  */
 export const SERVER_INSTRUCTIONS = `# Codegraph — code intelligence over an indexed knowledge graph
 
@@ -31,9 +32,9 @@ verbatim source PLUS who calls it and what it affects, so you edit with the
 blast radius in view. More accurate context, in far fewer tokens and
 round-trips than reading files yourself.
 
-## One tool: codegraph_explore — use it instead of reading files
+## The code tool: codegraph_explore — use it instead of reading files
 
-There is a single tool, \`codegraph_explore\`, and it is Read-equivalent. It
+For code there is one tool, \`codegraph_explore\`, and it is Read-equivalent. It
 takes either a natural-language question or a bag of symbol/file names and
 returns the **verbatim, line-numbered source** of the relevant symbols
 grouped by file — the same \`<n>\\t<line>\` shape \`Read\` gives you, safe to
@@ -55,6 +56,7 @@ calls; a grep/read exploration is dozens.
 - **"How does X reach/become Y? / the flow / the path from X to Y"** → \`codegraph_explore\`, naming the symbols that span the flow (e.g. \`mutateElement renderScene\`) — it surfaces the call path among them, riding dynamic-dispatch hops, and returns their source.
 - **Reading or editing a file/symbol you can name** → put its name or file path in the \`codegraph_explore\` query — it returns that current line-numbered source (safe to \`Edit\` from) with the call path and blast radius attached, so you don't Read it separately. For an overloaded name it returns every matching definition's body in one call.
 - **Need more?** Call \`codegraph_explore\` again with more specific names — treat the source it returns as already Read.
+- **"Why is this like this? What did the last session decide / try / get told about X?"** → \`codegraph_sessions\` with a few words. It searches the prose of this project's earlier agent sessions (prompts, replies, compaction summaries — stemmed, ranked) and names the session each hit came from. History and rationale live there, not in the code; do not grep transcript files by hand.
 
 ## Anti-patterns
 

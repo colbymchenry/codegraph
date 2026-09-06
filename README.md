@@ -593,6 +593,7 @@ codegraph ui [path]               # Open the browser viewer for an indexed proje
 codegraph unlock [path]           # Remove a stale lock file that's blocking indexing
 codegraph query <search>          # Search symbols (--kind, --limit, --json)
 codegraph explore <query>         # Relevant symbols' source + call paths in one shot (same output as the codegraph_explore MCP tool)
+codegraph sessions <words>        # Search the project's earlier agent sessions (--role, --since, --session, --any, --json; same output as codegraph_sessions)
 codegraph node <symbol|file>      # One symbol's source + callers, or read a file with line numbers (same output as codegraph_node)
 codegraph files [path]            # Show file structure (--format, --filter, --max-depth, --json)
 codegraph callers <symbol>        # Find what calls a function/method (--limit, --json)
@@ -638,11 +639,12 @@ fi
 
 ## MCP Tools
 
-When running as an MCP server, CodeGraph exposes a **single tool** — `codegraph_explore`. Measured agent behavior showed that one strong tool steers agents better than a menu of narrower ones — fewer mis-picks, and it saves context every session:
+When running as an MCP server, CodeGraph exposes **one tool for code** — `codegraph_explore` — and one for the project's own history — `codegraph_sessions`. Measured agent behavior showed that one strong code tool steers agents better than a menu of narrower ones — fewer mis-picks, and it saves context every session:
 
 | Tool | Purpose |
 |------|---------|
 | `codegraph_explore` | Answer almost any question in one call — "how does X work", a flow ("how does X reach Y"), or surveying an area — returning the relevant symbols' verbatim source grouped by file, plus the call paths between them and a blast-radius summary. Surfaces dynamic-dispatch hops (callbacks, React re-render, interface→impl) grep can't follow. Name a file or symbol in the query to read its current line-numbered source, the same shape the Read tool gives you. |
+| `codegraph_sessions` | Answer "why is this like this?", "what did the last session decide about X?", "did we already try Y?" — full-text search (stemmed, BM25-ranked) over the prose of the project's earlier agent sessions: prompts, replies and compaction summaries, never tool traffic. Reads Claude Code's transcripts for the project (`~/.claude/projects/<slug>/`) into `.codegraph/sessions.db`, refreshed on each call for files that changed. Each hit names its session, role, time and the matching passage. Set `"sessions": false` in `codegraph.json` to opt a project out; `CODEGRAPH_SESSIONS_DIR` points it at another transcript directory. |
 
 The other tools (`codegraph_node`, `codegraph_search`, `codegraph_callers`, `codegraph_callees`, `codegraph_impact`, `codegraph_files`, `codegraph_status`) stay fully functional but **unlisted by default** — everything they return already arrives inline on `codegraph_explore` (its blast-radius section, the relationship map, a symbol's body as its callee list). Re-enable any of them for the MCP surface with the `CODEGRAPH_MCP_TOOLS` environment variable (e.g. `CODEGRAPH_MCP_TOOLS=explore,node,search,callers`), or use their CLI equivalents (`codegraph node` / `query` / `callers` / `callees` / `impact` / `files` / `status`).
 
