@@ -107,12 +107,23 @@ describe('MCP initialize handshake (issue #172)', () => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-init-'));
   });
 
-  afterEach(() => {
-    if (child && !child.killed) {
-      child.kill('SIGKILL');
+  afterEach(async () => {
+    // A signalled child still holds its file handles until it is actually gone,
+    // and Windows refuses to remove a directory holding an open file — so wait
+    // for the exit, rather than only sending the signal.
+    if (child) {
+      const proc = child;
       child = null;
+      if (proc.exitCode === null && proc.signalCode === null) {
+        await new Promise<void>((resolve) => {
+          proc.once('exit', () => resolve());
+          proc.kill('SIGKILL');
+        });
+      }
     }
-    fs.rmSync(tempDir, { recursive: true, force: true });
+    // The server may have started a detached daemon this suite does not track,
+    // so retry the removal while any straggler releases the directory.
+    fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   });
 
   it('responds to initialize quickly when no .codegraph exists in cwd', async () => {

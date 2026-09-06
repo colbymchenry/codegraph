@@ -193,10 +193,25 @@ describe('Shared MCP daemon (issue #411)', () => {
     const daemonPid = readLockPid(realRoot);
     if (daemonPid && daemonPid !== process.pid && isAlive(daemonPid)) {
       try { process.kill(daemonPid, 'SIGKILL'); } catch { /* race */ }
+      await waitProcessExit(daemonPid, 5000);
     }
-    await new Promise((r) => setTimeout(r, 50));
+    // A signalled process still holds its file handles until it is actually
+    // gone, and Windows refuses to remove a directory holding an open file — so
+    // wait for each exit rather than for a fixed grace period.
+    await Promise.all(
+      servers.map(({ child }) =>
+        child.exitCode === null && child.signalCode === null
+          ? new Promise<void>((r) => child.once('exit', () => r()))
+          : Promise.resolve()
+      )
+    );
     servers.length = 0;
-    fs.rmSync(tempDir, { recursive: true, force: true });
+    // These tests deliberately leave a detached daemon alive, and a losing
+    // launcher can leave a candidate of its own mid-exit; either still holds
+    // the directory for a moment after the pid above is gone. Windows will not
+    // remove a directory holding an open file, so retry for a few seconds
+    // rather than assume the handles are released the instant the pid is.
+    fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 60, retryDelay: 100 });
   });
 
   it('two invocations share ONE detached daemon; both attach as proxies', async () => {
