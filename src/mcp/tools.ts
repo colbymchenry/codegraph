@@ -957,14 +957,24 @@ function collectDocSeeds(cg: CodeGraph, query: string, maxFiles = 2): DocSeed[] 
     // A heading is also named when the query covers every significant word of
     // it ("Backlog" for "the tracker backlog"): the two-term line rule cannot
     // see a one-word heading, and its rows rarely repeat the heading's word.
+    // Every term is path-zeroed when the query is just the file's name, and the
+    // weighted test below would then reject every heading. Presence stands in
+    // for weight in that case: the rarity signal is meaningless when there is
+    // only the one term, but "the query covers this heading" still is.
+    const anyWeighted = terms.some((t) => (weight.get(t) ?? 0) > 0);
     const coveredHeading = (name: string): number => {
-      const words = name.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 3 && !STOP_WORDS.has(w));
+      // DOC_QUERY_NOISE words are stripped from `terms`, so demanding them of a
+      // heading makes it uncoverable by any query at all ("Cloning the repo on
+      // Windows" can never have `repo` covered). Filtered on both sides or
+      // neither.
+      const words = name.toLowerCase().split(/[^a-z0-9]+/)
+        .filter((w) => w.length >= 3 && !STOP_WORDS.has(w) && !DOC_QUERY_NOISE.has(w));
       if (words.length === 0) return 0;
       let sum = 0;
       for (const w of words) {
-        const t = terms.find((q) => (weight.get(q) ?? 0) > 0 && w.includes(q));
+        const t = terms.find((q) => (anyWeighted ? (weight.get(q) ?? 0) > 0 : true) && w.includes(q));
         if (!t) return 0;
-        sum += weight.get(t) ?? 0;
+        sum += anyWeighted ? (weight.get(t) ?? 0) : 1;
       }
       return sum;
     };
@@ -993,8 +1003,18 @@ function collectDocSeeds(cg: CodeGraph, query: string, maxFiles = 2): DocSeed[] 
         matchLines: (lineHits.get(h.id) ?? []).sort((a, b) => b[1] - a[1] || a[0] - b[0]).map(([ln]) => ln),
         score: score.get(h.id) ?? 0,
       }));
-    if (sections.length === 0) continue;
-    seeds.push({ filePath: fp, named, hits, sections });
+    // A named file that scores no section still answers the question it was
+    // named in: `named` is what carries it past the two-hit file gate above,
+    // and dropping it here for want of a scoring line is the same file lost one
+    // layer later. Its opening sections are the best available answer — a user
+    // who types a filename has already said which file they want.
+    const chosen = sections.length > 0
+      ? sections
+      : named
+        ? headings.filter((h) => !isWrapper(h)).slice(0, 3).map((h) => ({ node: h, matchLines: [], score: 0 }))
+        : [];
+    if (chosen.length === 0) continue;
+    seeds.push({ filePath: fp, named, hits, sections: chosen });
   }
   seeds.sort((a, b) => (b.named ? 1 : 0) - (a.named ? 1 : 0) || b.hits - a.hits);
   // A second doc earns its slot only by matching as well as the first.
