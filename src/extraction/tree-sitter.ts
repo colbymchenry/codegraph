@@ -389,6 +389,41 @@ const LITERAL_RECEIVER_TYPES = new Set([
 ]);
 
 /**
+ * Languages whose member calls go through the TS/JS grammars.
+ */
+const TS_JS_CHAIN_LANGUAGES = new Set(['typescript', 'tsx', 'javascript', 'jsx']);
+
+/**
+ * Host objects a TS/JS project never declares: the browser, extension, and
+ * runtime namespaces, plus the builtin constructors whose statics are library
+ * calls. A member chain ROOTED at one of these ends in a platform API, so the
+ * bare method name the extractor used to emit for `chrome.storage.local.get(k)`
+ * or `document.body.querySelector(s)` could only ever exact-match an unrelated
+ * project symbol that happened to share the name (#1707). `window` is absent on
+ * purpose: `window.MyNamespace.doThing()` reaches a project symbol.
+ */
+const TS_JS_HOST_GLOBAL_ROOTS = new Set([
+  'chrome', 'browser', 'document', 'navigator', 'performance', 'console',
+  'localStorage', 'sessionStorage', 'indexedDB', 'crypto', 'globalThis',
+  'process', 'Math', 'JSON', 'Object', 'Array', 'Reflect', 'Promise', 'Intl',
+]);
+
+/** Receiver node types (TS/JS grammars) that continue a member chain downward. */
+const TS_JS_CHAIN_RECEIVER_TYPES = new Set(['member_expression', 'subscript_expression']);
+
+/**
+ * Root identifier of a TS/JS member chain — `chrome` for `chrome.storage.local`
+ * — or null when the chain bottoms out in a call, a literal, or `this`.
+ */
+function tsJsChainRoot(node: SyntaxNode, source: string): string | null {
+  let cur: SyntaxNode | null = node;
+  while (cur && TS_JS_CHAIN_RECEIVER_TYPES.has(cur.type)) {
+    cur = getChildByField(cur, 'object');
+  }
+  return cur && cur.type === 'identifier' ? getNodeText(cur, source) : null;
+}
+
+/**
  * React hooks that bind a NAME to a handler function (`const onPress =
  * useCallback(() => {…}, [])`). The arrow inside is extracted as a function
  * node named by the declarator — see `reactHookBoundName`.
@@ -4588,6 +4623,24 @@ export class TreeSitterExtractor {
               // Go receivers resolve strictly via validated field-hop
               // inference (see matchGoFieldChainCall) or stay unresolved.
               calleeName = `${getNodeText(receiver, this.source).replace(/\s+/g, '')}.${methodName}`;
+            } else if (
+              TS_JS_CHAIN_LANGUAGES.has(this.language) &&
+              receiver &&
+              TS_JS_CHAIN_RECEIVER_TYPES.has(receiver.type) &&
+              TS_JS_HOST_GLOBAL_ROOTS.has(tsJsChainRoot(receiver, this.source) ?? '')
+            ) {
+              // TS/JS member call reached through a host namespace —
+              // `chrome.storage.local.get(key)`, `document.body.querySelector(s)`.
+              // The bare method name this used to emit exact-matched whatever
+              // project symbol shared it: every `chrome.storage.local.get/set`
+              // in a storage wrapper bound to the wrapper's own `get`/`set`,
+              // a self-edge not in the source (#1707). Emit nothing: a silent
+              // miss, never a wrong edge. A chain rooted at a project value
+              // (`window.MyNs.run()`, `store.getState().act()`, `ref.value.m()`)
+              // keeps the bare name — those targets are real, and dropping them
+              // would cost far more recall than the mis-bind costs precision.
+              // Mirrored in the kernel's extract_call (tsjs/extractors.rs).
+              return;
             } else {
               calleeName = methodName;
             }
