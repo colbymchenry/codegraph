@@ -467,7 +467,9 @@ function isSealedModule(filePath: string, context: ResolutionContext): boolean {
  * Whether `candidate` can be named by a reference in `ref`'s file at all.
  * Applied by BOTH name-based strategies: declining in exact-match alone just
  * hands the same wrong target to matchFuzzy, which resolves a unique candidate
- * on its own at confidence 0.5.
+ * on its own at confidence 0.5. It filters the candidate set in
+ * `matchByExactName`, whose ambiguity handling ranks a crowd rather than
+ * declining it, and tests only the survivor in `matchFuzzy`, whose does.
  */
 function isCrossFileReachable(
   candidate: Node,
@@ -2510,7 +2512,7 @@ export function matchFuzzy(
   // Filter to callable kinds only (function, method, class)
   const callableKinds = new Set(['function', 'method', 'class']);
   const callableCandidates = applyLanguageGate(
-    candidates.filter((n) => callableKinds.has(n.kind) && isCrossFileReachable(n, ref, context)),
+    candidates.filter((n) => callableKinds.has(n.kind)),
     ref
   );
 
@@ -2518,7 +2520,10 @@ export function matchFuzzy(
   const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);
   const finalCandidates = sameLanguageCandidates.length > 0 ? sameLanguageCandidates : callableCandidates;
 
-  if (finalCandidates.length === 1) {
+  // The sealed-module test rejects the survivor, and never filters the set that
+  // produced it (#1719): removing a sealed candidate from a crowd would leave a
+  // lone one and manufacture a 0.5 guess out of an ambiguity fuzzy declines.
+  if (finalCandidates.length === 1 && isCrossFileReachable(finalCandidates[0]!, ref, context)) {
     const isCrossLanguage = finalCandidates[0]!.language !== ref.language;
     return {
       original: ref,
