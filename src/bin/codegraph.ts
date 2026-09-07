@@ -2442,6 +2442,9 @@ program
         /\/tests?\//,
         /\/e2e\//,
         /\/spec\//,
+        // Perl marks tests by EXTENSION, not by a name segment: `prove` runs
+        // `t/*.t`. Without this, no Perl project ever reports an affected test.
+        /\.t$/,
       ];
 
       // Custom filter pattern
