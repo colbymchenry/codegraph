@@ -1859,6 +1859,36 @@ export function matchMethodCall(
     return matchRustSelfFieldCall(objectOrClass!.slice('self.'.length), methodName!, ref, context);
   }
 
+  // Python call through an attribute chain — `self.data.append(x)`,
+  // `cfg.client.get(url)` — emitted as `self.data.append` since #66 kept the
+  // receiver's text instead of collapsing it to a bare method name. EXCLUSIVE
+  // for the same reason as Go and Rust above: the inference block ran already
+  // and `resolveMethodOnType` validated whatever it found, so everything past
+  // this point is the bare-name fallback. That fallback is what bound
+  // `self.data.append(1)` to an unrelated class's `append` — the receiver is a
+  // plain list, and nothing about the call says so.
+  //
+  // This DOES cost some recall, and the cost is measured rather than waved at.
+  // Indexing the tracked `.py` of four real projects, three were unchanged
+  // (278 / 643 / 301 call edges) and a 249-file one went 2605 -> 2564: of the 41
+  // edges dropped, 38 were fabrications (21 x a dict `.update` bound to a
+  // service's `update`; 16 x application code bound to a `get` defined in a TEST
+  // file; `self._model.transcribe` on an external Whisper model bound to the
+  // file's own `transcribe`) and 3 were genuine `self._capture.stop()` hops onto
+  // the class the constructor assigns. Those 3 are recoverable — python names an
+  // attribute's type in the class body (`self.x: T`, `self.x = T()`, a typed
+  // `__init__` parameter, a class-level annotation, a base class) and reading it
+  // properly needs the AST, not a scan of the class's source lines: a first
+  // attempt at the latter took types out of docstrings and nested classes and
+  // turned a correct edge into a wrong one. Until that exists, this shape is a
+  // silent miss, which is the trade this file makes everywhere else.
+  //
+  // A single-segment receiver (`obj.method`) is untouched — it still reaches the
+  // strategies below, where a receiver/name overlap is real evidence.
+  if (ref.language === 'python' && dotMatch && objectOrClass!.includes('.')) {
+    return null;
+  }
+
   // Java/Kotlin: receiver may be a field whose name doesn't match the type by
   // Java naming convention (`userbo` → class `UserBO`, abbreviated). Look up
   // the field in the enclosing class to get its declared type, then resolve
