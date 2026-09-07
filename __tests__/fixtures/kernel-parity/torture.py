@@ -47,3 +47,13 @@ def shadowed():
 
 handlers = {"recv": target_cb}
 callbacks = [target_cb, view]
+
+
+def fabrication_shapes(rows_by_file, key):
+    # Non-identifier receivers (#66): attribute chain, subscript, and call
+    # chain. Each must keep its receiver text as a qualifier — a bare
+    # `append`/`get` exact-matches an unrelated project function of that name.
+    rows_by_file.setdefault(key, []).append({"x": 1})
+    rows_by_file[key].append(2)
+    rows_by_file[key].get(key, None)
+    return rows_by_file

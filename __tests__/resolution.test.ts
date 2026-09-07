@@ -1504,6 +1504,60 @@ def external_caller():
       expect(externalCalls).toHaveLength(0);
     });
 
+    it('resolves a module-qualified call to a function whose name collides with a builtin collection method, and does not fabricate one from an unrelated chained receiver (#66)', async () => {
+      // `ledger.append(row)` (module imported, method name `append`) previously
+      // never reached resolution: isBuiltInOrExternal's Python built-in-method
+      // filter treated ANY `x.append(...)` as `list.append` unless `X` matched a
+      // known CLASS, so a real MODULE export named `append` was dropped before
+      // resolveViaImport ever ran. Separately, `d.setdefault(k, []).append(x)` —
+      // a non-identifier (call-chain) receiver — degraded at extraction time to
+      // a BARE `append` ref, which then exact-matched ledger.py's `append` as
+      // the only project-wide symbol of that name, fabricating a call edge.
+      fs.writeFileSync(
+        path.join(tempDir, 'ledger.py'),
+        'def append(row):\n    return True\n\n\ndef path():\n    return "ledger.jsonl"\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'record.py'),
+        `from . import ledger
+
+
+def add_outcome(row):
+    if not ledger.append(row):
+        return None
+    return ledger.path()
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'unrelated.py'),
+        `def build_map():
+    rows_by_file = {}
+    rows_by_file.setdefault("f", []).append({"x": 1})
+    return rows_by_file
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const ledgerAppend = cg
+        .getNodesByKind('function')
+        .find((n) => n.name === 'append' && n.filePath.replace(/\\/g, '/') === 'ledger.py');
+      expect(ledgerAppend).toBeDefined();
+
+      // The real, import-qualified call must resolve.
+      const addOutcome = cg.getNodesByKind('function').find((n) => n.name === 'add_outcome');
+      expect(addOutcome).toBeDefined();
+      const addOutcomeCalls = cg.getOutgoingEdges(addOutcome!.id).filter((e) => e.kind === 'calls');
+      expect(addOutcomeCalls.map((e) => e.target)).toContain(ledgerAppend!.id);
+
+      // The unrelated dict/list `.append()` on a chained receiver must NOT
+      // fabricate an edge to ledger.py's append.
+      const buildMap = cg.getNodesByKind('function').find((n) => n.name === 'build_map');
+      expect(buildMap).toBeDefined();
+      const buildMapCalls = cg.getOutgoingEdges(buildMap!.id).filter((e) => e.kind === 'calls');
+      expect(buildMapCalls.map((e) => e.target)).not.toContain(ledgerAppend!.id);
+    });
+
     it('attaches Go methods to their receiver type across files (#583, cross-file half)', async () => {
       // In Go a type's methods are commonly declared in a different file from the
       // `type` declaration (`type Box` in box.go, `func (b *Box) Get()` in

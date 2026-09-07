@@ -215,6 +215,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Fixed a long-running `codegraph ui` session serving a symbol that a sync had already deleted. The viewer keeps one connection to your index open, and its in-memory lookup didn't notice when another process — your agent's sync, or `codegraph sync` — rewrote the file underneath it, so a symbol screen could keep showing a body with no callers while search correctly reported it had moved. Because a symbol's identity includes the line it starts on, this happened after almost any edit above it.
 
+#### Language and framework accuracy
+
+- **Python calls into one of your own modules are no longer mistaken for built-ins.** A call like `ledger.append(row)`, where `ledger` is a module in your project that exports a function named `append`, was silently dropped as if it were a plain list method — so that function showed no callers and the flow through it stopped. Calls made through an attribute or a chained expression (`self.data.append(x)`) also no longer latch onto an unrelated function that merely shares the method's name, which had invented callers that don't exist. Calls through a module you did not write — `os.remove(path)`, `requests.get(url)` — stay out of the graph as before, instead of latching onto a method of your own that happens to share the name.
+
 ## [1.6.0] - 2026-08-26
 
 ### Highlights

@@ -4588,6 +4588,18 @@ export class TreeSitterExtractor {
               // Go receivers resolve strictly via validated field-hop
               // inference (see matchGoFieldChainCall) or stay unresolved.
               calleeName = `${getNodeText(receiver, this.source).replace(/\s+/g, '')}.${methodName}`;
+            } else if (this.language === 'python' && receiver) {
+              // Any other receiver shape — attribute chain (`self.data`), subscript
+              // (`d[k]`), call chain (`rows.setdefault(k, []).append(x)`) — previously
+              // fell through to a bare methodName. A bare name matching a common
+              // list/dict/str method (`append`, `get`, `update`, ...) can exact-match
+              // an unrelated top-level project function sharing that name, fabricating
+              // a call edge (#66, same class as #1230/#1276). Keep the receiver's
+              // source text as a qualifier so the ref can only resolve through
+              // import/module-member resolution, never the bare-name fallback; an
+              // unresolvable qualifier is a silent miss, never a wrong edge.
+              const receiverText = getNodeText(receiver, this.source).replace(/\s+/g, ' ').trim();
+              calleeName = receiverText ? `${receiverText}.${methodName}` : methodName;
             } else {
               calleeName = methodName;
             }
