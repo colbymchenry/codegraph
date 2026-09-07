@@ -2531,19 +2531,32 @@ function pythonTypeClass(
   // `from kinds import Real as R` — the class is declared under its EXPORTED
   // name, not the local one.
   const wantName = imp.exportedName === '*' ? typeName : imp.exportedName;
-  const inFile = (file: string) =>
-    classesNamed(wantName).filter((c) => c.filePath.replace(/\\/g, '/') === file);
+  const inFile = (file: string, name: string = wantName) =>
+    classesNamed(name).filter((c) => c.filePath.replace(/\\/g, '/') === file);
   let hit = inFile(norm);
   if (hit.length === 0 && /\/__init__\.pyi?$/.test(norm)) {
     // `from pkg import Client` where `pkg/__init__.py` re-exports it — the
     // dominant python package idiom. One hop only, through the package's OWN
     // import of that name, so the answer is still a module the source names.
+    //
+    // Every rule the top level applies applies HERE TOO. Leaving them off was
+    // this feature's recurring defect — a rule enforced at one site and not the
+    // sibling one level down — and here it was the worse half: the top level
+    // has an agreement rule that absorbs a bogus binding by refusing both, the
+    // hop has nothing, so a commented-out or docstring import was the SOLE
+    // binding and silently decided the edge.
+    const liveThere = livePythonImportSources(norm, context);
     const reexport = context
       .getImportMappings(norm, ref.language)
-      .filter((i) => i.localName === wantName);
-    if (new Set(reexport.map((i) => i.source)).size === 1) {
-      const via = pythonModuleFile(reexport[0]!.source, { ...ref, filePath: norm }, context);
-      if (via) hit = inFile(via);
+      .filter((i) => i.localName === wantName && (liveThere === null || liveThere.has(i.source)));
+    // Keyed on source AND exported name, matching the top level: the weaker
+    // source-only key called two different re-exports of one name unambiguous.
+    if (new Set(reexport.map((i) => i.source + ' ' + i.exportedName)).size === 1) {
+      const hop = reexport[0]!;
+      const via = pythonModuleFile(hop.source, { ...ref, filePath: norm }, context);
+      // `from .core import Legacy as Client` — declared under the EXPORTED name
+      // in the module the package names, same as the top level's `wantName`.
+      if (via) hit = inFile(via, hop.exportedName === '*' ? wantName : hop.exportedName);
     }
   }
   return hit.length === 1 ? hit[0]! : null;

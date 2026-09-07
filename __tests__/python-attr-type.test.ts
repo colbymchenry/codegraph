@@ -443,6 +443,12 @@ describe('python self-attribute type inference', () => {
       'class Client:\n    def run(self, x):\n        return x\n'
     );
     fs.writeFileSync(path.join(tempDir, 'pkg', '__init__.py'), 'from pkg.core import Client\n');
+    // DISTRACTOR: a second project `Client.run`, so a bare-name fallback cannot
+    // reach the right target by single-candidate luck.
+    fs.writeFileSync(
+      path.join(tempDir, 'decoy.py'),
+      'class Client:\n    def run(self, x):\n        return x\n'
+    );
     box('from pkg import Client\n\n\nclass Box:\n    def __init__(self):\n        self.h = Client()\n\n'
       + '    def go(self, x):\n        return self.h.run(x)\n');
     cg = await CodeGraph.init(tempDir, { index: true });
@@ -451,6 +457,36 @@ describe('python self-attribute type inference', () => {
       cg.getOutgoingEdges(go.id).filter((e) => e.kind === 'calls')
         .map((e) => cg!.getNode(e.target)!.filePath.replace(/\\/g, '/'))
     ).toEqual(['pkg/core.py']);
+  });
+
+  /** `pkg/__init__.py` re-exporting by star, with a stale import beside it. */
+  const reexportPkg = (initBody: string) => {
+    fs.mkdirSync(path.join(tempDir, 'pkg'));
+    fs.writeFileSync(
+      path.join(tempDir, 'pkg', 'core.py'),
+      'class Client:\n    def run(self, x):\n        return x\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'decoy.py'),
+      'class Client:\n    def run(self, x):\n        return x\n'
+    );
+    fs.writeFileSync(path.join(tempDir, 'pkg', '__init__.py'), initBody);
+    box('from pkg import Client\n\n\nclass Box:\n    def __init__(self):\n        self.h = Client()\n\n'
+      + '    def go(self, x):\n        return self.h.run(x)\n');
+  };
+
+  it('a commented-out import in a package __init__ does not decide the re-export', async () => {
+    // The worse half of the missed-sibling defect: the top level has an
+    // agreement rule that refuses two disagreeing bindings, the hop has none.
+    // So the comment was the SOLE binding and picked the file.
+    reexportPkg('# from decoy import Client\nfrom pkg.core import *\n');
+    expect(await runCalls()).toEqual([]);
+  });
+
+  it('a docstring import in a package __init__ does not decide the re-export', async () => {
+    // `__init__.py` docstrings routinely show `from pkg.legacy import X` usage.
+    reexportPkg('"""Usage:\n\n    from decoy import Client\n"""\nfrom pkg.core import *\n');
+    expect(await runCalls()).toEqual([]);
   });
 
   it('a commented-out import does not cancel the real one', async () => {
