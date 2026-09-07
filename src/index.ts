@@ -1259,9 +1259,7 @@ export class CodeGraph {
    * - Framework-specific patterns (React, Express, Laravel)
    * - Import-based resolution
    * - Name-based symbol matching
-   */
-  /**
-   * Synchronous resolution for library callers.
+   *
    *
    * NOTE: this cannot warm the grammars the resolver reads member types from
    * (loading one is async), so a python attribute call like

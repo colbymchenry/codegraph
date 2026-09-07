@@ -2298,6 +2298,26 @@ function pythonModuleFile(
   for (const candidate of [`${stem}.py`, `${stem}/__init__.py`, `${stem}.pyi`]) {
     if (context.fileExists(candidate)) return candidate;
   }
+  // A package root that is not the repo root — `src/pkg/core.py` imported as
+  // `pkg.core`, the packaged-project default, plus `backend/` and monorepo
+  // subdirectories. Anchoring only at the repo root made every attribute edge
+  // in such a layout disappear.
+  //
+  // This is a SUFFIX match, which is what the previous version got wrong — but
+  // wrong because it tiebroke among survivors, not because it looked at
+  // suffixes. Exactly one survivor or nothing: `services/client.py` and
+  // `examples/services/client.py` both match `services/client` and so neither
+  // is the answer.
+  if (dots === 0 && rest) {
+    const wanted = [`/${rest}.py`, `/${rest}/__init__.py`, `/${rest}.pyi`];
+    const found: string[] = [];
+    for (const f of context.getAllFiles?.() ?? []) {
+      const fp = f.replace(/\\/g, '/');
+      if (wanted.some((w) => fp.endsWith(w))) found.push(fp);
+      if (found.length > 1) return null;
+    }
+    if (found.length === 1) return found[0]!;
+  }
   return null;
 }
 
@@ -2331,9 +2351,20 @@ function pythonTypeClass(
   context: ResolutionContext,
 ): Node | null {
   const here = ref.filePath.replace(/\\/g, '/');
+  // `getImportMappings` is a regex over raw text and strips no comments, so
+  // `# from legacy import Real` above a real import produces a second, always
+  // disagreeing binding — and the agreement rule below then refuses both.
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
+  const liveSources = new Set<string>();
+  for (const raw of lines) {
+    const hash = raw.indexOf('#');
+    const code = hash >= 0 ? raw.slice(0, hash) : raw;
+    const m = /^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))/.exec(code);
+    if (m) liveSources.add((m[1] ?? m[2])!);
+  }
   const bindings = context
     .getImportMappings(ref.filePath, ref.language)
-    .filter((i) => i.localName === typeName);
+    .filter((i) => i.localName === typeName && (liveSources.size === 0 || liveSources.has(i.source)));
 
   const classesNamed = (name: string) =>
     context.getNodesByName(name).filter((n) => n.kind === 'class' && n.language === 'python');
@@ -2353,9 +2384,22 @@ function pythonTypeClass(
 
   // `from kinds import Real as R` — the class is declared under its EXPORTED
   // name, not the local one.
-  const hit = classesNamed(imp.exportedName === '*' ? typeName : imp.exportedName).filter(
-    (c) => c.filePath.replace(/\\/g, '/') === norm,
-  );
+  const wantName = imp.exportedName === '*' ? typeName : imp.exportedName;
+  const inFile = (file: string) =>
+    classesNamed(wantName).filter((c) => c.filePath.replace(/\\/g, '/') === file);
+  let hit = inFile(norm);
+  if (hit.length === 0 && /\/__init__\.pyi?$/.test(norm)) {
+    // `from pkg import Client` where `pkg/__init__.py` re-exports it — the
+    // dominant python package idiom. One hop only, through the package's OWN
+    // import of that name, so the answer is still a module the source names.
+    const reexport = context
+      .getImportMappings(norm, ref.language)
+      .filter((i) => i.localName === wantName);
+    if (new Set(reexport.map((i) => i.source)).size === 1) {
+      const via = pythonModuleFile(reexport[0]!.source, { ...ref, filePath: norm }, context);
+      if (via) hit = inFile(via);
+    }
+  }
   return hit.length === 1 ? hit[0]! : null;
 }
 
@@ -2421,6 +2465,15 @@ function matchPythonSelfAttrCall(
   // Walked here rather than through `resolveMethodOnType` because the class is
   // already pinned to one file: the shared helper searches every class of that
   // NAME, which is the ambiguity this function exists to refuse.
+  // `getSupertypes` matches by NAME, so it unions the `extends` targets of every
+  // python class called `cls.name` — a class that inherits nothing would
+  // inherit its namesake's base. That is the same "two classes of a name is no
+  // evidence" rule this function enforces above, and I dropped it one level
+  // down. No unique receiver class, no walk.
+  const receivers = context
+    .getNodesByName(cls.name)
+    .filter((n) => n.kind === 'class' && n.language === 'python');
+  if (receivers.length !== 1) return null;
   const seen = new Set<string>([cls.name]);
   let frontier = [cls.name];
   for (let depth = 0; depth < 4 && frontier.length > 0; depth++) {

@@ -289,6 +289,75 @@ describe('python self-attribute type inference', () => {
     ).toEqual(['base.py']);
   });
 
+  it('a class that inherits nothing does not inherit its namesake\'s base', async () => {
+    // `getSupertypes` matches by NAME, so it unions the `extends` targets of
+    // every class called `Real`. `b/real.py`'s Real inherits nothing; without a
+    // unique receiver it was given `a/real.py`'s Base.
+    fs.mkdirSync(path.join(tempDir, 'a'));
+    fs.mkdirSync(path.join(tempDir, 'b'));
+    fs.writeFileSync(
+      path.join(tempDir, 'a', 'base.py'),
+      'class Base:\n    def zorp(self, x):\n        return x\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'a', 'real.py'),
+      'from a.base import Base\n\n\nclass Real(Base):\n    pass\n'
+    );
+    fs.writeFileSync(path.join(tempDir, 'b', 'real.py'), 'class Real:\n    pass\n');
+    box('from b.real import Real\n\n\nclass Box:\n    def __init__(self):\n        self.h = Real()\n\n'
+      + '    def go(self, x):\n        return self.h.zorp(x)\n');
+    expect(await runCalls()).toEqual([]);
+  });
+
+  it('resolves a package root that is not the repo root (src layout)', async () => {
+    // `src/pkg/core.py` imported as `pkg.core` — the packaged-project default.
+    // Anchoring only at the repo root made every such edge disappear.
+    fs.mkdirSync(path.join(tempDir, 'src'));
+    fs.mkdirSync(path.join(tempDir, 'src', 'pkg'));
+    fs.mkdirSync(path.join(tempDir, 'src', 'pkg', 'api'));
+    fs.writeFileSync(
+      path.join(tempDir, 'src', 'pkg', 'core.py'),
+      'class Client:\n    def run(self, x):\n        return x\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'src', 'pkg', 'api', 'box.py'),
+      'from pkg.core import Client\n\n\nclass Box:\n    def __init__(self):\n        self.h = Client()\n\n'
+        + '    def go(self, x):\n        return self.h.run(x)\n'
+    );
+    cg = await CodeGraph.init(tempDir, { index: true });
+    const go = cg.getNodesByKind('method').find((n) => n.name === 'go')!;
+    expect(
+      cg.getOutgoingEdges(go.id).filter((e) => e.kind === 'calls')
+        .map((e) => cg!.getNode(e.target)!.filePath.replace(/\\/g, '/'))
+    ).toEqual(['src/pkg/core.py']);
+  });
+
+  it('follows a re-export through a package __init__.py', async () => {
+    fs.mkdirSync(path.join(tempDir, 'pkg'));
+    fs.writeFileSync(
+      path.join(tempDir, 'pkg', 'core.py'),
+      'class Client:\n    def run(self, x):\n        return x\n'
+    );
+    fs.writeFileSync(path.join(tempDir, 'pkg', '__init__.py'), 'from pkg.core import Client\n');
+    box('from pkg import Client\n\n\nclass Box:\n    def __init__(self):\n        self.h = Client()\n\n'
+      + '    def go(self, x):\n        return self.h.run(x)\n');
+    cg = await CodeGraph.init(tempDir, { index: true });
+    const go = cg.getNodesByKind('method').find((n) => n.name === 'go')!;
+    expect(
+      cg.getOutgoingEdges(go.id).filter((e) => e.kind === 'calls')
+        .map((e) => cg!.getNode(e.target)!.filePath.replace(/\\/g, '/'))
+    ).toEqual(['pkg/core.py']);
+  });
+
+  it('a commented-out import does not cancel the real one', async () => {
+    // The mappings come from a regex with no comment stripping, so the
+    // agreement rule saw a disagreement that is not in the code.
+    writeKinds();
+    box('# from legacy import Real\nfrom kinds import Real\n\n\nclass Box:\n    def __init__(self):\n'
+      + '        self.h = Real()\n\n    def go(self, x):\n        return self.h.run(x)\n');
+    expect(await runCalls()).toEqual(['run@Real::run']);
+  });
+
   it('a factory call is not mistaken for a type', async () => {
     writeKinds();
     box('from kinds import Real\n\n\ndef make_client():\n    return Real()\n\n\n'
