@@ -2204,6 +2204,35 @@ export async function memberTypesForFile(absPath: string, language: Language, li
   return memberTypesInTree(cached.tree.rootNode, cached.source, line);
 }
 
+/**
+ * Synchronous {@link memberTypesInTree} over source the caller already has,
+ * reusing the same LRU tree cache. The resolver needs this — `matchMethodCall`
+ * cannot await, and it holds the file's text but not an absolute path.
+ *
+ * Like {@link guardsForFileSync} it serves only a language whose grammar is
+ * ALREADY loaded, and yields an empty map otherwise: no type beats a wrong one.
+ */
+export function memberTypesForSourceSync(
+  cacheKey: string,
+  source: string,
+  language: Language,
+  line: number,
+): Map<string, string> {
+  const out = new Map<string, string>();
+  if (!supportsBranchGuards(language) || source.length > MAX_PARSE_BYTES) return out;
+  const key = `${language}:src:${source.length}`;
+  let cached = treeCache.get(cacheKey);
+  if (!cached || cached.key !== key || cached.source !== source) {
+    const parser = getParser(language);
+    if (!parser) return out;
+    const tree = parser.parse(source);
+    if (!tree) return out;
+    cached = { key, tree, source };
+    remember(cacheKey, cached);
+  }
+  return memberTypesInTree(cached.tree.rootNode, cached.source, line);
+}
+
 /** {@link memberTypesForFile} over source text — the test surface. */
 export async function memberTypesInSource(source: string, language: Language, line: number): Promise<Map<string, string>> {
   if (!supportsBranchGuards(language)) return new Map();
@@ -2218,6 +2247,115 @@ export async function memberTypesInSource(source: string, language: Language, li
 
 const CLASS_BODY_TYPES: ReadonlySet<string> = new Set(['class_body', 'declaration_list', 'field_declaration_list']);
 
+/**
+ * A python class's member types, read from the tree.
+ *
+ * Four shapes, because python spreads the same fact around:
+ *   `conn: Client`                      a class-level annotation (dataclass, pydantic, attrs)
+ *   `def __init__(self, conn: Client)`  a typed constructor parameter, bound to
+ *                                       whichever attribute is assigned FROM it
+ *   `self.cap: AudioCapture`            an annotated attribute
+ *   `self.cap = AudioCapture()`         a constructor call names the type
+ *
+ * Precedence is decided, not accidental: an annotation beats a parameter, which
+ * beats a constructor call, and within a tier the first declaration wins. (A
+ * source-order rule would let `self.conn = Stub()` in `__init__` beat a later
+ * `self.conn: Client`.)
+ *
+ * Reading the tree rather than the class's source lines is what makes this
+ * correct. A type named inside a DOCSTRING is a `string` node and can never be
+ * an assignment; a nested class's `__init__` belongs to the nested class and is
+ * skipped by not descending into `class_definition`. Both were live defects in
+ * the regex version this replaces.
+ */
+function pythonMemberTypes(
+  cls: SyntaxNode,
+  typeText: (n: SyntaxNode | null | undefined) => string,
+): Map<string, string> {
+  const annotated = new Map<string, string>();
+  const fromParam = new Map<string, string>();
+  const constructed = new Map<string, string>();
+  const body = cls.childForFieldName('body');
+  if (!body) return new Map();
+
+  const put = (m: Map<string, string>, name: string | undefined, type: string) => {
+    if (name && type && !m.has(name)) m.set(name, type);
+  };
+  /** `self.<name>` on the left of an assignment, else undefined. */
+  const selfAttr = (left: SyntaxNode | null): string | undefined => {
+    if (!left || left.type !== 'attribute') return undefined;
+    const obj = left.childForFieldName('object');
+    const attr = left.childForFieldName('attribute');
+    if (!obj || !attr || obj.type !== 'identifier' || obj.text !== 'self') return undefined;
+    return attr.text;
+  };
+  /** The type a constructor call names — `AudioCapture()`, `requests.Session()`. */
+  const calledType = (right: SyntaxNode | null): string => {
+    if (!right || right.type !== 'call') return '';
+    const fn = right.childForFieldName('function');
+    if (!fn || (fn.type !== 'identifier' && fn.type !== 'attribute')) return '';
+    return collapse(fn.text);
+  };
+
+  // Pass 1: the class's own statements. A nested class_definition is not ours.
+  const initFns: SyntaxNode[] = [];
+  for (const stmt of namedChildren(body)) {
+    if (stmt.type === 'class_definition') continue;
+    if (stmt.type === 'expression_statement') {
+      const asg = namedChildren(stmt).find((c) => c.type === 'assignment');
+      const left = asg?.childForFieldName('left');
+      if (asg && left?.type === 'identifier') put(annotated, left.text, typeText(asg.childForFieldName('type')));
+    } else if (stmt.type === 'function_definition') {
+      if (stmt.childForFieldName('name')?.text === '__init__') initFns.push(stmt);
+    }
+  }
+
+  // Pass 2: `__init__`'s typed parameters, so an attribute assigned FROM one
+  // inherits its type. Matching by the PARAMETER the attribute is assigned from
+  // (not by a shared name) keeps `self._conn = conn` right.
+  const paramTypes = new Map<string, string>();
+  for (const fn of initFns) {
+    for (const p of namedChildren(fn.childForFieldName('parameters') ?? fn)) {
+      if (p.type !== 'typed_parameter' && p.type !== 'typed_default_parameter') continue;
+      const nm = namedChildren(p).find((c) => c.type === 'identifier');
+      const ty = namedChildren(p).find((c) => c.type === 'type');
+      if (nm && ty && nm.text !== 'self') put(paramTypes, nm.text, typeText(ty));
+    }
+  }
+
+  // Pass 3: `self.x = ...` anywhere in the class's own methods.
+  const visitBody = (node: SyntaxNode | null) => {
+    if (!node) return;
+    for (const child of namedChildren(node)) {
+      if (child.type === 'class_definition') continue; // a nested class's `self` is its own
+      if (child.type === 'assignment') {
+        const name = selfAttr(child.childForFieldName('left'));
+        if (name) {
+          const ann = typeText(child.childForFieldName('type'));
+          if (ann) put(annotated, name, ann);
+          else {
+            const right = child.childForFieldName('right');
+            if (right?.type === 'identifier' && paramTypes.has(right.text)) {
+              put(fromParam, name, paramTypes.get(right.text)!);
+            } else {
+              put(constructed, name, calledType(right));
+            }
+          }
+        }
+      }
+      visitBody(child);
+    }
+  };
+  for (const stmt of namedChildren(body)) {
+    if (stmt.type === 'function_definition') visitBody(stmt.childForFieldName('body'));
+  }
+
+  const out = new Map<string, string>(constructed);
+  for (const [k, v] of fromParam) out.set(k, v);
+  for (const [k, v] of annotated) out.set(k, v);
+  return out;
+}
+
 export function memberTypesInTree(root: SyntaxNode, source: string, line: number): Map<string, string> {
   const out = new Map<string, string>();
   const row = line - 1;
@@ -2231,6 +2369,10 @@ export function memberTypesInTree(root: SyntaxNode, source: string, line: number
   }
   if (!cls) return out;
   const typeText = (n: SyntaxNode | null | undefined): string => (n ? collapse(n.text).replace(/^:\s*/, '').trim() : '');
+  // Python declares no field types, so its evidence is spread over the class
+  // body and its `__init__`, and the shapes have nothing in common with the
+  // `field_declaration` / `property_declaration` switch below.
+  if (cls.type === 'class_definition') return pythonMemberTypes(cls, typeText);
   const put = (name: string | null | undefined, type: string) => {
     if (name && type && !out.has(name)) out.set(name, type);
   };

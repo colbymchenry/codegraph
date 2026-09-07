@@ -6,6 +6,7 @@
 
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
+import { memberTypesForSourceSync } from '../graph/branch-guards';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -1886,7 +1887,9 @@ export function matchMethodCall(
   // A single-segment receiver (`obj.method`) is untouched — it still reaches the
   // strategies below, where a receiver/name overlap is real evidence.
   if (ref.language === 'python' && dotMatch && objectOrClass!.includes('.')) {
-    return null;
+    return objectOrClass!.startsWith('self.')
+      ? matchPythonSelfAttrCall(objectOrClass!.slice('self.'.length), methodName!, ref, context)
+      : null;
   }
 
   // Java/Kotlin: receiver may be a field whose name doesn't match the type by
@@ -2227,6 +2230,77 @@ export function rustFieldTypeName(raw: string): string | null {
  * unresolved. Rust struct fields are not graph nodes, so the declaration text
  * is the only place the type lives.
  */
+/** Python names whose methods are the runtime's, never a project symbol's. */
+const PYTHON_BUILTIN_TYPES: ReadonlySet<string> = new Set([
+  'list', 'dict', 'set', 'frozenset', 'tuple', 'str', 'bytes', 'bytearray',
+  'int', 'float', 'complex', 'bool', 'object', 'type', 'range', 'slice',
+  'Any', 'None', 'NoneType',
+]);
+
+/**
+ * The project type a python annotation names, or '' when it names none.
+ *
+ * `Optional[T]` / `T | None` / `Union[T, None]` are the same declaration as `T`
+ * — python's way of saying "assigned later". Anything still generic after that
+ * (`list[int]`, `Dict[str, Foo]`) is a container whose methods are the
+ * runtime's, and a DOTTED type (`requests.Session`) is refused outright: the
+ * graph names a class by its last segment, so accepting it would strip the
+ * package and bind an external object to a same-named project class — the
+ * fabrication this whole path exists to stop. Go's field-chain matcher refuses
+ * a package-qualified field type for the same reason; this is the stricter form
+ * of that rule, and it costs only the unusual `models.Session()` spelling.
+ */
+function pythonAnnotationType(raw: string): string {
+  let t = raw.trim();
+  for (let i = 0; i < 4 && t; i++) {
+    const opt = t.match(/^(?:typing\.)?Optional\s*\[\s*([^\]]+?)\s*\]$/)
+      ?? t.match(/^(?:typing\.)?Union\s*\[\s*([^,\]]+?)\s*,\s*None\s*\]$/);
+    if (opt) { t = opt[1]!.trim(); continue; }
+    const bar = t.match(/^(.+?)\s*\|\s*None$/);
+    if (bar) { t = bar[1]!.trim(); continue; }
+    break;
+  }
+  t = t.replace(/^['"]|['"]$/g, '').trim(); // a forward reference: `"Client"`
+  if (!t || t.includes('[') || t.includes('.') || !/^[A-Za-z_]\w*$/.test(t)) return '';
+  if (PYTHON_BUILTIN_TYPES.has(t)) return '';
+  return t;
+}
+
+/**
+ * Python call through an attribute of the enclosing class — `self.capture.stop()`,
+ * emitted as `self.capture.stop` since #66 kept the receiver's text.
+ *
+ * Python declares no field types, so the evidence is the class body, read from
+ * the AST (`memberTypesForSourceSync`): a class-level annotation, a typed
+ * `__init__` parameter bound to the attribute, `self.x: T`, or `self.x = T()`.
+ * `resolveMethodOnType` then validates the method exists on it, so a mis-read
+ * produces no edge rather than a wrong one.
+ *
+ * Reading the TREE rather than the class's source lines is what makes this
+ * safe, and it was learned the hard way: a regex version of this helper took a
+ * type out of a DOCSTRING and turned a correct edge into a wrong one, read a
+ * nested class's `__init__` as the outer class's, and matched a same-named class
+ * in another file. The tree answers all three by construction — a docstring is a
+ * `string` node and never an assignment, a nested class is not descended into,
+ * and the types come from the CALLER'S OWN file, keyed by the call site's line.
+ */
+function matchPythonSelfAttrCall(
+  attr: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  // Single hop only — `self.a.b.m()` names a type nothing here can read.
+  if (!attr || attr.includes('.')) return null;
+  const source = context.readFile(ref.filePath);
+  if (!source) return null;
+  const declared = memberTypesForSourceSync(ref.filePath, source, 'python', ref.line).get(attr);
+  if (!declared) return null;
+  const typeName = pythonAnnotationType(declared);
+  if (!typeName) return null;
+  return resolveMethodOnType(typeName, methodName, ref, context, 0.85, 'instance-method');
+}
+
 function matchRustSelfFieldCall(
   field: string,
   methodName: string,
