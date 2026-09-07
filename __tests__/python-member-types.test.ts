@@ -8,7 +8,7 @@
  */
 import { describe, it, expect, beforeAll } from 'vitest';
 import { initGrammars, loadGrammarsForLanguages } from '../src/extraction/grammars';
-import { memberTypesInSource } from '../src/graph/branch-guards';
+import { memberTypesInSource, memberTypesForSourceSync } from '../src/graph/branch-guards';
 
 const read = async (src: string, line: number) =>
   Object.fromEntries(await memberTypesInSource(src, 'python', line));
@@ -80,6 +80,23 @@ describe('python member types', () => {
         15,
       ),
     ).toEqual({ h: 'Real' });
+  });
+
+  it('reads a class once, however many call sites ask', async () => {
+    // Identity, not wall-clock: the second call must hand back the SAME map.
+    // The resolver asks per REF and this reader walks every method body, so
+    // without the memo the cost is quadratic in refs per class — measured at
+    // 39s for a 2000-method class against a 0.9s baseline. The memo was once
+    // attached to the async twin by mistake and the sync path everything
+    // actually uses kept re-walking, with nothing to notice.
+    const src =
+      'class B:\n    def __init__(self):\n        self.h = Real()\n\n'
+      + '    def a(self, x):\n        return self.h.run(x)\n\n'
+      + '    def b(self, x):\n        return self.h.run(x)\n';
+    const first = memberTypesForSourceSync('memo-probe.py', src, 'python', 6);
+    const second = memberTypesForSourceSync('memo-probe.py', src, 'python', 9);
+    expect(Object.fromEntries(first)).toEqual({ h: 'Real' });
+    expect(second).toBe(first);
   });
 
   it('prefers an annotation over a constructor call written earlier', async () => {

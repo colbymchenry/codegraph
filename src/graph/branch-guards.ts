@@ -2239,7 +2239,8 @@ export function memberTypesForSourceSync(
     cached = { key, tree, source };
     remember(cacheKey, cached);
   }
-  return memberTypesInTree(cached.tree.rootNode, cached.source, line);
+  cached.members ??= new Map();
+  return memberTypesInTree(cached.tree.rootNode, cached.source, line, cached.members);
 }
 
 /** {@link memberTypesForFile} over source text — the test surface. */
