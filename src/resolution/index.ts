@@ -28,6 +28,7 @@ import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packa
 import { logDebug } from '../errors';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
+import { warmBranchGuardGrammars } from '../graph/branch-guards';
 
 /** Node kinds that can declare supertypes (extends/implements). */
 const SUPERTYPE_BEARING_KINDS = new Set<Node['kind']>([
@@ -201,6 +202,37 @@ const CPP_BUILT_INS = new Set([
  *
  * Orchestrates reference resolution using multiple strategies.
  */
+/**
+ * Languages whose MEMBER TYPES the resolver reads from the parse tree
+ * (`memberTypesForSourceSync`). Python is the only one today.
+ *
+ * These grammars must be loaded ON THE THREAD THAT RESOLVES, and nothing else
+ * loads them there: a full index routes parsing to `parse-worker.js`, so the
+ * main thread never calls `loadGrammarsForLanguages`, while `sync` does. The
+ * reader is built to yield nothing rather than a wrong answer when a grammar is
+ * missing, so the symptom was silent — `codegraph index` produced no attribute
+ * edges and `codegraph sync` produced them, i.e. the graph depended on how a
+ * file happened to be indexed last.
+ */
+export const RESOLVER_TREE_LANGUAGES: readonly Language[] = ['python'];
+
+/**
+ * Load {@link RESOLVER_TREE_LANGUAGES} that this project actually contains.
+ * Cheap and idempotent; call before any resolution pass, on whichever thread
+ * will run it.
+ */
+export async function warmResolverGrammars(queries: QueryBuilder): Promise<void> {
+  let present: Set<string>;
+  try {
+    present = queries.getDistinctFileLanguages();
+  } catch {
+    return;
+  }
+  const wanted = RESOLVER_TREE_LANGUAGES.filter((l) => present.has(l));
+  if (wanted.length === 0) return;
+  await warmBranchGuardGrammars(wanted);
+}
+
 export class ReferenceResolver {
   private projectRoot: string;
   private queries: QueryBuilder;

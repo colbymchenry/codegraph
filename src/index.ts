@@ -46,6 +46,7 @@ import {
   ReferenceResolver,
   createResolver,
   ResolutionResult,
+  warmResolverGrammars,
 } from './resolution';
 import { GraphTraverser, GraphQueryManager } from './graph';
 import { ContextBuilder, createContextBuilder } from './context';
@@ -1273,6 +1274,11 @@ export class CodeGraph {
     // whole phase's write volume (22GB on a 4.6GB DB at kernel scale).
     backpressure?: () => Promise<void> | null
   ): Promise<ResolutionResult> {
+    // The resolver reads some languages' member types off the parse tree, and
+    // it runs HERE — on the main thread, where a worker-pool index never loads
+    // a grammar. Without this the reader finds no parser and silently returns
+    // nothing, so `index` and `sync` produced different graphs.
+    await warmResolverGrammars(this.queries);
     return this.resolver.resolveAndPersistBatched(onProgress, undefined, onSynthesisProgress, {
       dbPath: this.db.getPath(),
       // Bulk-edge-load hooks: on big runs the resolver drops the non-unique

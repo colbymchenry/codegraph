@@ -23,7 +23,7 @@ try {
 import { parentPort, threadId } from 'worker_threads';
 import { createDatabase, SqliteDatabase } from '../db/sqlite-adapter';
 import { QueryBuilder } from '../db/queries';
-import { ReferenceResolver } from './index';
+import { ReferenceResolver, warmResolverGrammars } from './index';
 import { SYNTH_PASSES } from './callback-synthesizer';
 import { createYielder } from './cooperative-yield';
 import type { UnresolvedReference } from '../types';
@@ -61,7 +61,16 @@ port.on('message', (msg: InMessage) => {
         resolver = new ReferenceResolver(msg.projectRoot, queries);
         resolver.initialize();
         if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] worker open: db=${tDb - tOpen}ms init=${Date.now() - tDb}ms`);
-        port.postMessage({ type: 'ready' });
+        // Same grammars the main thread warms before resolving. A worker that
+        // skipped this would resolve the SAME refs with no member types, so
+        // whether an attribute call got its edge would depend on the batch
+        // size that decided to fan out — and `resolveAndPersistBatched`'s
+        // contract is that the switch changes wall-clock, never the graph.
+        // `ready` is deferred until the load settles so no batch can arrive
+        // before the parser exists.
+        void warmResolverGrammars(queries)
+          .catch(() => undefined)
+          .then(() => port.postMessage({ type: 'ready' }));
         break;
       }
       case 'recycle': {
