@@ -11671,6 +11671,59 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     expect(blankLoneMacroLines(bare)).toBe(bare);
   });
 
+  it('blankCDesignatedMacroArgs empties a designated-initializer macro call, offsets kept (#1729)', async () => {
+    const { blankCDesignatedMacroArgs } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'void resetProfile(profile_t *p)',
+      '{',
+      '    RESET_CONFIG(profile_t, p,',
+      '        .pid = { [PID_ROLL] = PID_ROLL_DEFAULT, [PID_YAW] = { 50, 75 } },',
+      '        .limit = 500, // trailing comma follows',
+      '    );',
+      '    log(.5);',
+      '    OTHER_MACRO(a == b, c);',
+      '}',
+    ].join('\n');
+    const out = blankCDesignatedMacroArgs(src);
+    expect(out.length).toBe(src.length);
+    expect(out.split('\n').length).toBe(src.split('\n').length);
+    expect(out).toContain('RESET_CONFIG(');
+    expect(out).not.toContain('.pid');
+    expect(out).not.toContain('PID_ROLL');
+    // The closing `);` keeps its column; the argument lines are spaces.
+    expect(out.split('\n')[5]).toBe('    );');
+    expect(out.split('\n')[3]).toBe(' '.repeat(src.split('\n')[3].length));
+    // A numeric literal and a comparison are not designators.
+    expect(out).toContain('log(.5);');
+    expect(out).toContain('OTHER_MACRO(a == b, c);');
+  });
+
+  it('a designated-initializer macro call no longer swallows the functions after it (#1729)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1729-'));
+    try {
+      // 120 `.field = value` arguments: past the point where tree-sitter-c's
+      // error recovery ran the enclosing function to the end of the file.
+      const fields = Array.from({ length: 120 }, (_, i) => `        .field${i} = ${i},`).join('\n');
+      fs.writeFileSync(
+        path.join(dir, 'pid.c'),
+        `void resetProfile(profile_t *p)\n{\n    RESET_CONFIG(profile_t, p,\n${fields}\n    );\n}\n\nvoid g(void)\n{\n}\n\nint h(void)\n{\n    return 1;\n}\n`
+      );
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const fns = cg.getNodesByKind('function').filter((n) => n.filePath === 'pid.c');
+        const byName = Object.fromEntries(fns.map((n) => [n.name, n]));
+        expect(Object.keys(byName).sort()).toEqual(['g', 'h', 'resetProfile']);
+        expect(byName.resetProfile!.endLine).toBe(125);
+        expect(byName.g!.qualifiedName).toBe('g');
+        expect(byName.h!.qualifiedName).toBe('h');
+      } finally {
+        cg.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('blankCStatementMacroCalls blanks indented iterator macros, keeps the block', async () => {
     const { blankCStatementMacroCalls } = await import('../src/extraction/languages/c-cpp');
     const src = [

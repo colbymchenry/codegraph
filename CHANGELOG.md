@@ -201,6 +201,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Symbols, tests and the viewer
 
+- **A C macro call written with designated initializers no longer swallows every function after it.** Betaflight resets each config struct with `RESET_CONFIG(type, dst, .field = value, …)`, a shape the C grammar cannot parse; past a hundred or so fields its error recovery ran the enclosing function to the end of the file, the next function vanished from the index and every later one was filed under the first, where name matching then treated it as an unreachable closure. The argument list of such a call is now blanked before parsing, offsets kept, so the file's functions come out with their real extents. On that tree 45 functions in `pid.c` alone moved back to top level and their 117 callers resolve at exact-match confidence. Re-index after upgrading. (#1729)
+
 - **Files under an `e2e/` directory count as tests.** Their calls no longer appear as production callers in Steps, dead-code and test badges.
 
 - **Production code under a `samples` or `examples` package path is no longer treated as test code.** A Kotlin or Java project whose package path runs through `com/google/samples/…` (Now in Android, for one) had nearly every file counted as a fixture, so the Map opened on `build-logic`, the entry points hid the app, and dead-code and test badges were wrong. Only the project layout above a `src/` folder decides now; the package path below it never does.

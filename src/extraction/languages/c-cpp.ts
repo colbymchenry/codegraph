@@ -1515,8 +1515,55 @@ export function blankCNamedVariadicDefineDots(source: string): string {
  * C-detected headers in CUDA projects (llm.c keeps `__device__` helpers and
  * kernel prototypes in plain `.h`) — the same content-gated CUDA blank as
  * C++. Offset-preserving. */
+/**
+ * Blank the argument list of a statement-level `MACRO( … );` call whose
+ * arguments are designated initializers — betaflight's
+ *
+ *     RESET_CONFIG(pidProfile_t, pidProfile,
+ *         .pid = { [PID_ROLL] = PID_ROLL_DEFAULT, … },
+ *         .pidSumLimit = PIDSUM_LIMIT,
+ *         …
+ *     );
+ *
+ * tree-sitter-c has no rule for `.field = value` as a call argument, and past
+ * roughly a hundred such arguments its error recovery gives up on the
+ * enclosing function: the `function_definition` runs to the end of the file,
+ * the next function vanishes and every one after it is nested under the first
+ * (#1729 — 310 functions in 73 files on that tree, which name matching then
+ * treated as unreachable closures). Emptying the argument list to spaces,
+ * newlines kept, leaves `RESET_CONFIG(\n\n…\n);` — a call the grammar parses
+ * cleanly — at the cost of the references inside the initializer, which the
+ * broken parse was not yielding either. Statement-level only (`);` follows),
+ * macro-cased name only, offsets preserved.
+ */
+export function blankCDesignatedMacroArgs(source: string): string {
+  if (source.indexOf('=') === -1) return source;
+  const out = source.split('');
+  const re = /^[ \t]*([A-Z_][A-Z0-9_]*)\s*\(/gm;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source))) {
+    const open = m.index + m[0].length - 1;
+    let depth = 1;
+    let i = open + 1;
+    for (; i < source.length && depth > 0; i++) {
+      const c = source[i];
+      if (c === '(') depth++;
+      else if (c === ')') depth--;
+    }
+    if (depth !== 0) continue;
+    const close = i - 1;
+    const args = source.slice(open + 1, close);
+    // A designator at argument depth: `.name =` or `[index] =`.
+    if (!/(^|[,{(\s])(\.[A-Za-z_]\w*|\[[^\]]+\])\s*=[^=]/.test(args)) continue;
+    if (!/^\s*;/.test(source.slice(close + 1))) continue;
+    for (let k = open + 1; k < close; k++) if (out[k] !== '\n') out[k] = ' ';
+    re.lastIndex = close;
+  }
+  return out.join('');
+}
+
 function preParseCSource(source: string): string {
-  const inner = blankCKernelAnnotations(blankCCplusplusGuardBodies(source));
+  const inner = blankCDesignatedMacroArgs(blankCKernelAnnotations(blankCCplusplusGuardBodies(source)));
   let blanked = blankCLeadingAttrMacros(
     blankLoneMacroLines(
       blankCStatementMacroCalls(
