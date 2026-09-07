@@ -2269,6 +2269,72 @@ function pythonAnnotationType(raw: string): string {
  * importing file's own package, each extra dot climbs one more. Dropping it —
  * `replace(/^\.+/, '')` — made `from ..core import X` look in the wrong package.
  */
+/**
+ * Top-level stdlib module names. The suffix fallback below asks "does any
+ * indexed path END this way", which is not a python import rule — and the
+ * imports that reach it are overwhelmingly NOT project modules: on one real
+ * corpus 81 of 172 absolute import sources were stdlib. `from logging import
+ * Logger` would then bind to a project's own `app/utils/logging.py`, and the
+ * edge is indistinguishable from a statically-proven one. A module python
+ * itself provides is never the project file that happens to share its name.
+ */
+const PYTHON_STDLIB_TOP = new Set([
+  'abc','argparse','array','ast','asyncio','base64','bisect','builtins','bz2','calendar','cmath',
+  'cmd','codecs','collections','colorsys','concurrent','configparser','contextlib','contextvars',
+  'copy','copyreg','csv','ctypes','dataclasses','datetime','decimal','difflib','dis','doctest',
+  'email','encodings','enum','errno','faulthandler','fcntl','filecmp','fileinput','fnmatch',
+  'fractions','ftplib','functools','gc','getopt','getpass','gettext','glob','graphlib','gzip',
+  'hashlib','heapq','hmac','html','http','imaplib','importlib','inspect','io','ipaddress',
+  'itertools','json','keyword','linecache','locale','logging','lzma','mailbox','marshal','math',
+  'mimetypes','mmap','multiprocessing','netrc','numbers','operator','os','pathlib','pdb','pickle',
+  'pickletools','pkgutil','platform','plistlib','poplib','posixpath','pprint','profile','pstats',
+  'pty','pwd','py_compile','pyclbr','queue','quopri','random','re','readline','reprlib','resource',
+  'runpy','sched','secrets','select','selectors','shelve','shlex','shutil','signal','site','smtplib',
+  'socket','socketserver','sqlite3','ssl','stat','statistics','string','stringprep','struct',
+  'subprocess','symtable','sys','sysconfig','syslog','tarfile','tempfile','termios','textwrap',
+  'threading','time','timeit','token','tokenize','tomllib','trace','traceback','tracemalloc','tty',
+  'types','typing','unicodedata','unittest','urllib','uuid','venv','warnings','wave','weakref',
+  'webbrowser','wsgiref','xml','xmlrpc','zipapp','zipfile','zipimport','zlib','zoneinfo',
+]);
+
+/**
+ * Is `anchor` a directory python would import `rest` FROM — i.e. a source root
+ * with a real package chain under it?
+ *
+ * Two conditions, and both are the actual import rule rather than a heuristic:
+ *
+ * - **The anchor is not itself inside a package.** Python puts the top-level
+ *   package DIRECTLY on `sys.path`, so a directory carrying its own
+ *   `__init__.py` is a package interior, never a root. This is what rejects
+ *   `app/utils/logging.py` being claimed for `import logging`: `app/utils` is
+ *   part of `app`, so nothing imports `logging` from there.
+ * - **Every intermediate directory of `rest` is a package.** `config.settings`
+ *   requires `config/__init__.py`; a bare `deploy/config/settings.py` in a
+ *   deployment tree is not importable as `config.settings` and must not be
+ *   claimed as it.
+ *
+ * Uniqueness was the only test before, and uniqueness is not evidence — the
+ * same mistake this file's header records for `examples/services/client.py`,
+ * one layer out.
+ */
+function isPythonPackageRoot(
+  anchor: string,
+  rest: string,
+  context: ResolutionContext,
+): boolean {
+  const root = anchor.replace(/\/+$/, '');
+  if (root && context.fileExists(`${root}/__init__.py`)) return false;
+  const parts = rest.split('/');
+  let dir = root;
+  // The last segment is the module (or the package whose `__init__` matched);
+  // every segment BEFORE it must be an importable package.
+  for (let i = 0; i < parts.length - 1; i++) {
+    dir = dir ? `${dir}/${parts[i]}` : parts[i]!;
+    if (!context.fileExists(`${dir}/__init__.py`)) return false;
+  }
+  return true;
+}
+
 function pythonModuleFile(
   source: string,
   ref: UnresolvedRef,
@@ -2308,12 +2374,22 @@ function pythonModuleFile(
   // suffixes. Exactly one survivor or nothing: `services/client.py` and
   // `examples/services/client.py` both match `services/client` and so neither
   // is the answer.
-  if (dots === 0 && rest) {
+  //
+  // Uniqueness alone was still not enough, because a suffix match is not an
+  // import rule. Two further gates, both of them python's ACTUAL rule:
+  // `PYTHON_STDLIB_TOP` (a module python provides is never the project file
+  // that shares its name) and `isPythonPackageRoot` (the match must sit under a
+  // real source root with a real package chain). Without them a unique match
+  // was still routinely the wrong file — `import logging` claiming
+  // `app/utils/logging.py`, `from redis.client import Redis` claiming a test
+  // double under `tests/fixtures/`.
+  if (dots === 0 && rest && !PYTHON_STDLIB_TOP.has(rest.split('/')[0]!)) {
     const wanted = [`/${rest}.py`, `/${rest}/__init__.py`, `/${rest}.pyi`];
     const found: string[] = [];
     for (const f of context.getAllFiles?.() ?? []) {
       const fp = f.replace(/\\/g, '/');
-      if (wanted.some((w) => fp.endsWith(w))) found.push(fp);
+      const w = wanted.find((cand) => fp.endsWith(cand));
+      if (w && isPythonPackageRoot(fp.slice(0, fp.length - w.length), rest, context)) found.push(fp);
       if (found.length > 1) return null;
     }
     if (found.length === 1) return found[0]!;

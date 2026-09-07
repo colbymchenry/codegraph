@@ -309,16 +309,74 @@ describe('python self-attribute type inference', () => {
     expect(await runCalls()).toEqual([]);
   });
 
+  it('does not bind a stdlib import to a project file of the same name', async () => {
+    // The suffix fallback asks "does any indexed path END this way", which is
+    // not an import rule. On one real corpus 81 of 172 absolute import sources
+    // were stdlib, and each would claim a project file that merely shares its
+    // name — with `provenance: null`, indistinguishable from a proven call.
+    fs.mkdirSync(path.join(tempDir, 'utils'));
+    fs.writeFileSync(
+      path.join(tempDir, 'utils', 'logging.py'),
+      'class Logger:\n    def run(self, x):\n        return x\n'
+    );
+    writeKinds(); // DISTRACTOR
+    box('from logging import Logger\n\n\nclass Box:\n    def __init__(self):\n        self.h = Logger()\n\n'
+      + '    def go(self, x):\n        return self.h.run(x)\n');
+    expect(await runCalls()).toEqual([]);
+  });
+
+  it('does not claim a path whose parent directories are not packages', async () => {
+    // `deploy/config/settings.py` is the only suffix match for `config.settings`
+    // — unique, and still not importable as that: `deploy/config` has no
+    // `__init__.py`, so nothing can `from config.settings import ...` it.
+    // Uniqueness is not evidence, the same rule the header records one layer out.
+    fs.mkdirSync(path.join(tempDir, 'deploy'));
+    fs.mkdirSync(path.join(tempDir, 'deploy', 'config'));
+    fs.writeFileSync(
+      path.join(tempDir, 'deploy', 'config', 'settings.py'),
+      'class Real:\n    def run(self, x):\n        return x\n'
+    );
+    writeKinds(); // DISTRACTOR
+    box('from config.settings import Real\n\n\nclass Box:\n    def __init__(self):\n        self.h = Real()\n\n'
+      + '    def go(self, x):\n        return self.h.run(x)\n');
+    expect(await runCalls()).toEqual([]);
+  });
+
+  it('does not claim a test double nested under a fixture tree', async () => {
+    // `tests/fixtures/redis/client.py` ends `/redis/client.py` and is unique,
+    // but `tests/fixtures` is not a source root anyone imports `redis` from.
+    fs.mkdirSync(path.join(tempDir, 'tests', 'fixtures', 'redis'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'tests', 'fixtures', '__init__.py'), '');
+    fs.writeFileSync(path.join(tempDir, 'tests', 'fixtures', 'redis', '__init__.py'), '');
+    fs.writeFileSync(
+      path.join(tempDir, 'tests', 'fixtures', 'redis', 'client.py'),
+      'class Redis:\n    def run(self, x):\n        return x\n'
+    );
+    writeKinds(); // DISTRACTOR
+    box('from redis.client import Redis\n\n\nclass Box:\n    def __init__(self):\n        self.h = Redis()\n\n'
+      + '    def go(self, x):\n        return self.h.run(x)\n');
+    expect(await runCalls()).toEqual([]);
+  });
+
   it('resolves a package root that is not the repo root (src layout)', async () => {
     // `src/pkg/core.py` imported as `pkg.core` — the packaged-project default.
     // Anchoring only at the repo root made every such edge disappear.
     fs.mkdirSync(path.join(tempDir, 'src'));
     fs.mkdirSync(path.join(tempDir, 'src', 'pkg'));
     fs.mkdirSync(path.join(tempDir, 'src', 'pkg', 'api'));
+    // The `__init__.py` files are what make `pkg` importable AS `pkg` — the
+    // suffix fallback checks for them, so a fixture without them was testing a
+    // layout python itself could not import (PEP 420 namespace packages are the
+    // deliberate exception; see `isPythonPackageRoot`).
+    fs.writeFileSync(path.join(tempDir, 'src', 'pkg', '__init__.py'), '');
+    fs.writeFileSync(path.join(tempDir, 'src', 'pkg', 'api', '__init__.py'), '');
     fs.writeFileSync(
       path.join(tempDir, 'src', 'pkg', 'core.py'),
       'class Client:\n    def run(self, x):\n        return x\n'
     );
+    // DISTRACTOR: without it a bare-name fallback finds `run` by single-candidate
+    // luck and this passes on both arms.
+    writeKinds();
     fs.writeFileSync(
       path.join(tempDir, 'src', 'pkg', 'api', 'box.py'),
       'from pkg.core import Client\n\n\nclass Box:\n    def __init__(self):\n        self.h = Client()\n\n'
