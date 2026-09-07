@@ -159,6 +159,14 @@ interface CachedTree {
   key: string;
   tree: Tree;
   source: string;
+  /**
+   * `memberTypesInTree` per enclosing class, keyed by the class node's start
+   * index. The resolver asks once per REF, and python's reader walks the whole
+   * class (every method body) rather than only the body's direct children like
+   * the other languages — so without this the cost is quadratic in refs per
+   * class: a 2000-method class measured 1.2s -> 41s on a full index.
+   */
+  members?: Map<number, Map<string, string>>;
 }
 
 const TREE_CACHE_SIZE = 8;
@@ -2201,7 +2209,8 @@ export async function memberTypesForFile(absPath: string, language: Language, li
   if (!supportsBranchGuards(language)) return out;
   const cached = await treeFor(absPath, language);
   if (!cached) return out;
-  return memberTypesInTree(cached.tree.rootNode, cached.source, line);
+  cached.members ??= new Map();
+  return memberTypesInTree(cached.tree.rootNode, cached.source, line, cached.members);
 }
 
 /**
@@ -2267,6 +2276,12 @@ const CLASS_BODY_TYPES: ReadonlySet<string> = new Set(['class_body', 'declaratio
  * an assignment; a nested class's `__init__` belongs to the nested class and is
  * skipped by not descending into `class_definition`. Both were live defects in
  * the regex version this replaces.
+ *
+ * A parameter's type is applied ONLY inside the `__init__` that declared it.
+ * Applying it wherever the name reappeared meant an unrelated local — `dep =
+ * make_decoy(); self._cache = dep` in another method — inherited the
+ * constructor's type and produced a wrong edge, the fabrication class this path
+ * exists to prevent.
  */
 function pythonMemberTypes(
   cls: SyntaxNode,
@@ -2280,6 +2295,19 @@ function pythonMemberTypes(
 
   const put = (m: Map<string, string>, name: string | undefined, type: string) => {
     if (name && type && !m.has(name)) m.set(name, type);
+  };
+  /** A `def` as written, with any decorators peeled off. */
+  const asFunction = (n: SyntaxNode): SyntaxNode | null => {
+    if (n.type === 'function_definition') return n;
+    // `@inject def __init__(...)` and `@property def x(...)` are wrapped, and
+    // testing the wrapper's type made every decorated method invisible —
+    // dependency injection and `@property` are exactly where types live.
+    if (n.type === 'decorated_definition') {
+      const inner = n.childForFieldName('definition')
+        ?? namedChildren(n).find((c) => c.type === 'function_definition');
+      return inner?.type === 'function_definition' ? inner : null;
+    }
+    return null;
   };
   /** `self.<name>` on the left of an assignment, else undefined. */
   const selfAttr = (left: SyntaxNode | null): string | undefined => {
@@ -2297,34 +2325,34 @@ function pythonMemberTypes(
     return collapse(fn.text);
   };
 
-  // Pass 1: the class's own statements. A nested class_definition is not ours.
-  const initFns: SyntaxNode[] = [];
+  // The class's own statements. A nested class_definition is not ours.
+  const methods: SyntaxNode[] = [];
   for (const stmt of namedChildren(body)) {
     if (stmt.type === 'class_definition') continue;
     if (stmt.type === 'expression_statement') {
       const asg = namedChildren(stmt).find((c) => c.type === 'assignment');
       const left = asg?.childForFieldName('left');
       if (asg && left?.type === 'identifier') put(annotated, left.text, typeText(asg.childForFieldName('type')));
-    } else if (stmt.type === 'function_definition') {
-      if (stmt.childForFieldName('name')?.text === '__init__') initFns.push(stmt);
+      continue;
     }
+    const fn = asFunction(stmt);
+    if (fn) methods.push(fn);
   }
 
-  // Pass 2: `__init__`'s typed parameters, so an attribute assigned FROM one
-  // inherits its type. Matching by the PARAMETER the attribute is assigned from
-  // (not by a shared name) keeps `self._conn = conn` right.
-  const paramTypes = new Map<string, string>();
-  for (const fn of initFns) {
-    for (const p of namedChildren(fn.childForFieldName('parameters') ?? fn)) {
-      if (p.type !== 'typed_parameter' && p.type !== 'typed_default_parameter') continue;
-      const nm = namedChildren(p).find((c) => c.type === 'identifier');
-      const ty = namedChildren(p).find((c) => c.type === 'type');
-      if (nm && ty && nm.text !== 'self') put(paramTypes, nm.text, typeText(ty));
+  /** `__init__`'s typed parameters — in scope only within that `__init__`. */
+  const paramTypesOf = (fn: SyntaxNode): Map<string, string> => {
+    const types = new Map<string, string>();
+    if (fn.childForFieldName('name')?.text !== '__init__') return types;
+    for (const prm of namedChildren(fn.childForFieldName('parameters') ?? fn)) {
+      if (prm.type !== 'typed_parameter' && prm.type !== 'typed_default_parameter') continue;
+      const nm = namedChildren(prm).find((c) => c.type === 'identifier');
+      const ty = namedChildren(prm).find((c) => c.type === 'type');
+      if (nm && ty && nm.text !== 'self') put(types, nm.text, typeText(ty));
     }
-  }
+    return types;
+  };
 
-  // Pass 3: `self.x = ...` anywhere in the class's own methods.
-  const visitBody = (node: SyntaxNode | null) => {
+  const visitBody = (node: SyntaxNode | null, paramTypes: Map<string, string>) => {
     if (!node) return;
     for (const child of namedChildren(node)) {
       if (child.type === 'class_definition') continue; // a nested class's `self` is its own
@@ -2343,12 +2371,10 @@ function pythonMemberTypes(
           }
         }
       }
-      visitBody(child);
+      visitBody(child, paramTypes);
     }
   };
-  for (const stmt of namedChildren(body)) {
-    if (stmt.type === 'function_definition') visitBody(stmt.childForFieldName('body'));
-  }
+  for (const fn of methods) visitBody(fn.childForFieldName('body'), paramTypesOf(fn));
 
   const out = new Map<string, string>(constructed);
   for (const [k, v] of fromParam) out.set(k, v);
@@ -2356,23 +2382,41 @@ function pythonMemberTypes(
   return out;
 }
 
-export function memberTypesInTree(root: SyntaxNode, source: string, line: number): Map<string, string> {
+export function memberTypesInTree(
+  root: SyntaxNode,
+  source: string,
+  line: number,
+  memo?: Map<number, Map<string, string>>,
+): Map<string, string> {
   const out = new Map<string, string>();
   const row = line - 1;
   let node: SyntaxNode | null = innermostAt(root, row, firstNonBlankColumn(source, row));
   let cls: SyntaxNode | null = null;
-  for (let up = 0; node && up < 16; up++, node = node.parent) {
+  // Climb to the root rather than a fixed depth. The old cap of 16 lost the
+  // class for a call nested six blocks deep (`with` + `for` + `if` + `try`
+  // inside a method is ordinary python), which read as "this class declares no
+  // members" and silently dropped the edge. The walk is O(depth) and every
+  // frame is a cheap type test.
+  for (let up = 0; node && up < 512; up++, node = node.parent) {
     if (CLASS_TYPES.has(node.type)) {
       cls = node;
       break;
     }
   }
   if (!cls) return out;
+  // One class, one read. Callers ask per call SITE, and every site in a class
+  // gets the same answer.
+  const memoHit = memo?.get(cls.startIndex);
+  if (memoHit) return memoHit;
   const typeText = (n: SyntaxNode | null | undefined): string => (n ? collapse(n.text).replace(/^:\s*/, '').trim() : '');
   // Python declares no field types, so its evidence is spread over the class
   // body and its `__init__`, and the shapes have nothing in common with the
   // `field_declaration` / `property_declaration` switch below.
-  if (cls.type === 'class_definition') return pythonMemberTypes(cls, typeText);
+  if (cls.type === 'class_definition') {
+    const py = pythonMemberTypes(cls, typeText);
+    memo?.set(cls.startIndex, py);
+    return py;
+  }
   const put = (name: string | null | undefined, type: string) => {
     if (name && type && !out.has(name)) out.set(name, type);
   };
@@ -2438,5 +2482,6 @@ export function memberTypesInTree(root: SyntaxNode, source: string, line: number
         break;
     }
   }
+  memo?.set(cls.startIndex, out);
   return out;
 }
