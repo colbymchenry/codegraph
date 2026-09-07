@@ -155,6 +155,15 @@ export interface ResolutionContext {
   /** Get cached import mappings for a file */
   getImportMappings(filePath: string, language: Language): ImportMapping[];
   /**
+   * The project file an import specifier names, or null when it resolves
+   * outside the project (a stdlib or third-party module) — real module
+   * resolution, including relative dot counts, packages and `__init__.py`.
+   *
+   * Optional so minimal test contexts compile; a caller without it must treat
+   * the answer as unknown and produce no edge rather than guess.
+   */
+  resolveModulePath?(specifier: string, fromFile: string, language: Language): string | null;
+  /**
    * Project import-path aliases (tsconfig/jsconfig `paths`). Returns
    * `null` when the project doesn't define any. Cached per resolver
    * instance — safe to call from any resolver code path. Optional so

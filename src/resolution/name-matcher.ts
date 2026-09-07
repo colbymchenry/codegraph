@@ -2255,50 +2255,108 @@ function pythonAnnotationType(raw: string): string {
 }
 
 /**
+ * The project file a python import specifier names, or null.
+ *
+ * `resolveModulePath` (the resolver's own) answers a single-segment module, but
+ * not a dotted package path — `from app.real import Client` comes back null —
+ * so a dotted specifier is turned into a path here and CHECKED AGAINST THE
+ * INDEX rather than pattern-matched. That distinction is the point: the version
+ * this replaces compared candidate class paths with `endsWith`, which matched
+ * `examples/services/client.py` for `from services.client import …` and then
+ * took whichever sorted first.
+ *
+ * A relative specifier's LEADING DOT COUNT is significant: one dot is the
+ * importing file's own package, each extra dot climbs one more. Dropping it —
+ * `replace(/^\.+/, '')` — made `from ..core import X` look in the wrong package.
+ */
+function pythonModuleFile(
+  source: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  const direct = context.resolveModulePath?.(source, ref.filePath, ref.language);
+  if (direct) return direct.replace(/\\/g, '/');
+
+  const here = ref.filePath.replace(/\\/g, '/');
+  const dots = /^\.+/.exec(source)?.[0].length ?? 0;
+  const rest = source.slice(dots).replace(/\./g, '/');
+  let base: string;
+  if (dots > 0) {
+    // `.` = this file's package; each further dot climbs one.
+    const parts = here.split('/');
+    parts.pop(); // the file itself
+    for (let i = 1; i < dots; i++) {
+      if (parts.length === 0) return null; // climbed past the project root
+      parts.pop();
+    }
+    base = parts.join('/');
+  } else {
+    base = ''; // absolute: from the project root
+  }
+  const stem = base ? (rest ? `${base}/${rest}` : base) : rest;
+  if (!stem) return null;
+  for (const candidate of [`${stem}.py`, `${stem}/__init__.py`, `${stem}.pyi`]) {
+    if (context.fileExists(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
  * The project class a python type name refers to AT THIS CALL SITE, or null.
  *
- * Two questions the previous version asked neither of, and both produced wrong
- * edges. **Is it a project class at all?** `self.h = Session()` after
- * `from requests import Session` names an external class; refusing only the
- * DOTTED spelling (`requests.Session()`) guarded the rare form and let the
- * common one bind to a project `models.Session`. **Which one?** With two project
- * classes of a name, the method lookup fell back to index order and landed on a
- * `Client` defined in a test file.
+ * Everything here is a refusal to guess, and each refusal is a defect this
+ * function shipped with once:
  *
- * So: a name the file IMPORTS must come from the module the import names, and a
- * name it does not import must be declared in the file itself. An external
- * import matches no project file and yields null — a silent miss, as it should
- * be.
+ * - **The mapping itself is not trustworthy.** `getImportMappings` is a REGEX
+ *   over raw text, so `from decoy import Real` written inside a DOCSTRING
+ *   produces a mapping indistinguishable from the real import, and taking the
+ *   first match bound the call to `decoy`. The AST reader refuses a type named
+ *   in a docstring; handing the MODULE question back to text re-opened the same
+ *   hole one layer down. So: every mapping that binds the name must agree, or
+ *   there is no answer.
+ * - **The module path is not ours to compute.** Hand-rolled path arithmetic
+ *   dropped the dot count on `from ..core import X` (resolving it against the
+ *   importing file's own directory) and matched any file in a package for
+ *   `from pkg import X`. `resolveModulePath` is the resolver's real one:
+ *   relative levels, packages, `__init__.py`.
+ * - **Ambiguity is not a tiebreak.** Returning the first survivor meant the
+ *   alphabetically-first path won — `examples/services/client.py` over
+ *   `services/client.py`. Two candidates means no evidence, not a coin flip.
+ *
+ * A name the file does not import must be declared in the file itself.
  */
 function pythonTypeClass(
   typeName: string,
   ref: UnresolvedRef,
   context: ResolutionContext,
 ): Node | null {
-  const classes = context
-    .getNodesByName(typeName)
-    .filter((n) => n.kind === 'class' && n.language === 'python');
-  if (classes.length === 0) return null;
   const here = ref.filePath.replace(/\\/g, '/');
-  const dirOf = (p: string) => p.slice(0, p.lastIndexOf('/') + 1);
-  const imp = context
+  const bindings = context
     .getImportMappings(ref.filePath, ref.language)
-    .find((i) => i.localName === typeName);
-  if (!imp) {
-    // Not imported, so it is this file's own class or nothing. (A name from a
-    // star-import or a builtin is not something to guess about.)
-    return classes.find((c) => c.filePath.replace(/\\/g, '/') === here) ?? null;
+    .filter((i) => i.localName === typeName);
+
+  const classesNamed = (name: string) =>
+    context.getNodesByName(name).filter((n) => n.kind === 'class' && n.language === 'python');
+
+  if (bindings.length === 0) {
+    // Not imported: this file's own class, or nothing.
+    return classesNamed(typeName).find((c) => c.filePath.replace(/\\/g, '/') === here) ?? null;
   }
-  // `from app.real import Client` -> `app/real`; `from .kinds import Real` ->
-  // `kinds`, relative to the importing file's own directory.
-  const relative = /^\./.test(imp.source);
-  const mod = imp.source.replace(/^\.+/, '').replace(/\./g, '/');
-  const wanted = mod ? (relative ? dirOf(here) + mod : mod) : dirOf(here).replace(/\/$/, '');
-  const hit = classes.filter((c) => {
-    const fp = c.filePath.replace(/\\/g, '/').replace(/\.pyi?$/, '');
-    return fp === wanted || fp.endsWith('/' + wanted) || dirOf(fp).replace(/\/$/, '') === wanted;
-  });
-  return hit.length > 0 ? hit[0]! : null;
+  // A docstring's import and a real one both land here. If they name different
+  // things there is no way to tell which is code.
+  if (new Set(bindings.map((i) => `${i.source}\u0000${i.exportedName}`)).size !== 1) return null;
+  const imp = bindings[0]!;
+
+  const file = pythonModuleFile(imp.source, ref, context);
+  if (!file) return null; // stdlib, third-party, or unresolvable -> silent miss
+  const norm = file;
+
+  // `from kinds import Real as R` — the class is declared under its EXPORTED
+  // name, not the local one.
+  const hit = classesNamed(imp.exportedName === '*' ? typeName : imp.exportedName).filter(
+    (c) => c.filePath.replace(/\\/g, '/') === norm,
+  );
+  return hit.length === 1 ? hit[0]! : null;
 }
 
 /**
@@ -2337,8 +2395,9 @@ function matchPythonSelfAttrCall(
   const cls = pythonTypeClass(typeName, ref, context);
   if (!cls) return null;
 
-  // The method as declared on THAT class, in THAT file.
-  const want = `${typeName}::${methodName}`;
+  // The method as declared on THAT class, in THAT file. `cls.name`, not the
+  // local one: `from kinds import Real as R` declares the class as `Real`.
+  const want = `${cls.name}::${methodName}`;
   const own = context
     .getNodesByName(methodName)
     .find(
@@ -2351,15 +2410,55 @@ function matchPythonSelfAttrCall(
   if (own) {
     return { original: ref, targetNodeId: own.id, confidence: 0.85, resolvedBy: 'instance-method' };
   }
-  // Not declared there — it may be inherited. Hand off to the shared resolver
-  // for its supertype walk, but ONLY when the name is unambiguous: with two
-  // project classes of this name there is nothing here to pick between them,
-  // and picking by index order is what put an edge on a test file's class.
-  const sameName = context
-    .getNodesByName(typeName)
-    .filter((n) => n.kind === 'class' && n.language === 'python');
-  if (sameName.length !== 1) return null;
-  return resolveMethodOnType(typeName, methodName, ref, context, 0.85, 'instance-method');
+  // Not declared there — it may be inherited. `getSupertypes` reads the
+  // `extends` edges, which DO NOT EXIST during the first pass; that is why this
+  // shape is parked for the conformance pass (PY_SELF_ATTR_SHAPE in
+  // ../resolution), exactly as PHP's `this->prop.method` is. Before that fix the
+  // code claimed to hand off to a supertype walk that could never find anything,
+  // so `class Real(Base)` — a service subclass, the most ordinary shape there is
+  // — resolved to nothing.
+  //
+  // Walked here rather than through `resolveMethodOnType` because the class is
+  // already pinned to one file: the shared helper searches every class of that
+  // NAME, which is the ambiguity this function exists to refuse.
+  const seen = new Set<string>([cls.name]);
+  let frontier = [cls.name];
+  for (let depth = 0; depth < 4 && frontier.length > 0; depth++) {
+    const next: string[] = [];
+    for (const sub of frontier) {
+      for (const superName of context.getSupertypes?.(sub, ref.language) ?? []) {
+        if (seen.has(superName)) continue;
+        seen.add(superName);
+        const supers = context
+          .getNodesByName(superName)
+          .filter((n) => n.kind === 'class' && n.language === 'python');
+        // Two classes of that name is no evidence, same rule as above.
+        if (supers.length !== 1) continue;
+        const superCls = supers[0]!;
+        const inherited = context
+          .getNodesByName(methodName)
+          .find(
+            (m) =>
+              m.kind === 'method' &&
+              m.language === 'python' &&
+              m.filePath === superCls.filePath &&
+              (m.qualifiedName === `${superName}::${methodName}` ||
+                m.qualifiedName.endsWith(`::${superName}::${methodName}`)),
+          );
+        if (inherited) {
+          return {
+            original: ref,
+            targetNodeId: inherited.id,
+            confidence: 0.8,
+            resolvedBy: 'instance-method',
+          };
+        }
+        next.push(superName);
+      }
+    }
+    frontier = next;
+  }
+  return null;
 }
 
 /**

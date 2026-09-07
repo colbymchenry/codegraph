@@ -50,6 +50,13 @@ const CHAIN_SHAPE = /^(.+)\(\)\.(\w+)$/;
 const PHP_PROP_SHAPE = /^this->\w+\.\w+$/;
 
 /**
+ * Python `self.<attr>.<method>()`. Parked for the conformance pass for the same
+ * reason as PHP's property receiver: the attribute's class may declare the
+ * method on a SUPERTYPE, and `extends` edges do not exist during the first pass.
+ */
+const PY_SELF_ATTR_SHAPE = /^self\.\w+\.\w+$/;
+
+/**
  * Cache size limits. Each per-resolver cache is bounded so memory
  * stays flat on large codebases (20k+ files). Sizes were chosen to
  * cover the working set for typical resolution batches without
@@ -675,6 +682,9 @@ export class ReferenceResolver {
         return mappings;
       },
 
+      resolveModulePath: (specifier: string, fromFile: string, language) =>
+        resolveImportPath(specifier, fromFile, language, this.context),
+
       getProjectAliases: () => {
         if (this.projectAliases === undefined) {
           this.projectAliases = loadProjectAliases(this.projectRoot);
@@ -1079,6 +1089,13 @@ export class ReferenceResolver {
         PHP_PROP_SHAPE.test(ref.referenceName)
       ) {
         this.deferredChainRefs.push(ref);
+      } else if (
+        // Python `self.<attr>.<method>()` — same reason, same pass.
+        ref.referenceKind === 'calls' &&
+        ref.language === 'python' &&
+        PY_SELF_ATTR_SHAPE.test(ref.referenceName)
+      ) {
+        this.deferredChainRefs.push(ref);
       }
       return null;
     }
@@ -1335,7 +1352,8 @@ export class ReferenceResolver {
       // inference + resolveMethodOnType conformance walk); `::`-receiver
       // languages (Rust) split on `::` (matchScopedCallChain); other
       // dotted-receiver languages on `.` (matchDottedCallChain).
-      const chainMatch = (ref.language === 'php' && PHP_PROP_SHAPE.test(ref.referenceName))
+      const chainMatch = ((ref.language === 'php' && PHP_PROP_SHAPE.test(ref.referenceName))
+        || (ref.language === 'python' && PY_SELF_ATTR_SHAPE.test(ref.referenceName)))
         ? matchMethodCall(ref, this.context)
         : SCOPED_CHAIN_LANGUAGES.has(ref.language)
         ? matchScopedCallChain(ref, this.context)

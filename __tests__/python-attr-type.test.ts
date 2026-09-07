@@ -183,6 +183,112 @@ describe('python self-attribute type inference', () => {
     expect(hit).toEqual(['app/real.py']);
   });
 
+  it('an import written in a DOCSTRING does not decide the module', async () => {
+    // `getImportMappings` is a regex over raw text, so a docstring's import is
+    // indistinguishable from a real one and taking the first match bound this
+    // to `decoy`. The AST refuses a docstring TYPE; the module question had to
+    // be closed too. Disagreeing bindings mean no answer.
+    writeKinds();
+    box('"""Example usage.\n\n    from decoy import Real\n"""\nfrom kinds import Real\n\n\n'
+      + 'class Box:\n    def __init__(self):\n        self.h = Real()\n\n'
+      + '    def go(self, x):\n        return self.h.run(x)\n');
+    fs.writeFileSync(
+      path.join(tempDir, 'decoy.py'),
+      'class Real:\n    def run(self, x):\n        return x\n'
+    );
+    expect(await runCalls()).toEqual([]);
+  });
+
+  it('two candidate files under one module name resolve to neither', async () => {
+    // `endsWith` matched `examples/services/client.py` for
+    // `from services.client import Client`, and the first survivor won by
+    // alphabetical path. Ambiguity is not a tiebreak.
+    fs.mkdirSync(path.join(tempDir, 'services'));
+    fs.mkdirSync(path.join(tempDir, 'examples'));
+    fs.mkdirSync(path.join(tempDir, 'examples', 'services'));
+    const cls = 'class Client:\n    def run(self, x):\n        return x\n';
+    fs.writeFileSync(path.join(tempDir, 'services', 'client.py'), cls);
+    fs.writeFileSync(path.join(tempDir, 'examples', 'services', 'client.py'), cls);
+    box('from services.client import Client\n\n\nclass Box:\n    def __init__(self):\n'
+      + '        self.h = Client()\n\n    def go(self, x):\n        return self.h.run(x)\n');
+    const hit = await runCalls();
+    expect(hit).toEqual(['run@Client::run']);
+    // and it is the real one, not the alphabetically-first copy
+    const go = cg!.getNodesByKind('method').find((n) => n.name === 'go')!;
+    expect(
+      cg!.getOutgoingEdges(go.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg!.getNode(e.target)!.filePath.replace(/\\/g, '/'))
+    ).toEqual(['services/client.py']);
+  });
+
+  it('a parent-relative import resolves against the right package', async () => {
+    // `from ..core import Client` climbs one package. Dropping the dot count
+    // anchored it at the importing file's own directory, so it never resolved.
+    fs.mkdirSync(path.join(tempDir, 'proj'));
+    fs.mkdirSync(path.join(tempDir, 'proj', 'api'));
+    fs.writeFileSync(
+      path.join(tempDir, 'proj', 'core.py'),
+      'class Client:\n    def run(self, x):\n        return x\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'proj', 'api', 'box.py'),
+      'from ..core import Client\n\n\nclass Box:\n    def __init__(self):\n        self.h = Client()\n\n'
+        + '    def go(self, x):\n        return self.h.run(x)\n'
+    );
+    cg = await CodeGraph.init(tempDir, { index: true });
+    const go = cg.getNodesByKind('method').find((n) => n.name === 'go')!;
+    expect(
+      cg.getOutgoingEdges(go.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg!.getNode(e.target)!.filePath.replace(/\\/g, '/'))
+    ).toEqual(['proj/core.py']);
+  });
+
+  it('an aliased import resolves under the exported name', async () => {
+    writeKinds();
+    box('from kinds import Real as R\n\n\nclass Box:\n    def __init__(self):\n        self.h = R()\n\n'
+      + '    def go(self, x):\n        return self.h.run(x)\n');
+    expect(await runCalls()).toEqual(['run@Real::run']);
+  });
+
+  it('the constructor wins over a method written above it', async () => {
+    // `put` is first-wins and the methods were walked in source order, so a
+    // `reset()` above `__init__` decided the type.
+    writeKinds();
+    box('from kinds import Real, Decoy\n\n\nclass Box:\n    def reset(self):\n        self.h = Decoy()\n\n'
+      + '    def __init__(self):\n        self.h = Real()\n\n'
+      + '    def go(self, x):\n        return self.h.run(x)\n');
+    expect(await runCalls()).toEqual(['run@Real::run']);
+  });
+
+  it('an inherited method resolves through the conformance pass', async () => {
+    // `extends` edges do not exist in the first pass, so this shape is parked
+    // and retried. Without the deferral a service subclass — the most ordinary
+    // shape there is — got nothing.
+    fs.writeFileSync(
+      path.join(tempDir, 'base.py'),
+      'class Base:\n    def zorp(self, x):\n        return x\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'other.py'),
+      'class Unrelated:\n    def zorp(self, x):\n        return x\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'real.py'),
+      'from base import Base\n\n\nclass Real(Base):\n    pass\n'
+    );
+    box('from real import Real\n\n\nclass Box:\n    def __init__(self):\n        self.h = Real()\n\n'
+      + '    def go(self, x):\n        return self.h.zorp(x)\n');
+    cg = await CodeGraph.init(tempDir, { index: true });
+    const go = cg.getNodesByKind('method').find((n) => n.name === 'go')!;
+    expect(
+      cg.getOutgoingEdges(go.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg!.getNode(e.target)!.filePath.replace(/\\/g, '/'))
+    ).toEqual(['base.py']);
+  });
+
   it('a factory call is not mistaken for a type', async () => {
     writeKinds();
     box('from kinds import Real\n\n\ndef make_client():\n    return Real()\n\n\n'
