@@ -400,6 +400,16 @@ const PRIVATE_IS_FILE_LOCAL = new Set<string>(['kotlin', 'java', 'csharp', 'swif
 const C_STATIC_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
 
 /**
+ * A C/C++ file that IS a translation unit. A `static` defined here is local
+ * to it. A `static` (typically `static inline`) in a header is a different
+ * thing: the header is textually included, so the function exists in every
+ * unit that includes it and is callable from each — MAVLink's generated
+ * `mavlink_msg_*.h` are nothing but such functions, 4,306 real calls on one
+ * betaflight tree.
+ */
+const C_SOURCE_EXT = /\.(c|cc|cpp|cxx|c\+\+|m|mm)$/i;
+
+/**
  * Whether a C/C++ function definition carries the `static` storage class —
  * read from its first source line(s), since the extractor records no storage
  * class and the kernel arm would need the same field. `static` on the line
@@ -472,10 +482,12 @@ function rustModuleDir(filePath: string): string {
  * definition the language makes file-local is not a candidate for a
  * cross-file name match, however well the names agree:
  *
- * - **C / C++**: a `static` function is local to its translation unit. On a
- *   2,109-file betaflight tree 4,448 cross-file calls resolved onto a `static`
- *   in another file (#1730) — `usbd_get_descriptor` onto the `static
- *   get_device_descriptor` of whichever USB class file ranked first.
+ * - **C / C++**: a `static` function defined in a SOURCE file is local to
+ *   that translation unit; one in a header is part of every unit that
+ *   includes it and stays visible. On a 2,109-file betaflight tree 145
+ *   cross-file calls resolved onto a `static` in another `.c` (#1730) —
+ *   `usbd_get_descriptor` onto the `static get_device_descriptor` of
+ *   whichever USB class file ranked first.
  * - **Kotlin, Java, C#, Swift, Scala, Dart, PHP**: `private` is class- or
  *   file-local. An Android `editor.apply()` resolved onto an unrelated class's
  *   `private fun apply`.
@@ -499,7 +511,11 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   if (candidate.filePath === ref.filePath) return true;
   const lang = candidate.language as string;
   if (lang === 'c' || lang === 'cpp') {
-    return candidate.kind !== 'function' || !isStaticCFunction(candidate, context);
+    return (
+      candidate.kind !== 'function' ||
+      !C_SOURCE_EXT.test(candidate.filePath) ||
+      !isStaticCFunction(candidate, context)
+    );
   }
   if (lang === 'go') {
     // By the name's first letter, not the extractor's flag: the flag is unset

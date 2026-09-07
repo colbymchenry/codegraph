@@ -61,6 +61,14 @@ describe('C: a static function is local to its translation unit', () => {
     expect(await calleesOf('coreRun')).toContain('usb_audio.c:usbGetDescriptor');
   });
 
+  it('keeps a static inline defined in a header: it lives in every unit that includes it', async () => {
+    project({
+      'protocol.h': 'static inline void mav_put_char(char *buf, char c)\n{\n    buf[0] = c;\n}\n',
+      'core.c': '#include "protocol.h"\n\nvoid coreRun(char *b)\n{\n    mav_put_char(b, 0);\n}\n',
+    });
+    expect(await calleesOf('coreRun')).toContain('protocol.h:mav_put_char');
+  });
+
   it('keeps a same-file static, whichever line the keyword is on', async () => {
     project({
       'core.c': 'static void\nhelper(void)\n{\n}\n\nvoid coreRun(void)\n{\n    helper();\n}\n',
