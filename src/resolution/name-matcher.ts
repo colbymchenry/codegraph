@@ -1876,13 +1876,14 @@ export function matchMethodCall(
   // service's `update`; 16 x application code bound to a `get` defined in a TEST
   // file; `self._model.transcribe` on an external Whisper model bound to the
   // file's own `transcribe`) and 3 were genuine `self._capture.stop()` hops onto
-  // the class the constructor assigns. Those 3 are recoverable — python names an
-  // attribute's type in the class body (`self.x: T`, `self.x = T()`, a typed
-  // `__init__` parameter, a class-level annotation, a base class) and reading it
-  // properly needs the AST, not a scan of the class's source lines: a first
-  // attempt at the latter took types out of docstrings and nested classes and
-  // turned a correct edge into a wrong one. Until that exists, this shape is a
-  // silent miss, which is the trade this file makes everywhere else.
+  // the class the constructor assigns. Most of those 3 come back through
+  // `matchPythonSelfAttrCall` below, which reads the attribute's declared type
+  // off the AST — a first attempt that scanned the class's SOURCE LINES instead
+  // took types out of docstrings and nested classes and turned a correct edge
+  // into a wrong one, which is why it reads the tree. What the tree cannot type
+  // — `self.x = other.thing()`, an attribute declared on a base class, an
+  // external object — stays a silent miss, the trade this file makes
+  // everywhere else.
   //
   // A single-segment receiver (`obj.method`) is untouched — it still reaches the
   // strategies below, where a receiver/name overlap is real evidence.
@@ -2217,19 +2218,6 @@ export function rustFieldTypeName(raw: string): string | null {
   return seg;
 }
 
-/**
- * Resolve a Rust call through a field of the enclosing type —
- * `self.inner.run()`, emitted by the extractor as `self.inner.run` (#1585).
- * Mirrors the Go 2-hop precedent above (#1276): the owner type is the calling
- * method's qualified-name prefix (`Outer::run` → `Outer`), the field's declared
- * type comes from the owner struct's OWN declaration lines, and the method is
- * resolved AND VALIDATED on that type by resolveMethodOnType. The caller
- * treats this branch as exclusive for `self.<field>` receivers: a field whose
- * type is external (`std::vec::IntoIter`, `regex::Regex`), a generic
- * parameter, or not declared where we can see it yields null and the ref stays
- * unresolved. Rust struct fields are not graph nodes, so the declaration text
- * is the only place the type lives.
- */
 /** Python names whose methods are the runtime's, never a project symbol's. */
 const PYTHON_BUILTIN_TYPES: ReadonlySet<string> = new Set([
   'list', 'dict', 'set', 'frozenset', 'tuple', 'str', 'bytes', 'bytearray',
@@ -2374,6 +2362,19 @@ function matchPythonSelfAttrCall(
   return resolveMethodOnType(typeName, methodName, ref, context, 0.85, 'instance-method');
 }
 
+/**
+ * Resolve a Rust call through a field of the enclosing type —
+ * `self.inner.run()`, emitted by the extractor as `self.inner.run` (#1585).
+ * Mirrors the Go 2-hop precedent above (#1276): the owner type is the calling
+ * method's qualified-name prefix (`Outer::run` → `Outer`), the field's declared
+ * type comes from the owner struct's OWN declaration lines, and the method is
+ * resolved AND VALIDATED on that type by resolveMethodOnType. The caller
+ * treats this branch as exclusive for `self.<field>` receivers: a field whose
+ * type is external (`std::vec::IntoIter`, `regex::Regex`), a generic
+ * parameter, or not declared where we can see it yields null and the ref stays
+ * unresolved. Rust struct fields are not graph nodes, so the declaration text
+ * is the only place the type lives.
+ */
 function matchRustSelfFieldCall(
   field: string,
   methodName: string,

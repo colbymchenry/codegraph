@@ -76,11 +76,22 @@ describe('python self-attribute type inference', () => {
     expect(await runCalls()).toEqual(['run@Real::run']);
   });
 
-  it('unwraps Optional and a `| None` union', async () => {
+  it('unwraps Optional', async () => {
     writeKinds();
     box('from kinds import Real\n\n\nclass Box:\n    def __init__(self):\n'
-      + '        self.h: Optional[Real] = None\n        self.j: Real | None = None\n\n'
+      + '        self.h: Optional[Real] = None\n\n'
       + '    def go(self, x):\n        return self.h.run(x)\n');
+    expect(await runCalls()).toEqual(['run@Real::run']);
+  });
+
+  it('unwraps a `| None` union', async () => {
+    // Split from Optional deliberately: one test declaring both attributes and
+    // calling only one proved nothing about the other, which is how the first
+    // version of this file left the `| None` branch unexercised.
+    writeKinds();
+    box('from kinds import Real\n\n\nclass Box:\n    def __init__(self):\n'
+      + '        self.j: Real | None = None\n\n'
+      + '    def go(self, x):\n        return self.j.run(x)\n');
     expect(await runCalls()).toEqual(['run@Real::run']);
   });
 
@@ -110,18 +121,22 @@ describe('python self-attribute type inference', () => {
     expect(await runCalls()).toEqual(['run@Real::run']);
   });
 
-  it('a same-named class in another file donates nothing', async () => {
-    writeKinds();
+  it('a type this file never imported is not taken from another file', async () => {
+    // The attribute IS typed — `Client()` — so the cross-file question is
+    // actually reached. (An earlier version left the attribute untyped, so the
+    // reader produced nothing and the test passed without testing anything.)
+    // `box.py` declares no `Client` and imports none, so there is no evidence
+    // that `other.py`'s is the one meant.
     fs.writeFileSync(
       path.join(tempDir, 'other.py'),
-      'from kinds import Decoy\n\n\nclass Box:\n    def __init__(self):\n        self.h = Decoy()\n'
+      'class Client:\n    def run(self, x):\n        return x\n'
     );
-    box('class Box:\n    def __init__(self, h):\n        self.h = h\n\n'
+    box('class Box:\n    def __init__(self):\n        self.h = Client()\n\n'
       + '    def go(self, x):\n        return self.h.run(x)\n');
     expect(await runCalls()).toEqual([]);
   });
 
-  it('an external library object does not bind to a same-named project class', async () => {
+  it('an external library object written dotted does not bind to a project class', async () => {
     fs.writeFileSync(
       path.join(tempDir, 'models.py'),
       'class Session:\n    def run(self, x):\n        return x\n'
@@ -180,6 +195,19 @@ describe('python self-attribute type inference', () => {
     writeKinds();
     box('class Box:\n    def __init__(self):\n        self.h = []\n        self.k: list[int] = []\n\n'
       + '    def go(self, x):\n        self.k.run(x)\n        return self.h.run(x)\n');
+    expect(await runCalls()).toEqual([]);
+  });
+
+  it('a builtin name is refused even where the project shadows it', async () => {
+    // `self.h: dict` names the builtin, whatever a project class of that name
+    // says. Without the builtin list the class lookup would find this `dict`
+    // and bind to it — the generics check does not fire on a bare name.
+    fs.writeFileSync(
+      path.join(tempDir, 'shadow.py'),
+      'class dict:\n    def run(self, x):\n        return x\n'
+    );
+    box('from shadow import dict\n\n\nclass Box:\n    def __init__(self):\n'
+      + '        self.h: dict = {}\n\n    def go(self, x):\n        return self.h.run(x)\n');
     expect(await runCalls()).toEqual([]);
   });
 
