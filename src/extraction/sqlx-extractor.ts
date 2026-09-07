@@ -47,6 +47,13 @@ interface RefTarget {
 /** The blocks that are Dataform syntax rather than SQL. */
 const BLOCK_KEYWORDS = ['config', 'js', 'pre_operations', 'post_operations'] as const;
 
+/**
+ * A table name that is only the underscore mask an interpolation left behind —
+ * bare, or still wearing the BigQuery backticks it was written inside, which
+ * the SQL grammar keeps as part of the identifier.
+ */
+const MASKED_NAME = /^`?_+`?$/;
+
 export class SqlxExtractor {
   private filePath: string;
   private source: string;
@@ -198,8 +205,6 @@ export class SqlxExtractor {
   ): void {
     if (!isLanguageSupported('sql')) return;
     const chars = this.source.split('');
-    // A block is statement-level, so whitespace in its place still parses.
-    for (const block of blocks.values()) this.mask(chars, block.full, ' ');
     // An interpolation stands where a TABLE NAME goes, so it has to leave an
     // identifier behind: blanked to whitespace, `FROM ${ref("x")} c` reads as
     // `FROM c` and the alias becomes a phantom table reference. The mask is a
@@ -208,9 +213,13 @@ export class SqlxExtractor {
     for (const span of interpolations) {
       this.mask(chars, { start: span.start - 2, end: span.end + 1 }, '_');
     }
+    // A block is statement-level, so whitespace in its place still parses —
+    // and it goes last so an operations block's own interpolations, masked
+    // just above, are blanked along with the block that holds them.
+    for (const block of blocks.values()) this.mask(chars, block.full, ' ');
     const result = new TreeSitterExtractor(this.filePath, chars.join(''), 'sql').extract();
     for (const ref of result.unresolvedReferences) {
-      if (ref.referenceKind !== 'references' || /^_+$/.test(ref.referenceName)) continue;
+      if (ref.referenceKind !== 'references' || MASKED_NAME.test(ref.referenceName)) continue;
       this.addReference(modelNodeId, ref.referenceName, ref.line, seen);
     }
   }
@@ -230,7 +239,9 @@ export class SqlxExtractor {
    * One pass over the file, at brace depth 0, collecting the Dataform blocks
    * and every `${ … }` interpolation. Strings and comments are skipped whole,
    * so a `${ref("x")}` written inside a string literal or after a `--` is
-   * neither a block nor an interpolation, and produces nothing.
+   * neither a block nor an interpolation, and produces nothing. A BACKTICK is
+   * not a string here: BigQuery quotes identifiers with it, so ``​`${ref("x")}`​``
+   * is a table name being interpolated, and the scan reads through it.
    */
   private scan(): { blocks: Map<string, { body: Span; full: Span }>; interpolations: Span[] } {
     const s = this.source;
@@ -238,26 +249,58 @@ export class SqlxExtractor {
     const interpolations: Span[] = [];
     let i = 0;
     while (i < s.length) {
-      const skipped = this.skipAtomic(i, true);
+      const skipped = this.skipAtomic(i, false);
       if (skipped > i) {
         i = skipped;
         continue;
       }
-      if (s[i] === '$' && s[i + 1] === '{') {
-        const end = this.matchBrace(i + 1, s.length);
-        interpolations.push({ start: i + 2, end: end - 1 });
-        i = end;
+      const interp = this.interpolationAt(i, s.length);
+      if (interp) {
+        interpolations.push(interp.body);
+        i = interp.end;
         continue;
       }
       const block = this.blockAt(i);
       if (block) {
         blocks.set(block.name, { body: block.body, full: block.full });
+        // pre/post_operations hold SQL, so the `${ … }` refs written inside
+        // them count like any other. `config` and `js` don't: they are read
+        // as config keys and as ref() calls respectively.
+        if (block.name === 'pre_operations' || block.name === 'post_operations') {
+          this.collectInterpolations(block.body, interpolations);
+        }
         i = block.full.end;
         continue;
       }
       i++;
     }
     return { blocks, interpolations };
+  }
+
+  /** Every `${ … }` body span inside one stretch of SQL. */
+  private collectInterpolations(span: Span, out: Span[]): void {
+    let i = span.start;
+    while (i < span.end) {
+      const skipped = this.skipAtomic(i, false);
+      if (skipped > i) {
+        i = Math.min(skipped, span.end);
+        continue;
+      }
+      const interp = this.interpolationAt(i, span.end);
+      if (interp) {
+        out.push(interp.body);
+        i = interp.end;
+        continue;
+      }
+      i++;
+    }
+  }
+
+  /** A `${ … }` starting at `i`: its body span, and where the whole span ends. */
+  private interpolationAt(i: number, end: number): { body: Span; end: number } | null {
+    if (this.source[i] !== '$' || this.source[i + 1] !== '{') return null;
+    const close = this.matchBrace(i + 1, end);
+    return { body: { start: i + 2, end: close - 1 }, end: close };
   }
 
   /** A `config|js|pre_operations|post_operations {` starting at `i`. */

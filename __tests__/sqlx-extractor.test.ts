@@ -108,6 +108,23 @@ describe('Dataform .sqlx — ref() forms', () => {
   it('drops a ref whose argument is not a literal', () => {
     expect(refs('SELECT * FROM ${ref(sourceName)}\n')).toEqual([]);
   });
+
+  it('reads a ref() from a pre_operations / post_operations block', () => {
+    const sqlx =
+      'config { type: "table" }\n' +
+      'pre_operations {\n  DELETE FROM ${self()} WHERE id IN (SELECT id FROM ${ref("purges")})\n}\n' +
+      'SELECT 1\n' +
+      'post_operations {\n  GRANT SELECT ON ${self()} TO ${ref("readers")}\n}\n';
+    expect(refs(sqlx)).toEqual(['purges', 'readers']);
+  });
+
+  it('reads a ref() inside a backtick-quoted BigQuery identifier', () => {
+    // A backtick quotes an IDENTIFIER in BigQuery, so what it holds is still
+    // interpolated — unlike a single- or double-quoted string.
+    expect(refs('SELECT * FROM `${ref("staging", "customers")}`\n')).toEqual([
+      'staging.customers',
+    ]);
+  });
 });
 
 describe('Dataform .sqlx — config dependencies', () => {
