@@ -2398,6 +2398,86 @@ function pythonModuleFile(
 }
 
 /**
+ * The module sources named by imports that are actually CODE in `filePath` —
+ * or null if the file could not be read.
+ *
+ * `getImportMappings` is a regex over raw text with no notion of comments or
+ * strings, so `# from legacy import Real` and a docstring's usage example both
+ * produce mappings indistinguishable from a real import. The agreement rule in
+ * `pythonTypeClass` could only refuse BOTH, which turned a stale comment into a
+ * silent miss — and one level down, at the `__init__.py` re-export hop, there
+ * is no agreement rule at all, so a commented-out line could DECIDE an edge.
+ *
+ * So strip the text that is not code, then ask the extractor's OWN regexes what
+ * is left. Running the same patterns is the point: a filter stricter than the
+ * thing it filters silently drops legitimate bindings. A hand-written
+ * line-anchored version did exactly that — `import os; from kinds import Real`
+ * resolved before it and stopped resolving after.
+ *
+ * Returning null (unreadable) is NOT the same as returning an empty set. Empty
+ * means "read it, and every import-looking line was comment or string", which
+ * is precisely when the bindings must all be refused; conflating the two let a
+ * file whose ONLY import was commented out resolve through it.
+ */
+function livePythonImportSources(
+  filePath: string,
+  context: ResolutionContext,
+): Set<string> | null {
+  const lines =
+    context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split(/\r?\n/) ?? null;
+  if (lines === null) return null;
+
+  const code: string[] = [];
+  let fence: string | null = null; // the triple-quote we are inside, if any
+  for (const raw of lines) {
+    let kept = '';
+    let i = 0;
+    while (i < raw.length) {
+      if (fence !== null) {
+        const end = raw.indexOf(fence, i);
+        if (end < 0) {
+          i = raw.length;
+          break;
+        }
+        i = end + 3;
+        fence = null;
+        continue;
+      }
+      const three = raw.slice(i, i + 3);
+      if (three === '"""' || three === "'''") {
+        const end = raw.indexOf(three, i + 3);
+        if (end < 0) {
+          fence = three; // runs past this line
+          i = raw.length;
+          break;
+        }
+        i = end + 3; // opened and closed on one line
+        continue;
+      }
+      const ch = raw[i]!;
+      if (ch === '#') break; // the rest of the line is a comment
+      if (ch === '"' || ch === "'") {
+        let j = i + 1;
+        while (j < raw.length && raw[j] !== ch) j += raw[j] === '\\' ? 2 : 1;
+        i = j + 1;
+        continue;
+      }
+      kept += ch;
+      i++;
+    }
+    code.push(kept);
+  }
+
+  const stripped = code.join('\n');
+  const sources = new Set<string>();
+  // The two patterns `extractPythonImports` uses, verbatim — including the
+  // column-anchoring difference between them.
+  for (const m of stripped.matchAll(/from\s+([\w.]+)\s+import\s+([^#\n]+)/g)) sources.add(m[1]!);
+  for (const m of stripped.matchAll(/^import\s+([\w.]+)(?:\s+as\s+(\w+))?/gm)) sources.add(m[1]!);
+  return sources;
+}
+
+/**
  * The project class a python type name refers to AT THIS CALL SITE, or null.
  *
  * Everything here is a refusal to guess, and each refusal is a defect this
@@ -2427,20 +2507,10 @@ function pythonTypeClass(
   context: ResolutionContext,
 ): Node | null {
   const here = ref.filePath.replace(/\\/g, '/');
-  // `getImportMappings` is a regex over raw text and strips no comments, so
-  // `# from legacy import Real` above a real import produces a second, always
-  // disagreeing binding — and the agreement rule below then refuses both.
-  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
-  const liveSources = new Set<string>();
-  for (const raw of lines) {
-    const hash = raw.indexOf('#');
-    const code = hash >= 0 ? raw.slice(0, hash) : raw;
-    const m = /^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))/.exec(code);
-    if (m) liveSources.add((m[1] ?? m[2])!);
-  }
+  const liveSources = livePythonImportSources(ref.filePath, context);
   const bindings = context
     .getImportMappings(ref.filePath, ref.language)
-    .filter((i) => i.localName === typeName && (liveSources.size === 0 || liveSources.has(i.source)));
+    .filter((i) => i.localName === typeName && (liveSources === null || liveSources.has(i.source)));
 
   const classesNamed = (name: string) =>
     context.getNodesByName(name).filter((n) => n.kind === 'class' && n.language === 'python');

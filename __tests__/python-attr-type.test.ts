@@ -187,7 +187,13 @@ describe('python self-attribute type inference', () => {
     // `getImportMappings` is a regex over raw text, so a docstring's import is
     // indistinguishable from a real one and taking the first match bound this
     // to `decoy`. The AST refuses a docstring TYPE; the module question had to
-    // be closed too. Disagreeing bindings mean no answer.
+    // be closed too.
+    //
+    // This used to resolve to NOTHING — the two bindings disagreed and the rule
+    // could only refuse both. `livePythonImportSources` strips the docstring, so
+    // the decoy is no longer a binding at all and the real import wins. Same
+    // guarantee, strictly more recall: what matters is that `decoy` never
+    // decides, not that the answer is empty.
     writeKinds();
     box('"""Example usage.\n\n    from decoy import Real\n"""\nfrom kinds import Real\n\n\n'
       + 'class Box:\n    def __init__(self):\n        self.h = Real()\n\n'
@@ -196,6 +202,46 @@ describe('python self-attribute type inference', () => {
       path.join(tempDir, 'decoy.py'),
       'class Real:\n    def run(self, x):\n        return x\n'
     );
+    expect(await runCalls()).toEqual(['run@Real::run']);
+  });
+
+  it('a string literal that looks like an import donates no binding', async () => {
+    // NOTE: this passes on the parent too — the old line-anchored filter
+    // happened to exclude it. It is a GUARD, not a fix: dropping the anchor
+    // (needed so the filter is not stricter than the extractor) would have
+    // re-opened it if `livePythonImportSources` did not also strip strings.
+    writeKinds();
+    box('from kinds import Real\nDOC = "from decoy import Real"\n\n\nclass Box:\n'
+      + '    def __init__(self):\n        self.h = Real()\n\n'
+      + '    def go(self, x):\n        return self.h.run(x)\n');
+    fs.writeFileSync(
+      path.join(tempDir, 'decoy.py'),
+      'class Real:\n    def run(self, x):\n        return x\n'
+    );
+    expect(await runCalls()).toEqual(['run@Real::run']);
+  });
+
+  it('a real import that is not at the start of its line still binds', async () => {
+    // The filter must never be stricter than the extractor it filters: a
+    // line-anchored version dropped this binding, and the type stopped
+    // resolving where it had resolved before.
+    writeKinds();
+    box('import os; from kinds import Real\n\n\nclass Box:\n    def __init__(self):\n'
+      + '        self.h = Real()\n\n    def go(self, x):\n        return self.h.run(x)\n');
+    expect(await runCalls()).toEqual(['run@Real::run']);
+  });
+
+  it('a file whose ONLY import is commented out resolves nothing', async () => {
+    // The escape hatch for an unreadable file also fired here, because
+    // stripping the comment left no live import at all — so the one binding in
+    // the file was a commented-out line, unopposed, and it produced an edge.
+    writeKinds(); // DISTRACTOR
+    fs.writeFileSync(
+      path.join(tempDir, 'legacy.py'),
+      'class Real:\n    def run(self, x):\n        return x\n'
+    );
+    box('# from legacy import Real\n\n\nclass Box:\n    def __init__(self):\n'
+      + '        self.h = Real()\n\n    def go(self, x):\n        return self.h.run(x)\n');
     expect(await runCalls()).toEqual([]);
   });
 
