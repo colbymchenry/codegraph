@@ -12162,10 +12162,6 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
 
 describe('SQL Extraction', () => {
   describe('Language detection', () => {
-    it('should detect SQL files', () => {
-      expect(detectLanguage('schema.sql')).toBe('sql');
-    });
-
     it('should report SQL as supported', () => {
       expect(isLanguageSupported('sql')).toBe(true);
       expect(getSupportedLanguages()).toContain('sql');

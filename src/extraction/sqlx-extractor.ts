@@ -1,5 +1,5 @@
 import { Edge, ExtractionError, ExtractionResult, Node, UnresolvedReference } from '../types';
-import { generateNodeId } from './tree-sitter-helpers';
+import { computeLineStarts, generateNodeId, getLineNumber } from './tree-sitter-helpers';
 import { TreeSitterExtractor } from './tree-sitter';
 import { isLanguageSupported } from './grammars';
 
@@ -66,7 +66,7 @@ export class SqlxExtractor {
   constructor(filePath: string, source: string) {
     this.filePath = filePath;
     this.source = source;
-    this.computeLineStarts();
+    this.lineStarts = computeLineStarts(this.source);
   }
 
   extract(): ExtractionResult {
@@ -165,7 +165,7 @@ export class SqlxExtractor {
   /** Each entry of the config `dependencies: ["n", "s.n"]` array. */
   private addDependencies(span: Span | undefined, out: RefTarget[]): void {
     if (!span) return;
-    const line = this.getLineNumber(span.start);
+    const line = getLineNumber(this.lineStarts, span.start);
     for (const dep of this.stringLiterals(span)) {
       if (dep) out.push({ name: dep, line });
     }
@@ -337,7 +337,7 @@ export class SqlxExtractor {
       const call = this.refCallAt(i, span.end);
       if (call) {
         const target = this.parseRefArgs(call.args);
-        if (target) out.push({ ...target, line: this.getLineNumber(i) });
+        if (target) out.push({ ...target, line: getLineNumber(this.lineStarts, i) });
         i = call.end;
         continue;
       }
@@ -353,7 +353,7 @@ export class SqlxExtractor {
     let j = i + name.length;
     while (j < end && /\s/.test(s[j]!)) j++;
     if (s[j] !== '(') return null;
-    const close = this.matchParen(j, end);
+    const close = this.matchDelimiter(j, end, '(', ')');
     return { args: { start: j + 1, end: close - 1 }, end: close };
   }
 
@@ -518,11 +518,6 @@ export class SqlxExtractor {
     return this.matchDelimiter(open, end, '{', '}');
   }
 
-  /** Offset just past the `)` closing the `(` at `open`. */
-  private matchParen(open: number, end: number): number {
-    return this.matchDelimiter(open, end, '(', ')');
-  }
-
   private matchDelimiter(open: number, end: number, opener: string, closer: string): number {
     const s = this.source;
     let depth = 0;
@@ -542,23 +537,5 @@ export class SqlxExtractor {
       i++;
     }
     return end;
-  }
-
-  private computeLineStarts(): void {
-    this.lineStarts = [0];
-    for (let i = 0; i < this.source.length; i++) {
-      if (this.source.charCodeAt(i) === 10) this.lineStarts.push(i + 1);
-    }
-  }
-
-  private getLineNumber(offset: number): number {
-    let lo = 0;
-    let hi = this.lineStarts.length - 1;
-    while (lo < hi) {
-      const mid = (lo + hi + 1) >>> 1;
-      if (this.lineStarts[mid]! <= offset) lo = mid;
-      else hi = mid - 1;
-    }
-    return lo + 1;
   }
 }

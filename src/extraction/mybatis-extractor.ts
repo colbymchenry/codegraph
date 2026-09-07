@@ -1,5 +1,5 @@
 import { Edge, ExtractionError, ExtractionResult, Node, UnresolvedReference } from '../types';
-import { generateNodeId } from './tree-sitter-helpers';
+import { computeLineStarts, generateNodeId, getLineNumber } from './tree-sitter-helpers';
 
 /**
  * MyBatisExtractor — parses MyBatis mapper XML files.
@@ -49,7 +49,7 @@ export class MyBatisExtractor {
     // `<![CDATA[ … ]]>` is left intact: a literal `<!--` there is SQL data, not
     // an XML comment.
     this.source = MyBatisExtractor.stripXmlComments(source);
-    this.computeLineStarts();
+    this.lineStarts = computeLineStarts(this.source);
   }
 
   private static stripXmlComments(source: string): string {
@@ -199,8 +199,8 @@ export class MyBatisExtractor {
       if (!idMatch) continue;
       const id = idMatch[2]!;
       const absoluteIndex = bodyStart + m.index;
-      const startLine = this.getLineNumber(absoluteIndex);
-      const endLine = this.getLineNumber(absoluteIndex + m[0].length);
+      const startLine = getLineNumber(this.lineStarts, absoluteIndex);
+      const endLine = getLineNumber(this.lineStarts, absoluteIndex + m[0].length);
       const { qualifiedName: qualified, name } = this.qualifyStatement(namespace, id);
       const isSqlFragment = elemType === 'sql';
       // The id-hash folds in the statement's byte offset (unique per statement
@@ -242,7 +242,7 @@ export class MyBatisExtractor {
             ? `${namespace}::${refid}`
             : refid;
         const includeOffset = absoluteIndex + (m[0].length - m[3]!.length - `</${elemType}>`.length) + inc.index;
-        const line = this.getLineNumber(includeOffset);
+        const line = getLineNumber(this.lineStarts, includeOffset);
         this.unresolvedReferences.push({
           fromNodeId: nodeId,
           referenceName: refQualified,
@@ -287,24 +287,5 @@ export class MyBatisExtractor {
 
   private previewSql(body: string): string {
     return body.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
-  }
-
-  private computeLineStarts(): void {
-    this.lineStarts = [0];
-    for (let i = 0; i < this.source.length; i++) {
-      if (this.source.charCodeAt(i) === 10) this.lineStarts.push(i + 1);
-    }
-  }
-
-  private getLineNumber(offset: number): number {
-    // Binary search
-    let lo = 0;
-    let hi = this.lineStarts.length - 1;
-    while (lo < hi) {
-      const mid = (lo + hi + 1) >>> 1;
-      if (this.lineStarts[mid]! <= offset) lo = mid;
-      else hi = mid - 1;
-    }
-    return lo + 1;
   }
 }
