@@ -30,6 +30,7 @@ import { AstroExtractor } from './astro-extractor';
 import { DfmExtractor } from './dfm-extractor';
 import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
+import { SqlxExtractor } from './sqlx-extractor';
 import { CfmlExtractor } from './cfml-extractor';
 import { tryKernelExtract, takeDeferredPreParse } from './kernel';
 import {
@@ -6840,6 +6841,12 @@ export function extractFromSource(
     // Custom extractor for MyBatis mapper XML. Non-mapper XML returns just a
     // file node so the watcher tracks it without emitting symbols.
     const extractor = new MyBatisExtractor(filePath, source);
+    result = extractor.extract();
+  } else if (fileExtension === '.sqlx') {
+    // Custom extractor for Dataform models: a .sqlx is SQL wrapped in config/js/
+    // operations blocks and ${…} interpolations, so it never parses as SQL, and
+    // its ref()/dependencies edges live in those spans rather than in the tree.
+    const extractor = new SqlxExtractor(filePath, source);
     result = extractor.extract();
   } else if (detectedLanguage === 'cfml' || detectedLanguage === 'cfscript') {
     // Custom extractor for CFML (.cfc/.cfm) — dialect-switches between the

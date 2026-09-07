@@ -172,6 +172,9 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.tfvars': 'terraform',
   '.tofu': 'terraform',
   '.sql': 'sql',
+  // Dataform models. Not parseable SQL until the config/js/operations blocks
+  // and ${…} spans are blanked, which SqlxExtractor does before delegating.
+  '.sqlx': 'sql',
 };
 
 /**
