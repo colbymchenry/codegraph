@@ -975,7 +975,10 @@ export function blankCStatementMacroCalls(source: string): string {
   const content = (l: string): string => l.replace(/\r$/, '').trim();
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i] as string;
-    const m = /^[ \t]+([a-z_][a-z0-9_]*)[ \t]*\(/.exec(line);
+    // Lowercase iterator macros, or an all-caps block macro
+    // (`ATOMIC_BLOCK(NVIC_PRIO_MAX) {`, `PG_FOREACH(reg) {` — betaflight);
+    // a PascalCase name is left alone (a constructor, if the file is C++).
+    const m = /^[ \t]+([a-z_][a-z0-9_]*|[A-Z_][A-Z0-9_]*)[ \t]*\(/.exec(line);
     if (!m || C_STMT_MACRO_KEYWORDS.has(m[1] as string)) continue;
     const open = line.indexOf('(', m[0].length - 1);
     let depth = 0;
@@ -1592,6 +1595,110 @@ export function blankCDesignatedMacroArgs(source: string): string {
   return out.join('');
 }
 
+/**
+ * Collapse a `#if … #elif … #else … #endif` group whose branches are not
+ * self-contained statements to its first live branch. tree-sitter-c keeps
+ * EVERY branch of a conditional group and parses each as a run of block
+ * items, so a group is only harmless when each branch is complete on its
+ * own. Three shapes in real C are not, and each ends in a phantom function
+ * (K&R `if(cond) { … }` reads as an implicit-int function definition named
+ * `if`, and the extractor then files it — and every symbol after it — under
+ * the enclosing function; 265 on a betaflight tree, #1729 follow-up):
+ *
+ *  - a branch that BEGINS with `else` — `} #ifdef X  else if (…) { … } #endif`
+ *    (a conditional arm of an if-chain);
+ *  - a branch that ENDS with a bare `if (…)` / `else if (…)` header whose
+ *    body sits after the `#endif` (the ST HAL's per-device latency tables);
+ *  - a branch whose braces do not balance — a function signature or a `{`
+ *    that differs per configuration, with the body shared.
+ *
+ * The first branch not written `#if 0` is kept verbatim; every other branch
+ * AND the group's directive lines are blanked to spaces (newlines and `\r`
+ * kept, so offsets survive), which is exactly what the preprocessor would
+ * hand a compiler for that configuration. The symbols the other branches
+ * held were not extracting cleanly anyway. Balanced groups — the vast
+ * majority — are untouched. This pass edits directive lines on purpose, so
+ * it runs AFTER `restoreDirectiveLines` (like the named-variadic pass).
+ * Groups are handled innermost-first; an inner group inside a blanked branch
+ * simply disappears with it.
+ */
+const C_COND_OPEN_RE = /^[ \t]*#[ \t]*(if|ifdef|ifndef)\b[ \t]*(.*)$/;
+const C_COND_NEXT_RE = /^[ \t]*#[ \t]*(elif|else)\b/;
+const C_COND_ENDIF_RE = /^[ \t]*#[ \t]*endif\b/;
+export function blankCUnbalancedConditionalBranches(source: string): string {
+  if (source.indexOf('#') === -1) return source;
+  const lines = source.split('\n');
+  const stripCr = (l: string): string => (l.endsWith('\r') ? l.slice(0, -1) : l);
+  // Code content of a line: comments and string / char literals removed.
+  const code = (l: string): string =>
+    stripCr(l)
+      .replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, '')
+      .replace(/\/\*.*?\*\//g, '')
+      .replace(/\/\/.*$/, '')
+      .trim();
+  const blank = (l: string): string => l.replace(/[^\r]/g, ' ');
+  // Directive line indices of each open group, innermost last.
+  const stack: Array<{ marks: number[]; keep: number }> = [];
+  const directive: boolean[] = [];
+  let changed = false;
+  let continuation = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = stripCr(lines[i] as string);
+    const isDirective: boolean = continuation || /^[ \t]*#/.test(line);
+    directive[i] = isDirective;
+    const wasContinuation = continuation;
+    continuation = isDirective && /\\\s*$/.test(line);
+    if (!isDirective || wasContinuation) continue;
+    let m: RegExpExecArray | null;
+    if ((m = C_COND_OPEN_RE.exec(line))) {
+      const dead = m[1] === 'if' && /^0\b/.test(m[2] as string);
+      stack.push({ marks: [i], keep: dead ? 1 : 0 });
+      continue;
+    }
+    const top = stack[stack.length - 1];
+    if (!top) continue;
+    if (C_COND_NEXT_RE.test(line)) {
+      top.marks.push(i);
+      continue;
+    }
+    if (!C_COND_ENDIF_RE.test(line)) continue;
+    stack.pop();
+    top.marks.push(i);
+    if (top.keep >= top.marks.length - 1) continue; // `#if 0` with nothing to keep
+    let damaged = false;
+    for (let b = 0; b < top.marks.length - 1 && !damaged; b++) {
+      const body: string[] = [];
+      for (let k = (top.marks[b] as number) + 1; k < (top.marks[b + 1] as number); k++) {
+        if (directive[k]) continue; // a `\`-continued directive line
+        const c = code(lines[k] as string);
+        if (c) body.push(c);
+      }
+      if (body.length === 0) continue;
+      const first = body[0] as string;
+      const last = body[body.length - 1] as string;
+      let depth = 0;
+      for (const l of body) for (const ch of l) depth += ch === '{' ? 1 : ch === '}' ? -1 : 0;
+      damaged =
+        depth !== 0 ||
+        /^else\b/.test(first) ||
+        (/^(else[ \t]+)?if[ \t]*\(/.test(last) && /\)$/.test(last));
+    }
+    if (!damaged) continue;
+    for (let b = 0; b < top.marks.length - 1; b++) {
+      const from = top.marks[b] as number;
+      const to = top.marks[b + 1] as number;
+      // The directive line (with its `\`-continuations), then — unless this
+      // is the kept branch — the branch body.
+      for (let k = from; k < to && (k === from || directive[k]); k++) lines[k] = blank(lines[k] as string);
+      if (b === top.keep) continue;
+      for (let k = from + 1; k < to; k++) lines[k] = blank(lines[k] as string);
+    }
+    lines[i] = blank(lines[i] as string);
+    changed = true;
+  }
+  return changed ? lines.join('\n') : source;
+}
+
 function preParseCSource(source: string): string {
   const inner = blankCDesignatedMacroArgs(blankCKernelAnnotations(blankCCplusplusGuardBodies(source)));
   let blanked = blankCLeadingAttrMacros(
@@ -1616,9 +1723,12 @@ function preParseCSource(source: string): string {
     )
   );
   if (looksLikeCudaSource(blanked)) blanked = blankCudaConstructs(blanked);
-  // The named-variadic `#define` pass runs AFTER the directive restore — it
-  // deliberately edits directive lines (see its doc comment).
-  return blankCNamedVariadicDefineDots(restoreDirectiveLines(source, blanked));
+  // The named-variadic `#define` pass and the conditional-group collapse run
+  // AFTER the directive restore — they deliberately edit directive lines (see
+  // their doc comments).
+  return blankCUnbalancedConditionalBranches(
+    blankCNamedVariadicDefineDots(restoreDirectiveLines(source, blanked))
+  );
 }
 
 export const cppExtractor: LanguageExtractor = {

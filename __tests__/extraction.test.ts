@@ -12067,6 +12067,118 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     }
   });
 
+  it('blankCUnbalancedConditionalBranches collapses a damaged #if group to its first branch, offsets kept', async () => {
+    const { blankCUnbalancedConditionalBranches } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'void f(int id)',
+      '{',
+      '    if (id == 1) {',
+      '        a(id);',
+      '    }',
+      '#if defined(USE_V) || \\',
+      '    defined(USE_W)',
+      '    else if (id == 2) { // "{" in a comment',
+      '        b(id);',
+      '    }',
+      '#else',
+      '    else if (id == 3) {',
+      '        c(id);',
+      '    }',
+      '#endif',
+      '#ifdef USE_X',
+      '    d(id);',
+      '#else',
+      '    e(id);',
+      '#endif',
+      '}',
+      '#if 0',
+      'void dead(void) {',
+      '#else',
+      'void live(void) {',
+      '#endif',
+      '}',
+    ].join('\n');
+    const out = blankCUnbalancedConditionalBranches(src);
+    expect(out.length).toBe(src.length);
+    expect(out.split('\n').length).toBe(src.split('\n').length);
+    const lines = out.split('\n');
+    // The `else`-led group: directive lines (continuation included) and the
+    // second branch are spaces; the first branch is verbatim.
+    expect(lines[5]).toBe(' '.repeat(src.split('\n')[5]!.length));
+    expect(lines[6]).toBe(' '.repeat(src.split('\n')[6]!.length));
+    expect(lines[7]).toBe('    else if (id == 2) { // "{" in a comment');
+    expect(lines[8]).toBe('        b(id);');
+    expect(lines[10]).toBe('     ');
+    expect(lines[11]).toBe(' '.repeat(src.split('\n')[11]!.length));
+    expect(out).not.toContain('c(id)');
+    expect(lines[14]).toBe('      ');
+    // A balanced group is untouched, directives included.
+    expect(lines[15]).toBe('#ifdef USE_X');
+    expect(lines[16]).toBe('    d(id);');
+    expect(lines[18]).toBe('    e(id);');
+    expect(lines[19]).toBe('#endif');
+    // `#if 0` keeps the live branch instead.
+    expect(out).not.toContain('dead');
+    expect(lines[24]).toBe('void live(void) {');
+    // No conditional group at all: identity.
+    const plain = 'int g(void) {\n#define X 1\n    return X;\n}\n';
+    expect(blankCUnbalancedConditionalBranches(plain)).toBe(plain);
+  });
+
+  it('a #if branch beginning with `else` no longer files the rest of the file under the enclosing function', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-c-ifelse-'));
+    try {
+      fs.writeFileSync(
+        path.join(dir, 'current.c'),
+        [
+          'void currentMeterRead(int id, meter_t *meter)',
+          '{',
+          '    if (id == 1) {',
+          '        adcRead(meter);',
+          '    }',
+          '#ifdef USE_VIRTUAL',
+          '    else if (id == 2) {',
+          '        virtualRead(meter);',
+          '    }',
+          '#endif',
+          '    else {',
+          '        resetMeter(meter);',
+          '    }',
+          '}',
+          '',
+          'static bool markBusy(void)',
+          '{',
+          '    ATOMIC_BLOCK(NVIC_PRIO_MAX) {',
+          '        busy = true;',
+          '    }',
+          '    return true;',
+          '}',
+          '',
+          'int after(void)',
+          '{',
+          '    return 1;',
+          '}',
+          '',
+        ].join('\n')
+      );
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const fns = cg.getNodesByKind('function').filter((n) => n.filePath === 'current.c');
+        const byName = Object.fromEntries(fns.map((n) => [n.name, n]));
+        expect(Object.keys(byName).sort()).toEqual(['after', 'currentMeterRead', 'markBusy']);
+        expect(byName.currentMeterRead!.endLine).toBe(14);
+        expect(byName.markBusy!.qualifiedName).toBe('markBusy');
+        expect(byName.markBusy!.endLine).toBe(22);
+        expect(byName.after!.qualifiedName).toBe('after');
+        expect(byName.after!.startLine).toBe(24);
+      } finally {
+        cg.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('blankCStatementMacroCalls blanks indented iterator macros, keeps the block', async () => {
     const { blankCStatementMacroCalls } = await import('../src/extraction/languages/c-cpp');
     const src = [
