@@ -55,19 +55,24 @@ describe('python member types', () => {
   });
 
   it('finds the class from a deeply nested call site', async () => {
-    // `with` + `for` + `if` + `try` + `while` inside a method is ordinary
-    // python; a fixed 16-frame climb lost the class at six and read as "this
-    // class declares nothing".
-    expect(
-      await read(
-        'class B:\n    def __init__(self):\n        self.h = Real()\n\n    def go(self, x):\n'
-          + '        with a() as f:\n            for i in x:\n                if i:\n'
-          + '                    try:\n                        while i:\n'
-          + '                            return self.h.run(i)\n'
-          + '                    except E:\n                        pass\n',
-        11,
-      ),
-    ).toEqual({ h: 'Real' });
+    // Each python block costs TWO frames (the statement and its `block`), so a
+    // fixed 16-frame climb ran out at roughly seven nested blocks — `with` +
+    // `for` + `if` + `try` + `while` + a comprehension is ordinary code, and
+    // running out read as "this class declares nothing".
+    //
+    // Depth verified, not assumed: this fixture is 21 frames from the call to
+    // the `class_definition`, so it fails under the old cap and passes now. An
+    // earlier version of this test sat at 15 and passed either way.
+    const src =
+      'class B:\n    def __init__(self):\n        self.h = Real()\n\n    def go(self, x):\n'
+      + '        with a() as f:\n            for i in x:\n                if i:\n'
+      + '                    try:\n                        while i:\n'
+      + '                            with b() as g:\n'
+      + '                                for j in i:\n'
+      + '                                    if j:\n'
+      + '                                        return self.h.run(j)\n'
+      + '                    except E:\n                        pass\n';
+    expect(await read(src, 14)).toEqual({ h: 'Real' });
   });
 
   it('ignores a docstring and a nested class', async () => {

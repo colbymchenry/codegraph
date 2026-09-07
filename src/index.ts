@@ -883,6 +883,12 @@ export class CodeGraph {
                 current: 0,
                 total: retryable.length,
               });
+              // Same warm as the batched path. These are refs in files the
+              // sync did NOT change, so the orchestrator loaded grammars only
+              // for the CHANGED files' languages: a TypeScript edit that makes
+              // parked Python refs retryable would re-resolve them with no
+              // Python parser, and their attribute edges would go missing.
+              await warmResolverGrammars(this.queries);
               await this.resolver.resolveAndPersistListYielding(retryable);
               options.onProgress?.({
                 phase: 'resolving',
@@ -1253,6 +1259,15 @@ export class CodeGraph {
    * - Framework-specific patterns (React, Express, Laravel)
    * - Import-based resolution
    * - Name-based symbol matching
+   */
+  /**
+   * Synchronous resolution for library callers.
+   *
+   * NOTE: this cannot warm the grammars the resolver reads member types from
+   * (loading one is async), so a python attribute call like
+   * `self._capture.stop()` resolves here only if something else already loaded
+   * the grammar in this process. `resolveReferencesBatched` warms them and is
+   * what `index` and `sync` use; prefer it when the graph must be complete.
    */
   resolveReferences(onProgress?: (current: number, total: number) => void): ResolutionResult {
     // Get all unresolved references from the database

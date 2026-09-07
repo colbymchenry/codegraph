@@ -80,6 +80,17 @@ describe('python attribute types through the built binary', () => {
     expect(haltTargets(dir)).toEqual(['stop@capture.py']);
   });
 
+  // NOT TESTED HERE: the resolver WORKER's own grammar warming
+  // (`resolver-worker.ts`). A worker resolves nothing until a single batch
+  // reaches `MIN_PARALLEL_BATCH`, and fixtures up to 150 files x 30 calls
+  // (4,500 refs) still resolve entirely on the main thread — the pool spawns
+  // but never takes a batch — so a test at any size this suite can afford
+  // passes with the worker fix removed. Two attempts at one did exactly that.
+  // The worker path was verified by measurement instead: on a 1,500-file python
+  // project with the pool forced on, removing the worker's warm dropped edges
+  // into the fixture's method from 9,000 to 3,332. Left uncovered deliberately
+  // rather than covered by a test that cannot fail.
+
   it('index and sync agree — the graph does not depend on how a file was indexed', () => {
     run(['init'], dir);
     run(['index'], dir);
