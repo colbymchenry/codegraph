@@ -4,6 +4,7 @@
  * Handles symbol name matching for reference resolution.
  */
 
+import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
 
@@ -386,6 +387,133 @@ function isLexicallyReachable(
     ref.filePath === candidate.filePath &&
     containers.some((p) => ref.line >= p.startLine && ref.line <= p.endLine)
   );
+}
+
+/**
+ * Languages in which `visibility: 'private'` on a definition means no other
+ * FILE can name it: a Kotlin `private fun` is file- or class-local, and the
+ * same holds for Java, C#, Swift, Scala, Dart and PHP members.
+ */
+const PRIVATE_IS_FILE_LOCAL = new Set<string>(['kotlin', 'java', 'csharp', 'swift', 'scala', 'dart', 'php']);
+
+/** Per-context memo: node id → "this C/C++ function is declared `static`". */
+const C_STATIC_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * Whether a C/C++ function definition carries the `static` storage class —
+ * read from its first source line(s), since the extractor records no storage
+ * class and the kernel arm would need the same field. `static` on the line
+ * above the name (`static void\nfoo(void)`) is the common alternative layout.
+ */
+function isStaticCFunction(candidate: Node, context: ResolutionContext): boolean {
+  let memo = C_STATIC_MEMO.get(context);
+  if (!memo) {
+    memo = new Map();
+    C_STATIC_MEMO.set(context, memo);
+  }
+  const hit = memo.get(candidate.id);
+  if (hit !== undefined) return hit;
+  const lines = context.getFileLines?.(candidate.filePath) ?? context.readFile(candidate.filePath)?.split('\n') ?? [];
+  const head = [lines[candidate.startLine - 2] ?? '', lines[candidate.startLine - 1] ?? ''].join('\n');
+  const isStatic = /(^|[\s;}])static\s/.test(head);
+  memo.set(candidate.id, isStatic);
+  return isStatic;
+}
+
+/** Per-context memo: node id → "this Rust method implements a trait". */
+const RUST_TRAIT_IMPL_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * Whether a Rust method sits in an `impl Trait for Type` block. Such a method
+ * carries no `pub` — the trait decides its visibility — so the extractor
+ * records it as private; it is reachable wherever the trait is. Read from the
+ * nearest enclosing `impl` header above the method, memoised per node.
+ */
+function isRustTraitImplMethod(candidate: Node, context: ResolutionContext): boolean {
+  if (candidate.kind !== 'method') return false;
+  let memo = RUST_TRAIT_IMPL_MEMO.get(context);
+  if (!memo) {
+    memo = new Map();
+    RUST_TRAIT_IMPL_MEMO.set(context, memo);
+  }
+  const hit = memo.get(candidate.id);
+  if (hit !== undefined) return hit;
+  const lines = context.getFileLines?.(candidate.filePath) ?? context.readFile(candidate.filePath)?.split('\n') ?? [];
+  let isTrait = false;
+  for (let i = candidate.startLine - 2; i >= 0; i--) {
+    const line = lines[i] ?? '';
+    if (/^\s*(pub(\([^)]*\))?\s+)?(unsafe\s+)?impl\b/.test(line)) {
+      isTrait = /\sfor\s/.test(line.replace(/\/\/.*$/, ''));
+      break;
+    }
+    // A top-level item above the method means it was not inside an impl.
+    if (/^(pub(\([^)]*\))?\s+)?(fn|struct|enum|mod|trait|const|static|type)\b/.test(line)) break;
+  }
+  memo.set(candidate.id, isTrait);
+  return isTrait;
+}
+
+/**
+ * The directory a Rust file's private items are visible from: the file's own
+ * module subtree. `src/net.rs` and `src/net/mod.rs` own `src/net/`; a crate
+ * root (`lib.rs` / `main.rs`) owns its directory. A child module reaches its
+ * ancestors' private items (`super::`), a sibling or another crate never does.
+ */
+function rustModuleDir(filePath: string): string {
+  const base = path.posix.basename(filePath);
+  const dir = path.posix.dirname(filePath);
+  if (base === 'mod.rs' || base === 'lib.rs' || base === 'main.rs') return dir;
+  return path.posix.join(dir, base.replace(/\.rs$/, ''));
+}
+
+/**
+ * Whether `candidate` can be NAMED from a reference in `ref`'s file at all,
+ * given what its language says about the definition's visibility. A
+ * definition the language makes file-local is not a candidate for a
+ * cross-file name match, however well the names agree:
+ *
+ * - **C / C++**: a `static` function is local to its translation unit. On a
+ *   2,109-file betaflight tree 4,448 cross-file calls resolved onto a `static`
+ *   in another file (#1730) — `usbd_get_descriptor` onto the `static
+ *   get_device_descriptor` of whichever USB class file ranked first.
+ * - **Kotlin, Java, C#, Swift, Scala, Dart, PHP**: `private` is class- or
+ *   file-local. An Android `editor.apply()` resolved onto an unrelated class's
+ *   `private fun apply`.
+ * - **Go**: an unexported (lowercase) identifier is package-local, and a
+ *   package is a directory. Judged by the name's case: the extractor's
+ *   `isExported` is unset for every Go method.
+ * - **Rust**: a non-`pub` item is visible to its module and that module's
+ *   descendants, never to a sibling module or another crate — `.count()` on
+ *   an iterator resolved onto a `fn count` in a different crate. A method in
+ *   an `impl Trait for Type` block has the trait's visibility, not `private`.
+ *
+ * Same-file candidates are always visible. Applied by ReferenceResolver to
+ * the target the whole name-matching pipeline settled on, so a rejection ends
+ * the reference unresolved: declining inside matchByExactName instead let the
+ * ref fall through to matchFuzzy, which then committed to a same-language
+ * namesake the ranking had passed over — eight such edges on one tree, all
+ * onto a local `const fail = …` arrow the graph does not hold. matchFuzzy
+ * checks its own survivor as well, since nothing runs after it.
+ */
+export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (candidate.filePath === ref.filePath) return true;
+  const lang = candidate.language as string;
+  if (lang === 'c' || lang === 'cpp') {
+    return candidate.kind !== 'function' || !isStaticCFunction(candidate, context);
+  }
+  if (lang === 'go') {
+    // By the name's first letter, not the extractor's flag: the flag is unset
+    // for every Go method, exported or not.
+    return /^[A-Z]/.test(candidate.name) || path.posix.dirname(candidate.filePath) === path.posix.dirname(ref.filePath);
+  }
+  if (lang === 'rust') {
+    if (candidate.visibility !== 'private') return true;
+    if (isRustTraitImplMethod(candidate, context)) return true;
+    const owner = rustModuleDir(candidate.filePath);
+    return ref.filePath.startsWith(owner + '/');
+  }
+  if (PRIVATE_IS_FILE_LOCAL.has(lang)) return candidate.visibility !== 'private';
+  return true;
 }
 
 /**
@@ -1299,6 +1427,8 @@ function getInferScanStates(context: ResolutionContext): Map<string, InferScanSt
 /** Drop the per-context scan states (see ReferenceResolver.clearCaches). */
 export function clearNameMatcherMemos(context: ResolutionContext): void {
   INFER_SCAN_STATES.delete(context);
+  C_STATIC_MEMO.delete(context);
+  RUST_TRAIT_IMPL_MEMO.delete(context);
 }
 
 function memoPatterns(key: string, build: () => RegExp[]): RegExp[] {
@@ -2418,7 +2548,7 @@ export function matchFuzzy(
   const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);
   const finalCandidates = sameLanguageCandidates.length > 0 ? sameLanguageCandidates : callableCandidates;
 
-  if (finalCandidates.length === 1) {
+  if (finalCandidates.length === 1 && isVisibleAcrossFiles(finalCandidates[0]!, ref, context)) {
     const isCrossLanguage = finalCandidates[0]!.language !== ref.language;
     return {
       original: ref,

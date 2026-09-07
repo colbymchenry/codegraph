@@ -203,6 +203,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Symbols, tests and the viewer
 
+- **A definition its language makes file-local no longer captures calls from other files.** A C `static` function, a Kotlin/Java/C#/Swift `private` member, a Go unexported name in another package and a Rust non-`pub` item outside its module subtree cannot be what a name in another file means, but name matching accepted them whenever the names agreed: on a betaflight tree 4,448 calls landed on a `static` in some other file, an Android `editor.apply()` on an unrelated class's `private fun apply`, a JavaScript `fail(...)` on a Go program's `func fail`. Such a target is now declined outright — the reference stays unresolved rather than being handed to another file's namesake. Same-file definitions and Rust trait-impl methods are unaffected. Re-index after upgrading. (#1730)
+
 - **Files under an `e2e/` directory count as tests.** Their calls no longer appear as production callers in Steps, dead-code and test badges.
 
 - **Production code under a `samples` or `examples` package path is no longer treated as test code.** A Kotlin or Java project whose package path runs through `com/google/samples/…` (Now in Android, for one) had nearly every file counted as a fixture, so the Map opened on `build-logic`, the entry points hid the app, and dead-code and test badges were wrong. Only the project layout above a `src/` folder decides now; the package path below it never does.
