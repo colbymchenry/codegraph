@@ -17,7 +17,7 @@ import {
   ImportMapping,
 } from './types';
 import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
-import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos } from './import-resolver';
+import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos, resolveImportPath } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -1986,6 +1986,45 @@ export class ReferenceResolver {
   /**
    * Check if reference is to a built-in or external symbol
    */
+  /**
+   * True when `receiver` is a local name bound by an import that resolves to a
+   * file IN THIS PROJECT — the only case where letting a python
+   * built-in-method name through the filter is safe (#66).
+   *
+   * The first version of this escape asked only whether SOME import bound the
+   * local name. Every import produces a mapping, stdlib and PyPI included, so
+   * it was also true for `os`, `requests`, `np`. That opened the filter for
+   * them; `resolveViaImport` then found no project file, resolution fell
+   * through to the bare-name strategy, and `os.remove(p)` bound to whatever
+   * project method happens to be named `remove` — reintroducing, through its
+   * own escape hatch, the fabricated-edge class this filter exists to prevent.
+   * Verified: `import os; import requests` in a project with a `Store.remove`
+   * and a `Store.get` produced two wrong edges where the previous release
+   * produced none.
+   *
+   * Resolving the specifier is the same question `resolveViaImport` will ask
+   * next, so a receiver that passes here is one the qualified path can actually
+   * serve; anything else stays a silent miss rather than a wrong edge.
+   */
+  private isPythonProjectModule(ref: UnresolvedRef, receiver: string): boolean {
+    for (const imp of this.context.getImportMappings(ref.filePath, ref.language)) {
+      if (imp.localName !== receiver) continue;
+      // `import pkg.mod` / `import pkg.mod as m` binds the module `source`
+      // names. `from pkg import mod` binds `pkg.mod`, and `from . import mod`
+      // binds `.mod` — join without doubling the dot that makes `.` mean the
+      // current package.
+      const specifier = imp.isNamespace
+        ? imp.source
+        : imp.source.endsWith('.')
+          ? `${imp.source}${imp.exportedName}`
+          : `${imp.source}.${imp.exportedName}`;
+      if (resolveImportPath(specifier, ref.filePath, ref.language!, this.context)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private isBuiltInOrExternal(ref: UnresolvedRef): boolean {
     const name = ref.referenceName;
     const isJsTs = ref.language === 'typescript' || ref.language === 'javascript'
@@ -2041,12 +2080,9 @@ export class ReferenceResolver {
         if (PYTHON_BUILT_IN_METHODS.has(method)) {
           const capitalized = receiver.charAt(0).toUpperCase() + receiver.slice(1);
           const isKnownClass = this.knownNames?.has(capitalized) ?? false;
-          const isImportedModule =
-            !isKnownClass &&
-            this.context
-              .getImportMappings(ref.filePath, ref.language)
-              .some((imp) => imp.localName === receiver);
-          if (!isKnownClass && !isImportedModule) {
+          const isProjectModule =
+            !isKnownClass && this.isPythonProjectModule(ref, receiver);
+          if (!isKnownClass && !isProjectModule) {
             return true;
           }
         }
