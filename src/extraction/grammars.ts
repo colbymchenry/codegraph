@@ -50,6 +50,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  perl: 'tree-sitter-perl.wasm',
 };
 
 /**
@@ -141,6 +142,15 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.cu': 'cpp',
   '.cuh': 'cpp',
   '.nix': 'nix',
+  // Perl. `.t` is the near-universal extension for Perl test scripts (the
+  // `prove`/Test::Harness convention) and is not claimed by any other grammar
+  // here; `.psgi`/`.cgi` are Perl entry points by convention.
+  '.pl': 'perl',
+  '.pm': 'perl',
+  '.t': 'perl',
+  '.pod': 'perl',
+  '.psgi': 'perl',
+  '.cgi': 'perl',
   // XML: file-level tracking; the MyBatis extractor matches `<mapper namespace="...">`
   // shape and emits SQL-statement nodes (other XML returns empty).
   '.xml': 'xml',
@@ -290,7 +300,7 @@ export async function initGrammars(): Promise<void> {
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
-  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
+  'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix', 'perl',
   'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
   // R7a (C/C++ kernel port prep): tree-sitter-c v0.24.2 (b780e47) +
   // tree-sitter-cpp v0.23.4 (f41e1a0), parser.c/scanner.c sha-matched against
@@ -468,6 +478,20 @@ export function getParser(language: Language): Parser | null {
 }
 
 /**
+ * Extensions that map to Perl but are claimed by other languages too — `.t` by
+ * Raku/Terra/Turing, `.cgi` by Python and shell. A shebang disambiguates them.
+ */
+const AMBIGUOUS_PERL_EXTENSIONS = new Set(['.t', '.cgi']);
+
+/** True when the file opens with a shebang that does NOT name a Perl interpreter. */
+function hasNonPerlShebang(source: string): boolean {
+  if (!source.startsWith('#!')) return false;
+  const end = source.indexOf('\n');
+  const firstLine = end === -1 ? source : source.slice(0, end);
+  return !/\bperl\b/i.test(firstLine);
+}
+
+/**
  * Detect language from file extension.
  *
  * `overrides` is the project's validated custom extension → language map (from
@@ -491,6 +515,14 @@ export function detectLanguage(filePath: string, source?: string, overrides?: Re
   if (lang === 'c' && ext === '.h' && source) {
     if (looksLikeCpp(source)) return 'cpp';
     if (looksLikeObjc(source)) return 'objc';
+  }
+
+  // `.t` is Perl's standard test suffix but also Raku/Terra/Turing, and `.cgi`
+  // is as often Python or shell as Perl. An explicit shebang naming another
+  // interpreter is definitive — honour it rather than handing the file to the
+  // Perl grammar, which would produce a tree of parse errors.
+  if (lang === 'perl' && AMBIGUOUS_PERL_EXTENSIONS.has(ext) && source && hasNonPerlShebang(source)) {
+    return 'unknown';
   }
 
   return lang;
@@ -706,6 +738,7 @@ export function getLanguageDisplayName(language: Language): string {
     vbnet: 'Visual Basic .NET',
     erlang: 'Erlang',
     terraform: 'Terraform',
+    perl: 'Perl',
     arkts: 'ArkTS',
     unknown: 'Unknown',
   };
