@@ -2267,22 +2267,70 @@ function pythonAnnotationType(raw: string): string {
 }
 
 /**
+ * The project class a python type name refers to AT THIS CALL SITE, or null.
+ *
+ * Two questions the previous version asked neither of, and both produced wrong
+ * edges. **Is it a project class at all?** `self.h = Session()` after
+ * `from requests import Session` names an external class; refusing only the
+ * DOTTED spelling (`requests.Session()`) guarded the rare form and let the
+ * common one bind to a project `models.Session`. **Which one?** With two project
+ * classes of a name, the method lookup fell back to index order and landed on a
+ * `Client` defined in a test file.
+ *
+ * So: a name the file IMPORTS must come from the module the import names, and a
+ * name it does not import must be declared in the file itself. An external
+ * import matches no project file and yields null — a silent miss, as it should
+ * be.
+ */
+function pythonTypeClass(
+  typeName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): Node | null {
+  const classes = context
+    .getNodesByName(typeName)
+    .filter((n) => n.kind === 'class' && n.language === 'python');
+  if (classes.length === 0) return null;
+  const here = ref.filePath.replace(/\\/g, '/');
+  const dirOf = (p: string) => p.slice(0, p.lastIndexOf('/') + 1);
+  const imp = context
+    .getImportMappings(ref.filePath, ref.language)
+    .find((i) => i.localName === typeName);
+  if (!imp) {
+    // Not imported, so it is this file's own class or nothing. (A name from a
+    // star-import or a builtin is not something to guess about.)
+    return classes.find((c) => c.filePath.replace(/\\/g, '/') === here) ?? null;
+  }
+  // `from app.real import Client` -> `app/real`; `from .kinds import Real` ->
+  // `kinds`, relative to the importing file's own directory.
+  const relative = /^\./.test(imp.source);
+  const mod = imp.source.replace(/^\.+/, '').replace(/\./g, '/');
+  const wanted = mod ? (relative ? dirOf(here) + mod : mod) : dirOf(here).replace(/\/$/, '');
+  const hit = classes.filter((c) => {
+    const fp = c.filePath.replace(/\\/g, '/').replace(/\.pyi?$/, '');
+    return fp === wanted || fp.endsWith('/' + wanted) || dirOf(fp).replace(/\/$/, '') === wanted;
+  });
+  return hit.length > 0 ? hit[0]! : null;
+}
+
+/**
  * Python call through an attribute of the enclosing class — `self.capture.stop()`,
  * emitted as `self.capture.stop` since #66 kept the receiver's text.
  *
  * Python declares no field types, so the evidence is the class body, read from
  * the AST (`memberTypesForSourceSync`): a class-level annotation, a typed
  * `__init__` parameter bound to the attribute, `self.x: T`, or `self.x = T()`.
- * `resolveMethodOnType` then validates the method exists on it, so a mis-read
- * produces no edge rather than a wrong one.
+ * The type is then pinned to a specific project class through the file's own
+ * imports, and the method validated on it, so a mis-read produces no edge
+ * rather than a wrong one.
  *
  * Reading the TREE rather than the class's source lines is what makes this
  * safe, and it was learned the hard way: a regex version of this helper took a
  * type out of a DOCSTRING and turned a correct edge into a wrong one, read a
  * nested class's `__init__` as the outer class's, and matched a same-named class
- * in another file. The tree answers all three by construction — a docstring is a
- * `string` node and never an assignment, a nested class is not descended into,
- * and the types come from the CALLER'S OWN file, keyed by the call site's line.
+ * in another file. The tree answers the first two by construction — a docstring
+ * is a `string` node and never an assignment, and a nested class is not
+ * descended into — and `pythonTypeClass` answers the third.
  */
 function matchPythonSelfAttrCall(
   attr: string,
@@ -2298,6 +2346,31 @@ function matchPythonSelfAttrCall(
   if (!declared) return null;
   const typeName = pythonAnnotationType(declared);
   if (!typeName) return null;
+  const cls = pythonTypeClass(typeName, ref, context);
+  if (!cls) return null;
+
+  // The method as declared on THAT class, in THAT file.
+  const want = `${typeName}::${methodName}`;
+  const own = context
+    .getNodesByName(methodName)
+    .find(
+      (m) =>
+        m.kind === 'method' &&
+        m.language === 'python' &&
+        m.filePath === cls.filePath &&
+        (m.qualifiedName === want || m.qualifiedName.endsWith(`::${want}`)),
+    );
+  if (own) {
+    return { original: ref, targetNodeId: own.id, confidence: 0.85, resolvedBy: 'instance-method' };
+  }
+  // Not declared there — it may be inherited. Hand off to the shared resolver
+  // for its supertype walk, but ONLY when the name is unambiguous: with two
+  // project classes of this name there is nothing here to pick between them,
+  // and picking by index order is what put an edge on a test file's class.
+  const sameName = context
+    .getNodesByName(typeName)
+    .filter((n) => n.kind === 'class' && n.language === 'python');
+  if (sameName.length !== 1) return null;
   return resolveMethodOnType(typeName, methodName, ref, context, 0.85, 'instance-method');
 }
 

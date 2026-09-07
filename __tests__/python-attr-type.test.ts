@@ -131,6 +131,51 @@ describe('python self-attribute type inference', () => {
     expect(await runCalls()).toEqual([]);
   });
 
+  it('a bare-imported external class does not bind to a project class of that name', async () => {
+    // The common spelling. Refusing only `requests.Session()` guarded the rare
+    // form and let this one through, onto `models.Session`.
+    fs.writeFileSync(
+      path.join(tempDir, 'models.py'),
+      'class Session:\n    def run(self, x):\n        return x\n'
+    );
+    box('from requests import Session\n\n\nclass Box:\n    def __init__(self):\n        self.h = Session()\n\n'
+      + '    def go(self, x):\n        return self.h.run(x)\n');
+    expect(await runCalls()).toEqual([]);
+  });
+
+  it('picks the imported class, not whichever same-named one is indexed first', async () => {
+    fs.mkdirSync(path.join(tempDir, 'app'));
+    fs.mkdirSync(path.join(tempDir, 'aaa_tests'));
+    fs.writeFileSync(
+      path.join(tempDir, 'aaa_tests', 'fakes.py'),
+      'class Client:\n    def run(self, x):\n        return x\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'app', 'real.py'),
+      'class Client:\n    def run(self, x):\n        return x\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'app', 'box.py'),
+      'from app.real import Client\n\n\nclass Box:\n    def __init__(self):\n        self.h = Client()\n\n'
+        + '    def go(self, x):\n        return self.h.run(x)\n'
+    );
+    cg = await CodeGraph.init(tempDir, { index: true });
+    const go = cg.getNodesByKind('method').find((n) => n.name === 'go')!;
+    const hit = cg
+      .getOutgoingEdges(go.id)
+      .filter((e) => e.kind === 'calls')
+      .map((e) => cg!.getNode(e.target)!.filePath.replace(/\\/g, '/'));
+    expect(hit).toEqual(['app/real.py']);
+  });
+
+  it('a factory call is not mistaken for a type', async () => {
+    writeKinds();
+    box('from kinds import Real\n\n\ndef make_client():\n    return Real()\n\n\n'
+      + 'class Box:\n    def __init__(self):\n        self.h = make_client()\n\n'
+      + '    def go(self, x):\n        return self.h.run(x)\n');
+    expect(await runCalls()).toEqual([]);
+  });
+
   it('a plain container stays a silent miss', async () => {
     writeKinds();
     box('class Box:\n    def __init__(self):\n        self.h = []\n        self.k: list[int] = []\n\n'
