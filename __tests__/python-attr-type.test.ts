@@ -335,6 +335,32 @@ describe('python self-attribute type inference', () => {
     ).toEqual(['base.py']);
   });
 
+  it('inherits through a class whose NAME is not unique project-wide', async () => {
+    // `cls` is already pinned to one node in one file. Refusing the walk because
+    // some other file also defines a `Real` throws that away and loses every
+    // inherited edge for the commonest class names there are.
+    fs.writeFileSync(
+      path.join(tempDir, 'base.py'),
+      'class Base:\n    def zorp(self, x):\n        return x\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'real.py'),
+      'from base import Base\n\n\nclass Real(Base):\n    pass\n'
+    );
+    fs.mkdirSync(path.join(tempDir, 'unrelated'));
+    // The namesake that used to veto the walk — it inherits nothing.
+    fs.writeFileSync(path.join(tempDir, 'unrelated', 'real.py'), 'class Real:\n    pass\n');
+    // DISTRACTOR: a second project `zorp`, so a bare-name fallback cannot land
+    // on `Base.zorp` by single-candidate luck.
+    fs.writeFileSync(
+      path.join(tempDir, 'unrelated', 'other.py'),
+      'class Other:\n    def zorp(self, x):\n        return x\n'
+    );
+    box('from real import Real\n\n\nclass Box:\n    def __init__(self):\n        self.h = Real()\n\n'
+      + '    def go(self, x):\n        return self.h.zorp(x)\n');
+    expect(await runCalls()).toEqual(['zorp@Base::zorp']);
+  });
+
   it('a class that inherits nothing does not inherit its namesake\'s base', async () => {
     // `getSupertypes` matches by NAME, so it unions the `extends` targets of
     // every class called `Real`. `b/real.py`'s Real inherits nothing; without a

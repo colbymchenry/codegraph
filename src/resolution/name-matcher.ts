@@ -2627,26 +2627,30 @@ function matchPythonSelfAttrCall(
   // `getSupertypes` matches by NAME, so it unions the `extends` targets of every
   // python class called `cls.name` — a class that inherits nothing would
   // inherit its namesake's base. That is the same "two classes of a name is no
-  // evidence" rule this function enforces above, and I dropped it one level
-  // down. No unique receiver class, no walk.
-  const receivers = context
-    .getNodesByName(cls.name)
-    .filter((n) => n.kind === 'class' && n.language === 'python');
-  if (receivers.length !== 1) return null;
-  const seen = new Set<string>([cls.name]);
-  let frontier = [cls.name];
+  // evidence" rule this function enforces above, dropped one level down.
+  //
+  // The first fix for that refused the walk whenever `cls.name` was not unique
+  // project-wide, which answers the right question with the wrong evidence:
+  // `cls` is ALREADY one node in one file, pinned by `pythonTypeClass`, and a
+  // namesake in a test tree says nothing about it. It cost every inherited edge
+  // for any `Client` / `Config` / `Service` that appears twice — a recall cliff
+  // in exactly the repos this feature exists for. Ask the NODE for its own
+  // supertypes instead; the ambiguity that remains is resolving a supertype
+  // NAME to a class, and that is still refused below.
+  const seen = new Set<string>([cls.id]);
+  let frontier: Node[] = [cls];
   for (let depth = 0; depth < 4 && frontier.length > 0; depth++) {
-    const next: string[] = [];
+    const next: Node[] = [];
     for (const sub of frontier) {
-      for (const superName of context.getSupertypes?.(sub, ref.language) ?? []) {
-        if (seen.has(superName)) continue;
-        seen.add(superName);
+      for (const superName of context.getSupertypesOfNode?.(sub.id, ref.language) ?? []) {
         const supers = context
           .getNodesByName(superName)
           .filter((n) => n.kind === 'class' && n.language === 'python');
         // Two classes of that name is no evidence, same rule as above.
         if (supers.length !== 1) continue;
         const superCls = supers[0]!;
+        if (seen.has(superCls.id)) continue;
+        seen.add(superCls.id);
         const inherited = context
           .getNodesByName(methodName)
           .find(
@@ -2665,7 +2669,7 @@ function matchPythonSelfAttrCall(
             resolvedBy: 'instance-method',
           };
         }
-        next.push(superName);
+        next.push(superCls);
       }
     }
     frontier = next;

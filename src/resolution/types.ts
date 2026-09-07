@@ -146,6 +146,21 @@ export interface ResolutionContext {
    */
   getSupertypes?(typeName: string, language: Language): string[];
   /**
+   * Direct supertypes of ONE class node, by simple name — the `extends` edges
+   * out of that exact node rather than every node sharing its name.
+   *
+   * `getSupertypes` keys on a NAME, so it unions the bases of every same-named
+   * class and a class that inherits nothing appears to inherit its namesake's
+   * base. The only defence available was to refuse whenever the name was not
+   * globally unique, which threw away resolution the caller had already pinned
+   * to a single node and cost every inherited edge in any repo with a `Client`
+   * in both `app/` and `tests/`. Ask about the node instead. Like
+   * `getSupertypes` this reads resolved edges, so it is EMPTY during the first
+   * pass and populated for the conformance pass. Optional so external/test
+   * contexts compile without it.
+   */
+  getSupertypesOfNode?(nodeId: string, language: Language): string[];
+  /**
    * Look up a node by its id. Lets matchers derive the FROM-symbol's
    * enclosing-class scope (Swift implicit-self method scoping, `this.X`
    * member resolution). Optional so external/test contexts compile

@@ -604,6 +604,15 @@ export class ReferenceResolver {
         return this.queries.getAllFilePaths();
       },
 
+      getSupertypesOfNode: (nodeId: string, language: Language) => {
+        const names: string[] = [];
+        for (const e of this.queries.getOutgoingEdges(nodeId, ['extends', 'implements'])) {
+          const target = this.queries.getNodeById(e.target);
+          if (target && target.language === language) names.push(target.name);
+        }
+        return names;
+      },
+
       listDirectories: (relativePath: string) => {
         const target = relativePath === '.' || relativePath === ''
           ? this.projectRoot
