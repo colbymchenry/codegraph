@@ -2375,7 +2375,15 @@ function pythonMemberTypes(
       visitBody(child, paramTypes);
     }
   };
-  for (const fn of methods) visitBody(fn.childForFieldName('body'), paramTypesOf(fn));
+  // `__init__` first, and `put` is first-wins, so the constructor's assignment
+  // beats a reassignment in another method. Source order let a `reset()` written
+  // ABOVE the constructor decide the type — the same accident the
+  // annotation/parameter/constructor tiering exists to avoid, one level down.
+  const ordered = [
+    ...methods.filter((m) => m.childForFieldName('name')?.text === '__init__'),
+    ...methods.filter((m) => m.childForFieldName('name')?.text !== '__init__'),
+  ];
+  for (const fn of ordered) visitBody(fn.childForFieldName('body'), paramTypesOf(fn));
 
   const out = new Map<string, string>(constructed);
   for (const [k, v] of fromParam) out.set(k, v);
