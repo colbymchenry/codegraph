@@ -2270,6 +2270,42 @@ function pythonAnnotationType(raw: string): string {
  * `replace(/^\.+/, '')` — made `from ..core import X` look in the wrong package.
  */
 /**
+ * Per-context basename -> file-paths index for the python module suffix
+ * fallback, and per-context memo for `livePythonImportSources`.
+ *
+ * Both follow `luaFileBasenameIndexes` (import-resolver.ts), which exists
+ * because of this exact mistake: `getAllFiles()` is an uncached
+ * `SELECT path FROM files` and scanning it per ref goes quadratic. The suffix
+ * fallback reintroduced it, and worse than the lua case did — the imports that
+ * reach it are mostly stdlib and third-party, which match NOTHING, so the early
+ * `found.length > 1` exit never fires and every one of them pays the full scan
+ * twice (the resolver retries in a second pass). Measured at roughly 2x total
+ * index time on a 6.6k-file python repo, ~8M string comparisons.
+ *
+ * Buckets keep `getAllFiles()` order, so the candidate list filters to exactly
+ * the array the full scan produced: identical matches, identical winner.
+ */
+const pythonFileBasenameIndexes = new WeakMap<ResolutionContext, Map<string, string[]>>();
+
+function pythonBasenameIndex(context: ResolutionContext): Map<string, string[]> {
+  let index = pythonFileBasenameIndexes.get(context);
+  if (!index) {
+    index = new Map();
+    for (const f of context.getAllFiles?.() ?? []) {
+      const fp = f.replace(/\\/g, '/');
+      const base = fp.split('/').pop() ?? '';
+      const paths = index.get(base);
+      if (paths) paths.push(fp);
+      else index.set(base, [fp]);
+    }
+    pythonFileBasenameIndexes.set(context, index);
+  }
+  return index;
+}
+
+const pythonLiveSourceMemo = new WeakMap<ResolutionContext, Map<string, Set<string> | null>>();
+
+/**
  * Top-level stdlib module names. The suffix fallback below asks "does any
  * indexed path END this way", which is not a python import rule — and the
  * imports that reach it are overwhelmingly NOT project modules: on one real
@@ -2385,12 +2421,17 @@ function pythonModuleFile(
   // double under `tests/fixtures/`.
   if (dots === 0 && rest && !PYTHON_STDLIB_TOP.has(rest.split('/')[0]!)) {
     const wanted = [`/${rest}.py`, `/${rest}/__init__.py`, `/${rest}.pyi`];
+    const last = rest.split('/').pop()!;
+    const index = pythonBasenameIndex(context);
     const found: string[] = [];
-    for (const f of context.getAllFiles?.() ?? []) {
-      const fp = f.replace(/\\/g, '/');
-      const w = wanted.find((cand) => fp.endsWith(cand));
-      if (w && isPythonPackageRoot(fp.slice(0, fp.length - w.length), rest, context)) found.push(fp);
-      if (found.length > 1) return null;
+    for (const base of [`${last}.py`, '__init__.py', `${last}.pyi`]) {
+      for (const fp of index.get(base) ?? []) {
+        const w = wanted.find((cand) => fp.endsWith(cand));
+        if (!w || !isPythonPackageRoot(fp.slice(0, fp.length - w.length), rest, context)) continue;
+        if (found.includes(fp)) continue;
+        found.push(fp);
+        if (found.length > 1) return null;
+      }
     }
     if (found.length === 1) return found[0]!;
   }
@@ -2423,9 +2464,24 @@ function livePythonImportSources(
   filePath: string,
   context: ResolutionContext,
 ): Set<string> | null {
+  let memo = pythonLiveSourceMemo.get(context);
+  if (!memo) {
+    memo = new Map();
+    pythonLiveSourceMemo.set(context, memo);
+  }
+  // `getFileLines` is LRU-cached, but the strip-and-scan over every line is
+  // not, and it re-ran for every `self.attr.method()` ref in the file —
+  // O(refs x file length), the shape types.ts records as ~20% of index CPU on
+  // a java-heavy repo once before.
+  const cached = memo.get(filePath);
+  if (cached !== undefined) return cached;
+
   const lines =
     context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split(/\r?\n/) ?? null;
-  if (lines === null) return null;
+  if (lines === null) {
+    memo.set(filePath, null);
+    return null;
+  }
 
   const code: string[] = [];
   let fence: string | null = null; // the triple-quote we are inside, if any
@@ -2474,6 +2530,7 @@ function livePythonImportSources(
   // column-anchoring difference between them.
   for (const m of stripped.matchAll(/from\s+([\w.]+)\s+import\s+([^#\n]+)/g)) sources.add(m[1]!);
   for (const m of stripped.matchAll(/^import\s+([\w.]+)(?:\s+as\s+(\w+))?/gm)) sources.add(m[1]!);
+  memo.set(filePath, sources);
   return sources;
 }
 
