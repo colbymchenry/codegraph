@@ -150,6 +150,20 @@ describe('Language Detection', () => {
     expect(isSourceFile('default.nix')).toBe(true);
   });
 
+  it('should detect Perl files', () => {
+    expect(detectLanguage('lib/Sample/Widget.pm')).toBe('perl');
+    expect(detectLanguage('bin/deploy.pl')).toBe('perl');
+    // `.t` is the Test::Harness/prove convention for a Perl test script.
+    expect(detectLanguage('t/basic.t')).toBe('perl');
+    expect(detectLanguage('docs/Manual.pod')).toBe('perl');
+    expect(detectLanguage('app.psgi')).toBe('perl');
+    // Extensions are matched case-insensitively, so `Makefile.PL` maps too.
+    expect(detectLanguage('Makefile.PL')).toBe('perl');
+    expect(isSourceFile('lib/Sample/Widget.pm')).toBe(true);
+    expect(isLanguageSupported('perl')).toBe(true);
+    expect(getSupportedLanguages()).toContain('perl');
+  });
+
   it('should detect a .h whose only C++ signal is an export-macro class as cpp', () => {
     // Lean Unreal-Engine style header: the class is annotated with an export
     // macro and carries no explicit `public:`/`virtual`/`namespace`/`template`,
@@ -11917,5 +11931,573 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     expect(result.errors).toEqual([]);
     expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'Widget')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'size')).toBe(true);
+  });
+});
+
+describe('Perl Extraction', () => {
+  describe('Language detection', () => {
+    it('should report Perl as supported', () => {
+      expect(isLanguageSupported('perl')).toBe(true);
+      expect(getSupportedLanguages()).toContain('perl');
+      expect(isSourceFile('lib/Sample/Widget.pm')).toBe(true);
+      expect(isSourceFile('t/basic.t')).toBe(true);
+    });
+
+    it('should not claim an ambiguous extension whose shebang names another language', () => {
+      // `.t` is also Raku/Terra/Turing and `.cgi` is also Python/shell. An
+      // explicit shebang is definitive, so it must win over the extension —
+      // otherwise a Python CGI script gets parsed by the Perl grammar.
+      expect(detectLanguage('cgi-bin/script.cgi', '#!/usr/bin/env python3\nprint(1)\n')).not.toBe('perl');
+      expect(detectLanguage('t/basic.t', '#!/usr/bin/env raku\nsay 1;\n')).not.toBe('perl');
+      // Perl shebangs, and the unambiguous extensions, are unaffected.
+      expect(detectLanguage('t/basic.t', '#!/usr/bin/perl\nuse strict;\n')).toBe('perl');
+      expect(detectLanguage('cgi-bin/script.cgi', '#!/usr/bin/env perl\n')).toBe('perl');
+      expect(detectLanguage('t/basic.t')).toBe('perl');
+      expect(detectLanguage('lib/Sample.pm', '#!/usr/bin/env python3\n')).toBe('perl');
+    });
+  });
+
+  describe('Package scoping', () => {
+    it('should qualify subs with the package that a `package Foo;` statement opens', () => {
+      // The statement form scopes every FOLLOWING SIBLING — the subs are not
+      // children of the package node, so plain parent/child containment would
+      // attach them to the file and lose the `Foo::bar` qualified name.
+      const code = `package Sample::Widget;
+
+sub new {
+    my ($class) = @_;
+    return bless {}, $class;
+}
+
+sub name {
+    my $self = shift;
+    return $self->{name};
+}
+
+1;
+`;
+      const result = extractFromSource('lib/Sample/Widget.pm', code);
+      const ns = result.nodes.find((n) => n.kind === 'namespace');
+      expect(ns?.name).toBe('Sample::Widget');
+      const names = result.nodes
+        .filter((n) => n.kind === 'function')
+        .map((n) => n.qualifiedName)
+        .sort();
+      expect(names).toEqual(['Sample::Widget::name', 'Sample::Widget::new']);
+    });
+
+    it('should close one package scope when the next package statement opens', () => {
+      const code = `package First;
+
+sub alpha { return 1; }
+
+package Second;
+
+sub beta { return 2; }
+
+1;
+`;
+      const result = extractFromSource('lib/Two.pm', code);
+      const alpha = result.nodes.find((n) => n.name === 'alpha');
+      const beta = result.nodes.find((n) => n.name === 'beta');
+      expect(alpha?.qualifiedName).toBe('First::alpha');
+      expect(beta?.qualifiedName).toBe('Second::beta');
+    });
+
+    it('should keep a block-form package name absolute, not nested in the enclosing package', () => {
+      // A Perl package name is always absolute: `package Inner { }` written
+      // inside a `package Outer;` file declares `Inner`, never `Outer::Inner`.
+      const code = `package Outer;
+
+sub outer_sub { return 1; }
+
+package Inner {
+    sub inner_sub { return 2; }
+}
+
+sub after_block { return 3; }
+
+1;
+`;
+      const result = extractFromSource('lib/Outer.pm', code);
+      const inner = result.nodes.find((n) => n.kind === 'namespace' && n.name === 'Inner');
+      expect(inner?.qualifiedName).toBe('Inner');
+      expect(result.nodes.find((n) => n.name === 'inner_sub')?.qualifiedName).toBe('Inner::inner_sub');
+      // The enclosing package resumes after the block.
+      expect(result.nodes.find((n) => n.name === 'outer_sub')?.qualifiedName).toBe('Outer::outer_sub');
+      expect(result.nodes.find((n) => n.name === 'after_block')?.qualifiedName).toBe('Outer::after_block');
+    });
+
+    it('should scope a package nested inside another package block', () => {
+      // The package-aware walk originally ran only over source_file's children,
+      // so a package reached through a nested block got no scope handling and
+      // its subs inherited the OUTER package's name.
+      const code = `package Outer {
+    package Inner {
+        sub b { return 2; }
+    }
+}
+
+1;
+`;
+      const result = extractFromSource('lib/Nested.pm', code);
+      expect(result.nodes.find((n) => n.name === 'b')?.qualifiedName).toBe('Inner::b');
+      expect(result.nodes.some((n) => n.kind === 'namespace' && n.name === 'Inner')).toBe(true);
+    });
+
+    it('should scope a `package Foo;` statement opened inside a bare block', () => {
+      const code = `package Outer;
+
+sub outer_sub { return 1; }
+
+{
+    package Inner;
+    sub b { return 2; }
+}
+
+1;
+`;
+      const result = extractFromSource('lib/BlockLocal.pm', code);
+      expect(result.nodes.find((n) => n.name === 'b')?.qualifiedName).toBe('Inner::b');
+      expect(result.nodes.find((n) => n.name === 'outer_sub')?.qualifiedName).toBe('Outer::outer_sub');
+    });
+  });
+
+  describe('Imports and inheritance', () => {
+    it('should extract module imports but skip pragmas', () => {
+      const code = `package Sample;
+use strict;
+use warnings;
+use POSIX qw(floor);
+require Sample::Late;
+
+1;
+`;
+      const result = extractFromSource('lib/Sample.pm', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name).sort();
+      expect(imports).toEqual(['POSIX', 'Sample::Late']);
+      expect(imports).not.toContain('strict');
+      expect(imports).not.toContain('warnings');
+    });
+
+    it('should emit an extends reference for `use parent` / `use base`', () => {
+      const code = `package Sample::Child;
+use parent -norequire, 'Sample::Base';
+
+1;
+`;
+      const result = extractFromSource('lib/Sample/Child.pm', code);
+      const extendsRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'extends');
+      expect(extendsRefs.map((r) => r.referenceName)).toEqual(['Sample::Base']);
+      // `-norequire` is a flag, not a parent class.
+      expect(extendsRefs.map((r) => r.referenceName)).not.toContain('-norequire');
+    });
+
+    it('should extract `use constant` names as constants, both forms', () => {
+      const code = `package Sample;
+use constant MAX_RETRIES => 5;
+use constant {
+    ALPHA => 'a',
+    BETA  => 'b',
+};
+
+1;
+`;
+      const result = extractFromSource('lib/Sample.pm', code);
+      const consts = result.nodes.filter((n) => n.kind === 'constant').map((n) => n.name).sort();
+      expect(consts).toEqual(['ALPHA', 'BETA', 'MAX_RETRIES']);
+      // The pragma itself is not an import.
+      expect(result.nodes.some((n) => n.kind === 'import' && n.name === 'constant')).toBe(false);
+    });
+
+    it('should split a `qw()` parent list into one parent per word', () => {
+      // `use base qw(A B)` is the dominant multiple-inheritance idiom. The qw
+      // list is a SINGLE string_content node ("A B"), so collecting it whole
+      // produced one unresolvable parent literally named "A B".
+      const code = `package Sample::Child;
+use base qw(Sample::Alpha Sample::Beta);
+
+1;
+`;
+      const result = extractFromSource('lib/Sample/Child.pm', code);
+      const parents = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'extends')
+        .map((r) => r.referenceName)
+        .sort();
+      expect(parents).toEqual(['Sample::Alpha', 'Sample::Beta']);
+    });
+
+    it('should record `with ROLE` composition as an inheritance reference', () => {
+      // Role::Tiny/Moo/Moose compose a role's subs INTO the consuming package,
+      // so `$self->log` in a consumer really does land in the role. Without an
+      // edge for `with`, that relationship is invisible and a bare-name match
+      // picks an unrelated same-named sub from some other package.
+      const code = `package Sample::Consumer;
+use Role::Tiny::With;
+
+with 'Sample::Roles::Log';
+
+1;
+`;
+      const result = extractFromSource('lib/Sample/Consumer.pm', code);
+      const roles = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'extends')
+        .map((r) => r.referenceName);
+      expect(roles).toEqual(['Sample::Roles::Log']);
+    });
+
+    it('should split a `with qw()` role list into one role per word', () => {
+      const code = `package Sample::Consumer;
+with qw(Sample::Roles::Log Sample::Roles::General);
+
+1;
+`;
+      const result = extractFromSource('lib/Sample/Consumer.pm', code);
+      const roles = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'extends')
+        .map((r) => r.referenceName)
+        .sort();
+      expect(roles).toEqual(['Sample::Roles::General', 'Sample::Roles::Log']);
+    });
+
+    it('should not emit a call edge for the `with` role-composition keyword', () => {
+      // `with` parses as a plain function call; left alone it becomes a call to
+      // a sub named "with" that exists nowhere.
+      const code = `package Sample::Consumer;
+with 'Sample::Roles::Log';
+
+1;
+`;
+      const result = extractFromSource('lib/Sample/Consumer.pm', code);
+      expect(result.unresolvedReferences.some((r) => r.referenceName === 'with')).toBe(false);
+    });
+
+    it('should not treat a `with` call inside a subroutine as role composition', () => {
+      // Only a package-level `with` composes a role; anything else is a normal
+      // call to a user-defined sub that happens to be named `with`.
+      const code = `package Sample::Consumer;
+
+sub run {
+    my $self = shift;
+    return with('not a role');
+}
+
+1;
+`;
+      const result = extractFromSource('lib/Sample/Consumer.pm', code);
+      expect(
+        result.unresolvedReferences.some(
+          (r) => r.referenceKind === 'extends' && r.referenceName === 'not a role'
+        )
+      ).toBe(false);
+    });
+
+    it('should not invent a constant from the values of a list-valued constant', () => {
+      // `use constant COLORS => 'red', 'green', 'blue'` defines ONE constant.
+      // Taking every even-indexed list entry also picked up 'green'.
+      const code = `package Sample;
+use constant COLORS => 'red', 'green', 'blue';
+
+1;
+`;
+      const result = extractFromSource('lib/Sample.pm', code);
+      const consts = result.nodes.filter((n) => n.kind === 'constant').map((n) => n.name).sort();
+      expect(consts).toEqual(['COLORS']);
+    });
+
+    it('should pair hash-form constants correctly when a comment interrupts them', () => {
+      const code = `package Sample;
+use constant {
+    A => 1, # a leading comment
+    B => 'value',
+    C => 3,
+};
+
+1;
+`;
+      const result = extractFromSource('lib/Sample.pm', code);
+      const consts = result.nodes.filter((n) => n.kind === 'constant').map((n) => n.name).sort();
+      expect(consts).toEqual(['A', 'B', 'C']);
+      expect(consts).not.toContain('value');
+    });
+  });
+
+  describe('Calls', () => {
+    it('should link a plain sub call to its definition', () => {
+      const code = `package Sample;
+
+sub helper { return 1; }
+
+sub caller_sub {
+    return helper();
+}
+
+1;
+`;
+      const result = extractFromSource('lib/Sample.pm', code);
+      const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+      expect(refs.map((r) => r.referenceName)).toContain('helper');
+    });
+
+    it('should record the METHOD name for `$obj->method`, not the invocant', () => {
+      // The grammar uses invocant/method fields; the generic path would take the
+      // invocant ($obj) as the callee and drop `configure` entirely.
+      const code = `package Sample;
+
+sub run {
+    my ($self, $obj) = @_;
+    $obj->configure();
+    return $self->validate();
+}
+
+1;
+`;
+      const result = extractFromSource('lib/Sample.pm', code);
+      const called = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(called).toContain('configure');
+      expect(called).toContain('validate');
+      expect(called).not.toContain('$obj');
+      expect(called).not.toContain('$self');
+    });
+
+    it('should treat `Class->new` as an instantiation of that class', () => {
+      const code = `package Sample;
+
+sub build {
+    return Sample::Late->new(value => 1);
+}
+
+1;
+`;
+      const result = extractFromSource('lib/Sample.pm', code);
+      const inst = result.unresolvedReferences.filter((r) => r.referenceKind === 'instantiates');
+      expect(inst.map((r) => r.referenceName)).toContain('Sample::Late');
+    });
+
+    it('should qualify a class-method call with its class', () => {
+      const code = `package Sample;
+
+sub run {
+    return Sample::Base->helper();
+}
+
+1;
+`;
+      const result = extractFromSource('lib/Sample.pm', code);
+      const called = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(called).toContain('Sample::Base::helper');
+    });
+
+    it('should drop the outer call of a chained invocant, whose type is unknowable', () => {
+      // `$self->service_db()->attribute_add(...)` dispatches on whatever
+      // service_db() RETURNS — a different object. Emitting the bare name
+      // `attribute_add` let it exact-match the enclosing same-named sub, which
+      // on real ONTAP Perl produced hundreds of wrong self-referential call
+      // edges. Silent beats wrong: the inner call is still recorded.
+      const code = `package Sample;
+
+sub attribute_add {
+    my ($self, %opts) = @_;
+    return $self->service_db()->attribute_add(%opts);
+}
+
+1;
+`;
+      const result = extractFromSource('lib/Sample.pm', code);
+      const called = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(called).toContain('service_db');
+      expect(called).not.toContain('attribute_add');
+    });
+
+    it('should not emit a self-referential call for `SUPER::` override chaining', () => {
+      // `$self->SUPER::configure()` inside `sub configure` dispatches to the
+      // PARENT's method by definition — never the caller itself. The bare name
+      // would resolve straight back to the enclosing sub.
+      const code = `package Sample;
+
+sub configure {
+    my $self = shift;
+    $self->SUPER::configure();
+    return 1;
+}
+
+1;
+`;
+      const result = extractFromSource('lib/Sample.pm', code);
+      const selfCalls = result.unresolvedReferences.filter(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'configure',
+      );
+      expect(selfCalls).toHaveLength(0);
+    });
+
+    it('should not emit a call ref for any `SUPER::` dispatch', () => {
+      // SUPER:: dispatches to a PARENT class's method. CodeGraph's resolution
+      // has no inheritance/MRO model, so a bare method name binds to whichever
+      // same-named symbol matches — including the child's own override, the
+      // exact method Perl will NOT run. Both the same-named (override chaining)
+      // and differently-named forms are unsound, so neither is emitted.
+      const code = `package Child;
+
+sub configure {
+    my $self = shift;
+    $self->SUPER::configure();
+    return $self->SUPER::initialize();
+}
+
+sub initialize { return 1; }
+
+1;
+`;
+      const result = extractFromSource('lib/Child.pm', code);
+      const called = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(called).not.toContain('configure');
+      expect(called).not.toContain('initialize');
+      expect(called).not.toContain('Child::initialize');
+    });
+
+    it('should keep an explicit non-SUPER method qualifier', () => {
+      // `$obj->Base::helper()` names its target unambiguously; degrading it to
+      // a bare `helper` throws that away and lets it match the caller's own
+      // same-named sub instead of Base's.
+      const code = `package P;
+
+sub helper { return 1; }
+
+sub run {
+    my ($self, $obj) = @_;
+    return $obj->Base::helper();
+}
+
+1;
+`;
+      const result = extractFromSource('lib/P.pm', code);
+      const called = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(called).toContain('Base::helper');
+      expect(called).not.toContain('P::helper');
+    });
+
+    it('should not emit a call ref for a dynamic method name', () => {
+      // `$obj->$method()` resolves at runtime. Emitting `$method` made the name
+      // matcher bind the call to the VARIABLE of that name — an edge to
+      // something that is not even callable.
+      const code = `package P;
+
+sub run {
+    my ($self, $obj) = @_;
+    my $method = "helper";
+    return $obj->$method();
+}
+
+1;
+`;
+      const result = extractFromSource('lib/P.pm', code);
+      const called = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(called).not.toContain('$method');
+      expect(called).not.toContain('method');
+    });
+
+    it('should strip the sigil from an ampersand call so it can resolve', () => {
+      const code = `package P;
+
+sub helper { return 1; }
+
+sub run {
+    return &helper();
+}
+
+1;
+`;
+      const result = extractFromSource('lib/P.pm', code);
+      const called = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(called).toContain('helper');
+      expect(called).not.toContain('&helper');
+    });
+
+    it('should not emit call refs for Perl builtins', () => {
+      // `die`/`push`/`print`/`join` can never resolve to an indexed symbol;
+      // on real ONTAP Perl they were thousands of permanently-failed refs.
+      const code = `package Sample;
+
+sub run {
+    my ($self, @items) = @_;
+    push @items, 1;
+    print "hello";
+    my $line = join(',', @items);
+    die "boom" unless $line;
+    return $self->real_helper();
+}
+
+1;
+`;
+      const result = extractFromSource('lib/Sample.pm', code);
+      const called = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(called).toContain('real_helper');
+      for (const builtin of ['push', 'print', 'join', 'die']) {
+        expect(called).not.toContain(builtin);
+      }
+    });
+  });
+
+  describe('Variables', () => {
+    it('should extract package-level variables but not lexicals inside subs', () => {
+      // `my $self = shift;` exists in nearly every sub of every Perl file;
+      // indexing lexicals would multiply node count for unreachable symbols.
+      const code = `package Sample;
+
+our $VERSION = '1.02';
+our @EXPORT_OK = qw(build);
+my $counter = 0;
+
+sub build {
+    my $self = shift;
+    my ($local_only) = @_;
+    return $self;
+}
+
+1;
+`;
+      const result = extractFromSource('lib/Sample.pm', code);
+      const vars = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name).sort();
+      expect(vars).toEqual(['$VERSION', '$counter', '@EXPORT_OK']);
+      expect(vars).not.toContain('$self');
+      expect(vars).not.toContain('$local_only');
+      // `our` publishes a package global; `my` is file-private.
+      expect(result.nodes.find((n) => n.name === '$VERSION')?.isExported).toBe(true);
+      expect(result.nodes.find((n) => n.name === '$counter')?.isExported).toBe(false);
+    });
+
+    it('should not index lexicals declared inside an anonymous subroutine', () => {
+      // An anonymous sub creates no graph node, so a nodeStack-only check saw
+      // no enclosing function and treated its lexicals as package globals.
+      const code = `package Sample;
+
+my $handler = sub {
+    my $secret = 1;
+    return $secret;
+};
+
+1;
+`;
+      const result = extractFromSource('lib/Sample.pm', code);
+      const vars = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
+      expect(vars).toContain('$handler');
+      expect(vars).not.toContain('$secret');
+    });
   });
 });

@@ -395,6 +395,40 @@ const LITERAL_RECEIVER_TYPES = new Set([
  */
 const REACT_HANDLER_HOOKS = /^(?:React\.)?use(?:Callback|EffectEvent|Event)$/;
 
+/**
+ * Perl: node types that, in INVOCANT position, are themselves calls —
+ * `$self->service_db()->attribute_add(...)`. The outer method dispatches on
+ * whatever the inner call returns, a value with no statically known type, so
+ * the outer method's bare name is not a sound `calls` ref. See the perl branch
+ * in `extractCall`.
+ */
+const PERL_CHAINED_INVOCANT_TYPES = new Set([
+  'method_call_expression',
+  'function_call_expression',
+  'ambiguous_function_call_expression',
+  'coderef_call_expression',
+]);
+
+/**
+ * Perl builtins that parse as ordinary `(ambiguous_)function_call_expression`
+ * rather than the dedicated `func0op`/`func1op` nodes. They can never resolve
+ * to an indexed project symbol, so emitting `calls` refs for them only creates
+ * permanently-failed references (thousands of them on a real Perl corpus) and
+ * risks bare-name matching an unrelated same-named project sub.
+ */
+const PERL_BUILTINS = new Set([
+  'die', 'warn', 'print', 'printf', 'sprintf', 'say', 'push', 'pop', 'shift',
+  'unshift', 'splice', 'join', 'split', 'map', 'grep', 'sort', 'reverse',
+  'keys', 'values', 'each', 'exists', 'delete', 'defined', 'ref', 'bless',
+  'scalar', 'wantarray', 'length', 'substr', 'index', 'rindex', 'uc', 'lc',
+  'ucfirst', 'lcfirst', 'chomp', 'chop', 'chr', 'ord', 'abs', 'int', 'sqrt',
+  'hex', 'oct', 'rand', 'srand', 'time', 'localtime', 'gmtime', 'sleep',
+  'exit', 'open', 'close', 'binmode', 'eof', 'seek', 'tell', 'read', 'eval',
+  'chdir', 'mkdir', 'rmdir', 'unlink', 'rename', 'stat', 'lstat', 'opendir',
+  'readdir', 'closedir', 'system', 'exec', 'sprintf', 'lock', 'local',
+  'return', 'last', 'next', 'redo', 'goto', 'caller', 'sub',
+]);
+
 export class TreeSitterExtractor {
   private filePath: string;
   private language: Language;
@@ -4033,6 +4067,111 @@ export class TreeSitterExtractor {
         });
       }
       return;
+    }
+
+    // Perl: `$obj->method(...)` / `Class->new(...)` parse as
+    // method_call_expression with `invocant` + `method` fields — none of the
+    // `function`/`object`/`name` fields the branches below expect. The generic
+    // path would take namedChild(0) (the INVOCANT) as the callee and drop the
+    // method name entirely, so `$obj->configure()` recorded a `calls` ref to
+    // `$obj` and the method's callers were invisible — the same failure the
+    // ruby branch above fixes, for the same reason.
+    if (this.language === 'perl' && node.type === 'method_call_expression') {
+      const methodNode = getChildByField(node, 'method');
+      let methodName = methodNode ? getNodeText(methodNode, this.source) : '';
+      if (!methodName) return;
+      const line = node.startPosition.row + 1;
+      const column = node.startPosition.column;
+      const invocantNode = getChildByField(node, 'invocant');
+      // A CHAINED invocant — `$self->service_db()->attribute_add(...)` —
+      // dispatches on whatever the inner call RETURNS, a value with no
+      // statically known type. The bare method name is not a sound ref: on real
+      // ONTAP Perl it exact-matched the enclosing same-named sub and produced
+      // hundreds of wrong self-referential `calls` edges (the dominant source of
+      // them). Silent beats wrong — the inner call is still recorded on its own.
+      if (invocantNode && PERL_CHAINED_INVOCANT_TYPES.has(invocantNode.type)) return;
+      // A DYNAMIC method name — `$obj->$method()` — is a scalar wrapped in the
+      // `method` field. Its text (`$method`) is not a symbol name at all: name
+      // matching bound it to the VARIABLE `$method`, producing a `calls` edge to
+      // something that isn't callable.
+      if (methodNode && methodNode.namedChildCount > 0) {
+        for (let i = 0; i < methodNode.namedChildCount; i++) {
+          const child = methodNode.namedChild(i);
+          if (child && (child.type === 'scalar' || child.type === 'varname')) return;
+        }
+      }
+      if (methodName.includes('::')) {
+        // `$self->SUPER::configure(...)` dispatches to a PARENT class's method.
+        // CodeGraph's resolution has no inheritance/MRO model, so the bare name
+        // binds to whichever same-named symbol matches — very often the child's
+        // OWN override, i.e. precisely the method Perl will not run. No sound
+        // ref exists here, so emit none.
+        if (methodName.startsWith('SUPER::')) return;
+        // Any other explicit qualifier (`$obj->Base::helper()`) already names
+        // the target unambiguously — keep it whole rather than degrading it to
+        // a bare `helper` that could match the caller's own sub.
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: methodName,
+          referenceKind: 'calls',
+          line,
+          column,
+        });
+        return;
+      }
+      // A bareword invocant is a class name (`Foo::Bar->new`); a scalar
+      // (`$self->`) is a runtime value whose type isn't statically known, so the
+      // bare method name is the only sound ref.
+      const isClass = invocantNode?.type === 'bareword';
+      const invocantText = invocantNode && isClass ? getNodeText(invocantNode, this.source).trim() : '';
+      // `Class->new(...)` is Perl's constructor convention.
+      if (methodName === 'new' && invocantText) {
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: invocantText,
+          referenceKind: 'instantiates',
+          line,
+          column,
+        });
+        return;
+      }
+      this.unresolvedReferences.push({
+        fromNodeId: callerId,
+        referenceName: invocantText ? `${invocantText}::${methodName}` : methodName,
+        referenceKind: 'calls',
+        line,
+        column,
+      });
+      return;
+    }
+
+    // Perl: a plain `push @a, 1` / `die "x"` parses as an ordinary
+    // (ambiguous_)function_call_expression, so unlike the dedicated
+    // func0op/func1op builtin nodes it reaches the generic path. Drop the
+    // language's own builtins — they never resolve to a project symbol.
+    if (
+      this.language === 'perl' &&
+      (node.type === 'function_call_expression' || node.type === 'ambiguous_function_call_expression')
+    ) {
+      const fnNode = getChildByField(node, 'function');
+      const fnName = fnNode ? getNodeText(fnNode, this.source).trim() : '';
+      if (fnName && PERL_BUILTINS.has(fnName)) return;
+      // An ampersand call (`&helper()`) wraps the bare name in a `varname`
+      // child, but the `function` node's own text keeps the sigil. Definitions
+      // are indexed without it, so the generic path's `&helper` never resolved.
+      if (fnNode && fnName.startsWith('&')) {
+        const varnameNode = fnNode.namedChild(0);
+        const bare = varnameNode ? getNodeText(varnameNode, this.source).trim() : fnName.slice(1);
+        if (!bare) return;
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: bare,
+          referenceKind: 'calls',
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column,
+        });
+        return;
+      }
     }
 
     // ArkTS build()-DSL handling. Three shapes carry UI-attribute chains, and
