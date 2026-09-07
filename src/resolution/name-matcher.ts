@@ -388,6 +388,85 @@ function isLexicallyReachable(
   );
 }
 
+const JS_FAMILY = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx']);
+
+/**
+ * Whether a JS/TS `calls` ref is a RECEIVER-LESS call — `serialize(x)`, not
+ * `this.serialize(x)` / `obj.serialize(x)`. The extractor emits `this.m()`
+ * and `super.m()` under the bare method name, so the receiver is read back
+ * from the call site's own line: the text at the ref's column is the call
+ * expression, and it starts with the name itself only when nothing precedes
+ * it. In JS/TS a bare call can never bind to a class method (methods need a
+ * receiver), so a `method` node is not a candidate for it (#1714) — the
+ * enclosing method itself least of all, which the same-file proximity term
+ * used to pick over the module-scope function the call actually means.
+ */
+function isBareJsCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.referenceKind !== 'calls' || !JS_FAMILY.has(ref.language)) return false;
+  if (ref.referenceName.includes('.')) return false;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1]
+    ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return false;
+  const at = line.slice(ref.column);
+  const nameEsc = ref.referenceName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (!new RegExp('^' + nameEsc + '\\s*[(<]').test(at)) return false;
+  // Nothing but whitespace, an operator or an opener may precede a bare call.
+  return !/[.\w$\]\)]\s*$/.test(line.slice(0, ref.column)) || /\b(?:return|await|yield|typeof|void|new|else|case|throw|in|of|instanceof)\s*$/.test(line.slice(0, ref.column));
+}
+
+/** Per-context memo: `file\0name` → "the file binds this name locally". */
+const LOCAL_BINDING_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * Whether a JS/TS file binds `name` itself — as a `const`/`let`/`var`/
+ * `function`/`class` declaration (destructuring included) or as a parameter
+ * of a function or arrow. Such a binding shadows every same-named symbol in
+ * other files, so a bare call to it has no cross-file candidate: the
+ * `resolve` of `new Promise((resolve, reject) => …)`, a spec's
+ * `const transform = await makeTransform()`, a factory's `const now =
+ * options.now || (() => new Date())`. None of these is a node the graph
+ * holds (a parameter, a const bound to a call result), so without this the
+ * matcher hands the call to whichever other file defines the name — and
+ * once methods stop being candidates for a bare call (#1714), the function
+ * that was out-ranked steps in. Read from source, memoised per file+name.
+ */
+function isLocallyBoundJsName(name: string, filePath: string, context: ResolutionContext): boolean {
+  let memo = LOCAL_BINDING_MEMO.get(context);
+  if (!memo) {
+    memo = new Map();
+    LOCAL_BINDING_MEMO.set(context, memo);
+  }
+  const key = filePath + '\0' + name;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  const source = context.readFile(filePath) ?? '';
+  const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // `const { name } = require('./m')` / `= await import('./m')` binds an IMPORT,
+  // not a shadow: the symbol lives in the other file and the call means it.
+  const declRe = new RegExp(
+    '\\b(?:const|let|var)\\s+(?:' + n + '\\b|[{\\[][^;=]*?\\b' + n + '\\b[^;=]*?[}\\]])\\s*(?:=\\s*([^;\\n]*))?',
+    'g'
+  );
+  let bound = false;
+  for (const m of source.matchAll(declRe)) {
+    if (!/^\s*(?:await\s+)?(?:require|import)\s*\(/.test(m[1] ?? '')) { bound = true; break; }
+  }
+  if (!bound) {
+    bound =
+      new RegExp('\\b(?:function|class)\\s+' + n + '\\b').test(source) ||
+      // a parameter: every token before the name in the list is itself a
+      // parameter (identifier, optional type, optional default) — so a string
+      // argument containing the word cannot match.
+      new RegExp(
+        '\\(\\s*(?:(?:\\.\\.\\.)?[\\w$]+(?:\\s*\\??\\s*:\\s*[^,()]+)?(?:\\s*=\\s*[^,()]+)?\\s*,\\s*)*' +
+          n + '\\b(?:\\s*\\??\\s*:[^,()]*)?(?:\\s*=[^,()]*)?(?:\\s*,\\s*[^()]*)?\\)\\s*(?::[^=;{]*)?(?:=>|\\{)'
+      ).test(source) ||
+      new RegExp('(?:^|[^\\w$.])' + n + '\\s*=>').test(source);
+  }
+  memo.set(key, bound);
+  return bound;
+}
+
 /**
  * Try to resolve a reference by exact name match
  */
@@ -404,10 +483,16 @@ export function matchByExactName(
   // unresolved import refs each scored K same-named import candidates through
   // findBestMatch — O(K²) per package, the dominant cost of "Resolving refs" on
   // large import-heavy (front-end + back-end) repos (#915).
+  const bareJs = isBareJsCall(ref, context);
   const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref)
     .filter((n) => n.kind !== 'import')
     // Nested locals are only reachable from inside their container (#1230).
-    .filter((n) => isLexicallyReachable(n, ref, context));
+    .filter((n) => isLexicallyReachable(n, ref, context))
+    // A receiver-less JS/TS call cannot reach a method (#1714).
+    .filter((n) => !(bareJs && n.kind === 'method'))
+    // A name the file binds itself (a parameter, a const) shadows every other
+    // file's symbol of that name, so a bare call has no cross-file candidate.
+    .filter((n) => !(bareJs && n.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context)));
 
   if (candidates.length === 0) {
     return null;
@@ -1299,6 +1384,7 @@ function getInferScanStates(context: ResolutionContext): Map<string, InferScanSt
 /** Drop the per-context scan states (see ReferenceResolver.clearCaches). */
 export function clearNameMatcherMemos(context: ResolutionContext): void {
   INFER_SCAN_STATES.delete(context);
+  LOCAL_BINDING_MEMO.delete(context);
 }
 
 function memoPatterns(key: string, build: () => RegExp[]): RegExp[] {
@@ -2418,7 +2504,12 @@ export function matchFuzzy(
   const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);
   const finalCandidates = sameLanguageCandidates.length > 0 ? sameLanguageCandidates : callableCandidates;
 
-  if (finalCandidates.length === 1) {
+  if (
+    finalCandidates.length === 1 &&
+    !(isBareJsCall(ref, context) &&
+      (finalCandidates[0]!.kind === 'method' ||
+        (finalCandidates[0]!.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context))))
+  ) {
     const isCrossLanguage = finalCandidates[0]!.language !== ref.language;
     return {
       original: ref,
