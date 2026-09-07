@@ -12127,6 +12127,71 @@ use base qw(Sample::Alpha Sample::Beta);
       expect(parents).toEqual(['Sample::Alpha', 'Sample::Beta']);
     });
 
+    it('should record `with ROLE` composition as an inheritance reference', () => {
+      // Role::Tiny/Moo/Moose compose a role's subs INTO the consuming package,
+      // so `$self->log` in a consumer really does land in the role. Without an
+      // edge for `with`, that relationship is invisible and a bare-name match
+      // picks an unrelated same-named sub from some other package.
+      const code = `package Sample::Consumer;
+use Role::Tiny::With;
+
+with 'Sample::Roles::Log';
+
+1;
+`;
+      const result = extractFromSource('lib/Sample/Consumer.pm', code);
+      const roles = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'extends')
+        .map((r) => r.referenceName);
+      expect(roles).toEqual(['Sample::Roles::Log']);
+    });
+
+    it('should split a `with qw()` role list into one role per word', () => {
+      const code = `package Sample::Consumer;
+with qw(Sample::Roles::Log Sample::Roles::General);
+
+1;
+`;
+      const result = extractFromSource('lib/Sample/Consumer.pm', code);
+      const roles = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'extends')
+        .map((r) => r.referenceName)
+        .sort();
+      expect(roles).toEqual(['Sample::Roles::General', 'Sample::Roles::Log']);
+    });
+
+    it('should not emit a call edge for the `with` role-composition keyword', () => {
+      // `with` parses as a plain function call; left alone it becomes a call to
+      // a sub named "with" that exists nowhere.
+      const code = `package Sample::Consumer;
+with 'Sample::Roles::Log';
+
+1;
+`;
+      const result = extractFromSource('lib/Sample/Consumer.pm', code);
+      expect(result.unresolvedReferences.some((r) => r.referenceName === 'with')).toBe(false);
+    });
+
+    it('should not treat a `with` call inside a subroutine as role composition', () => {
+      // Only a package-level `with` composes a role; anything else is a normal
+      // call to a user-defined sub that happens to be named `with`.
+      const code = `package Sample::Consumer;
+
+sub run {
+    my $self = shift;
+    return with('not a role');
+}
+
+1;
+`;
+      const result = extractFromSource('lib/Sample/Consumer.pm', code);
+      expect(
+        result.unresolvedReferences.some(
+          (r) => r.referenceKind === 'extends' && r.referenceName === 'not a role'
+        )
+      ).toBe(false);
+    });
+
     it('should not invent a constant from the values of a list-valued constant', () => {
       // `use constant COLORS => 'red', 'green', 'blue'` defines ONE constant.
       // Taking every even-indexed list entry also picked up 'green'.

@@ -45,6 +45,16 @@ const PRAGMAS = new Set([
 /** `use parent`/`use base` declare inheritance, not an import. */
 const INHERITANCE_PRAGMAS = new Set(['parent', 'base']);
 
+/**
+ * Call node types a bare `with 'Role';` can parse as. The grammar cannot tell a
+ * list operator from a unary one without knowing the sub's prototype, so the
+ * same statement lands in either type depending on its arguments.
+ */
+const ROLE_COMPOSITION_CALL_TYPES = new Set([
+  'ambiguous_function_call_expression',
+  'function_call_expression',
+]);
+
 /** Sigil for a declared-variable node type. */
 const SIGILS: Record<string, string> = { scalar: '$', array: '@', hash: '%', glob: '*' };
 
@@ -105,7 +115,7 @@ function packageBlock(node: SyntaxNode): SyntaxNode | null {
  * class list of `use parent -norequire, 'A', 'B'` or `use base qw(A B)`.
  * `-norequire` is a flag, not a class, so leading-dash entries are dropped.
  */
-function usedNames(node: SyntaxNode, source: string): string[] {
+function usedNames(node: SyntaxNode, source: string, skipField = 'module'): string[] {
   const names: string[] = [];
   const push = (text: string): void => {
     const trimmed = text.trim();
@@ -132,7 +142,7 @@ function usedNames(node: SyntaxNode, source: string): string[] {
       if (child) walk(child);
     }
   };
-  const moduleNode = getChildByField(node, 'module');
+  const moduleNode = getChildByField(node, skipField);
   for (let i = 0; i < node.namedChildCount; i++) {
     const child = node.namedChild(i);
     if (child && child.id !== moduleNode?.id) walk(child);
@@ -177,18 +187,20 @@ function constantNames(node: SyntaxNode, source: string): { name: string; node: 
         if (inner?.type !== 'list_expression') continue;
         const items = entries(inner);
         for (let k = 0; k < items.length; k += 2) {
-          if (!isNameNode(items[k])) continue;
-          const text = nameOf(items[k]);
-          if (text) out.push({ name: text, node: items[k] });
+          const key = items[k];
+          if (!key || !isNameNode(key)) continue;
+          const text = nameOf(key);
+          if (text) out.push({ name: text, node: key });
         }
       }
     } else if (child.type === 'list_expression') {
       // Single-declaration form: only the leading entry is a name, however many
       // values follow it.
       const items = entries(child);
-      if (items.length && isNameNode(items[0])) {
-        const text = nameOf(items[0]);
-        if (text) out.push({ name: text, node: items[0] });
+      const first = items[0];
+      if (first && isNameNode(first)) {
+        const text = nameOf(first);
+        if (text) out.push({ name: text, node: first });
       }
     }
   }
@@ -384,6 +396,30 @@ export const perlExtractor: LanguageExtractor = {
         });
       }
       return true;
+    }
+
+    // --- role composition: `with 'Role'` / `with qw(A B)` ---
+    // Role::Tiny / Moo / Moose compose a role's subroutines INTO the consuming
+    // package, so a role is a real method-resolution parent — but `with` is a
+    // plain function call, not a pragma, so nothing models it by default. Left
+    // alone it also emits a bogus call to a sub named `with`.
+    if (ROLE_COMPOSITION_CALL_TYPES.has(node.type)) {
+      const fn = getChildByField(node, 'function');
+      if (fn && getNodeText(fn, ctx.source).trim() === 'with' && !insideSubroutine(node)) {
+        const from = ctx.nodeStack[ctx.nodeStack.length - 1];
+        if (from) {
+          for (const role of usedNames(node, ctx.source, 'function')) {
+            ctx.addUnresolvedReference({
+              fromNodeId: from,
+              referenceName: role,
+              referenceKind: 'extends',
+              line: node.startPosition.row + 1,
+              column: node.startPosition.column,
+            });
+          }
+        }
+        return true;
+      }
     }
 
     // --- `use` triage (see header comment) ---
