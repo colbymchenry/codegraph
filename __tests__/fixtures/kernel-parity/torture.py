@@ -53,3 +53,11 @@ INIT_EAGER = helper()
 INIT_LAMBDA = lambda: target_cb()
 INIT_MAP = {"a": helper()}
 init_a, init_b = helper(), view()
+
+# --- call receivers (#1683) ---------------------------------------------------
+def bucket_chains(d, k, v):
+    d.setdefault(k, []).append(v)
+    d.items().get(k)
+    make().run()
+    (lambda: make)()().run()
+    obj.make().run().again()

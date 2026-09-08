@@ -79,3 +79,11 @@ export default {
 const eagerConfig = loadConfig();
 const handlerMap = { onSave: () => persist(eagerConfig), onLoad: loadConfig() };
 const lazyList = [() => persist(eagerConfig)];
+// --- call-expression receivers (#1683) ----------------------------------------
+function bucketChains(d, k, v) {
+  d.setdefault(k, []).append(v);
+  make().run();
+  (0, make)().run();
+  arr[0]().go();
+  obj.make().run().again();
+}
