@@ -137,6 +137,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- **Watcher scope now matches `git ls-files --exclude-standard` (#1728).** `buildDefaultIgnore` / `buildScopeIgnore` read `.git/info/exclude` and `core.excludesFile` (not only the root `.gitignore`), and seed directories git reports as ignored-untracked so nested `.gitignore` effects prune the live watcher the same way the indexer skips them. Single-file auto-sync was already incremental (`pendingFiles` → scoped `sync({ paths })`); the remaining gap was watching trees git had excluded.
+
 - **Live sync no longer lets the write-ahead log grow without a bound when a reader is holding it open (#1539).** Incremental sync now uses the same writer pause that full indexing already used, and if checkpointing still cannot finish once the log is past its documented size limit — typically because the query pool is reading at the same time — sync stops with a clear error instead of keeping writing until the disk fills. The previous behaviour could leave a multi-tens-of-gigabyte log beside a few-gigabyte index on a large project. Close concurrent readers and retry, or raise `CODEGRAPH_WAL_VALVE_MB` if the limit is too tight for the project.
 
 - **A second `codegraph serve --mcp` on the same project no longer silently kills auto-sync (#1740).** Direct mode (`CODEGRAPH_NO_DAEMON=1` or proxy→in-process fallback) now takes an exclusive `.codegraph/writer.pid` lock; a second writer exits immediately with guidance to stop the other server or unset `CODEGRAPH_NO_DAEMON` so clients share the daemon. The shared daemon already multiplexes N clients onto one watcher — this closes the same-OS dual-direct gap the docs warned about for Windows/WSL but did not guard.

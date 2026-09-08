@@ -7793,6 +7793,82 @@ describe('Nested non-submodule git repos', () => {
     expect(ig.ignores('dist/')).toBe(true); // valid rule survives
     expect(ig.ignores('src/app.ts')).toBe(false);
   });
+
+  it('buildDefaultIgnore honors .git/info/exclude (#1728)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'exclude-root');
+    fs.mkdirSync(root, { recursive: true });
+    git(root, 'init', '-q');
+    fs.writeFileSync(path.join(root, 'src.ts'), 'export const x = 1;\n');
+    fs.mkdirSync(path.join(root, '.claude', 'worktrees', 'agent-1'), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, '.claude', 'worktrees', 'agent-1', 'src.ts'),
+      'export const w = 1;\n',
+    );
+    // Not in .gitignore — only in info/exclude (the reporter's exact shape).
+    fs.writeFileSync(
+      path.join(root, '.git', 'info', 'exclude'),
+      '**/.claude/worktrees/\n',
+    );
+
+    const ig = buildDefaultIgnore(root);
+    expect(ig.ignores('src.ts')).toBe(false);
+    expect(ig.ignores('.claude/worktrees/agent-1/src.ts')).toBe(true);
+    expect(ig.ignores('.claude/worktrees/')).toBe(true);
+
+    // ScopeIgnore (watcher path) agrees, including via git ignored-dir seeding.
+    const scope = buildScopeIgnore(root);
+    expect(scope.ignores('src.ts')).toBe(false);
+    expect(scope.ignores('.claude/worktrees/agent-1/')).toBe(true);
+    expect(scope.ignores('.claude/worktrees/agent-1/src.ts')).toBe(true);
+  });
+
+  it('buildDefaultIgnore honors core.excludesFile (#1728)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'excludesfile-root');
+    fs.mkdirSync(root, { recursive: true });
+    git(root, 'init', '-q');
+    const globalExcludes = path.join(tempDir, 'global-excludes');
+    fs.writeFileSync(globalExcludes, 'scratch/\n');
+    git(root, 'config', 'core.excludesFile', globalExcludes);
+    fs.mkdirSync(path.join(root, 'scratch'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'scratch', 'tmp.ts'), 'export const t = 1;\n');
+    fs.writeFileSync(path.join(root, 'app.ts'), 'export const a = 1;\n');
+
+    const ig = buildDefaultIgnore(root);
+    expect(ig.ignores('app.ts')).toBe(false);
+    expect(ig.ignores('scratch/')).toBe(true);
+    expect(ig.ignores('scratch/tmp.ts')).toBe(true);
+  });
+
+  it('buildScopeIgnore prunes dirs ignored only by a nested .gitignore (#1728)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'nested-gi-root');
+    fs.mkdirSync(path.join(root, 'pkg', 'build'), { recursive: true });
+    git(root, 'init', '-q');
+    git(root, 'config', 'user.email', 'test@test.com');
+    git(root, 'config', 'user.name', 'Test');
+    fs.writeFileSync(path.join(root, 'pkg', 'app.ts'), 'export const a = 1;\n');
+    fs.writeFileSync(path.join(root, 'pkg', 'build', 'out.ts'), 'export const o = 1;\n');
+    fs.writeFileSync(path.join(root, 'pkg', '.gitignore'), 'build/\n');
+    // Commit only the non-ignored file so git still reports build/ as ignored-other.
+    git(root, 'add', 'pkg/app.ts', 'pkg/.gitignore');
+    git(root, 'commit', '-q', '-m', 'init');
+
+    const scope = buildScopeIgnore(root);
+    expect(scope.ignores('pkg/app.ts')).toBe(false);
+    expect(scope.ignores('pkg/build/')).toBe(true);
+    expect(scope.ignores('pkg/build/out.ts')).toBe(true);
+  });
 });
 
 // =============================================================================
