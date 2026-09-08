@@ -374,12 +374,130 @@ function matchesNonProductionDir(lowerPath: string): boolean {
 }
 
 /**
+ * Corpus statistics used to discount an exact name match by how common the
+ * name is. Supplied by the caller because only the DB layer can count names.
+ */
+export interface NameCorpusStats {
+  /** Total indexed nodes. */
+  total: number;
+  /** How many indexed nodes carry this exact name (case-insensitive). */
+  countForName(name: string): number;
+}
+
+/**
+ * Floor for {@link nameMatchIdfScale}: a common name is discounted, never erased.
+ *
+ * Measured, not chosen. Swept 0→1 over the top-25 corpus-common names of five
+ * indexed repos (gin 2.5k nodes, Alamofire 4.5k, codegraph 9.2k, excalidraw
+ * 11k, django 62k), scoring two things: whether a query that IS a common name
+ * still returns that name first, and how much of a mixed query's top-10 the
+ * common name crowds out.
+ *
+ * Real corpora never drive the raw scale below ~0.36 (django's commonest name
+ * spans 1097 of 62080 nodes → 0.367), so any floor at or under 0.35 is inert —
+ * an earlier 0.25 was dead code. The binding cases are milder and real:
+ * searching Alamofire for `alamofire` (scale 0.551) or `request` (0.392)
+ * demoted the symbol with that exact name below a mere *prefix* match
+ * (`AlamofireExtended`, `requests`), which is never right — the user typed the
+ * name. 0.60 is the lowest value clearing the worst such case (0.551) with
+ * margin; it restores exact-name recall@1 to the undiscounted baseline on all
+ * five repos while keeping ~95% of the crowd-out relief.
+ */
+export const NAME_MATCH_IDF_FLOOR = 0.6;
+
+/**
+ * Damping applied to the exact-name bonus of a node the project de-prioritized
+ * (#1463). Lives here, next to the other exact-name lever, because the two
+ * compose and only {@link combinedExactNameScale} can hold the bound they
+ * share. Re-exported from the DB layer for the callers that had it there.
+ */
+export const DEPRIORITIZED_NAME_BONUS_SCALE = 0.75;
+
+/**
+ * Floor for the *combined* exact-name multiplier (#1462 + #1463).
+ *
+ * Both levers discount the same bonus, and each was derived against the same
+ * invariant with the other lever off: an exact name the user typed never loses
+ * to a mere prefix match. Multiplied they break it — a corpus-common name in a
+ * de-prioritized tree lands at `80 * 0.6 * 0.75 - 15 = 21`, under the prefix
+ * arm's supremum of 40.
+ *
+ * A de-prioritized node also carries the flat -15 path penalty, so the bound is
+ * `round(80 * s) - 15 > 40`, i.e. `s >= 0.69375`. 0.70 is the next clean value
+ * above it and leaves `round(80 * 0.70) - 15 = 41`.
+ *
+ * Note this is a floor on the product, not `min` of the two: `min(0.6, 0.75)`
+ * is 0.6, which is itself under the bound — taking the stronger discount alone
+ * does not clear it.
+ */
+export const COMBINED_EXACT_NAME_FLOOR = 0.7;
+
+/**
+ * The exact-name multiplier once both discounts are taken into account.
+ *
+ * @param idfScale - Corpus-frequency scale from {@link nameMatchIdfScale}.
+ * @param deprioritized - Whether the node sits in a de-prioritized path.
+ * @returns Multiplier for the exact-name bonus, never below the shared bound
+ *   when de-prioritized (where the -15 path penalty also applies).
+ */
+export function combinedExactNameScale(idfScale: number, deprioritized: boolean): number {
+  if (!deprioritized) return idfScale;
+  return Math.max(COMBINED_EXACT_NAME_FLOOR, idfScale * DEPRIORITIZED_NAME_BONUS_SCALE);
+}
+
+/**
+ * IDF-style scale for an exact-name bonus, in [NAME_MATCH_IDF_FLOOR, 1].
+ *
+ * An exact name match is strong evidence only when the name is rare. A bare
+ * `usage` that names hundreds of symbols carries almost no signal, yet used to
+ * collect the same flat bonus as a name that occurs once — enough to outrank
+ * product code that does not literally contain the token (#982, the
+ * corpus-frequency discount #746 left unimplemented).
+ *
+ * `log(1 + total/df) / log(1 + total)` gives exactly 1 for a unique name, so
+ * the common case is unchanged, and decays as the name spreads. The floor keeps
+ * a genuinely-intended query for a common name (an actual `usage()` reporter)
+ * ranking above non-matches: the aim is to discount the signal, not erase it.
+ *
+ * @param df - Number of indexed nodes sharing the name.
+ * @param total - Total indexed nodes.
+ * @returns Multiplier for the exact-name bonus.
+ */
+export function nameMatchIdfScale(df: number, total: number): number {
+  if (!Number.isFinite(df) || !Number.isFinite(total)) return 1;
+  if (df <= 1 || total <= 1) return 1;
+  const capped = Math.min(df, total);
+  const scale = Math.log(1 + total / capped) / Math.log(1 + total);
+  return Math.max(NAME_MATCH_IDF_FLOOR, Math.min(1, scale));
+}
+
+/**
  * Bonus when a node's name matches the search query.
  * Exact matches get the largest boost; prefix matches get smaller boosts.
  * Multi-word queries also check individual term matches against the name.
+ *
+ * @param corpus - Optional corpus stats. When given, the two exact-name bonuses
+ *   are scaled by {@link nameMatchIdfScale} so a name shared by many symbols
+ *   stops dominating. Omitted (or unavailable) leaves scoring as before.
  */
-export function nameMatchBonus(nodeName: string, query: string): number {
+export function nameMatchBonus(
+  nodeName: string,
+  query: string,
+  corpus?: NameCorpusStats,
+  deprioritized = false,
+): number {
   const nameLower = nodeName.toLowerCase();
+
+  // Only the exact-name arms below take the corpus discount. Prefix/substring
+  // bonuses are already small and length-scaled, so they never produced the
+  // #982 crowd-out. The de-prioritized damping applies to every arm (#1463) —
+  // it is the whole name signal that the project called peripheral — but only
+  // the exact arms compose two discounts, so only they need the shared floor.
+  const idf = corpus ? nameMatchIdfScale(corpus.countForName(nameLower), corpus.total) : 1;
+  const exact = (bonus: number): number =>
+    Math.round(bonus * combinedExactNameScale(idf, deprioritized));
+  const other = (bonus: number): number =>
+    deprioritized ? Math.round(bonus * DEPRIORITIZED_NAME_BONUS_SCALE) : bonus;
 
   // Split query into word-level terms (handles "CacheBuilder build" → ["cache","builder","build"])
   const rawTerms = query
@@ -395,26 +513,26 @@ export function nameMatchBonus(nodeName: string, query: string): number {
   const queryLower = query.replace(/[\s]+/g, '').toLowerCase();
 
   // Exact match: query exactly equals the node name
-  if (nameLower === queryLower) return 80;
+  if (nameLower === queryLower) return exact(80);
 
   // Exact match on a query token: "CacheBuilder build" and node name is "build"
-  if (queryTokens.length > 1 && queryTokens.includes(nameLower)) return 60;
+  if (queryTokens.length > 1 && queryTokens.includes(nameLower)) return exact(60);
 
   // Name starts with query — scale by length ratio so "Pod"→"Pod" (exact, handled above)
   // scores much higher than "Pod"→"PodGCControllerOptions" (ratio 0.125).
   if (nameLower.startsWith(queryLower)) {
     const ratio = queryLower.length / nameLower.length;
-    return Math.round(10 + 30 * ratio);
+    return other(Math.round(10 + 30 * ratio));
   }
 
   // All camelCase-split terms appear in the name
   if (rawTerms.length > 1) {
     const allMatch = rawTerms.every(t => nameLower.includes(t));
-    if (allMatch) return 15;
+    if (allMatch) return other(15);
   }
 
   // Name contains the full query as substring
-  if (nameLower.includes(queryLower)) return 10;
+  if (nameLower.includes(queryLower)) return other(10);
 
   return 0;
 }
