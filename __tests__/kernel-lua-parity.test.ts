@@ -127,6 +127,22 @@ describe.skipIf(!kernelBuilt)('kernel Lua/Luau extraction parity', () => {
     // lua functions carry NO isExported (undefined — not false).
     const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'topFn');
     expect(fn?.isExported).toBeUndefined();
+    expect(result.nodes.some((n) => n.kind === 'function' && n.name === 'anonAssigned')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'method' && n.qualifiedName === 'M::assigned')).toBe(true);
+    expect(
+      result.nodes.some((n) => n.kind === 'method' && n.qualifiedName === 'M.callbacks::on_start')
+    ).toBe(true);
+    expect(
+      result.nodes.some((n) => n.kind === 'method' && n.qualifiedName === 'M.callbacks::on_stop')
+    ).toBe(true);
+    for (const qualifiedName of ['M::assigned', 'M.callbacks::on_start', 'M.callbacks::on_stop']) {
+      const callable = result.nodes.find((n) => n.qualifiedName === qualifiedName)!;
+      expect(
+        refs.some(
+          (r) => r.fromNodeId === callable.id && r.referenceKind === 'calls' && r.referenceName === 'topFn'
+        )
+      ).toBe(true);
+    }
     // variables DO carry isExported === false.
     const v = result.nodes.find((n) => n.kind === 'variable' && n.name === 'core');
     expect(v?.isExported).toBe(false);
