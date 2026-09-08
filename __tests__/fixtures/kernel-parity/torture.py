@@ -47,3 +47,12 @@ def shadowed():
 
 handlers = {"recv": target_cb}
 callbacks = [target_cb, view]
+
+
+# --- call receivers (#1683) ---------------------------------------------------
+def bucket_chains(d, k, v):
+    d.setdefault(k, []).append(v)
+    d.items().get(k)
+    make().run()
+    (lambda: make)()().run()
+    obj.make().run().again()
