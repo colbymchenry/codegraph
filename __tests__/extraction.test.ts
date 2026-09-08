@@ -102,6 +102,12 @@ describe('Language Detection', () => {
     expect(detectLanguage('stdio.h', '#ifndef STDIO_H\nvoid printf();\n#endif\n')).toBe('c');
   });
 
+  it('should detect Markdown files', () => {
+    expect(detectLanguage('README.md')).toBe('markdown');
+    expect(detectLanguage('docs/guide.markdown')).toBe('markdown');
+    expect(detectLanguage('docs/page.mdx')).toBe('markdown');
+  });
+
   it('should detect Metal shader files as C++ (#1121)', () => {
     expect(detectLanguage('Shaders.metal')).toBe('cpp');
     expect(isSourceFile('Renderer/Shaders.metal')).toBe(true);
@@ -250,8 +256,215 @@ describe('Language Support', () => {
     expect(languages).toContain('swift');
     expect(languages).toContain('kotlin');
     expect(languages).toContain('dart');
+    expect(languages).toContain('markdown');
     expect(languages).toContain('solidity');
     expect(languages).toContain('nix');
+  });
+});
+
+describe('Markdown Extraction', () => {
+  it('should extract headings, links, and shell script references', () => {
+    const markdown = `# Project Guide
+
+See [Setup](docs/setup.md#install) and scripts/release.mjs.
+
+## Release
+
+\`\`\`bash
+npm run build
+node scripts/release.mjs
+\`\`\`
+`;
+
+    const result = extractFromSource('README.md', markdown);
+
+    const fileNode = result.nodes.find((n) => n.kind === 'file');
+    expect(fileNode).toMatchObject({
+      name: 'README.md',
+      language: 'markdown',
+    });
+
+    const headings = result.nodes.filter((n) => n.kind === 'module');
+    expect(headings.map((n) => n.name)).toContain('Project Guide');
+    expect(headings.map((n) => n.name)).toContain('Release');
+
+    const commandNode = result.nodes.find((n) => n.kind === 'function' && n.signature === 'node scripts/release.mjs');
+    expect(commandNode).toBeDefined();
+
+    expect(result.unresolvedReferences).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          referenceName: 'docs/setup.md#install',
+          referenceKind: 'imports',
+          language: 'markdown',
+        }),
+        expect.objectContaining({
+          referenceName: 'scripts/release.mjs',
+          referenceKind: 'calls',
+          language: 'markdown',
+        }),
+      ])
+    );
+  });
+
+  it('should extract structured table rows and file-symbol references from Markdown', () => {
+    const markdown = `# Maintenance Guide
+
+## Phase 4
+
+| Template | CLI Entry | Dispatcher | Implementation |
+| --- | --- | --- | --- |
+| P4-S1 | \`python "{script_path}" p4 "{csv_file}" s1 "{conditions_or_-}" "{probe_cols}"\` | \`scripts/csv_search.py::run_p4\` | \`scripts/csv_search.py::_p4_stage1\` |
+| P4-S2 | \`python "{script_path}" p4 "{csv_file}" s2 "{stage1_rows}" "{condition_or_-}" "{detail_cols}"\` | \`scripts/csv_search.py::run_p4\` | \`scripts/csv_search.py::_p4_stage2\` |
+
+- P4-FLOW changes must inspect \`scripts/csv_search.py::run_p4\`.
+`;
+
+    const result = extractFromSource('phases/phase4.md', markdown);
+
+    const tableRows = result.nodes.filter((n) => n.kind === 'constant' && n.qualifiedName.includes('table-row'));
+    expect(tableRows.map((n) => n.name)).toEqual(expect.arrayContaining(['P4-S1', 'P4-S2']));
+
+    const p4s1 = tableRows.find((n) => n.name === 'P4-S1');
+    expect(p4s1?.signature).toContain('Template: P4-S1');
+    expect(p4s1?.signature).toContain('Dispatcher: scripts/csv_search.py::run_p4');
+
+    const commandNode = result.nodes.find((n) =>
+      n.kind === 'function' &&
+      n.language === 'markdown' &&
+      n.signature?.includes('python "{script_path}" p4')
+    );
+    expect(commandNode).toBeDefined();
+
+    expect(result.unresolvedReferences).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          referenceName: 'phases/scripts/csv_search.py::run_p4',
+          referenceKind: 'references',
+          language: 'markdown',
+        }),
+        expect.objectContaining({
+          referenceName: 'phases/scripts/csv_search.py::_p4_stage1',
+          referenceKind: 'references',
+          language: 'markdown',
+        }),
+      ])
+    );
+  });
+
+  it('should keep structured blocks after fences containing a different fence marker', () => {
+    const markdown = `# Runbook
+
+\`\`\`text
+~~~~
+\`\`\`
+
+- POST-FENCE references \`src/auth.ts::login\`.
+
+| Key | Target |
+| --- | --- |
+| POST-TABLE | \`src/auth.ts::login\` |
+`;
+
+    const result = extractFromSource('docs/runbook.md', markdown);
+    const constants = result.nodes.filter((n) => n.kind === 'constant');
+
+    expect(constants).toEqual(expect.arrayContaining([
+      expect.objectContaining({ docstring: 'POST-FENCE references src/auth.ts::login.' }),
+      expect.objectContaining({ name: 'POST-TABLE' }),
+    ]));
+  });
+
+  it('indexes Setext (underline) headings and skips frontmatter / code fences', () => {
+    const markdown = `---
+title: Config Doc
+---
+
+Architecture Overview
+=====================
+
+Intro paragraph for the overview.
+
+Routing Layer
+-------------
+
+\`\`\`md
+Not A Heading
+=============
+\`\`\`
+`;
+
+    const result = extractFromSource('docs/arch.md', markdown);
+    const headings = result.nodes.filter((n) => n.kind === 'module');
+    const byName = new Map(headings.map((h) => [h.name, h]));
+
+    // Setext H1 (===) and H2 (---) become module nodes.
+    expect(byName.get('Architecture Overview')?.signature).toBe('# Architecture Overview');
+    expect(byName.get('Routing Layer')?.signature).toBe('## Routing Layer');
+    // Frontmatter `title:` (above the closing `---`) is NOT a heading, and a
+    // setext-looking line inside a code fence is ignored.
+    expect(byName.has('title: Config Doc')).toBe(false);
+    expect(byName.has('Not A Heading')).toBe(false);
+  });
+
+  it('builds a deterministic, compact file digest (intro + key references)', () => {
+    const markdown = `# Release Runbook
+
+This runbook explains how to cut a release.
+
+See [setup](docs/setup.md#install) and run \`scripts/release.mjs\`.
+It dispatches \`scripts/csv_search.py::run_p4\`.
+`;
+
+    const result = extractFromSource('RUNBOOK.md', markdown);
+    const fileNode = result.nodes.find((n) => n.kind === 'file');
+
+    expect(fileNode?.docstring).toBeDefined();
+    const digest = fileNode!.docstring!;
+    // Intro is the first prose line, not the heading or a link blob.
+    expect(digest).toContain('This runbook explains how to cut a release.');
+    // Key referenced files/symbols are surfaced, compacted to basenames.
+    expect(digest).toContain('refs:');
+    expect(digest).toContain('setup.md#install');
+    expect(digest).toContain('release.mjs');
+    expect(digest).toContain('csv_search.py::run_p4');
+    // Short enough to show in node details (the < 200 char detail gate).
+    expect(digest.length).toBeLessThan(200);
+  });
+});
+
+describe('Code to Markdown Reference Extraction', () => {
+  it('should extract Markdown path references from code string literals', () => {
+    const code = `
+export const GUIDE = '../docs/guide.md';
+
+export function loadDocs() {
+  return fs.readFileSync('../docs/guide.md#install', 'utf8');
+}
+`;
+
+    const result = extractFromSource('src/load-docs.ts', code);
+    const loadDocs = result.nodes.find((n) => n.kind === 'function' && n.name === 'loadDocs');
+    const guideConstant = result.nodes.find((n) => n.kind === 'constant' && n.name === 'GUIDE');
+
+    expect(loadDocs).toBeDefined();
+    expect(guideConstant).toBeDefined();
+    expect(result.unresolvedReferences).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          fromNodeId: loadDocs!.id,
+          referenceName: 'docs/guide.md#install',
+          referenceKind: 'references',
+          language: 'typescript',
+        }),
+        expect.objectContaining({
+          fromNodeId: guideConstant!.id,
+          referenceName: 'docs/guide.md',
+          referenceKind: 'references',
+          language: 'typescript',
+        }),
+      ])
+    );
   });
 });
 
