@@ -378,6 +378,7 @@ type IndexResult = {
  */
 function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexResult, projectPath?: string): void {
   const hasErrors = result.filesErrored > 0;
+  const parseWarnings = result.errors.filter((e) => e.code === 'parse_error' && e.severity === 'warning');
 
   // Surface non-file-level failures (e.g. lock-acquisition failure
   // when another indexer is running) before the file-count branches.
@@ -403,6 +404,10 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
       clack.log.success(`Indexed ${formatNumber(result.filesIndexed)} files`);
     }
     clack.log.info(`${formatNumber(result.nodesCreated)} nodes, ${formatNumber(result.edgesCreated)} edges in ${formatDuration(result.durationMs)}`);
+    // Warning-only parse failures keep indexing successful, but must be visible.
+    for (const warning of parseWarnings) {
+      clack.log.warn(warning.message);
+    }
     // A PARTIAL index (files silently dropped mid-pipeline) must not pass
     // as a clean run — it's the difference between "indexed the repo" and
     // "indexed most of the repo, quietly". Only the completeness
@@ -791,7 +796,13 @@ program
   .option('-q, --quiet', 'Suppress progress output')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
   .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean }) => {
-    const projectPath = resolveProjectPath(pathArg);
+    // An EXPLICIT path names the project to rebuild — it is never a hint to go
+    // looking for one. resolveProjectPath walks up to the nearest initialized
+    // ancestor, which is right for `codegraph query` run from a subdirectory,
+    // but for a full re-index it silently rebuilt the parent's graph under a
+    // normal "Done" when <path> had no index of its own (#1524). Only a bare
+    // `codegraph index` (cwd) may resolve upward.
+    const projectPath = pathArg ? path.resolve(pathArg) : resolveProjectPath();
 
     try {
       // Don't (re)index your home directory / a filesystem root (#845). --force
@@ -804,7 +815,12 @@ program
 
       if (!isInitialized(projectPath)) {
         error(`CodeGraph not initialized in ${projectPath}`);
-        info('Run "codegraph init" first');
+        const ancestor = pathArg ? resolveProjectPath(pathArg) : projectPath;
+        if (ancestor !== projectPath) {
+          info(`The nearest initialized project is ${ancestor} — pass that path to rebuild it, or run "codegraph init" in ${projectPath} to index it on its own.`);
+        } else {
+          info('Run "codegraph init" first');
+        }
         process.exit(1);
       }
 
