@@ -135,6 +135,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+#### MCP / indexing
+
+- **A second `codegraph serve --mcp` on the same project no longer silently kills auto-sync (#1740).** Direct mode (`CODEGRAPH_NO_DAEMON=1` or proxy→in-process fallback) now takes an exclusive `.codegraph/writer.pid` lock; a second writer exits immediately with guidance to stop the other server or unset `CODEGRAPH_NO_DAEMON` so clients share the daemon. The shared daemon already multiplexes N clients onto one watcher — this closes the same-OS dual-direct gap the docs warned about for Windows/WSL but did not guard.
+
 #### Screens, links and navigation
 
 - **Where the app goes after login is a fork, not two always-es.** A navigation whose destination comes back from a helper — `router.replace(await resolvePostLoginRoute())` over `return (await hasSeenWelcome(…)) ? '/home/' : '/welcome/'` — drew both screens with no condition, reading as if the welcome screen always shows. The two arms share a line, and only a column can tell them apart; each synthesized edge now carries its literal's own position, so the guard reader says which arm it is: `WHEN await hasSeenWelcome(…)` → home, and its negation → welcome. And the scan starts at the helper's body, so a literal-union return type — `Promise<'/welcome/' | '/home/'>`, whose routes are string literals too, written first — no longer stands in for the navigation itself. Re-index after upgrading to pick the positions up.
