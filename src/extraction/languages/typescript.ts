@@ -39,7 +39,7 @@ export function classifyTsClassMember(node: SyntaxNode): 'method' | 'property' {
 }
 
 export const typescriptExtractor: LanguageExtractor = {
-  functionTypes: ['function_declaration', 'arrow_function', 'function_expression'],
+  functionTypes: ['function_declaration', 'generator_function_declaration', 'arrow_function', 'function_expression', 'generator_function'],
   classTypes: ['class_declaration', 'abstract_class_declaration'],
   methodTypes: ['method_definition', 'public_field_definition'],
   classifyMethodNode: classifyTsClassMember,
