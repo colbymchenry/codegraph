@@ -138,6 +138,10 @@ describe('Language Detection', () => {
     expect(detectLanguage('versions.tofu')).toBe('terraform');
   });
 
+  it('should detect SQL files', () => {
+    expect(detectLanguage('schema.sql')).toBe('sql');
+  });
+
   it('should detect ArkTS files', () => {
     expect(detectLanguage('entry/src/main/ets/pages/Index.ets')).toBe('arkts');
     // Plain `.ts` in a HarmonyOS project is still TypeScript.
@@ -12424,5 +12428,96 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     expect(result.errors).toEqual([]);
     expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'Widget')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'size')).toBe(true);
+  });
+});
+
+// =============================================================================
+// SQL (DerekStride/tree-sitter-sql, vendored)
+// =============================================================================
+
+describe('SQL Extraction', () => {
+  describe('Language detection', () => {
+    it('should report SQL as supported', () => {
+      expect(isLanguageSupported('sql')).toBe(true);
+      expect(getSupportedLanguages()).toContain('sql');
+    });
+  });
+
+  describe('Table and column extraction', () => {
+    it('should extract a table and its columns as fields', () => {
+      const code = `
+CREATE TABLE users (
+  id INTEGER PRIMARY KEY,
+  name VARCHAR(100) NOT NULL
+);
+`;
+      const result = extractFromSource('schema.sql', code);
+      const table = result.nodes.find((n) => n.kind === 'class' && n.name === 'users');
+      expect(table).toBeDefined();
+      const fields = result.nodes.filter((n) => n.kind === 'field').map((n) => n.name);
+      expect(fields).toContain('id');
+      expect(fields).toContain('name');
+    });
+  });
+
+  describe('View extraction', () => {
+    it('should extract a view and its FROM/JOIN table references', () => {
+      const code = `
+CREATE VIEW active_users AS
+SELECT u.id FROM users u LEFT JOIN orders o ON o.user_id = u.id;
+`;
+      const result = extractFromSource('schema.sql', code);
+      const view = result.nodes.find((n) => n.kind === 'class' && n.name === 'active_users');
+      expect(view).toBeDefined();
+      const refs = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'references' && r.fromNodeId === view!.id)
+        .map((r) => r.referenceName);
+      expect(refs).toContain('users');
+      expect(refs).toContain('orders');
+    });
+  });
+
+  describe('Function extraction', () => {
+    it('should extract a function with its signature', () => {
+      const code = `
+CREATE FUNCTION total_for_user(uid INTEGER) RETURNS DECIMAL AS $$
+  SELECT SUM(total) FROM orders WHERE user_id = uid;
+$$ LANGUAGE SQL;
+`;
+      const result = extractFromSource('schema.sql', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'total_for_user');
+      expect(fn).toBeDefined();
+      expect(fn?.signature).toContain('uid');
+    });
+  });
+
+  describe('Call extraction', () => {
+    it('should record an invocation inside a view as a resolvable call reference', () => {
+      const code = `
+CREATE VIEW order_counts AS
+SELECT u.id, COUNT(o.id) FROM users u LEFT JOIN orders o ON o.user_id = u.id GROUP BY u.id;
+`;
+      const result = extractFromSource('schema.sql', code);
+      const call = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'COUNT'
+      );
+      expect(call).toBeDefined();
+    });
+  });
+
+  describe('DML table references', () => {
+    it('should reference the target table of INSERT/UPDATE/DELETE', () => {
+      const code = `
+INSERT INTO users (id, name) VALUES (1, 'Ada');
+UPDATE users SET name = 'Grace' WHERE id = 1;
+DELETE FROM orders WHERE total < 0;
+`;
+      const result = extractFromSource('schema.sql', code);
+      const refs = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'references')
+        .map((r) => r.referenceName);
+      expect(refs).toContain('users');
+      expect(refs).toContain('orders');
+    });
   });
 });

@@ -44,6 +44,34 @@ export function getChildByField(node: SyntaxNode, fieldName: string): SyntaxNode
 }
 
 /**
+ * Precompute the offset each line starts at, for {@link getLineNumber}'s binary search.
+ * Used by hand-scanning extractors (MyBatis XML, Dataform `.sqlx`) that track offsets
+ * into the raw source rather than tree-sitter node positions.
+ */
+export function computeLineStarts(source: string): number[] {
+  const lineStarts = [0];
+  for (let i = 0; i < source.length; i++) {
+    if (source.charCodeAt(i) === 10) lineStarts.push(i + 1);
+  }
+  return lineStarts;
+}
+
+/**
+ * Binary search `lineStarts` (from {@link computeLineStarts}) for the 1-based line
+ * number containing `offset`.
+ */
+export function getLineNumber(lineStarts: number[], offset: number): number {
+  let lo = 0;
+  let hi = lineStarts.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >>> 1;
+    if (lineStarts[mid]! <= offset) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo + 1;
+}
+
+/**
  * Node types that *wrap* a declaration so a leading comment is a sibling of the
  * wrapper, not of the emitted (inner) declaration node. CodeGraph emits the
  * inner node, so before looking for its preceding comment we climb out through

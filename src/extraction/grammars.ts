@@ -50,6 +50,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   terraform: 'tree-sitter-terraform.wasm',
   arkts: 'tree-sitter-arkts.wasm',
   nix: 'tree-sitter-nix.wasm',
+  sql: 'tree-sitter-sql.wasm',
 };
 
 /**
@@ -170,6 +171,10 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.tf': 'terraform',
   '.tfvars': 'terraform',
   '.tofu': 'terraform',
+  '.sql': 'sql',
+  // Dataform models. Not parseable SQL until the config/js/operations blocks
+  // and ${…} spans are blanked, which SqlxExtractor does before delegating.
+  '.sqlx': 'sql',
 };
 
 /**
@@ -338,6 +343,9 @@ const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   // kernel compiles the same-commit vendored C (codegraph-kernel/grammars/
   // dart); crates.io tree-sitter-dart is a different-lineage fork (rejected).
   'dart',
+  // SQL: tree-sitter-wasms does not ship SQL at all; we vendor the prebuilt
+  // tree-sitter-sql.wasm from DerekStride/tree-sitter-sql (MIT), ABI 15.
+  'sql',
 ]);
 
 /** Absolute path of a language's grammar WASM (vendored or tree-sitter-wasms). */
@@ -707,6 +715,7 @@ export function getLanguageDisplayName(language: Language): string {
     erlang: 'Erlang',
     terraform: 'Terraform',
     arkts: 'ArkTS',
+    sql: 'SQL',
     unknown: 'Unknown',
   };
   return names[language] || language;
