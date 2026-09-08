@@ -16,6 +16,7 @@ import type CodeGraph from '../index';
 import { resolveServerRoot } from '../directory';
 import { watchDisabledReason } from '../sync';
 import { ToolHandler } from './tools';
+import { releaseWriterLock, tryAcquireWriterLock, writerLockHeldMessage } from './writer-lock';
 import { QueryPool, resolvePoolSize } from './query-pool';
 
 // Lazy-load the heavy CodeGraph chain (sqlite + query/graph/context layers) OFF
@@ -67,6 +68,8 @@ export class MCPEngine {
   // bounded but shouldn't run on every tool call in the no-default state.
   private lastRetrySubScanAt = 0;
   private watcherStarted = false;
+  /** Set when this engine holds writer.pid (#1740). */
+  private writerLockRoot: string | null = null;
   private opts: Required<MCPEngineOptions>;
   private closed = false;
   // Off-loop read-tool pool (daemon mode only). Created lazily once the default
@@ -203,6 +206,10 @@ export class MCPEngine {
   stop(): void {
     if (this.closed) return;
     this.closed = true;
+    if (this.writerLockRoot) {
+      releaseWriterLock(this.writerLockRoot);
+      this.writerLockRoot = null;
+    }
     // Detach + terminate the worker pool first so no tool call routes to a
     // worker mid-teardown; outstanding pool calls resolve with graceful guidance.
     this.toolHandler.setQueryPool(null);
@@ -277,6 +284,24 @@ export class MCPEngine {
    */
   private startWatching(): void {
     if (!this.cg || this.watcherStarted || !this.opts.watch) return;
+
+    // #1740: only one live watcher/writer per project. Daemon and startDirect
+    // usually already hold writer.pid (re-entrant for this pid). Proxy
+    // in-process fallback acquires here; if another writer holds it, skip the
+    // watcher so we never contend on codegraph.lock until auto-sync degrades.
+    const lockRoot = this.projectPath;
+    if (lockRoot) {
+      const writer = tryAcquireWriterLock(lockRoot, 'fallback');
+      if (writer.kind === 'taken') {
+        const msg = writerLockHeldMessage(writer.existing, writer.pidPath);
+        process.stderr.write(
+          `[CodeGraph MCP] File watcher not started — ${msg}\n`
+        );
+        this.watcherStarted = true;
+        return;
+      }
+      this.writerLockRoot = lockRoot;
+    }
 
     const disabledReason = watchDisabledReason(this.projectPath ?? process.cwd());
     if (disabledReason) {

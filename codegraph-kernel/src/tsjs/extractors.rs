@@ -23,7 +23,7 @@ impl<'t> Walker<'t> {
         // variable_declarator (`export const useAuth = () => {}`).
         if name_override.is_none()
             && name == "<anonymous>"
-            && matches!(node.kind(), "arrow_function" | "function_expression")
+            && matches!(node.kind(), "arrow_function" | "function_expression" | "generator_function")
         {
             if let Some(parent) = node.parent() {
                 if parent.kind() == "variable_declarator" {
@@ -342,9 +342,9 @@ impl<'t> Walker<'t> {
             }
             let name = self.text(name_node).to_string();
 
-            // Arrow/function values extract as functions, named by the declarator.
+            // Arrow/function/generator values extract as functions, named by the declarator.
             if let Some(v) = value {
-                if matches!(v.kind(), "arrow_function" | "function_expression") {
+                if matches!(v.kind(), "arrow_function" | "function_expression" | "generator_function") {
                     self.extract_function(v, None);
                     continue;
                 }
@@ -1103,9 +1103,14 @@ impl<'t> Walker<'t> {
                         } else {
                             callee_name = method_name.to_string();
                         }
+                    } else if let Some(r) = receiver.filter(|r| r.kind() == "call_expression") {
+                        // Call receiver — `make().run()` (#1683): keep the inner
+                        // callee as `<inner>().<method>`, or emit nothing when it
+                        // is not a plain name / member chain. Mirrors
+                        // TreeSitterExtractor.extractCall.
+                        let Some(inner) = self.plain_inner_callee(r) else { return };
+                        callee_name = format!("{inner}().{method_name}");
                     } else {
-                        // (the call-receiver re-encode branches are other
-                        // languages'; TS/JS keeps the bare method name)
                         callee_name = method_name.to_string();
                     }
                 }
@@ -1127,6 +1132,22 @@ impl<'t> Walker<'t> {
     }
 
     // --- extractInstantiation -----------------------------------------------------------
+
+    /// The callee of a call-expression receiver when it is a plain identifier
+    /// or member chain (`make`, `d.setdefault`), whitespace stripped (#1683).
+    fn plain_inner_callee(&self, call: Node<'t>) -> Option<String> {
+        let inner = call.child_by_field_name("function")?;
+        let text: String = self.text(inner).chars().filter(|c| !c.is_whitespace()).collect();
+        if text.is_empty() {
+            return None;
+        }
+        let ok = text.split('.').all(|seg| {
+            let mut chars = seg.chars();
+            matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        });
+        if ok { Some(text) } else { None }
+    }
 
     pub(super) fn extract_instantiation(&mut self, node: Node<'t>) {
         if self.stack.is_empty() {

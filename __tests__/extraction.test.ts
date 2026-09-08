@@ -745,6 +745,63 @@ export const fetchData = async () => {
   });
 });
 
+describe('Generator Function Extraction (#1741)', () => {
+  const functionNames = (file: string, code: string) =>
+    extractFromSource(file, code)
+      .nodes.filter((n) => n.kind === 'function')
+      .map((n) => n.name)
+      .sort();
+
+  it('extracts function* and async function* declarations in TypeScript', () => {
+    process.env.CODEGRAPH_KERNEL = '0';
+    const code = `
+function plain() { return 1; }
+function* gen() { yield 2; }
+async function asyncFn() { return 3; }
+async function* asyncGen() { yield 4; }
+`;
+    expect(functionNames('gens.ts', code)).toEqual(['asyncFn', 'asyncGen', 'gen', 'plain']);
+  });
+
+  it('extracts function* and async function* declarations in JavaScript', () => {
+    process.env.CODEGRAPH_KERNEL = '0';
+    const code = `
+function plain() { return 1; }
+function* gen() { yield 2; }
+async function asyncFn() { return 3; }
+async function* asyncGen() { yield 4; }
+`;
+    expect(functionNames('gens.js', code)).toEqual(['asyncFn', 'asyncGen', 'gen', 'plain']);
+  });
+
+  it('extracts const-assigned generator and async generator expressions (TS)', () => {
+    process.env.CODEGRAPH_KERNEL = '0';
+    const code = `
+const g = function* () { yield 1; };
+const ag = async function* () { yield 2; };
+export const exportedGen = function* () { yield 3; };
+`;
+    const result = extractFromSource('gen-expr.ts', code);
+    const names = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name).sort();
+    expect(names).toEqual(['ag', 'exportedGen', 'g']);
+    expect(result.nodes.find((n) => n.name === 'exportedGen')?.isExported).toBe(true);
+    expect(result.nodes.find((n) => n.name === 'g')?.isExported).toBeFalsy();
+  });
+
+  it('extracts const-assigned generator and async generator expressions (JS)', () => {
+    process.env.CODEGRAPH_KERNEL = '0';
+    const code = `
+const g = function* () { yield 1; };
+const ag = async function* () { yield 2; };
+export const exportedGen = function* () { yield 3; };
+`;
+    const result = extractFromSource('gen-expr.js', code);
+    const names = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name).sort();
+    expect(names).toEqual(['ag', 'exportedGen', 'g']);
+    expect(result.nodes.find((n) => n.name === 'exportedGen')?.isExported).toBe(true);
+  });
+});
+
 describe('Type Alias Extraction', () => {
   it('should extract exported type aliases in TypeScript', () => {
     const code = `
@@ -5811,6 +5868,74 @@ end
   });
 });
 
+describe('C++ pure-virtual method nodes (#1727)', () => {
+  // Pure-virtual methods are field_declarations (`virtual int read(int key) = 0;`),
+  // not function_definitions — they previously minted no method node, so calls
+  // through an abstract base and cpp-override synthesis had nothing to attach to.
+  // Java interface methods already get nodes; C++ should behave similarly.
+  it('indexes Store::read from the issue fixture and records the call', () => {
+    const code = `
+class Store {
+public:
+    virtual ~Store() {}
+    virtual int read(int key) = 0;
+};
+
+class DiskStore : public Store {
+public:
+    int read(int key) override { return key + 1; }
+};
+
+class MemStore : public Store {
+public:
+    int read(int key) override { return key + 2; }
+};
+
+int fetch(Store* s, int k) {
+    return s->read(k);
+}
+`;
+    const result = extractFromSource('store.cc', code);
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.qualifiedName);
+    expect(methods).toContain('Store::read');
+    expect(methods).toContain('DiskStore::read');
+    expect(methods).toContain('MemStore::read');
+
+    const baseRead = result.nodes.find((n) => n.qualifiedName === 'Store::read');
+    expect(baseRead?.isAbstract).toBe(true);
+
+    // Call site unresolved ref targets the method name (resolver types the receiver).
+    expect(
+      result.unresolvedReferences.some(
+        (r) => r.referenceKind === 'calls' && (r.referenceName === 'read' || r.referenceName.endsWith('.read') || r.referenceName.endsWith('->read') || r.referenceName === 's.read')
+      )
+    ).toBe(true);
+  });
+
+  it('indexes pure virtuals with pointer/reference return types and operators', () => {
+    const code = `
+class Cloneable {
+public:
+    virtual Cloneable* clone() = 0;
+    virtual const Foo& get() = 0;
+    virtual Cloneable& operator=(const Cloneable&) = 0;
+    int notPure(int x);
+    int data = 0;
+};
+`;
+    const result = extractFromSource('clone.hpp', code);
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+    expect(methods).toContain('clone');
+    expect(methods).toContain('get');
+    expect(methods).toContain('operator=');
+    // Non-pure prototype and data member must NOT become methods here.
+    expect(methods).not.toContain('notPure');
+    expect(methods).not.toContain('data');
+    expect(result.nodes.find((n) => n.name === 'clone')?.isAbstract).toBe(true);
+  });
+
+});
+
 describe('C++ free-function name extraction', () => {
   let tempDir: string;
   let cg: CodeGraph;
@@ -7293,6 +7418,105 @@ describe('Directory Exclusion', () => {
   });
 });
 
+
+describe('Nested .gitignore node_modules exclusion (#1567)', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    cleanupTempDir(tempDir);
+  });
+
+  function plantNodeModules(subproject: string, packages = 80): void {
+    const base = path.join(tempDir, subproject, 'node_modules');
+    for (let i = 0; i < packages; i++) {
+      const pkg = path.join(base, `pkg${i}`);
+      fs.mkdirSync(pkg, { recursive: true });
+      fs.writeFileSync(path.join(pkg, 'index.js'), `module.exports = ${i};`);
+      fs.writeFileSync(path.join(pkg, 'index.d.ts'), 'export const n: number;');
+      if (i % 4 === 0) fs.writeFileSync(path.join(pkg, '.gitignore'), '*.map\n');
+      const nested = path.join(pkg, 'node_modules', `nested${i}`);
+      fs.mkdirSync(nested, { recursive: true });
+      fs.writeFileSync(path.join(nested, 'lib.ts'), 'export const x = 1;');
+    }
+  }
+
+  function initGitRepo(): void {
+    const { execFileSync } = require('child_process') as typeof import('child_process');
+    execFileSync('git', ['init'], { cwd: tempDir, stdio: 'ignore' });
+    execFileSync('git', ['add', '-A'], { cwd: tempDir, stdio: 'ignore' });
+    execFileSync(
+      'git',
+      ['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '-m', 'init'],
+      { cwd: tempDir, stdio: 'ignore' },
+    );
+  }
+
+  it('excludes node_modules ignored only by a nested .gitignore (git path)', () => {
+    fs.mkdirSync(path.join(tempDir, 'frontend', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'extension', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'frontend', 'src', 'app.ts'), 'export const a = 1;');
+    fs.writeFileSync(path.join(tempDir, 'extension', 'src', 'ext.ts'), 'export const b = 1;');
+    fs.writeFileSync(path.join(tempDir, 'root.ts'), 'export const r = 1;');
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), '*.log\n');
+    fs.writeFileSync(path.join(tempDir, 'frontend', '.gitignore'), '/node_modules\n');
+    fs.writeFileSync(path.join(tempDir, 'extension', '.gitignore'), 'node_modules/\n');
+    plantNodeModules('frontend');
+    plantNodeModules('extension');
+    initGitRepo();
+
+    const files = scanDirectory(tempDir);
+    expect(files.sort()).toEqual(['extension/src/ext.ts', 'frontend/src/app.ts', 'root.ts']);
+    expect(files.every((f) => !f.includes('node_modules'))).toBe(true);
+  });
+
+  it('excludes nested-gitignore node_modules on the filesystem-walk fallback too', () => {
+    fs.mkdirSync(path.join(tempDir, 'frontend', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'extension', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'frontend', 'src', 'app.ts'), 'export const a = 1;');
+    fs.writeFileSync(path.join(tempDir, 'extension', 'src', 'ext.ts'), 'export const b = 1;');
+    fs.writeFileSync(path.join(tempDir, 'root.ts'), 'export const r = 1;');
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), '*.log\n');
+    fs.writeFileSync(path.join(tempDir, 'frontend', '.gitignore'), '/node_modules\n');
+    fs.writeFileSync(path.join(tempDir, 'extension', '.gitignore'), 'node_modules/\n');
+    plantNodeModules('frontend', 60);
+    plantNodeModules('extension', 60);
+
+    const files = scanDirectory(tempDir);
+    expect(files.sort()).toEqual(['extension/src/ext.ts', 'frontend/src/app.ts', 'root.ts']);
+    expect(files.every((f) => !f.includes('node_modules'))).toBe(true);
+  });
+
+  it('still excludes when root only lists one subproject node_modules (Boba-like)', () => {
+    fs.mkdirSync(path.join(tempDir, 'frontend', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'extension', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'frontend', 'src', 'app.ts'), 'export const a = 1;');
+    fs.writeFileSync(path.join(tempDir, 'extension', 'src', 'ext.ts'), 'export const b = 1;');
+    fs.writeFileSync(path.join(tempDir, 'root.ts'), 'export const r = 1;');
+    fs.writeFileSync(
+      path.join(tempDir, '.gitignore'),
+      ['*.log', 'frontend/node_modules/', 'frontend/.angular/', ''].join('\n'),
+    );
+    fs.writeFileSync(path.join(tempDir, 'frontend', '.gitignore'), '/node_modules\n');
+    fs.writeFileSync(path.join(tempDir, 'extension', '.gitignore'), 'node_modules/\n');
+    plantNodeModules('frontend', 40);
+    plantNodeModules('extension', 40);
+
+    const fsFiles = scanDirectory(tempDir);
+    expect(fsFiles.every((f) => !f.includes('node_modules'))).toBe(true);
+    expect(fsFiles.sort()).toEqual(['extension/src/ext.ts', 'frontend/src/app.ts', 'root.ts']);
+
+    initGitRepo();
+    const gitFiles = scanDirectory(tempDir);
+    expect(gitFiles.every((f) => !f.includes('node_modules'))).toBe(true);
+    expect(gitFiles.sort()).toEqual(['extension/src/ext.ts', 'frontend/src/app.ts', 'root.ts']);
+  });
+});
+
+
 describe('Git Submodules', () => {
   let tempDir: string;
 
@@ -7636,6 +7860,82 @@ describe('Nested non-submodule git repos', () => {
     expect(() => ig.ignores('src/app.ts')).not.toThrow();
     expect(ig.ignores('dist/')).toBe(true); // valid rule survives
     expect(ig.ignores('src/app.ts')).toBe(false);
+  });
+
+  it('buildDefaultIgnore honors .git/info/exclude (#1728)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'exclude-root');
+    fs.mkdirSync(root, { recursive: true });
+    git(root, 'init', '-q');
+    fs.writeFileSync(path.join(root, 'src.ts'), 'export const x = 1;\n');
+    fs.mkdirSync(path.join(root, '.claude', 'worktrees', 'agent-1'), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, '.claude', 'worktrees', 'agent-1', 'src.ts'),
+      'export const w = 1;\n',
+    );
+    // Not in .gitignore — only in info/exclude (the reporter's exact shape).
+    fs.writeFileSync(
+      path.join(root, '.git', 'info', 'exclude'),
+      '**/.claude/worktrees/\n',
+    );
+
+    const ig = buildDefaultIgnore(root);
+    expect(ig.ignores('src.ts')).toBe(false);
+    expect(ig.ignores('.claude/worktrees/agent-1/src.ts')).toBe(true);
+    expect(ig.ignores('.claude/worktrees/')).toBe(true);
+
+    // ScopeIgnore (watcher path) agrees, including via git ignored-dir seeding.
+    const scope = buildScopeIgnore(root);
+    expect(scope.ignores('src.ts')).toBe(false);
+    expect(scope.ignores('.claude/worktrees/agent-1/')).toBe(true);
+    expect(scope.ignores('.claude/worktrees/agent-1/src.ts')).toBe(true);
+  });
+
+  it('buildDefaultIgnore honors core.excludesFile (#1728)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'excludesfile-root');
+    fs.mkdirSync(root, { recursive: true });
+    git(root, 'init', '-q');
+    const globalExcludes = path.join(tempDir, 'global-excludes');
+    fs.writeFileSync(globalExcludes, 'scratch/\n');
+    git(root, 'config', 'core.excludesFile', globalExcludes);
+    fs.mkdirSync(path.join(root, 'scratch'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'scratch', 'tmp.ts'), 'export const t = 1;\n');
+    fs.writeFileSync(path.join(root, 'app.ts'), 'export const a = 1;\n');
+
+    const ig = buildDefaultIgnore(root);
+    expect(ig.ignores('app.ts')).toBe(false);
+    expect(ig.ignores('scratch/')).toBe(true);
+    expect(ig.ignores('scratch/tmp.ts')).toBe(true);
+  });
+
+  it('buildScopeIgnore prunes dirs ignored only by a nested .gitignore (#1728)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'nested-gi-root');
+    fs.mkdirSync(path.join(root, 'pkg', 'build'), { recursive: true });
+    git(root, 'init', '-q');
+    git(root, 'config', 'user.email', 'test@test.com');
+    git(root, 'config', 'user.name', 'Test');
+    fs.writeFileSync(path.join(root, 'pkg', 'app.ts'), 'export const a = 1;\n');
+    fs.writeFileSync(path.join(root, 'pkg', 'build', 'out.ts'), 'export const o = 1;\n');
+    fs.writeFileSync(path.join(root, 'pkg', '.gitignore'), 'build/\n');
+    // Commit only the non-ignored file so git still reports build/ as ignored-other.
+    git(root, 'add', 'pkg/app.ts', 'pkg/.gitignore');
+    git(root, 'commit', '-q', '-m', 'init');
+
+    const scope = buildScopeIgnore(root);
+    expect(scope.ignores('pkg/app.ts')).toBe(false);
+    expect(scope.ignores('pkg/build/')).toBe(true);
+    expect(scope.ignores('pkg/build/out.ts')).toBe(true);
   });
 });
 
@@ -11669,6 +11969,102 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     // Underscore-free solid words are too risky and stay.
     const bare = ['NDEBUG', 'int z;', ''].join('\n');
     expect(blankLoneMacroLines(bare)).toBe(bare);
+  });
+
+  it('blankCDesignatedMacroArgs empties a designated-initializer macro call, offsets kept (#1729)', async () => {
+    const { blankCDesignatedMacroArgs } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'void resetProfile(profile_t *p)',
+      '{',
+      '    RESET_CONFIG(profile_t, p,',
+      '        .pid = { [PID_ROLL] = PID_ROLL_DEFAULT, [PID_YAW] = { 50, 75 } },',
+      '        .limit = 500, // trailing comma follows',
+      '    );',
+      '    log(.5);',
+      '    OTHER_MACRO(a == b, c);',
+      '}',
+    ].join('\n');
+    const out = blankCDesignatedMacroArgs(src);
+    expect(out.length).toBe(src.length);
+    expect(out.split('\n').length).toBe(src.split('\n').length);
+    expect(out).toContain('RESET_CONFIG(');
+    expect(out).not.toContain('.pid');
+    expect(out).not.toContain('PID_ROLL');
+    // The closing `);` keeps its column; the argument lines are spaces.
+    expect(out.split('\n')[5]).toBe('    );');
+    expect(out.split('\n')[3]).toBe(' '.repeat(src.split('\n')[3].length));
+    // A numeric literal and a comparison are not designators.
+    expect(out).toContain('log(.5);');
+    expect(out).toContain('OTHER_MACRO(a == b, c);');
+  });
+
+  it('a designated-initializer macro call no longer swallows the functions after it (#1729)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1729-'));
+    try {
+      // Issue fixture: designated-initializer args + trailing comma. Without
+      // blankCDesignatedMacroArgs, tree-sitter-c error recovery extends
+      // `function_definition` to EOF — `g` vanishes and `h` nests as `f::h`.
+      fs.writeFileSync(
+        path.join(dir, 'pid.c'),
+        [
+          'void f(void)',
+          '{',
+          '    M(a, b,',
+          '        .x = 1,',
+          '        .y = { 1, 2 },',
+          '    );',
+          '}',
+          '',
+          'void g(void)',
+          '{',
+          '}',
+          '',
+          'int h(void)',
+          '{',
+          '    return 1;',
+          '}',
+          '',
+        ].join('\n')
+      );
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const fns = cg.getNodesByKind('function').filter((n) => n.filePath === 'pid.c');
+        const byName = Object.fromEntries(fns.map((n) => [n.name, n]));
+        expect(Object.keys(byName).sort()).toEqual(['f', 'g', 'h']);
+        expect(byName.f!.endLine).toBe(7);
+        expect(byName.g!.qualifiedName).toBe('g');
+        expect(byName.h!.qualifiedName).toBe('h');
+      } finally {
+        cg.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a large designated-initializer macro call keeps later functions top-level (#1729)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1729-large-'));
+    try {
+      // Scale guard for betaflight-sized RESET_CONFIG argument lists.
+      const fields = Array.from({ length: 120 }, (_, i) => `        .field${i} = ${i},`).join('\n');
+      fs.writeFileSync(
+        path.join(dir, 'pid.c'),
+        `void resetProfile(profile_t *p)\n{\n    RESET_CONFIG(profile_t, p,\n${fields}\n    );\n}\n\nvoid g(void)\n{\n}\n\nint h(void)\n{\n    return 1;\n}\n`
+      );
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const fns = cg.getNodesByKind('function').filter((n) => n.filePath === 'pid.c');
+        const byName = Object.fromEntries(fns.map((n) => [n.name, n]));
+        expect(Object.keys(byName).sort()).toEqual(['g', 'h', 'resetProfile']);
+        expect(byName.resetProfile!.endLine).toBe(125);
+        expect(byName.g!.qualifiedName).toBe('g');
+        expect(byName.h!.qualifiedName).toBe('h');
+      } finally {
+        cg.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('blankCStatementMacroCalls blanks indented iterator macros, keeps the block', async () => {
