@@ -38,6 +38,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
+import { rmTempDir } from './rm-temp';
 import { getDaemonSocketPath } from '../src/mcp/daemon-paths';
 import { CodeGraphPackageVersion } from '../src/mcp/version';
 
@@ -162,6 +163,61 @@ function countListeningLines(root: string): number {
   return readDaemonLog(root).split('\n').filter((l) => l.includes('[CodeGraph daemon] Listening on')).length;
 }
 
+/**
+ * Every daemon that reached "Listening", by pid, from the log it writes itself.
+ *
+ * The lockfile names one daemon; the log names all of them. Under the
+ * concurrent-launcher race a second candidate can bind before the first
+ * candidate's lock is visible to it, and only one of the two ends up in the
+ * lockfile — so reaping by lockfile alone leaves a live daemon holding the
+ * database until its idle timeout, long past any teardown.
+ */
+function listeningPids(root: string): number[] {
+  const pids = new Set<number>();
+  for (const m of readDaemonLog(root).matchAll(/Listening on .*?\(pid (\d+)/g)) {
+    pids.add(Number(m[1]));
+  }
+  return [...pids];
+}
+
+/**
+ * Kill every daemon this root ever started, including one that has not started
+ * yet when the reap begins.
+ *
+ * Daemons are detached: there is no handle to close and no exit to await, so
+ * they have to be found by pid and killed. A single pass is not enough. A
+ * candidate that is mid-spawn when teardown runs binds a moment later and only
+ * then writes its "Listening" line, so a one-shot read of the lockfile and log
+ * cannot see it — and a daemon missed here holds the database open for its full
+ * idle timeout, which is far longer than any removal is willing to retry.
+ *
+ * So this keeps looking until the root has been quiet for several consecutive
+ * passes with nothing alive, which covers the spawn window rather than assuming
+ * it has closed. Guards our own pid: the version-mismatch test plants
+ * `pid: process.pid` in the lockfile, and we must never SIGKILL the worker.
+ *
+ * Returns whether the root actually went quiet. The two exits mean opposite
+ * things — quiet reached is a clean reap, `maxPasses` burned is a daemon that
+ * kept respawning or refused SIGKILL — and a caller that cannot tell them apart
+ * reads the second as the first, so the reap can report success on the exact
+ * run where it did nothing.
+ */
+async function reapDaemons(root: string, quietPasses = 6, maxPasses = 200): Promise<boolean> {
+  let quiet = 0;
+  for (let pass = 0; pass < maxPasses && quiet < quietPasses; pass++) {
+    const lockPid = readLockPid(root);
+    const pids = [...new Set([...(lockPid ? [lockPid] : []), ...listeningPids(root)])]
+      .filter((pid) => pid !== process.pid);
+    const alive = pids.filter(isAlive);
+    for (const pid of alive) {
+      try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+    }
+    quiet = alive.length === 0 ? quiet + 1 : 0;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  return quiet >= quietPasses;
+}
+
 function killTree(...procs: ChildProcessWithoutNullStreams[]): void {
   for (const p of procs) {
     if (!p.killed) { try { p.kill('SIGKILL'); } catch { /* gone */ } }
@@ -185,18 +241,22 @@ describe('Shared MCP daemon (issue #411)', () => {
   });
 
   afterEach(async () => {
+    // Registered before the kill, so no exit can land between the two.
+    const exits = servers.map((s) =>
+      s.child.exitCode === null && s.child.signalCode === null
+        ? new Promise<void>((resolve) => s.child.once('exit', () => resolve()))
+        : Promise.resolve()
+    );
     killTree(...servers.map((s) => s.child));
-    // The daemon is detached (not a tracked child) — reap it explicitly via the
-    // pid it recorded, so a test can't leak a background daemon. Guard against
-    // our own pid: the version-mismatch test plants `pid: process.pid` in the
-    // lockfile, and we must never SIGKILL the vitest worker.
-    const daemonPid = readLockPid(realRoot);
-    if (daemonPid && daemonPid !== process.pid && isAlive(daemonPid)) {
-      try { process.kill(daemonPid, 'SIGKILL'); } catch { /* race */ }
-    }
-    await new Promise((r) => setTimeout(r, 50));
+    await Promise.all(exits);
+    const reaped = await reapDaemons(realRoot);
     servers.length = 0;
-    fs.rmSync(tempDir, { recursive: true, force: true });
+    await rmTempDir(tempDir);
+    // Asserted after the removal so a failed reap still cleans up what it can,
+    // and surfaces as itself rather than as the EPERM it would cause next.
+    if (!reaped) {
+      throw new Error(`reapDaemons exhausted its pass budget on ${realRoot} — a daemon is still alive`);
+    }
   });
 
   it('two invocations share ONE detached daemon; both attach as proxies', async () => {

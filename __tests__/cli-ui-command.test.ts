@@ -12,7 +12,7 @@
  * observable fact rather than a promise.
  */
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { execFileSync, spawn, type ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as http from 'http';
@@ -221,11 +221,23 @@ describe('codegraph ui — serving', () => {
 
   const markerFile = (): string => path.join(markerDir, 'opened.txt');
 
-  /** The opener is async (detached); give it a moment before concluding. */
+  /**
+   * The opener is async (detached); give it a moment before concluding.
+   *
+   * Waits for CONTENT, not merely for the file to appear. Shell redirection
+   * creates the target before the command writes into it — `cmd.exe` opens the
+   * `>` target as it parses the line, ahead of `echo` — so an existence check
+   * can return a file that is real but still empty. Callers that expect no
+   * launch still get null: a file that never gains content times out the same
+   * as one that never appears.
+   */
   async function waitForMarker(timeoutMs: number): Promise<string | null> {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
-      if (fs.existsSync(markerFile())) return fs.readFileSync(markerFile(), 'utf-8');
+      if (fs.existsSync(markerFile())) {
+        const body = fs.readFileSync(markerFile(), 'utf-8');
+        if (body.trim() !== '') return body;
+      }
       if (Date.now() > deadline) return null;
       await new Promise((r) => setTimeout(r, 50));
     }
@@ -278,11 +290,11 @@ describe('codegraph ui — serving', () => {
   }, 60_000);
 
   it('CODEGRAPH_BROWSER=none suppresses the launch like --no-open', async () => {
-    fs.rmSync(markerFile(), { force: true });
     const viewer = await startViewer(['--port', '0', projectDir], { CODEGRAPH_BROWSER: 'none' });
     try {
       expect((await get(viewer.port, '/')).status).toBe(200);
-      expect(await waitForMarker(1_000)).toBeNull();
+      await vi.waitFor(() => expect(viewer.output()).toContain('Open that URL in a browser'));
+      expect(viewer.output()).not.toContain('Opening your browser');
     } finally {
       await stopViewer(viewer.child);
     }
