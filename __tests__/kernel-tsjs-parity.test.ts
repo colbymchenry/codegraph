@@ -76,7 +76,7 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
     resetKernelForTests();
   });
 
-  function assertParity(filePath: string, source: string, language: Language): void {
+  function assertParity(filePath: string, source: string, language: Language): ExtractionResult {
     process.env.CODEGRAPH_KERNEL_LANGS = 'all';
     delete process.env.CODEGRAPH_KERNEL;
     const viaKernel = tryKernelExtract(filePath, source, language);
@@ -93,7 +93,31 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
     expect(k.refs, `${filePath}: refs`).toEqual(w.refs);
     // Meaningful comparison, not empty-vs-empty.
     expect(viaWasm.nodes.length).toBeGreaterThan(3);
+    return viaWasm;
   }
+
+  it.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('leaves nested identifier receivers unresolved and keeps argument calls: %s (#1566)', (ext, language) => {
+    const result = assertParity(`fixture.${ext}`, `
+function readKey() { return 'answer'; }
+function local() {
+  const values = new Map();
+  return values.get(readKey());
+}
+function nested(holder) {
+  holder.values.get(readKey());
+  holder.values?.get(readKey());
+  holder['values'].get(readKey());
+  holder.deep.values.get(readKey());
+}
+`, language);
+    const nested = result.nodes.find((n) => n.name === 'nested' && n.kind === 'function');
+    expect(nested).toBeDefined();
+    expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'calls' && r.fromNodeId === nested!.id)
+      .map((r) => r.referenceName)).toEqual(['readKey', 'readKey', 'readKey', 'readKey']);
+    expect(result.unresolvedReferences.some((r) => r.referenceName === 'values.get')).toBe(true);
+  });
 
   it('torture fixture (tsx): components, stores, RTK, fn-refs, value-refs, decorators', () => {
     const file = path.join(FIXTURE_DIR, 'torture.tsx');
