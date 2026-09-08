@@ -137,6 +137,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- Indexing now warns when parser errors leave a file with no symbols, including C++ raw strings with 16-character delimiters, so missing code is no longer silent. (#1522)
+
+- `codegraph index <path>` now refuses uninitialized paths and names the nearest initialized parent instead of silently rebuilding it; thanks @danusha2345. (#1524, #1689)
+
 - Sync now recovers the same connections as a clean index after interrupted reference resolution, including inherited calls and callbacks that previously stayed missing. (#1577)
 
 - `codegraph_explore` now re-serves source to fresh subagents and after context compaction, with cross-call dedup available only through an explicit `CODEGRAPH_EXPLORE_DEDUP=1` opt-in; thanks @danusha2345. (#1620, #1624)
@@ -230,6 +234,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Kotlin `init { }` blocks and destructuring declarations no longer swallow their code: `init { val cfg = load() }` and `val (a, b) = makePair()` contributed no call edge at all, and now attribute to the enclosing class or file.
 - A Kotlin property's accessor body now belongs to the property whichever line it is written on, instead of being dropped (same line) or handed to the enclosing class (own line).
 - Kotlin properties that hold a lambda, a SAM callback or an anonymous object — `private val frameListener = CameraFrameListener { … }`, the way Android and MSDK callbacks are almost always declared — now contribute call edges. Previously everything inside such an initializer was dropped, so a function reached only through one of these callbacks looked like it had no callers at all and its blast radius came back far too small. Delegated properties (`by lazy { … }`) and plain initializers (`val x = compute()`) were affected the same way and are fixed too. Re-index with `codegraph index -f` after upgrading to pick up the new edges.
+- Rust unit structs (`struct Unit;`) and their trait implementation relationships now appear in the graph after re-indexing. (#1513, #1514)
 - Imports from Node built-ins or npm packages no longer connect to unrelated type members with matching names; re-index after upgrading to clear existing false dependencies. Thanks @ctype-lab. (#1537)
 
 - Inheritance relationships no longer attach external Rust or npm supertypes to unrelated local symbols with the same name, including in Svelte, Vue and Astro components; re-index after upgrading to clear existing false relationships. Thanks @ctype-lab. (#1536)
