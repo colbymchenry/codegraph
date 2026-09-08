@@ -1074,7 +1074,21 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
     // Git, but still wanted in the graph.)
     for (const f of collectIncludedFilesForRoot(rootDir)) visible.add(f);
     return visible;
-  } catch {
+  } catch (error) {
+    // Any failure here (git missing, a `git rev-parse`/`ls-files` timeout or
+    // buffer overrun under load, an unreadable repo, etc.) silently sent every
+    // caller to the `scanDirectoryWalk` filesystem-walk fallback with zero
+    // signal that the fast, fully git-delegated path was skipped — making a
+    // report like "the index walked into a nested-.gitignore-excluded
+    // directory" nearly untriageable, since there was no way to tell which of
+    // the two independent ignore implementations actually ran. Log it (gated
+    // by the project's existing CODEGRAPH_DEBUG convention, see logDebug) so a
+    // future report at this scale can confirm or rule out the fallback path
+    // in one step instead of re-instrumenting the source to find out.
+    logDebug('git-based file listing unavailable — falling back to filesystem walk', {
+      rootDir,
+      error: error instanceof Error ? error.message : String(error),
+    });
     return null;
   }
 }
