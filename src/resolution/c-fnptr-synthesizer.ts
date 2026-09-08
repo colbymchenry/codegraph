@@ -1209,7 +1209,7 @@ export async function cFnPointerDispatchEdges(
   // ---- receiver-type resolution within a function's source ----
   // `(?:struct )?TYPE [*]recv` declared in the params or body → TYPE (if a known
   //  fn-pointer-bearing struct).
-  const recvReCache = new Map<string, RegExp>();
+  const recvReCache = new LRUCache<string, RegExp>(4096);
   const recvTypeIn = (fnSrc: string, recv: string): string | null => {
     let re = recvReCache.get(recv);
     if (!re) {
@@ -1228,7 +1228,7 @@ export async function cFnPointerDispatchEdges(
   // structs (the base of a chained receiver needn't carry a fn pointer itself).
   // Falls back to a file-scope table variable (`cmdnames` in `cmdnames[i].fn()`).
   const escapeRe = (x: string): string => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const varReCache = new Map<string, RegExp>();
+  const varReCache = new LRUCache<string, RegExp>(4096);
   const varTypeIn = (fnSrc: string, v: string): string | null => {
     let re = varReCache.get(v);
     if (!re) {

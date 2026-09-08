@@ -72,6 +72,16 @@ impl Widget {
         self.n * mul()
     }
 
+    /// Receiver shapes (#1585): only `self.<field>.<method>()` keeps the
+    /// owner-field prefix; deeper / parenthesized / call / bare-self collapse.
+    fn via_field(&self) -> u32 {
+        self.field.deep_call();
+        self.field.z.clone();
+        self.method_a().chain_b();
+        (self.field).deep_call();
+        self.area()
+    }
+
     fn clone_self(&self) -> Self {
         Self::assoc();
         Widget {
@@ -106,6 +116,71 @@ impl<T> Container<T> {
 impl Render for Container<u32> {
     fn render(&self) {}
 }
+
+/// Receiver = the impl_item's `type` field (#1588): generic, lifetime,
+/// reference, scoped, and generic-trait impls all qualify by the TYPE.
+pub trait Source {
+    fn read(&mut self) -> usize;
+}
+
+pub struct FileSource {
+    pub n: usize,
+}
+
+impl Source for FileSource {
+    fn read(&mut self) -> usize {
+        self.n
+    }
+}
+
+pub struct BufSource<T> {
+    pub inner: T,
+}
+
+impl<T> Source for BufSource<T> {
+    fn read(&mut self) -> usize {
+        0
+    }
+}
+
+pub struct Parents<'a> {
+    cur: &'a u32,
+}
+
+impl<'a> Iterator for Parents<'a> {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> {
+        None
+    }
+}
+
+impl<T: Clone> Container<T> {
+    fn dup(&self) -> T {
+        self.item.clone()
+    }
+}
+
+impl Base for &Widget {}
+
+impl<T> Render for &mut BufSource<T> {
+    fn render(&self) {}
+}
+
+impl Base for self::Deep {}
+
+impl From<u32> for FileSource {
+    fn from(n: u32) -> Self {
+        FileSource { n: n as usize }
+    }
+}
+
+impl Base for (u32, u32) {}
+
+impl Render for dyn Base {
+    fn render(&self) {}
+}
+
+impl Base for u32 {}
 
 impl Later {
     fn touch(&self) {}

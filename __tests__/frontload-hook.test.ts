@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { planFrontload, findIndexedSubprojectRoots, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens } from '../src/directory';
+import { planFrontload, findIndexedSubprojectRoots, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens, PROMPT_HOOK_INJECTION_MAX, CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT, capPromptHookInjection } from '../src/directory';
 
 /** Make `dir` look indexed (isInitialized needs `.codegraph/codegraph.db`). */
 function mkIndexed(dir: string): string {
@@ -319,5 +319,30 @@ describe('isStructuralPrompt — cheap candidate gate (keyword OR code-token)', 
     expect(isStructuralPrompt('修复这个拼写错误')).toBe(false);
     expect(isStructuralPrompt('water the flower')).toBe(false);
     expect(isStructuralPrompt('')).toBe(false);
+  });
+});
+
+describe('prompt-hook injection cap (#1694)', () => {
+  it('PROMPT_HOOK_INJECTION_MAX stays under Claude Code\'s 10k inline hook-output limit', () => {
+    expect(PROMPT_HOOK_INJECTION_MAX).toBe(9000);
+    expect(CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT).toBe(10_000);
+    expect(PROMPT_HOOK_INJECTION_MAX).toBeLessThan(CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT);
+    // Leave headroom for the <codegraph_context> wrapper + projectPath nudge lines.
+    expect(CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT - PROMPT_HOOK_INJECTION_MAX).toBeGreaterThanOrEqual(500);
+  });
+
+  it('capPromptHookInjection leaves short payloads intact', () => {
+    expect(capPromptHookInjection('hello')).toBe('hello');
+    expect(capPromptHookInjection('x'.repeat(PROMPT_HOOK_INJECTION_MAX))).toBe('x'.repeat(PROMPT_HOOK_INJECTION_MAX));
+  });
+
+  it('capPromptHookInjection truncates oversize payloads with the explore notice', () => {
+    const over = 'a'.repeat(PROMPT_HOOK_INJECTION_MAX + 500);
+    const out = capPromptHookInjection(over);
+    expect(out.length).toBeLessThan(over.length);
+    expect(out.startsWith('a'.repeat(PROMPT_HOOK_INJECTION_MAX))).toBe(true);
+    expect(out).toContain('…(truncated; call codegraph_explore for the rest)');
+    // Capped body alone must still fit under the host inline limit.
+    expect(out.length).toBeLessThan(CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT);
   });
 });

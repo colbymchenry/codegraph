@@ -127,6 +127,33 @@ export function extractProseCandidates(prompt: string): string[] {
 }
 
 /**
+ * Words to look up in the segment vocabulary for a SEARCH query (as opposed
+ * to a prompt-hook gate): the query's prose candidates PLUS the segments of
+ * its identifier-shaped tokens. An agent's query names concepts both ways —
+ * "auto-scroll to bottom" (prose) and "atBottom tracking" (camel) — and the
+ * camel token must still reach the segment "bottom" even though the whole
+ * token matches no name. Same stopword/length rules as the hook path, since
+ * both feeds run through {@link extractProseCandidates}.
+ */
+export function extractSegmentSearchWords(query: string): string[] {
+  if (!query) return [];
+  const words = new Set(extractProseCandidates(query));
+  const segments: string[] = [];
+  for (const run of query.match(/[\p{L}\p{N}]+/gu) ?? []) {
+    // Only camel-humped tokens contribute segments — a plain word's
+    // "segments" are itself (already covered above), and snake_case arrives
+    // as separate runs because `_` is not a letter.
+    if (/[\p{Ll}\p{N}]\p{Lu}/u.test(run)) {
+      segments.push(...splitIdentifierSegments(run));
+    }
+  }
+  if (segments.length > 0) {
+    for (const w of extractProseCandidates(segments.join(' '))) words.add(w);
+  }
+  return [...words];
+}
+
+/**
  * Lookup variants for a prose word: the word itself plus light plural folding
  * ("services" → service, "dependencies" → dependencie/dependency is NOT
  * attempted — only a trailing s/es strip), so common plurals still hit their

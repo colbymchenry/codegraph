@@ -75,7 +75,10 @@ export const luaExtractor: LanguageExtractor = {
   typeAliasTypes: [],
   importTypes: [], // `require` is a function_call — handled in visitNode below
   callTypes: ['function_call'],
-  variableTypes: ['variable_declaration'], // see the `lua` branch in extractVariable
+  // Top-level assignments can introduce module members just as declarations do:
+  // `M.run = function() ... end`. The Lua branch in extractVariable ignores
+  // non-callable member assignments, but extracts function-valued targets.
+  variableTypes: ['variable_declaration', 'assignment_statement'],
   nameField: 'name',
   bodyField: 'body',
   paramsField: 'parameters',

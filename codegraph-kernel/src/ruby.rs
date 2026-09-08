@@ -383,6 +383,7 @@ impl<'t> Walker<'t> {
     /// the source of the module multiply-capture quirk (scan runs with the
     /// module already POPPED, so candidates re-attribute to the outer scope).
     fn try_visit_hook(&mut self, node: Node<'t>) -> bool {
+        stack_guard!();
         let kind = node.kind();
         if kind == "call" && node.child_by_field_name("receiver").is_none() {
             if let Some(method) = node.child_by_field_name("method") {
@@ -451,6 +452,7 @@ impl<'t> Walker<'t> {
     // --- the dispatcher (visitNode, Ruby-relevant branches) ----------------------
 
     fn visit_node(&mut self, node: Node<'t>) {
+        stack_guard!();
         // Language hook FIRST (tree-sitter.ts:943) — a handled subtree is
         // scanned for fn-ref candidates and never reaches the ladder (or the
         // maybeCaptureFnRefs call below).
@@ -522,10 +524,12 @@ impl<'t> Walker<'t> {
     // --- visitFunctionBody ------------------------------------------------------
 
     fn visit_function_body(&mut self, body: Node<'t>) {
+        stack_guard!();
         self.visit_for_calls_and_structure(body);
     }
 
     fn visit_for_calls_and_structure(&mut self, node: Node<'t>) {
+        stack_guard!();
         let kind = node.kind();
         self.maybe_capture_fn_refs(node);
 
@@ -596,6 +600,7 @@ impl<'t> Walker<'t> {
     // --- extractors --------------------------------------------------------------
 
     fn extract_function(&mut self, node: Node<'t>) {
+        stack_guard!();
         let name = self.extract_name(node);
         if name == "<anonymous>" {
             if let Some(body) = node.child_by_field_name("body") {
@@ -619,6 +624,7 @@ impl<'t> Walker<'t> {
     }
 
     fn extract_method(&mut self, node: Node<'t>) {
+        stack_guard!();
         let name = self.extract_name(node);
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
@@ -634,6 +640,7 @@ impl<'t> Walker<'t> {
     }
 
     fn extract_class(&mut self, node: Node<'t>) {
+        stack_guard!();
         let name = self.extract_name(node);
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
@@ -872,6 +879,7 @@ impl<'t> Walker<'t> {
     /// qualify); `block_argument` is a transparent layer; specials are the
     /// `method(:sym)` call form and hook-DSL `simple_symbol`s.
     fn normalize_fn_ref_value(&mut self, v: Node<'t>, from: u32, depth: u32) {
+        stack_guard!();
         if depth > 4 {
             return;
         }
@@ -938,6 +946,7 @@ impl<'t> Walker<'t> {
     }
 
     fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32) {
+        stack_guard!();
         if depth > 12 {
             return;
         }

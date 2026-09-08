@@ -13,6 +13,26 @@ import { describe, it, expect } from 'vitest';
 import { isTestFile } from '../src/search/query-utils';
 
 describe('isTestFile', () => {
+  it('flags test-support modules and doubles by directory name', () => {
+    expect(isTestFile('core/data-test/src/main/kotlin/com/example/FakeUserDataRepository.kt')).toBe(true);
+    expect(isTestFile('core/datastore-test/src/main/kotlin/com/example/InMemoryDataStore.kt')).toBe(true);
+    expect(isTestFile('core/testing/src/main/kotlin/com/example/TestUserDataRepository.kt')).toBe(true);
+    expect(isTestFile('pkg/testdata/fixture.go')).toBe(true);
+    expect(isTestFile('src/__mocks__/api.ts')).toBe(true);
+    expect(isTestFile('internal/testutil/helpers.go')).toBe(true);
+  });
+
+  it('does NOT flag production code whose package path runs through a samples or examples segment', () => {
+    // Only the project layout above `src/` decides; the package path below it never does.
+    expect(isTestFile('core/data/src/main/kotlin/com/google/samples/apps/nowinandroid/core/data/SyncUtilities.kt')).toBe(false);
+    expect(isTestFile('feature/foryou/impl/src/main/kotlin/com/google/samples/apps/ForYouViewModel.kt')).toBe(false);
+    expect(isTestFile('src/samples/demo.ts')).toBe(false);
+    // …while a real examples folder in the layout still counts.
+    expect(isTestFile('examples/basic/src/index.ts')).toBe(true);
+    expect(isTestFile('packages/x/examples/basic.ts')).toBe(true);
+    expect(isTestFile('benchmarks/run.py')).toBe(true);
+  });
+
   it('flags Kotlin test files and source sets', () => {
     expect(isTestFile('okhttp/src/jvmTest/kotlin/okhttp3/CallTest.kt')).toBe(true);
     expect(isTestFile('okhttp/src/commonTest/kotlin/okhttp3/CompressionInterceptorTest.kt')).toBe(true);

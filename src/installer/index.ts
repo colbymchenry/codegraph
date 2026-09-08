@@ -137,7 +137,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
   } else if (useDefaults) {
     location = 'global';
   } else {
-    // If every selected target is global-only (e.g. Codex), skip the
+    // If every selected target is global-only (e.g. the Copilot CLI), skip the
     // prompt and force user-wide — project-local would just produce
     // skip warnings.
     const allGlobalOnly = targets.every((t) => !t.supportsLocation('local'));
@@ -285,9 +285,10 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
   // index a surprise directory (e.g. a shell sitting in $HOME). Same next step
   // regardless of global/local scope.
   clack.note(
-    location === 'local'
+    (location === 'local'
       ? 'codegraph init        # build this project’s graph (one time; auto-syncs after)'
-      : 'cd <your-project>\ncodegraph init        # build a project’s graph (one time; auto-syncs after)',
+      : 'cd <your-project>\ncodegraph init        # build a project’s graph (one time; auto-syncs after)') +
+      '\n# (codegraph install --init does both steps in one command)',
     'Next: index a project',
   );
 
@@ -328,8 +329,8 @@ export type UninstallStatus = 'removed' | 'not-configured' | 'unsupported';
  * Per-target outcome of an uninstall sweep. `removed` means we deleted
  * at least one thing; `not-configured` means the agent had no codegraph
  * config at this location (nothing to do); `unsupported` means the
- * agent has no config concept for this location (e.g. Codex is
- * global-only, so a `local` uninstall skips it).
+ * agent has no config concept for this location (e.g. the Copilot CLI
+ * is global-only, so a `local` uninstall skips it).
  */
 export interface UninstallReport {
   id: TargetId;

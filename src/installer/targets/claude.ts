@@ -41,6 +41,18 @@ import {
   CODEGRAPH_SECTION_START,
 } from '../instructions-template';
 
+/**
+ * The shared stdio entry plus `alwaysLoad: true`, Claude Code's exemption from
+ * tool-search deferral (https://code.claude.com/docs/en/mcp#exempt-a-server-from-deferral).
+ * `codegraph_explore` carries the same flag in its `_meta`, which covers an
+ * entry written before this key; the entry-level key additionally makes
+ * Claude Code wait for this server's tools at startup, so they are in the
+ * first prompt rather than listed after the server connects in the background.
+ */
+function getClaudeMcpServerConfig() {
+  return { ...getMcpServerConfig(), alwaysLoad: true };
+}
+
 function configDir(loc: Location): string {
   return loc === 'global'
     ? path.join(os.homedir(), '.claude')
@@ -211,7 +223,7 @@ class ClaudeCodeTarget implements AgentTarget {
 
   printConfig(loc: Location): string {
     const target = mcpJsonPath(loc);
-    const snippet = JSON.stringify({ mcpServers: { codegraph: getMcpServerConfig() } }, null, 2);
+    const snippet = JSON.stringify({ mcpServers: { codegraph: getClaudeMcpServerConfig() } }, null, 2);
     return `# Add to ${target}\n\n${snippet}\n`;
   }
 
@@ -231,7 +243,7 @@ export function writeMcpEntry(loc: Location): WriteResult['files'][number] {
   const file = mcpJsonPath(loc);
   const existing = readJsonFile(file);
   const before = existing.mcpServers?.codegraph;
-  const after = getMcpServerConfig();
+  const after = getClaudeMcpServerConfig();
 
   if (jsonDeepEqual(before, after)) {
     // Already exactly what we'd write — preserve byte-identical file.

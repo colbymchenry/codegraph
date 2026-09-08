@@ -148,9 +148,11 @@ them are the ORIGINAL plan and carry expectations that measurement later correct
       tokio node sections IDENTICAL, small precision-positive edge churn only,
       full suite green), walker `codegraph-kernel/src/rustlang.rs` (survey
       artifact: rust-lang-kernel-port-checklist.md — isAsync dead-code,
-      impl-pushes-no-scope, trait-receiver bug on `impl Trait for Generic<T>`,
-      phantom const identifiers, use-binding triple emission, all preserved
-      bug-for-bug). Gates: parity sweeps **0 diffs** on ripgrep (101/101,
+      impl-pushes-no-scope, trait-receiver bug on `impl Trait for Generic<T>`
+      (fixed on both sides together in #1588 — receiver now comes from the
+      impl_item's `type` field), phantom const identifiers, use-binding
+      triple emission, all preserved bug-for-bug). Gates: parity sweeps
+      **0 diffs** on ripgrep (101/101,
       0 deferred) / tokio (790/790, 0 deferred) / rust-analyzer (1217/1488,
       0 diffs; 271 deferrals are token-macro-table sources — `T![~]`, `[$]` —
       that error on BOTH arms, grammar-inherent like fmt's C++ 42%); full-init
@@ -410,6 +412,14 @@ in a different emission order would shift rowids and change resolution — and
    file whose tree `has_error()` to the wasm extractor** (`defer:` signal, silent,
    per-file) — parity by construction on erroring files, 99.6%+ keep the fast path,
    and the harness fails if deferrals exceed 10% (a broken kernel can't hide).
+   The same signal carries a second, rarer case (#1581): the walkers recurse per
+   AST level, and a pathologically nested file (clang's 16,384-brace
+   `parser_overflow.c`, fuzzer corpora) overflowed the native stack — a SIGSEGV
+   that killed the whole indexer, uncatchable from JS. `src/stack.rs` now
+   checks the thread's real stack bounds at every recursive entry
+   (`stack_guard!`) and `run_guarded` turns a tripped walk into `defer:`, so
+   the file lands on the wasm path (which catches its own `RangeError` per
+   file) while the process lives. Pinned by `__tests__/kernel-deep-nesting.test.ts`.
 3. **Retrieval invariants:** kernel-indexed excalidraw — `mutateElement →
    renderStaticScene` connects end-to-end via explore (callback + react-render +
    jsx hops shown); synthesized-edge families present (408 jsx-render / 46

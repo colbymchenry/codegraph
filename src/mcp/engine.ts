@@ -11,10 +11,12 @@
  */
 
 import * as os from 'os';
+import * as path from 'path';
 import type CodeGraph from '../index';
-import { findNearestCodeGraphRoot } from '../directory';
+import { resolveServerRoot } from '../directory';
 import { watchDisabledReason } from '../sync';
 import { ToolHandler } from './tools';
+import { releaseWriterLock, tryAcquireWriterLock, writerLockHeldMessage } from './writer-lock';
 import { QueryPool, resolvePoolSize } from './query-pool';
 
 // Lazy-load the heavy CodeGraph chain (sqlite + query/graph/context layers) OFF
@@ -25,6 +27,9 @@ import { QueryPool, resolvePoolSize } from './query-pool';
 // agents flounder. require() is sync + cached on the CommonJS build.
 const loadCodeGraph = (): typeof import('../index').default =>
   (require('../index') as typeof import('../index')).default;
+
+/** How often the per-tool-call retry may re-run the sub-project down-scan. */
+const RETRY_SUBSCAN_TTL_MS = 5_000;
 
 export interface MCPEngineOptions {
   /**
@@ -59,7 +64,12 @@ export class MCPEngine {
   private projectPath: string | null = null;
   // Set on first `ensureInitialized` so subsequent sessions don't redo work.
   private initPromise: Promise<void> | null = null;
+  // Throttle for the retry path's sub-project down-scan (#1606) — the scan is
+  // bounded but shouldn't run on every tool call in the no-default state.
+  private lastRetrySubScanAt = 0;
   private watcherStarted = false;
+  /** Set when this engine holds writer.pid (#1740). */
+  private writerLockRoot: string | null = null;
   private opts: Required<MCPEngineOptions>;
   private closed = false;
   // Off-loop read-tool pool (daemon mode only). Created lazily once the default
@@ -158,8 +168,20 @@ export class MCPEngine {
     if (this.closed) return;
     if (this.toolHandler.hasDefaultCodeGraph()) return;
     this.toolHandler.setDefaultProjectHint(searchFrom);
-    const resolvedRoot = findNearestCodeGraphRoot(searchFrom);
+    // Same resolution `doInitialize` used: up-walk, then the bounded workspace
+    // down-scan (#1606) — this retry is exactly the path that picks up a
+    // project (root or child) `codegraph init`'d after the server started. The
+    // down-scan is throttled so the persistent no-default state doesn't pay a
+    // directory walk on every tool call; the up-walk always runs.
+    const scanDue = Date.now() - this.lastRetrySubScanAt >= RETRY_SUBSCAN_TTL_MS;
+    const res = resolveServerRoot(searchFrom, { subprojectScan: scanDue });
+    if (scanDue) {
+      this.lastRetrySubScanAt = Date.now();
+      if (!res.root) this.toolHandler.setKnownSubprojects(res.candidates, searchFrom);
+    }
+    const resolvedRoot = res.root;
     if (!resolvedRoot) return;
+    if (res.viaSubScan) this.logSubprojectAdoption(searchFrom, resolvedRoot);
     try {
       // Close any previously failed instance to avoid leaking resources.
       if (this.cg) {
@@ -184,6 +206,10 @@ export class MCPEngine {
   stop(): void {
     if (this.closed) return;
     this.closed = true;
+    if (this.writerLockRoot) {
+      releaseWriterLock(this.writerLockRoot);
+      this.writerLockRoot = null;
+    }
     // Detach + terminate the worker pool first so no tool call routes to a
     // worker mid-teardown; outstanding pool calls resolve with graceful guidance.
     this.toolHandler.setQueryPool(null);
@@ -201,12 +227,32 @@ export class MCPEngine {
   private async doInitialize(searchFrom: string): Promise<void> {
     this.toolHandler.setDefaultProjectHint(searchFrom);
 
-    const resolvedRoot = findNearestCodeGraphRoot(searchFrom);
+    // Up-walk first; when nothing is indexed at or above searchFrom, a bounded
+    // down-scan may adopt a SINGLE indexed sub-project as the default (#1606 —
+    // the workspace-container shape where only children are indexed). Zero or
+    // several candidates → no default project, but SAY so (#1607): the silent
+    // variant of this state read as "CodeGraph is broken" and was diagnosable
+    // only by knowing to look for a missing ~/.codegraph/daemons/ entry.
+    const res = resolveServerRoot(searchFrom);
+    const resolvedRoot = res.root;
     if (!resolvedRoot) {
-      // No .codegraph/ above searchFrom. Sessions may still discover one later via roots/list
+      // Sessions may still discover a project later via roots/list, and the
+      // per-call retry re-resolves — this state is recoverable, hence stderr
+      // (not a failure) + candidates surfaced through the tool-call error.
       this.projectPath = searchFrom;
+      this.toolHandler.setKnownSubprojects(res.candidates, searchFrom);
+      process.stderr.write(
+        `[CodeGraph MCP] No .codegraph/ at or above ${searchFrom}: no default project, live sync disabled.\n`
+      );
+      if (res.candidates.length > 0) {
+        const rels = res.candidates.map((c) => path.relative(searchFrom, c) || '.');
+        process.stderr.write(
+          `[CodeGraph MCP] Indexed sub-projects found: ${rels.join(', ')}. Pass \`projectPath\` per call, or launch with --path.\n`
+        );
+      }
       return;
     }
+    if (res.viaSubScan) this.logSubprojectAdoption(searchFrom, resolvedRoot);
 
     this.projectPath = resolvedRoot;
     try {
@@ -221,6 +267,14 @@ export class MCPEngine {
     }
   }
 
+  /** One stderr line when the default project came from the down-scan (#1606). */
+  private logSubprojectAdoption(searchFrom: string, root: string): void {
+    const rel = path.relative(searchFrom, root) || root;
+    process.stderr.write(
+      `[CodeGraph MCP] No .codegraph/ at ${searchFrom}; adopted the single indexed sub-project ${rel} as the default project.\n`
+    );
+  }
+
   /**
    * Start file watching on the active CodeGraph instance. Idempotent — the
    * watcher is per-engine, not per-session, which is why the daemon path
@@ -230,6 +284,24 @@ export class MCPEngine {
    */
   private startWatching(): void {
     if (!this.cg || this.watcherStarted || !this.opts.watch) return;
+
+    // #1740: only one live watcher/writer per project. Daemon and startDirect
+    // usually already hold writer.pid (re-entrant for this pid). Proxy
+    // in-process fallback acquires here; if another writer holds it, skip the
+    // watcher so we never contend on codegraph.lock until auto-sync degrades.
+    const lockRoot = this.projectPath;
+    if (lockRoot) {
+      const writer = tryAcquireWriterLock(lockRoot, 'fallback');
+      if (writer.kind === 'taken') {
+        const msg = writerLockHeldMessage(writer.existing, writer.pidPath);
+        process.stderr.write(
+          `[CodeGraph MCP] File watcher not started — ${msg}\n`
+        );
+        this.watcherStarted = true;
+        return;
+      }
+      this.writerLockRoot = lockRoot;
+    }
 
     const disabledReason = watchDisabledReason(this.projectPath ?? process.cwd());
     if (disabledReason) {
