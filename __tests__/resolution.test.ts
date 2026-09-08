@@ -1558,6 +1558,65 @@ def add_outcome(row):
       expect(buildMapCalls.map((e) => e.target)).not.toContain(ledgerAppend!.id);
     });
 
+    it('resolves Python module-attribute calls and file imports through an alias (#1626)', async () => {
+      // #715 taught resolvePythonModuleMember to fall back to a dotted-module
+      // file lookup, which fixed `from pkg import module` (#578). The aliased
+      // form still missed: the module path was rebuilt from the LOCAL name, so
+      // `from pkg import module as alias` looked for `pkg.alias` — a file that
+      // does not exist — and the call landed in unresolved_refs. The plain
+      // `import top as alias` form is a namespace import and binds at `source`,
+      // so it was already correct; it is pinned here so the fix can't regress it.
+      fs.mkdirSync(path.join(tempDir, 'pkg'));
+      fs.writeFileSync(path.join(tempDir, 'pkg', '__init__.py'), '');
+      fs.writeFileSync(
+        path.join(tempDir, 'pkg', 'module.py'),
+        'def func():\n    return 1\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'top_level.py'),
+        'def top_func():\n    return 2\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'main.py'),
+        `from pkg import module as mod_alias
+import top_level as tl
+
+
+def from_import_caller():
+    return mod_alias.func()
+
+
+def plain_import_caller():
+    return tl.top_func()
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const fromImportCaller = cg.getNodesByKind('function').filter((n) => n.name === 'from_import_caller')[0];
+      expect(fromImportCaller).toBeDefined();
+      const aliasCalls = cg.getOutgoingEdges(fromImportCaller!.id).filter((e) => e.kind === 'calls');
+      expect(aliasCalls).toHaveLength(1);
+      const aliasTarget = cg.getNode(aliasCalls[0]!.target);
+      expect(aliasTarget?.name).toBe('func');
+      expect(aliasTarget?.filePath.replace(/\\/g, '/')).toBe('pkg/module.py');
+
+      const plainCaller = cg.getNodesByKind('function').filter((n) => n.name === 'plain_import_caller')[0];
+      expect(plainCaller).toBeDefined();
+      const plainCalls = cg.getOutgoingEdges(plainCaller!.id).filter((e) => e.kind === 'calls');
+      expect(plainCalls).toHaveLength(1);
+      expect(cg.getNode(plainCalls[0]!.target)?.name).toBe('top_func');
+
+      // The file dependency must resolve too: fixing only the member lookup
+      // restores calls but leaves the aliased module's imports edge missing.
+      const mainFile = cg.getNodesByKind('file').find((n) => n.filePath === 'main.py');
+      const moduleFile = cg.getNodesByKind('file').find((n) => n.filePath.replace(/\\/g, '/') === 'pkg/module.py');
+      expect(mainFile).toBeDefined();
+      expect(moduleFile).toBeDefined();
+      const fileImports = cg.getOutgoingEdges(mainFile!.id).filter((e) => e.kind === 'imports');
+      expect(fileImports.map((e) => e.target)).toContain(moduleFile!.id);
+    });
+
     it('attaches Go methods to their receiver type across files (#583, cross-file half)', async () => {
       // In Go a type's methods are commonly declared in a different file from the
       // `type` declaration (`type Box` in box.go, `func (b *Box) Get()` in

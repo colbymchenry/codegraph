@@ -137,6 +137,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- `codegraph_explore` now re-serves source to fresh subagents and after context compaction, with cross-call dedup available only through an explicit `CODEGRAPH_EXPLORE_DEDUP=1` opt-in; thanks @danusha2345. (#1620, #1624)
+
 - Fixed index corruption that could happen when the same project was opened through two different path spellings — a symlinked checkout, or upper/lowercase variants of one path on a case-insensitive drive (Windows NTFS, or a WSL `/mnt` drive). CodeGraph now recognizes these as the same project and shares a single database connection instead of opening a second one that could corrupt the index. (#1057)
 
 - **Watcher scope now matches `git ls-files --exclude-standard` (#1728).** `buildDefaultIgnore` / `buildScopeIgnore` read `.git/info/exclude` and `core.excludesFile` (not only the root `.gitignore`), and seed directories git reports as ignored-untracked so nested `.gitignore` effects prune the live watcher the same way the indexer skips them. Single-file auto-sync was already incremental (`pendingFiles` → scoped `sync({ paths })`); the remaining gap was watching trees git had excluded.
@@ -252,6 +254,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`codegraph_explore` is loaded from the first prompt in Claude Code.** Claude Code defers every MCP tool behind a tool-search step, so a fresh session saw only the tool's name until the model searched for it, and the server's "call `codegraph_explore` instead of Read" had nothing loaded to act on. The tool now carries `anthropic/alwaysLoad` in its `_meta`, which exempts it on existing installs, and `codegraph install` writes `alwaysLoad: true` on the Claude Code server entry (re-run it to add the key). Copilot CLI's tool search holds MCP tools back the same way once ~30 tools are connected, so its entry now carries `deferTools: "never"`. (#1696)
 
 - Fixed a long-running `codegraph ui` session serving a symbol that a sync had already deleted. The viewer keeps one connection to your index open, and its in-memory lookup didn't notice when another process — your agent's sync, or `codegraph sync` — rewrote the file underneath it, so a symbol screen could keep showing a body with no callers while search correctly reported it had moved. Because a symbol's identity includes the line it starts on, this happened after almost any edit above it.
+
+- Python calls and file dependencies through `from package import module as alias` now appear in the graph, so renamed imports no longer hide live callers or imported modules. Thanks @JoeyNPP. (#1626)
 
 ## [1.6.0] - 2026-08-26
 
