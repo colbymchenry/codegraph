@@ -139,6 +139,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- `codegraph_explore` now makes clear that suggested call counts are advisory, so agents keep exploring when an answer is incomplete; thanks @rongbc. (#1504, #1570)
+
+- C++ functions following anonymous namespaces containing raw-string templates are now indexed correctly, even when template text resembles an unfinished macro call. (#1505)
+
 - Indexing now warns when parser errors leave a file with no symbols, including C++ raw strings with 16-character delimiters, so missing code is no longer silent. (#1522)
 
 - `codegraph index <path>` now refuses uninitialized paths and names the nearest initialized parent instead of silently rebuilding it; thanks @danusha2345. (#1524, #1689)
@@ -158,6 +162,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `codegraph install` now honors `CLAUDE_CONFIG_DIR` and `CODEX_HOME` for global Claude Code and Codex setup so CodeGraph loads in your chosen profile (thanks @seanchann; #1627).
 
 - Files opted in with `includeIgnored` now stay indexed on Git older than 2.36, and embedded repositories remain visible to the watcher (thanks @maxmilian and @newshowardz777; #1549).
+
+- `codegraph init` and `codegraph index` now list unsupported file extensions and explain that CodeGraph is inactive when no supported source files are found (#1502).
 
 #### Screens, links and navigation
 

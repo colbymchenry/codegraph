@@ -6,7 +6,7 @@
  * grep+Read. These tests pin the per-tier budget shape so future tuning
  * doesn't silently drift the small-project case back into bloat.
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -198,7 +198,26 @@ describe('codegraph_explore output respects the adaptive budget', () => {
     const text = result.content?.[0]?.text ?? '';
     expect(text).not.toContain('### Additional relevant files');
     expect(text).not.toContain('Complete source code is included above');
-    expect(text).not.toContain('Explore budget:');
+    expect(text).not.toContain('advisory only, NOT a quota');
+  });
+
+  it('emits advisory-only exploration guidance on medium projects — never quota wording', async () => {
+    // Medium tier (500–4,999 files) turns the guidance note on. The synthetic
+    // project is tiny, so fake the stats to land in that tier — the note's
+    // WORDING is what this test pins. Regression guard: quota phrasing
+    // ("remaining calls" / "Synthesize once") must never come back — agents
+    // read it as a hard cap, stop exploring early, and fall back to grep+Read.
+    const spy = vi.spyOn(cg, 'getStats').mockReturnValue({ fileCount: 1000 } as ReturnType<CodeGraph['getStats']>);
+    try {
+      const result = await handler.execute('codegraph_explore', { query: 'Session method helper' });
+      const text = result.content?.[0]?.text ?? '';
+      expect(text).toContain('advisory only, NOT a quota');
+      expect(text).toContain('extra calls are never rejected or rate-limited');
+      expect(text).not.toContain('remaining calls');
+      expect(text).not.toContain('Synthesize once');
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('still includes the Relationships section — it is the cheapest structural signal', async () => {
