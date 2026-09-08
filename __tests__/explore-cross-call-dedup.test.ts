@@ -28,6 +28,7 @@ import { ExploreSessionState, type ExploreProjectState } from '../src/mcp/explor
 import {
   EXPLORE_DEDUP,
   dedupeRange,
+  exploreDedupEnabled,
   fileFingerprint,
   formatBackReference,
   intersectRange,
@@ -40,6 +41,27 @@ import {
 const FIXTURE_SRC = path.join(__dirname, 'fixtures', 'payroll-go');
 const QUERY = 'how does payroll cycle create and calculate payslips?';
 const POINTER = 'Already sent earlier in this conversation';
+
+describe('dedup configuration', () => {
+  it('defaults off and requires an explicit truthy opt-in', () => {
+    const previous = process.env.CODEGRAPH_EXPLORE_DEDUP;
+    try {
+      delete process.env.CODEGRAPH_EXPLORE_DEDUP;
+      expect(exploreDedupEnabled()).toBe(false);
+      for (const enabled of ['1', 'true', 'on', 'yes', ' YES ']) {
+        process.env.CODEGRAPH_EXPLORE_DEDUP = enabled;
+        expect(exploreDedupEnabled()).toBe(true);
+      }
+      for (const disabled of ['0', 'false', 'off', 'no', 'unexpected']) {
+        process.env.CODEGRAPH_EXPLORE_DEDUP = disabled;
+        expect(exploreDedupEnabled()).toBe(false);
+      }
+    } finally {
+      if (previous === undefined) delete process.env.CODEGRAPH_EXPLORE_DEDUP;
+      else process.env.CODEGRAPH_EXPLORE_DEDUP = previous;
+    }
+  });
+});
 
 /** A prior-state shaped like the session tracker's, for the algebra tests. */
 function prior(files: Array<{ path: string; ranges: Array<[number, number]>; fingerprint?: string }>): ExploreProjectState {
@@ -183,8 +205,11 @@ describe('a second call against a real index', () => {
   let testDir: string;
   let cg: CodeGraph;
   let handler: ToolHandler;
+  let previousDedup: string | undefined;
 
   beforeAll(async () => {
+    previousDedup = process.env.CODEGRAPH_EXPLORE_DEDUP;
+    process.env.CODEGRAPH_EXPLORE_DEDUP = '1';
     testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-cg18-'));
     fs.cpSync(FIXTURE_SRC, testDir, { recursive: true });
     fs.rmSync(path.join(testDir, '.codegraph'), { recursive: true, force: true });
@@ -194,6 +219,8 @@ describe('a second call against a real index', () => {
   }, 120_000);
 
   afterAll(() => {
+    if (previousDedup === undefined) delete process.env.CODEGRAPH_EXPLORE_DEDUP;
+    else process.env.CODEGRAPH_EXPLORE_DEDUP = previousDedup;
     if (cg) cg.destroy();
     if (testDir && fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
   });
@@ -322,6 +349,23 @@ describe('a second call against a real index', () => {
       const second = await explore(QUERY, session);
       expect(second).toBe(first);
       expect(second).not.toContain(POINTER);
+    } finally {
+      if (previous === undefined) delete process.env.CODEGRAPH_EXPLORE_DEDUP;
+      else process.env.CODEGRAPH_EXPLORE_DEDUP = previous;
+    }
+  }, 120_000);
+
+  it('re-serves source by default when a connection may outlive the current context', async () => {
+    const session = new ExploreSessionState();
+    const previous = process.env.CODEGRAPH_EXPLORE_DEDUP;
+    delete process.env.CODEGRAPH_EXPLORE_DEDUP;
+    try {
+      const first = await explore(QUERY, session);
+      const second = await explore(QUERY, session);
+      expect(second).toBe(first);
+      expect(second).not.toContain(POINTER);
+      expect([...fencedLines(second).values()].reduce((sum, lines) => sum + lines.size, 0))
+        .toBeGreaterThan(20);
     } finally {
       if (previous === undefined) delete process.env.CODEGRAPH_EXPLORE_DEDUP;
       else process.env.CODEGRAPH_EXPLORE_DEDUP = previous;

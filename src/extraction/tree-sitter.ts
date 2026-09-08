@@ -407,34 +407,21 @@ const LITERAL_RECEIVER_TYPES = new Set([
  */
 const TS_JS_CHAIN_LANGUAGES = new Set(['typescript', 'tsx', 'javascript', 'jsx']);
 
-/**
- * Host objects a TS/JS project never declares: the browser, extension, and
- * runtime namespaces, plus the builtin constructors whose statics are library
- * calls. A member chain ROOTED at one of these ends in a platform API, so the
- * bare method name the extractor used to emit for `chrome.storage.local.get(k)`
- * or `document.body.querySelector(s)` could only ever exact-match an unrelated
- * project symbol that happened to share the name (#1707). `window` is absent on
- * purpose: `window.MyNamespace.doThing()` reaches a project symbol.
- */
-const TS_JS_HOST_GLOBAL_ROOTS = new Set([
-  'chrome', 'browser', 'document', 'navigator', 'performance', 'console',
-  'localStorage', 'sessionStorage', 'indexedDB', 'crypto', 'globalThis',
-  'process', 'Math', 'JSON', 'Object', 'Array', 'Reflect', 'Promise', 'Intl',
-]);
-
 /** Receiver node types (TS/JS grammars) that continue a member chain downward. */
 const TS_JS_CHAIN_RECEIVER_TYPES = new Set(['member_expression', 'subscript_expression']);
 
 /**
- * Root identifier of a TS/JS member chain — `chrome` for `chrome.storage.local`
- * — or null when the chain bottoms out in a call, a literal, or `this`.
+ * Identifier-rooted member chains have no inferred property type (#1566),
+ * including host API chains (#1707). Keep the existing `window.MyNamespace`
+ * escape for project globals; call-result and `this` receivers have their own
+ * paths and are outside this guard.
  */
-function tsJsChainRoot(node: SyntaxNode, source: string): string | null {
+function isUnresolvedTsJsChain(node: SyntaxNode, source: string): boolean {
   let cur: SyntaxNode | null = node;
   while (cur && TS_JS_CHAIN_RECEIVER_TYPES.has(cur.type)) {
     cur = getChildByField(cur, 'object');
   }
-  return cur && cur.type === 'identifier' ? getNodeText(cur, source) : null;
+  return !!cur && cur.type === 'identifier' && getNodeText(cur, source) !== 'window';
 }
 
 /**
@@ -4786,18 +4773,14 @@ export class TreeSitterExtractor {
               TS_JS_CHAIN_LANGUAGES.has(this.language) &&
               receiver &&
               TS_JS_CHAIN_RECEIVER_TYPES.has(receiver.type) &&
-              TS_JS_HOST_GLOBAL_ROOTS.has(tsJsChainRoot(receiver, this.source) ?? '')
+              isUnresolvedTsJsChain(receiver, this.source)
             ) {
-              // TS/JS member call reached through a host namespace —
-              // `chrome.storage.local.get(key)`, `document.body.querySelector(s)`.
-              // The bare method name this used to emit exact-matched whatever
-              // project symbol shared it: every `chrome.storage.local.get/set`
-              // in a storage wrapper bound to the wrapper's own `get`/`set`,
-              // a self-edge not in the source (#1707). Emit nothing: a silent
-              // miss, never a wrong edge. A chain rooted at a project value
-              // (`window.MyNs.run()`, `store.getState().act()`, `ref.value.m()`)
-              // keeps the bare name — those targets are real, and dropping them
-              // would cost far more recall than the mis-bind costs precision.
+              // `holder.values.get()` has no inferred property type (#1566).
+              // Emitting bare `get` exact-matches an unrelated project method;
+              // preserving the chain alone would still allow receiver guessing.
+              // Emit nothing until the property type can be established. This
+              // also covers host chains such as `chrome.storage.local.get()`
+              // (#1707). Calls inside arguments are visited independently.
               // Mirrored in the kernel's extract_call (tsjs/extractors.rs).
               return;
             } else {
