@@ -745,6 +745,63 @@ export const fetchData = async () => {
   });
 });
 
+describe('Generator Function Extraction (#1741)', () => {
+  const functionNames = (file: string, code: string) =>
+    extractFromSource(file, code)
+      .nodes.filter((n) => n.kind === 'function')
+      .map((n) => n.name)
+      .sort();
+
+  it('extracts function* and async function* declarations in TypeScript', () => {
+    process.env.CODEGRAPH_KERNEL = '0';
+    const code = `
+function plain() { return 1; }
+function* gen() { yield 2; }
+async function asyncFn() { return 3; }
+async function* asyncGen() { yield 4; }
+`;
+    expect(functionNames('gens.ts', code)).toEqual(['asyncFn', 'asyncGen', 'gen', 'plain']);
+  });
+
+  it('extracts function* and async function* declarations in JavaScript', () => {
+    process.env.CODEGRAPH_KERNEL = '0';
+    const code = `
+function plain() { return 1; }
+function* gen() { yield 2; }
+async function asyncFn() { return 3; }
+async function* asyncGen() { yield 4; }
+`;
+    expect(functionNames('gens.js', code)).toEqual(['asyncFn', 'asyncGen', 'gen', 'plain']);
+  });
+
+  it('extracts const-assigned generator and async generator expressions (TS)', () => {
+    process.env.CODEGRAPH_KERNEL = '0';
+    const code = `
+const g = function* () { yield 1; };
+const ag = async function* () { yield 2; };
+export const exportedGen = function* () { yield 3; };
+`;
+    const result = extractFromSource('gen-expr.ts', code);
+    const names = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name).sort();
+    expect(names).toEqual(['ag', 'exportedGen', 'g']);
+    expect(result.nodes.find((n) => n.name === 'exportedGen')?.isExported).toBe(true);
+    expect(result.nodes.find((n) => n.name === 'g')?.isExported).toBeFalsy();
+  });
+
+  it('extracts const-assigned generator and async generator expressions (JS)', () => {
+    process.env.CODEGRAPH_KERNEL = '0';
+    const code = `
+const g = function* () { yield 1; };
+const ag = async function* () { yield 2; };
+export const exportedGen = function* () { yield 3; };
+`;
+    const result = extractFromSource('gen-expr.js', code);
+    const names = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name).sort();
+    expect(names).toEqual(['ag', 'exportedGen', 'g']);
+    expect(result.nodes.find((n) => n.name === 'exportedGen')?.isExported).toBe(true);
+  });
+});
+
 describe('Type Alias Extraction', () => {
   it('should extract exported type aliases in TypeScript', () => {
     const code = `
