@@ -238,7 +238,7 @@ export class Telemetry {
     const day = this.utcDay();
     const cn = client?.name?.slice(0, 64);
     const cv = client?.version?.slice(0, 32);
-    const key = [day, kind, name, cn ?? '', cv ?? ''].join(' ');
+    const key = [day, kind, name, cn ?? '', cv ?? ''].join('\u0000');
     const line = this.counts.get(key);
     if (line) {
       line.c += 1;

@@ -120,6 +120,45 @@ describe('multi-repo workspaces (#514) + .gitignore-respect default (#970, #976)
       expect(files).toContain('tools.ts'); // the parent's own tracked code still indexes
     });
 
+    it('child-pattern spelling revives repos whose PARENT dir carries the gitignore rule (#1295)', () => {
+      // `.gitignore: /repos/` lists `repos/` as ONE ignored entry, while the
+      // CLI hint suggests `includeIgnored: ["repos/a/", "repos/b/"]` — the
+      // child spelling. That never matched the parent path, so the documented
+      // opt-in silently indexed nothing.
+      write(path.join(ws, 'repos/a/a.ts'), 'export const a = 1;\n');
+      write(path.join(ws, 'repos/b/b.ts'), 'export const b = 2;\n');
+      makeRepo(path.join(ws, 'repos/a'));
+      makeRepo(path.join(ws, 'repos/b'));
+      write(path.join(ws, '.gitignore'), '/repos/\n');
+      writeConfig({ includeIgnored: ['repos/a/', 'repos/b/'] });
+      makeRepo(ws);
+
+      const files = scanDirectory(ws);
+      expect(files).toContain('repos/a/a.ts');
+      expect(files).toContain('repos/b/b.ts');
+      // Discovery (the watcher path) agrees with the scanner.
+      expect(discoverEmbeddedRepoRoots(ws).sort()).toEqual(['repos/a/', 'repos/b/']);
+      // And the CLI hint has nothing left to nag about.
+      expect(findUnindexedIgnoredRepos(ws)).toEqual([]);
+    });
+
+    it('child-pattern spelling opts in ONLY the named repo; siblings stay out and stay hinted (#1295)', () => {
+      write(path.join(ws, 'repos/a/a.ts'), 'export const a = 1;\n');
+      write(path.join(ws, 'repos/b/b.ts'), 'export const b = 2;\n');
+      makeRepo(path.join(ws, 'repos/a'));
+      makeRepo(path.join(ws, 'repos/b'));
+      write(path.join(ws, '.gitignore'), '/repos/\n');
+      writeConfig({ includeIgnored: ['repos/a/'] });
+      makeRepo(ws);
+
+      const files = scanDirectory(ws);
+      expect(files).toContain('repos/a/a.ts');
+      expect(files.some((f) => f.startsWith('repos/b/'))).toBe(false);
+      expect(discoverEmbeddedRepoRoots(ws)).toEqual(['repos/a/']);
+      // The unopted sibling is still worth hinting about.
+      expect(findUnindexedIgnoredRepos(ws)).toEqual(['repos/b/']);
+    });
+
     it('only re-includes the opted-in dir, not every gitignored dir', () => {
       // `packages/` is opted in; `scratch/` (also holding a repo) is NOT.
       write(path.join(ws, 'packages/proj-a/src/auth.ts'), 'export function login() {}\n');

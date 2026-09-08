@@ -1,6 +1,6 @@
 import { parentPort, workerData } from 'worker_threads';
 import { writeSync } from 'fs';
-import { getGlyphs } from './glyphs';
+import { getRawWriteGlyphs } from './glyphs';
 import type { ShimmerWorkerMessage } from './types';
 
 // Write directly to fd 1 (stdout) instead of writeStdout().
@@ -11,20 +11,29 @@ import type { ShimmerWorkerMessage } from './types';
 //
 // Side effect: bypasses Node's TTY-aware encoding conversion on Windows,
 // so UTF-8 bytes hit the console raw and mojibake on OEM codepages.
-// `getGlyphs()` returns ASCII fallbacks on Windows to avoid this (#168).
+// `getRawWriteGlyphs()` therefore always falls back to ASCII on Windows
+// (#168). Everything this worker writes is transient — erased by the next
+// frame or by the parent's phase-done line — so ASCII here never shows up
+// in scrollback (#398); the persistent lines are printed by the parent
+// through the codepage-immune process.stdout path.
 function writeStdout(s: string): void {
   writeSync(1, s);
 }
 
-const G = getGlyphs();
+const G = getRawWriteGlyphs();
 const SPINNER_GLYPHS = G.spinner;
 const ANIM_INTERVAL = 150;
 const FRAMES_PER_GLYPH = 3;
 
-const RST = '\x1b[0m';
-const DM = '\x1b[2m';
-const GRN = '\x1b[32m';
-const BOLD = '\x1b[1m';
+// colors:false (NO_COLOR / --no-color on an interactive TTY, #1281) keeps the
+// animation but drops every color/style code. `\r\x1b[K` line rewrites stay —
+// they're cursor control, not color, and the parent only spawns this worker
+// when stdout is a real TTY.
+const COLORS: boolean = workerData.colors !== false;
+
+const RST = COLORS ? '\x1b[0m' : '';
+const DM = COLORS ? '\x1b[2m' : '';
+const BOLD = COLORS ? '\x1b[1m' : '';
 
 const startTime: number = workerData.startTime;
 
@@ -37,6 +46,7 @@ function lerp(a: number, b: number, t: number): number {
 }
 
 function shimmerColor(frame: number): string {
+  if (!COLORS) return '';
   const t = (Math.sin(frame * 2 * Math.PI / 13) + 1) / 2;
   const r = lerp(160, 251, t);
   const g = lerp(100, 191, t);
@@ -55,6 +65,10 @@ function renderBar(frame: number, filled: number, empty: number): string {
   const shimmerWidth = 3;
   let bar = '';
   for (let i = 0; i < filled; i++) {
+    if (!COLORS) {
+      bar += G.barFilled;
+      continue;
+    }
     const dist = Math.abs(i - shimmerPos);
     const t = Math.max(0, 1 - dist / shimmerWidth);
     const r = lerp(160, 251, t);
@@ -93,13 +107,12 @@ function render(): void {
   writeStdout(`\r\x1b[K${line}`);
 }
 
-function finishPhase(): void {
+// Clear the in-flight animation line. The persistent "phase done" line is
+// printed by the PARENT on the main thread (TTY-aware, codepage-immune) —
+// this worker's raw-byte path must never leave bytes in scrollback (#398).
+function clearLine(): void {
   if (!currentMessage) return;
   writeStdout(`\r\x1b[K`);
-  let detail = '';
-  if (currentPercent >= 0) detail = ` ${G.dash} done`;
-  else if (currentCount > 0) detail = ` ${G.dash} ${formatNumber(currentCount)} found`;
-  writeStdout(`${DM}${G.rail}${RST}  ${GRN}${G.phaseDone}${RST} ${currentMessage}${detail}\n`);
   currentMessage = '';
   currentPercent = -1;
   currentCount = 0;
@@ -113,11 +126,9 @@ parentPort!.on('message', (msg: ShimmerWorkerMessage) => {
     currentMessage = msg.phaseName;
     currentPercent = msg.percent;
     currentCount = msg.count;
-  } else if (msg.type === 'finish-phase') {
-    finishPhase();
   } else if (msg.type === 'stop') {
     clearInterval(tickInterval);
-    finishPhase();
+    clearLine();
     parentPort!.postMessage({ type: 'stopped' });
   }
 });

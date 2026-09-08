@@ -10,6 +10,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
   supportsUnicode,
+  supportsUnicodeRawWrites,
   getGlyphs,
   UNICODE_GLYPHS,
   ASCII_GLYPHS,
@@ -54,10 +55,81 @@ describe('supportsUnicode', () => {
     _resetGlyphsCache();
   });
 
-  it('returns false on Windows by default (mojibake-prone consoles)', () => {
-    withEnv({ CODEGRAPH_ASCII: undefined, CODEGRAPH_UNICODE: undefined, TERM: undefined }, () => {
+  /** Clears every signal the Windows detection reads, so cases are explicit. */
+  const NO_TERMINAL_SIGNALS: Record<string, string | undefined> = {
+    CODEGRAPH_ASCII: undefined,
+    CODEGRAPH_UNICODE: undefined,
+    TERM: undefined,
+    CI: undefined,
+    WT_SESSION: undefined,
+    TERMINUS_SUBLIME: undefined,
+    ConEmuTask: undefined,
+    TERM_PROGRAM: undefined,
+    TERMINAL_EMULATOR: undefined,
+  };
+
+  it('returns false on Windows in an unrecognized console (mojibake-prone legacy conhost)', () => {
+    withEnv(NO_TERMINAL_SIGNALS, () => {
       setPlatform('win32');
       expect(supportsUnicode()).toBe(false);
+    });
+  });
+
+  // The Windows allowlist must match @clack/prompts' bundled detection —
+  // wherever clack draws its Unicode frame, our rails must be Unicode too,
+  // or `codegraph index` mixes `|` and `│` in one output block (#398).
+  it.each([
+    ['Windows Terminal', { WT_SESSION: 'a-guid' }],
+    ['VS Code terminal', { TERM_PROGRAM: 'vscode' }],
+    ['ConEmu/Cmder', { ConEmuTask: '{cmd::Cmder}' }],
+    ['Alacritty', { TERM: 'alacritty' }],
+    ['xterm-256color', { TERM: 'xterm-256color' }],
+    ['JetBrains terminal', { TERMINAL_EMULATOR: 'JetBrains-JediTerm' }],
+    ['CI', { CI: 'true' }],
+  ])('returns true on Windows in %s (agrees with clack, #398)', (_name, envPatch) => {
+    withEnv({ ...NO_TERMINAL_SIGNALS, ...envPatch }, () => {
+      setPlatform('win32');
+      expect(supportsUnicode()).toBe(true);
+    });
+  });
+
+  it('CODEGRAPH_ASCII=1 still wins inside Windows Terminal (escape hatch)', () => {
+    withEnv({ ...NO_TERMINAL_SIGNALS, CODEGRAPH_ASCII: '1', WT_SESSION: 'a-guid' }, () => {
+      setPlatform('win32');
+      expect(supportsUnicode()).toBe(false);
+    });
+  });
+
+  // The raw fs.writeSync(1) path (shimmer animation frames) decodes through
+  // the console CODEPAGE on Windows, so it must stay ASCII there even in
+  // terminals where the codepage-immune main-thread path goes Unicode (#168).
+  describe('supportsUnicodeRawWrites', () => {
+    it('stays ASCII on Windows even inside Windows Terminal / vscode / CI', () => {
+      for (const envPatch of [{ WT_SESSION: 'a-guid' }, { TERM_PROGRAM: 'vscode' }, { CI: 'true' }]) {
+        withEnv({ ...NO_TERMINAL_SIGNALS, ...envPatch }, () => {
+          setPlatform('win32');
+          expect(supportsUnicodeRawWrites()).toBe(false);
+          expect(supportsUnicode()).toBe(true); // main-thread path DOES go Unicode there
+        });
+      }
+    });
+
+    it('CODEGRAPH_UNICODE=1 opts the raw path in on Windows', () => {
+      withEnv({ ...NO_TERMINAL_SIGNALS, CODEGRAPH_UNICODE: '1' }, () => {
+        setPlatform('win32');
+        expect(supportsUnicodeRawWrites()).toBe(true);
+      });
+    });
+
+    it('matches supportsUnicode() off Windows (Unicode on macOS, ASCII on TERM=linux)', () => {
+      withEnv({ ...NO_TERMINAL_SIGNALS }, () => {
+        setPlatform('darwin');
+        expect(supportsUnicodeRawWrites()).toBe(true);
+      });
+      withEnv({ ...NO_TERMINAL_SIGNALS, TERM: 'linux' }, () => {
+        setPlatform('linux');
+        expect(supportsUnicodeRawWrites()).toBe(false);
+      });
     });
   });
 
@@ -117,8 +189,20 @@ describe('getGlyphs', () => {
     _resetGlyphsCache();
   });
 
-  it('returns ASCII glyphs on Windows', () => {
-    withEnv({ CODEGRAPH_ASCII: undefined, CODEGRAPH_UNICODE: undefined }, () => {
+  it('returns ASCII glyphs on Windows in an unrecognized console', () => {
+    withEnv(
+      {
+        CODEGRAPH_ASCII: undefined,
+        CODEGRAPH_UNICODE: undefined,
+        TERM: undefined,
+        CI: undefined,
+        WT_SESSION: undefined,
+        TERMINUS_SUBLIME: undefined,
+        ConEmuTask: undefined,
+        TERM_PROGRAM: undefined,
+        TERMINAL_EMULATOR: undefined,
+      },
+      () => {
       setPlatform('win32');
       const g = getGlyphs();
       expect(g).toBe(ASCII_GLYPHS);

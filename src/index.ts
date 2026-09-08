@@ -8,6 +8,7 @@
 import * as path from 'path';
 import {
   Node,
+  NodeKind,
   Edge,
   FileRecord,
   ExtractionResult,
@@ -22,9 +23,10 @@ import {
   TaskContext,
   BuildContextOptions,
   FindRelevantContextOptions,
+  UnresolvedReference,
 } from './types';
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
-import { WalCheckpointValve } from './db/wal-valve';
+import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
 import { QueryBuilder } from './db/queries';
 import {
   isInitialized,
@@ -52,9 +54,12 @@ import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './
 import { EXTRACTION_VERSION } from './extraction/extraction-version';
 import { getCodeGraphDir } from './directory';
 import { deriveProjectNameTokens } from './search/query-utils';
+import ignore from 'ignore';
+import { loadDeprioritizePatterns } from './project-config';
 import { CodeGraphPackageVersion } from './mcp/version';
-import { segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
+import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
+import { minRefsForPool } from './resolution/resolver-pool';
 
 // Re-export types for consumers
 export * from './types';
@@ -125,6 +130,8 @@ export interface IndexOptions {
 
   /** Enable verbose logging (worker lifecycle, memory, timeouts) */
   verbose?: boolean;
+  /** Watcher fast path: reconcile ONLY these project-relative paths (see ExtractionOrchestrator.sync). */
+  paths?: string[];
 }
 
 /**
@@ -182,6 +189,39 @@ export class CodeGraph {
     } catch {
       // Best-effort: ranking still works without it.
     }
+    // Down-weight the peripheral trees the project named in `codegraph.json`
+    // `deprioritize` — indexed and findable, but never outranking real code
+    // (#982). Ranking-only, so a bad pattern costs relevance, never recall.
+    //
+    // Read LAZILY, not once here: `wireLayers` runs from the constructor and
+    // from `reopenIfReplaced`, so a matcher built here would freeze at whatever
+    // the config said when the project opened. The MCP server caches one
+    // CodeGraph per root for its whole lifetime, so editing `codegraph.json`
+    // would appear to do nothing until the process restarted — `exclude` and
+    // `include` do not behave that way. `loadDeprioritizePatterns` is
+    // mtime-cached, so this costs one `stat`; the compiled matcher is memoized
+    // on the pattern array's identity, which the cache keeps stable.
+    let cachedPatterns: string[] | undefined;
+    let cachedMatcher: ReturnType<typeof ignore> | undefined;
+    this.queries.setDeprioritizedPathMatcher((filePath: string): boolean => {
+      try {
+        const patterns = loadDeprioritizePatterns(this.projectRoot);
+        if (patterns.length === 0) return false;
+        if (patterns !== cachedPatterns) {
+          cachedPatterns = patterns;
+          cachedMatcher = ignore().add(patterns);
+        }
+        const rel = path.isAbsolute(filePath)
+          ? path.relative(this.projectRoot, filePath)
+          : filePath;
+        if (!rel || rel.startsWith('..')) return false;
+        return cachedMatcher!.ignores(rel.split(path.sep).join('/'));
+      } catch {
+        // Ranking must never take the search down with it.
+        return false;
+      }
+    });
+
     this.orchestrator = new ExtractionOrchestrator(this.projectRoot, this.queries);
     this.resolver = createResolver(this.projectRoot, this.queries);
     this.graphManager = new GraphQueryManager(this.queries);
@@ -445,15 +485,32 @@ export class CodeGraph {
       // the final fold-up before the interval is restored in the finally.
       // Kill switch: CODEGRAPH_NO_WAL_DEFER=1. Non-WAL journal modes (some
       // network filesystems) have no WAL to defer — skip.
-      const deferWal = process.env.CODEGRAPH_NO_WAL_DEFER !== '1' && this.db.getJournalMode() === 'wal';
+      // Fast-init: on a COMPLETELY fresh DB, trade crash-durability for speed
+      // during the bulk build (journal in memory, no fsync). Safe because the
+      // DB is disposable until the index completes — index_state stays
+      // 'indexing' and a crashed init is re-run from scratch; existing DBs
+      // (re-index/sync) never take this path. Kill switch:
+      // CODEGRAPH_NO_FAST_INIT=1 (same pattern as CODEGRAPH_NO_WAL_DEFER).
+      const freshDb = this.queries.getNodeAndEdgeCount().nodes === 0;
+      const fastInit = process.env.CODEGRAPH_NO_FAST_INIT !== '1' && freshDb;
+      if (fastInit) {
+        try {
+          this.db.getDb().pragma('journal_mode = MEMORY');
+          this.db.getDb().pragma('synchronous = OFF');
+        } catch { /* keep WAL */ }
+      }
+      const deferWal = !fastInit && process.env.CODEGRAPH_NO_WAL_DEFER !== '1' && this.db.getJournalMode() === 'wal';
       let walValve: WalCheckpointValve | null = null;
       let priorAutocheckpoint = 1000;
+      // Set when the fastInit+pool path below defers autocheckpointing, so the
+      // finally knows to restore the interval on that path too.
+      let restoreAutocheckpoint = false;
       if (deferWal) {
         priorAutocheckpoint = this.db.getWalAutocheckpoint();
         this.db.setWalAutocheckpoint(0);
         walValve = new WalCheckpointValve(
           this.db,
-          undefined,
+          resolveWalValveMb(process.env.CODEGRAPH_WAL_VALVE_MB, this.db.getDbFileSizeBytes()),
           undefined,
           options.verbose ? (m) => console.log(`[wal-valve] ${m}`) : undefined
         );
@@ -470,12 +527,37 @@ export class CodeGraph {
         // path as every file (re-)indexes below — so a full index is also the
         // orphan-cleanup pass for names deleted since the last one.
         try { this.queries.clearNameSegmentVocab(); } catch { /* vocab is advisory — never fail an index over it */ }
-        const result = await this.orchestrator.indexAll(
-          options.onProgress,
-          options.signal,
-          options.verbose,
-          walValve ? () => walValve!.backpressure() : undefined
-        );
+        // Bulk FTS mode for the mass-insert phase: drop the per-row FTS sync
+        // triggers, rebuild nodes_fts once from the nodes table afterwards.
+        // Crash inside the window is healed on the next DatabaseConnection.open.
+        this.db.beginBulkNodeLoad();
+        // Fresh-init only: also drop the parse-lane secondary indexes for the
+        // mass insert (the store-writer's B-tree-maintenance floor, plan §4d)
+        // and rebuild each in one scan afterwards. Incremental runs keep them
+        // — they delete per-file rows mid-phase through the file_path indexes.
+        if (freshDb) this.db.beginBulkParseLoad();
+        let result: IndexResult;
+        try {
+          result = await this.orchestrator.indexAll(
+            options.onProgress,
+            options.signal,
+            options.verbose,
+            walValve ? () => walValve!.backpressure() : undefined,
+            // Store-writer offload is fresh-DB-only: with any pre-existing
+            // data the store path must read (existing-file checks, cross-file
+            // edge snapshots) and delete, which belongs on one thread.
+            freshDb ? { dbPath: this.db.getPath(), fastInit } : null
+          );
+        } finally {
+          if (freshDb) {
+            const tIdx = Date.now();
+            await this.db.endBulkParseLoad();
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] parse-index-rebuild: ${Date.now() - tIdx}ms`);
+          }
+          const tFts = Date.now();
+          this.db.endBulkNodeLoad();
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] fts-rebuild: ${Date.now() - tFts}ms`);
+        }
 
         // Fold the parse phase's WAL BEFORE the first post-parse reads
         // (resolver re-init and resolution both read on the main thread):
@@ -492,10 +574,12 @@ export class CodeGraph {
         // and silently drop themselves. Re-initializing here gives them a
         // chance to see the actual project before resolution runs.
         if (result.success && result.filesIndexed > 0) {
+          const tReinit = Date.now();
           this.resolver.initialize();
           // Cross-file finalization (e.g. NestJS RouterModule prefixes). Runs
           // before resolution so updated names show up in subsequent reads.
           this.resolver.runPostExtract();
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] resolver-reinit: ${Date.now() - tReinit}ms`);
         }
 
         // Resolve references to create call/import/extends edges
@@ -503,19 +587,62 @@ export class CodeGraph {
           // Get count without loading all refs into memory
           const unresolvedCount = this.queries.getUnresolvedReferencesCount();
 
+          // Fast-init leaves the DB in memory-journal (rollback) mode, where
+          // the parallel resolver pool's read connections would contend with
+          // the main writer's exclusive commits. When the pool will actually
+          // run (enough pending refs), restore WAL BEFORE resolution so
+          // readers never block the writer; otherwise stay in the fast mode
+          // until the finally — sequential resolution has no readers.
+          if (fastInit && unresolvedCount >= minRefsForPool()) {
+            try {
+              this.db.getDb().pragma('synchronous = NORMAL');
+              this.db.getDb().pragma('journal_mode = WAL');
+              // Defer auto-checkpointing for the resolution phase, same
+              // rationale as the deferWal path above: at the default 1000-page
+              // interval, the persist loop's edge inserts + ref deletes make
+              // SQLite re-write hot B-tree pages into the main DB file inline
+              // on the writer over and over (#1231's pathology — measured as
+              // ~58% of the resolution phase on a 255k-ref repo). The valve
+              // bounds WAL growth off-thread; runMaintenance does the final
+              // fold and the finally restores the interval.
+              priorAutocheckpoint = this.db.getWalAutocheckpoint();
+              this.db.setWalAutocheckpoint(0);
+              restoreAutocheckpoint = true;
+              walValve = new WalCheckpointValve(
+                this.db,
+                undefined,
+                undefined,
+                options.verbose ? (m) => console.log(`[wal-valve] ${m}`) : undefined
+              );
+              walValve.start();
+            } catch { /* keep current mode; resolution still works sequentially */ }
+          }
+
           options.onProgress?.({
             phase: 'resolving',
             current: 0,
             total: unresolvedCount,
           });
 
-          await this.resolveReferencesBatched((current, total) => {
-            options.onProgress?.({
-              phase: 'resolving',
-              current,
-              total,
-            });
-          });
+          const tResolve = Date.now();
+          await this.resolveReferencesBatched(
+            (current, total) => {
+              options.onProgress?.({
+                phase: 'resolving',
+                current,
+                total,
+              });
+            },
+            (done, totalPasses) => {
+              options.onProgress?.({
+                phase: 'linking',
+                current: done,
+                total: totalPasses,
+              });
+            },
+            walValve ? () => walValve!.backpressure() : undefined
+          );
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] resolution: ${Date.now() - tResolve}ms`);
 
           // Second pass: chained calls whose method lives on a supertype the
           // receiver conforms to (protocol-extension / inherited / default-
@@ -607,8 +734,16 @@ export class CodeGraph {
         // (SQLite replays the WAL on the next open) and the follow-up write
         // that folds it is the known cost of a failed run.
         if (walValve) { walValve.stop(); await walValve.drain(); }
-        if (deferWal) {
+        if (deferWal || restoreAutocheckpoint) {
           try { this.db.setWalAutocheckpoint(priorAutocheckpoint); } catch { /* connection may be closing */ }
+        }
+        if (fastInit) {
+          // Back to the durable defaults; journal_mode=WAL folds the MEMORY
+          // journal state into a normal WAL-mode database file.
+          try {
+            this.db.getDb().pragma('synchronous = NORMAL');
+            this.db.getDb().pragma('journal_mode = WAL');
+          } catch { /* connection may be closing */ }
         }
         this.fileLock.release();
       }
@@ -647,6 +782,31 @@ export class CodeGraph {
       } catch {
         return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
       }
+      // Defer WAL auto-checkpointing for the whole incremental run, exactly
+      // as indexAll does for the bulk path (#1231): sync's store loop and its
+      // resolution passes churn the same FTS + secondary-index hot pages, and
+      // at the default 1000-page cadence the inline checkpoints re-write them
+      // over and over — on HDD-class storage a 7-file sync took 2 minutes at
+      // 0-2% CPU (#1248). The cost scales with the EXISTING database size,
+      // not the change size, so small syncs on big indexes hurt most. The
+      // valve bounds WAL growth off-thread; runMaintenance at the end does
+      // the final fold-up before the interval is restored in the finally.
+      // Same kill switch as indexAll: CODEGRAPH_NO_WAL_DEFER=1. Idle valve
+      // cost is one timer, so watcher-frequency syncs stay cheap.
+      const deferWal = process.env.CODEGRAPH_NO_WAL_DEFER !== '1' && this.db.getJournalMode() === 'wal';
+      let walValve: WalCheckpointValve | null = null;
+      let priorAutocheckpoint = 1000;
+      if (deferWal) {
+        priorAutocheckpoint = this.db.getWalAutocheckpoint();
+        this.db.setWalAutocheckpoint(0);
+        walValve = new WalCheckpointValve(
+          this.db,
+          resolveWalValveMb(process.env.CODEGRAPH_WAL_VALVE_MB, this.db.getDbFileSizeBytes()),
+          undefined,
+          options.verbose ? (m) => console.log(`[wal-valve] ${m}`) : undefined
+        );
+        walValve.start();
+      }
       try {
         // Captured BEFORE the sync runs: the sync's own incremental writes
         // populate vocab rows for the files it touches, so an end-of-sync
@@ -656,7 +816,18 @@ export class CodeGraph {
           try { return this.queries.isNameSegmentVocabEmpty(); } catch { return false; }
         })();
 
-        const result = await this.orchestrator.sync(options.onProgress);
+        // Writer-side backstop for deferred WAL checkpointing (#1539): sync
+        // previously armed the valve but never called backpressure(), so the
+        // hard/file caps were never enforced during daemon catch-up — only
+        // timer-driven PASSIVE checkpoints ran, and a query-pool reader could
+        // pin frames while the WAL grew without a bound.
+        const backpressure = walValve ? () => walValve!.backpressure() : undefined;
+        const result = await this.orchestrator.sync(options.onProgress, options.paths, backpressure);
+
+        // Fold the store phase's WAL BEFORE the post-store reads below
+        // (resolution reads on the main thread) — same rationale as
+        // indexAll's fold between store and resolution.
+        if (walValve) await walValve.foldNow();
 
         // Cross-file finalization (e.g. NestJS RouterModule prefixes). Run on
         // every sync that touched files so edits to `app.module.ts` propagate
@@ -735,13 +906,49 @@ export class CodeGraph {
               total: unresolvedCount,
             });
 
-            await this.resolveReferencesBatched((current, total) => {
-              options.onProgress?.({
-                phase: 'resolving',
-                current,
-                total,
-              });
-            });
+            await this.resolveReferencesBatched(
+              (current, total) => {
+                options.onProgress?.({
+                  phase: 'resolving',
+                  current,
+                  total,
+                });
+              },
+              (done, totalPasses) => {
+                options.onProgress?.({
+                  phase: 'linking',
+                  current: done,
+                  total: totalPasses,
+                });
+              },
+              backpressure
+            );
+          }
+        }
+
+        // Re-open resolution edges this sync may have invalidated ELSEWHERE in
+        // the repo (CG-33). Everything above re-resolves references in the
+        // changed files; this covers the opposite direction — references in
+        // files the sync never touched whose answer depended on a definition
+        // that just appeared or disappeared. Without it a synced index never
+        // converges to a full rebuild: measured at 4.3% of distinct edges wrong
+        // on codegraph's own index, in both directions, mostly `calls`. The
+        // resurrected refs are pending rows, so the orphan sweep immediately
+        // below is what resolves them — batched, yielding, multi-pass, exactly
+        // as a full index resolves.
+        //
+        // `definitionDelta` is empty for a body-only edit, so the overwhelmingly
+        // common sync pays one branch. CODEGRAPH_NO_REBIND=1 disables it.
+        if (result.definitionDelta && process.env.CODEGRAPH_NO_REBIND !== '1') {
+          const tRebind = Date.now();
+          const rebound = this.orchestrator.resurrectStaleResolutionEdges(
+            result.definitionDelta,
+            result.changedFilePaths ?? []
+          );
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+            console.error(
+              `[phase-timing] sync-rebind: ${Date.now() - tRebind}ms (${result.definitionDelta.length} changed names, ${rebound} edges re-opened)`
+            );
           }
         }
 
@@ -766,13 +973,23 @@ export class CodeGraph {
             total: orphanCount,
           });
 
-          await this.resolveReferencesBatched((current, total) => {
-            options.onProgress?.({
-              phase: 'resolving',
-              current,
-              total,
-            });
-          });
+          await this.resolveReferencesBatched(
+            (current, total) => {
+              options.onProgress?.({
+                phase: 'resolving',
+                current,
+                total,
+              });
+            },
+            (done, totalPasses) => {
+              options.onProgress?.({
+                phase: 'linking',
+                current: done,
+                total: totalPasses,
+              });
+            },
+            backpressure
+          );
         }
 
         if (filesChanged || orphanCount > 0) {
@@ -803,8 +1020,24 @@ export class CodeGraph {
           }
         } catch { /* vocab is advisory — never fail a sync over it */ }
 
+        // A killed full index leaves this marker at `indexing`. Sync repairs
+        // missing files, pending refs, and (on open) dropped indexes, so a
+        // successful recovery must also close the metadata state (#1556).
+        const fullReconcile = !options.paths || options.paths.length === 0;
+        if (fullReconcile && this.getIndexState() === 'indexing') {
+          try { this.queries.setMetadata('index_state', 'complete'); } catch { /* advisory */ }
+        }
+
         return result;
       } finally {
+        // Mirror indexAll's teardown: stop the valve, then restore the
+        // auto-checkpoint interval (runMaintenance above already folded the
+        // WAL on the success path; on the error path SQLite replays it on
+        // the next open).
+        if (walValve) { walValve.stop(); await walValve.drain(); }
+        if (deferWal) {
+          try { this.db.setWalAutocheckpoint(priorAutocheckpoint); } catch { /* connection may be closing */ }
+        }
         this.fileLock.release();
       }
     });
@@ -835,8 +1068,8 @@ export class CodeGraph {
 
     this.watcher = new FileWatcher(
       this.projectRoot,
-      async () => {
-        const result = await this.sync();
+      async (paths?: string[]) => {
+        const result = await this.sync({ paths });
         // sync() returns this exact zero-shape iff it failed to acquire the
         // file lock (a real empty sync always has filesChecked > 0 because
         // scanDirectory ran). Surface that to the watcher as a typed error
@@ -930,6 +1163,43 @@ export class CodeGraph {
   }
 
   /**
+   * How far the last sync got and how many files it left behind — the cheapest
+   * marker of "has this index moved". One query; safe to call on every
+   * filesystem event a live viewer sees.
+   */
+  getIndexRevision(): { lastIndexedAt: number | null; fileCount: number } {
+    return this.queries.getIndexRevision();
+  }
+
+  /**
+   * Files re-indexed strictly after `since`, newest first — what a sync just
+   * picked up. `total` is the real count, `paths` is capped at `limit`.
+   */
+  getFilesIndexedSince(since: number, limit: number): { paths: string[]; total: number } {
+    return this.queries.getFilesIndexedSince(since, limit);
+  }
+
+  /**
+   * Forget everything held in memory about rows another process may have
+   * changed.
+   *
+   * The query layer keeps an LRU of nodes by id, invalidated by writes made
+   * through THIS instance — which is exactly right for a process that owns the
+   * index, and wrong for one that is only reading a database somebody else is
+   * writing. A long-lived reader (the `codegraph ui` server, a daemon holding a
+   * graph open across an agent's edits) will otherwise answer `getNode(id)`
+   * with a row a sync deleted minutes ago, while every SQL-backed query beside
+   * it reports the truth — a disagreement that reads as a bug in whichever
+   * screen shows both.
+   *
+   * Cheap (clearing a bounded Map) and safe to call whenever the database file
+   * looks like it moved.
+   */
+  dropReadCaches(): void {
+    this.queries.clearCache();
+  }
+
+  /**
    * Completeness of the last full index run. `'complete'` is the only good
    * state. `'indexing'` after the fact means a run was killed mid-index (OOM,
    * SIGKILL, liveness watchdog) and the on-disk index is truncated;
@@ -1001,8 +1271,33 @@ export class CodeGraph {
    * Resolve references in batches to keep memory bounded on large codebases.
    * Processes chunks of unresolved refs, persisting results after each batch.
    */
-  async resolveReferencesBatched(onProgress?: (current: number, total: number) => void): Promise<ResolutionResult> {
-    return this.resolver.resolveAndPersistBatched(onProgress);
+  async resolveReferencesBatched(
+    onProgress?: (current: number, total: number) => void,
+    onSynthesisProgress?: (done: number, total: number) => void,
+    // The WAL valve's writer-side backstop, threaded into the batch loop's
+    // pool-idle boundaries. Without it the valve's only lever during
+    // resolution is timer-driven passive checkpoints, which the pool's
+    // continuous reads keep perpetually partial — the WAL then accretes the
+    // whole phase's write volume (22GB on a 4.6GB DB at kernel scale).
+    backpressure?: () => Promise<void> | null
+  ): Promise<ResolutionResult> {
+    return this.resolver.resolveAndPersistBatched(onProgress, undefined, onSynthesisProgress, {
+      dbPath: this.db.getPath(),
+      // Bulk-edge-load hooks: on big runs the resolver drops the non-unique
+      // edge indexes for the batch loop and recreates them before synthesis
+      // (which reads kind-keyed). Concurrent readers (a daemon serving this
+      // project mid-index) stay CORRECT during the window — target/kind reads
+      // just degrade to scans until the recreate.
+      bulkEdgeLoad: {
+        begin: () => this.db.beginBulkEdgeLoad(),
+        end: () => this.db.endBulkEdgeLoad(),
+      },
+      refIndexLoad: {
+        begin: () => this.db.beginBulkRefLoad(),
+        end: () => this.db.endBulkRefLoad(),
+      },
+      backpressure,
+    });
   }
 
   /**
@@ -1040,6 +1335,7 @@ export class CodeGraph {
   getStats(): GraphStats {
     const stats = this.queries.getStats();
     stats.dbSizeBytes = this.db.getSize();
+    stats.walSizeBytes = this.db.getWalSizeBytes();
     return stats;
   }
 
@@ -1074,6 +1370,205 @@ export class CodeGraph {
   }
 
   /**
+   * Get many nodes by id in ONE round-trip (LRU-cache aware).
+   *
+   * The batch form of {@link getNode}. Anything resolving a list of edges to
+   * their endpoints — a caller list, a callee rail, an impact set — must use
+   * this rather than a `getNode` per edge: a symbol with 500 callers is 500
+   * queries otherwise. Ids that name nothing are simply absent from the map.
+   */
+  getNodesByIds(ids: readonly string[]): Map<string, Node> {
+    return this.queries.getNodesByIds(ids);
+  }
+
+  /**
+   * Every symbol carrying an exact qualified name.
+   *
+   * The identity that survives a re-index. A node's id contains its start line,
+   * so any edit ABOVE a symbol gives it a different id — anything that has to
+   * name the same symbol across two indexes (a saved trail, a bookmark, a
+   * review comment) has to key on this instead, and then disambiguate the
+   * result by kind and file. Index-backed; unlike
+   * {@link GraphQueryManager.findByQualifiedName} it takes no pattern and scans
+   * nothing.
+   */
+  getNodesByQualifiedName(qualifiedName: string): Node[] {
+    return this.queries.getNodesByQualifiedNameExact(qualifiedName);
+  }
+
+  /**
+   * Outgoing edges for many source nodes at once — the batch form of
+   * {@link getOutgoingEdges}. See {@link QueryBuilder.getOutgoingEdgesFrom}.
+   */
+  getOutgoingEdgesFrom(nodeIds: readonly string[], kinds?: Edge['kind'][]): Edge[] {
+    return this.queries.getOutgoingEdgesFrom(nodeIds, kinds);
+  }
+
+  /**
+   * Fan-in (incoming edge count) for many nodes at once — the "hub" signal,
+   * without a query per node. See {@link QueryBuilder.countIncomingEdges}.
+   */
+  getFanIn(ids: readonly string[]): Map<string, number> {
+    return this.queries.countIncomingEdges(ids);
+  }
+
+  /**
+   * Incoming edges for many target nodes at once — the mirror of
+   * {@link getOutgoingEdgesFrom}. See {@link QueryBuilder.getIncomingEdgesTo}.
+   */
+  getIncomingEdgesTo(nodeIds: readonly string[], kinds?: Edge['kind'][]): Edge[] {
+    return this.queries.getIncomingEdgesTo(nodeIds, kinds);
+  }
+
+  /**
+   * Fan-out (outgoing edge count) for many nodes at once — the mirror of
+   * {@link getFanIn}. See {@link QueryBuilder.countOutgoingEdges}.
+   */
+  getFanOut(ids: readonly string[]): Map<string, number> {
+    return this.queries.countOutgoingEdges(ids);
+  }
+
+  /**
+   * Symbols nothing in the index points at, by kind — the candidate set the
+   * dead code report (`src/graph/dead-code.ts`) applies its exclusions to.
+   *
+   * Every edge kind except `contains` counts as a reference, so a method is
+   * not "reached" by the class that holds it. An unreferenced symbol is not
+   * yet a dead one: see {@link buildDeadCodeReport}.
+   */
+  getUnreferencedNodes(
+    kinds: readonly Node['kind'][],
+    limit: number
+  ): Array<{ node: Node; generated: boolean }> {
+    return this.queries.getUnreferencedNodes(kinds, limit);
+  }
+
+  /**
+   * Which of the given names are carried by more than one symbol, at least one
+   * of which something references — the names a "nothing reaches this" claim
+   * must not be made about, because the resolver may have picked the twin.
+   */
+  getAmbiguousReferencedNames(names: Iterable<string>): Set<string> {
+    return this.queries.getAmbiguousReferencedNames(names);
+  }
+
+  /**
+   * Which of the given languages this index records an export marker for. A
+   * language with none has no "reachable from outside" signal at all.
+   */
+  getLanguagesWithExports(languages: Iterable<string>): Set<string> {
+    return this.queries.getLanguagesWithExports(languages);
+  }
+
+  /**
+   * Which of the given names the index holds an unresolved reference to — the
+   * resolver saw the name and could not decide what it meant. A symbol with
+   * such a name can never be called unreferenced.
+   */
+  getUnresolvedNamesAmong(names: Iterable<string>): Set<string> {
+    return this.queries.getUnresolvedNamesAmong(names);
+  }
+
+  /**
+   * The symbols with the most distinct dependents, most first — the index's
+   * hubs. Distinct dependents, not edges: a helper called forty times from one
+   * function has one dependent, and it is dependents a blast radius grows from.
+   */
+  getTopDependedOn(limit: number): Array<{ nodeId: string; dependents: number }> {
+    return this.queries.getTopDependedOn(limit);
+  }
+
+  /**
+   * The graph's executable roots — files that run something at module level (a
+   * CLI, a worker entry, a script), ranked by calls x the number of other files
+   * they reach. A statement at the top level of a file is recorded as an edge
+   * out of the *file* node, which is what makes these visible at all.
+   */
+  getTopCallingFiles(
+    limit: number
+  ): Array<{ nodeId: string; filePath: string; calls: number; reaches: number; score: number }> {
+    return this.queries.getTopCallingFiles(limit);
+  }
+
+  /**
+   * How many other files depend on each of the given files, counted through
+   * their symbols (an `imports` edge points at the symbol, not the file).
+   * A zero means nothing else in the index reaches into that file.
+   */
+  getFileDependentCounts(filePaths: string[]): Map<string, number> {
+    return new Map(
+      this.queries.getFileDependentCounts(filePaths).map((row) => [row.filePath, row.dependents])
+    );
+  }
+
+  /**
+   * How far each of the given files reaches out: distinct other files their
+   * symbols touch, and how many references that is. The mirror of
+   * {@link getFileDependentCounts}; a test file's reach is what it exercises.
+   */
+  getFileReachCounts(filePaths: string[]): Map<string, { reaches: number; refs: number }> {
+    return new Map(
+      this.queries
+        .getFileReachCounts(filePaths)
+        .map((row) => [row.filePath, { reaches: row.reaches, refs: row.refs }])
+    );
+  }
+
+  /** The `file` nodes for the given paths, in one query. */
+  getFileNodes(filePaths: string[]): Node[] {
+    return this.queries.getFileNodes(filePaths);
+  }
+
+  /**
+   * Roll the edge table up to module granularity, for a file → module
+   * assignment the caller decides.
+   *
+   * The architecture map's single query: cross-module edge counts by kind,
+   * the `declared` subset of each (see {@link QueryBuilder.aggregateModuleGraph}),
+   * and the busiest symbol pairs behind each link. Read-only, and bounded by
+   * the number of modules rather than the number of edges.
+   */
+  getModuleAggregation(
+    assignments: ReadonlyArray<{ filePath: string; module: string }>,
+    options: {
+      kinds: readonly Edge['kind'][];
+      minConfidence: number;
+      topPairsPerLink: number;
+      pairKinds: readonly Edge['kind'][];
+    }
+  ): ReturnType<QueryBuilder['aggregateModuleGraph']> {
+    return this.queries.aggregateModuleGraph(assignments, options);
+  }
+
+  /**
+   * Every ordered pair of files where one reaches into the other — the edge
+   * list a cycle finder runs on. See {@link QueryBuilder.getCrossFileDependencyPairs}.
+   */
+  getFileDependencyPairs(minConfidence = 0): Array<{ source: string; target: string }> {
+    return this.queries.getCrossFileDependencyPairs(minConfidence);
+  }
+
+  /**
+   * References from a symbol that never resolved to an indexed node — the
+   * calls and type mentions that leave the index. Lets a reader account for
+   * the call sites that have no callee row instead of implying there are none.
+   */
+  getUnresolvedReferencesFrom(nodeId: string): UnresolvedReference[] {
+    return this.queries.getUnresolvedReferencesFrom(nodeId);
+  }
+
+  /**
+   * The same, for every symbol in a FILE at once, in line order.
+   *
+   * One indexed lookup instead of one per symbol — the whole-file reader needs
+   * it for every line it draws. See
+   * {@link QueryBuilder.getUnresolvedReferencesInFile}.
+   */
+  getUnresolvedReferencesInFile(filePath: string, limit?: number): UnresolvedReference[] {
+    return this.queries.getUnresolvedReferencesInFile(filePath, limit);
+  }
+
+  /**
    * Get all nodes in a file
    */
   getNodesInFile(filePath: string): Node[] {
@@ -1099,6 +1594,20 @@ export class CodeGraph {
   /** Nodes whose name starts with `prefix` (index range scan, capped). */
   getNodesByNamePrefix(prefix: string, limit = 20): Node[] {
     return this.queries.getNodesByNamePrefix(prefix, limit);
+  }
+
+  /**
+   * Nodes whose name CONTAINS `substring` (LIKE scan, ASCII-case-insensitive,
+   * shortest-first). The camel-infix lookup FTS can't do — `profileInfo`
+   * inside `getProfileInfoV2` is one FTS token (#1196).
+   */
+  getNodesByNameSubstring(
+    substring: string,
+    options: { kinds?: NodeKind[]; limit?: number; excludePrefix?: boolean } = {}
+  ): Node[] {
+    return this.queries
+      .findNodesByNameSubstring(substring, options)
+      .map((r) => r.node);
   }
 
   /**
@@ -1298,7 +1807,16 @@ export class CodeGraph {
    * null when fewer than 3 valid (non-test) routes exist.
    */
   getRoutingManifest(limit?: number): {
-    entries: Array<{ url: string; handler: string; handlerFile: string; handlerLine: number; handlerKind: string }>;
+    entries: Array<{
+      url: string;
+      handler: string;
+      handlerFile: string;
+      handlerLine: number;
+      handlerKind: string;
+      routeId: string;
+      routeFile: string;
+      routeLine: number;
+    }>;
     topHandlerFile: string | null;
     topHandlerFileCount: number;
     totalRoutes: number;
@@ -1340,6 +1858,37 @@ export class CodeGraph {
    */
   getFiles(): FileRecord[] {
     return this.queries.getAllFiles();
+  }
+
+  /**
+   * A `(path) => boolean` generated-file test over a BOUNDED candidate list,
+   * unioning the index-time content-banner flag with the filename convention
+   * (#1500). One query up front, O(1) per call after — built for use inside a
+   * ranking comparator, where re-querying per comparison would be quadratic.
+   *
+   * Pass every path you might ask about; a path outside the list falls back to
+   * the filename check alone.
+   */
+  generatedFilePredicate(filePaths: Iterable<string>): (filePath: string) => boolean {
+    return this.queries.generatedPredicateFor(filePaths);
+  }
+
+  /**
+   * A `(path) => boolean` ambient-declaration test over a BOUNDED candidate
+   * list: true for a file that declares nothing but types, originates no call
+   * edge, and that nothing in the index depends on — an ambient `.d.ts` of
+   * global shims, vendored typings, module augmentation (CG-28). Structural
+   * rather than extension-based, and deliberately narrow: see
+   * `QueryBuilder.getAmbientDeclarationPathsAmong` for why each condition is
+   * there, in particular why a `types.ts` the codebase imports is NOT flagged.
+   */
+  ambientDeclarationFilePredicate(filePaths: Iterable<string>): (filePath: string) => boolean {
+    return this.queries.ambientDeclarationPredicateFor(filePaths);
+  }
+
+  /** How many indexed files are flagged tool-generated. Reported by `status`. */
+  getGeneratedFileCount(): number {
+    return this.queries.countGeneratedFiles();
   }
 
   // ===========================================================================
@@ -1515,7 +2064,17 @@ export class CodeGraph {
   }
 
   /**
-   * Find dead code (unreferenced symbols)
+   * Find unreferenced symbols — the RAW candidate set.
+   *
+   * Non-exported symbols of the given kinds with no incoming edge but
+   * `contains`. That is a fact, not a claim: on this engine's own index it
+   * returns ~2 500 symbols, of which about 20 are actually unreachable. The
+   * rest are overrides, framework registrations, mis-resolved twins and
+   * references the extractor never recorded.
+   *
+   * For a list anybody should act on, use `buildDeadCodeReport` from
+   * `src/graph/dead-code.ts`, which applies the exclusions and counts every one
+   * of them. This method is kept as-is because it is a published API.
    *
    * @param kinds - Node kinds to check (default: functions, methods, classes)
    * @returns Array of unreferenced nodes
@@ -1571,7 +2130,23 @@ export class CodeGraph {
     query: string,
     options?: FindRelevantContextOptions
   ): Promise<Subgraph> {
-    return this.contextBuilder.findRelevantContext(query, options);
+    // Segment-vocab supplement: FTS keeps camelCase names as single tokens,
+    // so a word-level query ("auto-scroll to bottom") can never reach
+    // `pinFeedIfNearBottom` through search alone. Resolve the query's words
+    // against name_segment_vocab (same precision rules as the prompt hook:
+    // co-occurrence, else rare singles, verified against live nodes) and hand
+    // the names down as dampened exact-name seeds. Callers that pass their
+    // own seedNames keep them; failures degrade to no supplement.
+    let seedNames = options?.seedNames;
+    if (seedNames === undefined) {
+      try {
+        seedNames = this.getSegmentMatches(extractSegmentSearchWords(query), 8)
+          .map((m) => m.name);
+      } catch {
+        seedNames = [];
+      }
+    }
+    return this.contextBuilder.findRelevantContext(query, { ...options, seedNames });
   }
 
   /**

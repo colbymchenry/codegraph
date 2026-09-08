@@ -187,4 +187,45 @@ on_event(Ev) -> {seen, Ev}.
     const rows = await synthEdges(dir);
     expect(rows.map((r) => path.basename(r.tf))).toEqual(['public_impl.erl']);
   });
+
+  it('counts dispatch-site arity across <<binary>> literals (#1358)', async () => {
+    fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'src', 'codec_behaviour.erl'),
+      `-module(codec_behaviour).
+
+-callback decode(binary(), list()) -> term().
+
+-export([run/3]).
+
+run(Mod, Bin, Opts) ->
+    Mod:decode(Bin, Opts).
+`
+    );
+    fs.writeFileSync(
+      path.join(dir, 'src', 'json_codec.erl'),
+      `-module(json_codec).
+-behaviour(codec_behaviour).
+-export([decode/2]).
+
+decode(Bin, _Opts) -> Bin.
+`
+    );
+    // The dispatch site passes a binary literal whose commas previously
+    // inflated the computed arity (4 instead of 2), so the edge was dropped.
+    fs.writeFileSync(
+      path.join(dir, 'src', 'probe.erl'),
+      `-module(probe).
+-export([go/1]).
+
+go(Mod) ->
+    Mod:decode(<<1,2,3>>, []).
+`
+    );
+
+    const rows = await synthEdges(dir);
+    const fromProbe = rows.filter((r) => r.source === 'go').map((r) => `${path.basename(r.tf)}:${r.target}`);
+    expect(fromProbe).toEqual(['json_codec.erl:decode']);
+    expect(rows.every((r) => r.via === 'codec_behaviour:decode/2' || r.source !== 'go')).toBe(true);
+  });
 });

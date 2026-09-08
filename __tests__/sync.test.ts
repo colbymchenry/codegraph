@@ -149,6 +149,28 @@ describe('Sync Module', () => {
         expect(result.filesRemoved).toBe(0);
         expect(result.filesChecked).toBeGreaterThan(0);
       });
+
+      it('persists an oversized skipped file so later syncs do not retry it (#1557)', async () => {
+        const filePath = path.join(testDir, 'src', 'oversized.ts');
+        fs.writeFileSync(filePath, 'const value = 1;\n'.repeat(70_000));
+
+        const first = await cg.sync();
+        expect(first.filesAdded).toBe(1);
+        expect(cg.getFiles().find((f) => f.path === 'src/oversized.ts')?.errors?.[0]?.code).toBe('size_exceeded');
+
+        const second = await cg.sync();
+        expect(second.filesAdded).toBe(0);
+        expect(second.filesModified).toBe(0);
+      });
+
+      it('marks a successfully recovered indexing state complete (#1556)', async () => {
+        (cg as any).queries.setMetadata('index_state', 'indexing');
+        await cg.sync({ paths: ['src/index.ts'] });
+        expect(cg.getIndexState()).toBe('indexing');
+
+        await cg.sync();
+        expect(cg.getIndexState()).toBe('complete');
+      });
     });
   });
 
@@ -755,5 +777,107 @@ describe('Sync Module', () => {
       // callee_two is untouched by the rename and its edge survives.
       expect(callerCount('callee_two')).toBe(1);
     });
+  });
+});
+
+describe('Scoped sync parity (#watcher-scoped)', () => {
+  let testDir: string;
+  let cg: CodeGraph;
+
+  const snapshot = (g: CodeGraph): string => {
+    // Natural-key snapshot of the whole graph, mirroring dump-graph.mjs at
+    // unit scale: scoped and full sync must land the DB in the same state.
+    const nodes = g
+      .searchNodes('', { limit: 100000 })
+      .map((r) => r.node)
+      .map((n) => `${n.kind}|${n.qualifiedName}|${n.filePath}|${n.startLine}`)
+      .sort()
+      .join('\n');
+    return nodes;
+  };
+
+  beforeEach(async () => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-sync-scoped-'));
+    const srcDir = path.join(testDir, 'src');
+    fs.mkdirSync(srcDir);
+    fs.writeFileSync(path.join(srcDir, 'a.ts'), `export function alpha() { return beta(); }`);
+    fs.writeFileSync(path.join(srcDir, 'b.ts'), `export function beta() { return 1; }`);
+    cg = CodeGraph.initSync(testDir);
+    await cg.indexAll();
+  });
+
+  afterEach(() => {
+    cg?.destroy();
+    if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('a scoped modify lands the same graph as a full sync of the same edit', async () => {
+    fs.writeFileSync(path.join(testDir, 'src', 'b.ts'), `export function beta() { return 2; }\nexport function gamma() { return 3; }`);
+    const scoped = await cg.sync({ paths: ['src/b.ts'] });
+    expect(scoped.filesModified).toBe(1);
+    const scopedSnap = snapshot(cg);
+
+    // Re-apply the same end state through a FULL sync from the same start
+    // state: revert, full-sync, edit again, full-sync.
+    fs.writeFileSync(path.join(testDir, 'src', 'b.ts'), `export function beta() { return 1; }`);
+    await cg.sync();
+    fs.writeFileSync(path.join(testDir, 'src', 'b.ts'), `export function beta() { return 2; }\nexport function gamma() { return 3; }`);
+    const full = await cg.sync();
+    expect(full.filesModified).toBe(1);
+    expect(snapshot(cg)).toBe(scopedSnap);
+  });
+
+  it('a scoped delete removes the file and resurrects cross-file refs like a full sync', async () => {
+    fs.rmSync(path.join(testDir, 'src', 'b.ts'));
+    const scoped = await cg.sync({ paths: ['src/b.ts'] });
+    expect(scoped.filesRemoved).toBe(1);
+    expect(scoped.filesChecked).toBe(1); // checked paths, not found files (#449 lock signature)
+    const gone = cg.searchNodes('beta');
+    expect(gone.filter((r) => r.node.filePath === 'src/b.ts').length).toBe(0);
+  });
+
+  it('a scoped add indexes the new file', async () => {
+    fs.writeFileSync(path.join(testDir, 'src', 'c.ts'), `export function delta() { return 4; }`);
+    const scoped = await cg.sync({ paths: ['src/c.ts'] });
+    expect(scoped.filesAdded).toBe(1);
+    expect(cg.searchNodes('delta').length).toBeGreaterThan(0);
+  });
+
+  it('scoped sync ignores paths outside the change without touching them', async () => {
+    fs.writeFileSync(path.join(testDir, 'src', 'a.ts'), `export function alpha() { return beta() + 1; }`);
+    const scoped = await cg.sync({ paths: ['src/a.ts'] });
+    expect(scoped.filesModified).toBe(1);
+    expect(scoped.filesRemoved).toBe(0);
+    // b.ts untouched and still present
+    expect(cg.searchNodes('beta').length).toBeGreaterThan(0);
+  });
+
+  it('a scoped path that codegraph.json now excludes is removed, never re-parsed (#1590)', async () => {
+    // The daemon's watcher hands sync the exact edited path. If the project's
+    // scope changed underneath it, that path must be treated the way the full
+    // scan treats it — out of scope, hence gone — never parsed on trust.
+    const cfg = path.join(testDir, 'codegraph.json');
+    fs.writeFileSync(cfg, JSON.stringify({ exclude: ['src/b.ts'] }));
+    fs.writeFileSync(path.join(testDir, 'src', 'b.ts'), `export function beta() { return 2; }\nexport function gamma() { return 3; }`);
+    const scoped = await cg.sync({ paths: ['src/b.ts'] });
+    expect(scoped.filesRemoved).toBe(1);
+    expect(scoped.filesModified).toBe(0);
+    expect(scoped.filesAdded).toBe(0);
+    expect(cg.searchNodes('gamma').length).toBe(0);
+    expect(cg.searchNodes('beta').filter((r) => r.node.filePath === 'src/b.ts').length).toBe(0);
+    // Idempotent: the file stays out on a repeat scoped sync.
+    const again = await cg.sync({ paths: ['src/b.ts'] });
+    expect(again.filesRemoved).toBe(0);
+    expect(again.filesAdded).toBe(0);
+
+    // Dropping the exclude readmits it through the same scoped path. The
+    // scope matcher is mtime-keyed, so give the rewrite a distinct mtime even
+    // on a coarse-timestamp filesystem.
+    fs.writeFileSync(cfg, JSON.stringify({}));
+    const later = new Date(Date.now() + 5000);
+    fs.utimesSync(cfg, later, later);
+    const readmitted = await cg.sync({ paths: ['src/b.ts'] });
+    expect(readmitted.filesAdded).toBe(1);
+    expect(cg.searchNodes('gamma').length).toBe(1);
   });
 });

@@ -28,7 +28,15 @@ import { isGeneratedFile } from '../extraction/generated-detection';
 import { stripCommentsForRegex } from './strip-comments';
 import { cFnPointerDispatchEdges } from './c-fnptr-synthesizer';
 import { goframeRouteEdges } from './goframe-synthesizer';
+import { expoRouterReturnEdges } from './expo-router-synthesizer';
+import { nextLinkEdges } from './next-router-synthesizer';
+import { reactRouterLinkEdges } from './react-router-synthesizer';
+import { tanstackLinkEdges } from './tanstack-router-synthesizer';
+import { vueRouterLinkEdges } from './vue-router-synthesizer';
+import { svelteKitLinkEdges, svelteKitPageComponentEdges } from './sveltekit-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
+import { crossTierEdges } from './tier-synthesizer';
+import { enclosingFn, makeLineAt } from './synth-utils';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -109,33 +117,6 @@ function sliceLines(content: string, startLine?: number, endLine?: number): stri
   return content.split('\n').slice(startLine - 1, endLine).join('\n');
 }
 
-/**
- * Per-match line resolver over `src`, 1-based at `baseLine`. The inline
- * `src.slice(0, idx).split('\n').length` idiom is O(source-length) PER MATCH,
- * which goes quadratic on a match-dense source (a generated function full of
- * `.push(` calls re-scanned tens of thousands of times was most of the #1235
- * indexing wedge). Builds the newline index once — lazily, since most sources
- * never produce a match — then answers each call with a binary search.
- */
-function makeLineAt(src: string, baseLine: number): (idx: number) => number {
-  let nl: number[] | null = null;
-  return (idx: number) => {
-    if (!nl) {
-      nl = [];
-      for (let i = src.indexOf('\n'); i !== -1; i = src.indexOf('\n', i + 1)) nl.push(i);
-    }
-    // Count newlines strictly before idx.
-    let lo = 0;
-    let hi = nl.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (nl[mid]! < idx) lo = mid + 1;
-      else hi = mid;
-    }
-    return baseLine + lo;
-  };
-}
-
 function registrarField(src: string): string | null {
   const m = src.match(/this\.(\w+)\.(?:add|push|set)\(/);
   return m ? m[1]! : null;
@@ -147,21 +128,6 @@ function dispatcherField(src: string): string | null {
   const forEach = src.match(/this\.(\w+)\.forEach\(/);
   if (forEach) return forEach[1]!;
   return null;
-}
-
-const FN_KINDS = new Set(['method', 'function', 'component']);
-
-/** Innermost function/method node whose line range contains `line`. */
-function enclosingFn(nodesInFile: Node[], line: number): Node | null {
-  let best: Node | null = null;
-  for (const n of nodesInFile) {
-    if (!FN_KINDS.has(n.kind)) continue;
-    const end = n.endLine ?? n.startLine;
-    if (n.startLine <= line && end >= line) {
-      if (!best || n.startLine >= best.startLine) best = n; // prefer the tightest (latest-starting) encloser
-    }
-  }
-  return best;
 }
 
 /**
@@ -401,8 +367,23 @@ async function reactRenderEdges(queries: QueryBuilder, ctx: ResolutionContext, o
   let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
+  // A class can only emit here if it CONTAINS a method named `render` — so one
+  // indexed name lookup bounds the candidate set up front, and the class scan
+  // below skips everything else before its per-class edge/node queries. On a
+  // repo with few/no render methods (any non-React codebase) this collapses
+  // the pass from every-class fan-out to ~zero DB work, with identical output:
+  // the skipped classes fail the same `render` check today, just after paying
+  // for their children. (Not a language gate: `render` + `this.setState(` in
+  // Java — e.g. Litho — legitimately matches today and still does.)
+  const renderOwners = new Set<string>();
+  for (const n of ctx.getNodesByName('render')) {
+    if (n.kind !== 'method') continue;
+    for (const e of queries.getIncomingEdges(n.id, ['contains'])) renderOwners.add(e.source);
+  }
+  if (renderOwners.size === 0) return edges;
   for (const cls of queries.iterateNodesByKind('class')) {
     if ((++scanned255 & 63) === 0) await onYield();
+    if (!renderOwners.has(cls.id)) continue;
     const children = queries.getOutgoingEdges(cls.id, ['contains'])
       .map((e) => queries.getNodeById(e.target))
       .filter((n): n is Node => !!n && n.kind === 'method');
@@ -1029,21 +1010,35 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
   let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
-  const methodsOf = (classId: string): Node[] =>
-    queries
+  // Memoized: a popular base interface's method list is otherwise re-fetched
+  // once per implementer (dubbo-style hub interfaces have hundreds), and the
+  // memo only ever serves reads. Same rows, same order — byte-identical.
+  const methodsMemo = new Map<string, Node[]>();
+  const methodsOf = (classId: string): Node[] => {
+    const hit = methodsMemo.get(classId);
+    if (hit) return hit;
+    const methods = queries
       .getOutgoingEdges(classId, ['contains'])
       .map((e) => queries.getNodeById(e.target))
       .filter((n): n is Node => !!n && n.kind === 'method');
+    methodsMemo.set(classId, methods);
+    return methods;
+  };
   // Concrete-side kinds vary by language: `class` covers Java / Kotlin /
   // C# / TS / Swift-classes / Scala-classes; `struct` covers Swift value
   // types that conform to protocols. Iterate both.
-  const concreteKinds = ['class', 'struct'] as const;
+  const concreteKinds = ['class', 'struct', 'union'] as const;
   for (const kind of concreteKinds) {
   for (const cls of queries.iterateNodesByKind(kind)) {
     if ((++scanned255 & 63) === 0) await onYield();
+    // A class can only emit here if it HAS a supertype edge — check that
+    // (one edge query) before materializing its methods: most classes in a
+    // typical graph extend/implement nothing and skip in one hop.
+    const sups = queries.getOutgoingEdges(cls.id, ['implements', 'extends']);
+    if (sups.length === 0) continue;
     const implMethods = methodsOf(cls.id).filter((n) => IFACE_OVERRIDE_LANGS.has(n.language));
     if (implMethods.length === 0) continue;
-    for (const sup of queries.getOutgoingEdges(cls.id, ['implements', 'extends'])) {
+    for (const sup of sups) {
       const base = queries.getNodeById(sup.target);
       if (!base || !IFACE_OVERRIDE_LANGS.has(base.language) || base.id === cls.id) continue;
       // Group impl methods by name to handle OVERLOADS: an interface `list()` and
@@ -1212,7 +1207,12 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
     if ((++scanned & 255) === 0) await onYield(); // #1091: yield mid-scan on huge graphs
     const content = ctx.readFile(file);
     if (!content || (!content.includes('</') && !content.includes('/>'))) continue; // JSX-file gate
-    const parents = ctx.getNodesInFile(file).filter((n) => PARENT_KINDS.has(n.kind));
+    // File-level language gate, not merely a project-level one: mixed C/JS
+    // monorepos must not interpret `"<Foo/>"` inside C as JSX (#1560).
+    const parents = ctx.getNodesInFile(file).filter(
+      (n) => PARENT_KINDS.has(n.kind) && JS_FAMILY.includes(n.language)
+    );
+    if (parents.length === 0) continue;
     for (const parent of parents) {
       const src = sliceLines(content, parent.startLine, parent.endLine);
       if (!src || (!src.includes('</') && !src.includes('/>'))) continue;
@@ -1371,10 +1371,13 @@ async function vueTemplateEdges(ctx: ResolutionContext, onYield: MaybeYield): Pr
  *     DeviceEventEmitter.addListener("locationUpdate", handler);
  *
  * Synthesize: native dispatch site → JS handler, keyed by the literal
- * event name. Only matches NAMED handlers (the existing `ON_RE` named-
- * capture form). Inline arrow handlers like `addListener('x', d => …)`
- * aren't named at extraction time and would need link-through-body
- * support; matches the deliberate scope of the in-language synthesizer.
+ * event name. A NAMED handler (`addListener('x', handleX)`) is the target
+ * when it is a node; an unnamed one — a parameter passed through, or an
+ * inline `(data) => {…}` written in a `useEffect` — is attributed to the
+ * enclosing function, where the event demonstrably lands. (The in-language
+ * synthesizer stays named-only; this channel pairs across a language
+ * boundary on a literal, which is the evidence that makes the wider
+ * attribution safe.)
  *
  * Provenance `'heuristic'`, synthesizedBy `'rn-event-channel'`.
  */
@@ -1483,6 +1486,9 @@ async function rnEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Promis
       // function (the abstraction layer), giving a reachability-correct
       // hop even when the actual user-side handler lives one call up.
       const ADDLISTENER_ANY = /\.(?:on|once|addListener)\(\s*['"]([^'"]+)['"]\s*,\s*([A-Za-z_][\w.]*)/g;
+      // The inline form: `.addListener('x', (data) => {…})` / `function () {…}`.
+      const ADDLISTENER_INLINE =
+        /\.(?:on|once|addListener)\(\s*['"]([^'"]+)['"]\s*,\s*(?:async\s*)?(?:\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>|function\s*\()/g;
       ADDLISTENER_ANY.lastIndex = 0;
       let m: RegExpExecArray | null;
       while ((m = ADDLISTENER_ANY.exec(content))) {
@@ -1524,6 +1530,23 @@ async function rnEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Promis
         if (!targetId) continue;
         const map = jsHandlersByEvent.get(event) ?? new Map<string, string>();
         map.set(targetId, `${file}:${lineOf(m.index)}`);
+        jsHandlersByEvent.set(event, map);
+      }
+      // Inline listeners — the shape a React component registers inside a
+      // `useEffect`: `nativeEmitter.addListener('onCaptureComplete', (data) =>
+      // { … router.push('/review') })`. There is no handler symbol to name,
+      // so the subscription is attributed to the enclosing function exactly
+      // as the unnamed-argument form above is: the native event lands in that
+      // component, and its body is where a reader looks next. This channel
+      // only — the in-language synthesizer keeps its named-handler policy.
+      ADDLISTENER_INLINE.lastIndex = 0;
+      while ((m = ADDLISTENER_INLINE.exec(content))) {
+        const event = m[1];
+        if (!event) continue;
+        const enclosing = enclosingFn(nodesInFile, lineOf(m.index));
+        if (!enclosing) continue;
+        const map = jsHandlersByEvent.get(event) ?? new Map<string, string>();
+        if (!map.has(enclosing.id)) map.set(enclosing.id, `${file}:${lineOf(m.index)}`);
         jsHandlersByEvent.set(event, map);
       }
     }
@@ -1783,6 +1806,18 @@ async function mybatisJavaXmlEdges(queries: QueryBuilder, onYield: MaybeYield): 
   let scanned255 = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
+  // Collect the XML side FIRST (mapper `<select id=…>` statements extracted as
+  // xml-language method nodes): if the project has none — every Java+XML repo
+  // that doesn't use MyBatis — return before paying the full java-method
+  // stream below. Same rowid stream order as matching inline, so the edge
+  // output is byte-identical when mappers do exist.
+  const xmlMethods: Node[] = [];
+  for (const m of queries.iterateNodesByKind('method')) {
+    if ((++scanned255 & 63) === 0) await onYield();
+    if (m.language === 'xml') xmlMethods.push(m);
+  }
+  if (xmlMethods.length === 0) return edges;
+
   // Index Java methods by `<ClassName>::<methodName>` for O(1) lookup.
   const javaIndex = new Map<string, Node[]>();
   for (const m of queries.iterateNodesByKind('method')) {
@@ -1797,9 +1832,8 @@ async function mybatisJavaXmlEdges(queries: QueryBuilder, onYield: MaybeYield): 
     if (arr) arr.push(m); else javaIndex.set(key, [m]);
   }
 
-  for (const xml of queries.iterateNodesByKind('method')) {
+  for (const xml of xmlMethods) {
     if ((++scanned255 & 63) === 0) await onYield();
-    if (xml.language !== 'xml') continue;
     // Qualified name: `<namespace>::<id>`. Extract the simple class name.
     const colonIdx = xml.qualifiedName.lastIndexOf('::');
     if (colonIdx < 0) continue;
@@ -2020,11 +2054,16 @@ async function svelteKitLoadEdges(ctx: ResolutionContext, onYield: MaybeYield): 
       const loaderFile = `${dir}${prefix}${ext}`;
       if (!allFiles.has(loaderFile)) continue;
       for (const hook of ctx.getNodesInFile(loaderFile)) {
-        if (!HOOK_KINDS.has(hook.kind) || !HOOKS.has(hook.name)) continue;
+        // `load` and `actions` by name, and every function the loader file
+        // declares — a form action is an arrow inside `actions`, and it is a
+        // node of its own (`default`, `logout`), where the redirect that ends
+        // the submission is actually written.
+        const named = HOOK_KINDS.has(hook.kind) && HOOKS.has(hook.name);
+        if (!named && hook.kind !== 'function' && hook.kind !== 'method') continue;
         edges.push({
           source: page.id,
           target: hook.id,
-          kind: 'references',
+          kind: 'calls',
           line: page.startLine,
           provenance: 'heuristic',
           metadata: {
@@ -2963,6 +3002,10 @@ const ERLANG_BEHAVIOUR_FANOUT_CAP = 24;
  */
 function erlangArityAt(src: string, openIdx: number): number {
   let depth = 1;
+  // `<<1,2,3>>` binary literals: commas inside are element separators, not
+  // argument separators. Tracked separately from bracket depth because the
+  // single-char `<`/`>` comparison operators must stay inert (#1358).
+  let binDepth = 0;
   let commas = 0;
   let sawArg = false;
   const limit = Math.min(src.length, openIdx + 4000);
@@ -2983,13 +3026,15 @@ function erlangArityAt(src: string, openIdx: number): number {
       sawArg = true;
       continue;
     }
+    if (ch === '<' && src[i + 1] === '<') { binDepth++; i++; sawArg = true; continue; }
+    if (ch === '>' && src[i + 1] === '>' && binDepth > 0) { binDepth--; i++; continue; }
     if (ch === '(' || ch === '[' || ch === '{') { depth++; sawArg = true; continue; }
     if (ch === ')' || ch === ']' || ch === '}') {
       depth--;
       if (depth === 0) return sawArg ? commas + 1 : 0;
       continue;
     }
-    if (ch === ',' && depth === 1) { commas++; continue; }
+    if (ch === ',' && depth === 1 && binDepth === 0) { commas++; continue; }
     if (!/\s/.test(ch)) sawArg = true;
   }
   return -1;
@@ -3092,7 +3137,7 @@ async function nixOptionPathEdges(queries: QueryBuilder, onYield: MaybeYield): P
   // own namespace (`attrsOf (submodule { options = ...; })`) — its internals
   // are not globally addressable, so the sentinel blocks registration below it
   // while still excluding the region from write candidates.
-  const SUBMODULE = ' submodule';
+  const SUBMODULE = '\u0000submodule';
   const decls = new Map<string, Rec[]>();
   const writes: Rec[] = [];
   const register = (path: string[], rec: Rec) => {
@@ -3220,12 +3265,18 @@ async function erlangBehaviourDispatchEdges(queries: QueryBuilder, ctx: Resoluti
   }
   if (declaringBehaviours.size === 0) return [];
 
-  // Implementer target lookup, lazy per (behaviour, fn): implementers come
-  // from the `implements` edges extraction resolved, and the target is the
-  // implementer module's own exported `fn` function node.
+  // Implementer target lookup, lazy per (behaviour, fn, arity): implementers
+  // come from the `implements` edges extraction resolved, and the target is
+  // the implementer module's own exported `fn` node OF THE SITE'S ARITY —
+  // function qualifiedNames carry arity (`mod::fn/2`, #1610), so the arity the
+  // dispatch site used selects among same-named definitions.
   const targetCache = new Map<string, Node[]>();
-  const targetsOf = (behaviour: Node, fn: string): Node[] => {
-    const cacheKey = `${behaviour.id}#${fn}`;
+  const qnArity = (qn: string): number => {
+    const m = /\/(\d{1,3})$/.exec(qn);
+    return m ? Number(m[1]) : -1;
+  };
+  const targetsOf = (behaviour: Node, fn: string, arity: number): Node[] => {
+    const cacheKey = `${behaviour.id}#${fn}/${arity}`;
     let targets = targetCache.get(cacheKey);
     if (targets) return targets;
     targets = [];
@@ -3234,7 +3285,13 @@ async function erlangBehaviourDispatchEdges(queries: QueryBuilder, ctx: Resoluti
       if (!impl || impl.language !== 'erlang' || impl.kind !== 'namespace') continue;
       const fnNode = ctx
         .getNodesInFile(impl.filePath)
-        .find((n) => n.kind === 'function' && n.name === fn && n.isExported !== false);
+        .find(
+          (n) =>
+            n.kind === 'function' &&
+            n.name === fn &&
+            qnArity(n.qualifiedName) === arity &&
+            n.isExported !== false,
+        );
       if (fnNode) targets.push(fnNode);
     }
     targetCache.set(cacheKey, targets);
@@ -3263,7 +3320,7 @@ async function erlangBehaviourDispatchEdges(queries: QueryBuilder, ctx: Resoluti
       const behaviours = declaringBehaviours.get(`${fn}/${arity}`);
       if (!behaviours || behaviours.length !== 1) continue; // unknown or ambiguous
       const behaviour = behaviours[0]!;
-      const targets = targetsOf(behaviour, fn);
+      const targets = targetsOf(behaviour, fn, arity);
       if (targets.length === 0 || targets.length > ERLANG_BEHAVIOUR_FANOUT_CAP) continue;
       const line = safe.slice(0, m.index).split('\n').length;
       const disp = enclosingFn(nodesInFile, line);
@@ -3446,7 +3503,140 @@ async function laravelEventEdges(ctx: ResolutionContext, onYield: MaybeYield): P
  * Sidekiq Worker.perform_async → #perform + Laravel event(new X) → listener handle).
  * Returns the count added. Never throws into indexing — callers wrap in try/catch.
  */
-export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionContext): Promise<number> {
+
+/**
+ * Number of progress steps synthesizeCallbackEdges reports: one per `__mark()`
+ * call (every synthesis pass, plus the dedupe-merge and edge-insert steps).
+ * Cosmetic only — drift just makes the progress bar end early or jump — and a
+ * test pins it to the actual step count (registry passes + the fixed
+ * pre/post marks) so adding a pass without bumping this fails loudly instead
+ * of silently skewing the bar.
+ */
+const JS_FAMILY = ['typescript', 'javascript', 'tsx', 'jsx'];
+
+/** `has(...)` shape passed to pass gates — true when the project contains any of the languages. */
+type HasLang = (...ls: string[]) => boolean;
+
+/**
+ * One independent synthesis pass. Every pass scans the COMMITTED graph (plus
+ * source via ctx) and returns an edge list; nothing it produces is persisted
+ * until the ordered merge in synthesizeCallbackEdges — which is what makes
+ * execution order free and the passes safe to fan out across the resolver
+ * pool's read-only workers. `gate` short-circuits a pass whose language never
+ * appears in the project (its result is provably empty — see #1212).
+ */
+export interface SynthPassDef {
+  name: string;
+  gate: (has: HasLang) => boolean;
+  run: (
+    queries: QueryBuilder,
+    ctx: ResolutionContext,
+    yieldToLoop: MaybeYield,
+    subProgress?: (fraction: number) => void
+  ) => Promise<Edge[]>;
+}
+
+const ALWAYS = (): boolean => true;
+
+/**
+ * The independent passes, in MERGE ORDER — the first-seen dedup in
+ * synthesizeCallbackEdges follows this array, so reordering entries changes
+ * which duplicate edge wins. The two Go pre-passes (cross-file method
+ * `contains`, implicit `implements`) are NOT here: they persist before these
+ * run because interfaceOverrideEdges reads their edges from the DB.
+ */
+export const SYNTH_PASSES: SynthPassDef[] = [
+  { name: 'fieldEdges', gate: ALWAYS, run: (q, c, y) => fieldChannelEdges(q, c, y) },
+  { name: 'closureCollEdges', gate: ALWAYS, run: (q, c, y) => closureCollectionEdges(q, c, y) },
+  // Cross-tier channels — a client's `fetch('/api/x')` onto its own route,
+  // a queue job onto its consumer, a bus / socket event onto its handler.
+  // Before the in-process emitter pass: the same (source, target) pair
+  // keeps the more specific edge — the one that says which tier it crosses.
+  { name: 'tierEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => crossTierEdges(c, y) },
+  { name: 'emitterEdges', gate: ALWAYS, run: (_q, c, y) => eventEmitterEdges(c, y) },
+  { name: 'renderEdges', gate: ALWAYS, run: (q, c, y) => reactRenderEdges(q, c, y) },
+  { name: 'jsxEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => reactJsxChildEdges(c, y) },
+  { name: 'vueEdges', gate: (has) => has('vue'), run: (_q, c, y) => vueTemplateEdges(c, y) },
+  { name: 'svelteKitEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitLoadEdges(c, y) },
+  { name: 'pascalEdges', gate: ALWAYS, run: (_q, c, y) => pascalFormEdges(c, y) },
+  { name: 'flutterEdges', gate: (has) => has('dart'), run: (q, c, y) => flutterBuildEdges(q, c, y) },
+  { name: 'arkuiStateEdges', gate: (has) => has('arkts'), run: (q, c, y) => arkuiStateBuildEdges(q, c, y) },
+  { name: 'arkuiEmitter', gate: (has) => has('arkts'), run: (_q, c, y) => arkuiEmitterEdges(c, y) },
+  { name: 'arkuiRoutes', gate: (has) => has('arkts'), run: (_q, c, y) => arkuiRouterEdges(c, y) },
+  { name: 'cppEdges', gate: (has) => has('cpp'), run: (q, _c, y) => cppOverrideEdges(q, y) },
+  {
+    name: 'ifaceEdges',
+    gate: (has) => has('java', 'kotlin', 'csharp', 'swift', 'scala', 'go', 'rust', 'arkts', ...JS_FAMILY),
+    run: (q, _c, y) => interfaceOverrideEdges(q, y),
+  },
+  { name: 'kotlinExpectActual', gate: (has) => has('kotlin'), run: (q, _c, y) => kotlinExpectActualEdges(q, y) },
+  { name: 'goGrpcEdges', gate: (has) => has('go'), run: (q, _c, y) => goGrpcStubImplEdges(q, y) },
+  { name: 'rnEventEdgesList', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => rnEventEdges(c, y) },
+  { name: 'fabricNativeEdges', gate: ALWAYS, run: (_q, c, y) => fabricNativeImplEdges(c, y) },
+  // Expo module nodes (`expo-module:` ids) are emitted only from .swift/.kt
+  // files, and a pair needs BOTH platforms — so without both languages the
+  // pass's only collection loop is provably empty (it was streaming every
+  // method row on pure-Java repos to find nothing).
+  { name: 'expoXPlatEdges', gate: (has) => has('swift') && has('kotlin'), run: (q, _c, y) => expoCrossPlatformEdges(q, y) },
+  // An RN cross-platform edge requires a JS-language caller on the native
+  // method (`isBridge`) — no JS-family files means no JS-language nodes, so
+  // the result is provably empty.
+  { name: 'rnXPlatEdges', gate: (has) => has(...JS_FAMILY), run: (q, _c, y) => rnCrossPlatformEdges(q, y) },
+  {
+    name: 'mybatisEdges',
+    gate: (has) => has('java', 'kotlin') && has('xml'),
+    run: (q, _c, y) => mybatisJavaXmlEdges(q, y),
+  },
+  { name: 'ginEdges', gate: (has) => has('go'), run: (q, c, y) => ginMiddlewareChainEdges(q, c, y) },
+  { name: 'thunkEdges', gate: (has) => has(...JS_FAMILY), run: (q, c, y) => reduxThunkEdges(q, c, y) },
+  { name: 'registryEdges', gate: ALWAYS, run: (_q, c, y) => objectRegistryEdges(c, y) },
+  { name: 'rtkEdges', gate: (has) => has(...JS_FAMILY), run: (q, c, y) => rtkQueryEdges(q, c, y) },
+  { name: 'piniaEdges', gate: (has) => has('vue', ...JS_FAMILY), run: (_q, c, y) => piniaStoreEdges(c, y) },
+  { name: 'vuexEdges', gate: (has) => has('vue', ...JS_FAMILY), run: (_q, c, y) => vuexDispatchEdges(c, y) },
+  { name: 'celeryEdges', gate: (has) => has('python'), run: (_q, c, y) => celeryDispatchEdges(c, y) },
+  { name: 'springEdges', gate: (has) => has('java'), run: (_q, c, y) => springEventEdges(c, y) },
+  { name: 'mediatrEdges', gate: (has) => has('csharp'), run: (_q, c, y) => mediatrDispatchEdges(c, y) },
+  { name: 'sidekiqEdges', gate: (has) => has('ruby'), run: (_q, c, y) => sidekiqDispatchEdges(c, y) },
+  {
+    name: 'erlangBehaviourEdges',
+    gate: (has) => has('erlang'),
+    run: (q, c, y) => erlangBehaviourDispatchEdges(q, c, y),
+  },
+  { name: 'laravelEdges', gate: (has) => has('php'), run: (_q, c, y) => laravelEventEdges(c, y) },
+  {
+    name: 'cFnPtrEdges',
+    gate: (has) => has('c', 'cpp'),
+    run: (q, c, y, sub) => cFnPointerDispatchEdges(q, c, y, sub),
+  },
+  { name: 'goframeEdges', gate: (has) => has('go'), run: (_q, c, y) => goframeRouteEdges(c, y) },
+  // `router.push(await helper())` — the helper's return literals are the screens.
+  { name: 'expoRouterReturnEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => expoRouterReturnEdges(c, y) },
+  // `<Link href="/x">` / an internal `<a href>` — markup, not a call; the component navigates.
+  { name: 'nextLinkEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => nextLinkEdges(c, y) },
+  { name: 'reactRouterLinkEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => reactRouterLinkEdges(c, y) },
+  { name: 'tanstackLinkEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => tanstackLinkEdges(c, y) },
+  { name: 'vueRouterLinkEdges', gate: (has) => has('vue', ...JS_FAMILY), run: (_q, c, y) => vueRouterLinkEdges(c, y) },
+  { name: 'svelteKitPageEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitPageComponentEdges(c, y) },
+  { name: 'svelteKitLinkEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitLinkEdges(c, y) },
+  { name: 'nixOptionEdges', gate: (has) => has('nix'), run: (q, _c, y) => nixOptionPathEdges(q, y) },
+];
+
+/** Fixed non-registry steps: goMethodContains, goImplements, dedupe-merge, insertMergedEdges. */
+const FIXED_SYNTH_STEPS = 4;
+export const SYNTH_PROGRESS_STEPS = SYNTH_PASSES.length + FIXED_SYNTH_STEPS;
+export async function synthesizeCallbackEdges(
+  queries: QueryBuilder,
+  ctx: ResolutionContext,
+  onProgress?: (done: number, total: number) => void,
+  // A live resolver pool to fan the independent passes across (structural type
+  // so this file never imports the pool — resolver-worker imports THIS file).
+  // Null/omitted → the sequential path, byte-identical to the pool path.
+  pool?: { runSynthPass(name: string): Promise<{ edges: Edge[]; ms: number }> } | null,
+  // WAL-valve writer backstop (WalCheckpointValve.backpressure), called at
+  // pool-idle points in the edge-insert loops below — the passes themselves
+  // only read; every write in this function happens with the pool idle.
+  backpressure?: () => Promise<void> | null
+): Promise<number> {
   // Each sub-pass below is a whole-graph scan, and there are ~30 of them, all
   // running synchronously on the indexer's main thread. Their AGGREGATE can run
   // for well over a minute on a large repo — long enough for the #850 liveness
@@ -3455,6 +3645,30 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
   // that itself hangs (a real wedge) never reaches the next yield, so the
   // watchdog still catches that. See ./cooperative-yield.
   const yieldToLoop = createYielder();
+
+  // Synthesis runs AFTER the resolution progress bar reaches 100%, so without
+  // its own progress the UI freezes at "Resolving refs 100%" for the whole
+  // tail — long enough on big repos that users conclude the index hung and
+  // kill it. Report each completed pass; the caller surfaces it as its own
+  // progress phase. Emit 0/total up front so the phase flips immediately.
+  // Emissions are throttled to whole-percent movement (each consumes a UI
+  // message); values may be fractional steps from within-pass reporting.
+  let passesDone = 0;
+  let lastPct = -1;
+  const emit = (value: number): void => {
+    if (!onProgress) return;
+    const v = Math.min(value, SYNTH_PROGRESS_STEPS);
+    const pct = Math.floor((v / SYNTH_PROGRESS_STEPS) * 100);
+    if (pct === lastPct) return;
+    lastPct = pct;
+    onProgress(v, SYNTH_PROGRESS_STEPS);
+  };
+  // A single long pass otherwise parks the bar between steps; a pass that
+  // takes this callback reports a 0..1 fraction of its own work, surfaced
+  // here as fractional progress within its step.
+  const subProgress = (fraction: number): void =>
+    emit(passesDone + Math.max(0, Math.min(fraction, 1)));
+  emit(0);
 
   // Per-pass wall-clock timing to stderr, opt-in via CODEGRAPH_SYNTH_TIMINGS
   // (=1: passes over 250ms; =all: every pass). This is the diagnostic that
@@ -3467,6 +3681,8 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
     if (process.env.CODEGRAPH_SYNTH_TIMINGS && (dt > 250 || process.env.CODEGRAPH_SYNTH_TIMINGS === 'all')) {
       console.error(`[synth-timing] ${label}: ${dt}ms`);
     }
+    passesDone++;
+    emit(passesDone);
   };
 
   // Language gating: one indexed DISTINCT over the files table lets a pass
@@ -3477,7 +3693,6 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
   // Passes without an explicit language filter always run.
   const langs = queries.getDistinctFileLanguages();
   const has = (...ls: string[]): boolean => ls.some((l) => langs.has(l));
-  const JS_FAMILY = ['typescript', 'javascript', 'tsx', 'jsx'];
   const NONE: Edge[] = [];
 
   // Cross-file Go method→type `contains` edges must be synthesized AND persisted
@@ -3485,10 +3700,18 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
   // otherwise orphaned from the struct, and goImplementsEdges (next) derives a
   // struct's method set from its `contains` edges — so without this it would
   // under-count the interfaces a cross-file struct satisfies. (#583)
+  // Writer-side WAL backstop for the insert loops here (see the param doc):
+  // one fstat when under the valve's hard cap, a parked full backfill past it.
+  const foldIfOver = async (): Promise<void> => {
+    const bp = backpressure?.();
+    if (bp) await bp;
+  };
+
   const goMethodContains = has('go') ? await goCrossFileMethodContainsEdges(queries, yieldToLoop) : NONE;
   for (let i = 0; i < goMethodContains.length; i += 2000) {
     queries.insertEdges(goMethodContains.slice(i, i + 2000));
     await yieldToLoop();
+    await foldIfOver();
   }
   await yieldToLoop(); __mark('goMethodContains');
 
@@ -3500,87 +3723,82 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
   for (let i = 0; i < goImpl.length; i += 2000) {
     queries.insertEdges(goImpl.slice(i, i + 2000));
     await yieldToLoop();
+    await foldIfOver();
   }
   await yieldToLoop(); __mark('goImplements');
 
-  const fieldEdges = await fieldChannelEdges(queries, ctx, yieldToLoop); await yieldToLoop(); __mark('fieldEdges');
-  const closureCollEdges = await closureCollectionEdges(queries, ctx, yieldToLoop); await yieldToLoop(); __mark('closureCollEdges');
-  const emitterEdges = await eventEmitterEdges(ctx, yieldToLoop); await yieldToLoop(); __mark('emitterEdges');
-  const renderEdges = await reactRenderEdges(queries, ctx, yieldToLoop); await yieldToLoop(); __mark('renderEdges');
-  const jsxEdges = await reactJsxChildEdges(ctx, yieldToLoop); await yieldToLoop(); __mark('jsxEdges');
-  const vueEdges = has('vue') ? await vueTemplateEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('vueEdges');
-  const svelteKitEdges = has('svelte') ? await svelteKitLoadEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('svelteKitEdges');
-  const pascalEdges = await pascalFormEdges(ctx, yieldToLoop); await yieldToLoop(); __mark('pascalEdges');
-  const flutterEdges = has('dart') ? await flutterBuildEdges(queries, ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('flutterEdges');
-  const arkuiStateEdges = has('arkts') ? await arkuiStateBuildEdges(queries, ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('arkuiStateEdges');
-  const arkuiEmitter = has('arkts') ? await arkuiEmitterEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('arkuiEmitter');
-  const arkuiRoutes = has('arkts') ? await arkuiRouterEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('arkuiRoutes');
-  const cppEdges = has('cpp') ? await cppOverrideEdges(queries, yieldToLoop) : NONE; await yieldToLoop(); __mark('cppEdges');
-  const ifaceEdges = has('java', 'kotlin', 'csharp', 'swift', 'scala', 'go', 'rust', 'arkts', ...JS_FAMILY)
-    ? await interfaceOverrideEdges(queries, yieldToLoop) : NONE; await yieldToLoop(); __mark('ifaceEdges');
-  const kotlinExpectActual = has('kotlin') ? await kotlinExpectActualEdges(queries, yieldToLoop) : NONE; await yieldToLoop(); __mark('kotlinExpectActual');
-  const goGrpcEdges = has('go') ? await goGrpcStubImplEdges(queries, yieldToLoop) : NONE; await yieldToLoop(); __mark('goGrpcEdges');
-  const rnEventEdgesList = has(...JS_FAMILY) ? await rnEventEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('rnEventEdgesList');
-  const fabricNativeEdges = await fabricNativeImplEdges(ctx, yieldToLoop); await yieldToLoop(); __mark('fabricNativeEdges');
-  const expoXPlatEdges = await expoCrossPlatformEdges(queries, yieldToLoop); await yieldToLoop(); __mark('expoXPlatEdges');
-  const rnXPlatEdges = await rnCrossPlatformEdges(queries, yieldToLoop); await yieldToLoop(); __mark('rnXPlatEdges');
-  const mybatisEdges = has('java', 'kotlin') && has('xml') ? await mybatisJavaXmlEdges(queries, yieldToLoop) : NONE; await yieldToLoop(); __mark('mybatisEdges');
-  const ginEdges = has('go') ? await ginMiddlewareChainEdges(queries, ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('ginEdges');
-  const thunkEdges = has(...JS_FAMILY) ? await reduxThunkEdges(queries, ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('thunkEdges');
-  const registryEdges = await objectRegistryEdges(ctx, yieldToLoop); await yieldToLoop(); __mark('registryEdges');
-  const rtkEdges = has(...JS_FAMILY) ? await rtkQueryEdges(queries, ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('rtkEdges');
-  const piniaEdges = has('vue', ...JS_FAMILY) ? await piniaStoreEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('piniaEdges');
-  const vuexEdges = has('vue', ...JS_FAMILY) ? await vuexDispatchEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('vuexEdges');
-  const celeryEdges = has('python') ? await celeryDispatchEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('celeryEdges');
-  const springEdges = has('java') ? await springEventEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('springEdges');
-  const mediatrEdges = has('csharp') ? await mediatrDispatchEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('mediatrEdges');
-  const sidekiqEdges = has('ruby') ? await sidekiqDispatchEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('sidekiqEdges');
-  const erlangBehaviourEdges = has('erlang') ? await erlangBehaviourDispatchEdges(queries, ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('erlangBehaviourEdges');
-  const laravelEdges = has('php') ? await laravelEventEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('laravelEdges');
-  const cFnPtrEdges = has('c', 'cpp') ? await cFnPointerDispatchEdges(queries, ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('cFnPtrEdges');
-  const goframeEdges = has('go') ? await goframeRouteEdges(ctx, yieldToLoop) : NONE; await yieldToLoop(); __mark('goframeEdges');
-  const nixOptionEdges = has('nix') ? await nixOptionPathEdges(queries, yieldToLoop) : NONE; await yieldToLoop(); __mark('nixOptionEdges');
+  // Run the independent passes (see SYNTH_PASSES). Their results are merged in
+  // REGISTRY ORDER below regardless of execution order, and none of their edges
+  // persist until that merge — so every pass sees the same committed
+  // post-resolution DB state whether it runs sequentially here or on a resolver
+  // pool worker. With a live pool (already booted on ≥150k-ref repos), passes
+  // fan out across its read-only workers and the per-pass wall-clock comes from
+  // the worker; a pass that fails on a worker falls back to running on the main
+  // thread, so a worker crash isolates to a retry instead of failing synthesis.
+  const passEdges: Edge[][] = new Array<Edge[]>(SYNTH_PASSES.length).fill(NONE);
+  const markPass = (label: string, dt: number): void => {
+    if (process.env.CODEGRAPH_SYNTH_TIMINGS && (dt > 250 || process.env.CODEGRAPH_SYNTH_TIMINGS === 'all')) {
+      console.error(`[synth-timing] ${label}: ${dt}ms`);
+    }
+    passesDone++;
+    emit(passesDone);
+  };
+  const runPassOnMain = async (i: number): Promise<void> => {
+    const pass = SYNTH_PASSES[i]!;
+    const t0 = Date.now();
+    passEdges[i] = await pass.run(queries, ctx, yieldToLoop, subProgress);
+    await yieldToLoop();
+    markPass(pass.name, Date.now() - t0);
+  };
+
+  const gatedIn: number[] = [];
+  for (let i = 0; i < SYNTH_PASSES.length; i++) {
+    if (SYNTH_PASSES[i]!.gate(has)) gatedIn.push(i);
+    else markPass(SYNTH_PASSES[i]!.name, 0);
+  }
+
+  // Above this node count, a pass that OOM-killed its worker must NOT be
+  // retried on the main thread — the retry would OOM the whole process and
+  // take the index with it (the #1212 failure class). Below it, a worker
+  // failure is more likely a transient crash than a memory ceiling, and the
+  // main-thread retry keeps coverage. Skipping loses only that pass's
+  // synthesized edges; the index still completes.
+  const MAIN_RETRY_MAX_NODES = 1_500_000;
+  const graphNodes = queries.getNodeAndEdgeCount().nodes;
+
+  if (pool && gatedIn.length > 1) {
+    await Promise.all(
+      gatedIn.map(async (i) => {
+        const pass = SYNTH_PASSES[i]!;
+        try {
+          const out = await pool.runSynthPass(pass.name);
+          passEdges[i] = out.edges;
+          markPass(pass.name, out.ms);
+        } catch (err) {
+          if (graphNodes > MAIN_RETRY_MAX_NODES) {
+            // Worker died at a scale where the main-thread retry is a process
+            // OOM risk: skip the pass, keep the index alive, and say so.
+            console.error(
+              `[synthesis] pass '${pass.name}' failed on a worker at ${graphNodes} nodes — skipped (edges from this pass are absent): ${err instanceof Error ? err.message : String(err)}`
+            );
+            markPass(`${pass.name} (skipped at scale)`, 0);
+            return;
+          }
+          // Worker-side failure (crash, OOM, unknown pass after a version
+          // mismatch): retry this one pass on the main thread.
+          await runPassOnMain(i);
+        }
+      })
+    );
+  } else {
+    for (const i of gatedIn) {
+      await runPassOnMain(i);
+    }
+  }
 
   const merged: Edge[] = [];
   const seen = new Set<string>();
-  for (const e of [
-    ...fieldEdges,
-    ...closureCollEdges,
-    ...emitterEdges,
-    ...renderEdges,
-    ...jsxEdges,
-    ...vueEdges,
-    ...svelteKitEdges,
-    ...pascalEdges,
-    ...flutterEdges,
-    ...arkuiStateEdges,
-    ...arkuiEmitter,
-    ...arkuiRoutes,
-    ...cppEdges,
-    ...ifaceEdges,
-    ...kotlinExpectActual,
-    ...goGrpcEdges,
-    ...rnEventEdgesList,
-    ...fabricNativeEdges,
-    ...expoXPlatEdges,
-    ...rnXPlatEdges,
-    ...mybatisEdges,
-    ...ginEdges,
-    ...thunkEdges,
-    ...registryEdges,
-    ...rtkEdges,
-    ...piniaEdges,
-    ...vuexEdges,
-    ...celeryEdges,
-    ...springEdges,
-    ...mediatrEdges,
-    ...sidekiqEdges,
-    ...erlangBehaviourEdges,
-    ...laravelEdges,
-    ...cFnPtrEdges,
-    ...goframeEdges,
-    ...nixOptionEdges,
-  ]) {
+  for (const e of passEdges.flat()) {
     const key = `${e.source}>${e.target}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -3593,6 +3811,7 @@ export async function synthesizeCallbackEdges(queries: QueryBuilder, ctx: Resolu
   for (let i = 0; i < merged.length; i += 2000) {
     queries.insertEdges(merged.slice(i, i + 2000));
     await yieldToLoop();
+    await foldIfOver();
   }
   __mark('insertMergedEdges');
   return merged.length + goImpl.length + goMethodContains.length;

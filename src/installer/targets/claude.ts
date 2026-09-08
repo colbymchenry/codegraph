@@ -10,6 +10,9 @@
  *   - Instructions to `~/.claude/CLAUDE.md` (global) or
  *     `./.claude/CLAUDE.md` (local).
  *
+ * A non-blank `CLAUDE_CONFIG_DIR` moves all three global files into
+ * that profile directory, including `.claude.json` (#1627).
+ *
  * Earlier versions wrote the local MCP entry to `./.claude.json` — a
  * file Claude Code never reads — so the server silently never loaded
  * until the user manually renamed it to `.mcp.json` (issue #207). We
@@ -41,18 +44,43 @@ import {
   CODEGRAPH_SECTION_START,
 } from '../instructions-template';
 
+/**
+ * The shared stdio entry plus `alwaysLoad: true`, Claude Code's exemption from
+ * tool-search deferral (https://code.claude.com/docs/en/mcp#exempt-a-server-from-deferral).
+ * `codegraph_explore` carries the same flag in its `_meta`, which covers an
+ * entry written before this key; the entry-level key additionally makes
+ * Claude Code wait for this server's tools at startup, so they are in the
+ * first prompt rather than listed after the server connects in the background.
+ */
+function getClaudeMcpServerConfig() {
+  return { ...getMcpServerConfig(), alwaysLoad: true };
+}
+
+/**
+ * Root of the global Claude Code profile. Settings and instructions follow
+ * CLAUDE_CONFIG_DIR; local installs stay anchored to the project (#1627).
+ */
+function globalConfigDir(): string {
+  const override = process.env.CLAUDE_CONFIG_DIR;
+  return override && override.trim().length > 0
+    ? path.resolve(override)
+    : path.join(os.homedir(), '.claude');
+}
 function configDir(loc: Location): string {
   return loc === 'global'
-    ? path.join(os.homedir(), '.claude')
+    ? globalConfigDir()
     : path.join(process.cwd(), '.claude');
 }
 function mcpJsonPath(loc: Location): string {
-  // global → ~/.claude.json (user scope: visible in every project).
+  // global → $CLAUDE_CONFIG_DIR/.claude.json for a custom profile, else
+  // ~/.claude.json (beside ~/.claude, not inside it). User scope: every project.
   // local  → ./.mcp.json (project scope: the ONLY project-level MCP
   // file Claude Code reads — NOT ./.claude.json, which it ignores).
-  return loc === 'global'
-    ? path.join(os.homedir(), '.claude.json')
-    : path.join(process.cwd(), '.mcp.json');
+  if (loc !== 'global') return path.join(process.cwd(), '.mcp.json');
+  const override = process.env.CLAUDE_CONFIG_DIR;
+  return override && override.trim().length > 0
+    ? path.join(path.resolve(override), '.claude.json')
+    : path.join(os.homedir(), '.claude.json');
 }
 /**
  * Where pre-#207 installers wrote the local MCP entry. Claude Code
@@ -211,7 +239,7 @@ class ClaudeCodeTarget implements AgentTarget {
 
   printConfig(loc: Location): string {
     const target = mcpJsonPath(loc);
-    const snippet = JSON.stringify({ mcpServers: { codegraph: getMcpServerConfig() } }, null, 2);
+    const snippet = JSON.stringify({ mcpServers: { codegraph: getClaudeMcpServerConfig() } }, null, 2);
     return `# Add to ${target}\n\n${snippet}\n`;
   }
 
@@ -231,7 +259,7 @@ export function writeMcpEntry(loc: Location): WriteResult['files'][number] {
   const file = mcpJsonPath(loc);
   const existing = readJsonFile(file);
   const before = existing.mcpServers?.codegraph;
-  const after = getMcpServerConfig();
+  const after = getClaudeMcpServerConfig();
 
   if (jsonDeepEqual(before, after)) {
     // Already exactly what we'd write — preserve byte-identical file.
@@ -296,12 +324,24 @@ function isLegacyCodegraphHookCommand(command: unknown): boolean {
 
 /**
  * The front-load prompt-hook command the installer writes into Claude's
- * `UserPromptSubmit` (see writePromptHookEntry). Matched by substring so an
+ * `UserPromptSubmit` (see writePromptHookEntry). On Windows the launcher on
+ * PATH is `codegraph.cmd`, and Claude Code executes hooks through Git Bash,
+ * which — unlike cmd.exe — applies no PATHEXT: a bare `codegraph` is
+ * "command not found", exit 127 (#1466). Write the extension there; the
+ * `.cmd` spelling also resolves fine under cmd.exe and PowerShell.
+ */
+const PROMPT_HOOK_COMMAND = process.platform === 'win32'
+  ? 'codegraph.cmd prompt-hook'
+  : 'codegraph prompt-hook';
+
+/**
+ * Every spelling the installer has ever written (a settings.json can carry
+ * the other platform's form across a sync). Matched by substring so an
  * `npx @colbymchenry/codegraph prompt-hook` form is recognized too.
  */
-const PROMPT_HOOK_COMMAND = 'codegraph prompt-hook';
+const PROMPT_HOOK_FORMS = ['codegraph prompt-hook', 'codegraph.cmd prompt-hook'];
 function isPromptHookCommand(command: unknown): boolean {
-  return typeof command === 'string' && command.includes(PROMPT_HOOK_COMMAND);
+  return typeof command === 'string' && PROMPT_HOOK_FORMS.some((f) => command.includes(f));
 }
 
 /**
@@ -424,10 +464,31 @@ export function writePromptHookEntry(loc: Location): WriteResult['files'][number
   }
   if (!Array.isArray(settings.hooks.UserPromptSubmit)) settings.hooks.UserPromptSubmit = [];
 
+  // Self-heal (#1466): a pre-fix install on Windows wrote the bare
+  // `codegraph prompt-hook`, which Git Bash resolves to nothing; a
+  // settings.json carried across platforms can hold the other spelling too.
+  // Rewrite an installer-written command to this platform's form in place.
+  // Only the exact installer spellings migrate — an `npx …` or hand-edited
+  // variant is the user's own and stays untouched.
+  let migrated = false;
+  for (const group of settings.hooks.UserPromptSubmit) {
+    if (!group || !Array.isArray(group.hooks)) continue;
+    for (const h of group.hooks) {
+      if (h && PROMPT_HOOK_FORMS.includes(h.command) && h.command !== PROMPT_HOOK_COMMAND) {
+        h.command = PROMPT_HOOK_COMMAND;
+        migrated = true;
+      }
+    }
+  }
+
   const already = settings.hooks.UserPromptSubmit.some(
     (g: any) => g && Array.isArray(g.hooks) && g.hooks.some((h: any) => isPromptHookCommand(h?.command)),
   );
-  if (already) return { path: file, action: 'unchanged' };
+  if (already) {
+    if (!migrated) return { path: file, action: 'unchanged' };
+    writeJsonFile(file, settings);
+    return { path: file, action: 'updated' };
+  }
 
   settings.hooks.UserPromptSubmit.push({
     hooks: [{ type: 'command', command: PROMPT_HOOK_COMMAND }],

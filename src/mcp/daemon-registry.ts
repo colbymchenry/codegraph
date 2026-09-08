@@ -22,7 +22,13 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { getDaemonPidPath, getDaemonSocketCandidates, decodeLockInfo } from './daemon-paths';
+import {
+  getDaemonPidPath,
+  getDaemonSocketCandidates,
+  decodeLockInfo,
+  probeDaemonIdentity,
+  type DaemonLockInfo,
+} from './daemon-paths';
 
 export interface DaemonRecord {
   /** Realpath'd project root the daemon serves. */
@@ -114,6 +120,26 @@ export function listDaemons(opts: { prune?: boolean } = {}): DaemonRecord[] {
   return live.sort((a, b) => b.startedAt - a.startedAt);
 }
 
+/**
+ * Registry entries whose socket hello proves the recorded process is the
+ * daemon. Used by every user-facing list/stop-all path so a reused PID cannot
+ * appear as a phantom running daemon (#1553).
+ */
+export async function listVerifiedDaemons(opts: { prune?: boolean } = {}): Promise<DaemonRecord[]> {
+  const prune = opts.prune ?? true;
+  const candidates = listDaemons({ prune });
+  const checks = await Promise.all(candidates.map(async (rec) => ({
+    rec,
+    verified: await probeDaemonIdentity(rec),
+  })));
+  const verified: DaemonRecord[] = [];
+  for (const check of checks) {
+    if (check.verified) verified.push(check.rec);
+    else if (prune) deregisterDaemon(check.rec.root);
+  }
+  return verified;
+}
+
 /** Remove a stopped daemon's leftover lockfile + socket + registry record. */
 function cleanupDaemonArtifacts(root: string): void {
   try { fs.unlinkSync(getDaemonPidPath(root)); } catch { /* gone */ }
@@ -126,6 +152,20 @@ function cleanupDaemonArtifacts(root: string): void {
     }
   }
   deregisterDaemon(root);
+}
+
+/** Remove daemon artifacts only when no matching daemon answers the socket hello. */
+export async function clearStaleDaemonArtifacts(root: string): Promise<boolean> {
+  const pidPath = getDaemonPidPath(root);
+  const hadArtifacts = fs.existsSync(pidPath) || (
+    process.platform !== 'win32' && getDaemonSocketCandidates(root).some((p) => fs.existsSync(p))
+  );
+  if (!hadArtifacts) return false;
+  let info: DaemonLockInfo | null = null;
+  try { info = decodeLockInfo(fs.readFileSync(pidPath, 'utf8')); } catch { /* missing/corrupt */ }
+  if (info && isProcessAlive(info.pid) && await probeDaemonIdentity(info)) return false;
+  cleanupDaemonArtifacts(root);
+  return true;
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -154,9 +194,10 @@ export interface StopResult {
  */
 export async function stopDaemonAt(root: string): Promise<StopResult> {
   let pid: number | null = null;
+  let identity: DaemonLockInfo | null = null;
   try {
-    const info = decodeLockInfo(fs.readFileSync(getDaemonPidPath(root), 'utf8'));
-    pid = info?.pid ?? null;
+    identity = decodeLockInfo(fs.readFileSync(getDaemonPidPath(root), 'utf8'));
+    pid = identity?.pid ?? null;
   } catch {
     /* no lockfile */
   }
@@ -165,6 +206,7 @@ export async function stopDaemonAt(root: string): Promise<StopResult> {
       (r) => path.resolve(r.root) === path.resolve(root)
     );
     pid = rec?.pid ?? null;
+    if (rec) identity = rec;
   }
 
   if (pid == null) {
@@ -172,6 +214,12 @@ export async function stopDaemonAt(root: string): Promise<StopResult> {
     return { root, pid: null, outcome: 'no-daemon' };
   }
   if (!isProcessAlive(pid)) {
+    cleanupDaemonArtifacts(root);
+    return { root, pid, outcome: 'not-running' };
+  }
+  // Never signal a process merely because it reused a stale daemon PID. The
+  // daemon's immediate hello is the process-identity proof (#1553).
+  if (!identity || !await probeDaemonIdentity(identity)) {
     cleanupDaemonArtifacts(root);
     return { root, pid, outcome: 'not-running' };
   }
@@ -192,7 +240,7 @@ export async function stopDaemonAt(root: string): Promise<StopResult> {
 /** Stop every registered, live daemon. */
 export async function stopAllDaemons(): Promise<StopResult[]> {
   const results: StopResult[] = [];
-  for (const rec of listDaemons()) {
+  for (const rec of await listVerifiedDaemons()) {
     results.push(await stopDaemonAt(rec.root));
   }
   return results;

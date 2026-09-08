@@ -1,0 +1,179 @@
+/**
+ * Shared-password auth for the admin dashboard.
+ *
+ * Exactly two humans use this dashboard, so there is no user table, no auth
+ * provider and no session store: one password in a secret, and a long-lived
+ * HMAC-signed cookie so you sign in once per browser.
+ *
+ * Properties worth keeping if you touch this file:
+ * - the password is compared in constant time (over SHA-256 digests, so the
+ *   lengths always match and the comparison leaks nothing about the secret);
+ * - the cookie is a signed assertion, not a lookup key — nothing is stored
+ *   server-side, and a tampered payload fails the HMAC check;
+ * - the session is bound to a fingerprint of the password, so rotating
+ *   ADMIN_PASSWORD invalidates every cookie already out there.
+ */
+
+const COOKIE_NAME = 'cg_admin_session';
+/** ~1 year. Long-lived on purpose: two users, one password, sign in once. */
+const SESSION_TTL_SECONDS = 365 * 24 * 60 * 60;
+const SESSION_VERSION = 1;
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+interface SessionPayload {
+  v: number;
+  iat: number;
+  exp: number;
+  /** Fingerprint of the password this session was minted against. */
+  pw: string;
+}
+
+function base64UrlEncode(bytes: Uint8Array): string {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function base64UrlDecode(text: string): Uint8Array | null {
+  try {
+    const binary = atob(text.replace(/-/g, '+').replace(/_/g, '/'));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  } catch {
+    return null;
+  }
+}
+
+// Importing the HMAC key costs a round through WebCrypto; cache it per isolate.
+// A secret rotation ships a new deployment, which means new isolates.
+let cachedKey: { secret: string; key: CryptoKey } | null = null;
+
+async function hmacKey(secret: string): Promise<CryptoKey> {
+  if (cachedKey?.secret === secret) return cachedKey.key;
+  const key = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  cachedKey = { secret, key };
+  return key;
+}
+
+async function sign(secret: string, payload: string): Promise<Uint8Array> {
+  const signature = await crypto.subtle.sign('HMAC', await hmacKey(secret), encoder.encode(payload));
+  return new Uint8Array(signature);
+}
+
+/**
+ * Constant-time string equality. Both sides are hashed first so the digests are
+ * always the same length — `timingSafeEqual` throws on a length mismatch, and a
+ * throw would itself leak the length of the secret.
+ */
+async function equalsInConstantTime(a: string, b: string): Promise<boolean> {
+  const [digestA, digestB] = await Promise.all([
+    crypto.subtle.digest('SHA-256', encoder.encode(a)),
+    crypto.subtle.digest('SHA-256', encoder.encode(b)),
+  ]);
+  return crypto.subtle.timingSafeEqual(digestA, digestB);
+}
+
+/** Short, non-reversible marker of the current password, embedded in the session. */
+async function passwordFingerprint(password: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', encoder.encode(`cg-admin-pw\u0000${password}`));
+  return base64UrlEncode(new Uint8Array(digest).subarray(0, 8));
+}
+
+export async function checkPassword(env: Env, submitted: string): Promise<boolean> {
+  // A misconfigured deployment must not become an open dashboard.
+  if (!env.ADMIN_PASSWORD || !env.SESSION_SECRET) return false;
+  return equalsInConstantTime(submitted, env.ADMIN_PASSWORD);
+}
+
+export async function issueSession(env: Env): Promise<string> {
+  const now = Math.floor(Date.now() / 1000);
+  const payload: SessionPayload = {
+    v: SESSION_VERSION,
+    iat: now,
+    exp: now + SESSION_TTL_SECONDS,
+    pw: await passwordFingerprint(env.ADMIN_PASSWORD),
+  };
+  const encoded = base64UrlEncode(encoder.encode(JSON.stringify(payload)));
+  return `${encoded}.${base64UrlEncode(await sign(env.SESSION_SECRET, encoded))}`;
+}
+
+export async function hasValidSession(env: Env, request: Request): Promise<boolean> {
+  if (!env.ADMIN_PASSWORD || !env.SESSION_SECRET) return false;
+
+  const token = readSessionCookie(request);
+  if (!token) return false;
+
+  const dot = token.indexOf('.');
+  if (dot <= 0 || dot === token.length - 1) return false;
+  const encoded = token.slice(0, dot);
+
+  const provided = base64UrlDecode(token.slice(dot + 1));
+  if (!provided) return false;
+  const expected = await sign(env.SESSION_SECRET, encoded);
+  // Length is checked first: timingSafeEqual throws on mismatched lengths, and
+  // the length of an HMAC-SHA256 tag is public anyway.
+  if (provided.byteLength !== expected.byteLength) return false;
+  if (!crypto.subtle.timingSafeEqual(provided, expected)) return false;
+
+  const raw = base64UrlDecode(encoded);
+  if (!raw) return false;
+  let payload: SessionPayload;
+  try {
+    payload = JSON.parse(decoder.decode(raw)) as SessionPayload;
+  } catch {
+    return false;
+  }
+
+  if (payload?.v !== SESSION_VERSION) return false;
+  if (typeof payload.exp !== 'number' || payload.exp <= Math.floor(Date.now() / 1000)) return false;
+  // Rotating ADMIN_PASSWORD signs everyone out.
+  return payload.pw === (await passwordFingerprint(env.ADMIN_PASSWORD));
+}
+
+export function readSessionCookie(request: Request): string | null {
+  const header = request.headers.get('cookie');
+  if (!header) return null;
+  for (const part of header.split(';')) {
+    const cookie = part.trim();
+    if (cookie.startsWith(`${COOKIE_NAME}=`)) return cookie.slice(COOKIE_NAME.length + 1);
+  }
+  return null;
+}
+
+export function sessionCookie(token: string): string {
+  // Secure is accepted on http://localhost too, so `wrangler dev` still works.
+  return `${COOKIE_NAME}=${token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${SESSION_TTL_SECONDS}`;
+}
+
+export function clearedSessionCookie(): string {
+  return `${COOKIE_NAME}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`;
+}
+
+/**
+ * Rejects a cross-site form post. SameSite=Lax already blocks the cookie on a
+ * cross-site POST; this is the belt to that pair of braces.
+ */
+export function isSameOriginPost(request: Request): boolean {
+  const origin = request.headers.get('origin');
+  if (!origin) return true; // Absent on some legitimate non-browser clients (curl).
+  // "null" is what Chromium sends on a SAME-origin form submit when the page
+  // carries our own `Referrer-Policy: no-referrer` header — an unattributed
+  // origin, not a foreign one. Treat it like an absent header: rejecting it
+  // locks every Chromium user out of the login form, while an attacker who
+  // knows the password never needed a browser in the first place.
+  if (origin === 'null') return true;
+  try {
+    return new URL(origin).host === new URL(request.url).host;
+  } catch {
+    return false;
+  }
+}

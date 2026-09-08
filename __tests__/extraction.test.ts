@@ -11,7 +11,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
-import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
+import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, blankCLeadingAttrMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
 
 beforeAll(async () => {
@@ -173,6 +173,53 @@ class ENGINE_API UNetConnectionRepControl : public UObject
     expect(detectLanguage('Bar.h', 'struct ENGINE_API FBar : public FBase {};\n')).toBe('cpp');
     // Guard: a genuine C header must NOT be dragged to C++ by the new branch.
     expect(detectLanguage('cfoo.h', '#ifndef CFOO_H\nstruct Point { int x; int y; };\nvoid f(struct Point p);\n#endif\n')).toBe('c');
+  });
+
+  it('should detect a .h whose only C++ signal is a plain base clause as cpp (#1592)', () => {
+    // No export macro, no `class` keyword, no access section, no `virtual`:
+    // the derived struct's base clause is the only C++ construct, and the
+    // #1159 branch only knows the macro-annotated form. Misdetected as C, the
+    // C extractor drops `Derived` and mints a phantom `function Base`.
+    expect(detectLanguage('min.h', 'struct Base {};\nstruct Derived : Base {};\n')).toBe('cpp');
+    expect(detectLanguage('pub.h', 'struct Derived : public Base {};\n')).toBe('cpp');
+    expect(detectLanguage('scoped.h', 'struct Derived : ns::Base {};\n')).toBe('cpp');
+    expect(detectLanguage('tmpl.h', 'struct Derived : Base<int, Foo<T>> {};\n')).toBe('cpp');
+    expect(detectLanguage('final.h', 'struct Derived final : Base {};\n')).toBe('cpp');
+    expect(detectLanguage('multi.h', 'class Derived : public A, private B\n{\n};\n')).toBe('cpp');
+    expect(detectLanguage('virt.h', 'struct Derived : virtual Base {};\n')).toBe('cpp');
+
+    // The base clause sits PAST the 8 KB sample, behind a long C-compatible
+    // preamble (guards, defines, plain typedefs) — the second pass must scan
+    // the whole file, not just the sample.
+    const preamble = '#ifndef BIG_H\n#define BIG_H\n' + '#define VALUE_0 0\n'.repeat(700);
+    expect(preamble.length).toBeGreaterThan(8192);
+    expect(detectLanguage('big.h', `${preamble}struct Base {};\nstruct Derived : Base {};\n#endif\n`)).toBe('cpp');
+
+    // Controls — all genuine C, none may flip to C++:
+    // a bit-field (`:` after a member name inside the body),
+    expect(detectLanguage('bits.h', 'struct S { unsigned int a : 3; unsigned int b : 5; };\n')).toBe('c');
+    // a ternary whose `:` follows a `sizeof(struct …)` / cast,
+    expect(detectLanguage('tern.h', 'static inline int sz(int x) { return x ? sizeof(struct foo) : 0; }\n#define P(a,b) ((a) ? (struct foo *)(a) : (b))\n')).toBe('c');
+    // a label / identifier that merely starts with `struct`,
+    expect(detectLanguage('label.h', 'static void g(void) {\nstruct_end:\n  return;\n}\nint struct_a, struct_b;\n')).toBe('c');
+    // a doc comment whose prose reads like a base clause,
+    expect(detectLanguage('doc.h', '/* struct timeval: seconds, microseconds */\nstruct timeval { long tv_sec; long tv_usec; };\n// struct foo: x, y\n')).toBe('c');
+    // and the two existing controls.
+    expect(detectLanguage('cfoo.h', '#ifndef CFOO_H\nstruct Point { int x; int y; };\nvoid f(struct Point p);\n#endif\n')).toBe('c');
+    expect(detectLanguage('stdio.h', '#ifndef STDIO_H\nvoid printf();\n#endif\n')).toBe('c');
+  });
+
+  it('should extract a derived struct from a plain base-clause .h, with no phantom function (#1592)', () => {
+    const result = extractFromSource('src/min.h', 'struct Base {};\nstruct Derived : Base {};\n');
+    const derived = result.nodes.find((n) => n.name === 'Derived');
+    expect(derived).toBeDefined();
+    expect(derived?.kind).toBe('struct');
+    expect(derived?.language).toBe('cpp');
+    // The C mis-route read `Derived : Base {}` as a K&R-ish function `Base`
+    // returning `Derived` — that phantom must be gone.
+    expect(result.nodes.some((n) => n.name === 'Base' && n.kind === 'function')).toBe(false);
+    expect(result.nodes.filter((n) => n.name === 'Base')).toHaveLength(1);
+    expect(result.nodes.find((n) => n.name === 'Base')?.kind).toBe('struct');
   });
 
   it('should return unknown for unsupported extensions', () => {
@@ -519,6 +566,55 @@ interface Hprops {
     expect(refs.some((r) => r.referenceName === 'IOrderField')).toBe(true);
   });
 
+  it('indexes interface members, not just the interface itself', () => {
+    // tree-sitter-typescript spells interface members `method_signature` /
+    // `property_signature`, distinct from the class-member types the extractor
+    // listed, so they were never captured (#1638). Java/C# are unaffected —
+    // their grammars reuse `method_declaration`, already in their methodTypes.
+    // The cost lands on `.d.ts` platform APIs: with no declaration node, call
+    // sites through the interface have nothing to attach an edge to.
+    const code = `
+export interface PlatformApi {
+  fetchPage(id: string): Promise<string>;
+  version: string;
+}
+`;
+    const result = extractFromSource('api.d.ts', code);
+
+    const iface = result.nodes.find((n) => n.kind === 'interface' && n.name === 'PlatformApi');
+    const method = result.nodes.find((n) => n.kind === 'method' && n.name === 'fetchPage');
+    const prop = result.nodes.find((n) => n.kind === 'property' && n.name === 'version');
+    expect(iface).toBeDefined();
+    expect(method).toBeDefined();
+    expect(prop).toBeDefined();
+
+    // Attached to the interface, not merely present. A member the graph holds
+    // but hangs off the file is not a declaration a call edge can be resolved
+    // through, which is the whole point of extracting it.
+    const contained = result.edges
+      .filter((e) => e.kind === 'contains' && e.source === iface!.id)
+      .map((e) => e.target);
+    expect(contained).toContain(method!.id);
+    expect(contained).toContain(prop!.id);
+  });
+
+  it('does not mint a top-level function from a type literal method signature', () => {
+    // The failure mode the class-like guard on `method_signature` exists for
+    // (#1638). `extractMethod` treats a method node with no class-like parent
+    // as a free function — right for `method_definition`, wrong for a bodiless
+    // signature, whose only home outside an interface is a type literal. Those
+    // members are already extracted onto the alias (#359), so without the guard
+    // the file gains a phantom `function stop` beside the real `Handle::stop`.
+    const result = extractFromSource('t.ts', `
+export type Handle = { stop(): void; label: string };
+`);
+
+    const alias = result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'Handle');
+    expect(alias).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'method' && n.name === 'stop')).toBeDefined();
+    expect(result.nodes.filter((n) => n.kind === 'function' && n.name === 'stop')).toEqual([]);
+  });
+
   it('should extract type references from interface method signatures', () => {
     const code = `
 import type { IPage } from '../PromoterList';
@@ -698,6 +794,63 @@ export const fetchData = async () => {
   });
 });
 
+describe('Generator Function Extraction (#1741)', () => {
+  const functionNames = (file: string, code: string) =>
+    extractFromSource(file, code)
+      .nodes.filter((n) => n.kind === 'function')
+      .map((n) => n.name)
+      .sort();
+
+  it('extracts function* and async function* declarations in TypeScript', () => {
+    process.env.CODEGRAPH_KERNEL = '0';
+    const code = `
+function plain() { return 1; }
+function* gen() { yield 2; }
+async function asyncFn() { return 3; }
+async function* asyncGen() { yield 4; }
+`;
+    expect(functionNames('gens.ts', code)).toEqual(['asyncFn', 'asyncGen', 'gen', 'plain']);
+  });
+
+  it('extracts function* and async function* declarations in JavaScript', () => {
+    process.env.CODEGRAPH_KERNEL = '0';
+    const code = `
+function plain() { return 1; }
+function* gen() { yield 2; }
+async function asyncFn() { return 3; }
+async function* asyncGen() { yield 4; }
+`;
+    expect(functionNames('gens.js', code)).toEqual(['asyncFn', 'asyncGen', 'gen', 'plain']);
+  });
+
+  it('extracts const-assigned generator and async generator expressions (TS)', () => {
+    process.env.CODEGRAPH_KERNEL = '0';
+    const code = `
+const g = function* () { yield 1; };
+const ag = async function* () { yield 2; };
+export const exportedGen = function* () { yield 3; };
+`;
+    const result = extractFromSource('gen-expr.ts', code);
+    const names = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name).sort();
+    expect(names).toEqual(['ag', 'exportedGen', 'g']);
+    expect(result.nodes.find((n) => n.name === 'exportedGen')?.isExported).toBe(true);
+    expect(result.nodes.find((n) => n.name === 'g')?.isExported).toBeFalsy();
+  });
+
+  it('extracts const-assigned generator and async generator expressions (JS)', () => {
+    process.env.CODEGRAPH_KERNEL = '0';
+    const code = `
+const g = function* () { yield 1; };
+const ag = async function* () { yield 2; };
+export const exportedGen = function* () { yield 3; };
+`;
+    const result = extractFromSource('gen-expr.js', code);
+    const names = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name).sort();
+    expect(names).toEqual(['ag', 'exportedGen', 'g']);
+    expect(result.nodes.find((n) => n.name === 'exportedGen')?.isExported).toBe(true);
+  });
+});
+
 describe('Type Alias Extraction', () => {
   it('should extract exported type aliases in TypeScript', () => {
     const code = `
@@ -795,10 +948,20 @@ export type Names = ['alpha', 'beta'];
 `;
     const result = extractFromSource('noise.ts', code);
 
+    // Since #1638 the fixture's own interfaces legitimately declare `id` / `name`
+    // (`User::id`, `User::name`, `Service::name`), so membership in the name list
+    // no longer implies a leak. What #634 guards is the *source*: a node minted
+    // from a string literal in `Pick<User, 'id'>` or a tuple has no declaring
+    // interface, so exclude anything a `contains` edge ties to one.
+    const ifaceIds = new Set(result.nodes.filter((n) => n.kind === 'interface').map((n) => n.id));
+    const declaredInInterface = new Set(
+      result.edges.filter((e) => e.kind === 'contains' && ifaceIds.has(e.source)).map((e) => e.target)
+    );
     const leaked = result.nodes.filter(
       (n) =>
         (n.kind === 'method' || n.kind === 'property') &&
-        ['id', 'name', 'foo', 'bar', 'alpha', 'beta'].includes(n.name)
+        ['id', 'name', 'foo', 'bar', 'alpha', 'beta'].includes(n.name) &&
+        !declaredInInterface.has(n.id)
     );
     expect(leaked).toEqual([]);
   });
@@ -931,6 +1094,42 @@ const token = getTokenMp();
     );
     expect(call).toBeDefined();
   });
+
+  describe('initializer walk is scoped to the declared symbol (#693 for TS/JS)', () => {
+    const code = `
+const eager = load();
+const obj = { handler: () => target(), plain: target() };
+const list = [() => target()];
+export const exported = { handler: () => target() };
+`;
+    const callersOf = (name: string) => {
+      const result = extractFromSource('app.ts', code);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      return result.unresolvedReferences
+        .filter((u) => u.referenceKind === 'calls' && u.referenceName === name)
+        .map((u) => byId.get(u.fromNodeId))
+        .map((n) => (n ? `${n.kind}:${n.name}` : '?'))
+        .sort();
+    };
+
+    it("a plain call initializer names the CONSTANT as caller, not the file", () => {
+      // The walk ran with only the file on the stack, so `load` recorded the
+      // file as its caller — useless for callers/impact.
+      expect(callersOf('load')).toEqual(['constant:eager']);
+    });
+
+    it('a non-exported object literal contributes calls (it was skipped outright)', () => {
+      // `exported`'s members are minted as their own function nodes, so its
+      // arrow's call comes from `handler`; the non-exported ones attribute to
+      // the declared constant.
+      expect(callersOf('target')).toEqual([
+        'constant:list',
+        'constant:obj',
+        'constant:obj',
+        'function:handler',
+      ]);
+    });
+  });
 });
 
 describe('File Node Extraction', () => {
@@ -1019,6 +1218,42 @@ class UserService:
     expect(classNode).toBeDefined();
     expect(classNode?.name).toBe('UserService');
   });
+
+  it('walks a module-level assignment initializer scoped to the name (#693 for Python)', () => {
+    // The assignment minted a node and stopped, so everything a module builds
+    // at import time — `app = FastAPI()`, `ENGINE = create_engine(url)` — was
+    // missing from the graph. A tuple target mints no symbol, so its
+    // right-hand side attributes to the enclosing scope instead of vanishing.
+    const code = `
+def target(): pass
+def compute(): return 1
+
+APP = compute()
+handler = lambda: target()
+MAPPING = {"a": compute()}
+first, second = compute(), target()
+
+class K:
+    ATTR = compute()
+`;
+    const result = extractFromSource('app.py', code);
+    const byId = new Map(result.nodes.map((n) => [n.id, n]));
+    const owners = result.unresolvedReferences
+      .filter((u) => u.referenceKind === 'calls')
+      .map((u) => {
+        const n = byId.get(u.fromNodeId);
+        return `${u.referenceName}<-${n ? `${n.kind}:${n.name}` : '?'}`;
+      })
+      .sort();
+    expect(owners).toEqual([
+      'compute<-class:K', // a class attribute still rides the class (no node of its own)
+      'compute<-file:app.py', // the tuple target mints nothing
+      'compute<-variable:APP',
+      'compute<-variable:MAPPING',
+      'target<-file:app.py',
+      'target<-variable:handler',
+    ]);
+  });
 });
 
 describe('Go Extraction', () => {
@@ -1089,6 +1324,35 @@ pub struct User {
     expect(structNode?.name).toBe('User');
   });
 
+  it('should extract unit and tuple structs, not just brace structs', () => {
+    // A unit struct has no body field, but it IS a complete definition —
+    // Rust has no forward declarations. Skipping it dropped the type and
+    // every `impl Trait for UnitStruct` edge with it.
+    const code = `
+pub struct Unit;
+pub struct Tuple(pub u32);
+pub struct Brace { pub x: u32 }
+`;
+    const result = extractFromSource('shapes.rs', code);
+
+    const structs = result.nodes.filter((n) => n.kind === 'struct').map((n) => n.name).sort();
+    expect(structs).toEqual(['Brace', 'Tuple', 'Unit']);
+  });
+
+  it('should link impl Trait for a unit struct', () => {
+    const code = `
+pub struct Unit;
+pub trait Greet { fn hi(&self) -> String; }
+impl Greet for Unit { fn hi(&self) -> String { "unit".into() } }
+`;
+    const result = extractFromSource('greet.rs', code);
+
+    const unit = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Unit');
+    expect(unit).toBeDefined();
+    const trait = result.nodes.find((n) => n.kind === 'trait' && n.name === 'Greet');
+    expect(trait).toBeDefined();
+  });
+
   it('should extract trait declarations', () => {
     const code = `
 pub trait Repository {
@@ -1129,6 +1393,146 @@ impl Cache for MyCache {
     const myCacheNode = result.nodes.find((n) => n.name === 'MyCache' && n.kind === 'struct');
     expect(myCacheNode).toBeDefined();
     expect(implRef?.fromNodeId).toBe(myCacheNode?.id);
+  });
+
+  it('qualifies methods of a generic or lifetime impl by the implementing type, not the trait (#1588)', () => {
+    const code = `
+pub trait Source {
+    fn read(&mut self) -> usize;
+}
+
+pub struct FileSource { pub n: usize }
+impl Source for FileSource {
+    fn read(&mut self) -> usize { self.n }
+}
+
+pub struct BufSource<T> { pub inner: T }
+impl<T> Source for BufSource<T> {
+    fn read(&mut self) -> usize { 0 }
+}
+
+pub struct Parents<'a> { cur: &'a u32 }
+impl<'a> Iterator for Parents<'a> {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> { None }
+}
+
+pub struct Wrapper { pub n: usize }
+impl Source for &Wrapper {
+    fn read(&mut self) -> usize { 1 }
+}
+
+pub mod m { pub struct Scoped { pub n: usize } }
+impl Source for m::Scoped {
+    fn read(&mut self) -> usize { 2 }
+}
+
+pub struct Own { pub n: usize }
+impl From<u32> for Own {
+    fn from(n: u32) -> Self { Own { n: n as usize } }
+}
+`;
+    const result = extractFromSource('src.rs', code);
+
+    // Every impl method is qualified by the IMPLEMENTING type. Before, a
+    // parameterized implementing type (`BufSource<T>`, `Parents<'a>`, `&Wrapper`)
+    // left the trait's identifier as the only bare type_identifier child of the
+    // impl, so those methods were recorded as `Source::read` / `Iterator::next`.
+    const methodQns = result.nodes
+      .filter((n) => n.kind === 'method')
+      .map((n) => n.qualifiedName)
+      .sort();
+    expect(methodQns).toEqual([
+      'BufSource::read',
+      'FileSource::read',
+      'Own::from',
+      'Parents::next',
+      'Scoped::read',
+      'Source::read',
+      'Wrapper::read',
+    ]);
+    // The trait's qualified name now names exactly one node: its declaration.
+    const traitRead = result.nodes.filter((n) => n.qualifiedName === 'Source::read');
+    expect(traitRead).toHaveLength(1);
+    expect(traitRead[0]!.startLine).toBe(3);
+
+    // The implements back-reference comes FROM the implementing type's node
+    // for every impl shape, named by the trait's full text.
+    const implementsFrom = (typeName: string): string[] => {
+      const typeNode = result.nodes.find((n) => n.name === typeName && n.kind === 'struct');
+      expect(typeNode, typeName).toBeDefined();
+      return result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'implements' && r.fromNodeId === typeNode!.id)
+        .map((r) => r.referenceName);
+    };
+    expect(implementsFrom('FileSource')).toEqual(['Source']);
+    expect(implementsFrom('BufSource')).toEqual(['Source']);
+    expect(implementsFrom('Parents')).toEqual(['Iterator']);
+    expect(implementsFrom('Wrapper')).toEqual(['Source']);
+    expect(implementsFrom('Scoped')).toEqual(['Source']);
+    expect(implementsFrom('Own')).toEqual(['From<u32>']);
+
+    // …and the owner `contains` edge lands on the implementing type too.
+    const buf = result.nodes.find((n) => n.name === 'BufSource' && n.kind === 'struct')!;
+    const bufRead = result.nodes.find((n) => n.qualifiedName === 'BufSource::read')!;
+    expect(
+      result.edges.some((e) => e.kind === 'contains' && e.source === buf.id && e.target === bufRead.id)
+    ).toBe(true);
+  });
+
+  it('keeps the owner-field shape for `self.<field>.<method>()` and collapses every other receiver (#1585)', () => {
+    const code = `
+pub struct Outer { pub inner: Inner, pub deep: Deep }
+impl Outer {
+    pub fn run(&mut self) {
+        self.inner.run();
+        self.deep.inner.run();
+        self.make().run();
+        (self.inner).run();
+        self.run();
+        let local = Inner { n: 0 };
+        local.run();
+    }
+}
+`;
+    const result = extractFromSource('outer.rs', code);
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+    // Exactly one call keeps the `self.<field>` prefix — the single-hop field
+    // receiver whose type the resolver can read off the owner struct.
+    expect(calls.filter((c) => c.startsWith('self.'))).toEqual(['self.inner.run']);
+    // A local receiver keeps its name as before…
+    expect(calls).toContain('local.run');
+    // …and the deeper chain, the call receiver, the parenthesized receiver and
+    // the bare `self` receiver all still collapse to the method name.
+    expect(calls.filter((c) => c === 'run')).toHaveLength(4);
+    expect(calls).toContain('make');
+    const outerRun = result.nodes.find((n) => n.qualifiedName === 'Outer::run');
+    expect(outerRun).toBeDefined();
+    const fieldRef = result.unresolvedReferences.find((r) => r.referenceName === 'self.inner.run');
+    expect(fieldRef?.fromNodeId).toBe(outerRun!.id);
+    expect(fieldRef?.line).toBe(5);
+  });
+
+  it('gives no receiver to an impl whose target names no single type', () => {
+    // A tuple / `dyn Trait` / primitive implementing type has no struct to
+    // hang the methods off, so they are extracted as plain functions — the
+    // pre-#1588 behavior for these shapes, minus the trait mis-qualification.
+    const code = `
+pub trait Base { fn id(&self) -> u32; }
+impl Base for (u32, u32) {
+    fn id(&self) -> u32 { 0 }
+}
+impl Base for dyn Base {
+    fn id(&self) -> u32 { 1 }
+}
+`;
+    const result = extractFromSource('src.rs', code);
+    const ids = result.nodes.filter((n) => n.name === 'id');
+    expect(ids.map((n) => n.qualifiedName).sort()).toEqual(['Base::id', 'id', 'id']);
+    expect(ids.filter((n) => n.kind === 'function')).toHaveLength(2);
+    expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'implements')).toHaveLength(0);
   });
 
   it('should extract trait supertraits as extends references', () => {
@@ -1173,6 +1577,71 @@ impl Counter {
       (r) => r.referenceKind === 'implements'
     );
     expect(implRefs).toHaveLength(0);
+  });
+
+  it('walks a const/static initializer scoped to the declared symbol (#693 for Rust)', () => {
+    // The declaration minted a node and stopped, so a handler table, a
+    // lazily-built singleton or any computed const linked to nothing.
+    const code = `
+const LEN: usize = compute_len();
+static REGISTRY: Lazy<Cfg> = Lazy::new(|| build_cfg());
+`;
+    const result = extractFromSource('lib.rs', code);
+    const byId = new Map(result.nodes.map((n) => [n.id, n]));
+    const owner = (name: string) => {
+      const u = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === name
+      );
+      const n = u ? byId.get(u.fromNodeId) : undefined;
+      return n ? `${n.kind}:${n.name}` : undefined;
+    };
+    expect(owner('compute_len')).toBe('variable:LEN');
+    expect(owner('build_cfg')).toBe('variable:REGISTRY');
+  });
+
+  it('should extract union declarations and their impl edges', () => {
+    const code = `
+pub union Reg {
+    pub raw: u32,
+    pub halves: [u16; 2],
+}
+
+pub trait Describe {
+    fn describe(&self) -> u32;
+}
+
+impl Describe for Reg {
+    fn describe(&self) -> u32 {
+        unsafe { self.raw }
+    }
+}
+`;
+    const result = extractFromSource('reg.rs', code);
+
+    // A union is a first-class type definition, not an alias — it must be a
+    // node, or the impl below has no source endpoint to hang off.
+    const reg = result.nodes.find((n) => n.name === 'Reg');
+    expect(reg).toBeDefined();
+    expect(reg?.kind).toBe('union');
+
+    const implRef = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'implements' && r.referenceName === 'Describe'
+    );
+    expect(implRef).toBeDefined();
+    expect(implRef?.fromNodeId).toBe(reg?.id);
+
+    // The impl's method attaches to the union, not to the file — without a Reg
+    // node it was an orphan whose qualifiedName pointed at a type that did not
+    // exist in the graph.
+    const implMethod = result.nodes.find(
+      (n) => n.kind === 'method' && n.qualifiedName?.includes('Reg')
+    );
+    expect(implMethod).toBeDefined();
+    expect(
+      result.edges.some(
+        (e) => e.kind === 'contains' && e.source === reg?.id && e.target === implMethod?.id
+      )
+    ).toBe(true);
   });
 });
 
@@ -1336,6 +1805,37 @@ public class Splitter {
         n.qualifiedName.includes('$anon@')
     );
     expect(sepStart, 'override inside the lambda-returned anon class should be a method node').toBeDefined();
+  });
+
+  it('walks a field initializer scoped to the field (#693 for Java)', () => {
+    // The dispatcher only scanned a field_declaration for function-as-value
+    // candidates, so a lambda or anonymous class holding the work — the
+    // Android listener idiom — contributed no call edge and `target` looked
+    // callerless.
+    const code = `
+package p;
+class T {
+    private final Runnable fieldLambda = () -> target();
+    private final Runnable anonClass = new Runnable() {
+        public void run() { target(); }
+    };
+    private final int eager = compute();
+    void directCall() { target(); }
+    private void target() {}
+    private static int compute() { return 1; }
+}
+`;
+    const result = extractFromSource('T.java', code);
+    const byId = new Map(result.nodes.map((n) => [n.id, n]));
+    const callersOf = (name: string) =>
+      result.unresolvedReferences
+        .filter((u) => u.referenceKind === 'calls' && u.referenceName === name)
+        .map((u) => byId.get(u.fromNodeId)?.name)
+        .sort();
+
+    // `run` is the anonymous class's override, itself extracted under the field.
+    expect(callersOf('target')).toEqual(['directCall', 'fieldLambda', 'run']);
+    expect(callersOf('compute')).toEqual(['eager']);
   });
 });
 
@@ -1939,6 +2439,120 @@ class Bar {
     expect(result.nodes.find((n) => n.kind === 'namespace')).toBeUndefined();
     const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
     expect(cls?.qualifiedName).toBe('Bar');
+  });
+
+  describe('property initializers are walked, attributed to the property (#693 for Kotlin)', () => {
+    // The property hook consumes the whole property_declaration subtree, so
+    // before this the initializer was only scanned for function-as-value
+    // candidates and every call inside it vanished from the graph. Android/MSDK
+    // callbacks are declared exactly this way (`private val l = Listener { … }`),
+    // so anything reached only through one looked like it had no callers at all.
+    const code = `
+package repro
+
+class Repro {
+    private val fieldLambda: () -> Unit = { target() }
+    private val samField = Runnable { target() }
+    private val plain = target()
+    private val delegated by lazy { target() }
+    private val anonObject = object : Runnable { override fun run() { target() } }
+
+    fun directCall() { target() }
+    fun lambdaInMethod() { run { target() } }
+
+    private fun target() {}
+}
+
+object Holder {
+    val topLevelLambda: () -> Unit = { hit() }
+    private fun hit() {}
+}
+`;
+    const callersOf = (target: string) => {
+      const result = extractFromSource('Repro.kt', code);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      return result.unresolvedReferences
+        .filter((u) => u.referenceKind === 'calls' && u.referenceName === target)
+        .map((u) => byId.get(u.fromNodeId)?.name)
+        .sort();
+    };
+
+    it('a lambda / SAM / plain / delegated / object initializer calls FROM the property', () => {
+      // `run` is the anonymous object's override, extracted as its own node
+      // under `anonObject` — the same shape Go's initializer walk produces.
+      expect(callersOf('target')).toEqual([
+        'delegated',
+        'directCall',
+        'fieldLambda',
+        'lambdaInMethod',
+        'plain',
+        'run',
+        'samField',
+      ]);
+    });
+
+    it('a property in an `object` singleton is a caller too', () => {
+      expect(callersOf('hit')).toEqual(['topLevelLambda']);
+    });
+
+    it('an accessor body belongs to its property, written on either line', () => {
+      // `val x: T get() = …` nests the accessor UNDER the declaration; written
+      // on its own line the grammar makes it a following SIBLING instead. Both
+      // used to lose their calls (the nested one) or hand them to the enclosing
+      // class (the sibling); both now attribute to the property.
+      const src = `
+package p
+
+class C {
+    val sameLine: Int get() = compute()
+    val nextLine: Int
+        get() = compute()
+    var written: Int = 0
+        set(v) { store(v) }
+    private fun compute(): Int = 1
+    private fun store(v: Int) {}
+}
+`;
+      const result = extractFromSource('C.kt', src);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      const ownersOf = (name: string) =>
+        result.unresolvedReferences
+          .filter((u) => u.referenceKind === 'calls' && u.referenceName === name)
+          .map((u) => {
+            const n = byId.get(u.fromNodeId);
+            return n ? `${n.kind}:${n.name}` : '?';
+          })
+          .sort();
+      expect(ownersOf('compute')).toEqual(['field:nextLine', 'field:sameLine']);
+      expect(ownersOf('store')).toEqual(['field:written']);
+    });
+
+    it('an `init` block and a destructuring RHS no longer vanish', () => {
+      // Both mint no symbol of their own, so the hook consumed them and their
+      // code disappeared entirely; they now attribute to the enclosing scope.
+      const src = `
+package p
+
+class C {
+    init { val q = initCall() }
+    val (a, b) = makePair()
+}
+
+val (t1, t2) = topMakePair()
+`;
+      const result = extractFromSource('C.kt', src);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      const owner = (name: string) => {
+        const u = result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'calls' && r.referenceName === name
+        );
+        const n = u ? byId.get(u.fromNodeId) : undefined;
+        return n ? `${n.kind}:${n.name}` : undefined;
+      };
+      expect(owner('initCall')).toBe('class:C');
+      expect(owner('makePair')).toBe('class:C');
+      expect(owner('topMakePair')).toBe('namespace:p');
+    });
   });
 });
 
@@ -3704,6 +4318,47 @@ int f() { return 1; }
       const result = extractFromSource('nested.cpp', code);
       expect(result.nodes.find((n) => n.name === 'f')?.qualifiedName).toBe('a::b::f');
     });
+
+    // Out-of-line member definitions take their qualifiedName from the
+    // declarator's receiver (`ManifestStartup::Apply`), which is spelled
+    // RELATIVE to the enclosing namespace — the namespace prefix must compose
+    // in, or the method's qualifiedName diverges from its own class node's
+    // and `ns::Class::Method(...)` call sites never resolve (#1291).
+    it('out-of-line method definitions inside a namespace carry the namespace prefix', () => {
+      const code = `namespace simulator {
+class ManifestStartup {
+public:
+    struct Input { int x; };
+    struct Output { int y; };
+    static Output Apply(const Input& input);
+};
+ManifestStartup::Output ManifestStartup::Apply(const Input& input) { return {}; }
+}
+`;
+      const result = extractFromSource('manifest_startup.cpp', code);
+      const apply = result.nodes.filter((n) => n.name === 'Apply');
+      // The out-of-line definition's QN matches the class node's prefix.
+      expect(apply.map((n) => n.qualifiedName)).toContain('simulator::ManifestStartup::Apply');
+      expect(result.nodes.find((n) => n.kind === 'class')?.qualifiedName).toBe(
+        'simulator::ManifestStartup'
+      );
+    });
+
+    it('a receiver that re-spells the namespace path is not double-prefixed', () => {
+      const code = `namespace sim {
+class M { public: static void f(); static void g(); };
+void sim::M::f() {}
+void M::g() {}
+}
+void sim::M::f2() {}
+`;
+      const result = extractFromSource('m.cpp', code);
+      const qns = result.nodes.filter((n) => n.kind === 'method').map((n) => n.qualifiedName);
+      expect(qns).toContain('sim::M::f'); // fully re-spelled inside the namespace
+      expect(qns).toContain('sim::M::g'); // relative form
+      expect(qns).toContain('sim::M::f2'); // global scope, spelled absolute
+      expect(qns.find((q) => q?.includes('sim::sim'))).toBeUndefined();
+    });
   });
 
   describe('C++ forward declarations do not mint phantom class nodes (#1093)', () => {
@@ -4071,6 +4726,119 @@ class Both : public Base<char>, public Plain {};
       expect(stripCppTemplateArgs('Outer<int>::Inner')).toBe('Outer::Inner'); // mid-name
       expect(stripCppTemplateArgs('Base')).toBe('Base'); // no-op
       expect(stripCppTemplateArgs('ns::Plain')).toBe('ns::Plain'); // no-op qualified
+    });
+  });
+
+  describe('C leading attribute macro before typedef return type (#1211)', () => {
+    // `SEC_ATTR UINT32 LostName(VOID)` — tree-sitter's C grammar reads the
+    // unknown macro as the type, the typedef'd return as the declarator, and
+    // stores the PARAMETER LIST as the function name ("(VOID)"). The
+    // structural pre-parse blank recovers the definition; the issue's whole
+    // isolation table is pinned here.
+    it("recovers the issue's full isolation table under their real names", () => {
+      const code = `#define SEC_ATTR __attribute__((section(".init")))
+typedef unsigned int UINT32;
+#define VOID void
+
+SEC_ATTR VOID   GoodName(VOID)  { }
+SEC_ATTR UINT32 LostName(VOID)  { return 0; }
+UINT32 NoAttr(void) { return 0; }
+SEC_ATTR int BuiltinRet(void) { return 0; }
+__attribute__((section(".init"))) UINT32 RawAttr(void) { return 0; }
+SEC_ATTR UINT32 OneNamedArg(UINT32 x) { return x; }
+SEC_ATTR UINT32* PtrRet(VOID) { return 0; }
+`;
+      const result = extractFromSource('attrs.c', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(fns).toEqual(
+        expect.arrayContaining([
+          'GoodName', 'LostName', 'NoAttr', 'BuiltinRet', 'RawAttr', 'OneNamedArg', 'PtrRet',
+        ])
+      );
+      // The bug shape: a parameter list stored as a name.
+      expect(fns.find((n) => n.includes('('))).toBeUndefined();
+    });
+
+    it('blankCLeadingAttrMacros only touches the MACRO-ret-name-( definition shape', () => {
+      // Blanked: the definition shape (offset-preserving).
+      expect(blankCLeadingAttrMacros('SEC_ATTR UINT32 f(void) {}')).toBe(
+        '         UINT32 f(void) {}'
+      );
+      // Untouched: a plain typedef'd return with ONE identifier before `(`.
+      expect(blankCLeadingAttrMacros('UINT32 helper(void) {}')).toBe('UINT32 helper(void) {}');
+      // Untouched: an ALL-CAPS function CALL at line start.
+      expect(blankCLeadingAttrMacros('MY_ASSERT(x);')).toBe('MY_ASSERT(x);');
+      // Untouched: #define lines (start with #, not line-leading CAPS).
+      const def = '#define SEC_ATTR __attribute__((section(".init")))';
+      expect(blankCLeadingAttrMacros(def)).toBe(def);
+      // Untouched: multi-word builtin returns (the grammar keeps the name there).
+      expect(blankCLeadingAttrMacros('SEC_ATTR unsigned int f(void) {}')).toBe(
+        'SEC_ATTR unsigned int f(void) {}'
+      );
+      // Untouched: mid-line uses.
+      expect(blankCLeadingAttrMacros('x = SEC_ATTR UINT32 y(z);')).toBe(
+        'x = SEC_ATTR UINT32 y(z);'
+      );
+    });
+  });
+
+  describe('C++ out-of-line template method receivers (#1286)', () => {
+    // `template<typename T> T Box<T>::get()` used to store qualified_name
+    // `Box<T>::get` — the `<T>` qualifier never matched the class node indexed
+    // as `Box`, and long multi-line parameter lists could push qualified_name
+    // past NAME_MAX. Inline definitions of the same method produce `Box::get`,
+    // so the out-of-line form must normalize to the identical name.
+    it('strips the template parameter list from the receiver qualifier', () => {
+      const code = `template <typename T>
+class Box {
+public:
+    T get() const;
+    void set(T v);
+private:
+    T value;
+};
+
+template <typename T> T Box<T>::get() const { return value; }
+template <typename T> void Box<T>::set(T v) { value = v; }
+`;
+      const result = extractFromSource('box.cpp', code);
+      expect(result.errors).toHaveLength(0);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      const qns = methods.map((n) => n.qualifiedName).sort();
+      // Out-of-line definitions carry the SAME qualifier as the class node.
+      expect(qns).toContain('Box::get');
+      expect(qns).toContain('Box::set');
+      expect(qns.find((q) => q?.includes('<'))).toBeUndefined();
+      // Names themselves stay clean.
+      expect(methods.map((n) => n.name).sort()).toEqual(expect.arrayContaining(['get', 'set']));
+    });
+
+    it('multi-line template parameter lists cannot leak into qualified_name (NAME_MAX overflow shape)', () => {
+      // The ICU capi_helper.h shape: enormous multi-line parameter names made
+      // qualified_name 272 bytes (> NAME_MAX 255) including embedded newlines.
+      const code = `template <typename CType,
+          typename CPPType,
+          int32_t kMagicValidationSentinelConstantForTheHelperTemplateClassInstanceGuardLong>
+class ApiHelper {
+public:
+    CPPType* validate();
+};
+
+template <typename CType,
+          typename CPPType,
+          int32_t kMagicValidationSentinelConstantForTheHelperTemplateClassInstanceGuardLong>
+CPPType* ApiHelper<CType,
+                   CPPType,
+                   kMagicValidationSentinelConstantForTheHelperTemplateClassInstanceGuardLong>::validate() {
+    return nullptr;
+}
+`;
+      const result = extractFromSource('capi_helper.h', code);
+      const validate = result.nodes.find((n) => n.kind === 'method' && n.name === 'validate' && n.qualifiedName?.includes('::'));
+      expect(validate).toBeDefined();
+      expect(validate!.qualifiedName).toBe('ApiHelper::validate');
+      expect(validate!.qualifiedName!.length).toBeLessThan(255);
+      expect(validate!.qualifiedName).not.toMatch(/[<>\n]/);
     });
   });
 
@@ -5425,6 +6193,74 @@ end
   });
 });
 
+describe('C++ pure-virtual method nodes (#1727)', () => {
+  // Pure-virtual methods are field_declarations (`virtual int read(int key) = 0;`),
+  // not function_definitions — they previously minted no method node, so calls
+  // through an abstract base and cpp-override synthesis had nothing to attach to.
+  // Java interface methods already get nodes; C++ should behave similarly.
+  it('indexes Store::read from the issue fixture and records the call', () => {
+    const code = `
+class Store {
+public:
+    virtual ~Store() {}
+    virtual int read(int key) = 0;
+};
+
+class DiskStore : public Store {
+public:
+    int read(int key) override { return key + 1; }
+};
+
+class MemStore : public Store {
+public:
+    int read(int key) override { return key + 2; }
+};
+
+int fetch(Store* s, int k) {
+    return s->read(k);
+}
+`;
+    const result = extractFromSource('store.cc', code);
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.qualifiedName);
+    expect(methods).toContain('Store::read');
+    expect(methods).toContain('DiskStore::read');
+    expect(methods).toContain('MemStore::read');
+
+    const baseRead = result.nodes.find((n) => n.qualifiedName === 'Store::read');
+    expect(baseRead?.isAbstract).toBe(true);
+
+    // Call site unresolved ref targets the method name (resolver types the receiver).
+    expect(
+      result.unresolvedReferences.some(
+        (r) => r.referenceKind === 'calls' && (r.referenceName === 'read' || r.referenceName.endsWith('.read') || r.referenceName.endsWith('->read') || r.referenceName === 's.read')
+      )
+    ).toBe(true);
+  });
+
+  it('indexes pure virtuals with pointer/reference return types and operators', () => {
+    const code = `
+class Cloneable {
+public:
+    virtual Cloneable* clone() = 0;
+    virtual const Foo& get() = 0;
+    virtual Cloneable& operator=(const Cloneable&) = 0;
+    int notPure(int x);
+    int data = 0;
+};
+`;
+    const result = extractFromSource('clone.hpp', code);
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+    expect(methods).toContain('clone');
+    expect(methods).toContain('get');
+    expect(methods).toContain('operator=');
+    // Non-pure prototype and data member must NOT become methods here.
+    expect(methods).not.toContain('notPure');
+    expect(methods).not.toContain('data');
+    expect(result.nodes.find((n) => n.name === 'clone')?.isAbstract).toBe(true);
+  });
+
+});
+
 describe('C++ free-function name extraction', () => {
   let tempDir: string;
   let cg: CodeGraph;
@@ -5485,6 +6321,71 @@ std::string use() {
       const reached = [...cg.getImpactRadius(fn.id, 3).nodes.values()].map((n) => n.filePath ?? '');
       expect(reached.some((p) => p.endsWith('user.cc')), `${fn.name} should be called from user.cc`).toBe(true);
     }
+  });
+});
+
+describe('C/C++ union declarations', () => {
+  it('extracts a named union as a type node, but not a forward declaration', () => {
+    const code = `
+union packet_hdr {
+  unsigned int raw;
+  unsigned short port;
+};
+
+/* forward declaration — not a definition */
+union opaque_hdr;
+
+static unsigned int hdr_raw(union packet_hdr *h) { return h->raw; }
+`;
+    const result = extractFromSource('packet.c', code);
+
+    const hdr = result.nodes.find((n) => n.name === 'packet_hdr');
+    expect(hdr).toBeDefined();
+    expect(hdr?.kind).toBe('union');
+
+    // Same rule as `struct Foo;`: bodiless is a forward declaration, so it must
+    // not mint a phantom node beside the real definition.
+    expect(result.nodes.some((n) => n.name === 'opaque_hdr')).toBe(false);
+
+    // Exactly one node for the type — the definition — so a call site or a
+    // `union packet_hdr *` parameter has a single resolution target.
+    expect(result.nodes.filter((n) => n.name === 'packet_hdr')).toHaveLength(1);
+  });
+
+  it('gives a typedef union the typedef name, not a second <anonymous> node', () => {
+    const code = `
+typedef union {
+  unsigned int u;
+  float f;
+} word_t;
+`;
+    const result = extractFromSource('word.c', code);
+
+    const word = result.nodes.find((n) => n.name === 'word_t');
+    expect(word?.kind).toBe('union');
+    // Resolved through the typedef the same way `typedef struct { … } X;` is,
+    // so the anonymous union body does not become its own node.
+    expect(result.nodes.some((n) => n.name === '<anonymous>')).toBe(false);
+  });
+
+  it('extracts a C++ union with member functions', () => {
+    const code = `
+union Value {
+  int i;
+  double d;
+  int as_int() const { return i; }
+};
+`;
+    const result = extractFromSource('value.cpp', code);
+
+    const value = result.nodes.find((n) => n.name === 'Value');
+    expect(value?.kind).toBe('union');
+
+    const asInt = result.nodes.find((n) => n.name === 'as_int');
+    expect(asInt).toBeDefined();
+    expect(
+      result.edges.some((e) => e.kind === 'contains' && e.source === value?.id && e.target === asInt?.id)
+    ).toBe(true);
   });
 });
 
@@ -6672,6 +7573,54 @@ export function multiply(a: number, b: number): number {
     cg.close();
   });
 
+  it('should resolve an ES import from a .xsjs file to a .xsjslib file (#556)', async () => {
+    // Exercises the JS import-path resolution list: `./helpers` must resolve to
+    // `helpers.xsjslib`. `decoy.js` exports the same symbol name and is never
+    // imported — without .xsjs/.xsjslib in the list the import resolves to
+    // nothing and the call falls back to same-name matching, which binds the
+    // edge to the decoy. The decoy is what makes this test fail on a regression:
+    // with a lone helpers.xsjslib the fallback happens to pick the right file.
+    fs.writeFileSync(
+      path.join(tempDir, 'helpers.xsjslib'),
+      'export function buildQuery(table) {\n  return "SELECT * FROM " + table;\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'decoy.js'),
+      'export function buildQuery(table) {\n  return "DECOY " + table;\n}\n'
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'service.xsjs'),
+      'import { buildQuery } from "./helpers";\n\nfunction run() {\n  return buildQuery("users");\n}\n'
+    );
+
+    const cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+
+    const run = cg.getNodesInFile('service.xsjs').find((n) => n.name === 'run');
+    const buildQuery = cg.getNodesInFile('helpers.xsjslib').find((n) => n.name === 'buildQuery');
+    const decoy = cg.getNodesInFile('decoy.js').find((n) => n.name === 'buildQuery');
+    expect(run).toBeDefined();
+    expect(buildQuery).toBeDefined();
+    expect(decoy).toBeDefined();
+
+    expect(
+      cg.getFileDependencies('service.xsjs'),
+      "'./helpers' should resolve to helpers.xsjslib, not the same-named decoy"
+    ).toEqual(['helpers.xsjslib']);
+
+    const outgoing = cg.getOutgoingEdges(run!.id);
+    expect(
+      outgoing.find((e) => e.target === buildQuery!.id),
+      'run() should resolve buildQuery across the .xsjs -> .xsjslib import'
+    ).toBeDefined();
+    expect(
+      outgoing.find((e) => e.target === decoy!.id),
+      'run() must not bind to the unrelated same-named export in decoy.js'
+    ).toBeUndefined();
+
+    cg.close();
+  });
+
   it('should count the full file-level tracked class (yaml/twig/properties) in indexFiles()', async () => {
     fs.writeFileSync(path.join(tempDir, 'app.yaml'), 'name: test\n');
     fs.writeFileSync(path.join(tempDir, 'view.twig'), '{{ title }}\n');
@@ -6793,6 +7742,105 @@ describe('Directory Exclusion', () => {
     expect(files[0]).not.toContain('\\');
   });
 });
+
+
+describe('Nested .gitignore node_modules exclusion (#1567)', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    cleanupTempDir(tempDir);
+  });
+
+  function plantNodeModules(subproject: string, packages = 80): void {
+    const base = path.join(tempDir, subproject, 'node_modules');
+    for (let i = 0; i < packages; i++) {
+      const pkg = path.join(base, `pkg${i}`);
+      fs.mkdirSync(pkg, { recursive: true });
+      fs.writeFileSync(path.join(pkg, 'index.js'), `module.exports = ${i};`);
+      fs.writeFileSync(path.join(pkg, 'index.d.ts'), 'export const n: number;');
+      if (i % 4 === 0) fs.writeFileSync(path.join(pkg, '.gitignore'), '*.map\n');
+      const nested = path.join(pkg, 'node_modules', `nested${i}`);
+      fs.mkdirSync(nested, { recursive: true });
+      fs.writeFileSync(path.join(nested, 'lib.ts'), 'export const x = 1;');
+    }
+  }
+
+  function initGitRepo(): void {
+    const { execFileSync } = require('child_process') as typeof import('child_process');
+    execFileSync('git', ['init'], { cwd: tempDir, stdio: 'ignore' });
+    execFileSync('git', ['add', '-A'], { cwd: tempDir, stdio: 'ignore' });
+    execFileSync(
+      'git',
+      ['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '-m', 'init'],
+      { cwd: tempDir, stdio: 'ignore' },
+    );
+  }
+
+  it('excludes node_modules ignored only by a nested .gitignore (git path)', () => {
+    fs.mkdirSync(path.join(tempDir, 'frontend', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'extension', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'frontend', 'src', 'app.ts'), 'export const a = 1;');
+    fs.writeFileSync(path.join(tempDir, 'extension', 'src', 'ext.ts'), 'export const b = 1;');
+    fs.writeFileSync(path.join(tempDir, 'root.ts'), 'export const r = 1;');
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), '*.log\n');
+    fs.writeFileSync(path.join(tempDir, 'frontend', '.gitignore'), '/node_modules\n');
+    fs.writeFileSync(path.join(tempDir, 'extension', '.gitignore'), 'node_modules/\n');
+    plantNodeModules('frontend');
+    plantNodeModules('extension');
+    initGitRepo();
+
+    const files = scanDirectory(tempDir);
+    expect(files.sort()).toEqual(['extension/src/ext.ts', 'frontend/src/app.ts', 'root.ts']);
+    expect(files.every((f) => !f.includes('node_modules'))).toBe(true);
+  });
+
+  it('excludes nested-gitignore node_modules on the filesystem-walk fallback too', () => {
+    fs.mkdirSync(path.join(tempDir, 'frontend', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'extension', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'frontend', 'src', 'app.ts'), 'export const a = 1;');
+    fs.writeFileSync(path.join(tempDir, 'extension', 'src', 'ext.ts'), 'export const b = 1;');
+    fs.writeFileSync(path.join(tempDir, 'root.ts'), 'export const r = 1;');
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), '*.log\n');
+    fs.writeFileSync(path.join(tempDir, 'frontend', '.gitignore'), '/node_modules\n');
+    fs.writeFileSync(path.join(tempDir, 'extension', '.gitignore'), 'node_modules/\n');
+    plantNodeModules('frontend', 60);
+    plantNodeModules('extension', 60);
+
+    const files = scanDirectory(tempDir);
+    expect(files.sort()).toEqual(['extension/src/ext.ts', 'frontend/src/app.ts', 'root.ts']);
+    expect(files.every((f) => !f.includes('node_modules'))).toBe(true);
+  });
+
+  it('still excludes when root only lists one subproject node_modules (Boba-like)', () => {
+    fs.mkdirSync(path.join(tempDir, 'frontend', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'extension', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'frontend', 'src', 'app.ts'), 'export const a = 1;');
+    fs.writeFileSync(path.join(tempDir, 'extension', 'src', 'ext.ts'), 'export const b = 1;');
+    fs.writeFileSync(path.join(tempDir, 'root.ts'), 'export const r = 1;');
+    fs.writeFileSync(
+      path.join(tempDir, '.gitignore'),
+      ['*.log', 'frontend/node_modules/', 'frontend/.angular/', ''].join('\n'),
+    );
+    fs.writeFileSync(path.join(tempDir, 'frontend', '.gitignore'), '/node_modules\n');
+    fs.writeFileSync(path.join(tempDir, 'extension', '.gitignore'), 'node_modules/\n');
+    plantNodeModules('frontend', 40);
+    plantNodeModules('extension', 40);
+
+    const fsFiles = scanDirectory(tempDir);
+    expect(fsFiles.every((f) => !f.includes('node_modules'))).toBe(true);
+    expect(fsFiles.sort()).toEqual(['extension/src/ext.ts', 'frontend/src/app.ts', 'root.ts']);
+
+    initGitRepo();
+    const gitFiles = scanDirectory(tempDir);
+    expect(gitFiles.every((f) => !f.includes('node_modules'))).toBe(true);
+    expect(gitFiles.sort()).toEqual(['extension/src/ext.ts', 'frontend/src/app.ts', 'root.ts']);
+  });
+});
+
 
 describe('Git Submodules', () => {
   let tempDir: string;
@@ -7138,6 +8186,82 @@ describe('Nested non-submodule git repos', () => {
     expect(ig.ignores('dist/')).toBe(true); // valid rule survives
     expect(ig.ignores('src/app.ts')).toBe(false);
   });
+
+  it('buildDefaultIgnore honors .git/info/exclude (#1728)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'exclude-root');
+    fs.mkdirSync(root, { recursive: true });
+    git(root, 'init', '-q');
+    fs.writeFileSync(path.join(root, 'src.ts'), 'export const x = 1;\n');
+    fs.mkdirSync(path.join(root, '.claude', 'worktrees', 'agent-1'), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, '.claude', 'worktrees', 'agent-1', 'src.ts'),
+      'export const w = 1;\n',
+    );
+    // Not in .gitignore — only in info/exclude (the reporter's exact shape).
+    fs.writeFileSync(
+      path.join(root, '.git', 'info', 'exclude'),
+      '**/.claude/worktrees/\n',
+    );
+
+    const ig = buildDefaultIgnore(root);
+    expect(ig.ignores('src.ts')).toBe(false);
+    expect(ig.ignores('.claude/worktrees/agent-1/src.ts')).toBe(true);
+    expect(ig.ignores('.claude/worktrees/')).toBe(true);
+
+    // ScopeIgnore (watcher path) agrees, including via git ignored-dir seeding.
+    const scope = buildScopeIgnore(root);
+    expect(scope.ignores('src.ts')).toBe(false);
+    expect(scope.ignores('.claude/worktrees/agent-1/')).toBe(true);
+    expect(scope.ignores('.claude/worktrees/agent-1/src.ts')).toBe(true);
+  });
+
+  it('buildDefaultIgnore honors core.excludesFile (#1728)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'excludesfile-root');
+    fs.mkdirSync(root, { recursive: true });
+    git(root, 'init', '-q');
+    const globalExcludes = path.join(tempDir, 'global-excludes');
+    fs.writeFileSync(globalExcludes, 'scratch/\n');
+    git(root, 'config', 'core.excludesFile', globalExcludes);
+    fs.mkdirSync(path.join(root, 'scratch'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'scratch', 'tmp.ts'), 'export const t = 1;\n');
+    fs.writeFileSync(path.join(root, 'app.ts'), 'export const a = 1;\n');
+
+    const ig = buildDefaultIgnore(root);
+    expect(ig.ignores('app.ts')).toBe(false);
+    expect(ig.ignores('scratch/')).toBe(true);
+    expect(ig.ignores('scratch/tmp.ts')).toBe(true);
+  });
+
+  it('buildScopeIgnore prunes dirs ignored only by a nested .gitignore (#1728)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'nested-gi-root');
+    fs.mkdirSync(path.join(root, 'pkg', 'build'), { recursive: true });
+    git(root, 'init', '-q');
+    git(root, 'config', 'user.email', 'test@test.com');
+    git(root, 'config', 'user.name', 'Test');
+    fs.writeFileSync(path.join(root, 'pkg', 'app.ts'), 'export const a = 1;\n');
+    fs.writeFileSync(path.join(root, 'pkg', 'build', 'out.ts'), 'export const o = 1;\n');
+    fs.writeFileSync(path.join(root, 'pkg', '.gitignore'), 'build/\n');
+    // Commit only the non-ignored file so git still reports build/ as ignored-other.
+    git(root, 'add', 'pkg/app.ts', 'pkg/.gitignore');
+    git(root, 'commit', '-q', '-m', 'init');
+
+    const scope = buildScopeIgnore(root);
+    expect(scope.ignores('pkg/app.ts')).toBe(false);
+    expect(scope.ignores('pkg/build/')).toBe(true);
+    expect(scope.ignores('pkg/build/out.ts')).toBe(true);
+  });
 });
 
 // =============================================================================
@@ -7406,6 +8530,35 @@ def processData(): Unit = {
       const result = extractFromSource('processor.scala', code);
       const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
       expect(calls.length).toBeGreaterThan(0);
+    });
+
+    it('walks a val/var initializer scoped to the declared symbol (#693 for Scala)', () => {
+      // The val/var hook minted the node and returned true, so the dispatcher
+      // only scanned the subtree for function-as-value candidates — every call
+      // in an initializer was dropped, which on a `val`-heavy codebase
+      // (SpinalHDL, Akka wiring) is most of the wiring.
+      const code = `
+class C {
+  val fieldLambda: () => Unit = () => target()
+  val direct = target()
+  lazy val lazily = target()
+  private def target(): Unit = {}
+}
+
+object O {
+  val topLambda = () => hit()
+  def hit(): Unit = {}
+}
+`;
+      const result = extractFromSource('C.scala', code);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      const callersOf = (name: string) =>
+        result.unresolvedReferences
+          .filter((u) => u.referenceKind === 'calls' && u.referenceName === name)
+          .map((u) => byId.get(u.fromNodeId)?.name)
+          .sort();
+      expect(callersOf('target')).toEqual(['direct', 'fieldLambda', 'lazily']);
+      expect(callersOf('hit')).toEqual(['topLambda']);
     });
   });
 });
@@ -7987,6 +9140,58 @@ function M:send(data) return self end
       const send = methods.find((m) => m.name === 'send');
       expect(send?.qualifiedName).toBe('M::send');
     });
+
+    it('should name function expressions from local, member, and table-field bindings', () => {
+      const code = `
+local function helper() return 1 end
+local localFn = function() return helper() end
+local M = {
+  callbacks = {
+    onStart = function() return helper() end,
+    ["onStop"] = function() return helper() end,
+    [DYNAMIC] = function() return helper() end,
+  },
+}
+M.assignedFn = function() return helper() end
+M["bracketFn"] = function() return helper() end
+localFn()
+`;
+      const result = extractFromSource('handlers.lua', code);
+      const localFn = result.nodes.find((n) => n.kind === 'function' && n.name === 'localFn');
+      const assignedFn = result.nodes.find(
+        (n) => n.kind === 'method' && n.qualifiedName === 'M::assignedFn'
+      );
+      const onStart = result.nodes.find(
+        (n) => n.kind === 'method' && n.qualifiedName === 'M.callbacks::onStart'
+      );
+      const onStop = result.nodes.find(
+        (n) => n.kind === 'method' && n.qualifiedName === 'M.callbacks::onStop'
+      );
+      const bracketFn = result.nodes.find(
+        (n) => n.kind === 'method' && n.qualifiedName === 'M::bracketFn'
+      );
+
+      expect(localFn).toBeDefined();
+      expect(assignedFn).toBeDefined();
+      expect(onStart).toBeDefined();
+      expect(onStop).toBeDefined();
+      expect(bracketFn).toBeDefined();
+      expect(result.nodes.some((n) => n.name === 'DYNAMIC')).toBe(false);
+      expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'localFn')).toBe(false);
+
+      for (const callable of [localFn, assignedFn, onStart, onStop, bracketFn]) {
+        expect(
+          result.unresolvedReferences.some(
+            (r) => r.fromNodeId === callable!.id && r.referenceKind === 'calls' && r.referenceName === 'helper'
+          )
+        ).toBe(true);
+      }
+      expect(
+        result.unresolvedReferences.some(
+          (r) => r.referenceKind === 'calls' && r.referenceName === 'localFn'
+        )
+      ).toBe(true);
+    });
   });
 
   describe('Variable extraction', () => {
@@ -8180,6 +9385,22 @@ void helperFunction(int count) {
     const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
     expect(imports).toContain('Foundation/Foundation.h');
     expect(imports).toContain('MyClass.h');
+  });
+
+  it('extracts union declarations as first-class union nodes', () => {
+    const code = `
+typedef union {
+  unsigned int raw;
+  float value;
+} NumberBits;
+
+union opaque_bits;
+`;
+    const result = extractFromSource('NumberBits.m', code);
+
+    const numberBits = result.nodes.find((n) => n.name === 'NumberBits');
+    expect(numberBits?.kind).toBe('union');
+    expect(result.nodes.some((n) => n.name === 'opaque_bits')).toBe(false);
   });
 
   it('should record inheritance and protocol conformance', () => {
@@ -9851,7 +11072,81 @@ helper() -> ok.
       const ns = result.nodes.find((n) => n.kind === 'namespace');
       expect(ns?.name).toBe('my_server');
       const start = result.nodes.find((n) => n.kind === 'function' && n.name === 'start');
-      expect(start?.qualifiedName).toBe('my_server::start');
+      // Arity is part of an Erlang function's identity — qualifiedName carries it (#1610).
+      expect(start?.qualifiedName).toBe('my_server::start/0');
+    });
+
+    it('should give same-name different-arity functions separate arity-qualified nodes (#1610)', () => {
+      const code = `-module(gap).
+-export([f/1, f/2]).
+
+f(X)    -> X + 1.
+f(X, Y) -> X + Y.
+`;
+      const result = extractFromSource('src/gap.erl', code);
+      const fns = result.nodes.filter((n) => n.kind === 'function' && n.name === 'f');
+      expect(fns).toHaveLength(2);
+      expect(fns.map((n) => n.qualifiedName).sort()).toEqual(['gap::f/1', 'gap::f/2']);
+      const f1 = fns.find((n) => n.qualifiedName === 'gap::f/1')!;
+      const f2 = fns.find((n) => n.qualifiedName === 'gap::f/2')!;
+      expect([f1.startLine, f1.endLine]).toEqual([4, 4]);
+      expect([f2.startLine, f2.endLine]).toEqual([5, 5]);
+      expect(f1.signature).toBe('f(X)');
+      expect(f2.signature).toBe('f(X, Y)');
+    });
+
+    it('should split interleaved same-name defs by arity with distinct qualified names', () => {
+      const code = `-module(inter).
+
+f(X)    -> X + 1;
+f(Y)    -> Y.
+g()     -> ok.
+f(X, Y) -> X + Y.
+`;
+      const result = extractFromSource('src/inter.erl', code);
+      const fs = result.nodes.filter((n) => n.kind === 'function' && n.name === 'f');
+      expect(fs).toHaveLength(2);
+      expect(fs.map((n) => n.qualifiedName).sort()).toEqual(['inter::f/1', 'inter::f/2']);
+      // Clauses of the same arity still merge into one span.
+      const f1 = fs.find((n) => n.qualifiedName === 'inter::f/1')!;
+      expect([f1.startLine, f1.endLine]).toEqual([3, 4]);
+    });
+
+    it('should flag exported per arity (#1610)', () => {
+      const code = `-module(m).
+-export([f/1]).
+
+f(X) -> X.
+f(X, Y) -> {X, Y}.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      expect(result.nodes.find((n) => n.qualifiedName === 'm::f/1')?.isExported).toBe(true);
+      expect(result.nodes.find((n) => n.qualifiedName === 'm::f/2')?.isExported).toBe(false);
+    });
+
+    it('should attach a -spec sitting between two arities to the arity it names (#1610)', () => {
+      const code = `-module(deleg).
+-export([header/2, header/3]).
+
+header(Name, Req) ->
+    header(Name, Req, undefined).
+
+-spec header(binary(), map(), any()) -> any().
+header(Name, Headers, Default) ->
+    maps:get(Name, Headers, Default).
+`;
+      const result = extractFromSource('src/deleg.erl', code);
+      const h2 = result.nodes.find((n) => n.qualifiedName === 'deleg::header/2')!;
+      const h3 = result.nodes.find((n) => n.qualifiedName === 'deleg::header/3')!;
+      expect(h2.signature).toBe('header(Name, Req)');
+      expect(h3.signature).toBe('-spec header(binary(), map(), any()) -> any().');
+      expect([h2.startLine, h2.endLine]).toEqual([4, 5]);
+      expect(h3.startLine).toBe(8);
+      // The delegation call carries the callee's arity — no more self-loop.
+      const calls = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(calls).toContain('header/3');
     });
 
     it('should flag exported functions and honor -compile(export_all)', () => {
@@ -9986,11 +11281,31 @@ prepare(X) -> X.
 `;
       const result = extractFromSource('src/m.erl', code);
       const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
-      expect(calls).toContain('prepare');
-      // `mod:fn(...)` is emitted as `mod::fn` — the same shape the module
-      // namespace gives every function's qualifiedName, so it resolves via
-      // the qualified-name matcher.
-      expect(calls).toContain('other_mod::process');
+      expect(calls).toContain('prepare/1');
+      // `mod:fn(...)` is emitted as `mod::fn/arity` — the same shape the
+      // module namespace + arity suffix gives every function's qualifiedName,
+      // so it resolves via the qualified-name matcher (#1610).
+      expect(calls).toContain('other_mod::process/1');
+    });
+
+    it('should carry written arity on fun references and static MFA lists (#1610)', () => {
+      const code = `-module(m).
+-export([go/0]).
+
+go() ->
+    lists:map(fun bump/1, [1]),
+    Prod = fun other_mod:produce/2,
+    proc_lib:spawn_link(?MODULE, work, [a, b]),
+    Prod.
+
+bump(X) -> X + 1.
+work(_A, _B) -> ok.
+`;
+      const result = extractFromSource('src/m.erl', code);
+      const refs = result.unresolvedReferences;
+      expect(refs.some((r) => r.referenceKind === 'references' && r.referenceName === 'bump/1')).toBe(true);
+      expect(refs.some((r) => r.referenceKind === 'references' && r.referenceName === 'other_mod::produce/2')).toBe(true);
+      expect(refs.some((r) => r.referenceKind === 'calls' && r.referenceName === 'work/2')).toBe(true);
     });
 
     it('should not emit calls for dynamic dispatch (var module / var fun)', () => {
@@ -10003,9 +11318,9 @@ run(Mod, F) ->
 `;
       const result = extractFromSource('src/m.erl', code);
       const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
-      expect(calls).not.toContain('handle');
-      expect(calls).not.toContain('Mod::handle');
-      expect(calls).not.toContain('F');
+      expect(calls.some((c) => c.startsWith('handle'))).toBe(false);
+      expect(calls.some((c) => c.startsWith('Mod::'))).toBe(false);
+      expect(calls.some((c) => c === 'F' || c.startsWith('F/'))).toBe(false);
     });
 
     it('should connect gen_server self-calls to the module handlers', () => {
@@ -10033,9 +11348,10 @@ handle_cast({put, K, V}, S) -> {noreply, maps:put(K, V, S)}.
       const result = extractFromSource('src/kv_store.erl', code);
       const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
       // ?SERVER (defined as ?MODULE), ?MODULE, and the module's own atom all
-      // count as self — public API wrappers connect to their handlers.
-      expect(calls.filter((c) => c === 'kv_store::handle_call')).toHaveLength(2);
-      expect(calls).toContain('kv_store::handle_cast');
+      // count as self — public API wrappers connect to their handlers, at
+      // OTP's fixed handler arities (#1610).
+      expect(calls.filter((c) => c === 'kv_store::handle_call/3')).toHaveLength(2);
+      expect(calls).toContain('kv_store::handle_cast/2');
     });
 
     it('should connect gen_server calls to a registered-name module, directly or via an atom macro', () => {
@@ -10055,8 +11371,8 @@ evict(Key) ->
       // OTP's {local, ?MODULE} convention names a server after its module —
       // a cross-module registered name targets that module's handlers. A name
       // matching no module simply never resolves downstream.
-      expect(calls).toContain('kv_store::handle_call');
-      expect(calls).toContain('kv_store::handle_cast');
+      expect(calls).toContain('kv_store::handle_call/3');
+      expect(calls).toContain('kv_store::handle_cast/2');
     });
 
     it('should not connect gen_server calls with dynamic targets', () => {
@@ -10089,10 +11405,10 @@ monitor_loop(_P) -> ok.
 `;
       const result = extractFromSource('src/m.erl', code);
       const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
-      expect(calls).toContain('request_process'); // ?MODULE → bare, same-file resolution
-      expect(calls).toContain('monitor_loop');
-      expect(calls).toContain('other_mod::handle');
-      expect(calls).toContain('other_mod::tick');
+      expect(calls).toContain('request_process/2'); // ?MODULE → bare-with-arity, same-file resolution
+      expect(calls).toContain('monitor_loop/1');
+      expect(calls).toContain('other_mod::handle/1');
+      expect(calls).toContain('other_mod::tick/0');
     });
 
     it('should stay silent on dynamic spawn/apply (var module, fun value, or plain fun)', () => {
@@ -10109,8 +11425,8 @@ helper() -> ok.
       const result = extractFromSource('src/m.erl', code);
       const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
       // The fun body's call is still walked; no phantom MFA targets appear.
-      expect(calls).toContain('helper');
-      expect(calls.filter((c) => c !== 'spawn' && c !== 'apply' && c !== 'helper')).toHaveLength(0);
+      expect(calls).toContain('helper/0');
+      expect(calls.filter((c) => !['spawn/3', 'spawn/1', 'apply/3', 'helper/0'].includes(c))).toHaveLength(0);
     });
 
     it('should treat ?MODULE:fn calls as local calls', () => {
@@ -10124,7 +11440,7 @@ work() -> ok.
 `;
       const result = extractFromSource('src/m.erl', code);
       const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
-      expect(calls).toContain('work');
+      expect(calls).toContain('work/0');
     });
 
     it('should capture fun name/arity values as function references', () => {
@@ -10139,8 +11455,8 @@ notify(_P) -> ok.
 `;
       const result = extractFromSource('src/m.erl', code);
       const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references').map((r) => r.referenceName);
-      expect(refs).toContain('notify');
-      expect(refs).toContain('m::notify');
+      expect(refs).toContain('notify/1');
+      expect(refs).toContain('m::notify/1');
     });
 
     it('should reference records used in bodies and argument patterns', () => {
@@ -10176,8 +11492,8 @@ second(X) -> X.
       const calls = result.unresolvedReferences.filter(
         (r) => r.referenceKind === 'calls' && r.fromNodeId === handle?.id
       ).map((r) => r.referenceName);
-      expect(calls).toContain('first');
-      expect(calls).toContain('second');
+      expect(calls).toContain('first/1');
+      expect(calls).toContain('second/1');
     });
   });
 
@@ -10199,8 +11515,8 @@ analyze(Path) ->
       expect(fns).toContain('main');
       expect(fns).toContain('analyze');
       const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
-      expect(calls).toContain('analyze');
-      expect(calls).toContain('io::format');
+      expect(calls).toContain('analyze/1');
+      expect(calls).toContain('io::format/2');
     });
 
     it('should link an app resource file to its callback module and dependency apps', () => {
@@ -10246,7 +11562,7 @@ do_thing(X) ->
       const refsFrom = (id?: string) =>
         result.unresolvedReferences.filter((r) => r.fromNodeId === id).map((r) => `${r.referenceKind}:${r.referenceName}`);
       // The body's remote call belongs to the macro node — true exactly once.
-      expect(refsFrom(macro?.id)).toContain('calls:audit_logger::log');
+      expect(refsFrom(macro?.id)).toContain('calls:audit_logger::log/2');
       // The use site joins the call chain: do_thing -calls→ LOG_AUDIT.
       expect(refsFrom(doThing?.id)).toContain('calls:LOG_AUDIT');
     });
@@ -10279,7 +11595,7 @@ prepare() -> ok.
       const result = extractFromSource('src/m.erl', code);
       const refs = result.unresolvedReferences.map((r) => r.referenceName);
       // The nested call inside the macro's arguments still attributes to check/0.
-      expect(refs).toContain('prepare');
+      expect(refs).toContain('prepare/0');
       // ?assertEqual (an OTP header macro) is emitted and simply never resolves…
       expect(refs).toContain('assertEqual');
       // …but predefined macros have no definition to link.
@@ -10299,7 +11615,7 @@ prepare() -> ok.
       const alias = result.nodes.find((n) => n.kind === 'constant' && n.name === 'ALIAS');
       const refsFrom = (id?: string) =>
         result.unresolvedReferences.filter((r) => r.fromNodeId === id).map((r) => `${r.referenceKind}:${r.referenceName}`);
-      expect(refsFrom(target?.id)).toContain('calls:target_fn');
+      expect(refsFrom(target?.id)).toContain('calls:target_fn/0');
       expect(refsFrom(alias?.id)).toContain('references:TARGET');
     });
   });
@@ -11006,5 +12322,402 @@ import DataStore from '../data/DataStore';
       expect(imports).toContain('../model/TodoItem');
       expect(imports).toContain('../data/DataStore');
     });
+  });
+});
+
+// R7a preParse additions — the blanking passes added so macro-heavy C/C++
+// parses clean enough for the kernel route (each also improves the wasm
+// path's own graphs). Offset preservation is load-bearing everywhere.
+describe('C/C++ kernel-port preParse blanks (R7a)', () => {
+  it('blankCCplusplusGuardBodies blanks extern-C guard bodies, keeps directives', async () => {
+    const { blankCCplusplusGuardBodies } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      '#ifdef __cplusplus',
+      'extern "C" {',
+      '#endif',
+      'int real_decl(void);',
+      '#ifdef __cplusplus',
+      '}',
+      '#endif',
+      '',
+    ].join('\n');
+    const out = blankCCplusplusGuardBodies(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('extern "C"');
+    expect(out).toContain('#ifdef __cplusplus'); // directives stay
+    expect(out).toContain('int real_decl(void);');
+    // A guard with a nested directive bails (needs real preprocessing).
+    const nested = [
+      '#ifdef __cplusplus',
+      '#define EXTERNC extern "C"',
+      '#endif',
+      '',
+    ].join('\n');
+    expect(blankCCplusplusGuardBodies(nested)).toBe(nested);
+    // The `#ifndef` inverse guard is C-visible and must be untouched.
+    const inverse = ['#ifndef __cplusplus', 'int c_only(void);', '#endif', ''].join('\n');
+    expect(blankCCplusplusGuardBodies(inverse)).toBe(inverse);
+  });
+
+  it('blankLoneMacroLines blanks namespace-management macros, spares expression operands', async () => {
+    const { blankLoneMacroLines } = await import('../src/extraction/languages/c-cpp');
+    const src = ['FMT_BEGIN_NAMESPACE', 'struct S { int x; };', 'FMT_END_NAMESPACE', ''].join('\n');
+    const out = blankLoneMacroLines(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('FMT_BEGIN_NAMESPACE');
+    expect(out).toContain('struct S { int x; };');
+    // An ALL-CAPS operand alone on a line inside a multi-line expression is
+    // NOT a lone macro — the next line starts with an operator.
+    const expr = ['int x = 0', '  | FLAG_ONE', '  | FLAG_TWO;', ''].join('\n');
+    expect(blankLoneMacroLines(expr)).toBe(expr);
+    const cont = ['int y =', 'SOME_FLAG', '| OTHER;', ''].join('\n');
+    expect(blankLoneMacroLines(cont)).toBe(cont);
+    // Underscore-free solid words are too risky and stay.
+    const bare = ['NDEBUG', 'int z;', ''].join('\n');
+    expect(blankLoneMacroLines(bare)).toBe(bare);
+  });
+
+  it('blankCDesignatedMacroArgs empties a designated-initializer macro call, offsets kept (#1729)', async () => {
+    const { blankCDesignatedMacroArgs } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'void resetProfile(profile_t *p)',
+      '{',
+      '    RESET_CONFIG(profile_t, p,',
+      '        .pid = { [PID_ROLL] = PID_ROLL_DEFAULT, [PID_YAW] = { 50, 75 } },',
+      '        .limit = 500, // trailing comma follows',
+      '    );',
+      '    log(.5);',
+      '    OTHER_MACRO(a == b, c);',
+      '}',
+    ].join('\n');
+    const out = blankCDesignatedMacroArgs(src);
+    expect(out.length).toBe(src.length);
+    expect(out.split('\n').length).toBe(src.split('\n').length);
+    expect(out).toContain('RESET_CONFIG(');
+    expect(out).not.toContain('.pid');
+    expect(out).not.toContain('PID_ROLL');
+    // The closing `);` keeps its column; the argument lines are spaces.
+    expect(out.split('\n')[5]).toBe('    );');
+    expect(out.split('\n')[3]).toBe(' '.repeat(src.split('\n')[3].length));
+    // A numeric literal and a comparison are not designators.
+    expect(out).toContain('log(.5);');
+    expect(out).toContain('OTHER_MACRO(a == b, c);');
+  });
+
+  it('a designated-initializer macro call no longer swallows the functions after it (#1729)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1729-'));
+    try {
+      // Issue fixture: designated-initializer args + trailing comma. Without
+      // blankCDesignatedMacroArgs, tree-sitter-c error recovery extends
+      // `function_definition` to EOF — `g` vanishes and `h` nests as `f::h`.
+      fs.writeFileSync(
+        path.join(dir, 'pid.c'),
+        [
+          'void f(void)',
+          '{',
+          '    M(a, b,',
+          '        .x = 1,',
+          '        .y = { 1, 2 },',
+          '    );',
+          '}',
+          '',
+          'void g(void)',
+          '{',
+          '}',
+          '',
+          'int h(void)',
+          '{',
+          '    return 1;',
+          '}',
+          '',
+        ].join('\n')
+      );
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const fns = cg.getNodesByKind('function').filter((n) => n.filePath === 'pid.c');
+        const byName = Object.fromEntries(fns.map((n) => [n.name, n]));
+        expect(Object.keys(byName).sort()).toEqual(['f', 'g', 'h']);
+        expect(byName.f!.endLine).toBe(7);
+        expect(byName.g!.qualifiedName).toBe('g');
+        expect(byName.h!.qualifiedName).toBe('h');
+      } finally {
+        cg.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a large designated-initializer macro call keeps later functions top-level (#1729)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1729-large-'));
+    try {
+      // Scale guard for betaflight-sized RESET_CONFIG argument lists.
+      const fields = Array.from({ length: 120 }, (_, i) => `        .field${i} = ${i},`).join('\n');
+      fs.writeFileSync(
+        path.join(dir, 'pid.c'),
+        `void resetProfile(profile_t *p)\n{\n    RESET_CONFIG(profile_t, p,\n${fields}\n    );\n}\n\nvoid g(void)\n{\n}\n\nint h(void)\n{\n    return 1;\n}\n`
+      );
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const fns = cg.getNodesByKind('function').filter((n) => n.filePath === 'pid.c');
+        const byName = Object.fromEntries(fns.map((n) => [n.name, n]));
+        expect(Object.keys(byName).sort()).toEqual(['g', 'h', 'resetProfile']);
+        expect(byName.resetProfile!.endLine).toBe(125);
+        expect(byName.g!.qualifiedName).toBe('g');
+        expect(byName.h!.qualifiedName).toBe('h');
+      } finally {
+        cg.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('blankCStatementMacroCalls blanks indented iterator macros, keeps the block', async () => {
+    const { blankCStatementMacroCalls } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'static void walk(struct list *head) {',
+      '\tlist_for_each_entry(pos, head, member) {',
+      '\t\tuse(pos);',
+      '\t}',
+      '}',
+      '',
+    ].join('\n');
+    const out = blankCStatementMacroCalls(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('list_for_each_entry');
+    expect(out).toContain('use(pos);');
+    // A real call statement ends with `;` — untouched.
+    expect(out).toContain('use(pos);');
+    const call = ['void f(void) {', '\tdo_thing(a, b);', '}', ''].join('\n');
+    expect(blankCStatementMacroCalls(call)).toBe(call);
+    // Column-0 `name(args) {` is an implicit-int function definition — untouched.
+    const kandr = ['main(argc, argv)', '{', '\treturn 0;', '}', ''].join('\n');
+    expect(blankCStatementMacroCalls(kandr)).toBe(kandr);
+    // Control-flow keywords are never macros.
+    const ctrl = ['void g(int x) {', '\twhile (x) {', '\t\tx--;', '\t}', '}', ''].join('\n');
+    expect(blankCStatementMacroCalls(ctrl)).toBe(ctrl);
+  });
+
+  it('blankCTrailingParamAttrMacros blanks `name UNUSED` params, spares call args', async () => {
+    const { blankCTrailingParamAttrMacros } = await import('../src/extraction/languages/c-cpp');
+    const src = 'static int run(int argc UNUSED, const char **argv UNUSED)\n{\n\treturn 0;\n}\n';
+    const out = blankCTrailingParamAttrMacros(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('UNUSED');
+    expect(out).toContain('int argc ');
+    // A macro CONSTANT as a call argument is preceded by `,`/`(`, never by a
+    // bare identifier — untouched.
+    const call = 'void f(void) {\n\tconnect(sock, DEFAULT_TIMEOUT);\n}\n';
+    expect(blankCTrailingParamAttrMacros(call)).toBe(call);
+  });
+
+  it('blankCKernelAnnotations blanks sparse/section dunders, spares parameterized ones and real types', async () => {
+    const { blankCKernelAnnotations } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'static int __init audit_init(void) { return 0; }',
+      'void copy(void __user *dst, const char *src);',
+      '__bpf_kfunc void bpf_iter_destroy(struct bpf_iter_num *it);',
+      '__printf(1, 2) void log_fmt(const char *fmt, ...);',
+      'struct e *entry = container_of(r, struct audit_entry, rule);',
+      '__u32 count = 0;',
+      '',
+    ].join('\n');
+    const out = blankCKernelAnnotations(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('__init');
+    expect(out).not.toContain('__user');
+    expect(out).not.toContain('__bpf_kfunc');
+    // Parameterized annotations keep their name — blanking it would strand
+    // the argument list as a floating parenthesis.
+    expect(out).toContain('__printf(1, 2)');
+    // container_of's type-keyword argument blanks; other `struct` keywords stay.
+    expect(out).toContain('container_of(r,        audit_entry, rule)');
+    expect(out).toContain('struct e *entry');
+    // Real dunder TYPES are not annotations.
+    expect(out).toContain('__u32 count');
+  });
+
+  it('blankCParameterizedAnnotationMacros blanks name+args whole, eats a stranded field semicolon', async () => {
+    const { blankCParameterizedAnnotationMacros } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'struct file *f __free(fput) = NULL;',
+      'static void __printf(4, 0) log_it(int a, const char *fmt, ...);',
+      'struct ctx {',
+      '\t__bpf_md_ptr(struct bpf_iter_meta *, meta);',
+      '};',
+      'int keep = __hash(key);',
+      '',
+    ].join('\n');
+    const out = blankCParameterizedAnnotationMacros(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('__free');
+    expect(out).not.toContain('__printf');
+    // Mid-line match keeps its statement tail…
+    expect(out).toContain('= NULL;');
+    // …but a whole-line FIELD match eats the `;` too — a lone `;` field is
+    // itself a parse error while an empty struct body is not.
+    expect(out).not.toContain('__bpf_md_ptr');
+    expect(out.split('\n')[3]?.trim()).toBe('');
+    // Non-curated dunder calls are real code.
+    expect(out).toContain('__hash(key)');
+  });
+
+  it('blankCTypeKeywordArgs blanks bare type-keyword call args, spares valid look-alikes', async () => {
+    const { blankCTypeKeywordArgs } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'void j(void *head, void *map) {',
+      '\tvoid *p = kzalloc_obj(struct bpf_mount_opts);',
+      '\tvoid *e = list_first_entry(head,',
+      '\t\t\tstruct async_entry, domain_list);',
+      '\tvoid *n = hlist_entry_safe(rcu_dereference_raw(hlist_next_rcu(head)),',
+      '\t\t\tstruct bpf_dtab_netdev, index_hlist);',
+      '\treturn container_of(map, struct bpf_map, inner);',
+      '}',
+      'DEFINE_PER_CPU(struct task_struct *, ksoftirqd);',
+      '',
+    ].join('\n');
+    const out = blankCTypeKeywordArgs(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('struct bpf_mount_opts');
+    expect(out).toContain('       bpf_mount_opts'); // keyword → spaces, ident stays
+    expect(out).toContain('       async_entry, domain_list');
+    expect(out).toContain('       bpf_dtab_netdev'); // nested-paren predecessor arg
+    expect(out).toContain('       bpf_map, inner'); // `return` precedes real calls
+    // Pointer form blanks the stars too — two plain identifier args remain.
+    expect(out).toContain('       task_struct  , ksoftirqd');
+    // Valid look-alikes stay byte-identical.
+    for (const valid of [
+      'int a = sizeof(struct point);',
+      'int b = offsetof(struct point, y);',
+      'int c = _Generic(x, struct foo *: 1, default: 0);',
+      'int wf(struct a,\n\tstruct b);',
+      'void cast(void *p) { use((struct foo *)p); }',
+      'struct ops { int (*probe)(struct device *dev); };',
+    ]) {
+      expect(blankCTypeKeywordArgs(valid)).toBe(valid);
+    }
+  });
+
+  it('blankCFileScopePrefixedDeclMacros blanks static/extern CAPS-macro lines at any scope', async () => {
+    const { blankCFileScopePrefixedDeclMacros } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'static DEFINE_PER_CPU(struct llist_head, rstat_backlog_list);',
+      'void f(void) {',
+      '\tstatic DEFINE_RATELIMIT_STATE(ratelimit, 5 * HZ, 5);',
+      '}',
+      'EXPORT_SYMBOL(vmalloc);',
+      'static DEFINE_PER_CPU(struct cpuhp_cpu_state, cpuhp_state) = {',
+      '',
+    ].join('\n');
+    const out = blankCFileScopePrefixedDeclMacros(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('DEFINE_PER_CPU(struct llist_head');
+    expect(out).not.toContain('DEFINE_RATELIMIT_STATE'); // block scope blanks too
+    // Bare CAPS lines parse natively as K&R declarations — untouched.
+    expect(out).toContain('EXPORT_SYMBOL(vmalloc);');
+    // Initializer forms belong to the rewrite, not the blank.
+    expect(out).toContain('cpuhp_state) = {');
+  });
+
+  it('rewriteCPrefixedDeclMacroInitializers rewrites `static CAPS(type, name) = {` into the declaration', async () => {
+    const { rewriteCPrefixedDeclMacroInitializers } = await import('../src/extraction/languages/c-cpp');
+    const line = 'static DEFINE_PER_CPU(struct cpuhp_cpu_state, cpuhp_state) = {';
+    const src = [line, '\t.fail = CPUHP_INVALID,', '};', ''].join('\n');
+    const out = rewriteCPrefixedDeclMacroInitializers(src);
+    expect(out.length).toBe(src.length);
+    const rewritten = out.split('\n')[0] as string;
+    expect(rewritten).toContain('static struct cpuhp_cpu_state');
+    expect(rewritten).not.toContain('DEFINE_PER_CPU');
+    // The NAME keeps its exact original column, and the tail its offsets.
+    expect(rewritten.indexOf('cpuhp_state')).not.toBe(-1);
+    expect(rewritten.indexOf('cpuhp_state', 30)).toBe(line.indexOf('cpuhp_state', 30));
+    expect(rewritten.indexOf('= {')).toBe(line.indexOf('= {'));
+    // Three-argument macros never match.
+    const threeArg = 'static DEFINE_TIMER(t, fn, 0) = {\n};\n';
+    expect(rewriteCPrefixedDeclMacroInitializers(threeArg)).toBe(threeArg);
+  });
+
+  it('blankCVaArgQualifiedTypeArgs blanks multi-token va_arg types, spares single tokens', async () => {
+    const { blankCVaArgQualifiedTypeArgs } = await import('../src/extraction/languages/c-cpp');
+    const src = 'void f(va_list ap) {\n\tconst char *s = va_arg(ap, const char *);\n\tint n = va_arg(ap, int);\n}\n';
+    const out = blankCVaArgQualifiedTypeArgs(src);
+    expect(out.length).toBe(src.length);
+    expect(out).toContain('va_arg(ap              );');
+    expect(out).toContain('va_arg(ap, int);'); // parses natively — untouched
+  });
+
+  it('blankCNamedVariadicDefineDots blanks only the dots of GNU named-variadic params', async () => {
+    const { blankCNamedVariadicDefineDots } = await import('../src/extraction/languages/c-cpp');
+    const named = '#define verbose(env, fmt, args...) log_write(env, fmt, ##args)\nint x;\n';
+    const out = blankCNamedVariadicDefineDots(named);
+    expect(out.length).toBe(named.length);
+    expect(out).toContain('args   )'); // dots → spaces
+    expect(out).toContain('##args'); // body untouched
+    const std = '#define pr(fmt, ...) printk(fmt, __VA_ARGS__)\nint y;\n';
+    expect(blankCNamedVariadicDefineDots(std)).toBe(std);
+  });
+
+  it('blankCSandwichedAnnotations and blankCAutoInference: sandwich and C23-auto guards', async () => {
+    const { blankCSandwichedAnnotations, blankCAutoInference } = await import(
+      '../src/extraction/languages/c-cpp'
+    );
+    const src = 'static notrace void tick_do(void) { }\nstatic nokprobe_inline void arm(void) { }\n';
+    const out = blankCSandwichedAnnotations(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('notrace');
+    expect(out).not.toContain('nokprobe_inline');
+    // As a variable name (no following word) it survives.
+    const varUse = 'void f(void) { int notrace = 1; use(notrace); }\n';
+    expect(blankCSandwichedAnnotations(varUse)).toBe(varUse);
+    const c23 = 'void q(void) { auto hb = get_hb(); }\n';
+    const autoOut = blankCAutoInference(c23);
+    expect(autoOut.length).toBe(c23.length);
+    expect(autoOut).toContain('     hb = get_hb();');
+    // The storage-class reading has a TYPE after `auto` — untouched.
+    const storage = 'void s(void) { auto int x = 1; }\n';
+    expect(blankCAutoInference(storage)).toBe(storage);
+  });
+
+  it('blankCStatementMacroCalls spans wrapped iterator macros, spares wrapped real calls', async () => {
+    const { blankCStatementMacroCalls } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'static void walk(void *head) {',
+      '\thlist_for_each_entry_rcu(p, head, hlist,',
+      '\t\t\t\t lockdep_is_held(&kprobe_mutex)) {',
+      '\t\tuse(p);',
+      '\t}',
+      '}',
+      '',
+    ].join('\n');
+    const out = blankCStatementMacroCalls(src);
+    expect(out.length).toBe(src.length);
+    expect(out).not.toContain('hlist_for_each_entry_rcu');
+    expect(out).not.toContain('lockdep_is_held');
+    expect(out).toContain('use(p);');
+    // A wrapped REAL call ends in `;` — untouched.
+    const call = 'void f(void) {\n\tdo_thing(a,\n\t\t b);\n}\n';
+    expect(blankCStatementMacroCalls(call)).toBe(call);
+    // A wrapped condition is keyword-led — untouched.
+    const cond = 'void g(int a) {\n\tif (check(a,\n\t\t  a)) {\n\t\tuse(a);\n\t}\n}\n';
+    expect(blankCStatementMacroCalls(cond)).toBe(cond);
+  });
+
+  it('restoreDirectiveLines keeps #define lines out of the blanking blast radius', async () => {
+    const { extractFromSource } = await import('../src/extraction');
+    // FMT_API matches the _API-suffix member blank; without the directive
+    // restore the #define loses its NAME and the file gains a parse error.
+    const src = [
+      '#define FMT_API FMT_VISIBILITY("default")',
+      'class Widget {',
+      ' public:',
+      '  int size() const { return 1; }',
+      '};',
+      '',
+    ].join('\n');
+    const result = extractFromSource('lib.hpp', src, 'cpp');
+    expect(result.errors).toEqual([]);
+    expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'Widget')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'size')).toBe(true);
   });
 });

@@ -4,8 +4,11 @@
  * Handles symbol name matching for reference resolution.
  */
 
+import * as path from 'path';
 import { Language, Node } from '../types';
-import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
+import { UnresolvedRef, ResolvedRef, ResolutionContext, SUPERTYPE_TARGET_KINDS, isInheritanceRef, isImportableKind } from './types';
+import { blankStringContents, stripCommentsForRegex } from './strip-comments';
+import { JS_BUILT_INS } from './js-builtins';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -232,6 +235,16 @@ export function matchFunctionRef(
     ref.language === 'cpp' || ref.language === 'python' ||
     ref.language === 'php';
 
+  // Python additionally accepts CLASS targets for bare identifiers (#1478):
+  // class-as-value is a core Python idiom (`return SomeSerializer`,
+  // `Meta.model = Org`, registry dicts, `admin.site.register(Model, Admin)`)
+  // and, unlike TS, Python has no type-annotation recovery path. The
+  // false-positive mechanism behind the function-only rule was lowercase
+  // locals colliding with same-named METHODS (docopt.py) — a candidate must
+  // be an exact-name CLASS node here, and the extraction gate (same-file
+  // class ∪ imports) plus unique-or-drop still apply. Methods stay excluded.
+  const bareClassOk = ref.language === 'python';
+
   // Qualified member-pointer (`&Widget::on_click` → "Widget::on_click"):
   // resolve the member ON THAT SCOPE — exempt from bareFnOnly (the `&Cls::m`
   // shape is an explicit member reference). Unique-or-drop like everything else.
@@ -264,7 +277,9 @@ export function matchFunctionRef(
     .getNodesByName(ref.referenceName)
     .filter(
       (n) =>
-        (n.kind === 'function' || (!bareFnOnly && n.kind === 'method')) &&
+        (n.kind === 'function' ||
+          (!bareFnOnly && n.kind === 'method') ||
+          (bareClassOk && n.kind === 'class')) &&
         sameLanguageFamily(n.language, ref.language) &&
         n.id !== ref.fromNodeId // a function registering itself is not a dependency edge
     );
@@ -340,6 +355,385 @@ export function matchFunctionRef(
   return null;
 }
 
+/** Languages with no nested named functions: nesting in the graph is never a scope. */
+const NO_NESTED_FUNCTIONS = new Set<string>(['c', 'cpp']);
+
+/**
+ * A function nested inside another FUNCTION is only callable from within its
+ * container — Python, JS/TS, and every closure language scope it lexically.
+ * Resolving a bare name from elsewhere to a nested local fabricates an edge
+ * scope already rules out: `join(...)` in one function must never bind to a
+ * `join` defined inside a DIFFERENT function (#1230). A candidate whose
+ * qualifiedName parent is a same-file function/method is kept only when the
+ * ref originates inside that parent's line range. Class members are
+ * unaffected (their parent resolves to a class-like node), as are top-level
+ * symbols and C++ namespace-prefixed names (the prefix has no node).
+ */
+function isLexicallyReachable(
+  candidate: Node,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): boolean {
+  if (candidate.kind !== 'function') return true;
+  // C and C++ have no nested named functions, so a function the graph shows
+  // inside another is an extraction artifact, not a scope: tree-sitter-c
+  // cannot parse a macro call whose arguments are designated initializers
+  // (betaflight's `RESET_CONFIG(pidProfile_t, pidProfile, .pid = {…})`), and
+  // its error recovery runs the enclosing function_definition to the end of
+  // the file, nesting every function after it. Trusting that nesting rejected
+  // 117 real calls into pid.c on that tree; the functions are reachable.
+  if (NO_NESTED_FUNCTIONS.has(candidate.language)) return true;
+  const qn = candidate.qualifiedName;
+  if (!qn || !qn.includes('::')) return true;
+  const parentQn = qn.slice(0, qn.lastIndexOf('::'));
+  const containers = context
+    .getNodesByQualifiedName(parentQn)
+    .filter(
+      (p) =>
+        p.filePath === candidate.filePath &&
+        (p.kind === 'function' || p.kind === 'method') &&
+        p.startLine <= candidate.startLine &&
+        p.endLine >= candidate.endLine
+    );
+  if (containers.length === 0) return true;
+  return (
+    ref.filePath === candidate.filePath &&
+    containers.some((p) => ref.line >= p.startLine && ref.line <= p.endLine)
+  );
+}
+
+/** Languages whose module boundary is `import`/`export` (or CommonJS). */
+const ESM_FAMILY = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx', 'arkts']);
+
+/**
+ * A line-initial `import` statement — the marker that a JS/TS file is a MODULE
+ * rather than a classic script. Line-anchored and followed by a name, brace,
+ * star or quote, so a dynamic `import(` and the word inside a comment or string
+ * do not match.
+ */
+const HAS_IMPORT_STATEMENT = /^[ \t]*import[\s{*'"]/m;
+
+/**
+ * Anything the file could offer another file, in every form the extractor's own
+ * `isExported` flag misses. `^export` covers the declaration and later forms
+ * (`export const`, `export { x }`, `export default x`, `export *`); the
+ * CommonJS shapes cover files that never use ESM syntax at all, in both the dot
+ * and the bracket form; and `declare global` contributes names to every file
+ * whether or not the module exports anything of its own. Kept as a source test
+ * rather than a node scan precisely because `isExported` is set only from an
+ * `export_statement` ancestor, so `const x = …; export { x }` and
+ * `module.exports = { x }` both read as unexported on the node.
+ */
+const HAS_ESM_EXPORT = /^[ \t]*export[\s{*]|^[ \t]*declare\s+global\b/m;
+const HAS_CJS_EXPORT = /\bmodule\.exports\b|\bexports\s*[.[]/;
+
+/**
+ * Per-context memo of "this file is a module that exports nothing", asked once
+ * per candidate FILE rather than once per reference. Derived from file source,
+ * so it drops with the context's file caches — clearNameMatcherMemos deletes it
+ * alongside INFER_SCAN_STATES.
+ */
+const SEALED_MODULES = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * Whether `filePath` is a JS/TS module that exports NOTHING — an import
+ * statement present, no export of any form. No reference from another file can
+ * reach any binding in such a file, so every one of its symbols is a false
+ * candidate for a cross-file name match.
+ *
+ * This is the general case behind a package name capturing a same-named local:
+ * on `vitejs/vite`, 157 cross-file `imports` refs — every `import { defineConfig
+ * } from 'vite'` in the playground and the create-vite templates — resolved onto
+ * `playground/ssr-html/test-stacktrace.js::vite`, which is `const vite = await
+ * createServer(…)` at module scope in a file with zero exports. The existing
+ * guards cannot see it: `isLexicallyReachable` returns early for any candidate
+ * that is not a `function`, and the bare-import guard correctly declines because
+ * `vite` IS a workspace member, so the specifier really is project-local. What
+ * is wrong is only which node the name lands on.
+ *
+ * Deliberately narrow on three axes, because each is a class this would
+ * otherwise resolve wrongly in the opposite direction:
+ *
+ * - **A classic script is exempt.** Requiring an `import` statement means a
+ *   non-module `.js` file — concatenated globals, a browser `<script>` — keeps
+ *   its cross-file matches, where a top-level binding genuinely is reachable.
+ * - **CommonJS is exempt.** `module.exports` and `exports.x` are matched as
+ *   exports, so a CJS file is never sealed.
+ * - **Other languages are exempt.** Go, Python, Java and the rest have no
+ *   equivalent boundary, and several extractors hardcode `isExported`.
+ */
+function isSealedModule(filePath: string, context: ResolutionContext): boolean {
+  let memo = SEALED_MODULES.get(context);
+  if (!memo) {
+    memo = new Map();
+    SEALED_MODULES.set(context, memo);
+  }
+  const hit = memo.get(filePath);
+  if (hit !== undefined) return hit;
+  const source = context.readFile(filePath);
+  const code = source === null ? '' : blankStringContents(stripCommentsForRegex(source, 'typescript'));
+  // CommonJS assignments can execute inside template interpolations, which the
+  // masker blanks. Keep the conservative raw-source exemption for those forms.
+  const sealed =
+    source !== null && HAS_IMPORT_STATEMENT.test(code) &&
+    !context.getNodesInFile(filePath).some((n) => n.isExported) &&
+    !HAS_ESM_EXPORT.test(code) && !HAS_CJS_EXPORT.test(source);
+  memo.set(filePath, sealed);
+  return sealed;
+}
+
+/**
+ * Whether `candidate` can be named by a reference in `ref`'s file at all.
+ * Both name-based strategies validate their chosen candidate. Removing an
+ * unreachable candidate before ranking can promote an unrelated runner-up;
+ * rejecting the chosen target must leave the reference unresolved instead.
+ */
+function isCrossFileReachable(
+  candidate: Node,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): boolean {
+  if ((ref.language as string) !== 'markdown' && (candidate.language as string) === 'markdown') return false;
+  if (ref.referenceKind === 'calls' && ESM_FAMILY.has(candidate.language) &&
+    (candidate.kind === 'constant' || candidate.kind === 'variable') &&
+    /^=\s*require\s*\(\s*(['"])[^'"]+\.json\1\s*\)\s*;?\s*$/.test(candidate.signature ?? '')) return false;
+  return (
+    candidate.filePath === ref.filePath ||
+    !ESM_FAMILY.has(candidate.language) ||
+    !isSealedModule(candidate.filePath, context)
+  );
+}
+
+/**
+ * Languages in which `visibility: 'private'` on a definition means no other
+ * FILE can name it: a Kotlin `private fun` is file- or class-local, and the
+ * same holds for Java, C#, Swift, Scala, Dart and PHP members.
+ */
+const PRIVATE_IS_FILE_LOCAL = new Set<string>(['kotlin', 'java', 'csharp', 'swift', 'scala', 'dart', 'php']);
+
+/** Per-context memo: node id → "this C/C++ function is declared `static`". */
+const C_STATIC_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * A C/C++ file that IS a translation unit. A `static` defined here is local
+ * to it. A `static` (typically `static inline`) in a header is a different
+ * thing: the header is textually included, so the function exists in every
+ * unit that includes it and is callable from each — MAVLink's generated
+ * `mavlink_msg_*.h` are nothing but such functions, 4,306 real calls on one
+ * betaflight tree.
+ */
+const C_SOURCE_EXT = /\.(c|cc|cpp|cxx|c\+\+|m|mm)$/i;
+
+/**
+ * Whether a C/C++ function definition carries the `static` storage class —
+ * read from its first source line(s), since the extractor records no storage
+ * class and the kernel arm would need the same field. `static` on the line
+ * above the name (`static void\nfoo(void)`) is the common alternative layout.
+ */
+function isStaticCFunction(candidate: Node, context: ResolutionContext): boolean {
+  let memo = C_STATIC_MEMO.get(context);
+  if (!memo) {
+    memo = new Map();
+    C_STATIC_MEMO.set(context, memo);
+  }
+  const hit = memo.get(candidate.id);
+  if (hit !== undefined) return hit;
+  const lines = context.getFileLines?.(candidate.filePath) ?? context.readFile(candidate.filePath)?.split('\n') ?? [];
+  const head = [lines[candidate.startLine - 2] ?? '', lines[candidate.startLine - 1] ?? ''].join('\n');
+  const isStatic = /(^|[\s;}])static\s/.test(head);
+  memo.set(candidate.id, isStatic);
+  return isStatic;
+}
+
+/** Per-context memo: node id → "this Rust method implements a trait". */
+const RUST_TRAIT_IMPL_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * Whether a Rust method sits in an `impl Trait for Type` block. Such a method
+ * carries no `pub` — the trait decides its visibility — so the extractor
+ * records it as private; it is reachable wherever the trait is. Read from the
+ * nearest enclosing `impl` header above the method, memoised per node.
+ */
+function isRustTraitImplMethod(candidate: Node, context: ResolutionContext): boolean {
+  if (candidate.kind !== 'method') return false;
+  let memo = RUST_TRAIT_IMPL_MEMO.get(context);
+  if (!memo) {
+    memo = new Map();
+    RUST_TRAIT_IMPL_MEMO.set(context, memo);
+  }
+  const hit = memo.get(candidate.id);
+  if (hit !== undefined) return hit;
+  const lines = context.getFileLines?.(candidate.filePath) ?? context.readFile(candidate.filePath)?.split('\n') ?? [];
+  let isTrait = false;
+  for (let i = candidate.startLine - 2; i >= 0; i--) {
+    const line = lines[i] ?? '';
+    if (/^\s*(pub(\([^)]*\))?\s+)?(unsafe\s+)?impl\b/.test(line)) {
+      isTrait = /\sfor\s/.test(line.replace(/\/\/.*$/, ''));
+      break;
+    }
+    // A top-level item above the method means it was not inside an impl.
+    if (/^(pub(\([^)]*\))?\s+)?(fn|struct|enum|mod|trait|const|static|type)\b/.test(line)) break;
+  }
+  memo.set(candidate.id, isTrait);
+  return isTrait;
+}
+
+/**
+ * The directory a Rust file's private items are visible from: the file's own
+ * module subtree. `src/net.rs` and `src/net/mod.rs` own `src/net/`; a crate
+ * root (`lib.rs` / `main.rs`) owns its directory. A child module reaches its
+ * ancestors' private items (`super::`), a sibling or another crate never does.
+ */
+function rustModuleDir(filePath: string): string {
+  const base = path.posix.basename(filePath);
+  const dir = path.posix.dirname(filePath);
+  if (base === 'mod.rs' || base === 'lib.rs' || base === 'main.rs') return dir;
+  return path.posix.join(dir, base.replace(/\.rs$/, ''));
+}
+
+/**
+ * Whether `candidate` can be NAMED from a reference in `ref`'s file at all,
+ * given what its language says about the definition's visibility. A
+ * definition the language makes file-local is not a candidate for a
+ * cross-file name match, however well the names agree:
+ *
+ * - **C / C++**: a `static` function defined in a SOURCE file is local to
+ *   that translation unit; one in a header is part of every unit that
+ *   includes it and stays visible. On a 2,109-file betaflight tree 145
+ *   cross-file calls resolved onto a `static` in another `.c` (#1730) —
+ *   `usbd_get_descriptor` onto the `static get_device_descriptor` of
+ *   whichever USB class file ranked first.
+ * - **Kotlin, Java, C#, Swift, Scala, Dart, PHP**: `private` is class- or
+ *   file-local. An Android `editor.apply()` resolved onto an unrelated class's
+ *   `private fun apply`.
+ * - **Go**: an unexported (lowercase) identifier is package-local, and a
+ *   package is a directory. Judged by the name's case: the extractor's
+ *   `isExported` is unset for every Go method.
+ * - **Rust**: a non-`pub` item is visible to its module and that module's
+ *   descendants, never to a sibling module or another crate — `.count()` on
+ *   an iterator resolved onto a `fn count` in a different crate. A method in
+ *   an `impl Trait for Type` block has the trait's visibility, not `private`.
+ * - **JS / TS / ArkTS**: a binding in a module that exports nothing (an
+ *   `import` present, no `export` / CommonJS / `declare global`) is sealed —
+ *   the vite playground's `const vite = await createServer(…)` took 157
+ *   `import { defineConfig } from 'vite'` edges (#1719). Classic scripts,
+ *   CommonJS, later `export { … }`, and ambient globals stay visible.
+ *
+ * Same-file candidates are always visible. Applied by ReferenceResolver to
+ * the target the whole name-matching pipeline settled on, so a rejection ends
+ * the reference unresolved: declining inside matchByExactName instead let the
+ * ref fall through to matchFuzzy, which then committed to a same-language
+ * namesake the ranking had passed over — eight such edges on one tree, all
+ * onto a local `const fail = …` arrow the graph does not hold. matchFuzzy
+ * checks its own survivor as well, since nothing runs after it.
+ */
+export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (candidate.filePath === ref.filePath) return true;
+  const lang = candidate.language as string;
+  if (lang === 'c' || lang === 'cpp') {
+    return (
+      candidate.kind !== 'function' ||
+      !C_SOURCE_EXT.test(candidate.filePath) ||
+      !isStaticCFunction(candidate, context)
+    );
+  }
+  if (lang === 'go') {
+    // By the name's first letter, not the extractor's flag: the flag is unset
+    // for every Go method, exported or not.
+    return /^[A-Z]/.test(candidate.name) || path.posix.dirname(candidate.filePath) === path.posix.dirname(ref.filePath);
+  }
+  if (lang === 'rust') {
+    if (candidate.visibility !== 'private') return true;
+    if (isRustTraitImplMethod(candidate, context)) return true;
+    const owner = rustModuleDir(candidate.filePath);
+    return ref.filePath.startsWith(owner + '/');
+  }
+  if (PRIVATE_IS_FILE_LOCAL.has(lang)) return candidate.visibility !== 'private';
+  // JS/TS/ArkTS sealed modules + markdown/JSON call-target guards (#1719).
+  // Same predicate matchByExactName / matchFuzzy apply to their survivors so a
+  // rejection here cannot fall through to a promoted runner-up.
+  return isCrossFileReachable(candidate, ref, context);
+}
+
+const JS_FAMILY = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx']);
+
+/**
+ * Whether a JS/TS `calls` ref is a RECEIVER-LESS call — `serialize(x)`, not
+ * `this.serialize(x)` / `obj.serialize(x)`. The extractor emits `this.m()`
+ * and `super.m()` under the bare method name, so the receiver is read back
+ * from the call site's own line: the text at the ref's column is the call
+ * expression, and it starts with the name itself only when nothing precedes
+ * it. In JS/TS a bare call can never bind to a class method (methods need a
+ * receiver), so a `method` node is not a candidate for it (#1714) — the
+ * enclosing method itself least of all, which the same-file proximity term
+ * used to pick over the module-scope function the call actually means.
+ */
+function isBareJsCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.referenceKind !== 'calls' || !JS_FAMILY.has(ref.language)) return false;
+  if (ref.referenceName.includes('.')) return false;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1]
+    ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return false;
+  const at = line.slice(ref.column);
+  const nameEsc = ref.referenceName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (!new RegExp('^' + nameEsc + '\\s*[(<]').test(at)) return false;
+  // Nothing but whitespace, an operator or an opener may precede a bare call.
+  return !/[.\w$\]\)]\s*$/.test(line.slice(0, ref.column)) || /\b(?:return|await|yield|typeof|void|new|else|case|throw|in|of|instanceof)\s*$/.test(line.slice(0, ref.column));
+}
+
+/** Per-context memo: `file\0name` → "the file binds this name locally". */
+const LOCAL_BINDING_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * Whether a JS/TS file binds `name` itself — as a `const`/`let`/`var`/
+ * `function`/`class` declaration (destructuring included) or as a parameter
+ * of a function or arrow. Such a binding shadows every same-named symbol in
+ * other files, so a bare call to it has no cross-file candidate: the
+ * `resolve` of `new Promise((resolve, reject) => …)`, a spec's
+ * `const transform = await makeTransform()`, a factory's `const now =
+ * options.now || (() => new Date())`. None of these is a node the graph
+ * holds (a parameter, a const bound to a call result), so without this the
+ * matcher hands the call to whichever other file defines the name — and
+ * once methods stop being candidates for a bare call (#1714), the function
+ * that was out-ranked steps in. Read from source, memoised per file+name.
+ */
+function isLocallyBoundJsName(name: string, filePath: string, context: ResolutionContext): boolean {
+  let memo = LOCAL_BINDING_MEMO.get(context);
+  if (!memo) {
+    memo = new Map();
+    LOCAL_BINDING_MEMO.set(context, memo);
+  }
+  const key = filePath + '\0' + name;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  const source = context.readFile(filePath) ?? '';
+  const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // `const { name } = require('./m')` / `= await import('./m')` binds an IMPORT,
+  // not a shadow: the symbol lives in the other file and the call means it.
+  const declRe = new RegExp(
+    '\\b(?:const|let|var)\\s+(?:' + n + '\\b|[{\\[][^;=]*?\\b' + n + '\\b[^;=]*?[}\\]])\\s*(?:=\\s*([^;\\n]*))?',
+    'g'
+  );
+  let bound = false;
+  for (const m of source.matchAll(declRe)) {
+    if (!/^\s*(?:await\s+)?(?:require|import)\s*\(/.test(m[1] ?? '')) { bound = true; break; }
+  }
+  if (!bound) {
+    bound =
+      new RegExp('\\b(?:function|class)\\s+' + n + '\\b').test(source) ||
+      // a parameter: every token before the name in the list is itself a
+      // parameter (identifier, optional type, optional default) — so a string
+      // argument containing the word cannot match.
+      new RegExp(
+        '\\(\\s*(?:(?:\\.\\.\\.)?[\\w$]+(?:\\s*\\??\\s*:\\s*[^,()]+)?(?:\\s*=\\s*[^,()]+)?\\s*,\\s*)*' +
+          n + '\\b(?:\\s*\\??\\s*:[^,()]*)?(?:\\s*=[^,()]*)?(?:\\s*,\\s*[^()]*)?\\)\\s*(?::[^=;{]*)?(?:=>|\\{)'
+      ).test(source) ||
+      new RegExp('(?:^|[^\\w$.])' + n + '\\s*=>').test(source);
+  }
+  memo.set(key, bound);
+  return bound;
+}
+
 /**
  * Try to resolve a reference by exact name match
  */
@@ -356,8 +750,31 @@ export function matchByExactName(
   // unresolved import refs each scored K same-named import candidates through
   // findBestMatch — O(K²) per package, the dominant cost of "Resolving refs" on
   // large import-heavy (front-end + back-end) repos (#915).
+  const bareJs = isBareJsCall(ref, context);
   const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref)
-    .filter((n) => n.kind !== 'import');
+    .filter((n) => n.kind !== 'import')
+    // Nested locals are only reachable from inside their container (#1230).
+    .filter((n) => isLexicallyReachable(n, ref, context))
+    // Preserve import ranking; calls reject the winner without promoting another.
+    .filter((n) => ref.referenceKind !== 'imports' || n.filePath === ref.filePath ||
+      !ESM_FAMILY.has(n.language) || !isSealedModule(n.filePath, context))
+    // A receiver-less JS/TS call cannot reach a method (#1714).
+    .filter((n) => !(bareJs && n.kind === 'method'))
+    // A name the file binds itself (a parameter, a const) shadows every other
+    // file's symbol of that name, so a bare call has no cross-file candidate.
+    .filter((n) => !(bareJs && n.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context)))
+    // An `extends`/`implements` ref names a supertype, so anything that can't
+    // BE one is not a candidate at all. This is eligibility, not
+    // ranking: kind is only a scoring bonus below (and none is awarded for
+    // inheritance refs), so without this a same-named `enum_member` outranked
+    // the real `trait`, and as the sole candidate was adopted outright by the
+    // single-match shortcut. Restricting the pool BEFORE ranking lets the
+    // legitimate supertype win instead of merely dropping the false edge.
+    .filter((n) => !isInheritanceRef(ref) || SUPERTYPE_TARGET_KINDS.has(n.kind))
+    // Likewise for `imports`: a member that only exists inside a type is not
+    // importable, so it is not a candidate. Without this a `path`/`id`/`url`
+    // import resolved to some interface's same-named property.
+    .filter((n) => ref.referenceKind !== 'imports' || isImportableKind(n.kind));
 
   if (candidates.length === 0) {
     return null;
@@ -365,6 +782,7 @@ export function matchByExactName(
 
   // If only one match, use it — but penalize cross-language matches
   if (candidates.length === 1) {
+    if (!isCrossFileReachable(candidates[0]!, ref, context)) return null;
     const isCrossLanguage = candidates[0]!.language !== ref.language;
     return {
       original: ref,
@@ -385,7 +803,7 @@ export function matchByExactName(
 
   // Multiple matches - try to narrow down
   const bestMatch = findBestMatch(ref, candidates, context);
-  if (bestMatch) {
+  if (bestMatch && isCrossFileReachable(bestMatch, ref, context)) {
     // Lower confidence when the match is from a distant/unrelated module
     const proximity = computePathProximity(ref.filePath, bestMatch.filePath);
     const confidence = proximity >= 30 ? 0.7 : 0.4;
@@ -453,6 +871,35 @@ export function matchByQualifiedName(
     }
   }
 
+  // Erlang qualified refs (#1610): every erlang function's qualifiedName
+  // carries its arity (`mod::f/2`), and refs carry the call-site arity when it
+  // is statically known.
+  if (ref.language === 'erlang' && ref.referenceName.includes('::')) {
+    // A ref WITH arity that missed the exact lookup names an arity that isn't
+    // defined (or a module out of repo). Never fall through to the partial
+    // match — its "last segment" would be the arity digits — and never settle
+    // for a sibling arity: silent beats wrong.
+    if (/\/\d{1,3}$/.test(ref.referenceName)) return null;
+    // An arity-LESS qualified ref (dynamic MFA whose args list wasn't a
+    // static literal): resolve only when the module defines exactly ONE arity
+    // of that function; several arities with no signal is a guess.
+    const base = ref.referenceName.slice(ref.referenceName.lastIndexOf('::') + 2);
+    const prefix = `${ref.referenceName}/`;
+    const arityCands = keepForRef(context.getNodesByName(base)).filter(
+      (n) =>
+        n.qualifiedName.startsWith(prefix) && /^\d{1,3}$/.test(n.qualifiedName.slice(prefix.length)),
+    );
+    if (arityCands.length === 1) {
+      return {
+        original: ref,
+        targetNodeId: arityCands[0]!.id,
+        confidence: 0.85,
+        resolvedBy: 'qualified-name',
+      };
+    }
+    return null;
+  }
+
   // Try partial qualified name match — again preferring the call site's own
   // file when more than one symbol's qualifiedName ends with the reference.
   const parts = ref.referenceName.split(/[:.]/);
@@ -491,6 +938,93 @@ export function preferCallSiteFile(nodes: Node[], callSiteFile: string): Node[] 
     else other.push(n);
   }
   return same.length ? [...same, ...other] : nodes;
+}
+
+/**
+ * Languages whose object literals declare callable members — `export const
+ * api = { call() {…}, get: () => {…} }` used as a namespace (#1573).
+ */
+const OBJECT_LITERAL_LANGUAGES = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx', 'arkts']);
+
+/** True when `inner`'s source range lies within `outer`'s (lines, then columns on a shared line). */
+function rangeWithin(inner: Node, outer: Node): boolean {
+  const innerEnd = inner.endLine ?? inner.startLine;
+  const outerEnd = outer.endLine ?? outer.startLine;
+  if (inner.startLine < outer.startLine || innerEnd > outerEnd) return false;
+  if (inner.startLine === outer.startLine && inner.startColumn < outer.startColumn) return false;
+  if (innerEnd === outerEnd && inner.endColumn > outer.endColumn) return false;
+  return true;
+}
+
+function sameRange(a: Node, b: Node): boolean {
+  return (
+    a.startLine === b.startLine &&
+    a.startColumn === b.startColumn &&
+    (a.endLine ?? a.startLine) === (b.endLine ?? b.startLine) &&
+    a.endColumn === b.endColumn
+  );
+}
+
+/**
+ * Resolve `container.member` where `container` is a VALUE holding an object
+ * literal — `export const api = { call() {…}, get: () => {…} }` used as the
+ * module's namespace (#1573). The members are extracted as plain functions
+ * with BARE qualified names inside the constant's source extent (there is no
+ * `api::call`), so neither the `Container::member` lookup the class-shaped
+ * kinds use (#825) nor the declared-type inference for singleton instances
+ * (#1292) can reach them, and every such call resolved to nothing — or, via
+ * an import, to the constant itself. This looks the member up by CONTAINMENT:
+ * a node named `member` whose range lies inside the container's, in the
+ * container's own file. A helper declared inside a member's body is not a
+ * member and is skipped; nothing else in the file can donate a match. Calls
+ * take callable kinds only; other references accept value members too.
+ */
+export function resolveObjectLiteralMember(
+  container: Node,
+  member: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  confidence: number,
+  resolvedBy: ResolvedRef['resolvedBy'],
+): ResolvedRef | null {
+  if (container.kind !== 'constant' && container.kind !== 'variable') return null;
+  if (!OBJECT_LITERAL_LANGUAGES.has(container.language)) return null;
+  if (!sameLanguageFamily(container.language, ref.language)) return null;
+
+  const inFile = context.getNodesInFile(container.filePath);
+  const callable = (n: Node) => n.kind === 'function' || n.kind === 'method';
+  const valueMember = (n: Node) =>
+    callable(n) || n.kind === 'property' || n.kind === 'variable' || n.kind === 'constant';
+  const accepts = ref.referenceKind === 'calls' ? callable : valueMember;
+
+  const inside = inFile.filter((n) => n.id !== container.id && rangeWithin(n, container));
+  let candidates = inside.filter((n) => n.name === member && accepts(n));
+  if (candidates.length === 0) return null;
+
+  // Drop a candidate nested inside ANOTHER callable's body within the literal
+  // (`{ run() { const call = () => {}; } }` — `call` is `run`'s local, not a
+  // member). Strict containment: an identically-ranged sibling node for the
+  // same member (a property node over an arrow function) is not a body.
+  const bodies = inside.filter(callable);
+  candidates = candidates.filter(
+    (c) => !bodies.some((b) => b.id !== c.id && !sameRange(b, c) && rangeWithin(c, b))
+  );
+  if (candidates.length === 0) return null;
+
+  // Several survivors (a property AND a function for one arrow member, say):
+  // a callable first, then the earliest in source order.
+  candidates.sort((a, b) => {
+    const ca = callable(a) ? 0 : 1;
+    const cb = callable(b) ? 0 : 1;
+    if (ca !== cb) return ca - cb;
+    return a.startLine - b.startLine || a.startColumn - b.startColumn;
+  });
+  return {
+    original: ref,
+    targetNodeId: candidates[0]!.id,
+    confidence,
+    resolvedBy,
+  };
 }
 
 // Exported for the precedence unit tests (#1079): they assert the
@@ -549,12 +1083,16 @@ export function resolveMethodOnType(
     // populated in the conformance pass. Still VALIDATED (the method must exist on
     // a supertype), so a wrong inference produces no edge.
     if (depth < 4 && context.getSupertypes) {
-      for (const supertype of context.getSupertypes(typeName, ref.language)) {
-        const via = resolveMethodOnType(
-          supertype, methodName, ref, context, confidence, resolvedBy, preferredFqn, depth + 1,
-        );
-        if (via) return via;
-      }
+      const viaSupers = nmTimedT('rmot-supers', ref, (): ResolvedRef | null => {
+        for (const supertype of context.getSupertypes!(typeName, ref.language)) {
+          const via = resolveMethodOnType(
+            supertype, methodName, ref, context, confidence, resolvedBy, preferredFqn, depth + 1,
+          );
+          if (via) return via;
+        }
+        return null;
+      });
+      if (viaSupers) return viaSupers;
     }
     return null;
   }
@@ -744,12 +1282,12 @@ function lookupCalleeReturnType(
   return candidates.find((n) => n.kind === 'function')?.returnType ?? null;
 }
 
-/** Does the graph contain a class/struct named `name`'s last segment? */
+/** Does the graph contain an aggregate type named `name`'s last segment? */
 function cppClassExists(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
   const last = cppLastSegment(name);
   return context
     .getNodesByName(last)
-    .some((n) => (n.kind === 'class' || n.kind === 'struct') && n.language === ref.language);
+    .some((n) => (n.kind === 'class' || n.kind === 'struct' || n.kind === 'union') && n.language === ref.language);
 }
 
 /**
@@ -1075,7 +1613,7 @@ const NON_TYPE_RECEIVER_TOKENS = new Set([
  * args and pointer/ref markers, take the last `.`/`::`-qualified segment, and
  * reject obvious non-types.
  */
-function normalizeInferredTypeName(raw: string): string | null {
+export function normalizeInferredTypeName(raw: string): string | null {
   const cleaned = raw.replace(/<[^>]*>/g, '').replace(/[&*]/g, '').trim();
   const seg = cleaned.split(/[.:]+/).filter(Boolean).pop();
   if (!seg) return null;
@@ -1090,7 +1628,68 @@ function normalizeInferredTypeName(raw: string): string | null {
  * PascalCase is required in the capture where the language convention allows,
  * as a cheap false-positive guard on top of resolveMethodOnType's validation.
  */
-function localReceiverTypePatterns(language: Language, r: string): RegExp[] {
+/**
+ * Compiled-pattern memo for the receiver-type pattern builders below. They
+ * run for EVERY `receiver.method()` ref the matcher attempts, compiling 2–4
+ * fresh RegExp objects per call — and receivers repeat massively (`self`
+ * alone accounts for tens of thousands of refs on a Lua repo, measured 41µs
+ * per methodCall miss on kong with compilation a large slice). The patterns
+ * are a pure function of (language, receiver) and non-global (`.match()`
+ * never touches lastIndex), so shared instances are behavior-identical.
+ * FIFO-capped with no per-get mutation (the §7a.6 LRU-churn lesson): a hit
+ * costs one Map lookup, overflow evicts oldest, and an evicted entry simply
+ * recompiles exactly as every call did before this memo.
+ */
+const PATTERN_MEMO = new Map<string, RegExp[]>();
+const PATTERN_MEMO_CAP = 8192;
+
+/**
+ * Per-context incremental receiver-scan states for inferLocalReceiverType
+ * (see the memo comment there). Keyed (file, scopeStart, language, receiver);
+ * entries are a few dozen bytes, count is bounded by distinct receiver uses
+ * (same order as the context's other per-file caches). MUST drop whenever the
+ * context's file caches drop — the states are derived from file lines — so
+ * ReferenceResolver.clearCaches calls clearNameMatcherMemos alongside
+ * clearImportResolverMemos.
+ */
+type InferScanState = { hi: number; ansIdx: number; ansType: string | null };
+const INFER_SCAN_STATES = new WeakMap<ResolutionContext, Map<string, InferScanState>>();
+
+function getInferScanStates(context: ResolutionContext): Map<string, InferScanState> {
+  let m = INFER_SCAN_STATES.get(context);
+  if (!m) {
+    m = new Map();
+    INFER_SCAN_STATES.set(context, m);
+  }
+  return m;
+}
+
+/** Drop the per-context scan states (see ReferenceResolver.clearCaches). */
+export function clearNameMatcherMemos(context: ResolutionContext): void {
+  INFER_SCAN_STATES.delete(context);
+  C_STATIC_MEMO.delete(context);
+  RUST_TRAIT_IMPL_MEMO.delete(context);
+  SEALED_MODULES.delete(context);
+  LOCAL_BINDING_MEMO.delete(context);
+}
+
+function memoPatterns(key: string, build: () => RegExp[]): RegExp[] {
+  const hit = PATTERN_MEMO.get(key);
+  if (hit) return hit;
+  const patterns = build();
+  if (PATTERN_MEMO.size >= PATTERN_MEMO_CAP) {
+    const oldest = PATTERN_MEMO.keys().next().value;
+    if (oldest !== undefined) PATTERN_MEMO.delete(oldest);
+  }
+  PATTERN_MEMO.set(key, patterns);
+  return patterns;
+}
+
+export function localReceiverTypePatterns(language: Language, r: string): RegExp[] {
+  return memoPatterns(`${language}|${r}`, () => buildLocalReceiverTypePatterns(language, r));
+}
+
+function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[] {
   switch (language) {
     case 'typescript':
     case 'javascript':
@@ -1111,6 +1710,12 @@ function localReceiverTypePatterns(language: Language, r: string): RegExp[] {
     case 'python':
       return [
         new RegExp(`\\b${r}\\b\\s*=\\s*([A-Z][\\w.]*)\\s*\\(`), // lg = Logger(...)
+        // A quoted forward reference (`lg: "Logger"`, `lg: 'pkg.Logger'`) is the
+        // same annotation — and what every file under `from __future__ import
+        // annotations` or with a not-yet-defined class writes. The unquoted
+        // pattern below stopped at the quote and read no type at all, so the
+        // call produced no edge (#1684). Tried first: it is the stricter shape.
+        new RegExp(`\\b${r}\\b\\s*:\\s*["']([A-Z][\\w.]*)["']`), // lg: "Logger"
         new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.]*)`), // lg: Logger  (PEP 526)
       ];
     case 'java':
@@ -1337,6 +1942,53 @@ function inferLocalReceiverType(
     return null;
   };
 
+  // Incremental-scan memo (INFER_SCAN_STATES): this scan runs for EVERY
+  // `receiver.method()` ref and was measured at 61µs/ref on kong (2.4s of
+  // worker time, 99% misses — `self:` calls hunting a declaration Lua never
+  // writes). Refs for the same (file, scope, receiver) arrive in ~ascending
+  // line order, and the scan is a pure function of the file's immutable
+  // lines, so each line pays its regex matches ONCE per key instead of once
+  // per ref: query(c) = highest matching line in [startIdx..c]; a monotonic
+  // call extends the stored watermark by scanning only (hi..c] (the region
+  // at-or-below the previous answer is already proven empty above it); a
+  // non-monotonic call (rare — refs are rowid-ordered) falls back to the
+  // plain bounded scan and leaves the state alone. componentScoped is keyed
+  // out — its position-independent whole-file sweep below has different
+  // semantics.
+  if (!componentScoped) {
+    const states = getInferScanStates(context);
+    const key = `${ref.filePath}|${startIdx}|${ref.language}|${scanReceiver}`;
+    const state = states.get(key);
+    if (!state) {
+      for (let i = callIdx; i >= startIdx; i--) {
+        const type = matchLine(i);
+        if (type) {
+          states.set(key, { hi: callIdx, ansIdx: i, ansType: type });
+          return type;
+        }
+      }
+      states.set(key, { hi: callIdx, ansIdx: -1, ansType: null });
+      return null;
+    }
+    if (callIdx >= state.hi) {
+      for (let i = callIdx; i > state.hi; i--) {
+        const type = matchLine(i);
+        if (type) {
+          state.ansIdx = i;
+          state.ansType = type;
+          break;
+        }
+      }
+      state.hi = callIdx;
+      return state.ansIdx >= startIdx ? state.ansType : null;
+    }
+    for (let i = callIdx; i >= startIdx; i--) {
+      const type = matchLine(i);
+      if (type) return type;
+    }
+    return null;
+  }
+
   // Nearest declaration wins: scan backward from the call to the scope start.
   for (let i = callIdx; i >= startIdx; i--) {
     const type = matchLine(i);
@@ -1378,6 +2030,10 @@ function inferLocalReceiverType(
  * shape is handled by inferPhpAssignedPropertyType instead.
  */
 function phpPropertyTypePatterns(r: string): RegExp[] {
+  return memoPatterns(`php-prop|${r}`, () => buildPhpPropertyTypePatterns(r));
+}
+
+function buildPhpPropertyTypePatterns(r: string): RegExp[] {
   return [
     new RegExp(
       `\\b(?:(?:private|protected|public|readonly|static|final)(?:\\(set\\))?\\s+)+\\??([A-Za-z_\\\\][\\w\\\\]*)\\s+&?\\$${r}\\b`,
@@ -1526,10 +2182,10 @@ export function matchMethodCall(
   // shared source-based inferrer. resolveMethodOnType validates the method
   // exists on the inferred type, so a mis-inference produces no edge.
   if (inferableReceiver) {
-    const inferredType =
+    const inferredType = nmTimedT('mc-infer', ref, () =>
       ref.language === 'cpp'
         ? inferCppReceiverType(objectOrClass!, ref, context)
-        : inferLocalReceiverType(objectOrClass!, ref, context);
+        : inferLocalReceiverType(objectOrClass!, ref, context));
     if (inferredType) {
       // Java/Kotlin: when two classes share the simple name, the file's import
       // pins WHICH one (#314). Other languages disambiguate by call-site file.
@@ -1539,7 +2195,7 @@ export function matchMethodCall(
               .getImportMappings(ref.filePath, ref.language)
               .find((i) => i.localName === inferredType)?.source
           : undefined;
-      const typedMatch = resolveMethodOnType(
+      const typedMatch = nmTimedT('mc-rmot', ref, () => resolveMethodOnType(
         inferredType,
         methodName!,
         ref,
@@ -1547,11 +2203,60 @@ export function matchMethodCall(
         0.9,
         'instance-method',
         importedFqn,
-      );
+      ));
       if (typedMatch) {
         return typedMatch;
       }
+      // A known JS/TS builtin receiver is external when it has no project
+      // method (#1566). Inference already strips generics (`Map<K, V>` →
+      // `Map`); do not let Strategy 3 guess an unrelated `get`/`set`/`has`.
+      // Keep the validated match above for a project type shadowing a builtin.
+      if (ESM_FAMILY.has(ref.language) && JS_BUILT_INS.has(inferredType)) {
+        return null;
+      }
     }
+  }
+
+  // Go 2-hop field chain `base.field.Method` (#1276): the base's type comes
+  // from the enclosing scope (typed parameter / method receiver / local var),
+  // the field's declared type from that struct's own declaration lines, and
+  // the method is VALIDATED on the field's type by resolveMethodOnType. This
+  // branch is EXCLUSIVE for chained Go receivers: when the hop can't be
+  // inferred or the field's type is external (`conn *sql.DB` — no project
+  // node), the ref stays unresolved rather than falling through to the
+  // bare-name strategies below, which is exactly how `target.conn.Exec(...)`
+  // fabricated a dependency on an unrelated local interface's same-named
+  // method. Chained Go receivers were never emitted before #1276, so there
+  // is no prior recall to preserve on the fallback path.
+  if (ref.language === 'go' && dotMatch && objectOrClass!.includes('.')) {
+    return matchGoFieldChainCall(objectOrClass!, methodName!, ref, context);
+  }
+
+  // Rust call through a field of the enclosing type — `self.inner.run()`,
+  // emitted as `self.inner.run` (#1585). Same discipline as the Go branch
+  // above, and EXCLUSIVE for the same reason: validated field-type inference
+  // or nothing. Letting this shape reach the bare-name strategies below is
+  // how `self.inner.run()` resolved to a same-named method on an unrelated
+  // type — or to the calling method itself, a self-edge the source doesn't
+  // contain — whenever the field's type was external or merely shared a
+  // method name with something nearby.
+  if (ref.language === 'rust' && dotMatch && objectOrClass!.startsWith('self.')) {
+    return matchRustSelfFieldCall(objectOrClass!.slice('self.'.length), methodName!, ref, context);
+  }
+
+  // TS/JS call through a field of the enclosing class — `this.mailer.send()`,
+  // emitted as `this.mailer.send` (#1496). Same discipline as the Rust branch
+  // above, and EXCLUSIVE for the same reason: the field's declared type off
+  // the class's own declaration, validated by resolveMethodOnType, or nothing.
+  // Letting the bare name through is how `this.mailer.send()` inside
+  // `Notifier.send()` resolved to the calling method itself — a self-edge the
+  // source does not contain — whenever the two shared a name.
+  if (
+    (ref.language === 'typescript' || ref.language === 'javascript' || ref.language === 'tsx' || ref.language === 'jsx') &&
+    dotMatch &&
+    objectOrClass!.startsWith('this.')
+  ) {
+    return matchTsThisFieldCall(objectOrClass!.slice('this.'.length), methodName!, ref, context);
   }
 
   // Java/Kotlin: receiver may be a field whose name doesn't match the type by
@@ -1567,7 +2272,7 @@ export function matchMethodCall(
       // imported FQN so resolveMethodOnType can disambiguate (#314).
       const imports = context.getImportMappings(ref.filePath, ref.language);
       const importedFqn = imports.find((i) => i.localName === inferredType)?.source;
-      const typedMatch = resolveMethodOnType(
+      const typedMatch = nmTimedT('mc-rmot', ref, () => resolveMethodOnType(
         inferredType,
         methodName!,
         ref,
@@ -1575,11 +2280,32 @@ export function matchMethodCall(
         0.9,
         'instance-method',
         importedFqn,
-      );
+      ));
       if (typedMatch) {
         return typedMatch;
       }
     }
+  }
+
+  // Object-literal namespace receiver (#1573): `api.call()` where `api` is a
+  // same-file `const api = { call() {…}, get: () => {…} }`. Its members are
+  // plain functions with bare names inside the constant's extent — no
+  // `Container::member` qualified name — so none of the class-shaped
+  // strategies below can see them (Strategy 3 only considers `method`
+  // kinds) and the call resolved to nothing at all. Same file only: a
+  // cross-file use reaches the same helper through the import path.
+  if (dotMatch && !objectOrClass!.includes('.') && OBJECT_LITERAL_LANGUAGES.has(ref.language)) {
+    const literalMatch = nmTimedT('mc-literal', ref, (): ResolvedRef | null => {
+      const holders = preferCallSiteFile(context.getNodesByName(objectOrClass!), ref.filePath).filter(
+        (n) => (n.kind === 'constant' || n.kind === 'variable') && n.filePath === ref.filePath
+      );
+      for (const holder of holders) {
+        const hit = resolveObjectLiteralMember(holder, methodName!, ref, context, 0.85, 'instance-method');
+        if (hit) return hit;
+      }
+      return null;
+    });
+    if (literalMatch) return literalMatch;
   }
 
   // Strategy 1: Direct class name match (existing logic). When the receiver
@@ -1587,45 +2313,14 @@ export function matchMethodCall(
   // with a `Logger` in both `a/` and `b/`), try the class in the call site's
   // own file first — otherwise the first-indexed class wins and a call in `b/`
   // resolves to `a/`'s method (#1079).
-  const classCandidates = preferCallSiteFile(
-    context.getNodesByName(objectOrClass!),
-    ref.filePath,
-  );
-
-  for (const classNode of classCandidates) {
-    if (classNode.kind === 'class' || classNode.kind === 'struct' || classNode.kind === 'interface') {
-      // Skip cross-language class matches
-      if (classNode.language !== ref.language) continue;
-
-      const nodesInFile = context.getNodesInFile(classNode.filePath);
-      const methodNode = nodesInFile.find(
-        (n) =>
-          n.kind === 'method' &&
-          n.name === methodName &&
-          n.qualifiedName.includes(classNode.name)
-      );
-
-      if (methodNode) {
-        return {
-          original: ref,
-          targetNodeId: methodNode.id,
-          confidence: 0.85,
-          resolvedBy: 'qualified-name',
-        };
-      }
-    }
-  }
-
-  // Strategy 2: Instance variable receiver - try capitalized form to find class
-  // e.g., "permissionEngine" → look for classes containing "PermissionEngine"
-  const capitalizedReceiver = objectOrClass!.charAt(0).toUpperCase() + objectOrClass!.slice(1);
-  if (capitalizedReceiver !== objectOrClass) {
-    const fuzzyClassCandidates = preferCallSiteFile(
-      context.getNodesByName(capitalizedReceiver),
+  const strat1 = nmTimedT('mc-class', ref, (): ResolvedRef | null => {
+    const classCandidates = preferCallSiteFile(
+      context.getNodesByName(objectOrClass!),
       ref.filePath,
     );
-    for (const classNode of fuzzyClassCandidates) {
-      if (classNode.kind === 'class' || classNode.kind === 'struct' || classNode.kind === 'interface') {
+
+    for (const classNode of classCandidates) {
+      if (classNode.kind === 'class' || classNode.kind === 'struct' || classNode.kind === 'union' || classNode.kind === 'interface') {
         // Skip cross-language class matches
         if (classNode.language !== ref.language) continue;
 
@@ -1641,18 +2336,58 @@ export function matchMethodCall(
           return {
             original: ref,
             targetNodeId: methodNode.id,
-            confidence: 0.8,
-            resolvedBy: 'instance-method',
+            confidence: 0.85,
+            resolvedBy: 'qualified-name',
           };
         }
       }
     }
+    return null;
+  });
+  if (strat1) return strat1;
+
+  // Strategy 2: Instance variable receiver - try capitalized form to find class
+  // e.g., "permissionEngine" → look for classes containing "PermissionEngine"
+  const capitalizedReceiver = objectOrClass!.charAt(0).toUpperCase() + objectOrClass!.slice(1);
+  if (capitalizedReceiver !== objectOrClass) {
+    const strat2 = nmTimedT('mc-capital', ref, (): ResolvedRef | null => {
+      const fuzzyClassCandidates = preferCallSiteFile(
+        context.getNodesByName(capitalizedReceiver),
+        ref.filePath,
+      );
+      for (const classNode of fuzzyClassCandidates) {
+        if (classNode.kind === 'class' || classNode.kind === 'struct' || classNode.kind === 'union' || classNode.kind === 'interface') {
+          // Skip cross-language class matches
+          if (classNode.language !== ref.language) continue;
+
+          const nodesInFile = context.getNodesInFile(classNode.filePath);
+          const methodNode = nodesInFile.find(
+            (n) =>
+              n.kind === 'method' &&
+              n.name === methodName &&
+              n.qualifiedName.includes(classNode.name)
+          );
+
+          if (methodNode) {
+            return {
+              original: ref,
+              targetNodeId: methodNode.id,
+              confidence: 0.8,
+              resolvedBy: 'instance-method',
+            };
+          }
+        }
+      }
+      return null;
+    });
+    if (strat2) return strat2;
   }
 
   // Strategy 3: Find methods by name across the codebase, match by receiver
   // name similarity with the containing class. Handles abbreviated variable
   // names like permissionEngine → PermissionRuleEngine.
   if (methodName) {
+    const strat3 = nmTimedT('mc-byname', ref, (): ResolvedRef | null => {
     const methodCandidates = context.getNodesByName(methodName!);
     // Ubiquitous-method ceiling (#999): a method name re-declared across a
     // vendored theme/SDK (Metronic's `init`/`update`/… on every widget) yields
@@ -1712,9 +2447,331 @@ export function matchMethodCall(
         };
       }
     }
+    return null;
+    });
+    if (strat3) return strat3;
   }
 
   return null;
+}
+
+/** Go builtin/primitive field types that can never carry a project method. */
+const GO_BUILTIN_FIELD_TYPES = new Set([
+  'string', 'bool', 'byte', 'rune', 'error', 'any',
+  'int', 'int8', 'int16', 'int32', 'int64',
+  'uint', 'uint8', 'uint16', 'uint32', 'uint64', 'uintptr',
+  'float32', 'float64', 'complex64', 'complex128',
+  'chan', 'map', 'func', 'struct', 'interface',
+]);
+
+/**
+ * Resolve a Go 2-hop field-chain call `base.field.Method(...)` (#1276):
+ * `target.conn.Exec("insert")` where `func (target *Target) Write()` and
+ * `type Target struct { conn *sql.DB }`. Two inference hops, both read from
+ * source the same way #1108 does:
+ *   1. `base`'s type from the enclosing scope (method receiver, typed
+ *      parameter, or local declaration) via inferLocalReceiverType;
+ *   2. `field`'s declared type from the struct's own declaration lines.
+ * The method is then resolved AND VALIDATED on the field's type. A field
+ * whose type has no project node (`sql.DB`, any external dependency) yields
+ * null — the caller treats this branch as exclusive for chained Go
+ * receivers, so the ref stays unresolved instead of name-guessing.
+ */
+function matchGoFieldChainCall(
+  receiverChain: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  const segs = receiverChain.split('.');
+  if (segs.length !== 2 || !segs[0] || !segs[1]) return null;
+  const [base, field] = segs;
+
+  const baseType = inferLocalReceiverType(base!, ref, context);
+  if (!baseType) return null;
+
+  const fieldEsc = field!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const fieldTypeRe = new RegExp(`\\b${fieldEsc}\\s+\\*?\\[?\\]?([A-Za-z_][\\w.]*)`);
+
+  const structs = preferCallSiteFile(context.getNodesByName(baseType), ref.filePath).filter(
+    (n) => (n.kind === 'struct' || n.kind === 'class') && n.language === 'go'
+  );
+  for (const s of structs) {
+    const source = context.readFile(s.filePath);
+    if (!source) continue;
+    // Only the struct's own declaration lines — a same-named identifier
+    // elsewhere in the file can't donate a type. Matched LINE BY LINE with
+    // comments stripped: chi's `Mux` has a doc comment reading "the tree
+    // router" right above `tree *node`, and a whole-block match captured
+    // `router` from the prose instead of `node` from the field.
+    const declLines = source.split('\n').slice(Math.max(0, s.startLine - 1), s.endLine);
+    for (const rawLine of declLines) {
+      const line = rawLine.replace(/\/\/.*$/, '').replace(/\/\*.*?\*\//g, '');
+      const m = line.match(fieldTypeRe);
+      if (!m || !m[1]) continue;
+      const rawType = m[1];
+      // A package-qualified field type (`http.Handler`, `sql.DB`) is only
+      // followed when the package is IN-MODULE: stripping the qualifier and
+      // matching the bare name would conflate a stdlib/third-party type with
+      // any same-named project type — on chi, `handler http.Handler` bound
+      // to an example app's unrelated local `Handler`. That is the exact
+      // fabrication this matcher exists to prevent (#1276).
+      if (rawType.includes('.')) {
+        const pkg = rawType.split('.')[0]!;
+        const mod = context.getGoModule?.();
+        const imp = context
+          .getImportMappings(s.filePath, 'go')
+          .find((i) => i.localName === pkg);
+        const inModule =
+          !!mod &&
+          !!imp &&
+          (imp.source === mod.modulePath || imp.source.startsWith(mod.modulePath + '/'));
+        if (!inModule) continue;
+      }
+      // Unexported (lowercase) types are idiomatic Go and stay eligible —
+      // chi's `mx.tree.FindRoute()` chains through `tree *node`. A
+      // mis-capture is harmless: resolveMethodOnType only returns a
+      // validated `<type>::<method>` match.
+      const fieldType = rawType.split('.').pop();
+      if (!fieldType || !/^[A-Za-z_]/.test(fieldType) || GO_BUILTIN_FIELD_TYPES.has(fieldType)) continue;
+      const resolved = resolveMethodOnType(fieldType, methodName, ref, context, 0.85, 'instance-method');
+      if (resolved) return resolved;
+    }
+  }
+  return null;
+}
+
+// Rust primitives and the prelude's own types: a field of one of these never
+// names a project type, so a `self.<field>.<method>()` on it stays unresolved.
+const RUST_NON_PROJECT_FIELD_TYPES = new Set([
+  'bool', 'char', 'str', 'String',
+  'i8', 'i16', 'i32', 'i64', 'i128', 'isize',
+  'u8', 'u16', 'u32', 'u64', 'u128', 'usize',
+  'f32', 'f64',
+  'Self', 'self',
+]);
+
+/**
+ * Reduce a Rust field's declared type text to the simple name of the type a
+ * method call on that field auto-derefs to, or null when there is none we can
+ * name. Only the layers Rust's method-call auto-deref looks through are
+ * unwrapped: references (`&`, `&'a mut`) and the owning smart pointers
+ * (`Box`, `Rc`, `Arc`) — `self.inner.run()` with `inner: Box<Inner>` calls
+ * `Inner::run`. Containers that do NOT auto-deref to their parameter
+ * (`Option<Inner>`, `Vec<Inner>`, `Mutex<Inner>`, `RefCell<Inner>`) keep their
+ * own name and, having no project node, resolve to nothing — `self.items.push()`
+ * must never become `Inner::push`. A trait object (`Box<dyn Source>`) yields
+ * the trait, whose method node the interface-impl synthesizer fans out. A
+ * generic parameter (`T`), a primitive, a tuple / array / raw pointer / fn
+ * type, or a non-identifier yields null.
+ */
+export function rustFieldTypeName(raw: string): string | null {
+  let t = raw.trim();
+  for (;;) {
+    const before = t;
+    t = t.replace(/^&\s*(?:'\w+\s+)?(?:mut\s+)?/, '');
+    t = t.replace(/^(?:Box|Rc|Arc)\s*<\s*/, '');
+    t = t.replace(/^(?:dyn|impl)\s+/, '');
+    if (t === before) break;
+  }
+  // Drop generic args, the closing `>`s of unwrapped pointers, and trait-object
+  // bounds (`dyn Source + Send`); keep the last path segment.
+  t = t.replace(/[<>+].*$/, '').trim();
+  const seg = t.split('::').filter(Boolean).pop();
+  if (!seg || !/^[A-Za-z_]\w*$/.test(seg)) return null;
+  if (RUST_NON_PROJECT_FIELD_TYPES.has(seg)) return null;
+  if (/^[A-Z]$/.test(seg)) return null; // bare single-letter generic parameter
+  return seg;
+}
+
+/**
+ * Resolve a Rust call through a field of the enclosing type —
+ * `self.inner.run()`, emitted by the extractor as `self.inner.run` (#1585).
+ * Mirrors the Go 2-hop precedent above (#1276): the owner type is the calling
+ * method's qualified-name prefix (`Outer::run` → `Outer`), the field's declared
+ * type comes from the owner struct's OWN declaration lines, and the method is
+ * resolved AND VALIDATED on that type by resolveMethodOnType. The caller
+ * treats this branch as exclusive for `self.<field>` receivers: a field whose
+ * type is external (`std::vec::IntoIter`, `regex::Regex`), a generic
+ * parameter, or not declared where we can see it yields null and the ref stays
+ * unresolved. Rust struct fields are not graph nodes, so the declaration text
+ * is the only place the type lives.
+ */
+function matchRustSelfFieldCall(
+  field: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  // The extractor only ever emits a single field hop; anything else is not ours.
+  if (!field || field.includes('.')) return null;
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  if (!caller) return null;
+  const sep = caller.qualifiedName.lastIndexOf('::');
+  if (sep <= 0) return null; // a free fn has no `self`
+  const owner = caller.qualifiedName.slice(0, sep).split('::').pop();
+  if (!owner) return null;
+
+  const owners = preferCallSiteFile(context.getNodesByName(owner), ref.filePath).filter(
+    (n) =>
+      (n.kind === 'struct' || n.kind === 'union' || n.kind === 'class') &&
+      n.language === 'rust'
+  );
+  const fieldEsc = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // `pub inner: Inner,` / `inner: Box<dyn Source>,` / `pub(crate) inner: T }` —
+  // the type text runs to the field separator. A comma inside generic args
+  // (`HashMap<K, V>`) truncates the capture, which rustFieldTypeName then
+  // reduces to the container's own name — exactly the non-deref case it
+  // refuses anyway.
+  const fieldRe = new RegExp(`\\b${fieldEsc}\\s*:\\s*([^,{}]+)`);
+  for (const s of owners) {
+    const source = context.readFile(s.filePath);
+    if (!source) continue;
+    // Only the struct's own declaration lines, comment-stripped line by line —
+    // same discipline as the Go helper: prose or a same-named identifier
+    // elsewhere in the file can never donate a type.
+    const declLines = source.split('\n').slice(Math.max(0, s.startLine - 1), s.endLine);
+    for (const rawLine of declLines) {
+      const line = rawLine.replace(/\/\/.*$/, '').replace(/\/\*.*?\*\//g, '');
+      const m = line.match(fieldRe);
+      if (!m || !m[1]) continue;
+      const fieldType = rustFieldTypeName(m[1]);
+      // The field is declared here; whether or not its type names a project
+      // symbol, this owner is the answer — no other same-named struct applies.
+      if (!fieldType) return null;
+      return resolveMethodOnType(fieldType, methodName, ref, context, 0.85, 'instance-method');
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve a TS/JS `this.<field>.<method>()` call (#1496) through the field's
+ * declared type, read off the ENCLOSING class's own declaration lines:
+ * a field or constructor-parameter property (`private mailer: Mailer`,
+ * `mailer?: Mailer`, `readonly mailer: Mailer`) or an initializer
+ * (`mailer = new Mailer()`, `this.mailer = new Mailer()`). The method is then
+ * VALIDATED on that type by resolveMethodOnType. Null — never a bare-name
+ * fallback — when the field is not declared there or its type is external,
+ * a builtin (`this.items.push()`) or not spelled out.
+ */
+function matchTsThisFieldCall(
+  field: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  if (!field || field.includes('.')) return null;
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  if (!caller) return null;
+  const sep = caller.qualifiedName.lastIndexOf('::');
+  if (sep <= 0) return null; // not inside a class
+  const owner = caller.qualifiedName.slice(0, sep).split('::').pop();
+  if (!owner) return null;
+
+  const owners = preferCallSiteFile(context.getNodesByName(owner), ref.filePath).filter(
+    (n) => (n.kind === 'class' || n.kind === 'component') && sameLanguageFamily(n.language, ref.language)
+  );
+  const fieldEsc = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const patterns: Array<{ re: RegExp; valueType: boolean }> = [
+    // `storage: typeof DraftHubStorage` — the type OF a value: an object
+    // literal used as a namespace. Its members are bare-named functions inside
+    // the constant's extent (#1573), so they are found by containment, not by
+    // `Type::method`. Tried first: the declared-type pattern below would
+    // otherwise capture the word `typeof`.
+    {
+      re: new RegExp(`\\b${fieldEsc}\\b\\s*[?!]?\\s*:\\s*(?:readonly\\s+)?typeof\\s+([A-Za-z_$][\\w.$]*)`),
+      valueType: true,
+    },
+    // `private readonly mailer?: Mailer` — a class field or a constructor
+    // parameter property; the capture stops at `<`, `[` or `|`, so a generic
+    // or union type yields its head and resolveMethodOnType decides.
+    {
+      re: new RegExp(`\\b${fieldEsc}\\b\\s*[?!]?\\s*:\\s*(?:readonly\\s+)?([A-Za-z_$][\\w.$]*)`),
+      valueType: false,
+    },
+    // `mailer = new Mailer()` / `this.mailer = new Mailer()`
+    { re: new RegExp(`\\b${fieldEsc}\\b\\s*=\\s*new\\s+([A-Za-z_$][\\w.$]*)`), valueType: false },
+  ];
+  for (const cls of owners) {
+    const source = context.readFile(cls.filePath);
+    if (!source) continue;
+    const declLines = source.split('\n').slice(Math.max(0, cls.startLine - 1), cls.endLine);
+    for (const rawLine of declLines) {
+      const line = rawLine.replace(/\/\/.*$/, '').replace(/\/\*.*?\*\//g, '');
+      for (const { re, valueType } of patterns) {
+        const m = line.match(re);
+        if (!m || !m[1]) continue;
+        if (valueType) {
+          // The value's declaration may live in another file (it is imported);
+          // the call site's file is preferred when several share the name.
+          const holderName = m[1].split('.').pop()!;
+          const holders = preferCallSiteFile(context.getNodesByName(holderName), ref.filePath).filter(
+            (n) => (n.kind === 'constant' || n.kind === 'variable') && sameLanguageFamily(n.language, ref.language)
+          );
+          for (const holder of holders) {
+            const hit = resolveObjectLiteralMember(holder, methodName, ref, context, 0.85, 'instance-method');
+            if (hit) return hit;
+          }
+          return null;
+        }
+        // `ns.Mailer` → `Mailer`; a primitive or builtin names no project type.
+        const typeName = m[1].split('.').pop()!;
+        if (!/^[A-Z]/.test(typeName)) return null;
+        // Two apps in one repo may each declare a `UserService`. The bare-name
+        // path this replaces broke that tie by directory proximity, so keep the
+        // same signal: among the type's declarations of the method, prefer the
+        // one closest to the call site's directory (its own app), never index
+        // order. resolveMethodOnType still answers the single-declaration and
+        // supertype cases.
+        const declared = context
+          .getNodesByName(methodName)
+          .filter(
+            (n) =>
+              n.kind === 'method' &&
+              sameLanguageFamily(n.language, ref.language) &&
+              (n.qualifiedName === `${typeName}::${methodName}` || n.qualifiedName.endsWith(`::${typeName}::${methodName}`))
+          );
+        if (declared.length > 1) {
+          const callDirs = ref.filePath.split('/').slice(0, -1);
+          const shared = (fp: string) => {
+            const dirs = fp.split('/').slice(0, -1);
+            let i = 0;
+            while (i < dirs.length && i < callDirs.length && dirs[i] === callDirs[i]) i++;
+            return i;
+          };
+          const nearest = [...declared].sort((a, b) => shared(b.filePath) - shared(a.filePath) || a.filePath.localeCompare(b.filePath))[0]!;
+          return { original: ref, targetNodeId: nearest.id, confidence: 0.85, resolvedBy: 'instance-method' };
+        }
+        return resolveMethodOnType(typeName, methodName, ref, context, 0.85, 'instance-method');
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * The one fallback a TS/JS/Python call-receiver chain keeps (#1683): a STORE
+ * ACCESSOR. Zustand's `get()` inside the store factory and
+ * `useStore.getState()` outside it hand back the store whose actions are
+ * indexed as functions (#1573), so a unique callable of the method's name in
+ * the same language family is what `get().reset()` reaches. Nothing else
+ * qualifies: a chain rooted in a project value still says nothing about what
+ * the inner call RETURNS — `db.prepare(sql).all()` would bind to any project
+ * function named `all` — so it resolves to nothing, exactly like a chain
+ * rooted in a parameter (`d.setdefault(k, []).append(v)`).
+ */
+function matchStoreAccessorChain(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const m = ref.referenceName.match(/^([\w$.]+)\(\)\.(\w+)$/);
+  if (!m || !m[1] || !m[2]) return null;
+  const inner = m[1];
+  const method = m[2];
+  if (!(inner === 'get' || inner === 'getState' || inner.endsWith('.getState'))) return null;
+  const callables = context
+    .getNodesByName(method)
+    .filter((n) => (n.kind === 'function' || n.kind === 'method') && sameLanguageFamily(n.language, ref.language) && n.id !== ref.fromNodeId);
+  if (callables.length !== 1) return null;
+  return { original: ref, targetNodeId: callables[0]!.id, confidence: 0.6, resolvedBy: 'exact-match' };
 }
 
 /**
@@ -1832,6 +2889,7 @@ function findBestMatch(
       if (
         candidate.kind === 'class' ||
         candidate.kind === 'struct' ||
+        candidate.kind === 'union' ||
         candidate.kind === 'interface'
       ) {
         score += 25;
@@ -1883,13 +2941,39 @@ export function matchFuzzy(
 
   // Filter to callable kinds only (function, method, class)
   const callableKinds = new Set(['function', 'method', 'class']);
-  const callableCandidates = applyLanguageGate(candidates.filter((n) => callableKinds.has(n.kind)), ref);
+  const callableCandidates = applyLanguageGate(
+    candidates.filter((n) => callableKinds.has(n.kind)),
+    ref
+  );
 
   // Prefer same-language matches
   const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);
   const finalCandidates = sameLanguageCandidates.length > 0 ? sameLanguageCandidates : callableCandidates;
 
-  if (finalCandidates.length === 1) {
+  // Both post-pipeline visibility guards (#1745 language-local + #1719 sealed
+  // module). The sealed-module test rejects the survivor and never filters the
+  // set that produced it: removing a sealed candidate from a crowd would leave
+  // a lone one and manufacture a 0.5 guess out of an ambiguity fuzzy declines.
+  // Also decline a bare JS/TS call whose only survivor is a method or a
+  // cross-file name the file already binds locally (#1714).
+  // A function nested inside another function is only callable from inside
+  // its container (#1230), so a builtin method call (`res.text()`) whose only
+  // same-named project symbol is some file's closure must decline (#1708).
+  // The check sits on the ONE candidate this strategy would commit to, not on
+  // the candidate set: filtering the unreachable ones out of a crowd would
+  // leave a single survivor and hand it every call of that name — on vite,
+  // `import { resolve } from 'node:path'` in a dozen playground configs onto
+  // the one reachable `resolve` method (#1709). Reachability may reject a
+  // unique guess; it must never manufacture one.
+  if (
+    finalCandidates.length === 1 &&
+    isVisibleAcrossFiles(finalCandidates[0]!, ref, context) &&
+    isCrossFileReachable(finalCandidates[0]!, ref, context) &&
+    !(isBareJsCall(ref, context) &&
+      (finalCandidates[0]!.kind === 'method' ||
+        (finalCandidates[0]!.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context)))) &&
+    isLexicallyReachable(finalCandidates[0]!, ref, context)
+  ) {
     const isCrossLanguage = finalCandidates[0]!.language !== ref.language;
     return {
       original: ref,
@@ -1907,6 +2991,49 @@ export function matchFuzzy(
  */
 /** ArkUI attribute-helper decorators a `.attr(...)` chain may resolve to. */
 const ARKUI_ATTRIBUTE_DECORATORS = new Set(['Extend', 'Styles', 'AnimatableExtend', 'Builder']);
+
+/**
+ * CODEGRAPH_RESOLVE_PROFILE=2 sub-stage attribution for matchReference's
+ * strategy pipeline (`nm:<stage>|<refKind>|hit/miss`). Module-global because
+ * the matcher is a free function; each thread (main + every pool worker) has
+ * its own module instance, and dumpNameMatcherProfile is invoked from
+ * ReferenceResolver.dumpResolveProfile so worker tables surface too.
+ */
+const NM_PROFILE: Map<string, { n: number; ns: bigint }> | null =
+  process.env.CODEGRAPH_RESOLVE_PROFILE === '2' ? new Map() : null;
+
+function nmTimedT<T>(stage: string, ref: UnresolvedRef, fn: () => T): T {
+  if (!NM_PROFILE) return fn();
+  const t0 = process.hrtime.bigint();
+  const r = fn();
+  const dt = process.hrtime.bigint() - t0;
+  const key = `nm:${stage}|${ref.referenceKind}|${r ? 'hit' : 'miss'}`;
+  const slot = NM_PROFILE.get(key);
+  if (slot) {
+    slot.n++;
+    slot.ns += dt;
+  } else {
+    NM_PROFILE.set(key, { n: 1, ns: dt });
+  }
+  return r;
+}
+
+function nmTimed(stage: string, ref: UnresolvedRef, fn: () => ResolvedRef | null): ResolvedRef | null {
+  return nmTimedT(stage, ref, fn);
+}
+
+/** Dump this thread's matchReference sub-stage table to stderr (no-op unless =2). */
+export function dumpNameMatcherProfile(label: string): void {
+  if (!NM_PROFILE || NM_PROFILE.size === 0) return;
+  const rows = [...NM_PROFILE.entries()]
+    .map(([k, v]) => ({ k, n: v.n, ms: Number(v.ns / 1_000_000n) }))
+    .sort((a, b) => b.ms - a.ms);
+  for (const r of rows) {
+    console.error(
+      `[resolve-profile] ${label} ${r.k}: n=${r.n} total=${(r.ms / 1000).toFixed(1)}s avg=${((r.ms * 1000) / Math.max(1, r.n)).toFixed(0)}µs`
+    );
+  }
+}
 
 export function matchReference(
   ref: UnresolvedRef,
@@ -1976,22 +3103,68 @@ export function matchReference(
     };
   }
 
+  // Erlang call/fun refs carry the call-site arity (`f/1` — #1610) because
+  // arity is part of the function's identity and every erlang function's
+  // qualifiedName carries it (`mod::f/1`). Resolve ONLY to a definition of
+  // that exact arity: the call site's own file first (a local call targets its
+  // own module by language semantics; `-import`ed functions ride the
+  // cross-file branch), and when no definition of that arity exists anywhere,
+  // resolve to NOTHING rather than a sibling arity — the real target may be
+  // macro-generated or out of repo, and a wrong-arity edge is worse than none.
+  if (
+    ref.language === 'erlang' &&
+    !ref.referenceName.includes('::') &&
+    (ref.referenceKind === 'calls' || ref.referenceKind === 'references')
+  ) {
+    const am = /^(.+)\/(\d{1,3})$/.exec(ref.referenceName);
+    if (am) {
+      // endsWith is length-anchored, so `/1` cannot match `…/11`.
+      const arityTail = `/${am[2]}`;
+      const candidates = context
+        .getNodesByName(am[1]!)
+        .filter(
+          (n) =>
+            n.language === 'erlang' && n.kind === 'function' && n.qualifiedName.endsWith(arityTail),
+        );
+      if (candidates.length > 0) {
+        const sameFile = candidates.find((n) => n.filePath === ref.filePath);
+        if (sameFile) {
+          return { original: ref, targetNodeId: sameFile.id, confidence: 0.95, resolvedBy: 'exact-match' };
+        }
+        if (candidates.length === 1) {
+          return { original: ref, targetNodeId: candidates[0]!.id, confidence: 0.8, resolvedBy: 'exact-match' };
+        }
+        const best = findBestMatch(ref, candidates, context);
+        if (best) {
+          const proximity = computePathProximity(ref.filePath, best.filePath);
+          return {
+            original: ref,
+            targetNodeId: best.id,
+            confidence: proximity >= 30 ? 0.7 : 0.4,
+            resolvedBy: 'exact-match',
+          };
+        }
+      }
+      return null;
+    }
+  }
+
   // Try strategies in order of confidence
   let result: ResolvedRef | null;
 
   // 0. File path match (e.g., "snippets/drawer-menu.liquid" → file node)
-  result = matchByFilePath(ref, context);
+  result = nmTimed('filePath', ref, () => matchByFilePath(ref, context));
   if (result) return result;
 
   // 1. Qualified name match (highest confidence)
-  result = matchByQualifiedName(ref, context);
+  result = nmTimed('qualifiedName', ref, () => matchByQualifiedName(ref, context));
   if (result) return result;
 
   // 1b. C++ chained call whose receiver is another call — `Foo::instance().bar()`
   // encoded as `Foo::instance().bar` by the extractor (#645). Resolve the
   // receiver's type from what the inner call returns, then the method on it.
   if (ref.language === 'cpp' || ref.language === 'c') {
-    result = matchCppCallChain(ref, context);
+    result = nmTimed('cppChain', ref, () => matchCppCallChain(ref, context));
     if (result) return result;
   }
 
@@ -2000,7 +3173,7 @@ export function matchReference(
   // type is the factory's `self` (PHP `: self`/`: static`, Rust `-> Self`) or
   // concrete return type.
   if (ref.language === 'php' || ref.language === 'rust') {
-    result = matchScopedCallChain(ref, context);
+    result = nmTimed('scopedChain', ref, () => matchScopedCallChain(ref, context));
     if (result) return result;
   }
 
@@ -2022,20 +3195,33 @@ export function matchReference(
     ref.language === 'objc' ||
     ref.language === 'pascal'
   ) {
-    result = matchDottedCallChain(ref, context);
+    result = nmTimed('dottedChain', ref, () => matchDottedCallChain(ref, context));
     if (result) return result;
   }
 
+  // A call-receiver chain the extractor encoded as `<inner>().<method>` for a
+  // language with no chain resolver above (TS/JS, Python — #1683) is a
+  // receiver whose type is unknown. Nothing below may guess for it: the
+  // method-call pattern rejects the parens, exact name never matches, but the
+  // fuzzy strategy splits on `.` and would hand `make().run` to any `run` —
+  // the fabricated edge the encoding exists to prevent.
+  if (
+    ref.referenceName.includes('().') &&
+    (ref.language === 'typescript' || ref.language === 'javascript' || ref.language === 'tsx' || ref.language === 'jsx' || ref.language === 'python')
+  ) {
+    return nmTimed('storeAccessorChain', ref, () => matchStoreAccessorChain(ref, context));
+  }
+
   // 2. Method call pattern
-  result = matchMethodCall(ref, context);
+  result = nmTimed('methodCall', ref, () => matchMethodCall(ref, context));
   if (result) return result;
 
   // 3. Exact name match
-  result = matchByExactName(ref, context);
+  result = nmTimed('exactName', ref, () => matchByExactName(ref, context));
   if (result) return result;
 
   // 4. Fuzzy match (lowest confidence)
-  result = matchFuzzy(ref, context);
+  result = nmTimed('fuzzy', ref, () => matchFuzzy(ref, context));
   if (result) return result;
 
   return null;

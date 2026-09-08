@@ -55,6 +55,10 @@ for archive in "${archives[@]}"; do
       nodefile="node"
       ;;
   esac
+  # The browser viewer must survive the archive round-trip too: a tar/zip that
+  # dropped dist/viewer would publish a platform package whose `codegraph ui`
+  # serves a 404.
+  node "$ROOT/scripts/check-ui-build.mjs" --root "$pkgdir/lib"
   VERSION="$VERSION" SCOPE="$SCOPE" TARGET="$target" OSV="$os" ARCHV="$arch" NODEFILE="$nodefile" \
     node -e '
       const fs=require("fs");
@@ -64,7 +68,10 @@ for archive in "${archives[@]}"; do
         description: `CodeGraph self-contained bundle for ${process.env.TARGET}`,
         os: [process.env.OSV], cpu: [process.env.ARCHV],
         files: [process.env.NODEFILE, "lib", "bin"],
-        license: "MIT"
+        license: "MIT",
+        // npm --provenance refuses to publish unless this matches the repo
+        // the release workflow runs in.
+        repository: { type: "git", url: "git+https://github.com/colbymchenry/codegraph.git" }
       }, null, 2) + "\n");
     ' "$pkgdir/package.json"
   targets+=("$target")
@@ -111,9 +118,36 @@ VERSION="$VERSION" SCOPE="$SCOPE" TARGETS="${targets[*]}" \
       },
       optionalDependencies: opt,
       files: ["npm-shim.js","npm-sdk.js","dist","README.md"],
-      license: "MIT"
+      license: "MIT",
+      repository: { type: "git", url: "git+https://github.com/colbymchenry/codegraph.git" }
     }, null, 2) + "\n");
   ' "$NPM/main/package.json"
 
 echo "[pack-npm] ${SCOPE}/codegraph@${VERSION} (${#targets[@]} platform packages in optionalDependencies)"
 echo "[pack-npm] output: $NPM"
+
+# ---------------------------------------------------------------------------
+# @colbymchenry/codegraph-ui — the viewer's components as a Svelte library.
+#
+# Staged into release/npm-ui/, NOT release/npm/: the workflow publishes
+# `release/npm/codegraph-*` by glob, and a directory named codegraph-ui in
+# there would be swept into that loop the moment it existed.
+#
+# OFF by default. The package is prepared, versioned with the engine and
+# tested (CG-61), but publishing it is a decision the maintainer has not
+# made — and `ui/package.json` still carries `"private": true`, which is what
+# actually stops an accidental `npm publish`. Set CODEGRAPH_PACK_UI=1 to build
+# the tarball; publishing it additionally means removing that flag.
+# ---------------------------------------------------------------------------
+if [ "${CODEGRAPH_PACK_UI:-0}" = "1" ]; then
+  UIREL="$REL/npm-ui"
+  rm -rf "$UIREL"
+  mkdir -p "$UIREL"
+  ( cd "$ROOT" && npm run build:lib --workspace ui )
+  # `npm pack` honours "files" and works on a private package; `npm publish`
+  # does not, which is exactly the guard we want to keep for now.
+  ( cd "$ROOT/ui" && npm pack --pack-destination "$UIREL" >/dev/null )
+  echo "[pack-npm] ${SCOPE}/codegraph-ui@${VERSION} packed (not published) -> $UIREL"
+else
+  echo "[pack-npm] skipping ${SCOPE}/codegraph-ui (set CODEGRAPH_PACK_UI=1 to pack it)"
+fi

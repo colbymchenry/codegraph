@@ -31,6 +31,14 @@ declare module '@clack/prompts' {
     required?: boolean;
   }): Promise<Value[] | symbol>;
 
+  export function text(opts: {
+    message: string;
+    placeholder?: string;
+    defaultValue?: string;
+    initialValue?: string;
+    validate?: (value: string | undefined) => string | Error | undefined;
+  }): Promise<string | symbol>;
+
   export function spinner(): {
     start(message?: string): void;
     stop(message?: string): void;

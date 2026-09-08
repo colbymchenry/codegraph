@@ -102,6 +102,8 @@ export interface LanguageExtractor {
   interfaceTypes: string[];
   /** Node types that represent structs */
   structTypes: string[];
+  /** Node types that represent unions */
+  unionTypes?: string[];
   /** Node types that represent enums */
   enumTypes: string[];
   /** Node types that represent enum members/cases (e.g. Swift: 'enum_entry', Rust: 'enum_variant') */
@@ -158,6 +160,8 @@ export interface LanguageExtractor {
   isAsync?: (node: SyntaxNode) => boolean;
   /** Check if node is static */
   isStatic?: (node: SyntaxNode) => boolean;
+  /** Check if a method/class is abstract (C++ pure virtual, Java abstract, …). Return true to set; undefined/false leaves the flag unset. */
+  isAbstract?: (node: SyntaxNode) => boolean | undefined;
   /** Check if variable declaration is a constant (const vs let/var) */
   isConst?: (node: SyntaxNode) => boolean;
   /**
@@ -183,6 +187,19 @@ export interface LanguageExtractor {
    * bodiless class IS complete (Kotlin `class Empty`, Scala `case object`). (#1093)
    */
   skipBodilessClass?: boolean;
+  /**
+   * Keep a bodiless struct node — it IS a complete definition, not a forward
+   * declaration. Set only for languages where a bodiless `struct` is complete:
+   * Rust's unit struct (`struct Unit;`). Leave unset for C/C++, where
+   * `struct Foo;` is a forward declaration.
+   *
+   * Opposite polarity from `skipBodilessClass` (#1093) because the defaults
+   * differ: a bodiless CLASS is kept unless a language opts into skipping,
+   * a bodiless STRUCT is skipped unless a language opts into keeping. The
+   * hardcoded C# `record_declaration` carve-out (#831) is the same situation
+   * predating this flag.
+   */
+  allowBodilessStruct?: boolean;
   /** NodeKind to use for interface-like declarations (Rust: 'trait'). Default: 'interface' */
   interfaceKind?: NodeKind;
 
@@ -219,9 +236,13 @@ export interface LanguageExtractor {
    * both callable and data members (#808): TS/JS class FIELDS
    * (`public_field_definition` / `field_definition`) are methods only when
    * their value is callable (`onClick = () => {}`); a plain field
-   * (`public fonts: Fonts;`, `count = 0`) is a property. Default: 'method'.
+   * (`public fonts: Fonts;`, `count = 0`) is a property. C++ also lists
+   * `field_declaration` in methodTypes so pure-virtual methods (`= 0`) can
+   * mint nodes (#1727); non-callable field_declarations return `'skip'` so
+   * the walker still descends (data-member initializers keep their call
+   * edges). Default: 'method'.
    */
-  classifyMethodNode?: (node: SyntaxNode) => 'method' | 'property';
+  classifyMethodNode?: (node: SyntaxNode) => 'method' | 'property' | 'skip';
 
   /**
    * Resolve the body node for a function/method/class when it's not a child field.

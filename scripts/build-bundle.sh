@@ -63,10 +63,39 @@ echo "[bundle] building app"
 STAGE="$WORK/codegraph-${TARGET}"
 mkdir -p "$STAGE/lib" "$STAGE/bin"
 cp -R "$ROOT/dist" "$STAGE/lib/dist"
+# The browser viewer rides along inside dist/viewer (built by `npm run build`
+# above). Fail here rather than shipping a bundle whose `codegraph ui` serves
+# a 404 — the copy is verified, not assumed.
+node "$ROOT/scripts/check-ui-build.mjs" --root "$STAGE/lib"
 cp "$ROOT/package.json" "$ROOT/package-lock.json" "$STAGE/lib/"
 echo "[bundle] installing production dependencies"
+# The staged package.json declares the `ui` workspace but the bundle carries
+# no ui/ source — only its build output. That is fine: ui/ has dev
+# dependencies only, so --omit=dev skips the workspace outright and no link
+# is created. (If a future npm starts erroring on the absent folder, stage a
+# stub ui/package.json before this line rather than editing the lock.)
 ( cd "$STAGE/lib" && npm ci --omit=dev --ignore-scripts >/dev/null 2>&1 )
 rm -f "$STAGE/lib/package-lock.json"
+
+# 3b. Native extraction kernel (optional). Included when a prebuilt .node for
+#     the target exists — release/kernel/<target>/codegraph-kernel.node (the
+#     release workflow's prebuild artifacts) or the locally staged
+#     codegraph-kernel/prebuilds/<target>/ (scripts/build-kernel.sh). Absent →
+#     the bundle simply runs the wasm extraction path; the kernel is a
+#     per-language speedup, never a requirement (see
+#     docs/design/rust-kernel-migration-plan.md).
+KERNEL_NODE=""
+for candidate in "$ROOT/release/kernel/${TARGET}/codegraph-kernel.node" \
+                 "$ROOT/codegraph-kernel/prebuilds/${TARGET}/codegraph-kernel.node"; do
+  if [ -f "$candidate" ]; then KERNEL_NODE="$candidate"; break; fi
+done
+if [ -n "$KERNEL_NODE" ]; then
+  mkdir -p "$STAGE/lib/kernel"
+  cp "$KERNEL_NODE" "$STAGE/lib/kernel/codegraph-kernel.node"
+  echo "[bundle] native kernel included ($KERNEL_NODE)"
+else
+  echo "[bundle] no native kernel for ${TARGET} — bundle uses the wasm extraction path"
+fi
 
 # 4. Vendored Node + launcher (the launcher uses the bundled Node by relative
 #    path, so no system Node is ever needed).
@@ -81,7 +110,7 @@ rm -f "$STAGE/lib/package-lock.json"
 # runs are covered too; passing it here avoids that extra spawn.)
 if [ "$OSFAM" = "win32" ]; then
   cp "$NODE_BIN" "$STAGE/node.exe"
-  printf '@"%%~dp0..\\node.exe" --liftoff-only "%%~dp0..\\lib\\dist\\bin\\codegraph.js" %%*\r\n' \
+  printf '@"%%~dp0..\\node.exe" --liftoff-only --disable-warning=ExperimentalWarning "%%~dp0..\\lib\\dist\\bin\\codegraph.js" %%*\r\n' \
     > "$STAGE/bin/codegraph.cmd"
 else
   cp "$NODE_BIN" "$STAGE/node"
@@ -104,7 +133,9 @@ DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
 CODEGRAPH_HOST_PPID="${CODEGRAPH_HOST_PPID:-$PPID}"
 export CODEGRAPH_HOST_PPID
 # --liftoff-only: avoid the V8 turboshaft WASM Zone OOM (issues #293/#298).
-exec "$DIR/node" --liftoff-only "$DIR/lib/dist/bin/codegraph.js" "$@"
+# --disable-warning=ExperimentalWarning: mute node:sqlite's per-thread
+# "experimental feature" warning that otherwise interleaves with the progress UI.
+exec "$DIR/node" --liftoff-only --disable-warning=ExperimentalWarning "$DIR/lib/dist/bin/codegraph.js" "$@"
 LAUNCH
   chmod +x "$STAGE/bin/codegraph"
 fi

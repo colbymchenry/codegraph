@@ -4,7 +4,7 @@
  * Types for the reference resolution system.
  */
 
-import { Language, Node, ReferenceKind } from '../types';
+import { EdgeKind, Language, Node, ReferenceKind } from '../types';
 
 /**
  * An unresolved reference from extraction
@@ -43,6 +43,28 @@ export interface ResolvedRef {
   confidence: number;
   /** How it was resolved */
   resolvedBy: 'exact-match' | 'import' | 'qualified-name' | 'framework' | 'fuzzy' | 'instance-method' | 'file-path' | 'function-ref';
+  /**
+   * Edge kind the edge should carry when it is NOT the ref's own kind — a
+   * framework that turns a `calls` ref into a `navigates` edge, for example.
+   * The original kind is still recorded on the edge as `metadata.refKind`, so
+   * re-resolution after a target is removed reconstructs the ref faithfully.
+   */
+  edgeKind?: EdgeKind;
+  /** Extra metadata the strategy wants persisted on the edge (`href`, …). */
+  metadata?: Record<string, unknown>;
+  /**
+   * The OTHER targets, when one reference names several.
+   *
+   * A navigation whose destination is a conditional reaches every arm —
+   * `!isAdmin ? keyword ? '/search/…' : '/page/…' : '/admin/…'` is one call
+   * and three screens — and drawing only the first would hide two places the
+   * code goes. `createEdges` fans these out into an edge apiece, sharing this
+   * resolution's kind and confidence; each carries its own metadata.
+   *
+   * The reference itself still resolves ONCE, so the resolution pipeline's
+   * bookkeeping — cleanup by row id, counts, re-resolution — is unchanged.
+   */
+  alsoTargets?: { targetNodeId: string; metadata?: Record<string, unknown> }[];
 }
 
 /**
@@ -273,3 +295,54 @@ export type ReExport =
       /** Module specifier of the upstream module. */
       source: string;
     };
+
+/**
+ * Node kinds an `extends`/`implements` edge may legally TARGET — the things a
+ * type can actually inherit from or conform to.
+ *
+ * Kept deliberately wide: `type_alias` because TS `class X implements
+ * SomeAliasedObjectType` is valid, `component` because a framework component
+ * node stands in for a class, and `module`/`namespace` because whole
+ * languages inherit from one — Ruby `include Trackable` targets a `module`,
+ * Erlang `-behaviour(gen_server)` targets the behaviour module, which Erlang
+ * extraction indexes as a `namespace` (the conformance pass in
+ * `resolution/index.ts` makes the same `module` allowance).
+ *
+ * Everything omitted (`enum_member`, `method`, `field`, `property`,
+ * `variable`, `constant`, `function`, `parameter`, `import`, `export`,
+ * `file`, `route`) can never be a supertype in any supported language, so an
+ * inheritance edge pointing at one is false data.
+ *
+ * Why this is needed: the name-matcher scores node kind as a BONUS,
+ * never a filter, and awards no bonus at all for inheritance refs — so a
+ * same-named non-type outranked (or, as the sole candidate, was adopted
+ * outright as) the real supertype. Rust `use std::error::Error;` + `impl Error
+ * for MapperError {}` bound to the local `MapperError::Error` VARIANT. The
+ * supertype is out-of-repo and simply unresolvable; a failed ref is correct.
+ */
+export const SUPERTYPE_TARGET_KINDS = new Set<Node['kind']>([
+  'class', 'struct', 'interface', 'trait', 'protocol', 'enum', 'union',
+  'type_alias', 'component', 'module', 'namespace',
+]);
+
+/** True for the reference kinds that assert an inheritance/conformance relation. */
+export function isInheritanceRef(ref: UnresolvedRef): boolean {
+  return ref.referenceKind === 'extends' || ref.referenceKind === 'implements';
+}
+
+/**
+ * Node kinds an `imports` edge may never TARGET: members that only exist
+ * INSIDE a type. No language lets you import a class's property, an
+ * interface's method or an enum's variant — you import the type that
+ * contains it. The name-matcher has no kind filter, so a bare
+ * `import path from 'node:path'` (unresolvable, since the module is external)
+ * name-matched an interface property called `path` in an unrelated file.
+ */
+const NON_IMPORTABLE_KINDS = new Set<Node['kind']>([
+  'property', 'field', 'method', 'enum_member', 'parameter',
+]);
+
+/** Can an `imports` reference legally resolve to this node kind? */
+export function isImportableKind(kind: Node['kind']): boolean {
+  return !NON_IMPORTABLE_KINDS.has(kind);
+}

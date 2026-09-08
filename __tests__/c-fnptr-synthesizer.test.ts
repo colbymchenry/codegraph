@@ -86,6 +86,45 @@ int dispatch(struct ops o) { return o.handler(); }
     expect(edges.every((e) => e.via === 'ops.handler')).toBe(true);
   });
 
+  it('bridges function-pointer fields declared in a union', async () => {
+    write('union-ops.c', `
+union ops { int (*handler)(void); };
+static int on_open(void) { return 1; }
+static union ops the_ops = { .handler = on_open };
+
+int dispatch(union ops o) { return o.handler(); }
+`);
+    const edges = await load();
+    expect(has(edges, 'dispatch', 'on_open')).toBe(true);
+    expect(edges.every((e) => e.via === 'ops.handler')).toBe(true);
+  });
+
+  it('bridges an inline union table whose entries are macro-built', async () => {
+    write('inline-union.c', `
+#define SLOT(fn) { fn }
+static int on_open(void) { return 1; }
+static union inline_ops { int (*handler)(void); } ops[] = { SLOT(on_open) };
+
+int dispatch(union inline_ops o) { return o.handler(); }
+`);
+    const edges = await load();
+    expect(has(edges, 'dispatch', 'on_open')).toBe(true);
+  });
+
+  it('bridges a union table declared through an object-macro type alias', async () => {
+    write('alias-union.c', `
+#define OPS_TYPE union ops
+#define SLOT(fn) { fn }
+union ops { int (*handler)(void); };
+static int on_open(void) { return 1; }
+static OPS_TYPE ops[] = { SLOT(on_open) };
+
+int dispatch(union ops o) { return o.handler(); }
+`);
+    const edges = await load();
+    expect(has(edges, 'dispatch', 'on_open')).toBe(true);
+  });
+
   it('bridges the typedef-field + field←field double-hop (the hook_demo.c shape)', async () => {
     write('hook.c', `
 typedef void (*hook_func)(void);
@@ -365,5 +404,33 @@ void setup(int *L) {
 `);
     const edges = await load();
     expect(edges.length).toBe(0);
+  });
+
+  // This is the pass that parks the "Linking dynamic dispatch" bar on C-heavy
+  // repos, so it reports a within-pass fraction of its file sweeps. Pin that
+  // the fractions arrive, stay in (0, 1], and never go backwards.
+  it('reports a monotonic within-pass progress fraction over its file sweeps', async () => {
+    // Enough files to cross the per-16-files reporting cadence several times
+    // across the four file sweeps.
+    for (let i = 0; i < 33; i++) write(`f${i}.c`, `void fn${i}(void) { }\n`);
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const { cFnPointerDispatchEdges } = await import('../src/resolution/c-fnptr-synthesizer');
+    const fractions: number[] = [];
+    await cFnPointerDispatchEdges(
+      (cg as any).queries,
+      (cg as any).resolver.context,
+      async () => {},
+      (f: number) => fractions.push(f)
+    );
+    cg.close?.();
+    expect(fractions.length).toBeGreaterThanOrEqual(4);
+    for (const f of fractions) {
+      expect(f).toBeGreaterThan(0);
+      expect(f).toBeLessThanOrEqual(1);
+    }
+    for (let i = 1; i < fractions.length; i++) {
+      expect(fractions[i]!).toBeGreaterThanOrEqual(fractions[i - 1]!);
+    }
   });
 });

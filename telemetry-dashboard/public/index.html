@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>codegraph telemetry</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="masthead">
+      <div>
+        <h1>codegraph telemetry</h1>
+        <p class="subtitle">Anonymous usage from the public engine, straight out of D1.</p>
+      </div>
+      <form method="post" action="/logout">
+        <button type="submit" class="secondary">Sign out</button>
+      </form>
+    </header>
+
+    <!-- One filter row for the whole page: every panel below is drawn against the
+         range chosen here, and no panel carries a time control of its own. The
+         panels themselves are built from the registry in public/panels.js. -->
+    <section class="filters" id="filters" aria-label="Time range">
+      <div class="filter-group" data-role="presets"></div>
+
+      <div class="filter-group custom-range">
+        <label for="custom-from">From</label>
+        <input type="date" id="custom-from" data-role="custom-from" />
+        <label for="custom-to">To</label>
+        <input type="date" id="custom-to" data-role="custom-to" />
+        <button type="button" class="secondary" data-role="custom-apply">Apply</button>
+      </div>
+
+      <div class="filter-group filter-end">
+        <button type="button" class="secondary" data-role="refresh">Refresh</button>
+      </div>
+
+      <p class="filter-status">
+        <span id="range-summary">Loading…</span>
+        <span class="dot" aria-hidden="true">·</span>
+        <span id="data-through"></span>
+        <span class="dot" aria-hidden="true">·</span>
+        <span id="refreshed-at"></span>
+      </p>
+    </section>
+
+    <main class="grid" id="grid"></main>
+
+    <script src="/vendor/chart.umd.js"></script>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

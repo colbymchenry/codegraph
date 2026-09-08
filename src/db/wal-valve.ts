@@ -42,14 +42,45 @@
  * the next pass covers everything, the WAL wraps on the following commit,
  * and the pause is the disk's honest catch-up cost — the correct terminal
  * mode when hardware genuinely can't keep up with the append rate.
+ *
+ * Fail-closed (#1539): if parked backfills cannot progress (a reader pinning
+ * frames) while the WAL is past the hard/file caps, the valve throws
+ * {@link WalValveAbortError} instead of releasing the writer. The previous
+ * "futility latch" disabled parking for 60s after consecutive give-ups so a
+ * pinned reader would not churn checkpoint workers — but that also let the
+ * WAL grow without a bound (observed 64 GiB on a kernel-scale daemon catch-up
+ * with the query pool holding read marks). Aborting with a clear error is the
+ * safe terminal mode; the caller closes readers / retries once the pin clears.
  */
 
 import type { DatabaseConnection } from './index';
+
+/**
+ * Thrown when the valve cannot checkpoint past its documented caps while a
+ * reader pins WAL frames (#1539). Callers (index/sync) should surface this and
+ * stop writing rather than risk unbounded disk growth.
+ */
+export class WalValveAbortError extends Error {
+  readonly code = 'WAL_VALVE_ABORT' as const;
+  readonly walBytes: number;
+  readonly fileCapBytes: number;
+  readonly hardBytes: number;
+
+  constructor(message: string, sizes: { walBytes: number; fileCapBytes: number; hardBytes: number }) {
+    super(message);
+    this.name = 'WalValveAbortError';
+    this.walBytes = sizes.walBytes;
+    this.fileCapBytes = sizes.fileCapBytes;
+    this.hardBytes = sizes.hardBytes;
+  }
+}
 
 /** Soft WAL-growth threshold (MB) that triggers an off-thread passive checkpoint. */
 const DEFAULT_WAL_VALVE_MB = 256;
 /** Hard cap = this × soft threshold; past it the writer pauses for a full backfill. */
 const HARD_CAP_MULTIPLIER = 2;
+/** File cap = this × soft threshold; past it the barrier also TRUNCATEs the file. */
+const FILE_CAP_MULTIPLIER = 4;
 /** Passes attempted per writer pause before giving up (a pinned reader could stall forever). */
 const MAX_PAUSED_BACKFILL_PASSES = 20;
 /** How often the timer looks at the WAL file size. */
@@ -59,10 +90,18 @@ const CHECK_INTERVAL_MS = 2000;
  * Resolve the valve's soft threshold from the `CODEGRAPH_WAL_VALVE_MB`
  * override; non-numeric / non-positive values fall back to the default.
  */
-export function resolveWalValveMb(envVal: string | undefined): number {
+export function resolveWalValveMb(envVal: string | undefined, dbSizeBytes?: number): number {
   if (envVal !== undefined && envVal !== '') {
     const n = Number(envVal);
     if (Number.isFinite(n) && n > 0) return Math.floor(n);
+  }
+  // Scale with the project when the caller knows the DB size: every fold
+  // re-writes hot B-tree pages into the main file (the #1231 pathology in
+  // bounded form — 111s of a kernel-scale batch loop at the flat 256MB cap,
+  // §7a.2), so a big project affords a proportionally bigger transient WAL
+  // (~dbSize/4 soft ⇒ file cap ≈ dbSize) in exchange for ~4× fewer folds.
+  if (dbSizeBytes !== undefined && dbSizeBytes > 0) {
+    return Math.min(2048, Math.max(DEFAULT_WAL_VALVE_MB, Math.floor(dbSizeBytes / 4 / (1024 * 1024))));
   }
   return DEFAULT_WAL_VALVE_MB;
 }
@@ -80,16 +119,32 @@ export class WalCheckpointValve {
   private sizeAtLastFullBackfill = 0;
   private readonly softBytes: number;
   private readonly hardBytes: number;
+  private readonly fileCapBytes: number;
+
+  /**
+   * Consecutive parked-backfill give-ups. Used only for diagnostics in the
+   * abort message — parking is never disabled (#1539 fail-closed).
+   */
+  private consecutiveGiveUps = 0;
 
   constructor(
     private readonly db: DatabaseConnection,
     softMb: number = resolveWalValveMb(process.env.CODEGRAPH_WAL_VALVE_MB),
     private readonly intervalMs: number = CHECK_INTERVAL_MS,
-    private readonly log: (msg: string) => void = () => {}
+    log: (msg: string) => void = () => {}
   ) {
     this.softBytes = softMb * 1024 * 1024;
     this.hardBytes = this.softBytes * HARD_CAP_MULTIPLIER;
+    this.fileCapBytes = this.softBytes * FILE_CAP_MULTIPLIER;
+    // CODEGRAPH_WAL_VALVE_DEBUG=1 surfaces valve decisions to stderr without
+    // needing the caller's verbose plumbing — the observability gap that let
+    // §7a.1 run 1 fail silently (give-ups were verbose-gated and invisible).
+    this.log = process.env.CODEGRAPH_WAL_VALVE_DEBUG
+      ? (m) => console.error(`[wal-valve] ${m}`)
+      : log;
   }
+
+  private readonly log: (msg: string) => void;
 
   private mb(n: number): string {
     return `${Math.round(n / 1024 / 1024)}MB`;
@@ -103,7 +158,19 @@ export class WalCheckpointValve {
   /** Begin watching the WAL. Idempotent; the timer never holds the loop open. */
   start(): void {
     if (this.timer) return;
-    this.timer = setInterval(() => this.check(), this.intervalMs);
+    // One armed line per run under either diagnostics env: §7a.1's failed
+    // kernel-scale runs burned three 25-minute cycles before "is the valve
+    // even alive?" could be answered.
+    if (process.env.CODEGRAPH_SYNTH_TIMINGS || process.env.CODEGRAPH_WAL_VALVE_DEBUG) {
+      console.error(`[wal-valve] armed soft=${this.mb(this.softBytes)} hard=${this.mb(this.hardBytes)} wal=${this.mb(this.db.getWalSizeBytes())}`);
+    }
+    let ticks = 0;
+    this.timer = setInterval(() => {
+      if ((++ticks % 15) === 0) {
+        this.log(`alive: wal=${this.mb(this.db.getWalSizeBytes())} baseline=${this.mb(this.sizeAtLastFullBackfill)} inflight=${this.inflight ? 'y' : 'n'} paused=${this.pause ? 'y' : 'n'}`);
+      }
+      this.check();
+    }, this.intervalMs);
     this.timer.unref?.();
   }
 
@@ -128,7 +195,15 @@ export class WalCheckpointValve {
    */
   backpressure(): Promise<void> | null {
     if (this.pause) return this.pause;
-    if (this.growthBytes() <= this.hardBytes) return null;
+    // Two independent triggers:
+    //  - growth: un-backfilled BACKLOG past the hard cap (the original valve).
+    //  - file size: a WAL can stay fully backfilled and still grow without
+    //    bound — the writer only restarts at frame 0 if a commit finds no
+    //    reader marks, which §7a.1's instrumented run showed never happens
+    //    in practice (file marched 361→721MB through two COMPLETE
+    //    backfills). Past the file cap, park and TRUNCATE at the barrier —
+    //    the backfill part is instant when the backlog is already folded.
+    if (this.growthBytes() <= this.hardBytes && this.db.getWalSizeBytes() <= this.fileCapBytes) return null;
     this.log(`backpressure: wal=${this.mb(this.db.getWalSizeBytes())} baseline=${this.mb(this.sizeAtLastFullBackfill)} — pausing writer for full backfill`);
     const t0 = Date.now();
     this.pause = this.backfillFully().finally(() => {
@@ -165,28 +240,82 @@ export class WalCheckpointValve {
   /**
    * With the writer parked on the returned promise, loop passive passes until
    * one reports the entire WAL backfilled (typically the second: the first
-   * drains the pass that was already running against a stale snapshot). Gives
-   * up after a bounded number of passes — e.g. a reader pinning the WAL —
-   * because unbounded WAL growth degrades; a wedged writer never recovers.
+   * drains the pass that was already running against a stale snapshot). After
+   * a bounded number of passes without a full backfill — e.g. a reader
+   * pinning the WAL — throws {@link WalValveAbortError} when still past the
+   * hard/file caps (#1539 fail-closed). Soft give-up under those caps is
+   * reserved for foldNow on a modest backlog that could not complete.
    */
   private async backfillFully(): Promise<void> {
     for (let i = 0; i < MAX_PAUSED_BACKFILL_PASSES; i++) {
       if (this.inflight) await this.inflight; // fold in the stale in-flight pass first
       const res = await this.db.checkpointWalPassive();
-      if (!res) return; // checkpoint machinery unavailable — don't spin
+      if (!res) {
+        // Machinery unavailable: fail closed past the documented caps (#1539),
+        // otherwise soft-return so a non-WAL / closing connection does not abort.
+        const walBytes = this.db.getWalSizeBytes();
+        const growth = this.growthBytes();
+        if (walBytes > this.fileCapBytes || growth > this.hardBytes) {
+          throw new WalValveAbortError(
+            `WAL checkpoint machinery unavailable while over the documented cap ` +
+              `(wal=${this.mb(walBytes)}, fileCap=${this.mb(this.fileCapBytes)}). ` +
+              `Aborting to avoid unbounded disk growth.`,
+            { walBytes, fileCapBytes: this.fileCapBytes, hardBytes: this.hardBytes }
+          );
+        }
+        return;
+      }
       this.log(`backfill pass ${i + 1}: busy=${res.busy} log=${res.log} checkpointed=${res.checkpointed} wal=${this.mb(this.db.getWalSizeBytes())}`);
       if (res.busy === 0 && res.log === res.checkpointed) {
+        // Backfill complete AND we are at a parked barrier (backfillFully only
+        // runs under a writer pause): the no-reader window is guaranteed, so
+        // chop the FILE too — a fully-backfilled WAL otherwise keeps growing
+        // whenever commits land while pool readers hold marks (§7a.1: 22GB
+        // on-disk at kernel scale despite backfills). A racing reader turns
+        // this into a no-op (busy=1); the passive result above still stands.
+        const trunc = await this.db.checkpointWalTruncate();
+        if (trunc) this.log(`truncate: busy=${trunc.busy} wal=${this.mb(this.db.getWalSizeBytes())}`);
         this.sizeAtLastFullBackfill = this.db.getWalSizeBytes();
+        this.consecutiveGiveUps = 0;
         return;
       }
     }
-    this.log(`backfill gave up after ${MAX_PAUSED_BACKFILL_PASSES} passes — WAL stays unbounded this cycle`);
+    this.consecutiveGiveUps++;
+    const walBytes = this.db.getWalSizeBytes();
+    const growth = this.growthBytes();
+    const msg =
+      `backfill gave up after ${MAX_PAUSED_BACKFILL_PASSES} passes ` +
+      `(streak ${this.consecutiveGiveUps}) — a reader is pinning the WAL ` +
+      `(wal=${this.mb(walBytes)} growth=${this.mb(growth)} ` +
+      `hard=${this.mb(this.hardBytes)} fileCap=${this.mb(this.fileCapBytes)})`;
+    this.log(msg);
+    // Give-ups are rare and load-bearing for §7a.1-class diagnosis — surface
+    // them on any timing-instrumented run, not just valve-debug ones.
+    if (process.env.CODEGRAPH_SYNTH_TIMINGS && !process.env.CODEGRAPH_WAL_VALVE_DEBUG) {
+      console.error(`[wal-valve] ${msg}`);
+    }
+    // Fail closed (#1539): never release the writer past the documented caps
+    // when checkpoints cannot progress. The old futility latch disabled
+    // parking for 60s and allowed unbounded growth (64 GiB observed).
+    if (walBytes > this.fileCapBytes || growth > this.hardBytes) {
+      throw new WalValveAbortError(
+        `WAL checkpoint cannot progress while a reader pins frames ` +
+          `(wal=${this.mb(walBytes)}, growth=${this.mb(growth)}, ` +
+          `fileCap=${this.mb(this.fileCapBytes)}, hard=${this.mb(this.hardBytes)}, ` +
+          `give-ups=${this.consecutiveGiveUps}). Aborting to avoid unbounded disk growth. ` +
+          `Close concurrent readers (for example the MCP query pool) and retry, ` +
+          `or raise CODEGRAPH_WAL_VALVE_MB if the threshold is too tight for this project.`,
+        { walBytes, fileCapBytes: this.fileCapBytes, hardBytes: this.hardBytes }
+      );
+    }
   }
 
   private fire(): void {
+    this.log(`fire: wal=${this.mb(this.db.getWalSizeBytes())} baseline=${this.mb(this.sizeAtLastFullBackfill)}`);
     const p = this.db
       .checkpointWalPassive()
       .then((res) => {
+        this.log(`timer pass: ${res ? `busy=${res.busy} log=${res.log} checkpointed=${res.checkpointed}` : 'null (machinery unavailable)'} wal=${this.mb(this.db.getWalSizeBytes())}`);
         // Full backfill (busy 0, every log frame checkpointed) ⇒ the writer's
         // next commit wraps the WAL; the file's current size becomes the new
         // growth baseline. A partial pass (writer appended during it, or a
@@ -195,6 +324,14 @@ export class WalCheckpointValve {
         // SQLite reports log = checkpointed = -1, which is harmless here.
         if (res && res.busy === 0 && res.log === res.checkpointed) {
           this.sizeAtLastFullBackfill = this.db.getWalSizeBytes();
+          // NO truncate here. A truncate checkpoint that starts against an
+          // ACTIVE writer wins the lock race and then blocks that writer for
+          // its entire backfill — after a multi-GB single-transaction burst
+          // (edge-index recreate) that exceeds the writer's 5s busy_timeout
+          // and fails the index with "database is locked" (§7a.2 record run).
+          // The file chop happens exclusively at parked barriers
+          // (backpressure/foldNow), where the writer is awaiting us by
+          // construction and cannot collide.
         }
       })
       .catch(() => { /* best-effort */ })

@@ -13,16 +13,64 @@ name: Release
 #   5. publishes the npm thin-installer (shim + per-platform packages).
 #
 # Before triggering: bump package.json. CHANGELOG.md entries can live under
-# `## [Unreleased]` — step 2 takes care of moving them. Set the NPM_TOKEN secret.
+# `## [Unreleased]` — step 2 takes care of moving them.
+#
+# npm auth is OIDC trusted publishing (no NPM_TOKEN): every published package
+# (@colbymchenry/codegraph + the per-platform bundles) has this repo +
+# release.yml configured as its trusted publisher on npmjs.com. Adding a new
+# platform package means configuring its trusted publisher there before the
+# first release that includes it.
 on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write   # create the GitHub Release + tag, push the CHANGELOG promote
+  contents: write      # create the GitHub Release + tag, push the CHANGELOG promote
+  id-token: write      # OIDC token for npm --provenance and Sigstore signing
+  attestations: write  # store the GitHub artifact attestations for the bundles
 
 jobs:
+  # Native extraction-kernel prebuilds (docs/design/rust-kernel-migration-plan.md).
+  # As of 1.5.0 the kernel is the release's HEADLINE, not an optional extra, so
+  # this matrix is REQUIRED: a failed kernel build blocks the release instead of
+  # silently shipping wasm-only bundles under a Rust-engine banner. Per-file
+  # wasm fallback still exists at runtime for erroring files and unsupported
+  # platforms — but every published bundle must carry its .node. Note the
+  # vendored-grammar-C languages (kotlin/lua/scala/dart) compile parser.c via
+  # the cc crate, so each leg needs its platform C toolchain (runner images
+  # ship one). (Runner images ship rustup; build-kernel.sh
+  # adds each cross target itself.)
+  kernel:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            targets: aarch64-apple-darwin x86_64-apple-darwin
+          - runner: ubuntu-22.04 # oldest glibc runner → widest compatibility
+            targets: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            targets: aarch64-unknown-linux-gnu
+          - runner: windows-latest
+            targets: x86_64-pc-windows-msvc aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build kernel prebuilds
+        shell: bash
+        run: |
+          for t in ${{ matrix.targets }}; do
+            bash scripts/build-kernel.sh --target "$t"
+          done
+          ls -R codegraph-kernel/prebuilds
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ matrix.runner }}
+          path: codegraph-kernel/prebuilds/
+          if-no-files-found: error
+
   release:
     runs-on: ubuntu-latest
+    needs: kernel
     steps:
       - uses: actions/checkout@v6
         with:
@@ -45,7 +93,13 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
+          # No registry-url here: it writes an .npmrc that requires a
+          # NODE_AUTH_TOKEN env var to exist, and we publish via OIDC
+          # trusted publishing instead of a token.
+
+      - name: Upgrade npm for OIDC trusted publishing
+        # Trusted publishing needs npm >= 11.5; Node 22 bundles npm 10.
+        run: npm install -g npm@11 && npm --version
 
       - name: Sync package-lock.json if version drifted
         # When the maintainer bumps the version on package.json only — for
@@ -113,6 +167,33 @@ jobs:
             git push origin "HEAD:${GITHUB_REF#refs/heads/}"
           fi
 
+      - name: Download kernel prebuilds
+        # All legs are required (see the kernel job), so every target's
+        # <target>/codegraph-kernel.node must be present in release/kernel/.
+        uses: actions/download-artifact@v4
+        with:
+          pattern: kernel-*
+          merge-multiple: true
+          path: release/kernel/
+
+      - name: Kernel contract + full walker-parity gate
+        # Runs EVERY kernel suite (__tests__/kernel-*.test.ts — the wire
+        # contract, the grammar-source parity table checks, and all 20
+        # languages' walker byte-parity suites incl. torture/CRLF/defer pins)
+        # against the freshly built linux-x64 .node. The glob keeps this gate
+        # current as languages are added. CODEGRAPH_KERNEL_EXPECT=1 turns a
+        # missing binary into a FAILURE, and a missing prebuild fails outright
+        # — the matrix is required, so absence here means a wiring bug.
+        run: |
+          if [ -f release/kernel/linux-x64/codegraph-kernel.node ]; then
+            mkdir -p codegraph-kernel/prebuilds/linux-x64
+            cp release/kernel/linux-x64/codegraph-kernel.node codegraph-kernel/prebuilds/linux-x64/
+            CODEGRAPH_KERNEL_EXPECT=1 npx vitest run __tests__/kernel-*.test.ts
+          else
+            echo "::error::linux-x64 kernel prebuild missing despite required matrix"
+            exit 1
+          fi
+
       - name: Build all platform bundles
         run: |
           for t in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64 win32-arm64; do
@@ -126,6 +207,18 @@ jobs:
         run: |
           ( cd release && sha256sum codegraph-* > SHA256SUMS )
           cat release/SHA256SUMS
+
+      - name: Attest build provenance for release bundles
+        # Signed, publicly-verifiable proof that each bundle (and SHA256SUMS)
+        # was built by this workflow from this repo — SHA256SUMS alone only
+        # proves integrity, not origin, since it ships next to the bundles.
+        # Verify any downloaded artifact with:
+        #   gh attestation verify <file> -R colbymchenry/codegraph
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            release/codegraph-*
+            release/SHA256SUMS
 
       - name: Release notes from CHANGELOG.md
         # The [<version>] block was guaranteed-populated by the
@@ -154,8 +247,11 @@ jobs:
           fi
 
       - name: Publish to npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # Auth is OIDC trusted publishing (id-token: write above) — npm mints
+        # a short-lived credential from the workflow's identity; there is no
+        # NPM_TOKEN. Provenance is generated automatically on this path; the
+        # explicit --provenance keeps the intent visible and fails loudly if
+        # OIDC is ever unavailable.
         run: |
           V="${{ steps.ver.outputs.version }}"
           bash scripts/pack-npm.sh "$V"
@@ -167,7 +263,10 @@ jobs:
               echo "skip $name@$V (already published)"
             else
               echo "publishing $name@$V"
-              ( cd "$dir" && npm publish --access public )
+              # --provenance: publish with an npm provenance attestation
+              # (needs the id-token: write permission above and the
+              # repository field pack-npm.sh writes into each package.json).
+              ( cd "$dir" && npm publish --access public --provenance )
             fi
           done
 

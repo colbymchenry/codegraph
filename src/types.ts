@@ -14,6 +14,10 @@
  * Defined as a runtime-iterable `as const` array so the same source
  * of truth backs both the TS type and any runtime validation
  * (e.g. the search query parser).
+ *
+ * The ARRAY ORDER is part of the native kernel's wire contract (kinds cross
+ * the boundary as indexes — see src/extraction/kernel/layout.ts); append new
+ * kinds, never reorder.
  */
 export const NODE_KINDS = [
   'file',
@@ -38,26 +42,35 @@ export const NODE_KINDS = [
   'export',
   'route',
   'component',
+  'union',
 ] as const;
 
 export type NodeKind = (typeof NODE_KINDS)[number];
 
 /**
- * Types of edges (relationships) between nodes
+ * Types of edges (relationships) between nodes.
+ *
+ * Runtime-iterable like NODE_KINDS. The ARRAY ORDER is part of the native
+ * kernel's wire contract (kinds cross the boundary as indexes — see
+ * src/extraction/kernel/layout.ts); append new kinds, never reorder.
  */
-export type EdgeKind =
-  | 'contains'        // Parent contains child (file→class, class→method)
-  | 'calls'           // Function/method calls another
-  | 'imports'         // File imports from another
-  | 'exports'         // File exports a symbol
-  | 'extends'         // Class/interface extends another
-  | 'implements'      // Class implements interface
-  | 'references'      // Generic reference to another symbol
-  | 'type_of'         // Variable/parameter has type
-  | 'returns'         // Function returns type
-  | 'instantiates'    // Creates instance of class
-  | 'overrides'       // Method overrides parent method
-  | 'decorates';      // Decorator applied to symbol
+export const EDGE_KINDS = [
+  'contains',        // Parent contains child (file→class, class→method)
+  'calls',           // Function/method calls another
+  'imports',         // File imports from another
+  'exports',         // File exports a symbol
+  'extends',         // Class/interface extends another
+  'implements',      // Class implements interface
+  'references',      // Generic reference to another symbol
+  'type_of',         // Variable/parameter has type
+  'returns',         // Function returns type
+  'instantiates',    // Creates instance of class
+  'overrides',       // Method overrides parent method
+  'decorates',       // Decorator applied to symbol
+  'navigates',       // Navigates to a screen/route (Expo Router `router.push('/x')`)
+] as const;
+
+export type EdgeKind = (typeof EDGE_KINDS)[number];
 
 /**
  * Supported programming languages. See NODE_KINDS for why this is a
@@ -241,6 +254,15 @@ export interface FileRecord {
 
   /** Any extraction errors */
   errors?: ExtractionError[];
+
+  /**
+   * Tool-generated source, decided at index time from the filename
+   * convention OR a generation banner in the file's header (see
+   * extraction/generated-detection.ts). A relevance hint for ranking, not a
+   * hard filter. Absent on indexes built before schema v9 — treat
+   * `undefined` as "content signal unknown, fall back to the path check".
+   */
+  generated?: boolean;
 }
 
 // =============================================================================
@@ -265,6 +287,23 @@ export interface ExtractionResult {
 
   /** Extraction duration in milliseconds */
   durationMs: number;
+
+  /**
+   * Deferred-decode transport (native kernel, bulk-index path): when present,
+   * `nodes`/`edges`/`unresolvedReferences` are EMPTY and the file's tables
+   * ride as flat buffers to be decoded at the store boundary (the store
+   * worker), so the MAIN thread never materializes per-node objects.
+   * `kernelCounts` carries the table sizes for bookkeeping. Decode into a
+   * plain result with `materializeKernelResult` (src/extraction/kernel).
+   */
+  kernelBuffers?: {
+    meta: Uint8Array;
+    nodes: Uint8Array;
+    edges: Uint8Array;
+    refs: Uint8Array;
+    arena: Uint8Array;
+  };
+  kernelCounts?: { nodes: number; edges: number; refs: number };
 }
 
 /**
@@ -546,6 +585,10 @@ export interface GraphStats {
   /** Database size in bytes */
   dbSizeBytes: number;
 
+  /** Size of the SQLite `-wal` sidecar in bytes (0 when absent). A WAL far
+   * larger than the DB at rest means killed sessions left it behind (#1431). */
+  walSizeBytes: number;
+
   /** Last update timestamp */
   lastUpdated: number;
 }
@@ -646,4 +689,13 @@ export interface FindRelevantContextOptions {
 
   /** Node types to include */
   nodeKinds?: NodeKind[];
+
+  /**
+   * Extra symbol names to merge in as exact-name search candidates, at a
+   * dampened score. Fed by the segment-vocabulary supplement (CodeGraph.
+   * findRelevantContext): word-level query terms can't reach camelCase names
+   * through FTS — `pinFeedIfNearBottom` is one FTS token — so names whose
+   * SEGMENTS the query's words name are seeded here instead.
+   */
+  seedNames?: string[];
 }

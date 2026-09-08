@@ -1,0 +1,7 @@
+# Copy to .dev.vars for local development (`npm run dev`) and so that
+# `wrangler types` includes both secrets in the generated Env.
+# The real values live only in the deployed secrets:
+#   wrangler secret put ADMIN_PASSWORD
+#   wrangler secret put SESSION_SECRET
+ADMIN_PASSWORD="dev-password"
+SESSION_SECRET="dev-session-secret-not-the-real-one"

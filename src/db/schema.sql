@@ -55,7 +55,15 @@ CREATE TABLE IF NOT EXISTS edges (
     FOREIGN KEY (target) REFERENCES nodes(id) ON DELETE CASCADE
 );
 
--- Files: Tracked source files
+-- Files: Tracked source files.
+-- `generated` is the index-time verdict from extraction/generated-detection.ts:
+-- the filename convention (*.pb.go, *.g.dart, …) OR a generation banner in the
+-- file's header. Go's convention is a CONTENT marker, so a generated
+-- `payroll.go` beside hand-written use-cases is invisible to the path check
+-- alone (#1500) — deciding it here means ranking never reads file headers per
+-- request. Migration v9 adds the column to existing databases; rows keep the
+-- 0 default until the next full index, so readers treat it as a hint that
+-- only ever ADDS to the path signal, never overrides it.
 CREATE TABLE IF NOT EXISTS files (
     path TEXT PRIMARY KEY,
     content_hash TEXT NOT NULL,
@@ -64,7 +72,8 @@ CREATE TABLE IF NOT EXISTS files (
     modified_at INTEGER NOT NULL,
     indexed_at INTEGER NOT NULL,
     node_count INTEGER DEFAULT 0,
-    errors TEXT -- JSON array
+    errors TEXT, -- JSON array
+    generated INTEGER NOT NULL DEFAULT 0
 );
 
 -- Unresolved References: References that need resolution after full indexing.
@@ -173,9 +182,13 @@ CREATE INDEX IF NOT EXISTS idx_edges_target_kind ON edges(target, kind);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_identity
   ON edges(source, target, kind, IFNULL(line, -1), IFNULL(col, -1));
 
--- File indexes
+-- File indexes.
+-- idx_files_generated is PARTIAL: the generated set is a small minority of any
+-- repo, so a lookup that intersects a bounded candidate list with it stays
+-- proportional to the generated files, not to the repo.
 CREATE INDEX IF NOT EXISTS idx_files_language ON files(language);
 CREATE INDEX IF NOT EXISTS idx_files_modified_at ON files(modified_at);
+CREATE INDEX IF NOT EXISTS idx_files_generated ON files(path) WHERE generated = 1;
 
 -- Unresolved refs indexes
 CREATE INDEX IF NOT EXISTS idx_unresolved_from_node ON unresolved_refs(from_node_id);

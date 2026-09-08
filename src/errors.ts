@@ -162,6 +162,20 @@ export class ConfigError extends CodeGraphError {
 }
 
 /**
+ * A refused path — the caller asked for something outside the project root, or
+ * for a sensitive system directory. Deliberately a plain `Error` and NOT a
+ * {@link CodeGraphError}: it is a security marker every read sink tests with
+ * `instanceof`, not a categorized operational failure, and the MCP layer treats
+ * it as one of the only two "stop trying" conditions (see `mcp/tools.ts`).
+ *
+ * It lives here — in the dependency-free error module — rather than next to its
+ * first caller so that a consumer can enforce the refusal WITHOUT importing the
+ * MCP tool graph. `mcp/tools.ts` re-exports it, so the class identity stays
+ * single and every existing `instanceof` check keeps working.
+ */
+export class PathRefusalError extends Error {}
+
+/**
  * Simple logger for CodeGraph operations
  *
  * By default, logs to console.warn for warnings and console.error for errors.
