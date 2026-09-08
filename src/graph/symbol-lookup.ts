@@ -133,6 +133,35 @@ export interface SymbolLookupResult {
 }
 
 /**
+ * One group per (filePath, qualifiedName): same-file overloads stay together,
+ * while unrelated definitions keep their own edges. Shared by CLI and MCP.
+ * A non-matching file hint keeps all definitions and must be disclosed.
+ */
+export function groupDefinitions(
+  nodes: Node[],
+  fileFilter?: string
+): { groups: Node[][]; filteredOut: boolean } {
+  let pool = nodes;
+  let filteredOut = false;
+  if (fileFilter) {
+    const wanted = fileFilter.replace(/^\.\//, '');
+    const narrowed = pool.filter(
+      (n) => n.filePath === wanted || n.filePath.endsWith(wanted) || n.filePath.endsWith(`/${wanted}`)
+    );
+    if (narrowed.length > 0) pool = narrowed;
+    else filteredOut = true;
+  }
+  const byDef = new Map<string, Node[]>();
+  for (const n of pool) {
+    const key = `${n.filePath}|${n.qualifiedName}`;
+    const group = byDef.get(key);
+    if (group) group.push(n);
+    else byDef.set(key, [n]);
+  }
+  return { groups: [...byDef.values()], filteredOut };
+}
+
+/**
  * Resolve a user-supplied symbol name to the definitions it names.
  *
  * The exact-name index is consulted FIRST and is authoritative: it is complete
@@ -169,7 +198,7 @@ export function lookupSymbolNodes(cg: SymbolLookupHost, symbol: string): SymbolL
   const ranked = [...nodes].sort(
     (a, b) => (isGenerated(a.filePath) ? 1 : 0) - (isGenerated(b.filePath) ? 1 : 0)
   );
-  return { nodes: ranked, ambiguous: ranked.length > 1 };
+  return { nodes: ranked, ambiguous: groupDefinitions(ranked).groups.length > 1 };
 }
 
 /** One-line "kind at path:line" label used when disclosing an ambiguous query. */

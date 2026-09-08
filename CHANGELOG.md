@@ -135,7 +135,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
-- `codegraph callers`, `codegraph callees` and `codegraph impact` now resolve qualified names and disclose when a name selects several definitions; thanks @ferrine. (#1656, #1512)
+- `codegraph callers`, `codegraph callees` and `codegraph impact` now resolve qualified names, group results and JSON edges by definition, and accept `--file` to narrow ambiguous names; thanks @ferrine. (#1512, #1656)
 
 #### MCP / indexing
 

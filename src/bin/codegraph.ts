@@ -59,7 +59,8 @@ import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
 // server itself is loaded lazily inside the `ui` action. See ui-server/constants.
 import { BROWSER_ENV, DEFAULT_UI_PORT } from '../ui-server/constants';
 import type { UiServerHandle } from '../ui-server';
-import { lookupSymbolNodes, describeSymbolNode } from '../graph/symbol-lookup';
+import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../graph/symbol-lookup';
+import type { Node, Edge } from '../types';
 
 // Decided once, before `--color`/`--no-color` are stripped from argv below
 // (#1281). Piped/redirected stdout, NO_COLOR, or --no-color -> plain output.
@@ -363,54 +364,18 @@ function warn(message: string): void {
   console.log(chalk.yellow(getGlyphs().warn) + ' ' + message);
 }
 
-/**
- * Disclose that a name resolved to several DISTINCT definitions, whose results
- * were merged into the list just printed.
- *
- * `callers` / `callees` / `impact` aggregate across every definition a name
- * matches. That is the useful default — an interface method and its overrides
- * are usually all wanted — but presenting the union under one heading, with
- * nothing saying the name was ambiguous, is how a query for a common
- * identifier ends up reporting callers that belong to an entirely unrelated
- * symbol (often in another language, since collisions cluster on short generic
- * names like `group`, `num`, `parse`). Naming the targets keeps the aggregate
- * useful and makes the widening visible, and tells the user the qualified
- * spelling that would narrow it.
- */
-function printAmbiguityNote(
-  symbol: string,
-  targets: Array<{ qualifiedName: string; kind: string; language: string; filePath: string; startLine: number }>,
-  ambiguous: boolean
-): void {
-  if (!ambiguous || targets.length < 2) return;
-  const languages = new Set(targets.map((t) => t.language));
-  console.log(
-    chalk.yellow(getGlyphs().warn) +
-      ` "${symbol}" names ${targets.length} definitions` +
-      (languages.size > 1 ? ` across ${languages.size} languages` : '') +
-      ' — the results above are the union of all of them:'
-  );
-  for (const t of targets.slice(0, 10)) {
-    console.log(chalk.dim(`    ${describeSymbolNode(t as never)}`));
-  }
-  if (targets.length > 10) console.log(chalk.dim(`    … +${targets.length - 10} more`));
-  console.log(chalk.dim(`  Narrow it with a qualified name, e.g. "${narrowingExample(targets[0]!)}".`));
+/** Compact node shape retained by the CLI's existing JSON lists. */
+function cliNode(node: Node) {
+  return { name: node.name, kind: node.kind, filePath: node.filePath, startLine: node.startLine };
 }
 
-/**
- * A qualified spelling that would select exactly this definition. Languages
- * that carry the container in `qualifiedName` (Elixir, Java, C++, class-scoped
- * methods) can offer it directly; the ones that encode their module in the
- * FILE PATH instead (Python, Rust) have a bare qualifiedName, so suggesting it
- * would just echo the ambiguous name back. For those, `<file>.<name>` is the
- * spelling that resolves — it is what the file-path stage of `matchesSymbol`
- * matches on.
- */
-function narrowingExample(target: { qualifiedName: string; name?: string; filePath: string }): string {
-  const qualified = target.qualifiedName.replace(/::/g, '.');
-  if (qualified.includes('.')) return qualified;
-  const basename = target.filePath.split('/').pop()?.replace(/\.[^.]+$/, '');
-  return basename ? `${basename}.${qualified}` : qualified;
+/** Attribute a group's edges to every overload of this definition. */
+function cliDefinition(group: Node[]) {
+  const head = group[0]!;
+  return {
+    definition: { ...cliNode(head), id: head.id, qualifiedName: head.qualifiedName, language: head.language },
+    roots: group.map((node) => node.id),
+  };
 }
 
 type IndexResult = {
@@ -2200,181 +2165,140 @@ program
   });
 
 /**
- * codegraph callers <symbol>
- *
- * CLI parity with the MCP graph tools (codegraph_callers/callees/impact) so the
- * traversal queries work in scripts, CI, and git hooks without a running MCP
- * server.
+ * CLI parity with MCP callers/callees: resolve once, then collect and limit
+ * within each definition. The legacy JSON list remains an explicitly labeled
+ * union, with its original total/limit/truncated contract (#1674).
  */
-program
-  .command('callers <symbol>')
-  .description('Find all functions/methods that call a specific symbol')
-  .option('-p, --path <path>', 'Project path')
-  .option('-l, --limit <number>', 'Maximum results', '20')
-  .option('-j, --json', 'Output as JSON')
-  .action(async (symbol: string, options: { path?: string; limit?: string; json?: boolean }) => {
-    const projectPath = resolveProjectPath(options.path);
+for (const direction of ['callers', 'callees'] as const) {
+  const title = direction === 'callers' ? 'Callers' : 'Callees';
+  program
+    .command(`${direction} <symbol>`)
+    .description(direction === 'callers'
+      ? 'Find all functions/methods that call a specific symbol'
+      : 'Find all functions/methods called by a specific symbol')
+    .option('-p, --path <path>', 'Project path')
+    .option('-f, --file <path>', 'Narrow definitions by file path or suffix (no match: show all with a note)')
+    .option('-l, --limit <number>', 'Maximum results per definition (also caps the JSON union)', '20')
+    .option('-j, --json', 'Output as JSON')
+    .action(async (symbol: string, options: { path?: string; file?: string; limit?: string; json?: boolean }) => {
+      const projectPath = resolveProjectPath(options.path);
 
-    try {
-      if (!isInitialized(projectPath)) {
-        error(`CodeGraph not initialized in ${projectPath}`);
+      try {
+        if (!isInitialized(projectPath)) {
+          error(`CodeGraph not initialized in ${projectPath}`);
+          process.exit(1);
+        }
+
+        const { default: CodeGraph } = await loadCodeGraph();
+        const cg = await CodeGraph.open(projectPath);
+        try {
+          const limit = parseInt(options.limit || '20', 10);
+          const { nodes: targets } = lookupSymbolNodes(cg, symbol);
+          if (targets.length === 0) {
+            info(`Symbol "${symbol}" not found`);
+            return;
+          }
+
+          const { groups, filteredOut } = groupDefinitions(targets, options.file);
+          const ambiguous = groups.length > 1;
+          const note = filteredOut
+            ? `no definition of "${symbol}" matches file "${options.file}" — showing all definitions instead.`
+            : undefined;
+          const collected = groups.map((group) => {
+            const nodes = new Map<string, Node>();
+            const edges = new Map<string, Edge>();
+            for (const target of group) {
+              const connections = direction === 'callers' ? cg.getCallers(target.id) : cg.getCallees(target.id);
+              for (const { node, edge } of connections) {
+                nodes.set(node.id, node);
+                edges.set(`${edge.source}->${edge.target}:${edge.kind}`, edge);
+              }
+            }
+            return { group, nodes: [...nodes.values()], edges: [...edges.values()] };
+          });
+
+          if (options.json) {
+            const definitions = collected.map(({ group, nodes, edges }) => {
+              const limited = nodes.slice(0, limit);
+              const shown = new Set(limited.map((node) => node.id));
+              return {
+                ...cliDefinition(group),
+                [direction]: limited.map((node) => ({ id: node.id, ...cliNode(node) })),
+                edges: edges.filter((edge) => shown.has(direction === 'callers' ? edge.source : edge.target)),
+                total: nodes.length,
+                limit,
+                truncated: nodes.length > limit,
+              };
+            });
+            const union = new Map<string, Node>();
+            for (const { nodes } of collected) {
+              for (const node of nodes) union.set(node.id, node);
+            }
+            const total = union.size;
+            console.log(JSON.stringify({
+              symbol,
+              targets: groups.flat().map((node) => cliDefinition([node]).definition),
+              ambiguous,
+              aggregation: ambiguous ? 'union' : 'definition',
+              file: options.file,
+              filteredOut,
+              note,
+              definitions,
+              [direction]: [...union.values()].slice(0, limit).map(cliNode),
+              total,
+              limit,
+              truncated: total > limit,
+            }, null, 2));
+          } else {
+            if (note) warn(note);
+            if (ambiguous) {
+              console.log(chalk.bold(`\n${title} of "${symbol}" — ${groups.length} distinct definitions (narrow with --file):`));
+            }
+            for (const { group, nodes } of collected) {
+              const limited = nodes.slice(0, limit);
+              const total = nodes.length;
+              const truncated = total > limit;
+              const count = truncated ? `${limited.length} of ${total}` : String(total);
+              if (ambiguous) {
+                console.log(chalk.bold(`\n${describeSymbolNode(group[0]!)} (${count}):\n`));
+              } else {
+                console.log(chalk.bold(`\n${title} of "${symbol}" (${count}):\n`));
+                console.log(chalk.dim(describeSymbolNode(group[0]!)));
+              }
+              if (total === 0) {
+                if (ambiguous) console.log(chalk.dim(`  (no ${direction})`));
+                else info(`No ${direction} found for "${symbol}"`);
+              }
+              for (const node of limited) {
+                const loc = node.startLine ? `:${node.startLine}` : '';
+                console.log(chalk.cyan(node.kind.padEnd(12)) + chalk.white(node.name));
+                console.log(chalk.dim(`  ${node.filePath}${loc}`));
+                console.log();
+              }
+              if (truncated) console.log(chalk.dim(`Showing ${limited.length} of ${total}; pass --limit to widen.`));
+            }
+          }
+        } finally {
+          cg.destroy();
+        }
+      } catch (err) {
+        error(`${direction} failed: ${err instanceof Error ? err.message : String(err)}`);
         process.exit(1);
       }
-
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
-      const limit = parseInt(options.limit || '20', 10);
-
-      const { nodes: targets, ambiguous } = lookupSymbolNodes(cg, symbol);
-      if (targets.length === 0) {
-        info(`Symbol "${symbol}" not found`);
-        cg.destroy();
-        return;
-      }
-
-      const seen = new Set<string>();
-      const allCallers: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
-
-      for (const target of targets) {
-        for (const c of cg.getCallers(target.id)) {
-          if (!seen.has(c.node.id)) {
-            seen.add(c.node.id);
-            allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
-          }
-        }
-      }
-
-      const limited = allCallers.slice(0, limit);
-      const total = allCallers.length;
-      const truncated = total > limit;
-
-      if (options.json) {
-        console.log(JSON.stringify({
-          symbol,
-          // Which definitions the name resolved to. An aggregate over several
-          // distinct symbols has to say so — see graph/symbol-lookup.
-          targets: targets.map((t) => ({
-            qualifiedName: t.qualifiedName, kind: t.kind, language: t.language,
-            filePath: t.filePath, startLine: t.startLine,
-          })),
-          ambiguous,
-          callers: limited, total, limit, truncated,
-        }, null, 2));
-      } else if (limited.length === 0) {
-        info(`No callers found for "${symbol}"`);
-      } else {
-        const count = truncated ? `${limited.length} of ${total}` : String(total);
-        console.log(chalk.bold(`\nCallers of "${symbol}" (${count}):\n`));
-        for (const node of limited) {
-          const loc = node.startLine ? `:${node.startLine}` : '';
-          console.log(
-            chalk.cyan(node.kind.padEnd(12)) +
-            chalk.white(node.name)
-          );
-          console.log(chalk.dim(`  ${node.filePath}${loc}`));
-          console.log();
-        }
-        if (truncated) console.log(chalk.dim(`Showing ${limited.length} of ${total}; pass --limit to widen.`));
-        printAmbiguityNote(symbol, targets, ambiguous);
-      }
-
-      cg.destroy();
-    } catch (err) {
-      error(`callers failed: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
-    }
-  });
+    });
+}
 
 /**
- * codegraph callees <symbol>
- */
-program
-  .command('callees <symbol>')
-  .description('Find all functions/methods that a specific symbol calls')
-  .option('-p, --path <path>', 'Project path')
-  .option('-l, --limit <number>', 'Maximum results', '20')
-  .option('-j, --json', 'Output as JSON')
-  .action(async (symbol: string, options: { path?: string; limit?: string; json?: boolean }) => {
-    const projectPath = resolveProjectPath(options.path);
-
-    try {
-      if (!isInitialized(projectPath)) {
-        error(`CodeGraph not initialized in ${projectPath}`);
-        process.exit(1);
-      }
-
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
-      const limit = parseInt(options.limit || '20', 10);
-
-      const { nodes: targets, ambiguous } = lookupSymbolNodes(cg, symbol);
-      if (targets.length === 0) {
-        info(`Symbol "${symbol}" not found`);
-        cg.destroy();
-        return;
-      }
-
-      const seen = new Set<string>();
-      const allCallees: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
-
-      for (const target of targets) {
-        for (const c of cg.getCallees(target.id)) {
-          if (!seen.has(c.node.id)) {
-            seen.add(c.node.id);
-            allCallees.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
-          }
-        }
-      }
-
-      const limited = allCallees.slice(0, limit);
-      const total = allCallees.length;
-      const truncated = total > limit;
-
-      if (options.json) {
-        console.log(JSON.stringify({
-          symbol,
-          targets: targets.map((t) => ({
-            qualifiedName: t.qualifiedName, kind: t.kind, language: t.language,
-            filePath: t.filePath, startLine: t.startLine,
-          })),
-          ambiguous,
-          callees: limited, total, limit, truncated,
-        }, null, 2));
-      } else if (limited.length === 0) {
-        info(`No callees found for "${symbol}"`);
-      } else {
-        const count = truncated ? `${limited.length} of ${total}` : String(total);
-        console.log(chalk.bold(`\nCallees of "${symbol}" (${count}):\n`));
-        for (const node of limited) {
-          const loc = node.startLine ? `:${node.startLine}` : '';
-          console.log(
-            chalk.cyan(node.kind.padEnd(12)) +
-            chalk.white(node.name)
-          );
-          console.log(chalk.dim(`  ${node.filePath}${loc}`));
-          console.log();
-        }
-        if (truncated) console.log(chalk.dim(`Showing ${limited.length} of ${total}; pass --limit to widen.`));
-        printAmbiguityNote(symbol, targets, ambiguous);
-      }
-
-      cg.destroy();
-    } catch (err) {
-      error(`callees failed: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
-    }
-  });
-
-/**
- * codegraph impact <symbol>
+ * codegraph impact <symbol> — one blast radius per distinct definition.
  */
 program
   .command('impact <symbol>')
   .description('Analyze what code is affected by changing a symbol')
   .option('-p, --path <path>', 'Project path')
+  .option('-f, --file <path>', 'Narrow definitions by file path or suffix (no match: show all with a note)')
   .option('-d, --depth <number>', 'Traversal depth', '2')
   .option('-j, --json', 'Output as JSON')
-  .action(async (symbol: string, options: { path?: string; depth?: string; json?: boolean }) => {
+  .action(async (symbol: string, options: { path?: string; file?: string; depth?: string; json?: boolean }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
@@ -2385,72 +2309,89 @@ program
 
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
-      const depth = Math.min(Math.max(parseInt(options.depth || '2', 10), 1), 10);
+      try {
+        const depth = Math.min(Math.max(parseInt(options.depth || '2', 10), 1), 10);
+        const { nodes: targets } = lookupSymbolNodes(cg, symbol);
+        if (targets.length === 0) {
+          info(`Symbol "${symbol}" not found`);
+          return;
+        }
 
-      const { nodes: targets, ambiguous } = lookupSymbolNodes(cg, symbol);
-      if (targets.length === 0) {
-        info(`Symbol "${symbol}" not found`);
+        const { groups, filteredOut } = groupDefinitions(targets, options.file);
+        const ambiguous = groups.length > 1;
+        const note = filteredOut
+          ? `no definition of "${symbol}" matches file "${options.file}" — showing all definitions instead.`
+          : undefined;
+        const collected = groups.map((group) => {
+          const nodes = new Map<string, Node>();
+          const edges = new Map<string, Edge>();
+          for (const target of group) {
+            const impact = cg.getImpactRadius(target.id, depth);
+            for (const [id, node] of impact.nodes) nodes.set(id, node);
+            for (const edge of impact.edges) edges.set(`${edge.source}->${edge.target}:${edge.kind}`, edge);
+          }
+          return { group, nodes, edges };
+        });
+
+        if (options.json) {
+          const unionNodes = new Map<string, Node>();
+          const unionEdges = new Map<string, Edge>();
+          const definitions = collected.map(({ group, nodes, edges }) => {
+            for (const [id, node] of nodes) unionNodes.set(id, node);
+            for (const [key, edge] of edges) unionEdges.set(key, edge);
+            return {
+              ...cliDefinition(group),
+              nodeCount: nodes.size,
+              edgeCount: edges.size,
+              affected: [...nodes.values()].map((node) => ({ id: node.id, ...cliNode(node) })),
+              edges: [...edges.values()],
+            };
+          });
+          console.log(JSON.stringify({
+            symbol,
+            depth,
+            targets: groups.flat().map((node) => cliDefinition([node]).definition),
+            ambiguous,
+            aggregation: ambiguous ? 'union' : 'definition',
+            file: options.file,
+            filteredOut,
+            note,
+            definitions,
+            nodeCount: unionNodes.size,
+            edgeCount: unionEdges.size,
+            affected: [...unionNodes.values()].map(cliNode),
+          }, null, 2));
+        } else {
+          if (note) warn(note);
+          if (ambiguous) {
+            console.log(chalk.bold(`\nImpact of changing "${symbol}" — ${groups.length} distinct definitions (each with its own blast radius; narrow with --file):`));
+          }
+          for (const { group, nodes } of collected) {
+            if (ambiguous) {
+              console.log(chalk.bold(`\n${describeSymbolNode(group[0]!)} — ${nodes.size} affected symbols:\n`));
+            } else {
+              console.log(chalk.bold(`\nImpact of changing "${symbol}" — ${nodes.size} affected symbols:\n`));
+              console.log(chalk.dim(describeSymbolNode(group[0]!)));
+            }
+            const byFile = new Map<string, Node[]>();
+            for (const node of nodes.values()) {
+              const list = byFile.get(node.filePath) || [];
+              list.push(node);
+              byFile.set(node.filePath, list);
+            }
+            for (const [file, affected] of byFile) {
+              console.log(chalk.cyan(file));
+              for (const node of affected) {
+                const loc = node.startLine ? `:${node.startLine}` : '';
+                console.log(`  ${chalk.dim(node.kind.padEnd(12))}${node.name}${chalk.dim(loc)}`);
+              }
+              console.log();
+            }
+          }
+        }
+      } finally {
         cg.destroy();
-        return;
       }
-
-      // Merge impact subgraphs across every definition the name resolved to.
-      const mergedNodes = new Map<string, { name: string; kind: string; filePath: string; startLine?: number }>();
-      const seenEdges = new Set<string>();
-      let edgeCount = 0;
-
-      for (const target of targets) {
-        const impact = cg.getImpactRadius(target.id, depth);
-        for (const [id, n] of impact.nodes) {
-          mergedNodes.set(id, { name: n.name, kind: n.kind, filePath: n.filePath, startLine: n.startLine });
-        }
-        for (const e of impact.edges) {
-          const key = `${e.source}->${e.target}:${e.kind}`;
-          if (!seenEdges.has(key)) {
-            seenEdges.add(key);
-            edgeCount++;
-          }
-        }
-      }
-
-      if (options.json) {
-        console.log(JSON.stringify({
-          symbol,
-          depth,
-          targets: targets.map((t) => ({
-            qualifiedName: t.qualifiedName, kind: t.kind, language: t.language,
-            filePath: t.filePath, startLine: t.startLine,
-          })),
-          ambiguous,
-          nodeCount: mergedNodes.size,
-          edgeCount,
-          affected: Array.from(mergedNodes.values()),
-        }, null, 2));
-      } else if (mergedNodes.size === 0) {
-        info(`No affected symbols found for "${symbol}"`);
-      } else {
-        console.log(chalk.bold(`\nImpact of changing "${symbol}" — ${mergedNodes.size} affected symbols:\n`));
-
-        // Group by file
-        const byFile = new Map<string, Array<{ name: string; kind: string; startLine?: number }>>();
-        for (const node of mergedNodes.values()) {
-          const list = byFile.get(node.filePath) || [];
-          list.push({ name: node.name, kind: node.kind, startLine: node.startLine });
-          byFile.set(node.filePath, list);
-        }
-
-        for (const [file, nodes] of byFile) {
-          console.log(chalk.cyan(file));
-          for (const node of nodes) {
-            const loc = node.startLine ? `:${node.startLine}` : '';
-            console.log(`  ${chalk.dim(node.kind.padEnd(12))}${node.name}${chalk.dim(loc)}`);
-          }
-          console.log();
-        }
-        printAmbiguityNote(symbol, targets, ambiguous);
-      }
-
-      cg.destroy();
     } catch (err) {
       error(`impact failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
