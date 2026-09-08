@@ -4,6 +4,7 @@
  */
 
 import { afterEach, describe, expect, it } from 'vitest';
+import { spawn, ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -17,8 +18,13 @@ import {
 
 describe('writer lock (#1740)', () => {
   let dir: string;
+  const foreignHolders: ChildProcess[] = [];
 
   afterEach(() => {
+    for (const child of foreignHolders) {
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    }
+    foreignHolders.length = 0;
     if (dir) {
       releaseWriterLock(dir);
       try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -53,18 +59,25 @@ describe('writer lock (#1740)', () => {
 
   it('reports taken when a live foreign pid holds the lock', () => {
     const root = makeProject();
-    // Use our own pid first, then overwrite with a fake live-looking pid by
-    // writing a pid that is alive: process.pid of this test — simulate foreign
-    // by writing a different alive pid. On Linux, PID 1 is almost always alive.
+    // A foreign process that is genuinely alive, rather than a pid assumed to
+    // be: PID 1 is init on Linux but does not exist on Windows, where the lock
+    // then reads the holder as dead and correctly acquires — the assertion was
+    // failing on the fixture, not on the lock. A parked child is alive
+    // everywhere, and it is what the lock actually promises not to steal from.
+    const holder = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {
+      stdio: 'ignore',
+    });
+    foreignHolders.push(holder);
+    expect(holder.pid).toBeGreaterThan(0);
     fs.writeFileSync(
       getWriterPidPath(root),
-      JSON.stringify({ pid: 1, mode: 'direct', startedAt: Date.now() }) + '\n',
+      JSON.stringify({ pid: holder.pid, mode: 'direct', startedAt: Date.now() }) + '\n',
       { flag: 'wx' },
     );
     const r = tryAcquireWriterLock(root, 'direct');
     expect(r.kind).toBe('taken');
     if (r.kind === 'taken') {
-      expect(r.existing?.pid).toBe(1);
+      expect(r.existing?.pid).toBe(holder.pid);
       const msg = writerLockHeldMessage(r.existing, r.pidPath);
       expect(msg).toMatch(/writer lock held/i);
       expect(msg).toMatch(/CODEGRAPH_NO_DAEMON/);
