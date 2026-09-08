@@ -61,6 +61,7 @@ import { BROWSER_ENV, DEFAULT_UI_PORT } from '../ui-server/constants';
 import type { UiServerHandle } from '../ui-server';
 import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../graph/symbol-lookup';
 import type { Node, Edge } from '../types';
+import { isTestPath } from '../search/query-utils';
 
 // Decided once, before `--color`/`--no-color` are stripped from argv below
 // (#1281). Piped/redirected stdout, NO_COLOR, or --no-color -> plain output.
@@ -2452,16 +2453,6 @@ program
       const cg = await CodeGraph.open(projectPath);
       const maxDepth = parseInt(options.depth || '5', 10);
 
-      // Common test file patterns
-      const defaultTestPatterns = [
-        /\.spec\./,
-        /\.test\./,
-        /\/__tests__\//,
-        /\/tests?\//,
-        /\/e2e\//,
-        /\/spec\//,
-      ];
-
       // Custom filter pattern
       let customFilter: RegExp | null = null;
       if (options.filter) {
@@ -2474,9 +2465,14 @@ program
         customFilter = new RegExp(regex);
       }
 
+      // One notion of "a test" for the whole tool (#1507): the CLI used to keep
+      // its own six regexes here, which knew `.test.` and `/tests/` but not Go's
+      // `_test.go`, Python's `test_x.py` or the JVM's `FooTest.kt` — so
+      // `affected` reported "no tests" for whole ecosystems while `search` and
+      // the MCP tools counted those very files as tests.
       function isTestFile(filePath: string): boolean {
         if (customFilter) return customFilter.test(filePath);
-        return defaultTestPatterns.some(p => p.test(filePath));
+        return isTestPath(filePath);
       }
 
       // BFS to find all transitive dependents of changed files, filtered to test files
