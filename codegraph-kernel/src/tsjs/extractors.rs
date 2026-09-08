@@ -1065,6 +1065,28 @@ impl<'t> Walker<'t> {
 
     // --- extractCall (TS/JS generic tail) -------------------------------------------------
 
+    /// Whether a member-call receiver is a chain rooted at a host object a
+    /// TS/JS project never declares. `window` is absent on purpose:
+    /// `window.MyNs.doThing()` reaches a project symbol (#1707).
+    fn is_host_global_chain(&self, receiver: Node<'t>) -> bool {
+        const HOST_GLOBAL_ROOTS: [&str; 19] = [
+            "chrome", "browser", "document", "navigator", "performance", "console",
+            "localStorage", "sessionStorage", "indexedDB", "crypto", "globalThis",
+            "process", "Math", "JSON", "Object", "Array", "Reflect", "Promise", "Intl",
+        ];
+        let mut cur = receiver;
+        if !matches!(cur.kind(), "member_expression" | "subscript_expression") {
+            return false;
+        }
+        while matches!(cur.kind(), "member_expression" | "subscript_expression") {
+            match cur.child_by_field_name("object") {
+                Some(next) => cur = next,
+                None => return false,
+            }
+        }
+        cur.kind() == "identifier" && HOST_GLOBAL_ROOTS.contains(&self.text(cur))
+    }
+
     pub(super) fn extract_call(&mut self, node: Node<'t>) {
         if self.stack.is_empty() {
             return;
@@ -1090,6 +1112,16 @@ impl<'t> Walker<'t> {
                     // Literal receivers call builtins, never project symbols (#1230).
                     if let Some(r) = receiver {
                         if is_literal_receiver(r.kind()) {
+                            return;
+                        }
+                        // A chain rooted at a host namespace — `chrome.storage
+                        // .local.get(k)`, `document.body.querySelector(s)` —
+                        // ends in a platform API, so the bare method name emitted
+                        // here could only exact-match an unrelated project symbol
+                        // sharing it (#1707). Emit nothing. A chain rooted at a
+                        // project value keeps the bare name. Mirrors the TS
+                        // extractor's extractCall (extraction/tree-sitter.ts).
+                        if self.is_host_global_chain(r) {
                             return;
                         }
                     }
