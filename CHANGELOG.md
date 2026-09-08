@@ -228,6 +228,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 #### Symbols, tests and the viewer
 
 - Kotlin functions and methods now carry their signature — `(params): ReturnType` — in `codegraph_explore`, `node` and the viewer, instead of no signature at all. Re-index Kotlin projects after upgrading. (#1495)
+- `codegraph affected` now finds Go, Python and JVM test files that previously went unreported, while preserving custom `--filter` behavior (thanks @danusha2345; #1507, #1688).
+
 - Calls inside declaration initializers in Kotlin, Java, TypeScript, JavaScript, Scala, Rust and Python now appear under the declaration that owns them, making callers and impact results more accurate after re-indexing with `codegraph index -f` (thanks @danusha2345; #1510, #1511).
 - Java fields initialized with anonymous classes now expose their methods and calls in the graph.
 - Kotlin property accessors, initialization blocks and destructuring declarations now retain their calls with the correct owner.
