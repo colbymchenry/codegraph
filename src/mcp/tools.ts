@@ -32,6 +32,7 @@ import {
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
 import { isTestFile, normalizeNameToken } from '../search/query-utils';
+import { lastQualifierPart, matchesSymbol } from '../graph/symbol-lookup';
 import { extractQueryPaths, queryMightContainPaths } from '../search/query-paths';
 import {
   existsSync,
@@ -44,8 +45,6 @@ import { guardLabel, guardsForFileSync, siteKey, supportsBranchGuards, warmBranc
 import { findDynamicBoundaries, type BoundarySite } from '../graph/dynamic-boundary-report';
 import { countImplementers } from '../graph/type-hierarchy';
 import {
-  lastQualifierPart,
-  matchesSymbol,
   findAllSymbols,
   resolveNamedSymbolFlow,
 } from '../graph/named-symbol-flow';
@@ -6853,7 +6852,7 @@ export class ToolHandler {
    */
   /**
    * Check if a node matches a symbol query — see `matchesSymbol` in
-   * `../graph/named-symbol-flow`, which owns the rules.
+   * `../graph/symbol-lookup`, which owns the rules.
    */
   private matchesSymbol(node: Node, symbol: string): boolean {
     return matchesSymbol(node, symbol);

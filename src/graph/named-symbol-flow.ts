@@ -36,93 +36,10 @@ import type CodeGraph from '../index';
 import type { Node, Edge } from '../types';
 import { isTestFile } from '../search/query-utils';
 
-/**
- * Rust path roots that have no file-system equivalent — `crate` is the
- * current crate, `super` is the parent module, `self` is the current
- * module. Used by `matchesSymbol` to strip these before file-path
- * matching so `crate::configurator::stage_apply::run` resolves the
- * same as `configurator::stage_apply::run`.
- */
-export const RUST_PATH_PREFIXES = new Set(['crate', 'super', 'self']);
+import { lastQualifierPart, matchesSymbol } from './symbol-lookup';
 
-/**
- * Last `::` / `.` / `/`-separated segment of a qualified symbol. An Erlang
- * arity tail (`mod::fn/3`, `fn/3`) is stripped first — the useful last segment
- * is the function name, never the digits (#1610).
- */
-export function lastQualifierPart(symbol: string): string {
-  const noArity = symbol.replace(/\/\d{1,3}$/, '') || symbol;
-  const parts = noArity.split(/::|[./]/).filter((p) => p.length > 0);
-  return parts[parts.length - 1] ?? symbol;
-}
-
-/**
- * Check if a node matches a symbol query.
- *
- * Accepts simple names (`run`) and three flavors of qualifier:
- *   - dotted     `Session.request`         (TS/JS/Python)
- *   - colon-pair `stage_apply::run`        (Rust, C++, Ruby)
- *   - slash      `configurator/stage_apply` (path-ish)
- *
- * Multi-level qualifiers compose: `crate::configurator::stage_apply::run`
- * works. Rust path prefixes (`crate`, `super`, `self`) are stripped so
- * the canonical `crate::module::symbol` form resolves.
- *
- * Resolution order, last part must always equal `node.name`:
- *   1. Suffix-match against `qualifiedName` (handles class-scoped methods
- *      where the extractor builds the qualified name from the AST stack)
- *   2. File-path containment (handles file-derived modules in Rust/
- *      Python — `stage_apply::run` matches a `run` in `stage_apply.rs`)
- */
-export function matchesSymbol(node: Node, symbol: string): boolean {
-  // Erlang arity spelling (`fn/3`, `mod:fn/3` → normalized `mod.fn/3`): when
-  // the node's qualifiedName carries an arity (`mod::fn/3`, #1610), the
-  // written arity must match it exactly; the remaining comparison then runs
-  // on the arity-less spelling. A node with no arity in its qualifiedName
-  // keeps the original symbol (a `/` there means a path-ish name instead).
-  const aritySpelling = /^(.+)\/(\d{1,3})$/.exec(symbol);
-  if (aritySpelling) {
-    const nodeArity = /\/(\d{1,3})$/.exec(node.qualifiedName ?? '')?.[1];
-    if (nodeArity !== undefined) {
-      if (nodeArity !== aritySpelling[2]) return false;
-      symbol = aritySpelling[1]!;
-    }
-  }
-  // Simple name match
-  if (node.name === symbol) return true;
-  // File basename match (e.g., "product-card" matches "product-card.liquid")
-  if (node.kind === 'file' && node.name.replace(/\.[^.]+$/, '') === symbol) return true;
-
-  // Qualified-name lookups: split on any supported separator. `\w` keeps
-  // identifier chars (incl. `_`) intact; everything else is treated as
-  // a separator we tolerate.
-  if (!/[.\/]|::/.test(symbol)) return false;
-  const parts = symbol.split(/::|[./]/).filter((p) => p.length > 0);
-  if (parts.length < 2) return false;
-
-  const lastPart = parts[parts.length - 1]!;
-  if (node.name !== lastPart) return false;
-
-  // Stage 1: qualified-name suffix match. The extractor joins the
-  // semantic hierarchy with `::`, so `Session.request` and
-  // `Session::request` both become `Session::request` here.
-  const colonSuffix = parts.join('::');
-  if (node.qualifiedName.includes(colonSuffix)) return true;
-
-  // Stage 2: file-path containment. Rust modules and Python packages
-  // are not in `qualifiedName` — they're encoded in the file path. So
-  // `stage_apply::run` matches a `run` in any file whose path
-  // contains a `stage_apply` segment (with or without an extension).
-  //
-  // Filter out Rust path prefixes that have no file-system equivalent.
-  const containerHints = parts.slice(0, -1).filter((p) => !RUST_PATH_PREFIXES.has(p));
-  if (containerHints.length === 0) return false;
-
-  const segments = node.filePath.split('/').filter((s) => s.length > 0);
-  return containerHints.every((hint) =>
-    segments.some((seg) => seg === hint || seg.replace(/\.[^.]+$/, '') === hint)
-  );
-}
+// Preserve the existing imports while sharing the matcher with the CLI and MCP.
+export { RUST_PATH_PREFIXES, lastQualifierPart, matchesSymbol } from './symbol-lookup';
 
 /**
  * Find ALL symbols matching a name. Used by callers/callees/impact to aggregate

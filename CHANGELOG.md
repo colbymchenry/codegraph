@@ -135,6 +135,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- `codegraph callers`, `codegraph callees` and `codegraph impact` now resolve qualified names and disclose when a name selects several definitions; thanks @ferrine. (#1656, #1512)
+
 #### MCP / indexing
 
 - Indexing now warns when parser errors leave a file with no symbols, including C++ raw strings with 16-character delimiters, so missing code is no longer silent. (#1522)
