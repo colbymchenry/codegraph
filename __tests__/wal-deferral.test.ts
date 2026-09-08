@@ -14,7 +14,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { DatabaseConnection } from '../src/db';
-import { WalCheckpointValve, resolveWalValveMb } from '../src/db/wal-valve';
+import { WalCheckpointValve, WalValveAbortError, resolveWalValveMb } from '../src/db/wal-valve';
 import CodeGraph from '../src/index';
 
 let tmpDir: string;
@@ -192,6 +192,7 @@ function writeFixtureProject(): void {
     );
   }
 }
+
 
 async function seedPendingRefs(cg: CodeGraph): Promise<void> {
   const raw = (cg as unknown as { db: DatabaseConnection }).db.getDb();
@@ -442,6 +443,65 @@ describe('valve file-size trigger (§7a.1: backfilled WAL still grows the file)'
     expect(sizeTrigger).not.toBeNull();
     await sizeTrigger;
     expect(db.getWalSizeBytes()).toBe(0);
+    db.close();
+  });
+});
+
+
+describe('WAL valve fail-closed (#1539)', () => {
+  it('aborts with WalValveAbortError when parked backfills cannot progress past the file cap', async () => {
+    const db = openDb();
+    db.setWalAutocheckpoint(0);
+    writeRows(db, 800); // well past a 0.5MB soft / 2MB file cap
+    expect(db.getWalSizeBytes()).toBeGreaterThan(2 * 1024 * 1024);
+
+    const valve = new WalCheckpointValve(db, 0.5);
+    // Simulate a reader pinning every PASSIVE/TRUNCATE attempt.
+    db.checkpointWalPassive = async () => ({ busy: 1, log: 100, checkpointed: 0 });
+    db.checkpointWalTruncate = async () => ({ busy: 1, log: 100, checkpointed: 0 });
+
+    const bp = valve.backpressure();
+    expect(bp).not.toBeNull();
+    await expect(bp!).rejects.toBeInstanceOf(WalValveAbortError);
+    try {
+      await bp!;
+    } catch (err) {
+      expect(err).toMatchObject({
+        name: 'WalValveAbortError',
+        code: 'WAL_VALVE_ABORT',
+      });
+      expect((err as WalValveAbortError).message).toMatch(/Aborting to avoid unbounded disk growth/);
+      expect((err as WalValveAbortError).walBytes).toBeGreaterThan((err as WalValveAbortError).fileCapBytes);
+    }
+    // Caps remain enforceable: a subsequent backpressure call still parks (no
+    // futility latch that returns null and lets the writer race past the cap).
+    const again = valve.backpressure();
+    expect(again).not.toBeNull();
+    await expect(again!).rejects.toBeInstanceOf(WalValveAbortError);
+    db.close();
+  });
+
+  it('aborts when checkpoint machinery is unavailable while over the file cap', async () => {
+    const db = openDb();
+    db.setWalAutocheckpoint(0);
+    writeRows(db, 800);
+    const valve = new WalCheckpointValve(db, 0.5);
+    db.checkpointWalPassive = async () => null;
+    const bp = valve.backpressure();
+    expect(bp).not.toBeNull();
+    await expect(bp!).rejects.toBeInstanceOf(WalValveAbortError);
+    db.close();
+  });
+
+  it('does not abort a soft foldNow give-up that stays under both caps', async () => {
+    const db = openDb();
+    db.setWalAutocheckpoint(0);
+    writeRows(db, 50); // small WAL
+    const valve = new WalCheckpointValve(db, 1024); // 1GB soft — hard 2GB, fileCap 4GB
+    db.checkpointWalPassive = async () => ({ busy: 1, log: 10, checkpointed: 0 });
+    // foldNow calls backfillFully even with modest growth; under caps this is soft.
+    await expect(valve.foldNow()).resolves.toBeUndefined();
+    expect(valve.backpressure()).toBeNull();
     db.close();
   });
 });
