@@ -17,7 +17,7 @@ import {
   ImportMapping,
 } from './types';
 import { isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
-import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos } from './import-resolver';
+import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos, resolveImportPath } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -2003,6 +2003,42 @@ export class ReferenceResolver {
   }
 
   /**
+   * True when `receiver` is a local name bound by an import that resolves to a
+   * file IN THIS PROJECT — the only case where letting a python
+   * built-in-method name through the filter is safe (#1681).
+   *
+   * Asking only whether SOME import bound the local name is not enough: every
+   * import produces a mapping, stdlib and PyPI included, so that would also be
+   * true for `os`, `requests`, `np`. Opening the filter for them lets
+   * resolveViaImport find no project file, fall through to bare-name matching,
+   * and bind `os.remove(p)` to whatever project method happens to be named
+   * `remove` — reintroducing, through its own escape hatch, the fabricated-edge
+   * class this filter exists to prevent.
+   *
+   * Resolving the specifier is the same question resolveViaImport will ask
+   * next, so a receiver that passes here is one the qualified path can actually
+   * serve; anything else stays a silent miss rather than a wrong edge.
+   */
+  private isPythonProjectModule(ref: UnresolvedRef, receiver: string): boolean {
+    for (const imp of this.context.getImportMappings(ref.filePath, ref.language)) {
+      if (imp.localName !== receiver) continue;
+      // `import pkg.mod` / `import pkg.mod as m` binds the module `source`
+      // names. `from pkg import mod` binds `pkg.mod`, and `from . import mod`
+      // binds `.mod` — join without doubling the dot that makes `.` mean the
+      // current package.
+      const specifier = imp.isNamespace
+        ? imp.source
+        : imp.source.endsWith('.')
+          ? `${imp.source}${imp.exportedName}`
+          : `${imp.source}.${imp.exportedName}`;
+      if (resolveImportPath(specifier, ref.filePath, ref.language!, this.context)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * Check if reference is to a built-in or external symbol
    */
   private isBuiltInOrExternal(ref: UnresolvedRef): boolean {
@@ -2050,10 +2086,18 @@ export class ReferenceResolver {
         }
         // Filter built-in methods on non-class receivers
         // (e.g., items.append where items is a local list variable)
-        // But allow if the capitalized receiver matches a known codebase class
+        // But allow if the capitalized receiver matches a known codebase class,
+        // OR the receiver is itself an imported project module — a module can
+        // export a top-level function sharing a common collection-method name
+        // (`ledger.append`, `from . import ledger`), and that call is a real
+        // project dependency, not `list.append` (#1681). Without this, the
+        // qualified ref never reaches resolveViaImport / resolvePythonModuleMember.
         if (PYTHON_BUILT_IN_METHODS.has(method)) {
           const capitalized = receiver.charAt(0).toUpperCase() + receiver.slice(1);
-          if (!this.knownNames?.has(capitalized)) {
+          const isKnownClass = this.knownNames?.has(capitalized) ?? false;
+          const isProjectModule =
+            !isKnownClass && this.isPythonProjectModule(ref, receiver);
+          if (!isKnownClass && !isProjectModule) {
             return true;
           }
         }
