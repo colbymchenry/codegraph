@@ -43,7 +43,12 @@ beforeAll(async () => {
       'export function viaGlobal(): string {\n' +
       '  return window.MyNs.ping();\n' +
       '}\n' +
+      'export class PingService { ping(): string { return "service"; } }\n' +
       'export class Runner {\n' +
+      '  constructor(private svc: PingService) {}\n' +
+      '  run(): string { return this.svc.ping(); }\n' +
+      '}\n' +
+      'export class AnonymousRunner {\n' +
       '  constructor(private svc: { ping(): string }) {}\n' +
       '  run(): string { return this.svc.ping(); }\n' +
       '}\n'
@@ -86,6 +91,11 @@ describe('TS/JS call through a host-global chain (#1707)', () => {
   it('keeps a chain rooted at a project value — window.MyNs.m() and this.<field>.m()', () => {
     const ping = fn('ping', 'service.ts').id;
     expect(callTargets(fn('viaGlobal', 'service.ts').id)).toContain(ping);
-    expect(callTargets(method('Runner::run').id)).toContain(ping);
+    expect(callTargets(method('Runner::run').id)).toEqual([method('PingService::ping').id]);
+  });
+
+  it('does not guess a same-named project target for an anonymous field type (#1496)', () => {
+    // Neither the top-level ping nor PingService::ping establishes what svc is.
+    expect(callTargets(method('AnonymousRunner::run').id)).toEqual([]);
   });
 });
