@@ -137,6 +137,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- Indexing now warns when parser errors leave a file with no symbols, including C++ raw strings with 16-character delimiters, so missing code is no longer silent. (#1522)
+
 - `codegraph index <path>` now refuses uninitialized paths and names the nearest initialized parent instead of silently rebuilding it; thanks @danusha2345. (#1524, #1689)
 
 - Sync now recovers the same connections as a clean index after interrupted reference resolution, including inherited calls and callbacks that previously stayed missing. (#1577)

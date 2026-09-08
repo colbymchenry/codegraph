@@ -584,6 +584,18 @@ export class TreeSitterExtractor {
 
       if (packageNodeId) this.nodeStack.pop();
       this.nodeStack.pop();
+
+      // hasError is routine for several grammars; warn only when no symbols survived.
+      const symbolCount = this.nodes.filter((n) => n.kind !== 'file').length;
+      if (this.tree?.rootNode.hasError && symbolCount === 0) {
+        this.errors.push({
+          message:
+            `${this.filePath}: parse produced no symbols (tree has errors) — ` +
+            `the file is indexed but contributes nothing to the graph`,
+          severity: 'warning',
+          code: 'parse_error',
+        });
+      }
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
 

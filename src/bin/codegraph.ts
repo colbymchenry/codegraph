@@ -378,6 +378,7 @@ type IndexResult = {
  */
 function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexResult, projectPath?: string): void {
   const hasErrors = result.filesErrored > 0;
+  const parseWarnings = result.errors.filter((e) => e.code === 'parse_error' && e.severity === 'warning');
 
   // Surface non-file-level failures (e.g. lock-acquisition failure
   // when another indexer is running) before the file-count branches.
@@ -403,6 +404,10 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
       clack.log.success(`Indexed ${formatNumber(result.filesIndexed)} files`);
     }
     clack.log.info(`${formatNumber(result.nodesCreated)} nodes, ${formatNumber(result.edgesCreated)} edges in ${formatDuration(result.durationMs)}`);
+    // Warning-only parse failures keep indexing successful, but must be visible.
+    for (const warning of parseWarnings) {
+      clack.log.warn(warning.message);
+    }
     // A PARTIAL index (files silently dropped mid-pipeline) must not pass
     // as a clean run — it's the difference between "indexed the repo" and
     // "indexed most of the repo, quietly". Only the completeness
