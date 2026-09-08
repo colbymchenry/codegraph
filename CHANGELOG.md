@@ -145,6 +145,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Indexing no longer checks whether files outside your project exist. A relative import that points above the project directory (`../../something`) made CodeGraph probe that location on disk while resolving it. Nothing outside the project was ever read, and no such file was ever added to the index or linked to, but the check itself should not have happened — such an import now simply resolves to nothing. Symlinks inside your project that point at code kept elsewhere are unaffected and still index as before. Thanks @ErQrYfkrju. (#1631)
 
+- `codegraph install` now honors `CLAUDE_CONFIG_DIR` and `CODEX_HOME` for global Claude Code and Codex setup so CodeGraph loads in your chosen profile (thanks @seanchann; #1627).
+
 #### Screens, links and navigation
 
 - **Where the app goes after login is a fork, not two always-es.** A navigation whose destination comes back from a helper — `router.replace(await resolvePostLoginRoute())` over `return (await hasSeenWelcome(…)) ? '/home/' : '/welcome/'` — drew both screens with no condition, reading as if the welcome screen always shows. The two arms share a line, and only a column can tell them apart; each synthesized edge now carries its literal's own position, so the guard reader says which arm it is: `WHEN await hasSeenWelcome(…)` → home, and its negation → welcome. And the scan starts at the helper's body, so a literal-union return type — `Promise<'/welcome/' | '/home/'>`, whose routes are string literals too, written first — no longer stands in for the navigation itself. Re-index after upgrading to pick the positions up.
@@ -213,6 +215,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Symbols, tests and the viewer
 
+- Objective-C headers now index in a project that has no `.m` file. A `.h` file is read as C from its name alone, and only later — once its contents are read — recognized as Objective-C; the grammar for that was never loaded up front, so the file failed with a parser error and nothing in it reached the index. Adding any `.m` file used to make the same header work, which is what made this look arbitrary. Thanks @Juddd. (#1628)
+
 - TypeScript interface methods and properties are now indexed, so `node`, `callers` and impact can find platform `.d.ts` APIs while declaration-only files keep their lower ranking on flow queries; re-index TypeScript projects after upgrading. (#1638)
 - Lua and Luau function expressions assigned to locals, table members, or keyed table fields are now indexed as callable nodes. Calls from `local f = function() ... end`, `M.f = function() ... end`, and callback tables such as `M.handlers = { onClick = function() ... end }` are attributed to the named function or method instead of collapsing onto the file node, so callers and impact no longer omit these handlers. Re-index after upgrading. (#1616, #1650)
 - **Functions bound with `const` inside another function are symbols now.** `const handleClear = () => {…}` inside a React component — every handler that skips `useCallback` — was invisible to `callers`, `callees` and impact, answering "Symbol not found" exactly the way a function with no callers would. It is indexed like its module-level twin, contained by the enclosing function, with its own calls. Re-index after upgrading. (#1669)
@@ -246,6 +250,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`codegraph_explore` is loaded from the first prompt in Claude Code.** Claude Code defers every MCP tool behind a tool-search step, so a fresh session saw only the tool's name until the model searched for it, and the server's "call `codegraph_explore` instead of Read" had nothing loaded to act on. The tool now carries `anthropic/alwaysLoad` in its `_meta`, which exempts it on existing installs, and `codegraph install` writes `alwaysLoad: true` on the Claude Code server entry (re-run it to add the key). Copilot CLI's tool search holds MCP tools back the same way once ~30 tools are connected, so its entry now carries `deferTools: "never"`. (#1696)
 
 - Fixed a long-running `codegraph ui` session serving a symbol that a sync had already deleted. The viewer keeps one connection to your index open, and its in-memory lookup didn't notice when another process — your agent's sync, or `codegraph sync` — rewrote the file underneath it, so a symbol screen could keep showing a body with no callers while search correctly reported it had moved. Because a symbol's identity includes the line it starts on, this happened after almost any edit above it.
+
+- Python calls and file dependencies through `from package import module as alias` now appear in the graph, so renamed imports no longer hide live callers or imported modules. Thanks @JoeyNPP. (#1626)
 
 #### Language and framework accuracy
 
