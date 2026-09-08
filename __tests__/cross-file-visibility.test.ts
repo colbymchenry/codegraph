@@ -96,6 +96,19 @@ describe('Kotlin: a private function is class- or file-local', () => {
   });
 });
 
+describe('Kotlin: a private property is class- or file-local too', () => {
+  it('records the modifier on the property and declines a call onto it from another file', async () => {
+    project({
+      'WebRtcTransport.kt': 'class WebRtcTransport {\n    @Volatile private var token = ""\n    internal val shared = 1\n}\n',
+      'CommandValidator.kt': 'class CommandValidator {\n    fun validate(command: Map<String, Any>): String? {\n        if (!token(command["sessionId"], 128)) return "bad"\n        return null\n    }\n}\n',
+    });
+    expect(await calleesOf('validate')).not.toContain('WebRtcTransport.kt:token');
+    const fields = cg!.getNodesByKind('field').filter((n) => n.filePath.endsWith('WebRtcTransport.kt'));
+    expect(fields.find((n) => n.name === 'token')?.visibility).toBe('private');
+    expect(fields.find((n) => n.name === 'shared')?.visibility).toBe('internal');
+  });
+});
+
 describe('Go: an unexported identifier is package-local', () => {
   it('does not resolve a call onto an unexported func in another package', async () => {
     project({
