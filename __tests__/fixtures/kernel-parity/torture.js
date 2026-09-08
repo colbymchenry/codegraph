@@ -79,3 +79,11 @@ exports.getItems = async (req, res) => { res.json(await findItems()); };
 module.exports.deleteItem = function (req, res) { removeItem(req.params.id); res.end(); };
 exports.plain = 42;
 handlers.onSave = () => { persist(); };
+// --- call-expression receivers (#1683) ----------------------------------------
+function bucketChains(d, k, v) {
+  d.setdefault(k, []).append(v);
+  make().run();
+  (0, make)().run();
+  arr[0]().go();
+  obj.make().run().again();
+}
