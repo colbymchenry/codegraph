@@ -66,6 +66,7 @@ export function buildFile(cg: CodeGraph, projectRoot: string, requested: string)
   const nodes = cg.getNodesInFile(storedPath);
   const nodeIds = nodes.map((n) => n.id);
   const inThisFile = new Set(nodeIds);
+  const nodeKindById = new Map(nodes.map((n) => [n.id, n.kind]));
   const fileNode = nodes.find((n) => n.kind === 'file') ?? null;
 
   // ---------------------------------------------------------------------------
@@ -106,8 +107,20 @@ export function buildFile(cg: CodeGraph, projectRoot: string, requested: string)
   // the same signal `/api/entrypoints` ranks on. It is worth a line on this
   // screen because the outline cannot show it: top-level code belongs to no
   // symbol, so the only way to read it is to open the file node itself.
+  // A call made while initializing a module-level variable or constant is
+  // attributed to that name (#693), so those names are top-level code too and
+  // are counted with the file — the same set `getTopCallingFiles` ranks on.
+  const moduleLevelValueIds = fileNode
+    ? cg
+        .getOutgoingEdgesFrom([fileNode.id], ['contains'])
+        .map((e) => e.target)
+        .filter((id) => {
+          const kind = nodeKindById.get(id);
+          return kind === 'variable' || kind === 'constant';
+        })
+    : [];
   const topLevelEdges = fileNode
-    ? cg.getOutgoingEdgesFrom([fileNode.id], ['calls', 'instantiates'])
+    ? cg.getOutgoingEdgesFrom([fileNode.id, ...moduleLevelValueIds], ['calls', 'instantiates'])
     : [];
 
   return {
