@@ -171,7 +171,7 @@ function extractNameRaw(node: SyntaxNode, source: string, extractor: LanguageExt
   // not from identifiers in their body. Without this, single-expression arrow
   // functions like `const fn = () => someIdentifier` get named "someIdentifier"
   // instead of "fn", because the fallback below finds the body identifier.
-  if (node.type === 'arrow_function' || node.type === 'function_expression') {
+  if (node.type === 'arrow_function' || node.type === 'function_expression' || node.type === 'generator_function') {
     return '<anonymous>';
   }
 
@@ -1041,8 +1041,14 @@ export class TreeSitterExtractor {
     else if (this.extractor.methodTypes.includes(nodeType)) {
       // TS/JS class fields parse as a methodTypes node; only function-valued
       // fields are methods — a plain field (`public fonts: Fonts;`) is a
-      // property (#808). classifyMethodNode is absent for other languages.
-      if (this.extractor.classifyMethodNode?.(node) === 'property') {
+      // property (#808). C++ lists `field_declaration` so pure-virtual methods
+      // mint nodes (#1727); non-callable ones return 'skip' and fall through to
+      // the children walk. classifyMethodNode is absent for other languages.
+      const methodClass = this.extractor.classifyMethodNode?.(node) ?? 'method';
+      if (methodClass === 'skip') {
+        // Not a method — leave skipChildren false so data-member initializers
+        // still contribute call/instantiation edges under the enclosing class.
+      } else if (methodClass === 'property') {
         const propNode = this.extractProperty(node);
         // Walk the initializer so its calls/instantiations attribute to the
         // property (`history = createHistory()` → history calls
@@ -1556,7 +1562,7 @@ export class TreeSitterExtractor {
     if (
       !nameOverride &&
       name === '<anonymous>' &&
-      (node.type === 'arrow_function' || node.type === 'function_expression')
+      (node.type === 'arrow_function' || node.type === 'function_expression' || node.type === 'generator_function')
     ) {
       const parent = node.parent;
       if (parent?.type === 'variable_declarator') {
@@ -1798,6 +1804,9 @@ export class TreeSitterExtractor {
     const visibility = this.extractor.getVisibility?.(node);
     const isAsync = this.extractor.isAsync?.(node);
     const isStatic = this.extractor.isStatic?.(node);
+    // Only persist abstract when true — a false return must not mint `isAbstract: false`
+    // on every ordinary method (breaks kernel↔wasm parity JSON equality).
+    const isAbstract = this.extractor.isAbstract?.(node) ? true : undefined;
     const returnType = this.extractor.getReturnType?.(node, this.source);
     const extraProps: Partial<Node> = {
       docstring,
@@ -1805,6 +1814,7 @@ export class TreeSitterExtractor {
       visibility,
       isAsync,
       isStatic,
+      isAbstract,
       returnType,
     };
     if (receiverType) {
@@ -2623,7 +2633,7 @@ export class TreeSitterExtractor {
             }
             const name = getNodeText(nameNode, this.source);
             // Arrow functions / function expressions: extract as function instead of variable
-            if (valueNode && (valueNode.type === 'arrow_function' || valueNode.type === 'function_expression')) {
+            if (valueNode && (valueNode.type === 'arrow_function' || valueNode.type === 'function_expression' || valueNode.type === 'generator_function')) {
               this.extractFunction(valueNode);
               continue;
             }
@@ -4573,6 +4583,32 @@ export class TreeSitterExtractor {
               // scope keywords: such calls previously emitted a bare method
               // name, which either failed to resolve or resolved ambiguously.
               calleeName = `${getNodeText(receiver, this.source)}.${methodName}`;
+            } else if (
+              (this.language === 'typescript' ||
+                this.language === 'javascript' ||
+                this.language === 'tsx' ||
+                this.language === 'jsx' ||
+                this.language === 'python') &&
+              receiver &&
+              (receiver.type === 'call_expression' || receiver.type === 'call')
+            ) {
+              // Receiver that is itself a call — `d.setdefault(k, []).append(v)`,
+              // `make().run()`, `res.json().data` (#1683). The bare method name
+              // this used to emit exact-matched any top-level project symbol of
+              // that name and fabricated a call edge from an unrelated function
+              // (`append`, `get`, `run`…). Keep the inner callee, encoded as
+              // `<inner>().<method>` like the Java/Kotlin/C++ chains: the
+              // marker never appears in an ordinary ref, so nothing name-matches
+              // it, and a chain resolver can later infer the receiver's type
+              // from what the inner call returns. An inner callee that is not a
+              // plain name or member chain (`(await x)()`, `arr[0]()`) has no
+              // static receiver at all — emit nothing: a silent miss, never a
+              // wrong edge. The inner call is visited on its own either way.
+              // Mirrored in the kernel (tsjs/extractors.rs, python.rs).
+              const innerFn = getChildByField(receiver, 'function');
+              const innerCallee = innerFn ? getNodeText(innerFn, this.source).replace(/\s+/g, '') : '';
+              if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(innerCallee)) return;
+              calleeName = `${innerCallee}().${methodName}`;
             } else if (
               this.language === 'go' &&
               receiver &&

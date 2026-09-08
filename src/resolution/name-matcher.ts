@@ -4,8 +4,10 @@
  * Handles symbol name matching for reference resolution.
  */
 
+import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
+import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -388,6 +390,338 @@ function isLexicallyReachable(
   );
 }
 
+/** Languages whose module boundary is `import`/`export` (or CommonJS). */
+const ESM_FAMILY = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx', 'arkts']);
+
+/**
+ * A line-initial `import` statement — the marker that a JS/TS file is a MODULE
+ * rather than a classic script. Line-anchored and followed by a name, brace,
+ * star or quote, so a dynamic `import(` and the word inside a comment or string
+ * do not match.
+ */
+const HAS_IMPORT_STATEMENT = /^[ \t]*import[\s{*'"]/m;
+
+/**
+ * Anything the file could offer another file, in every form the extractor's own
+ * `isExported` flag misses. `^export` covers the declaration and later forms
+ * (`export const`, `export { x }`, `export default x`, `export *`); the
+ * CommonJS shapes cover files that never use ESM syntax at all, in both the dot
+ * and the bracket form; and `declare global` contributes names to every file
+ * whether or not the module exports anything of its own. Kept as a source test
+ * rather than a node scan precisely because `isExported` is set only from an
+ * `export_statement` ancestor, so `const x = …; export { x }` and
+ * `module.exports = { x }` both read as unexported on the node.
+ */
+const HAS_ESM_EXPORT = /^[ \t]*export[\s{*]|^[ \t]*declare\s+global\b/m;
+const HAS_CJS_EXPORT = /\bmodule\.exports\b|\bexports\s*[.[]/;
+
+/**
+ * Per-context memo of "this file is a module that exports nothing", asked once
+ * per candidate FILE rather than once per reference. Derived from file source,
+ * so it drops with the context's file caches — clearNameMatcherMemos deletes it
+ * alongside INFER_SCAN_STATES.
+ */
+const SEALED_MODULES = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * Whether `filePath` is a JS/TS module that exports NOTHING — an import
+ * statement present, no export of any form. No reference from another file can
+ * reach any binding in such a file, so every one of its symbols is a false
+ * candidate for a cross-file name match.
+ *
+ * This is the general case behind a package name capturing a same-named local:
+ * on `vitejs/vite`, 157 cross-file `imports` refs — every `import { defineConfig
+ * } from 'vite'` in the playground and the create-vite templates — resolved onto
+ * `playground/ssr-html/test-stacktrace.js::vite`, which is `const vite = await
+ * createServer(…)` at module scope in a file with zero exports. The existing
+ * guards cannot see it: `isLexicallyReachable` returns early for any candidate
+ * that is not a `function`, and the bare-import guard correctly declines because
+ * `vite` IS a workspace member, so the specifier really is project-local. What
+ * is wrong is only which node the name lands on.
+ *
+ * Deliberately narrow on three axes, because each is a class this would
+ * otherwise resolve wrongly in the opposite direction:
+ *
+ * - **A classic script is exempt.** Requiring an `import` statement means a
+ *   non-module `.js` file — concatenated globals, a browser `<script>` — keeps
+ *   its cross-file matches, where a top-level binding genuinely is reachable.
+ * - **CommonJS is exempt.** `module.exports` and `exports.x` are matched as
+ *   exports, so a CJS file is never sealed.
+ * - **Other languages are exempt.** Go, Python, Java and the rest have no
+ *   equivalent boundary, and several extractors hardcode `isExported`.
+ */
+function isSealedModule(filePath: string, context: ResolutionContext): boolean {
+  let memo = SEALED_MODULES.get(context);
+  if (!memo) {
+    memo = new Map();
+    SEALED_MODULES.set(context, memo);
+  }
+  const hit = memo.get(filePath);
+  if (hit !== undefined) return hit;
+  const source = context.readFile(filePath);
+  const code = source === null ? '' : blankStringContents(stripCommentsForRegex(source, 'typescript'));
+  // CommonJS assignments can execute inside template interpolations, which the
+  // masker blanks. Keep the conservative raw-source exemption for those forms.
+  const sealed =
+    source !== null && HAS_IMPORT_STATEMENT.test(code) &&
+    !context.getNodesInFile(filePath).some((n) => n.isExported) &&
+    !HAS_ESM_EXPORT.test(code) && !HAS_CJS_EXPORT.test(source);
+  memo.set(filePath, sealed);
+  return sealed;
+}
+
+/**
+ * Whether `candidate` can be named by a reference in `ref`'s file at all.
+ * Both name-based strategies validate their chosen candidate. Removing an
+ * unreachable candidate before ranking can promote an unrelated runner-up;
+ * rejecting the chosen target must leave the reference unresolved instead.
+ */
+function isCrossFileReachable(
+  candidate: Node,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): boolean {
+  if ((ref.language as string) !== 'markdown' && (candidate.language as string) === 'markdown') return false;
+  if (ref.referenceKind === 'calls' && ESM_FAMILY.has(candidate.language) &&
+    (candidate.kind === 'constant' || candidate.kind === 'variable') &&
+    /^=\s*require\s*\(\s*(['"])[^'"]+\.json\1\s*\)\s*;?\s*$/.test(candidate.signature ?? '')) return false;
+  return (
+    candidate.filePath === ref.filePath ||
+    !ESM_FAMILY.has(candidate.language) ||
+    !isSealedModule(candidate.filePath, context)
+  );
+}
+
+/**
+ * Languages in which `visibility: 'private'` on a definition means no other
+ * FILE can name it: a Kotlin `private fun` is file- or class-local, and the
+ * same holds for Java, C#, Swift, Scala, Dart and PHP members.
+ */
+const PRIVATE_IS_FILE_LOCAL = new Set<string>(['kotlin', 'java', 'csharp', 'swift', 'scala', 'dart', 'php']);
+
+/** Per-context memo: node id → "this C/C++ function is declared `static`". */
+const C_STATIC_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * A C/C++ file that IS a translation unit. A `static` defined here is local
+ * to it. A `static` (typically `static inline`) in a header is a different
+ * thing: the header is textually included, so the function exists in every
+ * unit that includes it and is callable from each — MAVLink's generated
+ * `mavlink_msg_*.h` are nothing but such functions, 4,306 real calls on one
+ * betaflight tree.
+ */
+const C_SOURCE_EXT = /\.(c|cc|cpp|cxx|c\+\+|m|mm)$/i;
+
+/**
+ * Whether a C/C++ function definition carries the `static` storage class —
+ * read from its first source line(s), since the extractor records no storage
+ * class and the kernel arm would need the same field. `static` on the line
+ * above the name (`static void\nfoo(void)`) is the common alternative layout.
+ */
+function isStaticCFunction(candidate: Node, context: ResolutionContext): boolean {
+  let memo = C_STATIC_MEMO.get(context);
+  if (!memo) {
+    memo = new Map();
+    C_STATIC_MEMO.set(context, memo);
+  }
+  const hit = memo.get(candidate.id);
+  if (hit !== undefined) return hit;
+  const lines = context.getFileLines?.(candidate.filePath) ?? context.readFile(candidate.filePath)?.split('\n') ?? [];
+  const head = [lines[candidate.startLine - 2] ?? '', lines[candidate.startLine - 1] ?? ''].join('\n');
+  const isStatic = /(^|[\s;}])static\s/.test(head);
+  memo.set(candidate.id, isStatic);
+  return isStatic;
+}
+
+/** Per-context memo: node id → "this Rust method implements a trait". */
+const RUST_TRAIT_IMPL_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * Whether a Rust method sits in an `impl Trait for Type` block. Such a method
+ * carries no `pub` — the trait decides its visibility — so the extractor
+ * records it as private; it is reachable wherever the trait is. Read from the
+ * nearest enclosing `impl` header above the method, memoised per node.
+ */
+function isRustTraitImplMethod(candidate: Node, context: ResolutionContext): boolean {
+  if (candidate.kind !== 'method') return false;
+  let memo = RUST_TRAIT_IMPL_MEMO.get(context);
+  if (!memo) {
+    memo = new Map();
+    RUST_TRAIT_IMPL_MEMO.set(context, memo);
+  }
+  const hit = memo.get(candidate.id);
+  if (hit !== undefined) return hit;
+  const lines = context.getFileLines?.(candidate.filePath) ?? context.readFile(candidate.filePath)?.split('\n') ?? [];
+  let isTrait = false;
+  for (let i = candidate.startLine - 2; i >= 0; i--) {
+    const line = lines[i] ?? '';
+    if (/^\s*(pub(\([^)]*\))?\s+)?(unsafe\s+)?impl\b/.test(line)) {
+      isTrait = /\sfor\s/.test(line.replace(/\/\/.*$/, ''));
+      break;
+    }
+    // A top-level item above the method means it was not inside an impl.
+    if (/^(pub(\([^)]*\))?\s+)?(fn|struct|enum|mod|trait|const|static|type)\b/.test(line)) break;
+  }
+  memo.set(candidate.id, isTrait);
+  return isTrait;
+}
+
+/**
+ * The directory a Rust file's private items are visible from: the file's own
+ * module subtree. `src/net.rs` and `src/net/mod.rs` own `src/net/`; a crate
+ * root (`lib.rs` / `main.rs`) owns its directory. A child module reaches its
+ * ancestors' private items (`super::`), a sibling or another crate never does.
+ */
+function rustModuleDir(filePath: string): string {
+  const base = path.posix.basename(filePath);
+  const dir = path.posix.dirname(filePath);
+  if (base === 'mod.rs' || base === 'lib.rs' || base === 'main.rs') return dir;
+  return path.posix.join(dir, base.replace(/\.rs$/, ''));
+}
+
+/**
+ * Whether `candidate` can be NAMED from a reference in `ref`'s file at all,
+ * given what its language says about the definition's visibility. A
+ * definition the language makes file-local is not a candidate for a
+ * cross-file name match, however well the names agree:
+ *
+ * - **C / C++**: a `static` function defined in a SOURCE file is local to
+ *   that translation unit; one in a header is part of every unit that
+ *   includes it and stays visible. On a 2,109-file betaflight tree 145
+ *   cross-file calls resolved onto a `static` in another `.c` (#1730) —
+ *   `usbd_get_descriptor` onto the `static get_device_descriptor` of
+ *   whichever USB class file ranked first.
+ * - **Kotlin, Java, C#, Swift, Scala, Dart, PHP**: `private` is class- or
+ *   file-local. An Android `editor.apply()` resolved onto an unrelated class's
+ *   `private fun apply`.
+ * - **Go**: an unexported (lowercase) identifier is package-local, and a
+ *   package is a directory. Judged by the name's case: the extractor's
+ *   `isExported` is unset for every Go method.
+ * - **Rust**: a non-`pub` item is visible to its module and that module's
+ *   descendants, never to a sibling module or another crate — `.count()` on
+ *   an iterator resolved onto a `fn count` in a different crate. A method in
+ *   an `impl Trait for Type` block has the trait's visibility, not `private`.
+ * - **JS / TS / ArkTS**: a binding in a module that exports nothing (an
+ *   `import` present, no `export` / CommonJS / `declare global`) is sealed —
+ *   the vite playground's `const vite = await createServer(…)` took 157
+ *   `import { defineConfig } from 'vite'` edges (#1719). Classic scripts,
+ *   CommonJS, later `export { … }`, and ambient globals stay visible.
+ *
+ * Same-file candidates are always visible. Applied by ReferenceResolver to
+ * the target the whole name-matching pipeline settled on, so a rejection ends
+ * the reference unresolved: declining inside matchByExactName instead let the
+ * ref fall through to matchFuzzy, which then committed to a same-language
+ * namesake the ranking had passed over — eight such edges on one tree, all
+ * onto a local `const fail = …` arrow the graph does not hold. matchFuzzy
+ * checks its own survivor as well, since nothing runs after it.
+ */
+export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (candidate.filePath === ref.filePath) return true;
+  const lang = candidate.language as string;
+  if (lang === 'c' || lang === 'cpp') {
+    return (
+      candidate.kind !== 'function' ||
+      !C_SOURCE_EXT.test(candidate.filePath) ||
+      !isStaticCFunction(candidate, context)
+    );
+  }
+  if (lang === 'go') {
+    // By the name's first letter, not the extractor's flag: the flag is unset
+    // for every Go method, exported or not.
+    return /^[A-Z]/.test(candidate.name) || path.posix.dirname(candidate.filePath) === path.posix.dirname(ref.filePath);
+  }
+  if (lang === 'rust') {
+    if (candidate.visibility !== 'private') return true;
+    if (isRustTraitImplMethod(candidate, context)) return true;
+    const owner = rustModuleDir(candidate.filePath);
+    return ref.filePath.startsWith(owner + '/');
+  }
+  if (PRIVATE_IS_FILE_LOCAL.has(lang)) return candidate.visibility !== 'private';
+  // JS/TS/ArkTS sealed modules + markdown/JSON call-target guards (#1719).
+  // Same predicate matchByExactName / matchFuzzy apply to their survivors so a
+  // rejection here cannot fall through to a promoted runner-up.
+  return isCrossFileReachable(candidate, ref, context);
+}
+
+const JS_FAMILY = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx']);
+
+/**
+ * Whether a JS/TS `calls` ref is a RECEIVER-LESS call — `serialize(x)`, not
+ * `this.serialize(x)` / `obj.serialize(x)`. The extractor emits `this.m()`
+ * and `super.m()` under the bare method name, so the receiver is read back
+ * from the call site's own line: the text at the ref's column is the call
+ * expression, and it starts with the name itself only when nothing precedes
+ * it. In JS/TS a bare call can never bind to a class method (methods need a
+ * receiver), so a `method` node is not a candidate for it (#1714) — the
+ * enclosing method itself least of all, which the same-file proximity term
+ * used to pick over the module-scope function the call actually means.
+ */
+function isBareJsCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.referenceKind !== 'calls' || !JS_FAMILY.has(ref.language)) return false;
+  if (ref.referenceName.includes('.')) return false;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1]
+    ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return false;
+  const at = line.slice(ref.column);
+  const nameEsc = ref.referenceName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (!new RegExp('^' + nameEsc + '\\s*[(<]').test(at)) return false;
+  // Nothing but whitespace, an operator or an opener may precede a bare call.
+  return !/[.\w$\]\)]\s*$/.test(line.slice(0, ref.column)) || /\b(?:return|await|yield|typeof|void|new|else|case|throw|in|of|instanceof)\s*$/.test(line.slice(0, ref.column));
+}
+
+/** Per-context memo: `file\0name` → "the file binds this name locally". */
+const LOCAL_BINDING_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * Whether a JS/TS file binds `name` itself — as a `const`/`let`/`var`/
+ * `function`/`class` declaration (destructuring included) or as a parameter
+ * of a function or arrow. Such a binding shadows every same-named symbol in
+ * other files, so a bare call to it has no cross-file candidate: the
+ * `resolve` of `new Promise((resolve, reject) => …)`, a spec's
+ * `const transform = await makeTransform()`, a factory's `const now =
+ * options.now || (() => new Date())`. None of these is a node the graph
+ * holds (a parameter, a const bound to a call result), so without this the
+ * matcher hands the call to whichever other file defines the name — and
+ * once methods stop being candidates for a bare call (#1714), the function
+ * that was out-ranked steps in. Read from source, memoised per file+name.
+ */
+function isLocallyBoundJsName(name: string, filePath: string, context: ResolutionContext): boolean {
+  let memo = LOCAL_BINDING_MEMO.get(context);
+  if (!memo) {
+    memo = new Map();
+    LOCAL_BINDING_MEMO.set(context, memo);
+  }
+  const key = filePath + '\0' + name;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  const source = context.readFile(filePath) ?? '';
+  const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // `const { name } = require('./m')` / `= await import('./m')` binds an IMPORT,
+  // not a shadow: the symbol lives in the other file and the call means it.
+  const declRe = new RegExp(
+    '\\b(?:const|let|var)\\s+(?:' + n + '\\b|[{\\[][^;=]*?\\b' + n + '\\b[^;=]*?[}\\]])\\s*(?:=\\s*([^;\\n]*))?',
+    'g'
+  );
+  let bound = false;
+  for (const m of source.matchAll(declRe)) {
+    if (!/^\s*(?:await\s+)?(?:require|import)\s*\(/.test(m[1] ?? '')) { bound = true; break; }
+  }
+  if (!bound) {
+    bound =
+      new RegExp('\\b(?:function|class)\\s+' + n + '\\b').test(source) ||
+      // a parameter: every token before the name in the list is itself a
+      // parameter (identifier, optional type, optional default) — so a string
+      // argument containing the word cannot match.
+      new RegExp(
+        '\\(\\s*(?:(?:\\.\\.\\.)?[\\w$]+(?:\\s*\\??\\s*:\\s*[^,()]+)?(?:\\s*=\\s*[^,()]+)?\\s*,\\s*)*' +
+          n + '\\b(?:\\s*\\??\\s*:[^,()]*)?(?:\\s*=[^,()]*)?(?:\\s*,\\s*[^()]*)?\\)\\s*(?::[^=;{]*)?(?:=>|\\{)'
+      ).test(source) ||
+      new RegExp('(?:^|[^\\w$.])' + n + '\\s*=>').test(source);
+  }
+  memo.set(key, bound);
+  return bound;
+}
+
 /**
  * Try to resolve a reference by exact name match
  */
@@ -404,10 +738,19 @@ export function matchByExactName(
   // unresolved import refs each scored K same-named import candidates through
   // findBestMatch — O(K²) per package, the dominant cost of "Resolving refs" on
   // large import-heavy (front-end + back-end) repos (#915).
+  const bareJs = isBareJsCall(ref, context);
   const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref)
     .filter((n) => n.kind !== 'import')
     // Nested locals are only reachable from inside their container (#1230).
-    .filter((n) => isLexicallyReachable(n, ref, context));
+    .filter((n) => isLexicallyReachable(n, ref, context))
+    // Preserve import ranking; calls reject the winner without promoting another.
+    .filter((n) => ref.referenceKind !== 'imports' || n.filePath === ref.filePath ||
+      !ESM_FAMILY.has(n.language) || !isSealedModule(n.filePath, context))
+    // A receiver-less JS/TS call cannot reach a method (#1714).
+    .filter((n) => !(bareJs && n.kind === 'method'))
+    // A name the file binds itself (a parameter, a const) shadows every other
+    // file's symbol of that name, so a bare call has no cross-file candidate.
+    .filter((n) => !(bareJs && n.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context)));
 
   if (candidates.length === 0) {
     return null;
@@ -415,6 +758,7 @@ export function matchByExactName(
 
   // If only one match, use it — but penalize cross-language matches
   if (candidates.length === 1) {
+    if (!isCrossFileReachable(candidates[0]!, ref, context)) return null;
     const isCrossLanguage = candidates[0]!.language !== ref.language;
     return {
       original: ref,
@@ -435,7 +779,7 @@ export function matchByExactName(
 
   // Multiple matches - try to narrow down
   const bestMatch = findBestMatch(ref, candidates, context);
-  if (bestMatch) {
+  if (bestMatch && isCrossFileReachable(bestMatch, ref, context)) {
     // Lower confidence when the match is from a distant/unrelated module
     const proximity = computePathProximity(ref.filePath, bestMatch.filePath);
     const confidence = proximity >= 30 ? 0.7 : 0.4;
@@ -1299,6 +1643,10 @@ function getInferScanStates(context: ResolutionContext): Map<string, InferScanSt
 /** Drop the per-context scan states (see ReferenceResolver.clearCaches). */
 export function clearNameMatcherMemos(context: ResolutionContext): void {
   INFER_SCAN_STATES.delete(context);
+  C_STATIC_MEMO.delete(context);
+  RUST_TRAIT_IMPL_MEMO.delete(context);
+  SEALED_MODULES.delete(context);
+  LOCAL_BINDING_MEMO.delete(context);
 }
 
 function memoPatterns(key: string, build: () => RegExp[]): RegExp[] {
@@ -2246,6 +2594,30 @@ function matchRustSelfFieldCall(
 }
 
 /**
+ * The one fallback a TS/JS/Python call-receiver chain keeps (#1683): a STORE
+ * ACCESSOR. Zustand's `get()` inside the store factory and
+ * `useStore.getState()` outside it hand back the store whose actions are
+ * indexed as functions (#1573), so a unique callable of the method's name in
+ * the same language family is what `get().reset()` reaches. Nothing else
+ * qualifies: a chain rooted in a project value still says nothing about what
+ * the inner call RETURNS — `db.prepare(sql).all()` would bind to any project
+ * function named `all` — so it resolves to nothing, exactly like a chain
+ * rooted in a parameter (`d.setdefault(k, []).append(v)`).
+ */
+function matchStoreAccessorChain(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const m = ref.referenceName.match(/^([\w$.]+)\(\)\.(\w+)$/);
+  if (!m || !m[1] || !m[2]) return null;
+  const inner = m[1];
+  const method = m[2];
+  if (!(inner === 'get' || inner === 'getState' || inner.endsWith('.getState'))) return null;
+  const callables = context
+    .getNodesByName(method)
+    .filter((n) => (n.kind === 'function' || n.kind === 'method') && sameLanguageFamily(n.language, ref.language) && n.id !== ref.fromNodeId);
+  if (callables.length !== 1) return null;
+  return { original: ref, targetNodeId: callables[0]!.id, confidence: 0.6, resolvedBy: 'exact-match' };
+}
+
+/**
  * Split a camelCase or PascalCase string into words.
  */
 function splitCamelCase(str: string): string[] {
@@ -2412,13 +2784,29 @@ export function matchFuzzy(
 
   // Filter to callable kinds only (function, method, class)
   const callableKinds = new Set(['function', 'method', 'class']);
-  const callableCandidates = applyLanguageGate(candidates.filter((n) => callableKinds.has(n.kind)), ref);
+  const callableCandidates = applyLanguageGate(
+    candidates.filter((n) => callableKinds.has(n.kind)),
+    ref
+  );
 
   // Prefer same-language matches
   const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);
   const finalCandidates = sameLanguageCandidates.length > 0 ? sameLanguageCandidates : callableCandidates;
 
-  if (finalCandidates.length === 1) {
+  // Both post-pipeline visibility guards (#1745 language-local + #1719 sealed
+  // module). The sealed-module test rejects the survivor and never filters the
+  // set that produced it: removing a sealed candidate from a crowd would leave
+  // a lone one and manufacture a 0.5 guess out of an ambiguity fuzzy declines.
+  // Also decline a bare JS/TS call whose only survivor is a method or a
+  // cross-file name the file already binds locally (#1714).
+  if (
+    finalCandidates.length === 1 &&
+    isVisibleAcrossFiles(finalCandidates[0]!, ref, context) &&
+    isCrossFileReachable(finalCandidates[0]!, ref, context) &&
+    !(isBareJsCall(ref, context) &&
+      (finalCandidates[0]!.kind === 'method' ||
+        (finalCandidates[0]!.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context))))
+  ) {
     const isCrossLanguage = finalCandidates[0]!.language !== ref.language;
     return {
       original: ref,
@@ -2642,6 +3030,19 @@ export function matchReference(
   ) {
     result = nmTimed('dottedChain', ref, () => matchDottedCallChain(ref, context));
     if (result) return result;
+  }
+
+  // A call-receiver chain the extractor encoded as `<inner>().<method>` for a
+  // language with no chain resolver above (TS/JS, Python — #1683) is a
+  // receiver whose type is unknown. Nothing below may guess for it: the
+  // method-call pattern rejects the parens, exact name never matches, but the
+  // fuzzy strategy splits on `.` and would hand `make().run` to any `run` —
+  // the fabricated edge the encoding exists to prevent.
+  if (
+    ref.referenceName.includes('().') &&
+    (ref.language === 'typescript' || ref.language === 'javascript' || ref.language === 'tsx' || ref.language === 'jsx' || ref.language === 'python')
+  ) {
+    return nmTimed('storeAccessorChain', ref, () => matchStoreAccessorChain(ref, context));
   }
 
   // 2. Method call pattern
