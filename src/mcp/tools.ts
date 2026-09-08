@@ -32,6 +32,7 @@ import {
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
 import { isTestFile, normalizeNameToken } from '../search/query-utils';
+import { groupDefinitions, lastQualifierPart, matchesSymbol } from '../graph/symbol-lookup';
 import { extractQueryPaths, queryMightContainPaths } from '../search/query-paths';
 import {
   existsSync,
@@ -44,8 +45,6 @@ import { guardLabel, guardsForFileSync, siteKey, supportsBranchGuards, warmBranc
 import { findDynamicBoundaries, type BoundarySite } from '../graph/dynamic-boundary-report';
 import { countImplementers } from '../graph/type-hierarchy';
 import {
-  lastQualifierPart,
-  matchesSymbol,
   findAllSymbols,
   resolveNamedSymbolFlow,
 } from '../graph/named-symbol-flow';
@@ -2350,27 +2349,7 @@ export class ToolHandler {
     nodes: Node[],
     fileFilter: string | undefined
   ): { groups: Node[][]; filteredOut: boolean } {
-    let pool = nodes;
-    let filteredOut = false;
-    if (fileFilter) {
-      const wanted = fileFilter.replace(/^\.\//, '');
-      const narrowed = pool.filter(
-        (n) => n.filePath === wanted || n.filePath.endsWith(wanted) || n.filePath.endsWith(`/${wanted}`)
-      );
-      if (narrowed.length > 0) {
-        pool = narrowed;
-      } else {
-        filteredOut = true;
-      }
-    }
-    const byDef = new Map<string, Node[]>();
-    for (const n of pool) {
-      const key = `${n.filePath}|${n.qualifiedName}`;
-      const group = byDef.get(key);
-      if (group) group.push(n);
-      else byDef.set(key, [n]);
-    }
-    return { groups: [...byDef.values()], filteredOut };
+    return groupDefinitions(nodes, fileFilter);
   }
 
   /** Section heading for one distinct definition in grouped output. */
@@ -2797,9 +2776,16 @@ export class ToolHandler {
         const synthSeen = new Set<string>();
         for (const n of [...named.values(), ...dynNamed.values()]) {
           if (synthLines.length >= 6) break;
-          for (const { node: other, edge } of [...cg.getCallers(n.id), ...cg.getCallees(n.id)]) {
+          // RAW edges for the same reason as hasHeuristicEdge above — a static
+          // edge over the same pair hides the synthesized one from getCallers.
+          const incident = [...cg.getIncomingEdges(n.id), ...cg.getOutgoingEdges(n.id)];
+          for (const edge of incident) {
             if (synthLines.length >= 6) break;
-            if (edge.provenance !== 'heuristic' || other.id === n.id) continue;
+            if (edge.provenance !== 'heuristic') continue;
+            const otherId = edge.source === n.id ? edge.target : edge.source;
+            if (otherId === n.id) continue;
+            const other = cg.getNode(otherId);
+            if (!other) continue;
             if (skipInChain && skipInChain(edge)) continue;
             const src = edge.source === n.id ? n : other;
             const tgt = edge.source === n.id ? other : n;
@@ -6869,7 +6855,7 @@ export class ToolHandler {
    */
   /**
    * Check if a node matches a symbol query — see `matchesSymbol` in
-   * `../graph/named-symbol-flow`, which owns the rules.
+   * `../graph/symbol-lookup`, which owns the rules.
    */
   private matchesSymbol(node: Node, symbol: string): boolean {
     return matchesSymbol(node, symbol);

@@ -362,6 +362,13 @@ export class CfmlExtractor {
         .filter((e) => e.kind === 'contains' && e.source === innerFileNodeId)
         .map((e) => e.target)
     );
+    // Snippet-top-level non-callables: `var x = …` locals of the enclosing
+    // function that the fragment-as-module parse mints as declarations.
+    const localVarIds = new Set(
+      result.nodes
+        .filter((n) => topLevelIds.has(n.id) && (n.kind === 'variable' || n.kind === 'constant'))
+        .map((n) => n.id)
+    );
     for (const node of result.nodes) {
       if (node.kind === 'file') continue;
       node.startLine += startLine;
@@ -391,7 +398,14 @@ export class CfmlExtractor {
       // top-level script in a .cfm template, or any statement directly in
       // the snippet body) attribute to the filtered-out snippet file node by
       // default — redirect those (and any genuinely unset ones) to parentId.
-      if ((!ref.fromNodeId || ref.fromNodeId === innerFileNodeId) && parentId) ref.fromNodeId = parentId;
+      // Same for a snippet-top-level `var x = helper()`: the inner extractor
+      // parses the fragment as a whole module, so it mints a variable node and
+      // attributes the initializer's calls to it — but this fragment is a
+      // FUNCTION BODY, so `x` is a local and `helper` is the enclosing
+      // function's callee. Snippet-top-level FUNCTIONS keep their own calls.
+      if ((!ref.fromNodeId || ref.fromNodeId === innerFileNodeId || localVarIds.has(ref.fromNodeId)) && parentId) {
+        ref.fromNodeId = parentId;
+      }
       this.unresolvedReferences.push(ref);
     }
     for (const error of result.errors) {

@@ -656,6 +656,18 @@ impl<'t> Walker<'t> {
                 if let (Some(row), Some(t)) = (created, type_node) {
                     self.emit_scala_type_refs(t, row);
                 }
+                // Walk the initializer ATTRIBUTED to the declared symbol
+                // (#693, the Go fix): the hook consumes this subtree and the
+                // dispatcher only fn-ref-scans it, so `val cb = () => target()`
+                // — and even a plain `val x = compute()` — emitted no call edge
+                // at all.
+                if let Some(row) = created {
+                    if let Some(value) = node.child_by_field_name("value") {
+                        self.stack.push(Scope { row, kind, name: name.clone() });
+                        self.visit_body(value);
+                        self.stack.pop();
+                    }
+                }
                 true
             }
             "enum_case_definitions" => {
