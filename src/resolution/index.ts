@@ -2126,8 +2126,22 @@ export class ReferenceResolver {
         // project dependency, not `list.append` (#1681). Without this, the
         // qualified ref never reaches resolveViaImport / resolvePythonModuleMember.
         if (PYTHON_BUILT_IN_METHODS.has(method)) {
+          // A module-scope collection binding is stronger evidence than a
+          // coincidentally matching class name (#1652). Only use this file's
+          // binding: an unrelated module may reuse the receiver for a collection.
+          const isCollection = this.context.getNodesByName(receiver).some((node) =>
+            node.language === 'python' && node.filePath === ref.filePath &&
+            (node.kind === 'variable' || node.kind === 'constant') &&
+            node.qualifiedName === receiver &&
+            /^=\s*(?:[\[{]|(?:dict|list|set|tuple|frozenset)\s*\(|\(\s*\)|\([^()]*,)/.test(node.signature ?? '')
+          );
+          if (isCollection) return true;
+
           const capitalized = receiver.charAt(0).toUpperCase() + receiver.slice(1);
-          const isKnownClass = this.knownNames?.has(capitalized) ?? false;
+          const isKnownClass = this.context.getNodesByName(capitalized).some((node) =>
+            node.language === 'python' &&
+            (node.kind === 'class' || node.kind === 'struct' || node.kind === 'interface')
+          );
           const isProjectModule =
             !isKnownClass && this.isPythonProjectModule(ref, receiver);
           if (!isKnownClass && !isProjectModule) {
@@ -2138,9 +2152,8 @@ export class ReferenceResolver {
       // A bare name colliding with a builtin method (index, get, update, count…)
       // is only a builtin when NOTHING in the codebase declares it. A declared
       // symbol with that exact name — e.g. a Flask/FastAPI view `def index()` or
-      // `def get()` — is a real reference target. Mirrors the knownNames guard on
-      // the dotted branch above; without it, every handler named after a builtin
-      // method silently loses its route→handler edge.
+      // `def get()` — is a real reference target. Without this guard, every
+      // handler named after a builtin method silently loses its route→handler edge.
       if (PYTHON_BUILT_IN_METHODS.has(name) && !this.knownNames?.has(name)) {
         return true;
       }
