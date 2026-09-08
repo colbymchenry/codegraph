@@ -145,7 +145,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Indexing no longer checks whether files outside your project exist. A relative import that points above the project directory (`../../something`) made CodeGraph probe that location on disk while resolving it. Nothing outside the project was ever read, and no such file was ever added to the index or linked to, but the check itself should not have happened — such an import now simply resolves to nothing. Symlinks inside your project that point at code kept elsewhere are unaffected and still index as before. Thanks @ErQrYfkrju. (#1631)
 
-- `codegraph install` now writes Codex's global setup where Codex actually reads it. If you point Codex at a custom profile directory with `CODEX_HOME`, the MCP entry and the instructions block went to `~/.codex` instead — written correctly, and then never read, so CodeGraph silently never loaded for you. `codegraph install --location=local` is unchanged: a project's Codex config still lives beside the project. Thanks @seanchann. (#1627)
+- `codegraph install` now honors `CLAUDE_CONFIG_DIR` and `CODEX_HOME` for global Claude Code and Codex setup so CodeGraph loads in your chosen profile (thanks @seanchann; #1627).
 
 #### Screens, links and navigation
 
