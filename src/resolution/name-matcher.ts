@@ -673,13 +673,17 @@ function isBareJsCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
 const LOCAL_BINDING_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
 
 /**
- * Whether a JS/TS file binds `name` itself — as a `const`/`let`/`var`/
- * `function`/`class` declaration (destructuring included) or as a parameter
- * of a function or arrow. Such a binding shadows every same-named symbol in
+ * Whether a JS/TS file binds `name` itself — as a plain `const`/`let`/`var`/
+ * `function`/`class` declaration or as a parameter of a function or arrow.
+ * A binding that only re-names a same-named member of something defined
+ * elsewhere is NOT one: `const { fetchUser } = useStore.getState()` and
+ * `const setZipUri = useStore((s) => s.setZipUri)` are how a store action
+ * reaches its caller, and the store-action resolution follows exactly those
+ * shapes — treating them as local would drop the `loginFlow → fetchUser`
+ * edge the graph is built to hold. A definition shadows every same-named symbol in
  * other files, so a bare call to it has no cross-file candidate: the
  * `resolve` of `new Promise((resolve, reject) => …)`, a spec's
- * `const transform = await makeTransform()`, a factory's `const now =
- * options.now || (() => new Date())`. None of these is a node the graph
+ * `const transform = await makeTransform()`. Neither is a node the graph
  * holds (a parameter, a const bound to a call result), so without this the
  * matcher hands the call to whichever other file defines the name — and
  * once methods stop being candidates for a bare call (#1714), the function
@@ -699,12 +703,19 @@ function isLocallyBoundJsName(name: string, filePath: string, context: Resolutio
   // `const { name } = require('./m')` / `= await import('./m')` binds an IMPORT,
   // not a shadow: the symbol lives in the other file and the call means it.
   const declRe = new RegExp(
-    '\\b(?:const|let|var)\\s+(?:' + n + '\\b|[{\\[][^;=]*?\\b' + n + '\\b[^;=]*?[}\\]])\\s*(?:=\\s*([^;\\n]*))?',
+    '\\b(?:const|let|var)\\s+' + n + '\\b\\s*(?:=\\s*([^;\\n]*))?',
     'g'
   );
   let bound = false;
+  const reBinding = new RegExp('(?:^|[^\\w$])' + n + '\\b');
   for (const m of source.matchAll(declRe)) {
-    if (!/^\s*(?:await\s+)?(?:require|import)\s*\(/.test(m[1] ?? '')) { bound = true; break; }
+    const init = m[1] ?? '';
+    // `const x = require(…)` is an import; `const setZipUri = useStore((s) =>
+    // s.setZipUri)` picks a same-named member out of something defined
+    // elsewhere. Neither defines the name — the graph's symbol is what it means.
+    if (/^\s*(?:await\s+)?(?:require|import)\s*\(/.test(init) || reBinding.test(init)) continue;
+    bound = true;
+    break;
   }
   if (!bound) {
     bound =
