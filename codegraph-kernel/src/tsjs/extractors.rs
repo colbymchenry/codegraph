@@ -1193,6 +1193,11 @@ impl<'t> Walker<'t> {
                         } else {
                             callee_name = method_name.to_string();
                         }
+                    } else if let Some(field) = receiver.and_then(|r| self.this_field_of(r)) {
+                        // `this.<field>.<method>()` — keep the field so the
+                        // resolver can read its declared type (#1496). Mirrors
+                        // TreeSitterExtractor.extractCall.
+                        callee_name = format!("this.{field}.{method_name}");
                     } else if let Some(r) = receiver.filter(|r| r.kind() == "call_expression") {
                         // Call receiver — `make().run()` (#1683): keep the inner
                         // callee as `<inner>().<method>`, or emit nothing when it
@@ -1222,6 +1227,19 @@ impl<'t> Walker<'t> {
     }
 
     // --- extractInstantiation -----------------------------------------------------------
+
+    /// `this.<field>` as a member_expression receiver → Some(field) (#1496).
+    fn this_field_of(&self, receiver: Node<'t>) -> Option<String> {
+        if receiver.kind() != "member_expression" {
+            return None;
+        }
+        let object = receiver.child_by_field_name("object")?;
+        let property = receiver.child_by_field_name("property")?;
+        if object.kind() != "this" || property.kind() != "property_identifier" {
+            return None;
+        }
+        Some(self.text(property).to_string())
+    }
 
     /// The callee of a call-expression receiver when it is a plain identifier
     /// or member chain (`make`, `d.setdefault`), whitespace stripped (#1683).
