@@ -96,15 +96,36 @@ describe('CG-28 — a declaration-only file does not outrank implementation on a
     if (testDir && fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
   });
 
+  /**
+   * Type-level for the purposes of this gate: a type declaration, or a member
+   * an interface declares.
+   *
+   * The second half is not a loosening. Since #1638 a `method_signature` /
+   * `property_signature` is indexed as a `method` / `property` node, so a file
+   * of nothing but interfaces no longer reads as nothing but `interface` kinds
+   * — but a bodiless signature is on the same side of the line as the interface
+   * that owns it, which is exactly how `getAmbientDeclarationPathsAmong` counts
+   * it. What this still catches, and is here to catch, is a `function` or a
+   * `class` creeping into the fixture: that would silently exempt the file and
+   * make every assertion below vacuous.
+   */
+  const isTypeLevel = (n: { id: string; kind: string }, filePath: string): boolean => {
+    if (n.kind === 'interface' || n.kind === 'type_alias') return true;
+    if (n.kind !== 'method' && n.kind !== 'property') return false;
+    const interfaceIds = new Set(
+      cg.getNodesInFile(filePath).filter((x) => x.kind === 'interface').map((x) => x.id),
+    );
+    return cg.getIncomingEdges(n.id)
+      .some((e) => e.kind === 'contains' && interfaceIds.has(e.source));
+  };
+
   describe('fixture shape — if this rots, the gate below means nothing', () => {
     it('holds two declaration-only files that differ only in the banner', () => {
       for (const p of [HANDWRITTEN_DECL, GENERATED_DECL]) {
         const nodes = cg.getNodesInFile(p).filter((n) => n.kind !== 'file' && n.kind !== 'import');
         expect(nodes.length, `${p} declares nothing`).toBeGreaterThan(10);
-        // Every symbol type-level, nothing with a body — the structural test the
-        // penalty keys on. A `function`/`class` creeping in would silently exempt
-        // the file and make every assertion below vacuous.
-        expect(nodes.every((n) => n.kind === 'interface' || n.kind === 'type_alias'), `${p} has a non-type symbol`).toBe(true);
+        // Nothing with a body — the structural test the penalty keys on.
+        expect(nodes.every((n) => isTypeLevel(n, p)), `${p} has a non-type symbol`).toBe(true);
       }
       // Only one of them announces itself, so the CG-25 penalty is the ONLY
       // difference between the two — that is what makes them comparable.
@@ -119,7 +140,7 @@ describe('CG-28 — a declaration-only file does not outrank implementation on a
       // structure of any answer about that code.
       const nodes = cg.getNodesInFile(SHARED_TYPES).filter((n) => n.kind !== 'file' && n.kind !== 'import');
       expect(nodes.length).toBeGreaterThan(0);
-      expect(nodes.every((n) => n.kind === 'interface' || n.kind === 'type_alias')).toBe(true);
+      expect(nodes.every((n) => isTypeLevel(n, SHARED_TYPES))).toBe(true);
       expect(cg.getFile(SHARED_TYPES)?.generated).toBeFalsy();
     });
 
@@ -175,6 +196,23 @@ describe('CG-28 — a declaration-only file does not outrank implementation on a
       const isAmbient = cg.ambientDeclarationFilePredicate([SHARED_TYPES, HANDWRITTEN_DECL]);
       expect(isAmbient(SHARED_TYPES)).toBe(false);
       expect(isAmbient(HANDWRITTEN_DECL)).toBe(true);
+    });
+
+    it('still flags a shim whose interfaces now contribute method/property nodes', () => {
+      // The silent-failure guard for #1638. Interface members are indexed, so a
+      // pure-interface `.d.ts` no longer holds only `interface` kinds — and the
+      // ambient rule is spelled as "EVERY declared symbol is type-level". Read
+      // literally that stops flagging the moment the extractor improves, and
+      // nothing else fails: the file just quietly ranks undamped again.
+      //
+      // Pinned from both ends on purpose. The `toBeGreaterThan(0)` half is what
+      // keeps the other half honest — assert only the flag and this test would
+      // still pass on an index where the members were never extracted at all,
+      // which is precisely the state it exists to detect a regression FROM.
+      const members = cg.getNodesInFile(HANDWRITTEN_DECL)
+        .filter((n) => n.kind === 'method' || n.kind === 'property');
+      expect(members.length, 'interface members are not indexed — see #1638').toBeGreaterThan(0);
+      expect(cg.ambientDeclarationFilePredicate([HANDWRITTEN_DECL])(HANDWRITTEN_DECL)).toBe(true);
     });
   });
 
