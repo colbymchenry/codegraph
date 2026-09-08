@@ -222,6 +222,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 #### Symbols, tests and the viewer
 
 - `codegraph affected` now recognises every ecosystem's test files — Go `foo_test.go`, Python `test_foo.py`, JVM `FooTest.kt` and the rest — instead of only `.test.`/`.spec.` names, so it stops reporting "no tests affected" for projects that have them. (#1507)
+- Imports from Node built-ins or npm packages no longer connect to unrelated type members with matching names; re-index after upgrading to clear existing false dependencies. Thanks @ctype-lab. (#1537)
+
+- Inheritance relationships no longer attach external Rust or npm supertypes to unrelated local symbols with the same name, including in Svelte, Vue and Astro components; re-index after upgrading to clear existing false relationships. Thanks @ctype-lab. (#1536)
+
 - PHP static calls through imported class aliases now reach the correct class when services and repositories share method names, so callers and impact analysis show the right dependencies after re-indexing. (#1545)
 - TypeScript/JavaScript: a call through a field of the enclosing class — `this.mailer.send()` — now resolves on the field's declared type, so a delegating wrapper that shares the method's name no longer records itself as its own callee and `callers`, `impact` and trace stop lying on that shape. A field whose type is external or a builtin stays unresolved rather than guessed. Re-index after upgrading. (#1496)
 - TypeScript and JavaScript collection calls through local variables and their nested properties no longer link to unrelated project methods; re-index after upgrading. (#1566)
