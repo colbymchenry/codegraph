@@ -41,6 +41,15 @@ export interface WorkspacePackages {
    * list). Absent for npm/pnpm members (their index conventions cover it).
    */
   entryByName?: Map<string, string>;
+  /**
+   * Package names declared with a `link:` or `file:` specifier in the root or
+   * any member manifest (`"@vitest/bundled-lib": "link:./bundled-lib"`). Such
+   * a package lives in the project but need not sit under a workspace glob,
+   * so {@link resolveWorkspaceImport} cannot see it — this set exists only so
+   * a caller can tell that the NAME is project-local, and deliberately carries
+   * no directory, since resolving these is a separate change.
+   */
+  localLinkNames?: Set<string>;
 }
 
 /**
@@ -55,13 +64,24 @@ export interface WorkspacePackages {
 export function loadWorkspacePackages(projectRoot: string): WorkspacePackages | null {
   const byName = new Map<string, string>();
 
+  const memberDirs: string[] = [];
   const patterns = readWorkspaceGlobs(projectRoot);
   for (const pattern of patterns) {
     for (const dir of expandWorkspaceGlob(projectRoot, pattern)) {
+      memberDirs.push(dir);
       const pkgName = readPackageName(path.join(projectRoot, dir));
       // First declaration wins — workspace patterns are tried in order.
       if (pkgName && !byName.has(pkgName)) byName.set(pkgName, dir);
     }
+  }
+
+  // A member may depend on a package that is inside the project but outside
+  // every workspace glob (vitest's `test/browser` declares `"@vitest/
+  // bundled-lib": "link:./bundled-lib"`, and the globs stop at `test/*`).
+  // Reading each manifest we already opened for its name costs nothing more.
+  const localLinkNames = new Set<string>();
+  for (const dir of ['', ...memberDirs]) {
+    for (const dep of readLinkDepNames(path.join(projectRoot, dir))) localLinkNames.add(dep);
   }
 
   // HarmonyOS/OpenHarmony (ArkTS) modular projects: every module's
@@ -77,10 +97,14 @@ export function loadWorkspacePackages(projectRoot: string): WorkspacePackages | 
     if (entry) entryByName.set(name, entry);
   }
 
-  if (byName.size === 0) return null;
+  if (byName.size === 0 && localLinkNames.size === 0) return null;
 
-  logDebug('workspace packages loaded', { count: byName.size });
-  return { byName, entryByName: entryByName.size > 0 ? entryByName : undefined };
+  logDebug('workspace packages loaded', { count: byName.size, linked: localLinkNames.size });
+  return {
+    byName,
+    entryByName: entryByName.size > 0 ? entryByName : undefined,
+    localLinkNames: localLinkNames.size > 0 ? localLinkNames : undefined,
+  };
 }
 
 /**
@@ -311,6 +335,32 @@ function expandWorkspaceGlob(projectRoot: string, pattern: string): string[] {
     out.push(base ? `${base}/${e.name}` : e.name);
   }
   return out;
+}
+
+/**
+ * Dependency names this manifest declares with a `link:` or `file:` specifier
+ * — the two protocols npm, yarn, pnpm and bun all read as "this package is a
+ * directory in the project", so the name is local however much it looks like
+ * a registry package. A missing or malformed manifest contributes nothing.
+ */
+function readLinkDepNames(dirAbs: string): string[] {
+  let pkg: Record<string, unknown>;
+  try {
+    pkg = JSON.parse(fs.readFileSync(path.join(dirAbs, 'package.json'), 'utf-8'));
+  } catch {
+    return [];
+  }
+  const names: string[] = [];
+  for (const field of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']) {
+    const deps = pkg?.[field];
+    if (!deps || typeof deps !== 'object') continue;
+    for (const [name, spec] of Object.entries(deps as Record<string, unknown>)) {
+      if (typeof spec === 'string' && (spec.startsWith('link:') || spec.startsWith('file:'))) {
+        names.push(name);
+      }
+    }
+  }
+  return names;
 }
 
 /** Read the `name` field from a member directory's package.json. */
