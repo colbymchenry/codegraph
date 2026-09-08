@@ -137,6 +137,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- Indexing now warns when parser errors leave a file with no symbols, including C++ raw strings with 16-character delimiters, so missing code is no longer silent. (#1522)
+
+- `codegraph index <path>` now refuses uninitialized paths and names the nearest initialized parent instead of silently rebuilding it; thanks @danusha2345. (#1524, #1689)
+
 - Sync now recovers the same connections as a clean index after interrupted reference resolution, including inherited calls and callbacks that previously stayed missing. (#1577)
 
 - `codegraph_explore` now re-serves source to fresh subagents and after context compaction, with cross-call dedup available only through an explicit `CODEGRAPH_EXPLORE_DEDUP=1` opt-in; thanks @danusha2345. (#1620, #1624)
@@ -224,6 +228,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Saved trails stay inside the indexed project even when a directory or trail file is a symlink.** The viewer refuses paths whose nearest existing directory resolves outside the project, opens trail files without following links and without blocking on a named pipe left in the trails directory, and creates its atomic temporary file exclusively so a pre-planted link cannot capture a read or write.
 
 - **Saved-trail authors are now resolved per project.** An embedded host serving several projects in one process no longer reuses the first repository's Git user name for every later trail.
+- Rust unit structs (`struct Unit;`) and their trait implementation relationships now appear in the graph after re-indexing. (#1513, #1514)
 - Imports from Node built-ins or npm packages no longer connect to unrelated type members with matching names; re-index after upgrading to clear existing false dependencies. Thanks @ctype-lab. (#1537)
 
 - Inheritance relationships no longer attach external Rust or npm supertypes to unrelated local symbols with the same name, including in Svelte, Vue and Astro components; re-index after upgrading to clear existing false relationships. Thanks @ctype-lab. (#1536)
