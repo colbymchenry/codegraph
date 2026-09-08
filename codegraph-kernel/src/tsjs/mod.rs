@@ -60,7 +60,7 @@ fn is_method_type(v: Variant, kind: &str) -> bool {
 }
 
 fn is_function_type(kind: &str) -> bool {
-    matches!(kind, "function_declaration" | "arrow_function" | "function_expression")
+    matches!(kind, "function_declaration" | "generator_function_declaration" | "arrow_function" | "function_expression" | "generator_function")
 }
 
 fn is_class_type(v: Variant, kind: &str) -> bool {
@@ -792,7 +792,7 @@ impl<'t> Walker<'t> {
         if let Some(name_node) = node.child_by_field_name("name") {
             return self.text(name_node).to_string();
         }
-        if matches!(node.kind(), "arrow_function" | "function_expression") {
+        if matches!(node.kind(), "arrow_function" | "function_expression" | "generator_function") {
             return "<anonymous>".to_string();
         }
         for i in 0..node.named_child_count() {

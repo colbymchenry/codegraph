@@ -48,6 +48,7 @@ import {
   tryAcquireDaemonLock,
 } from './daemon';
 import { connectWithHello, runLocalHandshakeProxy } from './proxy';
+import { releaseWriterLock, tryAcquireWriterLock, writerLockHeldMessage } from './writer-lock';
 import { getDaemonSocketCandidates, probeDaemonIdentity } from './daemon-paths';
 import { getTelemetry } from '../telemetry';
 import { checkForUpdateInBackground } from '../upgrade/update-check';
@@ -252,6 +253,8 @@ export class MCPServer {
   // Idempotency guard for stop().
   private stopped = false;
   private mode: 'unstarted' | 'direct' | 'proxy' | 'daemon' = 'unstarted';
+  /** Project root whose writer.pid we hold in direct mode (#1740); released on stop. */
+  private writerLockRoot: string | null = null;
 
   constructor(projectPath?: string) {
     this.projectPath = projectPath || null;
@@ -329,6 +332,10 @@ export class MCPServer {
   stop(): void {
     if (this.stopped) return;
     this.stopped = true;
+    if (this.writerLockRoot) {
+      releaseWriterLock(this.writerLockRoot);
+      this.writerLockRoot = null;
+    }
     if (this.ppidWatchdog) {
       clearInterval(this.ppidWatchdog);
       this.ppidWatchdog = null;
@@ -358,6 +365,20 @@ export class MCPServer {
     if (reason && process.env.CODEGRAPH_MCP_DEBUG) {
       process.stderr.write(`[CodeGraph MCP] Direct mode: ${reason}.\n`);
     }
+
+    // #1740: refuse a second direct writer on an initialized project. Daemon
+    // mode multiplexes clients; direct mode is single-writer-per-project.
+    const writerRoot = resolveDaemonRoot(this.projectPath);
+    if (writerRoot) {
+      const writer = tryAcquireWriterLock(writerRoot, 'direct');
+      if (writer.kind === 'taken') {
+        const msg = writerLockHeldMessage(writer.existing, writer.pidPath);
+        process.stderr.write(`[CodeGraph MCP] ${msg}\n`);
+        process.exit(1);
+      }
+      this.writerLockRoot = writerRoot;
+    }
+
     this.engine = new MCPEngine();
     const transport = new StdioTransport();
     this.session = new MCPSession(transport, this.engine, {
