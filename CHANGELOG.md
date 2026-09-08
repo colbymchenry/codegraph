@@ -135,6 +135,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- **A Kotlin `private val` / `private var` no longer captures calls from other files.** Properties were indexed without their visibility modifier, so the file-local rule that already declines a `private fun` read every property as public: an Android app's `token(...)` validator resolved onto another class's `@Volatile private var token`, and JavaScript, Go and Python callers landed on Kotlin test fixtures' private fields. Both the WebAssembly and the native path now record `private` / `internal` / `protected` on properties. Re-index after upgrading. (#1731)
 #### MCP / indexing
 
 - **Watcher scope now matches `git ls-files --exclude-standard` (#1728).** `buildDefaultIgnore` / `buildScopeIgnore` read `.git/info/exclude` and `core.excludesFile` (not only the root `.gitignore`), and seed directories git reports as ignored-untracked so nested `.gitignore` effects prune the live watcher the same way the indexer skips them. Single-file auto-sync was already incremental (`pendingFiles` → scoped `sync({ paths })`); the remaining gap was watching trees git had excluded.

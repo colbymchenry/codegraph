@@ -3,6 +3,21 @@ import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
 /** Kotlin return types that can't be a chained-call receiver (no class to chain on). */
+/** The visibility a Kotlin declaration's `modifiers` child spells out; public by default. */
+function kotlinVisibility(node: { childCount: number; child(i: number): { type: string; text: string } | null }): 'public' | 'private' | 'protected' | 'internal' {
+  for (let i = 0; i < node.childCount; i++) {
+    const child = node.child(i);
+    if (child?.type === 'modifiers') {
+      const text = child.text;
+      if (text.includes('public')) return 'public';
+      if (text.includes('private')) return 'private';
+      if (text.includes('protected')) return 'protected';
+      if (text.includes('internal')) return 'internal';
+    }
+  }
+  return 'public';
+}
+
 const KOTLIN_NON_CLASS_RETURN = new Set(['Unit', 'Nothing']);
 
 /**
@@ -126,7 +141,10 @@ export const kotlinExtractor: LanguageExtractor = {
       const sig = typeNode
         ? `${isVal ? 'val' : 'var'} ${name}: ${getNodeText(typeNode, ctx.source)}`
         : undefined;
-      ctx.createNode(kind, name, node, { signature: sig });
+      // `private val` / `internal var` at class or object scope: the modifier
+      // decides who can name it from another file (#1731's Kotlin rule reads
+      // `visibility`, and a property without one read as public).
+      ctx.createNode(kind, name, node, { signature: sig, visibility: kotlinVisibility(node) });
       return true;
     }
 
@@ -285,20 +303,7 @@ export const kotlinExtractor: LanguageExtractor = {
     }
     return sig;
   },
-  getVisibility: (node) => {
-    // Check for visibility modifiers in Kotlin
-    for (let i = 0; i < node.childCount; i++) {
-      const child = node.child(i);
-      if (child?.type === 'modifiers') {
-        const text = child.text;
-        if (text.includes('public')) return 'public';
-        if (text.includes('private')) return 'private';
-        if (text.includes('protected')) return 'protected';
-        if (text.includes('internal')) return 'internal';
-      }
-    }
-    return 'public'; // Kotlin defaults to public
-  },
+  getVisibility: (node) => kotlinVisibility(node),
   isStatic: (_node) => {
     // Kotlin doesn't have static, uses companion objects
     return false;
