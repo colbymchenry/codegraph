@@ -220,6 +220,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 #### Symbols, tests and the viewer
 
 - `codegraph index <path>` now rebuilds exactly the project you name. A path without an index of its own used to be silently resolved to the nearest initialized parent — a monorepo container, an ancestor with a stale index — and rebuilt under a normal "Done"; it is now an error that names that parent and how to index the path on its own. (#1524)
+- TypeScript/JavaScript: a call through a field of the enclosing class — `this.mailer.send()` — now resolves on the field's declared type, so a delegating wrapper that shares the method's name no longer records itself as its own callee and `callers`, `impact` and trace stop lying on that shape. A field whose type is external or a builtin stays unresolved rather than guessed. Re-index after upgrading. (#1496)
 - TypeScript and JavaScript collection calls through local variables and their nested properties no longer link to unrelated project methods; re-index after upgrading. (#1566)
 
 - Objective-C headers now index in a project that has no `.m` file. A `.h` file is read as C from its name alone, and only later — once its contents are read — recognized as Objective-C; the grammar for that was never loaded up front, so the file failed with a parser error and nothing in it reached the index. Adding any `.m` file used to make the same header work, which is what made this look arbitrary. Thanks @Juddd. (#1628)
