@@ -55,6 +55,7 @@ import {
   getDaemonSocketPath,
 } from './daemon-paths';
 import { CodeGraphPackageVersion } from './version';
+import { releaseWriterLock, tryAcquireWriterLock, writerLockHeldMessage } from './writer-lock';
 import { registerDaemon, deregisterDaemon } from './daemon-registry';
 
 /** Default idle linger after the last client disconnects. */
@@ -204,6 +205,16 @@ export class Daemon {
    * listening — the daemon then sticks around until idle/shutdown.
    */
   async start(): Promise<DaemonStartResult> {
+    // #1740: claim the project writer lock before opening/watching so a
+    // concurrent direct-mode serve --mcp cannot start a second watcher.
+    const writer = tryAcquireWriterLock(this.projectRoot, 'daemon');
+    if (writer.kind === 'taken') {
+      const msg = writerLockHeldMessage(writer.existing, writer.pidPath);
+      process.stderr.write(`[CodeGraph daemon] ${msg}\n`);
+      this.cleanupLockfile();
+      throw new Error(msg);
+    }
+
     // Engine init is deliberately backgrounded — see #172. The first session
     // to land waits on `ensureInitialized` either way, and unloaded sessions
     // (cross-project tool calls only) shouldn't pay any open cost.
@@ -498,6 +509,7 @@ export class Daemon {
   }
 
   private cleanupLockfile(): void {
+    releaseWriterLock(this.projectRoot);
     try {
       if (fs.existsSync(this.pidPath)) {
         // Only remove if it still belongs to us — another daemon may have
