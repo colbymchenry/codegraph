@@ -109,6 +109,18 @@ describe('Kotlin: a private property is class- or file-local too', () => {
   });
 });
 
+describe('Kotlin: a member of a private class is not visible either', () => {
+  it('declines a call onto a public fun of another file\'s private class', async () => {
+    // `clock`'s type is unknown here, so only the method name picks a target.
+    // Not a test file: production code never reaches a test suite's symbol anyway.
+    project({
+      'Coordinator.kt': 'class Coordinator {\n    private class Clock(var value: Long) { fun now() = value }\n}\n',
+      'Gimbal.kt': 'class Gimbal {\n    fun dispatchSpeed() {\n        val clock = provide()\n        val timestamp = clock.now()\n    }\n}\n',
+    });
+    expect(await calleesOf('dispatchSpeed')).not.toContain('Coordinator.kt:now');
+  });
+});
+
 describe('Go: an unexported identifier is package-local', () => {
   it('does not resolve a call onto an unexported func in another package', async () => {
     project({

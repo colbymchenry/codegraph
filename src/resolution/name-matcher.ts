@@ -1559,6 +1559,38 @@ function isSfcPrivate(n: Node, context: ResolutionContext): boolean {
   return true;
 }
 
+/** Per-context memo: node id → "this member sits inside a `private` class/object". */
+const PRIVATE_OWNER_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/** Kinds that own members and carry a visibility of their own. */
+const OWNER_KINDS = new Set<string>(['class', 'interface', 'struct', 'enum', 'namespace']);
+
+/**
+ * Whether `candidate` is a member of a `private` type in its file — a Kotlin
+ * test's `private class Clock { fun now() = value }`: the method is public,
+ * the class is not, so nothing outside the file can name `now`. Found by
+ * line range among the file's own nodes, memoised per node.
+ */
+function isInsidePrivateType(candidate: Node, context: ResolutionContext): boolean {
+  let memo = PRIVATE_OWNER_MEMO.get(context);
+  if (!memo) {
+    memo = new Map();
+    PRIVATE_OWNER_MEMO.set(context, memo);
+  }
+  const hit = memo.get(candidate.id);
+  if (hit !== undefined) return hit;
+  const inside = context.getNodesInFile(candidate.filePath).some(
+    (n) =>
+      n.id !== candidate.id &&
+      OWNER_KINDS.has(n.kind) &&
+      n.visibility === 'private' &&
+      n.startLine <= candidate.startLine &&
+      n.endLine >= candidate.endLine
+  );
+  memo.set(candidate.id, inside);
+  return inside;
+}
+
 /**
  * Whether `candidate` can be NAMED from a reference in `ref`'s file at all,
  * given what its language says about the definition's visibility. A
@@ -1647,7 +1679,9 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
     const owner = rustModuleDir(candidate.filePath);
     return ref.filePath.startsWith(owner + '/');
   }
-  if (PRIVATE_IS_FILE_LOCAL.has(lang)) return candidate.visibility !== 'private';
+  if (PRIVATE_IS_FILE_LOCAL.has(lang)) {
+    return candidate.visibility !== 'private' && !isInsidePrivateType(candidate, context);
+  }
   // An R test file runs in an environment of its own (testthat): its top-level
   // `c <- ggplot(…)` is not what the package's 2,843 `c(…)` calls mean. The
   // `helper-*.R` / `setup-*.R` files are sourced for every test, so theirs are shared.
@@ -6147,6 +6181,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   JAVA_STATIC_IMPORTS.delete(context);
   PY_IMPORTS.delete(context);
   PY_MODULE_LOCAL.delete(context);
+  PRIVATE_OWNER_MEMO.delete(context);
   SEALED_MODULES.delete(context);
   LOCAL_BINDING_MEMO.delete(context);
   LOCAL_BINDING_SITES.delete(context);
