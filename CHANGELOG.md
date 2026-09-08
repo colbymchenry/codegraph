@@ -224,6 +224,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Saved trails stay inside the indexed project even when a directory or trail file is a symlink.** The viewer refuses paths whose nearest existing directory resolves outside the project, opens trail files without following links and without blocking on a named pipe left in the trails directory, and creates its atomic temporary file exclusively so a pre-planted link cannot capture a read or write.
 
 - **Saved-trail authors are now resolved per project.** An embedded host serving several projects in one process no longer reuses the first repository's Git user name for every later trail.
+- Imports from Node built-ins or npm packages no longer connect to unrelated type members with matching names; re-index after upgrading to clear existing false dependencies. Thanks @ctype-lab. (#1537)
+
+- Inheritance relationships no longer attach external Rust or npm supertypes to unrelated local symbols with the same name, including in Svelte, Vue and Astro components; re-index after upgrading to clear existing false relationships. Thanks @ctype-lab. (#1536)
+
 - PHP static calls through imported class aliases now reach the correct class when services and repositories share method names, so callers and impact analysis show the right dependencies after re-indexing. (#1545)
 - TypeScript/JavaScript: a call through a field of the enclosing class — `this.mailer.send()` — now resolves on the field's declared type, so a delegating wrapper that shares the method's name no longer records itself as its own callee and `callers`, `impact` and trace stop lying on that shape. A field whose type is external or a builtin stays unresolved rather than guessed. Re-index after upgrading. (#1496)
 - TypeScript and JavaScript collection calls through local variables and their nested properties no longer link to unrelated project methods; re-index after upgrading. (#1566)
