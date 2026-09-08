@@ -2316,6 +2316,87 @@ func main() {
   });
 
   describe('Local-variable receiver-type inference (#1108)', () => {
+    it.each(['ts', 'tsx', 'js', 'jsx'])('keeps built-in Map calls off project methods — %s (#1566)', async (ext) => {
+      const typed = ext === 'ts' || ext === 'tsx';
+      fs.writeFileSync(path.join(tempDir, `cache.${ext}`), `
+export class LRUCache {
+  get(key) { return key; }
+  set(key, value) { return value; }
+  has(key) { return true; }
+}
+export function useLocalMap() {
+  const values = new Map${typed ? '<string, string>' : ''}();
+  values.set('answer', '42');
+  values.get('answer');
+  return values.has('answer');
+}
+export function useNestedMap(holder${typed ? ': { values: Map<string, string> }' : ''}) {
+  return holder.values.get('answer');
+}
+export function useProjectCache() {
+  const cache = new LRUCache();
+  cache.set('answer', '42');
+  cache.get('answer');
+  return cache.has('answer');
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      for (const name of ['useLocalMap', 'useNestedMap', 'useProjectCache']) {
+        const caller = cg.getNodesByName(name).find((n) => n.kind === 'function');
+        expect(caller, name).toBeDefined();
+        const calls = cg.getOutgoingEdges(caller!.id).filter((e) => e.kind === 'calls');
+        if (name === 'useProjectCache') {
+          const methods = cg.getNodesByKind('method').filter((n) => n.qualifiedName.startsWith('LRUCache::'));
+          expect(methods).toHaveLength(3);
+          expect(calls.map((e) => e.target).sort()).toEqual(methods.map((n) => n.id).sort());
+          expect(calls.every((e) => e.metadata?.confidence === 0.9)).toBe(true);
+        } else {
+          expect.soft(calls, `${ext}: ${name} must not call a project method`).toEqual([]);
+        }
+      }
+    });
+
+    it('keeps a validated project class that shadows Map (#1566)', async () => {
+      fs.writeFileSync(path.join(tempDir, 'shadow.ts'), `
+export class Map { get() { return 1; } }
+export class Other { get() { return 2; } }
+export function useShadow() {
+  const values = new Map();
+  return values.get();
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const caller = cg.getNodesByName('useShadow').find((n) => n.kind === 'function');
+      expect(caller).toBeDefined();
+      expect(cg.getCallees(caller!.id).filter(({ edge }) => edge.kind === 'calls').map(({ node }) => node.qualifiedName))
+        .toEqual(['Map::get']);
+    });
+
+    it.each([
+      ['Set', 'has'], ['WeakMap', 'get'], ['WeakSet', 'has'], ['Array', 'map'], ['Promise', 'then'],
+    ])('declines same-name guesses for an inferred %s receiver (#1566)', async (type, method) => {
+      fs.writeFileSync(path.join(tempDir, 'builtin.ts'), `
+export class Collision { ${method}() { return 1; } }
+export function constructed() {
+  const values = new ${type}();
+  return values.${method}();
+}
+export function annotated(values: ${type}<string>) {
+  return values.${method}();
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+      expect(cg.getNodesByKind('method').some((n) => n.name === method)).toBe(true);
+      for (const name of ['constructed', 'annotated']) {
+        const caller = cg.getNodesByName(name).find((n) => n.kind === 'function');
+        expect(caller, name).toBeDefined();
+        expect.soft(cg.getOutgoingEdges(caller!.id).filter((e) => e.kind === 'calls'), name).toEqual([]);
+      }
+    });
+
     // `lg.log()` where `lg` is a local whose type is inferred from its
     // declaration/initializer. Before this, only C++ resolved these; every
     // other language produced no method edge. Each case is one file with a

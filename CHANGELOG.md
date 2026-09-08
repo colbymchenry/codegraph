@@ -219,6 +219,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Symbols, tests and the viewer
 
+- TypeScript and JavaScript collection calls through local variables and their nested properties no longer link to unrelated project methods; re-index after upgrading. (#1566)
+
 - Objective-C headers now index in a project that has no `.m` file. A `.h` file is read as C from its name alone, and only later — once its contents are read — recognized as Objective-C; the grammar for that was never loaded up front, so the file failed with a parser error and nothing in it reached the index. Adding any `.m` file used to make the same header work, which is what made this look arbitrary. Thanks @Juddd. (#1628)
 
 - TypeScript interface methods and properties are now indexed, so `node`, `callers` and impact can find platform `.d.ts` APIs while declaration-only files keep their lower ranking on flow queries; re-index TypeScript projects after upgrading. (#1638)

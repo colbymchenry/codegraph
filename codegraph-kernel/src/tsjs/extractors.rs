@@ -1122,15 +1122,10 @@ impl<'t> Walker<'t> {
 
     // --- extractCall (TS/JS generic tail) -------------------------------------------------
 
-    /// Whether a member-call receiver is a chain rooted at a host object a
-    /// TS/JS project never declares. `window` is absent on purpose:
-    /// `window.MyNs.doThing()` reaches a project symbol (#1707).
-    fn is_host_global_chain(&self, receiver: Node<'t>) -> bool {
-        const HOST_GLOBAL_ROOTS: [&str; 19] = [
-            "chrome", "browser", "document", "navigator", "performance", "console",
-            "localStorage", "sessionStorage", "indexedDB", "crypto", "globalThis",
-            "process", "Math", "JSON", "Object", "Array", "Reflect", "Promise", "Intl",
-        ];
+    /// Identifier-rooted member chains have no inferred property type (#1566),
+    /// including host API chains (#1707). Keep the existing window namespace
+    /// escape; call-result and `this` receivers are outside this guard.
+    fn is_unresolved_member_chain(&self, receiver: Node<'t>) -> bool {
         let mut cur = receiver;
         if !matches!(cur.kind(), "member_expression" | "subscript_expression") {
             return false;
@@ -1141,7 +1136,7 @@ impl<'t> Walker<'t> {
                 None => return false,
             }
         }
-        cur.kind() == "identifier" && HOST_GLOBAL_ROOTS.contains(&self.text(cur))
+        cur.kind() == "identifier" && self.text(cur) != "window"
     }
 
     pub(super) fn extract_call(&mut self, node: Node<'t>) {
@@ -1171,14 +1166,12 @@ impl<'t> Walker<'t> {
                         if is_literal_receiver(r.kind()) {
                             return;
                         }
-                        // A chain rooted at a host namespace — `chrome.storage
-                        // .local.get(k)`, `document.body.querySelector(s)` —
-                        // ends in a platform API, so the bare method name emitted
-                        // here could only exact-match an unrelated project symbol
-                        // sharing it (#1707). Emit nothing. A chain rooted at a
-                        // project value keeps the bare name. Mirrors the TS
-                        // extractor's extractCall (extraction/tree-sitter.ts).
-                        if self.is_host_global_chain(r) {
+                        // `holder.values.get()` has no inferred property type
+                        // (#1566). Dropping the receiver or merely preserving it
+                        // would allow unrelated same-name method guesses. Emit
+                        // nothing, as for host chains (#1707); argument calls are
+                        // visited independently. Mirrors extractCall in TS.
+                        if self.is_unresolved_member_chain(r) {
                             return;
                         }
                     }
