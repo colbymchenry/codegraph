@@ -49,11 +49,23 @@ handlers = {"recv": target_cb}
 callbacks = [target_cb, view]
 
 
+# --- call receivers (#1683) ---------------------------------------------------
+def bucket_chains(d, k, v):
+    d.setdefault(k, []).append(v)
+    d.items().get(k)
+    make().run()
+    (lambda: make)()().run()
+    obj.make().run().again()
+
+
+# --- non-call, non-identifier receivers (#66) ---------------------------------
 def fabrication_shapes(rows_by_file, key):
-    # Non-identifier receivers (#66): attribute chain, subscript, and call
-    # chain. Each must keep its receiver text as a qualifier — a bare
-    # `append`/`get` exact-matches an unrelated project function of that name.
-    rows_by_file.setdefault(key, []).append({"x": 1})
+    # Attribute chain and subscript. Each must keep its receiver text as a
+    # qualifier — a bare `append`/`get` exact-matches an unrelated project
+    # function of that name. (The call-chain shape lives in bucket_chains
+    # above, which #1748 encodes as `<inner>().<method>` instead.)
+    self_like = rows_by_file
+    self_like.rows.append({"x": 1})
     rows_by_file[key].append(2)
     rows_by_file[key].get(key, None)
     return rows_by_file

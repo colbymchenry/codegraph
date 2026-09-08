@@ -608,10 +608,20 @@ impl<'t> Walker<'t> {
                         } else {
                             callee_name = method_name.to_string();
                         }
+                    } else if let Some(r) = receiver.filter(|r| r.kind() == "call") {
+                        // Call receiver — `d.setdefault(k, []).append(v)` (#1683):
+                        // `<inner>().<method>`, or nothing when the inner callee
+                        // is not a plain name / attribute chain. Mirrors
+                        // TreeSitterExtractor.extractCall.
+                        let Some(inner) = self.plain_inner_callee(r) else { return };
+                        callee_name = format!("{inner}().{method_name}");
                     } else if let Some(r) = receiver {
-                        // Any other receiver shape — attribute chain (`self.data`),
-                        // subscript (`d[k]`), call chain (`rows.setdefault(k, []).append(x)`)
-                        // — used to fall through to a BARE method_name. A bare name
+                        // Any receiver shape the arms above do not claim — attribute
+                        // chain (`self.data.append`) and subscript (`d[k].append`).
+                        // The call-chain shape (`rows.setdefault(k, []).append(x)`)
+                        // is taken by the `<inner>().<method>` arm above (#1748),
+                        // which is matched first.
+                        // These used to fall through to a BARE method_name. A bare name
                         // matching a common list/dict/str method (`append`, `get`,
                         // `update`, ...) exact-matches an unrelated top-level project
                         // function sharing that name, fabricating a call edge (#66,
@@ -645,6 +655,22 @@ impl<'t> Walker<'t> {
             let from = self.top_row();
             self.push_ref_at(from, &callee_name.clone(), edge_kind_index("calls").unwrap(), node);
         }
+    }
+
+    /// The callee of a call receiver when it is a plain identifier or attribute
+    /// chain (`make`, `d.setdefault`), whitespace stripped (#1683).
+    fn plain_inner_callee(&self, call: Node<'t>) -> Option<String> {
+        let inner = call.child_by_field_name("function")?;
+        let text: String = self.text(inner).chars().filter(|c| !c.is_whitespace()).collect();
+        if text.is_empty() {
+            return None;
+        }
+        let ok = text.split('.').all(|seg| {
+            let mut chars = seg.chars();
+            matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+        if ok { Some(text) } else { None }
     }
 
     /// extractDecoratorsFor — python decorators are PRECEDING SIBLINGS inside

@@ -16,7 +16,7 @@ import {
   FrameworkResolver,
   ImportMapping,
 } from './types';
-import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
+import { isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
 import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos, resolveImportPath } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { detectFrameworks } from './frameworks';
@@ -26,6 +26,7 @@ import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { loadGoModule, type GoModule } from './go-module';
 import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
+import { lexicalPathWithinRoot } from '../utils';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
 import { warmBranchGuardGrammars } from '../graph/branch-guards';
@@ -577,8 +578,18 @@ export class ReferenceResolver {
             return true;
           }
         }
-        // Fall back to filesystem for files not yet indexed
-        const fullPath = path.join(this.projectRoot, filePath);
+        // Fall back to filesystem for files not yet indexed. `path.join` does
+        // not clamp, and relative-import resolution hands us paths carrying
+        // `../` segments, so the probe has to be contained (#1631): a path
+        // outside the root can never be an indexed project file, and the
+        // `knownFiles` check above already answered for everything that is.
+        // Lexical containment only: this is a per-candidate hot path, and the
+        // symlink half of `validatePathWithinRoot` costs two `realpathSync`
+        // calls per probe (~70x slower here). It would also be wrong to apply
+        // — indexing deliberately follows in-root symlinks whose targets live
+        // outside the root (#935), so only the `../` escape is refused.
+        const fullPath = lexicalPathWithinRoot(this.projectRoot, filePath);
+        if (fullPath === null) return false;
         try {
           return fs.existsSync(fullPath);
         } catch (error) {
@@ -1025,6 +1036,19 @@ export class ReferenceResolver {
     if (fwEarly) return fwEarly;
 
     // Strategy 2: Try import-based resolution
+    // A TS/JS/Python call-receiver chain (`useStore.getState().reset`, #1683)
+    // names the ROOT's import, not the method's: letting resolveViaImport see
+    // it binds the call to the imported store constant and the method is
+    // never looked up. The name-matcher owns the chain shape for these
+    // languages — the Java/Kotlin/C++ chains keep their existing path.
+    if (
+      ref.referenceKind === 'calls' &&
+      CHAIN_SHAPE.test(ref.referenceName) &&
+      (ref.language === 'typescript' || ref.language === 'javascript' || ref.language === 'tsx' || ref.language === 'jsx' || ref.language === 'python')
+    ) {
+      return this.gateLanguage(matchReference(ref, this.context), ref);
+    }
+
     const tImp = this.profileStages ? process.hrtime.bigint() : 0n;
     const importResult = this.gateLanguage(resolveViaImport(ref, this.context), ref);
     if (this.profileStages) this.stageAdd('viaImport', ref, !!importResult, tImp);
@@ -1063,7 +1087,13 @@ export class ReferenceResolver {
     // binding it happened to pick. Same-file matches only.
     if (nameResult) {
       const target = this.queries.getNodeById(nameResult.targetNodeId);
-      if (ref.language === 'nix') {
+      // A definition its language makes file-local — a C `static`, a Kotlin
+      // `private fun`, a Go unexported name in another package, a Rust
+      // non-`pub` item outside its module subtree — cannot be what a name in
+      // another file means, whichever strategy chose it (#1730).
+      if (target && !isVisibleAcrossFiles(target, ref, this.context)) {
+        nameResult = null;
+      } else if (ref.language === 'nix') {
         if (!target || target.filePath !== ref.filePath) {
           nameResult = null;
         }
@@ -2043,25 +2073,19 @@ export class ReferenceResolver {
   }
 
   /**
-   * Check if reference is to a built-in or external symbol
-   */
-  /**
    * True when `receiver` is a local name bound by an import that resolves to a
    * file IN THIS PROJECT — the only case where letting a python
-   * built-in-method name through the filter is safe (#66).
+   * built-in-method name through the filter is safe (#1681).
    *
-   * The first version of this escape asked only whether SOME import bound the
-   * local name. Every import produces a mapping, stdlib and PyPI included, so
-   * it was also true for `os`, `requests`, `np`. That opened the filter for
-   * them; `resolveViaImport` then found no project file, resolution fell
-   * through to the bare-name strategy, and `os.remove(p)` bound to whatever
-   * project method happens to be named `remove` — reintroducing, through its
-   * own escape hatch, the fabricated-edge class this filter exists to prevent.
-   * Verified: `import os; import requests` in a project with a `Store.remove`
-   * and a `Store.get` produced two wrong edges where the previous release
-   * produced none.
+   * Asking only whether SOME import bound the local name is not enough: every
+   * import produces a mapping, stdlib and PyPI included, so that would also be
+   * true for `os`, `requests`, `np`. Opening the filter for them lets
+   * resolveViaImport find no project file, fall through to bare-name matching,
+   * and bind `os.remove(p)` to whatever project method happens to be named
+   * `remove` — reintroducing, through its own escape hatch, the fabricated-edge
+   * class this filter exists to prevent.
    *
-   * Resolving the specifier is the same question `resolveViaImport` will ask
+   * Resolving the specifier is the same question resolveViaImport will ask
    * next, so a receiver that passes here is one the qualified path can actually
    * serve; anything else stays a silent miss rather than a wrong edge.
    */
@@ -2084,6 +2108,9 @@ export class ReferenceResolver {
     return false;
   }
 
+  /**
+   * Check if reference is to a built-in or external symbol
+   */
   private isBuiltInOrExternal(ref: UnresolvedRef): boolean {
     const name = ref.referenceName;
     const isJsTs = ref.language === 'typescript' || ref.language === 'javascript'
@@ -2130,15 +2157,28 @@ export class ReferenceResolver {
         // Filter built-in methods on non-class receivers
         // (e.g., items.append where items is a local list variable)
         // But allow if the capitalized receiver matches a known codebase class,
-        // OR the receiver is itself an imported module in this file — a module
-        // can export a top-level function sharing a common collection-method
-        // name (`ledger.append`, `import ledger`/`from . import ledger`), and
-        // that call is a real project dependency, not `list.append` (#66).
-        // Without this, the qualified ref never reaches resolveViaImport /
-        // resolvePythonModuleMember, which already resolves it correctly.
+        // OR the receiver is itself an imported project module — a module can
+        // export a top-level function sharing a common collection-method name
+        // (`ledger.append`, `from . import ledger`), and that call is a real
+        // project dependency, not `list.append` (#1681). Without this, the
+        // qualified ref never reaches resolveViaImport / resolvePythonModuleMember.
         if (PYTHON_BUILT_IN_METHODS.has(method)) {
+          // A module-scope collection binding is stronger evidence than a
+          // coincidentally matching class name (#1652). Only use this file's
+          // binding: an unrelated module may reuse the receiver for a collection.
+          const isCollection = this.context.getNodesByName(receiver).some((node) =>
+            node.language === 'python' && node.filePath === ref.filePath &&
+            (node.kind === 'variable' || node.kind === 'constant') &&
+            node.qualifiedName === receiver &&
+            /^=\s*(?:[\[{]|(?:dict|list|set|tuple|frozenset)\s*\(|\(\s*\)|\([^()]*,)/.test(node.signature ?? '')
+          );
+          if (isCollection) return true;
+
           const capitalized = receiver.charAt(0).toUpperCase() + receiver.slice(1);
-          const isKnownClass = this.knownNames?.has(capitalized) ?? false;
+          const isKnownClass = this.context.getNodesByName(capitalized).some((node) =>
+            node.language === 'python' &&
+            (node.kind === 'class' || node.kind === 'struct' || node.kind === 'interface')
+          );
           const isProjectModule =
             !isKnownClass && this.isPythonProjectModule(ref, receiver);
           if (!isKnownClass && !isProjectModule) {
@@ -2149,9 +2189,8 @@ export class ReferenceResolver {
       // A bare name colliding with a builtin method (index, get, update, count…)
       // is only a builtin when NOTHING in the codebase declares it. A declared
       // symbol with that exact name — e.g. a Flask/FastAPI view `def index()` or
-      // `def get()` — is a real reference target. Mirrors the knownNames guard on
-      // the dotted branch above; without it, every handler named after a builtin
-      // method silently loses its route→handler edge.
+      // `def get()` — is a real reference target. Without this guard, every
+      // handler named after a builtin method silently loses its route→handler edge.
       if (PYTHON_BUILT_IN_METHODS.has(name) && !this.knownNames?.has(name)) {
         return true;
       }
@@ -2559,6 +2598,8 @@ export class ReferenceResolver {
     if (!result) return result;
     if (ref.referenceKind !== 'references' && ref.referenceKind !== 'imports') return result;
     const tgt = this.getLanguageFromNodeId(result.targetNodeId);
+    // Package imports cannot target prose found by a framework's name lookup.
+    if (ref.referenceKind === 'imports' && (tgt as string) === 'markdown' && (ref.language as string) !== 'markdown') return null;
     if (tgt && ref.language && crossesKnownFamily(tgt, ref.language)) return null;
     return result;
   }

@@ -608,6 +608,42 @@ describe('FileWatcher', () => {
       watcher.stop();
     });
 
+    it('info/exclude patterns drop worktree paths from pending (#1728)', async () => {
+      const { execFileSync } = await import('child_process');
+      // Re-init the testDir as a real git repo so buildScopeIgnore can read
+      // .git/info/exclude (createTempDir fixtures are usually plain dirs).
+      execFileSync('git', ['init', '-q'], { cwd: testDir, stdio: 'pipe' });
+      fs.mkdirSync(path.join(testDir, '.claude', 'worktrees', 'w1', 'src'), { recursive: true });
+      fs.writeFileSync(
+        path.join(testDir, '.claude', 'worktrees', 'w1', 'src', 'x.ts'),
+        'export const x = 1;\n',
+      );
+      fs.writeFileSync(
+        path.join(testDir, '.git', 'info', 'exclude'),
+        '**/.claude/worktrees/\n',
+      );
+
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = newWatcher(syncFn, { debounceMs: 100 });
+      watcher.start();
+      await watcher.waitUntilReady();
+
+      __emitWatchEventForTests(testDir, '.claude/worktrees/w1/src/x.ts');
+      expect(watcher.getPendingFiles().map((p) => p.path)).not.toContain(
+        '.claude/worktrees/w1/src/x.ts',
+      );
+      await new Promise((r) => setTimeout(r, 300));
+      expect(syncFn).not.toHaveBeenCalled();
+
+      // In-scope edits still schedule a scoped sync.
+      fs.writeFileSync(path.join(testDir, 'src', 'ok.ts'), 'export const ok = 1;\n');
+      __emitWatchEventForTests(testDir, 'src/ok.ts');
+      await waitFor(() => syncFn.mock.calls.length > 0);
+      expect(syncFn.mock.calls[0]![0]).toEqual(['src/ok.ts']);
+
+      watcher.stop();
+    });
+
     it('a nested .gitignore inside the scope forces a full sync', async () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
       const watcher = newWatcher(syncFn, { debounceMs: 100 });
