@@ -302,8 +302,33 @@ impl<'t> Walker<'t> {
         let name = self.text(name_node).to_string();
 
         // TS/JS field definitions carry an explicit `type` field; the generic
-        // scan is for other languages (#808).
-        let type_text = node.child_by_field_name("type").map(|t| {
+        // scan is for other languages (#808). A `property_signature` (an
+        // interface member, #1638) carries a `type` field and no value, so it
+        // reads the type field too: the generic scan's exclusion list covers
+        // `identifier` but not the `property_identifier` an interface member is
+        // named with, so it would stop on the name and make the signature repeat
+        // it (`counts counts`) instead of naming the type. Mirrors
+        // extractProperty's isTsJsField.
+        let is_ts_js_field = matches!(
+            node.kind(),
+            "public_field_definition" | "field_definition" | "property_signature"
+        );
+        let type_node = if is_ts_js_field {
+            node.child_by_field_name("type")
+        } else {
+            (0..node.named_child_count()).filter_map(|i| node.named_child(i)).find(|c| {
+                !matches!(
+                    c.kind(),
+                    "modifier"
+                        | "modifiers"
+                        | "identifier"
+                        | "accessor_list"
+                        | "accessors"
+                        | "equals_value_clause"
+                )
+            })
+        };
+        let type_text = type_node.map(|t| {
             let raw = self.text(t);
             raw.strip_prefix(':').unwrap_or(raw).trim_start().to_string()
         });
