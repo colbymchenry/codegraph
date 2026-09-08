@@ -718,6 +718,13 @@ impl<'t> Walker<'t> {
                 self.extract_function(node, Some(bound));
                 return;
             }
+            // `const handleClear = () => {…}` inside a body (#1669): named by
+            // its declarator, like at module scope. Mirrors
+            // TreeSitterExtractor's declaratorBoundFunction.
+            if self.declarator_bound_function(node) {
+                self.extract_function(node, None);
+                return;
+            }
         }
 
         if is_class_type(self.variant, kind) {
@@ -741,6 +748,27 @@ impl<'t> Walker<'t> {
     }
 
     // --- name / signature / modifier helpers ------------------------------------
+
+    /// Whether an anonymous function is the whole value of a
+    /// `variable_declarator` with a plain identifier name —
+    /// `const NAME = () => {…}` / `= function () {…}`.
+    fn declarator_bound_function(&self, node: Node<'t>) -> bool {
+        if !matches!(node.kind(), "arrow_function" | "function_expression") {
+            return false;
+        }
+        let Some(declarator) = node.parent() else { return false };
+        if declarator.kind() != "variable_declarator" {
+            return false;
+        }
+        let Some(value) = declarator.child_by_field_name("value") else { return false };
+        if value.start_byte() != node.start_byte() || value.end_byte() != node.end_byte() {
+            return false;
+        }
+        declarator
+            .child_by_field_name("name")
+            .map(|n| n.kind() == "identifier")
+            .unwrap_or(false)
+    }
 
     /// The declarator name a React handler hook binds an anonymous function
     /// to — `const NAME = useCallback(<node>, [...])` (also `React.useCallback`,
