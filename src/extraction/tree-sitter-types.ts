@@ -160,6 +160,8 @@ export interface LanguageExtractor {
   isAsync?: (node: SyntaxNode) => boolean;
   /** Check if node is static */
   isStatic?: (node: SyntaxNode) => boolean;
+  /** Check if a method/class is abstract (C++ pure virtual, Java abstract, …). Return true to set; undefined/false leaves the flag unset. */
+  isAbstract?: (node: SyntaxNode) => boolean | undefined;
   /** Check if variable declaration is a constant (const vs let/var) */
   isConst?: (node: SyntaxNode) => boolean;
   /**
@@ -221,9 +223,13 @@ export interface LanguageExtractor {
    * both callable and data members (#808): TS/JS class FIELDS
    * (`public_field_definition` / `field_definition`) are methods only when
    * their value is callable (`onClick = () => {}`); a plain field
-   * (`public fonts: Fonts;`, `count = 0`) is a property. Default: 'method'.
+   * (`public fonts: Fonts;`, `count = 0`) is a property. C++ also lists
+   * `field_declaration` in methodTypes so pure-virtual methods (`= 0`) can
+   * mint nodes (#1727); non-callable field_declarations return `'skip'` so
+   * the walker still descends (data-member initializers keep their call
+   * edges). Default: 'method'.
    */
-  classifyMethodNode?: (node: SyntaxNode) => 'method' | 'property';
+  classifyMethodNode?: (node: SyntaxNode) => 'method' | 'property' | 'skip';
 
   /**
    * Resolve the body node for a function/method/class when it's not a child field.

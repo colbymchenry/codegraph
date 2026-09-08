@@ -166,6 +166,35 @@ export function stripCppTemplateArgs(name: string): string {
   return out.trim();
 }
 
+
+/**
+ * Is this C++ `field_declaration` a pure-virtual method (`virtual int read(int key) = 0;`)?
+ * tree-sitter-cpp shapes those as a field_declaration whose declarator unwraps to a
+ * `function_declarator`, with the pure-virtual `= 0` as a DIRECT `number_literal` "0"
+ * child of the field_declaration (default-arg `= 0` lives inside parameter_declaration
+ * and must not match). Bodiless method prototypes (`int foo();`) and data members
+ * (`int x = 0;`) are excluded — prototypes usually have an out-of-line definition that
+ * already mints the method node; pure virtuals never do (#1727).
+ */
+export function isCppPureVirtualMethodDecl(node: SyntaxNode): boolean {
+  if (node.type !== 'field_declaration') return false;
+  let declarator: SyntaxNode | null = getChildByField(node, 'declarator');
+  if (!declarator) return false;
+  while (
+    declarator.type === 'pointer_declarator' ||
+    declarator.type === 'reference_declarator'
+  ) {
+    const inner: SyntaxNode | null =
+      getChildByField(declarator, 'declarator') || declarator.namedChild(0);
+    if (!inner) return false;
+    declarator = inner;
+  }
+  if (declarator.type !== 'function_declarator') return false;
+  return node.namedChildren.some(
+    (c: SyntaxNode) => c.type === 'number_literal' && c.text === '0'
+  );
+}
+
 /**
  * A function/method's return type lives in the `function_definition`'s `type`
  * field (`Metrics& Metrics::instance()` → `Metrics`). Constructors, destructors,
@@ -1607,7 +1636,17 @@ export const cppExtractor: LanguageExtractor = {
   // get picked as the blast-radius representative over — the single real
   // definition, exactly as bodiless struct/enum specifiers are already skipped. (#1093)
   skipBodilessClass: true,
-  methodTypes: ['function_definition'],
+  // `function_definition` covers inline / out-of-line bodies; `field_declaration`
+  // covers pure-virtual methods (`virtual int read(int key) = 0;`), which have no
+  // body and would otherwise mint no node — so calls through the abstract base and
+  // cpp-override synthesis had nothing to attach to (#1727). classifyMethodNode
+  // keeps ordinary data members / prototypes on the children-walk path.
+  methodTypes: ['function_definition', 'field_declaration'],
+  classifyMethodNode: (node) => {
+    if (node.type !== 'field_declaration') return 'method';
+    return isCppPureVirtualMethodDecl(node) ? 'method' : 'skip';
+  },
+  isAbstract: (node) => (isCppPureVirtualMethodDecl(node) ? true : undefined),
   interfaceTypes: [],
   structTypes: ['struct_specifier'],
   // C++ unions additionally carry member functions, which extract through the

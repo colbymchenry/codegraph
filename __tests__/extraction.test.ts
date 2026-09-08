@@ -5868,6 +5868,74 @@ end
   });
 });
 
+describe('C++ pure-virtual method nodes (#1727)', () => {
+  // Pure-virtual methods are field_declarations (`virtual int read(int key) = 0;`),
+  // not function_definitions — they previously minted no method node, so calls
+  // through an abstract base and cpp-override synthesis had nothing to attach to.
+  // Java interface methods already get nodes; C++ should behave similarly.
+  it('indexes Store::read from the issue fixture and records the call', () => {
+    const code = `
+class Store {
+public:
+    virtual ~Store() {}
+    virtual int read(int key) = 0;
+};
+
+class DiskStore : public Store {
+public:
+    int read(int key) override { return key + 1; }
+};
+
+class MemStore : public Store {
+public:
+    int read(int key) override { return key + 2; }
+};
+
+int fetch(Store* s, int k) {
+    return s->read(k);
+}
+`;
+    const result = extractFromSource('store.cc', code);
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.qualifiedName);
+    expect(methods).toContain('Store::read');
+    expect(methods).toContain('DiskStore::read');
+    expect(methods).toContain('MemStore::read');
+
+    const baseRead = result.nodes.find((n) => n.qualifiedName === 'Store::read');
+    expect(baseRead?.isAbstract).toBe(true);
+
+    // Call site unresolved ref targets the method name (resolver types the receiver).
+    expect(
+      result.unresolvedReferences.some(
+        (r) => r.referenceKind === 'calls' && (r.referenceName === 'read' || r.referenceName.endsWith('.read') || r.referenceName.endsWith('->read') || r.referenceName === 's.read')
+      )
+    ).toBe(true);
+  });
+
+  it('indexes pure virtuals with pointer/reference return types and operators', () => {
+    const code = `
+class Cloneable {
+public:
+    virtual Cloneable* clone() = 0;
+    virtual const Foo& get() = 0;
+    virtual Cloneable& operator=(const Cloneable&) = 0;
+    int notPure(int x);
+    int data = 0;
+};
+`;
+    const result = extractFromSource('clone.hpp', code);
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+    expect(methods).toContain('clone');
+    expect(methods).toContain('get');
+    expect(methods).toContain('operator=');
+    // Non-pure prototype and data member must NOT become methods here.
+    expect(methods).not.toContain('notPure');
+    expect(methods).not.toContain('data');
+    expect(result.nodes.find((n) => n.name === 'clone')?.isAbstract).toBe(true);
+  });
+
+});
+
 describe('C++ free-function name extraction', () => {
   let tempDir: string;
   let cg: CodeGraph;

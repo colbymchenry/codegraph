@@ -353,6 +353,61 @@ describe('C++ end-to-end — virtual override synthesis', () => {
 
     cg.close();
   });
+
+  it('indexes pure-virtual base methods and bridges overrides (#1727)', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-pure-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'store.cc'),
+      'class Store {\n' +
+        'public:\n' +
+        '    virtual ~Store() {}\n' +
+        '    virtual int read(int key) = 0;\n' +
+        '};\n' +
+        'class DiskStore : public Store {\n' +
+        'public:\n' +
+        '    int read(int key) override { return key + 1; }\n' +
+        '};\n' +
+        'class MemStore : public Store {\n' +
+        'public:\n' +
+        '    int read(int key) override { return key + 2; }\n' +
+        '};\n' +
+        'int fetch(Store* s, int k) {\n' +
+        '    return s->read(k);\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const storeRead = cg
+      .getNodesByKind('method')
+      .find((n) => n.qualifiedName === 'Store::read');
+    expect(storeRead, 'Store::read pure virtual must be a method node').toBeDefined();
+    expect(storeRead!.isAbstract).toBe(true);
+
+    const diskRead = cg
+      .getNodesByKind('method')
+      .find((n) => n.qualifiedName === 'DiskStore::read');
+    const memRead = cg
+      .getNodesByKind('method')
+      .find((n) => n.qualifiedName === 'MemStore::read');
+    expect(diskRead).toBeDefined();
+    expect(memRead).toBeDefined();
+
+    // cpp-override synthesis: base pure virtual → each override
+    const out = cg.getOutgoingEdges(storeRead!.id).filter((e) => e.kind === 'calls');
+    const targets = out.map((e) => e.target);
+    expect(targets).toContain(diskRead!.id);
+    expect(targets).toContain(memRead!.id);
+
+    // Call through abstract base resolves onto Store::read
+    const fetch = cg.getNodesByKind('function').find((n) => n.name === 'fetch');
+    expect(fetch).toBeDefined();
+    const callees = cg.getCallees(fetch!.id).map((c) => c.node.qualifiedName);
+    expect(callees).toContain('Store::read');
+
+    cg.close();
+  });
 });
 
 describe('Java end-to-end — field-injected bean trace (issue #389)', () => {
