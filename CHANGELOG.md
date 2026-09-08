@@ -229,6 +229,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Symbols, tests and the viewer
 
+- `codegraph affected --filter` now finds root-level tests with patterns like `tests/**/*.py` without selecting unrelated directories or backup files, while filename-only filters still work at any depth (thanks @Jseca666; #1273).
+
 - `codegraph affected` now finds Go, Python and JVM test files that previously went unreported, while preserving custom `--filter` behavior (thanks @danusha2345; #1507, #1688).
 
 - Calls inside declaration initializers in Kotlin, Java, TypeScript, JavaScript, Scala, Rust and Python now appear under the declaration that owns them, making callers and impact results more accurate after re-indexing with `codegraph index -f` (thanks @danusha2345; #1510, #1511).
