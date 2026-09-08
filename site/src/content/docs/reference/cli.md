@@ -12,6 +12,7 @@ codegraph uninit [path]           # Remove CodeGraph from a project (--force to 
 codegraph index [path]            # Full re-index from scratch (--force, --quiet, --verbose)
 codegraph sync [path]             # Incremental update (--quiet)
 codegraph status [path]           # Show statistics (--json)
+codegraph ui [path]               # Open the browser viewer for an indexed project (alias: web; --port, --no-open)
 codegraph unlock [path]           # Remove a stale lock file that's blocking indexing
 codegraph query <search>          # Search symbols (--kind, --limit, --json)
 codegraph explore <query>         # Relevant symbols' source + call paths in one shot (same output as the codegraph_explore MCP tool)
@@ -49,3 +50,19 @@ codegraph impact AuthMiddleware --depth 3
 ## affected
 
 Traces import dependencies transitively to find which test files are affected by changed source files. See [Affected Tests in CI](/codegraph/guides/affected-tests/) for options and a CI example.
+
+## ui
+
+`codegraph ui` opens the [browser viewer](/codegraph/guides/viewer/) for a project you have already indexed: callers on the left, the symbol's source in the middle, and what it calls on the right at the height of the line that calls it.
+
+```bash
+codegraph ui                     # the project you're standing in
+codegraph ui ~/code/my-app       # a project indexed elsewhere
+codegraph ui --port 8080         # pin a port (fails if it's taken)
+codegraph ui --no-open           # just print the URL (headless boxes, SSH)
+codegraph ui --read-only         # refuse every write, including saved trails
+```
+
+Without `--port` it takes 4747, or the next free port. `CODEGRAPH_BROWSER=<command>` chooses which browser opens; `CODEGRAPH_BROWSER=none` never opens one. `codegraph web` is an alias.
+
+The viewer listens on `127.0.0.1` only: it opens an index that already exists, never creates one, never changes your graph or a line of your code, and sends nothing anywhere. The one thing it writes is a trail you asked it to save, under `.codegraph/ui/trails/`; `--read-only` refuses even that.

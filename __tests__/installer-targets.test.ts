@@ -18,6 +18,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { parse as parseJsonc } from 'jsonc-parser';
 import { ALL_TARGETS, getTarget, resolveTargetFlag } from '../src/installer/targets/registry';
 import { uninstallTargets, refreshTargets } from '../src/installer';
 import { upsertTomlTable, removeTomlTable, buildTomlTable } from '../src/installer/targets/toml';
@@ -38,12 +39,18 @@ function setHome(dir: string): { restore: () => void } {
     APPDATA: process.env.APPDATA,
     XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
     HERMES_HOME: process.env.HERMES_HOME,
+    COPILOT_HOME: process.env.COPILOT_HOME,
+    CODEX_HOME: process.env.CODEX_HOME,
+    CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
   };
   process.env.HOME = dir;
   process.env.USERPROFILE = dir;
   process.env.APPDATA = path.join(dir, '.config');
   process.env.XDG_CONFIG_HOME = path.join(dir, '.config');
   delete process.env.HERMES_HOME;
+  delete process.env.COPILOT_HOME;
+  delete process.env.CODEX_HOME;
+  delete process.env.CLAUDE_CONFIG_DIR;
   return {
     restore() {
       if (prev.HOME === undefined) delete process.env.HOME; else process.env.HOME = prev.HOME;
@@ -51,6 +58,9 @@ function setHome(dir: string): { restore: () => void } {
       if (prev.APPDATA === undefined) delete process.env.APPDATA; else process.env.APPDATA = prev.APPDATA;
       if (prev.XDG_CONFIG_HOME === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = prev.XDG_CONFIG_HOME;
       if (prev.HERMES_HOME === undefined) delete process.env.HERMES_HOME; else process.env.HERMES_HOME = prev.HERMES_HOME;
+      if (prev.COPILOT_HOME === undefined) delete process.env.COPILOT_HOME; else process.env.COPILOT_HOME = prev.COPILOT_HOME;
+      if (prev.CODEX_HOME === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prev.CODEX_HOME;
+      if (prev.CLAUDE_CONFIG_DIR === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = prev.CLAUDE_CONFIG_DIR;
     },
   };
 }
@@ -134,7 +144,15 @@ describe('Installer targets — contract', () => {
             // opencode uses `mcp` not `mcpServers`. Match its shape too.
             if (target.id === 'opencode') {
               delete seed.mcpServers;
+              // Keep a v1-shaped sibling — real configs mix shapes during the
+              // OpenCode 1→2 transition; install must not disturb it (#1698).
               seed.mcp = { other: { type: 'local', command: ['x'], enabled: true } };
+            }
+            // VS Code's mcp.json uses `servers`; the JetBrains Copilot
+            // plugin's mcp.json is schema-compatible with it.
+            if (target.id === 'copilot-vscode' || target.id === 'copilot-jetbrains') {
+              delete seed.mcpServers;
+              seed.servers = { other: { command: 'x' } };
             }
             fs.writeFileSync(jsonPath, JSON.stringify(seed, null, 2) + '\n');
 
@@ -143,7 +161,13 @@ describe('Installer targets — contract', () => {
             const after = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
             if (target.id === 'opencode') {
               expect(after.mcp.other).toBeDefined();
-              expect(after.mcp.codegraph).toBeDefined();
+              expect(after.mcp.servers.codegraph).toBeDefined();
+              expect(after.mcp.servers.codegraph.codemode).toBe(false);
+              expect(after.mcp.servers.codegraph.disabled).toBe(false);
+              expect(after.mcp.codegraph).toBeUndefined();
+            } else if (target.id === 'copilot-vscode' || target.id === 'copilot-jetbrains') {
+              expect(after.servers.other).toBeDefined();
+              expect(after.servers.codegraph).toBeDefined();
             } else {
               expect(after.mcpServers.other).toBeDefined();
               expect(after.mcpServers.codegraph).toBeDefined();
@@ -225,6 +249,42 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(body).toContain('codegraph explore');
     const mdEntry = result.files.find((f) => f.path.endsWith('AGENTS.md'));
     expect(mdEntry?.action).toBe('updated');
+  });
+
+  it('codex: local install writes ./.codex/config.toml and the project-root ./AGENTS.md block (#1531)', () => {
+    const codex = getTarget('codex')!;
+    const result = codex.install('local', { autoAllow: false });
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    // macOS realpath shenanigans (/var vs /private/var) — suffix match.
+    expect(paths.some((p) => p.endsWith('/.codex/config.toml'))).toBe(true);
+    // AGENTS.md sits at the project root, NOT under .codex/ — that's the
+    // file Codex reads for repo instructions.
+    expect(paths.some((p) => p.endsWith('/AGENTS.md') && !p.includes('/.codex/'))).toBe(true);
+
+    const toml = fs.readFileSync(path.join(process.cwd(), '.codex', 'config.toml'), 'utf-8');
+    expect(toml).toContain('[mcp_servers.codegraph]');
+    expect(fs.readFileSync(path.join(process.cwd(), 'AGENTS.md'), 'utf-8')).toContain('codegraph explore');
+
+    // The project layer is only applied in a trusted project, so say so
+    // instead of reporting a silent success.
+    expect(result.notes?.join(' ')).toMatch(/trusted/);
+
+    // Global config is untouched by a local install.
+    expect(fs.existsSync(path.join(tmpHome, '.codex', 'config.toml'))).toBe(false);
+  });
+
+  it('codex: local uninstall reverses the local install and leaves the global entry alone (#1531)', () => {
+    const codex = getTarget('codex')!;
+    codex.install('global', { autoAllow: false });
+    codex.install('local', { autoAllow: false });
+    expect(codex.detect('local').alreadyConfigured).toBe(true);
+
+    codex.uninstall('local');
+
+    expect(codex.detect('local').alreadyConfigured).toBe(false);
+    expect(codex.detect('global').alreadyConfigured).toBe(true);
+    expect(fs.readFileSync(path.join(tmpHome, '.codex', 'config.toml'), 'utf-8'))
+      .toContain('[mcp_servers.codegraph]');
   });
 
   it('opencode: prefers .jsonc when both .json and .jsonc exist', () => {
@@ -826,7 +886,7 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(body).toContain('  telegram:\n  - hermes-telegram');
   });
 
-  it('opencode: uninstall removes only mcp.codegraph, preserves comments and siblings', () => {
+  it('opencode: uninstall removes only mcp.servers.codegraph, preserves comments and siblings', () => {
     const opencode = getTarget('opencode')!;
     const dir = path.join(tmpHome, '.config', 'opencode');
     fs.mkdirSync(dir, { recursive: true });
@@ -843,13 +903,15 @@ describe('Installer targets — partial-state idempotency', () => {
     ].join('\n'));
 
     opencode.install('global', { autoAllow: true });
-    const afterInstall = fs.readFileSync(file, 'utf-8');
-    expect(afterInstall).toContain('"codegraph"');
-    expect(afterInstall).toContain('"other"');
+    const afterInstall = parseJsonc(fs.readFileSync(file, 'utf-8'));
+    expect(afterInstall.mcp.servers.codegraph).toBeDefined();
+    expect(afterInstall.mcp.servers.codegraph.codemode).toBe(false);
+    expect(afterInstall.mcp.other).toBeDefined();
 
     opencode.uninstall('global');
     const afterUninstall = fs.readFileSync(file, 'utf-8');
     expect(afterUninstall).not.toContain('codegraph');
+    expect(afterUninstall).not.toContain('"servers"');
     expect(afterUninstall).toContain('// important comment');
     expect(afterUninstall).toContain('"other"');
   });
@@ -927,6 +989,22 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(fs.existsSync(path.join(tmpCwd, '.claude.json'))).toBe(false);
     const cfg = JSON.parse(fs.readFileSync(path.join(tmpCwd, '.mcp.json'), 'utf-8'));
     expect(cfg.mcpServers.codegraph).toBeDefined();
+    // Exempt from Claude Code's tool-search deferral (#1696).
+    expect(cfg.mcpServers.codegraph.alwaysLoad).toBe(true);
+  });
+
+  it('claude: re-running install on an entry that predates alwaysLoad adds the key (#1696)', () => {
+    const claude = getTarget('claude')!;
+    fs.writeFileSync(
+      path.join(tmpCwd, '.mcp.json'),
+      JSON.stringify({ mcpServers: { codegraph: { type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] } } }, null, 2),
+    );
+    const result = claude.install('local', { autoAllow: false });
+    const mcp = result.files.find((f) => f.path.replace(/\\/g, '/').endsWith('/.mcp.json'));
+    expect(mcp?.action).toBe('updated');
+    const cfg = JSON.parse(fs.readFileSync(path.join(tmpCwd, '.mcp.json'), 'utf-8'));
+    expect(cfg.mcpServers.codegraph.alwaysLoad).toBe(true);
+    expect(cfg.mcpServers.codegraph.args).toEqual(['serve', '--mcp']);
   });
 
   it('claude: install creates the CLAUDE.md codegraph block (#704)', () => {
@@ -961,6 +1039,7 @@ describe('Installer targets — partial-state idempotency', () => {
     claude.install('global', { autoAllow: false });
     const cfg = JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude.json'), 'utf-8'));
     expect(cfg.mcpServers.codegraph).toBeDefined();
+    expect(cfg.mcpServers.codegraph.alwaysLoad).toBe(true);
   });
 
   it('claude: local install migrates a legacy ./.claude.json codegraph entry into ./.mcp.json', () => {
@@ -1268,6 +1347,9 @@ describe('Installer targets — registry', () => {
     expect(getTarget('gemini')?.id).toBe('gemini');
     expect(getTarget('antigravity')?.id).toBe('antigravity');
     expect(getTarget('kiro')?.id).toBe('kiro');
+    expect(getTarget('copilot-vscode')?.id).toBe('copilot-vscode');
+    expect(getTarget('copilot-cli')?.id).toBe('copilot-cli');
+    expect(getTarget('copilot-jetbrains')?.id).toBe('copilot-jetbrains');
     expect(getTarget('not-a-real-target')).toBeUndefined();
   });
 
@@ -1276,6 +1358,18 @@ describe('Installer targets — registry', () => {
     expect(resolveTargetFlag('all', 'global').length).toBe(ALL_TARGETS.length);
     const csv = resolveTargetFlag('claude,cursor', 'global');
     expect(csv.map((t) => t.id)).toEqual(['claude', 'cursor']);
+  });
+
+  it("resolveTargetFlag('all') includes every Copilot target", () => {
+    const ids = resolveTargetFlag('all', 'global').map((t) => t.id);
+    expect(ids).toContain('copilot-vscode');
+    expect(ids).toContain('copilot-cli');
+    expect(ids).toContain('copilot-jetbrains');
+  });
+
+  it('resolveTargetFlag resolves the Copilot ids from a csv list', () => {
+    const csv = resolveTargetFlag('copilot-vscode,copilot-cli,copilot-jetbrains', 'global');
+    expect(csv.map((t) => t.id)).toEqual(['copilot-vscode', 'copilot-cli', 'copilot-jetbrains']);
   });
 
   it('resolveTargetFlag throws on unknown id', () => {
@@ -1750,6 +1844,149 @@ function listAllFiles(dir: string): string[] {
 }
 
 // ---------------------------------------------------------------------------
+// opencode OpenCode 2 native MCP shape (#1698)
+//
+// OpenCode 2 reads `mcp.servers.<name>` with `disabled` / `codemode`. The
+// v1 `mcp.<name>` + `enabled` shape still connects but drops `codemode`
+// during normalization — so the installer must write the native shape and
+// migrate/uninstall either.
+// ---------------------------------------------------------------------------
+describe('Installer targets — opencode native MCP shape (#1698)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('home');
+    tmpCwd = mkTmpDir('cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  const configFile = () => path.join(tmpHome, '.config', 'opencode', 'opencode.jsonc');
+
+  it('install writes mcp.servers.codegraph with disabled:false and codemode:false', () => {
+    const opencode = getTarget('opencode')!;
+    opencode.install('global', { autoAllow: true });
+    const cfg = JSON.parse(fs.readFileSync(configFile(), 'utf-8'));
+    expect(cfg.mcp.codegraph).toBeUndefined();
+    expect(cfg.mcp.servers.codegraph).toEqual({
+      type: 'local',
+      command: ['codegraph', 'serve', '--mcp'],
+      disabled: false,
+      codemode: false,
+    });
+  });
+
+  it('printConfig shows the native OpenCode 2 shape', () => {
+    const out = getTarget('opencode')!.printConfig('global');
+    expect(out).toContain('"servers"');
+    expect(out).toContain('"codemode": false');
+    expect(out).toContain('"disabled": false');
+    expect(out).not.toContain('"enabled"');
+    // No v1 top-level mcp.codegraph key in the snippet.
+    expect(out).not.toMatch(/"mcp"\s*:\s*\{\s*"codegraph"/);
+  });
+
+  it('re-install migrates a v1 mcp.codegraph entry to mcp.servers.codegraph', () => {
+    const dir = path.dirname(configFile());
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(configFile(), [
+      '{',
+      '  // keep me',
+      '  "$schema": "https://opencode.ai/config.json",',
+      '  "mcp": {',
+      '    "codegraph": { "type": "local", "command": ["codegraph", "serve", "--mcp"], "enabled": true },',
+      '    "other": { "type": "local", "command": ["x"], "enabled": true }',
+      '  }',
+      '}',
+      '',
+    ].join('\n'));
+
+    const opencode = getTarget('opencode')!;
+    expect(opencode.detect('global').alreadyConfigured).toBe(true);
+
+    const result = opencode.install('global', { autoAllow: true });
+    expect(result.files.find((f) => f.path === configFile())!.action).toBe('updated');
+
+    const text = fs.readFileSync(configFile(), 'utf-8');
+    expect(text).toContain('// keep me');
+    const cfg = parseJsonc(text);
+    expect(cfg.mcp.codegraph).toBeUndefined();
+    expect(cfg.mcp.other).toBeDefined();
+    expect(cfg.mcp.servers.codegraph).toEqual({
+      type: 'local',
+      command: ['codegraph', 'serve', '--mcp'],
+      disabled: false,
+      codemode: false,
+    });
+
+    // Idempotent after migration.
+    const second = opencode.install('global', { autoAllow: true });
+    expect(second.files.find((f) => f.path === configFile())!.action).toBe('unchanged');
+  });
+
+  it('uninstall removes a leftover v1 mcp.codegraph entry', () => {
+    const dir = path.dirname(configFile());
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(configFile(), [
+      '{',
+      '  // keep me',
+      '  "$schema": "https://opencode.ai/config.json",',
+      '  "mcp": {',
+      '    "codegraph": { "type": "local", "command": ["codegraph", "serve", "--mcp"], "enabled": true },',
+      '    "other": { "type": "local", "command": ["x"], "enabled": true }',
+      '  }',
+      '}',
+      '',
+    ].join('\n'));
+
+    const opencode = getTarget('opencode')!;
+    opencode.uninstall('global');
+    const text = fs.readFileSync(configFile(), 'utf-8');
+    expect(text).toContain('// keep me');
+    expect(text).toContain('"other"');
+    expect(text).not.toContain('codegraph');
+    expect(opencode.detect('global').alreadyConfigured).toBe(false);
+  });
+
+  it('uninstall removes a native mcp.servers.codegraph entry and an emptied servers wrapper', () => {
+    const dir = path.dirname(configFile());
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(configFile(), JSON.stringify({
+      $schema: 'https://opencode.ai/config.json',
+      mcp: {
+        servers: {
+          codegraph: {
+            type: 'local',
+            command: ['codegraph', 'serve', '--mcp'],
+            disabled: false,
+            codemode: false,
+          },
+        },
+      },
+    }, null, 2) + '\n');
+
+    const opencode = getTarget('opencode')!;
+    opencode.uninstall('global');
+    const text = fs.readFileSync(configFile(), 'utf-8');
+    expect(text).not.toContain('codegraph');
+    expect(text).not.toContain('"servers"');
+    expect(text).not.toContain('"mcp"');
+    expect(opencode.detect('global').alreadyConfigured).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // opencode global config path — XDG on every platform (#535)
 //
 // opencode resolves its config dir with `xdg-basedir`: XDG_CONFIG_HOME if
@@ -1895,5 +2132,747 @@ describe('Installer targets — opencode XDG config path (#535)', () => {
     expect(opencode.detect('global').installed).toBe(true);
     // But configuration state is read from the REAL path only.
     expect(opencode.detect('global').alreadyConfigured).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Copilot family — copilot-vscode / copilot-cli / copilot-jetbrains (CG-5)
+//
+// The registry-driven contract suite above covers the shared surface
+// (install/idempotency/sibling/uninstall/printConfig). These pin the
+// target-specific behavior: OS-specific global paths, `--path` injection
+// (copilot-vscode mirrors Cursor), global-only skip semantics (cli +
+// jetbrains, Codex pattern), COPILOT_HOME resolution, JSONC comment
+// preservation, empty-`servers`-wrapper cleanup, and printConfig parity
+// with what install writes.
+// ---------------------------------------------------------------------------
+describe('Installer targets — Copilot family', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('cop-home');
+    tmpCwd = mkTmpDir('cop-cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  // printConfig embeds the paste-able snippet after a `# Add to <path>`
+  // header — extract and parse just the JSON body.
+  function snippetJson(out: string): any {
+    const start = out.indexOf('{');
+    expect(start).toBeGreaterThanOrEqual(0);
+    return JSON.parse(out.slice(start));
+  }
+
+  // ---- copilot-vscode ----
+
+  it('copilot-vscode: local install writes ./.vscode/mcp.json with servers.codegraph and an absolute --path pin', () => {
+    const t = getTarget('copilot-vscode')!;
+    const result = t.install('local', { autoAllow: true });
+
+    const file = path.join(process.cwd(), '.vscode', 'mcp.json');
+    expect(result.files[0].path).toBe(file);
+    expect(result.files[0].action).toBe('created');
+    const cfg = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(cfg.servers.codegraph.type).toBe('stdio');
+    expect(cfg.servers.codegraph.command).toBe('codegraph');
+    // Cursor-mirror: local installs pin the project with an absolute path.
+    expect(cfg.servers.codegraph.args).toEqual(['serve', '--mcp', '--path', process.cwd()]);
+    // No mcpServers wrapper — VS Code's mcp.json uses `servers`.
+    expect(cfg.mcpServers).toBeUndefined();
+  });
+
+  it('copilot-vscode: global install writes a variable-free entry — no --path, no ${workspaceFolder}', () => {
+    // VS Code refuses to start a user-level server whose entry uses
+    // ${workspaceFolder} in any window with no folder open, toasting
+    // "Variable workspaceFolder can not be resolved" (hit live). VS Code
+    // documents cwd = workspace folder for stdio servers, and the
+    // codegraph server resolves the project from roots/cwd — so the
+    // global entry must carry no --path and no variables at all.
+    const t = getTarget('copilot-vscode')!;
+    const result = t.install('global', { autoAllow: true });
+    const cfg = JSON.parse(fs.readFileSync(result.files[0].path, 'utf-8'));
+    expect(cfg.servers.codegraph.args).toEqual(['serve', '--mcp']);
+    expect(JSON.stringify(cfg)).not.toContain('${');
+  });
+
+  it.runIf(process.platform === 'darwin')('copilot-vscode: global path is ~/Library/Application Support/Code/User/mcp.json on macOS', () => {
+    const t = getTarget('copilot-vscode')!;
+    const expected = path.join(tmpHome, 'Library', 'Application Support', 'Code', 'User', 'mcp.json');
+    expect(t.describePaths('global')).toEqual([expected]);
+    const result = t.install('global', { autoAllow: true });
+    expect(result.files[0].path).toBe(expected);
+    expect(fs.existsSync(expected)).toBe(true);
+  });
+
+  it.runIf(process.platform === 'linux')('copilot-vscode: global path honors XDG_CONFIG_HOME on Linux', () => {
+    const t = getTarget('copilot-vscode')!;
+    // setHome() points XDG_CONFIG_HOME at <home>/.config.
+    const expected = path.join(tmpHome, '.config', 'Code', 'User', 'mcp.json');
+    expect(t.describePaths('global')).toEqual([expected]);
+    const result = t.install('global', { autoAllow: true });
+    expect(result.files[0].path).toBe(expected);
+  });
+
+  it.runIf(process.platform === 'win32')('copilot-vscode: global path is %APPDATA%\\Code\\User\\mcp.json on Windows', () => {
+    const t = getTarget('copilot-vscode')!;
+    // setHome() points APPDATA at <home>/.config.
+    const expected = path.join(process.env.APPDATA!, 'Code', 'User', 'mcp.json');
+    expect(t.describePaths('global')).toEqual([expected]);
+    const result = t.install('global', { autoAllow: true });
+    expect(result.files[0].path).toBe(expected);
+  });
+
+  it('copilot-vscode: supports both global and local locations', () => {
+    const t = getTarget('copilot-vscode')!;
+    expect(t.supportsLocation('global')).toBe(true);
+    expect(t.supportsLocation('local')).toBe(true);
+  });
+
+  it('copilot-vscode: preserves comments and sibling servers through install + idempotent re-run (JSONC)', () => {
+    const t = getTarget('copilot-vscode')!;
+    const dir = path.join(tmpCwd, '.vscode');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'mcp.json');
+    fs.writeFileSync(file, [
+      '{',
+      '  // my MCP servers',
+      '  "servers": {',
+      '    "other": { "type": "stdio", "command": "other-server" } // keep',
+      '  }',
+      '}',
+      '',
+    ].join('\n'));
+
+    t.install('local', { autoAllow: true });
+    const afterInstall = fs.readFileSync(file, 'utf-8');
+    expect(afterInstall).toContain('// my MCP servers');
+    expect(afterInstall).toContain('// keep');
+    expect(afterInstall).toContain('"other-server"');
+    expect(afterInstall).toContain('"codegraph"');
+
+    const second = t.install('local', { autoAllow: true });
+    expect(second.files[0].action).toBe('unchanged');
+    expect(fs.readFileSync(file, 'utf-8')).toBe(afterInstall);
+  });
+
+  it('copilot-vscode: uninstall drops an emptied servers wrapper but keeps the file and its siblings (e.g. inputs)', () => {
+    const t = getTarget('copilot-vscode')!;
+    const dir = path.join(tmpCwd, '.vscode');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'mcp.json');
+    fs.writeFileSync(file, [
+      '{',
+      '  // prompt-time inputs',
+      '  "inputs": [{ "id": "api-key", "type": "promptString" }]',
+      '}',
+      '',
+    ].join('\n'));
+
+    t.install('local', { autoAllow: true });
+    const result = t.uninstall('local');
+    expect(result.files[0].action).toBe('removed');
+
+    // File survives; our entry and the now-empty `servers` wrapper are gone.
+    expect(fs.existsSync(file)).toBe(true);
+    const text = fs.readFileSync(file, 'utf-8');
+    expect(text).toContain('// prompt-time inputs');
+    const cfg = parseJsonc(text);
+    expect(cfg.inputs).toBeDefined();
+    expect(cfg.servers).toBeUndefined();
+    expect(text).not.toContain('codegraph');
+  });
+
+  it('copilot-vscode: uninstall keeps a non-empty servers wrapper (sibling server survives)', () => {
+    const t = getTarget('copilot-vscode')!;
+    const file = path.join(tmpCwd, '.vscode', 'mcp.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({
+      servers: { other: { type: 'stdio', command: 'other-server' } },
+    }, null, 2) + '\n');
+
+    t.install('local', { autoAllow: true });
+    t.uninstall('local');
+
+    const cfg = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(cfg.servers.other).toBeDefined();
+    expect(cfg.servers.codegraph).toBeUndefined();
+  });
+
+  it('copilot-vscode: uninstall when never installed reports not-found for both locations, no throw', () => {
+    const t = getTarget('copilot-vscode')!;
+    for (const loc of ['global', 'local'] as const) {
+      const result = t.uninstall(loc);
+      expect(result.files).toHaveLength(1);
+      expect(result.files[0].action).toBe('not-found');
+    }
+  });
+
+  it('copilot-vscode: detect() local reports installed only when a .vscode dir exists', () => {
+    const t = getTarget('copilot-vscode')!;
+    expect(t.detect('local').installed).toBe(false);
+    fs.mkdirSync(path.join(tmpCwd, '.vscode'), { recursive: true });
+    expect(t.detect('local').installed).toBe(true);
+    expect(t.detect('local').alreadyConfigured).toBe(false);
+  });
+
+  it('copilot-vscode: detect() global falls back to ~/.vscode (extensions dir) as the installed heuristic', () => {
+    const t = getTarget('copilot-vscode')!;
+    expect(t.detect('global').installed).toBe(false);
+    fs.mkdirSync(path.join(tmpHome, '.vscode'), { recursive: true });
+    expect(t.detect('global').installed).toBe(true);
+  });
+
+  it('copilot-vscode: printConfig matches what install writes, at both locations', () => {
+    const t = getTarget('copilot-vscode')!;
+    for (const loc of ['global', 'local'] as const) {
+      const printed = snippetJson(t.printConfig(loc));
+      const result = t.install(loc, { autoAllow: true });
+      const onDisk = JSON.parse(fs.readFileSync(result.files[0].path, 'utf-8'));
+      expect(printed.servers.codegraph).toEqual(onDisk.servers.codegraph);
+    }
+  });
+
+  it('copilot-vscode: install note tells the user to restart VS Code', () => {
+    const t = getTarget('copilot-vscode')!;
+    const result = t.install('local', { autoAllow: true });
+    expect(result.notes?.join(' ')).toMatch(/[Rr]estart VS Code/);
+  });
+
+
+  // ---- copilot-cli ----
+
+  it('copilot-cli: global install writes ~/.copilot/mcp-config.json with the documented entry shape (tools: ["*"], deferTools: "never")', () => {
+    const t = getTarget('copilot-cli')!;
+    const result = t.install('global', { autoAllow: true });
+
+    const file = path.join(tmpHome, '.copilot', 'mcp-config.json');
+    expect(result.files[0].path).toBe(file);
+    expect(result.files[0].action).toBe('created');
+    const cfg = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toEqual({
+      type: 'stdio',
+      command: 'codegraph',
+      args: ['serve', '--mcp'],
+      tools: ['*'],
+      // Exempt from Copilot CLI's tool search, the same way `alwaysLoad` exempts it in Claude Code (#1696).
+      deferTools: 'never',
+    });
+  });
+
+  it('copilot-cli: re-running install on an entry that predates deferTools adds the key (#1696)', () => {
+    const t = getTarget('copilot-cli')!;
+    const file = path.join(tmpHome, '.copilot', 'mcp-config.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ mcpServers: { codegraph: { type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'], tools: ['*'] } } }, null, 2),
+    );
+    const result = t.install('global', { autoAllow: true });
+    expect(result.files[0].action).toBe('updated');
+    const cfg = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(cfg.mcpServers.codegraph.deferTools).toBe('never');
+    expect(cfg.mcpServers.codegraph.tools).toEqual(['*']);
+  });
+
+  it('copilot-cli: is global-only — local install skips with a clear note, uninstall is a no-op', () => {
+    const t = getTarget('copilot-cli')!;
+    expect(t.supportsLocation('local')).toBe(false);
+    expect(t.supportsLocation('global')).toBe(true);
+
+    const install = t.install('local', { autoAllow: true });
+    expect(install.files).toEqual([]);
+    expect(install.notes?.join(' ')).toMatch(/no project-local config/);
+
+    expect(t.uninstall('local').files).toEqual([]);
+    expect(t.describePaths('local')).toEqual([]);
+    expect(t.detect('local').installed).toBe(false);
+  });
+
+  it('copilot-cli: honors the COPILOT_HOME override for install, detect, and uninstall', () => {
+    const t = getTarget('copilot-cli')!;
+    const custom = path.join(tmpHome, 'copilot-custom');
+    process.env.COPILOT_HOME = custom;
+
+    const result = t.install('global', { autoAllow: true });
+    const expected = path.join(custom, 'mcp-config.json');
+    expect(result.files[0].path).toBe(expected);
+    expect(fs.existsSync(expected)).toBe(true);
+    expect(t.detect('global').alreadyConfigured).toBe(true);
+    // The default location was never touched.
+    expect(fs.existsSync(path.join(tmpHome, '.copilot'))).toBe(false);
+
+    t.uninstall('global');
+    expect(t.detect('global').alreadyConfigured).toBe(false);
+  });
+
+  it('copilot-cli: uninstall removes only codegraph — sibling server and unrelated keys survive', () => {
+    const t = getTarget('copilot-cli')!;
+    const file = path.join(tmpHome, '.copilot', 'mcp-config.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({
+      mcpServers: { other: { type: 'stdio', command: 'other-server' } },
+      banner: 'never',
+    }, null, 2) + '\n');
+
+    t.install('global', { autoAllow: true });
+    t.uninstall('global');
+
+    const after = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(after.mcpServers.other).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeUndefined();
+    expect(after.banner).toBe('never');
+  });
+
+  it('copilot-cli: uninstall of a from-scratch install deletes the file — no `{}` husk to fool detect()', () => {
+    const t = getTarget('copilot-cli')!;
+    t.install('global', { autoAllow: true });
+    t.uninstall('global');
+    const file = path.join(tmpHome, '.copilot', 'mcp-config.json');
+    // A leftover empty mcp-config.json would count as a CLI footprint
+    // and keep the target showing as detected after uninstall.
+    expect(fs.existsSync(file)).toBe(false);
+  });
+
+  it('copilot-cli: uninstall keeps the file when unrelated top-level keys remain', () => {
+    const t = getTarget('copilot-cli')!;
+    const file = path.join(tmpHome, '.copilot', 'mcp-config.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ banner: 'never' }, null, 2) + '\n');
+    t.install('global', { autoAllow: true });
+    t.uninstall('global');
+    const after = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(after.mcpServers).toBeUndefined();
+    expect(after.banner).toBe('never');
+  });
+
+  it('copilot-cli: uninstall when never installed reports not-found, no throw', () => {
+    const t = getTarget('copilot-cli')!;
+    const result = t.uninstall('global');
+    expect(result.files).toHaveLength(1);
+    expect(result.files[0].action).toBe('not-found');
+
+    // Same when the file exists but holds no codegraph entry.
+    const file = path.join(tmpHome, '.copilot', 'mcp-config.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ mcpServers: { other: { command: 'x' } } }) + '\n');
+    expect(t.uninstall('global').files[0].action).toBe('not-found');
+  });
+
+  it('copilot-cli: detect() reports installed from CLI artifacts in ~/.copilot', () => {
+    const t = getTarget('copilot-cli')!;
+    // The tmp PATH may or may not carry a real `copilot` binary; only
+    // assert the positive signal we control. The CLI writes config.json
+    // on first run — that's the footprint.
+    fs.mkdirSync(path.join(tmpHome, '.copilot'), { recursive: true });
+    fs.writeFileSync(path.join(tmpHome, '.copilot', 'config.json'), '{}');
+    expect(t.detect('global').installed).toBe(true);
+    expect(t.detect('global').alreadyConfigured).toBe(false);
+  });
+
+  it('copilot-cli: detect() is NOT fooled by the VS Code extension\'s ~/.copilot/ide/ locks', () => {
+    // The VS Code Copilot Chat extension writes MCP socket-handoff lock
+    // files into ~/.copilot/ide/ on every launch — a machine with only
+    // the extension has ~/.copilot with a lone `ide` entry and no CLI.
+    const t = getTarget('copilot-cli')!;
+    const ideDir = path.join(tmpHome, '.copilot', 'ide');
+    fs.mkdirSync(ideDir, { recursive: true });
+    fs.writeFileSync(path.join(ideDir, 'some-uuid.lock'), '{"socketPath":"/tmp/mcp.sock"}');
+
+    // Pin PATH to an empty dir so a real `copilot` binary on the host
+    // can't turn this negative assertion into a false failure.
+    const prevPath = process.env.PATH;
+    process.env.PATH = ideDir;
+    try {
+      expect(t.detect('global').installed).toBe(false);
+
+      // An empty ~/.copilot (no CLI footprint at all) is also not enough.
+      fs.rmSync(ideDir, { recursive: true });
+      expect(t.detect('global').installed).toBe(false);
+    } finally {
+      process.env.PATH = prevPath;
+    }
+  });
+
+  it('copilot-cli: printConfig matches what install writes; local variant points at --location=global', () => {
+    const t = getTarget('copilot-cli')!;
+    const printed = snippetJson(t.printConfig('global'));
+    const result = t.install('global', { autoAllow: true });
+    const onDisk = JSON.parse(fs.readFileSync(result.files[0].path, 'utf-8'));
+    expect(printed.mcpServers.codegraph).toEqual(onDisk.mcpServers.codegraph);
+
+    expect(t.printConfig('local')).toMatch(/--location=global/);
+  });
+
+  // ---- copilot-jetbrains ----
+
+  it('copilot-jetbrains: global install writes github-copilot/intellij/mcp.json with the VS Code-compatible servers shape', () => {
+    const t = getTarget('copilot-jetbrains')!;
+    const result = t.install('global', { autoAllow: true });
+
+    // setHome() sets XDG_CONFIG_HOME, honored on every platform.
+    const file = path.join(tmpHome, '.config', 'github-copilot', 'intellij', 'mcp.json');
+    expect(result.files[0].path).toBe(file);
+    expect(result.files[0].action).toBe('created');
+    const cfg = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    // Plain entry — no --path injection for this user-global config.
+    expect(cfg.servers.codegraph).toEqual({ type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] });
+    expect(cfg.mcpServers).toBeUndefined();
+  });
+
+  it.runIf(process.platform !== 'win32')('copilot-jetbrains: falls back to ~/.config/github-copilot when XDG_CONFIG_HOME is unset', () => {
+    delete process.env.XDG_CONFIG_HOME;
+    const t = getTarget('copilot-jetbrains')!;
+    const expected = path.join(tmpHome, '.config', 'github-copilot', 'intellij', 'mcp.json');
+    expect(t.describePaths('global')).toEqual([expected]);
+    const result = t.install('global', { autoAllow: true });
+    expect(result.files[0].path).toBe(expected);
+  });
+
+  it.runIf(process.platform === 'win32')('copilot-jetbrains: falls back to %LOCALAPPDATA%\\github-copilot on Windows when XDG_CONFIG_HOME is unset', () => {
+    const prevLocal = process.env.LOCALAPPDATA;
+    delete process.env.XDG_CONFIG_HOME;
+    process.env.LOCALAPPDATA = path.join(tmpHome, 'AppData', 'Local');
+    try {
+      const t = getTarget('copilot-jetbrains')!;
+      const expected = path.join(tmpHome, 'AppData', 'Local', 'github-copilot', 'intellij', 'mcp.json');
+      expect(t.describePaths('global')).toEqual([expected]);
+      const result = t.install('global', { autoAllow: true });
+      expect(result.files[0].path).toBe(expected);
+    } finally {
+      if (prevLocal === undefined) delete process.env.LOCALAPPDATA;
+      else process.env.LOCALAPPDATA = prevLocal;
+    }
+  });
+
+  it('copilot-jetbrains: is global-only — local install skips with a clear note, uninstall is a no-op', () => {
+    const t = getTarget('copilot-jetbrains')!;
+    expect(t.supportsLocation('local')).toBe(false);
+    expect(t.supportsLocation('global')).toBe(true);
+
+    const install = t.install('local', { autoAllow: true });
+    expect(install.files).toEqual([]);
+    expect(install.notes?.join(' ')).toMatch(/no project-local MCP config/);
+
+    expect(t.uninstall('local').files).toEqual([]);
+    expect(t.describePaths('local')).toEqual([]);
+    expect(t.detect('local').installed).toBe(false);
+  });
+
+  it('copilot-jetbrains: preserves comments and sibling servers through install + idempotent re-run (JSONC)', () => {
+    const t = getTarget('copilot-jetbrains')!;
+    const file = path.join(tmpHome, '.config', 'github-copilot', 'intellij', 'mcp.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, [
+      '{',
+      '  // hand-edited via Settings → Tools → GitHub Copilot',
+      '  "servers": {',
+      '    "other": { "type": "stdio", "command": "other-server" }',
+      '  }',
+      '}',
+      '',
+    ].join('\n'));
+
+    t.install('global', { autoAllow: true });
+    const afterInstall = fs.readFileSync(file, 'utf-8');
+    expect(afterInstall).toContain('// hand-edited via Settings');
+    expect(afterInstall).toContain('"other-server"');
+    expect(afterInstall).toContain('"codegraph"');
+
+    const second = t.install('global', { autoAllow: true });
+    expect(second.files[0].action).toBe('unchanged');
+    expect(fs.readFileSync(file, 'utf-8')).toBe(afterInstall);
+  });
+
+  it('copilot-jetbrains: uninstall removes only codegraph and drops an emptied servers wrapper, keeping the file', () => {
+    const t = getTarget('copilot-jetbrains')!;
+    t.install('global', { autoAllow: true });
+    const file = path.join(tmpHome, '.config', 'github-copilot', 'intellij', 'mcp.json');
+
+    const result = t.uninstall('global');
+    expect(result.files[0].action).toBe('removed');
+    expect(fs.existsSync(file)).toBe(true);
+    const cfg = parseJsonc(fs.readFileSync(file, 'utf-8'));
+    expect(cfg.servers).toBeUndefined();
+  });
+
+  it('copilot-jetbrains: uninstall keeps a sibling server (wrapper not dropped when non-empty)', () => {
+    const t = getTarget('copilot-jetbrains')!;
+    const file = path.join(tmpHome, '.config', 'github-copilot', 'intellij', 'mcp.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({
+      servers: { other: { type: 'stdio', command: 'other-server' } },
+    }, null, 2) + '\n');
+
+    t.install('global', { autoAllow: true });
+    t.uninstall('global');
+
+    const cfg = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(cfg.servers.other).toBeDefined();
+    expect(cfg.servers.codegraph).toBeUndefined();
+  });
+
+  it('copilot-jetbrains: uninstall when never installed reports not-found, no throw', () => {
+    const t = getTarget('copilot-jetbrains')!;
+    const result = t.uninstall('global');
+    expect(result.files).toHaveLength(1);
+    expect(result.files[0].action).toBe('not-found');
+  });
+
+  it('copilot-jetbrains: detect() reports installed from the intellij config dir', () => {
+    const t = getTarget('copilot-jetbrains')!;
+    expect(t.detect('global').installed).toBe(false);
+    fs.mkdirSync(path.join(tmpHome, '.config', 'github-copilot', 'intellij'), { recursive: true });
+    expect(t.detect('global').installed).toBe(true);
+    expect(t.detect('global').alreadyConfigured).toBe(false);
+  });
+
+  it('copilot-jetbrains: printConfig matches what install writes and names the IDE settings path', () => {
+    const t = getTarget('copilot-jetbrains')!;
+    const out = t.printConfig('global');
+    expect(out).toContain('Settings → Tools → GitHub Copilot');
+    const printed = snippetJson(out);
+    const result = t.install('global', { autoAllow: true });
+    const onDisk = JSON.parse(fs.readFileSync(result.files[0].path, 'utf-8'));
+    expect(printed.servers.codegraph).toEqual(onDisk.servers.codegraph);
+
+    expect(t.printConfig('local')).toMatch(/--location=global/);
+  });
+
+  it('copilot-jetbrains: install note tells the user to restart the IDE', () => {
+    const t = getTarget('copilot-jetbrains')!;
+    const result = t.install('global', { autoAllow: true });
+    expect(result.notes?.join(' ')).toMatch(/[Rr]estart your JetBrains IDE/);
+  });
+
+  it('copilot family: all three coexist — uninstalling one leaves the others configured', () => {
+    const vscode = getTarget('copilot-vscode')!;
+    const cli = getTarget('copilot-cli')!;
+    const jetbrains = getTarget('copilot-jetbrains')!;
+    vscode.install('global', { autoAllow: true });
+    cli.install('global', { autoAllow: true });
+    jetbrains.install('global', { autoAllow: true });
+
+    cli.uninstall('global');
+
+    expect(cli.detect('global').alreadyConfigured).toBe(false);
+    expect(vscode.detect('global').alreadyConfigured).toBe(true);
+    expect(jetbrains.detect('global').alreadyConfigured).toBe(true);
+  });
+});
+
+describe('Installer targets — Claude CLAUDE_CONFIG_DIR override (#1627)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('home');
+    tmpCwd = mkTmpDir('cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  it.each(['absolute', 'relative'])('global install honors %s CLAUDE_CONFIG_DIR paths', (kind) => {
+    const custom = path.join(tmpHome, 'claude profile');
+    process.env.CLAUDE_CONFIG_DIR = kind === 'relative' ? path.relative(tmpCwd, custom) : custom;
+
+    const claude = getTarget('claude')!;
+    const result = claude.install('global', { autoAllow: true });
+    const paths = [
+      path.join(custom, '.claude.json'),
+      path.join(custom, 'settings.json'),
+      path.join(custom, 'CLAUDE.md'),
+    ] as const;
+
+    expect(result.files.map((f) => f.path)).toEqual(paths);
+    const mcp = JSON.parse(fs.readFileSync(paths[0], 'utf-8'));
+    expect(mcp.mcpServers.codegraph.alwaysLoad).toBe(true);
+    const settings = JSON.parse(fs.readFileSync(paths[1], 'utf-8'));
+    expect(settings.permissions.allow).toContain('mcp__codegraph__*');
+    expect(fs.readFileSync(paths[2], 'utf-8')).toContain('codegraph explore');
+    expect(claude.describePaths('global')).toEqual(paths);
+    expect(claude.printConfig('global')).toContain(`# Add to ${paths[0]}`);
+
+    const before = paths.map((p) => fs.readFileSync(p, 'utf-8'));
+    expect(claude.install('global', { autoAllow: true }).files.every((f) => f.action === 'unchanged')).toBe(true);
+    expect(paths.map((p) => fs.readFileSync(p, 'utf-8'))).toEqual(before);
+    expect(fs.existsSync(path.join(tmpHome, '.claude'))).toBe(false);
+    expect(fs.existsSync(path.join(tmpHome, '.claude.json'))).toBe(false);
+  });
+
+  it('detect and uninstall follow CLAUDE_CONFIG_DIR without touching the default profile', () => {
+    const claude = getTarget('claude')!;
+    claude.install('global', { autoAllow: true });
+    const defaults = claude.describePaths('global');
+    const before = defaults.map((p) => fs.readFileSync(p, 'utf-8'));
+
+    const custom = path.join(tmpHome, 'claude-profile');
+    process.env.CLAUDE_CONFIG_DIR = custom;
+    const mcpPath = path.join(custom, '.claude.json');
+    expect(claude.detect('global')).toEqual({
+      installed: false, alreadyConfigured: false, configPath: mcpPath,
+    });
+
+    claude.install('global', { autoAllow: true });
+    expect(claude.detect('global')).toEqual({
+      installed: true, alreadyConfigured: true, configPath: mcpPath,
+    });
+
+    const removed = claude.uninstall('global');
+    expect(removed.files).toEqual([
+      { path: mcpPath, action: 'removed' },
+      { path: path.join(custom, 'settings.json'), action: 'removed' },
+      { path: path.join(custom, 'CLAUDE.md'), action: 'removed' },
+    ]);
+    expect(JSON.parse(fs.readFileSync(mcpPath, 'utf-8')).mcpServers).toBeUndefined();
+    expect(JSON.parse(fs.readFileSync(path.join(custom, 'settings.json'), 'utf-8')).permissions).toBeUndefined();
+    expect(fs.existsSync(path.join(custom, 'CLAUDE.md'))).toBe(false);
+    expect(claude.detect('global').alreadyConfigured).toBe(false);
+    expect(defaults.map((p) => fs.readFileSync(p, 'utf-8'))).toEqual(before);
+  });
+
+  it.each([undefined, '', '   '])('falls back to the default profile when CLAUDE_CONFIG_DIR is %j', (override) => {
+    if (override !== undefined) process.env.CLAUDE_CONFIG_DIR = override;
+    const claude = getTarget('claude')!;
+    const result = claude.install('global', { autoAllow: true });
+
+    expect(result.files.map((f) => f.path)).toEqual([
+      path.join(tmpHome, '.claude.json'),
+      path.join(tmpHome, '.claude', 'settings.json'),
+      path.join(tmpHome, '.claude', 'CLAUDE.md'),
+    ]);
+    expect(JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude.json'), 'utf-8')).mcpServers.codegraph).toBeDefined();
+    expect(fs.existsSync(path.join(tmpHome, '.claude', 'settings.json'))).toBe(true);
+    expect(fs.existsSync(path.join(tmpHome, '.claude', 'CLAUDE.md'))).toBe(true);
+    // Claude Code keeps the default MCP JSON beside ~/.claude, not inside it.
+    expect(fs.existsSync(path.join(tmpHome, '.claude', '.claude.json'))).toBe(false);
+  });
+
+  it('leaves local install, detect, and uninstall unaffected by CLAUDE_CONFIG_DIR', () => {
+    const custom = path.join(tmpHome, 'claude-profile');
+    process.env.CLAUDE_CONFIG_DIR = custom;
+    const claude = getTarget('claude')!;
+    const result = claude.install('local', { autoAllow: true });
+    const mcpPath = path.join(tmpCwd, '.mcp.json');
+
+    expect(result.files.map((f) => f.path)).toEqual([
+      mcpPath,
+      path.join(tmpCwd, '.claude', 'settings.json'),
+      path.join(tmpCwd, '.claude', 'CLAUDE.md'),
+    ]);
+    expect(JSON.parse(fs.readFileSync(mcpPath, 'utf-8')).mcpServers.codegraph).toBeDefined();
+    expect(claude.detect('local')).toEqual({
+      installed: true, alreadyConfigured: true, configPath: mcpPath,
+    });
+    claude.uninstall('local');
+    expect(claude.detect('local').alreadyConfigured).toBe(false);
+    expect(fs.existsSync(custom)).toBe(false);
+    expect(fs.existsSync(path.join(tmpHome, '.claude'))).toBe(false);
+    expect(fs.existsSync(path.join(tmpHome, '.claude.json'))).toBe(false);
+  });
+});
+
+describe('Installer targets — Codex CODEX_HOME override (#1627)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('home');
+    tmpCwd = mkTmpDir('cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  const defaultDir = () => path.join(tmpHome, '.codex');
+
+  it('global install writes to $CODEX_HOME, not ~/.codex', () => {
+    const custom = path.join(tmpHome, 'codex-profile');
+    process.env.CODEX_HOME = custom;
+
+    const codex = getTarget('codex')!;
+    const result = codex.install('global', { autoAllow: false });
+
+    const toml = result.files.find((f) => f.path.endsWith('config.toml'))!;
+    expect(path.resolve(toml.path)).toBe(path.resolve(path.join(custom, 'config.toml')));
+    expect(fs.readFileSync(path.join(custom, 'config.toml'), 'utf-8')).toContain('[mcp_servers.codegraph]');
+    // The global AGENTS.md follows the config dir.
+    expect(fs.existsSync(path.join(custom, 'AGENTS.md'))).toBe(true);
+    // Nothing of ours may land in the default profile Codex is not reading.
+    expect(fs.existsSync(defaultDir())).toBe(false);
+  });
+
+  it('detect and uninstall follow $CODEX_HOME too', () => {
+    const custom = path.join(tmpHome, 'codex-profile');
+    process.env.CODEX_HOME = custom;
+    const codex = getTarget('codex')!;
+
+    expect(codex.detect('global').alreadyConfigured).toBe(false);
+    codex.install('global', { autoAllow: false });
+
+    const detected = codex.detect('global');
+    expect(detected.alreadyConfigured).toBe(true);
+    expect(path.resolve(detected.configPath!)).toBe(path.resolve(path.join(custom, 'config.toml')));
+
+    const removed = codex.uninstall('global');
+    expect(path.resolve(removed.files.find((f) => f.path.endsWith('config.toml'))!.path))
+      .toBe(path.resolve(path.join(custom, 'config.toml')));
+    // Our table was the only content, so the file goes with it.
+    expect(fs.existsSync(path.join(custom, 'config.toml'))).toBe(false);
+  });
+
+  it('falls back to ~/.codex when CODEX_HOME is unset or blank', () => {
+    const codex = getTarget('codex')!;
+    codex.install('global', { autoAllow: false });
+    expect(fs.existsSync(path.join(defaultDir(), 'config.toml'))).toBe(true);
+
+    fs.rmSync(defaultDir(), { recursive: true, force: true });
+    process.env.CODEX_HOME = '   '; // set-but-empty must not become the config dir
+    codex.install('global', { autoAllow: false });
+    expect(fs.existsSync(path.join(defaultDir(), 'config.toml'))).toBe(true);
+  });
+
+  it('leaves the local install alone — CODEX_HOME is the user layer only (#1531)', () => {
+    const custom = path.join(tmpHome, 'codex-profile');
+    process.env.CODEX_HOME = custom;
+
+    const codex = getTarget('codex')!;
+    const result = codex.install('local', { autoAllow: false });
+
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    expect(paths.some((p) => p.endsWith('/.codex/config.toml'))).toBe(true);
+    expect(fs.existsSync(path.join(process.cwd(), '.codex', 'config.toml'))).toBe(true);
+    // The project layer lives beside the project, never under the user profile.
+    expect(fs.existsSync(path.join(custom, 'config.toml'))).toBe(false);
   });
 });

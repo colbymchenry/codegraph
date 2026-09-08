@@ -149,6 +149,28 @@ describe('Sync Module', () => {
         expect(result.filesRemoved).toBe(0);
         expect(result.filesChecked).toBeGreaterThan(0);
       });
+
+      it('persists an oversized skipped file so later syncs do not retry it (#1557)', async () => {
+        const filePath = path.join(testDir, 'src', 'oversized.ts');
+        fs.writeFileSync(filePath, 'const value = 1;\n'.repeat(70_000));
+
+        const first = await cg.sync();
+        expect(first.filesAdded).toBe(1);
+        expect(cg.getFiles().find((f) => f.path === 'src/oversized.ts')?.errors?.[0]?.code).toBe('size_exceeded');
+
+        const second = await cg.sync();
+        expect(second.filesAdded).toBe(0);
+        expect(second.filesModified).toBe(0);
+      });
+
+      it('marks a successfully recovered indexing state complete (#1556)', async () => {
+        (cg as any).queries.setMetadata('index_state', 'indexing');
+        await cg.sync({ paths: ['src/index.ts'] });
+        expect(cg.getIndexState()).toBe('indexing');
+
+        await cg.sync();
+        expect(cg.getIndexState()).toBe('complete');
+      });
     });
   });
 
@@ -828,5 +850,34 @@ describe('Scoped sync parity (#watcher-scoped)', () => {
     expect(scoped.filesRemoved).toBe(0);
     // b.ts untouched and still present
     expect(cg.searchNodes('beta').length).toBeGreaterThan(0);
+  });
+
+  it('a scoped path that codegraph.json now excludes is removed, never re-parsed (#1590)', async () => {
+    // The daemon's watcher hands sync the exact edited path. If the project's
+    // scope changed underneath it, that path must be treated the way the full
+    // scan treats it — out of scope, hence gone — never parsed on trust.
+    const cfg = path.join(testDir, 'codegraph.json');
+    fs.writeFileSync(cfg, JSON.stringify({ exclude: ['src/b.ts'] }));
+    fs.writeFileSync(path.join(testDir, 'src', 'b.ts'), `export function beta() { return 2; }\nexport function gamma() { return 3; }`);
+    const scoped = await cg.sync({ paths: ['src/b.ts'] });
+    expect(scoped.filesRemoved).toBe(1);
+    expect(scoped.filesModified).toBe(0);
+    expect(scoped.filesAdded).toBe(0);
+    expect(cg.searchNodes('gamma').length).toBe(0);
+    expect(cg.searchNodes('beta').filter((r) => r.node.filePath === 'src/b.ts').length).toBe(0);
+    // Idempotent: the file stays out on a repeat scoped sync.
+    const again = await cg.sync({ paths: ['src/b.ts'] });
+    expect(again.filesRemoved).toBe(0);
+    expect(again.filesAdded).toBe(0);
+
+    // Dropping the exclude readmits it through the same scoped path. The
+    // scope matcher is mtime-keyed, so give the rewrite a distinct mtime even
+    // on a coarse-timestamp filesystem.
+    fs.writeFileSync(cfg, JSON.stringify({}));
+    const later = new Date(Date.now() + 5000);
+    fs.utimesSync(cfg, later, later);
+    const readmitted = await cg.sync({ paths: ['src/b.ts'] });
+    expect(readmitted.filesAdded).toBe(1);
+    expect(cg.searchNodes('gamma').length).toBe(1);
   });
 });

@@ -74,6 +74,7 @@ export default defineConfig({
 					label: 'Guides',
 					items: [
 						{ label: 'Indexing a Project', slug: 'guides/indexing' },
+						{ label: 'Reading Your Graph in the Browser', slug: 'guides/viewer' },
 						{ label: 'Framework Routes', slug: 'guides/framework-routes' },
 						{ label: 'Affected Tests in CI', slug: 'guides/affected-tests' },
 					],

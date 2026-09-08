@@ -4,7 +4,7 @@
  * Types for the reference resolution system.
  */
 
-import { Language, Node, ReferenceKind } from '../types';
+import { EdgeKind, Language, Node, ReferenceKind } from '../types';
 
 /**
  * An unresolved reference from extraction
@@ -43,6 +43,28 @@ export interface ResolvedRef {
   confidence: number;
   /** How it was resolved */
   resolvedBy: 'exact-match' | 'import' | 'qualified-name' | 'framework' | 'fuzzy' | 'instance-method' | 'file-path' | 'function-ref';
+  /**
+   * Edge kind the edge should carry when it is NOT the ref's own kind — a
+   * framework that turns a `calls` ref into a `navigates` edge, for example.
+   * The original kind is still recorded on the edge as `metadata.refKind`, so
+   * re-resolution after a target is removed reconstructs the ref faithfully.
+   */
+  edgeKind?: EdgeKind;
+  /** Extra metadata the strategy wants persisted on the edge (`href`, …). */
+  metadata?: Record<string, unknown>;
+  /**
+   * The OTHER targets, when one reference names several.
+   *
+   * A navigation whose destination is a conditional reaches every arm —
+   * `!isAdmin ? keyword ? '/search/…' : '/page/…' : '/admin/…'` is one call
+   * and three screens — and drawing only the first would hide two places the
+   * code goes. `createEdges` fans these out into an edge apiece, sharing this
+   * resolution's kind and confidence; each carries its own metadata.
+   *
+   * The reference itself still resolves ONCE, so the resolution pipeline's
+   * bookkeeping — cleanup by row id, counts, re-resolution — is unchanged.
+   */
+  alsoTargets?: { targetNodeId: string; metadata?: Record<string, unknown> }[];
 }
 
 /**

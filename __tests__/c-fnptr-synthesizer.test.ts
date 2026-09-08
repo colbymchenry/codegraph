@@ -86,6 +86,45 @@ int dispatch(struct ops o) { return o.handler(); }
     expect(edges.every((e) => e.via === 'ops.handler')).toBe(true);
   });
 
+  it('bridges function-pointer fields declared in a union', async () => {
+    write('union-ops.c', `
+union ops { int (*handler)(void); };
+static int on_open(void) { return 1; }
+static union ops the_ops = { .handler = on_open };
+
+int dispatch(union ops o) { return o.handler(); }
+`);
+    const edges = await load();
+    expect(has(edges, 'dispatch', 'on_open')).toBe(true);
+    expect(edges.every((e) => e.via === 'ops.handler')).toBe(true);
+  });
+
+  it('bridges an inline union table whose entries are macro-built', async () => {
+    write('inline-union.c', `
+#define SLOT(fn) { fn }
+static int on_open(void) { return 1; }
+static union inline_ops { int (*handler)(void); } ops[] = { SLOT(on_open) };
+
+int dispatch(union inline_ops o) { return o.handler(); }
+`);
+    const edges = await load();
+    expect(has(edges, 'dispatch', 'on_open')).toBe(true);
+  });
+
+  it('bridges a union table declared through an object-macro type alias', async () => {
+    write('alias-union.c', `
+#define OPS_TYPE union ops
+#define SLOT(fn) { fn }
+union ops { int (*handler)(void); };
+static int on_open(void) { return 1; }
+static OPS_TYPE ops[] = { SLOT(on_open) };
+
+int dispatch(union ops o) { return o.handler(); }
+`);
+    const edges = await load();
+    expect(has(edges, 'dispatch', 'on_open')).toBe(true);
+  });
+
   it('bridges the typedef-field + field←field double-hop (the hook_demo.c shape)', async () => {
     write('hook.c', `
 typedef void (*hook_func)(void);

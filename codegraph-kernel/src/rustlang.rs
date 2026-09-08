@@ -11,10 +11,11 @@
 //! - impl blocks push NO scope: members re-dispatch at file scope, so an impl
 //!   associated `const` becomes a FILE-level `variable`, and the method↔owner
 //!   `contains` edge is a source-order name scan (an impl ABOVE its struct
-//!   gets no edge). `impl Trait for Generic<T>`'s receiver resolves to the
-//!   TRAIT (the only direct type_identifier), and methods get QN
-//!   `Trait::method` — preserve, never "fix" via the grammar's trait:/type:
-//!   fields.
+//!   gets no edge). The receiver (method QN prefix, `contains` owner,
+//!   `implements` source) is the impl_item's `type` field via
+//!   impl_type_name — both sides moved to the grammar's trait:/type: fields
+//!   together in #1588 (the earlier positional scan qualified every
+//!   parameterized impl's methods by the TRAIT).
 //! - `const_item`/`static_item` ride the generic extractVariable fallback:
 //!   kind is always `variable`, no signature, and EVERY direct `identifier`
 //!   child mints a node (`const MAX: u32 = OTHER;` → two nodes, `MAX` + the
@@ -22,10 +23,12 @@
 //! - Unit structs (`struct Unit;`, no body field) mint NO node; `mod_item`
 //!   mints no module node and adds no QN prefix.
 //! - Chained-call re-encode is scoped_identifier-gated (`Foo::new().bar()` →
-//!   `Foo::new().bar`); instance chains, parens, `.await`, 2-hop fields, and
-//!   `self` receivers all collapse to the bare method name (`self` is node
-//!   kind `self`, not `identifier`, so it dodges SKIP_RECEIVERS by falling
-//!   through). Turbofish callees keep the raw `helper::<T>` text.
+//!   `Foo::new().bar`); a call through a field of the enclosing type keeps
+//!   the owner-field shape (`self.inner.run()` → `self.inner.run`, #1585);
+//!   instance chains, parens, `.await`, deeper/non-self field chains, and
+//!   bare `self` receivers all collapse to the bare method name (`self` is
+//!   node kind `self`, not `identifier`, so it dodges SKIP_RECEIVERS by
+//!   falling through). Turbofish callees keep the raw `helper::<T>` text.
 //! - `use` emits an import node named by the ROOT module (`crate`/`self`/…),
 //!   one root `imports` ref, then one FULL-path `imports` ref per binding;
 //!   `use x::*` (use_wildcard) emits nothing at all.
@@ -217,7 +220,7 @@ impl<'t> Walker<'t> {
     fn inside_class_like(&self) -> bool {
         self.stack
             .last()
-            .map(|s| matches!(s.kind, "class" | "struct" | "interface" | "trait" | "enum" | "module"))
+            .map(|s| matches!(s.kind, "class" | "struct" | "union" | "interface" | "trait" | "enum" | "module"))
             .unwrap_or(false)
     }
 
@@ -326,7 +329,7 @@ impl<'t> Walker<'t> {
             let parent_ok = self
                 .stack
                 .last()
-                .map(|s| matches!(s.kind, "file" | "class" | "module" | "struct" | "enum"))
+                .map(|s| matches!(s.kind, "file" | "class" | "module" | "struct" | "union" | "enum"))
                 .unwrap_or(false);
             if parent_ok {
                 self.fs_values.insert(name.to_string(), row);
@@ -399,33 +402,35 @@ impl<'t> Walker<'t> {
         Some(if last == "Self" { "self".to_string() } else { last.to_string() })
     }
 
-    /// rustExtractor.getReceiverType: parent-walk to the nearest impl_item;
-    /// LAST direct type_identifier child wins (for `impl Trait for Generic<T>`
-    /// that's the TRAIT — bug preserved); else the first generic_type's inner
-    /// type_identifier.
+    /// rustImplTypeName (languages/rust.ts) — the implementing type's simple
+    /// name for an impl block, from the grammar's `type` field (#1588):
+    /// `impl<T> Tr for G<T>` / `impl<'a> Iterator for Parents<'a>` /
+    /// `impl Tr for &Foo` / `impl Tr for m::Foo` → `G` / `Parents` / `Foo` /
+    /// `Foo`. Shapes naming no single type (tuple, `dyn Tr`, pointer,
+    /// primitive, fn type…) → None. Mirrored byte-for-byte — change both.
+    fn impl_type_name(&self, ty: Option<Node>) -> Option<String> {
+        let ty = ty?;
+        match ty.kind() {
+            "type_identifier" | "identifier" => Some(self.text(ty).to_string()),
+            "generic_type" => self.impl_type_name(ty.child_by_field_name("type")),
+            "scoped_type_identifier" | "scoped_identifier" => {
+                self.impl_type_name(ty.child_by_field_name("name"))
+            }
+            "reference_type" => self.impl_type_name(ty.child_by_field_name("type")),
+            _ => None,
+        }
+    }
+
+    /// rustExtractor.getReceiverType: parent-walk to the nearest impl_item and
+    /// read its `type` field (impl_type_name). The pre-#1588 rule took the
+    /// LAST direct type_identifier child, which for `impl Trait for Generic<T>`
+    /// was the TRAIT — so every parameterized impl's methods were qualified by
+    /// the trait.
     fn receiver_type_of(&self, node: Node) -> Option<String> {
         let mut parent = node.parent();
         while let Some(p) = parent {
             if p.kind() == "impl_item" {
-                let type_idents: Vec<Node> = (0..p.named_child_count())
-                    .filter_map(|i| p.named_child(i))
-                    .filter(|c| c.kind() == "type_identifier")
-                    .collect();
-                if let Some(last) = type_idents.last() {
-                    return Some(self.text(*last).to_string());
-                }
-                let generic = (0..p.named_child_count())
-                    .filter_map(|i| p.named_child(i))
-                    .find(|c| c.kind() == "generic_type");
-                if let Some(g) = generic {
-                    let inner = (0..g.named_child_count())
-                        .filter_map(|i| g.named_child(i))
-                        .find(|c| c.kind() == "type_identifier");
-                    if let Some(inner) = inner {
-                        return Some(self.text(inner).to_string());
-                    }
-                }
-                return None;
+                return self.impl_type_name(p.child_by_field_name("type"));
             }
             parent = p.parent();
         }
@@ -435,6 +440,7 @@ impl<'t> Walker<'t> {
     // --- visitNode ------------------------------------------------------------
 
     fn visit_node(&mut self, node: Node<'t>) {
+        stack_guard!();
         let kind = node.kind();
         let mut skip_children = false;
 
@@ -447,7 +453,10 @@ impl<'t> Walker<'t> {
             self.extract_interface(node);
             skip_children = true;
         } else if kind == "struct_item" {
-            self.extract_struct(node);
+            self.extract_aggregate(node, "struct");
+            skip_children = true;
+        } else if kind == "union_item" {
+            self.extract_aggregate(node, "union");
             skip_children = true;
         } else if kind == "enum_item" {
             self.extract_enum(node);
@@ -495,6 +504,7 @@ impl<'t> Walker<'t> {
     /// impl method's body, whose parent walk passes through the outer fn) or
     /// the stack top is class-like (trait members).
     fn extract_fn_or_method(&mut self, node: Node<'t>) {
+        stack_guard!();
         let receiver = self.receiver_type_of(node);
         let as_method = receiver.is_some() || self.inside_class_like();
 
@@ -529,7 +539,7 @@ impl<'t> Walker<'t> {
                     .iter()
                     .position(|m| {
                         m.name == *receiver
-                            && matches!(m.kind, "struct" | "class" | "enum" | "trait")
+                            && matches!(m.kind, "struct" | "union" | "class" | "enum" | "trait")
                     })
                     .map(|i| i as u32);
                 if let Some(owner_row) = owner_row {
@@ -561,6 +571,7 @@ impl<'t> Walker<'t> {
     /// extractInterface — kind `trait` (interfaceKind), inheritance from
     /// trait_bounds, body children visited with the trait pushed.
     fn extract_interface(&mut self, node: Node<'t>) {
+        stack_guard!();
         let name = self.extract_name(node);
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
@@ -579,9 +590,9 @@ impl<'t> Walker<'t> {
         self.stack.pop();
     }
 
-    /// extractStruct — body field REQUIRED (unit structs mint no node; tuple
-    /// structs' ordered_field_declaration_list is a body).
-    fn extract_struct(&mut self, node: Node<'t>) {
+    /// Extract a Rust struct or union with a body; unit structs remain skipped.
+    fn extract_aggregate(&mut self, node: Node<'t>, kind: &'static str) {
+        stack_guard!();
         let Some(body) = node.child_by_field_name("body") else { return };
         let name = self.extract_name(node);
         let extra = Extra {
@@ -589,10 +600,10 @@ impl<'t> Walker<'t> {
             visibility: Some(self.visibility_of(node)),
             ..Extra::default()
         };
-        let Some(row) = self.create_node("struct", &name, node, extra) else { return };
+        let Some(row) = self.create_node(kind, &name, node, extra) else { return };
         self.extract_inheritance(node, row);
 
-        self.stack.push(Scope { row, kind: "struct", name });
+        self.stack.push(Scope { row, kind, name });
         for i in 0..body.named_child_count() {
             if let Some(c) = body.named_child(i) {
                 self.visit_node(c);
@@ -604,6 +615,7 @@ impl<'t> Walker<'t> {
     /// extractEnum — body required; enum_variant children → enum_member nodes
     /// (name field only, payloads never walked); other children re-dispatched.
     fn extract_enum(&mut self, node: Node<'t>) {
+        stack_guard!();
         let Some(body) = node.child_by_field_name("body") else { return };
         let name = self.extract_name(node);
         let extra = Extra {
@@ -698,6 +710,7 @@ impl<'t> Walker<'t> {
 
     /// getRootModule (languages/rust.ts:124).
     fn root_module(&self, n: Node) -> String {
+        stack_guard!();
         let Some(first) = n.named_child(0) else {
             return self.text(n).to_string();
         };
@@ -717,6 +730,7 @@ impl<'t> Walker<'t> {
             if prefix.is_empty() { seg.to_string() } else { format!("{prefix}::{seg}") }
         }
         fn collect<'t>(w: &Walker<'t>, n: Node<'t>, prefix: &str, paths: &mut Vec<(String, Node<'t>)>) {
+            stack_guard!();
             match n.kind() {
                 "identifier" => paths.push((join(prefix, w.text(n)), n)),
                 "scoped_identifier" => {
@@ -833,9 +847,29 @@ impl<'t> Walker<'t> {
                                     callee_name = method_name.to_string();
                                 }
                             }
+                            "field_expression" => {
+                                // `self.<field>.<method>()` — a call through a
+                                // field of the enclosing type (#1585): keep the
+                                // `self.` prefix so the resolver can type the
+                                // field from the owner struct's declaration
+                                // (or leave it unresolved). Any other
+                                // field_expression receiver — a deeper chain,
+                                // a non-self base — keeps the bare name.
+                                let base = r.child_by_field_name("value");
+                                let field = r.child_by_field_name("field");
+                                match (base, field) {
+                                    (Some(b), Some(f))
+                                        if b.kind() == "self" && f.kind() == "field_identifier" =>
+                                    {
+                                        let field_name = self.text(f);
+                                        callee_name = format!("self.{field_name}.{method_name}");
+                                    }
+                                    _ => callee_name = method_name.to_string(),
+                                }
+                            }
                             _ => {
-                                // field_expression 2-hop, parenthesized,
-                                // await_expression, `self` — bare method name.
+                                // parenthesized, await_expression, `self` —
+                                // bare method name.
                                 callee_name = method_name.to_string();
                             }
                         }
@@ -964,6 +998,7 @@ impl<'t> Walker<'t> {
     /// every field has a field_identifier), and the field_declaration_list
     /// recursion that reaches it.
     fn extract_inheritance(&mut self, node: Node<'t>, class_row: u32) {
+        stack_guard!();
         let extends_kind = edge_kind_index("extends").unwrap();
         for i in 0..node.named_child_count() {
             let Some(child) = node.named_child(i) else { continue };
@@ -1022,42 +1057,25 @@ impl<'t> Walker<'t> {
         }
     }
 
-    /// extractRustImplItem — `impl Trait for Type` back-reference: positional
-    /// type-node filter (NEVER the grammar's trait:/type: fields), ≥2 needed,
-    /// target found by FIRST earlier node of kind struct/enum/class (never
-    /// trait); ref FROM the type's node, named by the trait's full text.
+    /// extractRustImplItem — `impl Trait for Type` back-reference from the
+    /// grammar's `trait` / `type` fields (#1588; an inherent impl has no
+    /// `trait` field and emits nothing). Target = FIRST earlier node of kind
+    /// struct/union/enum/class (never trait) named by impl_type_name; ref FROM
+    /// the type's node, named by the trait's full text (scoped path / generic
+    /// args kept), at the trait node's position.
     fn extract_rust_impl_item(&mut self, node: Node<'t>) {
-        let has_for = (0..node.child_count())
-            .filter_map(|i| node.child(i))
-            .any(|c| c.kind() == "for" && !c.is_named());
-        if !has_for {
+        let Some(trait_node) = node.child_by_field_name("trait") else {
             return;
-        }
-        let type_idents: Vec<Node> = (0..node.named_child_count())
-            .filter_map(|i| node.named_child(i))
-            .filter(|c| matches!(c.kind(), "type_identifier" | "generic_type" | "scoped_type_identifier"))
-            .collect();
-        if type_idents.len() < 2 {
-            return;
-        }
-        let trait_node = type_idents[0];
-        let type_node = type_idents[type_idents.len() - 1];
-
+        };
         let trait_name = self.text(trait_node).to_string();
-        let type_name = if type_node.kind() == "generic_type" {
-            (0..type_node.named_child_count())
-                .filter_map(|i| type_node.named_child(i))
-                .find(|c| c.kind() == "type_identifier")
-                .map(|c| self.text(c).to_string())
-                .unwrap_or_else(|| self.text(type_node).to_string())
-        } else {
-            self.text(type_node).to_string()
+        let Some(type_name) = self.impl_type_name(node.child_by_field_name("type")) else {
+            return;
         };
 
         let target_row = self
             .nodes_meta
             .iter()
-            .position(|m| m.name == type_name && matches!(m.kind, "struct" | "enum" | "class"))
+            .position(|m| m.name == type_name && matches!(m.kind, "struct" | "union" | "enum" | "class"))
             .map(|i| i as u32);
         if let Some(target_row) = target_row {
             self.push_ref_at(target_row, &trait_name, edge_kind_index("implements").unwrap(), trait_node);
@@ -1084,6 +1102,7 @@ impl<'t> Walker<'t> {
     }
 
     fn extract_type_refs_from_subtree(&mut self, node: Node<'t>, from_row: u32) {
+        stack_guard!();
         if node.kind() == "type_identifier" {
             let type_name = self.text(node).to_string();
             if !type_name.is_empty() && !is_builtin_type(&type_name) {
@@ -1101,10 +1120,12 @@ impl<'t> Walker<'t> {
     // --- visitFunctionBody -----------------------------------------------------
 
     fn visit_function_body(&mut self, body: Node<'t>) {
+        stack_guard!();
         self.visit_for_calls_and_structure(body);
     }
 
     fn visit_for_calls_and_structure(&mut self, node: Node<'t>) {
+        stack_guard!();
         let kind = node.kind();
         self.maybe_capture_fn_refs(node);
 
@@ -1131,7 +1152,11 @@ impl<'t> Walker<'t> {
 
         // Structural nodes inside bodies.
         if kind == "struct_item" {
-            self.extract_struct(node);
+            self.extract_aggregate(node, "struct");
+            return;
+        }
+        if kind == "union_item" {
+            self.extract_aggregate(node, "union");
             return;
         }
         if kind == "enum_item" {
@@ -1256,6 +1281,7 @@ impl<'t> Walker<'t> {
     }
 
     fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32) {
+        stack_guard!();
         if depth > 12 {
             return;
         }

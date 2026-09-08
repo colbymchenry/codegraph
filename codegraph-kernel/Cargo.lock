@@ -47,6 +47,7 @@ name = "codegraph-kernel"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "libc",
  "napi",
  "napi-build",
  "napi-derive",

@@ -7,6 +7,7 @@
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolutionContext, FrameworkExtractionResult } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
+import { resolveImportPath } from '../import-resolver';
 
 export const djangoResolver: FrameworkResolver = {
   name: 'django',
@@ -242,6 +243,22 @@ export const fastapiResolver: FrameworkResolver = {
       const content = context.readFile(file);
       if (content && content.includes('FastAPI(')) return true;
     }
+    // A service that is one directory of a monorepo (`backend/pyproject.toml`,
+    // `backend/app/main.py`): its manifest or its app object sits below the root.
+    let looked = 0;
+    for (const file of context.getAllFiles()) {
+      const norm = file.replace(/\\/g, '/');
+      const base = norm.slice(norm.lastIndexOf('/') + 1);
+      if (base === 'requirements.txt' || base === 'pyproject.toml' || base === 'requirements-dev.txt') {
+        const content = context.readFile(file);
+        if (content && /\bfastapi\b/i.test(content)) return true;
+        if (++looked >= 40) break;
+      } else if ((base === 'main.py' || base === 'app.py' || base === 'api.py') && norm.split('/').length <= 4) {
+        const content = context.readFile(file);
+        if (content && content.includes('FastAPI(')) return true;
+        if (++looked >= 40) break;
+      }
+    }
     return false;
   },
 
@@ -270,7 +287,144 @@ export const fastapiResolver: FrameworkResolver = {
       language: 'python',
     });
   },
+
+  /**
+   * Cross-file finalization for prefixes. A router's routes are written
+   * relative to where it is mounted —
+   *
+   *   router = APIRouter(prefix="/items")                 # items.py
+   *   api_router.include_router(items.router)              # api.py
+   *   app.include_router(api_router, prefix="/api/v1")     # main.py
+   *   @router.get("/{id}")                                 # → GET /api/v1/items/{id}
+   *
+   * — and per-file `extract()` can only see `GET /{id}`. This pass reads every
+   * `APIRouter(prefix=…)` and every `X.include_router(router, prefix=…)` whose
+   * prefix is a literal (a `settings.API_V1_STR` is unknown and that mount is
+   * left alone), resolves the included router to the file and variable it is
+   * (`items.router` through the module import, `items_router` through the
+   * alias, a local name), composes the prefixes down the tree, and renames the
+   * routes decorated with each router to the path a request takes. `id` and
+   * `qualifiedName` are preserved, so the pass is idempotent on every sync.
+   */
+  postExtract(context) {
+    interface Mount {
+      fromVar: string;
+      prefix: string;
+      target: { file: string; variable: string };
+    }
+    const own = new Map<string, Map<string, string>>(); // file → router variable → APIRouter(prefix=)
+    const mounts = new Map<string, Mount[]>(); // mounting file → mounts
+    const receivers = new Map<string, Map<number, string>>(); // file → decorator line → router variable
+    for (const file of context.getAllFiles()) {
+      if (!file.endsWith('.py')) continue;
+      const content = context.readFile(file);
+      if (!content || (!content.includes('APIRouter') && !content.includes('include_router'))) continue;
+      const safe = stripCommentsForRegex(content, 'python');
+      const vars = new Map<string, string>();
+      const decl = /\b([A-Za-z_]\w*)\s*=\s*APIRouter\s*\(([^)]*)\)/g;
+      let m: RegExpExecArray | null;
+      while ((m = decl.exec(safe)) !== null) {
+        const p = /\bprefix\s*=\s*['"]([^'"]*)['"]/.exec(m[2]!);
+        vars.set(m[1]!, p ? p[1]! : '');
+      }
+      own.set(file, vars);
+      const byLine = new Map<number, string>();
+      const deco = /@([A-Za-z_]\w*)\.(?:get|post|put|patch|delete|options|head)\s*\(/g;
+      while ((m = deco.exec(safe)) !== null) byLine.set(safe.slice(0, m.index).split('\n').length, m[1]!);
+      receivers.set(file, byLine);
+      const inc = /\b([A-Za-z_]\w*)\.include_router\s*\(\s*([A-Za-z_][\w.]*)\s*((?:,[^)]*)?)\)/g;
+      while ((m = inc.exec(safe)) !== null) {
+        const rest = m[3] ?? '';
+        const literal = /\bprefix\s*=\s*['"]([^'"]*)['"]/.exec(rest);
+        if (!literal && /\bprefix\s*=/.test(rest)) continue; // a computed prefix: unknown, not guessed
+        const target = includedRouter(m[2]!, file, vars, context);
+        if (!target) continue;
+        const list = mounts.get(file) ?? [];
+        list.push({ fromVar: m[1]!, prefix: literal ? literal[1]! : '', target });
+        mounts.set(file, list);
+      }
+    }
+    if (mounts.size === 0 && ![...own.values()].some((vars) => [...vars.values()].some((p) => p !== ''))) return [];
+
+    // The include-derived base of each (file, variable): the mounting router's
+    // base, plus its own prefix, plus the mount's — to a fixed point.
+    const key = (file: string, variable: string): string => `${file}\0${variable}`;
+    let base = new Map<string, string>();
+    for (let round = 0; round < 8; round++) {
+      const next = new Map<string, string>();
+      for (const [file, list] of mounts) {
+        for (const mount of list) {
+          const fromBase = base.get(key(file, mount.fromVar)) ?? '';
+          const fromOwn = own.get(file)?.get(mount.fromVar) ?? '';
+          const full = joinPyPaths(joinPyPaths(fromBase, fromOwn), mount.prefix);
+          const k = key(mount.target.file, mount.target.variable);
+          const seen = next.get(k);
+          if (seen !== undefined && seen !== full) next.set(k, '\0'); // two mounts, two paths: ambiguous
+          else next.set(k, full);
+        }
+      }
+      for (const [k, v] of [...next]) if (v === '\0') next.delete(k);
+      let changed = next.size !== base.size;
+      if (!changed) for (const [k, v] of next) if (base.get(k) !== v) changed = true;
+      base = next;
+      if (!changed) break;
+    }
+
+    const updates: Node[] = [];
+    for (const [file, byLine] of receivers) {
+      const vars = own.get(file) ?? new Map<string, string>();
+      for (const route of context.getNodesInFile(file)) {
+        if (route.kind !== 'route') continue;
+        const variable = byLine.get(route.startLine);
+        if (!variable) continue;
+        const prefix = joinPyPaths(base.get(key(file, variable)) ?? '', vars.get(variable) ?? '');
+        if (prefix === '' || prefix === '/') continue;
+        const sep = route.qualifiedName.indexOf('::');
+        const colon = sep < 0 ? -1 : route.qualifiedName.indexOf(':', sep + 2);
+        if (colon < 0) continue;
+        const method = route.qualifiedName.slice(sep + 2, colon);
+        const original = route.qualifiedName.slice(colon + 1);
+        const name = `${method} ${joinPyPaths(prefix, original)}`.trim();
+        if (name !== route.name) updates.push({ ...route, name });
+      }
+    }
+    return updates;
+  },
 };
+
+/** `/api/v1` + `/items` → `/api/v1/items`; `/items` + `` → `/items`; `` + `` → ``. */
+function joinPyPaths(prefix: string, path: string): string {
+  const a = prefix.replace(/\/+$/, '');
+  const b = path.replace(/^\/+/, '');
+  if (!a) return b ? `/${b}` : '';
+  return b ? `${a}/${b}` : a;
+}
+
+/**
+ * The file and variable an `include_router` argument names: `items.router`
+ * through the module's import, `items_router` through an alias import, or a
+ * router defined in the same file.
+ */
+function includedRouter(
+  expr: string,
+  file: string,
+  local: Map<string, string>,
+  context: ResolutionContext
+): { file: string; variable: string } | null {
+  const segs = expr.split('.');
+  const head = segs[0]!;
+  if (segs.length === 1 && local.has(head)) return { file, variable: head };
+  const mapping = context.getImportMappings(file, 'python').find((im) => im.localName === head);
+  if (!mapping) return null;
+  if (segs.length > 1) {
+    // `items.router`: `items` is a module — `from app.api.routes import items`.
+    const moduleFile = resolveImportPath(`${mapping.source}.${mapping.exportedName}`, file, 'python', context) ?? resolveImportPath(mapping.source, file, 'python', context);
+    return moduleFile ? { file: moduleFile, variable: segs[segs.length - 1]! } : null;
+  }
+  // `items_router`: `from .items import router as items_router`.
+  const moduleFile = resolveImportPath(mapping.source, file, 'python', context);
+  return moduleFile ? { file: moduleFile, variable: mapping.exportedName } : null;
+}
 
 interface DecoratorRouteOpts {
   decoratorRegex: RegExp;

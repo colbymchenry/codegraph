@@ -22,8 +22,10 @@ export const SERVER_INSTRUCTIONS = `# Codegraph — code intelligence over an in
 Codegraph is a SQLite knowledge graph of every symbol, edge, and file in
 the workspace — pre-computed structure you would otherwise re-derive by
 reading files (cached intelligence: thousands of parse/trace decisions you
-don't pay to re-reason each run). Reads are sub-millisecond; the index lags
-writes by ~1s through the file watcher. Reach for it BEFORE *and* while
+don't pay to re-reason each run). It indexes 30+ languages
+(TypeScript/JavaScript, Python, Go, Rust, Java, C#, C/C++, PHP, Ruby, Swift,
+Kotlin, and more) — don't assume a language here isn't covered. Reads are
+sub-millisecond; the index lags writes by ~1s through the file watcher. Reach for it BEFORE *and* while
 writing or editing code — not just for questions: one call returns the
 verbatim source PLUS who calls it and what it affects, so you edit with the
 blast radius in view. More accurate context, in far fewer tokens and
@@ -87,7 +89,7 @@ calls; a grep/read exploration is dozens.
 export const SERVER_INSTRUCTIONS_NO_ROOT_INDEX = `# Codegraph — available (per-project; pass projectPath)
 
 Codegraph is a SQLite knowledge graph of a codebase's symbols, edges, and
-files: one \`codegraph_explore\` call returns the verbatim, line-numbered source
+files (30+ languages): one \`codegraph_explore\` call returns the verbatim, line-numbered source
 of the relevant symbols PLUS the call paths between them and a blast-radius
 summary — replacing a grep + Read loop with one round-trip.
 

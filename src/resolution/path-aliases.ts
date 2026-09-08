@@ -11,11 +11,13 @@
  * ignored — every import through an alias was treated as unresolvable
  * unless it happened to match the small hard-coded fallback list.
  *
- * Scope deliberately small for v1:
- *   - reads tsconfig.json, then jsconfig.json
- *   - honours top-level `compilerOptions.baseUrl` and `compilerOptions.paths`
+ * Scope:
+ *   - reads tsconfig.json, then jsconfig.json, then tsconfig.base.json
+ *   - honours `compilerOptions.baseUrl` and `compilerOptions.paths`
+ *   - follows `extends` chains, nearest config wins (#1534) — Nx-style
+ *     monorepos keep every alias in a `tsconfig.base.json` the root
+ *     config merely inherits, so without this they resolved nothing
  *   - supports `*` wildcard (the only TS-supported wildcard)
- *   - does NOT follow `extends` chains yet (most projects don't need it)
  *   - does NOT read Vite/webpack/Rollup configs (separate follow-up)
  *
  * The file is parsed as JSON-with-comments-tolerant — tsconfigs in the
@@ -104,10 +106,116 @@ function stripJsonc(src: string): string {
 }
 
 interface RawTsconfig {
+  extends?: string | string[];
   compilerOptions?: {
     baseUrl?: string;
     paths?: Record<string, string[]>;
   };
+}
+
+/**
+ * The `baseUrl`/`paths` a config ends up with once its `extends` chain has
+ * been folded in. `pathsDir` is the directory of the config that actually
+ * declared `paths` — with no `baseUrl` anywhere, tsc anchors the targets
+ * there, not at the project root.
+ */
+interface EffectiveOptions {
+  baseUrl?: string;
+  paths?: Record<string, string[]>;
+  pathsDir?: string;
+}
+
+/** Guards against a pathological chain; real ones are 1-3 deep. */
+const MAX_EXTENDS_DEPTH = 32;
+
+/**
+ * Locate an `extends` target the way tsc does: `./x`-style values are
+ * relative to the referencing config, anything else is a node_modules
+ * package specifier resolved by walking up from that config. A missing
+ * `.json` extension is implied, and a bare package name means its
+ * `tsconfig.json`.
+ */
+function resolveExtendsTarget(spec: string, fromDir: string): string | null {
+  const isFile = (p: string): boolean => {
+    try {
+      return fs.statSync(p).isFile();
+    } catch {
+      return false;
+    }
+  };
+
+  if (spec.startsWith('./') || spec.startsWith('../') || path.isAbsolute(spec)) {
+    const base = path.resolve(fromDir, spec);
+    for (const cand of [base, `${base}.json`, path.join(base, 'tsconfig.json')]) {
+      if (isFile(cand)) return cand;
+    }
+    return null;
+  }
+
+  let dir = fromDir;
+  for (;;) {
+    const base = path.join(dir, 'node_modules', spec);
+    for (const cand of [base, `${base}.json`, path.join(base, 'tsconfig.json')]) {
+      if (isFile(cand)) return cand;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+/**
+ * Read `filePath` and fold its `extends` chain into a single set of
+ * effective options. Parents are applied first and the nearest config
+ * wins — tsc replaces `paths` wholesale rather than merging it.
+ *
+ * `stack` holds the configs currently being resolved, so a cycle
+ * (`a extends b extends a`) stops instead of recursing forever.
+ */
+function loadEffectiveOptions(
+  filePath: string,
+  stack: Set<string>,
+  depth: number
+): EffectiveOptions | null {
+  const abs = path.resolve(filePath);
+  if (stack.has(abs) || depth > MAX_EXTENDS_DEPTH) {
+    logDebug('path-aliases: extends chain cycle or too deep', { filePath: abs, depth });
+    return null;
+  }
+  const raw = readTsconfigLike(abs);
+  if (!raw) return null;
+
+  stack.add(abs);
+  const dir = path.dirname(abs);
+  const effective: EffectiveOptions = {};
+
+  const parents = typeof raw.extends === 'string' ? [raw.extends] : (raw.extends ?? []);
+  for (const spec of parents) {
+    if (typeof spec !== 'string') continue;
+    const target = resolveExtendsTarget(spec, dir);
+    if (!target) {
+      logDebug('path-aliases: unresolved extends', { from: abs, spec });
+      continue;
+    }
+    const inherited = loadEffectiveOptions(target, stack, depth + 1);
+    if (!inherited) continue;
+    if (inherited.baseUrl !== undefined) effective.baseUrl = inherited.baseUrl;
+    if (inherited.paths !== undefined) {
+      effective.paths = inherited.paths;
+      effective.pathsDir = inherited.pathsDir;
+    }
+  }
+  stack.delete(abs);
+
+  const co = raw.compilerOptions ?? {};
+  // Both are relative to the file that declared them, not to whichever
+  // config started the chain.
+  if (typeof co.baseUrl === 'string') effective.baseUrl = path.resolve(dir, co.baseUrl);
+  if (co.paths && typeof co.paths === 'object') {
+    effective.paths = co.paths;
+    effective.pathsDir = dir;
+  }
+  return effective;
 }
 
 function readTsconfigLike(filePath: string): RawTsconfig | null {
@@ -143,26 +251,40 @@ function splitWildcard(pattern: string): {
  * resolver does it via {@link aliasCache}).
  */
 export function loadProjectAliases(projectRoot: string): AliasMap | null {
-  const candidates = ['tsconfig.json', 'jsconfig.json'];
-  let raw: RawTsconfig | null = null;
+  // `tsconfig.base.json` comes last on purpose: when a root `tsconfig.json`
+  // exists it stays authoritative and reaches the base through `extends`.
+  // The fallback is for the Nx layouts where that never happens — a
+  // solution-style root config (`references`, no `extends`, no `paths`), or
+  // no root `tsconfig.json` at all.
+  const candidates = ['tsconfig.json', 'jsconfig.json', 'tsconfig.base.json'];
+  let effective: EffectiveOptions | null = null;
   let usedFile: string | null = null;
   for (const name of candidates) {
     const p = path.join(projectRoot, name);
-    if (fs.existsSync(p)) {
-      raw = readTsconfigLike(p);
-      if (raw) {
-        usedFile = name;
-        break;
-      }
+    if (!fs.existsSync(p)) continue;
+    const opts = loadEffectiveOptions(p, new Set(), 0);
+    if (!opts) continue;
+    // Remember the first readable config so a `paths`-less project still
+    // logs the file it was judged on, but keep looking: a config that
+    // contributes no aliases must not shadow one that does.
+    if (!effective) {
+      effective = opts;
+      usedFile = name;
+    }
+    if (opts.paths) {
+      effective = opts;
+      usedFile = name;
+      break;
     }
   }
-  if (!raw) return null;
+  if (!effective) return null;
 
-  const co = raw.compilerOptions ?? {};
-  const baseUrlRel = co.baseUrl ?? '.';
-  const baseUrl = path.resolve(projectRoot, baseUrlRel);
+  // With no explicit baseUrl, `paths` targets are relative to the config that
+  // declared them — which is the project root only when that config is the
+  // root one (the pre-`extends` assumption).
+  const baseUrl = effective.baseUrl ?? effective.pathsDir ?? projectRoot;
 
-  const paths = co.paths;
+  const paths = effective.paths;
   if (!paths || typeof paths !== 'object') {
     // baseUrl alone isn't an "alias" per se; with no paths we'd just
     // be redirecting the whole tree. Skip — the existing resolver

@@ -77,7 +77,7 @@ pub const EDGE_ROW_SIZE: usize = 44;
 pub const REF_ROW_SIZE: usize = 40;
 
 /// Mirror of NODE_KINDS in src/types.ts — order is the wire contract.
-pub const NODE_KINDS: [&str; 22] = [
+pub const NODE_KINDS: [&str; 23] = [
     "file",
     "module",
     "class",
@@ -100,10 +100,11 @@ pub const NODE_KINDS: [&str; 22] = [
     "export",
     "route",
     "component",
+    "union",
 ];
 
 /// Mirror of EDGE_KINDS in src/types.ts — order is the wire contract.
-pub const EDGE_KINDS: [&str; 12] = [
+pub const EDGE_KINDS: [&str; 13] = [
     "contains",
     "calls",
     "imports",
@@ -116,6 +117,7 @@ pub const EDGE_KINDS: [&str; 12] = [
     "instantiates",
     "overrides",
     "decorates",
+    "navigates",
 ];
 
 /// ReferenceKind code for the internal-only `function_ref` (#756).
