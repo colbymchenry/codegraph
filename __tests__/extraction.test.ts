@@ -12102,15 +12102,16 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     expect(out.length).toBe(src.length);
     expect(out.split('\n').length).toBe(src.split('\n').length);
     const lines = out.split('\n');
-    // The `else`-led group: directive lines (continuation included) and the
-    // second branch are spaces; the first branch is verbatim.
+    // The `else`-led group opens on a feature test and has an `#else`: the
+    // `#else` branch (the build without the feature) is verbatim; directive
+    // lines (continuation included) and the feature branch are spaces.
     expect(lines[5]).toBe(' '.repeat(src.split('\n')[5]!.length));
     expect(lines[6]).toBe(' '.repeat(src.split('\n')[6]!.length));
-    expect(lines[7]).toBe('    else if (id == 2) { // "{" in a comment');
-    expect(lines[8]).toBe('        b(id);');
+    expect(lines[7]).toBe(' '.repeat(src.split('\n')[7]!.length));
+    expect(out).not.toContain('b(id)');
     expect(lines[10]).toBe('     ');
-    expect(lines[11]).toBe(' '.repeat(src.split('\n')[11]!.length));
-    expect(out).not.toContain('c(id)');
+    expect(lines[11]).toBe('    else if (id == 3) {');
+    expect(lines[12]).toBe('        c(id);');
     expect(lines[14]).toBe('      ');
     // A balanced group is untouched, directives included.
     expect(lines[15]).toBe('#ifdef USE_X');
@@ -12123,6 +12124,64 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     // No conditional group at all: identity.
     const plain = 'int g(void) {\n#define X 1\n    return X;\n}\n';
     expect(blankCUnbalancedConditionalBranches(plain)).toBe(plain);
+  });
+
+  it('blankCUnbalancedConditionalBranches: two function heads under #ifdef/#else keep the #else head; expression fragments keep their only branch', async () => {
+    const { blankCUnbalancedConditionalBranches } = await import('../src/extraction/languages/c-cpp');
+    // jq's main.c: `umain` for WIN32, `main` otherwise — `main` must survive.
+    const heads = [
+      '#ifdef WIN32',
+      'int umain(int argc, char* argv[]) {',
+      '#else /*}*/',
+      'int main(int argc, char* argv[]) {',
+      '#endif',
+      '  return run(argc, argv);',
+      '}',
+    ].join('\n');
+    const h = blankCUnbalancedConditionalBranches(heads).split('\n');
+    expect(h[1]).toBe(' '.repeat('int umain(int argc, char* argv[]) {'.length));
+    expect(h[3]).toBe('int main(int argc, char* argv[]) {');
+    expect(h[0]).toBe('            ');
+    // `#ifndef` is the inverse: its first branch is the default build.
+    const inv = heads.replace('#ifdef WIN32', '#ifndef POSIX');
+    expect(blankCUnbalancedConditionalBranches(inv).split('\n')[1]).toBe('int umain(int argc, char* argv[]) {');
+    // A branch that is a fragment of an `if (…)` condition (STM32 HAL), or
+    // that opens with `} else if` (betaflight cli.c): directives blanked, the
+    // only branch kept, so the statement parses as written for that build.
+    const frag = [
+      'int check(op_t *h1, op_t *h4)',
+      '{',
+      '  if ((h1 == NULL)',
+      '#if defined(STM32G474xx)',
+      '      || (h4 == NULL)',
+      '#endif',
+      '     )',
+      '  {',
+      '    return 1;',
+      '  }',
+      '  if (',
+      '#if !defined(USE_FLASH)',
+      '      isEmpty(h1) ||',
+      '#endif',
+      '      strncasecmp(h1, "rom", 3) == 0) {',
+      '    reboot(1);',
+      '#if defined(USE_FLASH)',
+      '  } else if (isEmpty(h1)) {',
+      '    reboot(2);',
+      '#endif',
+      '  } else {',
+      '    reboot(0);',
+      '  }',
+      '  return 0;',
+      '}',
+    ].join('\n');
+    const f = blankCUnbalancedConditionalBranches(frag).split('\n');
+    expect(f[3]).toBe(' '.repeat('#if defined(STM32G474xx)'.length));
+    expect(f[4]).toBe('      || (h4 == NULL)');
+    expect(f[5]).toBe('      ');
+    expect(f[12]).toBe('      isEmpty(h1) ||');
+    expect(f[17]).toBe('  } else if (isEmpty(h1)) {');
+    expect(f[16]).toBe(' '.repeat('#if defined(USE_FLASH)'.length));
   });
 
   it('a #if branch beginning with `else` no longer files the rest of the file under the enclosing function', async () => {

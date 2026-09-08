@@ -1638,7 +1638,10 @@ export function blankCUnbalancedConditionalBranches(source: string): string {
       .trim();
   const blank = (l: string): string => l.replace(/[^\r]/g, ' ');
   // Directive line indices of each open group, innermost last.
-  const stack: Array<{ marks: number[]; keep: number }> = [];
+  // `positive`: the group opens on a feature test (`#ifdef X`, `#if defined(X)`,
+  // `#if X`), whose `#else` branch is the default build. `elseAt`: index into
+  // marks of that `#else`, if any.
+  const stack: Array<{ marks: number[]; dead: boolean; positive: boolean; elseAt: number }> = [];
   const directive: boolean[] = [];
   let changed = false;
   let continuation = false;
@@ -1651,20 +1654,28 @@ export function blankCUnbalancedConditionalBranches(source: string): string {
     if (!isDirective || wasContinuation) continue;
     let m: RegExpExecArray | null;
     if ((m = C_COND_OPEN_RE.exec(line))) {
-      const dead = m[1] === 'if' && /^0\b/.test(m[2] as string);
-      stack.push({ marks: [i], keep: dead ? 1 : 0 });
+      const cond = (m[2] as string).trim();
+      const dead = m[1] === 'if' && /^0\b/.test(cond);
+      const positive = m[1] === 'ifdef' || (m[1] === 'if' && !dead && !/^!/.test(cond));
+      stack.push({ marks: [i], dead, positive, elseAt: -1 });
       continue;
     }
     const top = stack[stack.length - 1];
     if (!top) continue;
     if (C_COND_NEXT_RE.test(line)) {
+      if (/^[ \t]*#[ \t]*else\b/.test(line)) top.elseAt = top.marks.length;
       top.marks.push(i);
       continue;
     }
     if (!C_COND_ENDIF_RE.test(line)) continue;
     stack.pop();
     top.marks.push(i);
-    if (top.keep >= top.marks.length - 1) continue; // `#if 0` with nothing to keep
+    // Which branch survives: never `#if 0`'s; for a feature test with an
+    // `#else`, the `#else` branch — the build without the feature is the one
+    // that defines `main`, not `umain` (jq's `#ifdef WIN32`); otherwise the
+    // first. A kept branch is verbatim; the others become spaces.
+    const keep = top.dead ? 1 : top.positive && top.elseAt > 0 ? top.elseAt : 0;
+    if (keep >= top.marks.length - 1) continue; // `#if 0` with nothing to keep
     let damaged = false;
     for (let b = 0; b < top.marks.length - 1 && !damaged; b++) {
       const body: string[] = [];
@@ -1677,10 +1688,21 @@ export function blankCUnbalancedConditionalBranches(source: string): string {
       const first = body[0] as string;
       const last = body[body.length - 1] as string;
       let depth = 0;
-      for (const l of body) for (const ch of l) depth += ch === '{' ? 1 : ch === '}' ? -1 : 0;
+      let dips = false;
+      for (const l of body) {
+        for (const ch of l) {
+          depth += ch === '{' ? 1 : ch === '}' ? -1 : 0;
+          if (depth < 0) dips = true; // closes a block it did not open (`} else if (…) {`)
+        }
+      }
       damaged =
         depth !== 0 ||
+        dips ||
         /^else\b/.test(first) ||
+        // A fragment of an expression: `|| (h4 == NULL)` inside an `if (…)`,
+        // `isEmpty(s) ||` before the rest of the condition.
+        /^(\|\||&&|,|\)|:|\?)/.test(first) ||
+        /(\|\||&&|,|\(|\?|:)$/.test(last) ||
         (/^(else[ \t]+)?if[ \t]*\(/.test(last) && /\)$/.test(last));
     }
     if (!damaged) continue;
@@ -1690,7 +1712,7 @@ export function blankCUnbalancedConditionalBranches(source: string): string {
       // The directive line (with its `\`-continuations), then — unless this
       // is the kept branch — the branch body.
       for (let k = from; k < to && (k === from || directive[k]); k++) lines[k] = blank(lines[k] as string);
-      if (b === top.keep) continue;
+      if (b === keep) continue;
       for (let k = from + 1; k < to; k++) lines[k] = blank(lines[k] as string);
     }
     lines[i] = blank(lines[i] as string);
