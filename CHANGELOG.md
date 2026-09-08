@@ -139,6 +139,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- C++ functions following anonymous namespaces containing raw-string templates are now indexed correctly, even when template text resembles an unfinished macro call. (#1505)
+
 - Indexing now warns when parser errors leave a file with no symbols, including C++ raw strings with 16-character delimiters, so missing code is no longer silent. (#1522)
 
 - `codegraph index <path>` now refuses uninitialized paths and names the nearest initialized parent instead of silently rebuilding it; thanks @danusha2345. (#1524, #1689)
