@@ -10,6 +10,7 @@ import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { resolveWorkspaceImport } from './workspace-packages';
+import { JS_BUILT_INS } from './js-builtins';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -1795,6 +1796,12 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
     case 'python':
       return [
         new RegExp(`\\b${r}\\b\\s*=\\s*([A-Z][\\w.]*)\\s*\\(`), // lg = Logger(...)
+        // A quoted forward reference (`lg: "Logger"`, `lg: 'pkg.Logger'`) is the
+        // same annotation — and what every file under `from __future__ import
+        // annotations` or with a not-yet-defined class writes. The unquoted
+        // pattern below stopped at the quote and read no type at all, so the
+        // call produced no edge (#1684). Tried first: it is the stricter shape.
+        new RegExp(`\\b${r}\\b\\s*:\\s*["']([A-Z][\\w.]*)["']`), // lg: "Logger"
         new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.]*)`), // lg: Logger  (PEP 526)
       ];
     case 'java':
@@ -2285,6 +2292,13 @@ export function matchMethodCall(
       ));
       if (typedMatch) {
         return typedMatch;
+      }
+      // A known JS/TS builtin receiver is external when it has no project
+      // method (#1566). Inference already strips generics (`Map<K, V>` →
+      // `Map`); do not let Strategy 3 guess an unrelated `get`/`set`/`has`.
+      // Keep the validated match above for a project type shadowing a builtin.
+      if (ESM_FAMILY.has(ref.language) && JS_BUILT_INS.has(inferredType)) {
+        return null;
       }
     }
   }

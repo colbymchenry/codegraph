@@ -20,7 +20,10 @@ impl<'t> Walker<'t> {
             .unwrap_or_else(|| self.extract_name(node));
 
         // Arrow/function-expression values: resolve the name from the parent
-        // variable_declarator (`export const useAuth = () => {}`).
+        // variable_declarator (`export const useAuth = () => {}`), or from a
+        // CommonJS export assignment (`exports.getItems = async () => {}`,
+        // #1675). Mirrors TreeSitterExtractor.extractFunction.
+        let mut common_js_export = false;
         if name_override.is_none()
             && name == "<anonymous>"
             && matches!(node.kind(), "arrow_function" | "function_expression" | "generator_function")
@@ -29,6 +32,11 @@ impl<'t> Walker<'t> {
                 if parent.kind() == "variable_declarator" {
                     if let Some(var_name) = parent.child_by_field_name("name") {
                         name = self.text(var_name).to_string();
+                    }
+                } else if parent.kind() == "assignment_expression" {
+                    if let Some(export_name) = self.common_js_export_name(parent, node) {
+                        name = export_name;
+                        common_js_export = true;
                     }
                 }
             }
@@ -46,7 +54,7 @@ impl<'t> Walker<'t> {
             docstring: crate::docstring::preceding_docstring(node, self.src),
             signature: self.signature_of(node),
             visibility: self.visibility_of(node),
-            is_exported: Some(self.is_exported(node)),
+            is_exported: Some(common_js_export || self.is_exported(node)),
             is_async: Some(self.is_async(node)),
             is_static: self.is_static(node),
             ..Extra::default()
@@ -63,6 +71,30 @@ impl<'t> Walker<'t> {
             self.visit_function_body(body);
         }
         self.stack.pop();
+    }
+
+    /// The property a CommonJS export assignment binds a function to —
+    /// `exports.NAME = <node>` / `module.exports.NAME = <node>` — or None for
+    /// any other assignment. The node must be the assignment's whole
+    /// right-hand side. Mirrors TreeSitterExtractor.commonJsExportName.
+    fn common_js_export_name(&self, assignment: Node<'t>, value: Node<'t>) -> Option<String> {
+        let right = assignment.child_by_field_name("right")?;
+        if right.start_byte() != value.start_byte() || right.end_byte() != value.end_byte() {
+            return None;
+        }
+        let left = assignment.child_by_field_name("left")?;
+        if left.kind() != "member_expression" {
+            return None;
+        }
+        let object = left.child_by_field_name("object")?;
+        let property = left.child_by_field_name("property")?;
+        if property.kind() != "property_identifier" {
+            return None;
+        }
+        if !matches!(self.text(object), "exports" | "module.exports") {
+            return None;
+        }
+        Some(self.text(property).to_string())
     }
 
     // --- reactComponentHoc / extractReactComponentNode (#841) --------------------
@@ -270,8 +302,33 @@ impl<'t> Walker<'t> {
         let name = self.text(name_node).to_string();
 
         // TS/JS field definitions carry an explicit `type` field; the generic
-        // scan is for other languages (#808).
-        let type_text = node.child_by_field_name("type").map(|t| {
+        // scan is for other languages (#808). A `property_signature` (an
+        // interface member, #1638) carries a `type` field and no value, so it
+        // reads the type field too: the generic scan's exclusion list covers
+        // `identifier` but not the `property_identifier` an interface member is
+        // named with, so it would stop on the name and make the signature repeat
+        // it (`counts counts`) instead of naming the type. Mirrors
+        // extractProperty's isTsJsField.
+        let is_ts_js_field = matches!(
+            node.kind(),
+            "public_field_definition" | "field_definition" | "property_signature"
+        );
+        let type_node = if is_ts_js_field {
+            node.child_by_field_name("type")
+        } else {
+            (0..node.named_child_count()).filter_map(|i| node.named_child(i)).find(|c| {
+                !matches!(
+                    c.kind(),
+                    "modifier"
+                        | "modifiers"
+                        | "identifier"
+                        | "accessor_list"
+                        | "accessors"
+                        | "equals_value_clause"
+                )
+            })
+        };
+        let type_text = type_node.map(|t| {
             let raw = self.text(t);
             raw.strip_prefix(':').unwrap_or(raw).trim_start().to_string()
         });
@@ -1065,15 +1122,10 @@ impl<'t> Walker<'t> {
 
     // --- extractCall (TS/JS generic tail) -------------------------------------------------
 
-    /// Whether a member-call receiver is a chain rooted at a host object a
-    /// TS/JS project never declares. `window` is absent on purpose:
-    /// `window.MyNs.doThing()` reaches a project symbol (#1707).
-    fn is_host_global_chain(&self, receiver: Node<'t>) -> bool {
-        const HOST_GLOBAL_ROOTS: [&str; 19] = [
-            "chrome", "browser", "document", "navigator", "performance", "console",
-            "localStorage", "sessionStorage", "indexedDB", "crypto", "globalThis",
-            "process", "Math", "JSON", "Object", "Array", "Reflect", "Promise", "Intl",
-        ];
+    /// Identifier-rooted member chains have no inferred property type (#1566),
+    /// including host API chains (#1707). Keep the existing window namespace
+    /// escape; call-result and `this` receivers are outside this guard.
+    fn is_unresolved_member_chain(&self, receiver: Node<'t>) -> bool {
         let mut cur = receiver;
         if !matches!(cur.kind(), "member_expression" | "subscript_expression") {
             return false;
@@ -1084,7 +1136,7 @@ impl<'t> Walker<'t> {
                 None => return false,
             }
         }
-        cur.kind() == "identifier" && HOST_GLOBAL_ROOTS.contains(&self.text(cur))
+        cur.kind() == "identifier" && self.text(cur) != "window"
     }
 
     pub(super) fn extract_call(&mut self, node: Node<'t>) {
@@ -1114,14 +1166,12 @@ impl<'t> Walker<'t> {
                         if is_literal_receiver(r.kind()) {
                             return;
                         }
-                        // A chain rooted at a host namespace — `chrome.storage
-                        // .local.get(k)`, `document.body.querySelector(s)` —
-                        // ends in a platform API, so the bare method name emitted
-                        // here could only exact-match an unrelated project symbol
-                        // sharing it (#1707). Emit nothing. A chain rooted at a
-                        // project value keeps the bare name. Mirrors the TS
-                        // extractor's extractCall (extraction/tree-sitter.ts).
-                        if self.is_host_global_chain(r) {
+                        // `holder.values.get()` has no inferred property type
+                        // (#1566). Dropping the receiver or merely preserving it
+                        // would allow unrelated same-name method guesses. Emit
+                        // nothing, as for host chains (#1707); argument calls are
+                        // visited independently. Mirrors extractCall in TS.
+                        if self.is_unresolved_member_chain(r) {
                             return;
                         }
                     }
