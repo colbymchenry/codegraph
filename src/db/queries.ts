@@ -280,6 +280,8 @@ export class QueryBuilder {
     getUnresolvedCount?: SqliteStatement;
     getUnresolvedBatch?: SqliteStatement;
     getUnresolvedBatchAfter?: SqliteStatement;
+    getUnresolvedPrerequisitesAfter?: SqliteStatement;
+    getUnresolvedDependentsAfter?: SqliteStatement;
     deleteRefsByRowIdsFull?: SqliteStatement;
     getAllFilePaths?: SqliteStatement;
     getAllNodeNames?: SqliteStatement;
@@ -3134,13 +3136,21 @@ export class QueryBuilder {
    * (§7a.2) — while the seek is O(batch) forever. `id` is the rowid alias, so
    * the enumeration order is identical to the OFFSET reader's.
    */
-  getUnresolvedReferencesBatchAfter(afterRowId: number, limit: number): UnresolvedReference[] {
-    if (!this.stmts.getUnresolvedBatchAfter) {
-      this.stmts.getUnresolvedBatchAfter = this.db.prepare(
-        "SELECT * FROM unresolved_refs WHERE status = 'pending' AND id > ? ORDER BY id LIMIT ?"
+  getUnresolvedReferencesBatchAfter(afterRowId: number, limit: number, prerequisites?: boolean): UnresolvedReference[] {
+    // Resolution prerequisites must be committed before dependent calls,
+    // even when an interrupted sync queued their rows in a different order
+    // from a clean index (#1577). Each phase still seeks by row id in bounded
+    // memory; the default preserves the public reader's original enumeration.
+    const key = prerequisites === undefined ? 'getUnresolvedBatchAfter'
+      : prerequisites ? 'getUnresolvedPrerequisitesAfter' : 'getUnresolvedDependentsAfter';
+    if (!this.stmts[key]) {
+      const filter = prerequisites === undefined ? ''
+        : ` AND reference_kind ${prerequisites ? 'IN' : 'NOT IN'} ('imports', 'extends', 'implements')`;
+      this.stmts[key] = this.db.prepare(
+        `SELECT * FROM unresolved_refs WHERE status = 'pending' AND id > ?${filter} ORDER BY id LIMIT ?`
       );
     }
-    const rows = this.stmts.getUnresolvedBatchAfter.all(afterRowId, limit) as UnresolvedRefRow[];
+    const rows = this.stmts[key]!.all(afterRowId, limit) as UnresolvedRefRow[];
     return rows.map((row) => ({
       fromNodeId: row.from_node_id,
       referenceName: row.reference_name,

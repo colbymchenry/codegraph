@@ -18,6 +18,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src/index';
+import { createDatabase } from '../src/db/sqlite-adapter';
+import type { ReferenceResolver } from '../src/resolution';
 
 describe('Orphaned refs sweep (#1187)', () => {
   let testDir: string;
@@ -61,6 +63,99 @@ describe('Orphaned refs sweep (#1187)', () => {
     expect(hit, `expected an indexed definition of ${name}`).toBeDefined();
     return hit!.node;
   }
+
+  // Compare call sites and resolution evidence, not just edge counts: a
+  // recovery can also silently downgrade confidence without losing a row.
+  function graphSnapshot() {
+    const { db } = createDatabase(path.join(testDir, '.codegraph', 'codegraph.db'), { readOnly: true });
+    try {
+      const sorted = (sql: string) => db.prepare(sql).all().map((row) => JSON.stringify(row)).sort();
+      return {
+        nodes: sorted('SELECT id, kind, name, qualified_name, file_path FROM nodes'),
+        edges: sorted('SELECT source, target, kind, line, col, metadata, provenance FROM edges'),
+        refs: sorted('SELECT from_node_id, reference_name, reference_kind, line, col, file_path, language, status FROM unresolved_refs'),
+      };
+    } finally {
+      db.close();
+    }
+  }
+
+  describe('recovery has clean-index resolution parity (#1577)', () => {
+    it('persists prerequisites before calls even when the orphan order is reversed', async () => {
+      fs.writeFileSync(path.join(testDir, 'aTypes.java'), [
+        'class Base { void draw() {} }',
+        'class Child extends Base {}',
+        'class Decoy { void draw() {} }',
+      ].join('\n'));
+      // Put the caller beyond the first clean-index batch. Recovery below
+      // queues that same caller FIRST and its inheritance prerequisite LAST.
+      fs.writeFileSync(path.join(testDir, 'bPadding.java'),
+        'class Padding { void noop() {\n' + 'externalCall();\n'.repeat(5100) + '} }\n');
+      fs.writeFileSync(path.join(testDir, 'zCaller.java'),
+        'class Caller { void run(Child child) { child.draw(); } }\n');
+
+      cg = CodeGraph.initSync(testDir);
+      await cg.indexAll();
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'Base::draw')!;
+      expect(callerFiles(target)).toEqual(['zCaller.java']);
+      const clean = graphSnapshot();
+
+      for (const file of ['zCaller.java', 'bPadding.java', 'aTypes.java']) {
+        await interruptAfterExtraction(file);
+      }
+      cg.destroy();
+      cg = CodeGraph.openSync(testDir);
+      expect(cg.getPendingReferenceCount()).toBeGreaterThan(5000);
+
+      const recovered = await cg.sync();
+      expect(recovered.filesAdded + recovered.filesModified + recovered.filesRemoved).toBe(0);
+      expect(cg.getPendingReferenceCount()).toBe(0);
+      expect(callerFiles(target)).toEqual(['zCaller.java']);
+      expect(graphSnapshot()).toEqual(clean);
+
+      await cg.sync();
+      expect(graphSnapshot()).toEqual(clean);
+    }, 15000);
+
+    it('recovers inherited callbacks when the process restarts before the deferred pass', async () => {
+      fs.writeFileSync(path.join(testDir, 'form.ts'), [
+        'class Base { handleSubmit() {} }',
+        'class Unrelated { missingHandler() {} }',
+        'class Form extends Base {',
+        '  wire() { bus.on("submit", this.handleSubmit); }',
+        '  save() { bus.on("save", this.handleSubmit); }',
+        '  confirm() { bus.on("confirm", this.handleSubmit); }',
+        '  missing() { bus.on("missing", this.missingHandler); }',
+        '}',
+      ].join('\n'));
+      cg = CodeGraph.initSync(testDir);
+      await cg.indexAll();
+      const target = findMethod('handleSubmit');
+      expect(cg.getIncomingEdges(target.id).filter((e) => e.kind === 'references')).toHaveLength(3);
+      const clean = graphSnapshot();
+
+      await interruptAfterExtraction('form.ts');
+      // Stop after the final batch has persisted, before the deferred
+      // inherited-member pass runs. There are no later batches to hide the
+      // bug: failed rows plus a lost in-memory queue used to look healthy.
+      // One ref per batch also exercises consecutive all-deferred batches:
+      // their intentionally pending rows must not trip the non-progress guard.
+      const resolver = (cg as unknown as { resolver: ReferenceResolver }).resolver;
+      await expect(resolver.resolveAndPersistBatched((current, total) => {
+        if (current === total) throw new Error('interrupted before deferred resolution');
+      }, 1)).rejects.toThrow('interrupted before deferred resolution');
+      cg.destroy();
+      cg = CodeGraph.openSync(testDir);
+
+      await cg.sync();
+      expect(cg.getIncomingEdges(target.id).filter((e) => e.kind === 'references')).toHaveLength(3);
+      expect(cg.getIncomingEdges(findMethod('missingHandler').id).filter((e) => e.kind === 'references')).toEqual([]);
+      expect(cg.getPendingReferenceCount()).toBe(0);
+      expect(graphSnapshot()).toEqual(clean);
+      await cg.sync();
+      expect(graphSnapshot()).toEqual(clean);
+    });
+  });
 
   describe('sync() heals an interrupted resolution run', () => {
     beforeEach(async () => {

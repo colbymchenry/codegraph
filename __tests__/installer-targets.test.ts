@@ -40,6 +40,8 @@ function setHome(dir: string): { restore: () => void } {
     XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
     HERMES_HOME: process.env.HERMES_HOME,
     COPILOT_HOME: process.env.COPILOT_HOME,
+    CODEX_HOME: process.env.CODEX_HOME,
+    CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
   };
   process.env.HOME = dir;
   process.env.USERPROFILE = dir;
@@ -47,6 +49,8 @@ function setHome(dir: string): { restore: () => void } {
   process.env.XDG_CONFIG_HOME = path.join(dir, '.config');
   delete process.env.HERMES_HOME;
   delete process.env.COPILOT_HOME;
+  delete process.env.CODEX_HOME;
+  delete process.env.CLAUDE_CONFIG_DIR;
   return {
     restore() {
       if (prev.HOME === undefined) delete process.env.HOME; else process.env.HOME = prev.HOME;
@@ -55,6 +59,8 @@ function setHome(dir: string): { restore: () => void } {
       if (prev.XDG_CONFIG_HOME === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = prev.XDG_CONFIG_HOME;
       if (prev.HERMES_HOME === undefined) delete process.env.HERMES_HOME; else process.env.HERMES_HOME = prev.HERMES_HOME;
       if (prev.COPILOT_HOME === undefined) delete process.env.COPILOT_HOME; else process.env.COPILOT_HOME = prev.COPILOT_HOME;
+      if (prev.CODEX_HOME === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prev.CODEX_HOME;
+      if (prev.CLAUDE_CONFIG_DIR === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = prev.CLAUDE_CONFIG_DIR;
     },
   };
 }
@@ -2663,5 +2669,210 @@ describe('Installer targets — Copilot family', () => {
     expect(cli.detect('global').alreadyConfigured).toBe(false);
     expect(vscode.detect('global').alreadyConfigured).toBe(true);
     expect(jetbrains.detect('global').alreadyConfigured).toBe(true);
+  });
+});
+
+describe('Installer targets — Claude CLAUDE_CONFIG_DIR override (#1627)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('home');
+    tmpCwd = mkTmpDir('cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  it.each(['absolute', 'relative'])('global install honors %s CLAUDE_CONFIG_DIR paths', (kind) => {
+    const custom = path.join(tmpHome, 'claude profile');
+    process.env.CLAUDE_CONFIG_DIR = kind === 'relative' ? path.relative(tmpCwd, custom) : custom;
+
+    const claude = getTarget('claude')!;
+    const result = claude.install('global', { autoAllow: true });
+    const paths = [
+      path.join(custom, '.claude.json'),
+      path.join(custom, 'settings.json'),
+      path.join(custom, 'CLAUDE.md'),
+    ] as const;
+
+    expect(result.files.map((f) => f.path)).toEqual(paths);
+    const mcp = JSON.parse(fs.readFileSync(paths[0], 'utf-8'));
+    expect(mcp.mcpServers.codegraph.alwaysLoad).toBe(true);
+    const settings = JSON.parse(fs.readFileSync(paths[1], 'utf-8'));
+    expect(settings.permissions.allow).toContain('mcp__codegraph__*');
+    expect(fs.readFileSync(paths[2], 'utf-8')).toContain('codegraph explore');
+    expect(claude.describePaths('global')).toEqual(paths);
+    expect(claude.printConfig('global')).toContain(`# Add to ${paths[0]}`);
+
+    const before = paths.map((p) => fs.readFileSync(p, 'utf-8'));
+    expect(claude.install('global', { autoAllow: true }).files.every((f) => f.action === 'unchanged')).toBe(true);
+    expect(paths.map((p) => fs.readFileSync(p, 'utf-8'))).toEqual(before);
+    expect(fs.existsSync(path.join(tmpHome, '.claude'))).toBe(false);
+    expect(fs.existsSync(path.join(tmpHome, '.claude.json'))).toBe(false);
+  });
+
+  it('detect and uninstall follow CLAUDE_CONFIG_DIR without touching the default profile', () => {
+    const claude = getTarget('claude')!;
+    claude.install('global', { autoAllow: true });
+    const defaults = claude.describePaths('global');
+    const before = defaults.map((p) => fs.readFileSync(p, 'utf-8'));
+
+    const custom = path.join(tmpHome, 'claude-profile');
+    process.env.CLAUDE_CONFIG_DIR = custom;
+    const mcpPath = path.join(custom, '.claude.json');
+    expect(claude.detect('global')).toEqual({
+      installed: false, alreadyConfigured: false, configPath: mcpPath,
+    });
+
+    claude.install('global', { autoAllow: true });
+    expect(claude.detect('global')).toEqual({
+      installed: true, alreadyConfigured: true, configPath: mcpPath,
+    });
+
+    const removed = claude.uninstall('global');
+    expect(removed.files).toEqual([
+      { path: mcpPath, action: 'removed' },
+      { path: path.join(custom, 'settings.json'), action: 'removed' },
+      { path: path.join(custom, 'CLAUDE.md'), action: 'removed' },
+    ]);
+    expect(JSON.parse(fs.readFileSync(mcpPath, 'utf-8')).mcpServers).toBeUndefined();
+    expect(JSON.parse(fs.readFileSync(path.join(custom, 'settings.json'), 'utf-8')).permissions).toBeUndefined();
+    expect(fs.existsSync(path.join(custom, 'CLAUDE.md'))).toBe(false);
+    expect(claude.detect('global').alreadyConfigured).toBe(false);
+    expect(defaults.map((p) => fs.readFileSync(p, 'utf-8'))).toEqual(before);
+  });
+
+  it.each([undefined, '', '   '])('falls back to the default profile when CLAUDE_CONFIG_DIR is %j', (override) => {
+    if (override !== undefined) process.env.CLAUDE_CONFIG_DIR = override;
+    const claude = getTarget('claude')!;
+    const result = claude.install('global', { autoAllow: true });
+
+    expect(result.files.map((f) => f.path)).toEqual([
+      path.join(tmpHome, '.claude.json'),
+      path.join(tmpHome, '.claude', 'settings.json'),
+      path.join(tmpHome, '.claude', 'CLAUDE.md'),
+    ]);
+    expect(JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude.json'), 'utf-8')).mcpServers.codegraph).toBeDefined();
+    expect(fs.existsSync(path.join(tmpHome, '.claude', 'settings.json'))).toBe(true);
+    expect(fs.existsSync(path.join(tmpHome, '.claude', 'CLAUDE.md'))).toBe(true);
+    // Claude Code keeps the default MCP JSON beside ~/.claude, not inside it.
+    expect(fs.existsSync(path.join(tmpHome, '.claude', '.claude.json'))).toBe(false);
+  });
+
+  it('leaves local install, detect, and uninstall unaffected by CLAUDE_CONFIG_DIR', () => {
+    const custom = path.join(tmpHome, 'claude-profile');
+    process.env.CLAUDE_CONFIG_DIR = custom;
+    const claude = getTarget('claude')!;
+    const result = claude.install('local', { autoAllow: true });
+    const mcpPath = path.join(tmpCwd, '.mcp.json');
+
+    expect(result.files.map((f) => f.path)).toEqual([
+      mcpPath,
+      path.join(tmpCwd, '.claude', 'settings.json'),
+      path.join(tmpCwd, '.claude', 'CLAUDE.md'),
+    ]);
+    expect(JSON.parse(fs.readFileSync(mcpPath, 'utf-8')).mcpServers.codegraph).toBeDefined();
+    expect(claude.detect('local')).toEqual({
+      installed: true, alreadyConfigured: true, configPath: mcpPath,
+    });
+    claude.uninstall('local');
+    expect(claude.detect('local').alreadyConfigured).toBe(false);
+    expect(fs.existsSync(custom)).toBe(false);
+    expect(fs.existsSync(path.join(tmpHome, '.claude'))).toBe(false);
+    expect(fs.existsSync(path.join(tmpHome, '.claude.json'))).toBe(false);
+  });
+});
+
+describe('Installer targets — Codex CODEX_HOME override (#1627)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('home');
+    tmpCwd = mkTmpDir('cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  const defaultDir = () => path.join(tmpHome, '.codex');
+
+  it('global install writes to $CODEX_HOME, not ~/.codex', () => {
+    const custom = path.join(tmpHome, 'codex-profile');
+    process.env.CODEX_HOME = custom;
+
+    const codex = getTarget('codex')!;
+    const result = codex.install('global', { autoAllow: false });
+
+    const toml = result.files.find((f) => f.path.endsWith('config.toml'))!;
+    expect(path.resolve(toml.path)).toBe(path.resolve(path.join(custom, 'config.toml')));
+    expect(fs.readFileSync(path.join(custom, 'config.toml'), 'utf-8')).toContain('[mcp_servers.codegraph]');
+    // The global AGENTS.md follows the config dir.
+    expect(fs.existsSync(path.join(custom, 'AGENTS.md'))).toBe(true);
+    // Nothing of ours may land in the default profile Codex is not reading.
+    expect(fs.existsSync(defaultDir())).toBe(false);
+  });
+
+  it('detect and uninstall follow $CODEX_HOME too', () => {
+    const custom = path.join(tmpHome, 'codex-profile');
+    process.env.CODEX_HOME = custom;
+    const codex = getTarget('codex')!;
+
+    expect(codex.detect('global').alreadyConfigured).toBe(false);
+    codex.install('global', { autoAllow: false });
+
+    const detected = codex.detect('global');
+    expect(detected.alreadyConfigured).toBe(true);
+    expect(path.resolve(detected.configPath!)).toBe(path.resolve(path.join(custom, 'config.toml')));
+
+    const removed = codex.uninstall('global');
+    expect(path.resolve(removed.files.find((f) => f.path.endsWith('config.toml'))!.path))
+      .toBe(path.resolve(path.join(custom, 'config.toml')));
+    // Our table was the only content, so the file goes with it.
+    expect(fs.existsSync(path.join(custom, 'config.toml'))).toBe(false);
+  });
+
+  it('falls back to ~/.codex when CODEX_HOME is unset or blank', () => {
+    const codex = getTarget('codex')!;
+    codex.install('global', { autoAllow: false });
+    expect(fs.existsSync(path.join(defaultDir(), 'config.toml'))).toBe(true);
+
+    fs.rmSync(defaultDir(), { recursive: true, force: true });
+    process.env.CODEX_HOME = '   '; // set-but-empty must not become the config dir
+    codex.install('global', { autoAllow: false });
+    expect(fs.existsSync(path.join(defaultDir(), 'config.toml'))).toBe(true);
+  });
+
+  it('leaves the local install alone — CODEX_HOME is the user layer only (#1531)', () => {
+    const custom = path.join(tmpHome, 'codex-profile');
+    process.env.CODEX_HOME = custom;
+
+    const codex = getTarget('codex')!;
+    const result = codex.install('local', { autoAllow: false });
+
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    expect(paths.some((p) => p.endsWith('/.codex/config.toml'))).toBe(true);
+    expect(fs.existsSync(path.join(process.cwd(), '.codex', 'config.toml'))).toBe(true);
+    // The project layer lives beside the project, never under the user profile.
+    expect(fs.existsSync(path.join(custom, 'config.toml'))).toBe(false);
   });
 });
