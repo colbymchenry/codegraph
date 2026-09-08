@@ -1373,6 +1373,47 @@ function pickClosestJvmCandidate(candidates: Node[], fromPath: string): Node {
   return best;
 }
 
+/**
+ * PHP scoped calls are encoded as "Alias.method" by both extractors. A use
+ * mapping names a namespace, not a filesystem path, so resolve the receiver
+ * through its localName and look up the method on that exact imported type.
+ * undefined means this is not an imported static call; null means the import
+ * owns the call but its method is unavailable, so name fallbacks must not guess.
+ */
+export function resolvePhpImportedStaticCall(
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null | undefined {
+  if (ref.language !== 'php' || ref.referenceKind !== 'calls') return undefined;
+  const call = /^(\w+)\.(\w+)$/.exec(ref.referenceName);
+  if (!call) return undefined;
+  const [, receiver, member] = call;
+  const imp = context.getImportMappings(ref.filePath, ref.language)
+    .find((i) => i.localName === receiver);
+  if (!imp) return undefined;
+
+  // PHP variables occupy a different namespace from class imports. Extraction
+  // strips the leading "$" from "$Alias->method()" too; leave that receiver to
+  // local type inference even when a class import has the same local name.
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split('\n');
+  const line = lines?.[ref.line - 1];
+  if (line?.slice(ref.column).startsWith('$')) return undefined;
+
+  const fqn = imp.source.replace(/^\\/, '');
+  const separator = fqn.lastIndexOf('\\');
+  const typeName = separator < 0
+    ? fqn
+    : `${fqn.slice(0, separator)}::${fqn.slice(separator + 1)}`;
+  const owners = context.getNodesByQualifiedName(typeName)
+    .filter((n) => n.language === 'php' && STATIC_MEMBER_CONTAINERS.has(n.kind));
+  if (owners.length !== 1) return null;
+  const owner = owners[0]!;
+  const methods = context.getNodesByQualifiedName(`${owner.qualifiedName}::${member}`)
+    .filter((n) => n.language === 'php' && n.kind === 'method' && n.filePath === owner.filePath);
+  if (methods.length !== 1) return null;
+  return { original: ref, targetNodeId: methods[0]!.id, confidence: 0.95, resolvedBy: 'import' };
+}
+
 export function resolveViaImport(
   ref: UnresolvedRef,
   context: ResolutionContext
