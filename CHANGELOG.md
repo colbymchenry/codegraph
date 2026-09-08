@@ -151,6 +151,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `codegraph install` now honors `CLAUDE_CONFIG_DIR` and `CODEX_HOME` for global Claude Code and Codex setup so CodeGraph loads in your chosen profile (thanks @seanchann; #1627).
 
+- Files opted in with `includeIgnored` now stay indexed on Git older than 2.36, and embedded repositories remain visible to the watcher (thanks @maxmilian and @newshowardz777; #1549).
+
 #### Screens, links and navigation
 
 - **Where the app goes after login is a fork, not two always-es.** A navigation whose destination comes back from a helper — `router.replace(await resolvePostLoginRoute())` over `return (await hasSeenWelcome(…)) ? '/home/' : '/welcome/'` — drew both screens with no condition, reading as if the welcome screen always shows. The two arms share a line, and only a column can tell them apart; each synthesized edge now carries its literal's own position, so the guard reader says which arm it is: `WHEN await hasSeenWelcome(…)` → home, and its negation → welcome. And the scan starts at the helper's body, so a literal-union return type — `Promise<'/welcome/' | '/home/'>`, whose routes are string literals too, written first — no longer stands in for the navigation itself. Re-index after upgrading to pick the positions up.
@@ -228,6 +230,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Kotlin `init { }` blocks and destructuring declarations no longer swallow their code: `init { val cfg = load() }` and `val (a, b) = makePair()` contributed no call edge at all, and now attribute to the enclosing class or file.
 - A Kotlin property's accessor body now belongs to the property whichever line it is written on, instead of being dropped (same line) or handed to the enclosing class (own line).
 - Kotlin properties that hold a lambda, a SAM callback or an anonymous object — `private val frameListener = CameraFrameListener { … }`, the way Android and MSDK callbacks are almost always declared — now contribute call edges. Previously everything inside such an initializer was dropped, so a function reached only through one of these callbacks looked like it had no callers at all and its blast radius came back far too small. Delegated properties (`by lazy { … }`) and plain initializers (`val x = compute()`) were affected the same way and are fixed too. Re-index with `codegraph index -f` after upgrading to pick up the new edges.
+- PHP static calls through imported class aliases now reach the correct class when services and repositories share method names, so callers and impact analysis show the right dependencies after re-indexing. (#1545)
 - TypeScript/JavaScript: a call through a field of the enclosing class — `this.mailer.send()` — now resolves on the field's declared type, so a delegating wrapper that shares the method's name no longer records itself as its own callee and `callers`, `impact` and trace stop lying on that shape. A field whose type is external or a builtin stays unresolved rather than guessed. Re-index after upgrading. (#1496)
 - TypeScript and JavaScript collection calls through local variables and their nested properties no longer link to unrelated project methods; re-index after upgrading. (#1566)
 
