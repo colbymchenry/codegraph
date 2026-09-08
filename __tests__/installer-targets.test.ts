@@ -23,6 +23,13 @@ import { ALL_TARGETS, getTarget, resolveTargetFlag } from '../src/installer/targ
 import { uninstallTargets, refreshTargets } from '../src/installer';
 import { upsertTomlTable, removeTomlTable, buildTomlTable } from '../src/installer/targets/toml';
 import { cleanupLegacyHooks, writePromptHookEntry, removePromptHookEntry } from '../src/installer/targets/claude';
+import {
+  atomicWriteFileSync,
+  writeJsonFile,
+  upsertInstructionsEntry,
+  removeMarkedSection,
+} from '../src/installer/targets/shared';
+import { CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END } from '../src/installer/instructions-template';
 
 function mkTmpDir(label: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `cg-targets-${label}-`));
@@ -2480,4 +2487,151 @@ describe('Installer targets — Copilot family', () => {
     expect(vscode.detect('global').alreadyConfigured).toBe(true);
     expect(jetbrains.detect('global').alreadyConfigured).toBe(true);
   });
+});
+
+// ---------------------------------------------------------------------------
+// symlink preservation (shared write helpers)
+//
+// `atomicWriteFileSync` lands a tmp file on `filePath` via `renameSync` —
+// but rename replaces the destination *link itself*, not what it points to.
+// Left unhandled, installing into a dotfiles-managed symlink (e.g.
+// `~/.claude/CLAUDE.md` -> `~/dotfiles/claude.md`) would silently detach the
+// link and leave a plain file behind, so future dotfiles edits stop
+// reaching the file the agent actually reads. These tests pin the fix:
+// every write must follow the link to its real target, the same way a
+// plain `writeFileSync` would.
+//
+// POSIX-only: symlink creation needs elevated privileges on Windows (see
+// the repo's Windows-gated-tests convention).
+// ---------------------------------------------------------------------------
+describe('symlink preservation (shared write helpers)', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkTmpDir('symlink');
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it.runIf(process.platform !== 'win32')('atomicWriteFileSync writes through a symlink, preserving the link', () => {
+    const realDir = path.join(tmpDir, 'real');
+    const linkDir = path.join(tmpDir, 'link');
+    fs.mkdirSync(realDir, { recursive: true });
+    fs.mkdirSync(linkDir, { recursive: true });
+    const realPath = path.join(realDir, 'config.md');
+    const linkPath = path.join(linkDir, 'config.md');
+    fs.writeFileSync(realPath, 'old');
+    fs.symlinkSync(realPath, linkPath);
+
+    atomicWriteFileSync(linkPath, 'new');
+
+    expect(fs.lstatSync(linkPath).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(realPath, 'utf-8')).toBe('new');
+    // No leftover tmp files in either directory.
+    expect(fs.readdirSync(linkDir).some((f) => f.includes('.tmp.'))).toBe(false);
+    expect(fs.readdirSync(realDir).some((f) => f.includes('.tmp.'))).toBe(false);
+  });
+
+  it.runIf(process.platform !== 'win32')('atomicWriteFileSync follows a symlink chain to the real target', () => {
+    const realPath = path.join(tmpDir, 'real.md');
+    const bPath = path.join(tmpDir, 'b');
+    const aPath = path.join(tmpDir, 'a');
+    fs.writeFileSync(realPath, 'old');
+    fs.symlinkSync(realPath, bPath);
+    fs.symlinkSync(bPath, aPath);
+
+    atomicWriteFileSync(aPath, 'chained');
+
+    expect(fs.lstatSync(aPath).isSymbolicLink()).toBe(true);
+    expect(fs.lstatSync(bPath).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(realPath, 'utf-8')).toBe('chained');
+  });
+
+  it.runIf(process.platform !== 'win32')('atomicWriteFileSync creates the target of a dangling symlink', () => {
+    const realDir = path.join(tmpDir, 'real');
+    const realPath = path.join(realDir, 'notyet.md');
+    const linkPath = path.join(tmpDir, 'link.md');
+    // realDir doesn't exist yet — the symlink target is unreachable.
+    fs.symlinkSync(realPath, linkPath);
+    expect(fs.existsSync(realDir)).toBe(false);
+
+    atomicWriteFileSync(linkPath, 'created through dangling link');
+
+    expect(fs.lstatSync(linkPath).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(realPath, 'utf-8')).toBe('created through dangling link');
+  });
+
+  it.runIf(process.platform !== 'win32')('writeJsonFile writes through a symlink, preserving the link', () => {
+    const realPath = path.join(tmpDir, 'real.json');
+    const linkPath = path.join(tmpDir, 'link.json');
+    fs.writeFileSync(realPath, '{}\n');
+    fs.symlinkSync(realPath, linkPath);
+
+    writeJsonFile(linkPath, { foo: 'bar' });
+
+    expect(fs.lstatSync(linkPath).isSymbolicLink()).toBe(true);
+    expect(JSON.parse(fs.readFileSync(realPath, 'utf-8'))).toEqual({ foo: 'bar' });
+  });
+
+  it.runIf(process.platform !== 'win32')(
+    'reproduces the reported case: a dotfiles-managed CLAUDE.md symlink keeps user content across install/uninstall',
+    () => {
+      const dotfilesDir = path.join(tmpDir, 'dotfiles');
+      fs.mkdirSync(dotfilesDir, { recursive: true });
+      const realPath = path.join(dotfilesDir, 'claude.md');
+      const linkPath = path.join(tmpDir, 'CLAUDE.md');
+      const userContent = '# My CLAUDE.md\n\nSome personal notes I keep in dotfiles.';
+      fs.writeFileSync(realPath, userContent + '\n');
+      fs.symlinkSync(realPath, linkPath);
+
+      const first = upsertInstructionsEntry(linkPath);
+      expect(first.action).toBe('updated');
+      expect(fs.lstatSync(linkPath).isSymbolicLink()).toBe(true);
+      const afterFirst = fs.readFileSync(realPath, 'utf-8');
+      expect(afterFirst).toContain(CODEGRAPH_SECTION_START);
+      expect(afterFirst).toContain(userContent);
+
+      const second = upsertInstructionsEntry(linkPath);
+      expect(second.action).toBe('unchanged');
+      expect(fs.lstatSync(linkPath).isSymbolicLink()).toBe(true);
+
+      const removeResult = removeMarkedSection(linkPath, CODEGRAPH_SECTION_START, CODEGRAPH_SECTION_END);
+      expect(removeResult).toBe('removed');
+      expect(fs.lstatSync(linkPath).isSymbolicLink()).toBe(true);
+      const afterRemove = fs.readFileSync(realPath, 'utf-8');
+      expect(afterRemove).not.toContain(CODEGRAPH_SECTION_START);
+      expect(afterRemove).toContain(userContent);
+    },
+  );
+
+  it.runIf(process.platform !== 'win32')(
+    'two agents symlinked to one shared AGENTS.md get exactly one block: the second upsert is unchanged',
+    () => {
+      // Multi-select install: several targets' instructions files are
+      // symlinks to one shared AGENTS.md. Now that writes resolve to the
+      // shared target, the marker-based upsert must dedupe across
+      // targets — same guarantee gemini.ts documents for Gemini +
+      // Antigravity sharing GEMINI.md, extended through symlinks.
+      const sharedPath = path.join(tmpDir, 'AGENTS.md');
+      const userContent = '# Shared agent instructions';
+      fs.writeFileSync(sharedPath, userContent + '\n');
+      const claudeLink = path.join(tmpDir, 'CLAUDE.md');
+      const codexLink = path.join(tmpDir, 'codex-AGENTS.md');
+      fs.symlinkSync(sharedPath, claudeLink);
+      fs.symlinkSync(sharedPath, codexLink);
+
+      const first = upsertInstructionsEntry(claudeLink);
+      expect(first.action).toBe('updated');
+      const second = upsertInstructionsEntry(codexLink);
+      expect(second.action).toBe('unchanged');
+
+      const content = fs.readFileSync(sharedPath, 'utf-8');
+      expect(content.split(CODEGRAPH_SECTION_START).length - 1).toBe(1);
+      expect(content).toContain(userContent);
+      expect(fs.lstatSync(claudeLink).isSymbolicLink()).toBe(true);
+      expect(fs.lstatSync(codexLink).isSymbolicLink()).toBe(true);
+    },
+  );
 });

@@ -73,12 +73,45 @@ export function readJsonFile(filePath: string): Record<string, any> {
 }
 
 /**
+ * Follow a symlink chain to the path a write should land on.
+ *
+ * `renameSync` replaces the destination *link itself* rather than its
+ * target, so an atomic write aimed at a symlinked config (e.g. a
+ * dotfiles-managed CLAUDE.md) would silently swap the link for a
+ * regular file and detach it from the user's dotfiles. Resolving
+ * first gives the temp-file-plus-rename the same follow-the-link
+ * semantics a plain `writeFileSync` has.
+ *
+ * `fs.realpathSync` alone can't do this: it throws on dangling links,
+ * and writing through a dangling link (creating its target) must keep
+ * working. Hence the manual walk. The 32-hop cap mirrors typical
+ * kernel ELOOP limits; on a loop we just write to the last path seen.
+ */
+function resolveWriteTarget(filePath: string): string {
+  let target = filePath;
+  for (let i = 0; i < 32; i++) {
+    let st: fs.Stats;
+    try {
+      st = fs.lstatSync(target);
+    } catch {
+      return target; // end of chain — target doesn't exist yet
+    }
+    if (!st.isSymbolicLink()) return target;
+    target = path.resolve(path.dirname(target), fs.readlinkSync(target));
+  }
+  return target;
+}
+
+/**
  * Write a file atomically: write to `<path>.tmp.<pid>`, then rename.
  *
  * Prevents corruption if the process crashes mid-write. The temp
- * file is cleaned up on rename failure.
+ * file is cleaned up on rename failure. Follows symlinks: the write
+ * lands on the link's target, like plain `writeFileSync`, instead of
+ * replacing the link itself.
  */
 export function atomicWriteFileSync(filePath: string, content: string): void {
+  filePath = resolveWriteTarget(filePath);
   const dir = path.dirname(filePath);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
