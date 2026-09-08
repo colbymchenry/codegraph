@@ -847,6 +847,141 @@ const POINTER_HEADER = '**Not shown above — explore these names for their sour
 /** Most files the pointer list ever names one-per-line; the rest are a count. */
 const POINTER_MAX_FILES = 10;
 /**
+ * How many elided-in-file symbols a gap marker or biased header names (#1711).
+ * Kept small: the names exist so a follow-up explore has a target, not so the
+ * meta-text rivals the source it is pointing at.
+ */
+const ELIDED_SYMBOL_CAP = 6;
+
+type ElidedSymbolRef = { name: string; kind: string; startLine: number };
+
+/**
+ * Indexed symbols whose definition starts strictly between two rendered
+ * spans. The hole is what a trim dropped; naming them is what lets the agent
+ * follow up by name instead of guessing (#1711).
+ */
+export function symbolsBetweenRanges(
+  nodes: ReadonlyArray<{ name: string; kind: string; startLine: number; endLine: number }>,
+  fromEnd: number,
+  toStart: number,
+): ElidedSymbolRef[] {
+  if (toStart <= fromEnd + 1) return [];
+  const out: ElidedSymbolRef[] = [];
+  const seen = new Set<string>();
+  for (const n of nodes) {
+    if (n.kind === 'import' || n.kind === 'export') continue;
+    if (n.startLine <= fromEnd || n.startLine >= toStart) continue;
+    if (seen.has(n.name)) continue;
+    seen.add(n.name);
+    out.push({ name: n.name, kind: n.kind, startLine: n.startLine });
+  }
+  out.sort((a, b) => a.startLine - b.startLine);
+  return out;
+}
+
+/**
+ * Symbols in `candidates` whose start line is not covered by any emitted range.
+ * Used to bias the per-file header toward what the trim dropped (#1711).
+ */
+export function symbolsNotInRanges(
+  candidates: ReadonlyArray<ElidedSymbolRef>,
+  ranges: ReadonlyArray<ExploreLineRange>,
+): ElidedSymbolRef[] {
+  if (ranges.length === 0) return [...candidates].sort((a, b) => a.startLine - b.startLine);
+  const out: ElidedSymbolRef[] = [];
+  const seen = new Set<string>();
+  for (const n of candidates) {
+    if (seen.has(n.name)) continue;
+    if (ranges.some((r) => n.startLine >= r.start && n.startLine <= r.end)) continue;
+    seen.add(n.name);
+    out.push(n);
+  }
+  out.sort((a, b) => a.startLine - b.startLine);
+  return out;
+}
+
+/**
+ * Gap marker between two non-contiguous slices of one file.
+ *
+ * Bare `... (gap) ...` told the agent something was missing but not WHAT —
+ * and the footer then asked it to re-explore "with its exact name", which is
+ * circular when the missing names *are* the question (#1711). When the hole
+ * holds indexed symbols, list them as `name (file:line)` (same shape the
+ * flow / blast-radius lines already use).
+ */
+export function formatGapMarker(
+  filePath: string,
+  elided: ReadonlyArray<ElidedSymbolRef>,
+): string {
+  if (elided.length === 0) return '\n\n... (gap) ...\n\n';
+  const shown = elided.slice(0, ELIDED_SYMBOL_CAP);
+  const more = elided.length - shown.length;
+  const names = shown.map((s) => `${s.name} (${filePath}:${s.startLine})`).join(', ')
+    + (more > 0 ? `, +${more} more` : '');
+  return `\n\n... (gap: ${names}) ...\n\n`;
+}
+
+/** Join rendered parts with gap markers that name whatever the trim skipped. */
+export function joinPartsWithNamedGaps(
+  filePath: string,
+  parts: ReadonlyArray<{ range: ExploreLineRange; text: string }>,
+  nodes: ReadonlyArray<{ name: string; kind: string; startLine: number; endLine: number }>,
+): string {
+  if (parts.length === 0) return '';
+  let out = parts[0]!.text;
+  for (let i = 1; i < parts.length; i++) {
+    const prev = parts[i - 1]!;
+    const next = parts[i]!;
+    out += formatGapMarker(filePath, symbolsBetweenRanges(nodes, prev.range.end, next.range.start));
+    out += next.text;
+  }
+  return out;
+}
+
+/**
+ * Prefer symbols the trim dropped when filling the per-file header's named
+ * slots, so `+N more` is less likely to hide the answer (#1711). Frequency
+ * still breaks ties among the preferred / remaining groups.
+ */
+export function biasHeaderSymbols(
+  symbols: readonly string[],
+  elided: ReadonlyArray<ElidedSymbolRef>,
+  cap: number,
+): { shown: string[]; omitted: number } {
+  const elidedLabels = elided.map((s) => `${s.name}(${s.kind})`);
+  const elidedSet = new Set(elidedLabels);
+  const elidedNames = new Set(elided.map((s) => s.name));
+  const counts = new Map<string, number>();
+  for (const s of symbols) counts.set(s, (counts.get(s) ?? 0) + 1);
+  // Also surface elided symbols that never made it into `symbols` (a dropped
+  // cluster's members are absent from assembleSection's list today).
+  for (const label of elidedLabels) {
+    if (!counts.has(label)) counts.set(label, 1);
+  }
+  // Earlier elided defs first (elided is startLine-sorted) so the header's
+  // named slots track source order through the hole rather than alphabetical
+  // filler (`calls0` beating `syncStateNow`).
+  const elidedRank = new Map<string, number>();
+  elided.forEach((s, i) => {
+    elidedRank.set(`${s.name}(${s.kind})`, i);
+    if (!elidedRank.has(s.name)) elidedRank.set(s.name, i);
+  });
+  const score = (label: string): [number, number, number] => {
+    const name = label.replace(/\(.*\)$/, '');
+    const preferred = elidedSet.has(label) || elidedNames.has(name) ? 1 : 0;
+    const rank = elidedRank.get(label) ?? elidedRank.get(name) ?? 9999;
+    return [preferred, counts.get(label) ?? 0, -rank];
+  };
+  const sorted = [...counts.keys()].sort((a, b) => {
+    const [pa, ca, ra] = score(a);
+    const [pb, cb, rb] = score(b);
+    return pb - pa || cb - ca || rb - ra || a.localeCompare(b);
+  });
+  const shown = sorted.slice(0, cap);
+  return { shown, omitted: Math.max(0, sorted.length - shown.length) };
+}
+
+/**
  * One pointer line: the file plus enough symbol names to make it NAMEABLE in a
  * follow-up explore. Capped — an un-capped list ran to ~1.9K on the #1500
  * fixture (12 generated CRUD symbols on one line), meta-text bought at the
@@ -4384,6 +4519,10 @@ export class ToolHandler {
       // (no `//` — not a comment in Python, Ruby, etc.). With line numbers on,
       // the line-number jump also signals the gap.
       const GAP_MARKER = '\n\n... (gap) ...\n\n';
+      // Full file index — not just the relevance-gathered `group.nodes`. A trim
+      // often drops filler symbols that never scored into the gather set; naming
+      // those holes still needs their defs (#1711).
+      const fileIndexNodes = cg.getNodesInFile(filePath);
 
       // Cross-call dedup (CG-18). `served` is what THIS session already sent the
       // agent for THIS file, and it is empty unless the file still hashes to the
@@ -4984,8 +5123,12 @@ export class ToolHandler {
       // does the slicing; a second function mirroring these window/padding rules
       // would drift.
       type SectionPart = { range: ExploreLineRange; text: string };
+      // Named gaps (#1711): a bare `... (gap) ...` hid the answer when the
+      // trim dropped the symbols the query was asking for. Budget estimates
+      // still use GAP_MARKER.length (a lower bound); the final fit test
+      // measures the real joined text.
       const sectionText = (parts: ReadonlyArray<SectionPart>): string =>
-        parts.map((p) => p.text).join(GAP_MARKER);
+        joinPartsWithNamedGaps(filePath, parts, fileIndexNodes);
       const buildSection = (
         c: { start: number; end: number; hasSpine?: boolean; spineCallLine?: number },
       ): SectionPart[] => {
@@ -5405,24 +5548,36 @@ export class ToolHandler {
       // the fit test below trims the weakest cluster and re-assembles rather
       // than skipping the file (CG-26).
       const assembleSection = (chosen: ReadonlySet<number>) => {
-        let text = '';
+        const parts: SectionPart[] = [];
         const symbols: string[] = [];
-        const ranges: ExploreLineRange[] = [];
         const covered: ExploreLineRange[] = [];
         for (let i = 0; i < clusters.length; i++) {
           if (!chosen.has(i)) continue;
           const cluster = clusters[i]!;
           const section = renderedClusters.get(i)!;
-          const part = sectionText(section.parts);
-          if (part.length > 0) {
-            if (text.length > 0) text += GAP_MARKER;
-            text += part;
-          }
-          ranges.push(...section.parts.map((p) => p.range));
+          parts.push(...section.parts);
           covered.push(...section.covered);
           symbols.push(...cluster.symbols);
         }
-        return { text, symbols, ranges, covered };
+        // Every member across ALL clusters (chosen or not) is a candidate for
+        // the header bias — a dropped cluster's symbols used to vanish from
+        // the header entirely (#1711).
+        const memberRefs: ElidedSymbolRef[] = [];
+        const seenMember = new Set<string>();
+        for (const c of clusters) {
+          for (const m of c.members) {
+            if (seenMember.has(m.name)) continue;
+            seenMember.add(m.name);
+            memberRefs.push({ name: m.name, kind: m.kind, startLine: m.start });
+          }
+        }
+        const ranges = parts.map((p) => p.range);
+        const text = joinPartsWithNamedGaps(filePath, parts, fileIndexNodes);
+        // Header bias prefers RELEVANT elisions (cluster members the trim cut)
+        // over incidental index filler — otherwise locale-sorted `calls0`…
+        // crowds out the answer methods (#1711).
+        const elided = symbolsNotInRanges(memberRefs, ranges);
+        return { text, symbols, ranges, covered, elided };
       };
       let assembled = assembleSection(chosenIndices);
 
@@ -5440,18 +5595,18 @@ export class ToolHandler {
       // Dedupe + cap the symbols list shown in the per-file header. Some
       // files (Session.swift in Alamofire) produced 3.4KB symbol lists
       // from cluster scoring + edge-source lines, dwarfing the per-file
-      // body cap. Show top names by frequency, with a "+N more" tail.
-      const headerFor = (symbols: readonly string[]): string => {
-        const symbolCounts = new Map<string, number>();
-        for (const s of symbols) symbolCounts.set(s, (symbolCounts.get(s) ?? 0) + 1);
-        const sortedSymbols = [...symbolCounts.entries()]
-          .sort((a, b) => b[1] - a[1])
-          .map(([name]) => name);
-        const headerSymbols = sortedSymbols.slice(0, budget.maxSymbolsInFileHeader);
-        const omittedCount = sortedSymbols.length - headerSymbols.length;
-        return fileSectionHeader(filePath, omittedCount > 0
-          ? `${headerSymbols.join(', ')}, +${omittedCount} more`
-          : headerSymbols.join(', '));
+      // body cap. Prefer symbols the trim elided (#1711), then frequency,
+      // with a "+N more" tail.
+      const headerFor = (
+        symbols: readonly string[],
+        elided: ReadonlyArray<ElidedSymbolRef> = [],
+      ): string => {
+        const { shown, omitted } = biasHeaderSymbols(
+          symbols, elided, budget.maxSymbolsInFileHeader,
+        );
+        return fileSectionHeader(filePath, omitted > 0
+          ? `${shown.join(', ')}, +${omitted} more`
+          : shown.join(', '));
       };
 
       // Last stop before the hard ceiling. The reservation already bounded cluster
@@ -5470,7 +5625,7 @@ export class ToolHandler {
       // admitted, reserved and rendered, and would have delivered nothing.
       // Only when the top-ranked cluster alone cannot fit is the file skipped —
       // that one is never sliced mid-method.
-      let fileHeader = headerFor(assembled.symbols);
+      let fileHeader = headerFor(assembled.symbols, assembled.elided);
       let chosenNow = chosenIndices;
       const costOfSection = (header: string, body: string) =>
         header.length + 2 + (body.length > 0 ? body.length + lang.length + 11 : 0);
@@ -5516,7 +5671,7 @@ export class ToolHandler {
           chosenNow = trimmed;
         }
         assembled = assembleSection(chosenNow);
-        fileHeader = headerFor(assembled.symbols);
+        fileHeader = headerFor(assembled.symbols, assembled.elided);
         anyFileTrimmed = true;
       }
       // One cluster left and still over — by the header estimate's error, at
@@ -5684,7 +5839,7 @@ export class ToolHandler {
     const completenessBlock: string[] = budget.includeCompletenessSignal
       ? ['', '---', `> **Complete source for ${filesIncluded} files is included above — do NOT re-read them.** If your question also needs files/symbols listed under "Not shown above" (or any area this call didn't cover), make ANOTHER codegraph_explore targeting those names — it returns the same source with line numbers and is cheaper and more complete than reading. Reserve Read for a single specific line range explore can't surface.`]
       : anyFileTrimmed
-        ? ['', `> Some file sections were trimmed for size. For a specific symbol you still need, run another \`codegraph_explore\` (or \`codegraph_node\`) with its exact name — line-numbered source, cheaper and more complete than Read.`]
+        ? ['', `> Some file sections were trimmed for size. Elided symbols are named inside gap markers as \`name (file:line)\` and preferred in the file header — run another \`codegraph_explore\` (or \`codegraph_node\`) with those exact names for their source.`]
         : [];
 
     // Explore budget note based on project size.
