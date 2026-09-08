@@ -41,7 +41,7 @@ try {
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, hasStructuralKeyword, extractCodeTokens } from '../directory';
+import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection } from '../directory';
 import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
@@ -1419,8 +1419,11 @@ program
             const text = result.content[0]?.text ?? '';
             if (!result.isError && text.trim()) {
               // Cap the injection so a large-repo explore can't flood the prompt.
-              const MAX = 16000;
-              const body = text.length > MAX ? `${text.slice(0, MAX)}\n…(truncated; call codegraph_explore for the rest)` : text;
+              // Claude Code shows hook stdout inline only up to 10,000 characters;
+              // above that it persists the output to a file and the model sees a
+              // 2 KB preview (#1694). PROMPT_HOOK_INJECTION_MAX (9,000) leaves
+              // room for the wrapper and the projectPath nudge lines below.
+              const body = capPromptHookInjection(text);
               // For a front-loaded SUB-project, a follow-up explore needs its path.
               const more = plan.viaSubScan
                 ? `call codegraph_explore with projectPath: "${plan.exploreRoot}" for more`

@@ -354,6 +354,9 @@ export function matchFunctionRef(
   return null;
 }
 
+/** Languages with no nested named functions: nesting in the graph is never a scope. */
+const NO_NESTED_FUNCTIONS = new Set<string>(['c', 'cpp']);
+
 /**
  * A function nested inside another FUNCTION is only callable from within its
  * container — Python, JS/TS, and every closure language scope it lexically.
@@ -371,6 +374,14 @@ function isLexicallyReachable(
   context: ResolutionContext
 ): boolean {
   if (candidate.kind !== 'function') return true;
+  // C and C++ have no nested named functions, so a function the graph shows
+  // inside another is an extraction artifact, not a scope: tree-sitter-c
+  // cannot parse a macro call whose arguments are designated initializers
+  // (betaflight's `RESET_CONFIG(pidProfile_t, pidProfile, .pid = {…})`), and
+  // its error recovery runs the enclosing function_definition to the end of
+  // the file, nesting every function after it. Trusting that nesting rejected
+  // 117 real calls into pid.c on that tree; the functions are reachable.
+  if (NO_NESTED_FUNCTIONS.has(candidate.language)) return true;
   const qn = candidate.qualifiedName;
   if (!qn || !qn.includes('::')) return true;
   const parentQn = qn.slice(0, qn.lastIndexOf('::'));
@@ -1686,6 +1697,12 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
     case 'python':
       return [
         new RegExp(`\\b${r}\\b\\s*=\\s*([A-Z][\\w.]*)\\s*\\(`), // lg = Logger(...)
+        // A quoted forward reference (`lg: "Logger"`, `lg: 'pkg.Logger'`) is the
+        // same annotation — and what every file under `from __future__ import
+        // annotations` or with a not-yet-defined class writes. The unquoted
+        // pattern below stopped at the quote and read no type at all, so the
+        // call produced no edge (#1684). Tried first: it is the stricter shape.
+        new RegExp(`\\b${r}\\b\\s*:\\s*["']([A-Z][\\w.]*)["']`), // lg: "Logger"
         new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.]*)`), // lg: Logger  (PEP 526)
       ];
     case 'java':
@@ -2799,13 +2816,23 @@ export function matchFuzzy(
   // a lone one and manufacture a 0.5 guess out of an ambiguity fuzzy declines.
   // Also decline a bare JS/TS call whose only survivor is a method or a
   // cross-file name the file already binds locally (#1714).
+  // A function nested inside another function is only callable from inside
+  // its container (#1230), so a builtin method call (`res.text()`) whose only
+  // same-named project symbol is some file's closure must decline (#1708).
+  // The check sits on the ONE candidate this strategy would commit to, not on
+  // the candidate set: filtering the unreachable ones out of a crowd would
+  // leave a single survivor and hand it every call of that name — on vite,
+  // `import { resolve } from 'node:path'` in a dozen playground configs onto
+  // the one reachable `resolve` method (#1709). Reachability may reject a
+  // unique guess; it must never manufacture one.
   if (
     finalCandidates.length === 1 &&
     isVisibleAcrossFiles(finalCandidates[0]!, ref, context) &&
     isCrossFileReachable(finalCandidates[0]!, ref, context) &&
     !(isBareJsCall(ref, context) &&
       (finalCandidates[0]!.kind === 'method' ||
-        (finalCandidates[0]!.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context))))
+        (finalCandidates[0]!.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context)))) &&
+    isLexicallyReachable(finalCandidates[0]!, ref, context)
   ) {
     const isCrossLanguage = finalCandidates[0]!.language !== ref.language;
     return {
