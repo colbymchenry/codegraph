@@ -1781,11 +1781,19 @@ function resolvePythonModuleMember(
     // `import mod` / `import numpy as np` bind the module at `source` itself;
     // `from . import certs` / `from pkg import mod` bind a SUBMODULE whose
     // dotted path is the source joined with the imported name.
+    //
+    // Join with the EXPORTED name, not the local one: under
+    // `from pkg import mod as alias` the receiver is `alias` but the module on
+    // disk is `pkg.mod`, and building `pkg.alias` looked for a file that does
+    // not exist — so the aliased form dropped its `calls` edge while the plain
+    // form (where the two names coincide) worked (#1626). For an unaliased
+    // import the two are identical, so this changes nothing there.
+    const moduleName = imp.exportedName === '*' ? imp.localName : imp.exportedName;
     const modulePath = imp.isNamespace
       ? imp.source
       : imp.source.endsWith('.')
-        ? imp.source + imp.localName
-        : imp.source + '.' + imp.localName;
+        ? imp.source + moduleName
+        : imp.source + '.' + moduleName;
 
     // resolveImportPath only maps RELATIVE dotted paths (`.mod`, `..pkg.mod`); an
     // ABSOLUTE package path (`pkg.module` from `from pkg import module`, or a bare
@@ -1973,9 +1981,12 @@ function resolveModuleImportToFile(
       modulePath = imp.source;
     } else if (ref.language === 'python') {
       // `from . import certs` — the imported NAME is a submodule of the source.
+      // As in resolvePythonModuleMember, use the exported name so an alias
+      // still links to the real module file (#1626).
+      const moduleName = imp.exportedName === '*' ? imp.localName : imp.exportedName;
       modulePath = imp.source.endsWith('.')
-        ? imp.source + imp.localName
-        : imp.source + '.' + imp.localName;
+        ? imp.source + moduleName
+        : imp.source + '.' + moduleName;
     } else {
       // A named TS/JS import binds a symbol, not a module — leave it alone.
       continue;

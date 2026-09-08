@@ -8,6 +8,7 @@ import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
+import { JS_BUILT_INS } from './js-builtins';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -2193,6 +2194,13 @@ export function matchMethodCall(
       ));
       if (typedMatch) {
         return typedMatch;
+      }
+      // A known JS/TS builtin receiver is external when it has no project
+      // method (#1566). Inference already strips generics (`Map<K, V>` →
+      // `Map`); do not let Strategy 3 guess an unrelated `get`/`set`/`has`.
+      // Keep the validated match above for a project type shadowing a builtin.
+      if (ESM_FAMILY.has(ref.language) && JS_BUILT_INS.has(inferredType)) {
+        return null;
       }
     }
   }
