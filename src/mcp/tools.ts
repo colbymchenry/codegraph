@@ -359,6 +359,14 @@ export const RELEVANCE_KIND_WEIGHT: Readonly<Record<string, number>> = {
 const DEFAULT_RELEVANCE_KIND_WEIGHT = 0.5;
 
 /**
+ * The "member of a type" tier of the table above, named so the one kind that
+ * cannot be read off `node.kind` can be placed on it: an interface's
+ * `method_signature` (#1638). Same value as `property`/`field`, deliberately —
+ * it is the same tier, not a new one.
+ */
+const TYPE_MEMBER_RELEVANCE_WEIGHT = 0.5;
+
+/**
  * Kinds whose evidentiary value depends on whether anything USES them. An
  * exported `const DEFAULTS` that half the codebase references is a real
  * definition; a `const explore` living inside one function of an eval script is
@@ -3481,6 +3489,35 @@ export class ToolHandler {
     // substantive definition (skip empty stubs + test files, same relevance the
     // trace endpoint picker uses) and inject it as an entry, so every symbol the
     // agent explicitly named is in the subgraph and its file is scored.
+    /**
+     * Is this a member an INTERFACE declares — a signature with no body (#1638)?
+     *
+     * It arrives as an ordinary `method` node, so without asking, every ranking
+     * stage reads a `.d.ts` full of `method_signature`s as a file full of
+     * callables. Two stages below ask, for the same reason: a signature is the
+     * declaration of behaviour, never behaviour, and the rank a file earns must
+     * not grow just because its interfaces spell their members out.
+     *
+     * Cached; reached only for `method` nodes on paths that already probe the
+     * graph per node, so it adds a key lookup, not a pass.
+     */
+    const interfaceMemberCache = new Map<string, boolean>();
+    const isInterfaceOwnedMethod = (node: Node): boolean => {
+      if (node.kind !== 'method') return false;
+      const cached = interfaceMemberCache.get(node.id);
+      if (cached !== undefined) return cached;
+      let owned = false;
+      try {
+        owned = cg.getIncomingEdges(node.id).some(
+          (e) => e.kind === 'contains' && cg.getNode(e.source)?.kind === 'interface',
+        );
+      } catch {
+        owned = false; // a probe failure must not manufacture a penalty
+      }
+      interfaceMemberCache.set(node.id, owned);
+      return owned;
+    };
+
     const namedSeedIds = new Set<string>();
     // The subset of named seeds that earns the named-FIRST sort tier. We still
     // SEED every ≤3-def name (so RWR / flow ranking is unchanged), but only the
@@ -3651,7 +3688,21 @@ export class ToolHandler {
           // so a named symbol FTS already gathered never sorted to the top.)
           namedSeedIds.add(n.id);
         }
-        for (const n of tierPicks) tierSeedIds.add(n.id);
+        // An interface's `method_signature` seeds (so RWR and the flow ranking
+        // still see it, and a query that names it still reaches its file) but
+        // never earns the named-FIRST tier (#1638). That tier means "the agent
+        // asked for the symbol DEFINED here", and this seeding says as much —
+        // it resolves a token to its substantive definition and sorts bodies
+        // first. A declaration is the stub that sort demotes, not the answer.
+        // Without this the tier is reachable by prose: `body`, `stream` and
+        // `metadata` are member names in any platform `.d.ts`, and each one
+        // corroborates the next through `coNamedInFile`, so an ambient shim
+        // walks past the NL-stopword guard and lands above every implementation
+        // file — the exact inversion CG-28 exists to prevent, arriving on a key
+        // that sorts above the CG-28 penalty.
+        for (const n of tierPicks) {
+          if (!isInterfaceOwnedMethod(n)) tierSeedIds.add(n.id);
+        }
       }
     }
 
@@ -3702,9 +3753,21 @@ export class ToolHandler {
       isolationCache.set(node.id, isolated);
       return isolated;
     };
+    /**
+     * A `method_signature` reaches here as a `method`, which the kind table
+     * rates 1.0: "a callable — the unit an architecture question is about". It
+     * is not that. It is the row below on the same scale, "a member of a type",
+     * and rating it as a callable is how a 28-interface `.d.ts` doubled its
+     * score the moment its members became indexable (#1638). Only `method`
+     * needs correcting; `property` already sits in the member tier whoever
+     * declares it.
+     */
     const relevanceWeight = (node: Node, probeIsolation: boolean): number => {
-      const weight = RELEVANCE_KIND_WEIGHT[node.kind] ?? DEFAULT_RELEVANCE_KIND_WEIGHT;
-      if (!probeIsolation || !WEAK_RELEVANCE_KINDS.has(node.kind)) return weight;
+      const signatureOnly = isInterfaceOwnedMethod(node);
+      const weight = signatureOnly
+        ? TYPE_MEMBER_RELEVANCE_WEIGHT
+        : RELEVANCE_KIND_WEIGHT[node.kind] ?? DEFAULT_RELEVANCE_KIND_WEIGHT;
+      if (!probeIsolation || !(signatureOnly || WEAK_RELEVANCE_KINDS.has(node.kind))) return weight;
       return isUsageIsolated(node) ? ISOLATED_WEAK_KIND_WEIGHT : weight;
     };
 
@@ -3932,8 +3995,33 @@ export class ToolHandler {
     // (org-user.storage.ts, call-connected to the matches) accrues mass; a lone
     // text match (LensSwitcher.swift, matched "switch" but calls nothing in the
     // flow) gets only its restart probability → ~0, and is dropped by the gate.
+    //
+    // A file the ambient-declaration penalty has already damped is a candidate,
+    // but not a place a walk STARTS. The restart vector is uniform over seeds,
+    // so every seed divides the restart mass the implementation files compete
+    // for — and since #1638 a platform `.d.ts` contributes one seed per member,
+    // whose names (`body`, `stream`, `metadata`) are exactly what a prose flow
+    // query matches. That is what halves an implementation file's graph mass
+    // while the shim's holds steady: dilution of the restart vector, not
+    // connectivity. `contains` is not a RANK_EDGE, so these members carry almost
+    // no walk mass of their own; seeding is the whole of their effect on rank.
+    //
+    // `isDampedDeclaration` and not a bare ambient test: it already exempts a
+    // file whose declared type the query NAMED, so a query genuinely about the
+    // declared type keeps its seeds and the shim still ranks first. Damped files
+    // stay in the candidate set, stay reachable, and keep their `score`
+    // contribution — this changes only where the walk starts.
+    const rwrSeedIds = new Set<string>();
+    for (const id of entryNodeIds) {
+      const seed = subgraph.nodes.get(id);
+      if (seed && isDampedDeclaration(seed.filePath)) continue;
+      rwrSeedIds.add(id);
+    }
     const nodeRwr = this.computeGraphRelevance(
-      [...subgraph.nodes.keys()], subgraph.edges, entryNodeIds,
+      // Fall back to the unfiltered seeds when EVERY seed is damped: the walk
+      // must not lose its restart vector and return all-uniform.
+      [...subgraph.nodes.keys()], subgraph.edges,
+      rwrSeedIds.size > 0 ? rwrSeedIds : entryNodeIds,
     );
     //
     // Carries `rankPenalty` too, so generated/low-value files are demoted on the
