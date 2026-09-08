@@ -32,6 +32,7 @@ import {
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
 import { isTestFile, normalizeNameToken } from '../search/query-utils';
+import { groupDefinitions, lastQualifierPart, matchesSymbol } from '../graph/symbol-lookup';
 import { extractQueryPaths, queryMightContainPaths } from '../search/query-paths';
 import {
   existsSync,
@@ -44,8 +45,6 @@ import { guardLabel, guardsForFileSync, siteKey, supportsBranchGuards, warmBranc
 import { findDynamicBoundaries, type BoundarySite } from '../graph/dynamic-boundary-report';
 import { countImplementers } from '../graph/type-hierarchy';
 import {
-  lastQualifierPart,
-  matchesSymbol,
   findAllSymbols,
   resolveNamedSymbolFlow,
 } from '../graph/named-symbol-flow';
@@ -2350,27 +2349,7 @@ export class ToolHandler {
     nodes: Node[],
     fileFilter: string | undefined
   ): { groups: Node[][]; filteredOut: boolean } {
-    let pool = nodes;
-    let filteredOut = false;
-    if (fileFilter) {
-      const wanted = fileFilter.replace(/^\.\//, '');
-      const narrowed = pool.filter(
-        (n) => n.filePath === wanted || n.filePath.endsWith(wanted) || n.filePath.endsWith(`/${wanted}`)
-      );
-      if (narrowed.length > 0) {
-        pool = narrowed;
-      } else {
-        filteredOut = true;
-      }
-    }
-    const byDef = new Map<string, Node[]>();
-    for (const n of pool) {
-      const key = `${n.filePath}|${n.qualifiedName}`;
-      const group = byDef.get(key);
-      if (group) group.push(n);
-      else byDef.set(key, [n]);
-    }
-    return { groups: [...byDef.values()], filteredOut };
+    return groupDefinitions(nodes, fileFilter);
   }
 
   /** Section heading for one distinct definition in grouped output. */
@@ -6853,7 +6832,7 @@ export class ToolHandler {
    */
   /**
    * Check if a node matches a symbol query — see `matchesSymbol` in
-   * `../graph/named-symbol-flow`, which owns the rules.
+   * `../graph/symbol-lookup`, which owns the rules.
    */
   private matchesSymbol(node: Node, symbol: string): boolean {
     return matchesSymbol(node, symbol);
