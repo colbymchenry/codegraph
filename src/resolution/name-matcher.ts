@@ -2814,11 +2814,12 @@ function pythonModuleFile(
  * silent miss — and one level down, at the `__init__.py` re-export hop, there
  * is no agreement rule at all, so a commented-out line could DECIDE an edge.
  *
- * So strip the text that is not code, then ask the extractor's OWN regexes what
- * is left. Running the same patterns is the point: a filter stricter than the
- * thing it filters silently drops legitimate bindings. A hand-written
- * line-anchored version did exactly that — `import os; from kinds import Real`
- * resolved before it and stopped resolving after.
+ * So strip the text that is not code with the SHARED per-language stripper
+ * (`strip-comments.ts`, the one the framework route extractors use), then ask
+ * the extractor's OWN regexes what is left. Running the same patterns is the
+ * point: a filter stricter than the thing it filters silently drops legitimate
+ * bindings. A hand-written line-anchored version did exactly that — `import os;
+ * from kinds import Real` resolved before it and stopped resolving after.
  *
  * Returning null (unreadable) is NOT the same as returning an empty set. Empty
  * means "read it, and every import-looking line was comment or string", which
@@ -2834,62 +2835,31 @@ function livePythonImportSources(
     memo = new Map();
     pythonLiveSourceMemo.set(context, memo);
   }
-  // `getFileLines` is LRU-cached, but the strip-and-scan over every line is
-  // not, and it re-ran for every `self.attr.method()` ref in the file —
-  // O(refs x file length), the shape types.ts records as ~20% of index CPU on
-  // a java-heavy repo once before.
+  // `readFile` is LRU-cached, but the strip-and-scan over the file is not, and
+  // it re-ran for every `self.attr.method()` ref in the file — O(refs x file
+  // length), the shape types.ts records as ~20% of index CPU on a java-heavy
+  // repo once before. Memoize per file, per resolution context.
   const cached = memo.get(filePath);
   if (cached !== undefined) return cached;
 
-  const lines =
-    context.getFileLines?.(filePath) ?? context.readFile(filePath)?.split(/\r?\n/) ?? null;
-  if (lines === null) {
+  const source = context.readFile(filePath);
+  if (source === null || source === undefined) {
     memo.set(filePath, null);
     return null;
   }
 
-  const code: string[] = [];
-  let fence: string | null = null; // the triple-quote we are inside, if any
-  for (const raw of lines) {
-    let kept = '';
-    let i = 0;
-    while (i < raw.length) {
-      if (fence !== null) {
-        const end = raw.indexOf(fence, i);
-        if (end < 0) {
-          i = raw.length;
-          break;
-        }
-        i = end + 3;
-        fence = null;
-        continue;
-      }
-      const three = raw.slice(i, i + 3);
-      if (three === '"""' || three === "'''") {
-        const end = raw.indexOf(three, i + 3);
-        if (end < 0) {
-          fence = three; // runs past this line
-          i = raw.length;
-          break;
-        }
-        i = end + 3; // opened and closed on one line
-        continue;
-      }
-      const ch = raw[i]!;
-      if (ch === '#') break; // the rest of the line is a comment
-      if (ch === '"' || ch === "'") {
-        let j = i + 1;
-        while (j < raw.length && raw[j] !== ch) j += raw[j] === '\\' ? 2 : 1;
-        i = j + 1;
-        continue;
-      }
-      kept += ch;
-      i++;
-    }
-    code.push(kept);
-  }
-
-  const stripped = code.join('\n');
+  // The shared per-language stripper, composed exactly as the TS receiver-type
+  // reader composes it above: `stripCommentsForRegex` blanks comments and
+  // triple-quoted docstrings, `blankStringContents` blanks what is inside a
+  // single-line string. Both BLANK rather than delete, so offsets — and the
+  // line anchoring the `^import` pattern relies on — survive.
+  //
+  // This replaces a hand-rolled line scanner. Sharing the stripper is the
+  // point: a bespoke one drifts from the extractor it is meant to mirror, and
+  // a filter stricter than the thing it filters silently drops legitimate
+  // bindings — an earlier line-anchored version did exactly that, and
+  // `import os; from kinds import Real` stopped resolving.
+  const stripped = blankStringContents(stripCommentsForRegex(source, 'python'));
   const sources = new Set<string>();
   // The two patterns `extractPythonImports` uses, verbatim — including the
   // column-anchoring difference between them.
