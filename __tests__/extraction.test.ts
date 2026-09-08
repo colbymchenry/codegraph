@@ -7350,6 +7350,105 @@ describe('Directory Exclusion', () => {
   });
 });
 
+
+describe('Nested .gitignore node_modules exclusion (#1567)', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    cleanupTempDir(tempDir);
+  });
+
+  function plantNodeModules(subproject: string, packages = 80): void {
+    const base = path.join(tempDir, subproject, 'node_modules');
+    for (let i = 0; i < packages; i++) {
+      const pkg = path.join(base, `pkg${i}`);
+      fs.mkdirSync(pkg, { recursive: true });
+      fs.writeFileSync(path.join(pkg, 'index.js'), `module.exports = ${i};`);
+      fs.writeFileSync(path.join(pkg, 'index.d.ts'), 'export const n: number;');
+      if (i % 4 === 0) fs.writeFileSync(path.join(pkg, '.gitignore'), '*.map\n');
+      const nested = path.join(pkg, 'node_modules', `nested${i}`);
+      fs.mkdirSync(nested, { recursive: true });
+      fs.writeFileSync(path.join(nested, 'lib.ts'), 'export const x = 1;');
+    }
+  }
+
+  function initGitRepo(): void {
+    const { execFileSync } = require('child_process') as typeof import('child_process');
+    execFileSync('git', ['init'], { cwd: tempDir, stdio: 'ignore' });
+    execFileSync('git', ['add', '-A'], { cwd: tempDir, stdio: 'ignore' });
+    execFileSync(
+      'git',
+      ['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '-m', 'init'],
+      { cwd: tempDir, stdio: 'ignore' },
+    );
+  }
+
+  it('excludes node_modules ignored only by a nested .gitignore (git path)', () => {
+    fs.mkdirSync(path.join(tempDir, 'frontend', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'extension', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'frontend', 'src', 'app.ts'), 'export const a = 1;');
+    fs.writeFileSync(path.join(tempDir, 'extension', 'src', 'ext.ts'), 'export const b = 1;');
+    fs.writeFileSync(path.join(tempDir, 'root.ts'), 'export const r = 1;');
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), '*.log\n');
+    fs.writeFileSync(path.join(tempDir, 'frontend', '.gitignore'), '/node_modules\n');
+    fs.writeFileSync(path.join(tempDir, 'extension', '.gitignore'), 'node_modules/\n');
+    plantNodeModules('frontend');
+    plantNodeModules('extension');
+    initGitRepo();
+
+    const files = scanDirectory(tempDir);
+    expect(files.sort()).toEqual(['extension/src/ext.ts', 'frontend/src/app.ts', 'root.ts']);
+    expect(files.every((f) => !f.includes('node_modules'))).toBe(true);
+  });
+
+  it('excludes nested-gitignore node_modules on the filesystem-walk fallback too', () => {
+    fs.mkdirSync(path.join(tempDir, 'frontend', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'extension', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'frontend', 'src', 'app.ts'), 'export const a = 1;');
+    fs.writeFileSync(path.join(tempDir, 'extension', 'src', 'ext.ts'), 'export const b = 1;');
+    fs.writeFileSync(path.join(tempDir, 'root.ts'), 'export const r = 1;');
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), '*.log\n');
+    fs.writeFileSync(path.join(tempDir, 'frontend', '.gitignore'), '/node_modules\n');
+    fs.writeFileSync(path.join(tempDir, 'extension', '.gitignore'), 'node_modules/\n');
+    plantNodeModules('frontend', 60);
+    plantNodeModules('extension', 60);
+
+    const files = scanDirectory(tempDir);
+    expect(files.sort()).toEqual(['extension/src/ext.ts', 'frontend/src/app.ts', 'root.ts']);
+    expect(files.every((f) => !f.includes('node_modules'))).toBe(true);
+  });
+
+  it('still excludes when root only lists one subproject node_modules (Boba-like)', () => {
+    fs.mkdirSync(path.join(tempDir, 'frontend', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'extension', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'frontend', 'src', 'app.ts'), 'export const a = 1;');
+    fs.writeFileSync(path.join(tempDir, 'extension', 'src', 'ext.ts'), 'export const b = 1;');
+    fs.writeFileSync(path.join(tempDir, 'root.ts'), 'export const r = 1;');
+    fs.writeFileSync(
+      path.join(tempDir, '.gitignore'),
+      ['*.log', 'frontend/node_modules/', 'frontend/.angular/', ''].join('\n'),
+    );
+    fs.writeFileSync(path.join(tempDir, 'frontend', '.gitignore'), '/node_modules\n');
+    fs.writeFileSync(path.join(tempDir, 'extension', '.gitignore'), 'node_modules/\n');
+    plantNodeModules('frontend', 40);
+    plantNodeModules('extension', 40);
+
+    const fsFiles = scanDirectory(tempDir);
+    expect(fsFiles.every((f) => !f.includes('node_modules'))).toBe(true);
+    expect(fsFiles.sort()).toEqual(['extension/src/ext.ts', 'frontend/src/app.ts', 'root.ts']);
+
+    initGitRepo();
+    const gitFiles = scanDirectory(tempDir);
+    expect(gitFiles.every((f) => !f.includes('node_modules'))).toBe(true);
+    expect(gitFiles.sort()).toEqual(['extension/src/ext.ts', 'frontend/src/app.ts', 'root.ts']);
+  });
+});
+
+
 describe('Git Submodules', () => {
   let tempDir: string;
 

@@ -1050,6 +1050,10 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
           { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
         );
         // Directory is gitignored by parent repo — fall back to filesystem walk
+        logDebug('project root is gitignored by a parent repo — falling back to filesystem walk', {
+          rootDir,
+          gitRoot,
+        });
         return null;
       } catch {
         // Not ignored — safe to use git ls-files
@@ -1074,7 +1078,20 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
     // Git, but still wanted in the graph.)
     for (const f of collectIncludedFilesForRoot(rootDir)) visible.add(f);
     return visible;
-  } catch {
+  } catch (error) {
+    // Any failure here (git missing, a `git rev-parse`/`ls-files` timeout or
+    // buffer overrun under load, an unreadable repo, unsupported flag combo on
+    // older git, etc.) silently sent every caller to `scanDirectoryWalk` with
+    // zero signal that the fast git-delegated path was skipped — making reports
+    // like #1567 (nested-`.gitignore`-excluded `node_modules` walked into)
+    // hard to triage, since both ignore implementations look correct in
+    // isolation but there was no way to tell which one ran. Log it under the
+    // existing CODEGRAPH_DEBUG gate so a future report can confirm or rule out
+    // the fallback in one step.
+    logDebug('git-based file listing unavailable — falling back to filesystem walk', {
+      rootDir,
+      error: error instanceof Error ? error.message : String(error),
+    });
     return null;
   }
 }
