@@ -4876,10 +4876,13 @@ export class TreeSitterExtractor {
     }
     // For namespaced/qualified constructors (`new ns.Foo()`,
     // `new ns::Foo()`) keep the trailing identifier — that's what
-    // matches a class node in the index.
+    // matches a class node in the index. PHP spells the separator `\`
+    // (`new \App\Models\User()`), so it belongs in the same strip; scoped to
+    // php because a backslash carries no qualifier meaning in the others.
     const lastDot = Math.max(
       className.lastIndexOf('.'),
-      className.lastIndexOf('::')
+      className.lastIndexOf('::'),
+      this.language === 'php' ? className.lastIndexOf('\\') : -1
     );
     if (lastDot >= 0) className = className.slice(lastDot + 1).replace(/^[:.]/, '');
     className = className.trim();
@@ -4987,6 +4990,17 @@ export class TreeSitterExtractor {
       node.namedChild(0);
     if (!recv) return;
     const t = recv.type;
+    // PHP writes any namespaced receiver as a `qualified_name` — `Foo\Bar::class`,
+    // `\App\Models\User::TABLE`, and the alias form `Type\Bankverbindung::class`
+    // after `use App\SoapTypes as Type;`. Without this branch every one of them is
+    // dropped with no unresolved ref to show for it. Match on the trailing simple
+    // name, as walkPhpTypePosition already does — that is what the class node is
+    // stored as, and what a `use` import brings into scope.
+    if (this.language === 'php' && t === 'qualified_name') {
+      const last = getNodeText(recv, this.source).split('\\').pop() ?? '';
+      if (/^[A-Z][A-Za-z0-9_]*$/.test(last)) this.pushStaticMemberRef(last, ownerId, recv);
+      return;
+    }
     if (
       t === 'identifier' || t === 'type_identifier' || t === 'simple_identifier' ||
       t === 'name' || t === 'scoped_type_identifier'
