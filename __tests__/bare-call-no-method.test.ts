@@ -80,7 +80,7 @@ describe('a receiver-less JS/TS call never binds to a method (#1714)', () => {
 
   it('a bare call to a name the file binds itself has no cross-file candidate', async () => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1714-'));
-    fs.writeFileSync(path.join(tempDir, 'config.ts'), 'export function resolve(p: string) { return p; }\nexport function transform(c: string) { return c; }\n');
+    fs.writeFileSync(path.join(tempDir, 'config.ts'), 'export function resolve(p: string) { return p; }\nexport function transform(c: string) { return c; }\nexport function now() { return 0; }\n');
     fs.writeFileSync(
       path.join(tempDir, 'client.ts'),
       [
@@ -90,8 +90,9 @@ describe('a receiver-less JS/TS call never binds to a method (#1714)', () => {
         '    setTimeout(() => resolve(), 10);',
         '  });',
         '}',
-        'export function run() {',
-        '  return transform("x").length;',
+        'export function run(options: { now?: () => number }) {',
+        '  const now = options.now || (() => Date.now());',
+        '  return now() + transform("x").length;',
         '}',
         '',
       ].join('\n')
