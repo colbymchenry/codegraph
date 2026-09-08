@@ -137,6 +137,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- Sync now recovers the same connections as a clean index after interrupted reference resolution, including inherited calls and callbacks that previously stayed missing. (#1577)
+
+- `codegraph_explore` now re-serves source to fresh subagents and after context compaction, with cross-call dedup available only through an explicit `CODEGRAPH_EXPLORE_DEDUP=1` opt-in; thanks @danusha2345. (#1620, #1624)
+
 - **Watcher scope now matches `git ls-files --exclude-standard` (#1728).** `buildDefaultIgnore` / `buildScopeIgnore` read `.git/info/exclude` and `core.excludesFile` (not only the root `.gitignore`), and seed directories git reports as ignored-untracked so nested `.gitignore` effects prune the live watcher the same way the indexer skips them. Single-file auto-sync was already incremental (`pendingFiles` → scoped `sync({ paths })`); the remaining gap was watching trees git had excluded.
 
 - **Live sync no longer lets the write-ahead log grow without a bound when a reader is holding it open (#1539).** Incremental sync now uses the same writer pause that full indexing already used, and if checkpointing still cannot finish once the log is past its documented size limit — typically because the query pool is reading at the same time — sync stops with a clear error instead of keeping writing until the disk fills. The previous behaviour could leave a multi-tens-of-gigabyte log beside a few-gigabyte index on a large project. Close concurrent readers and retry, or raise `CODEGRAPH_WAL_VALVE_MB` if the limit is too tight for the project.
@@ -144,6 +148,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A second `codegraph serve --mcp` on the same project no longer silently kills auto-sync (#1740).** Direct mode (`CODEGRAPH_NO_DAEMON=1` or proxy→in-process fallback) now takes an exclusive `.codegraph/writer.pid` lock; a second writer exits immediately with guidance to stop the other server or unset `CODEGRAPH_NO_DAEMON` so clients share the daemon. The shared daemon already multiplexes N clients onto one watcher — this closes the same-OS dual-direct gap the docs warned about for Windows/WSL but did not guard.
 
 - Indexing no longer checks whether files outside your project exist. A relative import that points above the project directory (`../../something`) made CodeGraph probe that location on disk while resolving it. Nothing outside the project was ever read, and no such file was ever added to the index or linked to, but the check itself should not have happened — such an import now simply resolves to nothing. Symlinks inside your project that point at code kept elsewhere are unaffected and still index as before. Thanks @ErQrYfkrju. (#1631)
+
+- `codegraph install` now honors `CLAUDE_CONFIG_DIR` and `CODEX_HOME` for global Claude Code and Codex setup so CodeGraph loads in your chosen profile (thanks @seanchann; #1627).
 
 #### Screens, links and navigation
 
@@ -214,6 +220,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 #### Symbols, tests and the viewer
 
 - Kotlin functions and methods now carry their signature — `(params): ReturnType` — in `codegraph_explore`, `node` and the viewer, instead of no signature at all. Re-index Kotlin projects after upgrading. (#1495)
+- TypeScript and JavaScript collection calls through local variables and their nested properties no longer link to unrelated project methods; re-index after upgrading. (#1566)
+
 - Objective-C headers now index in a project that has no `.m` file. A `.h` file is read as C from its name alone, and only later — once its contents are read — recognized as Objective-C; the grammar for that was never loaded up front, so the file failed with a parser error and nothing in it reached the index. Adding any `.m` file used to make the same header work, which is what made this look arbitrary. Thanks @Juddd. (#1628)
 
 - TypeScript interface methods and properties are now indexed, so `node`, `callers` and impact can find platform `.d.ts` APIs while declaration-only files keep their lower ranking on flow queries; re-index TypeScript projects after upgrading. (#1638)
@@ -249,6 +257,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`codegraph_explore` is loaded from the first prompt in Claude Code.** Claude Code defers every MCP tool behind a tool-search step, so a fresh session saw only the tool's name until the model searched for it, and the server's "call `codegraph_explore` instead of Read" had nothing loaded to act on. The tool now carries `anthropic/alwaysLoad` in its `_meta`, which exempts it on existing installs, and `codegraph install` writes `alwaysLoad: true` on the Claude Code server entry (re-run it to add the key). Copilot CLI's tool search holds MCP tools back the same way once ~30 tools are connected, so its entry now carries `deferTools: "never"`. (#1696)
 
 - Fixed a long-running `codegraph ui` session serving a symbol that a sync had already deleted. The viewer keeps one connection to your index open, and its in-memory lookup didn't notice when another process — your agent's sync, or `codegraph sync` — rewrote the file underneath it, so a symbol screen could keep showing a body with no callers while search correctly reported it had moved. Because a symbol's identity includes the line it starts on, this happened after almost any edit above it.
+
+- Python calls and file dependencies through `from package import module as alias` now appear in the graph, so renamed imports no longer hide live callers or imported modules. Thanks @JoeyNPP. (#1626)
 
 ## [1.6.0] - 2026-08-26
 
