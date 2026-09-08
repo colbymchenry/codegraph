@@ -17,7 +17,7 @@ import {
   ImportMapping,
 } from './types';
 import { isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
-import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos, resolveImportPath } from './import-resolver';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos, resolveImportPath } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -957,6 +957,12 @@ export class ReferenceResolver {
       const razorResult = this.resolveRazorUsing(ref);
       if (razorResult) return razorResult;
     }
+
+    // An explicit PHP class import owns its static calls, including an
+    // unavailable method. Do not let same-name fallbacks change the receiver
+    // to an unrelated Service/Repository type (#1545).
+    const phpStaticImport = resolvePhpImportedStaticCall(ref, this.context);
+    if (phpStaticImport !== undefined) return this.gateLanguage(phpStaticImport, ref);
 
     const candidates: ResolvedRef[] = [];
 
