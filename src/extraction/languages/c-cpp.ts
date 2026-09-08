@@ -166,6 +166,35 @@ export function stripCppTemplateArgs(name: string): string {
   return out.trim();
 }
 
+
+/**
+ * Is this C++ `field_declaration` a pure-virtual method (`virtual int read(int key) = 0;`)?
+ * tree-sitter-cpp shapes those as a field_declaration whose declarator unwraps to a
+ * `function_declarator`, with the pure-virtual `= 0` as a DIRECT `number_literal` "0"
+ * child of the field_declaration (default-arg `= 0` lives inside parameter_declaration
+ * and must not match). Bodiless method prototypes (`int foo();`) and data members
+ * (`int x = 0;`) are excluded — prototypes usually have an out-of-line definition that
+ * already mints the method node; pure virtuals never do (#1727).
+ */
+export function isCppPureVirtualMethodDecl(node: SyntaxNode): boolean {
+  if (node.type !== 'field_declaration') return false;
+  let declarator: SyntaxNode | null = getChildByField(node, 'declarator');
+  if (!declarator) return false;
+  while (
+    declarator.type === 'pointer_declarator' ||
+    declarator.type === 'reference_declarator'
+  ) {
+    const inner: SyntaxNode | null =
+      getChildByField(declarator, 'declarator') || declarator.namedChild(0);
+    if (!inner) return false;
+    declarator = inner;
+  }
+  if (declarator.type !== 'function_declarator') return false;
+  return node.namedChildren.some(
+    (c: SyntaxNode) => c.type === 'number_literal' && c.text === '0'
+  );
+}
+
 /**
  * A function/method's return type lives in the `function_definition`'s `type`
  * field (`Metrics& Metrics::instance()` → `Metrics`). Constructors, destructors,
@@ -1515,8 +1544,56 @@ export function blankCNamedVariadicDefineDots(source: string): string {
  * C-detected headers in CUDA projects (llm.c keeps `__device__` helpers and
  * kernel prototypes in plain `.h`) — the same content-gated CUDA blank as
  * C++. Offset-preserving. */
+/**
+ * Blank the argument list of a statement-level `MACRO( … );` call whose
+ * arguments are designated initializers — betaflight's
+ *
+ *     RESET_CONFIG(pidProfile_t, pidProfile,
+ *         .pid = { [PID_ROLL] = PID_ROLL_DEFAULT, … },
+ *         .pidSumLimit = PIDSUM_LIMIT,
+ *         …
+ *     );
+ *
+ * tree-sitter-c has no rule for `.field = value` as a call argument. Even a
+ * small statement-level `M(a, b, .x = 1, .y = { 1, 2 },);` with a trailing
+ * comma recovers by extending the enclosing `function_definition` to EOF —
+ * the next function vanishes and later ones nest under the first (#1729 —
+ * 310 functions in 73 files on a betaflight tree, which name matching then
+ * treated as unreachable closures). Emptying the argument list to spaces,
+ * newlines kept, leaves `RESET_CONFIG(\n\n…\n);` — a call the grammar parses
+ * cleanly — at the cost of the references inside the initializer, which the
+ * broken parse was not yielding either. Statement-level only (`);` follows),
+ * macro-cased name only, offsets preserved. Runs before the kernel route
+ * point, so both the wasm and kernel C arms see the same bytes.
+ */
+export function blankCDesignatedMacroArgs(source: string): string {
+  if (source.indexOf('=') === -1) return source;
+  const out = source.split('');
+  const re = /^[ \t]*([A-Z_][A-Z0-9_]*)\s*\(/gm;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source))) {
+    const open = m.index + m[0].length - 1;
+    let depth = 1;
+    let i = open + 1;
+    for (; i < source.length && depth > 0; i++) {
+      const c = source[i];
+      if (c === '(') depth++;
+      else if (c === ')') depth--;
+    }
+    if (depth !== 0) continue;
+    const close = i - 1;
+    const args = source.slice(open + 1, close);
+    // A designator at argument depth: `.name =` or `[index] =`.
+    if (!/(^|[,{(\s])(\.[A-Za-z_]\w*|\[[^\]]+\])\s*=[^=]/.test(args)) continue;
+    if (!/^\s*;/.test(source.slice(close + 1))) continue;
+    for (let k = open + 1; k < close; k++) if (out[k] !== '\n') out[k] = ' ';
+    re.lastIndex = close;
+  }
+  return out.join('');
+}
+
 function preParseCSource(source: string): string {
-  const inner = blankCKernelAnnotations(blankCCplusplusGuardBodies(source));
+  const inner = blankCDesignatedMacroArgs(blankCKernelAnnotations(blankCCplusplusGuardBodies(source)));
   let blanked = blankCLeadingAttrMacros(
     blankLoneMacroLines(
       blankCStatementMacroCalls(
@@ -1559,7 +1636,17 @@ export const cppExtractor: LanguageExtractor = {
   // get picked as the blast-radius representative over — the single real
   // definition, exactly as bodiless struct/enum specifiers are already skipped. (#1093)
   skipBodilessClass: true,
-  methodTypes: ['function_definition'],
+  // `function_definition` covers inline / out-of-line bodies; `field_declaration`
+  // covers pure-virtual methods (`virtual int read(int key) = 0;`), which have no
+  // body and would otherwise mint no node — so calls through the abstract base and
+  // cpp-override synthesis had nothing to attach to (#1727). classifyMethodNode
+  // keeps ordinary data members / prototypes on the children-walk path.
+  methodTypes: ['function_definition', 'field_declaration'],
+  classifyMethodNode: (node) => {
+    if (node.type !== 'field_declaration') return 'method';
+    return isCppPureVirtualMethodDecl(node) ? 'method' : 'skip';
+  },
+  isAbstract: (node) => (isCppPureVirtualMethodDecl(node) ? true : undefined),
   interfaceTypes: [],
   structTypes: ['struct_specifier'],
   // C++ unions additionally carry member functions, which extract through the

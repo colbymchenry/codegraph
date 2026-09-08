@@ -21,7 +21,8 @@
  * inside a string is a false positive, so {@link blankStringContents} blanks
  * them too, quotes preserved.)
  */
-import { stripCommentsForRegex, type CommentLang } from '../resolution/strip-comments';
+import { blankStringContents, stripCommentsForRegex, type CommentLang } from '../resolution/strip-comments';
+export { blankStringContents } from '../resolution/strip-comments';
 
 export interface BoundaryMatch {
   /** Stable form id, e.g. 'computed-call' — used for per-form dedupe. */
@@ -222,42 +223,6 @@ function commentLang(language: string): CommentLang | null {
 const MAX_MATCHES_PER_BODY = 3;
 const MAX_BODY_CHARS = 60_000; // a god-function tail is still scannable; beyond this, truncate
 
-/**
- * Blank the CONTENTS of string literals (quotes preserved, offsets preserved)
- * so dispatch-shaped prose — docs, error messages, template text — can't fire
- * a matcher. Run AFTER comment stripping (comments are already spaces).
- * Backslash escapes are honored; `'`/`"` strings end at a newline (treated as
- * unterminated, matching the comment stripper); backticks span lines, and
- * `${...}` interpolations inside them are blanked too — missing a dispatch
- * inside a template literal is acceptable, false-firing on prose is not.
- */
-export function blankStringContents(text: string): string {
-  const out = text.split('');
-  let i = 0;
-  const n = text.length;
-  while (i < n) {
-    const c = text[i]!;
-    if (c === '"' || c === "'" || c === '`') {
-      const quote = c;
-      i++;
-      while (i < n && text[i] !== quote) {
-        if (text[i] === '\\' && i + 1 < n) {
-          out[i] = ' ';
-          out[i + 1] = ' ';
-          i += 2;
-          continue;
-        }
-        if (quote !== '`' && text[i] === '\n') break; // unterminated — stop blanking
-        if (text[i] !== '\n') out[i] = ' ';           // keep newlines for line math
-        i++;
-      }
-      if (i < n && text[i] === quote) i++;
-      continue;
-    }
-    i++;
-  }
-  return out.join('');
-}
 
 /**
  * Scan one symbol's body for dynamic-dispatch sites.

@@ -24,11 +24,12 @@
  *     per-file watches are never needed.
  *
  * Excluded trees (node_modules/, dist/, .git/, …) are filtered via the
- * indexer's `buildScopeIgnore` (built-in default-ignore dirs + the project's
- * .gitignore) — on Linux they're never descended into (so they cost no watch),
- * and on macOS/Windows the single recursive stream still covers them but their
+ * indexer's `buildScopeIgnore` (built-in defaults + root `.gitignore` +
+ * `.git/info/exclude` + `core.excludesFile` + git ignored-untracked dirs) —
+ * on Linux they're never descended into (so they cost no watch), and on
+ * macOS/Windows the single recursive stream still covers them but their
  * events are dropped before any sync is scheduled. Either way the watcher's
- * scope matches the indexer's (#276 / #407).
+ * scope matches `git ls-files --exclude-standard` (#276 / #407 / #1728).
  */
 
 import * as fs from 'fs';
@@ -328,12 +329,14 @@ export class FileWatcher {
    * deterministically gate on watcher readiness.
    */
   private readyWaiters: Array<() => void> = [];
-  // The shared scope matcher (built-in defaults + project .gitignore + the
-  // `codegraph.json` exclude/include rules, with embedded child repos matched
-  // by their OWN rules — #514), built at start() and REBUILT whenever one of
-  // the files it is derived from changes (see `refreshScope`, #1590). Same
-  // source of truth the indexer uses, so watcher scope can never diverge from
-  // index scope. An embedded repo created after start() joins the scope on
+  // The shared scope matcher from `buildScopeIgnore` (built-in defaults +
+  // root `.gitignore` + `.git/info/exclude` + `core.excludesFile` + dirs
+  // `git ls-files --exclude-standard` reports ignored + `codegraph.json`
+  // exclude/include, with embedded child repos matched by their OWN rules —
+  // #514), built at start() and REBUILT whenever one of the files it is
+  // derived from changes (see `refreshScope`, #1590). Same construction the
+  // indexer uses for scoped sync, so watcher scope cannot diverge from index
+  // scope (#1728). An embedded repo created after start() joins the scope on
   // the next scope refresh / watcher restart / re-index.
   private ignoreMatcher: ScopeIgnore | null = null;
 
@@ -574,6 +577,14 @@ export class FileWatcher {
    */
   private handleChange(rel: string): void {
     if (!rel || rel === '.' || rel.startsWith('..')) return;
+    // `.git/info/exclude` is otherwise always-ignored with the rest of `.git/`,
+    // but it feeds `buildScopeIgnore` — allow it through as a scope refresh
+    // when the platform delivers the event (recursive watchers may; Linux
+    // per-directory watching does not descend into `.git/`) (#1728).
+    if (rel === '.git/info/exclude') {
+      this.refreshScope(rel);
+      return;
+    }
     if (this.isAlwaysIgnored(rel)) return;
     // The two root files the scope matcher is derived from are handled BEFORE
     // the matcher is consulted: a user `exclude` pattern that happens to cover
