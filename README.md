@@ -854,7 +854,7 @@ is written):
 - **Claude Code**
 - **Cursor**
 - **Codex CLI**
-- **opencode**
+- **opencode** — MCP entry is OpenCode 2's `mcp.servers.codegraph` with `codemode: false` (keeps `codegraph_explore` on the native tool list; `codegraph install` migrates the older `mcp.codegraph` shape)
 - **Hermes Agent**
 - **Gemini CLI**
 - **Antigravity IDE**

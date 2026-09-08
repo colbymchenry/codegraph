@@ -138,6 +138,8 @@ describe('Installer targets — contract', () => {
             // opencode uses `mcp` not `mcpServers`. Match its shape too.
             if (target.id === 'opencode') {
               delete seed.mcpServers;
+              // Keep a v1-shaped sibling — real configs mix shapes during the
+              // OpenCode 1→2 transition; install must not disturb it (#1698).
               seed.mcp = { other: { type: 'local', command: ['x'], enabled: true } };
             }
             // VS Code's mcp.json uses `servers`; the JetBrains Copilot
@@ -153,7 +155,10 @@ describe('Installer targets — contract', () => {
             const after = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
             if (target.id === 'opencode') {
               expect(after.mcp.other).toBeDefined();
-              expect(after.mcp.codegraph).toBeDefined();
+              expect(after.mcp.servers.codegraph).toBeDefined();
+              expect(after.mcp.servers.codegraph.codemode).toBe(false);
+              expect(after.mcp.servers.codegraph.disabled).toBe(false);
+              expect(after.mcp.codegraph).toBeUndefined();
             } else if (target.id === 'copilot-vscode' || target.id === 'copilot-jetbrains') {
               expect(after.servers.other).toBeDefined();
               expect(after.servers.codegraph).toBeDefined();
@@ -875,7 +880,7 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(body).toContain('  telegram:\n  - hermes-telegram');
   });
 
-  it('opencode: uninstall removes only mcp.codegraph, preserves comments and siblings', () => {
+  it('opencode: uninstall removes only mcp.servers.codegraph, preserves comments and siblings', () => {
     const opencode = getTarget('opencode')!;
     const dir = path.join(tmpHome, '.config', 'opencode');
     fs.mkdirSync(dir, { recursive: true });
@@ -892,13 +897,15 @@ describe('Installer targets — partial-state idempotency', () => {
     ].join('\n'));
 
     opencode.install('global', { autoAllow: true });
-    const afterInstall = fs.readFileSync(file, 'utf-8');
-    expect(afterInstall).toContain('"codegraph"');
-    expect(afterInstall).toContain('"other"');
+    const afterInstall = parseJsonc(fs.readFileSync(file, 'utf-8'));
+    expect(afterInstall.mcp.servers.codegraph).toBeDefined();
+    expect(afterInstall.mcp.servers.codegraph.codemode).toBe(false);
+    expect(afterInstall.mcp.other).toBeDefined();
 
     opencode.uninstall('global');
     const afterUninstall = fs.readFileSync(file, 'utf-8');
     expect(afterUninstall).not.toContain('codegraph');
+    expect(afterUninstall).not.toContain('"servers"');
     expect(afterUninstall).toContain('// important comment');
     expect(afterUninstall).toContain('"other"');
   });
@@ -1812,6 +1819,149 @@ function listAllFiles(dir: string): string[] {
   }
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// opencode OpenCode 2 native MCP shape (#1698)
+//
+// OpenCode 2 reads `mcp.servers.<name>` with `disabled` / `codemode`. The
+// v1 `mcp.<name>` + `enabled` shape still connects but drops `codemode`
+// during normalization — so the installer must write the native shape and
+// migrate/uninstall either.
+// ---------------------------------------------------------------------------
+describe('Installer targets — opencode native MCP shape (#1698)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('home');
+    tmpCwd = mkTmpDir('cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  const configFile = () => path.join(tmpHome, '.config', 'opencode', 'opencode.jsonc');
+
+  it('install writes mcp.servers.codegraph with disabled:false and codemode:false', () => {
+    const opencode = getTarget('opencode')!;
+    opencode.install('global', { autoAllow: true });
+    const cfg = JSON.parse(fs.readFileSync(configFile(), 'utf-8'));
+    expect(cfg.mcp.codegraph).toBeUndefined();
+    expect(cfg.mcp.servers.codegraph).toEqual({
+      type: 'local',
+      command: ['codegraph', 'serve', '--mcp'],
+      disabled: false,
+      codemode: false,
+    });
+  });
+
+  it('printConfig shows the native OpenCode 2 shape', () => {
+    const out = getTarget('opencode')!.printConfig('global');
+    expect(out).toContain('"servers"');
+    expect(out).toContain('"codemode": false');
+    expect(out).toContain('"disabled": false');
+    expect(out).not.toContain('"enabled"');
+    // No v1 top-level mcp.codegraph key in the snippet.
+    expect(out).not.toMatch(/"mcp"\s*:\s*\{\s*"codegraph"/);
+  });
+
+  it('re-install migrates a v1 mcp.codegraph entry to mcp.servers.codegraph', () => {
+    const dir = path.dirname(configFile());
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(configFile(), [
+      '{',
+      '  // keep me',
+      '  "$schema": "https://opencode.ai/config.json",',
+      '  "mcp": {',
+      '    "codegraph": { "type": "local", "command": ["codegraph", "serve", "--mcp"], "enabled": true },',
+      '    "other": { "type": "local", "command": ["x"], "enabled": true }',
+      '  }',
+      '}',
+      '',
+    ].join('\n'));
+
+    const opencode = getTarget('opencode')!;
+    expect(opencode.detect('global').alreadyConfigured).toBe(true);
+
+    const result = opencode.install('global', { autoAllow: true });
+    expect(result.files.find((f) => f.path === configFile())!.action).toBe('updated');
+
+    const text = fs.readFileSync(configFile(), 'utf-8');
+    expect(text).toContain('// keep me');
+    const cfg = parseJsonc(text);
+    expect(cfg.mcp.codegraph).toBeUndefined();
+    expect(cfg.mcp.other).toBeDefined();
+    expect(cfg.mcp.servers.codegraph).toEqual({
+      type: 'local',
+      command: ['codegraph', 'serve', '--mcp'],
+      disabled: false,
+      codemode: false,
+    });
+
+    // Idempotent after migration.
+    const second = opencode.install('global', { autoAllow: true });
+    expect(second.files.find((f) => f.path === configFile())!.action).toBe('unchanged');
+  });
+
+  it('uninstall removes a leftover v1 mcp.codegraph entry', () => {
+    const dir = path.dirname(configFile());
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(configFile(), [
+      '{',
+      '  // keep me',
+      '  "$schema": "https://opencode.ai/config.json",',
+      '  "mcp": {',
+      '    "codegraph": { "type": "local", "command": ["codegraph", "serve", "--mcp"], "enabled": true },',
+      '    "other": { "type": "local", "command": ["x"], "enabled": true }',
+      '  }',
+      '}',
+      '',
+    ].join('\n'));
+
+    const opencode = getTarget('opencode')!;
+    opencode.uninstall('global');
+    const text = fs.readFileSync(configFile(), 'utf-8');
+    expect(text).toContain('// keep me');
+    expect(text).toContain('"other"');
+    expect(text).not.toContain('codegraph');
+    expect(opencode.detect('global').alreadyConfigured).toBe(false);
+  });
+
+  it('uninstall removes a native mcp.servers.codegraph entry and an emptied servers wrapper', () => {
+    const dir = path.dirname(configFile());
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(configFile(), JSON.stringify({
+      $schema: 'https://opencode.ai/config.json',
+      mcp: {
+        servers: {
+          codegraph: {
+            type: 'local',
+            command: ['codegraph', 'serve', '--mcp'],
+            disabled: false,
+            codemode: false,
+          },
+        },
+      },
+    }, null, 2) + '\n');
+
+    const opencode = getTarget('opencode')!;
+    opencode.uninstall('global');
+    const text = fs.readFileSync(configFile(), 'utf-8');
+    expect(text).not.toContain('codegraph');
+    expect(text).not.toContain('"servers"');
+    expect(text).not.toContain('"mcp"');
+    expect(opencode.detect('global').alreadyConfigured).toBe(false);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // opencode global config path — XDG on every platform (#535)
