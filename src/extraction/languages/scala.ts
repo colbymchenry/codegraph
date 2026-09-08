@@ -166,6 +166,16 @@ export const scalaExtractor: LanguageExtractor = {
 
       const created = ctx.createNode(kind, name, node, { signature: sig, visibility: extractVisibility(node) });
       if (created && typeNode) emitScalaTypeRefs(typeNode, created.id, ctx, ctx.source);
+      // Walk the initializer ATTRIBUTED to the declared symbol (#693, the Go
+      // fix): the hook consumes this subtree and the dispatcher only scans it
+      // for function-as-value candidates, so `val cb = () => target()` — and
+      // even a plain `val x = compute()` — emitted no call edge at all.
+      const valueNode = node.childForFieldName('value');
+      if (created && valueNode) {
+        ctx.pushScope(created.id);
+        ctx.visitFunctionBody(valueNode, created.id);
+        ctx.popScope();
+      }
       return true;
     }
 

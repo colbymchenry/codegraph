@@ -228,6 +228,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 #### Symbols, tests and the viewer
 
 - `codegraph affected` now recognises every ecosystem's test files — Go `foo_test.go`, Python `test_foo.py`, JVM `FooTest.kt` and the rest — instead of only `.test.`/`.spec.` names, so it stops reporting "no tests affected" for projects that have them. (#1507)
+- Calls inside declaration initializers in Kotlin, Java, TypeScript, JavaScript, Scala, Rust and Python now appear under the declaration that owns them, making callers and impact results more accurate after re-indexing with `codegraph index -f` (thanks @danusha2345; #1510, #1511).
+- Java fields initialized with anonymous classes now expose their methods and calls in the graph.
+- Kotlin property accessors, initialization blocks and destructuring declarations now retain their calls with the correct owner.
+- The viewer continues to count module-level initializer calls as top-level file activity in entry points and file screens.
+- `codegraph_explore` again lists a dynamic-dispatch link when the same two symbols are also joined by an ordinary call.
 - Rust unit structs (`struct Unit;`) and their trait implementation relationships now appear in the graph after re-indexing. (#1513, #1514)
 - Imports from Node built-ins or npm packages no longer connect to unrelated type members with matching names; re-index after upgrading to clear existing false dependencies. Thanks @ctype-lab. (#1537)
 
