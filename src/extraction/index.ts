@@ -27,7 +27,7 @@ import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes } from './grammars';
-import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns } from '../project-config';
+import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
@@ -302,16 +302,116 @@ function readGitignorePatterns(giPath: string): string {
 }
 
 /**
+ * Resolve the repository GIT_DIR for `repoRoot` (a `.git` directory, or the
+ * target of a `.git` file pointer). Null when this isn't a git checkout.
+ */
+function resolveGitDir(repoRoot: string): string | null {
+  const gitPath = path.join(repoRoot, '.git');
+  let st: fs.Stats;
+  try {
+    st = fs.statSync(gitPath);
+  } catch {
+    return null;
+  }
+  if (st.isDirectory()) return gitPath;
+  if (!st.isFile()) return null;
+  try {
+    const raw = fs.readFileSync(gitPath, 'utf8').match(/^gitdir:\s*(.+)$/m)?.[1]?.trim();
+    if (!raw) return null;
+    return path.isAbsolute(raw) ? path.normalize(raw) : path.resolve(repoRoot, raw);
+  } catch {
+    return null;
+  }
+}
+
+/** Expand a leading `~/` the way git does for `core.excludesFile`. */
+function expandUserPath(p: string): string {
+  if (p === '~') return os.homedir();
+  if (p.startsWith('~/')) return path.join(os.homedir(), p.slice(2));
+  return p;
+}
+
+/**
+ * Root-relative exclude patterns from git sources that are NOT the root
+ * `.gitignore`: `.git/info/exclude` and `core.excludesFile`. Same semantics as
+ * the root `.gitignore`, so they merge into {@link buildDefaultIgnore}. Without
+ * these, the watcher / FS-walk scope silently diverged from
+ * `git ls-files --exclude-standard` (#1728).
+ */
+function readGitExcludeExtraPatterns(rootDir: string): string {
+  const chunks: string[] = [];
+  const gitDir = resolveGitDir(rootDir);
+  if (gitDir) {
+    const excludePath = path.join(gitDir, 'info', 'exclude');
+    if (fs.existsSync(excludePath)) {
+      const patterns = readGitignorePatterns(excludePath);
+      if (patterns) chunks.push(patterns);
+    }
+  }
+  try {
+    const configured = execFileSync(
+      'git',
+      ['-C', rootDir, 'config', '--get', 'core.excludesFile'],
+      { encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'ignore'] },
+    ).trim();
+    if (configured) {
+      const abs = expandUserPath(configured);
+      if (fs.existsSync(abs)) {
+        const patterns = readGitignorePatterns(abs);
+        if (patterns) chunks.push(patterns);
+      }
+    }
+  } catch {
+    // No git, unset, or timeout — leave extras empty.
+  }
+  return chunks.join('\n');
+}
+
+/**
+ * Directories `git ls-files -o -i --exclude-standard --directory` reports as
+ * ignored-untracked. Seeded into {@link ScopeIgnore} so nested `.gitignore`
+ * effects (and any exclude-standard rule the flat matcher might miss) prune the
+ * watcher the same way the indexer skips them (#1728).
+ */
+function listGitIgnoredDirectories(rootDir: string): string[] {
+  try {
+    const out = execFileSync(
+      'git',
+      ['-C', rootDir, 'ls-files', '-z', '-o', '-i', '--exclude-standard', '--directory'],
+      {
+        encoding: 'utf8',
+        timeout: 60_000,
+        maxBuffer: 50 * 1024 * 1024,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      },
+    );
+    const dirs: string[] = [];
+    for (const entry of out.split('\0')) {
+      if (!entry) continue;
+      dirs.push(entry.endsWith('/') ? entry : `${entry}/`);
+    }
+    return dirs;
+  } catch {
+    return [];
+  }
+}
+
+/**
  * An `ignore` matcher seeded with the built-in defaults, merged with the project's
- * root .gitignore so a negation there (e.g. `!vendor/`) overrides a default. Shared
- * by both enumeration paths so behavior is identical with or without git — and so
- * the defaults apply to tracked files too (committing a dependency dir doesn't make
- * it project code; the explicit `.gitignore` negation is the only opt-in).
+ * root .gitignore so a negation there (e.g. `!vendor/`) overrides a default, plus
+ * git's other root-relative exclude files (`.git/info/exclude`, `core.excludesFile`)
+ * so watcher / FS-walk scope matches `git ls-files --exclude-standard` (#1728).
+ * Shared by both enumeration paths so behavior is identical with or without git —
+ * and so the defaults apply to tracked files too (committing a dependency dir
+ * doesn't make it project code; the explicit `.gitignore` negation is the only
+ * opt-in).
  */
 export function buildDefaultIgnore(rootDir: string): Ignore {
   const ig = ignore().add(DEFAULT_IGNORE_PATTERNS);
   const rootGitignore = path.join(rootDir, '.gitignore');
   if (fs.existsSync(rootGitignore)) ig.add(readGitignorePatterns(rootGitignore));
+  const extra = readGitExcludeExtraPatterns(rootDir);
+  if (extra) ig.add(extra);
   return ig;
 }
 
@@ -630,14 +730,17 @@ function findNestedGitRepos(absDir: string, relPrefix: string): string[] {
 
 /**
  * Workspace-scope ignore matcher. Ordinary paths get the root's matcher
- * (built-in defaults + root `.gitignore`); paths inside an EMBEDDED repo get
- * that repo's own matcher (defaults + its root `.gitignore`) — the parent's
- * `.gitignore` hides a child repo from git, not from the index (#514). A
- * directory path (trailing slash) that is an ANCESTOR of an embedded root is
- * never ignored, so directory-pruning callers (the Linux per-directory
- * watcher) still descend to reach the embedded repos.
+ * (built-in defaults + root `.gitignore` + `.git/info/exclude` +
+ * `core.excludesFile`, plus directories `git ls-files --exclude-standard`
+ * reports as ignored); paths inside an EMBEDDED repo get that repo's own
+ * matcher — the parent's `.gitignore` hides a child repo from git, not from
+ * the index (#514). A directory path (trailing slash) that is an ANCESTOR of
+ * an embedded root is never ignored, so directory-pruning callers (the Linux
+ * per-directory watcher) still descend to reach the embedded repos.
  *
- * Single source of truth for indexer and watcher scope — they must not diverge.
+ * Shared by the indexer (scoped sync / skip checks) and the watcher so their
+ * scope cannot diverge from each other or from `git ls-files --exclude-standard`
+ * (#1728).
  */
 export class ScopeIgnore {
   private embedded: Array<{ root: string; matcher: Ignore }>;
@@ -710,8 +813,15 @@ export class ScopeIgnore {
 export function buildScopeIgnore(rootDir: string, embeddedRoots?: Iterable<string>): ScopeIgnore {
   const roots = embeddedRoots ? [...embeddedRoots] : discoverEmbeddedRepoRoots(rootDir);
   const include = loadIncludeMatcher(rootDir);
+  // Root matcher already has defaults + root `.gitignore` + info/exclude +
+  // core.excludesFile. Seed ignored-untracked directories from git so nested
+  // `.gitignore` effects prune the watcher identically to the indexer (#1728).
+  const rootMatcher = buildDefaultIgnore(rootDir);
+  for (const dir of listGitIgnoredDirectories(rootDir)) {
+    rootMatcher.add(dir);
+  }
   return new ScopeIgnore(
-    buildDefaultIgnore(rootDir),
+    rootMatcher,
     roots.map((root) => ({ root, matcher: buildDefaultIgnore(path.join(rootDir, root)) })),
     loadExcludeMatcher(rootDir),
     include,
@@ -1050,6 +1160,10 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
           { cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
         );
         // Directory is gitignored by parent repo — fall back to filesystem walk
+        logDebug('project root is gitignored by a parent repo — falling back to filesystem walk', {
+          rootDir,
+          gitRoot,
+        });
         return null;
       } catch {
         // Not ignored — safe to use git ls-files
@@ -1074,7 +1188,20 @@ function getGitVisibleFiles(rootDir: string): Set<string> | null {
     // Git, but still wanted in the graph.)
     for (const f of collectIncludedFilesForRoot(rootDir)) visible.add(f);
     return visible;
-  } catch {
+  } catch (error) {
+    // Any failure here (git missing, a `git rev-parse`/`ls-files` timeout or
+    // buffer overrun under load, an unreadable repo, unsupported flag combo on
+    // older git, etc.) silently sent every caller to `scanDirectoryWalk` with
+    // zero signal that the fast git-delegated path was skipped — making reports
+    // like #1567 (nested-`.gitignore`-excluded `node_modules` walked into)
+    // hard to triage, since both ignore implementations look correct in
+    // isolation but there was no way to tell which one ran. Log it under the
+    // existing CODEGRAPH_DEBUG gate so a future report can confirm or rule out
+    // the fallback in one step.
+    logDebug('git-based file listing unavailable — falling back to filesystem walk', {
+      rootDir,
+      error: error instanceof Error ? error.message : String(error),
+    });
     return null;
   }
 }
@@ -1104,7 +1231,7 @@ interface GitChanges {
  * case this cannot see (the child status that would report the deletions is gone
  * with it); a full `codegraph index` reconciles that.
  */
-function getGitChangedFiles(rootDir: string): GitChanges | null {
+export function getGitChangedFiles(rootDir: string): GitChanges | null {
   try {
     const changes: GitChanges = { modified: [], added: [], deleted: [] };
     // Custom extension → language overrides from the project's codegraph.json,
@@ -1120,7 +1247,13 @@ function getGitChangedFiles(rootDir: string): GitChanges | null {
 function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, overrides?: Record<string, Language>, includeIgnored: Ignore | null = null, exclude: Ignore | null = null): void {
   const output = execFileSync(
     'git',
-    ['status', '--porcelain', '--no-renames'],
+    // `-uall` lists individual untracked files instead of collapsing an
+    // entirely-untracked directory into one `?? dir/` entry, which would
+    // otherwise be dropped here (only embedded git repos are recursed into
+    // below). Nested untracked git repos still collapse to `?? repo/` even
+    // with `-uall` — git never crosses a repo boundary — so the recursion
+    // still handles them. (#1213)
+    ['status', '--porcelain', '--no-renames', '-uall'],
     { cwd: repoDir, encoding: 'utf-8', timeout: 10000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
   );
 
@@ -1442,10 +1575,55 @@ export class ExtractionOrchestrator {
    * hasn't run yet so single-file re-index paths can detect on the spot.
    */
   private detectedFrameworkNames: string[] | null = null;
+  /**
+   * Scope matcher for SCOPED syncs, memoized on the mtimes of the two root
+   * files it is derived from (`codegraph.json`, `.gitignore`). See
+   * {@link scopedSyncMatcher}.
+   */
+  private scopedMatcher: { key: string; matcher: ScopeIgnore } | null = null;
 
   constructor(rootDir: string, queries: QueryBuilder) {
     this.rootDir = rootDir;
     this.queries = queries;
+  }
+
+  /**
+   * The scope matcher a scoped sync applies to the paths it was handed — the
+   * same `buildScopeIgnore` the full scan uses, so an explicitly-passed path
+   * that is OUT of scope (a user `exclude` in `codegraph.json`, a `.gitignore`
+   * rule, a built-in default) is treated exactly as the full walk would treat
+   * it: absent, hence removed if tracked, never parsed (#1590).
+   *
+   * Memoized on the root config + root `.gitignore` mtimes: building the
+   * matcher runs embedded-repo discovery (`git ls-files`), which would defeat
+   * the scoped path's whole point (skipping O(repo) work) if paid per sync.
+   * Two `stat`s per sync while nothing changed. An embedded repo created
+   * between config edits joins the scoped matcher on the next full sync, the
+   * same lifecycle the watcher's own matcher already has.
+   */
+  private scopedSyncMatcher(): ScopeIgnore {
+    // Bust when any root-level exclude source the matcher reads may have
+    // changed. Nested `.gitignore` edits force a full watcher sync, which
+    // clears this cache (see the full-reconcile branch in sync()).
+    const gitDir = resolveGitDir(this.rootDir);
+    const key = [
+      PROJECT_CONFIG_FILENAME,
+      '.gitignore',
+      gitDir ? path.join(gitDir, 'info', 'exclude') : '',
+    ]
+      .map((name) => {
+        if (!name) return '-';
+        try {
+          return String(fs.statSync(path.isAbsolute(name) ? name : path.join(this.rootDir, name)).mtimeMs);
+        } catch {
+          return '-';
+        }
+      })
+      .join('|');
+    if (this.scopedMatcher && this.scopedMatcher.key === key) return this.scopedMatcher.matcher;
+    const matcher = buildScopeIgnore(this.rootDir);
+    this.scopedMatcher = { key, matcher };
+    return matcher;
   }
 
   /**
@@ -2653,7 +2831,13 @@ export class ExtractionOrchestrator {
      * set is not exactly known (directory removals, event overflow): the full
      * scan-diff remains the ground truth those cases need (#1285).
      */
-    scopedPaths?: string[]
+    scopedPaths?: string[],
+    /**
+     * Writer-side WAL pressure valve (#1539). Called after every changed file
+     * is stored, when no extraction transaction is open, so a checkpoint can
+     * safely catch up before the next file grows the WAL further.
+     */
+    backpressure?: () => Promise<void> | null
   ): Promise<SyncResult> {
     await initGrammars(); // Initialize WASM runtime (grammars loaded lazily below)
     const startTime = Date.now();
@@ -2694,7 +2878,23 @@ export class ExtractionOrchestrator {
       // reads `filesChecked === 0 && durationMs === 0` as the
       // lock-unavailable signature (#449).
       const unique = [...new Set(scopedPaths)];
-      currentFiles = unique.filter((p) => fs.existsSync(path.join(this.rootDir, p)));
+      // A scoped path is "present" only if it exists AND is in scope — the
+      // same two gates the full walk applies (source extension, scope
+      // matcher). Without the scope gate a caller's stale view of scope
+      // leaked straight into the index: the watcher re-parsed a file the
+      // user had just excluded in `codegraph.json` while `codegraph sync`
+      // removed it (#1590). Out-of-scope paths fall out of `currentFiles`,
+      // so a tracked one takes the removal branch below, exactly as a full
+      // sync would treat it. (`include`-forced paths pass: ScopeIgnore
+      // applies the include precedence itself.)
+      const scope = this.scopedSyncMatcher();
+      const overrides = loadExtensionOverrides(this.rootDir);
+      currentFiles = unique.filter(
+        (p) =>
+          isSourceFile(p, overrides) &&
+          !scope.ignores(p) &&
+          fs.existsSync(path.join(this.rootDir, p))
+      );
       trackedFiles = [];
       for (const p of unique) {
         const rec = this.queries.getFileByPath(p);
@@ -2703,6 +2903,10 @@ export class ExtractionOrchestrator {
       filesChecked = unique.length;
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-scoped: ${Date.now() - tSyncScan}ms (${unique.length} paths, ${trackedFiles.length} tracked)`);
     } else {
+      // Full reconcile: drop the memoized scope matcher so a nested
+      // `.gitignore` / exclude-standard change that forced this full sync is
+      // visible to the next scoped sync (#1728).
+      this.scopedMatcher = null;
       currentFiles = await scanDirectoryAsync(this.rootDir);
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-scan: ${Date.now() - tSyncScan}ms (${currentFiles.length} files)`);
       filesChecked = currentFiles.length;
@@ -2837,6 +3041,9 @@ export class ExtractionOrchestrator {
 
       const result = await this.indexFile(filePath);
       nodesUpdated += result.nodes.length;
+
+      const pause = backpressure?.();
+      if (pause) await pause;
     }
 
     // Names whose definition set this sync changed: a `file\0name` pair present

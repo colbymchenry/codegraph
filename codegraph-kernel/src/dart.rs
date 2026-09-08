@@ -596,6 +596,7 @@ impl<'t> Walker<'t> {
     // --- the main walk (visitNode, tree-sitter.ts:936-1303) ---------------
 
     fn visit(&mut self, node: Node<'t>) {
+        stack_guard!();
         // The visitNode hook (dart.ts:144-157) — the constants branch.
         if node.kind() == "static_final_declaration" {
             let mut cursor = node.walk();
@@ -669,6 +670,7 @@ impl<'t> Walker<'t> {
     // --- extractFunction / extractMethod (:1517 / :1737) ------------------
 
     fn extract_function(&mut self, node: Node<'t>) {
+        stack_guard!();
         // No receiver hook. Name first (resolveName inside extract_name).
         let name = self.extract_name(node);
         if name == "<anonymous>" {
@@ -770,6 +772,7 @@ impl<'t> Walker<'t> {
     // --- extractClass (:1679) — classes, mixins, extensions ---------------
 
     fn extract_class(&mut self, node: Node<'t>) {
+        stack_guard!();
         let resolved_body = self.resolve_body(node);
         // No skipBodilessClass. Anonymous `extension on String` → the name
         // fallback finds the ON type's type_identifier — a class named after
@@ -800,6 +803,7 @@ impl<'t> Walker<'t> {
     // --- extractEnum (:1914) ----------------------------------------------
 
     fn extract_enum(&mut self, node: Node<'t>) {
+        stack_guard!();
         let body = match self.resolve_body(node) {
             Some(b) => b,
             None => return,
@@ -1221,6 +1225,7 @@ impl<'t> Walker<'t> {
     }
 
     fn type_refs_from_subtree(&mut self, node: Node<'t>, from_row: u32) {
+        stack_guard!();
         if node.kind() == "type_identifier" {
             let name = self.text(node);
             if !name.is_empty() && !is_builtin_type(name) {
@@ -1239,6 +1244,7 @@ impl<'t> Walker<'t> {
     // --- visitFunctionBody (:5129-5286) — dart rows -----------------------
 
     fn visit_body(&mut self, node: Node<'t>) {
+        stack_guard!();
         self.maybe_capture_fn_refs(node);
 
         let kind = node.kind();
@@ -1348,6 +1354,7 @@ impl<'t> Walker<'t> {
     /// normalizeValue with DART_SPEC's one layer (`argument` → fan out).
     /// Named arguments are NOT captured (named_argument is not a layer).
     fn normalize_fn_ref_value(&mut self, v: Node<'t>, from: u32, depth: u32) {
+        stack_guard!();
         if depth > 4 {
             return;
         }
@@ -1378,6 +1385,7 @@ impl<'t> Walker<'t> {
     }
 
     fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32) {
+        stack_guard!();
         if depth > 12 {
             return;
         }

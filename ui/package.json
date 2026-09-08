@@ -1,0 +1,60 @@
+{
+  "name": "@colbymchenry/codegraph-ui",
+  "private": true,
+  "version": "1.6.0",
+  "type": "module",
+  "description": "The CodeGraph reader as Svelte components: Symbol view, Flow strip and architecture Map behind one data adapter.",
+  "keywords": [
+    "codegraph",
+    "svelte",
+    "code-intelligence",
+    "knowledge-graph"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/colbymchenry/codegraph.git",
+    "directory": "ui"
+  },
+  "license": "MIT",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "svelte": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "sideEffects": [
+    "**/*.css"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "svelte": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./theme.css": "./dist/lib/theme.css",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "vite build",
+    "build:lib": "node ../scripts/sync-ui-version.mjs && svelte-package -i src -o dist && node ../scripts/check-ui-package.mjs",
+    "dev": "vite",
+    "preview": "vite preview",
+    "check": "svelte-check --tsconfig ./tsconfig.json"
+  },
+  "peerDependencies": {
+    "svelte": "^5.25.0"
+  },
+  "dependencies": {
+    "@xyflow/svelte": "^1.6.5"
+  },
+  "devDependencies": {
+    "@fontsource-variable/archivo": "^5.3.0",
+    "@fontsource/ibm-plex-mono": "^5.3.0",
+    "@sveltejs/package": "^2.5.8",
+    "@sveltejs/vite-plugin-svelte": "^6.2.4",
+    "svelte": "^5.56.10",
+    "svelte-check": "^4.7.6",
+    "typescript": "^5.0.0",
+    "vite": "^7.3.6"
+  }
+}

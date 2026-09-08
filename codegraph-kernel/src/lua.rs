@@ -418,6 +418,7 @@ impl<'t> Walker<'t> {
     // --- the main walk (visitNode, tree-sitter.ts:936-1303) ---------------
 
     fn visit(&mut self, node: Node<'t>) {
+        stack_guard!();
         let kind = node.kind();
 
         // The visitNode hook (lua.ts:105-151) runs FIRST.
@@ -467,7 +468,7 @@ impl<'t> Walker<'t> {
             }
             // plain path returns false → children re-visited (the
             // typeof(require(...)) alias+import pair rides this).
-        } else if kind == "variable_declaration" {
+        } else if matches!(kind, "variable_declaration" | "assignment_statement") {
             self.extract_variable(node);
             // Initializer subtrees are never walked — candidates only.
             self.scan_fn_ref_subtree(node, 0);
@@ -487,6 +488,7 @@ impl<'t> Walker<'t> {
     // --- extractFunction / extractMethod (1517 / 1737) --------------------
 
     fn extract_function(&mut self, node: Node<'t>) {
+        stack_guard!();
         // :1522 receiver short-circuit IS the method routing.
         if let Some(receiver) = self.receiver_type(node) {
             let receiver = receiver.to_string();
@@ -522,6 +524,7 @@ impl<'t> Walker<'t> {
     }
 
     fn extract_method(&mut self, node: Node<'t>, receiver: String) {
+        stack_guard!();
         let name = self.extract_name(node);
         let docstring = preceding_docstring(node, self.src);
         let signature = self.signature_of(node);
@@ -575,21 +578,38 @@ impl<'t> Walker<'t> {
             }
             None => Vec::new(),
         };
-        let names: Vec<Node<'t>> = match var_list {
+        let targets: Vec<Node<'t>> = match var_list {
             Some(vl) => {
                 let mut c = vl.walk();
-                vl.named_children(&mut c).filter(|n| n.kind() == "identifier").collect()
+                vl.named_children(&mut c).collect()
             }
             None => Vec::new(),
         };
-        for (i, name_node) in names.iter().enumerate() {
-            let name = self.text(*name_node);
-            if name.is_empty() {
+        for (i, name_node) in targets.iter().enumerate() {
+            let Some((name, receiver, full_name)) = self.lua_assignment_target(*name_node) else {
+                continue;
+            };
+            let value = values.get(i).copied();
+            if let Some(value) = value {
+                if value.kind() == "function_definition" {
+                    self.extract_lua_function_value(
+                        value,
+                        name,
+                        receiver,
+                        docstring.clone(),
+                    );
+                    continue;
+                }
+                if value.kind() == "table_constructor" {
+                    self.extract_lua_table_functions(value, full_name);
+                }
+            }
+            // Dotted assignments update table members, not standalone vars.
+            if receiver.is_some() || node.kind() == "assignment_statement" {
                 continue;
             }
             // Positional value pairing; a missing value → NO signature key.
-            let signature = values.get(i).map(|v| util::init_signature(self.text(*v)));
-            let name = name.to_string();
+            let signature = value.map(|v| util::init_signature(self.text(v)));
             self.create_node(
                 "variable",
                 &name,
@@ -601,6 +621,110 @@ impl<'t> Walker<'t> {
                     ..Default::default()
                 },
             );
+        }
+    }
+
+    fn lua_assignment_target(&self, node: Node<'t>) -> Option<(String, Option<String>, String)> {
+        if node.kind() == "identifier" {
+            let name = self.text(node).trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            return Some((name.clone(), None, name));
+        }
+        if !matches!(
+            node.kind(),
+            "dot_index_expression" | "method_index_expression" | "bracket_index_expression"
+        ) {
+            return None;
+        }
+        let table = node.child_by_field_name("table")?;
+        let field = node
+            .child_by_field_name("field")
+            .or_else(|| node.child_by_field_name("method"))?;
+        let receiver = self.text(table).trim().to_string();
+        let name = self.lua_static_field_name(field, node.kind() == "bracket_index_expression");
+        if receiver.is_empty() || name.is_empty() {
+            return None;
+        }
+        let full_name = format!("{receiver}.{name}");
+        Some((name, Some(receiver), full_name))
+    }
+
+    fn lua_static_field_name(&self, node: Node<'t>, bracketed: bool) -> String {
+        if node.kind() == "identifier" {
+            return if bracketed {
+                String::new()
+            } else {
+                self.text(node).trim().to_string()
+            };
+        }
+        if node.kind() == "string" {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "string_content" {
+                    return self.text(child).trim().to_string();
+                }
+            }
+        }
+        String::new()
+    }
+
+    fn extract_lua_function_value(
+        &mut self,
+        node: Node<'t>,
+        name: String,
+        receiver: Option<String>,
+        docstring: Option<String>,
+    ) {
+        let signature = self.signature_of(node);
+        let (kind, qualified_name_override, is_exported) = match receiver {
+            Some(receiver) => (
+                "method",
+                Some(format!("{receiver}::{name}")),
+                None,
+            ),
+            None => ("function", None, self.is_exported_of(node)),
+        };
+        let row = self.create_node(
+            kind,
+            &name,
+            node,
+            Extra {
+                docstring,
+                signature,
+                qualified_name_override,
+                is_exported,
+                ..Default::default()
+            },
+        );
+        let Some(row) = row else { return };
+        self.stack.push(Scope { row, kind, name });
+        if let Some(body) = node.child_by_field_name("body") {
+            self.visit_body(body);
+        }
+        self.stack.pop();
+    }
+
+    fn extract_lua_table_functions(&mut self, table: Node<'t>, receiver: String) {
+        let mut cursor = table.walk();
+        let fields: Vec<Node<'t>> = table.named_children(&mut cursor).collect();
+        for field in fields {
+            if field.kind() != "field" {
+                continue;
+            }
+            let Some(name_node) = field.child_by_field_name("name") else { continue };
+            let Some(value) = field.child_by_field_name("value") else { continue };
+            let bracketed = self.text(field).trim_start().starts_with('[');
+            let name = self.lua_static_field_name(name_node, bracketed);
+            if name.is_empty() {
+                continue;
+            }
+            if value.kind() == "function_definition" {
+                self.extract_lua_function_value(value, name, Some(receiver.clone()), None);
+            } else if value.kind() == "table_constructor" {
+                self.extract_lua_table_functions(value, format!("{receiver}.{name}"));
+            }
         }
     }
 
@@ -654,6 +778,7 @@ impl<'t> Walker<'t> {
     // --- visitFunctionBody (5129-5286) — the hook-free body walk ----------
 
     fn visit_body(&mut self, node: Node<'t>) {
+        stack_guard!();
         // maybeCaptureFnRefs (5137) fires in the body walker too.
         self.maybe_capture_fn_refs(node);
 
@@ -750,6 +875,7 @@ impl<'t> Walker<'t> {
     /// normalizeValue with LUA_SPEC's one transparent layer (expression_list
     /// fans out to named children).
     fn normalize_fn_ref_value(&mut self, v: Node<'t>, from: u32, depth: u32) {
+        stack_guard!();
         if depth > 4 {
             return;
         }
@@ -780,17 +906,17 @@ impl<'t> Walker<'t> {
     }
 
     fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32) {
+        stack_guard!();
         if depth > 12 {
             return;
         }
         // Halt at nested function definitions (their bodies are walked — and
-        // attributed — by extractFunction). function_definition (anonymous)
-        // is deliberately NOT in the halt list — the scan descends into
-        // anonymous initializer bodies, attributing candidates to the file.
+        // attributed — by extractFunction). Lua function_definition values are
+        // now extracted from their assignment target and must stop this scan too.
         if depth > 0
             && matches!(
                 node.kind(),
-                "function_declaration" | "arrow_function" | "function_expression"
+                "function_declaration" | "function_definition" | "arrow_function" | "function_expression"
                     | "lambda_literal" | "lambda_expression"
             )
         {

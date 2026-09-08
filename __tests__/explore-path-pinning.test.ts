@@ -92,6 +92,23 @@ describe('path pinning (fix 1)', () => {
   });
 });
 
+describe('extension-less kebab basenames (the amnisphere gap)', () => {
+  const KEBAB_TARGET = 'src/lib/background-image-table.ts';
+
+  it('a bare kebab basename — no slash, no extension — pins and renders its file', async () => {
+    // Pre-fix this query never opened the path gate; FTS shredded the token
+    // into `background`/`image`/`table` and served the fragment decoy instead.
+    const out = await explore('background-image-table Source column');
+    expect(hasSection(out, KEBAB_TARGET)).toBe(true);
+    expect(out).toContain('pinned from the query');
+  });
+
+  it('kebab prose that names no file is not reported as an unresolved path', async () => {
+    const out = await explore('how does cross-call dedup interact with feed scroll pinning');
+    expect(out).not.toContain('No indexed file uniquely matches');
+  });
+});
+
 describe('segment supplement + variable seeding (fixes 2–3)', () => {
   it('word-level scroll terms reach the camelCase scroll code without a path', async () => {
     const out = await explore('feed auto-scroll to bottom pinning behavior');

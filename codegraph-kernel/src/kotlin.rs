@@ -648,6 +648,7 @@ impl<'t> Walker<'t> {
     // --- the dispatcher (visitNode, Kotlin-relevant branches) -----------------------
 
     fn visit_node(&mut self, node: Node<'t>) {
+        stack_guard!();
         if self.try_visit_hook(node) {
             self.scan_fn_ref_subtree(node, 0);
             return;
@@ -719,10 +720,12 @@ impl<'t> Walker<'t> {
     // --- visitFunctionBody ----------------------------------------------------------
 
     fn visit_function_body(&mut self, body: Node<'t>) {
+        stack_guard!();
         self.visit_for_calls_and_structure(body);
     }
 
     fn visit_for_calls_and_structure(&mut self, node: Node<'t>) {
+        stack_guard!();
         let kind = node.kind();
         self.maybe_capture_fn_refs(node);
 
@@ -777,6 +780,7 @@ impl<'t> Walker<'t> {
     // --- extractors ------------------------------------------------------------------
 
     fn extract_function(&mut self, node: Node<'t>) {
+        stack_guard!();
         // getReceiverType short-circuit (1522) — extension fns at any scope.
         if self.receiver_type_of(node).is_some() {
             self.extract_method(node);
@@ -810,6 +814,7 @@ impl<'t> Walker<'t> {
     }
 
     fn extract_method(&mut self, node: Node<'t>) {
+        stack_guard!();
         let receiver = self.receiver_type_of(node);
         let name = self.extract_name(node);
         let qualified_override = receiver.as_ref().map(|r| format!("{r}::{name}"));
@@ -861,6 +866,7 @@ impl<'t> Walker<'t> {
     }
 
     fn extract_class(&mut self, node: Node<'t>) {
+        stack_guard!();
         let resolved_body = self.resolve_body(node);
         let name = self.extract_name(node);
         let extra = Extra {
@@ -887,6 +893,7 @@ impl<'t> Walker<'t> {
     }
 
     fn extract_interface(&mut self, node: Node<'t>) {
+        stack_guard!();
         let name = self.extract_name(node);
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
@@ -905,6 +912,7 @@ impl<'t> Walker<'t> {
     }
 
     fn extract_enum(&mut self, node: Node<'t>) {
+        stack_guard!();
         let Some(body) = self.resolve_body(node) else { return };
         let name = self.extract_name(node);
         let extra = Extra {
@@ -1283,6 +1291,7 @@ impl<'t> Walker<'t> {
     }
 
     fn normalize_fn_ref_value(&mut self, v: Node<'t>, from: u32, depth: u32) {
+        stack_guard!();
         if depth > 4 {
             return;
         }
@@ -1362,6 +1371,7 @@ impl<'t> Walker<'t> {
     }
 
     fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32) {
+        stack_guard!();
         if depth > 12 {
             return;
         }

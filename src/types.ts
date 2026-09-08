@@ -67,6 +67,7 @@ export const EDGE_KINDS = [
   'instantiates',    // Creates instance of class
   'overrides',       // Method overrides parent method
   'decorates',       // Decorator applied to symbol
+  'navigates',       // Navigates to a screen/route (Expo Router `router.push('/x')`)
 ] as const;
 
 export type EdgeKind = (typeof EDGE_KINDS)[number];

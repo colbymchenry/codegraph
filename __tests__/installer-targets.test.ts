@@ -138,6 +138,8 @@ describe('Installer targets — contract', () => {
             // opencode uses `mcp` not `mcpServers`. Match its shape too.
             if (target.id === 'opencode') {
               delete seed.mcpServers;
+              // Keep a v1-shaped sibling — real configs mix shapes during the
+              // OpenCode 1→2 transition; install must not disturb it (#1698).
               seed.mcp = { other: { type: 'local', command: ['x'], enabled: true } };
             }
             // VS Code's mcp.json uses `servers`; the JetBrains Copilot
@@ -153,7 +155,10 @@ describe('Installer targets — contract', () => {
             const after = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
             if (target.id === 'opencode') {
               expect(after.mcp.other).toBeDefined();
-              expect(after.mcp.codegraph).toBeDefined();
+              expect(after.mcp.servers.codegraph).toBeDefined();
+              expect(after.mcp.servers.codegraph.codemode).toBe(false);
+              expect(after.mcp.servers.codegraph.disabled).toBe(false);
+              expect(after.mcp.codegraph).toBeUndefined();
             } else if (target.id === 'copilot-vscode' || target.id === 'copilot-jetbrains') {
               expect(after.servers.other).toBeDefined();
               expect(after.servers.codegraph).toBeDefined();
@@ -238,6 +243,42 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(body).toContain('codegraph explore');
     const mdEntry = result.files.find((f) => f.path.endsWith('AGENTS.md'));
     expect(mdEntry?.action).toBe('updated');
+  });
+
+  it('codex: local install writes ./.codex/config.toml and the project-root ./AGENTS.md block (#1531)', () => {
+    const codex = getTarget('codex')!;
+    const result = codex.install('local', { autoAllow: false });
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    // macOS realpath shenanigans (/var vs /private/var) — suffix match.
+    expect(paths.some((p) => p.endsWith('/.codex/config.toml'))).toBe(true);
+    // AGENTS.md sits at the project root, NOT under .codex/ — that's the
+    // file Codex reads for repo instructions.
+    expect(paths.some((p) => p.endsWith('/AGENTS.md') && !p.includes('/.codex/'))).toBe(true);
+
+    const toml = fs.readFileSync(path.join(process.cwd(), '.codex', 'config.toml'), 'utf-8');
+    expect(toml).toContain('[mcp_servers.codegraph]');
+    expect(fs.readFileSync(path.join(process.cwd(), 'AGENTS.md'), 'utf-8')).toContain('codegraph explore');
+
+    // The project layer is only applied in a trusted project, so say so
+    // instead of reporting a silent success.
+    expect(result.notes?.join(' ')).toMatch(/trusted/);
+
+    // Global config is untouched by a local install.
+    expect(fs.existsSync(path.join(tmpHome, '.codex', 'config.toml'))).toBe(false);
+  });
+
+  it('codex: local uninstall reverses the local install and leaves the global entry alone (#1531)', () => {
+    const codex = getTarget('codex')!;
+    codex.install('global', { autoAllow: false });
+    codex.install('local', { autoAllow: false });
+    expect(codex.detect('local').alreadyConfigured).toBe(true);
+
+    codex.uninstall('local');
+
+    expect(codex.detect('local').alreadyConfigured).toBe(false);
+    expect(codex.detect('global').alreadyConfigured).toBe(true);
+    expect(fs.readFileSync(path.join(tmpHome, '.codex', 'config.toml'), 'utf-8'))
+      .toContain('[mcp_servers.codegraph]');
   });
 
   it('opencode: prefers .jsonc when both .json and .jsonc exist', () => {
@@ -839,7 +880,7 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(body).toContain('  telegram:\n  - hermes-telegram');
   });
 
-  it('opencode: uninstall removes only mcp.codegraph, preserves comments and siblings', () => {
+  it('opencode: uninstall removes only mcp.servers.codegraph, preserves comments and siblings', () => {
     const opencode = getTarget('opencode')!;
     const dir = path.join(tmpHome, '.config', 'opencode');
     fs.mkdirSync(dir, { recursive: true });
@@ -856,13 +897,15 @@ describe('Installer targets — partial-state idempotency', () => {
     ].join('\n'));
 
     opencode.install('global', { autoAllow: true });
-    const afterInstall = fs.readFileSync(file, 'utf-8');
-    expect(afterInstall).toContain('"codegraph"');
-    expect(afterInstall).toContain('"other"');
+    const afterInstall = parseJsonc(fs.readFileSync(file, 'utf-8'));
+    expect(afterInstall.mcp.servers.codegraph).toBeDefined();
+    expect(afterInstall.mcp.servers.codegraph.codemode).toBe(false);
+    expect(afterInstall.mcp.other).toBeDefined();
 
     opencode.uninstall('global');
     const afterUninstall = fs.readFileSync(file, 'utf-8');
     expect(afterUninstall).not.toContain('codegraph');
+    expect(afterUninstall).not.toContain('"servers"');
     expect(afterUninstall).toContain('// important comment');
     expect(afterUninstall).toContain('"other"');
   });
@@ -940,6 +983,22 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(fs.existsSync(path.join(tmpCwd, '.claude.json'))).toBe(false);
     const cfg = JSON.parse(fs.readFileSync(path.join(tmpCwd, '.mcp.json'), 'utf-8'));
     expect(cfg.mcpServers.codegraph).toBeDefined();
+    // Exempt from Claude Code's tool-search deferral (#1696).
+    expect(cfg.mcpServers.codegraph.alwaysLoad).toBe(true);
+  });
+
+  it('claude: re-running install on an entry that predates alwaysLoad adds the key (#1696)', () => {
+    const claude = getTarget('claude')!;
+    fs.writeFileSync(
+      path.join(tmpCwd, '.mcp.json'),
+      JSON.stringify({ mcpServers: { codegraph: { type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] } } }, null, 2),
+    );
+    const result = claude.install('local', { autoAllow: false });
+    const mcp = result.files.find((f) => f.path.replace(/\\/g, '/').endsWith('/.mcp.json'));
+    expect(mcp?.action).toBe('updated');
+    const cfg = JSON.parse(fs.readFileSync(path.join(tmpCwd, '.mcp.json'), 'utf-8'));
+    expect(cfg.mcpServers.codegraph.alwaysLoad).toBe(true);
+    expect(cfg.mcpServers.codegraph.args).toEqual(['serve', '--mcp']);
   });
 
   it('claude: install creates the CLAUDE.md codegraph block (#704)', () => {
@@ -974,6 +1033,7 @@ describe('Installer targets — partial-state idempotency', () => {
     claude.install('global', { autoAllow: false });
     const cfg = JSON.parse(fs.readFileSync(path.join(tmpHome, '.claude.json'), 'utf-8'));
     expect(cfg.mcpServers.codegraph).toBeDefined();
+    expect(cfg.mcpServers.codegraph.alwaysLoad).toBe(true);
   });
 
   it('claude: local install migrates a legacy ./.claude.json codegraph entry into ./.mcp.json', () => {
@@ -1778,6 +1838,149 @@ function listAllFiles(dir: string): string[] {
 }
 
 // ---------------------------------------------------------------------------
+// opencode OpenCode 2 native MCP shape (#1698)
+//
+// OpenCode 2 reads `mcp.servers.<name>` with `disabled` / `codemode`. The
+// v1 `mcp.<name>` + `enabled` shape still connects but drops `codemode`
+// during normalization — so the installer must write the native shape and
+// migrate/uninstall either.
+// ---------------------------------------------------------------------------
+describe('Installer targets — opencode native MCP shape (#1698)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('home');
+    tmpCwd = mkTmpDir('cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  const configFile = () => path.join(tmpHome, '.config', 'opencode', 'opencode.jsonc');
+
+  it('install writes mcp.servers.codegraph with disabled:false and codemode:false', () => {
+    const opencode = getTarget('opencode')!;
+    opencode.install('global', { autoAllow: true });
+    const cfg = JSON.parse(fs.readFileSync(configFile(), 'utf-8'));
+    expect(cfg.mcp.codegraph).toBeUndefined();
+    expect(cfg.mcp.servers.codegraph).toEqual({
+      type: 'local',
+      command: ['codegraph', 'serve', '--mcp'],
+      disabled: false,
+      codemode: false,
+    });
+  });
+
+  it('printConfig shows the native OpenCode 2 shape', () => {
+    const out = getTarget('opencode')!.printConfig('global');
+    expect(out).toContain('"servers"');
+    expect(out).toContain('"codemode": false');
+    expect(out).toContain('"disabled": false');
+    expect(out).not.toContain('"enabled"');
+    // No v1 top-level mcp.codegraph key in the snippet.
+    expect(out).not.toMatch(/"mcp"\s*:\s*\{\s*"codegraph"/);
+  });
+
+  it('re-install migrates a v1 mcp.codegraph entry to mcp.servers.codegraph', () => {
+    const dir = path.dirname(configFile());
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(configFile(), [
+      '{',
+      '  // keep me',
+      '  "$schema": "https://opencode.ai/config.json",',
+      '  "mcp": {',
+      '    "codegraph": { "type": "local", "command": ["codegraph", "serve", "--mcp"], "enabled": true },',
+      '    "other": { "type": "local", "command": ["x"], "enabled": true }',
+      '  }',
+      '}',
+      '',
+    ].join('\n'));
+
+    const opencode = getTarget('opencode')!;
+    expect(opencode.detect('global').alreadyConfigured).toBe(true);
+
+    const result = opencode.install('global', { autoAllow: true });
+    expect(result.files.find((f) => f.path === configFile())!.action).toBe('updated');
+
+    const text = fs.readFileSync(configFile(), 'utf-8');
+    expect(text).toContain('// keep me');
+    const cfg = parseJsonc(text);
+    expect(cfg.mcp.codegraph).toBeUndefined();
+    expect(cfg.mcp.other).toBeDefined();
+    expect(cfg.mcp.servers.codegraph).toEqual({
+      type: 'local',
+      command: ['codegraph', 'serve', '--mcp'],
+      disabled: false,
+      codemode: false,
+    });
+
+    // Idempotent after migration.
+    const second = opencode.install('global', { autoAllow: true });
+    expect(second.files.find((f) => f.path === configFile())!.action).toBe('unchanged');
+  });
+
+  it('uninstall removes a leftover v1 mcp.codegraph entry', () => {
+    const dir = path.dirname(configFile());
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(configFile(), [
+      '{',
+      '  // keep me',
+      '  "$schema": "https://opencode.ai/config.json",',
+      '  "mcp": {',
+      '    "codegraph": { "type": "local", "command": ["codegraph", "serve", "--mcp"], "enabled": true },',
+      '    "other": { "type": "local", "command": ["x"], "enabled": true }',
+      '  }',
+      '}',
+      '',
+    ].join('\n'));
+
+    const opencode = getTarget('opencode')!;
+    opencode.uninstall('global');
+    const text = fs.readFileSync(configFile(), 'utf-8');
+    expect(text).toContain('// keep me');
+    expect(text).toContain('"other"');
+    expect(text).not.toContain('codegraph');
+    expect(opencode.detect('global').alreadyConfigured).toBe(false);
+  });
+
+  it('uninstall removes a native mcp.servers.codegraph entry and an emptied servers wrapper', () => {
+    const dir = path.dirname(configFile());
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(configFile(), JSON.stringify({
+      $schema: 'https://opencode.ai/config.json',
+      mcp: {
+        servers: {
+          codegraph: {
+            type: 'local',
+            command: ['codegraph', 'serve', '--mcp'],
+            disabled: false,
+            codemode: false,
+          },
+        },
+      },
+    }, null, 2) + '\n');
+
+    const opencode = getTarget('opencode')!;
+    opencode.uninstall('global');
+    const text = fs.readFileSync(configFile(), 'utf-8');
+    expect(text).not.toContain('codegraph');
+    expect(text).not.toContain('"servers"');
+    expect(text).not.toContain('"mcp"');
+    expect(opencode.detect('global').alreadyConfigured).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // opencode global config path — XDG on every platform (#535)
 //
 // opencode resolves its config dir with `xdg-basedir`: XDG_CONFIG_HOME if
@@ -2144,7 +2347,7 @@ describe('Installer targets — Copilot family', () => {
 
   // ---- copilot-cli ----
 
-  it('copilot-cli: global install writes ~/.copilot/mcp-config.json with the documented entry shape (tools: ["*"])', () => {
+  it('copilot-cli: global install writes ~/.copilot/mcp-config.json with the documented entry shape (tools: ["*"], deferTools: "never")', () => {
     const t = getTarget('copilot-cli')!;
     const result = t.install('global', { autoAllow: true });
 
@@ -2157,7 +2360,24 @@ describe('Installer targets — Copilot family', () => {
       command: 'codegraph',
       args: ['serve', '--mcp'],
       tools: ['*'],
+      // Exempt from Copilot CLI's tool search, the same way `alwaysLoad` exempts it in Claude Code (#1696).
+      deferTools: 'never',
     });
+  });
+
+  it('copilot-cli: re-running install on an entry that predates deferTools adds the key (#1696)', () => {
+    const t = getTarget('copilot-cli')!;
+    const file = path.join(tmpHome, '.copilot', 'mcp-config.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ mcpServers: { codegraph: { type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'], tools: ['*'] } } }, null, 2),
+    );
+    const result = t.install('global', { autoAllow: true });
+    expect(result.files[0].action).toBe('updated');
+    const cfg = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(cfg.mcpServers.codegraph.deferTools).toBe('never');
+    expect(cfg.mcpServers.codegraph.tools).toEqual(['*']);
   });
 
   it('copilot-cli: is global-only — local install skips with a clear note, uninstall is a no-op', () => {
