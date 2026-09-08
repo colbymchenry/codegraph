@@ -39,6 +39,7 @@ try {
 } catch { /* cache is best-effort */ }
 
 import { Command } from 'commander';
+import picomatch from 'picomatch';
 import * as path from 'path';
 import * as fs from 'fs';
 import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection } from '../directory';
@@ -2453,17 +2454,11 @@ program
       const cg = await CodeGraph.open(projectPath);
       const maxDepth = parseInt(options.depth || '5', 10);
 
-      // Custom filter pattern
-      let customFilter: RegExp | null = null;
-      if (options.filter) {
-        // Convert glob to regex: ** → .+, * → [^/]*, . → \.
-        const regex = options.filter
-          .replace(/[+[\]{}()^$|\\]/g, '\\$&')
-          .replace(/\./g, '\\.')
-          .replace(/\*\*/g, '.+')
-          .replace(/\*/g, '[^/]*');
-        customFilter = new RegExp(regex);
-      }
+      // Directory filters match whole paths; bare patterns such as *_test.go
+      // keep matching filenames at any depth, including dotfiles.
+      const customFilter = options.filter
+        ? picomatch(options.filter, { basename: !options.filter.includes('/'), dot: true })
+        : null;
 
       // One notion of "a test" for the whole tool (#1507): the CLI used to keep
       // its own six regexes here, which knew `.test.` and `/tests/` but not Go's
@@ -2471,7 +2466,7 @@ program
       // `affected` reported "no tests" for whole ecosystems while `search` and
       // the MCP tools counted those very files as tests.
       function isTestFile(filePath: string): boolean {
-        if (customFilter) return customFilter.test(filePath);
+        if (customFilter) return customFilter(filePath);
         return isTestPath(filePath);
       }
 
