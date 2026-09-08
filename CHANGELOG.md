@@ -213,6 +213,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Symbols, tests and the viewer
 
+- **Functions bound with `const` inside another function are symbols now.** `const handleClear = () => {…}` inside a React component — every handler that skips `useCallback` — was invisible to `callers`, `callees` and impact, answering "Symbol not found" exactly the way a function with no callers would. It is indexed like its module-level twin, contained by the enclosing function, with its own calls. Re-index after upgrading. (#1669)
 - `codegraph callers`, `callees`, and `query` now clearly report when their result limit hides additional matches, including exact totals in callers/callees JSON output; the `codegraph_callers` and `codegraph_callees` MCP answers carry the same "showing N of M" note. (#1639, #1674)
 - CommonJS controllers written as `exports.getItems = async (req, res) => {…}` or `module.exports.x = function () {…}` are now indexed as exported functions, so `node`, `callers` and impact find every Express handler in that style and the calls inside them belong to the handler instead of the file. Re-index JavaScript projects after upgrading. (#1675)
 - Python parameters annotated with a quoted forward reference — `def f(o: "Alpha")`, or anything under `from __future__ import annotations` — now resolve the methods called on them, the same as the unquoted annotation. Re-index Python projects after upgrading. (#1684)
