@@ -569,6 +569,33 @@ export function isStructuralPrompt(prompt: string): boolean {
 }
 
 /**
+ * Claude Code persists `UserPromptSubmit` hook stdout above this many
+ * characters to a file and shows the model a ~2 KB preview instead (#1694).
+ * Measured on Claude Code 2.1.261; documented in the hooks reference as a
+ * 10,000-character cap on hook output strings.
+ */
+export const CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT = 10_000;
+
+/**
+ * Max characters of explore text injected by `codegraph prompt-hook` before
+ * truncation. Must stay under {@link CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT} so
+ * the host delivers the payload inline. 9,000 leaves ~1k for the
+ * `<codegraph_context>` wrapper and the `projectPath` nudge lines appended
+ * after the cap is applied.
+ */
+export const PROMPT_HOOK_INJECTION_MAX = 9_000;
+
+/**
+ * Cap explore text for the prompt-hook injection, preserving the existing
+ * "call codegraph_explore for the rest" notice when truncated.
+ */
+export function capPromptHookInjection(text: string, max = PROMPT_HOOK_INJECTION_MAX): string {
+  return text.length > max
+    ? `${text.slice(0, max)}\n…(truncated; call codegraph_explore for the rest)`
+    : text;
+}
+
+/**
  * What the front-load hook should do for a prompt issued from a directory.
  */
 export interface FrontloadPlan {
