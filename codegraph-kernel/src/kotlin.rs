@@ -9,10 +9,10 @@
 //! is source-order dependent) and extractModifiers (expect/actual platform
 //! modifiers → the node DECORATORS wire field, on every created node — the
 //! KMP synthesizer's input). Preserved on purpose: the FIELD_COUNT-0 dead
-//! cluster (no signatures, ZERO type-annotation refs), hook-consumed property
-//! initializers emitting nothing, the bodiless-class header re-walk asymmetry,
-//! enum-entry bodies being invisible, KDoc (`multiline_comment`) never being
-//! a docstring AND chain-breaking, comment-gluing into import/package extents,
+//! cluster (no signatures, ZERO type-annotation refs), the bodiless-class
+//! header re-walk asymmetry, enum-entry bodies being invisible, KDoc
+//! (`multiline_comment`) never being a docstring AND chain-breaking,
+//! comment-gluing into import/package extents,
 //! `@Anno(args)` emitting nothing while `@Anno` emits decorates, zero
 //! instantiates refs (constructors are capitalized `calls`), the qualified-
 //! receiver `com::qext` bug, the paren-then-lambda `trailing()` garbage
@@ -85,6 +85,66 @@ fn is_js_space(c: char) -> bool {
 }
 fn strip_js_ws(s: &str) -> String {
     s.chars().filter(|c| !is_js_space(*c)).collect()
+}
+
+/// A property's CODE children: the named child right after the `=` token, a
+/// `property_delegate` (`by lazy { … }`), and an accessor the grammar nested
+/// under the declaration (`val x: Int get() = compute()` — written on ONE line;
+/// an accessor on its own line parses as a SIBLING of the property and is not
+/// reachable from here). What stays unwalked is the declaration itself —
+/// modifiers, the `val`/`var` keyword, the name+type, and an extension
+/// receiver's type and type parameters. (Go's #693 fix walks the `value` field
+/// for the same reason; this grammar exposes no fields at all, hence the `=`
+/// anchor.)
+fn property_initializers<'t>(node: Node<'t>) -> Vec<Node<'t>> {
+    let mut out: Vec<Node<'t>> = Vec::new();
+    let mut after_eq = false;
+    for i in 0..node.child_count() {
+        let Some(c) = node.child(i) else { continue };
+        if !c.is_named() {
+            if c.kind() == "=" {
+                after_eq = true;
+            }
+            continue;
+        }
+        if after_eq {
+            out.push(c);
+            after_eq = false;
+        } else if matches!(c.kind(), "property_delegate" | "getter" | "setter") {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Accessors written on their OWN line parse as SIBLINGS of the property, not
+/// as children of it (same-line ones nest — see property_initializers). Walking
+/// back over any accessors between us and the declaration finds the property an
+/// accessor belongs to; None when this accessor stands alone.
+fn accessor_owner<'t>(node: Node<'t>) -> Option<Node<'t>> {
+    let mut p = node.prev_named_sibling();
+    while let Some(n) = p {
+        if matches!(n.kind(), "getter" | "setter") {
+            p = n.prev_named_sibling();
+            continue;
+        }
+        return if n.kind() == "property_declaration" { Some(n) } else { None };
+    }
+    None
+}
+
+/// The sibling accessors that follow a property declaration, in source order.
+fn following_accessors<'t>(node: Node<'t>) -> Vec<Node<'t>> {
+    let mut out = Vec::new();
+    let mut n = node.next_named_sibling();
+    while let Some(c) = n {
+        if !matches!(c.kind(), "getter" | "setter") {
+            break;
+        }
+        out.push(c);
+        n = c.next_named_sibling();
+    }
+    out
 }
 
 struct Scope {
@@ -583,25 +643,23 @@ impl<'t> Walker<'t> {
     // --- the visitNode hook (property branch ONLY — fun-interface recovery is
     // defer-shielded and not ported) ------------------------------------------------
 
-    fn try_visit_hook(&mut self, node: Node<'t>) -> bool {
-        if node.kind() != "property_declaration" {
-            return false;
-        }
+    /// A property's node kind, or None when the declaration mints no node at
+    /// all: destructuring, an unreadable name, or a local (inside a function
+    /// body / `init` block / lambda / accessor). Kind by enclosing scope — a
+    /// singleton `object` / `companion object` (and a top-level property) holds
+    /// SHARED values (`val`→constant, `var`→variable, the Scala-object rule; a
+    /// `const val` is just a val); a class/interface/enum instance `val`/`var`
+    /// is per-instance state → `field`.
+    fn property_kind(&self, node: Node<'t>) -> Option<&'static str> {
         let var_decl = (0..node.named_child_count())
             .filter_map(|i| node.named_child(i))
-            .find(|c| c.kind() == "variable_declaration");
-        let name_node = var_decl.and_then(|vd| {
-            (0..vd.named_child_count())
-                .filter_map(|i| vd.named_child(i))
-                .find(|c| c.kind() == "simple_identifier")
-        });
-        let Some(name_node) = name_node else { return false }; // destructuring → decline
-        let name = self.text(name_node).to_string();
-        if name.is_empty() {
-            return false;
+            .find(|c| c.kind() == "variable_declaration")?;
+        let name_node = (0..var_decl.named_child_count())
+            .filter_map(|i| var_decl.named_child(i))
+            .find(|c| c.kind() == "simple_identifier")?;
+        if self.text(name_node).is_empty() {
+            return None;
         }
-
-        // Scope walk up the parent chain — first match wins.
         let mut scope: &str = "const";
         let mut p = node.parent();
         while let Some(pn) = p {
@@ -624,24 +682,89 @@ impl<'t> Walker<'t> {
             p = pn.parent();
         }
         if scope == "local" {
-            return true; // a local — extract nothing, subtree still scanned
+            return None;
         }
-
         let binding = (0..node.named_child_count())
             .filter_map(|i| node.named_child(i))
             .find(|c| c.kind() == "binding_pattern_kind");
         let is_val = binding.map(|b| self.text(b) == "val").unwrap_or(false);
-        let kind: &'static str = if scope == "instance" {
+        Some(if scope == "instance" {
             "field"
         } else if is_val {
             "constant"
         } else {
             "variable"
+        })
+    }
+
+    fn try_visit_hook(&mut self, node: Node<'t>) -> bool {
+        // An own-line accessor already walked by its owning property below. The
+        // ownership test re-derives the property's kind rather than remembering
+        // it: a destructured or local declaration mints no node, so its
+        // accessors were NOT consumed and must keep falling through.
+        if matches!(node.kind(), "getter" | "setter") {
+            return accessor_owner(node)
+                .and_then(|owner| self.property_kind(owner))
+                .is_some();
+        }
+        if node.kind() != "property_declaration" {
+            return false;
+        }
+        let var_decl = (0..node.named_child_count())
+            .filter_map(|i| node.named_child(i))
+            .find(|c| c.kind() == "variable_declaration");
+        let name_node = var_decl.and_then(|vd| {
+            (0..vd.named_child_count())
+                .filter_map(|i| vd.named_child(i))
+                .find(|c| c.kind() == "simple_identifier")
+        });
+        // Destructuring (`val (a, b) = makePair()`): NEITHER arm mints a symbol
+        // for the destructured names — declining just routes the node to
+        // extractField/extractVariable, which both find nothing for kotlin and
+        // end in the same fn-ref scan. But the RHS is CODE, and it was vanishing
+        // whole. Consume the node here and walk it at the ENCLOSING scope (no
+        // symbol of its own to attribute to).
+        let Some(name_node) = name_node else {
+            for init in property_initializers(node) {
+                self.visit_function_body(init);
+            }
+            return true;
+        };
+        let name = self.text(name_node).to_string();
+        if name.is_empty() {
+            return false;
+        }
+        let Some(kind) = self.property_kind(node) else {
+            // A local — no node is minted, but the initializer is still code.
+            // Walk it at the ENCLOSING scope: an `init { }` block's
+            // `val q = load()` is the CLASS calling load, and it used to
+            // disappear entirely (only the block's bare statements survived).
+            for init in property_initializers(node) {
+                self.visit_function_body(init);
+            }
+            return true;
         };
         // The `type`-field signature read is dead (zero fields) → signature
         // undefined; NO docstring/visibility/isStatic — the modifiers merge in
         // create_node still decorates expect/actual properties.
-        self.create_node(kind, &name, node, Extra::default());
+        let row = self.create_node(kind, &name, node, Extra::default());
+        // Walk the initializer ATTRIBUTED to the declared symbol (#693, the Go
+        // fix, ported): without this the subtree is only fn-ref-scanned, so a
+        // lambda / SAM / object initializer (`val cb = Runnable { target() }` —
+        // the idiomatic Android callback field) contributed NO call edge at all.
+        // The property also OWNS any accessor written on its own line, which the
+        // grammar makes a following SIBLING rather than a child; those bodies
+        // used to attribute to the enclosing class.
+        if let Some(row) = row {
+            self.stack.push(Scope { row, kind, name: name.clone() });
+            for init in property_initializers(node) {
+                self.visit_function_body(init);
+            }
+            for acc in following_accessors(node) {
+                self.visit_function_body(acc);
+            }
+            self.stack.pop();
+        }
         true
     }
 

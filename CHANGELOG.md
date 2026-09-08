@@ -135,6 +135,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- `codegraph callers`, `codegraph callees` and `codegraph impact` now resolve qualified names, group results and JSON edges by definition, and accept `--file` to narrow ambiguous names; thanks @ferrine. (#1512, #1656)
+
 #### MCP / indexing
 
 - Indexing now warns when parser errors leave a file with no symbols, including C++ raw strings with 16-character delimiters, so missing code is no longer silent. (#1522)
@@ -228,6 +230,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Saved trails stay inside the indexed project even when a directory or trail file is a symlink.** The viewer refuses paths whose nearest existing directory resolves outside the project, opens trail files without following links and without blocking on a named pipe left in the trails directory, and creates its atomic temporary file exclusively so a pre-planted link cannot capture a read or write.
 
 - **Saved-trail authors are now resolved per project.** An embedded host serving several projects in one process no longer reuses the first repository's Git user name for every later trail.
+- Calls inside declaration initializers in Kotlin, Java, TypeScript, JavaScript, Scala, Rust and Python now appear under the declaration that owns them, making callers and impact results more accurate after re-indexing with `codegraph index -f` (thanks @danusha2345; #1510, #1511).
+- Java fields initialized with anonymous classes now expose their methods and calls in the graph.
+- Kotlin property accessors, initialization blocks and destructuring declarations now retain their calls with the correct owner.
+- The viewer continues to count module-level initializer calls as top-level file activity in entry points and file screens.
+- `codegraph_explore` again lists a dynamic-dispatch link when the same two symbols are also joined by an ordinary call.
 - Rust unit structs (`struct Unit;`) and their trait implementation relationships now appear in the graph after re-indexing. (#1513, #1514)
 - Imports from Node built-ins or npm packages no longer connect to unrelated type members with matching names; re-index after upgrading to clear existing false dependencies. Thanks @ctype-lab. (#1537)
 
