@@ -208,8 +208,9 @@ export class ReferenceResolver {
   private context: ResolutionContext;
   private frameworks: FrameworkResolver[] = [];
   // Chained static-factory/fluent call refs the first pass couldn't resolve,
-  // collected in-memory (the batched resolver deletes unresolved refs from the
-  // DB, so they can't be re-read). Drained by resolveChainedCallsViaConformance
+  // collected in-memory and left pending in the DB until the post-pass
+  // finishes, so a restart can recover the queue (#1577). Drained by
+  // resolveChainedCallsViaConformance
   // once implements/extends edges exist, to resolve methods on a supertype the
   // receiver conforms to (#750).
   private deferredChainRefs: UnresolvedRef[] = [];
@@ -218,6 +219,7 @@ export class ReferenceResolver {
   // same reason as deferredChainRefs and drained by
   // resolveDeferredThisMemberRefs once implements/extends edges exist (#808).
   private deferredThisMemberRefs: UnresolvedRef[] = [];
+  private deferredRowIds = new Set<number>();
   // Per-`.razor`/`.cshtml`-file `@using` namespace set (own directives + folder
   // `_Imports.razor`, cascading to the project root). Used to disambiguate a
   // markup type ref to the right C# namespace.
@@ -711,6 +713,7 @@ export class ReferenceResolver {
   ): ResolutionResult {
     // Pre-load all nodes into memory for fast lookups
     this.warmCaches();
+    this.advanceSupertypeGeneration();
 
     const resolved: ResolvedRef[] = [];
     const unresolved: UnresolvedRef[] = [];
@@ -1067,7 +1070,7 @@ export class ReferenceResolver {
         CHAIN_LANGUAGES.has(ref.language) &&
         CHAIN_SHAPE.test(ref.referenceName)
       ) {
-        this.deferredChainRefs.push(ref);
+        this.deferReference(ref, this.deferredChainRefs);
       } else if (
         // PHP `$this->prop->method()` (encoded `this->prop.method`): its method
         // may live on the property's declared supertype, resolvable only once
@@ -1076,7 +1079,7 @@ export class ReferenceResolver {
         ref.language === 'php' &&
         PHP_PROP_SHAPE.test(ref.referenceName)
       ) {
-        this.deferredChainRefs.push(ref);
+        this.deferReference(ref, this.deferredChainRefs);
       }
       return null;
     }
@@ -1216,6 +1219,16 @@ export class ReferenceResolver {
     return { byRowId, legacyKeys };
   }
 
+  /** A deferred attempt is unfinished work, not a final failure (#1577). */
+  private nonDeferredFailures(unresolved: UnresolvedRef[]): UnresolvedRef[] {
+    return unresolved.filter((ref) => ref.rowId == null || !this.deferredRowIds.has(ref.rowId));
+  }
+
+  private deferReference(ref: UnresolvedRef, queue: UnresolvedRef[]): void {
+    queue.push(ref);
+    if (ref.rowId != null) this.deferredRowIds.add(ref.rowId);
+  }
+
   /**
    * Resolve and persist edges to database
    */
@@ -1223,6 +1236,15 @@ export class ReferenceResolver {
     unresolvedRefs: UnresolvedReference[],
     onProgress?: (current: number, total: number) => void
   ): ResolutionResult {
+    const prerequisites = unresolvedRefs.filter(ReferenceResolver.isPrerequisite);
+    if (prerequisites.length > 0 && prerequisites.length < unresolvedRefs.length) {
+      const first = this.resolveAndPersist(prerequisites, (current) => onProgress?.(current, unresolvedRefs.length));
+      const rest = this.resolveAndPersist(
+        unresolvedRefs.filter((ref) => !ReferenceResolver.isPrerequisite(ref)),
+        (current) => onProgress?.(prerequisites.length + current, unresolvedRefs.length)
+      );
+      return ReferenceResolver.mergeResults(first, rest);
+    }
     const result = this.resolveAll(unresolvedRefs, onProgress);
 
     // Create edges from resolved references
@@ -1250,7 +1272,7 @@ export class ReferenceResolver {
     // is still 'pending', so any pending row at rest belongs to an
     // interrupted run and the sweep can key off the pending count.
     if (result.unresolved.length > 0) {
-      const { byRowId, legacyKeys } = ReferenceResolver.partitionFailedCleanup(result.unresolved);
+      const { byRowId, legacyKeys } = ReferenceResolver.partitionFailedCleanup(this.nonDeferredFailures(result.unresolved));
       this.queries.markReferencesFailedByRowIds(byRowId);
       this.queries.markReferencesFailed(legacyKeys);
     }
@@ -1268,9 +1290,19 @@ export class ReferenceResolver {
    * a large edit lands many popular symbol names at once.
    */
   async resolveAndPersistListYielding(refs: UnresolvedReference[]): Promise<ResolutionResult> {
+    const prerequisites = refs.filter(ReferenceResolver.isPrerequisite);
+    if (prerequisites.length > 0 && prerequisites.length < refs.length) {
+      const first = await this.resolveAndPersistListYielding(prerequisites);
+      const rest = await this.resolveAndPersistListYielding(refs.filter((ref) => !ReferenceResolver.isPrerequisite(ref)));
+      return ReferenceResolver.mergeResults(first, rest);
+    }
     const maybeYield = createYielder();
     const result = await this.resolveBatchYielding(refs, maybeYield);
+    await this.persistResolutionResult(result, maybeYield);
+    return result;
+  }
 
+  private async persistResolutionResult(result: ResolutionResult, maybeYield: MaybeYield): Promise<number> {
     const PERSIST_CHUNK = 1000;
     const edges = this.createEdges(result.resolved);
     for (let i = 0; i < edges.length; i += PERSIST_CHUNK) {
@@ -1288,7 +1320,7 @@ export class ReferenceResolver {
       await maybeYield();
     }
 
-    const failedCleanup = ReferenceResolver.partitionFailedCleanup(result.unresolved);
+    const failedCleanup = ReferenceResolver.partitionFailedCleanup(this.nonDeferredFailures(result.unresolved));
     for (let i = 0; i < failedCleanup.byRowId.length; i += PERSIST_CHUNK) {
       this.queries.markReferencesFailedByRowIds(failedCleanup.byRowId.slice(i, i + PERSIST_CHUNK));
       await maybeYield();
@@ -1298,7 +1330,43 @@ export class ReferenceResolver {
       await maybeYield();
     }
 
-    return result;
+    return edges.length;
+  }
+
+  /** Finalize the durable queue only AFTER its edges have been inserted. */
+  private async persistDeferredReferences(deferred: UnresolvedRef[], resolved: ResolvedRef[]): Promise<number> {
+    for (const ref of deferred) if (ref.rowId != null) this.deferredRowIds.delete(ref.rowId);
+    const matched = new Set(resolved.map((ref) => ref.original));
+    const unresolved = deferred.filter((ref) => !matched.has(ref));
+    const count = await this.persistResolutionResult({
+      resolved,
+      unresolved,
+      stats: { total: deferred.length, resolved: resolved.length, unresolved: unresolved.length, byMethod: {} },
+    }, createYielder());
+    if (count > 0) this.clearCaches();
+    return count;
+  }
+
+  /** Same two phases as the bounded DB reader: persist wiring before calls. */
+  private static isPrerequisite(ref: UnresolvedReference): boolean {
+    return ref.referenceKind === 'imports' || ref.referenceKind === 'extends' || ref.referenceKind === 'implements';
+  }
+
+  private static mergeResults(first: ResolutionResult, rest: ResolutionResult): ResolutionResult {
+    const byMethod = { ...first.stats.byMethod };
+    for (const [method, count] of Object.entries(rest.stats.byMethod)) {
+      byMethod[method] = (byMethod[method] ?? 0) + count;
+    }
+    return {
+      resolved: first.resolved.concat(rest.resolved),
+      unresolved: first.unresolved.concat(rest.unresolved),
+      stats: {
+        total: first.stats.total + rest.stats.total,
+        resolved: first.stats.resolved + rest.stats.resolved,
+        unresolved: first.stats.unresolved + rest.stats.unresolved,
+        byMethod,
+      },
+    };
   }
 
   /**
@@ -1342,14 +1410,7 @@ export class ReferenceResolver {
       if (match) resolved.push(match);
       await maybeYield();
     }
-    if (resolved.length === 0) return 0;
-
-    const edges = this.createEdges(resolved);
-    if (edges.length > 0) {
-      this.queries.insertEdges(edges);
-      this.clearCaches();
-    }
-    return edges.length;
+    return this.persistDeferredReferences(deferred, resolved);
   }
 
   /**
@@ -1515,6 +1576,7 @@ export class ReferenceResolver {
         unresolved.push(ref);
       }
     }
+    this.deferredRowIds.clear(); // the admission side now owns both queues
     return {
       resolved,
       unresolved,
@@ -1539,8 +1601,8 @@ export class ReferenceResolver {
    * would have.
    */
   appendDeferredFromWorkers(deferredChain: UnresolvedRef[], deferredThisMember: UnresolvedRef[]): void {
-    this.deferredChainRefs.push(...deferredChain);
-    this.deferredThisMemberRefs.push(...deferredThisMember);
+    for (const ref of deferredChain) this.deferReference(ref, this.deferredChainRefs);
+    for (const ref of deferredThisMember) this.deferReference(ref, this.deferredThisMemberRefs);
   }
 
   /**
@@ -1748,8 +1810,25 @@ export class ReferenceResolver {
 
     try {
     try {
+    // Orphans retain interruption/re-extraction order, not clean-index order.
+    // A caller can precede its imports or supertypes by many batches (#1577).
+    // Drain those prerequisites first, then start a fresh keyset cursor over
+    // the remaining kinds. The disjoint filters let us prefetch across the
+    // phase boundary before cleanup without re-reading the current batch.
+    let prerequisites = true;
+    let afterRowId = 0;
+    const readNextBatch = (): UnresolvedReference[] => {
+      let next = this.queries.getUnresolvedReferencesBatchAfter(afterRowId, batchSize, prerequisites);
+      if (next.length === 0 && prerequisites) {
+        prerequisites = false;
+        afterRowId = 0;
+        next = this.queries.getUnresolvedReferencesBatchAfter(afterRowId, batchSize, prerequisites);
+      }
+      if (next.length > 0) afterRowId = next[next.length - 1]!.rowId!;
+      return next;
+    };
     tLp = Date.now();
-    let batch = this.queries.getUnresolvedReferencesBatchAfter(0, batchSize);
+    let batch = readNextBatch();
     lp('read', tLp);
     let inFlight: InFlight | null = batch.length > 0 ? beginBatch(batch) : null;
     while (batch.length > 0 && inFlight) {
@@ -1759,7 +1838,7 @@ export class ReferenceResolver {
       // enumeration yields the following batch (keyset — OFFSET re-walked the
       // accumulated failed prefix every read, 54.6s at kernel scale, §7a.2).
       tLp = Date.now();
-      const nextBatch = this.queries.getUnresolvedReferencesBatchAfter(batch[batch.length - 1]!.rowId!, batchSize);
+      const nextBatch = readNextBatch();
       lp('read', tLp);
 
       const tBatch = Date.now();
@@ -1880,7 +1959,9 @@ export class ReferenceResolver {
       // only see pending rows) but stay retryable when a later sync adds a
       // symbol that could satisfy them (#1240).
       tLp = Date.now();
-      const failedCleanup = ReferenceResolver.partitionFailedCleanup(result.unresolved);
+      const failures = this.nonDeferredFailures(result.unresolved);
+      const deferredCount = result.unresolved.length - failures.length;
+      const failedCleanup = ReferenceResolver.partitionFailedCleanup(failures);
       for (let i = 0; i < failedCleanup.byRowId.length; i += PERSIST_CHUNK) {
         removedThisBatch += this.queries.markReferencesFailedByRowIds(failedCleanup.byRowId.slice(i, i + PERSIST_CHUNK));
         await maybeYield();
@@ -1915,17 +1996,11 @@ export class ReferenceResolver {
       // batch one and left the rest of the table as permanent orphans (#1187).
       // The count-based guard below catches the true no-progress case.
 
-      // Non-progress guard (defense-in-depth). Each iteration enumerates from
-      // the head of the pending set, so the PENDING population MUST shrink
-      // every iteration — resolved refs are deleted and unresolvable ones are
-      // marked failed above, and both leave the pending set the batch reader
-      // sees. If it didn't shrink, a resolver returned a match whose
-      // `original.referenceName` differs from the stored row, so the keyed
-      // delete/update no-ops, and we'd re-read + re-resolve + re-insert the
-      // same rows forever (the runaway that grew a 99-file repo to 5M edges /
-      // 1.4 GB before the Go-fallback fix). Stop rather than grow the graph
-      // without bound. (An in-flight prefetched batch is abandoned unsettled —
-      // fan-out has no side effects until settleBatch appends its results.)
+      // Non-progress guard (defense-in-depth). Ordinary attempts must leave
+      // the pending set; a mismatched original reference can make legacy-key
+      // cleanup a no-op. Keep the guard against that broken persistence even
+      // though keyset pagination now advances independently of row cleanup.
+      // An abandoned prefetched batch has no side effects until settleBatch.
       // Non-progress signal, now O(1): `changes` summed across this batch's
       // deletes + failed-parks is the DIRECT evidence the guard's old count
       // diff inferred — a resolver returning a mismatched name makes the keyed
@@ -1935,7 +2010,9 @@ export class ReferenceResolver {
       // runs only on the suspicious path (claimed-work batch removed nothing —
       // e.g. every row was a sibling a legacy-key sweep already consumed),
       // where it arbitrates stop-vs-continue exactly as before.
-      if (removedThisBatch <= 0 && batch.length > 0) {
+      // Deferred refs legitimately remain pending for the post-pass. The
+      // keyset cursor advances past them; they must not trigger this guard.
+      if (removedThisBatch + deferredCount <= 0 && batch.length > 0) {
         tLp = Date.now();
         const remaining = this.queries.getUnresolvedReferencesCount();
         lp('countGuard', tLp);
@@ -2389,7 +2466,7 @@ export class ReferenceResolver {
       // Not on the class itself — possibly INHERITED. implements/extends
       // edges don't exist yet in this pass, so retry in the supertype pass
       // (resolveDeferredThisMemberRefs) instead of giving up.
-      this.deferredThisMemberRefs.push(ref);
+      this.deferReference(ref, this.deferredThisMemberRefs);
       return null;
     }
     const target = candidates.reduce((a, b) => (a.startLine <= b.startLine ? a : b));
@@ -2503,14 +2580,7 @@ export class ReferenceResolver {
         });
       }
     }
-    if (resolved.length === 0) return 0;
-
-    const edges = this.createEdges(resolved);
-    if (edges.length > 0) {
-      this.queries.insertEdges(edges);
-      this.clearCaches();
-    }
-    return edges.length;
+    return this.persistDeferredReferences(deferred, resolved);
   }
 
   private gateLanguage(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
