@@ -1558,7 +1558,7 @@ def add_outcome(row):
       expect(buildMapCalls.map((e) => e.target)).not.toContain(ledgerAppend!.id);
     });
 
-    it('resolves Python module-attribute calls through an ALIASED import (#1626)', async () => {
+    it('resolves Python module-attribute calls and file imports through an alias (#1626)', async () => {
       // #715 taught resolvePythonModuleMember to fall back to a dotted-module
       // file lookup, which fixed `from pkg import module` (#578). The aliased
       // form still missed: the module path was rebuilt from the LOCAL name, so
@@ -1606,6 +1606,15 @@ def plain_import_caller():
       const plainCalls = cg.getOutgoingEdges(plainCaller!.id).filter((e) => e.kind === 'calls');
       expect(plainCalls).toHaveLength(1);
       expect(cg.getNode(plainCalls[0]!.target)?.name).toBe('top_func');
+
+      // The file dependency must resolve too: fixing only the member lookup
+      // restores calls but leaves the aliased module's imports edge missing.
+      const mainFile = cg.getNodesByKind('file').find((n) => n.filePath === 'main.py');
+      const moduleFile = cg.getNodesByKind('file').find((n) => n.filePath.replace(/\\/g, '/') === 'pkg/module.py');
+      expect(mainFile).toBeDefined();
+      expect(moduleFile).toBeDefined();
+      const fileImports = cg.getOutgoingEdges(mainFile!.id).filter((e) => e.kind === 'imports');
+      expect(fileImports.map((e) => e.target)).toContain(moduleFile!.id);
     });
 
     it('attaches Go methods to their receiver type across files (#583, cross-file half)', async () => {

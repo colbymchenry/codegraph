@@ -1892,9 +1892,12 @@ function resolveModuleImportToFile(
       modulePath = imp.source;
     } else if (ref.language === 'python') {
       // `from . import certs` — the imported NAME is a submodule of the source.
+      // As in resolvePythonModuleMember, use the exported name so an alias
+      // still links to the real module file (#1626).
+      const moduleName = imp.exportedName === '*' ? imp.localName : imp.exportedName;
       modulePath = imp.source.endsWith('.')
-        ? imp.source + imp.localName
-        : imp.source + '.' + imp.localName;
+        ? imp.source + moduleName
+        : imp.source + '.' + moduleName;
     } else {
       // A named TS/JS import binds a symbol, not a module — leave it alone.
       continue;
