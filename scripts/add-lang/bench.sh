@@ -9,7 +9,10 @@
 # broken extractor); set FORCE_AB=1 to run it anyway.
 #
 # Usage: bench.sh <lang> <repo-name> <repo-url> "<question>" [headless|tmux|all]
-# Env:   CORPUS   corpus dir (default /tmp/codegraph-corpus, shared with agent-eval)
+# Env:   CORPUS         corpus dir (default /tmp/codegraph-corpus, shared with agent-eval)
+#        CODEGRAPH_BIN  path to the codegraph binary or dist/bin/codegraph.js —
+#                       bypasses the PATH lookup (needed on Windows, where the
+#                       npm shim isn't directly exec-able from Node children)
 set -uo pipefail
 
 LANG_TOKEN="${1:?usage: bench.sh <lang> <repo-name> <repo-url> \"<question>\" [mode]}"
@@ -23,10 +26,23 @@ AGENT_EVAL="$(cd "$HARNESS/../agent-eval" && pwd)"
 CORPUS="${CORPUS:-/tmp/codegraph-corpus}"
 REPO="$CORPUS/$NAME"
 
-command -v codegraph >/dev/null || { echo "no codegraph on PATH (build + ./scripts/local-install.sh first)"; exit 1; }
+# CODEGRAPH_BIN overrides the PATH lookup; the function shadows the `codegraph`
+# command for the rest of the script, and the export lets verify-extraction.mjs
+# (a Node child) resolve the same binary.
+if [ -n "${CODEGRAPH_BIN:-}" ]; then
+  export CODEGRAPH_BIN
+  case "$CODEGRAPH_BIN" in
+    *.js|*.mjs|*.cjs) codegraph() { node "$CODEGRAPH_BIN" "$@"; } ;;
+    *)                codegraph() { "$CODEGRAPH_BIN" "$@"; } ;;
+  esac
+  CODEGRAPH_DESC="$CODEGRAPH_BIN"
+else
+  command -v codegraph >/dev/null || { echo "no codegraph on PATH (build + ./scripts/local-install.sh first, or set CODEGRAPH_BIN)"; exit 1; }
+  CODEGRAPH_DESC="$(command -v codegraph)"
+fi
 
 echo "==================== add-lang bench: $NAME ($LANG_TOKEN) ===================="
-echo "codegraph: $(command -v codegraph) -> $(codegraph --version 2>/dev/null || echo '?')"
+echo "codegraph: $CODEGRAPH_DESC -> $(codegraph --version 2>/dev/null || echo '?')"
 
 # 1. Ensure the repo (shallow clone, reuse if present).
 mkdir -p "$CORPUS"
