@@ -311,6 +311,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Python calls and file dependencies through `from package import module as alias` now appear in the graph, so renamed imports no longer hide live callers or imported modules. Thanks @JoeyNPP. (#1626)
 
+- Bash and shell scripts are now indexed, including extensionless executable files with a shell shebang, so CodeGraph can follow functions, calls, and sourced scripts across a shell project.
+
 ## [1.6.0] - 2026-08-26
 
 ### Highlights
