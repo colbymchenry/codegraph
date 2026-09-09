@@ -22,6 +22,7 @@ import { astroResolver } from './astro';
 import { djangoResolver, flaskResolver, fastapiResolver } from './python';
 import { railsResolver } from './ruby';
 import { springResolver } from './java';
+import { micronautResolver } from './micronaut';
 import { playResolver } from './play';
 import { goResolver } from './go';
 import { goframeResolver } from './goframe';
@@ -68,6 +69,7 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   railsResolver,
   // Java
   springResolver,
+  micronautResolver,
   playResolver,
   // Go
   goResolver,
@@ -164,6 +166,7 @@ export { astroResolver } from './astro';
 export { djangoResolver, flaskResolver, fastapiResolver } from './python';
 export { railsResolver } from './ruby';
 export { springResolver } from './java';
+export { micronautResolver } from './micronaut';
 export { playResolver } from './play';
 export { goResolver } from './go';
 export { goframeResolver } from './goframe';
