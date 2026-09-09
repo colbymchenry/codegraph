@@ -22,6 +22,7 @@ import {
 import { isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
+import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
@@ -871,9 +872,26 @@ export class ReferenceResolver {
    * import, name-match, chain, CFML component path — passes through the
    * inheritance target-kind gate at ONE seam. Filtering inside the
    * name-matcher would have covered `matchByExactName` only.
+   * Calls that land on an alias binding then forward once to the callable
+   * the alias names (see ./alias-binding), regardless of the strategy.
    */
   resolveOne(ref: UnresolvedRef): ResolvedRef | null {
-    return this.gateTargetKind(this.resolveOneInner(ref), ref);
+    const resolved = this.gateTargetKind(this.resolveOneInner(ref), ref);
+    if (!resolved || ref.referenceKind !== 'calls') return resolved;
+
+    const target = this.queries.getNodeById(resolved.targetNodeId);
+    if (!target) return resolved;
+
+    const dot = ref.referenceName.lastIndexOf('.');
+    const memberName = dot >= 0 ? ref.referenceName.slice(dot + 1) : null;
+    const forwarded = resolveAliasBinding(target, memberName, this.context);
+    if (!forwarded || forwarded.id === resolved.targetNodeId) return resolved;
+
+    return {
+      ...resolved,
+      targetNodeId: forwarded.id,
+      confidence: Math.min(resolved.confidence, 0.85),
+    };
   }
 
   private resolveOneInner(ref: UnresolvedRef): ResolvedRef | null {
