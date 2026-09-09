@@ -5,7 +5,8 @@
  * SAME ExtractionResult as the wasm TreeSitterExtractor — nodes, edges, and
  * unresolved refs compared as canonicalized multisets — over the checked-in
  * torture fixture (torture.rs: impl/trait quirks incl. generic / lifetime /
- * reference / scoped / generic-trait impl receivers (#1588), unit-struct skip, phantom
+ * reference / scoped / generic-trait impl receivers (#1588), unit structs
+ * (a bodiless struct IS a definition — both walkers mint a node), phantom
  * const identifiers, use-binding refs incl. nested groups + wildcard-emits-
  * nothing, chained-call re-encode, turbofish, Rocket route macros body-only,
  * fn-ref shapes, value-ref shadowing, attribute-broken docstrings, dead-code

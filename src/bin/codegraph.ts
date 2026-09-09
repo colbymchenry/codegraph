@@ -41,7 +41,7 @@ try {
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, hasStructuralKeyword, extractCodeTokens } from '../directory';
+import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection } from '../directory';
 import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
@@ -59,6 +59,9 @@ import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
 // server itself is loaded lazily inside the `ui` action. See ui-server/constants.
 import { BROWSER_ENV, DEFAULT_UI_PORT } from '../ui-server/constants';
 import type { UiServerHandle } from '../ui-server';
+import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../graph/symbol-lookup';
+import type { Node, Edge } from '../types';
+import { isTestPath } from '../search/query-utils';
 
 // Decided once, before `--color`/`--no-color` are stripped from argv below
 // (#1281). Piped/redirected stdout, NO_COLOR, or --no-color -> plain output.
@@ -362,6 +365,27 @@ function warn(message: string): void {
   console.log(chalk.yellow(getGlyphs().warn) + ' ' + message);
 }
 
+/** "not found" (+ optional did-you-mean) when no exact symbol matches. */
+function formatSymbolNotFound(symbol: string, fuzzyNames: string[]): string {
+  const suggestions = [...new Set(fuzzyNames.filter((n) => n !== symbol))].slice(0, 3);
+  if (suggestions.length === 0) return `Symbol "${symbol}" not found`;
+  return `Symbol "${symbol}" not found — did you mean: ${suggestions.join(', ')}?`;
+}
+
+/** Compact node shape retained by the CLI's existing JSON lists. */
+function cliNode(node: Node) {
+  return { name: node.name, kind: node.kind, filePath: node.filePath, startLine: node.startLine };
+}
+
+/** Attribute a group's edges to every overload of this definition. */
+function cliDefinition(group: Node[]) {
+  const head = group[0]!;
+  return {
+    definition: { ...cliNode(head), id: head.id, qualifiedName: head.qualifiedName, language: head.language },
+    roots: group.map((node) => node.id),
+  };
+}
+
 type IndexResult = {
   success: boolean;
   filesIndexed: number;
@@ -371,6 +395,8 @@ type IndexResult = {
   edgesCreated: number;
   errors: Array<{ message: string; filePath?: string; severity: string; code?: string }>;
   durationMs: number;
+  filesSkippedUnsupported?: number;
+  topUnsupportedExtensions?: { ext: string; count: number }[];
 };
 
 /**
@@ -378,6 +404,7 @@ type IndexResult = {
  */
 function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexResult, projectPath?: string): void {
   const hasErrors = result.filesErrored > 0;
+  const parseWarnings = result.errors.filter((e) => e.code === 'parse_error' && e.severity === 'warning');
 
   // Surface non-file-level failures (e.g. lock-acquisition failure
   // when another indexer is running) before the file-count branches.
@@ -403,6 +430,10 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
       clack.log.success(`Indexed ${formatNumber(result.filesIndexed)} files`);
     }
     clack.log.info(`${formatNumber(result.nodesCreated)} nodes, ${formatNumber(result.edgesCreated)} edges in ${formatDuration(result.durationMs)}`);
+    // Warning-only parse failures keep indexing successful, but must be visible.
+    for (const warning of parseWarnings) {
+      clack.log.warn(warning.message);
+    }
     // A PARTIAL index (files silently dropped mid-pipeline) must not pass
     // as a clean run — it's the difference between "indexed the repo" and
     // "indexed most of the repo, quietly". Only the completeness
@@ -423,6 +454,20 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
     }
   } else if (hasErrors) {
     clack.log.error(`Indexing failed ${getGlyphs().dash} all ${formatNumber(result.filesErrored)} files had errors`);
+  } else if (result.filesSkippedUnsupported) {
+    // A project CodeGraph has no grammar for used to be indistinguishable from
+    // an empty one: same message, same `complete` state, same exit 0. Say which
+    // files were there and that the graph is empty on purpose, so nobody — and
+    // no agent trusting the graph — reads silence as "this code doesn't exist"
+    // (#1502).
+    const top = (result.topUnsupportedExtensions ?? [])
+      .map(e => `${e.ext} (${formatNumber(e.count)})`)
+      .join(', ');
+    clack.log.warn(
+      `No supported source files found ${getGlyphs().dash} ${formatNumber(result.filesSkippedUnsupported)} file(s) present, none in a language CodeGraph indexes`
+      + (top ? `: ${top}` : '')
+    );
+    clack.log.info('CodeGraph is inactive for this workspace — searches will return nothing. Use your own file tools here.');
   } else {
     clack.log.warn('No files found to index');
   }
@@ -791,7 +836,13 @@ program
   .option('-q, --quiet', 'Suppress progress output')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
   .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean }) => {
-    const projectPath = resolveProjectPath(pathArg);
+    // An EXPLICIT path names the project to rebuild — it is never a hint to go
+    // looking for one. resolveProjectPath walks up to the nearest initialized
+    // ancestor, which is right for `codegraph query` run from a subdirectory,
+    // but for a full re-index it silently rebuilt the parent's graph under a
+    // normal "Done" when <path> had no index of its own (#1524). Only a bare
+    // `codegraph index` (cwd) may resolve upward.
+    const projectPath = pathArg ? path.resolve(pathArg) : resolveProjectPath();
 
     try {
       // Don't (re)index your home directory / a filesystem root (#845). --force
@@ -804,7 +855,12 @@ program
 
       if (!isInitialized(projectPath)) {
         error(`CodeGraph not initialized in ${projectPath}`);
-        info('Run "codegraph init" first');
+        const ancestor = pathArg ? resolveProjectPath(pathArg) : projectPath;
+        if (ancestor !== projectPath) {
+          info(`The nearest initialized project is ${ancestor} — pass that path to rebuild it, or run "codegraph init" in ${projectPath} to index it on its own.`);
+        } else {
+          info('Run "codegraph init" first');
+        }
         process.exit(1);
       }
 
@@ -1164,7 +1220,9 @@ program
 
       const limit = parseInt(options.limit || '10', 10);
       const rawResults = cg.searchNodes(search, {
-        limit,
+        // Fetch one extra row so the CLI can report a cut without changing the
+        // long-standing bare-array contract of `query --json` (#1639).
+        limit: limit + 1,
         kinds: options.kind ? [options.kind as any] : undefined,
       });
 
@@ -1172,14 +1230,18 @@ program
       // hand-written implementation before protobuf/gRPC scaffolding
       // when both share a name. See extraction/generated-detection.ts.
       const isGen = cg.generatedFilePredicate(rawResults.map((r) => r.node.filePath));
-      const results = [...rawResults].sort((a, b) => {
+      const rankedResults = [...rawResults].sort((a, b) => {
         const aGen = isGen(a.node.filePath) ? 1 : 0;
         const bGen = isGen(b.node.filePath) ? 1 : 0;
         return aGen - bGen;
       });
+      const truncated = rankedResults.length > limit;
+      const results = rankedResults.slice(0, limit);
+      const truncationMessage = `Results truncated at ${limit}; pass --limit to widen.`;
 
       if (options.json) {
         console.log(JSON.stringify(results, null, 2));
+        if (truncated) console.error(truncationMessage);
       } else {
         if (results.length === 0) {
           info(`No results found for "${search}"`);
@@ -1205,6 +1267,7 @@ program
             }
             console.log();
           }
+          if (truncated) console.log(chalk.dim(truncationMessage));
         }
       }
 
@@ -1412,8 +1475,11 @@ program
             const text = result.content[0]?.text ?? '';
             if (!result.isError && text.trim()) {
               // Cap the injection so a large-repo explore can't flood the prompt.
-              const MAX = 16000;
-              const body = text.length > MAX ? `${text.slice(0, MAX)}\n…(truncated; call codegraph_explore for the rest)` : text;
+              // Claude Code shows hook stdout inline only up to 10,000 characters;
+              // above that it persists the output to a file and the model sees a
+              // 2 KB preview (#1694). PROMPT_HOOK_INJECTION_MAX (9,000) leaves
+              // room for the wrapper and the projectPath nudge lines below.
+              const body = capPromptHookInjection(text);
               // For a front-loaded SUB-project, a follow-up explore needs its path.
               const more = plan.viaSubScan
                 ? `call codegraph_explore with projectPath: "${plan.exploreRoot}" for more`
@@ -2123,176 +2189,140 @@ program
   });
 
 /**
- * codegraph callers <symbol>
- *
- * CLI parity with the MCP graph tools (codegraph_callers/callees/impact) so the
- * traversal queries work in scripts, CI, and git hooks without a running MCP
- * server.
+ * CLI parity with MCP callers/callees: resolve once, then collect and limit
+ * within each definition. The legacy JSON list remains an explicitly labeled
+ * union, with its original total/limit/truncated contract (#1674).
  */
-program
-  .command('callers <symbol>')
-  .description('Find all functions/methods that call a specific symbol')
-  .option('-p, --path <path>', 'Project path')
-  .option('-l, --limit <number>', 'Maximum results', '20')
-  .option('-j, --json', 'Output as JSON')
-  .action(async (symbol: string, options: { path?: string; limit?: string; json?: boolean }) => {
-    const projectPath = resolveProjectPath(options.path);
+for (const direction of ['callers', 'callees'] as const) {
+  const title = direction === 'callers' ? 'Callers' : 'Callees';
+  program
+    .command(`${direction} <symbol>`)
+    .description(direction === 'callers'
+      ? 'Find all functions/methods that call a specific symbol'
+      : 'Find all functions/methods called by a specific symbol')
+    .option('-p, --path <path>', 'Project path')
+    .option('-f, --file <path>', 'Narrow definitions by file path or suffix (no match: show all with a note)')
+    .option('-l, --limit <number>', 'Maximum results per definition (also caps the JSON union)', '20')
+    .option('-j, --json', 'Output as JSON')
+    .action(async (symbol: string, options: { path?: string; file?: string; limit?: string; json?: boolean }) => {
+      const projectPath = resolveProjectPath(options.path);
 
-    try {
-      if (!isInitialized(projectPath)) {
-        error(`CodeGraph not initialized in ${projectPath}`);
+      try {
+        if (!isInitialized(projectPath)) {
+          error(`CodeGraph not initialized in ${projectPath}`);
+          process.exit(1);
+        }
+
+        const { default: CodeGraph } = await loadCodeGraph();
+        const cg = await CodeGraph.open(projectPath);
+        try {
+          const limit = parseInt(options.limit || '20', 10);
+          const { nodes: targets } = lookupSymbolNodes(cg, symbol);
+          if (targets.length === 0) {
+            info(formatSymbolNotFound(symbol, cg.searchNodes(symbol, { limit: 5 }).map((m) => m.node.name)));
+            return;
+          }
+
+          const { groups, filteredOut } = groupDefinitions(targets, options.file);
+          const ambiguous = groups.length > 1;
+          const note = filteredOut
+            ? `no definition of "${symbol}" matches file "${options.file}" — showing all definitions instead.`
+            : undefined;
+          const collected = groups.map((group) => {
+            const nodes = new Map<string, Node>();
+            const edges = new Map<string, Edge>();
+            for (const target of group) {
+              const connections = direction === 'callers' ? cg.getCallers(target.id) : cg.getCallees(target.id);
+              for (const { node, edge } of connections) {
+                nodes.set(node.id, node);
+                edges.set(`${edge.source}->${edge.target}:${edge.kind}`, edge);
+              }
+            }
+            return { group, nodes: [...nodes.values()], edges: [...edges.values()] };
+          });
+
+          if (options.json) {
+            const definitions = collected.map(({ group, nodes, edges }) => {
+              const limited = nodes.slice(0, limit);
+              const shown = new Set(limited.map((node) => node.id));
+              return {
+                ...cliDefinition(group),
+                [direction]: limited.map((node) => ({ id: node.id, ...cliNode(node) })),
+                edges: edges.filter((edge) => shown.has(direction === 'callers' ? edge.source : edge.target)),
+                total: nodes.length,
+                limit,
+                truncated: nodes.length > limit,
+              };
+            });
+            const union = new Map<string, Node>();
+            for (const { nodes } of collected) {
+              for (const node of nodes) union.set(node.id, node);
+            }
+            const total = union.size;
+            console.log(JSON.stringify({
+              symbol,
+              targets: groups.flat().map((node) => cliDefinition([node]).definition),
+              ambiguous,
+              aggregation: ambiguous ? 'union' : 'definition',
+              file: options.file,
+              filteredOut,
+              note,
+              definitions,
+              [direction]: [...union.values()].slice(0, limit).map(cliNode),
+              total,
+              limit,
+              truncated: total > limit,
+            }, null, 2));
+          } else {
+            if (note) warn(note);
+            if (ambiguous) {
+              console.log(chalk.bold(`\n${title} of "${symbol}" — ${groups.length} distinct definitions (narrow with --file):`));
+            }
+            for (const { group, nodes } of collected) {
+              const limited = nodes.slice(0, limit);
+              const total = nodes.length;
+              const truncated = total > limit;
+              const count = truncated ? `${limited.length} of ${total}` : String(total);
+              if (ambiguous) {
+                console.log(chalk.bold(`\n${describeSymbolNode(group[0]!)} (${count}):\n`));
+              } else {
+                console.log(chalk.bold(`\n${title} of "${symbol}" (${count}):\n`));
+                console.log(chalk.dim(describeSymbolNode(group[0]!)));
+              }
+              if (total === 0) {
+                if (ambiguous) console.log(chalk.dim(`  (no ${direction})`));
+                else info(`No ${direction} found for "${symbol}"`);
+              }
+              for (const node of limited) {
+                const loc = node.startLine ? `:${node.startLine}` : '';
+                console.log(chalk.cyan(node.kind.padEnd(12)) + chalk.white(node.name));
+                console.log(chalk.dim(`  ${node.filePath}${loc}`));
+                console.log();
+              }
+              if (truncated) console.log(chalk.dim(`Showing ${limited.length} of ${total}; pass --limit to widen.`));
+            }
+          }
+        } finally {
+          cg.destroy();
+        }
+      } catch (err) {
+        error(`${direction} failed: ${err instanceof Error ? err.message : String(err)}`);
         process.exit(1);
       }
-
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
-      const limit = parseInt(options.limit || '20', 10);
-
-      const matches = cg.searchNodes(symbol, { limit: 50 });
-      if (matches.length === 0) {
-        info(`Symbol "${symbol}" not found`);
-        cg.destroy();
-        return;
-      }
-
-      const seen = new Set<string>();
-      const allCallers: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
-
-      for (const match of matches) {
-        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
-        if (!exactMatch && matches.length > 1) continue;
-        for (const c of cg.getCallers(match.node.id)) {
-          if (!seen.has(c.node.id)) {
-            seen.add(c.node.id);
-            allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
-          }
-        }
-      }
-
-      // Fallback: if exact filter removed everything, use the top match
-      if (allCallers.length === 0 && matches[0]) {
-        for (const c of cg.getCallers(matches[0].node.id)) {
-          if (!seen.has(c.node.id)) {
-            seen.add(c.node.id);
-            allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
-          }
-        }
-      }
-
-      const limited = allCallers.slice(0, limit);
-
-      if (options.json) {
-        console.log(JSON.stringify({ symbol, callers: limited }, null, 2));
-      } else if (limited.length === 0) {
-        info(`No callers found for "${symbol}"`);
-      } else {
-        console.log(chalk.bold(`\nCallers of "${symbol}" (${limited.length}):\n`));
-        for (const node of limited) {
-          const loc = node.startLine ? `:${node.startLine}` : '';
-          console.log(
-            chalk.cyan(node.kind.padEnd(12)) +
-            chalk.white(node.name)
-          );
-          console.log(chalk.dim(`  ${node.filePath}${loc}`));
-          console.log();
-        }
-      }
-
-      cg.destroy();
-    } catch (err) {
-      error(`callers failed: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
-    }
-  });
+    });
+}
 
 /**
- * codegraph callees <symbol>
- */
-program
-  .command('callees <symbol>')
-  .description('Find all functions/methods that a specific symbol calls')
-  .option('-p, --path <path>', 'Project path')
-  .option('-l, --limit <number>', 'Maximum results', '20')
-  .option('-j, --json', 'Output as JSON')
-  .action(async (symbol: string, options: { path?: string; limit?: string; json?: boolean }) => {
-    const projectPath = resolveProjectPath(options.path);
-
-    try {
-      if (!isInitialized(projectPath)) {
-        error(`CodeGraph not initialized in ${projectPath}`);
-        process.exit(1);
-      }
-
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
-      const limit = parseInt(options.limit || '20', 10);
-
-      const matches = cg.searchNodes(symbol, { limit: 50 });
-      if (matches.length === 0) {
-        info(`Symbol "${symbol}" not found`);
-        cg.destroy();
-        return;
-      }
-
-      const seen = new Set<string>();
-      const allCallees: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
-
-      for (const match of matches) {
-        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
-        if (!exactMatch && matches.length > 1) continue;
-        for (const c of cg.getCallees(match.node.id)) {
-          if (!seen.has(c.node.id)) {
-            seen.add(c.node.id);
-            allCallees.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
-          }
-        }
-      }
-
-      if (allCallees.length === 0 && matches[0]) {
-        for (const c of cg.getCallees(matches[0].node.id)) {
-          if (!seen.has(c.node.id)) {
-            seen.add(c.node.id);
-            allCallees.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
-          }
-        }
-      }
-
-      const limited = allCallees.slice(0, limit);
-
-      if (options.json) {
-        console.log(JSON.stringify({ symbol, callees: limited }, null, 2));
-      } else if (limited.length === 0) {
-        info(`No callees found for "${symbol}"`);
-      } else {
-        console.log(chalk.bold(`\nCallees of "${symbol}" (${limited.length}):\n`));
-        for (const node of limited) {
-          const loc = node.startLine ? `:${node.startLine}` : '';
-          console.log(
-            chalk.cyan(node.kind.padEnd(12)) +
-            chalk.white(node.name)
-          );
-          console.log(chalk.dim(`  ${node.filePath}${loc}`));
-          console.log();
-        }
-      }
-
-      cg.destroy();
-    } catch (err) {
-      error(`callees failed: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
-    }
-  });
-
-/**
- * codegraph impact <symbol>
+ * codegraph impact <symbol> — one blast radius per distinct definition.
  */
 program
   .command('impact <symbol>')
   .description('Analyze what code is affected by changing a symbol')
   .option('-p, --path <path>', 'Project path')
+  .option('-f, --file <path>', 'Narrow definitions by file path or suffix (no match: show all with a note)')
   .option('-d, --depth <number>', 'Traversal depth', '2')
   .option('-j, --json', 'Output as JSON')
-  .action(async (symbol: string, options: { path?: string; depth?: string; json?: boolean }) => {
+  .action(async (symbol: string, options: { path?: string; file?: string; depth?: string; json?: boolean }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
@@ -2303,77 +2333,89 @@ program
 
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
-      const depth = Math.min(Math.max(parseInt(options.depth || '2', 10), 1), 10);
+      try {
+        const depth = Math.min(Math.max(parseInt(options.depth || '2', 10), 1), 10);
+        const { nodes: targets } = lookupSymbolNodes(cg, symbol);
+        if (targets.length === 0) {
+          info(formatSymbolNotFound(symbol, cg.searchNodes(symbol, { limit: 5 }).map((m) => m.node.name)));
+          return;
+        }
 
-      const matches = cg.searchNodes(symbol, { limit: 50 });
-      if (matches.length === 0) {
-        info(`Symbol "${symbol}" not found`);
+        const { groups, filteredOut } = groupDefinitions(targets, options.file);
+        const ambiguous = groups.length > 1;
+        const note = filteredOut
+          ? `no definition of "${symbol}" matches file "${options.file}" — showing all definitions instead.`
+          : undefined;
+        const collected = groups.map((group) => {
+          const nodes = new Map<string, Node>();
+          const edges = new Map<string, Edge>();
+          for (const target of group) {
+            const impact = cg.getImpactRadius(target.id, depth);
+            for (const [id, node] of impact.nodes) nodes.set(id, node);
+            for (const edge of impact.edges) edges.set(`${edge.source}->${edge.target}:${edge.kind}`, edge);
+          }
+          return { group, nodes, edges };
+        });
+
+        if (options.json) {
+          const unionNodes = new Map<string, Node>();
+          const unionEdges = new Map<string, Edge>();
+          const definitions = collected.map(({ group, nodes, edges }) => {
+            for (const [id, node] of nodes) unionNodes.set(id, node);
+            for (const [key, edge] of edges) unionEdges.set(key, edge);
+            return {
+              ...cliDefinition(group),
+              nodeCount: nodes.size,
+              edgeCount: edges.size,
+              affected: [...nodes.values()].map((node) => ({ id: node.id, ...cliNode(node) })),
+              edges: [...edges.values()],
+            };
+          });
+          console.log(JSON.stringify({
+            symbol,
+            depth,
+            targets: groups.flat().map((node) => cliDefinition([node]).definition),
+            ambiguous,
+            aggregation: ambiguous ? 'union' : 'definition',
+            file: options.file,
+            filteredOut,
+            note,
+            definitions,
+            nodeCount: unionNodes.size,
+            edgeCount: unionEdges.size,
+            affected: [...unionNodes.values()].map(cliNode),
+          }, null, 2));
+        } else {
+          if (note) warn(note);
+          if (ambiguous) {
+            console.log(chalk.bold(`\nImpact of changing "${symbol}" — ${groups.length} distinct definitions (each with its own blast radius; narrow with --file):`));
+          }
+          for (const { group, nodes } of collected) {
+            if (ambiguous) {
+              console.log(chalk.bold(`\n${describeSymbolNode(group[0]!)} — ${nodes.size} affected symbols:\n`));
+            } else {
+              console.log(chalk.bold(`\nImpact of changing "${symbol}" — ${nodes.size} affected symbols:\n`));
+              console.log(chalk.dim(describeSymbolNode(group[0]!)));
+            }
+            const byFile = new Map<string, Node[]>();
+            for (const node of nodes.values()) {
+              const list = byFile.get(node.filePath) || [];
+              list.push(node);
+              byFile.set(node.filePath, list);
+            }
+            for (const [file, affected] of byFile) {
+              console.log(chalk.cyan(file));
+              for (const node of affected) {
+                const loc = node.startLine ? `:${node.startLine}` : '';
+                console.log(`  ${chalk.dim(node.kind.padEnd(12))}${node.name}${chalk.dim(loc)}`);
+              }
+              console.log();
+            }
+          }
+        }
+      } finally {
         cg.destroy();
-        return;
       }
-
-      // Merge impact subgraphs across all exact-matching symbols
-      const mergedNodes = new Map<string, { name: string; kind: string; filePath: string; startLine?: number }>();
-      const seenEdges = new Set<string>();
-      let edgeCount = 0;
-
-      for (const match of matches) {
-        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
-        if (!exactMatch && matches.length > 1) continue;
-        const impact = cg.getImpactRadius(match.node.id, depth);
-        for (const [id, n] of impact.nodes) {
-          mergedNodes.set(id, { name: n.name, kind: n.kind, filePath: n.filePath, startLine: n.startLine });
-        }
-        for (const e of impact.edges) {
-          const key = `${e.source}->${e.target}:${e.kind}`;
-          if (!seenEdges.has(key)) {
-            seenEdges.add(key);
-            edgeCount++;
-          }
-        }
-      }
-
-      // Fallback to top match if exact filter removed everything
-      if (mergedNodes.size === 0 && matches[0]) {
-        const impact = cg.getImpactRadius(matches[0].node.id, depth);
-        for (const [id, n] of impact.nodes) {
-          mergedNodes.set(id, { name: n.name, kind: n.kind, filePath: n.filePath, startLine: n.startLine });
-        }
-        edgeCount = impact.edges.length;
-      }
-
-      if (options.json) {
-        console.log(JSON.stringify({
-          symbol,
-          depth,
-          nodeCount: mergedNodes.size,
-          edgeCount,
-          affected: Array.from(mergedNodes.values()),
-        }, null, 2));
-      } else if (mergedNodes.size === 0) {
-        info(`No affected symbols found for "${symbol}"`);
-      } else {
-        console.log(chalk.bold(`\nImpact of changing "${symbol}" — ${mergedNodes.size} affected symbols:\n`));
-
-        // Group by file
-        const byFile = new Map<string, Array<{ name: string; kind: string; startLine?: number }>>();
-        for (const node of mergedNodes.values()) {
-          const list = byFile.get(node.filePath) || [];
-          list.push({ name: node.name, kind: node.kind, startLine: node.startLine });
-          byFile.set(node.filePath, list);
-        }
-
-        for (const [file, nodes] of byFile) {
-          console.log(chalk.cyan(file));
-          for (const node of nodes) {
-            const loc = node.startLine ? `:${node.startLine}` : '';
-            console.log(`  ${chalk.dim(node.kind.padEnd(12))}${node.name}${chalk.dim(loc)}`);
-          }
-          console.log();
-        }
-      }
-
-      cg.destroy();
     } catch (err) {
       error(`impact failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
@@ -2434,16 +2476,6 @@ program
       const cg = await CodeGraph.open(projectPath);
       const maxDepth = parseInt(options.depth || '5', 10);
 
-      // Common test file patterns
-      const defaultTestPatterns = [
-        /\.spec\./,
-        /\.test\./,
-        /\/__tests__\//,
-        /\/tests?\//,
-        /\/e2e\//,
-        /\/spec\//,
-      ];
-
       // Custom filter pattern
       let customFilter: RegExp | null = null;
       if (options.filter) {
@@ -2456,9 +2488,14 @@ program
         customFilter = new RegExp(regex);
       }
 
+      // One notion of "a test" for the whole tool (#1507): the CLI used to keep
+      // its own six regexes here, which knew `.test.` and `/tests/` but not Go's
+      // `_test.go`, Python's `test_x.py` or the JVM's `FooTest.kt` — so
+      // `affected` reported "no tests" for whole ecosystems while `search` and
+      // the MCP tools counted those very files as tests.
       function isTestFile(filePath: string): boolean {
         if (customFilter) return customFilter.test(filePath);
-        return defaultTestPatterns.some(p => p.test(filePath));
+        return isTestPath(filePath);
       }
 
       // BFS to find all transitive dependents of changed files, filtered to test files
