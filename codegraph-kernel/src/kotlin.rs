@@ -778,9 +778,11 @@ impl<'t> Walker<'t> {
             return true;
         };
         // The `type`-field signature read is dead (zero fields) → signature
-        // undefined; NO docstring/visibility/isStatic — the modifiers merge in
-        // create_node still decorates expect/actual properties.
-        let row = self.create_node(kind, &name, node, Extra::default());
+        // undefined; NO docstring/isStatic — the modifiers merge in
+        // create_node still decorates expect/actual properties. Visibility IS
+        // read: a `private val` is file-local to the resolver (#1731).
+        let extra = Extra { visibility: Some(self.visibility_of(node)), ..Extra::default() };
+        let row = self.create_node(kind, &name, node, extra);
         // Walk the initializer ATTRIBUTED to the declared symbol (#693, the Go
         // fix, ported): without this the subtree is only fn-ref-scanned, so a
         // lambda / SAM / object initializer (`val cb = Runnable { target() }` —
