@@ -484,6 +484,10 @@ Restart your agent (Claude Code / Cursor / Codex CLI / opencode / Hermes Agent /
 
 ### 3. Initialize Projects
 
+The interactive installer in step 1 already initializes **the project you ran it in** (it runs `codegraph init` for you on a local install — see "Initialize your current project" above). For that project you can skip straight to step 2.
+
+To index **other** projects, run `codegraph init` in each one:
+
 ```bash
 cd your-project
 codegraph init
