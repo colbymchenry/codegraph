@@ -216,3 +216,56 @@ describe('iBatis 2 <sqlMap> coverage (#1182 gap 3)', () => {
     expect(methodNodes(xml, 'SqlMapConfig.xml')).toHaveLength(0);
   });
 });
+
+describe('MyBatis extractor — whitespace in close tags', () => {
+  it('does not swallow the next statement when a close tag has trailing space', () => {
+    const xml =
+      '<mapper namespace="com.example.FooMapper">' +
+      '<select id="a">SELECT 1</select >' +
+      '<select id="b">SELECT 2</select>' +
+      '</mapper>';
+    expect(methodNames(xml).sort()).toEqual([
+      'com.example.FooMapper::a',
+      'com.example.FooMapper::b',
+    ]);
+  });
+
+  it('still resolves the include after a spaced close tag', () => {
+    const xml =
+      '<mapper namespace="com.example.FooMapper">' +
+      '<sql id="cols">id</sql>' +
+      '<select id="a">SELECT <include refid="cols"/> FROM t</select >' +
+      '</mapper>';
+    const refs = extractFromSource('FooMapper.xml', xml).unresolvedReferences.map(
+      (r) => r.referenceName
+    );
+    expect(refs).toContain('com.example.FooMapper::cols');
+  });
+});
+
+describe('MyBatis extractor — qualified include refid', () => {
+  it('resolves a cross-mapper refid whose namespace has multiple dots', () => {
+    const xml =
+      '<mapper namespace="com.example.M">' +
+      '<sql id="base">id, name</sql>' +
+      '<select id="getAll">SELECT <include refid="com.example.M.base"/> FROM t</select>' +
+      '</mapper>';
+    const res = extractFromSource('M.xml', xml);
+    const fragment = res.nodes.find((n) => n.qualifiedName.endsWith('::base'));
+    const refs = res.unresolvedReferences.map((r) => r.referenceName);
+    expect(fragment?.qualifiedName).toBe('com.example.M::base');
+    expect(refs).toContain('com.example.M::base');
+  });
+
+  it('still resolves a same-namespace bare refid (regression guard)', () => {
+    const xml =
+      '<mapper namespace="com.example.M">' +
+      '<sql id="base">id</sql>' +
+      '<select id="getAll">SELECT <include refid="base"/> FROM t</select>' +
+      '</mapper>';
+    const refs = extractFromSource('M.xml', xml).unresolvedReferences.map(
+      (r) => r.referenceName
+    );
+    expect(refs).toContain('com.example.M::base');
+  });
+});
