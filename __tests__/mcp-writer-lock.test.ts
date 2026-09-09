@@ -34,6 +34,15 @@ function spawnMcp(
   return { child, getStderr: () => stderr };
 }
 
+function readWriterPid(root: string): number | undefined {
+  try {
+    const { pid } = JSON.parse(fs.readFileSync(getWriterPidPath(root), 'utf8')) as { pid?: number };
+    return typeof pid === 'number' ? pid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 describe('issue #1740 — direct-mode writer lock', () => {
   let tempDir: string;
   let realRoot: string;
@@ -50,12 +59,22 @@ describe('issue #1740 — direct-mode writer lock', () => {
   });
 
   afterEach(async () => {
+    // In daemon mode the writer is a third process, spawned by the proxies and
+    // never recorded in `children` — the second test asserts exactly that. It
+    // holds the index open, so killing only the proxies leaves tempDir
+    // unremovable. writer.pid names it; the removal must not be silenced,
+    // because a swallowed failure here is what let this leak run unnoticed.
+    const childPids = new Set(children.map((c) => c.pid));
+    const writerPid = readWriterPid(realRoot);
     for (const c of children) {
       try { c.kill('SIGTERM'); } catch { /* ignore */ }
     }
     children.length = 0;
+    if (writerPid !== undefined && !childPids.has(writerPid)) {
+      try { process.kill(writerPid, 'SIGTERM'); } catch { /* already exited */ }
+    }
     await sleep(300);
-    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 10 });
   });
 
   it('second CODEGRAPH_NO_DAEMON serve --mcp exits with writer-lock error', async () => {
