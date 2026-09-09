@@ -211,14 +211,17 @@ export const springResolver: FrameworkResolver = {
     const now = Date.now();
     const lang: 'java' | 'kotlin' = filePath.endsWith('.kt') ? 'kotlin' : 'java';
     const safe = stripCommentsForRegex(content, 'java');
+    const consts = new Map<string, string>();
+    for (const m of safe.matchAll(/\bstatic\s+final\s+String\s+(\w+)\s*=\s*"([^"]*)"\s*;/g)) {
+      consts.set(m[1]!, m[2]!);
+    }
 
     // Class-level @RequestMapping prefix (an @RequestMapping whose tail leads to a
     // `class`). Joined onto each method's path — and, crucially, NOT treated as a
     // route itself (the old regex did, creating one bogus class route and missing
     // every BARE method mapping like `@PostMapping` with the path on the class).
-    let classPrefix = '';
     const cls = /@RequestMapping\s*\(([^)]*)\)\s*(?:@[\w.]+(?:\([^)]*\))?\s*)*(?:public\s+|final\s+|abstract\s+|open\s+|data\s+|sealed\s+)*class\b/.exec(safe);
-    if (cls) classPrefix = parseMappingPath(cls[1]!);
+    const classPrefixes = cls ? parseMappingPaths(cls[1]!, consts) : [''];
 
     const VERB: Record<string, string> = {
       GetMapping: 'GET', PostMapping: 'POST', PutMapping: 'PUT', PatchMapping: 'PATCH', DeleteMapping: 'DELETE',
@@ -228,38 +231,39 @@ export const springResolver: FrameworkResolver = {
     let match: RegExpExecArray | null;
     while ((match = mappingRegex.exec(safe)) !== null) {
       const method = VERB[match[1]!]!;
-      const sub = parseMappingPath((match[2] || '').replace(/^\(|\)$/g, ''));
-      const routePath = joinPath(classPrefix, sub);
+      const paths = parseMappingPaths((match[2] || '').replace(/^\(|\)$/g, ''), consts);
       const line = safe.slice(0, match.index).split('\n').length;
-      const routeNode: Node = {
-        id: `route:${filePath}:${line}:${method}:${routePath}`,
-        kind: 'route',
-        name: `${method} ${routePath}`,
-        qualifiedName: `${filePath}::route:${routePath}`,
-        filePath,
-        startLine: line,
-        endLine: line,
-        startColumn: 0,
-        endColumn: match[0].length,
-        language: lang,
-        updatedAt: now,
-      };
-      nodes.push(routeNode);
-
       // Method it decorates: first declared method after (skip stacked annotations;
       // Java puts the return type before the name). Bounded so we don't grab a far one.
       const tail = safe.slice(match.index + match[0].length, match.index + match[0].length + 600);
       const methodMatch = tail.match(/\bfun\s+(\w+)\s*\(|\b(?:public|private|protected)\s+[^;{=]*?\s+(\w+)\s*\(/);
-      if (methodMatch) {
-        references.push({
-          fromNodeId: routeNode.id,
-          referenceName: (methodMatch[1] ?? methodMatch[2])!,
-          referenceKind: 'references',
-          line,
-          column: 0,
+      for (const routePath of classPrefixes.flatMap(prefix => paths.map(sub => joinPath(prefix, sub)))) {
+        const routeNode: Node = {
+          id: `route:${filePath}:${line}:${method}:${routePath}`,
+          kind: 'route',
+          name: `${method} ${routePath}`,
+          qualifiedName: `${filePath}::route:${routePath}`,
           filePath,
+          startLine: line,
+          endLine: line,
+          startColumn: 0,
+          endColumn: match[0].length,
           language: lang,
-        });
+          updatedAt: now,
+        };
+        nodes.push(routeNode);
+
+        if (methodMatch) {
+          references.push({
+            fromNodeId: routeNode.id,
+            referenceName: (methodMatch[1] ?? methodMatch[2])!,
+            referenceKind: 'references',
+            line,
+            column: 0,
+            filePath,
+            language: lang,
+          });
+        }
       }
     }
 
@@ -273,24 +277,26 @@ export const springResolver: FrameworkResolver = {
       if (/^\s*(?:@[\w.]+(?:\([^)]*\))?\s*)*(?:public\s+|final\s+|abstract\s+|open\s+|data\s+|sealed\s+)*class\b/.test(after)) continue; // class-level prefix
       const methodMatch = after.match(/\bfun\s+(\w+)\s*\(|\b(?:public|private|protected)\s+[^;{=]*?\s+(\w+)\s*\(/);
       if (!methodMatch) continue;
-      const verbM = args.match(/method\s*=\s*(?:RequestMethod\.)?(\w+)/);
+      const verbM = args.match(/method\s*=\s*[{\[]?\s*(?:RequestMethod\.)?(\w+)/);
       const method = verbM ? verbM[1]!.toUpperCase() : 'ANY';
-      const routePath = joinPath(classPrefix, parseMappingPath(args));
+      const paths = parseMappingPaths(args, consts);
       const line = safe.slice(0, match.index).split('\n').length;
-      const routeNode: Node = {
-        id: `route:${filePath}:${line}:${method}:${routePath}`,
-        kind: 'route',
-        name: `${method} ${routePath}`,
-        qualifiedName: `${filePath}::route:${routePath}`,
-        filePath, startLine: line, endLine: line, startColumn: 0, endColumn: match[0].length, language: lang, updatedAt: now,
-      };
-      nodes.push(routeNode);
-      references.push({
-        fromNodeId: routeNode.id,
-        referenceName: (methodMatch[1] ?? methodMatch[2])!,
-        referenceKind: 'references',
-        line, column: 0, filePath, language: lang,
-      });
+      for (const routePath of classPrefixes.flatMap(prefix => paths.map(sub => joinPath(prefix, sub)))) {
+        const routeNode: Node = {
+          id: `route:${filePath}:${line}:${method}:${routePath}`,
+          kind: 'route',
+          name: `${method} ${routePath}`,
+          qualifiedName: `${filePath}::route:${routePath}`,
+          filePath, startLine: line, endLine: line, startColumn: 0, endColumn: match[0].length, language: lang, updatedAt: now,
+        };
+        nodes.push(routeNode);
+        references.push({
+          fromNodeId: routeNode.id,
+          referenceName: (methodMatch[1] ?? methodMatch[2])!,
+          referenceKind: 'references',
+          line, column: 0, filePath, language: lang,
+        });
+      }
     }
 
     // @Value("${key}") and @ConfigurationProperties(prefix="...") — bind
@@ -512,10 +518,24 @@ const COMPONENT_DIRS = ['/component/', '/components/', '/config/'];
 const CLASS_KINDS = new Set(['class']);
 const SERVICE_KINDS = new Set(['class', 'interface']);
 
-/** Path string from a mapping's args (`"/x"`, `value = "/x"`, `path = "/x"`); '' if bare. */
-function parseMappingPath(args: string): string {
-  const m = args.match(/["']([^"']*)["']/);
-  return m ? m[1]! : '';
+/** All declared paths; [''] for an omitted path, [] for an unresolved one. */
+function parseMappingPaths(args: string, consts: Map<string, string>): string[] {
+  const paths: string[] = [];
+  let hasPaths = false;
+  // Keep Java/Kotlin arrays and quoted URI variables together when separating
+  // attributes. Strings in produces/consumes/etc. are never mapping paths.
+  const argRe = /(?:^|,)\s*(?:(\w+)\s*=\s*)?(\{(?:[^"'}]|"[^"]*"|'[^']*')*\}|\[(?:[^"'\]]|"[^"]*"|'[^']*')*\]|"[^"]*"|'[^']*'|[^,]+)/g;
+  for (const arg of args.matchAll(argRe)) {
+    if (arg[1] && arg[1] !== 'value' && arg[1] !== 'path') continue;
+    hasPaths = true;
+    const scope = arg[2]!.trim().replace(/^[{\[]|[}\]]$/g, '').trim();
+    if (!scope) paths.push(''); // An explicitly empty path array also inherits the prefix.
+    for (const value of scope.matchAll(/(?:^|,)\s*(?:"([^"]*)"|'([^']*)'|([\w.]+))\s*(?=,|$)/g)) {
+      const path = value[1] ?? value[2] ?? consts.get(value[3]!.split('.').pop()!);
+      if (path !== undefined) paths.push(path);
+    }
+  }
+  return hasPaths ? [...new Set(paths)] : [''];
 }
 
 /** Join a class-level prefix and a method sub-path into one normalized `/path`. */
