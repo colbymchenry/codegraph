@@ -339,6 +339,7 @@ export function buildOrderModel(payload: WireStepsPayload): StepsModel | null {
       generatedFiles: [],
       facade: false,
       fileList: { total: 1, shown: 1, truncated: false, items: [step.node?.file ?? step.sub] },
+      dependents: { files: 0, modules: 0 },
     });
   }
   // Each decision is a point of its own on the canvas: a small box asking the
@@ -357,6 +358,7 @@ export function buildOrderModel(payload: WireStepsPayload): StepsModel | null {
       generatedFiles: [],
       facade: false,
       fileList: { total: 0, shown: 0, truncated: false, items: [] },
+      dependents: { files: 0, modules: 0 },
     });
   }
   const drawn = (id: string): boolean => nodes.has(id) || forks.has(id);

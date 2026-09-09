@@ -135,9 +135,17 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Spring mappings now include every declared path combination and resolve constants declared in the same file, while unresolved paths no longer appear as false root routes. (#1461)
 - `codegraph callers`, `codegraph callees` and `codegraph impact` now resolve qualified names, group results and JSON edges by definition, and accept `--file` to narrow ambiguous names; thanks @ferrine. (#1512, #1656)
+- `codegraph callers`, `codegraph callees` and `codegraph impact` (CLI and MCP) now report missing names with did-you-mean suggestions instead of another symbol's results, and exact matches with no callers stay empty; thanks @uvmplus. (#1473, #1481)
 
 #### MCP / indexing
+
+- The prompt hook no longer injects unrelated projects when run from your home directory or a broader directory containing a stray workspace manifest. (#1454)
+
+- Indexing now succeeds when Node.js's SQLite lacks FTS5, with search falling back to name and fuzzy matching; thanks @aniruddhaadak80. (#1532)
+
+- `codegraph_explore` now makes clear that suggested call counts are advisory, so agents keep exploring when an answer is incomplete; thanks @rongbc. (#1504, #1570)
 
 - C++ functions following anonymous namespaces containing raw-string templates are now indexed correctly, even when template text resembles an unfinished macro call. (#1505)
 
@@ -160,6 +168,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `codegraph install` now honors `CLAUDE_CONFIG_DIR` and `CODEX_HOME` for global Claude Code and Codex setup so CodeGraph loads in your chosen profile (thanks @seanchann; #1627).
 
 - Files opted in with `includeIgnored` now stay indexed on Git older than 2.36, and embedded repositories remain visible to the watcher (thanks @maxmilian and @newshowardz777; #1549).
+
+- `codegraph init` and `codegraph index` now list unsupported file extensions and explain that CodeGraph is inactive when no supported source files are found (#1502).
 
 #### Screens, links and navigation
 
@@ -229,6 +239,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Symbols, tests and the viewer
 
+- Kotlin functions and methods now carry their signature — `(params): ReturnType` — in `codegraph_explore`, `node` and the viewer, instead of no signature at all. Re-index Kotlin projects after upgrading. (#1495)
+- TypeScript/JavaScript value aliases — `export const alias = fn`, `export { fn as alias }`, object-literal `api = { run: fn }`, and same-file `const local = fn` — now forward calls edges to the aliased function, so callers and impact on the implementation include consumers that call through the alias instead of stopping at the binding. Genuine wrappers (`() => fn()`) are unchanged. Re-index after upgrading. Thanks @valkyriweb. (#1482, #1485)
 - `codegraph affected` now finds Go, Python and JVM test files that previously went unreported, while preserving custom `--filter` behavior (thanks @danusha2345; #1507, #1688).
 
 - Calls inside declaration initializers in Kotlin, Java, TypeScript, JavaScript, Scala, Rust and Python now appear under the declaration that owns them, making callers and impact results more accurate after re-indexing with `codegraph index -f` (thanks @danusha2345; #1510, #1511).
@@ -264,6 +276,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **An import that names the emitted extension resolves to its source.** Under `moduleResolution: node16 | nodenext | bundler` TypeScript requires `import { x } from './util.js'` for `util.ts`, and no file of that name exists, so the import resolver returned nothing and every name imported that way fell through to bare-name matching: a method wrapping the same-named helper it imports (`renderDockStyles() { return renderDockStyles(); }`) resolved to itself, and cross-module edges in such projects were name guesses. `.js` / `.jsx` / `.mjs` / `.cjs` specifiers now retry with the source extensions TypeScript compiles from when the emitted file is absent; a real `.js` beside the `.ts` still wins. On a 582-file repo whose `.ts` files import this way, import-backed `calls`/`imports` edges went from 4,002 to 7,312 and the eight wrapper-method self-edges disappeared. Re-index after upgrading. Thanks @bompus. (#1705, #1706)
 
 - **A C `#if` group whose branches are not whole statements no longer produces phantom functions.** An `else if (…) { … }` arm kept behind `#ifdef`, an `if (…)` header whose body sits after the `#endif` (the ST HAL's per-device latency tables), or a function signature that differs per configuration all read to the C grammar as a function *named* `if` — and every real function after it in the file was then filed underneath it, or dropped. Such a group is now collapsed to its first live branch before parsing, offsets kept, and block macros written in capitals (`ATOMIC_BLOCK(…) { … }`) are recognized like their lowercase cousins. On a betaflight tree 265 phantom nested functions became 5, and whole functions that had been missing (`spiInternalStartDMA`, `processSmartPortTelemetry`, the CMSIS matrix routines) are back with their callers at exact-match confidence. Re-index after upgrading.
+- **The Map groups a repository the way that repository is shaped.** It always drew top-level directories, so a project whose whole program lives under one `src/` opened as a picture of four boxes — `src`, `ios`, `.github`, `(root files)` — with two thirds of the code inside one of them and nothing to say about it. The Map now picks its own grouping: the shallowest one that is not a single box holding the program, so a mobile app opens on `src/app`, `src/components`, `src/api`, `ios/CaptureView` and the rest, and a project packaged as `frontend/src/…` opens on the screens, components and reducers instead of on the word `frontend`. A repository whose top-level directories really are its modules is left exactly where it was. A new **Grouping** control on the right says which one was chosen and lets you take it a level in or out, and a leaf directory is now named for itself rather than as `…/(root files)`. Each box now also says how much leans on it — how many files elsewhere reference straight into it — with a bar along its bottom edge scaled against the most depended-on box on screen, so the folder you have to be careful with is the one you can see at a glance rather than the one with the longest name. The Map also has a **Key** now, like the Screens and Steps tabs — including what the dashed maroon lines mean, which only appear once you select a module: that module reaching back UP into something that depends on it.
+
+- **The Symbol tab opens the Symbol tab.** With no symbol open and no trail to return to, clicking **Symbol** in the top bar took you to the landing page — which, on any project that has screens, is the Screens tab. So the button said Symbol and gave you somebody else's view. It now has an address of its own (`#/s`) that opens the "nothing selected" screen: the search prompt and the where-to-start list of routes, entry files and the symbols the most code depends on.
 
 - **Files under an `e2e/` directory count as tests.** Their calls no longer appear as production callers in Steps, dead-code and test badges.
 

@@ -207,7 +207,13 @@ with — so the strip and the MCP answer cannot disagree.
 Grid: canvas `minmax(600px,1fr)` | side panel **320px** (`--rule-soft` left border, 14px 16px padding).
 Nodes: rect `width = max(110, label.length × 7.3 + 28)`, **height 40**, `--paper` fill, 1px `--ink` stroke (2px + `--press` fill
 when hovered/selected; `--ink-4` when dimmed; test modules dashed `4 3` in `--ink-3`), label 13px mono at (10,17), count
-"N symbols · M files" 11px `--ink-3` at (10,32). Layers: vertical gap **74px**, horizontal gap **34px**, padding 44px; entry points at the
+"N symbols · M files · R depend on it" 11px `--ink-3` at (10,32). **Weight bar:** 4px band inside the bottom edge, `--ink` at
+0.3 (0.55 hovered/selected, 0.1 dimmed or generated), `width = node.width × (R / max R drawn)` — how much of the picture
+leans on this box. `R` is `dependents.files`: files OUTSIDE the module holding a direct confident reference into one of its
+files. **Direct, not transitive** — the transitive closure was measured and saturates on any repository with a dependency
+cycle (139–282 of 377 files on a real mobile app, a flat spread that only reports cyclicity), while the direct count on the
+same repository spreads 0–127 and names the modules a reader would name by hand. Relative to the heaviest box *drawn*, so
+turning tests on rescales rather than overflowing a maximum nobody can see; a module with R=0 draws no bar at all. Layers: vertical gap **74px**, horizontal gap **34px**, padding 44px; entry points at the
 top ("entry points" label), foundations at the bottom ("foundations — depend on nothing below"); faint layer lines `--rule-faint`.
 Layout: aggregate edges by module; break 2-cycles keeping the heavier direction; longest-path layering (a module sits one layer
 above everything it depends on); barycenter ordering, 3 sweeps; single-node layers centred; ports spread along each box

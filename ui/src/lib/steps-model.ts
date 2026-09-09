@@ -385,6 +385,8 @@ export function buildStepsModel(payload: WireStepsPayload): StepsModel {
       generatedFiles: [],
       facade: false,
       fileList: { total: 1, shown: 1, truncated: false, items: [step.node?.file ?? step.sub] },
+      // Not the Map: a step has no dependent count and draws no weight bar.
+      dependents: { files: 0, modules: 0 },
     });
   }
 
@@ -716,6 +718,7 @@ function packRegions(
       module: moduleOf.get(id)!,
       island: false,
       generated: false,
+      weight: 0,
       layer: layerOf(id),
       x,
       y: yy,

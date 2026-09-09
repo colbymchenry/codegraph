@@ -398,6 +398,8 @@ function moduleFor(info: ScreenNodeInfo, symbols: number): WireMapModule {
     generatedFiles: [],
     facade: false,
     fileList: { total: 1, shown: 1, truncated: false, items: [info.screen?.file ?? info.sub] },
+    // Not the Map: a screen has no dependent count and draws no weight bar.
+    dependents: { files: 0, modules: 0 },
   };
 }
 

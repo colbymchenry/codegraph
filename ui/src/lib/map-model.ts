@@ -122,7 +122,16 @@ export function moduleMetaLabel(module: WireMapModule, island = false): string {
   if (island) return 'nothing depends on this';
   const symbols = `${module.symbols} symbol${module.symbols === 1 ? '' : 's'}`;
   const files = `${module.files} file${module.files === 1 ? '' : 's'}`;
-  return `${symbols} · ${files}`;
+  // How big a change here is, said in the same breath as how big the module is.
+  // Two boxes of 20 files are not the same box when one of them is imported by
+  // ninety files and the other by two, and until this line the picture had no
+  // channel that said so — width tracked the length of the PATH.
+  // `?.` because `GraphAdapter` is a public seam: a host that assembles this
+  // payload itself and has not caught up to the field must lose the bar, not
+  // the screen. Every other read of `dependents` goes through this one.
+  const reach = module.dependents?.files ?? 0;
+  const depend = reach > 0 ? ` · ${reach} depend on it` : '';
+  return `${symbols} · ${files}${depend}`;
 }
 
 /** One port on a box's edge: the link it belongs to, and which end of it this is. */
@@ -144,6 +153,17 @@ export interface MapNodeLayout {
   island: boolean;
   /** Every file in it is tool-generated, so it draws in ink-4. */
   generated: boolean;
+  /**
+   * How much of the picture leans on this box, 0..1, as a share of the
+   * most-depended-on box DRAWN — the bar along the bottom of the node.
+   *
+   * Relative rather than absolute because there is no absolute scale a reader
+   * could calibrate against: 94 dependent files is enormous in a 377-file app
+   * and unremarkable in a monorepo. Relative to what is on screen, the longest
+   * bar always means "this is the one to be careful with, here". The absolute
+   * number is on the box beside it, so the bar never has to be trusted alone.
+   */
+  weight: number;
   layer: number;
   x: number;
   y: number;
@@ -417,6 +437,9 @@ export function buildMapLayout(
 
   const nodesById = new Map<string, MapNodeLayout>();
   const byId = new Map(modules.map((m) => [m.id, m]));
+  // The busiest box DRAWN sets the scale — so turning tests on rescales the
+  // bars rather than leaving a test module's bar overflowing a hidden maximum.
+  const heaviest = Math.max(0, ...modules.map((m) => m.dependents?.files ?? 0));
   rows.forEach((row, index) => {
     const span = rowSpans[index] ?? 0;
     const sum = rowSums[index] ?? 0;
@@ -435,6 +458,7 @@ export function buildMapLayout(
         // Every file generated, not merely some: a module with one `.pb.go` in
         // it is still a module somebody writes by hand.
         generated: module.files > 0 && module.generated === module.files,
+        weight: heaviest === 0 ? 0 : (module.dependents?.files ?? 0) / heaviest,
         layer: index,
         x,
         y,
