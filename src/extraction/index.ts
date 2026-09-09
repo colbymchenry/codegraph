@@ -99,6 +99,16 @@ export interface IndexResult {
    * counts. Only set by full-index runs (indexAll), not indexFiles/sync.
    */
   filesDiscovered?: number;
+  /**
+   * Files the scan saw but has no grammar for, tallied by extension. Only the
+   * degenerate case needs it: a project of unsupported files otherwise looks
+   * exactly like an empty one (0 files, state `complete`), so nothing tells the
+   * user — or an agent — that there was code here CodeGraph could not read
+   * (#1502). Counted during the scan's existing walk.
+   */
+  filesSkippedUnsupported?: number;
+  /** The most common unsupported extensions, biggest first. */
+  topUnsupportedExtensions?: { ext: string; count: number }[];
   nodesCreated: number;
   edgesCreated: number;
   errors: ExtractionError[];
@@ -925,9 +935,7 @@ export function discoverEmbeddedRepoRoots(rootDir: string): string[] {
     // same way collectGitFiles does, keeping watcher scope == indexer scope.
     // (#1031, #1033)
     try {
-      const staged = execFileSync(
-        'git',
-        ['ls-files', '-z', '-s', '--recurse-submodules'],
+      const staged = lsFilesStaged(
         { cwd: repoAbs, encoding: 'utf-8', timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
       );
       const repoIgnore = buildDefaultIgnore(repoAbs);
@@ -1041,6 +1049,30 @@ function findIgnoredEmbeddedRepos(repoDir: string, includeIgnored: Ignore | null
 }
 
 /**
+ * `git ls-files -z -s`, expanding submodules where git allows it.
+ *
+ * `--recurse-submodules` could not be combined with `-s` before git 2.36:
+ * `builtin/ls-files.c` listed `show_stage` among the modes that die, and the
+ * check is unconditional — it does not look at whether the repo actually has
+ * submodules, so every call fails on older git. Ubuntu 22.04 LTS (2.34.1) and
+ * Debian 11 (2.30.2) are both below that line.
+ *
+ * Letting the throw escape cost far more than submodule expansion: it unwound
+ * the whole git-visible pass, so `includeIgnored`, gitlink recursion and the
+ * `codegraph.json` include allowlist silently stopped applying and files went
+ * missing from the index with no error (#1549). Retry without the flag instead
+ * — `-s` is the part that matters here, since gitlink detection reads the mode
+ * bits, and embedded repos are reached through the gitlink recursion anyway.
+ */
+function lsFilesStaged(gitOpts: Parameters<typeof execFileSync>[2]): string {
+  try {
+    return execFileSync('git', ['ls-files', '-z', '-s', '--recurse-submodules'], gitOpts) as unknown as string;
+  } catch {
+    return execFileSync('git', ['ls-files', '-z', '-s'], gitOpts) as unknown as string;
+  }
+}
+
+/**
  * Collect git-visible files (tracked + untracked, .gitignore-respected) from the
  * git repository rooted at `repoDir`, adding each to `files` with `prefix`
  * prepended so paths stay relative to the original scan root.
@@ -1085,7 +1117,7 @@ function collectGitFiles(repoDir: string, prefix: string, files: Set<string>, em
   // on disk → those files are silently dropped from the index. (#541) With -s the
   // path follows a TAB after the `<mode> <object> <stage>` prefix.
   const gitlinkRels: string[] = [];
-  const tracked = execFileSync('git', ['ls-files', '-z', '-s', '--recurse-submodules'], gitOpts);
+  const tracked = lsFilesStaged(gitOpts);
   for (const entry of tracked.split('\0')) {
     if (!entry) continue;
     const tab = entry.indexOf('\t');
@@ -1386,9 +1418,30 @@ export function scanDirectory(
  * Async variant of scanDirectory that yields to the event loop periodically,
  * allowing worker threads to receive and render progress messages.
  */
+/**
+ * What a scan saw but could not index, tallied by extension.
+ *
+ * Filled during the walk the scan already performs — a project of unsupported
+ * files is otherwise indistinguishable from an empty one, because unsupported
+ * extensions are filtered out at discovery and never counted anywhere (#1502).
+ */
+export interface ScanSkipStats {
+  /** Lowercased extension (with dot) → how many files carried it. */
+  unsupportedByExtension: Map<string, number>;
+}
+
+/** Record one file the scan declined to index. */
+function tallySkip(stats: ScanSkipStats | undefined, rel: string): void {
+  if (!stats) return;
+  const ext = path.extname(rel).toLowerCase();
+  if (!ext) return;
+  stats.unsupportedByExtension.set(ext, (stats.unsupportedByExtension.get(ext) ?? 0) + 1);
+}
+
 export async function scanDirectoryAsync(
   rootDir: string,
-  onProgress?: (current: number, file: string) => void
+  onProgress?: (current: number, file: string) => void,
+  stats?: ScanSkipStats
 ): Promise<string[]> {
   // Custom extension → language overrides from the project's codegraph.json.
   const overrides = loadExtensionOverrides(rootDir);
@@ -1406,12 +1459,14 @@ export async function scanDirectoryAsync(
         if (count % 100 === 0) {
           await new Promise<void>(r => setImmediate(r));
         }
+      } else {
+        tallySkip(stats, filePath);
       }
     }
     return files;
   }
 
-  return scanDirectoryWalk(rootDir, onProgress);
+  return scanDirectoryWalk(rootDir, onProgress, stats);
 }
 
 /**
@@ -1419,7 +1474,8 @@ export async function scanDirectoryAsync(
  */
 function scanDirectoryWalk(
   rootDir: string,
-  onProgress?: (current: number, file: string) => void
+  onProgress?: (current: number, file: string) => void,
+  stats?: ScanSkipStats
 ): string[] {
   const files: string[] = [];
   let count = 0;
@@ -1502,10 +1558,14 @@ function scanDirectoryWalk(
               walk(fullPath, active);
             }
           } else if (stat.isFile()) {
-            if (!isIgnored(fullPath, false, active) && isSourceFile(relativePath, overrides)) {
-              files.push(relativePath);
-              count++;
-              onProgress?.(count, relativePath);
+            if (!isIgnored(fullPath, false, active)) {
+              if (isSourceFile(relativePath, overrides)) {
+                files.push(relativePath);
+                count++;
+                onProgress?.(count, relativePath);
+              } else {
+                tallySkip(stats, relativePath);
+              }
             }
           }
         } catch {
@@ -1519,10 +1579,14 @@ function scanDirectoryWalk(
           walk(fullPath, active);
         }
       } else if (entry.isFile()) {
-        if (!isIgnored(fullPath, false, active) && isSourceFile(relativePath, overrides)) {
-          files.push(relativePath);
-          count++;
-          onProgress?.(count, relativePath);
+        if (!isIgnored(fullPath, false, active)) {
+          if (isSourceFile(relativePath, overrides)) {
+            files.push(relativePath);
+            count++;
+            onProgress?.(count, relativePath);
+          } else {
+            tallySkip(stats, relativePath);
+          }
         }
       }
     }
@@ -1769,6 +1833,7 @@ export class ExtractionOrchestrator {
     // early-run 5-10s single stalls were observed on 95k-file repos but never
     // attributed — these labels settle scan vs framework-detect vs grammars.
     const tScan = Date.now();
+    const skipStats: ScanSkipStats = { unsupportedByExtension: new Map() };
     const files = await scanDirectoryAsync(this.rootDir, (current, file) => {
       onProgress?.({
         phase: 'scanning',
@@ -1776,8 +1841,20 @@ export class ExtractionOrchestrator {
         total: 0,
         currentFile: file,
       });
-    });
+    }, skipStats);
     if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] scan: ${Date.now() - tScan}ms (${files.length} files)`);
+    /** Only meaningful when nothing was indexable — see IndexResult (#1502). */
+    const skipSummary = (): Pick<IndexResult, 'filesSkippedUnsupported' | 'topUnsupportedExtensions'> => {
+      let total = 0;
+      for (const n of skipStats.unsupportedByExtension.values()) total += n;
+      if (total === 0) return {};
+      const top = [...skipStats.unsupportedByExtension.entries()]
+        .map(([ext, count]) => ({ ext, count }))
+        .sort((a, b) => b.count - a.count || a.ext.localeCompare(b.ext))
+        .slice(0, 5);
+      return { filesSkippedUnsupported: total, topUnsupportedExtensions: top };
+    };
+
 
     // A re-index over an existing DB skips unchanged-hash files at the store,
     // which would preserve wiped zero-node rows (#1541) — drop them first so
@@ -2169,6 +2246,7 @@ export class ExtractionOrchestrator {
         filesSkipped,
         filesErrored,
         filesDiscovered: total,
+        ...skipSummary(),
         nodesCreated: totalNodes,
         edgesCreated: totalEdges,
         errors: [{ message: 'Aborted', severity: 'error' }, ...errors],
@@ -2325,6 +2403,7 @@ export class ExtractionOrchestrator {
       filesSkipped,
       filesErrored,
       filesDiscovered: total,
+      ...skipSummary(),
       nodesCreated: totalNodes,
       edgesCreated: totalEdges,
       errors,

@@ -21,7 +21,7 @@
  * need receiver-type matching, deferred to Phase 3). All synthesized edges are
  * tagged `provenance:'heuristic'`. See docs/design/callback-edge-synthesis.md.
  */
-import type { Edge, Node, NodeKind } from '../types';
+import type { Edge, Language, Node, NodeKind } from '../types';
 import type { QueryBuilder } from '../db/queries';
 import type { ResolutionContext } from './types';
 import { isGeneratedFile } from '../extraction/generated-detection';
@@ -37,6 +37,7 @@ import { svelteKitLinkEdges, svelteKitPageComponentEdges } from './sveltekit-syn
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { crossTierEdges } from './tier-synthesizer';
 import { enclosingFn, makeLineAt } from './synth-utils';
+import { resolveImportPath } from './import-resolver';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -47,6 +48,7 @@ const ON_RE = /\.(?:on|once|addListener)\(\s*['"]([^'"]+)['"]\s*,\s*(?:function\
 const EMIT_RE = /\.(?:emit|fire|dispatchEvent)\(\s*['"]([^'"]+)['"]/g;
 const SETSTATE_RE = /this\.setState\s*\(/;
 const FLUTTER_SETSTATE_RE = /\bsetState\s*\(/; // Flutter: setState((){…}) / this.setState
+const JS_FAMILY = ['typescript', 'javascript', 'tsx', 'jsx'];
 const JSX_TAG_RE = /<([A-Z][A-Za-z0-9_]*)[\s/>]/g;
 const MAX_JSX_CHILDREN = 30;
 // Vue SFC templates: kebab-case child components (<el-button> → ElButton) and
@@ -1187,6 +1189,65 @@ async function goGrpcStubImplEdges(queries: QueryBuilder, onYield: MaybeYield): 
   return edges;
 }
 
+/** Kinds a JSX tag can name. A tag that resolves only to a type is markup we drop. */
+const JSX_CHILD_KINDS = new Set<NodeKind>(['component', 'function', 'class']);
+
+/**
+ * The languages a JSX tag can plausibly name a component in. Preferred over a
+ * same-named symbol in another language, never required — a React Native tag
+ * whose only match is the native class it bridges to (`requireNativeComponent`)
+ * still links there.
+ */
+const JSX_CHILD_LANGUAGES = [...JS_FAMILY, 'vue', 'svelte'];
+
+/** `localName` → the project file it is imported from, for one file's imports. */
+function importedFrom(ctx: ResolutionContext, file: string, language: Language): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const im of ctx.getImportMappings(file, language)) {
+    // The mappings name the module as written; the file it is comes from the
+    // same resolution the import resolver uses (aliases, extensions, index files).
+    const resolved = im.resolvedPath ?? resolveImportPath(im.source, file, language, ctx);
+    if (resolved) out.set(im.localName, resolved);
+  }
+  return out;
+}
+
+/**
+ * The component a JSX tag names, among every node that shares the name.
+ *
+ * A tag is written in one file, and that file already says which `FrameCard` it
+ * means: the one it declares, or the one it imports. Taking the FIRST node of
+ * that name — which is what this did — is a coin flip once a name repeats, and
+ * it costs twice over. The parent gets an edge to a component it never renders,
+ * and the component it does render is left with no caller at all, so every walk
+ * back from that subtree dead-ends: on an Expo app whose `<FrameCard/>` was one
+ * of two, the folder sheet's `openBackgroundNoiseDetail` stood alone on Screens
+ * with no screen behind it, while the edge pointed at an unrelated card in
+ * another sheet.
+ *
+ * Same file first — a small component declared beside its use is the commonest
+ * shape, and the one an import can never disambiguate. Then the file the name
+ * is imported from. Then the language, which only decides a tie: a `.tsx` tag
+ * naming both a TS component and a same-named Swift class means the TS one.
+ */
+function jsxChild(
+  ctx: ResolutionContext,
+  name: string,
+  file: string,
+  importsOf: () => Map<string, string>
+): Node | undefined {
+  const candidates = ctx.getNodesByName(name).filter((n) => JSX_CHILD_KINDS.has(n.kind));
+  if (candidates.length <= 1) return candidates[0];
+  const local = candidates.find((n) => n.filePath === file);
+  if (local) return local;
+  const from = importsOf().get(name);
+  if (from) {
+    const imported = candidates.find((n) => n.filePath === from);
+    if (imported) return imported;
+  }
+  return candidates.find((n) => JSX_CHILD_LANGUAGES.includes(n.language)) ?? candidates[0];
+}
+
 /**
  * Phase 5: React JSX child rendering. A component that returns `<Child .../>`
  * mounts Child — React calls it — but JSX instantiation isn't a static call edge,
@@ -1213,6 +1274,10 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
       (n) => PARENT_KINDS.has(n.kind) && JS_FAMILY.includes(n.language)
     );
     if (parents.length === 0) continue;
+    // Read once per file, and only when a name actually turns out ambiguous.
+    let imports: Map<string, string> | null = null;
+    const importsOf = () =>
+      (imports ??= importedFrom(ctx, file, parents[0]!.language));
     for (const parent of parents) {
       const src = sliceLines(content, parent.startLine, parent.endLine);
       if (!src || (!src.includes('</') && !src.includes('/>'))) continue;
@@ -1223,9 +1288,7 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
       let added = 0;
       for (const name of names) {
         if (added >= MAX_JSX_CHILDREN) break;
-        const child = ctx.getNodesByName(name).find(
-          (n) => n.kind === 'component' || n.kind === 'function' || n.kind === 'class'
-        );
+        const child = jsxChild(ctx, name, file, importsOf);
         if (!child || child.id === parent.id) continue;
         const key = `${parent.id}>${child.id}`;
         if (seen.has(key)) continue;
@@ -3512,8 +3575,6 @@ async function laravelEventEdges(ctx: ResolutionContext, onYield: MaybeYield): P
  * pre/post marks) so adding a pass without bumping this fails loudly instead
  * of silently skewing the bar.
  */
-const JS_FAMILY = ['typescript', 'javascript', 'tsx', 'jsx'];
-
 /** `has(...)` shape passed to pass gates — true when the project contains any of the languages. */
 type HasLang = (...ls: string[]) => boolean;
 

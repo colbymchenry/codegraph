@@ -5,7 +5,9 @@
  * compiled from the vendored fwcd 0.3.8 C sources, the arc's first
  * vendored-grammar-C language) produces the SAME ExtractionResult as the
  * wasm TreeSitterExtractor over the checked-in torture fixture (torture.kt:
- * the property hook's scope classification, extension-function receiver QNs
+ * the property hook's scope classification and its initializer walk (a
+ * lambda / SAM / anonymous-object RHS attributing its calls to the property),
+ * extension-function receiver QNs
  * (`WidgetK::extend`, the qualified `com::qext` bug) + the owner-contains
  * fallback, expect/actual → node DECORATORS (the KMP synthesizer feed),
  * the bodiless-vs-bodied class header asymmetry, comment-glued

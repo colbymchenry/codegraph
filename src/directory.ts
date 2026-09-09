@@ -213,6 +213,8 @@ export function findIndexedSubprojectRoots(
   root: string,
   opts: { maxDepth?: number; max?: number } = {},
 ): string[] {
+  // A stray workspace manifest must not enable scanning home or broader roots (#1454).
+  if (unsafeIndexRootReason(root) !== null) return [];
   const maxDepth = opts.maxDepth ?? 4;
   const max = opts.max ?? 64;
   const out: string[] = [];

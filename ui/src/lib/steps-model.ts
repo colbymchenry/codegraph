@@ -110,6 +110,14 @@ export interface StepsModel extends Picture {
    * holds none.
    */
   decisions: StepDecision[];
+  /**
+   * Per box, the links it does NOT draw a line for at rest, said in words on
+   * it instead ({@link StepStub}). Empty for a picture whose every line is
+   * local.
+   */
+  stubs: Map<string, StepStub[]>;
+  /** The edges drawn as stubs rather than lines — what {@link stepEdgeVisible} keeps back. */
+  stubbed: ReadonlySet<string>;
 }
 
 /**
@@ -126,6 +134,31 @@ export interface StepForkInfo {
   form: 'if' | 'switch' | 'ternary' | 'try';
   /** The point's words: the condition, asked — `user AND (await …)?`. */
   label: string;
+}
+
+/**
+ * One end of a link said in WORDS on its box instead of drawn as a line across
+ * the canvas.
+ *
+ * A line is a good drawing of a hop between two boxes a reader can see at
+ * once. It is a bad drawing of a hop across two thousand pixels: on one real
+ * screen the hundred and thirteen lines drawn at rest crossed each other six
+ * hundred and fifty-two times and each ran over five other boxes' names, so
+ * no single line could be followed and the boxes could not be read either.
+ * The link is not dropped — it is stated at BOTH ends, `→ resumeInference` on
+ * the box that leads there and `← CaptureView` on the box it arrives at, which
+ * says more than a line disappearing off the edge of the screen does. Select
+ * the box and every one of its real lines draws, exactly as before.
+ */
+export interface StepStub {
+  /** The layout edge this stands for, so selecting draws the real line. */
+  edge: string;
+  /** The box at the other end. */
+  other: string;
+  /** What that box calls itself. */
+  label: string;
+  /** `out` — this box leads there; `in` — it arrives from there. */
+  dir: 'out' | 'in';
 }
 
 /** One region of a screen's picture: its caption, and the space its boxes hold. */
@@ -385,6 +418,8 @@ export function buildStepsModel(payload: WireStepsPayload): StepsModel {
       generatedFiles: [],
       facade: false,
       fileList: { total: 1, shown: 1, truncated: false, items: [step.node?.file ?? step.sub] },
+      // Not the Map: a step has no dependent count and draws no weight bar.
+      dependents: { files: 0, modules: 0 },
     });
   }
 
@@ -469,6 +504,8 @@ export function buildStepsModel(payload: WireStepsPayload): StepsModel {
   const curves = trackedCurves(layout, layerGap);
   const polylines = new Map<string, Point[]>();
   for (const [id, curve] of curves) polylines.set(id, samplePolyline(curve, HIT_SAMPLES));
+  const entries = zones === null ? null : new Set(zones.map((z) => z.entry));
+  const { stubs, stubbed } = packStubs(layout, nodes, layerGap, entries);
   return {
     layout,
     nodes,
@@ -478,12 +515,99 @@ export function buildStepsModel(payload: WireStepsPayload): StepsModel {
     polylines,
     counts,
     regions: zones,
-    regionEntries: zones === null ? null : new Set(zones.map((z) => z.entry)),
+    regionEntries: entries,
     forks: null,
+    stubs,
+    stubbed,
     // Placed against the finished layout: a decision is drawn under the box
     // that makes it, so it needs to know where that box ended up.
     decisions: markDecisions(edges, layout),
   };
+}
+
+/* ----------------------------------------------------------------- stubs -- */
+
+/**
+ * How far apart two boxes may be, in lines, for the hop between them to still
+ * read as a line. Three lines is about as far as an eye follows a curve
+ * through other boxes without losing which one it left.
+ */
+const STUB_SPAN_LINES = 3;
+
+/**
+ * Which links are said in words rather than drawn, and the words for each box.
+ *
+ * A link is drawn when both its boxes are close enough to take it in at once —
+ * within {@link STUB_SPAN_LINES} lines, and no further across than a region's
+ * own lines start out running ({@link REGION_LINE_MIN}), so a drawn line stays
+ * inside one column of reading — and it runs down the layering. Everything else becomes a
+ * {@link StepStub} at both ends — the one link into each region included, so a
+ * region tiled into a lower band no longer reaches back up to the start with a
+ * line across the whole picture. Those 96 lines were 17% of what a real app's
+ * 51 screens drew and 79% of everything they crossed.
+ */
+/**
+ * The name a stub points at, without the mark its box wears for its kind: the
+ * stub already leads with a direction, and `← ⇠ onCaptureProgress` reads as
+ * two arrows arguing. The box itself keeps its mark, where nothing competes.
+ */
+function stubLabel(label: string): string {
+  return label.startsWith('⇢ ') || label.startsWith('⇠ ') ? label.slice(2) : label;
+}
+
+function packStubs(
+  layout: MapLayout,
+  infos: Map<string, StepNodeInfo>,
+  layerGap: number,
+  entries: ReadonlySet<string> | null
+): { stubs: Map<string, StepStub[]>; stubbed: ReadonlySet<string> } {
+  const stubs = new Map<string, StepStub[]>();
+  const stubbed = new Set<string>();
+  const nodeById = new Map(layout.nodes.map((n) => [n.id, n]));
+  const pitch = NODE_HEIGHT + layerGap;
+  const add = (id: string, stub: StepStub): void => {
+    stubs.set(id, [...(stubs.get(id) ?? []), stub]);
+  };
+  for (const edge of layout.edges) {
+    const from = nodeById.get(edge.source);
+    const to = nodeById.get(edge.target);
+    if (!from || !to) continue;
+    // On a regioned picture the anchor's fan is already stood in for by one
+    // link into each region ({@link StepsModel.regionEntries}); only THAT link
+    // is a line worth keeping or words worth saying, and the rest of the fan
+    // stays quiet as it was. An unregioned picture has no stand-in, so its
+    // anchor's links follow the same rule as every other.
+    if (entries !== null && infos.get(edge.source)?.step.anchor && !entries.has(edge.target)) continue;
+    const lines = Math.abs(to.y - from.y) / pitch;
+    const across = Math.abs(to.x + to.width / 2 - (from.x + from.width / 2));
+    // A back edge points up the layering: it is not a local hop however near
+    // it is, and it was already drawing nothing at rest — now it says so.
+    const near = !edge.back && !edge.thin && lines <= STUB_SPAN_LINES + 0.01 && across <= REGION_LINE_MIN;
+    if (near) continue;
+    stubbed.add(edge.id);
+    add(edge.source, {
+      edge: edge.id,
+      other: edge.target,
+      label: stubLabel(infos.get(edge.target)?.label ?? edge.target),
+      dir: 'out',
+    });
+    add(edge.target, {
+      edge: edge.id,
+      other: edge.source,
+      label: stubLabel(infos.get(edge.source)?.label ?? edge.source),
+      dir: 'in',
+    });
+  }
+  // What a box leads to reads before what reaches it, and each side in the
+  // order the picture puts the other end — down the page, then across.
+  const place = (id: string): number => {
+    const n = nodeById.get(id);
+    return n ? n.y * 100000 + n.x : 0;
+  };
+  for (const list of stubs.values()) {
+    list.sort((a, b) => (a.dir === b.dir ? place(a.other) - place(b.other) : a.dir === 'out' ? -1 : 1));
+  }
+  return { stubs, stubbed };
 }
 
 /* --------------------------------------------------------------- regions -- */
@@ -498,8 +622,29 @@ export function buildStepsModel(payload: WireStepsPayload): StepsModel {
 const REGION_GAP_Y = 72;
 /** The vertical rhythm of a regioned picture: one line of boxes and the gap under it. */
 const REGION_PITCH = NODE_HEIGHT + REGION_GAP_Y;
-/** A region's line of boxes wraps past this natural width. */
-const REGION_LINE_MAX = 720;
+/** The least width a region's line of boxes runs to before it wraps. */
+const REGION_LINE_MIN = 720;
+/**
+ * The widths a region's lines are tried at, narrowest first — a tie keeps the
+ * narrowest, so a small region never sprawls. A fixed 720 was the whole reason
+ * a big screen came out a 6,500px ribbon.
+ */
+const REGION_WIDTHS = [REGION_LINE_MIN, 1000, 1300, 1600, 1900, 2200, 2600, 3000];
+/**
+ * The shape the whole picture is aimed at: a little wider than tall. Boxes are
+ * wide and short, and so is the window a reader has, so a landscape picture
+ * wastes less of both than a square one — and a reader scrolls a tall picture
+ * far more than they pan a wide one.
+ */
+const CANVAS_ASPECT = 1.4;
+/** How far a finished canvas is from {@link CANVAS_ASPECT}, in log space so wide and tall cost alike. */
+function canvasCost(laid: { width: number; height: number }): number {
+  return Math.abs(Math.log(Math.max(1, laid.width) / Math.max(1, laid.height) / CANVAS_ASPECT));
+}
+/** How far a cluster's boxes sit in from the step that fires them. */
+const CLUSTER_INDENT = 26;
+/** Clusters stop stepping in past this depth, so a long chain stays on screen. */
+const CLUSTER_DEPTH_MAX = 6;
 /** Between two regions side by side. */
 const REGION_GUTTER = 72;
 /** Extra room between two rows of regions — the captions of the next row live in it. */
@@ -510,9 +655,54 @@ function bandBudget(area: number, widest: number): number {
 }
 
 /**
+ * The links minus the ones that close a cycle — those whose end is still open
+ * on the way in, found by one walk from every link's source in order, so the
+ * walk's own order decides which way round a cycle is the forward one. The
+ * twin of the order reading's `withoutBackEdges`, over map links.
+ */
+function forwardLinks(links: readonly WireMapLink[]): WireMapLink[] {
+  const out = new Map<string, WireMapLink[]>();
+  const nodes = new Set<string>();
+  for (const l of links) {
+    nodes.add(l.source);
+    nodes.add(l.target);
+    const list = out.get(l.source);
+    if (list) list.push(l);
+    else out.set(l.source, [l]);
+  }
+  /** 1 = open on the way in, 2 = done with. */
+  const state = new Map<string, number>();
+  const closes = new Set<WireMapLink>();
+  const visit = (root: string): void => {
+    const stack: { id: string; next: number }[] = [{ id: root, next: 0 }];
+    state.set(root, 1);
+    while (stack.length > 0) {
+      const top = stack[stack.length - 1]!;
+      const list = out.get(top.id) ?? [];
+      if (top.next >= list.length) {
+        state.set(top.id, 2);
+        stack.pop();
+        continue;
+      }
+      const link = list[top.next++]!;
+      const seen = state.get(link.target) ?? 0;
+      if (seen === 1) {
+        closes.add(link);
+        continue;
+      }
+      if (seen === 2) continue;
+      state.set(link.target, 1);
+      stack.push({ id: link.target, next: 0 });
+    }
+  };
+  for (const id of nodes) if (!state.has(id)) visit(id);
+  return links.filter((l) => !closes.has(l));
+}
+
+/**
  * The layout of a screen's picture: each region a small column of lines —
- * a box above what it sets in motion, a line wrapping when it grows past
- * {@link REGION_LINE_MAX} — and the regions tiled left to right, wrapping
+ * a box above what it sets in motion, a line wrapping when it grows past the
+ * width its shape earns ({@link REGION_WIDTHS}) — and the regions tiled left to right, wrapping
  * into bands, in the order the walk met them: the screen's own source order.
  * The anchor sits alone on top. Everything downstream — the tracked curves,
  * the pills, the pointer — is the same machinery over the same shapes.
@@ -561,148 +751,274 @@ function packRegions(
     regions.set(id, region);
   }
 
-  // Within a region, a step goes under the steps that lead to it.
+  // Within a region, a step goes under the steps that lead to it — minus the
+  // links that close a cycle. Relaxation over a cyclic graph never settles: it
+  // adds a row per pass until the bound, so a region holding one cycle sent
+  // sixty-five of its boxes to rows 294-301 while the rest sat at 0-2, and the
+  // order they were then packed in had nothing to do with what leads to what.
+  // The order reading learned this first ({@link withoutBackEdges} there); the
+  // cycle is still drawn, it just cannot stretch the picture.
   const regionOf = new Map(members.map((s) => [s.id, s.region?.id ?? anchor.id]));
+  const intra = links.filter(
+    (l) =>
+      l.source !== anchor.id &&
+      l.target !== anchor.id &&
+      l.source !== l.target &&
+      regionOf.get(l.source) === regionOf.get(l.target)
+  );
+  /** The steps the screen itself leads to — where its one line into a region can land. */
+  const fromAnchor = new Set(links.filter((l) => l.source === anchor.id).map((l) => l.target));
   const parentsOf = new Map<string, string[]>();
-  for (const l of links) {
-    if (l.source === anchor.id || l.target === anchor.id) continue;
-    if (regionOf.get(l.source) !== regionOf.get(l.target)) continue;
+  for (const l of forwardLinks(intra)) {
     const list = parentsOf.get(l.target) ?? [];
     list.push(l.source);
     parentsOf.set(l.target, list);
   }
 
-  interface Packed {
-    lines: string[][];
-    width: number;
-  }
-  const packed = new Map<string, Packed>();
-  for (const region of regions.values()) {
-    // A step goes under the steps that lead to it — rows from the region's OWN
-    // links, never from distance to the anchor, which is flat inside a region:
-    // a handler and the store it calls are both one hop from the screen, and
-    // side by side their line was a level arch, hidden at rest, so the store
-    // looked wired to nothing. Longest lead-to path, settled by relaxation as
-    // the order reading settles its rows; a cycle stops moving at the bound.
-    const rowOf = new Map<string, number>(region.members.map((m) => [m.id, 0]));
-    for (let pass = 0; pass < region.members.length; pass++) {
-      let moved = false;
-      for (const m of region.members) {
-        const above = (parentsOf.get(m.id) ?? [])
-          .map((p) => rowOf.get(p))
-          .filter((x): x is number => x !== undefined);
-        if (above.length === 0) continue;
-        const next = Math.max(...above) + 1;
-        if (next > rowOf.get(m.id)!) {
-          rowOf.set(m.id, next);
-          moved = true;
-        }
-      }
-      if (!moved) break;
-    }
-    const rows = new Map<number, WireStep[]>();
-    for (const m of region.members) {
-      const d = rowOf.get(m.id)!;
-      rows.set(d, [...(rows.get(d) ?? []), m]);
-    }
-    const lines: string[][] = [];
-    // The order a step was placed in, for putting its children near it.
-    const placedAt = new Map<string, number>();
-    let width = 0;
-    for (const d of [...rows.keys()].sort((a, b) => a - b)) {
-      const row = rows.get(d)!;
-      const near = (s: WireStep): number => {
-        const placed = (parentsOf.get(s.id) ?? []).map((p) => placedAt.get(p)).filter((x): x is number => x !== undefined);
-        if (placed.length === 0) return Number.MAX_SAFE_INTEGER;
-        return placed.reduce((a, b) => a + b, 0) / placed.length;
-      };
-      row.sort(
-        (a, b) => near(a) - near(b) || (a.order ?? 0) - (b.order ?? 0) || a.id.localeCompare(b.id)
+  // Who a step is drawn under: the FIRST step in the region that leads to it,
+  // in the walk's order — the same first-reach-wins the walk itself uses. A
+  // step belongs to one cluster, so a box that fires twenty things has those
+  // twenty under it rather than scattered down the region.
+  const childrenOf = new Map<string, string[]>();
+  {
+    const order = new Map(members.map((s) => [s.id, s.order ?? Number.MAX_SAFE_INTEGER]));
+    const out = new Map<string, string[]>();
+    for (const l of forwardLinks(intra)) out.set(l.source, [...(out.get(l.source) ?? []), l.target]);
+    const owned = new Set<string>();
+    const queue = members.filter((s) => (parentsOf.get(s.id) ?? []).length === 0).map((s) => s.id);
+    for (const id of queue) owned.add(id);
+    while (queue.length > 0) {
+      const id = queue.shift()!;
+      const kids = [...new Set(out.get(id) ?? [])].sort(
+        (a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0) || a.localeCompare(b)
       );
-      let line: string[] = [];
-      let w = 0;
-      for (const m of row) {
-        const bw = widthOf(m.id);
-        if (line.length > 0 && w + NODE_GAP + bw > REGION_LINE_MAX) {
-          lines.push(line);
-          width = Math.max(width, w);
-          line = [];
-          w = 0;
-        }
-        line.push(m.id);
-        w += (line.length > 1 ? NODE_GAP : 0) + bw;
-        placedAt.set(m.id, placedAt.size);
-      }
-      if (line.length > 0) {
-        lines.push(line);
-        width = Math.max(width, w);
+      for (const kid of kids) {
+        if (owned.has(kid)) continue;
+        owned.add(kid);
+        childrenOf.set(id, [...(childrenOf.get(id) ?? []), kid]);
+        queue.push(kid);
       }
     }
-    packed.set(region.id, { lines, width });
   }
 
-  // Tile the regions into bands under a width budget.
-  interface Band {
-    regions: Region[];
+  interface Packed {
+    /** Where each member sits: x from the region's left, and which line it is on. */
+    pos: Map<string, { x: number; line: number }>;
     lines: number;
     width: number;
+    entry: string;
   }
-  let area = 0;
-  let widest = 0;
-  for (const region of regions.values()) {
-    const p = packed.get(region.id)!;
-    area += p.width * p.lines.length * REGION_PITCH;
-    widest = Math.max(widest, p.width);
-  }
-  const budget = bandBudget(area, widest);
-  const bands: Band[] = [];
-  let band: Band | null = null;
-  for (const region of regions.values()) {
-    const p = packed.get(region.id)!;
-    if (band === null || band.width + REGION_GUTTER + p.width > budget) {
-      band = { regions: [], lines: 0, width: -REGION_GUTTER };
-      bands.push(band);
-    }
-    band.regions.push(region);
-    band.lines = Math.max(band.lines, p.lines.length);
-    band.width += REGION_GUTTER + p.width;
-  }
-  const contentWidth = Math.max(widthOf(anchor.id), ...bands.map((b) => b.width));
-
-  // Place everything. The anchor is alone on top; each band's regions centre
-  // as a row of columns; a region's lines centre within its own width.
-  const at = new Map<string, { x: number; y: number; line: number }>();
-  const zones: StepRegionZone[] = [];
   const anchorY = PADDING;
-  let y = anchorY + NODE_HEIGHT + SCREEN_LAYER_GAP + BAND_GAP;
-  let globalLine = 0;
-  for (const b of bands) {
-    let x = PADDING + (contentWidth - b.width) / 2;
-    for (const region of b.regions) {
-      const p = packed.get(region.id)!;
-      p.lines.forEach((line, j) => {
-        const lw = line.reduce((a, id) => a + widthOf(id), 0) + NODE_GAP * (line.length - 1);
-        let lx = x + (p.width - lw) / 2;
-        for (const id of line) {
-          at.set(id, { x: lx, y: y + j * REGION_PITCH, line: globalLine + j });
-          lx += widthOf(id) + NODE_GAP;
+  /**
+   * The whole picture at one line width: every region packed with its lines
+   * allowed to run that wide, then the regions dropped onto the canvas.
+   *
+   * The width cannot be estimated from the boxes alone — a cluster spends
+   * lines on its own structure, so `total / width` badly under-counts what a
+   * region takes — and it cannot be chosen per region either: widening one
+   * region to square it off leaves fewer of them side by side, so the CANVAS
+   * gets taller even as each region looks better (`/home` went 3,584px to
+   * 5,624px that way). One width, scored on the finished canvas.
+   */
+  const layoutAt = (lineMax: number) => {
+    const packed = new Map<string, Packed>();
+    for (const region of regions.values()) {
+      // A region is drawn as CLUSTERS, not as rows: a step, then the steps it
+      // sets in motion on the line under it, indented. Rows-then-wrap put every
+      // step of one distance on the same rows and wrapped them at a fixed width,
+      // so a box and the thing it fires ended up seven
+      // lines apart and their line crossed everything between — 70 of 113 lines
+      // on one real screen joined boxes ONE step apart and rendered seven lines
+      // apart. Under a cluster the same line is one line long.
+      const ids = new Set(region.members.map((m) => m.id));
+      const kidsOf = (id: string): string[] => (childrenOf.get(id) ?? []).filter((k) => ids.has(k));
+      const starts = region.members.filter((m) => (parentsOf.get(m.id) ?? []).length === 0).map((m) => m.id);
+
+      /** Lay the region out with its lines allowed to run this wide. */
+      const layAt = (lineMax: number): { pos: Map<string, { x: number; line: number }>; lines: number; width: number } => {
+        /**
+         * One cluster, in its own coordinates: a step, then the steps it sets
+         * in motion on the line under it, stepped in, and a cluster of its own
+         * for anything that leads on further.
+         */
+        const cluster = (root: string): { pos: Map<string, { x: number; line: number }>; lines: number; width: number } => {
+          const pos = new Map<string, { x: number; line: number }>();
+          let line = 0;
+          let width = 0;
+          const spread = (list: string[], left: number): void => {
+            if (list.length === 0) return;
+            let lx = left;
+            for (const id of list) {
+              const bw = widthOf(id);
+              if (lx > left && lx + bw - left > lineMax) {
+                line += 1;
+                lx = left;
+              }
+              pos.set(id, { x: lx, line });
+              width = Math.max(width, lx + bw);
+              lx += bw + NODE_GAP;
+            }
+            line += 1;
+          };
+          const place = (id: string, depth: number): void => {
+            const x = Math.min(depth, CLUSTER_DEPTH_MAX) * CLUSTER_INDENT;
+            pos.set(id, { x, line });
+            width = Math.max(width, x + widthOf(id));
+            line += 1;
+            const kids = kidsOf(id);
+            spread(kids.filter((k) => kidsOf(k).length === 0), x + CLUSTER_INDENT);
+            for (const hub of kids.filter((k) => kidsOf(k).length > 0)) place(hub, depth + 1);
+          };
+          place(root, 0);
+          return { pos, lines: line, width };
+        };
+
+        /** The steps that fire nothing, side by side — a screen's handlers are siblings, not a hierarchy. */
+        const flat = (list: string[]): { pos: Map<string, { x: number; line: number }>; lines: number; width: number } => {
+          const pos = new Map<string, { x: number; line: number }>();
+          let line = 0;
+          let width = 0;
+          let lx = 0;
+          for (const id of list) {
+            const bw = widthOf(id);
+            if (lx > 0 && lx + bw > lineMax) {
+              line += 1;
+              lx = 0;
+            }
+            pos.set(id, { x: lx, line });
+            width = Math.max(width, lx + bw);
+            lx += bw + NODE_GAP;
+          }
+          return { pos, lines: list.length === 0 ? 0 : line + 1, width };
+        };
+
+        // The region's blocks, in the walk's order: everything that fires
+        // nothing first, as one spread, then a cluster per step that does.
+        const blocks: { pos: Map<string, { x: number; line: number }>; lines: number; width: number }[] = [];
+        const bare = starts.filter((id) => kidsOf(id).length === 0);
+        if (bare.length > 0) blocks.push(flat(bare));
+        const placed = new Set(bare);
+        for (const id of starts) {
+          if (placed.has(id)) continue;
+          const b = cluster(id);
+          for (const k of b.pos.keys()) placed.add(k);
+          blocks.push(b);
         }
-      });
-      zones.push({
-        id: region.id,
-        label: region.label,
-        x,
-        y,
-        width: p.width,
-        height: (p.lines.length - 1) * REGION_PITCH + NODE_HEIGHT,
-        entry: p.lines[0]![0]!,
-      });
-      x += p.width + REGION_GUTTER;
+        // A cycle can leave a member with no reachable start; it stands alone.
+        for (const m of region.members) {
+          if (placed.has(m.id)) continue;
+          const b = cluster(m.id);
+          for (const k of b.pos.keys()) placed.add(k);
+          blocks.push(b);
+        }
+
+        // The blocks stack, one under the next, in the walk's order.
+        //
+        // Dropping them side by side the way the REGIONS drop onto the canvas
+        // was tried and measured across a real app's 51 screens, and it is a
+        // bad trade: total height 42,084px -> 39,756px (-6%), but lines running
+        // over other boxes 120 -> 134 and lines crossing each other 5 -> 8,
+        // because two clusters side by side put each one's lines through the
+        // other. Height is cheap to scroll; a crossed line is what made this
+        // picture unreadable in the first place. Regions differ — they are far
+        // enough apart that few lines run between them.
+        const pos = new Map<string, { x: number; line: number }>();
+        let width = 0;
+        let lines = 0;
+        for (const b of blocks) {
+          for (const [id, at2] of b.pos) pos.set(id, { x: at2.x, line: lines + at2.line });
+          width = Math.max(width, b.width);
+          lines += b.lines;
+        }
+        return { pos, lines, width };
+      };
+
+      const { pos, lines: line, width } = layAt(lineMax);
+      // Where the screen's own line into this region lands: the box nearest the
+      // region's top-left that the screen actually leads to. The walk's first
+      // member used to stand for the region, but clustering moves a step that
+      // fires something below the ones that fire nothing, so that box could sit
+      // lines down inside the region and the line from the start had to reach
+      // past everything above it to get there.
+      const topmost = (ids: string[]): string | null =>
+        ids
+          .filter((id) => pos.has(id))
+          .sort((a, b) => pos.get(a)!.line - pos.get(b)!.line || pos.get(a)!.x - pos.get(b)!.x)[0] ?? null;
+      const entry =
+        topmost(region.members.filter((m) => fromAnchor.has(m.id)).map((m) => m.id)) ??
+        topmost(region.members.map((m) => m.id)) ??
+        region.members[0]!.id;
+      packed.set(region.id, { pos, lines: line, width, entry });
     }
-    y += b.lines * REGION_PITCH + BAND_GAP;
-    globalLine += b.lines;
-  }
-  const height = y - REGION_PITCH - BAND_GAP + NODE_HEIGHT + PADDING;
+
+    // How wide the picture may run before a region has to go underneath.
+    let area = 0;
+    let widest = 0;
+    for (const region of regions.values()) {
+      const p = packed.get(region.id)!;
+      area += p.width * p.lines * REGION_PITCH;
+      widest = Math.max(widest, p.width);
+    }
+    const budget = bandBudget(area, widest);
+
+    // Place everything. The anchor is alone on top; each region, in the order
+    // the walk met them, goes as high as it can and then as far left as it can.
+    //
+    // Squaring the regions off into bands — a row at a time, the row as tall as
+    // its tallest member — left a screen's canvas 55% region and 45% nothing
+    // (`/home` 44%: 4,860px tall to hold 2,160px of picture), and that emptiness
+    // is what a reader scrolls through. Going highest-then-leftmost keeps the
+    // reading order (an earlier region is placed first, so it is never pushed
+    // below a later one) while a short region tucks under another short one
+    // instead of waiting for the tall one beside it.
+    const at = new Map<string, { x: number; y: number; line: number }>();
+    const zones: StepRegionZone[] = [];
+    const topY = anchorY + NODE_HEIGHT + SCREEN_LAYER_GAP + BAND_GAP;
+    /** What each stretch of the canvas is filled to, so far. */
+    const sky: { x0: number; x1: number; y: number }[] = [];
+    const floorAt = (x0: number, x1: number): number => {
+      let f = topY;
+      for (const s of sky) if (s.x1 > x0 + 1 && s.x0 < x1 - 1) f = Math.max(f, s.y);
+      return f;
+    };
+    for (const region of regions.values()) {
+      const p = packed.get(region.id)!;
+      const rh = Math.max(0, p.lines - 1) * REGION_PITCH + NODE_HEIGHT;
+      // Somewhere to start, plus the right-hand edge of everything already down.
+      const spots = [PADDING, ...sky.map((s) => s.x1 + REGION_GUTTER)]
+        .filter((x, i, all) => all.indexOf(x) === i && x + p.width <= PADDING + Math.max(budget, p.width))
+        .sort((m, n) => m - n);
+      let best = { x: PADDING, y: floorAt(PADDING, PADDING + p.width) };
+      for (const x of spots) {
+        const y = floorAt(x, x + p.width);
+        if (y < best.y - 1) best = { x, y };
+      }
+      const { x, y } = best;
+      // A cluster reads from its left edge, not from the region's centre: the
+      // indent is what says which step fired which.
+      for (const [id, at2] of p.pos) {
+        at.set(id, { x: x + at2.x, y: y + at2.line * REGION_PITCH, line: 0 });
+      }
+      zones.push({ id: region.id, label: region.label, x, y, width: p.width, height: rh, entry: p.entry });
+      // The gap under a region carries the next one's caption.
+      sky.push({ x0: x, x1: x + p.width, y: y + rh + BAND_GAP });
+    }
+    const contentWidth = Math.max(widthOf(anchor.id), ...zones.map((z) => z.x + z.width - PADDING));
+    // The layering comes from the finished geometry, not from a band counter:
+    // once regions drop independently, what a reader sees as one row IS one row.
+    for (const spot of at.values()) spot.line = Math.round((spot.y - topY) / REGION_PITCH);
+    const globalLine = Math.max(0, ...[...at.values()].map((v) => v.line)) + 1;
+    const height = Math.max(anchorY + NODE_HEIGHT, ...zones.map((z) => z.y + z.height)) + PADDING;
+    return { at, zones, contentWidth, globalLine, height, width: contentWidth + PADDING * 2 };
+  };
+
+  // Try the widths and keep the picture that comes out closest to the shape a
+  // window has. A tie keeps the narrowest, so a small picture never sprawls.
+  const tries = REGION_WIDTHS.map((w) => layoutAt(w));
+  const { at, zones, contentWidth, globalLine, height } = tries.reduce((a, b) =>
+    canvasCost(a) <= canvasCost(b) ? a : b
+  );
+
 
   // Layers count from the bottom, as the Map's do: the route of an edge and
   // which sides it uses fall out of the comparison alone.
@@ -716,6 +1032,7 @@ function packRegions(
       module: moduleOf.get(id)!,
       island: false,
       generated: false,
+      weight: 0,
       layer: layerOf(id),
       x,
       y: yy,
@@ -853,6 +1170,9 @@ export function stepEdgeVisible(
     return r.has(edge.source) || r.has(edge.target);
   }
   if (edge.thin || edge.back) return false;
+  // A hop too far to follow says itself in words on both its boxes instead
+  // ({@link StepStub}); drawing it as well is the web those words replace.
+  if (model.stubbed.has(edge.id)) return false;
   if (model.regions === null) return true;
   const from = model.nodes.get(edge.source)?.step;
   if (from?.anchor) return model.regionEntries?.has(edge.target) ?? true;

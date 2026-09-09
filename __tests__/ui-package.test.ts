@@ -674,6 +674,46 @@ describe('@colbymchenry/codegraph-ui — the seams', () => {
     expect(symbolHref('function:x')).toBe('#/s/function%3Ax');
   });
 
+  it('gives the Symbol tab an address of its own when no symbol is chosen', async () => {
+    const { parseHash } = await import('../ui/src/lib/router.svelte');
+
+    // The regression this pins: the tab used to fall back to `#/`, and `#/` is
+    // the landing page — which renders the SCREENS tab on any project that has
+    // screens. Clicking Symbol landed you on somebody else's view.
+    expect(symbolHref(null)).toBe('#/s');
+    expect(parseHash('#/').route.view).toBe('home');
+
+    const empty = parseHash(symbolHref(null)).route;
+    expect(empty.view).toBe('symbol');
+    expect(empty).toMatchObject({ view: 'symbol', id: null });
+
+    // …and a chosen symbol still round-trips, id and all.
+    const chosen = parseHash(symbolHref('function:x')).route;
+    expect(chosen).toMatchObject({ view: 'symbol', id: 'function:x' });
+  });
+
+  it('sends every nav tab to its own view', async () => {
+    const { parseHash } = await import('../ui/src/lib/router.svelte');
+    const { entryHref, screensHref, stepsHref, deadHref } = await import(
+      '../ui/src/lib/navigation'
+    );
+
+    // One href per tab in the top bar, each parsed back. A tab whose link
+    // resolves to a different tab's view is the bug above, in general form.
+    const tabs: Array<[string, string]> = [
+      ['screens', screensHref()],
+      ['steps', stepsHref()],
+      ['entry', entryHref()],
+      ['map', mapHref()],
+      ['symbol', symbolHref(null)],
+      ['flow', flowHref()],
+      ['dead', deadHref()],
+    ];
+    for (const [view, href] of tabs) {
+      expect(parseHash(href).route.view, `${href} should open the ${view} view`).toBe(view);
+    }
+  });
+
   it('the default adapter is the loopback JSON API and asks for `api/...`', async () => {
     const asked: string[] = [];
     const adapter = createHttpAdapter({

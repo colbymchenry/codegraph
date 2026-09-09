@@ -483,18 +483,26 @@ impl<'t> Walker<'t> {
                 }
             }
 
-            // Walk the initializer for calls — except the object/store shapes
-            // whose members are extracted method-by-method below.
+            // Walk the initializer for calls, ATTRIBUTED to the declared symbol
+            // (#693) — except the object/store shapes whose members are
+            // extracted method-by-method below (walking those too would
+            // double-count each member arrow's calls). Before this the walk ran
+            // with only the FILE on the stack (`const cfg = load()` recorded the
+            // file as load's caller) and object literals were skipped outright.
+            let members_extracted_separately = extract_object_methods
+                || rtk_endpoints.is_some()
+                || pinia_setup.is_some()
+                || !store_collections.is_empty();
             if let Some(v) = value {
-                let vk = v.kind();
-                if vk != "object"
-                    && vk != "object_expression"
-                    && !(extract_object_methods && vk == "call_expression")
-                    && rtk_endpoints.is_none()
-                    && pinia_setup.is_none()
-                    && store_collections.is_empty()
-                {
-                    self.visit_function_body(v);
+                if !members_extracted_separately {
+                    match var_row {
+                        Some(row) => {
+                            self.stack.push(Scope { row, kind, name: name.clone() });
+                            self.visit_function_body(v);
+                            self.stack.pop();
+                        }
+                        None => self.visit_function_body(v),
+                    }
                 }
             }
 
@@ -1122,15 +1130,10 @@ impl<'t> Walker<'t> {
 
     // --- extractCall (TS/JS generic tail) -------------------------------------------------
 
-    /// Whether a member-call receiver is a chain rooted at a host object a
-    /// TS/JS project never declares. `window` is absent on purpose:
-    /// `window.MyNs.doThing()` reaches a project symbol (#1707).
-    fn is_host_global_chain(&self, receiver: Node<'t>) -> bool {
-        const HOST_GLOBAL_ROOTS: [&str; 19] = [
-            "chrome", "browser", "document", "navigator", "performance", "console",
-            "localStorage", "sessionStorage", "indexedDB", "crypto", "globalThis",
-            "process", "Math", "JSON", "Object", "Array", "Reflect", "Promise", "Intl",
-        ];
+    /// Identifier-rooted member chains have no inferred property type (#1566),
+    /// including host API chains (#1707). Keep the existing window namespace
+    /// escape; call-result and `this` receivers are outside this guard.
+    fn is_unresolved_member_chain(&self, receiver: Node<'t>) -> bool {
         let mut cur = receiver;
         if !matches!(cur.kind(), "member_expression" | "subscript_expression") {
             return false;
@@ -1141,7 +1144,7 @@ impl<'t> Walker<'t> {
                 None => return false,
             }
         }
-        cur.kind() == "identifier" && HOST_GLOBAL_ROOTS.contains(&self.text(cur))
+        cur.kind() == "identifier" && self.text(cur) != "window"
     }
 
     pub(super) fn extract_call(&mut self, node: Node<'t>) {
@@ -1171,14 +1174,12 @@ impl<'t> Walker<'t> {
                         if is_literal_receiver(r.kind()) {
                             return;
                         }
-                        // A chain rooted at a host namespace — `chrome.storage
-                        // .local.get(k)`, `document.body.querySelector(s)` —
-                        // ends in a platform API, so the bare method name emitted
-                        // here could only exact-match an unrelated project symbol
-                        // sharing it (#1707). Emit nothing. A chain rooted at a
-                        // project value keeps the bare name. Mirrors the TS
-                        // extractor's extractCall (extraction/tree-sitter.ts).
-                        if self.is_host_global_chain(r) {
+                        // `holder.values.get()` has no inferred property type
+                        // (#1566). Dropping the receiver or merely preserving it
+                        // would allow unrelated same-name method guesses. Emit
+                        // nothing, as for host chains (#1707); argument calls are
+                        // visited independently. Mirrors extractCall in TS.
+                        if self.is_unresolved_member_chain(r) {
                             return;
                         }
                     }
@@ -1192,6 +1193,11 @@ impl<'t> Walker<'t> {
                         } else {
                             callee_name = method_name.to_string();
                         }
+                    } else if let Some(field) = receiver.and_then(|r| self.this_field_of(r)) {
+                        // `this.<field>.<method>()` — keep the field so the
+                        // resolver can read its declared type (#1496). Mirrors
+                        // TreeSitterExtractor.extractCall.
+                        callee_name = format!("this.{field}.{method_name}");
                     } else if let Some(r) = receiver.filter(|r| r.kind() == "call_expression") {
                         // Call receiver — `make().run()` (#1683): keep the inner
                         // callee as `<inner>().<method>`, or emit nothing when it
@@ -1221,6 +1227,19 @@ impl<'t> Walker<'t> {
     }
 
     // --- extractInstantiation -----------------------------------------------------------
+
+    /// `this.<field>` as a member_expression receiver → Some(field) (#1496).
+    fn this_field_of(&self, receiver: Node<'t>) -> Option<String> {
+        if receiver.kind() != "member_expression" {
+            return None;
+        }
+        let object = receiver.child_by_field_name("object")?;
+        let property = receiver.child_by_field_name("property")?;
+        if object.kind() != "this" || property.kind() != "property_identifier" {
+            return None;
+        }
+        Some(self.text(property).to_string())
+    }
 
     /// The callee of a call-expression receiver when it is a plain identifier
     /// or member chain (`make`, `d.setdefault`), whitespace stripped (#1683).
