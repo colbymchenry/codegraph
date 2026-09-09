@@ -146,6 +146,21 @@ export interface ResolutionContext {
    */
   getSupertypes?(typeName: string, language: Language): string[];
   /**
+   * Direct supertypes of ONE class node, by simple name — the `extends` edges
+   * out of that exact node rather than every node sharing its name.
+   *
+   * `getSupertypes` keys on a NAME, so it unions the bases of every same-named
+   * class and a class that inherits nothing appears to inherit its namesake's
+   * base. The only defence available was to refuse whenever the name was not
+   * globally unique, which threw away resolution the caller had already pinned
+   * to a single node and cost every inherited edge in any repo with a `Client`
+   * in both `app/` and `tests/`. Ask about the node instead. Like
+   * `getSupertypes` this reads resolved edges, so it is EMPTY during the first
+   * pass and populated for the conformance pass. Optional so external/test
+   * contexts compile without it.
+   */
+  getSupertypesOfNode?(nodeId: string, language: Language): string[];
+  /**
    * Look up a node by its id. Lets matchers derive the FROM-symbol's
    * enclosing-class scope (Swift implicit-self method scoping, `this.X`
    * member resolution). Optional so external/test contexts compile
@@ -154,6 +169,15 @@ export interface ResolutionContext {
   getNodeById?(id: string): Node | null;
   /** Get cached import mappings for a file */
   getImportMappings(filePath: string, language: Language): ImportMapping[];
+  /**
+   * The project file an import specifier names, or null when it resolves
+   * outside the project (a stdlib or third-party module) — real module
+   * resolution, including relative dot counts, packages and `__init__.py`.
+   *
+   * Optional so minimal test contexts compile; a caller without it must treat
+   * the answer as unknown and produce no edge rather than guess.
+   */
+  resolveModulePath?(specifier: string, fromFile: string, language: Language): string | null;
   /**
    * Project import-path aliases (tsconfig/jsconfig `paths`). Returns
    * `null` when the project doesn't define any. Cached per resolver

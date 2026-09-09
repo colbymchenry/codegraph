@@ -46,6 +46,7 @@ import {
   ReferenceResolver,
   createResolver,
   ResolutionResult,
+  warmResolverGrammars,
 } from './resolution';
 import { GraphTraverser, GraphQueryManager } from './graph';
 import { ContextBuilder, createContextBuilder } from './context';
@@ -888,6 +889,12 @@ export class CodeGraph {
                 current: 0,
                 total: retryable.length,
               });
+              // Same warm as the batched path. These are refs in files the
+              // sync did NOT change, so the orchestrator loaded grammars only
+              // for the CHANGED files' languages: a TypeScript edit that makes
+              // parked Python refs retryable would re-resolve them with no
+              // Python parser, and their attribute edges would go missing.
+              await warmResolverGrammars(this.queries);
               await this.resolver.resolveAndPersistListYielding(retryable);
               options.onProgress?.({
                 phase: 'resolving',
@@ -1260,6 +1267,13 @@ export class CodeGraph {
    * - Framework-specific patterns (React, Express, Laravel)
    * - Import-based resolution
    * - Name-based symbol matching
+   *
+   *
+   * NOTE: this cannot warm the grammars the resolver reads member types from
+   * (loading one is async), so a python attribute call like
+   * `self._capture.stop()` resolves here only if something else already loaded
+   * the grammar in this process. `resolveReferencesBatched` warms them and is
+   * what `index` and `sync` use; prefer it when the graph must be complete.
    */
   resolveReferences(onProgress?: (current: number, total: number) => void): ResolutionResult {
     // Get all unresolved references from the database
@@ -1281,6 +1295,11 @@ export class CodeGraph {
     // whole phase's write volume (22GB on a 4.6GB DB at kernel scale).
     backpressure?: () => Promise<void> | null
   ): Promise<ResolutionResult> {
+    // The resolver reads some languages' member types off the parse tree, and
+    // it runs HERE — on the main thread, where a worker-pool index never loads
+    // a grammar. Without this the reader finds no parser and silently returns
+    // nothing, so `index` and `sync` produced different graphs.
+    await warmResolverGrammars(this.queries);
     return this.resolver.resolveAndPersistBatched(onProgress, undefined, onSynthesisProgress, {
       dbPath: this.db.getPath(),
       // Bulk-edge-load hooks: on big runs the resolver drops the non-unique

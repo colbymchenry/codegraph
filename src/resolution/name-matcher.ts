@@ -7,6 +7,7 @@
 import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, SUPERTYPE_TARGET_KINDS, isInheritanceRef, isImportableKind } from './types';
+import { memberTypesForSourceSync } from '../graph/branch-guards';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_BUILT_INS } from './js-builtins';
 
@@ -2259,6 +2260,39 @@ export function matchMethodCall(
     return matchTsThisFieldCall(objectOrClass!.slice('this.'.length), methodName!, ref, context);
   }
 
+  // Python call through an attribute chain — `self.data.append(x)`,
+  // `cfg.client.get(url)` — emitted as `self.data.append` since #66 kept the
+  // receiver's text instead of collapsing it to a bare method name. EXCLUSIVE
+  // for the same reason as Go and Rust above: the inference block ran already
+  // and `resolveMethodOnType` validated whatever it found, so everything past
+  // this point is the bare-name fallback. That fallback is what bound
+  // `self.data.append(1)` to an unrelated class's `append` — the receiver is a
+  // plain list, and nothing about the call says so.
+  //
+  // This DOES cost some recall, and the cost is measured rather than waved at.
+  // Indexing the tracked `.py` of four real projects, three were unchanged
+  // (278 / 643 / 301 call edges) and a 249-file one went 2605 -> 2564: of the 41
+  // edges dropped, 38 were fabrications (21 x a dict `.update` bound to a
+  // service's `update`; 16 x application code bound to a `get` defined in a TEST
+  // file; `self._model.transcribe` on an external Whisper model bound to the
+  // file's own `transcribe`) and 3 were genuine `self._capture.stop()` hops onto
+  // the class the constructor assigns. Most of those 3 come back through
+  // `matchPythonSelfAttrCall` below, which reads the attribute's declared type
+  // off the AST — a first attempt that scanned the class's SOURCE LINES instead
+  // took types out of docstrings and nested classes and turned a correct edge
+  // into a wrong one, which is why it reads the tree. What the tree cannot type
+  // — `self.x = other.thing()`, an attribute declared on a base class, an
+  // external object — stays a silent miss, the trade this file makes
+  // everywhere else.
+  //
+  // A single-segment receiver (`obj.method`) is untouched — it still reaches the
+  // strategies below, where a receiver/name overlap is real evidence.
+  if (ref.language === 'python' && dotMatch && objectOrClass!.includes('.')) {
+    return objectOrClass!.startsWith('self.')
+      ? matchPythonSelfAttrCall(objectOrClass!.slice('self.'.length), methodName!, ref, context)
+      : null;
+  }
+
   // Java/Kotlin: receiver may be a field whose name doesn't match the type by
   // Java naming convention (`userbo` → class `UserBO`, abbreviated). Look up
   // the field in the enclosing class to get its declared type, then resolve
@@ -2582,6 +2616,492 @@ export function rustFieldTypeName(raw: string): string | null {
   if (RUST_NON_PROJECT_FIELD_TYPES.has(seg)) return null;
   if (/^[A-Z]$/.test(seg)) return null; // bare single-letter generic parameter
   return seg;
+}
+
+/** Python names whose methods are the runtime's, never a project symbol's. */
+const PYTHON_BUILTIN_TYPES: ReadonlySet<string> = new Set([
+  'list', 'dict', 'set', 'frozenset', 'tuple', 'str', 'bytes', 'bytearray',
+  'int', 'float', 'complex', 'bool', 'object', 'type', 'range', 'slice',
+  'Any', 'None', 'NoneType',
+]);
+
+/**
+ * The project type a python annotation names, or '' when it names none.
+ *
+ * `Optional[T]` / `T | None` / `Union[T, None]` are the same declaration as `T`
+ * — python's way of saying "assigned later". Anything still generic after that
+ * (`list[int]`, `Dict[str, Foo]`) is a container whose methods are the
+ * runtime's, and a DOTTED type (`requests.Session`) is refused outright: the
+ * graph names a class by its last segment, so accepting it would strip the
+ * package and bind an external object to a same-named project class — the
+ * fabrication this whole path exists to stop. Go's field-chain matcher refuses
+ * a package-qualified field type for the same reason; this is the stricter form
+ * of that rule, and it costs only the unusual `models.Session()` spelling.
+ */
+function pythonAnnotationType(raw: string): string {
+  let t = raw.trim();
+  for (let i = 0; i < 4 && t; i++) {
+    const opt = t.match(/^(?:typing\.)?Optional\s*\[\s*([^\]]+?)\s*\]$/)
+      ?? t.match(/^(?:typing\.)?Union\s*\[\s*([^,\]]+?)\s*,\s*None\s*\]$/);
+    if (opt) { t = opt[1]!.trim(); continue; }
+    const bar = t.match(/^(.+?)\s*\|\s*None$/);
+    if (bar) { t = bar[1]!.trim(); continue; }
+    break;
+  }
+  t = t.replace(/^['"]|['"]$/g, '').trim(); // a forward reference: `"Client"`
+  if (!t || t.includes('[') || t.includes('.') || !/^[A-Za-z_]\w*$/.test(t)) return '';
+  if (PYTHON_BUILTIN_TYPES.has(t)) return '';
+  return t;
+}
+
+/**
+ * The project file a python import specifier names, or null.
+ *
+ * `resolveModulePath` (the resolver's own) answers a single-segment module, but
+ * not a dotted package path — `from app.real import Client` comes back null —
+ * so a dotted specifier is turned into a path here and CHECKED AGAINST THE
+ * INDEX rather than pattern-matched. That distinction is the point: the version
+ * this replaces compared candidate class paths with `endsWith`, which matched
+ * `examples/services/client.py` for `from services.client import …` and then
+ * took whichever sorted first.
+ *
+ * A relative specifier's LEADING DOT COUNT is significant: one dot is the
+ * importing file's own package, each extra dot climbs one more. Dropping it —
+ * `replace(/^\.+/, '')` — made `from ..core import X` look in the wrong package.
+ */
+/**
+ * Per-context basename -> file-paths index for the python module suffix
+ * fallback, and per-context memo for `livePythonImportSources`.
+ *
+ * Both follow `luaFileBasenameIndexes` (import-resolver.ts), which exists
+ * because of this exact mistake: `getAllFiles()` is an uncached
+ * `SELECT path FROM files` and scanning it per ref goes quadratic. The suffix
+ * fallback reintroduced it, and worse than the lua case did — the imports that
+ * reach it are mostly stdlib and third-party, which match NOTHING, so the early
+ * `found.length > 1` exit never fires and every one of them pays the full scan
+ * twice (the resolver retries in a second pass). Measured at roughly 2x total
+ * index time on a 6.6k-file python repo, ~8M string comparisons.
+ *
+ * Buckets keep `getAllFiles()` order, so the candidate list filters to exactly
+ * the array the full scan produced: identical matches, identical winner.
+ */
+const pythonFileBasenameIndexes = new WeakMap<ResolutionContext, Map<string, string[]>>();
+
+function pythonBasenameIndex(context: ResolutionContext): Map<string, string[]> {
+  let index = pythonFileBasenameIndexes.get(context);
+  if (!index) {
+    index = new Map();
+    for (const f of context.getAllFiles?.() ?? []) {
+      const fp = f.replace(/\\/g, '/');
+      const base = fp.split('/').pop() ?? '';
+      const paths = index.get(base);
+      if (paths) paths.push(fp);
+      else index.set(base, [fp]);
+    }
+    pythonFileBasenameIndexes.set(context, index);
+  }
+  return index;
+}
+
+const pythonLiveSourceMemo = new WeakMap<ResolutionContext, Map<string, Set<string> | null>>();
+
+/**
+ * Top-level stdlib module names. The suffix fallback below asks "does any
+ * indexed path END this way", which is not a python import rule — and the
+ * imports that reach it are overwhelmingly NOT project modules: on one real
+ * corpus 81 of 172 absolute import sources were stdlib. `from logging import
+ * Logger` would then bind to a project's own `app/utils/logging.py`, and the
+ * edge is indistinguishable from a statically-proven one. A module python
+ * itself provides is never the project file that happens to share its name.
+ */
+const PYTHON_STDLIB_TOP = new Set([
+  'abc','argparse','array','ast','asyncio','base64','bisect','builtins','bz2','calendar','cmath',
+  'cmd','codecs','collections','colorsys','concurrent','configparser','contextlib','contextvars',
+  'copy','copyreg','csv','ctypes','dataclasses','datetime','decimal','difflib','dis','doctest',
+  'email','encodings','enum','errno','faulthandler','fcntl','filecmp','fileinput','fnmatch',
+  'fractions','ftplib','functools','gc','getopt','getpass','gettext','glob','graphlib','gzip',
+  'hashlib','heapq','hmac','html','http','imaplib','importlib','inspect','io','ipaddress',
+  'itertools','json','keyword','linecache','locale','logging','lzma','mailbox','marshal','math',
+  'mimetypes','mmap','multiprocessing','netrc','numbers','operator','os','pathlib','pdb','pickle',
+  'pickletools','pkgutil','platform','plistlib','poplib','posixpath','pprint','profile','pstats',
+  'pty','pwd','py_compile','pyclbr','queue','quopri','random','re','readline','reprlib','resource',
+  'runpy','sched','secrets','select','selectors','shelve','shlex','shutil','signal','site','smtplib',
+  'socket','socketserver','sqlite3','ssl','stat','statistics','string','stringprep','struct',
+  'subprocess','symtable','sys','sysconfig','syslog','tarfile','tempfile','termios','textwrap',
+  'threading','time','timeit','token','tokenize','tomllib','trace','traceback','tracemalloc','tty',
+  'types','typing','unicodedata','unittest','urllib','uuid','venv','warnings','wave','weakref',
+  'webbrowser','wsgiref','xml','xmlrpc','zipapp','zipfile','zipimport','zlib','zoneinfo',
+]);
+
+/**
+ * Is `anchor` a directory python would import `rest` FROM — i.e. a source root
+ * with a real package chain under it?
+ *
+ * Two conditions, and both are the actual import rule rather than a heuristic:
+ *
+ * - **The anchor is not itself inside a package.** Python puts the top-level
+ *   package DIRECTLY on `sys.path`, so a directory carrying its own
+ *   `__init__.py` is a package interior, never a root. This is what rejects
+ *   `app/utils/logging.py` being claimed for `import logging`: `app/utils` is
+ *   part of `app`, so nothing imports `logging` from there.
+ * - **Every intermediate directory of `rest` is a package.** `config.settings`
+ *   requires `config/__init__.py`; a bare `deploy/config/settings.py` in a
+ *   deployment tree is not importable as `config.settings` and must not be
+ *   claimed as it.
+ *
+ * Uniqueness was the only test before, and uniqueness is not evidence — the
+ * same mistake this file's header records for `examples/services/client.py`,
+ * one layer out.
+ */
+function isPythonPackageRoot(
+  anchor: string,
+  rest: string,
+  context: ResolutionContext,
+): boolean {
+  const root = anchor.replace(/\/+$/, '');
+  if (root && context.fileExists(`${root}/__init__.py`)) return false;
+  const parts = rest.split('/');
+  let dir = root;
+  // The last segment is the module (or the package whose `__init__` matched);
+  // every segment BEFORE it must be an importable package.
+  for (let i = 0; i < parts.length - 1; i++) {
+    dir = dir ? `${dir}/${parts[i]}` : parts[i]!;
+    if (!context.fileExists(`${dir}/__init__.py`)) return false;
+  }
+  return true;
+}
+
+function pythonModuleFile(
+  source: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  const direct = context.resolveModulePath?.(source, ref.filePath, ref.language);
+  if (direct) return direct.replace(/\\/g, '/');
+
+  const here = ref.filePath.replace(/\\/g, '/');
+  const dots = /^\.+/.exec(source)?.[0].length ?? 0;
+  const rest = source.slice(dots).replace(/\./g, '/');
+  let base: string;
+  if (dots > 0) {
+    // `.` = this file's package; each further dot climbs one.
+    const parts = here.split('/');
+    parts.pop(); // the file itself
+    for (let i = 1; i < dots; i++) {
+      if (parts.length === 0) return null; // climbed past the project root
+      parts.pop();
+    }
+    base = parts.join('/');
+  } else {
+    base = ''; // absolute: from the project root
+  }
+  const stem = base ? (rest ? `${base}/${rest}` : base) : rest;
+  if (!stem) return null;
+  for (const candidate of [`${stem}.py`, `${stem}/__init__.py`, `${stem}.pyi`]) {
+    if (context.fileExists(candidate)) return candidate;
+  }
+  // A package root that is not the repo root — `src/pkg/core.py` imported as
+  // `pkg.core`, the packaged-project default, plus `backend/` and monorepo
+  // subdirectories. Anchoring only at the repo root made every attribute edge
+  // in such a layout disappear.
+  //
+  // This is a SUFFIX match, which is what the previous version got wrong — but
+  // wrong because it tiebroke among survivors, not because it looked at
+  // suffixes. Exactly one survivor or nothing: `services/client.py` and
+  // `examples/services/client.py` both match `services/client` and so neither
+  // is the answer.
+  //
+  // Uniqueness alone was still not enough, because a suffix match is not an
+  // import rule. Two further gates, both of them python's ACTUAL rule:
+  // `PYTHON_STDLIB_TOP` (a module python provides is never the project file
+  // that shares its name) and `isPythonPackageRoot` (the match must sit under a
+  // real source root with a real package chain). Without them a unique match
+  // was still routinely the wrong file — `import logging` claiming
+  // `app/utils/logging.py`, `from redis.client import Redis` claiming a test
+  // double under `tests/fixtures/`.
+  if (dots === 0 && rest && !PYTHON_STDLIB_TOP.has(rest.split('/')[0]!)) {
+    const wanted = [`/${rest}.py`, `/${rest}/__init__.py`, `/${rest}.pyi`];
+    const last = rest.split('/').pop()!;
+    const index = pythonBasenameIndex(context);
+    const found: string[] = [];
+    for (const base of [`${last}.py`, '__init__.py', `${last}.pyi`]) {
+      for (const fp of index.get(base) ?? []) {
+        const w = wanted.find((cand) => fp.endsWith(cand));
+        if (!w || !isPythonPackageRoot(fp.slice(0, fp.length - w.length), rest, context)) continue;
+        if (found.includes(fp)) continue;
+        found.push(fp);
+        if (found.length > 1) return null;
+      }
+    }
+    if (found.length === 1) return found[0]!;
+  }
+  return null;
+}
+
+/**
+ * The module sources named by imports that are actually CODE in `filePath` —
+ * or null if the file could not be read.
+ *
+ * `getImportMappings` is a regex over raw text with no notion of comments or
+ * strings, so `# from legacy import Real` and a docstring's usage example both
+ * produce mappings indistinguishable from a real import. The agreement rule in
+ * `pythonTypeClass` could only refuse BOTH, which turned a stale comment into a
+ * silent miss — and one level down, at the `__init__.py` re-export hop, there
+ * is no agreement rule at all, so a commented-out line could DECIDE an edge.
+ *
+ * So strip the text that is not code with the SHARED per-language stripper
+ * (`strip-comments.ts`, the one the framework route extractors use), then ask
+ * the extractor's OWN regexes what is left. Running the same patterns is the
+ * point: a filter stricter than the thing it filters silently drops legitimate
+ * bindings. A hand-written line-anchored version did exactly that — `import os;
+ * from kinds import Real` resolved before it and stopped resolving after.
+ *
+ * Returning null (unreadable) is NOT the same as returning an empty set. Empty
+ * means "read it, and every import-looking line was comment or string", which
+ * is precisely when the bindings must all be refused; conflating the two let a
+ * file whose ONLY import was commented out resolve through it.
+ */
+function livePythonImportSources(
+  filePath: string,
+  context: ResolutionContext,
+): Set<string> | null {
+  let memo = pythonLiveSourceMemo.get(context);
+  if (!memo) {
+    memo = new Map();
+    pythonLiveSourceMemo.set(context, memo);
+  }
+  // `readFile` is LRU-cached, but the strip-and-scan over the file is not, and
+  // it re-ran for every `self.attr.method()` ref in the file — O(refs x file
+  // length), the shape types.ts records as ~20% of index CPU on a java-heavy
+  // repo once before. Memoize per file, per resolution context.
+  const cached = memo.get(filePath);
+  if (cached !== undefined) return cached;
+
+  const source = context.readFile(filePath);
+  if (source === null || source === undefined) {
+    memo.set(filePath, null);
+    return null;
+  }
+
+  // The shared per-language stripper, composed exactly as the TS receiver-type
+  // reader composes it above: `stripCommentsForRegex` blanks comments and
+  // triple-quoted docstrings, `blankStringContents` blanks what is inside a
+  // single-line string. Both BLANK rather than delete, so offsets — and the
+  // line anchoring the `^import` pattern relies on — survive.
+  //
+  // This replaces a hand-rolled line scanner. Sharing the stripper is the
+  // point: a bespoke one drifts from the extractor it is meant to mirror, and
+  // a filter stricter than the thing it filters silently drops legitimate
+  // bindings — an earlier line-anchored version did exactly that, and
+  // `import os; from kinds import Real` stopped resolving.
+  const stripped = blankStringContents(stripCommentsForRegex(source, 'python'));
+  const sources = new Set<string>();
+  // The two patterns `extractPythonImports` uses, verbatim — including the
+  // column-anchoring difference between them.
+  for (const m of stripped.matchAll(/from\s+([\w.]+)\s+import\s+([^#\n]+)/g)) sources.add(m[1]!);
+  for (const m of stripped.matchAll(/^import\s+([\w.]+)(?:\s+as\s+(\w+))?/gm)) sources.add(m[1]!);
+  memo.set(filePath, sources);
+  return sources;
+}
+
+/**
+ * The project class a python type name refers to AT THIS CALL SITE, or null.
+ *
+ * Everything here is a refusal to guess, and each refusal is a defect this
+ * function shipped with once:
+ *
+ * - **The mapping itself is not trustworthy.** `getImportMappings` is a REGEX
+ *   over raw text, so `from decoy import Real` written inside a DOCSTRING
+ *   produces a mapping indistinguishable from the real import, and taking the
+ *   first match bound the call to `decoy`. The AST reader refuses a type named
+ *   in a docstring; handing the MODULE question back to text re-opened the same
+ *   hole one layer down. So: every mapping that binds the name must agree, or
+ *   there is no answer.
+ * - **The module path is not ours to compute.** Hand-rolled path arithmetic
+ *   dropped the dot count on `from ..core import X` (resolving it against the
+ *   importing file's own directory) and matched any file in a package for
+ *   `from pkg import X`. `resolveModulePath` is the resolver's real one:
+ *   relative levels, packages, `__init__.py`.
+ * - **Ambiguity is not a tiebreak.** Returning the first survivor meant the
+ *   alphabetically-first path won — `examples/services/client.py` over
+ *   `services/client.py`. Two candidates means no evidence, not a coin flip.
+ *
+ * A name the file does not import must be declared in the file itself.
+ */
+function pythonTypeClass(
+  typeName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): Node | null {
+  const here = ref.filePath.replace(/\\/g, '/');
+  const liveSources = livePythonImportSources(ref.filePath, context);
+  const bindings = context
+    .getImportMappings(ref.filePath, ref.language)
+    .filter((i) => i.localName === typeName && (liveSources === null || liveSources.has(i.source)));
+
+  const classesNamed = (name: string) =>
+    context.getNodesByName(name).filter((n) => n.kind === 'class' && n.language === 'python');
+
+  if (bindings.length === 0) {
+    // Not imported: this file's own class, or nothing.
+    return classesNamed(typeName).find((c) => c.filePath.replace(/\\/g, '/') === here) ?? null;
+  }
+  // A docstring's import and a real one both land here. If they name different
+  // things there is no way to tell which is code.
+  if (new Set(bindings.map((i) => `${i.source}\u0000${i.exportedName}`)).size !== 1) return null;
+  const imp = bindings[0]!;
+
+  const file = pythonModuleFile(imp.source, ref, context);
+  if (!file) return null; // stdlib, third-party, or unresolvable -> silent miss
+  const norm = file;
+
+  // `from kinds import Real as R` — the class is declared under its EXPORTED
+  // name, not the local one.
+  const wantName = imp.exportedName === '*' ? typeName : imp.exportedName;
+  const inFile = (file: string, name: string = wantName) =>
+    classesNamed(name).filter((c) => c.filePath.replace(/\\/g, '/') === file);
+  let hit = inFile(norm);
+  if (hit.length === 0 && /\/__init__\.pyi?$/.test(norm)) {
+    // `from pkg import Client` where `pkg/__init__.py` re-exports it — the
+    // dominant python package idiom. One hop only, through the package's OWN
+    // import of that name, so the answer is still a module the source names.
+    //
+    // Every rule the top level applies applies HERE TOO. Leaving them off was
+    // this feature's recurring defect — a rule enforced at one site and not the
+    // sibling one level down — and here it was the worse half: the top level
+    // has an agreement rule that absorbs a bogus binding by refusing both, the
+    // hop has nothing, so a commented-out or docstring import was the SOLE
+    // binding and silently decided the edge.
+    const liveThere = livePythonImportSources(norm, context);
+    const reexport = context
+      .getImportMappings(norm, ref.language)
+      .filter((i) => i.localName === wantName && (liveThere === null || liveThere.has(i.source)));
+    // Keyed on source AND exported name, matching the top level: the weaker
+    // source-only key called two different re-exports of one name unambiguous.
+    if (new Set(reexport.map((i) => i.source + ' ' + i.exportedName)).size === 1) {
+      const hop = reexport[0]!;
+      const via = pythonModuleFile(hop.source, { ...ref, filePath: norm }, context);
+      // `from .core import Legacy as Client` — declared under the EXPORTED name
+      // in the module the package names, same as the top level's `wantName`.
+      if (via) hit = inFile(via, hop.exportedName === '*' ? wantName : hop.exportedName);
+    }
+  }
+  return hit.length === 1 ? hit[0]! : null;
+}
+
+/**
+ * Python call through an attribute of the enclosing class — `self.capture.stop()`,
+ * emitted as `self.capture.stop` since #66 kept the receiver's text.
+ *
+ * Python declares no field types, so the evidence is the class body, read from
+ * the AST (`memberTypesForSourceSync`): a class-level annotation, a typed
+ * `__init__` parameter bound to the attribute, `self.x: T`, or `self.x = T()`.
+ * The type is then pinned to a specific project class through the file's own
+ * imports, and the method validated on it, so a mis-read produces no edge
+ * rather than a wrong one.
+ *
+ * Reading the TREE rather than the class's source lines is what makes this
+ * safe, and it was learned the hard way: a regex version of this helper took a
+ * type out of a DOCSTRING and turned a correct edge into a wrong one, read a
+ * nested class's `__init__` as the outer class's, and matched a same-named class
+ * in another file. The tree answers the first two by construction — a docstring
+ * is a `string` node and never an assignment, and a nested class is not
+ * descended into — and `pythonTypeClass` answers the third.
+ */
+function matchPythonSelfAttrCall(
+  attr: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  // Single hop only — `self.a.b.m()` names a type nothing here can read.
+  if (!attr || attr.includes('.')) return null;
+  const source = context.readFile(ref.filePath);
+  if (!source) return null;
+  const declared = memberTypesForSourceSync(ref.filePath, source, 'python', ref.line).get(attr);
+  if (!declared) return null;
+  const typeName = pythonAnnotationType(declared);
+  if (!typeName) return null;
+  const cls = pythonTypeClass(typeName, ref, context);
+  if (!cls) return null;
+
+  // The method as declared on THAT class, in THAT file. `cls.name`, not the
+  // local one: `from kinds import Real as R` declares the class as `Real`.
+  const want = `${cls.name}::${methodName}`;
+  const own = context
+    .getNodesByName(methodName)
+    .find(
+      (m) =>
+        m.kind === 'method' &&
+        m.language === 'python' &&
+        m.filePath === cls.filePath &&
+        (m.qualifiedName === want || m.qualifiedName.endsWith(`::${want}`)),
+    );
+  if (own) {
+    return { original: ref, targetNodeId: own.id, confidence: 0.85, resolvedBy: 'instance-method' };
+  }
+  // Not declared there — it may be inherited. `getSupertypes` reads the
+  // `extends` edges, which DO NOT EXIST during the first pass; that is why this
+  // shape is parked for the conformance pass (PY_SELF_ATTR_SHAPE in
+  // ../resolution), exactly as PHP's `this->prop.method` is. Before that fix the
+  // code claimed to hand off to a supertype walk that could never find anything,
+  // so `class Real(Base)` — a service subclass, the most ordinary shape there is
+  // — resolved to nothing.
+  //
+  // Walked here rather than through `resolveMethodOnType` because the class is
+  // already pinned to one file: the shared helper searches every class of that
+  // NAME, which is the ambiguity this function exists to refuse.
+  // `getSupertypes` matches by NAME, so it unions the `extends` targets of every
+  // python class called `cls.name` — a class that inherits nothing would
+  // inherit its namesake's base. That is the same "two classes of a name is no
+  // evidence" rule this function enforces above, dropped one level down.
+  //
+  // The first fix for that refused the walk whenever `cls.name` was not unique
+  // project-wide, which answers the right question with the wrong evidence:
+  // `cls` is ALREADY one node in one file, pinned by `pythonTypeClass`, and a
+  // namesake in a test tree says nothing about it. It cost every inherited edge
+  // for any `Client` / `Config` / `Service` that appears twice — a recall cliff
+  // in exactly the repos this feature exists for. Ask the NODE for its own
+  // supertypes instead; the ambiguity that remains is resolving a supertype
+  // NAME to a class, and that is still refused below.
+  const seen = new Set<string>([cls.id]);
+  let frontier: Node[] = [cls];
+  for (let depth = 0; depth < 4 && frontier.length > 0; depth++) {
+    const next: Node[] = [];
+    for (const sub of frontier) {
+      for (const superName of context.getSupertypesOfNode?.(sub.id, ref.language) ?? []) {
+        const supers = context
+          .getNodesByName(superName)
+          .filter((n) => n.kind === 'class' && n.language === 'python');
+        // Two classes of that name is no evidence, same rule as above.
+        if (supers.length !== 1) continue;
+        const superCls = supers[0]!;
+        if (seen.has(superCls.id)) continue;
+        seen.add(superCls.id);
+        const inherited = context
+          .getNodesByName(methodName)
+          .find(
+            (m) =>
+              m.kind === 'method' &&
+              m.language === 'python' &&
+              m.filePath === superCls.filePath &&
+              (m.qualifiedName === `${superName}::${methodName}` ||
+                m.qualifiedName.endsWith(`::${superName}::${methodName}`)),
+          );
+        if (inherited) {
+          return {
+            original: ref,
+            targetNodeId: inherited.id,
+            confidence: 0.8,
+            resolvedBy: 'instance-method',
+          };
+        }
+        next.push(superCls);
+      }
+    }
+    frontier = next;
+  }
+  return null;
 }
 
 /**
