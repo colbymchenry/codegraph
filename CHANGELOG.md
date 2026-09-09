@@ -233,6 +233,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Symbols, tests and the viewer
 
+- Erlang selective imports now resolve a bare call to the exact exported module, function, and arity, while unqualified calls stay within their own module instead of binding to an unrelated same-named project function. Re-index Erlang projects after upgrading. (#1610) (Erlang)
 - Kotlin functions and methods now carry their signature — `(params): ReturnType` — in `codegraph_explore`, `node` and the viewer, instead of no signature at all. Re-index Kotlin projects after upgrading. (#1495)
 - `codegraph affected` now finds Go, Python and JVM test files that previously went unreported, while preserving custom `--filter` behavior (thanks @danusha2345; #1507, #1688).
 
