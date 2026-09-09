@@ -1,5 +1,10 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getNodeText, getChildByField, getPrecedingDocstring } from '../tree-sitter-helpers';
+import {
+  getNodeText,
+  getChildByField,
+  getPrecedingDocstring,
+  namedArgCount,
+} from '../tree-sitter-helpers';
 import type { LanguageExtractor, ExtractorContext } from '../tree-sitter-types';
 
 // Node names follow the vendored WhatsApp/tree-sitter-erlang grammar (0.19,
@@ -95,10 +100,9 @@ function moduleExports(node: SyntaxNode, source: string, filePath: string): Set<
   return result;
 }
 
-/** Argument count of a clause/sig: the `args` (expr_args) field's named-child count. */
+/** Argument count of a clause/sig: the `args` (expr_args) field's arguments. */
 function nodeArity(withArgs: SyntaxNode): number {
-  const args = getChildByField(withArgs, 'args');
-  return args ? args.namedChildCount : 0;
+  return namedArgCount(getChildByField(withArgs, 'args'));
 }
 
 /**
