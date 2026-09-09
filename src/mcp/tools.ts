@@ -2375,7 +2375,7 @@ export class ToolHandler {
 
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
-      return this.textResult(`Symbol "${symbol}" not found in the codebase`);
+      return this.textResult(`Symbol "${symbol}" not found in the codebase${allMatches.note}`);
     }
 
     const { groups, filteredOut } = this.groupDefinitions(allMatches.nodes, fileFilter);
@@ -2456,7 +2456,7 @@ export class ToolHandler {
 
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
-      return this.textResult(`Symbol "${symbol}" not found in the codebase`);
+      return this.textResult(`Symbol "${symbol}" not found in the codebase${allMatches.note}`);
     }
 
     const { groups, filteredOut } = this.groupDefinitions(allMatches.nodes, fileFilter);
@@ -2534,7 +2534,7 @@ export class ToolHandler {
 
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
-      return this.textResult(`Symbol "${symbol}" not found in the codebase`);
+      return this.textResult(`Symbol "${symbol}" not found in the codebase${allMatches.note}`);
     }
 
     const { groups, filteredOut } = this.groupDefinitions(allMatches.nodes, fileFilter);
