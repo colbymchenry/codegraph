@@ -157,6 +157,19 @@ async function loginRateLimitOk(env: Env, request: Request): Promise<boolean> {
   }
 }
 
+/** Best-effort abuse cap on the authenticated API surface, keyed by client IP. */
+async function apiRateLimitOk(env: Env, request: Request): Promise<boolean> {
+  const key = request.headers.get('cf-connecting-ip') ?? 'unknown';
+  try {
+    const { success } = await env.API_RATE_LIMITER.limit({ key });
+    return success;
+  } catch (err) {
+    // Fail open: a rate-limiter outage must not take the dashboard down.
+    console.error(JSON.stringify({ msg: 'api rate limiter unavailable', err: String(err) }));
+    return true;
+  }
+}
+
 async function handleLoginPage(env: Env, request: Request, url: URL): Promise<Response> {
   const next = safeNextPath(url.searchParams.get('next'));
   if (await hasValidSession(env, request)) return redirect(next);
@@ -259,6 +272,9 @@ export default {
       if (isApi) {
         if (!isRead) {
           return json({ error: 'method not allowed' }, { status: 405, headers: { allow: 'GET' } });
+        }
+        if (!(await apiRateLimitOk(env, request))) {
+          return json({ error: 'too many requests' }, { status: 429 });
         }
         return await apiResponse(env, url);
       }
