@@ -342,8 +342,8 @@ function stripPhp(src: string): string {
       continue;
     }
 
-    // # line comment (PHP supports both)
-    if (c === '#') {
+    // # line comment (PHP supports both; NOT #[ which is a PHP 8 attribute)
+    if (c === '#' && c2 !== '[') {
       const start = i;
       while (i < n && src[i] !== '\n') i++;
       blankRange(out, start, i, src);
