@@ -37,6 +37,10 @@ Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 [![Kiro](https://img.shields.io/badge/Kiro-supported-blueviolet.svg)](#supported-agents)
 [![GitHub Copilot](https://img.shields.io/badge/GitHub_Copilot-supported-blueviolet.svg)](#supported-agents)
 
+**English** · [简体中文](./README.zh-CN.md)
+
+<br />
+
 <br>
 
 **The CodeGraph platform is coming** — for every PR, know exactly what to test, what could break, which flows are affected, and whether business logic is compromised.
