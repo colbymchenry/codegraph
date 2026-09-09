@@ -13,6 +13,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
+import { EXTRACTION_VERSION } from '../src/extraction/extraction-version';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 const PKG_VERSION = JSON.parse(
@@ -30,6 +31,15 @@ function runStatusJson(cwd: string): Record<string, unknown> {
   // leading output by parsing the last non-empty line.
   const line = stdout.trim().split('\n').filter(Boolean).pop()!;
   return JSON.parse(line);
+}
+
+function runStatusText(cwd: string): string {
+  return execFileSync(process.execPath, [BIN, 'status'], {
+    cwd,
+    encoding: 'utf-8',
+    env: { ...process.env, CODEGRAPH_NO_DAEMON: '1', NO_COLOR: '1' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
 }
 
 describe('codegraph status --json — CI fields (#329)', () => {
@@ -85,6 +95,29 @@ describe('codegraph status --json — CI fields (#329)', () => {
     const ms = Date.parse(out.lastIndexed as string);
     expect(ms).toBeGreaterThanOrEqual(before - 1000);
     expect(ms).toBeLessThanOrEqual(after + 1000);
+  });
+
+  it('status requires a full rebuild when the extraction version is stale', async () => {
+    fs.writeFileSync(path.join(tempDir, 'a.ts'), 'export const x = 1;\n');
+    const cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.close();
+
+    // Simulate an index built by an older extraction engine. Incremental sync
+    // cannot revisit every unchanged file, so it must not be offered here.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(path.join(tempDir, '.codegraph', 'codegraph.db'));
+    db.prepare(
+      "INSERT INTO project_metadata (key, value, updated_at) VALUES ('indexed_with_extraction_version', ?, 0) " +
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+    ).run(String(EXTRACTION_VERSION - 1));
+    db.close();
+
+    const out = runStatusText(tempDir);
+    expect(out).toContain('Run "codegraph index"');
+    expect(out).toMatch(/full rebuild/i);
+    expect(out).not.toContain('codegraph sync');
   });
 });
 
