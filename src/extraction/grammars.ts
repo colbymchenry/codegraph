@@ -39,6 +39,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   lua: 'tree-sitter-lua.wasm',
   r: 'tree-sitter-r.wasm',
   luau: 'tree-sitter-luau.wasm',
+  hlsl: 'tree-sitter-hlsl.wasm',
   objc: 'tree-sitter-objc.wasm',
   cfml: 'tree-sitter-cfml.wasm',
   cfscript: 'tree-sitter-cfscript.wasm',
@@ -121,6 +122,11 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.sc': 'scala',
   '.lua': 'lua',
   '.luau': 'luau',
+  // Shader files (HLSL grammar with USF/USH/GLSL aliases)
+  '.hlsl': 'hlsl',
+  '.usf': 'hlsl',
+  '.ush': 'hlsl',
+  '.glsl': 'hlsl',
   '.m': 'objc',
   '.mm': 'objc',
   '.sol': 'solidity',
@@ -420,8 +426,15 @@ export async function loadGrammarsForLanguages(languages: Language[], wasmBytes?
   // See: https://github.com/tree-sitter/tree-sitter/issues/2338
   for (const lang of toLoad) {
     try {
-      const bytes = wasmBytes?.[lang];
-      const language = await WasmLanguage.load(bytes ?? resolveWasmPath(lang));
+      // Some grammars ship their own WASMs (not in tree-sitter-wasms, or the
+      // tree-sitter-wasms build is too old). Lua: tree-sitter-wasms ships an
+      // ABI-13 build that corrupts the shared WASM heap under web-tree-sitter
+      // 0.25 (drops nested calls/imports on every file after the first); we
+      // vendor the upstream ABI-15 wasm instead.
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'hlsl')
+        ? path.join(__dirname, 'wasm', wasmFile)
+        : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
+      const language = await WasmLanguage.load(wasmPath);
       languageCache.set(lang, language);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -692,6 +705,7 @@ export function getLanguageDisplayName(language: Language): string {
     scala: 'Scala',
     lua: 'Lua',
     luau: 'Luau',
+    hlsl: 'HLSL / Shader',
     objc: 'Objective-C',
     solidity: 'Solidity',
     nix: 'Nix',
