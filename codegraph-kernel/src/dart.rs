@@ -398,7 +398,8 @@ impl<'t> Walker<'t> {
         while let Some(parent) = p {
             if matches!(
                 parent.kind(),
-                "class_definition" | "mixin_declaration" | "extension_declaration" | "enum_declaration"
+                "class_definition" | "mixin_declaration" | "extension_declaration"
+                    | "extension_type_declaration" | "enum_declaration"
             ) {
                 return parent.child_by_field_name("name").map(|n| self.text(n));
             }
@@ -630,7 +631,13 @@ impl<'t> Walker<'t> {
                 self.extract_function(node);
                 return;
             }
-            "class_definition" | "mixin_declaration" | "extension_declaration" => {
+            // `extension_type_declaration` is Dart 3's `extension type Meters(double v)`.
+            // Mirrors dart.ts's extraClassNodeTypes: its body holds ordinary members,
+            // and a `method_signature` is only extracted when its enclosing node is
+            // class-like, so both arms must agree on this list or they disagree on
+            // every member of an extension type (#1784).
+            "class_definition" | "mixin_declaration" | "extension_declaration"
+            | "extension_type_declaration" => {
                 self.extract_class(node);
                 return;
             }
