@@ -52,6 +52,40 @@ despite where it lives) and the object-literal walker in
 
 ---
 
+## Static JavaScript HTTP declarations
+
+Added 2026-09-06 in `frameworks/http-routing.ts`: Hono, Elysia, Fastify,
+Hyper-Express, Koa router, H3, Bun, Effect v4 and option-free Vixeny builders.
+These produce method-qualified endpoint nodes, named-handler references and
+direct calls from inline handlers. They do not add Screens navigation.
+`http-routing.test.ts` covers all nine through full indexing and imported-handler
+resolution, as well as false-positive controls, prefixes and same-file mounts.
+
+Nuxt file routing in `frameworks/vue.ts` now includes root index pages, Nuxt 4
+route groups, server method suffixes, `server/routes/` and server catch-all
+segments. `nuxt-routes.test.ts` checks extraction and imported-handler resolution;
+the existing Next Pages/App Router and Vue navigation tests remain controls.
+This update does not re-verify the older coverage rows above.
+
+Untouched official source checks (routes and indexing, no application execution):
+
+| Framework | Pinned source | Scope |
+|---|---|---|
+| Hono | [examples basic](https://github.com/honojs/examples/blob/3b0b62875a0e1265763fea1c6388866d5697ef81/basic/src/index.ts) | 16 registrations, including 3 mounted paths |
+| Fastify | [winston logger](https://github.com/fastify/example/blob/d3032da0b307afa8749e967aa0dbdf239c348341/winston-logger/winston-logger.js) | `GET /hello` |
+| Elysia | [CORS example](https://github.com/elysiajs/elysia-cors/blob/58adc6030a3c790e2494e2e8bd45dd7938b9b024/example/index.ts) | `POST /` |
+| H3 | [router example](https://github.com/h3js/h3/blob/a5fdc86a6075506d71510aa5208739aa0b2bec29/examples/router.mjs) | 6 explicit methods at `/` |
+| Bun | [serve route tests](https://github.com/oven-sh/bun/blob/d316760e8cae0d69ae927898d5afc933ecf34671/test/js/bun/http/bun-serve-routes.test.ts) | Extraction of 9 declarations starting in lines 1–135 |
+| Effect v4 | [HTTP server tests](https://github.com/Effect-TS/effect-smol/blob/3a1128c7684e04d34d9f541f77adaac38a513056/packages/platform-node/test/NodeHttpServer.test.ts) | Extraction of 3 declarations starting in lines 1–90 |
+
+These are bounded fixtures, not whole-framework recall measurements. Hyper-Express,
+Koa and Vixeny have synthetic indexing tests only: the inspected official fixtures
+import relative framework source, which the package-provenance reader deliberately
+does not infer. Dynamic paths, cross-file mounts, runtime mutation and plugin
+factories remain outside coverage. Vixeny options require terminal-operation
+dataflow and are omitted. See the [route guide](../../site/src/content/docs/guides/framework-routes.md)
+for the supported declaration shapes and Nuxt configuration limits.
+
 ## What is left
 
 Ordered by cost-to-value. Each row says what is missing, not merely that
