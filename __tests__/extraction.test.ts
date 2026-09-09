@@ -8,8 +8,9 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { execFileSync } from 'child_process';
 import { CodeGraph } from '../src';
-import { extractFromSource, scanDirectory, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore } from '../src/extraction';
+import { extractFromSource, scanDirectory, scanDirectoryAsync, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore, type ScanSkipStats } from '../src/extraction';
 import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
 import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, blankCLeadingAttrMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
@@ -566,6 +567,55 @@ interface Hprops {
     expect(refs.some((r) => r.referenceName === 'IOrderField')).toBe(true);
   });
 
+  it('indexes interface members, not just the interface itself', () => {
+    // tree-sitter-typescript spells interface members `method_signature` /
+    // `property_signature`, distinct from the class-member types the extractor
+    // listed, so they were never captured (#1638). Java/C# are unaffected —
+    // their grammars reuse `method_declaration`, already in their methodTypes.
+    // The cost lands on `.d.ts` platform APIs: with no declaration node, call
+    // sites through the interface have nothing to attach an edge to.
+    const code = `
+export interface PlatformApi {
+  fetchPage(id: string): Promise<string>;
+  version: string;
+}
+`;
+    const result = extractFromSource('api.d.ts', code);
+
+    const iface = result.nodes.find((n) => n.kind === 'interface' && n.name === 'PlatformApi');
+    const method = result.nodes.find((n) => n.kind === 'method' && n.name === 'fetchPage');
+    const prop = result.nodes.find((n) => n.kind === 'property' && n.name === 'version');
+    expect(iface).toBeDefined();
+    expect(method).toBeDefined();
+    expect(prop).toBeDefined();
+
+    // Attached to the interface, not merely present. A member the graph holds
+    // but hangs off the file is not a declaration a call edge can be resolved
+    // through, which is the whole point of extracting it.
+    const contained = result.edges
+      .filter((e) => e.kind === 'contains' && e.source === iface!.id)
+      .map((e) => e.target);
+    expect(contained).toContain(method!.id);
+    expect(contained).toContain(prop!.id);
+  });
+
+  it('does not mint a top-level function from a type literal method signature', () => {
+    // The failure mode the class-like guard on `method_signature` exists for
+    // (#1638). `extractMethod` treats a method node with no class-like parent
+    // as a free function — right for `method_definition`, wrong for a bodiless
+    // signature, whose only home outside an interface is a type literal. Those
+    // members are already extracted onto the alias (#359), so without the guard
+    // the file gains a phantom `function stop` beside the real `Handle::stop`.
+    const result = extractFromSource('t.ts', `
+export type Handle = { stop(): void; label: string };
+`);
+
+    const alias = result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'Handle');
+    expect(alias).toBeDefined();
+    expect(result.nodes.find((n) => n.kind === 'method' && n.name === 'stop')).toBeDefined();
+    expect(result.nodes.filter((n) => n.kind === 'function' && n.name === 'stop')).toEqual([]);
+  });
+
   it('should extract type references from interface method signatures', () => {
     const code = `
 import type { IPage } from '../PromoterList';
@@ -745,6 +795,63 @@ export const fetchData = async () => {
   });
 });
 
+describe('Generator Function Extraction (#1741)', () => {
+  const functionNames = (file: string, code: string) =>
+    extractFromSource(file, code)
+      .nodes.filter((n) => n.kind === 'function')
+      .map((n) => n.name)
+      .sort();
+
+  it('extracts function* and async function* declarations in TypeScript', () => {
+    process.env.CODEGRAPH_KERNEL = '0';
+    const code = `
+function plain() { return 1; }
+function* gen() { yield 2; }
+async function asyncFn() { return 3; }
+async function* asyncGen() { yield 4; }
+`;
+    expect(functionNames('gens.ts', code)).toEqual(['asyncFn', 'asyncGen', 'gen', 'plain']);
+  });
+
+  it('extracts function* and async function* declarations in JavaScript', () => {
+    process.env.CODEGRAPH_KERNEL = '0';
+    const code = `
+function plain() { return 1; }
+function* gen() { yield 2; }
+async function asyncFn() { return 3; }
+async function* asyncGen() { yield 4; }
+`;
+    expect(functionNames('gens.js', code)).toEqual(['asyncFn', 'asyncGen', 'gen', 'plain']);
+  });
+
+  it('extracts const-assigned generator and async generator expressions (TS)', () => {
+    process.env.CODEGRAPH_KERNEL = '0';
+    const code = `
+const g = function* () { yield 1; };
+const ag = async function* () { yield 2; };
+export const exportedGen = function* () { yield 3; };
+`;
+    const result = extractFromSource('gen-expr.ts', code);
+    const names = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name).sort();
+    expect(names).toEqual(['ag', 'exportedGen', 'g']);
+    expect(result.nodes.find((n) => n.name === 'exportedGen')?.isExported).toBe(true);
+    expect(result.nodes.find((n) => n.name === 'g')?.isExported).toBeFalsy();
+  });
+
+  it('extracts const-assigned generator and async generator expressions (JS)', () => {
+    process.env.CODEGRAPH_KERNEL = '0';
+    const code = `
+const g = function* () { yield 1; };
+const ag = async function* () { yield 2; };
+export const exportedGen = function* () { yield 3; };
+`;
+    const result = extractFromSource('gen-expr.js', code);
+    const names = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name).sort();
+    expect(names).toEqual(['ag', 'exportedGen', 'g']);
+    expect(result.nodes.find((n) => n.name === 'exportedGen')?.isExported).toBe(true);
+  });
+});
+
 describe('Type Alias Extraction', () => {
   it('should extract exported type aliases in TypeScript', () => {
     const code = `
@@ -842,10 +949,20 @@ export type Names = ['alpha', 'beta'];
 `;
     const result = extractFromSource('noise.ts', code);
 
+    // Since #1638 the fixture's own interfaces legitimately declare `id` / `name`
+    // (`User::id`, `User::name`, `Service::name`), so membership in the name list
+    // no longer implies a leak. What #634 guards is the *source*: a node minted
+    // from a string literal in `Pick<User, 'id'>` or a tuple has no declaring
+    // interface, so exclude anything a `contains` edge ties to one.
+    const ifaceIds = new Set(result.nodes.filter((n) => n.kind === 'interface').map((n) => n.id));
+    const declaredInInterface = new Set(
+      result.edges.filter((e) => e.kind === 'contains' && ifaceIds.has(e.source)).map((e) => e.target)
+    );
     const leaked = result.nodes.filter(
       (n) =>
         (n.kind === 'method' || n.kind === 'property') &&
-        ['id', 'name', 'foo', 'bar', 'alpha', 'beta'].includes(n.name)
+        ['id', 'name', 'foo', 'bar', 'alpha', 'beta'].includes(n.name) &&
+        !declaredInInterface.has(n.id)
     );
     expect(leaked).toEqual([]);
   });
@@ -978,6 +1095,42 @@ const token = getTokenMp();
     );
     expect(call).toBeDefined();
   });
+
+  describe('initializer walk is scoped to the declared symbol (#693 for TS/JS)', () => {
+    const code = `
+const eager = load();
+const obj = { handler: () => target(), plain: target() };
+const list = [() => target()];
+export const exported = { handler: () => target() };
+`;
+    const callersOf = (name: string) => {
+      const result = extractFromSource('app.ts', code);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      return result.unresolvedReferences
+        .filter((u) => u.referenceKind === 'calls' && u.referenceName === name)
+        .map((u) => byId.get(u.fromNodeId))
+        .map((n) => (n ? `${n.kind}:${n.name}` : '?'))
+        .sort();
+    };
+
+    it("a plain call initializer names the CONSTANT as caller, not the file", () => {
+      // The walk ran with only the file on the stack, so `load` recorded the
+      // file as its caller — useless for callers/impact.
+      expect(callersOf('load')).toEqual(['constant:eager']);
+    });
+
+    it('a non-exported object literal contributes calls (it was skipped outright)', () => {
+      // `exported`'s members are minted as their own function nodes, so its
+      // arrow's call comes from `handler`; the non-exported ones attribute to
+      // the declared constant.
+      expect(callersOf('target')).toEqual([
+        'constant:list',
+        'constant:obj',
+        'constant:obj',
+        'function:handler',
+      ]);
+    });
+  });
 });
 
 describe('File Node Extraction', () => {
@@ -1066,6 +1219,42 @@ class UserService:
     expect(classNode).toBeDefined();
     expect(classNode?.name).toBe('UserService');
   });
+
+  it('walks a module-level assignment initializer scoped to the name (#693 for Python)', () => {
+    // The assignment minted a node and stopped, so everything a module builds
+    // at import time — `app = FastAPI()`, `ENGINE = create_engine(url)` — was
+    // missing from the graph. A tuple target mints no symbol, so its
+    // right-hand side attributes to the enclosing scope instead of vanishing.
+    const code = `
+def target(): pass
+def compute(): return 1
+
+APP = compute()
+handler = lambda: target()
+MAPPING = {"a": compute()}
+first, second = compute(), target()
+
+class K:
+    ATTR = compute()
+`;
+    const result = extractFromSource('app.py', code);
+    const byId = new Map(result.nodes.map((n) => [n.id, n]));
+    const owners = result.unresolvedReferences
+      .filter((u) => u.referenceKind === 'calls')
+      .map((u) => {
+        const n = byId.get(u.fromNodeId);
+        return `${u.referenceName}<-${n ? `${n.kind}:${n.name}` : '?'}`;
+      })
+      .sort();
+    expect(owners).toEqual([
+      'compute<-class:K', // a class attribute still rides the class (no node of its own)
+      'compute<-file:app.py', // the tuple target mints nothing
+      'compute<-variable:APP',
+      'compute<-variable:MAPPING',
+      'target<-file:app.py',
+      'target<-variable:handler',
+    ]);
+  });
 });
 
 describe('Go Extraction', () => {
@@ -1134,6 +1323,35 @@ pub struct User {
     const structNode = result.nodes.find((n) => n.kind === 'struct');
     expect(structNode).toBeDefined();
     expect(structNode?.name).toBe('User');
+  });
+
+  it('should extract unit and tuple structs, not just brace structs', () => {
+    // A unit struct has no body field, but it IS a complete definition —
+    // Rust has no forward declarations. Skipping it dropped the type and
+    // every `impl Trait for UnitStruct` edge with it.
+    const code = `
+pub struct Unit;
+pub struct Tuple(pub u32);
+pub struct Brace { pub x: u32 }
+`;
+    const result = extractFromSource('shapes.rs', code);
+
+    const structs = result.nodes.filter((n) => n.kind === 'struct').map((n) => n.name).sort();
+    expect(structs).toEqual(['Brace', 'Tuple', 'Unit']);
+  });
+
+  it('should link impl Trait for a unit struct', () => {
+    const code = `
+pub struct Unit;
+pub trait Greet { fn hi(&self) -> String; }
+impl Greet for Unit { fn hi(&self) -> String { "unit".into() } }
+`;
+    const result = extractFromSource('greet.rs', code);
+
+    const unit = result.nodes.find((n) => n.kind === 'struct' && n.name === 'Unit');
+    expect(unit).toBeDefined();
+    const trait = result.nodes.find((n) => n.kind === 'trait' && n.name === 'Greet');
+    expect(trait).toBeDefined();
   });
 
   it('should extract trait declarations', () => {
@@ -1362,6 +1580,26 @@ impl Counter {
     expect(implRefs).toHaveLength(0);
   });
 
+  it('walks a const/static initializer scoped to the declared symbol (#693 for Rust)', () => {
+    // The declaration minted a node and stopped, so a handler table, a
+    // lazily-built singleton or any computed const linked to nothing.
+    const code = `
+const LEN: usize = compute_len();
+static REGISTRY: Lazy<Cfg> = Lazy::new(|| build_cfg());
+`;
+    const result = extractFromSource('lib.rs', code);
+    const byId = new Map(result.nodes.map((n) => [n.id, n]));
+    const owner = (name: string) => {
+      const u = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'calls' && r.referenceName === name
+      );
+      const n = u ? byId.get(u.fromNodeId) : undefined;
+      return n ? `${n.kind}:${n.name}` : undefined;
+    };
+    expect(owner('compute_len')).toBe('variable:LEN');
+    expect(owner('build_cfg')).toBe('variable:REGISTRY');
+  });
+
   it('should extract union declarations and their impl edges', () => {
     const code = `
 pub union Reg {
@@ -1568,6 +1806,37 @@ public class Splitter {
         n.qualifiedName.includes('$anon@')
     );
     expect(sepStart, 'override inside the lambda-returned anon class should be a method node').toBeDefined();
+  });
+
+  it('walks a field initializer scoped to the field (#693 for Java)', () => {
+    // The dispatcher only scanned a field_declaration for function-as-value
+    // candidates, so a lambda or anonymous class holding the work — the
+    // Android listener idiom — contributed no call edge and `target` looked
+    // callerless.
+    const code = `
+package p;
+class T {
+    private final Runnable fieldLambda = () -> target();
+    private final Runnable anonClass = new Runnable() {
+        public void run() { target(); }
+    };
+    private final int eager = compute();
+    void directCall() { target(); }
+    private void target() {}
+    private static int compute() { return 1; }
+}
+`;
+    const result = extractFromSource('T.java', code);
+    const byId = new Map(result.nodes.map((n) => [n.id, n]));
+    const callersOf = (name: string) =>
+      result.unresolvedReferences
+        .filter((u) => u.referenceKind === 'calls' && u.referenceName === name)
+        .map((u) => byId.get(u.fromNodeId)?.name)
+        .sort();
+
+    // `run` is the anonymous class's override, itself extracted under the field.
+    expect(callersOf('target')).toEqual(['directCall', 'fieldLambda', 'run']);
+    expect(callersOf('compute')).toEqual(['eager']);
   });
 });
 
@@ -2171,6 +2440,120 @@ class Bar {
     expect(result.nodes.find((n) => n.kind === 'namespace')).toBeUndefined();
     const cls = result.nodes.find((n) => n.kind === 'class' && n.name === 'Bar');
     expect(cls?.qualifiedName).toBe('Bar');
+  });
+
+  describe('property initializers are walked, attributed to the property (#693 for Kotlin)', () => {
+    // The property hook consumes the whole property_declaration subtree, so
+    // before this the initializer was only scanned for function-as-value
+    // candidates and every call inside it vanished from the graph. Android/MSDK
+    // callbacks are declared exactly this way (`private val l = Listener { … }`),
+    // so anything reached only through one looked like it had no callers at all.
+    const code = `
+package repro
+
+class Repro {
+    private val fieldLambda: () -> Unit = { target() }
+    private val samField = Runnable { target() }
+    private val plain = target()
+    private val delegated by lazy { target() }
+    private val anonObject = object : Runnable { override fun run() { target() } }
+
+    fun directCall() { target() }
+    fun lambdaInMethod() { run { target() } }
+
+    private fun target() {}
+}
+
+object Holder {
+    val topLevelLambda: () -> Unit = { hit() }
+    private fun hit() {}
+}
+`;
+    const callersOf = (target: string) => {
+      const result = extractFromSource('Repro.kt', code);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      return result.unresolvedReferences
+        .filter((u) => u.referenceKind === 'calls' && u.referenceName === target)
+        .map((u) => byId.get(u.fromNodeId)?.name)
+        .sort();
+    };
+
+    it('a lambda / SAM / plain / delegated / object initializer calls FROM the property', () => {
+      // `run` is the anonymous object's override, extracted as its own node
+      // under `anonObject` — the same shape Go's initializer walk produces.
+      expect(callersOf('target')).toEqual([
+        'delegated',
+        'directCall',
+        'fieldLambda',
+        'lambdaInMethod',
+        'plain',
+        'run',
+        'samField',
+      ]);
+    });
+
+    it('a property in an `object` singleton is a caller too', () => {
+      expect(callersOf('hit')).toEqual(['topLevelLambda']);
+    });
+
+    it('an accessor body belongs to its property, written on either line', () => {
+      // `val x: T get() = …` nests the accessor UNDER the declaration; written
+      // on its own line the grammar makes it a following SIBLING instead. Both
+      // used to lose their calls (the nested one) or hand them to the enclosing
+      // class (the sibling); both now attribute to the property.
+      const src = `
+package p
+
+class C {
+    val sameLine: Int get() = compute()
+    val nextLine: Int
+        get() = compute()
+    var written: Int = 0
+        set(v) { store(v) }
+    private fun compute(): Int = 1
+    private fun store(v: Int) {}
+}
+`;
+      const result = extractFromSource('C.kt', src);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      const ownersOf = (name: string) =>
+        result.unresolvedReferences
+          .filter((u) => u.referenceKind === 'calls' && u.referenceName === name)
+          .map((u) => {
+            const n = byId.get(u.fromNodeId);
+            return n ? `${n.kind}:${n.name}` : '?';
+          })
+          .sort();
+      expect(ownersOf('compute')).toEqual(['field:nextLine', 'field:sameLine']);
+      expect(ownersOf('store')).toEqual(['field:written']);
+    });
+
+    it('an `init` block and a destructuring RHS no longer vanish', () => {
+      // Both mint no symbol of their own, so the hook consumed them and their
+      // code disappeared entirely; they now attribute to the enclosing scope.
+      const src = `
+package p
+
+class C {
+    init { val q = initCall() }
+    val (a, b) = makePair()
+}
+
+val (t1, t2) = topMakePair()
+`;
+      const result = extractFromSource('C.kt', src);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      const owner = (name: string) => {
+        const u = result.unresolvedReferences.find(
+          (r) => r.referenceKind === 'calls' && r.referenceName === name
+        );
+        const n = u ? byId.get(u.fromNodeId) : undefined;
+        return n ? `${n.kind}:${n.name}` : undefined;
+      };
+      expect(owner('initCall')).toBe('class:C');
+      expect(owner('makePair')).toBe('class:C');
+      expect(owner('topMakePair')).toBe('namespace:p');
+    });
   });
 });
 
@@ -5811,6 +6194,74 @@ end
   });
 });
 
+describe('C++ pure-virtual method nodes (#1727)', () => {
+  // Pure-virtual methods are field_declarations (`virtual int read(int key) = 0;`),
+  // not function_definitions — they previously minted no method node, so calls
+  // through an abstract base and cpp-override synthesis had nothing to attach to.
+  // Java interface methods already get nodes; C++ should behave similarly.
+  it('indexes Store::read from the issue fixture and records the call', () => {
+    const code = `
+class Store {
+public:
+    virtual ~Store() {}
+    virtual int read(int key) = 0;
+};
+
+class DiskStore : public Store {
+public:
+    int read(int key) override { return key + 1; }
+};
+
+class MemStore : public Store {
+public:
+    int read(int key) override { return key + 2; }
+};
+
+int fetch(Store* s, int k) {
+    return s->read(k);
+}
+`;
+    const result = extractFromSource('store.cc', code);
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.qualifiedName);
+    expect(methods).toContain('Store::read');
+    expect(methods).toContain('DiskStore::read');
+    expect(methods).toContain('MemStore::read');
+
+    const baseRead = result.nodes.find((n) => n.qualifiedName === 'Store::read');
+    expect(baseRead?.isAbstract).toBe(true);
+
+    // Call site unresolved ref targets the method name (resolver types the receiver).
+    expect(
+      result.unresolvedReferences.some(
+        (r) => r.referenceKind === 'calls' && (r.referenceName === 'read' || r.referenceName.endsWith('.read') || r.referenceName.endsWith('->read') || r.referenceName === 's.read')
+      )
+    ).toBe(true);
+  });
+
+  it('indexes pure virtuals with pointer/reference return types and operators', () => {
+    const code = `
+class Cloneable {
+public:
+    virtual Cloneable* clone() = 0;
+    virtual const Foo& get() = 0;
+    virtual Cloneable& operator=(const Cloneable&) = 0;
+    int notPure(int x);
+    int data = 0;
+};
+`;
+    const result = extractFromSource('clone.hpp', code);
+    const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+    expect(methods).toContain('clone');
+    expect(methods).toContain('get');
+    expect(methods).toContain('operator=');
+    // Non-pure prototype and data member must NOT become methods here.
+    expect(methods).not.toContain('notPure');
+    expect(methods).not.toContain('data');
+    expect(result.nodes.find((n) => n.name === 'clone')?.isAbstract).toBe(true);
+  });
+
+});
+
 describe('C++ free-function name extraction', () => {
   let tempDir: string;
   let cg: CodeGraph;
@@ -7293,6 +7744,105 @@ describe('Directory Exclusion', () => {
   });
 });
 
+
+describe('Nested .gitignore node_modules exclusion (#1567)', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  afterEach(() => {
+    cleanupTempDir(tempDir);
+  });
+
+  function plantNodeModules(subproject: string, packages = 80): void {
+    const base = path.join(tempDir, subproject, 'node_modules');
+    for (let i = 0; i < packages; i++) {
+      const pkg = path.join(base, `pkg${i}`);
+      fs.mkdirSync(pkg, { recursive: true });
+      fs.writeFileSync(path.join(pkg, 'index.js'), `module.exports = ${i};`);
+      fs.writeFileSync(path.join(pkg, 'index.d.ts'), 'export const n: number;');
+      if (i % 4 === 0) fs.writeFileSync(path.join(pkg, '.gitignore'), '*.map\n');
+      const nested = path.join(pkg, 'node_modules', `nested${i}`);
+      fs.mkdirSync(nested, { recursive: true });
+      fs.writeFileSync(path.join(nested, 'lib.ts'), 'export const x = 1;');
+    }
+  }
+
+  function initGitRepo(): void {
+    const { execFileSync } = require('child_process') as typeof import('child_process');
+    execFileSync('git', ['init'], { cwd: tempDir, stdio: 'ignore' });
+    execFileSync('git', ['add', '-A'], { cwd: tempDir, stdio: 'ignore' });
+    execFileSync(
+      'git',
+      ['-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '-m', 'init'],
+      { cwd: tempDir, stdio: 'ignore' },
+    );
+  }
+
+  it('excludes node_modules ignored only by a nested .gitignore (git path)', () => {
+    fs.mkdirSync(path.join(tempDir, 'frontend', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'extension', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'frontend', 'src', 'app.ts'), 'export const a = 1;');
+    fs.writeFileSync(path.join(tempDir, 'extension', 'src', 'ext.ts'), 'export const b = 1;');
+    fs.writeFileSync(path.join(tempDir, 'root.ts'), 'export const r = 1;');
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), '*.log\n');
+    fs.writeFileSync(path.join(tempDir, 'frontend', '.gitignore'), '/node_modules\n');
+    fs.writeFileSync(path.join(tempDir, 'extension', '.gitignore'), 'node_modules/\n');
+    plantNodeModules('frontend');
+    plantNodeModules('extension');
+    initGitRepo();
+
+    const files = scanDirectory(tempDir);
+    expect(files.sort()).toEqual(['extension/src/ext.ts', 'frontend/src/app.ts', 'root.ts']);
+    expect(files.every((f) => !f.includes('node_modules'))).toBe(true);
+  });
+
+  it('excludes nested-gitignore node_modules on the filesystem-walk fallback too', () => {
+    fs.mkdirSync(path.join(tempDir, 'frontend', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'extension', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'frontend', 'src', 'app.ts'), 'export const a = 1;');
+    fs.writeFileSync(path.join(tempDir, 'extension', 'src', 'ext.ts'), 'export const b = 1;');
+    fs.writeFileSync(path.join(tempDir, 'root.ts'), 'export const r = 1;');
+    fs.writeFileSync(path.join(tempDir, '.gitignore'), '*.log\n');
+    fs.writeFileSync(path.join(tempDir, 'frontend', '.gitignore'), '/node_modules\n');
+    fs.writeFileSync(path.join(tempDir, 'extension', '.gitignore'), 'node_modules/\n');
+    plantNodeModules('frontend', 60);
+    plantNodeModules('extension', 60);
+
+    const files = scanDirectory(tempDir);
+    expect(files.sort()).toEqual(['extension/src/ext.ts', 'frontend/src/app.ts', 'root.ts']);
+    expect(files.every((f) => !f.includes('node_modules'))).toBe(true);
+  });
+
+  it('still excludes when root only lists one subproject node_modules (Boba-like)', () => {
+    fs.mkdirSync(path.join(tempDir, 'frontend', 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'extension', 'src'), { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'frontend', 'src', 'app.ts'), 'export const a = 1;');
+    fs.writeFileSync(path.join(tempDir, 'extension', 'src', 'ext.ts'), 'export const b = 1;');
+    fs.writeFileSync(path.join(tempDir, 'root.ts'), 'export const r = 1;');
+    fs.writeFileSync(
+      path.join(tempDir, '.gitignore'),
+      ['*.log', 'frontend/node_modules/', 'frontend/.angular/', ''].join('\n'),
+    );
+    fs.writeFileSync(path.join(tempDir, 'frontend', '.gitignore'), '/node_modules\n');
+    fs.writeFileSync(path.join(tempDir, 'extension', '.gitignore'), 'node_modules/\n');
+    plantNodeModules('frontend', 40);
+    plantNodeModules('extension', 40);
+
+    const fsFiles = scanDirectory(tempDir);
+    expect(fsFiles.every((f) => !f.includes('node_modules'))).toBe(true);
+    expect(fsFiles.sort()).toEqual(['extension/src/ext.ts', 'frontend/src/app.ts', 'root.ts']);
+
+    initGitRepo();
+    const gitFiles = scanDirectory(tempDir);
+    expect(gitFiles.every((f) => !f.includes('node_modules'))).toBe(true);
+    expect(gitFiles.sort()).toEqual(['extension/src/ext.ts', 'frontend/src/app.ts', 'root.ts']);
+  });
+});
+
+
 describe('Git Submodules', () => {
   let tempDir: string;
 
@@ -7637,6 +8187,82 @@ describe('Nested non-submodule git repos', () => {
     expect(ig.ignores('dist/')).toBe(true); // valid rule survives
     expect(ig.ignores('src/app.ts')).toBe(false);
   });
+
+  it('buildDefaultIgnore honors .git/info/exclude (#1728)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'exclude-root');
+    fs.mkdirSync(root, { recursive: true });
+    git(root, 'init', '-q');
+    fs.writeFileSync(path.join(root, 'src.ts'), 'export const x = 1;\n');
+    fs.mkdirSync(path.join(root, '.claude', 'worktrees', 'agent-1'), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, '.claude', 'worktrees', 'agent-1', 'src.ts'),
+      'export const w = 1;\n',
+    );
+    // Not in .gitignore — only in info/exclude (the reporter's exact shape).
+    fs.writeFileSync(
+      path.join(root, '.git', 'info', 'exclude'),
+      '**/.claude/worktrees/\n',
+    );
+
+    const ig = buildDefaultIgnore(root);
+    expect(ig.ignores('src.ts')).toBe(false);
+    expect(ig.ignores('.claude/worktrees/agent-1/src.ts')).toBe(true);
+    expect(ig.ignores('.claude/worktrees/')).toBe(true);
+
+    // ScopeIgnore (watcher path) agrees, including via git ignored-dir seeding.
+    const scope = buildScopeIgnore(root);
+    expect(scope.ignores('src.ts')).toBe(false);
+    expect(scope.ignores('.claude/worktrees/agent-1/')).toBe(true);
+    expect(scope.ignores('.claude/worktrees/agent-1/src.ts')).toBe(true);
+  });
+
+  it('buildDefaultIgnore honors core.excludesFile (#1728)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'excludesfile-root');
+    fs.mkdirSync(root, { recursive: true });
+    git(root, 'init', '-q');
+    const globalExcludes = path.join(tempDir, 'global-excludes');
+    fs.writeFileSync(globalExcludes, 'scratch/\n');
+    git(root, 'config', 'core.excludesFile', globalExcludes);
+    fs.mkdirSync(path.join(root, 'scratch'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'scratch', 'tmp.ts'), 'export const t = 1;\n');
+    fs.writeFileSync(path.join(root, 'app.ts'), 'export const a = 1;\n');
+
+    const ig = buildDefaultIgnore(root);
+    expect(ig.ignores('app.ts')).toBe(false);
+    expect(ig.ignores('scratch/')).toBe(true);
+    expect(ig.ignores('scratch/tmp.ts')).toBe(true);
+  });
+
+  it('buildScopeIgnore prunes dirs ignored only by a nested .gitignore (#1728)', async () => {
+    const { execFileSync } = await import('child_process');
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync('git', args, { cwd, stdio: 'pipe' });
+
+    const root = path.join(tempDir, 'nested-gi-root');
+    fs.mkdirSync(path.join(root, 'pkg', 'build'), { recursive: true });
+    git(root, 'init', '-q');
+    git(root, 'config', 'user.email', 'test@test.com');
+    git(root, 'config', 'user.name', 'Test');
+    fs.writeFileSync(path.join(root, 'pkg', 'app.ts'), 'export const a = 1;\n');
+    fs.writeFileSync(path.join(root, 'pkg', 'build', 'out.ts'), 'export const o = 1;\n');
+    fs.writeFileSync(path.join(root, 'pkg', '.gitignore'), 'build/\n');
+    // Commit only the non-ignored file so git still reports build/ as ignored-other.
+    git(root, 'add', 'pkg/app.ts', 'pkg/.gitignore');
+    git(root, 'commit', '-q', '-m', 'init');
+
+    const scope = buildScopeIgnore(root);
+    expect(scope.ignores('pkg/app.ts')).toBe(false);
+    expect(scope.ignores('pkg/build/')).toBe(true);
+    expect(scope.ignores('pkg/build/out.ts')).toBe(true);
+  });
 });
 
 // =============================================================================
@@ -7905,6 +8531,35 @@ def processData(): Unit = {
       const result = extractFromSource('processor.scala', code);
       const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
       expect(calls.length).toBeGreaterThan(0);
+    });
+
+    it('walks a val/var initializer scoped to the declared symbol (#693 for Scala)', () => {
+      // The val/var hook minted the node and returned true, so the dispatcher
+      // only scanned the subtree for function-as-value candidates — every call
+      // in an initializer was dropped, which on a `val`-heavy codebase
+      // (SpinalHDL, Akka wiring) is most of the wiring.
+      const code = `
+class C {
+  val fieldLambda: () => Unit = () => target()
+  val direct = target()
+  lazy val lazily = target()
+  private def target(): Unit = {}
+}
+
+object O {
+  val topLambda = () => hit()
+  def hit(): Unit = {}
+}
+`;
+      const result = extractFromSource('C.scala', code);
+      const byId = new Map(result.nodes.map((n) => [n.id, n]));
+      const callersOf = (name: string) =>
+        result.unresolvedReferences
+          .filter((u) => u.referenceKind === 'calls' && u.referenceName === name)
+          .map((u) => byId.get(u.fromNodeId)?.name)
+          .sort();
+      expect(callersOf('target')).toEqual(['direct', 'fieldLambda', 'lazily']);
+      expect(callersOf('hit')).toEqual(['topLambda']);
     });
   });
 });
@@ -8485,6 +9140,58 @@ function M:send(data) return self end
       expect(connect?.qualifiedName).toBe('M::connect');
       const send = methods.find((m) => m.name === 'send');
       expect(send?.qualifiedName).toBe('M::send');
+    });
+
+    it('should name function expressions from local, member, and table-field bindings', () => {
+      const code = `
+local function helper() return 1 end
+local localFn = function() return helper() end
+local M = {
+  callbacks = {
+    onStart = function() return helper() end,
+    ["onStop"] = function() return helper() end,
+    [DYNAMIC] = function() return helper() end,
+  },
+}
+M.assignedFn = function() return helper() end
+M["bracketFn"] = function() return helper() end
+localFn()
+`;
+      const result = extractFromSource('handlers.lua', code);
+      const localFn = result.nodes.find((n) => n.kind === 'function' && n.name === 'localFn');
+      const assignedFn = result.nodes.find(
+        (n) => n.kind === 'method' && n.qualifiedName === 'M::assignedFn'
+      );
+      const onStart = result.nodes.find(
+        (n) => n.kind === 'method' && n.qualifiedName === 'M.callbacks::onStart'
+      );
+      const onStop = result.nodes.find(
+        (n) => n.kind === 'method' && n.qualifiedName === 'M.callbacks::onStop'
+      );
+      const bracketFn = result.nodes.find(
+        (n) => n.kind === 'method' && n.qualifiedName === 'M::bracketFn'
+      );
+
+      expect(localFn).toBeDefined();
+      expect(assignedFn).toBeDefined();
+      expect(onStart).toBeDefined();
+      expect(onStop).toBeDefined();
+      expect(bracketFn).toBeDefined();
+      expect(result.nodes.some((n) => n.name === 'DYNAMIC')).toBe(false);
+      expect(result.nodes.some((n) => n.kind === 'variable' && n.name === 'localFn')).toBe(false);
+
+      for (const callable of [localFn, assignedFn, onStart, onStop, bracketFn]) {
+        expect(
+          result.unresolvedReferences.some(
+            (r) => r.fromNodeId === callable!.id && r.referenceKind === 'calls' && r.referenceName === 'helper'
+          )
+        ).toBe(true);
+      }
+      expect(
+        result.unresolvedReferences.some(
+          (r) => r.referenceKind === 'calls' && r.referenceName === 'localFn'
+        )
+      ).toBe(true);
     });
   });
 
@@ -11671,6 +12378,102 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     expect(blankLoneMacroLines(bare)).toBe(bare);
   });
 
+  it('blankCDesignatedMacroArgs empties a designated-initializer macro call, offsets kept (#1729)', async () => {
+    const { blankCDesignatedMacroArgs } = await import('../src/extraction/languages/c-cpp');
+    const src = [
+      'void resetProfile(profile_t *p)',
+      '{',
+      '    RESET_CONFIG(profile_t, p,',
+      '        .pid = { [PID_ROLL] = PID_ROLL_DEFAULT, [PID_YAW] = { 50, 75 } },',
+      '        .limit = 500, // trailing comma follows',
+      '    );',
+      '    log(.5);',
+      '    OTHER_MACRO(a == b, c);',
+      '}',
+    ].join('\n');
+    const out = blankCDesignatedMacroArgs(src);
+    expect(out.length).toBe(src.length);
+    expect(out.split('\n').length).toBe(src.split('\n').length);
+    expect(out).toContain('RESET_CONFIG(');
+    expect(out).not.toContain('.pid');
+    expect(out).not.toContain('PID_ROLL');
+    // The closing `);` keeps its column; the argument lines are spaces.
+    expect(out.split('\n')[5]).toBe('    );');
+    expect(out.split('\n')[3]).toBe(' '.repeat(src.split('\n')[3].length));
+    // A numeric literal and a comparison are not designators.
+    expect(out).toContain('log(.5);');
+    expect(out).toContain('OTHER_MACRO(a == b, c);');
+  });
+
+  it('a designated-initializer macro call no longer swallows the functions after it (#1729)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1729-'));
+    try {
+      // Issue fixture: designated-initializer args + trailing comma. Without
+      // blankCDesignatedMacroArgs, tree-sitter-c error recovery extends
+      // `function_definition` to EOF — `g` vanishes and `h` nests as `f::h`.
+      fs.writeFileSync(
+        path.join(dir, 'pid.c'),
+        [
+          'void f(void)',
+          '{',
+          '    M(a, b,',
+          '        .x = 1,',
+          '        .y = { 1, 2 },',
+          '    );',
+          '}',
+          '',
+          'void g(void)',
+          '{',
+          '}',
+          '',
+          'int h(void)',
+          '{',
+          '    return 1;',
+          '}',
+          '',
+        ].join('\n')
+      );
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const fns = cg.getNodesByKind('function').filter((n) => n.filePath === 'pid.c');
+        const byName = Object.fromEntries(fns.map((n) => [n.name, n]));
+        expect(Object.keys(byName).sort()).toEqual(['f', 'g', 'h']);
+        expect(byName.f!.endLine).toBe(7);
+        expect(byName.g!.qualifiedName).toBe('g');
+        expect(byName.h!.qualifiedName).toBe('h');
+      } finally {
+        cg.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a large designated-initializer macro call keeps later functions top-level (#1729)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1729-large-'));
+    try {
+      // Scale guard for betaflight-sized RESET_CONFIG argument lists.
+      const fields = Array.from({ length: 120 }, (_, i) => `        .field${i} = ${i},`).join('\n');
+      fs.writeFileSync(
+        path.join(dir, 'pid.c'),
+        `void resetProfile(profile_t *p)\n{\n    RESET_CONFIG(profile_t, p,\n${fields}\n    );\n}\n\nvoid g(void)\n{\n}\n\nint h(void)\n{\n    return 1;\n}\n`
+      );
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const fns = cg.getNodesByKind('function').filter((n) => n.filePath === 'pid.c');
+        const byName = Object.fromEntries(fns.map((n) => [n.name, n]));
+        expect(Object.keys(byName).sort()).toEqual(['g', 'h', 'resetProfile']);
+        expect(byName.resetProfile!.endLine).toBe(125);
+        expect(byName.g!.qualifiedName).toBe('g');
+        expect(byName.h!.qualifiedName).toBe('h');
+      } finally {
+        cg.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('blankCStatementMacroCalls blanks indented iterator macros, keeps the block', async () => {
     const { blankCStatementMacroCalls } = await import('../src/extraction/languages/c-cpp');
     const src = [
@@ -11917,5 +12720,65 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     expect(result.errors).toEqual([]);
     expect(result.nodes.some((n) => n.kind === 'class' && n.name === 'Widget')).toBe(true);
     expect(result.nodes.some((n) => n.kind === 'method' && n.name === 'size')).toBe(true);
+  });
+});
+
+// `init` on a project CodeGraph has no grammar for used to look identical to a
+// successful index of an empty repo: 0 files, `index_state: complete`, exit 0.
+// Nothing said "there are 24k files here and I understood none of them", so an
+// agent told to trust the graph concluded the code did not exist (#1502).
+//
+// The scan already visits every file, so the count comes from the walk it
+// already does — no second pass.
+describe('Unsupported-language projects report what they skipped (#1502)', () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = createTempDir();
+  });
+
+  it('counts files it could not index, by extension, on the git path', async () => {
+    const runGit = (...args: string[]) =>
+      execFileSync('git', args, { cwd: tempDir, stdio: 'pipe' });
+    fs.mkdirSync(tempDir, { recursive: true });
+    runGit('init', '-q');
+    runGit('config', 'user.email', 'test@test.com');
+    runGit('config', 'user.name', 'Test');
+    fs.writeFileSync(path.join(tempDir, 'a.move'), 'module a {}');
+    fs.writeFileSync(path.join(tempDir, 'b.move'), 'module b {}');
+    fs.writeFileSync(path.join(tempDir, 'c.pl'), 'print 1;');
+    runGit('add', '-A');
+    runGit('commit', '-q', '-m', 'unsupported only');
+
+    const stats: ScanSkipStats = { unsupportedByExtension: new Map() };
+    const files = await scanDirectoryAsync(tempDir, undefined, stats);
+
+    expect(files).toEqual([]);
+    expect(stats.unsupportedByExtension.get('.move')).toBe(2);
+    expect(stats.unsupportedByExtension.get('.pl')).toBe(1);
+  });
+
+  it('counts them on the filesystem-walk path too (non-git project)', async () => {
+    fs.mkdirSync(tempDir, { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'a.move'), 'module a {}');
+    fs.writeFileSync(path.join(tempDir, 'b.pl'), 'print 1;');
+
+    const stats: ScanSkipStats = { unsupportedByExtension: new Map() };
+    const files = await scanDirectoryAsync(tempDir, undefined, stats);
+
+    expect(files).toEqual([]);
+    expect(stats.unsupportedByExtension.get('.move')).toBe(1);
+    expect(stats.unsupportedByExtension.get('.pl')).toBe(1);
+  });
+
+  it('stays silent when every file was indexable', async () => {
+    fs.mkdirSync(tempDir, { recursive: true });
+    fs.writeFileSync(path.join(tempDir, 'a.ts'), 'export const a = 1;');
+
+    const stats: ScanSkipStats = { unsupportedByExtension: new Map() };
+    const files = await scanDirectoryAsync(tempDir, undefined, stats);
+
+    expect(files).toEqual(['a.ts']);
+    expect(stats.unsupportedByExtension.size).toBe(0);
   });
 });

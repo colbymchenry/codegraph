@@ -55,12 +55,34 @@ impl Variant {
 /// typescriptExtractor.methodTypes / javascriptExtractor.methodTypes.
 fn is_method_type(v: Variant, kind: &str) -> bool {
     kind == "method_definition"
-        || (v.is_ts() && kind == "public_field_definition")
+        || (v.is_ts() && matches!(kind, "public_field_definition" | "method_signature"))
         || (!v.is_ts() && kind == "field_definition")
 }
 
+/// typescriptExtractor.propertyTypes. The interface counterpart of
+/// `public_field_definition`: it carries no value, so it is always a property
+/// and never goes through classify_ts_class_member (#1638).
+fn is_property_type(v: Variant, kind: &str) -> bool {
+    v.is_ts() && kind == "property_signature"
+}
+
+/// Method node types that spell a SIGNATURE — a declaration with no body (#1638).
+///
+/// They are a method of whatever type declares them and nothing on their own, so
+/// they must not take `extract_method`'s "no class-like parent, so treat it as a
+/// free function" fallback. The other method types can: a `method_definition`
+/// outside a class really is a function. This one appears outside a class only
+/// inside a type literal (`type Handle = { stop(): void }`), whose members
+/// `extract_ts_type_alias_members` already extracts and attaches to the alias
+/// (#359) — take the fallback and the file gains a phantom top-level
+/// `function stop` beside the real `Handle::stop`. Mirrors the TS extractor's
+/// SIGNATURE_METHOD_NODE_TYPES (extraction/tree-sitter.ts).
+fn is_signature_method_type(kind: &str) -> bool {
+    kind == "method_signature"
+}
+
 fn is_function_type(kind: &str) -> bool {
-    matches!(kind, "function_declaration" | "arrow_function" | "function_expression")
+    matches!(kind, "function_declaration" | "generator_function_declaration" | "arrow_function" | "function_expression" | "generator_function")
 }
 
 fn is_class_type(v: Variant, kind: &str) -> bool {
@@ -622,7 +644,9 @@ impl<'t> Walker<'t> {
         } else if is_class_type(self.variant, kind) {
             self.extract_class(node);
             skip_children = true;
-        } else if is_method_type(self.variant, kind) {
+        } else if is_method_type(self.variant, kind)
+            && (!is_signature_method_type(kind) || self.inside_class_like())
+        {
             if classify_ts_class_member(node) == Member::Property {
                 let prop = self.extract_property(node);
                 if let (Some((row, name)), Some(value)) = (prop, node.child_by_field_name("value")) {
@@ -664,12 +688,22 @@ impl<'t> Walker<'t> {
             self.extract_call(node);
         } else if kind == "new_expression" {
             self.extract_instantiation(node);
-        } else if self.variant.is_ts()
-            && matches!(kind, "property_signature" | "method_signature")
-            && self.inside_class_like()
-        {
-            let parent = self.top_row();
-            self.extract_type_annotations(node, parent);
+        } else if is_property_type(self.variant, kind) && self.inside_class_like() {
+            // NOTE: `property_signature` / `method_signature` used to be handled
+            // here together, hanging their type annotations off the ENCLOSING
+            // INTERFACE — the only anchor available while the members themselves
+            // went unextracted. Since #1638 `method_signature` is a method type
+            // and `property_signature` a property type, so the method branch
+            // above claims the first (under the same inside_class_like guard
+            // this branch had) and this one extracts the second as a real node.
+            // The `references` edges survive — extract_method and
+            // extract_property each call extract_type_annotations — but now hang
+            // off the member, the more precise anchor: `Api::fetch → PageId`
+            // says which member wants the type, where `Api → PageId` only said
+            // the file did.
+            self.extract_property(node);
+            self.scan_fn_ref_subtree(node, 0);
+            skip_children = true;
         }
 
         if !skip_children {
@@ -718,6 +752,13 @@ impl<'t> Walker<'t> {
                 self.extract_function(node, Some(bound));
                 return;
             }
+            // `const handleClear = () => {…}` inside a body (#1669): named by
+            // its declarator, like at module scope. Mirrors
+            // TreeSitterExtractor's declaratorBoundFunction.
+            if self.declarator_bound_function(node) {
+                self.extract_function(node, None);
+                return;
+            }
         }
 
         if is_class_type(self.variant, kind) {
@@ -741,6 +782,27 @@ impl<'t> Walker<'t> {
     }
 
     // --- name / signature / modifier helpers ------------------------------------
+
+    /// Whether an anonymous function is the whole value of a
+    /// `variable_declarator` with a plain identifier name —
+    /// `const NAME = () => {…}` / `= function () {…}`.
+    fn declarator_bound_function(&self, node: Node<'t>) -> bool {
+        if !matches!(node.kind(), "arrow_function" | "function_expression") {
+            return false;
+        }
+        let Some(declarator) = node.parent() else { return false };
+        if declarator.kind() != "variable_declarator" {
+            return false;
+        }
+        let Some(value) = declarator.child_by_field_name("value") else { return false };
+        if value.start_byte() != node.start_byte() || value.end_byte() != node.end_byte() {
+            return false;
+        }
+        declarator
+            .child_by_field_name("name")
+            .map(|n| n.kind() == "identifier")
+            .unwrap_or(false)
+    }
 
     /// The declarator name a React handler hook binds an anonymous function
     /// to — `const NAME = useCallback(<node>, [...])` (also `React.useCallback`,
@@ -792,7 +854,7 @@ impl<'t> Walker<'t> {
         if let Some(name_node) = node.child_by_field_name("name") {
             return self.text(name_node).to_string();
         }
-        if matches!(node.kind(), "arrow_function" | "function_expression") {
+        if matches!(node.kind(), "arrow_function" | "function_expression" | "generator_function") {
             return "<anonymous>".to_string();
         }
         for i in 0..node.named_child_count() {

@@ -20,15 +20,23 @@ impl<'t> Walker<'t> {
             .unwrap_or_else(|| self.extract_name(node));
 
         // Arrow/function-expression values: resolve the name from the parent
-        // variable_declarator (`export const useAuth = () => {}`).
+        // variable_declarator (`export const useAuth = () => {}`), or from a
+        // CommonJS export assignment (`exports.getItems = async () => {}`,
+        // #1675). Mirrors TreeSitterExtractor.extractFunction.
+        let mut common_js_export = false;
         if name_override.is_none()
             && name == "<anonymous>"
-            && matches!(node.kind(), "arrow_function" | "function_expression")
+            && matches!(node.kind(), "arrow_function" | "function_expression" | "generator_function")
         {
             if let Some(parent) = node.parent() {
                 if parent.kind() == "variable_declarator" {
                     if let Some(var_name) = parent.child_by_field_name("name") {
                         name = self.text(var_name).to_string();
+                    }
+                } else if parent.kind() == "assignment_expression" {
+                    if let Some(export_name) = self.common_js_export_name(parent, node) {
+                        name = export_name;
+                        common_js_export = true;
                     }
                 }
             }
@@ -46,7 +54,7 @@ impl<'t> Walker<'t> {
             docstring: crate::docstring::preceding_docstring(node, self.src),
             signature: self.signature_of(node),
             visibility: self.visibility_of(node),
-            is_exported: Some(self.is_exported(node)),
+            is_exported: Some(common_js_export || self.is_exported(node)),
             is_async: Some(self.is_async(node)),
             is_static: self.is_static(node),
             ..Extra::default()
@@ -63,6 +71,30 @@ impl<'t> Walker<'t> {
             self.visit_function_body(body);
         }
         self.stack.pop();
+    }
+
+    /// The property a CommonJS export assignment binds a function to —
+    /// `exports.NAME = <node>` / `module.exports.NAME = <node>` — or None for
+    /// any other assignment. The node must be the assignment's whole
+    /// right-hand side. Mirrors TreeSitterExtractor.commonJsExportName.
+    fn common_js_export_name(&self, assignment: Node<'t>, value: Node<'t>) -> Option<String> {
+        let right = assignment.child_by_field_name("right")?;
+        if right.start_byte() != value.start_byte() || right.end_byte() != value.end_byte() {
+            return None;
+        }
+        let left = assignment.child_by_field_name("left")?;
+        if left.kind() != "member_expression" {
+            return None;
+        }
+        let object = left.child_by_field_name("object")?;
+        let property = left.child_by_field_name("property")?;
+        if property.kind() != "property_identifier" {
+            return None;
+        }
+        if !matches!(self.text(object), "exports" | "module.exports") {
+            return None;
+        }
+        Some(self.text(property).to_string())
     }
 
     // --- reactComponentHoc / extractReactComponentNode (#841) --------------------
@@ -270,8 +302,33 @@ impl<'t> Walker<'t> {
         let name = self.text(name_node).to_string();
 
         // TS/JS field definitions carry an explicit `type` field; the generic
-        // scan is for other languages (#808).
-        let type_text = node.child_by_field_name("type").map(|t| {
+        // scan is for other languages (#808). A `property_signature` (an
+        // interface member, #1638) carries a `type` field and no value, so it
+        // reads the type field too: the generic scan's exclusion list covers
+        // `identifier` but not the `property_identifier` an interface member is
+        // named with, so it would stop on the name and make the signature repeat
+        // it (`counts counts`) instead of naming the type. Mirrors
+        // extractProperty's isTsJsField.
+        let is_ts_js_field = matches!(
+            node.kind(),
+            "public_field_definition" | "field_definition" | "property_signature"
+        );
+        let type_node = if is_ts_js_field {
+            node.child_by_field_name("type")
+        } else {
+            (0..node.named_child_count()).filter_map(|i| node.named_child(i)).find(|c| {
+                !matches!(
+                    c.kind(),
+                    "modifier"
+                        | "modifiers"
+                        | "identifier"
+                        | "accessor_list"
+                        | "accessors"
+                        | "equals_value_clause"
+                )
+            })
+        };
+        let type_text = type_node.map(|t| {
             let raw = self.text(t);
             raw.strip_prefix(':').unwrap_or(raw).trim_start().to_string()
         });
@@ -342,9 +399,9 @@ impl<'t> Walker<'t> {
             }
             let name = self.text(name_node).to_string();
 
-            // Arrow/function values extract as functions, named by the declarator.
+            // Arrow/function/generator values extract as functions, named by the declarator.
             if let Some(v) = value {
-                if matches!(v.kind(), "arrow_function" | "function_expression") {
+                if matches!(v.kind(), "arrow_function" | "function_expression" | "generator_function") {
                     self.extract_function(v, None);
                     continue;
                 }
@@ -426,18 +483,26 @@ impl<'t> Walker<'t> {
                 }
             }
 
-            // Walk the initializer for calls — except the object/store shapes
-            // whose members are extracted method-by-method below.
+            // Walk the initializer for calls, ATTRIBUTED to the declared symbol
+            // (#693) — except the object/store shapes whose members are
+            // extracted method-by-method below (walking those too would
+            // double-count each member arrow's calls). Before this the walk ran
+            // with only the FILE on the stack (`const cfg = load()` recorded the
+            // file as load's caller) and object literals were skipped outright.
+            let members_extracted_separately = extract_object_methods
+                || rtk_endpoints.is_some()
+                || pinia_setup.is_some()
+                || !store_collections.is_empty();
             if let Some(v) = value {
-                let vk = v.kind();
-                if vk != "object"
-                    && vk != "object_expression"
-                    && !(extract_object_methods && vk == "call_expression")
-                    && rtk_endpoints.is_none()
-                    && pinia_setup.is_none()
-                    && store_collections.is_empty()
-                {
-                    self.visit_function_body(v);
+                if !members_extracted_separately {
+                    match var_row {
+                        Some(row) => {
+                            self.stack.push(Scope { row, kind, name: name.clone() });
+                            self.visit_function_body(v);
+                            self.stack.pop();
+                        }
+                        None => self.visit_function_body(v),
+                    }
                 }
             }
 
@@ -1065,6 +1130,23 @@ impl<'t> Walker<'t> {
 
     // --- extractCall (TS/JS generic tail) -------------------------------------------------
 
+    /// Identifier-rooted member chains have no inferred property type (#1566),
+    /// including host API chains (#1707). Keep the existing window namespace
+    /// escape; call-result and `this` receivers are outside this guard.
+    fn is_unresolved_member_chain(&self, receiver: Node<'t>) -> bool {
+        let mut cur = receiver;
+        if !matches!(cur.kind(), "member_expression" | "subscript_expression") {
+            return false;
+        }
+        while matches!(cur.kind(), "member_expression" | "subscript_expression") {
+            match cur.child_by_field_name("object") {
+                Some(next) => cur = next,
+                None => return false,
+            }
+        }
+        cur.kind() == "identifier" && self.text(cur) != "window"
+    }
+
     pub(super) fn extract_call(&mut self, node: Node<'t>) {
         if self.stack.is_empty() {
             return;
@@ -1092,6 +1174,14 @@ impl<'t> Walker<'t> {
                         if is_literal_receiver(r.kind()) {
                             return;
                         }
+                        // `holder.values.get()` has no inferred property type
+                        // (#1566). Dropping the receiver or merely preserving it
+                        // would allow unrelated same-name method guesses. Emit
+                        // nothing, as for host chains (#1707); argument calls are
+                        // visited independently. Mirrors extractCall in TS.
+                        if self.is_unresolved_member_chain(r) {
+                            return;
+                        }
                     }
                     let recv_ident = receiver.filter(|r| {
                         matches!(r.kind(), "identifier" | "simple_identifier" | "field_identifier")
@@ -1103,9 +1193,19 @@ impl<'t> Walker<'t> {
                         } else {
                             callee_name = method_name.to_string();
                         }
+                    } else if let Some(field) = receiver.and_then(|r| self.this_field_of(r)) {
+                        // `this.<field>.<method>()` — keep the field so the
+                        // resolver can read its declared type (#1496). Mirrors
+                        // TreeSitterExtractor.extractCall.
+                        callee_name = format!("this.{field}.{method_name}");
+                    } else if let Some(r) = receiver.filter(|r| r.kind() == "call_expression") {
+                        // Call receiver — `make().run()` (#1683): keep the inner
+                        // callee as `<inner>().<method>`, or emit nothing when it
+                        // is not a plain name / member chain. Mirrors
+                        // TreeSitterExtractor.extractCall.
+                        let Some(inner) = self.plain_inner_callee(r) else { return };
+                        callee_name = format!("{inner}().{method_name}");
                     } else {
-                        // (the call-receiver re-encode branches are other
-                        // languages'; TS/JS keeps the bare method name)
                         callee_name = method_name.to_string();
                     }
                 }
@@ -1127,6 +1227,35 @@ impl<'t> Walker<'t> {
     }
 
     // --- extractInstantiation -----------------------------------------------------------
+
+    /// `this.<field>` as a member_expression receiver → Some(field) (#1496).
+    fn this_field_of(&self, receiver: Node<'t>) -> Option<String> {
+        if receiver.kind() != "member_expression" {
+            return None;
+        }
+        let object = receiver.child_by_field_name("object")?;
+        let property = receiver.child_by_field_name("property")?;
+        if object.kind() != "this" || property.kind() != "property_identifier" {
+            return None;
+        }
+        Some(self.text(property).to_string())
+    }
+
+    /// The callee of a call-expression receiver when it is a plain identifier
+    /// or member chain (`make`, `d.setdefault`), whitespace stripped (#1683).
+    fn plain_inner_callee(&self, call: Node<'t>) -> Option<String> {
+        let inner = call.child_by_field_name("function")?;
+        let text: String = self.text(inner).chars().filter(|c| !c.is_whitespace()).collect();
+        if text.is_empty() {
+            return None;
+        }
+        let ok = text.split('.').all(|seg| {
+            let mut chars = seg.chars();
+            matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        });
+        if ok { Some(text) } else { None }
+    }
 
     pub(super) fn extract_instantiation(&mut self, node: Node<'t>) {
         if self.stack.is_empty() {

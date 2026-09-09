@@ -32,6 +32,7 @@ import {
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
 import { isTestFile, normalizeNameToken } from '../search/query-utils';
+import { groupDefinitions, lastQualifierPart, matchesSymbol } from '../graph/symbol-lookup';
 import { extractQueryPaths, queryMightContainPaths } from '../search/query-paths';
 import {
   existsSync,
@@ -44,8 +45,6 @@ import { guardLabel, guardsForFileSync, siteKey, supportsBranchGuards, warmBranc
 import { findDynamicBoundaries, type BoundarySite } from '../graph/dynamic-boundary-report';
 import { countImplementers } from '../graph/type-hierarchy';
 import {
-  lastQualifierPart,
-  matchesSymbol,
   findAllSymbols,
   resolveNamedSymbolFlow,
 } from '../graph/named-symbol-flow';
@@ -208,7 +207,10 @@ export interface ExploreOutputBudget {
   includeAdditionalFiles: boolean;
   /** Include the "Complete source code is included above…" reminder. */
   includeCompletenessSignal: boolean;
-  /** Include the explore-budget reminder at the end. */
+  /**
+   * Include the advisory exploration-guidance note at the end. Purely
+   * advisory — the server NEVER rejects or rate-limits extra explore calls.
+   */
   includeBudgetNote: boolean;
 }
 
@@ -357,6 +359,14 @@ export const RELEVANCE_KIND_WEIGHT: Readonly<Record<string, number>> = {
   constant: 0.35, variable: 0.3, parameter: 0.15,
 };
 const DEFAULT_RELEVANCE_KIND_WEIGHT = 0.5;
+
+/**
+ * The "member of a type" tier of the table above, named so the one kind that
+ * cannot be read off `node.kind` can be placed on it: an interface's
+ * `method_signature` (#1638). Same value as `property`/`field`, deliberately —
+ * it is the same tier, not a new one.
+ */
+const TYPE_MEMBER_RELEVANCE_WEIGHT = 0.5;
 
 /**
  * Kinds whose evidentiary value depends on whether anything USES them. An
@@ -847,6 +857,141 @@ const POINTER_HEADER = '**Not shown above — explore these names for their sour
 /** Most files the pointer list ever names one-per-line; the rest are a count. */
 const POINTER_MAX_FILES = 10;
 /**
+ * How many elided-in-file symbols a gap marker or biased header names (#1711).
+ * Kept small: the names exist so a follow-up explore has a target, not so the
+ * meta-text rivals the source it is pointing at.
+ */
+const ELIDED_SYMBOL_CAP = 6;
+
+type ElidedSymbolRef = { name: string; kind: string; startLine: number };
+
+/**
+ * Indexed symbols whose definition starts strictly between two rendered
+ * spans. The hole is what a trim dropped; naming them is what lets the agent
+ * follow up by name instead of guessing (#1711).
+ */
+export function symbolsBetweenRanges(
+  nodes: ReadonlyArray<{ name: string; kind: string; startLine: number; endLine: number }>,
+  fromEnd: number,
+  toStart: number,
+): ElidedSymbolRef[] {
+  if (toStart <= fromEnd + 1) return [];
+  const out: ElidedSymbolRef[] = [];
+  const seen = new Set<string>();
+  for (const n of nodes) {
+    if (n.kind === 'import' || n.kind === 'export') continue;
+    if (n.startLine <= fromEnd || n.startLine >= toStart) continue;
+    if (seen.has(n.name)) continue;
+    seen.add(n.name);
+    out.push({ name: n.name, kind: n.kind, startLine: n.startLine });
+  }
+  out.sort((a, b) => a.startLine - b.startLine);
+  return out;
+}
+
+/**
+ * Symbols in `candidates` whose start line is not covered by any emitted range.
+ * Used to bias the per-file header toward what the trim dropped (#1711).
+ */
+export function symbolsNotInRanges(
+  candidates: ReadonlyArray<ElidedSymbolRef>,
+  ranges: ReadonlyArray<ExploreLineRange>,
+): ElidedSymbolRef[] {
+  if (ranges.length === 0) return [...candidates].sort((a, b) => a.startLine - b.startLine);
+  const out: ElidedSymbolRef[] = [];
+  const seen = new Set<string>();
+  for (const n of candidates) {
+    if (seen.has(n.name)) continue;
+    if (ranges.some((r) => n.startLine >= r.start && n.startLine <= r.end)) continue;
+    seen.add(n.name);
+    out.push(n);
+  }
+  out.sort((a, b) => a.startLine - b.startLine);
+  return out;
+}
+
+/**
+ * Gap marker between two non-contiguous slices of one file.
+ *
+ * Bare `... (gap) ...` told the agent something was missing but not WHAT —
+ * and the footer then asked it to re-explore "with its exact name", which is
+ * circular when the missing names *are* the question (#1711). When the hole
+ * holds indexed symbols, list them as `name (file:line)` (same shape the
+ * flow / blast-radius lines already use).
+ */
+export function formatGapMarker(
+  filePath: string,
+  elided: ReadonlyArray<ElidedSymbolRef>,
+): string {
+  if (elided.length === 0) return '\n\n... (gap) ...\n\n';
+  const shown = elided.slice(0, ELIDED_SYMBOL_CAP);
+  const more = elided.length - shown.length;
+  const names = shown.map((s) => `${s.name} (${filePath}:${s.startLine})`).join(', ')
+    + (more > 0 ? `, +${more} more` : '');
+  return `\n\n... (gap: ${names}) ...\n\n`;
+}
+
+/** Join rendered parts with gap markers that name whatever the trim skipped. */
+export function joinPartsWithNamedGaps(
+  filePath: string,
+  parts: ReadonlyArray<{ range: ExploreLineRange; text: string }>,
+  nodes: ReadonlyArray<{ name: string; kind: string; startLine: number; endLine: number }>,
+): string {
+  if (parts.length === 0) return '';
+  let out = parts[0]!.text;
+  for (let i = 1; i < parts.length; i++) {
+    const prev = parts[i - 1]!;
+    const next = parts[i]!;
+    out += formatGapMarker(filePath, symbolsBetweenRanges(nodes, prev.range.end, next.range.start));
+    out += next.text;
+  }
+  return out;
+}
+
+/**
+ * Prefer symbols the trim dropped when filling the per-file header's named
+ * slots, so `+N more` is less likely to hide the answer (#1711). Frequency
+ * still breaks ties among the preferred / remaining groups.
+ */
+export function biasHeaderSymbols(
+  symbols: readonly string[],
+  elided: ReadonlyArray<ElidedSymbolRef>,
+  cap: number,
+): { shown: string[]; omitted: number } {
+  const elidedLabels = elided.map((s) => `${s.name}(${s.kind})`);
+  const elidedSet = new Set(elidedLabels);
+  const elidedNames = new Set(elided.map((s) => s.name));
+  const counts = new Map<string, number>();
+  for (const s of symbols) counts.set(s, (counts.get(s) ?? 0) + 1);
+  // Also surface elided symbols that never made it into `symbols` (a dropped
+  // cluster's members are absent from assembleSection's list today).
+  for (const label of elidedLabels) {
+    if (!counts.has(label)) counts.set(label, 1);
+  }
+  // Earlier elided defs first (elided is startLine-sorted) so the header's
+  // named slots track source order through the hole rather than alphabetical
+  // filler (`calls0` beating `syncStateNow`).
+  const elidedRank = new Map<string, number>();
+  elided.forEach((s, i) => {
+    elidedRank.set(`${s.name}(${s.kind})`, i);
+    if (!elidedRank.has(s.name)) elidedRank.set(s.name, i);
+  });
+  const score = (label: string): [number, number, number] => {
+    const name = label.replace(/\(.*\)$/, '');
+    const preferred = elidedSet.has(label) || elidedNames.has(name) ? 1 : 0;
+    const rank = elidedRank.get(label) ?? elidedRank.get(name) ?? 9999;
+    return [preferred, counts.get(label) ?? 0, -rank];
+  };
+  const sorted = [...counts.keys()].sort((a, b) => {
+    const [pa, ca, ra] = score(a);
+    const [pb, cb, rb] = score(b);
+    return pb - pa || cb - ca || rb - ra || a.localeCompare(b);
+  });
+  const shown = sorted.slice(0, cap);
+  return { shown, omitted: Math.max(0, sorted.length - shown.length) };
+}
+
+/**
  * One pointer line: the file plus enough symbol names to make it NAMEABLE in a
  * follow-up explore. Capped — an un-capped list ran to ~1.9K on the #1500
  * fixture (12 generated CRUD symbols on one line), meta-text bought at the
@@ -942,6 +1087,12 @@ export interface ToolDefinition {
   };
   /** Behavioral hints for clients (see {@link ToolAnnotations}). */
   annotations?: ToolAnnotations;
+  /**
+   * MCP `_meta` on the tool definition. `anthropic/alwaysLoad: true` makes
+   * Claude Code load the tool at session start instead of deferring it behind
+   * its tool search (https://code.claude.com/docs/en/mcp#exempt-a-server-from-deferral).
+   */
+  _meta?: Record<string, unknown>;
 }
 
 /**
@@ -1196,6 +1347,9 @@ export const tools: ToolDefinition[] = [
       required: ['query'],
     },
     annotations: READ_ONLY_ANNOTATIONS,
+    // Loaded from the first prompt in Claude Code, which otherwise defers every
+    // MCP tool behind a ToolSearch step (#1696).
+    _meta: { 'anthropic/alwaysLoad': true },
   },
   {
     name: 'codegraph_status',
@@ -1535,7 +1689,7 @@ export class ToolHandler {
         if (tool.name === 'codegraph_explore') {
           return {
             ...tool,
-            description: `${tool.description} Budget: make at most ${budget} calls for this project (${stats.fileCount.toLocaleString()} files indexed).`,
+            description: `${tool.description} Exploration guidance — advisory only, NOT a quota: ~${budget} focused calls usually cover this project (${stats.fileCount.toLocaleString()} files indexed), and extra calls are never rejected or rate-limited.`,
           };
         }
         return tool;
@@ -2198,27 +2352,7 @@ export class ToolHandler {
     nodes: Node[],
     fileFilter: string | undefined
   ): { groups: Node[][]; filteredOut: boolean } {
-    let pool = nodes;
-    let filteredOut = false;
-    if (fileFilter) {
-      const wanted = fileFilter.replace(/^\.\//, '');
-      const narrowed = pool.filter(
-        (n) => n.filePath === wanted || n.filePath.endsWith(wanted) || n.filePath.endsWith(`/${wanted}`)
-      );
-      if (narrowed.length > 0) {
-        pool = narrowed;
-      } else {
-        filteredOut = true;
-      }
-    }
-    const byDef = new Map<string, Node[]>();
-    for (const n of pool) {
-      const key = `${n.filePath}|${n.qualifiedName}`;
-      const group = byDef.get(key);
-      if (group) group.push(n);
-      else byDef.set(key, [n]);
-    }
-    return { groups: [...byDef.values()], filteredOut };
+    return groupDefinitions(nodes, fileFilter);
   }
 
   /** Section heading for one distinct definition in grouped output. */
@@ -2241,7 +2375,7 @@ export class ToolHandler {
 
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
-      return this.textResult(`Symbol "${symbol}" not found in the codebase`);
+      return this.textResult(`Symbol "${symbol}" not found in the codebase${allMatches.note}`);
     }
 
     const { groups, filteredOut } = this.groupDefinitions(allMatches.nodes, fileFilter);
@@ -2275,7 +2409,12 @@ export class ToolHandler {
       // A successful `file` narrowing makes the multi-symbol aggregation note
       // stale — suppress it.
       const note = fileFilter && !filteredOut ? '' : allMatches.note;
-      const formatted = this.formatNodeList(callers.slice(0, limit), `Callers of ${symbol}`, labels) + note + filterNote;
+      // Say when the cap cut the list (#1639, #1674): a truncated answer with
+      // no marker reads as the complete set, and an agent under-counts from it.
+      const cut = callers.length > limit
+        ? `\n\n> Showing ${limit} of ${callers.length} callers; pass \`limit\` (up to 100) to widen.`
+        : '';
+      const formatted = this.formatNodeList(callers.slice(0, limit), `Callers of ${symbol}`, labels) + cut + note + filterNote;
       return this.textResult(this.truncateOutput(formatted));
     }
 
@@ -2297,6 +2436,9 @@ export class ToolHandler {
         const label = labels.get(node.id);
         lines.push(`- ${node.name} (${node.kind}) - ${node.filePath}${location}${label ? ` — via ${label}` : ''}`);
       }
+      if (callers.length > limit) {
+        lines.push(`- … +${callers.length - limit} more (pass \`limit\` to widen)`);
+      }
     }
     return this.textResult(this.truncateOutput(lines.join('\n') + filterNote));
   }
@@ -2314,7 +2456,7 @@ export class ToolHandler {
 
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
-      return this.textResult(`Symbol "${symbol}" not found in the codebase`);
+      return this.textResult(`Symbol "${symbol}" not found in the codebase${allMatches.note}`);
     }
 
     const { groups, filteredOut } = this.groupDefinitions(allMatches.nodes, fileFilter);
@@ -2347,7 +2489,12 @@ export class ToolHandler {
       // A successful `file` narrowing makes the multi-symbol aggregation note
       // stale — suppress it.
       const note = fileFilter && !filteredOut ? '' : allMatches.note;
-      const formatted = this.formatNodeList(callees.slice(0, limit), `Callees of ${symbol}`, labels) + note + filterNote;
+      // Say when the cap cut the list (#1639, #1674): a truncated answer with
+      // no marker reads as the complete set, and an agent under-counts from it.
+      const cut = callees.length > limit
+        ? `\n\n> Showing ${limit} of ${callees.length} callees; pass \`limit\` (up to 100) to widen.`
+        : '';
+      const formatted = this.formatNodeList(callees.slice(0, limit), `Callees of ${symbol}`, labels) + cut + note + filterNote;
       return this.textResult(this.truncateOutput(formatted));
     }
 
@@ -2367,6 +2514,9 @@ export class ToolHandler {
         const label = labels.get(node.id);
         lines.push(`- ${node.name} (${node.kind}) - ${node.filePath}${location}${label ? ` — via ${label}` : ''}`);
       }
+      if (callees.length > limit) {
+        lines.push(`- … +${callees.length - limit} more (pass \`limit\` to widen)`);
+      }
     }
     return this.textResult(this.truncateOutput(lines.join('\n') + filterNote));
   }
@@ -2384,7 +2534,7 @@ export class ToolHandler {
 
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
-      return this.textResult(`Symbol "${symbol}" not found in the codebase`);
+      return this.textResult(`Symbol "${symbol}" not found in the codebase${allMatches.note}`);
     }
 
     const { groups, filteredOut } = this.groupDefinitions(allMatches.nodes, fileFilter);
@@ -2613,9 +2763,16 @@ export class ToolHandler {
         const synthSeen = new Set<string>();
         for (const n of [...named.values(), ...dynNamed.values()]) {
           if (synthLines.length >= 6) break;
-          for (const { node: other, edge } of [...cg.getCallers(n.id), ...cg.getCallees(n.id)]) {
+          // RAW edges for the same reason as hasHeuristicEdge above — a static
+          // edge over the same pair hides the synthesized one from getCallers.
+          const incident = [...cg.getIncomingEdges(n.id), ...cg.getOutgoingEdges(n.id)];
+          for (const edge of incident) {
             if (synthLines.length >= 6) break;
-            if (edge.provenance !== 'heuristic' || other.id === n.id) continue;
+            if (edge.provenance !== 'heuristic') continue;
+            const otherId = edge.source === n.id ? edge.target : edge.source;
+            if (otherId === n.id) continue;
+            const other = cg.getNode(otherId);
+            if (!other) continue;
             if (skipInChain && skipInChain(edge)) continue;
             const src = edge.source === n.id ? n : other;
             const tgt = edge.source === n.id ? other : n;
@@ -3305,6 +3462,35 @@ export class ToolHandler {
     // substantive definition (skip empty stubs + test files, same relevance the
     // trace endpoint picker uses) and inject it as an entry, so every symbol the
     // agent explicitly named is in the subgraph and its file is scored.
+    /**
+     * Is this a member an INTERFACE declares — a signature with no body (#1638)?
+     *
+     * It arrives as an ordinary `method` node, so without asking, every ranking
+     * stage reads a `.d.ts` full of `method_signature`s as a file full of
+     * callables. Two stages below ask, for the same reason: a signature is the
+     * declaration of behaviour, never behaviour, and the rank a file earns must
+     * not grow just because its interfaces spell their members out.
+     *
+     * Cached; reached only for `method` nodes on paths that already probe the
+     * graph per node, so it adds a key lookup, not a pass.
+     */
+    const interfaceMemberCache = new Map<string, boolean>();
+    const isInterfaceOwnedMethod = (node: Node): boolean => {
+      if (node.kind !== 'method') return false;
+      const cached = interfaceMemberCache.get(node.id);
+      if (cached !== undefined) return cached;
+      let owned = false;
+      try {
+        owned = cg.getIncomingEdges(node.id).some(
+          (e) => e.kind === 'contains' && cg.getNode(e.source)?.kind === 'interface',
+        );
+      } catch {
+        owned = false; // a probe failure must not manufacture a penalty
+      }
+      interfaceMemberCache.set(node.id, owned);
+      return owned;
+    };
+
     const namedSeedIds = new Set<string>();
     // The subset of named seeds that earns the named-FIRST sort tier. We still
     // SEED every ≤3-def name (so RWR / flow ranking is unchanged), but only the
@@ -3475,7 +3661,21 @@ export class ToolHandler {
           // so a named symbol FTS already gathered never sorted to the top.)
           namedSeedIds.add(n.id);
         }
-        for (const n of tierPicks) tierSeedIds.add(n.id);
+        // An interface's `method_signature` seeds (so RWR and the flow ranking
+        // still see it, and a query that names it still reaches its file) but
+        // never earns the named-FIRST tier (#1638). That tier means "the agent
+        // asked for the symbol DEFINED here", and this seeding says as much —
+        // it resolves a token to its substantive definition and sorts bodies
+        // first. A declaration is the stub that sort demotes, not the answer.
+        // Without this the tier is reachable by prose: `body`, `stream` and
+        // `metadata` are member names in any platform `.d.ts`, and each one
+        // corroborates the next through `coNamedInFile`, so an ambient shim
+        // walks past the NL-stopword guard and lands above every implementation
+        // file — the exact inversion CG-28 exists to prevent, arriving on a key
+        // that sorts above the CG-28 penalty.
+        for (const n of tierPicks) {
+          if (!isInterfaceOwnedMethod(n)) tierSeedIds.add(n.id);
+        }
       }
     }
 
@@ -3526,9 +3726,21 @@ export class ToolHandler {
       isolationCache.set(node.id, isolated);
       return isolated;
     };
+    /**
+     * A `method_signature` reaches here as a `method`, which the kind table
+     * rates 1.0: "a callable — the unit an architecture question is about". It
+     * is not that. It is the row below on the same scale, "a member of a type",
+     * and rating it as a callable is how a 28-interface `.d.ts` doubled its
+     * score the moment its members became indexable (#1638). Only `method`
+     * needs correcting; `property` already sits in the member tier whoever
+     * declares it.
+     */
     const relevanceWeight = (node: Node, probeIsolation: boolean): number => {
-      const weight = RELEVANCE_KIND_WEIGHT[node.kind] ?? DEFAULT_RELEVANCE_KIND_WEIGHT;
-      if (!probeIsolation || !WEAK_RELEVANCE_KINDS.has(node.kind)) return weight;
+      const signatureOnly = isInterfaceOwnedMethod(node);
+      const weight = signatureOnly
+        ? TYPE_MEMBER_RELEVANCE_WEIGHT
+        : RELEVANCE_KIND_WEIGHT[node.kind] ?? DEFAULT_RELEVANCE_KIND_WEIGHT;
+      if (!probeIsolation || !(signatureOnly || WEAK_RELEVANCE_KINDS.has(node.kind))) return weight;
       return isUsageIsolated(node) ? ISOLATED_WEAK_KIND_WEIGHT : weight;
     };
 
@@ -3756,8 +3968,33 @@ export class ToolHandler {
     // (org-user.storage.ts, call-connected to the matches) accrues mass; a lone
     // text match (LensSwitcher.swift, matched "switch" but calls nothing in the
     // flow) gets only its restart probability → ~0, and is dropped by the gate.
+    //
+    // A file the ambient-declaration penalty has already damped is a candidate,
+    // but not a place a walk STARTS. The restart vector is uniform over seeds,
+    // so every seed divides the restart mass the implementation files compete
+    // for — and since #1638 a platform `.d.ts` contributes one seed per member,
+    // whose names (`body`, `stream`, `metadata`) are exactly what a prose flow
+    // query matches. That is what halves an implementation file's graph mass
+    // while the shim's holds steady: dilution of the restart vector, not
+    // connectivity. `contains` is not a RANK_EDGE, so these members carry almost
+    // no walk mass of their own; seeding is the whole of their effect on rank.
+    //
+    // `isDampedDeclaration` and not a bare ambient test: it already exempts a
+    // file whose declared type the query NAMED, so a query genuinely about the
+    // declared type keeps its seeds and the shim still ranks first. Damped files
+    // stay in the candidate set, stay reachable, and keep their `score`
+    // contribution — this changes only where the walk starts.
+    const rwrSeedIds = new Set<string>();
+    for (const id of entryNodeIds) {
+      const seed = subgraph.nodes.get(id);
+      if (seed && isDampedDeclaration(seed.filePath)) continue;
+      rwrSeedIds.add(id);
+    }
     const nodeRwr = this.computeGraphRelevance(
-      [...subgraph.nodes.keys()], subgraph.edges, entryNodeIds,
+      // Fall back to the unfiltered seeds when EVERY seed is damped: the walk
+      // must not lose its restart vector and return all-uniform.
+      [...subgraph.nodes.keys()], subgraph.edges,
+      rwrSeedIds.size > 0 ? rwrSeedIds : entryNodeIds,
     );
     //
     // Carries `rankPenalty` too, so generated/low-value files are demoted on the
@@ -4384,6 +4621,10 @@ export class ToolHandler {
       // (no `//` — not a comment in Python, Ruby, etc.). With line numbers on,
       // the line-number jump also signals the gap.
       const GAP_MARKER = '\n\n... (gap) ...\n\n';
+      // Full file index — not just the relevance-gathered `group.nodes`. A trim
+      // often drops filler symbols that never scored into the gather set; naming
+      // those holes still needs their defs (#1711).
+      const fileIndexNodes = cg.getNodesInFile(filePath);
 
       // Cross-call dedup (CG-18). `served` is what THIS session already sent the
       // agent for THIS file, and it is empty unless the file still hashes to the
@@ -4984,8 +5225,12 @@ export class ToolHandler {
       // does the slicing; a second function mirroring these window/padding rules
       // would drift.
       type SectionPart = { range: ExploreLineRange; text: string };
+      // Named gaps (#1711): a bare `... (gap) ...` hid the answer when the
+      // trim dropped the symbols the query was asking for. Budget estimates
+      // still use GAP_MARKER.length (a lower bound); the final fit test
+      // measures the real joined text.
       const sectionText = (parts: ReadonlyArray<SectionPart>): string =>
-        parts.map((p) => p.text).join(GAP_MARKER);
+        joinPartsWithNamedGaps(filePath, parts, fileIndexNodes);
       const buildSection = (
         c: { start: number; end: number; hasSpine?: boolean; spineCallLine?: number },
       ): SectionPart[] => {
@@ -5405,24 +5650,36 @@ export class ToolHandler {
       // the fit test below trims the weakest cluster and re-assembles rather
       // than skipping the file (CG-26).
       const assembleSection = (chosen: ReadonlySet<number>) => {
-        let text = '';
+        const parts: SectionPart[] = [];
         const symbols: string[] = [];
-        const ranges: ExploreLineRange[] = [];
         const covered: ExploreLineRange[] = [];
         for (let i = 0; i < clusters.length; i++) {
           if (!chosen.has(i)) continue;
           const cluster = clusters[i]!;
           const section = renderedClusters.get(i)!;
-          const part = sectionText(section.parts);
-          if (part.length > 0) {
-            if (text.length > 0) text += GAP_MARKER;
-            text += part;
-          }
-          ranges.push(...section.parts.map((p) => p.range));
+          parts.push(...section.parts);
           covered.push(...section.covered);
           symbols.push(...cluster.symbols);
         }
-        return { text, symbols, ranges, covered };
+        // Every member across ALL clusters (chosen or not) is a candidate for
+        // the header bias — a dropped cluster's symbols used to vanish from
+        // the header entirely (#1711).
+        const memberRefs: ElidedSymbolRef[] = [];
+        const seenMember = new Set<string>();
+        for (const c of clusters) {
+          for (const m of c.members) {
+            if (seenMember.has(m.name)) continue;
+            seenMember.add(m.name);
+            memberRefs.push({ name: m.name, kind: m.kind, startLine: m.start });
+          }
+        }
+        const ranges = parts.map((p) => p.range);
+        const text = joinPartsWithNamedGaps(filePath, parts, fileIndexNodes);
+        // Header bias prefers RELEVANT elisions (cluster members the trim cut)
+        // over incidental index filler — otherwise locale-sorted `calls0`…
+        // crowds out the answer methods (#1711).
+        const elided = symbolsNotInRanges(memberRefs, ranges);
+        return { text, symbols, ranges, covered, elided };
       };
       let assembled = assembleSection(chosenIndices);
 
@@ -5440,18 +5697,18 @@ export class ToolHandler {
       // Dedupe + cap the symbols list shown in the per-file header. Some
       // files (Session.swift in Alamofire) produced 3.4KB symbol lists
       // from cluster scoring + edge-source lines, dwarfing the per-file
-      // body cap. Show top names by frequency, with a "+N more" tail.
-      const headerFor = (symbols: readonly string[]): string => {
-        const symbolCounts = new Map<string, number>();
-        for (const s of symbols) symbolCounts.set(s, (symbolCounts.get(s) ?? 0) + 1);
-        const sortedSymbols = [...symbolCounts.entries()]
-          .sort((a, b) => b[1] - a[1])
-          .map(([name]) => name);
-        const headerSymbols = sortedSymbols.slice(0, budget.maxSymbolsInFileHeader);
-        const omittedCount = sortedSymbols.length - headerSymbols.length;
-        return fileSectionHeader(filePath, omittedCount > 0
-          ? `${headerSymbols.join(', ')}, +${omittedCount} more`
-          : headerSymbols.join(', '));
+      // body cap. Prefer symbols the trim elided (#1711), then frequency,
+      // with a "+N more" tail.
+      const headerFor = (
+        symbols: readonly string[],
+        elided: ReadonlyArray<ElidedSymbolRef> = [],
+      ): string => {
+        const { shown, omitted } = biasHeaderSymbols(
+          symbols, elided, budget.maxSymbolsInFileHeader,
+        );
+        return fileSectionHeader(filePath, omitted > 0
+          ? `${shown.join(', ')}, +${omitted} more`
+          : shown.join(', '));
       };
 
       // Last stop before the hard ceiling. The reservation already bounded cluster
@@ -5470,7 +5727,7 @@ export class ToolHandler {
       // admitted, reserved and rendered, and would have delivered nothing.
       // Only when the top-ranked cluster alone cannot fit is the file skipped —
       // that one is never sliced mid-method.
-      let fileHeader = headerFor(assembled.symbols);
+      let fileHeader = headerFor(assembled.symbols, assembled.elided);
       let chosenNow = chosenIndices;
       const costOfSection = (header: string, body: string) =>
         header.length + 2 + (body.length > 0 ? body.length + lang.length + 11 : 0);
@@ -5516,7 +5773,7 @@ export class ToolHandler {
           chosenNow = trimmed;
         }
         assembled = assembleSection(chosenNow);
-        fileHeader = headerFor(assembled.symbols);
+        fileHeader = headerFor(assembled.symbols, assembled.elided);
         anyFileTrimmed = true;
       }
       // One cluster left and still over — by the header estimate's error, at
@@ -5684,16 +5941,20 @@ export class ToolHandler {
     const completenessBlock: string[] = budget.includeCompletenessSignal
       ? ['', '---', `> **Complete source for ${filesIncluded} files is included above — do NOT re-read them.** If your question also needs files/symbols listed under "Not shown above" (or any area this call didn't cover), make ANOTHER codegraph_explore targeting those names — it returns the same source with line numbers and is cheaper and more complete than reading. Reserve Read for a single specific line range explore can't surface.`]
       : anyFileTrimmed
-        ? ['', `> Some file sections were trimmed for size. For a specific symbol you still need, run another \`codegraph_explore\` (or \`codegraph_node\`) with its exact name — line-numbered source, cheaper and more complete than Read.`]
+        ? ['', `> Some file sections were trimmed for size. Elided symbols are named inside gap markers as \`name (file:line)\` and preferred in the file header — run another \`codegraph_explore\` (or \`codegraph_node\`) with those exact names for their source.`]
         : [];
 
-    // Explore budget note based on project size.
+    // Advisory exploration-guidance note based on project size. Deliberately
+    // phrased as guidance, NOT a quota: agents read "budget / remaining calls /
+    // Synthesize once" as a hard cap and stop exploring early, falling back to
+    // grep + Read (which costs more tokens). The server never rejects or
+    // rate-limits extra explore calls, and the note says so explicitly.
     let budgetBlock: string[] = [];
     if (budget.includeBudgetNote) {
       try {
         const stats = cg.getStats();
         const callBudget = getExploreBudget(stats.fileCount);
-        budgetBlock = ['', `> **Explore budget: ${callBudget} calls for this project (${stats.fileCount.toLocaleString()} files indexed).** Each call covers ~6 files; if your question spans more, spend your remaining calls on the uncovered area BEFORE falling back to Read — another explore is cheaper and more complete than reading those files. Synthesize once you've used ${callBudget}.`];
+        budgetBlock = ['', `> **Exploration guidance — advisory only, NOT a quota: this project (~${stats.fileCount.toLocaleString()} files indexed) is usually covered in ≈${callBudget} focused explore calls, and extra calls are never rejected or rate-limited.** If the response above does not fully cover your question, run another codegraph_explore on the uncovered symbols — it is cheaper and more complete than Read. Only stop exploring when the response actually covers the flow you asked about.`];
       } catch {
         // Stats unavailable — skip budget note
       }
@@ -6585,7 +6846,7 @@ export class ToolHandler {
    */
   /**
    * Check if a node matches a symbol query — see `matchesSymbol` in
-   * `../graph/named-symbol-flow`, which owns the rules.
+   * `../graph/symbol-lookup`, which owns the rules.
    */
   private matchesSymbol(node: Node, symbol: string): boolean {
     return matchesSymbol(node, symbol);
