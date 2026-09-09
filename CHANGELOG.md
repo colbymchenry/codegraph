@@ -295,6 +295,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Python calls and file dependencies through `from package import module as alias` now appear in the graph, so renamed imports no longer hide live callers or imported modules. Thanks @JoeyNPP. (#1626)
 
+- **A function bound through a wrapper call is now part of the graph.** `const run = Effect.fn("Session.run")(function* () {…})` — and the same shape with Redux's `connect(mapState)(…)` or a project's own `wrap("name")(…)` — produced no function at all: only React's `useCallback`, `useEffectEvent` and `useEvent` were recognized as naming the function they wrap. The calls inside those bodies were attributed to the file instead, so a file appeared to call what the function called, and asking who calls a helper named the file rather than the function that really calls it. One codebase carried over a thousand of these. Any wrapper that is itself the result of a call now names the function it wraps, generators included; a callback passed straight to a single call, such as `useMemo` or `map`, is a computation and stays anonymous as before. Re-index after upgrading. (#1747)
+
 ## [1.6.0] - 2026-08-26
 
 ### Highlights
