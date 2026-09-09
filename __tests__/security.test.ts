@@ -227,6 +227,11 @@ describe('Symlink escape prevention (#527)', () => {
     expect(validatePathWithinRoot(root, 'escapedir/secret.txt')).toBeNull();
   });
 
+  it('rejects a missing leaf below an out-of-root directory symlink', () => {
+    if (!link(path.join(root, 'escapedir'), path.join(outside, 'pkg'))) return;
+    expect(validatePathWithinRoot(root, 'escapedir/not-created-yet/file.txt')).toBeNull();
+  });
+
   it('still allows an in-repo symlink that stays WITHIN the root (no over-blocking)', () => {
     if (!link(path.join(root, 'src', 'inlink.ts'), path.join(root, 'src', 'in.ts'))) return;
     expect(validatePathWithinRoot(root, 'src/inlink.ts')).not.toBeNull();

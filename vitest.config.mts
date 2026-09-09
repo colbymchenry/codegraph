@@ -1,10 +1,9 @@
+import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { defineConfig } from 'vitest/config';
 
 /**
- * The SHARED base. `vitest.workspace.mts` extends it twice — once for the
- * engine's node-environment suites and once for the viewer package's jsdom
- * one — so the environment, the plugins and the module-resolution conditions
- * a browser test needs cannot leak into the other 200-odd suites.
+ * One process, two Vitest projects. The engine stays in Node; the UI package
+ * test alone gets Svelte compilation, jsdom and browser resolution conditions.
  */
 export default defineConfig({
   test: {
@@ -38,5 +37,34 @@ export default defineConfig({
       provider: 'v8',
       reporter: ['text', 'json', 'html'],
     },
+    projects: [
+      {
+        extends: true,
+        test: {
+          name: 'engine',
+          include: ['__tests__/**/*.test.ts'],
+          exclude: ['**/node_modules/**', '**/dist/**', '__tests__/ui-package.test.ts'],
+        },
+      },
+      {
+        // Browser package resolution must not leak into the engine project:
+        // web-tree-sitter and other dual packages would resolve differently.
+        extends: false,
+        plugins: [svelte({ configFile: 'ui/svelte.config.js' })],
+        resolve: { conditions: ['browser'] },
+        test: {
+          name: 'ui',
+          globals: true,
+          include: ['__tests__/ui-package.test.ts'],
+          environment: 'jsdom',
+          server: {
+            deps: {
+              // @xyflow/svelte ships source .svelte files that Node cannot load.
+              inline: [/@xyflow\/svelte/],
+            },
+          },
+        },
+      },
+    ],
   },
 });
