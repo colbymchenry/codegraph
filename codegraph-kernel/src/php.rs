@@ -1155,6 +1155,17 @@ impl<'t> Walker<'t> {
             .or_else(|| node.child_by_field_name("scope"))
             .or_else(|| node.named_child(0));
         let Some(recv) = recv else { return };
+        // A namespaced receiver is a `qualified_name` — `Foo\Bar::class`,
+        // `\App\Models\User::TABLE`, and the alias form after `use X as Type;`.
+        // Match on the trailing simple name, as the php type-position walk
+        // already does: that is what the class node is stored as.
+        if recv.kind() == "qualified_name" {
+            let last = self.text(recv).rsplit('\\').next().unwrap_or("");
+            if capitalized_re().is_match(last) {
+                self.push_ref_at(owner, &last.to_string(), edge_kind_index("references").unwrap(), recv);
+            }
+            return;
+        }
         if matches!(
             recv.kind(),
             "identifier" | "type_identifier" | "simple_identifier" | "name" | "scoped_type_identifier"
@@ -1504,9 +1515,9 @@ fn find_anonymous_class_body(node: Node) -> Option<Node> {
 }
 
 /// The shared `new ns.Foo<T>()` normalization: strip `<...` from the first
-/// `<` (index > 0), keep the segment after the last `.`/`::`, strip ONE
-/// leading `:` or `.`, trim. Backslashes are NOT handled — php qualified
-/// names pass through whole.
+/// `<` (index > 0), keep the segment after the last `.`/`::`/`\`, strip ONE
+/// leading `:` or `.`, trim. The backslash is php's own separator, so
+/// `new \App\Models\User()` reduces to the name the class node carries.
 fn strip_generic_and_qualifier(raw: &str) -> String {
     let mut name = raw.to_string();
     if let Some(lt) = name.find('<') {
@@ -1518,7 +1529,8 @@ fn strip_generic_and_qualifier(raw: &str) -> String {
         .rfind('.')
         .map(|i| i as isize)
         .unwrap_or(-1)
-        .max(name.rfind("::").map(|i| i as isize).unwrap_or(-1));
+        .max(name.rfind("::").map(|i| i as isize).unwrap_or(-1))
+        .max(name.rfind('\\').map(|i| i as isize).unwrap_or(-1));
     if last_dot >= 0 {
         name = name[(last_dot as usize + 1)..].to_string();
         if name.starts_with(':') || name.starts_with('.') {
