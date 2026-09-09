@@ -685,9 +685,17 @@ function isBareJsCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
 const LOCAL_BINDING_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
 
 /**
- * Whether a JS/TS file binds `name` itself — as a `const`/`let`/`var`/
- * `function`/`class` declaration (destructuring included) or as a parameter
- * of a function or arrow. Such a binding shadows every same-named symbol in
+ * Whether a JS/TS file binds `name` itself — as a plain `const`/`let`/`var`/
+ * `function`/`class` declaration or as a parameter of a function or arrow.
+ * A binding that only re-names a same-named member of something defined
+ * elsewhere is NOT one: `const { fetchUser } = useStore.getState()` and the
+ * selector `const setZipUri = useStore((s) => s.setZipUri)` are how a store
+ * action reaches its caller, and the store-action resolution follows exactly
+ * those shapes — treating them as local would drop the `loginFlow → fetchUser`
+ * edge the graph is built to hold. A plain alias with a fallback (`const now =
+ * opts.now || Date.now`) is still local: on a Kotlin+JS app it otherwise
+ * landed 24 `now()` calls on a Kotlin test's `private val now`. A definition
+ * shadows every same-named symbol in
  * other files, so a bare call to it has no cross-file candidate: the
  * `resolve` of `new Promise((resolve, reject) => …)`, a spec's
  * `const transform = await makeTransform()`, a factory's `const now =
@@ -711,12 +719,24 @@ function isLocallyBoundJsName(name: string, filePath: string, context: Resolutio
   // `const { name } = require('./m')` / `= await import('./m')` binds an IMPORT,
   // not a shadow: the symbol lives in the other file and the call means it.
   const declRe = new RegExp(
-    '\\b(?:const|let|var)\\s+(?:' + n + '\\b|[{\\[][^;=]*?\\b' + n + '\\b[^;=]*?[}\\]])\\s*(?:=\\s*([^;\\n]*))?',
+    '\\b(?:const|let|var)\\s+' + n + '\\b\\s*(?:=\\s*([^;\\n]*))?',
     'g'
   );
   let bound = false;
+  // A selector: an arrow whose body is the same-named member of its own
+  // argument — `useStore((s) => s.setZipUri)`, `useSelector((st) => st.now)`.
+  // `() => Date.now()` is not one: the member is not picked off a parameter.
+  const selector = new RegExp('\\(?\\s*([\\w$]+)\\s*\\)?\\s*=>\\s*[({]?\\s*\\1\\.' + n + '\\b');
   for (const m of source.matchAll(declRe)) {
-    if (!/^\s*(?:await\s+)?(?:require|import)\s*\(/.test(m[1] ?? '')) { bound = true; break; }
+    const init = m[1] ?? '';
+    // `const x = require(…)` is an import; `const setZipUri = useStore((s) =>
+    // s.setZipUri)` picks a same-named member out of something defined
+    // elsewhere. Neither defines the name — the graph's symbol is what it means.
+    // A plain alias with a fallback, `const now = opts.now || Date.now`, IS a
+    // local binding: nothing in the graph is what that call means.
+    if (/^\s*(?:await\s+)?(?:require|import)\s*\(/.test(init) || selector.test(init)) continue;
+    bound = true;
+    break;
   }
   if (!bound) {
     bound =
