@@ -167,8 +167,8 @@ export function groupDefinitions(
  * The exact-name index is consulted FIRST and is authoritative: it is complete
  * and uncapped, whereas FTS ranks and truncates, and tokenises away `::` — so
  * a qualified query could miss a symbol that exists, or land on whatever
- * happened to rank first. FTS remains as the fallback for the fuzzy cases it is
- * genuinely good at (file basenames, partial names).
+ * happened to rank first. FTS candidates still have to satisfy the matcher;
+ * partial or mistyped names must never select the top fuzzy hit (#1473).
  */
 export function lookupSymbolNodes(cg: SymbolLookupHost, symbol: string): SymbolLookupResult {
   const qualified = isQualifiedSymbol(symbol);
@@ -183,12 +183,9 @@ export function lookupSymbolNodes(cg: SymbolLookupHost, symbol: string): SymbolL
     const exact = hits.filter((n) => matchesSymbol(n, symbol));
     if (exact.length > 0) {
       nodes = exact;
-    } else if (!qualified && hits[0]) {
-      // A bare name with no exact definition may still mean a file basename.
-      nodes = [hits[0]];
     }
-    // A qualified query with no exact match resolves to NOTHING rather than a
-    // misleading fuzzy hit (#173).
+    // Any query with no exact match resolves to NOTHING rather than a
+    // misleading fuzzy hit (#1473; qualified lookups already did this in #173).
   }
 
   if (nodes.length === 0) return { nodes: [], ambiguous: false };
