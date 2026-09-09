@@ -63,7 +63,8 @@ export function direct() { return new table.add().execute(); }
     const db = (cg as any).db.db;
     const rows = db
       .prepare(
-        `SELECT s.name source_name, t.name target_name, t.kind target_kind, t.file_path target_file
+        `SELECT s.name source_name, t.name target_name, t.kind target_kind, t.file_path target_file,
+                e.line edge_line, json_extract(e.metadata,'$.registeredAt') registered_at
          FROM edges e
          JOIN nodes s ON s.id = e.source
          JOIN nodes t ON t.id = e.target
@@ -77,6 +78,8 @@ export function direct() { return new table.add().execute(); }
     expect(rows.every((r: any) => r.source_name === 'executeCommand')).toBe(true);
     expect(rows.every((r: any) => r.target_kind === 'method' && r.target_name === 'execute')).toBe(true);
     expect(rows.every((r: any) => /commands\.ts$/.test(r.target_file))).toBe(true);
+    expect(rows.every((r: any) => r.edge_line === 13)).toBe(true);
+    expect(rows.every((r: any) => /manager\.ts:6$/.test(r.registered_at))).toBe(true);
     // The statically-accessed look-alike registry contributed nothing.
     expect(rows.some((r: any) => /static\.ts$/.test(r.target_file))).toBe(false);
   });

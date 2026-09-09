@@ -48,6 +48,10 @@ export interface PoolWorker {
 /** Default linger before a queued call is answered with busy-guidance. */
 const DEFAULT_BUSY_TIMEOUT_MS = 45_000; // < the ~60s MCP client request timeout
 
+/** Recycle a quiescent pool after a burst so worker-local graph/SQLite caches
+ * do not remain resident for the daemon's whole lifetime. */
+const DEFAULT_IDLE_SHRINK_MS = 60_000;
+
 /** Hard ceiling on pool size regardless of core count / env. */
 const MAX_POOL_SIZE = 16;
 
@@ -97,6 +101,8 @@ export interface QueryPoolOptions {
   softTimeoutMs?: number;
   /** Retries for an in-flight call whose worker crashed. Default 1. */
   maxRetries?: number;
+  /** Idle delay before recycling back to one fresh worker. Default 60s; 0 disables. */
+  idleShrinkMs?: number;
   /** Worker factory (tests inject a fake). Defaults to a real `worker_threads` Worker. */
   createWorker?: () => PoolWorker;
 }
@@ -157,13 +163,16 @@ export class QueryPool {
   private readonly maxSize: number;
   private readonly softTimeoutMs: number;
   private readonly maxRetries: number;
+  private readonly idleShrinkMs: number;
   private readonly createWorker: () => PoolWorker;
+  private idleShrinkTimer?: NodeJS.Timeout;
 
   constructor(opts: QueryPoolOptions) {
     this.root = opts.root;
     this.maxSize = Math.max(1, Math.min(opts.size ?? Math.max(1, os.cpus().length - 1), MAX_POOL_SIZE));
     this.softTimeoutMs = opts.softTimeoutMs ?? resolveBusyTimeoutMs();
     this.maxRetries = opts.maxRetries ?? 1;
+    this.idleShrinkMs = Math.max(0, opts.idleShrinkMs ?? DEFAULT_IDLE_SHRINK_MS);
     this.createWorker = opts.createWorker ?? (() => new Worker(WORKER_FILE, { workerData: { root: this.root } }));
     this.spawnOne(); // one eager warm worker, ready for the first call
   }
@@ -232,7 +241,45 @@ export class QueryPool {
       this.idle.push(w);
       if (job) this.settle(job, m.result ?? busyGuidance(0));
       this.drain();
+      this.armIdleShrink();
     }
+  }
+
+  private clearIdleShrink(): void {
+    if (this.idleShrinkTimer) clearTimeout(this.idleShrinkTimer);
+    this.idleShrinkTimer = undefined;
+  }
+
+  private armIdleShrink(): void {
+    this.clearIdleShrink();
+    if (
+      this.idleShrinkMs === 0 || this.destroyed || this.queue.length > 0 ||
+      this.inflight.size > 0 || this.pendingWorkers.size > 0 ||
+      this.idle.length !== this.workers.size
+    ) return;
+    this.idleShrinkTimer = setTimeout(() => this.shrinkIdle(), this.idleShrinkMs);
+    this.idleShrinkTimer.unref?.();
+  }
+
+  private shrinkIdle(): void {
+    this.idleShrinkTimer = undefined;
+    if (
+      this.destroyed || this.queue.length > 0 || this.inflight.size > 0 ||
+      this.pendingWorkers.size > 0 || this.idle.length !== this.workers.size
+    ) return;
+
+    // Drop every used isolate, including the last one: a single worker can hold
+    // hundreds of MB in graph and SQLite caches after a large query. Replace it
+    // with one clean warm worker so the next burst still avoids a cold queue.
+    const stale = [...this.workers];
+    this.workers.clear();
+    this.idle = [];
+    this.everReady = false;
+    for (const w of stale) {
+      try { void Promise.resolve(w.terminate()).catch(() => { /* already gone */ }); }
+      catch { /* already gone */ }
+    }
+    this.spawnOne();
   }
 
   // A worker died (crash hook, OOM, segfault, exit≠0). Respawn a replacement and
@@ -291,6 +338,7 @@ export class QueryPool {
 
   /** Run a read tool on the pool. Always resolves (never rejects). */
   run(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+    this.clearIdleShrink();
     return new Promise<ToolResult>((resolve) => {
       const job: Job = {
         id: this.nextId++, toolName, args, resolve,
@@ -312,6 +360,7 @@ export class QueryPool {
   async destroy(): Promise<void> {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.clearIdleShrink();
     const ws = [...this.workers];
     this.workers.clear();
     this.pendingWorkers.clear();
