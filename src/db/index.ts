@@ -123,7 +123,12 @@ export class DatabaseConnection {
 
     if (ftsIdx >= 0) {
       const preFts = schema.slice(0, ftsIdx);
-      const ftsSection = schema.slice(ftsIdx);
+      // FTS ends after the update trigger; required tables and indexes follow
+      // it in schema.sql and must still be created when FTS5 is unavailable.
+      const ftsSection = schema.slice(ftsIdx).match(
+        /^[\s\S]*?CREATE TRIGGER IF NOT EXISTS nodes_au\b[\s\S]*?END;/
+      )?.[0];
+      if (!ftsSection) throw new Error('schema.sql: FTS5 update trigger not found');
       // Execute everything before FTS5 first
       db.exec(preFts);
       // Try FTS5; if it fails, skip it and continue with LIKE-only search
@@ -138,6 +143,7 @@ export class DatabaseConnection {
           `For full-text search, use a Node.js build with FTS5 enabled.`
         );
       }
+      db.exec(schema.slice(ftsIdx + ftsSection.length));
     } else {
       db.exec(schema);
     }

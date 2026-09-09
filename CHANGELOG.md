@@ -140,6 +140,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- Indexing now succeeds when Node.js's SQLite lacks FTS5, with search falling back to name and fuzzy matching; thanks @aniruddhaadak80. (#1532)
+
 - `codegraph_explore` now makes clear that suggested call counts are advisory, so agents keep exploring when an answer is incomplete; thanks @rongbc. (#1504, #1570)
 
 - C++ functions following anonymous namespaces containing raw-string templates are now indexed correctly, even when template text resembles an unfinished macro call. (#1505)
