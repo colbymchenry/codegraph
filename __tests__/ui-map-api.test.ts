@@ -24,7 +24,13 @@ import * as os from 'os';
 import * as path from 'path';
 import CodeGraph from '../src/index';
 import { createGraphApi, startUiServer, type GraphApi, type UiServerHandle } from '../src/ui-server';
-import { moduleIdFor, normalizeRoot, pickDefaultRoot, resetMapCache } from '../src/ui-server/api/map';
+import {
+  moduleIdFor,
+  normalizeRoot,
+  pickDefaultDepth,
+  pickDefaultRoot,
+  resetMapCache,
+} from '../src/ui-server/api/map';
 
 let server: UiServerHandle;
 let api: GraphApi;
@@ -293,6 +299,102 @@ describe('pickDefaultRoot', () => {
   });
 });
 
+describe('pickDefaultDepth', () => {
+  /** `n` files under `dir`, each carrying `each` symbols. */
+  function spread(dir: string, n: number, each: number, test = false) {
+    return Array.from({ length: n }, (_, i) => ({
+      path: `${dir}/f${i}.ts`,
+      symbols: each,
+      test,
+    }));
+  }
+
+  it('goes deeper when one box holds the program', () => {
+    // The shape this rule exists for: a React-Native-ish repo whose whole app
+    // is under `src/`. At depth 1 the map is a box labelled `src` and nothing
+    // else — 285 files and two thirds of the symbols, unopenable.
+    const files = [
+      ...spread('src/components', 119, 12),
+      ...spread('src/app', 53, 21),
+      ...spread('src/api', 47, 7),
+      ...spread('src/utils', 24, 6),
+      ...spread('ios/CaptureView', 63, 28),
+      ...spread('ios/Camera', 3, 38),
+      ...spread('.github/workflows', 4, 0),
+    ];
+    expect(pickDefaultDepth(files, '')).toBe(2);
+  });
+
+  it('keeps a repository whose directories ARE its modules at one level', () => {
+    const files = [
+      ...spread('src/db', 8, 40),
+      ...spread('src/graph', 9, 40),
+      ...spread('src/mcp', 7, 40),
+      ...spread('src/search', 5, 40),
+      ...spread('src/sync', 4, 40),
+    ];
+    expect(pickDefaultDepth(files, 'src')).toBe(1);
+  });
+
+  it('does not open a dominant box that has nothing in it', () => {
+    // `src/core` holds most of the symbols but only three files: this is a
+    // small project honestly drawn, not a coarse grouping.
+    const files = [
+      ...spread('src/core', 3, 90),
+      ...spread('src/db', 2, 10),
+      ...spread('src/api', 2, 10),
+      { path: 'src/index.ts', symbols: 5, test: false },
+    ];
+    expect(pickDefaultDepth(files, 'src')).toBe(1);
+  });
+
+  it('keeps going while the picture is still one box', () => {
+    // `frontend/` then `frontend/src/` — two levels of packaging before the
+    // code. Neither is a map; the third level is.
+    const files = [
+      ...spread('frontend/src/screens', 15, 10),
+      ...spread('frontend/src/components', 14, 10),
+      ...spread('frontend/src/hooks', 8, 10),
+      ...spread('frontend/src/api', 6, 10),
+      ...spread('backend/app', 5, 8),
+    ];
+    expect(pickDefaultDepth(files, '')).toBe(3);
+  });
+
+  it('stops before a deeper grouping becomes a crowd', () => {
+    const files = [
+      ...spread('src/a', 30, 10),
+      ...Array.from({ length: 70 }, (_, i) => ({
+        path: `src/b/m${i}/f.ts`,
+        symbols: 1,
+        test: false,
+      })),
+    ];
+    // Depth 2 is dominated by `src/a`, but depth 3 would draw 71 boxes.
+    expect(pickDefaultDepth(files, '')).toBe(2);
+  });
+
+  it('does not chase a tree that has no more levels to give', () => {
+    const files = [
+      ...spread('src/a', 30, 10),
+      ...spread('src/b', 2, 1),
+    ];
+    expect(pickDefaultDepth(files, 'src')).toBe(1);
+  });
+
+  it('counts only the modules the map draws by default', () => {
+    // Test files are hidden unless the reader asks for them, so a depth that
+    // is only "enough boxes" once tests are counted is not enough boxes.
+    const files = [
+      ...spread('src/app', 40, 10),
+      ...spread('src/__tests__/a', 12, 10, true),
+      ...spread('src/__tests__/b', 12, 10, true),
+      ...spread('src/__tests__/c', 12, 10, true),
+    ];
+    expect(pickDefaultDepth(files, 'src')).toBe(1);
+  });
+});
+
 describe('GET /api/map', () => {
   it('is listed by the API index', async () => {
     const res = await request('/api');
@@ -407,11 +509,38 @@ describe('GET /api/map', () => {
     // down joins that level's bucket rather than being promoted to a module.
     expect(ids).toContain('src/core/passes');
     expect(ids).toContain('src/core/(root files)');
-    expect(ids).toContain('src/api/(root files)');
     expect(ids).not.toContain('src/core');
+    // …but the bucket keeps its name only because `src/core/passes` sits beside
+    // it. `src/api` has nothing below it, so its bucket IS `src/api` and saying
+    // otherwise would name a directory the repository does not have.
+    expect(ids).toContain('src/api');
+    expect(ids).not.toContain('src/api/(root files)');
 
     const slashed = await getMap('?root=src%2F&depth=2');
     expect(slashed.modules).toEqual(deep.modules);
+  });
+
+  it('counts the files outside each module that reference into it', async () => {
+    const map = await getMap('?root=src&depth=1');
+    const by = new Map<string, any>(map.modules.map((m: any) => [m.id, m]));
+
+    // `src/types.ts` and `src/index.ts` are what the rest of the fixture
+    // imports, so the bucket holding types is the most depended-on box.
+    const types = by.get('src/(root files)');
+    expect(types.dependents.files).toBeGreaterThan(0);
+    expect(types.dependents.modules).toBeGreaterThan(1);
+
+    // Every count is FILES OUTSIDE the module: never more than the rest of the
+    // repository, and a module's own internal imports never inflate it.
+    const total = map.modules.reduce((sum: number, m: any) => sum + m.files, 0);
+    for (const module of map.modules) {
+      expect(module.dependents.files).toBeLessThanOrEqual(total - module.files);
+      expect(module.dependents.modules).toBeLessThanOrEqual(map.modules.length - 1);
+      // A module nothing arrives at is an island, and the two must agree —
+      // they are computed from different queries and a reader sees both.
+      const arrives = map.links.some((l: any) => l.target === module.id);
+      if (!arrives) expect(module.dependents.files).toBe(0);
+    }
   });
 
   it('rejects an out-of-range depth as JSON, not as a crash', async () => {

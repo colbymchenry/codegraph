@@ -9,6 +9,7 @@ import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport } from './types';
 import { applyAliases } from './path-aliases';
+import { extractLocalExportAliases } from './alias-binding';
 import { resolveWorkspaceImport } from './workspace-packages';
 import {
   resolveMethodOnType,
@@ -113,7 +114,11 @@ function getFileExportIndex(filePath: string, context: ResolutionContext): FileE
   if (!idx) {
     idx = { byName: new Map(), defaultComponent: undefined, defaultFnClass: undefined, defaultBinding: undefined };
     const nodesInFile = context.getNodesInFile(filePath);
+    // Every declaration, exported or not: a local `export { impl as alias }`
+    // clause exports a declaration the extractor never flagged isExported.
+    const declared = new Map<string, Node>();
     for (const n of nodesInFile) {
+      if (!declared.has(n.name)) declared.set(n.name, n);
       if (!n.isExported) continue;
       if (!idx.byName.has(n.name)) idx.byName.set(n.name, n);
       if (idx.defaultComponent === undefined && n.kind === 'component') idx.defaultComponent = n;
@@ -124,6 +129,17 @@ function getFileExportIndex(filePath: string, context: ResolutionContext): FileE
       idx.defaultBinding = nodesInFile
         .filter((n) => n.name === bound && DEFAULT_BINDING_KINDS.has(n.kind))
         .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0];
+    }
+    // Bind names introduced by a local export clause to their declarations, so
+    // an importer asking for the renamed name gets the real symbol instead of
+    // falling through to the name-matcher (which cannot cross the rename).
+    const content = context.readFile(filePath);
+    if (content && content.includes('export')) {
+      for (const { exportedName, localName } of extractLocalExportAliases(content)) {
+        if (idx.byName.has(exportedName)) continue;
+        const decl = declared.get(localName);
+        if (decl) idx.byName.set(exportedName, decl);
+      }
     }
     perFile.set(filePath, idx);
   }
@@ -317,6 +333,21 @@ const C_CPP_STDLIB_HEADERS = new Set([
 ]);
 
 /**
+ * Languages whose imports are ES-module specifiers, extracted by
+ * `extractJSImports` and therefore classified by the same bare-specifier /
+ * alias / workspace rules. Svelte, Vue and Astro belong here: an SFC imports
+ * inside its `<script>` block (Astro: the `---` frontmatter) with exactly the
+ * same syntax, and leaving them out made `isExternalImport` answer "not
+ * external" for every npm specifier in an SFC.
+ */
+const ESM_IMPORT_LANGUAGES = new Set<Language>([
+  'typescript', 'tsx', 'javascript', 'jsx', 'arkts', 'svelte', 'vue', 'astro',
+]);
+
+/** Rust path roots that always name a standard-library crate. */
+const RUST_STDLIB_ROOTS = new Set(['std', 'core', 'alloc', 'proc_macro']);
+
+/**
  * Check if an import is external (npm package, etc.)
  *
  * `context` is consulted for project-defined path aliases
@@ -344,7 +375,7 @@ function isExternalImport(
   }
 
   // Common external patterns
-  if (language === 'typescript' || language === 'javascript' || language === 'tsx' || language === 'jsx' || language === 'arkts') {
+  if (ESM_IMPORT_LANGUAGES.has(language)) {
     // Node built-ins
     if (['fs', 'path', 'os', 'crypto', 'http', 'https', 'url', 'util', 'events', 'stream', 'child_process', 'buffer'].includes(importPath)) {
       return true;
@@ -1371,6 +1402,47 @@ function pickClosestJvmCandidate(candidates: Node[], fromPath: string): Node {
     }
   }
   return best;
+}
+
+/**
+ * PHP scoped calls are encoded as "Alias.method" by both extractors. A use
+ * mapping names a namespace, not a filesystem path, so resolve the receiver
+ * through its localName and look up the method on that exact imported type.
+ * undefined means this is not an imported static call; null means the import
+ * owns the call but its method is unavailable, so name fallbacks must not guess.
+ */
+export function resolvePhpImportedStaticCall(
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null | undefined {
+  if (ref.language !== 'php' || ref.referenceKind !== 'calls') return undefined;
+  const call = /^(\w+)\.(\w+)$/.exec(ref.referenceName);
+  if (!call) return undefined;
+  const [, receiver, member] = call;
+  const imp = context.getImportMappings(ref.filePath, ref.language)
+    .find((i) => i.localName === receiver);
+  if (!imp) return undefined;
+
+  // PHP variables occupy a different namespace from class imports. Extraction
+  // strips the leading "$" from "$Alias->method()" too; leave that receiver to
+  // local type inference even when a class import has the same local name.
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split('\n');
+  const line = lines?.[ref.line - 1];
+  if (line?.slice(ref.column).startsWith('$')) return undefined;
+
+  const fqn = imp.source.replace(/^\\/, '');
+  const separator = fqn.lastIndexOf('\\');
+  const typeName = separator < 0
+    ? fqn
+    : `${fqn.slice(0, separator)}::${fqn.slice(separator + 1)}`;
+  const owners = context.getNodesByQualifiedName(typeName)
+    .filter((n) => n.language === 'php' && STATIC_MEMBER_CONTAINERS.has(n.kind));
+  if (owners.length !== 1) return null;
+  const owner = owners[0]!;
+  const methods = context.getNodesByQualifiedName(`${owner.qualifiedName}::${member}`)
+    .filter((n) => n.language === 'php' && n.kind === 'method' && n.filePath === owner.filePath);
+  if (methods.length !== 1) return null;
+  return { original: ref, targetNodeId: methods[0]!.id, confidence: 0.95, resolvedBy: 'import' };
 }
 
 export function resolveViaImport(
@@ -2445,4 +2517,124 @@ function resolveStaticMember(
     if (callable) return callable;
   }
   return candidates[0];
+}
+
+/**
+ * Rust `use` declarations, flattened to `localName → full path`.
+ *
+ * Rust is the one supported language with NO `ImportMapping` extraction (see
+ * `extractImportMappings`), so this is the only channel that can tell whether
+ * a bare type name in a Rust file was brought in by a `use`. Handles nested
+ * groups (`use a::{b::C, d as E}`), globs (skipped — they bind no single
+ * name), and `as` aliases.
+ */
+function collectRustUseBindings(content: string): Map<string, string> {
+  const out = new Map<string, string>();
+
+  // Expand one level of `{...}` at a time so `a::{b::{C, D}, E}` flattens.
+  const expand = (spec: string): string[] => {
+    const open = spec.indexOf('{');
+    if (open === -1) return [spec.trim()];
+    const prefix = spec.slice(0, open);
+    let depth = 0;
+    let close = -1;
+    for (let i = open; i < spec.length; i++) {
+      if (spec[i] === '{') depth++;
+      else if (spec[i] === '}') {
+        depth--;
+        if (depth === 0) { close = i; break; }
+      }
+    }
+    if (close === -1) return [];
+    const suffix = spec.slice(close + 1);
+    const inner = spec.slice(open + 1, close);
+    const parts: string[] = [];
+    let depth2 = 0;
+    let start = 0;
+    for (let i = 0; i <= inner.length; i++) {
+      const ch = inner[i];
+      if (ch === '{') depth2++;
+      else if (ch === '}') depth2--;
+      if (i === inner.length || (ch === ',' && depth2 === 0)) {
+        const seg = inner.slice(start, i).trim();
+        if (seg) parts.push(seg);
+        start = i + 1;
+      }
+    }
+    return parts.flatMap((p) => expand(prefix + p + suffix));
+  };
+
+  // `use` items end at the first `;`. Attributes/visibility (`pub use`) are
+  // irrelevant to the binding itself.
+  const useRe = /(^|\n)\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([^;]+);/g;
+  let m: RegExpExecArray | null;
+  while ((m = useRe.exec(content)) !== null) {
+    for (const spec of expand(m[2]!.replace(/\s+/g, ' '))) {
+      const aliasMatch = /^(.*?)\s+as\s+([A-Za-z_]\w*)$/.exec(spec);
+      const rawPath = (aliasMatch ? aliasMatch[1]! : spec).trim();
+      if (!rawPath || rawPath.endsWith('*')) continue;
+      const segments = rawPath.split('::').map((s) => s.trim()).filter(Boolean);
+      const leaf = segments[segments.length - 1];
+      if (!leaf) continue;
+      const local = aliasMatch ? aliasMatch[2]! : leaf;
+      out.set(local, segments.join('::'));
+    }
+  }
+  return out;
+}
+
+/**
+ * Is `name`, as used in `ref`'s file, bound by an import whose module lives
+ * OUTSIDE the repository?
+ *
+ * When it is, no in-repo node can be the referent: the symbol is defined in a
+ * third-party crate/package, and any same-named local symbol the name-matcher
+ * finds is a coincidence. Rust `use std::error::Error;` + `impl Error for
+ * MapperError {}` bound to a local `MapperError::Error` variant, and once
+ * non-type kinds were filtered out it simply moved to an unrelated local
+ * `type Error` alias — restricting kinds alone RELOCATES the false edge
+ * instead of removing it, so locality has to be checked too.
+ *
+ * Answers only when it can be CERTAIN, because a false "yes" deletes a real
+ * edge. Two languages qualify, each with an oracle that cannot be wrong:
+ *
+ *  - **Rust** — the `use` path is rooted at a standard-library crate
+ *    (`std`/`core`/`alloc`/`proc_macro`), which by definition ships outside
+ *    any repository. Deliberately NOT generalized to "the module path doesn't
+ *    resolve to a file": a crate can re-export another workspace crate's
+ *    modules (`pub use pupil_core::{ports, domain};`), so `crate::ports::X`
+ *    has no `src/ports/` directory to walk yet is entirely in-repo — that
+ *    generalization measured 13 real trait implementations deleted.
+ *  - **ES modules** — `isExternalImport`, which already accounts for tsconfig
+ *    path aliases and monorepo workspace packages.
+ *
+ * Everything else returns false and resolves exactly as before. JVM and Python
+ * imports notably do NOT go through `resolveImportPath` (they have dedicated
+ * FQN/module matchers), so there is no trustworthy oracle to consult here.
+ */
+export function isBoundToOutOfRepoImport(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): boolean {
+  const name = ref.referenceName;
+  if (name.includes('::') || name.includes('.')) return false; // qualified refs resolve by path
+
+  if (ref.language === 'rust') {
+    const content = context.readFile(ref.filePath);
+    if (!content) return false;
+    const usePath = collectRustUseBindings(content).get(name);
+    if (!usePath) return false;
+    const segments = usePath.split('::');
+    if (segments.length < 2 || !RUST_STDLIB_ROOTS.has(segments[0]!)) return false;
+    // 2015-edition crate-relative paths can shadow a stdlib root with a local
+    // module of the same name — if the path walks to a real file, it's local.
+    return resolveRustModuleFile(segments.slice(0, -1), ref.filePath, context) === null;
+  }
+
+  if (!ESM_IMPORT_LANGUAGES.has(ref.language)) return false;
+  for (const imp of context.getImportMappings(ref.filePath, ref.language)) {
+    if (imp.localName !== name) continue;
+    return isExternalImport(imp.source, ref.language, context);
+  }
+  return false;
 }

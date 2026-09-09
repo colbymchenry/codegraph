@@ -39,7 +39,8 @@ export interface FileHrefOptions {
 
 export interface MapHrefOptions {
   root?: string | null;
-  depth?: number;
+  /** Absent or null leaves the grouping to the answering side. */
+  depth?: number | null;
   tests?: boolean;
 }
 
@@ -79,7 +80,14 @@ export interface StepsHrefOptions {
  * serve.
  */
 export interface NavigationDriver {
-  symbolHref(id: string, opts?: SymbolHrefOptions): string;
+  /**
+   * A symbol's page — or, with `null`, the Symbol tab with nothing chosen yet.
+   *
+   * The null case has to be addressable. Without it the tab had no href of its
+   * own and fell back to the landing page, which on a project that HAS screens
+   * is the Screens tab: clicking Symbol landed you on somebody else's view.
+   */
+  symbolHref(id: string | null, opts?: SymbolHrefOptions): string;
   fileHref(path: string, opts?: FileHrefOptions): string;
   mapHref(opts?: MapHrefOptions): string;
   flowHref(opts?: FlowHrefOptions): string;
@@ -116,6 +124,9 @@ export const hashNavigation: NavigationDriver = {
     const params = new URLSearchParams();
     if (opts.trail) params.set('t', opts.trail);
     if (opts.line) params.set('hl', String(opts.line));
+    // No id: the tab itself. `#/s` rather than `#/s/` so the segment filter
+    // cannot read an empty id back out of it.
+    if (!id) return `#/s${query(params)}`;
     return `#/s/${encodePath(id)}${query(params)}`;
   },
 
@@ -131,7 +142,9 @@ export const hashNavigation: NavigationDriver = {
   mapHref(opts = {}) {
     const params = new URLSearchParams();
     if (opts.root !== undefined && opts.root !== null) params.set('root', opts.root);
-    if (opts.depth && opts.depth !== 1) params.set('depth', String(opts.depth));
+    // Including 1: a reader who asked for top-level directories has said
+    // something, and dropping it would hand the choice back to the answer.
+    if (opts.depth) params.set('depth', String(opts.depth));
     if (opts.tests) params.set('tests', '1');
     return `#/map${query(params)}`;
   },
@@ -224,7 +237,7 @@ export function getNavigationDriver(): NavigationDriver {
 
 /* --------------------------- what the components actually call ----------- */
 
-export function symbolHref(id: string, opts: SymbolHrefOptions = {}): string {
+export function symbolHref(id: string | null, opts: SymbolHrefOptions = {}): string {
   return driver.symbolHref(id, opts);
 }
 

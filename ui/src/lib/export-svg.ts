@@ -172,6 +172,7 @@ function rect(
   h: number,
   attrs: {
     fill?: string;
+    fillOpacity?: number;
     stroke?: string;
     strokeWidth?: number;
     dash?: string;
@@ -184,6 +185,7 @@ function rect(
     `height="${round(h)}"`,
     `fill="${attrs.fill ?? 'none'}"`,
   ];
+  if (attrs.fillOpacity !== undefined) parts.push(`fill-opacity="${attrs.fillOpacity}"`);
   if (attrs.stroke) {
     parts.push(`stroke="${attrs.stroke}"`, `stroke-width="${attrs.strokeWidth ?? 1}"`);
     if (attrs.dash) parts.push(`stroke-dasharray="${attrs.dash}"`);
@@ -837,9 +839,20 @@ function mapNodeSvg(node: MapNodeLayout, selected: boolean, dimmed: boolean): st
         size: MODULE_META_SIZE,
         fill: dimmed ? EXPORT_COLORS.ink4 : EXPORT_COLORS.ink3,
       },
-      esc(truncate(moduleMetaLabel(module), room, MODULE_META_SIZE, SANS_ADVANCE))
+      // `node.island`, matching the canvas: an exported map that counts a
+      // module the screen said nothing depends on is a different picture.
+      esc(truncate(moduleMetaLabel(module, node.island), room, MODULE_META_SIZE, SANS_ADVANCE))
     )
   );
+  // The weight bar, same 3px inside the bottom edge as the canvas draws.
+  if (node.weight > 0) {
+    out.push(
+      rect(node.x, node.y + node.height - 4, node.width * node.weight, 4, {
+        fill: EXPORT_COLORS.ink,
+        fillOpacity: dimmed ? 0.1 : 0.3,
+      })
+    );
+  }
   return out.join('');
 }
 

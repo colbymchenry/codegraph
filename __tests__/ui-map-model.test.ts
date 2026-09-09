@@ -46,6 +46,7 @@ function mod(id: string, over: Partial<WireMapModule> = {}): WireMapModule {
     test: over.test ?? false,
     facade: over.facade ?? false,
     fileList: over.fileList ?? { total: 3, shown: 3, truncated: false, items: [] },
+    dependents: over.dependents ?? { files: 0, modules: 0 },
   };
 }
 
@@ -471,5 +472,51 @@ describe('directional ports and room', () => {
     expect(wide.height).toBe(buildMapLayout(payload, OPTS).height + (116 - LAYER_GAP));
     // Layer 0 is the bottom, so it has the larger y.
     expect(wide.layers[0]!.y - wide.layers[1]!.y).toBe(NODE_HEIGHT + 116);
+  });
+});
+
+describe('how much leans on a box', () => {
+  it('scales the bar against the heaviest module DRAWN', () => {
+    const modules = [
+      mod('src/types', { dependents: { files: 90, modules: 5 } }),
+      mod('src/db', { dependents: { files: 45, modules: 3 } }),
+      mod('src/cli', { dependents: { files: 0, modules: 0 } }),
+    ];
+    const links = [link('src/db', 'src/types', 20), link('src/cli', 'src/db', 20)];
+    const layout = buildMapLayout({ modules, links }, OPTS);
+    const weightOf = (id: string) => layout.nodes.find((n) => n.id === id)!.weight;
+
+    expect(weightOf('src/types')).toBe(1);
+    expect(weightOf('src/db')).toBeCloseTo(0.5, 5);
+    // Nothing depends on the CLI, so it draws no bar at all rather than a
+    // sliver a reader would have to squint at to call empty.
+    expect(weightOf('src/cli')).toBe(0);
+  });
+
+  it('rescales when a heavier test module joins the picture', () => {
+    const modules = [
+      mod('src/types', { dependents: { files: 40, modules: 4 } }),
+      mod('src/app', { dependents: { files: 10, modules: 1 } }),
+      mod('__tests__', { test: true, dependents: { files: 80, modules: 6 } }),
+    ];
+    const links = [link('src/app', 'src/types', 20), link('__tests__', 'src/app', 20)];
+    const spec = { modules, links };
+    // Tests off: the app's own busiest box is the full bar.
+    const off = buildMapLayout(spec, { includeTests: false });
+    expect(off.nodes.find((n) => n.id === 'src/types')!.weight).toBe(1);
+    // Tests on: the scale moves, rather than leaving a bar running past a
+    // maximum the reader cannot see.
+    const on = buildMapLayout(spec, { includeTests: true });
+    expect(on.nodes.find((n) => n.id === 'src/types')!.weight).toBeCloseTo(0.5, 5);
+    expect(on.nodes.find((n) => n.id === '__tests__')!.weight).toBe(1);
+  });
+
+  it('says the count on the box, and says nothing when nothing depends on it', () => {
+    expect(moduleMetaLabel(mod('src/db', { dependents: { files: 45, modules: 3 } }))).toBe(
+      '30 symbols · 3 files · 45 depend on it'
+    );
+    expect(moduleMetaLabel(mod('src/cli'))).toBe('30 symbols · 3 files');
+    // An island's line is still the one sentence that matters about it.
+    expect(moduleMetaLabel(mod('src/cli'), true)).toBe('nothing depends on this');
   });
 });

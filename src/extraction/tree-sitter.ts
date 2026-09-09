@@ -407,34 +407,21 @@ const LITERAL_RECEIVER_TYPES = new Set([
  */
 const TS_JS_CHAIN_LANGUAGES = new Set(['typescript', 'tsx', 'javascript', 'jsx']);
 
-/**
- * Host objects a TS/JS project never declares: the browser, extension, and
- * runtime namespaces, plus the builtin constructors whose statics are library
- * calls. A member chain ROOTED at one of these ends in a platform API, so the
- * bare method name the extractor used to emit for `chrome.storage.local.get(k)`
- * or `document.body.querySelector(s)` could only ever exact-match an unrelated
- * project symbol that happened to share the name (#1707). `window` is absent on
- * purpose: `window.MyNamespace.doThing()` reaches a project symbol.
- */
-const TS_JS_HOST_GLOBAL_ROOTS = new Set([
-  'chrome', 'browser', 'document', 'navigator', 'performance', 'console',
-  'localStorage', 'sessionStorage', 'indexedDB', 'crypto', 'globalThis',
-  'process', 'Math', 'JSON', 'Object', 'Array', 'Reflect', 'Promise', 'Intl',
-]);
-
 /** Receiver node types (TS/JS grammars) that continue a member chain downward. */
 const TS_JS_CHAIN_RECEIVER_TYPES = new Set(['member_expression', 'subscript_expression']);
 
 /**
- * Root identifier of a TS/JS member chain — `chrome` for `chrome.storage.local`
- * — or null when the chain bottoms out in a call, a literal, or `this`.
+ * Identifier-rooted member chains have no inferred property type (#1566),
+ * including host API chains (#1707). Keep the existing `window.MyNamespace`
+ * escape for project globals; call-result and `this` receivers have their own
+ * paths and are outside this guard.
  */
-function tsJsChainRoot(node: SyntaxNode, source: string): string | null {
+function isUnresolvedTsJsChain(node: SyntaxNode, source: string): boolean {
   let cur: SyntaxNode | null = node;
   while (cur && TS_JS_CHAIN_RECEIVER_TYPES.has(cur.type)) {
     cur = getChildByField(cur, 'object');
   }
-  return cur && cur.type === 'identifier' ? getNodeText(cur, source) : null;
+  return !!cur && cur.type === 'identifier' && getNodeText(cur, source) !== 'window';
 }
 
 /**
@@ -597,6 +584,18 @@ export class TreeSitterExtractor {
 
       if (packageNodeId) this.nodeStack.pop();
       this.nodeStack.pop();
+
+      // hasError is routine for several grammars; warn only when no symbols survived.
+      const symbolCount = this.nodes.filter((n) => n.kind !== 'file').length;
+      if (this.tree?.rootNode.hasError && symbolCount === 0) {
+        this.errors.push({
+          message:
+            `${this.filePath}: parse produced no symbols (tree has errors) — ` +
+            `the file is indexed but contributes nothing to the graph`,
+          severity: 'warning',
+          code: 'parse_error',
+        });
+      }
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
 
@@ -1975,8 +1974,16 @@ export class TreeSitterExtractor {
     // Skip forward declarations and type references (no body = not a definition)
     // — EXCEPT C# positional records (`record struct M(decimal Amount);`),
     // complete definitions with no body block. (#831)
+    //
+    // `allowBodilessStruct` is the per-language escape hatch for the same
+    // situation: a bodiless struct that IS a complete definition (Rust's unit
+    // struct `struct Unit;`). Opposite polarity from `skipBodilessClass`
+    // (#1093) because the two defaults differ — a bodiless CLASS is kept
+    // unless a language opts into skipping, a bodiless STRUCT is skipped
+    // unless a language opts into keeping.
     const body = getChildByField(node, this.extractor.bodyField);
-    if (!body && node.type !== 'record_declaration') return;
+    if (!body && node.type !== 'record_declaration' && !this.extractor.allowBodilessStruct)
+      return;
 
     const name = extractName(node, this.source, this.extractor);
     const docstring = getPrecedingDocstring(node, this.source);
@@ -2250,6 +2257,21 @@ export class TreeSitterExtractor {
           // and the language-aware path in `extractTypeAnnotations` descends
           // into that wrapper (#381).
           this.extractTypeAnnotations(node, fieldNode.id);
+          // Walk the initializer ATTRIBUTED to the declared field (#693, the
+          // Go fix; same shape as the TS/JS class-field walk above). The
+          // dispatcher only scanned this subtree for function-as-value
+          // candidates, so a lambda / method reference / anonymous class in
+          // `private final Runnable r = () -> target();` contributed NO call
+          // edge at all and `target` looked callerless. Keyed on the `value`
+          // FIELD, which only Java's `variable_declarator` carries — C#,
+          // VB.NET and PHP spell their initializer differently and are
+          // deliberately untouched here.
+          const valueNode = getChildByField(decl, 'value');
+          if (valueNode) {
+            this.nodeStack.push(fieldNode.id);
+            this.visitFunctionBody(valueNode, fieldNode.id);
+            this.nodeStack.pop();
+          }
         }
       }
     } else {
@@ -2811,19 +2833,24 @@ export class TreeSitterExtractor {
               storeCollections.push(objectOfFns);
             }
 
-            // Visit the initializer body for calls — EXCEPT object literals (their
-            // function-valued properties are extracted below) and the store-factory
-            // / createApi / store-collection call whose nested objects we extract
-            // method-by-method below (walking the whole call would re-visit those
-            // method arrows and mis-attribute their inner calls to the file scope).
-            if (valueNode &&
-                valueNode.type !== 'object' &&
-                valueNode.type !== 'object_expression' &&
-                !(extractObjectMethods && valueNode.type === 'call_expression') &&
-                !rtkEndpoints &&
-                !piniaSetup &&
-                storeCollections.length === 0) {
+            // Visit the initializer body for calls, ATTRIBUTED to the declared
+            // symbol (#693) — EXCEPT the shapes whose members are extracted
+            // one-by-one below (the store-factory / createApi / store-collection
+            // objects), where walking the whole initializer would re-visit each
+            // member arrow and double-count its calls.
+            //
+            // Two things were wrong here before. The walk ran with only the FILE
+            // on the stack, so `const cfg = load()` recorded the FILE as load's
+            // caller — the exact leak Go's #693 fixed. And an object literal was
+            // skipped outright, so `const obj = { handler: () => target() }`
+            // contributed nothing at all unless the const was exported (only then
+            // does extractObjectLiteralFunctions mint the members).
+            const membersExtractedSeparately =
+              extractObjectMethods || !!rtkEndpoints || !!piniaSetup || storeCollections.length > 0;
+            if (valueNode && !membersExtractedSeparately) {
+              if (varNode) this.nodeStack.push(varNode.id);
               this.visitFunctionBody(valueNode, '');
+              if (varNode) this.nodeStack.pop();
             }
 
             if (extractObjectMethods && objectOfFns) {
@@ -2848,6 +2875,7 @@ export class TreeSitterExtractor {
 
       // Ruby constant assignments (`MAX = 3`) have a `constant`-typed LHS, not
       // `identifier`; without this they were never extracted as symbols at all.
+      let assigned: Node | null = null;
       if (left && (left.type === 'identifier' || left.type === 'constant')) {
         const name = getNodeText(left, this.source);
         // Skip if name starts with lowercase and looks like a function call result
@@ -2855,10 +2883,22 @@ export class TreeSitterExtractor {
         const initValue = right ? getNodeText(right, this.source).slice(0, 100) : undefined;
         const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
 
-        this.createNode(kind, name, node, {
+        assigned = this.createNode(kind, name, node, {
           docstring,
           signature: initSignature,
         });
+      }
+      // Walk the initializer ATTRIBUTED to the assigned name (#693). A
+      // module-level `app = FastAPI()` / `ENGINE = create_engine(url)` /
+      // `handler = lambda: run()` dropped every call on the right-hand side, so
+      // whatever the module builds at import time linked to nothing. A tuple
+      // target (`a, b = f(), g()`) mints no symbol, so its RHS is walked at the
+      // enclosing scope rather than lost. Python only: Ruby shares this branch
+      // and gets its own turn.
+      if (this.language === 'python' && right) {
+        if (assigned) this.nodeStack.push(assigned.id);
+        this.visitFunctionBody(right, '');
+        if (assigned) this.nodeStack.pop();
       }
     } else if (this.language === 'go') {
       // Go: var_declaration, short_var_declaration, const_declaration
@@ -3012,6 +3052,8 @@ export class TreeSitterExtractor {
     } else {
       // Generic fallback for other languages
       // Try to find identifier children
+      const nameField = getChildByField(node, 'name');
+      let declared: Node | null = null;
       for (let i = 0; i < node.namedChildCount; i++) {
         const child = node.namedChild(i);
         if (child?.type === 'identifier' || child?.type === 'variable_declarator') {
@@ -3020,11 +3062,28 @@ export class TreeSitterExtractor {
             : extractName(child, this.source, this.extractor);
 
           if (name && name !== '<anonymous>') {
-            this.createNode(kind, name, child, {
+            const created = this.createNode(kind, name, child, {
               docstring,
               isExported,
             });
+            if (created && nameField && child.startIndex === nameField.startIndex) {
+              declared = created;
+            }
           }
+        }
+      }
+      // Walk the initializer ATTRIBUTED to the declared symbol (#693). Rust
+      // only for now: `const N: usize = compute()` and
+      // `static REGISTRY: Lazy<T> = Lazy::new(|| build())` dropped every call
+      // inside the initializer, so a handler table or a lazily-built singleton
+      // linked to nothing. The other languages sharing this fallback spell
+      // their initializer differently and get their own turn.
+      if (this.language === 'rust') {
+        const valueNode = getChildByField(node, 'value');
+        if (valueNode) {
+          if (declared) this.nodeStack.push(declared.id);
+          this.visitFunctionBody(valueNode, '');
+          if (declared) this.nodeStack.pop();
         }
       }
     }
@@ -4745,6 +4804,29 @@ export class TreeSitterExtractor {
               (this.language === 'typescript' ||
                 this.language === 'javascript' ||
                 this.language === 'tsx' ||
+                this.language === 'jsx') &&
+              receiver &&
+              receiver.type === 'member_expression' &&
+              getChildByField(receiver, 'object')?.type === 'this' &&
+              getChildByField(receiver, 'property')?.type === 'property_identifier'
+            ) {
+              // TS/JS call through a field of the enclosing class —
+              // `this.mailer.send()` (#1496). Keep the `this.<field>` prefix:
+              // the resolver reads the field's declared type off the class's
+              // own declaration (`private mailer: Mailer`, `mailer = new
+              // Mailer()`) and resolves the method on THAT type — or leaves the
+              // ref unresolved when the type is external or unknown. Previously
+              // this collapsed to the bare method name, which exact-matched
+              // whichever same-named method was nearest — the calling method
+              // itself when the two share a name, a self-edge not in the
+              // source. Same discipline as Rust's `self.<field>` (#1585).
+              // Mirrored in the kernel's extract_call (tsjs/extractors.rs).
+              const fieldName = getNodeText(getChildByField(receiver, 'property')!, this.source);
+              calleeName = `this.${fieldName}.${methodName}`;
+            } else if (
+              (this.language === 'typescript' ||
+                this.language === 'javascript' ||
+                this.language === 'tsx' ||
                 this.language === 'jsx' ||
                 this.language === 'python') &&
               receiver &&
@@ -4786,18 +4868,14 @@ export class TreeSitterExtractor {
               TS_JS_CHAIN_LANGUAGES.has(this.language) &&
               receiver &&
               TS_JS_CHAIN_RECEIVER_TYPES.has(receiver.type) &&
-              TS_JS_HOST_GLOBAL_ROOTS.has(tsJsChainRoot(receiver, this.source) ?? '')
+              isUnresolvedTsJsChain(receiver, this.source)
             ) {
-              // TS/JS member call reached through a host namespace —
-              // `chrome.storage.local.get(key)`, `document.body.querySelector(s)`.
-              // The bare method name this used to emit exact-matched whatever
-              // project symbol shared it: every `chrome.storage.local.get/set`
-              // in a storage wrapper bound to the wrapper's own `get`/`set`,
-              // a self-edge not in the source (#1707). Emit nothing: a silent
-              // miss, never a wrong edge. A chain rooted at a project value
-              // (`window.MyNs.run()`, `store.getState().act()`, `ref.value.m()`)
-              // keeps the bare name — those targets are real, and dropping them
-              // would cost far more recall than the mis-bind costs precision.
+              // `holder.values.get()` has no inferred property type (#1566).
+              // Emitting bare `get` exact-matches an unrelated project method;
+              // preserving the chain alone would still allow receiver guessing.
+              // Emit nothing until the property type can be established. This
+              // also covers host chains such as `chrome.storage.local.get()`
+              // (#1707). Calls inside arguments are visited independently.
               // Mirrored in the kernel's extract_call (tsjs/extractors.rs).
               return;
             } else {

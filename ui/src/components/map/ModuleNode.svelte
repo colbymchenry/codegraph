@@ -52,6 +52,10 @@
   aria-pressed={node.selected}
   title={`${module.id} — ${module.symbols} symbols in ${module.files} file${
     module.files === 1 ? '' : 's'
+  }${
+    (module.dependents?.files ?? 0) > 0
+      ? `. ${module.dependents.files} file${module.dependents.files === 1 ? '' : 's'} outside it, across ${module.dependents.modules} module${module.dependents.modules === 1 ? '' : 's'}, reference into it.`
+      : ''
   }${layout.island ? '. Nothing in the index depends on it.' : ''}${
     layout.generated ? '. Every file in it is tool-generated.' : ''
   }`}
@@ -61,6 +65,12 @@
   <span class="count" class:island={layout.island}
     >{moduleMetaLabel(module, layout.island)}</span
   >
+  <!-- How much leans on this box, as a share of the heaviest one drawn. Inside
+       the border rather than on it, so it reads as a level in the box and not
+       as a second, thicker edge. -->
+  {#if layout.weight > 0}
+    <span class="weight" style={`width:${(layout.weight * 100).toFixed(1)}%`}></span>
+  {/if}
 </button>
 
 {#each layout.sourceHandles as handle, i (handle)}
@@ -75,6 +85,7 @@
 
 <style>
   .mnode {
+    position: relative;
     display: flex;
     flex-direction: column;
     justify-content: center;
@@ -124,6 +135,28 @@
   .mnode:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 1px;
+  }
+  /* A wash, not a rule: it is a quantity the eye should compare across boxes at
+     a glance, never a line competing with the box's own border. */
+  .weight {
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    height: 4px;
+    background: var(--ink);
+    /* Dark enough to survive the fit: the map opens as far out as 0.45, where a
+       3px band at 0.18 was a rumour. Length is what carries the comparison, and
+       length cannot be read off a stroke the eye has to hunt for. */
+    opacity: 0.3;
+    pointer-events: none;
+  }
+  .mnode:hover .weight,
+  .mnode.sel .weight {
+    opacity: 0.55;
+  }
+  .mnode.dimmed .weight,
+  .mnode.gen .weight {
+    opacity: 0.1;
   }
   .name {
     font: 500 13px var(--mono);
