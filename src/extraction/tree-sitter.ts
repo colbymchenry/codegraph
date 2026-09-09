@@ -1870,10 +1870,20 @@ export class TreeSitterExtractor {
     // on every ordinary method (breaks kernel↔wasm parity JSON equality).
     const isAbstract = this.extractor.isAbstract?.(node) ? true : undefined;
     const returnType = this.extractor.getReturnType?.(node, this.source);
+    // A method that is a top-level declaration (Go: `func (r *T) Name()`) has
+    // the same exportedness rule as a function — the name's case — and a
+    // consumer asking "can another package name this?" needs it on methods
+    // too. Class members keep the flag unset: their reachability is the
+    // class's, and the languages whose isExported walks the parent chain
+    // (JS/TS) would otherwise re-mark every member of an exported class.
+    const isExported = this.extractor.methodsAreTopLevel
+      ? this.extractor.isExported?.(node, this.source)
+      : undefined;
     const extraProps: Partial<Node> = {
       docstring,
       signature,
       visibility,
+      isExported,
       isAsync,
       isStatic,
       isAbstract,
