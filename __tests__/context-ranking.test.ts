@@ -16,7 +16,7 @@ import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src/index';
 import { LOW_CONFIDENCE_MARKER } from '../src/context';
-import { isDistinctiveIdentifier, scorePathRelevance, deriveProjectNameTokens } from '../src/search/query-utils';
+import { isDistinctiveIdentifier, scorePathRelevance, deriveProjectNameTokens, nameMatchBonus } from '../src/search/query-utils';
 
 describe('isDistinctiveIdentifier', () => {
   it('treats plain dictionary words as non-distinctive', () => {
@@ -36,6 +36,26 @@ describe('isDistinctiveIdentifier', () => {
     expect(isDistinctiveIdentifier('user_store')).toBe(true);
     expect(isDistinctiveIdentifier('REST')).toBe(true);
     expect(isDistinctiveIdentifier('v2')).toBe(true);
+  });
+});
+
+// An empty / whitespace-only query has no name to match, so the bonus must be
+// 0. Before the guard, `queryLower` collapsed to '' and `nameLower.startsWith('')`
+// (always true) awarded a spurious flat +10 to every node. This is reachable via
+// `searchNodes('   ')`, where the rescoring guard `text || query` passes a
+// whitespace-only query through to nameMatchBonus.
+describe('nameMatchBonus empty/whitespace query', () => {
+  it('returns 0 for an empty query', () => {
+    expect(nameMatchBonus('authenticate', '')).toBe(0);
+  });
+
+  it('returns 0 for a whitespace-only query', () => {
+    expect(nameMatchBonus('authenticate', '   ')).toBe(0);
+    expect(nameMatchBonus('anything', '\t\n')).toBe(0);
+  });
+
+  it('still scores a real query (exact match unaffected by the guard)', () => {
+    expect(nameMatchBonus('authenticate', 'authenticate')).toBe(80);
   });
 });
 
