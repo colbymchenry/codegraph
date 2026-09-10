@@ -217,3 +217,19 @@ abstract class AbstractBase
 {
     abstract protected function hook(): void;
 }
+
+// Markdown path references: code -> documentation edges. Every shape the
+// normalizer branches on, so the two arms have to agree about the rejections
+// (URL, escape above the root) as well as the emissions.
+$mdGuide = '../docs/guide.md#install';
+$mdBare = 'README.md';
+$mdRooted = '/docs/rooted.md';
+$mdEscapes = '../../../../outside.md';
+$mdRemote = 'https://example.com/remote.md';
+$mdQueried = './notes.md?raw=1#top';
+$mdTwoInOne = 'see a.md and also sub/b.mdx';
+
+function mdLoad()
+{
+    loadDoc('docs/deep/nested.markdown');
+}

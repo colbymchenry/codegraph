@@ -168,3 +168,16 @@ typedef union {
 } word_t;
 
 static unsigned int hdr_raw(union packet_hdr *h) { return h->raw; }
+
+/* Markdown path references: code -> documentation edges. Every shape the
+   normalizer branches on, so the two arms have to agree about the rejections
+   (URL, escape above the root) as well as the emissions. */
+static const char *md_guide = "../docs/guide.md#install";
+static const char *md_bare = "README.md";
+static const char *md_rooted = "/docs/rooted.md";
+static const char *md_escapes = "../../../../outside.md";
+static const char *md_remote = "https://example.com/remote.md";
+static const char *md_queried = "./notes.md?raw=1#top";
+static const char *md_two_in_one = "see a.md and also sub/b.mdx";
+
+static void md_load(void) { load_doc("docs/deep/nested.markdown"); }

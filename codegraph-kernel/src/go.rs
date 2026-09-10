@@ -177,6 +177,8 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
 }
 
 impl<'t> Walker<'t> {
+    markdown_refs_impl!();
+
     fn text(&self, node: Node) -> &'t str {
         &self.src[node.byte_range()]
     }
@@ -385,6 +387,8 @@ impl<'t> Walker<'t> {
         let mut skip_children = false;
 
         self.maybe_capture_fn_refs(node);
+        let md_owner = self.top_row();
+        self.markdown_refs_from_string(node, md_owner);
 
         if kind == "function_declaration" {
             self.extract_function(node);
@@ -426,6 +430,8 @@ impl<'t> Walker<'t> {
         stack_guard!();
         let kind = node.kind();
         self.maybe_capture_fn_refs(node);
+        let md_owner = self.top_row();
+        self.markdown_refs_from_string(node, md_owner);
 
         if kind == "call_expression" {
             self.extract_call(node);

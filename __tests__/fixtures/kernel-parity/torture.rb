@@ -231,5 +231,20 @@ end
 
 def obj.weird_singleton; end
 
+# Markdown path references: code -> documentation edges. Every shape the
+# normalizer branches on, so the two arms have to agree about the rejections
+# (URL, escape above the root) as well as the emissions.
+MD_GUIDE = '../docs/guide.md#install'
+MD_BARE = 'README.md'
+MD_ROOTED = '/docs/rooted.md'
+MD_ESCAPES = '../../../../outside.md'
+MD_REMOTE = 'https://example.com/remote.md'
+MD_QUERIED = './notes.md?raw=1#top'
+MD_TWO_IN_ONE = 'see a.md and also sub/b.mdx'
+
+def md_load
+  load_doc('docs/deep/nested.markdown')
+end
+
 __END__
 raw data trailer here

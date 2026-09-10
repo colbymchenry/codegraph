@@ -230,3 +230,15 @@ export function NestedHandlers({ items, onPick }: { items: string[]; onPick: (a:
   const [a, b] = [() => 1, () => 2];
   return items.map((i) => <button onClick={handleClear} onDoubleClick={() => describe(i)}>{later(i)}{count}{a()}{b()}</button>);
 }
+
+// Markdown path references: code -> documentation edges. Every shape the
+// normalizer branches on, so the two arms have to agree about the rejections
+// (URL, escape above the root) as well as the emissions.
+const GUIDE = '../docs/guide.md#install';
+const BARE = 'README.md';
+const ROOTED = '/docs/rooted.md';
+const ESCAPES = '../../../../outside.md';
+const REMOTE = 'https://example.com/remote.md';
+const QUERIED = './notes.md?raw=1#top';
+const TWO_IN_ONE = 'see a.md and also sub/b.mdx';
+loadDoc('docs/deep/nested.markdown');

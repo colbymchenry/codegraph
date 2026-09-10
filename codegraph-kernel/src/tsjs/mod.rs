@@ -339,6 +339,8 @@ impl<'t> Walker<'t> {
         self.push_ref(self.top_row(), name, edge_kind_index("calls").unwrap(), node);
     }
 
+    markdown_refs_impl!();
+
     // --- createNode -----------------------------------------------------------
 
     /// createNode (tree-sitter.ts): id, qualified name from the scope stack,
@@ -636,6 +638,8 @@ impl<'t> Walker<'t> {
 
         // Function-as-value capture — independent of the dispatch ladder.
         self.maybe_capture_fn_refs(node);
+        let owner = self.top_row();
+        self.markdown_refs_from_string(node, owner);
 
         if is_function_type(kind) {
             // (the isInsideClassLike + methodTypes overlap is Python/Ruby-only)
@@ -725,6 +729,8 @@ impl<'t> Walker<'t> {
         stack_guard!();
         let kind = node.kind();
         self.maybe_capture_fn_refs(node);
+        let md_owner = self.top_row();
+        self.markdown_refs_from_string(node, md_owner);
 
         if kind == "call_expression" {
             self.extract_call(node);
