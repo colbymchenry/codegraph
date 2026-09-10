@@ -3527,6 +3527,21 @@ export class QueryBuilder {
   }
 
   /**
+   * Replace resolution edges with their original unresolved references as one
+   * transaction. If ref insertion fails, the edge deletion is rolled back.
+   */
+  replaceResolutionEdgesWithUnresolvedRefs(
+    edgeIds: number[],
+    refs: UnresolvedReference[]
+  ): number {
+    return this.db.transaction(() => {
+      const changed = this.deleteEdgesByIds(edgeIds);
+      this.insertUnresolvedRefsBatch(refs);
+      return changed;
+    })();
+  }
+
+  /**
    * Distinct node names present in the given files — the symbol names a sync
    * pass uses to look up retryable failed refs after those files changed.
    */
