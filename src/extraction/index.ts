@@ -1287,20 +1287,97 @@ interface GitChanges {
  * case this cannot see (the child status that would report the deletions is gone
  * with it); a full `codegraph index` reconciles that.
  */
-export function getGitChangedFiles(rootDir: string): GitChanges | null {
+export function getGitChangedFiles(rootDir: string, sinceCommit?: string | null): GitChanges | null {
   try {
+    // `git status` only ever describes the WORKING TREE, so a change that has
+    // been committed leaves no entry and never enters the candidate set — the
+    // hash comparison in getChangedFiles is correct but is never reached for
+    // it, and `pendingChanges` reads 0 while the index is genuinely behind
+    // (#1829). `sinceCommit` — the commit the index was last brought up to
+    // date at — adds the other half: what has been committed since. Callers
+    // that hold no such stamp still get exactly what they always did, the
+    // working-tree changes.
     const changes: GitChanges = { modified: [], added: [], deleted: [] };
     // Custom extension → language overrides from the project's codegraph.json,
     // so change detection sees the same custom-extension files the full index does.
     const overrides = loadExtensionOverrides(rootDir);
-    collectGitStatus(rootDir, '', changes, overrides, loadIncludeIgnoredMatcher(rootDir), loadExcludeMatcher(rootDir));
+    collectGitStatus(rootDir, '', changes, overrides, loadIncludeIgnoredMatcher(rootDir), loadExcludeMatcher(rootDir), sinceCommit ?? undefined);
     return changes;
   } catch {
     return null;
   }
 }
 
-function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, overrides?: Record<string, Language>, includeIgnored: Ignore | null = null, exclude: Ignore | null = null): void {
+/**
+ * Metadata key: the commit the index was last brought up to date at. Written by
+ * a full index AND by every successful sync — unlike the extraction stamp, which
+ * a sync must not advance because it only touches a subset of files. This one is
+ * about the TREE, and a sync does absorb the whole diff it computed. (#1829)
+ */
+export const INDEXED_AT_COMMIT_KEY = 'indexed_at_commit';
+
+/** HEAD's commit sha, or null in a non-git repo or one with no commits yet. */
+export function getGitHeadSha(rootDir: string): string | null {
+  try {
+    return execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+    }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `A<TAB>path` / `M<TAB>path` / `D<TAB>path` lines for every path committed
+ * between `sinceCommit` and HEAD. Empty when the stamp IS HEAD, which is the
+ * common case — one cheap git call on the hot path.
+ */
+function gitCommittedChangesSince(repoDir: string, sinceCommit: string): string[] {
+  try {
+    const out = execFileSync('git', ['diff', '--name-status', '--no-renames', sinceCommit, 'HEAD'], {
+      cwd: repoDir, encoding: 'utf-8', timeout: 10000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+    });
+    return out.split('\n').filter((l) => l.length > 2);
+  } catch {
+    // Unreachable in practice — isCommittedDiffUsable already proved the commit
+    // resolves — but a diff that fails must not take the whole fast path down.
+    return [];
+  }
+}
+
+/**
+ * Can an INDEX trust the git fast path, given the commit it was built at?
+ *
+ * False means "fall back to the full scan" — the expensive path that compares
+ * every file on disk against the DB, and the only correct read when git cannot
+ * say what happened between the stamp and now:
+ *
+ *  - stamp present but unknown to this repo (rebase, gc, shallow clone, a stamp
+ *    from a different checkout) — history moved under the index.
+ *  - stamp absent while the repo HAS commits — an index built before stamping
+ *    existed. One full scan; the next sync stamps it and the fast path returns.
+ *
+ * A repo with NO commits keeps the fast path with or without a stamp: every
+ * file is untracked, so `git status` already sees all of them. Callers with no
+ * index behind them (the exported `getGitChangedFiles`) never ask this — a
+ * working-tree diff is the whole of what they wanted. (#1829)
+ */
+export function canTrustGitFastPath(rootDir: string, sinceCommit?: string | null): boolean {
+  const head = getGitHeadSha(rootDir);
+  if (head == null) return true; // no commits (or not a git repo — caller handles that)
+  if (!sinceCommit) return false;
+  if (sinceCommit === head) return true;
+  try {
+    execFileSync('git', ['cat-file', '-e', `${sinceCommit}^{commit}`], {
+      cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, overrides?: Record<string, Language>, includeIgnored: Ignore | null = null, exclude: Ignore | null = null, sinceCommit?: string): void {
   const output = execFileSync(
     'git',
     // `-uall` lists individual untracked files instead of collapsing an
@@ -1325,6 +1402,39 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, over
   // parent's. (#766)
   const ig = buildDefaultIgnore(repoDir);
 
+  // One classifier for both candidate sources below, so a committed change is
+  // filtered by exactly the rules a working-tree change is (#766, #999, #1829).
+  const classify = (statusCode: string, rel: string): void => {
+    const filePath = normalizePath(prefix + rel);
+    if (!isSourceFile(filePath, overrides)) return;
+
+    if (statusCode.includes('D')) {
+      // Deletions stay unfiltered: getChangedFiles acts on one only when the
+      // path is already tracked in the DB, where removal is always correct — and
+      // that lets a newly-excluded dir's stale rows clean themselves up. (#766)
+      out.deleted.push(filePath);
+      return;
+    }
+
+    // Added (`??`) / modified files inside an excluded dir must not enter the
+    // index — match against the repo-relative path, same as the full scan. (#766)
+    if (ig.ignores(rel)) return;
+    // User `codegraph.json` `exclude` (#999) is project-root-relative, so it's
+    // matched against the full path — sync must not re-add a tracked file the
+    // full index now keeps out. Deletions above stay unfiltered so a file that
+    // WAS indexed before an exclude was added still cleans itself out.
+    if (exclude && exclude.ignores(filePath)) return;
+
+    if (statusCode === '??') {
+      out.added.push(filePath);
+    } else {
+      // M, MM, AM, A (staged), etc. — treat as modified. getChangedFiles
+      // re-decides added-vs-modified from the DB, so a committed `A` that the
+      // index never saw still lands in `added`.
+      out.modified.push(filePath);
+    }
+  };
+
   const untrackedDirs: string[] = [];
   for (const line of output.split('\n')) {
     if (line.length < 4) continue; // Minimum: "XY file"
@@ -1339,31 +1449,20 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, over
       continue;
     }
 
-    const filePath = normalizePath(prefix + rel);
-    if (!isSourceFile(filePath, overrides)) continue;
+    classify(statusCode, rel);
+  }
 
-    if (statusCode.includes('D')) {
-      // Deletions stay unfiltered: getChangedFiles acts on one only when the
-      // path is already tracked in the DB, where removal is always correct — and
-      // that lets a newly-excluded dir's stale rows clean themselves up. (#766)
-      out.deleted.push(filePath);
-      continue;
-    }
-
-    // Added (`??`) / modified files inside an excluded dir must not enter the
-    // index — match against the repo-relative path, same as the full scan. (#766)
-    if (ig.ignores(rel)) continue;
-    // User `codegraph.json` `exclude` (#999) is project-root-relative, so it's
-    // matched against the full path — sync must not re-add a tracked file the
-    // full index now keeps out. Deletions above stay unfiltered so a file that
-    // WAS indexed before an exclude was added still cleans itself out.
-    if (exclude && exclude.ignores(filePath)) continue;
-
-    if (statusCode === '??') {
-      out.added.push(filePath);
-    } else {
-      // M, MM, AM, A (staged), etc. — treat as modified
-      out.modified.push(filePath);
+  // Committed but unindexed: everything between the commit this index was last
+  // brought up to date at and HEAD. `git status` cannot see these — committing
+  // is precisely what removes a file from its output — so without this pass a
+  // `git commit` makes a real pending change read as zero (#1829). The stamp
+  // belongs to the ROOT repo, so the embedded-repo recursion below passes none.
+  if (sinceCommit) {
+    for (const line of gitCommittedChangesSince(repoDir, sinceCommit)) {
+      const tab = line.indexOf('\t');
+      if (tab < 1) continue;
+      // `A`/`M`/`D`/`T`… — padded to porcelain's two columns for `classify`.
+      classify(`${line.substring(0, tab).charAt(0)} `, normalizePath(line.substring(tab + 1)));
     }
   }
 
@@ -3176,7 +3275,15 @@ export class ExtractionOrchestrator {
    * Uses git status as a fast path when available, falling back to full scan.
    */
   getChangedFiles(): { added: string[]; modified: string[]; removed: string[] } {
-    const gitChanges = getGitChangedFiles(this.rootDir);
+    // The commit this index was last brought up to date at. Absent on an index
+    // built before stamping existed — getGitChangedFiles then declines the fast
+    // path and the full scan below answers correctly, once, until a sync or a
+    // full index writes the stamp. (#1829)
+    let sinceCommit: string | null = null;
+    try { sinceCommit = this.queries.getMetadata(INDEXED_AT_COMMIT_KEY) ?? null; } catch { /* advisory */ }
+    const gitChanges = canTrustGitFastPath(this.rootDir, sinceCommit)
+      ? getGitChangedFiles(this.rootDir, sinceCommit)
+      : null;
 
     if (gitChanges) {
       // === Git fast path ===
@@ -3184,8 +3291,20 @@ export class ExtractionOrchestrator {
       const modified: string[] = [];
       const removed: string[] = [];
 
+      // One file can now reach these lists from two candidate sources — the
+      // working tree AND the committed diff — when it was committed and then
+      // edited again. It is still one changed file: counting it twice would
+      // inflate `pendingChanges` and hand sync the same path twice. (#1829)
+      // Kept per list, not shared: a path can legitimately be BOTH — a commit
+      // deleted it and the working tree recreated it untracked — and that is a
+      // removal followed by an add, exactly as before.
+      const seenGone = new Set<string>();
+      const seenHere = new Set<string>();
+
       // Deleted files — only report if tracked in DB
       for (const filePath of gitChanges.deleted) {
+        if (seenGone.has(filePath)) continue;
+        seenGone.add(filePath);
         const tracked = this.queries.getFileByPath(filePath);
         if (tracked) {
           removed.push(filePath);
@@ -3197,6 +3316,8 @@ export class ExtractionOrchestrator {
       // hash-compared like modified files instead of always counting as added —
       // otherwise status reports them as pending forever. (See issue #206.)
       for (const filePath of [...gitChanges.modified, ...gitChanges.added]) {
+        if (seenHere.has(filePath)) continue;
+        seenHere.add(filePath);
         const fullPath = path.join(this.rootDir, filePath);
         let content: string;
         try {
