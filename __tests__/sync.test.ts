@@ -984,6 +984,24 @@ describe('committed-but-unindexed changes (#1829)', () => {
     expect(result.filesModified).toBe(1);
   });
 
+  it('sees a committed RENAME as a removal plus an add', async () => {
+    // `--no-renames` on the committed diff is deliberate: the index keys files
+    // by path, so a rename IS a removal and an add, and pairing them up would
+    // only have to be taken apart again.
+    fs.renameSync(path.join(testDir, 'src', 'one.ts'), path.join(testDir, 'src', 'renamed.ts'));
+    git('add', '-A');
+    git('commit', '-m', 'rename one');
+
+    const changes = cg.getChangedFiles();
+    expect(changes.removed).toContain('src/one.ts');
+    expect(changes.added).toContain('src/renamed.ts');
+
+    const result = await cg.sync();
+    expect(result.filesRemoved).toBe(1);
+    expect(result.filesAdded).toBe(1);
+    expect(cg.searchNodes('alpha').every((r) => r.node.filePath !== 'src/one.ts')).toBe(true);
+  });
+
   it('still filters committed changes by the rules the full index uses', async () => {
     // vendor/ is a built-in exclude git knows nothing about. Sourcing candidates
     // from `git diff` must not smuggle in files `git status` would have had
