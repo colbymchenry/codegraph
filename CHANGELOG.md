@@ -146,6 +146,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixes
 
 - Spring mappings now include every declared path combination and resolve constants declared in the same file, while unresolved paths no longer appear as false root routes. (#1461)
+- `codegraph node` now accepts a file reference that carries a line number — `src/app.ts:42`, `src/app.ts:42-80`, `src/app.ts#L42`, `src/app.ts#L42-L80` — instead of reporting the file as not indexed; the line range becomes the window that is read, and an `--offset`/`--limit` you pass yourself still wins. A path that really is named that way is still looked up as written. (#1831)
 - `codegraph callers`, `codegraph callees` and `codegraph impact` now resolve qualified names, group results and JSON edges by definition, and accept `--file` to narrow ambiguous names; thanks @ferrine. (#1512, #1656)
 - `codegraph callers`, `codegraph callees` and `codegraph impact` (CLI and MCP) now report missing names with did-you-mean suggestions instead of another symbol's results, and exact matches with no callers stay empty; thanks @uvmplus. (#1473, #1481)
 
