@@ -86,6 +86,7 @@ done
 #                per-platform bundle so its deps aren't duplicated here.
 cp "$ROOT/scripts/npm-shim.js" "$NPM/main/npm-shim.js"
 cp "$ROOT/scripts/npm-sdk.js" "$NPM/main/npm-sdk.js"
+cp -R "$ROOT/omp" "$NPM/main/omp"
 [ -f "$ROOT/README.md" ] && cp "$ROOT/README.md" "$NPM/main/README.md"
 
 # Ship the type declarations so `types`/`exports.types` resolve. Built from this
@@ -112,12 +113,13 @@ VERSION="$VERSION" SCOPE="$SCOPE" TARGETS="${targets[*]}" \
       bin: { codegraph: "npm-shim.js" },
       main: "npm-sdk.js",
       types: "dist/index.d.ts",
+      omp: { extensions: ["./omp/index.ts"] },
       exports: {
         ".": { types: "./dist/index.d.ts", default: "./npm-sdk.js" },
         "./package.json": "./package.json"
       },
       optionalDependencies: opt,
-      files: ["npm-shim.js","npm-sdk.js","dist","README.md"],
+      files: ["npm-shim.js","npm-sdk.js","dist","omp","README.md"],
       license: "MIT",
       repository: { type: "git", url: "git+https://github.com/colbymchenry/codegraph.git" }
     }, null, 2) + "\n");
