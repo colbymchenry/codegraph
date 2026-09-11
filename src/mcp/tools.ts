@@ -158,6 +158,25 @@ export function normalizeQuerySpelling(query: string): string {
 }
 
 /**
+ * Does this query-named span point at a real FILE inside the project?
+ *
+ * The `existsOnDisk` predicate `extractQueryPaths` takes (that module is pure —
+ * no DB, no fs — so the fs access lives here, where the project root is known).
+ * Only a REGULAR FILE counts: a directory span (`src/search`) is not a file
+ * reference and must keep flowing to the normal matching pipeline. Containment
+ * is enforced by `validatePathWithinRoot`, so a `../` span in a query cannot
+ * probe outside the project, and every fs error answers `false`.
+ */
+function pathIsProjectFile(projectRoot: string, relPath: string): boolean {
+  try {
+    const abs = validatePathWithinRoot(projectRoot, relPath);
+    return abs !== null && statSync(abs).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Calculate the recommended number of codegraph_explore calls based on project size.
  * Larger codebases need more exploration calls to cover their surface area,
  * but smaller ones should use fewer to avoid unnecessary overhead.
@@ -3318,7 +3337,7 @@ export class ToolHandler {
         const extraction = extractQueryPaths(
           rawQuery,
           cg.getFiles().map((f) => f.path),
-          { maxPins: maxFiles },
+          { maxPins: maxFiles, existsOnDisk: (rel) => pathIsProjectFile(projectRoot, rel) },
         );
         if (extraction.pinnedFiles.length > 0 || extraction.unresolvedPathSpans.length > 0) {
           pinnedFiles = extraction.pinnedFiles;
