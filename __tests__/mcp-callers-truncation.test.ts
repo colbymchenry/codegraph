@@ -35,14 +35,17 @@ beforeAll(async () => {
       Array.from({ length: CALLERS }, (_, i) => `export function caller${i}(): number { return warm(${i}); }`).join('\n') +
       '\n'
   );
-  // `hot` shares its name with its file, so the answer groups per definition.
-  fs.writeFileSync(path.join(tmpDir, 'src', 'hot.ts'), 'export function hot(n: number): number { return n; }\n');
-  fs.writeFileSync(
-    path.join(tmpDir, 'src', 'hot-callers.ts'),
-    "import { hot } from './hot';\n" +
-      Array.from({ length: CALLERS }, (_, i) => `export function hotCaller${i}(): number { return hot(${i}); }`).join('\n') +
-      '\n'
-  );
+  // Two functions with the same bare name exercise per-definition grouping.
+  // A single `hot.ts` is one definition, so callers stay a flat capped list.
+  for (const suffix of ['a', 'b']) {
+    fs.writeFileSync(path.join(tmpDir, 'src', `hot-${suffix}.ts`), 'export function hot(n: number): number { return n; }\n');
+    fs.writeFileSync(
+      path.join(tmpDir, 'src', `hot-${suffix}-callers.ts`),
+      `import { hot } from './hot-${suffix}';\n` +
+        Array.from({ length: CALLERS }, (_, i) => `export function hot${suffix.toUpperCase()}Caller${i}(): number { return hot(${i}); }`).join('\n') +
+        '\n'
+    );
+  }
   fs.writeFileSync(
     path.join(tmpDir, 'src', 'fan.ts'),
     Array.from({ length: CALLERS }, (_, i) => `export function helper${i}(): number { return ${i}; }`).join('\n') +
