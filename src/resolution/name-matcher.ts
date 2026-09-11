@@ -8,7 +8,7 @@ import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, SUPERTYPE_TARGET_KINDS, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
-import { JS_BUILT_INS } from './js-builtins';
+import { JS_BUILT_INS, isTsJsNestedCall } from './js-builtins';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -2789,7 +2789,12 @@ function matchStoreAccessorChain(ref: UnresolvedRef, context: ResolutionContext)
   if (!(inner === 'get' || inner === 'getState' || inner.endsWith('.getState'))) return null;
   const callables = context
     .getNodesByName(method)
-    .filter((n) => (n.kind === 'function' || n.kind === 'method') && sameLanguageFamily(n.language, ref.language) && n.id !== ref.fromNodeId);
+    .filter((n) => (n.kind === 'function' || n.kind === 'method') && sameLanguageFamily(n.language, ref.language) && n.id !== ref.fromNodeId)
+    // An interface signature describes the action; it is not a second
+    // implementation. Keep real class methods in the uniqueness check.
+    .filter((n) => !(['typescript', 'tsx'].includes(n.language) && n.kind === 'method' &&
+      context.getNodesInFile(n.filePath).some((parent) =>
+        (parent.kind === 'interface' || parent.kind === 'type_alias') && rangeWithin(n, parent))));
   if (callables.length !== 1) return null;
   return { original: ref, targetNodeId: callables[0]!.id, confidence: 0.6, resolvedBy: 'exact-match' };
 }
@@ -3168,6 +3173,9 @@ export function matchReference(
       return null;
     }
   }
+
+  // No generic fallback can establish an unknown nested receiver's type.
+  if (isTsJsNestedCall(ref)) return null;
 
   // Try strategies in order of confidence
   let result: ResolvedRef | null;

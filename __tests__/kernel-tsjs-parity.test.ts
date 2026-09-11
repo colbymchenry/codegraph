@@ -98,24 +98,39 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
 
   it.each([
     ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
-  ] as const)('leaves nested identifier receivers unresolved and keeps argument calls: %s (#1566)', (ext, language) => {
-    const result = assertParity(`fixture.${ext}`, `
+  ] as const)('preserves nested receivers and argument calls: %s (#1794)', (ext, language) => {
+    const source = `
 function readKey() { return 'answer'; }
 function local() {
   const values = new Map();
   return values.get(readKey());
 }
-function nested(holder) {
+function nested(holder, höldér) {
   holder.values.get(readKey());
   holder.values?.get(readKey());
   holder['values'].get(readKey());
   holder.deep.values.get(readKey());
+  holder?.values.get(readKey());
+  holder[readKey()].get(readKey());
+  holder[0].get(readKey());
+  holder["odd.key"].get(readKey());
+  holder /* receiver */.values.get(readKey());
+  höldér.values.get(readKey());
 }
-`, language);
+`;
+    const result = assertParity(`fixture.${ext}`, source, language);
+    assertParity(`fixture-crlf.${ext}`, source.replace(/\n/g, '\r\n'), language);
     const nested = result.nodes.find((n) => n.name === 'nested' && n.kind === 'function');
     expect(nested).toBeDefined();
     expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'calls' && r.fromNodeId === nested!.id)
-      .map((r) => r.referenceName)).toEqual(['readKey', 'readKey', 'readKey', 'readKey']);
+      .map((r) => r.referenceName)).toEqual([
+        'holder.values.get', 'readKey', 'holder.values.get', 'readKey',
+        "holder['values'].get", 'readKey', 'holder.deep.values.get', 'readKey',
+        'holder?.values.get', 'readKey', 'holder[readKey()].get', 'readKey', 'readKey',
+        'holder[0].get', 'readKey', 'holder["odd.key"].get', 'readKey',
+        'holder /* receiver */.values.get', 'readKey',
+        'höldér.values.get', 'readKey',
+      ]);
     expect(result.unresolvedReferences.some((r) => r.referenceName === 'values.get')).toBe(true);
   });
 

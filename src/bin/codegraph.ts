@@ -955,6 +955,11 @@ program
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
 
+      if (cg.isIndexStale()) {
+        cg.destroy();
+        throw new Error('Index extraction is stale. Run "codegraph index" for a full rebuild before syncing.');
+      }
+
       if (options.quiet) {
         await cg.sync();
         cg.destroy();

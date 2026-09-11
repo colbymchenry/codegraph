@@ -1130,10 +1130,9 @@ impl<'t> Walker<'t> {
 
     // --- extractCall (TS/JS generic tail) -------------------------------------------------
 
-    /// Identifier-rooted member chains have no inferred property type (#1566),
-    /// including host API chains (#1707). Keep the existing window namespace
-    /// escape; call-result and `this` receivers are outside this guard.
-    fn is_unresolved_member_chain(&self, receiver: Node<'t>) -> bool {
+    /// Identifier-rooted nested receivers retain their full call-site text.
+    /// Preserve the existing window namespace escape (#1794, #1566).
+    fn is_identifier_chain(&self, receiver: Node<'t>) -> bool {
         let mut cur = receiver;
         if !matches!(cur.kind(), "member_expression" | "subscript_expression") {
             return false;
@@ -1174,14 +1173,6 @@ impl<'t> Walker<'t> {
                         if is_literal_receiver(r.kind()) {
                             return;
                         }
-                        // `holder.values.get()` has no inferred property type
-                        // (#1566). Dropping the receiver or merely preserving it
-                        // would allow unrelated same-name method guesses. Emit
-                        // nothing, as for host chains (#1707); argument calls are
-                        // visited independently. Mirrors extractCall in TS.
-                        if self.is_unresolved_member_chain(r) {
-                            return;
-                        }
                     }
                     let recv_ident = receiver.filter(|r| {
                         matches!(r.kind(), "identifier" | "simple_identifier" | "field_identifier")
@@ -1205,6 +1196,10 @@ impl<'t> Walker<'t> {
                         // TreeSitterExtractor.extractCall.
                         let Some(inner) = self.plain_inner_callee(r) else { return };
                         callee_name = format!("{inner}().{method_name}");
+                    } else if let Some(r) = receiver.filter(|r| self.is_identifier_chain(*r)) {
+                        // Frameworks and Steps need the call site even when
+                        // generic resolution cannot prove a target (#1794).
+                        callee_name = format!("{}.{method_name}", self.text(r));
                     } else {
                         callee_name = method_name.to_string();
                     }

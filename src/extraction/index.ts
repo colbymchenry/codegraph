@@ -3173,53 +3173,10 @@ export class ExtractionOrchestrator {
 
   /**
    * Get files that have changed since last index.
-   * Uses git status as a fast path when available, falling back to full scan.
+   * Compare the full source inventory with the index: git status omits
+   * committed changes that have not been indexed yet (#1829).
    */
   getChangedFiles(): { added: string[]; modified: string[]; removed: string[] } {
-    const gitChanges = getGitChangedFiles(this.rootDir);
-
-    if (gitChanges) {
-      // === Git fast path ===
-      const added: string[] = [];
-      const modified: string[] = [];
-      const removed: string[] = [];
-
-      // Deleted files — only report if tracked in DB
-      for (const filePath of gitChanges.deleted) {
-        const tracked = this.queries.getFileByPath(filePath);
-        if (tracked) {
-          removed.push(filePath);
-        }
-      }
-
-      // Modified + added files — read + hash, compare with DB. Untracked (`??`)
-      // files stay untracked in git even after indexing, so they must be
-      // hash-compared like modified files instead of always counting as added —
-      // otherwise status reports them as pending forever. (See issue #206.)
-      for (const filePath of [...gitChanges.modified, ...gitChanges.added]) {
-        const fullPath = path.join(this.rootDir, filePath);
-        let content: string;
-        try {
-          content = fs.readFileSync(fullPath, 'utf-8');
-        } catch (error) {
-          logDebug('Skipping unreadable file while detecting changes', { filePath, error: String(error) });
-          continue;
-        }
-
-        const contentHash = hashContent(content);
-        const tracked = this.queries.getFileByPath(filePath);
-
-        if (!tracked) {
-          added.push(filePath);
-        } else if (tracked.contentHash !== contentHash) {
-          modified.push(filePath);
-        }
-      }
-
-      return { added, modified, removed };
-    }
-
-    // === Fallback: full scan (non-git project or git failure) ===
     const currentFiles = new Set(scanDirectory(this.rootDir));
     const trackedFiles = this.queries.getAllFiles();
 
@@ -3233,9 +3190,10 @@ export class ExtractionOrchestrator {
     const modified: string[] = [];
     const removed: string[] = [];
 
-    // Find removed files
+    // git ls-files can still list an unstaged deletion; check disk too,
+    // matching the full sync reconciliation.
     for (const tracked of trackedFiles) {
-      if (!currentFiles.has(tracked.path)) {
+      if (!currentFiles.has(tracked.path) || !fs.existsSync(path.join(this.rootDir, tracked.path))) {
         removed.push(tracked.path);
       }
     }
