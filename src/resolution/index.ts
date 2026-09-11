@@ -33,7 +33,7 @@ import { logDebug } from '../errors';
 import { lexicalPathWithinRoot } from '../utils';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
-import { JS_BUILT_INS } from './js-builtins';
+import { JS_BUILT_INS, isTsJsNestedCall } from './js-builtins';
 
 /** Node kinds that can declare supertypes (extends/implements). */
 const SUPERTYPE_BEARING_KINDS = new Set<Node['kind']>([
@@ -1020,6 +1020,14 @@ export class ReferenceResolver {
     }
     if (this.profileStages) this.stageAdd('frameworks', ref, fwEarly !== null, tFw);
     if (fwEarly) return fwEarly;
+
+    // An imported root is not the called nested member. Keep framework
+    // evidence, but never bind holder.values.get to holder or an unrelated get.
+    if (isTsJsNestedCall(ref)) {
+      return candidates.length > 0
+        ? candidates.reduce((best, curr) => curr.confidence > best.confidence ? curr : best)
+        : null;
+    }
 
     // Strategy 2: Try import-based resolution
     // A TS/JS/Python call-receiver chain (`useStore.getState().reset`, #1683)

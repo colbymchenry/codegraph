@@ -8,7 +8,7 @@ import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, SUPERTYPE_TARGET_KINDS, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
-import { JS_BUILT_INS } from './js-builtins';
+import { JS_BUILT_INS, isTsJsNestedCall } from './js-builtins';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -3148,6 +3148,9 @@ export function matchReference(
       return null;
     }
   }
+
+  // No generic fallback can establish an unknown nested receiver's type.
+  if (isTsJsNestedCall(ref)) return null;
 
   // Try strategies in order of confidence
   let result: ResolvedRef | null;

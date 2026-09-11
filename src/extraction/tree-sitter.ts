@@ -411,12 +411,10 @@ const TS_JS_CHAIN_LANGUAGES = new Set(['typescript', 'tsx', 'javascript', 'jsx']
 const TS_JS_CHAIN_RECEIVER_TYPES = new Set(['member_expression', 'subscript_expression']);
 
 /**
- * Identifier-rooted member chains have no inferred property type (#1566),
- * including host API chains (#1707). Keep the existing `window.MyNamespace`
- * escape for project globals; call-result and `this` receivers have their own
- * paths and are outside this guard.
+ * Nested identifier receivers retain their call-site text; window keeps its
+ * existing project-namespace behavior. Call-result and this paths are separate.
  */
-function isUnresolvedTsJsChain(node: SyntaxNode, source: string): boolean {
+function isTsJsIdentifierChain(node: SyntaxNode, source: string): boolean {
   let cur: SyntaxNode | null = node;
   while (cur && TS_JS_CHAIN_RECEIVER_TYPES.has(cur.type)) {
     cur = getChildByField(cur, 'object');
@@ -4868,16 +4866,12 @@ export class TreeSitterExtractor {
               TS_JS_CHAIN_LANGUAGES.has(this.language) &&
               receiver &&
               TS_JS_CHAIN_RECEIVER_TYPES.has(receiver.type) &&
-              isUnresolvedTsJsChain(receiver, this.source)
+              isTsJsIdentifierChain(receiver, this.source)
             ) {
-              // `holder.values.get()` has no inferred property type (#1566).
-              // Emitting bare `get` exact-matches an unrelated project method;
-              // preserving the chain alone would still allow receiver guessing.
-              // Emit nothing until the property type can be established. This
-              // also covers host chains such as `chrome.storage.local.get()`
-              // (#1707). Calls inside arguments are visited independently.
-              // Mirrored in the kernel's extract_call (tsjs/extractors.rs).
-              return;
+              // Keep call-site evidence for framework resolution and Steps.
+              // Generic resolution must not guess a target from the last name
+              // when the nested receiver's type is unknown (#1794, #1566).
+              calleeName = `${getNodeText(receiver, this.source)}.${methodName}`;
             } else {
               calleeName = methodName;
             }

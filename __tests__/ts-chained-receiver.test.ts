@@ -3,8 +3,8 @@
  * .get(k)`, `document.body.querySelector(s)` — ends in a platform API. Emitting
  * the bare method name for it let every such call exact-match whatever project
  * symbol shared the name, so a storage wrapper's `get` called itself (#1707).
- * Those are dropped, as are untyped identifier chains (#1566). The existing
- * `window.MyNs.run()` and `this.<field>.m()` paths remain outside that guard.
+ * Complete call references are retained; only proven targets become edges.
+ * `window.MyNs.run()` and `this.<field>.m()` keep their existing resolution.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
