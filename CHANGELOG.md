@@ -151,6 +151,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- `codegraph status` no longer reports zero pending changes for work you have already committed. Change detection asked git for the working-tree diff, and committing a file is exactly what removes it from that answer — so an edit read as pending until you committed it, then read as nothing while the index still lacked it. It now also asks git what changed between the commit the index was built from and where you are now, so the number matches what a sync would actually do. (#1829)
+
 - The prompt hook no longer injects unrelated projects when run from your home directory or a broader directory containing a stray workspace manifest. (#1454)
 
 - Indexing now succeeds when Node.js's SQLite lacks FTS5, with search falling back to name and fuzzy matching; thanks @aniruddhaadak80. (#1532)
