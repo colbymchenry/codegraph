@@ -24,7 +24,11 @@
  * spans removed.
  * Callers treat pinned files as first-class: guaranteed admission, top rank,
  * funded first. Pure string work — no DB, no fs — so it is trivially testable
- * and safe inside the query-pool workers.
+ * and safe inside the query-pool workers. The one question string shape cannot
+ * answer (is this dotless slashed span, `scripts/deploy`, a real file that is
+ * merely unindexed, or is it prose like `and/or`?) is delegated to an OPTIONAL
+ * `existsOnDisk` predicate the caller injects — the fs access stays at the call
+ * site, which owns the project root, and this module stays pure.
  */
 
 export interface QueryPathExtraction {
@@ -189,7 +193,18 @@ function resolveSpan(
 export function extractQueryPaths(
   query: string,
   indexedPaths: readonly string[],
-  opts: { maxPins?: number; maxMatchesPerSpan?: number } = {},
+  opts: {
+    maxPins?: number;
+    maxMatchesPerSpan?: number;
+    /**
+     * Does this repo-relative span name a real FILE in the project? Optional,
+     * injected by the caller (see the module docstring): it is the only way to
+     * tell a dotless path the index simply doesn't hold (`scripts/deploy`)
+     * from slashed prose (`and/or`), and it must stay out of this module.
+     * Must not throw — the caller absorbs fs errors and returns false.
+     */
+    existsOnDisk?: (relPath: string) => boolean;
+  } = {},
 ): QueryPathExtraction {
   const maxPins = Math.max(1, opts.maxPins ?? 8);
   const maxMatchesPerSpan = Math.max(1, opts.maxMatchesPerSpan ?? 3);
@@ -235,10 +250,19 @@ export function extractQueryPaths(
         pinnedSeen.add(m);
         pinned.push(m);
       }
-    } else if (ambiguous || isClearlyPathShaped(normalized)) {
+    } else if (
+      ambiguous
+      || isClearlyPathShaped(normalized)
+      || (normalized.includes('/') && opts.existsOnDisk?.(normalized) === true)
+    ) {
       // A real path that didn't resolve to a usable set. Keeping it in the
       // query is strictly worse — its fragments are what minted the junk
       // matches this module exists to stop — so strip it and say so.
+      // The third arm covers the DOTLESS slashed span (`scripts/deploy`,
+      // `bin/build`): shape alone cannot tell it from `and/or` or
+      // `input/output`, so the file's existence on disk decides. Loosening the
+      // SHAPE test instead would strip that prose out of every query and mint a
+      // false "no indexed file matches `and/or`" caveat.
       consumed.add(i);
       if (unresolved.length < 4) unresolved.push(normalized);
     }

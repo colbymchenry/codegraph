@@ -153,6 +153,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The prompt hook no longer injects unrelated projects when run from your home directory or a broader directory containing a stray workspace manifest. (#1454)
 
+- `codegraph_explore` now says so when a query names an extension-less file the index doesn't hold. A path like `scripts/deploy` has no extension on its last segment, so it failed the shape test that decides a span is a path beyond doubt — the name was left in the query, shredded into `scripts` and `deploy`, and the answer came back as a pile of unrelated source with no hint that the file you named was never consulted. Such a span is now checked against the project directory: if it is a real file, the answer carries the same `No indexed file uniquely matches ...` note a misspelled `src/foo.ts` already got. Slashed prose — `and/or`, `input/output`, `gen_server:call/2` — has no file behind it and is still left in the query untouched. (#1830)
+
 - Indexing now succeeds when Node.js's SQLite lacks FTS5, with search falling back to name and fuzzy matching; thanks @aniruddhaadak80. (#1532)
 
 - `codegraph_explore` now makes clear that suggested call counts are advisory, so agents keep exploring when an answer is incomplete; thanks @rongbc. (#1504, #1570)
