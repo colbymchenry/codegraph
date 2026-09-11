@@ -2634,6 +2634,7 @@ export class ExtractionOrchestrator {
         existingFile.nodeCount === 0 && (existingFile.errors?.length ?? 0) > 0;
       const incomingHasContent = result.nodes.length > 0;
       if (!existingIsMarker || !incomingHasContent) {
+        this.queries.replaceLiteralsForFile(filePath, result.nodes);
         return; // No changes
       }
     }

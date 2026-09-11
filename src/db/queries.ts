@@ -257,6 +257,7 @@ export class QueryBuilder {
     updateNode?: SqliteStatement;
     deleteNode?: SqliteStatement;
     deleteNodesByFile?: SqliteStatement;
+    deleteLiteralsByFile?: SqliteStatement;
     getNodeById?: SqliteStatement;
     getNodesByFile?: SqliteStatement;
     getNodesByKind?: SqliteStatement;
@@ -476,6 +477,43 @@ export class QueryBuilder {
     // import-only name can never be surfaced (getSegmentMatches requires a
     // real definition), so its rows would only inflate the rarity statistics.
     if (this.isSegmentableKind(node.kind)) this.insertNameSegments(node.name);
+    const literalRows: unknown[][] = [];
+    this.collectLiteralRows(node, literalRows);
+    this.insertLiteralRows(literalRows);
+  }
+
+  /** Rows for the `literals` side table (see schema.sql) — one per captured literal. */
+  private collectLiteralRows(node: Node, rows: unknown[][]): void {
+    for (const value of node.literals ?? []) rows.push([value, node.id, node.filePath]);
+  }
+
+  private insertLiteralRows(rows: unknown[][]): void {
+    this.runBatched(
+      'insertLiterals',
+      'INSERT OR IGNORE INTO literals (value, node_id, file_path) VALUES ',
+      '(?,?,?)',
+      rows
+    );
+  }
+
+  /**
+   * Node ids whose body holds one of `values` verbatim, joined to nodes so a
+   * row left behind by a stale index is never surfaced. Explore seeds on these
+   * ahead of every name-derived candidate.
+   */
+  findNodeIdsByLiteral(values: string[], limit = 24): string[] {
+    if (values.length === 0) return [];
+    const placeholders = values.map(() => '?').join(',');
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT l.node_id AS id FROM literals l
+         JOIN nodes n ON n.id = l.node_id
+         WHERE l.value IN (${placeholders})
+         ORDER BY n.kind = 'file', n.file_path, n.start_line
+         LIMIT ?`
+      )
+      .all(...values, limit) as Array<{ id: string }>;
+    return rows.map((r) => r.id);
   }
 
   /** Which node kinds contribute their name to the segment vocabulary — the
@@ -507,6 +545,7 @@ export class QueryBuilder {
       // per-.run() call overhead dominates the store phase on full indexes.
       const rows: unknown[][] = [];
       const segmentRows: unknown[][] = [];
+      const literalRows: unknown[][] = [];
       for (const node of nodes) {
         if (!node.id || !node.kind || !node.name || !node.filePath || !node.language) {
           console.error('[CodeGraph] Skipping node with missing required fields:', {
@@ -543,6 +582,7 @@ export class QueryBuilder {
           node.updatedAt ?? Date.now(),
         ]);
         if (this.isSegmentableKind(node.kind)) this.collectNameSegmentRows(node.name, segmentRows);
+        this.collectLiteralRows(node, literalRows);
       }
       this.runBatched(
         'insertNodes',
@@ -562,6 +602,7 @@ export class QueryBuilder {
         '(?,?)',
         segmentRows
       );
+      this.insertLiteralRows(literalRows);
     })();
   }
 
@@ -720,7 +761,26 @@ export class QueryBuilder {
         this.nodeCache.delete(id);
       }
     }
+    if (!this.stmts.deleteLiteralsByFile) {
+      this.stmts.deleteLiteralsByFile = this.db.prepare('DELETE FROM literals WHERE file_path = ?');
+    }
+    this.stmts.deleteLiteralsByFile.run(filePath);
     this.stmts.deleteNodesByFile.run(filePath);
+  }
+
+  /** Refresh extracted literals even when unchanged source keeps its existing nodes. */
+  replaceLiteralsForFile(filePath: string, nodes: Node[]): void {
+    this.db.transaction(() => {
+      this.db.prepare('DELETE FROM literals WHERE file_path = ?').run(filePath);
+      const rows: unknown[][] = [];
+      for (const node of nodes) this.collectLiteralRows(node, rows);
+      this.insertLiteralRows(rows);
+    })();
+  }
+
+  /** Full indexing repopulates present files and removes literals from deleted files. */
+  clearLiterals(): void {
+    this.db.exec('DELETE FROM literals');
   }
 
   // ===========================================================================
@@ -3678,6 +3738,7 @@ export class QueryBuilder {
     this.db.transaction(() => {
       this.db.exec('DELETE FROM unresolved_refs');
       this.db.exec('DELETE FROM edges');
+      this.db.exec('DELETE FROM literals');
       this.db.exec('DELETE FROM nodes');
       this.db.exec('DELETE FROM files');
     })();
