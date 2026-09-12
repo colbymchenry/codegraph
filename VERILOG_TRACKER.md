@@ -105,15 +105,20 @@ frontend и review задачи можно отдавать агентам; об
   копии, зафиксировать версии и подтвердить корректный compiler invocation.
   Выполнено 2026-09-12: три lockfile dependencies; demux preprocessing default/VCS
   и xbar lint/elaboration при NoSlvMst=1/2/4. Отчёт: `docs/validation-hdl-corpora-build-2026-09-12.md`.
-- [ ] **A3** Сравнить кандидатов: slang, Surelog/UHDM, Verilator; при необходимости
+- [x] **A3** Сравнить кандидатов: slang, Surelog/UHDM, Verilator; при необходимости
   Yosys для синтезируемого подмножества. Актуальные версии, лицензии, экспорт и
   ограничения проверить по официальным источникам во время прототипа.
-- [ ] **A4** Измерить на одинаковых profiles: parse/elaboration success, diagnostics,
+- [x] **A4** Измерить на одинаковых profiles: parse/elaboration success, diagnostics,
   source locations, types/parameters export, instance paths, время и peak RSS.
-- [ ] **A5** Проверить интеграцию: отдельный процесс, формат обмена, доступность на
+- [x] **A5** Проверить интеграцию: отдельный процесс, формат обмена, доступность на
   Linux/Windows/macOS, версия API, redistributability и необязательность установки.
-- [ ] **A6** Сохранить решение в `docs/hdl-frontend-decision.md` с матрицей результатов;
+- [x] **A6** Сохранить решение в `docs/hdl-frontend-decision.md` с матрицей результатов;
   выбрать один основной адаптер. Второй внедрять только при доказанном пробеле.
+  A3–A6 выполнены 2026-09-12: `docs/hdl-frontend-decision.md`, 24 comparative
+  controls на UART/CRC/AXI, source/parameter/type assertions и instance probe.
+  Выбран slang для следующей реализации; A5 platform availability проверена
+  по docs, runtime только Linux. Surelog/UHDM изучен без runtime.
+  Full macro mapping не доказан: macro-generated columns могут быть 0.
 
 **Приёмка:** воспроизводимый запуск минимум на трёх реальных корпусах; сравнение
 не менее двух подходящих кандидатов, либо документированный конкретный blocker.
@@ -296,9 +301,10 @@ J — повторяемый checklist, его отметки относятся
 ## 5. Ближайшая конкретная итерация
 
 1. **A1–A2 выполнены**: manifests и восстановленный AXI context; см. `docs/validation-hdl-corpora-build-2026-09-12.md`.
-2. Параллельно поручить агентам независимые frontend probes и аудит source mapping;
-   основной агент готовит общую схему результатов и baseline source graph.
-3. Свести **A3–A6** в decision report и зафиксировать adapter contract.
+2. **A3–A6 выполнены**: slang выбран по probes; adapter contract и ограничения
+   сохранены в `docs/hdl-frontend-decision.md`.
+3. Начать реализацию согласованного контракта, сохраняя strict/compatible profiles
+   раздельно и unknown coordinates для macro-generated declarations.
 4. Реализовать минимальную вертикаль **B1–B2 + C1–C2**: один profile, один top,
    parameter value с правильным source mapping и fallback без frontend.
 5. Провести J1–J9 для этого ограниченного пакета; затем расширять B/C и переходить к D.
@@ -309,6 +315,7 @@ J — повторяемый checklist, его отметки относятся
 | --- | --- | --- | --- | --- |
 | 2026-09-12 | Source navigation, scopes, access | Реализованные части перечислены в HDL-001–006 | Отчёты раздела 1 | Сохранить regression coverage |
 | 2026-09-12 | Build profiles | Ограниченный source-режим, реальные profile parity проверки | `b050fb89`, `docs/validation-hdl-profiles-2026-09-12.md` | A: frontend comparison |
+| 2026-09-12 | A3–A6 | 24 controls, slang выбран; CLI macro mapping неполон | `docs/hdl-frontend-decision.md` | B1/B2 + C1/C2 |
 | 2026-09-12 | A1–A2 | Manifest 137 HDL, три locked AXI dependencies, шесть compiler controls | `docs/validation-hdl-corpora-build-2026-09-12.md` | A3–A6, сравнение frontends |
 | 2026-09-12 | Полный план | Создан этот tracker; новые implementation задачи не объявлены выполненными | `VERILOG_TRACKER.md` | A1–A2 |
 
