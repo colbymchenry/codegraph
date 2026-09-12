@@ -16,7 +16,7 @@ const full: Node = {
   startLine: 3, endLine: 9, startColumn: 2, endColumn: 3,
   docstring: 'Runs the job.', signature: 'run(): Promise<void>', visibility: 'protected',
   isExported: true, isAsync: true, isStatic: true, isAbstract: true,
-  decorators: ['logged'], typeParameters: ['T'], returnType: 'Promise<void>', updatedAt: 1234,
+  decorators: ['logged'], typeParameters: ['T'], returnType: 'Promise<void>', metadata: undefined, updatedAt: 1234,
 };
 const bare: Node = {
   id: 'function:b', kind: 'function', name: 'bare', qualifiedName: 'bare', filePath: 'src/job.ts', language: 'typescript',
