@@ -21,6 +21,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
 import { ToolHandler } from '../src/mcp/tools';
+import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_NO_ROOT_INDEX } from '../src/mcp/server-instructions';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
@@ -185,6 +186,22 @@ describe('No-root-index session policy', () => {
     // unindexed empty list above.
     expect(tools.length).toBeGreaterThanOrEqual(1);
     expect(tools.map((t) => t.name)).toContain('codegraph_explore');
+  });
+});
+
+describe('Index-drift guardrail is shared by both instruction variants', () => {
+  const drift = /changed on disk after the last index sync/;
+
+  it('the indexed-root playbook carries it', () => {
+    expect(SERVER_INSTRUCTIONS).toMatch(drift);
+  });
+
+  it('the per-project variant carries it too', () => {
+    expect(SERVER_INSTRUCTIONS_NO_ROOT_INDEX).toMatch(drift);
+  });
+
+  it('without becoming the full playbook', () => {
+    expect(SERVER_INSTRUCTIONS_NO_ROOT_INDEX).not.toMatch(/## How to query/);
   });
 });
 
