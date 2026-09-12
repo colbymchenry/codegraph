@@ -4856,6 +4856,7 @@ CPPType* ApiHelper<CType,
     it('emits an instantiates ref for direct-init and brace-init', () => {
       expect(instNames('Calculator calc(0);')).toEqual(['Calculator']);
       expect(instNames('Widget w{1, 2};')).toEqual(['Widget']);
+      expect(instNames('Calculator deferred;')).toEqual(['Calculator']); // default construction
     });
 
     it('strips template args and namespace to the bare class name', () => {
@@ -4864,11 +4865,11 @@ CPPType* ApiHelper<CType,
       expect(instNames('ns::Widget w(0);')).toEqual(['Widget']);
     });
 
-    it('does not emit for primitives, default construction, or the most-vexing parse', () => {
+    it('does not emit for primitives, extern declarations, or the most-vexing parse', () => {
       expect(instNames('int x(5);')).toEqual([]); // primitive direct-init
       expect(instNames('int y{6};')).toEqual([]); // primitive brace-init
       expect(instNames('auto z = make();')).toEqual([]); // auto + call (handled elsewhere)
-      expect(instNames('Calculator deferred;')).toEqual([]); // default construction, no args
+      expect(instNames('extern Calculator deferred;')).toEqual([]); // declaration, no construction
       expect(instNames('Calculator calc();')).toEqual([]); // function declaration (most-vexing parse)
     });
 

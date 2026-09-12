@@ -9,6 +9,7 @@ import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, SUPERTYPE_TARGET_KINDS, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_BUILT_INS, isTsJsNestedCall } from './js-builtins';
+import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -194,7 +195,8 @@ function applyLanguageGate(candidates: Node[], ref: UnresolvedRef): Node[] {
     // Cross-language calls need a bridge resolver, never a coincidental name.
     // C/C++ enum values cannot be invoked (unlike Rust enum constructors).
     return candidates.filter(c => sameLanguageFamily(c.language, ref.language) &&
-      !((ref.language === 'c' || ref.language === 'cpp') && c.kind === 'enum_member'));
+      !((ref.language === 'c' || ref.language === 'cpp') &&
+        (c.kind === 'enum_member' || (c.kind === 'constant' && /^\s*#\s*define\b/.test(c.signature ?? '')))));
   }
   if (ref.referenceKind === 'references' || ref.referenceKind === 'function_ref') {
     return candidates.filter((c) => sameLanguageFamily(c.language, ref.language));
@@ -1093,7 +1095,7 @@ export function resolveMethodOnType(
     matches = [];
     for (const m of methodCandidates) {
       if (m.kind !== 'method') continue;
-      if (m.language !== ref.language) continue;
+      if (!sameLanguageFamily(m.language, ref.language)) continue;
       const qn = m.qualifiedName;
       if (qn === want || qn.endsWith(`::${want}`)) {
         matches.push(m);
@@ -1692,6 +1694,7 @@ function getInferScanStates(context: ResolutionContext): Map<string, InferScanSt
 
 /** Drop the per-context scan states (see ReferenceResolver.clearCaches). */
 export function clearNameMatcherMemos(context: ResolutionContext): void {
+  clearCppMacroVisibility(context);
   INFER_SCAN_STATES.delete(context);
   C_STATIC_MEMO.delete(context);
   RUST_TRAIT_IMPL_MEMO.delete(context);
@@ -3094,6 +3097,7 @@ export function matchReference(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  if (isVisibleCppMacro(ref, context)) return null;
   if (ref.language === 'verilog' && ref.referenceKind === 'instantiates' && !isVerilogSimPath(ref.filePath)) {
     const modules = context
       .getNodesByName(ref.referenceName)

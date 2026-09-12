@@ -20,6 +20,7 @@ import {
   isImportableKind,
 } from './types';
 import { isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
+import { isVisibleCppMacro } from './cpp-macro-visibility';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
@@ -472,7 +473,7 @@ export class ReferenceResolver {
           matches = [];
           for (const m of candidates) {
             if (m.kind !== 'method') continue;
-            if (m.language !== language) continue;
+            if (!sameLanguageFamily(m.language, language)) continue;
             const qn = m.qualifiedName;
             if (qn === want || qn.endsWith(`::${want}`)) matches.push(m);
           }
@@ -495,7 +496,7 @@ export class ReferenceResolver {
             ownerIndex = new Map<string, Node[]>();
             for (const m of candidates) {
               if (m.kind !== 'method') continue;
-              if (m.language !== language) continue;
+              if (!sameLanguageFamily(m.language, language)) continue;
               const qn = m.qualifiedName;
               const i2 = qn.lastIndexOf('::');
               if (i2 < 0) continue; // single-segment qn can never match `T::m`
@@ -876,6 +877,7 @@ export class ReferenceResolver {
    * the alias names (see ./alias-binding), regardless of the strategy.
    */
   resolveOne(ref: UnresolvedRef): ResolvedRef | null {
+    if (isVisibleCppMacro(ref, this.context)) return null;
     const resolved = this.gateTargetKind(this.resolveOneInner(ref), ref);
     if (!resolved || ref.referenceKind !== 'calls') return resolved;
 
@@ -2649,6 +2651,11 @@ export class ReferenceResolver {
    */
   private gateTargetKind(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
     if (!result) return result;
+
+    if (ref.referenceKind === 'calls') {
+      const target = this.queries.getNodeById(result.targetNodeId);
+      if (target?.kind === 'constant' && /^\s*#\s*define\b/.test(target.signature ?? '')) return null;
+    }
 
     // An `imports` reference names something importable — never a member that
     // only exists inside a type.

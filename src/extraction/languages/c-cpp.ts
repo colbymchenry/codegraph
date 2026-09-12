@@ -41,8 +41,9 @@ function findDeclaratorQualifiedId(declarator: SyntaxNode): SyntaxNode | undefin
  *    (`TEST` never matches; K&R C definitions have lowercase names);
  *  - the first "parameter" is a LONE identifier (no type, no declarator)
  *    containing a lowercase letter — the name being defined;
- *  - at least one more parameter follows and NONE of them is another lone
- *    identifier — a second bare arg means the first isn't the name (gtest's
+ *  - additional parameters, if present, must not be lone identifiers; with
+ *    only one argument, a same-file #define must declare that parameter as
+ *    the function name. A second bare arg means the first isn't the name (gtest's
  *    `TEST_F(Fixture, Name)`, `PYBIND11_MODULE(ext, m)`,
  *    google-benchmark's `BENCHMARK_DEFINE_F(Fix, name)` all bail here).
  */
@@ -55,7 +56,7 @@ function recoverCppMacroDefinedName(node: SyntaxNode, source: string): string | 
   const macroName = getNodeText(inner, source);
   if (!/^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(macroName)) return undefined;
   const params = getChildByField(declarator, 'parameters');
-  if (!params || params.namedChildCount < 2) return undefined;
+  if (!params || params.namedChildCount < 1) return undefined;
   const loneIdentText = (p: SyntaxNode): string | null =>
     p.type === 'parameter_declaration' &&
     p.namedChildCount === 1 &&
@@ -65,6 +66,12 @@ function recoverCppMacroDefinedName(node: SyntaxNode, source: string): string | 
   const first = params.namedChild(0);
   const name = first ? loneIdentText(first) : null;
   if (!name || !/[a-z]/.test(name)) return undefined;
+  if (params.namedChildCount === 1) {
+    // A single bare argument is ambiguous unless this file defines the macro
+    // as a function declaration using its parameter as the function name.
+    const definition = source.match(new RegExp(`^\\s*#\\s*define[ \\t]+${macroName}\\(([A-Za-z_]\\w*)\\)[ \\t]+([^\\n]+)`, 'm'));
+    if (!definition || !new RegExp(`\\b${definition[1]}[ \\t]*\\(`).test(definition[2]!)) return undefined;
+  }
   for (let i = 1; i < params.namedChildCount; i++) {
     const p = params.namedChild(i);
     if (p && loneIdentText(p) !== null) return undefined;
@@ -211,6 +218,14 @@ export const cExtractor: LanguageExtractor = {
   preParse: preParseCSource,
   // Universal net: recover a real name from any macro-mangled function name.
   recoverMangledName: recoverMangledCppName,
+  resolveName: (node, source) => {
+    const declarator = getChildByField(node, 'declarator');
+    const name = declarator?.namedChild(0);
+    // C parses FN(name) { ... } as type FN + (name) declarator.
+    if (node.type === 'function_definition' && declarator?.type === 'parenthesized_declarator' &&
+        declarator.namedChildCount === 1 && name?.type === 'identifier') return getNodeText(name, source);
+    return undefined;
+  },
   functionTypes: ['function_definition'],
   classTypes: [],
   methodTypes: [],

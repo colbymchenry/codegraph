@@ -1496,6 +1496,14 @@ export class ToolHandler {
   // main loop stays free for the MCP transport under concurrent load. Null in
   // direct/in-process mode (one client, no concurrency to parallelize).
   private queryPool: QueryPool | null = null;
+  private projectLifecycle: ((cg: CodeGraph) => Promise<void>) | null = null;
+  private projectGates = new Map<CodeGraph, Promise<void>>();
+  private closing = false;
+
+  /** Engine owns watching and writer locks; read-only handlers never activate projects. */
+  setProjectLifecycle(activate: (cg: CodeGraph) => Promise<void>): void {
+    this.projectLifecycle = activate;
+  }
 
   constructor(private cg: CodeGraph | null) {}
 
@@ -1709,6 +1717,7 @@ export class ToolHandler {
    * similar to how git finds .git/ directories.
    */
   private getCodeGraph(projectPath?: string): CodeGraph {
+    if (this.closing) throw new Error('MCP engine is shutting down');
     if (!projectPath) {
       if (!this.cg) {
         const searched = this.defaultProjectHint ?? process.cwd();
@@ -1819,7 +1828,18 @@ export class ToolHandler {
       cg.close();
     }
     this.projectCache.clear();
+    this.projectGates.clear();
     this.worktreeMismatchCache.clear();
+  }
+
+  /** Engine shutdown must drain active writers before closing cached projects. */
+  async closeAllAsync(): Promise<void> {
+    this.closing = true;
+    const projects = [...this.projectCache.values()];
+    this.projectCache.clear();
+    this.projectGates.clear();
+    this.worktreeMismatchCache.clear();
+    await Promise.all(projects.map((cg) => cg.closeAsync()));
   }
 
   /**
@@ -2141,6 +2161,21 @@ export class ToolHandler {
       if (args.pattern !== undefined) {
         const check = this.validateOptionalPath(args.pattern, 'pattern');
         if (typeof check === 'object' && check !== undefined) return check;
+      }
+
+      // Resolve on the engine thread even when dispatch uses a read worker:
+      // explicit projects need the same watcher and initial reconcile as default.
+      if (this.projectLifecycle && pathCheck) {
+        const cg = this.getCodeGraph(pathCheck);
+        let gate = this.projectGates.get(cg);
+        if (!gate) {
+          // Retry writer ownership on later calls: another engine may have
+          // closed since we opened this connection in read-only fallback.
+          gate = this.projectLifecycle(cg);
+          this.projectGates.set(cg, gate);
+          void gate.finally(() => this.projectGates.delete(cg));
+        }
+        await this.awaitCatchUpGate(gate);
       }
 
       // codegraph_status reports watcher state (pending files, degraded mode,
@@ -6520,8 +6555,8 @@ export class ToolHandler {
     let cg = this.getCodeGraph(args.projectPath as string | undefined);
     // Same trick as withStalenessNotice — when an explicit projectPath
     // resolves to the same project as the default session cg, prefer the
-    // default so getPendingFiles() (only populated by the default's watcher)
-    // is non-empty when there are pending edits.
+    // default so getPendingFiles() reads the same watcher as the default
+    // session when there are pending edits.
     if (this.cg && cg !== this.cg) {
       try {
         if (resolvePath(this.cg.getProjectRoot()) === resolvePath(cg.getProjectRoot())) {

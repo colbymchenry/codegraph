@@ -98,6 +98,17 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
 
   it.each([
     ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('keeps same-line accessor IDs distinct: %s (#1349)', (ext, language) => {
+    const result = assertParity(`accessors.${ext}`, `const emoji = '😀'; class Box { get value() { return read(); } set value(v) { write(v); } }`, language);
+    const accessors = result.nodes.filter(n => n.kind === 'method' && n.name === 'value');
+    expect(accessors).toHaveLength(2);
+    expect(new Set(accessors.map(n => n.id)).size).toBe(2);
+    expect(result.unresolvedReferences.find(r => r.referenceName === 'read')?.fromNodeId).toBe(accessors[0].id);
+    expect(result.unresolvedReferences.find(r => r.referenceName === 'write')?.fromNodeId).toBe(accessors[1].id);
+  });
+
+  it.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
   ] as const)('preserves nested receivers and argument calls: %s (#1794)', (ext, language) => {
     const source = `
 function readKey() { return 'answer'; }

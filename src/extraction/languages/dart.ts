@@ -40,7 +40,7 @@ function dartEnclosingTypeName(node: SyntaxNode): string | undefined {
   while (p) {
     if (
       p.type === 'class_definition' || p.type === 'mixin_declaration' ||
-      p.type === 'extension_declaration' || p.type === 'enum_declaration'
+      p.type === 'extension_declaration' || p.type === 'extension_type_declaration' || p.type === 'enum_declaration'
     ) {
       return p.childForFieldName('name')?.text;
     }
@@ -132,7 +132,7 @@ export const dartExtractor: LanguageExtractor = {
   importTypes: ['import_or_export'],
   callTypes: [],  // Dart calls use identifier+selector, handled via extractBareCall
   variableTypes: [],
-  extraClassNodeTypes: ['mixin_declaration', 'extension_declaration'],
+  extraClassNodeTypes: ['mixin_declaration', 'extension_declaration', 'extension_type_declaration'],
   // A Dart `static_final_declaration` is exactly a top-level or class-`static`
   // `const`/`final` — the shared-constant idiom — so extract it as `constant`
   // for value-reference edges. Instance fields, `var`, and typed declarations

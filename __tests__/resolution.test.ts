@@ -1295,7 +1295,7 @@ class Widget { public: Widget(int a, int b) {} };
 int runStack(int a, int b) { Calculator calc(0); return calc.add(a, b); }
 int runBrace() { Widget w{1, 2}; return 0; }
 int runHeap(int a, int b) { Calculator* c = new Calculator(0); return c->add(a, b); }
-void noise() { int x(5); int y{6}; Calculator deferred; }
+void noise() { int x(5); int y{6}; extern Calculator deferred; }
 `
       );
       cg = await CodeGraph.init(tempDir, { index: true });
@@ -1314,8 +1314,8 @@ void noise() { int x(5); int y{6}; Calculator deferred; }
       expect(instTargets('runBrace').map((n) => `${n.kind}:${n.name}`)).toContain('class:Widget');
       // Heap still works (regression guard).
       expect(instTargets('runHeap').map((n) => `${n.kind}:${n.name}`)).toContain('class:Calculator');
-      // Primitives (`int x(0)`/`int y{6}`) and bare default construction
-      // (`Calculator deferred;`) must NOT mint an instantiates edge.
+      // Primitives and extern declarations do not construct an object.
+      // Actual default construction is covered by cpp-remaining-regressions.
       expect(instTargets('noise')).toHaveLength(0);
     });
 

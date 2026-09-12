@@ -67,11 +67,12 @@ export class MCPEngine {
   // Throttle for the retry path's sub-project down-scan (#1606) — the scan is
   // bounded but shouldn't run on every tool call in the no-default state.
   private lastRetrySubScanAt = 0;
-  private watcherStarted = false;
+  private watchedProjects = new Set<string>();
   /** Set when this engine holds writer.pid (#1740). */
-  private writerLockRoot: string | null = null;
+  private writerLockRoots = new Set<string>();
   private opts: Required<MCPEngineOptions>;
   private closed = false;
+  private stopPromise: Promise<void> | null = null;
   // Off-loop read-tool pool (daemon mode only). Created lazily once the default
   // project is open — workers each hold their own WAL read connection.
   private queryPool: QueryPool | null = null;
@@ -79,6 +80,7 @@ export class MCPEngine {
   constructor(opts: MCPEngineOptions = {}) {
     this.opts = { watch: opts.watch ?? true, queryPool: opts.queryPool ?? false };
     this.toolHandler = new ToolHandler(null);
+    this.toolHandler.setProjectLifecycle((cg) => this.activateProject(cg));
   }
 
   /**
@@ -191,8 +193,7 @@ export class MCPEngine {
       this.cg = loadCodeGraph().openSync(resolvedRoot);
       this.projectPath = resolvedRoot;
       this.toolHandler.setDefaultCodeGraph(this.cg);
-      this.startWatching();
-      this.catchUpSync();
+      this.toolHandler.setCatchUpGate(this.activateProject(this.cg));
       this.maybeStartPool(resolvedRoot);
     } catch {
       // Still failing — caller will try again on the next tool call.
@@ -203,25 +204,28 @@ export class MCPEngine {
    * Close everything. Used on graceful daemon shutdown (SIGTERM/idle timeout)
    * and on direct-mode stop. Idempotent.
    */
-  stop(): void {
-    if (this.closed) return;
+  stop(): Promise<void> {
+    return this.stopPromise ??= this.doStop();
+  }
+
+  private async doStop(): Promise<void> {
     this.closed = true;
-    if (this.writerLockRoot) {
-      releaseWriterLock(this.writerLockRoot);
-      this.writerLockRoot = null;
-    }
+    if (this.initPromise) await this.initPromise;
     // Detach + terminate the worker pool first so no tool call routes to a
     // worker mid-teardown; outstanding pool calls resolve with graceful guidance.
     this.toolHandler.setQueryPool(null);
     if (this.queryPool) {
-      void this.queryPool.destroy();
+      await this.queryPool.destroy();
       this.queryPool = null;
     }
-    this.toolHandler.closeAll();
+    await this.toolHandler.closeAllAsync();
     if (this.cg) {
-      try { this.cg.close(); } catch { /* ignore */ }
+      await this.cg.closeAsync();
       this.cg = null;
     }
+    for (const root of this.writerLockRoots) releaseWriterLock(root);
+    this.writerLockRoots.clear();
+    this.watchedProjects.clear();
   }
 
   private async doInitialize(searchFrom: string): Promise<void> {
@@ -258,8 +262,7 @@ export class MCPEngine {
     try {
       this.cg = await loadCodeGraph().open(resolvedRoot);
       this.toolHandler.setDefaultCodeGraph(this.cg);
-      this.startWatching();
-      this.catchUpSync();
+      this.toolHandler.setCatchUpGate(this.activateProject(this.cg));
       this.maybeStartPool(resolvedRoot);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -277,19 +280,29 @@ export class MCPEngine {
 
   /**
    * Start file watching on the active CodeGraph instance. Idempotent — the
-   * watcher is per-engine, not per-session, which is why the daemon path
-   * collapses N inotify sets to one. The wording of the disabled-reason log
-   * exactly matches the prior in-tree implementation so log-driven dashboards
-   * keep working.
+   * watcher is per-project in the engine, not per-session. Explicit projectPath
+   * opens get the same writer ownership and catch-up lifecycle as the default.
    */
-  private startWatching(): void {
-    if (!this.cg || this.watcherStarted || !this.opts.watch) return;
+  private activateProject(cg: CodeGraph): Promise<void> {
+    const root = cg.getProjectRoot();
+    if (this.closed || this.watchedProjects.has(root)) return Promise.resolve();
+    const disabledReason = !this.opts.watch ? 'watch disabled for this engine' : watchDisabledReason(root);
+    if (disabledReason) {
+      this.watchedProjects.add(root);
+      process.stderr.write(`[CodeGraph MCP] Auto-sync disabled for ${root} — ${disabledReason}. Run \`codegraph sync\` to refresh.\n`);
+      return Promise.resolve();
+    }
+    if (!this.startWatching(cg)) return Promise.resolve();
+    this.watchedProjects.add(root);
+    return this.catchUpSync(cg);
+  }
 
+  private startWatching(cg: CodeGraph): boolean {
     // #1740: only one live watcher/writer per project. Daemon and startDirect
     // usually already hold writer.pid (re-entrant for this pid). Proxy
     // in-process fallback acquires here; if another writer holds it, skip the
     // watcher so we never contend on codegraph.lock until auto-sync degrades.
-    const lockRoot = this.projectPath;
+    const lockRoot = cg.getProjectRoot();
     if (lockRoot) {
       const writer = tryAcquireWriterLock(lockRoot, 'fallback');
       if (writer.kind === 'taken') {
@@ -297,20 +310,9 @@ export class MCPEngine {
         process.stderr.write(
           `[CodeGraph MCP] File watcher not started — ${msg}\n`
         );
-        this.watcherStarted = true;
-        return;
+        return false;
       }
-      this.writerLockRoot = lockRoot;
-    }
-
-    const disabledReason = watchDisabledReason(this.projectPath ?? process.cwd());
-    if (disabledReason) {
-      process.stderr.write(
-        `[CodeGraph MCP] File watcher disabled — ${disabledReason}. ` +
-        `The graph will not auto-update; run \`codegraph sync\` (or install the git sync hooks via \`codegraph init\`) to refresh.\n`
-      );
-      this.watcherStarted = true;
-      return;
+      this.writerLockRoots.add(lockRoot);
     }
 
     // Optional override for the debounce window via env var (issue #403).
@@ -323,7 +325,7 @@ export class MCPEngine {
       process.stderr.write(`[CodeGraph MCP] File watcher debounce: ${debounceMs}ms (CODEGRAPH_WATCH_DEBOUNCE_MS)\n`);
     }
 
-    const started = this.cg.watch({
+    const started = cg.watch({
       debounceMs,
       onSyncComplete: (result) => {
         if (result.filesChanged > 0) {
@@ -345,7 +347,6 @@ export class MCPEngine {
       },
     });
 
-    this.watcherStarted = true;
     if (started) {
       process.stderr.write('[CodeGraph MCP] File watcher active — graph will auto-sync on changes\n');
     } else {
@@ -353,6 +354,7 @@ export class MCPEngine {
         '[CodeGraph MCP] File watcher unavailable on this platform — run `codegraph sync` to refresh the graph after changes.\n'
       );
     }
+    return true;
   }
 
   /**
@@ -365,10 +367,8 @@ export class MCPEngine {
    * and the per-file staleness banner can't help because `getPendingFiles()`
    * is populated by the watcher, not by catch-up).
    */
-  private catchUpSync(): void {
-    const cg = this.cg;
-    if (!cg) return;
-    const p = cg
+  private catchUpSync(cg: CodeGraph): Promise<void> {
+    return cg
       .sync()
       .then((result) => {
         const changed = result.filesAdded + result.filesModified + result.filesRemoved;
@@ -380,7 +380,6 @@ export class MCPEngine {
         const msg = err instanceof Error ? err.message : String(err);
         process.stderr.write(`[CodeGraph MCP] Catch-up sync failed: ${msg}\n`);
       });
-    this.toolHandler.setCatchUpGate(p);
   }
 }
 

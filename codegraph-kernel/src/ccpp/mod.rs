@@ -599,6 +599,13 @@ impl<'t> Walker<'t> {
             }
         }
         if let Some(name_node) = node.child_by_field_name("declarator") {
+            if self.variant == Variant::C && node.kind() == "function_definition"
+                && name_node.kind() == "parenthesized_declarator" && name_node.named_child_count() == 1
+            {
+                if let Some(name) = name_node.named_child(0).filter(|n| n.kind() == "identifier") {
+                    return self.text(name).to_string();
+                }
+            }
             let mut resolved = name_node;
             // Unwrap pointer/reference declarators (`int* f()`, `T& f()`).
             while matches!(resolved.kind(), "pointer_declarator" | "reference_declarator") {
@@ -668,7 +675,7 @@ impl<'t> Walker<'t> {
             return None;
         }
         let params = declarator.child_by_field_name("parameters")?;
-        if params.named_child_count() < 2 {
+        if params.named_child_count() < 1 {
             return None;
         }
         let lone_ident_text = |p: Node| -> Option<&'t str> {
@@ -684,6 +691,15 @@ impl<'t> Walker<'t> {
         let name = params.named_child(0).and_then(lone_ident_text)?;
         if !has_lower_re().is_match(name) {
             return None;
+        }
+        if params.named_child_count() == 1 {
+            let pattern = format!(r"(?m)^\s*#\s*define[ \t]+{}\(([A-Za-z_]\w*)\)[ \t]+([^\n]+)", regex::escape(macro_name));
+            let definition = regex::Regex::new(&pattern).ok()?;
+            let captures = definition.captures(self.src)?;
+            let function_pattern = format!(r"\b{}[ \t]*\(", regex::escape(&captures[1]));
+            if !regex::Regex::new(&function_pattern).ok()?.is_match(&captures[2]) {
+                return None;
+            }
         }
         for i in 1..params.named_child_count() {
             if let Some(p) = params.named_child(i) {
@@ -817,6 +833,15 @@ impl<'t> Walker<'t> {
         stack_guard!();
         let kind = node.kind();
         let mut skip_children = false;
+
+        if kind == "preproc_function_def" {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = self.text(name_node).to_string();
+                let signature = Some(self.text(node).trim().to_string());
+                self.create_node("constant", &name, node, Extra { signature, ..Extra::default() });
+            }
+            return;
+        }
 
         // C++ namespace blocks: prefix-only, no node (#1291/#1093). Anonymous
         // namespaces fall through to the generic walk.
@@ -1456,6 +1481,11 @@ impl<'t> Walker<'t> {
 
     /// isCppStackConstruction (#1035).
     fn is_cpp_stack_construction(&self, node: Node) -> bool {
+        for i in 0..node.named_child_count() {
+            if let Some(child) = node.named_child(i) {
+                if child.kind() == "storage_class_specifier" && self.text(child) == "extern" { return false; }
+            }
+        }
         let Some(type_node) = node.child_by_field_name("type") else { return false };
         if !matches!(
             type_node.kind(),
@@ -1465,6 +1495,7 @@ impl<'t> Walker<'t> {
         }
         for i in 0..node.named_child_count() {
             let Some(child) = node.named_child(i) else { continue };
+            if child.kind() == "identifier" { return true; }
             if child.kind() != "init_declarator" {
                 continue;
             }
@@ -1570,6 +1601,11 @@ impl<'t> Walker<'t> {
     fn visit_for_calls_and_structure(&mut self, node: Node<'t>) {
         stack_guard!();
         let kind = node.kind();
+        if kind == "preproc_function_def" {
+            self.visit_node(node);
+            return;
+        }
+
         self.maybe_capture_fn_refs(node);
 
         if kind == "call_expression" {
@@ -1584,6 +1620,12 @@ impl<'t> Walker<'t> {
             && self.is_cpp_stack_construction(node)
         {
             self.extract_instantiation(node);
+            if let (Some(type_node), Some(from)) = (node.child_by_field_name("type"), self.stack.last().map(|s| s.row)) {
+                let class_name = strip_cpp_template_args(self.text(type_node));
+                if let Some(name) = class_name.split("::").filter(|s| !s.is_empty()).last() {
+                    self.push_ref_at(from, &format!("{class_name}::{name}"), edge_kind_index("calls").unwrap(), node);
+                }
+            }
         }
 
         // C++ local fn-pointer bindings: declarations and branch reassignments.

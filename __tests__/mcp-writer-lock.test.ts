@@ -9,6 +9,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
+import { stopDaemonAt } from '../src/mcp/daemon-registry';
 import { getWriterPidPath } from '../src/mcp/writer-lock';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
@@ -50,12 +51,20 @@ describe('issue #1740 — direct-mode writer lock', () => {
   });
 
   afterEach(async () => {
-    for (const c of children) {
-      try { c.kill('SIGTERM'); } catch { /* ignore */ }
-    }
+    const exits = children.map((c) => new Promise<void>((resolve, reject) => {
+      if (c.exitCode !== null || c.signalCode !== null) { resolve(); return; }
+      const timer = setTimeout(() => reject(new Error(`MCP child ${c.pid} did not exit`)), 5000);
+      c.once('close', () => { clearTimeout(timer); resolve(); });
+      c.kill('SIGTERM');
+    }));
+    // The proxies are not the detached writer. Verify its identity and stop
+    // only the daemon belonging to this uniquely-created test root.
+    await stopDaemonAt(realRoot);
+    await Promise.all(exits);
     children.length = 0;
-    await sleep(300);
-    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    if (process.platform !== 'win32') expect(fs.existsSync(getWriterPidPath(realRoot))).toBe(false);
+    fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    expect(fs.existsSync(tempDir)).toBe(false);
   });
 
   it('second CODEGRAPH_NO_DAEMON serve --mcp exits with writer-lock error', async () => {

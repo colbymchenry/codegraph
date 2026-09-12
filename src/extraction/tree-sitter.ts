@@ -1020,6 +1020,17 @@ export class TreeSitterExtractor {
       if (skipChildren) return;
     }
 
+    // Preprocessor definitions are values, never executable callees. Keeping
+    // the directive lets resolution recognize visible macros through includes.
+    if ((this.language === 'c' || this.language === 'cpp') &&
+        nodeType === 'preproc_function_def') {
+      const name = getChildByField(node, 'name');
+      if (name) this.createNode('constant', getNodeText(name, this.source), node, {
+        signature: getNodeText(node, this.source).trim(),
+      });
+      return;
+    }
+
     // C++ namespace blocks: carry the namespace name as a qualifiedName prefix
     // while walking the body, so `namespace flash { void compute_attn(); }`
     // indexes compute_attn with qualifiedName `flash::compute_attn` and a
@@ -1388,7 +1399,11 @@ export class TreeSitterExtractor {
       return null;
     }
 
-    const id = generateNodeId(this.filePath, kind, name, node.startPosition.row + 1);
+    // TS/JS permits same-name declarations on one line (notably get/set).
+    // Include the UTF-16 column for these languages so their edges cannot alias.
+    const column = ['typescript', 'tsx', 'javascript', 'jsx'].includes(this.language)
+      ? node.startPosition.column : undefined;
+    const id = generateNodeId(this.filePath, kind, name, node.startPosition.row + 1, column);
 
     // Some grammars (e.g. Dart) model a function/method body as a *sibling* of
     // the signature node, so the declaration node's own range is just the
@@ -5090,13 +5105,13 @@ export class TreeSitterExtractor {
    *    `auto` (`placeholder_type_specifier` — that form always carries a real
    *    `call_expression`, already handled), and sized specifiers are excluded —
    *    they construct no class; and
-   *  - a declarator carries constructor arguments: an `init_declarator` whose
-   *    `value` is an `argument_list` (`(args)`) or `initializer_list` (`{args}`).
-   *    This skips default construction `Calculator c;` (no value) and the
-   *    most-vexing-parse `Calculator c();` (a bodyless `function_declarator`,
-   *    a function decl — not a construction).
+   *  - a bare identifier (default construction), or an `init_declarator`
+   *    whose value is an `argument_list` / `initializer_list`. Pointer,
+   *    reference, and function declarators are excluded, including the
+   *    most-vexing-parse `Calculator c();` (a function declaration).
    */
   private isCppStackConstruction(node: SyntaxNode): boolean {
+    if (node.namedChildren.some(c => c.type === 'storage_class_specifier' && c.text === 'extern')) return false;
     const typeNode = getChildByField(node, 'type');
     if (
       !typeNode ||
@@ -5108,6 +5123,7 @@ export class TreeSitterExtractor {
     }
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
+      if (child?.type === 'identifier') return true; // T object; default construction
       if (child?.type !== 'init_declarator') continue;
       const value = getChildByField(child, 'value');
       if (value && (value.type === 'argument_list' || value.type === 'initializer_list')) {
@@ -5590,6 +5606,12 @@ export class TreeSitterExtractor {
 
     const visitForCallsAndStructure = (node: SyntaxNode): void => {
       const nodeType = node.type;
+      if ((this.language === 'c' || this.language === 'cpp') &&
+          nodeType === 'preproc_function_def') {
+        this.visitNode(node);
+        return;
+      }
+
 
       // Function-as-value capture (#756) — function bodies are walked here,
       // not in visitNode, so the capture hook must fire in both walkers.
@@ -5642,6 +5664,17 @@ export class TreeSitterExtractor {
       // (`Calculator calc(make())`) keeps its own `calls` ref.
       if (nodeType === 'declaration' && this.language === 'cpp' && this.isCppStackConstruction(node)) {
         this.extractInstantiation(node);
+        const type = getChildByField(node, 'type');
+        const className = type ? stripCppTemplateArgs(getNodeText(type, this.source)) : '';
+        const name = className.split('::').filter(Boolean).pop();
+        const callerId = this.nodeStack[this.nodeStack.length - 1];
+        if (name && callerId) this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: `${className}::${name}`,
+          referenceKind: 'calls',
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column,
+        });
       }
 
       // C++ local function-pointer bindings (see cppLocalFnPtrs): record

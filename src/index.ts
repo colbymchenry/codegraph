@@ -455,6 +455,12 @@ export class CodeGraph {
     this.db.close();
   }
 
+  /** Stop watching and drain in-flight index writes before closing SQLite. */
+  async closeAsync(): Promise<void> {
+    this.unwatch();
+    await this.indexMutex.withLock(() => this.close());
+  }
+
   /**
    * Get the project root directory
    */

@@ -157,6 +157,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- Callback связывается с обработчиком регистрирующего класса, включая TSX→TS и наследование, а не с одноимённым методом другого класса.
+- Исправлены C/C++ macro calls и local constructors; одноаргументные function macros получают подтверждённое имя.
+- TS/JS getter и setter одной строки больше не перезаписывают друг друга; Dart extension types сохраняют правильные границы и членов.
+- Явно выбранные MCP-проекты получают catch-up и watcher; shutdown дожидается записи, а тесты удаляют свой daemon.
+
 - Восстановлена поддержка Verilog/SystemVerilog и поиска пути от верхнего FPGA-модуля до вложенного; спасибо @FHYQ-Dong за исходный extractor.
 - Обрыв подключения во время MCP-handshake больше не оставляет фантомного клиента.
 - Prompt-hook пропускает служебные уведомления о завершении задач; тесты resolution удаляют временные каталоги после закрытия графа.
