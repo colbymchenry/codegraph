@@ -955,6 +955,19 @@ program
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
 
+      if (cg.isIndexStale()) {
+        cg.destroy();
+        const message = 'Index extraction is stale. Run "codegraph index" for a full rebuild before syncing.';
+        // A quiet sync is the git-hook path. The exit status still says "no",
+        // but one stderr line explains why so a hook that fails the commit on a
+        // non-zero exit does not block it with an invisible reason. (#1798)
+        if (options.quiet) {
+          process.stderr.write(`codegraph sync: ${message}\n`);
+          process.exit(1);
+        }
+        throw new Error(message);
+      }
+
       if (options.quiet) {
         await cg.sync();
         cg.destroy();
