@@ -1,0 +1,222 @@
+{
+  "axiRevision": "da8793b0e3f14c9186c94fac9ed6ec06375c254e",
+  "benderLockSha256": "6e91c73d8fdb6f6a2280e433dc4a3879adc0bb09969c09049d65564c0c50d223",
+  "tools": {
+    "bender": "bender 0.32.1",
+    "verilator": "Verilator 5.051 devel rev v5.050-260-g1c9a9e0cc (mod)"
+  },
+  "dependencies": {
+    "common_cells": {
+      "revision": "03d98106aa19952a10360d2230def85144a0008b",
+      "path": ".bender/git/checkouts/common_cells-3e2fcccecd7aee7b"
+    },
+    "common_verification": {
+      "revision": "fb1885f48ea46164a10568aeff51884389f67ae3",
+      "path": ".bender/git/checkouts/common_verification-5b9bacfe2f79eb87"
+    },
+    "tech_cells_generic": {
+      "revision": "3a3de73632a06826b1bd9c65a0a2e92b32016845",
+      "path": ".bender/git/checkouts/tech_cells_generic-6e6736c6cf5dbb6b"
+    }
+  },
+  "profile": {
+    "target": "synth_test",
+    "top": "synth_axi_lite_xbar",
+    "parameterValues": {
+      "NoSlvMst": [
+        1,
+        2,
+        4
+      ]
+    },
+    "defines": [
+      "+define+TARGET_SYNTHESIS",
+      "+define+TARGET_SYNTH_TEST",
+      "+define+TARGET_VERILATOR",
+      "+define+TARGET_SYNTHESIS",
+      "+define+TARGET_SYNTH_TEST",
+      "+define+TARGET_VERILATOR",
+      "+define+TARGET_SYNTHESIS",
+      "+define+TARGET_SYNTH_TEST",
+      "+define+TARGET_VERILATOR",
+      "+define+TARGET_SYNTHESIS",
+      "+define+TARGET_SYNTH_TEST",
+      "+define+TARGET_VERILATOR",
+      "+define+TARGET_SYNTHESIS",
+      "+define+TARGET_SYNTH_TEST",
+      "+define+TARGET_VERILATOR",
+      "+define+TARGET_SYNTHESIS",
+      "+define+TARGET_SYNTH_TEST",
+      "+define+TARGET_VERILATOR",
+      "+define+TARGET_SYNTHESIS",
+      "+define+TARGET_SYNTH_TEST",
+      "+define+TARGET_VERILATOR",
+      "+define+TARGET_SYNTHESIS",
+      "+define+TARGET_SYNTH_TEST",
+      "+define+TARGET_VERILATOR",
+      "+define+TARGET_SYNTHESIS",
+      "+define+TARGET_SYNTH_TEST",
+      "+define+TARGET_VERILATOR",
+      "+define+TARGET_SYNTHESIS",
+      "+define+TARGET_SYNTH_TEST",
+      "+define+TARGET_VERILATOR",
+      "+define+TARGET_SYNTHESIS",
+      "+define+TARGET_SYNTH_TEST",
+      "+define+TARGET_VERILATOR",
+      "+define+TARGET_SYNTHESIS",
+      "+define+TARGET_SYNTH_TEST",
+      "+define+TARGET_VERILATOR"
+    ],
+    "includeDirs": [
+      "+incdir+${AXI}/.bender/git/checkouts/common_cells-3e2fcccecd7aee7b/include",
+      "+incdir+${AXI}/.bender/git/checkouts/common_cells-3e2fcccecd7aee7b/include",
+      "+incdir+${AXI}/.bender/git/checkouts/common_cells-3e2fcccecd7aee7b/include",
+      "+incdir+${AXI}/.bender/git/checkouts/common_cells-3e2fcccecd7aee7b/include",
+      "+incdir+${AXI}/.bender/git/checkouts/common_cells-3e2fcccecd7aee7b/include",
+      "+incdir+${AXI}/.bender/git/checkouts/common_cells-3e2fcccecd7aee7b/include",
+      "+incdir+${AXI}/include",
+      "+incdir+${AXI}/.bender/git/checkouts/common_cells-3e2fcccecd7aee7b/include",
+      "+incdir+${AXI}/include"
+    ],
+    "filelistSha256": "89377169cba1b548529c3fd2a54a5b20fd66c925ccb94e64f005d343945a37f3"
+  },
+  "cases": [
+    {
+      "name": "demux-missing-include-control",
+      "argv": [
+        "${VERILATOR}",
+        "-E",
+        "-P",
+        "-Iinclude",
+        "src/axi_demux_simple.sv"
+      ],
+      "exit": 1,
+      "seconds": 0.072,
+      "warnings": {},
+      "errors": 3
+    },
+    {
+      "name": "demux-preprocess-default",
+      "argv": [
+        "${VERILATOR}",
+        "-E",
+        "-P",
+        "-Iinclude",
+        "-I${AXI}/.bender/git/checkouts/common_cells-3e2fcccecd7aee7b/include",
+        "src/axi_demux_simple.sv"
+      ],
+      "exit": 0,
+      "seconds": 0.072,
+      "warnings": {},
+      "errors": 0
+    },
+    {
+      "name": "demux-preprocess-VCS",
+      "argv": [
+        "${VERILATOR}",
+        "-E",
+        "-P",
+        "-Iinclude",
+        "-I${AXI}/.bender/git/checkouts/common_cells-3e2fcccecd7aee7b/include",
+        "+define+VCS",
+        "src/axi_demux_simple.sv"
+      ],
+      "exit": 0,
+      "seconds": 0.071,
+      "warnings": {},
+      "errors": 0
+    },
+    {
+      "name": "xbar-lint-1",
+      "argv": [
+        "${VERILATOR}",
+        "--lint-only",
+        "--assert",
+        "-Wno-fatal",
+        "--top-module",
+        "synth_axi_lite_xbar",
+        "-GNoSlvMst=1",
+        "--Mdir",
+        "${AXI}/build/final-controls/obj-1",
+        "-f",
+        "${AXI}/build/final-controls/verilator.f"
+      ],
+      "exit": 0,
+      "seconds": 0.611,
+      "warnings": {
+        "PINMISSING": 3,
+        "WIDTHEXPAND": 3,
+        "WIDTHTRUNC": 3
+      },
+      "errors": 0
+    },
+    {
+      "name": "xbar-lint-2",
+      "argv": [
+        "${VERILATOR}",
+        "--lint-only",
+        "--assert",
+        "-Wno-fatal",
+        "--top-module",
+        "synth_axi_lite_xbar",
+        "-GNoSlvMst=2",
+        "--Mdir",
+        "${AXI}/build/final-controls/obj-2",
+        "-f",
+        "${AXI}/build/final-controls/verilator.f"
+      ],
+      "exit": 0,
+      "seconds": 0.773,
+      "warnings": {
+        "PINMISSING": 3,
+        "SPLITVAR": 3,
+        "UNOPTFLAT": 1,
+        "WIDTHEXPAND": 3,
+        "WIDTHTRUNC": 4
+      },
+      "errors": 0
+    },
+    {
+      "name": "xbar-lint-4",
+      "argv": [
+        "${VERILATOR}",
+        "--lint-only",
+        "--assert",
+        "-Wno-fatal",
+        "--top-module",
+        "synth_axi_lite_xbar",
+        "-GNoSlvMst=4",
+        "--Mdir",
+        "${AXI}/build/final-controls/obj-4",
+        "-f",
+        "${AXI}/build/final-controls/verilator.f"
+      ],
+      "exit": 0,
+      "seconds": 1.183,
+      "warnings": {
+        "PINMISSING": 3,
+        "UNOPTFLAT": 2,
+        "WIDTHEXPAND": 3,
+        "WIDTHTRUNC": 4
+      },
+      "errors": 0
+    }
+  ],
+  "trackedInputCount": 152,
+  "trackedInputsUnchanged": true,
+  "limitations": [
+    "Warnings retained with -Wno-fatal; not a warning-free build",
+    "Lint/elaboration controls only, no simulation, synthesis or FPGA validation",
+    "Not the complete axi_synth_bench and not all tops"
+  ],
+  "toolDistribution": {
+    "benderRelease": "https://github.com/pulp-platform/bender/releases/tag/v0.32.1",
+    "benderArchiveSha256": "59a36723b056a06b266dc68d4ceedcd0aa17a1c096e8c2ea512af264ff6a13f6",
+    "benderArchiveChecksumVerified": true,
+    "ossCadSuite": "20260825"
+  },
+  "negativeEnvironmentControl": {
+    "BENDER_DIR": "/no/such/project",
+    "result": "Explicit --dir pins checkout; all six controls passed"
+  }
+}

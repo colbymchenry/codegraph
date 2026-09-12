@@ -71,8 +71,9 @@
   электрического драйвера, race, latch, timing или CDC.
 - Пределы профильного snapshot: 1 MiB на source/header и 64 MiB суммарно.
 - UART sim имеет 5 диагностик неинтерпретированного timescale; оба проверенных
-  AXI-профиля — 17 диагностик macro expansion. Полный demux требует отсутствовавших
-  в контрольном наборе common_cells includes; неполный корпус не считать ошибкой языка.
+  AXI-профиля — 17 диагностик macro expansion. Прежний corpus не содержал common_cells includes;
+  A2 восстановил их в отдельной compiler-копии. Исходный frozen corpus не меняется;
+  runtime CodeGraph по-прежнему не выполняет полный macro/include expansion.
 
 ## 3. Очередь выполнения и зависимости
 
@@ -95,10 +96,15 @@ frontend и review задачи можно отдавать агентам; об
 
 ## A. Корпуса и выбор compiler frontend
 
-- [ ] **A1** Зафиксировать manifest UART, eMMC/CRC, AXI: URL/revision, hashes,
+- [x] **A1** Зафиксировать manifest UART, eMMC/CRC, AXI: URL/revision, hashes,
   license, source lists, includes, defines, top, tool versions и отсутствующие зависимости.
-- [ ] **A2** Восстановить необходимые открытые зависимости AXI в изолированной
+  Выполнено 2026-09-12: 137 HDL-файлов, `docs/hdl-corpus-manifest.json`;
+  один локальный card-reader testbench закреплён hash, а не Git revision.
+  Проверены clean/change/add/remove/restore controls.
+- [x] **A2** Восстановить необходимые открытые зависимости AXI в изолированной
   копии, зафиксировать версии и подтвердить корректный compiler invocation.
+  Выполнено 2026-09-12: три lockfile dependencies; demux preprocessing default/VCS
+  и xbar lint/elaboration при NoSlvMst=1/2/4. Отчёт: `docs/validation-hdl-corpora-build-2026-09-12.md`.
 - [ ] **A3** Сравнить кандидатов: slang, Surelog/UHDM, Verilator; при необходимости
   Yosys для синтезируемого подмножества. Актуальные версии, лицензии, экспорт и
   ограничения проверить по официальным источникам во время прототипа.
@@ -289,7 +295,7 @@ J — повторяемый checklist, его отметки относятся
 
 ## 5. Ближайшая конкретная итерация
 
-1. Выполнить **A1–A2**: manifests и полноценный AXI build context.
+1. **A1–A2 выполнены**: manifests и восстановленный AXI context; см. `docs/validation-hdl-corpora-build-2026-09-12.md`.
 2. Параллельно поручить агентам независимые frontend probes и аудит source mapping;
    основной агент готовит общую схему результатов и baseline source graph.
 3. Свести **A3–A6** в decision report и зафиксировать adapter contract.
@@ -303,6 +309,7 @@ J — повторяемый checklist, его отметки относятся
 | --- | --- | --- | --- | --- |
 | 2026-09-12 | Source navigation, scopes, access | Реализованные части перечислены в HDL-001–006 | Отчёты раздела 1 | Сохранить regression coverage |
 | 2026-09-12 | Build profiles | Ограниченный source-режим, реальные profile parity проверки | `b050fb89`, `docs/validation-hdl-profiles-2026-09-12.md` | A: frontend comparison |
+| 2026-09-12 | A1–A2 | Manifest 137 HDL, три locked AXI dependencies, шесть compiler controls | `docs/validation-hdl-corpora-build-2026-09-12.md` | A3–A6, сравнение frontends |
 | 2026-09-12 | Полный план | Создан этот tracker; новые implementation задачи не объявлены выполненными | `VERILOG_TRACKER.md` | A1–A2 |
 
 Для следующей записи: дата → ID задач → наблюдаемый результат → commit/report →
