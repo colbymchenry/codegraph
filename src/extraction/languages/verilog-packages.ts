@@ -30,8 +30,13 @@ export function handleVerilogPackageNode(node: SyntaxNode, ctx: ExtractorContext
   const name = body?.childForFieldName('name');
   // Require the literal package separator between AST nodes, excluding object methods.
   if (primary && name && /^\s*::\s*$/.test(ctx.source.slice(primary.endIndex, name.startIndex))) {
-    const fromNodeId = ctx.nodeStack[ctx.nodeStack.length - 1];
+    const lexical = ctx.nodes.find(n => n.id === ctx.nodeStack[ctx.nodeStack.length - 1]);
+    const callable = [...ctx.nodeStack].reverse().map(id => ctx.nodes.find(n => n.id === id))
+      .find(n => n && (n.kind === 'function' || n.kind === 'method'));
+    const fromNodeId = callable?.id ?? lexical?.id;
     if (fromNodeId) ctx.addUnresolvedReference({ fromNodeId,
+      ...(lexical?.kind === 'namespace' && lexical.id !== fromNodeId
+        ? { candidates: [`hdl:scope:${lexical.qualifiedName}`] } : {}),
       referenceName: `${primary.text.trim()}::${name.text}`, referenceKind: 'calls',
       line: node.startPosition.row + 1, column: node.startPosition.column });
     for (const child of body!.namedChildren) if (child.id !== name.id) ctx.visitNode(child);

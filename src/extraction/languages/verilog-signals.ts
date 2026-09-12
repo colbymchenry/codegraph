@@ -68,7 +68,13 @@ export function isVerilogGenerateBinding(node: SyntaxNode, ctx: ExtractorContext
     if (ancestor.type === 'loop_generate_construct') {
       const init = children(ancestor).find(n => n.type === 'genvar_initialization');
       const id = init && identifier(init);
-      if (id && getNodeText(id, ctx.source) === name) return true;
+      if (id && getNodeText(id, ctx.source) === name) {
+        for (let i = ctx.nodeStack.length - 1; i >= 0; i--) {
+          const scope = ctx.nodes.find(n => n.id === ctx.nodeStack[i]);
+          if (scope && ctx.nodes.some(n => n.qualifiedName === `${scope.qualifiedName}::${name}` && n.decorators?.includes('hdl:generate-parameter'))) return false;
+        }
+        return true;
+      }
     }
     if (['module_declaration', 'interface_declaration', 'program_declaration'].includes(ancestor.type)) break;
   }
@@ -80,29 +86,24 @@ export function isVerilogGenerateBinding(node: SyntaxNode, ctx: ExtractorContext
  * Dotted hierarchical accesses are deliberately excluded: their root is not
  * sufficient evidence that the terminal signal belongs to this module.
  */
-export function addVerilogSignalReferences(node: SyntaxNode, ctx: ExtractorContext, ownerId: string): void {
-  const shadowed = new Set<string>();
-  const findLocals = (current: SyntaxNode): void => {
-    if (current.type === 'variable_decl_assignment' || current.type === 'net_decl_assignment') {
-      const id = current.childForFieldName('name') ?? identifier(current);
-      if (id) shadowed.add(getNodeText(id, ctx.source));
-    }
-    if (current.type === 'for_variable_declaration' || current.type === 'loop_variables') {
-      for (const id of children(current).filter(n => ['simple_identifier', 'escaped_identifier'].includes(n.type))) {
-        shadowed.add(getNodeText(id, ctx.source));
-      }
-    }
-    for (const child of children(current)) findLocals(child);
-  };
-  findLocals(node);
-  const skip = new Set(['data_declaration', 'net_declaration', 'tf_call', 'ps_or_hierarchical_function_identifier']);
+export function addVerilogSignalReferences(node: SyntaxNode, ctx: ExtractorContext, ownerId: string, lexicalScope = false): void {
+  // Parser recovery can lose a declaration while retaining its later uses.
+  // Keep the source nodes, but do not bind names from an incomplete procedural
+  // region to outer declarations. An unrelated valid process remains usable.
+  for (let ancestor: SyntaxNode | null = node; ancestor; ancestor = ancestor.parent) {
+    if (['always_construct', 'initial_construct', 'final_construct', 'function_declaration', 'task_declaration', 'seq_block', 'par_block', 'loop_statement'].includes(ancestor.type) && ancestor.hasError) return;
+    if (['module_declaration', 'interface_declaration', 'program_declaration'].includes(ancestor.type)) break;
+  }
+
+  const skip = new Set(['data_declaration', 'net_declaration', 'for_variable_declaration', 'tf_port_list', 'tf_port_declaration', 'tf_call', 'ps_or_hierarchical_function_identifier']);
   const emit = (id: SyntaxNode): void => {
     const name = getNodeText(id, ctx.source).trim();
-    if (shadowed.has(name) || isVerilogGenerateBinding(id, ctx, name)) return;
+    if (isVerilogGenerateBinding(id, ctx, name)) return;
     ctx.addUnresolvedReference({ fromNodeId: ownerId, referenceName: `hdl:signal:${name}`,
       referenceKind: 'references', line: id.startPosition.row + 1, column: id.startPosition.column });
   };
   const visit = (current: SyntaxNode): void => {
+    if (lexicalScope && current.id !== node.id && ['seq_block', 'par_block', 'loop_statement'].includes(current.type)) return;
     // A package-qualified call is also parsed as method_call. Its receiver
     // may name a package, never evidence for an identically named local port.
     if (current.type === 'method_call') {
@@ -161,6 +162,42 @@ export function addVerilogSignalReferences(node: SyntaxNode, ctx: ExtractorConte
 
 /** HDL declarations and executable blocks; called before generic recursion. */
 export function visitVerilogSignals(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  if (['seq_block', 'par_block', 'loop_statement'].includes(node.type)) {
+    // Generate blocks have their own handler; these nodes are procedural scopes.
+    const keyword = node.children[0]?.text ?? 'block';
+    const label = node.type === 'loop_statement' ? undefined : identifier(node);
+    const kind = node.type === 'loop_statement' ? keyword : node.type === 'par_block' ? 'fork' : 'block';
+    const name = label ? getNodeText(label, ctx.source) : `${kind}@${node.startPosition.row + 1}:${node.startPosition.column}`;
+    const created = ctx.createNode('namespace', name, node, { decorators: ['hdl:procedural-scope'] });
+    if (created) {
+      ctx.pushScope(created.id);
+      addVerilogSignalReferences(node, ctx, created.id, true);
+    }
+    walkChildren(node, ctx);
+    if (created) ctx.popScope();
+    return true;
+  }
+  if (['tf_port_item', 'tf_port_declaration', 'for_variable_declaration', 'loop_variables'].includes(node.type)) {
+    const list = node.type === 'tf_port_declaration'
+      ? children(node).find(n => n.type === 'list_of_tf_variable_identifiers') : node;
+    const ids = list ? children(list).filter(n => ['simple_identifier', 'escaped_identifier'].includes(n.type)) : [];
+    for (const id of ids) {
+      const created = ctx.createNode('field', getNodeText(id, ctx.source), id,
+        { signature: getNodeText(node, ctx.source), decorators: [node.type.startsWith('tf_') ? 'hdl:formal' : 'hdl:signal'] });
+      // Declarator initializers belong to this declaration's lexical scope.
+      if (created) {
+        for (let next = id.nextNamedSibling; next && !ids.some(n => n.id === next!.id); next = next.nextNamedSibling) {
+          if (next.type === 'expression' || next.type === 'constant_expression') addVerilogSignalReferences(next, ctx, created.id, true);
+        }
+      }
+    }
+    // Visit each initializer once with the enclosing callable as call owner.
+    for (const child of list ? children(list) : []) {
+      if (child.type === 'expression' || child.type === 'constant_expression') ctx.visitNode(child);
+    }
+    return true;
+  }
+
   if (node.type === 'ansi_port_declaration') {
     const name = node.childForFieldName('port_name');
     if (name) {
@@ -232,7 +269,7 @@ export function visitVerilogSignals(node: SyntaxNode, ctx: ExtractorContext): bo
     const created = ctx.createNode('function', name, node,
       { signature: getNodeText(node, ctx.source), decorators: ['hdl:process', `hdl:${kind}`] });
     if (created) {
-      addVerilogSignalReferences(node, ctx, created.id);
+      addVerilogSignalReferences(node, ctx, created.id, true);
       ctx.pushScope(created.id);
     }
     walkChildren(node, ctx);

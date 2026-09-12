@@ -45,7 +45,10 @@ endmodule`;
 
   it('does not bind a block-local shadow to a module signal', () => {
     const result = extractFromSource('shadow.sv', 'module top; logic x,y; initial begin logic x; x = y; end endmodule');
-    expect(result.unresolvedReferences.filter(r => r.referenceName.startsWith('hdl:signal:')).map(r => r.referenceName)).toEqual(['hdl:signal:y']);
+    const local = result.nodes.find(n => n.name === 'x' && n.qualifiedName.includes('::block@'))!;
+    const refs = result.unresolvedReferences.filter(r => r.referenceName.startsWith('hdl:signal:'));
+    expect(refs.map(r => r.referenceName)).toEqual(['hdl:signal:x', 'hdl:signal:y']);
+    expect(result.nodes.find(n => n.id === refs[0].fromNodeId)?.qualifiedName).toBe(local.qualifiedName.split('::').slice(0, -1).join('::'));
   });
 
   it('merges non-ANSI reg redeclarations and indexes initializer dependencies', () => {
@@ -62,8 +65,9 @@ leaf outside(.a(i)); endmodule`);
     const inside = result.nodes.find(n => n.name === 'u')!;
     const outside = result.nodes.find(n => n.name === 'outside')!;
     const shorthand = result.nodes.find(n => n.name === 'short')!;
-    expect(result.unresolvedReferences.filter(r => r.fromNodeId === shorthand.id).map(r => r.referenceName)).not.toContain('hdl:signal:i');
-    expect(result.unresolvedReferences.filter(r => r.fromNodeId === inside.id && r.referenceName.startsWith('hdl:signal:')).map(r => r.referenceName)).toEqual(['hdl:signal:x']);
+    expect(result.nodes.find(n => n.qualifiedName === 'top::lanes::i')?.decorators).toContain('hdl:generate-parameter');
+    expect(result.unresolvedReferences.filter(r => r.fromNodeId === shorthand.id).map(r => r.referenceName)).toContain('hdl:signal:i');
+    expect(result.unresolvedReferences.filter(r => r.fromNodeId === inside.id && r.referenceName.startsWith('hdl:signal:')).map(r => r.referenceName)).toEqual(['hdl:signal:i', 'hdl:signal:x']);
     expect(result.unresolvedReferences.filter(r => r.fromNodeId === outside.id).map(r => r.referenceName)).toContain('hdl:signal:i');
   });
 
@@ -112,8 +116,10 @@ initial for (int i=0;i<4;i++) x[i]=y;
 initial foreach (x[j]) x[j]=y;
 endmodule`);
     const refs = result.unresolvedReferences.filter(r => r.referenceName.startsWith('hdl:signal:')).map(r => r.referenceName);
-    expect(refs).not.toContain('hdl:signal:i');
-    expect(refs).not.toContain('hdl:signal:j');
+    expect(result.nodes.some(n => n.name === 'i' && n.qualifiedName.includes('::for@'))).toBe(true);
+    expect(result.nodes.some(n => n.name === 'j' && n.qualifiedName.includes('::foreach@'))).toBe(true);
+    expect(refs).toContain('hdl:signal:i');
+    expect(refs).toContain('hdl:signal:j');
     expect(refs).toContain('hdl:signal:x');
     expect(refs).toContain('hdl:signal:y');
   });

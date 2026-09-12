@@ -33,22 +33,29 @@ export function matchVerilogMember(ref: UnresolvedRef, context: ResolutionContex
   // Hierarchical instance calls require elaborated receiver identity, which this pass does not infer.
   if (ref.referenceName.includes('.')) return null;
   const caller = context.getNodeById?.(ref.fromNodeId);
-  const scopes = caller?.qualifiedName.split('::') ?? [];
-  for (let i = scopes.length; i > 0; i--) {
-    const matches = exact(`${scopes.slice(0, i).join('::')}::${ref.referenceName}`, ['function', 'method'])
+  const hint = ref.candidates?.find(c => c.startsWith('hdl:scope:'))?.slice('hdl:scope:'.length);
+  const lexical = hint && caller && context.getNodesByQualifiedName(hint).some(n =>
+    n.language === 'verilog' && n.filePath === ref.filePath && n.kind === 'namespace'
+    && n.qualifiedName.startsWith(`${caller.qualifiedName}::`) && n.startLine <= ref.line && n.endLine >= ref.line)
+    ? hint : caller?.qualifiedName;
+  const scopes = lexical?.split('::') ?? [];
+  const imports = context.getNodesInFile(ref.filePath).filter(n => n.kind === 'import' && n.startLine <= ref.line);
+  // Resolve one lexical level at a time: an inner package import can shadow
+  // an outer module function, just like a nearer declaration can.
+  for (let i = scopes.length; i >= 0; i--) {
+    const scope = scopes.slice(0, i).join('::');
+    const matches = exact(scope ? `${scope}::${ref.referenceName}` : ref.referenceName, ['function', 'method'])
       .filter(n => n.filePath === ref.filePath);
     if (matches.length) return result(matches);
-  }
-  const imported: Node[] = [];
-  for (const item of context.getNodesInFile(ref.filePath)) {
-    if (item.kind !== 'import' || item.startLine > ref.line) continue;
-    const prefix = item.qualifiedName.split('::').slice(0, -1).join('::');
-    if (prefix && !caller?.qualifiedName.startsWith(`${prefix}::`)) continue;
-    const match = item.signature?.trim().match(/^([\w$]+)::([\w$]+|\*)$/);
-    if (match && (match[2] === '*' || match[2] === ref.referenceName)) {
-      imported.push(...exact(`${match[1]}::${ref.referenceName}`, ['function', 'method']));
+    const imported: Node[] = [];
+    for (const item of imports) {
+      if (item.qualifiedName.split('::').slice(0, -1).join('::') !== scope) continue;
+      const match = item.signature?.trim().match(/^([\w$]+)::([\w$]+|\*)$/);
+      if (match && (match[2] === '*' || match[2] === ref.referenceName)) {
+        imported.push(...exact(`${match[1]}::${ref.referenceName}`, ['function', 'method']));
+      }
     }
+    if (imported.length) return result(imported);
   }
-  if (imported.length) return result(imported);
-  return result(exact(ref.referenceName, ['function', 'method']).filter(n => n.filePath === ref.filePath));
+  return null;
 }

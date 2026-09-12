@@ -1744,6 +1744,9 @@ function resurrectRefFromDroppedEdge(
     fromNodeId: e.source,
     referenceName: refName,
     referenceKind: refKind,
+    ...(e.sourceLanguage === 'verilog' && Array.isArray(e.metadata?.refCandidates)
+      && e.metadata.refCandidates.every((c: unknown) => typeof c === 'string')
+      ? { candidates: e.metadata.refCandidates as string[] } : {}),
     line: e.line ?? 0,
     column: e.column ?? 0,
     filePath: e.sourceFilePath,
@@ -2939,7 +2942,9 @@ export class ExtractionOrchestrator {
     const resurrected: UnresolvedReference[] = [];
     for (const e of crossFileIncomingEdges) {
       const name = e.metadata?.refName;
-      if (typeof name === 'string' && (name.startsWith('hdl:wildcard:') || name.startsWith('hdl:port-position:'))) {
+      // HDL members and ports often share short names within one file.
+      // Replay their qualified reference instead of reattaching by kind/name.
+      if (e.sourceLanguage === 'verilog' && typeof name === 'string') {
         const ref = resurrectRefFromDroppedEdge(e);
         if (ref) resurrected.push(ref);
         continue;

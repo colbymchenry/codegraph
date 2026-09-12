@@ -1,3 +1,4 @@
+import { initializeVerilogGenerateScope, visitVerilogGenvarDeclaration } from './verilog-generate';
 import { getVerilogPortOrder, visitVerilogSignals, addVerilogSignalReferences, isVerilogGenerateBinding } from './verilog-signals';
 import { handleVerilogPackageNode, getVerilogCallName } from './verilog-packages';
 import type { Node as SyntaxNode } from 'web-tree-sitter';
@@ -140,6 +141,7 @@ function handleSubroutine(node: SyntaxNode, ctx: ExtractorContext): boolean {
 
   const created = ctx.createNode('function', name, node, { signature });
   if (created) ctx.pushScope(created.id);
+  if (created && bodyDecl) addVerilogSignalReferences(bodyDecl, ctx, created.id, true);
   visitNamedChildren(node, ctx);
   if (created) ctx.popScope();
   return true;
@@ -150,8 +152,15 @@ function handleGenerateBlock(node: SyntaxNode, ctx: ExtractorContext): boolean {
   // Anonymous labels identify source scopes, not elaborated genblk numbers.
   const name = nameNode ? getNodeText(nameNode, ctx.source)
     : `generate@${node.startPosition.row + 1}:${node.startPosition.column}`;
-  const created = ctx.createNode('namespace', name, node);
-  if (created) ctx.pushScope(created.id);
+  const loop = node.parent?.type === 'loop_generate_construct' ? node.parent : null;
+  const created = ctx.createNode('namespace', name, node, {
+    decorators: ['hdl:generate-scope'],
+    ...(loop ? { signature: ctx.source.slice(loop.startIndex, node.startIndex).trim() } : {}),
+  });
+  if (created) {
+    ctx.pushScope(created.id);
+    initializeVerilogGenerateScope(node, ctx);
+  }
   visitNamedChildren(node, ctx);
   if (created) ctx.popScope();
   return true;
@@ -331,7 +340,10 @@ function handleTypedef(node: SyntaxNode, ctx: ExtractorContext): boolean {
 
 function handleCall(node: SyntaxNode, ctx: ExtractorContext): boolean {
   if (ctx.nodeStack.length > 0) {
-    const fromId = ctx.nodeStack[ctx.nodeStack.length - 1];
+    const lexical = ctx.nodes.find(n => n.id === ctx.nodeStack[ctx.nodeStack.length - 1]);
+    const callable = [...ctx.nodeStack].reverse().map(id => ctx.nodes.find(n => n.id === id))
+      .find(n => n && (n.kind === 'function' || n.kind === 'method'));
+    const fromId = callable?.id ?? lexical?.id;
     const callee = firstChildOfType(node, ['hierarchical_identifier']) ?? firstSimpleIdentifier(node);
     if (fromId && callee) {
       const name = getVerilogCallName(node, ctx.source);
@@ -340,6 +352,8 @@ function handleCall(node: SyntaxNode, ctx: ExtractorContext): boolean {
           fromNodeId: fromId,
           referenceName: name,
           referenceKind: 'calls',
+          ...(lexical?.kind === 'namespace' && lexical.id !== fromId
+            ? { candidates: [`hdl:scope:${lexical.qualifiedName}`] } : {}),
           line: node.startPosition.row + 1,
           column: node.startPosition.column,
         });
@@ -371,7 +385,7 @@ export const verilogExtractor: LanguageExtractor = {
   paramsField: 'tf_port_list',
 
   visitNode: (node, ctx) => {
-    if (visitVerilogSignals(node, ctx) || handleVerilogPackageNode(node, ctx)) return true;
+    if (visitVerilogGenvarDeclaration(node, ctx) || visitVerilogSignals(node, ctx) || handleVerilogPackageNode(node, ctx)) return true;
     switch (node.type) {
       case 'module_declaration':
       case 'program_declaration':
