@@ -3,6 +3,21 @@ import * as path from 'node:path';
 export interface HdlMacroPoint { file: string; line: number; column: number; byteOffset: number }
 export interface HdlMacroFrame { name: string | null; argument: boolean; spelling?: HdlMacroPoint; invocation?: { start: HdlMacroPoint; end: HdlMacroPoint } }
 
+export type HdlExpressionRole = 'initializer' | 'declared-initializer' | 'type';
+export interface HdlExpressionOrigin {
+  role: HdlExpressionRole;
+  sourceOrigin: 'macro';
+  source?: { file: string; line: number; column: number | null };
+  macroExpansion: HdlMacroFrame[];
+  macroExpansionComplete: boolean;
+}
+export interface HdlExpressionCoverage {
+  initializer: 'checked' | 'not-applicable' | 'unavailable' | 'command-line';
+  declaredInitializer: 'checked' | 'not-applicable' | 'unavailable';
+  type: 'checked' | 'not-applicable' | 'unavailable';
+  truncated: boolean;
+}
+
 export interface HdlSemanticFact {
   kind: 'parameter' | 'port' | 'type';
   name: string;
@@ -15,6 +30,8 @@ export interface HdlSemanticFact {
   sourceOrigin?: 'direct' | 'macro';
   macroExpansion?: HdlMacroFrame[];
   macroExpansionComplete?: boolean;
+  expressionOrigins?: HdlExpressionOrigin[];
+  expressionOriginCoverage?: HdlExpressionCoverage;
 }
 
 type AstObject = Record<string, unknown>;

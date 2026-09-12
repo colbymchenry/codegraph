@@ -25,6 +25,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- HDL: pyslang теперь показывает macro origins в initializer параметров и объявленных типах, различая override и исходный default.
+
 - HDL: `hdl-semantic --python` с pyslang показывает исходное написание и места вызова макросов, явно отмечая неполное сопоставление.
 
 - HDL: `hdl-semantic` с установленным slang показывает вычисленные параметры и ширины портов для выбранного профиля и экземпляра.

@@ -31,9 +31,23 @@ active profile, overrides, separate compilation units, limits и snapshot checks
 
 ## Что возвращается
 
-Объём этой версии — происхождение **имени объявления** parameter/port/typedef. Макрос
-только в initializer или выражении ширины не делает имя macro-origin. Полный
-набор macro uses внутри декларации/выражений ещё не экспортируется.
+Имена объявлений parameter/port/typedef сохраняют прежние sourceOrigin и
+macroExpansion. Макрос в initializer или типе не превращает само имя в
+macro-origin: ссылка на прямое source declaration остаётся допустимой.
+
+Дополнительно возвращаются `expressionOrigins` — уникальные compiler macro-token
+origins с ролями `initializer`, `declared-initializer` и `type`. Для `type`
+проверяется доступный объявленный type syntax, включая поддержанные dimensions.
+Фактический initializer не смешивается с default из объявления после override.
+Это прямые macro tokens соответствующего syntax, не транзитивный анализ всех
+констант, от которых зависит результат.
+
+`expressionOriginCoverage` отдельно описывает initializer, declaredInitializer
+и type: `checked`, `not-applicable` или `unavailable`; initializer также может
+иметь `command-line`. Пустой список при unavailable не доказывает отсутствия
+макросов. `truncated=true` означает достижение лимита выдачи. На факт возвращается
+не больше 32 expression origins; полнота отдельных macro frames остаётся в
+macroExpansionComplete.
 
 - `provenance.frontend = pyslang`, версия протокола/exporter и хеши Python,
   exporter и native pyslang module. Запуск идёт через Python `-I`; путь venv
@@ -70,7 +84,8 @@ Exporter — небольшой поставляемый Python helper; испо
 
 Computed include paths, files вне root и остальные ограничения snapshot runner
 сохраняются. Это не OS sandbox для запуска недоверенного compiler. Нет
-persistent cache, полного source-map для всех constructed tokens или automatic
+persistent cache, транзитивной карты зависимостей всех expressions, полного
+source-map для всех constructed tokens или automatic
 MCP compilation. Windows backend пока отключён; macOS runtime не проверялся.
 
 Поведение SourceManager сверено с [официальным API](https://www.sv-lang.com/classslang_1_1_source_manager.html).

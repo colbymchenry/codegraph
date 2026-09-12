@@ -5,6 +5,9 @@ macroExpansion contains a set of provenance frames reached through BOTH original
 and expansion parent relations. It is not an ordered invocation stack. Points
 are physical UTF-8 byte positions in root-confined source files. A pasted token's
 spelling point can identify its prefix argument; it is never a name range.
+Expression origins describe only macro tokens in the selected direct syntax,
+not transitive value/type dependencies. 'checked' plus truncated=true is a
+bounded partial scan; command-line initializers remain separate from defaults.
 """
 import hashlib
 import json
@@ -16,6 +19,9 @@ MAX_FACTS = 100_000
 MAX_DEPTH = 128
 MAX_BYTES = 64 * 1024 * 1024
 MAX_DIAGNOSTICS = 256 * 1024
+MAX_EXPRESSION_ORIGINS = 32
+MAX_PROVENANCE_FRAMES = 100_000
+MAX_SYNTAX_VISITS = 1_000_000
 
 
 def native_version(pyslang):
@@ -38,6 +44,9 @@ class Exporter:
         self.identities = set()
         self.visits = 0
         self.output_bytes = 0
+        self.syntax_cache = {}
+        self.syntax_visits = 0
+        self.provenance_frames = 0
 
     def point(self, location):
         try:
@@ -112,6 +121,145 @@ class Exporter:
         self.origins[key] = result
         return result
 
+    def bounded_origin(self, origin):
+        result = dict(origin)
+        frames = origin.get('macroExpansion', [])
+        remaining = max(0, MAX_PROVENANCE_FRAMES - self.provenance_frames)
+        truncated = len(frames) > remaining
+        if 'macroExpansion' in origin:
+            result['macroExpansion'] = frames[:remaining]
+            self.provenance_frames += len(result['macroExpansion'])
+            if truncated:
+                result['macroExpansionComplete'] = False
+        return result, truncated
+
+    @staticmethod
+    def syntax_key(syntax):
+        if syntax is None:
+            return None
+        span = syntax.sourceRange
+        return (syntax.kind.name, span.start.buffer.id, span.start.offset,
+                span.end.buffer.id, span.end.offset)
+
+    def command_line_syntax(self, syntax):
+        if syntax is None:
+            return False
+        location = self.manager.getFullyExpandedLoc(syntax.getFirstToken().location)
+        if not location.buffer.id:
+            return False
+        # Driver's override buffer has an explicit command-line line mapping
+        # and an unnamed synthetic path, unlike a physical `line spoof.
+        return (self.manager.getFileName(location) == '<command-line>'
+                and self.manager.getRawFileName(location.buffer).startswith('<unnamed_buffer')
+                and str(self.manager.getFullPath(location.buffer)).startswith('<unnamed_buffer'))
+
+    def scan_macro_tokens(self, syntax, role):
+        from pyslang.ast import VisitAction
+        from pyslang.parsing import Token
+        key = (id(syntax), role)
+        cached = self.syntax_cache.get(key)
+        if cached is not None:
+            return cached[1], cached[2]
+        locations, seen = [], set()
+        visited, truncated = 0, False
+
+        def visit(item):
+            nonlocal visited, truncated
+            visited += 1
+            self.syntax_visits += 1
+            if visited > 20_000 or self.syntax_visits > MAX_SYNTAX_VISITS:
+                truncated = True
+                return VisitAction.Interrupt
+            if isinstance(item, Token) and item.location.buffer.id and self.manager.isMacroLoc(item.location):
+                token_key = (item.location.buffer.id, item.location.offset)
+                if token_key not in seen:
+                    if len(locations) >= MAX_EXPRESSION_ORIGINS:
+                        truncated = True
+                        return VisitAction.Interrupt
+                    seen.add(token_key)
+                    locations.append(item.location)
+            return VisitAction.Advance
+
+        syntax.visit(visit)
+        # Retain the syntax wrapper: a bare Python id could otherwise be reused
+        # after collection, yielding origins for an unrelated syntax node.
+        self.syntax_cache[key] = (syntax, locations, truncated)
+        return locations, truncated
+
+    def expression_origins(self, symbol):
+        coverage = {'initializer': 'not-applicable', 'declaredInitializer': 'not-applicable',
+                    'type': 'unavailable', 'truncated': False}
+        plans = []
+        declared_type = getattr(symbol, 'declaredType', None)
+        declaration = symbol.syntax
+        type_declarations = [declaration] if declaration is not None else []
+        if symbol.kind.name == 'Port':
+            internal = symbol.internalSymbol
+            if declared_type is None:
+                declared_type = getattr(internal, 'declaredType', None) if internal else None
+            # A non-ANSI PortReference is just the header name. The actual
+            # declarator (including unpacked dimensions) belongs to its net/var.
+            internal_syntax = getattr(internal, 'syntax', None) if internal else None
+            if internal_syntax is not None:
+                type_declarations.insert(0, internal_syntax)
+        if symbol.kind.name == 'Parameter':
+            expression = symbol.initializer
+            effective = expression.syntax if expression is not None else None
+            if effective is None and expression is not None and declared_type is not None:
+                effective = declared_type.initializerSyntax
+            clause = getattr(declaration, 'initializer', None) if declaration is not None else None
+            default = getattr(clause, 'expr', None) if clause is not None else None
+            if effective is None:
+                coverage['initializer'] = 'unavailable'
+            else:
+                coverage['initializer'] = 'command-line' if self.command_line_syntax(effective) else 'checked'
+                plans.append(('initializer', effective))
+            # isOverridden alone is insufficient: Driver -G overrides currently
+            # leave it false, but their effective syntax is a distinct buffer.
+            overridden = symbol.isOverridden or (effective is not None and default is not None
+                                                 and self.syntax_key(effective) != self.syntax_key(default))
+            if overridden and default is not None:
+                coverage['declaredInitializer'] = 'checked'
+                plans.append(('declared-initializer', default))
+        type_syntax = declared_type.typeSyntax if declared_type is not None else None
+        dimensions = []
+        dimensions_known = symbol.kind.name != 'Port'
+        for candidate in type_declarations:
+            declared_dimensions = getattr(candidate, 'dimensions', None)
+            if declared_dimensions is not None:
+                dimensions_known = True
+                dimensions.extend(declared_dimensions)
+        type_inputs = ([type_syntax] if type_syntax is not None else []) + dimensions
+        if type_inputs and dimensions_known:
+            coverage['type'] = 'checked'
+            seen_types = set()
+            for node in type_inputs:
+                key = self.syntax_key(node)
+                if key not in seen_types:
+                    seen_types.add(key)
+                    plans.append(('type', node))
+        origins, seen, normalized_seen = [], set(), set()
+        for role, syntax in plans:
+            locations, truncated = self.scan_macro_tokens(syntax, role)
+            coverage['truncated'] |= truncated
+            for location in locations:
+                key = (role, location.buffer.id, location.offset)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if len(origins) >= MAX_EXPRESSION_ORIGINS:
+                    coverage['truncated'] = True
+                    break
+                origin, limited = self.bounded_origin(self.provenance(location))
+                coverage['truncated'] |= limited
+                entry = {'role': role, **origin}
+                normalized = json.dumps(entry, sort_keys=True, ensure_ascii=False, separators=(',', ':'))
+                if normalized in normalized_seen:
+                    continue
+                normalized_seen.add(normalized)
+                origins.append(entry)
+        return {'expressionOrigins': origins, 'expressionOriginCoverage': coverage}
+
     @staticmethod
     def segment(name):
         import re
@@ -122,9 +270,10 @@ class Exporter:
     def append(self, symbol, instance_path):
         kind = symbol.kind.name
         semantic_type = symbol.canonicalType if kind == 'TypeAlias' else symbol.type
+        origin, _ = self.bounded_origin(self.provenance(symbol.location))
         fact = {'kind': {'Parameter': 'parameter', 'Port': 'port', 'TypeAlias': 'type'}[kind],
                 'name': symbol.name, 'instancePath': instance_path,
-                'type': str(semantic_type), **self.provenance(symbol.location)}
+                'type': str(semantic_type), **origin, **self.expression_origins(symbol)}
         if semantic_type.isIntegral:
             width = semantic_type.bitWidth
             if 0 < width <= 2**53 - 1:

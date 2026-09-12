@@ -70,7 +70,7 @@ export async function analyzeHdlSemantics(root: string, options: HdlSemanticOpti
   truncated: matches.length > selected.length, diagnostics: result.diagnostics,
   limitations: ['Computed on demand from a source snapshot; no persistent semantic cache.',
     'Source columns retain frontend coordinates; null means unavailable, including macro-generated declarations.',
-    'Macro provenance covers declaration-name locations, not every macro use in types or initializer expressions.',
+    'Expression origins cover directly visited compiler syntax tokens; coverage/truncation is explicit, not a transitive constant-dependency proof.',
     'Only supported parameter/port facts are returned; absent or unknown widths are not zero.',
     'Compiler semantics are not simulation, synthesis, timing or hardware validation.'] };
 }

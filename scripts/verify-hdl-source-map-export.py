@@ -118,6 +118,112 @@ class SourceMapExportTests(unittest.TestCase):
         self.assertEqual(facts['nibble_t']['sourceOrigin'], 'direct')
         self.assertNotIn('direction', facts['byte_t'])
 
+    @staticmethod
+    def origin_names(fact, role):
+        return {frame['name'] for origin in fact['expressionOrigins'] if origin['role'] == role
+                for frame in origin.get('macroExpansion', [])}
+
+    def test_literal_parameter_tracks_its_macro_initializer_not_declaration_name(self):
+        self.write('defs.svh', '`define VALUE 7\n')
+        self.write('top.sv', '`include "defs.svh"\nmodule top; localparam int P=`VALUE; endmodule\n')
+        fact = next(f for f in self.compile('top.sv') if f['name'] == 'P')
+        self.assertEqual(fact['sourceOrigin'], 'direct')
+        self.assertEqual(self.origin_names(fact, 'initializer'), {'VALUE'})
+        self.assertEqual(fact['expressionOriginCoverage']['initializer'], 'checked')
+        self.assertEqual(fact['expressionOriginCoverage']['declaredInitializer'], 'not-applicable')
+
+    def test_port_and_type_dimensions_have_compiler_macro_origins_with_physical_coordinates(self):
+        self.write('defs.svh', '`define WIDTH 8\n', crlf=True)
+        self.write('top.sv', '`include "defs.svh"\n/* 😀 */ module top(output logic [`WIDTH-1:0] data);\n typedef logic [`WIDTH-1:0] word_t;\nendmodule\n', crlf=True, bom=True)
+        facts = {f['name']: f for f in self.compile('top.sv')}
+        for name in ['data', 'word_t']:
+            fact = facts[name]
+            self.assertEqual(fact['sourceOrigin'], 'direct')
+            self.assertEqual(fact['width'], 8)
+            self.assertEqual(self.origin_names(fact, 'type'), {'WIDTH'})
+            self.assertEqual(fact['expressionOriginCoverage']['type'], 'checked')
+            for origin in fact['expressionOrigins']:
+                for frame in origin.get('macroExpansion', []):
+                    if 'spelling' in frame:
+                        self.assertPoint(frame['spelling'])
+                    if 'invocation' in frame:
+                        self.assertPoint(frame['invocation']['start'])
+                        self.assertPoint(frame['invocation']['end'])
+
+    def test_nonansi_and_ansi_unpacked_port_dimensions_keep_macro_type_origins(self):
+        self.write('defs.svh', '`define W 4\n')
+        for declaration in ['module top(a); input logic a[`W]; endmodule',
+                            'module top(input logic a[`W]); endmodule']:
+            self.write('top.sv', '`include "defs.svh"\n' + declaration + '\n')
+            fact = next(f for f in self.compile('top.sv') if f['kind'] == 'port' and f['name'] == 'a')
+            self.assertEqual(self.origin_names(fact, 'type'), {'W'})
+            self.assertEqual(fact['expressionOriginCoverage']['type'], 'checked')
+            self.assertFalse(fact['expressionOriginCoverage']['truncated'])
+            self.assertEqual(len(fact['expressionOrigins']), 1)
+            for frame in fact['expressionOrigins'][0]['macroExpansion']:
+                if 'spelling' in frame:
+                    self.assertPoint(frame['spelling'])
+                if 'invocation' in frame:
+                    self.assertPoint(frame['invocation']['start'])
+                    self.assertPoint(frame['invocation']['end'])
+
+    def test_instance_override_separates_actual_and_declared_default_macro_origins(self):
+        self.write('defs.svh', '`define DEFAULT 7\n`define ACTUAL 11\n')
+        self.write('top.sv', '`include "defs.svh"\nmodule leaf #(parameter int P=`DEFAULT); endmodule\nmodule top; leaf #(.P(`ACTUAL)) u(); endmodule\n')
+        fact = next(f for f in self.compile('top.sv') if f['instancePath'] == 'top.u' and f['name'] == 'P')
+        self.assertEqual(fact['value'], '11')
+        self.assertEqual(self.origin_names(fact, 'initializer'), {'ACTUAL'})
+        self.assertEqual(self.origin_names(fact, 'declared-initializer'), {'DEFAULT'})
+        self.assertEqual(fact['expressionOriginCoverage']['declaredInitializer'], 'checked')
+
+    def test_command_line_override_never_reports_macro_default_as_effective(self):
+        self.write('top.sv', '`define DEFAULT 7\nmodule top #(parameter int P=`DEFAULT); endmodule\n')
+        fact = next(f for f in self.compile('top.sv', ['-G', 'P=11']) if f['name'] == 'P')
+        self.assertEqual(fact['value'], '11')
+        self.assertEqual(fact['expressionOriginCoverage']['initializer'], 'command-line')
+        self.assertFalse(self.origin_names(fact, 'initializer'))
+        self.assertEqual(self.origin_names(fact, 'declared-initializer'), {'DEFAULT'})
+
+    def test_checked_type_syntax_does_not_claim_transitive_typedef_dependencies(self):
+        self.write('top.sv', '`define WIDTH 8\ntypedef logic [`WIDTH-1:0] word_t;\nmodule top(output word_t data); endmodule\n')
+        fact = next(f for f in self.compile('top.sv') if f['name'] == 'data')
+        self.assertEqual(fact['width'], 8)
+        self.assertEqual(fact['expressionOriginCoverage']['type'], 'checked')
+        self.assertEqual(fact['expressionOrigins'], [])
+
+    def test_expression_origin_budget_is_explicit_and_keeps_compiled_value(self):
+        self.write('top.sv', '`define V 1\nmodule top; localparam int P=' + '+'.join(['`V'] * 40) + '; endmodule\n')
+        fact = next(f for f in self.compile('top.sv') if f['name'] == 'P')
+        self.assertEqual(fact['value'], '40')
+        self.assertEqual(len(fact['expressionOrigins']), 32)
+        self.assertTrue(fact['expressionOriginCoverage']['truncated'])
+
+    def test_normalized_origins_are_deduplicated_when_frame_budget_is_exhausted(self):
+        self.write('top.sv', '`define V 1\nmodule top; localparam int P=`V+`V; endmodule\n')
+        out = self.root / 'facts.json'
+        probe = """import importlib.util,sys
+sys.dont_write_bytecode=True
+spec=importlib.util.spec_from_file_location('test_exporter',sys.argv[1])
+module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+module.MAX_PROVENANCE_FRAMES=0
+raise SystemExit(module.main(['--ast-json',sys.argv[2],'--std=1800-2023','--top','top','--','top.sv']))
+"""
+        result = subprocess.run([sys.executable, '-I', '-c', probe, str(HELPER), str(out)],
+                                cwd=self.root, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        fact = next(f for f in json.loads(out.read_text())['facts'] if f['name'] == 'P')
+        self.assertEqual(fact['value'], '2')
+        self.assertEqual(len(fact['expressionOrigins']), 1)
+        self.assertTrue(fact['expressionOriginCoverage']['truncated'])
+        self.assertEqual(fact['expressionOrigins'][0]['macroExpansion'], [])
+        self.assertFalse(fact['expressionOrigins'][0]['macroExpansionComplete'])
+
+    def test_line_directive_cannot_spoof_command_line_origin(self):
+        self.write('top.sv', '`define VALUE 7\n`line 700 "<command-line>" 0\nmodule top; parameter int P=`VALUE; endmodule\n')
+        fact = next(f for f in self.compile('top.sv') if f['name'] == 'P')
+        self.assertEqual(fact['expressionOriginCoverage']['initializer'], 'checked')
+        self.assertEqual(self.origin_names(fact, 'initializer'), {'VALUE'})
+
     def test_rejects_semantic_errors_instead_of_exporting_partial_ast(self):
         self.write('top.sv', 'module top; missing_dependency u(); endmodule\n')
         result = self.compile('top.sv', success=False)
