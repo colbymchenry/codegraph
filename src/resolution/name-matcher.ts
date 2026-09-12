@@ -11,6 +11,7 @@ import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_BUILT_INS, isTsJsNestedCall } from './js-builtins';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
+import { isVerilogMemberRef, matchVerilogMember } from './verilog-members';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -3100,6 +3101,7 @@ export function matchReference(
 ): ResolvedRef | null {
   if (isVisibleCppMacro(ref, context)) return null;
   if (isCppConstructorRef(ref)) return matchCppConstructor(ref, context);
+  if (isVerilogMemberRef(ref)) return matchVerilogMember(ref, context);
   if (ref.language === 'verilog' && ref.referenceKind === 'instantiates' && !isVerilogSimPath(ref.filePath)) {
     const modules = context
       .getNodesByName(ref.referenceName)

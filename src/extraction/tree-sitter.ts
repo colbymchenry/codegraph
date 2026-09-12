@@ -1399,9 +1399,9 @@ export class TreeSitterExtractor {
       return null;
     }
 
-    // TS/JS accessors and C++ overloads can share a name and source line.
+    // TS/JS accessors, C++ overloads and HDL declarations can share a name and source line.
     // Include the UTF-16 column for these languages so their edges cannot alias.
-    const column = ['typescript', 'tsx', 'javascript', 'jsx', 'cpp'].includes(this.language)
+    const column = ['typescript', 'tsx', 'javascript', 'jsx', 'cpp', 'verilog'].includes(this.language)
       ? node.startPosition.column : undefined;
     const id = generateNodeId(this.filePath, kind, name, node.startPosition.row + 1, column);
 

@@ -145,6 +145,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Verilog/SystemVerilog: именованные экземпляры и generate scopes, порты/сигналы и always/assign доступны для навигации; связи локальных сигналов и package calls сохраняют scope, interfaces показывают modports. Полные elaboration и timing не моделируются.
+
 - Вызовы действий store больше не теряются из-за одноимённой сигнатуры в TypeScript-интерфейсе.
 
 - Вложенные вызовы JavaScript и TypeScript снова доступны Steps и распознаванию фреймворков без привязки встроенных коллекций к посторонним методам; существующие индексы нужно пересобрать. (#1794, #1566)

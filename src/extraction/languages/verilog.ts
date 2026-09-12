@@ -1,3 +1,5 @@
+import { visitVerilogSignals, addVerilogSignalReferences, isVerilogGenerateBinding } from './verilog-signals';
+import { handleVerilogPackageNode, getVerilogCallName } from './verilog-packages';
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
 import type { LanguageExtractor, ExtractorContext } from '../tree-sitter-types';
@@ -16,9 +18,9 @@ import type { LanguageExtractor, ExtractorContext } from '../tree-sitter-types';
  *  - module / interface / program / package / class → container nodes (kind
  *    `class`/`interface`) that scope their members.
  *  - function / task → `function` nodes (their bodies are walked for calls).
- *  - module instantiation → an `instantiates` reference (parent module → child
- *    module type). This is the highest-value HDL edge: it powers cross-module
- *    `trace`/`impact` ("what instantiates this module", "what does top use").
+ *  - module instances → named `variable` nodes with original connections and
+ *    `instantiates` edges (parent module and instance → module type).
+ *  - generate blocks → source scopes; arrays and loops are not elaborated.
  *  - parameter / localparam → `constant` nodes.
  *  - `define macro → `constant` node (a `.vh` header is mostly macros, and a
  *    `WIDTH` written as `` `DATA_W `` has to land somewhere).
@@ -31,8 +33,8 @@ import type { LanguageExtractor, ExtractorContext } from '../tree-sitter-types';
  * `include_compiler_directive` with the quoted path as its module name — the
  * file-path matcher resolves `"defs.vh"` / `"axi/typedef.svh"` to the indexed
  * header closest to the including file, the same way a C `#include` lands.
- * Ports and internal signals are intentionally NOT extracted — they would
- * explode the node count without aiding structural queries.
+ * Ports, signals and executable blocks are handled by verilog-signals; source
+ * occurrences are distinct from elaborated connectivity or drive direction.
  */
 
 // Header wrappers that carry a module/interface/program name.
@@ -63,9 +65,8 @@ function firstSimpleIdentifier(node: SyntaxNode): SyntaxNode | null {
 }
 
 /**
- * Keep the trailing segment of a qualified name (`pkg::mod` → `mod`,
- * `obj.method` → `method`) so cross-file name matching behaves the same for
- * calls and instantiations (declarations are stored unqualified).
+ * Module type names are resolved against module declarations. Function calls
+ * retain their package or hierarchy qualification in verilog-packages.
  */
 function trailingSegment(name: string): string {
   const sep = Math.max(name.lastIndexOf('::'), name.lastIndexOf('.'));
@@ -142,28 +143,84 @@ function handleSubroutine(node: SyntaxNode, ctx: ExtractorContext): boolean {
   return true;
 }
 
+function handleGenerateBlock(node: SyntaxNode, ctx: ExtractorContext): boolean {
+  const nameNode = getChildByField(node, 'name');
+  // Anonymous labels identify source scopes, not elaborated genblk numbers.
+  const name = nameNode ? getNodeText(nameNode, ctx.source)
+    : `generate@${node.startPosition.row + 1}:${node.startPosition.column}`;
+  const created = ctx.createNode('namespace', name, node);
+  if (created) ctx.pushScope(created.id);
+  visitNamedChildren(node, ctx);
+  if (created) ctx.popScope();
+  return true;
+}
+
 function handleInstantiation(node: SyntaxNode, ctx: ExtractorContext): boolean {
   const typeNode = getChildByField(node, 'instance_type') ?? firstSimpleIdentifier(node);
-  if (typeNode && ctx.nodeStack.length > 0) {
-    const fromId = ctx.nodeStack[ctx.nodeStack.length - 1];
-    // Normalize qualified types (`pkg::mod`) to the trailing segment, matching
-    // handleCall, so a `pkg::mod` instance still resolves to a `mod` declaration.
-    const moduleName = trailingSegment(getNodeText(typeNode, ctx.source).trim());
-    if (fromId && moduleName) {
-      ctx.addUnresolvedReference({
-        fromNodeId: fromId,
-        referenceName: moduleName,
-        referenceKind: 'instantiates',
-        line: node.startPosition.row + 1,
-        column: node.startPosition.column,
-      });
+  if (!typeNode) {
+    visitNamedChildren(node, ctx);
+    return true;
+  }
+  const typeName = getNodeText(typeNode, ctx.source).trim();
+  const moduleName = trailingSegment(typeName);
+  const addReference = (fromId: string, position: SyntaxNode): void => {
+    ctx.addUnresolvedReference({
+      fromNodeId: fromId,
+      referenceName: moduleName,
+      referenceKind: 'instantiates',
+      line: position.startPosition.row + 1,
+      column: position.startPosition.column,
+    });
+  };
+  // Keep the module-to-module flow even when a generate scope contains this
+  // declaration. Individual instances additionally provide navigable evidence.
+  for (let i = ctx.nodeStack.length - 1; i >= 0; i--) {
+    const parent = ctx.nodes.find(n => n.id === ctx.nodeStack[i]);
+    if (parent && (parent.kind === 'class' || parent.kind === 'interface')) {
+      addReference(parent.id, node);
+      break;
     }
   }
-  // Walk children so function calls inside parameter overrides (`.WIDTH(f(x))`)
-  // and port connections (`.a(helper(sig))`) still emit `calls` references. An
-  // instantiation's subtree is bounded (just its own connections), so this can't
-  // explode the walk the way a god-function fan-out would.
-  visitNamedChildren(node, ctx);
+  const parameters = firstChildOfType(node, ['parameter_value_assignment']);
+  const prefix = `${typeName}${parameters ? ' ' + getNodeText(parameters, ctx.source) : ''}`;
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (!child) continue;
+    if (child.type !== 'hierarchical_instance') {
+      ctx.visitNode(child);
+      continue;
+    }
+    const nameOfInstance = firstChildOfType(child, ['name_of_instance']);
+    const nameNode = nameOfInstance && (getChildByField(nameOfInstance, 'instance_name')
+      ?? firstSimpleIdentifier(nameOfInstance));
+    const name = nameNode ? getNodeText(nameNode, ctx.source) : undefined;
+    const created = name ? ctx.createNode('variable', name, child, {
+      // Preserve arrays, named/ordered/shorthand connections and parameter
+      // overrides as source evidence; do not infer elaborated wire endpoints.
+      signature: `${prefix} ${getNodeText(child, ctx.source)}`,
+    }) : null;
+    if (created) {
+      addReference(created.id, child);
+      addVerilogSignalReferences(child, ctx, created.id);
+      const connections = firstChildOfType(child, ['list_of_port_connections']);
+      for (const connection of connections?.namedChildren ?? []) {
+        // Shorthand .port connects the same local name. Empty .port() and .*
+        // provide no explicit local expression and are kept only in signature.
+        if (connection.type !== 'named_port_connection') continue;
+        const port = getChildByField(connection, 'port_name');
+        if (port && !isVerilogGenerateBinding(connection, ctx, getNodeText(port, ctx.source))
+          && /^\s*\.\s*[^()\s]+\s*$/.test(getNodeText(connection, ctx.source))) {
+          ctx.addUnresolvedReference({ fromNodeId: created.id,
+            referenceName: `hdl:signal:${getNodeText(port, ctx.source)}`,
+            referenceKind: 'references', line: port.startPosition.row + 1,
+            column: port.startPosition.column });
+        }
+      }
+      ctx.pushScope(created.id);
+    }
+    visitNamedChildren(child, ctx);
+    if (created) ctx.popScope();
+  }
   return true;
 }
 
@@ -202,7 +259,7 @@ function handleCall(node: SyntaxNode, ctx: ExtractorContext): boolean {
     const fromId = ctx.nodeStack[ctx.nodeStack.length - 1];
     const callee = firstChildOfType(node, ['hierarchical_identifier']) ?? firstSimpleIdentifier(node);
     if (fromId && callee) {
-      const name = trailingSegment(getNodeText(callee, ctx.source).trim());
+      const name = getVerilogCallName(node, ctx.source);
       if (name) {
         ctx.addUnresolvedReference({
           fromNodeId: fromId,
@@ -239,6 +296,7 @@ export const verilogExtractor: LanguageExtractor = {
   paramsField: 'tf_port_list',
 
   visitNode: (node, ctx) => {
+    if (visitVerilogSignals(node, ctx) || handleVerilogPackageNode(node, ctx)) return true;
     switch (node.type) {
       case 'module_declaration':
       case 'program_declaration':
@@ -250,6 +308,8 @@ export const verilogExtractor: LanguageExtractor = {
       case 'function_declaration':
       case 'task_declaration':
         return handleSubroutine(node, ctx);
+      case 'generate_block':
+        return handleGenerateBlock(node, ctx);
       case 'module_instantiation':
         return handleInstantiation(node, ctx);
       case 'parameter_declaration':

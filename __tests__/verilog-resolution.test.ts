@@ -51,7 +51,7 @@ describe('verilog module resolution', () => {
     write(dir, 'rtl/pll.v', PLL);
     write(dir, 'sim/pll_stub.v', PLL);
     const inst = (await edges(dir)).filter((e) => e.kind === 'instantiates');
-    expect(inst).toEqual([{ kind: 'instantiates', sn: 'top', sf: 'top.v', tn: 'pll', tf: 'rtl/pll.v' }]);
+    expect(inst.map(e => [e.sn, e.tn, e.tf]).sort()).toEqual([['top', 'pll', 'rtl/pll.v'], ['u_pll', 'pll', 'rtl/pll.v']]);
   });
 
   it('a stub named by file suffix is skipped too', async () => {
@@ -59,7 +59,7 @@ describe('verilog module resolution', () => {
     write(dir, 'rtl/pll.v', PLL);
     write(dir, 'models/pll_stub.v', PLL);
     const inst = (await edges(dir)).filter((e) => e.kind === 'instantiates');
-    expect(inst.map((e) => e.tf)).toEqual(['rtl/pll.v']);
+    expect(inst.map((e) => e.tf)).toEqual(['rtl/pll.v', 'rtl/pll.v']);
   });
 
   it('a testbench keeps every candidate and lands on the stub beside it', async () => {
@@ -67,7 +67,7 @@ describe('verilog module resolution', () => {
     write(dir, 'sim/pll_stub.v', PLL);
     write(dir, 'sim/tb_top.v', 'module tb_top;\n  reg clk; wire lock;\n  pll dut (.clk(clk), .lock(lock));\nendmodule\n');
     const inst = (await edges(dir)).filter((e) => e.kind === 'instantiates');
-    expect(inst.map((e) => e.tf)).toEqual(['sim/pll_stub.v']);
+    expect(inst.map((e) => e.tf)).toEqual(['sim/pll_stub.v', 'sim/pll_stub.v']);
   });
 
   it('`include resolves to the header file, by suffix and closest to the includer', async () => {

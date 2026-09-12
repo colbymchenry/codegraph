@@ -58,6 +58,10 @@ calls; a grep/read exploration is dozens.
 - Qualified symbol names accept dots, \`::\`, or slashes, including containers whose names contain dots (for example, \`AppWeb.Format.group\`).
 - Named-symbol call paths require exact matches; partial or mistyped names are never silently substituted as flow endpoints. If a graph query reports a missing symbol with did-you-mean suggestions, query the suggested name explicitly.
 
+## Verilog / SystemVerilog
+
+Query module and instance names to inspect hierarchy and the exact port-connection source. Ports/signals, generate scopes, modports and always/assign blocks are searchable. HDL references record syntactic signal use, not drive direction, timing or elaborated connectivity; wildcard connections and generate iterations are not expanded. Qualified package calls retain package identity.
+
 ## Anti-patterns
 
 - **Trust codegraph's results — don't re-verify them with grep.** They come from a full AST parse; re-checking with grep is slower, less accurate, and wastes context.

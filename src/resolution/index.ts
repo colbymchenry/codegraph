@@ -22,6 +22,7 @@ import {
 import { isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
 import { isVisibleCppMacro } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
+import { isVerilogMemberRef, matchVerilogMember } from './verilog-members';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
@@ -899,6 +900,7 @@ export class ReferenceResolver {
 
   private resolveOneInner(ref: UnresolvedRef): ResolvedRef | null {
     if (isCppConstructorRef(ref)) return matchCppConstructor(ref, this.context);
+    if (isVerilogMemberRef(ref)) return matchVerilogMember(ref, this.context);
     // Skip built-in/external references
     if (this.isBuiltInOrExternal(ref)) {
       return null;
