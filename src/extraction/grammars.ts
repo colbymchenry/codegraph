@@ -469,6 +469,12 @@ function expandGrammarLanguages(languages: Language[]): Language[] {
   if (languages.some((l) => l === 'svelte' || l === 'vue' || l === 'astro')) {
     languages = [...languages, 'typescript', 'javascript'];
   }
+  // A Vue script block may declare lang="tsx"/lang="jsx" — its extractor
+  // delegates to those grammars, so a pure-.vue project needs them loaded
+  // too (#2570), exactly as it needs typescript/javascript above.
+  if (languages.some((l) => l === 'vue')) {
+    languages = [...languages, 'tsx', 'jsx'];
+  }
   if (languages.some((l) => l === 'cfml')) {
     languages = [...languages, 'cfscript', 'cfquery'];
   }

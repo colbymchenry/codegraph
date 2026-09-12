@@ -12,8 +12,17 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- **`codegraph_component` — a Vue component's contract in one call.** Ask for a component by name and get its props (with their types, defaults and the comments above them), emits, slots and exposed members, the child components it renders, and every parent `@event="handler"` binding attached to it — so changing an emit shows exactly which parent handlers break, without reading the SFC. Available by default alongside `codegraph_explore`. Projects indexed before this change pick the data up as their files re-index; run `codegraph init` to have everything at once.
+
+- **Vue props and emits are read across files.** When a component's `defineProps` / `defineEmits` types live in a shared types file — imported directly, reached through `extends` chains, or renamed on import — their members are pulled in and shown with the types and docs as written. A base reached through two branches of an inheritance diamond shows up once, tsconfig `paths` aliases (`@/types/props`) resolve exactly like relative imports, and an import this extractor cannot follow (a bare package) is skipped rather than guessed.
+
+- **Vue templates are indexed as wiring, not just text.** Every `@event="handler"` on a component tag becomes a real edge from the component to the function that handles it, so callers, impact and the new component view see which functions a template drives — including through kebab-case tags.
+
 ### Fixes
 
+- A Vue component's `<script setup lang="tsx">` block is now parsed with the TSX grammar instead of the JavaScript one, so its TypeScript types and JSX markup are read correctly (the `lang` attribute is matched case-insensitively, so `lang="TSX"` works too). Before, a script holding only macros like `defineProps<{...}>()` produced a "parse produced no symbols" warning and contributed nothing to the graph, while one that happened to keep another declaration was still parsed wrong, silently. Re-index projects containing TSX script blocks after upgrading. Thanks @leadingGo for the report. (#2570)
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.
 - In VB.NET and C#, what a property's `Get` and `Set` code calls, creates and reads now belongs to that property, as do C#'s `get => …` accessors and `=> …` property bodies. Before, it was dropped, so a method used only from a property looked unused.
 - In VB.NET, a field or property initializer like `= Compute()` or `As New List(Of Order)` now links what it calls and creates, and so do a `Custom Event`'s `AddHandler`, `RemoveHandler` and `RaiseEvent` blocks. Re-index VB.NET and C# projects after upgrading.
