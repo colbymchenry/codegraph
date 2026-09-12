@@ -22,6 +22,7 @@ import {
 } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
+import { setExtractionRootHint } from './vue-extractor';
 import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs } from './parse-pool';
 import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
@@ -1906,6 +1907,9 @@ export class ExtractionOrchestrator {
     // worker is unavailable (e.g. running from source in tests).
     const parseWorkerPath = path.join(__dirname, 'parse-worker.js');
     const useWorker = fs.existsSync(parseWorkerPath);
+    // In-process extraction (no-pool fallback, single-file syncs) reads this
+    // hint directly; pool workers get it per-message instead.
+    setExtractionRootHint(this.rootDir);
 
     let pool: ParseWorkerPool | null = null;
     if (useWorker) {
@@ -1932,6 +1936,9 @@ export class ExtractionOrchestrator {
         parseTimeoutMs: PARSE_TIMEOUT_MS,
         log,
         grammarBuffers,
+        // Sibling-file context for extractors (Vue cross-file props/emits
+        // types). Also set in-process for the no-pool fallback below.
+        rootHint: this.rootDir,
       });
       log(`Parse worker pool: ${poolSize} worker(s)`);
       // Bulk index: every core will be needed — spawn the whole pool now so

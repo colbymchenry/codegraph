@@ -197,6 +197,15 @@ export interface Node {
    */
   returnType?: string;
 
+  /**
+   * Kind-specific structured payload, persisted as the nodes.metadata JSON
+   * column. Only kinds that need more than the fixed columns carry one today:
+   * `component` nodes store a `componentApi` record (props/emits/slots/exposed)
+   * extracted from the SFC by VueExtractor. Kept out of the fixed columns so
+   * future per-kind payloads don't require another migration each.
+   */
+  metadata?: Record<string, unknown>;
+
   /** When the node was last updated */
   updatedAt: number;
 }

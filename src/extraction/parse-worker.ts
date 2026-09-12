@@ -15,6 +15,7 @@ try {
 
 import { parentPort } from 'worker_threads';
 import { extractFromSource } from './tree-sitter';
+import { setExtractionRootHint } from './vue-extractor';
 import { detectLanguage, loadGrammarsForLanguages, resetParser } from './grammars';
 import { tryKernelExtractRaw } from './kernel';
 import { getAllFrameworkResolvers, getApplicableFrameworks } from '../resolution/frameworks';
@@ -65,8 +66,13 @@ import type { Language, ExtractionResult } from '../types';
 const PARSER_RESET_INTERVAL = 5000;
 const parseCounts = new Map<Language, number>();
 
-parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; languages?: Language[]; frameworkNames?: string[]; language?: Language; grammarBuffers?: Record<string, Uint8Array> }) => {
+parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; languages?: Language[]; frameworkNames?: string[]; language?: Language; grammarBuffers?: Record<string, Uint8Array>; rootHint?: string }) => {
   if (msg.type === 'load-grammars') {
+    // Project-root hint for extractors that read sibling files (Vue SFC
+    // cross-file props/emits types). It rides the load-grammars message, which
+    // every worker receives once per spawn — including after a recycle, so a
+    // fresh worker is never left without it. Per-task messages don't repeat it.
+    if (msg.rootHint) setExtractionRootHint(msg.rootHint);
     // Grammar WASM bytes pre-read by the main thread (when provided) make this
     // a memory load instead of a per-spawn disk read — see issue #1231.
     await loadGrammarsForLanguages(msg.languages!, msg.grammarBuffers);
