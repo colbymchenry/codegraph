@@ -40,6 +40,7 @@ import { logDebug, logWarn } from '../errors';
 import { normalizePath } from '../utils';
 import { isCodeGraphDataDir } from '../directory';
 import { watchDisabledReason } from './watch-policy';
+import { HdlWatchScope } from './hdl-watch-scope';
 
 /**
  * Number of consecutive lock-contention retries the watcher tolerates before
@@ -339,6 +340,7 @@ export class FileWatcher {
   // scope (#1728). An embedded repo created after start() joins the scope on
   // the next scope refresh / watcher restart / re-index.
   private ignoreMatcher: ScopeIgnore | null = null;
+  private readonly hdlScope: HdlWatchScope;
 
   private readonly projectRoot: string;
   private readonly debounceMs: number;
@@ -351,9 +353,11 @@ export class FileWatcher {
   constructor(
     projectRoot: string,
     syncFn: (paths?: string[]) => Promise<{ filesChanged: number; durationMs: number }>,
-    options: WatchOptions = {}
+    options: WatchOptions = {},
+    getHdlDependencyPaths?: () => string[]
   ) {
     this.projectRoot = projectRoot;
+    this.hdlScope = new HdlWatchScope(projectRoot, getHdlDependencyPaths);
     this.syncFn = syncFn;
     this.debounceMs = options.debounceMs ?? 2000;
     this.onSyncComplete = options.onSyncComplete;
@@ -385,6 +389,7 @@ export class FileWatcher {
 
     // Reuse the indexer's ignore set so the watcher and indexer agree on scope.
     this.ignoreMatcher = buildScopeIgnore(this.projectRoot);
+    this.hdlScope.refresh();
 
     try {
       if (this.inertForTests) {
@@ -474,14 +479,25 @@ export class FileWatcher {
    * full sync. The initial startup walk passes false (the engine's catch-up
    * sync owns the baseline).
    */
-  private watchTree(dir: string, markExisting: boolean): void {
+  private watchTree(dir: string, markExisting: boolean, rescan = false): void {
     // A degrade() mid-walk (exhaustion on an earlier directory) calls stop(),
     // which sets `stopped`; bail so the recursion unwinds without adding more
     // watches to a watcher that is shutting down. `inotifyLimitWarned` does the
     // same after ENOSPC — the kernel budget is gone, so stop trying the rest of
     // the tree (every add would fail) while keeping the watches already set.
     if (this.stopped || this.degradedReason || this.inotifyLimitWarned) return;
-    if (this.dirWatchers.has(dir)) return;
+    if (this.dirWatchers.has(dir)) {
+      // A profile switch can admit a formerly ignored child of an already watched directory.
+      if (rescan) {
+        let entries: fs.Dirent[];
+        try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+        for (const entry of entries) if (entry.isDirectory()) {
+          const child = path.join(dir, entry.name);
+          if (!this.shouldIgnoreDir(child)) this.watchTree(child, markExisting, true);
+        }
+      }
+      return;
+    }
     if (this.dirWatchers.size >= maxDirWatches()) {
       if (!this.dirCapWarned) {
         this.dirCapWarned = true;
@@ -593,7 +609,12 @@ export class FileWatcher {
       this.refreshScope(rel);
       return;
     }
-    if (this.ignoreMatcher && this.ignoreMatcher.ignores(rel)) return;
+    const hdlChange = this.hdlScope.matchesFile(rel) || this.hdlScope.matchesDirectory(rel);
+    if (this.hdlScope.isFilelist(rel)) {
+      this.refreshHdlScope();
+      this.needsFullScan = true;
+    }
+    if (!hdlChange && this.ignoreMatcher && this.ignoreMatcher.ignores(rel)) return;
     // A nested `.gitignore` (an embedded child repo's own rules, #514, or a
     // subdirectory rule the git-backed full scan honors) is only a scope
     // change when it sits INSIDE the current scope — checked after the matcher
@@ -604,7 +625,7 @@ export class FileWatcher {
       this.refreshScope(rel);
       return;
     }
-    if (!isSourceFile(rel, loadExtensionOverrides(this.projectRoot))) {
+    if (!hdlChange && !isSourceFile(rel, loadExtensionOverrides(this.projectRoot))) {
       this.maybeScheduleForRemovedDir(rel);
       return;
     }
@@ -645,8 +666,15 @@ export class FileWatcher {
   private refreshScope(rel: string): void {
     logDebug('Scope config changed; rebuilding watcher scope', { file: rel });
     this.ignoreMatcher = buildScopeIgnore(this.projectRoot);
+    this.refreshHdlScope();
     this.needsFullScan = true;
     this.scheduleSync();
+  }
+
+  private refreshHdlScope(): void {
+    if (this.hdlScope.refresh() && !this.inert && !this.recursiveWatcher && this.dirWatchers.size > 0) {
+      this.watchTree(this.projectRoot, false, true);
+    }
   }
 
   /**
@@ -713,6 +741,7 @@ export class FileWatcher {
     const rel = normalizePath(path.relative(this.projectRoot, dirPath));
     if (!rel || rel === '.' || rel.startsWith('..')) return false; // root / outside
     if (this.isAlwaysIgnored(rel)) return true;
+    if (this.hdlScope.matchesDirectory(rel)) return false;
     if (!this.ignoreMatcher) return false;
     return this.ignoreMatcher.ignores(rel + '/');
   }
@@ -912,6 +941,7 @@ export class FileWatcher {
 
     try {
       const result = await this.syncFn(scoped);
+      this.refreshHdlScope();
       if (!scoped) this.needsFullScan = false;
       this.lockRetryCount = 0; // a clean sync clears any contention backoff
       this.syncFailureRetryCount = 0; // ...and any generic-failure backoff

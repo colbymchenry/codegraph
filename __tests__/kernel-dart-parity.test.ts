@@ -125,6 +125,28 @@ describe.skipIf(!kernelBuilt)('kernel Dart extraction parity', () => {
     });
   }
 
+  it('extension types contain their getter and method with complete bodies', () => {
+    const result = assertParity('extension.dart', `extension type Meters(double value) {
+  double get km => value / 1000;
+  void report() {
+    print(km);
+  }
+}
+`, 4);
+    const owner = result.nodes.find(n => n.name === 'Meters')!;
+    expect(owner.kind).toBe('class');
+    const getter = result.nodes.find(n => n.name === 'km')!;
+    const method = result.nodes.find(n => n.name === 'report')!;
+    expect(getter.qualifiedName).toBe('Meters::km');
+    expect(method.qualifiedName).toBe('Meters::report');
+    expect(method.endLine).toBe(5);
+    for (const member of [getter, method]) {
+      expect(member.kind).toBe('method');
+      expect(result.edges.some(e => e.kind === 'contains' && e.source === owner.id && e.target === member.id)).toBe(true);
+    }
+    expect(result.unresolvedReferences.some(r => r.referenceName === 'print' && r.fromNodeId === method.id)).toBe(true);
+  });
+
   it('double-walk pins: duplicate local-fn nodes share an id; refs interleave', () => {
     const src = fs.readFileSync(path.join(FIXTURE_DIR, 'TortureDoubleWalk.dart'), 'utf8');
     const result = assertParity('fixtures/TortureDoubleWalk.dart', src, 5);

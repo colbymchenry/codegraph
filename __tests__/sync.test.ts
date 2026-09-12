@@ -219,6 +219,51 @@ describe('Sync Module', () => {
       }
     });
 
+    it.each(['added', 'modified', 'removed'] as const)(
+      'reports %s files after committing without indexing (#1829)',
+      async (kind) => {
+        const relativePath = kind === 'added' ? 'src/new.ts' : 'src/index.ts';
+        const filePath = path.join(testDir, relativePath);
+        if (kind === 'removed') fs.unlinkSync(filePath);
+        else fs.writeFileSync(filePath, 'export function changed() { return 99; }');
+
+        const expected = { added: [], modified: [], removed: [], [kind]: [relativePath] };
+        // In particular, unstaged deletions remain in git ls-files.
+        expect(cg.getChangedFiles()).toEqual(expected);
+        git('add', '--', 'src');
+        git('commit', '-m', 'changed without indexing');
+        expect(cg.getChangedFiles()).toEqual(expected);
+
+        await cg.sync();
+        expect(cg.getChangedFiles()).toEqual({ added: [], modified: [], removed: [] });
+      }
+    );
+
+    it('detects a committed rename and preserves the graph across repeated no-op syncs', async () => {
+      git('mv', 'src/index.ts', 'src/renamed.ts');
+      git('commit', '-m', 'rename without indexing');
+
+      expect(cg.getChangedFiles()).toEqual({
+        added: ['src/renamed.ts'], modified: [], removed: ['src/index.ts'],
+      });
+      // Status must not discard the last usable graph before sync succeeds.
+      expect(cg.searchNodes('hello').some(r => r.node.filePath === 'src/index.ts')).toBe(true);
+
+      const renamed = await cg.sync();
+      expect(renamed.filesAdded).toBe(1);
+      expect(renamed.filesRemoved).toBe(1);
+      const nodes = cg.searchNodes('hello').map(r => r.node);
+      expect(nodes).toHaveLength(1);
+      expect(nodes[0].filePath).toBe('src/renamed.ts');
+
+      for (let i = 0; i < 2; i++) {
+        expect(cg.getChangedFiles()).toEqual({ added: [], modified: [], removed: [] });
+        const unchanged = await cg.sync();
+        expect([unchanged.filesAdded, unchanged.filesModified, unchanged.filesRemoved]).toEqual([0, 0, 0]);
+        expect(cg.searchNodes('hello').map(r => r.node.id)).toEqual(nodes.map(node => node.id));
+      }
+    });
+
     it('should detect modified files via git', async () => {
       fs.writeFileSync(
         path.join(testDir, 'src', 'index.ts'),
@@ -880,4 +925,213 @@ describe('Scoped sync parity (#watcher-scoped)', () => {
     expect(readmitted.filesAdded).toBe(1);
     expect(cg.searchNodes('gamma').length).toBe(1);
   });
+});
+
+// A change that is COMMITTED but not yet indexed used to read as zero pending
+// changes: getChangedFiles' git fast path built its candidate list from
+// `git status --porcelain`, and committing is exactly what removes a file from
+// that output. The hash comparison below it was correct and simply never
+// reached. Committed work is now sourced from `git diff <indexed commit> HEAD`.
+// (#1829)
+describe('committed-but-unindexed changes (#1829)', () => {
+  let testDir: string;
+  let cg: CodeGraph;
+
+  const git = (...args: string[]) =>
+    execFileSync('git', args, { cwd: testDir, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+
+  beforeEach(async () => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1829-'));
+    git('init');
+    git('config', 'user.email', 'test@test.com');
+    git('config', 'user.name', 'Test');
+
+    fs.mkdirSync(path.join(testDir, 'src'));
+    fs.writeFileSync(path.join(testDir, 'src', 'one.ts'), `export function alpha() { return 1; }`);
+    git('add', '-A');
+    git('commit', '-m', 'initial');
+
+    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    await cg.indexAll();
+  });
+
+  afterEach(() => {
+    if (cg) cg.destroy();
+    if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('sees a committed NEW file (git status shows nothing; the DB has no row)', async () => {
+    fs.writeFileSync(path.join(testDir, 'src', 'two.ts'), `export function beta() { return 2; }`);
+    git('add', '-A');
+    git('commit', '-m', 'add two');
+
+    const changes = cg.getChangedFiles();
+    expect(changes.added).toContain('src/two.ts');
+
+    // status and sync must agree — the whole point is that the number a user
+    // reads matches the work that is actually outstanding.
+    const result = await cg.sync();
+    expect(result.filesAdded).toBe(1);
+    expect(cg.searchNodes('beta').length).toBeGreaterThan(0);
+  });
+
+  it('sees a committed MODIFICATION to an already-tracked file', async () => {
+    fs.writeFileSync(path.join(testDir, 'src', 'one.ts'), `export function alphaRenamed() { return 99; }`);
+    git('add', '-A');
+    git('commit', '-m', 'edit one');
+
+    expect(cg.getChangedFiles().modified).toContain('src/one.ts');
+    const result = await cg.sync();
+    expect(result.filesModified).toBe(1);
+    expect(cg.searchNodes('alphaRenamed').length).toBeGreaterThan(0);
+  });
+
+  it('sees a committed DELETE', async () => {
+    fs.writeFileSync(path.join(testDir, 'src', 'two.ts'), `export function beta() { return 2; }`);
+    git('add', '-A');
+    git('commit', '-m', 'add two');
+    await cg.sync();
+
+    fs.rmSync(path.join(testDir, 'src', 'two.ts'));
+    git('add', '-A');
+    git('commit', '-m', 'remove two');
+
+    expect(cg.getChangedFiles().removed).toContain('src/two.ts');
+    const result = await cg.sync();
+    expect(result.filesRemoved).toBe(1);
+  });
+
+  it('reports zero once the sync has absorbed the commit (the stamp advances)', async () => {
+    fs.writeFileSync(path.join(testDir, 'src', 'two.ts'), `export function beta() { return 2; }`);
+    git('add', '-A');
+    git('commit', '-m', 'add two');
+    await cg.sync();
+
+    const after = cg.getChangedFiles();
+    expect(after.added).toHaveLength(0);
+    expect(after.modified).toHaveLength(0);
+    expect(after.removed).toHaveLength(0);
+  });
+
+  it('counts a file once when it was committed AND edited again since', async () => {
+    // The same path now reaches the candidate list from both sources — the
+    // committed diff and `git status`. It is still one changed file.
+    fs.writeFileSync(path.join(testDir, 'src', 'one.ts'), `export function alpha() { return 2; }`);
+    git('add', '-A');
+    git('commit', '-m', 'edit one');
+    fs.writeFileSync(path.join(testDir, 'src', 'one.ts'), `export function alpha() { return 3; }`);
+
+    const changes = cg.getChangedFiles();
+    expect(changes.modified.filter((f) => f === 'src/one.ts')).toHaveLength(1);
+    expect(changes.added).toHaveLength(0);
+
+    const result = await cg.sync();
+    expect(result.filesModified).toBe(1);
+  });
+
+  it('sees a committed RENAME as a removal plus an add', async () => {
+    // `--no-renames` on the committed diff is deliberate: the index keys files
+    // by path, so a rename IS a removal and an add, and pairing them up would
+    // only have to be taken apart again.
+    fs.renameSync(path.join(testDir, 'src', 'one.ts'), path.join(testDir, 'src', 'renamed.ts'));
+    git('add', '-A');
+    git('commit', '-m', 'rename one');
+
+    const changes = cg.getChangedFiles();
+    expect(changes.removed).toContain('src/one.ts');
+    expect(changes.added).toContain('src/renamed.ts');
+
+    const result = await cg.sync();
+    expect(result.filesRemoved).toBe(1);
+    expect(result.filesAdded).toBe(1);
+    expect(cg.searchNodes('alpha').every((r) => r.node.filePath !== 'src/one.ts')).toBe(true);
+  });
+
+  it('still filters committed changes by the rules the full index uses', async () => {
+    // vendor/ is a built-in exclude git knows nothing about. Sourcing candidates
+    // from `git diff` must not smuggle in files `git status` would have had
+    // filtered out (#766) — same classifier, both sources.
+    fs.mkdirSync(path.join(testDir, 'vendor'));
+    fs.writeFileSync(path.join(testDir, 'vendor', 'lib.ts'), `export function vendored() { return 1; }`);
+    git('add', '-A');
+    git('commit', '-m', 'add vendor');
+
+    const changes = cg.getChangedFiles();
+    expect(changes.added).not.toContain('vendor/lib.ts');
+    expect(changes.modified).not.toContain('vendor/lib.ts');
+  });
+
+  it('falls back to the full scan when history moved under the index', async () => {
+    // A rebase/gc/shallow clone can leave the stamped commit unreachable. The
+    // fast path cannot diff against a commit that is gone, so the (correct,
+    // slower) full scan has to answer instead of silently reporting zero.
+    fs.writeFileSync(path.join(testDir, 'src', 'two.ts'), `export function beta() { return 2; }`);
+    git('add', '-A');
+    git('commit', '-m', 'add two');
+    (cg as unknown as { queries: { setMetadata(k: string, v: string): void } })
+      .queries.setMetadata('indexed_at_commit', '0'.repeat(40));
+
+    expect(cg.getChangedFiles().added).toContain('src/two.ts');
+  });
+
+  it('an index with no stamp still answers correctly (pre-#1829 index upgrading)', async () => {
+    (cg as unknown as { queries: { setMetadata(k: string, v: string): void } })
+      .queries.setMetadata('indexed_at_commit', '');
+    fs.writeFileSync(path.join(testDir, 'src', 'two.ts'), `export function beta() { return 2; }`);
+    git('add', '-A');
+    git('commit', '-m', 'add two');
+
+    expect(cg.getChangedFiles().added).toContain('src/two.ts');
+
+    // ...and it self-heals: the sync writes a stamp, so the next read is clean.
+    await cg.sync();
+    expect(cg.getChangedFiles().added).toHaveLength(0);
+  });
+  it('keeps the remaining committed diff after a scoped sync', async () => {
+    fs.writeFileSync(path.join(testDir, 'src', 'one.ts'), 'export function changed() {}');
+    fs.writeFileSync(path.join(testDir, 'src', 'two.ts'), 'export function beta() {}');
+    git('add', '-A'); git('commit', '-m', 'two changes');
+    await cg.sync({ paths: ['src/two.ts'] });
+    expect(cg.getChangedFiles().modified).toContain('src/one.ts');
+    await cg.sync();
+    expect(cg.getChangedFiles()).toEqual({ added: [], modified: [], removed: [] });
+  });
+
+  it('preserves a committed deletion recreated with the indexed content', async () => {
+    const file = path.join(testDir, 'src', 'one.ts');
+    const content = fs.readFileSync(file, 'utf8');
+    fs.rmSync(file); git('add', '-A'); git('commit', '-m', 'delete');
+    fs.writeFileSync(file, content);
+    expect(cg.getChangedFiles()).toEqual({ added: [], modified: [], removed: [] });
+    await cg.sync();
+    expect(cg.searchNodes('alpha').length).toBeGreaterThan(0);
+  });
+
+  it('reads committed non-ASCII paths without git quoting', () => {
+    fs.writeFileSync(path.join(testDir, 'src', 'пример.ts'), 'export function beta() {}');
+    git('add', '-A'); git('commit', '-m', 'unicode');
+    expect(cg.getChangedFiles().added).toContain('src/пример.ts');
+  });
+
+  it('finds an unstaged removal when an old stamp requires the fallback', () => {
+    (cg as unknown as { queries: { setMetadata(k: string, v: string): void } })
+      .queries.setMetadata('indexed_at_commit', '');
+    fs.rmSync(path.join(testDir, 'src', 'one.ts'));
+    expect(cg.getChangedFiles().removed).toContain('src/one.ts');
+  });
+
+  it('does not absorb a commit made during full indexing', async () => {
+    const before = git('rev-parse', 'HEAD').trim();
+    let committed = false;
+    await cg.indexAll({ onProgress: () => {
+      if (committed) return;
+      committed = true;
+      fs.writeFileSync(path.join(testDir, 'src', 'two.ts'), 'export function beta() {}');
+      git('add', '-A'); git('commit', '-m', 'during index');
+    }});
+    expect(committed).toBe(true);
+    const queries = (cg as unknown as { queries: { getMetadata(k: string): string } }).queries;
+    expect(queries.getMetadata('indexed_at_commit')).toBe(before);
+  });
+
 });

@@ -130,6 +130,34 @@ describe('a receiver-less JS/TS call never binds to a method (#1714)', () => {
     expect(names).toContain('test');
   });
 
+  it('a const that picks a same-named store action out of a hook is a re-binding, not a local definition', async () => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1714-'));
+    fs.writeFileSync(path.join(tempDir, 'package.json'), '{"name":"t","dependencies":{"zustand":"^4"}}\n');
+    fs.writeFileSync(
+      path.join(tempDir, 'store.ts'),
+      "import { create } from 'zustand'\nexport const useStore = create((set) => ({\n  setZipUri: (zipUri: string) => set({ zipUri }),\n  reset: () => set({}),\n}))\n"
+    );
+    fs.writeFileSync(
+      path.join(tempDir, 'screen.ts'),
+      [
+        "import { useStore } from './store'",
+        'export function onZipComplete(uri: string) {',
+        '  const setZipUri = useStore((s) => s.setZipUri)',
+        '  const { reset } = useStore.getState()',
+        '  setZipUri(uri)',
+        '  reset()',
+        '}',
+        '',
+      ].join('\n')
+    );
+    cg = await CodeGraph.init(tempDir, { index: true });
+    cg.resolveReferences();
+    const from = cg.getNodesByKind('function').find((n) => n.name === 'onZipComplete')!;
+    const targets = cg.getOutgoingEdges(from.id).filter((e) => e.kind === 'calls').map((e) => cg!.getNode(e.target)).map((n) => `${n?.filePath}:${n?.name}`);
+    expect(targets).toContain('store.ts:setZipUri');
+    expect(targets).toContain('store.ts:reset');
+  });
+
   it('keeps `other.serialize()` — a call through a receiver', async () => {
     const callees = await callsFromMethod(
       [

@@ -350,7 +350,7 @@ export class Daemon {
       await new Promise<void>((resolve) => this.server!.close(() => resolve()));
       this.server = null;
     }
-    this.engine.stop();
+    await this.engine.stop();
     this.cleanupLockfile();
     deregisterDaemon(this.projectRoot);
     if (process.platform !== 'win32') {
@@ -378,6 +378,9 @@ export class Daemon {
     // timeout, a non-hello first line, an early close — yields null pids and we
     // fall back to the socket-close lifecycle exactly as before (#692).
     void readClientHello(socket).then((peers) => {
+      // The peer may close while hello is being read; close is not replayed
+      // for the transport listeners we would install afterwards (#1356).
+      if (socket.destroyed) return;
       const transport = new SocketTransport(socket);
       const session = new MCPSession(transport, this.engine, {
         explicitProjectPath: this.projectRoot,
@@ -665,7 +668,7 @@ export function clearStaleDaemonLock(
       if (expectedDeadPid !== undefined && info.pid !== expectedDeadPid) return false;
       // PID liveness is normally sufficient. The takeover caller may override
       // it only after a failed identity handshake proves PID reuse.
-      if (!opts.allowLivePid && info.pid > 0 && isProcessAlive(info.pid)) return false;
+      if ((!opts.allowLivePid || !info.socketPath) && info.pid > 0 && isProcessAlive(info.pid)) return false;
     }
     fs.unlinkSync(pidPath);
     return true;

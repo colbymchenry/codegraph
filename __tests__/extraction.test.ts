@@ -4856,6 +4856,7 @@ CPPType* ApiHelper<CType,
     it('emits an instantiates ref for direct-init and brace-init', () => {
       expect(instNames('Calculator calc(0);')).toEqual(['Calculator']);
       expect(instNames('Widget w{1, 2};')).toEqual(['Widget']);
+      expect(instNames('Calculator deferred;')).toEqual(['Calculator']); // default construction
     });
 
     it('strips template args and namespace to the bare class name', () => {
@@ -4864,11 +4865,11 @@ CPPType* ApiHelper<CType,
       expect(instNames('ns::Widget w(0);')).toEqual(['Widget']);
     });
 
-    it('does not emit for primitives, default construction, or the most-vexing parse', () => {
+    it('does not emit for primitives, extern declarations, or the most-vexing parse', () => {
       expect(instNames('int x(5);')).toEqual([]); // primitive direct-init
       expect(instNames('int y{6};')).toEqual([]); // primitive brace-init
       expect(instNames('auto z = make();')).toEqual([]); // auto + call (handled elsewhere)
-      expect(instNames('Calculator deferred;')).toEqual([]); // default construction, no args
+      expect(instNames('extern Calculator deferred;')).toEqual([]); // declaration, no construction
       expect(instNames('Calculator calc();')).toEqual([]); // function declaration (most-vexing parse)
     });
 
@@ -12780,5 +12781,190 @@ describe('Unsupported-language projects report what they skipped (#1502)', () =>
 
     expect(files).toEqual(['a.ts']);
     expect(stats.unsupportedByExtension.size).toBe(0);
+  });
+});
+
+describe('Verilog / SystemVerilog Extraction', () => {
+  it('should report Verilog as supported', () => {
+    expect(isLanguageSupported('verilog')).toBe(true);
+    expect(getSupportedLanguages()).toContain('verilog');
+  });
+
+  it('should extract modules as containers with scoped functions and tasks', () => {
+    const code = `
+module top (input logic clk, output logic [7:0] z);
+  function automatic int square(int n);
+    return n * n;
+  endfunction
+  task automatic do_reset();
+    z = '0;
+  endtask
+endmodule
+`;
+    const result = extractFromSource('top.sv', code);
+
+    const mod = result.nodes.find((n) => n.kind === 'class' && n.name === 'top');
+    expect(mod).toBeDefined();
+    expect(mod?.language).toBe('verilog');
+
+    const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'square');
+    expect(fn).toBeDefined();
+    expect(fn?.qualifiedName).toBe('top::square'); // scoped under the module
+
+    const task = result.nodes.find((n) => n.kind === 'function' && n.name === 'do_reset');
+    expect(task).toBeDefined();
+  });
+
+  it('should emit an instantiates reference from a module to its submodule type', () => {
+    const code = `
+module alu #(parameter int WIDTH = 8) (input logic [WIDTH-1:0] a, output logic [WIDTH-1:0] y);
+endmodule
+
+module top (input logic [7:0] x, output logic [7:0] z);
+  alu #(.WIDTH(8)) u_alu (.a(x), .y(z));
+endmodule
+`;
+    const result = extractFromSource('soc.sv', code);
+
+    const top = result.nodes.find((n) => n.kind === 'class' && n.name === 'top');
+    expect(top).toBeDefined();
+
+    const inst = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'instantiates' && r.referenceName === 'alu'
+    );
+    expect(inst).toBeDefined();
+    expect(inst?.fromNodeId).toBe(top?.id); // the parent module is the source
+
+    // parameter is captured as a constant
+    const param = result.nodes.find((n) => n.kind === 'constant' && n.name === 'WIDTH');
+    expect(param).toBeDefined();
+  });
+
+  it('should extract package typedefs, functions, imports and call edges', () => {
+    const code = `
+package math_pkg;
+  typedef enum logic [1:0] { IDLE, RUN, DONE } state_t;
+  function automatic int add(int a, int b);
+    return a + b;
+  endfunction
+endpackage
+
+module worker (input logic clk);
+  import math_pkg::*;
+  function automatic int caller(int y);
+    return add(y);
+  endfunction
+endmodule
+`;
+    const result = extractFromSource('pkg.sv', code);
+
+    const pkg = result.nodes.find((n) => n.kind === 'class' && n.name === 'math_pkg');
+    expect(pkg).toBeDefined();
+
+    const typedef = result.nodes.find((n) => n.kind === 'type_alias' && n.name === 'state_t');
+    expect(typedef).toBeDefined();
+    expect(typedef?.qualifiedName).toBe('math_pkg::state_t');
+
+    const importNode = result.nodes.find((n) => n.kind === 'import' && n.name === 'math_pkg');
+    expect(importNode).toBeDefined();
+
+    const callRef = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'calls' && r.referenceName === 'add'
+    );
+    expect(callRef).toBeDefined();
+  });
+
+  it('should extract every package in a multi-package import statement', () => {
+    const code = `
+package a_pkg;
+  function automatic int fa(); return 1; endfunction
+endpackage
+
+package b_pkg;
+  function automatic int fb(); return 2; endfunction
+endpackage
+
+module worker (input logic clk);
+  import a_pkg::*, b_pkg::*;
+  function automatic int caller();
+    return fa() + fb();
+  endfunction
+endmodule
+`;
+    const result = extractFromSource('multi.sv', code);
+
+    const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    expect(imports).toContain('a_pkg');
+    expect(imports).toContain('b_pkg'); // the second import must not be dropped
+
+    // call edges still resolve when multiple imports share one statement
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+    expect(calls).toContain('fa');
+    expect(calls).toContain('fb');
+  });
+
+  it('should capture function calls inside instantiation port/param expressions', () => {
+    const code = `
+module sub #(parameter int W = 8) (input logic [W-1:0] a);
+endmodule
+
+module top (input logic [7:0] x);
+  function automatic int dbl(int v); return v * 2; endfunction
+  function automatic int wid(); return 8; endfunction
+  sub #(.W(wid())) u_sub (.a(dbl(x)));
+endmodule
+`;
+    const result = extractFromSource('inst_calls.sv', code);
+
+    const calls = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls')
+      .map((r) => r.referenceName);
+    expect(calls).toContain('dbl'); // call inside a port connection
+    expect(calls).toContain('wid'); // call inside a parameter override
+
+    // the instantiation edge itself is still emitted
+    const inst = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'instantiates' && r.referenceName === 'sub'
+    );
+    expect(inst).toBeDefined();
+  });
+
+  it('should emit an import for each `include directive, named by the included path', () => {
+    const code = `
+\`include "defs.vh"
+\`include "axi/typedef.svh"
+\`include <uvm_macros.svh>
+module top (input logic clk);
+endmodule
+`;
+    const result = extractFromSource('top.sv', code);
+
+    const includes = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    expect(includes).toEqual(['defs.vh', 'axi/typedef.svh', 'uvm_macros.svh']);
+
+    // the path is what the import ref carries, so the file-path matcher can
+    // land it on the header by suffix
+    const refs = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'imports')
+      .map((r) => r.referenceName);
+    expect(refs).toEqual(['defs.vh', 'axi/typedef.svh', 'uvm_macros.svh']);
+  });
+
+  it('should extract `define macros and top-level parameters from a header', () => {
+    const code = `
+\`ifndef DEFS_VH
+\`define DEFS_VH
+\`define DATA_W 16
+\`define ADDR(x) (x + 1)
+parameter CLK_HZ = 27_000_000;
+localparam BAUD = 115200;
+\`endif
+`;
+    const result = extractFromSource('defs.vh', code);
+
+    const constants = result.nodes.filter((n) => n.kind === 'constant').map((n) => n.name);
+    expect(constants).toEqual(['DEFS_VH', 'DATA_W', 'ADDR', 'CLK_HZ', 'BAUD']);
   });
 });

@@ -8,7 +8,12 @@ import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, SUPERTYPE_TARGET_KINDS, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
-import { JS_BUILT_INS } from './js-builtins';
+import { JS_BUILT_INS, isTsJsNestedCall } from './js-builtins';
+import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
+import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
+import { isVerilogMemberRef, matchVerilogMember } from './verilog-members';
+import { isVerilogPortRef, matchVerilogPort } from './verilog-ports';
+import { isVerilogWildcardRef, matchVerilogWildcard } from './verilog-wildcard';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -190,6 +195,13 @@ export function crossesKnownFamily(a: string, b: string): boolean {
  *    both-known filter so `.vue`/`.svelte` (own tag) importing `.ts` survives.
  */
 function applyLanguageGate(candidates: Node[], ref: UnresolvedRef): Node[] {
+  if (ref.referenceKind === 'calls') {
+    // Cross-language calls need a bridge resolver, never a coincidental name.
+    // C/C++ enum values cannot be invoked (unlike Rust enum constructors).
+    return candidates.filter(c => sameLanguageFamily(c.language, ref.language) &&
+      !((ref.language === 'c' || ref.language === 'cpp') &&
+        (c.kind === 'enum_member' || (c.kind === 'constant' && /^\s*#\s*define\b/.test(c.signature ?? '')))));
+  }
   if (ref.referenceKind === 'references' || ref.referenceKind === 'function_ref') {
     return candidates.filter((c) => sameLanguageFamily(c.language, ref.language));
   }
@@ -685,9 +697,17 @@ function isBareJsCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
 const LOCAL_BINDING_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
 
 /**
- * Whether a JS/TS file binds `name` itself — as a `const`/`let`/`var`/
- * `function`/`class` declaration (destructuring included) or as a parameter
- * of a function or arrow. Such a binding shadows every same-named symbol in
+ * Whether a JS/TS file binds `name` itself — as a plain `const`/`let`/`var`/
+ * `function`/`class` declaration or as a parameter of a function or arrow.
+ * A binding that only re-names a same-named member of something defined
+ * elsewhere is NOT one: `const { fetchUser } = useStore.getState()` and the
+ * selector `const setZipUri = useStore((s) => s.setZipUri)` are how a store
+ * action reaches its caller, and the store-action resolution follows exactly
+ * those shapes — treating them as local would drop the `loginFlow → fetchUser`
+ * edge the graph is built to hold. A plain alias with a fallback (`const now =
+ * opts.now || Date.now`) is still local: on a Kotlin+JS app it otherwise
+ * landed 24 `now()` calls on a Kotlin test's `private val now`. A definition
+ * shadows every same-named symbol in
  * other files, so a bare call to it has no cross-file candidate: the
  * `resolve` of `new Promise((resolve, reject) => …)`, a spec's
  * `const transform = await makeTransform()`, a factory's `const now =
@@ -711,12 +731,24 @@ function isLocallyBoundJsName(name: string, filePath: string, context: Resolutio
   // `const { name } = require('./m')` / `= await import('./m')` binds an IMPORT,
   // not a shadow: the symbol lives in the other file and the call means it.
   const declRe = new RegExp(
-    '\\b(?:const|let|var)\\s+(?:' + n + '\\b|[{\\[][^;=]*?\\b' + n + '\\b[^;=]*?[}\\]])\\s*(?:=\\s*([^;\\n]*))?',
+    '\\b(?:const|let|var)\\s+' + n + '\\b\\s*(?:=\\s*([^;\\n]*))?',
     'g'
   );
   let bound = false;
+  // A selector: an arrow whose body is the same-named member of its own
+  // argument — `useStore((s) => s.setZipUri)`, `useSelector((st) => st.now)`.
+  // `() => Date.now()` is not one: the member is not picked off a parameter.
+  const selector = new RegExp('\\(?\\s*([\\w$]+)\\s*\\)?\\s*=>\\s*[({]?\\s*\\1\\.' + n + '\\b');
   for (const m of source.matchAll(declRe)) {
-    if (!/^\s*(?:await\s+)?(?:require|import)\s*\(/.test(m[1] ?? '')) { bound = true; break; }
+    const init = m[1] ?? '';
+    // `const x = require(…)` is an import; `const setZipUri = useStore((s) =>
+    // s.setZipUri)` picks a same-named member out of something defined
+    // elsewhere. Neither defines the name — the graph's symbol is what it means.
+    // A plain alias with a fallback, `const now = opts.now || Date.now`, IS a
+    // local binding: nothing in the graph is what that call means.
+    if (/^\s*(?:await\s+)?(?:require|import)\s*\(/.test(init) || selector.test(init)) continue;
+    bound = true;
+    break;
   }
   if (!bound) {
     bound =
@@ -1067,7 +1099,7 @@ export function resolveMethodOnType(
     matches = [];
     for (const m of methodCandidates) {
       if (m.kind !== 'method') continue;
-      if (m.language !== ref.language) continue;
+      if (!sameLanguageFamily(m.language, ref.language)) continue;
       const qn = m.qualifiedName;
       if (qn === want || qn.endsWith(`::${want}`)) {
         matches.push(m);
@@ -1666,6 +1698,7 @@ function getInferScanStates(context: ResolutionContext): Map<string, InferScanSt
 
 /** Drop the per-context scan states (see ReferenceResolver.clearCaches). */
 export function clearNameMatcherMemos(context: ResolutionContext): void {
+  clearCppMacroVisibility(context);
   INFER_SCAN_STATES.delete(context);
   C_STATIC_MEMO.delete(context);
   RUST_TRAIT_IMPL_MEMO.delete(context);
@@ -1932,6 +1965,22 @@ function inferLocalReceiverType(
     // human-written local declaration lives on, and regexing it per ref is
     // pure waste — skip it rather than scan it.
     if (line.length > 10_000) return null;
+    if (ESM_FAMILY.has(ref.language)) {
+      // Follow an explicit awaited factory return through the normal binding
+      // resolver; a same-named function elsewhere is not type evidence (#1840).
+      const awaited = line.match(memoPatterns(`awaited|${escapedReceiver}`, () => [
+        new RegExp(String.raw`\b${escapedReceiver}\b\s*=\s*await\s+([A-Za-z_$][\w$]*)\s*\(`),
+      ])[0]!);
+      if (awaited?.[1]) {
+        const target = matchByExactName({ ...ref, referenceName: awaited[1] }, context);
+        const callee = target && context.getNodeById?.(target.targetNodeId);
+        const returnType = callee && (callee.returnType ?? callee.signature?.match(/\)\s*:\s*(Promise\s*<[^>]+>)\s*$/)?.[1]);
+        const promised = returnType?.match(/^Promise\s*<\s*([\w$]+)\s*>$/);
+        if (promised?.[1]) {
+          return promised[1];
+        }
+      }
+    }
     for (const re of patterns) {
       const m = line.match(re);
       if (m && m[1]) {
@@ -2187,6 +2236,7 @@ export function matchMethodCall(
         ? inferCppReceiverType(objectOrClass!, ref, context)
         : inferLocalReceiverType(objectOrClass!, ref, context));
     if (inferredType) {
+      if (ESM_FAMILY.has(ref.language) && ['string', 'number', 'boolean', 'bigint', 'symbol'].includes(inferredType)) return null;
       // Java/Kotlin: when two classes share the simple name, the file's import
       // pins WHICH one (#314). Other languages disambiguate by call-site file.
       const importedFqn =
@@ -2388,7 +2438,7 @@ export function matchMethodCall(
   // names like permissionEngine → PermissionRuleEngine.
   if (methodName) {
     const strat3 = nmTimedT('mc-byname', ref, (): ResolvedRef | null => {
-    const methodCandidates = context.getNodesByName(methodName!);
+    const methodCandidates = applyLanguageGate(context.getNodesByName(methodName!), ref);
     // Ubiquitous-method ceiling (#999): a method name re-declared across a
     // vendored theme/SDK (Metronic's `init`/`update`/… on every widget) yields
     // K candidates that receiver-word overlap can't reliably disambiguate —
@@ -2769,7 +2819,12 @@ function matchStoreAccessorChain(ref: UnresolvedRef, context: ResolutionContext)
   if (!(inner === 'get' || inner === 'getState' || inner.endsWith('.getState'))) return null;
   const callables = context
     .getNodesByName(method)
-    .filter((n) => (n.kind === 'function' || n.kind === 'method') && sameLanguageFamily(n.language, ref.language) && n.id !== ref.fromNodeId);
+    .filter((n) => (n.kind === 'function' || n.kind === 'method') && sameLanguageFamily(n.language, ref.language) && n.id !== ref.fromNodeId)
+    // An interface signature describes the action; it is not a second
+    // implementation. Keep real class methods in the uniqueness check.
+    .filter((n) => !(['typescript', 'tsx'].includes(n.language) && n.kind === 'method' &&
+      context.getNodesInFile(n.filePath).some((parent) =>
+        (parent.kind === 'interface' || parent.kind === 'type_alias') && rangeWithin(n, parent))));
   if (callables.length !== 1) return null;
   return { original: ref, targetNodeId: callables[0]!.id, confidence: 0.6, resolvedBy: 'exact-match' };
 }
@@ -3035,10 +3090,41 @@ export function dumpNameMatcherProfile(label: string): void {
   }
 }
 
+function isVerilogSimPath(filePath: string): boolean {
+  return (
+    /(^|\/)(sim|tb|tests?|testbench|dv)\//i.test(filePath) ||
+    /_(stub|tb|sim)\.s?vh?$/i.test(filePath)
+  );
+}
+
 export function matchReference(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  if (isVisibleCppMacro(ref, context)) return null;
+  if (isCppConstructorRef(ref)) return matchCppConstructor(ref, context);
+  if (isVerilogWildcardRef(ref)) return matchVerilogWildcard(ref, context, matchReference);
+  if (isVerilogPortRef(ref)) return matchVerilogPort(ref, context, matchReference);
+  if (isVerilogMemberRef(ref)) return matchVerilogMember(ref, context);
+  if (ref.language === 'verilog' && ref.referenceKind === 'instantiates' && !isVerilogSimPath(ref.filePath)) {
+    const modules = context
+      .getNodesByName(ref.referenceName)
+      .filter((n) => n.language === 'verilog' && (n.kind === 'class' || n.kind === 'interface'));
+    const synth = modules.filter((n) => !isVerilogSimPath(n.filePath));
+    if (synth.length > 0 && synth.length < modules.length) {
+      const best = synth.length === 1 ? synth[0]! : findBestMatch(ref, synth, context);
+      if (best) {
+        const proximity = computePathProximity(ref.filePath, best.filePath);
+        return {
+          original: ref,
+          targetNodeId: best.id,
+          confidence: synth.length === 1 || proximity >= 30 ? 0.7 : 0.4,
+          resolvedBy: 'exact-match',
+        };
+      }
+    }
+  }
+
   // Function-as-value refs (#756) resolve ONLY through the dedicated matcher —
   // never the fuzzy/qualified fallthrough below (a wrong callback edge is
   // worse than none).
@@ -3148,6 +3234,9 @@ export function matchReference(
       return null;
     }
   }
+
+  // No generic fallback can establish an unknown nested receiver's type.
+  if (isTsJsNestedCall(ref)) return null;
 
   // Try strategies in order of confidence
   let result: ResolvedRef | null;

@@ -25,6 +25,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- HDL: pyslang теперь показывает macro origins в initializer параметров и объявленных типах, различая override и исходный default.
+
+- HDL: `hdl-semantic --python` с pyslang показывает исходное написание и места вызова макросов, явно отмечая неполное сопоставление.
+
+- HDL: `hdl-semantic` с установленным slang показывает вычисленные параметры и ширины портов для выбранного профиля и экземпляра.
+
 - **Codex and Astra read project guidance from `AGENTS.md`.** The canonical agent guide now lives in `AGENTS.md` (with a nested `docs/AGENTS.md` for long validation notes); `CLAUDE.md` is a thin `@AGENTS.md` wrapper for Claude Code. Codex/Astra no longer miss the old CLAUDE-only instructions.
 
 - **A big screen's picture stops wrapping into a column.** How wide a screen's lines run before they wrap was worked out with a formula, and the formula was wrong for the way these pictures are actually drawn: a part of a screen spends lines on its own structure — a step that fires things gets a line to itself, and what it fires starts another — so estimating the lines from the boxes alone badly undercounted them, and one screen's 98 boxes wrapped into a 4,356px column. Laying a picture out is cheap and exact, so the widths are now simply tried and the one that comes out closest to the shape of a window is kept. Across one app's 51 screens the tallest picture went from 4,356px to 3,796px, total height fell 8%, and — because a shorter picture is also a picture whose lines have less far to go — lines running over other boxes fell by a third and lines crossing each other went from 13 to 5.
@@ -145,11 +151,50 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- HDL: именованные profiles в codegraph.json, filelists/include/define context, сохранение offsets при conditional selection, fingerprint/sync invalidation и диагностика configured/indexed profile. Watcher учитывает profile dependencies; полноценный macro expansion пока не выполняется.
+
+- HDL: source access roles read/write/readwrite/control/event и направления аргументов известных functions/tasks доступны через explore `hdlAccess` / CLI `--hdl-access`. Сохраняются разные позиции одной строки, initializer writes и переклассификация после изменения/удаления сигнатуры через sync.
+
+- HDL: точные procedural scopes, formal parameters и generate template declarations сохраняют локальные связи; исправлены defaults/for initializer calls, приоритет block imports и qualified cross-file replay после sync.
+
+- HDL: позиционные подключения следуют порядку ANSI/non-ANSI заголовка; `.*` учитывает явные подключения и локальную область видимости. Sync пересчитывает весь набор связей при изменении заголовка или удалении дубликата модуля. Grammar обновлена до tree-sitter-systemverilog 0.4.0 после сравнения 137 реальных HDL-файлов.
+
+- HDL: именованные подключения имеют отдельные переходы к формальным портам выбранного модуля и локальным сигналам; LHS bit/part selects и concatenations больше не теряют основания и индексы. Неоднозначные module declarations не дают предполагаемую formal binding.
+
+- Verilog/SystemVerilog: именованные экземпляры и generate scopes, порты/сигналы и always/assign доступны для навигации; связи локальных сигналов и package calls сохраняют scope, interfaces показывают modports. Полные elaboration и timing не моделируются.
+
+- Вызовы действий store больше не теряются из-за одноимённой сигнатуры в TypeScript-интерфейсе.
+
+- Вложенные вызовы JavaScript и TypeScript снова доступны Steps и распознаванию фреймворков без привязки встроенных коллекций к посторонним методам; существующие индексы нужно пересобрать. (#1794, #1566)
+- `codegraph status` показывает непроиндексированные добавления, изменения и удаления даже после commit в Git. (#1829)
+- `codegraph sync` отклоняет индекс устаревшего формата извлечения и предлагает полную переиндексацию. (#1798)
+
 - Spring mappings now include every declared path combination and resolve constants declared in the same file, while unresolved paths no longer appear as false root routes. (#1461)
 - `codegraph callers`, `codegraph callees` and `codegraph impact` now resolve qualified names, group results and JSON edges by definition, and accept `--file` to narrow ambiguous names; thanks @ferrine. (#1512, #1656)
 - `codegraph callers`, `codegraph callees` and `codegraph impact` (CLI and MCP) now report missing names with did-you-mean suggestions instead of another symbol's results, and exact matches with no callers stay empty; thanks @uvmplus. (#1473, #1481)
 
 #### MCP / indexing
+
+- Исправлены namespace и арность C++ local constructors, ложные вызовы от pointer/reference initializers и same-line C++ IDs.
+- Macro recovery больше не принимает комментарии и noexcept-expression за объявление функции; условный undef сохраняет неопределённость.
+- Symlink-псевдонимы проекта используют один MCP watcher и общий catch-up вместо параллельных экземпляров одного индекса.
+
+- Callback связывается с обработчиком регистрирующего класса, включая TSX→TS и наследование, а не с одноимённым методом другого класса.
+- Исправлены C/C++ macro calls и local constructors; одноаргументные function macros получают подтверждённое имя.
+- TS/JS getter и setter одной строки больше не перезаписывают друг друга; Dart extension types сохраняют правильные границы и членов.
+- Явно выбранные MCP-проекты получают catch-up и watcher; shutdown дожидается записи, а тесты удаляют свой daemon.
+
+- Восстановлена поддержка Verilog/SystemVerilog и поиска пути от верхнего FPGA-модуля до вложенного; спасибо @FHYQ-Dong за исходный extractor.
+- Обрыв подключения во время MCP-handshake больше не оставляет фантомного клиента.
+- Prompt-hook пропускает служебные уведомления о завершении задач; тесты resolution удаляют временные каталоги после закрытия графа.
+
+- Проверка вызовов больше не связывает C-макросы с одноимёнными enum и Go-код с посторонними TypeScript-символами.
+- Занятый `codegraph sync` сообщает о блокировке вместо ложного успеха, в том числе в quiet-режиме.
+- Неисправные query workers завершаются; старые PID-lockfiles живых процессов сохраняются.
+
+- При отказе `codegraph sync --quiet` из-за устаревшего индекса причина теперь выводится одной строкой в stderr.
+- Прерывание повторного разрешения связей больше не оставляет граф без исходной связи и записи восстановления.
+- В TypeScript вызов метода у результата `await` с объявленным `Promise<string>` больше не связывается с одноимённым методом постороннего класса.
 
 - The prompt hook no longer injects unrelated projects when run from your home directory or a broader directory containing a stray workspace manifest. (#1454)
 

@@ -899,3 +899,8 @@ export function validateDirectory(projectRoot: string): {
     errors,
   };
 }
+
+/** Claude's complete task-notification envelope is not a user search (#1832). */
+export function isTaskNotification(prompt: string): boolean {
+  return /^\s*<task-notification>[\s\S]*<\/task-notification>\s*$/.test(prompt);
+}

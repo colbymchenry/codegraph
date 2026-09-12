@@ -144,7 +144,7 @@ describe.skipIf(!kernelBuilt)('kernel scaffold', () => {
       const result = tryKernelExtract('src/utils.ts', FIXTURE, 'typescript')!;
       for (const n of result.nodes) {
         if (n.kind === 'file') continue;
-        expect(n.id).toBe(generateNodeId('src/utils.ts', n.kind, n.name, n.startLine));
+        expect(n.id).toBe(generateNodeId('src/utils.ts', n.kind, n.name, n.startLine, n.startColumn));
       }
     });
 

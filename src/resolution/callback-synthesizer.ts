@@ -38,6 +38,7 @@ import { createYielder, type MaybeYield } from './cooperative-yield';
 import { crossTierEdges } from './tier-synthesizer';
 import { enclosingFn, makeLineAt } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
+import { matchFunctionRef } from './name-matcher';
 
 const REGISTRAR_NAME = /^(on[A-Z]\w*|subscribe|addListener|addEventListener|register|watch|listen|addCallback)$/;
 const DISPATCHER_NAME = /(emit|trigger|notify|dispatch|fire|publish|flush)/i;
@@ -143,6 +144,50 @@ function* methodAndFunctionNodes(queries: QueryBuilder): IterableIterator<Node> 
   yield* queries.iterateNodesByKind('function');
 }
 
+function fieldCallbackOwner(queries: QueryBuilder, caller: Node): Node | undefined {
+  let level = [caller.id];
+  const seen = new Set<string>();
+  while (level.length) {
+    const parents: Node[] = [];
+    for (const id of level) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      for (const edge of queries.getIncomingEdges(id, ['contains'])) {
+        const node = queries.getNodeById(edge.source);
+        if (node) parents.push(node);
+      }
+    }
+    const owners = [...new Map(parents.filter(n => n.kind === 'class' || n.kind === 'component').map(n => [n.id, n])).values()];
+    if (owners.length) return owners.length === 1 ? owners[0] : undefined;
+    level = parents.map(n => n.id);
+  }
+  return undefined;
+}
+
+/** Resolve this.handler on the registering class, including inherited methods. */
+function fieldCallbackMethod(queries: QueryBuilder, ctx: ResolutionContext, caller: Node, name: string): Node | null {
+  const owner = fieldCallbackOwner(queries, caller);
+  if (!owner) return null;
+  let level = [owner.id];
+  const seen = new Set<string>();
+  const candidates = ctx.getNodesByName(name).filter(n => n.kind === 'method' || n.kind === 'function');
+  while (level.length) {
+    const found: Node[] = [];
+    const next: string[] = [];
+    for (const id of level) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const children = new Set(queries.getOutgoingEdges(id, ['contains']).map(e => e.target));
+      found.push(...candidates.filter(n => children.has(n.id)));
+      next.push(...queries.getOutgoingEdges(id, ['extends']).map(e => e.target));
+    }
+    const unique = [...new Map(found.map(n => [n.id, n])).values()];
+    if (unique.length) return unique.length === 1 ? unique[0]! : null;
+    level = next;
+  }
+  return null;
+}
+
 /** Phase 1: field-backed observer channels (registrar/dispatcher share a store). */
 async function fieldChannelEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   const registrars: Array<{ node: Node; field: string }> = [];
@@ -165,10 +210,11 @@ async function fieldChannelEdges(queries: QueryBuilder, ctx: ResolutionContext, 
   const seen = new Set<string>();
   for (const reg of registrars) {
     const chDispatchers = dispatchers.filter(
-      (d) => d.node.filePath === reg.node.filePath && d.field === reg.field
+      (d) => d.node.filePath === reg.node.filePath && d.field === reg.field &&
+        fieldCallbackOwner(queries, d.node)?.id === fieldCallbackOwner(queries, reg.node)?.id
     );
     if (chDispatchers.length === 0) continue;
-    const argRe = new RegExp(`${reg.node.name}\\s*\\(\\s*(?:this\\.)?(\\w+)`);
+    const argRe = new RegExp(`${reg.node.name}\\s*\\(\\s*(this\\.)?(\\w+)\\s*(?=[,)]|\\.bind\\s*\\()`);
     let added = 0;
     for (const e of queries.getIncomingEdges(reg.node.id, ['calls'])) {
       if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
@@ -178,7 +224,14 @@ async function fieldChannelEdges(queries: QueryBuilder, ctx: ResolutionContext, 
       const line = ctx.readFile(caller.filePath)?.split('\n')[e.line - 1];
       const am = line?.match(argRe);
       if (!am) continue;
-      const fn = ctx.getNodesByName(am[1]!).find((n) => n.kind === 'method' || n.kind === 'function');
+      const fn = am[1]
+        ? fieldCallbackMethod(queries, ctx, caller, am[2]!)
+        : (() => {
+            const target = matchFunctionRef({ fromNodeId: caller.id, referenceName: am[2]!,
+              referenceKind: 'function_ref', filePath: caller.filePath, language: caller.language,
+              line: e.line!, column: am.index! }, ctx);
+            return target ? queries.getNodeById(target.targetNodeId) ?? null : null;
+          })();
       if (!fn) continue;
       for (const disp of chDispatchers) {
         if (disp.node.id === fn.id) continue;

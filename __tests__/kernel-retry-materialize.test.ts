@@ -37,7 +37,8 @@ const KERNEL_PATH = path.join(
 );
 const kernelBuilt = fs.existsSync(KERNEL_PATH);
 
-describe.skipIf(!kernelBuilt)('kernel buffer-transport storage (#1541)', () => {
+// This suite requires native routing; the WASM-only matrix disables it explicitly.
+describe.skipIf(!kernelBuilt || process.env.CODEGRAPH_KERNEL === '0')('kernel buffer-transport storage (#1541)', () => {
   let dir: string;
   let cg: CodeGraph;
 

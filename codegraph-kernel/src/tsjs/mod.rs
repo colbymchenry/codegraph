@@ -348,7 +348,7 @@ impl<'t> Walker<'t> {
             return None;
         }
         let start_line = self.line_of(node);
-        let id = ids::node_id(self.file_path, kind, name, start_line);
+        let id = ids::node_id_at_column(self.file_path, kind, name, start_line, Some(self.col_of(node)));
 
         // endLine body extension: resolveBody only (TS/JS: function-valued
         // class fields whose body nests in the arrow / HOF-wrapped arrow).

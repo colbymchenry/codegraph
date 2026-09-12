@@ -329,13 +329,9 @@ export class MCPServer {
    * connected session; in direct mode it mirrors the pre-#411 behavior (close
    * cg, exit). Proxy mode never routes through here — the proxy exits itself.
    */
-  stop(): void {
+  async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
-    if (this.writerLockRoot) {
-      releaseWriterLock(this.writerLockRoot);
-      this.writerLockRoot = null;
-    }
     if (this.ppidWatchdog) {
       clearInterval(this.ppidWatchdog);
       this.ppidWatchdog = null;
@@ -345,7 +341,7 @@ export class MCPServer {
       this.livenessWatchdog = null;
     }
     if (this.daemon) {
-      void this.daemon.stop('stop()');
+      await this.daemon.stop('stop()');
       // Daemon.stop calls process.exit; nothing else to do.
       return;
     }
@@ -354,8 +350,12 @@ export class MCPServer {
       this.session = null;
     }
     if (this.engine) {
-      this.engine.stop();
+      await this.engine.stop();
       this.engine = null;
+    }
+    if (this.writerLockRoot) {
+      releaseWriterLock(this.writerLockRoot);
+      this.writerLockRoot = null;
     }
     process.exit(0);
   }
@@ -380,7 +380,7 @@ export class MCPServer {
     }
 
     this.engine = new MCPEngine();
-    const transport = new StdioTransport();
+    const transport = new StdioTransport({ exitOnClose: false, onClose: () => { void this.stop(); } });
     this.session = new MCPSession(transport, this.engine, {
       explicitProjectPath: this.projectPath,
     });

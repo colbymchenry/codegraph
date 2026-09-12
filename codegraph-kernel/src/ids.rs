@@ -3,6 +3,9 @@
 //!
 //!   `${kind}:${sha256(`${filePath}:${kind}:${name}:${line}`).hex[0..32]}`
 //!
+//! TS/JS and C++ use `node_id_at_column`, appending `:${utf16Column}` before hashing
+//! so same-line declarations have distinct identities.
+//!
 //! and the file-node special case in `TreeSitterExtractor.extract()`:
 //!
 //!   `file:${filePath}`
@@ -14,6 +17,10 @@
 use sha2::{Digest, Sha256};
 
 pub fn node_id(file_path: &str, kind: &str, name: &str, line: u32) -> String {
+    node_id_at_column(file_path, kind, name, line, None)
+}
+
+pub fn node_id_at_column(file_path: &str, kind: &str, name: &str, line: u32, column: Option<u32>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(file_path.as_bytes());
     hasher.update(b":");
@@ -22,6 +29,10 @@ pub fn node_id(file_path: &str, kind: &str, name: &str, line: u32) -> String {
     hasher.update(name.as_bytes());
     hasher.update(b":");
     hasher.update(line.to_string().as_bytes());
+    if let Some(column) = column {
+        hasher.update(b":");
+        hasher.update(column.to_string().as_bytes());
+    }
     let digest = hasher.finalize();
     // 32 hex chars = first 16 bytes.
     let mut hex = String::with_capacity(kind.len() + 1 + 32);

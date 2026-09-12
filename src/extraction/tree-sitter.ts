@@ -411,12 +411,10 @@ const TS_JS_CHAIN_LANGUAGES = new Set(['typescript', 'tsx', 'javascript', 'jsx']
 const TS_JS_CHAIN_RECEIVER_TYPES = new Set(['member_expression', 'subscript_expression']);
 
 /**
- * Identifier-rooted member chains have no inferred property type (#1566),
- * including host API chains (#1707). Keep the existing `window.MyNamespace`
- * escape for project globals; call-result and `this` receivers have their own
- * paths and are outside this guard.
+ * Nested identifier receivers retain their call-site text; window keeps its
+ * existing project-namespace behavior. Call-result and this paths are separate.
  */
-function isUnresolvedTsJsChain(node: SyntaxNode, source: string): boolean {
+function isTsJsIdentifierChain(node: SyntaxNode, source: string): boolean {
   let cur: SyntaxNode | null = node;
   while (cur && TS_JS_CHAIN_RECEIVER_TYPES.has(cur.type)) {
     cur = getChildByField(cur, 'object');
@@ -1022,6 +1020,17 @@ export class TreeSitterExtractor {
       if (skipChildren) return;
     }
 
+    // Preprocessor definitions are values, never executable callees. Keeping
+    // the directive lets resolution recognize visible macros through includes.
+    if ((this.language === 'c' || this.language === 'cpp') &&
+        nodeType === 'preproc_function_def') {
+      const name = getChildByField(node, 'name');
+      if (name) this.createNode('constant', getNodeText(name, this.source), node, {
+        signature: getNodeText(node, this.source).trim(),
+      });
+      return;
+    }
+
     // C++ namespace blocks: carry the namespace name as a qualifiedName prefix
     // while walking the body, so `namespace flash { void compute_attn(); }`
     // indexes compute_attn with qualifiedName `flash::compute_attn` and a
@@ -1390,7 +1399,11 @@ export class TreeSitterExtractor {
       return null;
     }
 
-    const id = generateNodeId(this.filePath, kind, name, node.startPosition.row + 1);
+    // TS/JS accessors, C++ overloads and HDL declarations can share a name and source line.
+    // Include the UTF-16 column for these languages so their edges cannot alias.
+    const column = ['typescript', 'tsx', 'javascript', 'jsx', 'cpp', 'verilog'].includes(this.language)
+      ? node.startPosition.column : undefined;
+    const id = generateNodeId(this.filePath, kind, name, node.startPosition.row + 1, column);
 
     // Some grammars (e.g. Dart) model a function/method body as a *sibling* of
     // the signature node, so the declaration node's own range is just the
@@ -4868,16 +4881,12 @@ export class TreeSitterExtractor {
               TS_JS_CHAIN_LANGUAGES.has(this.language) &&
               receiver &&
               TS_JS_CHAIN_RECEIVER_TYPES.has(receiver.type) &&
-              isUnresolvedTsJsChain(receiver, this.source)
+              isTsJsIdentifierChain(receiver, this.source)
             ) {
-              // `holder.values.get()` has no inferred property type (#1566).
-              // Emitting bare `get` exact-matches an unrelated project method;
-              // preserving the chain alone would still allow receiver guessing.
-              // Emit nothing until the property type can be established. This
-              // also covers host chains such as `chrome.storage.local.get()`
-              // (#1707). Calls inside arguments are visited independently.
-              // Mirrored in the kernel's extract_call (tsjs/extractors.rs).
-              return;
+              // Keep call-site evidence for framework resolution and Steps.
+              // Generic resolution must not guess a target from the last name
+              // when the nested receiver's type is unknown (#1794, #1566).
+              calleeName = `${getNodeText(receiver, this.source)}.${methodName}`;
             } else {
               calleeName = methodName;
             }
@@ -5096,13 +5105,13 @@ export class TreeSitterExtractor {
    *    `auto` (`placeholder_type_specifier` — that form always carries a real
    *    `call_expression`, already handled), and sized specifiers are excluded —
    *    they construct no class; and
-   *  - a declarator carries constructor arguments: an `init_declarator` whose
-   *    `value` is an `argument_list` (`(args)`) or `initializer_list` (`{args}`).
-   *    This skips default construction `Calculator c;` (no value) and the
-   *    most-vexing-parse `Calculator c();` (a bodyless `function_declarator`,
-   *    a function decl — not a construction).
+   *  - a bare identifier (default construction), or an `init_declarator`
+   *    whose value is an `argument_list` / `initializer_list`. Pointer,
+   *    reference, and function declarators are excluded, including the
+   *    most-vexing-parse `Calculator c();` (a function declaration).
    */
-  private isCppStackConstruction(node: SyntaxNode): boolean {
+  private cppStackConstructions(node: SyntaxNode): Array<{ node: SyntaxNode; arity: number }> {
+    if (node.namedChildren.some(c => c.type === 'storage_class_specifier' && c.text === 'extern')) return [];
     const typeNode = getChildByField(node, 'type');
     if (
       !typeNode ||
@@ -5110,17 +5119,23 @@ export class TreeSitterExtractor {
         typeNode.type !== 'template_type' &&
         typeNode.type !== 'qualified_identifier')
     ) {
-      return false;
+      return [];
     }
+    const constructions: Array<{ node: SyntaxNode; arity: number }> = [];
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
+      if (child?.type === 'identifier') { constructions.push({ node: child, arity: 0 }); continue; }
       if (child?.type !== 'init_declarator') continue;
+      const declarator = getChildByField(child, 'declarator');
+      if (declarator?.type !== 'identifier' && declarator?.type !== 'array_declarator') continue;
       const value = getChildByField(child, 'value');
       if (value && (value.type === 'argument_list' || value.type === 'initializer_list')) {
-        return true;
+        // Array initializer elements are objects, not constructor arguments.
+        if (declarator.type === 'array_declarator' && value.namedChildCount !== 0) continue;
+        constructions.push({ node: child, arity: value.namedChildren.filter(c => c.type !== 'comment').length });
       }
     }
-    return false;
+    return constructions;
   }
 
   /**
@@ -5596,6 +5611,12 @@ export class TreeSitterExtractor {
 
     const visitForCallsAndStructure = (node: SyntaxNode): void => {
       const nodeType = node.type;
+      if ((this.language === 'c' || this.language === 'cpp') &&
+          nodeType === 'preproc_function_def') {
+        this.visitNode(node);
+        return;
+      }
+
 
       // Function-as-value capture (#756) — function bodies are walked here,
       // not in visitNode, so the capture hook must fire in both walkers.
@@ -5646,8 +5667,20 @@ export class TreeSitterExtractor {
       // (which strips template args / namespace and emits the `instantiates`
       // ref). Children still recurse below, so a nested ctor-arg call
       // (`Calculator calc(make())`) keeps its own `calls` ref.
-      if (nodeType === 'declaration' && this.language === 'cpp' && this.isCppStackConstruction(node)) {
-        this.extractInstantiation(node);
+      if (nodeType === 'declaration' && this.language === 'cpp') {
+        const constructions = this.cppStackConstructions(node);
+        if (constructions.length) this.extractInstantiation(node);
+        const type = getChildByField(node, 'type');
+        const className = type ? stripCppTemplateArgs(getNodeText(type, this.source)) : '';
+        const name = className.split('::').filter(Boolean).pop();
+        const callerId = this.nodeStack[this.nodeStack.length - 1];
+        if (name && callerId) for (const construction of constructions) this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName: `${className}::${name}/${construction.arity}`,
+          referenceKind: 'calls',
+          line: node.startPosition.row + 1,
+          column: node.startPosition.column,
+        });
       }
 
       // C++ local function-pointer bindings (see cppLocalFnPtrs): record

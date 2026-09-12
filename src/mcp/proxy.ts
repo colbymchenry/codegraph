@@ -247,10 +247,10 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   const writeClient = (obj: JsonRpc | string): void => {
     try { process.stdout.write((typeof obj === 'string' ? obj : JSON.stringify(obj)) + '\n'); } catch { /* host gone */ }
   };
-  const shutdown = (): void => {
+  const shutdown = async (): Promise<void> => {
     if (shuttingDown) return; shuttingDown = true;
     try { daemonSocket?.destroy(); } catch { /* ignore */ }
-    try { engine?.stop(); } catch { /* ignore */ }
+    await engine?.stop();
     process.exit(0);
   };
   const ensureEngine = (): Promise<void> => {

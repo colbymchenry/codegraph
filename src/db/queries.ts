@@ -163,6 +163,22 @@ interface UnresolvedRefRow {
  * refs against newly-added node names.
  */
 function referenceNameTail(referenceName: string): string {
+  // Named HDL connections carry structured module/port/instance identity.
+  // Retry on the formal port name when a previously removed port reappears.
+  for (const prefix of ['hdl:port-position:', 'hdl:wildcard:']) {
+    if (referenceName.startsWith(prefix)) {
+      try {
+        const parts: unknown = JSON.parse(referenceName.slice(prefix.length));
+        if (Array.isArray(parts) && typeof parts[0] === 'string') return parts[0];
+      } catch { /* Fall back for malformed internal references. */ }
+    }
+  }
+  if (referenceName.startsWith('hdl:port:')) {
+    try {
+      const parts: unknown = JSON.parse(referenceName.slice('hdl:port:'.length));
+      if (Array.isArray(parts) && parts.length === 3 && typeof parts[1] === 'string') return parts[1];
+    } catch { /* Malformed refs retain the generic tail behavior below. */ }
+  }
   // Erlang refs carry a written arity (`f/1`, `mod::fn/2` — #1610); the tail a
   // new symbol's plain name could match is the arity-less function name.
   const base = referenceName.replace(/\/\d{1,3}$/, '') || referenceName;
@@ -3524,6 +3540,55 @@ export class QueryBuilder {
       }
     })();
     return changed;
+  }
+
+  /**
+   * Replace resolution edges with their original unresolved references as one
+   * transaction. If ref insertion fails, the edge deletion is rolled back.
+   */
+  replaceResolutionEdgesWithUnresolvedRefs(
+    edgeIds: number[],
+    refs: UnresolvedReference[]
+  ): number {
+    return this.db.transaction(() => {
+      let changed = this.deleteEdgesByIds(edgeIds);
+      const seenHdl = new Set<string>();
+      const pending = refs.filter(ref => {
+        if (!ref.referenceName.startsWith('hdl:wildcard:') && !ref.referenceName.startsWith('hdl:port-position:')) return true;
+        const key = JSON.stringify([ref.fromNodeId, ref.referenceName, ref.line, ref.column]);
+        if (seenHdl.has(key)) return false;
+        seenHdl.add(key);
+        return true;
+      });
+      // A wildcard/positional binding depends on the entire module header.
+      // Invalidate its complete fan-out, including actual signals in untouched
+      // files, before rebuilding it from one original reference.
+      for (const ref of pending) {
+        if (ref.referenceName.startsWith('hdl:wildcard:') || ref.referenceName.startsWith('hdl:port-position:')) {
+          changed += this.db.prepare("DELETE FROM edges WHERE source = ? AND json_extract(metadata, '$.refName') = ?")
+            .run(ref.fromNodeId, ref.referenceName).changes;
+        }
+      }
+      this.insertUnresolvedRefsBatch(pending);
+      return changed;
+    })();
+  }
+
+  hasLanguage(language: Language): boolean {
+    return !!this.db.prepare('SELECT 1 FROM nodes WHERE language = ? LIMIT 1').get(language);
+  }
+
+  /** HDL call arguments may change access when a remote formal changes direction.
+   * Seek HDL sources first, then their indexed outgoing edges; ordinary projects
+   * have no rows here. Include unclassified arguments so newly indexed callees
+   * can provide direction evidence on the next sync. */
+  getHdlCallArgumentEdges(): Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language }> {
+    const rows = this.db.prepare(`SELECT e.*, src.file_path AS source_file_path, src.language AS source_language
+      FROM nodes src JOIN edges e ON e.source = src.id
+      WHERE src.language = 'verilog' AND e.kind = 'references' AND e.metadata LIKE '%hdl:call-arg:%'`)
+      .all() as Array<EdgeRow & { source_file_path: string; source_language: Language }>;
+    return rows.map(row => ({ ...rowToEdge(row), edgeId: row.id,
+      sourceFilePath: row.source_file_path, sourceLanguage: row.source_language }));
   }
 
   /**

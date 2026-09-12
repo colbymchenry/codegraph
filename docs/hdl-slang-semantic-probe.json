@@ -1,0 +1,473 @@
+{
+  "schemaVersion": 1,
+  "toolVersion": "slang version 11.0.448+e222e7dc0",
+  "standard": "1800-2023",
+  "sourceInventory": "docs/hdl-corpus-manifest.json",
+  "all137ManifestSourceHashesStillMatch": true,
+  "cases": [
+    {
+      "name": "uart",
+      "exit": 1,
+      "argv": [
+        "${SLANG}",
+        "--single-unit",
+        "--std",
+        "1800-2023",
+        "--top",
+        "top",
+        "--ast-json",
+        "${OUTPUT}/uart.json",
+        "--ast-json-source-info",
+        "--diag-json",
+        "${OUTPUT}/uart.diagnostics.json",
+        "src/fifo.v",
+        "src/top.v",
+        "src/uart_arbiter.v",
+        "src/uart_rx.v",
+        "src/uart_rx_autobaud.v",
+        "src/uart_tx.v"
+      ],
+      "cwd": "${CORPUS}/dual-uart",
+      "astBytes": 1089429,
+      "diagnosticsBySeverity": {
+        "error": 9,
+        "note": 9
+      },
+      "diagnosticExamples": [
+        {
+          "severity": "error",
+          "message": "identifier 'rx1_dv' used before its declaration",
+          "location": "src/top.v:68:17",
+          "symbolPath": "top"
+        },
+        {
+          "severity": "note",
+          "message": "declared here",
+          "location": "src/top.v:142:16"
+        },
+        {
+          "severity": "error",
+          "message": "identifier 'rx2_dv' used before its declaration",
+          "location": "src/top.v:77:17",
+          "symbolPath": "top"
+        }
+      ]
+    },
+    {
+      "name": "board",
+      "exit": 1,
+      "argv": [
+        "${SLANG}",
+        "--single-unit",
+        "--std",
+        "1800-2023",
+        "--top",
+        "top",
+        "--ast-json",
+        "${OUTPUT}/board.json",
+        "--ast-json-source-info",
+        "--diag-json",
+        "${OUTPUT}/board.diagnostics.json",
+        "src/crc8.v",
+        "src/emmc_cmd.v",
+        "src/emmc_controller.v",
+        "src/emmc_crc16.v",
+        "src/emmc_crc7.v",
+        "src/emmc_dat.v",
+        "src/emmc_init.v",
+        "src/led_status.v",
+        "src/pll.v",
+        "src/sector_buf.v",
+        "src/sector_buf_wr.v",
+        "src/top.v",
+        "src/uart_bridge.v",
+        "src/uart_rx.v",
+        "src/uart_tx.v"
+      ],
+      "cwd": "${CORPUS}/card-reader",
+      "astBytes": 8437037,
+      "diagnosticsBySeverity": {
+        "error": 5,
+        "note": 4
+      },
+      "diagnosticExamples": [
+        {
+          "severity": "error",
+          "message": "identifier 'state' used before its declaration",
+          "location": "src/emmc_cmd.v:49:24",
+          "symbolPath": "top.u_emmc.u_cmd"
+        },
+        {
+          "severity": "note",
+          "message": "declared here",
+          "location": "src/emmc_cmd.v:51:17"
+        },
+        {
+          "severity": "error",
+          "message": "identifier 'wr_done_timeout' used before its declaration",
+          "location": "src/emmc_controller.v:466:36",
+          "symbolPath": "top.u_emmc"
+        }
+      ]
+    },
+    {
+      "name": "crc-std",
+      "exit": 0,
+      "argv": [
+        "${SLANG}",
+        "--single-unit",
+        "--std",
+        "1800-2023",
+        "--top",
+        "emmc_crc16",
+        "--ast-json",
+        "${OUTPUT}/crc-std.json",
+        "--ast-json-source-info",
+        "--diag-json",
+        "${OUTPUT}/crc-std.diagnostics.json",
+        "src/emmc_crc16.v"
+      ],
+      "cwd": "${CORPUS}/card-reader",
+      "astBytes": 107639,
+      "diagnosticsBySeverity": {},
+      "diagnosticExamples": []
+    },
+    {
+      "name": "axi-2-exact",
+      "exit": 0,
+      "argv": [
+        "${SLANG}",
+        "--single-unit",
+        "--std",
+        "1800-2023",
+        "--top",
+        "synth_axi_lite_xbar",
+        "--ast-json",
+        "${OUTPUT}/axi-2-exact.json",
+        "--ast-json-source-info",
+        "--diag-json",
+        "${OUTPUT}/axi-2-exact.diagnostics.json",
+        "-f",
+        "${AXI}/build/final-controls/verilator.f",
+        "-GNoSlvMst=2"
+      ],
+      "cwd": "${AXI}",
+      "astBytes": 9382003,
+      "diagnosticsBySeverity": {
+        "warning": 1
+      },
+      "diagnosticExamples": [
+        {
+          "severity": "warning",
+          "message": "finish argument must have value of 0, 1, or 2",
+          "optionName": "finish-num",
+          "location": ".bender/git/checkouts/common_verification-5b9bacfe2f79eb87/src/sim_timeout.sv:24:21",
+          "symbolPath": ".validate_params"
+        }
+      ]
+    },
+    {
+      "name": "axi-2",
+      "exit": 0,
+      "argv": [
+        "${SLANG}",
+        "--single-unit",
+        "--std",
+        "1800-2023",
+        "--top",
+        "synth_axi_lite_xbar",
+        "--ast-json",
+        "${OUTPUT}/axi-2.json",
+        "--ast-json-source-info",
+        "--diag-json",
+        "${OUTPUT}/axi-2.diagnostics.json",
+        "-f",
+        "${AXI}/build/final-controls/verilator.f",
+        "-GNoSlvMst=2",
+        "-DVERILATOR=1"
+      ],
+      "cwd": "${AXI}",
+      "astBytes": 9030294,
+      "diagnosticsBySeverity": {},
+      "diagnosticExamples": []
+    },
+    {
+      "name": "axi-4",
+      "exit": 0,
+      "argv": [
+        "${SLANG}",
+        "--single-unit",
+        "--std",
+        "1800-2023",
+        "--top",
+        "synth_axi_lite_xbar",
+        "--ast-json",
+        "${OUTPUT}/axi-4.json",
+        "--ast-json-source-info",
+        "--diag-json",
+        "${OUTPUT}/axi-4.diagnostics.json",
+        "-f",
+        "${AXI}/build/final-controls/verilator.f",
+        "-GNoSlvMst=4",
+        "-DVERILATOR=1"
+      ],
+      "cwd": "${AXI}",
+      "astBytes": 10796211,
+      "diagnosticsBySeverity": {},
+      "diagnosticExamples": []
+    },
+    {
+      "name": "uart-compat",
+      "exit": 0,
+      "argv": [
+        "${SLANG}",
+        "--single-unit",
+        "--std",
+        "1800-2023",
+        "--top",
+        "top",
+        "--ast-json",
+        "${OUTPUT}/uart-compat.json",
+        "--ast-json-source-info",
+        "--diag-json",
+        "${OUTPUT}/uart-compat.diagnostics.json",
+        "src/fifo.v",
+        "src/top.v",
+        "src/uart_arbiter.v",
+        "src/uart_rx.v",
+        "src/uart_rx_autobaud.v",
+        "src/uart_tx.v",
+        "--allow-use-before-declare"
+      ],
+      "cwd": "${CORPUS}/dual-uart",
+      "astBytes": 1075539,
+      "diagnosticsBySeverity": {},
+      "diagnosticExamples": []
+    },
+    {
+      "name": "board-compat",
+      "exit": 1,
+      "argv": [
+        "${SLANG}",
+        "--single-unit",
+        "--std",
+        "1800-2023",
+        "--top",
+        "top",
+        "--ast-json",
+        "${OUTPUT}/board-compat.json",
+        "--ast-json-source-info",
+        "--diag-json",
+        "${OUTPUT}/board-compat.diagnostics.json",
+        "src/crc8.v",
+        "src/emmc_cmd.v",
+        "src/emmc_controller.v",
+        "src/emmc_crc16.v",
+        "src/emmc_crc7.v",
+        "src/emmc_dat.v",
+        "src/emmc_init.v",
+        "src/led_status.v",
+        "src/pll.v",
+        "src/sector_buf.v",
+        "src/sector_buf_wr.v",
+        "src/top.v",
+        "src/uart_bridge.v",
+        "src/uart_rx.v",
+        "src/uart_tx.v",
+        "--allow-use-before-declare"
+      ],
+      "cwd": "${CORPUS}/card-reader",
+      "astBytes": 8402802,
+      "diagnosticsBySeverity": {
+        "error": 1
+      },
+      "diagnosticExamples": [
+        {
+          "severity": "error",
+          "message": "unknown module 'rPLL'",
+          "location": "src/pll.v:13:5",
+          "symbolPath": "top.u_pll"
+        }
+      ]
+    }
+  ],
+  "examples": {
+    "crc-std": {
+      "reachableInstancesIncludingTop": 1,
+      "parametersAtRoot": [],
+      "missingBodyReferences": [],
+      "crcOut": {
+        "name": "crc_out",
+        "type": "logic[15:0]",
+        "direction": "Out"
+      }
+    },
+    "uart-compat": {
+      "reachableInstancesIncludingTop": 7,
+      "parametersAtRoot": [
+        {
+          "path": "top.CLK_FREQ",
+          "value": "50000000",
+          "type": "logic signed[31:0]",
+          "source": {
+            "source_file": "src/top.v",
+            "source_line": 35,
+            "source_column": 16
+          }
+        },
+        {
+          "path": "top.BAUD_RATE",
+          "value": "921600",
+          "type": "logic signed[31:0]",
+          "source": {
+            "source_file": "src/top.v",
+            "source_line": 36,
+            "source_column": 16
+          }
+        },
+        {
+          "path": "top.BLINK_DURATION",
+          "value": "24'd5000000",
+          "type": "logic[23:0]",
+          "source": {
+            "source_file": "src/top.v",
+            "source_line": 62,
+            "source_column": 16
+          }
+        }
+      ],
+      "missingBodyReferences": [],
+      "rxParameters": [
+        {
+          "path": "top.u_rx1.CLK_FREQ",
+          "value": "50000000",
+          "type": "logic signed[31:0]",
+          "source": {
+            "source_file": "src/uart_rx.v",
+            "source_line": 11,
+            "source_column": 15
+          }
+        },
+        {
+          "path": "top.u_rx1.CLKS_PER_BIT",
+          "value": "54",
+          "type": "logic signed[31:0]",
+          "source": {
+            "source_file": "src/uart_rx.v",
+            "source_line": 22,
+            "source_column": 16
+          }
+        },
+        {
+          "path": "top.u_rx2.CLK_FREQ",
+          "value": "50000000",
+          "type": "logic signed[31:0]",
+          "source": {
+            "source_file": "src/uart_rx.v",
+            "source_line": 11,
+            "source_column": 15
+          }
+        }
+      ]
+    },
+    "axi-2": {
+      "reachableInstancesIncludingTop": 92,
+      "parametersAtRoot": [
+        {
+          "path": "synth_axi_lite_xbar.NoSlvMst",
+          "value": "32'd2",
+          "type": "int unsigned",
+          "source": {
+            "source_file": "test/axi_synth_bench.sv",
+            "source_line": 406,
+            "source_column": 26
+          }
+        },
+        {
+          "path": "synth_axi_lite_xbar.XbarCfg",
+          "value": "332'h2000000020000000500000005ffe000000000000000000000000000000200000002000000002",
+          "type": "axi_pkg::xbar_cfg_t",
+          "source": {
+            "source_file": "test/axi_synth_bench.sv",
+            "source_line": 422,
+            "source_column": 34
+          }
+        }
+      ],
+      "missingBodyReferences": [],
+      "slaveGenerateIndices": {
+        "path": "synth_axi_lite_xbar.i_xbar_dut.gen_slv_port_demux",
+        "loopVariable": "i",
+        "indices": [
+          "0",
+          "1"
+        ]
+      }
+    },
+    "axi-4": {
+      "reachableInstancesIncludingTop": 182,
+      "parametersAtRoot": [
+        {
+          "path": "synth_axi_lite_xbar.NoSlvMst",
+          "value": "32'd4",
+          "type": "int unsigned",
+          "source": {
+            "source_file": "test/axi_synth_bench.sv",
+            "source_line": 406,
+            "source_column": 26
+          }
+        },
+        {
+          "path": "synth_axi_lite_xbar.XbarCfg",
+          "value": "332'h4000000040000000500000005ffe000000000000000000000000000000200000002000000004",
+          "type": "axi_pkg::xbar_cfg_t",
+          "source": {
+            "source_file": "test/axi_synth_bench.sv",
+            "source_line": 422,
+            "source_column": 34
+          }
+        }
+      ],
+      "missingBodyReferences": [],
+      "slaveGenerateIndices": {
+        "path": "synth_axi_lite_xbar.i_xbar_dut.gen_slv_port_demux",
+        "loopVariable": "i",
+        "indices": [
+          "0",
+          "1",
+          "2",
+          "3"
+        ]
+      }
+    }
+  },
+  "astSchema": {
+    "rootInstances": "design.members entries with kind=Instance",
+    "instanceBody": "Instance.body is an object OR decimal-addr-prefixed reference string; resolve with global addr catalog",
+    "parameter": "InstanceBody.members Parameter: value (SV constant string), type, isLocal/isPort/isBody, source_file/source_line/source_column",
+    "types": "Default type is printable string, sometimes addr-prefixed reference. --ast-json-detailed-types emits PackedArrayType.range and elementType, isSigned, aliases and members. Strip addr from portable results.",
+    "source": "Ordinary symbols have source_file/source_line/source_column (declaration-name location); statements/expressions have source_*_start and source_*_end ranges. Ordinary positive columns are 1-based; tested literal range end is exclusive. Macro-expanded symbols can have column 0 at invocation line, not an exact token location.",
+    "generate": "GenerateBlockArray.members include Genvar and GenerateBlock. Each block has implicit local Parameter value for iteration index; skip isUninstantiated. Derive path array[index] then descend body members; follow shared InstanceBody references for each instance path."
+  },
+  "limitations": [
+    "Elaborated AST/type/constant probes only: no simulation, synthesis or timing validation.",
+    "AST JSON is emitted even on failed compilations; gate acceptance on compiler exit/diagnostics.",
+    "Strict Slang rejects UART use-before-declaration; success requires explicitly recorded --allow-use-before-declare compatibility option.",
+    "Board top still fails on missing rPLL even with declaration-order compatibility; no vendor-primitive substitution was introduced.",
+    "Generated TARGET_VERILATOR does not equal compiler builtin VERILATOR. Explicit -DVERILATOR=1 matches relevant Verilator guarded branches; exact-filelist and explicit-macro outcomes kept separately.",
+    "addr values and addr-prefixed strings are process-dependent and must not enter portable identity hashes.",
+    "Macro-origin AST locations can be coarse (column 0 at invocation); JSON alone did not provide a complete macro expansion/spelling source map."
+  ],
+  "macroSourceMapping": {
+    "example": {
+      "symbol": "synth_axi_lite_xbar.aw_chan_t",
+      "kind": "TypeAlias",
+      "source_file": "test/axi_synth_bench.sv",
+      "source_line": 415,
+      "source_column": 0,
+      "rawSource": "  `AXI_LITE_TYPEDEF_AW_CHAN_T(aw_chan_t, addr_t)"
+    },
+    "observation": "Macro-generated type symbols identify the invocation file/line but use column 0. This is not an exact original token position. No spelling/expansion stack was present in the probed AST JSON.",
+    "requiredBoundary": "Treat column 0 as unavailable/coarse macro origin; do not turn it into a valid 1-based column or claim exact declaration source ranges."
+  }
+}

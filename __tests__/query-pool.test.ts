@@ -196,3 +196,31 @@ describe('QueryPool', () => {
     await pool.destroy();
   });
 });
+
+it('retires a failed-opening worker and retries with a working one', async () => {
+  const workers: FakeWorker[] = [];
+  const pool = new QueryPool({ root: '/x', size: 1, createWorker: () => {
+    const w = new FakeWorker(() => ({result: ok('recovered')}), workers.length > 0);
+    workers.push(w); return w;
+  }});
+  try {
+    const result = await pool.run('codegraph_explore', {query: 'q'});
+    expect(result.content[0].text).toBe('recovered');
+    expect(workers[0].alive).toBe(false);
+    expect(pool.liveWorkers).toBe(1);
+  } finally { await pool.destroy(); }
+});
+
+it('bounds repeated open failures and completes pending work', async () => {
+  let spawned = 0;
+  const pool = new QueryPool({ root: '/x', size: 1, createWorker: () => {
+    spawned++; return new FakeWorker(() => ({result: ok('must not run')}), false);
+  }});
+  try {
+    const result = await pool.run('codegraph_explore', {query: 'q'});
+    expect(result.isError).toBe(true);
+    expect(pool.healthy).toBe(false);
+    expect(pool.liveWorkers).toBe(0);
+    expect(spawned).toBeLessThanOrEqual(12);
+  } finally { await pool.destroy(); }
+});

@@ -5,6 +5,8 @@
  */
 
 import * as fs from 'fs';
+import { HdlIndexContext } from '../hdl/index-context';
+import { loadHdlProfile } from '../hdl/profile';
 import * as fsp from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
@@ -119,6 +121,8 @@ export interface IndexResult {
  * Result of a sync operation
  */
 export interface SyncResult {
+  /** No reconciliation ran because another process owns the index lock. */
+  skippedReason?: 'locked';
   filesChecked: number;
   filesAdded: number;
   filesModified: number;
@@ -1287,20 +1291,97 @@ interface GitChanges {
  * case this cannot see (the child status that would report the deletions is gone
  * with it); a full `codegraph index` reconciles that.
  */
-export function getGitChangedFiles(rootDir: string): GitChanges | null {
+export function getGitChangedFiles(rootDir: string, sinceCommit?: string | null): GitChanges | null {
   try {
+    // `git status` only ever describes the WORKING TREE, so a change that has
+    // been committed leaves no entry and never enters the candidate set — the
+    // hash comparison in getChangedFiles is correct but is never reached for
+    // it, and `pendingChanges` reads 0 while the index is genuinely behind
+    // (#1829). `sinceCommit` — the commit the index was last brought up to
+    // date at — adds the other half: what has been committed since. Callers
+    // that hold no such stamp still get exactly what they always did, the
+    // working-tree changes.
     const changes: GitChanges = { modified: [], added: [], deleted: [] };
     // Custom extension → language overrides from the project's codegraph.json,
     // so change detection sees the same custom-extension files the full index does.
     const overrides = loadExtensionOverrides(rootDir);
-    collectGitStatus(rootDir, '', changes, overrides, loadIncludeIgnoredMatcher(rootDir), loadExcludeMatcher(rootDir));
+    collectGitStatus(rootDir, '', changes, overrides, loadIncludeIgnoredMatcher(rootDir), loadExcludeMatcher(rootDir), sinceCommit ?? undefined);
     return changes;
   } catch {
     return null;
   }
 }
 
-function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, overrides?: Record<string, Language>, includeIgnored: Ignore | null = null, exclude: Ignore | null = null): void {
+/**
+ * Metadata key: the commit the index was last brought up to date at. Written by
+ * a full index AND by every successful sync — unlike the extraction stamp, which
+ * a sync must not advance because it only touches a subset of files. This one is
+ * about the TREE, and a sync does absorb the whole diff it computed. (#1829)
+ */
+export const INDEXED_AT_COMMIT_KEY = 'indexed_at_commit';
+
+/** HEAD's commit sha, or null in a non-git repo or one with no commits yet. */
+export function getGitHeadSha(rootDir: string): string | null {
+  try {
+    return execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+    }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `A<TAB>path` / `M<TAB>path` / `D<TAB>path` lines for every path committed
+ * between `sinceCommit` and HEAD. Empty when the stamp IS HEAD, which is the
+ * common case — one cheap git call on the hot path.
+ */
+function gitCommittedChangesSince(repoDir: string, sinceCommit: string): string[] {
+  // Let getGitChangedFiles return null on failure, selecting the full scan.
+  const out = execFileSync('git', ['diff', '--name-status', '--no-renames', '-z', sinceCommit, 'HEAD', '--'], {
+    cwd: repoDir, encoding: 'utf-8', timeout: 10000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+  });
+  const fields = out.split('\0');
+  const lines: string[] = [];
+  for (let i = 0; i + 1 < fields.length; i += 2) {
+    lines.push(`${fields[i]}\t${fields[i + 1]}`);
+  }
+  return lines;
+}
+
+/**
+ * Can an INDEX trust the git fast path, given the commit it was built at?
+ *
+ * False means "fall back to the full scan" — the expensive path that compares
+ * every file on disk against the DB, and the only correct read when git cannot
+ * say what happened between the stamp and now:
+ *
+ *  - stamp present but unknown to this repo (rebase, gc, shallow clone, a stamp
+ *    from a different checkout) — history moved under the index.
+ *  - stamp absent while the repo HAS commits — an index built before stamping
+ *    existed. One full scan; the next sync stamps it and the fast path returns.
+ *
+ * A repo with NO commits keeps the fast path with or without a stamp: every
+ * file is untracked, so `git status` already sees all of them. Callers with no
+ * index behind them (the exported `getGitChangedFiles`) never ask this — a
+ * working-tree diff is the whole of what they wanted. (#1829)
+ */
+export function canTrustGitFastPath(rootDir: string, sinceCommit?: string | null): boolean {
+  const head = getGitHeadSha(rootDir);
+  if (head == null) return true; // no commits (or not a git repo — caller handles that)
+  if (!sinceCommit) return false;
+  if (sinceCommit === head) return true;
+  try {
+    execFileSync('git', ['cat-file', '-e', `${sinceCommit}^{commit}`], {
+      cwd: rootDir, encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, overrides?: Record<string, Language>, includeIgnored: Ignore | null = null, exclude: Ignore | null = null, sinceCommit?: string): void {
   const output = execFileSync(
     'git',
     // `-uall` lists individual untracked files instead of collapsing an
@@ -1325,6 +1406,39 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, over
   // parent's. (#766)
   const ig = buildDefaultIgnore(repoDir);
 
+  // One classifier for both candidate sources below, so a committed change is
+  // filtered by exactly the rules a working-tree change is (#766, #999, #1829).
+  const classify = (statusCode: string, rel: string): void => {
+    const filePath = normalizePath(prefix + rel);
+    if (!isSourceFile(filePath, overrides)) return;
+
+    if (statusCode.includes('D')) {
+      // Deletions stay unfiltered: getChangedFiles acts on one only when the
+      // path is already tracked in the DB, where removal is always correct — and
+      // that lets a newly-excluded dir's stale rows clean themselves up. (#766)
+      out.deleted.push(filePath);
+      return;
+    }
+
+    // Added (`??`) / modified files inside an excluded dir must not enter the
+    // index — match against the repo-relative path, same as the full scan. (#766)
+    if (ig.ignores(rel)) return;
+    // User `codegraph.json` `exclude` (#999) is project-root-relative, so it's
+    // matched against the full path — sync must not re-add a tracked file the
+    // full index now keeps out. Deletions above stay unfiltered so a file that
+    // WAS indexed before an exclude was added still cleans itself out.
+    if (exclude && exclude.ignores(filePath)) return;
+
+    if (statusCode === '??') {
+      out.added.push(filePath);
+    } else {
+      // M, MM, AM, A (staged), etc. — treat as modified. getChangedFiles
+      // re-decides added-vs-modified from the DB, so a committed `A` that the
+      // index never saw still lands in `added`.
+      out.modified.push(filePath);
+    }
+  };
+
   const untrackedDirs: string[] = [];
   for (const line of output.split('\n')) {
     if (line.length < 4) continue; // Minimum: "XY file"
@@ -1339,31 +1453,20 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, over
       continue;
     }
 
-    const filePath = normalizePath(prefix + rel);
-    if (!isSourceFile(filePath, overrides)) continue;
+    classify(statusCode, rel);
+  }
 
-    if (statusCode.includes('D')) {
-      // Deletions stay unfiltered: getChangedFiles acts on one only when the
-      // path is already tracked in the DB, where removal is always correct — and
-      // that lets a newly-excluded dir's stale rows clean themselves up. (#766)
-      out.deleted.push(filePath);
-      continue;
-    }
-
-    // Added (`??`) / modified files inside an excluded dir must not enter the
-    // index — match against the repo-relative path, same as the full scan. (#766)
-    if (ig.ignores(rel)) continue;
-    // User `codegraph.json` `exclude` (#999) is project-root-relative, so it's
-    // matched against the full path — sync must not re-add a tracked file the
-    // full index now keeps out. Deletions above stay unfiltered so a file that
-    // WAS indexed before an exclude was added still cleans itself out.
-    if (exclude && exclude.ignores(filePath)) continue;
-
-    if (statusCode === '??') {
-      out.added.push(filePath);
-    } else {
-      // M, MM, AM, A (staged), etc. — treat as modified
-      out.modified.push(filePath);
+  // Committed but unindexed: everything between the commit this index was last
+  // brought up to date at and HEAD. `git status` cannot see these — committing
+  // is precisely what removes a file from its output — so without this pass a
+  // `git commit` makes a real pending change read as zero (#1829). The stamp
+  // belongs to the ROOT repo, so the embedded-repo recursion below passes none.
+  if (sinceCommit) {
+    for (const line of gitCommittedChangesSince(repoDir, sinceCommit)) {
+      const tab = line.indexOf('\t');
+      if (tab < 1) continue;
+      // `A`/`M`/`D`/`T`… — padded to porcelain's two columns for `classify`.
+      classify(`${line.substring(0, tab).charAt(0)} `, normalizePath(line.substring(tab + 1)));
     }
   }
 
@@ -1643,6 +1746,9 @@ function resurrectRefFromDroppedEdge(
     fromNodeId: e.source,
     referenceName: refName,
     referenceKind: refKind,
+    ...(e.sourceLanguage === 'verilog' && Array.isArray(e.metadata?.refCandidates)
+      && e.metadata.refCandidates.every((c: unknown) => typeof c === 'string')
+      ? { candidates: e.metadata.refCandidates as string[] } : {}),
     line: e.line ?? 0,
     column: e.column ?? 0,
     filePath: e.sourceFilePath,
@@ -1655,6 +1761,51 @@ function resurrectRefFromDroppedEdge(
  */
 export class ExtractionOrchestrator {
   private rootDir: string;
+  private hdlContext: HdlIndexContext | null = null;
+  private hdlForce = false;
+  private hdlTouched = new Set<string>();
+
+  private prepareHdlContext(): void {
+    this.hdlTouched.clear();
+    const previous = this.queries.getMetadata('hdl_profile_fingerprint');
+    this.hdlContext = new HdlIndexContext(this.rootDir, !!this.queries.getMetadata('hdl_profile_name'));
+    this.hdlForce = previous !== this.hdlContext.fingerprint && (!!this.hdlContext.profile || !!this.queries.getMetadata('hdl_profile_name'));
+  }
+  private forceHdlFile(file: string): boolean { return this.hdlForce && !!this.hdlContext?.isHdl(file); }
+  private hdlSource(file: string, content: string): string {
+    if (!this.hdlContext) this.prepareHdlContext();
+    return this.hdlContext!.source(file, content);
+  }
+  commitHdlProfile(): void {
+    if (!this.hdlContext) return;
+    this.queries.setMetadata('hdl_profile_name', this.hdlContext.profile?.name ?? '');
+    this.queries.setMetadata('hdl_profile_fingerprint', this.hdlContext.fingerprint);
+    const context = JSON.parse(this.hdlContext.context());
+    if (this.hdlContext.profile) {
+      if (!this.hdlForce && this.hdlTouched.size < this.hdlContext.profile.files.length) {
+        const previous = JSON.parse(this.queries.getMetadata('hdl_profile_context') ?? '{}');
+        const units = previous.unitDiagnostics ?? {};
+        for (const file of this.hdlTouched) units[file] = context.unitDiagnostics[file] ?? [];
+        context.unitDiagnostics = units;
+        const combined = Object.values(units).flat();
+        context.diagnosticCount = combined.length;
+        context.diagnostics = combined.slice(0, 200);
+        context.incomplete = context.diagnostics.length > 0 || (!previous.unitDiagnostics && previous.incomplete === true);
+      }
+      const parseIssues = this.hdlContext.profile.files.flatMap(file => {
+        const record = this.queries.getFileByPath(file);
+        return record ? (record.errors ?? []).map(error => ({ filePath: file, ...error }))
+          : [{ filePath: file, message: 'Profile source has not been indexed.' }];
+      });
+      if (parseIssues.length) {
+        context.incomplete = true;
+        context.diagnostics = [...context.diagnostics, ...parseIssues].slice(0, 200);
+      }
+    }
+    this.queries.setMetadata('hdl_profile_context', JSON.stringify(context));
+    this.hdlForce = false;
+  }
+
   private queries: QueryBuilder;
   /**
    * Names of frameworks detected for this project, populated by indexAll().
@@ -1817,6 +1968,7 @@ export class ExtractionOrchestrator {
     // Threaded into language detection so custom-extension files load the right
     // grammar and store under the mapped language.
     const overrides = loadExtensionOverrides(this.rootDir);
+    this.prepareHdlContext();
 
     const log = verbose
       ? (msg: string) => { console.log(`[worker] ${msg}`); }
@@ -1834,7 +1986,7 @@ export class ExtractionOrchestrator {
     // attributed — these labels settle scan vs framework-detect vs grammars.
     const tScan = Date.now();
     const skipStats: ScanSkipStats = { unsupportedByExtension: new Map() };
-    const files = await scanDirectoryAsync(this.rootDir, (current, file) => {
+    const scannedFiles = await scanDirectoryAsync(this.rootDir, (current, file) => {
       onProgress?.({
         phase: 'scanning',
         current,
@@ -1842,6 +1994,15 @@ export class ExtractionOrchestrator {
         currentFile: file,
       });
     }, skipStats);
+    const files = this.hdlContext!.files(scannedFiles);
+    const allowed = new Set(files);
+    for (const tracked of this.queries.getAllFiles()) {
+      if (tracked.language !== 'verilog' || allowed.has(tracked.path)) continue;
+      const refs = this.queries.getCrossFileIncomingEdgesWithTarget(tracked.path)
+        .map(resurrectRefFromDroppedEdge).filter((ref): ref is UnresolvedReference => !!ref);
+      this.queries.deleteFile(tracked.path);
+      if (refs.length) this.queries.replaceResolutionEdgesWithUnresolvedRefs([], refs);
+    }
     if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] scan: ${Date.now() - tScan}ms (${files.length} files)`);
     /** Only meaningful when nothing was indexable — see IndexResult (#1502). */
     const skipSummary = (): Pick<IndexResult, 'filesSkippedUnsupported' | 'topUnsupportedExtensions'> => {
@@ -1971,8 +2132,9 @@ export class ExtractionOrchestrator {
      */
     const parseFile = (filePath: string, content: string): Promise<ExtractionResult> => {
       const language = detectLanguage(filePath, content, overrides);
-      if (!pool) return Promise.resolve(extractFromSource(filePath, content, language, frameworkNames));
-      return pool.requestParse({ filePath, content, language, frameworkNames });
+      const selected = this.hdlSource(filePath, content);
+      if (!pool) return Promise.resolve(extractFromSource(filePath, selected, language, frameworkNames));
+      return pool.requestParse({ filePath, content: selected, language, frameworkNames });
     };
 
     // --- Bounded rolling-window dispatch, ordered commit ---
@@ -2002,6 +2164,7 @@ export class ExtractionOrchestrator {
 
     const storeResult = async (filePath: string, content: string, stats: fs.Stats, result: ExtractionResult): Promise<void> => {
       processed++;
+      if (this.hdlContext?.profile && this.hdlContext.isHdl(filePath)) this.hdlTouched.add(filePath);
 
       // WAL hard-cap backstop: between files (never mid-transaction), pause
       // the store until the off-thread checkpoint catches up. Resolves to
@@ -2149,6 +2312,8 @@ export class ExtractionOrchestrator {
       // Read files in parallel (with path validation before any I/O)
       const fileContents = await Promise.all(
         batch.map(async (fp) => {
+          const snapshot = this.hdlContext?.sources.get(fp);
+          if (snapshot) return { filePath: fp, content: snapshot.original, stats: snapshot.stats, error: null as Error | null };
           try {
             // Indexing read: follow in-root symlinks the directory walk already
             // descended into (the `../` guard still applies) so files reached
@@ -2361,6 +2526,7 @@ export class ExtractionOrchestrator {
             .map(line => /^\s*\/\//.test(line) ? '' : line)
             .join('\n');
 
+          if (this.hdlContext?.profile && this.hdlContext.isHdl(filePath)) continue;
           let result: ExtractionResult;
           try {
             result = await parseFile(filePath, stripped);
@@ -2415,6 +2581,11 @@ export class ExtractionOrchestrator {
    * Index specific files
    */
   async indexFiles(filePaths: string[]): Promise<IndexResult> {
+    this.prepareHdlContext();
+    if (this.hdlForce && (this.hdlContext!.profile || this.queries.getMetadata('hdl_profile_name'))) {
+      throw new Error('HDL profile context changed; use sync or index to update the complete HDL selection');
+    }
+    filePaths = filePaths.filter(file => this.hdlContext!.accepts(file));
     const startTime = Date.now();
     const errors: ExtractionError[] = [];
     let filesIndexed = 0;
@@ -2474,6 +2645,9 @@ export class ExtractionOrchestrator {
         durationMs: 0,
       };
     }
+
+    const snapshot = this.hdlContext?.sources.get(relativePath);
+    if (snapshot) return this.indexFileWithContent(relativePath, snapshot.original, snapshot.stats);
 
     // Read file content and stats
     let content: string;
@@ -2560,7 +2734,7 @@ export class ExtractionOrchestrator {
     // otherwise detect on the spot so single-file re-index paths still emit
     // route nodes / middleware / etc.
     const frameworkNames = this.ensureDetectedFrameworks();
-    const result = extractFromSource(relativePath, content, language, frameworkNames);
+    const result = extractFromSource(relativePath, this.hdlSource(relativePath, content), language, frameworkNames);
 
     // Store in database
     await this.storeExtractionResult(relativePath, content, language, stats, result, createYielder());
@@ -2612,6 +2786,7 @@ export class ExtractionOrchestrator {
     // storing — persisting the transport as-is records the file as having no
     // symbols at all (#1541). No-op for already-decoded results.
     result = materializeKernelResult(result, filePath, language);
+    if (this.hdlContext?.profile && language === 'verilog') this.hdlTouched.add(filePath);
 
     // Bulk inserts run in bounded sub-transactions with a yield between, so a
     // giant generated file (tens of thousands of symbols) can't block the
@@ -2629,7 +2804,7 @@ export class ExtractionOrchestrator {
     // successful retry's symbols — a permanent empty file presented as
     // recovered (the #1541 wipe, reintroduced through the marker path).
     const existingFile = this.queries.getFileByPath(filePath);
-    if (existingFile && existingFile.contentHash === contentHash) {
+    if (existingFile && existingFile.contentHash === contentHash && !this.forceHdlFile(filePath)) {
       const existingIsMarker =
         existingFile.nodeCount === 0 && (existingFile.errors?.length ?? 0) > 0;
       const incomingHasContent = result.nodes.length > 0;
@@ -2837,6 +3012,14 @@ export class ExtractionOrchestrator {
     const reinserted: Edge[] = [];
     const resurrected: UnresolvedReference[] = [];
     for (const e of crossFileIncomingEdges) {
+      const name = e.metadata?.refName;
+      // HDL members and ports often share short names within one file.
+      // Replay their qualified reference instead of reattaching by kind/name.
+      if (e.sourceLanguage === 'verilog' && typeof name === 'string') {
+        const ref = resurrectRefFromDroppedEdge(e);
+        if (ref) resurrected.push(ref);
+        continue;
+      }
       const newTargetId = newNodesByKindName.get(`${e.targetKind}\0${e.targetName}`);
       if (newTargetId) {
         reinserted.push({ source: e.source, target: newTargetId, kind: e.kind, metadata: e.metadata, line: e.line, column: e.column, provenance: e.provenance });
@@ -2849,7 +3032,7 @@ export class ExtractionOrchestrator {
       this.queries.insertEdges(reinserted);
     }
     if (resurrected.length > 0) {
-      this.queries.insertUnresolvedRefsBatch(resurrected);
+      this.queries.replaceResolutionEdgesWithUnresolvedRefs([], resurrected);
     }
   }
 
@@ -2906,8 +3089,28 @@ export class ExtractionOrchestrator {
     // rebind to the same target is a clean no-op, but leaving the old row in
     // place for a rebind ELSEWHERE would keep both, turning drift into
     // duplication.
-    this.queries.deleteEdgesByIds(edgeIds);
-    this.queries.insertUnresolvedRefsBatch(refs);
+    this.queries.replaceResolutionEdgesWithUnresolvedRefs(edgeIds, refs);
+    return refs.length;
+  }
+
+  /** Reclassify argument accesses against current function/task formals.
+   * Existing calls are dependencies; missing signatures also need retries when
+   * a callee appears, so retain and revisit their plain argument references. */
+  resurrectHdlCallArgumentEdges(changedFilePaths: string[], removedFiles = false): number {
+    if (!changedFilePaths.length && !removedFiles) return 0;
+    const overrides = loadExtensionOverrides(this.rootDir);
+    // Removed files are absent from changedFilePaths and their language records
+    // have already cascaded; existing HDL argument sites still need declassification.
+    if (!removedFiles && !changedFilePaths.some(file => detectLanguage(file, undefined, overrides) === 'verilog')) return 0;
+    const fresh = new Set(changedFilePaths);
+    const candidates = this.queries.getHdlCallArgumentEdges().filter(e => !fresh.has(e.sourceFilePath));
+    const ids: number[] = [];
+    const refs: UnresolvedReference[] = [];
+    for (const edge of candidates) {
+      const ref = resurrectRefFromDroppedEdge(edge);
+      if (ref) { ids.push(edge.edgeId); refs.push(ref); }
+    }
+    if (refs.length) this.queries.replaceResolutionEdgesWithUnresolvedRefs(ids, refs);
     return refs.length;
   }
 
@@ -2938,6 +3141,8 @@ export class ExtractionOrchestrator {
      */
     backpressure?: () => Promise<void> | null
   ): Promise<SyncResult> {
+    this.prepareHdlContext();
+    if (this.hdlForce) scopedPaths = undefined;
     await initGrammars(); // Initialize WASM runtime (grammars loaded lazily below)
     const startTime = Date.now();
     let filesChecked = 0;
@@ -2991,7 +3196,7 @@ export class ExtractionOrchestrator {
       currentFiles = unique.filter(
         (p) =>
           isSourceFile(p, overrides) &&
-          !scope.ignores(p) &&
+          (!scope.ignores(p) || this.hdlContext!.sources.has(p)) &&
           fs.existsSync(path.join(this.rootDir, p))
       );
       trackedFiles = [];
@@ -3018,6 +3223,9 @@ export class ExtractionOrchestrator {
       trackedFiles = this.queries.getAllFiles();
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-tracked-load: ${Date.now() - tTracked}ms (${trackedFiles.length} tracked)`);
     }
+    currentFiles = scopedPaths?.length
+      ? currentFiles.filter(file => this.hdlContext!.accepts(file))
+      : this.hdlContext!.files(currentFiles);
     const currentSet = new Set(currentFiles);
     const trackedMap = new Map<string, FileRecord>();
     for (const f of trackedFiles) {
@@ -3048,7 +3256,7 @@ export class ExtractionOrchestrator {
             .map((e) => resurrectRefFromDroppedEdge(e))
             .filter((r): r is UnresolvedReference => r !== null);
           if (resurrected.length > 0) {
-            this.queries.insertUnresolvedRefsBatch(resurrected);
+            this.queries.replaceResolutionEdgesWithUnresolvedRefs([], resurrected);
           }
         }
         this.queries.deleteFile(tracked.path);
@@ -3075,7 +3283,7 @@ export class ExtractionOrchestrator {
       // change that preserves both exactly is the blind spot every mtime-based
       // incremental tool accepts; `index --force` is the escape hatch. Git bumps
       // mtime on every file it writes during checkout/merge, so pulls are caught.)
-      if (tracked) {
+      if (tracked && !this.forceHdlFile(filePath)) {
         try {
           const stat = fs.statSync(fullPath);
           if (stat.size === tracked.size && Math.floor(stat.mtimeMs) === Math.floor(tracked.modifiedAt)) {
@@ -3101,7 +3309,7 @@ export class ExtractionOrchestrator {
         filesToIndex.push(filePath);
         changedFilePaths.push(filePath);
         filesAdded++;
-      } else if (tracked.contentHash !== contentHash) {
+      } else if (tracked.contentHash !== contentHash || this.forceHdlFile(filePath)) {
         filesToIndex.push(filePath);
         changedFilePaths.push(filePath);
         filesModified++;
@@ -3176,7 +3384,20 @@ export class ExtractionOrchestrator {
    * Uses git status as a fast path when available, falling back to full scan.
    */
   getChangedFiles(): { added: string[]; modified: string[]; removed: string[] } {
-    const gitChanges = getGitChangedFiles(this.rootDir);
+    const profile = loadHdlProfile(this.rootDir).profile;
+    const profileFiles = profile ? new Set(profile.files) : null;
+    const profileOverrides = loadExtensionOverrides(this.rootDir);
+    const allowed = (file: string) => !profileFiles || detectLanguage(file, undefined, profileOverrides) !== 'verilog' || profileFiles.has(file);
+
+    // The commit this index was last brought up to date at. Absent on an index
+    // built before stamping existed — getGitChangedFiles then declines the fast
+    // path and the full scan below answers correctly, once, until a sync or a
+    // full index writes the stamp. (#1829)
+    let sinceCommit: string | null = null;
+    try { sinceCommit = this.queries.getMetadata(INDEXED_AT_COMMIT_KEY) ?? null; } catch { /* advisory */ }
+    const gitChanges = canTrustGitFastPath(this.rootDir, sinceCommit)
+      ? getGitChangedFiles(this.rootDir, sinceCommit)
+      : null;
 
     if (gitChanges) {
       // === Git fast path ===
@@ -3184,10 +3405,21 @@ export class ExtractionOrchestrator {
       const modified: string[] = [];
       const removed: string[] = [];
 
+      // One file can now reach these lists from two candidate sources — the
+      // working tree AND the committed diff — when it was committed and then
+      // edited again. It is still one changed file: counting it twice would
+      // inflate `pendingChanges` and hand sync the same path twice. (#1829)
+      // A committed deletion can have been recreated on disk. Classify that
+      // path by its current content rather than deleting its indexed symbols.
+      const seenGone = new Set<string>();
+      const seenHere = new Set<string>();
+
       // Deleted files — only report if tracked in DB
       for (const filePath of gitChanges.deleted) {
+        if (seenGone.has(filePath)) continue;
+        seenGone.add(filePath);
         const tracked = this.queries.getFileByPath(filePath);
-        if (tracked) {
+        if (tracked && !fs.existsSync(path.join(this.rootDir, filePath))) {
           removed.push(filePath);
         }
       }
@@ -3196,8 +3428,19 @@ export class ExtractionOrchestrator {
       // files stay untracked in git even after indexing, so they must be
       // hash-compared like modified files instead of always counting as added —
       // otherwise status reports them as pending forever. (See issue #206.)
-      for (const filePath of [...gitChanges.modified, ...gitChanges.added]) {
+      for (const filePath of [...gitChanges.modified, ...gitChanges.added, ...gitChanges.deleted, ...(profile?.files ?? [])]) {
+        if (!allowed(filePath)) continue;
+        if (seenHere.has(filePath)) continue;
+        seenHere.add(filePath);
         const fullPath = path.join(this.rootDir, filePath);
+        if (profileFiles?.has(filePath)) {
+          try {
+            if (fs.statSync(fullPath).size > MAX_FILE_SIZE) {
+              (this.queries.getFileByPath(filePath) ? modified : added).push(filePath);
+              continue;
+            }
+          } catch { continue; }
+        }
         let content: string;
         try {
           content = fs.readFileSync(fullPath, 'utf-8');
@@ -3220,7 +3463,8 @@ export class ExtractionOrchestrator {
     }
 
     // === Fallback: full scan (non-git project or git failure) ===
-    const currentFiles = new Set(scanDirectory(this.rootDir));
+    const scanned = scanDirectory(this.rootDir).filter(allowed);
+    const currentFiles = new Set(profile ? [...scanned, ...profile.files] : scanned);
     const trackedFiles = this.queries.getAllFiles();
 
     // Build Map for O(1) lookups
@@ -3235,7 +3479,7 @@ export class ExtractionOrchestrator {
 
     // Find removed files
     for (const tracked of trackedFiles) {
-      if (!currentFiles.has(tracked.path)) {
+      if (!currentFiles.has(tracked.path) || !fs.existsSync(path.join(this.rootDir, tracked.path))) {
         removed.push(tracked.path);
       }
     }
@@ -3243,6 +3487,14 @@ export class ExtractionOrchestrator {
     // Find added and modified files
     for (const filePath of currentFiles) {
       const fullPath = path.join(this.rootDir, filePath);
+      if (profileFiles?.has(filePath)) {
+        try {
+          if (fs.statSync(fullPath).size > MAX_FILE_SIZE) {
+            (trackedMap.has(filePath) ? modified : added).push(filePath);
+            continue;
+          }
+        } catch { continue; }
+      }
       let content: string;
       try {
         content = fs.readFileSync(fullPath, 'utf-8');

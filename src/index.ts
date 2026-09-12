@@ -28,6 +28,11 @@ import {
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
 import { QueryBuilder } from './db/queries';
+import { loadHdlProfile } from './hdl/profile';
+import { hdlDependenciesChanged } from './hdl/index-context';
+import { buildHdlProfileStatus, type HdlProfileStatus } from './hdl/status';
+import { analyzeHdlSemantics, type HdlSemanticOptions, type HdlSemanticResult } from './hdl/semantics';
+export type { HdlSemanticOptions, HdlSemanticResult } from './hdl/semantics';
 import {
   isInitialized,
   createDirectory,
@@ -40,6 +45,8 @@ import {
   IndexResult,
   SyncResult,
   extractFromSource,
+  getGitHeadSha,
+  INDEXED_AT_COMMIT_KEY,
   initGrammars,
 } from './extraction';
 import {
@@ -453,6 +460,12 @@ export class CodeGraph {
     this.db.close();
   }
 
+  /** Stop watching and drain in-flight index writes before closing SQLite. */
+  async closeAsync(): Promise<void> {
+    this.unwatch();
+    await this.indexMutex.withLock(() => this.close());
+  }
+
   /**
    * Get the project root directory
    */
@@ -476,6 +489,7 @@ export class CodeGraph {
       } catch {
         return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
       }
+      const headBeforeIndex = getGitHeadSha(this.projectRoot);
       // Defer WAL auto-checkpointing for the whole bulk run (#1231): the
       // default 1000-page interval re-writes hot pages into the main DB file
       // over and over — ~95% of all disk I/O during a bulk index, and a
@@ -692,6 +706,12 @@ export class CodeGraph {
           try {
             this.queries.setMetadata('indexed_with_version', CodeGraphPackageVersion);
             this.queries.setMetadata('indexed_with_extraction_version', String(EXTRACTION_VERSION));
+            // ...and the commit whose tree it was built from, so change
+            // detection can ask git what has been COMMITTED since — the half
+            // `git status` structurally cannot answer. (#1829)
+            if (headBeforeIndex && result.filesErrored === 0) {
+              this.queries.setMetadata(INDEXED_AT_COMMIT_KEY, headBeforeIndex);
+            }
           } catch { /* metadata is advisory — never fail an index over it */ }
         }
 
@@ -726,6 +746,7 @@ export class CodeGraph {
           }
         } catch { /* metadata is advisory — never fail an index over it */ }
 
+        if (result.success && result.filesErrored === 0) this.orchestrator.commitHdlProfile();
         return result;
       } finally {
         // Restore the auto-checkpoint interval AFTER the fold-up above so the
@@ -763,7 +784,9 @@ export class CodeGraph {
         return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
       }
       try {
-        return this.orchestrator.indexFiles(filePaths);
+        const result = await this.orchestrator.indexFiles(filePaths);
+        if (result.success && result.filesErrored === 0) this.orchestrator.commitHdlProfile();
+        return result;
       } finally {
         this.fileLock.release();
       }
@@ -780,7 +803,7 @@ export class CodeGraph {
       try {
         this.fileLock.acquire();
       } catch {
-        return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
+        return { skippedReason: 'locked', filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
       }
       // Defer WAL auto-checkpointing for the whole incremental run, exactly
       // as indexAll does for the bulk path (#1231): sync's store loop and its
@@ -822,6 +845,12 @@ export class CodeGraph {
         // timer-driven PASSIVE checkpoints ran, and a query-pool reader could
         // pin frames while the WAL grew without a bound.
         const backpressure = walValve ? () => walValve!.backpressure() : undefined;
+        // Captured BEFORE change detection runs, not after: if a commit lands
+        // while this sync is working, stamping the NEW head would claim we
+        // absorbed a diff we never looked at. Stamping the older commit only
+        // costs the next run a re-check of what it already has. (#1829)
+        const headBeforeSync = getGitHeadSha(this.projectRoot);
+
         const result = await this.orchestrator.sync(options.onProgress, options.paths, backpressure);
 
         // Fold the store phase's WAL BEFORE the post-store reads below
@@ -945,12 +974,21 @@ export class CodeGraph {
             result.definitionDelta,
             result.changedFilePaths ?? []
           );
+          // A deleted duplicate module can make an HDL binding unique again.
+          // Deletion-only syncs skip the changed-file failed-ref retry above.
+          const hdlRetry = this.queries.getRetryableFailedReferences(result.definitionDelta)
+            .filter(ref => ref.referenceName.startsWith('hdl:wildcard:') || ref.referenceName.startsWith('hdl:port-position:'));
+          if (hdlRetry.length > 0) await this.resolver.resolveAndPersistListYielding(hdlRetry);
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
             console.error(
               `[phase-timing] sync-rebind: ${Date.now() - tRebind}ms (${result.definitionDelta.length} changed names, ${rebound} edges re-opened)`
             );
           }
         }
+
+        // Access direction is signature-dependent even if no node name changed.
+        // Re-open typed and still-unclassified HDL argument sites in untouched files.
+        this.orchestrator.resurrectHdlCallArgumentEdges(result.changedFilePaths ?? [], result.filesRemoved > 0);
 
         // Orphan sweep (#1187). A resolution pass that dies mid-run — the #850
         // daemon liveness watchdog's SIGKILL (#1122), Ctrl-C, a crash — leaves
@@ -1028,6 +1066,18 @@ export class CodeGraph {
           try { this.queries.setMetadata('index_state', 'complete'); } catch { /* advisory */ }
         }
 
+        // Stamp the commit this sync brought the tree up to date at, so the
+        // NEXT change detection can see what was committed since. Only on a
+        // whole-tree sync: a `--paths` subset absorbed part of the diff, and
+        // stamping HEAD would tell the next run the rest was already indexed.
+        // Unlike the extraction stamp above, a sync DOES advance this one —
+        // it is about which tree the files came from, not which extractor
+        // produced their symbols. (#1829)
+        if (fullReconcile && headBeforeSync) {
+          try { this.queries.setMetadata(INDEXED_AT_COMMIT_KEY, headBeforeSync); } catch { /* advisory */ }
+        }
+
+        this.orchestrator.commitHdlProfile();
         return result;
       } finally {
         // Mirror indexAll's teardown: stop the valve, then restore the
@@ -1081,7 +1131,8 @@ export class CodeGraph {
         const filesChanged = result.filesAdded + result.filesModified + result.filesRemoved;
         return { filesChanged, durationMs: result.durationMs };
       },
-      options
+      options,
+      () => this.getHdlDependencyPaths()
     );
 
     return this.watcher.start();
@@ -1221,6 +1272,36 @@ export class CodeGraph {
    * index built before stamping existed (treated as stale). See
    * `extraction-version.ts` and `isIndexStale()`.
    */
+  getHdlDependencyPaths(): string[] {
+    try {
+      const context = JSON.parse(this.queries.getMetadata('hdl_profile_context') ?? 'null');
+      return Array.isArray(context?.dependencies) ? context.dependencies.flatMap((d: unknown) =>
+        d && typeof d === 'object' && 'path' in d && typeof d.path === 'string' ? [d.path] : []) : [];
+    } catch { return []; }
+  }
+
+  /** Explicit optional compiler query; source graph remains available if compilation fails. */
+  async getHdlSemantics(options: HdlSemanticOptions): Promise<HdlSemanticResult> {
+    return analyzeHdlSemantics(this.projectRoot, options, {
+      profile: () => this.getHdlProfileStatus(), stale: () => this.isIndexStale(),
+      file: file => this.queries.getFileByPath(file), nodes: file => this.queries.getNodesByFile(file),
+    });
+  }
+
+  getHdlProfileStatus(): HdlProfileStatus | null {
+    const configuration = loadHdlProfile(this.projectRoot);
+    const metadata = { name: this.queries.getMetadata('hdl_profile_name') || null,
+      fingerprint: this.queries.getMetadata('hdl_profile_fingerprint'), context: this.queries.getMetadata('hdl_profile_context') };
+    const hasHdl = this.queries.hasLanguage('verilog');
+    if (!hasHdl && !metadata.name && configuration.status === 'invalid-config') return null;
+    const status = buildHdlProfileStatus(configuration, metadata, hasHdl);
+    if (status?.state === 'matches' && status.indexed.mode === 'profile' && hdlDependenciesChanged(this.projectRoot, metadata.context)) {
+      status.state = 'mismatch'; status.mismatch = true; status.reindexRecommended = true;
+      status.diagnostics.push('HDL include dependency changed since indexing.');
+    }
+    return status;
+  }
+
   getIndexBuildInfo(): { version: string | null; extractionVersion: number | null } {
     const version = this.queries.getMetadata('indexed_with_version');
     const ev = this.queries.getMetadata('indexed_with_extraction_version');

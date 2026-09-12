@@ -12,7 +12,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { planFrontload, findIndexedSubprojectRoots, unsafeIndexRootReason, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens, PROMPT_HOOK_INJECTION_MAX, CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT, capPromptHookInjection } from '../src/directory';
+import { planFrontload, isTaskNotification, findIndexedSubprojectRoots, unsafeIndexRootReason, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens, PROMPT_HOOK_INJECTION_MAX, CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT, capPromptHookInjection } from '../src/directory';
 
 // Make the built-in exports configurable so HOME can point at a real temp
 // fixture without changing the process environment or the user's home files.
@@ -374,5 +374,17 @@ describe('prompt-hook injection cap (#1694)', () => {
     expect(out).toContain('…(truncated; call codegraph_explore for the rest)');
     // Capped body alone must still fit under the host inline limit.
     expect(out.length).toBeLessThan(CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT);
+  });
+});
+
+
+describe('system task notifications (#1832)', () => {
+  it('skips the complete system envelope', () => {
+    expect(isTaskNotification(' <task-notification>trace AuthService login flow</task-notification>\n')).toBe(true);
+  });
+  it('does not suppress a user question discussing the marker', () => {
+    expect(isTaskNotification('Why does <task-notification>trace</task-notification> trigger the hook?')).toBe(false);
+    expect(isTaskNotification('<task-notification>trace</task-notification> Explain this.')).toBe(false);
+    expect(isTaskNotification('trace AuthService login')).toBe(false);
   });
 });

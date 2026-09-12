@@ -98,24 +98,50 @@ describe.skipIf(!kernelBuilt)('kernel TS/JS extraction parity', () => {
 
   it.each([
     ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
-  ] as const)('leaves nested identifier receivers unresolved and keeps argument calls: %s (#1566)', (ext, language) => {
-    const result = assertParity(`fixture.${ext}`, `
+  ] as const)('keeps same-line accessor IDs distinct: %s (#1349)', (ext, language) => {
+    const result = assertParity(`accessors.${ext}`, `const emoji = '😀'; class Box { get value() { return read(); } set value(v) { write(v); } }`, language);
+    const accessors = result.nodes.filter(n => n.kind === 'method' && n.name === 'value');
+    expect(accessors).toHaveLength(2);
+    expect(new Set(accessors.map(n => n.id)).size).toBe(2);
+    expect(result.unresolvedReferences.find(r => r.referenceName === 'read')?.fromNodeId).toBe(accessors[0].id);
+    expect(result.unresolvedReferences.find(r => r.referenceName === 'write')?.fromNodeId).toBe(accessors[1].id);
+  });
+
+  it.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('preserves nested receivers and argument calls: %s (#1794)', (ext, language) => {
+    const source = `
 function readKey() { return 'answer'; }
 function local() {
   const values = new Map();
   return values.get(readKey());
 }
-function nested(holder) {
+function nested(holder, höldér) {
   holder.values.get(readKey());
   holder.values?.get(readKey());
   holder['values'].get(readKey());
   holder.deep.values.get(readKey());
+  holder?.values.get(readKey());
+  holder[readKey()].get(readKey());
+  holder[0].get(readKey());
+  holder["odd.key"].get(readKey());
+  holder /* receiver */.values.get(readKey());
+  höldér.values.get(readKey());
 }
-`, language);
+`;
+    const result = assertParity(`fixture.${ext}`, source, language);
+    assertParity(`fixture-crlf.${ext}`, source.replace(/\n/g, '\r\n'), language);
     const nested = result.nodes.find((n) => n.name === 'nested' && n.kind === 'function');
     expect(nested).toBeDefined();
     expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'calls' && r.fromNodeId === nested!.id)
-      .map((r) => r.referenceName)).toEqual(['readKey', 'readKey', 'readKey', 'readKey']);
+      .map((r) => r.referenceName)).toEqual([
+        'holder.values.get', 'readKey', 'holder.values.get', 'readKey',
+        "holder['values'].get", 'readKey', 'holder.deep.values.get', 'readKey',
+        'holder?.values.get', 'readKey', 'holder[readKey()].get', 'readKey', 'readKey',
+        'holder[0].get', 'readKey', 'holder["odd.key"].get', 'readKey',
+        'holder /* receiver */.values.get', 'readKey',
+        'höldér.values.get', 'readKey',
+      ]);
     expect(result.unresolvedReferences.some((r) => r.referenceName === 'values.get')).toBe(true);
   });
 

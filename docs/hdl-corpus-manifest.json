@@ -1,0 +1,2745 @@
+{
+  "schema_version": 1,
+  "purpose": "Воспроизводимые source snapshots для проверки CodeGraph HDL; исходники не распространяются.",
+  "hash_algorithm": "sha256",
+  "corpora": [
+    {
+      "id": "dual-uart",
+      "provenance": {
+        "remote": "https://github.com/danusha2345/2uart_to_1uart.git",
+        "revision": "afce8bf3392da11ed76dacd122e32b1fdb1aee6f",
+        "revision_matches_all_captured_sources": true,
+        "sources_not_matching_revision": [],
+        "working_tree_matches_all_captured_sources": true,
+        "sources_not_matching_origin_working_tree": [],
+        "note": "revision — доказательство только совпавших blobs; остальные файлы закреплены отдельными SHA-256"
+      },
+      "license": {
+        "status": "unknown; license file отсутствует в исходном repo root",
+        "evidence": [],
+        "source_spdx": []
+      },
+      "source_files": [
+        {
+          "path": "src/fifo.v",
+          "sha256": "c65ecffaec1fca5e7af55e4ae58071ec79299bff504c22fd54d4a87dc0660641",
+          "bytes": 2366
+        },
+        {
+          "path": "src/top.v",
+          "sha256": "1868c1182f158533c439804d084a65cda98b6d56d6c25783f4f226a62762ab2c",
+          "bytes": 7818
+        },
+        {
+          "path": "src/uart_arbiter.v",
+          "sha256": "61255fb82edcfd2b8ce5b72a175fcdecc7682c772d9247d6a379b74e8e242aaf",
+          "bytes": 5505
+        },
+        {
+          "path": "src/uart_rx.v",
+          "sha256": "19c2a62de05955a6f6efefab307d7f5d38d15e14f6bf7d72a43bbb66840d7a17",
+          "bytes": 4458
+        },
+        {
+          "path": "src/uart_rx_autobaud.v",
+          "sha256": "ea8bbd813e26807e33f7ec3151041b757063e79523196e077253aeaf2aa74838",
+          "bytes": 10553
+        },
+        {
+          "path": "src/uart_tx.v",
+          "sha256": "67a1c828fc32fb81ed8c763c7230ff0c495662003d5d2796a9c1c0253d09cbdb",
+          "bytes": 3248
+        },
+        {
+          "path": "tb/tb_fifo.v",
+          "sha256": "8f4c07e1c8aa2f16104faebe806747fda0fe9339c0ef7d3cdc9bab7e7e0b008f",
+          "bytes": 11580
+        },
+        {
+          "path": "tb/tb_top.v",
+          "sha256": "a9634eea196f2959f17f918d657a1829ac73b8259fad9b74b9dce7e92c2dc7ee",
+          "bytes": 13085
+        },
+        {
+          "path": "tb/tb_uart_arbiter.v",
+          "sha256": "310be4640f501fe0be8471245e233dd8f2bfe4c6a36a61e642408eed1771cc1a",
+          "bytes": 12202
+        },
+        {
+          "path": "tb/tb_uart_rx.v",
+          "sha256": "c55dfe4809564da5debcaf14f90d87553c9c27841dc11cd0cbdbf4a029884e02",
+          "bytes": 12179
+        },
+        {
+          "path": "tb/tb_uart_tx.v",
+          "sha256": "ca2311337d7d403b4e5d246e662045d712316816fedd6f7ea2390b9eff1145ac",
+          "bytes": 8715
+        }
+      ],
+      "source_inventory_sha256": "a71a77bfc592f9ed723de5fd50edad8e3d7e0bca5e71016d68bc62f491cc5adc",
+      "build_evidence": [
+        {
+          "path": "build.tcl",
+          "sha256": "fc60c215a602884aeb12a62affaede928d8d3e73d27eee4f4d4aaf4062517130",
+          "bytes": 829,
+          "command_evidence": [
+            {
+              "line": 8,
+              "text": "add_file -type verilog \"src/top.v\""
+            },
+            {
+              "line": 9,
+              "text": "add_file -type verilog \"src/uart_rx.v\""
+            },
+            {
+              "line": 10,
+              "text": "add_file -type verilog \"src/uart_tx.v\""
+            },
+            {
+              "line": 11,
+              "text": "add_file -type verilog \"src/fifo.v\""
+            },
+            {
+              "line": 12,
+              "text": "add_file -type verilog \"src/uart_arbiter.v\""
+            },
+            {
+              "line": 15,
+              "text": "add_file -type cst \"src/tangprimer25k.cst\""
+            },
+            {
+              "line": 16,
+              "text": "add_file -type sdc \"src/fpga_project.sdc\""
+            },
+            {
+              "line": 19,
+              "text": "set_option -top_module top"
+            }
+          ],
+          "declared_files": [
+            "src/top.v",
+            "src/uart_rx.v",
+            "src/uart_tx.v",
+            "src/fifo.v",
+            "src/uart_arbiter.v",
+            "src/tangprimer25k.cst",
+            "src/fpga_project.sdc"
+          ],
+          "matches_revision": true
+        },
+        {
+          "path": "fpga_primer.gprj",
+          "sha256": "febe843273bf64f873911a108fc9e02f5e69afa9cf34cecb508c73201a924c7a",
+          "bytes": 873,
+          "command_evidence": [],
+          "declared_files": [
+            "src/fifo.v",
+            "src/top.v",
+            "src/uart_arbiter.v",
+            "src/uart_rx.v",
+            "src/uart_rx_autobaud.v",
+            "src/uart_tx.v",
+            "src/tangprimer25k.cst",
+            "src/fpga_project.sdc"
+          ],
+          "matches_revision": true
+        },
+        {
+          "path": "tb/Makefile",
+          "sha256": "87026066eb3e5f371c0cb9047ab65b73c49f9f5c830a4d6ea28eb3c02a0e1bb3",
+          "bytes": 991,
+          "command_evidence": [
+            {
+              "line": 19,
+              "text": "$(IV) -o $(SIMDIR)/tb_fifo tb_fifo.v $(SRCDIR)/fifo.v"
+            },
+            {
+              "line": 23,
+              "text": "$(IV) -o $(SIMDIR)/tb_uart_rx tb_uart_rx.v $(SRCDIR)/uart_rx.v"
+            },
+            {
+              "line": 27,
+              "text": "$(IV) -o $(SIMDIR)/tb_uart_tx tb_uart_tx.v $(SRCDIR)/uart_tx.v"
+            },
+            {
+              "line": 31,
+              "text": "$(IV) -o $(SIMDIR)/tb_uart_arbiter tb_uart_arbiter.v $(SRCDIR)/uart_arbiter.v"
+            },
+            {
+              "line": 35,
+              "text": "$(IV) -o $(SIMDIR)/tb_top tb_top.v $(SRCS)"
+            }
+          ],
+          "matches_revision": true
+        }
+      ],
+      "validation_profiles": [
+        {
+          "name": "synth-source",
+          "purpose": "source-graph validation; не compiler/elaboration closure",
+          "files": [
+            "src/fifo.v",
+            "src/top.v",
+            "src/uart_arbiter.v",
+            "src/uart_rx.v",
+            "src/uart_rx_autobaud.v",
+            "src/uart_tx.v"
+          ],
+          "top_modules": [
+            "top"
+          ],
+          "top_evidence": [
+            {
+              "kind": "module",
+              "name": "top",
+              "path": "src/top.v",
+              "line": 20
+            }
+          ],
+          "include_dirs": [],
+          "defines": {}
+        },
+        {
+          "name": "sim-source",
+          "purpose": "source-graph validation; не compiler/elaboration closure",
+          "files": [
+            "src/fifo.v",
+            "src/top.v",
+            "src/uart_arbiter.v",
+            "src/uart_rx.v",
+            "src/uart_rx_autobaud.v",
+            "src/uart_tx.v",
+            "tb/tb_fifo.v",
+            "tb/tb_top.v",
+            "tb/tb_uart_arbiter.v",
+            "tb/tb_uart_rx.v",
+            "tb/tb_uart_tx.v"
+          ],
+          "top_modules": [
+            "tb_top"
+          ],
+          "top_evidence": [
+            {
+              "kind": "module",
+              "name": "tb_top",
+              "path": "tb/tb_top.v",
+              "line": 3
+            }
+          ],
+          "include_dirs": [],
+          "defines": {}
+        }
+      ],
+      "literal_include_references": [],
+      "missing_dependencies": {
+        "literal_includes": [],
+        "imported_packages_without_declaration": [],
+        "symbols": [],
+        "locked_external_packages": [],
+        "build_recipe_files_not_in_corpus": [
+          {
+            "path": "src/tangprimer25k.cst",
+            "evidence": "build.tcl"
+          },
+          {
+            "path": "src/fpga_project.sdc",
+            "evidence": "build.tcl"
+          },
+          {
+            "path": "src/tangprimer25k.cst",
+            "evidence": "fpga_primer.gprj"
+          },
+          {
+            "path": "src/fpga_project.sdc",
+            "evidence": "fpga_primer.gprj"
+          }
+        ],
+        "scope": "Только наблюдаемые literal includes/imports и перечисленные primitives; conditional branches не вычисляются. Не доказательство полной build closure."
+      }
+    },
+    {
+      "id": "card-reader",
+      "provenance": {
+        "remote": "https://github.com/danusha2345/fpga_tang_nano_9k_card_reader.git",
+        "revision": "dac04f8ec82869d3e358d3c4eefb7c168d42546f",
+        "revision_matches_all_captured_sources": false,
+        "sources_not_matching_revision": [
+          "sim/tb_uart_bridge_debug.v"
+        ],
+        "working_tree_matches_all_captured_sources": true,
+        "sources_not_matching_origin_working_tree": [],
+        "note": "revision — доказательство только совпавших blobs; остальные файлы закреплены отдельными SHA-256"
+      },
+      "license": {
+        "status": "unknown; license file отсутствует в исходном repo root",
+        "evidence": [],
+        "source_spdx": []
+      },
+      "source_files": [
+        {
+          "path": "sim/pll_stub.v",
+          "sha256": "0192791254f9c3215e1471afe211df1c199d2fa25bec674022a615405b3e06b9",
+          "bytes": 381
+        },
+        {
+          "path": "sim/tb_crc16.v",
+          "sha256": "553ebf3f32407ea54a53e471aa61ec5a7ee1e1a15918c765e12e9e22b4fa142c",
+          "bytes": 3093
+        },
+        {
+          "path": "sim/tb_crc7.v",
+          "sha256": "24d01ad415f665fdc7eac4fd4791728d0f5914d387b2388f6b261836d6115308",
+          "bytes": 3704
+        },
+        {
+          "path": "sim/tb_crc8.v",
+          "sha256": "91955aa6b6b7eecbb9973968f44c4b99b91c0c86a76d14d98de18d808916d0b0",
+          "bytes": 3760
+        },
+        {
+          "path": "sim/tb_emmc_cmd.v",
+          "sha256": "75e9d48be8d4baf8cea3a431e5a3670fa6a2c47ff80e8b1a5d5c7ce816cd0c89",
+          "bytes": 11899
+        },
+        {
+          "path": "sim/tb_emmc_cmd_crc_verify.v",
+          "sha256": "2498a5dd9d8c396421639c770124dd20f6e222c118a03582396fb222bcf946e2",
+          "bytes": 9231
+        },
+        {
+          "path": "sim/tb_emmc_controller.v",
+          "sha256": "7981f493e0292155e1de00b81ccf4988b280541234de20a9a0531290e6a28e0b",
+          "bytes": 123856
+        },
+        {
+          "path": "sim/tb_emmc_dat.v",
+          "sha256": "bda8e0aa2a2d5e1bf00418019b7a33274227c74eac8fd9f8aba786629a8fcd22",
+          "bytes": 23900
+        },
+        {
+          "path": "sim/tb_emmc_init.v",
+          "sha256": "d081bded8352a2571c996b1793dea2a7a6e7704bc5fd0c3a177d959787eef55d",
+          "bytes": 13724
+        },
+        {
+          "path": "sim/tb_led_status.v",
+          "sha256": "a147c7fe76605ab3b9de7694aeabb4599981cf096f648cd379025fd87f08346d",
+          "bytes": 6202
+        },
+        {
+          "path": "sim/tb_sector_buf.v",
+          "sha256": "91317266d09fb3d9f04716f50d4ab0094803089959d115d8c02c0f7fd087cb82",
+          "bytes": 5479
+        },
+        {
+          "path": "sim/tb_sector_buf_wr.v",
+          "sha256": "c824a359034bae978cbb79601c1f187b699dd44e51483046af7e63144f1fe850",
+          "bytes": 6581
+        },
+        {
+          "path": "sim/tb_top_integration.v",
+          "sha256": "0a18c66bd1470a1f8ab6d06debc0ba041247e19a5043e7ec994eff02580201e6",
+          "bytes": 27724
+        },
+        {
+          "path": "sim/tb_uart_bridge.v",
+          "sha256": "e0a3da7e2dd07f032e6853a68850e66b79532775cb85af35a1f73211bc7dd4b8",
+          "bytes": 97128
+        },
+        {
+          "path": "sim/tb_uart_bridge_debug.v",
+          "sha256": "fb613fbdf492ec1078d0e4c370f27d18d23089d62b4a6523197b51e4205ab959",
+          "bytes": 56
+        },
+        {
+          "path": "sim/tb_uart_loopback.v",
+          "sha256": "b3bc3ccfbf1027283caf4c38d1c64d881cd905eb690c172e94a36b8d54c2636f",
+          "bytes": 4755
+        },
+        {
+          "path": "sim/tb_uart_rx.v",
+          "sha256": "b2ca6aee7434d78b70ada6c1509e6d3c3f768b62e0f136575c9ad10f7baed2f5",
+          "bytes": 7493
+        },
+        {
+          "path": "sim/tb_uart_tx.v",
+          "sha256": "7f1694bde8defdaa081425495eb9cfa08e98bb27104143b2725f97065d354bd6",
+          "bytes": 6631
+        },
+        {
+          "path": "src/crc8.v",
+          "sha256": "fd17a37ac67e64efd43e77223da726bd1709a5bb4569e5ba86ef82dd80ebb5f7",
+          "bytes": 1359
+        },
+        {
+          "path": "src/emmc_cmd.v",
+          "sha256": "ae1b940eca8b5d0544d88d396bfb5d08b769515d2d43433807e432da97c7339a",
+          "bytes": 10333
+        },
+        {
+          "path": "src/emmc_controller.v",
+          "sha256": "0cfd8305dea92c4092e1f104d0d30afbb3ec897be4ae56d3a3b841da536d2596",
+          "bytes": 56612
+        },
+        {
+          "path": "src/emmc_crc16.v",
+          "sha256": "ecec53c91b36f19bfa14ab812cc64124e138dda9fee9ce880ea02f51ba4094dd",
+          "bytes": 1283
+        },
+        {
+          "path": "src/emmc_crc7.v",
+          "sha256": "02dfdf52d5d31a5ae3fa42f5259e985367eeb8d4356a09621173ae9f954e8bc8",
+          "bytes": 876
+        },
+        {
+          "path": "src/emmc_dat.v",
+          "sha256": "a3115db1e40b3dfdbfb38576b1b313fe7cc798f05a6f61cf33e5df565d7de1f3",
+          "bytes": 14746
+        },
+        {
+          "path": "src/emmc_init.v",
+          "sha256": "4e40f0e6c0ba032572f1c23080b828815b19e0758af81af4f47ca39a6e2bd659",
+          "bytes": 12607
+        },
+        {
+          "path": "src/led_status.v",
+          "sha256": "2a985147d102321e2e6d4f38416454789bc990d76afb95e63e66c4621239c10f",
+          "bytes": 2592
+        },
+        {
+          "path": "src/pll.v",
+          "sha256": "93beb7e1d457ea058d9c36b18f0a0f9b74610065e7790e620b86804a60b97a4b",
+          "bytes": 1657
+        },
+        {
+          "path": "src/sector_buf.v",
+          "sha256": "81f15d0757f1b5a44d580182df54b5e64acd5b46986e57ab7827384dd2c0cc5e",
+          "bytes": 1825
+        },
+        {
+          "path": "src/sector_buf_wr.v",
+          "sha256": "df3a8f302fdfcbfdc8e3508b5a43e42a609582d970befc46623dca09c17b00cd",
+          "bytes": 1978
+        },
+        {
+          "path": "src/top.v",
+          "sha256": "c4ae822abf6d2f0606c3212d3ce0a07fe0f6e94641ca0031f20fbe13c05b6e47",
+          "bytes": 7984
+        },
+        {
+          "path": "src/uart_bridge.v",
+          "sha256": "c271dd7a7d319c56060e142c9d9a4f714b03c042b040bda911a5f568af944481",
+          "bytes": 44080
+        },
+        {
+          "path": "src/uart_rx.v",
+          "sha256": "143a1d6075ba1ee0cff545a10e9fe481344be8a33d4805e87298269ed4703fc9",
+          "bytes": 3724
+        },
+        {
+          "path": "src/uart_tx.v",
+          "sha256": "4cc042e5556e61766a586ab7ce1315a673bbc0abdf4586158dbf1f6542266086",
+          "bytes": 2940
+        }
+      ],
+      "source_inventory_sha256": "99ddbc05f3e9045f39ab3f94bda8586fd3fd1e6a71f5ba36c05bd554d2fbb1d9",
+      "build_evidence": [
+        {
+          "path": "build.tcl",
+          "sha256": "63d49dee2411d6e198808e0fa78f6ba606a3c7266f568caebd82368aa79bf7bf",
+          "bytes": 213,
+          "command_evidence": [],
+          "declared_files": [],
+          "matches_revision": true
+        },
+        {
+          "path": "card_reader.gprj",
+          "sha256": "30547212c14daa7ac56f47c4aaf80ab538998508822a4c13968ce6144e90499d",
+          "bytes": 1428,
+          "command_evidence": [],
+          "declared_files": [
+            "src/top.v",
+            "src/pll.v",
+            "src/led_status.v",
+            "src/uart_rx.v",
+            "src/uart_tx.v",
+            "src/uart_bridge.v",
+            "src/crc8.v",
+            "src/emmc_crc7.v",
+            "src/emmc_crc16.v",
+            "src/emmc_cmd.v",
+            "src/emmc_dat.v",
+            "src/emmc_init.v",
+            "src/emmc_controller.v",
+            "src/sector_buf.v",
+            "src/sector_buf_wr.v",
+            "src/tangnano9k.cst",
+            "src/tangnano9k.sdc"
+          ],
+          "matches_revision": true
+        },
+        {
+          "path": "sim/Makefile",
+          "sha256": "cf03029a0536957b62eebb764a87b62562b8d11d04f75570a00fbd9d98244f6d",
+          "bytes": 3887,
+          "command_evidence": [
+            {
+              "line": 4,
+              "text": "IFLAGS = -I $(SRCDIR) -g2005-sv"
+            },
+            {
+              "line": 36,
+              "text": "@$(IVERILOG) $(IFLAGS) -o sim_crc8 tb_crc8.v $(SRC_CRC8) && $(VVP) sim_crc8"
+            },
+            {
+              "line": 39,
+              "text": "@$(IVERILOG) $(IFLAGS) -o sim_crc7 tb_crc7.v $(SRC_CRC7) && $(VVP) sim_crc7"
+            },
+            {
+              "line": 42,
+              "text": "@$(IVERILOG) $(IFLAGS) -o sim_crc16 tb_crc16.v $(SRC_CRC16) && $(VVP) sim_crc16"
+            },
+            {
+              "line": 45,
+              "text": "@$(IVERILOG) $(IFLAGS) -o sim_uart_tx tb_uart_tx.v $(SRC_UART_TX) && $(VVP) sim_uart_tx"
+            },
+            {
+              "line": 48,
+              "text": "@$(IVERILOG) $(IFLAGS) -o sim_uart_rx tb_uart_rx.v $(SRC_UART_RX) && $(VVP) sim_uart_rx"
+            },
+            {
+              "line": 51,
+              "text": "@$(IVERILOG) $(IFLAGS) -o sim_uart_loopback tb_uart_loopback.v $(SRC_UART_TX) $(SRC_UART_RX) && $(VVP) sim_uart_loopback"
+            },
+            {
+              "line": 54,
+              "text": "@$(IVERILOG) $(IFLAGS) -o sim_sector_buf tb_sector_buf.v $(SRC_SECTOR_BUF) && $(VVP) sim_sector_buf"
+            },
+            {
+              "line": 57,
+              "text": "@$(IVERILOG) $(IFLAGS) -o sim_sector_buf_wr tb_sector_buf_wr.v $(SRC_SECTOR_BUF_WR) && $(VVP) sim_sector_buf_wr"
+            },
+            {
+              "line": 60,
+              "text": "@$(IVERILOG) $(IFLAGS) -o sim_emmc_cmd tb_emmc_cmd.v $(SRC_EMMC_CMD) && $(VVP) sim_emmc_cmd"
+            },
+            {
+              "line": 63,
+              "text": "@$(IVERILOG) $(IFLAGS) -o sim_emmc_cmd_crc_verify tb_emmc_cmd_crc_verify.v $(SRC_EMMC_CMD) && $(VVP) sim_emmc_cmd_crc_verify"
+            },
+            {
+              "line": 66,
+              "text": "@$(IVERILOG) $(IFLAGS) -o sim_uart_bridge tb_uart_bridge.v $(SRC_UART_BRIDGE) && $(VVP) sim_uart_bridge"
+            },
+            {
+              "line": 69,
+              "text": "@$(IVERILOG) $(IFLAGS) -o sim_emmc_controller tb_emmc_controller.v $(SRC_EMMC_CTRL) && $(VVP) sim_emmc_controller"
+            },
+            {
+              "line": 72,
+              "text": "@$(IVERILOG) $(IFLAGS) -o sim_emmc_dat tb_emmc_dat.v $(SRC_EMMC_DAT) && $(VVP) sim_emmc_dat"
+            },
+            {
+              "line": 75,
+              "text": "@$(IVERILOG) $(IFLAGS) -o sim_emmc_init tb_emmc_init.v $(SRC_EMMC_INIT) && $(VVP) sim_emmc_init"
+            },
+            {
+              "line": 78,
+              "text": "@$(IVERILOG) $(IFLAGS) -o sim_led_status tb_led_status.v $(SRC_LED_STATUS) && $(VVP) sim_led_status"
+            },
+            {
+              "line": 81,
+              "text": "@$(IVERILOG) $(IFLAGS) -o sim_top_integration tb_top_integration.v $(SRC_TOP_INTEGRATION) && $(VVP) sim_top_integration"
+            },
+            {
+              "line": 84,
+              "text": "waves: IFLAGS += -DVCD_DUMP"
+            }
+          ],
+          "matches_revision": true
+        }
+      ],
+      "validation_profiles": [
+        {
+          "name": "synth-source",
+          "purpose": "source-graph validation; не compiler/elaboration closure",
+          "files": [
+            "src/crc8.v",
+            "src/emmc_cmd.v",
+            "src/emmc_controller.v",
+            "src/emmc_crc16.v",
+            "src/emmc_crc7.v",
+            "src/emmc_dat.v",
+            "src/emmc_init.v",
+            "src/led_status.v",
+            "src/pll.v",
+            "src/sector_buf.v",
+            "src/sector_buf_wr.v",
+            "src/top.v",
+            "src/uart_bridge.v",
+            "src/uart_rx.v",
+            "src/uart_tx.v"
+          ],
+          "top_modules": [
+            "top"
+          ],
+          "top_evidence": [
+            {
+              "kind": "module",
+              "name": "top",
+              "path": "src/top.v",
+              "line": 4
+            }
+          ],
+          "include_dirs": [],
+          "defines": {}
+        },
+        {
+          "name": "sim-integration-source",
+          "purpose": "source-graph validation; не compiler/elaboration closure",
+          "files": [
+            "sim/pll_stub.v",
+            "sim/tb_crc16.v",
+            "sim/tb_crc7.v",
+            "sim/tb_crc8.v",
+            "sim/tb_emmc_cmd.v",
+            "sim/tb_emmc_cmd_crc_verify.v",
+            "sim/tb_emmc_controller.v",
+            "sim/tb_emmc_dat.v",
+            "sim/tb_emmc_init.v",
+            "sim/tb_led_status.v",
+            "sim/tb_sector_buf.v",
+            "sim/tb_sector_buf_wr.v",
+            "sim/tb_top_integration.v",
+            "sim/tb_uart_bridge.v",
+            "sim/tb_uart_bridge_debug.v",
+            "sim/tb_uart_loopback.v",
+            "sim/tb_uart_rx.v",
+            "sim/tb_uart_tx.v",
+            "src/crc8.v",
+            "src/emmc_cmd.v",
+            "src/emmc_controller.v",
+            "src/emmc_crc16.v",
+            "src/emmc_crc7.v",
+            "src/emmc_dat.v",
+            "src/emmc_init.v",
+            "src/led_status.v",
+            "src/pll.v",
+            "src/sector_buf.v",
+            "src/sector_buf_wr.v",
+            "src/top.v",
+            "src/uart_bridge.v",
+            "src/uart_rx.v",
+            "src/uart_tx.v"
+          ],
+          "top_modules": [
+            "tb_top_integration"
+          ],
+          "top_evidence": [
+            {
+              "kind": "module",
+              "name": "tb_top_integration",
+              "path": "sim/tb_top_integration.v",
+              "line": 7
+            }
+          ],
+          "include_dirs": [
+            "src"
+          ],
+          "defines": {}
+        }
+      ],
+      "literal_include_references": [],
+      "missing_dependencies": {
+        "literal_includes": [],
+        "imported_packages_without_declaration": [],
+        "symbols": [
+          {
+            "name": "rPLL",
+            "kind": "vendor primitive",
+            "path": "src/pll.v",
+            "line": 13,
+            "evidence": "rPLL #( ... ); declaration отсутствует в corpus"
+          }
+        ],
+        "locked_external_packages": [],
+        "build_recipe_files_not_in_corpus": [
+          {
+            "path": "src/tangnano9k.cst",
+            "evidence": "card_reader.gprj"
+          },
+          {
+            "path": "src/tangnano9k.sdc",
+            "evidence": "card_reader.gprj"
+          }
+        ],
+        "scope": "Только наблюдаемые literal includes/imports и перечисленные primitives; conditional branches не вычисляются. Не доказательство полной build closure."
+      }
+    },
+    {
+      "id": "axi",
+      "provenance": {
+        "remote": "https://github.com/pulp-platform/axi.git",
+        "revision": "da8793b0e3f14c9186c94fac9ed6ec06375c254e",
+        "revision_matches_all_captured_sources": true,
+        "sources_not_matching_revision": [],
+        "working_tree_matches_all_captured_sources": true,
+        "sources_not_matching_origin_working_tree": [],
+        "note": "revision — доказательство только совпавших blobs; остальные файлы закреплены отдельными SHA-256"
+      },
+      "license": {
+        "status": "evidence-found",
+        "evidence": [
+          {
+            "path": "LICENSE",
+            "sha256": "6527a46225891b976fa94f634f6ee0cd22e1c7129d6f11c5c98c997627625fc7",
+            "bytes": 10329,
+            "first_line": "SOLDERPAD HARDWARE LICENSE version 0.51",
+            "matches_revision": true
+          }
+        ],
+        "source_spdx": [
+          {
+            "path": "src/axi_burst_splitter_gran.sv",
+            "line": 3,
+            "identifier": "SHL-0.51"
+          },
+          {
+            "path": "src/axi_inval_filter.sv",
+            "line": 3,
+            "identifier": "SHL-0.51"
+          },
+          {
+            "path": "src/axi_sim_mem.sv",
+            "line": 2,
+            "identifier": "SHL-0.51"
+          },
+          {
+            "path": "src/axi_throttle.sv",
+            "line": 3,
+            "identifier": "SHL-0.51"
+          },
+          {
+            "path": "test/tb_axi_bus_compare.sv",
+            "line": 2,
+            "identifier": "SHL-0.51"
+          },
+          {
+            "path": "test/tb_axi_sim_mem.sv",
+            "line": 2,
+            "identifier": "SHL-0.51"
+          },
+          {
+            "path": "test/tb_axi_slave_compare.sv",
+            "line": 2,
+            "identifier": "SHL-0.51"
+          }
+        ]
+      },
+      "source_files": [
+        {
+          "path": "include/axi/assign.svh",
+          "sha256": "8d6aa6ecc736515db75bb691e377b64753310c442e107757b99caabdf043b6cd",
+          "bytes": 45647
+        },
+        {
+          "path": "include/axi/port.svh",
+          "sha256": "3fa0ccc81d775c439e47d2c01dd62be79a9cfd8f2f84a05a1ef90b9cf3fb43d1",
+          "bytes": 6805
+        },
+        {
+          "path": "include/axi/typedef.svh",
+          "sha256": "63f095042c9183f977e95307df14ce0baa06b71121491a380af289f8b309482c",
+          "bytes": 14574
+        },
+        {
+          "path": "src/axi_atop_filter.sv",
+          "sha256": "06b31710ae8a80ecbba58a75b13d1441f9d14b26d5d425a52adaa94ff7f2b156",
+          "bytes": 16551
+        },
+        {
+          "path": "src/axi_burst_splitter.sv",
+          "sha256": "02de2c32cd5b1c933c2ee8700470664af60fb0916c6844962d307d575edce961",
+          "bytes": 3759
+        },
+        {
+          "path": "src/axi_burst_splitter_gran.sv",
+          "sha256": "0e265a8358a2b1a3eef0c564d29308c9e5cd4bacd33dee17475acd5dfb7fc44b",
+          "bytes": 25804
+        },
+        {
+          "path": "src/axi_burst_unwrap.sv",
+          "sha256": "d6e57c5a5c4c0c53a89074983cbb4aad82cf4987d3a181b0455ba2e8ecf58922",
+          "bytes": 23938
+        },
+        {
+          "path": "src/axi_bus_compare.sv",
+          "sha256": "588aabe3bf1fd0741adcdb64e0e8fffc3f0a2292070a7b2b09e7db7393a65d59",
+          "bytes": 30822
+        },
+        {
+          "path": "src/axi_cdc.sv",
+          "sha256": "060f775eb544a092bb4c8d0b5168a6cb7b0cd6128f1e4a35477918426c6307d2",
+          "bytes": 9778
+        },
+        {
+          "path": "src/axi_cdc_dst.sv",
+          "sha256": "19e0b9500ab384588bbcea09516e5cccb66c20fefef9cacc93e4213b19f67bdf",
+          "bytes": 11399
+        },
+        {
+          "path": "src/axi_cdc_src.sv",
+          "sha256": "3cdf744af8a126660dc5e57372112c09b86f162740b61d00041d1a27d95fcd6a",
+          "bytes": 11409
+        },
+        {
+          "path": "src/axi_chan_compare.sv",
+          "sha256": "94b632f82a8201357c838cd46837a861dc90a14f247035477cc3516e774c8688",
+          "bytes": 13598
+        },
+        {
+          "path": "src/axi_cut.sv",
+          "sha256": "a455ac4f0ca4d88c289579bdcb37d75c6e76c665d3aace6b8d5cd9f2272f1696",
+          "bytes": 9826
+        },
+        {
+          "path": "src/axi_delayer.sv",
+          "sha256": "84acca0fe4cbdddf39dce37f5bc65a308d7b98291398c2a2006db8f2217eee03",
+          "bytes": 6822
+        },
+        {
+          "path": "src/axi_demux.sv",
+          "sha256": "db364dfa2ce938cfb1f88c5eb6887fedfed16a1f2021446b7890dc625a864b09",
+          "bytes": 11244
+        },
+        {
+          "path": "src/axi_demux_id_counters.sv",
+          "sha256": "05a5b6b1cc6c481f8e3c8b1e785a4082831f0a3ab242cf266fd390447d018c0e",
+          "bytes": 6086
+        },
+        {
+          "path": "src/axi_demux_simple.sv",
+          "sha256": "f0beea644e9b4721046e27fb1179e9a1f481a1767a52092fe5ee7a1b3d287d08",
+          "bytes": 22427
+        },
+        {
+          "path": "src/axi_dumper.sv",
+          "sha256": "972066185a4cf52e0a53eef13b237306763451b8c98a6fb63fe49c01bb1b0d3f",
+          "bytes": 7872
+        },
+        {
+          "path": "src/axi_dw_converter.sv",
+          "sha256": "d3abfa0da05869740f6d8cfac03b36fd6719ac2eb9d46e6b9836346cbb1d00f1",
+          "bytes": 8249
+        },
+        {
+          "path": "src/axi_dw_downsizer.sv",
+          "sha256": "abf1d10e0cbf2441cd77c00673d80d475298f2f30bedd55851deace9fac34c71",
+          "bytes": 35248
+        },
+        {
+          "path": "src/axi_dw_upsizer.sv",
+          "sha256": "f728f9236365d1851149b6eeaa72aa51d5aa74a14499ef44689f495c72ecb220",
+          "bytes": 26506
+        },
+        {
+          "path": "src/axi_err_slv.sv",
+          "sha256": "1dedd614d1404367d1d8e555877d0421e3747ec9bca2f644d6b3587f9e37579d",
+          "bytes": 8461
+        },
+        {
+          "path": "src/axi_fifo.sv",
+          "sha256": "3d22b3749fd1328936544656765af3535eff751681dae26196fb54b1647d28dd",
+          "bytes": 8576
+        },
+        {
+          "path": "src/axi_fifo_delay_dyn.sv",
+          "sha256": "3c13123f7551d1c756eba5245ae4e3ba10c470d592e64a4fc2d5aa12e620aff7",
+          "bytes": 17017
+        },
+        {
+          "path": "src/axi_from_mem.sv",
+          "sha256": "6a176c4ae7af3fa0abc307e34273c9a09534975ca1ef096ebbee60dd5768476f",
+          "bytes": 5080
+        },
+        {
+          "path": "src/axi_id_prepend.sv",
+          "sha256": "190b2f3fd55ab509dc25d4495694c3f5c4e91cbed8b79727b5543ef017a3348e",
+          "bytes": 8634
+        },
+        {
+          "path": "src/axi_id_remap.sv",
+          "sha256": "50e88ebc9c439a0e9dda1674235f256c216d3db687d22a9bab2b66447275bd36",
+          "bytes": 32201
+        },
+        {
+          "path": "src/axi_id_serialize.sv",
+          "sha256": "f500626fb5d99694756adca33a79dedf8dd849840858ad086077097acb984ebe",
+          "bytes": 19672
+        },
+        {
+          "path": "src/axi_interleaved_xbar.sv",
+          "sha256": "c3673eab4a89a5c9395d75630e959c5fda383653a21d0970d2347a25f80c8959",
+          "bytes": 19157
+        },
+        {
+          "path": "src/axi_intf.sv",
+          "sha256": "85dea3129f2f63e6a06d1ee210fa1b76a689694e9f9fb5c489948d7eefd1c0ac",
+          "bytes": 21878
+        },
+        {
+          "path": "src/axi_inval_filter.sv",
+          "sha256": "1c452951b0d7c7821a788f156495d924d396df6c865b7f9bd93f74ae6970840a",
+          "bytes": 4375
+        },
+        {
+          "path": "src/axi_isolate.sv",
+          "sha256": "f92d7c6933e171d3ca216a591f6423d9f50aa05bed2c1bde508b76c5957bd39b",
+          "bytes": 17062
+        },
+        {
+          "path": "src/axi_iw_converter.sv",
+          "sha256": "f41dc7d8f462e247f8fcdfb0a2950852514ab649d5d397a7ced611efd3fc58d5",
+          "bytes": 16599
+        },
+        {
+          "path": "src/axi_join.sv",
+          "sha256": "e57c5738000347f3e0d2e912712ccb54e06643a5ea7b011d065817a48683f145",
+          "bytes": 1264
+        },
+        {
+          "path": "src/axi_lfsr.sv",
+          "sha256": "b88cf99560cf7c14374921417fd2415d4bb2d9b32cc20f0696e56d005067030f",
+          "bytes": 4130
+        },
+        {
+          "path": "src/axi_lite_demux.sv",
+          "sha256": "e20cca5d5268ff3388b436f491a4c373d1fa9e2523efd57f6b73e9788ea91e2d",
+          "bytes": 22980
+        },
+        {
+          "path": "src/axi_lite_dw_converter.sv",
+          "sha256": "99ecbc98581388c3d3ebb99abc71cb3bf4ff3cc0b6de09cdd14b4e81885d115a",
+          "bytes": 24607
+        },
+        {
+          "path": "src/axi_lite_from_mem.sv",
+          "sha256": "664abf80248bb45350241f8643abe9e50b0b574a0a80a01f4cfa902d26a1d8d2",
+          "bytes": 10765
+        },
+        {
+          "path": "src/axi_lite_join.sv",
+          "sha256": "17a0027d23a5255986f9fd11d215d1c1a47fe721a38b08429de29ef75154ff2b",
+          "bytes": 1175
+        },
+        {
+          "path": "src/axi_lite_lfsr.sv",
+          "sha256": "6ef7dc962291bafec0eed8e6566672fdf582ef89ff165530e40b5b1851e8db55",
+          "bytes": 7586
+        },
+        {
+          "path": "src/axi_lite_mailbox.sv",
+          "sha256": "c675e0a57dc8c8a72b72d2d1391a1ad83f26db4eabd5a816bc07ef6f49660c5e",
+          "bytes": 25943
+        },
+        {
+          "path": "src/axi_lite_mux.sv",
+          "sha256": "99b9a4a22c525f04ed10a06d9f9e59b80588226d9847976db6be5ded27e02f42",
+          "bytes": 20356
+        },
+        {
+          "path": "src/axi_lite_regs.sv",
+          "sha256": "7ba5e7228a8fca0057db362ae615b7c2c94fb384b5cd791746b0c38f3a7fef08",
+          "bytes": 20729
+        },
+        {
+          "path": "src/axi_lite_to_apb.sv",
+          "sha256": "41331a2316772913895d766d16c3ff77b2afc925f4090e857f9f76052be60f65",
+          "bytes": 20598
+        },
+        {
+          "path": "src/axi_lite_to_axi.sv",
+          "sha256": "f35ec83cc2168898f880e5edfcdf3a4ef323b11216f540233062cd27a692cb86",
+          "bytes": 4846
+        },
+        {
+          "path": "src/axi_lite_xbar.sv",
+          "sha256": "8aeb4125cef42a9ab0840bf26d57b356f4da1bdf617ce2702d92efa1058a7978",
+          "bytes": 13522
+        },
+        {
+          "path": "src/axi_modify_address.sv",
+          "sha256": "22515ac952bd92a0e81851609bc22cefd3889e1f264147bac0533d4a0adf18a9",
+          "bytes": 5597
+        },
+        {
+          "path": "src/axi_multicut.sv",
+          "sha256": "2dd21cd472c3c448a35814b8614ad68eb7c8ab7a00ed89935371a2f5de5bec68",
+          "bytes": 8070
+        },
+        {
+          "path": "src/axi_mux.sv",
+          "sha256": "d1635b12affe48d6e2c6f4c9fc7eebcd92e21c523e33162c98b3b21c2df49416",
+          "bytes": 25317
+        },
+        {
+          "path": "src/axi_pkg.sv",
+          "sha256": "244bd5cb3c5bc58d786f2ed2f5eeefd910c4fe03a175f4a2888c6a2ea1c430dc",
+          "bytes": 26577
+        },
+        {
+          "path": "src/axi_rw_join.sv",
+          "sha256": "b455707ff04a857c639f4b4887cda412a6c3f40d111d1ee5ffe5f5c8aa74fc04",
+          "bytes": 3821
+        },
+        {
+          "path": "src/axi_rw_split.sv",
+          "sha256": "d195730fde3fac4a84e090ff585ca584a21f8f905c3a10809ddb378ba28a4554",
+          "bytes": 3787
+        },
+        {
+          "path": "src/axi_serializer.sv",
+          "sha256": "b7fa3204c22220ab78873e9f52a91610502aeeeb3c8c2999f528c1b337d66a6d",
+          "bytes": 11184
+        },
+        {
+          "path": "src/axi_sim_mem.sv",
+          "sha256": "d88c7ef7ecbec85400ba16085e82172b180425ebe6827da41d18f5b045ea53a1",
+          "bytes": 19882
+        },
+        {
+          "path": "src/axi_slave_compare.sv",
+          "sha256": "75d1db7a303de753378443356cbc9eb07e248635744e6e28727cdaa642eddf0b",
+          "bytes": 6743
+        },
+        {
+          "path": "src/axi_test.sv",
+          "sha256": "d3ae3f15f0d674bdb322f9059a527b40e016b3733d7fd15f79414b87206c3648",
+          "bytes": 98306
+        },
+        {
+          "path": "src/axi_throttle.sv",
+          "sha256": "6597927f36422027a0f0d4d40d0a43721323b5f9e2428fc4ee903226e6491471",
+          "bytes": 3959
+        },
+        {
+          "path": "src/axi_to_axi_lite.sv",
+          "sha256": "1bc5aa798bac4b2b45718f899f3f78bfc5cc8146940051548ab402603de9290a",
+          "bytes": 12810
+        },
+        {
+          "path": "src/axi_to_detailed_mem.sv",
+          "sha256": "3e0d8a4407a9d6d2ca16dedfee68e9602493e4461d4bc0c09e10d02ec7137730",
+          "bytes": 39381
+        },
+        {
+          "path": "src/axi_to_mem.sv",
+          "sha256": "e6a282e8ce5c1d0e22a9e5971bbcc4d993d93fcdacbceb1b747473c9e8c35f32",
+          "bytes": 9034
+        },
+        {
+          "path": "src/axi_to_mem_banked.sv",
+          "sha256": "0ab535d90af7db007b02659f58a5f6fd6f13ca04cc89490f9b8856e39f923000",
+          "bytes": 18128
+        },
+        {
+          "path": "src/axi_to_mem_interleaved.sv",
+          "sha256": "60e8e75ec95f823f938ac09e803240cdfffd08a14203471e664c5ee847c02512",
+          "bytes": 15304
+        },
+        {
+          "path": "src/axi_to_mem_split.sv",
+          "sha256": "108a3cfc207c8627784770e08c705039832987b38f94938d27d6c64cced5ee35",
+          "bytes": 11641
+        },
+        {
+          "path": "src/axi_xbar.sv",
+          "sha256": "05987e199be28cf5716b934d3466a8deeee737ae6361d3a1394d64784e8cc78c",
+          "bytes": 11764
+        },
+        {
+          "path": "src/axi_xbar_unmuxed.sv",
+          "sha256": "2d5e1d4671f32520870360eb6e591856329f7ca02aa2f47dc76d6dc0a4b008bc",
+          "bytes": 12733
+        },
+        {
+          "path": "src/axi_xp.sv",
+          "sha256": "69d0fa49e07da874ef2b01ddc4545fab4a95f63b45dd0e1adb4bc666d75474b2",
+          "bytes": 10783
+        },
+        {
+          "path": "src/axi_zero_mem.sv",
+          "sha256": "c538ca77f2ec568ca6ea13d73ce29666891639ba368b43a1529143486e62a2ae",
+          "bytes": 4450
+        },
+        {
+          "path": "test/axi_synth_bench.sv",
+          "sha256": "02eecbcad3eeeb9ed8b37331ebb787a144cdcf5c1b93ab3af07fa7ff929d73ab",
+          "bytes": 25391
+        },
+        {
+          "path": "test/tb_axi_addr_test.sv",
+          "sha256": "315d3cbe9bf26134a73b41b8dbbef31a2f80fb2862d890b2be0968225cf577f5",
+          "bytes": 9058
+        },
+        {
+          "path": "test/tb_axi_atop_filter.sv",
+          "sha256": "a806df31dc31a8746121b9688983ae8ec0b1e94e731aaab81bb64ef39834ccdb",
+          "bytes": 15180
+        },
+        {
+          "path": "test/tb_axi_bus_compare.sv",
+          "sha256": "c0a42c7dda5a2fc8d51608b0b2e9a426ea3c34c93049c4ff4f7b658f6289fdee",
+          "bytes": 9500
+        },
+        {
+          "path": "test/tb_axi_cdc.sv",
+          "sha256": "bc36d363ceddd3156ae8a7fce4c46a4dac49ecbf19b2bf10559a90c1116e69a5",
+          "bytes": 8103
+        },
+        {
+          "path": "test/tb_axi_delayer.sv",
+          "sha256": "5ce2ad513fc8c76d9a2a4098900058049ad40491047c36a3833eb497f97eca14",
+          "bytes": 3836
+        },
+        {
+          "path": "test/tb_axi_dw_downsizer.sv",
+          "sha256": "2f80754761bb47d955b9e4912add2f01a9c2dd0abbaa0278c14ed08549cd83f3",
+          "bytes": 6642
+        },
+        {
+          "path": "test/tb_axi_dw_pkg.sv",
+          "sha256": "f45f79f43af06dcb71c5d2de6a2ae4038099fd4e11e2b77d15fb0dff333b1f91",
+          "bytes": 58508
+        },
+        {
+          "path": "test/tb_axi_dw_upsizer.sv",
+          "sha256": "80acb9719529c8534eef6ca1e681cb85ae89e66d17a8edd7b614986807f8e337",
+          "bytes": 5264
+        },
+        {
+          "path": "test/tb_axi_fifo.sv",
+          "sha256": "7bd8ec77c32dfaecc48f0475626b5ad8e429aac082b69c273eb693cebf7f6643",
+          "bytes": 6405
+        },
+        {
+          "path": "test/tb_axi_isolate.sv",
+          "sha256": "f9418ccd6f3a0dcf781f10a7924cfb886eebaac16a767524281a9e3fe6fa6f4a",
+          "bytes": 7293
+        },
+        {
+          "path": "test/tb_axi_iw_converter.sv",
+          "sha256": "921cdecc94fa443998e3c7154877ebc76ad628d0bae4b80e5a30e08a737cb415",
+          "bytes": 18357
+        },
+        {
+          "path": "test/tb_axi_lite_dw_converter.sv",
+          "sha256": "31b322a59a38e4390ad4edd46ab599f57ba96f938ce59603abe41c0efe5a2e06",
+          "bytes": 16953
+        },
+        {
+          "path": "test/tb_axi_lite_mailbox.sv",
+          "sha256": "5e5834904ee4f714f7c89d2794efd757c92e511193491ccfcd6df69da59563ea",
+          "bytes": 24929
+        },
+        {
+          "path": "test/tb_axi_lite_regs.sv",
+          "sha256": "e2a424715aba1f8f947f2fdb032be91fe470987aa971c8edf9da3a087585eecb",
+          "bytes": 13642
+        },
+        {
+          "path": "test/tb_axi_lite_to_apb.sv",
+          "sha256": "24744a16f55c6a922ecaa76f825a2d3df38fb8300c1f8eb3ef3a7c8e772470f7",
+          "bytes": 8825
+        },
+        {
+          "path": "test/tb_axi_lite_to_axi.sv",
+          "sha256": "6035670ef97817b351436f55473bcc72adb09da021955995db28f26a9f54ee90",
+          "bytes": 2943
+        },
+        {
+          "path": "test/tb_axi_lite_xbar.sv",
+          "sha256": "47bd0677132c4fa71b87c6e7f4aefb12c5f435fa74a24f3be18ce1188ee95260",
+          "bytes": 7021
+        },
+        {
+          "path": "test/tb_axi_modify_address.sv",
+          "sha256": "65cccd135d5b7db41adb37f47d8880b229570d40bf58b5717fa7d25f38f39479",
+          "bytes": 7662
+        },
+        {
+          "path": "test/tb_axi_serializer.sv",
+          "sha256": "afab1d86fd257ca9df3ebd9fc529af422f4f7e7d8879a463db0f7e7b09e1be17",
+          "bytes": 9850
+        },
+        {
+          "path": "test/tb_axi_sim_mem.sv",
+          "sha256": "7dc4f46e6d7400a89f311290726f69b2777884c175ecda2914ee4cf1a9c7df9a",
+          "bytes": 5276
+        },
+        {
+          "path": "test/tb_axi_slave_compare.sv",
+          "sha256": "40bf717f48bd8da7d7eea51b88ac573218aecb40b1a2fa43d3075e2ecebe4ac4",
+          "bytes": 7162
+        },
+        {
+          "path": "test/tb_axi_to_axi_lite.sv",
+          "sha256": "cdfaa127ba98f5a3ea385dbf4a56c9c093fb62e8ad752c9210c6ff1c5ee62985",
+          "bytes": 4853
+        },
+        {
+          "path": "test/tb_axi_to_mem_banked.sv",
+          "sha256": "3d8e72be993d42d53d4133c07d3a55560389e2122430feb417a1b66c96825df7",
+          "bytes": 13881
+        },
+        {
+          "path": "test/tb_axi_xbar.sv",
+          "sha256": "50c6cb7221ae88732dbcd43d7c68808693bf8e4e4a6863847ec476d9f8c2236f",
+          "bytes": 21907
+        },
+        {
+          "path": "test/tb_axi_xbar_pkg.sv",
+          "sha256": "a5476a02f5942ce8dd46efd54f9e58c34ac8834e14e37a822cc5fc565f92ad50",
+          "bytes": 20617
+        }
+      ],
+      "source_inventory_sha256": "12c988383b5ca8496055c17a0f9b5818ca19f3446051b1de0d5b6427909d8a0d",
+      "build_evidence": [
+        {
+          "path": "Bender.yml",
+          "sha256": "106b0e6b9306d0ea329ba09dce792c022a857acc76c72c480e80a00016148a52",
+          "bytes": 4193,
+          "command_evidence": [],
+          "matches_revision": true
+        },
+        {
+          "path": "Bender.lock",
+          "sha256": "6e91c73d8fdb6f6a2280e433dc4a3879adc0bb09969c09049d65564c0c50d223",
+          "bytes": 659,
+          "command_evidence": [],
+          "matches_revision": true
+        },
+        {
+          "path": "Makefile",
+          "sha256": "78b15816eb04acb7acc355fb1d5faff9239b11aca91b580968a4c94f270d6956",
+          "bytes": 2578,
+          "command_evidence": [],
+          "matches_revision": true
+        },
+        {
+          "path": "src_files.yml",
+          "sha256": "31ac5d14288b6a2bb628631282d8913463e76cfd54dd3c8e0e443c86dbf5a080",
+          "bytes": 2265,
+          "command_evidence": [],
+          "matches_revision": true
+        },
+        {
+          "path": "axi.core",
+          "sha256": "f139a36b04f07f92119a5a0be2ae117998ded05d3fb77aee7da822f6e3b4cdf0",
+          "bytes": 7862,
+          "command_evidence": [],
+          "matches_revision": true
+        }
+      ],
+      "validation_profiles": [
+        {
+          "name": "normal-source",
+          "purpose": "source-graph validation; не compiler/elaboration closure",
+          "files": [
+            "src/axi_pkg.sv",
+            "src/axi_interleaved_xbar.sv"
+          ],
+          "top_modules": [
+            "axi_interleaved_xbar"
+          ],
+          "top_evidence": [
+            {
+              "kind": "module",
+              "name": "axi_interleaved_xbar",
+              "path": "src/axi_interleaved_xbar.sv",
+              "line": 19
+            }
+          ],
+          "include_dirs": [
+            "include"
+          ],
+          "defines": {}
+        },
+        {
+          "name": "vcs-source",
+          "purpose": "source-graph validation; не compiler/elaboration closure",
+          "files": [
+            "src/axi_pkg.sv",
+            "src/axi_interleaved_xbar.sv"
+          ],
+          "top_modules": [
+            "axi_interleaved_xbar"
+          ],
+          "top_evidence": [
+            {
+              "kind": "module",
+              "name": "axi_interleaved_xbar",
+              "path": "src/axi_interleaved_xbar.sv",
+              "line": 19
+            }
+          ],
+          "include_dirs": [
+            "include"
+          ],
+          "defines": {
+            "VCS": "1"
+          }
+        }
+      ],
+      "literal_include_references": [
+        {
+          "path": "src/axi_atop_filter.sv",
+          "line": 373,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_atop_filter.sv",
+          "line": 375,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_burst_splitter.sv",
+          "line": 1,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_burst_splitter_gran.sv",
+          "line": 1,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_burst_splitter_gran.sv",
+          "line": 11,
+          "request": "common_cells/registers.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_burst_unwrap.sv",
+          "line": 1,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_burst_unwrap.sv",
+          "line": 18,
+          "request": "common_cells/registers.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_bus_compare.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_cdc.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_cdc.sv",
+          "line": 125,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_cdc.sv",
+          "line": 127,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_cdc_dst.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_cdc_dst.sv",
+          "line": 17,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_cdc_src.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_cdc_src.sv",
+          "line": 17,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_cut.sv",
+          "line": 124,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_cut.sv",
+          "line": 126,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_delayer.sv",
+          "line": 127,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_delayer.sv",
+          "line": 129,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_demux.sv",
+          "line": 1,
+          "request": "common_cells/assertions.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_demux.sv",
+          "line": 18,
+          "request": "common_cells/registers.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_demux.sv",
+          "line": 217,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_demux.sv",
+          "line": 220,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_demux_id_counters.sv",
+          "line": 1,
+          "request": "common_cells/registers.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_demux_simple.sv",
+          "line": 1,
+          "request": "common_cells/assertions.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_demux_simple.sv",
+          "line": 18,
+          "request": "common_cells/registers.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_demux_simple.sv",
+          "line": 19,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_dumper.sv",
+          "line": 158,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_dumper.sv",
+          "line": 161,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_dw_converter.sv",
+          "line": 112,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_dw_converter.sv",
+          "line": 116,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_fifo.sv",
+          "line": 161,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_fifo.sv",
+          "line": 163,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_fifo_delay_dyn.sv",
+          "line": 1,
+          "request": "common_cells/registers.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_fifo_delay_dyn.sv",
+          "line": 15,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_fifo_delay_dyn.sv",
+          "line": 16,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_from_mem.sv",
+          "line": 1,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_id_remap.sv",
+          "line": 1,
+          "request": "common_cells/registers.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_id_remap.sv",
+          "line": 650,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_id_remap.sv",
+          "line": 653,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_id_serialize.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_id_serialize.sv",
+          "line": 17,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_interleaved_xbar.sv",
+          "line": 311,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_interleaved_xbar.sv",
+          "line": 313,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_intf.sv",
+          "line": 354,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_inval_filter.sv",
+          "line": 39,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_inval_filter.sv",
+          "line": 42,
+          "request": "common_cells/registers.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_isolate.sv",
+          "line": 1,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_isolate.sv",
+          "line": 17,
+          "request": "common_cells/registers.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_isolate.sv",
+          "line": 411,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_iw_converter.sv",
+          "line": 1,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_iw_converter.sv",
+          "line": 256,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_join.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_lfsr.sv",
+          "line": 1,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_lite_demux.sv",
+          "line": 1,
+          "request": "common_cells/registers.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_lite_demux.sv",
+          "line": 490,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_lite_demux.sv",
+          "line": 492,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_lite_dw_converter.sv",
+          "line": 1,
+          "request": "common_cells/registers.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_lite_dw_converter.sv",
+          "line": 491,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_lite_dw_converter.sv",
+          "line": 494,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_lite_from_mem.sv",
+          "line": 92,
+          "request": "common_cells/registers.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_lite_join.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_lite_lfsr.sv",
+          "line": 1,
+          "request": "common_cells/registers.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_lite_mailbox.sv",
+          "line": 1,
+          "request": "common_cells/registers.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_lite_mailbox.sv",
+          "line": 196,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_lite_mailbox.sv",
+          "line": 553,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_lite_mux.sv",
+          "line": 1,
+          "request": "common_cells/registers.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_lite_mux.sv",
+          "line": 463,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_lite_mux.sv",
+          "line": 466,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_lite_regs.sv",
+          "line": 1,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_lite_regs.sv",
+          "line": 16,
+          "request": "common_cells/registers.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_lite_regs.sv",
+          "line": 411,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_lite_to_apb.sv",
+          "line": 1,
+          "request": "common_cells/registers.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_lite_to_apb.sv",
+          "line": 383,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_lite_to_apb.sv",
+          "line": 385,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_lite_xbar.sv",
+          "line": 1,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_lite_xbar.sv",
+          "line": 237,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_modify_address.sv",
+          "line": 83,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_modify_address.sv",
+          "line": 86,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_multicut.sv",
+          "line": 91,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_multicut.sv",
+          "line": 93,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_mux.sv",
+          "line": 1,
+          "request": "common_cells/assertions.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_mux.sv",
+          "line": 26,
+          "request": "common_cells/registers.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_mux.sv",
+          "line": 505,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_mux.sv",
+          "line": 508,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_rw_join.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_rw_join.sv",
+          "line": 16,
+          "request": "common_cells/assertions.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_rw_split.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_rw_split.sv",
+          "line": 16,
+          "request": "common_cells/assertions.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_serializer.sv",
+          "line": 1,
+          "request": "common_cells/registers.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_serializer.sv",
+          "line": 221,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_serializer.sv",
+          "line": 223,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_sim_mem.sv",
+          "line": 1,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_sim_mem.sv",
+          "line": 351,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_slave_compare.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_to_axi_lite.sv",
+          "line": 249,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_to_axi_lite.sv",
+          "line": 252,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_to_detailed_mem.sv",
+          "line": 1,
+          "request": "common_cells/registers.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_to_detailed_mem.sv",
+          "line": 601,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_to_detailed_mem.sv",
+          "line": 604,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_to_mem.sv",
+          "line": 1,
+          "request": "common_cells/registers.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "src/axi_to_mem.sv",
+          "line": 116,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_to_mem.sv",
+          "line": 119,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_to_mem_banked.sv",
+          "line": 308,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_to_mem_banked.sv",
+          "line": 311,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_to_mem_interleaved.sv",
+          "line": 259,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_to_mem_interleaved.sv",
+          "line": 261,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_to_mem_split.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_to_mem_split.sv",
+          "line": 164,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_xbar.sv",
+          "line": 154,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_xbar.sv",
+          "line": 156,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_xp.sv",
+          "line": 1,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_xp.sv",
+          "line": 166,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "src/axi_xp.sv",
+          "line": 168,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "src/axi_zero_mem.sv",
+          "line": 1,
+          "request": "common_cells/registers.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "test/axi_synth_bench.sv",
+          "line": 294,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "test/axi_synth_bench.sv",
+          "line": 402,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_addr_test.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_atop_filter.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_bus_compare.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_bus_compare.sv",
+          "line": 8,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_cdc.sv",
+          "line": 1,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_cdc.sv",
+          "line": 16,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_delayer.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_dw_downsizer.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_dw_upsizer.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_fifo.sv",
+          "line": 1,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_fifo.sv",
+          "line": 15,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_isolate.sv",
+          "line": 1,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_isolate.sv",
+          "line": 16,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_iw_converter.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_iw_converter.sv",
+          "line": 16,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_lite_dw_converter.sv",
+          "line": 1,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_lite_dw_converter.sv",
+          "line": 17,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_lite_mailbox.sv",
+          "line": 1,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_lite_mailbox.sv",
+          "line": 34,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_lite_regs.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_lite_to_apb.sv",
+          "line": 1,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_lite_to_apb.sv",
+          "line": 20,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_lite_to_axi.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_lite_xbar.sv",
+          "line": 1,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_lite_xbar.sv",
+          "line": 22,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_modify_address.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_modify_address.sv",
+          "line": 15,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_serializer.sv",
+          "line": 1,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_serializer.sv",
+          "line": 16,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_sim_mem.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_sim_mem.sv",
+          "line": 9,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_slave_compare.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_slave_compare.sv",
+          "line": 10,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_to_axi_lite.sv",
+          "line": 1,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_to_mem_banked.sv",
+          "line": 1,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_to_mem_banked.sv",
+          "line": 16,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_to_mem_banked.sv",
+          "line": 17,
+          "request": "common_cells/registers.svh",
+          "resolved_candidates": []
+        },
+        {
+          "path": "test/tb_axi_xbar.sv",
+          "line": 1,
+          "request": "axi/typedef.svh",
+          "resolved_candidates": [
+            "include/axi/typedef.svh"
+          ]
+        },
+        {
+          "path": "test/tb_axi_xbar.sv",
+          "line": 24,
+          "request": "axi/assign.svh",
+          "resolved_candidates": [
+            "include/axi/assign.svh"
+          ]
+        }
+      ],
+      "missing_dependencies": {
+        "literal_includes": [
+          {
+            "path": "src/axi_burst_splitter_gran.sv",
+            "line": 11,
+            "request": "common_cells/registers.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_burst_unwrap.sv",
+            "line": 18,
+            "request": "common_cells/registers.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_demux.sv",
+            "line": 1,
+            "request": "common_cells/assertions.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_demux.sv",
+            "line": 18,
+            "request": "common_cells/registers.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_demux_id_counters.sv",
+            "line": 1,
+            "request": "common_cells/registers.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_demux_simple.sv",
+            "line": 1,
+            "request": "common_cells/assertions.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_demux_simple.sv",
+            "line": 18,
+            "request": "common_cells/registers.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_fifo_delay_dyn.sv",
+            "line": 1,
+            "request": "common_cells/registers.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_id_remap.sv",
+            "line": 1,
+            "request": "common_cells/registers.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_inval_filter.sv",
+            "line": 42,
+            "request": "common_cells/registers.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_isolate.sv",
+            "line": 17,
+            "request": "common_cells/registers.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_lite_demux.sv",
+            "line": 1,
+            "request": "common_cells/registers.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_lite_dw_converter.sv",
+            "line": 1,
+            "request": "common_cells/registers.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_lite_from_mem.sv",
+            "line": 92,
+            "request": "common_cells/registers.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_lite_lfsr.sv",
+            "line": 1,
+            "request": "common_cells/registers.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_lite_mailbox.sv",
+            "line": 1,
+            "request": "common_cells/registers.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_lite_mux.sv",
+            "line": 1,
+            "request": "common_cells/registers.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_lite_regs.sv",
+            "line": 16,
+            "request": "common_cells/registers.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_lite_to_apb.sv",
+            "line": 1,
+            "request": "common_cells/registers.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_mux.sv",
+            "line": 1,
+            "request": "common_cells/assertions.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_mux.sv",
+            "line": 26,
+            "request": "common_cells/registers.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_rw_join.sv",
+            "line": 16,
+            "request": "common_cells/assertions.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_rw_split.sv",
+            "line": 16,
+            "request": "common_cells/assertions.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_serializer.sv",
+            "line": 1,
+            "request": "common_cells/registers.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_to_detailed_mem.sv",
+            "line": 1,
+            "request": "common_cells/registers.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_to_mem.sv",
+            "line": 1,
+            "request": "common_cells/registers.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "src/axi_zero_mem.sv",
+            "line": 1,
+            "request": "common_cells/registers.svh",
+            "resolved_candidates": []
+          },
+          {
+            "path": "test/tb_axi_to_mem_banked.sv",
+            "line": 17,
+            "request": "common_cells/registers.svh",
+            "resolved_candidates": []
+          }
+        ],
+        "imported_packages_without_declaration": [
+          {
+            "package": "cc_pkg",
+            "path": "src/axi_dw_downsizer.sv",
+            "line": 54
+          },
+          {
+            "package": "cc_pkg",
+            "path": "src/axi_dw_upsizer.sv",
+            "line": 56
+          },
+          {
+            "package": "cc_pkg",
+            "path": "src/axi_interleaved_xbar.sv",
+            "line": 20
+          },
+          {
+            "package": "cc_pkg",
+            "path": "src/axi_interleaved_xbar.sv",
+            "line": 316
+          },
+          {
+            "package": "cc_pkg",
+            "path": "src/axi_inval_filter.sv",
+            "line": 38
+          },
+          {
+            "package": "cc_pkg",
+            "path": "src/axi_xbar.sv",
+            "line": 19
+          },
+          {
+            "package": "cc_pkg",
+            "path": "src/axi_xbar.sv",
+            "line": 159
+          },
+          {
+            "package": "cc_pkg",
+            "path": "src/axi_xbar_unmuxed.sv",
+            "line": 19
+          },
+          {
+            "package": "cc_pkg",
+            "path": "src/axi_xp.sv",
+            "line": 171
+          },
+          {
+            "package": "rand_id_queue_pkg",
+            "path": "test/tb_axi_atop_filter.sv",
+            "line": 45
+          },
+          {
+            "package": "rand_verif_pkg",
+            "path": "test/tb_axi_atop_filter.sv",
+            "line": 46
+          }
+        ],
+        "symbols": [],
+        "locked_external_packages": [
+          {
+            "name": "common_cells",
+            "revision": "03d98106aa19952a10360d2230def85144a0008b",
+            "remote": "https://github.com/pulp-platform/common_cells.git",
+            "status": "external; не включён в source inventory",
+            "evidence": "Bender.lock"
+          },
+          {
+            "name": "common_verification",
+            "revision": "fb1885f48ea46164a10568aeff51884389f67ae3",
+            "remote": "https://github.com/pulp-platform/common_verification.git",
+            "status": "external; не включён в source inventory",
+            "evidence": "Bender.lock"
+          },
+          {
+            "name": "tech_cells_generic",
+            "revision": "3a3de73632a06826b1bd9c65a0a2e92b32016845",
+            "remote": "https://github.com/pulp-platform/tech_cells_generic.git",
+            "status": "external; не включён в source inventory",
+            "evidence": "Bender.lock"
+          }
+        ],
+        "build_recipe_files_not_in_corpus": [],
+        "scope": "Только наблюдаемые literal includes/imports и перечисленные primitives; conditional branches не вычисляются. Не доказательство полной build closure."
+      }
+    }
+  ]
+}

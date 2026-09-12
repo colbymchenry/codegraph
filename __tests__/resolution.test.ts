@@ -23,16 +23,17 @@ describe('Resolution Module', () => {
   let cg: CodeGraph;
 
   beforeEach(() => {
+    cg = undefined!;
     // Create temp directory
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-resolution-test-'));
   });
 
   afterEach(() => {
     // Clean up
-    if (cg) {
-      cg.destroy();
-    } else if (fs.existsSync(tempDir)) {
-      fs.rmSync(tempDir, { recursive: true });
+    try { cg?.destroy(); }
+    finally {
+      cg = undefined!;
+      if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
     }
   });
 
@@ -1294,7 +1295,7 @@ class Widget { public: Widget(int a, int b) {} };
 int runStack(int a, int b) { Calculator calc(0); return calc.add(a, b); }
 int runBrace() { Widget w{1, 2}; return 0; }
 int runHeap(int a, int b) { Calculator* c = new Calculator(0); return c->add(a, b); }
-void noise() { int x(5); int y{6}; Calculator deferred; }
+void noise() { int x(5); int y{6}; extern Calculator deferred; }
 `
       );
       cg = await CodeGraph.init(tempDir, { index: true });
@@ -1313,8 +1314,8 @@ void noise() { int x(5); int y{6}; Calculator deferred; }
       expect(instTargets('runBrace').map((n) => `${n.kind}:${n.name}`)).toContain('class:Widget');
       // Heap still works (regression guard).
       expect(instTargets('runHeap').map((n) => `${n.kind}:${n.name}`)).toContain('class:Calculator');
-      // Primitives (`int x(0)`/`int y{6}`) and bare default construction
-      // (`Calculator deferred;`) must NOT mint an instantiates edge.
+      // Primitives and extern declarations do not construct an object.
+      // Actual default construction is covered by cpp-remaining-regressions.
       expect(instTargets('noise')).toHaveLength(0);
     });
 
@@ -2316,6 +2317,30 @@ func main() {
   });
 
   describe('Local-variable receiver-type inference (#1108)', () => {
+    it.each(['ts', 'tsx', 'js', 'jsx'])('keeps compound receiver evidence without guessing targets — %s (#1794)', async (ext) => {
+      fs.writeFileSync(path.join(tempDir, `holder.${ext}`), 'export const holder = { values: new Map() };');
+      const receivers = [
+        'holder?.values', 'holder[readKey()]', 'holder[0]', 'holder["odd.key"]',
+        'holder /* receiver */.values', 'höldér.values', 'imported.values', 'data.holder.values',
+      ];
+      fs.writeFileSync(path.join(tempDir, `calls.${ext}`), `
+import { holder as imported } from './holder';
+import * as data from './holder';
+export class Collision { get(key) { return key; } }
+export function readKey() { return 'values'; }
+${receivers.map((receiver, i) => `export function nested${i}(holder, höldér) { return ${receiver}.get(readKey()); }`).join('\n')}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      for (let i = 0; i < receivers.length; i++) {
+        const caller = cg.getNodesByName(`nested${i}`).find(n => n.kind === 'function')!;
+        const callees = cg.getCallees(caller.id).filter(({ edge }) => edge.kind === 'calls');
+        // Argument and computed-key calls survive, but neither an imported
+        // root object nor Collision.get is evidence of the called member.
+        expect(callees.length, receivers[i]).toBeGreaterThan(0);
+        expect(callees.every(({ node }) => node.name === 'readKey'), receivers[i]).toBe(true);
+      }
+    });
+
     it.each(['ts', 'tsx', 'js', 'jsx'])('keeps built-in Map calls off project methods — %s (#1566)', async (ext) => {
       const typed = ext === 'ts' || ext === 'tsx';
       fs.writeFileSync(path.join(tempDir, `cache.${ext}`), `

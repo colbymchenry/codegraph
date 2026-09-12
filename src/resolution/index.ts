@@ -20,6 +20,11 @@ import {
   isImportableKind,
 } from './types';
 import { isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
+import { isVisibleCppMacro } from './cpp-macro-visibility';
+import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
+import { isVerilogMemberRef, matchVerilogMember } from './verilog-members';
+import { isVerilogPortRef, matchVerilogPort } from './verilog-ports';
+import { isVerilogWildcardRef, matchVerilogWildcard } from './verilog-wildcard';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
@@ -33,7 +38,7 @@ import { logDebug } from '../errors';
 import { lexicalPathWithinRoot } from '../utils';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
-import { JS_BUILT_INS } from './js-builtins';
+import { JS_BUILT_INS, isTsJsNestedCall } from './js-builtins';
 
 /** Node kinds that can declare supertypes (extends/implements). */
 const SUPERTYPE_BEARING_KINDS = new Set<Node['kind']>([
@@ -472,7 +477,7 @@ export class ReferenceResolver {
           matches = [];
           for (const m of candidates) {
             if (m.kind !== 'method') continue;
-            if (m.language !== language) continue;
+            if (!sameLanguageFamily(m.language, language)) continue;
             const qn = m.qualifiedName;
             if (qn === want || qn.endsWith(`::${want}`)) matches.push(m);
           }
@@ -495,7 +500,7 @@ export class ReferenceResolver {
             ownerIndex = new Map<string, Node[]>();
             for (const m of candidates) {
               if (m.kind !== 'method') continue;
-              if (m.language !== language) continue;
+              if (!sameLanguageFamily(m.language, language)) continue;
               const qn = m.qualifiedName;
               const i2 = qn.lastIndexOf('::');
               if (i2 < 0) continue; // single-segment qn can never match `T::m`
@@ -731,6 +736,7 @@ export class ReferenceResolver {
       filePath: ref.filePath || this.getFilePathFromNodeId(ref.fromNodeId),
       language: ref.language || this.getLanguageFromNodeId(ref.fromNodeId),
       rowId: ref.rowId,
+      candidates: ref.candidates,
     }));
 
     const total = refs.length;
@@ -876,6 +882,7 @@ export class ReferenceResolver {
    * the alias names (see ./alias-binding), regardless of the strategy.
    */
   resolveOne(ref: UnresolvedRef): ResolvedRef | null {
+    if (isVisibleCppMacro(ref, this.context)) return null;
     const resolved = this.gateTargetKind(this.resolveOneInner(ref), ref);
     if (!resolved || ref.referenceKind !== 'calls') return resolved;
 
@@ -895,6 +902,10 @@ export class ReferenceResolver {
   }
 
   private resolveOneInner(ref: UnresolvedRef): ResolvedRef | null {
+    if (isCppConstructorRef(ref)) return matchCppConstructor(ref, this.context);
+    if (isVerilogWildcardRef(ref)) return matchVerilogWildcard(ref, this.context, matchReference);
+    if (isVerilogPortRef(ref)) return matchVerilogPort(ref, this.context, matchReference);
+    if (isVerilogMemberRef(ref)) return matchVerilogMember(ref, this.context);
     // Skip built-in/external references
     if (this.isBuiltInOrExternal(ref)) {
       return null;
@@ -1020,6 +1031,14 @@ export class ReferenceResolver {
     }
     if (this.profileStages) this.stageAdd('frameworks', ref, fwEarly !== null, tFw);
     if (fwEarly) return fwEarly;
+
+    // An imported root is not the called nested member. Keep framework
+    // evidence, but never bind holder.values.get to holder or an unrelated get.
+    if (isTsJsNestedCall(ref)) {
+      return candidates.length > 0
+        ? candidates.reduce((best, curr) => curr.confidence > best.confidence ? curr : best)
+        : null;
+    }
 
     // Strategy 2: Try import-based resolution
     // A TS/JS/Python call-receiver chain (`useStore.getState().reset`, #1683)
@@ -1192,6 +1211,8 @@ export class ReferenceResolver {
           // wrong rebind; edges without refName (pre-#1240, synthesized) are
           // deliberately NOT resurrected for the same reason.
           refName: ref.original.referenceName,
+          ...(ref.original.language === 'verilog' && ref.original.candidates?.length
+            ? { refCandidates: ref.original.candidates } : {}),
           ...(ref.original.referenceKind !== kind ? { refKind: ref.original.referenceKind } : {}),
           // Uniform marker for function-as-value edges (#756), regardless of
           // which strategy resolved them (import vs matchFunctionRef) — lets
@@ -1481,6 +1502,7 @@ export class ReferenceResolver {
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
         rowId: raw.rowId,
+        candidates: raw.candidates,
       };
       const result = this.resolveOneTimed(ref);
       if (result) {
@@ -1601,6 +1623,7 @@ export class ReferenceResolver {
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
         rowId: raw.rowId,
+        candidates: raw.candidates,
       };
       const result = this.resolveOneTimed(ref);
       if (result) {
@@ -2641,6 +2664,11 @@ export class ReferenceResolver {
    */
   private gateTargetKind(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
     if (!result) return result;
+
+    if (ref.referenceKind === 'calls') {
+      const target = this.queries.getNodeById(result.targetNodeId);
+      if (target?.kind === 'constant' && /^\s*#\s*define\b/.test(target.signature ?? '')) return null;
+    }
 
     // An `imports` reference names something importable — never a member that
     // only exists inside a type.

@@ -1,3 +1,4 @@
+import { formatHdlProfileStatus } from '../hdl/status';
 /**
  * MCP Tool Definitions
  *
@@ -5,6 +6,7 @@
  */
 
 import type CodeGraph from '../index';
+import { formatHdlAccess, HDL_ACCESS_FILTERS, type HdlAccessFilter } from './hdl-access';
 import type { QueryPool } from './query-pool';
 import { findNearestCodeGraphRoot } from '../directory';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
@@ -36,6 +38,7 @@ import { groupDefinitions, lastQualifierPart, matchesSymbol } from '../graph/sym
 import { extractQueryPaths, queryMightContainPaths } from '../search/query-paths';
 import {
   existsSync,
+  realpathSync,
   readFileSync,
   statSync,
 } from 'fs';
@@ -1342,6 +1345,11 @@ export const tools: ToolDefinition[] = [
           description: 'Maximum number of files to include source code from (default: 12)',
           default: 12,
         },
+        hdlAccess: {
+          type: 'string',
+          description: 'HDL signal access filter. With this option query must be one exact signal name or qualified name; read includes control/event uses, write includes readwrite. Returns access sites and source, not elaborated drivers.',
+          enum: [...HDL_ACCESS_FILTERS],
+        },
         projectPath: projectPathProperty,
       },
       required: ['query'],
@@ -1496,6 +1504,14 @@ export class ToolHandler {
   // main loop stays free for the MCP transport under concurrent load. Null in
   // direct/in-process mode (one client, no concurrency to parallelize).
   private queryPool: QueryPool | null = null;
+  private projectLifecycle: ((cg: CodeGraph) => Promise<void>) | null = null;
+  private projectGates = new Map<CodeGraph, Promise<void>>();
+  private closing = false;
+
+  /** Engine owns watching and writer locks; read-only handlers never activate projects. */
+  setProjectLifecycle(activate: (cg: CodeGraph) => Promise<void>): void {
+    this.projectLifecycle = activate;
+  }
 
   constructor(private cg: CodeGraph | null) {}
 
@@ -1512,8 +1528,18 @@ export class ToolHandler {
   /**
    * Update the default CodeGraph instance (e.g. after lazy initialization)
    */
-  setDefaultCodeGraph(cg: CodeGraph): void {
+  setDefaultCodeGraph(cg: CodeGraph): CodeGraph {
+    const root = realpathSync(cg.getProjectRoot());
+    const cached = this.projectCache.get(root);
+    if (cached && cached !== cg) {
+      // An explicit request may have opened this project before default-root
+      // discovery completed. Preserve its watcher and in-flight catch-up.
+      cg.close();
+      cg = cached;
+    }
+    this.projectCache.delete(root); // default ownership moves to the engine
     this.cg = cg;
+    return cg;
   }
 
   /**
@@ -1524,7 +1550,22 @@ export class ToolHandler {
    * stale data, which is what would have happened without the gate.
    */
   setCatchUpGate(p: Promise<void> | null): void {
+    if (this.projectLifecycle && this.cg) {
+      // Engine defaults and explicit aliases share the same pending gate.
+      // Do not overwrite a catch-up already running on a promoted cache entry.
+      if (p && !this.projectGates.has(this.cg)) this.rememberProjectGate(this.cg, p);
+      if (!p) this.projectGates.delete(this.cg);
+      return;
+    }
     this.catchUpGate = p;
+  }
+
+  private rememberProjectGate(cg: CodeGraph, gate: Promise<void>): void {
+    this.projectGates.set(cg, gate);
+    const clear = (): void => {
+      if (this.projectGates.get(cg) === gate) this.projectGates.delete(cg);
+    };
+    void gate.then(clear, clear);
   }
 
   /**
@@ -1709,6 +1750,7 @@ export class ToolHandler {
    * similar to how git finds .git/ directories.
    */
   private getCodeGraph(projectPath?: string): CodeGraph {
+    if (this.closing) throw new Error('MCP engine is shutting down');
     if (!projectPath) {
       if (!this.cg) {
         const searched = this.defaultProjectHint ?? process.cwd();
@@ -1753,7 +1795,8 @@ export class ToolHandler {
     // worktree kept being served the parent checkout's index until restart
     // (#926). The DB connection itself is still cached (by resolved root,
     // below), so re-resolving costs only the stat walk, never a reopen.
-    const resolvedRoot = findNearestCodeGraphRoot(projectPath);
+    const nearestRoot = findNearestCodeGraphRoot(projectPath);
+    const resolvedRoot = nearestRoot ? realpathSync(nearestRoot) : null;
 
     if (!resolvedRoot) {
       throw new NotIndexedError(
@@ -1771,11 +1814,11 @@ export class ToolHandler {
     // support) that surfaces as intermittent
     // "database is locked" on concurrent tool calls. See issue #238. The
     // default instance is owned/closed by the server, so it's never cached.
-    if (this.cg && this.cg.getProjectRoot() === resolvedRoot) {
+    if (this.cg && realpathSync(this.cg.getProjectRoot()) === resolvedRoot) {
       return this.freshen(this.cg);
     }
 
-    // Cache the open DB connection by RESOLVED ROOT only — never by the input
+    // Cache the open DB connection by CANONICAL ROOT only — never by the input
     // path. One key per instance means closeAll() closes each exactly once, and
     // a changed resolution maps to a different entry instead of a stale hit.
     const cached = this.projectCache.get(resolvedRoot);
@@ -1819,7 +1862,18 @@ export class ToolHandler {
       cg.close();
     }
     this.projectCache.clear();
+    this.projectGates.clear();
     this.worktreeMismatchCache.clear();
+  }
+
+  /** Engine shutdown must drain active writers before closing cached projects. */
+  async closeAllAsync(): Promise<void> {
+    this.closing = true;
+    const projects = [...this.projectCache.values()];
+    this.projectCache.clear();
+    this.projectGates.clear();
+    this.worktreeMismatchCache.clear();
+    await Promise.all(projects.map((cg) => cg.closeAsync()));
   }
 
   /**
@@ -2143,6 +2197,20 @@ export class ToolHandler {
         if (typeof check === 'object' && check !== undefined) return check;
       }
 
+      // Resolve on the engine thread even when dispatch uses a read worker:
+      // explicit projects need the same watcher and initial reconcile as default.
+      if (this.projectLifecycle && (pathCheck || this.cg)) {
+        const cg = this.getCodeGraph(pathCheck);
+        let gate = this.projectGates.get(cg);
+        if (!gate) {
+          // Retry writer ownership on later calls: another engine may have
+          // closed since we opened this connection in read-only fallback.
+          gate = this.projectLifecycle(cg);
+          this.rememberProjectGate(cg, gate);
+        }
+        await this.awaitCatchUpGate(gate);
+      }
+
       // codegraph_status reports watcher state (pending files, degraded mode,
       // worktree warning) and embeds its own sections — it must run on the MAIN
       // thread against the watched default instance, so it is NEVER off-loaded to
@@ -2295,7 +2363,17 @@ export class ToolHandler {
       case 'codegraph_callers': return await this.handleCallers(args);
       case 'codegraph_callees': return await this.handleCallees(args);
       case 'codegraph_impact': return await this.handleImpact(args);
-      case 'codegraph_explore': return await this.handleExplore(args);
+      case 'codegraph_explore': {
+        const result = await this.handleExplore(args);
+        if (result.isError) return result;
+        const profile = this.getCodeGraph(args.projectPath as string | undefined).getHdlProfileStatus?.() ?? null;
+        const note = formatHdlProfileStatus(profile);
+        const first = result.content[0];
+        if (!note || first?.type !== 'text') return result;
+        const emission = result[EXPLORE_EMISSION_KEY];
+        return { ...result, content: [{type:'text', text:`${note}\n\n${first.text}`}, ...result.content.slice(1)],
+          ...(emission ? {[EXPLORE_EMISSION_KEY]: {...emission,responseBytes:emission.responseBytes + note.length + 2}} : {}) };
+      }
       case 'codegraph_node': return await this.handleNode(args);
       case 'codegraph_files': return await this.handleFiles(args);
       default: return this.errorResult(`Unknown tool: ${toolName}`);
@@ -3288,6 +3366,13 @@ export class ToolHandler {
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const projectRoot = cg.getProjectRoot();
+    if (args.hdlAccess !== undefined) {
+      if (typeof args.hdlAccess !== 'string' || !HDL_ACCESS_FILTERS.includes(args.hdlAccess as HdlAccessFilter)) {
+        return this.errorResult(`hdlAccess must be one of: ${HDL_ACCESS_FILTERS.join(', ')}`);
+      }
+      return this.textResult(this.truncateOutput(formatHdlAccess(cg, rawQuery, args.hdlAccess as HdlAccessFilter,
+        clamp((args.maxFiles as number) || 12, 1, 20))));
+    }
 
     // Resolve adaptive output budget from project size. Falls back to the
     // largest-tier defaults if stats aren't available, which preserves
@@ -6520,8 +6605,8 @@ export class ToolHandler {
     let cg = this.getCodeGraph(args.projectPath as string | undefined);
     // Same trick as withStalenessNotice — when an explicit projectPath
     // resolves to the same project as the default session cg, prefer the
-    // default so getPendingFiles() (only populated by the default's watcher)
-    // is non-empty when there are pending edits.
+    // default so getPendingFiles() reads the same watcher as the default
+    // session when there are pending edits.
     if (this.cg && cg !== this.cg) {
       try {
         if (resolvePath(this.cg.getProjectRoot()) === resolvePath(cg.getProjectRoot())) {

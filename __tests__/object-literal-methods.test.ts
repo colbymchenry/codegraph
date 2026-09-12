@@ -180,4 +180,23 @@ describe('object-literal method resolution (end-to-end)', () => {
 
     cg.close();
   });
+
+  it.each([
+    ['interface only', 'export interface S { reset(): void }'],
+    ['two implementations', 'export const useStore = create(() => ({ reset: () => {} }));\nexport class Other { reset() {} }'],
+  ])('does not guess a store action with %s', async (_label, declarations) => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-store-'));
+    fs.writeFileSync(path.join(tmpDir, 'store.ts'), declarations);
+    fs.writeFileSync(path.join(tmpDir, 'caller.ts'),
+      "import { useStore } from './store'; export function hardReset() { useStore.getState().reset(); }");
+    const cg = CodeGraph.initSync(tmpDir);
+    try {
+      await cg.indexAll();
+      const caller = cg.getNodesByName('hardReset')[0]!;
+      expect(cg.getCallees(caller.id).filter(({ node, edge }) =>
+        edge.kind === 'calls' && node.name === 'reset')).toEqual([]);
+    } finally {
+      cg.close();
+    }
+  });
 });
