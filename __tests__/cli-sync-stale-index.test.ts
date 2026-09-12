@@ -3,7 +3,7 @@ import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { CodeGraph } from '../src';
+import { CodeGraph, FileLock } from '../src';
 import { EXTRACTION_VERSION } from '../src/extraction/extraction-version';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
@@ -85,4 +85,18 @@ describe('explicit CLI sync with stale extraction', () => {
     expect(run('index').status).toBe(0);
     expect(run('sync').status).toBe(0);
   });
+});
+
+
+it.each([false, true])('reports lock contention instead of clean success, quiet=%s', quiet => {
+  fs.writeFileSync(path.join(root, 'added.ts'), 'export const added = 1;');
+  const lock = new FileLock(path.join(root, '.codegraph', 'codegraph.lock'));
+  lock.acquire();
+  try {
+    const result = run('sync', ...(quiet ? ['--quiet'] : []));
+    expect(result.status).toBe(1);
+    expect(result.stdout + result.stderr).toMatch(/busy|lock/i);
+    expect(result.stdout + result.stderr).not.toContain('Already up to date');
+    if (quiet) { expect(result.stdout).toBe(''); expect(result.stderr.trim().split('\n')).toHaveLength(1); }
+  } finally { lock.release(); }
 });

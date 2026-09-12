@@ -119,6 +119,8 @@ export interface IndexResult {
  * Result of a sync operation
  */
 export interface SyncResult {
+  /** No reconciliation ran because another process owns the index lock. */
+  skippedReason?: 'locked';
   filesChecked: number;
   filesAdded: number;
   filesModified: number;

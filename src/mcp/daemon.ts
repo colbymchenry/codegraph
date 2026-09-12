@@ -665,7 +665,7 @@ export function clearStaleDaemonLock(
       if (expectedDeadPid !== undefined && info.pid !== expectedDeadPid) return false;
       // PID liveness is normally sufficient. The takeover caller may override
       // it only after a failed identity handshake proves PID reuse.
-      if (!opts.allowLivePid && info.pid > 0 && isProcessAlive(info.pid)) return false;
+      if ((!opts.allowLivePid || !info.socketPath) && info.pid > 0 && isProcessAlive(info.pid)) return false;
     }
     fs.unlinkSync(pidPath);
     return true;

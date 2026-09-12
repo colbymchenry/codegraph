@@ -169,6 +169,9 @@ export function decodeLockInfo(raw: string): DaemonLockInfo | null {
   if (!trimmed) return null;
   try {
     const parsed = JSON.parse(trimmed);
+    if (typeof parsed === 'number' && Number.isSafeInteger(parsed) && parsed > 0) {
+      return { pid: parsed, version: 'unknown', socketPath: '', startedAt: 0 };
+    }
     if (
       parsed &&
       typeof parsed.pid === 'number' &&

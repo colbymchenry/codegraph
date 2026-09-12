@@ -966,8 +966,9 @@ program
       }
 
       if (options.quiet) {
-        await cg.sync();
+        const result = await cg.sync();
         cg.destroy();
+        if (result.skippedReason === 'locked') throw new Error('Index is busy: another process holds the lock. Retry sync shortly.');
         return;
       }
 
@@ -982,6 +983,10 @@ program
       });
 
       await progress.stop();
+      if (result.skippedReason === 'locked') {
+        cg.destroy();
+        throw new Error('Index is busy: another process holds the lock. Retry sync shortly.');
+      }
 
       const totalChanges = result.filesAdded + result.filesModified + result.filesRemoved;
 
@@ -999,9 +1004,9 @@ program
       clack.outro('Done');
       cg.destroy();
     } catch (err) {
-      if (!options.quiet) {
-        error(`Failed to sync: ${err instanceof Error ? err.message : String(err)}`);
-      }
+      const message = `Failed to sync: ${err instanceof Error ? err.message : String(err)}`;
+      if (options.quiet) process.stderr.write(`${message}\n`);
+      else error(message);
       process.exit(1);
     }
   });

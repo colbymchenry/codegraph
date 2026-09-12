@@ -220,8 +220,11 @@ export class QueryPool {
     if (!m) return;
     if (m.type === 'ready') {
       this.pendingWorkers.delete(w);
-      if (m.ok === false) this.totalCrashes++; // hard open failure
-      else this.everReady = true;
+      if (m.ok === false) {
+        this.onWorkerGone(w);
+        return;
+      }
+      this.everReady = true;
       this.idle.push(w);
       this.drain();
       return;
@@ -254,6 +257,11 @@ export class QueryPool {
         this.queue.unshift(job); // head of line — retry promptly
       } else {
         this.settle(job, { isError: true, content: [{ type: 'text', text: 'codegraph worker crashed; please retry the call.' }] });
+      }
+    }
+    if (!this.healthy) {
+      for (const queued of this.queue.splice(0)) {
+        this.settle(queued, { isError: true, content: [{ type: 'text', text: 'codegraph workers could not start; retry after checking the project index.' }] });
       }
     }
     this.drain();
@@ -291,6 +299,7 @@ export class QueryPool {
 
   /** Run a read tool on the pool. Always resolves (never rejects). */
   run(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+    if (!this.healthy) return Promise.resolve({ isError: true, content: [{ type: 'text', text: 'codegraph worker pool unavailable; retry after checking the project index.' }] });
     return new Promise<ToolResult>((resolve) => {
       const job: Job = {
         id: this.nextId++, toolName, args, resolve,

@@ -190,6 +190,12 @@ export function crossesKnownFamily(a: string, b: string): boolean {
  *    both-known filter so `.vue`/`.svelte` (own tag) importing `.ts` survives.
  */
 function applyLanguageGate(candidates: Node[], ref: UnresolvedRef): Node[] {
+  if (ref.referenceKind === 'calls') {
+    // Cross-language calls need a bridge resolver, never a coincidental name.
+    // C/C++ enum values cannot be invoked (unlike Rust enum constructors).
+    return candidates.filter(c => sameLanguageFamily(c.language, ref.language) &&
+      !((ref.language === 'c' || ref.language === 'cpp') && c.kind === 'enum_member'));
+  }
   if (ref.referenceKind === 'references' || ref.referenceKind === 'function_ref') {
     return candidates.filter((c) => sameLanguageFamily(c.language, ref.language));
   }
@@ -2425,7 +2431,7 @@ export function matchMethodCall(
   // names like permissionEngine → PermissionRuleEngine.
   if (methodName) {
     const strat3 = nmTimedT('mc-byname', ref, (): ResolvedRef | null => {
-    const methodCandidates = context.getNodesByName(methodName!);
+    const methodCandidates = applyLanguageGate(context.getNodesByName(methodName!), ref);
     // Ubiquitous-method ceiling (#999): a method name re-declared across a
     // vendored theme/SDK (Metronic's `init`/`update`/… on every widget) yields
     // K candidates that receiver-word overlap can't reliably disambiguate —
