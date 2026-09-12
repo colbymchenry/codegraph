@@ -3574,6 +3574,10 @@ export class QueryBuilder {
     })();
   }
 
+  hasLanguage(language: Language): boolean {
+    return !!this.db.prepare('SELECT 1 FROM nodes WHERE language = ? LIMIT 1').get(language);
+  }
+
   /** HDL call arguments may change access when a remote formal changes direction.
    * Seek HDL sources first, then their indexed outgoing edges; ordinary projects
    * have no rows here. Include unclassified arguments so newly indexed callees

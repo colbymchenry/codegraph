@@ -145,6 +145,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- HDL: именованные profiles в codegraph.json, filelists/include/define context, сохранение offsets при conditional selection, fingerprint/sync invalidation и диагностика configured/indexed profile. Watcher учитывает profile dependencies; полноценный macro expansion пока не выполняется.
+
 - HDL: source access roles read/write/readwrite/control/event и направления аргументов известных functions/tasks доступны через explore `hdlAccess` / CLI `--hdl-access`. Сохраняются разные позиции одной строки, initializer writes и переклассификация после изменения/удаления сигнатуры через sync.
 
 - HDL: точные procedural scopes, formal parameters и generate template declarations сохраняют локальные связи; исправлены defaults/for initializer calls, приоритет block imports и qualified cross-file replay после sync.

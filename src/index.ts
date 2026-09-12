@@ -28,6 +28,9 @@ import {
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
 import { QueryBuilder } from './db/queries';
+import { loadHdlProfile } from './hdl/profile';
+import { hdlDependenciesChanged } from './hdl/index-context';
+import { buildHdlProfileStatus, type HdlProfileStatus } from './hdl/status';
 import {
   isInitialized,
   createDirectory,
@@ -741,6 +744,7 @@ export class CodeGraph {
           }
         } catch { /* metadata is advisory — never fail an index over it */ }
 
+        if (result.success && result.filesErrored === 0) this.orchestrator.commitHdlProfile();
         return result;
       } finally {
         // Restore the auto-checkpoint interval AFTER the fold-up above so the
@@ -778,7 +782,9 @@ export class CodeGraph {
         return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
       }
       try {
-        return this.orchestrator.indexFiles(filePaths);
+        const result = await this.orchestrator.indexFiles(filePaths);
+        if (result.success && result.filesErrored === 0) this.orchestrator.commitHdlProfile();
+        return result;
       } finally {
         this.fileLock.release();
       }
@@ -1069,6 +1075,7 @@ export class CodeGraph {
           try { this.queries.setMetadata(INDEXED_AT_COMMIT_KEY, headBeforeSync); } catch { /* advisory */ }
         }
 
+        this.orchestrator.commitHdlProfile();
         return result;
       } finally {
         // Mirror indexAll's teardown: stop the valve, then restore the
@@ -1122,7 +1129,8 @@ export class CodeGraph {
         const filesChanged = result.filesAdded + result.filesModified + result.filesRemoved;
         return { filesChanged, durationMs: result.durationMs };
       },
-      options
+      options,
+      () => this.getHdlDependencyPaths()
     );
 
     return this.watcher.start();
@@ -1262,6 +1270,28 @@ export class CodeGraph {
    * index built before stamping existed (treated as stale). See
    * `extraction-version.ts` and `isIndexStale()`.
    */
+  getHdlDependencyPaths(): string[] {
+    try {
+      const context = JSON.parse(this.queries.getMetadata('hdl_profile_context') ?? 'null');
+      return Array.isArray(context?.dependencies) ? context.dependencies.flatMap((d: unknown) =>
+        d && typeof d === 'object' && 'path' in d && typeof d.path === 'string' ? [d.path] : []) : [];
+    } catch { return []; }
+  }
+
+  getHdlProfileStatus(): HdlProfileStatus | null {
+    const configuration = loadHdlProfile(this.projectRoot);
+    const metadata = { name: this.queries.getMetadata('hdl_profile_name') || null,
+      fingerprint: this.queries.getMetadata('hdl_profile_fingerprint'), context: this.queries.getMetadata('hdl_profile_context') };
+    const hasHdl = this.queries.hasLanguage('verilog');
+    if (!hasHdl && !metadata.name && configuration.status === 'invalid-config') return null;
+    const status = buildHdlProfileStatus(configuration, metadata, hasHdl);
+    if (status?.state === 'matches' && status.indexed.mode === 'profile' && hdlDependenciesChanged(this.projectRoot, metadata.context)) {
+      status.state = 'mismatch'; status.mismatch = true; status.reindexRecommended = true;
+      status.diagnostics.push('HDL include dependency changed since indexing.');
+    }
+    return status;
+  }
+
   getIndexBuildInfo(): { version: string | null; extractionVersion: number | null } {
     const version = this.queries.getMetadata('indexed_with_version');
     const ev = this.queries.getMetadata('indexed_with_extraction_version');

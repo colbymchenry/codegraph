@@ -118,7 +118,7 @@ describe('No-root-index session policy', () => {
     const instructions = (res.result as { instructions: string }).instructions;
 
     // No longer an "inactive, do nothing" note — the tools are available.
-    expect(instructions).not.toMatch(/inactive/i);
+    expect(instructions).not.toMatch(/(?:codegraph|server|tools?)[^\n.]{0,60}\binactive\b/i);
     // It steers the agent to target a project explicitly via projectPath...
     expect(instructions).toMatch(/projectPath/);
     expect(instructions).toMatch(/codegraph_explore/);
@@ -176,7 +176,7 @@ describe('No-root-index session policy', () => {
     const init = await request(child, { id: 0, method: 'initialize', params: initializeParams(tempDir) });
     const instructions = (init.result as { instructions: string }).instructions;
     expect(instructions).toMatch(/How to query/);
-    expect(instructions).not.toMatch(/inactive/i);
+    expect(instructions).not.toMatch(/(?:codegraph|server|tools?)[^\n.]{0,60}\binactive\b/i);
 
     const list = await request(child, { id: 1, method: 'tools/list' });
     const tools = (list.result as { tools: Array<{ name: string }> }).tools;

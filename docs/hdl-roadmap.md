@@ -63,7 +63,7 @@ UART и eMMC CRC; отрицательные controls для package/member/ин
 по сигналам показывают исходные строки и тип использования. Не называть это
 доказательством электрического драйвера, latch или race.
 
-### 3. Явный контекст HDL-сборки
+### 3. Явный контекст HDL-сборки — реализован ограниченный source-режим
 
 Польза: различать synthesis/testbench и условные варианты без выбора по имени
 директории там, где проект предоставляет точный состав сборки.
@@ -126,7 +126,8 @@ bind и связи DUT↔testbench. Затем оценить необходим
 
 - Этап 1 реализован; отчёты validation-hdl-scopes-2026-09-12.md и
   validation-hdl-parse-gaps-2026-09-12.md. Этап 2 реализован: validation-hdl-access-2026-09-12.md.
-  Следующий пакет реализации — этап 3, явный контекст HDL-сборки.
+  Этап 3 реализован в ограниченном source-режиме: hdl-profiles.md и
+  validation-hdl-profiles-2026-09-12.md. Следующий пакет — этап 4, compiler frontend.
 - Для каждого пакета: failing regression → исправление → независимое review
   → focused tests → реальные corpus queries и sync/rebuild comparison.
 - Полные native/WASM suites при изменениях общих extraction/resolution/storage

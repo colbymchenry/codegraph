@@ -1,3 +1,4 @@
+import { formatHdlProfileStatus } from '../hdl/status';
 /**
  * MCP Tool Definitions
  *
@@ -2362,7 +2363,17 @@ export class ToolHandler {
       case 'codegraph_callers': return await this.handleCallers(args);
       case 'codegraph_callees': return await this.handleCallees(args);
       case 'codegraph_impact': return await this.handleImpact(args);
-      case 'codegraph_explore': return await this.handleExplore(args);
+      case 'codegraph_explore': {
+        const result = await this.handleExplore(args);
+        if (result.isError) return result;
+        const profile = this.getCodeGraph(args.projectPath as string | undefined).getHdlProfileStatus?.() ?? null;
+        const note = formatHdlProfileStatus(profile);
+        const first = result.content[0];
+        if (!note || first?.type !== 'text') return result;
+        const emission = result[EXPLORE_EMISSION_KEY];
+        return { ...result, content: [{type:'text', text:`${note}\n\n${first.text}`}, ...result.content.slice(1)],
+          ...(emission ? {[EXPLORE_EMISSION_KEY]: {...emission,responseBytes:emission.responseBytes + note.length + 2}} : {}) };
+      }
       case 'codegraph_node': return await this.handleNode(args);
       case 'codegraph_files': return await this.handleFiles(args);
       default: return this.errorResult(`Unknown tool: ${toolName}`);
