@@ -973,4 +973,5 @@ MIT
 </div>
 
 Подробности HDL-профилей: [настройка и ограничения](docs/hdl-profiles.md).
-Вычисленные параметры и ширины по явному запросу: [hdl-semantic с установленным slang](docs/hdl-semantics.md).
+Вычисленные параметры и ширины по явному запросу: [hdl-semantic с установленным slang](docs/hdl-semantics.md);
+[происхождение макросов через pyslang](docs/hdl-macro-source-map.md).

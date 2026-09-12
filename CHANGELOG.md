@@ -25,6 +25,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- HDL: `hdl-semantic --python` с pyslang показывает исходное написание и места вызова макросов, явно отмечая неполное сопоставление.
+
 - HDL: `hdl-semantic` с установленным slang показывает вычисленные параметры и ширины портов для выбранного профиля и экземпляра.
 
 - **Codex and Astra read project guidance from `AGENTS.md`.** The canonical agent guide now lives in `AGENTS.md` (with a nested `docs/AGENTS.md` for long validation notes); `CLAUDE.md` is a thin `@AGENTS.md` wrapper for Claude Code. Codex/Astra no longer miss the old CLAUDE-only instructions.

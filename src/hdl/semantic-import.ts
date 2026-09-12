@@ -1,7 +1,10 @@
 import * as path from 'node:path';
 
+export interface HdlMacroPoint { file: string; line: number; column: number; byteOffset: number }
+export interface HdlMacroFrame { name: string | null; argument: boolean; spelling?: HdlMacroPoint; invocation?: { start: HdlMacroPoint; end: HdlMacroPoint } }
+
 export interface HdlSemanticFact {
-  kind: 'parameter' | 'port';
+  kind: 'parameter' | 'port' | 'type';
   name: string;
   instancePath: string;
   value?: string;
@@ -9,6 +12,9 @@ export interface HdlSemanticFact {
   width?: number;
   direction?: string;
   source?: { file: string; line: number; column: number | null };
+  sourceOrigin?: 'direct' | 'macro';
+  macroExpansion?: HdlMacroFrame[];
+  macroExpansionComplete?: boolean;
 }
 
 type AstObject = Record<string, unknown>;

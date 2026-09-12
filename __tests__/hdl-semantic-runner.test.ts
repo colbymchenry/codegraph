@@ -12,6 +12,10 @@ suite('isolated optional slang runner',()=>{
     const script=`#!${process.execPath}\nconst fs=require('node:fs'),cp=require('node:child_process');const args=process.argv.slice(2);if(args.includes('--version')){console.log('slang version 11.0.448+e222e7dc0');process.exit(0);}const output=args[args.indexOf('--ast-json')+1];${body}\nfs.writeFileSync(output,JSON.stringify({kind:'Root',argv:args,source:fs.readFileSync('rtl/top.sv','utf8'),include:fs.readFileSync('inc/common.flags','utf8'),cwd:process.cwd()}));`;
     fs.writeFileSync(exe,script,{mode:0o700});
   };
+  const fakePython=(body='',version=`codegraph pyslang 11.0.0 exporter 1 native ${'a'.repeat(64)}`)=>{
+    const script=`#!${process.execPath}\nconst fs=require('node:fs');const args=process.argv.slice(2);if(args.includes('--version')){console.log(${JSON.stringify(version)});process.exit(0);}if(args[0]!=='-I'||!args[1].endsWith('source-map-export.py'))process.exit(3);const output=args[args.indexOf('--ast-json')+1];${body}\nfs.writeFileSync(output,JSON.stringify({codegraphSemanticVersion:1,facts:[],argv:args,launcher:process.argv[1]}));`;
+    fs.writeFileSync(exe,script,{mode:0o700});
+  };
   beforeEach(()=>{
     const storage=path.join(os.homedir(),'storage');fs.mkdirSync(storage,{recursive:true});
     base=fs.mkdtempSync(path.join(storage,'cg-semantic-test-'));root=path.join(base,'project');temp=path.join(base,'snapshots');exe=path.join(base,'fake-slang');
@@ -20,6 +24,37 @@ suite('isolated optional slang runner',()=>{
     write('codegraph.json',JSON.stringify({hdl:{activeProfile:'synth',profiles:{synth:{files:['rtl/top.sv'],includeDirs:['inc'],topModules:['top'],defines:{SAFE:'1'}}}}}));fake();
   });
   afterEach(()=>{if(oldTemp===undefined)delete process.env.CODEGRAPH_SEMANTIC_TMPDIR;else process.env.CODEGRAPH_SEMANTIC_TMPDIR=oldTemp;fs.rmSync(base,{recursive:true,force:true});});
+  it('requires exactly one explicit backend selector',async()=>{
+    await expect(runSlangSemantics(root,{})).rejects.toThrow('exactly one');
+    await expect(runSlangSemantics(root,{executable:exe,pythonExecutable:exe})).rejects.toThrow('exactly one');
+  });
+  it('runs only isolated Python and records exporter/native hashes with normalized facts',async()=>{
+    fakePython();
+    const launcher=path.join(base,'venv/bin/python');fs.mkdirSync(path.dirname(launcher),{recursive:true});fs.symlinkSync(exe,launcher);
+    const result=await runSlangSemantics(root,{pythonExecutable:launcher,parameters:{WIDTH:'4'}});
+    expect(result.frontend).toBe('pyslang');expect(result.exporterSha256).toMatch(/^[a-f0-9]{64}$/);expect(result.librarySha256).toBe('a'.repeat(64));
+    expect((result.ast as any).codegraphSemanticVersion).toBe(1);expect((result.ast as any).argv[0]).toBe('-I');
+    expect((result.ast as any).launcher).toBe(launcher);expect((result.ast as any).argv).toContain('WIDTH=4');expect(fs.readdirSync(temp)).toEqual([]);
+  });
+  it('rejects unsupported Python exporter/library versions and malformed envelopes',async()=>{
+    fakePython('','codegraph pyslang 12.0.0 exporter 1 native '+ 'a'.repeat(64));
+    await expect(runSlangSemantics(root,{pythonExecutable:exe})).rejects.toThrow('schema family');
+    fakePython("fs.writeFileSync(output,JSON.stringify({codegraphSemanticVersion:2,facts:[]}));process.exit(0);");
+    await expect(runSlangSemantics(root,{pythonExecutable:exe})).rejects.toThrow('exporter envelope');
+  });
+  it('rejects a Python native library fingerprint that changes across the run',async()=>{
+    const marker=path.join(base,'library-changed');
+    const script=`#!${process.execPath}\nconst fs=require('node:fs'),args=process.argv.slice(2);if(args.includes('--version')){console.log('codegraph pyslang 11.0.0 exporter 1 native '+(fs.existsSync(${JSON.stringify(marker)})?'b':'a').repeat(64));process.exit(0);}fs.writeFileSync(${JSON.stringify(marker)},'changed');fs.writeFileSync(args[args.indexOf('--ast-json')+1],JSON.stringify({codegraphSemanticVersion:1,facts:[]}));`;
+    fs.writeFileSync(exe,script,{mode:0o700});await expect(runSlangSemantics(root,{pythonExecutable:exe})).rejects.toThrow('library changed');
+    expect(fs.readdirSync(temp)).toEqual([]);
+  });
+  it('applies the same output and cancellation bounds to Python',async()=>{
+    fakePython("process.stdout.write('x'.repeat(1024*1024+1));setInterval(()=>{},1000);return;");
+    await expect(runSlangSemantics(root,{pythonExecutable:exe})).rejects.toThrow('output exceeds');
+    fakePython("setInterval(()=>{},1000);return;");
+    const controller=new AbortController(),pending=runSlangSemantics(root,{pythonExecutable:exe,signal:controller.signal});
+    setTimeout(()=>controller.abort(),100);await expect(pending).rejects.toThrow('cancelled');expect(fs.readdirSync(temp)).toEqual([]);
+  });
   it('copies literal headers and argv safely, returns provenance/source map and removes snapshots',async()=>{
     const result=await runSlangSemantics(root,{executable:exe,parameters:{WIDTH:'8'},allowUseBeforeDeclare:true});
     const ast=result.ast as any;

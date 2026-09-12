@@ -3,7 +3,9 @@
 Команда `hdl-semantic` и API `CodeGraph.getHdlSemantics()` запускают установленный
 slang по явному запросу. Нужны инициализированный проект и активный HDL build
 profile в `codegraph.json`. Факты возвращаются отдельно от source graph; данные
-графа не перезаписываются. Slang автоматически не устанавливается.
+графа не перезаписываются. Slang автоматически не устанавливается. Для compiler macro provenance доступен
+[отдельный pyslang backend](hdl-macro-source-map.md) через --python; выбрать ровно
+один frontend executable.
 
 ## CLI
 

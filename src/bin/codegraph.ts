@@ -1318,13 +1318,14 @@ program
 program
   .command('hdl-semantic [query]')
   .description('Compute HDL parameters and port widths with optional slang (exact symbol or instance query)')
-  .requiredOption('--slang <executable>', 'Path to the installed slang executable')
+  .option('--slang <executable>', 'Path to the installed slang executable')
+  .option('--python <executable>', 'Python with pinned pyslang for compiler macro source mapping (instead of --slang)')
   .option('-p, --path <path>', 'Project path')
   .option('--top <name>', 'Single top module (defaults to the active profile top)')
   .option('--parameter <name=value...>', 'Top-level parameter overrides')
   .option('--allow-use-before-declare', 'Explicit slang compatibility mode')
   .option('--limit <number>', 'Maximum facts (1..1000)', '100')
-  .action(async (query: string | undefined, options: { slang: string; path?: string; top?: string;
+  .action(async (query: string | undefined, options: { slang?: string; python?: string; path?: string; top?: string;
     parameter?: string[]; allowUseBeforeDeclare?: boolean; limit: string }) => {
     const projectPath = resolveProjectPath(options.path);
     try {
@@ -1344,7 +1345,7 @@ program
       process.once('SIGINT', interrupt);
       process.once('SIGTERM', interrupt);
       try {
-        const result = await cg.getHdlSemantics({ executable: options.slang, top: options.top,
+        const result = await cg.getHdlSemantics({ executable: options.slang, pythonExecutable: options.python, top: options.top,
           parameters, allowUseBeforeDeclare: options.allowUseBeforeDeclare, query, limit: Number(options.limit),
           signal: controller.signal });
         console.log(JSON.stringify(result));

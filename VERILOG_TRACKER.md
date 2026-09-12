@@ -137,6 +137,11 @@ checkbox ниже остаётся открытым для полного зая
   собственный полный HDL-препроцессор внутри extractor.
 - [ ] **B2** Сопоставить expansion с исходным файлом, диапазоном, macro definition
   и invocation. Для неоднозначного mapping возвращать явную неизвестность.
+  Частично выполнено 2026-09-12: optional --python/pyslang backend возвращает
+  provenance имени parameter/port/typedef через обе SourceManager parent relations.
+  Реальный AXI aw_chan_t width35: аргумент415:31, macro body178:44, вызов415:3–49.
+  Collapsed ranges отмечены incomplete; origins всех выражений ещё не охвачены.
+  Отчёт `docs/validation-hdl-macro-source-map-2026-09-12.md`.
 - [ ] **B3** Проверить function-like macros, arguments/defaults, nested expansion,
   token concatenation/stringification, conditional includes и include guards.
 - [ ] **B4** Определить compilation-unit mode и порядок sources явно; не смешивать
@@ -313,7 +318,8 @@ J — повторяемый checklist, его отметки относятся
    раздельно и unknown coordinates для macro-generated declarations.
 4. **Минимальная on-demand вертикаль выполнена**: параметры/порты для одного
    profile/top, source links, ошибка compiler не меняет source graph. Дальше:
-   точный macro source mapping B2, расширенные types C3 и persistent semantic
+   расширение B2 с declaration-name provenance на initializer/type expressions,
+   расширенные types C3 и persistent semantic
    context/invalidation C1/D5; затем semantic queries MCP.
 5. Провести J1–J9 для этого ограниченного пакета; затем расширять B/C и переходить к D.
 
@@ -323,6 +329,7 @@ J — повторяемый checklist, его отметки относятся
 | --- | --- | --- | --- | --- |
 | 2026-09-12 | Source navigation, scopes, access | Реализованные части перечислены в HDL-001–006 | Отчёты раздела 1 | Сохранить regression coverage |
 | 2026-09-12 | Build profiles | Ограниченный source-режим, реальные profile parity проверки | `b050fb89`, `docs/validation-hdl-profiles-2026-09-12.md` | A: frontend comparison |
+| 2026-09-12 | B2 declaration origins | Pyslang SourceManager, реальные macro points/ranges и typedef35 | `docs/validation-hdl-macro-source-map-2026-09-12.md` | Expression origins, C3, cache |
 | 2026-09-12 | B/C первая вертикаль | API/CLI, реальные UART/CRC/AXI, include sync/rebuild parity | `docs/validation-hdl-semantics-2026-09-12.md` | B2, C3, persisted context |
 | 2026-09-12 | A3–A6 | 24 controls, slang выбран; CLI macro mapping неполон | `docs/hdl-frontend-decision.md` | B1/B2 + C1/C2 |
 | 2026-09-12 | A1–A2 | Manifest 137 HDL, три locked AXI dependencies, шесть compiler controls | `docs/validation-hdl-corpora-build-2026-09-12.md` | A3–A6, сравнение frontends |
