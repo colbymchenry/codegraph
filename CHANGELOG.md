@@ -145,6 +145,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- HDL: source access roles read/write/readwrite/control/event и направления аргументов известных functions/tasks доступны через explore `hdlAccess` / CLI `--hdl-access`. Сохраняются разные позиции одной строки, initializer writes и переклассификация после изменения/удаления сигнатуры через sync.
+
 - HDL: точные procedural scopes, formal parameters и generate template declarations сохраняют локальные связи; исправлены defaults/for initializer calls, приоритет block imports и qualified cross-file replay после sync.
 
 - HDL: позиционные подключения следуют порядку ANSI/non-ANSI заголовка; `.*` учитывает явные подключения и локальную область видимости. Sync пересчитывает весь набор связей при изменении заголовка или удалении дубликата модуля. Grammar обновлена до tree-sitter-systemverilog 0.4.0 после сравнения 137 реальных HDL-файлов.

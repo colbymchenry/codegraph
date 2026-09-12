@@ -44,7 +44,7 @@
 same-line declarations и stable IDs; sync после перемещения объявления даёт
 те же связи, что clean rebuild. Реальные UART/CRC/AXI-control examples.
 
-### 2. Разделить синтаксические reads, writes и control dependencies
+### 2. Разделить синтаксические reads, writes и control dependencies — реализовано
 
 Польза: ответить, какой блок читает сигнал и где код присваивает ему значение.
 
@@ -125,7 +125,8 @@ bind и связи DUT↔testbench. Затем оценить необходим
 ## Проверки и порядок поставки
 
 - Этап 1 реализован; отчёты validation-hdl-scopes-2026-09-12.md и
-  validation-hdl-parse-gaps-2026-09-12.md. Следующий пакет реализации — этап 2.
+  validation-hdl-parse-gaps-2026-09-12.md. Этап 2 реализован: validation-hdl-access-2026-09-12.md.
+  Следующий пакет реализации — этап 3, явный контекст HDL-сборки.
 - Для каждого пакета: failing regression → исправление → независимое review
   → focused tests → реальные corpus queries и sync/rebuild comparison.
 - Полные native/WASM suites при изменениях общих extraction/resolution/storage

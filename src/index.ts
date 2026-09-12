@@ -978,6 +978,10 @@ export class CodeGraph {
           }
         }
 
+        // Access direction is signature-dependent even if no node name changed.
+        // Re-open typed and still-unclassified HDL argument sites in untouched files.
+        this.orchestrator.resurrectHdlCallArgumentEdges(result.changedFilePaths ?? [], result.filesRemoved > 0);
+
         // Orphan sweep (#1187). A resolution pass that dies mid-run — the #850
         // daemon liveness watchdog's SIGKILL (#1122), Ctrl-C, a crash — leaves
         // the refs it never reached in unresolved_refs, and the git-scoped fast

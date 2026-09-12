@@ -3022,6 +3022,27 @@ export class ExtractionOrchestrator {
     return refs.length;
   }
 
+  /** Reclassify argument accesses against current function/task formals.
+   * Existing calls are dependencies; missing signatures also need retries when
+   * a callee appears, so retain and revisit their plain argument references. */
+  resurrectHdlCallArgumentEdges(changedFilePaths: string[], removedFiles = false): number {
+    if (!changedFilePaths.length && !removedFiles) return 0;
+    const overrides = loadExtensionOverrides(this.rootDir);
+    // Removed files are absent from changedFilePaths and their language records
+    // have already cascaded; existing HDL argument sites still need declassification.
+    if (!removedFiles && !changedFilePaths.some(file => detectLanguage(file, undefined, overrides) === 'verilog')) return 0;
+    const fresh = new Set(changedFilePaths);
+    const candidates = this.queries.getHdlCallArgumentEdges().filter(e => !fresh.has(e.sourceFilePath));
+    const ids: number[] = [];
+    const refs: UnresolvedReference[] = [];
+    for (const edge of candidates) {
+      const ref = resurrectRefFromDroppedEdge(edge);
+      if (ref) { ids.push(edge.edgeId); refs.push(ref); }
+    }
+    if (refs.length) this.queries.replaceResolutionEdgesWithUnresolvedRefs(ids, refs);
+    return refs.length;
+  }
+
   /**
    * Sync the index with the current file state.
    *

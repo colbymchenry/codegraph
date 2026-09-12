@@ -3574,6 +3574,19 @@ export class QueryBuilder {
     })();
   }
 
+  /** HDL call arguments may change access when a remote formal changes direction.
+   * Seek HDL sources first, then their indexed outgoing edges; ordinary projects
+   * have no rows here. Include unclassified arguments so newly indexed callees
+   * can provide direction evidence on the next sync. */
+  getHdlCallArgumentEdges(): Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language }> {
+    const rows = this.db.prepare(`SELECT e.*, src.file_path AS source_file_path, src.language AS source_language
+      FROM nodes src JOIN edges e ON e.source = src.id
+      WHERE src.language = 'verilog' AND e.kind = 'references' AND e.metadata LIKE '%hdl:call-arg:%'`)
+      .all() as Array<EdgeRow & { source_file_path: string; source_language: Language }>;
+    return rows.map(row => ({ ...rowToEdge(row), edgeId: row.id,
+      sourceFilePath: row.source_file_path, sourceLanguage: row.source_language }));
+  }
+
   /**
    * Distinct node names present in the given files — the symbol names a sync
    * pass uses to look up retryable failed refs after those files changed.

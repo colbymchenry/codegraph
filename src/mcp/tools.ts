@@ -5,6 +5,7 @@
  */
 
 import type CodeGraph from '../index';
+import { formatHdlAccess, HDL_ACCESS_FILTERS, type HdlAccessFilter } from './hdl-access';
 import type { QueryPool } from './query-pool';
 import { findNearestCodeGraphRoot } from '../directory';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
@@ -1342,6 +1343,11 @@ export const tools: ToolDefinition[] = [
           type: 'number',
           description: 'Maximum number of files to include source code from (default: 12)',
           default: 12,
+        },
+        hdlAccess: {
+          type: 'string',
+          description: 'HDL signal access filter. With this option query must be one exact signal name or qualified name; read includes control/event uses, write includes readwrite. Returns access sites and source, not elaborated drivers.',
+          enum: [...HDL_ACCESS_FILTERS],
         },
         projectPath: projectPathProperty,
       },
@@ -3349,6 +3355,13 @@ export class ToolHandler {
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const projectRoot = cg.getProjectRoot();
+    if (args.hdlAccess !== undefined) {
+      if (typeof args.hdlAccess !== 'string' || !HDL_ACCESS_FILTERS.includes(args.hdlAccess as HdlAccessFilter)) {
+        return this.errorResult(`hdlAccess must be one of: ${HDL_ACCESS_FILTERS.join(', ')}`);
+      }
+      return this.textResult(this.truncateOutput(formatHdlAccess(cg, rawQuery, args.hdlAccess as HdlAccessFilter,
+        clamp((args.maxFiles as number) || 12, 1, 20))));
+    }
 
     // Resolve adaptive output budget from project size. Falls back to the
     // largest-tier defaults if stats aren't available, which preserves

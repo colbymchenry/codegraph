@@ -1,4 +1,5 @@
 import type { Node } from '../types';
+import { resolveVerilogCallArgumentAccess } from './verilog-call-access';
 import type { ResolvedRef, ResolutionContext, UnresolvedRef } from './types';
 
 export function isVerilogMemberRef(ref: UnresolvedRef): boolean {
@@ -12,8 +13,20 @@ export function matchVerilogMember(ref: UnresolvedRef, context: ResolutionContex
     .filter(n => n.language === 'verilog' && kinds.includes(n.kind));
   const result = (nodes: Node[]): ResolvedRef | null => {
     const unique = [...new Map(nodes.map(n => [n.id, n])).values()];
-    return unique.length === 1 ? { original: ref, targetNodeId: unique[0]!.id,
-      confidence: 0.95, resolvedBy: 'qualified-name' } : null;
+    if (unique.length !== 1) return null;
+    let metadata: Record<string, unknown> | undefined;
+    if (ref.referenceKind === 'references' && ref.referenceName.startsWith('hdl:signal:')) {
+      const access = [...new Set((ref.candidates ?? []).filter(c => c.startsWith('hdl:access:'))
+        .map(c => c.slice('hdl:access:'.length)).filter(c => ['read', 'write', 'readwrite', 'control', 'event'].includes(c)))];
+      const argument = access.length ? undefined : resolveVerilogCallArgumentAccess(ref, context, matchVerilogMember);
+      if (argument) access.push(argument.access);
+      const events = [...new Set((ref.candidates ?? []).filter(c => c.startsWith('hdl:event:'))
+        .map(c => c.slice('hdl:event:'.length)).filter(c => ['posedge', 'negedge'].includes(c)))];
+      if (access.length) metadata = { hdlAccess: access, ...(events.length ? { hdlEvent: events } : {}),
+        ...(argument ? { hdlCallTargetId: argument.callableId, hdlFormalId: argument.formalId } : {}) };
+    }
+    return { original: ref, targetNodeId: unique[0]!.id, confidence: 0.95,
+      resolvedBy: 'qualified-name', ...(metadata ? { metadata } : {}) };
   };
   if (ref.referenceKind === 'references' && ref.referenceName.startsWith('hdl:signal:')) {
     const name = ref.referenceName.slice('hdl:signal:'.length);
