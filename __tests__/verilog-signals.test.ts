@@ -73,6 +73,68 @@ initial q=p::value(x); endmodule`);
     expect(result.unresolvedReferences.filter(r => r.referenceName.startsWith('hdl:signal:')).map(r => r.referenceName)).toEqual(['hdl:signal:q', 'hdl:signal:x']);
   });
 
+  it('records bit/part-select bases, bounds and concatenated assignment targets', () => {
+    const result = extractFromSource('selects.sv', `module top;
+assign x[3] = y;
+assign x[i+:W] = y;
+assign x[msb:lsb] = y;
+assign {a, b[j]} = v;
+endmodule`);
+    const refs = (line: number) => result.unresolvedReferences.filter(r => r.line === line && r.referenceName.startsWith('hdl:signal:')).map(r => r.referenceName);
+    expect(refs(2)).toEqual(['hdl:signal:x', 'hdl:signal:y']);
+    expect(refs(3)).toEqual(['hdl:signal:x', 'hdl:signal:i', 'hdl:signal:W', 'hdl:signal:y']);
+    expect(refs(4)).toEqual(['hdl:signal:x', 'hdl:signal:msb', 'hdl:signal:lsb', 'hdl:signal:y']);
+    expect(refs(5)).toEqual(['hdl:signal:a', 'hdl:signal:b', 'hdl:signal:j', 'hdl:signal:v']);
+  });
+
+  it('keeps index expressions but never flattens hierarchical LHS members', () => {
+    const result = extractFromSource('member-select.sv', `module top;
+assign remote.x[i] = y;
+assign {a, remote.x[j]} = v;
+assign x[bound(i)+:pkg::W] = y;
+assign pkg::x[i] = y;
+assign x[i].field[j] = y;
+assign $root.top.x[i] = y;
+endmodule`);
+    const refs = (line: number) => result.unresolvedReferences.filter(r => r.line === line && r.referenceName.startsWith('hdl:signal:')).map(r => r.referenceName);
+    expect(refs(2)).toEqual(['hdl:signal:i', 'hdl:signal:y']);
+    expect(refs(3)).toEqual(['hdl:signal:a', 'hdl:signal:j', 'hdl:signal:v']);
+    expect(refs(4)).toEqual(['hdl:signal:x', 'hdl:signal:i', 'hdl:signal:y']);
+    expect(refs(5)).toEqual(['hdl:signal:i', 'hdl:signal:y']);
+    expect(refs(6)).toEqual(['hdl:signal:i', 'hdl:signal:j', 'hdl:signal:y']);
+    expect(refs(7)).toEqual(['hdl:signal:i', 'hdl:signal:y']);
+  });
+
+  it('does not bind procedural for/foreach variables to matching module ports', () => {
+    const result = extractFromSource('procedural-loop.sv', `module top(input i, input j, input y);
+logic [7:0] x;
+initial for (int i=0;i<4;i++) x[i]=y;
+initial foreach (x[j]) x[j]=y;
+endmodule`);
+    const refs = result.unresolvedReferences.filter(r => r.referenceName.startsWith('hdl:signal:')).map(r => r.referenceName);
+    expect(refs).not.toContain('hdl:signal:i');
+    expect(refs).not.toContain('hdl:signal:j');
+    expect(refs).toContain('hdl:signal:x');
+    expect(refs).toContain('hdl:signal:y');
+  });
+
+  it('does not bind qualified procedural targets to same-named local ports', () => {
+    const result = extractFromSource('procedural-package.sv', `package p; logic x; endpackage
+module top(input a, input x, input i, input j, output [7:0] y);
+always_comb p::x = a;
+always_comb p::x[i] = helper(a);
+always_comb {p::x[i], y[j]} = a;
+always_comb remote.x[i] = a;
+assign y = p::x[i];
+endmodule`);
+    const refs = (line: number) => result.unresolvedReferences.filter(r => r.line === line && r.referenceName.startsWith('hdl:signal:')).map(r => r.referenceName);
+    expect(refs(3)).toEqual(['hdl:signal:a']);
+    expect(refs(4)).toEqual(['hdl:signal:i', 'hdl:signal:a']);
+    expect(refs(5)).toEqual(['hdl:signal:i', 'hdl:signal:y', 'hdl:signal:j', 'hdl:signal:a']);
+    expect(refs(6)).toEqual(['hdl:signal:i', 'hdl:signal:a']);
+    expect(refs(7)).toEqual(['hdl:signal:y', 'hdl:signal:i']);
+  });
+
   it('does not flatten hierarchical members into local signal references', () => {
     const result = extractFromSource('scope.sv', 'module top; wire x,y; assign x = remote.y; endmodule');
     expect(result.unresolvedReferences.filter(r => r.referenceName.startsWith('hdl:signal:')).map(r => r.referenceName)).toEqual(['hdl:signal:x']);

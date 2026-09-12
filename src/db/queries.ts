@@ -163,6 +163,14 @@ interface UnresolvedRefRow {
  * refs against newly-added node names.
  */
 function referenceNameTail(referenceName: string): string {
+  // Named HDL connections carry structured module/port/instance identity.
+  // Retry on the formal port name when a previously removed port reappears.
+  if (referenceName.startsWith('hdl:port:')) {
+    try {
+      const parts: unknown = JSON.parse(referenceName.slice('hdl:port:'.length));
+      if (Array.isArray(parts) && parts.length === 3 && typeof parts[1] === 'string') return parts[1];
+    } catch { /* Malformed refs retain the generic tail behavior below. */ }
+  }
   // Erlang refs carry a written arity (`f/1`, `mod::fn/2` — #1610); the tail a
   // new symbol's plain name could match is the arity-less function name.
   const base = referenceName.replace(/\/\d{1,3}$/, '') || referenceName;

@@ -46,10 +46,21 @@ export function addVerilogSignalReferences(node: SyntaxNode, ctx: ExtractorConte
       const id = current.childForFieldName('name') ?? identifier(current);
       if (id) shadowed.add(getNodeText(id, ctx.source));
     }
+    if (current.type === 'for_variable_declaration' || current.type === 'loop_variables') {
+      for (const id of children(current).filter(n => ['simple_identifier', 'escaped_identifier'].includes(n.type))) {
+        shadowed.add(getNodeText(id, ctx.source));
+      }
+    }
     for (const child of children(current)) findLocals(child);
   };
   findLocals(node);
   const skip = new Set(['data_declaration', 'net_declaration', 'tf_call', 'ps_or_hierarchical_function_identifier']);
+  const emit = (id: SyntaxNode): void => {
+    const name = getNodeText(id, ctx.source).trim();
+    if (shadowed.has(name) || isVerilogGenerateBinding(id, ctx, name)) return;
+    ctx.addUnresolvedReference({ fromNodeId: ownerId, referenceName: `hdl:signal:${name}`,
+      referenceKind: 'references', line: id.startPosition.row + 1, column: id.startPosition.column });
+  };
   const visit = (current: SyntaxNode): void => {
     // A package-qualified call is also parsed as method_call. Its receiver
     // may name a package, never evidence for an identically named local port.
@@ -66,16 +77,41 @@ export function addVerilogSignalReferences(node: SyntaxNode, ctx: ExtractorConte
       }
       return;
     }
-    if (current.type === 'hierarchical_identifier' || current.type === 'net_lvalue') {
-      const ids = children(current).filter(n => ['simple_identifier', 'escaped_identifier'].includes(n.type));
-      const text = getNodeText(current, ctx.source).trim();
-      if (ids.length === 1 && ids[0] && getNodeText(ids[0], ctx.source).trim() === text) {
-        if (shadowed.has(text) || isVerilogGenerateBinding(current, ctx, text)) return;
-        ctx.addUnresolvedReference({ fromNodeId: ownerId, referenceName: `hdl:signal:${text}`,
-          referenceKind: 'references', line: current.startPosition.row + 1, column: current.startPosition.column });
+    if (['variable_lvalue', 'primary', 'constant_primary'].includes(current.type) && children(current).some(n => n.type.endsWith('_scope') || n.type === 'implicit_class_handle')) {
+      // p::x (on either side) is a package variable, even though the grammar wraps x in a
+      // single hierarchical_identifier. Keep index expressions, not its name.
+      for (const child of children(current)) {
+        if (['select', 'constant_select', 'variable_lvalue'].includes(child.type)) visit(child);
+      }
+      return;
+    }
+    if (current.type === 'net_lvalue') {
+      const id = identifier(current);
+      const select = children(current).find(n => n.type === 'constant_select');
+      // The grammar puts `.member` identifiers directly inside constant_select,
+      // whereas bit/part-select expressions have their own nested AST nodes.
+      const hasMember = select && children(select).some(n => ['simple_identifier', 'escaped_identifier'].includes(n.type));
+      const hasQualifier = children(current).some(n => n.id !== id?.id && !['constant_select', 'net_lvalue'].includes(n.type));
+      if (id && !hasMember && !hasQualifier) emit(id);
+      // Concatenations recurse through nested net_lvalue; bounds recurse through
+      // constant_select. Bare member identifiers are never emitted by this walk.
+      for (const child of children(current)) if (child.id !== id?.id) visit(child);
+      return;
+    }
+    if (current.type === 'hierarchical_identifier' || current.type === 'constant_primary') {
+      const id = identifier(current);
+      // A single AST identifier is local evidence; qualified/member expressions
+      // must not collapse to a terminal name merely because that signal exists.
+      if (id && children(current).length === 1 && getNodeText(id, ctx.source).trim() === getNodeText(current, ctx.source).trim()) {
+        emit(id);
         return;
       }
-      if (current.type === 'hierarchical_identifier') return;
+      if (current.type === 'hierarchical_identifier') {
+        for (const child of children(current)) {
+          if (['constant_bit_select', 'bit_select', 'select'].includes(child.type)) visit(child);
+        }
+        return;
+      }
     }
     for (const child of children(current)) visit(child);
   };

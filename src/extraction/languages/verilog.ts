@@ -202,21 +202,33 @@ function handleInstantiation(node: SyntaxNode, ctx: ExtractorContext): boolean {
     if (created) {
       addReference(created.id, child);
       addVerilogSignalReferences(child, ctx, created.id);
+      ctx.pushScope(created.id);
       const connections = firstChildOfType(child, ['list_of_port_connections']);
       for (const connection of connections?.namedChildren ?? []) {
-        // Shorthand .port connects the same local name. Empty .port() and .*
-        // provide no explicit local expression and are kept only in signature.
         if (connection.type !== 'named_port_connection') continue;
         const port = getChildByField(connection, 'port_name');
-        if (port && !isVerilogGenerateBinding(connection, ctx, getNodeText(port, ctx.source))
+        if (!port) continue; // Wildcard .* has no explicit formal endpoint.
+        const portName = getNodeText(port, ctx.source);
+        const binding = ctx.createNode('property', portName, connection, {
+          signature: getNodeText(connection, ctx.source), decorators: ['hdl:connection'],
+        });
+        if (binding) {
+          ctx.addUnresolvedReference({ fromNodeId: binding.id,
+            referenceName: `hdl:port:${JSON.stringify([moduleName, portName, created.id])}`,
+            referenceKind: 'references', line: port.startPosition.row + 1, column: port.startPosition.column });
+          addVerilogSignalReferences(connection, ctx, binding.id);
+        }
+        // Shorthand .port connects the same local name. Empty .port() has a
+        // formal endpoint but no local expression; no drive direction inferred.
+        if (!isVerilogGenerateBinding(connection, ctx, portName)
           && /^\s*\.\s*[^()\s]+\s*$/.test(getNodeText(connection, ctx.source))) {
-          ctx.addUnresolvedReference({ fromNodeId: created.id,
-            referenceName: `hdl:signal:${getNodeText(port, ctx.source)}`,
-            referenceKind: 'references', line: port.startPosition.row + 1,
-            column: port.startPosition.column });
+          for (const owner of [created, ...(binding ? [binding] : [])]) {
+            ctx.addUnresolvedReference({ fromNodeId: owner.id,
+              referenceName: `hdl:signal:${portName}`, referenceKind: 'references',
+              line: port.startPosition.row + 1, column: port.startPosition.column });
+          }
         }
       }
-      ctx.pushScope(created.id);
     }
     visitNamedChildren(child, ctx);
     if (created) ctx.popScope();

@@ -60,7 +60,7 @@ calls; a grep/read exploration is dozens.
 
 ## Verilog / SystemVerilog
 
-Query module and instance names to inspect hierarchy and the exact port-connection source. Ports/signals, generate scopes, modports and always/assign blocks are searchable. HDL references record syntactic signal use, not drive direction, timing or elaborated connectivity; wildcard connections and generate iterations are not expanded. Qualified package calls retain package identity.
+Query module and instance names to inspect hierarchy and the exact port-connection source. Ports/signals, generate scopes, modports and always/assign blocks are searchable. Query an instance-qualified connection such as top.u_rx1.rx to inspect its local expression and declared target port; an explicit empty connection still names a formal port but has no local endpoint. Bit/part-select references identify the base signal and indexed expressions, not evaluated widths. HDL references record syntactic signal use, not drive direction, timing or elaborated connectivity; wildcard connections and generate iterations are not expanded. Qualified package calls retain package identity.
 
 ## Anti-patterns
 

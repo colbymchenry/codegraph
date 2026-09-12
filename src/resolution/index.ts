@@ -23,6 +23,7 @@ import { isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCall
 import { isVisibleCppMacro } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { isVerilogMemberRef, matchVerilogMember } from './verilog-members';
+import { isVerilogPortRef, matchVerilogPort } from './verilog-ports';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
@@ -900,6 +901,7 @@ export class ReferenceResolver {
 
   private resolveOneInner(ref: UnresolvedRef): ResolvedRef | null {
     if (isCppConstructorRef(ref)) return matchCppConstructor(ref, this.context);
+    if (isVerilogPortRef(ref)) return matchVerilogPort(ref, this.context, matchReference);
     if (isVerilogMemberRef(ref)) return matchVerilogMember(ref, this.context);
     // Skip built-in/external references
     if (this.isBuiltInOrExternal(ref)) {
