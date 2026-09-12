@@ -51,6 +51,12 @@ import {
 import { getUpdateNotice } from '../upgrade/update-check';
 import { ExploreDiagnostics } from './explore-diagnostics';
 import {
+  IndexVersionWarningState,
+  formatIndexBuildVersion,
+  formatIndexVersionWarning,
+  formatRunningVersion,
+} from './index-version-warning';
+import {
   EXPLORE_EMISSION_KEY,
   EXPLORE_SESSION_VIEW_ARG,
   ExploreSessionState,
@@ -2092,6 +2098,45 @@ export class ToolHandler {
   }
 
   /**
+   * Warn this MCP client once for each selected project whose persisted
+   * extraction version predates the running engine. The state belongs to the
+   * client session, never this shared handler: one daemon serves many clients.
+   */
+  private withIndexVersionNotice(
+    result: ToolResult,
+    projectPath: string | undefined,
+    state: IndexVersionWarningState | undefined,
+  ): ToolResult {
+    if (!state || result.isError) return result;
+    const [first, ...rest] = result.content;
+    if (!first || first.type !== 'text') return result;
+
+    let cg: CodeGraph;
+    try {
+      cg = this.getCodeGraph(projectPath);
+      if (!cg.isIndexStale()) return result;
+    } catch {
+      // No initialized project (or a project that cannot be opened) has no
+      // trustworthy build metadata to report and must not consume a warning.
+      return result;
+    }
+
+    let root: string;
+    try {
+      root = resolvePath(cg.getProjectRoot());
+    } catch {
+      return result;
+    }
+    if (!state.claim(root)) return result;
+
+    const warning = formatIndexVersionWarning(cg.getIndexBuildInfo());
+    return {
+      ...result,
+      content: [{ type: 'text', text: `${warning}\n\n${first.text}` }, ...rest],
+    };
+  }
+
+  /**
    * Execute a tool by name.
    *
    * `sessionState` is the CALLER's per-session explore history (CG-17). The
@@ -2104,6 +2149,7 @@ export class ToolHandler {
     toolName: string,
     args: Record<string, unknown>,
     sessionState?: ExploreSessionState,
+    indexVersionWarnings?: IndexVersionWarningState,
   ): Promise<ToolResult> {
     try {
       // Block the first tool call on the engine's post-open reconcile so we
@@ -2149,7 +2195,12 @@ export class ToolHandler {
       // a worker (whose read connection has no watcher). It also skips the
       // auto-banner wrapper to avoid duplicating its own pending-files section.
       if (toolName === 'codegraph_status') {
-        return await this.handleStatus(args);
+        const result = await this.handleStatus(args);
+        return this.withIndexVersionNotice(
+          result,
+          args.projectPath as string | undefined,
+          indexVersionWarnings,
+        );
       }
 
       // Read tools: off-load the CPU-heavy dispatch to the worker pool when one
@@ -2181,7 +2232,15 @@ export class ToolHandler {
       // caller passed session state.
       const result = this.takeExploreEmission(raw, sessionState);
       const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
-      return this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
+      const withStaleness = this.withStalenessNotice(
+        withWorktree,
+        args.projectPath as string | undefined,
+      );
+      return this.withIndexVersionNotice(
+        withStaleness,
+        args.projectPath as string | undefined,
+        indexVersionWarnings,
+      );
     } catch (err) {
       // Expected condition, not a malfunction: answer as a SUCCESS so the
       // agent keeps trusting the toolset for projects that ARE indexed.
@@ -6530,6 +6589,11 @@ export class ToolHandler {
       } catch { /* closed instance — leave as is */ }
     }
     const stats = cg.getStats();
+    const buildInfo = cg.getIndexBuildInfo();
+    const reindexRecommended = cg.isIndexStale();
+    const indexBuildLabel = cg.getLastIndexedAt() == null
+      ? 'not indexed yet'
+      : formatIndexBuildVersion(buildInfo);
 
     // Warn when this index actually belongs to a different git working tree
     // (e.g. the server resolved up from a nested worktree to the main checkout).
@@ -6555,6 +6619,11 @@ export class ToolHandler {
     // Surface the active SQLite backend (node:sqlite, Node's built-in real
     // SQLite — full WAL + FTS5, no native build).
     lines.push(`**Backend:** node:sqlite (Node built-in) — full WAL + FTS5`);
+    lines.push(
+      `**Index built with:** ${indexBuildLabel}`,
+      `**Running CodeGraph:** ${formatRunningVersion()}`,
+      `**Re-index recommended:** ${reindexRecommended ? 'yes — run `codegraph index`' : 'no'}`,
+    );
 
     // Effective journal mode. 'wal' ⇒ concurrent reads never block on a writer;
     // anything else ⇒ they can ("database is locked"). node:sqlite supports WAL
