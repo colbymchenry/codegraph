@@ -82,7 +82,9 @@ export function isVisibleCppMacro(ref: UnresolvedRef, context: ResolutionContext
           const name = directive[2]!;
           const defining = directive[1] === 'define';
           const previous = definitions.get(name);
-          const defined = defining ? or(previous?.defined ?? false, active) : and(previous?.defined ?? false, not(active));
+          // An absent entry is false; an existing unknown must stay unknown.
+          const prior = previous ? previous.defined : false;
+          const defined = defining ? or(prior, active) : and(prior, not(active));
           const assumedValue = defining ? condition(text.slice(directive[0].length), scope) : false;
           const value = active === true ? assumedValue : undefined;
           definitions.set(name, { defined, value, assumedDefined: defining, assumedValue, scope: [...scope] });

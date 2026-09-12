@@ -47,13 +47,47 @@ function findDeclaratorQualifiedId(declarator: SyntaxNode): SyntaxNode | undefin
  *    `TEST_F(Fixture, Name)`, `PYBIND11_MODULE(ext, m)`,
  *    google-benchmark's `BENCHMARK_DEFINE_F(Fix, name)` all bail here).
  */
+function singleParameterMacroNamesFunction(node: SyntaxNode, macroName: string, source: string): boolean {
+  let root = node;
+  while (root.parent) root = root.parent;
+  let definition: SyntaxNode | undefined;
+  const pending = [root];
+  while (pending.length) {
+    const candidate = pending.pop()!;
+    if (candidate.startIndex >= node.startIndex) continue;
+    if (candidate.type === 'preproc_function_def' &&
+        getChildByField(candidate, 'name')?.text === macroName &&
+        (!definition || candidate.startIndex > definition.startIndex)) definition = candidate;
+    pending.push(...candidate.namedChildren);
+  }
+  if (!definition) return false;
+  const params = getChildByField(definition, 'parameters');
+  const value = getChildByField(definition, 'value');
+  const parameter = params?.namedChild(0);
+  if (params?.namedChildCount !== 1 || parameter?.type !== 'identifier' || !value) return false;
+  // The first declarator's name must be the parameter. A later use inside
+  // noexcept(name()), an attribute or another expression is not a definition.
+  const head = getNodeText(value, source).split('(')[0]?.trim() ?? '';
+  const match = head.match(/^(?:[A-Za-z_]\w*(?:::\w+)*(?:[ \t]+|[*&][ \t]*))+([A-Za-z_]\w*)$/);
+  return match?.[1] === getNodeText(parameter, source);
+}
+
 function recoverCppMacroDefinedName(node: SyntaxNode, source: string): string | undefined {
-  if (node.type !== 'function_definition') return undefined;
+  if (node.type !== 'function_definition' || getChildByField(node, 'type')) return undefined;
   const declarator = getChildByField(node, 'declarator');
   if (declarator?.type !== 'function_declarator') return undefined;
   const inner = getChildByField(declarator, 'declarator');
   if (inner?.type !== 'identifier') return undefined;
   const macroName = getNodeText(inner, source);
+  // A real constructor has no return type too. Its owner is authoritative,
+  // including when a same-named macro appeared earlier and was undefined.
+  for (let owner = node.parent; owner; owner = owner.parent) {
+    if (owner.type === 'class_specifier' || owner.type === 'struct_specifier') {
+      const ownerName = getChildByField(owner, 'name');
+      if (ownerName && stripCppTemplateArgs(getNodeText(ownerName, source)) === macroName) return undefined;
+      break;
+    }
+  }
   if (!/^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(macroName)) return undefined;
   const params = getChildByField(declarator, 'parameters');
   if (!params || params.namedChildCount < 1) return undefined;
@@ -69,8 +103,7 @@ function recoverCppMacroDefinedName(node: SyntaxNode, source: string): string | 
   if (params.namedChildCount === 1) {
     // A single bare argument is ambiguous unless this file defines the macro
     // as a function declaration using its parameter as the function name.
-    const definition = source.match(new RegExp(`^\\s*#\\s*define[ \\t]+${macroName}\\(([A-Za-z_]\\w*)\\)[ \\t]+([^\\n]+)`, 'm'));
-    if (!definition || !new RegExp(`\\b${definition[1]}[ \\t]*\\(`).test(definition[2]!)) return undefined;
+    if (!singleParameterMacroNamesFunction(node, macroName, source)) return undefined;
   }
   for (let i = 1; i < params.namedChildCount; i++) {
     const p = params.namedChild(i);
@@ -223,7 +256,8 @@ export const cExtractor: LanguageExtractor = {
     const name = declarator?.namedChild(0);
     // C parses FN(name) { ... } as type FN + (name) declarator.
     if (node.type === 'function_definition' && declarator?.type === 'parenthesized_declarator' &&
-        declarator.namedChildCount === 1 && name?.type === 'identifier') return getNodeText(name, source);
+        declarator.namedChildCount === 1 && name?.type === 'identifier' &&
+        singleParameterMacroNamesFunction(node, getChildByField(node, 'type')?.text ?? '', source)) return getNodeText(name, source);
     return undefined;
   },
   functionTypes: ['function_definition'],
@@ -1743,6 +1777,20 @@ export const cppExtractor: LanguageExtractor = {
   resolveName: extractCppQualifiedMethodName,
   getReceiverType: extractCppReceiverType,
   getReturnType: extractCppReturnType,
+  getSignature: (node, source) => {
+    if (getChildByField(node, 'type') || recoverCppMacroDefinedName(node, source)) return undefined;
+    // Macro invocation parameters are not the generated function signature.
+    // Only method/constructor syntax contributes this parameter-only signature.
+    let isMethod = !!extractCppReceiverType(node, source);
+    for (let owner = node.parent; !isMethod && owner; owner = owner.parent) {
+      if (owner.type === 'field_declaration_list') { isMethod = true; break; }
+      if (owner.type === 'function_definition' || owner.type === 'compound_statement') break;
+    }
+    if (!isMethod) return undefined;
+    const declarator = getChildByField(node, 'declarator');
+    const parameters = declarator && getChildByField(declarator, 'parameters');
+    return parameters ? getNodeText(parameters, source) : undefined;
+  },
   getVisibility: (node) => {
     // Check for access specifier in parent
     const parent = node.parent;

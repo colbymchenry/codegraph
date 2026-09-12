@@ -3,7 +3,7 @@
 //!
 //!   `${kind}:${sha256(`${filePath}:${kind}:${name}:${line}`).hex[0..32]}`
 //!
-//! TS/JS uses `node_id_at_column`, appending `:${utf16Column}` before hashing
+//! TS/JS and C++ use `node_id_at_column`, appending `:${utf16Column}` before hashing
 //! so same-line declarations have distinct identities.
 //!
 //! and the file-node special case in `TreeSitterExtractor.extract()`:

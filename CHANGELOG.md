@@ -157,6 +157,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- Исправлены namespace и арность C++ local constructors, ложные вызовы от pointer/reference initializers и same-line C++ IDs.
+- Macro recovery больше не принимает комментарии и noexcept-expression за объявление функции; условный undef сохраняет неопределённость.
+- Symlink-псевдонимы проекта используют один MCP watcher и общий catch-up вместо параллельных экземпляров одного индекса.
+
 - Callback связывается с обработчиком регистрирующего класса, включая TSX→TS и наследование, а не с одноимённым методом другого класса.
 - Исправлены C/C++ macro calls и local constructors; одноаргументные function macros получают подтверждённое имя.
 - TS/JS getter и setter одной строки больше не перезаписывают друг друга; Dart extension types сохраняют правильные границы и членов.

@@ -20,6 +20,7 @@ describe('remaining C/C++ regressions', () => {
   it.each(['c', 'cpp'])('recovers a single-argument declared function macro (%s)', (language) => {
     const result = extractFromSource(`case.${language}`, '#define NATIVE_FN(name) int name(void)\nNATIVE_FN(get_version) { return 1; }\nint use_it(void) { return get_version(); }\n');
     expect(result.nodes.filter(n => n.kind === 'function').map(n => n.name)).toEqual(['get_version', 'use_it']);
+    expect(result.nodes.find(n => n.name === 'get_version')?.signature).toBeUndefined();
   });
   it.each(['c', 'cpp'])('resolves a real call to the macro-declared function (%s)', async (language) => {
     const root = mkdtempSync(join(tmpdir(), 'codegraph-cpp-macro-name-')); roots.push(root);

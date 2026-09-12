@@ -35,3 +35,12 @@ it('keeps local header facts within a hypothetical include path', () => {
     'maths.h':'#pragma once\n#define FAST_MATH\n#if defined(FAST_MATH)\nvoid TRACE(int);\n#else\n#define TRACE(x) (x)\n#endif'});
   expect(visible(ctx,'main.c',5)).toBe(false);
 });
+
+it('does not turn an unknown definition into absence after an unknown undef', () => {
+  const ctx=context({'main.c':'#if ENABLE_TRACE\n#define TRACE(x) ((void)(x))\n#endif\n#if CLEAR_TRACE\n#undef TRACE\n#endif\nvoid run(){TRACE(1);}'});
+  expect(visible(ctx,'main.c',7)).toBe(true);
+});
+it('a definite undef still removes a possible definition', () => {
+  const ctx=context({'main.c':'#if ENABLE_TRACE\n#define TRACE(x) ((void)(x))\n#endif\n#undef TRACE\nvoid run(){TRACE(1);}'});
+  expect(visible(ctx,'main.c',5)).toBe(false);
+});

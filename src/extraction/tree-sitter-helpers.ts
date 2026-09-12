@@ -14,7 +14,7 @@ import { NodeKind } from '../types';
  *
  * Uses a 32-character (128-bit) hash to avoid collisions when indexing
  * large codebases with many files containing similar symbols. The optional
- * UTF-16 column distinguishes same-line declarations (TS/JS); omitted columns
+ * UTF-16 column distinguishes same-line declarations (TS/JS and C++); omitted columns
  * preserve the existing identity format for other extraction paths.
  */
 export function generateNodeId(

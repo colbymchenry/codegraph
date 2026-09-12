@@ -36,6 +36,7 @@ import { groupDefinitions, lastQualifierPart, matchesSymbol } from '../graph/sym
 import { extractQueryPaths, queryMightContainPaths } from '../search/query-paths';
 import {
   existsSync,
+  realpathSync,
   readFileSync,
   statSync,
 } from 'fs';
@@ -1520,8 +1521,18 @@ export class ToolHandler {
   /**
    * Update the default CodeGraph instance (e.g. after lazy initialization)
    */
-  setDefaultCodeGraph(cg: CodeGraph): void {
+  setDefaultCodeGraph(cg: CodeGraph): CodeGraph {
+    const root = realpathSync(cg.getProjectRoot());
+    const cached = this.projectCache.get(root);
+    if (cached && cached !== cg) {
+      // An explicit request may have opened this project before default-root
+      // discovery completed. Preserve its watcher and in-flight catch-up.
+      cg.close();
+      cg = cached;
+    }
+    this.projectCache.delete(root); // default ownership moves to the engine
     this.cg = cg;
+    return cg;
   }
 
   /**
@@ -1532,7 +1543,22 @@ export class ToolHandler {
    * stale data, which is what would have happened without the gate.
    */
   setCatchUpGate(p: Promise<void> | null): void {
+    if (this.projectLifecycle && this.cg) {
+      // Engine defaults and explicit aliases share the same pending gate.
+      // Do not overwrite a catch-up already running on a promoted cache entry.
+      if (p && !this.projectGates.has(this.cg)) this.rememberProjectGate(this.cg, p);
+      if (!p) this.projectGates.delete(this.cg);
+      return;
+    }
     this.catchUpGate = p;
+  }
+
+  private rememberProjectGate(cg: CodeGraph, gate: Promise<void>): void {
+    this.projectGates.set(cg, gate);
+    const clear = (): void => {
+      if (this.projectGates.get(cg) === gate) this.projectGates.delete(cg);
+    };
+    void gate.then(clear, clear);
   }
 
   /**
@@ -1762,7 +1788,8 @@ export class ToolHandler {
     // worktree kept being served the parent checkout's index until restart
     // (#926). The DB connection itself is still cached (by resolved root,
     // below), so re-resolving costs only the stat walk, never a reopen.
-    const resolvedRoot = findNearestCodeGraphRoot(projectPath);
+    const nearestRoot = findNearestCodeGraphRoot(projectPath);
+    const resolvedRoot = nearestRoot ? realpathSync(nearestRoot) : null;
 
     if (!resolvedRoot) {
       throw new NotIndexedError(
@@ -1780,11 +1807,11 @@ export class ToolHandler {
     // support) that surfaces as intermittent
     // "database is locked" on concurrent tool calls. See issue #238. The
     // default instance is owned/closed by the server, so it's never cached.
-    if (this.cg && this.cg.getProjectRoot() === resolvedRoot) {
+    if (this.cg && realpathSync(this.cg.getProjectRoot()) === resolvedRoot) {
       return this.freshen(this.cg);
     }
 
-    // Cache the open DB connection by RESOLVED ROOT only — never by the input
+    // Cache the open DB connection by CANONICAL ROOT only — never by the input
     // path. One key per instance means closeAll() closes each exactly once, and
     // a changed resolution maps to a different entry instead of a stale hit.
     const cached = this.projectCache.get(resolvedRoot);
@@ -2165,15 +2192,14 @@ export class ToolHandler {
 
       // Resolve on the engine thread even when dispatch uses a read worker:
       // explicit projects need the same watcher and initial reconcile as default.
-      if (this.projectLifecycle && pathCheck) {
+      if (this.projectLifecycle && (pathCheck || this.cg)) {
         const cg = this.getCodeGraph(pathCheck);
         let gate = this.projectGates.get(cg);
         if (!gate) {
           // Retry writer ownership on later calls: another engine may have
           // closed since we opened this connection in read-only fallback.
           gate = this.projectLifecycle(cg);
-          this.projectGates.set(cg, gate);
-          void gate.finally(() => this.projectGates.delete(cg));
+          this.rememberProjectGate(cg, gate);
         }
         await this.awaitCatchUpGate(gate);
       }

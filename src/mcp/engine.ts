@@ -12,6 +12,7 @@
 
 import * as os from 'os';
 import * as path from 'path';
+import { realpathSync } from 'fs';
 import type CodeGraph from '../index';
 import { resolveServerRoot } from '../directory';
 import { watchDisabledReason } from '../sync';
@@ -181,7 +182,7 @@ export class MCPEngine {
       this.lastRetrySubScanAt = Date.now();
       if (!res.root) this.toolHandler.setKnownSubprojects(res.candidates, searchFrom);
     }
-    const resolvedRoot = res.root;
+    const resolvedRoot = res.root ? realpathSync(res.root) : null;
     if (!resolvedRoot) return;
     if (res.viaSubScan) this.logSubprojectAdoption(searchFrom, resolvedRoot);
     try {
@@ -192,7 +193,7 @@ export class MCPEngine {
       }
       this.cg = loadCodeGraph().openSync(resolvedRoot);
       this.projectPath = resolvedRoot;
-      this.toolHandler.setDefaultCodeGraph(this.cg);
+      this.cg = this.toolHandler.setDefaultCodeGraph(this.cg);
       this.toolHandler.setCatchUpGate(this.activateProject(this.cg));
       this.maybeStartPool(resolvedRoot);
     } catch {
@@ -238,7 +239,7 @@ export class MCPEngine {
     // variant of this state read as "CodeGraph is broken" and was diagnosable
     // only by knowing to look for a missing ~/.codegraph/daemons/ entry.
     const res = resolveServerRoot(searchFrom);
-    const resolvedRoot = res.root;
+    const resolvedRoot = res.root ? realpathSync(res.root) : null;
     if (!resolvedRoot) {
       // Sessions may still discover a project later via roots/list, and the
       // per-call retry re-resolves — this state is recoverable, hence stderr
@@ -261,7 +262,7 @@ export class MCPEngine {
     this.projectPath = resolvedRoot;
     try {
       this.cg = await loadCodeGraph().open(resolvedRoot);
-      this.toolHandler.setDefaultCodeGraph(this.cg);
+      this.cg = this.toolHandler.setDefaultCodeGraph(this.cg);
       this.toolHandler.setCatchUpGate(this.activateProject(this.cg));
       this.maybeStartPool(resolvedRoot);
     } catch (err) {
@@ -284,7 +285,7 @@ export class MCPEngine {
    * opens get the same writer ownership and catch-up lifecycle as the default.
    */
   private activateProject(cg: CodeGraph): Promise<void> {
-    const root = cg.getProjectRoot();
+    const root = realpathSync(cg.getProjectRoot());
     if (this.closed || this.watchedProjects.has(root)) return Promise.resolve();
     const disabledReason = !this.opts.watch ? 'watch disabled for this engine' : watchDisabledReason(root);
     if (disabledReason) {

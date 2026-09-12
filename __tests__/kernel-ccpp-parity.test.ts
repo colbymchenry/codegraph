@@ -95,6 +95,20 @@ describe.skipIf(!kernelBuilt)('kernel C/C++ extraction parity', () => {
     expect(viaWasm.nodes.length).toBeGreaterThanOrEqual(minNodes);
   }
 
+  it('same-line C++ overloads retain distinct IDs and body references, including UTF-16 columns', () => {
+    const source = `void zero() {} void one() {}
+/* 😀 */ struct Widget { Widget() { zero(); } Widget(int) { one(); } };
+`;
+    assertParity('same-line.cpp', source, 'cpp', 6);
+    assertParity('same-line-crlf.cpp', source.replace(/\n/g, '\r\n'), 'cpp', 6);
+    const result = extractFromSource('same-line.cpp', source, 'cpp');
+    const constructors = result.nodes.filter(n => n.kind === 'method' && n.name === 'Widget');
+    expect(constructors).toHaveLength(2);
+    expect(new Set(constructors.map(n => n.id)).size).toBe(2);
+    expect(result.unresolvedReferences.find(r => r.referenceName === 'zero')?.fromNodeId).toBe(constructors[0].id);
+    expect(result.unresolvedReferences.find(r => r.referenceName === 'one')?.fromNodeId).toBe(constructors[1].id);
+  });
+
   it('torture fixture (c): fn-ptr tables, typedefs, file-scope consts, value-refs', () => {
     const file = path.join(FIXTURE_DIR, 'torture.c');
     assertParity('fixtures/torture.c', fs.readFileSync(file, 'utf8'), 'c');

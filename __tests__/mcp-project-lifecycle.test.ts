@@ -59,6 +59,56 @@ describe('explicit project MCP lifecycle (#1835)', () => {
     expect(fs.existsSync(getWriterPidPath(b))).toBe(false);
   });
 
+  it.skipIf(process.platform === 'win32').each(['explicit', 'default', 'promoted'])(
+    'shares the watcher and pending catch-up across a symlink alias (%s)', async (mode) => {
+      const root = await project();
+      const aliasDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-project-alias-'));
+      roots.push(aliasDir);
+      const alias = path.join(aliasDir, 'link');
+      fs.symlinkSync(root, alias, 'dir');
+      fs.writeFileSync(path.join(root, 'added.ts'), 'export function added() {}');
+      const { ExtractionOrchestrator } = require('../dist/extraction') as typeof import('../src/extraction');
+      let release!: () => void;
+      const paused = new Promise<void>(resolve => { release = resolve; });
+      let entered!: () => void;
+      const started = new Promise<void>(resolve => { entered = resolve; });
+      const original = ExtractionOrchestrator.prototype.sync;
+      vi.spyOn(ExtractionOrchestrator.prototype, 'sync').mockImplementation(async function (...args) {
+        entered();
+        await paused;
+        return original.apply(this, args);
+      });
+      const watch = vi.spyOn(CodeGraph.prototype, 'watch');
+      const sync = vi.spyOn(CodeGraph.prototype, 'sync');
+      const e = engine();
+      const handler = e.getToolHandler();
+      if (mode === 'default') await e.ensureInitialized(alias);
+      const first = mode === 'default'
+        ? handler.execute('codegraph_files', {}).then(result => JSON.stringify(result))
+        : files(e, root);
+      await started;
+      let secondSettled = false;
+      let second: Promise<string> | undefined;
+      try {
+        if (mode === 'promoted') await e.ensureInitialized(alias);
+        second = (mode === 'promoted'
+          ? handler.execute('codegraph_files', {}).then(result => JSON.stringify(result))
+          : files(e, alias)).then(result => { secondSettled = true; return result; });
+        await new Promise(resolve => setTimeout(resolve, 80));
+        expect(secondSettled).toBe(false);
+        expect(watch).toHaveBeenCalledTimes(1);
+        expect(sync).toHaveBeenCalledTimes(1);
+        if (mode !== 'explicit') expect(e.getProjectPath()).toBe(root);
+      } finally {
+        release();
+        await first;
+        await second;
+      }
+      expect(await first).toContain('added.ts');
+      expect(await second).toContain('added.ts');
+    },
+  );
+
   it('auto-syncs subsequent edits in explicit projects', async () => {
     vi.stubEnv('CODEGRAPH_WATCH_DEBOUNCE_MS', '100');
     const root = await project();

@@ -1399,9 +1399,9 @@ export class TreeSitterExtractor {
       return null;
     }
 
-    // TS/JS permits same-name declarations on one line (notably get/set).
+    // TS/JS accessors and C++ overloads can share a name and source line.
     // Include the UTF-16 column for these languages so their edges cannot alias.
-    const column = ['typescript', 'tsx', 'javascript', 'jsx'].includes(this.language)
+    const column = ['typescript', 'tsx', 'javascript', 'jsx', 'cpp'].includes(this.language)
       ? node.startPosition.column : undefined;
     const id = generateNodeId(this.filePath, kind, name, node.startPosition.row + 1, column);
 
@@ -5110,8 +5110,8 @@ export class TreeSitterExtractor {
    *    reference, and function declarators are excluded, including the
    *    most-vexing-parse `Calculator c();` (a function declaration).
    */
-  private isCppStackConstruction(node: SyntaxNode): boolean {
-    if (node.namedChildren.some(c => c.type === 'storage_class_specifier' && c.text === 'extern')) return false;
+  private cppStackConstructions(node: SyntaxNode): Array<{ node: SyntaxNode; arity: number }> {
+    if (node.namedChildren.some(c => c.type === 'storage_class_specifier' && c.text === 'extern')) return [];
     const typeNode = getChildByField(node, 'type');
     if (
       !typeNode ||
@@ -5119,18 +5119,23 @@ export class TreeSitterExtractor {
         typeNode.type !== 'template_type' &&
         typeNode.type !== 'qualified_identifier')
     ) {
-      return false;
+      return [];
     }
+    const constructions: Array<{ node: SyntaxNode; arity: number }> = [];
     for (let i = 0; i < node.namedChildCount; i++) {
       const child = node.namedChild(i);
-      if (child?.type === 'identifier') return true; // T object; default construction
+      if (child?.type === 'identifier') { constructions.push({ node: child, arity: 0 }); continue; }
       if (child?.type !== 'init_declarator') continue;
+      const declarator = getChildByField(child, 'declarator');
+      if (declarator?.type !== 'identifier' && declarator?.type !== 'array_declarator') continue;
       const value = getChildByField(child, 'value');
       if (value && (value.type === 'argument_list' || value.type === 'initializer_list')) {
-        return true;
+        // Array initializer elements are objects, not constructor arguments.
+        if (declarator.type === 'array_declarator' && value.namedChildCount !== 0) continue;
+        constructions.push({ node: child, arity: value.namedChildren.filter(c => c.type !== 'comment').length });
       }
     }
-    return false;
+    return constructions;
   }
 
   /**
@@ -5662,15 +5667,16 @@ export class TreeSitterExtractor {
       // (which strips template args / namespace and emits the `instantiates`
       // ref). Children still recurse below, so a nested ctor-arg call
       // (`Calculator calc(make())`) keeps its own `calls` ref.
-      if (nodeType === 'declaration' && this.language === 'cpp' && this.isCppStackConstruction(node)) {
-        this.extractInstantiation(node);
+      if (nodeType === 'declaration' && this.language === 'cpp') {
+        const constructions = this.cppStackConstructions(node);
+        if (constructions.length) this.extractInstantiation(node);
         const type = getChildByField(node, 'type');
         const className = type ? stripCppTemplateArgs(getNodeText(type, this.source)) : '';
         const name = className.split('::').filter(Boolean).pop();
         const callerId = this.nodeStack[this.nodeStack.length - 1];
-        if (name && callerId) this.unresolvedReferences.push({
+        if (name && callerId) for (const construction of constructions) this.unresolvedReferences.push({
           fromNodeId: callerId,
-          referenceName: `${className}::${name}`,
+          referenceName: `${className}::${name}/${construction.arity}`,
           referenceKind: 'calls',
           line: node.startPosition.row + 1,
           column: node.startPosition.column,
