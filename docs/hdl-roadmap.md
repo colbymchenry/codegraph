@@ -12,12 +12,16 @@
 3. Regression tests, реальные Dual UART/eMMC/AXI, повторная индексация,
    build, проверки backend, push трёх remote и обновление draft PR #1845.
 
-## Последующие пакеты
+## Реализованный пакет после 7d0321ae
 
 - Позиционные подключения: source-order ports, включая non-ANSI headers,
   пустые позиции и проверку числа формальных портов.
 - Wildcard .*: раскрытие только при известном module и доступном локальном
   сигнале; explicit connections имеют приоритет, unknown остаётся unknown.
+- tree-sitter-systemverilog 0.4.0: проверка ABI, реальных корпусов и современных конструкций.
+
+## Последующие пакеты
+
 - Procedural block scope и generate bindings как отдельные объявления;
   затем классификация syntactic read/write с отрицательными controls.
 - Filelists/include paths/defines как явная конфигурация проекта, чтобы

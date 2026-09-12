@@ -966,6 +966,11 @@ export class CodeGraph {
             result.definitionDelta,
             result.changedFilePaths ?? []
           );
+          // A deleted duplicate module can make an HDL binding unique again.
+          // Deletion-only syncs skip the changed-file failed-ref retry above.
+          const hdlRetry = this.queries.getRetryableFailedReferences(result.definitionDelta)
+            .filter(ref => ref.referenceName.startsWith('hdl:wildcard:') || ref.referenceName.startsWith('hdl:port-position:'));
+          if (hdlRetry.length > 0) await this.resolver.resolveAndPersistListYielding(hdlRetry);
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
             console.error(
               `[phase-timing] sync-rebind: ${Date.now() - tRebind}ms (${result.definitionDelta.length} changed names, ${rebound} edges re-opened)`

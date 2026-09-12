@@ -165,6 +165,14 @@ interface UnresolvedRefRow {
 function referenceNameTail(referenceName: string): string {
   // Named HDL connections carry structured module/port/instance identity.
   // Retry on the formal port name when a previously removed port reappears.
+  for (const prefix of ['hdl:port-position:', 'hdl:wildcard:']) {
+    if (referenceName.startsWith(prefix)) {
+      try {
+        const parts: unknown = JSON.parse(referenceName.slice(prefix.length));
+        if (Array.isArray(parts) && typeof parts[0] === 'string') return parts[0];
+      } catch { /* Fall back for malformed internal references. */ }
+    }
+  }
   if (referenceName.startsWith('hdl:port:')) {
     try {
       const parts: unknown = JSON.parse(referenceName.slice('hdl:port:'.length));
@@ -3543,8 +3551,25 @@ export class QueryBuilder {
     refs: UnresolvedReference[]
   ): number {
     return this.db.transaction(() => {
-      const changed = this.deleteEdgesByIds(edgeIds);
-      this.insertUnresolvedRefsBatch(refs);
+      let changed = this.deleteEdgesByIds(edgeIds);
+      const seenHdl = new Set<string>();
+      const pending = refs.filter(ref => {
+        if (!ref.referenceName.startsWith('hdl:wildcard:') && !ref.referenceName.startsWith('hdl:port-position:')) return true;
+        const key = JSON.stringify([ref.fromNodeId, ref.referenceName, ref.line, ref.column]);
+        if (seenHdl.has(key)) return false;
+        seenHdl.add(key);
+        return true;
+      });
+      // A wildcard/positional binding depends on the entire module header.
+      // Invalidate its complete fan-out, including actual signals in untouched
+      // files, before rebuilding it from one original reference.
+      for (const ref of pending) {
+        if (ref.referenceName.startsWith('hdl:wildcard:') || ref.referenceName.startsWith('hdl:port-position:')) {
+          changed += this.db.prepare("DELETE FROM edges WHERE source = ? AND json_extract(metadata, '$.refName') = ?")
+            .run(ref.fromNodeId, ref.referenceName).changes;
+        }
+      }
+      this.insertUnresolvedRefsBatch(pending);
       return changed;
     })();
   }

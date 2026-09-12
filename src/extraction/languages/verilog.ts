@@ -1,4 +1,4 @@
-import { visitVerilogSignals, addVerilogSignalReferences, isVerilogGenerateBinding } from './verilog-signals';
+import { getVerilogPortOrder, visitVerilogSignals, addVerilogSignalReferences, isVerilogGenerateBinding } from './verilog-signals';
 import { handleVerilogPackageNode, getVerilogCallName } from './verilog-packages';
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { getNodeText, getChildByField } from '../tree-sitter-helpers';
@@ -106,7 +106,9 @@ function handleContainer(
     visitNamedChildren(node, ctx);
     return true;
   }
-  const created = ctx.createNode(kind, name, node);
+  const order = getVerilogPortOrder(node, ctx.source);
+  const created = ctx.createNode(kind, name, node, order === null ? undefined
+    : { decorators: [`hdl:port-order:${JSON.stringify(order)}`] });
   if (created) ctx.pushScope(created.id);
   visitNamedChildren(node, ctx);
   if (created) ctx.popScope();
@@ -153,6 +155,23 @@ function handleGenerateBlock(node: SyntaxNode, ctx: ExtractorContext): boolean {
   visitNamedChildren(node, ctx);
   if (created) ctx.popScope();
   return true;
+}
+
+/** Direct AST commas delimit slots; nested expression commas stay inside their node. */
+function positionalConnections(node: SyntaxNode, ctx: ExtractorContext, leading: SyntaxNode[] = []): Array<{ position: SyntaxNode; text: string }> | null {
+  if (node.hasError || node.namedChildren.some(n => !['ordered_port_connection', 'comment', 'block_comment', 'one_line_comment'].includes(n.type))) return null;
+  const slots: Array<{ position: SyntaxNode; text: string }> = [];
+  let start = leading[0]?.startIndex ?? node.startIndex;
+  let position: SyntaxNode = leading[0] ?? node;
+  for (const child of [...leading.flatMap(n => n.children), ...node.children]) {
+    if (child.type === ',') {
+      slots.push({ position, text: ctx.source.slice(start, child.startIndex).trim() });
+      start = child.endIndex;
+      position = child;
+    } else if (child.type === 'ordered_port_connection') position = child;
+  }
+  slots.push({ position, text: ctx.source.slice(start, node.endIndex).trim() });
+  return slots;
 }
 
 function handleInstantiation(node: SyntaxNode, ctx: ExtractorContext): boolean {
@@ -204,13 +223,57 @@ function handleInstantiation(node: SyntaxNode, ctx: ExtractorContext): boolean {
       addVerilogSignalReferences(child, ctx, created.id);
       ctx.pushScope(created.id);
       const connections = firstChildOfType(child, ['list_of_port_connections']);
-      for (const connection of connections?.namedChildren ?? []) {
+      // This grammar wraps leading empty-slot commas in ERROR. Accept only
+      // those literal separators; all other parse errors/mixed lists stay opaque.
+      const leadingCommas = child.namedChildren.filter(n => n.type === 'ERROR'
+        && connections && n.endIndex <= connections.startIndex && /^\s*,+\s*$/.test(getNodeText(n, ctx.source)));
+      const allowedErrors = new Set(leadingCommas.map(n => n.id));
+      const soundTree = (part: SyntaxNode): boolean => !part.isMissing && (part.type === 'ERROR'
+        ? allowedErrors.has(part.id) : part.namedChildren.every(soundTree));
+      const validConnections = soundTree(node)
+        && child.namedChildren.filter(n => n.type === 'list_of_port_connections').length === 1;
+      const slots = validConnections && connections ? positionalConnections(connections, ctx, leadingCommas) : null;
+      if (slots) slots.forEach((slot, index) => {
+        const binding = ctx.createNode('property', `port[${index}]`, slot.position, {
+          signature: slot.text, decorators: ['hdl:connection', `hdl:position:${index}`],
+        });
+        if (binding) {
+          ctx.addUnresolvedReference({ fromNodeId: binding.id,
+            referenceName: `hdl:port-position:${JSON.stringify([moduleName, index, slots.length, created.id])}`,
+            referenceKind: 'references', line: slot.position.startPosition.row + 1,
+            column: slot.position.startPosition.column });
+          if (slot.position.type === 'ordered_port_connection') addVerilogSignalReferences(slot.position, ctx, binding.id);
+        }
+      });
+      for (const connection of validConnections ? connections?.namedChildren ?? [] : []) {
         if (connection.type !== 'named_port_connection') continue;
         const port = getChildByField(connection, 'port_name');
-        if (!port) continue; // Wildcard .* has no explicit formal endpoint.
+        if (!port) {
+          if (!getNodeText(connection, ctx.source).includes('.*')) continue;
+          const excluded = (connections?.namedChildren ?? []).flatMap(n => {
+            const formal = getChildByField(n, 'port_name');
+            return formal ? [getNodeText(formal, ctx.source)] : [];
+          });
+          // An implicit generate parameter shadows an outer same-name signal.
+          for (let ancestor = connection.parent; ancestor; ancestor = ancestor.parent) {
+            if (ancestor.type === 'loop_generate_construct') {
+              const init = firstChildOfType(ancestor, ['genvar_initialization']);
+              const id = init && firstSimpleIdentifier(init);
+              if (id) excluded.push(getNodeText(id, ctx.source));
+            }
+            if (['module_declaration', 'interface_declaration', 'program_declaration'].includes(ancestor.type)) break;
+          }
+          const wildcard = ctx.createNode('property', '*', connection, {
+            signature: getNodeText(connection, ctx.source), decorators: ['hdl:connection', 'hdl:wildcard'],
+          });
+          if (wildcard) ctx.addUnresolvedReference({ fromNodeId: wildcard.id,
+            referenceName: `hdl:wildcard:${JSON.stringify([moduleName, created.id, excluded])}`,
+            referenceKind: 'references', line: connection.startPosition.row + 1, column: connection.startPosition.column });
+          continue;
+        }
         const portName = getNodeText(port, ctx.source);
         const binding = ctx.createNode('property', portName, connection, {
-          signature: getNodeText(connection, ctx.source), decorators: ['hdl:connection'],
+          signature: getNodeText(connection, ctx.source), decorators: ['hdl:connection', 'hdl:named'],
         });
         if (binding) {
           ctx.addUnresolvedReference({ fromNodeId: binding.id,

@@ -18,7 +18,7 @@ async function graph(files: Record<string, string>, check: (cg: CodeGraph, root:
   } finally { cg?.close(); fs.rmSync(root, { recursive: true, force: true }); }
 }
 function bindings(cg: CodeGraph) {
-  return (cg as any).db.db.prepare("select id, name, qualified_name qualifiedName, signature from nodes where kind='property' and language='verilog'").all() as Array<{ id: string; name: string; qualifiedName: string; signature: string }>;
+  return (cg as any).db.db.prepare("select id, name, qualified_name qualifiedName, signature from nodes where kind='property' and language='verilog' and decorators LIKE '%hdl:named%'").all() as Array<{ id: string; name: string; qualifiedName: string; signature: string }>;
 }
 const leaf = 'module leaf(input rx, output tx); endmodule';
 

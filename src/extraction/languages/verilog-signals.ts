@@ -20,6 +20,47 @@ function direction(node: SyntaxNode, ctx: ExtractorContext): string | undefined 
   return undefined;
 }
 
+/** Authoritative source header order for positional instance connections.
+ * null means the syntax is incomplete or needs preprocessing/elaboration.
+ * [] explicitly describes a module with no ports. Body declaration order is
+ * never used: legacy non-ANSI declarations can legally be reordered.
+ */
+export function getVerilogPortOrder(node: SyntaxNode, source: string): string[] | null {
+  const headers = new Set(['module_ansi_header', 'module_nonansi_header', 'module_header',
+    'interface_ansi_header', 'interface_nonansi_header', 'program_ansi_header', 'program_nonansi_header']);
+  const header = children(node).find(n => headers.has(n.type));
+  if (!header || node.hasError) return null;
+  const uncertain = (current: SyntaxNode): boolean => {
+    if (current.type.endsWith('_comment') || current.type === 'comment') return false;
+    return current.isMissing || current.type.includes('directive') || current.type.includes('macro')
+      || children(current).some(uncertain);
+  };
+  if (uncertain(header)) return null;
+  const list = children(header).find(n => ['list_of_ports', 'list_of_port_declarations'].includes(n.type));
+  if (!list) return [];
+  const names: string[] = [];
+  const seen = new Set<string>();
+  for (const port of children(list)) {
+    if (port.type.endsWith('_comment') || port.type === 'comment') continue;
+    let id: SyntaxNode | null | undefined;
+    if (port.type === 'ansi_port_declaration') {
+      if (getNodeText(port, source).trimStart().startsWith('.')) return null;
+      id = port.childForFieldName('port_name');
+    } else if (port.type === 'port') {
+      id = identifier(port);
+      if (!id || children(port).length !== 1 || getNodeText(port, source).trim() !== getNodeText(id, source).trim()) return null;
+    } else return null;
+    if (!id || !['simple_identifier', 'escaped_identifier'].includes(id.type)) return null;
+    const name = getNodeText(id, source).trim();
+    // Escaping an otherwise simple name does not create a distinct HDL port.
+    const canonical = name.replace(/^\\/, '');
+    if (!canonical || seen.has(canonical)) return null;
+    seen.add(canonical);
+    names.push(name);
+  }
+  return names;
+}
+
 /** Generate iteration variables are implicit local parameters in their body.
  * Do not let an identically named outer signal stand in for that binding. */
 export function isVerilogGenerateBinding(node: SyntaxNode, ctx: ExtractorContext, name: string): boolean {

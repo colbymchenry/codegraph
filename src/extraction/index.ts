@@ -2938,6 +2938,12 @@ export class ExtractionOrchestrator {
     const reinserted: Edge[] = [];
     const resurrected: UnresolvedReference[] = [];
     for (const e of crossFileIncomingEdges) {
+      const name = e.metadata?.refName;
+      if (typeof name === 'string' && (name.startsWith('hdl:wildcard:') || name.startsWith('hdl:port-position:'))) {
+        const ref = resurrectRefFromDroppedEdge(e);
+        if (ref) resurrected.push(ref);
+        continue;
+      }
       const newTargetId = newNodesByKindName.get(`${e.targetKind}\0${e.targetName}`);
       if (newTargetId) {
         reinserted.push({ source: e.source, target: newTargetId, kind: e.kind, metadata: e.metadata, line: e.line, column: e.column, provenance: e.provenance });
@@ -2950,7 +2956,7 @@ export class ExtractionOrchestrator {
       this.queries.insertEdges(reinserted);
     }
     if (resurrected.length > 0) {
-      this.queries.insertUnresolvedRefsBatch(resurrected);
+      this.queries.replaceResolutionEdgesWithUnresolvedRefs([], resurrected);
     }
   }
 
@@ -3148,7 +3154,7 @@ export class ExtractionOrchestrator {
             .map((e) => resurrectRefFromDroppedEdge(e))
             .filter((r): r is UnresolvedReference => r !== null);
           if (resurrected.length > 0) {
-            this.queries.insertUnresolvedRefsBatch(resurrected);
+            this.queries.replaceResolutionEdgesWithUnresolvedRefs([], resurrected);
           }
         }
         this.queries.deleteFile(tracked.path);

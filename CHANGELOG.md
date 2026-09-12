@@ -145,6 +145,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- HDL: позиционные подключения следуют порядку ANSI/non-ANSI заголовка; `.*` учитывает явные подключения и локальную область видимости. Sync пересчитывает весь набор связей при изменении заголовка или удалении дубликата модуля. Grammar обновлена до tree-sitter-systemverilog 0.4.0 после сравнения 137 реальных HDL-файлов.
+
 - HDL: именованные подключения имеют отдельные переходы к формальным портам выбранного модуля и локальным сигналам; LHS bit/part selects и concatenations больше не теряют основания и индексы. Неоднозначные module declarations не дают предполагаемую formal binding.
 
 - Verilog/SystemVerilog: именованные экземпляры и generate scopes, порты/сигналы и always/assign доступны для навигации; связи локальных сигналов и package calls сохраняют scope, interfaces показывают modports. Полные elaboration и timing не моделируются.
