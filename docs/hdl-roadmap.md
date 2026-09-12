@@ -1,5 +1,7 @@
 # План развития Verilog/SystemVerilog
 
+Актуальная очередь, критерии готовности и журнал выполнения: [VERILOG_TRACKER.md](../VERILOG_TRACKER.md). Ниже сохранена история исходных этапов.
+
 ## Реализованный пакет после ce13487b
 
 1. Ссылки на основания и индексы LHS bit/part selects и concatenations.
