@@ -24,7 +24,7 @@ the workspace — pre-computed structure you would otherwise re-derive by
 reading files (cached intelligence: thousands of parse/trace decisions you
 don't pay to re-reason each run). It indexes 30+ languages
 (TypeScript/JavaScript, Python, Go, Rust, Java, C#, C/C++, PHP, Ruby, Swift,
-Kotlin, and more) — don't assume a language here isn't covered. Reads are
+Kotlin, Haskell, and more) — don't assume a language here isn't covered. Reads are
 sub-millisecond; the index lags writes by ~1s through the file watcher. Reach for it BEFORE *and* while
 writing or editing code — not just for questions: one call returns the
 verbatim source PLUS who calls it and what it affects, so you edit with the

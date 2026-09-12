@@ -36,10 +36,31 @@ import type CodeGraph from '../index';
 import type { Node, Edge } from '../types';
 import { isTestFile } from '../search/query-utils';
 
-import { lastQualifierPart, matchesSymbol } from './symbol-lookup';
+import { lastQualifierPart, matchesSymbol, HASKELL_FLOW_IDENTIFIER_SOURCE, HASKELL_FLOW_MODULE_SOURCE, QUALIFIED_OPERATOR_CONTAINER_SOURCE, isHaskellOperatorBody, qualifiedHaskellOperator, qualifiedHaskellOperatorMatches } from './symbol-lookup';
 
 // Preserve the existing imports while sharing the matcher with the CLI and MCP.
 export { RUST_PATH_PREFIXES, lastQualifierPart, matchesSymbol } from './symbol-lookup';
+
+/** Split graph hierarchy separators only when they are outside operator parens. */
+function qualifiedNameSegments(value: string): string[] {
+  const segments: string[] = [];
+  let start = 0;
+  let depth = 0;
+  for (let index = 0; index < value.length; index++) {
+    const char = value[index]!;
+    if (char === '(') depth++;
+    else if (char === ')' && depth > 0) depth--;
+    if (depth !== 0) continue;
+    const separatorLength = value.startsWith('::', index) ? 2 : char === '.' ? 1 : 0;
+    if (separatorLength === 0) continue;
+    if (index > start) segments.push(value.slice(start, index));
+    index += separatorLength - 1;
+    start = index + 1;
+  }
+  if (start < value.length) segments.push(value.slice(start));
+  return segments.filter(Boolean);
+}
+
 
 /**
  * Find ALL symbols matching a name. Used by callers/callees/impact to aggregate
@@ -50,6 +71,47 @@ export { RUST_PATH_PREFIXES, lastQualifierPart, matchesSymbol } from './symbol-l
  * hits may appear in `note` as a did-you-mean hint when `nodes` is empty.
  */
 export function findAllSymbols(cg: CodeGraph, symbol: string): { nodes: Node[]; note: string } {
+  const qualifiedOperator = qualifiedHaskellOperator(symbol);
+  if (qualifiedOperator) {
+    const candidates = [
+      ...cg.getNodesByName(qualifiedOperator.nodeName),
+      ...cg.getNodesByName(qualifiedOperator.operatorBody),
+    ];
+    const exact = [...new Map(candidates.map((node) => [node.id, node])).values()]
+      .filter((node) => {
+        if (qualifiedHaskellOperatorMatches(node, qualifiedOperator)) return true;
+        if (
+          node.language === 'haskell'
+          && node.kind === 'enum_member'
+          && node.name === qualifiedOperator.nodeName
+          && node.isExported === true
+          && node.qualifiedName.startsWith(`${qualifiedOperator.moduleName}::`)
+          && node.qualifiedName.endsWith(`::${qualifiedOperator.nodeName}`)
+        ) return true;
+        if (node.language !== 'haskell' || node.kind !== 'method') return false;
+        if (!node.qualifiedName.startsWith(`${qualifiedOperator.moduleName}::`)
+          || !node.qualifiedName.endsWith(`::${qualifiedOperator.nodeName}`)) return false;
+        // Class selectors are exported through their class and are legitimately
+        // addressable through the module. Instance implementations and local
+        // helpers are not. Follow THIS method's containment edge rather than
+        // matching owner text: a nullary class and its instance may share the
+        // same qualified spelling.
+        return cg.getIncomingEdges(node.id).some((edge) => {
+          if (edge.kind !== 'contains') return false;
+          const owner = cg.getNode(edge.source);
+          return owner?.language === 'haskell' && owner.kind === 'trait';
+        });
+      });
+    if (exact.length === 0) return { nodes: [], note: '' };
+    const isGen = cg.generatedFilePredicate(exact.map((node) => node.filePath));
+    const nodes = [...exact].sort(
+      (left, right) => (isGen(left.filePath) ? 1 : 0) - (isGen(right.filePath) ? 1 : 0),
+    );
+    const note = nodes.length <= 1
+      ? ''
+      : `\n\n> **Note:** Aggregated results across ${nodes.length} symbols named "${symbol}": ${nodes.map((node) => `${node.kind} at ${node.filePath}:${node.startLine}`).join(', ')}`;
+    return { nodes, note };
+  }
   // Nix option paths: the declaration is stored as `options.<path>` and
   // config writes carry longer/quoted tails (`<path>."git/config".text`),
   // so a dotted option token (`xdg.configFile`, `launchd.user.agents`) has
@@ -69,6 +131,27 @@ export function findAllSymbols(cg: CodeGraph, symbol: string): { nodes: Node[]; 
       const nodes = optionHits.filter((n) => !seen.has(n.id) && !!seen.add(n.id)).slice(0, 10);
       return { nodes, note: '' };
     }
+  }
+  const unqualifiedOperator = /^\(([^()\s]+)\)$/.exec(symbol)?.[1]
+    ?? (/^\$+$/.test(symbol) ? symbol : undefined);
+  if (unqualifiedOperator && isHaskellOperatorBody(unqualifiedOperator)) {
+    const exact = cg.getNodesByName(`(${unqualifiedOperator})`)
+      .filter((node) => node.language === 'haskell');
+    // A bare dollar-only spelling is also a valid JavaScript identifier.
+    // Resolve both exact language-specific names, never a fuzzy operator match.
+    if (symbol === unqualifiedOperator) {
+      exact.push(...cg.getNodesByName(symbol).filter((node) => node.language !== 'haskell'));
+    }
+    const isGen = cg.generatedFilePredicate(exact.map((node) => node.filePath));
+    const nodes = [...exact].sort(
+      (left, right) => (isGen(left.filePath) ? 1 : 0) - (isGen(right.filePath) ? 1 : 0),
+    );
+    const note = nodes.length <= 1
+      ? ''
+      : `\n\n> **Note:** Aggregated results across ${nodes.length} symbols named "${symbol}": ${nodes.map((node) => `${node.kind} at ${node.filePath}:${node.startLine}`).join(', ')}`;
+    // An operator token is shape-exact. Never degrade an absent `(⊗)` into an
+    // FTS result for a nearby `(⊕)`.
+    return { nodes, note };
   }
 
   const isQualified = /[.\/]|::/.test(symbol);
@@ -148,7 +231,7 @@ const DYN_KINDS: ReadonlySet<string> = new Set(['constant', 'variable', 'field',
 
 /** Only a REAL file extension is stripped from a token — `Class.method` is kept. */
 const FILE_EXT =
-  /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl)$/i;
+  /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl|hs)$/i;
 
 /** Chain length ceiling, in NODES. Explore's Flow section has always used 7. */
 export const DEFAULT_MAX_HOPS = 7;
@@ -261,19 +344,117 @@ function rankForDirected(nodes: readonly Node[]): Node[] {
  * English word that happened to exact-match a callable.
  */
 function isPreciseToken(token: string): boolean {
-  return /[._$]|::|\//.test(token) || /[a-z][A-Z]/.test(token) || /^[A-Z]/.test(token);
+  return qualifiedHaskellOperator(token) !== null
+    || (() => {
+      const operator = /^\(([^()\s]+)\)$/.exec(token)?.[1];
+      return !!operator && isHaskellOperatorBody(operator);
+    })()
+    || /[._$'#]|::|\//.test(token)
+    || /[\p{Ll}][\p{Lu}\p{Lt}]/u.test(token)
+    || /^[\p{Lu}\p{Lt}\p{Lo}]/u.test(token);
 }
 
 /** The symbol-shaped tokens of a query, deduped and capped. */
 export function flowTokens(query: string): string[] {
-  return [
-    ...new Set(
-      query
-        .split(/[\s,()[\]]+/)
-        .map((t) => t.replace(FILE_EXT, '').trim())
-        .filter((t) => t.length >= 3 && /^[A-Za-z_$][\w$]*(?:(?:::|\.)[\w$]+)*$/.test(t))
-    ),
-  ].slice(0, MAX_TOKENS);
+  const found: Array<{ index: number; token: string }> = [];
+  const covered: Array<{ start: number; end: number }> = [];
+  const overlapsQualifiedOperator = (start: number, end: number): boolean =>
+    covered.some((range) => start < range.end && end > range.start);
+  const addQualifiedOperators = (pattern: RegExp): void => {
+    for (const match of query.matchAll(pattern)) {
+      const parsed = qualifiedHaskellOperator(match[0]);
+      if (!parsed) continue;
+      const start = match.index!;
+      const end = start + match[0].length;
+      // Do not reinterpret a capitalized suffix inside another language's
+      // identifier/path as a standalone Haskell module (`notOps.<+>`).
+      if (start > 0 && /[\p{L}\p{N}_'$.:/]/u.test(query[start - 1]!)) continue;
+      if (overlapsQualifiedOperator(start, end)) continue;
+      covered.push({ start, end });
+      found.push({ index: start, token: parsed.canonical });
+    }
+  };
+
+  // Parse qualified operators before ordinary dotted identifiers. Otherwise
+  // `Ops.<+>` degrades to the unrelated token `Ops`, losing the qualifier and
+  // allowing a fuzzy fallback to another module's operator.
+  addQualifiedOperators(new RegExp(
+    `(?:${QUALIFIED_OPERATOR_CONTAINER_SOURCE})::\\([^()\\s]+\\)`,
+    'gu',
+  ));
+  addQualifiedOperators(new RegExp(
+    `(?:${QUALIFIED_OPERATOR_CONTAINER_SOURCE})::[^()\\s,\\[\\]\\x60]+`,
+    'gu',
+  ));
+  addQualifiedOperators(new RegExp(
+    `\\((?:${HASKELL_FLOW_MODULE_SOURCE})\\.[^()\\s\`]+\\)`,
+    'gu',
+  ));
+  addQualifiedOperators(new RegExp(
+    `(?:${HASKELL_FLOW_MODULE_SOURCE})\\.[^()\\s,\\[\\]\`]+`,
+    'gu',
+  ));
+
+  const identifier = new RegExp(
+    `${HASKELL_FLOW_IDENTIFIER_SOURCE}(?:(?:::|\\.)${HASKELL_FLOW_IDENTIFIER_SOURCE})*`,
+    'gu',
+  );
+  for (const match of query.matchAll(identifier)) {
+    const start = match.index!;
+    const end = start + match[0].length;
+    if (overlapsQualifiedOperator(start, end)) continue;
+    // The old tokenizer validated each whitespace-delimited token as a WHOLE.
+    // Keep that contract for compound words and paths: `higher-order` does not
+    // name `higher` plus `order`, and `/packages/auth/controllers` must not
+    // consume the bounded symbol-token budget one directory segment at a time.
+    // Haskell operators are collected separately above/below, so rejecting an
+    // identifier fragment beside Unicode dash punctuation, `/`, or `\` cannot
+    // hide an operator. `\p{Pd}` matters for agent prose, which commonly uses
+    // typographic hyphen/en/em dashes rather than ASCII `-`.
+    if (/[\p{Pd}/\\]/u.test(query[start - 1] ?? '') || /[\p{Pd}/\\]/u.test(query[end] ?? '')) {
+      continue;
+    }
+    // A Template Haskell quote (`'name`) is syntax, not part of the queried
+    // identifier. Likewise reject the valid prefix of an invalid qualified
+    // spelling (`Module.'name`) instead of turning `Module` into a seed.
+    if (query[start - 1] === "'" || (query[end] === '.' && query[end + 1] === "'")) continue;
+    const token = normalizeToken(match[0]);
+    // Haskell identifiers may contain primes (`hover'`, `Module'.run'`).
+    // Keep the opening character strict in EVERY qualified segment so a quote
+    // itself can never begin a token or a segment.
+    // Keep the noise floor for short ASCII prose words, but do not discard a
+    // valid one- or two-codepoint Unicode identifier (`λ`, `函数`). Exact node
+    // lookup plus precise-token ranking still prevents a fuzzy fallback.
+    if ((token.length >= 3 || /[^\x00-\x7f]/u.test(token)) && new RegExp(
+      `^${HASKELL_FLOW_IDENTIFIER_SOURCE}(?:(?:::|\\.)${HASKELL_FLOW_IDENTIFIER_SOURCE})*$`,
+      'u',
+    ).test(token)) {
+      found.push({ index: start, token });
+    }
+  }
+
+  // Haskell operator definitions are stored in their canonical parenthesized
+  // form. Preserve an explicitly parenthesized operator, and canonicalize a
+  // whitespace-delimited infix spelling (`<+>`) to that same node name. The
+  // exact-name lookup below means prose punctuation that has no indexed symbol
+  // cannot become a flow endpoint.
+  const parenthesizedOperator = /\(([^()\s]+)\)/gu;
+  for (const match of query.matchAll(parenthesizedOperator)) {
+    const start = match.index!;
+    const end = start + match[0].length;
+    if (overlapsQualifiedOperator(start, end) || !isHaskellOperatorBody(match[1]!)) continue;
+    found.push({ index: start, token: `(${match[1]})` });
+  }
+  const bareOperator = /(?:^|[\s,\[`])([^\s,\[\]()`]+)(?=$|[\s,\]`])/gu;
+  for (const match of query.matchAll(bareOperator)) {
+    const start = match.index! + match[0].indexOf(match[1]!);
+    const end = start + match[1]!.length;
+    if (overlapsQualifiedOperator(start, end) || !isHaskellOperatorBody(match[1]!)) continue;
+    found.push({ index: start, token: normalizeToken(match[1]!) });
+  }
+
+  found.sort((left, right) => left.index - right.index);
+  return [...new Set(found.map(({ token }) => token))].slice(0, MAX_TOKENS);
 }
 
 /**
@@ -294,33 +475,46 @@ export function resolveNamedTokens(
   // Pool of name SEGMENTS (Class + method from every token), used to keep an
   // ambiguous simple name only where its CONTAINER class is itself named.
   const segPool = new Set<string>();
-  for (const t of tokens) for (const s of t.toLowerCase().split(/::|\./)) if (s) segPool.add(s);
+  for (const t of tokens) {
+    for (const segment of qualifiedNameSegments(t.toLowerCase())) segPool.add(segment);
+  }
 
-  // RAW edges, not getCallers/getCallees: those return one row per NEIGHBOUR
-  // (the #1086 de-dup), so when a pair is joined by BOTH a static and a
-  // synthesized edge the static one wins and the synthesized one becomes
-  // invisible — which is exactly what happens once a thunk's `dispatch(x)`
-  // is walked statically. The question here is about the graph, not about
-  // callers, so ask the edges directly.
-  const hasHeuristicEdge = (id: string): boolean =>
-    [...cg.getIncomingEdges(id), ...cg.getOutgoingEdges(id)].some(
-      (e) => e.provenance === 'heuristic'
-    );
+  // Match the edge kinds getCallers/getCallees historically considered here,
+  // but inspect raw edges so endpoint admission needs two indexed edge reads and
+  // no opposite-node hydration instead of four traversals plus node lookups.
+  const traversableEdgeKinds = new Set(['calls', 'references', 'imports', 'instantiates', 'navigates']);
+  const hasHeuristicEdge = (id: string): boolean => {
+    const incident = [...cg.getOutgoingEdges(id), ...cg.getIncomingEdges(id)];
+    return incident.some((edge) =>
+      edge.provenance === 'heuristic'
+      && traversableEdgeKinds.has(edge.kind)
+      && edge.source !== edge.target);
+  };
 
   for (const t of tokens) {
     const hits = findAllSymbols(cg, t).nodes;
-    const cands = hits.filter((n) => FLOW_CALLABLE_KINDS.has(n.kind));
+    const operatorToken = /^\(([^()\s]+)\)$/.exec(lastQualifierPart(t))?.[1];
+    const cands = hits.filter((n) =>
+      FLOW_CALLABLE_KINDS.has(n.kind)
+      || (n.language === 'haskell'
+        && n.kind === 'enum_member'
+        && !!operatorToken
+        && isHaskellOperatorBody(operatorToken))
+    );
     out.tokenFamily.set(t, cands);
-    // A qualified or otherwise-specific name (<=3 hits) keeps all of them.
+    // A qualified Haskell operator is already module-filtered by an exact-name
+    // path. Keep all class selectors even when there are >3; only the generic
+    // overload path needs co-naming to constrain ambiguity.
+    const moduleQualifiedOperator = qualifiedHaskellOperator(t) !== null;
     const specific = cands.length <= 3;
     // In directed mode every candidate is kept and the search decides: the pair
     // of overloads that actually connects IS the disambiguation, and co-naming
     // has nothing to work with when the whole query is two words.
     const pick =
-      specific || directed
+      specific || moduleQualifiedOperator || directed
         ? cands
         : cands.filter((n) => {
-            const segs = (n.qualifiedName || '').toLowerCase().split(/::|\./).filter(Boolean);
+            const segs = qualifiedNameSegments((n.qualifiedName || '').toLowerCase());
             const container = segs.length >= 2 ? segs[segs.length - 2] : '';
             return !!container && segPool.has(container);
           });
@@ -622,5 +816,16 @@ export function resolveNamedSymbolFlow(
 
 /** The token spelling {@link flowTokens} would have produced for one word. */
 export function normalizeToken(token: string): string {
-  return token.replace(FILE_EXT, '').trim();
+  const trimmed = token.replace(FILE_EXT, '').trim();
+  // flowTokens accepts Haskell's backtick call spelling; directed endpoints
+  // pass through this function separately and must reach the same canonical
+  // token map entry as the query text.
+  const normalized = /^`([^`]+)`$/.exec(trimmed)?.[1] ?? trimmed;
+  const qualifiedOperator = qualifiedHaskellOperator(normalized);
+  if (qualifiedOperator) return qualifiedOperator.canonical;
+  const parenthesized = /^\((.*)\)$/.exec(normalized)?.[1];
+  if (parenthesized && isHaskellOperatorBody(parenthesized)) return `(${parenthesized})`;
+  if (/^\$+$/.test(normalized)) return normalized;
+  if (isHaskellOperatorBody(normalized)) return `(${normalized})`;
+  return normalized;
 }
