@@ -7,8 +7,6 @@ dist/
 # svelte-package's scratch dir (ui/ library build)
 .svelte-kit/
 
-.cmem
-
 # IDE
 .idea/
 .vscode/
@@ -63,25 +61,15 @@ test-languages/
 nul
 release/
 
-.antigravitycli/
-
-# Local-only: browser-based tmux session launcher (see tmux-web/README.md)
-tmux-web/
-
 assets/__pycache__/
 
 assets/generate-waitlist.py
-
-.kommandr/
 
 # Local scratch tests (never commit)
 __tests__/zz-scratch*
 
 # linux-arm64 kernel cross-build cache (rust:1-bookworm builder)
 target-linux/
-.kommandr/kommandr.db
-.kommandr/kommandr.db-wal
-.kommandr/kommandr.db-shm
 
 # Stray git bundles from the Windows VM transfer (a lost `:` in an scp target
 # once committed three of these, 7.9 MB, into a feature branch).

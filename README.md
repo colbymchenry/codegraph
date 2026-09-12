@@ -54,7 +54,7 @@ Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 - [Why CodeGraph?](#why-codegraph)
 - [Key Features](#key-features)
 - [Framework-aware Routes](#framework-aware-routes)
-- [Mixed iOS / React Native / Expo bridging](#mixed-ios--react-native--expo-bridging)
+- [Mixed Android / iOS / React Native / Expo bridging](#mixed-android--ios--react-native--expo-bridging)
 - [Quick Start](#quick-start)
 - [How It Works](#how-it-works)
 - [CLI Reference](#cli-reference)
@@ -68,9 +68,14 @@ Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 - [Supported Languages](#supported-languages)
 - [Measured cross-file coverage](#measured-cross-file-coverage)
 - [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
+- [Documentation](docs/README.md)
 - [License](#license)
 
 ## Get Started
+
+The installers below use published upstream releases. To run changes from this
+checkout, follow [Build from source](CONTRIBUTING.md#build-from-source).
 
 ### 1. Install the CLI
 
@@ -351,12 +356,22 @@ In a repository holding several apps, each app's routes are matched only against
 
 ---
 
-## Mixed iOS / React Native / Expo bridging
+## Mixed Android / iOS / React Native / Expo bridging
 
-Real iOS and React Native codebases live across multiple languages — a Swift caller invokes an Objective-C selector that's been auto-bridged, a JS file calls into a native module via the React Native bridge, a JSX component delegates to a native view manager. Static tree-sitter extraction stops at each language boundary. CodeGraph bridges them so `codegraph_explore` connects the flow end-to-end across the gap — call paths and blast radius cross the boundary instead of stopping at it.
+Android, iOS, React Native, and Expo codebases cross language and runtime
+boundaries. CodeGraph connects supported iOS, React Native, and Expo bridges
+in the graph for `codegraph_explore`. Android platform commands provide
+additional evidence for AIDL implementations, JNI bindings, and IPC usage.
 
-| Boundary | JS / Swift side | Native side | How |
+The Android rows below return command-specific evidence and candidate assessments;
+they do not add automatic end-to-end IPC edges to the graph. Use the
+[CLI commands](docs/design/android-platform-analysis.md#cli-commands) directly or enable their [MCP tools](docs/design/android-platform-analysis.md#mcp-configuration).
+
+| Boundary | Source side | Target side | How |
 |---|---|---|---|
+| **Android AIDL** | `IPowerManager.aidl` | Java/Kotlin `IPowerManager.Stub` implementations | `codegraph aidl-impl IPowerManager` reports implementation candidates, package evidence, and registration sites |
+| **Android JNI** | Java `native` / Kotlin `external` methods, e.g. `Process` | C/C++ JNI functions and `RegisterNatives` tables | `codegraph jni-bridge Process` correlates declarations with native definitions and registration evidence |
+| **Android IPC** | `Messenger`, `ContentResolver`, or `LocalSocket` usage | Handler-based services, `ContentProvider` declarations, or local socket endpoints | `messenger-ipc`, `content-provider`, and `local-socket-ipc` report the evidence available for a named service or class; a result does not prove a runtime peer connection |
 | **Swift → ObjC** | Swift `obj.foo(bar:)` | ObjC selector `-fooWithBar:` | `@objc` auto-bridging rules (including init/property/protocol forms) + Cocoa preposition prefixes (`With`/`For`/`By`/`In`/`On`/`At`/…) |
 | **ObjC → Swift** | ObjC `[obj fooWithBar:]` | Swift `@objc func foo(bar:)` | Reverse-bridge name candidates; verifies `@objc` exposure from source |
 | **React Native legacy bridge** | JS `NativeModules.X.fn(...)` | ObjC `RCT_EXPORT_METHOD` / `RCT_REMAP_METHOD` · Java/Kotlin `@ReactMethod` | Parses macro/annotation declarations to build a JS-name → native-method map |
@@ -366,7 +381,7 @@ Real iOS and React Native codebases live across multiple languages — a Swift c
 | **Fabric view components** | JSX `<MyView prop={v}/>` | TS Codegen spec + native impl class | Spec → `component` node; convention-based name+suffix lookup (`View`/`ComponentView`/`Manager`/`ViewManager`) bridges to native |
 | **Legacy Paper view managers** | JSX `<MyView prop={v}/>` | ObjC `RCT_EXPORT_VIEW_PROPERTY` · Java/Kotlin `@ReactProp` | Same as Fabric — Paper-era declarations also produce `component` + `property` nodes |
 
-**Validated on real codebases** (small + medium + large for each bridge):
+**Recorded graph-bridge validation repositories:**
 
 | Bridge | Small | Medium | Large |
 |---|---|---|---|
@@ -376,7 +391,10 @@ Real iOS and React Native codebases live across multiple languages — a Swift c
 | Expo Modules | expo-haptics | expo-camera | expo SDK sweep (7 packages) |
 | Fabric / Paper views | [react-native-segmented-control](https://github.com/react-native-segmented-control/segmented-control) | [react-native-screens](https://github.com/software-mansion/react-native-screens) | [react-native-skia](https://github.com/Shopify/react-native-skia) |
 
-Each bridge emits edges tagged `provenance:'heuristic'` with `metadata.synthesizedBy:` set to a stable channel name (e.g. `swift-objc-bridge`, `rn-event-channel`, `fabric-native-impl`, `expo-module-extract`), so the agent can tell at a glance how a hop got into the graph.
+The graph bridges above emit edges tagged `provenance:'heuristic'` with `metadata.synthesizedBy:` set to a stable channel name (e.g. `swift-objc-bridge`, `rn-event-channel`, `fabric-native-impl`, `expo-module-extract`), so the agent can tell at a glance how a hop got into the graph.
+
+Android command examples, evidence contracts, public reference projects, and limitations
+are documented in the [Android platform guide](docs/design/android-platform-analysis.md).
 
 ---
 
@@ -580,7 +598,7 @@ fi
 
 ## MCP Tools
 
-When running as an MCP server, CodeGraph exposes a **single tool** — `codegraph_explore`. Measured agent behavior showed that one strong tool steers agents better than a menu of narrower ones — fewer mis-picks, and it saves context every session:
+When running as an MCP server, CodeGraph exposes a **single tool by default** — `codegraph_explore`. Measured agent behavior showed that one strong tool steers agents better than a menu of narrower ones — fewer mis-picks, and it saves context every session:
 
 | Tool | Purpose |
 |------|---------|
@@ -589,6 +607,9 @@ When running as an MCP server, CodeGraph exposes a **single tool** — `codegrap
 The other tools (`codegraph_node`, `codegraph_search`, `codegraph_callers`, `codegraph_callees`, `codegraph_impact`, `codegraph_files`, `codegraph_status`) stay fully functional but **unlisted by default** — everything they return already arrives inline on `codegraph_explore` (its blast-radius section, the relationship map, a symbol's body as its callee list). Re-enable any of them for the MCP surface with the `CODEGRAPH_MCP_TOOLS` environment variable (e.g. `CODEGRAPH_MCP_TOOLS=explore,node,search,callers`), or use their CLI equivalents (`codegraph node` / `query` / `callers` / `callees` / `impact` / `files` / `status`).
 
 Even when the server's own root has no `.codegraph/` index, the tools stay available: pass `projectPath` to query any indexed project — a sub-service in a monorepo, or a second repo — in the same session. A path that has no index returns clean guidance to use built-in tools instead, so nothing fails loudly, and indexing stays your decision.
+
+Android-specific tools are also opt-in. See the [Android platform tool guide](docs/design/android-platform-analysis.md#exposure)
+for their CLI equivalents and MCP configuration.
 
 ---
 
@@ -814,6 +835,8 @@ is written):
 | Go | `.go` | Full support |
 | Rust | `.rs` | Full support |
 | Java | `.java` | Full support |
+| Android AIDL | `.aidl` | On-demand interface declaration analysis with `aidl-impl` and `hal-interface`; not indexed as graph nodes |
+| Android HIDL | `.hal` | On-demand HAL declaration analysis with `hal-interface --type hidl`; indexed inheritance candidates; not indexed as graph nodes |
 | C# | `.cs` | Full support |
 | PHP | `.php` | Full support |
 | Ruby | `.rb` | Full support |
@@ -841,6 +864,8 @@ is written):
 | Solidity | `.sol` | Full support (contracts, libraries, interfaces, structs, enums, modifiers, events, errors, state variables, `import`/`using` directives, `emit`/`revert` calls) |
 | Terraform / OpenTofu | `.tf`, `.tfvars`, `.tofu` | Full support (resources, data sources, modules, variables, outputs, providers incl. aliases, `locals`; `var.`/`local.`/`module.`/resource references with Terraform's per-directory scoping enforced; module calls bridged across the boundary — inputs to the child module's variables, `module.M.out` to the child's output, `source` to the module's files; cloudposse/atmos `remote-state` cross-component wiring when the component is statically named; `provider = aws.east` selections resolved up the module tree; `moved`/`import`/`removed`/`check` block references; `.tfvars` assignments linked to the variables they set) |
 | Nix | `.nix` | Full support (functions with simple/destructured/curried params, `let`/attrset bindings, `inherit`, `import ./path` file edges — `./dir` resolving through `default.nix` — plus NixOS module `imports = [ ./x.nix ]` lists and `callPackage ./pkg.nix` file edges; call edges; module-system option wiring — a config write like `launchd.user.agents.x = { ... }` links to the module declaring `options.launchd.user.agents`, so option flows trace across modules) |
+
+The AIDL and HIDL rows describe bounded, on-demand analysis of interface declarations. These files do not use the indexed extraction pipeline; implementation evidence is matched against supported source languages in the existing graph. See the [Android platform tool guide](docs/design/android-platform-analysis.md) for limitations.
 
 ## Measured cross-file coverage
 
@@ -873,6 +898,10 @@ Impact and blast-radius queries are only as good as the dependency graph behind 
 
 Framework routing is validated the same way, on a canonical app per framework: Express 100%, FastAPI 98%, Flask 100%, NestJS 96.8%, Gin 96.5%, Axum 100%, Rocket 93.8%, Vapor 100%, Laravel 92%, Rails 89.6%, React Router 100% — and the convention/reflection-heavy ones at their honest static-analysis ceiling: ASP.NET 83.9%, Spring 83.3%, Drupal 78.9%, Play 76.3%, Django 74.1%. SvelteKit, Vue/Nuxt, and Astro use file-based routing, so their page/endpoint coverage is the Svelte/SvelteKit (100%), Vue/Nuxt (93.5%), and Astro (93.0% — every `src/pages/` file maps to a route node on the two validation repos) figures in the table above.
 
+Android platform tools use their own evidence contracts rather than the
+cross-file coverage metric above. Their reference inputs and validation guidance are
+in the [Android platform guide](docs/design/android-platform-analysis.md#public-reference-projects).
+
 ## Troubleshooting
 
 **"CodeGraph not initialized"** — Run `codegraph init` in your project directory first.
@@ -895,6 +924,12 @@ Framework routing is validated the same way, on a canonical app per framework: E
 **Sharing one checkout between Windows and WSL** — Don't point both at the same `.codegraph/`: the background-server lock and the SQLite index are tied to the OS that wrote them, and SQLite locking across the WSL2/Windows filesystem boundary is unreliable. Give each side its own index in the same tree by setting `CODEGRAPH_DIR` to a distinct name on one of them — e.g. `CODEGRAPH_DIR=.codegraph-win` on Windows, leaving WSL on the default `.codegraph`. CodeGraph skips any sibling `.codegraph-*` directory when indexing and watching, so the two never trip over each other.
 
 **Very large repositories (hundreds of thousands of files), or a large `.codegraph/codegraph.db-wal` file** — The `-wal` file is SQLite's write-ahead log: writes waiting to be folded into `codegraph.db`. While a big index is being built, CodeGraph lets it grow in proportion to the index (soft threshold = the larger of 256 MB and a quarter of the index size, up to 2 GB) before folding it back, because folding too often is what made large indexes slow on ordinary disks. At rest it is trimmed to 64 MB, and a leftover from a killed session is folded and trimmed the next time the project opens — the index itself has no size limit. Two environment variables tune this: `CODEGRAPH_WAL_VALVE_MB` (the soft threshold during indexing) and `CODEGRAPH_WAL_HEAL_MB` (the resting size and the trim threshold). `CODEGRAPH_WAL_VALVE_DEBUG=1` prints every decision to stderr.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for source builds, tests, and pull request
+preparation. The [documentation index](docs/README.md) links to architecture,
+feature designs, and validation methodology.
 
 ## License
 
