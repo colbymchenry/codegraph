@@ -181,5 +181,4 @@ queries does.
 A `git stash -- <path>` "baseline" reverts to **HEAD**, not to `main`. With a WIP
 commit on the branch that silently measures your own change against itself — it
 produced a clean "passes on main" here that was pure fiction. Use the file swap
-(`git show main:<path> > <path>`), as `.kommandr/memory/baseline-builds-use-fresh-file-swap`
-already says for builds.
+(`git show main:<path> > <path>`) and rebuild before measuring the baseline.
