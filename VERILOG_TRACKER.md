@@ -127,6 +127,12 @@ frontend и review задачи можно отдавать агентам; об
 
 ## B. Полное preprocessing через выбранный frontend
 
+**Первая вертикаль реализована (2026-09-12):** `hdl-semantic` /
+`CodeGraph.getHdlSemantics()` возвращают on-demand parameters/port widths с
+provenance и проверенными sourceNodeId. Отчёт `docs/validation-hdl-semantics-2026-09-12.md`,
+инструкция `docs/hdl-semantics.md`. Это частичное выполнение B1/B2 и C1/C2/C5;
+checkbox ниже остаётся открытым для полного заявленного объёма.
+
 - [ ] **B1** Получать include/macro expansion и diagnostics из frontend; не писать
   собственный полный HDL-препроцессор внутри extractor.
 - [ ] **B2** Сопоставить expansion с исходным файлом, диапазоном, macro definition
@@ -305,8 +311,10 @@ J — повторяемый checklist, его отметки относятся
    сохранены в `docs/hdl-frontend-decision.md`.
 3. Начать реализацию согласованного контракта, сохраняя strict/compatible profiles
    раздельно и unknown coordinates для macro-generated declarations.
-4. Реализовать минимальную вертикаль **B1–B2 + C1–C2**: один profile, один top,
-   parameter value с правильным source mapping и fallback без frontend.
+4. **Минимальная on-demand вертикаль выполнена**: параметры/порты для одного
+   profile/top, source links, ошибка compiler не меняет source graph. Дальше:
+   точный macro source mapping B2, расширенные types C3 и persistent semantic
+   context/invalidation C1/D5; затем semantic queries MCP.
 5. Провести J1–J9 для этого ограниченного пакета; затем расширять B/C и переходить к D.
 
 ## 6. Журнал выполнения
@@ -315,6 +323,7 @@ J — повторяемый checklist, его отметки относятся
 | --- | --- | --- | --- | --- |
 | 2026-09-12 | Source navigation, scopes, access | Реализованные части перечислены в HDL-001–006 | Отчёты раздела 1 | Сохранить regression coverage |
 | 2026-09-12 | Build profiles | Ограниченный source-режим, реальные profile parity проверки | `b050fb89`, `docs/validation-hdl-profiles-2026-09-12.md` | A: frontend comparison |
+| 2026-09-12 | B/C первая вертикаль | API/CLI, реальные UART/CRC/AXI, include sync/rebuild parity | `docs/validation-hdl-semantics-2026-09-12.md` | B2, C3, persisted context |
 | 2026-09-12 | A3–A6 | 24 controls, slang выбран; CLI macro mapping неполон | `docs/hdl-frontend-decision.md` | B1/B2 + C1/C2 |
 | 2026-09-12 | A1–A2 | Manifest 137 HDL, три locked AXI dependencies, шесть compiler controls | `docs/validation-hdl-corpora-build-2026-09-12.md` | A3–A6, сравнение frontends |
 | 2026-09-12 | Полный план | Создан этот tracker; новые implementation задачи не объявлены выполненными | `VERILOG_TRACKER.md` | A1–A2 |

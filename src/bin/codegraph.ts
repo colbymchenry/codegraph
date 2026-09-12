@@ -1316,6 +1316,50 @@ program
  * can reach the graph through a plain shell command.
  */
 program
+  .command('hdl-semantic [query]')
+  .description('Compute HDL parameters and port widths with optional slang (exact symbol or instance query)')
+  .requiredOption('--slang <executable>', 'Path to the installed slang executable')
+  .option('-p, --path <path>', 'Project path')
+  .option('--top <name>', 'Single top module (defaults to the active profile top)')
+  .option('--parameter <name=value...>', 'Top-level parameter overrides')
+  .option('--allow-use-before-declare', 'Explicit slang compatibility mode')
+  .option('--limit <number>', 'Maximum facts (1..1000)', '100')
+  .action(async (query: string | undefined, options: { slang: string; path?: string; top?: string;
+    parameter?: string[]; allowUseBeforeDeclare?: boolean; limit: string }) => {
+    const projectPath = resolveProjectPath(options.path);
+    try {
+      if (!isInitialized(projectPath)) throw new Error('HDL semantic queries require an initialized CodeGraph project');
+      const parameters: Record<string, string> = Object.create(null);
+      for (const argument of options.parameter ?? []) {
+        const separator = argument.indexOf('=');
+        if (separator < 1 || !argument.slice(separator + 1)) throw new Error('Parameter must be NAME=VALUE');
+        const name = argument.slice(0, separator);
+        if (Object.prototype.hasOwnProperty.call(parameters, name)) throw new Error('Duplicate HDL parameter override: ' + name);
+        parameters[name] = argument.slice(separator + 1);
+      }
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      const controller = new AbortController();
+      const interrupt = () => controller.abort();
+      process.once('SIGINT', interrupt);
+      process.once('SIGTERM', interrupt);
+      try {
+        const result = await cg.getHdlSemantics({ executable: options.slang, top: options.top,
+          parameters, allowUseBeforeDeclare: options.allowUseBeforeDeclare, query, limit: Number(options.limit),
+          signal: controller.signal });
+        console.log(JSON.stringify(result));
+      } finally {
+        process.removeListener('SIGINT', interrupt);
+        process.removeListener('SIGTERM', interrupt);
+        cg.close();
+      }
+    } catch (err) {
+      error(`HDL semantics failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exitCode = 1;
+    }
+  });
+
+program
   .command('explore <query...>')
   .description('Explore an area: relevant symbols\' source + call paths in one shot (same output as the codegraph_explore MCP tool)')
   .option('-p, --path <path>', 'Project path')

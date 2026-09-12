@@ -892,7 +892,7 @@ is written):
 | Astro | `.astro` | Full support (frontmatter + script extraction, template component/call references, `src/pages/` routes) |
 | Liquid | `.liquid` | Full support |
 | Pascal / Delphi | `.pas`, `.dpr`, `.dpk`, `.lpr` | Full support (classes, records, interfaces, enums, DFM/FMX form files) |
-| Verilog / SystemVerilog | `.v`, `.vh`, `.sv`, `.svh` | Модули и именованные instances, build profiles (filelists/includes/defines), lexical/generate scopes и formal parameters, порты/сигналы и named/positional/wildcard port bindings, bit/part selects, read/write/control/event queries, always/assign, interfaces/modports, package calls и иерархия instantiates; синтаксические связи без elaboration/timing |
+| Verilog / SystemVerilog | `.v`, `.vh`, `.sv`, `.svh` | Модули и именованные instances, build profiles (filelists/includes/defines), lexical/generate scopes и formal parameters, порты/сигналы и named/positional/wildcard port bindings, bit/part selects, read/write/control/event queries, always/assign, interfaces/modports, package calls и иерархия instantiates; source-граф без elaboration/timing, отдельный hdl-semantic через slang для параметров и ширин |
 | Lua | `.lua` | Full support (functions, methods with receivers, local variables, `require` imports, call edges) |
 | R | `.R` `.r` | Full support (functions in every assignment form, S4/R5/R6 classes with methods, `library`/`require` imports, `source()` file references, call edges) |
 | Luau | `.luau` | Full support (everything in Lua, plus `type`/`export type` aliases, typed signatures, and Roblox instance-path `require`) |
@@ -973,3 +973,4 @@ MIT
 </div>
 
 Подробности HDL-профилей: [настройка и ограничения](docs/hdl-profiles.md).
+Вычисленные параметры и ширины по явному запросу: [hdl-semantic с установленным slang](docs/hdl-semantics.md).

@@ -60,6 +60,8 @@ calls; a grep/read exploration is dozens.
 
 ## Verilog / SystemVerilog
 
+Computed parameters and port widths are available through the explicit codegraph hdl-semantic CLI with an installed slang executable and an active HDL profile. Standard explore returns source relationships; it does not automatically run the compiler. Compiler failures do not invalidate source navigation.
+
 An optional codegraph.json HDL profile selects source units and conditional branches. Exploration reports the indexed profile separately from current configuration. On mismatch, sync/rebuild before interpreting results as the new profile; invalid configuration must be corrected. Snippets remain original source, including inactive branches. Includes contribute macro state; full macro expansion and elaboration are not performed.
 
 For signal readers/writers, pass one exact or qualified signal name as query and set hdlAccess to read, write, readwrite, control, event, or all. Read includes control/event and readwrite; write includes readwrite. Results show source positions and known formal-argument direction evidence. Unknown references remain unclassified; empty results do not prove absence of access.
