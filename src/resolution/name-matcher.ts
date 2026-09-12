@@ -1952,6 +1952,22 @@ function inferLocalReceiverType(
     // human-written local declaration lives on, and regexing it per ref is
     // pure waste — skip it rather than scan it.
     if (line.length > 10_000) return null;
+    if (ESM_FAMILY.has(ref.language)) {
+      // Follow an explicit awaited factory return through the normal binding
+      // resolver; a same-named function elsewhere is not type evidence (#1840).
+      const awaited = line.match(memoPatterns(`awaited|${escapedReceiver}`, () => [
+        new RegExp(String.raw`\b${escapedReceiver}\b\s*=\s*await\s+([A-Za-z_$][\w$]*)\s*\(`),
+      ])[0]!);
+      if (awaited?.[1]) {
+        const target = matchByExactName({ ...ref, referenceName: awaited[1] }, context);
+        const callee = target && context.getNodeById?.(target.targetNodeId);
+        const returnType = callee && (callee.returnType ?? callee.signature?.match(/\)\s*:\s*(Promise\s*<[^>]+>)\s*$/)?.[1]);
+        const promised = returnType?.match(/^Promise\s*<\s*([\w$]+)\s*>$/);
+        if (promised?.[1]) {
+          return promised[1];
+        }
+      }
+    }
     for (const re of patterns) {
       const m = line.match(re);
       if (m && m[1]) {
@@ -2207,6 +2223,7 @@ export function matchMethodCall(
         ? inferCppReceiverType(objectOrClass!, ref, context)
         : inferLocalReceiverType(objectOrClass!, ref, context));
     if (inferredType) {
+      if (ESM_FAMILY.has(ref.language) && ['string', 'number', 'boolean', 'bigint', 'symbol'].includes(inferredType)) return null;
       // Java/Kotlin: when two classes share the simple name, the file's import
       // pins WHICH one (#314). Other languages disambiguate by call-site file.
       const importedFqn =

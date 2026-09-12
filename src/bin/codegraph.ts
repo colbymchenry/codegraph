@@ -957,7 +957,12 @@ program
 
       if (cg.isIndexStale()) {
         cg.destroy();
-        throw new Error('Index extraction is stale. Run "codegraph index" for a full rebuild before syncing.');
+        const message = 'Index extraction is stale. Run "codegraph index" for a full rebuild before syncing.';
+        if (options.quiet) {
+          process.stderr.write(`codegraph sync: ${message}\n`);
+          process.exit(1);
+        }
+        throw new Error(message);
       }
 
       if (options.quiet) {

@@ -157,6 +157,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- При отказе `codegraph sync --quiet` из-за устаревшего индекса причина теперь выводится одной строкой в stderr.
+- Прерывание повторного разрешения связей больше не оставляет граф без исходной связи и записи восстановления.
+- В TypeScript вызов метода у результата `await` с объявленным `Promise<string>` больше не связывается с одноимённым методом постороннего класса.
+
 - The prompt hook no longer injects unrelated projects when run from your home directory or a broader directory containing a stray workspace manifest. (#1454)
 
 - Indexing now succeeds when Node.js's SQLite lacks FTS5, with search falling back to name and fuzzy matching; thanks @aniruddhaadak80. (#1532)

@@ -53,8 +53,11 @@ describe('explicit CLI sync with stale extraction', () => {
           const result = run(...args);
           expect(result.status).toBe(1);
           const output = result.stdout + result.stderr;
-          if (quiet) expect(output).toBe('');
-          else expect(output).toContain('Run "codegraph index"');
+          expect(output).toContain('Run "codegraph index"');
+          if (quiet) {
+            expect(result.stdout).toBe('');
+            expect(result.stderr.trim().split('\n')).toHaveLength(1);
+          }
           expect(output).not.toContain('Already up to date');
           const cg = CodeGraph.openSync(root);
           try {
