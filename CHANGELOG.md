@@ -17,6 +17,14 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - CodeGraph's refusal to use a sensitive folder such as `~/.ssh`, `~/.config`, `/etc` or `C:\Windows` as a project can no longer be sidestepped: a link or junction that leads to one, a differently capitalized name on Windows and macOS, a `\\?\` spelling on Windows, and a path to a missing folder inside one are now refused like the folder itself. Before, any of these let an AI agent's query read the files inside. Thanks @mixxer for finding it.
 - The MCP server no longer uses a sensitive folder such as `~/.ssh`, `~/.config` or `/etc` as a session's default project, whether the folder came from your AI agent's workspace, the folder the server was started in, or `--path`. Before, only a folder an agent asked for by path was refused, so a session started in one that held an index answered from the files inside and kept it synced; now that session has no default project, and the agent can still query any other project by path.
 
+### New Features
+
+- **`codegraph_component` — a Vue component's contract in one call.** Ask for a component by name and get its props (with their types, defaults and the comments above them), emits, slots and exposed members, the child components it renders, and every parent `@event="handler"` binding attached to it — so changing an emit shows exactly which parent handlers break, without reading the SFC. Available by default alongside `codegraph_explore`. Projects indexed before this change pick the data up as their files re-index; run `codegraph init` to have everything at once.
+
+- **Vue props and emits are read across files.** When a component's `defineProps` / `defineEmits` types live in a shared types file — imported directly, reached through `extends` chains, or renamed on import — their members are pulled in and shown with the types and docs as written. A base reached through two branches of an inheritance diamond shows up once, tsconfig `paths` aliases (`@/types/props`) resolve exactly like relative imports, and an import this extractor cannot follow (a bare package) is skipped rather than guessed.
+
+- **Vue templates are indexed as wiring, not just text.** Every `@event="handler"` on a component tag becomes a real edge from the component to the function that handles it, so callers, impact and the new component view see which functions a template drives — including through kebab-case tags.
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)
