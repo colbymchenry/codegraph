@@ -42,7 +42,9 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@babel/parser": "^7.29.8",
     "@clack/prompts": "^1.3.0",
+    "@vue/compiler-sfc": "^3.5.42",
     "commander": "^14.0.2",
     "fast-string-width": "^3.0.2",
     "fast-wrap-ansi": "^0.2.0",

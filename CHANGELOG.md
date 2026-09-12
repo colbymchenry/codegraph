@@ -344,6 +344,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- **`codegraph_component` — a Vue component's contract in one call.** Ask for a component by name and get its props (with their types, defaults and the comments above them), emits, slots and exposed members, the child components it renders, and every parent `@event="handler"` binding attached to it — so changing an emit shows exactly which parent handlers break, without reading the SFC. Available by default alongside `codegraph_explore`. Projects indexed before this change pick the data up as their files re-index; run `codegraph init` to have everything at once.
+
+- **Vue props and emits are read across files.** When a component's `defineProps` / `defineEmits` types live in a shared types file — imported directly, reached through `extends` chains, or renamed on import — their members are pulled in and shown with the types and docs as written. A base reached through two branches of an inheritance diamond shows up once, tsconfig `paths` aliases (`@/types/props`) resolve exactly like relative imports, and an import this extractor cannot follow (a bare package) is skipped rather than guessed.
+
+- **Vue templates are indexed as wiring, not just text.** Every `@event="handler"` on a component tag becomes a real edge from the component to the function that handles it, so callers, impact and the new component view see which functions a template drives — including through kebab-case tags.
+
 - **Codex and Astra read project guidance from `AGENTS.md`.** The canonical agent guide now lives in `AGENTS.md` (with a nested `docs/AGENTS.md` for long validation notes); `CLAUDE.md` is a thin `@AGENTS.md` wrapper for Claude Code. Codex/Astra no longer miss the old CLAUDE-only instructions.
 
 - **Next.js pages and their navigation are in the graph.** App Router pages (`app/(group)/blog/[slug]/page.tsx` → `/blog/:slug`) and Pages Router pages are routes bound to the component they export, and `<Link href>`, an internal `<a href>`, `router.push` / `router.replace` (`next/navigation` and `next/router`), `redirect()` / `permanentRedirect()` and the middleware's `NextResponse.redirect(…)` are `navigates` edges between them. `app/api/**/route.ts` exports (`GET`, `POST`, …) are endpoints bound to their functions, and `pages/api/*` handlers are `ANY /api/…`. Re-index after upgrading.
