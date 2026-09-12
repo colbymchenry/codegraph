@@ -43,6 +43,7 @@ import { decodeLockInfo } from '../src/mcp/daemon-paths';
 import {
   acquireLockViaExclusiveOpen,
   bindFirstUsableSocket,
+  clearStaleDaemonLock,
   tryAcquireDaemonLock,
 } from '../src/mcp/daemon';
 
@@ -242,5 +243,46 @@ describe('lock acquisition without hard links (#997)', () => {
     expect(acquireLockViaExclusiveOpen(pidPath, loser)).toBe(false); // does not clobber
     // The winner's record is intact — the loser never overwrote it.
     expect(decodeLockInfo(fs.readFileSync(pidPath, 'utf8'))).toEqual(winner);
+  });
+});
+
+describe('legacy daemon lock decoding', () => {
+  it('decodes a plain decimal PID as a legacy lock record', () => {
+    expect(decodeLockInfo('4242\n')).toEqual({
+      pid: 4242,
+      version: 'unknown',
+      socketPath: '',
+      startedAt: 0,
+    });
+  });
+
+  it.each(['1e3', '0x3e8', '1000.0'])('rejects non-decimal PID syntax %s', (raw) => {
+    expect(decodeLockInfo(raw)).toBeNull();
+  });
+});
+
+describe('stale daemon lock snapshot validation', () => {
+  it('does not delete a same-PID replacement whose identity was never probed', () => {
+    const pidPath = path.join(os.tmpdir(), `cg-snapshot-${process.pid}-${Date.now()}.pid`);
+    tmpFiles.push(pidPath);
+    const original = JSON.stringify({
+      pid: process.pid,
+      version: '1.5.0',
+      socketPath: '/old.sock',
+      startedAt: 1,
+    });
+    const replacement = JSON.stringify({
+      pid: process.pid,
+      version: '1.5.0',
+      socketPath: '/new.sock',
+      startedAt: 2,
+    });
+    fs.writeFileSync(pidPath, replacement);
+
+    expect(clearStaleDaemonLock(pidPath, process.pid, {
+      allowLivePid: true,
+      expectedLockContents: original,
+    })).toBe(false);
+    expect(fs.readFileSync(pidPath, 'utf8')).toBe(replacement);
   });
 });

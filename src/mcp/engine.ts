@@ -47,6 +47,12 @@ export interface MCPEngineOptions {
    * disables it even in daemon mode.
    */
   queryPool?: boolean;
+  /**
+   * Project root whose writer slot must be claimed synchronously before this
+   * engine can open the graph. Used by proxy fallback to fence catch-up sync,
+   * not just the later file watcher.
+   */
+  writerLockRoot?: string;
 }
 
 /**
@@ -70,7 +76,7 @@ export class MCPEngine {
   private watcherStarted = false;
   /** Set when this engine holds writer.pid (#1740). */
   private writerLockRoot: string | null = null;
-  private opts: Required<MCPEngineOptions>;
+  private opts: Required<Omit<MCPEngineOptions, 'writerLockRoot'>>;
   private closed = false;
   // Off-loop read-tool pool (daemon mode only). Created lazily once the default
   // project is open — workers each hold their own WAL read connection.
@@ -79,6 +85,13 @@ export class MCPEngine {
   constructor(opts: MCPEngineOptions = {}) {
     this.opts = { watch: opts.watch ?? true, queryPool: opts.queryPool ?? false };
     this.toolHandler = new ToolHandler(null);
+    if (opts.writerLockRoot) {
+      const writer = tryAcquireWriterLock(opts.writerLockRoot, 'fallback');
+      if (writer.kind === 'taken') {
+        throw new Error(writerLockHeldMessage(writer.existing, writer.pidPath));
+      }
+      this.writerLockRoot = opts.writerLockRoot;
+    }
   }
 
   /**
