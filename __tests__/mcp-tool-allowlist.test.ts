@@ -17,13 +17,17 @@ describe('CODEGRAPH_MCP_TOOLS allowlist', () => {
 
   const listed = () => new ToolHandler(null).getTools().map(t => t.name).sort();
 
-  it('exposes ONLY codegraph_explore by default when unset', () => {
+  it('exposes only explore by default when unset', () => {
     delete process.env[ENV];
-    // The default set (see DEFAULT_MCP_TOOLS) is pared to explore alone — the one
-    // tool that earns its place (verbatim source grouped by file).
-    // node/search/callers/callees/impact/files/status stay defined and executable
-    // but unlisted; CODEGRAPH_MCP_TOOLS re-enables them.
+    // The default set (see DEFAULT_MCP_TOOLS): explore (verbatim source
+    // grouped by file). node/search/callers/callees/impact/files/status and
+    // the Vue component tool stay defined but unlisted; the allowlist opts in.
     expect(listed()).toEqual(['codegraph_explore']);
+  });
+
+  it('opts into the Vue component tool via the allowlist', () => {
+    process.env[ENV] = 'explore,component';
+    expect(listed()).toEqual(['codegraph_component', 'codegraph_explore']);
   });
 
   it('re-enables an unlisted tool via the allowlist (impact)', () => {
