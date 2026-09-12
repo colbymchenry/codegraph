@@ -378,6 +378,9 @@ export class Daemon {
     // timeout, a non-hello first line, an early close — yields null pids and we
     // fall back to the socket-close lifecycle exactly as before (#692).
     void readClientHello(socket).then((peers) => {
+      // The peer may close while hello is being read; close is not replayed
+      // for the transport listeners we would install afterwards (#1356).
+      if (socket.destroyed) return;
       const transport = new SocketTransport(socket);
       const session = new MCPSession(transport, this.engine, {
         explicitProjectPath: this.projectRoot,

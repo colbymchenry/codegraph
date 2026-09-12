@@ -23,16 +23,17 @@ describe('Resolution Module', () => {
   let cg: CodeGraph;
 
   beforeEach(() => {
+    cg = undefined!;
     // Create temp directory
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-resolution-test-'));
   });
 
   afterEach(() => {
     // Clean up
-    if (cg) {
-      cg.destroy();
-    } else if (fs.existsSync(tempDir)) {
-      fs.rmSync(tempDir, { recursive: true });
+    try { cg?.destroy(); }
+    finally {
+      cg = undefined!;
+      if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
     }
   });
 

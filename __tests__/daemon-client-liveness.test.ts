@@ -179,3 +179,26 @@ describe('Daemon.backstopShouldExit', () => {
     expect(d.backstopShouldExit(() => false)).toBe(false);
   });
 });
+
+it('does not attach a phantom client when the socket closes during hello', async () => {
+  const net = await import('node:net');
+  const d = new Daemon('/tmp/codegraph-hello-close-test', { idleTimeoutMs: 0 }) as any;
+  const server = net.createServer(socket => d.handleConnection(socket));
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address() as import('node:net').AddressInfo;
+  const client = net.createConnection({host: '127.0.0.1', port: address.port});
+  try {
+    await new Promise<void>((resolve, reject) => {
+      client.once('error', reject);
+      client.once('data', () => { client.destroy(); resolve(); });
+    });
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(d.clients.size).toBe(0);
+    expect(d.clientPeers.size).toBe(0);
+  } finally {
+    client.destroy();
+    for (const session of [...d.clients]) d.dropClient(session);
+    d.disarmIdleTimer();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});

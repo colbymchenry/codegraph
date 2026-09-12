@@ -3083,10 +3083,36 @@ export function dumpNameMatcherProfile(label: string): void {
   }
 }
 
+function isVerilogSimPath(filePath: string): boolean {
+  return (
+    /(^|\/)(sim|tb|tests?|testbench|dv)\//i.test(filePath) ||
+    /_(stub|tb|sim)\.s?vh?$/i.test(filePath)
+  );
+}
+
 export function matchReference(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  if (ref.language === 'verilog' && ref.referenceKind === 'instantiates' && !isVerilogSimPath(ref.filePath)) {
+    const modules = context
+      .getNodesByName(ref.referenceName)
+      .filter((n) => n.language === 'verilog' && (n.kind === 'class' || n.kind === 'interface'));
+    const synth = modules.filter((n) => !isVerilogSimPath(n.filePath));
+    if (synth.length > 0 && synth.length < modules.length) {
+      const best = synth.length === 1 ? synth[0]! : findBestMatch(ref, synth, context);
+      if (best) {
+        const proximity = computePathProximity(ref.filePath, best.filePath);
+        return {
+          original: ref,
+          targetNodeId: best.id,
+          confidence: synth.length === 1 || proximity >= 30 ? 0.7 : 0.4,
+          resolvedBy: 'exact-match',
+        };
+      }
+    }
+  }
+
   // Function-as-value refs (#756) resolve ONLY through the dedicated matcher —
   // never the fuzzy/qualified fallthrough below (a wrong callback edge is
   // worse than none).
