@@ -2358,6 +2358,59 @@ export function useProjectCache() {
       }
     });
 
+    it('keeps a built-in string method off an unrelated project method (#1840)', async () => {
+      fs.writeFileSync(path.join(tempDir, 'strings.ts'), `
+export async function listPaths(): Promise<string> { return "a\0b"; }
+export async function snapshot(): Promise<string[]> {
+  const listed = await listPaths();
+  return listed.split('\0');
+}
+`);
+      fs.writeFileSync(path.join(tempDir, 'pane.ts'), `
+export class PaneManager {
+  split(): string { return "new pane"; }
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const caller = cg.getNodesByName('snapshot').find((n) => n.kind === 'function');
+      expect(caller).toBeDefined();
+      expect(
+        cg.getCallees(caller!.id)
+          .filter(({ edge }) => edge.kind === 'calls')
+          .map(({ node }) => node.qualifiedName)
+          .sort(),
+      ).toEqual(['listPaths']);
+    });
+
+    it('types an awaited receiver from the callee\'s declared return (#1840)', async () => {
+      fs.writeFileSync(path.join(tempDir, 'engine.ts'), `
+export class Engine {
+  run(): string { return "ran"; }
+}
+export class Decoy {
+  run(): string { return "decoy"; }
+}
+export async function makeEngine(): Promise<Engine> { return new Engine(); }
+export async function drive(): Promise<string> {
+  const handle = await makeEngine();
+  return handle.run();
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const caller = cg.getNodesByName('drive').find((n) => n.kind === 'function');
+      expect(caller).toBeDefined();
+      expect(
+        cg.getCallees(caller!.id)
+          .filter(({ edge }) => edge.kind === 'calls')
+          .map(({ node }) => node.qualifiedName)
+          .sort(),
+      ).toEqual(['Engine::run', 'makeEngine']);
+    });
+
     it('keeps a validated project class that shadows Map (#1566)', async () => {
       fs.writeFileSync(path.join(tempDir, 'shadow.ts'), `
 export class Map { get() { return 1; } }

@@ -8,7 +8,7 @@ import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, SUPERTYPE_TARGET_KINDS, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
-import { JS_BUILT_INS } from './js-builtins';
+import { JS_BUILT_INS, TS_PRIMITIVE_TYPES } from './js-builtins';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -1655,6 +1655,25 @@ const PATTERN_MEMO_CAP = 8192;
 type InferScanState = { hi: number; ansIdx: number; ansType: string | null };
 const INFER_SCAN_STATES = new WeakMap<ResolutionContext, Map<string, InferScanState>>();
 
+/**
+ * Memo for the awaited-call second chance below. Same reasoning as
+ * INFER_SCAN_STATES: the lookup runs for every JS/TS `receiver.method()` whose
+ * declaration patterns missed, and it is a pure function of (file, scope,
+ * receiver) over immutable lines — so each key pays its scan and node lookup
+ * once instead of once per ref. `null` is cached too: a receiver that is not
+ * awaited-initialized is the common case and must not rescan.
+ */
+const AWAITED_TYPE_MEMO = new WeakMap<ResolutionContext, Map<string, string | null>>();
+
+function getAwaitedTypeMemo(context: ResolutionContext): Map<string, string | null> {
+  let m = AWAITED_TYPE_MEMO.get(context);
+  if (!m) {
+    m = new Map();
+    AWAITED_TYPE_MEMO.set(context, m);
+  }
+  return m;
+}
+
 function getInferScanStates(context: ResolutionContext): Map<string, InferScanState> {
   let m = INFER_SCAN_STATES.get(context);
   if (!m) {
@@ -1667,6 +1686,7 @@ function getInferScanStates(context: ResolutionContext): Map<string, InferScanSt
 /** Drop the per-context scan states (see ReferenceResolver.clearCaches). */
 export function clearNameMatcherMemos(context: ResolutionContext): void {
   INFER_SCAN_STATES.delete(context);
+  AWAITED_TYPE_MEMO.delete(context);
   C_STATIC_MEMO.delete(context);
   RUST_TRAIT_IMPL_MEMO.delete(context);
   SEALED_MODULES.delete(context);
@@ -1868,6 +1888,21 @@ function inferLocalReceiverType(
   ref: UnresolvedRef,
   context: ResolutionContext,
 ): string | null {
+  const declared = inferDeclaredLocalReceiverType(receiverName, ref, context);
+  if (declared) return declared;
+  // Second chance for JS/TS only, and only once the declaration patterns have
+  // already missed: `const listed = await listPaths()` is neither `= new X()`
+  // nor `: X`, so the receiver stayed untyped and the bare-name strategies
+  // guessed an unrelated same-named method (#1840).
+  if (!ESM_FAMILY.has(ref.language)) return null;
+  return inferEsmAwaitedCallType(receiverName, ref, context);
+}
+
+function inferDeclaredLocalReceiverType(
+  receiverName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
   // CFML scope prefixes: `variables.svc` / `this.svc` name a COMPONENT-scoped
   // field whose assignment or `property` declaration usually lives outside the
   // calling function (the init-pseudoconstructor / WireBox-injection pattern),
@@ -2013,6 +2048,85 @@ function inferLocalReceiverType(
     return inferPhpAssignedPropertyType(escapedReceiver, lines, callIdx);
   }
   return null;
+}
+
+/**
+ * Type of a JS/TS local bound to an awaited call — `const listed = await
+ * listPaths()` where `listPaths` is declared `(): Promise<string>`.
+ *
+ * The declared annotation is read from the callee's own declaration line
+ * rather than from node metadata: the TS/JS extractors do not populate
+ * `returnType` (only Java, Go, C#, Swift, Dart, ObjC and Pascal do), and
+ * teaching them to would change extraction output for every TS index. This
+ * stays inside resolution, where a bounded source scan is already the idiom
+ * (see inferPhpAssignedPropertyType).
+ *
+ * Only a bare callee qualifies. `await svc.load()` names a member whose owner
+ * would itself have to be inferred first, and guessing there is the mistake
+ * this is fixing.
+ */
+function inferEsmAwaitedCallType(
+  receiverName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  const lines = context.getFileLines
+    ? context.getFileLines(ref.filePath)
+    : (context.readFile(ref.filePath)?.split(/\r?\n/) ?? null);
+  if (!lines || lines.length === 0) return null;
+  const callIdx = Math.max(0, Math.min(lines.length - 1, ref.line - 1));
+  const startIdx = Math.max(0, enclosingScopeStartLine(ref, context) - 1);
+
+  const memo = getAwaitedTypeMemo(context);
+  const memoKey = `${ref.filePath}|${startIdx}|${ref.language}|${receiverName}`;
+  const cached = memo.get(memoKey);
+  if (cached !== undefined) return cached;
+  const resolved = resolveAwaitedCallType(receiverName, lines, callIdx, startIdx, ref, context);
+  memo.set(memoKey, resolved);
+  return resolved;
+}
+
+function resolveAwaitedCallType(
+  receiverName: string,
+  lines: string[],
+  callIdx: number,
+  startIdx: number,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  const escapedReceiver = receiverName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const awaited = new RegExp(`\\b${escapedReceiver}\\b\\s*=\\s*await\\s+([A-Za-z_$][\\w$]*)\\s*\\(`);
+  let callee: string | null = null;
+  for (let i = callIdx; i >= startIdx && callee === null; i--) {
+    const line = lines[i];
+    if (!line || line.length > 10_000) continue;
+    callee = line.match(awaited)?.[1] ?? null;
+  }
+  if (!callee) return null;
+
+  const declaring = preferCallSiteFile(
+    context.getNodesByName(callee).filter(
+      (n) => (n.kind === 'function' || n.kind === 'method') && n.language === ref.language,
+    ),
+    ref.filePath,
+  )[0];
+  if (!declaring) return null;
+
+  const declLines = context.getFileLines
+    ? context.getFileLines(declaring.filePath)
+    : (context.readFile(declaring.filePath)?.split(/\r?\n/) ?? null);
+  const declLine = declLines?.[Math.max(0, declaring.startLine - 1)];
+  if (!declLine || declLine.length > 10_000) return null;
+
+  // `...): Promise<string> {` — stop before the body, a default value or the
+  // end of the statement so an unannotated declaration yields nothing.
+  const annotated = declLine.match(/\)\s*:\s*([^{=;]+)/);
+  if (!annotated?.[1]) return null;
+  const returned = annotated[1].trim();
+  // `await` unwraps exactly one Promise layer; anything else is the type the
+  // caller sees as-is (an async function without the annotation lands here).
+  const awaitedType = returned.match(/^Promise\s*<([\s\S]+)>$/)?.[1]?.trim() ?? returned;
+  return normalizeInferredTypeName(awaitedType);
 }
 
 /**
@@ -2211,7 +2325,13 @@ export function matchMethodCall(
       // method (#1566). Inference already strips generics (`Map<K, V>` →
       // `Map`); do not let Strategy 3 guess an unrelated `get`/`set`/`has`.
       // Keep the validated match above for a project type shadowing a builtin.
-      if (ESM_FAMILY.has(ref.language) && JS_BUILT_INS.has(inferredType)) {
+      // A primitive receiver joins the builtins here: `listed.split()` on a
+      // `string` is the built-in method, and Strategy 3 would otherwise hand
+      // it whichever project class happens to declare a lone `split` (#1840).
+      if (
+        ESM_FAMILY.has(ref.language) &&
+        (JS_BUILT_INS.has(inferredType) || TS_PRIMITIVE_TYPES.has(inferredType))
+      ) {
         return null;
       }
     }
