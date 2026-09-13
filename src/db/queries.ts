@@ -276,6 +276,8 @@ export class QueryBuilder {
     insertUnresolved?: SqliteStatement;
     deleteUnresolvedByNode?: SqliteStatement;
     getUnresolvedByName?: SqliteStatement;
+    getUnresolvedByQualifiedName?: SqliteStatement;
+    getUnresolvedByNamespacedSuffix?: SqliteStatement;
     getNodesByName?: SqliteStatement;
     getNodesByNamePrefix?: SqliteStatement;
     getNodesByQualifiedNameExact?: SqliteStatement;
@@ -3070,6 +3072,97 @@ export class QueryBuilder {
       language: row.language as Language,
       rowId: row.id,
     }));
+  }
+
+  /**
+   * Get unresolved references named exactly `name`, OR `name` followed by a
+   * single `.member` qualifier (`name.Stub`, `name.Stub.Proxy`, ...).
+   *
+   * Extraction stores a superclass/interface clause's text verbatim rather
+   * than decomposing it, so a real Java `class Foo extends IBar.Stub` (the
+   * single most common AOSP Binder-implementation shape) records an
+   * unresolved `extends` reference named `"IBar.Stub"`, not bare `"IBar"`.
+   * `getUnresolvedByName('IBar')` alone would silently miss any such
+   * reference that stays genuinely unresolved. Note this method covers only
+   * the case where the reference reaches `unresolved_refs` at all: a
+   * separate cross-file resolver bug (fixed 2026-09-06, see
+   * src/resolution/name-matcher.ts) could mis-resolve a dotted `extends`
+   * reference to an unrelated same-named method BEFORE it ever became
+   * "unresolved", which this method has no visibility into. AOSP-only
+   * caller today (aidl.ts/hal.ts/system_service.ts).
+   *
+   * Deliberately does NOT match a C++ `::`-qualified prefix (`ns::name`) —
+   * that broader match previously lived here and leaked into every caller
+   * (including aidl-impl's Kotlin/Java-only contract), letting an unrelated
+   * C++ `class Decoy : public ns::IFoo {}` get promoted to a false
+   * "found" implementation for a Kotlin/Java-only AIDL interface (Codex
+   * adversarial review, 2026-09-10, HIGH-1). The `::`-suffix match now lives
+   * in {@link getUnresolvedByNamespacedSuffix}, used only by hal.ts's
+   * AIDL-specific Bn{Name} Binder-native stub check.
+   */
+  getUnresolvedByQualifiedName(name: string): UnresolvedReference[] {
+    if (!this.stmts.getUnresolvedByQualifiedName) {
+      this.stmts.getUnresolvedByQualifiedName = this.db.prepare(
+        "SELECT * FROM unresolved_refs WHERE reference_name = ? OR reference_name LIKE ? ESCAPE '\\'"
+      );
+    }
+    const likePrefix = name.replace(/[\\%_]/g, (c) => `\\${c}`);
+    const rows = this.stmts.getUnresolvedByQualifiedName.all(name, `${likePrefix}.%`) as UnresolvedRefRow[];
+    return rows.map((row) => ({
+      fromNodeId: row.from_node_id,
+      referenceName: row.reference_name,
+      referenceKind: row.reference_kind as EdgeKind,
+      line: row.line,
+      column: row.col,
+      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+      filePath: row.file_path,
+      language: row.language as Language,
+      rowId: row.id,
+    }));
+  }
+
+  /**
+   * Get unresolved references named exactly `name`, OR `name` reached
+   * through a C++ `::`-qualified prefix (`ns::name`, `outer::inner::name`).
+   *
+   * Narrow, AOSP-HAL-specific counterpart to {@link getUnresolvedByQualifiedName}:
+   * a real AIDL C++ HAL implementation's Binder-native stub base is
+   * routinely reached through a namespace alias (`namespace aidlvhal = ...;
+   * class Foo : public aidlvhal::BnVehicle`), never the bare `BnVehicle`.
+   * Split into its own method (rather than folded into the generic
+   * qualified-name lookup above) so this `::`-suffix reach never leaks into
+   * callers that only expect Kotlin/Java dotted-member matches (see the note
+   * on {@link getUnresolvedByQualifiedName}). Sole caller today: hal.ts's
+   * `findBnStubCandidates`, gated to `halType === 'aidl'`.
+   *
+   * SQLite's `LIKE` is ASCII case-insensitive by default, which would let
+   * `%::BnFoo` also match an unrelated `ns::bnfoo` (a different C++
+   * identifier) — filtered back out here with an exact, case-sensitive
+   * suffix check on the returned rows (Codex adversarial review, 2026-09-10,
+   * MEDIUM-2).
+   */
+  getUnresolvedByNamespacedSuffix(name: string): UnresolvedReference[] {
+    if (!this.stmts.getUnresolvedByNamespacedSuffix) {
+      this.stmts.getUnresolvedByNamespacedSuffix = this.db.prepare(
+        "SELECT * FROM unresolved_refs WHERE reference_name = ? OR reference_name LIKE ? ESCAPE '\\'"
+      );
+    }
+    const likeSuffix = name.replace(/[\\%_]/g, (c) => `\\${c}`);
+    const suffix = `::${name}`;
+    const rows = this.stmts.getUnresolvedByNamespacedSuffix.all(name, `%::${likeSuffix}`) as UnresolvedRefRow[];
+    return rows
+      .filter((row) => row.reference_name === name || row.reference_name.endsWith(suffix))
+      .map((row) => ({
+        fromNodeId: row.from_node_id,
+        referenceName: row.reference_name,
+        referenceKind: row.reference_kind as EdgeKind,
+        line: row.line,
+        column: row.col,
+        candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+        filePath: row.file_path,
+        language: row.language as Language,
+        rowId: row.id,
+      }));
   }
 
   /**

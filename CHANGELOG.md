@@ -25,6 +25,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- Analyze Android platform code with CLI commands and opt-in MCP tools for AIDL/HIDL implementation candidates, JNI bindings, system services, permission and broadcast literals, and Messenger, ContentProvider, and local-socket evidence.
 - **Codex and Astra read project guidance from `AGENTS.md`.** The canonical agent guide now lives in `AGENTS.md` (with a nested `docs/AGENTS.md` for long validation notes); `CLAUDE.md` is a thin `@AGENTS.md` wrapper for Claude Code. Codex/Astra no longer miss the old CLAUDE-only instructions.
 
 - **A big screen's picture stops wrapping into a column.** How wide a screen's lines run before they wrap was worked out with a formula, and the formula was wrong for the way these pictures are actually drawn: a part of a screen spends lines on its own structure — a step that fires things gets a line to itself, and what it fires starts another — so estimating the lines from the boxes alone badly undercounted them, and one screen's 98 boxes wrapped into a 4,356px column. Laying a picture out is cheap and exact, so the widths are now simply tried and the one that comes out closest to the shape of a window is kept. Across one app's 51 screens the tallest picture went from 4,356px to 3,796px, total height fell 8%, and — because a shorter picture is also a picture whose lines have less far to go — lines running over other boxes fell by a third and lines crossing each other went from 13 to 5.
@@ -310,6 +311,13 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Fixed a long-running `codegraph ui` session serving a symbol that a sync had already deleted. The viewer keeps one connection to your index open, and its in-memory lookup didn't notice when another process — your agent's sync, or `codegraph sync` — rewrote the file underneath it, so a symbol screen could keep showing a body with no callers while search correctly reported it had moved. Because a symbol's identity includes the line it starts on, this happened after almost any edit above it.
 
 - Python calls and file dependencies through `from package import module as alias` now appear in the graph, so renamed imports no longer hide live callers or imported modules. Thanks @JoeyNPP. (#1626)
+
+#### Type resolution and Android source extraction
+
+- Inheritance references no longer resolve to unrelated methods with matching names.
+- Qualified nested types and C++ namespace aliases resolve more accurately across source files.
+- The portable parser preserves members and inheritance in Java anonymous classes and Kotlin object expressions for implementation searches.
+- Qualified type lookups no longer match partial identifiers from unrelated scopes.
 
 ## [1.6.0] - 2026-08-26
 

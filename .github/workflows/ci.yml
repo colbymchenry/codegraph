@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: ["**"]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CODEGRAPH_TELEMETRY: '0'
+  CODEGRAPH_NO_UPDATE_CHECK: '1'
+
+jobs:
+  test:
+    name: Build and test (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Prepare sensitive-path test directory
+        run: mkdir -p "$HOME/.ssh"
+      - name: Test portable engine and viewer
+        env:
+          CODEGRAPH_KERNEL: '0'
+        run: npm test -- --maxWorkers=2 --minWorkers=1
+
+  kernel:
+    name: Native kernel and AOSP
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Build Linux kernel
+        run: bash scripts/build-kernel.sh --target x86_64-unknown-linux-gnu
+      - run: npm run build
+      - name: Require the native binary
+        run: test -s codegraph-kernel/prebuilds/linux-x64/codegraph-kernel.node
+      - name: Verify kernel parity and Android tracing
+        env:
+          CODEGRAPH_KERNEL_EXPECT: '1'
+        run: >-
+          npx vitest run
+          __tests__/kernel-*.test.ts
+          __tests__/aosp-*.test.ts
+          __tests__/kotlin-object-literal.test.ts
+          __tests__/extraction.test.ts
+          __tests__/resolution.test.ts
+          --maxWorkers=2 --minWorkers=1
+
+  checks:
+    name: CI checks
+    if: always()
+    needs: [test, kernel]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every validation job to pass
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+          KERNEL_RESULT: ${{ needs.kernel.result }}
+        run: |
+          test "$TEST_RESULT" = success
+          test "$KERNEL_RESULT" = success

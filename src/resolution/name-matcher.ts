@@ -734,6 +734,31 @@ function isLocallyBoundJsName(name: string, filePath: string, context: Resolutio
   return bound;
 }
 
+/** Node kinds eligible as targets of an extends/implements reference. */
+const TYPE_LIKE_NODE_KINDS = new Set<Node['kind']>([
+  'module',
+  'class',
+  'struct',
+  'interface',
+  'trait',
+  'protocol',
+  'enum',
+  'type_alias',
+  'union',
+]);
+
+function isInheritanceReference(ref: UnresolvedRef): boolean {
+  return ref.referenceKind === 'extends' || ref.referenceKind === 'implements';
+}
+
+function isTypeLikeNode(node: Node): boolean {
+  return TYPE_LIKE_NODE_KINDS.has(node.kind);
+}
+
+function filterCandidatesForReference(ref: UnresolvedRef, nodes: Node[]): Node[] {
+  return isInheritanceReference(ref) ? nodes.filter(isTypeLikeNode) : nodes;
+}
+
 /**
  * Try to resolve a reference by exact name match
  */
@@ -751,8 +776,11 @@ export function matchByExactName(
   // findBestMatch — O(K²) per package, the dominant cost of "Resolving refs" on
   // large import-heavy (front-end + back-end) repos (#915).
   const bareJs = isBareJsCall(ref, context);
-  const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref)
-    .filter((n) => n.kind !== 'import')
+  const candidates = filterCandidatesForReference(
+    ref,
+    applyLanguageGate(context.getNodesByName(ref.referenceName), ref)
+      .filter((n) => n.kind !== 'import'),
+  )
     // Nested locals are only reachable from inside their container (#1230).
     .filter((n) => isLexicallyReachable(n, ref, context))
     // Preserve import ranking; calls reject the winner without promoting another.
@@ -819,6 +847,27 @@ export function matchByExactName(
 }
 
 /**
+ * Whether `qualifiedName` ends with `suffix` at a real `::` scope boundary —
+ * NOT a plain `String.endsWith`, which false-matches across an identifier
+ * boundary purely by character coincidence: `"Aaa::operator+"` ends with the
+ * literal substring `"a::operator+"` only because `Aaa` itself happens to
+ * end in the letter `a`, even though `"a"` there was never meant as a scope
+ * qualifier at all — it was a C++ receiver *variable* named `a` in a
+ * `a.operator+(b)` call, decoy-matching the unrelated `Aaa::operator+`
+ * method instead of leaving receiver-type inference (`matchMethodCall`) to
+ * find the real `V::operator+` (regression found while adding `.`-to-`::`
+ * qualifier normalization below, 2026-09-11). A match only counts when the
+ * suffix is the WHOLE qualifiedName, or the two characters immediately
+ * preceding it are a real `::` separator.
+ */
+function endsWithQualifiedSegment(qualifiedName: string, suffix: string): boolean {
+  if (qualifiedName === suffix) return true;
+  if (!qualifiedName.endsWith(suffix)) return false;
+  const boundary = qualifiedName.length - suffix.length;
+  return boundary >= 2 && qualifiedName[boundary - 1] === ':' && qualifiedName[boundary - 2] === ':';
+}
+
+/**
  * Try to resolve by qualified name
  */
 export function matchByQualifiedName(
@@ -837,14 +886,32 @@ export function matchByQualifiedName(
   // must never resolve to a yaml/properties config node — that's a wrong edge
   // AND it hides the real callee. Drop those from both the exact and the partial
   // candidate sets so resolution falls through to method resolution below (#1180).
-  const keepForRef = (nodes: Node[]): Node[] =>
-    ref.referenceKind === 'calls'
-      ? nodes.filter(
-          (n) => !(n.kind === 'constant' && (n.language === 'yaml' || n.language === 'properties')),
-        )
-      : nodes;
+  const keepForRef = (nodes: Node[]): Node[] => {
+    let kept = nodes;
+    if (ref.referenceKind === 'calls') {
+      kept = kept.filter(
+        (n) => !(n.kind === 'constant' && (n.language === 'yaml' || n.language === 'properties')),
+      );
+    }
+    return filterCandidatesForReference(ref, kept);
+  };
 
-  const candidates = keepForRef(context.getNodesByQualifiedName(ref.referenceName));
+  // The GENERIC class-hierarchy walker's qualifiedName always joins scope
+  // with `::` (buildQualifiedName in tree-sitter.ts) regardless of source
+  // language, but an extends/implements clause's own text is recorded
+  // verbatim from the language's own syntax — so a Java/C# dotted supertype
+  // (`Outer.Inner`, `IFoo.Stub`) never matched a real indexed type's
+  // `::`-joined qualifiedName without normalizing the separator first.
+  // Scoped to ONLY inheritance references: several non-generic extractors
+  // (MyBatis XML statements, for one) deliberately build a MIXED
+  // qualifiedName that keeps literal dots from an already-dotted Java
+  // package/namespace string and adds `::` only at one specific boundary —
+  // blanket-normalizing every reference's dots to `::` mangled those
+  // (regression found and reverted to this narrower scope, 2026-09-11).
+  const normalizedQualifiedRef = isInheritanceRef(ref)
+    ? ref.referenceName.replace(/\./g, '::')
+    : ref.referenceName;
+  const candidates = keepForRef(context.getNodesByQualifiedName(normalizedQualifiedRef));
 
   if (candidates.length === 1) {
     return {
@@ -905,8 +972,18 @@ export function matchByQualifiedName(
   const parts = ref.referenceName.split(/[:.]/);
   const lastName = parts[parts.length - 1];
   if (lastName) {
+    // The strict `::`-boundary check only matters where normalization
+    // actually ran (inheritance refs) — every other reference kind keeps
+    // the original, deliberately loose `endsWith` (e.g. Expo's JS call site
+    // binds a shortened alias like `Haptics` that only matches the END of
+    // the native module's `...::ExpoHaptics.method` qualifiedName by design,
+    // with no `::` immediately before it).
     const partialCandidates = keepForRef(context.getNodesByName(lastName))
-      .filter((candidate) => candidate.qualifiedName.endsWith(ref.referenceName));
+      .filter((candidate) =>
+        isInheritanceRef(ref)
+          ? endsWithQualifiedSegment(candidate.qualifiedName, normalizedQualifiedRef)
+          : candidate.qualifiedName.endsWith(normalizedQualifiedRef)
+      );
     const chosen = preferCallSiteFile(partialCandidates, ref.filePath)[0];
     if (chosen) {
       return {
@@ -1048,6 +1125,11 @@ export function resolveMethodOnType(
   /** Recursion guard for the supertype/conformance walk. */
   depth = 0,
 ): ResolvedRef | null {
+  // This helper resolves a receiver's invoked member, never a type/member
+  // reference such as Java `class Foo extends IBar.Stub`. Keep the guard here
+  // as a backstop for every current and future caller of this call-only API.
+  if (ref.referenceKind !== 'calls') return null;
+
   // Look up methods by name and match by qualifiedName ending in
   // `<typeName>::<methodName>`. This works whether the method is defined
   // in-class (`class Foo { int bar() { ... } }`) or out-of-line in a separate
@@ -1370,6 +1452,7 @@ export function matchCppCallChain(
   ref: UnresolvedRef,
   context: ResolutionContext,
 ): ResolvedRef | null {
+  if (ref.referenceKind !== 'calls') return null;
   const m = ref.referenceName.match(/^(.+)\(\)\.(\w+)$/);
   if (!m || !m[1] || !m[2]) return null;
   const cls = resolveCppCallResultType(m[1], ref, context);
@@ -1392,6 +1475,7 @@ export function matchScopedCallChain(
   ref: UnresolvedRef,
   context: ResolutionContext,
 ): ResolvedRef | null {
+  if (ref.referenceKind !== 'calls') return null;
   const m = ref.referenceName.match(/^(.+)\(\)\.(\w+)$/);
   if (!m || !m[1] || !m[2]) return null;
   const inner = m[1];
@@ -1431,6 +1515,7 @@ export function matchDottedCallChain(
   ref: UnresolvedRef,
   context: ResolutionContext,
 ): ResolvedRef | null {
+  if (ref.referenceKind !== 'calls') return null;
   const m = ref.referenceName.match(/^(.+)\(\)\.(\w+)$/);
   if (!m || !m[1] || !m[2]) return null;
   const inner = m[1]; // `Foo.getInstance`
@@ -2107,6 +2192,12 @@ export function matchMethodCall(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  // A dotted/scoped name is not necessarily an invocation: Java inheritance
+  // refs such as `IBar.Stub` have the same surface shape. Let type-reference
+  // strategies handle non-call refs rather than falling through to the
+  // same-named-method heuristics below.
+  if (ref.referenceKind !== 'calls') return null;
+
   // Parse method call patterns like "obj.method" or "Class::method". The method
   // part allows trailing `:` keywords so Objective-C selectors resolve
   // (`SDImageCache.storeImage:`, `obj.setX:y:`); colons never appear in other
@@ -2939,12 +3030,12 @@ export function matchFuzzy(
   // Use pre-built lowercase index for O(1) lookup instead of scanning all nodes
   const candidates = context.getNodesByLowerName(lowerName);
 
-  // Filter to callable kinds only (function, method, class)
-  const callableKinds = new Set(['function', 'method', 'class']);
-  const callableCandidates = applyLanguageGate(
-    candidates.filter((n) => callableKinds.has(n.kind)),
-    ref
-  );
+  // Calls use callable kinds; inheritance is a type reference and must never
+  // fall through to a same-named method/function (HIGH-1).
+  const eligibleCandidates = isInheritanceReference(ref)
+    ? filterCandidatesForReference(ref, candidates)
+    : candidates.filter((n) => n.kind === 'function' || n.kind === 'method' || n.kind === 'class');
+  const callableCandidates = applyLanguageGate(eligibleCandidates, ref);
 
   // Prefer same-language matches
   const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);

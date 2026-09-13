@@ -181,3 +181,91 @@ describe('MCP initialize handshake (issue #172)', () => {
     expect(prompts.result.prompts).toEqual([]);
   }, 15000);
 });
+
+/**
+ * The AOSP-tools addendum (see docs/design/android-platform-analysis.md's Exposure
+ * section): SERVER_INSTRUCTIONS is a static template, so before this existed,
+ * enabling an AOSP tool via CODEGRAPH_MCP_TOOLS still left the agent's
+ * system prompt talking only about codegraph_explore, so the agent had no
+ * reason to ever call the newly-enabled tool. Tested directly against the
+ * pure functions (no subprocess) since the logic itself needs no CodeGraph
+ * instance; the handshake-wiring itself is exercised end-to-end by the
+ * `describe` block above (both call the same `enabledAospAddendum`).
+ */
+describe('AOSP tools addendum in the initialize instructions', () => {
+  const ORIGINAL_ENV = process.env.CODEGRAPH_MCP_TOOLS;
+  let tempDir: string | null = null;
+  let child: ChildProcessWithoutNullStreams | null = null;
+
+  afterEach(() => {
+    if (ORIGINAL_ENV === undefined) delete process.env.CODEGRAPH_MCP_TOOLS;
+    else process.env.CODEGRAPH_MCP_TOOLS = ORIGINAL_ENV;
+    if (child && !child.killed) {
+      child.kill('SIGKILL');
+      child = null;
+    }
+    if (tempDir) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+      tempDir = null;
+    }
+  });
+
+  it('adds nothing when no AOSP tool is enabled (the common, non-Android case)', async () => {
+    delete process.env.CODEGRAPH_MCP_TOOLS;
+    const { enabledAospAddendum } = await import('../src/mcp/session');
+    expect(enabledAospAddendum()).toBe('');
+
+    process.env.CODEGRAPH_MCP_TOOLS = 'explore,node,search';
+    expect(enabledAospAddendum()).toBe('');
+
+    process.env.CODEGRAPH_MCP_TOOLS = '';
+    expect(enabledAospAddendum()).toBe('');
+  });
+
+  it('names exactly the enabled AOSP tools, and only those', async () => {
+    process.env.CODEGRAPH_MCP_TOOLS = 'explore,aidl_impl,trace_permission';
+    const { enabledAospAddendum } = await import('../src/mcp/session');
+    const addendum = enabledAospAddendum();
+
+    expect(addendum).toContain('codegraph_aidl_impl');
+    expect(addendum).toContain('codegraph_trace_permission');
+    expect(addendum).not.toContain('codegraph_jni_bridge');
+    expect(addendum).not.toContain('codegraph_hal_interface');
+    expect(addendum).not.toContain('codegraph_system_service');
+    expect(addendum).not.toContain('codegraph_trace_broadcast');
+    expect(addendum).not.toContain('codegraph_messenger_ipc');
+    expect(addendum).not.toContain('codegraph_content_provider');
+    expect(addendum).not.toContain('codegraph_local_socket_ipc');
+  });
+
+  it('names the three IPC-pattern AOSP tools (messenger_ipc/content_provider/local_socket_ipc) when enabled, and only those', async () => {
+    process.env.CODEGRAPH_MCP_TOOLS = 'explore,messenger_ipc,content_provider,local_socket_ipc';
+    const { enabledAospAddendum } = await import('../src/mcp/session');
+    const addendum = enabledAospAddendum();
+
+    expect(addendum).toContain('codegraph_messenger_ipc');
+    expect(addendum).toContain('codegraph_content_provider');
+    expect(addendum).toContain('codegraph_local_socket_ipc');
+    expect(addendum).not.toContain('codegraph_aidl_impl');
+    expect(addendum).not.toContain('codegraph_jni_bridge');
+    expect(addendum).not.toContain('codegraph_hal_interface');
+    expect(addendum).not.toContain('codegraph_system_service');
+    expect(addendum).not.toContain('codegraph_trace_permission');
+    expect(addendum).not.toContain('codegraph_trace_broadcast');
+  });
+
+  it('is appended to the initialize instructions payload end-to-end', async () => {
+    process.env.CODEGRAPH_MCP_TOOLS = 'explore,jni_bridge';
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-aosp-init-'));
+    await CodeGraph.init(tempDir, { index: true });
+
+    child = spawnServer(tempDir);
+    const events = tagStreams(child);
+    sendInitialize(child, tempDir);
+    const ev = await waitFor(events, (e) => e.stream === 'stdout', 20000);
+    const json = JSON.parse(ev.text);
+
+    expect(json.result.instructions).toContain('codegraph_jni_bridge');
+    expect(json.result.instructions).not.toContain('codegraph_aidl_impl');
+  }, 25000);
+});

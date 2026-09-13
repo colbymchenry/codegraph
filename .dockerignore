@@ -2,7 +2,6 @@ node_modules
 dist
 .git
 .codegraph
-.kommandr
 docs
 assets
 codegraph-kernel/target
