@@ -343,6 +343,10 @@ After upgrading, run `codegraph index` once in each project so your existing gra
 
 - Anonymous usage telemetry is now stored entirely on CodeGraph's own first-party infrastructure — no third-party analytics vendor receives any of it, and the endpoint that receives it makes no outbound requests at all. Individual events are deleted after 90 days, leaving only anonymous daily totals. Nothing about what is collected changed, your IP address is still never read or stored, and every off-switch works exactly as before (`codegraph telemetry off`, `CODEGRAPH_TELEMETRY=0`, `DO_NOT_TRACK=1`). `TELEMETRY.md` remains the complete field-by-field list.
 
+- Added full Gleam language support for `.gleam` files, including the vendored
+  tree-sitter grammar, functions, types, constants, imports, call references,
+  and cross-file module resolution.
+
 ### Fixes
 
 #### Better answers from `codegraph_explore`
