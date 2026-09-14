@@ -107,6 +107,7 @@ export const LANGUAGES = [
   'r',
   'solidity',
   'nix',
+  'magik',
   'yaml',
   'twig',
   'xml',

@@ -143,8 +143,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   Trails are plain JSON, one file per trail, under `.codegraph/ui/trails/` — already ignored by git, so they stay yours by default. **Export** hands you the file if you'd rather commit one for the team. This is the only thing the viewer writes: it still never indexes, never changes your graph, and never touches a line of your code. Start it with `codegraph ui --read-only` and it won't write even that — saved trails can still be opened, just not saved or deleted.
 
+- CodeGraph now indexes **Magik** (`.magik`) — the SmallWorld/GE Smallworld language used in GIS and asset management platforms. Exemplar definitions (`define_slotted_exemplar`, `define_mixin`, and related forms) are extracted as class nodes, `_method` declarations as methods with their exemplar as the receiver type, named `_proc` blocks as functions, `_package` declarations as namespaces, and inline `##` docstrings are preserved. Call edges are tracked across methods and procedures.
+
 ### Fixes
 
+- Magik character literals (`%a`, `%newline`, `%space`, …) now parse reliably — the vendored grammar previously matched them too loosely, which could misparse adjacent code. Re-index Magik projects after upgrading.
 - Spring mappings now include every declared path combination and resolve constants declared in the same file, while unresolved paths no longer appear as false root routes. (#1461)
 - `codegraph callers`, `codegraph callees` and `codegraph impact` now resolve qualified names, group results and JSON edges by definition, and accept `--file` to narrow ambiguous names; thanks @ferrine. (#1512, #1656)
 - `codegraph callers`, `codegraph callees` and `codegraph impact` (CLI and MCP) now report missing names with did-you-mean suggestions instead of another symbol's results, and exact matches with no callers stay empty; thanks @uvmplus. (#1473, #1481)
