@@ -146,6 +146,86 @@ describe('Incremental sync converges to a full rebuild (CG-33)', () => {
     expect(describeDiff(synced, rebuilt)).toBe('missing from synced: 0, stale in synced: 0');
   });
 
+  it('keeps one edge when re-resolution selects the same target', async () => {
+    write('src/caller.ts', `export function run(): number {\n  return pct(1);\n}\n`);
+    write('src/alpha.ts', `export function pct(n: number): number {\n  return n;\n}\n`);
+    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    await cg.indexAll();
+
+    // zeta.ts introduces a competing definition, so the existing edge is
+    // reopened, but alpha.ts remains the deterministic first candidate.
+    write('src/zeta.ts', `export function pct(n: number): number {\n  return n * 2;\n}\n`);
+    const result = await cg.sync();
+    expect(result.definitionDelta).toContain('pct');
+
+    const targets = withDb((db) =>
+      (
+        db
+          .prepare(
+            `SELECT target.file_path AS file
+               FROM edges edge
+               JOIN nodes source ON source.id = edge.source
+               JOIN nodes target ON target.id = edge.target
+              WHERE source.name = 'run'
+                AND target.name = 'pct'
+                AND edge.kind = 'calls'`
+          )
+          .all() as Array<{ file: string }>
+      ).map((row) => row.file)
+    );
+    expect(targets).toEqual(['src/alpha.ts']);
+  });
+
+  it('rolls back edge deletion when requeueing its reference is interrupted', async () => {
+    write('src/caller.ts', `export function run(): number {\n  return pct(1);\n}\n`);
+    write('src/zeta.ts', `export function pct(n: number): number {\n  return n;\n}\n`);
+    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+    await cg.indexAll();
+
+    const originalEdge = withDb((db) => {
+      const row = db
+        .prepare(
+          `SELECT edge.source, edge.target, edge.kind
+             FROM edges edge
+             JOIN nodes source ON source.id = edge.source
+             JOIN nodes target ON target.id = edge.target
+            WHERE source.name = 'run'
+              AND target.name = 'pct'
+              AND edge.kind = 'calls'`
+        )
+        .get() as { source: string; target: string; kind: string };
+      db.exec(
+        `CREATE TRIGGER interrupt_pct_requeue
+         BEFORE INSERT ON unresolved_refs
+         WHEN NEW.reference_name = 'pct'
+         BEGIN
+           SELECT RAISE(ABORT, 'forced rebind interruption');
+         END;`
+      );
+      return `${row.source}|${row.target}|${row.kind}`;
+    });
+
+    write('src/alpha.ts', `export function pct(n: number): number {\n  return n * 2;\n}\n`);
+    await expect(cg.sync()).rejects.toThrow(/forced rebind interruption/);
+
+    // A failed requeue leaves the last committed graph answer untouched.
+    expect(edgeSet().has(originalEdge)).toBe(true);
+    const queued = withDb(
+      (db) =>
+        (
+          db
+            .prepare(
+              `SELECT COUNT(*) AS count
+                 FROM unresolved_refs ref
+                 JOIN nodes source ON source.id = ref.from_node_id
+                WHERE source.name = 'run' AND ref.reference_name = 'pct'`
+            )
+            .get() as { count: number }
+        ).count
+    );
+    expect(queued).toBe(0);
+  });
+
   /**
    * The mirror direction: removing a definition narrows the candidate set too,
    * so the delta must include names the sync DROPPED, not just names it added.

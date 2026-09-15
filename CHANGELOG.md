@@ -145,6 +145,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Calls between JavaScript, JSX and TypeScript files keep their callers and callback flows.
+- Zustand actions keep their callers when read through typed stores, destructured from store state, or selected by a hook.
+- Steps diagrams retain database operations made through external client chains without inventing internal dependencies.
+- Direct React Native bridge calls retain their native implementations and cross-platform relationships.
+- Dart extension-type getters remain searchable when using the WebAssembly parser.
+
 - Spring mappings now include every declared path combination and resolve constants declared in the same file, while unresolved paths no longer appear as false root routes. (#1461)
 - `codegraph callers`, `codegraph callees` and `codegraph impact` now resolve qualified names, group results and JSON edges by definition, and accept `--file` to narrow ambiguous names; thanks @ferrine. (#1512, #1656)
 - `codegraph callers`, `codegraph callees` and `codegraph impact` (CLI and MCP) now report missing names with did-you-mean suggestions instead of another symbol's results, and exact matches with no callers stay empty; thanks @uvmplus. (#1473, #1481)
@@ -152,6 +158,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 #### MCP / indexing
 
 - `codegraph status` no longer reports zero pending changes for work you have already committed. Change detection asked git for the working-tree diff, and committing a file is exactly what removes it from that answer — so an edit read as pending until you committed it, then read as nothing while the index still lacked it. It now also asks git what changed between the commit the index was built from and where you are now, so the number matches what a sync would actually do. (#1829)
+- Daemon startup and cleanup now preserve live legacy PID-only locks while still reclaiming dead or identity-disproved records, preventing two writers from serving the same project.
+- Incremental sync now keeps edge rebinding crash-safe: replacing a resolved edge with its recovery reference commits atomically, so an interruption cannot permanently remove the relationship.
 
 - The prompt hook no longer injects unrelated projects when run from your home directory or a broader directory containing a stray workspace manifest. (#1454)
 
