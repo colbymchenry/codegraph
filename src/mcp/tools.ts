@@ -31,6 +31,7 @@ import {
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
+import type { VueComponentApi, VuePropInfo } from '../extraction/vue-extractor';
 import { isTestFile, normalizeNameToken } from '../search/query-utils';
 import { groupDefinitions, lastQualifierPart, matchesSymbol } from '../graph/symbol-lookup';
 import { extractQueryPaths, queryMightContainPaths } from '../search/query-paths';
@@ -48,7 +49,6 @@ import {
   findAllSymbols,
   resolveNamedSymbolFlow,
 } from '../graph/named-symbol-flow';
-import { getUpdateNotice } from '../upgrade/update-check';
 import { ExploreDiagnostics } from './explore-diagnostics';
 import {
   EXPLORE_EMISSION_KEY,
@@ -115,6 +115,55 @@ const MAX_INPUT_LENGTH = 10_000;
  */
 const MAX_PATH_LENGTH = 4_096;
 
+/**
+ * Render a Vue component's public API (from `metadata.componentApi`, written
+ * by VueExtractor) as a compact markdown block. Attached to component nodes in
+ * `formatNodeDetails`, so `codegraph_node` / `codegraph_explore` answers carry
+ * the props/emits/slots contract an agent needs to USE the component without
+ * reading the SFC. Undefined when the node isn't a Vue component or its API
+ * wasn't extracted (pre-v10 index, non-Vue framework, nothing to report).
+ */
+function formatComponentApi(node: Node): string | undefined {
+  const api = node.metadata?.componentApi as VueComponentApi | undefined;
+  if (!api) return undefined;
+
+  const lines: string[] = ['**Vue component API:**'];
+  const oneLine = (text: string) => text.replace(/\s+/g, ' ').trim();
+  const docOf = (doc?: string) => (doc ? ` — ${oneLine(doc)}` : '');
+
+  if (api.props?.length) {
+    const renderProp = (p: VuePropInfo) => {
+      const type = p.type ? oneLine(p.type) : 'any';
+      const def = p.default !== undefined ? ` = ${oneLine(p.default)}` : '';
+      return `\`${p.name}${p.required ? '' : '?'}: ${type}${def}\`${docOf(p.doc)}`;
+    };
+    lines.push('', `**Props:** ${api.props.map(renderProp).join(' · ')}`);
+  }
+
+  if (api.emits?.length) {
+    lines.push(
+      '',
+      `**Emits:** ${api.emits.map((e) => `\`${e.name}${e.type || '()'}\`${docOf(e.doc)}`).join(' · ')}`
+    );
+  }
+
+  if (api.slots?.length) {
+    lines.push('', `**Slots:** ${api.slots.map((s) => `\`${s}\``).join(' · ')}`);
+  }
+
+  if (api.exposed?.length) {
+    lines.push('', `**Expose:** ${api.exposed.map((s) => `\`${s}\``).join(' · ')}`);
+  }
+
+  return lines.length > 1 ? lines.join('\n') : undefined;
+}
+
+/**
+ * An event-binding edge from the vue-handler synthesizer: it records the event
+ * it binds (metadata.event) but not the child component the binding sits on,
+ * unlike VueExtractor's own `references` edges (metadata.vueEvent/.vueComponent).
+ */
+const isVueHandlerEdge = (e: Edge) => e.metadata?.synthesizedBy === 'vue-handler';
 
 /**
  * Node kinds that contain other symbols. For these, `codegraph_node` with
@@ -1328,6 +1377,26 @@ export const tools: ToolDefinition[] = [
     annotations: READ_ONLY_ANNOTATIONS,
   },
   {
+    name: 'codegraph_component',
+    description: 'VUE COMPONENT CONTRACT — call before building with, editing, or refactoring a Vue component: its public API (props with types/defaults/docs, emits, slots, exposed), the child components it renders, the parents that use it, and every @event="handler" binding those parents attach — so changing an emit or prop shows exactly which parent handlers break. Query by component name (or pass `file` to disambiguate).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        component: {
+          type: 'string',
+          description: 'Component name, e.g. "Modal" (matches the .vue basename).',
+        },
+        file: {
+          type: 'string',
+          description: 'Optional path or basename (e.g. "src/components/Modal.vue") to disambiguate same-named components.',
+        },
+        projectPath: projectPathProperty,
+      },
+      required: ['component'],
+    },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
     name: 'codegraph_explore',
     description: 'PRIMARY TOOL — call FIRST for almost any question OR before an edit: how does X work, architecture, a bug, where/what is X, surveying an area, or the symbols you are about to change. Returns the verbatim source of the relevant symbols grouped by file in ONE capped call (Read-equivalent — treat the shown source as already Read; do NOT re-open those files), plus the call path among them. Query can be a natural-language question OR a bag of symbol/file names. Usually the ONLY call you need — more accurate context, in far fewer tokens and round-trips than a search/Read/Grep loop.',
     inputSchema: {
@@ -1454,7 +1523,7 @@ export function getStaticTools(): ToolDefinition[] {
  * status) remain fully functional — handlers stay, the library API and CLI are
  * untouched, and `CODEGRAPH_MCP_TOOLS=explore,node,...` re-enables any of them.
  */
-const DEFAULT_MCP_TOOLS = new Set(['explore']);
+const DEFAULT_MCP_TOOLS = new Set(['explore', 'component']);
 
 /**
  * Tool handler that executes tools against a CodeGraph instance
@@ -2297,6 +2366,7 @@ export class ToolHandler {
       case 'codegraph_impact': return await this.handleImpact(args);
       case 'codegraph_explore': return await this.handleExplore(args);
       case 'codegraph_node': return await this.handleNode(args);
+      case 'codegraph_component': return await this.handleComponent(args);
       case 'codegraph_files': return await this.handleFiles(args);
       default: return this.errorResult(`Unknown tool: ${toolName}`);
     }
@@ -6571,12 +6641,9 @@ export class ToolHandler {
     }
 
     // A newer release exists (#1243) — status is where users and agents look
-    // when something seems off, so surface the drift here too. Cheap memoized
-    // cache read; absent entirely when up to date or opted out.
-    const updateNotice = getUpdateNotice();
-    if (updateNotice) {
-      lines.push(`**Update available:** ${updateNotice}`);
-    }
+    // when something seems off, so surface the drift here too. Fork: the
+    // update check is disabled — a private fork must not suggest "upgrading"
+    // to an upstream release that lacks the fork's changes.
 
     // Non-zero at rest means a resolution pass was interrupted mid-run, so
     // some files' call/impact edges are missing until the next sync sweeps
@@ -6635,6 +6702,198 @@ export class ToolHandler {
     }
 
     return this.textResult(lines.join('\n'));
+  }
+
+  /**
+   * Handle codegraph_component — the Vue component contract: public API
+   * (metadata.componentApi from VueExtractor), the child components its
+   * template renders, the parents that use it, and the @event="handler"
+   * bindings on both sides. A parent's binding is its component→handler
+   * `references` edge tagged metadata.vueEvent / .vueComponent, so "who
+   * breaks if this emit changes" is answerable without reading any SFC.
+   */
+  private async handleComponent(args: Record<string, unknown>): Promise<ToolResult> {
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const name = this.validateString(args.component, 'component');
+    if (typeof name !== 'string') return name;
+    const fileHint = typeof args.file === 'string' && args.file.trim() ? args.file.trim() : undefined;
+
+    const matches = cg
+      .searchNodes(name, { limit: 50, kinds: ['component'] })
+      .map((r) => r.node)
+      .filter((n) => n.name.toLowerCase() === name.toLowerCase());
+    if (matches.length === 0) {
+      return this.textResult(
+        `No Vue component named "${name}" in the index. If the component exists on disk, re-run \`codegraph init\` to index it.`
+      );
+    }
+
+    // `component` nodes are not Vue-only (svelte / astro / razor / liquid /
+    // dfm produce them too) and only a Vue SFC carries a componentApi payload.
+    // Say so plainly instead of rendering a Vue-shaped "nothing here" message
+    // for a file this tool never reads.
+    const vueMatches = matches.filter((n) => n.language === 'vue');
+    if (vueMatches.length === 0) {
+      const found = matches.map((n) => `${n.name} (${n.language}, ${n.filePath})`).join(', ');
+      return this.textResult(
+        `"${name}" is not a Vue component: ${found}. \`codegraph_component\` reads the Vue SFC contract — use \`codegraph_explore\` with the name instead.`
+      );
+    }
+
+    let narrowed = vueMatches;
+    if (narrowed.length > 1 && fileHint) {
+      const norm = (p: string) => p.replace(/\\/g, '/').toLowerCase();
+      const fh = norm(fileHint);
+      const byFile = narrowed.filter((n) => norm(n.filePath).includes(fh));
+      if (byFile.length > 0) narrowed = byFile;
+    }
+    if (narrowed.length > 1) {
+      return this.textResult(
+        `Multiple components named "${name}":\n${narrowed.map((n) => `- ${n.filePath}`).join('\n')}\nPass \`file\` to pick one.`
+      );
+    }
+
+    const node = narrowed[0]!;
+    const outRefs = cg.getOutgoingEdgesFrom([node.id], ['references']);
+    const inRefs = cg.getIncomingEdgesTo([node.id], ['references']);
+    const myCalls = cg.getOutgoingEdgesFrom([node.id], ['calls']).filter(isVueHandlerEdge);
+
+    // Children: components this template renders (dedupe repeated tags);
+    // parents: components whose template renders me. Both are read off the
+    // edges already in hand, so ONE batched node lookup serves them.
+    const neighbours = cg.getNodesByIds([...outRefs, ...inRefs].flatMap((e) => [e.source, e.target]));
+    const children = new Map<string, Node>();
+    for (const e of outRefs) {
+      const target = neighbours.get(e.target);
+      if (target?.kind === 'component') children.set(target.id, target);
+    }
+    const parents = new Map<string, Node>();
+    for (const e of inRefs) {
+      const source = neighbours.get(e.source);
+      if (source?.kind === 'component') parents.set(source.id, source);
+    }
+
+    // A parent's own bindings are the same two edge populations read from the
+    // parent's side. The queries take an id ARRAY, so all parents are fetched
+    // in one round-trip per kind (N per-parent calls would mean N round-trips)
+    // and partitioned per parent below. Every endpoint rendered below — my
+    // binding targets and each parent's references/calls targets — resolved
+    // in one batch instead of per edge.
+    const api = node.metadata?.componentApi as VueComponentApi | undefined;
+    const myEmits = new Set((api?.emits ?? []).map((e) => e.name));
+    const parentIds = [...parents.keys()];
+    const parentRefs = parentIds.length ? cg.getOutgoingEdgesFrom(parentIds, ['references']) : [];
+    const parentCalls =
+      myEmits.size > 0 && parentIds.length
+        ? cg.getOutgoingEdgesFrom(parentIds, ['calls']).filter(isVueHandlerEdge)
+        : [];
+    const targets = cg.getNodesByIds(
+      [...outRefs, ...myCalls, ...parentRefs, ...parentCalls].flatMap((e) => [e.source, e.target])
+    );
+    // My own @event="handler" bindings. The precise `references` edge records
+    // WHICH child the binding sits on (metadata.vueComponent), so two
+    // different children bound to the same handler stay two rows; the
+    // vue-handler synthesizer's `calls` edge records only the event, so it is
+    // folded in only where no precise edge already names that (event, handler)
+    // pair — otherwise the same binding would print twice.
+    const myBindings: Edge[] = [];
+    const seenPrecise = new Set<string>();
+    for (const e of outRefs) {
+      if (typeof e.metadata?.vueEvent !== 'string') continue;
+      const key = `${e.metadata.vueComponent}:${e.metadata.vueEvent}:${e.target}`;
+      if (seenPrecise.has(key)) continue;
+      seenPrecise.add(key);
+      myBindings.push(e);
+    }
+    const coveredPair = new Set(myBindings.map((e) => `${e.metadata!.vueEvent}:${e.target}`));
+    for (const e of myCalls) {
+      const key = `${e.metadata?.event}:${e.target}`;
+      if (coveredPair.has(key)) continue;
+      coveredPair.add(key);
+      myBindings.push(e);
+    }
+
+    // Two edge populations describe a binding: the `references` edge knows
+    // WHICH child the @event sits on, the synthesizer's `calls` edge does not
+    // and so is matched by event name against this component's declared
+    // emits. The key is (parent, event, HANDLER): one binding seen from both
+    // populations is one row, while a parent binding the same event to two
+    // different handlers keeps both — those are exactly the handlers a changed
+    // emit breaks, so collapsing them would hide the answer.
+    const parentBindings = new Map<string, Array<{ event: string; handler: Node | undefined; line?: number }>>();
+    const seen = new Set<string>();
+    for (const e of parentRefs) {
+      if (e.metadata?.vueComponent !== node.name || typeof e.metadata?.vueEvent !== 'string') continue;
+      const event = e.metadata.vueEvent as string;
+      const key = `${e.source}:${event}:${e.target}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const list = parentBindings.get(e.source) ?? [];
+      list.push({ event, handler: targets.get(e.target), line: e.line });
+      parentBindings.set(e.source, list);
+    }
+    for (const e of parentCalls) {
+      const event = String(e.metadata?.event ?? '');
+      if (!event || !myEmits.has(event)) continue;
+      const key = `${e.source}:${event}:${e.target}`;
+      if (seen.has(key)) continue;
+      const list = parentBindings.get(e.source) ?? [];
+      list.push({ event, handler: targets.get(e.target), line: e.line });
+      parentBindings.set(e.source, list);
+      seen.add(key);
+    }
+
+    const lines: string[] = [`**${node.name}** (component)`, '', `**Location:** ${node.filePath}`];
+
+    const apiBlock = formatComponentApi(node);
+    if (apiBlock) {
+      lines.push('', apiBlock);
+    } else {
+      lines.push(
+        '',
+        '> No component API in the index — the SFC declares none, or its props/emits types are imported from somewhere this extractor cannot follow (a package, or a barrel re-export). Read the SFC for those; run `codegraph init` if the project was indexed before this data existed.'
+      );
+    }
+
+    if (children.size > 0) {
+      lines.push('', `**Renders:** ${[...children.values()].map((c) => `\`${c.name}\``).join(' · ')}`);
+    }
+    if (myBindings.length > 0) {
+      lines.push(
+        '',
+        '**Template event handlers:** ' +
+          myBindings
+            .map((e) => {
+              const event = (e.metadata?.vueEvent ?? e.metadata?.event) as string;
+              // The precise edge names the child the @event sits on; the
+              // synthesizer's edge doesn't, so that row stays unqualified.
+              const on = typeof e.metadata?.vueComponent === 'string' ? ` on \`${e.metadata.vueComponent}\`` : '';
+              const handler = targets.get(e.target);
+              const at = e.line ? ` (line ${e.line})` : '';
+              return `\`@${event}\`${on} → \`${handler?.name ?? '?'}\`${at}`;
+            })
+            .join(' · ')
+      );
+    }
+
+    if (parents.size > 0 || parentBindings.size > 0) {
+      lines.push('', '**Bound by parents:**');
+      if (parentBindings.size === 0) {
+        const emits = api?.emits?.map((e) => `\`${e.name}\``).join(' · ') ?? '';
+        lines.push(`- ${parents.size} parent(s) render this component; none binds its events${emits ? ` (${emits} declared)` : ''}.`);
+      } else {
+        for (const parent of parents.values()) {
+          const bound = parentBindings.get(parent.id);
+          if (!bound?.length) continue;
+          lines.push(
+            `- ${parent.name} (${parent.filePath}): ` +
+              bound.map((b) => `\`@${b.event}\` → \`${b.handler?.name ?? '?'}\`${b.line ? ` (line ${b.line})` : ''}`).join(' · ')
+          );
+        }
+      }
+    }
+
+    return this.textResult(this.truncateOutput(lines.join('\n')));
   }
 
   /**
@@ -6977,6 +7236,13 @@ export class ToolHandler {
   private edgeLabel(edge: Edge): string | null {
     if (edge.kind === 'calls') return null;
     if (edge.metadata?.fnRef === true) return 'callback registration';
+    // VueExtractor's template binding: `@event="handler"` on a component tag —
+    // the handler is reached THROUGH the template, which plain "reference"
+    // would hide.
+    if (typeof edge.metadata?.vueEvent === 'string') {
+      const child = typeof edge.metadata.vueComponent === 'string' ? ` on <${edge.metadata.vueComponent}>` : '';
+      return `template binding \`@${edge.metadata.vueEvent}\`${child}`;
+    }
     if (edge.kind === 'instantiates') return 'instantiation';
     if (edge.kind === 'imports') return 'import';
     if (edge.kind === 'references') return 'reference';
@@ -7048,6 +7314,11 @@ export class ToolHandler {
     // Only include docstring if it's short and useful
     if (node.docstring && node.docstring.length < 200) {
       lines.push('', node.docstring);
+    }
+
+    const componentApi = formatComponentApi(node);
+    if (componentApi) {
+      lines.push('', componentApi);
     }
 
     if (outline) {
