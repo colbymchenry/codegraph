@@ -32,6 +32,7 @@ import { QueryBuilder } from '../db/queries';
 import { createDatabase, SqliteDatabase } from '../db/sqlite-adapter';
 import { finalizeStoreBundle, type KernelStoreBundle, type StoreBundle } from './store-writer';
 import { decodeExtractBuffers } from './kernel/decode';
+import { captureLiterals } from './literal-capture';
 
 if (!parentPort) {
   throw new Error('store-worker must be run as a worker thread');
@@ -70,6 +71,9 @@ function decodeKernelBundle(bundle: KernelStoreBundle): StoreBundle {
     bundle.filePath,
     bundle.language
   );
+  if (bundle.buffers.literalSource !== undefined) {
+    captureLiterals(bundle.buffers.literalSource, decoded.nodes);
+  }
   return finalizeStoreBundle(decoded, bundle.filePath, bundle.language, bundle.file);
 }
 
