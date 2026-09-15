@@ -145,11 +145,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
-- Calls between JavaScript, JSX and TypeScript files keep their callers and callback flows.
-- Zustand actions keep their callers when read through typed stores, destructured from store state, or selected by a hook.
-- Steps diagrams retain database operations made through external client chains without inventing internal dependencies.
-- Direct React Native bridge calls retain their native implementations and cross-platform relationships.
 - Dart extension-type getters remain searchable when using the WebAssembly parser.
+- `codegraph sync` now refuses outdated extraction indexes instead of reporting them as up to date, and directs users to a full rebuild; with `--quiet` the reason is still printed as one line on stderr so a git hook failure is explainable. (#1798)
 
 - Spring mappings now include every declared path combination and resolve constants declared in the same file, while unresolved paths no longer appear as false root routes. (#1461)
 - `codegraph callers`, `codegraph callees` and `codegraph impact` now resolve qualified names, group results and JSON edges by definition, and accept `--file` to narrow ambiguous names; thanks @ferrine. (#1512, #1656)
