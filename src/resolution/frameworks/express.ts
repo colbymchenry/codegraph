@@ -9,6 +9,7 @@ import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from
 import { stripCommentsForRegex } from '../strip-comments';
 import { resolveImportPath } from '../import-resolver';
 import { dependsOn } from './package-deps';
+import { extractHttpRoutes } from './http-routing';
 
 function extractTailIdent(expr: string): string | null {
   const cleaned = expr.replace(/\s+/g, '').replace(/\(\)$/, '');
@@ -157,12 +158,14 @@ export const expressResolver: FrameworkResolver = {
     const now = Date.now();
     const lang = detectLanguage(filePath);
     const safe = stripCommentsForRegex(content, lang);
+    const foreignCalls = extractHttpRoutes(filePath, content).callStarts;
     // Match the route head up to the first arg: (app|router).METHOD('/path',
     // (NOT the whole call — handlers are often inline arrows whose `)`/`{}` the
     // old single-regex couldn't span, so inline-handler routes connected to nothing.)
     const head = /\b(app|router)\s*\.\s*(get|post|put|patch|delete|all|use)\s*\(\s*['"]([^'"]+)['"]\s*,/g;
     let match: RegExpExecArray | null;
     while ((match = head.exec(safe)) !== null) {
+      if (foreignCalls.has(match.index)) continue;
       const method = match[2]!;
       const routePath = match[3]!;
       if (method === 'use' && !routePath.startsWith('/')) continue;
@@ -246,6 +249,7 @@ export const expressResolver: FrameworkResolver = {
     // per method, at the line of its `.method(`, bound like the plain form.
     const chainHead = /\b(?:app|router)\s*\.\s*route\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
     while ((match = chainHead.exec(safe)) !== null) {
+      if (foreignCalls.has(match.index)) continue;
       const routePath = match[1]!;
       let at = match.index + match[0].length;
       for (;;) {
