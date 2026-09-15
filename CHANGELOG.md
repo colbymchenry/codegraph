@@ -16,6 +16,14 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - CodeGraph's refusal to use a sensitive folder such as `~/.ssh`, `~/.config`, `/etc` or `C:\Windows` as a project can no longer be sidestepped: a link or junction that leads to one, a differently capitalized name on Windows and macOS, a `\\?\` spelling on Windows, and a path to a missing folder inside one are now refused like the folder itself. Before, any of these let an AI agent's query read the files inside. Thanks @mixxer for finding it.
 
+### New Features
+
+- **Verilog and SystemVerilog are indexed.** Modules, packages, interfaces and modports, named instances, ports and signals, always/assign blocks and generate scopes are searchable, and `codegraph_explore` surfaces the instantiation path from a top module down to a nested one; based on the extractor contributed in #402 by @FHYQ-Dong. Re-index projects that contain Verilog files.
+- **HDL port bindings resolve to their formal ports.** Named, positional and wildcard (`.*`) connections link an instance's local signals to the instantiated module's ports, and bit or part selects keep their base signal.
+- **Signal readers and writers on request.** `codegraph_explore` with `hdlAccess` (CLI: `codegraph explore --hdl-access`) lists where a signal is read, written, used as a control condition or as a clock/reset event, including the direction of arguments passed to known functions and tasks.
+- **HDL build profiles.** An optional `hdl` section in `codegraph.json` selects source files or filelists, include directories and defines; conditional-compilation branches are indexed under the active profile, `codegraph status` reports the configured versus the indexed profile, and the file watcher follows filelists and included headers.
+- **Computed parameters and port widths.** `codegraph hdl-semantic` runs an installed slang (or pyslang through `--python`) on the active profile and returns evaluated parameters, port widths and macro origins as a separate answer, without touching the indexed graph.
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)
