@@ -16,6 +16,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { CodeGraph } from '../src';
+import { rmTempDir } from './rm-temp';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
@@ -107,12 +108,19 @@ describe('MCP initialize handshake (issue #172)', () => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-init-'));
   });
 
-  afterEach(() => {
-    if (child && !child.killed) {
-      child.kill('SIGKILL');
+  afterEach(async () => {
+    // kill() only asks; the child still owns its cwd and the project database
+    // when it returns, and Windows will not delete either out from under a live
+    // process. POSIX removes them regardless, which is why CI never sees this.
+    if (child) {
+      if (child.exitCode === null && child.signalCode === null) {
+        const exited = new Promise<void>((resolve) => child!.once('exit', () => resolve()));
+        child.kill('SIGKILL');
+        await exited;
+      }
       child = null;
     }
-    fs.rmSync(tempDir, { recursive: true, force: true });
+    await rmTempDir(tempDir);
   });
 
   it('responds to initialize quickly when no .codegraph exists in cwd', async () => {
