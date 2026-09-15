@@ -58,6 +58,7 @@ import ignore from 'ignore';
 import { loadDeprioritizePatterns } from './project-config';
 import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
+import { seedLiteralsInQuery } from './extraction/literal-capture';
 import { createYielder } from './resolution/cooperative-yield';
 import { minRefsForPool } from './resolution/resolver-pool';
 
@@ -527,6 +528,7 @@ export class CodeGraph {
         // path as every file (re-)indexes below — so a full index is also the
         // orphan-cleanup pass for names deleted since the last one.
         try { this.queries.clearNameSegmentVocab(); } catch { /* vocab is advisory — never fail an index over it */ }
+        try { this.queries.clearLiterals(); } catch { /* literals are repopulated even for unchanged files */ }
         // Bulk FTS mode for the mass-insert phase: drop the per-row FTS sync
         // triggers, rebuild nodes_fts once from the nodes table afterwards.
         // Crash inside the window is healed on the next DatabaseConnection.open.
@@ -2146,7 +2148,24 @@ export class CodeGraph {
         seedNames = [];
       }
     }
-    return this.contextBuilder.findRelevantContext(query, { ...options, seedNames });
+    const seedNodeIds = options?.seedNodeIds ?? this.findLiteralSeedIds(query);
+    return this.contextBuilder.findRelevantContext(query, { ...options, seedNames, seedNodeIds });
+  }
+
+  /**
+   * Literal seeds: a storage key, flag, or event name quoted in the query is
+   * never a symbol name, so resolve it through the literals table to the
+   * symbols whose bodies hold it. `CODEGRAPH_LITERAL_SEEDS=0` is the ablation
+   * switch; failures (pre-v10 database) degrade to no seeds. Explore's file
+   * sort calls this too, so a holder file ranks as a named file.
+   */
+  findLiteralSeedIds(query: string): string[] {
+    if (process.env.CODEGRAPH_LITERAL_SEEDS === '0') return [];
+    try {
+      return this.queries.findNodeIdsByLiteral(seedLiteralsInQuery(query));
+    } catch {
+      return [];
+    }
   }
 
   /**

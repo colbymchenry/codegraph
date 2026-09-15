@@ -124,7 +124,7 @@ function stripWrapping(token: string): string {
   for (;;) {
     const last = s[s.length - 1];
     if (!last) break;
-    if ('\'"`>.,;!?'.includes(last)) { s = s.slice(0, -1); continue; }
+    if ('\'"`>.,;!?:'.includes(last)) { s = s.slice(0, -1); continue; }
     if (last === ')' && !s.includes('(')) { s = s.slice(0, -1); continue; }
     if (last === ']' && !s.includes('[')) { s = s.slice(0, -1); continue; }
     if (last === '}' && !s.includes('{')) { s = s.slice(0, -1); continue; }
