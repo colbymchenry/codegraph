@@ -34,6 +34,8 @@ import { importPathKeys, moduleReferenceKeys } from './db/reference-tail';
 import { loadHdlProfile } from './hdl/profile';
 import { hdlDependenciesChanged } from './hdl/index-context';
 import { buildHdlProfileStatus, type HdlProfileStatus } from './hdl/status';
+import { analyzeHdlSemantics, type HdlSemanticOptions, type HdlSemanticResult } from './hdl/semantics';
+export type { HdlSemanticOptions, HdlSemanticResult } from './hdl/semantics';
 import {
   isInitialized,
   createDirectory,
@@ -1483,6 +1485,14 @@ export class CodeGraph {
       return Array.isArray(context?.dependencies) ? context.dependencies.flatMap((d: unknown) =>
         d && typeof d === 'object' && 'path' in d && typeof d.path === 'string' ? [d.path] : []) : [];
     } catch { return []; }
+  }
+
+  /** Explicit optional compiler query; source graph remains available if compilation fails. */
+  async getHdlSemantics(options: HdlSemanticOptions): Promise<HdlSemanticResult> {
+    return analyzeHdlSemantics(this.projectRoot, options, {
+      profile: () => this.getHdlProfileStatus(), stale: () => this.isIndexStale(),
+      file: file => this.queries.getFileByPath(file), nodes: file => this.queries.getNodesByFile(file),
+    });
   }
 
   getHdlProfileStatus(): HdlProfileStatus | null {
