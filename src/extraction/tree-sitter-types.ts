@@ -229,7 +229,7 @@ export interface LanguageExtractor {
    * Classify a class_declaration node when the grammar reuses one node type
    * for multiple concepts (e.g. Swift uses class_declaration for classes, structs, and enums).
    */
-  classifyClassNode?: (node: SyntaxNode) => 'class' | 'struct' | 'enum' | 'interface' | 'trait';
+  classifyClassNode?: (node: SyntaxNode) => 'class' | 'struct' | 'enum' | 'interface' | 'trait' | 'module';
 
   /**
    * Classify a methodTypes node when the grammar reuses one node type for

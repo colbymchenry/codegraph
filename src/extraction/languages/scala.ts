@@ -104,6 +104,11 @@ export const scalaExtractor: LanguageExtractor = {
 
   classifyClassNode: (node: SyntaxNode) => {
     if (node.type === 'trait_definition') return 'trait';
+    // A Scala `object` is a singleton (the companion-object idiom), not a
+    // type: `extends X` can never target it. Classifying it as `module`
+    // keeps it distinguishable from the same-named trait/class so the
+    // resolver can prefer the type node for extends/implements refs.
+    if (node.type === 'object_definition') return 'module';
     return 'class';
   },
 

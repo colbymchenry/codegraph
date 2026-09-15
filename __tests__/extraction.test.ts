@@ -4409,7 +4409,7 @@ class APXCharacter {  // the one real definition
 
       const scala = extractFromSource('M.scala', 'trait Marker\ncase object Red\nclass Foo\n');
       const scalaNames = scala.nodes
-        .filter((n) => ['class', 'trait', 'interface'].includes(n.kind))
+        .filter((n) => ['class', 'trait', 'interface', 'module'].includes(n.kind))
         .map((n) => n.name);
       expect(scalaNames).toEqual(expect.arrayContaining(['Marker', 'Red', 'Foo']));
     });
@@ -8296,14 +8296,14 @@ class UserService(private val repo: UserRepository) {
       expect(cls?.language).toBe('scala');
     });
 
-    it('should extract object definitions as class kind', () => {
+    it('should extract object definitions as module kind', () => {
       const code = `
 object DatabaseConfig {
   val url = "jdbc:postgresql://localhost/mydb"
 }
 `;
       const result = extractFromSource('Config.scala', code);
-      const obj = result.nodes.find((n) => n.kind === 'class' && n.name === 'DatabaseConfig');
+      const obj = result.nodes.find((n) => n.kind === 'module' && n.name === 'DatabaseConfig');
       expect(obj).toBeDefined();
     });
 
