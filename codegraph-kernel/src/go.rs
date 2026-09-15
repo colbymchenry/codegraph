@@ -488,7 +488,10 @@ impl<'t> Walker<'t> {
             signature: self.signature_of(node),
             return_type: self.return_type_of(node),
             qualified_name: receiver_type.as_ref().map(|r| format!("{r}::{name}")),
-            ..Extra::default() // extractMethod passes no isExported
+            // methodsAreTopLevel: a Go method is a top-level declaration, so
+            // extractMethod gives it the function's exportedness (name case).
+            is_exported: Some(self.is_exported(node)),
+            ..Extra::default()
         };
         let Some(row) = self.create_node("method", &name, node, extra) else { return };
 

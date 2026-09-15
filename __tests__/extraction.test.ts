@@ -12474,6 +12474,29 @@ describe('C/C++ kernel-port preParse blanks (R7a)', () => {
     }
   });
 
+  it('Go: a method carries the exportedness of its name, like a function', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-go-method-exported-'));
+    try {
+      fs.writeFileSync(
+        path.join(dir, 'log.go'),
+        'package log\n\ntype writer struct{}\n\nfunc (w *writer) Close() error { return nil }\n\nfunc (w *writer) flush() {}\n\nfunc Open() *writer { return &writer{} }\n\nfunc helper() {}\n'
+      );
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        const flag = (name: string) =>
+          cg.getNodesByKind('method').concat(cg.getNodesByKind('function')).find((n) => n.name === name)!.isExported;
+        expect(flag('Close')).toBe(true);
+        expect(flag('flush')).toBe(false);
+        expect(flag('Open')).toBe(true);
+        expect(flag('helper')).toBe(false);
+      } finally {
+        cg.close();
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('blankCStatementMacroCalls blanks indented iterator macros, keeps the block', async () => {
     const { blankCStatementMacroCalls } = await import('../src/extraction/languages/c-cpp');
     const src = [
