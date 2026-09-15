@@ -93,6 +93,13 @@ export interface AgentTarget {
    * pair lets the orchestrator skip cleanly with a clear message.
    */
   supportsLocation(loc: Location): boolean;
+  /**
+   * Read-only, and quiet. Every target is detected on every run —
+   * including agents codegraph was never installed into — and
+   * `install --refresh` skips the unconfigured ones on the strength of
+   * this answer, so a target that writes or warns here touches a config
+   * it has no business touching (issue #1870).
+   */
   detect(loc: Location): DetectionResult;
   install(loc: Location, opts: InstallOptions): WriteResult;
   /**
