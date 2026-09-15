@@ -1174,14 +1174,6 @@ impl<'t> Walker<'t> {
                         if is_literal_receiver(r.kind()) {
                             return;
                         }
-                        // `holder.values.get()` has no inferred property type
-                        // (#1566). Dropping the receiver or merely preserving it
-                        // would allow unrelated same-name method guesses. Emit
-                        // nothing, as for host chains (#1707); argument calls are
-                        // visited independently. Mirrors extractCall in TS.
-                        if self.is_unresolved_member_chain(r) {
-                            return;
-                        }
                     }
                     let recv_ident = receiver.filter(|r| {
                         matches!(r.kind(), "identifier" | "simple_identifier" | "field_identifier")
@@ -1193,6 +1185,12 @@ impl<'t> Walker<'t> {
                         } else {
                             callee_name = method_name.to_string();
                         }
+                    } else if receiver.is_some_and(|r| self.is_unresolved_member_chain(r)) {
+                        // Retain the call site for effects without guessing a
+                        // project method. Mirrors the TS extraction path.
+                        let chain = self.text(func).replace("?.", ".");
+                        let Some(chain) = Self::plain_member_name(&chain) else { return };
+                        callee_name = chain;
                     } else if let Some(field) = receiver.and_then(|r| self.this_field_of(r)) {
                         // `this.<field>.<method>()` — keep the field so the
                         // resolver can read its declared type (#1496). Mirrors
@@ -1245,7 +1243,11 @@ impl<'t> Walker<'t> {
     /// or member chain (`make`, `d.setdefault`), whitespace stripped (#1683).
     fn plain_inner_callee(&self, call: Node<'t>) -> Option<String> {
         let inner = call.child_by_field_name("function")?;
-        let text: String = self.text(inner).chars().filter(|c| !c.is_whitespace()).collect();
+        Self::plain_member_name(self.text(inner))
+    }
+
+    fn plain_member_name(source: &str) -> Option<String> {
+        let text: String = source.chars().filter(|c| !c.is_whitespace()).collect();
         if text.is_empty() {
             return None;
         }
