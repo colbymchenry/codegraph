@@ -50,6 +50,7 @@ Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 ## Contents
 
 - [Get Started](#get-started)
+- [Oh My Pi (native extension)](#oh-my-pi-native-extension)
 - [Language Support](#language-support)
 - [Why CodeGraph?](#why-codegraph)
 - [Key Features](#key-features)
@@ -108,6 +109,9 @@ codegraph install
 
 <sub>Detects and auto-configures Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, and GitHub Copilot (VS Code, Copilot CLI, JetBrains IDEs) — wiring the CodeGraph MCP server into each. **This is the step that connects CodeGraph to your agent;** installing the CLI in step 1 does not do it on its own. It only wires up your agent — it does **not** index any code; building each project's graph is the separate `codegraph init` in step 3. (Shortcut: `npx @colbymchenry/codegraph` downloads and runs this in one go.)</sub>
 
+Oh My Pi uses a [native extension](#oh-my-pi-native-extension) installed through
+OMP, not the interactive MCP installer.
+
 ### 3. Initialize each project
 
 ```bash
@@ -148,6 +152,63 @@ codegraph uninstall
 Pass `--keep-cli` to remove only the agent configurations and keep the CLI installed.
 
 <sub>Reverses the installer — strips CodeGraph's MCP server config, instructions, and permissions from each configured agent. Your project indexes (`.codegraph/`) are left untouched; remove those per-project with `codegraph uninit`. Use `--target` to remove from specific agents, or `--yes` to run non-interactively.</sub>
+
+## Oh My Pi (native extension)
+
+Install the package with OMP, then restart the session:
+
+```bash
+omp plugin install @colbymchenry/codegraph
+```
+
+The package declares `omp.extensions` and ships the native extension alongside
+the CLI. It uses the already-installed platform bundle, or an installed
+`codegraph` executable on PATH when loading from a source checkout. It never
+runs `npx`, installs a missing runtime, creates an index, or runs `init`/`sync`.
+On Windows, install the npm package with its matching platform dependency;
+shell-only `.cmd`/`.bat` launchers are not executed by the extension.
+
+In a project you have already indexed, ask a structural question such as
+“Explain download and its callers.” Before each new user run, the extension
+passes the prompt and working directory to the existing `codegraph prompt-hook`.
+The hook's raw `<codegraph_context>` output becomes a hidden custom message,
+not a replacement system prompt. Existing prompt selection, project discovery,
+query logic, and Claude Code hooks are unchanged. This does not configure an
+MCP server; an existing CodeGraph MCP connection can be used alongside it.
+
+Use an OMP version that fires `before_agent_start` for every new user run,
+including a fresh steer and a follow-up promoted from the queue. The extension
+does not replay input or regenerate context for each provider request. Session
+switches, branches, tree navigation, shutdown, and newer runs cancel pending
+work and discard its context.
+The target host is OMP integration commit
+`6aef0e8ad51b3bc5ea7a5f2a255c3d48e4c5af72`, containing the queue/input lifecycle
+fix `ad3fb437d3`; the `18.1.17` version string alone does not guarantee those
+fixes are present.
+
+The subprocess has a two-second deadline, a 256 KiB JSON input limit, and a
+64 KiB limit for each output stream. Downloads are disabled with
+`CODEGRAPH_NO_DOWNLOAD=1`. Missing executables/indexes, disabled hooks, failed
+queries, malformed output, and limit violations simply add no context.
+The existing `CODEGRAPH_NO_PROMPT_HOOK=1` or `CODEGRAPH_PROMPT_HOOK=0` switches
+also disable this extension's automatic work; normal CodeGraph telemetry
+preferences still apply.
+
+**Trust boundary:** the extension checks `ctx.isProjectTrusted()` before
+execution and before accepting its result. Current OMP returns `true`
+unconditionally: this API is a compatibility signal, **not a sandbox or an
+enforced per-project approval gate**. Enable this extension only in workspaces
+you trust, and use only a trusted installed CLI/PATH. It does not run commands
+from project configuration.
+
+For a source checkout, install the CLI first and load the package directory:
+
+```bash
+omp --extension /absolute/path/to/codegraph
+```
+
+Remove the extension with `omp plugin uninstall @colbymchenry/codegraph`.
+This is separate from `codegraph uninstall`; existing indexes are preserved.
 
 ---
 
@@ -863,6 +924,9 @@ is written):
 - **Antigravity IDE**
 - **Kiro**
 - **GitHub Copilot** — Copilot Chat in VS Code (`copilot-vscode`), the Copilot CLI (`copilot-cli`), and the Copilot plugin in JetBrains IDEs (`copilot-jetbrains`)
+
+**Oh My Pi (OMP)** has a separate [native prompt-context extension](#oh-my-pi-native-extension)
+installed through `omp plugin install`, not through the interactive installer.
 
 ## Supported Languages
 
