@@ -14,6 +14,10 @@ import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-vis
 import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
+import { isVerilogMemberRef, matchVerilogMember } from './verilog-members';
+import { isVerilogPortRef, matchVerilogPort } from './verilog-ports';
+import { isVerilogWildcardRef, matchVerilogWildcard } from './verilog-wildcard';
+
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
  * score. A name defined more times than this is "ubiquitous" — a method/symbol
@@ -9389,6 +9393,13 @@ export function dumpNameMatcherProfile(label: string): void {
   }
 }
 
+function isVerilogSimPath(filePath: string): boolean {
+  return (
+    /(^|\/)(sim|tb|tests?|testbench|dv)\//i.test(filePath) ||
+    /_(stub|tb|sim)\.s?vh?$/i.test(filePath)
+  );
+}
+
 export function matchReference(
   ref: UnresolvedRef,
   context: ResolutionContext
@@ -9582,6 +9593,28 @@ function matchReferenceInner(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  if (isVerilogWildcardRef(ref)) return matchVerilogWildcard(ref, context, matchReference);
+  if (isVerilogPortRef(ref)) return matchVerilogPort(ref, context, matchReference);
+  if (isVerilogMemberRef(ref)) return matchVerilogMember(ref, context);
+  if (ref.language === 'verilog' && ref.referenceKind === 'instantiates' && !isVerilogSimPath(ref.filePath)) {
+    const modules = context
+      .getNodesByName(ref.referenceName)
+      .filter((n) => n.language === 'verilog' && (n.kind === 'class' || n.kind === 'interface'));
+    const synth = modules.filter((n) => !isVerilogSimPath(n.filePath));
+    if (synth.length > 0 && synth.length < modules.length) {
+      const best = synth.length === 1 ? synth[0]! : findBestMatch(ref, synth, context);
+      if (best) {
+        const proximity = computePathProximity(ref.filePath, best.filePath);
+        return {
+          original: ref,
+          targetNodeId: best.id,
+          confidence: synth.length === 1 || proximity >= 30 ? 0.7 : 0.4,
+          resolvedBy: 'exact-match',
+        };
+      }
+    }
+  }
+
   // Function-as-value refs (#756) resolve ONLY through the dedicated matcher —
   // never the fuzzy/qualified fallthrough below (a wrong callback edge is
   // worse than none).
