@@ -153,6 +153,7 @@ describe('MCP initialize handshake (issue #172)', () => {
     const json = JSON.parse(response.text);
     expect(json.id).toBe(0);
     expect(json.result.serverInfo.name).toBe('codegraph');
+    expect(json.result.instructions).toContain('Haskell');
   }, 20000);
 
   it('answers resources/list and prompts/list with empty lists, not -32601 (issue #621)', async () => {

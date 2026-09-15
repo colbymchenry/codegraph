@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 9;
+export const CURRENT_SCHEMA_VERSION = 10;
 
 /**
  * Migration definition
@@ -175,6 +175,17 @@ const migrations: Migration[] = [
       db.exec(
         'CREATE INDEX IF NOT EXISTS idx_files_generated ON files(path) WHERE generated = 1'
       );
+    },
+  },
+  {
+    version: 10,
+    description:
+      'Persist Haskell module/import/export topology fingerprints for scoped incremental sync invalidation',
+    up: (db) => {
+      const cols = db.prepare('PRAGMA table_info(files)').all() as Array<{ name: string }>;
+      if (!cols.some((column) => column.name === 'haskell_topology_hash')) {
+        db.exec('ALTER TABLE files ADD COLUMN haskell_topology_hash TEXT');
+      }
     },
   },
 ];
