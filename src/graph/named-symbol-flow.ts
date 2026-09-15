@@ -139,6 +139,15 @@ export const FLOW_CALLABLE_KINDS: ReadonlySet<string> = new Set([
  */
 export const FLOW_EDGE_KINDS: ReadonlySet<string> = new Set(['calls', 'navigates']);
 
+function canSitOnFlow(n: { kind: string; language?: string }): boolean {
+  return FLOW_CALLABLE_KINDS.has(n.kind) || (n.kind === 'class' && n.language === 'verilog');
+}
+
+function carriesFlow(edge: { kind: string }, target: { language?: string }): boolean {
+  return FLOW_EDGE_KINDS.has(edge.kind) || (edge.kind === 'instantiates' && target.language === 'verilog');
+}
+
+
 /**
  * Node kinds that can be an endpoint of a SYNTHESIZED edge without being
  * callable. An RTK thunk is `const X = createAsyncThunk(...)`, so a thunk →
@@ -316,7 +325,7 @@ export function resolveNamedTokens(
 
   for (const t of tokens) {
     const hits = findAllSymbols(cg, t).nodes;
-    const cands = hits.filter((n) => FLOW_CALLABLE_KINDS.has(n.kind));
+    const cands = hits.filter((n) => canSitOnFlow(n));
     out.tokenFamily.set(t, cands);
     // A qualified or otherwise-specific name (<=3 hits) keeps all of them.
     const specific = cands.length <= 3;
@@ -350,7 +359,7 @@ export function resolveNamedTokens(
     if (out.dynNamed.size < 12) {
       let tokenDyn = 0;
       for (const n of hits) {
-        if (FLOW_CALLABLE_KINDS.has(n.kind) || !DYN_KINDS.has(n.kind) || out.dynNamed.has(n.id)) {
+        if (canSitOnFlow(n) || !DYN_KINDS.has(n.kind) || out.dynNamed.has(n.id)) {
           continue;
         }
         if (hasHeuristicEdge(n.id)) {
@@ -449,7 +458,7 @@ function walkCalls(
     if (id !== seed.id && named.has(id)) reached.push(id);
     if (at.depth >= maxHops - 1) continue;
     for (const c of cg.getCallees(id)) {
-      if (!FLOW_EDGE_KINDS.has(c.edge.kind)) continue;
+      if (!carriesFlow(c.edge, c.node)) continue;
       const isNamed = named.has(c.node.id);
       // A route node is a connector, not a symbol the reader would have named:
       // crossing one costs no bridge budget.
@@ -533,7 +542,7 @@ function walkBidirectional(
       const next: Node[] = [];
       for (const node of frontF) {
         for (const c of cg.getCallees(node.id)) {
-          if (!FLOW_EDGE_KINDS.has(c.edge.kind) || forward.has(c.node.id)) continue;
+          if (!carriesFlow(c.edge, c.node) || forward.has(c.node.id)) continue;
           forward.set(c.node.id, { prev: node.id, edge: c.edge, node: c.node });
           next.push(c.node);
         }
@@ -545,7 +554,7 @@ function walkBidirectional(
       const next: Node[] = [];
       for (const node of frontB) {
         for (const c of cg.getCallers(node.id)) {
-          if (!FLOW_EDGE_KINDS.has(c.edge.kind) || backward.has(c.node.id)) continue;
+          if (!carriesFlow(c.edge, c.node) || backward.has(c.node.id)) continue;
           backward.set(c.node.id, { next: node.id, edge: c.edge });
           backNodes.set(c.node.id, c.node);
           next.push(c.node);
