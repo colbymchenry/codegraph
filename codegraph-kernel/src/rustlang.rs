@@ -20,8 +20,7 @@
 //!   kind is always `variable`, no signature, and EVERY direct `identifier`
 //!   child mints a node (`const MAX: u32 = OTHER;` → two nodes, `MAX` + the
 //!   phantom `OTHER`). Top-level initializer values are never body-walked.
-//! - Unit structs (`struct Unit;`, no body field) mint NO node; `mod_item`
-//!   mints no module node and adds no QN prefix.
+//! - `mod_item` mints no module node and adds no QN prefix.
 //! - Chained-call re-encode is scoped_identifier-gated (`Foo::new().bar()` →
 //!   `Foo::new().bar`); a call through a field of the enclosing type keeps
 //!   the owner-field shape (`self.inner.run()` → `self.inner.run`, #1585);
@@ -590,10 +589,12 @@ impl<'t> Walker<'t> {
         self.stack.pop();
     }
 
-    /// Extract a Rust struct or union with a body; unit structs remain skipped.
+    /// Extract a Rust struct or union — the body field is OPTIONAL. A unit
+    /// struct (`struct U;`) has no body and is still a complete definition,
+    /// so it mints a node with no members; tuple structs' ordered_field_declaration_list
+    /// is a body. Mirrors the TS reference's `allowBodilessStruct`.
     fn extract_aggregate(&mut self, node: Node<'t>, kind: &'static str) {
         stack_guard!();
-        let Some(body) = node.child_by_field_name("body") else { return };
         let name = self.extract_name(node);
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
@@ -602,6 +603,10 @@ impl<'t> Walker<'t> {
         };
         let Some(row) = self.create_node(kind, &name, node, extra) else { return };
         self.extract_inheritance(node, row);
+
+        // Unit structs have no body to walk — the node itself is the whole
+        // definition.
+        let Some(body) = node.child_by_field_name("body") else { return };
 
         self.stack.push(Scope { row, kind, name });
         for i in 0..body.named_child_count() {
@@ -662,6 +667,8 @@ impl<'t> Walker<'t> {
     /// and the initializer value is never body-walked.
     fn extract_variable(&mut self, node: Node<'t>) {
         let docstring = preceding_docstring(node, self.src);
+        let name_field = node.child_by_field_name("name");
+        let mut declared: Option<(u32, String)> = None;
         for i in 0..node.named_child_count() {
             let Some(child) = node.named_child(i) else { continue };
             if child.kind() != "identifier" {
@@ -669,7 +676,7 @@ impl<'t> Walker<'t> {
             }
             let name = self.text(child).to_string();
             if !name.is_empty() {
-                self.create_node(
+                let row = self.create_node(
                     "variable",
                     &name,
                     child,
@@ -679,6 +686,26 @@ impl<'t> Walker<'t> {
                         ..Extra::default()
                     },
                 );
+                if let (Some(row), Some(nf)) = (row, name_field) {
+                    if child.start_byte() == nf.start_byte() {
+                        declared = Some((row, name));
+                    }
+                }
+            }
+        }
+        // Walk the initializer ATTRIBUTED to the declared symbol (#693):
+        // `const N: usize = compute()` and
+        // `static REGISTRY: Lazy<T> = Lazy::new(|| build())` dropped every call
+        // inside the initializer, so a handler table or a lazily-built
+        // singleton linked to nothing.
+        if let Some(value) = node.child_by_field_name("value") {
+            match declared {
+                Some((row, name)) => {
+                    self.stack.push(Scope { row, kind: "variable", name });
+                    self.visit_function_body(value);
+                    self.stack.pop();
+                }
+                None => self.visit_function_body(value),
             }
         }
     }

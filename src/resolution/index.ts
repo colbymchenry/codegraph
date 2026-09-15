@@ -15,10 +15,14 @@ import {
   ResolutionContext,
   FrameworkResolver,
   ImportMapping,
+  SUPERTYPE_TARGET_KINDS,
+  isInheritanceRef,
+  isImportableKind,
 } from './types';
-import { isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
-import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, clearImportResolverMemos, resolveImportPath } from './import-resolver';
+import { matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
+import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
@@ -35,6 +39,11 @@ import { JS_BUILT_INS } from './js-builtins';
 const SUPERTYPE_BEARING_KINDS = new Set<Node['kind']>([
   'class', 'struct', 'interface', 'trait', 'protocol', 'enum',
 ]);
+
+// SUPERTYPE_TARGET_KINDS (the kinds an extends/implements edge may TARGET)
+// lives in ./types — the name-matcher needs the same set to restrict its
+// candidate pool before ranking. It is deliberately wider than
+// SUPERTYPE_BEARING_KINDS above, which is about the DECLARING side.
 
 /**
  * Languages whose chained static-factory/fluent calls defer to the conformance
@@ -428,6 +437,7 @@ export class ReferenceResolver {
    */
   private createContext(): ResolutionContext {
     return {
+      resolveImport: (ref) => resolveViaImport(ref, this.context),
       getNodesInFile: (filePath: string) => {
         if (!this.nodeCache.has(filePath)) {
           this.nodeCache.set(filePath, this.queries.getNodesByFile(filePath));
@@ -463,7 +473,7 @@ export class ReferenceResolver {
           matches = [];
           for (const m of candidates) {
             if (m.kind !== 'method') continue;
-            if (m.language !== language) continue;
+            if (!sameLanguageFamily(m.language, language)) continue;
             const qn = m.qualifiedName;
             if (qn === want || qn.endsWith(`::${want}`)) matches.push(m);
           }
@@ -486,7 +496,7 @@ export class ReferenceResolver {
             ownerIndex = new Map<string, Node[]>();
             for (const m of candidates) {
               if (m.kind !== 'method') continue;
-              if (m.language !== language) continue;
+              if (!sameLanguageFamily(m.language, language)) continue;
               const qn = m.qualifiedName;
               const i2 = qn.lastIndexOf('::');
               if (i2 < 0) continue; // single-segment qn can never match `T::m`
@@ -857,9 +867,35 @@ export class ReferenceResolver {
   }
 
   /**
-   * Resolve a single reference
+   * Resolve a single reference.
+   *
+   * Thin decorator over `resolveOneInner` so every strategy — framework,
+   * import, name-match, chain, CFML component path — passes through the
+   * inheritance target-kind gate at ONE seam. Filtering inside the
+   * name-matcher would have covered `matchByExactName` only.
+   * Calls that land on an alias binding then forward once to the callable
+   * the alias names (see ./alias-binding), regardless of the strategy.
    */
   resolveOne(ref: UnresolvedRef): ResolvedRef | null {
+    const resolved = this.gateTargetKind(this.resolveOneInner(ref), ref);
+    if (!resolved || ref.referenceKind !== 'calls') return resolved;
+
+    const target = this.queries.getNodeById(resolved.targetNodeId);
+    if (!target) return resolved;
+
+    const dot = ref.referenceName.lastIndexOf('.');
+    const memberName = dot >= 0 ? ref.referenceName.slice(dot + 1) : null;
+    const forwarded = resolveAliasBinding(target, memberName, this.context);
+    if (!forwarded || forwarded.id === resolved.targetNodeId) return resolved;
+
+    return {
+      ...resolved,
+      targetNodeId: forwarded.id,
+      confidence: Math.min(resolved.confidence, 0.85),
+    };
+  }
+
+  private resolveOneInner(ref: UnresolvedRef): ResolvedRef | null {
     // Skip built-in/external references
     if (this.isBuiltInOrExternal(ref)) {
       return null;
@@ -908,7 +944,7 @@ export class ReferenceResolver {
       this.frameworks.some((f) => f.claimsReference?.(ref.referenceName));
     if (this.profileStages) this.stageAdd('preFilter', ref, preFilterPass, tPre);
     if (!preFilterPass) {
-      return null;
+      return this.gateLanguage(matchJsStoreBindingCall(ref, this.context), ref);
     }
 
     // Function-as-value refs (#756) get a dedicated, strictly-gated path:
@@ -958,6 +994,12 @@ export class ReferenceResolver {
       if (razorResult) return razorResult;
     }
 
+    // An explicit PHP class import owns its static calls, including an
+    // unavailable method. Do not let same-name fallbacks change the receiver
+    // to an unrelated Service/Repository type (#1545).
+    const phpStaticImport = resolvePhpImportedStaticCall(ref, this.context);
+    if (phpStaticImport !== undefined) return this.gateLanguage(phpStaticImport, ref);
+
     const candidates: ResolvedRef[] = [];
 
     // Strategy 1: Try framework-specific resolution. Cross-language bridges
@@ -979,6 +1021,9 @@ export class ReferenceResolver {
     }
     if (this.profileStages) this.stageAdd('frameworks', ref, fwEarly !== null, tFw);
     if (fwEarly) return fwEarly;
+    // A retained untyped chain supplies effect/call-site evidence only. In
+    // particular, importing its root does not make the root its call target.
+    if (isUnresolvedJsMemberCall(ref)) return null;
 
     // Strategy 2: Try import-based resolution
     // A TS/JS/Python call-receiver chain (`useStore.getState().reset`, #1683)
@@ -2574,6 +2619,45 @@ export class ReferenceResolver {
       }
     }
     return this.persistDeferredReferences(deferred, resolved);
+  }
+
+  /**
+   * Drop a resolution whose target cannot be what the reference names.
+   * Applied at the `resolveOne` seam so it covers every strategy uniformly —
+   * framework, import, name-match, chain, CFML component path.
+   *
+   * For `imports`: the target must be importable. A member that only exists
+   * inside a type never is.
+   *
+   * For `extends`/`implements`, it cannot be describing a real supertype when:
+   *
+   *  1. The target's kind can never be a supertype (an enum member, a method,
+   *     a variable). `matchByExactName` additionally narrows its candidate
+   *     pool by the same set, so a legitimate supertype outranks a same-named
+   *     non-type rather than merely losing its edge.
+   *  2. The name is imported from outside the repo, so NO local node is the
+   *     referent. Without this, filtering by kind alone just relocates the
+   *     false edge onto the next same-named local type.
+   *
+   * Direction is one-way: this only ever REMOVES an edge, never adds one. A
+   * dropped ref stays in `unresolved_refs` as `failed`, which is the honest
+   * record for a supertype that lives outside the repo — silent beats wrong.
+   */
+  private gateTargetKind(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
+    if (!result) return result;
+
+    // An `imports` reference names something importable — never a member that
+    // only exists inside a type.
+    if (ref.referenceKind === 'imports') {
+      const target = this.queries.getNodeById(result.targetNodeId);
+      return target && !isImportableKind(target.kind) ? null : result;
+    }
+
+    if (!isInheritanceRef(ref)) return result;
+    const target = this.queries.getNodeById(result.targetNodeId);
+    if (target && !SUPERTYPE_TARGET_KINDS.has(target.kind)) return null;
+    if (isBoundToOutOfRepoImport(ref, this.context)) return null;
+    return result;
   }
 
   private gateLanguage(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {

@@ -115,7 +115,12 @@ function nested(holder) {
     const nested = result.nodes.find((n) => n.name === 'nested' && n.kind === 'function');
     expect(nested).toBeDefined();
     expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'calls' && r.fromNodeId === nested!.id)
-      .map((r) => r.referenceName)).toEqual(['readKey', 'readKey', 'readKey', 'readKey']);
+      // Qualified sites are retained for effects; computed keys still make no
+      // receiver claim. All four calls inside arguments must also survive.
+      .map((r) => r.referenceName)).toEqual([
+        'holder.values.get', 'readKey', 'holder.values.get', 'readKey',
+        'readKey', 'holder.deep.values.get', 'readKey',
+      ]);
     expect(result.unresolvedReferences.some((r) => r.referenceName === 'values.get')).toBe(true);
   });
 

@@ -22,6 +22,15 @@ public class TortureService extends BaseService implements Runnable, AutoCloseab
   protected int count = 0;
   private final List<String> names;
   int packagePrivate, secondDeclarator;
+  /** Field initializers — walked scoped to the field (#693). */
+  private final Runnable fieldLambda = () -> helper(RETRY_LIMITS);
+  private final Runnable fieldAnonClass = new Runnable() {
+    @Override
+    public void run() {
+      helper(RETRY_LIMITS);
+    }
+  };
+  private final Runnable fieldMethodRef = TortureService::compute;
 
   /** Ctor javadoc. */
   public TortureService(List<String> names) {

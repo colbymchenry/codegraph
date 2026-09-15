@@ -81,7 +81,8 @@
     const encoded = router.params.get('t');
     untrack(() => {
       trail.hydrate(encoded);
-      if (current.view === 'symbol' && trail.current?.id !== current.id) {
+      // `id: null` is the tab with nothing chosen — there is no hop to record.
+      if (current.view === 'symbol' && current.id !== null && trail.current?.id !== current.id) {
         trail.push({ id: current.id });
       }
     });
@@ -157,7 +158,7 @@
 <TopBar bind:this={topbar} project={project.name} stats={project.summary} showScreens={hasScreens} />
 <TrailBar />
 <main>
-  {#if route.view === 'symbol'}
+  {#if route.view === 'symbol' && route.id !== null}
     <SymbolView id={route.id} line={route.line} />
   {:else if route.view === 'file' && route.source}
     <FileCodeView path={route.path} line={route.line} />
@@ -175,6 +176,8 @@
   {:else if route.view === 'entry'}
     <EntryView project={project.name} />
   {:else if route.view === 'screens' || (route.view === 'home' && hasScreens)}
+    <!-- `home` renders Screens when the project has any, which is why the
+         Symbol tab needs its own `#/s` and must never fall back to `#/`. -->
     <ScreensView />
   {:else if route.view === 'steps'}
     <StepsView anchor={route.anchor} symbol={route.symbol} depth={route.depth} through={route.through} reading={route.reading} />

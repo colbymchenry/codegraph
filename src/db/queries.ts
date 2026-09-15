@@ -244,6 +244,9 @@ export class QueryBuilder {
   private projectNameTokens: Set<string> = new Set();
   private isDeprioritizedPath: ((filePath: string) => boolean) | undefined;
 
+  // FTS5 availability flag — detected once at construction time (#1532)
+  private _fts5Available: boolean | undefined;
+
   // Node cache for frequently accessed nodes (LRU-style, max 1000 entries)
   private nodeCache: Map<string, Node> = new Map();
   private readonly maxCacheSize = 1000;
@@ -340,6 +343,13 @@ export class QueryBuilder {
 
   constructor(db: SqliteDatabase) {
     this.db = db;
+    // Detect FTS5 availability once (#1532)
+    try {
+      db.prepare("SELECT * FROM nodes_fts LIMIT 0").get();
+      this._fts5Available = true;
+    } catch {
+      this._fts5Available = false;
+    }
   }
 
   /**
@@ -1300,9 +1310,9 @@ export class QueryBuilder {
     const kinds = mergedKinds;
     const languages = mergedLanguages;
 
-    // First try FTS5 with prefix matching
+    // First try FTS5 with prefix matching (skip if FTS5 not available, #1532)
     let results = text
-      ? this.searchNodesFTS(text, { kinds, languages, limit, offset })
+      ? (this._fts5Available !== false ? this.searchNodesFTS(text, { kinds, languages, limit, offset }) : [])
       // Over-fetch by 5× when running filter-only (no text). The
       // post-scoring path: + name: filters can be very selective, so
       // a smaller multiplier risks returning fewer than `limit`
@@ -2204,6 +2214,12 @@ export class QueryBuilder {
    * build script does its work on the way down the file. `instantiates` counts
    * the same way — `new Server(...)` at module scope is the same act.
    *
+   * A call made while initializing a module-level `variable` / `constant` —
+   * `const service = new Service()`, `app = FastAPI()` — is attributed to the
+   * declared name (#693), not to the file, so the file's own edges alone would
+   * miss most of what a real entry point runs. Those names are the file's
+   * top-level code too, so `tops` counts them alongside the file node.
+   *
    * Ranking multiplies the two things an entry point does: it runs (calls), and
    * it wires the project together (distinct other files its symbols reach). One
    * alone is misleading — a registration table makes hundreds of module-level
@@ -2216,12 +2232,25 @@ export class QueryBuilder {
     if (limit <= 0) return [];
     return this.db
       .prepare(
-        `WITH runs AS (
-             SELECT e.source AS id, COUNT(*) AS calls
-               FROM edges e
-               JOIN nodes n ON n.id = e.source
-              WHERE n.kind = 'file' AND e.kind IN ('calls', 'instantiates')
-           GROUP BY e.source
+        `WITH tops AS (
+             SELECT n.id AS file_id, n.id AS src
+               FROM nodes n
+              WHERE n.kind = 'file'
+             UNION ALL
+             SELECT c.source AS file_id, c.target AS src
+               FROM edges c
+               JOIN nodes f ON f.id = c.source
+               JOIN nodes v ON v.id = c.target
+              WHERE c.kind = 'contains'
+                AND f.kind = 'file'
+                AND v.kind IN ('variable', 'constant')
+         ),
+         runs AS (
+             SELECT t.file_id AS id, COUNT(*) AS calls
+               FROM tops t
+               JOIN edges e ON e.source = t.src
+              WHERE e.kind IN ('calls', 'instantiates')
+           GROUP BY t.file_id
          ),
          cand AS (
              SELECT r.id AS id, n.file_path AS fp, r.calls AS calls
@@ -3495,6 +3524,21 @@ export class QueryBuilder {
       }
     })();
     return changed;
+  }
+
+  /**
+   * Replace resolution edges with their original unresolved references as one
+   * transaction. If ref insertion fails, the edge deletion is rolled back.
+   */
+  replaceResolutionEdgesWithUnresolvedRefs(
+    edgeIds: number[],
+    refs: UnresolvedReference[]
+  ): number {
+    return this.db.transaction(() => {
+      const changed = this.deleteEdgesByIds(edgeIds);
+      this.insertUnresolvedRefsBatch(refs);
+      return changed;
+    })();
   }
 
   /**

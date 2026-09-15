@@ -175,3 +175,10 @@ package object utilpkg {
   def pkgHelper(): Int = 1
   val pkgShared = 2
 }
+
+class InitWalk {
+  val initLambda: () => Unit = () => helperCall()
+  val initDirect = helperCall()
+  lazy val initLazy = process(1)
+  val initAnon = new Runnable { def run(): Unit = helperCall() }
+}
