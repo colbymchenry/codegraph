@@ -24,6 +24,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   javascript: 'tree-sitter-javascript.wasm',
   jsx: 'tree-sitter-javascript.wasm',
   python: 'tree-sitter-python.wasm',
+  verilog: 'tree-sitter-systemverilog.wasm',
   go: 'tree-sitter-go.wasm',
   rust: 'tree-sitter-rust.wasm',
   java: 'tree-sitter-java.wasm',
@@ -121,6 +122,11 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.scala': 'scala',
   '.sc': 'scala',
   '.lua': 'lua',
+  // Verilog / SystemVerilog (one grammar covers both)
+  '.v': 'verilog',
+  '.vh': 'verilog',
+  '.sv': 'verilog',
+  '.svh': 'verilog',
   '.luau': 'luau',
   '.m': 'objc',
   '.mm': 'objc',
@@ -395,7 +401,7 @@ export async function initGrammars(): Promise<void> {
  * the vendored wasm together.
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
-  'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
+  'pascal', 'scala', 'lua', 'luau', 'verilog', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
   'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
   'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
   // R7a (C/C++ kernel port prep): tree-sitter-c v0.24.2 (b780e47) +
@@ -922,6 +928,7 @@ export function getLanguageDisplayName(language: Language): string {
     scala: 'Scala',
     lua: 'Lua',
     luau: 'Luau',
+    verilog: 'Verilog / SystemVerilog',
     objc: 'Objective-C',
     solidity: 'Solidity',
     nix: 'Nix',
