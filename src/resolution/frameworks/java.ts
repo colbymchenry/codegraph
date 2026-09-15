@@ -126,6 +126,15 @@ export const springResolver: FrameworkResolver = {
       }
     }
 
+    // The DI/convention patterns below (1–5) are Spring-specific heuristics:
+    // they must only fire on Java/Kotlin refs, and never on inheritance refs.
+    // Without these gates a Scala `extends ExtCustomer` (Spring detected via a
+    // sibling Java module) was hijacked by Pattern 4's bare-name fallback to an
+    // unrelated same-named test class — `extends`/`implements` must resolve via
+    // imports/name matching, not directory heuristics.
+    if (ref.language !== 'java' && ref.language !== 'kotlin') return null;
+    if (ref.referenceKind === 'extends' || ref.referenceKind === 'implements') return null;
+
     // Pattern 1: Service references (dependency injection)
     if (ref.referenceName.endsWith('Service')) {
       const result = resolveByNameAndKind(ref.referenceName, SERVICE_KINDS, SERVICE_DIRS, context);
