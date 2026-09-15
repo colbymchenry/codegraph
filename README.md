@@ -6,7 +6,7 @@ Already installed? Run `codegraph upgrade`
 
 Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 
-### Supercharge Claude Code, Cursor, Codex, OpenCode, Hermes Agent, Gemini, Antigravity, Kiro, and GitHub Copilot with Semantic Code Intelligence
+### Supercharge Claude Code, Cursor, Codex, Devin, OpenCode, Hermes Agent, Gemini, Antigravity, Kiro, and GitHub Copilot with Semantic Code Intelligence
 
 **The fastest complete code graph · surgical context · built for how agents actually work · 100% local**
 
@@ -30,6 +30,7 @@ Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 [![Claude Code](https://img.shields.io/badge/Claude_Code-supported-blueviolet.svg)](#supported-agents)
 [![Cursor](https://img.shields.io/badge/Cursor-supported-blueviolet.svg)](#supported-agents)
 [![Codex](https://img.shields.io/badge/Codex-supported-blueviolet.svg)](#supported-agents)
+[![Devin](https://img.shields.io/badge/Devin-supported-blueviolet.svg)](#supported-agents)
 [![opencode](https://img.shields.io/badge/opencode-supported-blueviolet.svg)](#supported-agents)
 [![Hermes Agent](https://img.shields.io/badge/Hermes_Agent-supported-blueviolet.svg)](#supported-agents)
 [![Gemini](https://img.shields.io/badge/Gemini-supported-blueviolet.svg)](#supported-agents)
@@ -106,7 +107,7 @@ In a **new terminal**, run the installer to connect CodeGraph to the agents you 
 codegraph install
 ```
 
-<sub>Detects and auto-configures Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, and GitHub Copilot (VS Code, Copilot CLI, JetBrains IDEs) — wiring the CodeGraph MCP server into each. **This is the step that connects CodeGraph to your agent;** installing the CLI in step 1 does not do it on its own. It only wires up your agent — it does **not** index any code; building each project's graph is the separate `codegraph init` in step 3. (Shortcut: `npx @colbymchenry/codegraph` downloads and runs this in one go.)</sub>
+<sub>Detects and auto-configures Claude Code, Cursor, Codex CLI, Devin, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, and GitHub Copilot (VS Code, Copilot CLI, JetBrains IDEs) — wiring the CodeGraph MCP server into each. **This is the step that connects CodeGraph to your agent;** installing the CLI in step 1 does not do it on its own. It only wires up your agent — it does **not** index any code; building each project's graph is the separate `codegraph init` in step 3. (Shortcut: `npx @colbymchenry/codegraph` downloads and runs this in one go.)</sub>
 
 ### 3. Initialize each project
 
@@ -449,7 +450,7 @@ npx @colbymchenry/codegraph
 ```
 
 The installer will:
-- Ask which agent(s) to configure — auto-detects installed ones from: **Claude Code**, **Cursor**, **Codex CLI**, **opencode**, **Hermes Agent**, **Gemini CLI**, **Antigravity IDE**, **Kiro**, **GitHub Copilot** (VS Code, Copilot CLI, JetBrains IDEs)
+- Ask which agent(s) to configure — auto-detects installed ones from: **Claude Code**, **Cursor**, **Codex CLI**, **Devin**, **opencode**, **Hermes Agent**, **Gemini CLI**, **Antigravity IDE**, **Kiro**, **GitHub Copilot** (VS Code, Copilot CLI, JetBrains IDEs)
 - Prompt to install `codegraph` on your PATH (so agents can launch the MCP server)
 - Ask whether configs apply to all your projects or just this one
 - Write each chosen agent's MCP server config, plus a small marker-fenced CodeGraph section in the agent's instructions file (`CLAUDE.md` / `AGENTS.md` / `GEMINI.md`) — that's how subagents and non-MCP agents learn the `codegraph explore` command, since the MCP server's own guidance only reaches the main agent. Removed cleanly by `codegraph uninstall`.
@@ -480,7 +481,7 @@ codegraph install --print-config copilot-vscode      # same, for Copilot in VS C
 
 ### 2. Restart Your Agent
 
-Restart your agent (Claude Code / Cursor / Codex CLI / opencode / Hermes Agent / Gemini CLI / Antigravity IDE / Kiro / VS Code, the Copilot CLI, or your JetBrains IDE for GitHub Copilot) for the MCP server to load.
+Restart your agent (Claude Code / Cursor / Codex CLI / Devin / opencode / Hermes Agent / Gemini CLI / Antigravity IDE / Kiro / VS Code, the Copilot CLI, or your JetBrains IDE for GitHub Copilot) for the MCP server to load.
 
 ### 3. Initialize Projects
 
@@ -857,6 +858,7 @@ is written):
 - **Claude Code**
 - **Cursor**
 - **Codex CLI**
+- **Devin** — MCP entry goes in the dedicated `mcp_config.json` (`~/.config/devin/` or `.devin/`); a pre-v3000.3 `mcpServers` block in `config.json` is stripped so Devin's startup migration can't resurrect it after uninstall
 - **opencode** — MCP entry is OpenCode 2's `mcp.servers.codegraph` with `codemode: false` (keeps `codegraph_explore` on the native tool list; `codegraph install` migrates the older `mcp.codegraph` shape)
 - **Hermes Agent**
 - **Gemini CLI**
