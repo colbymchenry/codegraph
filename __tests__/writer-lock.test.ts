@@ -58,18 +58,26 @@ describe('writer lock (#1740)', () => {
 
   it('reports taken when a live foreign pid holds the lock', () => {
     const root = makeProject();
-    // Use our own pid first, then overwrite with a fake live-looking pid by
-    // writing a pid that is alive: process.pid of this test — simulate foreign
-    // by writing a different alive pid. On Linux, PID 1 is almost always alive.
+    // A foreign process that is genuinely alive, rather than a pid assumed to
+    // be: PID 1 is init on Linux but does not exist on Windows, where the lock
+    // then reads the holder as dead and correctly acquires — the assertion was
+    // failing on the fixture, not on the lock. A parked child is alive
+    // everywhere, and it is what the lock actually promises not to steal from.
+    // Uses the shared holder so afterEach reaps it (same as the fallback-
+    // engine case below).
+    holder = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {
+      stdio: 'ignore',
+    });
+    if (!holder.pid) throw new Error('Failed to spawn writer-lock holder');
     fs.writeFileSync(
       getWriterPidPath(root),
-      JSON.stringify({ pid: 1, mode: 'direct', startedAt: Date.now() }) + '\n',
+      JSON.stringify({ pid: holder.pid, mode: 'direct', startedAt: Date.now() }) + '\n',
       { flag: 'wx' },
     );
     const r = tryAcquireWriterLock(root, 'direct');
     expect(r.kind).toBe('taken');
     if (r.kind === 'taken') {
-      expect(r.existing?.pid).toBe(1);
+      expect(r.existing?.pid).toBe(holder.pid);
       const msg = writerLockHeldMessage(r.existing, r.pidPath);
       expect(msg).toMatch(/writer lock held/i);
       expect(msg).toMatch(/CODEGRAPH_NO_DAEMON/);
