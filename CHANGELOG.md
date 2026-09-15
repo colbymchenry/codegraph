@@ -25,6 +25,16 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- **Verilog and SystemVerilog are indexed.** Modules, packages, interfaces and modports, named instances, ports and signals, always/assign blocks and generate scopes are searchable, and `codegraph_explore` surfaces the instantiation path from a top module down to a nested one; based on the extractor contributed in #402 by @FHYQ-Dong. Re-index projects that contain Verilog files.
+
+- **HDL port bindings resolve to their formal ports.** Named, positional and wildcard (`.*`) connections link an instance's local signals to the instantiated module's ports, and bit or part selects keep their base signal.
+
+- **Signal readers and writers on request.** `codegraph_explore` with `hdlAccess` (CLI: `codegraph explore --hdl-access`) lists where a signal is read, written, used as a control condition or as a clock/reset event, including the direction of arguments passed to known functions and tasks.
+
+- **HDL build profiles.** An optional `hdl` section in `codegraph.json` selects source files or filelists, include directories and defines; conditional-compilation branches are indexed under the active profile, `codegraph status` reports the configured versus the indexed profile, and the file watcher follows filelists and included headers.
+
+- **Computed parameters and port widths.** `codegraph hdl-semantic` runs an installed slang (or pyslang through `--python`) on the active profile and returns evaluated parameters, port widths and macro origins as a separate answer, without touching the indexed graph.
+
 - **Codex and Astra read project guidance from `AGENTS.md`.** The canonical agent guide now lives in `AGENTS.md` (with a nested `docs/AGENTS.md` for long validation notes); `CLAUDE.md` is a thin `@AGENTS.md` wrapper for Claude Code. Codex/Astra no longer miss the old CLAUDE-only instructions.
 
 - **A big screen's picture stops wrapping into a column.** How wide a screen's lines run before they wrap was worked out with a formula, and the formula was wrong for the way these pictures are actually drawn: a part of a screen spends lines on its own structure — a step that fires things gets a line to itself, and what it fires starts another — so estimating the lines from the boxes alone badly undercounted them, and one screen's 98 boxes wrapped into a 4,356px column. Laying a picture out is cheap and exact, so the widths are now simply tried and the one that comes out closest to the shape of a window is kept. Across one app's 51 screens the tallest picture went from 4,356px to 3,796px, total height fell 8%, and — because a shorter picture is also a picture whose lines have less far to go — lines running over other boxes fell by a third and lines crossing each other went from 13 to 5.

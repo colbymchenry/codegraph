@@ -1391,7 +1391,10 @@ export class TreeSitterExtractor {
       return null;
     }
 
-    const id = generateNodeId(this.filePath, kind, name, node.startPosition.row + 1);
+    // HDL declarations can share a name and source line (`wire a, a_n;`).
+    // Include the UTF-16 column for Verilog so their edges cannot alias.
+    const column = this.language === 'verilog' ? node.startPosition.column : undefined;
+    const id = generateNodeId(this.filePath, kind, name, node.startPosition.row + 1, column);
 
     // Some grammars (e.g. Dart) model a function/method body as a *sibling* of
     // the signature node, so the declaration node's own range is just the
