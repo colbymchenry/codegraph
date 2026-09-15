@@ -116,6 +116,37 @@ describe('QueryPool', () => {
     await pool.destroy();
   });
 
+  it('recycles an idle burst back to one fresh worker', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const workers: FakeWorker[] = [];
+    const pool = new QueryPool({
+      root: '/x', size: 4, idleShrinkMs: 20,
+      createWorker: () => {
+        const worker = new FakeWorker((m) => ({
+          wait: gate.then(() => ok(`r${m.id}`)),
+        }));
+        workers.push(worker);
+        return worker;
+      },
+    });
+
+    const calls = Promise.all(Array.from({ length: 4 }, (_, i) => pool.run('codegraph_search', { i })));
+    await sleep(40);
+    expect(pool.liveWorkers).toBe(4);
+    release();
+    await calls;
+    await sleep(40);
+
+    expect(pool.liveWorkers).toBe(1);
+    expect(workers).toHaveLength(5); // four used isolates replaced by one clean isolate
+    expect(workers.slice(0, 4).every((w) => !w.alive)).toBe(true);
+    expect(pool.ready).toBe(true);
+    const again = await pool.run('codegraph_node', { symbol: 's' });
+    expect(again.isError).toBeFalsy();
+    await pool.destroy();
+  });
+
   it('recovers from a worker crash: retries the in-flight call and respawns', async () => {
     let calls = 0;
     const pool = new QueryPool({

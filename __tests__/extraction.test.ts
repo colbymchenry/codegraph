@@ -4,14 +4,14 @@
  * Tests for the tree-sitter extraction system.
  */
 
-import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { execFileSync } from 'child_process';
 import { CodeGraph } from '../src';
 import { extractFromSource, scanDirectory, scanDirectoryAsync, buildDefaultIgnore, discoverEmbeddedRepoRoots, buildScopeIgnore, type ScanSkipStats } from '../src/extraction';
-import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile } from '../src/extraction/grammars';
+import { detectLanguage, isLanguageSupported, getSupportedLanguages, initGrammars, loadAllGrammars, isSourceFile, getParser } from '../src/extraction/grammars';
 import { stripCppTemplateArgs, blankCppExportMacros, blankCppInlineMacros, blankMetalAttributes, blankCudaConstructs, blankCppAnnotationMacroCalls, blankCppApiPrefixMacros, blankCppInlineAnnotationMacros, blankCLeadingAttrMacros, recoverMangledCppName } from '../src/extraction/languages/c-cpp';
 import { normalizePath } from '../src/utils';
 
@@ -10410,6 +10410,22 @@ import foo.cfm;
 \t</cffunction>
 </cfcomponent>
 `;
+
+    it('releases the tag parser tree after extraction', () => {
+      const parser = getParser('cfml');
+      expect(parser).toBeDefined();
+      const sample = parser!.parse('<cfcomponent></cfcomponent>');
+      expect(sample).toBeDefined();
+      const treePrototype = Object.getPrototypeOf(sample!);
+      sample!.delete();
+      const deleteSpy = vi.spyOn(treePrototype, 'delete');
+      try {
+        extractFromSource('TagStyle.cfc', '<cfcomponent></cfcomponent>');
+        expect(deleteSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        deleteSpy.mockRestore();
+      }
+    });
 
     it('should name the component from the file name when the tag has no name attribute', () => {
       const result = extractFromSource('TagStyle.cfc', code);
