@@ -41,6 +41,7 @@ import { logDebug, logWarn } from '../errors';
 import { normalizePath } from '../utils';
 import { isCodeGraphDataDir } from '../directory';
 import { watchDisabledReason } from './watch-policy';
+import { HdlWatchScope } from './hdl-watch-scope';
 
 /**
  * Number of consecutive lock-contention retries the watcher tolerates before
@@ -355,6 +356,7 @@ export class FileWatcher {
   // scope (#1728). An embedded repo created after start() joins the scope on
   // the next scope refresh / watcher restart / re-index.
   private ignoreMatcher: ScopeIgnore | null = null;
+  private readonly hdlScope: HdlWatchScope;
 
   private readonly projectRoot: string;
   private readonly debounceMs: number;
@@ -375,9 +377,11 @@ export class FileWatcher {
     projectRoot: string,
     syncFn: (paths?: string[]) => Promise<{ filesChanged: number; durationMs: number }>,
     options: WatchOptions = {},
-    isFileStateCurrent?: (relativePath: string) => boolean
+    isFileStateCurrent?: (relativePath: string) => boolean,
+    getHdlDependencyPaths?: () => string[]
   ) {
     this.projectRoot = projectRoot;
+    this.hdlScope = new HdlWatchScope(projectRoot, getHdlDependencyPaths);
     this.syncFn = syncFn;
     this.debounceMs = options.debounceMs ?? 2000;
     this.onSyncComplete = options.onSyncComplete;
@@ -413,6 +417,7 @@ export class FileWatcher {
 
     // Reuse the indexer's ignore set so the watcher and indexer agree on scope.
     this.ignoreMatcher = buildScopeIgnore(this.projectRoot);
+    this.hdlScope.refresh();
 
     try {
       if (this.inertForTests) {
@@ -639,7 +644,12 @@ export class FileWatcher {
       this.refreshScope(rel);
       return;
     }
-    if (this.ignoreMatcher && this.ignoreMatcher.ignores(rel)) return;
+    const hdlChange = this.hdlScope.matchesFile(rel) || this.hdlScope.matchesDirectory(rel);
+    if (this.hdlScope.isFilelist(rel)) {
+      this.refreshHdlScope();
+      this.needsFullScan = true;
+    }
+    if (!hdlChange && this.ignoreMatcher && this.ignoreMatcher.ignores(rel)) return;
     // A nested `.gitignore` (an embedded child repo's own rules, #514, or a
     // subdirectory rule the git-backed full scan honors) is only a scope
     // change when it sits INSIDE the current scope — checked after the matcher
@@ -650,7 +660,7 @@ export class FileWatcher {
       this.refreshScope(rel);
       return;
     }
-    if (!isSourceFile(rel, loadExtensionOverrides(this.projectRoot), this.projectRoot)) {
+    if (!hdlChange && !isSourceFile(rel, loadExtensionOverrides(this.projectRoot), this.projectRoot)) {
       this.maybeScheduleForRemovedDir(rel);
       return;
     }
@@ -705,9 +715,16 @@ export class FileWatcher {
   private refreshScope(rel: string): void {
     logDebug('Scope config changed; rebuilding watcher scope', { file: rel });
     this.ignoreMatcher = buildScopeIgnore(this.projectRoot);
+    this.hdlScope.refresh();
     this.scheduleTreeRefresh();
     this.needsFullScan = true;
     this.scheduleSync();
+  }
+
+  private refreshHdlScope(): void {
+    // A profile switch can admit a formerly ignored directory; the walk adds
+    // its watches (and drops ones no longer in scope).
+    if (this.hdlScope.refresh()) this.refreshWatchTree();
   }
 
   /**
@@ -771,6 +788,7 @@ export class FileWatcher {
     const rel = normalizePath(path.relative(this.projectRoot, dirPath));
     if (!rel || rel === '.' || rel.startsWith('..')) return false; // root / outside
     if (this.isAlwaysIgnored(rel)) return true;
+    if (this.hdlScope.matchesDirectory(rel)) return false;
     if (!this.ignoreMatcher) return false;
     return this.ignoreMatcher.ignores(rel + '/');
   }
@@ -1016,6 +1034,7 @@ export class FileWatcher {
     if (!scoped) this.needsFullScan = false;
     try {
       const result = await this.syncFn(scoped);
+      this.refreshHdlScope();
       if (this.recoveringFromLock && !scoped && !this.needsFullScan) {
         this.degradedReason = null;
         this.recoveringFromLock = false;
@@ -1097,7 +1116,8 @@ export class FileWatcher {
       // above already set `stopped`, so this won't reschedule a watcher that
       // has given up. A directory removal whose full sync failed adds no
       // pending file, only `needsFullScan` — it still owes the full reconcile
-      // it asked for (#1964).
+      // it asked for (#1964). So does a scope change (`codegraph.json`, an HDL
+      // filelist) that landed while a SCOPED sync was in flight.
       if ((this.pendingFiles.size > 0 || this.needsFullScan) && !this.stopped) {
         const retryCount = Math.max(this.lockRetryCount, this.syncFailureRetryCount);
         if (retryCount > 0) {
