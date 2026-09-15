@@ -381,6 +381,16 @@ function matchesNonProductionDir(lowerPath: string): boolean {
 export function nameMatchBonus(nodeName: string, query: string): number {
   const nameLower = nodeName.toLowerCase();
 
+  // Full query as a single token (for compound identifiers like "CacheBuilder")
+  const queryLower = query.replace(/[\s]+/g, '').toLowerCase();
+
+  // An empty / whitespace-only query carries no name to match against. Bail
+  // before the `startsWith` check below, since `anyString.startsWith('')` is
+  // always true and would otherwise award a spurious flat +10 to every node
+  // (reachable via `searchNodes('   ')`, where the rescoring guard `text ||
+  // query` lets a whitespace-only query through).
+  if (!queryLower) return 0;
+
   // Split query into word-level terms (handles "CacheBuilder build" → ["cache","builder","build"])
   const rawTerms = query
     .replace(/([a-z])([A-Z])/g, '$1 $2')
@@ -390,9 +400,6 @@ export function nameMatchBonus(nodeName: string, query: string): number {
 
   // Also keep original space-separated tokens for exact-term matching
   const queryTokens = query.split(/\s+/).map(t => t.toLowerCase()).filter(t => t.length >= 2);
-
-  // Full query as a single token (for compound identifiers like "CacheBuilder")
-  const queryLower = query.replace(/[\s]+/g, '').toLowerCase();
 
   // Exact match: query exactly equals the node name
   if (nameLower === queryLower) return 80;
