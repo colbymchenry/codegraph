@@ -18,6 +18,7 @@ codegraph query <search>          # Search symbols (--kind, --limit, --json)
 codegraph explore <query>         # Relevant symbols' source + call paths in one shot (same output as the codegraph_explore MCP tool)
 codegraph node <symbol|file>      # One symbol's source + callers, or read a file with line numbers (same output as codegraph_node)
 codegraph files [path]            # Show file structure (--format, --filter, --pattern, --max-depth, --json)
+codegraph visualize [symbol]      # Generate interactive HTML graph (--depth, --limit, --output)
 codegraph callers <symbol>        # Find what calls a function/method (--limit, --json)
 codegraph callees <symbol>        # Find what a function/method calls (--limit, --json)
 codegraph impact <symbol>         # Analyze what code is affected by changing a symbol (--depth, --json)
@@ -66,3 +67,16 @@ codegraph ui --read-only         # refuse every write, including saved trails
 Without `--port` it takes 4747, or the next free port. `CODEGRAPH_BROWSER=<command>` chooses which browser opens; `CODEGRAPH_BROWSER=none` never opens one. `codegraph web` is an alias.
 
 The viewer listens on `127.0.0.1` only: it opens an index that already exists, never creates one, never changes your graph or a line of your code, and sends nothing anywhere. The one thing it writes is a trail you asked it to save, under `.codegraph/ui/trails/`; `--read-only` refuses even that.
+
+## visualize
+
+`codegraph visualize` writes a **standalone HTML file** instead of starting a server — useful for sharing a picture of the graph, attaching one to a review, or opening on a machine where running a server is awkward. Without a symbol it draws a project overview; with a symbol it draws that symbol's neighbourhood.
+
+```bash
+codegraph visualize                                    # whole project -> .codegraph/graph.html
+codegraph visualize handleRequest --depth 3 --limit 500
+codegraph visualize --kind class,function,method --edge-kind calls,extends,implements
+codegraph visualize --open                             # write it, then open it
+```
+
+The file contains the graph data inline — no network access, no third-party script — and carries its own filters, so node and edge kinds can be narrowed without regenerating. `--open` uses the same `CODEGRAPH_BROWSER` setting as `codegraph ui`.
