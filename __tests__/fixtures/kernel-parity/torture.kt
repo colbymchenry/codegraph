@@ -26,6 +26,9 @@ fun com.example.Qualified.qext() {}
 suspend fun suspender(): Unit { helper() }
 
 private internal fun visFn() {}
+private val hiddenTop = 1
+internal var sharedTop = 2
+
 
 fun inferred() = helper()
 
