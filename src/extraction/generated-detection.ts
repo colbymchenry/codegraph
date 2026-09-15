@@ -249,5 +249,9 @@ export function hasGeneratedHeader(content: string): boolean {
  * indexer persists to `files.generated`.
  */
 export function detectGeneratedFile(filePath: string, content: string): boolean {
+  // Markdown carries no banner: its `#` is a heading, not a comment leader,
+  // so a README that DESCRIBES generated code ("Code generated … DO NOT EDIT"
+  // under a heading) would flag itself. The path convention still applies.
+  if (/\.(?:md|markdown)$/i.test(filePath)) return isGeneratedFile(filePath);
   return isGeneratedFile(filePath) || hasGeneratedHeader(content);
 }

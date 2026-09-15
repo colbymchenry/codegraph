@@ -30,6 +30,68 @@ macro_rules! stack_guard {
     };
 }
 
+/// The markdown path-reference pair, for a walker with the usual shape
+/// (`text`, `line_of`, `col_of`, `arena`, `tables`, `file_path`). Every routed
+/// language needs the same two methods, and the wasm arm they must match is
+/// one implementation, so this is one implementation too — see markdown.rs for
+/// what it mirrors and why the two ref flags are set only here.
+macro_rules! markdown_refs_impl {
+    () => {
+        /// extractMarkdownPathReferencesFromStringNode.
+        fn markdown_refs_from_string(&mut self, node: Node<'t>, owner_row: u32) {
+            if !$crate::markdown::is_markdown_path_string_kind(node.kind()) {
+                return;
+            }
+            let found = $crate::markdown::markdown_path_refs(self.text(node), self.file_path);
+            if found.is_empty() {
+                return;
+            }
+            let kind_code = $crate::buffers::edge_kind_index("references").unwrap();
+            let line = self.line_of(node);
+            let column = self.col_of(node);
+            for (name, offset) in found {
+                let name_ref = self.arena.put(&name);
+                // addReference denormalizes filePath and language onto the ref
+                // where the ordinary ref path does not, so these two flags are
+                // set here and nowhere else.
+                self.tables.push_ref_flagged(
+                    &$crate::buffers::RefRow {
+                        from_idx: owner_row,
+                        kind: kind_code,
+                        line,
+                        column: column + offset as u32,
+                        reference_name: name_ref,
+                        candidates: $crate::buffers::NONE_STR,
+                        from_id_str: $crate::buffers::NONE_STR,
+                    },
+                    $crate::buffers::REF_FLAG_FILE_PATH | $crate::buffers::REF_FLAG_LANGUAGE,
+                );
+            }
+        }
+
+        /// extractMarkdownPathReferencesFromSubtree — for constructs whose walk
+        /// stops before their value, where the owner is the declared symbol
+        /// rather than the enclosing scope.
+        ///
+        /// Only some walkers stop that way (tsjs, python, java, csharp, ruby,
+        /// lua); in the rest a declaration's children are walked normally and
+        /// the string method above already covers them, so the pair is one
+        /// macro and this half goes unused there. The parity fixtures decide
+        /// which is which — every language's torture file carries the same
+        /// eight markdown shapes.
+        #[allow(dead_code)]
+        fn markdown_refs_from_subtree(&mut self, node: Node<'t>, owner_row: u32) {
+            stack_guard!();
+            self.markdown_refs_from_string(node, owner_row);
+            for i in 0..node.named_child_count() {
+                if let Some(c) = node.named_child(i) {
+                    self.markdown_refs_from_subtree(c, owner_row);
+                }
+            }
+        }
+    };
+}
+
 mod buffers;
 mod ccpp;
 mod cfnptr;
@@ -42,6 +104,7 @@ mod java;
 mod kotlin;
 mod langs;
 mod lua;
+mod markdown;
 mod php;
 mod rlang;
 mod ruby;

@@ -229,3 +229,18 @@ void patternUser(Object o) {
 void afterUnicode(String seance) {
   emit('café ☕ done');
 }
+
+// Markdown path references: code -> documentation edges. Every shape the
+// normalizer branches on, so the two arms have to agree about the rejections
+// (URL, escape above the root) as well as the emissions.
+const mdGuide = '../docs/guide.md#install';
+const mdBare = 'README.md';
+const mdRooted = '/docs/rooted.md';
+const mdEscapes = '../../../../outside.md';
+const mdRemote = 'https://example.com/remote.md';
+const mdQueried = './notes.md?raw=1#top';
+const mdTwoInOne = 'see a.md and also sub/b.mdx';
+
+void mdLoad() {
+  loadDoc('docs/deep/nested.markdown');
+}
