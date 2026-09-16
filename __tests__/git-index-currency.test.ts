@@ -15,6 +15,21 @@ vi.mock('fs', async importOriginal => {
   const actual = await importOriginal<typeof import('fs')>();
   return { ...actual, readFileSync: vi.fn(actual.readFileSync) };
 });
+// The real entry points, for the injecting implementations to fall through to
+// and for afterEach to reinstate. Under Vitest 4 `vi.spyOn` on a mocked
+// module's export returns the same `vi.fn`, so reading `cp.execFileSync` inside
+// a test and calling it from the injected implementation recurses into itself,
+// and `vi.restoreAllMocks()` no longer resets a `vi.fn`'s implementation.
+const actualCp = await vi.importActual<typeof import('child_process')>('child_process');
+const actualFs = await vi.importActual<typeof import('fs')>('fs');
+const injectExecFileSync = (impl: (real: typeof cp.execFileSync, ...args: any[]) => unknown) =>
+  vi.mocked(cp.execFileSync).mockImplementation(((...args: any[]) => impl(actualCp.execFileSync, ...args)) as typeof cp.execFileSync);
+const injectReadFileSync = (impl: (real: typeof fs.readFileSync, ...args: any[]) => unknown) =>
+  vi.mocked(fs.readFileSync).mockImplementation(((...args: any[]) => impl(actualFs.readFileSync, ...args)) as typeof fs.readFileSync);
+const reinstateIo = () => {
+  vi.mocked(cp.execFileSync).mockImplementation(actualCp.execFileSync as typeof cp.execFileSync);
+  vi.mocked(fs.readFileSync).mockImplementation(actualFs.readFileSync as typeof fs.readFileSync);
+};
 
 describe('git index currency across commits and restores (#1829)', () => {
   let root: string;
@@ -34,7 +49,7 @@ describe('git index currency across commits and restores (#1829)', () => {
     cg = CodeGraph.initSync(root);
     expect((await cg.indexAll()).success).toBe(true);
   });
-  afterEach(() => { vi.restoreAllMocks(); cg?.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  afterEach(() => { reinstateIo(); vi.restoreAllMocks(); cg?.close(); fs.rmSync(root, { recursive: true, force: true }); });
 
   it.each(['index', 'sync', 'scoped'] as const)('sees a restored indexed dirty edit after %s', async mode => {
     write('source.ts', 'dirtyVersion');
@@ -80,12 +95,11 @@ describe('git index currency across commits and restores (#1829)', () => {
 
   it('falls back when git diff fails instead of claiming a clean index', () => {
     write('new.ts', 'newSymbol'); commit();
-    const real = cp.execFileSync;
     let injected = 0;
-    vi.spyOn(cp, 'execFileSync').mockImplementation(((file: string, args: string[], options: any) => {
+    injectExecFileSync((real, file: string, args: string[], options: any) => {
       if (file === 'git' && args[0] === 'diff') { injected++; throw new Error('Injected git diff timeout'); }
       return real(file, args, options);
-    }) as typeof cp.execFileSync);
+    });
     expect(cg.getChangedFiles().added).toEqual(['new.ts']);
     expect(injected).toBeGreaterThan(0);
   });
@@ -132,16 +146,15 @@ describe('git index currency across commits and restores (#1829)', () => {
 
   it('keeps a committed path pending when sync cannot read it', async () => {
     write('new.ts', 'newSymbol'); commit();
-    const real = fs.readFileSync;
     let injected = 0;
-    vi.spyOn(fs, 'readFileSync').mockImplementation(((file: any, ...args: any[]) => {
+    injectReadFileSync((real, file: any, ...args: any[]) => {
       if (String(file) === path.join(root, 'new.ts')) { injected++; throw new Error('Injected transient read error'); }
       return (real as any)(file, ...args);
-    }) as typeof fs.readFileSync);
+    });
     await cg.sync();
     expect(injected).toBeGreaterThan(0);
     expect(symbols('newSymbol')).not.toContain('newSymbol');
-    vi.restoreAllMocks();
+    reinstateIo();
     expect(cg.getChangedFiles().added).toEqual(['new.ts']);
     await cg.sync(); clean();
   });
