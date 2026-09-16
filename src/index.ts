@@ -160,6 +160,8 @@ export class CodeGraph {
 
   // File watcher for auto-sync on file changes
   private watcher: FileWatcher | null = null;
+  private closed = false;
+  private reopenPromise: Promise<boolean> | null = null;
 
   private constructor(
     db: DatabaseConnection,
@@ -248,6 +250,7 @@ export class CodeGraph {
    * file can't be unlinked there, and st_ino is unreliable).
    */
   reopenIfReplaced(): boolean {
+    if (this.closed) return false;
     if (!this.db.isReplacedOnDisk()) return false;
     const dbPath = this.db.getPath();
     // Open the live file FIRST — if that throws (e.g. mid-recreate), the old
@@ -260,6 +263,38 @@ export class CodeGraph {
     this.wireLayers();
     // Releasing the dead handle also frees the leaked db/-wal/-shm fds that were
     // pinning the unlinked inode (#925).
+    try { stale.close(); } catch { /* the old inode is gone; closing just frees fds */ }
+    return true;
+  }
+
+  /** Async counterpart used by long-lived servers so recovery stays off-loop. */
+  async reopenIfReplacedAsync(): Promise<boolean> {
+    if (this.closed) return false;
+    if (this.reopenPromise) return this.reopenPromise;
+    const reopening = this.doReopenIfReplacedAsync();
+    this.reopenPromise = reopening;
+    try {
+      return await reopening;
+    } finally {
+      if (this.reopenPromise === reopening) this.reopenPromise = null;
+    }
+  }
+
+  /** Serialized implementation for {@link reopenIfReplacedAsync}. */
+  private async doReopenIfReplacedAsync(): Promise<boolean> {
+    if (!this.db.isReplacedOnDisk()) return false;
+    const dbPath = this.db.getPath();
+    // As above, complete the new open before disturbing the still-usable stale
+    // handle. This path also keeps secondary-index recovery off the event loop.
+    const fresh = await DatabaseConnection.openAsync(dbPath);
+    if (this.closed) {
+      try { fresh.close(); } catch { /* close() won the lifecycle race */ }
+      return false;
+    }
+    const stale = this.db;
+    this.db = fresh;
+    this.queries = new QueryBuilder(fresh.getDb());
+    this.wireLayers();
     try { stale.close(); } catch { /* the old inode is gone; closing just frees fds */ }
     return true;
   }
@@ -350,7 +385,7 @@ export class CodeGraph {
 
     // Open database
     const dbPath = getDatabasePath(resolvedRoot);
-    const db = DatabaseConnection.open(dbPath);
+    const db = await DatabaseConnection.openAsync(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
     const instance = new CodeGraph(db, queries, resolvedRoot);
@@ -447,6 +482,8 @@ export class CodeGraph {
    * Close the CodeGraph instance and release resources
    */
   close(): void {
+    if (this.closed) return;
+    this.closed = true;
     this.unwatch();
     // Release file lock if held
     this.fileLock.release();

@@ -163,6 +163,42 @@ export class DatabaseConnection {
    * Open an existing database
    */
   static open(dbPath: string): DatabaseConnection {
+    const conn = DatabaseConnection.openBase(dbPath);
+    try {
+      conn.healBulkSecondaryIndexes();
+
+      // Self-heal a killed session's leftover oversized WAL (#1431) — one
+      // statSync when healthy, off-thread checkpoint+truncate when not.
+      void conn.healOversizedWal();
+      return conn;
+    } catch (error) {
+      try { conn.close(); } catch { /* preserve the recovery error */ }
+      throw error;
+    }
+  }
+
+  /**
+   * Open an existing database without rebuilding dropped secondary indexes on
+   * the caller's event loop. A killed bulk-load window can leave those indexes
+   * absent, and rebuilding them on a large graph is long-running SQLite work.
+   */
+  static async openAsync(dbPath: string): Promise<DatabaseConnection> {
+    const conn = DatabaseConnection.openBase(dbPath);
+    try {
+      await conn.healBulkSecondaryIndexesOffThread();
+
+      // Self-heal a killed session's leftover oversized WAL (#1431) — one
+      // statSync when healthy, off-thread checkpoint+truncate when not.
+      void conn.healOversizedWal();
+      return conn;
+    } catch (error) {
+      try { conn.close(); } catch { /* preserve the recovery error */ }
+      throw error;
+    }
+  }
+
+  /** Open and perform the short, synchronous recovery shared by both paths. */
+  private static openBase(dbPath: string): DatabaseConnection {
     if (!fs.existsSync(dbPath)) {
       throw new Error(`Database not found: ${dbPath}`);
     }
@@ -191,12 +227,6 @@ export class DatabaseConnection {
     // beginBulkNodeLoad and endBulkNodeLoad): the FTS triggers are missing and
     // nodes_fts is stale. Rebuild + recreate so search stays in sync.
     conn.healBulkNodeLoad();
-    conn.healBulkSecondaryIndexes();
-
-    // Self-heal a killed session's leftover oversized WAL (#1431) — one
-    // statSync when healthy, off-thread checkpoint+truncate when not.
-    void conn.healOversizedWal();
-
     return conn;
   }
 
@@ -415,6 +445,20 @@ export class DatabaseConnection {
 
   /** Recreate every secondary index a killed bulk parse/ref/edge window may leave dropped. */
   private healBulkSecondaryIndexes(): void {
+    for (const ddl of this.bulkSecondaryIndexDdls()) {
+      this.db.exec(ddl);
+    }
+  }
+
+  /** Recreate dropped bulk-load indexes on a dedicated SQLite connection. */
+  private async healBulkSecondaryIndexesOffThread(): Promise<void> {
+    const ddls = this.bulkSecondaryIndexDdls();
+    if (ddls.length === 0) return;
+    await this.runSqlOffThread(ddls);
+  }
+
+  /** Return the canonical DDL needed to heal a killed bulk-load window. */
+  private bulkSecondaryIndexDdls(): string[] {
     const names = [...new Set<string>([
       ...DatabaseConnection.BULK_PARSE_INDEX_NAMES,
       ...DatabaseConnection.BULK_REF_INDEX_NAMES,
@@ -424,15 +468,15 @@ export class DatabaseConnection {
     const row = this.db
       .prepare(`SELECT count(*) AS c FROM sqlite_master WHERE type = 'index' AND name IN (${placeholders})`)
       .get(...names) as { c: number } | undefined;
-    if ((row?.c ?? 0) >= names.length) return;
+    if ((row?.c ?? 0) >= names.length) return [];
 
     const schemaPath = path.join(__dirname, 'schema.sql');
     const schema = fs.readFileSync(schemaPath, 'utf-8');
-    for (const idx of names) {
+    return names.map((idx) => {
       const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
       if (!m) throw new Error(`schema.sql: index ${idx} not found for crash recovery`);
-      this.db.exec(m[0]);
-    }
+      return m[0];
+    });
   }
 
   /**
@@ -802,6 +846,58 @@ export class DatabaseConnection {
         try { this.db.exec(p); } catch { /* ignore */ }
       }
     }
+  }
+
+  /**
+   * Run required SQL on a worker-owned connection. Unlike maintenance pragmas,
+   * crash recovery is not best-effort: the database must not be handed to a
+   * caller until every statement succeeds.
+   */
+  private async runSqlOffThread(statements: string[]): Promise<void> {
+    const { Worker } = await import('node:worker_threads');
+    const workerSource = `
+      const { workerData, parentPort } = require('node:worker_threads');
+      let db;
+      try {
+        const { DatabaseSync } = require('node:sqlite');
+        db = new DatabaseSync(workerData.dbPath);
+        db.exec('PRAGMA busy_timeout=30000');
+        for (const sql of workerData.statements) db.exec(sql);
+        db.close();
+        db = undefined;
+        parentPort.postMessage({ ok: true });
+      } catch (error) {
+        try { if (db) db.close(); } catch {}
+        parentPort.postMessage({
+          ok: false,
+          error: error && error.message ? error.message : String(error),
+        });
+      }
+    `;
+
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: Error): void => {
+        if (settled) return;
+        settled = true;
+        if (error) reject(error);
+        else resolve();
+      };
+
+      const worker = new Worker(workerSource, {
+        eval: true,
+        workerData: { dbPath: this.dbPath, statements },
+      });
+      worker.once('message', (message: { ok: boolean; error?: string }) => {
+        if (message.ok) finish();
+        else finish(new Error(`Secondary-index recovery failed: ${message.error ?? 'unknown worker error'}`));
+      });
+      worker.once('error', (error) => finish(error));
+      worker.once('exit', (code) => {
+        if (code !== 0) finish(new Error(`Secondary-index recovery worker exited with code ${code}`));
+        else finish(new Error('Secondary-index recovery worker exited before reporting completion'));
+      });
+    });
   }
 
   /**

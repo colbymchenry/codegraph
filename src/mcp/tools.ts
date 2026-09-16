@@ -1465,6 +1465,11 @@ const DEFAULT_MCP_TOOLS = new Set(['explore']);
 export class ToolHandler {
   // Cache of opened CodeGraph instances for cross-project queries
   private projectCache: Map<string, CodeGraph> = new Map();
+  // Coalesce concurrent first queries for the same project while its async
+  // recovery/open is still in flight, so only one connection is created.
+  private projectOpenPromises: Map<string, Promise<CodeGraph>> = new Map();
+  // Invalidates an in-flight open when closeAll() begins during shutdown.
+  private projectCacheGeneration = 0;
   // The directory the server last searched for a default project. Surfaced in
   // the "not initialized" error so users can see why detection missed.
   private defaultProjectHint: string | null = null;
@@ -1708,7 +1713,7 @@ export class ToolHandler {
    * Walks up parent directories to find the nearest .codegraph/ folder,
    * similar to how git finds .git/ directories.
    */
-  private getCodeGraph(projectPath?: string): CodeGraph {
+  private async getCodeGraph(projectPath?: string): Promise<CodeGraph> {
     if (!projectPath) {
       if (!this.cg) {
         const searched = this.defaultProjectHint ?? process.cwd();
@@ -1781,9 +1786,25 @@ export class ToolHandler {
     const cached = this.projectCache.get(resolvedRoot);
     if (cached) return this.freshen(cached);
 
-    const cg = loadCodeGraph().openSync(resolvedRoot);
-    this.projectCache.set(resolvedRoot, cg);
-    return cg;
+    const generation = this.projectCacheGeneration;
+    let opening = this.projectOpenPromises.get(resolvedRoot);
+    if (!opening) {
+      opening = loadCodeGraph().open(resolvedRoot);
+      this.projectOpenPromises.set(resolvedRoot, opening);
+    }
+    try {
+      const cg = await opening;
+      if (generation !== this.projectCacheGeneration) {
+        try { cg.close(); } catch { /* another waiter may already have closed it */ }
+        throw new Error('Project cache closed while the database was opening');
+      }
+      this.projectCache.set(resolvedRoot, cg);
+      return cg;
+    } finally {
+      if (this.projectOpenPromises.get(resolvedRoot) === opening) {
+        this.projectOpenPromises.delete(resolvedRoot);
+      }
+    }
   }
 
   /**
@@ -1796,9 +1817,9 @@ export class ToolHandler {
    * stat() and a no-op unless the inode actually changed; it never throws into a
    * tool call.
    */
-  private freshen(cg: CodeGraph): CodeGraph {
+  private async freshen(cg: CodeGraph): Promise<CodeGraph> {
     try {
-      if (cg.reopenIfReplaced()) {
+      if (await cg.reopenIfReplacedAsync()) {
         process.stderr.write(
           '[CodeGraph MCP] The index was replaced on disk (e.g. a git worktree ' +
           'recreated at the same path); reopened the live database in place.\n'
@@ -1815,10 +1836,12 @@ export class ToolHandler {
    * Close all cached project connections
    */
   closeAll(): void {
+    this.projectCacheGeneration++;
     for (const cg of this.projectCache.values()) {
       cg.close();
     }
     this.projectCache.clear();
+    this.projectOpenPromises.clear();
     this.worktreeMismatchCache.clear();
   }
 
@@ -1876,7 +1899,7 @@ export class ToolHandler {
    * (e.g. nothing initialized yet), it reports "no mismatch" so a tool is never
    * broken by this check.
    */
-  private worktreeMismatchFor(projectPath?: string): WorktreeIndexMismatch | null {
+  private async worktreeMismatchFor(projectPath?: string): Promise<WorktreeIndexMismatch | null> {
     const startPath = projectPath ?? this.defaultProjectHint ?? process.cwd();
 
     // The verdict depends on BOTH the start path AND the index root it resolves
@@ -1890,7 +1913,7 @@ export class ToolHandler {
     // that first verdict until restart (#926).
     let indexRoot: string;
     try {
-      indexRoot = this.getCodeGraph(projectPath).getProjectRoot();
+      indexRoot = (await this.getCodeGraph(projectPath)).getProjectRoot();
     } catch {
       // No resolvable project (or any other resolution error) → nothing to warn.
       return null;
@@ -1913,9 +1936,9 @@ export class ToolHandler {
    * is no mismatch. `codegraph_status` is excluded — it embeds its own verbose
    * warning — so it stays out of this path.
    */
-  private withWorktreeNotice(result: ToolResult, projectPath?: string): ToolResult {
+  private async withWorktreeNotice(result: ToolResult, projectPath?: string): Promise<ToolResult> {
     if (result.isError) return result;
-    const mismatch = this.worktreeMismatchFor(projectPath);
+    const mismatch = await this.worktreeMismatchFor(projectPath);
     if (!mismatch) return result;
 
     const notice = worktreeMismatchNotice(mismatch);
@@ -2000,12 +2023,12 @@ export class ToolHandler {
     return stale;
   }
 
-  private withStalenessNotice(result: ToolResult, projectPath?: string): ToolResult {
+  private async withStalenessNotice(result: ToolResult, projectPath?: string): Promise<ToolResult> {
     if (result.isError) return result;
 
     let cg: CodeGraph;
     try {
-      cg = this.getCodeGraph(projectPath);
+      cg = await this.getCodeGraph(projectPath);
     } catch {
       return result; // no default project — leave as is
     }
@@ -2180,7 +2203,7 @@ export class ToolHandler {
       // internal bookkeeping and must never reach the client, whether or not a
       // caller passed session state.
       const result = this.takeExploreEmission(raw, sessionState);
-      const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
+      const withWorktree = await this.withWorktreeNotice(result, args.projectPath as string | undefined);
       return this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
     } catch (err) {
       // Expected condition, not a malfunction: answer as a SUCCESS so the
@@ -2309,7 +2332,7 @@ export class ToolHandler {
     const query = this.validateString(args.query, 'query');
     if (typeof query !== 'string') return query;
 
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = await this.getCodeGraph(args.projectPath as string | undefined);
     const rawKind = args.kind as string | undefined;
     // The schema enum says 'type' (what agents naturally reach for); the
     // NodeKind is 'type_alias'. Without the mapping, kind: "type" silently
@@ -2369,7 +2392,7 @@ export class ToolHandler {
     const symbol = this.validateString(args.symbol, 'symbol');
     if (typeof symbol !== 'string') return symbol;
 
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = await this.getCodeGraph(args.projectPath as string | undefined);
     const limit = clamp((args.limit as number) || 20, 1, 100);
     const fileFilter = typeof args.file === 'string' ? args.file : undefined;
 
@@ -2450,7 +2473,7 @@ export class ToolHandler {
     const symbol = this.validateString(args.symbol, 'symbol');
     if (typeof symbol !== 'string') return symbol;
 
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = await this.getCodeGraph(args.projectPath as string | undefined);
     const limit = clamp((args.limit as number) || 20, 1, 100);
     const fileFilter = typeof args.file === 'string' ? args.file : undefined;
 
@@ -2528,7 +2551,7 @@ export class ToolHandler {
     const symbol = this.validateString(args.symbol, 'symbol');
     if (typeof symbol !== 'string') return symbol;
 
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = await this.getCodeGraph(args.projectPath as string | undefined);
     const depth = clamp((args.depth as number) || 2, 1, 10);
     const fileFilter = typeof args.file === 'string' ? args.file : undefined;
 
@@ -3286,7 +3309,7 @@ export class ToolHandler {
     // ranking all see the same canonical spelling (Erlang `mod:fn/arity`).
     const query = normalizeQuerySpelling(rawQuery);
 
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = await this.getCodeGraph(args.projectPath as string | undefined);
     const projectRoot = cg.getProjectRoot();
 
     // Resolve adaptive output budget from project size. Falls back to the
@@ -6129,7 +6152,7 @@ export class ToolHandler {
    * Handle codegraph_node
    */
   private async handleNode(args: Record<string, unknown>): Promise<ToolResult> {
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = await this.getCodeGraph(args.projectPath as string | undefined);
     // Default to false to minimize context usage
     const includeCode = args.includeCode === true;
     const fileHint = typeof args.file === 'string' && args.file.trim() ? args.file.trim() : undefined;
@@ -6517,7 +6540,7 @@ export class ToolHandler {
    * Handle codegraph_status
    */
   private async handleStatus(args: Record<string, unknown>): Promise<ToolResult> {
-    let cg = this.getCodeGraph(args.projectPath as string | undefined);
+    let cg = await this.getCodeGraph(args.projectPath as string | undefined);
     // Same trick as withStalenessNotice — when an explicit projectPath
     // resolves to the same project as the default session cg, prefer the
     // default so getPendingFiles() (only populated by the default's watcher)
@@ -6536,7 +6559,7 @@ export class ToolHandler {
     // Queries then reflect that tree's branch, not the worktree being edited.
     // status shows the verbose, multi-line form; the read tools get the compact
     // one-liner via withWorktreeNotice. Both share the cached detection.
-    const mismatch = this.worktreeMismatchFor(args.projectPath as string | undefined);
+    const mismatch = await this.worktreeMismatchFor(args.projectPath as string | undefined);
 
     const lines: string[] = [
       '**CodeGraph Status**',
@@ -6641,7 +6664,7 @@ export class ToolHandler {
    * Handle codegraph_files - get project file structure from the index
    */
   private async handleFiles(args: Record<string, unknown>): Promise<ToolResult> {
-    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const cg = await this.getCodeGraph(args.projectPath as string | undefined);
     const pathFilter = args.path as string | undefined;
     const pattern = args.pattern as string | undefined;
     const format = (args.format as 'tree' | 'flat' | 'grouped') || 'tree';

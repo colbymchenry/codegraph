@@ -2,6 +2,9 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
+import { CodeGraph } from '../src';
+import { DatabaseConnection, getDatabasePath } from '../src/db';
 import {
   parseWatchdogTimeoutMs,
   deriveCheckIntervalMs,
@@ -58,25 +61,35 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
     env: Record<string, string>,
     body: string,
     hardTimeoutMs: number,
-    progressPaths?: string[]
-  ): Promise<{ code: number | null; signal: NodeJS.Signals | 'TIMEOUT' | null }> {
+    progressPaths?: string[],
+    prelude = ''
+  ): Promise<{ code: number | null; signal: NodeJS.Signals | 'TIMEOUT' | null; stderr: string }> {
     const src = `
-      const { installMainThreadWatchdog } = require(${JSON.stringify(MODULE)});
-      installMainThreadWatchdog(${progressPaths ? JSON.stringify({ progressPaths }) : ''});
-      ${body}
+      (async () => {
+        ${prelude}
+        const { installMainThreadWatchdog } = require(${JSON.stringify(MODULE)});
+        installMainThreadWatchdog(${progressPaths ? JSON.stringify({ progressPaths }) : ''});
+        ${body}
+      })().catch((error) => {
+        console.error(error);
+        process.exit(23);
+      });
     `;
     const child = spawn(process.execPath, ['-e', src], {
       env: { ...process.env, ...env },
-      stdio: ['ignore', 'ignore', 'ignore'],
+      stdio: ['ignore', 'ignore', 'pipe'],
     });
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => { stderr += chunk; });
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         child.kill('SIGKILL');
-        resolve({ code: null, signal: 'TIMEOUT' });
+        resolve({ code: null, signal: 'TIMEOUT', stderr });
       }, hardTimeoutMs);
       child.on('exit', (code, signal) => {
         clearTimeout(timer);
-        resolve({ code, signal });
+        resolve({ code, signal, stderr });
       });
     });
   }
@@ -182,6 +195,69 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
     ]);
     expectKilled(r);
   }, 20000);
+
+  it('keeps interrupted secondary-index recovery off the watched event loop (#1887)', async () => {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-index-recovery-'));
+    try {
+      const project = CodeGraph.initSync(projectRoot);
+      project.close();
+
+      const dbPath = getDatabasePath(projectRoot);
+      const seed = DatabaseConnection.open(dbPath);
+      const expectedIndexes = (seed.getDb()
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+        .all() as Array<{ name: string }>).map((row) => row.name);
+
+      seed.beginBulkNodeLoad();
+      seed.beginBulkParseLoad();
+      const insert = seed.getDb().prepare(
+        `INSERT INTO nodes (
+          id, kind, name, qualified_name, file_path, language,
+          start_line, end_line, start_column, end_column, updated_at
+        ) VALUES (?, 'function', ?, ?, ?, 'typescript', 1, 1, 0, 1, ?)`
+      );
+      seed.getDb().exec('BEGIN');
+      try {
+        for (let i = 0; i < 600_000; i++) {
+          const name = `symbol_${i}`;
+          insert.run(`node_${i}`, name, name, `src/file_${i % 1000}.ts`, Date.now());
+        }
+        seed.getDb().exec('COMMIT');
+      } catch (error) {
+        seed.getDb().exec('ROLLBACK');
+        throw error;
+      }
+      seed.endBulkNodeLoad();
+      seed.close();
+
+      const DIST_INDEX = path.resolve(__dirname, '../dist/index.js');
+      const prelude = `
+        const { CodeGraph, initGrammars } = require(${JSON.stringify(DIST_INDEX)});
+        await initGrammars();
+      `;
+      const body = `
+        CodeGraph.open(${JSON.stringify(projectRoot)}).then((cg) => {
+          const names = cg.db.getDb()
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+            .all().map((row) => row.name);
+          cg.close();
+          process.exit(JSON.stringify(names) === ${JSON.stringify(JSON.stringify(expectedIndexes))} ? 0 : 21);
+        }).catch(() => process.exit(22));
+      `;
+      const r = await runChild(
+        { CODEGRAPH_WATCHDOG_TIMEOUT_MS: '100' },
+        body,
+        20_000,
+        [dbPath, `${dbPath}-wal`],
+        prelude
+      );
+
+      expect(r.signal).toBeNull();
+      expect(r.code, r.stderr).toBe(0);
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  }, 30000);
 
   it('does NOT kill a wedged process when CODEGRAPH_NO_WATCHDOG=1', async () => {
     const { code, signal } = await runChild(

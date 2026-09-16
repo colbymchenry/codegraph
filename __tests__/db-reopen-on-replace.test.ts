@@ -14,7 +14,7 @@
  * repros are gated to non-Windows; `isReplacedOnDisk` is verified to stay false
  * on Windows.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -113,5 +113,30 @@ describe('CodeGraph.reopenIfReplaced (issue #925)', () => {
     await server.indexAll();
     expect(server.reopenIfReplaced()).toBe(false);
     server.destroy();
+  });
+
+  it('does not publish a replacement connection after close wins the race', async () => {
+    const server = CodeGraph.initSync(root);
+    const stale = (server as unknown as { db: DatabaseConnection }).db;
+    const fresh = DatabaseConnection.initialize(path.join(root, 'replacement.db'));
+    let finishOpen!: (connection: DatabaseConnection) => void;
+    const openGate = new Promise<DatabaseConnection>((resolve) => { finishOpen = resolve; });
+    const replacedSpy = vi.spyOn(stale, 'isReplacedOnDisk').mockReturnValue(true);
+    const openSpy = vi.spyOn(DatabaseConnection, 'openAsync').mockReturnValue(openGate);
+
+    try {
+      const reopening = server.reopenIfReplacedAsync();
+      server.close();
+      finishOpen(fresh);
+
+      expect(await reopening).toBe(false);
+      expect(fresh.isOpen()).toBe(false);
+      expect(openSpy).toHaveBeenCalledOnce();
+    } finally {
+      replacedSpy.mockRestore();
+      openSpy.mockRestore();
+      try { server.close(); } catch { /* may already be closed */ }
+      try { fresh.close(); } catch { /* recovery closes it on the guarded path */ }
+    }
   });
 });
