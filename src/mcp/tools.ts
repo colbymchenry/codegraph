@@ -31,7 +31,7 @@ import {
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
-import { isTestFile, normalizeNameToken } from '../search/query-utils';
+import { isTestFile, normalizeNameToken, queryIsAboutTests } from '../search/query-utils';
 import { groupDefinitions, lastQualifierPart, matchesSymbol } from '../graph/symbol-lookup';
 import { extractQueryPaths, queryMightContainPaths } from '../search/query-paths';
 import {
@@ -1341,6 +1341,10 @@ export const tools: ToolDefinition[] = [
           type: 'number',
           description: 'Maximum number of files to include source code from (default: 12)',
           default: 12,
+        },
+        includeTests: {
+          type: 'boolean',
+          description: 'Include test/spec symbols in the Relationships section. Omit for auto — they are shown only when the query itself is about tests. Pass true to ask who covers a symbol; false to force them out.',
         },
         projectPath: projectPathProperty,
       },
@@ -3905,7 +3909,7 @@ export class ToolHandler {
     // keep-minimum then pulled two test files back in as the "spread".
     let candidateFiles = [...fileGroups.entries()];
     {
-      const queryMentionsTests = /\b(test|tests|testing|spec|verify|verifies)\b/i.test(matchQuery);
+      const queryMentionsTests = queryIsAboutTests(matchQuery);
       if (!queryMentionsTests) {
         // A pinned file is exempt: naming a test file by path IS asking for it.
         const nonLow = candidateFiles.filter(([p]) => !isLowValue(p) || pinnedSet.has(p));
@@ -4202,8 +4206,30 @@ export class ToolHandler {
     if (blastRadius) lines.push(blastRadius);
 
     // Relationship map — show how symbols connect
+    //
+    // Test edges are cut for the same reason test FILES are cut from the source
+    // section above: on a well-covered symbol they are most of the edge list, and
+    // the per-kind cap is small. A Go store method with a dozen callers rendered
+    // as ten `TestReserveSlot_* -> ReserveSlot` lines and "... and 100 more", so
+    // the one production caller the agent was asking about never made the cut —
+    // the section named the test suite instead of the call graph.
+    //
+    // `includeTests` overrides in both directions. Omitted, it follows the query,
+    // matching the source-file filter's own rule, so "which tests cover X" still
+    // answers with tests. The Blast radius section is untouched: its `tests:` line
+    // NAMES the covering files rather than flooding a cap, which is the half of
+    // this information that was already working.
+    const includeTests =
+      typeof args.includeTests === 'boolean'
+        ? args.includeTests
+        : queryIsAboutTests(matchQuery);
+    const isTestEndpoint = (id: string): boolean => {
+      const n = subgraph.nodes.get(id);
+      return !!n && isTestFile(n.filePath);
+    };
     const significantEdges = subgraph.edges.filter(e =>
-      e.kind !== 'contains' // skip contains — it's implied by file grouping
+      e.kind !== 'contains' && // skip contains — it's implied by file grouping
+      (includeTests || (!isTestEndpoint(e.source) && !isTestEndpoint(e.target)))
     );
 
     if (budget.includeRelationships && significantEdges.length > 0) {
