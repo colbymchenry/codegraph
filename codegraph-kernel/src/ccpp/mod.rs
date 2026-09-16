@@ -818,6 +818,18 @@ impl<'t> Walker<'t> {
         let kind = node.kind();
         let mut skip_children = false;
 
+        // C/C++ function-like macros become `constant` nodes carrying the
+        // directive as their signature — a value, never a callee (#1838).
+        // Mirrors tree-sitter.ts visitNode.
+        if kind == "preproc_function_def" {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = self.text(name_node).to_string();
+                let signature = Some(self.text(node).trim().to_string());
+                self.create_node("constant", &name, node, Extra { signature, ..Extra::default() });
+            }
+            return;
+        }
+
         // C++ namespace blocks: prefix-only, no node (#1291/#1093). Anonymous
         // namespaces fall through to the generic walk.
         if self.variant == Variant::Cpp && kind == "namespace_definition" {
@@ -926,6 +938,7 @@ impl<'t> Walker<'t> {
 
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
+            signature: self.constructor_signature(node),
             visibility: if self.variant == Variant::Cpp { self.visibility_of(node) } else { None },
             return_type: self.return_type_of(node),
             ..Extra::default()
@@ -962,6 +975,7 @@ impl<'t> Walker<'t> {
 
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
+            signature: self.constructor_signature(node),
             visibility: if self.variant == Variant::Cpp { self.visibility_of(node) } else { None },
             is_abstract: if self.variant == Variant::Cpp && self.is_cpp_pure_virtual_method_decl(node) {
                 Some(true)
@@ -1454,27 +1468,67 @@ impl<'t> Walker<'t> {
         }
     }
 
-    /// isCppStackConstruction (#1035).
-    fn is_cpp_stack_construction(&self, node: Node) -> bool {
-        let Some(type_node) = node.child_by_field_name("type") else { return false };
+    /// cppExtractor.getSignature (languages/c-cpp.ts): a C++ constructor
+    /// (a `function_definition` with no return type) carries its parameter
+    /// list as the signature so a local `T obj(args)` can pick the overload
+    /// by arity (#1839). Macro-shaped definitions whose real name was
+    /// recovered from an argument are excluded.
+    fn constructor_signature(&self, node: Node<'t>) -> Option<String> {
+        if self.variant != Variant::Cpp || node.kind() != "function_definition" {
+            return None;
+        }
+        if node.child_by_field_name("type").is_some() || self.recover_cpp_macro_defined_name(node).is_some() {
+            return None;
+        }
+        let params = node.child_by_field_name("declarator")?.child_by_field_name("parameters")?;
+        Some(self.text(params).to_string())
+    }
+
+    /// cppStackConstructions (tree-sitter.ts, #1035 / #1839): whether the
+    /// declaration constructs with arguments (→ `instantiates`), and one
+    /// arity per constructed object (→ `calls T::T/arity`). `extern`,
+    /// pointer / reference / function declarators construct nothing; an
+    /// array's braces hold elements, not constructor arguments.
+    fn cpp_stack_constructions(&self, node: Node<'t>) -> (bool, Vec<usize>) {
+        let none = (false, Vec::new());
+        let Some(type_node) = node.child_by_field_name("type") else { return none };
         if !matches!(
             type_node.kind(),
             "type_identifier" | "template_type" | "qualified_identifier"
         ) {
-            return false;
+            return none;
         }
+        let mut instantiates = false;
+        let mut arities = Vec::new();
         for i in 0..node.named_child_count() {
             let Some(child) = node.named_child(i) else { continue };
+            if child.kind() == "storage_class_specifier" && self.text(child) == "extern" {
+                return none;
+            }
+            if child.kind() == "identifier" {
+                arities.push(0);
+                continue;
+            }
             if child.kind() != "init_declarator" {
                 continue;
             }
-            if let Some(value) = child.child_by_field_name("value") {
-                if matches!(value.kind(), "argument_list" | "initializer_list") {
-                    return true;
-                }
+            let Some(declarator) = child.child_by_field_name("declarator") else { continue };
+            if !matches!(declarator.kind(), "identifier" | "array_declarator") {
+                continue;
+            }
+            let Some(value) = child.child_by_field_name("value") else { continue };
+            if !matches!(value.kind(), "argument_list" | "initializer_list") {
+                continue;
+            }
+            instantiates = true;
+            if declarator.kind() == "identifier" {
+                let count = (0..value.named_child_count())
+                    .filter(|&j| value.named_child(j).map(|n| n.kind() != "comment").unwrap_or(false))
+                    .count();
+                arities.push(count);
             }
         }
-        false
+        (instantiates, arities)
     }
 
     /// recordCppFnPtrBinding (tree-sitter.ts:5089).
@@ -1570,6 +1624,11 @@ impl<'t> Walker<'t> {
     fn visit_for_calls_and_structure(&mut self, node: Node<'t>) {
         stack_guard!();
         let kind = node.kind();
+        // A function-like macro defined inside a body is still a macro (#1838).
+        if kind == "preproc_function_def" {
+            self.visit_node(node);
+            return;
+        }
         self.maybe_capture_fn_refs(node);
 
         if kind == "call_expression" {
@@ -1578,12 +1637,25 @@ impl<'t> Walker<'t> {
             self.extract_instantiation(node);
         }
 
-        // C++ stack construction `Calculator calc(0)` / `Widget w{1,2}` (#1035).
-        if kind == "declaration"
-            && self.variant == Variant::Cpp
-            && self.is_cpp_stack_construction(node)
-        {
-            self.extract_instantiation(node);
+        // C++ stack construction `Calculator calc(0)` / `Widget w{1,2}` (#1035),
+        // plus one constructor ref `ns::T::T/arity` per constructed object (#1839).
+        if kind == "declaration" && self.variant == Variant::Cpp {
+            let (instantiates, arities) = self.cpp_stack_constructions(node);
+            if instantiates {
+                self.extract_instantiation(node);
+            }
+            if !arities.is_empty() && !self.stack.is_empty() {
+                if let Some(type_node) = node.child_by_field_name("type") {
+                    let from = self.top_row();
+                    let class_name = strip_cpp_template_args(self.text(type_node));
+                    if let Some(name) = class_name.split("::").filter(|s| !s.is_empty()).last() {
+                        let calls = edge_kind_index("calls").unwrap();
+                        for arity in arities {
+                            self.push_ref_at(from, &format!("{class_name}::{name}/{arity}"), calls, node);
+                        }
+                    }
+                }
+            }
         }
 
         // C++ local fn-pointer bindings: declarations and branch reassignments.

@@ -6,7 +6,7 @@
 
 import * as path from 'path';
 import { Language, Node } from '../types';
-import { UnresolvedRef, ResolvedRef, ResolutionContext, SUPERTYPE_TARGET_KINDS, isInheritanceRef, isImportableKind } from './types';
+import { UnresolvedRef, ResolvedRef, ResolutionContext, SUPERTYPE_TARGET_KINDS, CPP_DEFINE_SIGNATURE, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_BUILT_INS, TS_PRIMITIVE_TYPES } from './js-builtins';
 
@@ -190,6 +190,13 @@ export function crossesKnownFamily(a: string, b: string): boolean {
  *    both-known filter so `.vue`/`.svelte` (own tag) importing `.ts` survives.
  */
 function applyLanguageGate(candidates: Node[], ref: UnresolvedRef): Node[] {
+  if (ref.referenceKind === 'calls' && (ref.language === 'c' || ref.language === 'cpp')) {
+    // A function-like macro is never a callee (#1838) — and it must not count
+    // toward the same-name ceiling either: CMSIS ships one `__DSB()` macro
+    // per compiler header beside the GCC inline function, and those copies
+    // pushed the real function past the ceiling.
+    return candidates.filter((c) => !(c.kind === 'constant' && CPP_DEFINE_SIGNATURE.test(c.signature ?? '')));
+  }
   if (ref.referenceKind === 'references' || ref.referenceKind === 'function_ref') {
     return candidates.filter((c) => sameLanguageFamily(c.language, ref.language));
   }

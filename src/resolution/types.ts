@@ -350,3 +350,12 @@ const NON_IMPORTABLE_KINDS = new Set<Node['kind']>([
 export function isImportableKind(kind: Node['kind']): boolean {
   return !NON_IMPORTABLE_KINDS.has(kind);
 }
+
+/**
+ * The signature extraction gives a C/C++ `constant` minted from a
+ * function-like `preproc_function_def` (`#define NAME(args) …`, #1838). A
+ * macro is a value: it is never a `calls` target, and its presence in a
+ * translation unit is what makes `NAME(x)` a macro expansion rather than a
+ * call.
+ */
+export const CPP_DEFINE_SIGNATURE = /^\s*#\s*define\b/;

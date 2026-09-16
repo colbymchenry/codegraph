@@ -1728,6 +1728,18 @@ export const cppExtractor: LanguageExtractor = {
   resolveName: extractCppQualifiedMethodName,
   getReceiverType: extractCppReceiverType,
   getReturnType: extractCppReturnType,
+  // Constructors (a `function_definition` with no return type) carry their
+  // parameter list as the signature, so a local `T obj(args)` can be matched
+  // to the one overload with a compatible arity (#1839). Macro-shaped
+  // definitions whose real name was recovered from an argument are excluded:
+  // their "parameters" are macro arguments. Mirrored in the kernel.
+  getSignature: (node, source) => {
+    if (node.type !== 'function_definition' || getChildByField(node, 'type')) return undefined;
+    if (recoverCppMacroDefinedName(node, source)) return undefined;
+    const declarator = getChildByField(node, 'declarator');
+    const parameters = declarator && getChildByField(declarator, 'parameters');
+    return parameters ? getNodeText(parameters, source) : undefined;
+  },
   getVisibility: (node) => {
     // Check for access specifier in parent
     const parent = node.parent;
