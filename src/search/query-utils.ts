@@ -285,6 +285,18 @@ export function scorePathRelevance(
 }
 
 /**
+ * Does the query itself ask about tests?
+ *
+ * The waiver behind every test-filtering rule in explore: a filter that helps
+ * "how does auth work" is exactly wrong for "which tests cover login". Shared
+ * so the source-file filter and the relationship filter cannot drift into
+ * disagreeing about what a test-y query is.
+ */
+export function queryIsAboutTests(query: string): boolean {
+  return /\b(test|tests|testing|spec|verify|verifies)\b/i.test(query);
+}
+
+/**
  * Check if a file path looks like a test file
  *
  * "Test" here is the wide reading: anything that is not production code,

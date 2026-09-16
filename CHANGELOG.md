@@ -162,6 +162,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- `codegraph_explore` no longer answers "who calls this?" with a list of test names. On a well-covered symbol the relationship list was almost entirely its own test suite, so the production caller you were asking about was cut off under "... and 100 more". Tests are now left out of that list — unless your question is itself about tests, you named a test file by path, or the tests are the only callers there are — and `codegraph explore --tests` / `--no-tests` (or `includeTests` from an agent) asks for them either way. Examples, samples and benchmarks are not affected; only test suites are. The blast radius still names the test files that cover a symbol, as before.
+
 - Daemon startup and cleanup now preserve live legacy PID-only locks while still reclaiming dead or identity-disproved records, preventing two writers from serving the same project.
 - Incremental sync now keeps edge rebinding crash-safe: replacing a resolved edge with its recovery reference commits atomically, so an interruption cannot permanently remove the relationship.
 - Status now detects committed but unindexed changes and restored edits without scanning every source file; thanks @inth3shadows. (#1829)

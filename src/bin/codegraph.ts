@@ -1292,7 +1292,9 @@ program
   .description('Explore an area: relevant symbols\' source + call paths in one shot (same output as the codegraph_explore MCP tool)')
   .option('-p, --path <path>', 'Project path')
   .option('--max-files <number>', 'Maximum number of files to include source from')
-  .action(async (queryParts: string[], options: { path?: string; maxFiles?: string }) => {
+  .option('--tests', 'Include test/spec symbols in Relationships (default: only when the query is about tests)')
+  .option('--no-tests', 'Exclude test/spec symbols from Relationships')
+  .action(async (queryParts: string[], options: { path?: string; maxFiles?: string; tests?: boolean }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
@@ -1308,6 +1310,10 @@ program
 
       const args: Record<string, unknown> = { query: queryParts.join(' ') };
       if (options.maxFiles) args.maxFiles = parseInt(options.maxFiles, 10);
+      // Left undefined unless a flag was actually passed — that is the auto case,
+      // and commander leaves `tests` undefined when both --tests and --no-tests
+      // are declared and neither is given.
+      if (typeof options.tests === 'boolean') args.includeTests = options.tests;
       const result = await handler.execute('codegraph_explore', args);
 
       console.log(result.content[0]?.text ?? '');
