@@ -365,6 +365,13 @@ function warn(message: string): void {
   console.log(chalk.yellow(getGlyphs().warn) + ' ' + message);
 }
 
+/** "not found" (+ optional did-you-mean) when no exact symbol matches. */
+function formatSymbolNotFound(symbol: string, fuzzyNames: string[]): string {
+  const suggestions = [...new Set(fuzzyNames.filter((n) => n !== symbol))].slice(0, 3);
+  if (suggestions.length === 0) return `Symbol "${symbol}" not found`;
+  return `Symbol "${symbol}" not found — did you mean: ${suggestions.join(', ')}?`;
+}
+
 /** Compact node shape retained by the CLI's existing JSON lists. */
 function cliNode(node: Node) {
   return { name: node.name, kind: node.kind, filePath: node.filePath, startLine: node.startLine };
@@ -2212,7 +2219,7 @@ for (const direction of ['callers', 'callees'] as const) {
           const limit = parseInt(options.limit || '20', 10);
           const { nodes: targets } = lookupSymbolNodes(cg, symbol);
           if (targets.length === 0) {
-            info(`Symbol "${symbol}" not found`);
+            info(formatSymbolNotFound(symbol, cg.searchNodes(symbol, { limit: 5 }).map((m) => m.node.name)));
             return;
           }
 
@@ -2330,7 +2337,7 @@ program
         const depth = Math.min(Math.max(parseInt(options.depth || '2', 10), 1), 10);
         const { nodes: targets } = lookupSymbolNodes(cg, symbol);
         if (targets.length === 0) {
-          info(`Symbol "${symbol}" not found`);
+          info(formatSymbolNotFound(symbol, cg.searchNodes(symbol, { limit: 5 }).map((m) => m.node.name)));
           return;
         }
 

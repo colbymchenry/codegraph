@@ -2679,8 +2679,10 @@ describe('Installer targets — Claude CLAUDE_CONFIG_DIR override (#1627)', () =
   let homeRestore: { restore: () => void };
 
   beforeEach(() => {
-    tmpHome = mkTmpDir('home');
-    tmpCwd = mkTmpDir('cwd');
+    // chdir resolves symlinks (macOS /var -> /private/var). Build the
+    // expected paths from the same canonical roots without relaxing equality.
+    tmpHome = fs.realpathSync(mkTmpDir('home'));
+    tmpCwd = fs.realpathSync(mkTmpDir('cwd'));
     origCwd = process.cwd();
     process.chdir(tmpCwd);
     homeRestore = setHome(tmpHome);

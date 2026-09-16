@@ -157,6 +157,26 @@ describe.skipIf(!HAS_SQLITE)('matchesSymbol — module-qualified lookups (#173)'
     expect(matches.length).toBe(0);
   });
 
+  it('findAllSymbols rejects a fuzzy-only bare prefix with a suggestion (#1473)', () => {
+    expect(cg.getNodesByName('run_due')).toEqual([]);
+    expect(cg.searchNodes('run_due').length).toBeGreaterThan(0);
+    const all = findAllSymbols(cg, 'run_due');
+    expect(all.nodes).toEqual([]);
+    expect(all.note).toMatch(/Did you mean:.*run_due_tasks/);
+  });
+
+  it('findAllSymbols rejects an unknown qualifier even when the bare tail exists (#173)', () => {
+    expect(cg.getNodesByName('run').length).toBeGreaterThan(0);
+    expect(findAllSymbols(cg, 'missing::run').nodes).toEqual([]);
+  });
+
+  it('preserves codegraph_node file-basename lookup (#1473)', () => {
+    expect(cg.getNodesByName('stage_apply')).toEqual([]);
+    const matches = findSymbolMatches(cg, 'stage_apply');
+    expect(matches.length).toBeGreaterThan(0);
+    expect(matches[0]!.filePath).toMatch(/configurator\/stage_apply\.rs$/);
+  });
+
   it('codegraph_node with a `file` hint pins an overloaded name to that file', async () => {
     // `run` is defined in BOTH stage_apply.rs and stage_detect.rs. A bare lookup
     // returns both; the `file` hint narrows to the one the caller saw in a trail.
@@ -390,5 +410,16 @@ describe.skipIf(!HAS_SQLITE)('lookupSymbolNodes — the shared path used by call
   it('an unknown qualified name resolves to nothing rather than a fuzzy hit', () => {
     const { nodes } = lookupSymbolNodes(cg, 'chart.nonexistent_fn');
     expect(nodes.length).toBe(0);
+  });
+
+  it.each(['grou', 'Group'])('rejects fuzzy-only bare name "%s" (#1473)', (symbol) => {
+    expect(cg.getNodesByName(symbol)).toEqual([]);
+    expect(cg.searchNodes(symbol).length).toBeGreaterThan(0);
+    expect(lookupSymbolNodes(cg, symbol)).toEqual({ nodes: [], ambiguous: false });
+  });
+
+  it('rejects an unknown qualifier even when the bare tail exists (#173)', () => {
+    expect(cg.getNodesByName('group').length).toBeGreaterThan(0);
+    expect(lookupSymbolNodes(cg, 'missing.group')).toEqual({ nodes: [], ambiguous: false });
   });
 });

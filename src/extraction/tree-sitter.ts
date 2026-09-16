@@ -1091,7 +1091,8 @@ export class TreeSitterExtractor {
     // SIGNATURE_METHOD_NODE_TYPES for what falling through would otherwise mint.
     else if (
       this.extractor.methodTypes.includes(nodeType)
-      && (!SIGNATURE_METHOD_NODE_TYPES.has(nodeType) || this.isInsideClassLikeNode())
+      && (!(TS_JS_CHAIN_LANGUAGES.has(this.language) || this.language === 'arkts')
+        || !SIGNATURE_METHOD_NODE_TYPES.has(nodeType) || this.isInsideClassLikeNode())
     ) {
       // TS/JS class fields parse as a methodTypes node; only function-valued
       // fields are methods — a plain field (`public fonts: Fonts;`) is a
@@ -4708,6 +4709,17 @@ export class TreeSitterExtractor {
               } else {
                 calleeName = methodName;
               }
+            } else if (this.language === 'rust' && receiver && receiver.type === 'self') {
+              // Rust `self.method()`. Keep the `self.` prefix, exactly as the
+              // field shape below does (#1585): the resolver reads the owner
+              // off the CALLING method's qualified name and resolves the
+              // method on that type. Collapsing to the bare method name handed
+              // the resolver a name with no owner, which it then matched among
+              // all same-named methods by file proximity — so `self.reset()`
+              // inside `impl Target` landed on a `Decoy::reset` that happened
+              // to sit nearer, with nothing in the edge to show it was a guess
+              // (#1861). Mirrored in the kernel's extract_call (rustlang.rs).
+              calleeName = `self.${methodName}`;
             } else if (
               this.language === 'rust' &&
               receiver &&
@@ -4870,14 +4882,12 @@ export class TreeSitterExtractor {
               TS_JS_CHAIN_RECEIVER_TYPES.has(receiver.type) &&
               isUnresolvedTsJsChain(receiver, this.source)
             ) {
-              // `holder.values.get()` has no inferred property type (#1566).
-              // Emitting bare `get` exact-matches an unrelated project method;
-              // preserving the chain alone would still allow receiver guessing.
-              // Emit nothing until the property type can be established. This
-              // also covers host chains such as `chrome.storage.local.get()`
-              // (#1707). Calls inside arguments are visited independently.
-              // Mirrored in the kernel's extract_call (tsjs/extractors.rs).
-              return;
+              // Keep the source call for effect reporting, but never collapse
+              // it to a guessed method. The resolver only lets frameworks
+              // with receiver evidence handle these qualified chains.
+              const chain = getNodeText(func, this.source).replace(/\s+/g, '').replace(/\?\./g, '.');
+              if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*){2,}$/.test(chain)) return;
+              calleeName = chain;
             } else {
               calleeName = methodName;
             }

@@ -37,7 +37,7 @@ beforeAll(async () => {
       '}\n'
   );
   // Plain JS: the field's type is only known from its `new` initializer.
-  // (resolveMethodOnType matches within one language, so the JS wrapper gets a JS Mailer.)
+  // Its sibling-extension cases are covered by release-main-regressions.test.ts.
   w('legacy-mailer.js', 'class LegacyMailer {\n  send(msg) { return msg; }\n}\nmodule.exports = { LegacyMailer };\n');
   w(
     'legacy.js',
