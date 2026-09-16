@@ -172,7 +172,15 @@ const DEFAULT_FIND_OPTIONS: Required<FindRelevantContextOptions> = {
   edgeKinds: [],
   nodeKinds: HIGH_VALUE_NODE_KINDS, // Filter out imports/exports by default
   seedNames: [],         // Segment-vocab supplement — filled by the facade
+  seedNodeIds: [],       // Literal-table seeds — filled by the facade
 };
+
+/**
+ * Score for a literal seed. Above the BM25 magnitudes the FTS channel returns
+ * (tens to hundreds) and every additive boost below, so a symbol holding the
+ * quoted literal leads the ranking whatever else the query matched.
+ */
+const LITERAL_SEED_SCORE = 1000;
 
 // Re-export the low-confidence sentinel (defined in a dependency-free leaf so
 // the MCP layer can import it without pulling this module's deps onto the
@@ -483,7 +491,16 @@ export class ContextBuilder {
 
     // Step 2: Look up exact matches for extracted symbols
     let exactMatches: SearchResult[] = [];
-    if (symbolsFromQuery.length > 0 || opts.seedNames.length > 0) {
+    // Explicit seed lookups already bound their results. Retain those results
+    // through ranking: a later reader/writer must not disappear at a size trim.
+    const retainedSeedIds = new Set(opts.seedNodeIds);
+    const keepSeedsThenTop = (results: SearchResult[], n: number): SearchResult[] => {
+      if (retainedSeedIds.size === 0) return results.slice(0, n);
+      const seeds = results.filter((r) => retainedSeedIds.has(r.node.id));
+      const rest = results.filter((r) => !retainedSeedIds.has(r.node.id)).slice(0, n);
+      return [...seeds, ...rest];
+    };
+    if (symbolsFromQuery.length > 0 || opts.seedNames.length > 0 || opts.seedNodeIds.length > 0) {
       try {
         if (symbolsFromQuery.length > 0) {
           // Get more results so we can apply co-location boosting before trimming
@@ -491,6 +508,20 @@ export class ContextBuilder {
             limit: Math.ceil(opts.searchLimit * 5),
             kinds: opts.nodeKinds && opts.nodeKinds.length > 0 ? opts.nodeKinds : undefined,
           });
+        }
+
+        // Literal seeds: the query quoted a string that lives in these
+        // symbols' bodies. No name matches it, so they enter here, first and
+        // at a fixed top score; the co-location pass below still compounds
+        // several hits in one file.
+        if (opts.seedNodeIds.length > 0) {
+          const byId = this.queries.getNodesByIds(opts.seedNodeIds);
+          for (const id of opts.seedNodeIds) {
+            const node = byId.get(id);
+            if (!node || exactMatches.some((r) => r.node.id === id)) continue;
+            exactMatches.push({ node, score: LITERAL_SEED_SCORE });
+          }
+          logDebug('Literal seed matches', { seedNodeIds: opts.seedNodeIds, added: byId.size });
         }
 
         // Step 2a: segment-vocabulary seeds. Word-level query terms cannot
@@ -502,12 +533,18 @@ export class ContextBuilder {
         // in one file (pinFeedIfNearBottom + feedAtBottom + handleFeedScroll)
         // is exactly the evidence that file is the answer.
         if (opts.seedNames.length > 0) {
+          const compoundQuery = symbolsFromQuery.some(s => /[a-z][A-Z]|_/.test(s));
+          const namedCallable = exactMatches.some(r => ['function', 'method', 'component', 'class'].includes(r.node.kind)
+            && symbolsFromQuery.some(s => isDistinctiveIdentifier(s) && s.toLowerCase() === r.node.name.toLowerCase()));
           const seedResults = this.queries.findNodesByExactName(opts.seedNames, {
             limit: Math.ceil(opts.searchLimit * 3),
             kinds: opts.nodeKinds && opts.nodeKinds.length > 0 ? opts.nodeKinds : undefined,
           });
           const known = new Set(exactMatches.map((r) => r.node.id));
           for (const r of seedResults) {
+            // A concept-only query needs these bounded matches to survive;
+            // explicit callable queries retain their existing focused ranking.
+            if (compoundQuery && !namedCallable) retainedSeedIds.add(r.node.id);
             if (known.has(r.node.id)) continue;
             known.add(r.node.id);
             exactMatches.push({ ...r, score: r.score * 0.6 });
@@ -538,7 +575,7 @@ export class ContextBuilder {
         }
 
         // Trim back to reasonable size
-        exactMatches = exactMatches.slice(0, Math.ceil(opts.searchLimit * 2));
+        exactMatches = keepSeedsThenTop(exactMatches, Math.ceil(opts.searchLimit * 2));
         logDebug('Exact symbol matches', { count: exactMatches.length });
       } catch (error) {
         logDebug('Exact symbol lookup failed', { error: String(error) });
@@ -587,7 +624,7 @@ export class ContextBuilder {
         }
       }
       exactMatches.sort((a, b) => b.score - a.score);
-      exactMatches = exactMatches.slice(0, Math.ceil(opts.searchLimit * 3));
+      exactMatches = keepSeedsThenTop(exactMatches, Math.ceil(opts.searchLimit * 3));
     }
 
     // Step 3: Run text search for natural language term matching
@@ -977,7 +1014,7 @@ export class ContextBuilder {
     // compound) have now contributed. Sort by score so multi-term matches from
     // later steps can outrank dampened single-term matches from earlier steps.
     searchResults.sort((a, b) => b.score - a.score);
-    searchResults = searchResults.slice(0, opts.searchLimit * 3);
+    searchResults = keepSeedsThenTop(searchResults, opts.searchLimit * 3);
 
     // Filter by minimum score
     let filteredResults = searchResults.filter((r) => r.score >= opts.minScore);
@@ -991,7 +1028,7 @@ export class ContextBuilder {
     // With 36 entry points and maxNodes=120, each gets only 3 nodes — useless.
     // Cap to searchLimit so each entry point gets a meaningful traversal budget.
     if (filteredResults.length > opts.searchLimit) {
-      filteredResults = filteredResults.slice(0, opts.searchLimit);
+      filteredResults = keepSeedsThenTop(filteredResults, opts.searchLimit);
     }
 
     // Confidence signal for the honest-handoff footer (consumed in buildContext).

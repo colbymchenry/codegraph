@@ -19,6 +19,29 @@ const cand = (
 const budget = getExploreOutputBudget(1000);
 
 describe('allocateExploreBudget — pinned files', () => {
+  it('funds a named body and its supporting source without overspending the pool', () => {
+    const { allowances, pool } = allocateExploreBudget([
+      cand('pipeline.ts', 100, { pinned: true, minChars: 6500 }),
+      ...Array.from({ length: 5 }, (_, i) => cand(`caller${i}.ts`, 100)),
+    ], budget, 8);
+    expect(allowances.get('pipeline.ts')!).toBeGreaterThanOrEqual(6500);
+    expect([...allowances.values()].reduce((sum, n) => sum + n, 0)).toBeLessThanOrEqual(pool);
+    for (const [file, bytes] of allowances) {
+      if (file !== 'pipeline.ts') expect(bytes).toBeGreaterThanOrEqual(EXPLORE_ALLOCATION.MIN_CHARS);
+    }
+  });
+
+  it('shares unaffordable source minimums and ignores nonfinite demands', () => {
+    const { allowances, pool } = allocateExploreBudget([
+      cand('a.ts', 100, { minChars: 100000 }),
+      cand('b.ts', 100, { minChars: 100000 }),
+      cand('c.ts', 100, { minChars: NaN }),
+    ], budget, 8);
+    expect(allowances.get('a.ts')).toBe(allowances.get('b.ts'));
+    expect(allowances.get('c.ts')!).toBeGreaterThanOrEqual(EXPLORE_ALLOCATION.MIN_CHARS);
+    expect([...allowances.values()].reduce((sum, n) => sum + n, 0)).toBeLessThanOrEqual(pool);
+  });
+
   it('never cliffs a pinned file, however low it scores', () => {
     const { allowances, cliffed } = allocateExploreBudget(
       [
