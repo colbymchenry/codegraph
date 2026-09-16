@@ -47,13 +47,13 @@ export default defineConfig({
      * parses have warmed a grammar function up, its background tier-up job
      * exhausts a compiler Zone and aborts the worker — `Fatal process out of
      * memory: Zone`, surfaced by vitest only as "Worker exited unexpectedly"
-     * with the rest of the file's tests silently unrun (#1779; the product-side
-     * story is in wasm-runtime-flags.ts, #293/#298). On Node 24 with a
-     * 660-test extraction suite this reproduced on every run at the same test.
-     * V8 flags are process-global, so the parse worker threads a test spawns
-     * are covered too.
+     * with the rest of the file's tests silently unrun (#1779, #1883; the
+     * product-side story is in wasm-runtime-flags.ts, #293/#298). V8 flags are
+     * process-global, so the parse worker threads a test spawns are covered
+     * too. Vitest 4 reads `test.execArgv`; the 2.x `poolOptions.forks.execArgv`
+     * is silently ignored here. The engine project inherits it via `extends`.
      */
-    poolOptions: { forks: { execArgv: [...WASM_RUNTIME_FLAGS] } },
+    execArgv: [...WASM_RUNTIME_FLAGS],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'html'],
