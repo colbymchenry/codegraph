@@ -1,5 +1,6 @@
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { defineConfig } from 'vitest/config';
+import { WASM_RUNTIME_FLAGS } from './src/extraction/wasm-runtime-flags';
 
 /**
  * One process, two Vitest projects. The engine stays in Node; the UI package
@@ -33,6 +34,21 @@ export default defineConfig({
        */
       CODEGRAPH_TELEMETRY: '0',
     },
+    /**
+     * The same V8 flags every real launch path passes (the bundled launcher,
+     * the CLI's self re-exec, refresh-launcher): keep tree-sitter grammar
+     * compilation on the Liftoff baseline tier. Without them a pool worker
+     * runs the grammars on the turboshaft optimizing tier, and once enough
+     * parses have warmed a grammar function up, its background tier-up job
+     * exhausts a compiler Zone and aborts the worker — `Fatal process out of
+     * memory: Zone`, surfaced by vitest only as "Worker exited unexpectedly"
+     * with the rest of the file's tests silently unrun (#1779, #1883; the
+     * product-side story is in wasm-runtime-flags.ts, #293/#298). V8 flags are
+     * process-global, so the parse worker threads a test spawns are covered
+     * too. Vitest 4 reads `test.execArgv`; the 2.x `poolOptions.forks.execArgv`
+     * is silently ignored here. The engine project inherits it via `extends`.
+     */
+    execArgv: [...WASM_RUNTIME_FLAGS],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'html'],
