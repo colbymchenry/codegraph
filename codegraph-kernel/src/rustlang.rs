@@ -894,9 +894,17 @@ impl<'t> Walker<'t> {
                                     _ => callee_name = method_name.to_string(),
                                 }
                             }
+                            // `self.method()` — keep the `self.` prefix so the
+                            // resolver can read the owner off the calling
+                            // method's qualified name and resolve the method on
+                            // THAT type, instead of matching a bare name by file
+                            // proximity (#1861). Mirrors the wasm extractor.
+                            "self" => {
+                                callee_name = format!("self.{method_name}");
+                            }
                             _ => {
-                                // parenthesized, await_expression, `self` —
-                                // bare method name.
+                                // parenthesized, await_expression — bare method
+                                // name.
                                 callee_name = method_name.to_string();
                             }
                         }
