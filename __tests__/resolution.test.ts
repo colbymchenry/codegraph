@@ -1258,6 +1258,78 @@ impl<T> Source for BufSource<T> {
       expect(callsFrom('Countdown::run').map((c) => c.target)).toEqual(['Countdown::run']);
     });
 
+    // ── Rust `self.<method>()` receivers (#1861) ──────────────────────────
+    it('resolves `self.method()` on the enclosing type, not on whichever same-named method sits nearer (#1861)', async () => {
+      // The issue's repro, one file: `Decoy::reset` sits between the call and
+      // the method it means, so a bare name ranked by file proximity picked
+      // the decoy — and the edge carried no provenance to say it was a guess.
+      writeRustCrate(tempDir, {
+        'lib.rs':
+          'pub struct Target { pub n: i32 }\n\nimpl Target {\n    pub fn reset(&mut self) { self.n = -1; }\n}\n\n' +
+          'pub struct Decoy { pub n: i32 }\n\nimpl Decoy {\n    pub fn reset(&mut self) { self.n = 0; }\n}\n\n' +
+          'impl Target {\n    pub fn run(&mut self) { self.reset(); }\n}\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(callsFrom('Target::run')).toEqual([
+        { target: 'Target::reset', resolvedBy: 'qualified-name', provenance: undefined },
+      ]);
+    });
+
+    it('decides the same way across directories, where proximity decided before (#1861)', async () => {
+      // Same code, only the layout changes. If the answer moved with the file
+      // tree, proximity was still deciding it.
+      writeRustCrate(tempDir, {
+        'lib.rs': 'pub mod near;\npub mod far;\n',
+        'near.rs': 'pub struct Decoy { pub n: i32 }\nimpl Decoy {\n    pub fn reset(&mut self) { self.n = 0; }\n}\n',
+        'far.rs':
+          'pub struct Target { pub n: i32 }\nimpl Target {\n    pub fn reset(&mut self) { self.n = -1; }\n}\n' +
+          'impl Target {\n    pub fn run(&mut self) { self.reset(); }\n}\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(callsFrom('Target::run').map((c) => c.target)).toEqual(['Target::reset']);
+    });
+
+    it('declines when the enclosing type has no such method, and does not change a receiver-less call (#1861)', async () => {
+      // The two ways this could overreach. `self.missing()` names nothing on
+      // the owner, so it must not fall back to some other type's `missing`.
+      //
+      // The receiver-less half is pinned as it BEHAVES, not as it should: a
+      // bare `reset()` is a free-function call, and it already resolved to
+      // `Target::reset` before this change — the mirror image of #1861, where
+      // a call with no receiver is given one. That is a separate defect in the
+      // bare-name strategy, measured on this branch's parent; the cell is here
+      // so this change is pinned to not make it worse.
+      writeRustCrate(tempDir, {
+        'lib.rs':
+          'pub fn reset() {}\n\n' +
+          'pub struct Other { pub n: i32 }\nimpl Other {\n    pub fn missing(&mut self) {}\n}\n\n' +
+          'pub struct Target { pub n: i32 }\nimpl Target {\n    pub fn reset(&mut self) { self.n = -1; }\n' +
+          '    pub fn free(&mut self) { reset(); }\n' +
+          '    pub fn absent(&mut self) { self.missing(); }\n}\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      // Unchanged by this commit — see the note above.
+      expect(callsFrom('Target::free').map((c) => c.target)).toEqual(['Target::reset']);
+      // Nothing on the owner is named `missing`, so no edge at all.
+      expect(callsFrom('Target::absent')).toEqual([]);
+    });
+
+    it('resolves `self.method()` inside a trait impl to that impl (#1861)', async () => {
+      writeRustCrate(tempDir, {
+        'lib.rs':
+          'pub trait Run {\n    fn go(&mut self);\n}\n\n' +
+          'pub struct Decoy { pub n: i32 }\nimpl Decoy {\n    pub fn step(&mut self) { self.n = 0; }\n}\n\n' +
+          'pub struct Doer { pub n: i32 }\nimpl Doer {\n    pub fn step(&mut self) { self.n = 1; }\n}\n' +
+          'impl Run for Doer {\n    fn go(&mut self) { self.step(); }\n}\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(callsFrom('Doer::go').map((c) => c.target)).toEqual(['Doer::step']);
+    });
+
     it('resolves a trait-object field to the trait method and typed fields to the right implementation (#1585, #1588)', async () => {
       // The #1588 repro's second half: `UsesFile::go` / `UsesBuf::go` each
       // forward through a typed field, and a `Box<dyn Source>` field lands on
@@ -2356,6 +2428,59 @@ export function useProjectCache() {
           expect.soft(calls, `${ext}: ${name} must not call a project method`).toEqual([]);
         }
       }
+    });
+
+    it('keeps a built-in string method off an unrelated project method (#1840)', async () => {
+      fs.writeFileSync(path.join(tempDir, 'strings.ts'), `
+export async function listPaths(): Promise<string> { return "a\0b"; }
+export async function snapshot(): Promise<string[]> {
+  const listed = await listPaths();
+  return listed.split('\0');
+}
+`);
+      fs.writeFileSync(path.join(tempDir, 'pane.ts'), `
+export class PaneManager {
+  split(): string { return "new pane"; }
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const caller = cg.getNodesByName('snapshot').find((n) => n.kind === 'function');
+      expect(caller).toBeDefined();
+      expect(
+        cg.getCallees(caller!.id)
+          .filter(({ edge }) => edge.kind === 'calls')
+          .map(({ node }) => node.qualifiedName)
+          .sort(),
+      ).toEqual(['listPaths']);
+    });
+
+    it('types an awaited receiver from the callee\'s declared return (#1840)', async () => {
+      fs.writeFileSync(path.join(tempDir, 'engine.ts'), `
+export class Engine {
+  run(): string { return "ran"; }
+}
+export class Decoy {
+  run(): string { return "decoy"; }
+}
+export async function makeEngine(): Promise<Engine> { return new Engine(); }
+export async function drive(): Promise<string> {
+  const handle = await makeEngine();
+  return handle.run();
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const caller = cg.getNodesByName('drive').find((n) => n.kind === 'function');
+      expect(caller).toBeDefined();
+      expect(
+        cg.getCallees(caller!.id)
+          .filter(({ edge }) => edge.kind === 'calls')
+          .map(({ node }) => node.qualifiedName)
+          .sort(),
+      ).toEqual(['Engine::run', 'makeEngine']);
     });
 
     it('keeps a validated project class that shadows Map (#1566)', async () => {

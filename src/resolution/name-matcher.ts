@@ -8,7 +8,7 @@ import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, SUPERTYPE_TARGET_KINDS, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
-import { JS_BUILT_INS } from './js-builtins';
+import { JS_BUILT_INS, TS_PRIMITIVE_TYPES } from './js-builtins';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -1693,6 +1693,19 @@ const PATTERN_MEMO_CAP = 8192;
 type InferScanState = { hi: number; ansIdx: number; ansType: string | null };
 const INFER_SCAN_STATES = new WeakMap<ResolutionContext, Map<string, InferScanState>>();
 
+/** Awaited inference caches are scoped to the resolver's stable-source window.
+ * Negative file eligibility avoids scanning ordinary receiver misses; call-site
+ * keys distinguish shadowed bindings and sibling blocks. Both caches are bounded
+ * and are invalidated with file/import caches on sync. */
+type AwaitedType = { name: string | null; filePath: string };
+type AwaitedFile = {
+  code: string; ready: boolean; offsets: number[]; names: Set<string>;
+  scopes: { start: number; end: number; parent: number }[];
+  declarations: Map<string, { index: number; length: number }[]>;
+};
+const AWAITED_TYPE_MEMO = new WeakMap<ResolutionContext, Map<string, AwaitedType | null>>();
+const AWAITED_FILES = new WeakMap<ResolutionContext, Map<string, AwaitedFile | null>>();
+
 function getInferScanStates(context: ResolutionContext): Map<string, InferScanState> {
   let m = INFER_SCAN_STATES.get(context);
   if (!m) {
@@ -1705,6 +1718,8 @@ function getInferScanStates(context: ResolutionContext): Map<string, InferScanSt
 /** Drop the per-context scan states (see ReferenceResolver.clearCaches). */
 export function clearNameMatcherMemos(context: ResolutionContext): void {
   INFER_SCAN_STATES.delete(context);
+  AWAITED_TYPE_MEMO.delete(context);
+  AWAITED_FILES.delete(context);
   C_STATIC_MEMO.delete(context);
   RUST_TRAIT_IMPL_MEMO.delete(context);
   PRIVATE_OWNER_MEMO.delete(context);
@@ -2056,6 +2071,164 @@ function inferLocalReceiverType(
   return null;
 }
 
+/** Infer only a visible awaited binding and its actual local/imported callee.
+ * The signature already carries the return annotation in both extractors, so
+ * multiline declarations and neighboring declarations cannot donate a type.
+ * `null` means no awaited evidence; a null NAME means an awaited receiver whose
+ * type is unknown, which must not fall back to an unrelated method name. */
+function inferEsmAwaitedCallType(
+  receiverName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): AwaitedType | null {
+  if (!/^[A-Za-z_$][\w$]*$/.test(receiverName)) return null;
+  let files = AWAITED_FILES.get(context);
+  if (!files) { files = new Map(); AWAITED_FILES.set(context, files); }
+  let file = files.get(ref.filePath);
+  if (file === undefined) {
+    const source = context.readFile(ref.filePath) ?? '';
+    file = null;
+    // Raw eligibility is cheap; sanitize and index scopes only when a ref
+    // actually uses one of these names. Comments cannot donate a binding:
+    // the names are checked again after sanitizing on the first real lookup.
+    const names = new Set([...source.matchAll(/\b(?:const|let|var)\s+([\w$]+)\s*=\s*await\s+[\w$]+\s*\(/g)].map(m => m[1]!));
+    if (names.size) file = { code: source, ready: false, names, offsets: [], scopes: [], declarations: new Map() };
+    if (files.size >= 256) files.delete(files.keys().next().value!);
+    files.set(ref.filePath, file);
+  }
+  if (!file?.names.has(receiverName)) return null;
+  if (!file.ready) {
+    const code = blankStringContents(stripCommentsForRegex(file.code, 'typescript'));
+    const names = new Set([...code.matchAll(/\b(?:const|let|var)\s+([\w$]+)\s*=\s*await\s+[\w$]+\s*\(/g)].map(m => m[1]!));
+    const offsets = [0];
+    const scopes = [{ start: -1, end: code.length, parent: -1 }];
+    const stack = [0];
+    for (let i = 0; i < code.length; i++) {
+      if (code[i] === '\n') offsets.push(i + 1);
+      if (code[i] === '{') {
+        scopes.push({ start: i, end: code.length, parent: stack[stack.length - 1]! });
+        stack.push(scopes.length - 1);
+      } else if (code[i] === '}' && stack.length > 1) scopes[stack.pop()!]!.end = i;
+    }
+    const declarations = new Map<string, { index: number; length: number }[]>();
+    for (const m of code.matchAll(/\b(?:const|let|var)\s+([\w$]+)\s*=\s*/g)) {
+      if (!names.has(m[1]!)) continue;
+      const entries = declarations.get(m[1]!) ?? [];
+      entries.push({ index: m.index!, length: m[0].length });
+      declarations.set(m[1]!, entries);
+    }
+    Object.assign(file, { code, ready: true, names, offsets, scopes, declarations });
+    if (!names.has(receiverName)) return null;
+  }
+  let memo = AWAITED_TYPE_MEMO.get(context);
+  if (!memo) { memo = new Map(); AWAITED_TYPE_MEMO.set(context, memo); }
+  const key = `${ref.filePath}|${ref.line}|${ref.column}|${receiverName}`;
+  if (memo.has(key)) return memo.get(key)!;
+  const result = resolveAwaitedCallType(receiverName, file, ref, context);
+  if (memo.size >= PATTERN_MEMO_CAP) memo.delete(memo.keys().next().value!);
+  memo.set(key, result);
+  return result;
+}
+
+function resolveAwaitedCallType(
+  receiverName: string,
+  file: AwaitedFile,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): AwaitedType | null {
+  const unknown: AwaitedType = { name: null, filePath: ref.filePath };
+  const end = (file.offsets[ref.line - 1] ?? file.code.length) + ref.column;
+  const code = file.code.slice(0, end);
+  const escaped = receiverName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Locate scopes in the precomputed brace tree. Rescanning the entire file
+  // for every candidate binding made large test files quadratic in refs.
+  const scopeAt = (offset: number): number => {
+    let lo = 0, hi = file.scopes.length;
+    while (lo + 1 < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (file.scopes[mid]!.start < offset) lo = mid; else hi = mid;
+    }
+    while (lo > 0 && file.scopes[lo]!.end < offset) lo = file.scopes[lo]!.parent;
+    return lo;
+  };
+  const visibleAt = (declaration: number, use: number): boolean => {
+    const ancestor = scopeAt(declaration);
+    for (let scope = scopeAt(use); scope >= 0; scope = file.scopes[scope]!.parent) if (scope === ancestor) return true;
+    return false;
+  };
+  const binding = [...(file.declarations.get(receiverName) ?? [])].reverse()
+    .find(m => m.index < end && visibleAt(m.index, end));
+  if (!binding) return null;
+  const init = code.slice(binding.index + binding.length);
+  if (!/^await\b/.test(init)) return null;
+  // Only a bare call result, not a following member/index/conditional expression.
+  const call = /^await\s+([A-Za-z_$][\w$]*)\s*\(/.exec(init);
+  if (!call) return null;
+  let depth = 1, callEnd = call[0].length;
+  for (; callEnd < init.length && depth; callEnd++) {
+    if (init[callEnd] === '(') depth++;
+    else if (init[callEnd] === ')') depth--;
+  }
+  if (depth) return unknown;
+  const tail = init.slice(callEnd);
+  // A following property/index/call is not the callee's annotated value.
+  if (!/^[ \t]*(?:;|\r?\n(?![ \t]*[.(\[?]))/.test(tail)) return unknown;
+  const rest = tail;
+  if (new RegExp(`\\b(?:const|let|var|function|class)\\s+(?:${escaped}\\b|\\{[^}]*\\b${escaped}\\b)`).test(rest) ||
+      new RegExp(`\\b${escaped}\\s*=(?!=)`).test(rest) || hasParameterBinding(rest, escaped)) return unknown;
+
+  const bindingLine = file.code.slice(0, binding.index!).split('\n').length;
+  const bindingRef = { ...ref, line: bindingLine, column: binding.index! - file.offsets[bindingLine - 1]! };
+  const callee = call[1]!;
+  const calleeEscaped = callee.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (context.getNodesInFile(ref.filePath).some(n =>
+    (n.kind === 'function' || n.kind === 'method') && n.startLine <= bindingLine && n.endLine >= bindingLine &&
+    n.signature && hasParameterBinding(`${n.signature} {`, calleeEscaped))) return unknown;
+
+  const imported = context.getImportMappings(ref.filePath, ref.language).some(m => m.localName === callee);
+  let declaring: Node | undefined;
+  if (imported) {
+    if (importShadowedAt(callee, bindingRef, context)) return unknown;
+    const resolved = context.resolveImport?.({ ...bindingRef, referenceName: callee, referenceKind: 'calls' });
+    declaring = resolved ? context.getNodeById?.(resolved.targetNodeId) ?? undefined : undefined;
+  } else {
+    const local = context.getNodesByName(callee).filter(n => n.kind === 'function' &&
+      n.filePath === ref.filePath && ESM_FAMILY.has(n.language) && isLexicallyReachable(n, bindingRef, context));
+    if (local.length === 1) declaring = local[0];
+  }
+  if (!declaring || declaring.kind !== 'function' || !declaring.signature) return unknown;
+  if (!imported) {
+    const beforeBinding = code.slice(0, binding.index!);
+    const shadows = new RegExp(`\\b(?:const|let|var)\\s+${calleeEscaped}\\b`, 'g');
+    for (const shadow of beforeBinding.matchAll(shadows)) {
+      if (!visibleAt(shadow.index!, binding.index)) continue;
+      // A typed arrow function may itself be the declared local factory.
+      const line = file.code.slice(0, shadow.index!).split('\n').length;
+      if (line !== declaring.startLine || shadow.index! - file.offsets[line - 1]! > declaring.startColumn) return unknown;
+    }
+  }
+  const signature = declaring.signature;
+  const annotation = signature.slice(signature.lastIndexOf(')') + 1).match(/^\s*:\s*([\s\S]+)$/)?.[1]?.trim();
+  if (!annotation) return unknown;
+  // Do not turn unions, arrays, object/function types, or conditional types into
+  // a project class. Await recursively unwraps promises, but this narrow path
+  // accepts a single named Promise<T> layer only.
+  const returned = annotation.match(/^Promise\s*<\s*([\w$]+)\s*>$/)?.[1] ?? annotation;
+  if (!/^[A-Za-z_$][\w$]*$/.test(returned)) return unknown;
+  if (TS_PRIMITIVE_TYPES.has(returned)) return { name: returned, filePath: declaring.filePath };
+
+  const typeRef = { ...bindingRef, fromNodeId: declaring.id, filePath: declaring.filePath,
+    language: declaring.language, line: declaring.startLine, column: declaring.startColumn,
+    referenceName: returned, referenceKind: 'references' as const };
+  const typeImport = context.getImportMappings(declaring.filePath, declaring.language).some(m => m.localName === returned);
+  const resolved = typeImport ? context.resolveImport?.(typeRef) : null;
+  const typeNode = resolved ? context.getNodeById?.(resolved.targetNodeId) :
+    context.getNodesByName(returned).find(n => n.filePath === declaring.filePath &&
+      ESM_FAMILY.has(n.language) && (n.kind === 'class' || n.kind === 'interface'));
+  if (!typeNode || (typeNode.kind !== 'class' && typeNode.kind !== 'interface')) return unknown;
+  return { name: typeNode.name, filePath: typeNode.filePath };
+}
+
 /**
  * Patterns that recover a PHP class property's declared type for a
  * `$this->prop` receiver. Deliberately NOT localReceiverTypePatterns: only
@@ -2223,10 +2396,16 @@ export function matchMethodCall(
   // shared source-based inferrer. resolveMethodOnType validates the method
   // exists on the inferred type, so a mis-inference produces no edge.
   if (inferableReceiver) {
-    const inferredType = nmTimedT('mc-infer', ref, () =>
+    let inferredType = nmTimedT('mc-infer', ref, () =>
       ref.language === 'cpp'
         ? inferCppReceiverType(objectOrClass!, ref, context)
         : inferLocalReceiverType(objectOrClass!, ref, context));
+    const awaited = !inferredType && ESM_FAMILY.has(ref.language)
+      ? inferEsmAwaitedCallType(objectOrClass!, ref, context) : null;
+    if (awaited) {
+      if (!awaited.name || TS_PRIMITIVE_TYPES.has(awaited.name)) return null;
+      inferredType = awaited.name;
+    }
     if (inferredType) {
       // Java/Kotlin: when two classes share the simple name, the file's import
       // pins WHICH one (#314). Other languages disambiguate by call-site file.
@@ -2239,20 +2418,32 @@ export function matchMethodCall(
       const typedMatch = nmTimedT('mc-rmot', ref, () => resolveMethodOnType(
         inferredType,
         methodName!,
-        ref,
+        awaited ? { ...ref, filePath: awaited.filePath } : ref,
         context,
         0.9,
         'instance-method',
         importedFqn,
       ));
       if (typedMatch) {
+        if (awaited) {
+          const target = context.getNodeById?.(typedMatch.targetNodeId);
+          if (!target || (target.qualifiedName.startsWith(`${inferredType}::`) && target.filePath !== awaited.filePath)) return null;
+          return { ...typedMatch, original: ref };
+        }
         return typedMatch;
       }
+      if (awaited) return null;
       // A known JS/TS builtin receiver is external when it has no project
       // method (#1566). Inference already strips generics (`Map<K, V>` →
       // `Map`); do not let Strategy 3 guess an unrelated `get`/`set`/`has`.
       // Keep the validated match above for a project type shadowing a builtin.
-      if (ESM_FAMILY.has(ref.language) && JS_BUILT_INS.has(inferredType)) {
+      // A primitive receiver joins the builtins here: `listed.split()` on a
+      // `string` is the built-in method, and Strategy 3 would otherwise hand
+      // it whichever project class happens to declare a lone `split` (#1840).
+      if (
+        ESM_FAMILY.has(ref.language) &&
+        (JS_BUILT_INS.has(inferredType) || TS_PRIMITIVE_TYPES.has(inferredType))
+      ) {
         return null;
       }
     }
@@ -2283,6 +2474,17 @@ export function matchMethodCall(
   // method name with something nearby.
   if (ref.language === 'rust' && dotMatch && objectOrClass!.startsWith('self.')) {
     return matchRustSelfFieldCall(objectOrClass!.slice('self.'.length), methodName!, ref, context);
+  }
+
+  // Rust call on the enclosing type itself — `self.reset()`, emitted as
+  // `self.reset` (#1861). Same discipline as the field branch above, and
+  // EXCLUSIVE for the same reason: the owner is written on the `impl` line and
+  // carried in the calling method's qualified name, so it is not a guess.
+  // Letting this shape reach the bare-name strategies below is how
+  // `self.reset()` resolved to a same-named method on an unrelated type
+  // whenever that type's method happened to sit nearer the call site.
+  if (ref.language === 'rust' && dotMatch && objectOrClass === 'self') {
+    return matchRustSelfCall(methodName!, ref, context);
   }
 
   // TS/JS call through a field of the enclosing class — `this.mailer.send()`,
@@ -2623,6 +2825,56 @@ export function rustFieldTypeName(raw: string): string | null {
   if (RUST_NON_PROJECT_FIELD_TYPES.has(seg)) return null;
   if (/^[A-Z]$/.test(seg)) return null; // bare single-letter generic parameter
   return seg;
+}
+
+/**
+ * `self.method()` in Rust — the method on the type the call sits inside.
+ *
+ * The owner is the calling method's qualified-name prefix (`Target::run` →
+ * `Target`), which is where the `impl` block's type ends up. A free function
+ * has no `self`, so a caller whose qualified name carries no owner declines.
+ * Exactly one candidate must belong to that owner: a project with two `impl`
+ * blocks for the same type is normal, two same-named methods on it is not, and
+ * guessing between them is the failure this replaces.
+ */
+function matchRustSelfCall(
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  if (!caller?.qualifiedName) return null;
+  const sep = caller.qualifiedName.lastIndexOf('::');
+  if (sep <= 0) return null; // a free fn has no `self`
+  const owner = caller.qualifiedName.slice(0, sep);
+
+  let owned = context
+    .getNodesByQualifiedName(`${owner}::${methodName}`)
+    .filter(
+      (n) =>
+        n.kind === 'method' &&
+        n.language === 'rust' &&
+        n.qualifiedName === `${owner}::${methodName}`,
+    );
+  // Rust's extracted qualified names omit module paths. Two modules can
+  // each declare `Target`; matching just `Target::reset` does not establish
+  // ownership. In that case require a single owner declaration in the
+  // caller's file and a method in that file. Otherwise leave it unresolved.
+  // A unique owner still permits ordinary impl blocks split across files.
+  const owners = context.getNodesByQualifiedName(owner).filter((n) =>
+    n.language === 'rust' && ['struct', 'enum', 'union', 'trait', 'class'].includes(n.kind));
+  if (owners.length > 1) {
+    if (owners.filter((n) => n.filePath === caller.filePath).length !== 1) return null;
+    owned = owned.filter((n) => n.filePath === caller.filePath);
+  }
+  if (owned.length !== 1) return null;
+
+  return {
+    original: ref,
+    targetNodeId: owned[0]!.id,
+    confidence: 0.9,
+    resolvedBy: 'qualified-name',
+  };
 }
 
 /**

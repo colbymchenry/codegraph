@@ -145,6 +145,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
+
+- Turning telemetry off now resets its identity and stops running processes from recording, sending, or restoring unsent data. (#1869)
+
 - Calls between JavaScript, JSX and TypeScript files keep their callers and callback flows.
 - Zustand actions keep their callers when read through typed stores, destructured from store state, or selected by a hook.
 - Steps diagrams retain database operations made through external client chains without inventing internal dependencies.
@@ -152,13 +156,16 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Dart extension-type getters remain searchable when using the WebAssembly parser.
 
 - **A Kotlin `private val` / `private var` no longer captures calls from other files.** Properties were indexed without their visibility modifier, so the file-local rule that already declines a `private fun` read every property as public: an Android app's `token(...)` validator resolved onto another class's `@Volatile private var token`, and JavaScript, Go and Python callers landed on Kotlin test fixtures' private fields. Both the WebAssembly and the native path now record `private` / `internal` / `protected` on properties. Re-index after upgrading. (#1731)
+- Calling a built-in method on an awaited value no longer records a call into an unrelated class that happens to declare a method of the same name, and a variable bound to an awaited call now resolves methods on the type that call returns. Thanks @maxmilian. (#1840)
 - Spring mappings now include every declared path combination and resolve constants declared in the same file, while unresolved paths no longer appear as false root routes. (#1461)
 - `codegraph callers`, `codegraph callees` and `codegraph impact` now resolve qualified names, group results and JSON edges by definition, and accept `--file` to narrow ambiguous names; thanks @ferrine. (#1512, #1656)
 - `codegraph callers`, `codegraph callees` and `codegraph impact` (CLI and MCP) now report missing names with did-you-mean suggestions instead of another symbol's results, and exact matches with no callers stay empty; thanks @uvmplus. (#1473, #1481)
 
 #### MCP / indexing
 
+- Daemon startup and cleanup now preserve live legacy PID-only locks while still reclaiming dead or identity-disproved records, preventing two writers from serving the same project.
 - Incremental sync now keeps edge rebinding crash-safe: replacing a resolved edge with its recovery reference commits atomically, so an interruption cannot permanently remove the relationship.
+- Status now detects committed but unindexed changes and restored edits without scanning every source file; thanks @inth3shadows. (#1829)
 
 - The prompt hook no longer injects unrelated projects when run from your home directory or a broader directory containing a stray workspace manifest. (#1454)
 

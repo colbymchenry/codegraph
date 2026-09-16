@@ -4709,6 +4709,17 @@ export class TreeSitterExtractor {
               } else {
                 calleeName = methodName;
               }
+            } else if (this.language === 'rust' && receiver && receiver.type === 'self') {
+              // Rust `self.method()`. Keep the `self.` prefix, exactly as the
+              // field shape below does (#1585): the resolver reads the owner
+              // off the CALLING method's qualified name and resolves the
+              // method on that type. Collapsing to the bare method name handed
+              // the resolver a name with no owner, which it then matched among
+              // all same-named methods by file proximity — so `self.reset()`
+              // inside `impl Target` landed on a `Decoy::reset` that happened
+              // to sit nearer, with nothing in the edge to show it was a guess
+              // (#1861). Mirrored in the kernel's extract_call (rustlang.rs).
+              calleeName = `self.${methodName}`;
             } else if (
               this.language === 'rust' &&
               receiver &&
