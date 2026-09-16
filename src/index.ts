@@ -517,6 +517,7 @@ export class CodeGraph {
         walValve.start();
       }
       try {
+        const gitState = this.orchestrator.beginGitIndexState(true);
         const before = this.queries.getNodeAndEdgeCount();
         // Mark the index as in-flight BEFORE any writes: a run killed
         // mid-index (OOM, SIGKILL, the #850 liveness watchdog) leaves this
@@ -695,6 +696,11 @@ export class CodeGraph {
           } catch { /* metadata is advisory — never fail an index over it */ }
         }
 
+        if (result.success && result.filesErrored === 0 &&
+          (result.filesDiscovered === undefined || result.filesIndexed + result.filesSkipped >= result.filesDiscovered)) {
+          this.orchestrator.finishGitIndexState(gitState, true);
+        }
+
         // Reconcile the scan's ground truth against what the pipeline
         // accounted for. A shortfall means files were silently dropped
         // (observed in the wild: a run under heavy load came up 37 files
@@ -822,6 +828,9 @@ export class CodeGraph {
         // timer-driven PASSIVE checkpoints ran, and a query-pool reader could
         // pin frames while the WAL grew without a bound.
         const backpressure = walValve ? () => walValve!.backpressure() : undefined;
+        const fullReconcile = !options.paths || options.paths.length === 0;
+        const gitState = this.orchestrator.beginGitIndexState(fullReconcile);
+
         const result = await this.orchestrator.sync(options.onProgress, options.paths, backpressure);
 
         // Fold the store phase's WAL BEFORE the post-store reads below
@@ -1023,10 +1032,11 @@ export class CodeGraph {
         // A killed full index leaves this marker at `indexing`. Sync repairs
         // missing files, pending refs, and (on open) dropped indexes, so a
         // successful recovery must also close the metadata state (#1556).
-        const fullReconcile = !options.paths || options.paths.length === 0;
         if (fullReconcile && this.getIndexState() === 'indexing') {
           try { this.queries.setMetadata('index_state', 'complete'); } catch { /* advisory */ }
         }
+
+        this.orchestrator.finishGitIndexState(gitState, fullReconcile, result.failedFilePaths);
 
         return result;
       } finally {
