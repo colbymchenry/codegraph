@@ -41,7 +41,7 @@ try {
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection } from '../directory';
+import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection } from '../directory';
 import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
@@ -1413,6 +1413,9 @@ program
       let input: { prompt?: string; cwd?: string } = {};
       try { input = JSON.parse(raw); } catch { return; }
       const prompt = String(input.prompt || '');
+      // System-injected task notifications are not user prompts: exit before
+      // any project lookup or explore work (#1832).
+      if (isTaskNotification(prompt)) return;
 
       // Gate telemetry: how often each tier fires vs. no-ops — counter names
       // only, NEVER prompt content (see TELEMETRY.md). This is the data that
