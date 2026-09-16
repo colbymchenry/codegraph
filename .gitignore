@@ -52,6 +52,10 @@ docs/business/
 # CodeGraph data directories (in test projects)
 .codegraph/
 
+# Agent configuration — local only, not for version control
+AGENTS.md
+CLAUDE.md
+
 test_frameworks
 
 # Test language repos for manual testing
