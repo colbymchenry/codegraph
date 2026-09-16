@@ -40,6 +40,7 @@ import * as path from 'path';
 import { CodeGraph } from '../src';
 import { getDaemonSocketPath } from '../src/mcp/daemon-paths';
 import { CodeGraphPackageVersion } from '../src/mcp/version';
+import { EXTRACTION_VERSION } from '../src/extraction/extraction-version';
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
@@ -162,6 +163,17 @@ function countListeningLines(root: string): number {
   return readDaemonLog(root).split('\n').filter((l) => l.includes('[CodeGraph daemon] Listening on')).length;
 }
 
+function stampIndexStale(cg: CodeGraph, version: string): void {
+  const metadata = cg as unknown as {
+    queries: { setMetadata(key: string, value: string): void };
+  };
+  metadata.queries.setMetadata('indexed_with_version', version);
+  metadata.queries.setMetadata(
+    'indexed_with_extraction_version',
+    String(EXTRACTION_VERSION - 1),
+  );
+}
+
 function killTree(...procs: ChildProcessWithoutNullStreams[]): void {
   for (const p of procs) {
     if (!p.killed) { try { p.kill('SIGKILL'); } catch { /* gone */ } }
@@ -237,6 +249,105 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(countListeningLines(realRoot)).toBe(1);
     expect(readLockPid(realRoot)).toBe(daemonPid);
   }, 40000);
+
+  it('warns once per proxied client when the shared project index is stale (#1852)', async () => {
+    fs.writeFileSync(path.join(tempDir, 'alpha.ts'), 'export function alpha() { return 1; }\n');
+    const indexed = await CodeGraph.open(tempDir);
+    await indexed.indexAll();
+    stampIndexStale(indexed, '0.1.0');
+    indexed.close();
+
+    const env = { CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '15000' };
+    const first = spawnServer(tempDir, env);
+    const second = spawnServer(tempDir, env);
+    servers.push(first, second);
+    sendInitialize(first.child, `file://${tempDir}`, 1);
+    sendInitialize(second.child, `file://${tempDir}`, 1);
+    await waitFor(() => findResponse(first.stdout, 1), 10000);
+    await waitFor(() => findResponse(second.stdout, 1), 10000);
+    await waitFor(() => first.stderr.some((line) => line.includes('Attached to shared daemon')), 8000);
+    await waitFor(() => second.stderr.some((line) => line.includes('Attached to shared daemon')), 8000);
+
+    const callSearch = (server: SpawnedServer, id: number) => {
+      sendMessage(server.child, {
+        jsonrpc: '2.0',
+        id,
+        method: 'tools/call',
+        params: { name: 'codegraph_search', arguments: { query: 'alpha' } },
+      });
+    };
+    const responseText = (response: any): string => response.result.content[0].text;
+
+    callSearch(first, 2);
+    const firstInitial = await waitFor(() => findResponse(first.stdout, 2), 10000);
+
+    callSearch(first, 3);
+    callSearch(second, 2);
+    const firstRepeat = await waitFor(() => findResponse(first.stdout, 3), 10000);
+    const secondInitial = await waitFor(() => findResponse(second.stdout, 2), 10000);
+
+    expect(responseText(firstInitial)).toMatch(/index predates the running extraction engine/i);
+    expect(responseText(firstRepeat)).not.toMatch(/index predates/i);
+    expect(responseText(secondInitial)).toMatch(/index predates the running extraction engine/i);
+    expect(countListeningLines(realRoot)).toBe(1);
+  }, 45000);
+
+  it('does not repeat a daemon-delivered warning after proxy failover (#1852)', async () => {
+    fs.writeFileSync(path.join(tempDir, 'alpha.ts'), 'export function alpha() { return 1; }\n');
+    const indexed = await CodeGraph.open(tempDir);
+    await indexed.indexAll();
+    stampIndexStale(indexed, '0.1.0');
+    indexed.close();
+
+    const otherRoot = path.join(tempDir, 'other');
+    fs.mkdirSync(otherRoot);
+    fs.writeFileSync(path.join(otherRoot, 'bravo.ts'), 'export function bravo() { return 2; }\n');
+    const other = await CodeGraph.init(otherRoot, { index: false });
+    await other.indexAll();
+    stampIndexStale(other, '0.2.0');
+    other.close();
+
+    const env = { CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '30000', CODEGRAPH_PPID_POLL_MS: '5000' };
+    const server = spawnServer(tempDir, env);
+    servers.push(server);
+    sendInitialize(server.child, `file://${tempDir}`, 1);
+    await waitFor(() => findResponse(server.stdout, 1), 10000);
+    await waitFor(() => server.stderr.some((line) => line.includes('Attached to shared daemon')), 8000);
+    await waitFor(() => (readLockPid(realRoot) ?? 0) > 0, 8000);
+    const daemonPid = readLockPid(realRoot)!;
+
+    sendMessage(server.child, {
+      jsonrpc: '2.0', id: 2, method: 'tools/call',
+      params: { name: 'codegraph_search', arguments: { query: 'alpha' } },
+    });
+    const throughDaemon = await waitFor(() => findResponse(server.stdout, 2), 10000);
+    expect(throughDaemon.result.content[0].text).toMatch(/index predates/i);
+
+    process.kill(daemonPid, 'SIGTERM');
+    expect(await waitProcessExit(daemonPid, 8000)).toBe(true);
+    await waitFor(
+      () => server.stderr.some((line) => line.includes('serving this session in-process')),
+      8000,
+    );
+
+    sendMessage(server.child, {
+      jsonrpc: '2.0', id: 3, method: 'tools/call',
+      params: { name: 'codegraph_search', arguments: { query: 'alpha' } },
+    });
+    const afterFailover = await waitFor(() => findResponse(server.stdout, 3), 10000);
+    expect(afterFailover.result.content[0].text).not.toMatch(/index predates/i);
+
+    sendMessage(server.child, {
+      jsonrpc: '2.0', id: 4, method: 'tools/call',
+      params: {
+        name: 'codegraph_search',
+        arguments: { query: 'bravo', projectPath: otherRoot },
+      },
+    });
+    const otherProject = await waitFor(() => findResponse(server.stdout, 4), 10000);
+    expect(otherProject.result.content[0].text).toMatch(/index predates/i);
+    expect(otherProject.result.content[0].text).toContain('CodeGraph v0.2.0');
+  }, 45000);
 
   it('concurrent launchers converge on a single daemon (lockfile race — must-fix 1)', async () => {
     const env = { CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '15000' };
