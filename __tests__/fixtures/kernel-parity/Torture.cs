@@ -179,3 +179,25 @@ namespace Torture.Beta
 {
     public class Other { }
 }
+
+// Markdown path references: code -> documentation edges. Every shape the
+// normalizer branches on, so the two arms have to agree about the rejections
+// (URL, escape above the root) as well as the emissions.
+namespace Torture.Markdown
+{
+    public class MarkdownPaths
+    {
+        public const string Guide = "../docs/guide.md#install";
+        public const string Bare = "README.md";
+        public const string Rooted = "/docs/rooted.md";
+        public const string Escapes = "../../../../outside.md";
+        public const string Remote = "https://example.com/remote.md";
+        public const string Queried = "./notes.md?raw=1#top";
+        public const string TwoInOne = "see a.md and also sub/b.mdx";
+
+        public void Load()
+        {
+            LoadDoc("docs/deep/nested.markdown");
+        }
+    }
+}

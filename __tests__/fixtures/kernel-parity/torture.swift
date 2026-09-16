@@ -204,3 +204,18 @@ func fnRefExtras() {
 
 import class Darwin.FILE
 @testable import TortureKit
+
+// Markdown path references: code -> documentation edges. Every shape the
+// normalizer branches on, so the two arms have to agree about the rejections
+// (URL, escape above the root) as well as the emissions.
+let mdGuide = "../docs/guide.md#install"
+let mdBare = "README.md"
+let mdRooted = "/docs/rooted.md"
+let mdEscapes = "../../../../outside.md"
+let mdRemote = "https://example.com/remote.md"
+let mdQueried = "./notes.md?raw=1#top"
+let mdTwoInOne = "see a.md and also sub/b.mdx"
+
+func mdLoad() {
+  loadDoc("docs/deep/nested.markdown")
+}

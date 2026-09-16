@@ -141,6 +141,8 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
 }
 
 impl<'t> Walker<'t> {
+    markdown_refs_impl!();
+
     fn text(&self, node: Node) -> &'t str {
         &self.src[node.byte_range()]
     }
@@ -302,6 +304,8 @@ impl<'t> Walker<'t> {
         if self.hook(node) {
             return;
         }
+        let md_owner = self.top_row();
+        self.markdown_refs_from_string(node, md_owner);
         if node.kind() == "call" {
             self.extract_call(node);
         }

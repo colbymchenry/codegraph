@@ -125,6 +125,10 @@ pub const FUNCTION_REF_CODE: u8 = 200;
 
 /// Ref-row flag bit 0: the ref carries `filePath` = the extracted file.
 pub const REF_FLAG_FILE_PATH: u8 = 1;
+/// The ref carries the file's language, as `addReference` (tree-sitter.ts)
+/// emits it. Ordinary refs must NOT set this: their wasm counterparts have no
+/// `language` field and parity compares the objects whole.
+pub const REF_FLAG_LANGUAGE: u8 = 2;
 
 pub fn node_kind_index(kind: &str) -> Option<u8> {
     NODE_KINDS.iter().position(|k| *k == kind).map(|i| i as u8)
