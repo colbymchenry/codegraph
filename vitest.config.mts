@@ -1,4 +1,5 @@
 import { defineConfig } from 'vitest/config';
+import { WASM_RUNTIME_FLAGS } from './src/extraction/wasm-runtime-flags';
 
 /**
  * The SHARED base. `vitest.workspace.mts` extends it twice — once for the
@@ -34,6 +35,21 @@ export default defineConfig({
        */
       CODEGRAPH_TELEMETRY: '0',
     },
+    /**
+     * The same V8 flags every real launch path passes (the bundled launcher,
+     * the CLI's self re-exec, refresh-launcher): keep tree-sitter grammar
+     * compilation on the Liftoff baseline tier. Without them a pool worker
+     * runs the grammars on the turboshaft optimizing tier, and once enough
+     * parses have warmed a grammar function up, its background tier-up job
+     * exhausts a compiler Zone and aborts the worker — `Fatal process out of
+     * memory: Zone`, surfaced by vitest only as "Worker exited unexpectedly"
+     * with the rest of the file's tests silently unrun (#1779; the product-side
+     * story is in wasm-runtime-flags.ts, #293/#298). On Node 24 with a
+     * 660-test extraction suite this reproduced on every run at the same test.
+     * V8 flags are process-global, so the parse worker threads a test spawns
+     * are covered too.
+     */
+    poolOptions: { forks: { execArgv: [...WASM_RUNTIME_FLAGS] } },
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'html'],
