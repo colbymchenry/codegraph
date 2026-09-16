@@ -3300,7 +3300,7 @@ export class ToolHandler {
     } catch {
       budget = getExploreOutputBudget(Infinity);
     }
-    const maxFiles = clamp((args.maxFiles as number) || budget.defaultMaxFiles, 1, 20);
+    let maxFiles = clamp((args.maxFiles as number) || budget.defaultMaxFiles, 1, 20);
 
     // File paths named in the query become PINNED files: guaranteed admission,
     // top of the rank order, funded first — and their span is REMOVED from the
@@ -3328,6 +3328,19 @@ export class ToolHandler {
       } catch { /* path pinning must never fail an explore call */ }
     }
     const pinnedSet = new Set(pinnedFiles);
+    // A literal quoted in the query names every file holding it, so the
+    // default file cap (sized for ranked padding) rises to the holder count;
+    // the character budget still bounds the answer, and an explicit maxFiles
+    // stands.
+    const literalSeedIds = cg.findLiteralSeedIds(matchQuery);
+    if (!args.maxFiles && literalSeedIds.length > 0) {
+      const holderFiles = new Set<string>();
+      for (const id of literalSeedIds) {
+        const n = cg.getNode(id);
+        if (n) holderFiles.add(n.filePath);
+      }
+      maxFiles = clamp(Math.max(maxFiles, holderFiles.size), 1, 12);
+    }
     const pinnedOrder = new Map(pinnedFiles.map((p, i) => [p, i]));
 
     // Per-file allocation diagnostic (CG-4). `null` unless CODEGRAPH_EXPLORE_DEBUG
@@ -3676,6 +3689,13 @@ export class ToolHandler {
         for (const n of tierPicks) {
           if (!isInterfaceOwnedMethod(n)) tierSeedIds.add(n.id);
         }
+      }
+    }
+    // Exact literal holders deserve the same source priority as named symbols.
+    for (const id of literalSeedIds) {
+      if (subgraph.nodes.has(id)) {
+        namedSeedIds.add(id);
+        tierSeedIds.add(id);
       }
     }
 

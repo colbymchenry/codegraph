@@ -161,6 +161,22 @@ CREATE TABLE IF NOT EXISTS name_segment_vocab (
     PRIMARY KEY (segment, name)
 ) WITHOUT ROWID;
 
+-- Identifier-like string literal → the symbol whose body holds it
+-- (extraction/literal-capture.ts). Lets an explore query that names a storage
+-- key, CLI flag, or event name seed on its readers and writers: nodes_fts
+-- covers names, docstrings and signatures, never string contents. Written on
+-- the node write path; a file's rows are deleted with its nodes and a full
+-- index clears the table. Reads still join nodes, so a stale row is never
+-- surfaced. Empty on migrated databases until the next full index (the
+-- source strings are not recoverable from the graph).
+CREATE TABLE IF NOT EXISTS literals (
+    value TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    PRIMARY KEY (value, node_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_literals_file ON literals(file_path);
+
 -- Edge indexes.
 -- idx_edges_source / idx_edges_target are intentionally omitted —
 -- the (source, kind) and (target, kind) composites below cover the

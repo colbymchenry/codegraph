@@ -18,6 +18,7 @@ import type { ExtractionResult, Language } from '../../types';
 import { EXTRACTORS } from '../languages';
 import { getKernel, kernelSupports } from './loader';
 import { decodeExtractBuffers } from './decode';
+import { captureLiterals } from '../literal-capture';
 import {
   KERNEL_ABI_VERSION as LAYOUT_ABI,
   META as LAYOUT_META,
@@ -233,7 +234,7 @@ export function tryKernelExtractRaw(
         buffers.arena.toString('utf8', errorsOff, errorsOff + errorsLen)
       ) as ExtractionResult['errors'];
     }
-    return { buffers, counts, errors };
+    return { buffers: { ...buffers, literalSource: pre }, counts, errors };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (message.includes('defer:')) {
@@ -268,6 +269,7 @@ export function materializeKernelResult(
     filePath,
     language
   );
+  if (b.literalSource !== undefined) captureLiterals(b.literalSource, decoded.nodes);
   decoded.durationMs = result.durationMs;
   return decoded;
 }
@@ -294,6 +296,16 @@ export function tryKernelExtract(
     const buffers = kernel.extractFile(filePath, pre, language);
     const result = decodeExtractBuffers(buffers, filePath, language);
     POST_PASSES[language]?.(result, source);
+    // Literal seeds are a pass over source text and the node list, never over
+    // the tree (literal-capture.ts), so they need no Rust mirror — the same
+    // pass the wasm extractor runs at the end of extract() applies to the
+    // kernel's nodes here, and the two paths stay node-for-node identical.
+    // `pre`, not `source`: the wasm extractor captures from its own preParsed
+    // text, and a preParse blanks bytes a literal could otherwise be read from.
+    // Without this every routed language loses its seeds while markdown and the
+    // unrouted ones keep theirs, and a quoted-key explore query silently stops
+    // finding holders.
+    captureLiterals(pre, result.nodes);
     result.durationMs = Date.now() - t0;
     return result;
   } catch (err) {

@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 9;
+export const CURRENT_SCHEMA_VERSION = 10;
 
 /**
  * Migration definition
@@ -175,6 +175,26 @@ const migrations: Migration[] = [
       db.exec(
         'CREATE INDEX IF NOT EXISTS idx_files_generated ON files(path) WHERE generated = 1'
       );
+    },
+  },
+  {
+    version: 10,
+    description:
+      'Add literals — identifier-like string literal → enclosing symbol, so explore seeds on storage keys and flags',
+    up: (db) => {
+      // DDL only. No backfill: the values come from file CONTENT the migration
+      // cannot see, so the table stays empty until the next full index and
+      // explore behaves exactly as before for those queries. Keep in lockstep
+      // with schema.sql.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS literals (
+          value TEXT NOT NULL,
+          node_id TEXT NOT NULL,
+          file_path TEXT NOT NULL,
+          PRIMARY KEY (value, node_id)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS idx_literals_file ON literals(file_path);
+      `);
     },
   },
 ];
