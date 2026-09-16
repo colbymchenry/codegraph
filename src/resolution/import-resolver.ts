@@ -17,6 +17,12 @@ import {
   localReceiverTypePatterns,
   normalizeInferredTypeName,
 } from './name-matcher';
+import {
+  clearRustModulePathMemos,
+  getRustPathInclusionParent,
+  resolveRustSuperModuleFile,
+  rustSelfModuleDirAbs,
+} from './rust-module-paths';
 
 /**
  * Extension resolution order by language
@@ -153,6 +159,7 @@ export function clearImportResolverMemos(context: ResolutionContext): void {
   fileExportIndexes.delete(context);
   luaFileBasenameIndexes.delete(context);
   cobolCopybookIndexes.delete(context);
+  clearRustModulePathMemos(context);
 }
 
 export function resolveImportPath(
@@ -887,6 +894,8 @@ export function extractImportMappings(
     mappings.push(...extractPHPImports(content));
   } else if (language === 'c' || language === 'cpp') {
     mappings.push(...extractCppImports(content));
+  } else if (language === 'rust') {
+    mappings.push(...extractRustImports(content));
   }
 
   return mappings;
@@ -1189,6 +1198,87 @@ function extractCppImports(content: string): ImportMapping[] {
       isDefault: false,
       isNamespace: true,
     });
+  }
+
+  return mappings;
+}
+
+/**
+ * Extract Rust `use` declarations into import mappings. Named `use` items bind
+ * a local name to a module path; `use path::*` glob imports bind every public
+ * item from that module (Rust Reference, Use declarations).
+ */
+function extractRustImports(content: string): ImportMapping[] {
+  const mappings: ImportMapping[] = [];
+
+  const expand = (spec: string): string[] => {
+    const open = spec.indexOf('{');
+    if (open === -1) return [spec.trim()];
+    const prefix = spec.slice(0, open);
+    let depth = 0;
+    let close = -1;
+    for (let i = open; i < spec.length; i++) {
+      if (spec[i] === '{') depth++;
+      else if (spec[i] === '}') {
+        depth--;
+        if (depth === 0) {
+          close = i;
+          break;
+        }
+      }
+    }
+    if (close === -1) return [];
+    const suffix = spec.slice(close + 1);
+    const inner = spec.slice(open + 1, close);
+    const parts: string[] = [];
+    let depth2 = 0;
+    let start = 0;
+    for (let i = 0; i <= inner.length; i++) {
+      const ch = inner[i];
+      if (ch === '{') depth2++;
+      else if (ch === '}') depth2--;
+      if (i === inner.length || (ch === ',' && depth2 === 0)) {
+        const seg = inner.slice(start, i).trim();
+        if (seg) parts.push(seg);
+        start = i + 1;
+      }
+    }
+    return parts.flatMap((p) => expand(prefix + p + suffix));
+  };
+
+  const useRe = /(^|\n)\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([^;]+);/g;
+  let m: RegExpExecArray | null;
+  while ((m = useRe.exec(content)) !== null) {
+    for (const spec of expand(m[2]!.replace(/\s+/g, ' '))) {
+      const aliasMatch = /^(.*?)\s+as\s+([A-Za-z_]\w*)$/.exec(spec);
+      const rawPath = (aliasMatch ? aliasMatch[1]! : spec).trim();
+      if (!rawPath) continue;
+
+      if (rawPath.endsWith('::*')) {
+        const modPath = rawPath.slice(0, -3);
+        if (!modPath) continue;
+        mappings.push({
+          localName: '*',
+          exportedName: '*',
+          source: modPath,
+          isDefault: false,
+          isNamespace: true,
+        });
+        continue;
+      }
+
+      const segments = rawPath.split('::').map((s) => s.trim()).filter(Boolean);
+      const leaf = segments[segments.length - 1];
+      if (!leaf || leaf === 'self' || leaf === 'super' || leaf === 'crate') continue;
+      const local = aliasMatch ? aliasMatch[2]! : leaf;
+      mappings.push({
+        localName: local,
+        exportedName: leaf,
+        source: segments.join('::'),
+        isDefault: false,
+        isNamespace: false,
+      });
+    }
   }
 
   return mappings;
@@ -1614,6 +1704,14 @@ export function resolveViaImport(
   if (ref.language === 'rust' && ref.referenceName.includes('::')) {
     const rustResult = resolveRustPathReference(ref, context);
     if (rustResult) return rustResult;
+  }
+
+  // Rust bare names brought in by `use` (named or `path::*` glob). Without this,
+  // `use super::*` in a #[path]-included test module falls through to global
+  // name-matching and can land on a same-named symbol in another crate (#1837).
+  if (ref.language === 'rust' && !ref.referenceName.includes('::')) {
+    const rustUse = resolveRustUseImport(ref, imports, context);
+    if (rustUse) return rustUse;
   }
 
   // Lua / Luau `require(...)`: a dotted module path (`a.b.c` from
@@ -2043,6 +2141,86 @@ function resolvePythonAbsoluteModule(
   return hit ? { original: ref, targetNodeId: hit.id, confidence: 0.9, resolvedBy: 'import' } : null;
 }
 
+const RUST_SYMBOL_KINDS = new Set([
+  'function',
+  'struct',
+  'union',
+  'enum',
+  'trait',
+  'type_alias',
+  'constant',
+  'method',
+  'class',
+  'interface',
+]);
+
+function findRustSymbolInFile(
+  file: string,
+  name: string,
+  context: ResolutionContext,
+  callableOnly: boolean
+): Node | undefined {
+  return context.getNodesInFile(file).find((n) => {
+    if (n.name !== name) return false;
+    if (!RUST_SYMBOL_KINDS.has(n.kind)) return false;
+    if (callableOnly && n.kind !== 'function' && n.kind !== 'method') return false;
+    return true;
+  });
+}
+
+/**
+ * Resolve a bare Rust reference through `use` bindings: named imports and
+ * `use module::*` globs (Rust Reference, Use declarations).
+ */
+function resolveRustUseImport(
+  ref: UnresolvedRef,
+  imports: ImportMapping[],
+  context: ResolutionContext
+): ResolvedRef | null {
+  const callableOnly = ref.referenceKind === 'calls' || ref.referenceKind === 'function_ref';
+
+  // Named `use path::item` / `use path::item as alias` — map via stored source path.
+  for (const imp of imports) {
+    if (imp.isNamespace || imp.localName !== ref.referenceName) continue;
+    const qualified = imp.source;
+    if (!qualified.includes('::')) continue;
+    const fakeRef: UnresolvedRef = { ...ref, referenceName: qualified };
+    const hit = resolveRustPathReference(fakeRef, context);
+    if (hit) return hit;
+  }
+
+  // `use super::*` / `use crate::m::*` — search the imported module file.
+  for (const imp of imports) {
+    if (!imp.isNamespace || imp.exportedName !== '*') continue;
+    const file = resolveRustModulePathToFile(imp.source, ref.filePath, context);
+    if (!file || file === ref.filePath) continue;
+    const target = findRustSymbolInFile(file, ref.referenceName, context, callableOnly);
+    if (target) {
+      return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
+    }
+  }
+
+  return null;
+}
+
+/** Map a Rust module path string (`super`, `crate::m`, `self::sub`) to a file. */
+function resolveRustModulePathToFile(
+  modPath: string,
+  fromFile: string,
+  context: ResolutionContext
+): string | null {
+  const segments = modPath.split('::').filter((s) => s.length > 0);
+  if (segments.length === 0) return null;
+
+  let supers = 0;
+  while (supers < segments.length && segments[supers] === 'super') supers++;
+  if (supers > 0 && supers === segments.length) {
+    return resolveRustSuperModuleFile(supers, fromFile, context);
+  }
+
+  return resolveRustModuleFile(segments, fromFile, context);
+}
+
 /**
  * Resolve a Rust qualified reference `A::B::C` by mapping the MODULE prefix
  * (`A::B`) to a file and finding the leaf symbol (`C`) in it. This is the Rust
@@ -2064,20 +2242,7 @@ function resolveRustPathReference(
   const file = resolveRustModuleFile(modSegs, ref.filePath, context);
   if (!file || file === ref.filePath) return null;
 
-  const target = context.getNodesInFile(file).find(
-    (n) =>
-      n.name === leaf &&
-      (n.kind === 'function' ||
-        n.kind === 'struct' ||
-        n.kind === 'union' ||
-        n.kind === 'enum' ||
-        n.kind === 'trait' ||
-        n.kind === 'type_alias' ||
-        n.kind === 'constant' ||
-        n.kind === 'method' ||
-        n.kind === 'class' ||
-        n.kind === 'interface')
-  );
+  const target = findRustSymbolInFile(file, leaf, context, false);
   if (target) {
     return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
   }
@@ -2102,12 +2267,17 @@ function rustCrateRootDir(fromFileAbs: string, context: ResolutionContext): stri
 }
 
 /** Directory under which the current file's module declares its SUBMODULES. */
-function rustSelfModuleDir(fromFileAbs: string): string {
-  const base = path.basename(fromFileAbs);
-  const dir = path.dirname(fromFileAbs);
-  // mod.rs / lib.rs / main.rs own their directory; `foo.rs`'s submodules live in `foo/`.
-  if (base === 'mod.rs' || base === 'lib.rs' || base === 'main.rs') return dir;
-  return path.join(dir, base.replace(/\.rs$/, ''));
+function rustSelfModuleDir(
+  fromFileAbs: string,
+  fromFileRel: string,
+  context: ResolutionContext
+): string {
+  const parentViaPath = getRustPathInclusionParent(fromFileRel, context);
+  if (parentViaPath) {
+    const projectRoot = context.getProjectRoot();
+    return path.dirname(path.join(projectRoot, parentViaPath));
+  }
+  return rustSelfModuleDirAbs(fromFileAbs);
 }
 
 /**
@@ -2149,14 +2319,19 @@ function resolveRustModuleFile(
     return resolveUnder(rustCrateRootDir(fromAbs, context), segments.slice(1));
   }
   if (first === 'self') {
-    return resolveUnder(rustSelfModuleDir(fromAbs), segments.slice(1));
+    return resolveUnder(rustSelfModuleDir(fromAbs, fromFile, context), segments.slice(1));
   }
   if (first === 'super') {
     let supers = 0;
     while (segments[supers] === 'super') supers++;
-    let dir: string | null = rustSelfModuleDir(fromAbs);
-    for (let s = 0; s < supers && dir; s++) dir = path.dirname(dir);
-    return resolveUnder(dir, segments.slice(supers));
+    const rest = segments.slice(supers);
+    if (rest.length === 0) {
+      return resolveRustSuperModuleFile(supers, fromFile, context);
+    }
+    const parentFile = resolveRustSuperModuleFile(supers, fromFile, context);
+    if (!parentFile) return null;
+    const parentAbs = path.join(projectRoot, parentFile);
+    return resolveUnder(rustSelfModuleDir(parentAbs, parentFile, context), rest);
   }
   // Bare path. In expression position (`submodule::item()` — the router-assembly
   // and general cross-module-call pattern) the prefix is a SUBMODULE of the
@@ -2164,7 +2339,7 @@ function resolveRustModuleFile(
   // Fall back to crate-relative for 2015-edition / crate-root items. External
   // crate paths (`serde::de::Error`) miss both and fall through to name-matching.
   return (
-    resolveUnder(rustSelfModuleDir(fromAbs), segments) ??
+    resolveUnder(rustSelfModuleDir(fromAbs, fromFile, context), segments) ??
     resolveUnder(rustCrateRootDir(fromAbs, context), segments)
   );
 }
