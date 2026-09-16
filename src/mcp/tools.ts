@@ -31,7 +31,7 @@ import {
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
-import { isTestFile, normalizeNameToken, queryIsAboutTests } from '../search/query-utils';
+import { isTestFile, isTestPath, normalizeNameToken, queryIsAboutTests } from '../search/query-utils';
 import { groupDefinitions, lastQualifierPart, matchesSymbol } from '../graph/symbol-lookup';
 import { extractQueryPaths, queryMightContainPaths } from '../search/query-paths';
 import {
@@ -4219,18 +4219,42 @@ export class ToolHandler {
     // answers with tests. The Blast radius section is untouched: its `tests:` line
     // NAMES the covering files rather than flooding a cap, which is the half of
     // this information that was already working.
-    const includeTests =
-      typeof args.includeTests === 'boolean'
-        ? args.includeTests
-        : queryIsAboutTests(matchQuery);
+    //
+    // Three things are carried over from the source-file filter deliberately,
+    // because dropping any one of them makes this filter lie:
+    //
+    //  - The predicate is `isTestPath`, NOT `isTestFile`. The latter is the wide
+    //    reading — examples, samples, benchmarks, fixtures — which nothing here
+    //    intends to cut, and which no phrasing of the query could win back
+    //    (`queryIsAboutTests` doesn't match "which examples call X"). A file
+    //    rendered in the Source Code section while its edges are gone is a
+    //    response that contradicts itself.
+    //  - A PINNED file is exempt. `extractQueryPaths` strips the path span out of
+    //    `matchQuery`, so the "test" inside `src/store.test.ts` is invisible to
+    //    the waiver by the time it runs — naming a test file by path IS asking
+    //    for it, and the source filter says so in the same words.
+    //  - If the filter would empty the section, it stands down. Tests are then
+    //    the only signal for this area, and the blast radius does not cover for
+    //    it: that section is roots-only and capped, so a non-root symbol whose
+    //    callers are all tests would lose the information entirely. An explicit
+    //    `includeTests: false` still means false — that caller asked for the
+    //    empty section and gets it.
+    const explicitTests = typeof args.includeTests === 'boolean' ? args.includeTests : undefined;
+    const includeTests = explicitTests ?? queryIsAboutTests(matchQuery);
     const isTestEndpoint = (id: string): boolean => {
       const n = subgraph.nodes.get(id);
-      return !!n && isTestFile(n.filePath);
+      return !!n && isTestPath(n.filePath) && !pinnedSet.has(n.filePath);
     };
-    const significantEdges = subgraph.edges.filter(e =>
-      e.kind !== 'contains' && // skip contains — it's implied by file grouping
-      (includeTests || (!isTestEndpoint(e.source) && !isTestEndpoint(e.target)))
+    const nonContainsEdges = subgraph.edges.filter(e =>
+      e.kind !== 'contains' // skip contains — it's implied by file grouping
     );
+    const productionEdges = nonContainsEdges.filter(e =>
+      !isTestEndpoint(e.source) && !isTestEndpoint(e.target)
+    );
+    const significantEdges =
+      includeTests || (productionEdges.length === 0 && explicitTests === undefined)
+        ? nonContainsEdges
+        : productionEdges;
 
     if (budget.includeRelationships && significantEdges.length > 0) {
       lines.push('**Relationships**');

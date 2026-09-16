@@ -44,6 +44,27 @@ describe('codegraph_explore — test edges in Relationships', () => {
       `import { reserveSlot } from './store';\n` + testCallers,
     );
 
+    // An example calls it too. Examples are not production code, but they are
+    // not a test suite either — they render in the source section, so their
+    // edges have to survive.
+    fs.mkdirSync(path.join(testDir, 'examples'), { recursive: true });
+    fs.writeFileSync(
+      path.join(testDir, 'examples', 'quickstart.ts'),
+      `import { reserveSlot } from '../src/store';\n` +
+      `export function demoReserve() { return reserveSlot(); }\n`,
+    );
+
+    // `orphanHelper` is called ONLY from a test — filtering it leaves nothing.
+    fs.writeFileSync(
+      path.join(src, 'orphan.ts'),
+      `export function orphanHelper() { return 7; }\n`,
+    );
+    fs.writeFileSync(
+      path.join(src, 'orphan.test.ts'),
+      `import { orphanHelper } from './orphan';\n` +
+      `export function checkOrphan() { return orphanHelper(); }\n`,
+    );
+
     // The Relationships section is gated on repo size (off below 500 files), so
     // the fixture has to clear that bar for this filter to render at all.
     const filler = path.join(src, 'filler');
@@ -105,6 +126,42 @@ describe('codegraph_explore — test edges in Relationships', () => {
     const rel = relationships(res.content[0].text);
 
     expect(rel).not.toMatch(/checkReserveSlot/);
+  });
+
+  it('keeps a test file that the query pinned by path', async () => {
+    // extractQueryPaths strips the path span out of the query before the waiver
+    // sees it, so the "test" inside the path cannot speak for itself.
+    const res = await handler.execute('codegraph_explore', {
+      query: 'src/store.test.ts reserveSlot',
+    });
+    const rel = relationships(res.content[0].text);
+
+    expect(rel).toMatch(/checkReserveSlot/);
+  });
+
+  it('does not cut examples, benchmarks or fixtures — only tests', async () => {
+    const res = await handler.execute('codegraph_explore', { query: 'reserveSlot' });
+    const rel = relationships(res.content[0].text);
+
+    // Rendered in the source section, so its edges have to be there too.
+    expect(rel).toContain('demoReserve');
+  });
+
+  it('stands down when the tests are the only callers there are', async () => {
+    const res = await handler.execute('codegraph_explore', { query: 'orphanHelper' });
+    const rel = relationships(res.content[0].text);
+
+    expect(rel).toMatch(/checkOrphan/);
+  });
+
+  it('still empties the section when includeTests: false asked for that', async () => {
+    const res = await handler.execute('codegraph_explore', {
+      query: 'orphanHelper',
+      includeTests: false,
+    });
+    const rel = relationships(res.content[0].text);
+
+    expect(rel).not.toMatch(/checkOrphan/);
   });
 
   it('leaves the blast radius section naming the covering test file', async () => {
