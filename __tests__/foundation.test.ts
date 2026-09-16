@@ -138,6 +138,24 @@ describe('CodeGraph Foundation', () => {
       expect(after).toEqual(before);
     });
 
+    it('restores every secondary index through the asynchronous open path (#1887)', async () => {
+      const dbPath = getDatabasePath(tempDir);
+      const first = DatabaseConnection.initialize(dbPath);
+      const before = (first.getDb()
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+        .all() as Array<{ name: string }>).map((r) => r.name);
+      first.beginBulkParseLoad();
+      first.close();
+
+      const reopened = await DatabaseConnection.openAsync(dbPath);
+      const after = (reopened.getDb()
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+        .all() as Array<{ name: string }>).map((r) => r.name);
+      reopened.close();
+
+      expect(after).toEqual(before);
+    });
+
     it('skips secondary-index DDL when the schema is already healthy', () => {
       const dbPath = getDatabasePath(tempDir);
       const connection = DatabaseConnection.initialize(dbPath);
