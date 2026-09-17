@@ -15,6 +15,7 @@
  *   codegraph status [path]      Show index status
  *   codegraph query <search>     Search for symbols
  *   codegraph files [options]    Show project file structure
+ *   codegraph visualize [symbol] Write an interactive HTML graph of the index
  *   codegraph context <task>     Build context for a task
  *   codegraph callers <symbol>   Find what calls a function/method
  *   codegraph callees <symbol>   Find what a function/method calls
@@ -41,7 +42,9 @@ try {
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
+import { pathToFileURL } from 'url';
 import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection } from '../directory';
+import { EDGE_KINDS, NODE_KINDS } from '../types';
 import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
@@ -1778,6 +1781,65 @@ function globToRegex(pattern: string): RegExp {
 }
 
 /**
+ * A number flag, clamped to its sensible range instead of rejected. `--limit 0`
+ * meaning "the minimum" is friendlier than an error for a knob the user is
+ * tuning to see the graph change.
+ */
+function parseBoundedInteger(
+  raw: string | undefined,
+  label: string,
+  fallback: number,
+  min: number,
+  max: number
+): number {
+  const parsed = raw === undefined ? fallback : Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`Invalid ${label}: ${raw}`);
+  }
+  return Math.min(Math.max(parsed, min), max);
+}
+
+/**
+ * A comma/space separated list validated against the kinds the graph actually
+ * uses, so an unknown kind is reported by name rather than silently matching
+ * nothing.
+ */
+function parseAllowedList<T extends string>(
+  raw: string | undefined,
+  allowed: readonly T[],
+  label: string
+): T[] | undefined {
+  if (!raw) return undefined;
+  const values = raw
+    .split(/[,\s]+/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const invalid = values.filter((value) => !(allowed as readonly string[]).includes(value));
+  if (invalid.length > 0) {
+    throw new Error(`Unknown ${label}: ${invalid.join(', ')}. Allowed: ${allowed.join(', ')}`);
+  }
+  return Array.from(new Set(values)) as T[];
+}
+
+function parseDirection(raw: string | undefined): 'incoming' | 'outgoing' | 'both' {
+  const value = raw ?? 'both';
+  if (value === 'incoming' || value === 'outgoing' || value === 'both') return value;
+  throw new Error(`Unknown direction: ${value}. Allowed: incoming, outgoing, both`);
+}
+
+/**
+ * A symbol name made safe for a file name — `Class.method` and `a::b` both
+ * collapse to dashes, since neither is portable in a path.
+ */
+function slugForFileName(value: string): string {
+  const slug = value
+    .replace(/[^a-z0-9_.-]+/gi, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80);
+  return slug || 'symbol';
+}
+
+/**
  * Print files as a tree
  */
 function printFileTree(
@@ -1845,6 +1907,107 @@ function printFileTree(
 
   renderNode(root, '', true, 0);
 }
+
+/**
+ * codegraph visualize [symbol] — write a standalone HTML graph of the index.
+ * An overview of the whole project, or the neighbourhood of one symbol.
+ */
+program
+  .command('visualize [symbol]')
+  .description('Write an interactive HTML graph of the indexed project, or of one symbol')
+  .option('-p, --path <path>', 'Project path')
+  .option('-o, --output <file>', 'Output HTML path (default: .codegraph/graph.html)')
+  .option('-d, --depth <number>', 'Traversal depth when a symbol is provided', '2')
+  .option('-l, --limit <number>', 'Maximum nodes to include', '300')
+  .option('--direction <direction>', 'Traversal direction: incoming, outgoing, both', 'both')
+  .option('-k, --kind <kinds>', 'Comma-separated node kinds to include')
+  .option('-e, --edge-kind <kinds>', 'Comma-separated edge kinds to include')
+  .option('--open', 'Open the generated HTML file in your browser')
+  .addHelpText(
+    'after',
+    `
+Examples:
+  $ codegraph visualize                     Graph the whole project
+  $ codegraph visualize buildContext        Graph one symbol's neighbourhood
+  $ codegraph visualize -k function,method  Only functions and methods
+  $ codegraph visualize --open              Write the file and open it
+
+The file is self-contained: no network access, no third-party script. Node and
+edge kinds are filtered in the browser as well, so the graph can be narrowed
+without regenerating it.
+`
+  )
+  .action(async (symbol: string | undefined, options: {
+    path?: string;
+    output?: string;
+    depth?: string;
+    limit?: string;
+    direction?: string;
+    kind?: string;
+    edgeKind?: string;
+    open?: boolean;
+  }) => {
+    const projectPath = resolveProjectPath(options.path);
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const limit = parseBoundedInteger(options.limit, 'limit', 300, 1, 2000);
+      const depth = parseBoundedInteger(options.depth, 'depth', 2, 1, 10);
+      const direction = parseDirection(options.direction);
+      const nodeKinds = parseAllowedList(options.kind, NODE_KINDS, 'node kind');
+      const edgeKinds = parseAllowedList(options.edgeKind, EDGE_KINDS, 'edge kind');
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      const { buildVisualizationGraph, renderVisualizationHtml } = await import('../visualization');
+      const cg = await CodeGraph.open(projectPath);
+      try {
+        const graph = buildVisualizationGraph(cg, {
+          projectRoot: projectPath,
+          symbol,
+          limit,
+          depth,
+          direction,
+          nodeKinds,
+          edgeKinds,
+        });
+
+        if (graph.nodes.length === 0) {
+          const label = symbol ? ` for "${symbol}"` : '';
+          info(`No graph nodes found${label}. Run "codegraph index" or adjust filters.`);
+          return;
+        }
+
+        const outputPath = options.output
+          ? path.resolve(options.output)
+          : path.join(
+              getCodeGraphDir(projectPath),
+              symbol ? `graph-${slugForFileName(symbol)}.html` : 'graph.html'
+            );
+        fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+        fs.writeFileSync(outputPath, renderVisualizationHtml(graph), 'utf-8');
+
+        success(`Generated graph visualization: ${outputPath}`);
+        info(`${graph.stats.includedNodes} nodes, ${graph.stats.includedEdges} edges included`);
+        if (graph.stats.truncated) {
+          info(`Limited from ${graph.stats.totalNodes} indexed nodes. Increase --limit for more.`);
+        }
+
+        if (options.open === true) {
+          const { openBrowser } = await import('../ui-server/open-browser');
+          openBrowser(pathToFileURL(outputPath).href);
+        }
+      } finally {
+        cg.close();
+      }
+    } catch (err) {
+      error(`visualize failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
 
 /**
  * codegraph daemon — interactive manager for the background daemons. Arrow keys
