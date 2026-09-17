@@ -1,5 +1,5 @@
 {
-  "_comment": "Test corpus for /agent-eval. Add entries freely. size: Small (<~150 files), Medium (~150-1500), Large (>~1500). 'question' is a representative architectural question that exercises cross-file understanding.",
+  "_comment": "Test corpus for /codegraph-lift. Add entries freely. size: Small (<~150 files), Medium (~150-1500), Large (>~1500). 'question' is a representative architectural question that exercises cross-file understanding.",
   "TypeScript": [
     {
       "name": "ky",
