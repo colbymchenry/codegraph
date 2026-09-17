@@ -34,6 +34,7 @@ import { vbnetExtractor } from './vbnet';
 import { erlangExtractor } from './erlang';
 import { solidityExtractor } from './solidity';
 import { terraformExtractor } from './terraform';
+import { enforcescriptExtractor } from './enforcescript';
 import { arktsExtractor } from './arkts';
 import { nixExtractor } from './nix';
 
@@ -67,6 +68,7 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   erlang: erlangExtractor,
   solidity: solidityExtractor,
   terraform: terraformExtractor,
+  enforcescript: enforcescriptExtractor,
   arkts: arktsExtractor,
   nix: nixExtractor,
 };
