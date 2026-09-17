@@ -1,4 +1,4 @@
-import { Node, Edge, ExtractionResult, ExtractionError, UnresolvedReference } from '../types';
+import { Node, Edge, ExtractionResult, ExtractionError, UnresolvedReference, Language } from '../types';
 import { generateNodeId } from './tree-sitter-helpers';
 import { TreeSitterExtractor } from './tree-sitter';
 import { isLanguageSupported } from './grammars';
@@ -16,6 +16,14 @@ import { isLanguageSupported } from './grammars';
  *  - `@typeof(MainLayout)`                → the referenced type
  *  - `<MyComponent .../>` (Blazor only)   → the component class (.razor or `.cs : ComponentBase`)
  *  - `<Grid TItem="CatalogItem">`         → the generic type argument
+ *
+ * It also links the JavaScript/TypeScript inside HTML `<script>` blocks — the
+ * `.cshtml` analog of a Blazor `@code` block — to the functions, modules, and
+ * types it names. Traditional ASP.NET MVC views keep their front-end logic in
+ * `<script>`, so a helper or module used only from a view's inline script would
+ * otherwise look unreferenced. Those refs keep their `javascript`/`typescript`
+ * language family (NOT `razor`/dotnet), so the name-matcher's cross-family gate
+ * resolves them to `.js`/`.ts` symbols instead of dropping them.
  *
  * Risk mitigations (see docs/design/template-markup-parser.md):
  *  - Only PascalCase (`[A-Z]`-initial) tags are treated as components — HTML
@@ -75,6 +83,10 @@ export class RazorExtractor {
       // this is where component logic uses services/DTOs, so it covers the types
       // referenced only from component code.
       this.processCodeBlocks(componentId);
+      // Delegate the JS/TS inside HTML `<script>` blocks to the JS/TS extractor.
+      // Traditional MVC `.cshtml` keeps front-end logic there — the markup analog
+      // of a Blazor `@code` block, but JavaScript instead of C#.
+      this.processScriptBlocks(componentId);
     } catch (error) {
       this.errors.push({
         message: `Razor extraction error: ${error instanceof Error ? error.message : String(error)}`,
@@ -273,6 +285,69 @@ export class RazorExtractor {
           column: ref.column,
           filePath: this.filePath,
           language: 'razor',
+        });
+      }
+    }
+  }
+
+  /**
+   * Extract inline `<script>` blocks (JS/TS) from the markup. A `<script src=...>`
+   * with no inline body, and non-JS blocks (`type="text/html"` templates, JSON
+   * islands), are skipped. Returns each block's content with the 0-indexed line
+   * where the content begins, so refs map back to the right line in the view.
+   */
+  private extractScriptBlocks(): Array<{ content: string; startLine: number; isTypeScript: boolean }> {
+    const blocks: Array<{ content: string; startLine: number; isTypeScript: boolean }> = [];
+    const scriptRe = /<script(\s[^>]*)?>(?<content>[\s\S]*?)<\/script>/gi;
+    let m: RegExpExecArray | null;
+    while ((m = scriptRe.exec(this.source)) !== null) {
+      const attrs = m[1] || '';
+      const content = m.groups?.content ?? m[2] ?? '';
+      if (!content.trim()) continue; // <script src="..."> or empty block
+      // Only treat the block as JS/TS — skip template/data script types.
+      const type = attrs.match(/type\s*=\s*["']([^"']+)["']/i)?.[1]?.toLowerCase();
+      if (type && !/(javascript|ecmascript|babel|jsx|typescript|module)/.test(type)) continue;
+      const isTypeScript = /lang\s*=\s*["'](ts|typescript)["']/i.test(attrs) || type === 'application/typescript';
+      const beforeScript = this.source.slice(0, m.index);
+      const scriptTagLine = (beforeScript.match(/\n/g) || []).length;
+      const openingTag = m[0].slice(0, m[0].indexOf('>') + 1);
+      const openingTagLines = (openingTag.match(/\n/g) || []).length;
+      blocks.push({ content, startLine: scriptTagLine + openingTagLines, isTypeScript });
+    }
+    return blocks;
+  }
+
+  /**
+   * Delegate each `<script>` block's JS/TS to the tree-sitter JS/TS extractor and
+   * attribute the block's external references (calls, imports, type uses) to the
+   * component. Keep ONLY the dependency references — no per-symbol nodes — so the
+   * file's node count stays one component node (the design doc's stable-node-count
+   * invariant).
+   *
+   * Crucially, refs keep their `javascript`/`typescript` language, NOT `razor`:
+   * the name-matcher's cross-family gate resolves `references`/`imports` only
+   * within the same language family, and `razor` is in the `dotnet` family — so a
+   * JS ref tagged `razor` would be dropped before reaching a `.js`/`.ts` symbol.
+   * Degrades gracefully if the JS/TS grammar isn't loaded.
+   */
+  private processScriptBlocks(componentId: string): void {
+    for (const block of this.extractScriptBlocks()) {
+      const scriptLanguage: Language = block.isTypeScript ? 'typescript' : 'javascript';
+      if (!isLanguageSupported(scriptLanguage)) continue;
+      let result: ExtractionResult;
+      try {
+        result = new TreeSitterExtractor(this.filePath, block.content, scriptLanguage).extract();
+      } catch {
+        continue; // grammar not loaded / parse failure — skip this block
+      }
+      for (const ref of result.unresolvedReferences) {
+        this.unresolvedReferences.push({
+          ...ref,
+          fromNodeId: componentId,
+          line: ref.line + block.startLine,
+          column: ref.column,
+          filePath: this.filePath,
+          language: scriptLanguage,
         });
       }
     }
