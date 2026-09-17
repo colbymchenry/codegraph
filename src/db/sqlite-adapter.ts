@@ -10,6 +10,9 @@
  * wasm fallback. When run from source instead, it requires Node >= 22.5.
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
+
 export interface SqliteStatement {
   run(...params: any[]): { changes: number; lastInsertRowid: number | bigint };
   get(...params: any[]): any;
@@ -54,7 +57,19 @@ class NodeSqliteAdapter implements SqliteDatabase {
   constructor(dbPath: string, opts?: { readOnly?: boolean }) {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { DatabaseSync } = require('node:sqlite');
-    this._db = opts?.readOnly ? new DatabaseSync(dbPath, { readOnly: true }) : new DatabaseSync(dbPath);
+    if (opts?.readOnly) {
+      // A WAL-mode database must attach (and create if absent) its -shm file
+      // even for read-only connections, which fails on a non-writable path —
+      // e.g. an index prebuilt by a system daemon under a root-owned shared
+      // directory. When neither the db file nor its directory is writable
+      // there can be no concurrent writer either, so the immutable=1 URI
+      // form (read the main db file directly, skip WAL recovery) is both
+      // safe and the only thing that works there.
+      const target = indexNonWritable(dbPath) ? immutableUri(dbPath) : dbPath;
+      this._db = new DatabaseSync(target, { readOnly: true });
+    } else {
+      this._db = new DatabaseSync(dbPath);
+    }
   }
 
   get open(): boolean {
@@ -163,4 +178,28 @@ export function createDatabase(dbPath: string, opts?: { readOnly?: boolean }): {
       `Underlying error: ${msg}`
     );
   }
+}
+
+/**
+ * True when a WAL connection cannot work on this path: either the db file or
+ * its parent directory is not writable (a WAL connection needs to create
+ * -wal/-shm beside the file, even for reads). Shared by `createDatabase`
+ * (choose immutable vs plain read-only) and `DatabaseConnection.open` (skip
+ * migrations and self-heal) so both layers always agree.
+ */
+export function indexNonWritable(dbPath: string): boolean {
+  try {
+    fs.accessSync(dbPath, fs.constants.W_OK);
+    fs.accessSync(path.dirname(dbPath), fs.constants.W_OK);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+/** `file:` URI with immutable=1 — reads the main db file directly and skips
+ *  WAL recovery; valid only because a non-writable path has no writers. */
+function immutableUri(dbPath: string): string {
+  const encoded = dbPath.split('/').map(encodeURIComponent).join('/');
+  return `file:${encoded}?immutable=1`;
 }

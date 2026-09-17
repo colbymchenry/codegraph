@@ -4,7 +4,7 @@
  * Handles SQLite database initialization and connection management.
  */
 
-import { SqliteDatabase, SqliteBackend, createDatabase } from './sqlite-adapter';
+import { SqliteDatabase, SqliteBackend, createDatabase, indexNonWritable } from './sqlite-adapter';
 import * as fs from 'fs';
 import * as path from 'path';
 import { SchemaVersion } from '../types';
@@ -27,11 +27,13 @@ export { SqliteDatabase, SqliteBackend } from './sqlite-adapter';
  * on a writer, so this timeout only governs cross-process write contention
  * (e.g. the git-hook `codegraph sync` running while the MCP server writes).
  */
-function configureConnection(db: SqliteDatabase): void {
+function configureConnection(db: SqliteDatabase, readOnly = false): void {
   db.pragma('busy_timeout = 5000');      // MUST be first — see above
   db.pragma('foreign_keys = ON');
-  db.pragma('journal_mode = WAL');       // node:sqlite supports WAL on every platform
-  db.pragma('synchronous = NORMAL');     // safe with WAL mode
+  if (!readOnly) {
+    db.pragma('journal_mode = WAL');     // node:sqlite supports WAL on every platform
+    db.pragma('synchronous = NORMAL');   // safe with WAL mode
+  }
   db.pragma('cache_size = -64000');      // 64 MB page cache
   db.pragma('temp_store = MEMORY');      // temp tables in memory
   db.pragma('mmap_size = 268435456');    // 256 MB memory-mapped I/O
@@ -41,7 +43,9 @@ function configureConnection(db: SqliteDatabase): void {
   // forever. With the limit set, any checkpoint that resets the WAL truncates
   // the file back down. Killed-process leftovers are handled separately by
   // healOversizedWal() at open. (#1431)
-  db.pragma(`journal_size_limit = ${WAL_HEAL_THRESHOLD_BYTES}`);
+  if (!readOnly) {
+    db.pragma(`journal_size_limit = ${WAL_HEAL_THRESHOLD_BYTES}`);
+  }
 }
 
 /**
@@ -167,9 +171,15 @@ export class DatabaseConnection {
       throw new Error(`Database not found: ${dbPath}`);
     }
 
-    const { db, backend } = createDatabase(dbPath);
+    // Read-only consumption of a prebuilt index (e.g. one prewarmed by a
+    // system daemon under a root-owned shared path): when neither the db
+    // file nor its directory is writable, open read-only (the adapter picks
+    // the immutable=1 form) and skip every write path below — migrations,
+    // FTS/index self-heal, WAL heal — so plain queries keep working.
+    const indexReadOnly = indexNonWritable(dbPath);
+    const { db, backend } = createDatabase(dbPath, indexReadOnly ? { readOnly: true } : undefined);
 
-    configureConnection(db);
+    configureConnection(db, indexReadOnly);
 
     // Detect FTS5 availability for search fallback (#1532)
     let fts5Available = true;
@@ -179,23 +189,25 @@ export class DatabaseConnection {
       fts5Available = false;
     }
 
-    // Check and run migrations if needed
     const conn = new DatabaseConnection(db, dbPath, backend, fts5Available);
     const currentVersion = getCurrentVersion(db);
 
-    if (currentVersion < CURRENT_SCHEMA_VERSION) {
-      runMigrations(db, currentVersion);
+    if (!indexReadOnly) {
+      // Check and run migrations if needed
+      if (currentVersion < CURRENT_SCHEMA_VERSION) {
+        runMigrations(db, currentVersion);
+      }
+
+      // Self-heal a bulk-load window that never closed (crash between
+      // beginBulkNodeLoad and endBulkNodeLoad): the FTS triggers are missing and
+      // nodes_fts is stale. Rebuild + recreate so search stays in sync.
+      conn.healBulkNodeLoad();
+      conn.healBulkSecondaryIndexes();
+
+      // Self-heal a killed session's leftover oversized WAL (#1431) — one
+      // statSync when healthy, off-thread checkpoint+truncate when not.
+      void conn.healOversizedWal();
     }
-
-    // Self-heal a bulk-load window that never closed (crash between
-    // beginBulkNodeLoad and endBulkNodeLoad): the FTS triggers are missing and
-    // nodes_fts is stale. Rebuild + recreate so search stays in sync.
-    conn.healBulkNodeLoad();
-    conn.healBulkSecondaryIndexes();
-
-    // Self-heal a killed session's leftover oversized WAL (#1431) — one
-    // statSync when healthy, off-thread checkpoint+truncate when not.
-    void conn.healOversizedWal();
 
     return conn;
   }
