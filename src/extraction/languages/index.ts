@@ -24,6 +24,7 @@ import { dartExtractor } from './dart';
 import { pascalExtractor } from './pascal';
 import { scalaExtractor } from './scala';
 import { luaExtractor } from './lua';
+import { gdscriptExtractor } from './gdscript';
 import { rExtractor } from './r';
 import { luauExtractor } from './luau';
 import { objcExtractor } from './objc';
@@ -59,6 +60,7 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   lua: luaExtractor,
   r: rExtractor,
   luau: luauExtractor,
+  gdscript: gdscriptExtractor,
   objc: objcExtractor,
   cfscript: cfscriptExtractor,
   cfquery: cfqueryExtractor,
