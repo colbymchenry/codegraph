@@ -82,3 +82,70 @@ describe('curried wrapper handlers', () => {
     expect(refsFrom(result, file!.id)).not.toContain('helper');
   });
 });
+
+// Object members (#1747 follow-up). An Effect service is usually an object a
+// factory returns, so the wrapper's result lands in a `pair`, not a declarator.
+// The property key names it — the same key extractObjectLiteralFunctions
+// already uses for `key: () => {}`.
+const MEMBER_CODE = `
+declare const Effect: { fn: (n: string) => (b: unknown) => unknown };
+declare function wrap(n: string): (c: unknown) => unknown;
+declare function useMemo<T>(f: () => T, d: unknown[]): T;
+
+function helper() { return 1; }
+
+function make() {
+  return {
+    getMode: Effect.fn("ACP.Session.getMode")(function* (id: string) { return helper(); }),
+    'quotedKey': wrap("n")(() => { return helper(); }),
+    computed: useMemo(() => 1 + 1, []),
+    mapped: [1, 2].map((x) => x + 1),
+  };
+}
+
+const service = {
+  run: Effect.fn("Service.run")(function* () { return helper(); }),
+  plain: () => helper(),
+};
+
+// Exported with an inline function member: extractObjectLiteralFunctions mints
+// the members one by one and the initializer is not walked, so the curried
+// member has to be reached from there too.
+export const mixed = {
+  direct: () => helper(),
+  wrapped: Effect.fn("Mixed.wrapped")(function* () { return helper(); }),
+};
+`;
+
+describe('curried wrapper handlers as object members', () => {
+  const fnNodes = (result: ReturnType<typeof extractFromSource>) =>
+    result.nodes.filter((n) => n.kind === 'function');
+
+  it('names the wrapped function after its property key', () => {
+    const names = fnNodes(extractFromSource('src/m.ts', MEMBER_CODE)).map((n) => n.name);
+    expect(names).toContain('getMode');
+    expect(names).toContain('quotedKey');
+    expect(names).toContain('run');
+    expect(names).toContain('wrapped');
+  });
+
+  it('leaves single-call member values anonymous, and does not duplicate plain members', () => {
+    const names = fnNodes(extractFromSource('src/m.ts', MEMBER_CODE)).map((n) => n.name);
+    expect(names).not.toContain('computed');
+    expect(names).not.toContain('mapped');
+    // Neither path may mint a member twice.
+    expect(names.filter((n) => n === 'run')).toHaveLength(1);
+    expect(names.filter((n) => n === 'wrapped')).toHaveLength(1);
+    expect(names.filter((n) => n === 'plain').length).toBeLessThanOrEqual(1);
+  });
+
+  it('attributes the member body calls to the member, not to the factory', () => {
+    const result = extractFromSource('src/m.ts', MEMBER_CODE);
+    const getMode = fnNodes(result).find((n) => n.name === 'getMode');
+    expect(getMode, 'no function node for getMode').toBeDefined();
+    expect(refsFrom(result, getMode!.id)).toContain('helper');
+    const make = fnNodes(result).find((n) => n.name === 'make');
+    expect(make, 'no function node for make').toBeDefined();
+    expect(refsFrom(result, make!.id)).not.toContain('helper');
+  });
+});

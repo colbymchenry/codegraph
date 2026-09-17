@@ -850,7 +850,9 @@ impl<'t> Walker<'t> {
     }
 
     /// The declarator name for an anonymous function passed to a CURRIED
-    /// wrapper call — `const NAME = factory(...)(function () {…})` — or None.
+    /// wrapper call — `const NAME = factory(...)(function () {…})` — or the
+    /// property key when the call is an object member, `{ NAME: factory(...)(fn) }`;
+    /// else None.
     ///
     /// `react_hook_bound_name` above names a function through the declarator
     /// that binds it; the shape is general, but that method is bounded to the
@@ -890,11 +892,22 @@ impl<'t> Walker<'t> {
         if callee.kind() != "call_expression" {
             return None;
         }
-        let declarator = call.parent()?;
-        if declarator.kind() != "variable_declarator" {
+        let binder = call.parent()?;
+        // `{ getMode: Effect.fn("…")(function* () {…}) }`: an object member is
+        // named by its property key, as extract_object_literal_functions names
+        // `key: () => {}`.
+        if binder.kind() == "pair" {
+            let key = binder.child_by_field_name("key")?;
+            let value = binder.child_by_field_name("value")?;
+            if value.start_byte() != call.start_byte() || value.end_byte() != call.end_byte() {
+                return None;
+            }
+            return Some(util::object_key_name(self.text(key)));
+        }
+        if binder.kind() != "variable_declarator" {
             return None;
         }
-        let name_node = declarator.child_by_field_name("name")?;
+        let name_node = binder.child_by_field_name("name")?;
         if name_node.kind() != "identifier" {
             return None;
         }

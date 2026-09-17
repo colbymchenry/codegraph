@@ -2305,6 +2305,11 @@ export class TreeSitterExtractor {
         const value = getChildByField(member, 'value');
         if (key && value && (value.type === 'arrow_function' || value.type === 'function_expression')) {
           this.extractFunction(value, this.objectKeyName(key));
+        } else if (value?.type === 'call_expression') {
+          // `key: Effect.fn("…")(function* () {…})` — see curriedWrapperBoundName.
+          const fn = getChildByField(value, 'arguments')?.namedChild(0);
+          const bound = fn ? this.curriedWrapperBoundName(fn) : null;
+          if (fn && bound) this.extractFunction(fn, bound);
         }
       } else if (member.type === 'method_definition') {
         // Method shorthand: `{ fetchUser() {...} }`. extractMethod deliberately
@@ -5593,7 +5598,8 @@ export class TreeSitterExtractor {
 
   /**
    * The declarator name for an anonymous function passed to a CURRIED wrapper
-   * call — `const NAME = factory(...)(function () {…})` — or null.
+   * call — `const NAME = factory(...)(function () {…})` — or the property key
+   * when the call is an object member, `{ NAME: factory(...)(fn) }`; else null.
    *
    * `reactHookBoundName` above already names a function through the declarator
    * that binds it; the shape is general, but that method is deliberately
@@ -5638,9 +5644,20 @@ export class TreeSitterExtractor {
     // itself a call, so this is the second application of a curried wrapper.
     const callee = getChildByField(call, 'function');
     if (!callee || callee.type !== 'call_expression') return null;
-    const declarator = call.parent;
-    if (!declarator || declarator.type !== 'variable_declarator') return null;
-    const nameNode = getChildByField(declarator, 'name');
+    const binder = call.parent;
+    if (!binder) return null;
+    // `{ getMode: Effect.fn("…")(function* () {…}) }` — a service is often an
+    // object a factory returns, so the wrapper's result lands in a `pair`. The
+    // property key names it, as extractObjectLiteralFunctions names
+    // `key: () => {}`.
+    if (binder.type === 'pair') {
+      const key = getChildByField(binder, 'key');
+      const value = getChildByField(binder, 'value');
+      if (!key || !value || value.startIndex !== call.startIndex || value.endIndex !== call.endIndex) return null;
+      return this.objectKeyName(key);
+    }
+    if (binder.type !== 'variable_declarator') return null;
+    const nameNode = getChildByField(binder, 'name');
     return nameNode?.type === 'identifier' ? getNodeText(nameNode, this.source) : null;
   }
 
