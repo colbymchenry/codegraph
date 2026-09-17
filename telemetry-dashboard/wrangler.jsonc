@@ -46,6 +46,11 @@
       "name": "LOGIN_RATE_LIMITER",
       "namespace_id": "2001",
       "simple": { "limit": 5, "period": 60 }
+    },
+    {
+      "name": "API_RATE_LIMITER",
+      "namespace_id": "2002",
+      "simple": { "limit": 120, "period": 60 }
     }
   ]
 }
