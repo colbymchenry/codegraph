@@ -76,6 +76,9 @@ export class MCPEngine {
   private watcherStarted = false;
   /** Set when this engine holds writer.pid (#1740). */
   private writerLockRoot: string | null = null;
+  // Roots of explicit-`projectPath` projects whose writer.pid this engine holds
+  // (#1835) — released when the ToolHandler closes the project or on stop().
+  private explicitWriterLocks: Set<string> = new Set();
   private opts: Required<Omit<MCPEngineOptions, 'writerLockRoot'>>;
   private closed = false;
   // Off-loop read-tool pool (daemon mode only). Created lazily once the default
@@ -85,6 +88,10 @@ export class MCPEngine {
   constructor(opts: MCPEngineOptions = {}) {
     this.opts = { watch: opts.watch ?? true, queryPool: opts.queryPool ?? false };
     this.toolHandler = new ToolHandler(null);
+    this.toolHandler.setProjectLifecycle({
+      activate: (cg) => this.activateExplicitProject(cg),
+      release: (cg) => this.releaseExplicitProject(cg),
+    });
     if (opts.writerLockRoot) {
       const writer = tryAcquireWriterLock(opts.writerLockRoot, 'fallback');
       if (writer.kind === 'taken') {
@@ -231,11 +238,96 @@ export class MCPEngine {
       this.queryPool = null;
     }
     this.toolHandler.closeAll();
+    for (const root of this.explicitWriterLocks) releaseWriterLock(root);
+    this.explicitWriterLocks.clear();
     if (this.cg) {
       try { this.cg.close(); } catch { /* ignore */ }
       this.cg = null;
     }
   }
+
+  /**
+   * Give a project opened for an explicit `projectPath` the default project's
+   * lifecycle (#1835): a file watcher while the ToolHandler keeps it cached and
+   * a catch-up sync now, whose promise the handler awaits before the first call
+   * against it. Only when this engine wins the project's writer lock — if another
+   * live process (its own daemon, say) holds it, that process already syncs the
+   * index and we must not contend for codegraph.lock (#1740). Never throws.
+   */
+  private activateExplicitProject(cg: CodeGraph): Promise<void> {
+    if (this.closed || !this.opts.watch) return Promise.resolve();
+    const root = cg.getProjectRoot();
+    const writer = tryAcquireWriterLock(root, 'fallback');
+    if (writer.kind === 'taken') {
+      process.stderr.write(
+        `[CodeGraph MCP] Not syncing ${root} from this session — ${writerLockHeldMessage(writer.existing, writer.pidPath)}\n`
+      );
+      return Promise.resolve();
+    }
+    this.explicitWriterLocks.add(root);
+
+    const disabledReason = watchDisabledReason(root);
+    if (disabledReason) {
+      process.stderr.write(`[CodeGraph MCP] File watcher disabled for ${root} — ${disabledReason}.\n`);
+    } else if (cg.watch(this.watchOptions())) {
+      process.stderr.write(`[CodeGraph MCP] File watcher active for ${root} (opened via projectPath)\n`);
+    }
+
+    return cg
+      .sync()
+      .then((result) => {
+        const changed = result.filesAdded + result.filesModified + result.filesRemoved;
+        if (changed > 0) {
+          process.stderr.write(`[CodeGraph MCP] Caught up ${changed} file(s) changed in ${root}\n`);
+        }
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`[CodeGraph MCP] Catch-up sync failed for ${root}: ${msg}\n`);
+      });
+  }
+
+  /** Drop the writer lock of an explicit project the ToolHandler is closing (#1835). */
+  private releaseExplicitProject(cg: CodeGraph): void {
+    const root = cg.getProjectRoot();
+    if (!this.explicitWriterLocks.delete(root)) return;
+    releaseWriterLock(root);
+  }
+
+  /** Watch options shared by the default project and explicit projects. */
+  private watchOptions(): Parameters<CodeGraph['watch']>[0] {
+    // Optional override for the debounce window via env var (issue #403).
+    // Useful for workspaces with bursty writes (formatter-on-save chains,
+    // large generated outputs) where the 2s default fires too often. Clamped
+    // to [100ms, 60s]; out-of-range / non-numeric values fall back to the
+    // FileWatcher default. We log the active value so it's discoverable.
+    const debounceMs = parseDebounceEnv(process.env.CODEGRAPH_WATCH_DEBOUNCE_MS);
+    if (debounceMs !== undefined) {
+      process.stderr.write(`[CodeGraph MCP] File watcher debounce: ${debounceMs}ms (CODEGRAPH_WATCH_DEBOUNCE_MS)\n`);
+    }
+    return {
+      debounceMs,
+      onSyncComplete: (result) => {
+        if (result.filesChanged > 0) {
+          process.stderr.write(
+            `[CodeGraph MCP] Auto-synced ${result.filesChanged} file(s) in ${result.durationMs}ms\n`
+          );
+        }
+      },
+      onSyncError: (err) => {
+        process.stderr.write(`[CodeGraph MCP] Auto-sync error: ${err.message}\n`);
+      },
+      onDegraded: (reason) => {
+        // Live watching gave up permanently (watch-resource exhaustion or a
+        // write lock held past the retry budget). Say so loudly and ONCE — the
+        // graph will no longer auto-update, so a long-running MCP session must
+        // not keep assuming it's fresh. The reason already names the remedy
+        // (`codegraph sync` / git sync hooks).
+        process.stderr.write(`[CodeGraph MCP] File watcher degraded — ${reason}\n`);
+      },
+    };
+  }
+
 
   private async doInitialize(searchFrom: string): Promise<void> {
     this.toolHandler.setDefaultProjectHint(searchFrom);
@@ -326,37 +418,7 @@ export class MCPEngine {
       return;
     }
 
-    // Optional override for the debounce window via env var (issue #403).
-    // Useful for workspaces with bursty writes (formatter-on-save chains,
-    // large generated outputs) where the 2s default fires too often. Clamped
-    // to [100ms, 60s]; out-of-range / non-numeric values fall back to the
-    // FileWatcher default. We log the active value so it's discoverable.
-    const debounceMs = parseDebounceEnv(process.env.CODEGRAPH_WATCH_DEBOUNCE_MS);
-    if (debounceMs !== undefined) {
-      process.stderr.write(`[CodeGraph MCP] File watcher debounce: ${debounceMs}ms (CODEGRAPH_WATCH_DEBOUNCE_MS)\n`);
-    }
-
-    const started = this.cg.watch({
-      debounceMs,
-      onSyncComplete: (result) => {
-        if (result.filesChanged > 0) {
-          process.stderr.write(
-            `[CodeGraph MCP] Auto-synced ${result.filesChanged} file(s) in ${result.durationMs}ms\n`
-          );
-        }
-      },
-      onSyncError: (err) => {
-        process.stderr.write(`[CodeGraph MCP] Auto-sync error: ${err.message}\n`);
-      },
-      onDegraded: (reason) => {
-        // Live watching gave up permanently (watch-resource exhaustion or a
-        // write lock held past the retry budget). Say so loudly and ONCE — the
-        // graph will no longer auto-update, so a long-running MCP session must
-        // not keep assuming it's fresh. The reason already names the remedy
-        // (`codegraph sync` / git sync hooks).
-        process.stderr.write(`[CodeGraph MCP] File watcher degraded — ${reason}\n`);
-      },
-    });
+    const started = this.cg.watch(this.watchOptions());
 
     this.watcherStarted = true;
     if (started) {
