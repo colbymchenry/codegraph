@@ -353,9 +353,9 @@ export function applyAliases(
       // baseUrl is absolute; produce a path relative to projectRoot
       const absolute = path.resolve(aliases.baseUrl, filled);
       const relative = path.relative(projectRoot, absolute);
-      // Skip if the rewrite escapes the project root (unsafe + can't
-      // be looked up via the file index anyway).
-      if (relative.startsWith('..')) continue;
+      // Skip only real parent segments (not valid names such as `..generated`),
+      // plus absolute results from cross-drive paths on Windows.
+      if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) continue;
       out.push(relative.replace(/\\/g, '/'));
     }
     return out;
