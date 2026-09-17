@@ -21,11 +21,27 @@ $arch = if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture 
 $target = "win32-$arch"
 
 # 2. Resolve the version (latest release unless pinned).
+#    Use the releases/latest *web* redirect first — the unauthenticated GitHub API
+#    is rate-limited to 60 requests/hour per IP and returns 403 on shared hosts
+#    and CI (issue #325). The redirect has no such limit. Fall back to the API.
 $version = $env:CODEGRAPH_VERSION
 if (-not $version) {
-  $version = (Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest").tag_name
+  try {
+    # Follow the redirect and read the final URL (no API call, no rate limit).
+    $resp = Invoke-WebRequest -Uri "https://github.com/$repo/releases/latest" -UseBasicParsing
+    if ($resp.BaseResponse.ResponseUri.AbsoluteUri -match '/releases/tag/(.+)') {
+      $version = $Matches[1]
+    }
+  } catch { }
 }
-if (-not $version) { throw "codegraph: could not resolve latest version; set CODEGRAPH_VERSION." }
+if (-not $version) {
+  try {
+    $version = (Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest").tag_name
+  } catch { }
+}
+# Release tags are vX.Y.Z; accept a bare X.Y.Z in CODEGRAPH_VERSION too.
+if ($version -and $version -notmatch '^v') { $version = "v$version" }
+if (-not $version) { throw "codegraph: could not resolve latest version; set CODEGRAPH_VERSION (e.g. CODEGRAPH_VERSION=v0.9.7)." }
 
 # 3. Download + extract the bundle into a stable 'current' dir (overwritten on upgrade).
 $url = "https://github.com/$repo/releases/download/$version/codegraph-$target.zip"
