@@ -236,3 +236,84 @@ describe('extractQueryPaths — extension-less kebab basenames', () => {
     expect(out.strippedQuery).toBe('background-image-table then');
   });
 });
+
+/**
+ * Dotless slashed spans (#1830). `scripts/deploy` names a real file that the
+ * index does not hold (no recognized extension), but the shape test demands a
+ * dot-extension on the last segment — so the span was neither pinned NOR
+ * reported, and its fragments (`scripts`, `deploy`) went on to feed FTS. The
+ * agent got a pile of unrelated source with no hint that the file it named was
+ * never consulted. Shape alone cannot decide this (`and/or` is the same shape),
+ * so the caller injects an `existsOnDisk` predicate and the file's existence
+ * decides. These tests also pin that the predicate is genuinely CONSULTED —
+ * a predicate that is never called would make the whole arm vacuous.
+ */
+describe('extractQueryPaths — dotless slashed spans, decided on disk', () => {
+  /** Records every span the predicate is asked about. */
+  const probe = (onDisk: readonly string[]) => {
+    const asked: string[] = [];
+    return {
+      asked,
+      existsOnDisk: (rel: string) => { asked.push(rel); return onDisk.includes(rel); },
+    };
+  };
+
+  it('reports a dotless path that exists on disk but is not indexed', () => {
+    const p = probe(['scripts/deploy']);
+    const out = extractQueryPaths(
+      'why does scripts/deploy fail on release', INDEX, { existsOnDisk: p.existsOnDisk },
+    );
+    expect(out.pinnedFiles).toEqual([]);
+    expect(out.unresolvedPathSpans).toEqual(['scripts/deploy']);
+    expect(out.strippedQuery).toBe('why does fail on release');
+    // Vacuity guard: the verdict came from the predicate, not from some other arm.
+    expect(p.asked).toContain('scripts/deploy');
+  });
+
+  it('leaves the same span alone when no predicate is injected', () => {
+    const q = 'why does scripts/deploy fail on release';
+    const out = extractQueryPaths(q, INDEX);
+    expect(out.unresolvedPathSpans).toEqual([]);
+    expect(out.strippedQuery).toBe(q);
+  });
+
+  it('leaves `and/or` prose alone even though a predicate is injected', () => {
+    const p = probe(['scripts/deploy']);
+    const q = 'does gen_server:call/2 block and/or timeout';
+    const out = extractQueryPaths(q, INDEX, { existsOnDisk: p.existsOnDisk });
+    expect(out.pinnedFiles).toEqual([]);
+    expect(out.unresolvedPathSpans).toEqual([]);
+    expect(out.strippedQuery).toBe(q);
+    // Consulted and refused — not skipped by shape.
+    expect(p.asked).toContain('and/or');
+  });
+
+  it('leaves a slashed word pair that is not a file on disk alone', () => {
+    const p = probe(['scripts/deploy']);
+    const q = 'trace the input/output buffering path';
+    const out = extractQueryPaths(q, INDEX, { existsOnDisk: p.existsOnDisk });
+    expect(out.unresolvedPathSpans).toEqual([]);
+    expect(out.strippedQuery).toBe(q);
+    expect(p.asked).toContain('input/output');
+  });
+
+  it('still reports a dotted span that matches nothing and is not on disk', () => {
+    const p = probe([]);
+    const out = extractQueryPaths(
+      'crash in src/routes/gone/missing-page.svelte on load', INDEX,
+      { existsOnDisk: p.existsOnDisk },
+    );
+    expect(out.unresolvedPathSpans).toEqual(['src/routes/gone/missing-page.svelte']);
+    expect(out.strippedQuery).toBe('crash in on load');
+  });
+
+  it('pins an indexed dotless path by resolution, never asking about it', () => {
+    const p = probe(['scripts/pre-commit']);
+    const out = extractQueryPaths(
+      'what does scripts/pre-commit run', INDEX, { existsOnDisk: p.existsOnDisk },
+    );
+    expect(out.pinnedFiles).toEqual(['scripts/pre-commit']);
+    expect(out.unresolvedPathSpans).toEqual([]);
+    expect(p.asked).not.toContain('scripts/pre-commit');
+  });
+});
