@@ -561,6 +561,56 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(paths.some((p) => p.endsWith('/.kiro/steering/codegraph.md'))).toBe(false);
   });
 
+  it('kimi: install writes mcp.json (mcpServers.codegraph) with no `type` field', () => {
+    const kimi = getTarget('kimi')!;
+    const result = kimi.install('global', { autoAllow: true });
+    const mcp = path.join(tmpHome, '.kimi-code', 'mcp.json');
+    expect(result.files.some((f) => f.path === mcp)).toBe(true);
+
+    const cfg = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    // Kimi Code infers stdio from the presence of `command`; its
+    // documented schema has no `type` field, so we don't write one.
+    expect(cfg.mcpServers.codegraph).toEqual({ command: 'codegraph', args: ['serve', '--mcp'] });
+  });
+
+  it('kimi: install preserves a pre-existing sibling MCP server in mcp.json', () => {
+    const kimi = getTarget('kimi')!;
+    const mcp = path.join(tmpHome, '.kimi-code', 'mcp.json');
+    fs.mkdirSync(path.dirname(mcp), { recursive: true });
+    fs.writeFileSync(mcp, JSON.stringify({
+      mcpServers: { other: { command: 'uvx', args: ['other-server'] } },
+    }, null, 2) + '\n');
+
+    kimi.install('global', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    expect(after.mcpServers.other).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeDefined();
+  });
+
+  it('kimi: uninstall strips codegraph but leaves sibling MCP servers intact', () => {
+    const kimi = getTarget('kimi')!;
+    const mcp = path.join(tmpHome, '.kimi-code', 'mcp.json');
+    fs.mkdirSync(path.dirname(mcp), { recursive: true });
+    fs.writeFileSync(mcp, JSON.stringify({
+      mcpServers: { other: { command: 'uvx', args: ['other-server'] } },
+    }, null, 2) + '\n');
+
+    kimi.install('global', { autoAllow: true });
+    kimi.uninstall('global');
+
+    const after = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    expect(after.mcpServers.other).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeUndefined();
+  });
+
+  it('kimi: local install writes ./.kimi-code/mcp.json', () => {
+    const kimi = getTarget('kimi')!;
+    const result = kimi.install('local', { autoAllow: true });
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    expect(paths.some((p) => p.endsWith('/.kimi-code/mcp.json'))).toBe(true);
+  });
+
   it('antigravity: install writes to LEGACY ~/.gemini/antigravity/mcp_config.json when no migration marker', () => {
     const antigravity = getTarget('antigravity')!;
     antigravity.install('global', { autoAllow: true });
@@ -1350,6 +1400,7 @@ describe('Installer targets — registry', () => {
     expect(getTarget('copilot-vscode')?.id).toBe('copilot-vscode');
     expect(getTarget('copilot-cli')?.id).toBe('copilot-cli');
     expect(getTarget('copilot-jetbrains')?.id).toBe('copilot-jetbrains');
+    expect(getTarget('kimi')?.id).toBe('kimi');
     expect(getTarget('not-a-real-target')).toBeUndefined();
   });
 
@@ -1365,6 +1416,13 @@ describe('Installer targets — registry', () => {
     expect(ids).toContain('copilot-vscode');
     expect(ids).toContain('copilot-cli');
     expect(ids).toContain('copilot-jetbrains');
+  });
+
+  it("resolveTargetFlag('all') and csv include the kimi target", () => {
+    const ids = resolveTargetFlag('all', 'global').map((t) => t.id);
+    expect(ids).toContain('kimi');
+    const csv = resolveTargetFlag('claude,kimi', 'global');
+    expect(csv.map((t) => t.id)).toEqual(['claude', 'kimi']);
   });
 
   it('resolveTargetFlag resolves the Copilot ids from a csv list', () => {
