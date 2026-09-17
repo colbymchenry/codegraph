@@ -760,6 +760,9 @@ export class TreeSitterExtractor {
       //    naturally bounded by real `this.X` expressions, and resolution is
       //    strictly class-scoped (own members or the validated supertype
       //    pass), so nothing fuzzy can leak.
+      //  - `*.<member>` (#1820 obj.method / c.store.Fetch): ALWAYS flush —
+      //    the member is often defined in another file, and resolution is
+      //    unique-or-drop on function/method targets only.
       //  - `Scope::member` (C++ member-pointers, Java/Kotlin type-qualified
       //    method refs, PHP `'Cls::m'`): ALWAYS flush — the explicit-ref
       //    syntax is self-selecting, the referenced type often needs NO
@@ -769,7 +772,7 @@ export class TreeSitterExtractor {
       //  - C-family file-scope initializers skip the gate entirely
       //    (constant-expression context — see FnRefSpec.ungatedModes).
       //  - everything else: name ∈ same-file functions/methods ∪ imports.
-      if (!c.name.startsWith('this.') && !c.name.includes('::')) {
+      if (!c.name.startsWith('this.') && !c.name.startsWith('*.') && !c.name.includes('::')) {
         const skipGate =
           (ungated?.has(c.mode) === true && atFileScope) ||
           c.skipGate === true; // PHP HOF-position string callables (see FnRefCandidate.skipGate)

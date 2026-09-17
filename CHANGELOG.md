@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`callers`/`impact` now see methods passed as values (#1820).** `pool.submit(obj.method, …)`, `thread_pool_exec(self.store.fetch, …)`, and Go `Submit(c.store.Fetch)` were invisible because only `obj.method(...)` call expressions created edges. Those member values are captured as `*.method` and resolve unique-or-drop (same-file first). A second method of the same name in the repo still produces no edge — a wrong callback is worse than none. Direct calls are unchanged. Go `go c.store.Fetch(ids)` was already a call expression and stays a `calls` edge. **Upgrading:** re-index (or start `codegraph serve --mcp` — the daemon rebuilds a graph stamped with an older extractor so the watcher does not keep serving the hole).
+
 ### Highlights
 
 - **`codegraph ui` — your graph in a browser.** A local, read-only viewer for the project you already indexed: your code with its callers and callees in the margin, a map of the whole repository, and a strip that shows how one symbol reaches another.

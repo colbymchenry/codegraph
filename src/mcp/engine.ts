@@ -381,10 +381,22 @@ export class MCPEngine {
   private catchUpSync(): void {
     const cg = this.cg;
     if (!cg) return;
-    const p = cg
-      .sync()
+    // Incremental mtime sync cannot backfill new edge kinds. When the on-disk
+    // graph was built by an older extractor (EXTRACTION_VERSION bump — e.g.
+    // #1820 method-value callers), rebuild once so the watcher daemon does
+    // not keep serving a graph that is missing those edges until a manual
+    // `codegraph index`.
+    const staleExtractor = cg.isIndexStale();
+    const p = (staleExtractor ? cg.indexAll() : cg.sync())
       .then((result) => {
-        const changed = result.filesAdded + result.filesModified + result.filesRemoved;
+        if (staleExtractor) {
+          process.stderr.write(
+            '[CodeGraph MCP] Rebuilt index (extractor newer than on-disk graph) so callers/impact include new edge kinds\n'
+          );
+          return;
+        }
+        const sync = result as { filesAdded: number; filesModified: number; filesRemoved: number };
+        const changed = sync.filesAdded + sync.filesModified + sync.filesRemoved;
         if (changed > 0) {
           process.stderr.write(`[CodeGraph MCP] Caught up ${changed} file(s) changed since last run\n`);
         }

@@ -6,7 +6,8 @@
 //! decorators (`@staticmethod` yes, `@app.route(...)` no — python's `call`
 //! kind isn't `call_expression`), module-level assignments always extract as
 //! `variable` (no isConst hook), and `self.method` fn-ref candidates carry the
-//! BARE attribute name. Python is not a TYPE_ANNOTATION language — no type
+//! BARE attribute name (`obj.method` / `self.store.method` as `*.method`, #1820).
+//! Python is not a TYPE_ANNOTATION language — no type
 //! refs anywhere. Files with parse errors defer to wasm.
 
 use crate::buffers::{
@@ -811,16 +812,20 @@ impl<'t> Walker<'t> {
         for v in values {
             let (name, anchor) = match v.kind() {
                 "identifier" => (self.text(v).to_string(), v),
-                // `self.handle_click` — object EXACTLY `self`; BARE attr name.
+                // `self.handle_click` — object EXACTLY `self`/`cls`; BARE attr
+                // name. Any other receiver (`self.store.fetch`, `Foo.parse`)
+                // is #1820: last identifier as `*.name` (always flushed).
                 "attribute" => {
                     let obj = v.child_by_field_name("object");
                     let attr = v.child_by_field_name("attribute");
                     match (obj, attr) {
                         (Some(o), Some(a))
-                            if o.kind() == "identifier" && self.text(o) == "self" =>
+                            if o.kind() == "identifier"
+                                && matches!(self.text(o), "self" | "cls") =>
                         {
                             (self.text(a).to_string(), a)
                         }
+                        (Some(_), Some(a)) => (format!("*.{}", self.text(a)), a),
                         _ => continue,
                     }
                 }
@@ -872,6 +877,7 @@ impl<'t> Walker<'t> {
         let mut seen: HashSet<(String, String)> = HashSet::new();
         for c in cands {
             if !c.name.starts_with("this.")
+                && !c.name.starts_with("*.")
                 && !c.name.contains("::")
                 && !self.defined_fn_names.contains(&c.name)
                 && !self.imported_names.contains(&c.name)

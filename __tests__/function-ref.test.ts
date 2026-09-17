@@ -859,6 +859,197 @@ describe('Function-as-value capture (#756)', () => {
     }
   });
 
+  it('#1820 PYTHON: obj.method passed as a callback is a caller; a unique method resolves', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-1820-py-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'store.py'),
+      [
+        'class Base:',
+        '    pass',
+        '',
+        'class Store(Base):',
+        '    def fetch(self, ids):',
+        '        return ids',
+      ].join('\n')
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'consumer.py'),
+      [
+        'from concurrent.futures import ThreadPoolExecutor',
+        '',
+        'class Consumer:',
+        '    def __init__(self, store: object):',
+        '        self.store = store',
+        '',
+        '    def direct(self, ids):',
+        '        return self.store.fetch(ids)',
+        '',
+        '    def via_callback(self, ids, pool: ThreadPoolExecutor):',
+        '        return pool.submit(self.store.fetch, ids)',
+      ].join('\n')
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    try {
+      await cg.indexAll();
+      const fetch = cg.getNodesByName('fetch').find((n) => n.kind === 'method')!;
+      const callers = cg.getCallers(fetch.id).map((c) => c.node.name).sort();
+      expect(callers).toContain('direct');
+      expect(callers).toContain('via_callback');
+      expect(sourceNames(cg, fnRefEdgesInto(cg, 'fetch'))).toEqual(['via_callback']);
+    } finally {
+      cg.destroy();
+      tmpDir = undefined;
+    }
+  });
+
+  it('#1820 PYTHON: a test-file mock does not veto the production method', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-1820-py-mock-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'store.py'),
+      'class Store:\n    def fetch(self, ids):\n        return ids\n'
+    );
+    fs.mkdirSync(path.join(tmpDir, 'tests'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'tests', 'test_store.py'),
+      'class FakeStore:\n    def fetch(self, ids):\n        return ids\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'consumer.py'),
+      [
+        'class Consumer:',
+        '    def __init__(self, store):',
+        '        self.store = store',
+        '    def via_callback(self, pool, ids):',
+        '        return pool.submit(self.store.fetch, ids)',
+      ].join('\n')
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    try {
+      await cg.indexAll();
+      const edges = fnRefEdgesInto(cg, 'fetch');
+      expect(sourceNames(cg, edges)).toEqual(['via_callback']);
+      const target = cg.getNode(edges[0]!.target);
+      expect(target?.filePath.endsWith('store.py')).toBe(true);
+    } finally {
+      cg.destroy();
+      tmpDir = undefined;
+    }
+  });
+
+  it('#1820 PYTHON: a NotImplementedError base does not veto the override', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-1820-py-base-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'base.py'),
+      [
+        'class Base:',
+        '    def fetch(self, ids):',
+        '        raise NotImplementedError("subclass")',
+      ].join('\n')
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'store.py'),
+      [
+        'from base import Base',
+        'class Store(Base):',
+        '    def fetch(self, ids):',
+        '        return ids',
+      ].join('\n')
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'consumer.py'),
+      [
+        'class Consumer:',
+        '    def __init__(self, store):',
+        '        self.store = store',
+        '    def via_callback(self, pool, ids):',
+        '        return pool.submit(self.store.fetch, ids)',
+      ].join('\n')
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    try {
+      await cg.indexAll();
+      const edges = fnRefEdgesInto(cg, 'fetch');
+      expect(sourceNames(cg, edges)).toEqual(['via_callback']);
+      const target = cg.getNode(edges[0]!.target);
+      expect(target?.qualifiedName).toContain('Store');
+    } finally {
+      cg.destroy();
+      tmpDir = undefined;
+    }
+  });
+
+  it('#1820 PYTHON: two methods of the same name produce no callback edge', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-1820-py-decoy-'));
+    fs.writeFileSync(path.join(tmpDir, 'a.py'), 'class A:\n    def fetch(self, ids):\n        return ids\n');
+    fs.writeFileSync(path.join(tmpDir, 'b.py'), 'class B:\n    def fetch(self, ids):\n        return ids\n');
+    fs.writeFileSync(
+      path.join(tmpDir, 'consumer.py'),
+      [
+        'class Consumer:',
+        '    def __init__(self, store):',
+        '        self.store = store',
+        '    def via_callback(self, pool, ids):',
+        '        return pool.submit(self.store.fetch, ids)',
+      ].join('\n')
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    try {
+      await cg.indexAll();
+      expect(fnRefEdgesInto(cg, 'fetch')).toHaveLength(0);
+    } finally {
+      cg.destroy();
+      tmpDir = undefined;
+    }
+  });
+
+  it('#1820 GO: method value Submit(c.store.Fetch) is a caller; go Fetch(ids) is a call', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-1820-go-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'store.go'),
+      [
+        'package demo',
+        '',
+        'type Store struct{}',
+        '',
+        'func (s *Store) Fetch(ids []string) []string { return ids }',
+      ].join('\n')
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'consumer.go'),
+      [
+        'package demo',
+        '',
+        'func Submit(fn func([]string) []string, ids []string) []string { return fn(ids) }',
+        '',
+        'type Consumer struct{ store *Store }',
+        '',
+        'func (c *Consumer) Direct(ids []string) []string { return c.store.Fetch(ids) }',
+        '',
+        'func (c *Consumer) ViaGo(ids []string) { go c.store.Fetch(ids) }',
+        '',
+        'func (c *Consumer) ViaSubmit(ids []string) []string { return Submit(c.store.Fetch, ids) }',
+      ].join('\n')
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    try {
+      await cg.indexAll();
+      const fetch = cg.getNodesByName('Fetch').find((n) => n.kind === 'method')!;
+      const callers = cg.getCallers(fetch.id).map((c) => c.node.name).sort();
+      expect(callers).toContain('Direct');
+      expect(callers).toContain('ViaGo');
+      expect(callers).toContain('ViaSubmit');
+      expect(sourceNames(cg, fnRefEdgesInto(cg, 'Fetch'))).toEqual(['ViaSubmit']);
+    } finally {
+      cg.destroy();
+      tmpDir = undefined;
+    }
+  });
+
   it('DRAIN: resolvable function_ref rows leave unresolved_refs; re-index is stable', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-drain-'));
     fs.writeFileSync(

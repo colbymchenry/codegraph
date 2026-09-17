@@ -45,8 +45,8 @@ custom `visitNode` hooks like Scala's val/var handler) get a candidates-only
 | C / ObjC | `argument_list` | `assignment_expression.right` | `initializer_pair.value` | `initializer_list`, `init_declarator.value` | `&fn` (`pointer_expression`), `@selector(...)` (ObjC) |
 | C++ | **`&` forms only** in args/rhs/varinit | (same — explicit `&` only) | bare ids at FILE scope only | bare ids at FILE scope only | `&fn`, `&Cls::method` (resolved scoped to the class) |
 | TS / JS (tsx/jsx) | `arguments` | `assignment_expression.right` | `pair.value` | `array`, `variable_declarator.value` | `this.method` (`member_expression`, class-scoped — see rule 3) |
-| Python | `argument_list`, `keyword_argument.value`, `return_statement` (#1478 — single expression only; tuple returns not descended) | `assignment.right` | `pair.value` | `list` | `self.method` (`attribute`) |
-| Go | `argument_list` | `assignment_statement` / `short_var_declaration` (`expression_list`) | `keyed_element` | `literal_value`, `var_spec.value` | — |
+| Python | `argument_list`, `keyword_argument.value`, `return_statement` (#1478 — single expression only; tuple returns not descended) | `assignment.right` | `pair.value` | `list` | `self.method` (`attribute`); `obj.method` / `self.store.method` as `*.method` (#1820, unique-or-drop) |
+| Go | `argument_list` | `assignment_statement` / `short_var_declaration` (`expression_list`) | `keyed_element` | `literal_value`, `var_spec.value` | `c.store.Fetch` method value as `*.Fetch` (#1820); `go c.store.Fetch(ids)` is a call, not this form |
 | Rust | `arguments` | `assignment_expression.right` | `field_initializer.value` | `array_expression`, `static_item` / `let_declaration.value` | — |
 | Java | `argument_list` | `assignment_expression.right` | — | `variable_declarator.value` | `method_reference` (`Cls::m`, `this::m`) — the only form |
 | Kotlin | `value_arguments` | `assignment` (last child) | — | — | `callable_reference` (`::f`), `navigation_expression` `this::m` |

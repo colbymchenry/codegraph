@@ -25,9 +25,10 @@
  *
  * Deliberately NOT covered (resolving the *dispatch* — `o->cb(x)` → the
  * registered function — needs data-flow through struct fields; a wrong edge
- * is worse than none): indirect-call resolution and `obj.method` member
- * values where `obj` isn't `this`/`self` (the receiver's type is statically
- * unknowable without local data-flow).
+ * is worse than none): indirect-call resolution. Member values where the
+ * receiver isn't `this`/`self` (`pool.submit(obj.method)`, `Submit(c.store.Fetch)`)
+ * ARE captured as `*.method` (#1820) and resolve unique-or-drop to a
+ * function/method of that name — same discipline as C ungated tables.
  */
 
 import type { Node as SyntaxNode } from 'web-tree-sitter';
@@ -231,6 +232,7 @@ const GO_SPEC: FnRefSpec = {
     ['literal_element', null],
     ['expression_list', null],
   ]),
+  special: new Set(['selector_expression']),
 };
 
 const RUST_SPEC: FnRefSpec = {
@@ -699,16 +701,19 @@ function normalizeSpecial(
       return [];
     }
 
-    // Swift `#selector(Holder.fire)` → fire. ObjC `@selector(storeImage:)` →
-    // `storeImage:` verbatim (ObjC method nodes keep their selector colons).
+    // Go `c.store.Fetch` (has a `field` child) vs Swift `#selector(...)` /
+    // ObjC `@selector(...)` (no `field` — inner identifier / selector text).
     case 'selector_expression': {
+      const field = getChildByField(node, 'field');
+      if (field) {
+        const name = getNodeText(field, source);
+        return name ? [{ name: `*.${name}`, node: field, skipGate: true }] : [];
+      }
       const inner = node.namedChild(0);
       if (!inner) return [];
       if (inner.type === 'identifier' || inner.type === 'simple_identifier') {
         return [{ name: getNodeText(inner, source), node: inner }];
       }
-      // Swift dotted form: rightmost simple_identifier. ObjC keyword selector:
-      // text as-is.
       const last = lastNamedOfType(node, new Set(['simple_identifier']));
       if (last) return [{ name: getNodeText(last, source), node: last }];
       return [{ name: getNodeText(inner, source).trim(), node: inner }];
@@ -739,14 +744,23 @@ function normalizeSpecial(
       return [];
     }
 
-    // `self.handle_click` (Python) — object must be EXACTLY `self`.
+    // `self.handle_click` (Python) — object EXACTLY `self`/`cls` keeps the
+    // bare attribute name (same-file method gate). Any other receiver
+    // (`self.store.fetch`, `FileService.parse`) is #1820: last identifier
+    // as `*.name`, skipGate so a unique cross-file method can resolve.
     case 'attribute': {
       const obj = getChildByField(node, 'object');
       const attr = getChildByField(node, 'attribute');
-      if (obj && attr && obj.type === 'identifier' && getNodeText(obj, source) === 'self') {
-        return [{ name: getNodeText(attr, source), node: attr }];
+      if (!obj || !attr) return [];
+      const name = getNodeText(attr, source);
+      if (!name) return [];
+      if (
+        obj.type === 'identifier' &&
+        (getNodeText(obj, source) === 'self' || getNodeText(obj, source) === 'cls')
+      ) {
+        return [{ name, node: attr }];
       }
-      return [];
+      return [{ name: `*.${name}`, node: attr, skipGate: true }];
     }
 
     // `this.Run0` (C#) — receiver must be EXACTLY `this`. Two grammar shapes:

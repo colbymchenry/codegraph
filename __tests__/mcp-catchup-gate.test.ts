@@ -3,7 +3,10 @@
  * filesystem reconcile so it never serves rows for files that were
  * deleted (or edited) while no MCP server was running.
  *
- * Background: `MCPEngine.catchUpSync()` fires `cg.sync()` in the background.
+ * Background: `MCPEngine.catchUpSync()` fires `cg.sync()` in the background
+ * (or `cg.indexAll()` when the on-disk extractor stamp is older than
+ * EXTRACTION_VERSION, so a daemon start after #1820-style edge-kind bumps
+ * rebuilds instead of serving a hole until a manual re-index).
  * Before this fix it was fire-and-forget — a tool call could race past it
  * and return rows for files that no longer exist on disk. The per-file
  * staleness banner (`withStalenessNotice`) couldn't help, because

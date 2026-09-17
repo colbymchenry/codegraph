@@ -9,6 +9,21 @@ import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, SUPERTYPE_TARGET_KINDS, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_BUILT_INS, TS_PRIMITIVE_TYPES } from './js-builtins';
+import { isTestFile } from '../search/query-utils';
+
+/** True when a method body is only a not-implemented stub (Python ABC default). */
+function isNotImplementedStub(n: Node, context: ResolutionContext): boolean {
+  const src = context.readFile(n.filePath);
+  if (!src) return false;
+  const start = Math.max(0, n.startLine - 1);
+  const end = Math.max(start + 1, n.endLine);
+  const body = src.split('\n').slice(start, end).join('\n');
+  return (
+    /\bNotImplementedError\b/.test(body) ||
+    /\bnotImplemented\b/.test(body) ||
+    /throw new (?:Error|UnsupportedOperationException)\(\s*['"]not implemented/i.test(body)
+  );
+}
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -215,6 +230,61 @@ export function matchFunctionRef(
   // `this.<member>` refs are resolved ONLY by the class-scoped resolver in
   // resolveOne (resolveThisMemberFnRef) — never by name matching here.
   if (ref.referenceName.startsWith('this.')) return null;
+
+  // #1820: `obj.method` / `c.store.Fetch` captured as `*.method`. Methods
+  // AND functions, same-file first, unique-or-drop cross-file. Bare Python
+  // ids stay function-only (the KIND FILTER test); this prefix is only
+  // emitted for an actual member-value AST node.
+  if (ref.referenceName.startsWith('*.')) {
+    const memberName = ref.referenceName.slice(2);
+    if (!memberName) return null;
+    const memberCandidates = context
+      .getNodesByName(memberName)
+      .filter(
+        (n) =>
+          (n.kind === 'function' || n.kind === 'method') &&
+          sameLanguageFamily(n.language, ref.language) &&
+          n.id !== ref.fromNodeId
+      );
+    if (memberCandidates.length === 0) return null;
+    const sameFileMember = memberCandidates.filter((n) => n.filePath === ref.filePath);
+    if (sameFileMember.length > 0) {
+      const target = sameFileMember.reduce((a, b) => (a.startLine <= b.startLine ? a : b));
+      return {
+        original: ref,
+        targetNodeId: target.id,
+        confidence: sameFileMember.length === 1 ? 0.95 : 0.9,
+        resolvedBy: 'function-ref',
+      };
+    }
+    // Test doubles (`class _Store: def fetch`) must not veto the one production
+    // method of the same name — that was #1820 still looking "unique-or-drop
+    // silent" on a real repo with unit-test mocks.
+    const production = memberCandidates.filter((n) => !isTestFile(n.filePath));
+    const pool = production.length > 0 ? production : memberCandidates;
+    if (pool.length === 1) {
+      return {
+        original: ref,
+        targetNodeId: pool[0]!.id,
+        confidence: 0.8,
+        resolvedBy: 'function-ref',
+      };
+    }
+    // Base `raise NotImplementedError` / equivalent stubs must not veto the
+    // one real override (`DocStoreConnection.delete_payload_fields` vs
+    // `QdrantConnection.delete_payload_fields`). Two real implementations
+    // still unique-or-drop.
+    const impls = pool.filter((n) => !isNotImplementedStub(n, context));
+    if (impls.length === 1) {
+      return {
+        original: ref,
+        targetNodeId: impls[0]!.id,
+        confidence: 0.8,
+        resolvedBy: 'function-ref',
+      };
+    }
+    return null;
+  }
 
   // In JS/TS/Python a bare identifier can never be a method value (methods
   // are only reachable through a receiver — `this.m` / `self.m` /

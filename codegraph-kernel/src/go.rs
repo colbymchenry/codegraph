@@ -1006,6 +1006,25 @@ impl<'t> Walker<'t> {
                     row: p.row,
                 });
             }
+            // #1820: `c.store.Fetch` method value — last field as `*.Fetch`.
+            "selector_expression" => {
+                let field = v
+                    .child_by_field_name("field")
+                    .or_else(|| v.named_child(v.named_child_count().saturating_sub(1)));
+                let Some(field) = field else { return };
+                let name = self.text(field);
+                if name.is_empty() || is_stoplisted(name) {
+                    return;
+                }
+                let p = field.start_position();
+                self.fn_ref_cands.push(Cand {
+                    from,
+                    name: format!("*.{name}"),
+                    line: p.row as u32 + 1,
+                    column_byte: field.start_byte(),
+                    row: p.row,
+                });
+            }
             "literal_element" | "expression_list" => {
                 for i in 0..v.named_child_count() {
                     if let Some(c) = v.named_child(i) {
@@ -1047,6 +1066,7 @@ impl<'t> Walker<'t> {
         let mut seen: HashSet<(String, String)> = HashSet::new();
         for c in cands {
             if !c.name.starts_with("this.")
+                && !c.name.starts_with("*.")
                 && !c.name.contains("::")
                 && !self.defined_fn_names.contains(&c.name)
                 && !self.imported_names.contains(&c.name)
