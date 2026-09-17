@@ -180,6 +180,13 @@ export interface ParseWorkerPoolOptions {
    * the worker's own disk read.
    */
   grammarBuffers?: Record<string, Uint8Array>;
+  /**
+   * Project root (absolute). Forwarded to every worker so language extractors
+   * that need SIBLING-file context (VueExtractor resolving an imported type
+   * declaration) can turn a project-relative filePath into a real path.
+   * Optional: without it those extractors simply skip cross-file work.
+   */
+  rootHint?: string;
 }
 
 export class ParseWorkerPool {
@@ -202,10 +209,12 @@ export class ParseWorkerPool {
   private readonly createWorker: () => ParsePoolWorker;
   private readonly log: (msg: string) => void;
   private readonly grammarBuffers?: Record<string, Uint8Array>;
+  private readonly rootHint?: string;
 
   constructor(opts: ParseWorkerPoolOptions) {
     this.languages = opts.languages;
     this.grammarBuffers = opts.grammarBuffers;
+    this.rootHint = opts.rootHint;
     this.maxSize = Math.max(1, Math.min(opts.size, MAX_PARSE_POOL_SIZE));
     this.recycleInterval = opts.recycleInterval ?? DEFAULT_RECYCLE_INTERVAL;
     this.parseTimeoutMs = opts.parseTimeoutMs ?? DEFAULT_PARSE_TIMEOUT_MS;
@@ -284,7 +293,7 @@ export class ParseWorkerPool {
     // Load grammars; the worker replies 'grammars-loaded' and only then is idle.
     // Pre-read WASM bytes (when the orchestrator provided them) make this a
     // memory load instead of a per-spawn disk read.
-    w.postMessage({ type: 'load-grammars', languages: this.languages, grammarBuffers: this.grammarBuffers });
+    w.postMessage({ type: 'load-grammars', languages: this.languages, grammarBuffers: this.grammarBuffers, rootHint: this.rootHint });
   }
 
   private onMessage(w: ParsePoolWorker, m: ParseWorkerMessage): void {

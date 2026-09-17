@@ -20,7 +20,6 @@ import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_NO_ROOT_INDEX } from './server
 import { CodeGraphPackageVersion } from './version';
 import { resolveServerRoot } from '../directory';
 import { getTelemetry, ClientInfo } from '../telemetry';
-import { getUpdateNotice } from '../upgrade/update-check';
 import { ExploreSessionState } from './explore-session-state';
 
 /**
@@ -38,7 +37,9 @@ export const SERVER_INFO = {
  * Instructions for the `initialize` response, with the update-availability
  * notice appended when one is known (#1243). Exported so the proxy's local
  * handshake sends the IDENTICAL payload — same convention as SERVER_INFO.
- * `getUpdateNotice` is a memoized synchronous cache read, so the #172
+ * FORK: the update notice is disabled (default null) — a private fork must
+ * never suggest "upgrading" to an upstream release lacking the fork's changes.
+ * `getUpdateNotice` was a memoized synchronous cache read, so the #172
  * respond-fast contract holds; when no notice exists the instructions are
  * byte-identical to the bare constants.
  *
@@ -47,7 +48,7 @@ export const SERVER_INFO = {
  * instructions equality must set `CODEGRAPH_NO_UPDATE_CHECK=1` in the spawn
  * env or it will fail only in the weeks after a release ships.
  */
-export function initializeInstructions(base: string, notice: string | null = getUpdateNotice()): string {
+export function initializeInstructions(base: string, notice: string | null = null): string {
   if (!notice) return base;
   return (
     `${base}\n\n---\n${notice} This server keeps running the old version until ` +

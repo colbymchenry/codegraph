@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 9;
+export const CURRENT_SCHEMA_VERSION = 10;
 
 /**
  * Migration definition
@@ -175,6 +175,32 @@ const migrations: Migration[] = [
       db.exec(
         'CREATE INDEX IF NOT EXISTS idx_files_generated ON files(path) WHERE generated = 1'
       );
+    },
+  },
+  {
+    version: 10,
+    description:
+      'Add nodes.metadata — kind-specific structured payload (component nodes carry componentApi: props/emits/slots/exposed)',
+    up: (db) => {
+      // DDL only — instant on any size database, and NO backfill: the payload
+      // comes from Vue SFC extraction, which this migration has no access to
+      // (the nodes table stores no source). Migrated rows stay NULL until the
+      // next Vue re-extraction writes one; `sync` heals file-by-file as files
+      // change. Readers must treat NULL metadata as "not extracted yet", not
+      // "no API". ALTER TABLE has no IF NOT EXISTS, so guard for idempotency —
+      // a database created from current schema.sql already has the column.
+      // Keep in lockstep with schema.sql. Also guard the TABLE itself: the
+      // migration runner can be pointed at a minimal synthetic database (the
+      // generated-flag-index legacy fixture carries only `files`), and a
+      // missing nodes table means there is nothing to upgrade.
+      const hasNodes = (
+        db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'nodes'").all() as Array<{ name: string }>
+      ).length > 0;
+      if (!hasNodes) return;
+      const cols = db.prepare('PRAGMA table_info(nodes)').all() as Array<{ name: string }>;
+      if (!cols.some((c) => c.name === 'metadata')) {
+        db.exec('ALTER TABLE nodes ADD COLUMN metadata TEXT');
+      }
     },
   },
 ];
