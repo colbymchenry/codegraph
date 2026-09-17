@@ -155,6 +155,40 @@ export function unsafeIndexRootReason(projectRoot: string): string | null {
   return null;
 }
 
+/**
+ * Resolve `dir` to its `realpathSync` form (symlinks + `.`/`..` collapsed),
+ * falling back to the input on failure (e.g. a path that vanished mid-call).
+ * Used as the stat-failure fallback of {@link canonicalRootKey}.
+ */
+function canonicalizeRoot(dir: string): string {
+  try {
+    return fs.realpathSync(dir);
+  } catch {
+    return dir;
+  }
+}
+
+/**
+ * A stable filesystem-IDENTITY key for an index root: `"<dev>:<ino>"`. Unlike a
+ * path string — even a realpath'd one — this is identical for EVERY spelling of
+ * the same physical directory, including a case-variant on a case-insensitive
+ * mount (Windows NTFS, or WSL's DrvFs `/mnt/c`) where `realpathSync` preserves
+ * the caller's casing and so cannot dedupe. The MCP server keys its open-DB
+ * connection cache by this so two spellings of one repo share ONE SQLite
+ * connection instead of opening a second that corrupts the shared
+ * `.codegraph/codegraph.db` (#1057, same second-connection mechanism as #238).
+ * Falls back to the realpath'd path when the directory can't be stat'd (e.g. it
+ * vanished mid-call), so the key stays usable and stable-enough.
+ */
+export function canonicalRootKey(root: string): string {
+  try {
+    const s = fs.statSync(root);
+    return `${s.dev}:${s.ino}`;
+  } catch {
+    return canonicalizeRoot(root);
+  }
+}
+
 export function findNearestCodeGraphRoot(startPath: string): string | null {
   let current = path.resolve(startPath);
   const root = path.parse(current).root;
