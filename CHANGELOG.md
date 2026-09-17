@@ -145,6 +145,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- The Claude Code prompt hook no longer runs on the task-notification messages Claude Code injects when a background agent finishes, removing a multi-second stall on every such turn. (#1832)
+
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
 - Turning telemetry off now resets its identity and stops running processes from recording, sending, or restoring unsent data. (#1869)

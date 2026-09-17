@@ -899,3 +899,14 @@ export function validateDirectory(projectRoot: string): {
     errors,
   };
 }
+
+/**
+ * Claude Code injects `<task-notification>…</task-notification>` blocks as
+ * `user` messages when a background agent finishes, and UserPromptSubmit
+ * hooks receive them exactly like typed prompts (#1832). The whole prompt
+ * must be that single envelope; a user question that merely mentions the
+ * marker is still a prompt.
+ */
+export function isTaskNotification(prompt: string): boolean {
+  return /^\s*<task-notification>[\s\S]*<\/task-notification>\s*$/.test(prompt);
+}
