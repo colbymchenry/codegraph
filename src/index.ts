@@ -23,6 +23,7 @@ import {
   TaskContext,
   BuildContextOptions,
   FindRelevantContextOptions,
+  ImpactOptions,
   UnresolvedReference,
 } from './types';
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
@@ -2004,8 +2005,8 @@ export class CodeGraph {
    * @param maxDepth - Maximum depth to traverse (default: 3)
    * @returns Subgraph containing potentially impacted nodes
    */
-  getImpactRadius(nodeId: string, maxDepth: number = 3): Subgraph {
-    return this.traverser.getImpactRadius(nodeId, maxDepth);
+  getImpactRadius(nodeId: string, maxDepth: number = 3, options: ImpactOptions = {}): Subgraph {
+    return this.traverser.getImpactRadius(nodeId, maxDepth, options);
   }
 
   /**

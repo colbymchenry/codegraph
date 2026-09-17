@@ -82,6 +82,44 @@ describe('LRUCache', () => {
     expect(() => new LRUCache(NaN)).toThrow();
   });
 
+  it('evicts by retained weight as well as entry count', () => {
+    const cache = new LRUCache<string, string>(100, {
+      maxWeight: 10,
+      weightOf: (value) => value.length,
+    });
+    cache.set('a', '1234');
+    cache.set('b', '5678');
+    expect(cache.get('a')).toBe('1234'); // refresh a; b is now oldest
+    cache.set('c', '9012');
+    expect(cache.get('b')).toBeUndefined();
+    expect(cache.get('a')).toBe('1234');
+    expect(cache.get('c')).toBe('9012');
+  });
+
+  it('does not retain a single entry larger than the weight budget', () => {
+    const cache = new LRUCache<string, string>(10, {
+      maxWeight: 4,
+      weightOf: (value) => value.length,
+    });
+    cache.set('too-large', '12345');
+    expect(cache.size).toBe(0);
+  });
+
+  it('updates weight accounting on replacement and clear', () => {
+    const cache = new LRUCache<string, string>(10, {
+      maxWeight: 6,
+      weightOf: (value) => value.length,
+    });
+    cache.set('a', '12345');
+    cache.set('a', '1');
+    cache.set('b', '23456');
+    expect(cache.get('a')).toBe('1');
+    expect(cache.get('b')).toBe('23456');
+    cache.clear();
+    cache.set('c', '123456');
+    expect(cache.get('c')).toBe('123456');
+  });
+
   it('stays bounded under heavy churn (regression for OOM scenario)', () => {
     const cache = new LRUCache<string, number>(100);
     for (let i = 0; i < 10_000; i++) {

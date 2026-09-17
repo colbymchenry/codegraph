@@ -112,8 +112,14 @@ export class CfmlExtractor {
       return;
     }
 
-    const fileNode = this.createFileNode();
-    this.walkProgram(tree.rootNode, fileNode.id);
+    try {
+      const fileNode = this.createFileNode();
+      this.walkProgram(tree.rootNode, fileNode.id);
+    } finally {
+      // Tree-sitter trees own WASM/native memory outside V8's heap. Tag-based
+      // CFML bypasses TreeSitterExtractor, so it must release its tree here.
+      tree.delete();
+    }
   }
 
   /** Build the file's own `kind:'file'` node, spanning the whole source. Tag-based files need this explicitly — unlike `extractBareScript` (which delegates the whole file to `TreeSitterExtractor` and inherits its file node), `extractTagBased` walks the tree itself and has no other source of one. */
