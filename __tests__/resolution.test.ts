@@ -173,6 +173,209 @@ describe('Resolution Module', () => {
       expect(matchReference(appRef('my_behaviour'), context)?.targetNodeId).toBe(behaviourModule.id);
     });
 
+    it('should resolve Elixir bare calls same-file only, and implements refs to namespaces only', () => {
+      const mkNode = (partial: Partial<Node> & Pick<Node, 'id' | 'kind' | 'name' | 'qualifiedName' | 'filePath'>): Node => ({
+        language: 'elixir',
+        startLine: 1,
+        endLine: 1,
+        startColumn: 0,
+        endColumn: 0,
+        updatedAt: Date.now(),
+        ...partial,
+      });
+      // A cross-file `config/1` function that Mix's `config :app, …` DSL calls
+      // must NOT link to, and a same-file `helper/1` that a bare call must.
+      const crossFileConfig = mkNode({
+        id: 'function:lib/consumer.ex:config:5',
+        kind: 'function',
+        name: 'config',
+        qualifiedName: 'MyApp.Consumer::config',
+        filePath: 'lib/consumer.ex',
+      });
+      const sameFileHelper = mkNode({
+        id: 'function:lib/worker.ex:helper:20',
+        kind: 'function',
+        name: 'helper',
+        qualifiedName: 'MyApp.Worker::helper',
+        filePath: 'lib/worker.ex',
+      });
+      const behaviourModule = mkNode({
+        id: 'namespace:lib/my_behaviour.ex:MyBehaviour:1',
+        kind: 'namespace',
+        name: 'MyBehaviour',
+        qualifiedName: 'MyBehaviour',
+        filePath: 'lib/my_behaviour.ex',
+      });
+      // The caller — `MyApp.Worker.run/1` — so bare calls resolve within its
+      // own module (`MyApp.Worker`, same module as sameFileHelper).
+      const runCaller = mkNode({
+        id: 'function:lib/worker.ex:run:3',
+        kind: 'function',
+        name: 'run',
+        qualifiedName: 'MyApp.Worker::run',
+        filePath: 'lib/worker.ex',
+        startLine: 3,
+      });
+      const nodes = [crossFileConfig, sameFileHelper, behaviourModule, runCaller];
+      const byId = new Map(nodes.map((n) => [n.id, n]));
+      const context: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: (name) => nodes.filter((n) => n.name === name),
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => false,
+        readFile: () => null,
+        getProjectRoot: () => '/test',
+        getAllFiles: () => [],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
+        getNodeById: (id) => byId.get(id) ?? null,
+      };
+      const mkRef = (name: string, kind: 'calls' | 'references' | 'implements') => ({
+        fromNodeId: 'function:lib/worker.ex:run:3',
+        referenceName: name,
+        referenceKind: kind,
+        line: 4,
+        column: 0,
+        filePath: 'lib/worker.ex',
+        language: 'elixir' as const,
+      });
+
+      // Bare call to a function that only exists in ANOTHER file: silence.
+      expect(matchReference(mkRef('config', 'calls'), context)).toBeNull();
+      // Bare call to a same-file function resolves.
+      expect(matchReference(mkRef('helper', 'calls'), context)?.targetNodeId).toBe(sameFileHelper.id);
+      // Bare capture reference follows the same rule.
+      expect(matchReference(mkRef('helper', 'references'), context)?.targetNodeId).toBe(sameFileHelper.id);
+      expect(matchReference(mkRef('config', 'references'), context)).toBeNull();
+      // `@behaviour`/`use` implements refs resolve only to module namespaces;
+      // an out-of-repo behaviour stays unresolved.
+      expect(matchReference(mkRef('MyBehaviour', 'implements'), context)?.targetNodeId).toBe(behaviourModule.id);
+      expect(matchReference(mkRef('GenServer', 'implements'), context)).toBeNull();
+    });
+
+    describe('Elixir bare-call resolution qualifies by enclosing module', () => {
+      // One file, two modules that BOTH define `helper/0`. A bare `helper()`
+      // call must resolve to the CALLER's module's function, never the other
+      // module's — a cross-module edge is a wrong edge, worse than none.
+      const mkNode = (
+        partial: Partial<Node> & Pick<Node, 'id' | 'kind' | 'name' | 'qualifiedName' | 'filePath'>
+      ): Node => ({
+        language: 'elixir',
+        startLine: 1,
+        endLine: 1,
+        startColumn: 0,
+        endColumn: 0,
+        updatedAt: Date.now(),
+        ...partial,
+      });
+      const FILE = 'lib/two_mods.ex';
+      // Module A defined FIRST so getNodesByName returns A's helper first —
+      // pre-fix, a bare call from B would (wrongly) pick A[0].
+      const aHelper = mkNode({
+        id: 'function:lib/two_mods.ex:helper:2',
+        kind: 'function',
+        name: 'helper',
+        qualifiedName: 'Sample.A::helper',
+        filePath: FILE,
+        startLine: 2,
+      });
+      const aModule = mkNode({
+        id: 'namespace:lib/two_mods.ex:Sample.A:1',
+        kind: 'namespace',
+        name: 'Sample.A',
+        qualifiedName: 'Sample.A',
+        filePath: FILE,
+        startLine: 1,
+      });
+      const bHelper = mkNode({
+        id: 'function:lib/two_mods.ex:helper:12',
+        kind: 'function',
+        name: 'helper',
+        qualifiedName: 'Sample.B::helper',
+        filePath: FILE,
+        startLine: 12,
+      });
+      const bRun = mkNode({
+        id: 'function:lib/two_mods.ex:run:14',
+        kind: 'function',
+        name: 'run',
+        qualifiedName: 'Sample.B::run',
+        filePath: FILE,
+        startLine: 14,
+      });
+      const bModule = mkNode({
+        id: 'namespace:lib/two_mods.ex:Sample.B:11',
+        kind: 'namespace',
+        name: 'Sample.B',
+        qualifiedName: 'Sample.B',
+        filePath: FILE,
+        startLine: 11,
+      });
+
+      const mkContext = (nodes: Node[]): ResolutionContext => {
+        const byId = new Map(nodes.map((n) => [n.id, n]));
+        return {
+          getNodesInFile: () => [],
+          // A's helper first, so the OLD `sameFile[0]` picks the wrong module.
+          getNodesByName: (name) => nodes.filter((n) => n.name === name),
+          getNodesByQualifiedName: () => [],
+          getNodesByKind: () => [],
+          fileExists: () => false,
+          readFile: () => null,
+          getProjectRoot: () => '/test',
+          getAllFiles: () => [],
+          getNodesByLowerName: () => [],
+          getImportMappings: () => [],
+          getNodeById: (id) => byId.get(id) ?? null,
+        };
+      };
+
+      const mkRef = (fromNodeId: string) => ({
+        fromNodeId,
+        referenceName: 'helper',
+        referenceKind: 'calls' as const,
+        line: 15,
+        column: 4,
+        filePath: FILE,
+        language: 'elixir' as const,
+      });
+
+      it('(a) resolves a bare call to the CALLER module, not the first same-named function', () => {
+        const context = mkContext([aModule, aHelper, bModule, bHelper, bRun]);
+        const result = matchReference(mkRef(bRun.id), context);
+        expect(result).not.toBeNull();
+        // The wrong-target guard: must be B's helper, never A's.
+        const target = [aModule, aHelper, bModule, bHelper, bRun].find(
+          (n) => n.id === result!.targetNodeId
+        );
+        expect(target?.qualifiedName).toBe('Sample.B::helper');
+        expect(result!.targetNodeId).toBe(bHelper.id);
+      });
+
+      it('(b) stays unresolved when only ANOTHER module defines the name', () => {
+        // Only module A defines helper; the call lives in module B → no edge
+        // (pre-fix this wrongly created B.run → A::helper).
+        const context = mkContext([aModule, aHelper, bModule, bRun]);
+        expect(matchReference(mkRef(bRun.id), context)).toBeNull();
+      });
+
+      it('(c) control: single module, bare call to own function resolves', () => {
+        const context = mkContext([bModule, bHelper, bRun]);
+        const result = matchReference(mkRef(bRun.id), context);
+        expect(result?.targetNodeId).toBe(bHelper.id);
+      });
+
+      it('(d) module-attribute caller (namespace node) resolves to its own module', () => {
+        // c4c0eec: a call inside a custom module-attribute value carries the
+        // MODULE namespace node as fromNode. It must still resolve to that
+        // module's helper.
+        const context = mkContext([aModule, aHelper, bModule, bHelper, bRun]);
+        const result = matchReference(mkRef(bModule.id), context);
+        expect(result?.targetNodeId).toBe(bHelper.id);
+      });
+    });
+
     it('should prefer same-module candidates over cross-module matches', () => {
       // Simulates a Python monorepo where multiple apps define navigate()
       const candidateA: Node = {
