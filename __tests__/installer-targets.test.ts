@@ -561,6 +561,107 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(paths.some((p) => p.endsWith('/.kiro/steering/codegraph.md'))).toBe(false);
   });
 
+  it('devin: global install writes ~/.config/devin/mcp_config.json with a schema-exact entry (no `type`)', () => {
+    const devin = getTarget('devin')!;
+    const result = devin.install('global', { autoAllow: true });
+    const mcp = path.join(tmpHome, '.config', 'devin', 'mcp_config.json');
+    const agents = path.join(tmpHome, '.config', 'devin', 'AGENTS.md');
+    expect(result.files.some((f) => f.path === mcp)).toBe(true);
+    expect(result.files.some((f) => f.path === agents)).toBe(true);
+
+    const cfg = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    // Devin's mcp_config schema is additionalProperties:false — no `type`.
+    expect(cfg.mcpServers.codegraph).toEqual({ command: 'codegraph', args: ['serve', '--mcp'] });
+    expect(fs.readFileSync(agents, 'utf-8')).toContain('CODEGRAPH_START');
+  });
+
+  it('devin: local install writes ./.devin/mcp_config.json and the project-root ./AGENTS.md block (#704)', () => {
+    const devin = getTarget('devin')!;
+    const result = devin.install('local', { autoAllow: true });
+    const paths = result.files.map((f) => f.path.replace(/\\/g, '/'));
+    expect(paths.some((p) => p.endsWith('/.devin/mcp_config.json'))).toBe(true);
+    expect(paths.some((p) => p.endsWith('/AGENTS.md'))).toBe(true);
+    const cfg = JSON.parse(fs.readFileSync(path.join(process.cwd(), '.devin', 'mcp_config.json'), 'utf-8'));
+    expect(cfg.mcpServers.codegraph).toEqual({ command: 'codegraph', args: ['serve', '--mcp'] });
+  });
+
+  it('devin: install preserves a pre-existing sibling MCP server in mcp_config.json', () => {
+    const devin = getTarget('devin')!;
+    const mcp = path.join(tmpHome, '.config', 'devin', 'mcp_config.json');
+    fs.mkdirSync(path.dirname(mcp), { recursive: true });
+    fs.writeFileSync(mcp, JSON.stringify({
+      mcpServers: { other: { command: 'bunx', args: ['other-server'], disabled: true } },
+    }, null, 2) + '\n');
+
+    devin.install('global', { autoAllow: true });
+
+    const after = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    expect(after.mcpServers.other).toEqual({ command: 'bunx', args: ['other-server'], disabled: true });
+    expect(after.mcpServers.codegraph).toBeDefined();
+  });
+
+  it('devin: uninstall strips codegraph and the AGENTS.md block, leaving siblings', () => {
+    const devin = getTarget('devin')!;
+    const mcp = path.join(tmpHome, '.config', 'devin', 'mcp_config.json');
+    const agents = path.join(tmpHome, '.config', 'devin', 'AGENTS.md');
+    fs.mkdirSync(path.dirname(mcp), { recursive: true });
+    fs.writeFileSync(mcp, JSON.stringify({
+      mcpServers: { other: { command: 'bunx', args: ['other-server'] } },
+    }, null, 2) + '\n');
+    fs.writeFileSync(agents, `# My Devin rules\n\n${LEGACY_BLOCK}\n`);
+
+    devin.install('global', { autoAllow: true });
+    devin.uninstall('global');
+
+    const after = JSON.parse(fs.readFileSync(mcp, 'utf-8'));
+    expect(after.mcpServers.other).toBeDefined();
+    expect(after.mcpServers.codegraph).toBeUndefined();
+    const body = fs.readFileSync(agents, 'utf-8');
+    expect(body).toContain('# My Devin rules');
+    expect(body).not.toContain('CODEGRAPH_START');
+  });
+
+  it('devin: install self-heals a stale pre-#529 AGENTS.md block', () => {
+    const devin = getTarget('devin')!;
+    const agents = path.join(tmpHome, '.config', 'devin', 'AGENTS.md');
+    fs.mkdirSync(path.dirname(agents), { recursive: true });
+    fs.writeFileSync(agents, `${LEGACY_BLOCK}\n`);
+
+    devin.install('global', { autoAllow: true });
+
+    const body = fs.readFileSync(agents, 'utf-8');
+    expect(body).toContain('CODEGRAPH_START');
+    expect(body).not.toContain('codegraph_search');
+  });
+
+  it('devin: install and uninstall strip a legacy config.json mcpServers entry (pre-v3000.3 location)', () => {
+    const devin = getTarget('devin')!;
+    const legacy = path.join(tmpHome, '.config', 'devin', 'config.json');
+    fs.mkdirSync(path.dirname(legacy), { recursive: true });
+    fs.writeFileSync(legacy, JSON.stringify({
+      theme: 'dark',
+      mcpServers: { codegraph: { command: 'codegraph', args: ['serve', '--mcp'] } },
+    }, null, 2) + '\n');
+
+    // A legacy entry makes the target report already-configured…
+    expect(devin.detect('global').alreadyConfigured).toBe(true);
+    // …and install moves it out of config.json so Devin's startup
+    // migration cannot re-add a stale copy over ours.
+    devin.install('global', { autoAllow: true });
+    let after = JSON.parse(fs.readFileSync(legacy, 'utf-8'));
+    expect(after.theme).toBe('dark');
+    expect(after.mcpServers).toBeUndefined();
+
+    // Uninstall removes it too — otherwise the next Devin launch would
+    // migrate it back into mcp_config.json and resurrect the server.
+    fs.writeFileSync(legacy, JSON.stringify({
+      mcpServers: { codegraph: { command: 'codegraph', args: ['serve', '--mcp'] } },
+    }, null, 2) + '\n');
+    devin.uninstall('global');
+    after = JSON.parse(fs.readFileSync(legacy, 'utf-8'));
+    expect(after.mcpServers).toBeUndefined();
+  });
+
   it('antigravity: install writes to LEGACY ~/.gemini/antigravity/mcp_config.json when no migration marker', () => {
     const antigravity = getTarget('antigravity')!;
     antigravity.install('global', { autoAllow: true });
@@ -1342,6 +1443,7 @@ describe('Installer targets — registry', () => {
     expect(getTarget('claude')?.id).toBe('claude');
     expect(getTarget('cursor')?.id).toBe('cursor');
     expect(getTarget('codex')?.id).toBe('codex');
+    expect(getTarget('devin')?.id).toBe('devin');
     expect(getTarget('opencode')?.id).toBe('opencode');
     expect(getTarget('hermes')?.id).toBe('hermes');
     expect(getTarget('gemini')?.id).toBe('gemini');
