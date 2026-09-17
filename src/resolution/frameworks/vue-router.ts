@@ -175,7 +175,7 @@ function isVueConfigRoute(node: Node): boolean {
 function isNuxtPage(node: Node): boolean {
   return (
     node.language === 'vue' &&
-    node.filePath.includes('/pages/') &&
+    /(?:^|\/)pages\//.test(node.filePath.replace(/\\/g, '/')) &&
     node.id === `route:${node.filePath}:${node.name}:1`
   );
 }
