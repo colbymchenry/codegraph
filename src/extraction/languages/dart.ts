@@ -132,7 +132,15 @@ export const dartExtractor: LanguageExtractor = {
   importTypes: ['import_or_export'],
   callTypes: [],  // Dart calls use identifier+selector, handled via extractBareCall
   variableTypes: [],
-  extraClassNodeTypes: ['mixin_declaration', 'extension_declaration'],
+  // `extension_type_declaration` is Dart 3's `extension type Meters(double v)`.
+  // It belongs here for the same reason `mixin`/`extension` do — its body holds
+  // ordinary members — but it also has to be here for them to be indexed AT ALL:
+  // Dart spells an implemented method `method_signature`, the node type #1780
+  // gated behind `isInsideClassLikeNode()` to stop a bodiless TS interface
+  // member minting a phantom free function. Without the extension type itself
+  // being a class-like node, its body is not class-like, so every
+  // `method_signature` in it failed that gate and was dropped (#1784).
+  extraClassNodeTypes: ['mixin_declaration', 'extension_declaration', 'extension_type_declaration'],
   // A Dart `static_final_declaration` is exactly a top-level or class-`static`
   // `const`/`final` — the shared-constant idiom — so extract it as `constant`
   // for value-reference edges. Instance fields, `var`, and typed declarations
