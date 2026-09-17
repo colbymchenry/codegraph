@@ -82,6 +82,14 @@ export interface ProjectConfig {
    * beyond the built-ins.
    */
   deprioritize?: string[];
+  /**
+   * Whether `codegraph sessions` / the `codegraph_sessions` tool may index the
+   * agent-session transcripts that belong to this project (Claude Code's
+   * `~/.claude/projects/<slug>/`). On by default: the read is local and the
+   * index lives in the project's gitignored `.codegraph/`. `false` opts out for
+   * a project whose transcripts must not be searchable from the graph.
+   */
+  sessions?: boolean;
 }
 
 /** Parsed, validated view of a project's `codegraph.json`. */
@@ -91,6 +99,7 @@ interface ParsedConfig {
   exclude: string[];
   deprioritize: string[];
   include: string[];
+  sessions: boolean;
 }
 
 interface CacheEntry {
@@ -114,6 +123,7 @@ const EMPTY_CONFIG: ParsedConfig = Object.freeze({
   exclude: Object.freeze([]) as unknown as string[],
   include: Object.freeze([]) as unknown as string[],
   deprioritize: Object.freeze([]) as unknown as string[],
+  sessions: true,
 });
 
 /**
@@ -167,16 +177,29 @@ function parseConfig(file: string): ParsedConfig {
   const exclude = extractExclude(parsed, file);
   const include = extractInclude(parsed, file);
   const deprioritize = extractPatternList(parsed, file, 'deprioritize');
+  const sessions = extractSessions(parsed, file);
   if (
     extensions === EMPTY_EXTENSIONS &&
     includeIgnored.length === 0 &&
     exclude.length === 0 &&
     include.length === 0 &&
-    deprioritize.length === 0
+    deprioritize.length === 0 &&
+    sessions
   ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude, include, deprioritize };
+  return { extensions, includeIgnored, exclude, include, deprioritize, sessions };
+}
+
+/** `sessions`: a boolean, default true; anything else is warned about and ignored. */
+function extractSessions(parsed: object, file: string): boolean {
+  const raw = (parsed as ProjectConfig).sessions;
+  if (raw === undefined) return true;
+  if (typeof raw !== 'boolean') {
+    logWarn(`Ignoring "sessions" in ${PROJECT_CONFIG_FILENAME}: must be true or false`, { file });
+    return true;
+  }
+  return raw;
 }
 
 /**
@@ -389,6 +412,11 @@ export function loadDeprioritizePatterns(rootDir: string): string[] {
  */
 export function loadIncludePatterns(rootDir: string): string[] {
   return loadParsedConfig(rootDir).include;
+}
+
+/** Whether the project's agent-session transcripts may be indexed (default true). */
+export function loadSessionsEnabled(rootDir: string): boolean {
+  return loadParsedConfig(rootDir).sessions;
 }
 
 /** Test/maintenance hook: forget cached config (e.g. after rewriting it in a test). */
