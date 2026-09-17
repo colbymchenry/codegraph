@@ -192,6 +192,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `codegraph install` now honors `CLAUDE_CONFIG_DIR` and `CODEX_HOME` for global Claude Code and Codex setup so CodeGraph loads in your chosen profile (thanks @seanchann; #1627).
 
+- `codegraph install --refresh` no longer leaves a `.backup` file beside the config of an agent it isn't set up for. Checking whether an agent already has CodeGraph meant reading its config, and a config that wasn't valid JSON — an empty `mcp_config.json` next to an Antigravity install, say — got copied aside with a warning that CodeGraph was about to overwrite it, even though the agent was then skipped untouched. Checking is silent now; a config that can't be read is still backed up, but only when CodeGraph really is replacing it. Thanks @Gotman08. (#1870)
+
 - Files opted in with `includeIgnored` now stay indexed on Git older than 2.36, and embedded repositories remain visible to the watcher (thanks @maxmilian and @newshowardz777; #1549).
 
 - `codegraph init` and `codegraph index` now list unsupported file extensions and explain that CodeGraph is inactive when no supported source files are found (#1502).

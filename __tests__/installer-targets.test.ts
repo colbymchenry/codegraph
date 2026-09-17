@@ -14,7 +14,7 @@
  * touched.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -1758,6 +1758,85 @@ describe('Installer — refreshTargets sweep (codegraph install --refresh)', () 
       expect(r.status).toBe('unchanged');
       expect(r.changedPaths).toEqual([]);
     }
+  });
+});
+
+describe('Installer — detection never writes (#1870)', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  // Antigravity present with an MCP config JSON.parse rejects, and
+  // codegraph never installed into it — the reported setup: an empty
+  // (0-byte) `~/.gemini/config/mcp_config.json`.
+  function plantUnparseableAntigravityConfig(content: string): string {
+    const dir = path.join(tmpHome, '.gemini', 'config');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'mcp_config.json');
+    fs.writeFileSync(file, content);
+    return file;
+  }
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('detect-home');
+    tmpCwd = mkTmpDir('detect-cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  it('a refresh leaves an unconfigured agent\'s unparseable config alone — no backup, no warning', () => {
+    const file = plantUnparseableAntigravityConfig('');
+
+    // Asserted inside the spy: `mockRestore` also clears the recorded
+    // calls, so a `not.toHaveBeenCalled()` after it always passes.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const reports = refreshTargets(ALL_TARGETS, 'global');
+      expect(reports.find((r) => r.id === 'antigravity')!.status).toBe('not-configured');
+      expect(fs.readdirSync(path.dirname(file))).toEqual(['mcp_config.json']);
+      expect(fs.readFileSync(file, 'utf-8')).toBe('');
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('detect() on its own touches nothing', () => {
+    const file = plantUnparseableAntigravityConfig('{ half a config');
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(getTarget('antigravity')!.detect('global').alreadyConfigured).toBe(false);
+      expect(fs.readdirSync(path.dirname(file))).toEqual(['mcp_config.json']);
+      expect(fs.readFileSync(file, 'utf-8')).toBe('{ half a config');
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('an install that really overwrites an unparseable config still backs it up first', () => {
+    const file = plantUnparseableAntigravityConfig('{ half a config');
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      getTarget('antigravity')!.install('global', { autoAllow: false });
+      expect(warn).toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+
+    expect(fs.readFileSync(file + '.backup', 'utf-8')).toBe('{ half a config');
+    expect(JSON.parse(fs.readFileSync(file, 'utf-8')).mcpServers.codegraph).toBeDefined();
   });
 });
 
