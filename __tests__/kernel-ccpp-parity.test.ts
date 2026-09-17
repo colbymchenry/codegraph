@@ -110,6 +110,53 @@ describe.skipIf(!kernelBuilt)('kernel C/C++ extraction parity', () => {
     assertParity('fixtures/torture.hpp', fs.readFileSync(file, 'utf8'), 'cpp');
   });
 
+  it('macro + constructor fixture (cpp): #define constants, constructor signatures, per-declarator ctor refs (#1838/#1839)', () => {
+    const file = path.join(FIXTURE_DIR, 'torture-macros-ctors.cpp');
+    const source = fs.readFileSync(file, 'utf8');
+    assertParity('fixtures/torture-macros-ctors.cpp', source, 'cpp');
+    // Pin the shapes the resolver relies on, so parity is never empty-vs-empty.
+    process.env.CODEGRAPH_KERNEL = '0';
+    const result = extractFromSource('fixtures/torture-macros-ctors.cpp', source, 'cpp');
+    delete process.env.CODEGRAPH_KERNEL;
+    expect(result.nodes.filter((n) => n.kind === 'constant').map((n) => n.qualifiedName).sort()).toEqual([
+      'TRACE_POINT',
+      'app::APP_LOG',
+      'app::constructions::LOCAL_TRACE',
+    ]);
+    expect(
+      result.nodes.filter((n) => n.kind === 'method' && n.name === 'Widget').map((n) => n.signature).sort()
+    ).toEqual(['()', '(int a, int b = 2)', '(int value)']);
+    const ctorRefs = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls' && r.referenceName.includes('/'))
+      .map((r) => r.referenceName);
+    expect(ctorRefs).toEqual([
+      'Aggregate::Aggregate/0',
+      'Widget::Widget/0',
+      'Widget::Widget/0',
+      'Widget::Widget/1',
+      'Widget::Widget/2',
+      'Widget::Widget/0',
+      'Widget::Widget/1',
+      'Widget::Widget/2',
+      'app::Widget::Widget/1',
+      'Box::Box/1',
+    ]);
+  });
+
+  it('macro fixture (c): #define constants at file scope and inside a body (#1838)', () => {
+    const file = path.join(FIXTURE_DIR, 'torture-macros.c');
+    const source = fs.readFileSync(file, 'utf8');
+    assertParity('fixtures/torture-macros.c', source, 'c');
+    process.env.CODEGRAPH_KERNEL = '0';
+    const result = extractFromSource('fixtures/torture-macros.c', source, 'c');
+    delete process.env.CODEGRAPH_KERNEL;
+    expect(result.nodes.filter((n) => n.kind === 'constant').map((n) => n.name).sort()).toEqual([
+      'LOCAL_TRACE',
+      'MAX',
+      'TRACE_POINT',
+    ]);
+  });
+
   // Metal rides the cpp route: `.metal` maps to language 'cpp' and the
   // extension-gated `[[attribute]]` blank must reach the kernel arm through
   // the route-point preParse hoist (filePath rides along for the gate).
@@ -144,6 +191,8 @@ describe.skipIf(!kernelBuilt)('kernel C/C++ extraction parity', () => {
     ['torture.c', 'c'],
     ['torture.cpp', 'cpp'],
     ['torture.hpp', 'cpp'],
+    ['torture-macros-ctors.cpp', 'cpp'],
+    ['torture-macros.c', 'c'],
   ] as const)('torture fixture CRLF parity: %s', (name, lang) => {
     const file = path.join(FIXTURE_DIR, name);
     const crlf = fs.readFileSync(file, 'utf8').replace(/(?<!\r)\n/g, '\r\n');

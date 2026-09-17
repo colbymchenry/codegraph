@@ -147,6 +147,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
+- A C or C++ macro invocation such as `TRACE_POINT(1)` no longer shows up as a call to a same-named function in another file when the macro is defined in that file or one of its included headers; function-like macros are indexed as constants, never as callees. (#1838)
+
+- C++ local object initialization — `Widget w;`, `Widget w(1);`, `Widget w{1};` — now calls the constructor defined for the type in the nearest namespace, picking the overload whose parameter count fits when exactly one does, instead of pointing at the class itself; plain aggregates, pointers, references and `extern` declarations produce no call. (#1839)
+
 - Turning telemetry off now resets its identity and stops running processes from recording, sending, or restoring unsent data. (#1869)
 
 - Calls between JavaScript, JSX and TypeScript files keep their callers and callback flows.
