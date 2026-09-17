@@ -786,7 +786,12 @@ export class CodeGraph {
       try {
         this.fileLock.acquire();
       } catch {
-        return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
+        const lockHolderPid = this.fileLock.readHolderPid();
+        return {
+          skippedReason: 'locked',
+          ...(lockHolderPid != null ? { lockHolderPid } : {}),
+          filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0,
+        };
       }
       // Defer WAL auto-checkpointing for the whole incremental run, exactly
       // as indexAll does for the bulk path (#1231): sync's store loop and its

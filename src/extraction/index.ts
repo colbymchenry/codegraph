@@ -125,6 +125,14 @@ export interface SyncResult {
   filesRemoved: number;
   nodesUpdated: number;
   durationMs: number;
+  /**
+   * Set when NO reconciliation ran because another process holds the index
+   * lock (`.codegraph/codegraph.lock`, e.g. an MCP server mid-sync). The
+   * counts above are then all zero and must not be read as "up to date".
+   */
+  skippedReason?: 'locked';
+  /** PID of the process holding the lock, when it could be read. */
+  lockHolderPid?: number;
   changedFilePaths?: string[];
   /** Paths not absorbed because reading or extraction failed; retain for status/retry. */
   failedFilePaths?: string[];
