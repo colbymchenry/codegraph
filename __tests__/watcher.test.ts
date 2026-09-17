@@ -30,6 +30,7 @@ import {
   type WatchOptions,
 } from '../src/sync/watcher';
 import CodeGraph from '../src/index';
+import { rmTempDir } from './rm-temp';
 
 type SyncFn = (paths?: string[]) => Promise<{ filesChanged: number; durationMs: number }>;
 
@@ -70,11 +71,16 @@ describe('FileWatcher', () => {
     fs.writeFileSync(path.join(srcDir, 'index.ts'), 'export const x = 1;');
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     __setFsWatchForTests(null); // reset the injected fs.watch seam
     vi.restoreAllMocks();
     if (fs.existsSync(testDir)) {
-      fs.rmSync(testDir, { recursive: true, force: true });
+      // The end-to-end test drives a real fs.watch, whose directory handle the
+      // OS releases a beat after unwatch() returns. Windows fails the removal
+      // with EPERM in that window; POSIX unlinks regardless, which is why only
+      // Windows sees it. Every holder this suite owns is already closed at its
+      // own site — this waits out the release, it does not stand in for it.
+      await rmTempDir(testDir);
     }
   });
 
