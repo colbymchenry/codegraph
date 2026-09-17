@@ -155,6 +155,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Direct React Native bridge calls retain their native implementations and cross-platform relationships.
 - Dart extension-type getters remain searchable when using the WebAssembly parser.
 
+- **A Kotlin `private val` / `private var` no longer captures calls from other files.** Properties were indexed without their visibility modifier, so the file-local rule that already declines a `private fun` read every property as public: an Android app's `token(...)` validator resolved onto another class's `@Volatile private var token`, and JavaScript, Go and Python callers landed on Kotlin test fixtures' private fields. Both the WebAssembly and the native path now record `private` / `internal` / `protected` on properties. Re-index after upgrading. (#1731)
 - Calling a built-in method on an awaited value no longer records a call into an unrelated class that happens to declare a method of the same name, and a variable bound to an awaited call now resolves methods on the type that call returns. Thanks @maxmilian. (#1840)
 - Spring mappings now include every declared path combination and resolve constants declared in the same file, while unresolved paths no longer appear as false root routes. (#1461)
 - `codegraph callers`, `codegraph callees` and `codegraph impact` now resolve qualified names, group results and JSON edges by definition, and accept `--file` to narrow ambiguous names; thanks @ferrine. (#1512, #1656)
