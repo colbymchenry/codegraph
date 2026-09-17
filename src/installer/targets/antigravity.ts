@@ -126,7 +126,19 @@ function resolveCodegraphCommand(): string {
       shell: '/bin/bash',
       windowsHide: true,
     }).trim();
-    if (resolved && fs.existsSync(resolved)) return resolved;
+    if (resolved && fs.existsSync(resolved)) {
+      // fnm resolves `codegraph` inside an ephemeral per-shell symlink dir
+      // (~/.local/state/fnm_multishells/<pid>/bin) that fnm removes when the
+      // installing shell exits, leaving a dangling command in the GUI app's
+      // MCP config. Canonicalize the containing directory so the path outlives
+      // the shell, while preserving the `codegraph` binary name (agents that
+      // validate the command by basename still match).
+      try {
+        return path.join(fs.realpathSync(path.dirname(resolved)), path.basename(resolved));
+      } catch {
+        return resolved;
+      }
+    }
   } catch {
     /* fall through to bare name */
   }
