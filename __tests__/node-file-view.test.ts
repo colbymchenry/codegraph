@@ -115,4 +115,66 @@ describe('codegraph_node file-view (Read replacement)', () => {
     const out = await text({ file: 'does-not-exist.ts' });
     expect(out).toMatch(/no indexed file matches/i);
   });
+
+  // #1831: a path pasted with a line suffix (`a.ts:12`, `a.ts:12-40`, `a.ts#L88`)
+  // used to be treated as part of the FILENAME, so an indexed file came back as
+  // `No indexed file matches` — byte-identical to a genuine miss. explore has
+  // stripped these shapes all along (src/search/query-paths.ts); file-view now
+  // does too, and the range becomes the read window.
+  describe('line-suffixed paths (#1831)', () => {
+    it('VACUITY GUARD: the plain path resolves, so a suffixed miss can only come from the suffix', async () => {
+      const out = await text({ file: 'big.ts' });
+      expect(out).not.toMatch(/no indexed file matches/i);
+      expect(out).toMatch(/^1\texport function big/m);
+    });
+
+    it('`file.ts:<a>-<b>` reads that range, not a miss', async () => {
+      const out = await text({ file: 'big.ts:1000-1002' });
+      expect(out).not.toMatch(/no indexed file matches/i);
+      expect(out).toMatch(/^1000\t {2}const v998 = 998;$/m);
+      expect(out).toMatch(/^1002\t {2}const v1000 = 1000;$/m);
+      expect(out).not.toMatch(/^1003\t/m); // limit = b - a + 1, no more
+      expect(out).not.toMatch(/^1\t/m);
+    });
+
+    it('`file.ts:<a>` starts the window at that line (Read given only an offset)', async () => {
+      const out = await text({ file: 'big.ts:1000' });
+      expect(out).toMatch(/^1000\t {2}const v998 = 998;$/m);
+      expect(out).not.toMatch(/^999\t/m);
+    });
+
+    it('`file.ts#L<n>` and `file.ts#L<a>-L<b>` work the same way', async () => {
+      const single = await text({ file: 'big.ts#L1000' });
+      expect(single).toMatch(/^1000\t {2}const v998 = 998;$/m);
+      expect(single).not.toMatch(/^999\t/m);
+
+      const range = await text({ file: 'big.ts#L1000-L1002' });
+      expect(range).toMatch(/^1000\t {2}const v998 = 998;$/m);
+      expect(range).toMatch(/^1002\t {2}const v1000 = 1000;$/m);
+      expect(range).not.toMatch(/^1003\t/m);
+
+      // The bare `#L1000-1002` spelling (no second L) too.
+      const bare = await text({ file: 'big.ts#L1000-1002' });
+      expect(bare).toMatch(/^1000\t {2}const v998 = 998;$/m);
+      expect(bare).not.toMatch(/^1003\t/m);
+    });
+
+    it('a full repo-relative path carries its suffix too', async () => {
+      const out = await text({ file: 'src/big.ts:1000-1001' });
+      expect(out).toMatch(/^1000\t {2}const v998 = 998;$/m);
+      expect(out).not.toMatch(/^1002\t/m);
+    });
+
+    it('an explicit offset/limit from the caller WINS over the suffix (no silent override)', async () => {
+      const out = await text({ file: 'big.ts:1000-1002', offset: 5, limit: 2 });
+      expect(out).toMatch(/^5\t {2}const v3 = 3;$/m);
+      expect(out).toMatch(/^6\t {2}const v4 = 4;$/m);
+      expect(out).not.toMatch(/^1000\t/m);
+    });
+
+    it('a genuine miss still reports a miss, suffix or not', async () => {
+      const out = await text({ file: 'does-not-exist.ts:10-20' });
+      expect(out).toMatch(/no indexed file matches/i);
+    });
+  });
 });
