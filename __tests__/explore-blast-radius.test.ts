@@ -113,3 +113,48 @@ describe('codegraph_explore — blast radius', () => {
     expect(text).not.toMatch(/Blast radius[\s\S]*`lonelyLeaf`/);
   });
 });
+
+describe('codegraph_explore — template-view callers in blast radius', () => {
+  let testDir: string;
+  let cg: CodeGraph;
+  let handler: ToolHandler;
+
+  beforeEach(async () => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-blast-view-'));
+    const src = path.join(testDir, 'src');
+    fs.mkdirSync(src, { recursive: true });
+
+    // A shared helper depended on by MANY same-language code callers (> FILE_CAP)
+    // plus a template view. Under a single flat cap the lone view would be
+    // pushed into "+N more"; it must instead surface in its own dedicated slot.
+    fs.writeFileSync(path.join(src, 'helper.ts'), `export function fmt(x: number) { return x + 1; }\n`);
+    for (const n of ['a', 'b', 'c', 'd', 'e']) {
+      fs.writeFileSync(
+        path.join(src, `${n}.ts`),
+        `import { fmt } from './helper';\nexport function use_${n}() { return fmt(1); }\n`,
+      );
+    }
+    fs.writeFileSync(
+      path.join(src, 'Widget.vue'),
+      `<template><div /></template>\n<script>\nimport { fmt } from './helper';\nexport default { created() { fmt(2); } };\n</script>\n`,
+    );
+
+    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts', '**/*.vue'], exclude: [] } });
+    await cg.indexAll();
+    handler = new ToolHandler(cg);
+  });
+
+  afterEach(() => {
+    if (cg) cg.destroy();
+    if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('surfaces template-view callers in their own slot, not buried under the code "+N more" cap', async () => {
+    const res = await handler.execute('codegraph_explore', { query: 'fmt' });
+    const text = res.content[0].text;
+    expect(text).toContain('`fmt`');
+    // The .vue view appears in a dedicated "view(s):" slot rather than being
+    // hidden behind the >FILE_CAP code-caller "+N more".
+    expect(text).toMatch(/views?:[^\n]*Widget\.vue/);
+  });
+});
