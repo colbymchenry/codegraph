@@ -46,7 +46,7 @@ class HermesTarget implements AgentTarget {
     const installed = fs.existsSync(hermesHome()) || fs.existsSync(file);
     return {
       installed,
-      alreadyConfigured: hasCodeGraphMcpServer(content),
+      alreadyConfigured: hasCodeGraphMcpServer(content) && hasHermesQuerySkill(),
       configPath: file,
     };
   }
@@ -59,8 +59,11 @@ class HermesTarget implements AgentTarget {
       };
     }
     return {
-      files: [writeHermesConfig()],
-      notes: ['Start a new Hermes session for MCP changes to take effect.'],
+      files: [writeHermesConfig(), writeHermesQuerySkill()],
+      notes: [
+        'Start a new Hermes session for MCP and skill changes to take effect.',
+        'Ask Hermes to use the codegraph-query skill for graph-backed codebase questions.',
+      ],
     };
   }
 
@@ -68,16 +71,17 @@ class HermesTarget implements AgentTarget {
     if (loc !== 'global') return { files: [] };
     const file = configPath();
     if (!fs.existsSync(file)) {
-      return { files: [{ path: file, action: 'not-found' }] };
+      return { files: [{ path: file, action: 'not-found' }, removeHermesQuerySkill()] };
     }
 
     const before = readText(file);
     const after = removeCodeGraphToolset(removeCodeGraphMcpServer(before));
+    const removedSkill = removeHermesQuerySkill();
     if (after === before) {
-      return { files: [{ path: file, action: 'not-found' }] };
+      return { files: [{ path: file, action: 'not-found' }, removedSkill] };
     }
     atomicWriteFileSync(file, ensureTrailingNewline(after));
-    return { files: [{ path: file, action: 'removed' }] };
+    return { files: [{ path: file, action: 'removed' }, removedSkill] };
   }
 
   printConfig(loc: Location): string {
@@ -94,13 +98,18 @@ class HermesTarget implements AgentTarget {
       '    - hermes-cli',
       '    - mcp-codegraph',
       '',
+      `# CodeGraph query skill is installed at ${hermesQuerySkillPath()}`,
+      '# Load it in Hermes with: /skill codegraph-query',
+      '',
     ].join('\n');
   }
 
   describePaths(loc: Location): string[] {
-    return loc === 'global' ? [configPath()] : [];
+    return loc === 'global' ? [configPath(), hermesQuerySkillPath()] : [];
   }
 }
+
+const HERMES_QUERY_SKILL_NAME = 'codegraph-query';
 
 function hermesHome(): string {
   return process.env.HERMES_HOME
@@ -110,6 +119,10 @@ function hermesHome(): string {
 
 function configPath(): string {
   return path.join(hermesHome(), 'config.yaml');
+}
+
+function hermesQuerySkillPath(): string {
+  return path.join(hermesHome(), 'skills', HERMES_QUERY_SKILL_NAME, 'SKILL.md');
 }
 
 function readText(file: string): string {
@@ -132,6 +145,90 @@ function writeHermesConfig(): WriteResult['files'][number] {
   }
   atomicWriteFileSync(file, ensureTrailingNewline(after));
   return { path: file, action: existed ? 'updated' : 'created' };
+}
+
+
+function renderHermesQuerySkill(): string {
+  return `---
+name: ${HERMES_QUERY_SKILL_NAME}
+description: Use CodeGraph from Hermes to answer natural-language codebase questions with graph-backed MCP tools, explicit projectPath recovery, and preserved operational notices.
+---
+
+# CodeGraph Query for Hermes
+
+Use this skill when a Hermes user asks a natural-language question about an indexed codebase, such as how a feature works, where a symbol is used, what calls a function, what a change might affect, or which files matter for a task.
+
+## Requirements
+
+- Prefer CodeGraph MCP tools from the \`mcp-codegraph\` toolset over raw file reads when graph/index data can answer the question.
+- Choose the most specific graph operation available:
+  - Search or node lookup for symbol discovery.
+  - Context for task-scoped understanding.
+  - Trace for flows between symbols or modules.
+  - Callers/callees for call relationships.
+  - Impact for change-risk questions.
+  - Files for project structure questions.
+- If the MCP server is unavailable, use the CodeGraph CLI as a manual fallback where possible, for example \`codegraph query <question>\`, \`codegraph context <task>\`, \`codegraph callers <symbol>\`, or \`codegraph impact <symbol>\`.
+- Do not invent edges, callers, flows, or source locations. If CodeGraph output is empty or insufficient, say what was missing and recommend a narrower query, re-index, or raw code inspection.
+
+## Project path recovery
+
+Hermes sessions sometimes start outside the indexed repository. If CodeGraph reports that no default project is loaded or that it searched from the wrong directory:
+
+1. Ask for or infer the intended repository path.
+2. Retry with an absolute \`projectPath\` argument when using MCP tools.
+3. If using CLI fallback, run the command from the repository root or pass the command's path argument when supported.
+
+Never hide this recovery step. The user should know which project index answered the question.
+
+## Preserve operational notices
+
+CodeGraph warnings are part of answer correctness. Preserve notices about:
+
+- stale or pending index updates,
+- catch-up sync or filesystem reconciliation,
+- worktree/index mismatch,
+- not-initialized projects,
+- missing or ambiguous symbols.
+
+Surface these notices with the answer instead of summarizing them away.
+
+## Response shape
+
+Answer concisely:
+
+1. Direct answer.
+2. Graph evidence: relevant symbols, files, source locations, or paths from CodeGraph output.
+3. Operational notices, if any.
+4. Suggested next graph query when useful.
+`;
+}
+
+function hasHermesQuerySkill(): boolean {
+  return readText(hermesQuerySkillPath()) === renderHermesQuerySkill();
+}
+
+function writeHermesQuerySkill(): WriteResult['files'][number] {
+  const file = hermesQuerySkillPath();
+  const existed = fs.existsSync(file);
+  const before = readText(file);
+  const after = renderHermesQuerySkill();
+  if (before === after) return { path: file, action: 'unchanged' };
+  atomicWriteFileSync(file, ensureTrailingNewline(after));
+  return { path: file, action: existed ? 'updated' : 'created' };
+}
+
+function removeHermesQuerySkill(): WriteResult['files'][number] {
+  const file = hermesQuerySkillPath();
+  if (!fs.existsSync(file)) return { path: file, action: 'not-found' };
+  fs.rmSync(file);
+  const dir = path.dirname(file);
+  try {
+    fs.rmdirSync(dir);
+  } catch {
+    // Keep the directory if the user has added other files beside SKILL.md.
+  }
+  return { path: file, action: 'removed' };
 }
 
 function ensureTrailingNewline(text: string): string {
