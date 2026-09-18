@@ -27,6 +27,13 @@ import * as path from 'path';
 import { Language } from './types';
 import { isLanguageSupported } from './extraction/grammars';
 import { logWarn } from './errors';
+import {
+  DEFAULT_MAP_MAX_DEPTH,
+  MAX_MAP_MAX_DEPTH,
+  normalizeMapRoot,
+  type MapScope,
+  type ViewerMapConfig,
+} from './lib/map-config';
 
 /** Filename of the project-scoped config, resolved relative to the project root. */
 export const PROJECT_CONFIG_FILENAME = 'codegraph.json';
@@ -82,6 +89,13 @@ export interface ProjectConfig {
    * beyond the built-ins.
    */
   deprioritize?: string[];
+  /** Optional read-only browser viewer settings. */
+  viewer?: {
+    map?: {
+      maxDepth?: number;
+      scopes?: MapScope[];
+    };
+  };
 }
 
 /** Parsed, validated view of a project's `codegraph.json`. */
@@ -91,6 +105,7 @@ interface ParsedConfig {
   exclude: string[];
   deprioritize: string[];
   include: string[];
+  viewerMap: ViewerMapConfig;
 }
 
 interface CacheEntry {
@@ -108,12 +123,17 @@ const cache = new Map<string, CacheEntry>();
 
 /** Shared frozen empties so the no-config path allocates nothing. */
 const EMPTY_EXTENSIONS: Record<string, Language> = Object.freeze({});
+const EMPTY_VIEWER_MAP: ViewerMapConfig = Object.freeze({
+  maxDepth: DEFAULT_MAP_MAX_DEPTH,
+  scopes: Object.freeze([]),
+});
 const EMPTY_CONFIG: ParsedConfig = Object.freeze({
   extensions: EMPTY_EXTENSIONS,
   includeIgnored: Object.freeze([]) as unknown as string[],
   exclude: Object.freeze([]) as unknown as string[],
   include: Object.freeze([]) as unknown as string[],
   deprioritize: Object.freeze([]) as unknown as string[],
+  viewerMap: EMPTY_VIEWER_MAP,
 });
 
 /**
@@ -167,16 +187,106 @@ function parseConfig(file: string): ParsedConfig {
   const exclude = extractExclude(parsed, file);
   const include = extractInclude(parsed, file);
   const deprioritize = extractPatternList(parsed, file, 'deprioritize');
+  const viewerMap = extractViewerMapConfig(parsed, file);
   if (
     extensions === EMPTY_EXTENSIONS &&
     includeIgnored.length === 0 &&
     exclude.length === 0 &&
     include.length === 0 &&
-    deprioritize.length === 0
+    deprioritize.length === 0 &&
+    viewerMap === EMPTY_VIEWER_MAP
   ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude, include, deprioritize };
+  return { extensions, includeIgnored, exclude, include, deprioritize, viewerMap };
+}
+
+function extractViewerMapConfig(parsed: object, file: string): ViewerMapConfig {
+  const viewer = (parsed as ProjectConfig).viewer;
+  if (viewer === undefined) return EMPTY_VIEWER_MAP;
+  if (!viewer || typeof viewer !== 'object' || Array.isArray(viewer)) {
+    logWarn(`Ignoring "viewer" in ${PROJECT_CONFIG_FILENAME}: must be an object`, { file });
+    return EMPTY_VIEWER_MAP;
+  }
+  const map = viewer.map;
+  if (map === undefined) return EMPTY_VIEWER_MAP;
+  if (!map || typeof map !== 'object' || Array.isArray(map)) {
+    logWarn(`Ignoring "viewer.map" in ${PROJECT_CONFIG_FILENAME}: must be an object`, { file });
+    return EMPTY_VIEWER_MAP;
+  }
+
+  let maxDepth = DEFAULT_MAP_MAX_DEPTH;
+  if (map.maxDepth !== undefined) {
+    if (
+      typeof map.maxDepth !== 'number' ||
+      !Number.isSafeInteger(map.maxDepth) ||
+      map.maxDepth < 1 ||
+      map.maxDepth > MAX_MAP_MAX_DEPTH
+    ) {
+      logWarn(
+        `Ignoring "viewer.map.maxDepth" in ${PROJECT_CONFIG_FILENAME}: must be a whole number from 1 to ${MAX_MAP_MAX_DEPTH}`,
+        { file }
+      );
+    } else {
+      maxDepth = map.maxDepth;
+    }
+  }
+
+  const scopes = extractMapScopes(map.scopes, file);
+  return maxDepth === DEFAULT_MAP_MAX_DEPTH && scopes.length === 0
+    ? EMPTY_VIEWER_MAP
+    : { maxDepth, scopes };
+}
+
+function extractMapScopes(raw: unknown, file: string): MapScope[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    logWarn(`Ignoring "viewer.map.scopes" in ${PROJECT_CONFIG_FILENAME}: must be an array`, { file });
+    return [];
+  }
+
+  const scopes: MapScope[] = [];
+  const labels = new Set<string>();
+  const roots = new Set<string>();
+  for (const scope of raw) {
+    if (!scope || typeof scope !== 'object' || Array.isArray(scope)) {
+      logWarn(`Ignoring a "viewer.map.scopes" entry in ${PROJECT_CONFIG_FILENAME}: must be an object`, { file });
+      continue;
+    }
+    const { label, root } = scope as { label?: unknown; root?: unknown };
+    if (typeof label !== 'string' || !label.trim()) {
+      logWarn(`Ignoring a "viewer.map.scopes" entry in ${PROJECT_CONFIG_FILENAME}: label must be a non-empty string`, { file });
+      continue;
+    }
+    if (typeof root !== 'string') {
+      logWarn(`Ignoring scope "${label.trim()}" in ${PROJECT_CONFIG_FILENAME}: root must be a string`, { file });
+      continue;
+    }
+    const slashRoot = root.trim().replace(/\\/g, '/');
+    const normalizedRoot = normalizeMapRoot(root);
+    if (
+      !normalizedRoot ||
+      isAbsoluteMapRoot(slashRoot) ||
+      isAbsoluteMapRoot(normalizedRoot) ||
+      normalizedRoot.split('/').some((segment) => segment === '' || segment === '.' || segment === '..')
+    ) {
+      logWarn(`Ignoring scope "${label.trim()}" in ${PROJECT_CONFIG_FILENAME}: root must be a canonical relative directory without traversal`, { file });
+      continue;
+    }
+    const normalizedLabel = label.trim();
+    if (labels.has(normalizedLabel) || roots.has(normalizedRoot)) {
+      logWarn(`Ignoring duplicate viewer map scope "${normalizedLabel}" in ${PROJECT_CONFIG_FILENAME}: labels and roots are first-wins`, { file });
+      continue;
+    }
+    labels.add(normalizedLabel);
+    roots.add(normalizedRoot);
+    scopes.push({ label: normalizedLabel, root: normalizedRoot });
+  }
+  return scopes;
+}
+
+function isAbsoluteMapRoot(root: string): boolean {
+  return root.startsWith('/') || /^[A-Za-z]:\//.test(root);
 }
 
 /**
@@ -389,6 +499,11 @@ export function loadDeprioritizePatterns(rootDir: string): string[] {
  */
 export function loadIncludePatterns(rootDir: string): string[] {
   return loadParsedConfig(rootDir).include;
+}
+
+/** Load validated named scopes and grouping limit for the read-only map viewer. */
+export function loadViewerMapConfig(rootDir: string): ViewerMapConfig {
+  return loadParsedConfig(rootDir).viewerMap;
 }
 
 /** Test/maintenance hook: forget cached config (e.g. after rewriting it in a test). */

@@ -235,6 +235,42 @@ Mono, so the code grid survives and only the letterforms change.
 | `#/entry` | entry points — routes, files that run something, tests, hubs |
 | `#/screens` | screens — the app's screens and the transitions between them |
 
+The map's **Showing** selector includes every indexed directory, including nested
+directories; its file count covers all indexed descendants. **Grouping** is automatic
+by default (up to four levels).
+
+Projects can add named map scopes and raise the manual grouping limit in their existing
+root `codegraph.json`:
+
+```json
+{
+  "viewer": {
+    "map": {
+      "maxDepth": 12,
+      "scopes": [
+        { "label": "Application", "root": "server" },
+        { "label": "Shared application", "root": "server/shared" }
+      ]
+    }
+  }
+}
+```
+
+`maxDepth` accepts whole numbers from 1 through 32 and limits both the selector and
+explicit map URLs. Automatic grouping never exceeds four levels or a smaller configured
+limit. Scope roots are relative directory paths; roots absent from the index remain selectable
+with zero files. Malformed map settings are ignored with a warning. Refresh the browser after
+editing `codegraph.json` to load the new settings.
+
+Selecting a map module offers **Focus**. **Depends on** and **Used by** show that
+module's transitive reachable modules across the indexed repository, following the same
+confidence and test-visibility policy as the map; this is module-level reachability, not
+proof of an exact symbol impact. Focus holds the original root and grouping stable so
+Clear focus restores the prior map, while Showing identifies the focused module and direction.
+A viewer adapter must advertise repository map context
+for Focus; older adapters remain available for ordinary maps and show a recoverable error
+instead of a partial focus result.
+
 ## Entry points
 
 `#/entry` draws `/api/entrypoints` as file groups, reusing the Symbol view's

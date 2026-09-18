@@ -29,7 +29,7 @@ import type {
   WireSymbolPayload,
   WireTrails,
 } from './wire';
-import type { SaveTrailRequest, StepsRequest } from './adapter';
+import type { MapRequest, SaveTrailRequest, StepsRequest } from './adapter';
 
 export * from './wire';
 export { ApiFailure } from './adapter';
@@ -167,7 +167,7 @@ export function canDrawSteps(): boolean {
 }
 
 export function fetchMap(
-  opts: { root?: string | null; depth?: number } = {},
+  opts: MapRequest = {},
   signal?: AbortSignal
 ): Promise<WireMapPayload> {
   return getGraphAdapter().map(opts, signal);

@@ -641,6 +641,10 @@ export interface WireMapCycle {
 export interface WireMapPayload {
   root: string;
   depth: number;
+  /** Omitted by adapters that cannot aggregate beyond the requested scope. */
+  context?: 'scope' | 'repository';
+  /** Absent in older library adapters; the viewer falls back to four. */
+  maxDepth?: number;
   roots: Array<{ root: string; label: string; files: number }>;
   modules: WireMapModule[];
   links: WireMapLink[];
