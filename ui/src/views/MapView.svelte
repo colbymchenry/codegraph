@@ -28,6 +28,7 @@
     type MapFocusDirection,
     type MapFocusGrouping,
   } from '../lib/map-focus';
+  import { isEligibleMapModule } from '../lib/map-eligibility';
   import {
     buildMapLayout,
     isEdgeVisible,
@@ -154,7 +155,9 @@
           (
             wantDirection === null ||
             next.context !== 'repository' ||
-            !next.modules.some((module) => module.id === wantFocus && (wantTests || !module.test))
+            !next.modules.some(
+              (module) => module.id === wantFocus && isEligibleMapModule(module, wantTests)
+            )
           )
         ) {
           error = next.context !== 'repository'

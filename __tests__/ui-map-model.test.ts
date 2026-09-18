@@ -33,6 +33,7 @@ import {
   type MapLayout,
 } from '../ui/src/lib/map-model';
 import { focusMapPayload } from '../ui/src/lib/map-focus';
+import { selectEligibleMapGraph } from '../ui/src/lib/map-eligibility';
 import type { WireMapLink, WireMapModule } from '../ui/src/lib/api';
 
 /* ------------------------------------------------------------- fixtures -- */
@@ -108,6 +109,28 @@ describe('focusMapPayload', () => {
       .toEqual(['app', 'core', 'db', 'cycle', 'test-bridge', 'unrelated']);
     expect(focusMapPayload(payload, 'isolated', 'depends-on', false)?.modules.map((module) => module.id))
       .toEqual(['isolated']);
+  });
+
+  it('shares test eligibility and endpoint filtering without changing unfiltered island evidence', () => {
+    const payload = {
+      modules: [mod('core'), mod('test-bridge', { test: true }), mod('isolated')],
+      links: [link('test-bridge', 'core', 8), link('core', 'missing', 8)],
+    } as any;
+
+    const withoutTests = selectEligibleMapGraph(payload, false);
+    expect(withoutTests.modules.map((module) => module.id)).toEqual(['core', 'isolated']);
+    expect(withoutTests.links).toEqual([]);
+    expect(focusMapPayload(payload, 'test-bridge', 'depends-on', false)).toBeNull();
+
+    const withTests = selectEligibleMapGraph(payload, true);
+    expect(withTests.links.map((edge) => `${edge.source}->${edge.target}`)).toEqual([
+      'test-bridge->core',
+    ]);
+    expect(focusMapPayload(payload, 'test-bridge', 'depends-on', true)?.modules.map((module) => module.id))
+      .toEqual(['core', 'test-bridge']);
+
+    const layout = buildMapLayout(payload, { includeTests: false });
+    expect(layout.nodes.find((node) => node.id === 'core')?.island).toBe(false);
   });
 });
 

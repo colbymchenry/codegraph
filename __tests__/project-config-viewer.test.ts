@@ -89,6 +89,26 @@ describe('viewer map configuration (codegraph.json)', () => {
     expect(warnings).toHaveLength(6);
   });
 
+  it('rejects noncanonical interior scope segments while retaining canonical indexed roots', () => {
+    writeConfig({
+      viewer: {
+        map: {
+          scopes: [
+            { label: 'Double separator', root: 'src//api' },
+            { label: 'Dot segment', root: 'src/./api' },
+            { label: 'API', root: 'src/api' },
+          ],
+        },
+      },
+    });
+
+    expect(loadViewerMapConfig(dir)).toEqual({
+      maxDepth: 4,
+      scopes: [{ label: 'API', root: 'src/api' }],
+    });
+    expect(warnings).toHaveLength(2);
+  });
+
   it.each([
     ['viewer array', { viewer: [] }],
     ['map array', { viewer: { map: [] } }],

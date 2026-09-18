@@ -268,9 +268,9 @@ function extractMapScopes(raw: unknown, file: string): MapScope[] {
       !normalizedRoot ||
       isAbsoluteMapRoot(slashRoot) ||
       isAbsoluteMapRoot(normalizedRoot) ||
-      normalizedRoot.split('/').includes('..')
+      normalizedRoot.split('/').some((segment) => segment === '' || segment === '.' || segment === '..')
     ) {
-      logWarn(`Ignoring scope "${label.trim()}" in ${PROJECT_CONFIG_FILENAME}: root must be a relative directory without traversal`, { file });
+      logWarn(`Ignoring scope "${label.trim()}" in ${PROJECT_CONFIG_FILENAME}: root must be a canonical relative directory without traversal`, { file });
       continue;
     }
     const normalizedLabel = label.trim();

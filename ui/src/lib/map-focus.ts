@@ -1,4 +1,5 @@
 import type { WireMapPayload } from './wire';
+import { selectEligibleMapGraph } from './map-eligibility';
 
 /** The direction that owns traversal semantics, not URL serialization. */
 export type MapFocusDirection = 'depends-on' | 'used-by';
@@ -19,14 +20,8 @@ export function focusMapPayload(
   direction: MapFocusDirection,
   includeTests: boolean
 ): WireMapPayload | null {
-  const eligible = new Set(
-    payload.modules.filter((module) => includeTests || !module.test).map((module) => module.id)
-  );
-  if (!eligible.has(anchor)) return null;
-
-  const links = payload.links.filter(
-    (link) => eligible.has(link.source) && eligible.has(link.target)
-  );
+  const { ids, links } = selectEligibleMapGraph(payload, includeTests);
+  if (!ids.has(anchor)) return null;
   const visited = new Set([anchor]);
   const work = [anchor];
   while (work.length > 0) {

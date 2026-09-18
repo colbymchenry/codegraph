@@ -625,6 +625,35 @@ describe('GET /api/map', () => {
     }
   });
 
+  it('omits noncanonical configured scopes while a canonical indexed scope remains selectable', async () => {
+    writeViewerConfig({
+      viewer: {
+        map: {
+          scopes: [
+            { label: 'Double separator', root: 'src//api' },
+            { label: 'Dot segment', root: 'src/./api' },
+            { label: 'API', root: 'src/api' },
+          ],
+        },
+      },
+    });
+    try {
+      const configured = await getMap();
+      expect(configured.roots.some((root: any) => root.label === 'Double separator')).toBe(false);
+      expect(configured.roots.some((root: any) => root.label === 'Dot segment')).toBe(false);
+      const api = configured.roots.find((root: any) => root.label === 'API');
+      expect(api).toMatchObject({ root: 'src/api' });
+      expect(api.files).toBeGreaterThan(0);
+
+      const scoped = await getMap('?root=src%2Fapi&depth=1');
+      expect(scoped.modules.flatMap((module: any) => module.fileList.items)).toEqual(
+        expect.arrayContaining(['src/api/routes.ts'])
+      );
+    } finally {
+      removeViewerConfig();
+    }
+  });
+
   it('caps automatic depth at a smaller configured maximum', async () => {
     writeViewerConfig({ viewer: { map: { maxDepth: 1 } } });
     try {
