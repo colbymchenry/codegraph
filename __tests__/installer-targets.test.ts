@@ -23,6 +23,10 @@ import { ALL_TARGETS, getTarget, resolveTargetFlag } from '../src/installer/targ
 import { uninstallTargets, refreshTargets } from '../src/installer';
 import { upsertTomlTable, removeTomlTable, buildTomlTable } from '../src/installer/targets/toml';
 import { cleanupLegacyHooks, writePromptHookEntry, removePromptHookEntry } from '../src/installer/targets/claude';
+import {
+  writePromptHookEntry as zcodeWritePromptHookEntry,
+  removePromptHookEntry as zcodeRemovePromptHookEntry,
+} from '../src/installer/targets/zcode';
 
 function mkTmpDir(label: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `cg-targets-${label}-`));
@@ -154,6 +158,13 @@ describe('Installer targets — contract', () => {
               delete seed.mcpServers;
               seed.servers = { other: { command: 'x' } };
             }
+            // ZCode's config.json nests servers under `mcp.servers`
+            // (and carries sibling top-level keys like `plugins`).
+            if (target.id === 'zcode') {
+              delete seed.mcpServers;
+              seed.mcp = { servers: { other: { command: 'x' } } };
+              seed.plugins = { enabledPlugins: { 'some@plugin': true } };
+            }
             fs.writeFileSync(jsonPath, JSON.stringify(seed, null, 2) + '\n');
 
             target.install(location, { autoAllow: true });
@@ -165,6 +176,13 @@ describe('Installer targets — contract', () => {
               expect(after.mcp.servers.codegraph.codemode).toBe(false);
               expect(after.mcp.servers.codegraph.disabled).toBe(false);
               expect(after.mcp.codegraph).toBeUndefined();
+            } else if (target.id === 'zcode') {
+              expect(after.mcp.servers.other).toBeDefined();
+              expect(after.mcp.servers.codegraph).toBeDefined();
+              // A Claude-style `type` key must not creep back in, and
+              // sibling top-level keys survive.
+              expect(after.mcp.servers.codegraph.type).toBeUndefined();
+              expect(after.plugins.enabledPlugins['some@plugin']).toBe(true);
             } else if (target.id === 'copilot-vscode' || target.id === 'copilot-jetbrains') {
               expect(after.servers.other).toBeDefined();
               expect(after.servers.codegraph).toBeDefined();
@@ -1350,6 +1368,7 @@ describe('Installer targets — registry', () => {
     expect(getTarget('copilot-vscode')?.id).toBe('copilot-vscode');
     expect(getTarget('copilot-cli')?.id).toBe('copilot-cli');
     expect(getTarget('copilot-jetbrains')?.id).toBe('copilot-jetbrains');
+    expect(getTarget('zcode')?.id).toBe('zcode');
     expect(getTarget('not-a-real-target')).toBeUndefined();
   });
 
@@ -2876,5 +2895,175 @@ describe('Installer targets — Codex CODEX_HOME override (#1627)', () => {
     expect(fs.existsSync(path.join(process.cwd(), '.codex', 'config.toml'))).toBe(true);
     // The project layer lives beside the project, never under the user profile.
     expect(fs.existsSync(path.join(custom, 'config.toml'))).toBe(false);
+  });
+});
+
+describe('Installer targets — ZCode', () => {
+  let tmpHome: string;
+  let tmpCwd: string;
+  let origCwd: string;
+  let homeRestore: { restore: () => void };
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('zcode-home');
+    tmpCwd = mkTmpDir('zcode-cwd');
+    origCwd = process.cwd();
+    process.chdir(tmpCwd);
+    homeRestore = setHome(tmpHome);
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    process.chdir(origCwd);
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+  });
+
+  // ZCode hook entries are process-shaped (`{ type: 'process', command,
+  // args, timeoutMs }`), not Claude's shell-string form, and the command
+  // is platform-aware for the same #1466 reason (Windows must spawn
+  // `codegraph.cmd` — a bare `codegraph` doesn't resolve PATHEXT).
+  const ZCODE_HOOK_CMD = process.platform === 'win32' ? 'codegraph.cmd' : 'codegraph';
+  const globalConfig = () => path.join(tmpHome, '.zcode', 'cli', 'config.json');
+  const globalAgents = () => path.join(tmpHome, '.zcode', 'AGENTS.md');
+  const hookCommands = (c: any): string[] =>
+    (c.hooks?.UserPromptSubmit ?? []).flatMap((g: any) => (g.hooks ?? []).map((h: any) => h.command));
+
+  it('install with promptHook:true writes nested mcp.servers AND an enabled process-shaped hook', () => {
+    const zcode = getTarget('zcode')!;
+    const result = zcode.install('global', { autoAllow: true, promptHook: true });
+    expect(result.files.map((f) => f.path)).toEqual(
+      expect.arrayContaining([globalConfig(), globalAgents()]),
+    );
+
+    const c = JSON.parse(fs.readFileSync(globalConfig(), 'utf-8'));
+    // Nested shape — a top-level mcpServers key would silently no-op.
+    expect(c.mcpServers).toBeUndefined();
+    expect(c.mcp.servers.codegraph).toEqual({
+      command: 'codegraph',
+      args: ['serve', '--mcp'],
+    });
+    expect(c.mcp.servers.codegraph.type).toBeUndefined();
+
+    // Config-file hooks are inert unless hooks.enabled is true.
+    expect(c.hooks.enabled).toBe(true);
+    expect(c.hooks.UserPromptSubmit).toHaveLength(1);
+    expect(c.hooks.UserPromptSubmit[0].hooks[0]).toEqual({
+      type: 'process',
+      command: ZCODE_HOOK_CMD,
+      args: ['prompt-hook'],
+      timeoutMs: 30000,
+    });
+
+    // Instructions land in the user-scope AGENTS.md.
+    const md = fs.readFileSync(globalAgents(), 'utf-8');
+    expect(md).toContain('<!-- CODEGRAPH_START -->');
+    expect(md).toContain('codegraph explore');
+  });
+
+  it('install without promptHook does NOT create a hooks block', () => {
+    getTarget('zcode')!.install('global', { autoAllow: true });
+    const c = JSON.parse(fs.readFileSync(globalConfig(), 'utf-8'));
+    expect(c.hooks).toBeUndefined();
+  });
+
+  it('re-install with promptHook:true is byte-identical (no duplicate hook)', () => {
+    const zcode = getTarget('zcode')!;
+    zcode.install('global', { autoAllow: true, promptHook: true });
+    const first = fs.readFileSync(globalConfig(), 'utf-8');
+    const second = zcode.install('global', { autoAllow: true, promptHook: true });
+    expect(second.files.every((f) => f.action === 'unchanged')).toBe(true);
+    expect(fs.readFileSync(globalConfig(), 'utf-8')).toBe(first);
+    expect(hookCommands(JSON.parse(first)).filter((x) => x === ZCODE_HOOK_CMD)).toHaveLength(1);
+  });
+
+  it('promptHook:false strips the hook (opt-out round-trips); enabled stays as-is', () => {
+    const zcode = getTarget('zcode')!;
+    zcode.install('global', { autoAllow: true, promptHook: true });
+    zcode.install('global', { autoAllow: true, promptHook: false });
+    const c = JSON.parse(fs.readFileSync(globalConfig(), 'utf-8'));
+    expect(hookCommands(c)).not.toContain(ZCODE_HOOK_CMD);
+    expect(c.hooks.UserPromptSubmit).toBeUndefined();
+    // `enabled` provenance is unknowable (the user may rely on it for
+    // other config hooks), so removal deliberately leaves it behind.
+    expect(c.hooks.enabled).toBe(true);
+  });
+
+  it('normalizes a hand-copied Claude-style entry (drops `type`) and stays idempotent', () => {
+    fs.mkdirSync(path.dirname(globalConfig()), { recursive: true });
+    fs.writeFileSync(globalConfig(), JSON.stringify({
+      mcp: { servers: { codegraph: { type: 'stdio', command: 'codegraph', args: ['serve', '--mcp'] } } },
+    }, null, 2) + '\n');
+
+    const first = getTarget('zcode')!.install('global', { autoAllow: true });
+    expect(first.files[0].action).toBe('updated');
+    const c = JSON.parse(fs.readFileSync(globalConfig(), 'utf-8'));
+    expect(c.mcp.servers.codegraph).toEqual({ command: 'codegraph', args: ['serve', '--mcp'] });
+
+    const second = getTarget('zcode')!.install('global', { autoAllow: true });
+    expect(second.files[0].action).toBe('unchanged');
+  });
+
+  it('zcodeWritePromptHookEntry preserves a sibling process hook; uninstall keeps it', () => {
+    fs.mkdirSync(path.dirname(globalConfig()), { recursive: true });
+    fs.writeFileSync(globalConfig(), JSON.stringify({
+      hooks: {
+        UserPromptSubmit: [
+          { hooks: [{ type: 'process', command: 'my-own-hook', args: ['run'] }] },
+        ],
+      },
+    }, null, 2) + '\n');
+
+    expect(zcodeWritePromptHookEntry('global').action).toBe('updated');
+    let c = JSON.parse(fs.readFileSync(globalConfig(), 'utf-8'));
+    expect(hookCommands(c)).toEqual(['my-own-hook', ZCODE_HOOK_CMD]);
+    expect(c.hooks.enabled).toBe(true);
+
+    getTarget('zcode')!.uninstall('global');
+    c = JSON.parse(fs.readFileSync(globalConfig(), 'utf-8'));
+    expect(hookCommands(c)).toEqual(['my-own-hook']);
+  });
+
+  it('zcodeRemovePromptHookEntry accepts the other platform\'s command spelling', () => {
+    fs.mkdirSync(path.dirname(globalConfig()), { recursive: true });
+    const otherCmd = process.platform === 'win32' ? 'codegraph' : 'codegraph.cmd';
+    fs.writeFileSync(globalConfig(), JSON.stringify({
+      hooks: {
+        enabled: true,
+        UserPromptSubmit: [{ hooks: [{ type: 'process', command: otherCmd, args: ['prompt-hook'], timeoutMs: 30000 }] }],
+      },
+    }, null, 2) + '\n');
+
+    expect(zcodeRemovePromptHookEntry('global').action).toBe('removed');
+    const c = JSON.parse(fs.readFileSync(globalConfig(), 'utf-8'));
+    expect(c.hooks.UserPromptSubmit).toBeUndefined();
+    expect(c.hooks.enabled).toBe(true);
+  });
+
+  it('uninstall strips the AGENTS.md block but keeps user content; local install writes workspace files only', () => {
+    fs.mkdirSync(tmpCwd, { recursive: true });
+    fs.writeFileSync(path.join(tmpCwd, 'AGENTS.md'), '# My project rules\n\nkeep me\n');
+    getTarget('zcode')!.install('local', { autoAllow: true, promptHook: true });
+
+    // Workspace scope: ./.zcode/config.json + ./AGENTS.md.
+    expect(fs.existsSync(path.join(tmpCwd, '.zcode', 'config.json'))).toBe(true);
+    expect(fs.existsSync(path.join(tmpCwd, 'AGENTS.md'))).toBe(true);
+    expect(fs.existsSync(globalConfig())).toBe(false);
+
+    getTarget('zcode')!.uninstall('local');
+    const md = fs.readFileSync(path.join(tmpCwd, 'AGENTS.md'), 'utf-8');
+    expect(md).not.toContain('CODEGRAPH');
+    expect(md).toContain('keep me');
+    const c = JSON.parse(fs.readFileSync(path.join(tmpCwd, '.zcode', 'config.json'), 'utf-8'));
+    expect(c.mcp).toBeUndefined();
+  });
+
+  it('printConfig shows the nested mcp.servers shape and writes nothing', () => {
+    const out = getTarget('zcode')!.printConfig('global');
+    expect(out).toContain('mcp');
+    expect(out).toContain('"codegraph"');
+    const parsed = JSON.parse(out.slice(out.indexOf('{')));
+    expect(parsed.mcp.servers.codegraph).toEqual({ command: 'codegraph', args: ['serve', '--mcp'] });
+    expect(fs.existsSync(globalConfig())).toBe(false);
   });
 });
