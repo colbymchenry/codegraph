@@ -236,9 +236,30 @@ Mono, so the code grid survives and only the letterforms change.
 | `#/screens` | screens — the app's screens and the transitions between them |
 
 The map's **Showing** selector includes every indexed directory, including nested
-directories such as `supabase/functions/_shared`; its file count covers all indexed
-descendants. **Grouping** is automatic by default (up to four levels), or can be set
-manually from one through twelve directory levels.
+directories; its file count covers all indexed descendants. **Grouping** is automatic
+by default (up to four levels).
+
+Projects can add named map scopes and raise the manual grouping limit in their existing
+root `codegraph.json`:
+
+```json
+{
+  "viewer": {
+    "map": {
+      "maxDepth": 12,
+      "scopes": [
+        { "label": "Application", "root": "server" },
+        { "label": "Shared application", "root": "server/shared" }
+      ]
+    }
+  }
+}
+```
+
+`maxDepth` accepts whole numbers from 1 through 32 and limits both the selector and
+explicit map URLs. Automatic grouping never exceeds four levels or a smaller configured
+limit. Scope roots are relative indexed directories; invalid settings are ignored with a
+warning. Refresh the browser after editing `codegraph.json` to load the new settings.
 
 ## Entry points
 

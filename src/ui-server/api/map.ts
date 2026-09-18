@@ -36,7 +36,8 @@
 
 import type { CodeGraph } from '../../index';
 import type { EdgeKind, Language } from '../../types';
-import { MAX_MANUAL_MAP_DEPTH } from '../../lib/map-config';
+import { loadViewerMapConfig } from '../../project-config';
+import { DEFAULT_MAP_MAX_DEPTH, normalizeMapRoot } from '../../lib/map-config';
 import { isTestFile } from '../../search/query-utils';
 import { badRequest } from './respond';
 import { UNCERTAIN_BELOW, toPosixPath, wireList, type WireList } from './wire';
@@ -179,6 +180,8 @@ export interface WireMapCycle {
 export interface WireMapPayload {
   root: string;
   depth: number;
+  /** Effective configured upper bound for a reader-selected grouping depth. */
+  maxDepth: number;
   /** Every root the selector may offer, this index's own directories. */
   roots: Array<{ root: string; label: string; files: number }>;
   modules: WireMapModule[];
@@ -210,13 +213,7 @@ export interface MapQuery {
 // =============================================================================
 
 /** Strip a trailing slash and any leading `./`, so `src/` and `src` are one root. */
-export function normalizeRoot(raw: string | undefined): string {
-  let root = (raw ?? '').trim().replace(/\\/g, '/');
-  while (root.startsWith('./')) root = root.slice(2);
-  while (root.endsWith('/')) root = root.slice(0, -1);
-  if (root === '.' || root === '/') return '';
-  return root;
-}
+export const normalizeRoot = normalizeMapRoot;
 
 function stemOf(basename: string): string {
   const dot = basename.indexOf('.');
@@ -365,7 +362,8 @@ function tallyModules(
  */
 export function pickDefaultDepth(
   files: ReadonlyArray<{ path: string; symbols: number; test: boolean }>,
-  root: string
+  root: string,
+  maxDepth = DEFAULT_MAP_MAX_DEPTH
 ): number {
   // Past the deepest directory, a bigger number only renames boxes to
   // `src/a/(root files)`. There is nothing below the leaves.
@@ -380,7 +378,7 @@ export function pickDefaultDepth(
 
   let fallback = DEFAULT_DEPTH;
   let fallbackCount = 0;
-  for (let depth = DEFAULT_DEPTH; depth <= Math.min(MAX_AUTOMATIC_DEPTH, deepest); depth += 1) {
+  for (let depth = DEFAULT_DEPTH; depth <= Math.min(MAX_AUTOMATIC_DEPTH, maxDepth, deepest); depth += 1) {
     const tally = tallyModules(files, root, depth);
     if (tally.count === 0) break;
     // Deeper only gets more crowded from here.
@@ -427,7 +425,7 @@ export function resetMapCache(): void {
  * to survive parsing: a depth defaulted to 1 here is indistinguishable from a
  * reader who asked for 1, and {@link pickDefaultDepth} would never run.
  */
-export function parseMapQuery(query: URLSearchParams): {
+export function parseMapQuery(query: URLSearchParams, maxDepth = DEFAULT_MAP_MAX_DEPTH): {
   root: string | null;
   depth: number | null;
 } {
@@ -435,11 +433,11 @@ export function parseMapQuery(query: URLSearchParams): {
   let depth: number | null = null;
   if (rawDepth !== null && rawDepth !== '') {
     if (!/^\d+$/.test(rawDepth)) {
-      throw badRequest(`depth must be a whole number from 1 to ${MAX_MANUAL_MAP_DEPTH}.`);
+      throw badRequest(`depth must be a whole number from 1 to ${maxDepth}.`);
     }
     depth = Number(rawDepth);
-    if (!Number.isSafeInteger(depth) || depth < 1 || depth > MAX_MANUAL_MAP_DEPTH) {
-      throw badRequest(`depth must be a whole number from 1 to ${MAX_MANUAL_MAP_DEPTH}.`);
+    if (!Number.isSafeInteger(depth) || depth < 1 || depth > maxDepth) {
+      throw badRequest(`depth must be a whole number from 1 to ${maxDepth}.`);
     }
   }
   const rawRoot = query.get('root');
@@ -484,7 +482,8 @@ function collapseLoneRootFiles(ids: ReadonlySet<string>): Map<string, string> {
 
 export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchParams): WireMapPayload {
   const started = Date.now();
-  const { root: requestedRoot, depth: requestedDepth } = parseMapQuery(query);
+  const viewerMap = loadViewerMapConfig(projectRoot);
+  const { root: requestedRoot, depth: requestedDepth } = parseMapQuery(query, viewerMap.maxDepth);
 
   const fileRecords = cg.getFiles().map((file) => {
     const path = toPosixPath(file.path);
@@ -501,7 +500,7 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
   // Root first, then depth against THAT root: how finely to cut depends on
   // what is being cut. Choosing `src` and then asking for one level under it
   // is the same question as choosing the whole project and asking for two.
-  const depth = requestedDepth ?? pickDefaultDepth(fileRecords, root);
+  const depth = requestedDepth ?? pickDefaultDepth(fileRecords, root, viewerMap.maxDepth);
   const stats = cg.getStats();
   const key = [
     projectRoot,
@@ -510,6 +509,7 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
     stats.fileCount,
     root,
     depth,
+    JSON.stringify(viewerMap),
   ].join('\u0000');
   const hit = cache.get(key);
   if (hit) {
@@ -623,7 +623,8 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
   const payload: WireMapPayload = {
     root,
     depth,
-    roots: rootOptions(fileRecords),
+    maxDepth: viewerMap.maxDepth,
+    roots: rootOptions(fileRecords, viewerMap.scopes),
     modules: [...modules.values()]
       .map((entry) => {
         const shown = entry.paths.slice().sort().slice(0, MAX_FILES_PER_MODULE);
@@ -810,7 +811,8 @@ function tarjan(nodes: readonly string[], edgesOf: (id: string) => readonly stri
  * project it is a one-line list nobody has to use.
  */
 function rootOptions(
-  files: ReadonlyArray<{ path: string; symbols: number }>
+  files: ReadonlyArray<{ path: string; symbols: number }>,
+  scopes: ReadonlyArray<{ label: string; root: string }>
 ): WireMapPayload['roots'] {
   const byDir = new Map<string, number>();
   for (const file of files) {
@@ -836,5 +838,11 @@ function rootOptions(
         files: count,
       };
     });
-  return [{ root: '', label: 'whole repository', files: files.length }, ...dirs];
+  const named = scopes.map((scope) => ({
+    root: scope.root,
+    label: scope.label,
+    files: byDir.get(scope.root) ?? 0,
+  }));
+  const namedRoots = new Set(scopes.map((scope) => scope.root));
+  return [{ root: '', label: 'whole repository', files: files.length }, ...named, ...dirs.filter((dir) => !namedRoots.has(dir.root))];
 }

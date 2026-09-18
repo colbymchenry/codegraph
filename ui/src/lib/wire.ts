@@ -641,6 +641,8 @@ export interface WireMapCycle {
 export interface WireMapPayload {
   root: string;
   depth: number;
+  /** Absent in older library adapters; the viewer falls back to four. */
+  maxDepth?: number;
   roots: Array<{ root: string; label: string; files: number }>;
   modules: WireMapModule[];
   links: WireMapLink[];
