@@ -1,7 +1,13 @@
-import type { MapFocusDirection } from './navigation';
 import type { WireMapPayload } from './wire';
 
-export type { MapFocusDirection };
+/** The direction that owns traversal semantics, not URL serialization. */
+export type MapFocusDirection = 'depends-on' | 'used-by';
+
+/** The resolved aggregation identity that Focus must retain across refreshes. */
+export interface MapFocusGrouping {
+  readonly root: string;
+  readonly depth: number;
+}
 
 /**
  * Keep a module and its complete transitive relationship closure. This operates

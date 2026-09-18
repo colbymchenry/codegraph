@@ -621,6 +621,7 @@ describe('@colbymchenry/codegraph-ui — a host renders the package', () => {
       tests: false,
       focus: 'src/auth',
       direction: 'depends-on',
+      focusGrouping: { root: 'src', depth: 1 },
     });
 
     expect(host.textContent ?? '').toContain('cannot focus across the repository');
@@ -639,6 +640,7 @@ describe('@colbymchenry/codegraph-ui — a host renders the package', () => {
       tests: false,
       focus: 'src/auth',
       direction: 'depends-on',
+      focusGrouping: { root: 'src', depth: 1 },
     });
 
     const showing = host.querySelector('select') as HTMLSelectElement;
@@ -659,6 +661,7 @@ describe('@colbymchenry/codegraph-ui — a host renders the package', () => {
       ['tests', false],
       ['focus', 'src/auth'],
       ['direction', 'depends-on'],
+      ['focusGrouping', { root: 'src', depth: 1 }],
     ]);
     let resolveFocused: ((payload: WireMapPayload) => void) | null = null;
     let resolveOrdinary: ((payload: WireMapPayload) => void) | null = null;
@@ -686,6 +689,9 @@ describe('@colbymchenry/codegraph-ui — a host renders the package', () => {
         },
         get direction() {
           return route.get('direction') as 'depends-on' | 'used-by' | null;
+        },
+        get focusGrouping() {
+          return route.get('focusGrouping') as { root: string; depth: number } | null;
         },
       },
     }) as Record<string, unknown>;
@@ -722,6 +728,136 @@ describe('@colbymchenry/codegraph-ui — a host renders the package', () => {
     }
     expect(host.textContent ?? '').toContain('ordinary');
     expect(host.textContent ?? '').not.toContain('cannot focus across the repository');
+  });
+
+  it('freezes resolved automatic grouping through focus and restores automatic mode on clear', async () => {
+    const { adapter } = mockAdapter();
+    const { parseHash } = await import('../ui/src/lib/router.svelte');
+    const route = new SvelteMap<string, unknown>([
+      ['root', null],
+      ['depth', null],
+      ['tests', false],
+      ['focus', null],
+      ['direction', null],
+      ['focusGrouping', null],
+    ]);
+    const requests: Array<{ root?: string | null; depth?: number; context?: string }> = [];
+    let defaultsChanged = false;
+    adapter.map = (request = {}) => {
+      requests.push(request);
+      if (request.context === 'repository') return Promise.resolve({ ...MAP, context: 'repository' });
+      return Promise.resolve(defaultsChanged ? { ...MAP, root: 'other', depth: 2 } : MAP);
+    };
+    setGraphAdapter(adapter);
+    setNavigationDriver({
+      ...hashNavigation,
+      navigate: (href) => {
+        const next = parseHash(href).route;
+        if (next.view !== 'map') throw new Error(`Expected map route, got ${next.view}.`);
+        route.set('root', next.root);
+        route.set('depth', next.depth);
+        route.set('tests', next.tests);
+        route.set('focus', next.focus);
+        route.set('direction', next.direction);
+        route.set('focusGrouping', next.focusGrouping);
+      },
+    });
+
+    mounted = mount(ArchitectureMap, {
+      target: host,
+      props: {
+        get root() {
+          return route.get('root') as string | null;
+        },
+        get depth() {
+          return route.get('depth') as number | null;
+        },
+        get tests() {
+          return route.get('tests') as boolean;
+        },
+        get focus() {
+          return route.get('focus') as string | null;
+        },
+        get direction() {
+          return route.get('direction') as 'depends-on' | 'used-by' | null;
+        },
+        get focusGrouping() {
+          return route.get('focusGrouping') as { root: string; depth: number } | null;
+        },
+      },
+    }) as Record<string, unknown>;
+    for (let turn = 0; turn < 4; turn += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      flushSync();
+    }
+    expect(requests[0]).toMatchObject({ root: null, context: 'scope' });
+    expect(requests[0]?.depth).toBeUndefined();
+
+    [...host.querySelectorAll<HTMLButtonElement>('.mnode')]
+      .find((node) => node.textContent?.includes('src/http'))
+      ?.click();
+    for (let turn = 0; turn < 4; turn += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      flushSync();
+    }
+    [...host.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === 'Focus')
+      ?.click();
+    for (let turn = 0; turn < 4; turn += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      flushSync();
+    }
+    expect(route.get('focusGrouping')).toEqual({ root: 'src', depth: 1 });
+    expect(requests.at(-1)).toMatchObject({ root: 'src', depth: 1, context: 'repository' });
+    expect(host.textContent ?? '').toContain(
+      'Clear focus · return to whole repository · automatic grouping'
+    );
+
+    [...host.querySelectorAll<HTMLButtonElement>('.mnode')]
+      .find((node) => node.textContent?.includes('src/auth'))
+      ?.click();
+    for (let turn = 0; turn < 4; turn += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      flushSync();
+    }
+    [...host.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.trim() === 'Focus')
+      ?.click();
+    for (let turn = 0; turn < 4; turn += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      flushSync();
+    }
+    expect(route.get('focusGrouping')).toEqual({ root: 'src', depth: 1 });
+    expect(requests.at(-1)).toMatchObject({ root: 'src', depth: 1, context: 'repository' });
+
+    defaultsChanged = true;
+    live.signal('index', { index: { lastIndexedAt: 2, files: 4 } });
+    for (let turn = 0; turn < 4; turn += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      flushSync();
+    }
+    expect(requests.at(-1)).toMatchObject({ root: 'src', depth: 1, context: 'repository' });
+
+    const selects = host.querySelectorAll<HTMLSelectElement>('select');
+    selects[2]!.value = 'used-by';
+    selects[2]!.dispatchEvent(new Event('change', { bubbles: true }));
+    host.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
+    for (let turn = 0; turn < 4; turn += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      flushSync();
+    }
+    expect(requests.slice(-2).every((request) => request.root === 'src' && request.depth === 1)).toBe(true);
+
+    host.querySelector<HTMLButtonElement>('button.clear')?.click();
+    for (let turn = 0; turn < 4; turn += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      flushSync();
+    }
+    expect(route.get('root')).toBeNull();
+    expect(route.get('depth')).toBeNull();
+    expect(route.get('focusGrouping')).toBeNull();
+    expect(requests.at(-1)).toMatchObject({ root: null, context: 'scope' });
+    expect(requests.at(-1)?.depth).toBeUndefined();
   });
 
   it('TrailBar and SearchPalette mount and read through the same adapter', async () => {
@@ -866,6 +1002,38 @@ describe('@colbymchenry/codegraph-ui — the seams', () => {
       tests: true,
       focus: 'src/core',
       direction: 'used-by',
+    });
+  });
+
+  it('parses a paired focus grouping snapshot and rejects incomplete automatic focus links', async () => {
+    const { parseHash } = await import('../ui/src/lib/router.svelte');
+
+    expect(
+      parseHash(
+        '#/map?focus=src%2Fcore&direction=used-by&focusRoot=&focusDepth=1'
+      ).route
+    ).toMatchObject({
+      view: 'map',
+      root: null,
+      depth: null,
+      focus: 'src/core',
+      direction: 'used-by',
+      focusGrouping: { root: '', depth: 1 },
+      focusError: null,
+    });
+    expect(
+      parseHash('#/map?root=src&depth=2&focus=src%2Fcore&direction=depends-on').route
+    ).toMatchObject({
+      focusGrouping: { root: 'src', depth: 2 },
+      focusError: null,
+    });
+    expect(
+      parseHash('#/map?focus=src%2Fcore&direction=depends-on&focusRoot=src').route
+    ).toMatchObject({
+      focus: null,
+      direction: null,
+      focusGrouping: null,
+      focusError: 'This focus link is incomplete or invalid.',
     });
   });
 

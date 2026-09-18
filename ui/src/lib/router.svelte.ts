@@ -31,7 +31,7 @@
  */
 
 import { registerHashSync } from './navigation';
-import type { MapFocusDirection } from './navigation';
+import type { MapFocusDirection, MapFocusGrouping } from './map-focus';
 
 export {
   back,
@@ -77,6 +77,7 @@ export type Route =
       tests: boolean;
       focus: string | null;
       direction: MapFocusDirection | null;
+      focusGrouping: MapFocusGrouping | null;
       focusError: string | null;
     }
   | {
@@ -163,8 +164,27 @@ export function parseHash(hash: string): RouterLocation {
     const depth = rawDepth !== null && /^\d+$/.test(rawDepth) ? Number(rawDepth) : Number.NaN;
     const rawFocus = params.get('focus');
     const rawDirection = params.get('direction');
-    const focused = rawFocus !== null || rawDirection !== null;
+    const rawFocusRoot = params.get('focusRoot');
+    const rawFocusDepth = params.get('focusDepth');
+    const focused =
+      rawFocus !== null ||
+      rawDirection !== null ||
+      rawFocusRoot !== null ||
+      rawFocusDepth !== null;
     const direction = rawDirection === 'depends-on' || rawDirection === 'used-by' ? rawDirection : null;
+    const focusDepth =
+      rawFocusDepth !== null && /^\d+$/.test(rawFocusDepth) ? Number(rawFocusDepth) : Number.NaN;
+    const hasSnapshotPart = rawFocusRoot !== null || rawFocusDepth !== null;
+    const explicitGrouping =
+      rawFocusRoot !== null && Number.isSafeInteger(focusDepth) && focusDepth >= 1
+        ? { root: rawFocusRoot, depth: focusDepth }
+        : null;
+    const legacyGrouping =
+      !hasSnapshotPart && root !== null && Number.isSafeInteger(depth) && depth >= 1
+        ? { root, depth }
+        : null;
+    const focusGrouping = explicitGrouping ?? legacyGrouping;
+    const validFocus = !!rawFocus && direction !== null && focusGrouping !== null;
     route = {
       view: 'map',
       root: root === null ? null : root,
@@ -172,9 +192,10 @@ export function parseHash(hash: string): RouterLocation {
       // link intact so an explicit configured depth survives the round trip.
       depth: Number.isSafeInteger(depth) && depth >= 1 ? depth : null,
       tests: params.get('tests') === '1',
-      focus: rawFocus && direction ? rawFocus : null,
-      direction: rawFocus && direction ? direction : null,
-      focusError: focused && (!rawFocus || !direction) ? 'This focus link is incomplete or invalid.' : null,
+      focus: validFocus ? rawFocus : null,
+      direction: validFocus ? direction : null,
+      focusGrouping: validFocus ? focusGrouping : null,
+      focusError: focused && !validFocus ? 'This focus link is incomplete or invalid.' : null,
     };
   } else if (head === 'entry' && rest.length === 0) {
     route = { view: 'entry' };

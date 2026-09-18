@@ -258,8 +258,9 @@ root `codegraph.json`:
 
 `maxDepth` accepts whole numbers from 1 through 32 and limits both the selector and
 explicit map URLs. Automatic grouping never exceeds four levels or a smaller configured
-limit. Scope roots are relative indexed directories; invalid settings are ignored with a
-warning. Refresh the browser after editing `codegraph.json` to load the new settings.
+limit. Scope roots are relative directory paths; roots absent from the index remain selectable
+with zero files. Malformed map settings are ignored with a warning. Refresh the browser after
+editing `codegraph.json` to load the new settings.
 
 Selecting a map module offers **Focus**. **Depends on** and **Used by** show that
 module's transitive reachable modules across the indexed repository, following the same

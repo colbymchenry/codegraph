@@ -171,6 +171,7 @@
       tests={route.tests}
       focus={route.focus}
       direction={route.direction}
+      focusGrouping={route.focusGrouping}
       focusError={route.focusError}
     />
   {:else if route.view === 'flow'}

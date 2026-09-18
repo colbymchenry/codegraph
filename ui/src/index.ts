@@ -81,7 +81,7 @@ export type {
   SymbolHrefOptions,
 } from './lib/navigation';
 export { focusMapPayload } from './lib/map-focus';
-export type { MapFocusDirection } from './lib/map-focus';
+export type { MapFocusDirection, MapFocusGrouping } from './lib/map-focus';
 
 /** The wire vocabulary an adapter answers in. Types only — no runtime. */
 export * from './lib/wire';

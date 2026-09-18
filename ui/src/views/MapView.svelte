@@ -22,8 +22,12 @@
   import { exportFilename, mapSvg } from '../lib/export-svg';
   import { fetchMap, type WireMapPayload } from '../lib/api';
   import { live } from '../lib/live.svelte';
-  import { mapHref, navigate, type MapFocusDirection } from '../lib/navigation';
-  import { focusMapPayload } from '../lib/map-focus';
+  import { mapHref, navigate } from '../lib/navigation';
+  import {
+    focusMapPayload,
+    type MapFocusDirection,
+    type MapFocusGrouping,
+  } from '../lib/map-focus';
   import {
     buildMapLayout,
     isEdgeVisible,
@@ -38,6 +42,7 @@
     tests: boolean;
     focus?: string | null;
     direction?: MapFocusDirection | null;
+    focusGrouping?: MapFocusGrouping | null;
     focusError?: string | null;
   }
 
@@ -47,6 +52,7 @@
     tests,
     focus = null,
     direction = null,
+    focusGrouping = null,
     focusError = null,
   }: Props = $props();
 
@@ -109,6 +115,7 @@
     const wantDepth = depth;
     const wantFocus = focus;
     const wantDirection = direction;
+    const wantFocusGrouping = focusGrouping;
     const wantTests = tests;
     // Read so the effect re-runs when the index moves: the map IS the graph,
     // and the layering changes with it. The canvas stays on screen while the
@@ -122,10 +129,22 @@
       loading = false;
       return () => controller.abort();
     }
-    fetchMap(
-      { root: wantRoot, depth: wantDepth ?? undefined, context: wantFocus ? 'repository' : 'scope' },
-      controller.signal
-    )
+    const mapRequest =
+      wantFocus === null
+        ? { root: wantRoot, depth: wantDepth ?? undefined, context: 'scope' as const }
+        : wantFocusGrouping === null
+          ? null
+          : {
+              root: wantFocusGrouping.root,
+              depth: wantFocusGrouping.depth,
+              context: 'repository' as const,
+            };
+    if (mapRequest === null) {
+      error = 'This focus link is incomplete or invalid. Clear focus to return to the folder map.';
+      loading = false;
+      return () => controller.abort();
+    }
+    fetchMap(mapRequest, controller.signal)
       .then((next) => {
         if (controller.signal.aborted) return;
         payload = next;
@@ -255,14 +274,16 @@
   function startFocus(id: string): void {
     selected = null;
     hovered = null;
-    navigate(mapHref({ root, depth, tests, focus: id, direction: 'depends-on' }));
+    const grouping = focusGrouping ?? (payload === null ? null : { root: payload.root, depth: payload.depth });
+    if (grouping === null) return;
+    navigate(mapHref({ root, depth, tests, focus: id, direction: 'depends-on', focusGrouping: grouping }));
   }
 
   function setFocusDirection(next: MapFocusDirection): void {
     if (focus === null) return;
     selected = null;
     hovered = null;
-    navigate(mapHref({ root, depth, tests, focus, direction: next }));
+    navigate(mapHref({ root, depth, tests, focus, direction: next, focusGrouping }));
   }
 
   function clearFocus(): void {
@@ -293,7 +314,7 @@
   function setTests(next: boolean): void {
     selected = null;
     hovered = null;
-    navigate(mapHref({ root, depth, tests: next, focus, direction }));
+    navigate(mapHref({ root, depth, tests: next, focus, direction, focusGrouping }));
   }
 
 </script>
@@ -420,7 +441,8 @@
       onFocus={startFocus}
       onSelectFocusDirection={setFocusDirection}
       onClearFocus={clearFocus}
-      restoredRoot={payload.root}
+      restoredRoot={root}
+      restoredDepth={depth}
     />
   {/if}
 </div>

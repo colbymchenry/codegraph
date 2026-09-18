@@ -16,7 +16,7 @@
   import { plural } from '../../lib/symbol-model';
   import type { WireMapLink, WireMapPayload } from '../../lib/api';
   import type { MapLayout } from '../../lib/map-model';
-  import type { MapFocusDirection } from '../../lib/navigation';
+  import type { MapFocusDirection } from '../../lib/map-focus';
 
   /** Older independently packaged adapters did not send `maxDepth`. */
   const LEGACY_ADAPTER_MAX_DEPTH = 4;
@@ -43,7 +43,8 @@
     onFocus: (id: string) => void;
     onSelectFocusDirection: (direction: MapFocusDirection) => void;
     onClearFocus: () => void;
-    restoredRoot: string;
+    restoredRoot: string | null;
+    restoredDepth: number | null;
   }
 
   let {
@@ -64,6 +65,7 @@
     onSelectFocusDirection,
     onClearFocus,
     restoredRoot,
+    restoredDepth,
   }: Props = $props();
 
   /**
@@ -191,7 +193,9 @@
       </select>
     </label>
     <button class="clear" onclick={onClearFocus}
-      >Clear focus · return to {restoredRoot || 'whole repository'}</button
+      >Clear focus · return to {restoredRoot || 'whole repository'} · {restoredDepth === null
+        ? 'automatic grouping'
+        : depthLabel(restoredDepth)}</button
     >
   {/if}
 

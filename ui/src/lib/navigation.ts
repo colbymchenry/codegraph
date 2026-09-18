@@ -24,6 +24,10 @@
  * scope, which a host must never inherit just by rendering a Symbol view.
  */
 
+import type { MapFocusDirection, MapFocusGrouping } from './map-focus';
+
+export type { MapFocusDirection } from './map-focus';
+
 export interface SymbolHrefOptions {
   /** A line to highlight and scroll to in the destination. */
   line?: number;
@@ -44,9 +48,9 @@ export interface MapHrefOptions {
   tests?: boolean;
   focus?: string | null;
   direction?: MapFocusDirection | null;
+  /** Resolved grouping identity retained while a focus link is active. */
+  focusGrouping?: MapFocusGrouping | null;
 }
-
-export type MapFocusDirection = 'depends-on' | 'used-by';
 
 export interface DeadCodeHrefOptions {
   /** Include symbols something outside the index could import. */
@@ -153,6 +157,10 @@ export const hashNavigation: NavigationDriver = {
     if (opts.focus && opts.direction) {
       params.set('focus', opts.focus);
       params.set('direction', opts.direction);
+      if (opts.focusGrouping) {
+        params.set('focusRoot', opts.focusGrouping.root);
+        params.set('focusDepth', String(opts.focusGrouping.depth));
+      }
     }
     return `#/map${query(params)}`;
   },
