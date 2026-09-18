@@ -189,7 +189,11 @@ export function parseHash(hash: string): RouterLocation {
         ? { root: rawFocusRoot, depth: focusDepth }
         : null;
     const legacyGrouping =
-      !hasSnapshotPart && root !== null && Number.isSafeInteger(depth) && depth >= 1
+      !hasSnapshotPart &&
+      root !== null &&
+      isCanonicalMapRoot(root) &&
+      Number.isSafeInteger(depth) &&
+      depth >= 1
         ? { root, depth }
         : null;
     const focusGrouping = explicitGrouping ?? legacyGrouping;
