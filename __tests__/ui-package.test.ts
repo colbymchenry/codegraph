@@ -692,6 +692,25 @@ describe('@colbymchenry/codegraph-ui — the seams', () => {
     expect(chosen).toMatchObject({ view: 'symbol', id: 'function:x' });
   });
 
+  it('preserves valid deep map grouping links for the API to validate', async () => {
+    const { parseHash } = await import('../ui/src/lib/router.svelte');
+
+    for (const depth of [5, 12, 32]) {
+      expect(parseHash(`#/map?root=src&depth=${depth}`).route).toMatchObject({
+        view: 'map',
+        root: 'src',
+        depth,
+      });
+    }
+    for (const depth of ['1.5', '12x']) {
+      expect(parseHash(`#/map?root=src&depth=${depth}`).route).toMatchObject({
+        view: 'map',
+        root: 'src',
+        depth: null,
+      });
+    }
+  });
+
   it('sends every nav tab to its own view', async () => {
     const { parseHash } = await import('../ui/src/lib/router.svelte');
     const { entryHref, screensHref, stepsHref, deadHref } = await import(

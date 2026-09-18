@@ -16,7 +16,9 @@
   import { plural } from '../../lib/symbol-model';
   import type { WireMapLink, WireMapPayload } from '../../lib/api';
   import type { MapLayout } from '../../lib/map-model';
-  import { DEFAULT_MAP_MAX_DEPTH } from '../../../../src/lib/map-config';
+
+  /** Older independently packaged adapters did not send `maxDepth`. */
+  const LEGACY_ADAPTER_MAX_DEPTH = 4;
 
   interface Props {
     payload: WireMapPayload;
@@ -61,7 +63,7 @@
    * the thing anybody should have to reach for.
    */
   const DEPTHS = $derived(
-    Array.from({ length: payload.maxDepth ?? DEFAULT_MAP_MAX_DEPTH }, (_, index) => index + 1)
+    Array.from({ length: payload.maxDepth ?? LEGACY_ADAPTER_MAX_DEPTH }, (_, index) => index + 1)
   );
 
   function depthLabel(depth: number): string {

@@ -149,11 +149,14 @@ export function parseHash(hash: string): RouterLocation {
     // grouping — top-level directories — that is wrong for every project whose
     // program lives under a single `src/`.
     const root = params.get('root');
-    const depth = Number.parseInt(params.get('depth') ?? '', 10);
+    const rawDepth = params.get('depth');
+    const depth = rawDepth !== null && /^\d+$/.test(rawDepth) ? Number(rawDepth) : Number.NaN;
     route = {
       view: 'map',
       root: root === null ? null : root,
-      depth: Number.isFinite(depth) && depth >= 1 && depth <= 4 ? depth : null,
+      // The server owns the configured upper bound; keep any valid integer
+      // link intact so an explicit configured depth survives the round trip.
+      depth: Number.isSafeInteger(depth) && depth >= 1 ? depth : null,
       tests: params.get('tests') === '1',
     };
   } else if (head === 'entry' && rest.length === 0) {
