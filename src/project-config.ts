@@ -93,7 +93,7 @@ export interface ProjectConfig {
   viewer?: {
     map?: {
       maxDepth?: number;
-      scopes?: Array<{ label?: string; root?: string }>;
+      scopes?: MapScope[];
     };
   };
 }
@@ -125,7 +125,7 @@ const cache = new Map<string, CacheEntry>();
 const EMPTY_EXTENSIONS: Record<string, Language> = Object.freeze({});
 const EMPTY_VIEWER_MAP: ViewerMapConfig = Object.freeze({
   maxDepth: DEFAULT_MAP_MAX_DEPTH,
-  scopes: Object.freeze([]) as unknown as MapScope[],
+  scopes: Object.freeze([]),
 });
 const EMPTY_CONFIG: ParsedConfig = Object.freeze({
   extensions: EMPTY_EXTENSIONS,
@@ -266,8 +266,8 @@ function extractMapScopes(raw: unknown, file: string): MapScope[] {
     const normalizedRoot = normalizeMapRoot(root);
     if (
       !normalizedRoot ||
-      slashRoot.startsWith('/') ||
-      /^[A-Za-z]:\//.test(slashRoot) ||
+      isAbsoluteMapRoot(slashRoot) ||
+      isAbsoluteMapRoot(normalizedRoot) ||
       normalizedRoot.split('/').includes('..')
     ) {
       logWarn(`Ignoring scope "${label.trim()}" in ${PROJECT_CONFIG_FILENAME}: root must be a relative directory without traversal`, { file });
@@ -283,6 +283,10 @@ function extractMapScopes(raw: unknown, file: string): MapScope[] {
     scopes.push({ label: normalizedLabel, root: normalizedRoot });
   }
   return scopes;
+}
+
+function isAbsoluteMapRoot(root: string): boolean {
+  return root.startsWith('/') || /^[A-Za-z]:\//.test(root);
 }
 
 /**

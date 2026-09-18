@@ -89,6 +89,21 @@ describe('viewer map configuration (codegraph.json)', () => {
     expect(warnings).toHaveLength(6);
   });
 
+  it.each([
+    ['viewer array', { viewer: [] }],
+    ['map array', { viewer: { map: [] } }],
+    ['scope array entry', { viewer: { map: { scopes: [[]] } } }],
+    ['non-string scope label', { viewer: { map: { scopes: [{ label: 1, root: 'backend' }] } } }],
+    ['non-string scope root', { viewer: { map: { scopes: [{ label: 'Backend', root: 1 }] } } }],
+    ['normalized Unix absolute root', { viewer: { map: { scopes: [{ label: 'Backend', root: './/backend' }] } } }],
+    ['normalized Windows absolute root', { viewer: { map: { scopes: [{ label: 'Backend', root: './C:/backend' }] } } }],
+    ['Windows absolute root', { viewer: { map: { scopes: [{ label: 'Backend', root: 'C:/backend' }] } } }],
+  ])('warns and safely ignores a %s', (_case, config) => {
+    writeConfig(config);
+    expect(loadViewerMapConfig(dir)).toEqual({ maxDepth: 4, scopes: [] });
+    expect(warnings).toHaveLength(1);
+  });
+
   it('refreshes changed settings and returns to defaults after removal', () => {
     writeConfig({ viewer: { map: { maxDepth: 12, scopes: [{ label: 'Backend', root: 'backend' }] } } });
     expect(loadViewerMapConfig(dir).maxDepth).toBe(12);

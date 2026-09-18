@@ -5,13 +5,13 @@ export const DEFAULT_MAP_MAX_DEPTH = 4;
 export const MAX_MAP_MAX_DEPTH = 32;
 
 export interface MapScope {
-  label: string;
-  root: string;
+  readonly label: string;
+  readonly root: string;
 }
 
 export interface ViewerMapConfig {
-  maxDepth: number;
-  scopes: MapScope[];
+  readonly maxDepth: number;
+  readonly scopes: readonly MapScope[];
 }
 
 /** Normalize a map root without resolving it against the filesystem. */
