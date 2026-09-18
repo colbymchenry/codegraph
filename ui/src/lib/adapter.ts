@@ -114,6 +114,8 @@ export interface MapRequest {
   root?: string | null;
   /** How many path segments under the root name a module. */
   depth?: number;
+  /** Repository context preserves the requested scope's module identities. */
+  context?: 'scope' | 'repository';
 }
 
 export interface SearchRequest {
@@ -403,6 +405,7 @@ export function createHttpAdapter(options: HttpAdapterOptions = {}): GraphAdapte
       const params = new URLSearchParams();
       if (request.root !== undefined && request.root !== null) params.set('root', request.root);
       if (request.depth) params.set('depth', String(request.depth));
+      if (request.context) params.set('context', request.context);
       return getJson<WireMapPayload>(`api/map${query(params)}`, signal);
     },
 

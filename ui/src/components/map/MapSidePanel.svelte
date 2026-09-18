@@ -16,6 +16,7 @@
   import { plural } from '../../lib/symbol-model';
   import type { WireMapLink, WireMapPayload } from '../../lib/api';
   import type { MapLayout } from '../../lib/map-model';
+  import type { MapFocusDirection } from '../../lib/navigation';
 
   /** Older independently packaged adapters did not send `maxDepth`. */
   const LEGACY_ADAPTER_MAX_DEPTH = 4;
@@ -36,6 +37,10 @@
     buildSvg: (scale: number) => string;
     /** File stem for a downloaded map, without an extension. */
     exportName: string;
+    focus: { id: string; direction: MapFocusDirection } | null;
+    onFocus: (id: string) => void;
+    onSelectFocusDirection: (direction: MapFocusDirection) => void;
+    onClearFocus: () => void;
   }
 
   let {
@@ -51,6 +56,10 @@
     onSelect,
     buildSvg,
     exportName,
+    focus,
+    onFocus,
+    onSelectFocusDirection,
+    onClearFocus,
   }: Props = $props();
 
   /**
@@ -115,9 +124,12 @@
   <label class="field">
     <span>Showing</span>
     <select
-      value={payload.root}
+      value={focus === null ? payload.root : ''}
       onchange={(event) => onSelectRoot((event.currentTarget as HTMLSelectElement).value)}
     >
+      {#if focus !== null}
+        <option value="" disabled>{focus.id} · {focus.direction}</option>
+      {/if}
       {#each payload.roots as option (option.root)}
         <option value={option.root}>{option.label} · {option.files} files</option>
       {/each}
@@ -131,6 +143,7 @@
     <span>Grouping</span>
     <select
       value={chosenDepth === null ? 'auto' : String(chosenDepth)}
+      disabled={focus !== null}
       onchange={(event) => {
         const value = (event.currentTarget as HTMLSelectElement).value;
         onSelectDepth(value === 'auto' ? null : Number(value));
@@ -142,6 +155,21 @@
       {/each}
     </select>
   </label>
+  {#if focus !== null}
+    <p class="dim">Grouping stays fixed while focused so module identities remain stable.</p>
+    <label class="field">
+      <span>Direction</span>
+      <select
+        value={focus.direction}
+        onchange={(event) =>
+          onSelectFocusDirection((event.currentTarget as HTMLSelectElement).value as MapFocusDirection)}
+      >
+        <option value="depends-on">Depends on</option>
+        <option value="used-by">Used by</option>
+      </select>
+    </label>
+    <button class="clear" onclick={onClearFocus}>Clear focus</button>
+  {/if}
 
   <label class="toggle">
     <input
@@ -261,6 +289,9 @@
             : `${selectedModule.generated} tool-generated`}
         {/if}
       </p>
+      {#if focus === null}
+        <button class="clear" onclick={() => onFocus(selectedModule.id)}>Focus</button>
+      {/if}
 
       {#if (selectedModule.dependents?.files ?? 0) > 0}
         <p class="reach">

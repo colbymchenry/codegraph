@@ -32,6 +32,7 @@ import {
   NODE_HEIGHT,
   type MapLayout,
 } from '../ui/src/lib/map-model';
+import { focusMapPayload } from '../ui/src/lib/map-focus';
 import type { WireMapLink, WireMapModule } from '../ui/src/lib/api';
 
 /* ------------------------------------------------------------- fixtures -- */
@@ -75,6 +76,40 @@ function layerOf(layout: MapLayout, id: string): number {
 const OPTS = { includeTests: false };
 
 /* ---------------------------------------------------------------- specs -- */
+
+describe('focusMapPayload', () => {
+  const modules = [
+    mod('app'),
+    mod('core'),
+    mod('db'),
+    mod('thin'),
+    mod('cycle'),
+    mod('test-bridge', { test: true }),
+    mod('isolated'),
+    mod('unrelated'),
+  ];
+  const links = [
+    link('app', 'core', 10),
+    link('core', 'db', 10),
+    link('db', 'cycle', 1),
+    link('cycle', 'core', 1),
+    link('core', 'thin', 1),
+    link('test-bridge', 'db', 10),
+    link('unrelated', 'db', 10),
+  ];
+
+  it('walks complete eligible links transitively in either direction and retains isolates', () => {
+    const payload = { modules, links } as any;
+    expect(focusMapPayload(payload, 'app', 'depends-on', false)?.modules.map((module) => module.id))
+      .toEqual(['app', 'core', 'db', 'thin', 'cycle']);
+    expect(focusMapPayload(payload, 'db', 'used-by', false)?.modules.map((module) => module.id))
+      .toEqual(['app', 'core', 'db', 'cycle', 'unrelated']);
+    expect(focusMapPayload(payload, 'db', 'used-by', true)?.modules.map((module) => module.id))
+      .toEqual(['app', 'core', 'db', 'cycle', 'test-bridge', 'unrelated']);
+    expect(focusMapPayload(payload, 'isolated', 'depends-on', false)?.modules.map((module) => module.id))
+      .toEqual(['isolated']);
+  });
+});
 
 describe('nodeWidth', () => {
   it('fits the wider of the two lines and never goes under the floor', () => {

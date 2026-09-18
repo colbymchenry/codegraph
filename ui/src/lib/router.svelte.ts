@@ -31,6 +31,7 @@
  */
 
 import { registerHashSync } from './navigation';
+import type { MapFocusDirection } from './navigation';
 
 export {
   back,
@@ -52,6 +53,7 @@ export type {
   FileHrefOptions,
   FlowHrefOptions,
   MapHrefOptions,
+  MapFocusDirection,
   NavigationDriver,
   StepsHrefOptions,
   SymbolHrefOptions,
@@ -68,7 +70,15 @@ export type Route =
       /** The whole-file source view rather than the outline (design spec §3.4). */
       source: boolean;
     }
-  | { view: 'map'; root: string | null; depth: number | null; tests: boolean }
+  | {
+      view: 'map';
+      root: string | null;
+      depth: number | null;
+      tests: boolean;
+      focus: string | null;
+      direction: MapFocusDirection | null;
+      focusError: string | null;
+    }
   | {
       view: 'flow';
       /** "how does X reach Y" — both ends pinned. */
@@ -151,6 +161,10 @@ export function parseHash(hash: string): RouterLocation {
     const root = params.get('root');
     const rawDepth = params.get('depth');
     const depth = rawDepth !== null && /^\d+$/.test(rawDepth) ? Number(rawDepth) : Number.NaN;
+    const rawFocus = params.get('focus');
+    const rawDirection = params.get('direction');
+    const focused = rawFocus !== null || rawDirection !== null;
+    const direction = rawDirection === 'depends-on' || rawDirection === 'used-by' ? rawDirection : null;
     route = {
       view: 'map',
       root: root === null ? null : root,
@@ -158,6 +172,9 @@ export function parseHash(hash: string): RouterLocation {
       // link intact so an explicit configured depth survives the round trip.
       depth: Number.isSafeInteger(depth) && depth >= 1 ? depth : null,
       tests: params.get('tests') === '1',
+      focus: rawFocus && direction ? rawFocus : null,
+      direction: rawFocus && direction ? direction : null,
+      focusError: focused && (!rawFocus || !direction) ? 'This focus link is incomplete or invalid.' : null,
     };
   } else if (head === 'entry' && rest.length === 0) {
     route = { view: 'entry' };

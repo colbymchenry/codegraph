@@ -165,7 +165,14 @@
   {:else if route.view === 'file'}
     <FileView path={route.path} line={route.line} />
   {:else if route.view === 'map'}
-    <MapView root={route.root} depth={route.depth} tests={route.tests} />
+    <MapView
+      root={route.root}
+      depth={route.depth}
+      tests={route.tests}
+      focus={route.focus}
+      direction={route.direction}
+      focusError={route.focusError}
+    />
   {:else if route.view === 'flow'}
     <FlowView
       from={route.from}

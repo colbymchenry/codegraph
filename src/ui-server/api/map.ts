@@ -180,6 +180,8 @@ export interface WireMapCycle {
 export interface WireMapPayload {
   root: string;
   depth: number;
+  /** The aggregation extent; older adapters may omit it. */
+  context: 'scope' | 'repository';
   /** Effective configured upper bound for a reader-selected grouping depth. */
   maxDepth: number;
   /** Every root the selector may offer, this index's own directories. */
@@ -206,6 +208,7 @@ export interface WireMapPayload {
 export interface MapQuery {
   root: string;
   depth: number;
+  context: 'scope' | 'repository';
 }
 
 // =============================================================================
@@ -428,6 +431,7 @@ export function resetMapCache(): void {
 export function parseMapQuery(query: URLSearchParams, maxDepth = DEFAULT_MAP_MAX_DEPTH): {
   root: string | null;
   depth: number | null;
+  context: 'scope' | 'repository';
 } {
   const rawDepth = query.get('depth');
   let depth: number | null = null;
@@ -440,8 +444,16 @@ export function parseMapQuery(query: URLSearchParams, maxDepth = DEFAULT_MAP_MAX
       throw badRequest(`depth must be a whole number from 1 to ${maxDepth}.`);
     }
   }
+  const rawContext = query.get('context');
+  if (rawContext !== null && rawContext !== 'scope' && rawContext !== 'repository') {
+    throw badRequest('context must be "scope" or "repository".');
+  }
   const rawRoot = query.get('root');
-  return { root: rawRoot === null ? null : normalizeRoot(rawRoot), depth };
+  return {
+    root: rawRoot === null ? null : normalizeRoot(rawRoot),
+    depth,
+    context: rawContext === 'repository' ? 'repository' : 'scope',
+  };
 }
 
 /**
@@ -483,7 +495,7 @@ function collapseLoneRootFiles(ids: ReadonlySet<string>): Map<string, string> {
 export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchParams): WireMapPayload {
   const started = Date.now();
   const viewerMap = loadViewerMapConfig(projectRoot);
-  const { root: requestedRoot, depth: requestedDepth } = parseMapQuery(query, viewerMap.maxDepth);
+  const { root: requestedRoot, depth: requestedDepth, context } = parseMapQuery(query, viewerMap.maxDepth);
 
   const fileRecords = cg.getFiles().map((file) => {
     const path = toPosixPath(file.path);
@@ -501,6 +513,10 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
   // what is being cut. Choosing `src` and then asking for one level under it
   // is the same question as choosing the whole project and asking for two.
   const depth = requestedDepth ?? pickDefaultDepth(fileRecords, root, viewerMap.maxDepth);
+  const groupingRoot = context === 'repository' ? '' : root;
+  const groupingDepth = context === 'repository'
+    ? depth + root.split('/').filter(Boolean).length
+    : depth;
   const stats = cg.getStats();
   const key = [
     projectRoot,
@@ -509,6 +525,7 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
     stats.fileCount,
     root,
     depth,
+    context,
     JSON.stringify(viewerMap),
   ].join('\u0000');
   const hit = cache.get(key);
@@ -537,7 +554,7 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
 
   const assigned = new Map<string, { id: string; facade: boolean }>();
   for (const file of fileRecords) {
-    const at = moduleIdFor(file.path, root, depth);
+    const at = moduleIdFor(file.path, groupingRoot, groupingDepth);
     if (at !== null) assigned.set(file.path, at);
   }
   const renamed = collapseLoneRootFiles(new Set([...assigned.values()].map((a) => a.id)));
@@ -623,6 +640,7 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
   const payload: WireMapPayload = {
     root,
     depth,
+    context,
     maxDepth: viewerMap.maxDepth,
     roots: rootOptions(fileRecords, viewerMap.scopes),
     modules: [...modules.values()]

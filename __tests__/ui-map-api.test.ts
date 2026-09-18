@@ -225,6 +225,11 @@ export function start(): void {
     `import { authenticate } from '../_shared/auth';\n\nexport const serve = () => authenticate();\n`
   );
   write(projectRoot, 'supabasex/functions/other.ts', `export const other = true;\n`);
+  write(
+    projectRoot,
+    'tools/consumer.ts',
+    `import { Engine } from '../src/core/engine';\n\nexport const consume = () => new Engine().boot();\n`
+  );
 
   write(
     projectRoot,
@@ -238,7 +243,7 @@ export function testBoot(): string[] {
   );
 
   const cg = CodeGraph.initSync(projectRoot, {
-    config: { include: ['src/**/*.ts', 'supabase/**/*.ts', 'supabasex/**/*.ts', '__tests__/**/*.ts'], exclude: [] },
+    config: { include: ['src/**/*.ts', 'supabase/**/*.ts', 'supabasex/**/*.ts', 'tools/**/*.ts', '__tests__/**/*.ts'], exclude: [] },
   });
   await cg.indexAll();
   cg.resolveReferences();
@@ -704,5 +709,26 @@ describe('GET /api/map', () => {
     const all = await getMap('?root=&depth=1');
     expect(all.root).toBe('');
     expect(all.modules.map((m: any) => m.id)).not.toEqual(src.modules.map((m: any) => m.id));
+  });
+
+  it('uses repository context to retain a nested scope identity and outside callers', async () => {
+    const scoped = await getMap('?root=src&depth=1');
+    const repository = await getMap('?root=src&depth=1&context=repository');
+
+    expect(repository.context).toBe('repository');
+    expect(repository.modules.map((module: any) => module.id)).toEqual(
+      expect.arrayContaining(['src/core', 'tools'])
+    );
+    const scopedCore = scoped.modules.find((module: any) => module.id === 'src/core');
+    const repositoryCore = repository.modules.find((module: any) => module.id === 'src/core');
+    expect(repositoryCore).toMatchObject({
+      id: scopedCore.id,
+      files: scopedCore.files,
+      symbols: scopedCore.symbols,
+      fileList: scopedCore.fileList,
+    });
+    expect(repository.links).toEqual(
+      expect.arrayContaining([expect.objectContaining({ source: 'tools', target: 'src/core' })])
+    );
   });
 });

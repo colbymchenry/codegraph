@@ -261,6 +261,14 @@ explicit map URLs. Automatic grouping never exceeds four levels or a smaller con
 limit. Scope roots are relative indexed directories; invalid settings are ignored with a
 warning. Refresh the browser after editing `codegraph.json` to load the new settings.
 
+Selecting a map module offers **Focus**. **Depends on** and **Used by** show that
+module's transitive reachable modules across the indexed repository, following the same
+confidence and test-visibility policy as the map; this is module-level reachability, not
+proof of an exact symbol impact. Focus holds the original root and grouping stable so
+Clear focus restores the prior map. A viewer adapter must advertise repository map context
+for Focus; older adapters remain available for ordinary maps and show a recoverable error
+instead of a partial focus result.
+
 ## Entry points
 
 `#/entry` draws `/api/entrypoints` as file groups, reusing the Symbol view's

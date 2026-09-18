@@ -167,7 +167,7 @@ export function canDrawSteps(): boolean {
 }
 
 export function fetchMap(
-  opts: { root?: string | null; depth?: number } = {},
+  opts: { root?: string | null; depth?: number; context?: 'scope' | 'repository' } = {},
   signal?: AbortSignal
 ): Promise<WireMapPayload> {
   return getGraphAdapter().map(opts, signal);

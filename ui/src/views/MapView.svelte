@@ -22,7 +22,8 @@
   import { exportFilename, mapSvg } from '../lib/export-svg';
   import { fetchMap, type WireMapPayload } from '../lib/api';
   import { live } from '../lib/live.svelte';
-  import { mapHref, navigate } from '../lib/navigation';
+  import { mapHref, navigate, type MapFocusDirection } from '../lib/navigation';
+  import { focusMapPayload } from '../lib/map-focus';
   import {
     buildMapLayout,
     isEdgeVisible,
@@ -35,9 +36,19 @@
     /** `null` = nobody has chosen; the answer picks a grouping for this repo. */
     depth: number | null;
     tests: boolean;
+    focus?: string | null;
+    direction?: MapFocusDirection | null;
+    focusError?: string | null;
   }
 
-  let { root, depth, tests }: Props = $props();
+  let {
+    root,
+    depth,
+    tests,
+    focus = null,
+    direction = null,
+    focusError = null,
+  }: Props = $props();
 
   let payload = $state<WireMapPayload | null>(null);
   let error = $state<string | null>(null);
@@ -86,6 +97,9 @@
   $effect(() => {
     const wantRoot = root;
     const wantDepth = depth;
+    const wantFocus = focus;
+    const wantDirection = direction;
+    const wantTests = tests;
     // Read so the effect re-runs when the index moves: the map IS the graph,
     // and the layering changes with it. The canvas stays on screen while the
     // new aggregation lands (the server answers a cached one in milliseconds
@@ -93,10 +107,29 @@
     void live.indexTick;
     const controller = new AbortController();
     loading = true;
-    error = null;
-    fetchMap({ root: wantRoot, depth: wantDepth ?? undefined }, controller.signal)
+    error = focusError;
+    if (focusError !== null) {
+      loading = false;
+      return () => controller.abort();
+    }
+    fetchMap(
+      { root: wantRoot, depth: wantDepth ?? undefined, context: wantFocus ? 'repository' : 'scope' },
+      controller.signal
+    )
       .then((next) => {
         payload = next;
+        if (
+          wantFocus !== null &&
+          (
+            wantDirection === null ||
+            next.context !== 'repository' ||
+            !next.modules.some((module) => module.id === wantFocus && (wantTests || !module.test))
+          )
+        ) {
+          error = next.context !== 'repository'
+            ? 'This map data source cannot focus across the repository. Clear focus to return to the folder map.'
+            : 'This focused module is no longer in the indexed graph. Clear focus to return to the folder map.';
+        }
         loading = false;
       })
       .catch((err: unknown) => {
@@ -107,8 +140,14 @@
     return () => controller.abort();
   });
 
+  const focusedPayload = $derived(
+    payload === null || focus === null || direction === null
+      ? payload
+      : focusMapPayload(payload, focus, direction, tests)
+  );
+  const displayPayload = $derived(focusedPayload ?? payload);
   const layout = $derived<MapLayout | null>(
-    payload === null ? null : buildMapLayout(payload, { includeTests: tests })
+    displayPayload === null ? null : buildMapLayout(displayPayload, { includeTests: tests })
   );
 
   /** Modules one hop from the selection — everything else is dimmed, not hidden. */
@@ -123,7 +162,7 @@
   });
 
   const nodes = $derived.by<Node[]>(() => {
-    if (layout === null) return [];
+    if (layout === null || loading) return [];
     return layout.nodes.map((node) => ({
       id: node.id,
       type: 'module',
@@ -166,9 +205,9 @@
   });
 
   const selectedFiles = $derived(
-    selected === null || payload === null
+    selected === null || displayPayload === null
       ? []
-      : (payload.modules.find((m) => m.id === selected)?.fileList.items ?? [])
+      : (displayPayload.modules.find((m) => m.id === selected)?.fileList.items ?? [])
   );
 
   function onEdgeHover(edge: MapEdgeLayout | null, event: MouseEvent | null): void {
@@ -199,6 +238,25 @@
     navigate(mapHref({ root, depth: next, tests }));
   }
 
+  function startFocus(id: string): void {
+    selected = null;
+    hovered = null;
+    navigate(mapHref({ root, depth, tests, focus: id, direction: 'depends-on' }));
+  }
+
+  function setFocusDirection(next: MapFocusDirection): void {
+    if (focus === null) return;
+    selected = null;
+    hovered = null;
+    navigate(mapHref({ root, depth, tests, focus, direction: next }));
+  }
+
+  function clearFocus(): void {
+    selected = null;
+    hovered = null;
+    navigate(mapHref({ root, depth, tests }));
+  }
+
   /**
    * The map as it stands, for a README.
    *
@@ -220,7 +278,8 @@
 
   function setTests(next: boolean): void {
     selected = null;
-    navigate(mapHref({ root, depth, tests: next }));
+    hovered = null;
+    navigate(mapHref({ root, depth, tests: next, focus, direction }));
   }
 
 </script>
@@ -231,6 +290,9 @@
       <div class="state">
         <h2>The map could not be built</h2>
         <p>{error}</p>
+        {#if focus !== null || focusError !== null}
+          <button class="clearfocus" onclick={clearFocus}>Clear focus</button>
+        {/if}
       </div>
     {:else if loading && payload === null}
       <div class="state"><p class="dim">Aggregating the graph by module…</p></div>
@@ -323,7 +385,7 @@
 
   {#if payload !== null && layout !== null}
     <MapSidePanel
-      {payload}
+      payload={displayPayload ?? payload}
       {layout}
       {selected}
       includeTests={tests}
@@ -335,6 +397,10 @@
       chosenDepth={depth}
       onSelectDepth={setDepth}
       onSelect={(id) => (selected = id)}
+      focus={focus === null || direction === null ? null : { id: focus, direction }}
+      onFocus={startFocus}
+      onSelectFocusDirection={setFocusDirection}
+      onClearFocus={clearFocus}
     />
   {/if}
 </div>
@@ -350,6 +416,15 @@
     position: relative;
     overflow: hidden;
     background: var(--paper);
+  }
+  .clearfocus {
+    border: 1px solid var(--rule-soft);
+    border-radius: 0;
+    background: var(--paper);
+    color: var(--ink-2);
+    cursor: pointer;
+    font: 12px var(--sans);
+    padding: 4px 6px;
   }
   /* Svelte Flow paints its own surface and its own controls; both are
      re-tokenised so the canvas belongs to the paper/ink system rather than

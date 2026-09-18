@@ -42,7 +42,11 @@ export interface MapHrefOptions {
   /** Absent or null leaves the grouping to the answering side. */
   depth?: number | null;
   tests?: boolean;
+  focus?: string | null;
+  direction?: MapFocusDirection | null;
 }
+
+export type MapFocusDirection = 'depends-on' | 'used-by';
 
 export interface DeadCodeHrefOptions {
   /** Include symbols something outside the index could import. */
@@ -146,6 +150,10 @@ export const hashNavigation: NavigationDriver = {
     // something, and dropping it would hand the choice back to the answer.
     if (opts.depth) params.set('depth', String(opts.depth));
     if (opts.tests) params.set('tests', '1');
+    if (opts.focus && opts.direction) {
+      params.set('focus', opts.focus);
+      params.set('direction', opts.direction);
+    }
     return `#/map${query(params)}`;
   },
 

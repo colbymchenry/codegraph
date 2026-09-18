@@ -711,6 +711,20 @@ describe('@colbymchenry/codegraph-ui — the seams', () => {
     }
   });
 
+  it('restores explicit focus state from a map deep link', async () => {
+    const { parseHash } = await import('../ui/src/lib/router.svelte');
+
+    expect(parseHash('#/map?root=src&depth=12&tests=1&focus=src%2Fcore&direction=used-by').route)
+      .toMatchObject({
+        view: 'map',
+        root: 'src',
+        depth: 12,
+        tests: true,
+        focus: 'src/core',
+        direction: 'used-by',
+      });
+  });
+
   it('sends every nav tab to its own view', async () => {
     const { parseHash } = await import('../ui/src/lib/router.svelte');
     const { entryHref, screensHref, stepsHref, deadHref } = await import(
