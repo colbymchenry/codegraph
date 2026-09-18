@@ -104,9 +104,6 @@
     hovered = null;
   });
 
-  // One fetch per (root, depth). The tests toggle is deliberately NOT in here:
-  // the payload already carries every module, so including them is a filter,
-  // not a question for the server.
   $effect(() => {
     const wantRoot = root;
     const wantDepth = depth;

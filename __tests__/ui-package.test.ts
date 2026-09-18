@@ -849,6 +849,26 @@ describe('@colbymchenry/codegraph-ui — the seams', () => {
       });
   });
 
+  it('round-trips focus through the production hash map URL boundary', async () => {
+    const { parseHash } = await import('../ui/src/lib/router.svelte');
+    const href = hashNavigation.mapHref({
+      root: 'src',
+      depth: 2,
+      tests: true,
+      focus: 'src/core',
+      direction: 'used-by',
+    });
+
+    expect(parseHash(href).route).toMatchObject({
+      view: 'map',
+      root: 'src',
+      depth: 2,
+      tests: true,
+      focus: 'src/core',
+      direction: 'used-by',
+    });
+  });
+
   it('sends every nav tab to its own view', async () => {
     const { parseHash } = await import('../ui/src/lib/router.svelte');
     const { entryHref, screensHref, stepsHref, deadHref } = await import(
@@ -894,6 +914,27 @@ describe('@colbymchenry/codegraph-ui — the seams', () => {
     expect(asked[2]).toBe('api/source?file=src%2Fa.ts&from=1&to=4');
     // Repeated `id` params, never a comma-joined list.
     expect(asked[3]).toBe('api/nodes?id=a&id=b');
+  });
+
+  it('forwards repository context through the real HTTP map adapter', async () => {
+    const asked: string[] = [];
+    const adapter = createHttpAdapter({
+      fetch: async (input) => {
+        asked.push(String(input));
+        return new Response(JSON.stringify(MAP), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      },
+    });
+
+    const focused = await adapter.map({ root: 'src', depth: 2, context: 'repository' });
+    const ordinary = await adapter.map();
+
+    expect(focused).toEqual(MAP);
+    expect(ordinary).toEqual(MAP);
+    expect(asked[0]).toBe('api/map?root=src&depth=2&context=repository');
+    expect(asked[1]).toBe('api/map');
   });
 
   it('an adapter with no live channel never connects and never polls', () => {
