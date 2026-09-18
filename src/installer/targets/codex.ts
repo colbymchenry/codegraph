@@ -7,7 +7,8 @@
  *   - Instructions to `AGENTS.md`.
  *
  * Both locations are supported (#1531):
- *   - global: `~/.codex/config.toml` + `~/.codex/AGENTS.md`
+ *   - global: `$CODEX_HOME/config.toml` + `$CODEX_HOME/AGENTS.md`,
+ *     falling back to `~/.codex` when the env var is unset (#1627)
  *   - local:  `<cwd>/.codex/config.toml` + `<cwd>/AGENTS.md`
  *
  * Codex has a first-class project config layer: `.codex/config.toml`
@@ -53,9 +54,16 @@ import { buildTomlTable, removeTomlTable, upsertTomlTable } from './toml';
 const TOML_HEADER = 'mcp_servers.codegraph';
 
 function configDir(loc: Location): string {
-  return loc === 'global'
-    ? path.join(os.homedir(), '.codex')
-    : path.join(process.cwd(), '.codex');
+  if (loc !== 'global') return path.join(process.cwd(), '.codex');
+  // Codex resolves its user layer from `CODEX_HOME` and only falls back to
+  // `~/.codex` (#1627). Installing to the fallback while Codex reads the
+  // override is a silent no-op: the files are written, and Codex never looks
+  // at them. Same resolution the copilot-cli target already does for
+  // `COPILOT_HOME`. Only the user layer moves — the project layer below is
+  // anchored to the project, not the profile.
+  const override = process.env.CODEX_HOME;
+  if (override && override.trim().length > 0) return override;
+  return path.join(os.homedir(), '.codex');
 }
 function tomlConfigPath(loc: Location): string {
   return path.join(configDir(loc), 'config.toml');

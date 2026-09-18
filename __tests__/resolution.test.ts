@@ -1258,6 +1258,78 @@ impl<T> Source for BufSource<T> {
       expect(callsFrom('Countdown::run').map((c) => c.target)).toEqual(['Countdown::run']);
     });
 
+    // ── Rust `self.<method>()` receivers (#1861) ──────────────────────────
+    it('resolves `self.method()` on the enclosing type, not on whichever same-named method sits nearer (#1861)', async () => {
+      // The issue's repro, one file: `Decoy::reset` sits between the call and
+      // the method it means, so a bare name ranked by file proximity picked
+      // the decoy — and the edge carried no provenance to say it was a guess.
+      writeRustCrate(tempDir, {
+        'lib.rs':
+          'pub struct Target { pub n: i32 }\n\nimpl Target {\n    pub fn reset(&mut self) { self.n = -1; }\n}\n\n' +
+          'pub struct Decoy { pub n: i32 }\n\nimpl Decoy {\n    pub fn reset(&mut self) { self.n = 0; }\n}\n\n' +
+          'impl Target {\n    pub fn run(&mut self) { self.reset(); }\n}\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(callsFrom('Target::run')).toEqual([
+        { target: 'Target::reset', resolvedBy: 'qualified-name', provenance: undefined },
+      ]);
+    });
+
+    it('decides the same way across directories, where proximity decided before (#1861)', async () => {
+      // Same code, only the layout changes. If the answer moved with the file
+      // tree, proximity was still deciding it.
+      writeRustCrate(tempDir, {
+        'lib.rs': 'pub mod near;\npub mod far;\n',
+        'near.rs': 'pub struct Decoy { pub n: i32 }\nimpl Decoy {\n    pub fn reset(&mut self) { self.n = 0; }\n}\n',
+        'far.rs':
+          'pub struct Target { pub n: i32 }\nimpl Target {\n    pub fn reset(&mut self) { self.n = -1; }\n}\n' +
+          'impl Target {\n    pub fn run(&mut self) { self.reset(); }\n}\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(callsFrom('Target::run').map((c) => c.target)).toEqual(['Target::reset']);
+    });
+
+    it('declines when the enclosing type has no such method, and does not change a receiver-less call (#1861)', async () => {
+      // The two ways this could overreach. `self.missing()` names nothing on
+      // the owner, so it must not fall back to some other type's `missing`.
+      //
+      // The receiver-less half is pinned as it BEHAVES, not as it should: a
+      // bare `reset()` is a free-function call, and it already resolved to
+      // `Target::reset` before this change — the mirror image of #1861, where
+      // a call with no receiver is given one. That is a separate defect in the
+      // bare-name strategy, measured on this branch's parent; the cell is here
+      // so this change is pinned to not make it worse.
+      writeRustCrate(tempDir, {
+        'lib.rs':
+          'pub fn reset() {}\n\n' +
+          'pub struct Other { pub n: i32 }\nimpl Other {\n    pub fn missing(&mut self) {}\n}\n\n' +
+          'pub struct Target { pub n: i32 }\nimpl Target {\n    pub fn reset(&mut self) { self.n = -1; }\n' +
+          '    pub fn free(&mut self) { reset(); }\n' +
+          '    pub fn absent(&mut self) { self.missing(); }\n}\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      // Unchanged by this commit — see the note above.
+      expect(callsFrom('Target::free').map((c) => c.target)).toEqual(['Target::reset']);
+      // Nothing on the owner is named `missing`, so no edge at all.
+      expect(callsFrom('Target::absent')).toEqual([]);
+    });
+
+    it('resolves `self.method()` inside a trait impl to that impl (#1861)', async () => {
+      writeRustCrate(tempDir, {
+        'lib.rs':
+          'pub trait Run {\n    fn go(&mut self);\n}\n\n' +
+          'pub struct Decoy { pub n: i32 }\nimpl Decoy {\n    pub fn step(&mut self) { self.n = 0; }\n}\n\n' +
+          'pub struct Doer { pub n: i32 }\nimpl Doer {\n    pub fn step(&mut self) { self.n = 1; }\n}\n' +
+          'impl Run for Doer {\n    fn go(&mut self) { self.step(); }\n}\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(callsFrom('Doer::go').map((c) => c.target)).toEqual(['Doer::step']);
+    });
+
     it('resolves a trait-object field to the trait method and typed fields to the right implementation (#1585, #1588)', async () => {
       // The #1588 repro's second half: `UsesFile::go` / `UsesBuf::go` each
       // forward through a typed field, and a `Box<dyn Source>` field lands on
@@ -1556,6 +1628,65 @@ def add_outcome(row):
       expect(buildMap).toBeDefined();
       const buildMapCalls = cg.getOutgoingEdges(buildMap!.id).filter((e) => e.kind === 'calls');
       expect(buildMapCalls.map((e) => e.target)).not.toContain(ledgerAppend!.id);
+    });
+
+    it('resolves Python module-attribute calls and file imports through an alias (#1626)', async () => {
+      // #715 taught resolvePythonModuleMember to fall back to a dotted-module
+      // file lookup, which fixed `from pkg import module` (#578). The aliased
+      // form still missed: the module path was rebuilt from the LOCAL name, so
+      // `from pkg import module as alias` looked for `pkg.alias` — a file that
+      // does not exist — and the call landed in unresolved_refs. The plain
+      // `import top as alias` form is a namespace import and binds at `source`,
+      // so it was already correct; it is pinned here so the fix can't regress it.
+      fs.mkdirSync(path.join(tempDir, 'pkg'));
+      fs.writeFileSync(path.join(tempDir, 'pkg', '__init__.py'), '');
+      fs.writeFileSync(
+        path.join(tempDir, 'pkg', 'module.py'),
+        'def func():\n    return 1\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'top_level.py'),
+        'def top_func():\n    return 2\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'main.py'),
+        `from pkg import module as mod_alias
+import top_level as tl
+
+
+def from_import_caller():
+    return mod_alias.func()
+
+
+def plain_import_caller():
+    return tl.top_func()
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const fromImportCaller = cg.getNodesByKind('function').filter((n) => n.name === 'from_import_caller')[0];
+      expect(fromImportCaller).toBeDefined();
+      const aliasCalls = cg.getOutgoingEdges(fromImportCaller!.id).filter((e) => e.kind === 'calls');
+      expect(aliasCalls).toHaveLength(1);
+      const aliasTarget = cg.getNode(aliasCalls[0]!.target);
+      expect(aliasTarget?.name).toBe('func');
+      expect(aliasTarget?.filePath.replace(/\\/g, '/')).toBe('pkg/module.py');
+
+      const plainCaller = cg.getNodesByKind('function').filter((n) => n.name === 'plain_import_caller')[0];
+      expect(plainCaller).toBeDefined();
+      const plainCalls = cg.getOutgoingEdges(plainCaller!.id).filter((e) => e.kind === 'calls');
+      expect(plainCalls).toHaveLength(1);
+      expect(cg.getNode(plainCalls[0]!.target)?.name).toBe('top_func');
+
+      // The file dependency must resolve too: fixing only the member lookup
+      // restores calls but leaves the aliased module's imports edge missing.
+      const mainFile = cg.getNodesByKind('file').find((n) => n.filePath === 'main.py');
+      const moduleFile = cg.getNodesByKind('file').find((n) => n.filePath.replace(/\\/g, '/') === 'pkg/module.py');
+      expect(mainFile).toBeDefined();
+      expect(moduleFile).toBeDefined();
+      const fileImports = cg.getOutgoingEdges(mainFile!.id).filter((e) => e.kind === 'imports');
+      expect(fileImports.map((e) => e.target)).toContain(moduleFile!.id);
     });
 
     it('attaches Go methods to their receiver type across files (#583, cross-file half)', async () => {
@@ -2257,6 +2388,140 @@ func main() {
   });
 
   describe('Local-variable receiver-type inference (#1108)', () => {
+    it.each(['ts', 'tsx', 'js', 'jsx'])('keeps built-in Map calls off project methods — %s (#1566)', async (ext) => {
+      const typed = ext === 'ts' || ext === 'tsx';
+      fs.writeFileSync(path.join(tempDir, `cache.${ext}`), `
+export class LRUCache {
+  get(key) { return key; }
+  set(key, value) { return value; }
+  has(key) { return true; }
+}
+export function useLocalMap() {
+  const values = new Map${typed ? '<string, string>' : ''}();
+  values.set('answer', '42');
+  values.get('answer');
+  return values.has('answer');
+}
+export function useNestedMap(holder${typed ? ': { values: Map<string, string> }' : ''}) {
+  return holder.values.get('answer');
+}
+export function useProjectCache() {
+  const cache = new LRUCache();
+  cache.set('answer', '42');
+  cache.get('answer');
+  return cache.has('answer');
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      for (const name of ['useLocalMap', 'useNestedMap', 'useProjectCache']) {
+        const caller = cg.getNodesByName(name).find((n) => n.kind === 'function');
+        expect(caller, name).toBeDefined();
+        const calls = cg.getOutgoingEdges(caller!.id).filter((e) => e.kind === 'calls');
+        if (name === 'useProjectCache') {
+          const methods = cg.getNodesByKind('method').filter((n) => n.qualifiedName.startsWith('LRUCache::'));
+          expect(methods).toHaveLength(3);
+          expect(calls.map((e) => e.target).sort()).toEqual(methods.map((n) => n.id).sort());
+          expect(calls.every((e) => e.metadata?.confidence === 0.9)).toBe(true);
+        } else {
+          expect.soft(calls, `${ext}: ${name} must not call a project method`).toEqual([]);
+        }
+      }
+    });
+
+    it('keeps a built-in string method off an unrelated project method (#1840)', async () => {
+      fs.writeFileSync(path.join(tempDir, 'strings.ts'), `
+export async function listPaths(): Promise<string> { return "a\0b"; }
+export async function snapshot(): Promise<string[]> {
+  const listed = await listPaths();
+  return listed.split('\0');
+}
+`);
+      fs.writeFileSync(path.join(tempDir, 'pane.ts'), `
+export class PaneManager {
+  split(): string { return "new pane"; }
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const caller = cg.getNodesByName('snapshot').find((n) => n.kind === 'function');
+      expect(caller).toBeDefined();
+      expect(
+        cg.getCallees(caller!.id)
+          .filter(({ edge }) => edge.kind === 'calls')
+          .map(({ node }) => node.qualifiedName)
+          .sort(),
+      ).toEqual(['listPaths']);
+    });
+
+    it('types an awaited receiver from the callee\'s declared return (#1840)', async () => {
+      fs.writeFileSync(path.join(tempDir, 'engine.ts'), `
+export class Engine {
+  run(): string { return "ran"; }
+}
+export class Decoy {
+  run(): string { return "decoy"; }
+}
+export async function makeEngine(): Promise<Engine> { return new Engine(); }
+export async function drive(): Promise<string> {
+  const handle = await makeEngine();
+  return handle.run();
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const caller = cg.getNodesByName('drive').find((n) => n.kind === 'function');
+      expect(caller).toBeDefined();
+      expect(
+        cg.getCallees(caller!.id)
+          .filter(({ edge }) => edge.kind === 'calls')
+          .map(({ node }) => node.qualifiedName)
+          .sort(),
+      ).toEqual(['Engine::run', 'makeEngine']);
+    });
+
+    it('keeps a validated project class that shadows Map (#1566)', async () => {
+      fs.writeFileSync(path.join(tempDir, 'shadow.ts'), `
+export class Map { get() { return 1; } }
+export class Other { get() { return 2; } }
+export function useShadow() {
+  const values = new Map();
+  return values.get();
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const caller = cg.getNodesByName('useShadow').find((n) => n.kind === 'function');
+      expect(caller).toBeDefined();
+      expect(cg.getCallees(caller!.id).filter(({ edge }) => edge.kind === 'calls').map(({ node }) => node.qualifiedName))
+        .toEqual(['Map::get']);
+    });
+
+    it.each([
+      ['Set', 'has'], ['WeakMap', 'get'], ['WeakSet', 'has'], ['Array', 'map'], ['Promise', 'then'],
+    ])('declines same-name guesses for an inferred %s receiver (#1566)', async (type, method) => {
+      fs.writeFileSync(path.join(tempDir, 'builtin.ts'), `
+export class Collision { ${method}() { return 1; } }
+export function constructed() {
+  const values = new ${type}();
+  return values.${method}();
+}
+export function annotated(values: ${type}<string>) {
+  return values.${method}();
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+      expect(cg.getNodesByKind('method').some((n) => n.name === method)).toBe(true);
+      for (const name of ['constructed', 'annotated']) {
+        const caller = cg.getNodesByName(name).find((n) => n.kind === 'function');
+        expect(caller, name).toBeDefined();
+        expect.soft(cg.getOutgoingEdges(caller!.id).filter((e) => e.kind === 'calls'), name).toEqual([]);
+      }
+    });
+
     // `lg.log()` where `lg` is a local whose type is inferred from its
     // declaration/initializer. Before this, only C++ resolved these; every
     // other language produced no method edge. Each case is one file with a

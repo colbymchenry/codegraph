@@ -20,12 +20,15 @@
   let view = $derived(router.route.view);
 
   // The Symbol tab returns you to where you were reading, not to a blank
-  // view: the current symbol if you are on one, else the trail's last hop.
+  // view: the current symbol if you are on one, else the trail's last hop —
+  // and failing both, the tab's own empty screen. NOT `#/`: the landing page
+  // renders the Screens tab on any project that has screens, so that fallback
+  // sent a reader who clicked Symbol to somebody else's view.
   let symbolTabHref = $derived.by(() => {
     const route = router.route;
-    if (route.view === 'symbol') return symbolHref(route.id);
+    if (route.view === 'symbol' && route.id !== null) return symbolHref(route.id);
     const current = trail.current;
-    return current ? symbolHref(current.id) : '#/';
+    return symbolHref(current ? current.id : null);
   });
 
   /** What `/` and Cmd-K reach — the palette owns its own keyboard. */

@@ -55,7 +55,11 @@ import {
   getDaemonSocketPath,
 } from './daemon-paths';
 import { CodeGraphPackageVersion } from './version';
-import { releaseWriterLock, tryAcquireWriterLock, writerLockHeldMessage } from './writer-lock';
+import {
+  releaseWriterLock,
+  tryAcquireWriterLock,
+  writerLockHeldMessage,
+} from './writer-lock';
 import { registerDaemon, deregisterDaemon } from './daemon-registry';
 
 /** Default idle linger after the last client disconnects. */
@@ -161,9 +165,8 @@ export interface DaemonStartResult {
  *
  * Race-safe: callers must first call `tryAcquireDaemonLock(projectRoot)` and
  * only construct a Daemon if they got the lock (`kind: 'acquired'`). The atomic
- * `O_EXCL` create inside the acquire helper — which now also writes the full
- * record before returning — is the only synchronization between competing
- * daemons.
+ * create/link inside the acquire helper elects one candidate. The project
+ * writer lock then fences bind/ownership refresh against stale-artifact cleanup.
  */
 export class Daemon {
   private server: net.Server | null = null;
@@ -199,10 +202,9 @@ export class Daemon {
   }
 
   /**
-   * Bind the socket, kick off engine init, and register signal handlers. The
-   * lockfile body was already written atomically by `tryAcquireDaemonLock`, so
-   * there is nothing to write here. The promise resolves once the server is
-   * listening — the daemon then sticks around until idle/shutdown.
+   * Bind the socket, refresh the ownership record, kick off engine init, and
+   * register signal handlers. The promise resolves once the server is listening
+   * — the daemon then sticks around until idle/shutdown.
    */
   async start(): Promise<DaemonStartResult> {
     // #1740: claim the project writer lock before opening/watching so a
@@ -215,10 +217,16 @@ export class Daemon {
       throw new Error(msg);
     }
 
-    // Engine init is deliberately backgrounded — see #172. The first session
-    // to land waits on `ensureInitialized` either way, and unloaded sessions
-    // (cross-project tool calls only) shouldn't pay any open cost.
-    void this.engine.ensureInitialized(this.projectRoot);
+    let initialLockContents: string;
+    try {
+      initialLockContents = fs.readFileSync(this.pidPath, 'utf8');
+      if (decodeLockInfo(initialLockContents)?.pid !== process.pid) {
+        throw new Error('daemon lock belongs to another process');
+      }
+    } catch {
+      releaseWriterLock(this.projectRoot);
+      throw new Error('Lost daemon lock ownership before startup.');
+    }
 
     // Walk the ordered socket candidates and bind the first that works. The
     // in-project path comes first; the deterministic tmpdir path is the fallback
@@ -282,18 +290,26 @@ export class Daemon {
       startedAt: Date.now(),
     };
 
-    // `tryAcquireDaemonLock` wrote the pidfile with the PREFERRED path (candidate
-    // 0) before we knew which one would bind. If we relocated, rewrite it so the
-    // per-project record is honest. Atomic temp+rename; safe because we hold the
-    // lock and we're alive — `clearStaleDaemonLock` pid-verifies, so no racing
-    // candidate clears or clobbers a live daemon's lock.
-    if (this.socketPath !== candidates[0]) {
-      try {
-        const tmpPid = `${this.pidPath}.${process.pid}.relocate`;
-        fs.writeFileSync(tmpPid, encodeLockInfo(lock), { mode: 0o600 });
-        fs.renameSync(tmpPid, this.pidPath);
-      } catch { /* best-effort; the registry record below carries the real path */ }
+    // Refresh the lock on every successful bind, not only relocation. The
+    // writer lock prevents stale-artifact cleanup from racing this ownership
+    // check, and the exact snapshot prevents overwriting a replacement record.
+    try {
+      if (fs.readFileSync(this.pidPath, 'utf8') !== initialLockContents) {
+        throw new Error('Lost daemon lock ownership after binding.');
+      }
+      const tmpPid = `${this.pidPath}.${process.pid}.bound`;
+      fs.writeFileSync(tmpPid, encodeLockInfo(lock), { mode: 0o600 });
+      fs.renameSync(tmpPid, this.pidPath);
+    } catch (err) {
+      try { bound.server.close(); } catch { /* best-effort */ }
+      this.cleanupLockfile();
+      throw err;
     }
+
+    // Engine init is deliberately backgrounded — see #172. It starts only
+    // after bind and ownership refresh, so a delayed daemon that lost election
+    // can never open a second watcher or writer.
+    void this.engine.ensureInitialized(this.projectRoot);
 
     // Drop a discovery record so `codegraph list` / `stop --all` can find us.
     // Best-effort; a missing record only means list's liveness prune covers it.
@@ -531,7 +547,13 @@ export class Daemon {
  */
 export type AcquireResult =
   | { kind: 'acquired'; pidPath: string; info: DaemonLockInfo }
-  | { kind: 'taken'; existing: DaemonLockInfo | null; pidPath: string };
+  | {
+      kind: 'taken';
+      existing: DaemonLockInfo | null;
+      /** Exact record read after losing acquisition; null when it was unreadable. */
+      lockContents: string | null;
+      pidPath: string;
+    };
 
 /**
  * Atomically create the daemon pidfile with its full record already in place.
@@ -609,10 +631,12 @@ export function tryAcquireDaemonLock(projectRoot: string): AcquireResult {
   // record — `existing` is null only for a genuinely corrupt leftover, never a
   // mid-write race.
   let existing: DaemonLockInfo | null = null;
+  let lockContents: string | null = null;
   try {
-    existing = decodeLockInfo(fs.readFileSync(pidPath, 'utf8'));
+    lockContents = fs.readFileSync(pidPath, 'utf8');
+    existing = decodeLockInfo(lockContents);
   } catch { /* unreadable lockfile — treat as malformed */ }
-  return { kind: 'taken', existing, pidPath };
+  return { kind: 'taken', existing, lockContents, pidPath };
 }
 
 /**
@@ -655,10 +679,14 @@ export function acquireLockViaExclusiveOpen(pidPath: string, info: DaemonLockInf
 export function clearStaleDaemonLock(
   pidPath: string,
   expectedDeadPid?: number,
-  opts: { allowLivePid?: boolean } = {}
+  opts: { allowLivePid?: boolean; expectedLockContents?: string } = {}
 ): boolean {
   try {
     const raw = fs.readFileSync(pidPath, 'utf8');
+    // The identity record changed after the caller inspected it. Even the same
+    // PID may now advertise a newly-bound socket, so this snapshot was never
+    // disproved and must not be deleted.
+    if (opts.expectedLockContents !== undefined && raw !== opts.expectedLockContents) return false;
     const info = decodeLockInfo(raw);
     if (info) {
       // A different pid took over since we read it — not ours to clear.

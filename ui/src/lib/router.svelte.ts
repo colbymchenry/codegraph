@@ -59,7 +59,8 @@ export type {
 
 export type Route =
   | { view: 'home' }
-  | { view: 'symbol'; id: string; line: number | null }
+  /** `id: null` = the Symbol tab, nothing chosen — the empty screen. */
+  | { view: 'symbol'; id: string | null; line: number | null }
   | {
       view: 'file';
       path: string;
@@ -67,7 +68,7 @@ export type Route =
       /** The whole-file source view rather than the outline (design spec §3.4). */
       source: boolean;
     }
-  | { view: 'map'; root: string | null; depth: number; tests: boolean }
+  | { view: 'map'; root: string | null; depth: number | null; tests: boolean }
   | {
       view: 'flow';
       /** "how does X reach Y" — both ends pinned. */
@@ -135,19 +136,24 @@ export function parseHash(hash: string): RouterLocation {
   let route: Route;
   if (head === undefined) {
     route = { view: 'home' };
-  } else if (head === 's' && rest.length > 0) {
-    route = { view: 'symbol', id: rest.join('/'), line };
+  } else if (head === 's') {
+    // `#/s` on its own is the tab, not a 404: nothing is chosen yet.
+    route = { view: 'symbol', id: rest.length > 0 ? rest.join('/') : null, line };
   } else if (head === 'file' && rest.length > 0) {
     route = { view: 'file', path: rest.join('/'), line, source: params.get('src') === '1' };
   } else if (head === 'map' && rest.length === 0) {
     // The map's shape travels in the URL like the trail does: a link to
-    // "src/vs at depth 2, tests on" has to reopen the same picture.
+    // "src/vs at depth 2, tests on" has to reopen the same picture. Absent, it
+    // stays absent: the answering side reads the repository and picks a depth,
+    // and a 1 defaulted in here would silently override that with the one
+    // grouping — top-level directories — that is wrong for every project whose
+    // program lives under a single `src/`.
     const root = params.get('root');
     const depth = Number.parseInt(params.get('depth') ?? '', 10);
     route = {
       view: 'map',
       root: root === null ? null : root,
-      depth: Number.isFinite(depth) && depth >= 1 && depth <= 4 ? depth : 1,
+      depth: Number.isFinite(depth) && depth >= 1 && depth <= 4 ? depth : null,
       tests: params.get('tests') === '1',
     };
   } else if (head === 'entry' && rest.length === 0) {

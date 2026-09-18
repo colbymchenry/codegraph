@@ -837,6 +837,118 @@ describe('railsResolver.extract', () => {
 import { springResolver } from '../src/resolution/frameworks/java';
 
 describe('springResolver.extract', () => {
+  it.each([
+    ['UserController.java', '{"/a", "/b"}', '@GetMapping({"/x", "/y"})', 'public String handle() { return "ok"; }'],
+    ['UserController.java', 'path = {"/a", "/b"}', '@RequestMapping(value = {"/x", "/y"}, method = RequestMethod.GET)', 'public String handle() { return "ok"; }'],
+    ['UserController.kt', 'value = ["/a", "/b"]', '@GetMapping(path = ["/x", "/y"])', 'fun handle(): String = "ok"'],
+  ])('indexes every class/method path pair in %s with %s and %s (#1461)', (filePath, base, mapping, handler) => {
+    const src = `@RestController
+@RequestMapping(${base})
+public class UserController {
+  ${mapping}
+  ${handler}
+}`;
+    const { nodes, references } = springResolver.extract!(filePath, src);
+    expect(nodes.map(n => n.name)).toEqual(['GET /a/x', 'GET /a/y', 'GET /b/x', 'GET /b/y']);
+    expect(new Set(nodes.map(n => n.id)).size).toBe(4);
+    expect(references.map(r => [r.fromNodeId, r.referenceName])).toEqual(nodes.map(n => [n.id, 'handle']));
+  });
+
+  it.each(['ErrorHandler.PATH', 'PATH', 'value = ErrorHandler.PATH', 'path = PATH'])(
+    'resolves a same-file constant prefix in @RequestMapping(%s) (#1461)', (args) => {
+      const src = `@Controller
+@RequestMapping(${args})
+public class ErrorHandler {
+  public static final String PATH = "/error";
+  @RequestMapping(method = {RequestMethod.GET})
+  public String handle() { return "err"; }
+}`;
+      const { nodes, references } = springResolver.extract!('ErrorHandler.java', src);
+      expect(nodes.map(n => n.name)).toEqual(['GET /error']);
+      expect(references.map(r => [r.fromNodeId, r.referenceName])).toEqual([[nodes[0].id, 'handle']]);
+    },
+  );
+
+  it('keeps literals and resolved constants in path arrays, including URI variables (#1461)', () => {
+    const src = `@RequestMapping({"/api", "/{tenant}/api"})
+public class ItemController {
+  public static final String ITEMS = "/items";
+  @GetMapping(path = {ITEMS, "/items/{id}", External.MISSING}, produces = "application/json")
+  public String get() { return "ok"; }
+}`;
+    const { nodes, references } = springResolver.extract!('ItemController.java', src);
+    expect(nodes.map(n => n.name)).toEqual([
+      'GET /api/items', 'GET /api/items/{id}', 'GET /{tenant}/api/items', 'GET /{tenant}/api/items/{id}',
+    ]);
+    expect(references.map(r => r.referenceName)).toEqual(['get', 'get', 'get', 'get']);
+  });
+
+  it.each([
+    ['value = "/ok", produces = "application/json"', '/base/ok'],
+    ['consumes = {"application/json", "text/plain"}, path = "/ok", produces = "application/json"', '/base/ok'],
+    ['produces = "application/json", consumes = "text/plain"', '/base'],
+  ])('only treats path arguments as paths: %s (#1461)', (args, expected) => {
+    const src = `@RequestMapping("/base")
+public class UserController {
+  @GetMapping(${args})
+  public String handle() { return "ok"; }
+}`;
+    const { nodes } = springResolver.extract!('UserController.java', src);
+    expect(nodes.map(n => n.name)).toEqual([`GET ${expected}`]);
+  });
+
+  it.each([
+    ['External.MISSING', '@GetMapping'],
+    ['value = MISSING, produces = "application/json"', '@GetMapping("/ok")'],
+    ['"/base"', '@GetMapping(External.MISSING)'],
+    ['"/base"', '@GetMapping(path = MISSING, produces = "application/json")'],
+    ['"/base"', '@RequestMapping(value = MISSING, method = RequestMethod.GET)'],
+  ])('omits unresolved paths: class %s, method %s (#1461)', (base, mapping) => {
+    const src = `@RequestMapping(${base})
+public class UserController {
+  // public static final String MISSING = "/comment";
+  ${mapping}
+  public String handle() { return "ok"; }
+}`;
+    expect(springResolver.extract!('UserController.java', src)).toEqual({ nodes: [], references: [] });
+  });
+
+  it.each([
+    ['@GetMapping', 'GET'],
+    ['@GetMapping()', 'GET'],
+    ['@RequestMapping(method = RequestMethod.GET)', 'GET'],
+    ['@RequestMapping(method = {RequestMethod.GET})', 'GET'],
+    ['@RequestMapping', 'ANY'],
+  ])('inherits the class prefix for %s without emitting a class route (#1461)', (mapping, verb) => {
+    const src = `@RequestMapping("/base")
+public class UserController {
+  ${mapping}
+  public String handle() { return "ok"; }
+}`;
+    const { nodes, references } = springResolver.extract!('UserController.java', src);
+    expect(nodes.map(n => n.name)).toEqual([`${verb} /base`]);
+    expect(references.map(r => r.referenceName)).toEqual(['handle']);
+  });
+
+  it('preserves annotation and reference line numbers after multiline Javadocs (#1461)', () => {
+    const src = `/**
+ * Controller documentation.
+ */
+@RequestMapping("/base")
+public class UserController {
+  /**
+   * Handler documentation with @GetMapping("/fake").
+   */
+  @GetMapping({"/x", "/y"})
+  public String handle() { return "ok"; }
+}`;
+    const { nodes, references } = springResolver.extract!('UserController.java', src);
+    expect(nodes.map(n => [n.name, n.startLine, n.endLine])).toEqual([
+      ['GET /base/x', 9, 9], ['GET /base/y', 9, 9],
+    ]);
+    expect(references.map(r => [r.referenceName, r.line])).toEqual([['handle', 9], ['handle', 9]]);
+  });
+
   it('extracts route with @GetMapping and next method', () => {
     const src = `
 @GetMapping("/users")

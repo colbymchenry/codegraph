@@ -4,9 +4,11 @@
  */
 
 import { afterEach, describe, expect, it } from 'vitest';
+import { spawn, type ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { MCPEngine } from '../src/mcp/engine';
 import {
   decodeWriterLockInfo,
   getWriterPidPath,
@@ -17,8 +19,11 @@ import {
 
 describe('writer lock (#1740)', () => {
   let dir: string;
+  let holder: ChildProcess | null = null;
 
   afterEach(() => {
+    try { holder?.kill('SIGKILL'); } catch { /* already gone */ }
+    holder = null;
     if (dir) {
       releaseWriterLock(dir);
       try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -83,5 +88,30 @@ describe('writer lock (#1740)', () => {
     const r = tryAcquireWriterLock(root, 'direct');
     expect(r.kind).toBe('acquired');
     releaseWriterLock(root);
+  });
+
+  it('lets a fallback engine atomically claim and release writer ownership', () => {
+    const root = makeProject();
+    const engine = new MCPEngine({ writerLockRoot: root });
+
+    expect(decodeWriterLockInfo(fs.readFileSync(getWriterPidPath(root), 'utf8'))).toMatchObject({
+      pid: process.pid,
+      mode: 'fallback',
+    });
+
+    engine.stop();
+    expect(fs.existsSync(getWriterPidPath(root))).toBe(false);
+  });
+
+  it('rejects a fallback engine before opening when another process owns writer.pid', () => {
+    const root = makeProject();
+    holder = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    if (!holder.pid) throw new Error('Failed to spawn writer-lock holder');
+    fs.writeFileSync(
+      getWriterPidPath(root),
+      JSON.stringify({ pid: holder.pid, mode: 'daemon', startedAt: Date.now() }) + '\n',
+    );
+
+    expect(() => new MCPEngine({ writerLockRoot: root })).toThrow(/writer lock held/i);
   });
 });
