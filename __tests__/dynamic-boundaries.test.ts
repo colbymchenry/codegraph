@@ -261,6 +261,31 @@ describe('codegraph_explore — dynamic boundaries', () => {
     expect(text).not.toContain('**Dynamic boundaries');
   });
 
+  it('does not synthesize a JavaScript event channel into a same-named Haskell function', async () => {
+    await setup({
+      'events.js': [
+        'export function emitReady(bus) {',
+        "  bus.emit('ready');",
+        '}',
+        'export function wire(bus) {',
+        "  bus.on('ready', handler);",
+        '}',
+      ].join('\n'),
+      'Target.hs': [
+        'module Target where',
+        'handler value = value',
+      ].join('\n'),
+    }, ['**/*.js', '**/*.hs']);
+
+    const emitter = cg.getNodesByName('emitReady')
+      .find((node) => node.filePath === 'src/events.js')!;
+    const haskellHandler = cg.getNodesByName('handler')
+      .find((node) => node.filePath === 'src/Target.hs')!;
+    expect(cg.getOutgoingEdges(emitter.id).some((edge) =>
+      edge.target === haskellHandler.id && edge.provenance === 'heuristic'
+    )).toBe(false);
+  });
+
   it('never adds the section to a fully connected flow', async () => {
     await setup({
       'pipeline.ts': [

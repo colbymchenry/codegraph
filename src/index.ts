@@ -41,6 +41,7 @@ import {
   SyncResult,
   extractFromSource,
   initGrammars,
+  HASKELL_IMPORT_INVALIDATION_PENDING,
 } from './extraction';
 import {
   ReferenceResolver,
@@ -759,7 +760,10 @@ export class CodeGraph {
   /**
    * Index specific files
    *
-   * Uses a mutex to prevent concurrent indexing operations.
+   * Uses a mutex to prevent concurrent indexing operations. Re-opened
+   * resolution edges (definition-name deltas, Haskell import-topology churn)
+   * are left as PENDING refs — follow this call with a {@link sync} so the
+   * orphan sweep re-resolves them.
    */
   async indexFiles(filePaths: string[]): Promise<IndexResult> {
     return this.indexMutex.withLock(async () => {
@@ -768,9 +772,46 @@ export class CodeGraph {
       } catch {
         return { success: false, filesIndexed: 0, filesSkipped: 0, filesErrored: 0, nodesCreated: 0, edgesCreated: 0, errors: [{ message: 'Could not acquire file lock - another process may be indexing', severity: 'error' as const }], durationMs: 0 };
       }
+      // Resolver caches drop only when this run actually invalidated
+      // resolution state. Node ids embed start lines (`sha256(filePath:kind:
+      // name:line)`), so a store that shifted lines re-mints the file's node
+      // identities, and every store re-parks the file's references as pending
+      // rows — the caches hold the pre-extraction graph and must not survive
+      // that. A run that stored nothing (all files skipped/errored) keeps
+      // them warm.
+      let resolutionStateInvalidated = false;
+      const haskellInvalidationPending = (): boolean =>
+        this.queries.getMetadata(HASKELL_IMPORT_INVALIDATION_PENDING) === '1';
       try {
-        return this.orchestrator.indexFiles(filePaths);
+        const haskellPendingBefore = haskellInvalidationPending();
+        const beforePairs = this.queries.getNodeNamePairsByFiles(filePaths);
+        const result = await this.orchestrator.indexFiles(filePaths);
+        if (filePaths.length > 0) {
+          const afterPairs = this.queries.getNodeNamePairsByFiles(filePaths);
+          const delta = new Set<string>();
+          const nameOf = (pair: string) => pair.slice(pair.indexOf('\0') + 1);
+          for (const pair of beforePairs) if (!afterPairs.has(pair)) delta.add(nameOf(pair));
+          for (const pair of afterPairs) if (!beforePairs.has(pair)) delta.add(nameOf(pair));
+          this.orchestrator.resurrectStaleResolutionEdges([...delta], []);
+          if (delta.size > 0) resolutionStateInvalidated = true;
+        }
+        // The orchestrator arms `haskell_import_invalidation_pending` before
+        // indexing any Haskell file and resolves it (or leaves it for the next
+        // sync's recovery) inside the same call — the flag's final value cannot
+        // distinguish a completed import-edge invalidation from a no-Haskell
+        // run, so the arming states (flag set on entry or left set on exit)
+        // count as invalidation work, as does any successful store.
+        if (result.filesIndexed > 0 || haskellPendingBefore || haskellInvalidationPending()) {
+          resolutionStateInvalidated = true;
+        }
+        return result;
+      } catch (error) {
+        // Earlier stores may have committed before a later store or replay
+        // failed. Recovery must resolve against those writes, not warm caches.
+        resolutionStateInvalidated = true;
+        throw error;
       } finally {
+        if (resolutionStateInvalidated) this.resolver.clearCaches();
         this.fileLock.release();
       }
     });
@@ -852,6 +893,12 @@ export class CodeGraph {
           // warmed against the pre-removal graph; drop them so resolution
           // sees the post-removal state. (runPostExtract above clears caches
           // itself, so the changed-files branch is already covered.)
+          this.resolver.clearCaches();
+        }
+        if (result.haskellImportInvalidationRecovered) {
+          // The recovered sync may have no filesystem delta, so neither branch
+          // above clears resolver/import caches. Its replayed pending refs must
+          // see the already-committed post-crash module topology.
           this.resolver.clearCaches();
         }
 

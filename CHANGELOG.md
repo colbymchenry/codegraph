@@ -143,6 +143,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   Trails are plain JSON, one file per trail, under `.codegraph/ui/trails/` — already ignored by git, so they stay yours by default. **Export** hands you the file if you'd rather commit one for the team. This is the only thing the viewer writes: it still never indexes, never changes your graph, and never touches a line of your code. Start it with `codegraph ui --read-only` and it won't write even that — saved trails can still be opened, just not saved or deleted.
 
+- **Haskell projects now get code intelligence:** CodeGraph indexes modules, declarations, imports, re-exports, operators, Template Haskell, Unicode identifiers, and Cabal/Stack workspaces so `codegraph_explore` can follow many real flows within a workspace.
+
+### Security
+
+- Indexing now bounds re-export searches so deeply interconnected modules cannot cause exponential work and block the process. (#1337)
+
 ### Fixes
 
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
@@ -263,6 +269,30 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **ASP.NET Minimal API endpoint groups are routes.** The handler-first form — `groupBuilder.MapPost(CreateTodoItem)`, `MapPut(UpdateTodoItem, "{id}")` inside an `IEndpointGroup` / `EndpointGroupBase` class (the Clean Architecture template and its descendants) — now registers `POST /api/TodoItems` and `PUT /api/TodoItems/{id}`, with the `/api/` head read from the app's own `MapGroup($"/api/{groupName}")` and a class's `RoutePrefix` honoured, each bound to its handler so the Steps tab starts there and lists its `TypedResults` replies by status code.
 
 - **A FastAPI service that lives in one directory of a monorepo is detected.** `backend/pyproject.toml` and `backend/app/main.py` count, not only files at the repository root — the official full-stack template's routes now appear in Entry points and the Steps tab.
+
+#### Haskell indexing
+
+- Large Haskell projects index and refresh exported definitions faster while preserving import visibility and ambiguity checks. (#1337)
+
+- Haskell local functions keep their callers when they shadow a parameter with the same name. (#1337)
+
+- Custom Haskell functions named like standard combinators no longer create calls to arguments they do not execute. (#1337)
+
+- Haskell pattern synonyms now retain calls through local helpers while excluding quoted code that is not executed.
+
+- Haskell calls now respect nested and inline local scopes, keeping helpers from capturing unrelated calls elsewhere in a function.
+
+- Haskell names shared by a module declaration and an import remain unresolved when ambiguous, including after an imported module changes its exports.
+
+- Haskell record fields shared by several constructors resolve as one selector per type, and applied deriving clauses no longer create false class relationships.
+
+- Haskell record construction now links each field to the type named by its constructor, including through qualified imports.
+
+- Incremental Haskell updates refresh affected module imports with fewer database reads while preserving unrelated graph relationships.
+
+- Haskell identifiers written in Chinese, Hangul, Tangut and other Unicode letter scripts now parse and resolve in ordinary, qualified and Template Haskell expressions instead of silently disappearing from the graph.
+
+- External imports in headerless Haskell scripts now stay unresolved instead of incorrectly pointing back to their own import declaration.
 
 #### Symbols, tests and the viewer
 

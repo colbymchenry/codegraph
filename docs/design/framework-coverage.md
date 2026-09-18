@@ -124,9 +124,12 @@ analysis.
 
 ## Languages
 
-All ~30 languages in the README have full structural extraction; nothing is
-outstanding on that axis. The gap that is language-shaped is the **`WHEN`
-label**.
+All ~30 languages in the README have full structural extraction — except the
+two the README itself lists as **Partial support**: Haskell (Cabal component
+boundaries, CPP branches, Template Haskell-generated declarations, semantic
+typeclass dispatch, and `.lhs`/`.hsc` are not yet modeled) and Objective-C
+(`.mm` ObjC++ may parse incompletely). Nothing else is outstanding on that
+axis. The gap that is language-shaped is the **`WHEN` label**.
 
 **Guard rules exist** (`RULES_BY_LANGUAGE` in `src/graph/branch-guards.ts`) for:
 TypeScript, TSX, JavaScript, JSX, Swift, Python, Java, Kotlin, C#, Go, C, C++,
@@ -138,7 +141,7 @@ the first two inherit the C rules and the third has none.)
 **No rules** — boxes draw, arrows carry no condition, and no arguments or
 trigger labels are read: PHP, Ruby, Rust, Scala, Dart, Erlang, Lua, Luau, R,
 Solidity, COBOL, CFML, VB.NET, Nix, Terraform, Pascal/Delphi, Liquid, Razor,
-Twig, ArkTS, and the `.svelte` / `.vue` / `.astro` template languages.
+Twig, ArkTS, Haskell, and the `.svelte` / `.vue` / `.astro` template languages.
 
 A language with no rules yields **nothing**, never a wrong label — that is the
 design, so an absent row here is a missing feature, not a bug.

@@ -179,7 +179,7 @@ export function findNearestCodeGraphRoot(startPath: string): string | null {
 /** Heavy/irrelevant directory names the sub-project scan never descends into. */
 const SUBPROJECT_SCAN_SKIP = new Set([
   'node_modules', '.git', '.svn', '.hg', 'dist', 'build', 'out', 'target',
-  'vendor', 'bin', 'obj', '.next', '.nuxt', '.svelte-kit', '.cache', 'coverage',
+  'dist-newstyle', 'vendor', 'bin', 'obj', '.next', '.nuxt', '.svelte-kit', '.cache', 'coverage',
   '.venv', 'venv', '__pycache__', '.turbo', '.idea', '.vscode', 'tmp', 'temp',
 ]);
 
@@ -191,10 +191,18 @@ const WORKSPACE_ROOT_MANIFESTS = [
   'go.work', 'go.mod', 'Cargo.toml', 'pom.xml', 'build.gradle', 'build.gradle.kts',
   'settings.gradle', 'pyproject.toml', 'composer.json', 'Gemfile', 'rush.json',
   'WORKSPACE', 'WORKSPACE.bazel',
+  // Haskell workspaces (Cabal, Stack, and hpack).
+  'cabal.project', 'stack.yaml', 'package.yaml',
 ];
 
 function looksLikeProjectRoot(dir: string): boolean {
-  return WORKSPACE_ROOT_MANIFESTS.some((m) => fs.existsSync(path.join(dir, m)));
+  if (WORKSPACE_ROOT_MANIFESTS.some((m) => fs.existsSync(path.join(dir, m)))) return true;
+  try {
+    return fs.readdirSync(dir, { withFileTypes: true })
+      .some((entry) => entry.isFile() && entry.name.endsWith('.cabal'));
+  } catch {
+    return false;
+  }
 }
 
 function escapeRegExp(s: string): string {

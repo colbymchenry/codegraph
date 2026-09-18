@@ -22,6 +22,7 @@ Language support is automatic from the file extension — there's nothing to con
 | Swift | `.swift` | Full support |
 | Kotlin | `.kt`, `.kts` | Full support |
 | Scala | `.scala`, `.sc` | Full support (classes, traits, methods, type aliases, Scala 3 enums) |
+| Haskell | `.hs` | Partial support (modules/imports/re-exports, export lists, grouped functions/signatures, ADTs/GADTs, records, type families, typeclasses/instances, direct/infix/higher-order calls, and active Template Haskell splices; Cabal component boundaries, CPP branches, Template Haskell-generated declarations, semantic typeclass dispatch, and `.lhs`/`.hsc` are not yet modeled) |
 | Dart | `.dart` | Full support |
 | Svelte | `.svelte` | Full support (script extraction, Svelte 5 runes, SvelteKit routes) |
 | Vue | `.vue` | Full support (script + script-setup, Nuxt page/API/middleware routes) |
