@@ -20,6 +20,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { flushSync, mount, unmount } from 'svelte';
+import { SvelteMap } from 'svelte/reactivity';
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import {
@@ -598,6 +599,16 @@ describe('@colbymchenry/codegraph-ui — a host renders the package', () => {
     const text = host.textContent ?? '';
     expect(text).toContain('auth');
     expect(text).toContain('http');
+    const island = [...host.querySelectorAll<HTMLButtonElement>('.mnode')].find((node) =>
+      node.textContent?.includes('src/http')
+    );
+    expect(island?.title).toContain('Nothing in this view depends on it.');
+    island?.click();
+    for (let turn = 0; turn < 4; turn += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      flushSync();
+    }
+    expect(host.textContent ?? '').toContain('Nothing in this view depends on this module');
   });
 
   it('shows one recoverable focus error when an adapter lacks repository context', async () => {
@@ -615,6 +626,102 @@ describe('@colbymchenry/codegraph-ui — a host renders the package', () => {
     expect(host.textContent ?? '').toContain('cannot focus across the repository');
     expect(host.querySelectorAll('button').length).toBe(1);
     expect(host.querySelector('button')?.textContent).toContain('Clear focus');
+  });
+
+  it('identifies the focused module in Showing without replacing the folder choices', async () => {
+    const { adapter } = mockAdapter();
+    adapter.map = () => Promise.resolve({ ...MAP, context: 'repository' });
+    setGraphAdapter(adapter);
+
+    await render(ArchitectureMap, {
+      root: 'src',
+      depth: 1,
+      tests: false,
+      focus: 'src/auth',
+      direction: 'depends-on',
+    });
+
+    const showing = host.querySelector('select') as HTMLSelectElement;
+    expect(showing.value).toBe('.');
+    expect(showing.selectedOptions[0]?.disabled).toBe(true);
+    expect(showing.selectedOptions[0]?.textContent).toContain('Focus: src/auth · Depends on');
+    expect([...showing.options].some((option) => option.value === 'src')).toBe(true);
+    expect(host.textContent ?? '').toContain(
+      'No other indexed modules are reachable through its dependencies under the current filters.'
+    );
+  });
+
+  it('keeps the ordinary map when a deferred focused adapter ignores abort', async () => {
+    const { adapter } = mockAdapter();
+    const route = new SvelteMap<string, string | number | boolean | null>([
+      ['root', 'src'],
+      ['depth', 1],
+      ['tests', false],
+      ['focus', 'src/auth'],
+      ['direction', 'depends-on'],
+    ]);
+    let resolveFocused: ((payload: WireMapPayload) => void) | null = null;
+    let resolveOrdinary: ((payload: WireMapPayload) => void) | null = null;
+    adapter.map = (request) =>
+      new Promise<WireMapPayload>((resolve) => {
+        if (request?.context === 'repository') resolveFocused = resolve;
+        else resolveOrdinary = resolve;
+      });
+    setGraphAdapter(adapter);
+
+    mounted = mount(ArchitectureMap, {
+      target: host,
+      props: {
+        get root() {
+          return route.get('root') as string | null;
+        },
+        get depth() {
+          return route.get('depth') as number | null;
+        },
+        get tests() {
+          return route.get('tests') as boolean;
+        },
+        get focus() {
+          return route.get('focus') as string | null;
+        },
+        get direction() {
+          return route.get('direction') as 'depends-on' | 'used-by' | null;
+        },
+      },
+    }) as Record<string, unknown>;
+    for (let turn = 0; turn < 4; turn += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      flushSync();
+    }
+    expect(resolveFocused).not.toBeNull();
+
+    route.set('focus', null);
+    route.set('direction', null);
+    for (let turn = 0; turn < 4; turn += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      flushSync();
+    }
+    expect(resolveOrdinary).not.toBeNull();
+
+    const ordinary: WireMapPayload = {
+      ...MAP,
+      modules: [{ ...MAP.modules[1]!, id: 'src/ordinary', label: 'ordinary' }],
+      links: [],
+    };
+    resolveOrdinary!(ordinary);
+    for (let turn = 0; turn < 4; turn += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      flushSync();
+    }
+    expect(host.textContent ?? '').toContain('ordinary');
+
+    resolveFocused!({ ...MAP, context: 'repository' });
+    for (let turn = 0; turn < 4; turn += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      flushSync();
+    }
+    expect(host.textContent ?? '').toContain('ordinary');
+    expect(host.textContent ?? '').not.toContain('cannot focus across the repository');
   });
 
   it('TrailBar and SearchPalette mount and read through the same adapter', async () => {

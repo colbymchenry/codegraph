@@ -265,7 +265,8 @@ Selecting a map module offers **Focus**. **Depends on** and **Used by** show tha
 module's transitive reachable modules across the indexed repository, following the same
 confidence and test-visibility policy as the map; this is module-level reachability, not
 proof of an exact symbol impact. Focus holds the original root and grouping stable so
-Clear focus restores the prior map. A viewer adapter must advertise repository map context
+Clear focus restores the prior map, while Showing identifies the focused module and direction.
+A viewer adapter must advertise repository map context
 for Focus; older adapters remain available for ordinary maps and show a recoverable error
 instead of a partial focus result.
 

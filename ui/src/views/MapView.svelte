@@ -191,7 +191,6 @@
         layout: node,
         selected: selected === node.id,
         dimmed: neighbours !== null && !neighbours.has(node.id),
-        focused: focus !== null,
         onSelect: (id: string) => {
           selected = selected === id ? null : id;
           hovered = null;

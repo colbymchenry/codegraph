@@ -20,7 +20,6 @@
       layout: MapNodeLayout;
       selected: boolean;
       dimmed: boolean;
-      focused: boolean;
       onSelect: (id: string) => void;
     }
   );
@@ -57,7 +56,7 @@
     (module.dependents?.files ?? 0) > 0
       ? `. ${module.dependents.files} file${module.dependents.files === 1 ? '' : 's'} outside it, across ${module.dependents.modules} module${module.dependents.modules === 1 ? '' : 's'}, reference into it.`
       : ''
-  }${layout.island ? node.focused ? '. Nothing in this view depends on it.' : '. Nothing in the index depends on it.' : ''}${
+  }${layout.island ? '. Nothing in this view depends on it.' : ''}${
     layout.generated ? '. Every file in it is tool-generated.' : ''
   }`}
 >

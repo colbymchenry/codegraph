@@ -20,6 +20,8 @@
 
   /** Older independently packaged adapters did not send `maxDepth`. */
   const LEGACY_ADAPTER_MAX_DEPTH = 4;
+  /** Focus is a view state, never a normalized indexed directory root. */
+  const FOCUSED_SHOWING_VALUE = '.';
 
   interface Props {
     payload: WireMapPayload;
@@ -109,6 +111,7 @@
   );
 
   const thinCount = $derived(layout.edges.filter((e) => e.thin && !e.back).length);
+  const focusDirectionLabel = $derived(focus?.direction === 'depends-on' ? 'Depends on' : 'Used by');
 </script>
 
 <aside class="mapside">
@@ -126,9 +129,17 @@
   <label class="field">
     <span>Showing</span>
     <select
-      value={payload.root}
-      onchange={(event) => onSelectRoot((event.currentTarget as HTMLSelectElement).value)}
+      value={focus === null ? payload.root : FOCUSED_SHOWING_VALUE}
+      onchange={(event) => {
+        const root = (event.currentTarget as HTMLSelectElement).value;
+        if (root !== FOCUSED_SHOWING_VALUE) onSelectRoot(root);
+      }}
     >
+      {#if focus !== null}
+        <option value={FOCUSED_SHOWING_VALUE} disabled
+          >Focus: {focus.id} · {focusDirectionLabel}</option
+        >
+      {/if}
       {#each payload.roots as option (option.root)}
         <option value={option.root}>{option.label} · {option.files} files</option>
       {/each}
@@ -160,6 +171,13 @@
       <span class="mono">{focus.id}</span><br />
       {focus.direction === 'depends-on' ? 'Everything it depends on' : 'Everything that uses it'}
     </p>
+    {#if layout.nodes.length === 1}
+      <p class="dim">
+        No other indexed modules {focus.direction === 'depends-on'
+          ? 'are reachable through its dependencies'
+          : 'depend on it'} under the current filters.
+      </p>
+    {/if}
     <p class="dim">Grouping stays fixed while focused so module identities remain stable.</p>
     <label class="field">
       <span>Direction</span>
@@ -310,7 +328,7 @@
 
       {#if selectedNode?.island}
         <p class="island">
-          Nothing in the index depends on this module — no import, call or reference crosses into
+          Nothing in this view depends on this module — no import, call or reference crosses into
           it. It may be an entry point, or reached in a way the graph cannot see.
         </p>
       {/if}
