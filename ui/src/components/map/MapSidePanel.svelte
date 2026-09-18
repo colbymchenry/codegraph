@@ -114,6 +114,9 @@
 
   const thinCount = $derived(layout.edges.filter((e) => e.thin && !e.back).length);
   const focusDirectionLabel = $derived(focus?.direction === 'depends-on' ? 'Depends on' : 'Used by');
+  const restoredRootLabel = $derived(
+    restoredRoot === null ? 'automatic folder' : restoredRoot || 'whole repository'
+  );
 </script>
 
 <aside class="mapside">
@@ -193,7 +196,7 @@
       </select>
     </label>
     <button class="clear" onclick={onClearFocus}
-      >Clear focus · return to {restoredRoot || 'whole repository'} · {restoredDepth === null
+      >Clear focus · return to {restoredRootLabel} · {restoredDepth === null
         ? 'automatic grouping'
         : depthLabel(restoredDepth)}</button
     >

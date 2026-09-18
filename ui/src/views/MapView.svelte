@@ -105,6 +105,7 @@
     tests;
     focus;
     direction;
+    focusGrouping;
     focusError;
     selected = null;
     hovered = null;

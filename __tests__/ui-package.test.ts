@@ -810,12 +810,24 @@ describe('@colbymchenry/codegraph-ui — a host renders the package', () => {
     expect(route.get('focusGrouping')).toEqual({ root: 'src', depth: 1 });
     expect(requests.at(-1)).toMatchObject({ root: 'src', depth: 1, context: 'repository' });
     expect(host.textContent ?? '').toContain(
-      'Clear focus · return to whole repository · automatic grouping'
+      'Clear focus · return to automatic folder · automatic grouping'
     );
 
     [...host.querySelectorAll<HTMLButtonElement>('.mnode')]
       .find((node) => node.textContent?.includes('src/auth'))
       ?.click();
+    for (let turn = 0; turn < 4; turn += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      flushSync();
+    }
+    expect(host.querySelector<HTMLButtonElement>('.mnode[aria-pressed="true"]')).not.toBeNull();
+    route.set('focusGrouping', { root: 'src', depth: 2 });
+    for (let turn = 0; turn < 4; turn += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      flushSync();
+    }
+    expect(host.querySelector<HTMLButtonElement>('.mnode[aria-pressed="true"]')).toBeNull();
+    route.set('focusGrouping', { root: 'src', depth: 1 });
     for (let turn = 0; turn < 4; turn += 1) {
       await new Promise((resolve) => setTimeout(resolve, 0));
       flushSync();
