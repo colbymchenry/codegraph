@@ -41,6 +41,7 @@
     onFocus: (id: string) => void;
     onSelectFocusDirection: (direction: MapFocusDirection) => void;
     onClearFocus: () => void;
+    restoredRoot: string;
   }
 
   let {
@@ -60,6 +61,7 @@
     onFocus,
     onSelectFocusDirection,
     onClearFocus,
+    restoredRoot,
   }: Props = $props();
 
   /**
@@ -124,12 +126,9 @@
   <label class="field">
     <span>Showing</span>
     <select
-      value={focus === null ? payload.root : ''}
+      value={payload.root}
       onchange={(event) => onSelectRoot((event.currentTarget as HTMLSelectElement).value)}
     >
-      {#if focus !== null}
-        <option value="" disabled>{focus.id} · {focus.direction}</option>
-      {/if}
       {#each payload.roots as option (option.root)}
         <option value={option.root}>{option.label} · {option.files} files</option>
       {/each}
@@ -156,6 +155,11 @@
     </select>
   </label>
   {#if focus !== null}
+    <p class="focusname">
+      <b>Focused module</b><br />
+      <span class="mono">{focus.id}</span><br />
+      {focus.direction === 'depends-on' ? 'Everything it depends on' : 'Everything that uses it'}
+    </p>
     <p class="dim">Grouping stays fixed while focused so module identities remain stable.</p>
     <label class="field">
       <span>Direction</span>
@@ -168,7 +172,9 @@
         <option value="used-by">Used by</option>
       </select>
     </label>
-    <button class="clear" onclick={onClearFocus}>Clear focus</button>
+    <button class="clear" onclick={onClearFocus}
+      >Clear focus · return to {restoredRoot || 'whole repository'}</button
+    >
   {/if}
 
   <label class="toggle">
@@ -246,7 +252,7 @@
     </details>
   {/if}
 
-  {#if payload.cycles.total > 0}
+  {#if focus === null && payload.cycles.total > 0}
     <details>
       <summary>
         Circular imports between files
@@ -289,7 +295,7 @@
             : `${selectedModule.generated} tool-generated`}
         {/if}
       </p>
-      {#if focus === null}
+      {#if focus === null || focus.id !== selectedModule.id}
         <button class="clear" onclick={() => onFocus(selectedModule.id)}>Focus</button>
       {/if}
 
@@ -379,6 +385,9 @@
   .reach {
     font-size: 11.5px;
     margin: 0 0 8px;
+  }
+  .focusname {
+    overflow-wrap: anywhere;
   }
   .field {
     display: flex;

@@ -73,6 +73,7 @@
   // storage shape as the Screens and Steps keys.
   const LEGEND_KEY = 'codegraph-ui:map-legend';
   let legendOpen = $state(readLegendOpen());
+  let focusedLegendOpen = $state(false);
   function readLegendOpen(): boolean {
     try {
       return localStorage.getItem(LEGEND_KEY) !== 'closed';
@@ -90,6 +91,18 @@
 
   const nodeTypes = { module: ModuleNode };
   const edgeTypes = { module: ModuleEdge };
+  const legendIsOpen = $derived(focus === null ? legendOpen : focusedLegendOpen);
+
+  $effect(() => {
+    root;
+    depth;
+    tests;
+    focus;
+    direction;
+    focusError;
+    selected = null;
+    hovered = null;
+  });
 
   // One fetch per (root, depth). The tests toggle is deliberately NOT in here:
   // the payload already carries every module, so including them is a filter,
@@ -117,6 +130,7 @@
       controller.signal
     )
       .then((next) => {
+        if (controller.signal.aborted) return;
         payload = next;
         if (
           wantFocus !== null &&
@@ -146,6 +160,9 @@
       : focusMapPayload(payload, focus, direction, tests)
   );
   const displayPayload = $derived(focusedPayload ?? payload);
+  const layoutKey = $derived(
+    `${payload?.root ?? ''}\u0000${payload?.depth ?? ''}\u0000${tests}\u0000${focus ?? ''}\u0000${direction ?? ''}`
+  );
   const layout = $derived<MapLayout | null>(
     displayPayload === null ? null : buildMapLayout(displayPayload, { includeTests: tests })
   );
@@ -174,6 +191,7 @@
         layout: node,
         selected: selected === node.id,
         dimmed: neighbours !== null && !neighbours.has(node.id),
+        focused: focus !== null,
         onSelect: (id: string) => {
           selected = selected === id ? null : id;
           hovered = null;
@@ -306,7 +324,8 @@
         </p>
       </div>
     {:else if layout !== null}
-      <SvelteFlow
+      {#key layoutKey}
+        <SvelteFlow
         {nodes}
         {edges}
         {nodeTypes}
@@ -324,7 +343,7 @@
           selected = null;
           hovered = null;
         }}
-      >
+        >
         <!-- The layer rules ride INSIDE the viewport, so they pan and zoom
              with the boxes they explain. A layer line drawn on the frame
              would sit next to the wrong row the moment anyone scrolled. -->
@@ -348,15 +367,19 @@
           {/each}
         </ViewportPortal>
         <Controls position="bottom-right" showLock={false} />
-      </SvelteFlow>
+        </SvelteFlow>
+      {/key}
 
       <!-- The key, on the picture it explains. -->
       <MapKey
         minWeight={layout.minWeight}
         thinCount={layout.edges.filter((e) => e.thin && !e.back).length}
         declaredBasis={layout.basis.kind === 'declared'}
-        open={legendOpen}
-        onToggle={(next) => (legendOpen = next)}
+        open={legendIsOpen}
+        onToggle={(next) => {
+          if (focus === null) legendOpen = next;
+          else focusedLegendOpen = next;
+        }}
       />
 
       {#if hovered !== null}
@@ -383,7 +406,7 @@
     {/if}
   </div>
 
-  {#if payload !== null && layout !== null}
+  {#if error === null && !loading && payload !== null && layout !== null}
     <MapSidePanel
       payload={displayPayload ?? payload}
       {layout}
@@ -401,6 +424,7 @@
       onFocus={startFocus}
       onSelectFocusDirection={setFocusDirection}
       onClearFocus={clearFocus}
+      restoredRoot={payload.root}
     />
   {/if}
 </div>

@@ -600,6 +600,23 @@ describe('@colbymchenry/codegraph-ui — a host renders the package', () => {
     expect(text).toContain('http');
   });
 
+  it('shows one recoverable focus error when an adapter lacks repository context', async () => {
+    const { adapter } = mockAdapter();
+    setGraphAdapter(adapter);
+
+    await render(ArchitectureMap, {
+      root: 'src',
+      depth: 1,
+      tests: false,
+      focus: 'src/auth',
+      direction: 'depends-on',
+    });
+
+    expect(host.textContent ?? '').toContain('cannot focus across the repository');
+    expect(host.querySelectorAll('button').length).toBe(1);
+    expect(host.querySelector('button')?.textContent).toContain('Clear focus');
+  });
+
   it('TrailBar and SearchPalette mount and read through the same adapter', async () => {
     const { adapter } = mockAdapter();
     setGraphAdapter(adapter);
