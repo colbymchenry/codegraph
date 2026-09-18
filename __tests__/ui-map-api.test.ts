@@ -191,6 +191,29 @@ export function start(): void {
 `
   );
 
+  // These paths differ only after four directory segments beneath `src`.
+  // Depth 5 must separate them; depth 4 must not.
+  write(
+    projectRoot,
+    'src/deep/a/b/c/left/item.ts',
+    `export const left = 'left';\n`
+  );
+  write(
+    projectRoot,
+    'src/deep/a/b/c/right/item.ts',
+    `export const right = 'right';\n`
+  );
+  write(
+    projectRoot,
+    'supabase/functions/_shared/auth.ts',
+    `export const authenticate = (): boolean => true;\n`
+  );
+  write(
+    projectRoot,
+    'supabase/functions/worker/serve.ts',
+    `import { authenticate } from '../_shared/auth';\n\nexport const serve = () => authenticate();\n`
+  );
+
   write(
     projectRoot,
     '__tests__/engine.test.ts',
@@ -203,7 +226,7 @@ export function testBoot(): string[] {
   );
 
   const cg = CodeGraph.initSync(projectRoot, {
-    config: { include: ['src/**/*.ts', '__tests__/**/*.ts'], exclude: [] },
+    config: { include: ['src/**/*.ts', 'supabase/**/*.ts', '__tests__/**/*.ts'], exclude: [] },
   });
   await cg.indexAll();
   cg.resolveReferences();
@@ -408,7 +431,14 @@ describe('GET /api/map', () => {
     expect(map.depth).toBe(1);
 
     const ids = map.modules.map((m: any) => m.id);
-    expect(ids).toEqual(['src/(root files)', 'src/api', 'src/core', 'src/db', 'src/index.ts']);
+    expect(ids).toEqual([
+      'src/(root files)',
+      'src/api',
+      'src/core',
+      'src/db',
+      'src/deep',
+      'src/index.ts',
+    ]);
     expect(map.modules.find((m: any) => m.id === 'src/core').files).toBe(3);
 
     const facade = map.modules.find((m: any) => m.id === 'src/index.ts');
@@ -419,12 +449,16 @@ describe('GET /api/map', () => {
     expect(map.modules.every((m: any) => m.test === false)).toBe(true);
   });
 
-  it('offers every top-level directory as a root, plus the repository itself', async () => {
+  it('offers every indexed directory with descendant file counts, plus the repository itself', async () => {
     const map = await getMap();
     expect(map.roots[0]).toEqual({ root: '', label: 'whole repository', files: map.index.files });
-    expect(map.roots.map((r: any) => r.root)).toEqual(
-      expect.arrayContaining(['', 'src', '__tests__'])
-    );
+    expect(map.roots).toEqual(expect.arrayContaining([
+      { root: 'supabase', label: 'supabase', files: 2 },
+      { root: 'supabase/functions', label: '  ↳ functions', files: 2 },
+      { root: 'supabase/functions/_shared', label: '    ↳ _shared', files: 1 },
+      { root: 'supabase/functions/worker', label: '    ↳ worker', files: 1 },
+    ]));
+    expect(new Set(map.roots.map((r: any) => r.root)).size).toBe(map.roots.length);
   });
 
   it('counts cross-module edges only, with a declared subset and named pairs', async () => {
@@ -520,6 +554,30 @@ describe('GET /api/map', () => {
     expect(slashed.modules).toEqual(deep.modules);
   });
 
+  it('isolates a nested root without sibling files', async () => {
+    const map = await getMap('?root=supabase%2Ffunctions&depth=1');
+    expect(map.root).toBe('supabase/functions');
+    expect(map.modules.flatMap((module: any) => module.fileList.items)).toEqual(
+      expect.arrayContaining([
+        'supabase/functions/_shared/auth.ts',
+        'supabase/functions/worker/serve.ts',
+      ])
+    );
+    expect(map.modules.flatMap((module: any) => module.fileList.items)).not.toContain('src/index.ts');
+  });
+
+  it('uses manual depths through 12, including levels deeper than the automatic cap', async () => {
+    const shallow = await getMap('?root=src&depth=4');
+    const deep = await getMap('?root=src&depth=5');
+    expect(shallow.modules.map((module: any) => module.id)).toContain('src/deep/a/b/c');
+    expect(deep.modules.map((module: any) => module.id)).toEqual(
+      expect.arrayContaining(['src/deep/a/b/c/left', 'src/deep/a/b/c/right'])
+    );
+
+    const boundary = await request('/api/map?root=src&depth=12');
+    expect(boundary.status).toBe(200);
+  });
+
   it('counts the files outside each module that reference into it', async () => {
     const map = await getMap('?root=src&depth=1');
     const by = new Map<string, any>(map.modules.map((m: any) => [m.id, m]));
@@ -544,12 +602,18 @@ describe('GET /api/map', () => {
   });
 
   it('rejects an out-of-range depth as JSON, not as a crash', async () => {
-    const res = await request('/api/map?depth=9');
+    const res = await request('/api/map?depth=13');
     expect(res.status).toBe(400);
     expect(res.type).toBe('application/json; charset=utf-8');
     const body = JSON.parse(res.body);
     expect(body.code).toBe('bad-request');
     expect(body.error).toContain('depth');
+  });
+
+  it.each(['0', '1.5', '3x'])('rejects non-whole depth `%s`', async (depth) => {
+    const res = await request(`/api/map?depth=${depth}`);
+    expect(res.status).toBe(400);
+    expect(JSON.parse(res.body).error).toContain('whole number from 1 to 12');
   });
 
   it('serves the second identical request from the cache, byte for byte', async () => {

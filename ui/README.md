@@ -235,6 +235,11 @@ Mono, so the code grid survives and only the letterforms change.
 | `#/entry` | entry points — routes, files that run something, tests, hubs |
 | `#/screens` | screens — the app's screens and the transitions between them |
 
+The map's **Showing** selector includes every indexed directory, including nested
+directories such as `supabase/functions/_shared`; its file count covers all indexed
+descendants. **Grouping** is automatic by default (up to four levels), or can be set
+manually from one through twelve directory levels.
+
 ## Entry points
 
 `#/entry` draws `/api/entrypoints` as file groups, reusing the Symbol view's

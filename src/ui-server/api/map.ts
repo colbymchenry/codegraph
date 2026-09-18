@@ -36,6 +36,7 @@
 
 import type { CodeGraph } from '../../index';
 import type { EdgeKind, Language } from '../../types';
+import { MAX_MANUAL_MAP_DEPTH } from '../../lib/map-config';
 import { isTestFile } from '../../search/query-utils';
 import { badRequest } from './respond';
 import { UNCERTAIN_BELOW, toPosixPath, wireList, type WireList } from './wire';
@@ -83,7 +84,7 @@ const MAX_CYCLE_LENGTH = 12;
 
 /** Default segments below the root that name a module. */
 const DEFAULT_DEPTH = 1;
-const MAX_DEPTH = 4;
+const MAX_AUTOMATIC_DEPTH = 4;
 
 /**
  * Basenames that stay their own box when they sit loose in a module root.
@@ -379,7 +380,7 @@ export function pickDefaultDepth(
 
   let fallback = DEFAULT_DEPTH;
   let fallbackCount = 0;
-  for (let depth = DEFAULT_DEPTH; depth <= Math.min(MAX_DEPTH, deepest); depth += 1) {
+  for (let depth = DEFAULT_DEPTH; depth <= Math.min(MAX_AUTOMATIC_DEPTH, deepest); depth += 1) {
     const tally = tallyModules(files, root, depth);
     if (tally.count === 0) break;
     // Deeper only gets more crowded from here.
@@ -433,9 +434,12 @@ export function parseMapQuery(query: URLSearchParams): {
   const rawDepth = query.get('depth');
   let depth: number | null = null;
   if (rawDepth !== null && rawDepth !== '') {
-    depth = Number.parseInt(rawDepth, 10);
-    if (!Number.isFinite(depth) || depth < 1 || depth > MAX_DEPTH) {
-      throw badRequest(`depth must be a whole number from 1 to ${MAX_DEPTH}.`);
+    if (!/^\d+$/.test(rawDepth)) {
+      throw badRequest(`depth must be a whole number from 1 to ${MAX_MANUAL_MAP_DEPTH}.`);
+    }
+    depth = Number(rawDepth);
+    if (!Number.isSafeInteger(depth) || depth < 1 || depth > MAX_MANUAL_MAP_DEPTH) {
+      throw badRequest(`depth must be a whole number from 1 to ${MAX_MANUAL_MAP_DEPTH}.`);
     }
   }
   const rawRoot = query.get('root');
@@ -798,8 +802,9 @@ function tarjan(nodes: readonly string[], edgesOf: (id: string) => readonly stri
 }
 
 /**
- * The roots the selector offers: the repository root plus every top-level
- * directory that holds indexed files, biggest first.
+ * The roots the selector offers: the repository root plus every indexed
+ * directory. Top-level directories stay biggest-first; descendants follow
+ * their parent so a native select still reads like a directory tree.
  *
  * A monorepo's answer to "which project am I looking at" — and on a single
  * project it is a one-line list nobody has to use.
@@ -809,13 +814,27 @@ function rootOptions(
 ): WireMapPayload['roots'] {
   const byDir = new Map<string, number>();
   for (const file of files) {
-    const slash = file.path.indexOf('/');
-    if (slash <= 0) continue;
-    const dir = file.path.slice(0, slash);
-    byDir.set(dir, (byDir.get(dir) ?? 0) + 1);
+    const parts = toPosixPath(file.path).split('/').filter(Boolean);
+    for (let depth = 1; depth < parts.length; depth += 1) {
+      const dir = parts.slice(0, depth).join('/');
+      byDir.set(dir, (byDir.get(dir) ?? 0) + 1);
+    }
   }
   const dirs = [...byDir]
-    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-    .map(([root, count]) => ({ root, label: root, files: count }));
+    .sort(([a], [b]) => {
+      const aTop = a.split('/')[0]!;
+      const bTop = b.split('/')[0]!;
+      const topOrder = (byDir.get(bTop) ?? 0) - (byDir.get(aTop) ?? 0) || aTop.localeCompare(bTop);
+      if (topOrder !== 0) return topOrder;
+      return a.localeCompare(b);
+    })
+    .map(([root, count]) => {
+      const parts = root.split('/');
+      return {
+        root,
+        label: parts.length === 1 ? root : `${'  '.repeat(parts.length - 1)}↳ ${parts.at(-1)}`,
+        files: count,
+      };
+    });
   return [{ root: '', label: 'whole repository', files: files.length }, ...dirs];
 }

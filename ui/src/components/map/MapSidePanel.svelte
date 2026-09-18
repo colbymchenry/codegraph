@@ -16,6 +16,7 @@
   import { plural } from '../../lib/symbol-model';
   import type { WireMapLink, WireMapPayload } from '../../lib/api';
   import type { MapLayout } from '../../lib/map-model';
+  import { MAX_MANUAL_MAP_DEPTH } from '../../../../src/lib/map-config';
 
   interface Props {
     payload: WireMapPayload;
@@ -59,7 +60,7 @@
    * choice is wrong for what the reader is looking at — an escape hatch, not
    * the thing anybody should have to reach for.
    */
-  const DEPTHS = [1, 2, 3, 4] as const;
+  const DEPTHS = Array.from({ length: MAX_MANUAL_MAP_DEPTH }, (_, index) => index + 1);
 
   function depthLabel(depth: number): string {
     return depth === 1 ? 'top-level folders' : `${depth} folders deep`;
