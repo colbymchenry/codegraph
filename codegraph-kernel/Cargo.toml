@@ -62,6 +62,12 @@ tree-sitter-luau = "=1.2.0"
 # kotlin grammar C (see build.rs — no kotlin crate dep is possible).
 tree-sitter-language = "0.1"
 
+# Stack-bounds queries for the walker stack guard (src/stack.rs, #1581):
+# pthread_getattr_np / pthread_get_stackaddr_np. Already in the lock file
+# transitively; Windows uses a hand-declared kernel32 extern instead.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 napi-build = "2"
 cc = "1"

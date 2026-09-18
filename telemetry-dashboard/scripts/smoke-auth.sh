@@ -121,8 +121,14 @@ check "cross-origin post     → 400" 400 \
   "$(status -X POST "$BASE/login" -H 'Origin: https://evil.example' -d "password=${PASSWORD}")"
 # One sign-in, then every cookie assertion reads the captured headers. Doing a
 # fresh POST per assertion would burn the login rate limit and 429 halfway down.
-SIGNIN="$(curl -s -D - -o /dev/null -c "$JAR" -X POST "$BASE/login" -d "password=${PASSWORD}" -d "next=/")"
-check    "correct password      → 302" "302" "$(printf '%s' "$SIGNIN" | head -1 | awk '{print $2}')"
+# The sign-in carries `Origin: null` — what Chromium actually sends on a
+# same-origin form submit from a page with our `Referrer-Policy: no-referrer`
+# header. Rejecting it locked every Chromium browser out of the login form
+# while curl-shaped tests (no Origin at all) kept passing.
+SIGNIN="$(curl -s -D - -o /dev/null -c "$JAR" -X POST "$BASE/login" -H 'Origin: null' -d "password=${PASSWORD}" -d "next=/")"
+SIGNIN_STATUS="$(printf '%s' "$SIGNIN" | head -1 | awk '{print $2}')"
+check    "correct password      → 302" "302" "$SIGNIN_STATUS"
+check    "Origin: null (Chromium form post) not rejected" "yes" "$([ "$SIGNIN_STATUS" != "400" ] && echo yes || echo no)"
 contains "cookie is HttpOnly"     "HttpOnly"         "$SIGNIN"
 contains "cookie is Secure"       "Secure"           "$SIGNIN"
 contains "cookie is SameSite=Lax" "SameSite=Lax"     "$SIGNIN"
@@ -173,10 +179,12 @@ check "tampered cookie on a page → 302 to login" 302 \
 
 echo
 echo "Sign-out"
-check "POST /logout → 302" 302 "$(status -X POST "$BASE/logout")"
+check "POST /logout → 302" 302 "$(status -X POST "$BASE/logout" -H 'Origin: null')"
 contains "logout clears the cookie" "Max-Age=0" \
   "$(curl -s -D - -o /dev/null -X POST "$BASE/logout")"
 check "GET /logout  → 405" 405 "$(status "$BASE/logout")"
+check "cross-origin logout → 400" 400 \
+  "$(status -X POST "$BASE/logout" -H 'Origin: https://evil.example')"
 
 echo
 echo "Rate limiting (6 attempts in a minute; the 6th should be capped)"

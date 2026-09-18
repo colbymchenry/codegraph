@@ -175,13 +175,26 @@ function cFamilySpec(extra?: { special?: string[]; addressOfOnly?: boolean }): F
 // resolve precisely. Bare identifiers stay function-kind-only (a bare id can
 // never be a method value in JS).
 const TS_JS_SPEC: FnRefSpec = {
-  idTypes: new Set(['identifier']),
+  // `shorthand_property_identifier`: `{ handleSubmit }` — the object a hook
+  // returns its handlers in, and a namespace object's members.
+  idTypes: new Set(['identifier', 'shorthand_property_identifier']),
   dispatch: new Map<string, CaptureRule>([
     ['arguments', { mode: 'args' }],
     ['assignment_expression', { mode: 'rhs', field: 'right' }],
     ['variable_declarator', { mode: 'varinit', field: 'value' }],
     ['pair', { mode: 'value', field: 'value' }],
     ['array', { mode: 'list' }],
+    // A JSX attribute value or child: `onPress={handleSubmit}`, `renderItem={renderRow}`,
+    // `<Route component={Home}/>`. The expression's one named child is the value; a
+    // spread or a call normalizes to nothing. This is THE handler-binding idiom of
+    // React, and without it a tap's handler had no edge from the component that
+    // renders it — the Screens and Steps views could not see what a tap does.
+    ['jsx_expression', { mode: 'list' }],
+    // An object literal's shorthand members — `return { handleApprove,
+    // handleRetake }` from a hook, `const Api = { upload, createFolder }`.
+    // Every named child is offered; only a shorthand identifier normalizes
+    // (a `pair` is its own container above, a spread or a method is nothing).
+    ['object', { mode: 'list' }],
   ]),
   special: new Set(['member_expression']),
 };

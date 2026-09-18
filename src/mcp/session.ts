@@ -18,7 +18,7 @@ import { MCPEngine } from './engine';
 import { tools } from './tools';
 import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_NO_ROOT_INDEX } from './server-instructions';
 import { CodeGraphPackageVersion } from './version';
-import { findNearestCodeGraphRoot } from '../directory';
+import { resolveServerRoot } from '../directory';
 import { getTelemetry, ClientInfo } from '../telemetry';
 import { getUpdateNotice } from '../upgrade/update-check';
 import { ExploreSessionState } from './explore-session-state';
@@ -230,18 +230,23 @@ export class MCPSession {
       explicitPath = this.explicitProjectPath;
     }
 
-    // Pick the instructions variant by the root's index state — a cheap
-    // synchronous walk-up (existsSync loop only, no DB open, so the #172
-    // respond-fast contract holds). When the root IS indexed, send the full
-    // single-project playbook. When it ISN'T, send the per-project variant
-    // (tools are still exposed — see handleToolsList): it tells the agent there
-    // is no default project and to pass `projectPath` to any project that has a
-    // `.codegraph/`. Gating tool AVAILABILITY on whether `./` is indexed was the
-    // #964 bug — it broke monorepos (only sub-projects indexed) and never
-    // surfaced the tools after a mid-session `codegraph init`. When no explicit
-    // path is known yet (roots/list dance pending), cwd is the best predictor of
-    // where the default project will resolve.
-    const indexed = findNearestCodeGraphRoot(explicitPath ?? process.cwd()) !== null;
+    // Pick the instructions variant by the root's index state — synchronous
+    // and bounded (an existsSync walk-up plus, when that misses, the depth- and
+    // count-bounded workspace down-scan; no DB open, so the #172 respond-fast
+    // contract holds). This is the SAME resolution the engine's doInitialize
+    // runs (#1606), so the variant matches what the engine will actually adopt
+    // — a workspace whose single indexed sub-project becomes the default gets
+    // the full single-project playbook, race-free by construction (both sides
+    // compute it independently; no ordering between handshake and engine init
+    // is assumed). When the root ISN'T indexed (and nothing was adopted), send
+    // the per-project variant (tools are still exposed — see handleToolsList):
+    // it tells the agent there is no default project and to pass `projectPath`
+    // to any project that has a `.codegraph/`. Gating tool AVAILABILITY on
+    // whether `./` is indexed was the #964 bug — it broke monorepos (only
+    // sub-projects indexed) and never surfaced the tools after a mid-session
+    // `codegraph init`. When no explicit path is known yet (roots/list dance
+    // pending), cwd is the best predictor of where the default will resolve.
+    const indexed = resolveServerRoot(explicitPath ?? process.cwd()).root !== null;
 
     // Respond to the handshake BEFORE doing any heavy init — see issue #172.
     this.transport.sendResult(request.id, {

@@ -68,16 +68,19 @@ export const EXPLORE_DEDUP = {
   MAX_SYMBOLS_IN_POINTER: 5,
 } as const;
 
-const OFF = new Set(['0', 'false', 'off', 'no']);
+const ON = new Set(['1', 'true', 'on', 'yes']);
 
 /**
- * Kill switch: `CODEGRAPH_EXPLORE_DEDUP=0` renders every call as if the session
- * had no history. Read per call (not memoized) so a test can toggle it.
+ * Cross-call source suppression is opt-in. An MCP connection is not a reliable
+ * conversation boundary: some hosts reuse it for subagents, and compaction can
+ * discard source while keeping the connection alive (#1620). Without a host-
+ * supplied context lifecycle, re-serving source is the only always-correct
+ * default. Read per call (not memoized) so tests and launchers can toggle it.
  */
 export function exploreDedupEnabled(): boolean {
   const raw = process.env.CODEGRAPH_EXPLORE_DEDUP;
-  if (raw === undefined) return true;
-  return !OFF.has(raw.trim().toLowerCase());
+  if (raw === undefined) return false;
+  return ON.has(raw.trim().toLowerCase());
 }
 
 /**

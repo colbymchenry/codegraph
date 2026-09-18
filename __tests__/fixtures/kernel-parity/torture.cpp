@@ -39,6 +39,8 @@ class Session {
 public:
   void open();
   virtual ~Session() {}
+  // #1727 — pure virtual must mint a method node (parity between wasm + kernel).
+  virtual int read(int key) = 0;
 };
 void Session::open() {}
 }  // namespace app::net

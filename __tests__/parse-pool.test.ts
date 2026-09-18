@@ -11,7 +11,7 @@
  * parallelism safe.
  */
 import { describe, it, expect } from 'vitest';
-import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs, type ParsePoolWorker, type ParseTask } from '../src/extraction/parse-pool';
+import { ParseWorkerPool, resolveParseBudgetMs, resolveParsePoolSize, resolveParseTimeoutMs, type ParsePoolWorker, type ParseTask } from '../src/extraction/parse-pool';
 import type { Language, ExtractionResult } from '../src/types';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -91,6 +91,17 @@ describe('resolveParseTimeoutMs', () => {
     expect(resolveParseTimeoutMs('abc')).toBe(10_000);
     expect(resolveParseTimeoutMs('0')).toBe(10_000);
     expect(resolveParseTimeoutMs('-5')).toBe(10_000);
+  });
+});
+
+describe('resolveParseBudgetMs', () => {
+  it('caps near-limit blob headers at a 20s soft / 60s hard window (#1555)', () => {
+    expect(resolveParseBudgetMs(10_000, 940_800)).toBe(20_000);
+    expect(resolveParseBudgetMs(10_000, 857_376)).toBe(20_000);
+  });
+
+  it('does not clamp an explicit larger base timeout', () => {
+    expect(resolveParseBudgetMs(45_000, 940_800)).toBe(45_000);
   });
 });
 

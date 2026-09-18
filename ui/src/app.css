@@ -1,0 +1,129 @@
+/* =====================================================================
+   codegraph ui — the app's global primitives
+
+   The design tokens themselves live in `lib/theme.css`, which is also
+   what `@colbymchenry/codegraph-ui` exports for a host to import and
+   override. This file is everything ON TOP of them that only the
+   standalone viewer needs: the reset, the shell grid, and the handful of
+   primitives shared across views.
+
+   Component-specific rules live in each .svelte file's scoped <style>.
+   ===================================================================== */
+
+@import './lib/theme.css';
+
+/* ---------- reset ---------- */
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  /* body always paints --paper: the bars are transparent over it and a
+     short view must not reveal the browser's own canvas colour. */
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 13px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  /* Square corners are non-negotiable in this system, including on the
+     UA-styled controls (input, select, button) we do not restyle. */
+  border-radius: 0 !important;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+h1,
+h2,
+h3 {
+  font-weight: 600;
+  text-wrap: balance;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+    animation: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ---------- app shell ----------
+   Design spec §3.1: top bar 48px / trail bar 34px / main. The grid is on
+   index.html's mount host, which App.svelte fills directly (no wrapper — a
+   second #app would duplicate the id).
+
+   The trail row is `auto`, not `--trailbar-h`: the bar keeps that height on
+   its own (see TrailBar.svelte) and grows only while the save-trail form is
+   open. Pinning the row instead would clip the form. */
+#app {
+  height: 100vh;
+  display: grid;
+  grid-template-rows: var(--topbar-h) auto 1fr;
+}
+
+/* ---------- cross-view primitives ---------- */
+.mono {
+  font-family: var(--mono);
+}
+
+.dim {
+  color: var(--ink-3);
+}
+
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Empty / not-yet-loaded states. Sentence case, no exclamation marks —
+   say what is missing and what to do about it. */
+.emptystate {
+  padding: 40px;
+  max-width: 60ch;
+  color: var(--ink-2);
+  line-height: 1.5;
+}
+
+.emptystate h2 {
+  margin: 0 0 8px;
+  font-size: 16px;
+  color: var(--ink);
+}
+
+.emptystate p {
+  margin: 0 0 10px;
+}
+
+.emptystate code {
+  font-family: var(--mono);
+  font-size: 12px;
+  background: var(--press);
+  padding: 1px 4px;
+}

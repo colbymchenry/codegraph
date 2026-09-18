@@ -54,7 +54,9 @@ Types: functionTypes=[`function_item`, **`function_signature_item`**] (the
 latter = a trait method DECLARATION `fn render(&self);` — extracted so a
 trait's method set is first-class); classTypes=[] (impl blocks instead);
 methodTypes = same two; interfaceTypes=[`trait_item`] with
-**interfaceKind:'trait'**; structTypes=[`struct_item`]; enumTypes=[`enum_item`];
+**interfaceKind:'trait'**; structTypes=[`struct_item`];
+unionTypes=[`union_item`] (same body walk, distinct `union` node kind);
+enumTypes=[`enum_item`];
 enumMemberTypes=[`enum_variant`]; typeAliasTypes=[`type_item`];
 importTypes=[`use_declaration`]; callTypes=[`call_expression`];
 variableTypes=[`let_declaration`, `const_item`, `static_item`].
@@ -87,18 +89,21 @@ Hooks PRESENT (port each exactly):
 - **getVisibility (rust.ts:74)** — direct child of type `visibility_modifier`:
   text `.includes('pub')` → `'public'` else `'private'`; no modifier →
   `'private'` (so `pub(crate)`/`pub(super)` are all `'public'`).
-- **getReceiverType (rust.ts:83)** — walk PARENT chain to the nearest
-  `impl_item`; there: filter DIRECT namedChildren of type `type_identifier`;
-  if ≥1, return the LAST one's source text (`source.substring(startIndex,
-  endIndex)` — UTF-16 units). If none, find the first `generic_type` child and
-  return its inner `type_identifier` text; else undefined. Never an impl parent
-  → undefined. QUIRK/BUG, PRESERVE: for `impl Trait for Generic<T>` the only
-  direct type_identifier is the TRAIT (probe: `impl Render for Container<T>` →
-  typeIdents=[`Render`] → receiver = **`Render`**, the trait name — methods get
-  qualifiedName `Render::render` and a contains edge from the trait node if one
-  exists in-file). `impl fmt::Display for Fields` is fine
-  (scoped_type_identifier isn't type_identifier → [Fields]). `impl<T>
-  Container<T>` → no direct type_identifiers → generic branch → `Container`.
+- **getReceiverType (rust.ts)** — walk PARENT chain to the nearest
+  `impl_item`; there, read the grammar's `type` field through
+  `rustImplTypeName` (kernel: `impl_type_name`): `type_identifier`/`identifier`
+  → text; `generic_type` → its `type` field (bare name, never the args);
+  `scoped_type_identifier`/`scoped_identifier` → its `name` field (last
+  segment); `reference_type` → its `type` field; anything else (tuple, `dyn`,
+  pointer, primitive, fn type) → undefined. Never an impl parent → undefined.
+  **Changed in #1588 on both sides together**: the original rule took the LAST
+  direct `type_identifier` child, so for `impl Trait for Generic<T>` /
+  `Parents<'a>` / `&Foo` the only bare identifier was the TRAIT's (probe:
+  `impl Render for Container<T>` → receiver **`Render`** → methods
+  `Render::render`, colliding with the trait declaration and feeding the
+  interface-impl synthesizer a phantom declaration). Now `Container`.
+  `impl fmt::Display for Fields` → `Fields`; `impl<T> Container<T>` →
+  `Container`; `impl Tr for m::Foo` → `Foo` (was: no receiver).
   Note `<T>` type_parameters is its own child, its inner T is NOT a direct
   impl child.
 - **extractImport (rust.ts:120)** — signature = trimmed full `use …;` text.
@@ -135,7 +140,7 @@ undefined; **no isConst means `const_item`/`static_item` extract as kind
 |---|---|---|
 | `function_item` (top level) | functionTypes, tree-sitter.ts:994 → extractFunction:1517 | not inside class-like at file scope → extractFunction; **first line of extractFunction (1522): if getReceiverType returns a value → extractMethod instead** (this is how impl-block fns become methods — impl_item does NOT push a scope) |
 | `function_signature_item` | same | in a trait body (trait pushed, class-like) → extractMethod; no `body` field → no body walk |
-| `struct_item` | structTypes:1059 → extractStruct:1869 | `body` field required: **unit structs `struct Unit;` have no body → NO node minted** (1876, `record_declaration` exemption is C#-only). Tuple structs have body `ordered_field_declaration_list` → extracted. `field_declaration` children make NO nodes (rust has no fieldTypes) — visitNode recurses into them and finds nothing |
+| `struct_item` | structTypes:1059 → extractStruct:1869 | ~~`body` field required: unit structs `struct Unit;` have no body → NO node minted~~ — **superseded: Rust now sets `allowBodilessStruct`, so `struct Unit;` mints a node with no members.** Rust has no forward declarations, so the bodiless skip (meant for C/C++) never applied here; the `record_declaration` exemption is the C# form of the same carve-out. Tuple structs have body `ordered_field_declaration_list` → extracted. `field_declaration` children make NO nodes (rust has no fieldTypes) — visitNode recurses into them and finds nothing |
 | `enum_item` | enumTypes:1064 → extractEnum:1914 | body `enum_variant_list`; `enum_variant` children → extractEnumMembers:1958 — **`name` field path: one `enum_member` node from `getChildByField(node,'name')`, then return** (variant payload bodies `B(u32)` / `C { x }` are never walked). Non-variant children (e.g. `attribute_item`) → visitNode (no-op) |
 | `trait_item` | interfaceTypes:1054 → extractInterface:1834 | kind `'trait'` (interfaceKind); extractInheritance sees the `trait_bounds` child (see below); body `declaration_list` children visited with the trait pushed → fn items become methods with QN `Trait::name` via nodeStack |
 | `impl_item` | dedicated branch:1273-1276 → extractRustImplItem:5690 | emits the implements back-reference (below); **skipChildren stays false** → the `declaration_list` is then visited normally by the loop at 1295 (that's how impl members are reached; impl pushes NOTHING on the nodeStack) |
@@ -185,8 +190,9 @@ undefined; **no isConst means `const_item`/`static_item` extract as kind
   present AND not class-like — finds the FIRST node in `this.nodes` with
   `name === receiverType && filePath === this.filePath && kind ∈
   {struct,class,enum,trait}`. Source-order dependent: an impl ABOVE its struct
-  gets no contains edge. `impl Trait for Generic<T>` (receiver=trait bug) links
-  to the TRAIT node if it's in-file.** Then type annotations, decorators
+  gets no contains edge. Since #1588 `impl Trait for Generic<T>` links to the
+  implementing TYPE's node (it used to link to the TRAIT node, the receiver
+  bug).** Then type annotations, decorators
   (no-op), body walk with the method pushed.
 - **Nested `fn` inside an impl-method's body**: visitFunctionBody:5245 →
   named → extractFunction → getReceiverType walks parents THROUGH the outer fn
@@ -220,9 +226,13 @@ Generic else-branch (4312+), `func = childForFieldName('function') ?? namedChild
      (4455) → `Foo::new().bar()` → ref `Foo::new().bar`; an instance chain
      `x.foo().bar()` (innerFn field_expression) → bare `bar`. When not
      re-encoding, calleeName = bare methodName.
-   - receiver anything else (`field_expression` 2-hop `v.field.method()`,
-     `parenthesized_expression`, `await_expression`, `self`) → bare
-     methodName (probed all four).
+   - receiver `field_expression` whose `value` is `self` and whose `field` is
+     a `field_identifier` (`self.inner.run()`) → `self.inner.run` — the
+     owner-field shape the resolver types from the struct declaration
+     (#1585, both sides together).
+   - receiver anything else (`field_expression` with a non-self base
+     `v.field.method()` / deeper `self.a.b.m()`, `parenthesized_expression`,
+     `await_expression`, `self`) → bare methodName (probed all four).
 2. `func.type === 'scoped_identifier'` (4499) → calleeName = FULL text
    (`Foo::new`, `m::helper2`, `std::mem::swap` — whatever the source spells,
    whitespace included).
@@ -480,7 +490,7 @@ inner `array_expression`, but `const CB: fn() = handler;` captures nothing
 ## Gates (per plan §5, no exceptions)
 
 - **Torture fixture `torture.rs`** (+ CRLF variant, derived in-memory), pinning
-  at minimum: unit struct (NO node) / tuple struct / field struct; enum with
+  at minimum: unit struct (node, no members) / tuple struct / field struct; enum with
   unit+tuple+struct variants; trait with supertraits incl. a SCOPED one
   (`fmt::Debug` — dropped) + `function_signature_item` + default method +
   associated type/const (no node; const value call attributes to trait);

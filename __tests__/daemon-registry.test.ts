@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawn } from 'child_process';
 import * as fs from 'fs';
+import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import {
@@ -9,8 +10,13 @@ import {
   registerDaemon,
   deregisterDaemon,
   listDaemons,
+  listVerifiedDaemons,
+  clearStaleDaemonArtifacts,
+  stopDaemonAt,
   type DaemonRecord,
 } from '../src/mcp/daemon-registry';
+import { encodeLockInfo, getDaemonPidPath } from '../src/mcp/daemon-paths';
+import { releaseWriterLock, tryAcquireWriterLock } from '../src/mcp/writer-lock';
 
 /** A pid that's guaranteed dead: spawn a trivial process, let it exit, reap it. */
 async function deadPid(): Promise<number> {
@@ -99,5 +105,139 @@ describe('daemon-registry', () => {
     registerDaemon(rec('/proj/new', process.pid, 2000));
     const live = listDaemons();
     expect(live.map((d) => d.root)).toEqual(['/proj/new', '/proj/old']);
+  });
+
+  it('keeps a registry entry whose socket hello matches its PID and version', async () => {
+    const root = fs.mkdtempSync(path.join(tmpHome, 'verified-'));
+    const socketPath = process.platform === 'win32'
+      ? `\\\\.\\pipe\\cg-reg-${process.pid}-${Date.now()}`
+      : path.join(tmpHome, 'verified.sock');
+    const server = net.createServer((socket) => {
+      socket.end(JSON.stringify({
+        protocol: 1,
+        pid: process.pid,
+        codegraph: '1.5.0',
+        socketPath,
+      }) + '\n');
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(socketPath, resolve);
+    });
+    try {
+      registerDaemon({ root, pid: process.pid, version: '1.5.0', socketPath, startedAt: 1 });
+      expect((await listVerifiedDaemons()).map((d) => d.root)).toEqual([root]);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it('never signals a reused live PID when no matching daemon answers (#1553)', async () => {
+    const root = fs.mkdtempSync(path.join(tmpHome, 'project-'));
+    const pidPath = getDaemonPidPath(root);
+    fs.mkdirSync(path.dirname(pidPath), { recursive: true });
+    fs.writeFileSync(pidPath, encodeLockInfo({
+      pid: process.pid,
+      version: '1.5.0',
+      socketPath: path.join(root, '.codegraph', 'missing.sock'),
+      startedAt: Date.now() - 60_000,
+    }));
+
+    registerDaemon({
+      root,
+      pid: process.pid,
+      version: '1.5.0',
+      socketPath: path.join(root, '.codegraph', 'missing.sock'),
+      startedAt: Date.now() - 60_000,
+    });
+
+    expect(await listVerifiedDaemons()).toEqual([]);
+    const result = await stopDaemonAt(root);
+    expect(result).toMatchObject({ pid: process.pid, outcome: 'not-running' });
+    expect(isProcessAlive(process.pid)).toBe(true);
+    expect(fs.existsSync(pidPath)).toBe(false);
+  });
+
+  it('preserves a live legacy lock when stop cannot verify daemon identity', async () => {
+    const root = fs.mkdtempSync(path.join(tmpHome, 'legacy-stop-'));
+    const pidPath = getDaemonPidPath(root);
+    fs.mkdirSync(path.dirname(pidPath), { recursive: true });
+    fs.writeFileSync(pidPath, `${process.pid}\n`);
+
+    const result = await stopDaemonAt(root);
+
+    expect(result).toMatchObject({ pid: process.pid, outcome: 'unverified' });
+    expect(fs.readFileSync(pidPath, 'utf8')).toBe(`${process.pid}\n`);
+    expect(isProcessAlive(process.pid)).toBe(true);
+  });
+
+  it('preserves a replacement lock written while stale identity is probed', async () => {
+    const root = fs.mkdtempSync(path.join(tmpHome, 'probe-race-'));
+    const pidPath = getDaemonPidPath(root);
+    const socketPath = process.platform === 'win32'
+      ? `\\\\.\\pipe\\cg-race-old-${process.pid}-${Date.now()}`
+      : path.join(tmpHome, 'probe-race-old.sock');
+    const replacementSocketPath = process.platform === 'win32'
+      ? `\\\\.\\pipe\\cg-race-new-${process.pid}-${Date.now()}`
+      : path.join(tmpHome, 'probe-race-new.sock');
+    let acceptConnection!: () => void;
+    const connected = new Promise<void>((resolve) => { acceptConnection = resolve; });
+    let acceptedSocket: net.Socket | null = null;
+    const server = net.createServer((socket) => {
+      acceptedSocket = socket;
+      acceptConnection();
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(socketPath, resolve);
+    });
+    const original = encodeLockInfo({
+      pid: process.pid,
+      version: '1.5.0',
+      socketPath,
+      startedAt: 1,
+    });
+    const replacement = encodeLockInfo({
+      pid: process.pid,
+      version: '1.5.0',
+      socketPath: replacementSocketPath,
+      startedAt: 2,
+    });
+    fs.mkdirSync(path.dirname(pidPath), { recursive: true });
+    fs.writeFileSync(pidPath, original);
+
+    try {
+      const clearing = clearStaleDaemonArtifacts(root);
+      await connected;
+      fs.writeFileSync(pidPath, replacement);
+      acceptedSocket!.end('{"protocol":0}\n');
+
+      expect(await clearing).toBe(false);
+      expect(fs.readFileSync(pidPath, 'utf8')).toBe(replacement);
+    } finally {
+      acceptedSocket?.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it('does not clean daemon artifacts while another writer owns the project', async () => {
+    const root = fs.mkdtempSync(path.join(tmpHome, 'writer-claim-'));
+    const pidPath = getDaemonPidPath(root);
+    const lock = encodeLockInfo({
+      pid: process.pid,
+      version: '1.5.0',
+      socketPath: path.join(root, '.codegraph', 'not-listening.sock'),
+      startedAt: 1,
+    });
+    fs.mkdirSync(path.dirname(pidPath), { recursive: true });
+    fs.writeFileSync(pidPath, lock);
+    expect(tryAcquireWriterLock(root, 'daemon').kind).toBe('acquired');
+
+    try {
+      expect(await clearStaleDaemonArtifacts(root)).toBe(false);
+      expect(fs.readFileSync(pidPath, 'utf8')).toBe(lock);
+    } finally {
+      releaseWriterLock(root);
+    }
   });
 });

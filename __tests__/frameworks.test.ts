@@ -837,6 +837,118 @@ describe('railsResolver.extract', () => {
 import { springResolver } from '../src/resolution/frameworks/java';
 
 describe('springResolver.extract', () => {
+  it.each([
+    ['UserController.java', '{"/a", "/b"}', '@GetMapping({"/x", "/y"})', 'public String handle() { return "ok"; }'],
+    ['UserController.java', 'path = {"/a", "/b"}', '@RequestMapping(value = {"/x", "/y"}, method = RequestMethod.GET)', 'public String handle() { return "ok"; }'],
+    ['UserController.kt', 'value = ["/a", "/b"]', '@GetMapping(path = ["/x", "/y"])', 'fun handle(): String = "ok"'],
+  ])('indexes every class/method path pair in %s with %s and %s (#1461)', (filePath, base, mapping, handler) => {
+    const src = `@RestController
+@RequestMapping(${base})
+public class UserController {
+  ${mapping}
+  ${handler}
+}`;
+    const { nodes, references } = springResolver.extract!(filePath, src);
+    expect(nodes.map(n => n.name)).toEqual(['GET /a/x', 'GET /a/y', 'GET /b/x', 'GET /b/y']);
+    expect(new Set(nodes.map(n => n.id)).size).toBe(4);
+    expect(references.map(r => [r.fromNodeId, r.referenceName])).toEqual(nodes.map(n => [n.id, 'handle']));
+  });
+
+  it.each(['ErrorHandler.PATH', 'PATH', 'value = ErrorHandler.PATH', 'path = PATH'])(
+    'resolves a same-file constant prefix in @RequestMapping(%s) (#1461)', (args) => {
+      const src = `@Controller
+@RequestMapping(${args})
+public class ErrorHandler {
+  public static final String PATH = "/error";
+  @RequestMapping(method = {RequestMethod.GET})
+  public String handle() { return "err"; }
+}`;
+      const { nodes, references } = springResolver.extract!('ErrorHandler.java', src);
+      expect(nodes.map(n => n.name)).toEqual(['GET /error']);
+      expect(references.map(r => [r.fromNodeId, r.referenceName])).toEqual([[nodes[0].id, 'handle']]);
+    },
+  );
+
+  it('keeps literals and resolved constants in path arrays, including URI variables (#1461)', () => {
+    const src = `@RequestMapping({"/api", "/{tenant}/api"})
+public class ItemController {
+  public static final String ITEMS = "/items";
+  @GetMapping(path = {ITEMS, "/items/{id}", External.MISSING}, produces = "application/json")
+  public String get() { return "ok"; }
+}`;
+    const { nodes, references } = springResolver.extract!('ItemController.java', src);
+    expect(nodes.map(n => n.name)).toEqual([
+      'GET /api/items', 'GET /api/items/{id}', 'GET /{tenant}/api/items', 'GET /{tenant}/api/items/{id}',
+    ]);
+    expect(references.map(r => r.referenceName)).toEqual(['get', 'get', 'get', 'get']);
+  });
+
+  it.each([
+    ['value = "/ok", produces = "application/json"', '/base/ok'],
+    ['consumes = {"application/json", "text/plain"}, path = "/ok", produces = "application/json"', '/base/ok'],
+    ['produces = "application/json", consumes = "text/plain"', '/base'],
+  ])('only treats path arguments as paths: %s (#1461)', (args, expected) => {
+    const src = `@RequestMapping("/base")
+public class UserController {
+  @GetMapping(${args})
+  public String handle() { return "ok"; }
+}`;
+    const { nodes } = springResolver.extract!('UserController.java', src);
+    expect(nodes.map(n => n.name)).toEqual([`GET ${expected}`]);
+  });
+
+  it.each([
+    ['External.MISSING', '@GetMapping'],
+    ['value = MISSING, produces = "application/json"', '@GetMapping("/ok")'],
+    ['"/base"', '@GetMapping(External.MISSING)'],
+    ['"/base"', '@GetMapping(path = MISSING, produces = "application/json")'],
+    ['"/base"', '@RequestMapping(value = MISSING, method = RequestMethod.GET)'],
+  ])('omits unresolved paths: class %s, method %s (#1461)', (base, mapping) => {
+    const src = `@RequestMapping(${base})
+public class UserController {
+  // public static final String MISSING = "/comment";
+  ${mapping}
+  public String handle() { return "ok"; }
+}`;
+    expect(springResolver.extract!('UserController.java', src)).toEqual({ nodes: [], references: [] });
+  });
+
+  it.each([
+    ['@GetMapping', 'GET'],
+    ['@GetMapping()', 'GET'],
+    ['@RequestMapping(method = RequestMethod.GET)', 'GET'],
+    ['@RequestMapping(method = {RequestMethod.GET})', 'GET'],
+    ['@RequestMapping', 'ANY'],
+  ])('inherits the class prefix for %s without emitting a class route (#1461)', (mapping, verb) => {
+    const src = `@RequestMapping("/base")
+public class UserController {
+  ${mapping}
+  public String handle() { return "ok"; }
+}`;
+    const { nodes, references } = springResolver.extract!('UserController.java', src);
+    expect(nodes.map(n => n.name)).toEqual([`${verb} /base`]);
+    expect(references.map(r => r.referenceName)).toEqual(['handle']);
+  });
+
+  it('preserves annotation and reference line numbers after multiline Javadocs (#1461)', () => {
+    const src = `/**
+ * Controller documentation.
+ */
+@RequestMapping("/base")
+public class UserController {
+  /**
+   * Handler documentation with @GetMapping("/fake").
+   */
+  @GetMapping({"/x", "/y"})
+  public String handle() { return "ok"; }
+}`;
+    const { nodes, references } = springResolver.extract!('UserController.java', src);
+    expect(nodes.map(n => [n.name, n.startLine, n.endLine])).toEqual([
+      ['GET /base/x', 9, 9], ['GET /base/y', 9, 9],
+    ]);
+    expect(references.map(r => [r.referenceName, r.line])).toEqual([['handle', 9], ['handle', 9]]);
+  });
+
   it('extracts route with @GetMapping and next method', () => {
     const src = `
 @GetMapping("/users")
@@ -1424,6 +1536,42 @@ public IActionResult ListUsers()
     expect(nodes[0].name).toBe('GET /users');
     expect(references[0].referenceName).toBe('ListUsers');
   });
+
+  it('extracts the handler-first endpoint-group form under the class, with the optional path', () => {
+    const src = `
+public class TodoItems : IEndpointGroup
+{
+    public static void Map(RouteGroupBuilder groupBuilder)
+    {
+        groupBuilder.RequireAuthorization();
+        groupBuilder.MapPost(CreateTodoItem);
+        groupBuilder.MapPut(UpdateTodoItem, "{id}");
+        groupBuilder.MapDelete(DeleteTodoItem, "{id}");
+    }
+    public static async Task<Created<int>> CreateTodoItem(ISender sender, CreateTodoItemCommand command) { }
+}
+`;
+    const { nodes, references } = aspnetResolver.extract!('Web/Endpoints/TodoItems.cs', src);
+    expect(nodes.map((n) => n.name)).toEqual(['POST /TodoItems', 'PUT /TodoItems/{id}', 'DELETE /TodoItems/{id}']);
+    expect(nodes.map((n) => n.startLine)).toEqual([7, 8, 9]);
+    expect(references.map((r) => r.referenceName)).toEqual(['CreateTodoItem', 'UpdateTodoItem', 'DeleteTodoItem']);
+    expect(nodes[0]!.qualifiedName).toBe('Web/Endpoints/TodoItems.cs::group:TodoItems:POST:');
+  });
+
+  it('a class with its own RoutePrefix literal names its routes under it', () => {
+    const src = `
+public class TodoLists : IEndpointGroup
+{
+    public static string RoutePrefix => "/api/todo-lists";
+    public static void Map(RouteGroupBuilder group)
+    {
+        group.MapGet(GetTodoLists);
+    }
+}
+`;
+    const { nodes } = aspnetResolver.extract!('TodoLists.cs', src);
+    expect(nodes.map((n) => n.name)).toEqual(['GET /api/todo-lists']);
+  });
 });
 
 import { vaporResolver } from '../src/resolution/frameworks/swift';
@@ -1472,9 +1620,51 @@ func boot(routes: RoutesBuilder) throws {
     const { nodes } = vaporResolver.extract!('configure.swift', src);
     expect(nodes).toHaveLength(0);
   });
+
+  // A `.METHOD(...)` call with many comma-separated args and no `use:` used to
+  // make the route regex backtrack exponentially (60 args hung for minutes).
+  it('does not backtrack exponentially on a long arg list without use:', () => {
+    const args = Array.from({ length: 60 }, (_, i) => `arg${i}: value${i}`).join(', ');
+    const src = `app.get(${args})\n`;
+    const start = performance.now();
+    const { nodes } = vaporResolver.extract!('routes.swift', src);
+    const elapsed = performance.now() - start;
+    expect(nodes).toHaveLength(0);
+    expect(elapsed).toBeLessThan(250);
+  });
+
+  it('still parses every Vapor route shape after the arg-list rewrite', () => {
+    const src = `
+admin.get(use: self.list)
+app.get("users", use: listUsers)
+router.post("users", User.parameter, "edit", use: UserController.edit)
+app.patch(":id" ,  "meta" ,  use: update)
+app.get(
+  "multi",
+  "line",
+  use: multiLine
+)
+`;
+    const { nodes, references } = vaporResolver.extract!('routes.swift', src);
+    expect(nodes.map((n) => n.name)).toEqual([
+      'GET /',
+      'GET /users',
+      'POST /users/edit',
+      'PATCH /:id/meta',
+      'GET /multi/line',
+    ]);
+    expect(references.map((r) => r.referenceName)).toEqual([
+      'list',
+      'listUsers',
+      'edit',
+      'update',
+      'multiLine',
+    ]);
+  });
 });
 
 import { reactResolver } from '../src/resolution/frameworks/react';
+import { nextjsResolver } from '../src/resolution/frameworks/nextjs';
 import { svelteResolver } from '../src/resolution/frameworks/svelte';
 import { astroResolver } from '../src/resolution/frameworks/astro';
 
@@ -1514,13 +1704,14 @@ describe('reactResolver.extract — React Router', () => {
   });
 
   it('does not treat config files or a nextjs-pages dir as Next.js routes', () => {
-    const cfg = reactResolver.extract!('apps/nextjs-pages/next.config.mjs', 'export default {}');
+    const cfg = nextjsResolver.extract!('apps/nextjs-pages/next.config.mjs', 'export default {}');
     expect(cfg.nodes.filter((n) => n.kind === 'route')).toHaveLength(0);
-    const vite = reactResolver.extract!('src/pages/vite.config.ts', 'export default {}');
+    const vite = nextjsResolver.extract!('src/pages/vite.config.ts', 'export default {}');
     expect(vite.nodes.filter((n) => n.kind === 'route')).toHaveLength(0);
-    // a real page still works
-    const page = reactResolver.extract!('src/pages/about.tsx', 'export default function About(){return null}');
+    // a real page still works — and the React resolver leaves it to the Next one
+    const page = nextjsResolver.extract!('src/pages/about.tsx', 'export default function About(){return null}');
     expect(page.nodes.filter((n) => n.kind === 'route').map((n) => n.name)).toEqual(['/about']);
+    expect(reactResolver.extract!('src/pages/about.tsx', 'export default function About(){return null}').nodes).toHaveLength(0);
   });
 });
 

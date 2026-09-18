@@ -153,7 +153,12 @@ export const svelteResolver: FrameworkResolver = {
     const fileName = filePath.split(/[/\\]/).pop() || '';
     const routeMatch = getSvelteKitRouteInfo(fileName);
 
-    if (routeMatch) {
+    // Only a `+page.svelte` is a URL. A `+layout.svelte` and a `+error.svelte`
+    // sit at the same path as the page beside them, so emitting a route for
+    // them put the same address in the index two and three times over — one
+    // `/` for the page, one for the layout, one for the error page — which the
+    // Screens picture then drew as three separate screens.
+    if (routeMatch === 'page') {
       // Extract route path from directory structure
       // e.g., src/routes/blog/[slug]/+page.svelte -> /blog/:slug
       const routePath = filePathToSvelteKitRoute(filePath);

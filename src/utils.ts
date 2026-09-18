@@ -81,6 +81,24 @@ function isWithinDir(child: string, parent: string): boolean {
 }
 
 /**
+ * The lexical half of {@link validatePathWithinRoot}, on its own.
+ *
+ * Returns the resolved absolute path when `filePath` stays inside
+ * `projectRoot` after `../` segments are applied, or null when it escapes.
+ * No filesystem access — for callers on a hot path that only need to refuse a
+ * lexical escape, and for which the realpath half would be both unnecessary
+ * and far too expensive (the existence probe in resolution's `fileExists`,
+ * #1631: two `realpathSync` calls per probe made it ~70x slower).
+ *
+ * This is NOT a substitute for `validatePathWithinRoot` on any path whose
+ * contents get served — those must keep the symlink-aware check (#527).
+ */
+export function lexicalPathWithinRoot(projectRoot: string, filePath: string): string | null {
+  const resolved = path.resolve(projectRoot, filePath);
+  return isWithinDir(resolved, path.resolve(projectRoot)) ? resolved : null;
+}
+
+/**
  * Validate that a file path stays within the project root, resolving symlinks.
  *
  * Two layers: a cheap lexical check that catches `../` traversal, then a
@@ -112,14 +130,13 @@ export function validatePathWithinRoot(
   filePath: string,
   options?: { allowSymlinkEscape?: boolean }
 ): string | null {
-  const resolved = path.resolve(projectRoot, filePath);
-  const normalizedRoot = path.resolve(projectRoot);
-
   // 1. Lexical containment — cheap, catches `../` traversal. Applies even on
   //    the indexing read path: a crafted `../` escape is still rejected.
-  if (!isWithinDir(resolved, normalizedRoot)) {
+  const resolved = lexicalPathWithinRoot(projectRoot, filePath);
+  if (resolved === null) {
     return null;
   }
+  const normalizedRoot = path.resolve(projectRoot);
 
   // 2. Symlink-aware containment — resolve symlinks on both sides and re-check,
   //    so an in-repo symlink whose real target escapes the root is rejected.

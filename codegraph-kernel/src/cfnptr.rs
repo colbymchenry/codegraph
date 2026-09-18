@@ -432,8 +432,19 @@ struct InlineScan {
 fn scan_inline_structs(s: &[u8]) -> InlineScan {
     let mut out = InlineScan { ptr: false, types: Vec::new(), tags: Vec::new() };
     let mut last = 0;
-    while let Some(t) = find_word(s, b"struct", last) {
-        let after_kw = t + 6;
+    loop {
+        let next_struct = find_word(s, b"struct", last);
+        let next_union = find_word(s, b"union", last);
+        let Some((t, keyword_len)) = (match (next_struct, next_union) {
+            (Some(st), Some(un)) if st < un => Some((st, 6)),
+            (Some(_), Some(un)) => Some((un, 5)),
+            (Some(st), None) => Some((st, 6)),
+            (None, Some(un)) => Some((un, 5)),
+            (None, None) => None,
+        }) else {
+            break;
+        };
+        let after_kw = t + keyword_len;
         let ws = skip_jsws(s, after_kw);
         if ws == after_kw || !is_word_at(s, ws) {
             last = t + 1;
@@ -569,10 +580,10 @@ fn init_body(s: &[u8], p: usize) -> Option<(String, usize)> {
     let i = skip_jsws(s, p);
     let mods = modifier_positions(s, i);
     for &pos in mods.iter().rev() {
-        for with_struct in [true, false] {
-            let q = if with_struct {
-                if s.len() >= pos + 6 && &s[pos..pos + 6] == b"struct" {
-                    let e = pos + 6;
+        for keyword in [Some(b"struct".as_slice()), Some(b"union".as_slice()), None] {
+            let q = if let Some(keyword) = keyword {
+                if s.len() >= pos + keyword.len() && &s[pos..pos + keyword.len()] == keyword {
+                    let e = pos + keyword.len();
                     let w = skip_jsws(s, e);
                     if w == e {
                         continue;
@@ -729,12 +740,19 @@ fn alias_line(line: &[u8]) -> Option<&[u8]> {
     if v0 == name_end {
         return None; // [ \t]+ before the value
     }
-    // (?:struct[ \t]+)* greedy, k-descending on value failure.
+    // (?:(?:struct|union)[ \t]+)* greedy, k-descending on value failure.
     let mut stack = vec![v0];
     loop {
         let cur = *stack.last().unwrap();
-        if line.len() >= cur + 6 && &line[cur..cur + 6] == b"struct" {
-            let e = cur + 6;
+        let keyword_len = if line.len() >= cur + 6 && &line[cur..cur + 6] == b"struct" {
+            Some(6)
+        } else if line.len() >= cur + 5 && &line[cur..cur + 5] == b"union" {
+            Some(5)
+        } else {
+            None
+        };
+        if let Some(keyword_len) = keyword_len {
+            let e = cur + keyword_len;
             let w2 = skip_sp_tab(line, e);
             if w2 > e {
                 stack.push(w2);

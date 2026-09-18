@@ -9,9 +9,11 @@ import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport } from './types';
 import { applyAliases } from './path-aliases';
+import { extractLocalExportAliases } from './alias-binding';
 import { resolveWorkspaceImport } from './workspace-packages';
 import {
   resolveMethodOnType,
+  resolveObjectLiteralMember,
   localReceiverTypePatterns,
   normalizeInferredTypeName,
 } from './name-matcher';
@@ -26,7 +28,7 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   // module-entry convention, hit when a bare workspace import ("data") is
   // rewritten to the member's directory; lowercase variants for safety.
   arkts: ['.ets', '.ts', '.d.ts', '.js', '/Index.ets', '/index.ets', '/index.ts', '/index.js'],
-  javascript: ['.js', '.jsx', '.mjs', '.cjs', '/index.js', '/index.jsx'],
+  javascript: ['.js', '.jsx', '.mjs', '.cjs', '.xsjs', '.xsjslib', '/index.js', '/index.jsx'],
   tsx: ['.tsx', '.ts', '.d.ts', '.js', '.jsx', '/index.tsx', '/index.ts', '/index.js'],
   jsx: ['.jsx', '.js', '/index.jsx', '/index.js'],
   // SFC consumers import plain TS/JS, sibling components, and barrels
@@ -78,6 +80,27 @@ interface FileExportIndex {
   byName: Map<string, Node>;
   defaultComponent: Node | undefined;
   defaultFnClass: Node | undefined;
+  /**
+   * The node an `export default NAME` statement names, exported at its
+   * declaration or not — the precise answer where `defaultFnClass` is a
+   * guess. `const Home = () => …; export default Home` and the namespace
+   * object `const UploadApi = { uploadARCapture }; export default UploadApi`
+   * are both invisible to the `isExported` index above: neither declaration
+   * has an `export_statement` ancestor.
+   */
+  defaultBinding: Node | undefined;
+}
+
+const DEFAULT_BINDING_KINDS = new Set<string>(['function', 'class', 'component', 'constant', 'variable']);
+const DEFAULT_EXPORT_BINDING_RE = /^[ \t]*export\s+default\s+([A-Za-z_$][\w$]*)\s*;?[ \t]*$/m;
+const JS_FAMILY_FILE = /\.(?:[cm]?[jt]sx?)$/;
+
+/** The identifier `export default NAME` names in a JS-family file, or null. */
+function defaultExportBinding(filePath: string, context: ResolutionContext): string | null {
+  if (!JS_FAMILY_FILE.test(filePath)) return null;
+  const source = context.readFile(filePath);
+  if (!source || !source.includes('export default')) return null;
+  return source.match(DEFAULT_EXPORT_BINDING_RE)?.[1] ?? null;
 }
 const fileExportIndexes = new WeakMap<ResolutionContext, Map<string, FileExportIndex>>();
 
@@ -89,12 +112,34 @@ function getFileExportIndex(filePath: string, context: ResolutionContext): FileE
   }
   let idx = perFile.get(filePath);
   if (!idx) {
-    idx = { byName: new Map(), defaultComponent: undefined, defaultFnClass: undefined };
-    for (const n of context.getNodesInFile(filePath)) {
+    idx = { byName: new Map(), defaultComponent: undefined, defaultFnClass: undefined, defaultBinding: undefined };
+    const nodesInFile = context.getNodesInFile(filePath);
+    // Every declaration, exported or not: a local `export { impl as alias }`
+    // clause exports a declaration the extractor never flagged isExported.
+    const declared = new Map<string, Node>();
+    for (const n of nodesInFile) {
+      if (!declared.has(n.name)) declared.set(n.name, n);
       if (!n.isExported) continue;
       if (!idx.byName.has(n.name)) idx.byName.set(n.name, n);
       if (idx.defaultComponent === undefined && n.kind === 'component') idx.defaultComponent = n;
       if (idx.defaultFnClass === undefined && (n.kind === 'function' || n.kind === 'class')) idx.defaultFnClass = n;
+    }
+    const bound = defaultExportBinding(filePath, context);
+    if (bound !== null) {
+      idx.defaultBinding = nodesInFile
+        .filter((n) => n.name === bound && DEFAULT_BINDING_KINDS.has(n.kind))
+        .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0];
+    }
+    // Bind names introduced by a local export clause to their declarations, so
+    // an importer asking for the renamed name gets the real symbol instead of
+    // falling through to the name-matcher (which cannot cross the rename).
+    const content = context.readFile(filePath);
+    if (content && content.includes('export')) {
+      for (const { exportedName, localName } of extractLocalExportAliases(content)) {
+        if (idx.byName.has(exportedName)) continue;
+        const decl = declared.get(localName);
+        if (decl) idx.byName.set(exportedName, decl);
+      }
     }
     perFile.set(filePath, idx);
   }
@@ -288,6 +333,21 @@ const C_CPP_STDLIB_HEADERS = new Set([
 ]);
 
 /**
+ * Languages whose imports are ES-module specifiers, extracted by
+ * `extractJSImports` and therefore classified by the same bare-specifier /
+ * alias / workspace rules. Svelte, Vue and Astro belong here: an SFC imports
+ * inside its `<script>` block (Astro: the `---` frontmatter) with exactly the
+ * same syntax, and leaving them out made `isExternalImport` answer "not
+ * external" for every npm specifier in an SFC.
+ */
+const ESM_IMPORT_LANGUAGES = new Set<Language>([
+  'typescript', 'tsx', 'javascript', 'jsx', 'arkts', 'svelte', 'vue', 'astro',
+]);
+
+/** Rust path roots that always name a standard-library crate. */
+const RUST_STDLIB_ROOTS = new Set(['std', 'core', 'alloc', 'proc_macro']);
+
+/**
  * Check if an import is external (npm package, etc.)
  *
  * `context` is consulted for project-defined path aliases
@@ -315,7 +375,7 @@ function isExternalImport(
   }
 
   // Common external patterns
-  if (language === 'typescript' || language === 'javascript' || language === 'tsx' || language === 'jsx' || language === 'arkts') {
+  if (ESM_IMPORT_LANGUAGES.has(language)) {
     // Node built-ins
     if (['fs', 'path', 'os', 'crypto', 'http', 'https', 'url', 'util', 'events', 'stream', 'child_process', 'buffer'].includes(importPath)) {
       return true;
@@ -423,8 +483,48 @@ function resolveRelativeImport(
     return relativePath;
   }
 
+  return findSourceForEmittedSpecifier(relativePath, language, context);
+}
+
+/**
+ * TypeScript under `moduleResolution: node16 | nodenext | bundler` writes the
+ * EMITTED extension in the specifier (`import x from './util.js'` for
+ * `util.ts`, `.mjs` for `.mts`, `.cjs` for `.cts`), and the source file with that
+ * exact name never exists in the repo. Without this remap the import resolver
+ * returned null for every such import, so each imported name fell through to
+ * bare-name matching: a method wrapping the same-named helper it imports
+ * (`renderDockStyles() { return renderDockStyles() }`) resolved to ITSELF, and
+ * any repo-wide same-named symbol could win the cross-module edge.
+ */
+const EMITTED_TO_SOURCE_EXTENSIONS: ReadonlyArray<readonly [RegExp, readonly string[]]> = [
+  [/\.js$/, ['.ts', '.tsx', '.d.ts']],
+  [/\.jsx$/, ['.tsx']],
+  [/\.mjs$/, ['.mts', '.d.mts']],
+  [/\.cjs$/, ['.cts', '.d.cts']],
+];
+
+function findSourceForEmittedSpecifier(
+  relativePath: string,
+  language: Language,
+  context: ResolutionContext
+): string | null {
+  if (!EMITTED_SPECIFIER_LANGUAGES.has(language)) return null;
+  for (const [emitted, sources] of EMITTED_TO_SOURCE_EXTENSIONS) {
+    if (!emitted.test(relativePath)) continue;
+    const stem = relativePath.replace(emitted, '');
+    for (const ext of sources) {
+      const candidate = stem + ext;
+      if (context.fileExists(candidate)) return candidate;
+    }
+    return null;
+  }
   return null;
 }
+
+/** Languages whose import specifiers can name the emitted `.js` of a `.ts` source. */
+const EMITTED_SPECIFIER_LANGUAGES: ReadonlySet<string> = new Set([
+  'typescript', 'tsx', 'javascript', 'jsx', 'vue', 'svelte', 'astro', 'arkts',
+]);
 
 /**
  * Resolve an aliased/absolute import.
@@ -450,7 +550,7 @@ function resolveAliasedImport(
       if (context.fileExists(candidate)) return candidate;
     }
     if (context.fileExists(basePath)) return basePath;
-    return null;
+    return findSourceForEmittedSpecifier(basePath, language, context);
   };
 
   // 1. Project tsconfig/jsconfig paths.
@@ -1304,6 +1404,47 @@ function pickClosestJvmCandidate(candidates: Node[], fromPath: string): Node {
   return best;
 }
 
+/**
+ * PHP scoped calls are encoded as "Alias.method" by both extractors. A use
+ * mapping names a namespace, not a filesystem path, so resolve the receiver
+ * through its localName and look up the method on that exact imported type.
+ * undefined means this is not an imported static call; null means the import
+ * owns the call but its method is unavailable, so name fallbacks must not guess.
+ */
+export function resolvePhpImportedStaticCall(
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null | undefined {
+  if (ref.language !== 'php' || ref.referenceKind !== 'calls') return undefined;
+  const call = /^(\w+)\.(\w+)$/.exec(ref.referenceName);
+  if (!call) return undefined;
+  const [, receiver, member] = call;
+  const imp = context.getImportMappings(ref.filePath, ref.language)
+    .find((i) => i.localName === receiver);
+  if (!imp) return undefined;
+
+  // PHP variables occupy a different namespace from class imports. Extraction
+  // strips the leading "$" from "$Alias->method()" too; leave that receiver to
+  // local type inference even when a class import has the same local name.
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split('\n');
+  const line = lines?.[ref.line - 1];
+  if (line?.slice(ref.column).startsWith('$')) return undefined;
+
+  const fqn = imp.source.replace(/^\\/, '');
+  const separator = fqn.lastIndexOf('\\');
+  const typeName = separator < 0
+    ? fqn
+    : `${fqn.slice(0, separator)}::${fqn.slice(separator + 1)}`;
+  const owners = context.getNodesByQualifiedName(typeName)
+    .filter((n) => n.language === 'php' && STATIC_MEMBER_CONTAINERS.has(n.kind));
+  if (owners.length !== 1) return null;
+  const owner = owners[0]!;
+  const methods = context.getNodesByQualifiedName(`${owner.qualifiedName}::${member}`)
+    .filter((n) => n.language === 'php' && n.kind === 'method' && n.filePath === owner.filePath);
+  if (methods.length !== 1) return null;
+  return { original: ref, targetNodeId: methods[0]!.id, confidence: 0.95, resolvedBy: 'import' };
+}
+
 export function resolveViaImport(
   ref: UnresolvedRef,
   context: ResolutionContext
@@ -1545,6 +1686,22 @@ export function resolveViaImport(
                 resolvedBy: 'import',
               };
             }
+            // An imported object literal used as a namespace (#1573):
+            // `api.call()` after `import { api } from './api'` where `api` is
+            // `export const api = { call() {…} }`. Its members have bare
+            // qualified names inside the constant's extent, so the
+            // `Container::member` lookup above can't see them and the edge
+            // landed on the constant — every cross-file caller of the method
+            // went missing. Resolve the member by containment instead.
+            if (targetNode.kind === 'constant' || targetNode.kind === 'variable') {
+              const member = ref.referenceName.slice(imp.localName.length + 1).split('.')[0];
+              if (member) {
+                const literalMember = resolveObjectLiteralMember(targetNode, member, ref, context, 0.9, 'import');
+                if (literalMember) return literalMember;
+                const aliasMember = resolveObjectLiteralAlias(targetNode, member, ref, context);
+                if (aliasMember) return aliasMember;
+              }
+            }
             // An imported VALUE (singleton constant / shared instance) called
             // through a member: `reproStore.notifyJoinGuildStatus()` after
             // `import { reproStore } from './store'`. findExportedSymbol
@@ -1607,11 +1764,19 @@ function resolvePythonModuleMember(
     // `import mod` / `import numpy as np` bind the module at `source` itself;
     // `from . import certs` / `from pkg import mod` bind a SUBMODULE whose
     // dotted path is the source joined with the imported name.
+    //
+    // Join with the EXPORTED name, not the local one: under
+    // `from pkg import mod as alias` the receiver is `alias` but the module on
+    // disk is `pkg.mod`, and building `pkg.alias` looked for a file that does
+    // not exist — so the aliased form dropped its `calls` edge while the plain
+    // form (where the two names coincide) worked (#1626). For an unaliased
+    // import the two are identical, so this changes nothing there.
+    const moduleName = imp.exportedName === '*' ? imp.localName : imp.exportedName;
     const modulePath = imp.isNamespace
       ? imp.source
       : imp.source.endsWith('.')
-        ? imp.source + imp.localName
-        : imp.source + '.' + imp.localName;
+        ? imp.source + moduleName
+        : imp.source + '.' + moduleName;
 
     // resolveImportPath only maps RELATIVE dotted paths (`.mod`, `..pkg.mod`); an
     // ABSOLUTE package path (`pkg.module` from `from pkg import module`, or a bare
@@ -1702,6 +1867,80 @@ function resolveLuaRequire(ref: UnresolvedRef, context: ResolutionContext): Reso
   return null;
 }
 
+/**
+ * `UploadApi.uploadARCapture()` where `UploadApi` is a NAMESPACE OBJECT — the
+ * default-export façade most React Native API layers are written as:
+ *
+ *   import { uploadARCapture } from './frames'
+ *   const UploadApi = { uploadARCapture, createFolder }
+ *   export default UploadApi
+ *
+ * The member is a shorthand (or `key: ident`) property whose value is a
+ * binding of the object's file, not a function defined inside the literal,
+ * so containment (`resolveObjectLiteralMember`) finds nothing and the call
+ * landed on the constant — every cross-file caller of the API function went
+ * missing. Read the literal's source, take the binding the member names, and
+ * resolve it where the object's file would: a symbol declared there, else
+ * through its own imports. Calls accept callable targets only.
+ */
+function resolveObjectLiteralAlias(
+  container: Node,
+  member: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): ResolvedRef | null {
+  if (container.kind !== 'constant' && container.kind !== 'variable') return null;
+  if (!JS_FAMILY_FILE.test(container.filePath)) return null;
+  if (!/^[A-Za-z_$][\w$]*$/.test(member)) return null;
+  const lines = context.getFileLines?.(container.filePath) ?? context.readFile(container.filePath)?.split('\n');
+  if (!lines) return null;
+  const extent = lines.slice(container.startLine - 1, container.endLine).join('\n');
+  const brace = extent.indexOf('{');
+  if (brace < 0) return null;
+  const body = extent.slice(brace);
+  const keyed = new RegExp(`[{,\\s]${member}\\s*:\\s*([A-Za-z_$][\\w$]*)\\s*[,}]`);
+  const shorthand = new RegExp(`[{,\\s]${member}\\s*[,}]`);
+  const k = body.match(keyed);
+  const binding = k ? k[1]! : shorthand.test(body) ? member : null;
+  if (binding === null) return null;
+
+  const callable = (n: Node) => n.kind === 'function' || n.kind === 'method' || n.kind === 'class';
+  const accepts =
+    ref.referenceKind === 'calls'
+      ? callable
+      : (n: Node) => callable(n) || n.kind === 'constant' || n.kind === 'variable' || n.kind === 'component';
+
+  // Declared in the object's own file, outside the literal.
+  const local = context
+    .getNodesInFile(container.filePath)
+    .filter((n) => n.name === binding && n.id !== container.id && accepts(n))
+    .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0];
+  if (local) return { original: ref, targetNodeId: local.id, confidence: 0.9, resolvedBy: 'import' };
+
+  // Imported into the object's file.
+  for (const imp of context.getImportMappings(container.filePath, container.language)) {
+    if (imp.localName !== binding || imp.isNamespace) continue;
+    const resolvedPath = resolveImportPath(imp.source, container.filePath, container.language, context);
+    if (!resolvedPath) continue;
+    const target = findExportedSymbol(
+      resolvedPath,
+      {
+        isDefault: imp.isDefault,
+        isNamespace: false,
+        exportedName: imp.isDefault ? 'default' : imp.exportedName,
+        memberName: null,
+      },
+      container.language,
+      context,
+      new Set()
+    );
+    if (target && accepts(target)) {
+      return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
+    }
+  }
+  return null;
+}
+
 function resolveModuleImportToFile(
   ref: UnresolvedRef,
   imports: ImportMapping[],
@@ -1725,9 +1964,12 @@ function resolveModuleImportToFile(
       modulePath = imp.source;
     } else if (ref.language === 'python') {
       // `from . import certs` — the imported NAME is a submodule of the source.
+      // As in resolvePythonModuleMember, use the exported name so an alias
+      // still links to the real module file (#1626).
+      const moduleName = imp.exportedName === '*' ? imp.localName : imp.exportedName;
       modulePath = imp.source.endsWith('.')
-        ? imp.source + imp.localName
-        : imp.source + '.' + imp.localName;
+        ? imp.source + moduleName
+        : imp.source + '.' + moduleName;
     } else {
       // A named TS/JS import binds a symbol, not a module — leave it alone.
       continue;
@@ -1827,6 +2069,7 @@ function resolveRustPathReference(
       n.name === leaf &&
       (n.kind === 'function' ||
         n.kind === 'struct' ||
+        n.kind === 'union' ||
         n.kind === 'enum' ||
         n.kind === 'trait' ||
         n.kind === 'type_alias' ||
@@ -2136,7 +2379,9 @@ function findExportedSymbolWalk(
     // `.ts`/`.tsx` `export default fn`/`class` case. Without the component
     // branch, an `export { default as X } from './X.svelte'` barrel never
     // resolves and the component shows a false 0 callers (#629).
-    const direct = exportIndex.defaultComponent ?? exportIndex.defaultFnClass;
+    // A component file IS its default export; otherwise the statement that
+    // names the binding beats the first-exported-function guess.
+    const direct = exportIndex.defaultComponent ?? exportIndex.defaultBinding ?? exportIndex.defaultFnClass;
     if (direct) return direct;
   } else if (want.isNamespace && want.memberName) {
     const direct = exportIndex.byName.get(want.memberName);
@@ -2191,7 +2436,7 @@ function findExportedSymbolWalk(
 
 /** Node kinds that own static members reachable as `Container.member`. */
 const STATIC_MEMBER_CONTAINERS = new Set<Node['kind']>([
-  'class', 'struct', 'interface', 'enum', 'trait', 'protocol',
+  'class', 'struct', 'union', 'interface', 'enum', 'trait', 'protocol',
 ]);
 
 /**
@@ -2272,4 +2517,124 @@ function resolveStaticMember(
     if (callable) return callable;
   }
   return candidates[0];
+}
+
+/**
+ * Rust `use` declarations, flattened to `localName → full path`.
+ *
+ * Rust is the one supported language with NO `ImportMapping` extraction (see
+ * `extractImportMappings`), so this is the only channel that can tell whether
+ * a bare type name in a Rust file was brought in by a `use`. Handles nested
+ * groups (`use a::{b::C, d as E}`), globs (skipped — they bind no single
+ * name), and `as` aliases.
+ */
+function collectRustUseBindings(content: string): Map<string, string> {
+  const out = new Map<string, string>();
+
+  // Expand one level of `{...}` at a time so `a::{b::{C, D}, E}` flattens.
+  const expand = (spec: string): string[] => {
+    const open = spec.indexOf('{');
+    if (open === -1) return [spec.trim()];
+    const prefix = spec.slice(0, open);
+    let depth = 0;
+    let close = -1;
+    for (let i = open; i < spec.length; i++) {
+      if (spec[i] === '{') depth++;
+      else if (spec[i] === '}') {
+        depth--;
+        if (depth === 0) { close = i; break; }
+      }
+    }
+    if (close === -1) return [];
+    const suffix = spec.slice(close + 1);
+    const inner = spec.slice(open + 1, close);
+    const parts: string[] = [];
+    let depth2 = 0;
+    let start = 0;
+    for (let i = 0; i <= inner.length; i++) {
+      const ch = inner[i];
+      if (ch === '{') depth2++;
+      else if (ch === '}') depth2--;
+      if (i === inner.length || (ch === ',' && depth2 === 0)) {
+        const seg = inner.slice(start, i).trim();
+        if (seg) parts.push(seg);
+        start = i + 1;
+      }
+    }
+    return parts.flatMap((p) => expand(prefix + p + suffix));
+  };
+
+  // `use` items end at the first `;`. Attributes/visibility (`pub use`) are
+  // irrelevant to the binding itself.
+  const useRe = /(^|\n)\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([^;]+);/g;
+  let m: RegExpExecArray | null;
+  while ((m = useRe.exec(content)) !== null) {
+    for (const spec of expand(m[2]!.replace(/\s+/g, ' '))) {
+      const aliasMatch = /^(.*?)\s+as\s+([A-Za-z_]\w*)$/.exec(spec);
+      const rawPath = (aliasMatch ? aliasMatch[1]! : spec).trim();
+      if (!rawPath || rawPath.endsWith('*')) continue;
+      const segments = rawPath.split('::').map((s) => s.trim()).filter(Boolean);
+      const leaf = segments[segments.length - 1];
+      if (!leaf) continue;
+      const local = aliasMatch ? aliasMatch[2]! : leaf;
+      out.set(local, segments.join('::'));
+    }
+  }
+  return out;
+}
+
+/**
+ * Is `name`, as used in `ref`'s file, bound by an import whose module lives
+ * OUTSIDE the repository?
+ *
+ * When it is, no in-repo node can be the referent: the symbol is defined in a
+ * third-party crate/package, and any same-named local symbol the name-matcher
+ * finds is a coincidence. Rust `use std::error::Error;` + `impl Error for
+ * MapperError {}` bound to a local `MapperError::Error` variant, and once
+ * non-type kinds were filtered out it simply moved to an unrelated local
+ * `type Error` alias — restricting kinds alone RELOCATES the false edge
+ * instead of removing it, so locality has to be checked too.
+ *
+ * Answers only when it can be CERTAIN, because a false "yes" deletes a real
+ * edge. Two languages qualify, each with an oracle that cannot be wrong:
+ *
+ *  - **Rust** — the `use` path is rooted at a standard-library crate
+ *    (`std`/`core`/`alloc`/`proc_macro`), which by definition ships outside
+ *    any repository. Deliberately NOT generalized to "the module path doesn't
+ *    resolve to a file": a crate can re-export another workspace crate's
+ *    modules (`pub use pupil_core::{ports, domain};`), so `crate::ports::X`
+ *    has no `src/ports/` directory to walk yet is entirely in-repo — that
+ *    generalization measured 13 real trait implementations deleted.
+ *  - **ES modules** — `isExternalImport`, which already accounts for tsconfig
+ *    path aliases and monorepo workspace packages.
+ *
+ * Everything else returns false and resolves exactly as before. JVM and Python
+ * imports notably do NOT go through `resolveImportPath` (they have dedicated
+ * FQN/module matchers), so there is no trustworthy oracle to consult here.
+ */
+export function isBoundToOutOfRepoImport(
+  ref: UnresolvedRef,
+  context: ResolutionContext
+): boolean {
+  const name = ref.referenceName;
+  if (name.includes('::') || name.includes('.')) return false; // qualified refs resolve by path
+
+  if (ref.language === 'rust') {
+    const content = context.readFile(ref.filePath);
+    if (!content) return false;
+    const usePath = collectRustUseBindings(content).get(name);
+    if (!usePath) return false;
+    const segments = usePath.split('::');
+    if (segments.length < 2 || !RUST_STDLIB_ROOTS.has(segments[0]!)) return false;
+    // 2015-edition crate-relative paths can shadow a stdlib root with a local
+    // module of the same name — if the path walks to a real file, it's local.
+    return resolveRustModuleFile(segments.slice(0, -1), ref.filePath, context) === null;
+  }
+
+  if (!ESM_IMPORT_LANGUAGES.has(ref.language)) return false;
+  for (const imp of context.getImportMappings(ref.filePath, ref.language)) {
+    if (imp.localName !== name) continue;
+    return isExternalImport(imp.source, ref.language, context);
+  }
+  return false;
 }

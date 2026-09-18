@@ -14,6 +14,7 @@ You've got CodeGraph installed and a graph built. Here's where to go next.
 ## Put it to work
 
 - [Indexing a Project](/codegraph/guides/indexing/) — full index, incremental sync, and the file watcher.
+- [Reading Your Graph in the Browser](/codegraph/guides/viewer/) — `codegraph ui`: callers, source and callees on one screen.
 - [Framework Routes](/codegraph/guides/framework-routes/) — link URL patterns to their handlers.
 - [Affected Tests in CI](/codegraph/guides/affected-tests/) — run only the tests a change touches.
 

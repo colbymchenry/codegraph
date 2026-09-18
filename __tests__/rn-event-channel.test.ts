@@ -158,3 +158,71 @@ export function onMessage(listener: (m: any) => void) {
     expect(rows[0].target_name).toBe('onBattery');
   });
 });
+
+describe('RN event channel synthesizer — inline listeners', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rn-event-inline-'));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('attributes an inline arrow listener to the enclosing component, from a Swift sendEvent(withName:)', async () => {
+    fs.writeFileSync(path.join(dir, 'package.json'), '{"name":"x","dependencies":{"react-native":"^0.76"}}');
+    fs.writeFileSync(
+      path.join(dir, 'CaptureEvents.swift'),
+      `import Foundation
+class CaptureEvents: RCTEventEmitter {
+  func emitZipComplete() {
+    sendEvent(withName: "onZipComplete", body: ["ok": true])
+  }
+  func emitProgress() {
+    sendEvent(withName: "onCaptureProgress", body: nil)
+  }
+}
+`
+    );
+    fs.writeFileSync(
+      path.join(dir, 'App.tsx'),
+      `import { useEffect } from 'react'
+export default function ReviewScreen() {
+  useEffect(() => {
+    const zip = nativeEmitter.addListener('onZipComplete', (data) => {
+      upload(data)
+    })
+    const progress = nativeEmitter.addListener('onCaptureProgress', async function () {
+      await tick()
+    })
+    return () => {
+      zip.remove()
+      progress.remove()
+    }
+  }, [])
+  return null
+}
+function upload(d: unknown) {}
+function tick() {}
+`
+    );
+
+    const cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const db = (cg as any).db.db;
+    const rows = db
+      .prepare(
+        `SELECT s.name source_name, t.name target_name, json_extract(e.metadata,'$.event') event,
+                json_extract(e.metadata,'$.registeredAt') registered_at
+         FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+         WHERE json_extract(e.metadata,'$.synthesizedBy') = 'rn-event-channel'
+         ORDER BY event`
+      )
+      .all();
+    cg.close?.();
+    expect(rows.map((r: any) => [r.source_name, r.target_name, r.event])).toEqual([
+      ['emitProgress', 'ReviewScreen', 'onCaptureProgress'],
+      ['emitZipComplete', 'ReviewScreen', 'onZipComplete'],
+    ]);
+    expect(rows[1].registered_at).toBe('App.tsx:4');
+  });
+});

@@ -8,11 +8,15 @@
  * logic), since the end-to-end hook is validated by a live agent run, not a
  * unit test.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { planFrontload, findIndexedSubprojectRoots, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens } from '../src/directory';
+import { planFrontload, findIndexedSubprojectRoots, unsafeIndexRootReason, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens, PROMPT_HOOK_INJECTION_MAX, CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT, capPromptHookInjection } from '../src/directory';
+
+// Make the built-in exports configurable so HOME can point at a real temp
+// fixture without changing the process environment or the user's home files.
+vi.mock('os', async (importOriginal) => ({ ...await importOriginal<typeof import('os')>() }));
 
 /** Make `dir` look indexed (isInitialized needs `.codegraph/codegraph.db`). */
 function mkIndexed(dir: string): string {
@@ -30,7 +34,10 @@ function mkWorkspaceRoot(dir: string): string {
 describe('planFrontload — front-load hook project resolution (#964)', () => {
   let tmp: string;
   beforeEach(() => { tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-frontload-'))); });
-  afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
 
   it('cwd is itself indexed → front-load cwd (the common single-project case)', () => {
     mkIndexed(tmp);
@@ -90,6 +97,29 @@ describe('planFrontload — front-load hook project resolution (#964)', () => {
     const plan = planFrontload(tmp, 'how does it work');
     expect(plan.exploreRoot).toBeNull();
     expect(plan.nudgeProjects).toEqual([]);
+  });
+
+  it.each([
+    { root: 'home', manifest: 'package.json', children: 1 },
+    { root: 'home', manifest: 'package.json', children: 2 },
+    { root: 'home', manifest: 'WORKSPACE', children: 1 },
+    { root: 'parent of home', manifest: 'package.json', children: 1 },
+  ])('$root with stray $manifest and $children indexed children → no-op (#1454)', ({ root, manifest, children }) => {
+    const homeDir = root === 'home' ? tmp : path.join(tmp, 'user');
+    fs.mkdirSync(homeDir, { recursive: true });
+    vi.spyOn(os, 'homedir').mockReturnValue(homeDir);
+    if (manifest === 'package.json') mkWorkspaceRoot(tmp);
+    else fs.mkdirSync(path.join(tmp, manifest)); // Even a WORKSPACE directory opens the manifest gate.
+    mkIndexed(path.join(tmp, 'packages', 'api'));
+    if (children === 2) mkIndexed(path.join(tmp, 'packages', 'web'));
+    expect(unsafeIndexRootReason(tmp)).toBe(root === 'home' ? 'your home directory' : 'a parent of your home directory');
+
+    expect(planFrontload(tmp, 'how does authentication work end to end?')).toEqual({
+      exploreRoot: null,
+      nudgeProjects: [],
+      viaSubScan: false,
+    });
+    expect(findIndexedSubprojectRoots(tmp)).toEqual([]);
   });
 
   it('nothing indexed anywhere → no-op', () => {
@@ -319,5 +349,30 @@ describe('isStructuralPrompt — cheap candidate gate (keyword OR code-token)', 
     expect(isStructuralPrompt('修复这个拼写错误')).toBe(false);
     expect(isStructuralPrompt('water the flower')).toBe(false);
     expect(isStructuralPrompt('')).toBe(false);
+  });
+});
+
+describe('prompt-hook injection cap (#1694)', () => {
+  it('PROMPT_HOOK_INJECTION_MAX stays under Claude Code\'s 10k inline hook-output limit', () => {
+    expect(PROMPT_HOOK_INJECTION_MAX).toBe(9000);
+    expect(CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT).toBe(10_000);
+    expect(PROMPT_HOOK_INJECTION_MAX).toBeLessThan(CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT);
+    // Leave headroom for the <codegraph_context> wrapper + projectPath nudge lines.
+    expect(CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT - PROMPT_HOOK_INJECTION_MAX).toBeGreaterThanOrEqual(500);
+  });
+
+  it('capPromptHookInjection leaves short payloads intact', () => {
+    expect(capPromptHookInjection('hello')).toBe('hello');
+    expect(capPromptHookInjection('x'.repeat(PROMPT_HOOK_INJECTION_MAX))).toBe('x'.repeat(PROMPT_HOOK_INJECTION_MAX));
+  });
+
+  it('capPromptHookInjection truncates oversize payloads with the explore notice', () => {
+    const over = 'a'.repeat(PROMPT_HOOK_INJECTION_MAX + 500);
+    const out = capPromptHookInjection(over);
+    expect(out.length).toBeLessThan(over.length);
+    expect(out.startsWith('a'.repeat(PROMPT_HOOK_INJECTION_MAX))).toBe(true);
+    expect(out).toContain('…(truncated; call codegraph_explore for the rest)');
+    // Capped body alone must still fit under the host inline limit.
+    expect(out.length).toBeLessThan(CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT);
   });
 });

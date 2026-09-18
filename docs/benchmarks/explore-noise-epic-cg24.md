@@ -52,13 +52,13 @@ change at all**.
 Deterministic across the 6-repo suite: no repo truncates, none loses a file,
 okhttp gains one, every repo lands at or under the 25,000 hard ceiling.
 
-## Open
+## Follow-up — CG-38 (closed)
 
-**CG-38** — agent-named symbols in the tail of a large file never render. On the
+**Agent-named symbols in the tail of a large file never rendered.** On the
 motivating repo, `queueMessage` (line 1087) and `flushQueuedMessages` (1102) in a
-1,414-line file are absent from the response on both prose and symbol-bag
-queries, even when that file wins rank #1 with 67% of the envelope. The response
-returns the `QueuedMessage` *interface* at line 70 — a fuzzy near-match on the
+1,414-line file were absent from the response on both prose and symbol-bag
+queries, even when that file won rank #1 with 67% of the envelope. The response
+returned the `QueuedMessage` *interface* at line 70 — a fuzzy near-match on the
 query token — instead of the function.
 
 **Pre-existing, not caused by this epic.** A controlled bisect (index held fixed,
@@ -67,15 +67,20 @@ lines here and CG-36 rendering 463; the symbols render at neither. The epic
 strictly improves the case. An earlier claim that the epic regressed it was
 wrong — it compared runs across two different indexes.
 
-Sharpest lead: an earlier index of the same repo with the `.d.ts` **not** flagged
-generated rendered 581 lines including both symbols on the pre-epic engine, where
-the current flagged index renders 12. A penalty on one file should not shrink an
-unrelated top-ranked file's render; `rankPenalty` scales `fileGraphScore`, which
-moves the relevance gate and reshuffles the admitted set.
+Two independent causes, both longstanding: `buildFlowFromNamedSymbols` discarded
+the named-symbol IDENTITY along with the narrative whenever the named symbols did
+not form a call chain, so the importance-9 injection never ran; and the ceiling
+trim cut in SOURCE order, so a named def at the end of a large file was always the
+first thing dropped. Full account, plus the ranker-penalty lead (real, and
+orthogonal — the defs are absent at both `generated` flag states on the old build
+and present at both on the new one): `explore-tail-render-cg38.md`.
 
 This epic's probes measure envelope share, starvation, source totals and file
-counts. **None measures "did the agent-named symbol render"** — which is why this
-survived the whole epic. CG-38 requires the fixture that closes that gap.
+counts. **None measured "did the agent-named symbol render"** — which is why this
+survived the whole epic. `scripts/agent-eval/probe-named-symbol.mjs`,
+`__tests__/fixtures/tail-render-ts` and
+`__tests__/explore-named-symbol-render.test.ts` close that gap: per-symbol and
+binary, checking the definition LINE against the response's rendered lines.
 
 CG-36's own measurement is worth carrying forward, because the issue named the wrong
 fix point: both real cases (`query.py`, `RealInterceptorChain.kt`) lost on

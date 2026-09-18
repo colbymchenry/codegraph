@@ -9,12 +9,12 @@
  * the valve's trigger/dedupe/backpressure logic, and the end-to-end indexAll
  * behavior (identical graph with and without deferral; interval restored).
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { DatabaseConnection } from '../src/db';
-import { WalCheckpointValve, resolveWalValveMb } from '../src/db/wal-valve';
+import { WalCheckpointValve, WalValveAbortError, resolveWalValveMb } from '../src/db/wal-valve';
 import CodeGraph from '../src/index';
 
 let tmpDir: string;
@@ -193,6 +193,20 @@ function writeFixtureProject(): void {
   }
 }
 
+
+async function seedPendingRefs(cg: CodeGraph): Promise<void> {
+  const raw = (cg as unknown as { db: DatabaseConnection }).db.getDb();
+  const node = raw.prepare("SELECT id, file_path FROM nodes WHERE kind = 'function' LIMIT 1").get() as
+    | { id: string; file_path: string }
+    | undefined;
+  expect(node).toBeDefined();
+  const ins = raw.prepare(
+    "INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, file_path, language, status) VALUES (?, ?, 'calls', 1, 0, ?, 'typescript', 'pending')"
+  );
+  ins.run(node!.id, 'helper0', node!.file_path);
+  ins.run(node!.id, 'helper1', node!.file_path);
+}
+
 describe('indexAll WAL deferral end-to-end', () => {
 
   it('produces the same graph with and without deferral, and restores the interval', async () => {
@@ -298,6 +312,35 @@ describe('sync WAL deferral end-to-end (#1248)', () => {
       delete process.env.CODEGRAPH_NO_WAL_DEFER;
     }
   });
+
+  it('applies WAL backpressure during changed-file storage and orphan resolution (#1539)', async () => {
+    writeFixtureProject();
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+    const backpressure = vi
+      .spyOn(WalCheckpointValve.prototype, 'backpressure')
+      .mockReturnValue(null);
+
+    try {
+      fs.writeFileSync(
+        path.join(tmpDir, 'src', 'mod0.ts'),
+        `export function fn0(x: number): number { return helper0(x) + 100; }\n` +
+        `function helper0(x: number): number { return x * 100; }\n`
+      );
+      const changed = await cg.sync();
+      expect(changed.filesModified).toBe(1);
+      expect(backpressure).toHaveBeenCalled();
+
+      backpressure.mockClear();
+      await seedPendingRefs(cg);
+      const recovered = await cg.sync();
+      expect(recovered.filesAdded + recovered.filesModified + recovered.filesRemoved).toBe(0);
+      expect(backpressure).toHaveBeenCalled();
+    } finally {
+      backpressure.mockRestore();
+      await cg.close();
+    }
+  });
 });
 
 describe('resolution-phase WAL backpressure plumbing (§7a.1)', () => {
@@ -307,19 +350,6 @@ describe('resolution-phase WAL backpressure plumbing (§7a.1)', () => {
   // a backfill and let the WAL wrap — a kernel-scale run without it grew a
   // 22GB WAL on a 4.6GB DB. These pin that the batch loop (a) calls the hook
   // at the pool-idle boundary and (b) actually parks on a returned promise.
-
-  async function seedPendingRefs(cg: CodeGraph): Promise<void> {
-    const raw = (cg as unknown as { db: DatabaseConnection }).db.getDb();
-    const node = raw.prepare("SELECT id, file_path FROM nodes WHERE kind = 'function' LIMIT 1").get() as
-      | { id: string; file_path: string }
-      | undefined;
-    expect(node).toBeDefined();
-    const ins = raw.prepare(
-      "INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, file_path, language, status) VALUES (?, ?, 'calls', 1, 0, ?, 'typescript', 'pending')"
-    );
-    ins.run(node!.id, 'helper0', node!.file_path);
-    ins.run(node!.id, 'helper1', node!.file_path);
-  }
 
   it('calls the backpressure hook once per settled batch', async () => {
     writeFixtureProject();
@@ -413,6 +443,65 @@ describe('valve file-size trigger (§7a.1: backfilled WAL still grows the file)'
     expect(sizeTrigger).not.toBeNull();
     await sizeTrigger;
     expect(db.getWalSizeBytes()).toBe(0);
+    db.close();
+  });
+});
+
+
+describe('WAL valve fail-closed (#1539)', () => {
+  it('aborts with WalValveAbortError when parked backfills cannot progress past the file cap', async () => {
+    const db = openDb();
+    db.setWalAutocheckpoint(0);
+    writeRows(db, 800); // well past a 0.5MB soft / 2MB file cap
+    expect(db.getWalSizeBytes()).toBeGreaterThan(2 * 1024 * 1024);
+
+    const valve = new WalCheckpointValve(db, 0.5);
+    // Simulate a reader pinning every PASSIVE/TRUNCATE attempt.
+    db.checkpointWalPassive = async () => ({ busy: 1, log: 100, checkpointed: 0 });
+    db.checkpointWalTruncate = async () => ({ busy: 1, log: 100, checkpointed: 0 });
+
+    const bp = valve.backpressure();
+    expect(bp).not.toBeNull();
+    await expect(bp!).rejects.toBeInstanceOf(WalValveAbortError);
+    try {
+      await bp!;
+    } catch (err) {
+      expect(err).toMatchObject({
+        name: 'WalValveAbortError',
+        code: 'WAL_VALVE_ABORT',
+      });
+      expect((err as WalValveAbortError).message).toMatch(/Aborting to avoid unbounded disk growth/);
+      expect((err as WalValveAbortError).walBytes).toBeGreaterThan((err as WalValveAbortError).fileCapBytes);
+    }
+    // Caps remain enforceable: a subsequent backpressure call still parks (no
+    // futility latch that returns null and lets the writer race past the cap).
+    const again = valve.backpressure();
+    expect(again).not.toBeNull();
+    await expect(again!).rejects.toBeInstanceOf(WalValveAbortError);
+    db.close();
+  });
+
+  it('aborts when checkpoint machinery is unavailable while over the file cap', async () => {
+    const db = openDb();
+    db.setWalAutocheckpoint(0);
+    writeRows(db, 800);
+    const valve = new WalCheckpointValve(db, 0.5);
+    db.checkpointWalPassive = async () => null;
+    const bp = valve.backpressure();
+    expect(bp).not.toBeNull();
+    await expect(bp!).rejects.toBeInstanceOf(WalValveAbortError);
+    db.close();
+  });
+
+  it('does not abort a soft foldNow give-up that stays under both caps', async () => {
+    const db = openDb();
+    db.setWalAutocheckpoint(0);
+    writeRows(db, 50); // small WAL
+    const valve = new WalCheckpointValve(db, 1024); // 1GB soft — hard 2GB, fileCap 4GB
+    db.checkpointWalPassive = async () => ({ busy: 1, log: 10, checkpointed: 0 });
+    // foldNow calls backfillFully even with modest growth; under caps this is soft.
+    await expect(valve.foldNow()).resolves.toBeUndefined();
+    expect(valve.backpressure()).toBeNull();
     db.close();
   });
 });

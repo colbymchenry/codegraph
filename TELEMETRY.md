@@ -26,7 +26,14 @@ toggle and never re-asks. If you never saw the installer (e.g. `npx` straight in
 a one-line notice is printed to stderr before the first time anything is sent.
 
 Off means off: when disabled, CodeGraph records nothing, opens no connection to the
-telemetry endpoint, and sends no "opted out" ping.
+telemetry endpoint, and sends no "opted out" ping. Running processes recheck the stored
+choice before recording, persisting, and each send. Turning it off removes the local
+identity and unsent queues (including claimed queues); turning it back on creates a new
+identity. An HTTP request already started cannot be recalled, but opt-out prevents later
+request chunks and prevents its unsent data from being requeued.
+
+Environment overrides still apply: `CODEGRAPH_TELEMETRY=1` explicitly forces telemetry
+on for that process even when the stored choice is off; `DO_NOT_TRACK=1` takes precedence.
 
 Separately from telemetry, the MCP server checks GitHub for a newer release in the
 background (at most once a day) so it can tell you an update exists — it fetches a
@@ -65,6 +72,18 @@ And one of four events:
 Usage is **aggregated locally into daily totals** before anything is sent — there is no
 per-call event stream, and nothing is sent in real time.
 
+### The browser viewer sends nothing
+
+`codegraph ui` (the local viewer) has no telemetry of its own. The server it starts
+makes no outbound connections at all, and the page in your browser talks only to that
+server on `127.0.0.1`: nothing about the symbols you open, the searches you type, or the
+path you walk leaves your machine, and none of it is recorded anywhere. The only thing
+telemetry ever learns about the viewer is what it learns about every command: that a
+command named `ui` was run, once, on a day, in the daily `usage_rollup` above. The
+command never triggers a send of its own, and `codegraph telemetry off`,
+`CODEGRAPH_TELEMETRY=0`, or `DO_NOT_TRACK=1` switches off even that count, as it does
+everything else on this page.
+
 ## What is never collected
 
 - **No source code.** No file paths, file names, directory names, repository names or
@@ -84,8 +103,8 @@ source lives in [`telemetry-worker/`](telemetry-worker/) in this repository. It 
 every event and property against the allowlist above (anything else is dropped), never
 reads the client IP, and rate-limits per machine ID. Sends are fire-and-forget with a
 short timeout: offline or air-gapped machines buffer a bounded local file (256 KB cap)
-and never retry-loop, log errors, or slow a command down. Telemetry never adds latency to
-MCP tool calls — recording is an in-memory counter.
+and never retry-loop, log errors, or slow a command down. Recording refreshes the small local consent file, then increments an in-memory counter;
+MCP tool calls never wait for telemetry network requests or queue writes.
 
 ## Where it is stored
 

@@ -20,6 +20,7 @@
  *   codegraph callees <symbol>   Find what a function/method calls
  *   codegraph impact <symbol>    Analyze what code is affected by changing a symbol
  *   codegraph affected [files]   Find test files affected by changes
+ *   codegraph ui [path]          Open the browser viewer for an indexed project (alias: web)
  *   codegraph upgrade [version]  Update CodeGraph to the latest release
  */
 
@@ -40,7 +41,7 @@ try {
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, hasStructuralKeyword, extractCodeTokens } from '../directory';
+import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection } from '../directory';
 import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
@@ -53,6 +54,14 @@ import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime
 import { installCommandSupervision } from './command-supervision';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
 import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
+// Value import, but dependency-free by design so `--help` text can name the
+// default port without dragging node:http into every other subcommand; the
+// server itself is loaded lazily inside the `ui` action. See ui-server/constants.
+import { BROWSER_ENV, DEFAULT_UI_PORT } from '../ui-server/constants';
+import type { UiServerHandle } from '../ui-server';
+import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../graph/symbol-lookup';
+import type { Node, Edge } from '../types';
+import { isTestPath } from '../search/query-utils';
 
 // Decided once, before `--color`/`--no-color` are stripped from argv below
 // (#1281). Piped/redirected stdout, NO_COLOR, or --no-color -> plain output.
@@ -356,6 +365,27 @@ function warn(message: string): void {
   console.log(chalk.yellow(getGlyphs().warn) + ' ' + message);
 }
 
+/** "not found" (+ optional did-you-mean) when no exact symbol matches. */
+function formatSymbolNotFound(symbol: string, fuzzyNames: string[]): string {
+  const suggestions = [...new Set(fuzzyNames.filter((n) => n !== symbol))].slice(0, 3);
+  if (suggestions.length === 0) return `Symbol "${symbol}" not found`;
+  return `Symbol "${symbol}" not found — did you mean: ${suggestions.join(', ')}?`;
+}
+
+/** Compact node shape retained by the CLI's existing JSON lists. */
+function cliNode(node: Node) {
+  return { name: node.name, kind: node.kind, filePath: node.filePath, startLine: node.startLine };
+}
+
+/** Attribute a group's edges to every overload of this definition. */
+function cliDefinition(group: Node[]) {
+  const head = group[0]!;
+  return {
+    definition: { ...cliNode(head), id: head.id, qualifiedName: head.qualifiedName, language: head.language },
+    roots: group.map((node) => node.id),
+  };
+}
+
 type IndexResult = {
   success: boolean;
   filesIndexed: number;
@@ -365,6 +395,8 @@ type IndexResult = {
   edgesCreated: number;
   errors: Array<{ message: string; filePath?: string; severity: string; code?: string }>;
   durationMs: number;
+  filesSkippedUnsupported?: number;
+  topUnsupportedExtensions?: { ext: string; count: number }[];
 };
 
 /**
@@ -372,6 +404,7 @@ type IndexResult = {
  */
 function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexResult, projectPath?: string): void {
   const hasErrors = result.filesErrored > 0;
+  const parseWarnings = result.errors.filter((e) => e.code === 'parse_error' && e.severity === 'warning');
 
   // Surface non-file-level failures (e.g. lock-acquisition failure
   // when another indexer is running) before the file-count branches.
@@ -397,6 +430,10 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
       clack.log.success(`Indexed ${formatNumber(result.filesIndexed)} files`);
     }
     clack.log.info(`${formatNumber(result.nodesCreated)} nodes, ${formatNumber(result.edgesCreated)} edges in ${formatDuration(result.durationMs)}`);
+    // Warning-only parse failures keep indexing successful, but must be visible.
+    for (const warning of parseWarnings) {
+      clack.log.warn(warning.message);
+    }
     // A PARTIAL index (files silently dropped mid-pipeline) must not pass
     // as a clean run — it's the difference between "indexed the repo" and
     // "indexed most of the repo, quietly". Only the completeness
@@ -405,8 +442,32 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
     for (const w of result.errors.filter((e) => e.code === 'index_partial')) {
       clack.log.warn(w.message);
     }
+    // Files salvaged from comment-stripped source after repeated parser
+    // failures are indexed but possibly incomplete — say so here, or the run
+    // reads as fully clean and the index quietly disagrees with a later
+    // re-parse of the same bytes (#1565).
+    const salvaged = result.errors.filter((e) => e.code === 'salvaged_stripped');
+    if (salvaged.length > 0) {
+      const sample = salvaged.slice(0, 3).map((e) => e.filePath).filter(Boolean).join(', ');
+      const more = salvaged.length > 3 ? ', ...' : '';
+      clack.log.warn(`${formatNumber(salvaged.length)} file(s) indexed from comment-stripped source after repeated parse failures ${getGlyphs().dash} symbols may be incomplete (${sample}${more})`);
+    }
   } else if (hasErrors) {
     clack.log.error(`Indexing failed ${getGlyphs().dash} all ${formatNumber(result.filesErrored)} files had errors`);
+  } else if (result.filesSkippedUnsupported) {
+    // A project CodeGraph has no grammar for used to be indistinguishable from
+    // an empty one: same message, same `complete` state, same exit 0. Say which
+    // files were there and that the graph is empty on purpose, so nobody — and
+    // no agent trusting the graph — reads silence as "this code doesn't exist"
+    // (#1502).
+    const top = (result.topUnsupportedExtensions ?? [])
+      .map(e => `${e.ext} (${formatNumber(e.count)})`)
+      .join(', ');
+    clack.log.warn(
+      `No supported source files found ${getGlyphs().dash} ${formatNumber(result.filesSkippedUnsupported)} file(s) present, none in a language CodeGraph indexes`
+      + (top ? `: ${top}` : '')
+    );
+    clack.log.info('CodeGraph is inactive for this workspace — searches will return nothing. Use your own file tools here.');
   } else {
     clack.log.warn('No files found to index');
   }
@@ -443,9 +504,16 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
       clack.log.info(`The index is fully usable ${getGlyphs().dash} only the failed files are missing.`);
     }
   } else if (projectPath) {
-    const logPath = path.join(getCodeGraphDir(projectPath), 'errors.log');
-    if (fs.existsSync(logPath)) {
-      fs.unlinkSync(logPath);
+    // No hard errors. Salvaged-file warnings still belong in the log — it
+    // carries the per-file detail behind the one-line summary above.
+    if (result.errors.some((e) => e.code === 'salvaged_stripped')) {
+      writeErrorLog(projectPath, result.errors);
+      clack.log.info('See .codegraph/errors.log for details');
+    } else {
+      const logPath = path.join(getCodeGraphDir(projectPath), 'errors.log');
+      if (fs.existsSync(logPath)) {
+        fs.unlinkSync(logPath);
+      }
     }
   }
 }
@@ -590,6 +658,100 @@ async function recordIndexTelemetry(
 // =============================================================================
 
 /**
+ * The `init` flow — shared by `codegraph init` and `codegraph install --init`
+ * (#1578): refuse an unsafe root, create `.codegraph/`, build the initial
+ * index under supervision, then the post-index offers. `yes` makes every
+ * offer non-interactive (defaults only), so a container / CI bootstrap never
+ * blocks on a prompt. An unsafe root sets `process.exitCode = 1` and returns
+ * (no `--force` is implied by any caller); an index failure exits 1.
+ */
+async function runInit(
+  projectPath: string,
+  options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean },
+): Promise<void> {
+  const clack = await importESM('@clack/prompts');
+
+  clack.intro('Initializing CodeGraph');
+
+  try {
+    // Refuse to index your home directory / a filesystem root — it pulls in
+    // caches, other projects, and your whole tree (a multi-GB index + watcher
+    // churn, and on pre-1.0 macOS a machine-crashing fd blowup, #845).
+    const unsafe = unsafeIndexRootReason(projectPath);
+    if (unsafe && !options.force) {
+      clack.log.error(`Refusing to initialize in ${projectPath} — it looks like ${unsafe}.`);
+      clack.log.info('Run this inside a specific project directory, or pass --force if you really mean to index everything under it.');
+      clack.outro('');
+      process.exitCode = 1;
+      return;
+    }
+
+    if (isInitialized(projectPath)) {
+      clack.log.warn(`Already initialized in ${projectPath}`);
+      clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
+      try {
+        const { offerWatchFallback } = await import('../installer');
+        await offerWatchFallback(clack, projectPath, { yes: options.yes });
+      } catch { /* non-fatal */ }
+      clack.outro('');
+      return;
+    }
+
+    const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
+    const cg = await CodeGraph.init(projectPath, { index: false });
+    clack.log.success(`Initialized in ${projectPath}`);
+
+    // Indexing runs by default now. The legacy -i/--index flag is still
+    // accepted (so existing muscle memory and scripts don't break) but is a
+    // no-op — initializing always builds the initial index.
+    // Supervise the index: self-terminate if orphaned or wedged (#999).
+    // The DB + WAL paths let the liveness watchdog tell a slow store on
+    // degraded storage from a true wedge (#1231).
+    // A closure so we can re-run the exact same supervised, progress-rendered
+    // index if the user opts gitignored child repos in below (#1156).
+    const dbPath = getDatabasePath(projectPath);
+    const runIndex = async (): Promise<IndexResult> => {
+      const supervision = installCommandSupervision('init', { progressPaths: [dbPath, `${dbPath}-wal`] });
+      try {
+        if (options.verbose) {
+          return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
+        }
+        process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
+        const progress = createShimmerProgress();
+        const r = await cg.indexAll({ onProgress: progress.onProgress });
+        await progress.stop();
+        return r;
+      } finally {
+        supervision.stop();
+      }
+    };
+    const result = await runIndex();
+    printIndexResult(clack, result, projectPath);
+    await recordIndexTelemetry(cg, result);
+
+    // An empty graph at a git super-repo usually means `.gitignore` excludes
+    // the child repos that hold the code — surface them and offer to opt in
+    // rather than leaving the user with a silent 0-node "Done". (#1156)
+    // Under --yes the offer prints its one-line opt-in snippet instead of
+    // prompting (same as a non-TTY run).
+    if (result.nodesCreated === 0) {
+      await offerIndexIgnoredRepos(clack, projectPath, runIndex, { interactive: !options.yes });
+    }
+
+    try {
+      const { offerWatchFallback } = await import('../installer');
+      await offerWatchFallback(clack, projectPath, { yes: options.yes });
+    } catch { /* non-fatal */ }
+
+    clack.outro('Done');
+    cg.destroy();
+  } catch (err) {
+    clack.log.error(`Failed: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+}
+
+/**
  * codegraph init [path]
  */
 program
@@ -598,86 +760,9 @@ program
   .option('-i, --index', 'Deprecated: indexing now runs by default; flag accepted for backward compatibility')
   .option('-f, --force', 'Initialize even if the path looks like your home directory or a filesystem root')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
-  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean }) => {
-    const projectPath = path.resolve(pathArg || process.cwd());
-    const clack = await importESM('@clack/prompts');
-
-    clack.intro('Initializing CodeGraph');
-
-    try {
-      // Refuse to index your home directory / a filesystem root — it pulls in
-      // caches, other projects, and your whole tree (a multi-GB index + watcher
-      // churn, and on pre-1.0 macOS a machine-crashing fd blowup, #845).
-      const unsafe = unsafeIndexRootReason(projectPath);
-      if (unsafe && !options.force) {
-        clack.log.error(`Refusing to initialize in ${projectPath} — it looks like ${unsafe}.`);
-        clack.log.info('Run this inside a specific project directory, or pass --force if you really mean to index everything under it.');
-        clack.outro('');
-        process.exitCode = 1;
-        return;
-      }
-
-      if (isInitialized(projectPath)) {
-        clack.log.warn(`Already initialized in ${projectPath}`);
-        clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
-        try {
-          const { offerWatchFallback } = await import('../installer');
-          await offerWatchFallback(clack, projectPath);
-        } catch { /* non-fatal */ }
-        clack.outro('');
-        return;
-      }
-
-      const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
-      const cg = await CodeGraph.init(projectPath, { index: false });
-      clack.log.success(`Initialized in ${projectPath}`);
-
-      // Indexing runs by default now. The legacy -i/--index flag is still
-      // accepted (so existing muscle memory and scripts don't break) but is a
-      // no-op — initializing always builds the initial index.
-      // Supervise the index: self-terminate if orphaned or wedged (#999).
-      // The DB + WAL paths let the liveness watchdog tell a slow store on
-      // degraded storage from a true wedge (#1231).
-      // A closure so we can re-run the exact same supervised, progress-rendered
-      // index if the user opts gitignored child repos in below (#1156).
-      const dbPath = getDatabasePath(projectPath);
-      const runIndex = async (): Promise<IndexResult> => {
-        const supervision = installCommandSupervision('init', { progressPaths: [dbPath, `${dbPath}-wal`] });
-        try {
-          if (options.verbose) {
-            return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
-          }
-          process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-          const progress = createShimmerProgress();
-          const r = await cg.indexAll({ onProgress: progress.onProgress });
-          await progress.stop();
-          return r;
-        } finally {
-          supervision.stop();
-        }
-      };
-      const result = await runIndex();
-      printIndexResult(clack, result, projectPath);
-      await recordIndexTelemetry(cg, result);
-
-      // An empty graph at a git super-repo usually means `.gitignore` excludes
-      // the child repos that hold the code — surface them and offer to opt in
-      // rather than leaving the user with a silent 0-node "Done". (#1156)
-      if (result.nodesCreated === 0) {
-        await offerIndexIgnoredRepos(clack, projectPath, runIndex, { interactive: true });
-      }
-
-      try {
-        const { offerWatchFallback } = await import('../installer');
-        await offerWatchFallback(clack, projectPath);
-      } catch { /* non-fatal */ }
-
-      clack.outro('Done');
-      cg.destroy();
-    } catch (err) {
-      clack.log.error(`Failed: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
-    }
+  .option('-y, --yes', 'Non-interactive: skip every prompt and take the defaults (for scripts / CI / container bootstraps)')
+  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean }) => {
+    await runInit(path.resolve(pathArg || process.cwd()), options);
   });
 
 /**
@@ -751,7 +836,13 @@ program
   .option('-q, --quiet', 'Suppress progress output')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
   .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean }) => {
-    const projectPath = resolveProjectPath(pathArg);
+    // An EXPLICIT path names the project to rebuild — it is never a hint to go
+    // looking for one. resolveProjectPath walks up to the nearest initialized
+    // ancestor, which is right for `codegraph query` run from a subdirectory,
+    // but for a full re-index it silently rebuilt the parent's graph under a
+    // normal "Done" when <path> had no index of its own (#1524). Only a bare
+    // `codegraph index` (cwd) may resolve upward.
+    const projectPath = pathArg ? path.resolve(pathArg) : resolveProjectPath();
 
     try {
       // Don't (re)index your home directory / a filesystem root (#845). --force
@@ -764,7 +855,12 @@ program
 
       if (!isInitialized(projectPath)) {
         error(`CodeGraph not initialized in ${projectPath}`);
-        info('Run "codegraph init" first');
+        const ancestor = pathArg ? resolveProjectPath(pathArg) : projectPath;
+        if (ancestor !== projectPath) {
+          info(`The nearest initialized project is ${ancestor} — pass that path to rebuild it, or run "codegraph init" in ${projectPath} to index it on its own.`);
+        } else {
+          info('Run "codegraph init" first');
+        }
         process.exit(1);
       }
 
@@ -1124,7 +1220,9 @@ program
 
       const limit = parseInt(options.limit || '10', 10);
       const rawResults = cg.searchNodes(search, {
-        limit,
+        // Fetch one extra row so the CLI can report a cut without changing the
+        // long-standing bare-array contract of `query --json` (#1639).
+        limit: limit + 1,
         kinds: options.kind ? [options.kind as any] : undefined,
       });
 
@@ -1132,14 +1230,18 @@ program
       // hand-written implementation before protobuf/gRPC scaffolding
       // when both share a name. See extraction/generated-detection.ts.
       const isGen = cg.generatedFilePredicate(rawResults.map((r) => r.node.filePath));
-      const results = [...rawResults].sort((a, b) => {
+      const rankedResults = [...rawResults].sort((a, b) => {
         const aGen = isGen(a.node.filePath) ? 1 : 0;
         const bGen = isGen(b.node.filePath) ? 1 : 0;
         return aGen - bGen;
       });
+      const truncated = rankedResults.length > limit;
+      const results = rankedResults.slice(0, limit);
+      const truncationMessage = `Results truncated at ${limit}; pass --limit to widen.`;
 
       if (options.json) {
         console.log(JSON.stringify(results, null, 2));
+        if (truncated) console.error(truncationMessage);
       } else {
         if (results.length === 0) {
           info(`No results found for "${search}"`);
@@ -1165,6 +1267,7 @@ program
             }
             console.log();
           }
+          if (truncated) console.log(chalk.dim(truncationMessage));
         }
       }
 
@@ -1212,6 +1315,65 @@ program
       if (result.isError) process.exit(1);
     } catch (err) {
       error(`Explore failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph context <task...>
+ *
+ * The CLI face of the public `buildContext` API (ContextBuilder): FTS entry
+ * points + graph expansion + code blocks, formatted as markdown or JSON.
+ * Advertised in the usage header since the first release but never actually
+ * registered (#1611); external integrations (e.g. Memorix) invoke it as
+ * `codegraph context --path <root> --format json --max-nodes 8 --no-code <task>`.
+ */
+program
+  .command('context <task...>')
+  .description('Build context for a task: relevant symbols, relationships, and code blocks')
+  .option('-p, --path <path>', 'Project path')
+  .option('-f, --format <format>', 'Output format: markdown or json', 'markdown')
+  .option('-n, --max-nodes <number>', 'Maximum number of symbols to include')
+  .option('--no-code', 'Omit code blocks (structure only)')
+  .action(async (taskParts: string[], options: { path?: string; format?: string; maxNodes?: string; code?: boolean }) => {
+    const projectPath = resolveProjectPath(options.path);
+
+    const format = options.format ?? 'markdown';
+    if (format !== 'markdown' && format !== 'json') {
+      error(`Unknown format "${options.format}" — use "markdown" or "json".`);
+      process.exit(1);
+    }
+    let maxNodes: number | undefined;
+    if (options.maxNodes !== undefined) {
+      maxNodes = parseInt(options.maxNodes, 10);
+      if (Number.isNaN(maxNodes) || maxNodes < 1) {
+        error(`--max-nodes expects a positive integer, got "${options.maxNodes}".`);
+        process.exit(1);
+      }
+    }
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+
+      const result = await cg.buildContext(taskParts.join(' '), {
+        format,
+        includeCode: options.code !== false,
+        ...(maxNodes !== undefined ? { maxNodes } : {}),
+      });
+
+      // Both supported formats return a formatted string; print it verbatim so
+      // `--format json` stays machine-parseable on stdout (error()/warnings go
+      // to stderr only).
+      console.log(typeof result === 'string' ? result : JSON.stringify(result, null, 2));
+      cg.destroy();
+    } catch (err) {
+      error(`Context build failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
   });
@@ -1313,8 +1475,11 @@ program
             const text = result.content[0]?.text ?? '';
             if (!result.isError && text.trim()) {
               // Cap the injection so a large-repo explore can't flood the prompt.
-              const MAX = 16000;
-              const body = text.length > MAX ? `${text.slice(0, MAX)}\n…(truncated; call codegraph_explore for the rest)` : text;
+              // Claude Code shows hook stdout inline only up to 10,000 characters;
+              // above that it persists the output to a file and the model sees a
+              // 2 KB preview (#1694). PROMPT_HOOK_INJECTION_MAX (9,000) leaves
+              // room for the wrapper and the projectPath nudge lines below.
+              const body = capPromptHookInjection(text);
               // For a front-loaded SUB-project, a follow-up explore needs its path.
               const more = plan.viaSubScan
                 ? `call codegraph_explore with projectPath: "${plan.exploreRoot}" for more`
@@ -1691,10 +1856,10 @@ program
   .aliases(['daemons'])
   .description('Manage running CodeGraph background daemons — pick one and press enter to stop it')
   .action(async () => {
-    const { listDaemons, stopDaemonAt, stopAllDaemons } = await import('../mcp/daemon-registry');
+    const { listVerifiedDaemons, stopDaemonAt, stopAllDaemons } = await import('../mcp/daemon-registry');
     const { runDaemonPicker } = await import('../mcp/daemon-manager');
 
-    const daemons = listDaemons();
+    const daemons = await listVerifiedDaemons();
     if (daemons.length === 0) {
       info('No CodeGraph daemons running.');
       return;
@@ -1717,7 +1882,7 @@ program
     const clack = await importESM('@clack/prompts');
     clack.intro('CodeGraph daemons');
     await runDaemonPicker({
-      list: listDaemons,
+      list: listVerifiedDaemons,
       stop: stopDaemonAt,
       stopAll: stopAllDaemons,
       cwdRoot,
@@ -1727,6 +1892,191 @@ program
       note: (m) => clack.log.success(m),
       done: (m) => clack.outro(m),
     });
+  });
+
+/**
+ * Print the "no index here" guidance.
+ *
+ * The viewer READS an index; it never builds one — indexing stays the user's
+ * decision, exactly as it is for the MCP tools. So a missing index is normal
+ * input, not a failure to apologize for: say what is missing, say the one
+ * command that fixes it, and never print a stack trace.
+ */
+function printNoIndexGuidance(projectPath: string): void {
+  error(`No CodeGraph index found for ${projectPath}`);
+  console.error('');
+  // getGlyphs() (not a literal em dash): a legacy Windows console decodes raw
+  // UTF-8 with its OEM codepage and renders one as mojibake (#168).
+  console.error(`  The viewer reads an index that already exists ${getGlyphs().dash} it never creates one.`);
+  console.error('  To index this project:');
+  console.error('');
+  console.error(`    ${chalk.cyan('codegraph init')}`);
+  console.error('');
+  console.error('  Already indexed somewhere else? Point the viewer at it:');
+  console.error('');
+  console.error(`    ${chalk.cyan('codegraph ui /path/to/indexed/project')}`);
+  console.error('');
+}
+
+/**
+ * codegraph ui [path]  (alias: web)
+ *
+ * The browser reader: serves the built viewer (`dist/viewer/`) over loopback
+ * and opens it. It opens the index for reading and never writes to it, never
+ * indexes, and never changes a line of the project's code. The single thing it
+ * writes is a trail the reader saved, as JSON under `.codegraph/ui/trails/`;
+ * `--read-only` turns even that off.
+ *
+ * Deliberately absent from TELEMETRY_FLUSH_COMMANDS above: the command's own
+ * banner tells the user nothing leaves their machine, so it must not be the
+ * thing that triggers a telemetry send. The usage count still buffers locally
+ * like every other quick command.
+ */
+program
+  .command('ui [path]')
+  .alias('web')
+  .description('Open the CodeGraph viewer in your browser — read your indexed project as a graph')
+  .option('--port <number>', `Port to listen on (default: ${DEFAULT_UI_PORT}, or the next free one)`)
+  .option('--no-open', 'Print the URL instead of opening a browser')
+  .option('--read-only', 'Refuse every write — saved trails can be opened but not saved or deleted')
+  .addHelpText(
+    'after',
+    `
+Examples:
+  $ codegraph ui                    Read the project you're standing in
+  $ codegraph ui ~/code/my-app      Read a specific indexed project
+  $ codegraph ui --port 8080        Use one specific port (fails if it's taken)
+  $ codegraph ui --no-open          Just print the URL (headless boxes, SSH)
+  $ codegraph web                   Same command under its alias
+
+Pick a symbol and you see who calls it on the left, its source in the middle,
+and what it calls on the right at the height of the line that calls it. Search
+with / (or Cmd-K), click a file path for the file's outline and its imports.
+
+Ask "how does execute reach getFile" (or "execute -> getFile") in the search
+box for the flow between two symbols: one card per hop, opened at the line that
+makes the next call, with dynamic-dispatch hops drawn dashed and named. The Map
+tab draws the whole project by module, with dependencies pointing down.
+
+Never opened this codebase before? The Entry points tab lists the routes with
+the symbols that serve them, the files that run something when they load, the
+tests, and what the most code depends on — and starts a flow from any of them.
+
+The page keeps up with the project while it is open: save a file and it says so
+within about a third of a second, and whatever is on screen re-reads the graph
+when something re-indexes it. It watches for that; it never polls.
+
+Save a walk you want to keep: name the trail and it is written to
+.codegraph/ui/trails/ (already gitignored) as plain JSON, listed on the empty
+screen, and reopened at the symbol you left. Hops are remembered by name rather
+than by position, so a saved trail survives re-indexing and says which hop moved
+when one does. Pass --read-only to refuse every write.
+
+The viewer listens on 127.0.0.1 only, so nothing on your network can reach it.
+It opens an index that already exists, never indexes, and never changes a line
+of your code — the one thing it writes is a trail you asked it to save.
+Requests from any other host are refused, and nothing is sent anywhere: no code,
+no paths, no analytics.
+
+Without --port it takes ${DEFAULT_UI_PORT}, or the next free port if that one is busy.
+
+Set ${BROWSER_ENV}=<command> to choose which browser opens, or
+${BROWSER_ENV}=none to never open one.
+`
+  )
+  .action(async (pathArg: string | undefined, options: { port?: string; open?: boolean; readOnly?: boolean }) => {
+    // An explicit --port stays explicit: a scripted `--port 8080` that quietly
+    // lands on 8081 is worse than one that says the port is busy. The default
+    // port is the only one we're free to walk away from.
+    let requestedPort: number | undefined;
+    if (options.port !== undefined) {
+      requestedPort = Number(options.port);
+      if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65535) {
+        error(`--port must be a whole number between 0 and 65535 (got "${options.port}").`);
+        process.exit(1);
+      }
+    }
+
+    const projectPath = resolveProjectPath(pathArg);
+
+    // Sensitive-directory refusal before anything opens: the same guard the MCP
+    // entry points use, so `codegraph ui /etc` is turned away here rather than
+    // becoming a browsable view of the system.
+    const { validateProjectPath } = await import('../utils');
+    const rootError = validateProjectPath(projectPath);
+    if (rootError) {
+      error(rootError);
+      process.exit(1);
+    }
+
+    if (!isInitialized(projectPath)) {
+      printNoIndexGuidance(projectPath);
+      process.exit(1);
+    }
+
+    const { startUiServer, openBrowser, createGraphApi, ViewerMissingError } = await import(
+      '../ui-server'
+    );
+
+    // The JSON API the viewer reads its screens from. It opens the index lazily
+    // on the first request, so a slow first paint is the only cost of mounting
+    // it here rather than after the browser connects.
+    const readOnly = options.readOnly === true;
+    const api = createGraphApi({
+      projectRoot: projectPath,
+      readOnly,
+      readOnlyReason: readOnly
+        ? 'This viewer was started with --read-only, so trails cannot be saved.'
+        : undefined,
+    });
+
+    let handle: UiServerHandle;
+    try {
+      handle = await startUiServer({
+        projectRoot: projectPath,
+        port: requestedPort,
+        portFallback: requestedPort === undefined,
+        api: api.handler,
+      });
+    } catch (err) {
+      api.close();
+      // Both failure modes here (viewer assets missing, no port available) carry
+      // their own remediation — print it plainly, never a stack trace.
+      error(err instanceof ViewerMissingError || err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+
+    console.log('');
+    console.log(chalk.bold('CodeGraph viewer'));
+    console.log('');
+    console.log(`  ${chalk.dim('Reading')}  ${projectPath}`);
+    console.log(`  ${chalk.dim('URL')}      ${chalk.cyan(handle.url)}`);
+    console.log(
+      `  ${chalk.dim('Access')}   this machine only ${getGlyphs().dash} ` +
+        (readOnly
+          ? 'read-only, nothing leaves your computer'
+          : 'nothing leaves your computer; saved trails are the only thing written')
+    );
+    console.log('');
+
+    const opened = options.open === false ? false : openBrowser(handle.url);
+    console.log(
+      opened
+        ? chalk.dim('  Opening your browser... press Ctrl+C to stop.')
+        : chalk.dim('  Open that URL in a browser. Press Ctrl+C to stop.')
+    );
+    console.log('');
+
+    // The http server keeps the event loop alive on its own; these just make
+    // Ctrl-C hang up live sockets instead of waiting on browser keep-alives.
+    const shutdown = (): void => {
+      // Release the SQLite handle before the socket: the process should never
+      // exit with a live connection to the user's index.
+      api.close();
+      void handle.close().then(() => process.exit(0));
+    };
+    process.once('SIGINT', shutdown);
+    process.once('SIGTERM', shutdown);
   });
 
 /**
@@ -1823,14 +2173,15 @@ program
       }
 
       const lockPath = path.join(getCodeGraphDir(projectPath), 'codegraph.lock');
-
-      if (!fs.existsSync(lockPath)) {
-        info(`No lock file found ${getGlyphs().dash} nothing to do`);
-        return;
+      let removed = false;
+      if (fs.existsSync(lockPath)) {
+        fs.unlinkSync(lockPath);
+        removed = true;
       }
-
-      fs.unlinkSync(lockPath);
-      success('Removed lock file. You can now run indexing again.');
+      const { clearStaleDaemonArtifacts } = await import('../mcp/daemon-registry');
+      removed = await clearStaleDaemonArtifacts(projectPath) || removed;
+      if (removed) success('Removed stale lock artifacts. You can now run indexing again.');
+      else info(`No stale lock files found ${getGlyphs().dash} nothing to do`);
     } catch (err) {
       error(`Failed to remove lock: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
@@ -1838,176 +2189,140 @@ program
   });
 
 /**
- * codegraph callers <symbol>
- *
- * CLI parity with the MCP graph tools (codegraph_callers/callees/impact) so the
- * traversal queries work in scripts, CI, and git hooks without a running MCP
- * server.
+ * CLI parity with MCP callers/callees: resolve once, then collect and limit
+ * within each definition. The legacy JSON list remains an explicitly labeled
+ * union, with its original total/limit/truncated contract (#1674).
  */
-program
-  .command('callers <symbol>')
-  .description('Find all functions/methods that call a specific symbol')
-  .option('-p, --path <path>', 'Project path')
-  .option('-l, --limit <number>', 'Maximum results', '20')
-  .option('-j, --json', 'Output as JSON')
-  .action(async (symbol: string, options: { path?: string; limit?: string; json?: boolean }) => {
-    const projectPath = resolveProjectPath(options.path);
+for (const direction of ['callers', 'callees'] as const) {
+  const title = direction === 'callers' ? 'Callers' : 'Callees';
+  program
+    .command(`${direction} <symbol>`)
+    .description(direction === 'callers'
+      ? 'Find all functions/methods that call a specific symbol'
+      : 'Find all functions/methods called by a specific symbol')
+    .option('-p, --path <path>', 'Project path')
+    .option('-f, --file <path>', 'Narrow definitions by file path or suffix (no match: show all with a note)')
+    .option('-l, --limit <number>', 'Maximum results per definition (also caps the JSON union)', '20')
+    .option('-j, --json', 'Output as JSON')
+    .action(async (symbol: string, options: { path?: string; file?: string; limit?: string; json?: boolean }) => {
+      const projectPath = resolveProjectPath(options.path);
 
-    try {
-      if (!isInitialized(projectPath)) {
-        error(`CodeGraph not initialized in ${projectPath}`);
+      try {
+        if (!isInitialized(projectPath)) {
+          error(`CodeGraph not initialized in ${projectPath}`);
+          process.exit(1);
+        }
+
+        const { default: CodeGraph } = await loadCodeGraph();
+        const cg = await CodeGraph.open(projectPath);
+        try {
+          const limit = parseInt(options.limit || '20', 10);
+          const { nodes: targets } = lookupSymbolNodes(cg, symbol);
+          if (targets.length === 0) {
+            info(formatSymbolNotFound(symbol, cg.searchNodes(symbol, { limit: 5 }).map((m) => m.node.name)));
+            return;
+          }
+
+          const { groups, filteredOut } = groupDefinitions(targets, options.file);
+          const ambiguous = groups.length > 1;
+          const note = filteredOut
+            ? `no definition of "${symbol}" matches file "${options.file}" — showing all definitions instead.`
+            : undefined;
+          const collected = groups.map((group) => {
+            const nodes = new Map<string, Node>();
+            const edges = new Map<string, Edge>();
+            for (const target of group) {
+              const connections = direction === 'callers' ? cg.getCallers(target.id) : cg.getCallees(target.id);
+              for (const { node, edge } of connections) {
+                nodes.set(node.id, node);
+                edges.set(`${edge.source}->${edge.target}:${edge.kind}`, edge);
+              }
+            }
+            return { group, nodes: [...nodes.values()], edges: [...edges.values()] };
+          });
+
+          if (options.json) {
+            const definitions = collected.map(({ group, nodes, edges }) => {
+              const limited = nodes.slice(0, limit);
+              const shown = new Set(limited.map((node) => node.id));
+              return {
+                ...cliDefinition(group),
+                [direction]: limited.map((node) => ({ id: node.id, ...cliNode(node) })),
+                edges: edges.filter((edge) => shown.has(direction === 'callers' ? edge.source : edge.target)),
+                total: nodes.length,
+                limit,
+                truncated: nodes.length > limit,
+              };
+            });
+            const union = new Map<string, Node>();
+            for (const { nodes } of collected) {
+              for (const node of nodes) union.set(node.id, node);
+            }
+            const total = union.size;
+            console.log(JSON.stringify({
+              symbol,
+              targets: groups.flat().map((node) => cliDefinition([node]).definition),
+              ambiguous,
+              aggregation: ambiguous ? 'union' : 'definition',
+              file: options.file,
+              filteredOut,
+              note,
+              definitions,
+              [direction]: [...union.values()].slice(0, limit).map(cliNode),
+              total,
+              limit,
+              truncated: total > limit,
+            }, null, 2));
+          } else {
+            if (note) warn(note);
+            if (ambiguous) {
+              console.log(chalk.bold(`\n${title} of "${symbol}" — ${groups.length} distinct definitions (narrow with --file):`));
+            }
+            for (const { group, nodes } of collected) {
+              const limited = nodes.slice(0, limit);
+              const total = nodes.length;
+              const truncated = total > limit;
+              const count = truncated ? `${limited.length} of ${total}` : String(total);
+              if (ambiguous) {
+                console.log(chalk.bold(`\n${describeSymbolNode(group[0]!)} (${count}):\n`));
+              } else {
+                console.log(chalk.bold(`\n${title} of "${symbol}" (${count}):\n`));
+                console.log(chalk.dim(describeSymbolNode(group[0]!)));
+              }
+              if (total === 0) {
+                if (ambiguous) console.log(chalk.dim(`  (no ${direction})`));
+                else info(`No ${direction} found for "${symbol}"`);
+              }
+              for (const node of limited) {
+                const loc = node.startLine ? `:${node.startLine}` : '';
+                console.log(chalk.cyan(node.kind.padEnd(12)) + chalk.white(node.name));
+                console.log(chalk.dim(`  ${node.filePath}${loc}`));
+                console.log();
+              }
+              if (truncated) console.log(chalk.dim(`Showing ${limited.length} of ${total}; pass --limit to widen.`));
+            }
+          }
+        } finally {
+          cg.destroy();
+        }
+      } catch (err) {
+        error(`${direction} failed: ${err instanceof Error ? err.message : String(err)}`);
         process.exit(1);
       }
-
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
-      const limit = parseInt(options.limit || '20', 10);
-
-      const matches = cg.searchNodes(symbol, { limit: 50 });
-      if (matches.length === 0) {
-        info(`Symbol "${symbol}" not found`);
-        cg.destroy();
-        return;
-      }
-
-      const seen = new Set<string>();
-      const allCallers: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
-
-      for (const match of matches) {
-        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
-        if (!exactMatch && matches.length > 1) continue;
-        for (const c of cg.getCallers(match.node.id)) {
-          if (!seen.has(c.node.id)) {
-            seen.add(c.node.id);
-            allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
-          }
-        }
-      }
-
-      // Fallback: if exact filter removed everything, use the top match
-      if (allCallers.length === 0 && matches[0]) {
-        for (const c of cg.getCallers(matches[0].node.id)) {
-          if (!seen.has(c.node.id)) {
-            seen.add(c.node.id);
-            allCallers.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
-          }
-        }
-      }
-
-      const limited = allCallers.slice(0, limit);
-
-      if (options.json) {
-        console.log(JSON.stringify({ symbol, callers: limited }, null, 2));
-      } else if (limited.length === 0) {
-        info(`No callers found for "${symbol}"`);
-      } else {
-        console.log(chalk.bold(`\nCallers of "${symbol}" (${limited.length}):\n`));
-        for (const node of limited) {
-          const loc = node.startLine ? `:${node.startLine}` : '';
-          console.log(
-            chalk.cyan(node.kind.padEnd(12)) +
-            chalk.white(node.name)
-          );
-          console.log(chalk.dim(`  ${node.filePath}${loc}`));
-          console.log();
-        }
-      }
-
-      cg.destroy();
-    } catch (err) {
-      error(`callers failed: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
-    }
-  });
+    });
+}
 
 /**
- * codegraph callees <symbol>
- */
-program
-  .command('callees <symbol>')
-  .description('Find all functions/methods that a specific symbol calls')
-  .option('-p, --path <path>', 'Project path')
-  .option('-l, --limit <number>', 'Maximum results', '20')
-  .option('-j, --json', 'Output as JSON')
-  .action(async (symbol: string, options: { path?: string; limit?: string; json?: boolean }) => {
-    const projectPath = resolveProjectPath(options.path);
-
-    try {
-      if (!isInitialized(projectPath)) {
-        error(`CodeGraph not initialized in ${projectPath}`);
-        process.exit(1);
-      }
-
-      const { default: CodeGraph } = await loadCodeGraph();
-      const cg = await CodeGraph.open(projectPath);
-      const limit = parseInt(options.limit || '20', 10);
-
-      const matches = cg.searchNodes(symbol, { limit: 50 });
-      if (matches.length === 0) {
-        info(`Symbol "${symbol}" not found`);
-        cg.destroy();
-        return;
-      }
-
-      const seen = new Set<string>();
-      const allCallees: Array<{ name: string; kind: string; filePath: string; startLine?: number }> = [];
-
-      for (const match of matches) {
-        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
-        if (!exactMatch && matches.length > 1) continue;
-        for (const c of cg.getCallees(match.node.id)) {
-          if (!seen.has(c.node.id)) {
-            seen.add(c.node.id);
-            allCallees.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
-          }
-        }
-      }
-
-      if (allCallees.length === 0 && matches[0]) {
-        for (const c of cg.getCallees(matches[0].node.id)) {
-          if (!seen.has(c.node.id)) {
-            seen.add(c.node.id);
-            allCallees.push({ name: c.node.name, kind: c.node.kind, filePath: c.node.filePath, startLine: c.node.startLine });
-          }
-        }
-      }
-
-      const limited = allCallees.slice(0, limit);
-
-      if (options.json) {
-        console.log(JSON.stringify({ symbol, callees: limited }, null, 2));
-      } else if (limited.length === 0) {
-        info(`No callees found for "${symbol}"`);
-      } else {
-        console.log(chalk.bold(`\nCallees of "${symbol}" (${limited.length}):\n`));
-        for (const node of limited) {
-          const loc = node.startLine ? `:${node.startLine}` : '';
-          console.log(
-            chalk.cyan(node.kind.padEnd(12)) +
-            chalk.white(node.name)
-          );
-          console.log(chalk.dim(`  ${node.filePath}${loc}`));
-          console.log();
-        }
-      }
-
-      cg.destroy();
-    } catch (err) {
-      error(`callees failed: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
-    }
-  });
-
-/**
- * codegraph impact <symbol>
+ * codegraph impact <symbol> — one blast radius per distinct definition.
  */
 program
   .command('impact <symbol>')
   .description('Analyze what code is affected by changing a symbol')
   .option('-p, --path <path>', 'Project path')
+  .option('-f, --file <path>', 'Narrow definitions by file path or suffix (no match: show all with a note)')
   .option('-d, --depth <number>', 'Traversal depth', '2')
   .option('-j, --json', 'Output as JSON')
-  .action(async (symbol: string, options: { path?: string; depth?: string; json?: boolean }) => {
+  .action(async (symbol: string, options: { path?: string; file?: string; depth?: string; json?: boolean }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
@@ -2018,77 +2333,89 @@ program
 
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
-      const depth = Math.min(Math.max(parseInt(options.depth || '2', 10), 1), 10);
+      try {
+        const depth = Math.min(Math.max(parseInt(options.depth || '2', 10), 1), 10);
+        const { nodes: targets } = lookupSymbolNodes(cg, symbol);
+        if (targets.length === 0) {
+          info(formatSymbolNotFound(symbol, cg.searchNodes(symbol, { limit: 5 }).map((m) => m.node.name)));
+          return;
+        }
 
-      const matches = cg.searchNodes(symbol, { limit: 50 });
-      if (matches.length === 0) {
-        info(`Symbol "${symbol}" not found`);
+        const { groups, filteredOut } = groupDefinitions(targets, options.file);
+        const ambiguous = groups.length > 1;
+        const note = filteredOut
+          ? `no definition of "${symbol}" matches file "${options.file}" — showing all definitions instead.`
+          : undefined;
+        const collected = groups.map((group) => {
+          const nodes = new Map<string, Node>();
+          const edges = new Map<string, Edge>();
+          for (const target of group) {
+            const impact = cg.getImpactRadius(target.id, depth);
+            for (const [id, node] of impact.nodes) nodes.set(id, node);
+            for (const edge of impact.edges) edges.set(`${edge.source}->${edge.target}:${edge.kind}`, edge);
+          }
+          return { group, nodes, edges };
+        });
+
+        if (options.json) {
+          const unionNodes = new Map<string, Node>();
+          const unionEdges = new Map<string, Edge>();
+          const definitions = collected.map(({ group, nodes, edges }) => {
+            for (const [id, node] of nodes) unionNodes.set(id, node);
+            for (const [key, edge] of edges) unionEdges.set(key, edge);
+            return {
+              ...cliDefinition(group),
+              nodeCount: nodes.size,
+              edgeCount: edges.size,
+              affected: [...nodes.values()].map((node) => ({ id: node.id, ...cliNode(node) })),
+              edges: [...edges.values()],
+            };
+          });
+          console.log(JSON.stringify({
+            symbol,
+            depth,
+            targets: groups.flat().map((node) => cliDefinition([node]).definition),
+            ambiguous,
+            aggregation: ambiguous ? 'union' : 'definition',
+            file: options.file,
+            filteredOut,
+            note,
+            definitions,
+            nodeCount: unionNodes.size,
+            edgeCount: unionEdges.size,
+            affected: [...unionNodes.values()].map(cliNode),
+          }, null, 2));
+        } else {
+          if (note) warn(note);
+          if (ambiguous) {
+            console.log(chalk.bold(`\nImpact of changing "${symbol}" — ${groups.length} distinct definitions (each with its own blast radius; narrow with --file):`));
+          }
+          for (const { group, nodes } of collected) {
+            if (ambiguous) {
+              console.log(chalk.bold(`\n${describeSymbolNode(group[0]!)} — ${nodes.size} affected symbols:\n`));
+            } else {
+              console.log(chalk.bold(`\nImpact of changing "${symbol}" — ${nodes.size} affected symbols:\n`));
+              console.log(chalk.dim(describeSymbolNode(group[0]!)));
+            }
+            const byFile = new Map<string, Node[]>();
+            for (const node of nodes.values()) {
+              const list = byFile.get(node.filePath) || [];
+              list.push(node);
+              byFile.set(node.filePath, list);
+            }
+            for (const [file, affected] of byFile) {
+              console.log(chalk.cyan(file));
+              for (const node of affected) {
+                const loc = node.startLine ? `:${node.startLine}` : '';
+                console.log(`  ${chalk.dim(node.kind.padEnd(12))}${node.name}${chalk.dim(loc)}`);
+              }
+              console.log();
+            }
+          }
+        }
+      } finally {
         cg.destroy();
-        return;
       }
-
-      // Merge impact subgraphs across all exact-matching symbols
-      const mergedNodes = new Map<string, { name: string; kind: string; filePath: string; startLine?: number }>();
-      const seenEdges = new Set<string>();
-      let edgeCount = 0;
-
-      for (const match of matches) {
-        const exactMatch = match.node.name === symbol || match.node.name.endsWith(`.${symbol}`) || match.node.name.endsWith(`::${symbol}`);
-        if (!exactMatch && matches.length > 1) continue;
-        const impact = cg.getImpactRadius(match.node.id, depth);
-        for (const [id, n] of impact.nodes) {
-          mergedNodes.set(id, { name: n.name, kind: n.kind, filePath: n.filePath, startLine: n.startLine });
-        }
-        for (const e of impact.edges) {
-          const key = `${e.source}->${e.target}:${e.kind}`;
-          if (!seenEdges.has(key)) {
-            seenEdges.add(key);
-            edgeCount++;
-          }
-        }
-      }
-
-      // Fallback to top match if exact filter removed everything
-      if (mergedNodes.size === 0 && matches[0]) {
-        const impact = cg.getImpactRadius(matches[0].node.id, depth);
-        for (const [id, n] of impact.nodes) {
-          mergedNodes.set(id, { name: n.name, kind: n.kind, filePath: n.filePath, startLine: n.startLine });
-        }
-        edgeCount = impact.edges.length;
-      }
-
-      if (options.json) {
-        console.log(JSON.stringify({
-          symbol,
-          depth,
-          nodeCount: mergedNodes.size,
-          edgeCount,
-          affected: Array.from(mergedNodes.values()),
-        }, null, 2));
-      } else if (mergedNodes.size === 0) {
-        info(`No affected symbols found for "${symbol}"`);
-      } else {
-        console.log(chalk.bold(`\nImpact of changing "${symbol}" — ${mergedNodes.size} affected symbols:\n`));
-
-        // Group by file
-        const byFile = new Map<string, Array<{ name: string; kind: string; startLine?: number }>>();
-        for (const node of mergedNodes.values()) {
-          const list = byFile.get(node.filePath) || [];
-          list.push({ name: node.name, kind: node.kind, startLine: node.startLine });
-          byFile.set(node.filePath, list);
-        }
-
-        for (const [file, nodes] of byFile) {
-          console.log(chalk.cyan(file));
-          for (const node of nodes) {
-            const loc = node.startLine ? `:${node.startLine}` : '';
-            console.log(`  ${chalk.dim(node.kind.padEnd(12))}${node.name}${chalk.dim(loc)}`);
-          }
-          console.log();
-        }
-      }
-
-      cg.destroy();
     } catch (err) {
       error(`impact failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
@@ -2149,16 +2476,6 @@ program
       const cg = await CodeGraph.open(projectPath);
       const maxDepth = parseInt(options.depth || '5', 10);
 
-      // Common test file patterns
-      const defaultTestPatterns = [
-        /\.spec\./,
-        /\.test\./,
-        /\/__tests__\//,
-        /\/tests?\//,
-        /\/e2e\//,
-        /\/spec\//,
-      ];
-
       // Custom filter pattern
       let customFilter: RegExp | null = null;
       if (options.filter) {
@@ -2171,9 +2488,14 @@ program
         customFilter = new RegExp(regex);
       }
 
+      // One notion of "a test" for the whole tool (#1507): the CLI used to keep
+      // its own six regexes here, which knew `.test.` and `/tests/` but not Go's
+      // `_test.go`, Python's `test_x.py` or the JVM's `FooTest.kt` — so
+      // `affected` reported "no tests" for whole ecosystems while `search` and
+      // the MCP tools counted those very files as tests.
       function isTestFile(filePath: string): boolean {
         if (customFilter) return customFilter.test(filePath);
-        return defaultTestPatterns.some(p => p.test(filePath));
+        return isTestPath(filePath);
       }
 
       // BFS to find all transitive dependents of changed files, filtered to test files
@@ -2246,10 +2568,11 @@ program
  */
 program
   .command('install')
-  .description('Install codegraph MCP server into one or more agents (Claude Code, Cursor, Codex CLI, opencode, Hermes Agent)')
+  .description('Install codegraph MCP server into one or more agents (Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, GitHub Copilot)')
   .option('-t, --target <ids>', 'Target agent(s): comma-separated ids, or "auto"|"all"|"none". Default: prompt')
   .option('-l, --location <where>', 'Install location: "global" or "local". Default: prompt')
   .option('-y, --yes', 'Non-interactive: defaults to --location=global --target=auto, auto-allow on')
+  .option('-i, --init', 'After wiring agents, also run `codegraph init` in the current directory — builds this project’s index, so install + index is one command (combine with --yes for an unattended bootstrap)')
   .option('--no-permissions', 'Skip writing the auto-allow permissions list (Claude Code only)')
   .option('--print-config <id>', 'Print MCP config snippet for the named agent and exit (no file writes)')
   .option('--refresh', 'Rewrite what previous installs configured, for already-configured agents only (never adds new ones). Run automatically by `codegraph upgrade`')
@@ -2257,6 +2580,7 @@ program
     target?: string;
     location?: string;
     yes?: boolean;
+    init?: boolean;
     permissions?: boolean;
     printConfig?: string;
     refresh?: boolean;
@@ -2334,6 +2658,18 @@ program
       error(err instanceof Error ? err.message : String(err));
       process.exit(1);
     }
+
+    // --init: the one-shot "wire agents AND build this project's index"
+    // bootstrap (#1578). The installer itself never indexes implicitly (a
+    // surprise index of $HOME is the thing we refuse) — an explicit flag is
+    // the user choosing. Runs after a successful install, including the
+    // `--target none` / nothing-detected case (the installer returns normally
+    // there), and shares every guard with `codegraph init`: an unsafe root
+    // is refused (exit 1, no implied --force), an already-initialized
+    // project just says so. `--yes` flows through so no offer prompts.
+    if (opts.init) {
+      await runInit(process.cwd(), { yes: opts.yes });
+    }
   });
 
 /**
@@ -2346,7 +2682,7 @@ program
  */
 program
   .command('uninstall')
-  .description('Remove codegraph from your agents (Claude Code, Cursor, Codex CLI, opencode, Hermes Agent)')
+  .description('Remove codegraph from your agents (Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, GitHub Copilot)')
   .option('-t, --target <ids>', 'Target agent(s): comma-separated ids, or "all". Default: all')
   .option('-l, --location <where>', 'Uninstall location: "global" or "local". Default: prompt')
   .option('-y, --yes', 'Non-interactive: defaults to --location=global --target=all')

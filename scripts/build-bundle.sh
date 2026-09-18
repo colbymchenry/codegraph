@@ -63,8 +63,17 @@ echo "[bundle] building app"
 STAGE="$WORK/codegraph-${TARGET}"
 mkdir -p "$STAGE/lib" "$STAGE/bin"
 cp -R "$ROOT/dist" "$STAGE/lib/dist"
+# The browser viewer rides along inside dist/viewer (built by `npm run build`
+# above). Fail here rather than shipping a bundle whose `codegraph ui` serves
+# a 404 — the copy is verified, not assumed.
+node "$ROOT/scripts/check-ui-build.mjs" --root "$STAGE/lib"
 cp "$ROOT/package.json" "$ROOT/package-lock.json" "$STAGE/lib/"
 echo "[bundle] installing production dependencies"
+# The staged package.json declares the `ui` workspace but the bundle carries
+# no ui/ source — only its build output. That is fine: ui/ has dev
+# dependencies only, so --omit=dev skips the workspace outright and no link
+# is created. (If a future npm starts erroring on the absent folder, stage a
+# stub ui/package.json before this line rather than editing the lock.)
 ( cd "$STAGE/lib" && npm ci --omit=dev --ignore-scripts >/dev/null 2>&1 )
 rm -f "$STAGE/lib/package-lock.json"
 

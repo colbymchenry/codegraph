@@ -42,9 +42,38 @@
  * the next pass covers everything, the WAL wraps on the following commit,
  * and the pause is the disk's honest catch-up cost — the correct terminal
  * mode when hardware genuinely can't keep up with the append rate.
+ *
+ * Fail-closed (#1539): if parked backfills cannot progress (a reader pinning
+ * frames) while the WAL is past the hard/file caps, the valve throws
+ * {@link WalValveAbortError} instead of releasing the writer. The previous
+ * "futility latch" disabled parking for 60s after consecutive give-ups so a
+ * pinned reader would not churn checkpoint workers — but that also let the
+ * WAL grow without a bound (observed 64 GiB on a kernel-scale daemon catch-up
+ * with the query pool holding read marks). Aborting with a clear error is the
+ * safe terminal mode; the caller closes readers / retries once the pin clears.
  */
 
 import type { DatabaseConnection } from './index';
+
+/**
+ * Thrown when the valve cannot checkpoint past its documented caps while a
+ * reader pins WAL frames (#1539). Callers (index/sync) should surface this and
+ * stop writing rather than risk unbounded disk growth.
+ */
+export class WalValveAbortError extends Error {
+  readonly code = 'WAL_VALVE_ABORT' as const;
+  readonly walBytes: number;
+  readonly fileCapBytes: number;
+  readonly hardBytes: number;
+
+  constructor(message: string, sizes: { walBytes: number; fileCapBytes: number; hardBytes: number }) {
+    super(message);
+    this.name = 'WalValveAbortError';
+    this.walBytes = sizes.walBytes;
+    this.fileCapBytes = sizes.fileCapBytes;
+    this.hardBytes = sizes.hardBytes;
+  }
+}
 
 /** Soft WAL-growth threshold (MB) that triggers an off-thread passive checkpoint. */
 const DEFAULT_WAL_VALVE_MB = 256;
@@ -93,17 +122,10 @@ export class WalCheckpointValve {
   private readonly fileCapBytes: number;
 
   /**
-   * Futility latch: consecutive backfill give-ups (a reader pinning the WAL)
-   * disable further writer pauses for a cooldown, so a pinned phase degrades
-   * to the pre-valve behavior (unbounded WAL, folded when the pinner exits)
-   * instead of burning a 20-pass checkpoint attempt — each pass a worker
-   * thread + fresh connection — at EVERY over-cap boundary. That churn is
-   * what turned a pinned kernel-scale resolution from slow into OOM-killed
-   * (§7a.1 run 1: 22GB WAL, exit 137 at an envelope the pre-fix build
-   * survived).
+   * Consecutive parked-backfill give-ups. Used only for diagnostics in the
+   * abort message — parking is never disabled (#1539 fail-closed).
    */
   private consecutiveGiveUps = 0;
-  private futileUntil = 0;
 
   constructor(
     private readonly db: DatabaseConnection,
@@ -173,7 +195,6 @@ export class WalCheckpointValve {
    */
   backpressure(): Promise<void> | null {
     if (this.pause) return this.pause;
-    if (Date.now() < this.futileUntil) return null; // pinned reader — parking is churn, not progress
     // Two independent triggers:
     //  - growth: un-backfilled BACKLOG past the hard cap (the original valve).
     //  - file size: a WAL can stay fully backfilled and still grow without
@@ -219,15 +240,31 @@ export class WalCheckpointValve {
   /**
    * With the writer parked on the returned promise, loop passive passes until
    * one reports the entire WAL backfilled (typically the second: the first
-   * drains the pass that was already running against a stale snapshot). Gives
-   * up after a bounded number of passes — e.g. a reader pinning the WAL —
-   * because unbounded WAL growth degrades; a wedged writer never recovers.
+   * drains the pass that was already running against a stale snapshot). After
+   * a bounded number of passes without a full backfill — e.g. a reader
+   * pinning the WAL — throws {@link WalValveAbortError} when still past the
+   * hard/file caps (#1539 fail-closed). Soft give-up under those caps is
+   * reserved for foldNow on a modest backlog that could not complete.
    */
   private async backfillFully(): Promise<void> {
     for (let i = 0; i < MAX_PAUSED_BACKFILL_PASSES; i++) {
       if (this.inflight) await this.inflight; // fold in the stale in-flight pass first
       const res = await this.db.checkpointWalPassive();
-      if (!res) return; // checkpoint machinery unavailable — don't spin
+      if (!res) {
+        // Machinery unavailable: fail closed past the documented caps (#1539),
+        // otherwise soft-return so a non-WAL / closing connection does not abort.
+        const walBytes = this.db.getWalSizeBytes();
+        const growth = this.growthBytes();
+        if (walBytes > this.fileCapBytes || growth > this.hardBytes) {
+          throw new WalValveAbortError(
+            `WAL checkpoint machinery unavailable while over the documented cap ` +
+              `(wal=${this.mb(walBytes)}, fileCap=${this.mb(this.fileCapBytes)}). ` +
+              `Aborting to avoid unbounded disk growth.`,
+            { walBytes, fileCapBytes: this.fileCapBytes, hardBytes: this.hardBytes }
+          );
+        }
+        return;
+      }
       this.log(`backfill pass ${i + 1}: busy=${res.busy} log=${res.log} checkpointed=${res.checkpointed} wal=${this.mb(this.db.getWalSizeBytes())}`);
       if (res.busy === 0 && res.log === res.checkpointed) {
         // Backfill complete AND we are at a parked barrier (backfillFully only
@@ -240,20 +277,36 @@ export class WalCheckpointValve {
         if (trunc) this.log(`truncate: busy=${trunc.busy} wal=${this.mb(this.db.getWalSizeBytes())}`);
         this.sizeAtLastFullBackfill = this.db.getWalSizeBytes();
         this.consecutiveGiveUps = 0;
-        this.futileUntil = 0;
         return;
       }
     }
     this.consecutiveGiveUps++;
-    if (this.consecutiveGiveUps >= 2) {
-      this.futileUntil = Date.now() + 60_000;
-    }
-    const msg = `backfill gave up after ${MAX_PAUSED_BACKFILL_PASSES} passes (streak ${this.consecutiveGiveUps}${this.futileUntil ? ', parking disabled 60s' : ''}) — a reader is pinning the WAL`;
+    const walBytes = this.db.getWalSizeBytes();
+    const growth = this.growthBytes();
+    const msg =
+      `backfill gave up after ${MAX_PAUSED_BACKFILL_PASSES} passes ` +
+      `(streak ${this.consecutiveGiveUps}) — a reader is pinning the WAL ` +
+      `(wal=${this.mb(walBytes)} growth=${this.mb(growth)} ` +
+      `hard=${this.mb(this.hardBytes)} fileCap=${this.mb(this.fileCapBytes)})`;
     this.log(msg);
     // Give-ups are rare and load-bearing for §7a.1-class diagnosis — surface
     // them on any timing-instrumented run, not just valve-debug ones.
     if (process.env.CODEGRAPH_SYNTH_TIMINGS && !process.env.CODEGRAPH_WAL_VALVE_DEBUG) {
       console.error(`[wal-valve] ${msg}`);
+    }
+    // Fail closed (#1539): never release the writer past the documented caps
+    // when checkpoints cannot progress. The old futility latch disabled
+    // parking for 60s and allowed unbounded growth (64 GiB observed).
+    if (walBytes > this.fileCapBytes || growth > this.hardBytes) {
+      throw new WalValveAbortError(
+        `WAL checkpoint cannot progress while a reader pins frames ` +
+          `(wal=${this.mb(walBytes)}, growth=${this.mb(growth)}, ` +
+          `fileCap=${this.mb(this.fileCapBytes)}, hard=${this.mb(this.hardBytes)}, ` +
+          `give-ups=${this.consecutiveGiveUps}). Aborting to avoid unbounded disk growth. ` +
+          `Close concurrent readers (for example the MCP query pool) and retry, ` +
+          `or raise CODEGRAPH_WAL_VALVE_MB if the threshold is too tight for this project.`,
+        { walBytes, fileCapBytes: this.fileCapBytes, hardBytes: this.hardBytes }
+      );
     }
   }
 

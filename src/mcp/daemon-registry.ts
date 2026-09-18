@@ -22,7 +22,15 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { getDaemonPidPath, getDaemonSocketCandidates, decodeLockInfo } from './daemon-paths';
+import {
+  getDaemonPidPath,
+  getDaemonSocketCandidates,
+  decodeLockInfo,
+  canProbeDaemonIdentity,
+  probeDaemonIdentity,
+  type DaemonLockInfo,
+} from './daemon-paths';
+import { readWriterLock, releaseWriterLock, tryAcquireWriterLock } from './writer-lock';
 
 export interface DaemonRecord {
   /** Realpath'd project root the daemon serves. */
@@ -114,18 +122,86 @@ export function listDaemons(opts: { prune?: boolean } = {}): DaemonRecord[] {
   return live.sort((a, b) => b.startedAt - a.startedAt);
 }
 
-/** Remove a stopped daemon's leftover lockfile + socket + registry record. */
-function cleanupDaemonArtifacts(root: string): void {
-  try { fs.unlinkSync(getDaemonPidPath(root)); } catch { /* gone */ }
-  // POSIX sockets are real files; Windows named pipes vanish with the process.
-  // Sweep every candidate — a daemon that relocated past an unusable in-project
-  // FS (ExFAT/FAT; #997) left its socket at the tmpdir fallback, not candidate 0.
-  if (process.platform !== 'win32') {
-    for (const candidate of getDaemonSocketCandidates(root)) {
-      try { fs.unlinkSync(candidate); } catch { /* gone */ }
-    }
+/**
+ * Registry entries whose socket hello proves the recorded process is the
+ * daemon. Used by every user-facing list/stop-all path so a reused PID cannot
+ * appear as a phantom running daemon (#1553).
+ */
+export async function listVerifiedDaemons(opts: { prune?: boolean } = {}): Promise<DaemonRecord[]> {
+  const prune = opts.prune ?? true;
+  const candidates = listDaemons({ prune });
+  const checks = await Promise.all(candidates.map(async (rec) => ({
+    rec,
+    verified: await probeDaemonIdentity(rec),
+  })));
+  const verified: DaemonRecord[] = [];
+  for (const check of checks) {
+    if (check.verified) verified.push(check.rec);
+    else if (prune) deregisterDaemon(check.rec.root);
   }
-  deregisterDaemon(root);
+  return verified;
+}
+
+/** Remove stale artifacts while holding the project writer slot exclusively. */
+function cleanupDaemonArtifacts(
+  root: string,
+  expectedLockContents: string | null,
+): boolean {
+  const pidPath = getDaemonPidPath(root);
+  // A daemon owns writer.pid before binding or relocating its socket. Claiming
+  // the writer slot therefore freezes every legitimate daemon artifact writer
+  // while we compare the inspected lock snapshot and clean it up.
+  if (readWriterLock(root)?.pid === process.pid) return false;
+  const claim = tryAcquireWriterLock(root, 'cleanup');
+  if (claim.kind === 'taken') return false;
+
+  try {
+    if (expectedLockContents === null) {
+      if (fs.existsSync(pidPath)) return false;
+    } else {
+      try {
+        if (fs.readFileSync(pidPath, 'utf8') !== expectedLockContents) return false;
+      } catch {
+        return false;
+      }
+    }
+    // POSIX sockets are real files; Windows named pipes vanish with the process.
+    // Sweep every candidate before releasing daemon.pid, so no successor can
+    // acquire the lock and bind a socket that this cleanup then removes.
+    if (process.platform !== 'win32') {
+      for (const candidate of getDaemonSocketCandidates(root)) {
+        try { fs.unlinkSync(candidate); } catch { /* gone */ }
+      }
+    }
+    deregisterDaemon(root);
+    try { fs.unlinkSync(pidPath); } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return false;
+    }
+    return true;
+  } finally {
+    releaseWriterLock(root);
+  }
+}
+
+/** Remove daemon artifacts only when no matching daemon answers the socket hello. */
+export async function clearStaleDaemonArtifacts(root: string): Promise<boolean> {
+  const pidPath = getDaemonPidPath(root);
+  const hadArtifacts = fs.existsSync(pidPath) || (
+    process.platform !== 'win32' && getDaemonSocketCandidates(root).some((p) => fs.existsSync(p))
+  );
+  if (!hadArtifacts) return false;
+  let info: DaemonLockInfo | null = null;
+  let lockContents: string | null = null;
+  try {
+    lockContents = fs.readFileSync(pidPath, 'utf8');
+    info = decodeLockInfo(lockContents);
+  } catch { /* missing/corrupt */ }
+  if (info && isProcessAlive(info.pid)) {
+    // A live legacy holder has no socket path to probe. That is inconclusive,
+    // not proof of PID reuse, so preserve its lock rather than risk two writers.
+    if (!canProbeDaemonIdentity(info) || await probeDaemonIdentity(info)) return false;
+  }
+  return cleanupDaemonArtifacts(root, lockContents);
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -142,8 +218,8 @@ async function waitForDeath(pid: number, timeoutMs: number): Promise<boolean> {
 export interface StopResult {
   root: string;
   pid: number | null;
-  /** 'term' graceful, 'kill' force, 'not-running' stale lock, 'no-daemon' none found. */
-  outcome: 'term' | 'kill' | 'not-running' | 'no-daemon';
+  /** 'term' graceful, 'kill' force, 'not-running' stale, 'no-daemon' absent, 'unverified' preserved. */
+  outcome: 'term' | 'kill' | 'not-running' | 'no-daemon' | 'unverified';
 }
 
 /**
@@ -154,9 +230,12 @@ export interface StopResult {
  */
 export async function stopDaemonAt(root: string): Promise<StopResult> {
   let pid: number | null = null;
+  let identity: DaemonLockInfo | null = null;
+  let lockContents: string | null = null;
   try {
-    const info = decodeLockInfo(fs.readFileSync(getDaemonPidPath(root), 'utf8'));
-    pid = info?.pid ?? null;
+    lockContents = fs.readFileSync(getDaemonPidPath(root), 'utf8');
+    identity = decodeLockInfo(lockContents);
+    pid = identity?.pid ?? null;
   } catch {
     /* no lockfile */
   }
@@ -165,15 +244,25 @@ export async function stopDaemonAt(root: string): Promise<StopResult> {
       (r) => path.resolve(r.root) === path.resolve(root)
     );
     pid = rec?.pid ?? null;
+    if (rec) identity = rec;
   }
 
   if (pid == null) {
-    cleanupDaemonArtifacts(root);
+    cleanupDaemonArtifacts(root, lockContents);
     return { root, pid: null, outcome: 'no-daemon' };
   }
   if (!isProcessAlive(pid)) {
-    cleanupDaemonArtifacts(root);
-    return { root, pid, outcome: 'not-running' };
+    const removed = cleanupDaemonArtifacts(root, lockContents);
+    return { root, pid, outcome: removed ? 'not-running' : 'unverified' };
+  }
+  // Never signal a process merely because it reused a stale daemon PID. The
+  // daemon's immediate hello is the process-identity proof (#1553).
+  if (!identity || !canProbeDaemonIdentity(identity)) {
+    return { root, pid, outcome: 'unverified' };
+  }
+  if (!await probeDaemonIdentity(identity)) {
+    const removed = cleanupDaemonArtifacts(root, lockContents);
+    return { root, pid, outcome: removed ? 'not-running' : 'unverified' };
   }
 
   // POSIX: SIGTERM runs the daemon's graceful shutdown. Windows: TerminateProcess
@@ -185,14 +274,14 @@ export async function stopDaemonAt(root: string): Promise<StopResult> {
     await waitForDeath(pid, 2000);
     outcome = 'kill';
   }
-  cleanupDaemonArtifacts(root);
+  cleanupDaemonArtifacts(root, lockContents);
   return { root, pid, outcome };
 }
 
 /** Stop every registered, live daemon. */
 export async function stopAllDaemons(): Promise<StopResult[]> {
   const results: StopResult[] = [];
-  for (const rec of listDaemons()) {
+  for (const rec of await listVerifiedDaemons()) {
     results.push(await stopDaemonAt(rec.root));
   }
   return results;

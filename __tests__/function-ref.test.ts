@@ -795,8 +795,10 @@ describe('Function-as-value capture (#756)', () => {
 
       // The DRF wiring: get_serializer_class → the imported serializer class,
       // via `return` — the issue's headline gap. The module-level registry
-      // dict rides the file node.
+      // dict rides BOTH the assigned name (the initializer walk, #693) and the
+      // file node (the dispatcher's own scan, which runs either way).
       expect(sourceNames(cg, fnRefEdgesInto(cg, 'OrgSerializerFull'))).toEqual([
+        'SERIALIZER_REGISTRY',
         'get_serializer_class',
         'views.py',
       ]);

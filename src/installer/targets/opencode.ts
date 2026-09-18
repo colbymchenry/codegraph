@@ -19,15 +19,26 @@
  *     instructions — same convention Codex CLI uses.
  *   - No permissions concept.
  *
- * Config shape uses opencode's wrapper:
+ * Config shape uses OpenCode 2's native wrapper (also read by 1.18+):
  *   {
  *     "$schema": "https://opencode.ai/config.json",
- *     "mcp": { "codegraph": { "type": "local", "command": [...], "enabled": true } }
+ *     "mcp": {
+ *       "servers": {
+ *         "codegraph": {
+ *           "type": "local",
+ *           "command": [...],
+ *           "disabled": false,
+ *           "codemode": false
+ *         }
+ *       }
+ *     }
  *   }
  *
- * The shape differs from Claude/Cursor — opencode uses `mcp.<name>`
- * (not `mcpServers`), takes `command` as a string array combining
- * binary + args, and includes an explicit `enabled` flag.
+ * OpenCode 2 puts servers under `mcp.servers` (not `mcp.<name>`), uses
+ * `disabled` instead of `enabled`, and defaults tools through Code Mode —
+ * `codemode: false` keeps `codegraph_explore` on the provider's native
+ * tool list (#1698). Pre-#1698 installs wrote the v1 `mcp.codegraph` +
+ * `enabled` shape; re-install migrates, uninstall removes either.
  *
  * Reads + writes go through `jsonc-parser` so any `//` and `/* *\/`
  * comments the user has added to their `.jsonc` survive idempotent
@@ -115,12 +126,25 @@ function parseConfig(text: string): Record<string, any> {
   return result as Record<string, any>;
 }
 
-function getOpencodeServerEntry(): { type: string; command: string[]; enabled: boolean } {
+function getOpencodeServerEntry(): {
+  type: string;
+  command: string[];
+  disabled: boolean;
+  codemode: boolean;
+} {
   return {
     type: 'local',
     command: ['codegraph', 'serve', '--mcp'],
-    enabled: true,
+    disabled: false,
+    // Keep codegraph_explore on the native tool list — OpenCode 2's
+    // default Code Mode would otherwise hide the one-tool server (#1698).
+    codemode: false,
   };
+}
+
+/** True when either the OpenCode 2 native entry or a pre-#1698 v1 entry is present. */
+function hasCodegraphEntry(config: Record<string, any>): boolean {
+  return !!(config.mcp?.servers?.codegraph || config.mcp?.codegraph);
 }
 
 const FORMATTING = { tabSize: 2, insertSpaces: true, eol: '\n' };
@@ -137,7 +161,7 @@ class OpencodeTarget implements AgentTarget {
   detect(loc: Location): DetectionResult {
     const file = configPath(loc);
     const config = parseConfig(readConfigText(file));
-    const alreadyConfigured = !!config.mcp?.codegraph;
+    const alreadyConfigured = hasCodegraphEntry(config);
     // Global: the XDG dir is what current opencode creates on first run; the
     // legacy %APPDATA% dir still counts as "opencode present" so a re-install
     // can sweep the stale pre-#535 entry out of it.
@@ -176,7 +200,7 @@ class OpencodeTarget implements AgentTarget {
     const target = configPath(loc);
     const snippet = JSON.stringify({
       $schema: 'https://opencode.ai/config.json',
-      mcp: { codegraph: getOpencodeServerEntry() },
+      mcp: { servers: { codegraph: getOpencodeServerEntry() } },
     }, null, 2);
     return `# Add to ${target}\n\n${snippet}\n`;
   }
@@ -199,10 +223,12 @@ function writeMcpEntry(loc: Location): WriteResult['files'][number] {
   }
 
   const config = parseConfig(text);
-  const before = config.mcp?.codegraph;
+  const before = config.mcp?.servers?.codegraph;
   const after = getOpencodeServerEntry();
+  const hasLegacy = !!config.mcp?.codegraph;
 
-  if (jsonDeepEqual(before, after)) {
+  // Native entry already matches and no v1 leftover → nothing to do.
+  if (jsonDeepEqual(before, after) && !hasLegacy) {
     return { path: file, action: 'unchanged' };
   }
 
@@ -214,9 +240,18 @@ function writeMcpEntry(loc: Location): WriteResult['files'][number] {
     text = applyEdits(text, schemaEdits);
   }
 
+  // Migrate pre-#1698 `mcp.codegraph` (+ enabled) off the file so OpenCode 2
+  // keeps only the native entry where `codemode` survives normalization.
+  if (hasLegacy) {
+    const legacyEdits = modify(text, ['mcp', 'codegraph'], undefined, {
+      formattingOptions: FORMATTING,
+    });
+    text = applyEdits(text, legacyEdits);
+  }
+
   // Surgical edit — preserves comments, formatting, and order of
   // every key we don't touch.
-  const edits = modify(text, ['mcp', 'codegraph'], after, {
+  const edits = modify(text, ['mcp', 'servers', 'codegraph'], after, {
     formattingOptions: FORMATTING,
   });
   const updated = applyEdits(text, edits);
@@ -226,26 +261,50 @@ function writeMcpEntry(loc: Location): WriteResult['files'][number] {
 }
 
 /**
- * Surgically drop `mcp.codegraph` from one config file. Leaves sibling
- * servers, comments, and formatting untouched; drops an emptied `mcp`
- * wrapper too. Shared by uninstall and the legacy-%APPDATA% sweep.
+ * Surgically drop our CodeGraph entry from one config file — either the
+ * OpenCode 2 native `mcp.servers.codegraph` or a pre-#1698 `mcp.codegraph`.
+ * Leaves sibling servers, comments, and formatting untouched; drops emptied
+ * `mcp.servers` / `mcp` wrappers too. Shared by uninstall and the
+ * legacy-%APPDATA% sweep.
  */
 function removeMcpEntryAt(file: string): WriteResult['files'][number] {
   if (!fs.existsSync(file)) return { path: file, action: 'not-found' };
-  const text = readConfigText(file);
+  let text = readConfigText(file);
   const config = parseConfig(text);
-  if (!config.mcp?.codegraph) return { path: file, action: 'not-found' };
+  if (!hasCodegraphEntry(config)) return { path: file, action: 'not-found' };
 
-  let edits = modify(text, ['mcp', 'codegraph'], undefined, {
-    formattingOptions: FORMATTING,
-  });
-  let updated = applyEdits(text, edits);
+  let updated = text;
+  if (config.mcp?.servers?.codegraph) {
+    const edits = modify(updated, ['mcp', 'servers', 'codegraph'], undefined, {
+      formattingOptions: FORMATTING,
+    });
+    updated = applyEdits(updated, edits);
+  }
+  // Re-parse after the native removal so a file that held BOTH shapes
+  // (unusual, but possible mid-migration) still drops the v1 leftover.
+  const mid = parseConfig(updated);
+  if (mid.mcp?.codegraph) {
+    const edits = modify(updated, ['mcp', 'codegraph'], undefined, {
+      formattingOptions: FORMATTING,
+    });
+    updated = applyEdits(updated, edits);
+  }
+
+  // If `mcp.servers` is now an empty object, drop that wrapper.
+  let afterParsed = parseConfig(updated);
+  if (afterParsed.mcp?.servers && typeof afterParsed.mcp.servers === 'object' &&
+      Object.keys(afterParsed.mcp.servers).length === 0) {
+    const edits = modify(updated, ['mcp', 'servers'], undefined, {
+      formattingOptions: FORMATTING,
+    });
+    updated = applyEdits(updated, edits);
+    afterParsed = parseConfig(updated);
+  }
 
   // If `mcp` is now an empty object, drop the wrapper too.
-  const afterParsed = parseConfig(updated);
   if (afterParsed.mcp && typeof afterParsed.mcp === 'object' &&
       Object.keys(afterParsed.mcp).length === 0) {
-    edits = modify(updated, ['mcp'], undefined, { formattingOptions: FORMATTING });
+    const edits = modify(updated, ['mcp'], undefined, { formattingOptions: FORMATTING });
     updated = applyEdits(updated, edits);
   }
 

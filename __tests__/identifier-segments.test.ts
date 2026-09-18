@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   splitIdentifierSegments,
   extractProseCandidates,
+  extractSegmentSearchWords,
   normalizeProseWord,
   segmentLookupVariants,
 } from '../src/search/identifier-segments';
@@ -99,5 +100,34 @@ describe('segmentLookupVariants — light plural folding', () => {
   it('never strips a word below the minimum', () => {
     expect(segmentLookupVariants('bus')).toEqual(['bus']);
     expect(segmentLookupVariants('boxes')).toEqual(['boxes']); // -es strip would go sub-minimum
+  });
+});
+
+describe('extractSegmentSearchWords — query words for the search-side vocab supplement', () => {
+  it('keeps prose words and adds camel-token segments', () => {
+    const words = extractSegmentSearchWords('auto-scroll to bottom — atBottom tracking');
+    // Prose candidates survive as before…
+    expect(words).toContain('scroll');
+    expect(words).toContain('bottom');
+    expect(words).toContain('tracking');
+    // …and the camel token contributed its ≥4-char segments ("at" is under
+    // the prose minimum; "bottom" arrives from the split even when the prose
+    // pass missed it).
+    expect(extractSegmentSearchWords('where is atBottom set')).toContain('bottom');
+  });
+
+  it('splits multi-hump tokens into every usable segment', () => {
+    const words = extractSegmentSearchWords('trace pinFeedIfNearBottom please');
+    expect(words).toEqual(expect.arrayContaining(['feed', 'near', 'bottom']));
+  });
+
+  it('does not invent segments for plain prose', () => {
+    const words = extractSegmentSearchWords('how does checkout work');
+    expect(words).toContain('checkout');
+    expect(words).not.toContain('check');
+  });
+
+  it('returns nothing for an empty query', () => {
+    expect(extractSegmentSearchWords('')).toEqual([]);
   });
 });

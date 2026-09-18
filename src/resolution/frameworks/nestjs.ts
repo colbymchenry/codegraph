@@ -30,6 +30,7 @@ import {
   ResolutionContext,
 } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
+import { declaredDependencies } from './package-deps';
 
 // ---------------------------------------------------------------------------
 // Public surface — see comment at top of file. This file owns four NestJS
@@ -47,19 +48,9 @@ export const nestjsResolver: FrameworkResolver = {
   languages: ['typescript', 'javascript'],
 
   detect(context: ResolutionContext): boolean {
-    // Primary, fast path: any @nestjs/* dependency in package.json.
-    const packageJson = context.readFile('package.json');
-    if (packageJson) {
-      try {
-        const pkg = JSON.parse(packageJson);
-        const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-        if (Object.keys(deps).some((k) => k.startsWith('@nestjs/'))) {
-          return true;
-        }
-      } catch {
-        // Invalid JSON — fall through to the source scan.
-      }
-    }
+    // Primary, fast path: any @nestjs/* dependency in a package.json — the
+    // root's, or a workspace's (`apps/api/`, `server/`).
+    for (const name of declaredDependencies(context)) if (name.startsWith('@nestjs/')) return true;
 
     // Fallback: NestJS-specific decorators in conventionally named files.
     const allFiles = context.getAllFiles();
