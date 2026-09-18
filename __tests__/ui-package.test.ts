@@ -1047,6 +1047,16 @@ describe('@colbymchenry/codegraph-ui — the seams', () => {
       focusGrouping: null,
       focusError: 'This focus link is incomplete or invalid.',
     });
+    expect(
+      parseHash(
+        '#/map?root=src&depth=2&focus=src%2Fcore&direction=depends-on&focusRoot=..%2Foutside&focusDepth=1'
+      ).route
+    ).toMatchObject({
+      focus: null,
+      direction: null,
+      focusGrouping: null,
+      focusError: 'This focus link is incomplete or invalid.',
+    });
   });
 
   it('sends every nav tab to its own view', async () => {

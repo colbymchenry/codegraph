@@ -135,6 +135,12 @@ function parseLine(params: URLSearchParams): number | null {
   return Number.isFinite(line) && line > 0 ? line : null;
 }
 
+function isCanonicalMapRoot(root: string): boolean {
+  if (root === '') return true;
+  if (root.startsWith('/') || /^[a-z]:/i.test(root) || root.includes('\\')) return false;
+  return root.split('/').every((segment) => segment !== '' && segment !== '.' && segment !== '..');
+}
+
 export function parseHash(hash: string): RouterLocation {
   const raw = hash.startsWith('#') ? hash.slice(1) : hash;
   const q = raw.indexOf('?');
@@ -176,7 +182,10 @@ export function parseHash(hash: string): RouterLocation {
       rawFocusDepth !== null && /^\d+$/.test(rawFocusDepth) ? Number(rawFocusDepth) : Number.NaN;
     const hasSnapshotPart = rawFocusRoot !== null || rawFocusDepth !== null;
     const explicitGrouping =
-      rawFocusRoot !== null && Number.isSafeInteger(focusDepth) && focusDepth >= 1
+      rawFocusRoot !== null &&
+      isCanonicalMapRoot(rawFocusRoot) &&
+      Number.isSafeInteger(focusDepth) &&
+      focusDepth >= 1
         ? { root: rawFocusRoot, depth: focusDepth }
         : null;
     const legacyGrouping =
