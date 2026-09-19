@@ -27,6 +27,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Verilog and SystemVerilog are indexed.** Modules, packages, interfaces and modports, named instances, ports and signals, always/assign blocks and generate scopes are searchable, and `codegraph_explore` surfaces the instantiation path from a top module down to a nested one; based on the extractor contributed in #402 by @FHYQ-Dong. Re-index projects that contain Verilog files.
 
+- **A derived parameter depends on the parameters it is computed from.** `localparam K = (N + 1) * 2;` links `K` to `N`, so impact on a width or depth parameter follows the whole chain of `localparam`s built on it, inside its own module. Suggested by @FHYQ-Dong.
+
 - **HDL port bindings resolve to their formal ports.** Named, positional and wildcard (`.*`) connections link an instance's local signals to the instantiated module's ports, and bit or part selects keep their base signal.
 
 - **Signal readers and writers on request.** `codegraph_explore` with `hdlAccess` (CLI: `codegraph explore --hdl-access`) lists where a signal is read, written, used as a control condition or as a clock/reset event, including the direction of arguments passed to known functions and tasks.
