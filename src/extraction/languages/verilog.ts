@@ -315,7 +315,18 @@ function handleParam(node: SyntaxNode, ctx: ExtractorContext): boolean {
       const assign = list.namedChild(i);
       if (!assign || assign.type !== 'param_assignment') continue;
       const id = firstSimpleIdentifier(assign);
-      if (id) ctx.createNode('constant', getNodeText(id, ctx.source), assign);
+      if (!id) continue;
+      const created = ctx.createNode('constant', getNodeText(id, ctx.source), assign);
+      if (!created) continue;
+      // `localparam K = (N + 1) * 2;` depends on N: the value expression's
+      // identifiers become scoped references FROM the parameter, so impact on
+      // N follows the derived-parameter chain (N -> K -> M). The declared name
+      // itself is skipped; the shared walk already leaves out callee names and
+      // package qualifiers, and the resolver binds only in the lexical scope.
+      for (let j = 0; j < assign.namedChildCount; j++) {
+        const part = assign.namedChild(j);
+        if (part && part.id !== id.id) addVerilogSignalReferences(part, ctx, created.id);
+      }
     }
   }
   return true;
