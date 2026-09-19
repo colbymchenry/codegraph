@@ -4,7 +4,9 @@
  * Defines the tools exposed by the CodeGraph MCP server.
  */
 
+import { formatHdlProfileStatus } from '../hdl/status';
 import type CodeGraph from '../index';
+import { formatHdlAccess, HDL_ACCESS_FILTERS, type HdlAccessFilter } from './hdl-access';
 import type { QueryPool } from './query-pool';
 import { findNearestCodeGraphRoot } from '../directory';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
@@ -1342,6 +1344,11 @@ export const tools: ToolDefinition[] = [
           description: 'Maximum number of files to include source code from (default: 12)',
           default: 12,
         },
+        hdlAccess: {
+          type: 'string',
+          description: 'HDL signal access filter. With this option query must be one exact signal name or qualified name; read includes control/event uses, write includes readwrite. Returns access sites and source, not elaborated drivers.',
+          enum: [...HDL_ACCESS_FILTERS],
+        },
         projectPath: projectPathProperty,
       },
       required: ['query'],
@@ -2295,7 +2302,17 @@ export class ToolHandler {
       case 'codegraph_callers': return await this.handleCallers(args);
       case 'codegraph_callees': return await this.handleCallees(args);
       case 'codegraph_impact': return await this.handleImpact(args);
-      case 'codegraph_explore': return await this.handleExplore(args);
+      case 'codegraph_explore': {
+        const result = await this.handleExplore(args);
+        if (result.isError) return result;
+        const profile = this.getCodeGraph(args.projectPath as string | undefined).getHdlProfileStatus?.() ?? null;
+        const note = formatHdlProfileStatus(profile);
+        const first = result.content[0];
+        if (!note || first?.type !== 'text') return result;
+        const emission = result[EXPLORE_EMISSION_KEY];
+        return { ...result, content: [{type:'text', text:`${note}\n\n${first.text}`}, ...result.content.slice(1)],
+          ...(emission ? {[EXPLORE_EMISSION_KEY]: {...emission,responseBytes:emission.responseBytes + note.length + 2}} : {}) };
+      }
       case 'codegraph_node': return await this.handleNode(args);
       case 'codegraph_files': return await this.handleFiles(args);
       default: return this.errorResult(`Unknown tool: ${toolName}`);
@@ -3288,6 +3305,13 @@ export class ToolHandler {
 
     const cg = this.getCodeGraph(args.projectPath as string | undefined);
     const projectRoot = cg.getProjectRoot();
+    if (args.hdlAccess !== undefined) {
+      if (typeof args.hdlAccess !== 'string' || !HDL_ACCESS_FILTERS.includes(args.hdlAccess as HdlAccessFilter)) {
+        return this.errorResult(`hdlAccess must be one of: ${HDL_ACCESS_FILTERS.join(', ')}`);
+      }
+      return this.textResult(this.truncateOutput(formatHdlAccess(cg, rawQuery, args.hdlAccess as HdlAccessFilter,
+        clamp((args.maxFiles as number) || 12, 1, 20))));
+    }
 
     // Resolve adaptive output budget from project size. Falls back to the
     // largest-tier defaults if stats aren't available, which preserves

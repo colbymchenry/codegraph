@@ -24,6 +24,7 @@ import { dartExtractor } from './dart';
 import { pascalExtractor } from './pascal';
 import { scalaExtractor } from './scala';
 import { luaExtractor } from './lua';
+import { verilogExtractor } from './verilog';
 import { rExtractor } from './r';
 import { luauExtractor } from './luau';
 import { objcExtractor } from './objc';
@@ -57,6 +58,7 @@ export const EXTRACTORS: Partial<Record<Language, LanguageExtractor>> = {
   pascal: pascalExtractor,
   scala: scalaExtractor,
   lua: luaExtractor,
+  verilog: verilogExtractor,
   r: rExtractor,
   luau: luauExtractor,
   objc: objcExtractor,
