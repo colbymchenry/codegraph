@@ -5060,6 +5060,71 @@ import 'package:flutter/material.dart';
       expect(importNode?.name).toBe('price');
     });
 
+    /* Inside a {% liquid %} tag, each body line is a tag with no braces of
+       its own. Patterns anchored on `{%` miss these references. */
+    it('should extract render inside a {% liquid %} block', () => {
+      const code = [
+        '{% liquid',
+        '  assign heading = section.settings.title',
+        "  render 'card', title: heading",
+        '%}',
+      ].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).toContain('card');
+    });
+
+    it('should extract assign inside a {% liquid %} block', () => {
+      const code = ['{% liquid', '  assign heading = section.settings.title', '%}'].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const vars = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
+      expect(vars).toContain('heading');
+    });
+
+    it('should extract section inside a {% liquid %} block', () => {
+      const code = ['{% liquid', "  section 'header'", '%}'].join('\n');
+      const result = extractFromSource('layout/theme.liquid', code);
+
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).toContain('header');
+    });
+
+    it('should report the real line number for a tag inside a {% liquid %} block', () => {
+      const code = ['<div>', '{% liquid', '  assign x = 1', "  render 'card'", '%}'].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const card = result.nodes.find((n) => n.kind === 'import' && n.name === 'card');
+      expect(card?.startLine).toBe(4);
+    });
+
+    it('should not count a tag twice when both spellings appear', () => {
+      const code = ["{% render 'card' %}", '{% liquid', "  render 'card'", '%}'].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const cards = result.nodes.filter((n) => n.kind === 'import' && n.name === 'card');
+      expect(cards.length).toBe(2);
+      expect(new Set(cards.map((n) => n.startLine)).size).toBe(2);
+    });
+
+    it('should not read a bare `render` outside a {% liquid %} block as a tag', () => {
+      // Prose and filters mentioning the word must not become references.
+      const code = ['<p>We render the card below.</p>', "{{ product | render_as: 'card' }}"].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).not.toContain('card');
+    });
+
+    it('should handle whitespace control on the {% liquid %} tag itself', () => {
+      const code = ['{%- liquid', "  render 'card'", '-%}'].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).toContain('card');
+    });
+
     it('should extract multiple imports', () => {
       const code = `
 {% section 'header' %}

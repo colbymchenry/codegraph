@@ -125,15 +125,77 @@ export class LiquidExtractor {
   }
 
   /**
+   * Every occurrence of a Liquid tag, in BOTH spellings it can be written in.
+   *
+   * Inside a `{% liquid %}` tag, each line of the body is a tag
+   * WITHOUT braces of its own:
+   *
+   *   {% liquid
+   *     assign heading = section.settings.title
+   *     render 'card', title: heading
+   *   %}
+   *
+   * A pattern anchored on `{%` misses these references and assignments.
+   *
+   * Returns real offsets into `this.source`, so callers keep using
+   * getLineNumber/getLineStart unchanged.
+   */
+  private findTagOccurrences(
+    tagPattern: string,
+    argPattern: string,
+  ): Array<{ fullMatch: string; groups: string[]; index: number }> {
+    const found: Array<{ fullMatch: string; groups: string[]; index: number }> = [];
+
+    /* `{% liquid ... %}` bodies, so the braced pass can skip them. Without this
+       a body that itself contains `{%` (inside a string, say) could be counted
+       twice. */
+    const blocks: Array<{ start: number; end: number; bodyStart: number; body: string }> = [];
+    const liquidTag = /\{%[-]?\s*liquid\b([\s\S]*?)[-]?%\}/g;
+    let block;
+    while ((block = liquidTag.exec(this.source)) !== null) {
+      blocks.push({
+        start: block.index,
+        end: block.index + block[0].length,
+        bodyStart: block.index + block[0].indexOf(block[1]!),
+        body: block[1]!,
+      });
+    }
+
+    const braced = new RegExp(`\\{%[-]?\\s*(${tagPattern})\\s+${argPattern}`, 'g');
+    let match;
+    while ((match = braced.exec(this.source)) !== null) {
+      if (blocks.some((b) => match!.index >= b.start && match!.index < b.end)) continue;
+      found.push({ fullMatch: match[0], groups: match.slice(1) as string[], index: match.index });
+    }
+
+    /* Inside a `{% liquid %}` body each tag starts its own line. Anchoring on
+       the line start is what keeps `render` in `{{ product | render_as }}` or
+       in an inline `#` comment from being read as a tag. */
+    const bare = new RegExp(`^[ \\t]*(${tagPattern})\\s+${argPattern}`, 'gm');
+    for (const b of blocks) {
+      let inner;
+      const re = new RegExp(bare.source, 'gm');
+      while ((inner = re.exec(b.body)) !== null) {
+        found.push({
+          fullMatch: inner[0].trimStart(),
+          groups: inner.slice(1) as string[],
+          index: b.bodyStart + inner.index + (inner[0].length - inner[0].trimStart().length),
+        });
+      }
+    }
+
+    return found.sort((a, b) => a.index - b.index);
+  }
+
+  /**
    * Extract {% render 'snippet' %} and {% include 'snippet' %} references
    */
   private extractSnippetReferences(fileNodeId: string): void {
-    // Match {% render 'name' %} or {% include 'name' %} with optional parameters
-    const renderRegex = /\{%[-]?\s*(render|include)\s+['"]([^'"]+)['"]/g;
-    let match;
-
-    while ((match = renderRegex.exec(this.source)) !== null) {
-      const [fullMatch, tagType, snippetName] = match;
+    // Both spellings: {% render 'name' %} and a bare `render 'name'` line
+    // inside a {% liquid %} block.
+    for (const match of this.findTagOccurrences('render|include', `['"]([^'"]+)['"]`)) {
+      const fullMatch = match.fullMatch;
+      const [tagType, snippetName] = match.groups;
       const line = this.getLineNumber(match.index);
 
       // Create an import node for searchability
@@ -202,12 +264,10 @@ export class LiquidExtractor {
    * Extract {% section 'name' %} references
    */
   private extractSectionReferences(fileNodeId: string): void {
-    // Match {% section 'name' %}
-    const sectionRegex = /\{%[-]?\s*section\s+['"]([^'"]+)['"]/g;
-    let match;
-
-    while ((match = sectionRegex.exec(this.source)) !== null) {
-      const [fullMatch, sectionName] = match;
+    // Both spellings, as for render/include above.
+    for (const match of this.findTagOccurrences('section', `['"]([^'"]+)['"]`)) {
+      const fullMatch = match.fullMatch;
+      const sectionName = match.groups[1];
       const line = this.getLineNumber(match.index);
 
       // Create an import node for searchability
@@ -335,12 +395,9 @@ export class LiquidExtractor {
    * Extract {% assign var = value %} statements
    */
   private extractAssignments(fileNodeId: string): void {
-    // Match {% assign variable_name = ... %}
-    const assignRegex = /\{%[-]?\s*assign\s+(\w+)\s*=/g;
-    let match;
-
-    while ((match = assignRegex.exec(this.source)) !== null) {
-      const [, variableName] = match;
+    // Both spellings. Most of a modern theme's assigns are the bare kind.
+    for (const match of this.findTagOccurrences('assign', `(\\w+)\\s*=`)) {
+      const variableName = match.groups[1];
       const line = this.getLineNumber(match.index);
 
       // Create a variable node
@@ -356,7 +413,7 @@ export class LiquidExtractor {
         startLine: line,
         endLine: line,
         startColumn: match.index - this.getLineStart(line),
-        endColumn: match.index - this.getLineStart(line) + match[0].length,
+        endColumn: match.index - this.getLineStart(line) + match.fullMatch.length,
         updatedAt: Date.now(),
       };
 
