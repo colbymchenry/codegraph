@@ -163,8 +163,11 @@ For a compatibility matrix, run the same fixture command using each intended
 CodeGraph build and actual operating system, preserving JSON output, engine
 version and exit. `engines` is an assertion about those builds, not proof by itself.
 The starter's range defaults to the current preview version through `<2`; narrow
-it if you have not validated that range. Native Windows/macOS validation is still
-pending for this preview.
+it if you have not validated that range. The preview author/lifecycle checks
+passed on Linux x64, Windows Server 2022 x64 and macOS 15 ARM64 with Node 22.23.2;
+see the [native validation report](../validation/extensions-native-20260922.md)
+for commands, exact revisions and untested combinations. This does not certify
+your extension or every version in its declared range.
 
 ## Publish through the local marketplace
 
@@ -267,8 +270,12 @@ journals need a verified backup or manual repair; they are never guessed away.
 The companion returns the recovery error instead of claiming the project is
 ready.
 
-The current validation covers process death on Linux using local files and
-SQLite locking. Native Windows/macOS, machine power loss, network filesystems,
-and mixed older writers that bypass the coordinator have not been validated.
+Process-death checks passed on Linux x64, Windows Server 2022 x64 and macOS 15
+ARM64 using local files and SQLite locking, including the default data directory
+and a `CODEGRAPH_DIR` override. Extension package/trust files and recovery records
+follow that override. The native report records both POSIX kills and Windows
+termination results. Machine power loss, network filesystems, simultaneous
+Windows/WSL project use, and mixed older writers bypassing coordination remain
+unvalidated.
 Direct edits to the graph database, deliberate deletion of the coordination
 files, and concurrent project destruction are outside this recovery contract.
