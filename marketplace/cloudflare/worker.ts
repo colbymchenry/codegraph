@@ -30,6 +30,7 @@ export async function validateSubmission(raw:any) {
     const key=await crypto.subtle.importKey('jwk',raw.publicKey,{name:'ECDSA',namedCurve:'P-256'},true,['verify']);
     if(!await crypto.subtle.verify({name:'ECDSA',hash:'SHA-256'},key,decodeBase64(raw.signature),utf8.encode(raw.payload)))throw Error('Publisher signature is invalid');
     const p=JSON.parse(raw.payload);
+    if(p.official===true||p.publisherId!==undefined||p.provenance!==undefined)throw Error('Official status and publisher identity require the trusted operator path');
     if(!Number.isFinite(p.timestamp)||Math.abs(Date.now()-p.timestamp)>600000||typeof p.nonce!=='string'||!p.nonce||p.nonce.length>200)throw Error('Submission expired or invalid nonce');
     for(const field of ['name','description','publisher','readme','source','artifact'])if(typeof p[field]!=='string')throw Error('Missing '+field);
     if(!p.name.trim()||p.name.length>80||!p.publisher.trim()||p.publisher.length>80||p.description.length>240||p.readme.length>30000)throw Error('Listing fields exceed allowed length');

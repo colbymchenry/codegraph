@@ -14,5 +14,6 @@ export async function startLocal({state,testing=false,boundary,port=0,publishing
   const exists=await db.prepare("SELECT name FROM sqlite_master WHERE name='registry_meta'").first();
   if(!exists&&!initialize){await mf.dispose();throw Error('Source registry is not initialized; verify the source state path before backup');}
   if(!exists)for(const line of fs.readFileSync(path.join(root,'migrations/0001_registry.sql'),'utf8').split('\n').filter(Boolean))await db.exec(line);
+  if(initialize&&!await db.prepare("SELECT value FROM registry_meta WHERE key='official_operator'").first())await db.batch(fs.readFileSync(path.join(root,'migrations/0002_official_operator.sql'),'utf8').split('\n').filter(Boolean).map(sql=>db.prepare(sql)));
   return {mf,db,bucket:await mf.getR2Bucket('PACKAGES'),port:Number((await mf.ready).port),close:()=>mf.dispose()};
 }

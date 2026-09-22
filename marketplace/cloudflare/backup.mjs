@@ -2,6 +2,7 @@
 // No administrative HTTP endpoint is shipped. Remote export/restore steps are in cloudflare-hosting.md.
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import {validateOfficialListing} from './official.mjs';
 import {createHash} from 'node:crypto';
 import {createRequire} from 'node:module';
 const require=createRequire(import.meta.url),{parsePackage}=require('../../dist/plugins/package');
@@ -12,7 +13,7 @@ function check(snapshot,objects){
   const owners=new Map(snapshot.tables.extensions.map(r=>[r.id,r.publisher]));
   for(const row of snapshot.tables.releases){
     const listing=JSON.parse(row.listing),bytes=objects.get(row.integrity),p=parsePackage(bytes).package;
-    if(hash(bytes)!==row.integrity||bytes.length!==row.size||row.object_key!=='packages/sha256/'+row.integrity||p.codegraph.id!==row.id||p.version!==row.version||owners.get(row.id)!==row.publisher||listing.publisherId!==row.publisher||listing.integrity!==row.integrity||listing.id!==row.id||listing.version!==row.version||listing.official!==false||listing.apiVersion!==p.codegraph.apiVersion||listing.engines!==(p.codegraph.engines??'*')||JSON.stringify(listing.capabilities)!==JSON.stringify(p.codegraph.capabilities))throw Error('Backup artifact, ownership or listing mismatch');
+    if(hash(bytes)!==row.integrity||bytes.length!==row.size||row.object_key!=='packages/sha256/'+row.integrity||p.codegraph.id!==row.id||p.version!==row.version||owners.get(row.id)!==row.publisher||listing.publisherId!==row.publisher||listing.integrity!==row.integrity||listing.id!==row.id||listing.version!==row.version||(listing.official!==false&&!validateOfficialListing(listing,bytes))||listing.apiVersion!==p.codegraph.apiVersion||listing.engines!==(p.codegraph.engines??'*')||JSON.stringify(listing.capabilities)!==JSON.stringify(p.codegraph.capabilities))throw Error('Backup artifact, ownership or listing mismatch');
   }
   for(const id of owners.keys())if(!snapshot.tables.releases.some(r=>r.id===id))throw Error('Backup has orphan ownership');
 }

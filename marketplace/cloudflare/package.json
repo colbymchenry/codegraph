@@ -10,8 +10,9 @@
     "check:access": "wrangler whoami"
   },
   "devDependencies": {
-    "wrangler": "4.136.1",
+    "aws4fetch": "1.0.20",
+    "esbuild": "0.28.1",
     "miniflare": "5.20260921.0-alpha",
-    "esbuild": "0.28.1"
+    "wrangler": "4.136.1"
   }
 }
