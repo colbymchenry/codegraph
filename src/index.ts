@@ -567,7 +567,12 @@ export class CodeGraph {
       let candidate: CodeGraph | undefined;
       let attached = false;
       try {
+        const configFile = path.join(this.projectRoot, 'codegraph.json');
+        const readConfig = () => fs.existsSync(configFile) ? fs.readFileSync(configFile, 'utf8') : null;
+        const configAtLoad = readConfig();
         const plugins = await loadPlugins(this.projectRoot);
+        const activatedStamp = this.extensionStamp(plugins);
+        if (readConfig() !== configAtLoad) throw new Error('Project configuration changed while loading extensions; previous graph retained. Retry the update.');
         if (plugins.diagnostics.some(d => d.state !== 'loaded')) throw new Error(plugins.diagnostics.map(d => `${d.id}: ${d.message ?? d.state}`).join('; '));
         const inputs = plugins.synthPasses.length ? this.semanticInputStamp() : undefined;
         if (!options.extensionTransactionId) { beginGraphCandidate(this.projectRoot, candidateId); recorded = true; }
@@ -597,16 +602,18 @@ export class CodeGraph {
           // Candidate replacement is one bulk load. Keep the FTS trigger window
           // INSIDE this SQLite transaction so a kill rolls back graph and FTS
           // schema together; readers keep the prior committed index.
-          const bulkFts = process.env.CODEGRAPH_NO_SEMANTIC_BULK_FTS !== '1';
-          if (bulkFts) this.db.beginBulkNodeLoad();
+          const bulkGraphIndexes = process.env.CODEGRAPH_NO_SEMANTIC_BULK !== '1';
+          if (bulkGraphIndexes) { this.db.beginBulkNodeLoad(); this.db.beginBulkParseLoad(); }
           channel('codegraph.semantic.update').publish({ projectRoot: this.projectRoot, phase: 'copy_started' });
           this.queries.clear();
           for (const table of ['files', 'nodes', 'edges', 'unresolved_refs']) {
             connection.exec(`INSERT INTO main.${table} SELECT * FROM extension_candidate.${table}`);
           }
-          if (bulkFts) this.db.endBulkNodeLoad();
+          if (bulkGraphIndexes) { this.db.endAtomicBulkParseLoad(); this.db.endBulkNodeLoad(); }
           this.queries.setMetadata('plugins_last_run', JSON.stringify(plugins.diagnostics));
-          this.queries.setMetadata('indexed_with_plugins', this.extensionStamp(plugins));
+          // Freeze the evaluated configuration. An edit during the SQLite copy
+          // must stay dirty for the next sync, never stamp old output as current.
+          this.queries.setMetadata('indexed_with_plugins', activatedStamp);
           this.queries.setMetadata('indexed_with_version', CodeGraphPackageVersion);
           this.queries.setMetadata('indexed_with_extraction_version', String(EXTRACTION_VERSION));
           this.queries.setMetadata('index_state', 'complete');

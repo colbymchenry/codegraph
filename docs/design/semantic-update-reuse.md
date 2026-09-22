@@ -30,7 +30,9 @@ Before/after source stamps cover the scanned indexed files plus root config and
 ignore rules. An observed change aborts before commit and preserves the working
 graph. This does not lock the filesystem: arbitrary external plugin I/O or a
 write after the final observation is not a certified snapshot. Retry after edits
-settle. Cache entries are content-keyed, so a failed candidate may safely retain
+settle. The committed plugin fingerprint is frozen at registry load, so a config
+edit during the subsequent SQLite copy stays dirty for the next sync instead of
+incorrectly labelling an old graph as matching new options. Cache entries are content-keyed, so a failed candidate may safely retain
 unchanged core parses but never graph or plugin output.
 
 Graph-only candidate records contain a checksummed UUID and diagnostic PID.
@@ -38,11 +40,11 @@ The project SQLite coordinator is authoritative, independent of PID reuse.
 Fresh opens reclaim the exact orphaned stage after process death; an invalid
 record blocks recovery without deleting files. During a live graph-only update,
 readers can use the old committed graph. The existing SQLite graph transaction
-still determines old/new visibility. FTS triggers are suspended and rebuilt
+still determines old/new visibility. Built-in non-unique graph secondary indexes and FTS triggers are suspended and rebuilt
 inside that same transaction using the existing bulk-load API, avoiding per-row
-FTS work during replacement. A kill rolls back the trigger schema and FTS data
+index maintenance during replacement. A kill rolls back the secondary/trigger schema and FTS data
 with the graph; readers never see a committed missing-trigger window.
-`CODEGRAPH_NO_SEMANTIC_BULK_FTS=1` retains the previous trigger path. A commit marker invalidates long-lived
+`CODEGRAPH_NO_SEMANTIC_BULK=1` retains the previous trigger path. A commit marker invalidates long-lived
 reader caches. Managed config/trust transactions retain their exclusive guard.
 
 Measurements and correctness/recovery coverage will be linked after validation.

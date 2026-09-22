@@ -48,13 +48,13 @@ it('reuses core parsing while rerunning global hooks, rejects source races, isol
   const author = path.join(root, 'author'); createExtensionProject(author, 'global-fixture');
   const manifestPath = path.join(author, 'package.json'), manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   manifest.codegraph.capabilities = ['frameworks', 'synthPasses']; fs.writeFileSync(manifestPath, JSON.stringify(manifest));
-  fs.writeFileSync(path.join(author, 'index.cjs'), `module.exports = ({projectRoot}) => ({
+  fs.writeFileSync(path.join(author, 'index.cjs'), `module.exports = ({projectRoot,options}) => ({
     frameworks:[{name:'global-framework',languages:['python'],detect:()=>true,resolve:()=>null,
       extract(file){ if(file!=='handlers.py')return {nodes:[],references:[]};
         const name=require('fs').readFileSync(require('path').join(projectRoot,'binding.py'),'utf8').trim();
         return {nodes:[{id:'plugin:global-fixture:route',kind:'route',name,qualifiedName:name,filePath:file,language:'python',startLine:1,endLine:1,startColumn:0,endColumn:1,metadata:{}}],references:[]}; }}],
     synthPasses:[{name:'bindings',languages:['python'],run(ctx){
-      const name=(ctx.readFile('binding.py')||'').trim(); if(name==='FAIL')throw Error('real pass failed');
+      const name=options.target||(ctx.readFile('binding.py')||'').trim(); if(name==='FAIL')throw Error('real pass failed');
       const from=ctx.getNodesByName('dispatch').filter(n=>n.kind==='function'),to=ctx.getNodesByName(name).filter(n=>n.kind==='function');if(from.length!==1||to.length!==1)return [];
       return [{source:from[0].id,target:to[0].id,kind:'calls',line:1,metadata:{label:'Global binding'}}]; }}]
   });`);
@@ -91,6 +91,18 @@ it('reuses core parsing while rerunning global hooks, rejects source races, isol
     expect(edges(g)).toEqual([['dispatch','cancel']]);
     fs.writeFileSync(binding,'receipt'); await g.sync(); expect(edges(g)).toEqual([['dispatch','receipt']]);
     expect(edges(graphs[1])).toEqual([['dispatch','cancel']]);
+    // A config edit after the final source observation must remain dirty. The
+    // committed stamp must describe the evaluated options, not the later file.
+    const configFile = path.join(project, 'codegraph.json'), config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+    const editDuringCopy = (event: any) => { if (event.projectRoot === project && event.phase === 'copy_started') {
+      config.plugins[0].options = { target: 'cancel' }; fs.writeFileSync(configFile, JSON.stringify(config));
+    }};
+    diagnostics.subscribe(editDuringCopy);
+    try { await g.indexFiles(['handlers.py']); } finally { diagnostics.unsubscribe(editDuringCopy); }
+    expect(edges(g)).toEqual([['dispatch','receipt']]);
+    expect(JSON.parse(fs.readFileSync(configFile,'utf8')).plugins[0].options.target).toBe('cancel');
+    await g.sync(); expect(edges(g)).toEqual([['dispatch','cancel']]);
+    config.plugins[0].options = {}; fs.writeFileSync(configFile,JSON.stringify(config)); await g.sync();
     const before = JSON.stringify([edges(g),g.getNodesByKind('route')]);
     const fresh = await CodeGraph.open(project); graphs.push(fresh); await fresh.refreshPluginIndex();
     expect(JSON.stringify([edges(fresh),fresh.getNodesByKind('route')])).toBe(before);

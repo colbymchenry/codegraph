@@ -303,6 +303,20 @@ export class DatabaseConnection {
     await this.endBulkEdgeLoad();
   }
 
+  /** @internal Synchronous restoration for a whole-graph replacement transaction.
+   * The caller deletes ALL graph rows, so no mid-load queries need secondary
+   * indexes. Unlike ordinary async indexing, no yield may escape the enclosing
+   * SQLite transaction. Primary/unique constraints and user indexes stay intact.
+   */
+  endAtomicBulkParseLoad(): void {
+    const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf-8');
+    for (const index of [...DatabaseConnection.BULK_PARSE_INDEX_NAMES, ...DatabaseConnection.BULK_EDGE_INDEX_NAMES]) {
+      const statement = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${index}\\b[^;]*;`));
+      if (!statement) throw new Error(`schema.sql: index ${index} not found for atomic bulk recreation`);
+      this.db.exec(statement[0]);
+    }
+  }
+
   /**
    * unresolved_refs secondary indexes NOT read by the batched resolution
    * loop. The loop pages pending refs by keyset (`status='pending' AND id>?`
