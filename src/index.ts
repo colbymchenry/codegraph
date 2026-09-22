@@ -266,6 +266,25 @@ export class CodeGraph {
   }
 
   /**
+   * Set when this instance followed a database replaced on disk (#1902): the
+   * next sync that can run reconciles the whole tree, because whatever the old
+   * handle absorbed since the rebuild never reached the new file.
+   */
+  private pendingFullReconcile = false;
+
+  /** How long a recreated, not-yet-indexed database is treated as a rebuild in progress. */
+  private static readonly RECREATE_GRACE_MS = 120_000;
+
+  /** The database file at the path was written within the recreate grace window. */
+  private isFreshlyRecreated(): boolean {
+    try {
+      return Date.now() - fs.statSync(getDatabasePath(this.projectRoot)).mtimeMs < CodeGraph.RECREATE_GRACE_MS;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Heal a stale database handle in place. If `.codegraph/` was removed and
    * recreated at the SAME path while this instance held the DB open — a git
    * worktree removed and re-added, or `rm -rf .codegraph` + `codegraph init` —
@@ -1091,10 +1110,25 @@ export class CodeGraph {
       // If the reopen fails (the rebuild is mid-way), report the lock-busy
       // shape so the watcher keeps its pending files and retries.
       try {
-        if (this.reopenReplacedDatabase()) options = { ...options, paths: undefined };
+        if (this.reopenReplacedDatabase()) this.pendingFullReconcile = true;
       } catch {
         this.fileLock.release();
         return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
+      }
+      if (this.pendingFullReconcile) {
+        // `codegraph index` recreates the file, THEN takes the write lock in
+        // indexAll. A sync landing in that gap would otherwise run a full
+        // reconcile of the empty file and hold the lock the rebuild is about
+        // to ask for. A fresh file with no index_state yet is that rebuild:
+        // step aside (lock-busy shape, the watcher retries) and reconcile in
+        // full once it is done. Bounded, so a rebuild that died before
+        // indexing does not park the watcher forever.
+        if (this.getIndexState() === null && this.isFreshlyRecreated()) {
+          this.fileLock.release();
+          return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
+        }
+        this.pendingFullReconcile = false;
+        options = { ...options, paths: undefined };
       }
       // Defer WAL auto-checkpointing for the whole incremental run, exactly
       // as indexAll does for the bulk path (#1231): sync's store loop and its
