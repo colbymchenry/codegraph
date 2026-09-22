@@ -214,8 +214,10 @@ Per-repository records, hashes and all nine raw responses are under
   author tests and a fresh generated-extension publish/install/removal exercise.
   See [author acceptance](extensions-author-20260922.md) for its separate evidence
   and limits; the original recovery scripts alone did not satisfy this gate.
-- The catalog selects the most recently published release. Installation rejects
-  incompatible engine ranges but does not resolve an older compatible release.
+- The compatible-version gap was subsequently closed for Linux/local in
+  `79f2d9f`: browser and headless registry installs select the highest compatible
+  stable semver; exact pins and automatic no-downgrade updates are verified.
+  See [compatible release acceptance](extensions-compatibility-20260922.md).
 - Exception rollback is tested. Process termination between config/database
   writes and stale `operation.lock` recovery are not completed crash guarantees.
 - Only Linux was exercised. Native Windows/macOS installation, worker loading,
