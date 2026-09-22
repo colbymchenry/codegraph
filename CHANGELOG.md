@@ -154,6 +154,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Extension installation and interrupted-operation recovery now honor `CODEGRAPH_DIR` without creating or modifying the default data directory.
+
 - Managed extensions remain trusted when a project is opened with different path capitalization on Windows and macOS.
 - Publisher forms preserve entered descriptions and source links while package metadata finishes loading.
 

@@ -19,13 +19,13 @@ const env = { ...process.env, CODEGRAPH_TELEMETRY: '0', CODEGRAPH_WASM_RELAUNCHE
 const playwright = process.env.PLAYWRIGHT_MODULE || path.join(root, '.qa/browser/node_modules/playwright');
 env.PLAYWRIGHT_MODULE = playwright;
 env.CHROME_PATH = process.env.CHROME_PATH || require(playwright).chromium.executablePath();
-async function run(name, command, args, timeout = 360000) {
-  const step = { name, command: [command, ...args], cwd: root, revision: version, started: new Date().toISOString(), status: 'running' };
+async function run(name, command, args, timeout = 360000, overrides = {}) {
+  const step = { name, command: [command, ...args], cwd: root, revision: version, overrides, started: new Date().toISOString(), status: 'running' };
   metadata.steps.push(step); save(); console.log('START', name);
   const logFile = path.join(out, name + '.log'); const log = fs.openSync(logFile, 'w');
   const started = Date.now();
   const result = await new Promise(resolve => {
-    const child = spawn(command, args, { cwd: root, env, stdio: ['ignore', log, log], timeout });
+    const child = spawn(command, args, { cwd: root, env: { ...env, ...overrides }, stdio: ['ignore', log, log], timeout });
     let error;
     child.on('error', e => error = String(e));
     child.on('close', (exit, signal) => resolve({ exit, signal, error }));
@@ -42,12 +42,13 @@ async function run(name, command, args, timeout = 360000) {
   if (built) {
     await run('marketplace-build', ...npmCommand(['run', 'build', '--prefix', 'marketplace']));
     await run('focused', process.execPath, ['node_modules/vitest/vitest.mjs', 'run',
-      '__tests__/extension-trust.test.ts', '__tests__/extension-releases.test.ts', '__tests__/extension-marketplace.test.ts', '__tests__/extension-author.test.ts', '__tests__/plugins.test.ts', '__tests__/extension-explore.test.ts',
+      '__tests__/foundation.test.ts', '__tests__/extension-trust.test.ts', '__tests__/extension-releases.test.ts', '__tests__/extension-marketplace.test.ts', '__tests__/extension-author.test.ts', '__tests__/plugins.test.ts', '__tests__/extension-explore.test.ts',
       '__tests__/db-reopen-on-replace.test.ts', '__tests__/status-json.test.ts', '__tests__/sync.test.ts', '__tests__/concurrent-locking.test.ts',
       '--maxWorkers=2', '--minWorkers=1', '--reporter=default', '--reporter=json', `--outputFile.json=${path.join(out, 'focused.json')}`]);
     await run('compiled-workers', process.execPath, ['--test', 'scripts/validation/extensions-runtime.test.cjs']);
     await run('native-paths', process.execPath, ['scripts/validation/native-paths.cjs']);
     await run('process-recovery', process.execPath, ['scripts/validation/extensions-recovery.cjs'], 600000);
+    await run('process-recovery-override', process.execPath, ['scripts/validation/extensions-recovery.cjs'], 600000, { CODEGRAPH_DIR: '.codegraph-native', RECOVERY_OUTPUT: path.join(out, 'recovery-override') });
     await run('external-author', process.execPath, ['scripts/validation/extension-author.cjs'], 600000);
     await run('compatibility', process.execPath, ['scripts/validation/extensions-compatibility.cjs']);
     await run('browser', process.execPath, ['scripts/validation/marketplace-browser.cjs']);

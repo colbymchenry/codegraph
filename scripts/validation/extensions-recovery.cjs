@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const { channel } = require('node:diagnostics_channel');
 const { randomUUID, createHash } = require('node:crypto');
-const { CodeGraph } = require('../../dist');
+const { CodeGraph, getCodeGraphDir, codeGraphDirName } = require('../../dist');
 const { ExtensionManager } = require('../../dist/plugins/manager');
 const { recoverExtensions } = require('../../dist/plugins/recovery');
 const { packageDigest } = require('../../dist/plugins/package');
@@ -16,9 +16,9 @@ function artifact(version = '1.0.0') {
     files: { 'index.cjs': `module.exports=()=>({frameworks:[{name:'routes',languages:['python'],detect:()=>true,resolve:()=>null,extract(file){return {nodes:[{id:'plugin:recovery-demo:'+file,kind:'route',name:'/${version}',qualifiedName:file+'::route',filePath:file,language:'python',startLine:1,endLine:1,startColumn:0,endColumn:1,updatedAt:0}],references:[]}}}]});` } }));
 }
 function config(root) { return fs.existsSync(path.join(root, 'codegraph.json')) ? fs.readFileSync(path.join(root, 'codegraph.json'), 'utf8') : null; }
-function trust(root) { const file = path.join(root, '.codegraph/plugins/trust.json'); return fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null; }
+function trust(root) { const file = path.join(getCodeGraphDir(root), 'plugins/trust.json'); return fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null; }
 function inspect(root) {
-  const dbPath = path.join(root, '.codegraph/codegraph.db');
+  const dbPath = path.join(getCodeGraphDir(root), 'codegraph.db');
   let routes = [];
   if (fs.existsSync(dbPath)) {
     const db = new DatabaseSync(dbPath, { readOnly: true });
@@ -96,10 +96,11 @@ if (process.argv[2] === '--child') {
     return root;
   }
   function clean(root) {
-    const folder = path.join(root, '.codegraph/plugins');
+    if (codeGraphDirName() !== '.codegraph') assert.equal(fs.existsSync(path.join(root, '.codegraph')), false, 'override must not create default data directory');
+    const folder = path.join(getCodeGraphDir(root), 'plugins');
     assert.ok(!fs.existsSync(path.join(folder, 'transaction.json')));
     assert.ok(!fs.existsSync(path.join(folder, 'operation.lock')));
-    assert.ok(!fs.readdirSync(path.join(root, '.codegraph')).some(n => n.startsWith('extension-stage-')));
+    assert.ok(!fs.readdirSync(getCodeGraphDir(root)).some(n => n.startsWith('extension-stage-')));
     assert.ok(!fs.readdirSync(folder).some(n => n.startsWith('stage-')));
     assert.equal(fs.readFileSync(path.join(root, 'keep.txt'), 'utf8'), 'unrelated bytes');
     const entries = JSON.parse(config(root) || '{}').plugins || [], trusted = JSON.parse(trust(root) || '{}');
@@ -133,7 +134,7 @@ if (process.argv[2] === '--child') {
       for (const boundary of ['package_ready', 'trust_written']) {
         const root = await project(true), before = inspect(root);
         await killAt(root, 'update', boundary); await run(root); assert.deepEqual(inspect(root), before); clean(root);
-        const packages = fs.readdirSync(path.join(root, '.codegraph/plugins/packages')); assert.equal(packages.length, 1);
+        const packages = fs.readdirSync(path.join(getCodeGraphDir(root), 'plugins/packages')); assert.equal(packages.length, 1);
         receipt({ action: 'update', boundary, decision: 'rollback and discard new package/trust', passed: true });
       }
       const first = await project(false, false);
@@ -146,13 +147,13 @@ if (process.argv[2] === '--child') {
       receipt({ action: 'kill recovery itself', boundary: 'recovery_config', decision: 'idempotent rollback', passed: true });
       const live = await project(true), c = child(live, 'update', 'config_written');
       await Promise.race([c.reached, c.done.then(r => { throw new Error('Live-owner fixture exited early: ' + r.stderr); })]);
-      const lock = path.join(live, '.codegraph/plugins/operation.lock'); fs.utimesSync(lock, 1, 1);
+      const lock = path.join(getCodeGraphDir(live), 'plugins/operation.lock'); fs.utimesSync(lock, 1, 1);
       for (const action of ['install', 'inspect', 'index']) {
         const result = await run(live, action, 1); assert.match(result.stderr, /operation is active/);
       }
       assert.ok(processes.has(c.processChild)); c.processChild.kill('SIGKILL'); await c.done; await run(live); clean(live);
       receipt({ action: 'live aged owner', decision: 'mutation/read/index excluded; no timeout stealing', passed: true });
-      const reused = await project(true), owner = path.join(reused, '.codegraph/plugins/operation.lock');
+      const reused = await project(true), owner = path.join(getCodeGraphDir(reused), 'plugins/operation.lock');
       fs.writeFileSync(owner, JSON.stringify({ format: 'codegraph-operation-lock-1', id: randomUUID(), pid: process.pid, startedAt: 1 }));
       await run(reused); clean(reused);
       fs.writeFileSync(owner, String(process.pid));
@@ -161,31 +162,31 @@ if (process.argv[2] === '--child') {
       fs.writeFileSync(owner, String(deadPid)); await run(reused); clean(reused);
       receipt({ action: 'PID reuse and legacy owners', decision: 'SQLite ownership authoritative; live legacy blocked, dead legacy reclaimed', passed: true });
       const torn = await project(true); await killAt(torn, 'update', 'config_written');
-      const journal = path.join(torn, '.codegraph/plugins/transaction.json'), original = fs.readFileSync(journal);
-      fs.writeFileSync(path.join(torn, '.codegraph/plugins/operation.lock'), '{');
+      const journal = path.join(getCodeGraphDir(torn), 'plugins/transaction.json'), original = fs.readFileSync(journal);
+      fs.writeFileSync(path.join(getCodeGraphDir(torn), 'plugins/operation.lock'), '{');
       fs.writeFileSync(journal, '{'); const state = inspect(torn);
       assert.match((await run(torn, 'inspect', 1)).stderr, /invalid transaction record/); assert.deepEqual(inspect(torn), state);
       fs.writeFileSync(journal, original); await run(torn); clean(torn);
-      fs.writeFileSync(path.join(torn, '.codegraph/plugins/operation.lock'), '{');
-      assert.match((await run(torn, 'inspect', 1)).stderr, /torn\/unknown owner/); fs.unlinkSync(path.join(torn, '.codegraph/plugins/operation.lock'));
+      fs.writeFileSync(path.join(getCodeGraphDir(torn), 'plugins/operation.lock'), '{');
+      assert.match((await run(torn, 'inspect', 1)).stderr, /torn\/unknown owner/); fs.unlinkSync(path.join(getCodeGraphDir(torn), 'plugins/operation.lock'));
       receipt({ action: 'torn records', decision: 'invalid journal/unknown owner fail closed; valid journal recovers torn owner', passed: true });
       for (const boundary of ['config_written', 'graph_committed']) {
         const edited = await project(true); await killAt(edited, 'update', boundary);
         const cfg = JSON.parse(config(edited)); cfg.userNote = 'preserve this edit'; fs.writeFileSync(path.join(edited, 'codegraph.json'), JSON.stringify(cfg));
-        const t = JSON.parse(trust(edited)); t['unrelated-user-key'] = 'preserve'; fs.writeFileSync(path.join(edited, '.codegraph/plugins/trust.json'), JSON.stringify(t));
+        const t = JSON.parse(trust(edited)); t['unrelated-user-key'] = 'preserve'; fs.writeFileSync(path.join(getCodeGraphDir(edited), 'plugins/trust.json'), JSON.stringify(t));
         await run(edited); assert.equal(JSON.parse(config(edited)).userNote, 'preserve this edit'); assert.equal(JSON.parse(trust(edited))['unrelated-user-key'], 'preserve'); clean(edited);
         receipt({ action: 'unrelated config/trust edits', boundary, decision: 'preserved', passed: true });
         const conflict = await project(true); await killAt(conflict, 'update', boundary);
         const cfg2 = JSON.parse(config(conflict)); cfg2.plugins[0].options = { userEdit: true }; const editedRaw = JSON.stringify(cfg2);
         fs.writeFileSync(path.join(conflict, 'codegraph.json'), editedRaw);
         assert.match((await run(conflict, 'inspect', 1)).stderr, /plugins were edited externally/); assert.equal(config(conflict), editedRaw);
-        const r = JSON.parse(JSON.parse(fs.readFileSync(path.join(conflict, '.codegraph/plugins/transaction.json'))).payload);
+        const r = JSON.parse(JSON.parse(fs.readFileSync(path.join(getCodeGraphDir(conflict), 'plugins/transaction.json'))).payload);
         cfg2.plugins = JSON.parse(boundary === 'graph_committed' ? r.nextConfig : r.previousConfig).plugins; cfg2.resolvedByUser = true;
         fs.writeFileSync(path.join(conflict, 'codegraph.json'), JSON.stringify(cfg2));
         await run(conflict); clean(conflict); assert.equal(JSON.parse(config(conflict)).resolvedByUser, true);
         receipt({ action: 'conflicting plugin edit', boundary, decision: 'no overwrite; actionable repair then recovery', passed: true });
       }
-      const graphLocked = await project(true), graphLock = path.join(graphLocked, '.codegraph/codegraph.lock');
+      const graphLocked = await project(true), graphLock = path.join(getCodeGraphDir(graphLocked), 'codegraph.lock');
       fs.writeFileSync(graphLock, String(process.pid)); fs.utimesSync(graphLock, 1, 1);
       assert.match((await run(graphLocked, 'update', 1)).stderr, /legacy graph owner/);
       assert.equal(fs.readFileSync(graphLock, 'utf8'), String(process.pid)); fs.unlinkSync(graphLock);
@@ -201,10 +202,10 @@ if (process.argv[2] === '--child') {
       receipt({ action: 'graph-affecting external config edit', decision: 'preserved and blocked with repair instructions', passed: true });
       const tamper = await project(true); await killAt(tamper, 'update', 'graph_committed');
       const entry = JSON.parse(config(tamper)).plugins[0];
-      const entryFile = path.join(tamper, '.codegraph/plugins/packages', entry.integrity, 'index.cjs'), originalEntry = fs.readFileSync(entryFile);
+      const entryFile = path.join(getCodeGraphDir(tamper), 'plugins/packages', entry.integrity, 'index.cjs'), originalEntry = fs.readFileSync(entryFile);
       fs.appendFileSync(entryFile, '\n// external change');
       assert.match((await run(tamper, 'inspect', 1)).stderr, /installed package managed:recovery-demo is missing or changed/);
-      assert.ok(fs.existsSync(path.join(tamper, '.codegraph/plugins/transaction.json')));
+      assert.ok(fs.existsSync(path.join(getCodeGraphDir(tamper), 'plugins/transaction.json')));
       fs.writeFileSync(entryFile, originalEntry); await run(tamper); clean(tamper);
       receipt({ action: 'changed installed package', decision: 'trust revalidated; blocked until bytes restored', passed: true });
       const cached = await project(true), reader = await CodeGraph.open(cached);
@@ -214,7 +215,7 @@ if (process.argv[2] === '--child') {
         assert.equal(reader.getNode(node.id).name, '/2.0.0');
       } finally { reader.close(); }
       receipt({ action: 'long-lived reader after fresh-process recovery', decision: 'old cached node invalidated by commit marker', passed: true });
-      fs.writeFileSync(path.join(out, 'result.json'), JSON.stringify({ platform: process.platform, arch: process.arch, node: process.version, termination: process.platform === 'win32' ? 'Node child.kill(SIGKILL) / TerminateProcess' : 'SIGKILL', rows, commands: commands.length }, null, 2));
+      fs.writeFileSync(path.join(out, 'result.json'), JSON.stringify({ platform: process.platform, arch: process.arch, node: process.version, dataDirectory: codeGraphDirName(), termination: process.platform === 'win32' ? 'Node child.kill(SIGKILL) / TerminateProcess' : 'SIGKILL', rows, commands: commands.length }, null, 2));
     } finally {
       for (const c of processes) c.kill('SIGKILL');
       if (processes.size) await new Promise(resolve => setTimeout(resolve, 300));

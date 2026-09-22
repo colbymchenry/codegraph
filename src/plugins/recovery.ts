@@ -1,6 +1,7 @@
 /** Process-death recovery for managed extensions; no PID/age based lock stealing. */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { getCodeGraphDir } from '../directory';
 import { randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { channel } from 'node:diagnostics_channel';
@@ -10,7 +11,7 @@ import { sha256, packageDigest, trustedPackageDigest, type ExtensionPackage } fr
 
 const context = new AsyncLocalStorage<string>();
 const transitions = channel('codegraph.extension.transaction');
-const dir = (root: string) => path.join(root, '.codegraph', 'plugins');
+const dir = (root: string) => path.join(getCodeGraphDir(root), 'plugins');
 const recordPath = (root: string) => path.join(dir(root), 'transaction.json');
 const ownerPath = (root: string) => path.join(dir(root), 'operation.lock');
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
@@ -102,7 +103,7 @@ function checkOwner(root: string, journal?: RecordV1): void {
   fail(root, 'torn/unknown owner record without a valid transaction; confirm no legacy installer is running before archiving the owner record');
 }
 function checkGraphOwner(root: string, transactionPid?: number): void {
-  const lock = path.join(root, '.codegraph', 'codegraph.lock'), raw = read(lock)?.trim();
+  const lock = path.join(getCodeGraphDir(root), 'codegraph.lock'), raw = read(lock)?.trim();
   if (raw === undefined) return;
   if (transactionPid && raw === String(transactionPid)) return; // orphan proved by the coordinator
   if (/^[1-9]\d*$/.test(raw)) {
@@ -113,7 +114,7 @@ function checkGraphOwner(root: string, transactionPid?: number): void {
   fail(root, 'unknown legacy graph lock; confirm its owner has stopped before archiving codegraph.lock');
 }
 function marker(root: string, graphExisted: boolean): string | null {
-  const file = path.join(root, '.codegraph', 'codegraph.db');
+  const file = path.join(getCodeGraphDir(root), 'codegraph.db');
   if (!fs.existsSync(file)) return null;
   const { db } = createDatabase(file);
   try {
@@ -129,7 +130,7 @@ function replaceObserved(root: string, file: string, observed: string | null, ta
   if (target === null) remove(file); else durableWrite(file, target);
 }
 function cleanup(root: string, r: RecordV1, committed: boolean): void {
-  const stage = path.join(root, '.codegraph', `extension-stage-${r.id}.db`);
+  const stage = path.join(getCodeGraphDir(root), `extension-stage-${r.id}.db`);
   for (const suffix of ['', '-wal', '-shm', '.lock']) remove(stage + suffix);
   fs.rmSync(path.join(dir(root), `stage-${r.id}`), { recursive: true, force: true });
   if (!committed && r.package && !r.package.existed) {
@@ -140,9 +141,9 @@ function cleanup(root: string, r: RecordV1, committed: boolean): void {
   // All modern graph writers use the coordinator. Only remove the killed
   // transaction's own old graph lock; never someone else's legacy lock.
   if (!committed && !r.graphExisted) {
-    for (const suffix of ['', '-wal', '-shm']) remove(path.join(root, '.codegraph', 'codegraph.db') + suffix);
+    for (const suffix of ['', '-wal', '-shm']) remove(path.join(getCodeGraphDir(root), 'codegraph.db') + suffix);
   }
-  const graphLock = path.join(root, '.codegraph', 'codegraph.lock');
+  const graphLock = path.join(getCodeGraphDir(root), 'codegraph.lock');
   if (read(graphLock)?.trim() === String(r.pid)) remove(graphLock);
 }
 /** Validate the version/trust side before removing the only recovery record. */
@@ -229,7 +230,7 @@ export class ExtensionTransaction {
   readonly record: RecordV1;
   constructor(readonly root: string, nextConfig: string, pkg?: { contents: ExtensionPackage; integrity: string }) {
     if (fs.existsSync(recordPath(root))) throw new Error('An extension transaction is already active');
-    this.record = { format: 1, id: randomUUID(), pid: process.pid, graphExisted: fs.existsSync(path.join(root, '.codegraph', 'codegraph.db')),
+    this.record = { format: 1, id: randomUUID(), pid: process.pid, graphExisted: fs.existsSync(path.join(getCodeGraphDir(root), 'codegraph.db')),
       previousConfig: read(path.join(root, 'codegraph.json')), nextConfig,
       previousTrust: read(path.join(dir(root), 'trust.json')), nextTrust: read(path.join(dir(root), 'trust.json')),
       ...(pkg ? { package: { integrity: pkg.integrity, existed: fs.existsSync(path.join(dir(root), 'packages', pkg.integrity)) } } : {}) };

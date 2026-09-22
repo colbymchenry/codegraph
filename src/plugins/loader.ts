@@ -1,5 +1,6 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { getCodeGraphDir } from '../directory';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { NODE_KINDS, EDGE_KINDS, LANGUAGES, type Node, type Edge } from '../types';
@@ -11,7 +12,7 @@ import { loadPluginEntries } from '../project-config';
 import { version as engineVersion } from '../../package.json';
 
 const importESM = new Function('url', 'return import(url)') as (url: string) => Promise<unknown>;
-export const pluginDirectory = (root: string): string => path.join(root, '.codegraph', 'plugins');
+export const pluginDirectory = (root: string): string => path.join(getCodeGraphDir(root), 'plugins');
 
 function resolveEntry(root: string, entry: PluginEntry): ResolvedPlugin {
   let packageRoot: string;
