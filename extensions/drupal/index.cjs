@@ -35,6 +35,47 @@ function codeMask(source) {
   }
   return chars.join('');
 }
+// Only metadata immediately attached to a declaration counts. Walking backward
+// over balanced attributes avoids carrying examples from an earlier class body.
+function declarationMetadata(source, code, offset) {
+  const parts = [];
+  let end = offset;
+  for (;;) {
+    while (end > 0 && /\s/.test(source[end - 1])) end--;
+    const tailStart = Math.max(0, end - 16);
+    const modifier = /\b(?:public|protected|private|static|final|abstract|readonly)\s*$/.exec(code.slice(tailStart, end));
+    if (modifier && tailStart + modifier.index + modifier[0].length === end) { end = tailStart + modifier.index; continue; }
+    if (source.slice(end - 2, end) === '*/') {
+      const start = source.lastIndexOf('/*', end - 2);
+      if (start < 0) break;
+      if (source.startsWith('/**', start)) parts.unshift(source.slice(start, end));
+      end = start; continue;
+    }
+    if (code[end - 1] === ']') {
+      let depth = 1, start = end - 2;
+      for (; start >= 0; start--) {
+        if (code[start] === ']') depth++;
+        if (code[start] === '[' && --depth === 0) break;
+      }
+      if (start < 1 || code[start - 1] !== '#') break;
+      parts.unshift(source.slice(start - 1, end)); end = start - 1; continue;
+    }
+    break;
+  }
+  return parts.join('\n');
+}
+function callArguments(source, code, open) {
+  const args = [];
+  let depth = 1, start = open + 1;
+  for (let i = start; i < code.length; i++) {
+    if ('([{'.includes(code[i])) depth++;
+    if (')]}'.includes(code[i])) {
+      if (--depth === 0) { args.push(source.slice(start, i).trim()); return args; }
+    }
+    if (code[i] === ',' && depth === 1) { args.push(source.slice(start, i).trim()); start = i + 1; }
+  }
+  return [];
+}
 function yaml(source) {
   const doc = YAML.parseDocument(source, { uniqueKeys: true, maxAliasCount: 50 });
   if (doc.errors.length) return {};
@@ -68,11 +109,9 @@ function serviceNodes(file, source) {
 function pluginDeclarations(file, source) {
   const nodes = [];
   const code = codeMask(source);
-  let previous = 0;
   for (const cls of source.matchAll(/\b(?:final\s+|abstract\s+)?class\s+(\w+)/g)) {
     if (code[cls.index] === ' ') continue;
-    const prelude = source.slice(previous, cls.index);
-    previous = cls.index + cls[0].length;
+    const prelude = declarationMetadata(source, code, cls.index);
     const annotation = /@(Block|FieldType|FieldFormatter|FieldWidget|Action|QueueWorker|Condition|Filter|MenuLink|MigrateSource|MigrateProcess|MigrateDestination|Views\w*|SearchPlugin|RenderElement|FormElement)\s*\([\s\S]*?\bid\s*=\s*["']([^"']+)["']/g;
     const attribute = /#\[\s*(?:[\w\\]+\\)?(Block|FieldType|FieldFormatter|FieldWidget|Action|QueueWorker|Condition|Filter|MenuLink|MigrateSource|MigrateProcess|MigrateDestination|Views\w*|SearchPlugin|RenderElement|FormElement)\s*\([\s\S]*?(?:\bid\s*:\s*)?["']([^"']+)["']/g;
     const matches = [...prelude.matchAll(annotation), ...prelude.matchAll(attribute)];
@@ -110,7 +149,9 @@ module.exports = () => ({
     const files = ctx.getAllFiles().slice().sort();
     const nodesInFile = new Map();
     const sourceCache = new Map();
+    const codeCache = new Map();
     const read = f => { if (!sourceCache.has(f)) sourceCache.set(f, ctx.readFile(f) || ''); return sourceCache.get(f); };
+    const codeFor = f => { if (!codeCache.has(f)) codeCache.set(f, codeMask(read(f))); return codeCache.get(f); };
     const nodes = f => { if (!nodesInFile.has(f)) nodesInFile.set(f, ctx.getNodesInFile(f)); return nodesInFile.get(f); };
     const classes = new Map();
     const services = new Map();
@@ -131,7 +172,7 @@ module.exports = () => ({
     function fullClass(name, file) {
       if (!name) return '';
       if (name.startsWith('\\')) return clean(name);
-      const source = read(file);
+      const source = codeFor(file);
       const first = name.split('\\')[0];
       for (const u of source.matchAll(/^\s*use\s+([\w\\]+)(?:\s+as\s+(\w+))?\s*;/gm)) {
         if ((u[2] || simple(u[1])) === first) return clean(u[1]) + name.slice(first.length);
@@ -165,15 +206,18 @@ module.exports = () => ({
       if (constant[2] === 'class') return name;
       if (cls) {
         const source = read(cls.filePath);
-        const value = new RegExp('\\bconst\\s+' + constant[2] + '\\s*=\\s*["\\\']([^"\\\']+)["\\\']').exec(source);
-        if (value) return value[1];
+        const pattern = new RegExp('\\bconst\\s+' + constant[2] + '\\s*=\\s*["\\\']([^"\\\']+)["\\\']', 'g');
+        for (const value of source.matchAll(pattern)) {
+          const line = lineAt(source, value.index);
+          if (codeFor(cls.filePath)[value.index] !== ' ' && line >= cls.startLine && line <= cls.endLine) return value[1];
+        }
       }
       return name + '::' + constant[2];
     }
 
     for (const file of files.filter(phpFile)) {
       const source = read(file);
-      const ns = /\bnamespace\s+([\w\\]+)\s*[;{]/.exec(source)?.[1];
+      const ns = /\bnamespace\s+([\w\\]+)\s*[;{]/.exec(codeFor(file))?.[1];
       for (const cls of nodes(file).filter(n => n.kind === 'class')) add(classes, ns ? ns+'\\'+cls.name : cls.name, cls);
       await yieldToLoop();
     }
@@ -215,6 +259,7 @@ module.exports = () => ({
     }
     for (const file of files.filter(phpFile)) {
       const source = read(file), lines = source.split('\n');
+      const offsets = [0]; for (let i = 0; i < lines.length; i++) offsets.push(offsets[i] + lines[i].length + 1);
       for (const n of nodes(file)) {
         if (n.id.startsWith('plugin:drupal:') && n.kind === 'component') {
           const cls = nodes(file).find(c => c.kind === 'class' && c.startLine <= n.startLine && c.endLine >= n.startLine);
@@ -222,8 +267,9 @@ module.exports = () => ({
           const id = n.name.slice(n.name.indexOf(':') + 1); if (cls) add(pluginClasses, id, cls);
         }
         if (!['method', 'function'].includes(n.kind)) continue;
-        const priorNodeEnd = Math.max(0, ...nodes(file).filter(p => ['method', 'function'].includes(p.kind) && p.endLine < n.startLine).map(p => p.endLine));
-        const prelude = lines.slice(priorNodeEnd, n.startLine).join('\n');
+        const start = offsets[n.startLine - 1];
+        const declaration = /\bfunction\s+&?\s*[A-Za-z_]\w*\s*\(/.exec(codeFor(file).slice(start, offsets[n.endLine]));
+        const prelude = declaration ? declarationMetadata(source, codeFor(file), start + declaration.index) : '';
         const hookAttribute = /#\[\s*(?:[\w\\]+\\)?Hook\s*\(\s*['"]([^'"]+)['"]/g;
         for (const h of prelude.matchAll(hookAttribute)) add(hooks, h[1], n);
         if (n.kind === 'function' && /\.(module|install|theme|inc)$/.test(file)) {
@@ -239,8 +285,11 @@ module.exports = () => ({
           const cls = nodes(file).find(c => c.kind === 'class' && n.startLine >= c.startLine && n.endLine <= c.endLine);
           if (!cls || !/EventSubscriberInterface/.test(source.slice(0, source.indexOf('{', source.indexOf('class '+cls.name))))) continue;
           const body = lines.slice(n.startLine - 1, n.endLine).join('\n');
+          const bodyCode = codeMask(body);
           const registration = /(?:\$events\s*\[([^\]]+)\]\s*(?:\[\])?\s*=|(['"][^'"]+['"]|[\w\\]+::\w+)\s*=>)\s*\[?\s*['"](\w+)['"]/g;
           for (const r of body.matchAll(registration)) {
+            const executable = bodyCode.slice(r.index, r.index + r[0].length);
+            if (r[1] ? executable[0] !== '$' : !executable.includes('=>')) continue;
             const event = eventName(r[1] || r[2], file), handler = method(cls, r[3]);
             if (event && handler) add(subscribers, event, { handler, file, line: n.startLine + lineAt(body, r.index) - 1 });
           }
@@ -250,15 +299,16 @@ module.exports = () => ({
     }
     for (const file of files.filter(phpFile)) {
       const source = read(file);
-      const code = codeMask(source);
+      const code = codeFor(file);
       const patterns = [
         { re: /(?:->invokeAll|->alter)\s*\(\s*['"]([^'"]+)['"]/g, kind: 'hook' },
         { re: /(?:\\?Drupal::service|\$container->get)\s*\(\s*['"]([^'"]+)['"]/g, kind: 'service' },
         { re: /->createInstance\s*\(\s*['"]([^'"]+)['"]/g, kind: 'plugin' },
-        { re: /->dispatch\s*\(\s*[^,\n]+,\s*([^\)\n]+)\)/g, kind: 'event' },
+        { re: /->dispatch\s*\(/g, kind: 'event' },
       ];
       for (const { re, kind } of patterns) for (const m of source.matchAll(re)) {
         if (code[m.index] === ' ') continue;
+        if (kind === 'service' && /[A-Za-z0-9_\\]/.test(source[m.index - 1] || '')) continue;
         const line = lineAt(source, m.index), from = enclosing(file, line); if (!from) continue;
         if (kind === 'hook') {
           const hook = m[0].startsWith('->alter') ? m[1] + '_alter' : m[1];
@@ -269,7 +319,13 @@ module.exports = () => ({
           // Literal id must uniquely identify a declaration across managers.
           edge(from, unique(pluginClasses.get(m[1]) || []), 'Drupal plugin construction', file, line, 'instantiates');
         } else {
-          const event = eventName(m[1], file);
+          // Symfony changed from dispatch(name, event) to dispatch(event, name).
+          // Accept either explicit literal/constant slot, never infer a dynamic name.
+          const args = callArguments(source, code, m.index + m[0].length - 1);
+          if (args.length !== 2) continue;
+          const names = args.map(arg => eventName(arg, file)).filter(Boolean);
+          if (names.length !== 1) continue;
+          const event = names[0];
           for (const target of subscribers.get(event) || []) edge(from, target.handler, `Drupal event ${event}`, target.file, target.line);
         }
       }

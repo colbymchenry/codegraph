@@ -94,6 +94,21 @@ async function cli(args, expected = 0) {
     assert.equal(await page.evaluate(() => state.snapshot.error), undefined);
     await expectGraph(roots[1], '1.10.0'); assert.deepEqual(await graph(roots[0]), []);
     checks.push('one browser Install selects 1.10.0 over incompatible 9.0.0 and preview; actual Python graph refreshed only in chosen destination');
+    // Hold actual bridge resolution to inspect the transient destination state.
+    await page.evaluate(() => {
+      const originalRpc = rpc;
+      const gate = new Promise(resolve => window.releaseSelection = resolve);
+      rpc = (type, value) => type === 'command' && value?.action === 'resolve' ? gate.then(() => originalRpc(type, value)) : originalRpc(type, value);
+      window.pendingSelection = refreshSelections().finally(() => { rpc = originalRpc; });
+    });
+    await page.screenshot({ path: path.join(out, 'metadata-pending.png'), fullPage: true });
+    assert.equal(await page.locator('[data-installed-version]').innerText(), '1.10.0');
+    assert.equal(await page.locator('[data-selected-version]').innerText(), 'Checking compatibility…');
+    assert.equal(await page.locator('a[href^="/api/download/"]').count(), 0);
+    await page.evaluate(async () => { releaseSelection(); await pendingSelection; });
+    assert.equal(await page.locator('[data-selected-version]').innerText(), '1.10.0');
+    assert.equal(await page.locator('[data-installed-version]').innerText(), '1.10.0');
+    checks.push('pending compatibility refresh never shows incompatible catalog version as selected; installed and selected versions remain distinct');
     await page.screenshot({ path: path.join(out, 'desktop-installed.png'), fullPage: true });
     const config = fs.readFileSync(path.join(roots[1], 'codegraph.json'), 'utf8');
     const noChoice = await page.evaluate(async () => {

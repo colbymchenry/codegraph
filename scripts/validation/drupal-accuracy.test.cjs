@@ -15,9 +15,15 @@ test('Drupal declarations and event registrations distinguish executable wiring 
 namespace Drupal\\sample;
 class Calls {
  public function good() { \\Drupal::service('sample.dep'); $dispatcher->dispatch($event, 'done'); }
+ public function constantEvent() { $dispatcher->dispatch($event, Events::DONE); }
+ public function legacy() { $dispatcher->dispatch('done', new Event($one, $two)); }
  public function bad() { NotDrupal::service('sample.dep'); $dispatcher->dispatch($event, 'fake'); }
 }
 class Dependency {}
+class Events {
+ // const DONE = 'fake';
+ const DONE = 'done';
+}
 `,
  'Subscriber.php':`<?php
 namespace Drupal\\sample;
@@ -56,7 +62,7 @@ class Hooks {
   const db=new DatabaseSync(path.join(root,'.codegraph/codegraph.db'),{readOnly:true});
   try {
    const edges=db.prepare("SELECT s.name source,t.name target,json_extract(e.metadata,'$.label') label FROM edges e JOIN nodes s ON s.id=e.source JOIN nodes t ON t.id=e.target WHERE json_extract(e.metadata,'$.synthesizedBy')='drupal'").all();
-   for(const [source,target,label] of [['good','Dependency','Drupal service lookup'],['good','onDone','Drupal event done'],['dispatch','actualHook','Drupal hook done']])assert.ok(edges.some(e=>e.source===source&&e.target===target&&e.label===label),JSON.stringify({source,target,label,edges}));
+   for(const [source,target,label] of [['good','Dependency','Drupal service lookup'],['good','onDone','Drupal event done'],['legacy','onDone','Drupal event done'],['constantEvent','onDone','Drupal event done'],['dispatch','actualHook','Drupal hook done']])assert.ok(edges.some(e=>e.source===source&&e.target===target&&e.label===label),JSON.stringify({source,target,label,edges}));
    assert.deepEqual(edges.filter(e=>e.source==='bad'||e.target==='onFake'||e.target==='notHook'),[],'Unrelated static receiver and commented/string declarations are not wiring');
    assert.deepEqual(db.prepare("SELECT name FROM nodes WHERE kind='component' AND id LIKE 'plugin:drupal:%' ORDER BY name").all().map(n=>n.name),['Block:real']);
   }finally{db.close();}

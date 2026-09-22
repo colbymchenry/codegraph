@@ -1,9 +1,17 @@
 {
   "name": "@colbymchenry/codegraph-drupal",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Drupal routes, service wiring, hooks, plugins and event subscribers.",
   "main": "dist/index.cjs",
   "license": "MIT",
   "repository": "https://github.com/colbymchenry/codegraph",
-  "codegraph": { "id": "drupal", "apiVersion": 1, "engines": ">=1.6.0 <2", "capabilities": ["frameworks", "synthPasses"] }
+  "codegraph": {
+    "id": "drupal",
+    "apiVersion": 1,
+    "engines": ">=1.6.0 <2",
+    "capabilities": [
+      "frameworks",
+      "synthPasses"
+    ]
+  }
 }
