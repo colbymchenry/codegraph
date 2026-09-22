@@ -178,4 +178,33 @@ describe('a schema-less codegraph.db is not an initialized project (#1895)', () 
     db.close();
     expect(row.c).toBe(1);
   });
+
+  it('(d) an empty file is repaired too; a file that is not SQLite is refused with guidance and left alone', () => {
+    plantBrokenDb(parent, 'empty');
+    fs.writeFileSync(path.join(parent, 'a.py'), 'def alpha():\n    return 1\n');
+    const empty = run(parent, ['init', '--yes']);
+    expect(empty.status).toBe(0);
+    expect(empty.out).toContain('without the codegraph schema');
+    expect(isInitialized(parent)).toBe(true);
+
+    for (const bytes of ['x'.repeat(4096), 'hello']) {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1895-foreign-'));
+      try {
+        const cgDir = path.join(dir, '.codegraph');
+        fs.mkdirSync(cgDir);
+        const dbPath = path.join(cgDir, 'codegraph.db');
+        fs.writeFileSync(dbPath, bytes);
+        fs.writeFileSync(path.join(dir, 'a.py'), 'def alpha():\n    return 1\n');
+        const r = run(dir, ['init', '--yes']);
+        expect(r.status).toBe(1);
+        expect(r.out).toContain('is not a SQLite database');
+        expect(r.out).not.toContain('rebuilding');
+        expect(r.out).not.toContain('file is not a database');
+        // Nothing is deleted or rewritten behind the user's back.
+        expect(fs.readFileSync(dbPath, 'utf-8')).toBe(bytes);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
 });
