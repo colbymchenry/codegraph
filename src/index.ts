@@ -913,6 +913,9 @@ export class CodeGraph {
     const plugins = await loadPlugins(this.projectRoot);
     if ((plugins.resolved.length || this.queries.getMetadata('indexed_with_plugins')) &&
         this.queries.getMetadata('indexed_with_plugins') !== this.extensionStamp(plugins)) return this.indexAll();
+    // Semantic passes can connect unchanged files through changed metadata.
+    // A scoped write cannot invalidate those relationships safely.
+    if (plugins.synthPasses.length) return this.refreshPluginIndex();
     return withPlugins(plugins, () => this.indexFilesWithPlugins(filePaths));
   }
 
@@ -952,6 +955,21 @@ export class CodeGraph {
     }
     return withPlugins(plugins, async () => {
       this.resolver.initialize();
+      if (plugins.synthPasses.length) {
+        const changed = this.orchestrator.getChangedFiles();
+        if (changed.added.length || changed.modified.length || changed.removed.length ||
+            this.queries.getUnresolvedReferencesCount() > 0 || this.getIndexState() === 'indexing') {
+          // API v1 semantic passes have no dependency/invalidation contract.
+          // Rebuild a candidate before touching the working graph, then commit
+          // it atomically. This also removes links whose registration changed
+          // in a different file from either endpoint. Ignore scoped paths here:
+          // a global contribution must observe one consistent project snapshot.
+          const result = await this.refreshPluginIndex({ ...options, paths: undefined });
+          return { filesChecked: result.filesIndexed, filesAdded: changed.added.length,
+            filesModified: changed.modified.length, filesRemoved: changed.removed.length,
+            nodesUpdated: result.nodesCreated, durationMs: result.durationMs };
+        }
+      }
       const result = await this.syncWithPlugins(options);
       this.queries.setMetadata('plugins_last_run', JSON.stringify(plugins.diagnostics));
       return result;

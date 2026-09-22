@@ -17,6 +17,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Extension preview
 
+- Reconcile global semantic-extension links after sync or explicit file indexing with an atomic candidate rebuild. Failed passes preserve the working graph; changed-file sync currently pays full-rebuild cost for these extensions.
+
 - Prepare immutable Drupal extension 0.1.1: ignore unrelated static receivers and commented/quoted declarations, and resolve both explicit Symfony event argument orders. Preserve the reviewed 0.1.0 artifact and policy.
 - Keep installed and selected marketplace versions distinct while compatibility metadata refreshes; pending requests no longer display an incompatible catalog version as installed.
 

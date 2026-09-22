@@ -279,3 +279,7 @@ Windows/WSL project use, and mixed older writers bypassing coordination remain
 unvalidated.
 Direct edits to the graph database, deliberate deletion of the coordination
 files, and concurrent project destruction are outside this recovery contract.
+
+## Semantic-pass synchronization
+
+API v1 semantic passes can inspect the whole project and do not declare a dependency map. When source files change in a project with a semantic pass, `sync` builds and atomically commits a full candidate graph. Explicit `indexFiles` also refreshes the whole project. Scoped path arguments do not restrict that candidate: cross-file registrations must agree with their endpoints. A failed pass preserves the previous graph and reports failure. An unchanged healthy project does not rebuild. This trades incremental latency for correctness; large-project edits can cost a full rebuild. A future dependency/invalidation API is required before making this path incremental safely.
