@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- Add a trusted, pinned Drupal import command for the Cloudflare registry, with target/plan verification, atomic owner claims, official backup preservation and local Worker/browser graph acceptance.
+
+
 ### Extension preview
 
 - Add project-scoped framework and semantic extensions, managed package installation, worker loading, and graph refresh on install/update/enable/disable/remove. Failed activation preserves the previous project configuration and graph.
