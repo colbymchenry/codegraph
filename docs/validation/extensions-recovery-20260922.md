@@ -3,7 +3,9 @@
 This is a development checkpoint, not a product release. Runtime/graph source checkpoint:
 `c33354c930e1853f618223734186bc2d2aaf9bec`, based on
 `ba3c21e50d9129d2f5f3843ec3728868ae6d47a1`. The follow-up `2ca1385` changes marketplace source/documentation links only.
-Final regression uses that source; report-only commits may follow it.
+Final regression tested clean revision `07b0a10455989cf33ce134a7557b20168c7c287d`,
+which adds only the report/changelog/coverage checkpoint to that source.
+The subsequent regression evidence commit changes documentation only.
 
 ## Scope and fixes
 
@@ -59,17 +61,65 @@ summary, so its outcome is unknown. Later interrupted attempts are recorded in
 
 ## Regression checkpoint
 
-The recovered-source full suite completed with 259 passing files / 4,539
-passing tests and 16 skipped files / 192 skipped tests. The subsequent final
-suite was interrupted without a completion JSON or summary; its outcome is
-unconfirmed. The final source will be checked in four sequential Vitest shards
-so each completed portion has a durable command, revision and exit record.
-Final results are pending at this documentation checkpoint.
+The earlier recovered-source full suite completed with 259 passing files / 4,539
+passing tests and 16 skipped files / 192 skipped tests. That run predates the
+final fixes and is separate from the final-source results below. The subsequent
+unsharded final suite and first shard-1 attempt were interrupted without a
+completion receipt or summary; neither is counted as passing.
+
+The final source passed all four sequential Vitest shards on September 22,
+2026, from 02:10:11 to 02:18:25 UTC. Every shard tested clean revision
+`07b0a10455989cf33ce134a7557b20168c7c287d` with this exact command, substituting
+the shard number for `N`:
+
+```sh
+npx vitest run --shard=N/4 --maxWorkers=2 --minWorkers=1
+```
+
+| Shard | Exit | Files passed / skipped | Tests passed / skipped | Command seconds |
+|---|---:|---:|---:|---:|
+| 1/4 | 0 | 64 / 6 | 1,693 / 63 | 136.478 |
+| 2/4 | 0 | 65 / 5 | 1,125 / 56 | 102.268 |
+| 3/4 | 0 | 68 / 2 | 860 / 23 | 147.704 |
+| 4/4 | 0 | 64 / 3 | 867 / 50 | 89.888 |
+| Total | 0 | 261 / 16 | 4,545 / 192 | 476.338 |
+
+There were zero reported failures. Skipped tests are not validated coverage.
+The combined file inventory matches all 277 tracked test files exactly once,
+with no missing, unexpected or duplicate files. Source and configuration stayed
+unchanged throughout; no test fixes were needed in this continuation.
+
+The committed [regression receipts](extensions-regression-20260922.json) contain
+each exact command, revision, start/finish time, exit, summary, file inventory
+and raw-log SHA-256. Local originals are
+`.qa/recovery/final-shard-{1,2,3,4}.{started.json,json,log}`. The interrupted
+01:58:11 shard attempt is retained separately as
+`.qa/recovery/final-shard-1-interrupted-015811.*`, including an explicit
+incomplete record with unknown exit status. Each successful shard wrote its
+receipt and appended the external recovery checkpoint before the next began.
+
+Stable execution was possible during this continuation: all four commands
+completed normally without another task interruption. This does not diagnose
+the earlier interruptions. Klaus's readback reported continuous kernel uptime
+of about six days and zero visible OOM events; the earlier SIGTERM exits do not
+establish a host reboot or CodeGraph crash. Host/control logs were unavailable,
+and the shared-service cause remains unknown. No infrastructure changes were made.
 
 Completed final-source preparation: engine build (exit 0, 35.389 s), Drupal
 package build (exit 0, 0.329 s), Drupal negative fixture (exit 0, 1.413 s), and
 marketplace frontend build (exit 0, 0.245 s). The rebuilt Drupal package hash
 matches the artifact used for the completed corpus checks.
+
+This milestone reused the successful corpus, browser, worker and control
+artifacts because there were no invalidating source changes. PR preparation
+is the next milestone; this pass did not push, create a PR, deploy or release.
+
+| Product gate | Status after this milestone |
+|---|---|
+| Code-complete | Incomplete: acceptance gaps below remain |
+| Validated | Final Linux regression passed; broader acceptance remains partial |
+| Preview-ready | Local evidence exists; hosted HTTPS preview unverified |
+| Released | No |
 
 ## Worker, package and browser checks
 
