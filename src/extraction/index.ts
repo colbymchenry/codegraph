@@ -159,6 +159,30 @@ export function hashContent(content: string): string {
 }
 
 /**
+ * What stands in for the content of a file over MAX_SOURCE_FILE_SIZE_BYTES. Such a file is
+ * never parsed, so its bytes are never needed — reading them only to hash and
+ * discard cost multi-GB RSS spikes on committed video/blob fixtures and could
+ * fail outright with `Invalid string length` (#1910). The stamp is a function
+ * of size alone: change detection compares it to the stored hash, so a
+ * same-size rewrite of an oversize file is not a change (nothing about it is
+ * indexed), while crossing the limit in either direction is.
+ */
+export function oversizeStamp(size: number): string {
+  return `codegraph:oversize:${size}`;
+}
+
+/**
+ * Read a file for hashing/indexing: the whole text when it is under the size
+ * limit, the size stamp when it is over — the caller never decodes an oversize
+ * file. `stats` is what the caller already has; without it the file is stat'ed.
+ */
+function readSourceOrStamp(fullPath: string, stats?: fs.Stats): { content: string; stats: fs.Stats } {
+  const st = stats ?? fs.statSync(fullPath);
+  if (st.size > MAX_SOURCE_FILE_SIZE_BYTES) return { content: oversizeStamp(st.size), stats: st };
+  return { content: fs.readFileSync(fullPath, 'utf-8'), stats: st };
+}
+
+/**
  * Directory names that are dependency, build, cache, or tooling output across the
  * languages/frameworks CodeGraph supports — curated from the canonical
  * github/gitignore templates. Excluded by default so the graph reflects your code,
@@ -1876,6 +1900,9 @@ export class ExtractionOrchestrator {
         const full = validatePathWithinRoot(rootDir, relativePath);
         if (!full) return null;
         try {
+          // Framework detectors scan source by name; a file over the size
+          // limit was never indexed and must not be decoded here either (#1910).
+          if (fs.statSync(full).size > MAX_SOURCE_FILE_SIZE_BYTES) return null;
           return fs.readFileSync(full, 'utf-8');
         } catch {
           return null;
@@ -2297,13 +2324,19 @@ export class ExtractionOrchestrator {
             // stream (#1910) is recognised from its head here, at no extra I/O,
             // and never decoded or parsed. The scan already drops these; this
             // guards the paths that hand files in by name (sync, watcher).
+            // Stat first: a file over the size limit is stored as skipped
+            // without ever being read or decoded (#1910), so ten oversize
+            // fixtures in one I/O batch no longer cost their size in RSS.
+            const stats = await fsp.stat(fullPath);
+            if (stats.size > MAX_SOURCE_FILE_SIZE_BYTES) {
+              return { filePath: fp, content: oversizeStamp(stats.size), stats, error: null as Error | null };
+            }
             const bytes = await fsp.readFile(fullPath);
             if (hasMpegTsExtension(fp) && isMpegTransportStream(bytes.subarray(0, MPEG_TS_SNIFF_BYTES))) {
               logDebug('Skipping MPEG transport stream named .ts — not TypeScript', { filePath: fp });
               return { filePath: fp, content: null as string | null, stats: null as fs.Stats | null, error: null as Error | null, skipped: true };
             }
             const content = bytes.toString('utf-8');
-            const stats = await fsp.stat(fullPath);
             return { filePath: fp, content, stats, error: null as Error | null };
           } catch (err) {
             return { filePath: fp, content: null as string | null, stats: null as fs.Stats | null, error: err as Error };
@@ -2633,7 +2666,8 @@ export class ExtractionOrchestrator {
     let stats: fs.Stats;
     try {
       stats = await fsp.stat(fullPath);
-      content = await fsp.readFile(fullPath, 'utf-8');
+      // An oversize file is stored as skipped; its bytes are never needed (#1910).
+      content = stats.size > MAX_SOURCE_FILE_SIZE_BYTES ? oversizeStamp(stats.size) : await fsp.readFile(fullPath, 'utf-8');
     } catch (error) {
       return {
         nodes: [],
@@ -3254,9 +3288,10 @@ export class ExtractionOrchestrator {
       }
 
       // New, or size/mtime changed — read + hash to confirm a real content change.
+      // (An oversize file hashes as its size stamp, unread — #1910.)
       let content: string;
       try {
-        content = fs.readFileSync(fullPath, 'utf-8');
+        content = readSourceOrStamp(fullPath).content;
       } catch (error) {
         logDebug('Skipping unreadable file during sync', { filePath, error: String(error) });
         failedFilePaths.push(filePath);
@@ -3423,7 +3458,7 @@ export class ExtractionOrchestrator {
           continue;
         }
         let content: string;
-        try { content = fs.readFileSync(fullPath, 'utf-8'); }
+        try { content = readSourceOrStamp(fullPath).content; }
         catch (error) {
           logDebug('Skipping unreadable file while detecting changes', { filePath, error: String(error) });
           continue;
@@ -3461,7 +3496,7 @@ export class ExtractionOrchestrator {
       const fullPath = path.join(this.rootDir, filePath);
       let content: string;
       try {
-        content = fs.readFileSync(fullPath, 'utf-8');
+        content = readSourceOrStamp(fullPath).content;
       } catch (error) {
         logDebug('Skipping unreadable file while detecting changes', { filePath, error: String(error) });
         continue;
