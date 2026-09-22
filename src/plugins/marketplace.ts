@@ -44,7 +44,7 @@ export function createMarketplaceStore(database: string) {
       if (db.prepare('SELECT 1 FROM releases WHERE id=? AND version=?').get(pkg.codegraph.id, pkg.version)) return;
       publish(bytes, { publisherId: 'codegraph', publisher: 'CodeGraph', official: true, name: 'Drupal',
         description: 'Follow Drupal routes, services, hooks, plugins and events through your codebase.',
-        source: 'https://github.com/colbymchenry/codegraph/tree/feature/extensions-marketplace/extensions/drupal',
+        source: 'https://github.com/colbymchenry/codegraph',
         readme: 'Understand the framework connections that ordinary function calls cannot show.\n\nRoutes and forms connect to their handlers. Service definitions connect to implementations and explicit injected services. Documented procedural hooks and Hook attributes connect to literal invocations. Plugin annotations and attributes identify implementations. Literal event dispatch connects to declared subscribers.\n\nInstall replaces the built-in Drupal resolver for this project. Requires CodeGraph 1.6.0 with extension support (preview build).\n\nComputed identifiers, external dependencies outside your index, ambiguous classes and unknown entity handlers remain unresolved. New programming languages and PHP branch-condition analysis are outside this extension API.' });
     },
     list(): Listing[] {
