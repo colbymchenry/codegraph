@@ -3167,7 +3167,10 @@ export class ExtractionOrchestrator {
         (p) =>
           isSourceFile(p, overrides) &&
           !scope.ignores(p) &&
-          fs.existsSync(path.join(this.rootDir, p))
+          fs.existsSync(path.join(this.rootDir, p)) &&
+          // Same rule as the scan (#1910): a reported video clip is not a
+          // source file, so a tracked one is removed and a new one ignored.
+          !isMpegTsVideoFile(this.rootDir, p)
       );
       trackedFiles = [];
       for (const p of unique) {
@@ -3423,7 +3426,11 @@ export class ExtractionOrchestrator {
       for (const filePath of candidates) {
         const tracked = this.queries.getFileByPath(filePath);
         const fullPath = path.join(this.rootDir, filePath);
-        if (!isSourceFile(filePath, overrides) || scope.ignores(filePath) || !fs.existsSync(fullPath)) {
+        // A `.ts` that is an MPEG transport stream is not source (#1910): the
+        // scan never lists it, so git must not report it as pending either —
+        // an untracked clip would otherwise stay "added" after every sync.
+        if (!isSourceFile(filePath, overrides) || scope.ignores(filePath) || !fs.existsSync(fullPath)
+          || isMpegTsVideoFile(this.rootDir, filePath)) {
           if (tracked) removed.push(filePath);
           continue;
         }
