@@ -99,7 +99,9 @@ export function getCodeGraphDir(projectRoot: string): string {
  * The probe is cheap and gated so hot callers (the prompt hook, MCP root
  * resolution on every call) pay one small read: file size, then the SQLite
  * header magic, then a read-only open with a single `sqlite_master` lookup —
- * memoized per path + mtime + size so an unchanged db is never reopened.
+ * memoized per path + mtime + size so an unchanged db is never reopened. A
+ * database that passes the header check but cannot be opened counts as
+ * initialized (see hasNodesTable) — only a proven-absent schema says no.
  */
 export function isInitialized(projectRoot: string): boolean {
   const codegraphDir = getCodeGraphDir(projectRoot);
@@ -151,6 +153,14 @@ function readsAsSqlite(dbPath: string): boolean {
   }
 }
 
+/**
+ * Fails OPEN. Once the size gate and the header magic have passed, the file IS
+ * a SQLite database; only a SUCCESSFUL `sqlite_master` query that proves the
+ * `nodes` table is absent may say "not initialized". Any open/prepare error —
+ * locked, busy, a WAL db in a directory we cannot create `-shm` in (read-only
+ * checkout, mount, another user's tree), disk I/O — returns true: the
+ * pre-existing behaviour for a database we cannot inspect.
+ */
 function hasNodesTable(dbPath: string): boolean {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const { DatabaseSync } = require('node:sqlite');
@@ -159,10 +169,8 @@ function hasNodesTable(dbPath: string): boolean {
     db = new DatabaseSync(dbPath, { readOnly: true });
     const row = db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'nodes'").get();
     return row !== undefined;
-  } catch (err) {
-    // A db another process holds an exclusive lock on is a live db, not a
-    // broken one; only an unreadable or schema-less file is "not initialized".
-    return /locked|busy/i.test(String((err as Error)?.message ?? ''));
+  } catch {
+    return true;
   } finally {
     // Never hold the handle: Windows file locking would block the owner.
     try { db?.close(); } catch { /* already closed */ }
