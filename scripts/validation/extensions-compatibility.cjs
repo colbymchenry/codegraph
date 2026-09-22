@@ -147,7 +147,10 @@ async function cli(args, expected = 0) {
     await cli(['install', registry + '/api/download/compatible-demo/1.9.0', '--path', roots[2]]); await expectGraph(roots[2], '1.9.0');
     const file = path.join(lab, 'pinned.cgext'); fs.writeFileSync(file, pinned.bytes);
     await cli(['install', file, '--path', roots[2]]); await expectGraph(roots[2], '1.10.0');
-    checks.push('exact artifact URL/file semantics preserved');
+    await publish('1.10.0+fixture.1');
+    await cli(['install', 'compatible-demo', '--registry', registry, '--version', '1.10.0+fixture.1', '--path', roots[2]]);
+    await expectGraph(roots[2], '1.10.0+fixture.1');
+    checks.push('exact artifact URL/file semantics and build-metadata pin identity preserved');
     await page.setViewportSize({ width: 390, height: 844 });
     await page.locator('.compatibility').filter({ hasText: 'Selected 3.0.0' }).waitFor();
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));

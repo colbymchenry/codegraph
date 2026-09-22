@@ -20,6 +20,13 @@ describe('compatible registry selection', () => {
     expect(choose(rows.reverse()).version).toBe('1.10.0');
     expect(choose([release('2.0.0', { engines: '>=2' }), release('1.0.0')], { engineVersion: '2.1.0' }).version).toBe('2.0.0');
   });
+  it('preserves build metadata identity with deterministic equal-precedence selection', () => {
+    const rows = [release('1.0.0+z'), release('1.0.0+a'), release('v2.0.0')];
+    expect(choose(rows).version).toBe('1.0.0+a');
+    expect(choose(rows.reverse()).version).toBe('1.0.0+a');
+    expect(choose(rows, { version: '1.0.0+z' }).version).toBe('1.0.0+z');
+    expect(() => choose(rows, { version: 'v2.0.0' })).toThrow('exact semantic version');
+  });
   it('skips invalid metadata and unsupported APIs instead of adopting them', () => {
     expect(choose([null, release('bad'), release('9.0.0', { apiVersion: 2 }), release('8.0.0', { engines: 'nonsense' }),
       release('7.0.0', { integrity: 'bad' }), release('6.0.0', { id: 'other' }), release('5.0.0', { capabilities: ['languages'] }),

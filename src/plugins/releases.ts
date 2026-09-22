@@ -16,10 +16,17 @@ export interface ReleaseSelection {
 export function validateExtensionId(id: unknown): asserts id is string {
   if (typeof id !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(id)) throw new Error('Expected a lowercase extension id');
 }
+function exactVersion(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const parsed = semver.parse(value);
+  // semver.valid()/SemVer.version omit build metadata; retain it for immutable
+  // artifact identity while rejecting aliases such as v1.0.0 or whitespace.
+  return !!parsed && value === parsed.version + (parsed.build.length ? '+' + parsed.build.join('.') : '');
+}
 export function resolveRelease(raw: unknown, id: string, options: ReleaseSelection): ExtensionRelease {
   validateExtensionId(id);
   if (!semver.valid(options.engineVersion)) throw new Error('Cannot determine the connected CodeGraph version');
-  if (options.version !== undefined && (typeof options.version !== 'string' || semver.valid(options.version) !== options.version)) throw new Error('Request an exact semantic version, such as 1.2.3 (prereleases require an exact pin)');
+  if (options.version !== undefined && !exactVersion(options.version)) throw new Error('Request an exact semantic version, such as 1.2.3 (prereleases require an exact pin)');
   if (!Array.isArray(raw)) throw new Error('Registry returned an invalid release catalog');
   if (options.currentVersion !== undefined && !semver.valid(options.currentVersion)) throw new Error('Installed version is invalid; request an explicit version to repair it');
   const candidates: ExtensionRelease[] = [], reasons: string[] = [];
@@ -28,7 +35,7 @@ export function resolveRelease(raw: unknown, id: string, options: ReleaseSelecti
     const r = item as ExtensionRelease;
     if (options.version !== undefined && r?.version !== options.version) continue;
     try {
-      if (!r || r.id !== id || typeof r.version !== 'string' || semver.valid(r.version) !== r.version ||
+      if (!r || r.id !== id || !exactVersion(r.version) ||
           typeof r.integrity !== 'string' || !/^[a-f0-9]{64}$/.test(r.integrity) || typeof r.engines !== 'string') throw new Error('invalid release identity, version, integrity or engine range');
       if (versions.has(r.version)) throw new Error(`Registry returned duplicate immutable version ${r.version}`);
       versions.add(r.version);
