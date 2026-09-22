@@ -8,7 +8,7 @@ if(!['serve','backup','restore'].includes(action)||!stateArg||(['backup','restor
 if(!path.isAbsolute(stateArg)||(backupArg&&!path.isAbsolute(backupArg)))throw Error('Use explicit absolute state and backup paths');
 if(action==='backup'&&!fs.existsSync(stateArg))throw Error('Source state directory does not exist');
 if(action==='restore'&&fs.existsSync(stateArg))throw Error('Restore requires a new state directory');
-const server=await startLocal({state:stateArg,publishing:action==='serve'});
+const server=await startLocal({state:stateArg,publishing:action==='serve',initialize:action!=='backup'});
 if(action==='serve'){
   console.log(JSON.stringify({local:true,origin:'http://127.0.0.1:'+server.port,state:stateArg}));
   for(const signal of ['SIGTERM','SIGINT'])process.once(signal,async()=>{await server.close();process.exit(0);});

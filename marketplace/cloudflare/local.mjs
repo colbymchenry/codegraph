@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 const root=path.dirname(fileURLToPath(import.meta.url));
-export async function startLocal({state,testing=false,boundary,port=0,publishing=true}={}) {
+export async function startLocal({state,testing=false,boundary,port=0,publishing=true,initialize=true}={}) {
   const mf=new Miniflare({...convertV4MiniflareOptions({host:'127.0.0.1',port,workers:[{name:'registry',modules:true,scriptPath:path.join(root,'.build',testing?'test-worker.js':'worker.js'),compatibilityDate:'2026-09-21',
     d1Databases:{DB:'registry'},r2Buckets:{PACKAGES:'packages'},
     bindings:{PUBLISHING_ENABLED:String(publishing)},serviceBindings:{
@@ -12,6 +12,7 @@ export async function startLocal({state,testing=false,boundary,port=0,publishing
   await mf.ready;
   const db=await mf.getD1Database('DB');
   const exists=await db.prepare("SELECT name FROM sqlite_master WHERE name='registry_meta'").first();
+  if(!exists&&!initialize){await mf.dispose();throw Error('Source registry is not initialized; verify the source state path before backup');}
   if(!exists)for(const line of fs.readFileSync(path.join(root,'migrations/0001_registry.sql'),'utf8').split('\n').filter(Boolean))await db.exec(line);
   return {mf,db,bucket:await mf.getR2Bucket('PACKAGES'),port:Number((await mf.ready).port),close:()=>mf.dispose()};
 }

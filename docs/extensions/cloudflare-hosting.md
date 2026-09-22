@@ -22,6 +22,7 @@ npx tsc
 npm ci --prefix marketplace/cloudflare --no-audit --no-fund
 npm run build --prefix marketplace/cloudflare
 npm test --prefix marketplace/cloudflare
+(cd marketplace/cloudflare && node ops-test.mjs)
 CLOUDFLARE_REGISTRY=1 PLAYWRIGHT_MODULE=/absolute/path/to/playwright \
   node scripts/validation/extensions-compatibility.cjs
 CLOUDFLARE_REGISTRY=1 PLAYWRIGHT_MODULE=/absolute/path/to/playwright \
@@ -39,7 +40,7 @@ node ops.mjs backup /absolute/lab/registry /absolute/backups/unique-snapshot
 node ops.mjs restore /absolute/new-lab/registry /absolute/backups/unique-snapshot
 ```
 
-Stop the rehearsal server before using the operator CLI on that same local state. The binding-level backup reads identity/owners/releases/nonces in one D1 batch snapshot, then copies immutable R2 bytes. A completion manifest is written last. Restore verifies checksums, manifest/package/ownership correspondence, refuses an occupied target, copies objects first and publishes metadata in one D1 batch. Partial restores remain detached and must be retried into a new destination. Backups contain public packages and metadata, not publisher private keys. Protect the independent checksum against tampering; checksums alone are not authentication. Local process-kill proof does not establish provider disk/power-loss or off-host retention guarantees.
+Stop the rehearsal server before using the operator CLI on that same local state. Backup refuses missing or uninitialized source state and never silently migrates an empty source into a successful snapshot. The binding-level backup reads identity/owners/releases/nonces in one D1 batch snapshot, then copies immutable R2 bytes. A completion manifest is written last. Restore verifies checksums, manifest/package/ownership correspondence, refuses an occupied target, copies objects first and publishes metadata in one D1 batch. Partial restores remain detached and must be retried into a new destination. Backups contain public packages and metadata, not publisher private keys. Protect the independent checksum against tampering; checksums alone are not authentication. Local process-kill proof does not establish provider disk/power-loss or off-host retention guarantees.
 
 ## Prepare deployment after access is verified
 
