@@ -2,6 +2,7 @@
 // Capture every committed fixture state, including the cold reference rebuild.
 const fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');
 const {DatabaseSync}=require('node:sqlite'),{channel}=require('node:diagnostics_channel');
+if (require('node:worker_threads').isMainThread) {
 const project=path.resolve(process.argv[2]),output=process.argv[3]+'.assertions.json',rows=[];
 channel('codegraph.semantic.update').subscribe(e=>{
  if(e.phase!=='committed'||path.resolve(e.projectRoot)!==project)return;
@@ -21,3 +22,5 @@ channel('codegraph.semantic.update').subscribe(e=>{
   fs.writeFileSync(output,JSON.stringify(rows,null,2));
  }finally{db.close()}
 });
+
+}
