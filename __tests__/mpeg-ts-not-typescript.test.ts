@@ -12,6 +12,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { execFileSync } from 'child_process';
 import { CodeGraph } from '../src';
 import { scanDirectoryAsync, type ScanSkipStats } from '../src/extraction';
 import { detectLanguage, isMpegTransportStream, MPEG_TS_SNIFF_BYTES } from '../src/extraction/grammars';
@@ -151,6 +152,53 @@ describe('MPEG-TS video named .ts is skipped, real TypeScript is indexed (#1910)
       expect(elapsed).toBeLessThan(2000);
     } finally {
       await cg.close();
+    }
+  });
+});
+
+describe('a video .ts never stays pending (#1910)', () => {
+  const dirs: string[] = [];
+  afterEach(() => { for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true }); });
+  const gitProject = (): string => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mpegts-git-'));
+    dirs.push(dir);
+    const git = (...a: string[]) => execFileSync('git', a, { cwd: dir, stdio: 'pipe' });
+    git('init', '-q'); git('config', 'user.email', 't@t'); git('config', 'user.name', 't');
+    fs.writeFileSync(path.join(dir, 'app.ts'), 'export const a = 1;\n');
+    git('add', '.'); git('commit', '-qm', 'init');
+    return dir;
+  };
+
+  it('an untracked clip is not reported as added, before or after sync', async () => {
+    const dir = gitProject();
+    const cg = await CodeGraph.init(dir, { index: true });
+    try {
+      fs.writeFileSync(path.join(dir, 'clip.ts'), makeMpegTs(40));
+      expect(cg.getChangedFiles()).toEqual({ added: [], modified: [], removed: [] });
+      await cg.sync();
+      expect(cg.getChangedFiles()).toEqual({ added: [], modified: [], removed: [] });
+      expect(cg.getFiles().map((f) => f.path)).toEqual(['app.ts']);
+    } finally {
+      cg.close();
+    }
+  });
+
+  it('a tracked TypeScript file that becomes a clip is removed, on the git path and on a scoped sync', async () => {
+    for (const scoped of [false, true]) {
+      const dir = gitProject();
+      fs.writeFileSync(path.join(dir, 'clip.ts'), 'export const clip = 1;\n');
+      const cg = await CodeGraph.init(dir, { index: true });
+      try {
+        expect(cg.getNodesInFile('clip.ts').some((n) => n.name === 'clip')).toBe(true);
+        fs.writeFileSync(path.join(dir, 'clip.ts'), makeMpegTs(40));
+        if (!scoped) expect(cg.getChangedFiles()).toEqual({ added: [], modified: [], removed: ['clip.ts'] });
+        await (scoped ? cg.sync({ paths: ['clip.ts'] }) : cg.sync());
+        expect(cg.getFiles().map((f) => f.path)).toEqual(['app.ts']);
+        expect(cg.getNodesInFile('clip.ts')).toEqual([]);
+        expect(cg.getChangedFiles()).toEqual({ added: [], modified: [], removed: [] });
+      } finally {
+        cg.close();
+      }
     }
   });
 });
