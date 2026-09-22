@@ -105,6 +105,15 @@ export class MCPEngine {
       activate: (cg) => this.explicitProjects.get(cg)?.ready() ?? Promise.resolve(),
       release: (cg) => this.releaseExplicitProject(cg),
     });
+    // A tool call found the default project's database replaced on disk (a
+    // `codegraph index` rebuild) and reopened it (#1902). Reconcile the new
+    // file with the usual catch-up — `sync()` serializes on the index mutex,
+    // so it never overlaps an in-flight watcher sync. Only when this engine is
+    // watching, i.e. it is the project's writer: a read-only engine (writer
+    // lock held elsewhere, watching disabled) must not start writing.
+    this.toolHandler.setOnDatabaseReopened((cg) => {
+      if (cg === this.cg && cg.isWatching()) this.catchUpSync(true);
+    });
     if (opts.writerLockRoot && !this.opts.readOnly) {
       const writer = tryAcquireWriterLock(opts.writerLockRoot, 'fallback');
       if (writer.kind === 'taken') {
@@ -397,10 +406,12 @@ export class MCPEngine {
    * and the per-file staleness banner can't help because `getPendingFiles()`
    * is populated by the watcher, not by catch-up).
    */
-  private catchUpSync(): void {
+  private catchUpSync(afterReopen = false): void {
     const cg = this.cg;
     if (!cg || this.opts.readOnly) return;
-    if (this.defaultLease) {
+    // The lease's gate is the startup reconcile and stays settled once caught
+    // up; a database reopened after a rebuild (#1902) needs a sync of its own.
+    if (this.defaultLease && !afterReopen) {
       this.toolHandler.setCatchUpGate(this.defaultLease.ready());
       return;
     }

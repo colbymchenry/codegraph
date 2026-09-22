@@ -1587,6 +1587,9 @@ export class ToolHandler {
   // (see {@link resolveCatchUpGateTimeoutMs}) so a minutes-long reconcile on a
   // huge repo can't hang a call (#905); cleared when the reconcile settles.
   private catchUpGate: Promise<void> | null = null;
+  // Engine hook fired when `freshen` reopened a replaced database (#1902), so
+  // the engine can reconcile the new file with a catch-up sync.
+  private onDatabaseReopened: ((cg: CodeGraph) => void) | null = null;
   // Optional worker-thread pool for off-loop read-tool dispatch. When ready +
   // healthy, heavy reads leave the main loop free for the MCP transport.
   private queryPool: QueryPool | null = null;
@@ -1632,6 +1635,15 @@ export class ToolHandler {
     }, () => {
       if (this.catchUpGate === p) this.catchUpGate = null;
     });
+  }
+
+  /**
+   * Engine-only: called after a tool call's {@link freshen} reopened a database
+   * that was replaced on disk (#1902). The engine decides whether a catch-up
+   * sync is its to run (only for the instance it watches and writes).
+   */
+  setOnDatabaseReopened(fn: ((cg: CodeGraph) => void) | null): void {
+    this.onDatabaseReopened = fn;
   }
 
   /**
@@ -1966,6 +1978,7 @@ export class ToolHandler {
           '[CodeGraph MCP] The index was replaced on disk (e.g. a git worktree ' +
           'recreated at the same path); reopened the live database in place.\n'
         );
+        this.onDatabaseReopened?.(cg);
       }
     } catch {
       // Best-effort self-heal — a failed reopen must never break the tool call;
