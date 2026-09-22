@@ -17,6 +17,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Extension preview
 
+- Add a deployed Cloudflare marketplace preview with dedicated D1/private R2, reviewed OAuth operator import/backup/restore, expiring publication windows and actual HTTPS graph acceptance. Provider redeployment and detached restore preserve immutable releases; public publishing is disabled after controlled validation.
+
 - Reconcile global semantic-extension links after sync or explicit file indexing with an atomic candidate rebuild. Failed passes preserve the working graph. Reuse bounded core parse results on warm project instances while rerunning all framework hooks, global resolution and semantic passes; cold or disabled reuse retains full parsing. Reject observed source changes before commit and reclaim interrupted graph-only candidates. Rebuild text search and built-in secondary indexes in bulk inside the atomic replacement transaction.
 
 - Prepare immutable Drupal extension 0.1.1: ignore unrelated static receivers and commented/quoted declarations, and resolve both explicit Symfony event argument orders. Preserve the reviewed 0.1.0 artifact and policy.
@@ -24,7 +26,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Add project-scoped framework and semantic extensions, managed package installation, worker loading, and graph refresh on install/update/enable/disable/remove. Failed activation preserves the previous project configuration and graph.
 - Add an external Drupal extension for declared routes/forms, services, hooks, plugins and event subscribers. Literal route paths can be explore endpoints; extension edges retain their labels and registration sites. Comments and quoted examples do not count as PHP invocations.
-- Add a local marketplace preview with signed publisher submissions, immutable releases, publisher ownership checks and a companion connection for project selection. Mobile detail pages retain version, compatibility and source information. Hosted deployment remains follow-up work; this is not a release announcement.
+- Add a local marketplace preview with signed publisher submissions, immutable releases, publisher ownership checks and a companion connection for project selection. Mobile detail pages retain version, compatibility and source information. The dedicated Cloudflare preview now has separate hosted acceptance evidence; this is not a release announcement.
 - Extension authors can generate a starter with `codegraph extensions create`, test real graph contributions and removal with `codegraph extensions test`, and use the public SDK types and author guide without private core imports.
 
 - Marketplace and headless registry installs now select the highest stable semantic version compatible with the connected engine and extension API. Automatic updates refuse downgrades; explicit pins (including prereleases) never substitute another version. Downloaded identity, compatibility and integrity are rechecked locally.

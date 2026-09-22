@@ -51,11 +51,11 @@ node ops.mjs serve /absolute/preview-registry
 
 A second apply returns `unchanged` only if all immutable metadata and actual object bytes still agree. `inspect-local` refuses an absent/uninitialized registry; it never provisions remote resources. For an existing local rehearsal made before migration 0002, start/stop the updated `ops.mjs serve` once before import. This helper automatically migrates only its explicit local state.
 
-## Remote preparation and execution — not yet exercised against an account
+## Remote preparation and execution
 
-No remote import has been performed. Klaus owns account access. A browser login does not establish API credentials or permission to activate resources. Do not deploy/create resources, edit DNS, enable billing or run these remote writes until the actual account, included resources, permissions and approved target have been verified.
+Official Drupal 0.1.1 has been imported into the dedicated preview using the supported Wrangler OAuth binding operator. The legacy direct HTTP/S3 adapter below still has only mocked contract evidence. Klaus owns account coordination; a browser login alone does not establish CLI authentication or resource authority. Do not deploy/create resources, edit DNS, enable billing or run these remote writes until the actual account, included resources, permissions and approved target have been verified.
 
-1. Verify the preview Worker, private R2 Standard bucket and D1 database belong to the intended account. Apply **both migrations** to the authorized preview using `wrangler d1 migrations apply DB --remote --config wrangler.deploy.json`. Back up existing data first; do not reset the database. Obtain the actual registry ID with `wrangler d1 execute DB --remote --config wrangler.deploy.json --command "SELECT value FROM registry_meta WHERE key='id'"`. No such command was executed remotely during local acceptance.
+1. Verify the preview Worker, private R2 Standard bucket and D1 database belong to the intended account. Apply **both migrations** to the authorized preview using `wrangler d1 migrations apply DB --remote --config wrangler.deploy.json`. Back up existing data first; do not reset the database. Obtain the actual registry ID with `wrangler d1 execute DB --remote --config wrangler.deploy.json --command "SELECT value FROM registry_meta WHERE key='id'"`. The current actual provider proof is recorded separately from the earlier local acceptance.
 2. Create a private target JSON containing only public resource identifiers:
 
 ```json
@@ -75,7 +75,17 @@ No remote import has been performed. Klaus owns account access. A browser login 
 5. Run the same `apply PLAN --confirm-plan-sha256 HASH`. Before any data write, it reads authenticated Worker settings and requires `DB` and `PACKAGES` to match the target D1 ID and R2 bucket. It then verifies D1 registry identity/schema. The adapter uses the Cloudflare D1 query API and signed R2 S3 GET/conditional PUT (`If-None-Match: *`) on fixed account endpoints, with no arbitrary endpoint or unauthenticated admin route. It does not provision resources, change bindings or auto-migrate remote databases.
 6. Preserve the JSON receipt and verify official catalog/detail/filter, exact download bytes and compatible one-Install/graph/manage behavior on the actual stable HTTPS origin. Repeat provider redeployment/backup/restore acceptance independently before claiming durable delivery.
 
-The remote HTTP request contract and binding mismatch were checked with a test transport, **not a live provider account**. Actual auth scopes, deployed binding shape, S3 condition handling, regional endpoints and provider limits still require verification. This adapter currently targets default R2 account endpoints; jurisdiction-specific endpoints require a reviewed configuration change. See [Worker settings API](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/settings/methods/get/), [D1 query API](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/query/), and [R2 S3 compatibility](https://developers.cloudflare.com/r2/api/s3/api/).
+The legacy direct HTTP/S3 request contract and binding mismatch were checked with a test transport, **not a live provider account**. The new `hosted-ops.mjs` alternative reuses normal Wrangler OAuth and actual remote D1/R2 bindings instead of requiring separate S3 keys. Actual auth scopes, deployed binding shape, S3 condition handling, regional endpoints and provider limits still require verification. This adapter currently targets default R2 account endpoints; jurisdiction-specific endpoints require a reviewed configuration change. See [Worker settings API](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/settings/methods/get/), [D1 query API](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/query/), and [R2 S3 compatibility](https://developers.cloudflare.com/r2/api/s3/api/).
+
+## OAuth plan/apply alternative used for the hosted preview
+
+Follow the environment/config guards in [Cloudflare hosting](cloudflare-hosting.md#supported-oauth-operator-and-provider-snapshots). Save the `result.target` returned by `hosted-ops.mjs inspect` as a target file. Generate the same reviewed plan with `official-cli.mjs plan TARGET ARTIFACT NEW_PLAN`, inspect its exact destination/provenance and SHA-256, then:
+
+```sh
+node marketplace/cloudflare/hosted-ops.mjs apply marketplace/cloudflare/wrangler.deploy.json REVIEWED_CONFIG_SHA /absolute/plan.json REVIEWED_PLAN_SHA
+```
+
+Both the local rehearsal and OAuth adapter call the same `validatePlan`/`importOfficial` functions. The OAuth path also verifies current 100% deployment bindings and `PUBLISHING_ENABLED=false`. It does not provision, grant auth, enable publication, reset storage or attach a hostname. Never use the placeholder config. A repeated apply is permitted only after actual state is checked; it returns `unchanged` when listing and stored bytes are identical.
 
 ## Executable acceptance
 
@@ -87,4 +97,4 @@ PLAYWRIGHT_MODULE=/absolute/path/to/playwright PATHAUTO_CORPUS=/absolute/pinned/
 
 The browser test exports clean Pathauto source at `b97aadf47a37cff25f7d6105c3dade6778fccb47` into a disposable project. It uses the real CLI and local workerd/D1/R2, connects the browser once, clicks Install once, and verifies two route handlers, one hook and one service injection in actual SQLite. It proves malformed/incompatible/tampered failure preservation, disable/enable/remove cleanup, official catalog/detail/filter, and desktop/mobile layout. It does not modify the source corpus or rerun the larger corpus benchmark.
 
-[Hosting/cost limits](cloudflare-hosting.md) remain unchanged: no durable Cloudflare URL, provider persistence, remote backup proof or Free-plan CPU fit is established. `marketplace.getcodegraph.com` remains proposed. The Drupal review evidence is recorded separately; historical measured rebuild overhead was 22–30%, and local rebuild timings do not establish Workers Free CPU suitability.
+See [supported OAuth operator, hosted proof and cost limits](cloudflare-hosting.md) for the dedicated stable HTTPS deployment and provider snapshot procedure. Free-plan CPU fit is not established by Paid-plan success. `marketplace.getcodegraph.com` remains proposed. The Drupal review evidence is recorded separately; historical measured rebuild overhead was 22–30%, and local rebuild timings do not establish Workers Free CPU suitability.
