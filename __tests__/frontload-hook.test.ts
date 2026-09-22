@@ -19,10 +19,13 @@ import { planFrontload, isTaskNotification, findIndexedSubprojectRoots, unsafeIn
 // fixture without changing the process environment or the user's home files.
 vi.mock('os', async (importOriginal) => ({ ...await importOriginal<typeof import('os')>() }));
 
-/** Make `dir` look indexed (isInitialized needs `.codegraph/codegraph.db`). */
+/**
+ * Make `dir` indexed. isInitialized needs `.codegraph/codegraph.db` WITH the
+ * codegraph schema — an empty file no longer counts (#1895).
+ */
 function mkIndexed(dir: string): string {
-  fs.mkdirSync(path.join(dir, '.codegraph'), { recursive: true });
-  fs.writeFileSync(path.join(dir, '.codegraph', 'codegraph.db'), '');
+  fs.mkdirSync(dir, { recursive: true });
+  CodeGraph.initSync(dir).close();
   return dir;
 }
 /** A workspace-root manifest so the down-scan gate (looksLikeProjectRoot) passes. */
