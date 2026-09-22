@@ -83,7 +83,7 @@ class Session {
     const finalizeStart = clock();
     // Never throw an observer failure into the successful engine operation.
     const record = { name, success: !error, certified: false, phases: op.phases, ...op.pending?.metrics,
-      authoritativeInvocations: op.invocations, graphMarker: null, trace: op.pending?.trace || [],
+      authoritativeInvocations: op.invocations, graphMarker: null, identity: op.pending?.identity || null, trace: op.pending?.trace || [],
       owned: op.pending?.owned || [], reason: error ? 'operation-failed' : op.reason || 'not-observed' };
     try {
       const state = dbState(this.root); record.graphMarker = state.marker;
@@ -98,7 +98,7 @@ class Session {
         const sort = es => normalize(es).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
         if (hash(sort(actual)) !== hash(sort(expected))) throw Error('committed SQLite/owned merge mismatch');
         this.committed = { identity: p.identity, trace: p.trace, owned: copy(p.owned), marker: state.marker, bytes: p.metrics.traceBytes };
-        record.certified = true; record.reason = 'committed'; record.sqliteHash = hash(sort(actual));
+        record.certified = true; record.reason = 'committed'; record.sqlite = sort(actual); record.sqliteHash = hash(record.sqlite);
       } else if (error || op.reason || !op.graphCommitted) this.committed = null;
     } catch (e) { record.reason = 'observer:' + e.message; this.committed = null; this.disabled = true; }
     record.finalizeMs = clock() - finalizeStart;
@@ -141,7 +141,7 @@ function invoke(root, ctx, options) {
       const t = clock();
       if (op.fault === 'capture-error') throw Error('injected observer failure');
       if (methods.has(method) && !reason) {
-        const entry = { method, args: copy(args), hash: hash(value), valueBytes: Buffer.byteLength(JSON.stringify(value)),
+        const entry = { method, args: copy(args), value: copy(value), hash: hash(value), valueBytes: Buffer.byteLength(JSON.stringify(value)),
           empty: value === null || value === false || (Array.isArray(value) && value.length === 0) };
         traceBytes += Buffer.byteLength(JSON.stringify(entry));
         if (trace.length >= session.options.maxReads || traceBytes > session.options.maxBytes) reason = 'observation-budget';

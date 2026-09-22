@@ -52,7 +52,9 @@ properties, preserve all remaining values and array order. This is a new interna
 not transparent interception of arbitrary v1 callbacks. The evaluator cannot read the
 omitted fields. Returned arrays/objects are detached copies. All empty, false and null
 results are recorded, not just successful symbols. Each observation stores operation,
-arguments, complete result SHA256, serialized value byte count and empty-result marker.
+arguments, complete result value and SHA256, serialized value byte count and empty-result marker.
+Diagnostic rows retain invocation identity, premerge owned output and the certified
+SQLite edge set so the receipt hashes and comparisons can be independently recomputed.
 No previous returned member list substitutes for reexecuting a query predicate.
 
 Identity binds canonical project path, loaded adapter/observer/engine bytes, engine
