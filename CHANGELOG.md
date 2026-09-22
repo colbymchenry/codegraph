@@ -12,6 +12,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Extension preview
+
+- Add project-scoped framework and semantic extensions, managed package installation, worker loading, and graph refresh on install/update/enable/disable/remove. Failed activation preserves the previous project configuration and graph.
+- Add an external Drupal extension for declared routes/forms, services, hooks, plugins and event subscribers. Literal route paths can be explore endpoints; extension edges retain their labels and registration sites. Comments and quoted examples do not count as PHP invocations.
+- Add a local marketplace preview with signed publisher submissions, immutable releases, publisher ownership checks and a companion connection for project selection. Mobile detail pages retain version, compatibility and source information. Hosting, compatible-version selection and a complete authoring kit remain follow-up work; this is not a release announcement.
+
 ### Highlights
 
 - **`codegraph ui` — your graph in a browser.** A local, read-only viewer for the project you already indexed: your code with its callers and callees in the margin, a map of the whole repository, and a strip that shows how one symbol reaches another.

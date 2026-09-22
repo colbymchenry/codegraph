@@ -4,6 +4,12 @@
 queries in [Checking this file is still true](#checking-this-file-is-still-true)
 before trusting a row; this is a snapshot, not a live view.
 
+**Extension preview, 2026-09-22:** the optional external Drupal package adds
+declared route/form handlers, service injection, literal hook/event dispatch
+and plugin implementation links. It does not add Drupal screen navigation or
+PHP branch guards. Scope and reproducible validation are recorded in
+[the extension recovery report](../validation/extensions-recovery-20260922.md).
+
 This file exists to be read cold. It says, for every framework and language the
 README claims, **which of the three pictures it can draw today** and what is
 missing from the ones it cannot — so a fresh session can pick up the next piece
