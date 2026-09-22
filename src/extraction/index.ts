@@ -27,7 +27,7 @@ import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs } from './
 import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
-import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes } from './grammars';
+import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
@@ -560,6 +560,7 @@ function collectIncludedFiles(
       if (!include.ignores(rel)) return;
       if (exclude && exclude.ignores(rel)) return;
       if (!isSourceFile(rel, overrides)) return;
+      if (isMpegTsVideoFile(rootDir, rel)) return;
       out.add(rel);
     }
   };
@@ -1498,6 +1499,7 @@ export function scanDirectory(
     let count = 0;
     for (const filePath of gitFiles) {
       if (isSourceFile(filePath, overrides)) {
+        if (isMpegTsVideoFile(rootDir, filePath)) continue;
         files.push(filePath);
         count++;
         onProgress?.(count, filePath);
@@ -1514,6 +1516,31 @@ export function scanDirectory(
  * Async variant of scanDirectory that yields to the event loop periodically,
  * allowing worker threads to receive and render progress messages.
  */
+/**
+ * Whether a `.ts` file on disk is an MPEG transport stream rather than
+ * TypeScript (#1910). Reads only the file's head — `MPEG_TS_SNIFF_BYTES`, under
+ * 1 KB — so the check costs one small read per `.ts` file at discovery, never a
+ * whole-file read; any file the extension does not make ambiguous is not
+ * touched at all. A file that cannot be read is left to the indexing path,
+ * which reports the read error itself.
+ */
+function isMpegTsVideoFile(rootDir: string, relativePath: string): boolean {
+  if (!hasMpegTsExtension(relativePath)) return false;
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(path.join(rootDir, relativePath), 'r');
+    const head = Buffer.allocUnsafe(MPEG_TS_SNIFF_BYTES);
+    const n = fs.readSync(fd, head, 0, head.length, 0);
+    if (!isMpegTransportStream(head.subarray(0, n))) return false;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+  }
+  logDebug('Skipping MPEG transport stream named .ts — not TypeScript', { filePath: relativePath });
+  return true;
+}
+
 /**
  * What a scan saw but could not index, tallied by extension.
  *
@@ -1548,6 +1575,7 @@ export async function scanDirectoryAsync(
     let count = 0;
     for (const filePath of gitFiles) {
       if (isSourceFile(filePath, overrides)) {
+        if (isMpegTsVideoFile(rootDir, filePath)) continue;
         files.push(filePath);
         count++;
         onProgress?.(count, filePath);
@@ -1656,6 +1684,7 @@ function scanDirectoryWalk(
           } else if (stat.isFile()) {
             if (!isIgnored(fullPath, false, active)) {
               if (isSourceFile(relativePath, overrides)) {
+                if (isMpegTsVideoFile(rootDir, relativePath)) continue;
                 files.push(relativePath);
                 count++;
                 onProgress?.(count, relativePath);
@@ -1677,6 +1706,7 @@ function scanDirectoryWalk(
       } else if (entry.isFile()) {
         if (!isIgnored(fullPath, false, active)) {
           if (isSourceFile(relativePath, overrides)) {
+            if (isMpegTsVideoFile(rootDir, relativePath)) continue;
             files.push(relativePath);
             count++;
             onProgress?.(count, relativePath);
@@ -2270,7 +2300,16 @@ export class ExtractionOrchestrator {
               logWarn('Path traversal blocked in batch reader', { filePath: fp });
               return { filePath: fp, content: null as string | null, stats: null as fs.Stats | null, error: new Error('Path traversal blocked') };
             }
-            const content = await fsp.readFile(fullPath, 'utf-8');
+            // Read bytes, not text: a `.ts` that is really an MPEG transport
+            // stream (#1910) is recognised from its head here, at no extra I/O,
+            // and never decoded or parsed. The scan already drops these; this
+            // guards the paths that hand files in by name (sync, watcher).
+            const bytes = await fsp.readFile(fullPath);
+            if (hasMpegTsExtension(fp) && isMpegTransportStream(bytes.subarray(0, MPEG_TS_SNIFF_BYTES))) {
+              logDebug('Skipping MPEG transport stream named .ts — not TypeScript', { filePath: fp });
+              return { filePath: fp, content: null as string | null, stats: null as fs.Stats | null, error: null as Error | null, skipped: true };
+            }
+            const content = bytes.toString('utf-8');
             const stats = await fsp.stat(fullPath);
             return { filePath: fp, content, stats, error: null as Error | null };
           } catch (err) {
@@ -2281,8 +2320,15 @@ export class ExtractionOrchestrator {
 
       // Dispatch each readable file into the bounded parse window; the window
       // stores results on the main thread as they arrive.
-      for (const { filePath, content, stats, error } of fileContents) {
+      for (const { filePath, content, stats, error, skipped } of fileContents) {
         if (signal?.aborted) { aborted = true; break; }
+
+        if (skipped) {
+          // Not a source file after all — counted as done, stored as nothing.
+          processed++;
+          onProgress?.({ phase: 'parsing', current: processed, total });
+          continue;
+        }
 
         if (error || content === null || stats === null) {
           processed++;
@@ -2633,6 +2679,12 @@ export class ExtractionOrchestrator {
         errors: [{ message: 'Path traversal blocked', filePath: relativePath, severity: 'error', code: 'path_traversal' }],
         durationMs: 0,
       };
+    }
+
+    // An MPEG transport stream named `.ts` is not TypeScript (#1910): one
+    // sub-KB head read decides it, before the language lookup and the parse.
+    if (isMpegTsVideoFile(this.rootDir, relativePath)) {
+      return { nodes: [], edges: [], unresolvedReferences: [], errors: [], durationMs: 0 };
     }
 
     const language = detectLanguage(relativePath, content, loadExtensionOverrides(this.rootDir));
