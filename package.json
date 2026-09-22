@@ -14,6 +14,7 @@
   "files": [
     "dist",
     "scripts",
+    "docs/extensions",
     "README.md"
   ],
   "workspaces": [

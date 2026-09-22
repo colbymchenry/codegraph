@@ -100,6 +100,12 @@ export {
 export { Mutex, FileLock, processInBatches, debounce, throttle, MemoryMonitor } from './utils';
 export { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 export { MCPServer } from './mcp';
+// Public author API: available through the source package and published SDK shim.
+export { defineExtension, EXTENSION_API_VERSION, createExtensionProject, testExtension } from './plugins/author';
+export type { AuthorFixtureCase, AuthorTestReport, AuthorNodeExpectation, AuthorEdgeExpectation } from './plugins/author';
+export { packExtension } from './plugins/package';
+export type { CodeGraphPlugin, PluginContext, PluginManifest, PluginContributions, SynthPass } from './plugins/api';
+export type { FrameworkResolver, ResolutionContext, UnresolvedRef, ResolvedRef } from './resolution/types';
 
 /**
  * Options for initializing a new CodeGraph project

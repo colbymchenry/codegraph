@@ -3,10 +3,22 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ExtensionManager, downloadPackage } from './manager';
 import { startExtensionBridge } from './bridge';
-import { parsePackage, type ExtensionPackage } from './package';
+import { packExtension } from './package';
+import { createExtensionProject, testExtension } from './author';
 
 export function registerExtensionCommands(program: Command): void {
   const extensions = program.command('extensions').description('Install and manage framework extensions');
+  extensions.command('create <directory>').description('Create a portable Python event-map extension starter and author tests')
+    .requiredOption('--id <id>', 'Unique lowercase extension id')
+    .action((directory, options) => {
+      createExtensionProject(directory, options.id);
+      console.log(`Created ${path.resolve(directory)}. Next: codegraph extensions test ${directory}`);
+    });
+  extensions.command('test <directory>').description('Check compatibility, graph assertions, determinism and removal in disposable projects; executes your extension')
+    .option('--fixtures <file>', 'Author fixture JSON relative to extension directory', 'extension.test.json')
+    .action(async (directory, options) => {
+      console.log(JSON.stringify(await testExtension(directory, { fixtures: options.fixtures }), null, 2));
+    });
   extensions.command('list').option('--path <path>', 'Project directory', '.').action(options => {
     console.log(JSON.stringify(new ExtensionManager(options.path).list(), null, 2));
   });
@@ -34,21 +46,7 @@ export function registerExtensionCommands(program: Command): void {
     });
   extensions.command('pack <directory>').description('Bundle an extension directory; validates metadata without executing code')
     .requiredOption('--out <file>', 'Output .cgext file').action((directory, options) => {
-      const root = path.resolve(directory);
-      const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
-      const files: Record<string, string> = {};
-      function walk(dir: string): void {
-        for (const file of fs.readdirSync(dir, { withFileTypes: true })) {
-          if (file.name.startsWith('.') || file.name === 'node_modules' || (dir === root && file.name === 'package.json')) continue;
-          const absolute = path.join(dir, file.name);
-          if (file.isSymbolicLink()) throw new Error('Package symlinks are unsupported');
-          if (file.isDirectory()) walk(absolute);
-          else files[path.relative(root, absolute).split(path.sep).join('/')] = fs.readFileSync(absolute, 'utf8');
-        }
-      }
-      walk(root);
-      const artifact: ExtensionPackage = { format: 'codegraph-extension-1', package: pkg, files };
-      const bytes = Buffer.from(JSON.stringify(artifact)); parsePackage(bytes);
-      fs.writeFileSync(options.out, bytes); console.log(`Packed ${pkg.name}@${pkg.version} into ${options.out}`);
+      const bytes = packExtension(directory);
+      fs.writeFileSync(options.out, bytes); console.log(`Packed extension into ${options.out}`);
     });
 }

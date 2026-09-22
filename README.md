@@ -707,6 +707,10 @@ ranking. It is *not* a filter: unlike the built-in `example/`, `sample/`,
 from some result sets outright — `deprioritize` only ever changes rank. Reach
 for `exclude` when you want something gone.
 
+### Framework extension authoring (development preview)
+
+The development branch includes a [public extension author guide](docs/extensions/authoring.md), a starter generator, and a graph compatibility test harness. These commands are not yet in a published npm release.
+
 ### Custom file extensions
 
 If your project uses a non-standard extension for a [supported

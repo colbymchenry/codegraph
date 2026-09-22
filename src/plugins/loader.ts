@@ -131,12 +131,12 @@ function validateNode(node: Node, id: string, root: string): Node {
   if (!node || typeof node.id !== 'string' || !node.id.startsWith(`plugin:${id}:`) || !node.name || !node.qualifiedName ||
       !NODE_KINDS.includes(node.kind) || !LANGUAGES.includes(node.language) || !validPath(root, node.filePath) ||
       !Number.isInteger(node.startLine) || node.startLine < 1 || !Number.isInteger(node.endLine) || node.endLine < node.startLine ||
-      !Number.isInteger(node.startColumn) || node.startColumn < 0 || !Number.isInteger(node.endColumn) || node.endColumn < 0) throw new Error('Invalid contributed node');
+      !Number.isInteger(node.startColumn) || node.startColumn < 0 || !Number.isInteger(node.endColumn) || node.endColumn < 0) throw new Error(`Invalid contributed node: use a plugin:${id}: id, supported kind/language, relative filePath and valid 1-based lines / 0-based columns`);
   return { ...node, updatedAt: 0 };
 }
 function validateEdge(edge: Edge, id: string): Edge {
   if (!edge || !edge.source || !edge.target || !EDGE_KINDS.includes(edge.kind) ||
-      typeof edge.metadata?.label !== 'string' || !edge.metadata.label.trim() || edge.metadata.label.length > 160) throw new Error('Invalid contributed edge or missing label');
+      typeof edge.metadata?.label !== 'string' || !edge.metadata.label.trim() || edge.metadata.label.length > 160) throw new Error('Invalid contributed edge or missing label: provide source/target node IDs, a supported kind and metadata.label (1–160 characters)');
   return { ...edge, provenance: 'heuristic', metadata: { ...edge.metadata, synthesizedBy: id } };
 }
 function guardFramework(fw: FrameworkResolver, p: ResolvedPlugin, diag: PluginDiagnostic, root: string): FrameworkResolver {
@@ -159,6 +159,7 @@ function guardFramework(fw: FrameworkResolver, p: ResolvedPlugin, diag: PluginDi
     }),
     extract: fw.extract ? (file, source) => call('extract', { nodes: [], references: [] }, () => {
       const out = fw.extract!(file, source);
+      if (!out || !Array.isArray(out.nodes) || !Array.isArray(out.references)) throw new Error('extract must return { nodes: [], references: [] }; both fields must be arrays');
       const nodes = out.nodes.map(n => validateNode(n, id, root));
       const references = out.references.map((r: UnresolvedRef) => {
         if (!r.fromNodeId.startsWith(`plugin:${id}:`) || !nodes.some(n => n.id === r.fromNodeId) || !r.referenceName ||

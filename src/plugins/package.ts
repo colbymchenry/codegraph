@@ -22,12 +22,39 @@ export function safeFile(file: string): boolean {
 }
 export function validateManifest(raw: unknown, engineVersion?: string): PluginManifest {
   const m = raw as PluginManifest;
-  if (!m || typeof m !== 'object' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(m.id) || m.apiVersion !== 1 ||
+  if (!m || typeof m !== 'object' || Array.isArray(m)) throw new Error('package.json must contain a codegraph manifest object');
+  if (m.apiVersion !== 1) throw new Error(`Extension uses unsupported API version ${String(m.apiVersion)}; this engine supports 1. Set codegraph.apiVersion to 1 and use the v1 author guide.`);
+  if (typeof m.id !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(m.id) ||
       !Array.isArray(m.capabilities) || m.capabilities.length === 0 ||
-      m.capabilities.some(c => c !== 'frameworks' && c !== 'synthPasses')) throw new Error('Invalid extension manifest or unsupported API version');
+      m.capabilities.some(c => c !== 'frameworks' && c !== 'synthPasses')) throw new Error('Invalid extension manifest: codegraph.id must use lowercase letters/digits/hyphens; capabilities must contain frameworks and/or synthPasses');
   if (m.engines !== undefined && (typeof m.engines !== 'string' || !semver.validRange(m.engines))) throw new Error('Invalid CodeGraph version range');
-  if (engineVersion && m.engines && !semver.satisfies(engineVersion, m.engines)) throw new Error(`Extension requires CodeGraph ${m.engines}; running ${engineVersion}`);
+  if (engineVersion && m.engines && !semver.satisfies(engineVersion, m.engines)) throw new Error(`Extension requires CodeGraph ${m.engines}; running ${engineVersion}. Use a compatible engine or correct codegraph.engines after testing against that engine.`);
   return m;
+}
+
+/** Package author source without evaluating it or running install scripts. */
+export function packExtension(directory: string): Buffer {
+  const root = fs.realpathSync(directory);
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+  const files: Record<string, string> = {};
+  function walk(dir: string): void {
+    for (const file of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      if (file.name.startsWith('.') || file.name === 'node_modules' || (dir === root && file.name === 'package.json')) continue;
+      const absolute = path.join(dir, file.name);
+      if (file.isSymbolicLink()) throw new Error('Package symlinks are unsupported');
+      if (file.isDirectory()) walk(absolute);
+      else {
+        const bytes = fs.readFileSync(absolute);
+        const content = bytes.toString('utf8');
+        if (!Buffer.from(content).equals(bytes)) throw new Error(`Package file must be UTF-8: ${file.name}`);
+        files[path.relative(root, absolute).split(path.sep).join('/')] = content;
+      }
+    }
+  }
+  walk(root);
+  const bytes = Buffer.from(JSON.stringify({ format: 'codegraph-extension-1', package: pkg, files }));
+  parsePackage(bytes);
+  return bytes;
 }
 export function parsePackage(bytes: Buffer, engineVersion?: string): ExtensionPackage {
   if (bytes.length > MAX_PACKAGE_BYTES) throw new Error('Extension package exceeds 8 MiB');
