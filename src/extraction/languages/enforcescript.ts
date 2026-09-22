@@ -105,6 +105,87 @@ function convertForeachColonToIn(source: string): string {
   });
 }
 
+/**
+ * `<Type> Name(params) { body };` — a method/function body immediately
+ * followed by a stray `;`. Enforce Script's compiler tolerates it — it's
+ * scattered across 21+ base-game files (`gameplayeffectwidgets_base.c`,
+ * `human.c`, `entityai.c`, `dayzplayerimplement.c`, …), never a mod-only
+ * quirk — but a body-ful `method_declaration` can NEVER be followed by `;`
+ * in the C# grammar (only a body-LESS interface-style signature can), so the
+ * stray `;` derails the WHOLE class into one top-level ERROR node the
+ * instant it appears (confirmed against gameplayeffectwidgets_base.c: the
+ * class and all 15 of its methods vanished from the tree).
+ *
+ * Blanks any stray `;` directly following a `{ … }` block whose OWN `{` was
+ * itself preceded by `)` — the shape shared by a method/constructor body AND
+ * an `if`/`for`/`while`/`foreach`/`switch`/`catch`/`using`/`lock` body. The
+ * control-flow case is deliberately not excluded: `if (x) { … };` already
+ * parses as two ordinary statements (the block, then an empty statement), so
+ * blanking that harmless `;` changes nothing structurally — it only matters
+ * for the method-declaration case, and getting that case right without
+ * false positives needs full member-vs-statement classification this stays
+ * simple by not needing. (Enforce Script has no C#-style `new Foo() {
+ * init };` object-initializer syntax — confirmed empirically against the
+ * whole DayZ base-game script tree — so that real C# false-positive shape
+ * never occurs here.)
+ *
+ * Brace-balanced and string/char/comment-aware so a `}` or `;` inside a
+ * literal is never mistaken for a real token. Byte-offset preserving (only
+ * the stray `;` itself is blanked to a space).
+ */
+function blankStrayBlockSemicolons(source: string): string {
+  if (source.indexOf('{') === -1) return source;
+  const n = source.length;
+  const out: string[] = Array.from(source);
+  const parenPrecededStack: boolean[] = [];
+  let lastSignificant = '';
+  let i = 0;
+  while (i < n) {
+    const c = source[i];
+    if (c === '/' && source[i + 1] === '/') {
+      while (i < n && source[i] !== '\n') i++;
+      continue;
+    }
+    if (c === '/' && source[i + 1] === '*') {
+      i += 2;
+      while (i < n && !(source[i] === '*' && source[i + 1] === '/')) i++;
+      i = Math.min(i + 2, n);
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      const quote = c;
+      i++;
+      while (i < n && source[i] !== quote) {
+        if (source[i] === '\\') i++;
+        i++;
+      }
+      i++;
+      lastSignificant = quote;
+      continue;
+    }
+    if (c === '{') {
+      parenPrecededStack.push(lastSignificant === ')');
+      lastSignificant = '{';
+      i++;
+      continue;
+    }
+    if (c === '}') {
+      const precededByParen = parenPrecededStack.pop() ?? false;
+      lastSignificant = '}';
+      i++;
+      if (precededByParen) {
+        let j = i;
+        while (j < n && /\s/.test(source[j] as string)) j++;
+        if (source[j] === ';') out[j] = ' ';
+      }
+      continue;
+    }
+    if (!/\s/.test(c as string)) lastSignificant = c as string;
+    i++;
+  }
+  return out.join('');
+}
+
 function preprocessEnforceScript(source: string): string {
   source = blankPreprocessorDirectives(source);
   source = markModdedAndStripInheritance(source);
@@ -112,6 +193,7 @@ function preprocessEnforceScript(source: string): string {
   source = blankUnknownModifiers(source);
   source = blankVoidBeforeDestructor(source);
   source = convertForeachColonToIn(source);
+  source = blankStrayBlockSemicolons(source);
   return source;
 }
 
@@ -131,6 +213,16 @@ export const enforcescriptExtractor: LanguageExtractor = {
   // blankVoidBeforeDestructor removes the leading `void` — same name/params/
   // body field shape as method_declaration, so no extra hooks are needed.
   methodTypes: [...csharpExtractor.methodTypes, 'destructor_declaration'],
+  // File-scope free functions (`void wpnPrint(string s) { … }` outside any
+  // class) — a routine EnforceScript pattern real C# has no equivalent for
+  // (every C# function lives in a class); the grammar parses one exactly like
+  // a C# 9 top-level-statement local function (`compilation_unit >
+  // global_statement > local_function_statement`). csharpExtractor leaves
+  // `functionTypes` empty since real C# has no file-scope functions to catch
+  // this way. Only ever dispatched for genuinely top-level instances — one
+  // nested inside another function's body is walked via visitFunctionBody,
+  // which never reaches this dispatch, so no local-helper explosion.
+  functionTypes: ['local_function_statement'],
   extractModifiers: (node) => (hasModdedSentinel(node) ? ['modded'] : undefined),
   // `modded class Foo` has no bases (the inheritance clause was stripped
   // pre-parse), so no false `extends` edge is ever created. This links it to
