@@ -87,8 +87,19 @@ export function getCodeGraphDir(projectRoot: string): string {
 }
 
 /**
- * Check if a project has been initialized with CodeGraph
- * Requires both .codegraph/ directory AND codegraph.db to exist
+ * Check if a project has been initialized with CodeGraph.
+ *
+ * Requires `.codegraph/codegraph.db` to exist AND to carry the codegraph
+ * schema. A file that merely exists — empty, or a SQLite database with no
+ * tables, as an interrupted `init` or a stray `touch` leaves behind — used to
+ * count as initialized, so one such file in an ANCESTOR directory (worst
+ * case: `$HOME`) captured the upward resolution of every project beneath it
+ * and made their real indexes unreachable (#1895).
+ *
+ * The probe is cheap and gated so hot callers (the prompt hook, MCP root
+ * resolution on every call) pay one small read: file size, then the SQLite
+ * header magic, then a read-only open with a single `sqlite_master` lookup —
+ * memoized per path + mtime + size so an unchanged db is never reopened.
  */
 export function isInitialized(projectRoot: string): boolean {
   const codegraphDir = getCodeGraphDir(projectRoot);
@@ -97,7 +108,65 @@ export function isInitialized(projectRoot: string): boolean {
   }
   // Must have codegraph.db, not just .codegraph folder
   const dbPath = path.join(codegraphDir, 'codegraph.db');
-  return fs.existsSync(dbPath);
+  let st: fs.Stats;
+  try {
+    st = fs.statSync(dbPath);
+  } catch {
+    return false;
+  }
+  return hasCodeGraphSchema(dbPath, st);
+}
+
+/** `codegraph.db` exists at `projectRoot` but does not carry the schema (#1895). */
+export function hasSchemalessDb(projectRoot: string): boolean {
+  const dbPath = path.join(getCodeGraphDir(projectRoot), 'codegraph.db');
+  return fs.existsSync(dbPath) && !isInitialized(projectRoot);
+}
+
+const SQLITE_MAGIC = Buffer.from('SQLite format 3\0', 'latin1');
+/** A SQLite file header is 100 bytes; anything shorter cannot be a database. */
+const SQLITE_HEADER_SIZE = 100;
+const schemaProbeCache = new Map<string, { mtimeMs: number; size: number; ok: boolean }>();
+
+function hasCodeGraphSchema(dbPath: string, st: fs.Stats): boolean {
+  if (!st.isFile() || st.size < SQLITE_HEADER_SIZE) return false;
+  const cached = schemaProbeCache.get(dbPath);
+  if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) return cached.ok;
+  const ok = readsAsSqlite(dbPath) && hasNodesTable(dbPath);
+  schemaProbeCache.set(dbPath, { mtimeMs: st.mtimeMs, size: st.size, ok });
+  return ok;
+}
+
+function readsAsSqlite(dbPath: string): boolean {
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(dbPath, 'r');
+    const head = Buffer.alloc(SQLITE_MAGIC.length);
+    const n = fs.readSync(fd, head, 0, head.length, 0);
+    return n === head.length && head.equals(SQLITE_MAGIC);
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+  }
+}
+
+function hasNodesTable(dbPath: string): boolean {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { DatabaseSync } = require('node:sqlite');
+  let db: any = null;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    const row = db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'nodes'").get();
+    return row !== undefined;
+  } catch (err) {
+    // A db another process holds an exclusive lock on is a live db, not a
+    // broken one; only an unreadable or schema-less file is "not initialized".
+    return /locked|busy/i.test(String((err as Error)?.message ?? ''));
+  } finally {
+    // Never hold the handle: Windows file locking would block the owner.
+    try { db?.close(); } catch { /* already closed */ }
+  }
 }
 
 /**
@@ -731,11 +800,11 @@ function ensureGitignore(gitignorePath: string): boolean {
  */
 export function createDirectory(projectRoot: string): void {
   const codegraphDir = getCodeGraphDir(projectRoot);
-  const dbPath = path.join(codegraphDir, 'codegraph.db');
 
-  // Only throw if CodeGraph is actually initialized (db exists)
-  // .codegraph/ folder alone is fine
-  if (fs.existsSync(dbPath)) {
+  // Only throw if CodeGraph is actually initialized (db with a schema).
+  // .codegraph/ folder alone — or a schema-less codegraph.db left by an
+  // interrupted init (#1895) — is fine: initialize() adds the schema to it.
+  if (isInitialized(projectRoot)) {
     throw new Error(`CodeGraph already initialized in ${projectRoot}`);
   }
 

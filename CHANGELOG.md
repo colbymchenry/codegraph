@@ -177,6 +177,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Interrupted extension installs and changes recover their last consistent configuration and graph, while conflicting user edits produce repair instructions instead of being overwritten.
 
+- An empty or table-less `codegraph.db` left behind in a parent directory (by an interrupted `codegraph init`, or a never-populated `~/.codegraph/`) no longer counts as an initialized project, so it can no longer hide the real index of every project beneath it. Only a database that actually carries the codegraph schema is treated as initialized, and `codegraph init` in the directory with the broken file now repairs it instead of refusing with "Already initialized". (#1895)
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
 - Turning telemetry off now resets its identity and stops running processes from recording, sending, or restoring unsent data. (#1869)
