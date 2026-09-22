@@ -1,0 +1,3909 @@
+{
+  "format": 1,
+  "recordedAt": "2026-09-22T12:12:03.155044+00:00",
+  "branch": "feature/extensions-author-kit-20260922",
+  "pr": "https://github.com/colbymchenry/codegraph/pull/1911",
+  "applicationSource": "52c1b38644e9c0833945ceabaa086ecbbd4aac57",
+  "operatorSource": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+  "testedSourceDelta": [
+    "docs/extensions/cloudflare-hosting.md",
+    "marketplace/cloudflare/local.mjs",
+    "marketplace/cloudflare/ops-test.mjs",
+    "marketplace/cloudflare/ops.mjs"
+  ],
+  "hostedCloudflare": false,
+  "deployment": null,
+  "sourceFiles": [
+    {
+      "path": "__tests__/extension-package-portable.test.ts",
+      "bytes": 1850,
+      "sha256": "86f90d13d56ca80e1d927e264e44c7a16e4955d0ff0b70eec8993deba0cae11b"
+    },
+    {
+      "path": "marketplace/cloudflare/.gitignore",
+      "bytes": 65,
+      "sha256": "a8b8851eb5aa2caf5a0ed8e78590b8d54d819c41fa5bfb407c3c917c4bcb9249"
+    },
+    {
+      "path": "marketplace/cloudflare/backup.mjs",
+      "bytes": 4792,
+      "sha256": "40e162c875d85321ca6f5e8af553284e30f00d5d7dd4eaa79be8d0ff8bfbd814"
+    },
+    {
+      "path": "marketplace/cloudflare/build.mjs",
+      "bytes": 507,
+      "sha256": "928ac6fb72ff1cab5c9742b127839524ccd81d28057bf7dbda18e2eded407678"
+    },
+    {
+      "path": "marketplace/cloudflare/local.mjs",
+      "bytes": 1710,
+      "sha256": "e42e53ab7c21c81972eb73f540abecd539f2998ded10eb89831987c478c48541"
+    },
+    {
+      "path": "marketplace/cloudflare/migrations/0001_registry.sql",
+      "bytes": 1544,
+      "sha256": "2565291cfbac417a720f6cb314a747a28bd6e1bab74ab8c432983353afe190aa"
+    },
+    {
+      "path": "marketplace/cloudflare/ops-test.mjs",
+      "bytes": 4262,
+      "sha256": "b2257afd6f70c073b6399ae11630bd43390f57b16a6b6c464cc5bd1218ee0ebd"
+    },
+    {
+      "path": "marketplace/cloudflare/ops.mjs",
+      "bytes": 1355,
+      "sha256": "6f3d0f837452a0c45096051326059e3aea101260f9f5433fea53f447b5455932"
+    },
+    {
+      "path": "marketplace/cloudflare/package-lock.json",
+      "bytes": 49562,
+      "sha256": "31034ff1b7c51eda45ea7880bc6c4b7fc25714df4755bd562bbcc1e69e2d560f"
+    },
+    {
+      "path": "marketplace/cloudflare/package.json",
+      "bytes": 381,
+      "sha256": "d969a370d278c1be48e0c8cad7275c00a95b352c7d3cdaf019c984c58479c59c"
+    },
+    {
+      "path": "marketplace/cloudflare/test-child.mjs",
+      "bytes": 261,
+      "sha256": "46cb4d4efa27fda343f0cd8dda32525f13b18bf0dd8179a49eef53cf6eb9fc60"
+    },
+    {
+      "path": "marketplace/cloudflare/test-worker.ts",
+      "bytes": 435,
+      "sha256": "4459716b06fcd2cca8fff67623daf93e8af80f52e7522a6047c383af8d84ff81"
+    },
+    {
+      "path": "marketplace/cloudflare/test.mjs",
+      "bytes": 11454,
+      "sha256": "9964f7a0b50ec1884ab353e24d18aef46ea34701bb69aa91b2278fec78c17ac5"
+    },
+    {
+      "path": "marketplace/cloudflare/worker.ts",
+      "bytes": 10728,
+      "sha256": "ea78032e5289aa4f940ad9cffeecac662e3eb1afe801516b7474a2510524c1bb"
+    },
+    {
+      "path": "marketplace/cloudflare/wrangler.jsonc",
+      "bytes": 681,
+      "sha256": "b46ea98f273f2c01228102dd4633a9ebf0d1142e3293b33b19f28d29b043ea61"
+    },
+    {
+      "path": "marketplace/public/_headers",
+      "bytes": 254,
+      "sha256": "7b2fb8fc7fc84e6968ab54a3e200df400b7af1fcb68bcf6aec44a6248a1aeb4e"
+    },
+    {
+      "path": "scripts/validation/cloudflare-registry.cjs",
+      "bytes": 343,
+      "sha256": "af995ae88b2b5fc1ee2a458557024b26068636e384de9a63d793a97fcf1b32f4"
+    },
+    {
+      "path": "scripts/validation/extensions-compatibility.cjs",
+      "bytes": 15204,
+      "sha256": "2e029a44a08f2043047167ad620df411e6c0a3b2ed2145a79ece9a1b92e6dca4"
+    },
+    {
+      "path": "scripts/validation/marketplace-browser.cjs",
+      "bytes": 16309,
+      "sha256": "32eb9504634b90153d9819ae3b8355be44a3326b61ee2e6fd5ec0ee21c6d707c"
+    },
+    {
+      "path": "src/plugins/package-validation.ts",
+      "bytes": 3124,
+      "sha256": "22edaf08c9531c6169ca0abf8f80c5b3536e29b049a2c387393ba2af4e003bf9"
+    },
+    {
+      "path": "src/plugins/package.ts",
+      "bytes": 3974,
+      "sha256": "98fb111460d5a2ef5e1f1dc367768e7b44cc44bb51549b4a4f93c9f5a6694fbc"
+    }
+  ],
+  "compiledFiles": [
+    {
+      "path": "marketplace/cloudflare/.build/test-worker.js",
+      "bytes": 145769,
+      "sha256": "22d668d1aeeaca95dddecf980fdf107513af0b105d9fe221e70f87014192ab33"
+    },
+    {
+      "path": "marketplace/cloudflare/.build/test-worker.ts.meta.json",
+      "bytes": 60816,
+      "sha256": "90a1693fb66c7a679ccb3bb7fb2347abb9354e8ef2019e36925888ecf7c96520"
+    },
+    {
+      "path": "marketplace/cloudflare/.build/worker.js",
+      "bytes": 145457,
+      "sha256": "2bc5fd44fdc45d5a72c809dbcbe6e8e79dff071b6c91ca1644189d9f1529be22"
+    },
+    {
+      "path": "marketplace/cloudflare/.build/worker.ts.meta.json",
+      "bytes": 60607,
+      "sha256": "bbd2b4f2537bf3071132f91ff544ecab9d15b720b7798e1f2e9be7aa17c5ddca"
+    },
+    {
+      "path": "dist/plugins/package.js",
+      "bytes": 6553,
+      "sha256": "039abfd75cfc0d68bf3254ac944d948378a3b0f68a723c17c110951110d4dd1f"
+    },
+    {
+      "path": "dist/plugins/package-validation.js",
+      "bytes": 4355,
+      "sha256": "ce3d069c645bf04b7fc4fe1c55ce04520eedb2cc1d75b39c603f816358a39ea9"
+    },
+    {
+      "path": "dist/plugins/manager.js",
+      "bytes": 10481,
+      "sha256": "143535f6590b35b55180f48d39b6ab6d2d94062938da418c8ac5bdf856ee4400"
+    },
+    {
+      "path": "dist/plugins/releases.js",
+      "bytes": 5088,
+      "sha256": "cb586bd81a266eb187e0babc74193a66cff096b6cdeba6b6489e241b15824796"
+    },
+    {
+      "path": "dist/plugins/bridge.js",
+      "bytes": 12298,
+      "sha256": "a98b1159482e5b312dd40d5fbf0387e0d52e8ffde5ff56f0de61b3187f55ef12"
+    }
+  ],
+  "localResults": {
+    "runtime": {
+      "revision": "52c1b38644e9c0833945ceabaa086ecbbd4aac57",
+      "dirty": false,
+      "platform": "linux",
+      "node": "v22.23.2",
+      "checks": [
+        "Web Crypto signature and SPKI identity match Node publisher",
+        "catalog and immutable R2 package bytes agree",
+        "missing and corrupt stored artifacts fail closed instead of serving bytes",
+        "replay and immutable version reject without replacement",
+        "existing publisher owns later versions",
+        "invalid signatures packages and unsupported API rejected",
+        "cross-origin publication rejected",
+        "R2 boundary failures expose no catalog and exact signed retry succeeds",
+        "lost response after D1 commit retains release and replay guard",
+        "concurrent same-version commit has one winner",
+        "concurrent initial publisher ownership has one winner",
+        "D1 failure rolls back release ownership and replay nonce",
+        "isolated D1/R2 backup restore retains listing ownership and nonce; refuses live overwrite",
+        "corrupt snapshot cannot expose a restored catalog",
+        "replacement Worker runtime retains D1 metadata and R2 bytes",
+        "8 MiB package survives Worker crypto D1 metadata and R2 upload/download",
+        "over-limit package rejected",
+        "D1 rate limit survives distributed requests",
+        "real test-owned process kills after R2 and D1 boundaries recover in fresh runtime",
+        "production bundle has no test failure control",
+        "publication stays disabled until explicitly enabled"
+      ],
+      "receipts": [
+        {
+          "exit": null,
+          "signal": "SIGKILL",
+          "log": "child-1.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "exit": null,
+          "signal": "SIGKILL",
+          "log": "child-2.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "snapshot": {
+        "releases": 7,
+        "objects": 7
+      },
+      "largePackage": {
+        "bytes": 8388608,
+        "wallMilliseconds": 917.0780420000001,
+        "note": "Local wall time includes storage I/O; not Cloudflare CPU billing measurement"
+      },
+      "success": true
+    },
+    "operators": {
+      "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+      "dirty": false,
+      "checks": [
+        "missing source fails before backup",
+        "empty source fails without creating a registry snapshot",
+        "documented backup command captures a release and refuses overwrite",
+        "documented restore command preserves publisher release and exact bytes",
+        "restore refuses an existing target before mutation"
+      ],
+      "commands": [
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "ops.mjs",
+            "backup",
+            "/tmp/cg-worker-operators-nbMZDw/missing",
+            "/tmp/cg-worker-operators-nbMZDw/absent-backup"
+          ],
+          "exit": 1,
+          "signal": null,
+          "log": "command-1.log"
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "ops.mjs",
+            "backup",
+            "/tmp/cg-worker-operators-nbMZDw/empty",
+            "/tmp/cg-worker-operators-nbMZDw/empty-backup"
+          ],
+          "exit": 1,
+          "signal": null,
+          "log": "command-2.log"
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "ops.mjs",
+            "backup",
+            "/tmp/cg-worker-operators-nbMZDw/source",
+            "/tmp/cg-worker-operators-nbMZDw/snapshot"
+          ],
+          "exit": 0,
+          "signal": null,
+          "log": "command-3.log"
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "ops.mjs",
+            "backup",
+            "/tmp/cg-worker-operators-nbMZDw/source",
+            "/tmp/cg-worker-operators-nbMZDw/snapshot"
+          ],
+          "exit": 1,
+          "signal": null,
+          "log": "command-4.log"
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "ops.mjs",
+            "restore",
+            "/tmp/cg-worker-operators-nbMZDw/restored",
+            "/tmp/cg-worker-operators-nbMZDw/snapshot"
+          ],
+          "exit": 0,
+          "signal": null,
+          "log": "command-5.log"
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "ops.mjs",
+            "restore",
+            "/tmp/cg-worker-operators-nbMZDw/restored",
+            "/tmp/cg-worker-operators-nbMZDw/snapshot"
+          ],
+          "exit": 1,
+          "signal": null,
+          "log": "command-6.log"
+        }
+      ],
+      "success": true
+    },
+    "compatibility": {
+      "checks": [
+        "signed immutable versions; semantic catalog order independent of publication order",
+        "one browser Install selects 1.10.0 over incompatible 9.0.0 and preview; actual Python graph refreshed only in chosen destination",
+        "no-compatible browser selection/command fails usefully and preserves existing config/graph",
+        "headless automatic selection agrees; exact incompatible pin/no-compatible/missing update fail without mutation",
+        "prerelease requires explicit exact pin; automatic update refuses downgrade; explicit lower pin remains exact",
+        "compatible but broken update retains previous version and graph",
+        "browser and headless update to highest compatible stable; stale graph labels removed",
+        "exact artifact URL/file semantics and build-metadata pin identity preserved",
+        "removal cleans contributions; desktop/mobile display actual destination compatibility; no page errors"
+      ],
+      "releases": [
+        {
+          "id": "compatible-demo",
+          "version": "1.10.0",
+          "engines": ">=1.6.0 <2",
+          "integrity": "d59f9b1e9bd7d027081de45ab004aefe3236708ddeb4fc7135c92502ce0866d8"
+        },
+        {
+          "id": "compatible-demo",
+          "version": "1.9.0",
+          "engines": ">=1.6.0 <2",
+          "integrity": "07e64445b8c7205ec9a1d76c9e29affbd55d45e0817e9c3d92572b9f00486fcd"
+        },
+        {
+          "id": "compatible-demo",
+          "version": "0.5.0",
+          "engines": ">=1.6.0 <2",
+          "integrity": "ad3c944ff2bea24feb81cb25839746b72e4845b9dae3cba3a4e2ce872855114d"
+        },
+        {
+          "id": "compatible-demo",
+          "version": "20.0.0-beta.1",
+          "engines": ">=1.6.0 <2",
+          "integrity": "1a24723ecad51739315c4a6439227ff0a884700647ac505db74a12949fa99c82"
+        },
+        {
+          "id": "compatible-demo",
+          "version": "9.0.0",
+          "engines": ">=9",
+          "integrity": "c3f802635737b02d15f6fe3e82cde56c41a1c83c8a9cc0858ef964b49be206c9"
+        },
+        {
+          "id": "unavailable-demo",
+          "version": "1.0.0",
+          "engines": ">=9",
+          "integrity": "bc25c179402f994d59e586491cc0921d01ddc6dcf12bea9274982df745f42ef0"
+        },
+        {
+          "id": "compatible-demo",
+          "version": "2.0.0",
+          "engines": ">=1.6.0 <2",
+          "integrity": "5b2f2099fbe51f94a4242f8e81570bacf3a7c16625e8439af3853adab1de65f1"
+        },
+        {
+          "id": "compatible-demo",
+          "version": "3.0.0",
+          "engines": ">=1.6.0 <2",
+          "integrity": "e9f0eecbf6621e6f0ba7fc139d1eb91ffa2899548e0b5e615e3443a0496c8081"
+        },
+        {
+          "id": "compatible-demo",
+          "version": "1.10.0+fixture.1",
+          "engines": ">=1.6.0 <2",
+          "integrity": "b78efa83378ef1de9e79e8f6e4c18f0470382d8946481c4680fd0cbe2c6c349f"
+        }
+      ],
+      "commands": [
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "compatible-demo",
+            "--registry",
+            "http://127.0.0.1:39817",
+            "--path",
+            "/tmp/cg-compatible-HwNpqp/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 1.904
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "compatible-demo",
+            "--registry",
+            "http://127.0.0.1:39817",
+            "--version",
+            "9.0.0",
+            "--path",
+            "/tmp/cg-compatible-HwNpqp/headless-python-project"
+          ],
+          "exit": 1,
+          "seconds": 0.606
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "update",
+            "unavailable-demo",
+            "--registry",
+            "http://127.0.0.1:39817",
+            "--path",
+            "/tmp/cg-compatible-HwNpqp/headless-python-project"
+          ],
+          "exit": 1,
+          "seconds": 0.338
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "unavailable-demo",
+            "--registry",
+            "http://127.0.0.1:39817",
+            "--path",
+            "/tmp/cg-compatible-HwNpqp/headless-python-project"
+          ],
+          "exit": 1,
+          "seconds": 0.514
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "compatible-demo",
+            "--registry",
+            "http://127.0.0.1:39817",
+            "--version",
+            "20.0.0-beta.1",
+            "--path",
+            "/tmp/cg-compatible-HwNpqp/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 1.751
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "update",
+            "compatible-demo",
+            "--registry",
+            "http://127.0.0.1:39817",
+            "--path",
+            "/tmp/cg-compatible-HwNpqp/headless-python-project"
+          ],
+          "exit": 1,
+          "seconds": 0.434
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "compatible-demo",
+            "--registry",
+            "http://127.0.0.1:39817",
+            "--version",
+            "1.9.0",
+            "--path",
+            "/tmp/cg-compatible-HwNpqp/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 1.699
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "update",
+            "compatible-demo",
+            "--registry",
+            "http://127.0.0.1:39817",
+            "--path",
+            "/tmp/cg-compatible-HwNpqp/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 1.7
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "http://127.0.0.1:39817/api/download/compatible-demo/1.9.0",
+            "--path",
+            "/tmp/cg-compatible-HwNpqp/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 1.569
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "/tmp/cg-compatible-HwNpqp/pinned.cgext",
+            "--path",
+            "/tmp/cg-compatible-HwNpqp/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 2.169
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "compatible-demo",
+            "--registry",
+            "http://127.0.0.1:39817",
+            "--version",
+            "1.10.0+fixture.1",
+            "--path",
+            "/tmp/cg-compatible-HwNpqp/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 2.184
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "remove",
+            "compatible-demo",
+            "--path",
+            "/tmp/cg-compatible-HwNpqp/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 1.595
+        }
+      ],
+      "engineVersion": "1.6.0",
+      "platform": "linux",
+      "browser": "153.0.8010.36"
+    },
+    "browser": {
+      "browser": "153.0.8010.36",
+      "platform": "linux",
+      "checks": [
+        "late catalog response preserves the entered publisher form and package",
+        "real browser signed publisher upload",
+        "slow package metadata preserves typed publisher fields",
+        "browser publisher ownership rejection",
+        "browser invalid-signature failure state",
+        "browser malformed-package rejection without publication",
+        "one-click selected-project install verified in SQLite",
+        "real postMessage wrong-window command ignored",
+        "failed browser update preserves working version and graph",
+        "browser update replaces stale graph contributions",
+        "browser disable/enable/remove verified in SQLite",
+        "mobile detail fits viewport",
+        "real postMessage wrong-origin command ignored",
+        "closed local companion expires the connection visibly",
+        "real stopped registry shows actionable publisher failure without changing local graph"
+      ],
+      "pageErrors": []
+    }
+  },
+  "receipts": [
+    {
+      "receipt": {
+        "path": ".qa/recovery/cloudflare-access-final.json",
+        "bytes": 603,
+        "sha256": "a2bc877db9d61bf950ec6f02f3d35df20b2057d8419438eae6d01d453cc13d75"
+      },
+      "log": {
+        "path": ".qa/recovery/cloudflare-access-final.log",
+        "bytes": 391,
+        "sha256": "0dad792b0ac31989c8da6585de4ab4833e16a47c09517de3a3f7454294468ead"
+      },
+      "result": {
+        "command": [
+          "env",
+          "WRANGLER_SEND_METRICS=false",
+          "WRANGLER_LOG_PATH=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/cloudflare/wrangler-access-final.log",
+          "marketplace/cloudflare/node_modules/.bin/wrangler",
+          "whoami"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T12:06:07.958745+00:00",
+        "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 3.265,
+        "finished_at": "2026-09-22T12:06:11.224097+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/cloudflare-browser-final.json",
+        "bytes": 627,
+        "sha256": "4eabd11cc8f029c87db0d5e55eb80ad3ba10631369e9dda688e96d0a2ae48566"
+      },
+      "log": {
+        "path": ".qa/recovery/cloudflare-browser-final.log",
+        "bytes": 2441,
+        "sha256": "8562a151d1a014c47bcb2a8656231bbed5a9377b8af3d35d7819fd36a8b89efe"
+      },
+      "result": {
+        "command": [
+          "env",
+          "CLOUDFLARE_REGISTRY=1",
+          "BROWSER_OUTPUT=.qa/cloudflare/browser-final",
+          "PLAYWRIGHT_MODULE=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/browser-tools/node_modules/playwright",
+          "node",
+          "scripts/validation/marketplace-browser.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T07:01:36.462807+00:00",
+        "revision": "52c1b38644e9c0833945ceabaa086ecbbd4aac57",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 24.058,
+        "finished_at": "2026-09-22T07:02:00.520981+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/cloudflare-compatibility-final.json",
+        "bytes": 636,
+        "sha256": "227563447d8a36943cb33b23b1e0241abeaeefde9b1abd8821281fa3126d3486"
+      },
+      "log": {
+        "path": ".qa/recovery/cloudflare-compatibility-final.log",
+        "bytes": 3286,
+        "sha256": "f87036873106748c6e6454c8da19f30e3b082a53bc487ac7ecc4b8b5688eaa5e"
+      },
+      "result": {
+        "command": [
+          "env",
+          "CLOUDFLARE_REGISTRY=1",
+          "COMPAT_OUTPUT=.qa/cloudflare/compatibility-final",
+          "PLAYWRIGHT_MODULE=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/browser-tools/node_modules/playwright",
+          "node",
+          "scripts/validation/extensions-compatibility.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T12:05:45.003895+00:00",
+        "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 29.84,
+        "finished_at": "2026-09-22T12:06:14.844292+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/cloudflare-compatibility-sequential.json",
+        "bytes": 755,
+        "sha256": "c92542aa9cc04b7e48577932d5d545201ffd07c8144bf11b9040f374efba7316"
+      },
+      "log": {
+        "path": ".qa/recovery/cloudflare-compatibility-sequential.log",
+        "bytes": 3134,
+        "sha256": "a10609d5ab8621351db831d4dd36e5e5e7b925dd11254525ae2000fd7a62f86e"
+      },
+      "result": {
+        "command": [
+          "node",
+          "scripts/validation/extensions-compatibility.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T06:59:30.723302+00:00",
+        "revision": "44aaa721b2206af68c2ed99a96a4c9f7eabf1bef",
+        "working_tree": " M CHANGELOG.md\n M docs/extensions/hosting.md\n M marketplace/cloudflare/migrations/0001_registry.sql\n M marketplace/cloudflare/test.mjs\n M marketplace/cloudflare/worker.ts\n M src/plugins/package-validation.ts\n?? __tests__/extension-package-portable.test.ts\n?? docs/extensions/cloudflare-hosting.md\n?? marketplace/cloudflare/ops.mjs\n",
+        "exit_code": 0,
+        "seconds": 30.44,
+        "finished_at": "2026-09-22T07:00:01.163550+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/cloudflare-compatibility.json",
+        "bytes": 614,
+        "sha256": "026a2801175a7aa967f904e1f5f16baf96bb259181cd217b7f40db8c6d40153a"
+      },
+      "log": {
+        "path": ".qa/recovery/cloudflare-compatibility.log",
+        "bytes": 989,
+        "sha256": "b28ba28b397d7a105d2ac32e78deba55d9f2266eef5b3fd4fedecfb8d23ef04f"
+      },
+      "result": {
+        "command": [
+          "node",
+          "scripts/validation/extensions-compatibility.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T06:57:11.469545+00:00",
+        "revision": "44aaa721b2206af68c2ed99a96a4c9f7eabf1bef",
+        "working_tree": " M CHANGELOG.md\n M docs/extensions/hosting.md\n M marketplace/cloudflare/test.mjs\n M src/plugins/package-validation.ts\n?? docs/extensions/cloudflare-hosting.md\n?? marketplace/cloudflare/ops.mjs\n",
+        "exit_code": 1,
+        "seconds": 24.592,
+        "finished_at": "2026-09-22T06:57:36.062051+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/cloudflare-dryrun-final.json",
+        "bytes": 864,
+        "sha256": "61acec257d0bd8ff4a72807103add20e59e1056cf459aa4120b0d5da4020d18a"
+      },
+      "log": {
+        "path": ".qa/recovery/cloudflare-dryrun-final.log",
+        "bytes": 820,
+        "sha256": "e8ee7ddf084bfcbb4464496b06e906dc0e5c90d24b0a79283072540322874725"
+      },
+      "result": {
+        "command": [
+          "env",
+          "XDG_CONFIG_HOME=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/.cloudflare-config",
+          "WRANGLER_SEND_METRICS=false",
+          "WRANGLER_LOG_PATH=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/cloudflare/wrangler-dryrun-final.log",
+          "marketplace/cloudflare/node_modules/.bin/wrangler",
+          "deploy",
+          "--config",
+          "marketplace/cloudflare/wrangler.jsonc",
+          "--dry-run",
+          "--experimental-provision=false",
+          "--experimental-auto-create=false"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T12:05:01.491592+00:00",
+        "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 3.712,
+        "finished_at": "2026-09-22T12:05:05.203399+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/cloudflare-focused-final.json",
+        "bytes": 908,
+        "sha256": "6b002be08cb6426dc3ccbec5be92ef8e9f61bfb890d86244b2569e40fd2f5a9b"
+      },
+      "log": {
+        "path": ".qa/recovery/cloudflare-focused-final.log",
+        "bytes": 3836,
+        "sha256": "a7dc768f0c157ec58228c153fa2ca55d72fe4e4a5a2eba71cf0263b200afeaf6"
+      },
+      "result": {
+        "command": [
+          "npx",
+          "vitest",
+          "run",
+          "__tests__/extension-package-portable.test.ts",
+          "__tests__/extension-marketplace.test.ts",
+          "__tests__/extension-author.test.ts",
+          "__tests__/extension-releases.test.ts",
+          "__tests__/extension-trust.test.ts",
+          "__tests__/plugins.test.ts",
+          "__tests__/marketplace-storage.test.ts",
+          "--maxWorkers=2",
+          "--minWorkers=1"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T07:01:24.302733+00:00",
+        "revision": "52c1b38644e9c0833945ceabaa086ecbbd4aac57",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 12.086,
+        "finished_at": "2026-09-22T07:01:36.388548+00:00",
+        "summary": [
+          "Test Files  7 passed (7)",
+          "Tests  35 passed (35)",
+          "Duration  9.40s (transform 3.86s, setup 0ms, collect 10.06s, tests 5.29s, environment 3ms, prepare 1.16s)"
+        ]
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/cloudflare-focused.json",
+        "bytes": 1111,
+        "sha256": "3dd69ab86a61af6699c5cd2082d1d8ad0a14278b769d71b17de8472d234fa1cf"
+      },
+      "log": {
+        "path": ".qa/recovery/cloudflare-focused.log",
+        "bytes": 3690,
+        "sha256": "67380f946149a4e63ca69174a297ede3da3f52093d8245183f585da1f58fc934"
+      },
+      "result": {
+        "command": [
+          "npx",
+          "vitest",
+          "run",
+          "__tests__/extension-marketplace.test.ts",
+          "__tests__/extension-author.test.ts",
+          "__tests__/extension-releases.test.ts",
+          "__tests__/extension-trust.test.ts",
+          "__tests__/plugins.test.ts",
+          "__tests__/marketplace-storage.test.ts",
+          "--maxWorkers=2",
+          "--minWorkers=1"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T06:58:02.551867+00:00",
+        "revision": "44aaa721b2206af68c2ed99a96a4c9f7eabf1bef",
+        "working_tree": " M CHANGELOG.md\n M docs/extensions/hosting.md\n M marketplace/cloudflare/migrations/0001_registry.sql\n M marketplace/cloudflare/test.mjs\n M src/plugins/package-validation.ts\n?? docs/extensions/cloudflare-hosting.md\n?? marketplace/cloudflare/ops.mjs\n",
+        "exit_code": 0,
+        "seconds": 13.142,
+        "finished_at": "2026-09-22T06:58:15.693948+00:00",
+        "summary": [
+          "Test Files  6 passed (6)",
+          "Tests  31 passed (31)",
+          "Duration  9.72s (transform 4.05s, setup 0ms, collect 10.40s, tests 5.13s, environment 3ms, prepare 1.06s)"
+        ]
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/cloudflare-https-compatibility-network-retry.json",
+        "bytes": 687,
+        "sha256": "ef4e42e8c6cc73bb00900c60aba31ad183e74816807a5ce666a37142544f9fd0"
+      },
+      "log": {
+        "path": ".qa/recovery/cloudflare-https-compatibility-network-retry.log",
+        "bytes": 578,
+        "sha256": "89e710f292887e01f2077192f0151a77934857f0ab449c4c47bef91f5b67af13"
+      },
+      "result": {
+        "command": [
+          "env",
+          "CLOUDFLARE_REGISTRY=1",
+          "REGISTRY_TEST_HTTPS=1",
+          "COMPAT_OUTPUT=.qa/cloudflare/https-worker-compatibility-network-retry",
+          "PLAYWRIGHT_MODULE=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/browser-tools/node_modules/playwright",
+          "node",
+          "scripts/validation/extensions-compatibility.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T12:05:00.191979+00:00",
+        "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+        "working_tree": "",
+        "exit_code": 1,
+        "seconds": 16.163,
+        "finished_at": "2026-09-22T12:05:16.355394+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/cloudflare-https-compatibility.json",
+        "bytes": 673,
+        "sha256": "e3cedb22d235a65399384d4ffb8ac64c1ce80c7989086805a6214e18fe0ff16c"
+      },
+      "log": {
+        "path": ".qa/recovery/cloudflare-https-compatibility.log",
+        "bytes": 568,
+        "sha256": "66d879b02f4cf7f3076a7a80525b5d0c66c5c3abd909d438038e4d11983d6ac4"
+      },
+      "result": {
+        "command": [
+          "env",
+          "CLOUDFLARE_REGISTRY=1",
+          "REGISTRY_TEST_HTTPS=1",
+          "COMPAT_OUTPUT=.qa/cloudflare/https-worker-compatibility",
+          "PLAYWRIGHT_MODULE=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/browser-tools/node_modules/playwright",
+          "node",
+          "scripts/validation/extensions-compatibility.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T07:07:43.046509+00:00",
+        "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+        "working_tree": "",
+        "exit_code": 1,
+        "seconds": 13.781,
+        "finished_at": "2026-09-22T07:07:56.827189+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/cloudflare-max-diagnostic.json",
+        "bytes": 397,
+        "sha256": "43de241e47cd9bfdba3bd2cb9439c17ca90ee8b51573d10db85b742d9f1e55b5"
+      },
+      "log": {
+        "path": ".qa/recovery/cloudflare-max-diagnostic.log",
+        "bytes": 855,
+        "sha256": "b80ac126ad6e497f087c751d3d6ae3a3de31c4ed223ad9d20220e01594975248"
+      },
+      "result": {
+        "command": [
+          "node",
+          ".qa/cloudflare/max-package.mjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T06:53:36.038220+00:00",
+        "revision": "44aaa721b2206af68c2ed99a96a4c9f7eabf1bef",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 7.078,
+        "finished_at": "2026-09-22T06:53:43.118314+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/cloudflare-operators-final.json",
+        "bytes": 403,
+        "sha256": "ab6365eda74ec19f97588e0b4923778727b7206ce7fcd02ca1c5f6bbe1045575"
+      },
+      "log": {
+        "path": ".qa/recovery/cloudflare-operators-final.log",
+        "bytes": 305,
+        "sha256": "68259f4ed9d836d0c8969cbcaab6edb834aa9dc94da2e3153a46742fb7a688bf"
+      },
+      "result": {
+        "command": [
+          "node",
+          "ops-test.mjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/marketplace/cloudflare",
+        "started_at": "2026-09-22T07:07:17.008883+00:00",
+        "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 12.902,
+        "finished_at": "2026-09-22T07:07:29.911097+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/cloudflare-runtime-final.json",
+        "bytes": 555,
+        "sha256": "ff346ba7462ed7255692a3cdd1978f3bfbdaf6d0311dffbbc43f9c12b38760e8"
+      },
+      "log": {
+        "path": ".qa/recovery/cloudflare-runtime-final.log",
+        "bytes": 1379,
+        "sha256": "68396ecfd81a856d7be81a67ea62e4da5a8e576d38a3bfd0239d53e0c1227c2a"
+      },
+      "result": {
+        "command": [
+          "env",
+          "CLOUDFLARE_OUTPUT=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/cloudflare/runtime-final",
+          "npm",
+          "test",
+          "--prefix",
+          "marketplace/cloudflare"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T07:00:25.354987+00:00",
+        "revision": "52c1b38644e9c0833945ceabaa086ecbbd4aac57",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 16.162,
+        "finished_at": "2026-09-22T07:00:41.516538+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/cloudflare-runtime-first.json",
+        "bytes": 687,
+        "sha256": "e027e380d50926696b4828b0fd28b041c39dbef1d3933b64a6bed6c7d5e049d8"
+      },
+      "log": {
+        "path": ".qa/recovery/cloudflare-runtime-first.log",
+        "bytes": 5252,
+        "sha256": "a9e4f36fd6292744900ff01692ed15bc79ecdb17c5d98fb0bb3362e85e05955d"
+      },
+      "result": {
+        "command": [
+          "npm",
+          "test",
+          "--prefix",
+          "marketplace/cloudflare"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T06:44:04.458294+00:00",
+        "revision": "160f4685eafc6a7e54847b5501435ea5da073fb3",
+        "working_tree": " M scripts/validation/extensions-compatibility.cjs\n M scripts/validation/marketplace-browser.cjs\n M src/plugins/package.ts\n?? marketplace/cloudflare/\n?? marketplace/public/_headers\n?? scripts/validation/cloudflare-registry.cjs\n?? src/plugins/package-validation.ts\n",
+        "exit_code": 1,
+        "seconds": 6.962,
+        "finished_at": "2026-09-22T06:44:11.420638+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/cloudflare-runtime-resumed.json",
+        "bytes": 491,
+        "sha256": "11e5dde22c4fd4c0f603ca3986d0f5e943bda8b0990c3450920894ad41ba9097"
+      },
+      "log": {
+        "path": ".qa/recovery/cloudflare-runtime-resumed.log",
+        "bytes": 1243,
+        "sha256": "d7043ab10648e29120000db0b5c607fc65493f12ef08cd7024c1620b95abde3f"
+      },
+      "result": {
+        "command": [
+          "npm",
+          "test",
+          "--prefix",
+          "marketplace/cloudflare"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T06:54:31.560067+00:00",
+        "revision": "44aaa721b2206af68c2ed99a96a4c9f7eabf1bef",
+        "working_tree": " M marketplace/cloudflare/test.mjs\n M src/plugins/package-validation.ts\n",
+        "exit_code": 0,
+        "seconds": 30.934,
+        "finished_at": "2026-09-22T06:55:02.495705+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/cloudflare-runtime-second.json",
+        "bytes": 687,
+        "sha256": "f039792255e31cd50f8abde2ba7d0374a120ee3684438dc657bcf79669ced0f4"
+      },
+      "log": {
+        "path": ".qa/recovery/cloudflare-runtime-second.log",
+        "bytes": 5252,
+        "sha256": "744846a4dfa10fe5e05b8a9e12a4c1a617b3948a81c03b6bc855596ca9c2b6d3"
+      },
+      "result": {
+        "command": [
+          "npm",
+          "test",
+          "--prefix",
+          "marketplace/cloudflare"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T06:45:02.017539+00:00",
+        "revision": "160f4685eafc6a7e54847b5501435ea5da073fb3",
+        "working_tree": " M scripts/validation/extensions-compatibility.cjs\n M scripts/validation/marketplace-browser.cjs\n M src/plugins/package.ts\n?? marketplace/cloudflare/\n?? marketplace/public/_headers\n?? scripts/validation/cloudflare-registry.cjs\n?? src/plugins/package-validation.ts\n",
+        "exit_code": 1,
+        "seconds": 9.057,
+        "finished_at": "2026-09-22T06:45:11.074897+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/cloudflare-runtime-third.json",
+        "bytes": 688,
+        "sha256": "e6d57695536635c27704beb37590af8db4595488d62b19b4dda31c2c7aa8924c"
+      },
+      "log": {
+        "path": ".qa/recovery/cloudflare-runtime-third.log",
+        "bytes": 1295,
+        "sha256": "0d5a5238c418c6e7ca3c12d489c6ab021c520213e5f8d62bd764b0fe13d297a8"
+      },
+      "result": {
+        "command": [
+          "npm",
+          "test",
+          "--prefix",
+          "marketplace/cloudflare"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T06:46:07.679734+00:00",
+        "revision": "160f4685eafc6a7e54847b5501435ea5da073fb3",
+        "working_tree": " M scripts/validation/extensions-compatibility.cjs\n M scripts/validation/marketplace-browser.cjs\n M src/plugins/package.ts\n?? marketplace/cloudflare/\n?? marketplace/public/_headers\n?? scripts/validation/cloudflare-registry.cjs\n?? src/plugins/package-validation.ts\n",
+        "exit_code": 1,
+        "seconds": 37.862,
+        "finished_at": "2026-09-22T06:46:45.541772+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/cloudflare-shared-build.json",
+        "bytes": 569,
+        "sha256": "6cdc4a8ee3bea6ce81a0cbb773a571191a14d00f2de873247be7a005800442a0"
+      },
+      "log": {
+        "path": ".qa/recovery/cloudflare-shared-build.log",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "result": {
+        "command": [
+          "npx",
+          "tsc"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T06:57:10.290863+00:00",
+        "revision": "44aaa721b2206af68c2ed99a96a4c9f7eabf1bef",
+        "working_tree": " M CHANGELOG.md\n M docs/extensions/hosting.md\n M marketplace/cloudflare/test.mjs\n M src/plugins/package-validation.ts\n?? docs/extensions/cloudflare-hosting.md\n?? marketplace/cloudflare/ops.mjs\n",
+        "exit_code": 0,
+        "seconds": 52.193,
+        "finished_at": "2026-09-22T06:58:02.483169+00:00",
+        "summary": []
+      }
+    }
+  ],
+  "nativeNodeRegression": [
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/summary.json",
+      "summary": {
+        "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+        "platform": "win32",
+        "arch": "x64",
+        "release": "10.0.20348",
+        "scope": "marketplace",
+        "notRun": [
+          {
+            "name": "compiled-workers",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          },
+          {
+            "name": "native-paths",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          },
+          {
+            "name": "process-recovery",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          },
+          {
+            "name": "process-recovery-override",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          }
+        ],
+        "node": "v22.23.2",
+        "runnerOS": "Windows",
+        "runnerArch": "X64",
+        "imageOS": "win22",
+        "imageVersion": "20260913.307.1",
+        "githubRun": "35725244066",
+        "githubAttempt": "1",
+        "started": "2026-09-22T12:07:28.470Z",
+        "steps": [
+          {
+            "name": "build",
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node_modules\\npm\\bin\\npm-cli.js",
+              "run",
+              "build"
+            ],
+            "cwd": "D:\\a\\codegraph\\codegraph",
+            "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+            "overrides": {},
+            "started": "2026-09-22T12:07:28.832Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 19.41,
+            "finished": "2026-09-22T12:07:48.243Z",
+            "log": "build.log",
+            "sha256": "0a15b409b5c48fc4a0e916b170ceba1d7ca6b78b488f6b0c270703c68ba1a78d"
+          },
+          {
+            "name": "marketplace-build",
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node_modules\\npm\\bin\\npm-cli.js",
+              "run",
+              "build",
+              "--prefix",
+              "marketplace"
+            ],
+            "cwd": "D:\\a\\codegraph\\codegraph",
+            "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+            "overrides": {},
+            "started": "2026-09-22T12:07:48.244Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 0.278,
+            "finished": "2026-09-22T12:07:48.523Z",
+            "log": "marketplace-build.log",
+            "sha256": "9f2e1db0d5b81451bd46f3f69be017f4f15e7e70df7217ca244b6f530fa6cd2a"
+          },
+          {
+            "name": "focused",
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "node_modules/vitest/vitest.mjs",
+              "run",
+              "__tests__/marketplace-storage.test.ts",
+              "__tests__/foundation.test.ts",
+              "__tests__/extension-trust.test.ts",
+              "__tests__/extension-releases.test.ts",
+              "__tests__/extension-marketplace.test.ts",
+              "__tests__/extension-author.test.ts",
+              "__tests__/plugins.test.ts",
+              "__tests__/extension-explore.test.ts",
+              "__tests__/db-reopen-on-replace.test.ts",
+              "__tests__/status-json.test.ts",
+              "__tests__/sync.test.ts",
+              "__tests__/concurrent-locking.test.ts",
+              "--maxWorkers=2",
+              "--minWorkers=1",
+              "--reporter=default",
+              "--reporter=json",
+              "--outputFile.json=D:\\a\\codegraph\\codegraph\\.qa\\native\\win32-x64\\focused.json"
+            ],
+            "cwd": "D:\\a\\codegraph\\codegraph",
+            "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+            "overrides": {},
+            "started": "2026-09-22T12:07:48.524Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 65.735,
+            "finished": "2026-09-22T12:08:54.260Z",
+            "log": "focused.log",
+            "sha256": "d06b6bc1c46c9dcf7d940b1713c4569c8e7212fa30ab2671ab2f891ee0e26707"
+          },
+          {
+            "name": "registry-storage",
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "scripts/validation/marketplace-storage.cjs"
+            ],
+            "cwd": "D:\\a\\codegraph\\codegraph",
+            "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+            "overrides": {
+              "STORAGE_OUTPUT": "D:\\a\\codegraph\\codegraph\\.qa\\native\\win32-x64\\registry-storage"
+            },
+            "started": "2026-09-22T12:08:54.261Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 1.895,
+            "finished": "2026-09-22T12:08:56.157Z",
+            "log": "registry-storage.log",
+            "sha256": "07bd4c9fcae9ea23c4030f2f44936e2b9af31fb60364858f57562bf26c8d9937"
+          },
+          {
+            "name": "external-author",
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "scripts/validation/extension-author.cjs"
+            ],
+            "cwd": "D:\\a\\codegraph\\codegraph",
+            "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+            "overrides": {},
+            "started": "2026-09-22T12:08:56.159Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 59.03,
+            "finished": "2026-09-22T12:09:55.190Z",
+            "log": "external-author.log",
+            "sha256": "939741c36c96380d6354c381e70ce1a927432888467f62531f3498ec36142bad"
+          },
+          {
+            "name": "compatibility",
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "scripts/validation/extensions-compatibility.cjs"
+            ],
+            "cwd": "D:\\a\\codegraph\\codegraph",
+            "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+            "overrides": {},
+            "started": "2026-09-22T12:09:55.191Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 22.401,
+            "finished": "2026-09-22T12:10:17.593Z",
+            "log": "compatibility.log",
+            "sha256": "f5b300b873cbff3aa8cd1e0660f947c87f888b65aaf9c8a850ca178837edc7ac"
+          },
+          {
+            "name": "browser",
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "scripts/validation/marketplace-browser.cjs"
+            ],
+            "cwd": "D:\\a\\codegraph\\codegraph",
+            "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+            "overrides": {},
+            "started": "2026-09-22T12:10:17.594Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 20.304,
+            "finished": "2026-09-22T12:10:37.898Z",
+            "log": "browser.log",
+            "sha256": "91823162979345d8d04765507aa7b4f107eaa839b0d21c3b7872b5b4a1864b00"
+          }
+        ],
+        "finished": "2026-09-22T12:10:37.899Z",
+        "success": true
+      },
+      "focused": {
+        "numPassedTests": 141,
+        "numPendingTests": 4,
+        "numFailedTests": 0
+      }
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/summary.json",
+      "summary": {
+        "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+        "platform": "darwin",
+        "arch": "arm64",
+        "release": "24.6.0",
+        "scope": "marketplace",
+        "notRun": [
+          {
+            "name": "compiled-workers",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          },
+          {
+            "name": "native-paths",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          },
+          {
+            "name": "process-recovery",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          },
+          {
+            "name": "process-recovery-override",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          }
+        ],
+        "node": "v22.23.2",
+        "runnerOS": "macOS",
+        "runnerArch": "ARM64",
+        "imageOS": "macos15",
+        "imageVersion": "20260907.0337.1",
+        "githubRun": "35725244066",
+        "githubAttempt": "1",
+        "started": "2026-09-22T12:07:07.762Z",
+        "steps": [
+          {
+            "name": "build",
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/lib/node_modules/npm/bin/npm-cli.js",
+              "run",
+              "build"
+            ],
+            "cwd": "/Users/runner/work/codegraph/codegraph",
+            "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+            "overrides": {},
+            "started": "2026-09-22T12:07:08.049Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 18.45,
+            "finished": "2026-09-22T12:07:26.501Z",
+            "log": "build.log",
+            "sha256": "fb214727328fb7017f7d83c294dd79d129ed991d4fc481a8adf58db98b063121"
+          },
+          {
+            "name": "marketplace-build",
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/lib/node_modules/npm/bin/npm-cli.js",
+              "run",
+              "build",
+              "--prefix",
+              "marketplace"
+            ],
+            "cwd": "/Users/runner/work/codegraph/codegraph",
+            "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+            "overrides": {},
+            "started": "2026-09-22T12:07:26.506Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 0.312,
+            "finished": "2026-09-22T12:07:26.819Z",
+            "log": "marketplace-build.log",
+            "sha256": "9f2e1db0d5b81451bd46f3f69be017f4f15e7e70df7217ca244b6f530fa6cd2a"
+          },
+          {
+            "name": "focused",
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "node_modules/vitest/vitest.mjs",
+              "run",
+              "__tests__/marketplace-storage.test.ts",
+              "__tests__/foundation.test.ts",
+              "__tests__/extension-trust.test.ts",
+              "__tests__/extension-releases.test.ts",
+              "__tests__/extension-marketplace.test.ts",
+              "__tests__/extension-author.test.ts",
+              "__tests__/plugins.test.ts",
+              "__tests__/extension-explore.test.ts",
+              "__tests__/db-reopen-on-replace.test.ts",
+              "__tests__/status-json.test.ts",
+              "__tests__/sync.test.ts",
+              "__tests__/concurrent-locking.test.ts",
+              "--maxWorkers=2",
+              "--minWorkers=1",
+              "--reporter=default",
+              "--reporter=json",
+              "--outputFile.json=/Users/runner/work/codegraph/codegraph/.qa/native/darwin-arm64/focused.json"
+            ],
+            "cwd": "/Users/runner/work/codegraph/codegraph",
+            "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+            "overrides": {},
+            "started": "2026-09-22T12:07:26.822Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 22.441,
+            "finished": "2026-09-22T12:07:49.264Z",
+            "log": "focused.log",
+            "sha256": "84ba95e9abead0735c74196d377d884fc152758bd46cb999d7ea59463a5b7425"
+          },
+          {
+            "name": "registry-storage",
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "scripts/validation/marketplace-storage.cjs"
+            ],
+            "cwd": "/Users/runner/work/codegraph/codegraph",
+            "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+            "overrides": {
+              "STORAGE_OUTPUT": "/Users/runner/work/codegraph/codegraph/.qa/native/darwin-arm64/registry-storage"
+            },
+            "started": "2026-09-22T12:07:49.267Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 1.218,
+            "finished": "2026-09-22T12:07:50.486Z",
+            "log": "registry-storage.log",
+            "sha256": "cac623f821ca72be94547f212d0f9fe97c51f1608027e44a0e7bc413eb4981ba"
+          },
+          {
+            "name": "external-author",
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "scripts/validation/extension-author.cjs"
+            ],
+            "cwd": "/Users/runner/work/codegraph/codegraph",
+            "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+            "overrides": {},
+            "started": "2026-09-22T12:07:50.489Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 31.539,
+            "finished": "2026-09-22T12:08:22.030Z",
+            "log": "external-author.log",
+            "sha256": "e5d3d7d00a8e5e9ac9850efd861296f4aee9bcc57a51d3269b6f6188494881db"
+          },
+          {
+            "name": "compatibility",
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "scripts/validation/extensions-compatibility.cjs"
+            ],
+            "cwd": "/Users/runner/work/codegraph/codegraph",
+            "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+            "overrides": {},
+            "started": "2026-09-22T12:08:22.049Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 15.921,
+            "finished": "2026-09-22T12:08:37.976Z",
+            "log": "compatibility.log",
+            "sha256": "603c1a15a67764599bc609b8dfd31443ce8413bb16d4d89b647a45c85df52dee"
+          },
+          {
+            "name": "browser",
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "scripts/validation/marketplace-browser.cjs"
+            ],
+            "cwd": "/Users/runner/work/codegraph/codegraph",
+            "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+            "overrides": {},
+            "started": "2026-09-22T12:08:37.979Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 19.498,
+            "finished": "2026-09-22T12:08:57.478Z",
+            "log": "browser.log",
+            "sha256": "de4db275a232773bd3afd07a0121bfcd34a38023adeaebc28df88cb58af0ec9a"
+          }
+        ],
+        "finished": "2026-09-22T12:08:57.486Z",
+        "success": true
+      },
+      "focused": {
+        "numPassedTests": 144,
+        "numPendingTests": 1,
+        "numFailedTests": 0
+      }
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/summary.json",
+      "summary": {
+        "revision": "52c1b38644e9c0833945ceabaa086ecbbd4aac57",
+        "platform": "darwin",
+        "arch": "arm64",
+        "release": "24.6.0",
+        "scope": "marketplace",
+        "notRun": [
+          {
+            "name": "compiled-workers",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          },
+          {
+            "name": "native-paths",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          },
+          {
+            "name": "process-recovery",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          },
+          {
+            "name": "process-recovery-override",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          }
+        ],
+        "node": "v22.23.2",
+        "runnerOS": "macOS",
+        "runnerArch": "ARM64",
+        "imageOS": "macos15",
+        "imageVersion": "20260907.0337.1",
+        "githubRun": "35697507959",
+        "githubAttempt": "1",
+        "started": "2026-09-22T07:01:31.404Z",
+        "steps": [
+          {
+            "name": "build",
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/lib/node_modules/npm/bin/npm-cli.js",
+              "run",
+              "build"
+            ],
+            "cwd": "/Users/runner/work/codegraph/codegraph",
+            "revision": "52c1b38644e9c0833945ceabaa086ecbbd4aac57",
+            "overrides": {},
+            "started": "2026-09-22T07:01:31.591Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 12.15,
+            "finished": "2026-09-22T07:01:43.742Z",
+            "log": "build.log",
+            "sha256": "7cc5cee203ad1019a33a3e022d91cc01992005208093866c55380bd6050402cb"
+          },
+          {
+            "name": "marketplace-build",
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/lib/node_modules/npm/bin/npm-cli.js",
+              "run",
+              "build",
+              "--prefix",
+              "marketplace"
+            ],
+            "cwd": "/Users/runner/work/codegraph/codegraph",
+            "revision": "52c1b38644e9c0833945ceabaa086ecbbd4aac57",
+            "overrides": {},
+            "started": "2026-09-22T07:01:43.744Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 0.173,
+            "finished": "2026-09-22T07:01:43.917Z",
+            "log": "marketplace-build.log",
+            "sha256": "9f2e1db0d5b81451bd46f3f69be017f4f15e7e70df7217ca244b6f530fa6cd2a"
+          },
+          {
+            "name": "focused",
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "node_modules/vitest/vitest.mjs",
+              "run",
+              "__tests__/marketplace-storage.test.ts",
+              "__tests__/foundation.test.ts",
+              "__tests__/extension-trust.test.ts",
+              "__tests__/extension-releases.test.ts",
+              "__tests__/extension-marketplace.test.ts",
+              "__tests__/extension-author.test.ts",
+              "__tests__/plugins.test.ts",
+              "__tests__/extension-explore.test.ts",
+              "__tests__/db-reopen-on-replace.test.ts",
+              "__tests__/status-json.test.ts",
+              "__tests__/sync.test.ts",
+              "__tests__/concurrent-locking.test.ts",
+              "--maxWorkers=2",
+              "--minWorkers=1",
+              "--reporter=default",
+              "--reporter=json",
+              "--outputFile.json=/Users/runner/work/codegraph/codegraph/.qa/native/darwin-arm64/focused.json"
+            ],
+            "cwd": "/Users/runner/work/codegraph/codegraph",
+            "revision": "52c1b38644e9c0833945ceabaa086ecbbd4aac57",
+            "overrides": {},
+            "started": "2026-09-22T07:01:43.919Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 17.87,
+            "finished": "2026-09-22T07:02:01.789Z",
+            "log": "focused.log",
+            "sha256": "e3a5c11abed780989829220fbdcaa91474e60876a861f5844be145d040288f62"
+          },
+          {
+            "name": "registry-storage",
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "scripts/validation/marketplace-storage.cjs"
+            ],
+            "cwd": "/Users/runner/work/codegraph/codegraph",
+            "revision": "52c1b38644e9c0833945ceabaa086ecbbd4aac57",
+            "overrides": {
+              "STORAGE_OUTPUT": "/Users/runner/work/codegraph/codegraph/.qa/native/darwin-arm64/registry-storage"
+            },
+            "started": "2026-09-22T07:02:01.791Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 1.018,
+            "finished": "2026-09-22T07:02:02.809Z",
+            "log": "registry-storage.log",
+            "sha256": "ec06784b5db547a7c5eb87563c5e0607291f1a544350c404b6c76d31b9ec15ae"
+          },
+          {
+            "name": "external-author",
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "scripts/validation/extension-author.cjs"
+            ],
+            "cwd": "/Users/runner/work/codegraph/codegraph",
+            "revision": "52c1b38644e9c0833945ceabaa086ecbbd4aac57",
+            "overrides": {},
+            "started": "2026-09-22T07:02:02.811Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 23.569,
+            "finished": "2026-09-22T07:02:26.380Z",
+            "log": "external-author.log",
+            "sha256": "fcd3d1dfec7c8d8d60b571ac0b5bc7150ff0d72240810ba8e28c0fea9072dd8b"
+          },
+          {
+            "name": "compatibility",
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "scripts/validation/extensions-compatibility.cjs"
+            ],
+            "cwd": "/Users/runner/work/codegraph/codegraph",
+            "revision": "52c1b38644e9c0833945ceabaa086ecbbd4aac57",
+            "overrides": {},
+            "started": "2026-09-22T07:02:26.382Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 13.261,
+            "finished": "2026-09-22T07:02:39.644Z",
+            "log": "compatibility.log",
+            "sha256": "4cafe6fccd6a26072019c595eb08434c3081287f79c0117e2345aa5329abb537"
+          },
+          {
+            "name": "browser",
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "scripts/validation/marketplace-browser.cjs"
+            ],
+            "cwd": "/Users/runner/work/codegraph/codegraph",
+            "revision": "52c1b38644e9c0833945ceabaa086ecbbd4aac57",
+            "overrides": {},
+            "started": "2026-09-22T07:02:39.645Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 14.508,
+            "finished": "2026-09-22T07:02:54.153Z",
+            "log": "browser.log",
+            "sha256": "601c201d94ac8a512e2c74da3ecfec2d44309177c0a67df7ba6a559e818541ab"
+          }
+        ],
+        "finished": "2026-09-22T07:02:54.154Z",
+        "success": true
+      },
+      "focused": {
+        "numPassedTests": 144,
+        "numPendingTests": 1,
+        "numFailedTests": 0
+      }
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/summary.json",
+      "summary": {
+        "revision": "52c1b38644e9c0833945ceabaa086ecbbd4aac57",
+        "platform": "win32",
+        "arch": "x64",
+        "release": "10.0.20348",
+        "scope": "marketplace",
+        "notRun": [
+          {
+            "name": "compiled-workers",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          },
+          {
+            "name": "native-paths",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          },
+          {
+            "name": "process-recovery",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          },
+          {
+            "name": "process-recovery-override",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          }
+        ],
+        "node": "v22.23.2",
+        "runnerOS": "Windows",
+        "runnerArch": "X64",
+        "imageOS": "win22",
+        "imageVersion": "20260913.307.1",
+        "githubRun": "35697507959",
+        "githubAttempt": "1",
+        "started": "2026-09-22T07:01:52.995Z",
+        "steps": [
+          {
+            "name": "build",
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node_modules\\npm\\bin\\npm-cli.js",
+              "run",
+              "build"
+            ],
+            "cwd": "D:\\a\\codegraph\\codegraph",
+            "revision": "52c1b38644e9c0833945ceabaa086ecbbd4aac57",
+            "overrides": {},
+            "started": "2026-09-22T07:01:53.348Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 19.68,
+            "finished": "2026-09-22T07:02:13.029Z",
+            "log": "build.log",
+            "sha256": "ff86bcabdf93901ec242d9c430827792e75296e227bf47b6fa8dc088aae0054e"
+          },
+          {
+            "name": "marketplace-build",
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node_modules\\npm\\bin\\npm-cli.js",
+              "run",
+              "build",
+              "--prefix",
+              "marketplace"
+            ],
+            "cwd": "D:\\a\\codegraph\\codegraph",
+            "revision": "52c1b38644e9c0833945ceabaa086ecbbd4aac57",
+            "overrides": {},
+            "started": "2026-09-22T07:02:13.031Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 0.256,
+            "finished": "2026-09-22T07:02:13.287Z",
+            "log": "marketplace-build.log",
+            "sha256": "9f2e1db0d5b81451bd46f3f69be017f4f15e7e70df7217ca244b6f530fa6cd2a"
+          },
+          {
+            "name": "focused",
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "node_modules/vitest/vitest.mjs",
+              "run",
+              "__tests__/marketplace-storage.test.ts",
+              "__tests__/foundation.test.ts",
+              "__tests__/extension-trust.test.ts",
+              "__tests__/extension-releases.test.ts",
+              "__tests__/extension-marketplace.test.ts",
+              "__tests__/extension-author.test.ts",
+              "__tests__/plugins.test.ts",
+              "__tests__/extension-explore.test.ts",
+              "__tests__/db-reopen-on-replace.test.ts",
+              "__tests__/status-json.test.ts",
+              "__tests__/sync.test.ts",
+              "__tests__/concurrent-locking.test.ts",
+              "--maxWorkers=2",
+              "--minWorkers=1",
+              "--reporter=default",
+              "--reporter=json",
+              "--outputFile.json=D:\\a\\codegraph\\codegraph\\.qa\\native\\win32-x64\\focused.json"
+            ],
+            "cwd": "D:\\a\\codegraph\\codegraph",
+            "revision": "52c1b38644e9c0833945ceabaa086ecbbd4aac57",
+            "overrides": {},
+            "started": "2026-09-22T07:02:13.288Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 67.719,
+            "finished": "2026-09-22T07:03:21.008Z",
+            "log": "focused.log",
+            "sha256": "6146823a84728e57d35e33f3ed23aafb2963286d8de8bef30216d6a7d215f6d8"
+          },
+          {
+            "name": "registry-storage",
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "scripts/validation/marketplace-storage.cjs"
+            ],
+            "cwd": "D:\\a\\codegraph\\codegraph",
+            "revision": "52c1b38644e9c0833945ceabaa086ecbbd4aac57",
+            "overrides": {
+              "STORAGE_OUTPUT": "D:\\a\\codegraph\\codegraph\\.qa\\native\\win32-x64\\registry-storage"
+            },
+            "started": "2026-09-22T07:03:21.009Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 1.796,
+            "finished": "2026-09-22T07:03:22.806Z",
+            "log": "registry-storage.log",
+            "sha256": "a1a5b8b5daf650cb4d6057b21dc727d6c15ba6b818b480957ce56545d48313a5"
+          },
+          {
+            "name": "external-author",
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "scripts/validation/extension-author.cjs"
+            ],
+            "cwd": "D:\\a\\codegraph\\codegraph",
+            "revision": "52c1b38644e9c0833945ceabaa086ecbbd4aac57",
+            "overrides": {},
+            "started": "2026-09-22T07:03:22.808Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 66.449,
+            "finished": "2026-09-22T07:04:29.258Z",
+            "log": "external-author.log",
+            "sha256": "de7f09ff82929af0eb91f1c6d76c1b41d088d2c505b599d5eb4ce2377c9e5aad"
+          },
+          {
+            "name": "compatibility",
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "scripts/validation/extensions-compatibility.cjs"
+            ],
+            "cwd": "D:\\a\\codegraph\\codegraph",
+            "revision": "52c1b38644e9c0833945ceabaa086ecbbd4aac57",
+            "overrides": {},
+            "started": "2026-09-22T07:04:29.259Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 22.902,
+            "finished": "2026-09-22T07:04:52.162Z",
+            "log": "compatibility.log",
+            "sha256": "c57e0afa5b435ac00c05caec49a757fbb057e4d704291f8930e31e9ba59e815a"
+          },
+          {
+            "name": "browser",
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "scripts/validation/marketplace-browser.cjs"
+            ],
+            "cwd": "D:\\a\\codegraph\\codegraph",
+            "revision": "52c1b38644e9c0833945ceabaa086ecbbd4aac57",
+            "overrides": {},
+            "started": "2026-09-22T07:04:52.162Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 23.644,
+            "finished": "2026-09-22T07:05:15.807Z",
+            "log": "browser.log",
+            "sha256": "60f81583dc573f3b9d081105892dbbb23185c2a5a63ad9c9ad06b344229a0f33"
+          }
+        ],
+        "finished": "2026-09-22T07:05:15.808Z",
+        "success": true
+      },
+      "focused": {
+        "numPassedTests": 141,
+        "numPendingTests": 4,
+        "numFailedTests": 0
+      }
+    }
+  ],
+  "temporaryHttpsNodeRegression": [
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/summary.json",
+      "summary": {
+        "revision": "e77f011ec34c14150a805bb41e2a06c2a9efad3d",
+        "run": "35725244163",
+        "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+        "arch": "x86_64",
+        "node": "v22.23.2",
+        "steps": [
+          {
+            "name": "build",
+            "command": [
+              "npm",
+              "run",
+              "build"
+            ],
+            "started": "2026-09-22T12:07:12.486621+00:00",
+            "exit": 0,
+            "seconds": 14.024622009999973,
+            "sha256": "710951afeae182fb0955123d5dc53f70bb92697231ba50456c383e31045b833d",
+            "finished": "2026-09-22T12:07:26.511613+00:00"
+          },
+          {
+            "name": "marketplace-build",
+            "command": [
+              "npm",
+              "run",
+              "build",
+              "--prefix",
+              "marketplace"
+            ],
+            "started": "2026-09-22T12:07:26.511885+00:00",
+            "exit": 0,
+            "seconds": 0.16440701999999874,
+            "sha256": "9f2e1db0d5b81451bd46f3f69be017f4f15e7e70df7217ca244b6f530fa6cd2a",
+            "finished": "2026-09-22T12:07:26.676695+00:00"
+          },
+          {
+            "name": "https-compatibility",
+            "command": [
+              "node",
+              "scripts/validation/extensions-compatibility.cjs"
+            ],
+            "started": "2026-09-22T12:07:26.676986+00:00",
+            "exit": 0,
+            "seconds": 23.594660814000008,
+            "sha256": "f3d0c74ca7a7dc82db4ac0d43858fd6d40f484f9c259d4db398fc22d9a8c9f42",
+            "finished": "2026-09-22T12:07:50.272012+00:00"
+          },
+          {
+            "name": "https-browser",
+            "command": [
+              "node",
+              "scripts/validation/marketplace-browser.cjs"
+            ],
+            "started": "2026-09-22T12:07:50.272312+00:00",
+            "exit": 0,
+            "seconds": 24.742417206000027,
+            "sha256": "0018f7750f0e0f1feb5ee5cfbb9639441e06652161906ae045a3a5ec3b5ace29",
+            "finished": "2026-09-22T12:08:15.015114+00:00"
+          }
+        ],
+        "success": true
+      }
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/summary.json",
+      "summary": {
+        "revision": "52c1b38644e9c0833945ceabaa086ecbbd4aac57",
+        "run": "35697507943",
+        "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+        "arch": "x86_64",
+        "node": "v22.23.2",
+        "steps": [
+          {
+            "name": "build",
+            "command": [
+              "npm",
+              "run",
+              "build"
+            ],
+            "started": "2026-09-22T07:02:26.662305+00:00",
+            "exit": 0,
+            "seconds": 12.220997170999993,
+            "sha256": "8e0dc42e6f267a55666befbda1cbc9ebc920ed3ece5f3a5f1ca2f861cc7a4dae",
+            "finished": "2026-09-22T07:02:38.883614+00:00"
+          },
+          {
+            "name": "marketplace-build",
+            "command": [
+              "npm",
+              "run",
+              "build",
+              "--prefix",
+              "marketplace"
+            ],
+            "started": "2026-09-22T07:02:38.883868+00:00",
+            "exit": 0,
+            "seconds": 0.11403855700001486,
+            "sha256": "9f2e1db0d5b81451bd46f3f69be017f4f15e7e70df7217ca244b6f530fa6cd2a",
+            "finished": "2026-09-22T07:02:38.998437+00:00"
+          },
+          {
+            "name": "https-compatibility",
+            "command": [
+              "node",
+              "scripts/validation/extensions-compatibility.cjs"
+            ],
+            "started": "2026-09-22T07:02:38.998676+00:00",
+            "exit": 0,
+            "seconds": 26.991122551000018,
+            "sha256": "f3d0c74ca7a7dc82db4ac0d43858fd6d40f484f9c259d4db398fc22d9a8c9f42",
+            "finished": "2026-09-22T07:03:05.990276+00:00"
+          },
+          {
+            "name": "https-browser",
+            "command": [
+              "node",
+              "scripts/validation/marketplace-browser.cjs"
+            ],
+            "started": "2026-09-22T07:03:05.990525+00:00",
+            "exit": 0,
+            "seconds": 25.368522181000003,
+            "sha256": "dec550a6d50bcdc20911f7333af5d8c031db9a6dbe23a84d096beb63ca810895",
+            "finished": "2026-09-22T07:03:31.359563+00:00"
+          }
+        ],
+        "success": true
+      }
+    }
+  ],
+  "rawFiles": [
+    {
+      "path": ".qa/cloudflare/access.log",
+      "bytes": 283,
+      "sha256": "2218ef059b42434ef633210d0b728ecca6e5a2d5e4f3525e0357ff6c3b2aca29"
+    },
+    {
+      "path": ".qa/cloudflare/browser-final/desktop-installed.png",
+      "bytes": 151273,
+      "sha256": "15d0c996b2459a5c8d556dbc7e280909b2dda468a7c5c39d9dcab9fe15bed1c5"
+    },
+    {
+      "path": ".qa/cloudflare/browser-final/mobile-detail.png",
+      "bytes": 79658,
+      "sha256": "de58ac3bbfea366411b01bddb921f91bf77b01cc3c708cfa79bb79aeaef16274"
+    },
+    {
+      "path": ".qa/cloudflare/browser-final/result.json",
+      "bytes": 966,
+      "sha256": "9e89a9a5702660630f3f4946a76a9766d9502d5f3857a9c7a38bfab18fe1685d"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility/failure.json",
+      "bytes": 398,
+      "sha256": "91a94d652cffdc78d0f24c1fb25b06d3db89e8143075bf2289aebb6364f0dca3"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-final/command-1.log",
+      "bytes": 243,
+      "sha256": "64f1ac60c8ad25f6569563d24914759b70acf1b73e5cffeef4feb12ce4c226b9"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-final/command-10.log",
+      "bytes": 143,
+      "sha256": "f03135c33691b92a8cd0834b0ab07175f81eb68d071d2e495c7ef96f6cbb5e69"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-final/command-11.log",
+      "bytes": 263,
+      "sha256": "08588ddba0b05a3667ca2e4858c6625aaa7cfdd4b248283e284b36ca7bfd3b0f"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-final/command-12.log",
+      "bytes": 95,
+      "sha256": "303e141e174839575e69f0ae0ddf92ead0470e6dca049ac1edd45fb64b607bde"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-final/command-2.log",
+      "bytes": 293,
+      "sha256": "d93afb7d84337fce0fb443fb79883800bb478b4c94635140b8f67f9734ed2b26"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-final/command-3.log",
+      "bytes": 122,
+      "sha256": "78fff926f4f8969d8e1705c0a1271cbd63b822579f81d715c2042ad94c80ad45"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-final/command-4.log",
+      "bytes": 290,
+      "sha256": "83a7b90bfd2c211c6fb4afcf72e261ef7b42bfd6dc21cfb72d530fb970aef44a"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-final/command-5.log",
+      "bytes": 257,
+      "sha256": "5a0ae6eb30e6659515338894feeb98ebeabbcd4f66e01f425110e75e83d7986d"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-final/command-6.log",
+      "bytes": 530,
+      "sha256": "38c1d85e306b15c18732c81df087390b3dfbd3873bc8836e36be492a1fb8a7fa"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-final/command-7.log",
+      "bytes": 241,
+      "sha256": "74798a107028fa391113eb0b6fa7efac8bfee9c644dbb121892993443666f2f0"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-final/command-8.log",
+      "bytes": 241,
+      "sha256": "be1f77d7dd153abaab34b2a75bdd5c2d036b406fc11da38ee8d4362bd4c26387"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-final/command-9.log",
+      "bytes": 142,
+      "sha256": "fec96b4acb520e5ee4d8a42660e9a876f54f08d60c1fc98bcc7b1dcfd2ba6748"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-final/commands.json",
+      "bytes": 4742,
+      "sha256": "8f7452443d878596a4226f350acf974b19d412eaa80d456584da3118b24fe71a"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-final/desktop-installed.png",
+      "bytes": 96968,
+      "sha256": "96d5170c7a2d606377896f7d0c2d0bd0fccac4f236d7c7ddf9a71faf40ba714c"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-final/desktop-selected.png",
+      "bytes": 95813,
+      "sha256": "fdca96f47082ef93a8690b806c677b82fade9bda5bd11fcb0ac5d2c85bd0dc59"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-final/mobile-selected.png",
+      "bytes": 77916,
+      "sha256": "0e4417cda9ae24ce78206946b9fa298469e65a1a37da07cf99d3367571bb8abd"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-final/result.json",
+      "bytes": 7848,
+      "sha256": "5d9023775d4af23ae48031a5fdebced5a176d5ac7f614218d59ad0dc1a8e0454"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-sequential/command-1.log",
+      "bytes": 243,
+      "sha256": "64f1ac60c8ad25f6569563d24914759b70acf1b73e5cffeef4feb12ce4c226b9"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-sequential/command-10.log",
+      "bytes": 143,
+      "sha256": "f03135c33691b92a8cd0834b0ab07175f81eb68d071d2e495c7ef96f6cbb5e69"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-sequential/command-11.log",
+      "bytes": 263,
+      "sha256": "08588ddba0b05a3667ca2e4858c6625aaa7cfdd4b248283e284b36ca7bfd3b0f"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-sequential/command-12.log",
+      "bytes": 95,
+      "sha256": "303e141e174839575e69f0ae0ddf92ead0470e6dca049ac1edd45fb64b607bde"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-sequential/command-2.log",
+      "bytes": 293,
+      "sha256": "d93afb7d84337fce0fb443fb79883800bb478b4c94635140b8f67f9734ed2b26"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-sequential/command-3.log",
+      "bytes": 122,
+      "sha256": "78fff926f4f8969d8e1705c0a1271cbd63b822579f81d715c2042ad94c80ad45"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-sequential/command-4.log",
+      "bytes": 290,
+      "sha256": "83a7b90bfd2c211c6fb4afcf72e261ef7b42bfd6dc21cfb72d530fb970aef44a"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-sequential/command-5.log",
+      "bytes": 257,
+      "sha256": "5a0ae6eb30e6659515338894feeb98ebeabbcd4f66e01f425110e75e83d7986d"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-sequential/command-6.log",
+      "bytes": 530,
+      "sha256": "38c1d85e306b15c18732c81df087390b3dfbd3873bc8836e36be492a1fb8a7fa"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-sequential/command-7.log",
+      "bytes": 241,
+      "sha256": "74798a107028fa391113eb0b6fa7efac8bfee9c644dbb121892993443666f2f0"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-sequential/command-8.log",
+      "bytes": 241,
+      "sha256": "be1f77d7dd153abaab34b2a75bdd5c2d036b406fc11da38ee8d4362bd4c26387"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-sequential/command-9.log",
+      "bytes": 142,
+      "sha256": "fec96b4acb520e5ee4d8a42660e9a876f54f08d60c1fc98bcc7b1dcfd2ba6748"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-sequential/commands.json",
+      "bytes": 4742,
+      "sha256": "f43269e220243e5161bee6066780f7b0084ce0345c42dfa969677039948b168f"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-sequential/desktop-installed.png",
+      "bytes": 97396,
+      "sha256": "bdd473e66c8c90a5ba86dfbb6d3b3d82fe4e424872d937e8836fee37f46b4e9e"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-sequential/desktop-selected.png",
+      "bytes": 96130,
+      "sha256": "45d0505b223a0950e2ceb5e39a7b0ca30a488c2231ab64eb53f7c7d3f7fdb20c"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-sequential/mobile-selected.png",
+      "bytes": 78222,
+      "sha256": "5f58087ffc855dc164554cb7d155660639fe18ae9b02b6b9dc6d1eda8e412d02"
+    },
+    {
+      "path": ".qa/cloudflare/compatibility-sequential/result.json",
+      "bytes": 7848,
+      "sha256": "cf739d4dc959821e9972cea0552bc99a3c51570b4cadddb5f6a51fab687b582d"
+    },
+    {
+      "path": ".qa/cloudflare/dryrun-fixed.log",
+      "bytes": 820,
+      "sha256": "c1c70f4f31c077d1ab3b595834aa4eab852ee212a739b014233a0b4fe3bbdc1b"
+    },
+    {
+      "path": ".qa/cloudflare/dryrun.log",
+      "bytes": 573,
+      "sha256": "e654b1262580798d0da07e2f861499052bd566d89c78f3e226017ff198d3006d"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/browser/desktop-installed.png",
+      "bytes": 154966,
+      "sha256": "0287e0b9b8e75b76133a488e6e4101b31a3df1f21910e058f618e90d76d3e87a"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/browser/https-network-errors.log",
+      "bytes": 1823,
+      "sha256": "04e9830a9ab016bc05c197ef9b1504d1d76cf62bb54eeaf1a798ce48c19dcd1c"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/browser/https-transport.json",
+      "bytes": 181,
+      "sha256": "dfb15de2387d14d1234da187420761edf595e86c26c3ac1b1f5e8ba483b0a862"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/browser/https-tunnel.log",
+      "bytes": 7334,
+      "sha256": "758c87e7fb51a3e6da4cf9423d246cfd573a00355e72179f096e5e3955ed8fb2"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/browser/mobile-detail.png",
+      "bytes": 82123,
+      "sha256": "75054782ad55db8f53e2b072d578a0bef8c6897f24f5c36258064ee7f527eb65"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/browser/result.json",
+      "bytes": 966,
+      "sha256": "e18319d636a119baf362f8e8d3b34b4643ee3707e5b87319399453df4e21dcad"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/build.log",
+      "bytes": 7374,
+      "sha256": "8e0dc42e6f267a55666befbda1cbc9ebc920ed3ece5f3a5f1ca2f861cc7a4dae"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/compatibility/command-1.log",
+      "bytes": 243,
+      "sha256": "64f1ac60c8ad25f6569563d24914759b70acf1b73e5cffeef4feb12ce4c226b9"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/compatibility/command-10.log",
+      "bytes": 143,
+      "sha256": "f03135c33691b92a8cd0834b0ab07175f81eb68d071d2e495c7ef96f6cbb5e69"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/compatibility/command-11.log",
+      "bytes": 263,
+      "sha256": "08588ddba0b05a3667ca2e4858c6625aaa7cfdd4b248283e284b36ca7bfd3b0f"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/compatibility/command-12.log",
+      "bytes": 95,
+      "sha256": "303e141e174839575e69f0ae0ddf92ead0470e6dca049ac1edd45fb64b607bde"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/compatibility/command-2.log",
+      "bytes": 293,
+      "sha256": "d93afb7d84337fce0fb443fb79883800bb478b4c94635140b8f67f9734ed2b26"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/compatibility/command-3.log",
+      "bytes": 122,
+      "sha256": "78fff926f4f8969d8e1705c0a1271cbd63b822579f81d715c2042ad94c80ad45"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/compatibility/command-4.log",
+      "bytes": 290,
+      "sha256": "83a7b90bfd2c211c6fb4afcf72e261ef7b42bfd6dc21cfb72d530fb970aef44a"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/compatibility/command-5.log",
+      "bytes": 257,
+      "sha256": "5a0ae6eb30e6659515338894feeb98ebeabbcd4f66e01f425110e75e83d7986d"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/compatibility/command-6.log",
+      "bytes": 530,
+      "sha256": "38c1d85e306b15c18732c81df087390b3dfbd3873bc8836e36be492a1fb8a7fa"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/compatibility/command-7.log",
+      "bytes": 241,
+      "sha256": "74798a107028fa391113eb0b6fa7efac8bfee9c644dbb121892993443666f2f0"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/compatibility/command-8.log",
+      "bytes": 241,
+      "sha256": "be1f77d7dd153abaab34b2a75bdd5c2d036b406fc11da38ee8d4362bd4c26387"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/compatibility/command-9.log",
+      "bytes": 142,
+      "sha256": "fec96b4acb520e5ee4d8a42660e9a876f54f08d60c1fc98bcc7b1dcfd2ba6748"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/compatibility/commands.json",
+      "bytes": 4918,
+      "sha256": "be0cdd5a028d8e5b3507787d2c92396829c87ae43c837ef43a067b266a5e01e3"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/compatibility/desktop-installed.png",
+      "bytes": 97046,
+      "sha256": "4136244eb9bdcd2174c984b1fb1b50980ee1271f429cbeb2fd30d1ddcc5104d8"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/compatibility/desktop-selected.png",
+      "bytes": 98753,
+      "sha256": "a1b18536980342550e620bb2ad3b9eea1525e889ae36144b4d085e801b271fbb"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/compatibility/https-network-errors.log",
+      "bytes": 1589,
+      "sha256": "401f768d43673d38207aae0e0e0d4ad41a7d7f05a01eed4f7befe78261ceb3c9"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/compatibility/https-transport.json",
+      "bytes": 175,
+      "sha256": "cbf19a65e38f950679f6ddea34a6461d5c94124a5c55141c18c177b029b1e226"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/compatibility/https-tunnel.log",
+      "bytes": 6796,
+      "sha256": "af5793c9835c620618c930130ef78e7ea3885df20b20a3433401de0b44fdb59e"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/compatibility/mobile-selected.png",
+      "bytes": 85145,
+      "sha256": "3e79583879a6ff7f28d2d2f974244cec4845a89d118c3cb381365ccca5e67661"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/compatibility/result.json",
+      "bytes": 8024,
+      "sha256": "84df06c09991fc7da74d910092ec159316a464e1a8eb3b55cec5aac8d8b1fb1c"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/https-browser.log",
+      "bytes": 2448,
+      "sha256": "dec550a6d50bcdc20911f7333af5d8c031db9a6dbe23a84d096beb63ca810895"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/https-compatibility.log",
+      "bytes": 3160,
+      "sha256": "f3d0c74ca7a7dc82db4ac0d43858fd6d40f484f9c259d4db398fc22d9a8c9f42"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/marketplace-build.log",
+      "bytes": 72,
+      "sha256": "9f2e1db0d5b81451bd46f3f69be017f4f15e7e70df7217ca244b6f530fa6cd2a"
+    },
+    {
+      "path": ".qa/cloudflare/https-52c1b38/marketplace-https-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/summary.json",
+      "bytes": 1770,
+      "sha256": "6ac94274544cf623865e3909fd678b32ff0ed1cbb61c500dc7280b2127ae3efa"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/browser/desktop-installed.png",
+      "bytes": 155778,
+      "sha256": "f145df8afd2d67f244e572d5e7ce1facd52ba32f18cf297a8b9031056587d8dc"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/browser/https-network-errors.log",
+      "bytes": 1407,
+      "sha256": "722620aaf4cda828eee4c01f0d8f2e586382966f0d16bfd8659cb04117b84523"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/browser/https-transport.json",
+      "bytes": 184,
+      "sha256": "43b317b587c6f0d61c606e78c8448eb9ad79027f057c5aef153fe0aaf83ac5e0"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/browser/https-tunnel.log",
+      "bytes": 7331,
+      "sha256": "92799ac857fac68e8c3b44a6ab7e3ef5c82f2851c48d1c07526dfa88b09d5094"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/browser/mobile-detail.png",
+      "bytes": 83552,
+      "sha256": "66a21503f60e4861b668f78fc5ee429a758d62fcbde929a2f7570bcabf004b52"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/browser/result.json",
+      "bytes": 966,
+      "sha256": "e18319d636a119baf362f8e8d3b34b4643ee3707e5b87319399453df4e21dcad"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/build.log",
+      "bytes": 7374,
+      "sha256": "710951afeae182fb0955123d5dc53f70bb92697231ba50456c383e31045b833d"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/compatibility/command-1.log",
+      "bytes": 243,
+      "sha256": "64f1ac60c8ad25f6569563d24914759b70acf1b73e5cffeef4feb12ce4c226b9"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/compatibility/command-10.log",
+      "bytes": 143,
+      "sha256": "f03135c33691b92a8cd0834b0ab07175f81eb68d071d2e495c7ef96f6cbb5e69"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/compatibility/command-11.log",
+      "bytes": 263,
+      "sha256": "08588ddba0b05a3667ca2e4858c6625aaa7cfdd4b248283e284b36ca7bfd3b0f"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/compatibility/command-12.log",
+      "bytes": 95,
+      "sha256": "303e141e174839575e69f0ae0ddf92ead0470e6dca049ac1edd45fb64b607bde"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/compatibility/command-2.log",
+      "bytes": 293,
+      "sha256": "d93afb7d84337fce0fb443fb79883800bb478b4c94635140b8f67f9734ed2b26"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/compatibility/command-3.log",
+      "bytes": 122,
+      "sha256": "78fff926f4f8969d8e1705c0a1271cbd63b822579f81d715c2042ad94c80ad45"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/compatibility/command-4.log",
+      "bytes": 290,
+      "sha256": "83a7b90bfd2c211c6fb4afcf72e261ef7b42bfd6dc21cfb72d530fb970aef44a"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/compatibility/command-5.log",
+      "bytes": 257,
+      "sha256": "5a0ae6eb30e6659515338894feeb98ebeabbcd4f66e01f425110e75e83d7986d"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/compatibility/command-6.log",
+      "bytes": 530,
+      "sha256": "38c1d85e306b15c18732c81df087390b3dfbd3873bc8836e36be492a1fb8a7fa"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/compatibility/command-7.log",
+      "bytes": 241,
+      "sha256": "74798a107028fa391113eb0b6fa7efac8bfee9c644dbb121892993443666f2f0"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/compatibility/command-8.log",
+      "bytes": 241,
+      "sha256": "be1f77d7dd153abaab34b2a75bdd5c2d036b406fc11da38ee8d4362bd4c26387"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/compatibility/command-9.log",
+      "bytes": 142,
+      "sha256": "fec96b4acb520e5ee4d8a42660e9a876f54f08d60c1fc98bcc7b1dcfd2ba6748"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/compatibility/commands.json",
+      "bytes": 5006,
+      "sha256": "afe00de6d890318afce993a9f6215173c5e6715bf68781537c97741680c7dd34"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/compatibility/desktop-installed.png",
+      "bytes": 96928,
+      "sha256": "4ee615b51ae1cf1ae4085c4e12a50f5494f90d6ce1f6ba8526eb5c2bbf762c03"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/compatibility/desktop-selected.png",
+      "bytes": 98624,
+      "sha256": "17b7808257723dce012d5b40b0c64e5c12213ae7c3aac5ce6b11d710ab03cda9"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/compatibility/https-network-errors.log",
+      "bytes": 402,
+      "sha256": "4ec76ea3ed5e10cddfd4eb4334b59a8af52a2f51994764398b307b7099c97923"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/compatibility/https-transport.json",
+      "bytes": 184,
+      "sha256": "783d920e3f762ee41283b76476cd03f39ab9788f42e1a4a364aa470de76ff218"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/compatibility/https-tunnel.log",
+      "bytes": 6799,
+      "sha256": "f9af62194abfd43e5ea29f1e1a2b96e26b0614dcd66bb81216ba6a5f60c37265"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/compatibility/mobile-selected.png",
+      "bytes": 85126,
+      "sha256": "e4c5ca93cf9546940d490e0f35bab1d706a4a9038c377271ddee0d01c2119245"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/compatibility/result.json",
+      "bytes": 8112,
+      "sha256": "da33941de70fb71366d4d8e02846375d09712f656baece629d75b5e53b7adf2b"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/https-browser.log",
+      "bytes": 2448,
+      "sha256": "0018f7750f0e0f1feb5ee5cfbb9639441e06652161906ae045a3a5ec3b5ace29"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/https-compatibility.log",
+      "bytes": 3160,
+      "sha256": "f3d0c74ca7a7dc82db4ac0d43858fd6d40f484f9c259d4db398fc22d9a8c9f42"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/marketplace-build.log",
+      "bytes": 72,
+      "sha256": "9f2e1db0d5b81451bd46f3f69be017f4f15e7e70df7217ca244b6f530fa6cd2a"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011/marketplace-https-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/summary.json",
+      "bytes": 1770,
+      "sha256": "ed5be16c40945ad6a90d357490c8a04409afafbd30b08b482fa5138a9c9ae097"
+    },
+    {
+      "path": ".qa/cloudflare/https-e77f011-run.json",
+      "bytes": 1640,
+      "sha256": "7b262ccbfada658f4ed69514b47cca32558be9ebed24f5ba04eef19989bd05c4"
+    },
+    {
+      "path": ".qa/cloudflare/https-worker-compatibility/failure.json",
+      "bytes": 331,
+      "sha256": "b72ef39716fd5f2ae948068f9b17a7a8d196839734fad30473840aa3aef1e175"
+    },
+    {
+      "path": ".qa/cloudflare/https-worker-compatibility/https-network-errors.log",
+      "bytes": 1950,
+      "sha256": "0f25d4ce60a9209341ab4c89e0903e6969305ef768765d6dbe3d880c1369f15f"
+    },
+    {
+      "path": ".qa/cloudflare/https-worker-compatibility/https-transport.json",
+      "bytes": 178,
+      "sha256": "7c2dd4488259c604d795cfc81d79eac3b76146ed2f46e517eec8ac59ab42890a"
+    },
+    {
+      "path": ".qa/cloudflare/https-worker-compatibility/https-tunnel.log",
+      "bytes": 6576,
+      "sha256": "d57baa6e40d714576987b7cc2feeecc245ea1b96351bd5ebedfd09d11e5823ad"
+    },
+    {
+      "path": ".qa/cloudflare/https-worker-compatibility-network-retry/failure.json",
+      "bytes": 331,
+      "sha256": "b72ef39716fd5f2ae948068f9b17a7a8d196839734fad30473840aa3aef1e175"
+    },
+    {
+      "path": ".qa/cloudflare/https-worker-compatibility-network-retry/https-network-errors.log",
+      "bytes": 2200,
+      "sha256": "535d9622de2a707dd98a3e59080b6ceb11d2d188386e25c797e7ecd36421ccfd"
+    },
+    {
+      "path": ".qa/cloudflare/https-worker-compatibility-network-retry/https-transport.json",
+      "bytes": 183,
+      "sha256": "455939be457b8c0c91f35ec6e02ad5a6eccf18ad4bd0e52226226c00af411436"
+    },
+    {
+      "path": ".qa/cloudflare/https-worker-compatibility-network-retry/https-tunnel.log",
+      "bytes": 6149,
+      "sha256": "a84f2c6ed21f8adbced9a1aba80205897beef2de16eee864fe56856fabd6d8ad"
+    },
+    {
+      "path": ".qa/cloudflare/max-package.mjs",
+      "bytes": 1977,
+      "sha256": "740914e6993ccf8068d308d621bc77c2939f48682b1b3b03ead782d538b7df77"
+    },
+    {
+      "path": ".qa/cloudflare/miniflare-versions.json",
+      "bytes": 2703,
+      "sha256": "4d975b0c46867e7101a602c55858e8de1a0eaaf8fc02587bc41ceff75ee22e88"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/author/command-1.log",
+      "bytes": 233,
+      "sha256": "77e1ede557120d9bf81d40ca877627689310c4aaf845ef393473c5efcc902c5a"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/author/command-2.log",
+      "bytes": 135112,
+      "sha256": "e1273da6bf3d9879ea163059862b71d4912ea10291418fa02bc7c4a39814a685"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/author/command-3.log",
+      "bytes": 25,
+      "sha256": "44a784cc08b1e73a44c0bf704e56a742f67527e48ac8e6f114f8d5124754fa77"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/author/command-4.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/author/command-5.log",
+      "bytes": 3704,
+      "sha256": "7fec5eaccc74f88bf631617cfa9cb403e99a999d32b6a886de1a5d35ba8852bf"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/author/command-6.log",
+      "bytes": 130,
+      "sha256": "40e4d539fcae00c8771b06a94b9951eed922e4650372c2eac8308e345a985ad7"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/author/command-7.log",
+      "bytes": 816,
+      "sha256": "e0fe2c700d7d87225ae38a03d507e53d6f75aa9232478f39a69c8a582a013156"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/author/command-8.log",
+      "bytes": 771,
+      "sha256": "318ef578267baba26b935bfea82c5a442a3d0c44deb4066696885eddca931f74"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/author/command-9.log",
+      "bytes": 41,
+      "sha256": "f9e32a0ac5e1c0ad3c7ce9a7fd6d7c6589c3583aa35af47ca980243a50d58b8c"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/author/commands.json",
+      "bytes": 4486,
+      "sha256": "1b2c89cf0226054767bda25173140b03ac4ffcdb0cfdfad0632f7364ad1a4a81"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/author/generated-tests.log",
+      "bytes": 493,
+      "sha256": "7cc8c9e966b59ec5135c7b3b3a7728e841681883b93e404327058972d14cfe4d"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/author/published.png",
+      "bytes": 251394,
+      "sha256": "d45804fb2fbc9c17444f2d4afbd32549bca129c7bd6655b529813e5060aa5f7f"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/author/python-events-0.1.0.cgext",
+      "bytes": 13918,
+      "sha256": "fda4f5c09b5cc8e5fd58dc377a3fb26e8b582719d98ccdc06152bd1b89c76077"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/author/result.json",
+      "bytes": 6470,
+      "sha256": "70d8bf53c97fa9cc7a9cad726ae4cda3e5f1eda39ae37956cb6fce05d959f0e7"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/browser/desktop-installed.png",
+      "bytes": 168599,
+      "sha256": "7d03dde268369217f276d8e5a840abc0d30bdc641f394351747f8966f28ea58c"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/browser/mobile-detail.png",
+      "bytes": 85155,
+      "sha256": "561cf75841e1e622ec384ed38f62801f7d9dc2d26b7a83ddbcc2d46c3a65a128"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/browser/result.json",
+      "bytes": 967,
+      "sha256": "2574b80c153bf6089a10ee1a5f7e4c400cb61200e46c49fdd58910d170fd5fcb"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/browser.log",
+      "bytes": 4484,
+      "sha256": "601c201d94ac8a512e2c74da3ecfec2d44309177c0a67df7ba6a559e818541ab"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/build.log",
+      "bytes": 7374,
+      "sha256": "7cc5cee203ad1019a33a3e022d91cc01992005208093866c55380bd6050402cb"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/compatibility/command-1.log",
+      "bytes": 919,
+      "sha256": "08d909020322a4eda7a73f709a662225ee860dbd80cd4df686750a15ee89710b"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/compatibility/command-10.log",
+      "bytes": 819,
+      "sha256": "a6ce5bdf8ca37ae023e3f613b5c87d459541c4fe249d1468f386f176090b6cd5"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/compatibility/command-11.log",
+      "bytes": 939,
+      "sha256": "2ffc7e94777f929b837853c1f620ba366677eecf23eee63ff0990a580792c123"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/compatibility/command-12.log",
+      "bytes": 771,
+      "sha256": "86f98509a1e8d2e2c0b2c1adf50290f483dcb665ae499735118770989a7a1699"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/compatibility/command-2.log",
+      "bytes": 293,
+      "sha256": "d93afb7d84337fce0fb443fb79883800bb478b4c94635140b8f67f9734ed2b26"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/compatibility/command-3.log",
+      "bytes": 122,
+      "sha256": "78fff926f4f8969d8e1705c0a1271cbd63b822579f81d715c2042ad94c80ad45"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/compatibility/command-4.log",
+      "bytes": 290,
+      "sha256": "83a7b90bfd2c211c6fb4afcf72e261ef7b42bfd6dc21cfb72d530fb970aef44a"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/compatibility/command-5.log",
+      "bytes": 933,
+      "sha256": "295c106a7df3efe329233fb64e6998823009497f8e69d4d29f83734a9b514c1f"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/compatibility/command-6.log",
+      "bytes": 530,
+      "sha256": "38c1d85e306b15c18732c81df087390b3dfbd3873bc8836e36be492a1fb8a7fa"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/compatibility/command-7.log",
+      "bytes": 917,
+      "sha256": "6b881a1057ed43db016d7ed087772fbf887831f4031839b599a7dc2ad2c1a50f"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/compatibility/command-8.log",
+      "bytes": 917,
+      "sha256": "846eac9974dd5de3193f8b36377704eaa6f3b28afc5a30d57175e5f85954a597"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/compatibility/command-9.log",
+      "bytes": 818,
+      "sha256": "bf1c9805ae29baab5e6e3086679bff35cac4fe131352693f8de6032340b66ab4"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/compatibility/commands.json",
+      "bytes": 5362,
+      "sha256": "4b03a1157c6664b8208221a4236177fb060ed7aca10ddfeb42efa9f44e8e8ebf"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/compatibility/desktop-installed.png",
+      "bytes": 106823,
+      "sha256": "53a4c64615615a42a77f6af226d915fa75f48013113cb22b227f28cd325dba0c"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/compatibility/desktop-selected.png",
+      "bytes": 99899,
+      "sha256": "e775a339da67dee2911421cc5ed909c45d93a66edaf65f039cf5cdb2ee1b3dd0"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/compatibility/mobile-selected.png",
+      "bytes": 86820,
+      "sha256": "a280baa785582f48bf98c585d658caba5a95cb056d496a2e8c9480885b87738e"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/compatibility/result.json",
+      "bytes": 8469,
+      "sha256": "b85f473c0288246e9f769b30794fc95468e6629e5e43635cbed003f08eb5e9f9"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/compatibility.log",
+      "bytes": 3173,
+      "sha256": "4cafe6fccd6a26072019c595eb08434c3081287f79c0117e2345aa5329abb537"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/external-author.log",
+      "bytes": 577,
+      "sha256": "fcd3d1dfec7c8d8d60b571ac0b5bc7150ff0d72240810ba8e28c0fea9072dd8b"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/focused.json",
+      "bytes": 50281,
+      "sha256": "d7ca3a2ff984818d5524320be7146795c17707206cf33cd01c1e970b4f05b467"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/focused.log",
+      "bytes": 15245,
+      "sha256": "e3a5c11abed780989829220fbdcaa91474e60876a861f5844be145d040288f62"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/marketplace-build.log",
+      "bytes": 72,
+      "sha256": "9f2e1db0d5b81451bd46f3f69be017f4f15e7e70df7217ca244b6f530fa6cd2a"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/registry-storage/1.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/registry-storage/10.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/registry-storage/11.log",
+      "bytes": 286,
+      "sha256": "a8e395f920e16ca2b3535854ca91dcce675c82079e19b337a3c1f6693bd05c35"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/registry-storage/12.log",
+      "bytes": 286,
+      "sha256": "f04baab5af26afe5a89c1e6479a2c560ee734740416cfdef38bb47350ef64c42"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/registry-storage/2.log",
+      "bytes": 634,
+      "sha256": "d4a215c395c7957589bcbd334ef73276c34c956d512c3e328b018280d5381200"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/registry-storage/3.log",
+      "bytes": 213,
+      "sha256": "ed82b2d97647323506632d542dc88071c98a73cc178033c528ca868b258d0805"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/registry-storage/4.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/registry-storage/5.log",
+      "bytes": 634,
+      "sha256": "13d5b8b64479ac031548a0400a0ec57b93151095c7be35a6bee896c2d0c71258"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/registry-storage/6.log",
+      "bytes": 225,
+      "sha256": "1d22af74de9b546db001e6b48180b47d3c07affcf173b57145a286564fc4b753"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/registry-storage/7.log",
+      "bytes": 630,
+      "sha256": "fae83260105d0c928dddf14381a40d1507544b60611dfc4b8d40f529a1dc64e1"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/registry-storage/8.log",
+      "bytes": 216,
+      "sha256": "d26e1ac122aa57b45d0cddc83e578b392cd48aa93573e2708a178a1a500815be"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/registry-storage/9.log",
+      "bytes": 286,
+      "sha256": "21ff6e778f36717603c5fed838c43eefcd71ce4dead63dbb00254da8cf6d3cdb"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/registry-storage/result.json",
+      "bytes": 11250,
+      "sha256": "5759f03767a6766e2f69caa20b8252f26bafa9b6972b041c93c82888480032e3"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/registry-storage/success.json",
+      "bytes": 82,
+      "sha256": "17c7b0ee92dcd022a25b808ad223346c3c40a1805f94d5cdf6c92cea22f2d53c"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/registry-storage.log",
+      "bytes": 1079,
+      "sha256": "ec06784b5db547a7c5eb87563c5e0607291f1a544350c404b6c76d31b9ec15ae"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-macos-15-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/darwin-arm64/summary.json",
+      "bytes": 6502,
+      "sha256": "417a842ef21f247cf9fbe1fb81d8d3f2b7893ca57936f67c43edab94506898c9"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/author/command-1.log",
+      "bytes": 209,
+      "sha256": "97621eb61411ccaa2acbf2ba61508af4894ceec5381e7be9b9b189c41bb391ef"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/author/command-2.log",
+      "bytes": 135113,
+      "sha256": "a1306ba661e8b4d35d0876d954ffc5f002a9faf0f6a721901df43617e3dec937"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/author/command-3.log",
+      "bytes": 26,
+      "sha256": "4762b6d52cc063cdfa62978517afcf16b818752c7d39cfc1c1bb53e982ecef66"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/author/command-4.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/author/command-5.log",
+      "bytes": 3685,
+      "sha256": "f70cf39e9e8686feab8ce8b3633974db98c413dc1285cd8c029a8d2eb1c291a4"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/author/command-6.log",
+      "bytes": 118,
+      "sha256": "ae5a2da51894939acebc37b3a9eb4028c58e28233d48cc7f9976c423e1a0d401"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/author/command-7.log",
+      "bytes": 812,
+      "sha256": "1c39cb78946a77f8699407d304870bff972beb59f737f6727125f2cef5bb7a9f"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/author/command-8.log",
+      "bytes": 767,
+      "sha256": "846633c7ce5562d3b338778ad37556c20ae5c54e8a4db28601ae257afab9dc65"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/author/command-9.log",
+      "bytes": 41,
+      "sha256": "f9e32a0ac5e1c0ad3c7ce9a7fd6d7c6589c3583aa35af47ca980243a50d58b8c"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/author/commands.json",
+      "bytes": 4391,
+      "sha256": "39a054750d01caf70ba85e64ddb154bedf79b363595aaa5c06c594c4915ca026"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/author/generated-tests.log",
+      "bytes": 493,
+      "sha256": "c0e8343d203819721396ce81a22021a2b5880d6a4912bad2305f5262805db466"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/author/published.png",
+      "bytes": 141105,
+      "sha256": "a3f7eaba035435a1626a6f8eff04b61ee3afe19554abe8a7c2c89321eab058da"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/author/python-events-0.1.0.cgext",
+      "bytes": 13612,
+      "sha256": "5683cd00a2333411c686608efc649e973630f37da28ec7ed35488fbd02efd9db"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/author/result.json",
+      "bytes": 6374,
+      "sha256": "ea9400c49ffcc22d5c618041f68af5102bb2f12c8844da7ed2b6e2d5554aef16"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/browser/desktop-installed.png",
+      "bytes": 117262,
+      "sha256": "1e9ec6025cd37956b8417302e5cfc25f8d18c176978339e1e5a43191cce0f658"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/browser/mobile-detail.png",
+      "bytes": 57172,
+      "sha256": "a87520e567e44245584c0a571f729296461b8f9ed81732fc44771f920e1324b5"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/browser/result.json",
+      "bytes": 966,
+      "sha256": "4a19aa5d127a87bc1b2a98d6ca2caea33e077e55eb10d3692ecb7a4dab75fb97"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/browser.log",
+      "bytes": 4464,
+      "sha256": "60f81583dc573f3b9d081105892dbbb23185c2a5a63ad9c9ad06b344229a0f33"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/build.log",
+      "bytes": 6969,
+      "sha256": "ff86bcabdf93901ec242d9c430827792e75296e227bf47b6fa8dc088aae0054e"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/compatibility/command-1.log",
+      "bytes": 915,
+      "sha256": "22dcb2d05560ad5aae837a8193a81b41aaa5e2f5327c435f448be40a8d6117bb"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/compatibility/command-10.log",
+      "bytes": 815,
+      "sha256": "cddf4e739f428d3bec9a6de1a54f5a69666410cf6ce090a08cd02aada7ec0c95"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/compatibility/command-11.log",
+      "bytes": 935,
+      "sha256": "ceafcd7ee626e27032d418479249d7a79fa75aa6d3df653e7740c6f44496612c"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/compatibility/command-12.log",
+      "bytes": 767,
+      "sha256": "b118f2ad8f6522a0f828792b4e2c668095e0d3d2c83e01338edd254f99a32baa"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/compatibility/command-2.log",
+      "bytes": 293,
+      "sha256": "d93afb7d84337fce0fb443fb79883800bb478b4c94635140b8f67f9734ed2b26"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/compatibility/command-3.log",
+      "bytes": 122,
+      "sha256": "78fff926f4f8969d8e1705c0a1271cbd63b822579f81d715c2042ad94c80ad45"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/compatibility/command-4.log",
+      "bytes": 290,
+      "sha256": "83a7b90bfd2c211c6fb4afcf72e261ef7b42bfd6dc21cfb72d530fb970aef44a"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/compatibility/command-5.log",
+      "bytes": 929,
+      "sha256": "c1bc76530a52cb46257771c6f36af909ecd33fbbf1e1c3af753ab43a56f1e7fa"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/compatibility/command-6.log",
+      "bytes": 530,
+      "sha256": "38c1d85e306b15c18732c81df087390b3dfbd3873bc8836e36be492a1fb8a7fa"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/compatibility/command-7.log",
+      "bytes": 913,
+      "sha256": "98f5071cb019e1ae8a96fa257e5da434f04f8f8c54527da37425e8646eae1560"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/compatibility/command-8.log",
+      "bytes": 909,
+      "sha256": "d0bf3648f05688de49df7f135111be41b1f5c34b71940d2f5372b0d3ef18244f"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/compatibility/command-9.log",
+      "bytes": 814,
+      "sha256": "e552b9af9d6861825ccf307963281fc8bcf24f90392ccc6228e954f94e8b3a37"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/compatibility/commands.json",
+      "bytes": 5214,
+      "sha256": "078c53622073b0da59623abdfed92b29c8f5f7184b452b8bf4031d289f3ef7a4"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/compatibility/desktop-installed.png",
+      "bytes": 67532,
+      "sha256": "f2f4df27d682fd723bd288dcf9c9dfe31da821f938428cb290992b69644a00f5"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/compatibility/desktop-selected.png",
+      "bytes": 66591,
+      "sha256": "79339c9c8eacfed33460140da276b1923e243dc8e16c0c2b4f5ce201a791f3d3"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/compatibility/mobile-selected.png",
+      "bytes": 57148,
+      "sha256": "b40a380fb8fb780f38c5e0786792b0c904c42331377c63fa7a94cfd2ff2f895e"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/compatibility/result.json",
+      "bytes": 8320,
+      "sha256": "cc3ebc76fcccec39c7a1ce878671e72ff0f33732250ee2a6c1edc4e683b8919d"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/compatibility.log",
+      "bytes": 3160,
+      "sha256": "c57e0afa5b435ac00c05caec49a757fbb057e4d704291f8930e31e9ba59e815a"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/external-author.log",
+      "bytes": 576,
+      "sha256": "de7f09ff82929af0eb91f1c6d76c1b41d088d2c505b599d5eb4ce2377c9e5aad"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/focused.json",
+      "bytes": 49992,
+      "sha256": "bb7a8480fa991e60b0a1924a3a4824ffcc8e943bc347e37710034bd87238f66b"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/focused.log",
+      "bytes": 17314,
+      "sha256": "6146823a84728e57d35e33f3ed23aafb2963286d8de8bef30216d6a7d215f6d8"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/marketplace-build.log",
+      "bytes": 72,
+      "sha256": "9f2e1db0d5b81451bd46f3f69be017f4f15e7e70df7217ca244b6f530fa6cd2a"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/registry-storage/1.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/registry-storage/10.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/registry-storage/11.log",
+      "bytes": 285,
+      "sha256": "3cb07434c2f5b207487f59125baecc94341ff46e4fbdbaca24558bdca9cf7446"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/registry-storage/12.log",
+      "bytes": 285,
+      "sha256": "e6ea4a0458b72abdab414638b92538669478c38a858d22661f73538404fe27c4"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/registry-storage/2.log",
+      "bytes": 633,
+      "sha256": "15fddd6af40df87de6159bc22caf3f72cb934b604588f1783666081773bdd084"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/registry-storage/3.log",
+      "bytes": 212,
+      "sha256": "46a1d2fc9a656f867f2dc993af19ef0d2b72e80fb39c41daf09482fab3465377"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/registry-storage/4.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/registry-storage/5.log",
+      "bytes": 633,
+      "sha256": "bcac8e0711f1d6c1f818f80c27eb8c7cb9d6c929446e3e6ca07e7dff3895564a"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/registry-storage/6.log",
+      "bytes": 224,
+      "sha256": "a9ab4667548a5c0878d9132a9aa948e6d4a289384e15d75b7357d5c77a2e34ce"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/registry-storage/7.log",
+      "bytes": 629,
+      "sha256": "d0175b4eef05625072e59b6c00d276961979ad55d847a4cda066ac77ecf34015"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/registry-storage/8.log",
+      "bytes": 215,
+      "sha256": "cc2100ebc32329f2b093e7bf46e4b8313b38c21ca8ab449cad1aa36aa2d5b402"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/registry-storage/9.log",
+      "bytes": 285,
+      "sha256": "c00f870e6502ff55a74ffd5f86aea93d65cb741e38449c000fe6145370364618"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/registry-storage/result.json",
+      "bytes": 10930,
+      "sha256": "f4d6a69605e4873676cbd2b7ad397b3d2dfe3c817d634351f00ca7672f727083"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/registry-storage/success.json",
+      "bytes": 82,
+      "sha256": "17c7b0ee92dcd022a25b808ad223346c3c40a1805f94d5cdf6c92cea22f2d53c"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/registry-storage.log",
+      "bytes": 1078,
+      "sha256": "a1a5b8b5daf650cb4d6057b21dc727d6c15ba6b818b480957ce56545d48313a5"
+    },
+    {
+      "path": ".qa/cloudflare/native-52c1b38/extensions-native-windows-2022-52c1b38644e9c0833945ceabaa086ecbbd4aac57-1/win32-x64/summary.json",
+      "bytes": 6411,
+      "sha256": "351b40bf34d42c8092578a89c9ddee7a3d9f6a96726d3d289eca77b7b91e55dd"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/author/command-1.log",
+      "bytes": 233,
+      "sha256": "ccfb29dae954006f8f6067fb5dba5fd3d443ada70e9b571ced799ed6ea49437d"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/author/command-2.log",
+      "bytes": 135112,
+      "sha256": "83fe22274637054d75a870c9a95f229abd41c144ceb4faf7635b11c16ad98346"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/author/command-3.log",
+      "bytes": 25,
+      "sha256": "085fc9698776fc74087c1fe553da555f0ff13d28c3c55863bf1dcbc98cf88823"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/author/command-4.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/author/command-5.log",
+      "bytes": 3704,
+      "sha256": "74ad2b3aed0196cf062fa0f919fbabb7b7f67c7127c02840bf67bd88a8777e59"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/author/command-6.log",
+      "bytes": 130,
+      "sha256": "f64a2bdba0fc8320b0c4beb965eaa17876f432922f0f7c4d3ba4297808115140"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/author/command-7.log",
+      "bytes": 816,
+      "sha256": "8934493c26a24f6a06cca62fdfa3062b5f7c8c4eaa0b817d75a5cf8c17b150c6"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/author/command-8.log",
+      "bytes": 771,
+      "sha256": "0129819df1c870f5e2c3dc701c6cfeb25745d8016c6293e457c27335a68097e7"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/author/command-9.log",
+      "bytes": 41,
+      "sha256": "fa64eff9ade501ab4c19f11982bc0fac0eb3f4fb34471ba1dd5f2b91ce777d34"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/author/commands.json",
+      "bytes": 4486,
+      "sha256": "be783f304bc0f278009dd7b058a16aee690d483f0e15b3ccb86fd24c01212ffa"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/author/generated-tests.log",
+      "bytes": 493,
+      "sha256": "74f3237a1c54188fcaccd51751c68b7d2f355be857b3c5abdc7b5b41792855c7"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/author/published.png",
+      "bytes": 250844,
+      "sha256": "863f4e8f11c2b49271c1d80cfdeba66dcb224b318d26616d90707782703e6bde"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/author/python-events-0.1.0.cgext",
+      "bytes": 13918,
+      "sha256": "3317b5b4b8da1cfb45b728062a7c88e85a292bdca3a1c05c9175f225db631bb1"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/author/result.json",
+      "bytes": 6470,
+      "sha256": "72b4ca3ba9bc13509aa566d2123eeeea85a0e60d402ed23842b539231959845d"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/browser/desktop-installed.png",
+      "bytes": 168816,
+      "sha256": "f37aa2d706c30cdf96ad8bd5df88b5c1141c5de46d980df54bdc3b961fc2fd14"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/browser/mobile-detail.png",
+      "bytes": 85145,
+      "sha256": "0baa701978177d711d4acbbd34806eb7bce995af48e76735d683223c7346a92f"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/browser/result.json",
+      "bytes": 967,
+      "sha256": "2574b80c153bf6089a10ee1a5f7e4c400cb61200e46c49fdd58910d170fd5fcb"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/browser.log",
+      "bytes": 4484,
+      "sha256": "de4db275a232773bd3afd07a0121bfcd34a38023adeaebc28df88cb58af0ec9a"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/build.log",
+      "bytes": 7374,
+      "sha256": "fb214727328fb7017f7d83c294dd79d129ed991d4fc481a8adf58db98b063121"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/compatibility/command-1.log",
+      "bytes": 919,
+      "sha256": "9d5ef708f8a2b2e2759a37cba9e4f56c8197fc9a11de53d33ed0917934fd91ad"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/compatibility/command-10.log",
+      "bytes": 819,
+      "sha256": "b285c1d6351a96822ff04e1a1e92eb6e9e2f96c8d62cfca2f096bad3c2731471"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/compatibility/command-11.log",
+      "bytes": 939,
+      "sha256": "09cb027a7fc8ce2425f52dbb0c17729db2d6b22d5908b08b3726d0abb80a0743"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/compatibility/command-12.log",
+      "bytes": 771,
+      "sha256": "0f02f63eadc09ef2216fe1f5e2386f550d7746bc911990057c5d349a538e633d"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/compatibility/command-2.log",
+      "bytes": 293,
+      "sha256": "d93afb7d84337fce0fb443fb79883800bb478b4c94635140b8f67f9734ed2b26"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/compatibility/command-3.log",
+      "bytes": 122,
+      "sha256": "78fff926f4f8969d8e1705c0a1271cbd63b822579f81d715c2042ad94c80ad45"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/compatibility/command-4.log",
+      "bytes": 290,
+      "sha256": "83a7b90bfd2c211c6fb4afcf72e261ef7b42bfd6dc21cfb72d530fb970aef44a"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/compatibility/command-5.log",
+      "bytes": 933,
+      "sha256": "d625726181868e227ecf61134560cae2821941e8ea9325f7acac7f9afa095894"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/compatibility/command-6.log",
+      "bytes": 530,
+      "sha256": "38c1d85e306b15c18732c81df087390b3dfbd3873bc8836e36be492a1fb8a7fa"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/compatibility/command-7.log",
+      "bytes": 917,
+      "sha256": "81bbef052a009fd05133246ff7660bceeae014d108be06481d8924fdf1d658cc"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/compatibility/command-8.log",
+      "bytes": 917,
+      "sha256": "c4ecafcb7cf5eb54c19db2e525cfe95c3c1aac60ebb487e9646e832d74e2b412"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/compatibility/command-9.log",
+      "bytes": 818,
+      "sha256": "93b73f012bca86e39d3b600fd13cd23a50a434665f99c0368930d8cd0460ab1a"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/compatibility/commands.json",
+      "bytes": 5364,
+      "sha256": "4ed7d8cbffaf9d0a0ecd590101960ade0587f4d1f5a8e251bed4c078933517a8"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/compatibility/desktop-installed.png",
+      "bytes": 107109,
+      "sha256": "bd72ce5b214acd8836c39b53f4aefc40b99320c7ce538b457dba2256b2e86988"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/compatibility/desktop-selected.png",
+      "bytes": 99958,
+      "sha256": "d1aea27b0d048e0223e162aa0059d028a83be671000bd502068abd87914517e2"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/compatibility/mobile-selected.png",
+      "bytes": 86759,
+      "sha256": "5e1f5628fe802bcc42ca280f6697c98e4470440d23b15fd8e223779f68778917"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/compatibility/result.json",
+      "bytes": 8471,
+      "sha256": "acb4eecc7222335cce7a795c76aaf5aea7d4b33d24d65cc3ac1ddf7381b81f2a"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/compatibility.log",
+      "bytes": 3173,
+      "sha256": "603c1a15a67764599bc609b8dfd31443ce8413bb16d4d89b647a45c85df52dee"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/external-author.log",
+      "bytes": 577,
+      "sha256": "e5d3d7d00a8e5e9ac9850efd861296f4aee9bcc57a51d3269b6f6188494881db"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/focused.json",
+      "bytes": 50261,
+      "sha256": "535876a6b8b18435b536bbc215cca39d3c3b4ca86de8f1f9518881955ef02b64"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/focused.log",
+      "bytes": 17427,
+      "sha256": "84ba95e9abead0735c74196d377d884fc152758bd46cb999d7ea59463a5b7425"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/marketplace-build.log",
+      "bytes": 72,
+      "sha256": "9f2e1db0d5b81451bd46f3f69be017f4f15e7e70df7217ca244b6f530fa6cd2a"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/registry-storage/1.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/registry-storage/10.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/registry-storage/11.log",
+      "bytes": 286,
+      "sha256": "17c45b04e6e2d757c3b03fed220e2f44fb559e643bfcb9c5972063b411f16585"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/registry-storage/12.log",
+      "bytes": 286,
+      "sha256": "b55d79e829e097b91867a7a54203a11dea9f12be78c2ad2c5e3505be837a5c62"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/registry-storage/2.log",
+      "bytes": 634,
+      "sha256": "49c7b380fa60c7c3567a750c95f878f47ad94aa40735d3b3a4271447ec73d0d9"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/registry-storage/3.log",
+      "bytes": 213,
+      "sha256": "0d6cf88b0ba5dc0cdab62e38db251567360565a7a344c503ce7cc67d37842bdd"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/registry-storage/4.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/registry-storage/5.log",
+      "bytes": 634,
+      "sha256": "ea61016fbcb725ae8a0530c43c9560efc9b83c5666befa3770ff5ec8d027a65e"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/registry-storage/6.log",
+      "bytes": 225,
+      "sha256": "4a4280ea27dbaebaa51db478cac94c9f58954beeb77e1210cb47cf3675258503"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/registry-storage/7.log",
+      "bytes": 630,
+      "sha256": "8f48bea6761a96e6c03f4435bd1107908ec794d36f2f28487a89601952c98c98"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/registry-storage/8.log",
+      "bytes": 216,
+      "sha256": "87b0523daf5b2738db1e034d18d81304ac468da966d05532f3ad9649e092fa16"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/registry-storage/9.log",
+      "bytes": 286,
+      "sha256": "00285a565a7921e26add14fd254dbe76107cadec7ff9e8ce096f86e6b0456f52"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/registry-storage/result.json",
+      "bytes": 11250,
+      "sha256": "beadaa2f48fe3d1c0dbe32b1956d940d12dee6a12ad9a9fd4e36261654b53f12"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/registry-storage/success.json",
+      "bytes": 82,
+      "sha256": "3a6cb9fd7b5ae56f1b1ea6fd6fa24b9b7d4b4bbc4ddf0e6d4f765044a9e1b5f2"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/registry-storage.log",
+      "bytes": 1079,
+      "sha256": "cac623f821ca72be94547f212d0f9fe97c51f1608027e44a0e7bc413eb4981ba"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-macos-15-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/darwin-arm64/summary.json",
+      "bytes": 6503,
+      "sha256": "e0726c5299dc69f822a2d2164392816f55e2a838b118af21eb716eba95fbebd3"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/author/command-1.log",
+      "bytes": 209,
+      "sha256": "22165f505e59a3b26afc039fb1ba87f963b12aca7695cb35453e66ea3da44e0f"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/author/command-2.log",
+      "bytes": 135113,
+      "sha256": "d08e3ef2301505b02e64f0d8a6ef3a6889f5bc9a7566b012c570041c1ecc3926"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/author/command-3.log",
+      "bytes": 26,
+      "sha256": "4762b6d52cc063cdfa62978517afcf16b818752c7d39cfc1c1bb53e982ecef66"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/author/command-4.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/author/command-5.log",
+      "bytes": 3666,
+      "sha256": "38fe148042cb495a4d11333236889fda66f1874ff5dae4a8a678949b855ac0fe"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/author/command-6.log",
+      "bytes": 118,
+      "sha256": "81c9184e2363b38901a93fae37c093636e171580b13a9d90276a539c347270ae"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/author/command-7.log",
+      "bytes": 808,
+      "sha256": "3e9061c5eca49b1f371df969ffcfab148e3b7725f75ae9f3ad0fdf9f05163f23"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/author/command-8.log",
+      "bytes": 767,
+      "sha256": "7b585617b81a7c364306092979c313c291b6f2f07fe76e854d412d0bd125ff17"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/author/command-9.log",
+      "bytes": 41,
+      "sha256": "fa64eff9ade501ab4c19f11982bc0fac0eb3f4fb34471ba1dd5f2b91ce777d34"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/author/commands.json",
+      "bytes": 4389,
+      "sha256": "588adf9feaee0f0ddecfe278ab5fda255a32cc9dfdaed2c83b5add8f6399e8f2"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/author/generated-tests.log",
+      "bytes": 493,
+      "sha256": "ddd9d9168cfc6ee48098f2d970d323d39edbe5af6c9351e2e96fbe23937bde77"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/author/published.png",
+      "bytes": 140947,
+      "sha256": "cd7d6fa7df063c11414cde378b49d62be21f402279c0f2049ccf1d75c07f4f92"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/author/python-events-0.1.0.cgext",
+      "bytes": 13612,
+      "sha256": "160f17da01d337da95ec5d3b8c3b844feaf7351c383f721c3dd4253cdbf7369d"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/author/result.json",
+      "bytes": 6372,
+      "sha256": "3b9d32ff6ef26fc1df593f903f2ccf0df7b0f643ee88ddeb61bb13a4ba46a297"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/browser/desktop-installed.png",
+      "bytes": 117470,
+      "sha256": "ba725eead3e4a8466353e1c664f59e9f6de13736d0395008eb5e48da1ce55fd3"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/browser/mobile-detail.png",
+      "bytes": 57330,
+      "sha256": "4613c6c4383883eb6c6e67d667a73ae5520ae5da37299d0ffff4f3cbb97c1d56"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/browser/result.json",
+      "bytes": 966,
+      "sha256": "4a19aa5d127a87bc1b2a98d6ca2caea33e077e55eb10d3692ecb7a4dab75fb97"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/browser.log",
+      "bytes": 4464,
+      "sha256": "91823162979345d8d04765507aa7b4f107eaa839b0d21c3b7872b5b4a1864b00"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/build.log",
+      "bytes": 6969,
+      "sha256": "0a15b409b5c48fc4a0e916b170ceba1d7ca6b78b488f6b0c270703c68ba1a78d"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/compatibility/command-1.log",
+      "bytes": 915,
+      "sha256": "7d5b3beb6b03b388e6ca325a0fe5bb2ef9d726a28719c35445e714413c556026"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/compatibility/command-10.log",
+      "bytes": 815,
+      "sha256": "8471e65ad8e6372988d2d1c5aa4fa5e36ec87c32c51543996d48f6d6df80dfe2"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/compatibility/command-11.log",
+      "bytes": 935,
+      "sha256": "dafc7095d39e1fb47d85b35258ac160d56738badf53fa461c0ee5a53714350ec"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/compatibility/command-12.log",
+      "bytes": 767,
+      "sha256": "d4d0655b264bb68486758b9df8c0d6996e3b987191385a778eedab1cf99f6620"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/compatibility/command-2.log",
+      "bytes": 293,
+      "sha256": "d93afb7d84337fce0fb443fb79883800bb478b4c94635140b8f67f9734ed2b26"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/compatibility/command-3.log",
+      "bytes": 122,
+      "sha256": "78fff926f4f8969d8e1705c0a1271cbd63b822579f81d715c2042ad94c80ad45"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/compatibility/command-4.log",
+      "bytes": 290,
+      "sha256": "83a7b90bfd2c211c6fb4afcf72e261ef7b42bfd6dc21cfb72d530fb970aef44a"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/compatibility/command-5.log",
+      "bytes": 929,
+      "sha256": "900137541f099961dc443fc7380995a2cb9a833659dd70804226b6a9f2d4216a"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/compatibility/command-6.log",
+      "bytes": 530,
+      "sha256": "38c1d85e306b15c18732c81df087390b3dfbd3873bc8836e36be492a1fb8a7fa"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/compatibility/command-7.log",
+      "bytes": 913,
+      "sha256": "2c3ca6839d17ac47080c684c1fd325dc7d249a1258081bf869c1032f8290c25d"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/compatibility/command-8.log",
+      "bytes": 913,
+      "sha256": "454a0d1e6168f455fb6d52434d1d5f7f0d20b5dfd6e178a4e5642fdbde626f6f"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/compatibility/command-9.log",
+      "bytes": 814,
+      "sha256": "064ac7d088c92dbf75900f889241fb0e41c682b00671aeeda2d843d0630ef309"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/compatibility/commands.json",
+      "bytes": 5213,
+      "sha256": "d5aeb0c33196342a6a1184f784f4f3a85fb3322db508e73a84b08460aa46bdf5"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/compatibility/desktop-installed.png",
+      "bytes": 67674,
+      "sha256": "e859c442a6f658989844d25630dc2bdfbb3149406dff007856c81235ef507080"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/compatibility/desktop-selected.png",
+      "bytes": 66732,
+      "sha256": "093e7cbfdac6ae1a53ad9a2d6370adb884c53f416c78225368d0d52ef461b552"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/compatibility/mobile-selected.png",
+      "bytes": 57275,
+      "sha256": "28b6a2716ff7840871e65c09e8aef69f8c205f0709878d8f084a532361cc38cd"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/compatibility/result.json",
+      "bytes": 8319,
+      "sha256": "4267f19fd6353d43fd70ab1609ebeff39a4336748ee01c0c00c1a1716fbf42cc"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/compatibility.log",
+      "bytes": 3160,
+      "sha256": "f5b300b873cbff3aa8cd1e0660f947c87f888b65aaf9c8a850ca178837edc7ac"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/external-author.log",
+      "bytes": 576,
+      "sha256": "939741c36c96380d6354c381e70ce1a927432888467f62531f3498ec36142bad"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/focused.json",
+      "bytes": 50007,
+      "sha256": "c1509eade566e32cc93253213969ff3b7c73c8890f168632b270149e8a2f71da"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/focused.log",
+      "bytes": 17613,
+      "sha256": "d06b6bc1c46c9dcf7d940b1713c4569c8e7212fa30ab2671ab2f891ee0e26707"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/marketplace-build.log",
+      "bytes": 72,
+      "sha256": "9f2e1db0d5b81451bd46f3f69be017f4f15e7e70df7217ca244b6f530fa6cd2a"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/registry-storage/1.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/registry-storage/10.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/registry-storage/11.log",
+      "bytes": 285,
+      "sha256": "66dd6082ffc1ca322127f9c4293c42b31251cde4895c7aba407b75e4073c1476"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/registry-storage/12.log",
+      "bytes": 285,
+      "sha256": "fa2ba8573fb11dd6fef34a8f3acaf802c0cbbea0957165f83f99e28bd20a19e9"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/registry-storage/2.log",
+      "bytes": 633,
+      "sha256": "d2c20426085ba26ebd174509d8f74ef9ce8cc01b8b654142c9400725835ca3f1"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/registry-storage/3.log",
+      "bytes": 212,
+      "sha256": "3f7e6a915e203726e47dfe2577339bd0096148999cd1c68ddb51d49f20dcecfa"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/registry-storage/4.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/registry-storage/5.log",
+      "bytes": 633,
+      "sha256": "1ebe6e0e5571fde7599f7bcf3d4fb01af00a9f6e549df0aa7da5deb88d2441aa"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/registry-storage/6.log",
+      "bytes": 224,
+      "sha256": "a0f3b75cb727d395c7066afe494fd683e9afd2b6d0dec086c8bd83f82466fca3"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/registry-storage/7.log",
+      "bytes": 629,
+      "sha256": "fc7e1a8947655937322fe091cbad9c4d4f76bb0b85fb1cfe675b3bc0be515762"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/registry-storage/8.log",
+      "bytes": 215,
+      "sha256": "cea7986e6c2ec3f2ed28b03e38ffb9c1af7e0d5643044552ac4a1146cef31be3"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/registry-storage/9.log",
+      "bytes": 285,
+      "sha256": "4a7de5f941fa52ab1af000f3b8d9e10a645ecf1dbdfaf8e10dfd37438e8b047e"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/registry-storage/result.json",
+      "bytes": 10930,
+      "sha256": "ca4b987b952ac8ccd514a55d0dd12aa5e939d77b53d7d1e61146dc5ca2687cb7"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/registry-storage/success.json",
+      "bytes": 82,
+      "sha256": "3a6cb9fd7b5ae56f1b1ea6fd6fa24b9b7d4b4bbc4ddf0e6d4f765044a9e1b5f2"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/registry-storage.log",
+      "bytes": 1078,
+      "sha256": "07bd4c9fcae9ea23c4030f2f44936e2b9af31fb60364858f57562bf26c8d9937"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011/extensions-native-windows-2022-e77f011ec34c14150a805bb41e2a06c2a9efad3d-1/win32-x64/summary.json",
+      "bytes": 6410,
+      "sha256": "31ef85e8e88ed21626e083e97619bb7e4ca5a95f75cf2a41195a904aade109fc"
+    },
+    {
+      "path": ".qa/cloudflare/native-e77f011-run.json",
+      "bytes": 2718,
+      "sha256": "f803ccc26ee69ee8bcac6b060df925dff80893165ffb93d1043faf5453530d27"
+    },
+    {
+      "path": ".qa/cloudflare/operators/command-1.log",
+      "bytes": 694,
+      "sha256": "d77bd7cbe78f25ccc4716c3e67c3bb68f8a40af9051619c4d6fc7c1e708f7b0e"
+    },
+    {
+      "path": ".qa/cloudflare/operators/command-2.log",
+      "bytes": 769,
+      "sha256": "bc51120a94e1c268f742b794021dd4ca4267f331fcfbe7f1af3a1b89c0f3e787"
+    },
+    {
+      "path": ".qa/cloudflare/operators/command-3.log",
+      "bytes": 27,
+      "sha256": "44a990bee9edb4753beb3067aa01ea22b32b09b48b82e1ec05d49e264c29fa1c"
+    },
+    {
+      "path": ".qa/cloudflare/operators/command-4.log",
+      "bytes": 629,
+      "sha256": "f543baf67904f065a1751598719dc2029d3795e582375b945277a8868667e056"
+    },
+    {
+      "path": ".qa/cloudflare/operators/command-5.log",
+      "bytes": 15,
+      "sha256": "ddf45599a032d2957f31bed0864bc54738066258347cb8b9750df763424afc92"
+    },
+    {
+      "path": ".qa/cloudflare/operators/command-6.log",
+      "bytes": 698,
+      "sha256": "3a3edb34a60586506fe5a63b0371543c8eadae2a1a158d77e9db1197cdccedaf"
+    },
+    {
+      "path": ".qa/cloudflare/operators/progress.json",
+      "bytes": 2038,
+      "sha256": "0bb9f4b77ecce05a5d3e98e2ab0745a7fcd59bf338968ebf87be31dfa48f4173"
+    },
+    {
+      "path": ".qa/cloudflare/operators/result.json",
+      "bytes": 2133,
+      "sha256": "e195a0ccfefbf8cb9a47c0b7b17e74e59af553427873773047cb7fd3e50aabe5"
+    },
+    {
+      "path": ".qa/cloudflare/runtime/child-1.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/cloudflare/runtime/child-2.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/cloudflare/runtime/failure.json",
+      "bytes": 1139,
+      "sha256": "be5d529d39fa5fa71c6abe7da3d3264097c00f7748020fc1617674da69a7c7ad"
+    },
+    {
+      "path": ".qa/cloudflare/runtime/progress.json",
+      "bytes": 1610,
+      "sha256": "65cb2346ca0267baea6758a12d438bc1b7805b1438e9020e06f602ea1e7ffc55"
+    },
+    {
+      "path": ".qa/cloudflare/runtime/result.json",
+      "bytes": 1947,
+      "sha256": "b7fb70f310b6e3a7131b5162198151e54bbc836459e7bfdd73a91bd3fd958c8e"
+    },
+    {
+      "path": ".qa/cloudflare/runtime-final/child-1.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/cloudflare/runtime-final/child-2.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/cloudflare/runtime-final/progress.json",
+      "bytes": 1750,
+      "sha256": "c4c2a9c2c8a1710c48cfd3ecceec7604c893b282f670c4a4072db5d361011b92"
+    },
+    {
+      "path": ".qa/cloudflare/runtime-final/result.json",
+      "bytes": 2087,
+      "sha256": "bed26907892a10b5a6accb902b227e27197d676f3e3979f42a6621013f3dcde6"
+    },
+    {
+      "path": ".qa/cloudflare/runtime-first.log",
+      "bytes": 779,
+      "sha256": "6abc728a2dcd5d348f1e3a5aa957c4ad0e4929f9c325a81cce6d5dba05bd474e"
+    },
+    {
+      "path": ".qa/cloudflare/runtime-second.log",
+      "bytes": 838,
+      "sha256": "ad2fece0d0ac28c18df332fc217bdff4665be2f26bb9a268a47336db49750189"
+    },
+    {
+      "path": ".qa/cloudflare/runtime-third.failure.json",
+      "bytes": 1139,
+      "sha256": "be5d529d39fa5fa71c6abe7da3d3264097c00f7748020fc1617674da69a7c7ad"
+    },
+    {
+      "path": ".qa/cloudflare/runtime-third.log",
+      "bytes": 1288,
+      "sha256": "4c278c0ca0e9bbd8a7ffb75404c77d6645becc73631e8afc1fb9858626ba0c93"
+    },
+    {
+      "path": ".qa/cloudflare/tsc.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/cloudflare/wrangler-access-final.log",
+      "bytes": 6406,
+      "sha256": "1d642132740c0945000fb4367a3825b08246be38f6677a4f41cd49b408a06e82"
+    },
+    {
+      "path": ".qa/cloudflare/wrangler-dryrun-final.log",
+      "bytes": 4665,
+      "sha256": "de14a3db085a42c8b9f821cfef0e50a51de18d4016db00439852d22d85a2a284"
+    },
+    {
+      "path": ".qa/cloudflare/wrangler-dryrun-fixed.log",
+      "bytes": 4699,
+      "sha256": "0cb9f2ead05e653877a5d1bc367aabd472783eea8b24c58150b903afec28a967"
+    },
+    {
+      "path": ".qa/cloudflare/wrangler-dryrun.log",
+      "bytes": 10445,
+      "sha256": "f2ad3623381faedc6b9d7cb30af530d371e6e84d3075a09fb1f83cde2623197c"
+    },
+    {
+      "path": ".qa/cloudflare/wrangler.log",
+      "bytes": 6285,
+      "sha256": "2f696bc48e9556f9db1c8bc5ca529016fbdae4d5d520149604f2d35cc6c65c29"
+    }
+  ],
+  "limits": [
+    "Cloudflare account/plan/resources and custom domain not verified; Wrangler whoami unauthenticated",
+    "Cloudflare Worker local HTTP only: both temporary HTTPS attempts failed DNS",
+    "Node temporary HTTPS success is separate, not a Cloudflare-hosted Worker pass",
+    "No remote redeploy/backup/restore or Free CPU eligibility demonstrated",
+    "Prior full Linux 4564 tests and Drupal corpus evidence not rerun for host preference; measured Drupal overhead 22\u201330%"
+  ]
+}

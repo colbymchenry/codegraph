@@ -29,7 +29,7 @@ CLOUDFLARE_REGISTRY=1 PLAYWRIGHT_MODULE=/absolute/path/to/playwright \
   node scripts/validation/marketplace-browser.cjs
 ```
 
-The exact Wrangler/Miniflare/workerd versions are pinned in the separate lockfile. Current Wrangler uses Miniflare 5 alpha; the local adapter uses its documented v4-options converter and explicit `resourcePersistencePath`. Default test state is disposable. Production configuration points to `worker.ts`; only `test-worker.ts` accepts failure/kill controls. Tests exercise real local D1/R2 bindings, Web Crypto, HTTP and test-owned subprocess kills, not JavaScript storage mocks. Static assets in integration tests are delivered through a local binding; the actual platform asset routing is separately checked by a Wrangler dry run and still needs hosted verification.
+The exact Wrangler/Miniflare/workerd versions are pinned in the separate lockfile. Current Wrangler uses Miniflare 5 alpha; the local adapter uses its documented v4-options converter and explicit `resourcePersistencePath`. Default test state is disposable. Production configuration points to `worker.ts`; only `test-worker.ts` accepts failure/kill controls. Tests exercise real local D1/R2 bindings, Web Crypto, HTTP and test-owned subprocess kills, not JavaScript storage mocks. Static assets in integration tests are delivered through a local binding; Wrangler dry run validates bundling and asset/binding configuration; actual platform routing still needs hosted verification.
 
 For a retained local rehearsal (no Cloudflare account needed):
 
