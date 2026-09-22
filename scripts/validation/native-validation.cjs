@@ -21,7 +21,7 @@ const playwright = process.env.PLAYWRIGHT_MODULE || path.join(root, '.qa/browser
 env.PLAYWRIGHT_MODULE = playwright;
 env.CHROME_PATH = process.env.CHROME_PATH || require(playwright).chromium.executablePath();
 async function run(name, command, args, timeout = 360000, overrides = {}) {
-  if (metadata.scope === 'marketplace' && !['build','marketplace-build','focused','registry-storage','external-author','compatibility','browser'].includes(name)) {
+  if (metadata.scope === 'marketplace' && !['build','marketplace-build','drupal-package','drupal-accuracy','focused','registry-storage','external-author','compatibility','browser'].includes(name)) {
     metadata.notRun.push({ name, reason: 'Unchanged core lifecycle; retain prior native evidence instead of rerunning' }); save(); return true;
   }
   const step = { name, command: [command, ...args], cwd: root, revision: version, overrides, started: new Date().toISOString(), status: 'running' };
@@ -45,6 +45,8 @@ async function run(name, command, args, timeout = 360000, overrides = {}) {
   const built = await run('build', ...npmCommand(['run', 'build']));
   if (built) {
     await run('marketplace-build', ...npmCommand(['run', 'build', '--prefix', 'marketplace']));
+    await run('drupal-package', process.execPath, ['scripts/build-extensions.mjs']);
+    await run('drupal-accuracy', process.execPath, ['--test', 'scripts/validation/drupal-accuracy.test.cjs', 'scripts/validation/drupal-negative.test.cjs']);
     await run('focused', process.execPath, ['node_modules/vitest/vitest.mjs', 'run',
       '__tests__/marketplace-storage.test.ts', '__tests__/foundation.test.ts', '__tests__/extension-trust.test.ts', '__tests__/extension-releases.test.ts', '__tests__/extension-marketplace.test.ts', '__tests__/extension-author.test.ts', '__tests__/plugins.test.ts', '__tests__/extension-explore.test.ts',
       '__tests__/db-reopen-on-replace.test.ts', '__tests__/status-json.test.ts', '__tests__/sync.test.ts', '__tests__/concurrent-locking.test.ts',

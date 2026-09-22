@@ -7,6 +7,8 @@ on:
     branches: [feature/extensions-author-kit-20260922]
     paths:
       - 'src/**'
+      - 'extensions/drupal/**'
+      - 'scripts/build-extensions.mjs'
       - '__tests__/**'
       - 'scripts/validation/**'
       - 'package*.json'

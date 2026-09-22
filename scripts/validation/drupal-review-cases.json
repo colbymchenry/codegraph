@@ -1,0 +1,255 @@
+{
+  "pathauto": {
+    "flows": [
+      [
+        "/admin/config/search/path/settings",
+        "pathauto.routing.yml",
+        "buildForm",
+        "src/Form/PathautoSettingsForm.php",
+        "Drupal route handler",
+        "/admin/config/search/path/settings PathautoSettingsForm.buildForm"
+      ],
+      [
+        "/admin/config/search/path/update_bulk",
+        "pathauto.routing.yml",
+        "buildForm",
+        "src/Form/PathautoBulkUpdateForm.php",
+        "Drupal route handler",
+        "/admin/config/search/path/update_bulk PathautoBulkUpdateForm.buildForm"
+      ],
+      [
+        "getPunctuationCharacters",
+        "src/AliasCleaner.php",
+        "pathautoPunctuationCharsAlter",
+        "tests/modules/pathauto_custom_punctuation_test/src/Hook/PathautoCustomPunctuationTestHooks.php",
+        "Drupal hook pathauto_punctuation_chars_alter",
+        "AliasCleaner.getPunctuationCharacters PathautoCustomPunctuationTestHooks.pathautoPunctuationCharsAlter"
+      ]
+    ],
+    "extra": [
+      [
+        "PathautoGenerator",
+        "src/PathautoGenerator.php",
+        "AliasCleaner",
+        "src/AliasCleaner.php",
+        "Drupal service injection"
+      ],
+      [
+        "pathauto_update_8100",
+        "pathauto.install",
+        "AliasTypeManager",
+        "src/AliasTypeManager.php",
+        "Drupal service lookup"
+      ],
+      [
+        "service:pathauto.alias_cleaner",
+        "pathauto.services.yml",
+        "AliasCleaner",
+        "src/AliasCleaner.php",
+        "Drupal service implementation"
+      ],
+      [
+        "PathautoGenerator",
+        "src/PathautoGenerator.php",
+        "AliasUniquifier",
+        "src/AliasUniquifier.php",
+        "Drupal service injection"
+      ],
+      [
+        "Action:pathauto_update_alias",
+        "src/Plugin/Action/UpdateAction.php",
+        "UpdateAction",
+        "src/Plugin/Action/UpdateAction.php",
+        "Drupal plugin implementation"
+      ],
+      [
+        "getPunctuationCharacters",
+        "src/AliasCleaner.php",
+        "pathauto_custom_punctuation_test_pathauto_punctuation_chars_alter",
+        "tests/modules/pathauto_custom_punctuation_test/pathauto_custom_punctuation_test.module",
+        "Drupal hook pathauto_punctuation_chars_alter"
+      ]
+    ],
+    "negative": [
+      [
+        "/admin/config/search/path/patterns/add",
+        "pathauto.routing.yml",
+        "Drupal route handler",
+        "_entity_form"
+      ],
+      [
+        "buildForm",
+        "src/Form/PathautoBulkUpdateForm.php",
+        "Drupal plugin construction",
+        "createInstance($id)"
+      ]
+    ]
+  },
+  "commerce": {
+    "flows": [
+      [
+        "/cart",
+        "modules/cart/commerce_cart.routing.yml",
+        "cartPage",
+        "modules/cart/src/Controller/CartController.php",
+        "Drupal route handler",
+        "/cart CartController.cartPage"
+      ],
+      [
+        "/checkout/{commerce_order}/{step}",
+        "modules/checkout/commerce_checkout.routing.yml",
+        "formPage",
+        "modules/checkout/src/Controller/CheckoutController.php",
+        "Drupal route handler",
+        "/checkout/{commerce_order}/{step} CheckoutController.formPage"
+      ],
+      [
+        "/admin/commerce/orders/add",
+        "modules/order/commerce_order.routing.yml",
+        "buildForm",
+        "modules/order/src/Form/OrderAddForm.php",
+        "Drupal route handler",
+        "/admin/commerce/orders/add OrderAddForm.buildForm"
+      ]
+    ],
+    "extra": [
+      [
+        "CurrentCountry",
+        "src/CurrentCountry.php",
+        "ChainCountryResolver",
+        "src/Resolver/ChainCountryResolver.php",
+        "Drupal service injection"
+      ],
+      [
+        "Block:commerce_cart",
+        "modules/cart/src/Plugin/Block/CartBlock.php",
+        "CartBlock",
+        "modules/cart/src/Plugin/Block/CartBlock.php",
+        "Drupal plugin implementation"
+      ],
+      [
+        "commerce_cart_cron",
+        "modules/cart/commerce_cart.module",
+        "Cron",
+        "modules/cart/src/Cron.php",
+        "Drupal service lookup"
+      ],
+      [
+        "CurrentLocale",
+        "src/CurrentLocale.php",
+        "ChainLocaleResolver",
+        "src/Resolver/ChainLocaleResolver.php",
+        "Drupal service injection"
+      ],
+      [
+        "QueueWorker:commerce_cart_expiration",
+        "modules/cart/src/Plugin/QueueWorker/CartExpiration.php",
+        "CartExpiration",
+        "modules/cart/src/Plugin/QueueWorker/CartExpiration.php",
+        "Drupal plugin implementation"
+      ],
+      [
+        "addOrderItem",
+        "modules/cart/src/CartManager.php",
+        "displayAddToCartMessage",
+        "modules/cart/src/EventSubscriber/CartEventSubscriber.php",
+        "Drupal event commerce_cart.entity.add"
+      ]
+    ],
+    "negative": [
+      [
+        "/admin/commerce/config/products",
+        "modules/product/commerce_product.routing.yml",
+        "Drupal route handler",
+        "SystemController::systemAdminMenuBlockPage"
+      ]
+    ]
+  },
+  "drupal": {
+    "flows": [
+      [
+        "setAccount",
+        "core/lib/Drupal/Core/Session/AccountProxy.php",
+        "setDefaultTimeZone",
+        "core/modules/system/src/TimeZoneResolver.php",
+        "Drupal event account.set",
+        "AccountProxy.setAccount TimeZoneResolver.setDefaultTimeZone"
+      ],
+      [
+        "filterResponse",
+        "core/modules/big_pipe/src/Render/BigPipe.php",
+        "onResponse",
+        "core/lib/Drupal/Core/EventSubscriber/ActiveLinkResponseFilter.php",
+        "Drupal event Symfony\\Component\\HttpKernel\\KernelEvents::RESPONSE",
+        "BigPipe.filterResponse ActiveLinkResponseFilter.onResponse"
+      ],
+      [
+        "finish",
+        "core/lib/Drupal/Core/Config/ConfigImporter.php",
+        "onConfigImporterImport",
+        "core/lib/Drupal/Core/EventSubscriber/ConfigSnapshotSubscriber.php",
+        "Drupal event config.importer.import",
+        "ConfigImporter.finish ConfigSnapshotSubscriber.onConfigImporterImport"
+      ]
+    ],
+    "extra": [
+      [
+        "/admin/modules",
+        "core/modules/system/system.routing.yml",
+        "buildForm",
+        "core/modules/system/src/Form/ModulesListForm.php",
+        "Drupal route handler"
+      ],
+      [
+        "service:renderer",
+        "core/core.services.yml",
+        "Renderer",
+        "core/lib/Drupal/Core/Render/Renderer.php",
+        "Drupal service implementation"
+      ],
+      [
+        "ConfigActionManager",
+        "core/lib/Drupal/Core/Config/Action/ConfigActionManager.php",
+        "ConfigManager",
+        "core/lib/Drupal/Core/Config/ConfigManager.php",
+        "Drupal service injection"
+      ],
+      [
+        "_batch_page",
+        "core/includes/batch.inc",
+        "BatchStorage",
+        "core/lib/Drupal/Core/Batch/BatchStorage.php",
+        "Drupal service lookup"
+      ],
+      [
+        "_filter_url",
+        "core/modules/filter/filter.module",
+        "FilterUrl",
+        "core/modules/filter/src/Plugin/Filter/FilterUrl.php",
+        "Drupal plugin construction"
+      ],
+      [
+        "Filter:filter_url",
+        "core/modules/filter/src/Plugin/Filter/FilterUrl.php",
+        "FilterUrl",
+        "core/modules/filter/src/Plugin/Filter/FilterUrl.php",
+        "Drupal plugin implementation"
+      ],
+      [
+        "drupal_flush_all_caches",
+        "core/includes/common.inc",
+        "cacheFlush",
+        "core/modules/locale/src/Hook/LocaleHooks.php",
+        "Drupal hook cache_flush"
+      ]
+    ],
+    "negative": [
+      [
+        "invokeAllDeprecated",
+        "core/lib/Drupal/Core/Extension/ModuleHandler.php",
+        "Drupal hook ",
+        "invokeAll($hook"
+      ]
+    ]
+  }
+}
