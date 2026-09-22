@@ -28,7 +28,7 @@ export function validateManifest(raw: unknown, engineVersion?: string): PluginMa
 
 export function parsePackage(bytes: Uint8Array, engineVersion?: string): ExtensionPackage {
   if (bytes.length > MAX_PACKAGE_BYTES) throw new Error('Extension package exceeds 8 MiB');
-  const p = JSON.parse(new TextDecoder().decode(bytes)) as ExtensionPackage;
+  const p = JSON.parse(new TextDecoder('utf-8', { ignoreBOM: true }).decode(bytes)) as ExtensionPackage;
   if (p?.format !== 'codegraph-extension-1' || !p.package || typeof p.package.name !== 'string' ||
       !semver.valid(p.package.version) || !p.files || Array.isArray(p.files) || typeof p.files !== 'object') throw new Error('Invalid extension package');
   validateManifest(p.package.codegraph, engineVersion);

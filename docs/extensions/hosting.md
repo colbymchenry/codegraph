@@ -1,5 +1,7 @@
 # Hosting the extension marketplace
 
+Cloudflare is now the preferred hosted target. See [Cloudflare deployment and cost guidance](cloudflare-hosting.md). The Node/SQLite instructions below remain the portable backend reference; Vercel-specific instructions are historical alternatives, not the current delivery target.
+
 This branch supplies a Node registry and browser frontend. It does not provision a host, disk, backup service, TLS endpoint or Vercel project. A running local server or temporary HTTPS tunnel is not a durable deployment.
 
 ## Persistence contract

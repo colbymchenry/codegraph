@@ -6,6 +6,7 @@ CREATE TABLE releases (id TEXT NOT NULL, version TEXT NOT NULL, publisher TEXT N
 CREATE TABLE submissions (nonce TEXT PRIMARY KEY, created INTEGER NOT NULL);
 CREATE INDEX submissions_created ON submissions(created);
 CREATE TABLE rate_limits (key TEXT PRIMARY KEY, expires INTEGER NOT NULL, count INTEGER NOT NULL);
+CREATE INDEX rate_limits_expires ON rate_limits(expires);
 CREATE TRIGGER release_owner BEFORE INSERT ON releases BEGIN SELECT CASE WHEN (SELECT publisher FROM extensions WHERE id=NEW.id) != NEW.publisher THEN RAISE(ABORT,'Extension id belongs to another publisher') END; END;
 CREATE TRIGGER release_capacity BEFORE INSERT ON releases BEGIN SELECT CASE WHEN (SELECT count(*) FROM releases) >= 1000 THEN RAISE(ABORT,'Preview registry capacity reached; contact the operator') END; END;
 CREATE TRIGGER immutable_release BEFORE UPDATE ON releases BEGIN SELECT RAISE(ABORT,'Release versions are immutable'); END;

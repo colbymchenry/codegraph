@@ -34,6 +34,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- Prepare a Cloudflare marketplace backend with signed publication, immutable packages, persistent metadata and isolated recovery validation. Hosted setup remains a preview prerequisite.
+
 - Marketplace operators can preserve published extensions across service restarts and restore verified backups into an isolated registry.
 
 - **Codex and Astra read project guidance from `AGENTS.md`.** The canonical agent guide now lives in `AGENTS.md` (with a nested `docs/AGENTS.md` for long validation notes); `CLAUDE.md` is a thin `@AGENTS.md` wrapper for Claude Code. Codex/Astra no longer miss the old CLAUDE-only instructions.

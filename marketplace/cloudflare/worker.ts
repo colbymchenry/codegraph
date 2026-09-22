@@ -7,7 +7,12 @@ const headers = { 'X-Content-Type-Options':'nosniff', 'Referrer-Policy':'no-refe
   'Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'" };
 export const digest = async (bytes: BufferSource) => [...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(b=>b.toString(16).padStart(2,'0')).join('');
 export const objectKey = (hash:string) => 'packages/sha256/'+hash;
-function decodeBase64(value:string) { const raw=atob(value); return Uint8Array.from(raw,c=>c.charCodeAt(0)); }
+function decodeBase64(value:string) {
+  const raw=atob(value),bytes=new Uint8Array(raw.length);
+  // Avoid the temporary per-character array created by Uint8Array.from for 8 MiB packages.
+  for(let i=0;i<raw.length;i++)bytes[i]=raw.charCodeAt(i);
+  return bytes;
+}
 function json(status:number,data:unknown) { return Response.json(data,{status,headers:{...headers,'Cache-Control':'no-store'}}); }
 class InputError extends Error {}
 async function readBody(request:Request) {
