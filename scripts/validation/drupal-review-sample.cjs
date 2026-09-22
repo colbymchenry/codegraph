@@ -5,6 +5,8 @@ const {CodeGraph}=require('../../dist');
 const {ExtensionManager}=require('../../dist/plugins/manager');
 Object.assign(process.env,{CODEGRAPH_TELEMETRY:'0',CODEGRAPH_PARSE_WORKERS:'2',CODEGRAPH_RESOLVE_WORKERS:'0',CODEGRAPH_SYNTH_TIMINGS:'all'});
 const [project,mode,operation,output,artifact='dist/extensions/drupal.cgext']=process.argv.slice(2);
+const sourceRevision=cp.execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim();
+const sourceDirty=!!cp.execFileSync('git',['status','--porcelain'],{encoding:'utf8'}).trim();
 const hash=b=>crypto.createHash('sha256').update(b).digest('hex');
 function graphSnapshot(){const db=new DatabaseSync(path.join(project,'.codegraph/codegraph.db'),{readOnly:true});try{
  const nodes=db.prepare('SELECT * FROM nodes ORDER BY id').all().map(({updated_at,...n})=>n);
@@ -18,6 +20,6 @@ function graphSnapshot(){const db=new DatabaseSync(path.join(project,'.codegraph
  else {const graph=CodeGraph.isInitialized(project)?await CodeGraph.open(project):await CodeGraph.init(project);try{result=operation==='rebuild'?await graph.refreshPluginIndex():operation==='sync'?await graph.sync():await graph.indexAll();}finally{graph.close();}}
  assert.ok(!result?.filesErrored && result?.success!==false,JSON.stringify(result));
  const measured={wallMs:performance.now()-started,cpu:process.cpuUsage(cpu),resources:process.resourceUsage()};
- const record={revision:cp.execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(),dirty:!!cp.execFileSync('git',['status','--porcelain'],{encoding:'utf8'}).trim(),project,mode,operation,artifactSHA:mode==='external'?hash(fs.readFileSync(artifact)):null,node:process.version,platform:process.platform,...measured,graph:graphSnapshot()};
+ const record={revision:sourceRevision,dirty:sourceDirty,project,mode,operation,artifactSHA:mode==='external'?hash(fs.readFileSync(artifact)):null,node:process.version,platform:process.platform,...measured,graph:graphSnapshot()};
  fs.mkdirSync(path.dirname(output),{recursive:true});fs.writeFileSync(output,JSON.stringify(record,null,2));console.log(JSON.stringify(record));
 })().catch(e=>{console.error(e);process.exitCode=1;});

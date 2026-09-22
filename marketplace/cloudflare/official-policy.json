@@ -2,19 +2,36 @@
   "format": "codegraph-official-policy-1",
   "publisherId": "codegraph",
   "publisher": "CodeGraph",
-  "releases": [{
-    "id": "drupal",
-    "version": "0.1.0",
-    "packageName": "@colbymchenry/codegraph-drupal",
-    "sha256": "e5015747d02fe50d6af607b6c44f1db9cf7969a0070866ed03c7643377a459c8",
-    "bytes": 289167,
-    "repository": "https://github.com/colbymchenry/codegraph",
-    "sourceRevision": "37d4dd837120c1d56316c3cc65b6587b743a9112",
-    "sourcePath": "extensions/drupal/index.cjs",
-    "sourceSha256": "eb7688957a14edd36efd8c109283a7355ceb7dd8199987fe3264c3f37489e841",
-    "entrySha256": "0e6d117bab017fd4b0a6f09fe2289bf42c4b597548228be244b5729f7a022dd8",
-    "name": "Drupal",
-    "description": "Follow Drupal routes, services, hooks, plugins and events through your codebase.",
-    "readme": "Official CodeGraph Drupal extension preview. Routes and forms connect to their handlers; services connect to implementations and explicit injections; literal hooks and events connect to declared implementations.\n\nInstalling replaces the built-in Drupal resolver for this project. Requires CodeGraph >=1.6.0 <2 with extension support.\n\nComputed identifiers, missing external dependencies, ambiguous classes and unknown entity handlers remain unresolved. Broader Drupal coverage and performance review remain open."
-  }]
+  "releases": [
+    {
+      "id": "drupal",
+      "version": "0.1.0",
+      "packageName": "@colbymchenry/codegraph-drupal",
+      "sha256": "e5015747d02fe50d6af607b6c44f1db9cf7969a0070866ed03c7643377a459c8",
+      "bytes": 289167,
+      "repository": "https://github.com/colbymchenry/codegraph",
+      "sourceRevision": "37d4dd837120c1d56316c3cc65b6587b743a9112",
+      "sourcePath": "extensions/drupal/index.cjs",
+      "sourceSha256": "eb7688957a14edd36efd8c109283a7355ceb7dd8199987fe3264c3f37489e841",
+      "entrySha256": "0e6d117bab017fd4b0a6f09fe2289bf42c4b597548228be244b5729f7a022dd8",
+      "name": "Drupal",
+      "description": "Follow Drupal routes, services, hooks, plugins and events through your codebase.",
+      "readme": "Official CodeGraph Drupal extension preview. Routes and forms connect to their handlers; services connect to implementations and explicit injections; literal hooks and events connect to declared implementations.\n\nInstalling replaces the built-in Drupal resolver for this project. Requires CodeGraph >=1.6.0 <2 with extension support.\n\nComputed identifiers, missing external dependencies, ambiguous classes and unknown entity handlers remain unresolved. Broader Drupal coverage and performance review remain open."
+    },
+    {
+      "id": "drupal",
+      "version": "0.1.1",
+      "packageName": "@colbymchenry/codegraph-drupal",
+      "sha256": "e5ed73bee51524585e4f4da1d5017fdee3037a3fa71d8f08edab6c318fedc59a",
+      "bytes": 291889,
+      "repository": "https://github.com/colbymchenry/codegraph",
+      "sourceRevision": "b27bf875c95d3b82a0df411f68d0d8497993667b",
+      "sourcePath": "extensions/drupal/index.cjs",
+      "sourceSha256": "e9a5f13baaf0ba53ab17f0e348edd73ba91c80a11034746372c808eda8e3714d",
+      "entrySha256": "17aa1ea7feed33cb42e010d9eae15f4a07035987ced3b9cd0f6f39a2ee6adc91",
+      "name": "Drupal",
+      "description": "Follow Drupal routes, services, hooks, plugins and events through your codebase.",
+      "readme": "Official CodeGraph Drupal extension 0.1.1 preview. Rejects commented/quoted declarations and handles explicit legacy and modern Symfony event argument order. Routes and forms connect to their handlers; services connect to implementations and explicit injections; literal hooks and events connect to declared implementations.\n\nInstalling replaces the built-in Drupal resolver for this project. Requires CodeGraph >=1.6.0 <2 with extension support.\n\nComputed identifiers, missing external dependencies, ambiguous classes and unknown entity handlers remain unresolved. Broader Drupal coverage and performance review remain open."
+    }
+  ]
 }
