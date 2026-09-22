@@ -278,9 +278,19 @@ export class CodeGraph {
    *
    * POSIX-only in practice: `isReplacedOnDisk` never fires on Windows (an open
    * file can't be unlinked there, and st_ino is unreliable).
+   *
+   * Refuses (returns false) while an index/sync holds the index mutex: closing
+   * the handle that run is writing through would break it mid-flight. `sync()`
+   * performs the same check itself once it holds the mutex (#1902), so the
+   * replaced file is still picked up — by that sync, or by the caller's retry.
    */
   reopenIfReplaced(): boolean {
-    if (this.closed) return false;
+    if (this.closed || this.indexMutex.isLocked() || this.reopenPromise) return false;
+    return this.reopenReplacedDatabase();
+  }
+
+  /** Synchronous compatibility path; async server callers use the guarded open below. */
+  private reopenReplacedDatabase(): boolean {
     recoverExtensions(this.projectRoot);
     if (!this.db.isReplacedOnDisk()) return false;
     const dbPath = this.db.getPath();
@@ -1069,6 +1079,21 @@ export class CodeGraph {
       try {
         this.fileLock.acquire();
       } catch {
+        return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
+      }
+      // A full rebuild in another process (`codegraph index` → recreate)
+      // unlinks the database and creates a new file at the same path. A
+      // long-lived instance — the MCP daemon's watcher — would otherwise keep
+      // "syncing" into the dead inode, and nothing it wrote there is visible
+      // to anyone (#1902). Follow the path before writing (one stat), and
+      // widen a scoped sync to a full one: whatever the old handle absorbed
+      // since the rebuild is gone, so the new file has to be reconciled whole.
+      // If the reopen fails (the rebuild is mid-way), report the lock-busy
+      // shape so the watcher keeps its pending files and retries.
+      try {
+        if (this.reopenReplacedDatabase()) options = { ...options, paths: undefined };
+      } catch {
+        this.fileLock.release();
         return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
       }
       // Defer WAL auto-checkpointing for the whole incremental run, exactly
