@@ -80,6 +80,27 @@ describe('a schema-less codegraph.db is not an initialized project (#1895)', () 
     expect(planFrontload(child, 'how does alpha call beta').exploreRoot).toBeNull();
   });
 
+  // Root ignores mode bits and Windows has no chmod-based directory permissions.
+  const canDenyWrite = process.platform !== 'win32' && process.getuid?.() !== 0;
+  it.runIf(canDenyWrite)('fails OPEN: a WAL db in a directory we cannot open read-only is still initialized', async () => {
+    // SQLite needs to create `-shm` to open a WAL database; with the directory
+    // non-writable the read-only open throws. That is a database we cannot
+    // inspect, not a schema-less one — it must keep resolving (#1913 review).
+    await indexProject(parent);
+    const src = path.join(parent, '.codegraph', 'codegraph.db');
+    const other = path.join(tmp, 'other');
+    fs.mkdirSync(path.join(other, '.codegraph'), { recursive: true });
+    fs.copyFileSync(src, path.join(other, '.codegraph', 'codegraph.db'));
+    const dir = path.join(other, '.codegraph');
+    fs.chmodSync(dir, 0o555);
+    try {
+      expect(isInitialized(other)).toBe(true);
+      expect(findNearestCodeGraphRoot(path.join(other, 'sub'))).toBe(other);
+    } finally {
+      fs.chmodSync(dir, 0o755);
+    }
+  });
+
   it('a real index still resolves upward from a subdirectory', async () => {
     await indexProject(parent);
     expect(isInitialized(parent)).toBe(true);
