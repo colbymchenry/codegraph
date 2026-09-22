@@ -17,6 +17,12 @@ export function checkVersion(c,version) {
  const b=version.resources?.bindings||[];
  if(!b.some(x=>x.name==='DB'&&x.type==='d1'&&(x.id||x.database_id)===c.d1_databases[0].database_id)||!b.some(x=>x.name==='PACKAGES'&&x.type==='r2_bucket'&&x.bucket_name===c.r2_buckets[0].bucket_name)||!b.some(x=>x.name==='PUBLISHING_ENABLED'&&x.text==='false')||b.some(x=>!['DB','PACKAGES','PUBLISHING_ENABLED','ASSETS'].includes(x.name)))throw Error('Live deployment bindings/publication state differ from reviewed target');
 }
+export function latestDeployment(deployments) {
+ if(!Array.isArray(deployments)||!deployments.length||deployments.some(x=>!Number.isFinite(Date.parse(x.created_on))))throw Error('Cannot establish current deployment timestamp');
+ const ordered=[...deployments].sort((a,b)=>Date.parse(b.created_on)-Date.parse(a.created_on));
+ if(ordered[1]&&Date.parse(ordered[0].created_on)===Date.parse(ordered[1].created_on))throw Error('Ambiguous current deployment');
+ return ordered[0];
+}
 export async function connect(configPath,configHash,{detached=false}={}) {
  const c=reviewedConfig(configPath,configHash);
  const cli=path.join(here,'node_modules/wrangler/bin/wrangler.js');
@@ -26,7 +32,7 @@ export async function connect(configPath,configHash,{detached=false}={}) {
  try{deployments=command('deployments','list');}catch(e){if(!detached||!String(e.stderr).includes('10007'))throw Error('Cannot verify live deployment; no binding operation started');deployments=[];}
  let version;
  if(detached){if(!/-restore(?:-|$)/.test(c.name)||deployments.length)throw Error('Restore must use a new detached restore Worker name');}
- else {const current=deployments[0];if(current?.versions?.length!==1||current.versions[0].percentage!==100)throw Error('Require one fully deployed version');version=command('versions','view',current.versions[0].version_id);checkVersion(c,version);}
+ else {const current=latestDeployment(deployments);if(current?.versions?.length!==1||current.versions[0].percentage!==100)throw Error('Require one fully deployed version');version=command('versions','view',current.versions[0].version_id);checkVersion(c,version);}
  const proxy=await getPlatformProxy({configPath,remoteBindings:true,persist:false});
  return {c,db:proxy.env.DB,bucket:proxy.env.PACKAGES,version,close:()=>proxy.dispose()};
 }
