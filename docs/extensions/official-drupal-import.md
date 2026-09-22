@@ -4,9 +4,16 @@ The Cloudflare registry's public `/api/publish` endpoint cannot assign official 
 
 ## Trust and immutable publication
 
-`marketplace/cloudflare/official-policy.json` is a reviewed allowlist, committed alongside the operator. It pins Drupal `0.1.0`, package name, exact 289,167-byte artifact SHA-256, bundled entry hash, source repository/revision/path/hash and official metadata. The trusted identity is `publisherId: codegraph`, display name `CodeGraph`; it is distinct from the 64-hex SPKI identities assigned by community signatures. The policy is an operator trust decision anchored in reviewed source, **not a claim of a new signed upstream release**. Changing the policy requires review and a new immutable version when bytes change.
+`marketplace/cloudflare/official-policy.json` is a reviewed allowlist, committed alongside the operator. It retains Drupal `0.1.0` unchanged and adds the reviewed `0.1.1` accuracy revision. Each entry pins package name, version, byte length, artifact SHA-256, bundled entry hash, source repository/revision/path/hash and official metadata. The trusted identity is `publisherId: codegraph`, display name `CodeGraph`; it is distinct from the 64-hex SPKI identities assigned by community signatures. The policy is an operator trust decision anchored in reviewed source, **not a claim of a new signed upstream release**. Changing the policy requires review and a new immutable version when bytes change.
 
-Artifact provenance: `dist/extensions/drupal.cgext` SHA-256 `e5015747d02fe50d6af607b6c44f1db9cf7969a0070866ed03c7643377a459c8`; source `extensions/drupal/index.cjs` at `37d4dd837120c1d56316c3cc65b6587b743a9112`. The existing `node scripts/build-extensions.mjs` build is reproducible with repository-locked dependencies. The command validates the complete artifact, supported extension API and the target engine version before any write, then enforces the pinned identity/integrity/entry provenance.
+Artifact provenance:
+
+| Version | Artifact | SHA-256 | Reviewed source |
+|---|---|---|---|
+| 0.1.0 | `dist/extensions/drupal-0.1.0.cgext` (289,167 bytes) | `e5015747d02fe50d6af607b6c44f1db9cf7969a0070866ed03c7643377a459c8` | `37d4dd837120c1d56316c3cc65b6587b743a9112` |
+| 0.1.1 | `dist/extensions/drupal-0.1.1.cgext` (291,889 bytes); also current `drupal.cgext` | `e5ed73bee51524585e4f4da1d5017fdee3037a3fa71d8f08edab6c318fedc59a` | `b27bf875c95d3b82a0df411f68d0d8497993667b` |
+
+The build preserves the archived 0.1.0 package under `extensions/drupal/releases/` and copies it byte-for-byte. `node scripts/build-extensions.mjs` builds 0.1.1 with repository-locked dependencies. The command validates the complete artifact, supported extension API and target engine before any write, then enforces pinned identity/integrity/entry provenance. Publish 0.1.1 as a new version; never replace 0.1.0. Both can coexist and repeated identical imports are idempotent.
 
 Each plan includes an explicit registry identity and destination. `apply` requires the SHA-256 of the exact reviewed plan and validates its fields against the policy again. A different registry, unsupported engine, malformed artifact, changed plan, unexpected package or digest mismatch fails without publication. Plans and receipts contain public metadata and paths; credentials are never placed in either.
 
@@ -80,4 +87,4 @@ PLAYWRIGHT_MODULE=/absolute/path/to/playwright PATHAUTO_CORPUS=/absolute/pinned/
 
 The browser test exports clean Pathauto source at `b97aadf47a37cff25f7d6105c3dade6778fccb47` into a disposable project. It uses the real CLI and local workerd/D1/R2, connects the browser once, clicks Install once, and verifies two route handlers, one hook and one service injection in actual SQLite. It proves malformed/incompatible/tampered failure preservation, disable/enable/remove cleanup, official catalog/detail/filter, and desktop/mobile layout. It does not modify the source corpus or rerun the larger corpus benchmark.
 
-[Hosting/cost limits](cloudflare-hosting.md) remain unchanged: no durable Cloudflare URL, provider persistence, remote backup proof or Free-plan CPU fit is established. `marketplace.getcodegraph.com` remains proposed. Broader Drupal accuracy/performance review and current integrated full regression remain later milestones; historical measured overhead is 22–30%.
+[Hosting/cost limits](cloudflare-hosting.md) remain unchanged: no durable Cloudflare URL, provider persistence, remote backup proof or Free-plan CPU fit is established. `marketplace.getcodegraph.com` remains proposed. The Drupal review evidence is recorded separately; historical measured rebuild overhead was 22–30%, and local rebuild timings do not establish Workers Free CPU suitability.

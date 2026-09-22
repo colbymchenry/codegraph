@@ -17,6 +17,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Extension preview
 
+- Prepare immutable Drupal extension 0.1.1: ignore unrelated static receivers and commented/quoted declarations, and resolve both explicit Symfony event argument orders. Preserve the reviewed 0.1.0 artifact and policy.
+- Keep installed and selected marketplace versions distinct while compatibility metadata refreshes; pending requests no longer display an incompatible catalog version as installed.
+
 - Add project-scoped framework and semantic extensions, managed package installation, worker loading, and graph refresh on install/update/enable/disable/remove. Failed activation preserves the previous project configuration and graph.
 - Add an external Drupal extension for declared routes/forms, services, hooks, plugins and event subscribers. Literal route paths can be explore endpoints; extension edges retain their labels and registration sites. Comments and quoted examples do not count as PHP invocations.
 - Add a local marketplace preview with signed publisher submissions, immutable releases, publisher ownership checks and a companion connection for project selection. Mobile detail pages retain version, compatibility and source information. Hosted deployment remains follow-up work; this is not a release announcement.

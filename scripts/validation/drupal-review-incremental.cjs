@@ -15,7 +15,7 @@ function snapshot(){const db=new DatabaseSync(path.join(project,'.codegraph/code
    for(const file of files)assert.ok(!fs.existsSync(path.join(project,file)));
    fs.writeFileSync(path.join(project,files[0]),`<?php
 namespace Drupal\\review;
-class ReviewSubscriber { public static function getSubscribedEvents() { return ['review.convergence' => 'onReview']; } public function onReview($event) {} }
+class ReviewSubscriber implements \\Symfony\\Component\\EventDispatcher\\EventSubscriberInterface { public static function getSubscribedEvents() { return ['review.convergence' => 'onReview']; } public function onReview($event) {} }
 class ReviewDispatch { public function send($dispatcher,$event) { $dispatcher->dispatch('review.convergence', $event); } }
 `);
    fs.writeFileSync(path.join(project,files[1]),"review.route:\n  path: '/__review_unknown'\n  defaults:\n    _controller: '\\Missing\\Unknown::missing'\n");
