@@ -10,7 +10,7 @@ const { startMarketplaceServer } = require('../../dist/plugins/marketplace');
 const { startExtensionBridge } = require('../../dist/plugins/bridge');
 process.env.CODEGRAPH_TELEMETRY = '0';
 process.env.CODEGRAPH_PARSE_WORKERS = '2';
-const out = path.resolve('.qa/recovery/browser'); fs.mkdirSync(out, { recursive: true });
+const out = path.resolve(process.env.BROWSER_OUTPUT || '.qa/recovery/browser'); fs.mkdirSync(out, { recursive: true });
 const checks = [];
 const safeError = error => String(error.stack || error).replace(/token=[a-f0-9]+/g, 'token=[redacted]');
 function artifact(version, broken = false) {

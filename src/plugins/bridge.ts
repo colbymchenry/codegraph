@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { ExtensionManager, downloadPackage, type ExtensionProgress } from './manager';
+import { validateExtensionId } from './releases';
 import { version } from '../../package.json';
 
 export interface BridgeHandle { url: string; connectionUrl: string; close(): Promise<void> }
@@ -44,7 +45,7 @@ export async function startExtensionBridge(roots: string[], marketplace: string,
     const supplied = Buffer.from(req.headers.authorization?.replace(/^Bearer /, '') ?? '');
     if (supplied.length !== token.length || !timingSafeEqual(supplied, Buffer.from(token))) { reply(401, { error: 'Connect CodeGraph first' }); return; }
     if (req.method === 'GET' && route === '/status') {
-      reply(200, { version, projects: projects.map((p, i) => ({ ...p, extensions: managers[i]!.list() })), progress, jobId, busy: !!job, error: failure }); return;
+      reply(200, { version, apiVersion: 1, projects: projects.map((p, i) => ({ ...p, extensions: managers[i]!.list() })), progress, jobId, busy: !!job, error: failure }); return;
     }
     if (req.method !== 'POST' || route !== '/command') { reply(404, { error: 'Unknown command' }); return; }
     if (job) { reply(409, { error: 'An operation is already running' }); return; }
@@ -54,9 +55,18 @@ export async function startExtensionBridge(roots: string[], marketplace: string,
       const command = JSON.parse(body);
       const index = projects.findIndex(p => p.id === command.project);
       if (index < 0) throw new Error('Unknown destination');
-      if (!['install', 'update', 'disable', 'enable', 'remove'].includes(command.action)) throw new Error('Unknown operation');
+      if (!['resolve', 'install', 'update', 'disable', 'enable', 'remove'].includes(command.action)) throw new Error('Unknown operation');
+      if (command.action === 'resolve') {
+        validateExtensionId(command.id);
+        reply(200, await managers[index]!.resolve({ registry: market.origin, id: command.id, version: command.version, update: command.update === true })); return;
+      }
       if (['install', 'update'].includes(command.action)) {
-        if (typeof command.url !== 'string' || new URL(command.url).origin !== market.origin || !/^[a-f0-9]{64}$/.test(command.integrity)) throw new Error('Expected a pinned release from this marketplace');
+        if (command.url !== undefined) {
+          if (typeof command.url !== 'string' || new URL(command.url).origin !== market.origin || !/^[a-f0-9]{64}$/.test(command.integrity)) throw new Error('Expected a pinned release from this marketplace');
+        } else {
+          validateExtensionId(command.id);
+          if (command.selected !== undefined && (typeof command.selected?.version !== 'string' || !/^[a-f0-9]{64}$/.test(command.selected?.integrity))) throw new Error('Invalid selected release');
+        }
         if (command.replaces !== undefined && (!Array.isArray(command.replaces) || command.replaces.some((v: unknown) => typeof v !== 'string'))) throw new Error('Invalid replacement list');
       } else if (typeof command.id !== 'string') throw new Error('Extension id required');
       const manager = managers[index]!;
@@ -64,8 +74,11 @@ export async function startExtensionBridge(roots: string[], marketplace: string,
       progress = { state: 'downloading', message: 'Preparing extension operation' };
       job = (async () => {
         if (command.action === 'install' || command.action === 'update') {
-          const bytes = await downloadPackage(command.url, market.origin);
-          await manager.install({ bytes, integrity: command.integrity, source: command.url, replaces: command.replaces });
+          if (command.url !== undefined) {
+            const bytes = await downloadPackage(command.url, market.origin);
+            await manager.install({ bytes, integrity: command.integrity, source: command.url, replaces: command.replaces });
+          } else await manager.installFromRegistry({ registry: market.origin, id: command.id, version: command.version,
+            update: command.action === 'update', selected: command.selected, replaces: command.replaces });
         } else if (command.action === 'remove') await manager.remove(command.id);
         else await manager.setEnabled(command.id, command.action === 'enable');
       })().catch(err => { failure = String(err); progress = { state: 'failed', message: failure }; }).finally(() => { job = undefined; });

@@ -6,9 +6,17 @@ import { clearProjectConfigCache, loadPluginEntries } from '../project-config';
 import { packageDigest, parsePackage, sha256, MAX_PACKAGE_BYTES } from './package';
 import { pluginDirectory } from './loader';
 import type { PluginEntry } from './api';
+import * as semver from 'semver';
+import { resolveRelease, validateExtensionId, type ExtensionRelease } from './releases';
 
 export interface ExtensionProgress { state: 'downloading' | 'installing' | 'indexing' | 'ready' | 'failed'; message: string }
-export interface InstallRequest { bytes: Buffer; source?: string; integrity?: string; replaces?: string[] }
+export interface InstallRequest { bytes: Buffer; source?: string; integrity?: string; replaces?: string[]; expected?: { id: string; version: string }; automatic?: boolean }
+
+export interface RegistryRequest {
+  registry: string; id: string; version?: string; update?: boolean; replaces?: string[];
+  /** Optional preview binding: refuse a catalog change after the user saw a selection. */
+  selected?: { version: string; integrity: string };
+}
 
 export function atomicWrite(file: string, data: string): void {
   const temp = file + '.' + randomUUID() + '.tmp';
@@ -39,13 +47,40 @@ export class ExtensionManager {
   }
   list(): PluginEntry[] { return loadPluginEntries(this.root); }
 
+  async resolve(request: RegistryRequest): Promise<ExtensionRelease> {
+    validateExtensionId(request.id);
+    const current = this.list().find(e => e.name === `managed:${request.id}`);
+    if (request.update && !current) throw new Error(`${request.id} is not installed in this destination`);
+    const registry = new URL(request.registry);
+    if (registry.username || registry.password) throw new Error('Registry URL must not contain credentials');
+    const url = new URL(`/api/extensions/${request.id}`, registry);
+    const raw = JSON.parse((await downloadPackage(url.href)).toString('utf8'));
+    return resolveRelease(raw, request.id, { engineVersion, version: request.version,
+      currentVersion: request.version === undefined ? current?.version : undefined });
+  }
+
+  async installFromRegistry(request: RegistryRequest): Promise<PluginEntry> {
+    this.onProgress({ state: 'downloading', message: `Resolving ${request.id} for CodeGraph ${engineVersion} (API 1)` });
+    const release = await this.resolve(request);
+    if (request.selected && (request.selected.version !== release.version || request.selected.integrity !== release.integrity)) throw new Error('Compatible release changed since selection. Refresh the marketplace and try again.');
+    const url = new URL(`/api/download/${request.id}/${encodeURIComponent(release.version)}`, request.registry);
+    const bytes = await downloadPackage(url.href);
+    return this.install({ bytes, source: url.href, integrity: release.integrity, replaces: request.replaces,
+      expected: { id: request.id, version: release.version }, automatic: request.version === undefined });
+  }
+
   async install(request: InstallRequest): Promise<PluginEntry> {
     const p = parsePackage(request.bytes, engineVersion);
+    if (request.expected && (p.package.codegraph.id !== request.expected.id || p.package.version !== request.expected.version)) throw new Error('Downloaded extension identity/version does not match the selected release');
     const integrity = sha256(request.bytes);
     if (request.integrity && request.integrity !== integrity) throw new Error('Downloaded extension integrity does not match its release');
     const entry: PluginEntry = { name: `managed:${p.package.codegraph.id}`, version: p.package.version, integrity,
       enabled: true, replaces: request.replaces ?? [], ...(request.source ? { source: request.source } : {}) };
     await this.change(async entries => {
+      // Recheck under the operation lock: another completed install may have
+      // advanced the destination while registry metadata was being fetched.
+      const installed = entries.find(e => e.name === entry.name);
+      if (request.automatic && installed?.version && (!semver.valid(installed.version) || semver.lt(p.package.version, installed.version))) throw new Error(`Automatic install would downgrade installed ${installed.version}; request an exact version explicitly`);
       this.onProgress({ state: 'installing', message: `Installing ${p.package.codegraph.id} ${p.package.version}` });
       const packages = path.join(pluginDirectory(this.root), 'packages');
       fs.mkdirSync(packages, { recursive: true, mode: 0o700 });

@@ -23,12 +23,21 @@ export function registerExtensionCommands(program: Command): void {
     console.log(JSON.stringify(new ExtensionManager(options.path).list(), null, 2));
   });
   for (const action of ['install', 'update']) extensions.command(`${action} <package>`)
-    .description('Install a .cgext package or HTTPS release; extension code runs with your permissions')
+    .description('Install an exact .cgext file/URL, or resolve an id with --registry; extension code runs with your permissions')
     .option('--path <path>', 'Project directory', '.')
+    .option('--registry <url>', 'Resolve the package argument as an extension id from this registry')
+    .option('--version <version>', 'Exact registry version (required to opt into a prerelease); never substitutes')
     .option('--replaces <frameworks>', 'Explicitly replace comma-separated built-in resolvers')
     .action(async (source, options) => {
+      const manager = new ExtensionManager(options.path, p => console.error(`${p.state}: ${p.message}`));
+      if (options.registry) {
+        const installed = await manager.installFromRegistry({ registry: options.registry, id: source, version: options.version,
+          update: action === 'update', replaces: options.replaces?.split(',') });
+        console.log(`Installed ${source} ${installed.version}`); return;
+      }
+      if (options.version) throw new Error('--version requires --registry; file and URL installs already select an exact artifact');
       const bytes = /^https?:/.test(source) ? await downloadPackage(source) : fs.readFileSync(path.resolve(source));
-      await new ExtensionManager(options.path, p => console.error(`${p.state}: ${p.message}`)).install({ bytes,
+      await manager.install({ bytes,
         source: /^https?:/.test(source) ? source : undefined, replaces: options.replaces?.split(',') });
     });
   for (const action of ['disable', 'enable', 'remove']) extensions.command(`${action} <id>`)

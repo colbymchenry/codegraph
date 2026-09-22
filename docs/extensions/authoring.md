@@ -187,3 +187,47 @@ Do not deploy or publish to npm as part of this author exercise. Other preview
 gaps remain: compatible-version fallback, crash/stale-lock recovery and broader
 Drupal accuracy/performance review. The prior Drupal sample measured about
 22–30% rebuild overhead versus the built-in resolver; it is not a general SLA.
+
+
+## Select compatible registry releases
+
+The connected local engine selects the highest stable semantic version matching
+its own CodeGraph version and extension API, independent of publication time.
+The marketplace shows that selected version and destination before enabling
+Install. Switching destinations refreshes the selection. An incompatible latest
+release does not prevent installation of an older compatible release. A missing,
+invalid or unsupported API marker is not assumed compatible.
+
+The same selection is available without a browser:
+
+```sh
+codegraph extensions install python-events --registry http://127.0.0.1:PORT --path /absolute/path/python-app
+codegraph extensions update python-events --registry http://127.0.0.1:PORT --path /absolute/path/python-app
+codegraph extensions install python-events --registry http://127.0.0.1:PORT --version 0.1.0 --path /absolute/path/python-app
+```
+
+Use the actual registry origin in place of the example URL. Remote registries
+must use HTTPS; loopback HTTP is supported for development. `--registry` makes
+the positional argument an extension ID. Without it, the argument remains an
+exact package file or URL; `--version` is rejected for those artifact inputs.
+
+Automatic selection never adopts prereleases or downgrades an installed
+version. Opt into a preview using an exact `--version 0.2.0-beta.1` pin. Exact
+pins may intentionally select an older version, but must still match the
+running engine and supported API; they never fall back. Semver engine ranges
+use standard prerelease exclusion rules, so an engine preview must be explicitly
+allowed by the package range. Build metadata does not change semver precedence;
+equal-precedence versions have a deterministic lexical tie break.
+
+No compatible release leaves the current configuration and graph unchanged and
+reports the rejected ranges/APIs. Catalogs are selection hints: the local
+installer rechecks the downloaded package ID, version, engine/API compatibility
+and SHA-256 digest. A changed browser selection must be refreshed before
+installing. Failed activation still rolls back the configuration and graph.
+
+The companion's authenticated `resolve` command accepts `project`, `id`, and an
+optional exact `version`. Registry `install`/`update` commands use the same fields
+and may bind the displayed selection via `selected: { version, integrity }`.
+They resolve only against the connected marketplace. Existing exact `url` plus
+`integrity` commands keep their artifact semantics. All commands retain the
+origin, window, local-host and bearer checks.

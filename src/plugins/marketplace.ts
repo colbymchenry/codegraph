@@ -2,6 +2,7 @@
 import * as http from 'node:http';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as semver from 'semver';
 import { createPublicKey, verify, type JsonWebKey } from 'node:crypto';
 import { createDatabase } from '../db/sqlite-adapter';
 import { parsePackage, sha256, MAX_PACKAGE_BYTES } from './package';
@@ -13,7 +14,7 @@ interface Submission {
 }
 interface Listing {
   id: string; name: string; description: string; publisher: string; publisherId: string;
-  official: boolean; version: string; engines: string; capabilities: string[]; integrity: string;
+  official: boolean; version: string; apiVersion: number; engines: string; capabilities: string[]; integrity: string;
   readme: string; source: string; publishedAt: string;
 }
 export function createMarketplaceStore(database: string) {
@@ -27,7 +28,7 @@ export function createMarketplaceStore(database: string) {
     const id = pkg.codegraph.id;
     const listing: Listing = { id, version: pkg.version, name: details.name, description: details.description,
       publisherId: details.publisherId, publisher: details.publisher, official: details.official === true,
-      readme: details.readme, source: details.source, engines: pkg.codegraph.engines ?? '*',
+      readme: details.readme, source: details.source, apiVersion: pkg.codegraph.apiVersion, engines: pkg.codegraph.engines ?? '*',
       capabilities: pkg.codegraph.capabilities, integrity: sha256(bytes), publishedAt: new Date().toISOString() };
     db.transaction(() => {
       const owner = db.prepare('SELECT publisher FROM extensions WHERE id = ?').get(id) as { publisher: string } | undefined;
@@ -36,6 +37,17 @@ export function createMarketplaceStore(database: string) {
       db.prepare('INSERT INTO releases VALUES (?,?,?,?,?)').run(id, pkg.version, JSON.stringify(listing), bytes, Date.now());
     })();
     return listing;
+  }
+  // Old persisted listings predate apiVersion. Recover it from their immutable
+  // package, never guess that a missing API marker is supported.
+  function listings(id?: string): Listing[] {
+    const rows = (id === undefined ? db.prepare('SELECT listing, bytes FROM releases').all() :
+      db.prepare('SELECT listing, bytes FROM releases WHERE id=?').all(id)) as { listing: string; bytes: Uint8Array }[];
+    return rows.map(row => {
+      const listing = JSON.parse(row.listing) as Listing;
+      if (listing.apiVersion === undefined) listing.apiVersion = parsePackage(Buffer.from(row.bytes)).package.codegraph.apiVersion;
+      return listing;
+    }).sort((a, b) => Number(!!semver.prerelease(a.version)) - Number(!!semver.prerelease(b.version)) || semver.rcompare(a.version, b.version) || a.version.localeCompare(b.version));
   }
   return {
     close: () => db.close(),
@@ -48,12 +60,11 @@ export function createMarketplaceStore(database: string) {
         readme: 'Understand the framework connections that ordinary function calls cannot show.\n\nRoutes and forms connect to their handlers. Service definitions connect to implementations and explicit injected services. Documented procedural hooks and Hook attributes connect to literal invocations. Plugin annotations and attributes identify implementations. Literal event dispatch connects to declared subscribers.\n\nInstall replaces the built-in Drupal resolver for this project. Requires CodeGraph 1.6.0 with extension support (preview build).\n\nComputed identifiers, external dependencies outside your index, ambiguous classes and unknown entity handlers remain unresolved. New programming languages and PHP branch-condition analysis are outside this extension API.' });
     },
     list(): Listing[] {
-      const rows = db.prepare('SELECT listing FROM releases ORDER BY created DESC').all() as { listing: string }[];
       const seen = new Set<string>();
-      return rows.map(r => JSON.parse(r.listing) as Listing).filter(l => { if (seen.has(l.id)) return false; seen.add(l.id); return true; });
+      return listings().filter(l => { if (seen.has(l.id)) return false; seen.add(l.id); return true; });
     },
     releases(id: string): Listing[] {
-      return (db.prepare('SELECT listing FROM releases WHERE id=? ORDER BY created DESC').all(id) as { listing: string }[]).map(r => JSON.parse(r.listing));
+      return listings(id);
     },
     download(id: string, version: string): Buffer | undefined {
       const row = db.prepare('SELECT bytes FROM releases WHERE id=? AND version=?').get(id, version) as { bytes: Uint8Array } | undefined;
@@ -99,7 +110,7 @@ export async function startMarketplaceServer(options: { database: string; public
       if (req.method === 'GET' && release) { json(200, store.releases(release[1]!)); return; }
       const download = /^\/api\/download\/([a-z0-9-]+)\/([^/]+)$/.exec(url.pathname);
       if (req.method === 'GET' && download) {
-        const bytes = store.download(download[1]!, download[2]!);
+        const bytes = store.download(download[1]!, decodeURIComponent(download[2]!));
         if (!bytes) { json(404, { error: 'Release not found' }); return; }
         res.writeHead(200, { 'Content-Type': 'application/vnd.codegraph.extension+json', 'Content-Length': bytes.length,
           'Cache-Control': 'public, max-age=31536000, immutable', 'Content-Disposition': `attachment; filename="${download[1]}-${download[2]}.cgext"` });
