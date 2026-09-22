@@ -22,7 +22,7 @@ for (const root of roots) {
 createExtensionProject(author, 'compatible-demo');
 const original = fs.readFileSync(path.join(author, 'index.cjs'), 'utf8');
 const keys = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
-let server, bridge, browser, page, registry;
+let server, bridge, browser, page, registry, https;
 async function publish(version, engines = '>=1.6.0 <2', id = 'compatible-demo', broken = false) {
   const pkg = JSON.parse(fs.readFileSync(path.join(author, 'package.json'), 'utf8'));
   pkg.version = version; pkg.codegraph.id = id; pkg.codegraph.engines = engines;
@@ -63,6 +63,7 @@ async function cli(args, expected = 0) {
   try {
     server = await startMarketplaceServer({ database: path.join(lab, 'registry.db'), publicDirectory: path.join(repo, 'marketplace/public') });
     registry = `http://127.0.0.1:${server.port}`;
+    if (process.env.REGISTRY_TEST_HTTPS === '1') { https = await require('./https-marketplace.cjs').httpsMarketplace(server.port, out); registry = https.origin; }
     // Publication order intentionally differs from semantic order; previews and
     // a newer incompatible release must never displace the compatible stable one.
     const pinned = await publish('1.10.0'); await publish('1.9.0'); await publish('0.5.0');
@@ -78,6 +79,7 @@ async function cli(args, expected = 0) {
     page.setDefaultTimeout(60000);
     const errors = []; page.on('pageerror', e => errors.push(e.message));
     await page.goto(bridge.connectionUrl);
+    if (https) assert.equal(await page.evaluate(() => isSecureContext), true);
     const popupWait = page.waitForEvent('popup'); await page.locator('#connect').click(); const popup = await popupWait;
     await popup.getByRole('button', { name: 'Allow connection' }).click();
     await page.getByText('CodeGraph connected', { exact: true }).waitFor();
@@ -165,5 +167,5 @@ async function cli(args, expected = 0) {
   } catch (error) {
     await page?.screenshot({ path: path.join(out, 'failure.png'), fullPage: true }).catch(() => {});
     fs.writeFileSync(path.join(out, 'failure.json'), JSON.stringify({ checks, error: String(error.stack).replace(/token=[a-f0-9]+/g, 'token=[redacted]') }, null, 2)); throw error;
-  } finally { await browser?.close(); await bridge?.close(); await server?.close(); fs.rmSync(lab, { recursive: true, force: true }); }
+  } finally { await browser?.close(); await https?.close(); await bridge?.close(); await server?.close(); fs.rmSync(lab, { recursive: true, force: true }); }
 })().catch(error => { console.error(String(error.stack).replace(/token=[a-f0-9]+/g, 'token=[redacted]')); process.exitCode = 1; });

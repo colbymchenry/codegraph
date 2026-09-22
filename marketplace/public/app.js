@@ -22,9 +22,13 @@ function toast(message) {
   clearTimeout(toast.timer); toast.timer = setTimeout(() => { el.hidden = true; }, 6000);
 }
 async function api(path, options) {
-  const response = await fetch(path, options);
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || 'Request failed');
+  let response;
+  try { response = await fetch(path, options); }
+  catch { throw new Error('Cannot reach the marketplace registry. Check your connection and try again.'); }
+  let data;
+  try { data = await response.json(); }
+  catch { throw new Error(`Marketplace registry unavailable (HTTP ${response.status}). Try again shortly.`); }
+  if (!response.ok) throw new Error(data.error || `Marketplace registry unavailable (HTTP ${response.status}). Try again shortly.`);
   return data;
 }
 function project() { return state.snapshot?.projects.find(p => p.id === state.project); }

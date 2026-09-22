@@ -42,9 +42,10 @@ async function run(name, command, args, timeout = 360000, overrides = {}) {
   if (built) {
     await run('marketplace-build', ...npmCommand(['run', 'build', '--prefix', 'marketplace']));
     await run('focused', process.execPath, ['node_modules/vitest/vitest.mjs', 'run',
-      '__tests__/foundation.test.ts', '__tests__/extension-trust.test.ts', '__tests__/extension-releases.test.ts', '__tests__/extension-marketplace.test.ts', '__tests__/extension-author.test.ts', '__tests__/plugins.test.ts', '__tests__/extension-explore.test.ts',
+      '__tests__/marketplace-storage.test.ts', '__tests__/foundation.test.ts', '__tests__/extension-trust.test.ts', '__tests__/extension-releases.test.ts', '__tests__/extension-marketplace.test.ts', '__tests__/extension-author.test.ts', '__tests__/plugins.test.ts', '__tests__/extension-explore.test.ts',
       '__tests__/db-reopen-on-replace.test.ts', '__tests__/status-json.test.ts', '__tests__/sync.test.ts', '__tests__/concurrent-locking.test.ts',
       '--maxWorkers=2', '--minWorkers=1', '--reporter=default', '--reporter=json', `--outputFile.json=${path.join(out, 'focused.json')}`]);
+    await run('registry-storage', process.execPath, ['scripts/validation/marketplace-storage.cjs'], 120000, { STORAGE_OUTPUT: path.join(out, 'registry-storage') });
     await run('compiled-workers', process.execPath, ['--test', 'scripts/validation/extensions-runtime.test.cjs']);
     await run('native-paths', process.execPath, ['scripts/validation/native-paths.cjs']);
     await run('process-recovery', process.execPath, ['scripts/validation/extensions-recovery.cjs'], 600000);

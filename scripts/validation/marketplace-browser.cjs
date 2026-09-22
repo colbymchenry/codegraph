@@ -29,10 +29,11 @@ function routes(root) {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-browser-recovery-'));
   const roots = ['one', 'two'].map(n => path.join(temp, n));
   roots.forEach(r => { fs.mkdirSync(r); fs.writeFileSync(path.join(r, 'app.ts'), 'export function main() {}'); });
-  let server, bridge, browser, attacker, debugPage, debugSnapshot;
+  let server, bridge, browser, attacker, debugPage, debugSnapshot, https;
   try {
     server = await startMarketplaceServer({ database: path.join(temp, 'registry.db'), publicDirectory: path.resolve('marketplace/public') });
-    const origin = `http://127.0.0.1:${server.port}`;
+    let origin = `http://127.0.0.1:${server.port}`;
+    if (process.env.REGISTRY_TEST_HTTPS === '1') { https = await require('./https-marketplace.cjs').httpsMarketplace(server.port, out); origin = https.origin; }
     bridge = await startExtensionBridge(roots, origin);
     const token = new URLSearchParams(new URL(bridge.connectionUrl).hash.slice(1)).get('token');
     const snapshot = async () => (await fetch(bridge.url + '/status', { headers: { Authorization: 'Bearer ' + token } })).json();
@@ -45,6 +46,7 @@ function routes(root) {
     debugPage = page;
     const pageErrors = []; page.on('pageerror', e => pageErrors.push(e.message));
     await page.goto(bridge.connectionUrl, { waitUntil: 'domcontentloaded' });
+    if (https) assert.equal(await page.evaluate(() => isSecureContext), true);
     // Reproduce slow native file reads: metadata must never erase typed fields.
     await page.evaluate(() => { const original=File.prototype.text; File.prototype.text=async function(){await new Promise(resolve=>setTimeout(resolve,500));return original.call(this);}; });
     console.log('Opened marketplace');
@@ -168,6 +170,19 @@ function routes(root) {
     await evil.evaluate(() => window.target.postMessage({ channel: 'codegraph-extensions-v1', type: 'command', id: 'wrong-origin', command: { action: 'enable', id: 'browser-example', project: '1' } }, '*'));
     await evil.waitForTimeout(300); assert.equal((await snapshot()).jobId, beforeOrigin);
     checks.push('real postMessage wrong-origin command ignored');
+    await popup.close();
+    await page.getByText('Reconnect CodeGraph', { exact: true }).waitFor();
+    checks.push('closed local companion expires the connection visibly');
+    await page.getByRole('link', { name: 'Publish an extension' }).click();
+    await page.locator('#artifact').setInputFiles({ name: 'example.cgext', mimeType: 'application/json', buffer: artifact('4.0.0') });
+    for (const [id, value] of Object.entries({ name: 'Browser example', publisher: 'Recovery publisher', description: 'Outage check', source: 'https://example.com/source', readme: 'Outage check' })) await page.locator('#'+id).fill(value);
+    await page.locator('#package-summary').filter({ hasText: 'v4.0.0' }).waitFor();
+    await server.close(); server = undefined;
+    await page.getByRole('button', { name: 'Publish release' }).click();
+    await page.locator('#publish-result').filter({ hasText: /marketplace registry/i }).waitFor();
+    assert.equal(await page.getByRole('button', { name: 'Publish release' }).isEnabled(), true);
+    assert.deepEqual(routes(roots[1]), []);
+    checks.push('real stopped registry shows actionable publisher failure without changing local graph');
     assert.deepEqual(pageErrors, []);
     fs.writeFileSync(path.join(out, 'result.json'), JSON.stringify({ browser: browser.version(), platform: process.platform, checks, pageErrors }, null, 2));
     console.log(JSON.stringify({ checks, browser: browser.version(), platform: process.platform }));
@@ -175,7 +190,7 @@ function routes(root) {
     await debugPage?.screenshot({ path: path.join(out, 'failure.png'), fullPage: true }).catch(() => {});
     fs.writeFileSync(path.join(out, 'failure.json'), JSON.stringify({ checks, error: safeError(error), snapshot: await debugSnapshot?.() }, null, 2)); throw Error(safeError(error));
   } finally {
-    await browser?.close(); await bridge?.close(); await server?.close();
+    await browser?.close(); await https?.close(); await bridge?.close(); await server?.close();
     if (attacker) await new Promise(resolve => attacker.close(resolve));
     fs.rmSync(temp, { recursive: true, force: true });
   }

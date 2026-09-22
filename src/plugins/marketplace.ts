@@ -3,7 +3,8 @@ import * as http from 'node:http';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as semver from 'semver';
-import { createPublicKey, verify, type JsonWebKey } from 'node:crypto';
+import { createPublicKey, verify, randomUUID, type JsonWebKey } from 'node:crypto';
+import { channel } from 'node:diagnostics_channel';
 import { createDatabase } from '../db/sqlite-adapter';
 import { parsePackage, sha256, MAX_PACKAGE_BYTES } from './package';
 
@@ -12,7 +13,7 @@ interface Submission {
   publicKey: JsonWebKey;
   signature: string;
 }
-interface Listing {
+export interface Listing {
   id: string; name: string; description: string; publisher: string; publisherId: string;
   official: boolean; version: string; apiVersion: number; engines: string; capabilities: string[]; integrity: string;
   readme: string; source: string; publishedAt: string;
@@ -20,9 +21,20 @@ interface Listing {
 export function createMarketplaceStore(database: string) {
   fs.mkdirSync(path.dirname(database), { recursive: true });
   const { db } = createDatabase(database);
-  db.exec(`CREATE TABLE IF NOT EXISTS extensions (id TEXT PRIMARY KEY, publisher TEXT NOT NULL);
+  db.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+    CREATE TABLE IF NOT EXISTS registry_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS extensions (id TEXT PRIMARY KEY, publisher TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS releases (id TEXT NOT NULL, version TEXT NOT NULL, listing TEXT NOT NULL, bytes BLOB NOT NULL, created INTEGER NOT NULL, PRIMARY KEY(id,version));
     CREATE TABLE IF NOT EXISTS submissions (nonce TEXT PRIMARY KEY, created INTEGER NOT NULL);`);
+  db.prepare('INSERT OR IGNORE INTO registry_meta VALUES (?,?)').run('id', randomUUID());
+  db.prepare('INSERT OR IGNORE INTO registry_meta VALUES (?,?)').run('schema', '1');
+  const transaction = <T>(fn: () => T): T => {
+    // Acquire the writer before reading ownership. A deferred read->write
+    // upgrade can fail immediately under concurrent publication despite timeout.
+    db.exec('BEGIN IMMEDIATE');
+    try { const result = fn(); db.exec('COMMIT'); return result; }
+    catch (error) { db.exec('ROLLBACK'); throw error; }
+  };
   function publish(bytes: Buffer, details: { publisherId: string; publisher: string; readme: string; source: string; name: string; description: string; official?: boolean }): Listing {
     const pkg = parsePackage(bytes).package;
     const id = pkg.codegraph.id;
@@ -30,34 +42,45 @@ export function createMarketplaceStore(database: string) {
       publisherId: details.publisherId, publisher: details.publisher, official: details.official === true,
       readme: details.readme, source: details.source, apiVersion: pkg.codegraph.apiVersion, engines: pkg.codegraph.engines ?? '*',
       capabilities: pkg.codegraph.capabilities, integrity: sha256(bytes), publishedAt: new Date().toISOString() };
-    db.transaction(() => {
-      const owner = db.prepare('SELECT publisher FROM extensions WHERE id = ?').get(id) as { publisher: string } | undefined;
-      if (owner && owner.publisher !== details.publisherId) throw new Error('This extension id belongs to another publisher');
-      db.prepare('INSERT OR IGNORE INTO extensions VALUES (?,?)').run(id, details.publisherId);
-      db.prepare('INSERT INTO releases VALUES (?,?,?,?,?)').run(id, pkg.version, JSON.stringify(listing), bytes, Date.now());
-    })();
+    const owner = db.prepare('SELECT publisher FROM extensions WHERE id = ?').get(id) as { publisher: string } | undefined;
+    if (owner && owner.publisher !== details.publisherId) throw new Error('This extension id belongs to another publisher');
+    db.prepare('INSERT OR IGNORE INTO extensions VALUES (?,?)').run(id, details.publisherId);
+    db.prepare('INSERT INTO releases VALUES (?,?,?,?,?)').run(id, pkg.version, JSON.stringify(listing), bytes, Date.now());
+    // Validation-only subscribers can pause a test-owned process here.
+    channel('codegraph.marketplace.publication').publish({ database, id, version: pkg.version, phase: 'before-commit' });
     return listing;
   }
   // Old persisted listings predate apiVersion. Recover it from their immutable
   // package, never guess that a missing API marker is supported.
   function listings(id?: string): Listing[] {
-    const rows = (id === undefined ? db.prepare('SELECT listing, bytes FROM releases').all() :
-      db.prepare('SELECT listing, bytes FROM releases WHERE id=?').all(id)) as { listing: string; bytes: Uint8Array }[];
+    const rows = (id === undefined ? db.prepare('SELECT id, version, listing FROM releases').all() :
+      db.prepare('SELECT id, version, listing FROM releases WHERE id=?').all(id)) as { id: string; version: string; listing: string }[];
     return rows.map(row => {
       const listing = JSON.parse(row.listing) as Listing;
-      if (listing.apiVersion === undefined) listing.apiVersion = parsePackage(Buffer.from(row.bytes)).package.codegraph.apiVersion;
+      if (listing.apiVersion === undefined) {
+        const artifact = db.prepare('SELECT bytes FROM releases WHERE id=? AND version=?').get(row.id, row.version) as { bytes: Uint8Array };
+        listing.apiVersion = parsePackage(Buffer.from(artifact.bytes)).package.codegraph.apiVersion;
+      }
       return listing;
     }).sort((a, b) => Number(!!semver.prerelease(a.version)) - Number(!!semver.prerelease(b.version)) || semver.rcompare(a.version, b.version) || a.version.localeCompare(b.version));
   }
   return {
     close: () => db.close(),
+    identity: () => (db.prepare("SELECT value FROM registry_meta WHERE key='id'").get() as { value: string }).value,
+    health: () => { db.prepare('SELECT count(*) FROM registry_meta').get(); return { ok: true, publishing: true, protocol: 1, storage: 'sqlite-atomic', schema: 1 }; },
     seedOfficial(bytes: Buffer): void {
       const pkg = parsePackage(bytes).package;
-      if (db.prepare('SELECT 1 FROM releases WHERE id=? AND version=?').get(pkg.codegraph.id, pkg.version)) return;
-      publish(bytes, { publisherId: 'codegraph', publisher: 'CodeGraph', official: true, name: 'Drupal',
-        description: 'Follow Drupal routes, services, hooks, plugins and events through your codebase.',
-        source: 'https://github.com/colbymchenry/codegraph',
-        readme: 'Understand the framework connections that ordinary function calls cannot show.\n\nRoutes and forms connect to their handlers. Service definitions connect to implementations and explicit injected services. Documented procedural hooks and Hook attributes connect to literal invocations. Plugin annotations and attributes identify implementations. Literal event dispatch connects to declared subscribers.\n\nInstall replaces the built-in Drupal resolver for this project. Requires CodeGraph 1.6.0 with extension support (preview build).\n\nComputed identifiers, external dependencies outside your index, ambiguous classes and unknown entity handlers remain unresolved. New programming languages and PHP branch-condition analysis are outside this extension API.' });
+      transaction(() => {
+        const existing = db.prepare('SELECT listing, bytes FROM releases WHERE id=? AND version=?').get(pkg.codegraph.id, pkg.version) as { listing: string; bytes: Uint8Array } | undefined;
+        if (existing) {
+          if (JSON.parse(existing.listing).publisherId !== 'codegraph' || !Buffer.from(existing.bytes).equals(bytes)) throw new Error('Official seed conflicts with an immutable existing release');
+          return;
+        }
+        publish(bytes, { publisherId: 'codegraph', publisher: 'CodeGraph', official: true, name: 'Drupal',
+          description: 'Follow Drupal routes, services, hooks, plugins and events through your codebase.',
+          source: 'https://github.com/colbymchenry/codegraph',
+          readme: 'Understand the framework connections that ordinary function calls cannot show.\n\nRoutes and forms connect to their handlers. Service definitions connect to implementations and explicit injected services. Documented procedural hooks and Hook attributes connect to literal invocations. Plugin annotations and attributes identify implementations. Literal event dispatch connects to declared subscribers.\n\nInstall replaces the built-in Drupal resolver for this project. Requires CodeGraph 1.6.0 with extension support (preview build).\n\nComputed identifiers, external dependencies outside your index, ambiguous classes and unknown entity handlers remain unresolved. New programming languages and PHP branch-condition analysis are outside this extension API.' });
+      });
     },
     list(): Listing[] {
       const seen = new Set<string>();
@@ -84,18 +107,20 @@ export function createMarketplaceStore(database: string) {
       if (source.protocol !== 'https:' || source.username || source.password) throw new Error('Source repository must be an HTTPS URL');
       const publisherId = sha256(publicKey.export({ type: 'spki', format: 'der' }));
       let result!: Listing;
-      db.transaction(() => {
+      transaction(() => {
         db.prepare('INSERT INTO submissions VALUES (?,?)').run(payload.nonce, Date.now());
         result = publish(Buffer.from(payload.artifact, 'base64'), { ...payload, publisherId, official: false });
-      })();
+      });
+      channel('codegraph.marketplace.publication').publish({ database, id: result.id, version: result.version, phase: 'after-commit' });
       return result;
     },
   };
 }
 
-export async function startMarketplaceServer(options: { database: string; publicDirectory: string; officialArtifact?: string; port?: number }) {
+export async function startMarketplaceServer(options: { database: string; publicDirectory: string; officialArtifact?: string; port?: number; host?: string }) {
   const store = createMarketplaceStore(options.database);
-  if (options.officialArtifact) store.seedOfficial(fs.readFileSync(options.officialArtifact));
+  try { if (options.officialArtifact) store.seedOfficial(fs.readFileSync(options.officialArtifact)); }
+  catch (error) { store.close(); throw error; }
   const attempts = new Map<string, { time: number; count: number }>();
   const server = http.createServer(async (req, res) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -105,7 +130,7 @@ export async function startMarketplaceServer(options: { database: string; public
     const json = (status: number, data: unknown) => { res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(data)); };
     try {
       if (req.method === 'GET' && url.pathname === '/api/extensions') { json(200, store.list()); return; }
-      if (req.method === 'GET' && url.pathname === '/api/health') { json(200, { ok: true, publishing: true, protocol: 1 }); return; }
+      if (req.method === 'GET' && url.pathname === '/api/health') { json(200, store.health()); return; }
       const release = /^\/api\/extensions\/([a-z0-9-]+)$/.exec(url.pathname);
       if (req.method === 'GET' && release) { json(200, store.releases(release[1]!)); return; }
       const download = /^\/api\/download\/([a-z0-9-]+)\/([^/]+)$/.exec(url.pathname);
@@ -118,6 +143,7 @@ export async function startMarketplaceServer(options: { database: string; public
       }
       if (req.method === 'POST' && url.pathname === '/api/publish') {
         const key = req.socket.remoteAddress ?? 'unknown';
+        for (const [address, attempt] of attempts) if (Date.now() - attempt.time >= 60_000) attempts.delete(address);
         const previous = attempts.get(key);
         const rate = previous && Date.now() - previous.time < 60_000 ? previous : { time: Date.now(), count: 0 };
         attempts.set(key, rate);
@@ -134,6 +160,7 @@ export async function startMarketplaceServer(options: { database: string; public
       res.end(fs.readFileSync(path.join(options.publicDirectory, file)));
     } catch (err) { json(400, { error: err instanceof Error ? err.message : String(err) }); }
   });
-  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(options.port ?? 0, '127.0.0.1', resolve); });
+  try { await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(options.port ?? 0, options.host ?? '127.0.0.1', resolve); }); }
+  catch (error) { store.close(); throw error; }
   return { port: (server.address() as { port: number }).port, close: () => new Promise<void>(resolve => server.close(() => { store.close(); resolve(); })) };
 }
