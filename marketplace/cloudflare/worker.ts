@@ -15,6 +15,12 @@ function decodeBase64(value:string) {
 }
 function json(status:number,data:unknown) { return Response.json(data,{status,headers:{...headers,'Cache-Control':'no-store'}}); }
 class InputError extends Error {}
+// Optional operator deadline makes a controlled acceptance window fail closed after interruption.
+// Existing local fixtures may omit it; hosted acceptance always supplies an absolute UTC deadline.
+function publishingEnabled(env:any) {
+  return env.PUBLISHING_ENABLED === 'true' &&
+    (env.PUBLISHING_UNTIL === undefined || Date.now() < Date.parse(env.PUBLISHING_UNTIL));
+}
 async function readBody(request:Request) {
   const limit=MAX_PACKAGE_BYTES*1.5;
   if(Number(request.headers.get('content-length'))>limit) throw new InputError('Submission exceeds 12 MiB envelope limit');
@@ -58,7 +64,7 @@ export function createHandler(hook: (phase:string)=>Promise<void> = async()=>{})
       // All reads use the primary D1 endpoint. No eventually-consistent cache or replicas.
       const schema=await env.DB.prepare("SELECT value FROM registry_meta WHERE key='schema'").first('value');
       if(schema!=='1')return json(503,{error:'Registry is not initialized or schema is unsupported; operator must apply migrations'});
-      if(request.method==='GET'&&url.pathname==='/api/health')return json(200,{ok:true,publishing:env.PUBLISHING_ENABLED==='true',protocol:1,storage:'d1-r2',schema:1});
+      if(request.method==='GET'&&url.pathname==='/api/health')return json(200,{ok:true,publishing:publishingEnabled(env),protocol:1,storage:'d1-r2',schema:1});
       const releases=/^\/api\/extensions\/([a-z0-9-]+)$/.exec(url.pathname);
       if(request.method==='GET'&&(url.pathname==='/api/extensions'||releases)) {
         const query=releases?env.DB.prepare('SELECT listing FROM releases WHERE id=?').bind(releases[1]):env.DB.prepare('SELECT listing FROM releases');
@@ -78,7 +84,7 @@ export function createHandler(hook: (phase:string)=>Promise<void> = async()=>{})
         return new Response(bytes,{headers:{...headers,'Content-Type':'application/vnd.codegraph.extension+json','Content-Length':String(row.size),'Cache-Control':'public, max-age=31536000, immutable','Content-Disposition':`attachment; filename="${download[1]}-${encodeURIComponent(version)}.cgext"`}});
       }
       if(request.method==='POST'&&url.pathname==='/api/publish') {
-        if(env.PUBLISHING_ENABLED!=='true')return json(503,{error:'Publishing is disabled; operator must verify storage and usage limits before enabling it'});
+        if(!publishingEnabled(env))return json(503,{error:'Publishing is disabled; operator must verify storage and usage limits before enabling it'});
         const origin=request.headers.get('origin');if(origin&&origin!==url.origin)return json(403,{error:'Publisher origin is not allowed'});
         const minute=Math.floor(Date.now()/60000),ip=request.headers.get('CF-Connecting-IP')??'local';
         const rateKey=await digest(utf8.encode(ip+':'+minute));
