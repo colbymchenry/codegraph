@@ -92,3 +92,22 @@ export function packageDigest(root: string): string {
   walk(root);
   return hash.digest('hex');
 }
+
+/** Trust follows the same existing directory across filesystem case/short-name
+ * aliases, never a lowercased string or a different directory with equal bytes. */
+export function trustedPackageDigest(directory: string, trusted: Record<string, unknown>): string | undefined {
+  const real = fs.realpathSync(directory);
+  if (typeof trusted[real] === 'string') return trusted[real] as string;
+  const target = fs.statSync(real, { bigint: true });
+  if (!target.isDirectory() || target.ino === 0n) return;
+  const matches = new Set<string>();
+  for (const [approved, digest] of Object.entries(trusted)) {
+    if (typeof digest !== 'string' || !path.isAbsolute(approved)) continue;
+    try {
+      const candidate = fs.statSync(approved, { bigint: true });
+      if (candidate.isDirectory() && candidate.dev === target.dev && candidate.ino === target.ino) matches.add(digest);
+    } catch { /* An absent historical package is not this directory. */ }
+  }
+  if (matches.size > 1) throw new Error('Conflicting trust records for aliases of the same package directory');
+  return matches.values().next().value;
+}

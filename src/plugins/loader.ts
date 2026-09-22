@@ -6,7 +6,7 @@ import { NODE_KINDS, EDGE_KINDS, LANGUAGES, type Node, type Edge } from '../type
 import type { FrameworkResolver, UnresolvedRef } from '../resolution/types';
 import type { CodeGraphPlugin, PluginDiagnostic, PluginEntry, ResolvedPlugin } from './api';
 import { emptyRegistry, type PluginRegistry } from './registry';
-import { inside, packageDigest, validateManifest, sha256 } from './package';
+import { inside, packageDigest, trustedPackageDigest, validateManifest, sha256 } from './package';
 import { loadPluginEntries } from '../project-config';
 import { version as engineVersion } from '../../package.json';
 
@@ -40,7 +40,7 @@ function resolveEntry(root: string, entry: PluginEntry): ResolvedPlugin {
   if (entry.name.startsWith('./') || entry.name.startsWith('managed:')) {
     let trusted: Record<string, string> = {};
     try { trusted = JSON.parse(fs.readFileSync(path.join(pluginDirectory(root), 'trust.json'), 'utf8')); } catch { /* no trust yet */ }
-    if (trusted[realRoot] !== digest) throw new Error('Extension code is not trusted; install it with codegraph extensions install');
+    if (trustedPackageDigest(realRoot, trusted) !== digest) throw new Error('Extension code is not trusted; install it with codegraph extensions install');
   }
   if (entry.version && entry.version !== pkg.version) throw new Error('Installed version does not match project pin');
   if (entry.name.startsWith('managed:') && entry.name.slice(8) !== manifest.id) throw new Error('Managed extension identity mismatch');

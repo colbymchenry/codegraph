@@ -154,6 +154,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Managed extensions remain trusted when a project is opened with different path capitalization on Windows and macOS.
+- Publisher forms preserve entered descriptions and source links while package metadata finishes loading.
+
 - Interrupted extension installs and changes recover their last consistent configuration and graph, while conflicting user edits produce repair instructions instead of being overwritten.
 
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)

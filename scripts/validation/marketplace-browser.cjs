@@ -45,6 +45,8 @@ function routes(root) {
     debugPage = page;
     const pageErrors = []; page.on('pageerror', e => pageErrors.push(e.message));
     await page.goto(bridge.connectionUrl, { waitUntil: 'domcontentloaded' });
+    // Reproduce slow native file reads: metadata must never erase typed fields.
+    await page.evaluate(() => { const original=File.prototype.text; File.prototype.text=async function(){await new Promise(resolve=>setTimeout(resolve,500));return original.call(this);}; });
     console.log('Opened marketplace');
     await page.getByRole('link', { name: 'Publish an extension' }).click();
     async function publish(version, broken = false) {
@@ -56,12 +58,15 @@ function routes(root) {
       await page.locator('#description').fill('A second framework used for end-to-end validation.');
       await page.locator('#source').fill('https://example.com/recovery-source');
       await page.locator('#readme').fill('Validation-only extension. Adds one explicit route to each TypeScript file.');
+      await page.locator('#package-summary').filter({ hasText: 'v'+version+' ·' }).waitFor();
+      assert.equal(await page.locator('#description').inputValue(), 'A second framework used for end-to-end validation.');
+      assert.equal(await page.locator('#source').inputValue(), 'https://example.com/recovery-source');
       await page.getByRole('button', { name: 'Publish release' }).click();
       console.log('Submitted', version);
       await page.waitForURL('**/extensions/browser-example');
       await page.getByText(version, { exact: true }).waitFor();
     }
-    await publish('1.0.0'); checks.push('real browser signed publisher upload');
+    await publish('1.0.0'); checks.push('real browser signed publisher upload'); checks.push('slow package metadata preserves typed publisher fields');
     const first = (await (await fetch(origin + '/api/extensions')).json())[0];
     assert.equal(first.official, false);
     // A separate browser has a separate signing identity and cannot claim this id.

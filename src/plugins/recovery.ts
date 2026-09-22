@@ -6,7 +6,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { channel } from 'node:diagnostics_channel';
 import { createDatabase } from '../db/sqlite-adapter';
 import { clearProjectConfigCache } from '../project-config';
-import { sha256, packageDigest, type ExtensionPackage } from './package';
+import { sha256, packageDigest, trustedPackageDigest, type ExtensionPackage } from './package';
 
 const context = new AsyncLocalStorage<string>();
 const transitions = channel('codegraph.extension.transaction');
@@ -156,7 +156,7 @@ function verifyPackages(root: string, config: string | null, trust: string | nul
     try {
       const pkg = object(read(path.join(packageRoot, 'package.json')));
       if (pkg.version !== entry.version || (pkg.codegraph as { id?: string })?.id !== entry.name.slice(8) ||
-          packageDigest(packageRoot) !== trusted[fs.realpathSync(packageRoot)]) throw new Error('version/identity/trust mismatch');
+          packageDigest(packageRoot) !== trustedPackageDigest(packageRoot, trusted)) throw new Error('version/identity/trust mismatch');
     } catch (error) { fail(root, `installed package ${entry.name} is missing or changed (${String(error)}); restore the recorded package bytes/trust from backup before recovery`); }
   }
 }

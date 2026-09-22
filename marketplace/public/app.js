@@ -175,11 +175,14 @@ document.addEventListener('change',async event=>{
   if(event.target.id==='project'){state.project=event.target.value;void refreshSelections();}
   if(event.target.id==='artifact')try{
     const file=event.target.files[0];if(file.size>8*1024*1024)throw new Error('Package exceeds 8 MiB');
+    const input=event.target, form=input.closest('form');
+    const fields=Object.fromEntries(['name','description','source'].map(id=>[id,form.querySelector('#'+id)]));
+    const before=Object.fromEntries(Object.entries(fields).map(([id,field])=>[id,field.value]));
     const pkg=JSON.parse(await file.text()).package;
+    if(!form.isConnected||input.files[0]!==file)return;
     document.querySelector('#package-summary').textContent=`${pkg.codegraph.id} · v${pkg.version} · API ${pkg.codegraph.apiVersion}`;
-    document.querySelector('#name').value=pkg.codegraph.id;
-    document.querySelector('#description').value=pkg.description||'';
-    document.querySelector('#source').value=typeof pkg.repository==='string'?pkg.repository:'';
+    const defaults={name:pkg.codegraph.id,description:pkg.description||'',source:typeof pkg.repository==='string'?pkg.repository:''};
+    for(const [id,value] of Object.entries(defaults))if(before[id]===''&&fields[id].value===before[id])fields[id].value=value;
   }catch(e){toast(e.message);}
   if(event.target.id==='restore-key')try{const key=JSON.parse(await event.target.files[0].text());await crypto.subtle.importKey('jwk',key,{name:'ECDSA',namedCurve:'P-256'},true,['sign']);await keyStore('put',key);toast('Publisher key restored.');}catch{toast('Invalid publisher key.');}
 });
