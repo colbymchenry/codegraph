@@ -2807,12 +2807,16 @@ program
  * the version affordance in `codegraph --help`.
  */
 // Command registration is lightweight; heavy implementation loads only when invoked.
+// Preserve extension --version pins for the lazily registered subcommands;
+// the root's engine-version flag must not consume them first.
+if (process.argv[2] === 'extensions') program.enablePositionalOptions();
 const extensionCommands = program.command('extensions').description('Install and manage framework extensions').allowUnknownOption().allowExcessArguments();
 extensionCommands.action(async () => {
   const { registerExtensionCommands } = await import('../plugins/cli');
   const cli = new Command().name('codegraph');
   registerExtensionCommands(cli);
-  await cli.parseAsync(process.argv);
+  try { await cli.parseAsync(process.argv); }
+  catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
 });
 
 program

@@ -38,6 +38,19 @@ describe('codegraph version affordances', () => {
     });
   }
 
+  it('keeps an extension exact-version pin out of the root version flag', () => {
+    // No registry request is needed: --version without --registry must fail,
+    // not print the engine version and exit zero.
+    let result;
+    try { result = { exit: 0, output: run(['extensions', 'install', 'missing.cgext', '--version', '9.0.0']) }; }
+    catch (error) {
+      const e = error as { status: number; stdout: string; stderr: string };
+      result = { exit: e.status, output: `${e.stdout ?? ''}${e.stderr ?? ''}` };
+    }
+    expect(result.exit).toBe(1);
+    expect(result.output).toContain('--version requires --registry');
+  });
+
   it('lists the `version` subcommand in --help', () => {
     expect(run(['--help'])).toContain('version');
   });

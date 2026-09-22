@@ -8,7 +8,7 @@ const { createExtensionProject, CodeGraph } = require('../../dist');
 const { packExtension } = require('../../dist/plugins/package');
 const { startMarketplaceServer } = require('../../dist/plugins/marketplace');
 const { startExtensionBridge } = require('../../dist/plugins/bridge');
-const repo = path.resolve(__dirname, '../..'), out = path.join(repo, '.qa/recovery/compatibility');
+const repo = path.resolve(__dirname, '../..'), out = path.resolve(process.env.COMPAT_OUTPUT || path.join(repo, '.qa/recovery/compatibility'));
 fs.mkdirSync(out, { recursive: true });
 const lab = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-compatible-'));
 const author = path.join(lab, 'author'), checks = [], commands = [], releases = [];

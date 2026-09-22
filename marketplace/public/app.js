@@ -132,13 +132,14 @@ window.addEventListener('message', event => {
   if (message.type === 'connected' || message.type === 'status') {
     const before = JSON.stringify(state.snapshot);
     const wasBusy = state.snapshot?.busy;
+    const beforeProjects = JSON.stringify(state.snapshot?.projects);
     state.snapshot = message.data;
     if (wasBusy && !state.snapshot.busy && state.notice) toast(state.snapshot.progress.message);
     document.querySelector('#connect').classList.add('connected');
     document.querySelector('#connection-label').textContent = 'CodeGraph connected';
     if (message.type === 'connected') { toast('Connected. Select your project and install an extension.'); render(); void refreshSelections(); }
     else if (JSON.stringify(state.snapshot) !== before && location.pathname !== '/publish') render();
-    if (wasBusy && !state.snapshot.busy) void refreshSelections();
+    if (message.type !== 'connected' && !state.snapshot.busy && (wasBusy || JSON.stringify(state.snapshot.projects) !== beforeProjects)) void refreshSelections();
   }
   if (message.type === 'disconnected') disconnect();
 });
