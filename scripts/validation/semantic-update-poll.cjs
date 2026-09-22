@@ -1,4 +1,4 @@
-const diagnosticEvents=[];require('node:diagnostics_channel').channel('codegraph.semantic.update').subscribe(e=>diagnosticEvents.push(e));
+const diagnosticEvents=[];require('node:diagnostics_channel').channel('codegraph.semantic.update').subscribe(e=>diagnosticEvents.push({...e,atMs:performance.now()}));
 const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto'),assert=require('node:assert/strict');const {CodeGraph}=require('../../dist');const {DatabaseSync}=require('node:sqlite');
 Object.assign(process.env,{CODEGRAPH_TELEMETRY:'0',CODEGRAPH_PARSE_WORKERS:'2',CODEGRAPH_RESOLVE_WORKERS:'0',CODEGRAPH_SYNTH_TIMINGS:'all'});
 const [root,file,out]=process.argv.slice(2),original=fs.readFileSync(path.join(root,file)),rows=[];fs.mkdirSync(path.dirname(out),{recursive:true});

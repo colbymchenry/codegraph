@@ -99,7 +99,9 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
       let result: ReusableExtraction | undefined;
       if (msg.reuseCore) {
         const core = msg.coreExtraction ?? extractFromSource(filePath!, content!, language);
-        result = applyFrameworkExtraction(structuredClone(core), filePath!, content!, language, frameworkNames);
+        // A received base was already cloned by postMessage; only a new base
+        // needs a second copy so the returned cache entry stays unmodified.
+        result = applyFrameworkExtraction(msg.coreExtraction ? core : structuredClone(core), filePath!, content!, language, frameworkNames);
         if (!msg.coreExtraction) result.coreExtraction = core;
       }
       const frameworksNeedDecode =

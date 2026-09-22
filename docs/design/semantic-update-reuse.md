@@ -38,7 +38,11 @@ The project SQLite coordinator is authoritative, independent of PID reuse.
 Fresh opens reclaim the exact orphaned stage after process death; an invalid
 record blocks recovery without deleting files. During a live graph-only update,
 readers can use the old committed graph. The existing SQLite graph transaction
-still determines old/new visibility. A commit marker invalidates long-lived
+still determines old/new visibility. FTS triggers are suspended and rebuilt
+inside that same transaction using the existing bulk-load API, avoiding per-row
+FTS work during replacement. A kill rolls back the trigger schema and FTS data
+with the graph; readers never see a committed missing-trigger window.
+`CODEGRAPH_NO_SEMANTIC_BULK_FTS=1` retains the previous trigger path. A commit marker invalidates long-lived
 reader caches. Managed config/trust transactions retain their exclusive guard.
 
 Measurements and correctness/recovery coverage will be linked after validation.

@@ -1,4 +1,4 @@
-const diagnosticEvents=[];require('node:diagnostics_channel').channel('codegraph.semantic.update').subscribe(e=>diagnosticEvents.push(e));
+const diagnosticEvents=[];require('node:diagnostics_channel').channel('codegraph.semantic.update').subscribe(e=>diagnosticEvents.push({...e,atMs:performance.now()}));
 // Disposable existing corpus only. Keeps the graph open across an edit sequence.
 const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto'),cp=require('node:child_process'),assert=require('node:assert/strict');
 const {DatabaseSync}=require('node:sqlite');const {CodeGraph}=require('../../dist');

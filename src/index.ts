@@ -594,10 +594,17 @@ export class CodeGraph {
           throw new Error('Project sources or configuration changed during semantic indexing; previous graph retained. Retry the update.');
         channel('codegraph.semantic.update').publish({ projectRoot: this.projectRoot, phase: 'before_commit' });
         connection.transaction(() => {
+          // Candidate replacement is one bulk load. Keep the FTS trigger window
+          // INSIDE this SQLite transaction so a kill rolls back graph and FTS
+          // schema together; readers keep the prior committed index.
+          const bulkFts = process.env.CODEGRAPH_NO_SEMANTIC_BULK_FTS !== '1';
+          if (bulkFts) this.db.beginBulkNodeLoad();
+          channel('codegraph.semantic.update').publish({ projectRoot: this.projectRoot, phase: 'copy_started' });
           this.queries.clear();
           for (const table of ['files', 'nodes', 'edges', 'unresolved_refs']) {
             connection.exec(`INSERT INTO main.${table} SELECT * FROM extension_candidate.${table}`);
           }
+          if (bulkFts) this.db.endBulkNodeLoad();
           this.queries.setMetadata('plugins_last_run', JSON.stringify(plugins.diagnostics));
           this.queries.setMetadata('indexed_with_plugins', this.extensionStamp(plugins));
           this.queries.setMetadata('indexed_with_version', CodeGraphPackageVersion);
