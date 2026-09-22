@@ -1,20 +1,20 @@
 {
-  "source_revision": "79f2d9f1cab2e19ad35fb99f4e215da8f9d5fdfa",
-  "source_tree": "1205687f3c4a60a30565efcc94592d78e50f9ddc",
+  "source_revision": "0730549f2a57f6cb7e4b70215a29ba59c03d89df",
+  "source_tree": "bda29b126b50afe335770dcbb8157eff8f6cdd5e",
   "source_sha256": {
     "CHANGELOG.md": "2f99f5088cb3363d5c157bb82451b2cde37ebf9291cdef5259b97204f0d14dd9",
     "__tests__/cli-version.test.ts": "7f2263a10cbee34d67ca44d514abb0c0da13d165b30fe8698fdc2969982aabc3",
-    "__tests__/extension-releases.test.ts": "3dda48db9b97b4ac9ea437d62d1f503e91f2f8ea5ec8592f2230843cfb2197db",
+    "__tests__/extension-releases.test.ts": "2d504a21689a7c847bd4f19b1df2dd2f94cc20db1878bbc64de9fe6f3eb4bd09",
     "docs/extensions/authoring.md": "224c5c8652a469c98857bafeefd69894e69709e302cc58eff50f8d399ba8c88b",
     "marketplace/public/app.js": "c7a8681945d82de27c2e46f8c76f08cdd616a54ab7aaae118091be8b7bc2fdea",
-    "scripts/validation/extensions-compatibility.cjs": "e6b9a6dfdb27f59a9398f88f6df7726bb6e2c850581849aeb536add7878d5194",
+    "scripts/validation/extensions-compatibility.cjs": "7fa68bf41f1db9580cb8794e5ef07d329c1bd254d3fe5645431a2e0f2ce55ea7",
     "scripts/validation/marketplace-browser.cjs": "76194905d863800ad7d173d54137eb0195038fde2bae9a1eb450d6f2c0be3153",
     "src/bin/codegraph.ts": "021b46718a6aa45a4edc01a001bfaa912f3d98dd515a5a704fdf866aa60bc23c",
     "src/plugins/bridge.ts": "2a8f7b86e480a58d87e9f081c3292ec22885b597107b2c26b76a6d89fb9e86f8",
     "src/plugins/cli.ts": "9af94178b540ea4975d5a7b715730132c69409004f8dcd09f99bd84f936aea00",
     "src/plugins/manager.ts": "7c24442476b5fc63f84fe047df3f4e371059e1973bdbc5b35a9e45e6e5d97134",
     "src/plugins/marketplace.ts": "605dc8c53abf67d55a0a4b04ef305535ff3dc3456bf7fa2b6cb184ce49cb0e92",
-    "src/plugins/releases.ts": "96988d116ea6aa0c106c0a9dcfc2031f9da969888e75e9f60cedc3882a8cec97"
+    "src/plugins/releases.ts": "bd45e219925890ab0bdbd1bd41b791df447a9e3bfe9d1967588903c4d4b1d4b2"
   },
   "checks": [
     {
@@ -24,16 +24,16 @@
         "build"
       ],
       "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
-      "started_at": "2026-09-22T03:09:27.479283+00:00",
-      "revision": "eab93c311434e1a5878c680a52b8c072da5ff772",
-      "working_tree": " M __tests__/cli-version.test.ts\n M marketplace/public/app.js\n M scripts/validation/extensions-compatibility.cjs\n M src/bin/codegraph.ts\n",
+      "started_at": "2026-09-22T03:15:13.496959+00:00",
+      "revision": "79fd602b5e422a2c72ed1e2e24c975992109f2b2",
+      "working_tree": " M __tests__/extension-releases.test.ts\n M scripts/validation/extensions-compatibility.cjs\n M src/plugins/releases.ts\n",
       "exit_code": 0,
-      "seconds": 32.724,
-      "finished_at": "2026-09-22T03:10:00.203028+00:00",
+      "seconds": 34.146,
+      "finished_at": "2026-09-22T03:15:47.642936+00:00",
       "summary": [],
-      "receipt_path": ".qa/recovery/compat-cli-fix-build.json",
-      "log_path": ".qa/recovery/compat-cli-fix-build.log",
-      "log_sha256": "3bba6fec83b4be911d5685d45371e7461b42e3c89143f2a21f998d2d6c5d7c3b"
+      "receipt_path": ".qa/recovery/compat-semver-build.json",
+      "log_path": ".qa/recovery/compat-semver-build.log",
+      "log_sha256": "59712559ddbe277b05f2f0b506e3db79e24c850b134073c72cc0fb4115e70feb"
     },
     {
       "command": [
@@ -52,20 +52,20 @@
         "--minWorkers=1"
       ],
       "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
-      "started_at": "2026-09-22T03:10:54.157173+00:00",
-      "revision": "79f2d9f1cab2e19ad35fb99f4e215da8f9d5fdfa",
+      "started_at": "2026-09-22T03:16:18.476929+00:00",
+      "revision": "0730549f2a57f6cb7e4b70215a29ba59c03d89df",
       "working_tree": "",
       "exit_code": 0,
-      "seconds": 18.087,
-      "finished_at": "2026-09-22T03:11:12.244376+00:00",
+      "seconds": 17.392,
+      "finished_at": "2026-09-22T03:16:35.868633+00:00",
       "summary": [
         "Test Files  8 passed (8)",
-        "Tests  43 passed (43)",
-        "Duration  16.05s (transform 3.61s, setup 0ms, collect 10.08s, tests 12.62s, environment 3ms, prepare 1.32s)"
+        "Tests  44 passed (44)",
+        "Duration  15.29s (transform 3.43s, setup 0ms, collect 9.43s, tests 12.25s, environment 5ms, prepare 1.26s)"
       ],
-      "receipt_path": ".qa/recovery/compat-focused-final.json",
-      "log_path": ".qa/recovery/compat-focused-final.log",
-      "log_sha256": "3441fe1eb195e7a44a6f80476dd035880573d148b92ed7aeee7ab1fb7eace0e8"
+      "receipt_path": ".qa/recovery/compat-semver-focused.json",
+      "log_path": ".qa/recovery/compat-semver-focused.log",
+      "log_sha256": "5bfe44fd6c71fffb6deafaf70be795b13665d1663fa77aa7489cbbec581f9b99"
     },
     {
       "command": [
@@ -74,16 +74,16 @@
         "scripts/validation/extensions-runtime.test.cjs"
       ],
       "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
-      "started_at": "2026-09-22T03:11:13.854565+00:00",
-      "revision": "79f2d9f1cab2e19ad35fb99f4e215da8f9d5fdfa",
+      "started_at": "2026-09-22T03:17:01.062537+00:00",
+      "revision": "0730549f2a57f6cb7e4b70215a29ba59c03d89df",
       "working_tree": "",
       "exit_code": 0,
-      "seconds": 7.52,
-      "finished_at": "2026-09-22T03:11:21.374094+00:00",
+      "seconds": 7.598,
+      "finished_at": "2026-09-22T03:17:08.660288+00:00",
       "summary": [],
-      "receipt_path": ".qa/recovery/compat-workers.json",
-      "log_path": ".qa/recovery/compat-workers.log",
-      "log_sha256": "902d611c9e10018ba53ede698aec98d84bfc4d5cdd6f2e911f5b1300d08387d4"
+      "receipt_path": ".qa/recovery/compat-semver-workers.json",
+      "log_path": ".qa/recovery/compat-semver-workers.log",
+      "log_sha256": "cd152c92d5bae8fad317e93ba804867d716e2557ea295f596427c4b604dc56c3"
     },
     {
       "command": [
@@ -91,16 +91,16 @@
         "scripts/validation/extensions-compatibility.cjs"
       ],
       "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
-      "started_at": "2026-09-22T03:10:06.389817+00:00",
-      "revision": "79f2d9f1cab2e19ad35fb99f4e215da8f9d5fdfa",
+      "started_at": "2026-09-22T03:16:35.932176+00:00",
+      "revision": "0730549f2a57f6cb7e4b70215a29ba59c03d89df",
       "working_tree": "",
       "exit_code": 0,
-      "seconds": 24.301,
-      "finished_at": "2026-09-22T03:10:30.691130+00:00",
+      "seconds": 25.074,
+      "finished_at": "2026-09-22T03:17:01.006327+00:00",
       "summary": [],
-      "receipt_path": ".qa/recovery/compat-e2e-verified.json",
-      "log_path": ".qa/recovery/compat-e2e-verified.log",
-      "log_sha256": "c3097f4ef12522a0248149e234e0ccaf9c6733f9c2df84c60a06ac67c6c24d07"
+      "receipt_path": ".qa/recovery/compat-semver-e2e.json",
+      "log_path": ".qa/recovery/compat-semver-e2e.log",
+      "log_sha256": "edf734979a1d35046b1529ed8ceefc2dd4e6f17340492402a5930075c70b77ac"
     },
     {
       "command": [
@@ -108,16 +108,16 @@
         "scripts/validation/marketplace-browser.cjs"
       ],
       "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
-      "started_at": "2026-09-22T03:11:38.183791+00:00",
-      "revision": "79f2d9f1cab2e19ad35fb99f4e215da8f9d5fdfa",
+      "started_at": "2026-09-22T03:17:08.715799+00:00",
+      "revision": "0730549f2a57f6cb7e4b70215a29ba59c03d89df",
       "working_tree": "",
       "exit_code": 0,
-      "seconds": 14.119,
-      "finished_at": "2026-09-22T03:11:52.303059+00:00",
+      "seconds": 13.848,
+      "finished_at": "2026-09-22T03:17:22.563420+00:00",
       "summary": [],
-      "receipt_path": ".qa/recovery/compat-browser-regression.json",
-      "log_path": ".qa/recovery/compat-browser-regression.log",
-      "log_sha256": "a75f9b58660eb4607daaf5c0df45fd5fec719f69f893f7c6925f296fc6409ed2"
+      "receipt_path": ".qa/recovery/compat-semver-browser.json",
+      "log_path": ".qa/recovery/compat-semver-browser.log",
+      "log_sha256": "fa707445157d5318b1f0b690bab008bada19293ab33854719ccf4f3d5bb368e2"
     }
   ],
   "compatibility": {
@@ -129,7 +129,7 @@
       "prerelease requires explicit exact pin; automatic update refuses downgrade; explicit lower pin remains exact",
       "compatible but broken update retains previous version and graph",
       "browser and headless update to highest compatible stable; stale graph labels removed",
-      "exact artifact URL/file semantics preserved",
+      "exact artifact URL/file semantics and build-metadata pin identity preserved",
       "removal cleans contributions; desktop/mobile display actual destination compatibility; no page errors"
     ],
     "releases": [
@@ -180,6 +180,12 @@
         "version": "3.0.0",
         "engines": ">=1.6.0 <2",
         "integrity": "e9f0eecbf6621e6f0ba7fc139d1eb91ffa2899548e0b5e615e3443a0496c8081"
+      },
+      {
+        "id": "compatible-demo",
+        "version": "1.10.0+fixture.1",
+        "engines": ">=1.6.0 <2",
+        "integrity": "b78efa83378ef1de9e79e8f6e4c18f0470382d8946481c4680fd0cbe2c6c349f"
       }
     ],
     "commands": [
@@ -191,13 +197,13 @@
           "install",
           "compatible-demo",
           "--registry",
-          "http://127.0.0.1:43423",
+          "http://127.0.0.1:38631",
           "--path",
-          "/tmp/cg-compatible-NzGUvq/headless-python-project"
+          "/tmp/cg-compatible-K7pOZO/headless-python-project"
         ],
         "exit": 0,
-        "seconds": 1.665,
-        "log_path": ".qa/recovery/compatibility-verified/command-1.log",
+        "seconds": 1.605,
+        "log_path": ".qa/recovery/compatibility-final/command-1.log",
         "log_sha256": "64f1ac60c8ad25f6569563d24914759b70acf1b73e5cffeef4feb12ce4c226b9"
       },
       {
@@ -208,15 +214,15 @@
           "install",
           "compatible-demo",
           "--registry",
-          "http://127.0.0.1:43423",
+          "http://127.0.0.1:38631",
           "--version",
           "9.0.0",
           "--path",
-          "/tmp/cg-compatible-NzGUvq/headless-python-project"
+          "/tmp/cg-compatible-K7pOZO/headless-python-project"
         ],
         "exit": 1,
-        "seconds": 0.414,
-        "log_path": ".qa/recovery/compatibility-verified/command-2.log",
+        "seconds": 0.394,
+        "log_path": ".qa/recovery/compatibility-final/command-2.log",
         "log_sha256": "d93afb7d84337fce0fb443fb79883800bb478b4c94635140b8f67f9734ed2b26"
       },
       {
@@ -227,13 +233,13 @@
           "update",
           "unavailable-demo",
           "--registry",
-          "http://127.0.0.1:43423",
+          "http://127.0.0.1:38631",
           "--path",
-          "/tmp/cg-compatible-NzGUvq/headless-python-project"
+          "/tmp/cg-compatible-K7pOZO/headless-python-project"
         ],
         "exit": 1,
-        "seconds": 0.32,
-        "log_path": ".qa/recovery/compatibility-verified/command-3.log",
+        "seconds": 0.311,
+        "log_path": ".qa/recovery/compatibility-final/command-3.log",
         "log_sha256": "78fff926f4f8969d8e1705c0a1271cbd63b822579f81d715c2042ad94c80ad45"
       },
       {
@@ -244,13 +250,13 @@
           "install",
           "unavailable-demo",
           "--registry",
-          "http://127.0.0.1:43423",
+          "http://127.0.0.1:38631",
           "--path",
-          "/tmp/cg-compatible-NzGUvq/headless-python-project"
+          "/tmp/cg-compatible-K7pOZO/headless-python-project"
         ],
         "exit": 1,
-        "seconds": 0.435,
-        "log_path": ".qa/recovery/compatibility-verified/command-4.log",
+        "seconds": 0.421,
+        "log_path": ".qa/recovery/compatibility-final/command-4.log",
         "log_sha256": "83a7b90bfd2c211c6fb4afcf72e261ef7b42bfd6dc21cfb72d530fb970aef44a"
       },
       {
@@ -261,15 +267,15 @@
           "install",
           "compatible-demo",
           "--registry",
-          "http://127.0.0.1:43423",
+          "http://127.0.0.1:38631",
           "--version",
           "20.0.0-beta.1",
           "--path",
-          "/tmp/cg-compatible-NzGUvq/headless-python-project"
+          "/tmp/cg-compatible-K7pOZO/headless-python-project"
         ],
         "exit": 0,
-        "seconds": 1.618,
-        "log_path": ".qa/recovery/compatibility-verified/command-5.log",
+        "seconds": 1.604,
+        "log_path": ".qa/recovery/compatibility-final/command-5.log",
         "log_sha256": "5a0ae6eb30e6659515338894feeb98ebeabbcd4f66e01f425110e75e83d7986d"
       },
       {
@@ -280,13 +286,13 @@
           "update",
           "compatible-demo",
           "--registry",
-          "http://127.0.0.1:43423",
+          "http://127.0.0.1:38631",
           "--path",
-          "/tmp/cg-compatible-NzGUvq/headless-python-project"
+          "/tmp/cg-compatible-K7pOZO/headless-python-project"
         ],
         "exit": 1,
-        "seconds": 0.423,
-        "log_path": ".qa/recovery/compatibility-verified/command-6.log",
+        "seconds": 0.377,
+        "log_path": ".qa/recovery/compatibility-final/command-6.log",
         "log_sha256": "38c1d85e306b15c18732c81df087390b3dfbd3873bc8836e36be492a1fb8a7fa"
       },
       {
@@ -297,15 +303,15 @@
           "install",
           "compatible-demo",
           "--registry",
-          "http://127.0.0.1:43423",
+          "http://127.0.0.1:38631",
           "--version",
           "1.9.0",
           "--path",
-          "/tmp/cg-compatible-NzGUvq/headless-python-project"
+          "/tmp/cg-compatible-K7pOZO/headless-python-project"
         ],
         "exit": 0,
-        "seconds": 1.607,
-        "log_path": ".qa/recovery/compatibility-verified/command-7.log",
+        "seconds": 1.622,
+        "log_path": ".qa/recovery/compatibility-final/command-7.log",
         "log_sha256": "74798a107028fa391113eb0b6fa7efac8bfee9c644dbb121892993443666f2f0"
       },
       {
@@ -316,13 +322,13 @@
           "update",
           "compatible-demo",
           "--registry",
-          "http://127.0.0.1:43423",
+          "http://127.0.0.1:38631",
           "--path",
-          "/tmp/cg-compatible-NzGUvq/headless-python-project"
+          "/tmp/cg-compatible-K7pOZO/headless-python-project"
         ],
         "exit": 0,
-        "seconds": 1.639,
-        "log_path": ".qa/recovery/compatibility-verified/command-8.log",
+        "seconds": 1.558,
+        "log_path": ".qa/recovery/compatibility-final/command-8.log",
         "log_sha256": "be1f77d7dd153abaab34b2a75bdd5c2d036b406fc11da38ee8d4362bd4c26387"
       },
       {
@@ -331,13 +337,13 @@
           "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
           "extensions",
           "install",
-          "http://127.0.0.1:43423/api/download/compatible-demo/1.9.0",
+          "http://127.0.0.1:38631/api/download/compatible-demo/1.9.0",
           "--path",
-          "/tmp/cg-compatible-NzGUvq/headless-python-project"
+          "/tmp/cg-compatible-K7pOZO/headless-python-project"
         ],
         "exit": 0,
-        "seconds": 1.767,
-        "log_path": ".qa/recovery/compatibility-verified/command-9.log",
+        "seconds": 1.7,
+        "log_path": ".qa/recovery/compatibility-final/command-9.log",
         "log_sha256": "fec96b4acb520e5ee4d8a42660e9a876f54f08d60c1fc98bcc7b1dcfd2ba6748"
       },
       {
@@ -346,14 +352,33 @@
           "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
           "extensions",
           "install",
-          "/tmp/cg-compatible-NzGUvq/pinned.cgext",
+          "/tmp/cg-compatible-K7pOZO/pinned.cgext",
           "--path",
-          "/tmp/cg-compatible-NzGUvq/headless-python-project"
+          "/tmp/cg-compatible-K7pOZO/headless-python-project"
         ],
         "exit": 0,
-        "seconds": 1.608,
-        "log_path": ".qa/recovery/compatibility-verified/command-10.log",
+        "seconds": 1.458,
+        "log_path": ".qa/recovery/compatibility-final/command-10.log",
         "log_sha256": "f03135c33691b92a8cd0834b0ab07175f81eb68d071d2e495c7ef96f6cbb5e69"
+      },
+      {
+        "command": [
+          "/usr/local/bin/node",
+          "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+          "extensions",
+          "install",
+          "compatible-demo",
+          "--registry",
+          "http://127.0.0.1:38631",
+          "--version",
+          "1.10.0+fixture.1",
+          "--path",
+          "/tmp/cg-compatible-K7pOZO/headless-python-project"
+        ],
+        "exit": 0,
+        "seconds": 1.602,
+        "log_path": ".qa/recovery/compatibility-final/command-11.log",
+        "log_sha256": "08588ddba0b05a3667ca2e4858c6625aaa7cfdd4b248283e284b36ca7bfd3b0f"
       },
       {
         "command": [
@@ -363,11 +388,11 @@
           "remove",
           "compatible-demo",
           "--path",
-          "/tmp/cg-compatible-NzGUvq/headless-python-project"
+          "/tmp/cg-compatible-K7pOZO/headless-python-project"
         ],
         "exit": 0,
-        "seconds": 1.68,
-        "log_path": ".qa/recovery/compatibility-verified/command-11.log",
+        "seconds": 1.47,
+        "log_path": ".qa/recovery/compatibility-final/command-12.log",
         "log_sha256": "303e141e174839575e69f0ae0ddf92ead0470e6dca049ac1edd45fb64b607bde"
       }
     ],
@@ -394,8 +419,8 @@
     "pageErrors": []
   },
   "screenshots": {
-    "docs/validation/extensions-compatibility-20260922/mobile-selected.png": "e6d817201490ad00f572d65de913c09be5f77f1e179da7dc9b5f4972a44746b2",
-    "docs/validation/extensions-compatibility-20260922/desktop-selected.png": "6f1bf3961036fc1800c1aecf5329d5dad335ea0c4936e6ad65b310c2a0663cae"
+    "docs/validation/extensions-compatibility-20260922/mobile-selected.png": "0bc1879a9b099c881de24d704522c73ca2f3c93a025549ba313d4580cea47d13",
+    "docs/validation/extensions-compatibility-20260922/desktop-selected.png": "69ade62b799da90273b207d3f7ff9b43adae0fcac47d36949b1d47aeafaba602"
   },
   "environment": {
     "platform": "Linux x86_64",
@@ -403,12 +428,15 @@
     "engine": "1.6.0",
     "extension_api": 1,
     "PLAYWRIGHT_MODULE": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/browser-tools/node_modules/playwright",
-    "COMPAT_OUTPUT": ".qa/recovery/compatibility-verified",
-    "BROWSER_OUTPUT": ".qa/recovery/compat-browser-regression"
+    "COMPAT_OUTPUT": ".qa/recovery/compatibility-final",
+    "BROWSER_OUTPUT": ".qa/recovery/compat-browser-final"
   },
-  "prior_failed_attempt": {
-    "receipt": ".qa/recovery/compat-e2e.json",
-    "log_sha256": "5fdb771ab70b656fe16e1fd381324adb979ec7e2d0c70730ed868d1d32b5f357",
-    "reason": "Root CLI --version intercepted extension exact-version pin, printing engine version and exiting zero. Fixed by scoped positional parsing in 79f2d9f."
+  "prior_attempts": {
+    "failed_e2e": {
+      "receipt": ".qa/recovery/compat-e2e.json",
+      "log_sha256": "5fdb771ab70b656fe16e1fd381324adb979ec7e2d0c70730ed868d1d32b5f357",
+      "reason": "Root CLI --version intercepted extension exact-version pin, printing engine version and exiting zero. Fixed by scoped positional parsing in 79f2d9f."
+    },
+    "passed_79f2d9f": "compat-focused-final (43 tests), compat-workers, compat-e2e-verified (9 checks/11 CLI commands), compat-browser-regression. Preserved separately; current matrix adds an exact build-metadata pin after review found semver normalization discarded the build suffix."
   }
 }

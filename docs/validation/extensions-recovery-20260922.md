@@ -215,7 +215,7 @@ Per-repository records, hashes and all nine raw responses are under
   See [author acceptance](extensions-author-20260922.md) for its separate evidence
   and limits; the original recovery scripts alone did not satisfy this gate.
 - The compatible-version gap was subsequently closed for Linux/local in
-  `79f2d9f`: browser and headless registry installs select the highest compatible
+  `0730549`: browser and headless registry installs select the highest compatible
   stable semver; exact pins and automatic no-downgrade updates are verified.
   See [compatible release acceptance](extensions-compatibility-20260922.md).
 - Exception rollback is tested. Process termination between config/database
