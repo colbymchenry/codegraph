@@ -15,7 +15,7 @@ process.env.CODEGRAPH_PARALLEL_RESOLVE_MIN = '0';
 const roots = [];
 after(() => roots.forEach(root => fs.rmSync(root, { recursive: true, force: true })));
 function root() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-compiled-'));
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-compiled-')));
   roots.push(dir);
   fs.writeFileSync(path.join(dir, 'app.ts'), 'export function entry() {}\nexport function handler() {}\n');
   return dir;

@@ -73,7 +73,7 @@ async function cli(args, expected = 0) {
     assert.deepEqual(all.map(r => r.version), ['9.0.0', '1.10.0', '1.9.0', '0.5.0', '20.0.0-beta.1']);
     assert.equal(all[0].apiVersion, 1); checks.push('signed immutable versions; semantic catalog order independent of publication order');
     bridge = await startExtensionBridge(roots.slice(0, 2), registry);
-    browser = await chromium.launch({ executablePath: '/opt/google/chrome/chrome', headless: true, args: ['--no-sandbox'] });
+    browser = await chromium.launch({ executablePath: process.env.CHROME_PATH || '/opt/google/chrome/chrome', headless: true, args: ['--no-sandbox'] });
     page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
     page.setDefaultTimeout(60000);
     const errors = []; page.on('pageerror', e => errors.push(e.message));

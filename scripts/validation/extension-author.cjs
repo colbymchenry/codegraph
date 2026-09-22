@@ -10,7 +10,7 @@ const { spawn } = require('node:child_process');
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const { startMarketplaceServer } = require('../../dist/plugins/marketplace');
 const repo = path.resolve(__dirname, '../..');
-const out = path.join(repo, '.qa/recovery/author-e2e');
+const out = path.resolve(process.env.AUTHOR_OUTPUT || path.join(repo, '.qa/recovery/author-e2e'));
 fs.mkdirSync(out, { recursive: true });
 const lab = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-external-author-'));
 const author = path.join(lab, 'python-events');
@@ -18,6 +18,7 @@ const project = path.join(lab, 'python-app');
 const commands = [];
 const env = { ...process.env, npm_config_cache: path.join(lab, 'npm-cache'), CODEGRAPH_TELEMETRY: '0', CODEGRAPH_PARSE_WORKERS: '2', CODEGRAPH_RESOLVE_WORKERS: '2', CODEGRAPH_PARALLEL_RESOLVE_MIN: '0' };
 async function run(command, args, cwd = lab) {
+  if (command === 'npm') [command, args] = require('./platform-tools.cjs').npmCommand(args);
   const start = Date.now();
   // Keep the event loop responsive while the CLI downloads from our local registry.
   const result = await new Promise(resolve => {

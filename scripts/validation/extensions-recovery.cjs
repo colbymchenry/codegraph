@@ -1,4 +1,5 @@
-// Real SIGKILLs target ONLY children created by this disposable-project harness.
+// Forced termination targets ONLY children created by this disposable-project harness.
+// Node maps SIGKILL to TerminateProcess on Windows; retain the observed exit/signal.
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
@@ -75,8 +76,9 @@ if (process.argv[2] === '--child') {
     try { await Promise.race([c.reached, c.done.then(r => { throw new Error(`Child exited before ${boundary}: ${r.stderr}`); }), new Promise((_, reject) => timer = setTimeout(() => reject(new Error('Boundary timeout: ' + boundary)), 90000))]); }
     finally { clearTimeout(timer); }
     assert.ok(processes.has(c.processChild));
-    c.processChild.kill('SIGKILL');
-    const result = await c.done; assert.equal(result.signal, 'SIGKILL');
+    assert.equal(c.processChild.kill('SIGKILL'), true);
+    const result = await c.done;
+    assert.ok(result.signal === 'SIGKILL' || (process.platform === 'win32' && result.exit !== 0), 'owned paused child must be forcibly terminated');
     return c.processChild.pid;
   }
   async function run(root, action = 'inspect', expected = 0, cli = false) {
@@ -104,7 +106,7 @@ if (process.argv[2] === '--child') {
     for (const entry of entries) {
       const pkg = path.join(folder, 'packages', entry.integrity);
       assert.equal(JSON.parse(fs.readFileSync(path.join(pkg, 'package.json'))).version, entry.version);
-      assert.equal(trusted[pkg], packageDigest(pkg));
+      assert.equal(trusted[fs.realpathSync(pkg)], packageDigest(pkg));
     }
   }
   function receipt(value) { rows.push(value); fs.writeFileSync(path.join(out, 'matrix.json'), JSON.stringify(rows, null, 2)); console.log(JSON.stringify(value)); }
@@ -212,7 +214,7 @@ if (process.argv[2] === '--child') {
         assert.equal(reader.getNode(node.id).name, '/2.0.0');
       } finally { reader.close(); }
       receipt({ action: 'long-lived reader after fresh-process recovery', decision: 'old cached node invalidated by commit marker', passed: true });
-      fs.writeFileSync(path.join(out, 'result.json'), JSON.stringify({ platform: process.platform, node: process.version, rows, commands: commands.length }, null, 2));
+      fs.writeFileSync(path.join(out, 'result.json'), JSON.stringify({ platform: process.platform, arch: process.arch, node: process.version, termination: process.platform === 'win32' ? 'Node child.kill(SIGKILL) / TerminateProcess' : 'SIGKILL', rows, commands: commands.length }, null, 2));
     } finally {
       for (const c of processes) c.kill('SIGKILL');
       if (processes.size) await new Promise(resolve => setTimeout(resolve, 300));
