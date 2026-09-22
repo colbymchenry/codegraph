@@ -6,7 +6,7 @@ const http = require('node:http');
 const assert = require('node:assert/strict');
 const { DatabaseSync } = require('node:sqlite');
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
-const { startMarketplaceServer } = require('../../dist/plugins/marketplace');
+const { startMarketplaceServer } = process.env.CLOUDFLARE_REGISTRY === '1' ? require('./cloudflare-registry.cjs') : require('../../dist/plugins/marketplace');
 const { startExtensionBridge } = require('../../dist/plugins/bridge');
 process.env.CODEGRAPH_TELEMETRY = '0';
 process.env.CODEGRAPH_PARSE_WORKERS = '2';

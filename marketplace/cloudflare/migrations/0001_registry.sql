@@ -1,0 +1,12 @@
+CREATE TABLE registry_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+INSERT INTO registry_meta VALUES ('schema','1');
+INSERT INTO registry_meta VALUES ('id',lower(hex(randomblob(16))));
+CREATE TABLE extensions (id TEXT PRIMARY KEY, publisher TEXT NOT NULL);
+CREATE TABLE releases (id TEXT NOT NULL, version TEXT NOT NULL, publisher TEXT NOT NULL, listing TEXT NOT NULL CHECK(json_valid(listing)), object_key TEXT NOT NULL, integrity TEXT NOT NULL, size INTEGER NOT NULL CHECK(size BETWEEN 1 AND 8388608), PRIMARY KEY(id,version), FOREIGN KEY(id) REFERENCES extensions(id));
+CREATE TABLE submissions (nonce TEXT PRIMARY KEY, created INTEGER NOT NULL);
+CREATE INDEX submissions_created ON submissions(created);
+CREATE TABLE rate_limits (key TEXT PRIMARY KEY, expires INTEGER NOT NULL, count INTEGER NOT NULL);
+CREATE TRIGGER release_owner BEFORE INSERT ON releases BEGIN SELECT CASE WHEN (SELECT publisher FROM extensions WHERE id=NEW.id) != NEW.publisher THEN RAISE(ABORT,'Extension id belongs to another publisher') END; END;
+CREATE TRIGGER release_capacity BEFORE INSERT ON releases BEGIN SELECT CASE WHEN (SELECT count(*) FROM releases) >= 1000 THEN RAISE(ABORT,'Preview registry capacity reached; contact the operator') END; END;
+CREATE TRIGGER immutable_release BEFORE UPDATE ON releases BEGIN SELECT RAISE(ABORT,'Release versions are immutable'); END;
+CREATE TRIGGER immutable_owner BEFORE UPDATE ON extensions BEGIN SELECT RAISE(ABORT,'Publisher ownership is immutable'); END;

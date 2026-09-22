@@ -6,7 +6,7 @@ const { generateKeyPairSync, sign, randomUUID, createHash } = require('node:cryp
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const { createExtensionProject, CodeGraph } = require('../../dist');
 const { packExtension } = require('../../dist/plugins/package');
-const { startMarketplaceServer } = require('../../dist/plugins/marketplace');
+const { startMarketplaceServer } = process.env.CLOUDFLARE_REGISTRY === '1' ? require('./cloudflare-registry.cjs') : require('../../dist/plugins/marketplace');
 const { startExtensionBridge } = require('../../dist/plugins/bridge');
 const repo = path.resolve(__dirname, '../..'), out = path.resolve(process.env.COMPAT_OUTPUT || path.join(repo, '.qa/recovery/compatibility'));
 fs.mkdirSync(out, { recursive: true });
