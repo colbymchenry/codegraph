@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#f7f6f2"><title>CodeGraph — Extension marketplace</title><meta name="description" content="Framework knowledge for your CodeGraph. Discover, publish and install extensions."><link rel="stylesheet" href="/style.css"><script defer src="/app.js"></script></head>
+<body>
+<header class="nav"><a href="/" class="wordmark" data-link><span class="mark" aria-hidden="true">▦</span>codegraph<span class="nav-label">/ extensions</span></a><nav><a href="/" data-link>Discover</a><a href="/publish" data-link>Publish an extension</a><a href="https://github.com/colbymchenry/codegraph" target="_blank" rel="noopener">GitHub ↗</a><button class="connect-button" id="connect"><span class="dot"></span><span id="connection-label">Connect CodeGraph</span></button></nav></header>
+<main id="app"></main>
+<footer><a class="wordmark" href="/" data-link>codegraph</a><span>Framework knowledge. Local intelligence.</span><a href="https://github.com/colbymchenry/codegraph/tree/feature/extensions-marketplace/docs" target="_blank" rel="noopener">Extension documentation ↗</a><span class="preview-tag">Preview</span></footer>
+<div id="toast" role="status" aria-live="polite" hidden></div>
+<dialog id="connect-dialog"><button class="close" aria-label="Close connection dialog">×</button><span class="eyebrow">ONE-TIME CONNECTION</span><h2>Bring your project<br>into the picture.</h2><p>Start the CodeGraph companion in your project, then open the connection link it prints.</p><div class="command"><code id="connect-command"></code><button id="copy-command">Copy</button></div><p class="muted small">Requires the extension preview build. Keep the companion running while you use the marketplace. Your source code stays on your computer.</p><label for="connection-link">Already started? Paste your connection link</label><input id="connection-link" type="url" placeholder="https://…/#bridge=…"><button class="primary" id="open-companion">Open connection</button><p id="connect-error" role="alert"></p></dialog>
+</body></html>

@@ -1,3 +1,4 @@
+import { synthEdgeLabel } from '../../graph/synth-edge-label';
 /**
  * `GET /api/steps` — what happens from here: a screen, a handler or any
  * symbol as the ANCHOR, and everything it sets in motion drawn as typed steps.
@@ -1598,6 +1599,8 @@ function fileScopeRefsWithin(cg: CodeGraph, node: Node, memo: Map<string, Unreso
 
 /** `push /capture`, `renders <Button>`, `via rn-event-channel`, `calls`. */
 function siteText(edge: Edge, meta: Record<string, unknown>, target: Node): string {
+  const explicit = synthEdgeLabel(edge);
+  if (explicit) return explicit;
   if (edge.kind === 'navigates') {
     const method = edge.provenance === 'heuristic' ? 'returns' : typeof meta.navMethod === 'string' ? meta.navMethod : 'push';
     return `${method} ${typeof meta.href === 'string' ? meta.href : target.name}`;
@@ -1614,6 +1617,8 @@ function siteText(edge: Edge, meta: Record<string, unknown>, target: Node): stri
 
 /** The words on a hop that was not a plain call — the Flow strip's connector label, in short. */
 function hopLabel(meta: Record<string, unknown>, synthesized: boolean): string {
+  const explicit = synthEdgeLabel({ metadata: meta });
+  if (explicit) return explicit;
   const parts: string[] = [];
   if (typeof meta.synthesizedBy === 'string') parts.push(`via ${meta.synthesizedBy}`);
   else if (synthesized) parts.push('inferred');

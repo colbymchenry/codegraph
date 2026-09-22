@@ -1,0 +1,6 @@
+{
+  "name": "codegraph-extension-marketplace",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": { "dev": "node server/dev.cjs", "build": "node server/build.cjs" }
+}

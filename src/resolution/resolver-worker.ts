@@ -1,3 +1,7 @@
+import { loadPlugins } from '../plugins/loader';
+import { emptyRegistry, withPlugins } from '../plugins/registry';
+import type { ResolvedPlugin } from '../plugins/api';
+let pluginRegistry = emptyRegistry('');
 /**
  * Resolver worker — one member of the parallel-resolution pool.
  *
@@ -24,7 +28,7 @@ import { parentPort, threadId } from 'worker_threads';
 import { createDatabase, SqliteDatabase } from '../db/sqlite-adapter';
 import { QueryBuilder } from '../db/queries';
 import { ReferenceResolver } from './index';
-import { SYNTH_PASSES } from './callback-synthesizer';
+import { getSynthPasses } from './callback-synthesizer';
 import { createYielder } from './cooperative-yield';
 import type { UnresolvedReference } from '../types';
 
@@ -38,7 +42,7 @@ let queries: QueryBuilder | null = null;
 let resolver: ReferenceResolver | null = null;
 
 type InMessage =
-  | { type: 'open'; dbPath: string; projectRoot: string }
+  | { type: 'open'; dbPath: string; projectRoot: string; plugins?: ResolvedPlugin[] }
   | { type: 'recycle'; id: number }
   | { type: 'resolve'; id: number; refs: UnresolvedReference[] }
   | { type: 'synth'; id: number; pass: string }
@@ -46,7 +50,9 @@ type InMessage =
 
 let dbPath: string | null = null;
 
-port.on('message', (msg: InMessage) => {
+port.on('message', async (msg: InMessage) => {
+  if (msg.type === 'open') pluginRegistry = await loadPlugins(msg.projectRoot, msg.plugins ?? [], 'resolver');
+  return withPlugins(pluginRegistry, () => {
   try {
     switch (msg.type) {
       case 'open': {
@@ -61,7 +67,7 @@ port.on('message', (msg: InMessage) => {
         resolver = new ReferenceResolver(msg.projectRoot, queries);
         resolver.initialize();
         if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] worker open: db=${tDb - tOpen}ms init=${Date.now() - tDb}ms`);
-        port.postMessage({ type: 'ready' });
+        port.postMessage({ type: 'ready', diagnostics: pluginRegistry.diagnostics });
         break;
       }
       case 'recycle': {
@@ -88,7 +94,7 @@ port.on('message', (msg: InMessage) => {
         const tRes = Date.now();
         const out = resolver.resolveListForAdmission(msg.refs);
         if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] worker resolve: ${msg.refs.length} refs in ${Date.now() - tRes}ms`);
-        port.postMessage({ type: 'result', id: msg.id, ...out });
+        port.postMessage({ type: 'result', id: msg.id, ...out, diagnostics: pluginRegistry.diagnostics });
         break;
       }
       case 'synth': {
@@ -98,7 +104,7 @@ port.on('message', (msg: InMessage) => {
         // its own error propagation — a throwing pass reports {type:'error'}
         // and the main thread retries it sequentially.
         if (!resolver || !queries) throw new Error('resolver-worker: synth before open');
-        const pass = SYNTH_PASSES.find((p) => p.name === msg.pass);
+        const pass = getSynthPasses().find((p) => p.name === msg.pass);
         if (!pass) throw new Error(`resolver-worker: unknown synth pass '${msg.pass}'`);
         const q = queries;
         const r = resolver;
@@ -106,7 +112,7 @@ port.on('message', (msg: InMessage) => {
           const t0 = Date.now();
           try {
             const edges = await pass.run(q, r.getResolutionContext(), createYielder());
-            port.postMessage({ type: 'synth-result', id: msg.id, edges, ms: Date.now() - t0 });
+            port.postMessage({ type: 'synth-result', id: msg.id, edges, diagnostics: pluginRegistry.diagnostics, ms: Date.now() - t0 });
           } catch (err) {
             port.postMessage({
               type: 'error',
@@ -137,4 +143,5 @@ port.on('message', (msg: InMessage) => {
       message: err instanceof Error ? err.message : String(err),
     });
   }
+  });
 });

@@ -1,3 +1,7 @@
+import { loadPlugins } from '../plugins/loader';
+import { emptyRegistry, withPlugins } from '../plugins/registry';
+import type { ResolvedPlugin } from '../plugins/api';
+let pluginRegistry = emptyRegistry('');
 /**
  * Parse Worker
  *
@@ -65,12 +69,14 @@ import type { Language, ExtractionResult } from '../types';
 const PARSER_RESET_INTERVAL = 5000;
 const parseCounts = new Map<Language, number>();
 
-parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; languages?: Language[]; frameworkNames?: string[]; language?: Language; grammarBuffers?: Record<string, Uint8Array> }) => {
+parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; languages?: Language[]; frameworkNames?: string[]; language?: Language; grammarBuffers?: Record<string, Uint8Array>; plugins?: ResolvedPlugin[]; projectRoot?: string }) => {
+  if (msg.type === 'load-grammars' && msg.projectRoot) pluginRegistry = await loadPlugins(msg.projectRoot, msg.plugins ?? [], 'parse');
+  return withPlugins(pluginRegistry, async () => {
   if (msg.type === 'load-grammars') {
     // Grammar WASM bytes pre-read by the main thread (when provided) make this
     // a memory load instead of a per-spawn disk read — see issue #1231.
     await loadGrammarsForLanguages(msg.languages!, msg.grammarBuffers);
-    parentPort!.postMessage({ type: 'grammars-loaded' });
+    parentPort!.postMessage({ type: 'grammars-loaded', diagnostics: pluginRegistry.diagnostics });
   } else if (msg.type === 'parse') {
     const { id, filePath, content, frameworkNames } = msg;
     // Worker-side parse clock: reported back with the result so the pool can
@@ -120,7 +126,7 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
         resetParser(language);
       }
 
-      parentPort!.postMessage({ type: 'parse-result', id, result, parseMs: performance.now() - t0 });
+      parentPort!.postMessage({ type: 'parse-result', id, result, diagnostics: pluginRegistry.diagnostics, parseMs: performance.now() - t0 });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
 
@@ -147,4 +153,5 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
   } else if (msg.type === 'shutdown') {
     parentPort!.postMessage({ type: 'shutdown-ack' });
   }
+  });
 });

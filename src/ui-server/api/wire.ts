@@ -1,3 +1,4 @@
+import { synthEdgeLabel } from '../../graph/synth-edge-label';
 /**
  * The wire shapes the viewer reads, and the rules for producing them.
  *
@@ -177,6 +178,7 @@ export interface WireEdge {
   confidence?: number;
   resolvedBy?: string;
   provenance?: string;
+  label?: string;
   synthesizedBy?: string;
   via?: string;
   registeredAt?: string;
@@ -192,6 +194,8 @@ export interface WireEdge {
 export function toWireEdge(edge: Edge): WireEdge {
   const meta = (edge.metadata ?? {}) as Record<string, unknown>;
   const wire: WireEdge = { kind: edge.kind };
+  const label = synthEdgeLabel(edge);
+  if (label) wire.label = label;
   if (typeof edge.line === 'number') wire.line = edge.line;
   if (typeof edge.column === 'number') wire.col = edge.column;
   if (typeof meta.confidence === 'number') wire.confidence = meta.confidence;

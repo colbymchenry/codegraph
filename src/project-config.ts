@@ -27,11 +27,13 @@ import * as path from 'path';
 import { Language } from './types';
 import { isLanguageSupported } from './extraction/grammars';
 import { logWarn } from './errors';
+import type { PluginEntry } from './plugins/api';
 
 /** Filename of the project-scoped config, resolved relative to the project root. */
 export const PROJECT_CONFIG_FILENAME = 'codegraph.json';
 
 export interface ProjectConfig {
+  plugins?: (string | PluginEntry)[];
   /** Map of custom file extension (`.foo`) to a supported language id. */
   extensions?: Record<string, string>;
   /**
@@ -86,6 +88,7 @@ export interface ProjectConfig {
 
 /** Parsed, validated view of a project's `codegraph.json`. */
 interface ParsedConfig {
+  plugins: PluginEntry[];
   extensions: Record<string, Language>;
   includeIgnored: string[];
   exclude: string[];
@@ -109,6 +112,7 @@ const cache = new Map<string, CacheEntry>();
 /** Shared frozen empties so the no-config path allocates nothing. */
 const EMPTY_EXTENSIONS: Record<string, Language> = Object.freeze({});
 const EMPTY_CONFIG: ParsedConfig = Object.freeze({
+  plugins: [],
   extensions: EMPTY_EXTENSIONS,
   includeIgnored: Object.freeze([]) as unknown as string[],
   exclude: Object.freeze([]) as unknown as string[],
@@ -162,12 +166,14 @@ function parseConfig(file: string): ParsedConfig {
 
   if (!parsed || typeof parsed !== 'object') return EMPTY_CONFIG;
 
+  const plugins = parsePluginEntries((parsed as ProjectConfig).plugins, file);
   const extensions = extractExtensions(parsed, file);
   const includeIgnored = extractIncludeIgnored(parsed, file);
   const exclude = extractExclude(parsed, file);
   const include = extractInclude(parsed, file);
   const deprioritize = extractPatternList(parsed, file, 'deprioritize');
   if (
+    plugins.length === 0 &&
     extensions === EMPTY_EXTENSIONS &&
     includeIgnored.length === 0 &&
     exclude.length === 0 &&
@@ -176,7 +182,7 @@ function parseConfig(file: string): ParsedConfig {
   ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude, include, deprioritize };
+  return { plugins, extensions, includeIgnored, exclude, include, deprioritize };
 }
 
 /**
@@ -446,4 +452,27 @@ export function addIncludeIgnoredPatterns(rootDir: string, patterns: string[]): 
   fs.writeFileSync(file, JSON.stringify(config, null, 2) + '\n');
   clearProjectConfigCache();
   return added;
+}
+
+/** Framework extensions, independent of file-suffix language overrides. */
+export function loadPluginEntries(rootDir: string): PluginEntry[] {
+  return loadParsedConfig(rootDir).plugins;
+}
+function parsePluginEntries(raw: unknown, file: string): PluginEntry[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) { logWarn('Ignoring plugins: expected an array', { file }); return []; }
+  const out: PluginEntry[] = [];
+  for (const item of raw) {
+    const e = typeof item === 'string' ? { name: item } : item;
+    if (!e || typeof e.name !== 'string' || !e.name.trim() ||
+        e.name.includes('\\') || e.name.startsWith('/') || e.name.startsWith('../') ||
+        (e.name.includes(':') && !/^managed:[a-z0-9][a-z0-9-]{0,63}$/.test(e.name)) ||
+        (e.options !== undefined && (!e.options || typeof e.options !== 'object' || Array.isArray(e.options))) ||
+        (e.replaces !== undefined && (!Array.isArray(e.replaces) || e.replaces.some((r: unknown) => typeof r !== 'string'))) ||
+        (e.enabled !== undefined && typeof e.enabled !== 'boolean')) {
+      logWarn('Ignoring invalid plugin entry', { file }); continue;
+    }
+    out.push(e as PluginEntry);
+  }
+  return out;
 }

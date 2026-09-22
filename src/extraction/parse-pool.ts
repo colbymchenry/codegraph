@@ -1,3 +1,4 @@
+import { currentPlugins, mergePluginDiagnostics } from '../plugins/registry';
 /**
  * Parse worker pool — runs tree-sitter parsing across N worker threads so a full
  * `codegraph index` uses every core instead of pinning one.
@@ -149,6 +150,7 @@ interface ParseJob {
 
 /** Shape of a message a worker posts back (grammar-load ack or a parse result). */
 interface ParseWorkerMessage {
+  diagnostics?: import('../plugins/api').PluginDiagnostic[];
   type?: string;
   id?: number;
   result?: ExtractionResult;
@@ -195,6 +197,7 @@ export class ParseWorkerPool {
   private totalCrashes = 0;
   private destroyed = false;
 
+  private readonly plugins = currentPlugins();
   private readonly languages: Language[];
   private readonly maxSize: number;
   private readonly recycleInterval: number;
@@ -284,10 +287,11 @@ export class ParseWorkerPool {
     // Load grammars; the worker replies 'grammars-loaded' and only then is idle.
     // Pre-read WASM bytes (when the orchestrator provided them) make this a
     // memory load instead of a per-spawn disk read.
-    w.postMessage({ type: 'load-grammars', languages: this.languages, grammarBuffers: this.grammarBuffers });
+    w.postMessage({ type: 'load-grammars', languages: this.languages, grammarBuffers: this.grammarBuffers, plugins: this.plugins?.resolved, projectRoot: this.plugins?.projectRoot });
   }
 
   private onMessage(w: ParsePoolWorker, m: ParseWorkerMessage): void {
+    mergePluginDiagnostics(this.plugins, m.diagnostics);
     if (m.type === 'grammars-loaded') {
       if (!this.workers.has(w)) return; // recycled/destroyed before ready
       this.pending.delete(w);

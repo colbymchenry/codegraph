@@ -1,3 +1,4 @@
+import { synthEdgeLabel } from '../graph/synth-edge-label';
 /**
  * MCP Tool Definitions
  *
@@ -2619,6 +2620,10 @@ export class ToolHandler {
     const m = edge.metadata as Record<string, unknown> | undefined;
     const registeredAt = typeof m?.registeredAt === 'string' ? m.registeredAt : undefined;
     const at = registeredAt ? ` @${registeredAt}` : '';
+    const extensionLabel = synthEdgeLabel(edge);
+    if (extensionLabel && typeof m?.synthesizedBy === 'string') {
+      return { label: extensionLabel, compact: `${extensionLabel}${at}`, registeredAt };
+    }
     if (m?.synthesizedBy === 'callback') {
       const via = m.via ? `\`${String(m.via)}\`` : 'a registrar';
       const field = m.field ? ` on .${String(m.field)}` : '';

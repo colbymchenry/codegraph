@@ -1,3 +1,4 @@
+import { currentPlugins, mergePluginDiagnostics } from '../plugins/registry';
 /**
  * ResolverPool — main-thread client for the parallel-resolution workers.
  *
@@ -147,6 +148,7 @@ export class ResolverPool {
   }
 
   private constructor(workerScript: string, dbPath: string, projectRoot: string, size: number) {
+    const plugins = currentPlugins();
     for (let i = 0; i < size; i++) {
       const worker = new Worker(workerScript);
       let readyResolve!: () => void;
@@ -156,7 +158,8 @@ export class ResolverPool {
         readyReject = reject;
       });
       const pw: PoolWorker = { worker, ready, busy: 0 };
-      worker.on('message', (msg: { type: string; id?: number; message?: string; edges?: Edge[]; ms?: number } & Partial<ChunkResult>) => {
+      worker.on('message', (msg: { diagnostics?: import('../plugins/api').PluginDiagnostic[]; type: string; id?: number; message?: string; edges?: Edge[]; ms?: number } & Partial<ChunkResult>) => {
+        mergePluginDiagnostics(plugins, msg.diagnostics);
         if (msg.type === 'ready') {
           readyResolve();
         } else if (msg.type === 'result' && msg.id !== undefined) {
@@ -205,7 +208,7 @@ export class ResolverPool {
           readyReject(this.failed!);
         }
       });
-      worker.postMessage({ type: 'open', dbPath, projectRoot });
+      worker.postMessage({ type: 'open', dbPath, projectRoot, plugins: currentPlugins()?.resolved });
       this.workers.push(pw);
     }
   }

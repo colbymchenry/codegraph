@@ -6,6 +6,11 @@
  */
 
 import * as path from 'path';
+import * as fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { loadPlugins, pluginFingerprint } from './plugins/loader';
+import { withPlugins, currentPlugins, type PluginRegistry } from './plugins/registry';
+import { loadPluginEntries } from './project-config';
 import {
   Node,
   NodeKind,
@@ -470,6 +475,88 @@ export class CodeGraph {
    * Uses a mutex to prevent concurrent indexing operations.
    */
   async indexAll(options: IndexOptions = {}): Promise<IndexResult> {
+    const plugins = await loadPlugins(this.projectRoot);
+    return withPlugins(plugins, async () => {
+      const result = await this.indexAllWithPlugins(options);
+      this.queries.setMetadata('plugins_last_run', JSON.stringify(plugins.diagnostics));
+      if (result.success && result.filesErrored === 0) this.queries.setMetadata('indexed_with_plugins', this.extensionStamp(plugins));
+      return result;
+    });
+  }
+
+  /** Last write's diagnostics; reading never evaluates extension modules. */
+  getPluginDiagnostics(): import('./plugins/api').PluginDiagnostic[] {
+    try { return JSON.parse(this.queries.getMetadata('plugins_last_run') ?? '[]'); } catch { return []; }
+  }
+
+  /** Build a candidate graph first; failed activation never replaces working data. */
+  async refreshPluginIndex(options: IndexOptions = {}): Promise<IndexResult> {
+    return this.indexMutex.withLock(async () => {
+      this.fileLock.acquire();
+      const stagingPath = path.join(getCodeGraphDir(this.projectRoot), `extension-stage-${randomUUID()}.db`);
+      let candidate: CodeGraph | undefined;
+      let attached = false;
+      try {
+        const plugins = await loadPlugins(this.projectRoot);
+        if (plugins.diagnostics.some(d => d.state !== 'loaded')) throw new Error(plugins.diagnostics.map(d => `${d.id}: ${d.message ?? d.state}`).join('; '));
+        const db = DatabaseConnection.initialize(stagingPath);
+        candidate = new CodeGraph(db, new QueryBuilder(db.getDb()), this.projectRoot);
+        candidate.fileLock = new FileLock(stagingPath + '.lock');
+        const result = await withPlugins(plugins, () => candidate!.indexAllWithPlugins(options));
+        if (!result.success || result.filesErrored || plugins.diagnostics.some(d => d.state !== 'loaded')) {
+          throw new Error('Extension activation failed: ' + [...result.errors.map(e => e.message), ...plugins.diagnostics.filter(d => d.state !== 'loaded').map(d => d.message)].join('; '));
+        }
+        candidate.close(); candidate = undefined;
+        const connection = this.db.getDb();
+        connection.prepare('ATTACH DATABASE ? AS extension_candidate').run(stagingPath);
+        attached = true;
+        connection.transaction(() => {
+          this.queries.clear();
+          for (const table of ['files', 'nodes', 'edges', 'unresolved_refs']) {
+            connection.exec(`INSERT INTO main.${table} SELECT * FROM extension_candidate.${table}`);
+          }
+          this.queries.setMetadata('plugins_last_run', JSON.stringify(plugins.diagnostics));
+          this.queries.setMetadata('indexed_with_plugins', this.extensionStamp(plugins));
+          this.queries.setMetadata('indexed_with_version', CodeGraphPackageVersion);
+          this.queries.setMetadata('indexed_with_extraction_version', String(EXTRACTION_VERSION));
+          this.queries.setMetadata('index_state', 'complete');
+        })();
+        connection.exec('DETACH DATABASE extension_candidate'); attached = false;
+        this.orchestrator = new ExtractionOrchestrator(this.projectRoot, this.queries);
+        this.resolver.clearCaches();
+        await this.rebuildNameSegmentVocab();
+        return result;
+      } finally {
+        candidate?.close();
+        if (attached) this.db.getDb().exec('DETACH DATABASE extension_candidate');
+        for (const suffix of ['', '-wal', '-shm', '.lock']) {
+          try { fs.unlinkSync(stagingPath + suffix); } catch { /* candidate cleanup */ }
+        }
+        this.fileLock.release();
+      }
+    });
+  }
+
+  private extensionStamp(plugins: PluginRegistry): string {
+    return pluginFingerprint(loadPluginEntries(this.projectRoot)) + ':' +
+      plugins.resolved.map(p => `${p.manifest.id}@${p.version}:${p.digest}`).join(',');
+  }
+
+  private preparePluginWrite(): void {
+    const plugins = currentPlugins();
+    if (!plugins) return;
+    const previous = this.queries.getMetadata('indexed_with_plugins');
+    if ((previous || plugins.resolved.length) && previous !== this.extensionStamp(plugins)) {
+      // Recreate derived graph state when options, replacement choices, code or
+      // the enabled set changes. Unchanged source hashes must not retain old
+      // extension contributions. User source and saved graph trails are untouched.
+      this.queries.clear();
+      this.orchestrator = new ExtractionOrchestrator(this.projectRoot, this.queries);
+    }
+    this.resolver.initialize();
+  }
+
+  private async indexAllWithPlugins(options: IndexOptions = {}): Promise<IndexResult> {
     return this.indexMutex.withLock(async () => {
       try {
         this.fileLock.acquire();
@@ -491,6 +578,7 @@ export class CodeGraph {
       // 'indexing' and a crashed init is re-run from scratch; existing DBs
       // (re-index/sync) never take this path. Kill switch:
       // CODEGRAPH_NO_FAST_INIT=1 (same pattern as CODEGRAPH_NO_WAL_DEFER).
+      try { this.preparePluginWrite(); } catch (err) { this.fileLock.release(); throw err; }
       const freshDb = this.queries.getNodeAndEdgeCount().nodes === 0;
       const fastInit = process.env.CODEGRAPH_NO_FAST_INIT !== '1' && freshDb;
       if (fastInit) {
@@ -762,6 +850,13 @@ export class CodeGraph {
    * Uses a mutex to prevent concurrent indexing operations.
    */
   async indexFiles(filePaths: string[]): Promise<IndexResult> {
+    const plugins = await loadPlugins(this.projectRoot);
+    if ((plugins.resolved.length || this.queries.getMetadata('indexed_with_plugins')) &&
+        this.queries.getMetadata('indexed_with_plugins') !== this.extensionStamp(plugins)) return this.indexAll();
+    return withPlugins(plugins, () => this.indexFilesWithPlugins(filePaths));
+  }
+
+  private async indexFilesWithPlugins(filePaths: string[]): Promise<IndexResult> {
     return this.indexMutex.withLock(async () => {
       try {
         this.fileLock.acquire();
@@ -782,6 +877,24 @@ export class CodeGraph {
    * Uses a mutex to prevent concurrent indexing operations.
    */
   async sync(options: IndexOptions = {}): Promise<SyncResult> {
+    const plugins = await loadPlugins(this.projectRoot);
+    if ((plugins.resolved.length || this.queries.getMetadata('indexed_with_plugins')) &&
+        this.queries.getMetadata('indexed_with_plugins') !== this.extensionStamp(plugins)) {
+      const result = await withPlugins(plugins, () => this.indexAllWithPlugins(options));
+      this.queries.setMetadata('plugins_last_run', JSON.stringify(plugins.diagnostics));
+      if (!result.success || result.filesErrored) throw new Error('Extension refresh failed; run codegraph index');
+      this.queries.setMetadata('indexed_with_plugins', this.extensionStamp(plugins));
+      return { filesChecked: result.filesIndexed, filesAdded: 0, filesModified: result.filesIndexed, filesRemoved: 0, nodesUpdated: result.nodesCreated, durationMs: result.durationMs };
+    }
+    return withPlugins(plugins, async () => {
+      this.resolver.initialize();
+      const result = await this.syncWithPlugins(options);
+      this.queries.setMetadata('plugins_last_run', JSON.stringify(plugins.diagnostics));
+      return result;
+    });
+  }
+
+  private async syncWithPlugins(options: IndexOptions = {}): Promise<SyncResult> {
     return this.indexMutex.withLock(async () => {
       try {
         this.fileLock.acquire();

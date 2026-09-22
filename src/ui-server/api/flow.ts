@@ -1,3 +1,4 @@
+import { synthEdgeLabel } from '../../graph/synth-edge-label';
 /**
  * `GET /api/flow` — the call path between two symbols, as cards.
  *
@@ -310,6 +311,8 @@ export function parseFlowQuery(query: URLSearchParams): FlowQuery {
  * §3.5 fixes the phrasing — "via callback · registered at file:line".
  */
 export function flowEdgeLabel(edge: Edge, upward: boolean): string {
+  const explicit = synthEdgeLabel(edge);
+  if (explicit) return explicit;
   const meta = (edge.metadata ?? {}) as Record<string, unknown>;
   const parts: string[] = [];
   if (edge.provenance === 'heuristic' && typeof meta.synthesizedBy === 'string') {

@@ -1,3 +1,4 @@
+import { currentPlugins } from '../../plugins/registry';
 /**
  * Framework Resolver Registry
  *
@@ -100,21 +101,22 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
  * Get all framework resolvers
  */
 export function getAllFrameworkResolvers(): FrameworkResolver[] {
-  return FRAMEWORK_RESOLVERS;
+  const plugins = currentPlugins();
+  return plugins ? [...FRAMEWORK_RESOLVERS.filter(r => !plugins.replaces.has(r.name)), ...plugins.frameworks] : FRAMEWORK_RESOLVERS;
 }
 
 /**
  * Get a resolver by name
  */
 export function getFrameworkResolver(name: string): FrameworkResolver | undefined {
-  return FRAMEWORK_RESOLVERS.find((r) => r.name === name);
+  return getAllFrameworkResolvers().find((r) => r.name === name);
 }
 
 /**
  * Detect which frameworks are used in a project
  */
 export function detectFrameworks(context: ResolutionContext): FrameworkResolver[] {
-  return FRAMEWORK_RESOLVERS.filter((resolver) => {
+  return getAllFrameworkResolvers().filter((resolver) => {
     try {
       return resolver.detect(context);
     } catch {
@@ -140,11 +142,7 @@ export function getApplicableFrameworks(
  * Register a custom framework resolver
  */
 export function registerFrameworkResolver(resolver: FrameworkResolver): void {
-  // Remove existing resolver with same name
-  const index = FRAMEWORK_RESOLVERS.findIndex((r) => r.name === resolver.name);
-  if (index !== -1) {
-    FRAMEWORK_RESOLVERS.splice(index, 1);
-  }
+  if (FRAMEWORK_RESOLVERS.some(r => r.name === resolver.name)) throw new Error(`Duplicate framework: ${resolver.name}`);
   FRAMEWORK_RESOLVERS.push(resolver);
 }
 
