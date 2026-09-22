@@ -209,9 +209,11 @@ Per-repository records, hashes and all nine raw responses are under
 
 ## Acceptance gaps
 
-- The runtime types and pack command exist, but a usable author template,
-  dedicated author test harness and complete SDK/author documentation are absent.
-  These recovery scripts are product-validation tools, not the authoring kit.
+- The author-kit gap at this regression checkpoint was subsequently closed for
+  the Linux preview by `8b30afb`: public SDK exports, starter generation, dedicated
+  author tests and a fresh generated-extension publish/install/removal exercise.
+  See [author acceptance](extensions-author-20260922.md) for its separate evidence
+  and limits; the original recovery scripts alone did not satisfy this gate.
 - The catalog selects the most recently published release. Installation rejects
   incompatible engine ranges but does not resolve an older compatible release.
 - Exception rollback is tested. Process termination between config/database

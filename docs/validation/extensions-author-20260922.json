@@ -1,0 +1,294 @@
+{
+  "sourceRevision": "8b30afb328fc8fe0c4d2d0b348d53bdbcb009acc",
+  "platform": "linux",
+  "authorOutsideCore": true,
+  "generatedId": "python-events",
+  "publicSdk": "@colbymchenry/codegraph",
+  "artifactSha256": "d87fe94c5016372984c579b31989c036e863b6102bbf027704c7ff8afe21e5c8",
+  "checks": [
+    "generated CLI starter",
+    "fresh local npm package installation",
+    "public JSDoc typecheck",
+    "generated positive and negative fixture harness",
+    "signed browser publisher submission",
+    "managed install from local release URL",
+    "actual event-to-Python-handler edge",
+    "non-Node target",
+    "managed removal clears contribution"
+  ],
+  "routes": [
+    {
+      "id": "plugin:python-events:checkout.events.yaml:1",
+      "kind": "route",
+      "name": "event:order.created",
+      "qualifiedName": "checkout.events.yaml::event:order.created:1",
+      "filePath": "checkout.events.yaml",
+      "language": "yaml",
+      "startLine": 1,
+      "endLine": 1,
+      "startColumn": 0,
+      "endColumn": 27,
+      "visibility": null,
+      "isExported": false,
+      "isAsync": false,
+      "isStatic": false,
+      "isAbstract": false,
+      "updatedAt": 0
+    }
+  ],
+  "edges": [
+    {
+      "source": "plugin:python-events:checkout.events.yaml:1",
+      "target": "function:58a0dab3277dcb344ab16c8590891a47",
+      "kind": "calls",
+      "metadata": {
+        "label": "Python event dispatch",
+        "registeredAt": "checkout.events.yaml:1",
+        "synthesizedBy": "python-events",
+        "confidence": 1,
+        "resolvedBy": "framework",
+        "refName": "python-events:send_receipt"
+      },
+      "line": 1,
+      "column": 0,
+      "provenance": null
+    }
+  ],
+  "commands": [
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+        "extensions",
+        "create",
+        "/tmp/codegraph-external-author-q7LLRf/python-events",
+        "--id",
+        "python-events"
+      ],
+      "cwd": "/tmp/codegraph-external-author-q7LLRf",
+      "exit": 0,
+      "seconds": 0.374
+    },
+    {
+      "command": [
+        "npm",
+        "pack",
+        "--ignore-scripts",
+        "--json",
+        "--pack-destination",
+        "/tmp/codegraph-external-author-q7LLRf"
+      ],
+      "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+      "exit": 0,
+      "seconds": 13.987
+    },
+    {
+      "command": [
+        "npm",
+        "install",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+        "--save-dev",
+        "/tmp/codegraph-external-author-q7LLRf/colbymchenry-codegraph-1.6.0.tgz"
+      ],
+      "cwd": "/tmp/codegraph-external-author-q7LLRf/python-events",
+      "exit": 0,
+      "seconds": 7.007
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/node_modules/typescript/bin/tsc",
+        "--allowJs",
+        "--checkJs",
+        "--noEmit",
+        "--skipLibCheck",
+        "--target",
+        "ES2022",
+        "--module",
+        "commonjs",
+        "/tmp/codegraph-external-author-q7LLRf/python-events/index.cjs"
+      ],
+      "cwd": "/tmp/codegraph-external-author-q7LLRf/python-events",
+      "exit": 0,
+      "seconds": 1.535
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/tmp/codegraph-external-author-q7LLRf/python-events/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js",
+        "extensions",
+        "test",
+        "."
+      ],
+      "cwd": "/tmp/codegraph-external-author-q7LLRf/python-events",
+      "exit": 0,
+      "seconds": 5.734
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/tmp/codegraph-external-author-q7LLRf/python-events/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js",
+        "extensions",
+        "pack",
+        ".",
+        "--out",
+        "/tmp/codegraph-external-author-q7LLRf/python-events-0.1.0.cgext"
+      ],
+      "cwd": "/tmp/codegraph-external-author-q7LLRf/python-events",
+      "exit": 0,
+      "seconds": 0.409
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/tmp/codegraph-external-author-q7LLRf/python-events/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js",
+        "extensions",
+        "install",
+        "http://127.0.0.1:39495/api/download/python-events/0.1.0",
+        "--path",
+        "/tmp/codegraph-external-author-q7LLRf/python-app"
+      ],
+      "cwd": "/tmp/codegraph-external-author-q7LLRf",
+      "exit": 0,
+      "seconds": 1.531
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/tmp/codegraph-external-author-q7LLRf/python-events/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js",
+        "extensions",
+        "remove",
+        "python-events",
+        "--path",
+        "/tmp/codegraph-external-author-q7LLRf/python-app"
+      ],
+      "cwd": "/tmp/codegraph-external-author-q7LLRf",
+      "exit": 0,
+      "seconds": 1.5
+    },
+    {
+      "command": [
+        "git",
+        "rev-parse",
+        "HEAD"
+      ],
+      "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+      "exit": 0,
+      "seconds": 0.005
+    }
+  ],
+  "browserErrors": [],
+  "generatedHarness": {
+    "apiVersion": 1,
+    "engineVersion": "1.6.0",
+    "artifactSha256": "d87fe94c5016372984c579b31989c036e863b6102bbf027704c7ff8afe21e5c8",
+    "cases": [
+      {
+        "name": "literal event reaches its Python handler; unknown and computed targets do not",
+        "assertions": 6,
+        "deterministic": true,
+        "removalClean": true
+      },
+      {
+        "name": "ambiguous Python handlers stay unresolved",
+        "assertions": 2,
+        "deterministic": true,
+        "removalClean": true
+      }
+    ]
+  },
+  "sourceFiles": {
+    "src/index.ts": "72b3178b79a999c42d117927a9db758b8fd918a08031dd2c8812bb1e28c54464",
+    "src/plugins/author.ts": "a485954370619e31aacf3e70f6126ac4b86dfa5e038d32fe8484b9c528b74979",
+    "src/plugins/author-template.ts": "effca678ce3c0f25aa620cda4f5ad49b77a6d894f1b02a5ea3246236f14e18c4",
+    "src/plugins/package.ts": "8e44d767ab0e461d46ebcad5b6e0fc80d9f69adb8b3978adea7cc53b58630f9e",
+    "src/plugins/loader.ts": "be9cebf6c35552b60958a627ef022059e9e879b9c002437233dd0f91115f58a6",
+    "src/plugins/cli.ts": "33d015518c878853c9c9a1fc449ea0cc7b31bbaa8433b65e4ebd0db0e43af894"
+  },
+  "validationReceipts": [
+    {
+      "command": [
+        "npm",
+        "run",
+        "build"
+      ],
+      "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+      "started_at": "2026-09-22T02:34:40.721360+00:00",
+      "revision": "1466021e1855a87f95bec6a7885935e4c412c02e",
+      "working_tree": " M package.json\n M scripts/pack-npm.sh\n M src/index.ts\n M src/plugins/cli.ts\n M src/plugins/loader.ts\n M src/plugins/package.ts\n?? __tests__/extension-author.test.ts\n?? docs/extensions/\n?? src/plugins/author-template.ts\n?? src/plugins/author.ts\n",
+      "exit_code": 0,
+      "seconds": 121.099,
+      "finished_at": "2026-09-22T02:36:41.821256+00:00",
+      "summary": [],
+      "name": "author-build-fixed",
+      "log_sha256": "fafb0510d7f8202de576141182b2c472d70c72f71c65d714403b96f6e201435a",
+      "source_provenance": "Ran on the uncommitted implementation later saved in 8b30afb328fc8fe0c4d2d0b348d53bdbcb009acc. Runtime/author source was unchanged afterward; documentation and the external acceptance runner were finalized before that commit."
+    },
+    {
+      "command": [
+        "npx",
+        "vitest",
+        "run",
+        "__tests__/extension-author.test.ts",
+        "__tests__/plugins.test.ts",
+        "__tests__/extension-marketplace.test.ts",
+        "__tests__/extension-explore.test.ts",
+        "__tests__/npm-sdk.test.ts",
+        "__tests__/cli-install-init.test.ts",
+        "--maxWorkers=2",
+        "--minWorkers=1"
+      ],
+      "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+      "started_at": "2026-09-22T02:36:55.849622+00:00",
+      "revision": "1466021e1855a87f95bec6a7885935e4c412c02e",
+      "working_tree": " M package.json\n M scripts/pack-npm.sh\n M src/index.ts\n M src/plugins/cli.ts\n M src/plugins/loader.ts\n M src/plugins/package.ts\n?? __tests__/extension-author.test.ts\n?? docs/extensions/\n?? src/plugins/author-template.ts\n?? src/plugins/author.ts\n",
+      "exit_code": 0,
+      "seconds": 16.937,
+      "finished_at": "2026-09-22T02:37:12.786761+00:00",
+      "summary": [
+        "Test Files  6 passed (6)",
+        "Tests  26 passed (26)",
+        "Duration  13.98s (transform 4.05s, setup 0ms, collect 9.63s, tests 11.18s, environment 4ms, prepare 891ms)"
+      ],
+      "name": "author-focused",
+      "log_sha256": "8b015c4302523b64d02aa89231844ee62273eee1cc5004dd83aa7a3c3827c4f9",
+      "source_provenance": "Ran on the uncommitted implementation later saved in 8b30afb328fc8fe0c4d2d0b348d53bdbcb009acc. Runtime/author source was unchanged afterward; documentation and the external acceptance runner were finalized before that commit."
+    },
+    {
+      "command": [
+        "node",
+        "scripts/validation/extension-author.cjs"
+      ],
+      "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+      "started_at": "2026-09-22T02:45:34.362731+00:00",
+      "revision": "8b30afb328fc8fe0c4d2d0b348d53bdbcb009acc",
+      "working_tree": "",
+      "exit_code": 0,
+      "seconds": 35.338,
+      "finished_at": "2026-09-22T02:46:09.700357+00:00",
+      "summary": [],
+      "name": "author-e2e-verified",
+      "log_sha256": "0fea1999575dc8d05e7c17023233a13f1b6a32a0758e46271e664bf2850bab98"
+    },
+    {
+      "command": [
+        "node",
+        "--test",
+        "scripts/validation/extensions-runtime.test.cjs"
+      ],
+      "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+      "started_at": "2026-09-22T02:46:43.214257+00:00",
+      "revision": "8b30afb328fc8fe0c4d2d0b348d53bdbcb009acc",
+      "working_tree": "",
+      "exit_code": 0,
+      "seconds": 8.019,
+      "finished_at": "2026-09-22T02:46:51.233044+00:00",
+      "summary": [],
+      "name": "author-compiled-workers",
+      "log_sha256": "55f18f7919ecc0245b730827ae8461cbcd46aac2615fbd5737a68b66da9dd788"
+    }
+  ],
+  "scope": "Author kit and local generated-extension acceptance; not a production release or hosted HTTPS/platform acceptance."
+}
