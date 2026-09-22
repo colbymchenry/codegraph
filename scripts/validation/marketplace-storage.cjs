@@ -83,6 +83,11 @@ async function main() {
     assert.deepEqual(await (await fetch(restart.origin+'/api/extensions')).json(),catalog);
     assert.equal(storage.openMarketplaceVolume(volume).id,initialized.id); passed('fresh production process and different deployment cwd preserve catalog/identity/artifacts');
     const backup = path.join(lab,'backup'); storage.backupMarketplaceVolume(volume,backup);
+    const pending = publish('in-flight-demo','1.0.0','before-commit'); await waitFor(()=>fs.existsSync(pending.ready));
+    const concurrentBackup = path.join(lab,'concurrent-backup'); storage.backupMarketplaceVolume(volume,concurrentBackup);
+    pending.proc.kill('SIGKILL'); await pending.done;
+    assert.deepEqual(storage.verifyMarketplaceDatabase(path.join(concurrentBackup,'registry.sqlite')),before);
+    passed('backup concurrent with uncommitted publication captures only complete releases');
     const restored = path.join(lab,'restored'); storage.restoreMarketplaceVolume(backup,restored);
     assert.deepEqual(storage.verifyMarketplaceDatabase(path.join(restored,'registry.sqlite')),before);
     const isolated = await server(restored,lab);

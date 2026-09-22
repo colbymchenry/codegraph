@@ -168,4 +168,4 @@ async function cli(args, expected = 0) {
     await page?.screenshot({ path: path.join(out, 'failure.png'), fullPage: true }).catch(() => {});
     fs.writeFileSync(path.join(out, 'failure.json'), JSON.stringify({ checks, error: String(error.stack).replace(/token=[a-f0-9]+/g, 'token=[redacted]') }, null, 2)); throw error;
   } finally { await browser?.close(); await https?.close(); await bridge?.close(); await server?.close(); fs.rmSync(lab, { recursive: true, force: true }); }
-})().catch(error => { console.error(String(error.stack).replace(/token=[a-f0-9]+/g, 'token=[redacted]')); process.exitCode = 1; });
+})().catch(error => { console.error(String(error.stack).replace(/token=[a-f0-9]+/g, 'token=[redacted]')); if(error.cause) console.error(error.cause); process.exitCode = 1; });

@@ -8,11 +8,12 @@ import { parsePackage, sha256 } from './package';
 
 const databaseName = 'registry.sqlite';
 const markerName = 'registry-volume.json';
-function sync(file: string): void {
-  const fd = fs.openSync(file, 'r');
+function sync(file: string, directory = false): void {
+  // Windows FlushFileBuffers requires a writable file handle.
+  const fd = fs.openSync(file, directory ? 'r' : 'r+');
   try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
 }
-function syncDir(directory: string): void { if (process.platform !== 'win32') sync(directory); }
+function syncDir(directory: string): void { if (process.platform !== 'win32') sync(directory, true); }
 function writeNew(file: string, data: string): void {
   const fd = fs.openSync(file, 'wx', 0o600);
   try { fs.writeFileSync(fd, data); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }

@@ -34,6 +34,9 @@ jobs:
     timeout-minutes: 35
     env:
       CODEGRAPH_TELEMETRY: '0'
+      # This increment changes registry storage and hosted browser behavior.
+      # Prior core lifecycle/native-path/70-kill matrices remain recorded.
+      NATIVE_VALIDATION_SCOPE: marketplace
     steps:
       - uses: actions/checkout@v4
         with:

@@ -8,6 +8,7 @@ const out = path.resolve(process.env.NATIVE_OUTPUT || `.qa/native/${process.plat
 fs.mkdirSync(out, { recursive: true });
 const version = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
 const metadata = { revision: version, platform: process.platform, arch: process.arch, release: os.release(),
+  scope: process.env.NATIVE_VALIDATION_SCOPE || 'full', notRun: [],
   node: process.version, runnerOS: process.env.RUNNER_OS, runnerArch: process.env.RUNNER_ARCH,
   imageOS: process.env.ImageOS, imageVersion: process.env.ImageVersion,
   githubRun: process.env.GITHUB_RUN_ID, githubAttempt: process.env.GITHUB_RUN_ATTEMPT,
@@ -20,6 +21,9 @@ const playwright = process.env.PLAYWRIGHT_MODULE || path.join(root, '.qa/browser
 env.PLAYWRIGHT_MODULE = playwright;
 env.CHROME_PATH = process.env.CHROME_PATH || require(playwright).chromium.executablePath();
 async function run(name, command, args, timeout = 360000, overrides = {}) {
+  if (metadata.scope === 'marketplace' && !['build','marketplace-build','focused','registry-storage','external-author','compatibility','browser'].includes(name)) {
+    metadata.notRun.push({ name, reason: 'Unchanged core lifecycle; retain prior native evidence instead of rerunning' }); save(); return true;
+  }
   const step = { name, command: [command, ...args], cwd: root, revision: version, overrides, started: new Date().toISOString(), status: 'running' };
   metadata.steps.push(step); save(); console.log('START', name);
   const logFile = path.join(out, name + '.log'); const log = fs.openSync(logFile, 'w');

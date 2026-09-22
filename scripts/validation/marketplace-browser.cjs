@@ -173,6 +173,7 @@ function routes(root) {
     await popup.close();
     await page.getByText('Reconnect CodeGraph', { exact: true }).waitFor();
     checks.push('closed local companion expires the connection visibly');
+    await page.setViewportSize({ width: 1440, height: 1000 });
     await page.getByRole('link', { name: 'Publish an extension' }).click();
     await page.locator('#artifact').setInputFiles({ name: 'example.cgext', mimeType: 'application/json', buffer: artifact('4.0.0') });
     for (const [id, value] of Object.entries({ name: 'Browser example', publisher: 'Recovery publisher', description: 'Outage check', source: 'https://example.com/source', readme: 'Outage check' })) await page.locator('#'+id).fill(value);
@@ -194,4 +195,4 @@ function routes(root) {
     if (attacker) await new Promise(resolve => attacker.close(resolve));
     fs.rmSync(temp, { recursive: true, force: true });
   }
-})().catch(error => { console.error(safeError(error)); process.exitCode = 1; });
+})().catch(error => { console.error(safeError(error)); if(error.cause) console.error(error.cause); process.exitCode = 1; });

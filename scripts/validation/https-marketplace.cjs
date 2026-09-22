@@ -20,7 +20,7 @@ exports.httpsMarketplace = async function(port, out) {
         try { const response = await fetch(url+'/api/health',{signal:AbortSignal.timeout(5000)}); if(response.ok && (await response.json()).ok) {
           fs.writeFileSync(path.join(out,'https-transport.json'),JSON.stringify({origin:url,kind:'temporary-public-tunnel',durableHosting:false,verifiedAt:new Date().toISOString()},null,2));
           return { origin:url, close };
-        }} catch { /* Wait for public route propagation. */ }
+        }} catch (error) { fs.appendFileSync(path.join(out,'https-network-errors.log'),new Date().toISOString()+' '+String(error)+' '+String(error.cause?.stack || '')+'\n'); }
       }
       await new Promise(resolve=>setTimeout(resolve,500));
     }
