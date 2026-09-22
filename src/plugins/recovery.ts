@@ -101,6 +101,17 @@ function checkOwner(root: string, journal?: RecordV1): void {
   }
   fail(root, 'torn/unknown owner record without a valid transaction; confirm no legacy installer is running before archiving the owner record');
 }
+function checkGraphOwner(root: string, transactionPid?: number): void {
+  const lock = path.join(root, '.codegraph', 'codegraph.lock'), raw = read(lock)?.trim();
+  if (raw === undefined) return;
+  if (transactionPid && raw === String(transactionPid)) return; // orphan proved by the coordinator
+  if (/^[1-9]\d*$/.test(raw)) {
+    try { process.kill(Number(raw), 0); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') { remove(lock); return; } }
+    fail(root, `legacy graph owner ${raw} may be live (or PID reused); wait for it to finish before retrying, regardless of lock age`);
+  }
+  fail(root, 'unknown legacy graph lock; confirm its owner has stopped before archiving codegraph.lock');
+}
 function marker(root: string, graphExisted: boolean): string | null {
   const file = path.join(root, '.codegraph', 'codegraph.db');
   if (!fs.existsSync(file)) return null;
@@ -153,6 +164,7 @@ function verifyPackages(root: string, config: string | null, trust: string | nul
 function reconcile(root: string): boolean {
   const r = loadRecord(root); checkOwner(root, r);
   if (!r) { remove(ownerPath(root)); return false; }
+  checkGraphOwner(root, r.pid);
   const committed = marker(root, r.graphExisted) === r.id;
   const configFile = path.join(root, 'codegraph.json'), trustFile = path.join(dir(root), 'trust.json');
   const configRaw = read(configFile), trustRaw = read(trustFile);
@@ -202,7 +214,7 @@ export function withExtensionGuardSync<T>(root: string, work: () => T): T {
   root = fs.realpathSync(root);
   if (context.getStore() === root) return work();
   const release = acquire(root);
-  try { return context.run(root, () => { reconcile(root); return work(); }); }
+  try { return context.run(root, () => { reconcile(root); checkGraphOwner(root); return work(); }); }
   finally { release(); }
 }
 /** Indexers and lifecycle writers share this OS-released lock for their full run. */
@@ -210,7 +222,7 @@ export async function withExtensionGuard<T>(root: string, work: () => Promise<T>
   root = fs.realpathSync(root);
   if (context.getStore() === root) return work();
   const release = acquire(root);
-  try { return await context.run(root, async () => { reconcile(root); return work(); }); }
+  try { return await context.run(root, async () => { reconcile(root); checkGraphOwner(root); return work(); }); }
   finally { release(); }
 }
 export class ExtensionTransaction {

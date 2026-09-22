@@ -183,6 +183,12 @@ if (process.argv[2] === '--child') {
         await run(conflict); clean(conflict); assert.equal(JSON.parse(config(conflict)).resolvedByUser, true);
         receipt({ action: 'conflicting plugin edit', boundary, decision: 'no overwrite; actionable repair then recovery', passed: true });
       }
+      const graphLocked = await project(true), graphLock = path.join(graphLocked, '.codegraph/codegraph.lock');
+      fs.writeFileSync(graphLock, String(process.pid)); fs.utimesSync(graphLock, 1, 1);
+      assert.match((await run(graphLocked, 'update', 1)).stderr, /legacy graph owner/);
+      assert.equal(fs.readFileSync(graphLock, 'utf8'), String(process.pid)); fs.unlinkSync(graphLock);
+      fs.writeFileSync(graphLock, '{'); assert.match((await run(graphLocked, 'index', 1)).stderr, /unknown legacy graph lock/); fs.unlinkSync(graphLock);
+      receipt({ action: 'live aged/torn legacy graph lock', decision: 'no age-based stealing or guessing', passed: true });
       const settings = await project(true); await killAt(settings, 'update', 'config_written');
       const changedSettings = JSON.parse(config(settings)); changedSettings.exclude = ['handlers.py'];
       const changedRaw = JSON.stringify(changedSettings); fs.writeFileSync(path.join(settings, 'codegraph.json'), changedRaw);

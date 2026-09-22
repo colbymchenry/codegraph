@@ -274,7 +274,7 @@ export class CodeGraph {
    * file can't be unlinked there, and st_ino is unreliable).
    */
   reopenIfReplaced(): boolean {
-    this.ensureExtensionState();
+    recoverExtensions(this.projectRoot);
     if (!this.db.isReplacedOnDisk()) return false;
     const dbPath = this.db.getPath();
     // Open the live file FIRST — if that throws (e.g. mid-recreate), the old
@@ -503,7 +503,6 @@ export class CodeGraph {
    * Get the project root directory
    */
   getProjectRoot(): string {
-    this.ensureExtensionState();
     return this.projectRoot;
   }
 
