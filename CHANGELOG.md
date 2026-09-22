@@ -169,6 +169,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Trails are plain JSON, one file per trail, under `.codegraph/ui/trails/` — already ignored by git, so they stay yours by default. **Export** hands you the file if you'd rather commit one for the team. This is the only thing the viewer writes: it still never indexes, never changes your graph, and never touches a line of your code. Start it with `codegraph ui --read-only` and it won't write even that — saved trails can still be opened, just not saved or deleted.
 
 ### Fixes
+- A file over the size limit is no longer read before it is skipped: committed video and blob fixtures used to be decoded in full — a 400 MB fixture cost 3.4 GB of memory — only to be discarded, and the same file was read again by every resolution pass. Its size stamp now stands in for its content, during indexing and when checking for changes. (#1910)
 
 - Extension installation and interrupted-operation recovery now honor `CODEGRAPH_DIR` without creating or modifying the default data directory.
 
