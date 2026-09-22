@@ -119,10 +119,31 @@ export function isInitialized(projectRoot: string): boolean {
   return hasCodeGraphSchema(dbPath, st);
 }
 
-/** `codegraph.db` exists at `projectRoot` but does not carry the schema (#1895). */
+/**
+ * `codegraph.db` exists at `projectRoot` but does not carry the schema, and
+ * `init` can add it in place: an empty file, or a SQLite database without the
+ * codegraph tables (#1895). A file that is not SQLite at all is NOT this case —
+ * see {@link hasForeignDbFile}.
+ */
 export function hasSchemalessDb(projectRoot: string): boolean {
   const dbPath = path.join(getCodeGraphDir(projectRoot), 'codegraph.db');
-  return fs.existsSync(dbPath) && !isInitialized(projectRoot);
+  let st: fs.Stats;
+  try { st = fs.statSync(dbPath); } catch { return false; }
+  if (!st.isFile() || isInitialized(projectRoot)) return false;
+  return st.size === 0 || readsAsSqlite(dbPath);
+}
+
+/**
+ * `codegraph.db` exists at `projectRoot` and is not a SQLite database (no
+ * header magic): SQLite refuses to open it, so `init` cannot rebuild it in
+ * place. The caller must say so rather than promise a repair; nothing here
+ * deletes the file.
+ */
+export function hasForeignDbFile(projectRoot: string): boolean {
+  const dbPath = path.join(getCodeGraphDir(projectRoot), 'codegraph.db');
+  let st: fs.Stats;
+  try { st = fs.statSync(dbPath); } catch { return false; }
+  return st.isFile() && st.size > 0 && !readsAsSqlite(dbPath);
 }
 
 const SQLITE_MAGIC = Buffer.from('SQLite format 3\0', 'latin1');
