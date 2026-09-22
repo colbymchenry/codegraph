@@ -103,7 +103,13 @@ function render() {
   else if (location.pathname.startsWith('/extensions/')) renderDetail(decodeURIComponent(location.pathname.split('/')[2]));
   else renderCatalog();
 }
-async function refresh() { state.catalog = await api('/api/extensions'); render(); await refreshSelections(); }
+async function refresh() {
+  state.catalog = await api('/api/extensions');
+  // A catalog response can arrive after navigation and form entry over HTTPS.
+  // Keep the live form (including its File input and signing state) intact.
+  if (location.pathname !== '/publish' || !document.querySelector('#publish-form')) render();
+  await refreshSelections();
+}
 function connect() {
   if (state.connection) { openCompanion(); return; }
   document.querySelector('#connect-command').textContent = `codegraph extensions connect --marketplace ${location.origin}`;
@@ -220,4 +226,4 @@ document.addEventListener('submit',async event=>{
   }catch(e){status.textContent=e.message;}finally{submit.disabled=false;}
 });
 app.innerHTML='<div class="loading">Loading extensions…</div>';
-refresh().catch(e=>{app.innerHTML=`<section class="section detail"><h1>Marketplace unavailable</h1><p>${escape(e.message)}</p><button id="retry">Try again</button></section>`;document.querySelector('#retry').onclick=()=>location.reload();});
+refresh().catch(e=>{if(document.querySelector('#publish-form')){toast(e.message);return;}app.innerHTML=`<section class="section detail"><h1>Marketplace unavailable</h1><p>${escape(e.message)}</p><button id="retry">Try again</button></section>`;document.querySelector('#retry').onclick=()=>location.reload();});

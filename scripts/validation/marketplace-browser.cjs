@@ -45,6 +45,11 @@ function routes(root) {
     const page = await context.newPage();
     debugPage = page;
     const pageErrors = []; page.on('pageerror', e => pageErrors.push(e.message));
+    let releaseCatalog, firstCatalog = true;
+    await page.route('**/api/extensions', async route => {
+      if (firstCatalog) { firstCatalog = false; await new Promise(resolve => { releaseCatalog = resolve; }); }
+      await route.continue();
+    });
     await page.goto(bridge.connectionUrl, { waitUntil: 'domcontentloaded' });
     if (https) assert.equal(await page.evaluate(() => isSecureContext), true);
     // Reproduce slow native file reads: metadata must never erase typed fields.
@@ -61,6 +66,13 @@ function routes(root) {
       await page.locator('#source').fill('https://example.com/recovery-source');
       await page.locator('#readme').fill('Validation-only extension. Adds one explicit route to each TypeScript file.');
       await page.locator('#package-summary').filter({ hasText: 'v'+version+' ·' }).waitFor();
+      if (releaseCatalog) {
+        const response = page.waitForResponse(r=>r.url().endsWith('/api/extensions'));
+        releaseCatalog(); releaseCatalog = undefined; await response;
+        await page.waitForTimeout(200);
+        assert.equal(await page.locator('#artifact').evaluate(input=>input.files[0]?.name),'example.cgext');
+        checks.push('late catalog response preserves the entered publisher form and package');
+      }
       assert.equal(await page.locator('#description').inputValue(), 'A second framework used for end-to-end validation.');
       assert.equal(await page.locator('#source').inputValue(), 'https://example.com/recovery-source');
       await page.getByRole('button', { name: 'Publish release' }).click();
