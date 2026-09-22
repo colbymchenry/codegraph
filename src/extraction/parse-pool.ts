@@ -30,6 +30,7 @@ import { currentPlugins, mergePluginDiagnostics } from '../plugins/registry';
 
 import { Worker } from 'worker_threads';
 import type { Language, ExtractionResult } from '../types';
+import type { ReusableExtraction } from './core-reuse';
 
 /**
  * Minimal worker surface the pool drives — satisfied by a real `worker_threads`
@@ -52,6 +53,8 @@ export interface ParseTask {
   content: string;
   language: Language;
   frameworkNames?: string[];
+  reuseCore?: boolean;
+  coreExtraction?: ExtractionResult;
 }
 
 /** Default upper bound on the pool size derived from the core count. */
@@ -261,7 +264,7 @@ export class ParseWorkerPool {
    * if the parse times out or its worker crashes — the caller records the error
    * and (for worker-exit/OOM/timeout rejections) re-attempts in its retry pass.
    */
-  requestParse(task: ParseTask): Promise<ExtractionResult> {
+  requestParse(task: ParseTask): Promise<ReusableExtraction> {
     if (this.destroyed) return Promise.reject(new Error('Parse pool destroyed'));
     return new Promise<ExtractionResult>((resolve, reject) => {
       this.queue.push({ id: this.nextId++, task, resolve, reject, settled: false });
@@ -378,6 +381,8 @@ export class ParseWorkerPool {
       content: job.task.content,
       frameworkNames: job.task.frameworkNames,
       language: job.task.language,
+      reuseCore: job.task.reuseCore,
+      coreExtraction: job.task.coreExtraction,
     });
   }
 

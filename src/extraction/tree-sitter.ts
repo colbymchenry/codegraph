@@ -7220,6 +7220,13 @@ export function extractFromSource(
     }
   }
 
+  return applyFrameworkExtraction(result, filePath, source, detectedLanguage, frameworkNames);
+}
+
+/** Internal split: framework hooks always rerun, including when core parsing is reused. */
+export function applyFrameworkExtraction(
+  result: ExtractionResult, filePath: string, source: string, detectedLanguage: Language, frameworkNames?: string[]
+): ExtractionResult {
   // Framework-specific extraction (routes, middleware, etc.)
   if (frameworkNames && frameworkNames.length > 0) {
     const allResolvers = getAllFrameworkResolvers();

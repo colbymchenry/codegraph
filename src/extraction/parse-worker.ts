@@ -18,7 +18,8 @@ try {
 } catch { /* cache is best-effort */ }
 
 import { parentPort } from 'worker_threads';
-import { extractFromSource } from './tree-sitter';
+import { extractFromSource, applyFrameworkExtraction } from './tree-sitter';
+import type { ReusableExtraction } from './core-reuse';
 import { detectLanguage, loadGrammarsForLanguages, resetParser } from './grammars';
 import { tryKernelExtractRaw } from './kernel';
 import { getAllFrameworkResolvers, getApplicableFrameworks } from '../resolution/frameworks';
@@ -69,7 +70,7 @@ import type { Language, ExtractionResult } from '../types';
 const PARSER_RESET_INTERVAL = 5000;
 const parseCounts = new Map<Language, number>();
 
-parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; languages?: Language[]; frameworkNames?: string[]; language?: Language; grammarBuffers?: Record<string, Uint8Array>; plugins?: ResolvedPlugin[]; projectRoot?: string }) => {
+parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; languages?: Language[]; frameworkNames?: string[]; language?: Language; grammarBuffers?: Record<string, Uint8Array>; plugins?: ResolvedPlugin[]; projectRoot?: string; reuseCore?: boolean; coreExtraction?: ExtractionResult }) => {
   if (msg.type === 'load-grammars' && msg.projectRoot) pluginRegistry = await loadPlugins(msg.projectRoot, msg.plugins ?? [], 'parse');
   return withPlugins(pluginRegistry, async () => {
   if (msg.type === 'load-grammars') {
@@ -95,7 +96,12 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
       // buffer clone is a flat memcpy). Only when no applicable framework has
       // an extract() hook: those merge extra nodes/refs into the DECODED
       // result inside extractFromSource, so such files keep the decoded path.
-      let result: ExtractionResult | undefined;
+      let result: ReusableExtraction | undefined;
+      if (msg.reuseCore) {
+        const core = msg.coreExtraction ?? extractFromSource(filePath!, content!, language);
+        result = applyFrameworkExtraction(structuredClone(core), filePath!, content!, language, frameworkNames);
+        if (!msg.coreExtraction) result.coreExtraction = core;
+      }
       const frameworksNeedDecode =
         frameworkNames && frameworkNames.length > 0
           ? getApplicableFrameworks(
@@ -103,7 +109,7 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
               language
             ).some((fw) => !!fw.extract)
           : false;
-      if (!frameworksNeedDecode) {
+      if (!result && !frameworksNeedDecode) {
         const raw = tryKernelExtractRaw(filePath!, content!, language);
         if (raw) {
           result = {

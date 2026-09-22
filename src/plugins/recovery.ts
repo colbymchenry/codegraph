@@ -13,6 +13,7 @@ const context = new AsyncLocalStorage<string>();
 const transitions = channel('codegraph.extension.transaction');
 const dir = (root: string) => path.join(getCodeGraphDir(root), 'plugins');
 const recordPath = (root: string) => path.join(dir(root), 'transaction.json');
+const candidatePath = (root: string) => path.join(dir(root), 'candidate.json');
 const ownerPath = (root: string) => path.join(dir(root), 'operation.lock');
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const indexSettings = ['extensions', 'includeIgnored', 'exclude', 'include'];
@@ -80,7 +81,7 @@ function acquire(root: string): () => void {
     db.exec('PRAGMA busy_timeout=0; CREATE TABLE IF NOT EXISTS lifecycle_mutex (id INTEGER); BEGIN IMMEDIATE');
   } catch (error) {
     db.close();
-    throw new Error(`Extension/index operation is active or its coordinator is unavailable at ${root}. Retry after the owner finishes; no live lock is stolen. ${String(error)}`);
+    throw new Error(`Extension/index operation is active or its coordinator is unavailable at ${root}. Retry after the owner finishes; no live lock is stolen. ${String(error)}`, { cause: error });
   }
   return () => { try { db.exec('ROLLBACK'); } finally { db.close(); } };
 }
@@ -161,10 +162,37 @@ function verifyPackages(root: string, config: string | null, trust: string | nul
     } catch (error) { fail(root, `installed package ${entry.name} is missing or changed (${String(error)}); restore the recorded package bytes/trust from backup before recovery`); }
   }
 }
+/** Only called while the project coordinator is owned. No config/trust mutation. */
+export function beginGraphCandidate(root: string, id: string): void {
+  if (!uuid.test(id) || fs.existsSync(candidatePath(root))) throw new Error('Unreconciled graph candidate');
+  const payload = JSON.stringify({ format: 1, id, pid: process.pid });
+  durableWrite(candidatePath(root), JSON.stringify({ payload, sha256: sha256(payload) }));
+}
+export function finishGraphCandidate(root: string): boolean {
+  const raw = read(candidatePath(root)); if (raw === null) return false;
+  let record: { format: number; id: string; pid: number };
+  try {
+    const envelope = JSON.parse(raw);
+    if (sha256(envelope.payload) !== envelope.sha256) throw new Error('checksum');
+    record = JSON.parse(envelope.payload);
+    if (record.format !== 1 || !uuid.test(record.id) || !Number.isSafeInteger(record.pid) || record.pid <= 0) throw new Error('fields');
+  } catch {
+    throw new Error(`Invalid graph candidate record at ${candidatePath(root)}. Preserve it and restore a verified record before retrying; no project files were overwritten.`);
+  }
+  // The coordinator, not PID age, proves that an earlier writer has ended.
+  checkGraphOwner(root, record.pid);
+  const stage = path.join(getCodeGraphDir(root), `extension-stage-${record.id}.db`);
+  for (const suffix of ['', '-wal', '-shm', '.lock']) remove(stage + suffix);
+  const lock = path.join(getCodeGraphDir(root), 'codegraph.lock');
+  if (read(lock)?.trim() === String(record.pid)) remove(lock);
+  remove(candidatePath(root));
+  return true;
+}
 /** Reconcile synchronously under the coordinator; never evaluates extension code. */
 function reconcile(root: string): boolean {
+  const candidateCleaned = finishGraphCandidate(root);
   const r = loadRecord(root); checkOwner(root, r);
-  if (!r) { remove(ownerPath(root)); return false; }
+  if (!r) { remove(ownerPath(root)); return candidateCleaned; }
   checkGraphOwner(root, r.pid);
   const committed = marker(root, r.graphExisted) === r.id;
   const configFile = path.join(root, 'codegraph.json'), trustFile = path.join(dir(root), 'trust.json');
@@ -205,10 +233,19 @@ function reconcile(root: string): boolean {
 export function recoverExtensions(root: string): boolean {
   root = path.resolve(root);
   if (context.getStore() === root) return false;
-  if (!fs.existsSync(recordPath(root)) && !fs.existsSync(ownerPath(root))) return false;
+  if (!fs.existsSync(recordPath(root)) && !fs.existsSync(ownerPath(root)) && !fs.existsSync(candidatePath(root))) return false;
   root = fs.realpathSync(root);
   if (context.getStore() === root) return false;
-  const release = acquire(root);
+  let release: () => void;
+  try { release = acquire(root); }
+  catch (error) {
+    // A live graph-only candidate leaves the committed graph readable. Managed
+    // config/trust transactions still require the existing exclusive recovery.
+    const cause = (error as Error).cause as Error | undefined;
+    if (!fs.existsSync(recordPath(root)) && !fs.existsSync(ownerPath(root)) &&
+        fs.existsSync(candidatePath(root)) && /database is locked/i.test(cause?.message ?? '')) return false;
+    throw error;
+  }
   try { return context.run(root, () => reconcile(root)); } finally { release(); }
 }
 export function withExtensionGuardSync<T>(root: string, work: () => T): T {

@@ -5,10 +5,12 @@
  * knowledge graph from any codebase.
  */
 
+import { CoreExtractionReuse } from './extraction/core-reuse';
+import { channel } from 'node:diagnostics_channel';
 import * as path from 'path';
 import * as fs from 'node:fs';
-import { randomUUID } from 'node:crypto';
-import { recoverExtensions, withExtensionGuard, withExtensionGuardSync, extensionTransition } from './plugins/recovery';
+import { randomUUID, createHash } from 'node:crypto';
+import { recoverExtensions, withExtensionGuard, withExtensionGuardSync, extensionTransition, beginGraphCandidate, finishGraphCandidate } from './plugins/recovery';
 import { loadPlugins, pluginFingerprint } from './plugins/loader';
 import { withPlugins, currentPlugins, type PluginRegistry } from './plugins/registry';
 import { loadPluginEntries } from './project-config';
@@ -47,6 +49,7 @@ import {
   SyncResult,
   extractFromSource,
   initGrammars,
+  scanDirectory,
 } from './extraction';
 import {
   ReferenceResolver,
@@ -160,6 +163,7 @@ export class CodeGraph {
   private queries: QueryBuilder;
   private projectRoot: string;
   private extensionCommit: string | null = null;
+  private semanticParseReuse = new CoreExtractionReuse();
   // Assigned via wireLayers() from the constructor (and again on reopen) — the
   // `!` tells TS these are definitely set even though the assignment is one
   // method call away from the constructor body.
@@ -252,7 +256,7 @@ export class CodeGraph {
 
   private ensureExtensionState(): void {
     const recovered = recoverExtensions(this.projectRoot);
-    const commit = this.queries.getMetadata('extension_transaction');
+    const commit = [this.queries.getMetadata('extension_transaction'), this.queries.getMetadata('semantic_update')].join(':');
     if (recovered || commit !== this.extensionCommit) {
       this.queries.clearCache(); this.resolver.clearCaches();
       this.extensionCommit = commit;
@@ -494,6 +498,7 @@ export class CodeGraph {
    */
   close(): void {
     this.unwatch();
+    this.semanticParseReuse.clear();
     // Release file lock if held
     this.fileLock.release();
     this.db.close();
@@ -540,19 +545,43 @@ export class CodeGraph {
     return withExtensionGuard(this.projectRoot, () => this.refreshPluginIndexGuarded(options));
   }
 
+  /** Observed indexed inputs, not a filesystem lock or a declaration of arbitrary plugin I/O. */
+  private semanticInputStamp(): string {
+    const hash = createHash('sha256');
+    const files = new Set(scanDirectory(this.projectRoot));
+    for (const file of ['codegraph.json', '.gitignore']) if (fs.existsSync(path.join(this.projectRoot, file))) files.add(file);
+    for (const file of [...files].sort()) {
+      const full = path.join(this.projectRoot, file), stat = fs.statSync(full);
+      hash.update(JSON.stringify([file, stat.size, stat.mtimeMs, stat.ctimeMs]));
+      hash.update(fs.readFileSync(full));
+    }
+    return hash.digest('hex');
+  }
+
   private async refreshPluginIndexGuarded(options: IndexOptions = {}): Promise<IndexResult> {
     return this.indexMutex.withLock(async () => {
       this.fileLock.acquire();
-      const stagingPath = path.join(getCodeGraphDir(this.projectRoot), `extension-stage-${options.extensionTransactionId ?? randomUUID()}.db`);
+      const candidateId = options.extensionTransactionId ?? randomUUID();
+      const stagingPath = path.join(getCodeGraphDir(this.projectRoot), `extension-stage-${candidateId}.db`);
+      let recorded = false;
       let candidate: CodeGraph | undefined;
       let attached = false;
       try {
         const plugins = await loadPlugins(this.projectRoot);
         if (plugins.diagnostics.some(d => d.state !== 'loaded')) throw new Error(plugins.diagnostics.map(d => `${d.id}: ${d.message ?? d.state}`).join('; '));
+        const inputs = plugins.synthPasses.length ? this.semanticInputStamp() : undefined;
+        if (!options.extensionTransactionId) { beginGraphCandidate(this.projectRoot, candidateId); recorded = true; }
         const db = DatabaseConnection.initialize(stagingPath);
         candidate = new CodeGraph(db, new QueryBuilder(db.getDb()), this.projectRoot);
         candidate.fileLock = new FileLock(stagingPath + '.lock');
-        const result = await withPlugins(plugins, () => candidate!.indexAllWithPlugins(options));
+        const reuse = plugins.synthPasses.length && process.env.CODEGRAPH_NO_SEMANTIC_REUSE !== '1' ? this.semanticParseReuse : undefined;
+        const beforeReuse = reuse?.stats();
+        const result = await withPlugins(plugins, () => candidate!.indexAllWithPlugins(options, reuse));
+        const afterReuse = reuse?.stats();
+        channel('codegraph.semantic.update').publish({ projectRoot: this.projectRoot, phase: 'candidate_ready',
+          coreReused: afterReuse ? afterReuse.hits - beforeReuse!.hits : 0,
+          coreParsed: afterReuse ? afterReuse.misses - beforeReuse!.misses : result.filesDiscovered,
+          cacheBytes: afterReuse?.bytes ?? 0 });
         if (!result.success || result.filesErrored || plugins.diagnostics.some(d => d.state !== 'loaded')) {
           throw new Error('Extension activation failed: ' + [...result.errors.map(e => e.message), ...plugins.diagnostics.filter(d => d.state !== 'loaded').map(d => d.message)].join('; '));
         }
@@ -561,6 +590,9 @@ export class CodeGraph {
         connection.prepare('ATTACH DATABASE ? AS extension_candidate').run(stagingPath);
         attached = true;
         options.beforeExtensionCommit?.();
+        if (inputs !== undefined && inputs !== this.semanticInputStamp())
+          throw new Error('Project sources or configuration changed during semantic indexing; previous graph retained. Retry the update.');
+        channel('codegraph.semantic.update').publish({ projectRoot: this.projectRoot, phase: 'before_commit' });
         connection.transaction(() => {
           this.queries.clear();
           for (const table of ['files', 'nodes', 'edges', 'unresolved_refs']) {
@@ -571,11 +603,14 @@ export class CodeGraph {
           this.queries.setMetadata('indexed_with_version', CodeGraphPackageVersion);
           this.queries.setMetadata('indexed_with_extraction_version', String(EXTRACTION_VERSION));
           this.queries.setMetadata('index_state', 'complete');
+          this.queries.setMetadata('semantic_update', candidateId);
+          channel('codegraph.semantic.update').publish({ projectRoot: this.projectRoot, phase: 'in_commit' });
           if (options.extensionTransactionId) {
             this.queries.setMetadata('extension_transaction', options.extensionTransactionId);
             extensionTransition(this.projectRoot, options.extensionTransactionId, 'graph_before_commit');
           }
         })();
+        channel('codegraph.semantic.update').publish({ projectRoot: this.projectRoot, phase: 'committed' });
         if (options.extensionTransactionId) extensionTransition(this.projectRoot, options.extensionTransactionId, 'graph_committed');
         connection.exec('DETACH DATABASE extension_candidate'); attached = false;
         this.orchestrator = new ExtractionOrchestrator(this.projectRoot, this.queries);
@@ -588,7 +623,8 @@ export class CodeGraph {
         for (const suffix of ['', '-wal', '-shm', '.lock']) {
           try { fs.unlinkSync(stagingPath + suffix); } catch { /* candidate cleanup */ }
         }
-        this.fileLock.release();
+        try { if (recorded) finishGraphCandidate(this.projectRoot); }
+        finally { this.fileLock.release(); }
       }
     });
   }
@@ -612,7 +648,7 @@ export class CodeGraph {
     this.resolver.initialize();
   }
 
-  private async indexAllWithPlugins(options: IndexOptions = {}): Promise<IndexResult> {
+  private async indexAllWithPlugins(options: IndexOptions = {}, coreReuse?: CoreExtractionReuse): Promise<IndexResult> {
     return this.indexMutex.withLock(async () => {
       try {
         this.fileLock.acquire();
@@ -691,7 +727,8 @@ export class CodeGraph {
             // Store-writer offload is fresh-DB-only: with any pre-existing
             // data the store path must read (existing-file checks, cross-file
             // edge snapshots) and delete, which belongs on one thread.
-            freshDb ? { dbPath: this.db.getPath(), fastInit } : null
+            freshDb ? { dbPath: this.db.getPath(), fastInit } : null,
+            coreReuse
           );
         } finally {
           if (freshDb) {

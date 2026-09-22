@@ -48,12 +48,13 @@ async function run(name, command, args, timeout = 360000, overrides = {}) {
     await run('drupal-package', process.execPath, ['scripts/build-extensions.mjs']);
     await run('drupal-accuracy', process.execPath, ['--test', 'scripts/validation/drupal-accuracy.test.cjs', 'scripts/validation/drupal-negative.test.cjs']);
     await run('focused', process.execPath, ['node_modules/vitest/vitest.mjs', 'run',
-      '__tests__/marketplace-storage.test.ts', '__tests__/foundation.test.ts', '__tests__/extension-trust.test.ts', '__tests__/extension-releases.test.ts', '__tests__/extension-marketplace.test.ts', '__tests__/extension-author.test.ts', '__tests__/extension-sync.test.ts', '__tests__/plugins.test.ts', '__tests__/extension-explore.test.ts',
+      '__tests__/marketplace-storage.test.ts', '__tests__/foundation.test.ts', '__tests__/extension-trust.test.ts', '__tests__/extension-releases.test.ts', '__tests__/extension-marketplace.test.ts', '__tests__/extension-author.test.ts', '__tests__/extension-sync.test.ts', '__tests__/core-extraction-reuse.test.ts', '__tests__/parse-pool.test.ts', '__tests__/plugins.test.ts', '__tests__/extension-explore.test.ts',
       '__tests__/db-reopen-on-replace.test.ts', '__tests__/status-json.test.ts', '__tests__/sync.test.ts', '__tests__/concurrent-locking.test.ts',
       '--maxWorkers=2', '--minWorkers=1', '--reporter=default', '--reporter=json', `--outputFile.json=${path.join(out, 'focused.json')}`]);
     await run('registry-storage', process.execPath, ['scripts/validation/marketplace-storage.cjs'], 120000, { STORAGE_OUTPUT: path.join(out, 'registry-storage') });
     await run('compiled-workers', process.execPath, ['--test', 'scripts/validation/extensions-runtime.test.cjs']);
     await run('native-paths', process.execPath, ['scripts/validation/native-paths.cjs']);
+    await run('semantic-update-recovery', process.execPath, ['scripts/validation/semantic-update-recovery.cjs'], 180000, { SEMANTIC_RECOVERY_OUTPUT: path.join(out, 'semantic-recovery') });
     await run('process-recovery', process.execPath, ['scripts/validation/extensions-recovery.cjs'], 600000);
     await run('process-recovery-override', process.execPath, ['scripts/validation/extensions-recovery.cjs'], 600000, { CODEGRAPH_DIR: '.codegraph-native', RECOVERY_OUTPUT: path.join(out, 'recovery-override') });
     await run('external-author', process.execPath, ['scripts/validation/extension-author.cjs'], 600000);
