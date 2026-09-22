@@ -15,9 +15,9 @@ const checks = [];
 const safeError = error => String(error.stack || error).replace(/token=[a-f0-9]+/g, 'token=[redacted]');
 function artifact(version, broken = false) {
   return Buffer.from(JSON.stringify({ format: 'codegraph-extension-1', package: {
-    name: '@browser/example', version, main: 'index.cjs', codegraph: { id: 'hosted-browser-20260922', apiVersion: 1, capabilities: ['frameworks'] },
+    name: '@browser/example', version, main: 'index.cjs', codegraph: { id: 'hosted-browser-20260922c', apiVersion: 1, capabilities: ['frameworks'] },
   }, files: { 'index.cjs': `module.exports=()=>({frameworks:[{name:'route',languages:['typescript'],detect:()=>true,resolve:()=>null,
-    extract(file){${broken ? "throw Error('Rejected browser update');" : ''} return {nodes:[{id:'plugin:hosted-browser-20260922:'+file,kind:'route',name:'/browser-${version}',qualifiedName:file+'::browser',filePath:file,language:'typescript',startLine:1,endLine:1,startColumn:0,endColumn:0,updatedAt:0}],references:[]}}}]});` } }));
+    extract(file){${broken ? "throw Error('Rejected browser update');" : ''} return {nodes:[{id:'plugin:hosted-browser-20260922c:'+file,kind:'route',name:'/browser-${version}',qualifiedName:file+'::browser',filePath:file,language:'typescript',startLine:1,endLine:1,startColumn:0,endColumn:0,updatedAt:0}],references:[]}}}]});` } }));
 }
 function routes(root) {
   const file = path.join(root, '.codegraph/codegraph.db');
@@ -33,7 +33,7 @@ function routes(root) {
   try {
     let origin = process.env.HOSTED_REGISTRY;
     assert.match(origin || '', /^https:\/\/[a-z0-9.-]+\.workers\.dev$/);
-    assert.equal((await(await fetch(origin+'/api/extensions/hosted-browser-20260922')).json()).length,0,'Fixture already exists; use a fresh isolated target or rename this owned fixture');
+    assert.equal((await(await fetch(origin+'/api/extensions/hosted-browser-20260922c')).json()).length,0,'Fixture already exists; use a fresh isolated target or rename this owned fixture');
     if (process.env.REGISTRY_TEST_HTTPS === '1') { https = await require('./https-marketplace.cjs').httpsMarketplace(server.port, out); origin = https.origin; }
     bridge = await startExtensionBridge(roots, origin);
     const token = new URLSearchParams(new URL(bridge.connectionUrl).hash.slice(1)).get('token');
@@ -81,11 +81,11 @@ function routes(root) {
       assert.equal(await page.locator('#source').inputValue(), 'https://example.com/recovery-source');
       await page.getByRole('button', { name: 'Publish release' }).click();
       console.log('Submitted', version);
-      await page.waitForURL('**/extensions/hosted-browser-20260922');
+      await page.waitForURL('**/extensions/hosted-browser-20260922c');
       await page.getByText(version, { exact: true }).waitFor();
     }
     await publish('1.0.0'); checks.push('real browser signed publisher upload'); checks.push('slow package metadata preserves typed publisher fields');
-    const first = (await (await fetch(origin + '/api/extensions')).json()).find(x=>x.id==='hosted-browser-20260922');
+    const first = (await (await fetch(origin + '/api/extensions')).json()).find(x=>x.id==='hosted-browser-20260922c');
     assert.equal(first.official, false);
     // A separate browser has a separate signing identity and cannot claim this id.
     const otherContext = await browser.newContext();
@@ -113,16 +113,16 @@ function routes(root) {
     await other.locator('#source').fill('https://example.com/invalid');
     await other.getByRole('button', { name: 'Publish release' }).click();
     await other.locator('#publish-result').filter({ hasText: /package/i }).waitFor();
-    assert.equal((await (await fetch(origin + '/api/extensions/hosted-browser-20260922')).json()).length, 1);
+    assert.equal((await (await fetch(origin + '/api/extensions/hosted-browser-20260922c')).json()).length, 1);
     await otherContext.close(); checks.push('browser malformed-package rejection without publication');
     await page.getByRole('link', { name: 'Marketplace', exact: true }).first().click();
-    await page.getByRole('link', {name:'Browser example',exact:true}).click();
     const popupPromise = page.waitForEvent('popup');
     await page.locator('#connect').click();
     const popup = await popupPromise;
     await popup.getByRole('button', { name: 'Allow connection' }).click();
     await page.getByText('CodeGraph connected', { exact: true }).waitFor();
     await page.locator('#project').selectOption('1');
+    await page.locator('a[href="/extensions/hosted-browser-20260922c"]').first().click();
     let completedJob = 0;
     await page.getByRole('button', { name: 'Install extension' }).click();
     async function settle(expected) {
@@ -143,7 +143,7 @@ function routes(root) {
       window.__recoveryPopup = state.popup;
       const iframe = document.createElement('iframe'); iframe.name = 'wrong-source'; document.body.append(iframe);
     });
-    await page.frame({ name: 'wrong-source' }).evaluate(() => parent.__recoveryPopup.postMessage({ channel: 'codegraph-extensions-v1', type: 'command', id: 'wrong-window', command: { action: 'remove', id: 'hosted-browser-20260922', project: '1' } }, '*'));
+    await page.frame({ name: 'wrong-source' }).evaluate(() => parent.__recoveryPopup.postMessage({ channel: 'codegraph-extensions-v1', type: 'command', id: 'wrong-window', command: { action: 'remove', id: 'hosted-browser-20260922c', project: '1' } }, '*'));
     await page.waitForTimeout(300); assert.equal((await snapshot()).jobId, before);
     await page.locator('iframe[name="wrong-source"]').evaluate(node => node.remove());
     checks.push('real postMessage wrong-window command ignored');
@@ -185,7 +185,7 @@ function routes(root) {
     const badPopupPromise = evil.waitForEvent('popup'); await evil.locator('#open').click(); const badPopup = await badPopupPromise;
     await badPopup.getByRole('button', { name: 'Allow connection' }).click();
     const beforeOrigin = (await snapshot()).jobId;
-    await evil.evaluate(() => window.target.postMessage({ channel: 'codegraph-extensions-v1', type: 'command', id: 'wrong-origin', command: { action: 'enable', id: 'hosted-browser-20260922', project: '1' } }, '*'));
+    await evil.evaluate(() => window.target.postMessage({ channel: 'codegraph-extensions-v1', type: 'command', id: 'wrong-origin', command: { action: 'enable', id: 'hosted-browser-20260922c', project: '1' } }, '*'));
     await evil.waitForTimeout(300); assert.equal((await snapshot()).jobId, beforeOrigin);
     checks.push('real postMessage wrong-origin command ignored');
     await popup.close();
