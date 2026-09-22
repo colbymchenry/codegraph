@@ -83,6 +83,38 @@ describe('live sync after the index is rebuilt by another process (#1902)', () =
     }
   });
 
+  posixOnly('a sync in the gap between recreate and indexAll steps aside, then reconciles in full', async () => {
+    const server = CodeGraph.initSync(root);
+    await server.indexAll();
+    try {
+      // `codegraph index`: the file is recreated first, the write lock is taken later by indexAll.
+      const rebuilder = await CodeGraph.recreate(root);
+      fs.appendFileSync(path.join(root, 'src', 'a.ts'), 'export function gamma() { return 3; }\n');
+      // The server's sync lands in the gap: it must not claim the lock for a full reconcile of the empty file.
+      const gap = await server.sync({ paths: ['src/a.ts'] });
+      expect(gap.filesChecked).toBe(0);
+      // So the rebuild still gets its lock and completes.
+      const built = await rebuilder.indexAll();
+      expect(built.success).toBe(true);
+      rebuilder.close();
+      // An edit the rebuild did not see, made after it finished.
+      fs.appendFileSync(path.join(root, 'src', 'b.ts'), 'export function delta() { return 4; }\n');
+      // The next (scoped, unrelated) sync is widened to the whole tree once.
+      fs.writeFileSync(path.join(root, 'src', 'c.ts'), 'export function echo() { return 5; }\n');
+      const after = await server.sync({ paths: ['src/c.ts'] });
+      expect(after.filesChecked).toBeGreaterThan(1);
+      expect(await onDiskHas(root, 'gamma')).toBe(true);
+      expect(await onDiskHas(root, 'delta')).toBe(true);
+      expect(await onDiskHas(root, 'echo')).toBe(true);
+      // And only once: the following scoped sync stays scoped.
+      fs.appendFileSync(path.join(root, 'src', 'c.ts'), 'export function foxtrot() { return 6; }\n');
+      const scoped = await server.sync({ paths: ['src/c.ts'] });
+      expect(scoped.filesChecked).toBe(1);
+    } finally {
+      server.close();
+    }
+  });
+
   posixOnly('a scoped sync that finds the database replaced reconciles the whole tree', async () => {
     const server = CodeGraph.initSync(root);
     await server.indexAll();
