@@ -358,7 +358,7 @@ const MEMBER_ACCESS_TYPES: ReadonlySet<string> = new Set([
  * already-covered types). Don't re-add `member_expression`/`attribute` here.
  */
 const STATIC_MEMBER_LANGS: ReadonlySet<string> = new Set([
-  'java', 'csharp', 'kotlin', 'swift', 'scala', 'dart', 'php', 'cpp',
+  'java', 'csharp', 'enforcescript', 'kotlin', 'swift', 'scala', 'dart', 'php', 'cpp',
 ]);
 
 /**
@@ -442,7 +442,7 @@ export class TreeSitterExtractor {
   // Value-reference edges (default ON; set CODEGRAPH_VALUE_REFS=0 to disable; see flushValueRefs).
   // Same-file reads of file-scope const/var symbols → `references` edges so impact analysis catches
   // value consumers ("change this constant/table, affect its readers").
-  private static readonly VALUE_REF_LANGS = new Set<string>(['typescript', 'javascript', 'tsx', 'arkts', 'go', 'python', 'rust', 'ruby', 'c', 'java', 'csharp', 'php', 'scala', 'kotlin', 'swift', 'dart', 'pascal']);
+  private static readonly VALUE_REF_LANGS = new Set<string>(['typescript', 'javascript', 'tsx', 'arkts', 'go', 'python', 'rust', 'ruby', 'c', 'java', 'csharp', 'enforcescript', 'php', 'scala', 'kotlin', 'swift', 'dart', 'pascal']);
   private static readonly MAX_VALUE_REF_NODES = 20_000;
   private readonly valueRefsEnabled = process.env.CODEGRAPH_VALUE_REFS !== '0';
   private fileScopeValues = new Map<string, string>();
@@ -2177,7 +2177,7 @@ export class TreeSitterExtractor {
     // constant/variable, not field). Scoped to languages whose `isConst`
     // predicate is field-shaped — other languages' fields stay `field`.
     const fieldKind: NodeKind =
-      (this.language === 'java' || this.language === 'csharp') &&
+      (this.language === 'java' || this.language === 'csharp' || this.language === 'enforcescript') &&
       (this.extractor.isConst?.(node) ?? false)
         ? 'constant'
         : 'field';
@@ -3049,6 +3049,32 @@ export class TreeSitterExtractor {
           docstring,
           isExported,
         });
+      }
+    } else if (this.language === 'csharp' || this.language === 'enforcescript') {
+      // C#/Enforce Script file-scope declarations: `local_declaration_statement`
+      // (top-level `const`/var, outside any class — the canonical EnforceScript
+      // shape, e.g. DayZ's constants.c: dozens of `const int FOO = 1;` at file
+      // scope) wraps its declarator(s) one level deeper, inside a nested
+      // `variable_declaration` — the generic fallback below only reads a
+      // *direct* identifier/variable_declarator child, so every file-scope
+      // Enforce Script constant went unextracted. Mirrors extractField's C#
+      // `variable_declaration` unwrap.
+      const varDecl = node.namedChildren.find(c => c.type === 'variable_declaration');
+      const declarators = varDecl ? varDecl.namedChildren.filter(c => c.type === 'variable_declarator') : [];
+      if (declarators.length > 0) {
+        const typeNode = varDecl!.namedChildren.find(c => c.type !== 'variable_declarator');
+        const typeText = typeNode ? getNodeText(typeNode, this.source) : undefined;
+        for (const decl of declarators) {
+          const nameNode = getChildByField(decl, 'name') || decl.namedChildren.find(c => c.type === 'identifier');
+          if (!nameNode) continue;
+          const name = getNodeText(nameNode, this.source);
+          const valueNode = getChildByField(decl, 'value');
+          const initValue = valueNode ? getNodeText(valueNode, this.source).slice(0, 100) : undefined;
+          const signature = typeText
+            ? `${typeText} ${name}${initValue ? ` = ${initValue}${initValue.length >= 100 ? '...' : ''}` : ''}`
+            : name;
+          this.createNode(kind, name, decl, { docstring, signature, isExported });
+        }
       }
     } else {
       // Generic fallback for other languages
