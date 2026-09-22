@@ -70,6 +70,13 @@ describe('Language Detection', () => {
     expect(detectLanguage('class.hpp')).toBe('cpp');
   });
 
+  it('should detect Shell files', () => {
+    expect(detectLanguage('script.sh')).toBe('shell');
+    expect(detectLanguage('config.zsh')).toBe('shell');
+    expect(detectLanguage('.bash_profile.bash')).toBe('shell'); // `.bash` extension
+    expect(detectLanguage('rc')).toBe('unknown'); // dotfiles without an extension are not detected
+  });
+
   it('should detect C# files', () => {
     expect(detectLanguage('Program.cs')).toBe('csharp');
   });
@@ -2043,6 +2050,73 @@ class ChildController extends BaseController implements Serializable, JsonSerial
     expect(implementsRefs.length).toBe(2);
     expect(implementsRefs.map((r) => r.referenceName)).toContain('Serializable');
     expect(implementsRefs.map((r) => r.referenceName)).toContain('JsonSerializable');
+  });
+});
+
+describe('Shell Extraction', () => {
+  it('should extract function definitions (both bare and `function` keyword forms)', () => {
+    const code = `
+#!/usr/bin/env bash
+greet() {
+  local name="$1"
+  echo "Hello, \${name}"
+}
+
+function install_pkg {
+  apt-get update
+}
+`;
+    const result = extractFromSource('deploy.sh', code);
+
+    const funcs = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name).sort();
+    expect(funcs).toEqual(['greet', 'install_pkg']);
+  });
+
+  it('should extract variables and upper-case constants from assignments', () => {
+    const code = `
+VERSION="1.0.0"
+readonly CONFIG_DIR="\${HOME}/config"
+
+deploy() {
+  local env="$1"
+}
+`;
+    const result = extractFromSource('build.sh', code);
+
+    expect(result.nodes.find((n) => n.kind === 'constant' && n.name === 'VERSION')).toBeDefined();
+    // `readonly CONFIG_DIR` is a declaration_command wrapping the assignment.
+    expect(result.nodes.find((n) => n.kind === 'constant' && n.name === 'CONFIG_DIR')).toBeDefined();
+  });
+
+  it('should treat source/`.` commands as imports', () => {
+    const code = `
+source ./lib/common.sh
+. ~/.profile
+
+run() { :; }
+`;
+    const result = extractFromSource('main.sh', code);
+
+    const importNames = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+    expect(importNames).toContain('common.sh');
+  });
+
+  it('should emit call references for project-local commands but not builtins/external tools', () => {
+    const code = `
+ensure_dir() { mkdir -p /tmp/x; }
+
+deploy_all() {
+  ensure_dir
+  echo "done"
+}
+`;
+    const result = extractFromSource('run.sh', code);
+
+    const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+    // `ensure_dir` is a local symbol; `echo` and `mkdir` are builtins/external.
+    expect(calls).toContain('ensure_dir');
+    expect(calls).not.toContain('echo');
+    expect(calls).not.toContain('mkdir');
   });
 });
 

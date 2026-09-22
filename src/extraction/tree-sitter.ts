@@ -3050,6 +3050,37 @@ export class TreeSitterExtractor {
           isExported,
         });
       }
+    } else if (this.language === 'shell') {
+      // Shell: a plain assignment `VERSION="1.0"` / `readonly CONFIG_DIR=...`.
+      // The name is the `name:` child of type `variable_name`, and an
+      // upper-case name conventionally denotes a constant (`declare -r`,
+      // `readonly`, or bare UPPER_SNAKE). Values may hold expansions — keep a
+      // short signature for searchability. Both top-level assignments and ones
+      // inside function bodies are tracked (shell has no block scoping beyond
+      // that, so the last write is what later code sees).
+      const nameNode = getChildByField(node, 'name');
+      if (nameNode && nameNode.type === 'variable_name') {
+        const name = getNodeText(nameNode, this.source).trim();
+        if (name) {
+          const valueNode = node.namedChildren.find(
+            (c: SyntaxNode) => c !== nameNode && /^(string|word|expansion|command_substitution)$/.test(c.type),
+          );
+          const initValue = valueNode ? getNodeText(valueNode, this.source).slice(0, 100) : undefined;
+          const isConstName = /^[A-Z][A-Z0-9_]*$/.test(name);
+          // `declare -r`/`readonly` wrap the assignment in a declaration_command.
+          let isExportedDecl = false;
+          if (node.parent?.type === 'declaration_command') {
+            const txt = getNodeText(node.parent, this.source).slice(0, 40);
+            isExportedDecl = /^readonly|^declare -r/.test(txt.trim());
+          }
+          this.createNode(
+            isConstName || isExportedDecl ? 'constant' : 'variable',
+            name,
+            node,
+            { docstring, signature: initValue ? `= ${initValue}` : undefined },
+          );
+        }
+      }
     } else {
       // Generic fallback for other languages
       // Try to find identifier children
@@ -5610,6 +5641,20 @@ export class TreeSitterExtractor {
       // Function-as-value capture (#756) — function bodies are walked here,
       // not in visitNode, so the capture hook must fire in both walkers.
       this.maybeCaptureFnRefs(node, nodeType);
+
+      // Shell: the body walker is a SEPARATE descent from visitNode's
+      // dispatcher (it exists to find calls/instances/structural nodes inside
+      // function bodies), so shell — whose every bare word is a `command` and
+      // whose imports are `source foo.sh` commands — must be given the same
+      // hook here or those edges silently vanish inside function bodies.
+      // Scoped to shell only: other visitNode-bearing extractors (Kotlin, Lua,
+      // Ruby, …) already handle their own body traversal and double-invoking
+      // them corrupts call attribution (#shell).
+      if (this.language === 'shell' && this.extractor!.visitNode) {
+        const ctx = this.makeExtractorContext();
+        const handled = this.extractor!.visitNode(node, ctx);
+        if (handled) return;
+      }
 
       // Rocket route-registration macros (`routes![…]` / `catchers![…]`): the
       // handler paths live in a raw token tree the call walker can't see.
