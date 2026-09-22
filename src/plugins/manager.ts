@@ -120,7 +120,7 @@ export class ExtensionManager {
           this.onProgress({ state: 'indexing', message: 'Building and checking the updated graph' });
           const { CodeGraph } = await import('../index');
           const graph = CodeGraph.isInitialized(this.root) ? await CodeGraph.open(this.root) : await CodeGraph.init(this.root);
-          try { await graph.refreshPluginIndex({ extensionTransactionId: transaction.record.id }); } finally { graph.close(); }
+          try { await graph.refreshPluginIndex({ extensionTransactionId: transaction.record.id, beforeExtensionCommit: () => transaction.assertStaged() }); } finally { graph.close(); }
           transaction.reconcile();
         } catch (error) {
           // The durable graph marker decides rollback vs completion, including

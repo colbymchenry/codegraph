@@ -13,7 +13,9 @@ const transitions = channel('codegraph.extension.transaction');
 const dir = (root: string) => path.join(root, '.codegraph', 'plugins');
 const recordPath = (root: string) => path.join(dir(root), 'transaction.json');
 const ownerPath = (root: string) => path.join(dir(root), 'operation.lock');
-const uuid = /^[a-f0-9-]{36}$/;
+const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+const indexSettings = ['extensions', 'includeIgnored', 'exclude', 'include'];
+const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 interface RecordV1 {
   format: 1; id: string; pid: number; graphExisted: boolean; previousConfig: string | null; nextConfig: string;
   previousTrust: string | null; nextTrust: string | null;
@@ -88,7 +90,7 @@ function checkOwner(root: string, journal?: RecordV1): void {
     const owner = JSON.parse(raw);
     // For current writers, the acquired SQLite lock is authoritative even if
     // this PID is alive/reused. It cannot be acquired during a live operation.
-    if (owner?.format === 'codegraph-operation-lock-1' && uuid.test(owner.id) && Number.isSafeInteger(owner.pid)) return;
+    if (owner?.format === 'codegraph-operation-lock-1' && uuid.test(owner.id) && Number.isSafeInteger(owner.pid) && owner.pid > 0) return;
   } catch { /* legacy/torn */ }
   if (journal) return; // durable v1 journal + acquired SQLite lock prove orphan
   if (/^[1-9]\d*$/.test(raw.trim())) {
@@ -132,6 +134,21 @@ function cleanup(root: string, r: RecordV1, committed: boolean): void {
   const graphLock = path.join(root, '.codegraph', 'codegraph.lock');
   if (read(graphLock)?.trim() === String(r.pid)) remove(graphLock);
 }
+/** Validate the version/trust side before removing the only recovery record. */
+function verifyPackages(root: string, config: string | null, trust: string | null): void {
+  const entries = object(config).plugins, trusted = object(trust);
+  if (!Array.isArray(entries)) return;
+  for (const entry of entries) {
+    if (!entry || typeof entry.name !== 'string' || !entry.name.startsWith('managed:')) continue;
+    if (!/^[a-f0-9]{64}$/.test(entry.integrity)) fail(root, 'invalid installed package integrity');
+    const packageRoot = path.join(dir(root), 'packages', entry.integrity);
+    try {
+      const pkg = object(read(path.join(packageRoot, 'package.json')));
+      if (pkg.version !== entry.version || (pkg.codegraph as { id?: string })?.id !== entry.name.slice(8) ||
+          packageDigest(packageRoot) !== trusted[fs.realpathSync(packageRoot)]) throw new Error('version/identity/trust mismatch');
+    } catch (error) { fail(root, `installed package ${entry.name} is missing or changed (${String(error)}); restore the recorded package bytes/trust from backup before recovery`); }
+  }
+}
 /** Reconcile synchronously under the coordinator; never evaluates extension code. */
 function reconcile(root: string): boolean {
   const r = loadRecord(root); checkOwner(root, r);
@@ -142,7 +159,8 @@ function reconcile(root: string): boolean {
   let targetConfig: string | null, targetTrust: string | null;
   try {
     const previous = object(r.previousConfig), next = object(r.nextConfig), current = object(configRaw);
-    const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+    for (const key of indexSettings) if (!same(current[key], next[key]))
+      fail(root, `${key} was edited externally and may change the graph; save that edit separately, restore the recorded ${key}, recover, then reapply it and run codegraph index`);
     const wanted = committed ? next.plugins : previous.plugins;
     if (!same(current.plugins, wanted) && (committed || !same(current.plugins, next.plugins)))
       fail(root, `plugins were edited externally; graph ${committed ? 'committed the new version (restore nextConfig.plugins)' : 'retains the old version (restore previousConfig.plugins)'}`);
@@ -160,6 +178,7 @@ function reconcile(root: string): boolean {
     }
     targetTrust = trustRaw === r.nextTrust || trustRaw === r.previousTrust ? (committed ? r.nextTrust : r.previousTrust) : JSON.stringify(currentTrust);
   } catch (error) { return fail(root, String(error)); }
+  verifyPackages(root, targetConfig, targetTrust);
   replaceObserved(root, configFile, configRaw, targetConfig);
   extensionTransition(root, r.id, 'recovery_config');
   replaceObserved(root, trustFile, trustRaw, targetTrust);
@@ -178,6 +197,13 @@ export function recoverExtensions(root: string): boolean {
   if (context.getStore() === root) return false;
   const release = acquire(root);
   try { return context.run(root, () => reconcile(root)); } finally { release(); }
+}
+export function withExtensionGuardSync<T>(root: string, work: () => T): T {
+  root = fs.realpathSync(root);
+  if (context.getStore() === root) return work();
+  const release = acquire(root);
+  try { return context.run(root, () => { reconcile(root); return work(); }); }
+  finally { release(); }
 }
 /** Indexers and lifecycle writers share this OS-released lock for their full run. */
 export async function withExtensionGuard<T>(root: string, work: () => Promise<T>): Promise<T> {
@@ -221,6 +247,12 @@ export class ExtensionTransaction {
     extensionTransition(this.root, r.id, 'trust_written');
     replaceObserved(this.root, path.join(this.root, 'codegraph.json'), r.previousConfig, r.nextConfig);
     clearProjectConfigCache(); extensionTransition(this.root, r.id, 'config_written');
+  }
+  assertStaged(): void {
+    const expected = object(this.record.nextConfig), current = object(read(path.join(this.root, 'codegraph.json')));
+    for (const key of ['plugins', ...indexSettings]) if (!same(current[key], expected[key]))
+      fail(this.root, `${key} changed while building the candidate; preserve the edit and reconcile it with the recorded config`);
+    verifyPackages(this.root, this.record.nextConfig, read(path.join(dir(this.root), 'trust.json')));
   }
   reconcile(): void { reconcile(this.root); }
 }

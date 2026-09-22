@@ -143,7 +143,7 @@ if (process.argv[2] === '--child') {
       await run(repeated); assert.deepEqual(inspect(repeated), before); clean(repeated);
       receipt({ action: 'kill recovery itself', boundary: 'recovery_config', decision: 'idempotent rollback', passed: true });
       const live = await project(true), c = child(live, 'update', 'config_written');
-      await c.reached;
+      await Promise.race([c.reached, c.done.then(r => { throw new Error('Live-owner fixture exited early: ' + r.stderr); })]);
       const lock = path.join(live, '.codegraph/plugins/operation.lock'); fs.utimesSync(lock, 1, 1);
       for (const action of ['install', 'inspect', 'index']) {
         const result = await run(live, action, 1); assert.match(result.stderr, /operation is active/);
@@ -183,6 +183,29 @@ if (process.argv[2] === '--child') {
         await run(conflict); clean(conflict); assert.equal(JSON.parse(config(conflict)).resolvedByUser, true);
         receipt({ action: 'conflicting plugin edit', boundary, decision: 'no overwrite; actionable repair then recovery', passed: true });
       }
+      const settings = await project(true); await killAt(settings, 'update', 'config_written');
+      const changedSettings = JSON.parse(config(settings)); changedSettings.exclude = ['handlers.py'];
+      const changedRaw = JSON.stringify(changedSettings); fs.writeFileSync(path.join(settings, 'codegraph.json'), changedRaw);
+      assert.match((await run(settings, 'inspect', 1)).stderr, /exclude was edited externally/);
+      assert.equal(config(settings), changedRaw);
+      delete changedSettings.exclude; fs.writeFileSync(path.join(settings, 'codegraph.json'), JSON.stringify(changedSettings));
+      await run(settings); clean(settings);
+      receipt({ action: 'graph-affecting external config edit', decision: 'preserved and blocked with repair instructions', passed: true });
+      const tamper = await project(true); await killAt(tamper, 'update', 'graph_committed');
+      const entry = JSON.parse(config(tamper)).plugins[0];
+      const entryFile = path.join(tamper, '.codegraph/plugins/packages', entry.integrity, 'index.cjs'), originalEntry = fs.readFileSync(entryFile);
+      fs.appendFileSync(entryFile, '\n// external change');
+      assert.match((await run(tamper, 'inspect', 1)).stderr, /installed package managed:recovery-demo is missing or changed/);
+      assert.ok(fs.existsSync(path.join(tamper, '.codegraph/plugins/transaction.json')));
+      fs.writeFileSync(entryFile, originalEntry); await run(tamper); clean(tamper);
+      receipt({ action: 'changed installed package', decision: 'trust revalidated; blocked until bytes restored', passed: true });
+      const cached = await project(true), reader = await CodeGraph.open(cached);
+      try {
+        const node = reader.getNodesByKind('route')[0]; assert.equal(reader.getNode(node.id).name, '/1.0.0');
+        await killAt(cached, 'update', 'graph_committed'); await run(cached); clean(cached);
+        assert.equal(reader.getNode(node.id).name, '/2.0.0');
+      } finally { reader.close(); }
+      receipt({ action: 'long-lived reader after fresh-process recovery', decision: 'old cached node invalidated by commit marker', passed: true });
       fs.writeFileSync(path.join(out, 'result.json'), JSON.stringify({ platform: process.platform, node: process.version, rows, commands: commands.length }, null, 2));
     } finally {
       for (const c of processes) c.kill('SIGKILL');

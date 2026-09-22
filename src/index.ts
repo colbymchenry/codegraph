@@ -8,7 +8,7 @@
 import * as path from 'path';
 import * as fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { recoverExtensions, withExtensionGuard, extensionTransition } from './plugins/recovery';
+import { recoverExtensions, withExtensionGuard, withExtensionGuardSync, extensionTransition } from './plugins/recovery';
 import { loadPlugins, pluginFingerprint } from './plugins/loader';
 import { withPlugins, currentPlugins, type PluginRegistry } from './plugins/registry';
 import { loadPluginEntries } from './project-config';
@@ -136,6 +136,8 @@ export interface OpenOptions {
 export interface IndexOptions {
   /** @internal Managed lifecycle transaction marker, committed with graph data. */
   extensionTransactionId?: string;
+  /** @internal Revalidate the staged config/trust before the atomic graph commit. */
+  beforeExtensionCommit?: () => void;
   /** Progress callback */
   onProgress?: (progress: IndexProgress) => void;
 
@@ -157,6 +159,7 @@ export class CodeGraph {
   private db: DatabaseConnection;
   private queries: QueryBuilder;
   private projectRoot: string;
+  private extensionCommit: string | null = null;
   // Assigned via wireLayers() from the constructor (and again on reopen) — the
   // `!` tells TS these are definitely set even though the assignment is one
   // method call away from the constructor body.
@@ -248,8 +251,11 @@ export class CodeGraph {
   }
 
   private ensureExtensionState(): void {
-    if (recoverExtensions(this.projectRoot)) {
+    const recovered = recoverExtensions(this.projectRoot);
+    const commit = this.queries.getMetadata('extension_transaction');
+    if (recovered || commit !== this.extensionCommit) {
       this.queries.clearCache(); this.resolver.clearCaches();
+      this.extensionCommit = commit;
     }
   }
 
@@ -299,6 +305,11 @@ export class CodeGraph {
    * @returns A new CodeGraph instance
    */
   static async init(projectRoot: string, options: InitOptions = {}): Promise<CodeGraph> {
+    fs.mkdirSync(path.resolve(projectRoot), { recursive: true });
+    return withExtensionGuard(projectRoot, () => CodeGraph.initGuarded(projectRoot, options));
+  }
+
+  private static async initGuarded(projectRoot: string, options: InitOptions): Promise<CodeGraph> {
     await initGrammars();
     const resolvedRoot = path.resolve(projectRoot);
     recoverExtensions(resolvedRoot);
@@ -330,6 +341,11 @@ export class CodeGraph {
    * Initialize synchronously (without indexing)
    */
   static initSync(projectRoot: string): CodeGraph {
+    fs.mkdirSync(path.resolve(projectRoot), { recursive: true });
+    return withExtensionGuardSync(projectRoot, () => CodeGraph.initSyncGuarded(projectRoot));
+  }
+
+  private static initSyncGuarded(projectRoot: string): CodeGraph {
     const resolvedRoot = path.resolve(projectRoot);
     recoverExtensions(resolvedRoot);
 
@@ -545,6 +561,7 @@ export class CodeGraph {
         const connection = this.db.getDb();
         connection.prepare('ATTACH DATABASE ? AS extension_candidate').run(stagingPath);
         attached = true;
+        options.beforeExtensionCommit?.();
         connection.transaction(() => {
           this.queries.clear();
           for (const table of ['files', 'nodes', 'edges', 'unresolved_refs']) {
@@ -2406,6 +2423,7 @@ export class CodeGraph {
     input: TaskInput,
     options?: BuildContextOptions
   ): Promise<TaskContext | string> {
+    this.ensureExtensionState();
     return this.contextBuilder.buildContext(input, options);
   }
 
@@ -2417,14 +2435,14 @@ export class CodeGraph {
    * Optimize the database (vacuum and analyze)
    */
   optimize(): void {
-    this.db.optimize();
+    withExtensionGuardSync(this.projectRoot, () => this.db.optimize());
   }
 
   /**
    * Clear all data from the graph
    */
   clear(): void {
-    this.queries.clear();
+    withExtensionGuardSync(this.projectRoot, () => this.queries.clear());
   }
 
   /**
