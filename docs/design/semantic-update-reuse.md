@@ -7,7 +7,8 @@ from language, filename or a previous set of returned edges.
 The first optimization keeps a bounded in-memory cache of **core extraction
 before framework hooks** on the owning CodeGraph instance. Keys include exact
 relative path, decoded source, selected language and engine environment switches.
-An instance cannot survive an engine upgrade; no persistent cache schema exists.
+The cache is not persisted across graph instances or processes. Restart long-lived
+engines after an engine upgrade; no persistent cache schema exists.
 Framework detection/extract/postExtract, reference resolution and every semantic
 pass still rerun against a fresh candidate in the original insertion order.
 Workers still evaluate framework hooks. Failed extraction is not retained.
@@ -47,4 +48,5 @@ with the graph; readers never see a committed missing-trigger window.
 `CODEGRAPH_NO_SEMANTIC_BULK=1` retains the previous trigger path. A commit marker invalidates long-lived
 reader caches. Managed config/trust transactions retain their exclusive guard.
 
-Measurements and correctness/recovery coverage will be linked after validation.
+See the [measured update and recovery report](../validation/extensions-semantic-update-20260922.md)
+for exact samples, current Linux/native checks, interruptions and remaining costs.
