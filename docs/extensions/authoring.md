@@ -231,3 +231,44 @@ and may bind the displayed selection via `selected: { version, integrity }`.
 They resolve only against the connected marketplace. Existing exact `url` plus
 `integrity` commands keep their artifact semantics. All commands retain the
 origin, window, local-host and bearer checks.
+
+
+## Interrupted lifecycle operations
+
+Managed install/update/enable/disable/remove writes a recovery journal before
+changing package trust or project settings. After a killed process, opening or
+indexing the project, reading extension status/list, or starting another managed
+operation automatically reconciles that journal. You can also run:
+
+```sh
+codegraph extensions recover --path /absolute/path/project
+```
+
+Before the graph transaction commits, recovery restores the previous plugin
+settings and trust and retains the old graph. After that commit, recovery
+finishes the new state. Recovery does not execute extension code. A failed first
+install into an uninitialized project returns that project to uninitialized.
+Previously installed immutable packages remain available; an uncommitted new
+package and transaction-owned temporary graph files are cleaned up.
+
+A live operation excludes another writer and pending-state readers. Wait for
+it to finish and retry; an old timestamp is never permission to take its lock.
+Modern ownership comes from a SQLite transaction, which the OS releases when
+the process exits, rather than from a PID that could be reused. Legacy live or
+ambiguous PID locks require operator confirmation, not a timeout override.
+
+Unrelated config fields and trust entries survive recovery. If plugin settings,
+indexing rules, or transaction-owned trust/package bytes changed independently,
+recovery stops with the conflicting field and journal path. Keep a copy of your
+edit and the journal. Restore the indicated recorded plugin/settings or package
+bytes, run recovery, then reapply the intended edit and reindex. Do not discard
+a journal or remove a live lock to hide the conflict. Invalid/checksum-failing
+journals need a verified backup or manual repair; they are never guessed away.
+The companion returns the recovery error instead of claiming the project is
+ready.
+
+The current validation covers process death on Linux using local files and
+SQLite locking. Native Windows/macOS, machine power loss, network filesystems,
+and mixed older writers that bypass the coordinator have not been validated.
+Direct edits to the graph database, deliberate deletion of the coordination
+files, and concurrent project destruction are outside this recovery contract.
