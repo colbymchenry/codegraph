@@ -45,7 +45,9 @@ export async function startExtensionBridge(roots: string[], marketplace: string,
     const supplied = Buffer.from(req.headers.authorization?.replace(/^Bearer /, '') ?? '');
     if (supplied.length !== token.length || !timingSafeEqual(supplied, Buffer.from(token))) { reply(401, { error: 'Connect CodeGraph first' }); return; }
     if (req.method === 'GET' && route === '/status') {
-      reply(200, { version, apiVersion: 1, projects: projects.map((p, i) => ({ ...p, extensions: managers[i]!.list() })), progress, jobId, busy: !!job, error: failure }); return;
+      try {       reply(200, { version, apiVersion: 1, projects: projects.map((p, i) => ({ ...p, extensions: managers[i]!.list() })), progress, jobId, busy: !!job, error: failure }); }
+      catch (error) { reply(409, { error: String(error) }); }
+      return;
     }
     if (req.method !== 'POST' || route !== '/command') { reply(404, { error: 'Unknown command' }); return; }
     if (job) { reply(409, { error: 'An operation is already running' }); return; }
@@ -105,7 +107,7 @@ let connected=false;
 const status=document.getElementById('status');
 document.getElementById('destination').textContent='Marketplace: '+marketplace;
 const headers={Authorization:'Bearer '+token,'Content-Type':'application/json'};
-async function snapshot(){const r=await fetch('/status',{headers});if(!r.ok)throw new Error('Connection expired. Run codegraph extensions connect again.');return r.json();}
+async function snapshot(){const r=await fetch('/status',{headers});const data=await r.json();if(!r.ok)throw new Error(data.error||'Connection expired. Run codegraph extensions connect again.');return data;}
 const send=data=>{if(window.opener)window.opener.postMessage({channel:'codegraph-extensions-v1',...data},marketplace);};
 document.getElementById('connect').onclick=async()=>{try{const data=await snapshot();connected=true;document.getElementById('connect').hidden=true;status.textContent='Connected. Return to the marketplace.';send({type:'connected',data});}catch(e){status.textContent=e.message;}};
 window.addEventListener('message',async event=>{

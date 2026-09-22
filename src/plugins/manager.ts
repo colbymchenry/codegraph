@@ -1,12 +1,11 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { randomUUID } from 'node:crypto';
 import { version as engineVersion } from '../../package.json';
-import { clearProjectConfigCache, loadPluginEntries } from '../project-config';
-import { packageDigest, parsePackage, sha256, MAX_PACKAGE_BYTES } from './package';
-import { pluginDirectory } from './loader';
+import { loadPluginEntries } from '../project-config';
+import { parsePackage, sha256, MAX_PACKAGE_BYTES, type ExtensionPackage } from './package';
 import type { PluginEntry } from './api';
 import * as semver from 'semver';
+import { recoverExtensions, withExtensionGuard, ExtensionTransaction, durableWrite } from './recovery';
 import { resolveRelease, validateExtensionId, type ExtensionRelease } from './releases';
 
 export interface ExtensionProgress { state: 'downloading' | 'installing' | 'indexing' | 'ready' | 'failed'; message: string }
@@ -18,11 +17,7 @@ export interface RegistryRequest {
   selected?: { version: string; integrity: string };
 }
 
-export function atomicWrite(file: string, data: string): void {
-  const temp = file + '.' + randomUUID() + '.tmp';
-  fs.writeFileSync(temp, data, { mode: 0o600, flag: 'wx' });
-  try { fs.renameSync(temp, file); } finally { if (fs.existsSync(temp)) fs.unlinkSync(temp); }
-}
+export const atomicWrite = durableWrite;
 
 /** Download only bounded HTTPS artifacts (loopback HTTP for local development). */
 export async function downloadPackage(url: string, expectedOrigin?: string): Promise<Buffer> {
@@ -42,10 +37,15 @@ export async function downloadPackage(url: string, expectedOrigin?: string): Pro
 
 export class ExtensionManager {
   private busy = false;
+  private visibleEntries?: PluginEntry[];
   constructor(readonly root: string, private onProgress: (progress: ExtensionProgress) => void = () => {}) {
     this.root = fs.realpathSync(root);
   }
-  list(): PluginEntry[] { return loadPluginEntries(this.root); }
+  list(): PluginEntry[] {
+    if (this.visibleEntries) return structuredClone(this.visibleEntries);
+    recoverExtensions(this.root);
+    return loadPluginEntries(this.root);
+  }
 
   async resolve(request: RegistryRequest): Promise<ExtensionRelease> {
     validateExtensionId(request.id);
@@ -82,36 +82,13 @@ export class ExtensionManager {
       const installed = entries.find(e => e.name === entry.name);
       if (request.automatic && installed?.version && (!semver.valid(installed.version) || semver.lt(p.package.version, installed.version))) throw new Error(`Automatic install would downgrade installed ${installed.version}; request an exact version explicitly`);
       this.onProgress({ state: 'installing', message: `Installing ${p.package.codegraph.id} ${p.package.version}` });
-      const packages = path.join(pluginDirectory(this.root), 'packages');
-      fs.mkdirSync(packages, { recursive: true, mode: 0o700 });
-      const destination = path.join(packages, integrity);
-      if (!fs.existsSync(destination)) {
-        const stage = fs.mkdtempSync(path.join(packages, 'stage-'));
-        for (const [file, content] of Object.entries(p.files)) {
-          const dest = path.join(stage, file);
-          fs.mkdirSync(path.dirname(dest), { recursive: true });
-          fs.writeFileSync(dest, content, { flag: 'wx', mode: 0o600 });
-        }
-        // Reconstruct only supported metadata, never execute install scripts.
-        fs.writeFileSync(path.join(stage, 'package.json'), JSON.stringify(p.package, null, 2));
-        fs.renameSync(stage, destination);
-      }
-      const expected = { ...p.files, 'package.json': JSON.stringify(p.package, null, 2) };
-      for (const [file, content] of Object.entries(expected)) {
-        if (fs.readFileSync(path.join(destination, file), 'utf8') !== content) throw new Error('Installed package was modified');
-      }
-      const trustFile = path.join(pluginDirectory(this.root), 'trust.json');
-      let trust: Record<string, string> = {};
-      try { trust = JSON.parse(fs.readFileSync(trustFile, 'utf8')); } catch { /* first install */ }
-      trust[fs.realpathSync(destination)] = packageDigest(destination);
-      atomicWrite(trustFile, JSON.stringify(trust));
       const previous = entries.find(e => e.name === entry.name);
       entry.options = previous?.options;
       if (!request.replaces) entry.replaces = previous?.replaces ?? [];
       const index = entries.findIndex(e => e.name === entry.name);
       if (index < 0) entries.push(entry); else entries[index] = entry;
       return entries;
-    });
+    }, 'Extension activated and graph refreshed', { contents: p, integrity });
     return entry;
   }
 
@@ -127,42 +104,33 @@ export class ExtensionManager {
     await this.change(async entries => entries.filter(e => e.name !== `managed:${id}` && e.name !== id), 'Extension removed and graph refreshed');
   }
 
-  private async change(update: (entries: PluginEntry[]) => Promise<PluginEntry[]>, successMessage = 'Extension activated and graph refreshed'): Promise<void> {
+  private async change(update: (entries: PluginEntry[]) => Promise<PluginEntry[]>, successMessage = 'Extension activated and graph refreshed', pkg?: { contents: ExtensionPackage; integrity: string }): Promise<void> {
     if (this.busy) throw new Error('An extension operation is already running');
     this.busy = true;
-    const dir = pluginDirectory(this.root);
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    // A no-timeout exclusive lock: long indexes must not be stolen mid-update.
-    const lock = path.join(dir, 'operation.lock');
-    let ownsLock = false;
-    const configFile = path.join(this.root, 'codegraph.json');
-    let previous: string | undefined;
-    let written: string | undefined;
     try {
-      fs.writeFileSync(lock, String(process.pid), { flag: 'wx', mode: 0o600 }); ownsLock = true;
-      if (fs.existsSync(configFile)) previous = fs.readFileSync(configFile, 'utf8');
-      const config = previous === undefined ? {} : JSON.parse(previous);
-      if (!config || Array.isArray(config) || typeof config !== 'object') throw new Error('codegraph.json must be an object');
-      const entries = await update(structuredClone(this.list()));
-      config.plugins = entries;
-      written = JSON.stringify(config, null, 2) + '\n';
-      atomicWrite(configFile, written); clearProjectConfigCache();
-      this.onProgress({ state: 'indexing', message: 'Building and checking the updated graph' });
-      const { CodeGraph } = await import('../index');
-      const graph = CodeGraph.isInitialized(this.root) ? await CodeGraph.open(this.root) : await CodeGraph.init(this.root);
-      try { await graph.refreshPluginIndex(); } finally { graph.close(); }
-      this.onProgress({ state: 'ready', message: successMessage });
-    } catch (err) {
-      // Restore only our own write; a user edit during indexing is preserved.
-      if (written !== undefined && fs.readFileSync(configFile, 'utf8') === written) {
-        if (previous === undefined) fs.unlinkSync(configFile); else atomicWrite(configFile, previous);
-        clearProjectConfigCache();
-      }
-      this.onProgress({ state: 'failed', message: String(err) });
-      throw err;
-    } finally {
-      if (ownsLock) fs.unlinkSync(lock);
-      this.busy = false;
-    }
+      await withExtensionGuard(this.root, async () => {
+        this.visibleEntries = structuredClone(loadPluginEntries(this.root));
+        const file = path.join(this.root, 'codegraph.json');
+        const config = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
+        if (!config || Array.isArray(config) || typeof config !== 'object') throw new Error('codegraph.json must be an object');
+        config.plugins = await update(structuredClone(this.visibleEntries));
+        const transaction = new ExtensionTransaction(this.root, JSON.stringify(config, null, 2) + '\n', pkg);
+        try {
+          transaction.stage(pkg);
+          this.onProgress({ state: 'indexing', message: 'Building and checking the updated graph' });
+          const { CodeGraph } = await import('../index');
+          const graph = CodeGraph.isInitialized(this.root) ? await CodeGraph.open(this.root) : await CodeGraph.init(this.root);
+          try { await graph.refreshPluginIndex({ extensionTransactionId: transaction.record.id }); } finally { graph.close(); }
+          transaction.reconcile();
+        } catch (error) {
+          // The durable graph marker decides rollback vs completion, including
+          // exceptions after SQLite committed. Conflicts retain the journal.
+          transaction.reconcile(); throw error;
+        }
+        this.visibleEntries = undefined;
+        this.onProgress({ state: 'ready', message: successMessage });
+      });
+    } catch (error) { this.onProgress({ state: 'failed', message: String(error) }); throw error; }
+    finally { this.visibleEntries = undefined; this.busy = false; }
   }
 }

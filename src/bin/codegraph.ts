@@ -1012,6 +1012,8 @@ program
     const worktreeMismatch = detectWorktreeIndexMismatch(startPath, projectPath);
 
     try {
+      const { recoverExtensions } = await import('../plugins/recovery');
+      recoverExtensions(projectPath);
       if (!isInitialized(projectPath)) {
         if (options.json) {
           console.log(JSON.stringify({

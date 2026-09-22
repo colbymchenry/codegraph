@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import { ExtensionManager, downloadPackage } from './manager';
 import { startExtensionBridge } from './bridge';
 import { packExtension } from './package';
+import { recoverExtensions } from './recovery';
 import { createExtensionProject, testExtension } from './author';
 
 export function registerExtensionCommands(program: Command): void {
@@ -18,6 +19,11 @@ export function registerExtensionCommands(program: Command): void {
     .option('--fixtures <file>', 'Author fixture JSON relative to extension directory', 'extension.test.json')
     .action(async (directory, options) => {
       console.log(JSON.stringify(await testExtension(directory, { fixtures: options.fixtures }), null, 2));
+    });
+  extensions.command('recover').description('Reconcile an interrupted extension lifecycle without executing extension code')
+    .option('--path <path>', 'Project directory', '.').action(options => {
+      const recovered = recoverExtensions(path.resolve(options.path));
+      console.log(recovered ? 'Extension transaction recovered' : 'No interrupted extension transaction');
     });
   extensions.command('list').option('--path <path>', 'Project directory', '.').action(options => {
     console.log(JSON.stringify(new ExtensionManager(options.path).list(), null, 2));
