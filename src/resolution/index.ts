@@ -20,7 +20,7 @@ import {
   isImportableKind,
 } from './types';
 import { matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath } from './import-resolver';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, pythonRootFingerprint, pythonReopenScope, pythonPackageImporters } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks } from './frameworks';
@@ -688,15 +688,16 @@ export class ReferenceResolver {
           this.reExportCache.set(filePath, []);
           return [];
         }
-        // Re-exports are a JS/TS-only construct, and what matters is the
-        // BARREL file's own language — not the consuming reference's. A
-        // `.svelte`/`.vue` consumer threads its own language down the
-        // re-export chase, which would make extractReExports() bail on a
-        // `.ts` index barrel and silently break the chain (#629). Re-key
+        // What matters is the BARREL file's own language — not the consuming
+        // reference's. A `.svelte`/`.vue` consumer threads its own language
+        // down the re-export chase, which would make extractReExports() bail
+        // on a `.ts` index barrel and silently break the chain (#629). Re-key
         // the parse on the barrel's extension so the chase works no matter
-        // what kind of file imports through it.
+        // what kind of file imports through it. Python re-exports through its
+        // imports (a package `__init__.py`), so a `.py` barrel parses as Python.
         const isJsFamily = /\.(?:d\.ts|[cm]?tsx?|[cm]?jsx?|ets)$/i.test(filePath);
-        const reExports = extractReExports(content, isJsFamily ? 'typescript' : language);
+        const barrelLanguage = isJsFamily ? 'typescript' : /\.py$/i.test(filePath) ? 'python' : language;
+        const reExports = extractReExports(content, barrelLanguage);
         this.reExportCache.set(filePath, reExports);
         return reExports;
       },
@@ -2118,6 +2119,40 @@ export class ReferenceResolver {
       resolved: [],
       unresolved: [],
       stats: aggregateStats,
+    };
+  }
+
+  /**
+   * Digest of the package roots Python import resolution rests on (see
+   * `pythonRootFingerprint`). Build configs are read from disk rather than
+   * the file cache, so a sync after an edit sees the edit. Empty for a
+   * project with no Python.
+   */
+  getPythonRootFingerprint(): string {
+    return pythonRootFingerprint(this.diskContext());
+  }
+
+  /** What a sync must re-open after these Python files were added or removed (see `pythonReopenScope`). */
+  getPythonReopenScope(changedFiles: string[]): ReturnType<typeof pythonReopenScope> {
+    return pythonReopenScope(this.diskContext(), changedFiles);
+  }
+
+  /** Importers of Python packages whose `__init__.py` was edited, with the names they bind (see `pythonPackageImporters`). */
+  getPythonPackageImporters(initFiles: string[]): Map<string, Map<string, string | null>> {
+    return pythonPackageImporters(this.context, initFiles);
+  }
+
+  /** The resolution context, reading build configs from disk rather than the file cache. */
+  private diskContext(): ResolutionContext {
+    return {
+      ...this.context,
+      readFile: (filePath: string) => {
+        try {
+          return fs.readFileSync(path.join(this.projectRoot, filePath), 'utf-8');
+        } catch {
+          return null;
+        }
+      },
     };
   }
 
