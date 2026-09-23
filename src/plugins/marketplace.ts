@@ -154,9 +154,13 @@ export async function startMarketplaceServer(options: { database: string; public
       }
       if (req.method !== 'GET') { json(405, { error: 'Method not allowed' }); return; }
       const files: Record<string, string> = { '/': 'index.html', '/app.js': 'app.js', '/style.css': 'style.css' };
-      const file = files[url.pathname] ?? (url.pathname.startsWith('/extensions/') || url.pathname === '/publish' ? 'index.html' : undefined);
+      // Fixed UI asset paths only; never turn publicDirectory into an arbitrary file server.
+      const asset = /^\/(?:icons\.js|fonts\.css|fonts\/[a-z0-9-]+\.woff2|brand\/[a-z0-9-]+\.svg|licenses\/[a-z0-9-]+\.txt)$/.test(url.pathname)
+        ? url.pathname.slice(1) : undefined;
+      const file = files[url.pathname] ?? asset ?? (url.pathname.startsWith('/extensions/') || url.pathname === '/publish' ? 'index.html' : undefined);
       if (!file) { json(404, { error: 'Not found' }); return; }
-      res.writeHead(200, { 'Content-Type': file.endsWith('.html') ? 'text/html; charset=utf-8' : file.endsWith('.js') ? 'text/javascript' : 'text/css' });
+      const type = file.endsWith('.html') ? 'text/html; charset=utf-8' : file.endsWith('.js') ? 'text/javascript' : file.endsWith('.woff2') ? 'font/woff2' : file.endsWith('.svg') ? 'image/svg+xml' : file.endsWith('.txt') ? 'text/plain; charset=utf-8' : 'text/css';
+      res.writeHead(200, { 'Content-Type': type });
       res.end(fs.readFileSync(path.join(options.publicDirectory, file)));
     } catch (err) { json(400, { error: err instanceof Error ? err.message : String(err) }); }
   });

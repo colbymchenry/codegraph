@@ -23,6 +23,19 @@ function submission(keys: ReturnType<typeof identity>, version = '1.0.0', bytes 
     signature: sign('sha256', Buffer.from(payload), { key: keys.privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64') };
 }
 describe('extension publishing and connection contract', () => {
+  it('serves bundled UI assets with correct MIME while rejecting unrelated paths', async () => {
+    const server = await startMarketplaceServer({ database: path.join(root(), 'registry.db'), publicDirectory: path.resolve('marketplace/public') });
+    const url = `http://127.0.0.1:${server.port}`;
+    try {
+      for (const [file, type] of [['icons.js', 'text/javascript'], ['fonts.css', 'text/css'], ['fonts/archivo-latin-wght-normal.woff2', 'font/woff2'], ['brand/codegraph.svg', 'image/svg+xml'], ['licenses/lucide.txt', 'text/plain; charset=utf-8']]) {
+        const response = await fetch(`${url}/${file}`);
+        expect(response.status).toBe(200);
+        expect(response.headers.get('content-type')).toBe(type);
+        expect(Buffer.from(await response.arrayBuffer())).toEqual(fs.readFileSync(path.resolve('marketplace/public', file)));
+      }
+      for (const file of ['_headers', 'package.json', '../package.json', 'fonts/%2e%2e%2fpackage.json', 'fonts/a/b.woff2']) expect((await fetch(`${url}/${file}`)).status).toBe(404);
+    } finally { await server.close(); }
+  });
   it('persists immutable releases, enforces ownership, and keeps community publication separate from official status', () => {
     const database = path.join(root(), 'registry.db'), owner = identity();
     let store = createMarketplaceStore(database);

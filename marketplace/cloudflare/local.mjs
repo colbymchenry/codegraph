@@ -6,8 +6,9 @@ const root=path.dirname(fileURLToPath(import.meta.url));
 export async function startLocal({state,testing=false,boundary,port=0,publishing=true,publishingUntil,initialize=true,sourceReviews=[],fixtureSourceApproval=false}={}) {
   const mf=new Miniflare({...convertV4MiniflareOptions({host:'127.0.0.1',port,workers:[{name:'registry',modules:true,scriptPath:path.join(root,'.build',testing?'test-worker.js':'worker.js'),compatibilityDate:'2026-09-21',
     d1Databases:{DB:'registry'},r2Buckets:{PACKAGES:'packages'},
+    // Mirror deployed asset-first routing; the former three-file mock hid missing UI assets.
+    assets:{directory:path.join(root,'../public'),binding:'ASSETS',run_worker_first:['/api/*'],routerConfig:{has_user_worker:true},assetConfig:{not_found_handling:'single-page-application'}},
     bindings:{...(testing?{TEST_SOURCE_REVIEWS:JSON.stringify(sourceReviews),TEST_FIXTURE_SOURCE_APPROVAL:String(fixtureSourceApproval)}:{}),PUBLISHING_ENABLED:String(publishing),...(publishingUntil===undefined?{}:{PUBLISHING_UNTIL:publishingUntil})},serviceBindings:{
-      ASSETS:async req=>{const name=path.basename(new URL(req.url).pathname);if(!['index.html','app.js','style.css'].includes(name))return new Response('Not found',{status:404});return new Response(fs.readFileSync(path.join(root,'../public',name)),{headers:{'Content-Type':name.endsWith('.html')?'text/html':name.endsWith('.js')?'text/javascript':'text/css'}});},
       ...(boundary?{TEST_BOUNDARY:boundary}:{})}}]}),resourcePersistencePath:state});
   await mf.ready;
   const db=await mf.getD1Database('DB');
