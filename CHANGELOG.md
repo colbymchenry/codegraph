@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Python imports now resolve the way Python finds modules: from your project's package roots — the repository root, `src/` layouts, each service with its own `pyproject.toml`, `setup.cfg` or `setup.py`, and the package directories those declare — so `from shop.cart import total` reaches `src/shop/cart.py`, `from pkg import name` reaches what the package's `__init__.py` defines or re-exports (respecting `__all__`), and `import json` or `import requests` no longer links to a same-named file nested in a test fixture, an example, a vendored copy or another package. After a module, package or `__init__.py` is added or removed, a package's `__init__.py` is edited, or a build config is edited, the next sync brings Python imports back in line with a fresh index; the file watcher doesn't react to a build-config edit by itself, so run `codegraph sync` after one. Re-index Python projects after upgrading. (#1704)
 
 ## [1.6.2] - 2026-10-03
 
