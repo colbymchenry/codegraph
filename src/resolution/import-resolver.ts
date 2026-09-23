@@ -1754,12 +1754,27 @@ function resolvePythonModuleMember(
   const dotIdx = ref.referenceName.indexOf('.');
   if (dotIdx <= 0) return null;
   const receiver = ref.referenceName.substring(0, dotIdx);
-  // The immediate member of the module (first segment after the receiver).
-  const member = ref.referenceName.substring(dotIdx + 1).split('.')[0];
-  if (!member) return null;
+
+  const moduleFile = (modulePath: string, fromFile: string): string | null => {
+    // resolveImportPath only maps RELATIVE dotted paths (`.mod`, `..pkg.mod`); an
+    // ABSOLUTE package path (`pkg.module` from `from pkg import module`, or a bare
+    // `import pkg.mod`) resolves to null there, so fall back to the dotted-module
+    // file lookup — the same asymmetry resolveModuleImportToFile already handles
+    // for the file→file import edge. Without this, a `module.func()` call after
+    // `from pkg import module` dropped its `calls` edge even though the import
+    // edge resolved (#578).
+    return resolveImportPath(modulePath, fromFile, ref.language, context)
+      ?? findPythonModuleFile(modulePath, context, fromFile)?.filePath
+      ?? null;
+  };
 
   for (const imp of imports) {
-    if (imp.localName !== receiver) continue;
+    // `import pkg.mod` binds `pkg`, so a call spells the whole path out —
+    // `pkg.mod.func()`. The mapping names the module by its last segment, which
+    // never matches that receiver; match the full dotted source instead.
+    const spelledOut = imp.isNamespace && imp.localName === imp.source.split('.').pop()
+      && imp.source.includes('.') && ref.referenceName.startsWith(`${imp.source}.`);
+    if (imp.localName !== receiver && !spelledOut) continue;
 
     // `import mod` / `import numpy as np` bind the module at `source` itself;
     // `from . import certs` / `from pkg import mod` bind a SUBMODULE whose
@@ -1772,27 +1787,50 @@ function resolvePythonModuleMember(
     // form (where the two names coincide) worked (#1626). For an unaliased
     // import the two are identical, so this changes nothing there.
     const moduleName = imp.exportedName === '*' ? imp.localName : imp.exportedName;
-    const modulePath = imp.isNamespace
+    let modulePath = imp.isNamespace
       ? imp.source
       : imp.source.endsWith('.')
         ? imp.source + moduleName
         : imp.source + '.' + moduleName;
+    const rest = ref.referenceName
+      .substring(spelledOut ? imp.source.length + 1 : dotIdx + 1)
+      .split('.');
 
-    // resolveImportPath only maps RELATIVE dotted paths (`.mod`, `..pkg.mod`); an
-    // ABSOLUTE package path (`pkg.module` from `from pkg import module`, or a bare
-    // `import pkg.mod`) resolves to null there, so fall back to the dotted-module
-    // file lookup — the same asymmetry resolveModuleImportToFile already handles
-    // for the file→file import edge. Without this, a `module.func()` call after
-    // `from pkg import module` dropped its `calls` edge even though the import
-    // edge resolved (#578).
-    let resolvedPath = resolveImportPath(modulePath, ref.filePath, ref.language, context);
-    if (!resolvedPath) {
-      resolvedPath = findPythonModuleFile(modulePath, context, ref.filePath)?.filePath ?? null;
-    }
+    let resolvedPath = moduleFile(modulePath, ref.filePath);
     if (!resolvedPath || resolvedPath === ref.filePath) continue;
+
+    // A CALL through a longer path — `utils.helpers.do_x()`, `mod.Klass.run()`
+    // — names submodules and then one symbol. Descend while the next segment
+    // is a module file; what is left must be a top-level callable, or a class
+    // and one of its methods. Anything else is not something this path can
+    // prove, so it is no edge — never the first segment's symbol, which for
+    // `mod.Klass.run()` would record a call to the class. Other reference
+    // kinds keep the single-member lookup below.
+    if (ref.referenceKind === 'calls' && rest.length > 1) {
+      while (rest.length > 1) {
+        const sub = moduleFile(`${modulePath}.${rest[0]}`, resolvedPath);
+        if (!sub) break;
+        modulePath = `${modulePath}.${rest.shift()}`;
+        resolvedPath = sub;
+      }
+      const inFile = context.getNodesInFile(resolvedPath);
+      let target: Node | undefined;
+      if (rest.length === 1) {
+        target = inFile.find((n) => n.name === rest[0] && (n.kind === 'function' || n.kind === 'class'));
+      } else if (rest.length === 2) {
+        const cls = inFile.find((n) => n.name === rest[0] && n.kind === 'class');
+        target = cls && inFile.find((n) =>
+          n.kind === 'method' && n.name === rest[1] && n.qualifiedName.endsWith(`${cls.name}::${rest[1]}`));
+      }
+      if (target) {
+        return { original: ref, targetNodeId: target.id, confidence: 0.85, resolvedBy: 'import' };
+      }
+      continue;
+    }
 
     // Find the member as a top-level definition in the module file. Exclude
     // `method` so `mod.foo` never lands on a same-named class method.
+    const member = rest[0];
     const target = context.getNodesInFile(resolvedPath).find(
       (n) =>
         n.name === member &&

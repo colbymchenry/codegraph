@@ -19,7 +19,7 @@ import {
   isInheritanceRef,
   isImportableKind,
 } from './types';
-import { matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
+import { matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos, pythonAttrRefResolves } from './name-matcher';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
@@ -30,6 +30,7 @@ import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { loadGoModule, type GoModule } from './go-module';
 import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
+import { stripCommentsForRegex } from './strip-comments';
 import { lexicalPathWithinRoot } from '../utils';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
@@ -876,6 +877,97 @@ export class ReferenceResolver {
    * Calls that land on an alias binding then forward once to the callable
    * the alias names (see ./alias-binding), regardless of the strategy.
    */
+  /**
+   * The failed python attribute-chain refs that an edit to `touched` makes
+   * resolvable now — what a sync retries after a factory or a base class
+   * changed in another file (`pythonAttrRefResolves` answers each one).
+   *
+   * The candidates are the refs in the files that import a touched file
+   * within a few hops, counted once per (calling symbol, name). When there
+   * are more than `ceiling` of them — an edit to a module most of the project
+   * imports — only those the edit can plausibly reach are kept: an attribute
+   * a touched file assigns, a call receiver it defines, a class that
+   * subclasses one of its classes, or an attribute assigned from a call to
+   * something it defines. Null when even that is over the ceiling; those refs
+   * wait for a full index.
+   *
+   * Past the ceiling, then, these become resolvable only at the next full
+   * index: a factory two hops from the edit, a subclass two hops away, and an
+   * attribute typed by an annotation — a parameter `c: Client`, or a
+   * class-level `c: Client` in a class that only gains the base or import that
+   * resolves `Client` in the touched file.
+   */
+  pythonAttrRetryCandidates(touched: string[], ceiling: number = 2000): UnresolvedReference[] | null {
+    const touchedSet = new Set(touched);
+    const closure = this.queries.getPythonImporterClosure(touched).filter((f) => !touchedSet.has(f));
+    // One answer per (calling symbol, name): the same call written twice in
+    // one function resolves the same way, so it is asked — and counted — once.
+    const keyOf = (ref: { fromNodeId: string; referenceName: string }) => `${ref.fromNodeId}\0${ref.referenceName}`;
+    const resolvable = (refs: UnresolvedReference[]) => {
+      const answers = new Map<string, boolean>();
+      return refs.filter((ref) => {
+        if (!ref.filePath || !ref.language) return false;
+        const key = keyOf(ref);
+        let ok = answers.get(key);
+        if (ok === undefined) answers.set(key, (ok = pythonAttrRefResolves(ref as UnresolvedRef, this.context)));
+        return ok;
+      });
+    };
+    const candidates = this.queries.getFailedPythonAttrRefKeys(closure);
+    const load = (keys: typeof candidates) => this.queries.getUnresolvedReferencesByIds(keys.map((k) => k.id));
+    if (new Set(candidates.map(keyOf)).size <= ceiling) return resolvable(load(candidates));
+
+    const assigned = new Set<string>();
+    const defined = new Set<string>();
+    const subclassing = new Set<string>();
+    const calling = new Set<string>();
+    for (const file of touched) {
+      const source = this.context.readFile(file);
+      if (source) {
+        const text = stripCommentsForRegex(source, 'python');
+        for (const m of text.matchAll(/\b(?:self|cls)\.(\w+)\s*(?::[^=\n]*)?=(?!=)|^[ \t]+(\w+)\s*(?::[^=\n]*)?=(?!=)/gm)) {
+          assigned.add((m[1] ?? m[2])!);
+        }
+      }
+      for (const n of this.context.getNodesInFile(file)) {
+        if (n.kind === 'class' || n.kind === 'function' || n.kind === 'method') defined.add(n.name);
+      }
+      for (const f of this.queries.getPythonFilesWithEdgesInto(file, ['extends'], ['class'])) subclassing.add(f);
+      for (const f of this.queries.getPythonFilesWithEdgesInto(file, ['calls', 'instantiates'], ['function', 'method', 'class'])) {
+        calling.add(f);
+      }
+    }
+
+    const callees = new Map<string, Map<string, Set<string>>>(); // file → attr → callee names
+    const assignedCallees = (file: string, attr: string): Set<string> => {
+      let byAttr = callees.get(file);
+      if (!byAttr) {
+        byAttr = new Map();
+        const source = this.context.readFile(file);
+        const text = source ? stripCommentsForRegex(source, 'python') : '';
+        for (const m of text.matchAll(/\b(\w+)\s*(?::[^=\n]*)?=(?!=)\s*(?:await\s+)?(?:[\w.]*\.)?(\w+)\s*\(/g)) {
+          let set = byAttr.get(m[1]!);
+          if (!set) byAttr.set(m[1]!, (set = new Set()));
+          set.add(m[2]!);
+        }
+        callees.set(file, byAttr);
+      }
+      return byAttr.get(attr) ?? new Set();
+    };
+
+    const kept = candidates.filter((ref) => {
+      const name = ref.referenceName;
+      if (name.includes('().')) return defined.has(name.split('().')[0]!.split('.').pop()!);
+      const segs = name.split('.');
+      if (segs.length !== 3 || !segs.every((seg) => /^[A-Za-z_]\w*$/.test(seg))) return false;
+      const attr = segs[1]!;
+      if (assigned.has(attr)) return true;
+      if (subclassing.has(ref.filePath) && (segs[0] === 'self' || segs[0] === 'cls')) return true;
+      return calling.has(ref.filePath) && [...assignedCallees(ref.filePath, attr)].some((c) => defined.has(c));
+    });
+    return new Set(kept.map(keyOf)).size <= ceiling ? resolvable(load(kept)) : null;
+  }
+
   resolveOne(ref: UnresolvedRef): ResolvedRef | null {
     const resolved = this.gateTargetKind(this.resolveOneInner(ref), ref);
     if (!resolved || ref.referenceKind !== 'calls') return resolved;
