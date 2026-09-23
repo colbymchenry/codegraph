@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as cp from 'child_process';
-import * as fs from 'fs';
+import * as fs from 'node:fs';
 import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
@@ -11,9 +11,9 @@ vi.mock('child_process', async importOriginal => {
   const actual = await importOriginal<typeof import('child_process')>();
   return { ...actual, execFileSync: vi.fn(actual.execFileSync) };
 });
-vi.mock('fs', async importOriginal => {
-  const actual = await importOriginal<typeof import('fs')>();
-  return { ...actual, readFileSync: vi.fn(actual.readFileSync) };
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, readFileSync: vi.fn(actual.readFileSync), openSync: vi.fn(actual.openSync) };
 });
 
 describe('git index currency across commits and restores (#1829)', () => {
@@ -132,12 +132,12 @@ describe('git index currency across commits and restores (#1829)', () => {
 
   it('keeps a committed path pending when sync cannot read it', async () => {
     write('new.ts', 'newSymbol'); commit();
-    const real = fs.readFileSync;
+    const real = fs.openSync;
     let injected = 0;
-    vi.spyOn(fs, 'readFileSync').mockImplementation(((file: any, ...args: any[]) => {
+    vi.spyOn(fs, 'openSync').mockImplementation(((file: any, ...args: any[]) => {
       if (String(file) === path.join(root, 'new.ts')) { injected++; throw new Error('Injected transient read error'); }
       return (real as any)(file, ...args);
-    }) as typeof fs.readFileSync);
+    }) as typeof fs.openSync);
     await cg.sync();
     expect(injected).toBeGreaterThan(0);
     expect(symbols('newSymbol')).not.toContain('newSymbol');

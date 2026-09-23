@@ -39,7 +39,7 @@ async function run(name, command, args, timeout = 360000, overrides = {}) {
   const built = await run('build', ...npmCommand(['run', 'build']));
   if (built && metadata.scope === 'repairs') {
     metadata.notRun = ['unchanged core/worker/lifecycle paths: reuse successful steps at 90516f8, run 35880834124'];
-    await run('focused', process.execPath, ['node_modules/vitest/vitest.mjs', 'run', '__tests__/db-reopen-on-replace.test.ts', '__tests__/upgrade.test.ts', '__tests__/update-check.test.ts', '__tests__/cli-ui-command.test.ts', '--maxWorkers=1', '--minWorkers=1', '--reporter=default', '--reporter=json', `--outputFile.json=${path.join(out, 'focused.json')}`], 300000);
+    await run('focused', process.execPath, ['node_modules/vitest/vitest.mjs', 'run', '__tests__/db-reopen-on-replace.test.ts', '__tests__/upgrade.test.ts', '__tests__/update-check.test.ts', '__tests__/git-index-currency.test.ts', '__tests__/cli-ui-command.test.ts', '--maxWorkers=1', '--minWorkers=1', '--reporter=default', '--reporter=json', `--outputFile.json=${path.join(out, 'focused.json')}`], 300000);
     await run('file-growth-race', process.execPath, ['scripts/validation/release-size-race.cjs','dist']);
     await run('installer-archives', process.execPath, ['scripts/validation/release-installers.cjs']);
     await run('security-negative', process.execPath, ['scripts/validation/release-security.cjs','.','dist']);
