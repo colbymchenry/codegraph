@@ -1,0 +1,45 @@
+name: Release candidate validation
+on:
+  push:
+    branches: [candidate/extensions-release-20260923]
+    paths:
+      - 'src/**'
+      - '__tests__/**'
+      - 'scripts/**'
+      - 'install.*'
+      - 'package*.json'
+      - '.github/workflows/release-candidate.yml'
+permissions:
+  contents: read
+concurrency:
+  group: release-candidate-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  native:
+    if: github.repository == 'colbymchenry/codegraph'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      CODEGRAPH_TELEMETRY: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.2'
+      - run: npm ci --no-audit --no-fund
+      - name: Candidate checks with command receipts
+        run: node scripts/validation/release-native.cjs
+      - name: Retain candidate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-candidate-${{ matrix.os }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: .qa/release-native/
+          include-hidden-files: true
+          retention-days: 7

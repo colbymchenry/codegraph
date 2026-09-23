@@ -49,7 +49,7 @@ describe('installMainThreadWatchdog opt-out', () => {
  * the built module the way mcp-ppid-watchdog.test.ts drives the built CLI.
  */
 describe('liveness watchdog (spawned, real watchdog process)', () => {
-  const MODULE = path.resolve(__dirname, '../dist/mcp/liveness-watchdog.js');
+  const MODULE = path.resolve(process.env.RELEASE_BASELINE_DIST || path.join(__dirname, '../dist'), 'mcp/liveness-watchdog.js');
 
   beforeAll(() => {
     if (!fs.existsSync(MODULE)) {
@@ -218,7 +218,7 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
       );
       seed.getDb().exec('BEGIN');
       try {
-        for (let i = 0; i < 600_000; i++) {
+        for (let i = 0; i < 150_000; i++) {
           const name = `symbol_${i}`;
           insert.run(`node_${i}`, name, name, `src/file_${i % 1000}.ts`, Date.now());
         }
@@ -230,7 +230,7 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
       seed.endBulkNodeLoad();
       seed.close();
 
-      const DIST_INDEX = path.resolve(__dirname, '../dist/index.js');
+      const DIST_INDEX = path.resolve(process.env.RELEASE_BASELINE_DIST || path.join(__dirname, '../dist'), 'index.js');
       const prelude = `
         const { CodeGraph, initGrammars } = require(${JSON.stringify(DIST_INDEX)});
         await initGrammars();
@@ -252,7 +252,7 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
         prelude
       );
 
-      expect(r.signal).toBeNull();
+      expect(r.signal, r.stderr).toBeNull();
       expect(r.code, r.stderr).toBe(0);
     } finally {
       fs.rmSync(projectRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

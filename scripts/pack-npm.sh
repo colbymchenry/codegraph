@@ -55,9 +55,8 @@ for archive in "${archives[@]}"; do
       nodefile="node"
       ;;
   esac
-  # The browser viewer must survive the archive round-trip too: a tar/zip that
-  # dropped dist/viewer would publish a platform package whose `codegraph ui`
-  # serves a 404.
+  # Retained viewer assets must survive the archive round-trip even though
+  # the ui/web commands are withheld from this release.
   node "$ROOT/scripts/check-ui-build.mjs" --root "$pkgdir/lib"
   VERSION="$VERSION" SCOPE="$SCOPE" TARGET="$target" OSV="$os" ARCHV="$arch" NODEFILE="$nodefile" \
     node -e '

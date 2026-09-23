@@ -298,15 +298,15 @@ describe.skipIf(!CAN_NET)('npm-shim download fallback (local HTTPS)', () => {
     expect(fs.existsSync(path.join(cache, 'bundles', `${target}-5.0.0-bad`))).toBe(false);
   }, 20000);
 
-  it('proceeds when no SHA256SUMS is published (older releases)', async () => {
+  it('fails closed when no SHA256SUMS is published (older releases)', async () => {
     sumsBody = null; // 404
     const pkg = makePkg('5.0.0-nosums');
     const cache = mkTmp('cache');
     const r = await runShim(pkg, ['--version'], netEnv(cache));
 
-    expect(r.status).toBe(0);
-    expect(r.stderr).toContain('downloading');
-    expect(r.stderr).not.toContain('checksum verified'); // skipped, not failed
-    expect(r.stdout).toContain('FAKE_BUNDLE_RAN');
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('checksum manifest unavailable');
+    expect(r.stdout).not.toContain('FAKE_BUNDLE_RAN');
+    expect(fs.existsSync(path.join(cache, 'bundles', `${target}-5.0.0-nosums`))).toBe(false);
   }, 20000);
 });

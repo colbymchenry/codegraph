@@ -991,6 +991,12 @@ export class QueryBuilder {
    * stamp: recomputed only after something wrote to the database.
    */
   getDominantFile(): { filePath: string; edgeCount: number; nextEdgeCount: number } | null {
+    // total_changes() includes rolled-back writes. Never retain a result read
+    // inside a transaction; rollback otherwise leaves its stamp unchanged.
+    if (this.db.inTransaction !== false) {
+      this.dominantFileMemo = undefined;
+      return this.computeDominantFile();
+    }
     const stamp = this.getChangeStamp();
     if (this.dominantFileMemo?.stamp === stamp) return this.dominantFileMemo.value;
     const value = this.computeDominantFile();

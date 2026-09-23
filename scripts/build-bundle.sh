@@ -64,8 +64,8 @@ STAGE="$WORK/codegraph-${TARGET}"
 mkdir -p "$STAGE/lib" "$STAGE/bin"
 cp -R "$ROOT/dist" "$STAGE/lib/dist"
 # The browser viewer rides along inside dist/viewer (built by `npm run build`
-# above). Fail here rather than shipping a bundle whose `codegraph ui` serves
-# a 404 — the copy is verified, not assumed.
+# above). The viewer commands are withheld; verify the retained assets for
+# SDK consumers and future viewer work.
 node "$ROOT/scripts/check-ui-build.mjs" --root "$STAGE/lib"
 cp "$ROOT/package.json" "$ROOT/package-lock.json" "$STAGE/lib/"
 echo "[bundle] installing production dependencies"

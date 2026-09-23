@@ -321,6 +321,7 @@ export class CodeGraph {
     this.db = fresh;
     this.queries = new QueryBuilder(fresh.getDb());
     this.wireLayers();
+    this.pendingFullReconcile = true;
     // Releasing the dead handle also frees the leaked db/-wal/-shm fds that were
     // pinning the unlinked inode (#925).
     try { stale.close(); } catch { /* the old inode is gone; closing just frees fds */ }
@@ -331,7 +332,9 @@ export class CodeGraph {
   async reopenIfReplacedAsync(): Promise<boolean> {
     if (this.closed) return false;
     if (this.reopenPromise) return this.reopenPromise;
-    const reopening = this.doReopenIfReplacedAsync();
+    if (this.indexMutex.isLocked()) return false;
+    const reopening = withExtensionGuard(this.projectRoot, () =>
+      this.indexMutex.withLock(() => this.doReopenIfReplacedAsync()));
     this.reopenPromise = reopening;
     try {
       return await reopening;
@@ -342,6 +345,8 @@ export class CodeGraph {
 
   /** Serialized implementation for {@link reopenIfReplacedAsync}. */
   private async doReopenIfReplacedAsync(): Promise<boolean> {
+    if (this.closed) return false;
+    recoverExtensions(this.projectRoot);
     if (!this.db.isReplacedOnDisk()) return false;
     const dbPath = this.db.getPath();
     // As above, complete the new open before disturbing the still-usable stale
@@ -355,6 +360,7 @@ export class CodeGraph {
     this.db = fresh;
     this.queries = new QueryBuilder(fresh.getDb());
     this.wireLayers();
+    this.pendingFullReconcile = true;
     try { stale.close(); } catch { /* the old inode is gone; closing just frees fds */ }
     return true;
   }
@@ -1061,6 +1067,21 @@ export class CodeGraph {
   }
 
   private async syncGuarded(options: IndexOptions = {}): Promise<SyncResult> {
+    const empty = { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
+    try {
+      await this.indexMutex.withLock(() => this.doReopenIfReplacedAsync());
+    } catch { return empty; }
+    if (this.pendingFullReconcile) {
+      if (this.getIndexState() === null && this.isFreshlyRecreated()) return empty;
+      options = { ...options, paths: undefined };
+    }
+    const result = await this.syncCurrentDatabase(options);
+    // A failed/lock-busy run must retain the full catch-up for the next retry.
+    if (result.filesChecked > 0) this.pendingFullReconcile = false;
+    return result;
+  }
+
+  private async syncCurrentDatabase(options: IndexOptions = {}): Promise<SyncResult> {
     const plugins = await loadPlugins(this.projectRoot);
     if ((plugins.resolved.length || this.queries.getMetadata('indexed_with_plugins')) &&
         this.queries.getMetadata('indexed_with_plugins') !== this.extensionStamp(plugins)) {
@@ -1099,36 +1120,6 @@ export class CodeGraph {
         this.fileLock.acquire();
       } catch {
         return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
-      }
-      // A full rebuild in another process (`codegraph index` → recreate)
-      // unlinks the database and creates a new file at the same path. A
-      // long-lived instance — the MCP daemon's watcher — would otherwise keep
-      // "syncing" into the dead inode, and nothing it wrote there is visible
-      // to anyone (#1902). Follow the path before writing (one stat), and
-      // widen a scoped sync to a full one: whatever the old handle absorbed
-      // since the rebuild is gone, so the new file has to be reconciled whole.
-      // If the reopen fails (the rebuild is mid-way), report the lock-busy
-      // shape so the watcher keeps its pending files and retries.
-      try {
-        if (this.reopenReplacedDatabase()) this.pendingFullReconcile = true;
-      } catch {
-        this.fileLock.release();
-        return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
-      }
-      if (this.pendingFullReconcile) {
-        // `codegraph index` recreates the file, THEN takes the write lock in
-        // indexAll. A sync landing in that gap would otherwise run a full
-        // reconcile of the empty file and hold the lock the rebuild is about
-        // to ask for. A fresh file with no index_state yet is that rebuild:
-        // step aside (lock-busy shape, the watcher retries) and reconcile in
-        // full once it is done. Bounded, so a rebuild that died before
-        // indexing does not park the watcher forever.
-        if (this.getIndexState() === null && this.isFreshlyRecreated()) {
-          this.fileLock.release();
-          return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
-        }
-        this.pendingFullReconcile = false;
-        options = { ...options, paths: undefined };
       }
       // Defer WAL auto-checkpointing for the whole incremental run, exactly
       // as indexAll does for the bulk path (#1231): sync's store loop and its

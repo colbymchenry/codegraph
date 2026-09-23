@@ -200,25 +200,23 @@ function download(url, dest, redirectsLeft) {
   });
 }
 
-// Best-effort integrity check. When the release publishes a SHA256SUMS file, the
-// downloaded archive MUST match its listed hash or we abort. When that file is
-// absent (older releases) or simply unreachable, we proceed — the archive still
-// arrived from GitHub over TLS. So tampering/corruption is caught, while a
-// missing checksum never breaks an install.
+// Downloaded fallback bundles require an exact, unambiguous SHA256SUMS entry.
+// Missing manifests fail before extraction; already installed npm bundles are unaffected.
 async function verifyChecksum(archivePath, asset, base, version) {
   var sumsPath = archivePath + '.SHA256SUMS';
   try {
     await download(base + '/v' + version + '/SHA256SUMS', sumsPath, 6);
   } catch (e) {
-    return; // not published / unreachable → skip
+    throw new Error('checksum manifest unavailable: ' + e.message);
   }
   var expected = null;
+  var count = 0;
   var lines = fs.readFileSync(sumsPath, 'utf8').split('\n');
   for (var i = 0; i < lines.length; i++) {
     var m = lines[i].trim().match(/^([0-9a-fA-F]{64})\s+\*?(.+)$/);
-    if (m && path.basename(m[2].trim()) === asset) { expected = m[1].toLowerCase(); break; }
+    if (m && m[2].trim() === asset) { expected = m[1].toLowerCase(); count++; }
   }
-  if (!expected) return; // asset not listed → nothing to check
+  if (!expected || count !== 1) throw new Error('missing or ambiguous checksum for ' + asset);
   var actual = require('crypto').createHash('sha256').update(fs.readFileSync(archivePath)).digest('hex');
   if (actual !== expected) {
     throw new Error('checksum mismatch for ' + asset +

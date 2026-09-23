@@ -13,7 +13,8 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import CodeGraph from '../src';
+import CodeGraph, { createExtensionProject, packExtension } from '../src';
+import { ExtensionManager } from '../src/plugins/manager';
 import type { QueryBuilder } from '../src/db/queries';
 
 /** A file whose functions call each other in a chain: `n` in-file call edges. */
@@ -90,4 +91,51 @@ describe('dominant file — computed once per index state (#1864)', () => {
 
     expect(queriesOf(reader).getDominantFile()?.filePath).toBe('ext/plugin.ts');
   });
+  it('does not cache uncommitted results across rollback', async () => {
+    const cg = await setup();
+    const q = queriesOf(cg);
+    const before = q.getDominantFile();
+    const db = (cg as any).db.getDb();
+    db.exec('BEGIN');
+    try { db.exec('DELETE FROM edges'); expect(q.getDominantFile()).toBeNull(); }
+    finally { db.exec('ROLLBACK'); }
+    expect(q.getDominantFile()).toEqual(before);
+  });
+
+  it.runIf(process.platform !== 'win32')('invalidates when a replacement database is reopened', async () => {
+    const reader = await setup();
+    expect(queriesOf(reader).getDominantFile()?.filePath).toBe('core/engine.ts');
+    fs.writeFileSync(path.join(dir, 'ext/plugin.ts'), chain('pluginStep', 120));
+    const rebuilt = await CodeGraph.recreate(dir);
+    try { await rebuilt.indexAll(); } finally { rebuilt.close(); }
+    expect(await reader.reopenIfReplacedAsync()).toBe(true);
+    expect(queriesOf(reader).getDominantFile()?.filePath).toBe('ext/plugin.ts');
+  });
+
+  it('sees an extension graph commit and its removal', async () => {
+    const cg = await setup();
+    expect(queriesOf(cg).getDominantFile()?.filePath).toBe('core/engine.ts');
+    fs.writeFileSync(path.join(dir, 'ext/plugin.ts'), chain('pluginStep', 15));
+    await cg.sync();
+    const authorRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cache-author-'));
+    const author = path.join(authorRoot, 'extension');
+    try {
+      createExtensionProject(author, 'cache-edges');
+      const file = path.join(author, 'package.json');
+      const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
+      manifest.codegraph.capabilities = ['synthPasses']; fs.writeFileSync(file, JSON.stringify(manifest));
+      fs.writeFileSync(path.join(author, 'index.cjs'), `module.exports=()=>({synthPasses:[{name:'dense',languages:['typescript'],run(ctx){
+        const nodes=Array.from({length:15},(_,i)=>ctx.getNodesByName('pluginStep'+i)[0]).filter(Boolean);
+        return nodes.flatMap((a,i)=>nodes.map((b,j)=>({source:a.id,target:b.id,kind:'calls',line:i+1,metadata:{label:'test '+j}})));
+      }}]});`);
+      const manager = new ExtensionManager(dir);
+      await manager.install({bytes:packExtension(author)});
+      await cg.reopenIfReplacedAsync();
+      expect(queriesOf(cg).getDominantFile()?.filePath).toBe('ext/plugin.ts');
+      await manager.remove('cache-edges');
+      await cg.reopenIfReplacedAsync();
+      expect(queriesOf(cg).getDominantFile()?.filePath).toBe('core/engine.ts');
+    } finally { fs.rmSync(authorRoot,{recursive:true,force:true}); }
+  });
+
 });

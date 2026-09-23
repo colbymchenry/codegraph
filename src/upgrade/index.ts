@@ -28,6 +28,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as https from 'https';
 import { spawnSync } from 'child_process';
+import { parse as parseVersion } from 'semver';
 import { ansiColorsEnabled } from '../ui/color';
 
 export const REPO = 'colbymchenry/codegraph';
@@ -155,14 +156,10 @@ export interface Semver {
 }
 
 export function parseSemver(version: string): Semver | null {
-  const m = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?/.exec(version.trim());
-  if (!m) return null;
-  return {
-    major: parseInt(m[1]!, 10),
-    minor: parseInt(m[2]!, 10),
-    patch: parseInt(m[3]!, 10),
-    pre: m[4] ?? null,
-  };
+  const parsed = parseVersion(version.trim());
+  if (!parsed) return null;
+  return { major: parsed.major, minor: parsed.minor, patch: parsed.patch,
+    pre: parsed.prerelease.length ? parsed.prerelease.join('.') : null };
 }
 
 /** Returns >0 if a>b, <0 if a<b, 0 if equal. Throws on unparseable input. */
@@ -337,6 +334,7 @@ export async function runUpgrade(opts: UpgradeOptions, deps: UpgradeDeps): Promi
   let latest: string;
   try {
     latest = normalizeVersion(opts.version || (await deps.resolveLatest()));
+    if (!parseSemver(latest)) throw new Error('Invalid release version: expected a complete semantic version.');
   } catch (err) {
     deps.error(err instanceof Error ? err.message : String(err));
     return 1;
@@ -574,6 +572,8 @@ function upgradeUnixBundle(
 
 /** Build the in-place Windows upgrade script (exported for unit-testing). */
 export function buildWindowsUpgradeScript(bundleRoot: string, version: string, arch: string): string {
+  if (!parseSemver(version) || version !== version.trim()) throw new Error('Invalid release version');
+  if (!['x64', 'arm64'].includes(arch)) throw new Error('Unsupported Windows architecture');
   const target = `win32-${arch}`;
   const url = `https://github.com/${REPO}/releases/download/${version}/codegraph-${target}.zip`;
   // Windows can't DELETE a running exe but CAN rename it, so we upgrade IN
@@ -584,13 +584,21 @@ export function buildWindowsUpgradeScript(bundleRoot: string, version: string, a
   // install.ps1 here — it `Remove-Item`s current\, which fails on the locked exe.
   return [
     `$ErrorActionPreference='Stop'`,
-    `$dest='${bundleRoot}'`,
+    `$dest='${bundleRoot.replace(/'/g, "''")}'`,
     `$url='${url}'`,
     `Write-Host "Downloading $url"`,
     `$tmp=Join-Path $env:TEMP ('cg-up-'+[guid]::NewGuid().ToString('N'))`,
     `New-Item -ItemType Directory -Force -Path $tmp | Out-Null`,
     `$zip=Join-Path $tmp 'cg.zip'`,
     `Invoke-WebRequest -Uri $url -OutFile $zip`,
+    `$sums=Join-Path $tmp 'SHA256SUMS'`,
+    `Invoke-WebRequest -Uri 'https://github.com/${REPO}/releases/download/${version}/SHA256SUMS' -OutFile $sums`,
+    `$pattern='^([0-9a-fA-F]{64})\\s+\\*?'+[regex]::Escape('codegraph-${target}.zip')+'$'`,
+    `$entries=@(Get-Content -LiteralPath $sums | Where-Object { $_.Trim() -match $pattern })`,
+    `if($entries.Count -ne 1){throw 'Missing or ambiguous archive checksum'}`,
+    `$null=$entries[0].Trim() -match $pattern`,
+    `$expectedHash=$Matches[1]`,
+    `if((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash -ne $expectedHash){throw 'Archive checksum mismatch; installation unchanged'}`,
     `$stage=Join-Path $tmp 'stage'`,
     `Expand-Archive -Path $zip -DestinationPath $stage -Force`,
     `$inner=Join-Path $stage 'codegraph-${target}'`,

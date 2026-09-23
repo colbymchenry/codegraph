@@ -144,10 +144,21 @@ describe('live sync after the index is rebuilt by another process (#1902)', () =
     await server.indexAll();
     try {
       await rebuild(root);
+      let entered = false;
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      // Reopen first so wireLayers does not replace the instrumented orchestrator.
+      await server.reopenIfReplacedAsync();
+      const live = (server as any).orchestrator;
+      const sync = live.sync.bind(live);
+      live.sync = async (...args: any[]) => { entered = true; await gate; return sync(...args); };
       const inFlight = server.sync();
-      expect(server.isIndexing()).toBe(true);
-      expect(server.reopenIfReplaced()).toBe(false);
-      await inFlight;
+      try {
+        await waitFor(() => entered);
+        expect(server.isIndexing()).toBe(true);
+        expect(server.reopenIfReplaced()).toBe(false);
+        expect(await server.reopenIfReplacedAsync()).toBe(false);
+      } finally { release(); await inFlight; }
       // The sync itself followed the path.
       expect(server.reopenIfReplaced()).toBe(false);
       fs.appendFileSync(path.join(root, 'src', 'a.ts'), 'export function echo() { return 6; }\n');

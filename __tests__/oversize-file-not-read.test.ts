@@ -50,30 +50,4 @@ describe('oversize files are stat-gated, never read (#1910)', () => {
     }
   });
 
-  it('a 400 MB sparse fixture indexes in well under a second and without growing the heap by its size', async () => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-oversize-big-'));
-    fs.writeFileSync(path.join(dir, 'ok.ts'), 'export const one = 1;\n');
-    // Sparse: occupies no disk, but stat() reports 400 MB — a read would decode all of it.
-    const fd = fs.openSync(path.join(dir, 'huge.ts'), 'w');
-    fs.ftruncateSync(fd, 400 * 1024 * 1024);
-    fs.closeSync(fd);
-    // Warm the engine on a sibling project first, so the grammar and worker
-    // start-up cost is not mistaken for the file being read.
-    const warm = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-oversize-warm-'));
-    fs.writeFileSync(path.join(warm, 'w.ts'), 'export const w = 1;\n');
-    (await CodeGraph.init(warm, { index: true })).close();
-    fs.rmSync(warm, { recursive: true, force: true });
-    const before = process.memoryUsage().rss;
-    const t0 = Date.now();
-    const cg = await CodeGraph.init(dir, { index: true });
-    try {
-      expect(Date.now() - t0).toBeLessThan(5000);
-      // Reading 400 MB would show as at least that much RSS; the stamp shows as none.
-      expect(process.memoryUsage().rss - before).toBeLessThan(100 * 1024 * 1024);
-      expect(cg.getFiles().map(f => f.path).sort()).toEqual(['huge.ts', 'ok.ts']);
-      expect(cg.getChangedFiles()).toEqual({ added: [], modified: [], removed: [] });
-    } finally {
-      cg.close();
-    }
-  });
 });

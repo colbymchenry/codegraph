@@ -3,6 +3,11 @@ title: Reading Your Graph in the Browser
 description: codegraph ui opens a local viewer for an indexed project — callers, source, and callees on one screen.
 ---
 
+:::caution[Deferred feature]
+The `ui` command and `web` alias are unavailable in the next release candidate. This page records the planned viewer; the examples below are not shipped CLI commands. Extension installation uses the separate `extensions connect` companion.
+:::
+
+
 `codegraph ui` opens a viewer for a project you have already indexed. It is the same graph your agent reads, on screen.
 
 ```bash

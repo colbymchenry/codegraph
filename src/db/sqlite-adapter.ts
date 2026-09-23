@@ -30,6 +30,8 @@ export interface SqliteDatabase {
   transaction<T>(fn: (...args: any[]) => T): (...args: any[]) => T;
   close(): void;
   readonly open: boolean;
+  /** Undefined on older runtimes: callers must conservatively avoid memoization. */
+  readonly inTransaction?: boolean;
 }
 
 /**
@@ -56,6 +58,8 @@ class NodeSqliteAdapter implements SqliteDatabase {
     const { DatabaseSync } = require('node:sqlite');
     this._db = opts?.readOnly ? new DatabaseSync(dbPath, { readOnly: true }) : new DatabaseSync(dbPath);
   }
+
+  get inTransaction(): boolean | undefined { return this._db.isTransaction; }
 
   get open(): boolean {
     return this._db.isOpen;
