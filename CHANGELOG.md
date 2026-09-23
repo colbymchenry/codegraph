@@ -145,6 +145,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Scala classes that extend a parent with several argument lists keep every `with` parent, and Scala 3 capture types and `given … with` bodies parse, because the bundled Scala grammar moved to its v0.26.2 release. Re-index Scala projects to pick this up. (#1823)
+
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
 - Turning telemetry off now resets its identity and stops running processes from recording, sending, or restoring unsent data. (#1869)

@@ -41,14 +41,13 @@ fn main() {
     println!("cargo:rerun-if-changed=grammars/lua");
 
     // Scala grammar — vendored C (third vendored-grammar-C language): the
-    // vendored wasm is tree-sitter/tree-sitter-scala master@0aca5d0a6f (the
-    // 2026-04-22 generation sync — 30 states PAST the v0.26.0 tag/crate, so a
-    // crate pin would be a silent downgrade). Sources are that commit's
-    // checked-in generated artifacts, sha-recorded in the scala checklist
-    // §Grammar prep:
-    //   parser.c  bc3c3c794f19461d99d04de6c31d57fa3e41243509b9ab023a9b88ed3273d102
-    //   scanner.c e4ba242568ee3493015598997bf60f613802616eade62717c21109287ef64752
-    // parser.c is 35 MB — the biggest grammar in the tree; expect a slow cc
+    // vendored wasm is the tree-sitter/tree-sitter-scala v0.26.2 release asset,
+    // and these sources are the same tag's checked-in generated artifacts
+    // (#1823 — the previous master@0aca5d0a6f pin truncated an `extends`
+    // clause after a parent with several argument lists):
+    //   parser.c  9f6d03fa6c63d2d855b6f9e0368046a58568587eefc38b5e38bdb001e8ec68db
+    //   scanner.c daed58e6cf61f5b034adf51029c566141da5fb181540b77c8a28654a26e4ddd7
+    // parser.c is ~27 MB — the biggest grammar in the tree; expect a slow cc
     // step on clean builds.
     let mut scala = cc::Build::new();
     scala.include("grammars/scala");
