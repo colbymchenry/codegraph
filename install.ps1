@@ -27,6 +27,9 @@ if (-not $version) {
 }
 if (-not $version) { throw "codegraph: could not resolve latest version; set CODEGRAPH_VERSION." }
 
+if ($version -notmatch '^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?\z') { throw 'codegraph: invalid release version.' }
+if (-not $version.StartsWith('v')) { $version = "v$version" }
+
 # 3. Download + extract the bundle into a stable 'current' dir (overwritten on upgrade).
 $url = "https://github.com/$repo/releases/download/$version/codegraph-$target.zip"
 Write-Host "Installing CodeGraph $version ($target)..."
@@ -34,6 +37,21 @@ $tmp = Join-Path $env:TEMP ("cg-" + [guid]::NewGuid().ToString())
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 $zip = Join-Path $tmp 'cg.zip'
 Invoke-WebRequest -Uri $url -OutFile $zip
+$asset = "codegraph-$target.zip"
+$sumsPath = Join-Path $tmp 'SHA256SUMS'
+Invoke-WebRequest -Uri "https://github.com/$repo/releases/download/$version/SHA256SUMS" -OutFile $sumsPath
+$pattern = '^([0-9a-fA-F]{64})\s+\*?' + [regex]::Escape($asset) + '$'
+$entries = @(Get-Content -LiteralPath $sumsPath | Where-Object { $_.Trim() -match $pattern })
+if ($entries.Count -ne 1) { throw 'codegraph: missing or ambiguous archive checksum.' }
+$null = $entries[0].Trim() -match $pattern
+$expectedHash = $Matches[1]
+# Use .NET directly: Windows PowerShell launched from pwsh can lack Get-FileHash.
+$hasher = [System.Security.Cryptography.SHA256]::Create()
+$stream = [System.IO.File]::OpenRead($zip)
+try { $actualHash = [BitConverter]::ToString($hasher.ComputeHash($stream)).Replace('-', '') }
+finally { $stream.Dispose(); $hasher.Dispose() }
+if ($actualHash -ne $expectedHash) { throw 'codegraph: archive checksum mismatch; installation unchanged.' }
+
 
 $dest = Join-Path $installDir 'current'
 if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }

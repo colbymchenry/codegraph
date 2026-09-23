@@ -112,13 +112,13 @@ describe('issue #238 — ToolHandler reuses the default instance (#2)', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('getCodeGraph(defaultRoot) returns the default instance, not a new connection', () => {
-    const openSpy = vi.spyOn(CodeGraph, 'openSync');
+  it('getCodeGraph(defaultRoot) returns the default instance, not a new connection', async () => {
+    const openSpy = vi.spyOn(CodeGraph, 'open');
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const resolved = (handler as any).getCodeGraph(root);
+      const resolved = await (handler as any).getCodeGraph(root);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const nested = (handler as any).getCodeGraph(path.join(root, 'does', 'not', 'exist'));
+      const nested = await (handler as any).getCodeGraph(path.join(root, 'does', 'not', 'exist'));
       expect(resolved).toBe(cg);
       expect(nested).toBe(cg); // a sub-path resolves up to the same default project
       expect(openSpy).not.toHaveBeenCalled(); // no second connection opened
@@ -128,7 +128,7 @@ describe('issue #238 — ToolHandler reuses the default instance (#2)', () => {
   });
 
   it('concurrent read tool calls (mixed projectPath) all succeed without "database is locked"', async () => {
-    const openSpy = vi.spyOn(CodeGraph, 'openSync');
+    const openSpy = vi.spyOn(CodeGraph, 'open');
     try {
       const calls: Promise<{ content: Array<{ text: string }>; isError?: boolean }>[] = [
         handler.execute('codegraph_search', { query: 'helper' }),

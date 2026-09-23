@@ -181,6 +181,8 @@ export class CodeGraph {
 
   // File watcher for auto-sync on file changes
   private watcher: FileWatcher | null = null;
+  private closed = false;
+  private reopenPromise: Promise<boolean> | null = null;
 
   private constructor(
     db: DatabaseConnection,
@@ -264,6 +266,25 @@ export class CodeGraph {
   }
 
   /**
+   * Set when this instance followed a database replaced on disk (#1902): the
+   * next sync that can run reconciles the whole tree, because whatever the old
+   * handle absorbed since the rebuild never reached the new file.
+   */
+  private pendingFullReconcile = false;
+
+  /** How long a recreated, not-yet-indexed database is treated as a rebuild in progress. */
+  private static readonly RECREATE_GRACE_MS = 120_000;
+
+  /** The database file at the path was written within the recreate grace window. */
+  private isFreshlyRecreated(): boolean {
+    try {
+      return Date.now() - fs.statSync(getDatabasePath(this.projectRoot)).mtimeMs < CodeGraph.RECREATE_GRACE_MS;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Heal a stale database handle in place. If `.codegraph/` was removed and
    * recreated at the SAME path while this instance held the DB open — a git
    * worktree removed and re-added, or `rm -rf .codegraph` + `codegraph init` —
@@ -276,8 +297,19 @@ export class CodeGraph {
    *
    * POSIX-only in practice: `isReplacedOnDisk` never fires on Windows (an open
    * file can't be unlinked there, and st_ino is unreliable).
+   *
+   * Refuses (returns false) while an index/sync holds the index mutex: closing
+   * the handle that run is writing through would break it mid-flight. `sync()`
+   * performs the same check itself once it holds the mutex (#1902), so the
+   * replaced file is still picked up — by that sync, or by the caller's retry.
    */
   reopenIfReplaced(): boolean {
+    if (this.closed || this.indexMutex.isLocked() || this.reopenPromise) return false;
+    return this.reopenReplacedDatabase();
+  }
+
+  /** Synchronous compatibility path; async server callers use the guarded open below. */
+  private reopenReplacedDatabase(): boolean {
     recoverExtensions(this.projectRoot);
     if (!this.db.isReplacedOnDisk()) return false;
     const dbPath = this.db.getPath();
@@ -289,8 +321,46 @@ export class CodeGraph {
     this.db = fresh;
     this.queries = new QueryBuilder(fresh.getDb());
     this.wireLayers();
+    this.pendingFullReconcile = true;
     // Releasing the dead handle also frees the leaked db/-wal/-shm fds that were
     // pinning the unlinked inode (#925).
+    try { stale.close(); } catch { /* the old inode is gone; closing just frees fds */ }
+    return true;
+  }
+
+  /** Async counterpart used by long-lived servers so recovery stays off-loop. */
+  async reopenIfReplacedAsync(): Promise<boolean> {
+    if (this.closed) return false;
+    if (this.reopenPromise) return this.reopenPromise;
+    if (this.indexMutex.isLocked()) return false;
+    const reopening = withExtensionGuard(this.projectRoot, () =>
+      this.indexMutex.withLock(() => this.doReopenIfReplacedAsync()));
+    this.reopenPromise = reopening;
+    try {
+      return await reopening;
+    } finally {
+      if (this.reopenPromise === reopening) this.reopenPromise = null;
+    }
+  }
+
+  /** Serialized implementation for {@link reopenIfReplacedAsync}. */
+  private async doReopenIfReplacedAsync(): Promise<boolean> {
+    if (this.closed) return false;
+    recoverExtensions(this.projectRoot);
+    if (!this.db.isReplacedOnDisk()) return false;
+    const dbPath = this.db.getPath();
+    // As above, complete the new open before disturbing the still-usable stale
+    // handle. This path also keeps secondary-index recovery off the event loop.
+    const fresh = await DatabaseConnection.openAsync(dbPath);
+    if (this.closed) {
+      try { fresh.close(); } catch { /* close() won the lifecycle race */ }
+      return false;
+    }
+    const stale = this.db;
+    this.db = fresh;
+    this.queries = new QueryBuilder(fresh.getDb());
+    this.wireLayers();
+    this.pendingFullReconcile = true;
     try { stale.close(); } catch { /* the old inode is gone; closing just frees fds */ }
     return true;
   }
@@ -394,7 +464,7 @@ export class CodeGraph {
 
     // Open database
     const dbPath = getDatabasePath(resolvedRoot);
-    const db = DatabaseConnection.open(dbPath);
+    const db = await DatabaseConnection.openAsync(dbPath);
     const queries = new QueryBuilder(db.getDb());
 
     const instance = new CodeGraph(db, queries, resolvedRoot);
@@ -497,6 +567,8 @@ export class CodeGraph {
    * Close the CodeGraph instance and release resources
    */
   close(): void {
+    if (this.closed) return;
+    this.closed = true;
     this.unwatch();
     this.semanticParseReuse.clear();
     // Release file lock if held
@@ -995,6 +1067,21 @@ export class CodeGraph {
   }
 
   private async syncGuarded(options: IndexOptions = {}): Promise<SyncResult> {
+    const empty = { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
+    try {
+      await this.indexMutex.withLock(() => this.doReopenIfReplacedAsync());
+    } catch { return empty; }
+    if (this.pendingFullReconcile) {
+      if (this.getIndexState() === null && this.isFreshlyRecreated()) return empty;
+      options = { ...options, paths: undefined };
+    }
+    const result = await this.syncCurrentDatabase(options);
+    // A failed/lock-busy run must retain the full catch-up for the next retry.
+    if (result.filesChecked > 0) this.pendingFullReconcile = false;
+    return result;
+  }
+
+  private async syncCurrentDatabase(options: IndexOptions = {}): Promise<SyncResult> {
     const plugins = await loadPlugins(this.projectRoot);
     if ((plugins.resolved.length || this.queries.getMetadata('indexed_with_plugins')) &&
         this.queries.getMetadata('indexed_with_plugins') !== this.extensionStamp(plugins)) {

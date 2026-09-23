@@ -62,6 +62,11 @@ fi
 [ -n "$version" ] || { echo "codegraph: could not resolve latest version; set CODEGRAPH_VERSION (e.g. CODEGRAPH_VERSION=v0.9.4)." >&2; exit 1; }
 # Release tags are vX.Y.Z; accept a bare X.Y.Z in CODEGRAPH_VERSION too.
 case "$version" in v*) ;; *) version="v$version" ;; esac
+# Version is used as a path component; refuse suffixes and traversal before I/O.
+case "$version" in *[!0-9A-Za-z.+-]*) echo 'codegraph: invalid release version.' >&2; exit 1;; esac
+printf '%s\n' "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$' || {
+  echo 'codegraph: invalid release version.' >&2; exit 1;
+}
 
 # 3. Download + extract the bundle.
 url="https://github.com/$REPO/releases/download/$version/codegraph-${target}.tar.gz"
@@ -69,6 +74,23 @@ echo "Installing CodeGraph $version ($target)..."
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 curl -fsSL "$url" -o "$tmp/cg.tar.gz" || { echo "codegraph: download failed: $url" >&2; exit 1; }
+
+# Verify before extracting or replacing an existing installation. A missing or
+# ambiguous manifest is an error; TLS alone does not verify archive contents.
+asset="codegraph-${target}.tar.gz"
+curl -fsSL "https://github.com/$REPO/releases/download/$version/SHA256SUMS" -o "$tmp/SHA256SUMS" || {
+  echo 'codegraph: checksum manifest unavailable; installation unchanged.' >&2; exit 1;
+}
+expected="$(awk -v asset="$asset" 'length($1)==64 && $1 !~ /[^0-9a-fA-F]/ { name=$2; sub(/^\*/, "", name); if (name==asset) print tolower($1) }' "$tmp/SHA256SUMS")"
+[ "${#expected}" -eq 64 ] || { echo 'codegraph: missing or ambiguous archive checksum.' >&2; exit 1; }
+if command -v sha256sum >/dev/null 2>&1; then
+  actual="$(sha256sum "$tmp/cg.tar.gz" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+  actual="$(shasum -a 256 "$tmp/cg.tar.gz" | awk '{print $1}')"
+else
+  echo 'codegraph: sha256sum or shasum is required to verify the download.' >&2; exit 1
+fi
+[ "$actual" = "$expected" ] || { echo 'codegraph: archive checksum mismatch; installation unchanged.' >&2; exit 1; }
 
 dest="$INSTALL_DIR/versions/$version"
 rm -rf "$dest"
