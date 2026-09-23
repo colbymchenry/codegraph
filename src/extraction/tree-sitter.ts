@@ -4888,6 +4888,21 @@ export class TreeSitterExtractor {
               const chain = getNodeText(func, this.source).replace(/\s+/g, '').replace(/\?\./g, '.');
               if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*){2,}$/.test(chain)) return;
               calleeName = chain;
+            } else if (this.language === 'python' && receiver) {
+              // Any receiver shape the branches above do not claim — attribute
+              // chain (`self.data.append`) and subscript (`d[k].append`). The
+              // call-chain shape (`rows.setdefault(k, []).append(x)`) is taken
+              // by the `<inner>().<method>` branch above (#1748), which runs
+              // first. These previously fell through to a bare methodName. A
+              // bare name matching a common
+              // list/dict/str method (`append`, `get`, `update`, ...) can exact-match
+              // an unrelated top-level project function sharing that name, fabricating
+              // a call edge (#66, same class as #1230/#1276). Keep the receiver's
+              // source text as a qualifier so the ref can only resolve through
+              // import/module-member resolution, never the bare-name fallback; an
+              // unresolvable qualifier is a silent miss, never a wrong edge.
+              const receiverText = getNodeText(receiver, this.source).replace(/\s+/g, ' ').trim();
+              calleeName = receiverText ? `${receiverText}.${methodName}` : methodName;
             } else {
               calleeName = methodName;
             }
