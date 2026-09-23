@@ -32,6 +32,18 @@ describe('Dart extension type members (#1784)', () => {
     expect(kinds).toContain('method:Meters::show');
   });
 
+  it('names an extension type constructor after the constructor, not the type', () => {
+    const code = `extension type Meters(double value) {
+  Meters.fromKm(double km) : this(km * 1000);
+  factory Meters.zero() => Meters(0);
+}
+`;
+    const result = extractFromSource('meters.dart', code);
+    const ctors = result.nodes.filter((n) => n.kind === 'method');
+    expect(ctors.map((n) => n.qualifiedName).sort()).toEqual(['Meters::fromKm', 'Meters::zero']);
+    for (const c of ctors) expect(c.returnType).toBe('Meters');
+  });
+
   it('leaves extension, mixin and class bodies alone', () => {
     const code = `extension StringHelpers on String {
   String shout() => toUpperCase();

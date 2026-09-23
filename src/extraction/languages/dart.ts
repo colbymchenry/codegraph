@@ -40,7 +40,8 @@ function dartEnclosingTypeName(node: SyntaxNode): string | undefined {
   while (p) {
     if (
       p.type === 'class_definition' || p.type === 'mixin_declaration' ||
-      p.type === 'extension_declaration' || p.type === 'enum_declaration'
+      p.type === 'extension_declaration' || p.type === 'extension_type_declaration' ||
+      p.type === 'enum_declaration'
     ) {
       return p.childForFieldName('name')?.text;
     }
