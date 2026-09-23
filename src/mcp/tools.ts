@@ -2980,7 +2980,7 @@ export class ToolHandler {
       '',
       ...notes,
       '',
-      '> These sites choose their call target at runtime (registry / bus / reflection) — the site shown IS where the flow continues. To follow it, run codegraph_explore or codegraph_node on a candidate; source for the sites above is included below.',
+      '> These sites choose their call target at runtime (registry / bus / reflection) — the site shown IS where the flow continues. To follow it, run codegraph_explore on a candidate; source for the sites above is included below.',
       '',
     ].join('\n');
   }
@@ -4408,6 +4408,11 @@ export class ToolHandler {
     // (#1046) — it must reflect what we show, not the raw candidate gather.
     const renderedFilePaths: string[] = [];
     let anyFileTrimmed = false;
+    // Files whose rendered source is a SLICE (clusters / focused / skeleton),
+    // not the whole file. The completeness footer must not call them complete:
+    // a "Complete source … do NOT re-read" line under a body full of gap markers
+    // is a contradiction, and the agent resolves it by Reading the file (#1918).
+    let slicedFiles = 0;
     // Files that changed on disk after their last index sync (#1474). Their
     // indexed line ranges are untrustworthy, so sliced renders (adaptive /
     // skeleton / clusters) are OFF for them: a small drifted file still ships
@@ -4436,6 +4441,8 @@ export class ToolHandler {
       overhead: number;
       ranges: ExploreLineRange[];
       fingerprint: string;
+      /** The section is a slice of the file, not the whole file. */
+      sliced: boolean;
     };
     let suppressedFallback: SuppressedFallback | null = null;
     // Reservation carry-forward (CG-21). A reservation is a promise the render
@@ -4739,6 +4746,7 @@ export class ToolHandler {
           noteEmitted(filePath, [...ranges, ...opts.covered], body.length, fingerprint);
           renderedFilePaths.push(filePath);
           filesIncluded++;
+          if (opts.mode !== 'whole') slicedFiles++;
           return;
         }
         // Fully held. The section is the pointer; the slot and the bytes go to a
@@ -4762,6 +4770,7 @@ export class ToolHandler {
             overhead: opts.overhead,
             ranges: opts.fullRanges,
             fingerprint,
+            sliced: opts.mode !== 'whole',
           };
         }
       };
@@ -5844,6 +5853,7 @@ export class ToolHandler {
         sourceSpent += restore.sourceChars;
         newSourceChars += restore.sourceChars;
         filesIncluded++;
+        if (restore.sliced) slicedFiles++;
         const idx = backReferencedFiles.indexOf(restore.filePath);
         if (idx >= 0) backReferencedFiles.splice(idx, 1);
         emittedByFile.set(restore.filePath, {
@@ -5935,13 +5945,21 @@ export class ToolHandler {
     }
 
     // Completeness signal so agents know they don't need to re-read these files.
-    // On small projects the budget gates this off — but if we actually had to
-    // trim or drop clusters, surface a brief note so the agent knows it can
-    // still Read for more detail.
+    // It is only ever claimed for files shipped WHOLE: a sliced file is named
+    // as sliced, with the way to reach what the slice left out (#1918). On
+    // small projects the budget gates the signal off, but a trim still gets
+    // the brief note. Only codegraph_explore is named — the other tools are
+    // not listed to agents by default.
+    const trimNote = `Elided symbols are named inside gap markers as \`name (file:line)\` and preferred in the file header — run another \`codegraph_explore\` with those exact names for their source.`;
+    const wholeFiles = filesIncluded - slicedFiles;
     const completenessBlock: string[] = budget.includeCompletenessSignal
-      ? ['', '---', `> **Complete source for ${filesIncluded} files is included above — do NOT re-read them.** If your question also needs files/symbols listed under "Not shown above" (or any area this call didn't cover), make ANOTHER codegraph_explore targeting those names — it returns the same source with line numbers and is cheaper and more complete than reading. Reserve Read for a single specific line range explore can't surface.`]
-      : anyFileTrimmed
-        ? ['', `> Some file sections were trimmed for size. Elided symbols are named inside gap markers as \`name (file:line)\` and preferred in the file header — run another \`codegraph_explore\` (or \`codegraph_node\`) with those exact names for their source.`]
+      ? ['', '---', `> ${[
+          wholeFiles > 0 ? `**Complete source for ${wholeFiles} ${wholeFiles === 1 ? 'file is' : 'files are'} included above — do NOT re-read ${wholeFiles === 1 ? 'it' : 'them'}.**` : '',
+          slicedFiles > 0 ? `**${slicedFiles} ${slicedFiles === 1 ? 'file is' : 'files are'} shown as slices** (the lines shown are verbatim and current). ${trimNote}` : '',
+          `If your question also needs files/symbols listed under "Not shown above" (or any area this call didn't cover), make ANOTHER codegraph_explore targeting those names — it returns the same source with line numbers and is cheaper and more complete than reading. Reserve Read for a single specific line range explore can't surface.`,
+        ].filter(Boolean).join(' ')}`]
+      : anyFileTrimmed || slicedFiles > 0
+        ? ['', `> Some file sections were trimmed for size. ${trimNote}`]
         : [];
 
     // Advisory exploration-guidance note based on project size. Deliberately
