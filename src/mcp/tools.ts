@@ -6,7 +6,7 @@
 
 import type CodeGraph from '../index';
 import type { QueryPool } from './query-pool';
-import { findNearestCodeGraphRoot } from '../directory';
+import { findNearestCodeGraphRoot, isSameIndexRoot } from '../directory';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
 // helper in engine.ts. ToolHandler must load to answer tools/list (static
 // schemas), but it must NOT drag in sqlite/query layers before the daemon binds;
@@ -1771,7 +1771,8 @@ export class ToolHandler {
     // support) that surfaces as intermittent
     // "database is locked" on concurrent tool calls. See issue #238. The
     // default instance is owned/closed by the server, so it's never cached.
-    if (this.cg && this.cg.getProjectRoot() === resolvedRoot) {
+    // Another spelling of the same root counts too (#1057).
+    if (this.cg && isSameIndexRoot(this.cg.getProjectRoot(), resolvedRoot)) {
       return this.freshen(this.cg);
     }
 
@@ -1780,6 +1781,17 @@ export class ToolHandler {
     // a changed resolution maps to a different entry instead of a stale hit.
     const cached = this.projectCache.get(resolvedRoot);
     if (cached) return this.freshen(cached);
+
+    // A new spelling of a root that is already open — a symlinked checkout, or
+    // a case-variant on a case-insensitive mount — is the SAME index. File the
+    // spelling as an alias of the open connection instead of opening a second
+    // one to the same `.codegraph/codegraph.db` (#1057).
+    for (const [root, open] of this.projectCache) {
+      if (isSameIndexRoot(root, resolvedRoot)) {
+        this.projectCache.set(resolvedRoot, open);
+        return this.freshen(open);
+      }
+    }
 
     const cg = loadCodeGraph().openSync(resolvedRoot);
     this.projectCache.set(resolvedRoot, cg);
@@ -1815,7 +1827,8 @@ export class ToolHandler {
    * Close all cached project connections
    */
   closeAll(): void {
-    for (const cg of this.projectCache.values()) {
+    // One instance can sit under several spellings (#1057); close it once.
+    for (const cg of new Set(this.projectCache.values())) {
       cg.close();
     }
     this.projectCache.clear();
