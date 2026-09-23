@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Python calls through an attribute now reach the method your code gives that attribute. `self.sink.stop()` follows `self.sink = Sink()`, a `sink: Sink` annotation, or a typed `__init__` parameter to `Sink`'s `stop`, including a `stop` that `Sink` inherits, and an attribute of a typed local or parameter resolves the same way. An attribute whose type the code never names is left unresolved rather than guessed. Re-index Python projects after upgrading. (#1704)
 
 ## [1.6.2] - 2026-10-03
 
