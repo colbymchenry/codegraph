@@ -164,6 +164,8 @@ export interface SyncResult {
    * nothing downstream.
    */
   definitionDelta?: string[];
+  /** Tracked files this sync found gone and deleted from the index. */
+  removedFilePaths?: string[];
 }
 
 /**
@@ -3240,6 +3242,39 @@ export class ExtractionOrchestrator {
   }
 
   /**
+   * Re-open resolution edges whose answer was READ from a file this sync
+   * touched, although neither end of the edge changed: a python attribute typed
+   * through a factory or a base class in another file records those files as
+   * `metadata.typeFrom`. The definition delta cannot see these — editing what a
+   * factory returns, or what a base `__init__` assigns, adds or removes no
+   * definition — so without this a synced index keeps the old type forever.
+   * The edges go back to pending refs; returns the files they come from, whose
+   * pending rows the caller resolves.
+   */
+  resurrectTypeDependentEdges(touchedPaths: string[], changedFilePaths: string[]): string[] {
+    const touched = new Set(touchedPaths.filter((p) => /\.pyi?$/.test(p)));
+    if (touched.size === 0) return [];
+    const alreadyFresh = new Set(changedFilePaths);
+
+    const edgeIds: number[] = [];
+    const refs: UnresolvedReference[] = [];
+    const files = new Set<string>();
+    for (const e of this.queries.getEdgesWithTypeFrom()) {
+      if (alreadyFresh.has(e.sourceFilePath)) continue;
+      const from = e.metadata?.typeFrom;
+      if (!Array.isArray(from) || !from.some((f) => typeof f === 'string' && touched.has(f))) continue;
+      const ref = resurrectRefFromDroppedEdge(e);
+      if (!ref) continue;
+      edgeIds.push(e.edgeId);
+      refs.push(ref);
+      files.add(e.sourceFilePath);
+    }
+    if (refs.length === 0) return [];
+    this.queries.replaceResolutionEdgesWithUnresolvedRefs(edgeIds, refs);
+    return [...files];
+  }
+
+  /**
    * Sync the index with the current file state.
    *
    * Change detection is filesystem-based, never git: a (size, mtime) stat
@@ -3277,6 +3312,7 @@ export class ExtractionOrchestrator {
     let nodesUpdated = 0;
     const changedFilePaths: string[] = [];
     const addedFilePaths: string[] = [];
+    const removedFilePaths: string[] = [];
     // `file\0name` definition pairs for the files this sync touches, sampled
     // BEFORE their nodes are replaced/deleted. Compared against the post-store
     // pairs below to derive `definitionDelta` (CG-33).
@@ -3386,6 +3422,7 @@ export class ExtractionOrchestrator {
       }
       onFileChange?.(tracked.path);
       this.queries.deleteFile(tracked.path);
+      removedFilePaths.push(tracked.path);
       filesRemoved++;
     };
     const removed: FileRecord[] = [];
@@ -3546,6 +3583,7 @@ export class ExtractionOrchestrator {
       ...(addedFilePaths.length > 0 ? { addedFilePaths } : {}),
       ...(failedFilePaths.length > 0 ? { failedFilePaths } : {}),
       definitionDelta: definitionDelta.length > 0 ? definitionDelta : undefined,
+      ...(removedFilePaths.length > 0 ? { removedFilePaths } : {}),
     };
   }
 
