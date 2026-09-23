@@ -1,0 +1,18 @@
+{
+  "name": "codegraph-marketplace-cloudflare",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node test.mjs",
+    "dev": "wrangler dev --local",
+    "check:access": "wrangler whoami"
+  },
+  "devDependencies": {
+    "aws4fetch": "1.0.20",
+    "esbuild": "0.28.1",
+    "miniflare": "5.20260921.0-alpha",
+    "wrangler": "4.136.1"
+  }
+}

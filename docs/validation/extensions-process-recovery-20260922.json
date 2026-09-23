@@ -1,0 +1,2444 @@
+{
+  "generated_at": "2026-09-22T03:56:46.028902+00:00",
+  "checkout": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+  "branch": "feature/extensions-author-kit-20260922",
+  "source_revision": "9ab6959d26fc8b1deddecbb136f08e109505e055",
+  "platform": "Linux x86_64",
+  "node": "v22.23.2",
+  "source_hashes": {
+    "src/plugins/recovery.ts": "2919e820cc580f28a458cf4cade2c6af78371fb9455c6d993476875be4baea35",
+    "src/plugins/manager.ts": "48de2dc9059aa28a8d324c68172fa98dc4e36c05ed0c85c5fa718600324ba076",
+    "src/index.ts": "ff272caafad3fbf8c474326bc2bf23cc665c787ff8d4e0d2e23504c0d169dc6e",
+    "src/plugins/bridge.ts": "4bfbab7cb9dfbb12be7523e6c61cdbe69e965e280f9e06474419f79655fe55d0",
+    "src/plugins/cli.ts": "21ff297862a43b030ab3a761cf1023e3b41811c873cece7ae2911fe209fdb330",
+    "src/bin/codegraph.ts": "e29864579360da81ee072dd878d7cf8d81358c0f3c5d8b426b2d25e3326b81c1",
+    "scripts/validation/extensions-recovery.cjs": "8b8f53e05cd5115db17b45c8c165f66eef8d051f2a49b97df14a5711482fc23b",
+    "scripts/validation/extensions-runtime.test.cjs": "18e92220c7e39f08e8063940b5410b7579b02d2869cc123e7ef8f9205c7b249d",
+    "scripts/validation/extensions-compatibility.cjs": "7fa68bf41f1db9580cb8794e5ef07d329c1bd254d3fe5645431a2e0f2ce55ea7",
+    "scripts/validation/marketplace-browser.cjs": "76194905d863800ad7d173d54137eb0195038fde2bae9a1eb450d6f2c0be3153"
+  },
+  "compiled_hashes": {
+    "dist/index.js": "119ef1b12f4943fbecd4bb30c58c3ca4a67cb6d857dc173d2a42084e27d15248",
+    "dist/plugins/recovery.js": "77e109522130bfd39c34eb73e540380928050cac49f8e8e65af4f9909ad3d33e",
+    "dist/plugins/manager.js": "143535f6590b35b55180f48d39b6ab6d2d94062938da418c8ac5bdf856ee4400",
+    "dist/plugins/bridge.js": "a98b1159482e5b312dd40d5fbf0387e0d52e8ffde5ff56f0de61b3187f55ef12",
+    "dist/plugins/cli.js": "7ac05be6d5bc7637bde48006c948a6c2ac326ff4e0fa163e6f4ceb04e3a69dd1",
+    "dist/bin/codegraph.js": "e97fd6d507fb6735cdadff6277c77f6fd760a881f177b19ebf94a3971572274c"
+  },
+  "receipts": [
+    {
+      "receipt": {
+        "path": ".qa/recovery/recovery-final-build.json",
+        "sha256": "278a7dc5b926f12b226e7e4988e76d273f07f8bf33be38764830a2dba821c3a8",
+        "bytes": 383
+      },
+      "log": {
+        "path": ".qa/recovery/recovery-final-build.log",
+        "sha256": "fe66a7e58369256409c964c3e6f5ac356f8c97968f0185bbab1a2f5c3f40ad5b",
+        "bytes": 5016
+      },
+      "result": {
+        "command": [
+          "npm",
+          "run",
+          "build"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T03:49:35.937493+00:00",
+        "revision": "9ab6959d26fc8b1deddecbb136f08e109505e055",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 33.999,
+        "finished_at": "2026-09-22T03:50:09.936850+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/recovery-kills-final.json",
+        "sha256": "a9c4dc48c99028a30dd6fade9e2e54d6554be40965764b01e55f4e83906d29ac",
+        "bytes": 411
+      },
+      "log": {
+        "path": ".qa/recovery/recovery-kills-final.log",
+        "sha256": "f7eb010cd04554b67e09c570d41c5a50f27f474b7da4b4dc71cebd92edeb66ec",
+        "bytes": 38281
+      },
+      "result": {
+        "command": [
+          "node",
+          "scripts/validation/extensions-recovery.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T03:50:32.911515+00:00",
+        "revision": "9ab6959d26fc8b1deddecbb136f08e109505e055",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 108.392,
+        "finished_at": "2026-09-22T03:52:21.303515+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/recovery-focused-final.json",
+        "sha256": "b8a2cb092096fe72e87aafd8342ffc636c102c42f8139bf16202074c3742cad3",
+        "bytes": 1272
+      },
+      "log": {
+        "path": ".qa/recovery/recovery-focused-final.log",
+        "sha256": "db1ce0492571d249ff558d560ef94dacbfadfb83f6afdae144d533ba5794a3eb",
+        "bytes": 21953
+      },
+      "result": {
+        "command": [
+          "npx",
+          "vitest",
+          "run",
+          "__tests__/extension-releases.test.ts",
+          "__tests__/extension-marketplace.test.ts",
+          "__tests__/extension-author.test.ts",
+          "__tests__/plugins.test.ts",
+          "__tests__/extension-explore.test.ts",
+          "__tests__/npm-sdk.test.ts",
+          "__tests__/cli-install-init.test.ts",
+          "__tests__/cli-version.test.ts",
+          "__tests__/status-json.test.ts",
+          "__tests__/sync.test.ts",
+          "__tests__/sync-rebuild-convergence.test.ts",
+          "__tests__/index-command.test.ts",
+          "__tests__/db-reopen-on-replace.test.ts",
+          "__tests__/concurrent-locking.test.ts",
+          "__tests__/watcher.test.ts",
+          "--maxWorkers=2",
+          "--minWorkers=1"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T03:52:29.471784+00:00",
+        "revision": "9ab6959d26fc8b1deddecbb136f08e109505e055",
+        "working_tree": " M CHANGELOG.md\n M docs/extensions/authoring.md\n",
+        "exit_code": 0,
+        "seconds": 56.356,
+        "finished_at": "2026-09-22T03:53:25.827407+00:00",
+        "summary": [
+          "Test Files  15 passed (15)",
+          "Tests  157 passed | 1 skipped (158)",
+          "Duration  54.38s (transform 4.55s, setup 0ms, collect 16.10s, tests 81.30s, environment 5ms, prepare 2.37s)"
+        ]
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/recovery-workers-final.json",
+        "sha256": "3a3544592ce2b3d858a15d8f95fd55d0b4b8fc390278150510aec66983b805fe",
+        "bytes": 537
+      },
+      "log": {
+        "path": ".qa/recovery/recovery-workers-final.log",
+        "sha256": "4d0efb705fc4bba2fe8f683ce9a13d1bae8b9917d9a2c71612ae7cb16b9e678c",
+        "bytes": 5538
+      },
+      "result": {
+        "command": [
+          "node",
+          "--test",
+          "scripts/validation/extensions-runtime.test.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T03:54:09.110014+00:00",
+        "revision": "9ab6959d26fc8b1deddecbb136f08e109505e055",
+        "working_tree": " M CHANGELOG.md\n M docs/extensions/authoring.md\n?? docs/validation/extensions-process-recovery-20260922.md\n",
+        "exit_code": 0,
+        "seconds": 7.902,
+        "finished_at": "2026-09-22T03:54:17.011802+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/recovery-compatibility-final.json",
+        "sha256": "4eb0c1f25b6ec3068ed8ad3a4bab022448156851a89a6095076d21d924d9a1fc",
+        "bytes": 525
+      },
+      "log": {
+        "path": ".qa/recovery/recovery-compatibility-final.log",
+        "sha256": "2e073520c22f630c5dc9bade5d2b9c84a576a7a7f7ffb3cc445890478c03c24e",
+        "bytes": 3121
+      },
+      "result": {
+        "command": [
+          "node",
+          "scripts/validation/extensions-compatibility.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T03:54:35.738686+00:00",
+        "revision": "9ab6959d26fc8b1deddecbb136f08e109505e055",
+        "working_tree": " M CHANGELOG.md\n M docs/extensions/authoring.md\n?? docs/validation/extensions-process-recovery-20260922.md\n",
+        "exit_code": 0,
+        "seconds": 25.563,
+        "finished_at": "2026-09-22T03:55:01.301546+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/recovery-browser-final.json",
+        "sha256": "d0513198f9afa7a5ac9a427d2e5469e703e9fc9c60027598db6ed3dc7d17ca60",
+        "bytes": 520
+      },
+      "log": {
+        "path": ".qa/recovery/recovery-browser-final.log",
+        "sha256": "a75f9b58660eb4607daaf5c0df45fd5fec719f69f893f7c6925f296fc6409ed2",
+        "bytes": 2153
+      },
+      "result": {
+        "command": [
+          "node",
+          "scripts/validation/marketplace-browser.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T03:55:27.375244+00:00",
+        "revision": "9ab6959d26fc8b1deddecbb136f08e109505e055",
+        "working_tree": " M CHANGELOG.md\n M docs/extensions/authoring.md\n?? docs/validation/extensions-process-recovery-20260922.md\n",
+        "exit_code": 0,
+        "seconds": 14.125,
+        "finished_at": "2026-09-22T03:55:41.500166+00:00",
+        "summary": []
+      }
+    }
+  ],
+  "artifacts": [
+    {
+      "path": ".qa/recovery/process-recovery-final/matrix.json",
+      "sha256": "1a1d6ba5b63a2c26aa250db38aadce277b0bc2c9749f7492844dfa1ddc2a1c1a",
+      "bytes": 5091
+    },
+    {
+      "path": ".qa/recovery/process-recovery-final/result.json",
+      "sha256": "8e54daf817cbf43253adf0b7bf368d4ab2c40c884990a5c7be38d767c473271f",
+      "bytes": 5617
+    },
+    {
+      "path": ".qa/recovery/process-recovery-final/commands.json",
+      "sha256": "68c26de5b6d620f550cfc459100da96144542dd67c2d534aca4364945d06913b",
+      "bytes": 57497
+    },
+    {
+      "path": ".qa/recovery/compat-after-recovery/result.json",
+      "sha256": "66a6600aeddc9abe7821d1a0a7e0f62e9517754fa27c3cfa7345f3eb2a48eab2",
+      "bytes": 7848
+    },
+    {
+      "path": ".qa/recovery/compat-after-recovery/commands.json",
+      "sha256": "8f0e649ba2fb7796da630b9e50f13648baeb14a45c9308d0f077c28abf13b4b1",
+      "bytes": 4742
+    },
+    {
+      "path": ".qa/recovery/browser-after-recovery/result.json",
+      "sha256": "eee8468a62f4b9690c1f3136a72f2797c1e4e03020aa0cf47b30a5ad3461f081",
+      "bytes": 672
+    },
+    {
+      "path": "docs/validation/extensions-process-recovery-20260922/desktop-installed.png",
+      "sha256": "d0701b5a77ea935c4744278b30f28fbcdf007cceada3c780870784305e8cb300",
+      "bytes": 97557
+    },
+    {
+      "path": ".qa/recovery/compat-after-recovery/command-1.log",
+      "sha256": "64f1ac60c8ad25f6569563d24914759b70acf1b73e5cffeef4feb12ce4c226b9",
+      "bytes": 243
+    },
+    {
+      "path": ".qa/recovery/compat-after-recovery/command-10.log",
+      "sha256": "f03135c33691b92a8cd0834b0ab07175f81eb68d071d2e495c7ef96f6cbb5e69",
+      "bytes": 143
+    },
+    {
+      "path": ".qa/recovery/compat-after-recovery/command-11.log",
+      "sha256": "08588ddba0b05a3667ca2e4858c6625aaa7cfdd4b248283e284b36ca7bfd3b0f",
+      "bytes": 263
+    },
+    {
+      "path": ".qa/recovery/compat-after-recovery/command-12.log",
+      "sha256": "303e141e174839575e69f0ae0ddf92ead0470e6dca049ac1edd45fb64b607bde",
+      "bytes": 95
+    },
+    {
+      "path": ".qa/recovery/compat-after-recovery/command-2.log",
+      "sha256": "d93afb7d84337fce0fb443fb79883800bb478b4c94635140b8f67f9734ed2b26",
+      "bytes": 293
+    },
+    {
+      "path": ".qa/recovery/compat-after-recovery/command-3.log",
+      "sha256": "78fff926f4f8969d8e1705c0a1271cbd63b822579f81d715c2042ad94c80ad45",
+      "bytes": 122
+    },
+    {
+      "path": ".qa/recovery/compat-after-recovery/command-4.log",
+      "sha256": "83a7b90bfd2c211c6fb4afcf72e261ef7b42bfd6dc21cfb72d530fb970aef44a",
+      "bytes": 290
+    },
+    {
+      "path": ".qa/recovery/compat-after-recovery/command-5.log",
+      "sha256": "5a0ae6eb30e6659515338894feeb98ebeabbcd4f66e01f425110e75e83d7986d",
+      "bytes": 257
+    },
+    {
+      "path": ".qa/recovery/compat-after-recovery/command-6.log",
+      "sha256": "38c1d85e306b15c18732c81df087390b3dfbd3873bc8836e36be492a1fb8a7fa",
+      "bytes": 530
+    },
+    {
+      "path": ".qa/recovery/compat-after-recovery/command-7.log",
+      "sha256": "74798a107028fa391113eb0b6fa7efac8bfee9c644dbb121892993443666f2f0",
+      "bytes": 241
+    },
+    {
+      "path": ".qa/recovery/compat-after-recovery/command-8.log",
+      "sha256": "be1f77d7dd153abaab34b2a75bdd5c2d036b406fc11da38ee8d4362bd4c26387",
+      "bytes": 241
+    },
+    {
+      "path": ".qa/recovery/compat-after-recovery/command-9.log",
+      "sha256": "fec96b4acb520e5ee4d8a42660e9a876f54f08d60c1fc98bcc7b1dcfd2ba6748",
+      "bytes": 142
+    }
+  ],
+  "recovery_matrix": {
+    "platform": "linux",
+    "node": "v22.23.2",
+    "rows": [
+      {
+        "action": "install",
+        "boundary": "prepared",
+        "decision": "rollback",
+        "repeatedRecovery": true,
+        "passed": true
+      },
+      {
+        "action": "install",
+        "boundary": "config_written",
+        "decision": "rollback",
+        "repeatedRecovery": true,
+        "passed": true
+      },
+      {
+        "action": "install",
+        "boundary": "graph_before_commit",
+        "decision": "rollback",
+        "repeatedRecovery": true,
+        "passed": true
+      },
+      {
+        "action": "install",
+        "boundary": "graph_committed",
+        "decision": "complete",
+        "repeatedRecovery": true,
+        "passed": true
+      },
+      {
+        "action": "update",
+        "boundary": "prepared",
+        "decision": "rollback",
+        "repeatedRecovery": true,
+        "passed": true
+      },
+      {
+        "action": "update",
+        "boundary": "config_written",
+        "decision": "rollback",
+        "repeatedRecovery": true,
+        "passed": true
+      },
+      {
+        "action": "update",
+        "boundary": "graph_before_commit",
+        "decision": "rollback",
+        "repeatedRecovery": true,
+        "passed": true
+      },
+      {
+        "action": "update",
+        "boundary": "graph_committed",
+        "decision": "complete",
+        "repeatedRecovery": true,
+        "passed": true
+      },
+      {
+        "action": "disable",
+        "boundary": "prepared",
+        "decision": "rollback",
+        "repeatedRecovery": true,
+        "passed": true
+      },
+      {
+        "action": "disable",
+        "boundary": "config_written",
+        "decision": "rollback",
+        "repeatedRecovery": true,
+        "passed": true
+      },
+      {
+        "action": "disable",
+        "boundary": "graph_before_commit",
+        "decision": "rollback",
+        "repeatedRecovery": true,
+        "passed": true
+      },
+      {
+        "action": "disable",
+        "boundary": "graph_committed",
+        "decision": "complete",
+        "repeatedRecovery": true,
+        "passed": true
+      },
+      {
+        "action": "enable",
+        "boundary": "prepared",
+        "decision": "rollback",
+        "repeatedRecovery": true,
+        "passed": true
+      },
+      {
+        "action": "enable",
+        "boundary": "config_written",
+        "decision": "rollback",
+        "repeatedRecovery": true,
+        "passed": true
+      },
+      {
+        "action": "enable",
+        "boundary": "graph_before_commit",
+        "decision": "rollback",
+        "repeatedRecovery": true,
+        "passed": true
+      },
+      {
+        "action": "enable",
+        "boundary": "graph_committed",
+        "decision": "complete",
+        "repeatedRecovery": true,
+        "passed": true
+      },
+      {
+        "action": "remove",
+        "boundary": "prepared",
+        "decision": "rollback",
+        "repeatedRecovery": true,
+        "passed": true
+      },
+      {
+        "action": "remove",
+        "boundary": "config_written",
+        "decision": "rollback",
+        "repeatedRecovery": true,
+        "passed": true
+      },
+      {
+        "action": "remove",
+        "boundary": "graph_before_commit",
+        "decision": "rollback",
+        "repeatedRecovery": true,
+        "passed": true
+      },
+      {
+        "action": "remove",
+        "boundary": "graph_committed",
+        "decision": "complete",
+        "repeatedRecovery": true,
+        "passed": true
+      },
+      {
+        "action": "update",
+        "boundary": "package_ready",
+        "decision": "rollback and discard new package/trust",
+        "passed": true
+      },
+      {
+        "action": "update",
+        "boundary": "trust_written",
+        "decision": "rollback and discard new package/trust",
+        "passed": true
+      },
+      {
+        "action": "first uninitialized install",
+        "boundary": "graph_before_commit",
+        "entry": "CLI status",
+        "passed": true
+      },
+      {
+        "action": "kill recovery itself",
+        "boundary": "recovery_config",
+        "decision": "idempotent rollback",
+        "passed": true
+      },
+      {
+        "action": "live aged owner",
+        "decision": "mutation/read/index excluded; no timeout stealing",
+        "passed": true
+      },
+      {
+        "action": "PID reuse and legacy owners",
+        "decision": "SQLite ownership authoritative; live legacy blocked, dead legacy reclaimed",
+        "passed": true
+      },
+      {
+        "action": "torn records",
+        "decision": "invalid journal/unknown owner fail closed; valid journal recovers torn owner",
+        "passed": true
+      },
+      {
+        "action": "unrelated config/trust edits",
+        "boundary": "config_written",
+        "decision": "preserved",
+        "passed": true
+      },
+      {
+        "action": "conflicting plugin edit",
+        "boundary": "config_written",
+        "decision": "no overwrite; actionable repair then recovery",
+        "passed": true
+      },
+      {
+        "action": "unrelated config/trust edits",
+        "boundary": "graph_committed",
+        "decision": "preserved",
+        "passed": true
+      },
+      {
+        "action": "conflicting plugin edit",
+        "boundary": "graph_committed",
+        "decision": "no overwrite; actionable repair then recovery",
+        "passed": true
+      },
+      {
+        "action": "live aged/torn legacy graph lock",
+        "decision": "no age-based stealing or guessing",
+        "passed": true
+      },
+      {
+        "action": "graph-affecting external config edit",
+        "decision": "preserved and blocked with repair instructions",
+        "passed": true
+      },
+      {
+        "action": "changed installed package",
+        "decision": "trust revalidated; blocked until bytes restored",
+        "passed": true
+      },
+      {
+        "action": "long-lived reader after fresh-process recovery",
+        "decision": "old cached node invalidated by commit marker",
+        "passed": true
+      }
+    ],
+    "commands": 103
+  },
+  "child_receipts": [
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/1",
+        "install",
+        "prepared"
+      ],
+      "pid": 32,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 0.332,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-1.log",
+      "sha256": "bc26f2ff1e8dac0c39ba9d8b959410b2bb75a86bfcd2026542cbeeebb3125377"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/1",
+        "list"
+      ],
+      "pid": 40,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.38,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-2.log",
+      "sha256": "aa39d718868ea7ef39c90530812442d2fbc5c18089e87b2b1358e76e4874dc18"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/1",
+        "recover"
+      ],
+      "pid": 48,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.358,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-3.log",
+      "sha256": "fb5c5d389b4d012478a2a17da9182c02c0d7e6d2ebb86bac7b5a75b17f24fd29"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/2",
+        "install",
+        "config_written"
+      ],
+      "pid": 67,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 0.345,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-4.log",
+      "sha256": "52640aeb07d004c5c39074d85c3f68c500cfa7d13bba3f1c6315353daef6b514"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/2",
+        "index"
+      ],
+      "pid": 75,
+      "exit": 0,
+      "signal": null,
+      "seconds": 1.25,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-5.log",
+      "sha256": "3f2f4d85d914bf73d31e9454762d229373c0dcc1901465fc1596e862b8b29ad2"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/2",
+        "recover"
+      ],
+      "pid": 99,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.335,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-6.log",
+      "sha256": "f6463d33bc17428833cb2e5125e933ab9f9de4758b104712dc38a3dec99c3560"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/3",
+        "install",
+        "graph_before_commit"
+      ],
+      "pid": 118,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 1.313,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-7.log",
+      "sha256": "d7456ede8bf4537e129c9c571d40c0b6874fbd6939f8cec5cc936569ed1da0f2"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/3",
+        "inspect"
+      ],
+      "pid": 141,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.374,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-8.log",
+      "sha256": "1466ac5b418ae402cfb5098609d30e322254d51738bc3e98bd1483780adcb7ea"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/3",
+        "recover"
+      ],
+      "pid": 149,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.341,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-9.log",
+      "sha256": "29cb72fa67457d2012930ab1b9a6335a2a4940b153204f851661cdf3cb485ed9"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/4",
+        "install",
+        "graph_committed"
+      ],
+      "pid": 168,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 1.205,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-10.log",
+      "sha256": "eda344de320bafbf7108050b8b99881d9a69cfd1fffdb4b7bc33c58374090fba"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/4",
+        "inspect"
+      ],
+      "pid": 191,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.373,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-11.log",
+      "sha256": "01a00e0febd6f3eca8d07a0505409ac50d7fd30eb80d3272677b79773869b85c"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/4",
+        "recover"
+      ],
+      "pid": 199,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.357,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-12.log",
+      "sha256": "5cb84409a0b7ca7cfcd4e8c3952bb85847fee65efc265c15b7d119d9ba9b4602"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/5",
+        "update",
+        "prepared"
+      ],
+      "pid": 229,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 0.335,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-13.log",
+      "sha256": "c4571a8f18daa53f79a768c14f554f865c0e08239f2d645fb7f4760d233ba47d"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/5",
+        "list"
+      ],
+      "pid": 237,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.364,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-14.log",
+      "sha256": "beec5f36627591d6786976967bd3a5de8c361ff680493fa1ad40e267bbaed98e"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/5",
+        "recover"
+      ],
+      "pid": 245,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.357,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-15.log",
+      "sha256": "97a30c218e16eeecab76c12f9ca171e365f762be06ce4a5ad30e86142008d847"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/6",
+        "update",
+        "config_written"
+      ],
+      "pid": 275,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 0.373,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-16.log",
+      "sha256": "37e2fdca619301dde6b5c090be432b29bccfac00ea567d7439c3c524dffc2727"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/6",
+        "index"
+      ],
+      "pid": 283,
+      "exit": 0,
+      "signal": null,
+      "seconds": 1.25,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-17.log",
+      "sha256": "dabb28dd6e09f76bcb1b9bb6deede7bf832509dfddeef19805b472f22aa4a3e6"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/6",
+        "recover"
+      ],
+      "pid": 307,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.345,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-18.log",
+      "sha256": "e94351bf2d5116ab2d2f6716d3a90fc8ad194e074805a60599243760ec287a91"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/7",
+        "update",
+        "graph_before_commit"
+      ],
+      "pid": 337,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 1.219,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-19.log",
+      "sha256": "20113171708069c7cd20647a5a1774215bd5fa0ab3bac7ae4d75015ef7488264"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/7",
+        "inspect"
+      ],
+      "pid": 360,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.422,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-20.log",
+      "sha256": "a177017d9d91352bffadf07f8cabfcb573a3e25cf8e26442f35dc813973ce865"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/7",
+        "recover"
+      ],
+      "pid": 368,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.374,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-21.log",
+      "sha256": "fb5138d42e3aabee539b104ca93e0718b391ab6e6c7ff17e68dbf236e43f5baa"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/8",
+        "update",
+        "graph_committed"
+      ],
+      "pid": 398,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 1.221,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-22.log",
+      "sha256": "f4d9be8a4e5e86a4e7929dbd86fccfb45c035ce3ac52a45178e1610302724c76"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/8",
+        "inspect"
+      ],
+      "pid": 421,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.398,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-23.log",
+      "sha256": "cf784224c683e127118eeb25f2a8e2aa169dfe42881ff662eed22b4fac5b8ff0"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/8",
+        "recover"
+      ],
+      "pid": 429,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.346,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-24.log",
+      "sha256": "7dc12c3ad7f0ed14943a0ed70422cf5ebc9362f25e71a62beac81cdcba8accc1"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/9",
+        "disable",
+        "prepared"
+      ],
+      "pid": 459,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 0.322,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-25.log",
+      "sha256": "500cd6b5b73a7ffddd3c69ea1a1b99febf11c8a88a5150a7ae817876213b5b21"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/9",
+        "list"
+      ],
+      "pid": 467,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.395,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-26.log",
+      "sha256": "aaf517c802e84e3100066814c88fc40d56691d14ef53fb9bb485182b31b9712d"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/9",
+        "recover"
+      ],
+      "pid": 475,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.347,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-27.log",
+      "sha256": "48eac12f29d6a0183fcf9486b253ff5cc76cfdb8edabdbfebb7a6da959c11ad0"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/10",
+        "disable",
+        "config_written"
+      ],
+      "pid": 505,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 0.338,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-28.log",
+      "sha256": "3c7286b6f4df28e624fd4f420439598db2664303aae3d0ce6bab67cdde357b3a"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/10",
+        "index"
+      ],
+      "pid": 513,
+      "exit": 0,
+      "signal": null,
+      "seconds": 1.33,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-29.log",
+      "sha256": "5be0e4ef805046c37608ea94022aed18cfbf32266af9576367086a6721b9e622"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/10",
+        "recover"
+      ],
+      "pid": 537,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.346,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-30.log",
+      "sha256": "b8b8e120880878e8eaaff6e0a92c119ca50eaff4b21f76584e81e18574add5f2"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/11",
+        "disable",
+        "graph_before_commit"
+      ],
+      "pid": 567,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 1.212,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-31.log",
+      "sha256": "70cf2aad762dcefed81ee83a12e3a350918d017eb6e46a3e676e2d8e73190d9b"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/11",
+        "inspect"
+      ],
+      "pid": 590,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.426,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-32.log",
+      "sha256": "48b394f0e026e93392e5f31894a17b1eadfba8a71ae64ed7d9f68dc43acaac51"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/11",
+        "recover"
+      ],
+      "pid": 598,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.374,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-33.log",
+      "sha256": "cde030996371cfe5632590ef92de666cb37577d712f032dc919f72d001cdb27f"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/12",
+        "disable",
+        "graph_committed"
+      ],
+      "pid": 628,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 1.191,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-34.log",
+      "sha256": "828a7c23b02d3acad2938d0315fbe7f061654350ccc0e7bd4609437d1a16bf6c"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/12",
+        "inspect"
+      ],
+      "pid": 651,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.414,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-35.log",
+      "sha256": "c1cf6b359352d73d65a005d5c66cf9976e8754c46c403d324c45fd29f0476846"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/12",
+        "recover"
+      ],
+      "pid": 659,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.391,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-36.log",
+      "sha256": "890a18d3914d44f980ef044952015cc5866795a83cbd4f4ef5d1656fe4043839"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/13",
+        "enable",
+        "prepared"
+      ],
+      "pid": 700,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 0.373,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-37.log",
+      "sha256": "afd70f5317bbf61bd0b93ffa4177167e4fb9a5b0143a03106bc760322b82d23f"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/13",
+        "list"
+      ],
+      "pid": 708,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.371,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-38.log",
+      "sha256": "b502f26ae461380a4058d4fe71f49d6b13aca14d21003c807216788c464751fa"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/13",
+        "recover"
+      ],
+      "pid": 716,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.337,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-39.log",
+      "sha256": "0ea4ec02fe00f55686b8ef39b4abfb03365d030374c34f8193330e6b1d08bcae"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/14",
+        "enable",
+        "config_written"
+      ],
+      "pid": 757,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 0.342,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-40.log",
+      "sha256": "8fee9856cd069c9f9c77c17e4e580ab7769ab091bb5a38039a2f949ae856b762"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/14",
+        "index"
+      ],
+      "pid": 765,
+      "exit": 0,
+      "signal": null,
+      "seconds": 1.241,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-41.log",
+      "sha256": "7ddec23e2c4688bab5ddd9672a705cfe0a01218ce14a60bac0ad7e2a568573ca"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/14",
+        "recover"
+      ],
+      "pid": 789,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.321,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-42.log",
+      "sha256": "63ce882c64441730224bc92495b64123a5674cab8e3347ef177e03a58fa8238e"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/15",
+        "enable",
+        "graph_before_commit"
+      ],
+      "pid": 830,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 1.124,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-43.log",
+      "sha256": "cbbfbb55d221fd270351f974d5d32903c38c8ebb26d716948dda7e2704dd3fa0"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/15",
+        "inspect"
+      ],
+      "pid": 853,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.386,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-44.log",
+      "sha256": "3ba970a5ff8ec524187ece006e0b5022d182b6227af747411ea77f0810507e9d"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/15",
+        "recover"
+      ],
+      "pid": 861,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.374,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-45.log",
+      "sha256": "e825390bfdc8deb61c6c754a4298edecfdb67aa0a88e7c2304cb0db948db436e"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/16",
+        "enable",
+        "graph_committed"
+      ],
+      "pid": 902,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 1.379,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-46.log",
+      "sha256": "24e80fce4ead9e748fd195e80d2078a81476345d1c7c2f521390bf73a4474cca"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/16",
+        "inspect"
+      ],
+      "pid": 925,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.396,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-47.log",
+      "sha256": "c3c975573441a767a5344b6b0b98899f81eb68d641086daa421ae7e383f980e9"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/16",
+        "recover"
+      ],
+      "pid": 933,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.38,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-48.log",
+      "sha256": "9b146b8af0f360df5057f799f7fef44e2fca682c76f274f686b1027ecbf74511"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/17",
+        "remove",
+        "prepared"
+      ],
+      "pid": 963,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 0.369,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-49.log",
+      "sha256": "3e4bbc00d7d13203b4c1fedf83013bdfe51146b6ff46b2faf8f4ef09109ff983"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/17",
+        "list"
+      ],
+      "pid": 971,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.385,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-50.log",
+      "sha256": "2987c4f4fd5bc0bb4f8bfd48c2a2ad4248ed7266502415e72c3b2d675d6dba85"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/17",
+        "recover"
+      ],
+      "pid": 979,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.415,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-51.log",
+      "sha256": "aa5cfe8c218c13117de51ee52175283ee8ccae6fa5784d3758ad489532af03fb"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/18",
+        "remove",
+        "config_written"
+      ],
+      "pid": 1009,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 0.357,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-52.log",
+      "sha256": "9764650a97cae72fbe904944d823c2f2416cf87ee6754767d5a52a46e4238dfa"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/18",
+        "index"
+      ],
+      "pid": 1017,
+      "exit": 0,
+      "signal": null,
+      "seconds": 1.258,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-53.log",
+      "sha256": "82c1199a115204c7be173e9cdd375e7fd236277acc7dddccb822ce3b9a88f380"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/18",
+        "recover"
+      ],
+      "pid": 1041,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.349,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-54.log",
+      "sha256": "eb60c8ce7e0c9c025afc7b7c9162653f455ddbc47bac88d9f14e247bc9f2bdcc"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/19",
+        "remove",
+        "graph_before_commit"
+      ],
+      "pid": 1071,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 1.207,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-55.log",
+      "sha256": "3ac410feb459c607fb7f7bad79dbe331d727d07ff8d4800d53519a840da490ad"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/19",
+        "inspect"
+      ],
+      "pid": 1094,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.373,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-56.log",
+      "sha256": "7b0c4320d1daa41de5ef37676a8a695279ba3913d2669b96b32fde30f0d92026"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/19",
+        "recover"
+      ],
+      "pid": 1102,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.327,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-57.log",
+      "sha256": "b376232604c3c54101e20b534e80b72331afb5cbf4862c562a539626a475265f"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/20",
+        "remove",
+        "graph_committed"
+      ],
+      "pid": 1132,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 1.183,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-58.log",
+      "sha256": "fe9f37cb0925427373b1339321d5dcd5ba3418a2c332802a2220a9d8b89515b3"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/20",
+        "inspect"
+      ],
+      "pid": 1155,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.389,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-59.log",
+      "sha256": "10ec309cd7d5421c14d060a7f99014c5dbbf17044d43a3b131727e3630aec7e4"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/20",
+        "recover"
+      ],
+      "pid": 1163,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.35,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-60.log",
+      "sha256": "3c67f0eb2ff025f068a1636fca4742685510df91a7ae70bc6d02bfdc54913dbe"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/21",
+        "update",
+        "package_ready"
+      ],
+      "pid": 1193,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 0.366,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-61.log",
+      "sha256": "af7ff482c0aaac7c91ab3e8f36c8a005cdc2c11c9792204e88c9c0a4bd4fba22"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/21",
+        "inspect"
+      ],
+      "pid": 1201,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.445,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-62.log",
+      "sha256": "3543866e1f54685efe696330eb961264de674417934b7ab30e6f79109bc2a58f"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/22",
+        "update",
+        "trust_written"
+      ],
+      "pid": 1231,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 0.341,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-63.log",
+      "sha256": "ec56ae732bd987a0427e3442533a8ed63633feb64a8edd0a2a19cadb8ef6ba1c"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/22",
+        "inspect"
+      ],
+      "pid": 1239,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.419,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-64.log",
+      "sha256": "ee8169f7aec183eae668d136c9b55869ebeb717872cc2c737172a82791a29222"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/23",
+        "install",
+        "graph_before_commit"
+      ],
+      "pid": 1247,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 1.359,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-65.log",
+      "sha256": "4860334b96f47722c6ce5a31d50fa630b887dee50236c224375bc6e3298a6015"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+        "status",
+        "/tmp/cg-kill-owned-5KrJhE/23",
+        "--json"
+      ],
+      "pid": 1270,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.216,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-66.log",
+      "sha256": "071b726e1f7cefa685786e406baa6c3a6d1b53b0cdfc006c00fdd5a04d39e88a"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/24",
+        "update",
+        "config_written"
+      ],
+      "pid": 1300,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 0.332,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-67.log",
+      "sha256": "5fd69cbd5d6c270fe255756264af545417f67fabca4a3830ba8e3a5ca23d7fdd"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/24",
+        "inspect",
+        "recovery_config"
+      ],
+      "pid": 1308,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 0.384,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-68.log",
+      "sha256": "71d204d502b6e4f846fc66c5e832a27dcdeac0ad83aa13c587b05ff8999d5b97"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/24",
+        "inspect"
+      ],
+      "pid": 1316,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.382,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-69.log",
+      "sha256": "39a6979f1a6e3606204b74f97725c1783517852396f296c7a45b8717afa2c32a"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/25",
+        "install"
+      ],
+      "pid": 1354,
+      "exit": 1,
+      "signal": null,
+      "seconds": 0.345,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-70.log",
+      "sha256": "1467c8036a3a7f5c44f8d3eef194239c080c3c8b5f9d8f7456be44ad19a98e9f"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/25",
+        "inspect"
+      ],
+      "pid": 1362,
+      "exit": 1,
+      "signal": null,
+      "seconds": 0.373,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-71.log",
+      "sha256": "9562efbf99a50dff8d34808f5eb0d5dd5d8b6280a7d7bda0cd6e04b2116d5b93"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/25",
+        "index"
+      ],
+      "pid": 1370,
+      "exit": 1,
+      "signal": null,
+      "seconds": 0.363,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-72.log",
+      "sha256": "862d1247395d497a3823764fe8156af54b463750249332e46de516fbd72658e9"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/25",
+        "update",
+        "config_written"
+      ],
+      "pid": 1346,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 1.448,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-73.log",
+      "sha256": "588ec9094258331f91a9af1e585251aad7697168c55d9ec21784abb29f01d5ae"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/25",
+        "inspect"
+      ],
+      "pid": 1378,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.368,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-74.log",
+      "sha256": "582480a5919af86726d46acc00e69d2b5a1f0e003b926bfad6f0f2736e5a85d3"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/26",
+        "inspect"
+      ],
+      "pid": 1408,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.393,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-75.log",
+      "sha256": "4edc7ef87bfc795342153ded61a4bced7344dc64e6f1f05c4a3e6723b1b84795"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/26",
+        "inspect"
+      ],
+      "pid": 1416,
+      "exit": 1,
+      "signal": null,
+      "seconds": 0.352,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-76.log",
+      "sha256": "32938d4ac209ad7718259a94e0f6575ee35c860c17222c3e8103d72c11012b73"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/26",
+        "update",
+        "prepared"
+      ],
+      "pid": 1424,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 0.35,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-77.log",
+      "sha256": "986b08e84d7b508668163fc0e125d8f70fb77569e0f9ea643e3c1c1fdb7b39ac"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/26",
+        "inspect"
+      ],
+      "pid": 1432,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.472,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-78.log",
+      "sha256": "409815b7915b9028da8c8ac3d3b99123eb799d52411629f3114a19c1d6801934"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/26",
+        "inspect"
+      ],
+      "pid": 1440,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.383,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-79.log",
+      "sha256": "422822595179347484d4e3862701572b6928ccf829b6e1050a1d2acb1719048a"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/27",
+        "update",
+        "config_written"
+      ],
+      "pid": 1470,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 0.394,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-80.log",
+      "sha256": "edccc5c8b6a7a73fa6e28df44605147e80ced28874672e0e268f348afd217688"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/27",
+        "inspect"
+      ],
+      "pid": 1478,
+      "exit": 1,
+      "signal": null,
+      "seconds": 0.356,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-81.log",
+      "sha256": "726401651696fd9d57786d45928a3cc517079be67b779f5c9346c2e90df533c7"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/27",
+        "inspect"
+      ],
+      "pid": 1486,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.366,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-82.log",
+      "sha256": "4d85305ee669cc4abd6554e0b510387993084f1500b724fb07c3d50aaa6ce987"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/27",
+        "inspect"
+      ],
+      "pid": 1494,
+      "exit": 1,
+      "signal": null,
+      "seconds": 0.356,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-83.log",
+      "sha256": "8758378c0e300e62a5403b9fa262c3622bcdb550ed1e40c737d70f05008347d2"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/28",
+        "update",
+        "config_written"
+      ],
+      "pid": 1524,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 0.348,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-84.log",
+      "sha256": "efd1681ecba4b851ab1daf6d1c72af3b68bd742c2a6c65248787e486d1182a80"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/28",
+        "inspect"
+      ],
+      "pid": 1532,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.395,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-85.log",
+      "sha256": "d288f10e2f8e0d8cde03378973d97ca1aef309f25958ff93a264f06cfa6c0ddf"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/29",
+        "update",
+        "config_written"
+      ],
+      "pid": 1562,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 0.371,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-86.log",
+      "sha256": "7eb6d1b6418715c2919a8224c61494036bdd77c9c137412ed32965fb3dc33b75"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/29",
+        "inspect"
+      ],
+      "pid": 1570,
+      "exit": 1,
+      "signal": null,
+      "seconds": 0.349,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-87.log",
+      "sha256": "ecf28cac1a9e456c1b648927dc4963fa34997c16c280c2a9323822e1a01c272d"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/29",
+        "inspect"
+      ],
+      "pid": 1578,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.368,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-88.log",
+      "sha256": "a042f6168b14cb487e24e637f293ec34573adcc0070bce091bdf63f826f3fdef"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/30",
+        "update",
+        "graph_committed"
+      ],
+      "pid": 1608,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 1.271,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-89.log",
+      "sha256": "4052f753e79c94579c6f87065fec6d0d5ee7e9aa42c6908f57577c5a637c013e"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/30",
+        "inspect"
+      ],
+      "pid": 1631,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.394,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-90.log",
+      "sha256": "7d04fcf3bc530c35b81302008da592b3b9c97f4fbce9ef3610ab6c009c32f5a7"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/31",
+        "update",
+        "graph_committed"
+      ],
+      "pid": 1661,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 1.276,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-91.log",
+      "sha256": "b79d3dda5501d5c6107050242d0b828c39a5786a928d2cdaf10bfaad2e0e6808"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/31",
+        "inspect"
+      ],
+      "pid": 1684,
+      "exit": 1,
+      "signal": null,
+      "seconds": 0.379,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-92.log",
+      "sha256": "ed740c2e0971f00be8a984d886e36b7adda575ee92937970a393b55f46d840bf"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/31",
+        "inspect"
+      ],
+      "pid": 1692,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.392,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-93.log",
+      "sha256": "56a184c52ff719cb58a94c78770262c426c33928d6667f1d9b6e0991318ef7f1"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/32",
+        "update"
+      ],
+      "pid": 1722,
+      "exit": 1,
+      "signal": null,
+      "seconds": 0.348,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-94.log",
+      "sha256": "920302b5bf8b733443631a8c06fce01326f1a158100d1834a7a10205e0851b0a"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/32",
+        "index"
+      ],
+      "pid": 1730,
+      "exit": 1,
+      "signal": null,
+      "seconds": 0.371,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-95.log",
+      "sha256": "3b96fea2ae14b8ea408894b27ee1e888e6f9dc525921446657b1b896b593bca0"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/33",
+        "update",
+        "config_written"
+      ],
+      "pid": 1760,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 0.357,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-96.log",
+      "sha256": "8fcd03bbf76108f4fd6c49de9ba489e049c4144d1b45406f998901fa02d5b5dc"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/33",
+        "inspect"
+      ],
+      "pid": 1768,
+      "exit": 1,
+      "signal": null,
+      "seconds": 0.346,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-97.log",
+      "sha256": "c20e7119291b88928c6550af8c3a5f1ec8d855f5d0e3d1b92f7bb9f78f3acda9"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/33",
+        "inspect"
+      ],
+      "pid": 1776,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.402,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-98.log",
+      "sha256": "346e4a2a500a8d2ad598ea51c06f63fb884167b78ed52011c504438b6d89bf25"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/34",
+        "update",
+        "graph_committed"
+      ],
+      "pid": 1806,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 1.237,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-99.log",
+      "sha256": "9c1875d48dc01e1dcff05e4f408095054d425b0d8103c655cf738340df9f1022"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/34",
+        "inspect"
+      ],
+      "pid": 1829,
+      "exit": 1,
+      "signal": null,
+      "seconds": 0.369,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-100.log",
+      "sha256": "54d0c377240479ce0503b87425447de3db2c2b9166064b65bcea22d2960d5f6a"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/34",
+        "inspect"
+      ],
+      "pid": 1837,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.386,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-101.log",
+      "sha256": "30025d75172e22cc467abe3ab29f572b0b2ace486d867fd4e9a1c80238c40e9a"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/35",
+        "update",
+        "graph_committed"
+      ],
+      "pid": 1867,
+      "exit": null,
+      "signal": "SIGKILL",
+      "seconds": 1.227,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-102.log",
+      "sha256": "8c7158f21b7d619558a7e689b0f43640aecccc5ce5b9afd9ed90c2dc79cb797b"
+    },
+    {
+      "command": [
+        "/usr/local/bin/node",
+        "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/scripts/validation/extensions-recovery.cjs",
+        "--child",
+        "/tmp/cg-kill-owned-5KrJhE/35",
+        "inspect"
+      ],
+      "pid": 1890,
+      "exit": 0,
+      "signal": null,
+      "seconds": 0.428,
+      "log": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/recovery/process-recovery-final/child-103.log",
+      "sha256": "f5088be305c341c1834994d2419efc97f7b7f6a7d74f0a757573df70604acc36"
+    }
+  ],
+  "compatibility": {
+    "checks": [
+      "signed immutable versions; semantic catalog order independent of publication order",
+      "one browser Install selects 1.10.0 over incompatible 9.0.0 and preview; actual Python graph refreshed only in chosen destination",
+      "no-compatible browser selection/command fails usefully and preserves existing config/graph",
+      "headless automatic selection agrees; exact incompatible pin/no-compatible/missing update fail without mutation",
+      "prerelease requires explicit exact pin; automatic update refuses downgrade; explicit lower pin remains exact",
+      "compatible but broken update retains previous version and graph",
+      "browser and headless update to highest compatible stable; stale graph labels removed",
+      "exact artifact URL/file semantics and build-metadata pin identity preserved",
+      "removal cleans contributions; desktop/mobile display actual destination compatibility; no page errors"
+    ],
+    "releases": [
+      {
+        "id": "compatible-demo",
+        "version": "1.10.0",
+        "engines": ">=1.6.0 <2",
+        "integrity": "d59f9b1e9bd7d027081de45ab004aefe3236708ddeb4fc7135c92502ce0866d8"
+      },
+      {
+        "id": "compatible-demo",
+        "version": "1.9.0",
+        "engines": ">=1.6.0 <2",
+        "integrity": "07e64445b8c7205ec9a1d76c9e29affbd55d45e0817e9c3d92572b9f00486fcd"
+      },
+      {
+        "id": "compatible-demo",
+        "version": "0.5.0",
+        "engines": ">=1.6.0 <2",
+        "integrity": "ad3c944ff2bea24feb81cb25839746b72e4845b9dae3cba3a4e2ce872855114d"
+      },
+      {
+        "id": "compatible-demo",
+        "version": "20.0.0-beta.1",
+        "engines": ">=1.6.0 <2",
+        "integrity": "1a24723ecad51739315c4a6439227ff0a884700647ac505db74a12949fa99c82"
+      },
+      {
+        "id": "compatible-demo",
+        "version": "9.0.0",
+        "engines": ">=9",
+        "integrity": "c3f802635737b02d15f6fe3e82cde56c41a1c83c8a9cc0858ef964b49be206c9"
+      },
+      {
+        "id": "unavailable-demo",
+        "version": "1.0.0",
+        "engines": ">=9",
+        "integrity": "bc25c179402f994d59e586491cc0921d01ddc6dcf12bea9274982df745f42ef0"
+      },
+      {
+        "id": "compatible-demo",
+        "version": "2.0.0",
+        "engines": ">=1.6.0 <2",
+        "integrity": "5b2f2099fbe51f94a4242f8e81570bacf3a7c16625e8439af3853adab1de65f1"
+      },
+      {
+        "id": "compatible-demo",
+        "version": "3.0.0",
+        "engines": ">=1.6.0 <2",
+        "integrity": "e9f0eecbf6621e6f0ba7fc139d1eb91ffa2899548e0b5e615e3443a0496c8081"
+      },
+      {
+        "id": "compatible-demo",
+        "version": "1.10.0+fixture.1",
+        "engines": ">=1.6.0 <2",
+        "integrity": "b78efa83378ef1de9e79e8f6e4c18f0470382d8946481c4680fd0cbe2c6c349f"
+      }
+    ],
+    "commands": [
+      {
+        "command": [
+          "/usr/local/bin/node",
+          "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+          "extensions",
+          "install",
+          "compatible-demo",
+          "--registry",
+          "http://127.0.0.1:44859",
+          "--path",
+          "/tmp/cg-compatible-ztntwo/headless-python-project"
+        ],
+        "exit": 0,
+        "seconds": 1.714
+      },
+      {
+        "command": [
+          "/usr/local/bin/node",
+          "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+          "extensions",
+          "install",
+          "compatible-demo",
+          "--registry",
+          "http://127.0.0.1:44859",
+          "--version",
+          "9.0.0",
+          "--path",
+          "/tmp/cg-compatible-ztntwo/headless-python-project"
+        ],
+        "exit": 1,
+        "seconds": 0.403
+      },
+      {
+        "command": [
+          "/usr/local/bin/node",
+          "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+          "extensions",
+          "update",
+          "unavailable-demo",
+          "--registry",
+          "http://127.0.0.1:44859",
+          "--path",
+          "/tmp/cg-compatible-ztntwo/headless-python-project"
+        ],
+        "exit": 1,
+        "seconds": 0.316
+      },
+      {
+        "command": [
+          "/usr/local/bin/node",
+          "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+          "extensions",
+          "install",
+          "unavailable-demo",
+          "--registry",
+          "http://127.0.0.1:44859",
+          "--path",
+          "/tmp/cg-compatible-ztntwo/headless-python-project"
+        ],
+        "exit": 1,
+        "seconds": 0.432
+      },
+      {
+        "command": [
+          "/usr/local/bin/node",
+          "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+          "extensions",
+          "install",
+          "compatible-demo",
+          "--registry",
+          "http://127.0.0.1:44859",
+          "--version",
+          "20.0.0-beta.1",
+          "--path",
+          "/tmp/cg-compatible-ztntwo/headless-python-project"
+        ],
+        "exit": 0,
+        "seconds": 1.643
+      },
+      {
+        "command": [
+          "/usr/local/bin/node",
+          "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+          "extensions",
+          "update",
+          "compatible-demo",
+          "--registry",
+          "http://127.0.0.1:44859",
+          "--path",
+          "/tmp/cg-compatible-ztntwo/headless-python-project"
+        ],
+        "exit": 1,
+        "seconds": 0.46
+      },
+      {
+        "command": [
+          "/usr/local/bin/node",
+          "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+          "extensions",
+          "install",
+          "compatible-demo",
+          "--registry",
+          "http://127.0.0.1:44859",
+          "--version",
+          "1.9.0",
+          "--path",
+          "/tmp/cg-compatible-ztntwo/headless-python-project"
+        ],
+        "exit": 0,
+        "seconds": 1.54
+      },
+      {
+        "command": [
+          "/usr/local/bin/node",
+          "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+          "extensions",
+          "update",
+          "compatible-demo",
+          "--registry",
+          "http://127.0.0.1:44859",
+          "--path",
+          "/tmp/cg-compatible-ztntwo/headless-python-project"
+        ],
+        "exit": 0,
+        "seconds": 1.725
+      },
+      {
+        "command": [
+          "/usr/local/bin/node",
+          "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+          "extensions",
+          "install",
+          "http://127.0.0.1:44859/api/download/compatible-demo/1.9.0",
+          "--path",
+          "/tmp/cg-compatible-ztntwo/headless-python-project"
+        ],
+        "exit": 0,
+        "seconds": 1.575
+      },
+      {
+        "command": [
+          "/usr/local/bin/node",
+          "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+          "extensions",
+          "install",
+          "/tmp/cg-compatible-ztntwo/pinned.cgext",
+          "--path",
+          "/tmp/cg-compatible-ztntwo/headless-python-project"
+        ],
+        "exit": 0,
+        "seconds": 1.501
+      },
+      {
+        "command": [
+          "/usr/local/bin/node",
+          "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+          "extensions",
+          "install",
+          "compatible-demo",
+          "--registry",
+          "http://127.0.0.1:44859",
+          "--version",
+          "1.10.0+fixture.1",
+          "--path",
+          "/tmp/cg-compatible-ztntwo/headless-python-project"
+        ],
+        "exit": 0,
+        "seconds": 1.765
+      },
+      {
+        "command": [
+          "/usr/local/bin/node",
+          "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+          "extensions",
+          "remove",
+          "compatible-demo",
+          "--path",
+          "/tmp/cg-compatible-ztntwo/headless-python-project"
+        ],
+        "exit": 0,
+        "seconds": 1.493
+      }
+    ],
+    "engineVersion": "1.6.0",
+    "platform": "linux",
+    "browser": "153.0.8010.36"
+  },
+  "browser": {
+    "browser": "153.0.8010.36",
+    "platform": "linux",
+    "checks": [
+      "real browser signed publisher upload",
+      "browser publisher ownership rejection",
+      "browser invalid-signature failure state",
+      "browser malformed-package rejection without publication",
+      "one-click selected-project install verified in SQLite",
+      "real postMessage wrong-window command ignored",
+      "failed browser update preserves working version and graph",
+      "browser update replaces stale graph contributions",
+      "browser disable/enable/remove verified in SQLite",
+      "mobile detail fits viewport",
+      "real postMessage wrong-origin command ignored"
+    ],
+    "pageErrors": []
+  },
+  "environment_overrides": {
+    "recovery-kills-final": {
+      "RECOVERY_OUTPUT": ".qa/recovery/process-recovery-final"
+    },
+    "recovery-compatibility-final": {
+      "COMPAT_OUTPUT": ".qa/recovery/compat-after-recovery",
+      "PLAYWRIGHT_MODULE": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/browser-tools/node_modules/playwright"
+    },
+    "recovery-browser-final": {
+      "BROWSER_OUTPUT": ".qa/recovery/browser-after-recovery",
+      "PLAYWRIGHT_MODULE": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/browser-tools/node_modules/playwright"
+    }
+  },
+  "prior_nonfinal_receipts": [
+    {
+      "path": ".qa/recovery/recovery-first-build.json",
+      "sha256": "8f267552ad67ba3804dd493e5037d70e40de834f0c65dd3ac302e2eb25e5b4cb",
+      "bytes": 529
+    },
+    {
+      "path": ".qa/recovery/recovery-build-fixed.json",
+      "sha256": "922e11d8290ea7615f47d2ea4098783ff87df14ed0765cdc2b1e1b0203c1fec8",
+      "bytes": 529
+    },
+    {
+      "path": ".qa/recovery/recovery-build-third.json",
+      "sha256": "bb2feea4a04a38eb6836ec1453e9dad81ebf9625437c61eec2e8b5c434126e7a",
+      "bytes": 576
+    },
+    {
+      "path": ".qa/recovery/recovery-kills-first.json",
+      "sha256": "7df628839bc5025a95927adbecee86f9e67e10d49707f3f57d80b7625765f0eb",
+      "bytes": 603
+    },
+    {
+      "path": ".qa/recovery/recovery-build-fourth.json",
+      "sha256": "c40de29dbf8190bc716856ac05a6174731fd2f264b8cc9af1e72938ab3968614",
+      "bytes": 502
+    },
+    {
+      "path": ".qa/recovery/recovery-focused-first.json",
+      "sha256": "c967a3b0afc6d4a291aed3caa6f0d5df44b8688d148468cd076983c69cc03556",
+      "bytes": 1087
+    }
+  ],
+  "limits": [
+    "Linux/local process death only; native Windows/macOS and power-loss/network-filesystem tests pending",
+    "Historical 4545-pass full suite predates author/compatibility/recovery; no current whole-suite or hosted CI claim",
+    "Historical Drupal measured rebuild overhead 22\u201330%; no fresh corpus/performance rerun",
+    "No hosted HTTPS/durable registry/Vercel acceptance, merge or release"
+  ]
+}

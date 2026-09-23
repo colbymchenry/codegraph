@@ -113,6 +113,7 @@ export interface WireEdge {
   confidence?: number;
   resolvedBy?: string;
   provenance?: string;
+  label?: string;
   synthesizedBy?: string;
   via?: string;
   registeredAt?: string;

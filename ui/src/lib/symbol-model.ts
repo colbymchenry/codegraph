@@ -98,7 +98,7 @@ export function relationWhens(relation: WireRelation): string[] {
 export function synthesizedBy(relation: WireRelation): string | null {
   if (!relation.synthesized) return null;
   const edge = relation.edges.find((e) => e.provenance === 'heuristic');
-  return edge?.synthesizedBy ?? edge?.via ?? 'synthesized';
+  return edge?.label ?? edge?.synthesizedBy ?? edge?.via ?? 'synthesized';
 }
 
 export function basename(path: string): string {

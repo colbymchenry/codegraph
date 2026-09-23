@@ -14,6 +14,7 @@
   "files": [
     "dist",
     "scripts",
+    "docs/extensions",
     "README.md"
   ],
   "workspaces": [
@@ -49,6 +50,7 @@
     "ignore": "^7.0.5",
     "jsonc-parser": "^3.3.1",
     "picomatch": "^4.0.3",
+    "semver": "^7.8.5",
     "sisteransi": "^1.0.5",
     "tree-sitter-wasms": "^0.1.11",
     "web-tree-sitter": "^0.25.3"
@@ -58,9 +60,11 @@
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^20.19.30",
     "@types/picomatch": "^4.0.2",
+    "@types/semver": "^7.8.0",
     "jsdom": "^25.0.1",
     "typescript": "^5.0.0",
-    "vitest": "^2.1.9"
+    "vitest": "^2.1.9",
+    "yaml": "^2.9.1"
   },
   "engines": {
     "node": ">=20.0.0 <25.0.0"

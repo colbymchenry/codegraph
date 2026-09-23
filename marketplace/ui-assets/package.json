@@ -1,0 +1,11 @@
+{
+  "name": "codegraph-marketplace-ui-assets",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {"build": "node build.cjs", "check": "node build.cjs --check"},
+  "devDependencies": {
+    "@fontsource-variable/archivo": "5.2.8",
+    "@fontsource/ibm-plex-mono": "5.2.7",
+    "lucide-static": "0.468.0"
+  }
+}

@@ -1,3 +1,4 @@
+import { currentPlugins } from '../plugins/registry';
 /**
  * Callback / observer edge synthesis — Phase 1 + 2.
  *
@@ -3684,6 +3685,9 @@ export const SYNTH_PASSES: SynthPassDef[] = [
 
 /** Fixed non-registry steps: goMethodContains, goImplements, dedupe-merge, insertMergedEdges. */
 const FIXED_SYNTH_STEPS = 4;
+export function getSynthPasses(): SynthPassDef[] {
+  return [...SYNTH_PASSES, ...(currentPlugins()?.synthPasses ?? [])];
+}
 export const SYNTH_PROGRESS_STEPS = SYNTH_PASSES.length + FIXED_SYNTH_STEPS;
 export async function synthesizeCallbackEdges(
   queries: QueryBuilder,
@@ -3698,6 +3702,8 @@ export async function synthesizeCallbackEdges(
   // only read; every write in this function happens with the pool idle.
   backpressure?: () => Promise<void> | null
 ): Promise<number> {
+  const effectivePasses = getSynthPasses();
+  const progressSteps = effectivePasses.length + FIXED_SYNTH_STEPS;
   // Each sub-pass below is a whole-graph scan, and there are ~30 of them, all
   // running synchronously on the indexer's main thread. Their AGGREGATE can run
   // for well over a minute on a large repo — long enough for the #850 liveness
@@ -3718,11 +3724,11 @@ export async function synthesizeCallbackEdges(
   let lastPct = -1;
   const emit = (value: number): void => {
     if (!onProgress) return;
-    const v = Math.min(value, SYNTH_PROGRESS_STEPS);
-    const pct = Math.floor((v / SYNTH_PROGRESS_STEPS) * 100);
+    const v = Math.min(value, progressSteps);
+    const pct = Math.floor((v / progressSteps) * 100);
     if (pct === lastPct) return;
     lastPct = pct;
-    onProgress(v, SYNTH_PROGRESS_STEPS);
+    onProgress(v, progressSteps);
   };
   // A single long pass otherwise parks the bar between steps; a pass that
   // takes this callback reports a 0..1 fraction of its own work, surfaced
@@ -3788,7 +3794,7 @@ export async function synthesizeCallbackEdges(
   }
   await yieldToLoop(); __mark('goImplements');
 
-  // Run the independent passes (see SYNTH_PASSES). Their results are merged in
+  // Run the independent passes (see effectivePasses). Their results are merged in
   // REGISTRY ORDER below regardless of execution order, and none of their edges
   // persist until that merge — so every pass sees the same committed
   // post-resolution DB state whether it runs sequentially here or on a resolver
@@ -3796,7 +3802,7 @@ export async function synthesizeCallbackEdges(
   // fan out across its read-only workers and the per-pass wall-clock comes from
   // the worker; a pass that fails on a worker falls back to running on the main
   // thread, so a worker crash isolates to a retry instead of failing synthesis.
-  const passEdges: Edge[][] = new Array<Edge[]>(SYNTH_PASSES.length).fill(NONE);
+  const passEdges: Edge[][] = new Array<Edge[]>(effectivePasses.length).fill(NONE);
   const markPass = (label: string, dt: number): void => {
     if (process.env.CODEGRAPH_SYNTH_TIMINGS && (dt > 250 || process.env.CODEGRAPH_SYNTH_TIMINGS === 'all')) {
       console.error(`[synth-timing] ${label}: ${dt}ms`);
@@ -3805,7 +3811,7 @@ export async function synthesizeCallbackEdges(
     emit(passesDone);
   };
   const runPassOnMain = async (i: number): Promise<void> => {
-    const pass = SYNTH_PASSES[i]!;
+    const pass = effectivePasses[i]!;
     const t0 = Date.now();
     passEdges[i] = await pass.run(queries, ctx, yieldToLoop, subProgress);
     await yieldToLoop();
@@ -3813,9 +3819,9 @@ export async function synthesizeCallbackEdges(
   };
 
   const gatedIn: number[] = [];
-  for (let i = 0; i < SYNTH_PASSES.length; i++) {
-    if (SYNTH_PASSES[i]!.gate(has)) gatedIn.push(i);
-    else markPass(SYNTH_PASSES[i]!.name, 0);
+  for (let i = 0; i < effectivePasses.length; i++) {
+    if (effectivePasses[i]!.gate(has)) gatedIn.push(i);
+    else markPass(effectivePasses[i]!.name, 0);
   }
 
   // Above this node count, a pass that OOM-killed its worker must NOT be
@@ -3830,7 +3836,7 @@ export async function synthesizeCallbackEdges(
   if (pool && gatedIn.length > 1) {
     await Promise.all(
       gatedIn.map(async (i) => {
-        const pass = SYNTH_PASSES[i]!;
+        const pass = effectivePasses[i]!;
         try {
           const out = await pool.runSynthPass(pass.name);
           passEdges[i] = out.edges;

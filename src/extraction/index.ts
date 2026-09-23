@@ -21,7 +21,8 @@ import {
   ReferenceKind,
 } from '../types';
 import { QueryBuilder } from '../db/queries';
-import { extractFromSource } from './tree-sitter';
+import { extractFromSource, applyFrameworkExtraction } from './tree-sitter';
+import type { CoreExtractionReuse } from './core-reuse';
 import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs } from './parse-pool';
 import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
@@ -1895,7 +1896,8 @@ export class ExtractionOrchestrator {
     // passed for a COMPLETELY fresh database, where the main thread performs
     // no reads/writes during the parse loop, so one writer applying bundles
     // in file order preserves the #1015 determinism exactly.
-    storeWriterOpts?: { dbPath: string; fastInit: boolean } | null
+    storeWriterOpts?: { dbPath: string; fastInit: boolean } | null,
+    coreReuse?: CoreExtractionReuse
   ): Promise<IndexResult> {
     const tGrammar = Date.now();
     await initGrammars();
@@ -1981,6 +1983,7 @@ export class ExtractionOrchestrator {
 
     // Phase 2: Parse files in a worker thread (keeps main thread unblocked for UI)
     const total = files.length;
+    coreReuse?.retain(files);
     let processed = 0;
 
     // Emit parsing phase immediately so the progress bar appears during worker setup.
@@ -2064,10 +2067,24 @@ export class ExtractionOrchestrator {
      * in-process synchronously as the no-worker fallback. The language is resolved
      * here on the main thread, where the codegraph.json overrides are loaded.
      */
-    const parseFile = (filePath: string, content: string): Promise<ExtractionResult> => {
+    const parseFile = async (filePath: string, content: string): Promise<ExtractionResult> => {
       const language = detectLanguage(filePath, content, overrides);
-      if (!pool) return Promise.resolve(extractFromSource(filePath, content, language, frameworkNames));
-      return pool.requestParse({ filePath, content, language, frameworkNames });
+      if (!coreReuse) {
+        if (!pool) return extractFromSource(filePath, content, language, frameworkNames);
+        return pool.requestParse({ filePath, content, language, frameworkNames });
+      }
+      const core = coreReuse.get(filePath, content, language);
+      if (!pool) {
+        const base = core ?? extractFromSource(filePath, content, language);
+        if (!core) coreReuse.set(filePath, content, language, base);
+        return applyFrameworkExtraction(structuredClone(base), filePath, content, language, frameworkNames);
+      }
+      const result = await pool.requestParse({ filePath, content, language, frameworkNames, reuseCore: true, coreExtraction: core });
+      if (result.coreExtraction) {
+        coreReuse.set(filePath, content, language, result.coreExtraction);
+        delete result.coreExtraction;
+      }
+      return result;
     };
 
     // --- Bounded rolling-window dispatch, ordered commit ---

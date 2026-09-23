@@ -1,0 +1,2264 @@
+{
+  "generatedAt": "2026-09-23T04:18:01.521551+00:00",
+  "implementationSource": "ca6c375993317640f592d1ecc149f5aa48116885",
+  "readOnlyDriverSource": "9f18692f076c0f8311def321856bb31e5f21374c",
+  "applicationSource": "7575dcc71e4524c660aff06486ebc007cca290b9",
+  "priorAcceptedRemote": "d971e06fade2876225208f604b73975fa8491743",
+  "pr": "https://github.com/colbymchenry/codegraph/pull/1911",
+  "sourceHashes": {
+    "CHANGELOG.md": "dce3f0762d5952ad80063fe54897045712f425124a8985dbae081e904d9ef385",
+    "docs/extensions/marketplace-budget-and-source.md": "8ada69cb520ec7ab0d66694511ab4210de45bd00bb0d81c3b5fa453d035078ea",
+    "docs/validation/extensions-budget-source-20260923.md": "61fef5ae75a134cb0f31f1f61b0d91777c1fd7507e38ff6a407b7b751406dde2",
+    "docs/validation/images/budget-source-20260923/local-desktop.png": "146296358501c20edbf37d0ffce8af99a5e67be042552d3095ccb07202455d2e",
+    "docs/validation/images/budget-source-20260923/local-mobile.png": "89c10d7d8292c901cc0e6248f0235d65d9f02964a3c71584e386a4bbd90d8e20",
+    "docs/validation/images/budget-source-20260923/readonly-overlay-desktop.png": "6aeec4a2e2cb05d009e3d065881e790b9890bc1c6a0fd8fa6734feea35241365",
+    "docs/validation/images/budget-source-20260923/readonly-overlay-mobile.png": "8d59ba0cc7287212baeda5abae330817d1bb55e863430355ee3a5841281205c8",
+    "marketplace/cloudflare/.gitignore": "b0b03865851368853903bf79cfabe0476c8825c93208cfe65ced3416748e1ede",
+    "marketplace/cloudflare/build.mjs": "928ac6fb72ff1cab5c9742b127839524ccd81d28057bf7dbda18e2eded407678",
+    "marketplace/cloudflare/hosted-ops-test.mjs": "657bfc17b4f6247368b1f8fa847609935e0ed9ab89a1e1abe36bd2049c8c97f5",
+    "marketplace/cloudflare/hosted-ops.mjs": "9ef0b18bb0d83f73c119667a07d2510edb6df1966498e4af14ea62de02647061",
+    "marketplace/cloudflare/local.mjs": "b71d3c77265a40076cbf4b3bd0eb7128702f590c3281444cfada4d978ae1a751",
+    "marketplace/cloudflare/official-policy.json": "9246028741797088c5ddb34079090fe73d6d111ed639a9d35a172d8416c3b8f1",
+    "marketplace/cloudflare/official-test.mjs": "4feca219b6a48dbfb33a420cbad11f9d15695b630d87f1cdea92248ac2ef05ec",
+    "marketplace/cloudflare/official.mjs": "b49b31a99c5c163ef964e6870889aa3f910b0301bcf4e4122450d15d8eab69e6",
+    "marketplace/cloudflare/package-lock.json": "50e94ebca41788619b4f9b97a79dfffd60392b09cbae8e88869768d7d4f0a4f7",
+    "marketplace/cloudflare/package.json": "97470c687f45a99b5e987ba7bd2cfd7208692ad41a308aab2f3a03ededeb06fc",
+    "marketplace/cloudflare/publication-window-test.mjs": "d09ffabe3acf12c93484a9649628d4df29424f055ea5750f5cafe20fe901137c",
+    "marketplace/cloudflare/review-source.mjs": "4ff2eeb3741e9db055cf6bd59a85fd04571e6651251f79ddf82c85d9239304f0",
+    "marketplace/cloudflare/source-test.mjs": "fa96dd770788d9d5060e9724bca941c63c1642ecc86ed6b9519be5d8389fcef5",
+    "marketplace/cloudflare/test-child.mjs": "76e3fc10579e9ef73121eb8480217275b9a9358478a266c8dfc9e51924be4711",
+    "marketplace/cloudflare/test-worker.ts": "1401c06250c83d02108ded9ca2d322ccb0ce8c9f07e14bae637e6e0209775ca9",
+    "marketplace/cloudflare/test.mjs": "49f2076270d7671c9ff43d1580ebfc5ebe535046a70b5bb960ec1721a59aad41",
+    "marketplace/cloudflare/worker.ts": "d49fafb07abccdb98cffc653fc7a26ef9ae42d85a220d01fcbe80768998ae9d2",
+    "marketplace/public/_headers": "7b2fb8fc7fc84e6968ab54a3e200df400b7af1fcb68bcf6aec44a6248a1aeb4e",
+    "marketplace/public/app.js": "daee5b464f885a30313ec41951d23c74cb922d32bd6e98487c1f5492946b0efc",
+    "marketplace/public/index.html": "f21a48f085163669974fa8967bb1651a5289c2395840136811e12ed2a799403d",
+    "marketplace/public/style.css": "54a868bb567596233dfbcbd98583d8593f38ce7c77100f9d0836e94f87d1a8ae",
+    "marketplace/source-review.cjs": "c4f9cab7a242547b1bb64ace3ca5231e0bb815cd9c1fc0951f9ae3991525b1e7",
+    "marketplace/source-reviews.json": "dc4a75c737fff1e1aca351cb3ff3f549b24964cd780dc2f6219107895800d5f8",
+    "scripts/validation/cloudflare-registry.cjs": "b6acba301944ab0fc4f00e79dbcdc139271f90eb77ec267318582e3e6b75cc96",
+    "scripts/validation/extensions-compatibility.cjs": "e467d150fb9dfdb36d89174545c68347c1f4c4d99c7543c55730e2d770a1788e",
+    "scripts/validation/marketplace-browser.cjs": "e7dfc872f89936ee85dc90c9ffa40fa3bec8d27c247ce1f4c8b6b4ae9437c618",
+    "scripts/validation/marketplace-budget.cjs": "7556a078556d19fc5f087ef45dacb1938df157ff2a5220fe91fe6904c2bea876",
+    "scripts/validation/marketplace-source-browser.cjs": "51213b4c45a555cd2c3daa612053ea968ad27921812501299747a09f0b55442b",
+    "scripts/validation/marketplace-source-hosted-readonly.cjs": "921f78c65a4aee9e2e8d36374280be5b0815274398e64b29745bdf90b87fceee",
+    "src/plugins/marketplace.ts": "8f9a09fecbece38c380a0e1c296aa85ce2bf3cfb341fcf9b035c57bd3354ac22",
+    "src/plugins/package-validation.ts": "22edaf08c9531c6169ca0abf8f80c5b3536e29b049a2c387393ba2af4e003bf9",
+    "src/plugins/package.ts": "98fb111460d5a2ef5e1f1dc367768e7b44cc44bb51549b4a4f93c9f5a6694fbc"
+  },
+  "compiledHashes": {
+    "dist/index.js": "e66d30aaa728ca54cd419af1f50aa0ca22a6409efd58bb71b97ec5564de56ae5",
+    "dist/index.d.ts": "7a4d7d0e8829e1ebe74e387b1e2503ebd1d798f8174e1af81a72c1d62fc61d09",
+    "dist/db/index.js": "84832b6b622bbf40b2beed2824e6d020b18e55ddfa2d16458dcb8d638d102966",
+    "dist/plugins/recovery.js": "49ed19a5a386273a17d21b823b620be312dc58533e5a5dc8c451e97e39d39774",
+    "dist/extraction/index.js": "66dd378d44e82bbaf23df3b54a28aeaaa3e8bf6dea000eaa11d5d6aef6ea6b86",
+    "dist/extraction/core-reuse.js": "2c2883ef6a465edae6bf07fc02574eb975d6d2e2cd1d31ace49d9b87fed137c7",
+    "dist/extraction/parse-pool.js": "94cc18e2c14241f665641c174e9d882f5c893cfb825d6d13744d6a094fe929d6",
+    "dist/extraction/parse-worker.js": "85fa539597a610eb97c5738f9cfaaecf8b17cf7944519e2b95fb81a334daddc2",
+    "dist/extraction/tree-sitter.js": "87bfc4cd6cdc3cbc8406a531edc127ec84cacf770c9251a5bcfeaaf78b61883c",
+    "dist/extensions/drupal.cgext": "e5ed73bee51524585e4f4da1d5017fdee3037a3fa71d8f08edab6c318fedc59a",
+    "dist/extensions/drupal-0.1.0.cgext": "e5015747d02fe50d6af607b6c44f1db9cf7969a0070866ed03c7643377a459c8",
+    "dist/extensions/drupal-0.1.1.cgext": "e5ed73bee51524585e4f4da1d5017fdee3037a3fa71d8f08edab6c318fedc59a",
+    "marketplace/cloudflare/.build/worker.js": "7d4cf7fcebec3d6a78ea1dc7a139b74adf400a318dbf7374149359e4b14825f1",
+    "marketplace/cloudflare/.build/test-worker.js": "78ca7bc25b7b9f43bc06a7442a40aa6031ba6387a1621fb665f875f41100e463",
+    ".qa/source-budget/ui-dryrun/worker.js": "43dc01b6bd20160381d409c80ecd4f447ab6539a34890110e6dcad6684060561"
+  },
+  "immutableArtifacts": {
+    "extensions/drupal/releases/drupal-0.1.0.cgext": "e5015747d02fe50d6af607b6c44f1db9cf7969a0070866ed03c7643377a459c8",
+    "dist/extensions/drupal.cgext": "e5ed73bee51524585e4f4da1d5017fdee3037a3fa71d8f08edab6c318fedc59a"
+  },
+  "acceptedReuse": {
+    "sourceHashes": {
+      "matched": {
+        ".github/workflows/extensions-native.yml": {
+          "accepted": "7682919b56fba90dfc4109e3631839e06385469947d85bd29210e72019570511",
+          "current": "7682919b56fba90dfc4109e3631839e06385469947d85bd29210e72019570511"
+        },
+        "__tests__/core-extraction-reuse.test.ts": {
+          "accepted": "80ba8afdb3d5a1fcf6e9c13b1c7382897300cd05b476a8d920eaa06c8c880c99",
+          "current": "80ba8afdb3d5a1fcf6e9c13b1c7382897300cd05b476a8d920eaa06c8c880c99"
+        },
+        "__tests__/extension-sync.test.ts": {
+          "accepted": "5f520cdda673d78afd0024115f9adc6ce37973a6bcee4356a7279e543ff743ac",
+          "current": "5f520cdda673d78afd0024115f9adc6ce37973a6bcee4356a7279e543ff743ac"
+        },
+        "docs/design/semantic-update-reuse.md": {
+          "accepted": "dca02fc13fa3c367b747876f1734da75ddf715c56b438a7bc44c0dfde48473a0",
+          "current": "dca02fc13fa3c367b747876f1734da75ddf715c56b438a7bc44c0dfde48473a0"
+        },
+        "docs/validation/semantic-update-assert.cjs": {
+          "accepted": "e767e1635f0dc28171f35f4456f37ebd4f65c965be6b6130dd24cc616ffe75c1",
+          "current": "e767e1635f0dc28171f35f4456f37ebd4f65c965be6b6130dd24cc616ffe75c1"
+        },
+        "package-lock.json": {
+          "accepted": "85274fb46487a320a60d2050f41f5637bf3ea116170b047fe24aa8e768cec366",
+          "current": "85274fb46487a320a60d2050f41f5637bf3ea116170b047fe24aa8e768cec366"
+        },
+        "package.json": {
+          "accepted": "42c062210185a80c2d57bed2ac850a98d7660d3a0da2e04afa638f72305dd7e8",
+          "current": "42c062210185a80c2d57bed2ac850a98d7660d3a0da2e04afa638f72305dd7e8"
+        },
+        "scripts/validation/native-validation.cjs": {
+          "accepted": "75947748786ff0eaeff2418794ff2dffbd0c001b6238a8aa7a85eb400edc9658",
+          "current": "75947748786ff0eaeff2418794ff2dffbd0c001b6238a8aa7a85eb400edc9658"
+        },
+        "scripts/validation/semantic-update-poll.cjs": {
+          "accepted": "a768dae4ab5f5c8cf2af5d19f0c34e95d976fe778e35981581086ece753af756",
+          "current": "a768dae4ab5f5c8cf2af5d19f0c34e95d976fe778e35981581086ece753af756"
+        },
+        "scripts/validation/semantic-update-recovery.cjs": {
+          "accepted": "e8f5b331526bb9736384ae82b8a1dcfddd2c3d1943f9c032f58de1f0015f5b7e",
+          "current": "e8f5b331526bb9736384ae82b8a1dcfddd2c3d1943f9c032f58de1f0015f5b7e"
+        },
+        "scripts/validation/semantic-update-sample.cjs": {
+          "accepted": "08045e86b54bf56ce8103e2b5c1eb4520749abcca12656b91e50a4de5c60e167",
+          "current": "08045e86b54bf56ce8103e2b5c1eb4520749abcca12656b91e50a4de5c60e167"
+        },
+        "src/db/index.ts": {
+          "accepted": "e6ff63155237c2cba4c5f4d04bcf68ae1c81311ecff45d35a71dc3a743f6603e",
+          "current": "e6ff63155237c2cba4c5f4d04bcf68ae1c81311ecff45d35a71dc3a743f6603e"
+        },
+        "src/db/schema.sql": {
+          "accepted": "ad06c6892a5ea36b0e2fb27f5529da44c5b9f291e87b022413f8790e70d513b9",
+          "current": "ad06c6892a5ea36b0e2fb27f5529da44c5b9f291e87b022413f8790e70d513b9"
+        },
+        "src/extraction/core-reuse.ts": {
+          "accepted": "02d44426d4091e2b053cc26110f3245a46a91b626a610537a85b24e36cb32807",
+          "current": "02d44426d4091e2b053cc26110f3245a46a91b626a610537a85b24e36cb32807"
+        },
+        "src/extraction/index.ts": {
+          "accepted": "0108cacf9d8d0ab3e468ebd36b9ef75b0ce23b22480c55a1bbb75425a506eb17",
+          "current": "0108cacf9d8d0ab3e468ebd36b9ef75b0ce23b22480c55a1bbb75425a506eb17"
+        },
+        "src/extraction/parse-pool.ts": {
+          "accepted": "64ac4dce8da85fc0054ecf7497b5e6a6b0aac6a765879a164c316e3027f350cc",
+          "current": "64ac4dce8da85fc0054ecf7497b5e6a6b0aac6a765879a164c316e3027f350cc"
+        },
+        "src/extraction/parse-worker.ts": {
+          "accepted": "2aca8c20a7748a515b0456b01c80b92c6d4a5ea63e7bb51b88ae41ee52389c3c",
+          "current": "2aca8c20a7748a515b0456b01c80b92c6d4a5ea63e7bb51b88ae41ee52389c3c"
+        },
+        "src/extraction/tree-sitter.ts": {
+          "accepted": "7a72225fde1868af0b19d25078f34aa3f445decc26de2aff6d4dcf43ecf0b324",
+          "current": "7a72225fde1868af0b19d25078f34aa3f445decc26de2aff6d4dcf43ecf0b324"
+        },
+        "src/index.ts": {
+          "accepted": "31562b5bc5442620ea7e20fc6f11644f4bd6ebef6696488f884391ac02411be7",
+          "current": "31562b5bc5442620ea7e20fc6f11644f4bd6ebef6696488f884391ac02411be7"
+        },
+        "src/plugins/api.ts": {
+          "accepted": "779146a3bc84fd911d4c8fadd03c8fac03a5ac64766886c3498978223f2fd935",
+          "current": "779146a3bc84fd911d4c8fadd03c8fac03a5ac64766886c3498978223f2fd935"
+        },
+        "src/plugins/loader.ts": {
+          "accepted": "5f026cb63d1697b82db346645b101792c77351d5ed630504196287fe79da7c83",
+          "current": "5f026cb63d1697b82db346645b101792c77351d5ed630504196287fe79da7c83"
+        },
+        "src/plugins/manager.ts": {
+          "accepted": "48de2dc9059aa28a8d324c68172fa98dc4e36c05ed0c85c5fa718600324ba076",
+          "current": "48de2dc9059aa28a8d324c68172fa98dc4e36c05ed0c85c5fa718600324ba076"
+        },
+        "src/plugins/recovery.ts": {
+          "accepted": "44c7698414e6d91d99b7de3f301ce74e3983df2d204250e73604b72c8f796a4b",
+          "current": "44c7698414e6d91d99b7de3f301ce74e3983df2d204250e73604b72c8f796a4b"
+        },
+        "src/project-config.ts": {
+          "accepted": "7f2d3356dd272dc13b29dac130750a69c8cabbf2f69c7222f16e093c3b0a3d90",
+          "current": "7f2d3356dd272dc13b29dac130750a69c8cabbf2f69c7222f16e093c3b0a3d90"
+        },
+        "docs/validation/semantic-update-resume.cjs": {
+          "accepted": "540049903feb1b688d96ad45de84bcb3a360a08fcf66b13bcf4eda47148f30c7",
+          "current": "540049903feb1b688d96ad45de84bcb3a360a08fcf66b13bcf4eda47148f30c7"
+        }
+      },
+      "changed": {
+        "CHANGELOG.md": {
+          "accepted": "37ca580580a359bc2fb1eb55fb130f7a7d3d5c1b893c8104cd913638ee5a9453",
+          "current": "dce3f0762d5952ad80063fe54897045712f425124a8985dbae081e904d9ef385"
+        }
+      }
+    },
+    "compiledHashes": {
+      "matched": {
+        "dist/index.js": {
+          "accepted": "e66d30aaa728ca54cd419af1f50aa0ca22a6409efd58bb71b97ec5564de56ae5",
+          "current": "e66d30aaa728ca54cd419af1f50aa0ca22a6409efd58bb71b97ec5564de56ae5"
+        },
+        "dist/index.d.ts": {
+          "accepted": "7a4d7d0e8829e1ebe74e387b1e2503ebd1d798f8174e1af81a72c1d62fc61d09",
+          "current": "7a4d7d0e8829e1ebe74e387b1e2503ebd1d798f8174e1af81a72c1d62fc61d09"
+        },
+        "dist/db/index.js": {
+          "accepted": "84832b6b622bbf40b2beed2824e6d020b18e55ddfa2d16458dcb8d638d102966",
+          "current": "84832b6b622bbf40b2beed2824e6d020b18e55ddfa2d16458dcb8d638d102966"
+        },
+        "dist/plugins/recovery.js": {
+          "accepted": "49ed19a5a386273a17d21b823b620be312dc58533e5a5dc8c451e97e39d39774",
+          "current": "49ed19a5a386273a17d21b823b620be312dc58533e5a5dc8c451e97e39d39774"
+        },
+        "dist/extraction/index.js": {
+          "accepted": "66dd378d44e82bbaf23df3b54a28aeaaa3e8bf6dea000eaa11d5d6aef6ea6b86",
+          "current": "66dd378d44e82bbaf23df3b54a28aeaaa3e8bf6dea000eaa11d5d6aef6ea6b86"
+        },
+        "dist/extraction/core-reuse.js": {
+          "accepted": "2c2883ef6a465edae6bf07fc02574eb975d6d2e2cd1d31ace49d9b87fed137c7",
+          "current": "2c2883ef6a465edae6bf07fc02574eb975d6d2e2cd1d31ace49d9b87fed137c7"
+        },
+        "dist/extraction/parse-pool.js": {
+          "accepted": "94cc18e2c14241f665641c174e9d882f5c893cfb825d6d13744d6a094fe929d6",
+          "current": "94cc18e2c14241f665641c174e9d882f5c893cfb825d6d13744d6a094fe929d6"
+        },
+        "dist/extraction/parse-worker.js": {
+          "accepted": "85fa539597a610eb97c5738f9cfaaecf8b17cf7944519e2b95fb81a334daddc2",
+          "current": "85fa539597a610eb97c5738f9cfaaecf8b17cf7944519e2b95fb81a334daddc2"
+        },
+        "dist/extraction/tree-sitter.js": {
+          "accepted": "87bfc4cd6cdc3cbc8406a531edc127ec84cacf770c9251a5bcfeaaf78b61883c",
+          "current": "87bfc4cd6cdc3cbc8406a531edc127ec84cacf770c9251a5bcfeaaf78b61883c"
+        },
+        "dist/extensions/drupal.cgext": {
+          "accepted": "e5ed73bee51524585e4f4da1d5017fdee3037a3fa71d8f08edab6c318fedc59a",
+          "current": "e5ed73bee51524585e4f4da1d5017fdee3037a3fa71d8f08edab6c318fedc59a"
+        },
+        "dist/extensions/drupal-0.1.0.cgext": {
+          "accepted": "e5015747d02fe50d6af607b6c44f1db9cf7969a0070866ed03c7643377a459c8",
+          "current": "e5015747d02fe50d6af607b6c44f1db9cf7969a0070866ed03c7643377a459c8"
+        },
+        "dist/extensions/drupal-0.1.1.cgext": {
+          "accepted": "e5ed73bee51524585e4f4da1d5017fdee3037a3fa71d8f08edab6c318fedc59a",
+          "current": "e5ed73bee51524585e4f4da1d5017fdee3037a3fa71d8f08edab6c318fedc59a"
+        }
+      },
+      "changed": {
+        "marketplace/cloudflare/.build/worker.js": {
+          "accepted": "981f24d6518908fa33259a3e3e8cb4d3d6d9a073446ccfa3132c1a98c52e7cb9",
+          "current": "7d4cf7fcebec3d6a78ea1dc7a139b74adf400a318dbf7374149359e4b14825f1"
+        }
+      }
+    }
+  },
+  "commands": [
+    {
+      "name": "source-budget-access",
+      "receipt": ".qa/recovery/source-budget-access.json",
+      "receiptSha256": "e36c427078e3cd0e3593b0065f6ebf6cc4a67eebdda36c74bd093b7b5e80c8e9",
+      "log": ".qa/recovery/source-budget-access.log",
+      "logSha256": "8a2d694d69eca3774b161b9f526424131cf4ee75f5f8490257d3de122f2320a4",
+      "body": {
+        "command": [
+          "env",
+          "CLOUDFLARE_ACCOUNT_ID=7d98d729ba8b090125fe2d6aab88135a",
+          "WRANGLER_LOG_PATH=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/hosted/wrangler",
+          "node",
+          "marketplace/cloudflare/node_modules/wrangler/bin/wrangler.js",
+          "whoami"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-23T04:08:22.664755+00:00",
+        "revision": "ca6c375993317640f592d1ecc149f5aa48116885",
+        "working_tree": " M marketplace/cloudflare/.gitignore\n",
+        "exit_code": 1,
+        "seconds": 2.184,
+        "finished_at": "2026-09-23T04:08:24.848743+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-browser-first",
+      "receipt": ".qa/recovery/source-budget-browser-first.json",
+      "receiptSha256": "c87ea62418f5acb3068e44cd32e6e41e69a23470978fa1ec43839c9dfd51dd7d",
+      "log": ".qa/recovery/source-budget-browser-first.log",
+      "logSha256": "dfcbbffae0572403e11d95b23c806c3804320b2cd2c9d821a87d3e59812c3f71",
+      "body": {
+        "command": [
+          "env",
+          "PLAYWRIGHT_MODULE=./.qa/browser/node_modules/playwright",
+          "node",
+          "scripts/validation/marketplace-source-browser.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-23T04:00:15.311793+00:00",
+        "revision": "d971e06fade2876225208f604b73975fa8491743",
+        "working_tree": " M marketplace/cloudflare/local.mjs\n M marketplace/cloudflare/official-test.mjs\n M marketplace/cloudflare/official.mjs\n M marketplace/cloudflare/test-child.mjs\n M marketplace/cloudflare/test-worker.ts\n M marketplace/cloudflare/test.mjs\n M marketplace/cloudflare/worker.ts\n M marketplace/public/app.js\n M marketplace/public/style.css\n M scripts/validation/cloudflare-registry.cjs\n M scripts/validation/extensions-compatibility.cjs\n M scripts/validation/marketplace-browser.cjs\n?? marketplace/cloudflare/review-source.mjs\n?? marketplace/cloudflare/source-test.mjs\n?? marketplace/source-review.cjs\n?? marketplace/source-reviews.json\n?? scripts/validation/marketplace-source-browser.cjs\n",
+        "exit_code": 1,
+        "seconds": 0.075,
+        "finished_at": "2026-09-23T04:00:15.386299+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-browser-fourth",
+      "receipt": ".qa/recovery/source-budget-browser-fourth.json",
+      "receiptSha256": "831731fb259d8c9f7bc5fda8f716c7d053dda1fffa1d9a6e0f0fcc4f8b27e4d1",
+      "log": ".qa/recovery/source-budget-browser-fourth.log",
+      "logSha256": "96e6e1d283b7e9ab64c0de9d4fdb41ce0a6f68cbe7a0b25f46c452b9bc3bc968",
+      "body": {
+        "command": [
+          "env",
+          "SOURCE_BROWSER_OUTPUT=.qa/source-budget/browser-final",
+          "PLAYWRIGHT_MODULE=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/browser-tools/node_modules/playwright",
+          "node",
+          "scripts/validation/marketplace-source-browser.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-23T04:02:14.415037+00:00",
+        "revision": "d971e06fade2876225208f604b73975fa8491743",
+        "working_tree": " M marketplace/cloudflare/local.mjs\n M marketplace/cloudflare/official-test.mjs\n M marketplace/cloudflare/official.mjs\n M marketplace/cloudflare/test-child.mjs\n M marketplace/cloudflare/test-worker.ts\n M marketplace/cloudflare/test.mjs\n M marketplace/cloudflare/worker.ts\n M marketplace/public/app.js\n M marketplace/public/style.css\n M scripts/validation/cloudflare-registry.cjs\n M scripts/validation/extensions-compatibility.cjs\n M scripts/validation/marketplace-browser.cjs\n?? marketplace/cloudflare/review-source.mjs\n?? marketplace/cloudflare/source-test.mjs\n?? marketplace/source-review.cjs\n?? marketplace/source-reviews.json\n?? scripts/validation/marketplace-source-browser.cjs\n",
+        "exit_code": 0,
+        "seconds": 15.35,
+        "finished_at": "2026-09-23T04:02:29.766539+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-browser-second",
+      "receipt": ".qa/recovery/source-budget-browser-second.json",
+      "receiptSha256": "f5b92180c7a41f2a39d0789ed88a1e6131ed3cdc9e1c7c2319eb14d7dc13ef94",
+      "log": ".qa/recovery/source-budget-browser-second.log",
+      "logSha256": "8107e4ed0667f410a409228e9439ee16b716dfe7464f5737a4f77e4ead12827c",
+      "body": {
+        "command": [
+          "env",
+          "PLAYWRIGHT_MODULE=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/browser/node_modules/playwright",
+          "node",
+          "scripts/validation/marketplace-source-browser.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-23T04:00:29.829656+00:00",
+        "revision": "d971e06fade2876225208f604b73975fa8491743",
+        "working_tree": " M marketplace/cloudflare/local.mjs\n M marketplace/cloudflare/official-test.mjs\n M marketplace/cloudflare/official.mjs\n M marketplace/cloudflare/test-child.mjs\n M marketplace/cloudflare/test-worker.ts\n M marketplace/cloudflare/test.mjs\n M marketplace/cloudflare/worker.ts\n M marketplace/public/app.js\n M marketplace/public/style.css\n M scripts/validation/cloudflare-registry.cjs\n M scripts/validation/extensions-compatibility.cjs\n M scripts/validation/marketplace-browser.cjs\n?? marketplace/cloudflare/review-source.mjs\n?? marketplace/cloudflare/source-test.mjs\n?? marketplace/source-review.cjs\n?? marketplace/source-reviews.json\n?? scripts/validation/marketplace-source-browser.cjs\n",
+        "exit_code": 1,
+        "seconds": 0.085,
+        "finished_at": "2026-09-23T04:00:29.914130+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-browser-third",
+      "receipt": ".qa/recovery/source-budget-browser-third.json",
+      "receiptSha256": "4de92c1c154e2b85f4b220a945fec699f2c578bc3c1909bfbd66eb256a6facd2",
+      "log": ".qa/recovery/source-budget-browser-third.log",
+      "logSha256": "682309e2461d87f5682db896dba84632987131264890e43735b9adb5d17ba538",
+      "body": {
+        "command": [
+          "env",
+          "PLAYWRIGHT_MODULE=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/browser-tools/node_modules/playwright",
+          "node",
+          "scripts/validation/marketplace-source-browser.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-23T04:00:50.187632+00:00",
+        "revision": "d971e06fade2876225208f604b73975fa8491743",
+        "working_tree": " M marketplace/cloudflare/local.mjs\n M marketplace/cloudflare/official-test.mjs\n M marketplace/cloudflare/official.mjs\n M marketplace/cloudflare/test-child.mjs\n M marketplace/cloudflare/test-worker.ts\n M marketplace/cloudflare/test.mjs\n M marketplace/cloudflare/worker.ts\n M marketplace/public/app.js\n M marketplace/public/style.css\n M scripts/validation/cloudflare-registry.cjs\n M scripts/validation/extensions-compatibility.cjs\n M scripts/validation/marketplace-browser.cjs\n?? marketplace/cloudflare/review-source.mjs\n?? marketplace/cloudflare/source-test.mjs\n?? marketplace/source-review.cjs\n?? marketplace/source-reviews.json\n?? scripts/validation/marketplace-source-browser.cjs\n",
+        "exit_code": 1,
+        "seconds": 37.671,
+        "finished_at": "2026-09-23T04:01:27.858928+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-build-final",
+      "receipt": ".qa/recovery/source-budget-build-final.json",
+      "receiptSha256": "ea49570845145820973e1ca87e706db04602380d0e64148a5426cf7c2ebc00a0",
+      "log": ".qa/recovery/source-budget-build-final.log",
+      "logSha256": "822e1b890c2b4be9819cecd10c9a8234d31ba024fa17ee3890a3e8ab2317d978",
+      "body": {
+        "command": [
+          "npm",
+          "--prefix",
+          "marketplace/cloudflare",
+          "run",
+          "build"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-23T04:05:47.295625+00:00",
+        "revision": "d971e06fade2876225208f604b73975fa8491743",
+        "working_tree": " M CHANGELOG.md\n M marketplace/cloudflare/local.mjs\n M marketplace/cloudflare/official-test.mjs\n M marketplace/cloudflare/official.mjs\n M marketplace/cloudflare/test-child.mjs\n M marketplace/cloudflare/test-worker.ts\n M marketplace/cloudflare/test.mjs\n M marketplace/cloudflare/worker.ts\n M marketplace/public/app.js\n M marketplace/public/style.css\n M scripts/validation/cloudflare-registry.cjs\n M scripts/validation/extensions-compatibility.cjs\n M scripts/validation/marketplace-browser.cjs\n?? docs/extensions/marketplace-budget-and-source.md\n?? marketplace/cloudflare/review-source.mjs\n?? marketplace/cloudflare/source-test.mjs\n?? marketplace/source-review.cjs\n?? marketplace/source-reviews.json\n?? scripts/validation/marketplace-budget.cjs\n?? scripts/validation/marketplace-source-browser.cjs\n",
+        "exit_code": 0,
+        "seconds": 0.614,
+        "finished_at": "2026-09-23T04:05:47.910011+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-build-second",
+      "receipt": ".qa/recovery/source-budget-build-second.json",
+      "receiptSha256": "9bc304e344c511d423cb15aea48f0420e977093a6b2ff2e1617162a018858a22",
+      "log": ".qa/recovery/source-budget-build-second.log",
+      "logSha256": "822e1b890c2b4be9819cecd10c9a8234d31ba024fa17ee3890a3e8ab2317d978",
+      "body": {
+        "command": [
+          "npm",
+          "--prefix",
+          "marketplace/cloudflare",
+          "run",
+          "build"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-23T03:56:52.709931+00:00",
+        "revision": "d971e06fade2876225208f604b73975fa8491743",
+        "working_tree": " M marketplace/cloudflare/local.mjs\n M marketplace/cloudflare/official.mjs\n M marketplace/cloudflare/test-worker.ts\n M marketplace/cloudflare/worker.ts\n M marketplace/public/app.js\n M marketplace/public/style.css\n?? marketplace/cloudflare/review-source.mjs\n?? marketplace/cloudflare/source-test.mjs\n?? marketplace/source-review.cjs\n?? marketplace/source-reviews.json\n",
+        "exit_code": 0,
+        "seconds": 0.458,
+        "finished_at": "2026-09-23T03:56:53.168187+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-build-third",
+      "receipt": ".qa/recovery/source-budget-build-third.json",
+      "receiptSha256": "1d855c85863a9acbed3642af58c1ff97cfefd3366928d1c81280eae00b9d8f40",
+      "log": ".qa/recovery/source-budget-build-third.log",
+      "logSha256": "822e1b890c2b4be9819cecd10c9a8234d31ba024fa17ee3890a3e8ab2317d978",
+      "body": {
+        "command": [
+          "npm",
+          "--prefix",
+          "marketplace/cloudflare",
+          "run",
+          "build"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-23T03:58:29.356804+00:00",
+        "revision": "d971e06fade2876225208f604b73975fa8491743",
+        "working_tree": " M marketplace/cloudflare/local.mjs\n M marketplace/cloudflare/official-test.mjs\n M marketplace/cloudflare/official.mjs\n M marketplace/cloudflare/test-child.mjs\n M marketplace/cloudflare/test-worker.ts\n M marketplace/cloudflare/test.mjs\n M marketplace/cloudflare/worker.ts\n M marketplace/public/app.js\n M marketplace/public/style.css\n M scripts/validation/cloudflare-registry.cjs\n M scripts/validation/extensions-compatibility.cjs\n M scripts/validation/marketplace-browser.cjs\n?? marketplace/cloudflare/review-source.mjs\n?? marketplace/cloudflare/source-test.mjs\n?? marketplace/source-review.cjs\n?? marketplace/source-reviews.json\n",
+        "exit_code": 0,
+        "seconds": 0.565,
+        "finished_at": "2026-09-23T03:58:29.921392+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-build",
+      "receipt": ".qa/recovery/source-budget-build.json",
+      "receiptSha256": "d5669a1d707af6684107181befc98c224bcad0f4add9df1f11cefa988ce60f4a",
+      "log": ".qa/recovery/source-budget-build.log",
+      "logSha256": "822e1b890c2b4be9819cecd10c9a8234d31ba024fa17ee3890a3e8ab2317d978",
+      "body": {
+        "command": [
+          "npm",
+          "--prefix",
+          "marketplace/cloudflare",
+          "run",
+          "build"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-23T03:55:39.880042+00:00",
+        "revision": "d971e06fade2876225208f604b73975fa8491743",
+        "working_tree": " M marketplace/cloudflare/official.mjs\n M marketplace/cloudflare/worker.ts\n M marketplace/public/app.js\n M marketplace/public/style.css\n?? marketplace/cloudflare/review-source.mjs\n?? marketplace/source-review.cjs\n?? marketplace/source-reviews.json\n",
+        "exit_code": 0,
+        "seconds": 0.633,
+        "finished_at": "2026-09-23T03:55:40.513089+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-committed-browser",
+      "receipt": ".qa/recovery/source-budget-committed-browser.json",
+      "receiptSha256": "ac496baafe80dcaec12459461fa8a74e8d408b8563216d2ceddc933061e2b63b",
+      "log": ".qa/recovery/source-budget-committed-browser.log",
+      "logSha256": "96e6e1d283b7e9ab64c0de9d4fdb41ce0a6f68cbe7a0b25f46c452b9bc3bc968",
+      "body": {
+        "command": [
+          "env",
+          "SOURCE_BROWSER_OUTPUT=.qa/source-budget/committed-browser",
+          "PLAYWRIGHT_MODULE=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/browser-tools/node_modules/playwright",
+          "node",
+          "scripts/validation/marketplace-source-browser.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-23T04:06:17.678019+00:00",
+        "revision": "ca6c375993317640f592d1ecc149f5aa48116885",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 15.062,
+        "finished_at": "2026-09-23T04:06:32.740559+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-compatibility",
+      "receipt": ".qa/recovery/source-budget-compatibility.json",
+      "receiptSha256": "c20199baca37438d686cede3bd3ae9413d02ee324623cfca14c5719eba782372",
+      "log": ".qa/recovery/source-budget-compatibility.log",
+      "logSha256": "f2eccb232f97a9cbabb00527ba7da4b97c052dde26b5cc5070156c11310b06f9",
+      "body": {
+        "command": [
+          "env",
+          "CLOUDFLARE_REGISTRY=1",
+          "COMPATIBILITY_OUTPUT=.qa/source-budget/compatibility",
+          "PLAYWRIGHT_MODULE=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/browser-tools/node_modules/playwright",
+          "node",
+          "scripts/validation/extensions-compatibility.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-23T04:06:32.826754+00:00",
+        "revision": "ca6c375993317640f592d1ecc149f5aa48116885",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 35.924,
+        "finished_at": "2026-09-23T04:07:08.750840+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-cost-final",
+      "receipt": ".qa/recovery/source-budget-cost-final.json",
+      "receiptSha256": "6ec61fb06ad5eb78f85d5945774a7fe1ca997dc29b42a838e6e2d15cb2944552",
+      "log": ".qa/recovery/source-budget-cost-final.log",
+      "logSha256": "e007e64e85495b51f292855dcae02ad8c4cb4b1c2fb7556fcf9a8adf6d1088f4",
+      "body": {
+        "command": [
+          "node",
+          "scripts/validation/marketplace-budget.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-23T04:10:07.585244+00:00",
+        "revision": "ca6c375993317640f592d1ecc149f5aa48116885",
+        "working_tree": " M CHANGELOG.md\n M docs/extensions/marketplace-budget-and-source.md\n M marketplace/cloudflare/.gitignore\n?? scripts/validation/marketplace-source-hosted-readonly.cjs\n",
+        "exit_code": 0,
+        "seconds": 0.07,
+        "finished_at": "2026-09-23T04:10:07.654953+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-cost",
+      "receipt": ".qa/recovery/source-budget-cost.json",
+      "receiptSha256": "f2de04074d94aa9fbdd7b7806d26a2a2eaa5ca7bf2f3405c4aea633bdaf13e00",
+      "log": ".qa/recovery/source-budget-cost.log",
+      "logSha256": "e007e64e85495b51f292855dcae02ad8c4cb4b1c2fb7556fcf9a8adf6d1088f4",
+      "body": {
+        "command": [
+          "node",
+          "scripts/validation/marketplace-budget.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-23T04:04:11.218551+00:00",
+        "revision": "d971e06fade2876225208f604b73975fa8491743",
+        "working_tree": " M marketplace/cloudflare/local.mjs\n M marketplace/cloudflare/official-test.mjs\n M marketplace/cloudflare/official.mjs\n M marketplace/cloudflare/test-child.mjs\n M marketplace/cloudflare/test-worker.ts\n M marketplace/cloudflare/test.mjs\n M marketplace/cloudflare/worker.ts\n M marketplace/public/app.js\n M marketplace/public/style.css\n M scripts/validation/cloudflare-registry.cjs\n M scripts/validation/extensions-compatibility.cjs\n M scripts/validation/marketplace-browser.cjs\n?? docs/extensions/marketplace-budget-and-source.md\n?? marketplace/cloudflare/review-source.mjs\n?? marketplace/cloudflare/source-test.mjs\n?? marketplace/source-review.cjs\n?? marketplace/source-reviews.json\n?? scripts/validation/marketplace-budget.cjs\n?? scripts/validation/marketplace-source-browser.cjs\n",
+        "exit_code": 0,
+        "seconds": 0.071,
+        "finished_at": "2026-09-23T04:04:11.289205+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-https-readonly",
+      "receipt": ".qa/recovery/source-budget-https-readonly.json",
+      "receiptSha256": "023207dbd485a80331b2abf579a8f06895344c752f488153a4a028fd76547585",
+      "log": ".qa/recovery/source-budget-https-readonly.log",
+      "logSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "body": {
+        "command": [
+          "env",
+          "PLAYWRIGHT_MODULE=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/browser-tools/node_modules/playwright",
+          "node",
+          "scripts/validation/marketplace-source-hosted-readonly.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-23T04:09:24.618046+00:00",
+        "revision": "ca6c375993317640f592d1ecc149f5aa48116885",
+        "working_tree": " M marketplace/cloudflare/.gitignore\n?? scripts/validation/marketplace-source-hosted-readonly.cjs\n",
+        "exit_code": 0,
+        "seconds": 3.403,
+        "finished_at": "2026-09-23T04:09:28.020858+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-package-regression-corrected",
+      "receipt": ".qa/recovery/source-budget-package-regression-corrected.json",
+      "receiptSha256": "774fcb55c41b6c68e655244946aea1ecdb7b7ebd640266501e7cc96639f73a86",
+      "log": ".qa/recovery/source-budget-package-regression-corrected.log",
+      "logSha256": "834313159043e900238775ebe51c851f49d6bf4530f6d31954c9fa6f751eba13",
+      "body": {
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "__tests__/extension-package-portable.test.ts",
+          "__tests__/extension-marketplace.test.ts",
+          "__tests__/extension-releases.test.ts",
+          "--maxWorkers=1",
+          "--no-file-parallelism"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-23T04:07:08.401527+00:00",
+        "revision": "ca6c375993317640f592d1ecc149f5aa48116885",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 8.703,
+        "finished_at": "2026-09-23T04:07:17.104801+00:00",
+        "summary": [
+          "Test Files  3 passed (3)",
+          "Tests  16 passed (16)",
+          "Duration  5.04s (transform 660ms, setup 0ms, collect 1.31s, tests 1.10s, environment 1ms, prepare 907ms)"
+        ]
+      }
+    },
+    {
+      "name": "source-budget-package-regression",
+      "receipt": ".qa/recovery/source-budget-package-regression.json",
+      "receiptSha256": "5315d44a40a7bc14b16ffce691e699a5bab4c092478a9de876c542f8f7964849",
+      "log": ".qa/recovery/source-budget-package-regression.log",
+      "logSha256": "579501b9409bf40b14140dc33f28e0803d0d74517e6ab9d3da6651545b5d20ca",
+      "body": {
+        "command": [
+          "node",
+          "node_modules/vitest/vitest.mjs",
+          "run",
+          "__tests__/plugins-package.test.ts",
+          "__tests__/plugins-marketplace.test.ts",
+          "--maxWorkers=1",
+          "--no-file-parallelism"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-23T04:06:17.689676+00:00",
+        "revision": "ca6c375993317640f592d1ecc149f5aa48116885",
+        "working_tree": "",
+        "exit_code": 1,
+        "seconds": 3.76,
+        "finished_at": "2026-09-23T04:06:21.449958+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-provider-before",
+      "receipt": ".qa/recovery/source-budget-provider-before.json",
+      "receiptSha256": "0cf9efad64110512912bbf9b378af92ce8b09d74e7bb7389b16821ddaabc51a9",
+      "log": ".qa/recovery/source-budget-provider-before.log",
+      "logSha256": "70567c28dd390f8b78b8589946bb7bc72abf96d27b08b6a327d7a0dd14007008",
+      "body": {
+        "command": [
+          "env",
+          "CLOUDFLARE_ACCOUNT_ID=7d98d729ba8b090125fe2d6aab88135a",
+          "WRANGLER_LOG_PATH=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/hosted/wrangler",
+          "node",
+          "marketplace/cloudflare/node_modules/wrangler/bin/wrangler.js",
+          "deployments",
+          "list",
+          "--config",
+          "marketplace/cloudflare/wrangler.deploy.json",
+          "--json"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-23T04:07:09.479622+00:00",
+        "revision": "ca6c375993317640f592d1ecc149f5aa48116885",
+        "working_tree": "",
+        "exit_code": 1,
+        "seconds": 5.517,
+        "finished_at": "2026-09-23T04:07:14.996601+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-public-review",
+      "receipt": ".qa/recovery/source-budget-public-review.json",
+      "receiptSha256": "031213b1e434358f4feed87c819e98b6c569aa6aacd4243703e3b9a651778c4b",
+      "log": ".qa/recovery/source-budget-public-review.log",
+      "logSha256": "72474ab44ef1da825b205b9294d01eed80c3627916358c428094c06b9a1912ad",
+      "body": {
+        "command": [
+          "node",
+          "marketplace/cloudflare/review-source.mjs",
+          "extensions/drupal/releases/drupal-0.1.0.cgext",
+          "https://github.com/colbymchenry/codegraph",
+          "d971e06fade2876225208f604b73975fa8491743",
+          "extensions/drupal/releases/drupal-0.1.0.cgext",
+          "codegraph",
+          ".qa/source-budget/public-drupal-review.json"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-23T04:00:29.812462+00:00",
+        "revision": "d971e06fade2876225208f604b73975fa8491743",
+        "working_tree": " M marketplace/cloudflare/local.mjs\n M marketplace/cloudflare/official-test.mjs\n M marketplace/cloudflare/official.mjs\n M marketplace/cloudflare/test-child.mjs\n M marketplace/cloudflare/test-worker.ts\n M marketplace/cloudflare/test.mjs\n M marketplace/cloudflare/worker.ts\n M marketplace/public/app.js\n M marketplace/public/style.css\n M scripts/validation/cloudflare-registry.cjs\n M scripts/validation/extensions-compatibility.cjs\n M scripts/validation/marketplace-browser.cjs\n?? marketplace/cloudflare/review-source.mjs\n?? marketplace/cloudflare/source-test.mjs\n?? marketplace/source-review.cjs\n?? marketplace/source-reviews.json\n?? scripts/validation/marketplace-source-browser.cjs\n",
+        "exit_code": 0,
+        "seconds": 1.022,
+        "finished_at": "2026-09-23T04:00:30.834109+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-publisher",
+      "receipt": ".qa/recovery/source-budget-publisher.json",
+      "receiptSha256": "e248ec7f9433d773c4f8404185eca378a1eddce25a0ac2aae4740ce14c27de39",
+      "log": ".qa/recovery/source-budget-publisher.log",
+      "logSha256": "504e7a0b0596809609b05080f93f7742d48811c45ee2ad1190aef30bef34c2c4",
+      "body": {
+        "command": [
+          "env",
+          "CLOUDFLARE_REGISTRY=1",
+          "BROWSER_OUTPUT=.qa/source-budget/publisher",
+          "PLAYWRIGHT_MODULE=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/browser-tools/node_modules/playwright",
+          "node",
+          "scripts/validation/marketplace-browser.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-23T04:07:08.852940+00:00",
+        "revision": "ca6c375993317640f592d1ecc149f5aa48116885",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 29.47,
+        "finished_at": "2026-09-23T04:07:38.322937+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-ui-dryrun",
+      "receipt": ".qa/recovery/source-budget-ui-dryrun.json",
+      "receiptSha256": "9a1afff00381a6e8bee4b053b643fd91faff085a389d3a355d95ed270749e550",
+      "log": ".qa/recovery/source-budget-ui-dryrun.log",
+      "logSha256": "18366293400f50d38ad9f5e566f90786c856d0607e1041e80fc667ad1d813c7f",
+      "body": {
+        "command": [
+          "env",
+          "CLOUDFLARE_ACCOUNT_ID=7d98d729ba8b090125fe2d6aab88135a",
+          "WRANGLER_LOG_PATH=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/hosted/wrangler",
+          "node",
+          "marketplace/cloudflare/node_modules/wrangler/bin/wrangler.js",
+          "deploy",
+          "--dry-run",
+          "--config",
+          "marketplace/cloudflare/wrangler.source-ui.json",
+          "--outdir",
+          "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/source-budget/ui-dryrun"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-23T04:07:41.347265+00:00",
+        "revision": "ca6c375993317640f592d1ecc149f5aa48116885",
+        "working_tree": " M marketplace/cloudflare/.gitignore\n",
+        "exit_code": 0,
+        "seconds": 2.485,
+        "finished_at": "2026-09-23T04:07:43.832017+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-committed-official",
+      "receipt": "marketplace/cloudflare/.qa/recovery/source-budget-committed-official.json",
+      "receiptSha256": "27ee888d869a47dfaab877a75fbf3fa52768ae7de83fd0e7a28db12ef78c6321",
+      "log": "marketplace/cloudflare/.qa/recovery/source-budget-committed-official.log",
+      "logSha256": "44dffd767d6dca45bc9da582426fe35c1276af21266ae0b8fb2cff33d0d02909",
+      "body": {
+        "command": [
+          "env",
+          "OFFICIAL_OUTPUT=../../.qa/source-budget/committed-official",
+          "node",
+          "official-test.mjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/marketplace/cloudflare",
+        "started_at": "2026-09-23T04:06:48.033822+00:00",
+        "revision": "ca6c375993317640f592d1ecc149f5aa48116885",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 20.532,
+        "finished_at": "2026-09-23T04:07:08.566045+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-committed-policy",
+      "receipt": "marketplace/cloudflare/.qa/recovery/source-budget-committed-policy.json",
+      "receiptSha256": "e234809bd21405b9ccf7d4f5738890f4e8ecda404c32317919e7873b85831736",
+      "log": "marketplace/cloudflare/.qa/recovery/source-budget-committed-policy.log",
+      "logSha256": "5ca2901193f36f8f8e2021a9713c7b0c9eeb167ed811931695493ef375da1972",
+      "body": {
+        "command": [
+          "env",
+          "SOURCE_OUTPUT=../../.qa/source-budget/committed-policy",
+          "node",
+          "source-test.mjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/marketplace/cloudflare",
+        "started_at": "2026-09-23T04:06:17.646981+00:00",
+        "revision": "ca6c375993317640f592d1ecc149f5aa48116885",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 4.978,
+        "finished_at": "2026-09-23T04:06:22.624822+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-committed-runtime",
+      "receipt": "marketplace/cloudflare/.qa/recovery/source-budget-committed-runtime.json",
+      "receiptSha256": "09f30cbdaeeda5e3440e808ca6b91390ec1e2d7d3d7bebe3e93da231c528493f",
+      "log": "marketplace/cloudflare/.qa/recovery/source-budget-committed-runtime.log",
+      "logSha256": "e1a29f5e9eebe1ed3e15b68f964471b4d07c12370aeec58faeb2b0b050457fdb",
+      "body": {
+        "command": [
+          "env",
+          "CLOUDFLARE_OUTPUT=../../.qa/source-budget/committed-runtime",
+          "node",
+          "test.mjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/marketplace/cloudflare",
+        "started_at": "2026-09-23T04:06:22.703208+00:00",
+        "revision": "ca6c375993317640f592d1ecc149f5aa48116885",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 25.127,
+        "finished_at": "2026-09-23T04:06:47.831091+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-deadline",
+      "receipt": "marketplace/cloudflare/.qa/recovery/source-budget-deadline.json",
+      "receiptSha256": "4124486a0197d4d59ef1204dddf24bc5ed3ff6b5f701c8e7d8b13f1d910f2285",
+      "log": "marketplace/cloudflare/.qa/recovery/source-budget-deadline.log",
+      "logSha256": "00681723315df1e4dc81283241e0c6dea08047155fd57d10debd633de8f1d7ae",
+      "body": {
+        "command": [
+          "node",
+          "publication-window-test.mjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/marketplace/cloudflare",
+        "started_at": "2026-09-23T04:07:08.634485+00:00",
+        "revision": "ca6c375993317640f592d1ecc149f5aa48116885",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 13.409,
+        "finished_at": "2026-09-23T04:07:22.043126+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-guards",
+      "receipt": "marketplace/cloudflare/.qa/recovery/source-budget-guards.json",
+      "receiptSha256": "8a65dfdff7d635f880df741bcf5c76705a1c50fc498d9db90adf3021eef62f8d",
+      "log": "marketplace/cloudflare/.qa/recovery/source-budget-guards.log",
+      "logSha256": "a43287e2839fcfeda397d8567213ddf062cd1cecab341497637c55149f4ed7b9",
+      "body": {
+        "command": [
+          "node",
+          "hosted-ops-test.mjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/marketplace/cloudflare",
+        "started_at": "2026-09-23T04:07:22.089895+00:00",
+        "revision": "ca6c375993317640f592d1ecc149f5aa48116885",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 2.244,
+        "finished_at": "2026-09-23T04:07:24.334268+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-official",
+      "receipt": "marketplace/cloudflare/.qa/recovery/source-budget-official.json",
+      "receiptSha256": "21b72319400e263e1e9a9e5a98895abc49150e30878800750fcfe4abf4611e78",
+      "log": "marketplace/cloudflare/.qa/recovery/source-budget-official.log",
+      "logSha256": "44dffd767d6dca45bc9da582426fe35c1276af21266ae0b8fb2cff33d0d02909",
+      "body": {
+        "command": [
+          "env",
+          "OFFICIAL_OUTPUT=../../.qa/source-budget/official",
+          "node",
+          "official-test.mjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/marketplace/cloudflare",
+        "started_at": "2026-09-23T04:00:33.050563+00:00",
+        "revision": "d971e06fade2876225208f604b73975fa8491743",
+        "working_tree": " M marketplace/cloudflare/local.mjs\n M marketplace/cloudflare/official-test.mjs\n M marketplace/cloudflare/official.mjs\n M marketplace/cloudflare/test-child.mjs\n M marketplace/cloudflare/test-worker.ts\n M marketplace/cloudflare/test.mjs\n M marketplace/cloudflare/worker.ts\n M marketplace/public/app.js\n M marketplace/public/style.css\n M scripts/validation/cloudflare-registry.cjs\n M scripts/validation/extensions-compatibility.cjs\n M scripts/validation/marketplace-browser.cjs\n?? marketplace/cloudflare/review-source.mjs\n?? marketplace/cloudflare/source-test.mjs\n?? marketplace/source-review.cjs\n?? marketplace/source-reviews.json\n?? scripts/validation/marketplace-source-browser.cjs\n",
+        "exit_code": 0,
+        "seconds": 12.998,
+        "finished_at": "2026-09-23T04:00:46.049010+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-policy-final",
+      "receipt": "marketplace/cloudflare/.qa/recovery/source-budget-policy-final.json",
+      "receiptSha256": "11782d7b36de110489a59b87fd3132addef62d9fcbf54af9a11b2a5cc5c79884",
+      "log": "marketplace/cloudflare/.qa/recovery/source-budget-policy-final.log",
+      "logSha256": "5ca2901193f36f8f8e2021a9713c7b0c9eeb167ed811931695493ef375da1972",
+      "body": {
+        "command": [
+          "node",
+          "source-test.mjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/marketplace/cloudflare",
+        "started_at": "2026-09-23T04:00:29.847491+00:00",
+        "revision": "d971e06fade2876225208f604b73975fa8491743",
+        "working_tree": " M marketplace/cloudflare/local.mjs\n M marketplace/cloudflare/official-test.mjs\n M marketplace/cloudflare/official.mjs\n M marketplace/cloudflare/test-child.mjs\n M marketplace/cloudflare/test-worker.ts\n M marketplace/cloudflare/test.mjs\n M marketplace/cloudflare/worker.ts\n M marketplace/public/app.js\n M marketplace/public/style.css\n M scripts/validation/cloudflare-registry.cjs\n M scripts/validation/extensions-compatibility.cjs\n M scripts/validation/marketplace-browser.cjs\n?? marketplace/cloudflare/review-source.mjs\n?? marketplace/cloudflare/source-test.mjs\n?? marketplace/source-review.cjs\n?? marketplace/source-reviews.json\n?? scripts/validation/marketplace-source-browser.cjs\n",
+        "exit_code": 0,
+        "seconds": 3.152,
+        "finished_at": "2026-09-23T04:00:32.999415+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-policy",
+      "receipt": "marketplace/cloudflare/.qa/recovery/source-budget-policy.json",
+      "receiptSha256": "dcfe56554fd861afbf618b9a15bd2d51a379127ff1e220e3de41da1c4b87423d",
+      "log": "marketplace/cloudflare/.qa/recovery/source-budget-policy.log",
+      "logSha256": "5ca2901193f36f8f8e2021a9713c7b0c9eeb167ed811931695493ef375da1972",
+      "body": {
+        "command": [
+          "node",
+          "source-test.mjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/marketplace/cloudflare",
+        "started_at": "2026-09-23T03:57:08.151473+00:00",
+        "revision": "d971e06fade2876225208f604b73975fa8491743",
+        "working_tree": " M marketplace/cloudflare/local.mjs\n M marketplace/cloudflare/official.mjs\n M marketplace/cloudflare/test-worker.ts\n M marketplace/cloudflare/worker.ts\n M marketplace/public/app.js\n M marketplace/public/style.css\n?? marketplace/cloudflare/review-source.mjs\n?? marketplace/cloudflare/source-test.mjs\n?? marketplace/source-review.cjs\n?? marketplace/source-reviews.json\n",
+        "exit_code": 0,
+        "seconds": 6.941,
+        "finished_at": "2026-09-23T03:57:15.092293+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-runtime-final",
+      "receipt": "marketplace/cloudflare/.qa/recovery/source-budget-runtime-final.json",
+      "receiptSha256": "3eeb5f9ddf7cd6b83b87800b78048aa3b4ef699cab4eaa563fd088150089a20d",
+      "log": "marketplace/cloudflare/.qa/recovery/source-budget-runtime-final.log",
+      "logSha256": "e1a29f5e9eebe1ed3e15b68f964471b4d07c12370aeec58faeb2b0b050457fdb",
+      "body": {
+        "command": [
+          "env",
+          "CLOUDFLARE_OUTPUT=../../.qa/source-budget/runtime-final",
+          "node",
+          "test.mjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/marketplace/cloudflare",
+        "started_at": "2026-09-23T04:02:15.641814+00:00",
+        "revision": "d971e06fade2876225208f604b73975fa8491743",
+        "working_tree": " M marketplace/cloudflare/local.mjs\n M marketplace/cloudflare/official-test.mjs\n M marketplace/cloudflare/official.mjs\n M marketplace/cloudflare/test-child.mjs\n M marketplace/cloudflare/test-worker.ts\n M marketplace/cloudflare/test.mjs\n M marketplace/cloudflare/worker.ts\n M marketplace/public/app.js\n M marketplace/public/style.css\n M scripts/validation/cloudflare-registry.cjs\n M scripts/validation/extensions-compatibility.cjs\n M scripts/validation/marketplace-browser.cjs\n?? marketplace/cloudflare/review-source.mjs\n?? marketplace/cloudflare/source-test.mjs\n?? marketplace/source-review.cjs\n?? marketplace/source-reviews.json\n?? scripts/validation/marketplace-source-browser.cjs\n",
+        "exit_code": 0,
+        "seconds": 21.767,
+        "finished_at": "2026-09-23T04:02:37.408849+00:00",
+        "summary": []
+      }
+    },
+    {
+      "name": "source-budget-runtime",
+      "receipt": "marketplace/cloudflare/.qa/recovery/source-budget-runtime.json",
+      "receiptSha256": "33e77a98a0c0fb2876d54c4292742e9d5643b2762eecd7568694b4a0fa4b8dd5",
+      "log": "marketplace/cloudflare/.qa/recovery/source-budget-runtime.log",
+      "logSha256": "8129017ebb4d60a600035662c835308cf6f4dc7d287d6414e315914599705f62",
+      "body": {
+        "command": [
+          "env",
+          "CLOUDFLARE_OUTPUT=../../.qa/source-budget/runtime",
+          "node",
+          "test.mjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/marketplace/cloudflare",
+        "started_at": "2026-09-23T04:00:50.204201+00:00",
+        "revision": "d971e06fade2876225208f604b73975fa8491743",
+        "working_tree": " M marketplace/cloudflare/local.mjs\n M marketplace/cloudflare/official-test.mjs\n M marketplace/cloudflare/official.mjs\n M marketplace/cloudflare/test-child.mjs\n M marketplace/cloudflare/test-worker.ts\n M marketplace/cloudflare/test.mjs\n M marketplace/cloudflare/worker.ts\n M marketplace/public/app.js\n M marketplace/public/style.css\n M scripts/validation/cloudflare-registry.cjs\n M scripts/validation/extensions-compatibility.cjs\n M scripts/validation/marketplace-browser.cjs\n?? marketplace/cloudflare/review-source.mjs\n?? marketplace/cloudflare/source-test.mjs\n?? marketplace/source-review.cjs\n?? marketplace/source-reviews.json\n?? scripts/validation/marketplace-source-browser.cjs\n",
+        "exit_code": 1,
+        "seconds": 20.662,
+        "finished_at": "2026-09-23T04:01:10.867752+00:00",
+        "summary": []
+      }
+    }
+  ],
+  "incompleteCommands": [],
+  "raw": {
+    ".qa/recovery/source-budget-access.json": {
+      "sha256": "e36c427078e3cd0e3593b0065f6ebf6cc4a67eebdda36c74bd093b7b5e80c8e9",
+      "bytes": 670
+    },
+    ".qa/recovery/source-budget-access.log": {
+      "sha256": "8a2d694d69eca3774b161b9f526424131cf4ee75f5f8490257d3de122f2320a4",
+      "bytes": 695
+    },
+    ".qa/recovery/source-budget-access.started.json": {
+      "sha256": "5c5b29574b2943f84bff05616e3485ec1df5365a6dc0aafd240514200a120ec4",
+      "bytes": 562
+    },
+    ".qa/recovery/source-budget-browser-first.json": {
+      "sha256": "c87ea62418f5acb3068e44cd32e6e41e69a23470978fa1ec43839c9dfd51dd7d",
+      "bytes": 1190
+    },
+    ".qa/recovery/source-budget-browser-first.log": {
+      "sha256": "dfcbbffae0572403e11d95b23c806c3804320b2cd2c9d821a87d3e59812c3f71",
+      "bytes": 1212
+    },
+    ".qa/recovery/source-budget-browser-first.started.json": {
+      "sha256": "14d3b2d1057408d6d70e476fbaeab729a6cacf0beff18f2888d7d76ab29f41fa",
+      "bytes": 1082
+    },
+    ".qa/recovery/source-budget-browser-fourth.json": {
+      "sha256": "831731fb259d8c9f7bc5fda8f716c7d053dda1fffa1d9a6e0f0fcc4f8b27e4d1",
+      "bytes": 1314
+    },
+    ".qa/recovery/source-budget-browser-fourth.log": {
+      "sha256": "96e6e1d283b7e9ab64c0de9d4fdb41ce0a6f68cbe7a0b25f46c452b9bc3bc968",
+      "bytes": 1925
+    },
+    ".qa/recovery/source-budget-browser-fourth.started.json": {
+      "sha256": "69325f82e8d35d1a921a76de1dee70101a2ab267de671cf75ee6b47ef0015359",
+      "bytes": 1206
+    },
+    ".qa/recovery/source-budget-browser-second.json": {
+      "sha256": "f5b92180c7a41f2a39d0789ed88a1e6131ed3cdc9e1c7c2319eb14d7dc13ef94",
+      "bytes": 1261
+    },
+    ".qa/recovery/source-budget-browser-second.log": {
+      "sha256": "8107e4ed0667f410a409228e9439ee16b716dfe7464f5737a4f77e4ead12827c",
+      "bytes": 1283
+    },
+    ".qa/recovery/source-budget-browser-second.started.json": {
+      "sha256": "23df1b6d2c060bfc973f50e996e132b94a73b396299df36b6b12e89601d49d5e",
+      "bytes": 1153
+    },
+    ".qa/recovery/source-budget-browser-third.json": {
+      "sha256": "4de92c1c154e2b85f4b220a945fec699f2c578bc3c1909bfbd66eb256a6facd2",
+      "bytes": 1254
+    },
+    ".qa/recovery/source-budget-browser-third.log": {
+      "sha256": "682309e2461d87f5682db896dba84632987131264890e43735b9adb5d17ba538",
+      "bytes": 1475
+    },
+    ".qa/recovery/source-budget-browser-third.started.json": {
+      "sha256": "1ef6c7f0ef8709cfb7e9fb0d9cc01e8ac361be011a4d008bdb326336574aa096",
+      "bytes": 1145
+    },
+    ".qa/recovery/source-budget-build-final.json": {
+      "sha256": "ea49570845145820973e1ca87e706db04602380d0e64148a5426cf7c2ebc00a0",
+      "bytes": 1244
+    },
+    ".qa/recovery/source-budget-build-final.log": {
+      "sha256": "822e1b890c2b4be9819cecd10c9a8234d31ba024fa17ee3890a3e8ab2317d978",
+      "bytes": 66
+    },
+    ".qa/recovery/source-budget-build-final.started.json": {
+      "sha256": "17973fdc20ad03e5f79be722901c48533a0e25b669cdab0cf6a86767f84c2e8d",
+      "bytes": 1136
+    },
+    ".qa/recovery/source-budget-build-second.json": {
+      "sha256": "9bc304e344c511d423cb15aea48f0420e977093a6b2ff2e1617162a018858a22",
+      "bytes": 805
+    },
+    ".qa/recovery/source-budget-build-second.log": {
+      "sha256": "822e1b890c2b4be9819cecd10c9a8234d31ba024fa17ee3890a3e8ab2317d978",
+      "bytes": 66
+    },
+    ".qa/recovery/source-budget-build-second.started.json": {
+      "sha256": "1e887e023ddeebc50dd216955dcfe17004ad69382916b26dcc2e11775b25464d",
+      "bytes": 697
+    },
+    ".qa/recovery/source-budget-build-third.json": {
+      "sha256": "1d855c85863a9acbed3642af58c1ff97cfefd3366928d1c81280eae00b9d8f40",
+      "bytes": 1074
+    },
+    ".qa/recovery/source-budget-build-third.log": {
+      "sha256": "822e1b890c2b4be9819cecd10c9a8234d31ba024fa17ee3890a3e8ab2317d978",
+      "bytes": 66
+    },
+    ".qa/recovery/source-budget-build-third.started.json": {
+      "sha256": "4bc33eb91cb6415318ea0bbd0393d76cc31edb9f48730849161cd5042a2b75e0",
+      "bytes": 966
+    },
+    ".qa/recovery/source-budget-build.json": {
+      "sha256": "d5669a1d707af6684107181befc98c224bcad0f4add9df1f11cefa988ce60f4a",
+      "bytes": 683
+    },
+    ".qa/recovery/source-budget-build.log": {
+      "sha256": "822e1b890c2b4be9819cecd10c9a8234d31ba024fa17ee3890a3e8ab2317d978",
+      "bytes": 66
+    },
+    ".qa/recovery/source-budget-build.started.json": {
+      "sha256": "4177094b2f09cd444d6ffc3681c079ca25c69a31997a7a63e072cb1c568d9c51",
+      "bytes": 575
+    },
+    ".qa/recovery/source-budget-committed-browser.json": {
+      "sha256": "ac496baafe80dcaec12459461fa8a74e8d408b8563216d2ceddc933061e2b63b",
+      "bytes": 619
+    },
+    ".qa/recovery/source-budget-committed-browser.log": {
+      "sha256": "96e6e1d283b7e9ab64c0de9d4fdb41ce0a6f68cbe7a0b25f46c452b9bc3bc968",
+      "bytes": 1925
+    },
+    ".qa/recovery/source-budget-committed-browser.started.json": {
+      "sha256": "463d62481041169d0f5fb88cba2af94cf3fd770e35e65adb8bede1a3c52401ac",
+      "bytes": 510
+    },
+    ".qa/recovery/source-budget-compatibility.json": {
+      "sha256": "c20199baca37438d686cede3bd3ae9413d02ee324623cfca14c5719eba782372",
+      "bytes": 641
+    },
+    ".qa/recovery/source-budget-compatibility.log": {
+      "sha256": "f2eccb232f97a9cbabb00527ba7da4b97c052dde26b5cc5070156c11310b06f9",
+      "bytes": 3281
+    },
+    ".qa/recovery/source-budget-compatibility.started.json": {
+      "sha256": "2e536ad77e361ffa3f3dfaaf9865a88c99109898dd2b012540d42e521fcfda27",
+      "bytes": 532
+    },
+    ".qa/recovery/source-budget-cost-final.json": {
+      "sha256": "6ec61fb06ad5eb78f85d5945774a7fe1ca997dc29b42a838e6e2d15cb2944552",
+      "bytes": 577
+    },
+    ".qa/recovery/source-budget-cost-final.log": {
+      "sha256": "e007e64e85495b51f292855dcae02ad8c4cb4b1c2fb7556fcf9a8adf6d1088f4",
+      "bytes": 1152
+    },
+    ".qa/recovery/source-budget-cost-final.started.json": {
+      "sha256": "457b810ba6603c5eec98407f742a0f56183a1eb7469d6f8a988ef411ae21669d",
+      "bytes": 470
+    },
+    ".qa/recovery/source-budget-cost.json": {
+      "sha256": "f2de04074d94aa9fbdd7b7806d26a2a2eaa5ca7bf2f3405c4aea633bdaf13e00",
+      "bytes": 1207
+    },
+    ".qa/recovery/source-budget-cost.log": {
+      "sha256": "e007e64e85495b51f292855dcae02ad8c4cb4b1c2fb7556fcf9a8adf6d1088f4",
+      "bytes": 1152
+    },
+    ".qa/recovery/source-budget-cost.started.json": {
+      "sha256": "2893a5f8a6a9efd65599b549f6cef86484a3716ae103e4e50ea4419a04e6992b",
+      "bytes": 1099
+    },
+    ".qa/recovery/source-budget-https-readonly.json": {
+      "sha256": "023207dbd485a80331b2abf579a8f06895344c752f488153a4a028fd76547585",
+      "bytes": 661
+    },
+    ".qa/recovery/source-budget-https-readonly.log": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    ".qa/recovery/source-budget-https-readonly.started.json": {
+      "sha256": "e0a837cf799c5adbe1a79815ff0ec714ab50db951fa1154d21d06a50c78c83f8",
+      "bytes": 553
+    },
+    ".qa/recovery/source-budget-package-regression-corrected.json": {
+      "sha256": "774fcb55c41b6c68e655244946aea1ecdb7b7ebd640266501e7cc96639f73a86",
+      "bytes": 777
+    },
+    ".qa/recovery/source-budget-package-regression-corrected.log": {
+      "sha256": "834313159043e900238775ebe51c851f49d6bf4530f6d31954c9fa6f751eba13",
+      "bytes": 930
+    },
+    ".qa/recovery/source-budget-package-regression-corrected.started.json": {
+      "sha256": "14b963eb2b2e40758ec878becced2c443c4f43e5a8ec6110884b34b9bb7db4c8",
+      "bytes": 494
+    },
+    ".qa/recovery/source-budget-package-regression.json": {
+      "sha256": "5315d44a40a7bc14b16ffce691e699a5bab4c092478a9de876c542f8f7964849",
+      "bytes": 544
+    },
+    ".qa/recovery/source-budget-package-regression.log": {
+      "sha256": "579501b9409bf40b14140dc33f28e0803d0d74517e6ab9d3da6651545b5d20ca",
+      "bytes": 600
+    },
+    ".qa/recovery/source-budget-package-regression.started.json": {
+      "sha256": "ff845fdd40360f308521bb603952379041dc372f06ae8a02024849a48bc0ce8c",
+      "bytes": 437
+    },
+    ".qa/recovery/source-budget-provider-before.json": {
+      "sha256": "0cf9efad64110512912bbf9b378af92ce8b09d74e7bb7389b16821ddaabc51a9",
+      "bytes": 730
+    },
+    ".qa/recovery/source-budget-provider-before.log": {
+      "sha256": "70567c28dd390f8b78b8589946bb7bc72abf96d27b08b6a327d7a0dd14007008",
+      "bytes": 659
+    },
+    ".qa/recovery/source-budget-provider-before.started.json": {
+      "sha256": "c320ca8dce71edd7269581f05160edb2299eed4231472ab48a601d0b2c9eda9d",
+      "bytes": 622
+    },
+    ".qa/recovery/source-budget-public-review.json": {
+      "sha256": "031213b1e434358f4feed87c819e98b6c569aa6aacd4243703e3b9a651778c4b",
+      "bytes": 1378
+    },
+    ".qa/recovery/source-budget-public-review.log": {
+      "sha256": "72474ab44ef1da825b205b9294d01eed80c3627916358c428094c06b9a1912ad",
+      "bytes": 147
+    },
+    ".qa/recovery/source-budget-public-review.started.json": {
+      "sha256": "c2ac876ec28566604bb2db6ac2e0b859a73a16ca843d1fa6626126aa464a4561",
+      "bytes": 1270
+    },
+    ".qa/recovery/source-budget-publisher.json": {
+      "sha256": "e248ec7f9433d773c4f8404185eca378a1eddce25a0ac2aae4740ce14c27de39",
+      "bytes": 625
+    },
+    ".qa/recovery/source-budget-publisher.log": {
+      "sha256": "504e7a0b0596809609b05080f93f7742d48811c45ee2ad1190aef30bef34c2c4",
+      "bytes": 2441
+    },
+    ".qa/recovery/source-budget-publisher.started.json": {
+      "sha256": "d46c91bf5d50162435ac47872e3722707ba9ba4a090dd50ab070eb4307a2036a",
+      "bytes": 517
+    },
+    ".qa/recovery/source-budget-ui-dryrun.json": {
+      "sha256": "9a1afff00381a6e8bee4b053b643fd91faff085a389d3a355d95ed270749e550",
+      "bytes": 881
+    },
+    ".qa/recovery/source-budget-ui-dryrun.log": {
+      "sha256": "18366293400f50d38ad9f5e566f90786c856d0607e1041e80fc667ad1d813c7f",
+      "bytes": 1156
+    },
+    ".qa/recovery/source-budget-ui-dryrun.started.json": {
+      "sha256": "17389833c16e7536cbf9d95ae085e7d6c4633c798b6af1d3cb7c2ebe3266f8fc",
+      "bytes": 773
+    },
+    ".qa/source-budget/browser/desktop-source.png": {
+      "sha256": "c9eb84a6e29ca121d136dd1dc6a82b71a5c1ee19b3aeece105cae78fbe058f53",
+      "bytes": 148421
+    },
+    ".qa/source-budget/browser/failure.json": {
+      "sha256": "ed32abdab014695395672c7d75a0263c01984b3b7ba4b2712702e0b7d2e26d9d",
+      "bytes": 879
+    },
+    ".qa/source-budget/browser/failure.png": {
+      "sha256": "68628a2486faa52504dcc93d11df64126800b00726a806ffc98ced0e11b5560b",
+      "bytes": 161418
+    },
+    ".qa/source-budget/browser/progress.json": {
+      "sha256": "13c9d8eb6d7f03173b3d1aadabc3867b32a293057676cb9e795c2f35eb1a6341",
+      "bytes": 567
+    },
+    ".qa/source-budget/browser/verified-download.cgext": {
+      "sha256": "9099577f132b1a363398f829cd3c10fda126df42dcf7cb9e8b366e173e7365d3",
+      "bytes": 117810
+    },
+    ".qa/source-budget/browser-final/desktop-source.png": {
+      "sha256": "755443f492a3403ba682819353b43930d0ac84cb2b91740231eed791329adf22",
+      "bytes": 147849
+    },
+    ".qa/source-budget/browser-final/mobile-source.png": {
+      "sha256": "3539b9bfa7aa958109f4a39cfea225977dfae70713a97a93e6bb9f0b957e4415",
+      "bytes": 137494
+    },
+    ".qa/source-budget/browser-final/progress.json": {
+      "sha256": "e8e9002964af8d87ba85d8c5452059ad1f09410385305b900b3e89c89522e485",
+      "bytes": 1070
+    },
+    ".qa/source-budget/browser-final/summary.json": {
+      "sha256": "d706784789319a9d00b0fb4453f6666f89d355bc8516f0d684b08f558c351c7c",
+      "bytes": 1514
+    },
+    ".qa/source-budget/browser-final/verified-download.cgext": {
+      "sha256": "732be8ef075f0188020a2f92e9522ab5db8bf173849f3bb18b84dfaff8297582",
+      "bytes": 117825
+    },
+    ".qa/source-budget/committed-browser/desktop-source.png": {
+      "sha256": "146296358501c20edbf37d0ffce8af99a5e67be042552d3095ccb07202455d2e",
+      "bytes": 150092
+    },
+    ".qa/source-budget/committed-browser/mobile-source.png": {
+      "sha256": "89c10d7d8292c901cc0e6248f0235d65d9f02964a3c71584e386a4bbd90d8e20",
+      "bytes": 139165
+    },
+    ".qa/source-budget/committed-browser/progress.json": {
+      "sha256": "e8e9002964af8d87ba85d8c5452059ad1f09410385305b900b3e89c89522e485",
+      "bytes": 1070
+    },
+    ".qa/source-budget/committed-browser/summary.json": {
+      "sha256": "d706784789319a9d00b0fb4453f6666f89d355bc8516f0d684b08f558c351c7c",
+      "bytes": 1514
+    },
+    ".qa/source-budget/committed-browser/verified-download.cgext": {
+      "sha256": "732be8ef075f0188020a2f92e9522ab5db8bf173849f3bb18b84dfaff8297582",
+      "bytes": 117825
+    },
+    ".qa/source-budget/committed-official/command-1.log": {
+      "sha256": "8dccae29ffc96a576814582e960bbe3d991ebb897f63e5ad6f26dff936b25356",
+      "bytes": 145
+    },
+    ".qa/source-budget/committed-official/command-2.log": {
+      "sha256": "1c50fc5b61fb3e9ad90c65ccda617bcc943bccb8ec0ce9e678a9787b6f96c24e",
+      "bytes": 392
+    },
+    ".qa/source-budget/committed-official/command-3.log": {
+      "sha256": "f13557a940e03312ca474e10a736e7d3ab07214f2cdaef7b9622bbe2c2886d44",
+      "bytes": 62
+    },
+    ".qa/source-budget/committed-official/command-4.log": {
+      "sha256": "699f218b67a06ee1d4342b6922c00dd0a28e28e9c58d3310382ece060d5ada03",
+      "bytes": 1532
+    },
+    ".qa/source-budget/committed-official/progress.json": {
+      "sha256": "541000131d3df41a422c7ce25f4bbdc19f055d29c3b324aa98322d89188f8f1d",
+      "bytes": 3012
+    },
+    ".qa/source-budget/committed-official/result.json": {
+      "sha256": "a7e874a1ebb42d08a6af4dbcdf6ef98687f5e91943bec536d50f4b96e40a123f",
+      "bytes": 3219
+    },
+    ".qa/source-budget/committed-policy/progress.json": {
+      "sha256": "0074aa7c37565b7132d70c4c7242c4423b023763f4cfe32f1d5fa70f66babd5b",
+      "bytes": 887
+    },
+    ".qa/source-budget/committed-policy/summary.json": {
+      "sha256": "54094a5fb020987540f7817ceb8b6f0059050b1b16730aa908f34e7e59d57360",
+      "bytes": 1478
+    },
+    ".qa/source-budget/committed-runtime/child-1.log": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    ".qa/source-budget/committed-runtime/child-2.log": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    ".qa/source-budget/committed-runtime/progress.json": {
+      "sha256": "94bd660f24fbb017366cae1873b953cdd2b9e2ee78a6b46507e1008db69c7a56",
+      "bytes": 1777
+    },
+    ".qa/source-budget/committed-runtime/result.json": {
+      "sha256": "39edcd20f3ffaff9890cb8f02cc52a780212420d31198e33eaaa8d4a6cd33535",
+      "bytes": 2108
+    },
+    ".qa/source-budget/compatibility/command-1.log": {
+      "sha256": "64f1ac60c8ad25f6569563d24914759b70acf1b73e5cffeef4feb12ce4c226b9",
+      "bytes": 243
+    },
+    ".qa/source-budget/compatibility/command-10.log": {
+      "sha256": "f03135c33691b92a8cd0834b0ab07175f81eb68d071d2e495c7ef96f6cbb5e69",
+      "bytes": 143
+    },
+    ".qa/source-budget/compatibility/command-11.log": {
+      "sha256": "08588ddba0b05a3667ca2e4858c6625aaa7cfdd4b248283e284b36ca7bfd3b0f",
+      "bytes": 263
+    },
+    ".qa/source-budget/compatibility/command-12.log": {
+      "sha256": "303e141e174839575e69f0ae0ddf92ead0470e6dca049ac1edd45fb64b607bde",
+      "bytes": 95
+    },
+    ".qa/source-budget/compatibility/command-2.log": {
+      "sha256": "d93afb7d84337fce0fb443fb79883800bb478b4c94635140b8f67f9734ed2b26",
+      "bytes": 293
+    },
+    ".qa/source-budget/compatibility/command-3.log": {
+      "sha256": "78fff926f4f8969d8e1705c0a1271cbd63b822579f81d715c2042ad94c80ad45",
+      "bytes": 122
+    },
+    ".qa/source-budget/compatibility/command-4.log": {
+      "sha256": "83a7b90bfd2c211c6fb4afcf72e261ef7b42bfd6dc21cfb72d530fb970aef44a",
+      "bytes": 290
+    },
+    ".qa/source-budget/compatibility/command-5.log": {
+      "sha256": "5a0ae6eb30e6659515338894feeb98ebeabbcd4f66e01f425110e75e83d7986d",
+      "bytes": 257
+    },
+    ".qa/source-budget/compatibility/command-6.log": {
+      "sha256": "38c1d85e306b15c18732c81df087390b3dfbd3873bc8836e36be492a1fb8a7fa",
+      "bytes": 530
+    },
+    ".qa/source-budget/compatibility/command-7.log": {
+      "sha256": "74798a107028fa391113eb0b6fa7efac8bfee9c644dbb121892993443666f2f0",
+      "bytes": 241
+    },
+    ".qa/source-budget/compatibility/command-8.log": {
+      "sha256": "be1f77d7dd153abaab34b2a75bdd5c2d036b406fc11da38ee8d4362bd4c26387",
+      "bytes": 241
+    },
+    ".qa/source-budget/compatibility/command-9.log": {
+      "sha256": "fec96b4acb520e5ee4d8a42660e9a876f54f08d60c1fc98bcc7b1dcfd2ba6748",
+      "bytes": 142
+    },
+    ".qa/source-budget/compatibility/commands.json": {
+      "sha256": "af330808da3b42c93abdbdf4cdc192ab4d607e37d6b77003b4eddcc9a16dcbf7",
+      "bytes": 4737
+    },
+    ".qa/source-budget/compatibility/desktop-installed.png": {
+      "sha256": "6c413e493693fa32c6a310a4f9c11e2a1c9c3bdd95b2bbc770d76d1596fa24f6",
+      "bytes": 118228
+    },
+    ".qa/source-budget/compatibility/desktop-selected.png": {
+      "sha256": "77786156ea09af4ce929aa3c22c3c840d80e65254926d3ea23fa838c7190a7c0",
+      "bytes": 115174
+    },
+    ".qa/source-budget/compatibility/failure.json": {
+      "sha256": "f6268a019984af2f5a912c6352398ecce4f7fc7a3d0966f22dda8d2654179792",
+      "bytes": 724
+    },
+    ".qa/source-budget/compatibility/failure.png": {
+      "sha256": "b52c00108c57a7ed746c926db05f747b2602c3e00a55e7dba7e364a1210b33f5",
+      "bytes": 117456
+    },
+    ".qa/source-budget/compatibility/metadata-pending.png": {
+      "sha256": "74a05f421735155b6e24efae0f0cdde7b814887693f91220b6965c13d9d0cdfa",
+      "bytes": 91381
+    },
+    ".qa/source-budget/compatibility/mobile-selected.png": {
+      "sha256": "87aa832e28b3574e4ad2308d0c16edb89ade023bc91af7a06e6c906adf4a34e0",
+      "bytes": 99276
+    },
+    ".qa/source-budget/compatibility/result.json": {
+      "sha256": "afcb4d3fc4417746b4b77897727cb8deef5cadc9244afcb21a88e58970a24ea6",
+      "bytes": 7982
+    },
+    ".qa/source-budget/compatibility-output-location.json": {
+      "sha256": "22f6d5a7cdeb1a7b1e6f16e4cff7ee858e14b1c3dc574b10c9d5716442395574",
+      "bytes": 326
+    },
+    ".qa/source-budget/cost-model.json": {
+      "sha256": "ca4e2efdb04168b397136856655f0e0b17013780f4cba790daa1fe3c84b9fa39",
+      "bytes": 2071
+    },
+    ".qa/source-budget/deployment-plan.json": {
+      "sha256": "8f61a8834e8e0a02631afb5238fe0f405882b4667220e974a683588af52f8695",
+      "bytes": 570
+    },
+    ".qa/source-budget/https-readonly/desktop-legacy-source.png": {
+      "sha256": "6aeec4a2e2cb05d009e3d065881e790b9890bc1c6a0fd8fa6734feea35241365",
+      "bytes": 265169
+    },
+    ".qa/source-budget/https-readonly/mobile-legacy-source.png": {
+      "sha256": "8d59ba0cc7287212baeda5abae330817d1bb55e863430355ee3a5841281205c8",
+      "bytes": 226907
+    },
+    ".qa/source-budget/https-readonly/summary.json": {
+      "sha256": "03d6b3f40cff170af0848aa4cd93f39ffcd7027135aa03ebd7d45c595fec4fec",
+      "bytes": 2637
+    },
+    ".qa/source-budget/official/command-1.log": {
+      "sha256": "36fad22f581ef6e027f6ab6d229376f0d12a0b3aee3234683b1a69341b6bff51",
+      "bytes": 145
+    },
+    ".qa/source-budget/official/command-2.log": {
+      "sha256": "a9c9c546e9c9d74b2642d98fc3a2b74ae0e370f4dec4a0e6c58357929a17e6f1",
+      "bytes": 392
+    },
+    ".qa/source-budget/official/command-3.log": {
+      "sha256": "f13557a940e03312ca474e10a736e7d3ab07214f2cdaef7b9622bbe2c2886d44",
+      "bytes": 62
+    },
+    ".qa/source-budget/official/command-4.log": {
+      "sha256": "038fa312e6610fcb7b019570bdd724668e9d3df835a5a72d9ba0ede463ee1d2d",
+      "bytes": 1532
+    },
+    ".qa/source-budget/official/progress.json": {
+      "sha256": "552a69593c2ca9b267c08798a2b351a904c276dd5f64fce8541ca6f60a4e4087",
+      "bytes": 3012
+    },
+    ".qa/source-budget/official/result.json": {
+      "sha256": "0cc62d1229be86a2046dab1acfee1f95e77eecbfde606633cc065dc515edf3fa",
+      "bytes": 3218
+    },
+    ".qa/source-budget/policy/progress.json": {
+      "sha256": "0074aa7c37565b7132d70c4c7242c4423b023763f4cfe32f1d5fa70f66babd5b",
+      "bytes": 887
+    },
+    ".qa/source-budget/policy/summary.json": {
+      "sha256": "15d75ec117acf2574388945bf2859c5d93250093f62d934714e73542127ccd3f",
+      "bytes": 1478
+    },
+    ".qa/source-budget/pr-before.json": {
+      "sha256": "c9936cbfae268f6a081c0cc8e4334238d94edd9dda950032892dc89946fdccdc",
+      "bytes": 148
+    },
+    ".qa/source-budget/public-drupal-review.json": {
+      "sha256": "5b03f24cd558c7ffd58aa4ec335c102e5360f9e24dc9e855c026c9f7f0ac0599",
+      "bytes": 418
+    },
+    ".qa/source-budget/publisher/desktop-installed.png": {
+      "sha256": "430ee7793d4cbec736e0896e113254956c6caa5bb3ff213f83b5152e1adc1946",
+      "bytes": 151490
+    },
+    ".qa/source-budget/publisher/mobile-detail.png": {
+      "sha256": "bcf437cf4e6d586d2d110ced97f600eed5df8f15530bae096b02417129cf69d6",
+      "bytes": 100811
+    },
+    ".qa/source-budget/publisher/result.json": {
+      "sha256": "9e89a9a5702660630f3f4946a76a9766d9502d5f3857a9c7a38bfab18fe1685d",
+      "bytes": 966
+    },
+    ".qa/source-budget/runtime/child-1.log": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    ".qa/source-budget/runtime/child-2.log": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    ".qa/source-budget/runtime/failure.json": {
+      "sha256": "d1da2c053a63dcc2f45b6830940fa138291142e2c19500a1c9b4bd9e096cc926",
+      "bytes": 2134
+    },
+    ".qa/source-budget/runtime/progress.json": {
+      "sha256": "f7271532f261c4a8afd00464fa35fecc9f1b02488ff7639477f3d93a28ca74ba",
+      "bytes": 1638
+    },
+    ".qa/source-budget/runtime-final/child-1.log": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    ".qa/source-budget/runtime-final/child-2.log": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    ".qa/source-budget/runtime-final/progress.json": {
+      "sha256": "6ae70c854d4b810e75e5c6a6918d3282e5eb574eb63f3687ebdd756aaab7ac22",
+      "bytes": 1777
+    },
+    ".qa/source-budget/runtime-final/result.json": {
+      "sha256": "c594b2f4e060fa6f6f83cbac2eeca8a90d150405963c7dabdb8ed51d3a3dcb2f",
+      "bytes": 2114
+    },
+    ".qa/source-budget/ui-dryrun/README.md": {
+      "sha256": "78cc5a86c4b9e89f14b618291e347e22f6c4415a5d4b5ae75bfddb851b0d235b",
+      "bytes": 130
+    },
+    ".qa/source-budget/ui-dryrun/worker.js": {
+      "sha256": "43dc01b6bd20160381d409c80ecd4f447ab6539a34890110e6dcad6684060561",
+      "bytes": 151512
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-committed-official.json": {
+      "sha256": "27ee888d869a47dfaab877a75fbf3fa52768ae7de83fd0e7a28db12ef78c6321",
+      "bytes": 485
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-committed-official.log": {
+      "sha256": "44dffd767d6dca45bc9da582426fe35c1276af21266ae0b8fb2cff33d0d02909",
+      "bytes": 1388
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-committed-official.started.json": {
+      "sha256": "cac6db11a53bd0479ae1ba00022b581008f7db3f31b08b0193082f7ea75af320",
+      "bytes": 376
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-committed-policy.json": {
+      "sha256": "e234809bd21405b9ccf7d4f5738890f4e8ecda404c32317919e7873b85831736",
+      "bytes": 478
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-committed-policy.log": {
+      "sha256": "5ca2901193f36f8f8e2021a9713c7b0c9eeb167ed811931695493ef375da1972",
+      "bytes": 845
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-committed-policy.started.json": {
+      "sha256": "13ad3f5f8879bc0f14488e9cc1f1bf22680448357ce755573da6fb4c07d09e1a",
+      "bytes": 370
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-committed-runtime.json": {
+      "sha256": "09f30cbdaeeda5e3440e808ca6b91390ec1e2d7d3d7bebe3e93da231c528493f",
+      "bytes": 477
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-committed-runtime.log": {
+      "sha256": "e1a29f5e9eebe1ed3e15b68f964471b4d07c12370aeec58faeb2b0b050457fdb",
+      "bytes": 1342
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-committed-runtime.started.json": {
+      "sha256": "8d7768ac02dc49d956ce5c2c36116438fe2f887562e64047654f8cf97731d5eb",
+      "bytes": 368
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-deadline.json": {
+      "sha256": "4124486a0197d4d59ef1204dddf24bc5ed3ff6b5f701c8e7d8b13f1d910f2285",
+      "bytes": 418
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-deadline.log": {
+      "sha256": "00681723315df1e4dc81283241e0c6dea08047155fd57d10debd633de8f1d7ae",
+      "bytes": 210
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-deadline.started.json": {
+      "sha256": "bd4fb96fe10ec09ad9f2468b42b38676543c4df586f04ae8fece843e2a0c8310",
+      "bytes": 309
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-guards.json": {
+      "sha256": "8a65dfdff7d635f880df741bcf5c76705a1c50fc498d9db90adf3021eef62f8d",
+      "bytes": 409
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-guards.log": {
+      "sha256": "a43287e2839fcfeda397d8567213ddf062cd1cecab341497637c55149f4ed7b9",
+      "bytes": 87
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-guards.started.json": {
+      "sha256": "f0fd549d9686af3844518bb3cfb7a73383934f40a44f637938a4b828a9b408cc",
+      "bytes": 301
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-official.json": {
+      "sha256": "21b72319400e263e1e9a9e5a98895abc49150e30878800750fcfe4abf4611e78",
+      "bytes": 1175
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-official.log": {
+      "sha256": "44dffd767d6dca45bc9da582426fe35c1276af21266ae0b8fb2cff33d0d02909",
+      "bytes": 1388
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-official.started.json": {
+      "sha256": "5b363e988d2b8327c3c876dca19754601f33f954c33bcef5ab0759628292c1e3",
+      "bytes": 1066
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-policy-final.json": {
+      "sha256": "11782d7b36de110489a59b87fd3132addef62d9fcbf54af9a11b2a5cc5c79884",
+      "bytes": 1105
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-policy-final.log": {
+      "sha256": "5ca2901193f36f8f8e2021a9713c7b0c9eeb167ed811931695493ef375da1972",
+      "bytes": 845
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-policy-final.started.json": {
+      "sha256": "a35fd12b08be12baacbddf1adc52e0921875a2d4eb699c826ef0084997526d0e",
+      "bytes": 997
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-policy.json": {
+      "sha256": "dcfe56554fd861afbf618b9a15bd2d51a379127ff1e220e3de41da1c4b87423d",
+      "bytes": 782
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-policy.log": {
+      "sha256": "5ca2901193f36f8f8e2021a9713c7b0c9eeb167ed811931695493ef375da1972",
+      "bytes": 845
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-policy.started.json": {
+      "sha256": "0f196974926cde36f8520a1f03f94303b52d2027930ac3af13c44b63013df383",
+      "bytes": 674
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-runtime-final.json": {
+      "sha256": "3eeb5f9ddf7cd6b83b87800b78048aa3b4ef699cab4eaa563fd088150089a20d",
+      "bytes": 1173
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-runtime-final.log": {
+      "sha256": "e1a29f5e9eebe1ed3e15b68f964471b4d07c12370aeec58faeb2b0b050457fdb",
+      "bytes": 1342
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-runtime-final.started.json": {
+      "sha256": "041d260451680c9cef9135345f686ea07b4bfe750b80fc510030a2d0e7dd5cde",
+      "bytes": 1064
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-runtime.json": {
+      "sha256": "33e77a98a0c0fb2876d54c4292742e9d5643b2762eecd7568694b4a0fa4b8dd5",
+      "bytes": 1167
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-runtime.log": {
+      "sha256": "8129017ebb4d60a600035662c835308cf6f4dc7d287d6414e315914599705f62",
+      "bytes": 1822
+    },
+    "marketplace/cloudflare/.qa/recovery/source-budget-runtime.started.json": {
+      "sha256": "a77debb8a93132356fdd11f76ea1d1c827d79514555ca21635d9e30b4ede581e",
+      "bytes": 1058
+    },
+    "marketplace/cloudflare/wrangler.source-ui.json": {
+      "sha256": "f7d7c7dc0d6825a7f8b64682344dbe76b4bce2acfbf516af21be604f01f9e5dc",
+      "bytes": 1204
+    }
+  },
+  "results": {
+    "sourcePolicy": {
+      "success": true,
+      "checks": [
+        "bounded public repository commit and entire package byte review (mocked provider contract)",
+        "private unavailable rate-limited wrong-commit and unrelated package sources rejected",
+        "source host revision and traversal validated before any fetch",
+        "review binds exact id version artifact publisher repository and revision",
+        "real workerd rejects missing mismatched and spoofed source provenance",
+        "changed artifact cannot reuse reviewed source admission",
+        "signature and official spoof defenses remain active",
+        "failed source admission writes no owner release nonce or package",
+        "real workerd publishes trusted source proof from operator policy only",
+        "immutable bytes ownership and reviewed listing persist after refused replacements",
+        "production Worker ignores test binding policies and defaults to empty approved list"
+      ],
+      "review": {
+        "format": "codegraph-source-review-1",
+        "id": "source-demo",
+        "version": "1.0.0",
+        "integrity": "1464abc2e830fb993a14b72321e1781a7f600a46c3cdef3dd007f82440f3ae9f",
+        "publisherId": "271c720beb9316a70ad2aa0d9728dda974fc3d421c447ececb20b402390e9e18",
+        "repository": "https://github.com/review/example",
+        "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "path": "packages/demo.cgext",
+        "checkedAt": "2026-09-23T04:06:19.314Z"
+      },
+      "scope": "Public provider responses mocked; actual local workerd+D1+R2 admission exercised"
+    },
+    "sourceBrowser": {
+      "success": true,
+      "checks": [
+        "unconnected browser lists every runtime dependency and manifest before any install",
+        "HTML and executable extension source render inertly as literal text",
+        "large source content is paged without truncating downloadable files",
+        "source download uses the same verified immutable bytes",
+        "connecting a destination cannot substitute its compatible version for previously reviewed catalog bytes",
+        "catalog selection changing after inspection blocks install rather than switching versions",
+        "in-flight source selection race cannot certify stale bytes",
+        "download corruption hides content and blocks review-dependent installation",
+        "reviewed exact version installs once and produces actual SQLite graph",
+        "mobile file inspection fits viewport and preserves literal source",
+        "review required for changed update; actual throwing update preserves working graph",
+        "disable and removal retain managed lifecycle behavior",
+        "browser verifier rejects identity traversal NUL excessive files and size violations"
+      ],
+      "browser": "153.0.8010.36",
+      "sourcePolicy": "explicit test records, no public provider verification claim",
+      "packageHashes": [
+        "0f8be1b329a4c63f1fea0d1b928b4f20cd3ca7335d8b68074ae8acb879f11d7f",
+        "732be8ef075f0188020a2f92e9522ab5db8bf173849f3bb18b84dfaff8297582",
+        "d16096e8c1789ba1d9d490e88a81f11717ac2c40bc38fbea3df90b563fe8c0c2",
+        "263c807f2173ee8be17e304fa68009a81ae0e8d6a674c4f03690471341f2b988"
+      ]
+    },
+    "runtime": {
+      "revision": "ca6c375993317640f592d1ecc149f5aa48116885",
+      "dirty": false,
+      "platform": "linux",
+      "node": "v22.23.2",
+      "checks": [
+        "Web Crypto signature and SPKI identity match Node publisher",
+        "catalog and immutable R2 package bytes agree",
+        "missing and corrupt stored artifacts fail closed instead of serving bytes",
+        "replay and immutable version reject without replacement",
+        "existing publisher owns later versions",
+        "invalid signatures packages and unsupported API rejected",
+        "cross-origin publication rejected",
+        "R2 boundary failures expose no catalog and exact signed retry succeeds",
+        "lost response after D1 commit retains release and replay guard",
+        "concurrent same-version commit has one winner",
+        "concurrent initial publisher ownership has one winner",
+        "D1 failure rolls back release ownership and replay nonce",
+        "isolated D1/R2 backup restore retains listing ownership and nonce; refuses live overwrite",
+        "corrupt snapshot cannot expose a restored catalog",
+        "replacement Worker runtime retains D1 metadata and R2 bytes",
+        "8 MiB package survives Worker crypto D1 metadata and R2 upload/download",
+        "over-limit package rejected",
+        "D1 rate limit survives distributed requests",
+        "real test-owned process kills after R2 and D1 boundaries recover in fresh runtime",
+        "production ignores test fault headers and refuses unreviewed publication",
+        "publication stays disabled until explicitly enabled"
+      ],
+      "receipts": [
+        {
+          "exit": null,
+          "signal": "SIGKILL",
+          "log": "child-1.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "exit": null,
+          "signal": "SIGKILL",
+          "log": "child-2.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "snapshot": {
+        "releases": 7,
+        "objects": 7
+      },
+      "largePackage": {
+        "bytes": 8388608,
+        "wallMilliseconds": 2474.499769,
+        "note": "Local wall time includes storage I/O; not Cloudflare CPU billing measurement"
+      },
+      "success": true
+    },
+    "official": {
+      "revision": "ca6c375993317640f592d1ecc149f5aa48116885",
+      "dirty": false,
+      "checks": [
+        "unsupported extension API rejected before writes",
+        "malformed package rejected before writes",
+        "incompatible target engine rejected before writes",
+        "tampered but valid JSON package rejected by reviewed provenance pin",
+        "edited publication plan rejected",
+        "wrong registry identity rejected",
+        "historical 0.1.0 remains immutable and importable alongside the reviewed current version",
+        "official identity provenance and exact bytes published through real D1/R2",
+        "safe repeated plan is idempotent and retains original listing",
+        "public API rejects official identity spoof while preserving community publication",
+        "community cannot replace reserved official Drupal ownership",
+        "prior community ownership is not stolen by operator import",
+        "existing immutable version metadata conflict is not overwritten",
+        "concurrent identical official imports converge to one release",
+        "R2 and D1 failures expose no release or orphan owner; exact retry succeeds",
+        "idempotent repeat detects corrupt object and never repairs by silent overwrite",
+        "official provenance ownership and bytes survive isolated backup restore",
+        "explicit CLI target plan hash confirmation and repeat operation work",
+        "remote adapter uses fixed account endpoints and conditional S3 creation (contract only)",
+        "remote binding mismatch stops before database or object writes (contract only)"
+      ],
+      "commands": [
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "official-cli.mjs",
+            "inspect-local",
+            "/tmp/cg-official-o9GPCq/main"
+          ],
+          "exit": 0,
+          "sha256": "8dccae29ffc96a576814582e960bbe3d991ebb897f63e5ad6f26dff936b25356",
+          "log": "command-1.log"
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "official-cli.mjs",
+            "plan",
+            "/tmp/cg-official-o9GPCq/target.json",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/extensions/drupal.cgext",
+            "/tmp/cg-official-o9GPCq/plan.json"
+          ],
+          "exit": 0,
+          "sha256": "1c50fc5b61fb3e9ad90c65ccda617bcc943bccb8ec0ce9e678a9787b6f96c24e",
+          "log": "command-2.log"
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "official-cli.mjs",
+            "apply",
+            "/tmp/cg-official-o9GPCq/plan.json",
+            "--confirm-plan-sha256",
+            "0000000000000000000000000000000000000000000000000000000000000000"
+          ],
+          "exit": 1,
+          "sha256": "f13557a940e03312ca474e10a736e7d3ab07214f2cdaef7b9622bbe2c2886d44",
+          "log": "command-3.log"
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "official-cli.mjs",
+            "apply",
+            "/tmp/cg-official-o9GPCq/plan.json",
+            "--confirm-plan-sha256",
+            "962682d134f14387e65fc7e63b25d124df43cc2fb79caf4a092c78a4d594bad3"
+          ],
+          "exit": 0,
+          "sha256": "699f218b67a06ee1d4342b6922c00dd0a28e28e9c58d3310382ece060d5ada03",
+          "log": "command-4.log"
+        }
+      ],
+      "artifactSHA": "e5ed73bee51524585e4f4da1d5017fdee3037a3fa71d8f08edab6c318fedc59a",
+      "artifactBytes": 291889,
+      "success": true
+    },
+    "compatibility": {
+      "checks": [
+        "signed immutable versions; semantic catalog order independent of publication order",
+        "one browser Install selects 1.10.0 over incompatible 9.0.0 and preview; actual Python graph refreshed only in chosen destination",
+        "pending compatibility refresh never shows incompatible catalog version as selected; installed and selected versions remain distinct",
+        "no-compatible browser selection/command fails usefully and preserves existing config/graph",
+        "headless automatic selection agrees; exact incompatible pin/no-compatible/missing update fail without mutation",
+        "prerelease requires explicit exact pin; automatic update refuses downgrade; explicit lower pin remains exact",
+        "compatible but broken update retains previous version and graph",
+        "browser and headless update to highest compatible stable; stale graph labels removed",
+        "exact artifact URL/file semantics and build-metadata pin identity preserved",
+        "removal cleans contributions; desktop/mobile display actual destination compatibility; no page errors"
+      ],
+      "releases": [
+        {
+          "id": "compatible-demo",
+          "version": "1.10.0",
+          "engines": ">=1.6.0 <2",
+          "integrity": "d59f9b1e9bd7d027081de45ab004aefe3236708ddeb4fc7135c92502ce0866d8"
+        },
+        {
+          "id": "compatible-demo",
+          "version": "1.9.0",
+          "engines": ">=1.6.0 <2",
+          "integrity": "07e64445b8c7205ec9a1d76c9e29affbd55d45e0817e9c3d92572b9f00486fcd"
+        },
+        {
+          "id": "compatible-demo",
+          "version": "0.5.0",
+          "engines": ">=1.6.0 <2",
+          "integrity": "ad3c944ff2bea24feb81cb25839746b72e4845b9dae3cba3a4e2ce872855114d"
+        },
+        {
+          "id": "compatible-demo",
+          "version": "20.0.0-beta.1",
+          "engines": ">=1.6.0 <2",
+          "integrity": "1a24723ecad51739315c4a6439227ff0a884700647ac505db74a12949fa99c82"
+        },
+        {
+          "id": "compatible-demo",
+          "version": "9.0.0",
+          "engines": ">=9",
+          "integrity": "c3f802635737b02d15f6fe3e82cde56c41a1c83c8a9cc0858ef964b49be206c9"
+        },
+        {
+          "id": "unavailable-demo",
+          "version": "1.0.0",
+          "engines": ">=9",
+          "integrity": "bc25c179402f994d59e586491cc0921d01ddc6dcf12bea9274982df745f42ef0"
+        },
+        {
+          "id": "compatible-demo",
+          "version": "2.0.0",
+          "engines": ">=1.6.0 <2",
+          "integrity": "5b2f2099fbe51f94a4242f8e81570bacf3a7c16625e8439af3853adab1de65f1"
+        },
+        {
+          "id": "compatible-demo",
+          "version": "3.0.0",
+          "engines": ">=1.6.0 <2",
+          "integrity": "e9f0eecbf6621e6f0ba7fc139d1eb91ffa2899548e0b5e615e3443a0496c8081"
+        },
+        {
+          "id": "compatible-demo",
+          "version": "1.10.0+fixture.1",
+          "engines": ">=1.6.0 <2",
+          "integrity": "b78efa83378ef1de9e79e8f6e4c18f0470382d8946481c4680fd0cbe2c6c349f"
+        }
+      ],
+      "commands": [
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "compatible-demo",
+            "--registry",
+            "http://127.0.0.1:39287",
+            "--path",
+            "/tmp/cg-compatible-tUJM97/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 2.353
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "compatible-demo",
+            "--registry",
+            "http://127.0.0.1:39287",
+            "--version",
+            "9.0.0",
+            "--path",
+            "/tmp/cg-compatible-tUJM97/headless-python-project"
+          ],
+          "exit": 1,
+          "seconds": 0.5
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "update",
+            "unavailable-demo",
+            "--registry",
+            "http://127.0.0.1:39287",
+            "--path",
+            "/tmp/cg-compatible-tUJM97/headless-python-project"
+          ],
+          "exit": 1,
+          "seconds": 0.36
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "unavailable-demo",
+            "--registry",
+            "http://127.0.0.1:39287",
+            "--path",
+            "/tmp/cg-compatible-tUJM97/headless-python-project"
+          ],
+          "exit": 1,
+          "seconds": 0.513
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "compatible-demo",
+            "--registry",
+            "http://127.0.0.1:39287",
+            "--version",
+            "20.0.0-beta.1",
+            "--path",
+            "/tmp/cg-compatible-tUJM97/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 2.1
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "update",
+            "compatible-demo",
+            "--registry",
+            "http://127.0.0.1:39287",
+            "--path",
+            "/tmp/cg-compatible-tUJM97/headless-python-project"
+          ],
+          "exit": 1,
+          "seconds": 0.5
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "compatible-demo",
+            "--registry",
+            "http://127.0.0.1:39287",
+            "--version",
+            "1.9.0",
+            "--path",
+            "/tmp/cg-compatible-tUJM97/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 1.965
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "update",
+            "compatible-demo",
+            "--registry",
+            "http://127.0.0.1:39287",
+            "--path",
+            "/tmp/cg-compatible-tUJM97/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 1.931
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "http://127.0.0.1:39287/api/download/compatible-demo/1.9.0",
+            "--path",
+            "/tmp/cg-compatible-tUJM97/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 1.881
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "/tmp/cg-compatible-tUJM97/pinned.cgext",
+            "--path",
+            "/tmp/cg-compatible-tUJM97/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 1.981
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "compatible-demo",
+            "--registry",
+            "http://127.0.0.1:39287",
+            "--version",
+            "1.10.0+fixture.1",
+            "--path",
+            "/tmp/cg-compatible-tUJM97/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 2.168
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "remove",
+            "compatible-demo",
+            "--path",
+            "/tmp/cg-compatible-tUJM97/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 2.011
+        }
+      ],
+      "engineVersion": "1.6.0",
+      "platform": "linux",
+      "browser": "153.0.8010.36"
+    },
+    "publisher": {
+      "browser": "153.0.8010.36",
+      "platform": "linux",
+      "checks": [
+        "late catalog response preserves the entered publisher form and package",
+        "real browser signed publisher upload",
+        "slow package metadata preserves typed publisher fields",
+        "browser publisher ownership rejection",
+        "browser invalid-signature failure state",
+        "browser malformed-package rejection without publication",
+        "one-click selected-project install verified in SQLite",
+        "real postMessage wrong-window command ignored",
+        "failed browser update preserves working version and graph",
+        "browser update replaces stale graph contributions",
+        "browser disable/enable/remove verified in SQLite",
+        "mobile detail fits viewport",
+        "real postMessage wrong-origin command ignored",
+        "closed local companion expires the connection visibly",
+        "real stopped registry shows actionable publisher failure without changing local graph"
+      ],
+      "pageErrors": []
+    },
+    "readOnlyHTTPS": {
+      "success": true,
+      "scope": "Actual read-only HTTPS health/catalog/package; tested local UI overlaid in this browser, NOT deployed UI",
+      "origin": "https://codegraph-marketplace-preview.colby-7d9.workers.dev",
+      "health": {
+        "ok": true,
+        "publishing": false,
+        "protocol": 1,
+        "storage": "d1-r2",
+        "schema": 1
+      },
+      "restoreHealth": {
+        "ok": true,
+        "publishing": false,
+        "protocol": 1,
+        "storage": "d1-r2",
+        "schema": 1
+      },
+      "release": {
+        "id": "drupal",
+        "version": "0.1.1",
+        "name": "Drupal",
+        "description": "Follow Drupal routes, services, hooks, plugins and events through your codebase.",
+        "publisher": "CodeGraph",
+        "publisherId": "codegraph",
+        "official": true,
+        "readme": "Official CodeGraph Drupal extension 0.1.1 preview. Rejects commented/quoted declarations and handles explicit legacy and modern Symfony event argument order. Routes and forms connect to their handlers; services connect to implementations and explicit injections; literal hooks and events connect to declared implementations.\n\nInstalling replaces the built-in Drupal resolver for this project. Requires CodeGraph >=1.6.0 <2 with extension support.\n\nComputed identifiers, missing external dependencies, ambiguous classes and unknown entity handlers remain unresolved. Broader Drupal coverage and performance review remain open.",
+        "source": "https://github.com/colbymchenry/codegraph/tree/b27bf875c95d3b82a0df411f68d0d8497993667b/extensions/drupal",
+        "apiVersion": 1,
+        "engines": ">=1.6.0 <2",
+        "capabilities": [
+          "frameworks",
+          "synthPasses"
+        ],
+        "integrity": "e5ed73bee51524585e4f4da1d5017fdee3037a3fa71d8f08edab6c318fedc59a",
+        "publishedAt": "2026-09-22T21:05:56.339Z",
+        "provenance": {
+          "repository": "https://github.com/colbymchenry/codegraph",
+          "revision": "b27bf875c95d3b82a0df411f68d0d8497993667b",
+          "path": "extensions/drupal/index.cjs",
+          "sourceSha256": "e9a5f13baaf0ba53ab17f0e348edd73ba91c80a11034746372c808eda8e3714d",
+          "entrySha256": "17aa1ea7feed33cb42e010d9eae15f4a07035987ced3b9cd0f6f39a2ee6adc91"
+        }
+      },
+      "remoteAppSHA": "0cd4c80822ee7c08241e6b41483c32de627ce9ac821e788b7ab54fd7ef0aff02",
+      "remoteHasSourceViewer": false,
+      "files": 2,
+      "checks": [
+        "both public endpoints publishing false",
+        "immutable Drupal 0.1.1 fingerprint matches accepted artifact",
+        "all displayed packaged source matches local immutable reference",
+        "historical repository provenance explicitly unverified",
+        "no connection installation or publication",
+        "desktop/mobile inert inspection without page errors"
+      ]
+    },
+    "deadline": {
+      "checks": [
+        "future deadline health and POST agree",
+        "expired deadline health and POST agree",
+        "invalid deadline health and POST agree",
+        "live window expires without deployment or process restart"
+      ],
+      "success": true
+    },
+    "guards": {
+      "passed": 18,
+      "scope": "operator admission/config/live-binding guards; no remote calls"
+    }
+  },
+  "publicReview": {
+    "format": "codegraph-source-review-1",
+    "id": "drupal",
+    "version": "0.1.0",
+    "integrity": "e5015747d02fe50d6af607b6c44f1db9cf7969a0070866ed03c7643377a459c8",
+    "publisherId": "codegraph",
+    "repository": "https://github.com/colbymchenry/codegraph",
+    "revision": "d971e06fade2876225208f604b73975fa8491743",
+    "path": "extensions/drupal/releases/drupal-0.1.0.cgext",
+    "checkedAt": "2026-09-23T04:00:30.812Z"
+  },
+  "costModel": {
+    "date": "2026-09-23",
+    "basePlanUSD": 5,
+    "periodDays": 30,
+    "assumptions": "One source view, six API reads and four conservatively Worker-charged asset requests per download; thirty maximum-size uploads. No cache savings. Existing restored snapshot unchanged, no new provider copies.",
+    "rows": [
+      {
+        "downloads": 15000,
+        "sourceViews": 15000,
+        "metadataRequests": 90000,
+        "assetRequests": 60000,
+        "uploads": 30,
+        "workerRequests": 180030,
+        "cpuMs": 1721370,
+        "workerAllowancePercent": {
+          "requests": 1.8003000000000002,
+          "cpu": 5.7379
+        },
+        "r2ClassB": 30030,
+        "r2ClassA": 30,
+        "d1ReadRowsCurrentUpper": 1770000,
+        "d1ReadRows1000ReleaseUpper": 90240000,
+        "maxMonthlyPackageTransferGB": 251.65824,
+        "storageAfter30MaxSizeUploadsBytes": 269142660,
+        "workerMarginalUSDIfAllowancesAlreadyExhausted": 0.0884364
+      },
+      {
+        "downloads": 30000,
+        "sourceViews": 30000,
+        "metadataRequests": 180000,
+        "assetRequests": 120000,
+        "uploads": 30,
+        "workerRequests": 360030,
+        "cpuMs": 3431370,
+        "workerAllowancePercent": {
+          "requests": 3.6003,
+          "cpu": 11.437899999999999
+        },
+        "r2ClassB": 60030,
+        "r2ClassA": 30,
+        "d1ReadRowsCurrentUpper": 3510000,
+        "d1ReadRows1000ReleaseUpper": 180450000,
+        "maxMonthlyPackageTransferGB": 503.31648,
+        "storageAfter30MaxSizeUploadsBytes": 269142660,
+        "workerMarginalUSDIfAllowancesAlreadyExhausted": 0.1766364
+      }
+    ],
+    "limitations": [
+      "Account-wide allowances and unrelated workloads unknown",
+      "Taxes, paid logs, abuse, background polling, backups and future storage growth excluded",
+      "CPU samples are not throughput or peak-memory proof",
+      "R2 billable units round up; marginal fractional arithmetic is not an exact invoice"
+    ],
+    "sources": [
+      "https://developers.cloudflare.com/workers/platform/pricing/",
+      "https://developers.cloudflare.com/r2/pricing/",
+      "https://developers.cloudflare.com/d1/platform/pricing/"
+    ]
+  },
+  "deployment": {
+    "performed": false,
+    "blocker": "Supported Wrangler OAuth token expired and could not refresh; no duplicate login authorized.",
+    "plan": {
+      "baseCommit": "d971e06fade2876225208f604b73975fa8491743",
+      "uiCommit": "ca6c375993317640f592d1ecc149f5aa48116885",
+      "workerBundle": ".qa/hosted/restore-dryrun/worker.js",
+      "workerSha256": "43dc01b6bd20160381d409c80ecd4f447ab6539a34890110e6dcad6684060561",
+      "config": "marketplace/cloudflare/wrangler.source-ui.json",
+      "configSha256": "f7d7c7dc0d6825a7f8b64682344dbe76b4bce2acfbf516af21be604f01f9e5dc",
+      "scope": "UI assets only; exact accepted Worker bytes; same bindings, CPU, observability, publishing=false; no storage writes or source-policy activation"
+    },
+    "dryRunPassed": true,
+    "policyDeployed": false,
+    "uiDeployed": false
+  },
+  "scopeNotes": [
+    "Public GitHub negative provider responses mocked; successful Drupal 0.1.0 public review is real and read-only.",
+    "Source-policy and storage gates use real local workerd/D1/R2; fixture policy explicitly simulated only in test entrypoint.",
+    "Read-only HTTPS browser overlays local UI; this is not deployed source inspection.",
+    "Compatibility output copied from default path after successful command; copied September22 failure files are historical, not this run.",
+    "No engine/native/fullLinux/corpus/provider restore or large provider upload rerun; earlier evidence source-specific.",
+    "Budget assumes shared allowances available; no hard cap or account invoice guarantee.",
+    "General publishing disabled; static source policy empty; portable Node admission not migrated."
+  ]
+}

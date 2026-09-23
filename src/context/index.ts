@@ -1,3 +1,4 @@
+import { synthEdgeLabel } from '../graph/synth-edge-label';
 /**
  * Context Builder
  *
@@ -404,7 +405,7 @@ export class ContextBuilder {
       const m = e.metadata as Record<string, unknown> | undefined;
       if (!m?.synthesizedBy) continue;
       const at = typeof m.registeredAt === 'string' ? ` @${m.registeredAt}` : '';
-      const label = m.synthesizedBy === 'callback'
+      const label = synthEdgeLabel(e) ?? (m.synthesizedBy === 'callback'
         ? `callback via ${m.via ? `\`${String(m.via)}\`` : 'registrar'}${at}`
         : m.synthesizedBy === 'react-render'
         ? `React re-render via setState${at}`
@@ -418,7 +419,7 @@ export class ContextBuilder {
         ? `queue job ${m.event ? `\`${String(m.event)}\`` : ''}${m.queue ? ` on \`${String(m.queue)}\`` : ''}${at}`
         : m.synthesizedBy === 'event-bus' && m.channel === 'socket'
         ? `socket message ${m.event ? `\`${String(m.event)}\`` : ''}${m.tier === 'client→server' ? ' → server' : m.tier === 'server→client' ? ' → client' : ''}${at}`
-        : `event ${m.event ? `\`${String(m.event)}\`` : ''}${at}`;
+        : `via ${String(m.synthesizedBy)}${m.event ? ` ${String(m.event)}` : ''}${at}`);
       synthByPair.set(`${e.source}>${e.target}`, label);
     }
     const renderChain = (c: string[]): string => {

@@ -1,0 +1,73 @@
+name: Marketplace HTTPS acceptance
+on:
+  push:
+    branches: [feature/extensions-author-kit-20260922]
+    paths:
+      - 'src/plugins/marketplace*.ts'
+      - 'marketplace/**'
+      - 'scripts/validation/https-marketplace.cjs'
+      - 'scripts/validation/extensions-compatibility.cjs'
+      - 'scripts/validation/marketplace-browser.cjs'
+      - '.github/workflows/marketplace-https.yml'
+permissions:
+  contents: read
+jobs:
+  https:
+    # Standard included public-repository runner; test fixtures only.
+    if: github.repository == 'colbymchenry/codegraph'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CODEGRAPH_TELEMETRY: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.2'
+      - run: npm ci --no-audit --no-fund
+      - run: npm install --prefix .qa/browser --ignore-scripts --no-save --package-lock=false playwright@1.63.0
+      - run: node .qa/browser/node_modules/playwright/cli.js install --with-deps chromium
+      - name: Download verified test-only tunnel binary
+        run: |
+          mkdir -p .qa/bin
+          curl --fail --location --retry 3 https://github.com/cloudflare/cloudflared/releases/download/2026.9.1/cloudflared-linux-amd64 -o .qa/bin/cloudflared
+          echo '03f1f25d1cc93b9ad6c60569d44060bc4f17ed97075760ed8cfca4b12dcd68cc  .qa/bin/cloudflared' | sha256sum --check
+          chmod +x .qa/bin/cloudflared
+          echo "$GITHUB_WORKSPACE/.qa/bin" >> "$GITHUB_PATH"
+      - name: Build and verify real HTTPS acceptance with receipts
+        run: |
+          python3 -u - <<'PY'
+          import os, pathlib, subprocess, json, hashlib, datetime, time, platform
+          root = pathlib.Path.cwd()
+          out = root / '.qa/https-run'
+          out.mkdir(parents=True, exist_ok=True)
+          env = dict(os.environ, REGISTRY_TEST_HTTPS='1', PLAYWRIGHT_MODULE=str(root / '.qa/browser/node_modules/playwright'), COMPAT_OUTPUT=str(out / 'compatibility'), BROWSER_OUTPUT=str(out / 'browser'))
+          env['CHROME_PATH'] = subprocess.check_output(['node','-e',"console.log(require('./.qa/browser/node_modules/playwright').chromium.executablePath())"],text=True).strip()
+          data = dict(revision=os.environ['GITHUB_SHA'], run=os.environ['GITHUB_RUN_ID'], platform=platform.platform(), arch=platform.machine(), node=subprocess.check_output(['node','--version'],text=True).strip(), steps=[])
+          for name,command in [('build',['npm','run','build']),('marketplace-build',['npm','run','build','--prefix','marketplace']),('https-compatibility',['node','scripts/validation/extensions-compatibility.cjs']),('https-browser',['node','scripts/validation/marketplace-browser.cjs'])]:
+              receipt = dict(name=name,command=command,started=datetime.datetime.now(datetime.timezone.utc).isoformat())
+              data['steps'].append(receipt)
+              (out/'summary.json').write_text(json.dumps(data,indent=2))
+              start=time.monotonic()
+              with (out/(name+'.log')).open('w') as log:
+                  try: result=subprocess.run(command,env=env,stdout=log,stderr=subprocess.STDOUT,timeout=360); receipt['exit']=result.returncode
+                  except subprocess.TimeoutExpired: receipt['exit']=None; receipt['error']='timed out'
+              receipt.update(seconds=time.monotonic()-start,sha256=hashlib.sha256((out/(name+'.log')).read_bytes()).hexdigest(),finished=datetime.datetime.now(datetime.timezone.utc).isoformat())
+              (out/'summary.json').write_text(json.dumps(data,indent=2))
+              print(name,receipt['exit'],flush=True)
+              if receipt['exit']!=0:
+                  print((out/(name+'.log')).read_text()[-8000:])
+                  if 'build' in name: break
+          data['success']=len(data['steps'])==4 and all(s.get('exit')==0 for s in data['steps'])
+          (out/'summary.json').write_text(json.dumps(data,indent=2))
+          raise SystemExit(0 if data['success'] else 1)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: marketplace-https-${{ github.sha }}-${{ github.run_attempt }}
+          path: .qa/https-run/
+          include-hidden-files: true
+          retention-days: 7

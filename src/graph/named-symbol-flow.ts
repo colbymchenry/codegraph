@@ -50,6 +50,13 @@ export { RUST_PATH_PREFIXES, lastQualifierPart, matchesSymbol } from './symbol-l
  * hits may appear in `note` as a did-you-mean hint when `nodes` is empty.
  */
 export function findAllSymbols(cg: CodeGraph, symbol: string): { nodes: Node[]; note: string } {
+  // Literal route paths are precise graph names, not filesystem qualifiers.
+  // Do not let FTS turn /cart into unrelated symbols containing "cart".
+  if (symbol.startsWith('/')) {
+    const nodes = [...cg.getNodesByName(symbol), ...cg.getNodesByNamePrefix(symbol + ' [', 50)]
+      .filter(n => n.kind === 'route' && n.name.replace(/ \[[^\]]+\]$/, '') === symbol);
+    return { nodes, note: '' };
+  }
   // Nix option paths: the declaration is stored as `options.<path>` and
   // config writes carry longer/quoted tails (`<path>."git/config".text`),
   // so a dotted option token (`xdg.configFile`, `launchd.user.agents`) has
@@ -270,8 +277,9 @@ export function flowTokens(query: string): string[] {
     ...new Set(
       query
         .split(/[\s,()[\]]+/)
-        .map((t) => t.replace(FILE_EXT, '').trim())
-        .filter((t) => t.length >= 3 && /^[A-Za-z_$][\w$]*(?:(?:::|\.)[\w$]+)*$/.test(t))
+        .map((t) => (t.startsWith('/') ? t : t.replace(FILE_EXT, '')).trim())
+        .filter((t) => /^\/(?:[\w~%{}:*.+-]+\/?)*$/.test(t) ||
+          (t.length >= 3 && /^[A-Za-z_$][\w$]*(?:(?:::|\.)[\w$]+)*$/.test(t)))
     ),
   ].slice(0, MAX_TOKENS);
 }

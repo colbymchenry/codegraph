@@ -1,0 +1,64 @@
+name: Extension native validation
+
+# A topic-branch push can run this workflow before it exists on main.
+# No release/deployment events, production secrets, or write token permissions.
+on:
+  push:
+    branches: [feature/extensions-author-kit-20260922]
+    paths:
+      - 'src/**'
+      - 'extensions/drupal/**'
+      - 'scripts/build-extensions.mjs'
+      - '__tests__/**'
+      - 'scripts/validation/**'
+      - 'package*.json'
+      - 'ui/**'
+      - 'marketplace/**'
+      - '.github/workflows/extensions-native.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: extensions-native-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native:
+    # Public repo, standard included runners only (no large/paid labels).
+    if: github.repository == 'colbymchenry/codegraph'
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        os: [windows-2022, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    env:
+      CODEGRAPH_TELEMETRY: '0'
+      # Core parsing/candidate recovery changed: exercise native lifecycle too.
+      NATIVE_VALIDATION_SCOPE: full
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.2'
+      - name: Install development dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Install test-only browser
+        run: npm install --prefix .qa/browser --ignore-scripts --no-save --package-lock=false playwright@1.63.0
+      - name: Download Chromium for this native OS
+        run: node .qa/browser/node_modules/playwright/cli.js install chromium
+      - name: Run native acceptance with durable receipts
+        run: node scripts/validation/native-validation.cjs
+      - name: Retain validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: extensions-native-${{ matrix.os }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: .qa/native/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7

@@ -4,6 +4,27 @@
 queries in [Checking this file is still true](#checking-this-file-is-still-true)
 before trusting a row; this is a snapshot, not a live view.
 
+**Extension preview, 2026-09-22:** Drupal 0.1.1 supports explicit `_controller`
+and `_form` route defaults, unique YAML service classes/aliases and literal
+constructor arguments, literal service lookups, attached hook documentation or
+`Hook` attributes, explicit plugin IDs from attached annotations/attributes,
+and named event dispatch/subscriber links. Both Symfony `dispatch(name, event)`
+and `dispatch(event, name)` forms require an explicit literal/constant name.
+Commented calls, quoted declaration examples, unrelated `NotDrupal::service`,
+unknown targets, cyclic service aliases, computed IDs and duplicate plugin IDs
+are covered by negative checks.
+
+The review samples 28 exact links across pinned Pathauto, Commerce and Drupal
+core, plus four unresolved corpus cases and focused synthetic positives/negatives.
+It is not an exhaustive precision/recall measurement. Dynamic entity forms,
+container factories/decorators, autowiring, computed dispatch names, single-argument
+object event inference, grouped imports and multiple namespaces per file are not
+certified. Receiver matching for hook/event/plugin APIs remains heuristic, not
+PHP runtime type analysis. No Drupal screen navigation or PHP branch guards are
+added. Immutable 0.1.0 is retained alongside 0.1.1. See the
+[Drupal review report](../validation/extensions-drupal-review-20260922.md) for
+exact source, measurements, exclusions and remaining limits.
+
 This file exists to be read cold. It says, for every framework and language the
 README claims, **which of the three pictures it can draw today** and what is
 missing from the ones it cannot — so a fresh session can pick up the next piece

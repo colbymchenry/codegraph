@@ -1,0 +1,747 @@
+{
+  "generatedAt": "2026-09-22T16:45:19.411103+00:00",
+  "reviewTestedSource": "57f332dbb70dbbaf2a45fc2f6bf8fdd76c11f46a",
+  "applicationSource": "7575dcc71e4524c660aff06486ebc007cca290b9",
+  "acceptedHead": "b04cf479375b955d58dfed69d9211e43baecdf54",
+  "acceptedRegressionCheckout": "e0885ee750ffc99bfb304906bed25966cdac6fb7",
+  "pr": "https://github.com/colbymchenry/codegraph/pull/1911",
+  "sourceHashes": {
+    "docs/validation/dependency-review/model.cjs": "cdfe50e338edb589f6acd82e9bc0733f9c6e8bd8059c899afb0896ef17ff8348",
+    "docs/validation/dependency-review/run.cjs": "cf09b4c01594e21c80d62705458ff55b58246f9b7e110ee460f54a87b9409056",
+    "docs/design/semantic-dependency-contract.md": "064a27b0a81b1fecd742ee1632b93d674321d9a2176dd4070f0a8bdd459d9d75",
+    "src/plugins/api.ts": "779146a3bc84fd911d4c8fadd03c8fac03a5ac64766886c3498978223f2fd935",
+    "src/plugins/loader.ts": "5f026cb63d1697b82db346645b101792c77351d5ed630504196287fe79da7c83",
+    "src/plugins/registry.ts": "21f9d4807f343a9183ee738307c43f2b4fdb55e7988ed2e1150a580d3373d4d9",
+    "src/plugins/author-template.ts": "effca678ce3c0f25aa620cda4f5ad49b77a6d894f1b02a5ea3246236f14e18c4",
+    "src/plugins/package-validation.ts": "22edaf08c9531c6169ca0abf8f80c5b3536e29b049a2c387393ba2af4e003bf9",
+    "src/resolution/types.ts": "642fe8007246e70e2529bdad877d5c747de624aba2381dc9187eaeca9a428dfe",
+    "src/resolution/index.ts": "b016116b5348952f0933d74dfc20dfabe4bf76c2195aa47dc4bd5f7e50a607bf",
+    "src/resolution/callback-synthesizer.ts": "5d9feb00c36b72aa2cb173d5f30c4a800d3bcb2dc40875c93508d84970c01ea8",
+    "src/extraction/index.ts": "0108cacf9d8d0ab3e468ebd36b9ef75b0ce23b22480c55a1bbb75425a506eb17",
+    "src/extraction/tree-sitter.ts": "7a72225fde1868af0b19d25078f34aa3f445decc26de2aff6d4dcf43ecf0b324",
+    "src/index.ts": "31562b5bc5442620ea7e20fc6f11644f4bd6ebef6696488f884391ac02411be7",
+    "extensions/drupal/index.cjs": "e9a5f13baaf0ba53ab17f0e348edd73ba91c80a11034746372c808eda8e3714d",
+    "extensions/drupal/package.json": "876e4059a8f967a9d9ab595cafc359f8820c4d0f1bbc1b3ec8939f03ac0a11a1",
+    "__tests__/extension-sync.test.ts": "5f520cdda673d78afd0024115f9adc6ce37973a6bcee4356a7279e543ff743ac",
+    "package.json": "42c062210185a80c2d57bed2ac850a98d7660d3a0da2e04afa638f72305dd7e8",
+    "package-lock.json": "85274fb46487a320a60d2050f41f5637bf3ea116170b047fe24aa8e768cec366"
+  },
+  "compiledHashes": {
+    "dist/index.js": "e66d30aaa728ca54cd419af1f50aa0ca22a6409efd58bb71b97ec5564de56ae5",
+    "dist/index.d.ts": "7a4d7d0e8829e1ebe74e387b1e2503ebd1d798f8174e1af81a72c1d62fc61d09",
+    "dist/db/index.js": "84832b6b622bbf40b2beed2824e6d020b18e55ddfa2d16458dcb8d638d102966",
+    "dist/plugins/recovery.js": "49ed19a5a386273a17d21b823b620be312dc58533e5a5dc8c451e97e39d39774",
+    "dist/extraction/index.js": "66dd378d44e82bbaf23df3b54a28aeaaa3e8bf6dea000eaa11d5d6aef6ea6b86",
+    "dist/extraction/core-reuse.js": "2c2883ef6a465edae6bf07fc02574eb975d6d2e2cd1d31ace49d9b87fed137c7",
+    "dist/extraction/parse-pool.js": "94cc18e2c14241f665641c174e9d882f5c893cfb825d6d13744d6a094fe929d6",
+    "dist/extraction/parse-worker.js": "85fa539597a610eb97c5738f9cfaaecf8b17cf7944519e2b95fb81a334daddc2",
+    "dist/extraction/tree-sitter.js": "87bfc4cd6cdc3cbc8406a531edc127ec84cacf770c9251a5bcfeaaf78b61883c",
+    "dist/extensions/drupal.cgext": "e5ed73bee51524585e4f4da1d5017fdee3037a3fa71d8f08edab6c318fedc59a",
+    "dist/extensions/drupal-0.1.0.cgext": "e5015747d02fe50d6af607b6c44f1db9cf7969a0070866ed03c7643377a459c8",
+    "dist/extensions/drupal-0.1.1.cgext": "e5ed73bee51524585e4f4da1d5017fdee3037a3fa71d8f08edab6c318fedc59a",
+    "marketplace/cloudflare/.build/worker.js": "981f24d6518908fa33259a3e3e8cb4d3d6d9a073446ccfa3132c1a98c52e7cb9",
+    "dist/plugins/manager.js": "143535f6590b35b55180f48d39b6ab6d2d94062938da418c8ac5bdf856ee4400",
+    "dist/plugins/loader.js": "2e3bd419159d6ca19bc8c2bd834429b9e622eb5b9e885d59670efb1318475247",
+    "dist/plugins/author-template.js": "053250ae725130e38c82222a2f97000884566940655aa603185763dfa338ac1f",
+    "dist/plugins/package.js": "039abfd75cfc0d68bf3254ac944d948378a3b0f68a723c17c110951110d4dd1f",
+    "dist/plugins/package-validation.js": "ce3d069c645bf04b7fc4fe1c55ce04520eedb2cc1d75b39c603f816358a39ea9",
+    "dist/resolution/index.js": "09fc4b8552c78dfb21a95d306c4edd9c96974a28fc76636a506ef708f1b7e923",
+    "dist/resolution/callback-synthesizer.js": "fe8080adce15d3c64cbc78015925b23ee24dc97e2bf68f35e8ea48c6c6cbeca9",
+    "dist/types.js": "172990e7194c219090f8c19e5c64da629cb4d89a7d14f1df667f76561ef24369"
+  },
+  "acceptedSourceHashesMatched": 26,
+  "acceptedCompiledHashesMatched": 13,
+  "commands": [
+    {
+      "receipt": ".qa/recovery/dependency-review-first.json",
+      "receiptSha256": "e9ac1bd068e11939b0116c3e86c37506ff7d44d279c39ebc0d845180a0d56289",
+      "log": ".qa/recovery/dependency-review-first.log",
+      "logSha256": "00c7e0f88937d3eb5831334de7d5be15f145e396fe9787ca71105aff368e0e86",
+      "body": {
+        "command": [
+          "node",
+          "docs/validation/dependency-review/run.cjs",
+          ".qa/dependency-review/first"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T16:37:09.287172+00:00",
+        "revision": "b04cf479375b955d58dfed69d9211e43baecdf54",
+        "working_tree": "?? docs/validation/dependency-review/\n",
+        "exit_code": 1,
+        "seconds": 1.008,
+        "finished_at": "2026-09-22T16:37:10.295598+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": ".qa/recovery/dependency-review-second.json",
+      "receiptSha256": "8877661636f4027c4eb9ff4fc80a4ecaf18b985ede2da9d9322a9e5325946a75",
+      "log": ".qa/recovery/dependency-review-second.log",
+      "logSha256": "d0adf7df633a11adc7e94b6c91c237d855995a556e362f052c65deed214a0b44",
+      "body": {
+        "command": [
+          "node",
+          "docs/validation/dependency-review/run.cjs",
+          ".qa/dependency-review/second"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T16:37:27.922149+00:00",
+        "revision": "b04cf479375b955d58dfed69d9211e43baecdf54",
+        "working_tree": "?? docs/validation/dependency-review/\n",
+        "exit_code": 1,
+        "seconds": 5.836,
+        "finished_at": "2026-09-22T16:37:33.758524+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": ".qa/recovery/dependency-review-third.json",
+      "receiptSha256": "1b0fe22ac6e9380a2284a1e4c8eddcf74fbdac454d35ff9f6a85f70ee1a86fd7",
+      "log": ".qa/recovery/dependency-review-third.log",
+      "logSha256": "34b13e052052763530846c48df77cf0cb0a5b89ade96a8815b788bcf6081f8a1",
+      "body": {
+        "command": [
+          "node",
+          "docs/validation/dependency-review/run.cjs",
+          ".qa/dependency-review/third"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T16:38:38.897280+00:00",
+        "revision": "b04cf479375b955d58dfed69d9211e43baecdf54",
+        "working_tree": "?? docs/validation/dependency-review/\n",
+        "exit_code": 0,
+        "seconds": 6.585,
+        "finished_at": "2026-09-22T16:38:45.482175+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": ".qa/recovery/dependency-review-final.json",
+      "receiptSha256": "ea7de3011188bcc96a93397118fadb0b62196e1b34640e06efdc0a7455e6d8d2",
+      "log": ".qa/recovery/dependency-review-final.log",
+      "logSha256": "e0974b92ec7f8108ea6bbab32977b1bba8eec58a0c93ce0b58d8f62bfca2363e",
+      "body": {
+        "command": [
+          "node",
+          "docs/validation/dependency-review/run.cjs",
+          ".qa/dependency-review/final"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T16:42:24.632990+00:00",
+        "revision": "57f332dbb70dbbaf2a45fc2f6bf8fdd76c11f46a",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 6.65,
+        "finished_at": "2026-09-22T16:42:31.282934+00:00",
+        "summary": []
+      }
+    }
+  ],
+  "raw": {
+    ".qa/dependency-review/final/drupal-1.json": "342f75adc998d35f3ec5627af3c5e1a6ded077ebdecf77e4604185e430236e18",
+    ".qa/dependency-review/final/drupal-2.json": "cf7e5cb8d8600ffb2d56b32f5ad89a87963d6ffc952fb43084e089f18b2e263e",
+    ".qa/dependency-review/final/drupal-3.json": "f2e723a4eeb7c038001cac71bd88da0282786c2af5cb443ae0d0a09fec6b2461",
+    ".qa/dependency-review/final/drupal-4.json": "77498bdbd7aa4daea3b457366fd543b3ba43267c08c38536730d772be096814b",
+    ".qa/dependency-review/final/drupal-5.json": "779ba12c1c265166f180ee9718bcb1e1d9284d2c21877f7aed21a6d6200cc2f3",
+    ".qa/dependency-review/final/drupal-6.json": "ebc2867561c55c9dfe1c96499ccc4c5652f19c78914a030c33491344b7c27d7f",
+    ".qa/dependency-review/final/drupal-7.json": "bcfe8840ed859be5b22ee70eca3f7ea101c43219f0762ac82fcc3b401be3e8eb",
+    ".qa/dependency-review/final/drupal-8.json": "b072bdd01474d49b9c0f339edf322219a44a01d486a6443d7dc752391dbadcff",
+    ".qa/dependency-review/final/drupal-9.json": "691492e1d544552180372694fb7ac4156b295c3c0bed6a23e305a20b7e08243f",
+    ".qa/dependency-review/final/progress.json": "271c26e88935b783838cf728a17cd148f7c52c312ed5239b275f98e13fc9f560",
+    ".qa/dependency-review/final/result.json": "f48ad5d885a58b6b1fd42d3c5fa0424cfc8b98372e34b3fa95190b8b393a6d4a",
+    ".qa/dependency-review/final/source-model.cjs": "cdfe50e338edb589f6acd82e9bc0733f9c6e8bd8059c899afb0896ef17ff8348",
+    ".qa/dependency-review/final/source-run.cjs": "cf09b4c01594e21c80d62705458ff55b58246f9b7e110ee460f54a87b9409056",
+    ".qa/dependency-review/first/failure.json": "40d59f8d6b9f5ca717fe5f051a8e2fa7fb5cd27be647d4a18fb0da78772d266c",
+    ".qa/dependency-review/first/progress.json": "75dcccde18a9496c5f8b0f4bca918b0713a5fadc63259e4fdd733e71954b08f9",
+    ".qa/dependency-review/second/drupal-1.json": "80ff8556ce9b53af2558164010a40010fba4ff30f6207340337f0ab82083aeb7",
+    ".qa/dependency-review/second/drupal-2.json": "db0455138652c931f17e6ab312c8c2a6eb2768de3225a21923f2529c1e7b9d25",
+    ".qa/dependency-review/second/drupal-3.json": "7f993a780e0598b4b14d584e329b544b8fbfd8ed0feb45cf7028de9ea690c720",
+    ".qa/dependency-review/second/drupal-4.json": "78651faaf0947ea26c29fbb6d4367f4511cb0ea5d109c76a000682c7f3c03047",
+    ".qa/dependency-review/second/drupal-5.json": "12b2c929570a9ff8616340e942b2cfe578001a993d351158b4808405df67e695",
+    ".qa/dependency-review/second/drupal-6.json": "7b07af03c7ea13405bdf568744300fb2039be2f516e304130f45b044dfec9aed",
+    ".qa/dependency-review/second/drupal-7.json": "2029f4694d6ff71d71d4d303c0266bc2336ec04638567415ca02b4d42417ef2e",
+    ".qa/dependency-review/second/failure.json": "ace34ee8a15b3c14f1b1427bdf013513f854df158784fb7e6b324b91aba2ffa0",
+    ".qa/dependency-review/second/progress.json": "9cef3b4af72355cd02548daf16d8a4e6d87117f9ac184108cdc62d665b44b190",
+    ".qa/dependency-review/third/drupal-1.json": "a1d77a900e48b56ab945e89f627145d7841ab2b73c0ea8681dba1d752e40b090",
+    ".qa/dependency-review/third/drupal-2.json": "c0d8459a75d57d0d66dbeeaecc2b7b0fd7494156a640dd15da47436f10e5727e",
+    ".qa/dependency-review/third/drupal-3.json": "3aeac1725ba5296837d16736598b3d00ea6fa66191ded3ccea36a7dfe3df1291",
+    ".qa/dependency-review/third/drupal-4.json": "11569369e702757ac3df0c796ac91cb154b4424a5ef487620e5c50ca9377da42",
+    ".qa/dependency-review/third/drupal-5.json": "6694c4ea6f3d2487d5883b676c86cba71baea704a0adf67d3bcc4bca9338bbd2",
+    ".qa/dependency-review/third/drupal-6.json": "d92ec11a9ed0e6d6582c1e03a77d1f21d2d2ac06a8ff6c1f8829b14e275a08df",
+    ".qa/dependency-review/third/drupal-7.json": "5cc71a192217e2bd1c84e3806a1e10a032e9f81952c8376517eb83fa7edfa3a4",
+    ".qa/dependency-review/third/drupal-8.json": "6c05165e1e03e9fc4ee6046c1be3d42a7b5e56f57bedfd0bf4716e17e359db9f",
+    ".qa/dependency-review/third/drupal-9.json": "f790b26b16147ac32b471024c233040f66d386ed4293395b2c0ebb1a203e28a4",
+    ".qa/dependency-review/third/progress.json": "71653a10145c24d9617a689d4259dc09e3237066856c5bfa1cab5a3c0af33103",
+    ".qa/dependency-review/third/result.json": "18bbea905ecbe4c372a9040c0097544e0b91c71d28b2262798bf3aafb8697b89",
+    ".qa/recovery/dependency-review-first.json": "e9ac1bd068e11939b0116c3e86c37506ff7d44d279c39ebc0d845180a0d56289",
+    ".qa/recovery/dependency-review-first.log": "00c7e0f88937d3eb5831334de7d5be15f145e396fe9787ca71105aff368e0e86",
+    ".qa/recovery/dependency-review-second.json": "8877661636f4027c4eb9ff4fc80a4ecaf18b985ede2da9d9322a9e5325946a75",
+    ".qa/recovery/dependency-review-second.log": "d0adf7df633a11adc7e94b6c91c237d855995a556e362f052c65deed214a0b44",
+    ".qa/recovery/dependency-review-third.json": "1b0fe22ac6e9380a2284a1e4c8eddcf74fbdac454d35ff9f6a85f70ee1a86fd7",
+    ".qa/recovery/dependency-review-third.log": "34b13e052052763530846c48df77cf0cb0a5b89ade96a8815b788bcf6081f8a1",
+    ".qa/recovery/dependency-review-final.json": "ea7de3011188bcc96a93397118fadb0b62196e1b34640e06efdc0a7455e6d8d2",
+    ".qa/recovery/dependency-review-final.log": "e0974b92ec7f8108ea6bbab32977b1bba8eec58a0c93ce0b58d8f62bfca2363e",
+    ".qa/recovery/dependency-review-final.started.json": "3a648f8ddf4f8f8a4307c57fe159eb72262774255cf334df929eb505a19134b2",
+    ".qa/recovery/dependency-review-first.started.json": "b75c96c82be391818558f60ff23038a1b64aeaf6117016bdd09774228292dcc8",
+    ".qa/recovery/dependency-review-second.started.json": "bde924f3e2e1df7fc6868854201406fabf00cab33d4593e48877a59f4c517690",
+    ".qa/recovery/dependency-review-third.started.json": "d7235b940957e1d746be3e05f7db129096dc7feb8e2c0bfb433e33b1a0162a98"
+  },
+  "result": {
+    "success": true,
+    "revision": "57f332dbb70dbbaf2a45fc2f6bf8fdd76c11f46a",
+    "node": "v22.23.2",
+    "platform": "linux",
+    "inputs": [
+      {
+        "path": "__tests__/extension-sync.test.ts",
+        "sha256": "5f520cdda673d78afd0024115f9adc6ce37973a6bcee4356a7279e543ff743ac"
+      },
+      {
+        "generated": "extensionTemplate(review-events)",
+        "sha256": "421bfbf182026c6180cc38e9aae845f3e416d2d6ff77fb4ff39d30b6b29e64d1"
+      },
+      {
+        "corpus": "pathauto",
+        "revision": "b97aadf47a37cff25f7d6105c3dade6778fccb47",
+        "path": "composer.json",
+        "sha256": "4c44de1b45f67616472a1ef5ece891ad7a9b06c6d37ac4d35264b07348c0965d"
+      },
+      {
+        "corpus": "pathauto",
+        "revision": "b97aadf47a37cff25f7d6105c3dade6778fccb47",
+        "path": "pathauto.routing.yml",
+        "sha256": "39d8d7d1300422cfe81b517cb28d34d40d9683906aac4aa450e7fc9bae7f62fe"
+      },
+      {
+        "corpus": "pathauto",
+        "revision": "b97aadf47a37cff25f7d6105c3dade6778fccb47",
+        "path": "src/Form/PathautoSettingsForm.php",
+        "sha256": "f5bf0e826c8b8d79328899eb6f22c88ad049f02e1577416ab6d3289de87ac6b2"
+      },
+      {
+        "corpus": "pathauto",
+        "revision": "b97aadf47a37cff25f7d6105c3dade6778fccb47",
+        "path": "src/Form/PathautoBulkUpdateForm.php",
+        "sha256": "f257129607c03e875e60a9f2990a1242ea90b060cb188cd4a955a3cb4060dd23"
+      },
+      {
+        "path": "dist/extensions/drupal-0.1.1.cgext",
+        "sha256": "e5ed73bee51524585e4f4da1d5017fdee3037a3fa71d8f08edab6c318fedc59a"
+      }
+    ],
+    "checks": [
+      {
+        "name": "negative symbol read: previously missing handler appears",
+        "scope": "expected stale-cache counterexample",
+        "staleHash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "expectedHash": "45b492602391a02b89271750bd19b8adbfe90a5394a5b09ad332b96ba933759f",
+        "capturedQueries": [
+          [
+            "readFile",
+            [
+              "binding.py"
+            ]
+          ],
+          [
+            "getNodesByName",
+            [
+              "dispatch"
+            ]
+          ],
+          [
+            "getNodesByName",
+            [
+              "missing"
+            ]
+          ]
+        ],
+        "corrected": true
+      },
+      {
+        "name": "negative file read: missing binding file appears",
+        "scope": "expected stale-cache counterexample",
+        "staleHash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "expectedHash": "b24fe7d1c11d7c6ccba58647cb309eaa7a1dc403ddef787a95ccee855595cfa5",
+        "capturedQueries": [
+          [
+            "readFile",
+            [
+              "binding.py"
+            ]
+          ],
+          [
+            "getNodesByName",
+            [
+              "dispatch"
+            ]
+          ],
+          [
+            "getNodesByName",
+            [
+              "receipt"
+            ]
+          ]
+        ],
+        "corrected": true
+      },
+      {
+        "name": "query membership: second same-named target makes prior unique result ambiguous",
+        "scope": "expected stale-cache counterexample",
+        "staleHash": "b24fe7d1c11d7c6ccba58647cb309eaa7a1dc403ddef787a95ccee855595cfa5",
+        "expectedHash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "capturedQueries": [
+          [
+            "readFile",
+            [
+              "binding.py"
+            ]
+          ],
+          [
+            "getNodesByName",
+            [
+              "dispatch"
+            ]
+          ],
+          [
+            "getNodesByName",
+            [
+              "receipt"
+            ]
+          ]
+        ],
+        "corrected": true
+      },
+      {
+        "name": "enumeration membership: new indexed registration file appears",
+        "scope": "expected stale-cache counterexample",
+        "staleHash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "expectedHash": "6f64ce95b2e116968754e87fc16bee6fd39801ebccc16eafaba6d251391d9ac4",
+        "capturedQueries": [
+          [
+            "getAllFiles",
+            []
+          ]
+        ],
+        "corrected": true
+      },
+      {
+        "name": "generic initial full evaluation",
+        "scope": "model with actual generic callback",
+        "ran": [
+          "generic:bindings"
+        ],
+        "reused": [],
+        "fallback": null,
+        "outputHash": "b24fe7d1c11d7c6ccba58647cb309eaa7a1dc403ddef787a95ccee855595cfa5",
+        "edges": 1
+      },
+      {
+        "name": "unchanged snapshot reuses callback",
+        "scope": "model with actual generic callback",
+        "ran": [],
+        "reused": [
+          "generic:bindings"
+        ],
+        "fallback": null,
+        "outputHash": "b24fe7d1c11d7c6ccba58647cb309eaa7a1dc403ddef787a95ccee855595cfa5",
+        "edges": 1
+      },
+      {
+        "name": "unread content change reuses callback",
+        "scope": "model with actual generic callback",
+        "ran": [],
+        "reused": [
+          "generic:bindings"
+        ],
+        "fallback": null,
+        "outputHash": "b24fe7d1c11d7c6ccba58647cb309eaa7a1dc403ddef787a95ccee855595cfa5",
+        "edges": 1
+      },
+      {
+        "name": "metadata retarget replaces old owned edge between untouched endpoints",
+        "scope": "model with actual generic callback",
+        "ran": [
+          "generic:bindings"
+        ],
+        "reused": [],
+        "fallback": null,
+        "outputHash": "79787a160058b1c8053a22bdc4249164b14dc4b05be7ee13e27429a83dc29002",
+        "edges": 1
+      },
+      {
+        "name": "target deletion removes owned output",
+        "scope": "model with actual generic callback",
+        "ran": [
+          "generic:bindings"
+        ],
+        "reused": [],
+        "fallback": null,
+        "outputHash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "edges": 0
+      },
+      {
+        "name": "target rename invalidates identity and selects new endpoint",
+        "scope": "model with actual generic callback",
+        "ran": [
+          "generic:bindings"
+        ],
+        "reused": [],
+        "fallback": null,
+        "outputHash": "92833698f6094a311fd3728ee7172e61a6ff4f4ebc0da0ee45118ce08a213f8b",
+        "edges": 1
+      },
+      {
+        "name": "same-ID node field change invalidates complete query value",
+        "scope": "model with actual generic callback",
+        "ran": [
+          "generic:bindings"
+        ],
+        "reused": [],
+        "fallback": null,
+        "outputHash": "92833698f6094a311fd3728ee7172e61a6ff4f4ebc0da0ee45118ce08a213f8b",
+        "edges": 1
+      },
+      {
+        "name": "option change is an invocation dependency",
+        "scope": "model with actual generic callback",
+        "ran": [
+          "generic:bindings"
+        ],
+        "reused": [],
+        "fallback": null,
+        "outputHash": "b24fe7d1c11d7c6ccba58647cb309eaa7a1dc403ddef787a95ccee855595cfa5",
+        "edges": 1
+      },
+      {
+        "name": "config and scan policy epoch invalidate",
+        "scope": "model with actual generic callback",
+        "ran": [
+          "generic:bindings"
+        ],
+        "reused": [],
+        "fallback": null,
+        "outputHash": "b24fe7d1c11d7c6ccba58647cb309eaa7a1dc403ddef787a95ccee855595cfa5",
+        "edges": 1
+      },
+      {
+        "name": "project identity prevents cross-project reuse",
+        "scope": "model with actual generic callback",
+        "ran": [
+          "generic:bindings"
+        ],
+        "reused": [],
+        "fallback": null,
+        "outputHash": "b24fe7d1c11d7c6ccba58647cb309eaa7a1dc403ddef787a95ccee855595cfa5",
+        "edges": 1
+      },
+      {
+        "name": "package digest change invalidates",
+        "scope": "model with actual generic callback",
+        "ran": [
+          "generic:bindings"
+        ],
+        "reused": [],
+        "fallback": null,
+        "outputHash": "b24fe7d1c11d7c6ccba58647cb309eaa7a1dc403ddef787a95ccee855595cfa5",
+        "edges": 1
+      },
+      {
+        "name": "throw preserves prior output and dependency generation",
+        "scope": "model commit only"
+      },
+      {
+        "name": "failed invocation retries without reusing partial trace",
+        "scope": "model with actual generic callback",
+        "ran": [
+          "generic:bindings"
+        ],
+        "reused": [],
+        "fallback": null,
+        "outputHash": "92833698f6094a311fd3728ee7172e61a6ff4f4ebc0da0ee45118ce08a213f8b",
+        "edges": 1
+      },
+      {
+        "name": "source observation race aborts model commit",
+        "scope": "model; no OS/SQLite transaction"
+      },
+      {
+        "name": "restart discards cache and reevaluates",
+        "scope": "model with actual generic callback",
+        "ran": [
+          "generic:bindings"
+        ],
+        "reused": [],
+        "fallback": null,
+        "outputHash": "92833698f6094a311fd3728ee7172e61a6ff4f4ebc0da0ee45118ce08a213f8b",
+        "edges": 1
+      },
+      {
+        "name": "empty directory observation invalidates when child appears",
+        "scope": "model rule fixture",
+        "ran": [
+          "directories"
+        ],
+        "reused": [],
+        "fallback": null,
+        "outputHash": "dae3a66bf58f8fcca8dd9fc8d6d597f7cf97148ac7b8d4bf22ca7fb0e3429e57",
+        "edges": 1
+      },
+      {
+        "name": "query result order is observable and preserved",
+        "scope": "model rule fixture",
+        "ran": [
+          "ordered-query"
+        ],
+        "reused": [],
+        "fallback": null,
+        "outputHash": "5e66fa0fffc6b61eccdbc8b3601622e6f7a27e1d2a072dea861ef78069ad1d23",
+        "edges": 1
+      },
+      {
+        "name": "upstream-stage edge membership invalidates supertype query",
+        "scope": "model rule fixture",
+        "ran": [
+          "supertype"
+        ],
+        "reused": [],
+        "fallback": null,
+        "outputHash": "58298e57b75c8c739b67c1e2de80e37ab25a34883d6de9afddaf140e93724c12",
+        "edges": 1
+      },
+      {
+        "name": "registry reorder changes first-pair winner",
+        "scope": "model rule fixture",
+        "ran": [
+          "b",
+          "a"
+        ],
+        "reused": [],
+        "fallback": null,
+        "outputHash": "5f393c9b9deef085739c39cdc042f34c06034c167c0ca9b1f16d33b76a49bfcb",
+        "edges": 1
+      },
+      {
+        "name": "removing first owner reveals shadowed contribution",
+        "scope": "model rule fixture",
+        "ran": [
+          "a"
+        ],
+        "reused": [],
+        "fallback": null,
+        "outputHash": "5752859ea59944924ec65df0f6359887695f3ba6735f6e0281ce903d46384301",
+        "edges": 1
+      },
+      {
+        "name": "disabling all owners removes all owned outputs",
+        "scope": "model rule fixture",
+        "ran": [],
+        "reused": [],
+        "fallback": null,
+        "outputHash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "edges": 0
+      },
+      {
+        "name": "unsupported context operation falls back to full schedule",
+        "scope": "model rule fixture",
+        "ran": [
+          "generic:bindings",
+          "unsupported"
+        ],
+        "reused": [],
+        "fallback": "unsupported context operation: getProjectAliases",
+        "outputHash": "fe3f0e12e34b7e86f2b602536b608f0cc813e9eead3b6d6348aefad94ffda144",
+        "edges": 2
+      },
+      {
+        "name": "caught unsupported read still taints capture and forces fallback",
+        "scope": "model rule fixture",
+        "ran": [
+          "unsupported"
+        ],
+        "reused": [],
+        "fallback": "unsupported context operation: getProjectAliases",
+        "outputHash": "6f64ce95b2e116968754e87fc16bee6fd39801ebccc16eafaba6d251391d9ac4",
+        "edges": 1
+      },
+      {
+        "name": "later-unit failure publishes neither earlier output nor its new cache",
+        "scope": "model transaction"
+      },
+      {
+        "name": "actual generated starter: detection membership enables resolution",
+        "scope": "model with actual generated starter",
+        "ran": [
+          "actual-starter-resolve"
+        ],
+        "reused": [],
+        "fallback": null,
+        "outputHash": "cf80bbbf01222d4ae42accd62e26ffd3dd15f1df3d5ac7f53303eb9d62a28ecc",
+        "edges": 1
+      },
+      {
+        "name": "actual generated starter: query ambiguity removes resolution",
+        "scope": "model with actual generated starter",
+        "ran": [
+          "actual-starter-resolve"
+        ],
+        "reused": [],
+        "fallback": null,
+        "outputHash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "edges": 0
+      },
+      {
+        "name": "declaration-only admission is UNSOUND for real cross-file fs hook",
+        "scope": "actual existing hook, expected stale result"
+      },
+      {
+        "name": "legacy hook forces whole-schedule evaluation",
+        "scope": "model rule fixture",
+        "ran": [
+          "actual-untracked-hook",
+          "generic:bindings"
+        ],
+        "reused": [],
+        "fallback": "legacy/untracked unit: whole schedule",
+        "outputHash": "cf8895836c591991df7bf5c209e122dbba105bad1aa6551a83280eba817eebc7",
+        "edges": 2
+      },
+      {
+        "name": "external environment is global fallback, never inferred from returned edges",
+        "scope": "model rule fixture",
+        "ran": [
+          "untracked-env-model"
+        ],
+        "reused": [],
+        "fallback": "legacy/untracked unit: whole schedule",
+        "outputHash": "1c6910c8fc1a545dddff7b1531a74fbbe2d9723c5ab44a9df66e61259a77b007",
+        "edges": 1
+      },
+      {
+        "name": "Drupal actual full oracle: missing form target",
+        "scope": "model vs unmodified Drupal callback AND actual managed SQLite full rebuild on pinned subset",
+        "nodes": 30,
+        "edges": 1,
+        "graphHash": "569f187d6e3263a9070a28744355bcba97803d2b3512f51a28f85e6a96df7c6d",
+        "reads": 6,
+        "ran": [
+          "drupal:wiring"
+        ],
+        "reused": []
+      },
+      {
+        "name": "Drupal actual full oracle: missing form appears",
+        "scope": "model vs unmodified Drupal callback AND actual managed SQLite full rebuild on pinned subset",
+        "nodes": 51,
+        "edges": 2,
+        "graphHash": "c2a05f51a2a26279830514bc4855718832d296957fd590019c60b7847b6f93fe",
+        "reads": 8,
+        "ran": [
+          "drupal:wiring"
+        ],
+        "reused": []
+      },
+      {
+        "name": "Drupal actual full oracle: duplicate class removes ambiguous route",
+        "scope": "model vs unmodified Drupal callback AND actual managed SQLite full rebuild on pinned subset",
+        "nodes": 72,
+        "edges": 1,
+        "graphHash": "569f187d6e3263a9070a28744355bcba97803d2b3512f51a28f85e6a96df7c6d",
+        "reads": 10,
+        "ran": [
+          "drupal:wiring"
+        ],
+        "reused": []
+      },
+      {
+        "name": "Drupal actual full oracle: duplicate deletion restores route",
+        "scope": "model vs unmodified Drupal callback AND actual managed SQLite full rebuild on pinned subset",
+        "nodes": 51,
+        "edges": 2,
+        "graphHash": "c2a05f51a2a26279830514bc4855718832d296957fd590019c60b7847b6f93fe",
+        "reads": 8,
+        "ran": [
+          "drupal:wiring"
+        ],
+        "reused": []
+      },
+      {
+        "name": "Drupal actual full oracle: YAML retargets untouched PHP endpoints",
+        "scope": "model vs unmodified Drupal callback AND actual managed SQLite full rebuild on pinned subset",
+        "nodes": 51,
+        "edges": 2,
+        "graphHash": "c9db62ffc10207eaa1c679ead38bf12ca02abbbb3090b30ad9ae01675593a05f",
+        "reads": 8,
+        "ran": [
+          "drupal:wiring"
+        ],
+        "reused": []
+      },
+      {
+        "name": "Drupal actual full oracle: target rename changes endpoint identity",
+        "scope": "model vs unmodified Drupal callback AND actual managed SQLite full rebuild on pinned subset",
+        "nodes": 51,
+        "edges": 2,
+        "graphHash": "9ca89614fbc032b77fb0e05b62c627b32904ba739aae44d898a8b8e028b11098",
+        "reads": 8,
+        "ran": [
+          "drupal:wiring"
+        ],
+        "reused": []
+      },
+      {
+        "name": "Drupal actual full oracle: target deletion removes both routes",
+        "scope": "model vs unmodified Drupal callback AND actual managed SQLite full rebuild on pinned subset",
+        "nodes": 29,
+        "edges": 0,
+        "graphHash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "reads": 6,
+        "ran": [
+          "drupal:wiring"
+        ],
+        "reused": []
+      },
+      {
+        "name": "Drupal actual full oracle: target restoration restores both routes",
+        "scope": "model vs unmodified Drupal callback AND actual managed SQLite full rebuild on pinned subset",
+        "nodes": 51,
+        "edges": 2,
+        "graphHash": "c9db62ffc10207eaa1c679ead38bf12ca02abbbb3090b30ad9ae01675593a05f",
+        "reads": 8,
+        "ran": [
+          "drupal:wiring"
+        ],
+        "reused": []
+      },
+      {
+        "name": "Drupal actual full oracle: non-indexed composer detection turns off wiring and nodes",
+        "scope": "model vs unmodified Drupal callback AND actual managed SQLite full rebuild on pinned subset",
+        "nodes": 43,
+        "edges": 0,
+        "graphHash": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "reads": 2,
+        "ran": [
+          "drupal:wiring"
+        ],
+        "reused": []
+      }
+    ],
+    "productionCachingEnabled": false,
+    "limits": [
+      "In-memory model; no cache integrated into engine",
+      "Admission flag is not a sandbox",
+      "Drupal oracle uses four pinned files, not full corpus",
+      "No new latency, restart/process-kill or hosted proof"
+    ]
+  },
+  "boundaries": {
+    "modelChecks": 33,
+    "actualManagedEngineReferenceStates": 9,
+    "productionCacheIntegrated": false,
+    "reranFullLinuxOrNative": false,
+    "precommitFailures": [
+      "Artifact UTF-8 decode harness error",
+      "Expected route absent after detection disabled; harness corrected with explicit absence assertions"
+    ],
+    "earlyAttemptSourceLimit": "Initial dirty harness versions were not committed separately; receipts/logs retained. Final source copies match tested commit."
+  }
+}

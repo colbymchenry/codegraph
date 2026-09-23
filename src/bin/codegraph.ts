@@ -1012,6 +1012,8 @@ program
     const worktreeMismatch = detectWorktreeIndexMismatch(startPath, projectPath);
 
     try {
+      const { recoverExtensions } = await import('../plugins/recovery');
+      recoverExtensions(projectPath);
       if (!isInitialized(projectPath)) {
         if (options.json) {
           console.log(JSON.stringify({
@@ -2806,6 +2808,19 @@ program
  * (see top of main). This subcommand makes `codegraph version` work and lists
  * the version affordance in `codegraph --help`.
  */
+// Command registration is lightweight; heavy implementation loads only when invoked.
+// Preserve extension --version pins for the lazily registered subcommands;
+// the root's engine-version flag must not consume them first.
+if (process.argv[2] === 'extensions') program.enablePositionalOptions();
+const extensionCommands = program.command('extensions').description('Install and manage framework extensions').allowUnknownOption().allowExcessArguments();
+extensionCommands.action(async () => {
+  const { registerExtensionCommands } = await import('../plugins/cli');
+  const cli = new Command().name('codegraph');
+  registerExtensionCommands(cli);
+  try { await cli.parseAsync(process.argv); }
+  catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+});
+
 program
   .command('version')
   .description('Print the installed CodeGraph version (also: -v, --version)')

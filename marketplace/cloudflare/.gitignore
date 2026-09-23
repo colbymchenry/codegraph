@@ -1,0 +1,8 @@
+node_modules/
+.build/
+.wrangler/
+.dev.vars*
+wrangler.deploy.json
+wrangler.window.json
+wrangler.restore.json
+wrangler.source-ui.json

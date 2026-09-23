@@ -1,0 +1,14 @@
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "/api/gateway" },
+    { "source": "/extensions/:path*", "destination": "/index.html" },
+    { "source": "/publish", "destination": "/index.html" }
+  ],
+  "headers": [{ "source": "/(.*)", "headers": [
+    { "key": "Referrer-Policy", "value": "no-referrer" },
+    { "key": "X-Content-Type-Options", "value": "nosniff" },
+    { "key": "Content-Security-Policy", "value": "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'" }
+  ]}]
+}

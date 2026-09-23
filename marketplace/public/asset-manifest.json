@@ -1,0 +1,111 @@
+{
+  "packages": {
+    "lucide-static": "0.468.0",
+    "@fontsource-variable/archivo": "5.2.8",
+    "@fontsource/ibm-plex-mono": "5.2.7"
+  },
+  "icons": [
+    "arrow-up-right",
+    "arrow-right",
+    "arrow-left",
+    "search",
+    "download",
+    "upload",
+    "badge-check",
+    "plug",
+    "refresh-cw",
+    "shield-check",
+    "code-xml",
+    "file-code-2",
+    "files",
+    "copy",
+    "x",
+    "chevron-left",
+    "chevron-right",
+    "circle-alert",
+    "loader-circle",
+    "trash-2",
+    "power",
+    "key-round",
+    "external-link",
+    "package",
+    "monitor",
+    "circle-check"
+  ],
+  "inputs": {
+    "lucide-static/package.json": "6b4e2b5cf36a1cf9fa0832c6ede322c5bafd93d5667eeac8fa2e3aeea57dceca",
+    "@fontsource-variable/archivo/package.json": "8cfd334ce0a9dc9ba0baaf89b1b678aef986533a48ea7b5c7a6ba21d4540d609",
+    "@fontsource/ibm-plex-mono/package.json": "6226dd2fe4c2c8216a398e7c708efec8f7b1d266512584de234fcfcf559035a5",
+    "lucide-static/icons/arrow-up-right.svg": "7a58fb69deddd385b9bd47b406d3e9f3ccfbe11b319efcd5071cbd5b19c1bd4f",
+    "lucide-static/icons/arrow-right.svg": "12b97a4d2821da556ce7df95f89df46deb94aa711d46b36a848be0de0ac2a7f0",
+    "lucide-static/icons/arrow-left.svg": "e31ed0af85ffbed2b54f78f37af197c3b84b24e776cba1d27613d6a9ad555a16",
+    "lucide-static/icons/search.svg": "e11a04d51c122a8a759211424920efc65fa36b7ab06237c34ef90317d920ddf9",
+    "lucide-static/icons/download.svg": "f68a21e11115edc0aef51ac6f8f4618e14d2b92055f1cb9f5d670efc696bea85",
+    "lucide-static/icons/upload.svg": "ebdb92b0456cbae0a2897676607490897734deda0248aa3369d864e94ad28f28",
+    "lucide-static/icons/badge-check.svg": "5e378751554e5b2a0ffdf395590c8e87fc0d472210693a92ee586aea68ce308c",
+    "lucide-static/icons/plug.svg": "2cb346fd91bbdda3fc21d73625c242c2e96a5f26783fa0c9737cdd57543cc0c5",
+    "lucide-static/icons/refresh-cw.svg": "d63b359b0fe05e03cff8aaa7acf82f9569733e83f7fb4742d583a086972c4bb0",
+    "lucide-static/icons/shield-check.svg": "0e9116845c6053cd3bfa09a3e4c232f5fb28c3abab75792287d2aed31c24ebe7",
+    "lucide-static/icons/code-xml.svg": "7c6551292a71cfff12c70727124f3c76832c903263af142b9e61da826fa4b2a5",
+    "lucide-static/icons/file-code-2.svg": "d4f244a6ba7f5e646cd801ac2ff54fd1a40c4f5190b857b822d44d165326a0bf",
+    "lucide-static/icons/files.svg": "59df6669b61261311a83a807116a61a001dd4b4f29bb8867a5e84f42bc97b150",
+    "lucide-static/icons/copy.svg": "6828c476979a7e4d5ae3ac726f8fadbcab066ec53299b7f8422cda321a60a841",
+    "lucide-static/icons/x.svg": "0f38855d9d5775c10960ae53e46b745f77914b43f78c43bf8abc39f4d5e06de1",
+    "lucide-static/icons/chevron-left.svg": "a185985349089649d06747570c72f47fe1f5eb293a9a0f11278f6442b0b9d25c",
+    "lucide-static/icons/chevron-right.svg": "fea488a3b60fd7738bbbf8ca98826ef5c0381347c5fd1048d45ee70a75a51cfe",
+    "lucide-static/icons/circle-alert.svg": "2c65a5c03a73d3115ce493779f82af98d94f0d72facf1d97c61ea08566bb401c",
+    "lucide-static/icons/loader-circle.svg": "44ad0f822a89b28a3feecf7276686c818a92a4a9c77cc51404c58929e30f0f3a",
+    "lucide-static/icons/trash-2.svg": "9268a35cfb4f9d852c3d13f2c91476dd067c21c20e2bcdb0093fd93fd0bf34b7",
+    "lucide-static/icons/power.svg": "0fe9fe8cc5ffa3bc81da60b80af8c4ceff557aa8b87e913b1a86aa8f4bc01382",
+    "lucide-static/icons/key-round.svg": "a0d77f9b3f399ba0f44a49945b69abe0aad0e37e524fa81f7e3f271bddcc4936",
+    "lucide-static/icons/external-link.svg": "15432d67349662d1427ca5b8cc52d4152a9a893a251a842a817de1974a6b5766",
+    "lucide-static/icons/package.svg": "d2bb2edb3e9acc1d00535af3596837558b761b24d8933070d5565b71eeaac74f",
+    "lucide-static/icons/monitor.svg": "3ef31ab3ab45c174485e0c1dfc3bd3b54ae51cb74df8230a0e136d78ca580efd",
+    "lucide-static/icons/circle-check.svg": "d48c0901de2262e9f7c0566b5ad3893eafeab509715be6ac4e3b449f15d9260b",
+    "lucide-static/LICENSE": "1e7290b35280a048667bbf0ebabac1c7fd52a75300e8b2946ac165715997f2bc",
+    "@fontsource-variable/archivo/LICENSE": "c3c8402eec0e31dc9a76851235b1c02a0bb821488b2db8e35bcc2ab60ca8fc2b",
+    "@fontsource/ibm-plex-mono/LICENSE": "23b0a9d0c6d3f140a0b77e483c5cfa6bba574325ef5cb189ed9f2fec4884533f",
+    "@fontsource-variable/archivo/files/archivo-latin-wght-normal.woff2": "8f704806dbedeaaeca334b11ec348bc3ac3a439d6431544b3afb54f534ee4967",
+    "@fontsource/ibm-plex-mono/files/ibm-plex-mono-latin-400-normal.woff2": "08949f728dc52d528e69b1667d15c89a5686a4ee9a296ff90983985f99c380f7",
+    "@fontsource/ibm-plex-mono/files/ibm-plex-mono-latin-500-normal.woff2": "01d285447409c8a588692162439a038b8cbd7871309ee20267b0d2d91c6e8e22",
+    "@fontsource/ibm-plex-mono/files/ibm-plex-mono-latin-600-normal.woff2": "0d1f0b8d0722224e32e9f28261bdc86c79115be73444ae5eceb73976a1bcdf83"
+  },
+  "outputs": {
+    "icons.js": {
+      "sha256": "00cbaf094ebd45cac3fa118db73e90124e0bfa13e2a76f6c5fb44be6ae1be962",
+      "bytes": 4385
+    },
+    "licenses/lucide.txt": {
+      "sha256": "1e7290b35280a048667bbf0ebabac1c7fd52a75300e8b2946ac165715997f2bc",
+      "bytes": 880
+    },
+    "licenses/archivo.txt": {
+      "sha256": "c3c8402eec0e31dc9a76851235b1c02a0bb821488b2db8e35bcc2ab60ca8fc2b",
+      "bytes": 4503
+    },
+    "licenses/ibm-plex-mono.txt": {
+      "sha256": "23b0a9d0c6d3f140a0b77e483c5cfa6bba574325ef5cb189ed9f2fec4884533f",
+      "bytes": 5299
+    },
+    "fonts/archivo-latin-wght-normal.woff2": {
+      "sha256": "8f704806dbedeaaeca334b11ec348bc3ac3a439d6431544b3afb54f534ee4967",
+      "bytes": 34928
+    },
+    "fonts/ibm-plex-mono-latin-400-normal.woff2": {
+      "sha256": "08949f728dc52d528e69b1667d15c89a5686a4ee9a296ff90983985f99c380f7",
+      "bytes": 14708
+    },
+    "fonts/ibm-plex-mono-latin-500-normal.woff2": {
+      "sha256": "01d285447409c8a588692162439a038b8cbd7871309ee20267b0d2d91c6e8e22",
+      "bytes": 14888
+    },
+    "fonts/ibm-plex-mono-latin-600-normal.woff2": {
+      "sha256": "0d1f0b8d0722224e32e9f28261bdc86c79115be73444ae5eceb73976a1bcdf83",
+      "bytes": 15620
+    },
+    "fonts.css": {
+      "sha256": "406d1608eab9daccfeae30aa8c463860be88062453f77084fcf60212cfdc6c1a",
+      "bytes": 743
+    }
+  }
+}

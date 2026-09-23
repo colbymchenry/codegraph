@@ -1,3 +1,4 @@
+import { currentPlugins, mergePluginDiagnostics } from '../plugins/registry';
 /**
  * Parse worker pool — runs tree-sitter parsing across N worker threads so a full
  * `codegraph index` uses every core instead of pinning one.
@@ -29,6 +30,7 @@
 
 import { Worker } from 'worker_threads';
 import type { Language, ExtractionResult } from '../types';
+import type { ReusableExtraction } from './core-reuse';
 
 /**
  * Minimal worker surface the pool drives — satisfied by a real `worker_threads`
@@ -51,6 +53,8 @@ export interface ParseTask {
   content: string;
   language: Language;
   frameworkNames?: string[];
+  reuseCore?: boolean;
+  coreExtraction?: ExtractionResult;
 }
 
 /** Default upper bound on the pool size derived from the core count. */
@@ -149,6 +153,7 @@ interface ParseJob {
 
 /** Shape of a message a worker posts back (grammar-load ack or a parse result). */
 interface ParseWorkerMessage {
+  diagnostics?: import('../plugins/api').PluginDiagnostic[];
   type?: string;
   id?: number;
   result?: ExtractionResult;
@@ -195,6 +200,7 @@ export class ParseWorkerPool {
   private totalCrashes = 0;
   private destroyed = false;
 
+  private readonly plugins = currentPlugins();
   private readonly languages: Language[];
   private readonly maxSize: number;
   private readonly recycleInterval: number;
@@ -258,7 +264,7 @@ export class ParseWorkerPool {
    * if the parse times out or its worker crashes — the caller records the error
    * and (for worker-exit/OOM/timeout rejections) re-attempts in its retry pass.
    */
-  requestParse(task: ParseTask): Promise<ExtractionResult> {
+  requestParse(task: ParseTask): Promise<ReusableExtraction> {
     if (this.destroyed) return Promise.reject(new Error('Parse pool destroyed'));
     return new Promise<ExtractionResult>((resolve, reject) => {
       this.queue.push({ id: this.nextId++, task, resolve, reject, settled: false });
@@ -284,10 +290,11 @@ export class ParseWorkerPool {
     // Load grammars; the worker replies 'grammars-loaded' and only then is idle.
     // Pre-read WASM bytes (when the orchestrator provided them) make this a
     // memory load instead of a per-spawn disk read.
-    w.postMessage({ type: 'load-grammars', languages: this.languages, grammarBuffers: this.grammarBuffers });
+    w.postMessage({ type: 'load-grammars', languages: this.languages, grammarBuffers: this.grammarBuffers, plugins: this.plugins?.resolved, projectRoot: this.plugins?.projectRoot });
   }
 
   private onMessage(w: ParsePoolWorker, m: ParseWorkerMessage): void {
+    mergePluginDiagnostics(this.plugins, m.diagnostics);
     if (m.type === 'grammars-loaded') {
       if (!this.workers.has(w)) return; // recycled/destroyed before ready
       this.pending.delete(w);
@@ -374,6 +381,8 @@ export class ParseWorkerPool {
       content: job.task.content,
       frameworkNames: job.task.frameworkNames,
       language: job.task.language,
+      reuseCore: job.task.reuseCore,
+      coreExtraction: job.task.coreExtraction,
     });
   }
 

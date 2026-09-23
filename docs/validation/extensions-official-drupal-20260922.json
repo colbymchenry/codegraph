@@ -1,0 +1,4250 @@
+{
+  "format": 1,
+  "recordedAt": "2026-09-22T12:42:43.155740+00:00",
+  "branch": "feature/extensions-author-kit-20260922",
+  "pr": "https://github.com/colbymchenry/codegraph/pull/1911",
+  "sourceRevision": "5d406969056bd75e48de05500f8ed9b143c1d66e",
+  "additionalChecksRevision": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+  "sourceDelta": [
+    "CHANGELOG.md",
+    "docs/extensions/cloudflare-hosting.md",
+    "docs/extensions/official-drupal-import.md"
+  ],
+  "hostedCloudflare": false,
+  "remoteWrites": false,
+  "sourceFiles": [
+    {
+      "path": "marketplace/cloudflare/backup.mjs",
+      "bytes": 4891,
+      "sha256": "636ba4aa1490a267e745fa58872c7e6eb6da7e6a2b7616ff41f96127a09fc5bb"
+    },
+    {
+      "path": "marketplace/cloudflare/local.mjs",
+      "bytes": 1969,
+      "sha256": "452dadfa4cbf567531a0bbca359de138e290d4a36bbce951534c8ed460f57df8"
+    },
+    {
+      "path": "marketplace/cloudflare/migrations/0002_official_operator.sql",
+      "bytes": 393,
+      "sha256": "c338456b5e63451304a7081e50f8196881d3a9a239a75ce9c6a4bcd4d10f3149"
+    },
+    {
+      "path": "marketplace/cloudflare/official-cli.mjs",
+      "bytes": 2674,
+      "sha256": "88858384b3334891ae988072b18677873c578ec64234174bb9ce702a8f32028a"
+    },
+    {
+      "path": "marketplace/cloudflare/official-policy.json",
+      "bytes": 1338,
+      "sha256": "5f4a752963674c32d2ce8ccf5d4963ddeb5a73b73cb67a805ceda642340ecd4f"
+    },
+    {
+      "path": "marketplace/cloudflare/official-remote.mjs",
+      "bytes": 3558,
+      "sha256": "f71141e8ce3f433dcc3737a06c9cf18cee1eb192243dcff743ee74426ecfd0c4"
+    },
+    {
+      "path": "marketplace/cloudflare/official-test.mjs",
+      "bytes": 10724,
+      "sha256": "66761ebd215617e110d25e0aa07abcd8ffafdcfa1acec7b044e09bf092971b2d"
+    },
+    {
+      "path": "marketplace/cloudflare/official.mjs",
+      "bytes": 6535,
+      "sha256": "1f69d70dd0520ed2b28abc45d90a07d335d766a6cfd6c92be0eff2b8aec8c71f"
+    },
+    {
+      "path": "marketplace/cloudflare/package-lock.json",
+      "bytes": 49900,
+      "sha256": "50e94ebca41788619b4f9b97a79dfffd60392b09cbae8e88869768d7d4f0a4f7"
+    },
+    {
+      "path": "marketplace/cloudflare/package.json",
+      "bytes": 408,
+      "sha256": "97470c687f45a99b5e987ba7bd2cfd7208692ad41a308aab2f3a03ededeb06fc"
+    },
+    {
+      "path": "marketplace/cloudflare/worker.ts",
+      "bytes": 10895,
+      "sha256": "2458ab5dcbd404824945e239665c472c2534ecdca93c7a9394a4a034692b683f"
+    },
+    {
+      "path": "scripts/validation/cloudflare-official-drupal.cjs",
+      "bytes": 9888,
+      "sha256": "98c43564ffd05396885d6dd900514f83f459cc61fc32c74e793f555225a55ed7"
+    }
+  ],
+  "compiledFiles": [
+    {
+      "path": "marketplace/cloudflare/.build/test-worker.js",
+      "bytes": 145942,
+      "sha256": "9a050c581a5677eb246f8728c69246104f335efd89d90e9f00737015fafa3474"
+    },
+    {
+      "path": "marketplace/cloudflare/.build/test-worker.ts.meta.json",
+      "bytes": 60816,
+      "sha256": "e5392c50afbf46b9a82d862f693c934e15a193096f621c8f27125db9feb20dd3"
+    },
+    {
+      "path": "marketplace/cloudflare/.build/worker.js",
+      "bytes": 145630,
+      "sha256": "981f24d6518908fa33259a3e3e8cb4d3d6d9a073446ccfa3132c1a98c52e7cb9"
+    },
+    {
+      "path": "marketplace/cloudflare/.build/worker.ts.meta.json",
+      "bytes": 60607,
+      "sha256": "9adecfa63207a9e2ae0ace8645aa9ba2afdb7dc79c7e993800f6f8ef5f52ff0f"
+    },
+    {
+      "path": "dist/plugins/package.js",
+      "bytes": 6553,
+      "sha256": "039abfd75cfc0d68bf3254ac944d948378a3b0f68a723c17c110951110d4dd1f"
+    },
+    {
+      "path": "dist/plugins/package-validation.js",
+      "bytes": 4355,
+      "sha256": "ce3d069c645bf04b7fc4fe1c55ce04520eedb2cc1d75b39c603f816358a39ea9"
+    },
+    {
+      "path": "dist/plugins/manager.js",
+      "bytes": 10481,
+      "sha256": "143535f6590b35b55180f48d39b6ab6d2d94062938da418c8ac5bdf856ee4400"
+    },
+    {
+      "path": "dist/plugins/releases.js",
+      "bytes": 5088,
+      "sha256": "cb586bd81a266eb187e0babc74193a66cff096b6cdeba6b6489e241b15824796"
+    },
+    {
+      "path": "dist/plugins/bridge.js",
+      "bytes": 12298,
+      "sha256": "a98b1159482e5b312dd40d5fbf0387e0d52e8ffde5ff56f0de61b3187f55ef12"
+    },
+    {
+      "path": "dist/extensions/drupal.cgext",
+      "bytes": 289167,
+      "sha256": "e5015747d02fe50d6af607b6c44f1db9cf7969a0070866ed03c7643377a459c8"
+    }
+  ],
+  "localResults": {
+    "operator": {
+      "revision": "5d406969056bd75e48de05500f8ed9b143c1d66e",
+      "dirty": false,
+      "checks": [
+        "unsupported extension API rejected before writes",
+        "malformed package rejected before writes",
+        "incompatible target engine rejected before writes",
+        "tampered but valid JSON package rejected by reviewed provenance pin",
+        "edited publication plan rejected",
+        "wrong registry identity rejected",
+        "official identity provenance and exact bytes published through real D1/R2",
+        "safe repeated plan is idempotent and retains original listing",
+        "public API rejects official identity spoof while preserving community publication",
+        "community cannot replace reserved official Drupal ownership",
+        "prior community ownership is not stolen by operator import",
+        "existing immutable version metadata conflict is not overwritten",
+        "concurrent identical official imports converge to one release",
+        "R2 and D1 failures expose no release or orphan owner; exact retry succeeds",
+        "idempotent repeat detects corrupt object and never repairs by silent overwrite",
+        "official provenance ownership and bytes survive isolated backup restore",
+        "explicit CLI target plan hash confirmation and repeat operation work",
+        "remote adapter uses fixed account endpoints and conditional S3 creation (contract only)",
+        "remote binding mismatch stops before database or object writes (contract only)"
+      ],
+      "commands": [
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "official-cli.mjs",
+            "inspect-local",
+            "/tmp/cg-official-FHB9qK/main"
+          ],
+          "exit": 0,
+          "sha256": "20e5f0c30aa5826d2a5e1a6742e36df0e5c650b3b5707ccf3a8798a7629da38f",
+          "log": "command-1.log"
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "official-cli.mjs",
+            "plan",
+            "/tmp/cg-official-FHB9qK/target.json",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/extensions/drupal.cgext",
+            "/tmp/cg-official-FHB9qK/plan.json"
+          ],
+          "exit": 0,
+          "sha256": "88ac6e072f56e473bb1043e953afbd1af5068afad4069f0a76ff5f0e4cade575",
+          "log": "command-2.log"
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "official-cli.mjs",
+            "apply",
+            "/tmp/cg-official-FHB9qK/plan.json",
+            "--confirm-plan-sha256",
+            "0000000000000000000000000000000000000000000000000000000000000000"
+          ],
+          "exit": 1,
+          "sha256": "f13557a940e03312ca474e10a736e7d3ab07214f2cdaef7b9622bbe2c2886d44",
+          "log": "command-3.log"
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "official-cli.mjs",
+            "apply",
+            "/tmp/cg-official-FHB9qK/plan.json",
+            "--confirm-plan-sha256",
+            "de52667d3d6c358e24e4c1c3405c31a60295e53248e82ac48809c32a535a1089"
+          ],
+          "exit": 0,
+          "sha256": "60667884f0e2a9a5b53b8e028ee56706e4abe455315ac3c13c680f322445463f",
+          "log": "command-4.log"
+        }
+      ],
+      "artifactSHA": "e5015747d02fe50d6af607b6c44f1db9cf7969a0070866ed03c7643377a459c8",
+      "artifactBytes": 289167,
+      "success": true
+    },
+    "officialDrupalBrowser": {
+      "revision": "5d406969056bd75e48de05500f8ed9b143c1d66e",
+      "dirty": false,
+      "platform": "linux",
+      "browser": "153.0.8010.36",
+      "corpus": {
+        "name": "pathauto",
+        "revision": "b97aadf47a37cff25f7d6105c3dade6778fccb47"
+      },
+      "checks": [
+        "reviewed operator CLI imports actual team Drupal artifact into real Worker D1/R2",
+        "official catalog filter displays trusted CodeGraph Drupal identity",
+        "one connection and one Install refresh only selected pinned Drupal project; four real route hook and DI edges verified",
+        "tampered registry artifact fails installation without changing existing graph or config",
+        "incompatible and malformed installs preserve previously working Drupal graph",
+        "browser disable removes actual extension contributions",
+        "browser enable restores expected graph and mobile official details",
+        "browser removal clears extension config and SQLite contributions; no page errors"
+      ],
+      "commands": [
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/marketplace/cloudflare/official-cli.mjs",
+            "inspect-local",
+            "/tmp/cg-official-browser-lg2vQT/registry"
+          ],
+          "exit": 0,
+          "log": "operator-1.log",
+          "sha256": "21ec240ceca7006118421de6266b183263b153fa2d2779967b82ca96e81df717"
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/marketplace/cloudflare/official-cli.mjs",
+            "plan",
+            "/tmp/cg-official-browser-lg2vQT/target.json",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/extensions/drupal.cgext",
+            "/tmp/cg-official-browser-lg2vQT/plan.json"
+          ],
+          "exit": 0,
+          "log": "operator-2.log",
+          "sha256": "5901b0e358d8b238bf80689bcb0be9cd6aa882dc4d8e1f9f819e63d56efa231f"
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/marketplace/cloudflare/official-cli.mjs",
+            "apply",
+            "/tmp/cg-official-browser-lg2vQT/plan.json",
+            "--confirm-plan-sha256",
+            "e9255a4d517db60750cd176144aee77074a6640336964198a8613d709b78960b"
+          ],
+          "exit": 0,
+          "log": "operator-3.log",
+          "sha256": "79224ce85edb145500e36bea351ad88da21fe163f7b59053bc2587d9ab0d9d3f"
+        }
+      ],
+      "success": true
+    },
+    "workerRuntime": {
+      "revision": "5d406969056bd75e48de05500f8ed9b143c1d66e",
+      "dirty": false,
+      "platform": "linux",
+      "node": "v22.23.2",
+      "checks": [
+        "Web Crypto signature and SPKI identity match Node publisher",
+        "catalog and immutable R2 package bytes agree",
+        "missing and corrupt stored artifacts fail closed instead of serving bytes",
+        "replay and immutable version reject without replacement",
+        "existing publisher owns later versions",
+        "invalid signatures packages and unsupported API rejected",
+        "cross-origin publication rejected",
+        "R2 boundary failures expose no catalog and exact signed retry succeeds",
+        "lost response after D1 commit retains release and replay guard",
+        "concurrent same-version commit has one winner",
+        "concurrent initial publisher ownership has one winner",
+        "D1 failure rolls back release ownership and replay nonce",
+        "isolated D1/R2 backup restore retains listing ownership and nonce; refuses live overwrite",
+        "corrupt snapshot cannot expose a restored catalog",
+        "replacement Worker runtime retains D1 metadata and R2 bytes",
+        "8 MiB package survives Worker crypto D1 metadata and R2 upload/download",
+        "over-limit package rejected",
+        "D1 rate limit survives distributed requests",
+        "real test-owned process kills after R2 and D1 boundaries recover in fresh runtime",
+        "production bundle has no test failure control",
+        "publication stays disabled until explicitly enabled"
+      ],
+      "receipts": [
+        {
+          "exit": null,
+          "signal": "SIGKILL",
+          "log": "child-1.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "exit": null,
+          "signal": "SIGKILL",
+          "log": "child-2.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "snapshot": {
+        "releases": 7,
+        "objects": 7
+      },
+      "largePackage": {
+        "bytes": 8388608,
+        "wallMilliseconds": 898.7431269999997,
+        "note": "Local wall time includes storage I/O; not Cloudflare CPU billing measurement"
+      },
+      "success": true
+    },
+    "workerCompatibility": {
+      "checks": [
+        "signed immutable versions; semantic catalog order independent of publication order",
+        "one browser Install selects 1.10.0 over incompatible 9.0.0 and preview; actual Python graph refreshed only in chosen destination",
+        "no-compatible browser selection/command fails usefully and preserves existing config/graph",
+        "headless automatic selection agrees; exact incompatible pin/no-compatible/missing update fail without mutation",
+        "prerelease requires explicit exact pin; automatic update refuses downgrade; explicit lower pin remains exact",
+        "compatible but broken update retains previous version and graph",
+        "browser and headless update to highest compatible stable; stale graph labels removed",
+        "exact artifact URL/file semantics and build-metadata pin identity preserved",
+        "removal cleans contributions; desktop/mobile display actual destination compatibility; no page errors"
+      ],
+      "releases": [
+        {
+          "id": "compatible-demo",
+          "version": "1.10.0",
+          "engines": ">=1.6.0 <2",
+          "integrity": "d59f9b1e9bd7d027081de45ab004aefe3236708ddeb4fc7135c92502ce0866d8"
+        },
+        {
+          "id": "compatible-demo",
+          "version": "1.9.0",
+          "engines": ">=1.6.0 <2",
+          "integrity": "07e64445b8c7205ec9a1d76c9e29affbd55d45e0817e9c3d92572b9f00486fcd"
+        },
+        {
+          "id": "compatible-demo",
+          "version": "0.5.0",
+          "engines": ">=1.6.0 <2",
+          "integrity": "ad3c944ff2bea24feb81cb25839746b72e4845b9dae3cba3a4e2ce872855114d"
+        },
+        {
+          "id": "compatible-demo",
+          "version": "20.0.0-beta.1",
+          "engines": ">=1.6.0 <2",
+          "integrity": "1a24723ecad51739315c4a6439227ff0a884700647ac505db74a12949fa99c82"
+        },
+        {
+          "id": "compatible-demo",
+          "version": "9.0.0",
+          "engines": ">=9",
+          "integrity": "c3f802635737b02d15f6fe3e82cde56c41a1c83c8a9cc0858ef964b49be206c9"
+        },
+        {
+          "id": "unavailable-demo",
+          "version": "1.0.0",
+          "engines": ">=9",
+          "integrity": "bc25c179402f994d59e586491cc0921d01ddc6dcf12bea9274982df745f42ef0"
+        },
+        {
+          "id": "compatible-demo",
+          "version": "2.0.0",
+          "engines": ">=1.6.0 <2",
+          "integrity": "5b2f2099fbe51f94a4242f8e81570bacf3a7c16625e8439af3853adab1de65f1"
+        },
+        {
+          "id": "compatible-demo",
+          "version": "3.0.0",
+          "engines": ">=1.6.0 <2",
+          "integrity": "e9f0eecbf6621e6f0ba7fc139d1eb91ffa2899548e0b5e615e3443a0496c8081"
+        },
+        {
+          "id": "compatible-demo",
+          "version": "1.10.0+fixture.1",
+          "engines": ">=1.6.0 <2",
+          "integrity": "b78efa83378ef1de9e79e8f6e4c18f0470382d8946481c4680fd0cbe2c6c349f"
+        }
+      ],
+      "commands": [
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "compatible-demo",
+            "--registry",
+            "http://127.0.0.1:44731",
+            "--path",
+            "/tmp/cg-compatible-9Om5qw/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 1.646
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "compatible-demo",
+            "--registry",
+            "http://127.0.0.1:44731",
+            "--version",
+            "9.0.0",
+            "--path",
+            "/tmp/cg-compatible-9Om5qw/headless-python-project"
+          ],
+          "exit": 1,
+          "seconds": 0.49
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "update",
+            "unavailable-demo",
+            "--registry",
+            "http://127.0.0.1:44731",
+            "--path",
+            "/tmp/cg-compatible-9Om5qw/headless-python-project"
+          ],
+          "exit": 1,
+          "seconds": 0.333
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "unavailable-demo",
+            "--registry",
+            "http://127.0.0.1:44731",
+            "--path",
+            "/tmp/cg-compatible-9Om5qw/headless-python-project"
+          ],
+          "exit": 1,
+          "seconds": 0.399
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "compatible-demo",
+            "--registry",
+            "http://127.0.0.1:44731",
+            "--version",
+            "20.0.0-beta.1",
+            "--path",
+            "/tmp/cg-compatible-9Om5qw/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 1.75
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "update",
+            "compatible-demo",
+            "--registry",
+            "http://127.0.0.1:44731",
+            "--path",
+            "/tmp/cg-compatible-9Om5qw/headless-python-project"
+          ],
+          "exit": 1,
+          "seconds": 0.404
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "compatible-demo",
+            "--registry",
+            "http://127.0.0.1:44731",
+            "--version",
+            "1.9.0",
+            "--path",
+            "/tmp/cg-compatible-9Om5qw/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 1.638
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "update",
+            "compatible-demo",
+            "--registry",
+            "http://127.0.0.1:44731",
+            "--path",
+            "/tmp/cg-compatible-9Om5qw/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 1.622
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "http://127.0.0.1:44731/api/download/compatible-demo/1.9.0",
+            "--path",
+            "/tmp/cg-compatible-9Om5qw/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 1.557
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "/tmp/cg-compatible-9Om5qw/pinned.cgext",
+            "--path",
+            "/tmp/cg-compatible-9Om5qw/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 1.509
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "install",
+            "compatible-demo",
+            "--registry",
+            "http://127.0.0.1:44731",
+            "--version",
+            "1.10.0+fixture.1",
+            "--path",
+            "/tmp/cg-compatible-9Om5qw/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 1.958
+        },
+        {
+          "command": [
+            "/usr/local/bin/node",
+            "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+            "extensions",
+            "remove",
+            "compatible-demo",
+            "--path",
+            "/tmp/cg-compatible-9Om5qw/headless-python-project"
+          ],
+          "exit": 0,
+          "seconds": 1.535
+        }
+      ],
+      "engineVersion": "1.6.0",
+      "platform": "linux",
+      "browser": "153.0.8010.36"
+    },
+    "workerBrowser": {
+      "browser": "153.0.8010.36",
+      "platform": "linux",
+      "checks": [
+        "late catalog response preserves the entered publisher form and package",
+        "real browser signed publisher upload",
+        "slow package metadata preserves typed publisher fields",
+        "browser publisher ownership rejection",
+        "browser invalid-signature failure state",
+        "browser malformed-package rejection without publication",
+        "one-click selected-project install verified in SQLite",
+        "real postMessage wrong-window command ignored",
+        "failed browser update preserves working version and graph",
+        "browser update replaces stale graph contributions",
+        "browser disable/enable/remove verified in SQLite",
+        "mobile detail fits viewport",
+        "real postMessage wrong-origin command ignored",
+        "closed local companion expires the connection visibly",
+        "real stopped registry shows actionable publisher failure without changing local graph"
+      ],
+      "pageErrors": []
+    }
+  },
+  "graphProof": {
+    "corpus": "pathauto",
+    "revision": "b97aadf47a37cff25f7d6105c3dade6778fccb47",
+    "artifactSHA": "e5015747d02fe50d6af607b6c44f1db9cf7969a0070866ed03c7643377a459c8",
+    "nodes": 1103,
+    "edges": 1867,
+    "pluginEdges": 66,
+    "hash": "27aba48fb25cea98d6da30c8d67ba0db4b30e5aaef3d5ba113bcce4012709216",
+    "expected": [
+      [
+        "/admin/config/search/path/settings",
+        "pathauto.routing.yml",
+        "buildForm",
+        "src/Form/PathautoSettingsForm.php",
+        "Drupal route handler"
+      ],
+      [
+        "/admin/config/search/path/update_bulk",
+        "pathauto.routing.yml",
+        "buildForm",
+        "src/Form/PathautoBulkUpdateForm.php",
+        "Drupal route handler"
+      ],
+      [
+        "getPunctuationCharacters",
+        "src/AliasCleaner.php",
+        "pathautoPunctuationCharsAlter",
+        "tests/modules/pathauto_custom_punctuation_test/src/Hook/PathautoCustomPunctuationTestHooks.php",
+        "Drupal hook pathauto_punctuation_chars_alter"
+      ],
+      [
+        "PathautoGenerator",
+        "src/PathautoGenerator.php",
+        "AliasCleaner",
+        "src/AliasCleaner.php",
+        "Drupal service injection"
+      ]
+    ]
+  },
+  "receipts": [
+    {
+      "receipt": {
+        "path": ".qa/recovery/official-browser-first.json",
+        "bytes": 1094,
+        "sha256": "a3dd82dbe1891dee0b8ec98b6f0ddca6f2e8dbcbf572989849bee8535777ab7b"
+      },
+      "log": {
+        "path": ".qa/recovery/official-browser-first.log",
+        "bytes": 1665,
+        "sha256": "3d6f584a9a90bc57c9f09b2a5493a78ed6cbc833b23e6262cac8971b049c73ef"
+      },
+      "result": {
+        "command": [
+          "env",
+          "PLAYWRIGHT_MODULE=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/browser-tools/node_modules/playwright",
+          "node",
+          "scripts/validation/cloudflare-official-drupal.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T12:28:30.137056+00:00",
+        "revision": "55fb9796f9cf2d5f472c5b0ea5f60ba01b9b7b45",
+        "working_tree": " M marketplace/cloudflare/backup.mjs\n M marketplace/cloudflare/local.mjs\n M marketplace/cloudflare/package-lock.json\n M marketplace/cloudflare/package.json\n M marketplace/cloudflare/worker.ts\n?? marketplace/cloudflare/migrations/0002_official_operator.sql\n?? marketplace/cloudflare/official-cli.mjs\n?? marketplace/cloudflare/official-policy.json\n?? marketplace/cloudflare/official-remote.mjs\n?? marketplace/cloudflare/official-test.mjs\n?? marketplace/cloudflare/official.mjs\n?? scripts/validation/cloudflare-official-drupal.cjs\n",
+        "exit_code": 0,
+        "seconds": 22.454,
+        "finished_at": "2026-09-22T12:28:52.591052+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/official-build-repro.json",
+        "bytes": 428,
+        "sha256": "ba6416f1777ae503172cf8f2a276595b54d0e586eb917b8aa2cbfe42b11116e7"
+      },
+      "log": {
+        "path": ".qa/recovery/official-build-repro.log",
+        "bytes": 66,
+        "sha256": "822e1b890c2b4be9819cecd10c9a8234d31ba024fa17ee3890a3e8ab2317d978"
+      },
+      "result": {
+        "command": [
+          "npm",
+          "run",
+          "build",
+          "--prefix",
+          "marketplace/cloudflare"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T12:39:46.377044+00:00",
+        "revision": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 0.495,
+        "finished_at": "2026-09-22T12:39:46.871621+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/official-drupal-browser-final.json",
+        "bytes": 612,
+        "sha256": "ed88ffcc03fd6d4af0dee980599afb884cac989beda760303125dd73498a0763"
+      },
+      "log": {
+        "path": ".qa/recovery/official-drupal-browser-final.log",
+        "bytes": 1677,
+        "sha256": "c8f39005efcedd07a7f73d301fa93a10e46aa85997a587ad73246c6f975b8792"
+      },
+      "result": {
+        "command": [
+          "env",
+          "OFFICIAL_BROWSER_OUTPUT=.qa/official/browser-final",
+          "PLAYWRIGHT_MODULE=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/browser-tools/node_modules/playwright",
+          "node",
+          "scripts/validation/cloudflare-official-drupal.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T12:30:36.571180+00:00",
+        "revision": "5d406969056bd75e48de05500f8ed9b143c1d66e",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 23.196,
+        "finished_at": "2026-09-22T12:30:59.766815+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/official-dryrun.json",
+        "bytes": 856,
+        "sha256": "537aa6ff3a091846a60d0267a7e9a7ef9d06648dee7a5374705031416acf0ca0"
+      },
+      "log": {
+        "path": ".qa/recovery/official-dryrun.log",
+        "bytes": 928,
+        "sha256": "b915a66038bb6ef6bc82033d8c636cc16e44547ab4c806164862df749a870893"
+      },
+      "result": {
+        "command": [
+          "env",
+          "XDG_CONFIG_HOME=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/.cloudflare-config",
+          "WRANGLER_SEND_METRICS=false",
+          "WRANGLER_LOG_PATH=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/official/wrangler-dryrun.log",
+          "marketplace/cloudflare/node_modules/.bin/wrangler",
+          "deploy",
+          "--config",
+          "marketplace/cloudflare/wrangler.jsonc",
+          "--dry-run",
+          "--experimental-provision=false",
+          "--experimental-auto-create=false"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T12:35:26.622045+00:00",
+        "revision": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 2.271,
+        "finished_at": "2026-09-22T12:35:28.892842+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/official-operator-final.json",
+        "bytes": 563,
+        "sha256": "5159af7551954596bcc4b36a2173c3925fcc306a4da2c462aaa960a95ea80689"
+      },
+      "log": {
+        "path": ".qa/recovery/official-operator-final.log",
+        "bytes": 1294,
+        "sha256": "a23d351642b038c536c0526f2756d558e33a735fac3784aaf5377e23ac9587af"
+      },
+      "result": {
+        "command": [
+          "env",
+          "OFFICIAL_OUTPUT=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/official/operator-final",
+          "bash",
+          "-c",
+          "cd marketplace/cloudflare && node official-test.mjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T12:30:06.130656+00:00",
+        "revision": "5d406969056bd75e48de05500f8ed9b143c1d66e",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 13.87,
+        "finished_at": "2026-09-22T12:30:20.000370+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/official-operator-first.json",
+        "bytes": 941,
+        "sha256": "806eae0be16644b2924b80b760ca380ae3fc7d69350d8a0b32143118a0d4de04"
+      },
+      "log": {
+        "path": ".qa/recovery/official-operator-first.log",
+        "bytes": 558,
+        "sha256": "7d39686aeaf4b82a9dde4524008a036433c0af5bbb1527ac8090eb75ea818a9c"
+      },
+      "result": {
+        "command": [
+          "npm",
+          "exec",
+          "--prefix",
+          "marketplace/cloudflare",
+          "--",
+          "node",
+          "--version"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T12:26:27.176060+00:00",
+        "revision": "55fb9796f9cf2d5f472c5b0ea5f60ba01b9b7b45",
+        "working_tree": " M marketplace/cloudflare/backup.mjs\n M marketplace/cloudflare/local.mjs\n M marketplace/cloudflare/package-lock.json\n M marketplace/cloudflare/package.json\n M marketplace/cloudflare/worker.ts\n?? marketplace/cloudflare/migrations/0002_official_operator.sql\n?? marketplace/cloudflare/official-cli.mjs\n?? marketplace/cloudflare/official-policy.json\n?? marketplace/cloudflare/official-remote.mjs\n?? marketplace/cloudflare/official-test.mjs\n?? marketplace/cloudflare/official.mjs\n",
+        "exit_code": 1,
+        "seconds": 0.803,
+        "finished_at": "2026-09-22T12:26:27.978653+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/official-operator-matrix.json",
+        "bytes": 915,
+        "sha256": "7079e620287873c09ca824a10d153c8896ea31c72c4d8bbf953396b5d1abd4eb"
+      },
+      "log": {
+        "path": ".qa/recovery/official-operator-matrix.log",
+        "bytes": 1156,
+        "sha256": "6aeaa46141d22fd13d8edd7b2057b2ce49a7ce58322fb53c5bb0481a2bb4fdce"
+      },
+      "result": {
+        "command": [
+          "bash",
+          "-c",
+          "cd marketplace/cloudflare && node official-test.mjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T12:26:28.031118+00:00",
+        "revision": "55fb9796f9cf2d5f472c5b0ea5f60ba01b9b7b45",
+        "working_tree": " M marketplace/cloudflare/backup.mjs\n M marketplace/cloudflare/local.mjs\n M marketplace/cloudflare/package-lock.json\n M marketplace/cloudflare/package.json\n M marketplace/cloudflare/worker.ts\n?? marketplace/cloudflare/migrations/0002_official_operator.sql\n?? marketplace/cloudflare/official-cli.mjs\n?? marketplace/cloudflare/official-policy.json\n?? marketplace/cloudflare/official-remote.mjs\n?? marketplace/cloudflare/official-test.mjs\n?? marketplace/cloudflare/official.mjs\n",
+        "exit_code": 0,
+        "seconds": 13.553,
+        "finished_at": "2026-09-22T12:26:41.583924+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/official-shared-regression.json",
+        "bytes": 907,
+        "sha256": "a4745f6abbece17d42230dc3a66280949163683f2f4399620b387109488b75c1"
+      },
+      "log": {
+        "path": ".qa/recovery/official-shared-regression.log",
+        "bytes": 3834,
+        "sha256": "f816fd4042b5f17acdbafdc305f4d725eaf1ada2b6e10d43d138b1f7c87fb014"
+      },
+      "result": {
+        "command": [
+          "npx",
+          "vitest",
+          "run",
+          "__tests__/extension-package-portable.test.ts",
+          "__tests__/extension-marketplace.test.ts",
+          "__tests__/extension-author.test.ts",
+          "__tests__/extension-releases.test.ts",
+          "__tests__/extension-trust.test.ts",
+          "__tests__/plugins.test.ts",
+          "__tests__/marketplace-storage.test.ts",
+          "--maxWorkers=2",
+          "--minWorkers=1"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T12:34:16.794432+00:00",
+        "revision": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 12.282,
+        "finished_at": "2026-09-22T12:34:29.076397+00:00",
+        "summary": [
+          "Test Files  7 passed (7)",
+          "Tests  35 passed (35)",
+          "Duration  9.29s (transform 3.80s, setup 0ms, collect 9.90s, tests 5.34s, environment 3ms, prepare 1.08s)"
+        ]
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/official-worker-browser-regression.json",
+        "bytes": 630,
+        "sha256": "49a9040b50427c68a00585b92c9858a648654dcad4c63431901ded67c2b2c5e3"
+      },
+      "log": {
+        "path": ".qa/recovery/official-worker-browser-regression.log",
+        "bytes": 2441,
+        "sha256": "f870206b8f82cd4a266b556f6c60180c3b6e835e1236fc0a776eb8440ed27859"
+      },
+      "result": {
+        "command": [
+          "env",
+          "CLOUDFLARE_REGISTRY=1",
+          "BROWSER_OUTPUT=.qa/official/browser-regression",
+          "PLAYWRIGHT_MODULE=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/browser-tools/node_modules/playwright",
+          "node",
+          "scripts/validation/marketplace-browser.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T12:34:56.533041+00:00",
+        "revision": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 23.911,
+        "finished_at": "2026-09-22T12:35:20.443579+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/official-worker-compatibility.json",
+        "bytes": 629,
+        "sha256": "134f3ef104a3abcac8b30192087301d181107cf65220027dada93564d04d61a9"
+      },
+      "log": {
+        "path": ".qa/recovery/official-worker-compatibility.log",
+        "bytes": 3147,
+        "sha256": "20de273cc71fe0d559a1a9c826707b842e667426646691486f8c4799d87186e8"
+      },
+      "result": {
+        "command": [
+          "env",
+          "CLOUDFLARE_REGISTRY=1",
+          "COMPAT_OUTPUT=.qa/official/compatibility",
+          "PLAYWRIGHT_MODULE=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/browser-tools/node_modules/playwright",
+          "node",
+          "scripts/validation/extensions-compatibility.cjs"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T12:34:29.132196+00:00",
+        "revision": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 27.352,
+        "finished_at": "2026-09-22T12:34:56.483882+00:00",
+        "summary": []
+      }
+    },
+    {
+      "receipt": {
+        "path": ".qa/recovery/official-worker-regression.json",
+        "bytes": 547,
+        "sha256": "08b835b3a750e48d7d8ff550568331e27b0a3b1ec84b2e166573fd53412991c6"
+      },
+      "log": {
+        "path": ".qa/recovery/official-worker-regression.log",
+        "bytes": 1379,
+        "sha256": "68396ecfd81a856d7be81a67ea62e4da5a8e576d38a3bfd0239d53e0c1227c2a"
+      },
+      "result": {
+        "command": [
+          "env",
+          "CLOUDFLARE_OUTPUT=/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/.qa/official/runtime",
+          "npm",
+          "test",
+          "--prefix",
+          "marketplace/cloudflare"
+        ],
+        "cwd": "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph",
+        "started_at": "2026-09-22T12:30:20.080698+00:00",
+        "revision": "5d406969056bd75e48de05500f8ed9b143c1d66e",
+        "working_tree": "",
+        "exit_code": 0,
+        "seconds": 16.429,
+        "finished_at": "2026-09-22T12:30:36.509409+00:00",
+        "summary": []
+      }
+    }
+  ],
+  "verifiedCommandLogs": [
+    {
+      "path": ".qa/official/browser-final/operator-1.log",
+      "bytes": 157,
+      "sha256": "21ec240ceca7006118421de6266b183263b153fa2d2779967b82ca96e81df717"
+    },
+    {
+      "path": ".qa/official/browser-final/operator-2.log",
+      "bytes": 412,
+      "sha256": "5901b0e358d8b238bf80689bcb0be9cd6aa882dc4d8e1f9f819e63d56efa231f"
+    },
+    {
+      "path": ".qa/official/browser-final/operator-3.log",
+      "bytes": 1418,
+      "sha256": "79224ce85edb145500e36bea351ad88da21fe163f7b59053bc2587d9ab0d9d3f"
+    },
+    {
+      "path": ".qa/official/operator-final/command-1.log",
+      "bytes": 145,
+      "sha256": "20e5f0c30aa5826d2a5e1a6742e36df0e5c650b3b5707ccf3a8798a7629da38f"
+    },
+    {
+      "path": ".qa/official/operator-final/command-2.log",
+      "bytes": 392,
+      "sha256": "88ac6e072f56e473bb1043e953afbd1af5068afad4069f0a76ff5f0e4cade575"
+    },
+    {
+      "path": ".qa/official/operator-final/command-3.log",
+      "bytes": 62,
+      "sha256": "f13557a940e03312ca474e10a736e7d3ab07214f2cdaef7b9622bbe2c2886d44"
+    },
+    {
+      "path": ".qa/official/operator-final/command-4.log",
+      "bytes": 1419,
+      "sha256": "60667884f0e2a9a5b53b8e028ee56706e4abe455315ac3c13c680f322445463f"
+    },
+    {
+      "path": ".qa/official/browser/operator-1.log",
+      "bytes": 157,
+      "sha256": "6ab5d94b42c46a57ebd9eab803a75fcf52f5034ee0dd9322104b47c613267c90"
+    },
+    {
+      "path": ".qa/official/browser/operator-2.log",
+      "bytes": 412,
+      "sha256": "b7f8bef3db083ec14cd05dd76fcb113b5c09bea45eeb6ad8ec5c3fe2e2550ca9"
+    },
+    {
+      "path": ".qa/official/browser/operator-3.log",
+      "bytes": 1418,
+      "sha256": "c76eab23cf7a87d7b09bc4663db1dd4599102a09fdb3568bab660da822e05510"
+    },
+    {
+      "path": ".qa/official/operator/command-1.log",
+      "bytes": 145,
+      "sha256": "64422fd51041caf900d5b96b850953cc618fa102166105bcd27e00468b655a77"
+    },
+    {
+      "path": ".qa/official/operator/command-2.log",
+      "bytes": 392,
+      "sha256": "a3c1a73fc7ad73cda88e636654ebdfeeb9fca11422ac891d6a759bef37633f04"
+    },
+    {
+      "path": ".qa/official/operator/command-3.log",
+      "bytes": 62,
+      "sha256": "f13557a940e03312ca474e10a736e7d3ab07214f2cdaef7b9622bbe2c2886d44"
+    },
+    {
+      "path": ".qa/official/operator/command-4.log",
+      "bytes": 1419,
+      "sha256": "619a893ada588cbf9c9f9e3cbf44f0e7787be4629f959e95ab83d7932ba02e65"
+    }
+  ],
+  "nativeNodeRegression": [
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/summary.json",
+      "summary": {
+        "revision": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+        "platform": "darwin",
+        "arch": "arm64",
+        "release": "24.6.0",
+        "scope": "marketplace",
+        "notRun": [
+          {
+            "name": "compiled-workers",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          },
+          {
+            "name": "native-paths",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          },
+          {
+            "name": "process-recovery",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          },
+          {
+            "name": "process-recovery-override",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          }
+        ],
+        "node": "v22.23.2",
+        "runnerOS": "macOS",
+        "runnerArch": "ARM64",
+        "imageOS": "macos15",
+        "imageVersion": "20260907.0337.1",
+        "githubRun": "35727987357",
+        "githubAttempt": "1",
+        "started": "2026-09-22T12:34:52.654Z",
+        "steps": [
+          {
+            "name": "build",
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/lib/node_modules/npm/bin/npm-cli.js",
+              "run",
+              "build"
+            ],
+            "cwd": "/Users/runner/work/codegraph/codegraph",
+            "revision": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+            "overrides": {},
+            "started": "2026-09-22T12:34:52.892Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 13.074,
+            "finished": "2026-09-22T12:35:05.968Z",
+            "log": "build.log",
+            "sha256": "fb511453bb542457cc71d0a878baf8d2d3735efbbab6258ce5c6e260a6c1cbfb"
+          },
+          {
+            "name": "marketplace-build",
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/lib/node_modules/npm/bin/npm-cli.js",
+              "run",
+              "build",
+              "--prefix",
+              "marketplace"
+            ],
+            "cwd": "/Users/runner/work/codegraph/codegraph",
+            "revision": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+            "overrides": {},
+            "started": "2026-09-22T12:35:05.973Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 0.139,
+            "finished": "2026-09-22T12:35:06.112Z",
+            "log": "marketplace-build.log",
+            "sha256": "9f2e1db0d5b81451bd46f3f69be017f4f15e7e70df7217ca244b6f530fa6cd2a"
+          },
+          {
+            "name": "focused",
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "node_modules/vitest/vitest.mjs",
+              "run",
+              "__tests__/marketplace-storage.test.ts",
+              "__tests__/foundation.test.ts",
+              "__tests__/extension-trust.test.ts",
+              "__tests__/extension-releases.test.ts",
+              "__tests__/extension-marketplace.test.ts",
+              "__tests__/extension-author.test.ts",
+              "__tests__/plugins.test.ts",
+              "__tests__/extension-explore.test.ts",
+              "__tests__/db-reopen-on-replace.test.ts",
+              "__tests__/status-json.test.ts",
+              "__tests__/sync.test.ts",
+              "__tests__/concurrent-locking.test.ts",
+              "--maxWorkers=2",
+              "--minWorkers=1",
+              "--reporter=default",
+              "--reporter=json",
+              "--outputFile.json=/Users/runner/work/codegraph/codegraph/.qa/native/darwin-arm64/focused.json"
+            ],
+            "cwd": "/Users/runner/work/codegraph/codegraph",
+            "revision": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+            "overrides": {},
+            "started": "2026-09-22T12:35:06.113Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 18.336,
+            "finished": "2026-09-22T12:35:24.576Z",
+            "log": "focused.log",
+            "sha256": "bdb867f0d19fec98030dc6096162a49dc7e054ee21124f1823612ed10f610769"
+          },
+          {
+            "name": "registry-storage",
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "scripts/validation/marketplace-storage.cjs"
+            ],
+            "cwd": "/Users/runner/work/codegraph/codegraph",
+            "revision": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+            "overrides": {
+              "STORAGE_OUTPUT": "/Users/runner/work/codegraph/codegraph/.qa/native/darwin-arm64/registry-storage"
+            },
+            "started": "2026-09-22T12:35:24.579Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 1.106,
+            "finished": "2026-09-22T12:35:25.686Z",
+            "log": "registry-storage.log",
+            "sha256": "81b30aece6008f65bac0802e0d51fede63b7c147ba55d1cd6defd3f1dcb35f00"
+          },
+          {
+            "name": "external-author",
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "scripts/validation/extension-author.cjs"
+            ],
+            "cwd": "/Users/runner/work/codegraph/codegraph",
+            "revision": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+            "overrides": {},
+            "started": "2026-09-22T12:35:25.688Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 28.378,
+            "finished": "2026-09-22T12:35:54.066Z",
+            "log": "external-author.log",
+            "sha256": "2d353dc3728b36bf3a5181bc25f20ea3cbda097c380cd80b4040d9946f690c66"
+          },
+          {
+            "name": "compatibility",
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "scripts/validation/extensions-compatibility.cjs"
+            ],
+            "cwd": "/Users/runner/work/codegraph/codegraph",
+            "revision": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+            "overrides": {},
+            "started": "2026-09-22T12:35:54.068Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 13.596,
+            "finished": "2026-09-22T12:36:07.665Z",
+            "log": "compatibility.log",
+            "sha256": "64265076728c780be240f40c1830545a24cf89f409464286fcebea67f6ddd959"
+          },
+          {
+            "name": "browser",
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "scripts/validation/marketplace-browser.cjs"
+            ],
+            "cwd": "/Users/runner/work/codegraph/codegraph",
+            "revision": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+            "overrides": {},
+            "started": "2026-09-22T12:36:07.666Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 15.071,
+            "finished": "2026-09-22T12:36:22.738Z",
+            "log": "browser.log",
+            "sha256": "9e0b1de7b2587fbd1fbebe22f59a513c70bbad241d76846ef7606a7feb0bcc9b"
+          }
+        ],
+        "finished": "2026-09-22T12:36:22.741Z",
+        "success": true
+      },
+      "focused": {
+        "numPassedTests": 144,
+        "numPendingTests": 1,
+        "numFailedTests": 0
+      }
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/summary.json",
+      "summary": {
+        "revision": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+        "platform": "win32",
+        "arch": "x64",
+        "release": "10.0.20348",
+        "scope": "marketplace",
+        "notRun": [
+          {
+            "name": "compiled-workers",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          },
+          {
+            "name": "native-paths",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          },
+          {
+            "name": "process-recovery",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          },
+          {
+            "name": "process-recovery-override",
+            "reason": "Unchanged core lifecycle; retain prior native evidence instead of rerunning"
+          }
+        ],
+        "node": "v22.23.2",
+        "runnerOS": "Windows",
+        "runnerArch": "X64",
+        "imageOS": "win22",
+        "imageVersion": "20260913.307.1",
+        "githubRun": "35727987357",
+        "githubAttempt": "1",
+        "started": "2026-09-22T12:35:06.148Z",
+        "steps": [
+          {
+            "name": "build",
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node_modules\\npm\\bin\\npm-cli.js",
+              "run",
+              "build"
+            ],
+            "cwd": "D:\\a\\codegraph\\codegraph",
+            "revision": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+            "overrides": {},
+            "started": "2026-09-22T12:35:06.405Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 15.626,
+            "finished": "2026-09-22T12:35:22.032Z",
+            "log": "build.log",
+            "sha256": "ee6e47d91f4983d940e104af89884aa9800cfb49fa4e5f431cadd33d5a11b321"
+          },
+          {
+            "name": "marketplace-build",
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node_modules\\npm\\bin\\npm-cli.js",
+              "run",
+              "build",
+              "--prefix",
+              "marketplace"
+            ],
+            "cwd": "D:\\a\\codegraph\\codegraph",
+            "revision": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+            "overrides": {},
+            "started": "2026-09-22T12:35:22.033Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 0.184,
+            "finished": "2026-09-22T12:35:22.217Z",
+            "log": "marketplace-build.log",
+            "sha256": "9f2e1db0d5b81451bd46f3f69be017f4f15e7e70df7217ca244b6f530fa6cd2a"
+          },
+          {
+            "name": "focused",
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "node_modules/vitest/vitest.mjs",
+              "run",
+              "__tests__/marketplace-storage.test.ts",
+              "__tests__/foundation.test.ts",
+              "__tests__/extension-trust.test.ts",
+              "__tests__/extension-releases.test.ts",
+              "__tests__/extension-marketplace.test.ts",
+              "__tests__/extension-author.test.ts",
+              "__tests__/plugins.test.ts",
+              "__tests__/extension-explore.test.ts",
+              "__tests__/db-reopen-on-replace.test.ts",
+              "__tests__/status-json.test.ts",
+              "__tests__/sync.test.ts",
+              "__tests__/concurrent-locking.test.ts",
+              "--maxWorkers=2",
+              "--minWorkers=1",
+              "--reporter=default",
+              "--reporter=json",
+              "--outputFile.json=D:\\a\\codegraph\\codegraph\\.qa\\native\\win32-x64\\focused.json"
+            ],
+            "cwd": "D:\\a\\codegraph\\codegraph",
+            "revision": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+            "overrides": {},
+            "started": "2026-09-22T12:35:22.218Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 70.344,
+            "finished": "2026-09-22T12:36:32.562Z",
+            "log": "focused.log",
+            "sha256": "bd4ec7706dc18a557e00499660ad450e34cef77b69c0e59b0acfad5a4c516cbc"
+          },
+          {
+            "name": "registry-storage",
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "scripts/validation/marketplace-storage.cjs"
+            ],
+            "cwd": "D:\\a\\codegraph\\codegraph",
+            "revision": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+            "overrides": {
+              "STORAGE_OUTPUT": "D:\\a\\codegraph\\codegraph\\.qa\\native\\win32-x64\\registry-storage"
+            },
+            "started": "2026-09-22T12:36:32.563Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 1.769,
+            "finished": "2026-09-22T12:36:34.333Z",
+            "log": "registry-storage.log",
+            "sha256": "51ec9323b768b0ade61e911b1da7f6191149e0fcde715d4ae2f922e3ee6d4bee"
+          },
+          {
+            "name": "external-author",
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "scripts/validation/extension-author.cjs"
+            ],
+            "cwd": "D:\\a\\codegraph\\codegraph",
+            "revision": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+            "overrides": {},
+            "started": "2026-09-22T12:36:34.335Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 82.896,
+            "finished": "2026-09-22T12:37:57.231Z",
+            "log": "external-author.log",
+            "sha256": "7903035256e8592f821051264dc3f45fe245cab48b2cc071afee5f8240e61539"
+          },
+          {
+            "name": "compatibility",
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "scripts/validation/extensions-compatibility.cjs"
+            ],
+            "cwd": "D:\\a\\codegraph\\codegraph",
+            "revision": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+            "overrides": {},
+            "started": "2026-09-22T12:37:57.232Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 21.853,
+            "finished": "2026-09-22T12:38:19.085Z",
+            "log": "compatibility.log",
+            "sha256": "1cc4239bfbc96c5255244baced43c3cfe69b90801c5bb2353d27425f81088a74"
+          },
+          {
+            "name": "browser",
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "scripts/validation/marketplace-browser.cjs"
+            ],
+            "cwd": "D:\\a\\codegraph\\codegraph",
+            "revision": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+            "overrides": {},
+            "started": "2026-09-22T12:38:19.086Z",
+            "status": "passed",
+            "exit": 0,
+            "signal": null,
+            "seconds": 21.563,
+            "finished": "2026-09-22T12:38:40.649Z",
+            "log": "browser.log",
+            "sha256": "401dd1c986b8e364704e9b048134eea0f90446aaa4926dba4fbc1e63c1eeff63"
+          }
+        ],
+        "finished": "2026-09-22T12:38:40.650Z",
+        "success": true
+      },
+      "focused": {
+        "numPassedTests": 141,
+        "numPendingTests": 4,
+        "numFailedTests": 0
+      }
+    }
+  ],
+  "temporaryHttpsNodeRegression": [
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/summary.json",
+      "summary": {
+        "revision": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+        "run": "35727987378",
+        "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+        "arch": "x86_64",
+        "node": "v22.23.2",
+        "steps": [
+          {
+            "name": "build",
+            "command": [
+              "npm",
+              "run",
+              "build"
+            ],
+            "started": "2026-09-22T12:34:58.151538+00:00",
+            "exit": 0,
+            "seconds": 8.961004138999996,
+            "sha256": "d93aebdd4201a873f4a71d41d0f6ae6dba3b24ba0f6570ca9b51ae50e700f17e",
+            "finished": "2026-09-22T12:35:07.112871+00:00"
+          },
+          {
+            "name": "marketplace-build",
+            "command": [
+              "npm",
+              "run",
+              "build",
+              "--prefix",
+              "marketplace"
+            ],
+            "started": "2026-09-22T12:35:07.113057+00:00",
+            "exit": 0,
+            "seconds": 0.11400702199999557,
+            "sha256": "9f2e1db0d5b81451bd46f3f69be017f4f15e7e70df7217ca244b6f530fa6cd2a",
+            "finished": "2026-09-22T12:35:07.227457+00:00"
+          },
+          {
+            "name": "https-compatibility",
+            "command": [
+              "node",
+              "scripts/validation/extensions-compatibility.cjs"
+            ],
+            "started": "2026-09-22T12:35:07.227804+00:00",
+            "exit": 0,
+            "seconds": 35.58415501100001,
+            "sha256": "186a5800a412ed7dae33d7bf6fb8b21c44f9d9120aeeb9cc5e459a4929a68dc1",
+            "finished": "2026-09-22T12:35:42.812416+00:00"
+          },
+          {
+            "name": "https-browser",
+            "command": [
+              "node",
+              "scripts/validation/marketplace-browser.cjs"
+            ],
+            "started": "2026-09-22T12:35:42.812715+00:00",
+            "exit": 1,
+            "seconds": 90.705043985,
+            "sha256": "32f163b43fa0ae298ac83b8ed2e9a0cffff8eef0856ee6f1ec6af4c61f41a3e2",
+            "finished": "2026-09-22T12:37:13.518157+00:00"
+          }
+        ],
+        "success": false
+      },
+      "browserFailure": {
+        "checks": [],
+        "error": "Error: Test HTTPS tunnel did not become reachable; see https-tunnel.log\n    at exports.httpsMarketplace (/home/runner/work/codegraph/codegraph/scripts/validation/https-marketplace.cjs:27:11)\n    at async /home/runner/work/codegraph/codegraph/scripts/validation/marketplace-browser.cjs:36:60"
+      }
+    }
+  ],
+  "githubRuns": {
+    "native": {
+      "conclusion": "success",
+      "headSha": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+      "jobs": [
+        {
+          "completedAt": "2026-09-22T12:38:44Z",
+          "conclusion": "success",
+          "databaseId": 106746251171,
+          "name": "native (macos-15)",
+          "startedAt": "2026-09-22T12:34:28Z",
+          "status": "completed",
+          "steps": [
+            {
+              "conclusion": "success",
+              "name": "Set up job",
+              "number": 1,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Run actions/checkout@v4",
+              "number": 2,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Run actions/setup-node@v4",
+              "number": 3,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Install development dependencies",
+              "number": 4,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Install test-only browser",
+              "number": 5,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Download Chromium for this native OS",
+              "number": 6,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Run native acceptance with durable receipts",
+              "number": 7,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Retain validation evidence",
+              "number": 8,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Post Run actions/setup-node@v4",
+              "number": 15,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Post Run actions/checkout@v4",
+              "number": 16,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Complete job",
+              "number": 17,
+              "status": "completed"
+            }
+          ],
+          "url": "https://github.com/colbymchenry/codegraph/actions/runs/35727987357/job/106746251171"
+        },
+        {
+          "completedAt": "2026-09-22T12:38:44Z",
+          "conclusion": "success",
+          "databaseId": 106746251448,
+          "name": "native (windows-2022)",
+          "startedAt": "2026-09-22T12:34:23Z",
+          "status": "completed",
+          "steps": [
+            {
+              "conclusion": "success",
+              "name": "Set up job",
+              "number": 1,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Run actions/checkout@v4",
+              "number": 2,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Run actions/setup-node@v4",
+              "number": 3,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Install development dependencies",
+              "number": 4,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Install test-only browser",
+              "number": 5,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Download Chromium for this native OS",
+              "number": 6,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Run native acceptance with durable receipts",
+              "number": 7,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Retain validation evidence",
+              "number": 8,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Post Run actions/setup-node@v4",
+              "number": 15,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Post Run actions/checkout@v4",
+              "number": 16,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Complete job",
+              "number": 17,
+              "status": "completed"
+            }
+          ],
+          "url": "https://github.com/colbymchenry/codegraph/actions/runs/35727987357/job/106746251448"
+        }
+      ],
+      "status": "completed"
+    },
+    "https": {
+      "conclusion": "failure",
+      "headSha": "6272db657e8d45511a2059b3fdf89d90bb81ea77",
+      "jobs": [
+        {
+          "completedAt": "2026-09-22T12:37:17Z",
+          "conclusion": "failure",
+          "databaseId": 106746250507,
+          "name": "https",
+          "startedAt": "2026-09-22T12:34:23Z",
+          "status": "completed",
+          "steps": [
+            {
+              "conclusion": "success",
+              "name": "Set up job",
+              "number": 1,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Run actions/checkout@v4",
+              "number": 2,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Run actions/setup-node@v4",
+              "number": 3,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Run npm ci --no-audit --no-fund",
+              "number": 4,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Run npm install --prefix .qa/browser --ignore-scripts --no-save --package-lock=false playwright@1.63.0",
+              "number": 5,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Run node .qa/browser/node_modules/playwright/cli.js install --with-deps chromium",
+              "number": 6,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Download verified test-only tunnel binary",
+              "number": 7,
+              "status": "completed"
+            },
+            {
+              "conclusion": "failure",
+              "name": "Build and verify real HTTPS acceptance with receipts",
+              "number": 8,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Run actions/upload-artifact@v4",
+              "number": 9,
+              "status": "completed"
+            },
+            {
+              "conclusion": "skipped",
+              "name": "Post Run actions/setup-node@v4",
+              "number": 17,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Post Run actions/checkout@v4",
+              "number": 18,
+              "status": "completed"
+            },
+            {
+              "conclusion": "success",
+              "name": "Complete job",
+              "number": 19,
+              "status": "completed"
+            }
+          ],
+          "url": "https://github.com/colbymchenry/codegraph/actions/runs/35727987378/job/106746250507"
+        }
+      ],
+      "status": "completed"
+    }
+  },
+  "rawFiles": [
+    {
+      "path": ".qa/official/browser/desktop-installed.png",
+      "bytes": 116353,
+      "sha256": "7713626c83db841bf55e4bfe25e46aedc8c98ce1488423f7428ab0d76868f885"
+    },
+    {
+      "path": ".qa/official/browser/graph-proof.json",
+      "bytes": 1116,
+      "sha256": "6bd1ceab7e517f7bfdf02b5f91a11cc8b874c440170655594f2f317f98296daa"
+    },
+    {
+      "path": ".qa/official/browser/mobile-official.png",
+      "bytes": 110503,
+      "sha256": "7e1f1259a954cb8b8e924064f0bea9c1c14ac1b07f9dd5e6a8c604b598af06ca"
+    },
+    {
+      "path": ".qa/official/browser/operator-1.log",
+      "bytes": 157,
+      "sha256": "6ab5d94b42c46a57ebd9eab803a75fcf52f5034ee0dd9322104b47c613267c90"
+    },
+    {
+      "path": ".qa/official/browser/operator-2.log",
+      "bytes": 412,
+      "sha256": "b7f8bef3db083ec14cd05dd76fcb113b5c09bea45eeb6ad8ec5c3fe2e2550ca9"
+    },
+    {
+      "path": ".qa/official/browser/operator-3.log",
+      "bytes": 1418,
+      "sha256": "c76eab23cf7a87d7b09bc4663db1dd4599102a09fdb3568bab660da822e05510"
+    },
+    {
+      "path": ".qa/official/browser/progress.json",
+      "bytes": 2202,
+      "sha256": "7967b511075db2faffadc77ee1d51ffdb2fda46a4fc1f9877f0fcb44a6848e35"
+    },
+    {
+      "path": ".qa/official/browser/result.json",
+      "bytes": 2451,
+      "sha256": "247d9af49ada6729f7e86225b5711b96eaa7d41853fde4eb723cbe00f1a34a8c"
+    },
+    {
+      "path": ".qa/official/browser-final/desktop-installed.png",
+      "bytes": 116353,
+      "sha256": "7713626c83db841bf55e4bfe25e46aedc8c98ce1488423f7428ab0d76868f885"
+    },
+    {
+      "path": ".qa/official/browser-final/graph-proof.json",
+      "bytes": 1116,
+      "sha256": "6bd1ceab7e517f7bfdf02b5f91a11cc8b874c440170655594f2f317f98296daa"
+    },
+    {
+      "path": ".qa/official/browser-final/mobile-official.png",
+      "bytes": 110503,
+      "sha256": "7e1f1259a954cb8b8e924064f0bea9c1c14ac1b07f9dd5e6a8c604b598af06ca"
+    },
+    {
+      "path": ".qa/official/browser-final/operator-1.log",
+      "bytes": 157,
+      "sha256": "21ec240ceca7006118421de6266b183263b153fa2d2779967b82ca96e81df717"
+    },
+    {
+      "path": ".qa/official/browser-final/operator-2.log",
+      "bytes": 412,
+      "sha256": "5901b0e358d8b238bf80689bcb0be9cd6aa882dc4d8e1f9f819e63d56efa231f"
+    },
+    {
+      "path": ".qa/official/browser-final/operator-3.log",
+      "bytes": 1418,
+      "sha256": "79224ce85edb145500e36bea351ad88da21fe163f7b59053bc2587d9ab0d9d3f"
+    },
+    {
+      "path": ".qa/official/browser-final/progress.json",
+      "bytes": 2202,
+      "sha256": "e31672596d47e58fec8f7180e572efd65cc70ab3c58c1b3817efd1738e128cf7"
+    },
+    {
+      "path": ".qa/official/browser-final/result.json",
+      "bytes": 2452,
+      "sha256": "337145db5b856abd25796fe869fe12baf2860960afd0c9fb6f1e4526fdfbb367"
+    },
+    {
+      "path": ".qa/official/browser-regression/desktop-installed.png",
+      "bytes": 151625,
+      "sha256": "719a0ac615ffb3eae1562f3c1006e828034b554325f67c864af37113ea34ef38"
+    },
+    {
+      "path": ".qa/official/browser-regression/mobile-detail.png",
+      "bytes": 79668,
+      "sha256": "ca390e0ac8e7e979d40cb508b4320983894fbacd7f7d1e99771b2c2613dc3265"
+    },
+    {
+      "path": ".qa/official/browser-regression/result.json",
+      "bytes": 966,
+      "sha256": "9e89a9a5702660630f3f4946a76a9766d9502d5f3857a9c7a38bfab18fe1685d"
+    },
+    {
+      "path": ".qa/official/build-before.json",
+      "bytes": 484,
+      "sha256": "0b88efafab5b23d676c52783965bbc1d06c167fce3aecae27bb8cccbde811344"
+    },
+    {
+      "path": ".qa/official/build-repro.json",
+      "bytes": 531,
+      "sha256": "2c451d4eed1ce242a9c816c210907606fe1568ae95e7a400430953667522b554"
+    },
+    {
+      "path": ".qa/official/compatibility/command-1.log",
+      "bytes": 243,
+      "sha256": "64f1ac60c8ad25f6569563d24914759b70acf1b73e5cffeef4feb12ce4c226b9"
+    },
+    {
+      "path": ".qa/official/compatibility/command-10.log",
+      "bytes": 143,
+      "sha256": "f03135c33691b92a8cd0834b0ab07175f81eb68d071d2e495c7ef96f6cbb5e69"
+    },
+    {
+      "path": ".qa/official/compatibility/command-11.log",
+      "bytes": 263,
+      "sha256": "08588ddba0b05a3667ca2e4858c6625aaa7cfdd4b248283e284b36ca7bfd3b0f"
+    },
+    {
+      "path": ".qa/official/compatibility/command-12.log",
+      "bytes": 95,
+      "sha256": "303e141e174839575e69f0ae0ddf92ead0470e6dca049ac1edd45fb64b607bde"
+    },
+    {
+      "path": ".qa/official/compatibility/command-2.log",
+      "bytes": 293,
+      "sha256": "d93afb7d84337fce0fb443fb79883800bb478b4c94635140b8f67f9734ed2b26"
+    },
+    {
+      "path": ".qa/official/compatibility/command-3.log",
+      "bytes": 122,
+      "sha256": "78fff926f4f8969d8e1705c0a1271cbd63b822579f81d715c2042ad94c80ad45"
+    },
+    {
+      "path": ".qa/official/compatibility/command-4.log",
+      "bytes": 290,
+      "sha256": "83a7b90bfd2c211c6fb4afcf72e261ef7b42bfd6dc21cfb72d530fb970aef44a"
+    },
+    {
+      "path": ".qa/official/compatibility/command-5.log",
+      "bytes": 257,
+      "sha256": "5a0ae6eb30e6659515338894feeb98ebeabbcd4f66e01f425110e75e83d7986d"
+    },
+    {
+      "path": ".qa/official/compatibility/command-6.log",
+      "bytes": 530,
+      "sha256": "38c1d85e306b15c18732c81df087390b3dfbd3873bc8836e36be492a1fb8a7fa"
+    },
+    {
+      "path": ".qa/official/compatibility/command-7.log",
+      "bytes": 241,
+      "sha256": "74798a107028fa391113eb0b6fa7efac8bfee9c644dbb121892993443666f2f0"
+    },
+    {
+      "path": ".qa/official/compatibility/command-8.log",
+      "bytes": 241,
+      "sha256": "be1f77d7dd153abaab34b2a75bdd5c2d036b406fc11da38ee8d4362bd4c26387"
+    },
+    {
+      "path": ".qa/official/compatibility/command-9.log",
+      "bytes": 142,
+      "sha256": "fec96b4acb520e5ee4d8a42660e9a876f54f08d60c1fc98bcc7b1dcfd2ba6748"
+    },
+    {
+      "path": ".qa/official/compatibility/commands.json",
+      "bytes": 4742,
+      "sha256": "4a98db1e8ad7350fbb236aaacd5519309bd59f5c48f7339f6db3c9d6d267ead1"
+    },
+    {
+      "path": ".qa/official/compatibility/desktop-installed.png",
+      "bytes": 97827,
+      "sha256": "64b4fc5594846d14bf02a3362b190f0fe225436f26d2c859a11356d3bd61d21f"
+    },
+    {
+      "path": ".qa/official/compatibility/desktop-selected.png",
+      "bytes": 96683,
+      "sha256": "748fc5059a93a3b8fe88e44475160760c8b57f488afbc6dbe6df4a0fa428c4bc"
+    },
+    {
+      "path": ".qa/official/compatibility/mobile-selected.png",
+      "bytes": 78542,
+      "sha256": "dbb5f9c46ffddd31ceebf3059b14f30dd6d3381355d0db33b21d3dbe35ff6b2d"
+    },
+    {
+      "path": ".qa/official/compatibility/result.json",
+      "bytes": 7848,
+      "sha256": "55e6652558c3612e642c1a8684f13fc71a276b23d5718cf96fe65db16add49c1"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/browser/failure.json",
+      "bytes": 325,
+      "sha256": "5b942552cd48488672cccb78d3997a9892f5de2d8895e05c16f5e1622ee18251"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/browser/https-network-errors.log",
+      "bytes": 32038,
+      "sha256": "e5925496095a40d2b8f2fd6f10727c470156cc6b48643cd749cccbfdb507ada1"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/browser/https-tunnel.log",
+      "bytes": 6801,
+      "sha256": "6582cc1b9d75639b7db82a7a98879be395148844e1e930ec7ee4fe3251bfbdb4"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/build.log",
+      "bytes": 7374,
+      "sha256": "d93aebdd4201a873f4a71d41d0f6ae6dba3b24ba0f6570ca9b51ae50e700f17e"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-1.log",
+      "bytes": 243,
+      "sha256": "64f1ac60c8ad25f6569563d24914759b70acf1b73e5cffeef4feb12ce4c226b9"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-10.log",
+      "bytes": 143,
+      "sha256": "f03135c33691b92a8cd0834b0ab07175f81eb68d071d2e495c7ef96f6cbb5e69"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-11.log",
+      "bytes": 263,
+      "sha256": "08588ddba0b05a3667ca2e4858c6625aaa7cfdd4b248283e284b36ca7bfd3b0f"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-12.log",
+      "bytes": 95,
+      "sha256": "303e141e174839575e69f0ae0ddf92ead0470e6dca049ac1edd45fb64b607bde"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-2.log",
+      "bytes": 293,
+      "sha256": "d93afb7d84337fce0fb443fb79883800bb478b4c94635140b8f67f9734ed2b26"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-3.log",
+      "bytes": 122,
+      "sha256": "78fff926f4f8969d8e1705c0a1271cbd63b822579f81d715c2042ad94c80ad45"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-4.log",
+      "bytes": 290,
+      "sha256": "83a7b90bfd2c211c6fb4afcf72e261ef7b42bfd6dc21cfb72d530fb970aef44a"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-5.log",
+      "bytes": 257,
+      "sha256": "5a0ae6eb30e6659515338894feeb98ebeabbcd4f66e01f425110e75e83d7986d"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-6.log",
+      "bytes": 530,
+      "sha256": "38c1d85e306b15c18732c81df087390b3dfbd3873bc8836e36be492a1fb8a7fa"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-7.log",
+      "bytes": 241,
+      "sha256": "74798a107028fa391113eb0b6fa7efac8bfee9c644dbb121892993443666f2f0"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-8.log",
+      "bytes": 241,
+      "sha256": "be1f77d7dd153abaab34b2a75bdd5c2d036b406fc11da38ee8d4362bd4c26387"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-9.log",
+      "bytes": 142,
+      "sha256": "fec96b4acb520e5ee4d8a42660e9a876f54f08d60c1fc98bcc7b1dcfd2ba6748"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/commands.json",
+      "bytes": 5014,
+      "sha256": "35b176fb8e1b8438b39c3c7847ff48f4380738b4b91c07df10b0ca490f2b5e29"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/desktop-installed.png",
+      "bytes": 96917,
+      "sha256": "aa984d8d506e94cc96fe0423a33bc55abf19a6f6985692fcbf30dc3168266e38"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/desktop-selected.png",
+      "bytes": 98611,
+      "sha256": "bf06a71bf98f60a27cddade1e0c87d0394af57ed383676ed5f8c9032f37cfeb6"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/https-network-errors.log",
+      "bytes": 5112,
+      "sha256": "447d588be770c6cc92bb45561c3bae613db9f09a48e20851b9fdb29b53793bc4"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/https-transport.json",
+      "bytes": 185,
+      "sha256": "94512f48ae5960edf3be924ce14f8485281a9bdf50fd51b8ccb4cbec5beeec4a"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/https-tunnel.log",
+      "bytes": 6798,
+      "sha256": "dc195eedc252b4284af5d567de106f374a03e82b1ccfcb04d192d520e52492d6"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/mobile-selected.png",
+      "bytes": 85057,
+      "sha256": "cfab323dec0328e4afdf6d6a1b927e212a32bc85a2ed049260e10420c03d9bec"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/result.json",
+      "bytes": 8120,
+      "sha256": "6a318bdb329ad9e74a61a62fd241f94335c53188e755e3b14beaeed4b8331312"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/https-browser.log",
+      "bytes": 645,
+      "sha256": "32f163b43fa0ae298ac83b8ed2e9a0cffff8eef0856ee6f1ec6af4c61f41a3e2"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/https-compatibility.log",
+      "bytes": 3160,
+      "sha256": "186a5800a412ed7dae33d7bf6fb8b21c44f9d9120aeeb9cc5e459a4929a68dc1"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/marketplace-build.log",
+      "bytes": 72,
+      "sha256": "9f2e1db0d5b81451bd46f3f69be017f4f15e7e70df7217ca244b6f530fa6cd2a"
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/summary.json",
+      "bytes": 1763,
+      "sha256": "a5decb40329e0e1dd181c672b8ed4edb2bc6d049ec34fe6737b8fce9e504bf83"
+    },
+    {
+      "path": ".qa/official/https-run.json",
+      "bytes": 1640,
+      "sha256": "d010b53d8c5f4603878828fd9da946e95ed67745d40228178fb5c9b2e3ee0d65"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/command-1.log",
+      "bytes": 233,
+      "sha256": "72dff572661a5b2e8e5464d91d7cb9fdafd3e5c9fb0cca0e603ecbefd6759c80"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/command-2.log",
+      "bytes": 135360,
+      "sha256": "288be01c1e70e1861f67c22fa50ec23cbfeff59e14b9223e6862a37672fefa30"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/command-3.log",
+      "bytes": 25,
+      "sha256": "67741e1e35aef24633e977d9b9a1672d0e2062f2cd5c357d15cef98b05a3beab"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/command-4.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/command-5.log",
+      "bytes": 3685,
+      "sha256": "056ad003c8c804f0e18522f55ed65173262214d2e0332df6fce6d18c922bd3f8"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/command-6.log",
+      "bytes": 130,
+      "sha256": "b3bc584e270ae41be04b281554f25d42ef0793bc217ea8f60effd372afef6035"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/command-7.log",
+      "bytes": 812,
+      "sha256": "b08383e3fbcfcea4fcf73e4135bb39b593c7ecaa0c022f80c567646b3de41132"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/command-8.log",
+      "bytes": 767,
+      "sha256": "751c3e7a4861162f2376cfffd567fa90486d04171b454296602440364210075b"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/command-9.log",
+      "bytes": 41,
+      "sha256": "7b2ad7639965df6a69d85364b617d20db711cb8b9526af8242d70e95bf81ac29"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/commands.json",
+      "bytes": 4486,
+      "sha256": "8909aa47ea6cbf628906eaf55525db0b5218611a583f9977d6a1d54e4d9b05e0"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/generated-tests.log",
+      "bytes": 493,
+      "sha256": "03b557d5333326680c88154fcb805ec717c58686c640ddf952ba25d8c77844f8"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/published.png",
+      "bytes": 250574,
+      "sha256": "378a00ec542fce8f7cf98d7bd01faea0ec3ef7cbf95c53577859e6ce2163ba25"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/python-events-0.1.0.cgext",
+      "bytes": 13918,
+      "sha256": "b86737a711dc43d7017bafce00bcfa40eedc9ecd32f071d44face13043fb085a"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/result.json",
+      "bytes": 6470,
+      "sha256": "9d65b43353ccf38bfbab9fef99696ed8c7c16fd381bab75c29239c77ce7d1b6e"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/browser/desktop-installed.png",
+      "bytes": 168450,
+      "sha256": "230fc92aa1436befce31a2721f04d55053d910edc40f29332df81f6e9728464b"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/browser/mobile-detail.png",
+      "bytes": 85159,
+      "sha256": "84725c1a5259026f85f281cded8c86baf9719a1c670002026b7809996d481e7c"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/browser/result.json",
+      "bytes": 967,
+      "sha256": "2574b80c153bf6089a10ee1a5f7e4c400cb61200e46c49fdd58910d170fd5fcb"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/browser.log",
+      "bytes": 4633,
+      "sha256": "9e0b1de7b2587fbd1fbebe22f59a513c70bbad241d76846ef7606a7feb0bcc9b"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/build.log",
+      "bytes": 7374,
+      "sha256": "fb511453bb542457cc71d0a878baf8d2d3735efbbab6258ce5c6e260a6c1cbfb"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-1.log",
+      "bytes": 915,
+      "sha256": "20fa28a5590f5cc732fa936eedbfc69ad6806de1fa0f2621815eeb7941e7b64a"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-10.log",
+      "bytes": 815,
+      "sha256": "3a6f06e0b35658eba7a658fe7b5b48b960df7a662883bf891410e25581f0a917"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-11.log",
+      "bytes": 935,
+      "sha256": "e7606c84860d7a3acca97a9a2a4caa068b9579c803240be97b5797eff4560c44"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-12.log",
+      "bytes": 767,
+      "sha256": "87d2cbcddec654e795661fe9bf6d06e5d9aaeea58ea249b063d8bc8b0c91598e"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-2.log",
+      "bytes": 293,
+      "sha256": "d93afb7d84337fce0fb443fb79883800bb478b4c94635140b8f67f9734ed2b26"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-3.log",
+      "bytes": 122,
+      "sha256": "78fff926f4f8969d8e1705c0a1271cbd63b822579f81d715c2042ad94c80ad45"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-4.log",
+      "bytes": 290,
+      "sha256": "83a7b90bfd2c211c6fb4afcf72e261ef7b42bfd6dc21cfb72d530fb970aef44a"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-5.log",
+      "bytes": 929,
+      "sha256": "0fce88f672e44b400b559e9e6fd1091b627b6f644490c188a37f831721cb3a58"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-6.log",
+      "bytes": 530,
+      "sha256": "38c1d85e306b15c18732c81df087390b3dfbd3873bc8836e36be492a1fb8a7fa"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-7.log",
+      "bytes": 913,
+      "sha256": "38fdb7f61e54815bdd5cd252708500216a903b7dff8816282095138d7adde629"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-8.log",
+      "bytes": 913,
+      "sha256": "7f618bf8d06940ae60c6f8745d37e1d1af67fd7c2fe3627cbe8c4393ec033c51"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-9.log",
+      "bytes": 814,
+      "sha256": "53f2cb5654f9a9b910fb9291161ac06ed1d615b198c271a2495c72e7105cb281"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/commands.json",
+      "bytes": 5363,
+      "sha256": "6ce758c2797fae512d6794de370fcf0e193ae638e947a129956a29549c4e9405"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/desktop-installed.png",
+      "bytes": 106850,
+      "sha256": "46de01a0d0c40c353719dca5dd47601b0d6e00ba56fe6bd86eaf89a8fb30735b"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/desktop-selected.png",
+      "bytes": 99812,
+      "sha256": "4fc537f5485695c2188f13f6f2089e796d7f758561fe9693f88e504290aab025"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/mobile-selected.png",
+      "bytes": 86499,
+      "sha256": "df231f80848f9cd65241cab33ac7774f3e049fa93ab2f7149830a73b47ceecd6"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/result.json",
+      "bytes": 8470,
+      "sha256": "d0cf7c035ce2056095acd969a5e3b14a899a65d031ec7941c756e996f0f127b1"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility.log",
+      "bytes": 3160,
+      "sha256": "64265076728c780be240f40c1830545a24cf89f409464286fcebea67f6ddd959"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/external-author.log",
+      "bytes": 576,
+      "sha256": "2d353dc3728b36bf3a5181bc25f20ea3cbda097c380cd80b4040d9946f690c66"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/focused.json",
+      "bytes": 50273,
+      "sha256": "67644404cdfff0ae931305b32530db0860803c3a030200535c98594841346760"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/focused.log",
+      "bytes": 14540,
+      "sha256": "bdb867f0d19fec98030dc6096162a49dc7e054ee21124f1823612ed10f610769"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/marketplace-build.log",
+      "bytes": 72,
+      "sha256": "9f2e1db0d5b81451bd46f3f69be017f4f15e7e70df7217ca244b6f530fa6cd2a"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/registry-storage/1.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/registry-storage/10.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/registry-storage/11.log",
+      "bytes": 285,
+      "sha256": "9740c739bbb67dcf81280cfc46e3e201f6966eba6bfd70bec5672cf104e6f364"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/registry-storage/12.log",
+      "bytes": 285,
+      "sha256": "37ca4360af8a56dfc05f93669780b77cfdf443f8387c5632bb036e87aee26537"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/registry-storage/2.log",
+      "bytes": 633,
+      "sha256": "fe1906b1738b9f53b06bdcec9323af81431beb6e6830ddea79eaef75cf29a314"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/registry-storage/3.log",
+      "bytes": 212,
+      "sha256": "e4c0210a054bf87c048c40f6942a815ce4201f7783b83dedf540a65e07cf6d08"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/registry-storage/4.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/registry-storage/5.log",
+      "bytes": 633,
+      "sha256": "d2eef016c70a41fda988d7b6ed487f045011dd42ed38a4e05fa6ff5f2d520a2c"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/registry-storage/6.log",
+      "bytes": 224,
+      "sha256": "1d43d6633f352b07750084a349cfa11bf4d2a3220d710c1a45d226239c906f14"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/registry-storage/7.log",
+      "bytes": 629,
+      "sha256": "cfcc52c4f58871923cbe2b9d34606f9b792d659fdb5dbca1d23138ec85749194"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/registry-storage/8.log",
+      "bytes": 215,
+      "sha256": "60f8486f02fa5d22006d35418e39ad8ee70a824985ad8c5a136ae5401fc25366"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/registry-storage/9.log",
+      "bytes": 285,
+      "sha256": "bc13f09f8b46aa7701d9561a292f1de3f606c773576f4a8b456e816a03e23356"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/registry-storage/result.json",
+      "bytes": 11250,
+      "sha256": "0631f455ef3e5e067161881a70a5630e86dc36415e6d6558ec63373cd65dd8f0"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/registry-storage/success.json",
+      "bytes": 82,
+      "sha256": "2e10bbc65ddded830bdca3aa9c054008f94d5b8e0f1f58bd8b8b52f9eb04296d"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/registry-storage.log",
+      "bytes": 1078,
+      "sha256": "81b30aece6008f65bac0802e0d51fede63b7c147ba55d1cd6defd3f1dcb35f00"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/summary.json",
+      "bytes": 6504,
+      "sha256": "4ba975510a08b4300b49c52fae89ce524a96504b631a750a9fa8b0dd7d9aa400"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/command-1.log",
+      "bytes": 209,
+      "sha256": "54c3c6acba8fd9c5ddcfbcc9a4c2590efd918fa1316582d59e2e16eb1e083aa1"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/command-2.log",
+      "bytes": 135361,
+      "sha256": "38ac157d0a7a2e65cd27e428bea2fb506b85f4d1182bb97d5c1681bd97271b37"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/command-3.log",
+      "bytes": 26,
+      "sha256": "adc6df920a079cf591a5e802501cf07df817878b7e2801164d10e17d8231dacf"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/command-4.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/command-5.log",
+      "bytes": 3685,
+      "sha256": "0d3c3b3c3bea5b81e23e83da78f1d64e5772a54e2b0df0a879544fdc1be9ccdc"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/command-6.log",
+      "bytes": 118,
+      "sha256": "98eafcea6b231ae38ae17e3ac184e40465f35f0f641d3f00df9e068611fa381a"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/command-7.log",
+      "bytes": 812,
+      "sha256": "e145ebc377f16ca5124b86d3883fb80f25f06b93dcc156b677d38c4719f4a6b0"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/command-8.log",
+      "bytes": 767,
+      "sha256": "73f08ca8b711d2a0613133145d1f4f1b702a6aa41aea9c7aae8ab4dd968cf36e"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/command-9.log",
+      "bytes": 41,
+      "sha256": "7b2ad7639965df6a69d85364b617d20db711cb8b9526af8242d70e95bf81ac29"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/commands.json",
+      "bytes": 4390,
+      "sha256": "eddff192d6cf31ad495bd20b417f424802c09261d63174343d07e50d673c999a"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/generated-tests.log",
+      "bytes": 493,
+      "sha256": "75d593033afa175597093d615c33d18c0e8d066d93166682ec420c17fdc812a8"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/published.png",
+      "bytes": 140519,
+      "sha256": "aef85f7ebd497e020e268ba8ba8ec128a0df3ab74233035d8e1fd45ca0d43736"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/python-events-0.1.0.cgext",
+      "bytes": 13612,
+      "sha256": "9229232eb9e8d1a490f93e8bd7e1aaa8c1db70d3f22f67c779f5e2b7d03c970d"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/result.json",
+      "bytes": 6373,
+      "sha256": "007df77530cef334c1a7b72159b672948545452fdd1a94da2855a7eb792a64ec"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/browser/desktop-installed.png",
+      "bytes": 117122,
+      "sha256": "03a0ec62222025e5939252a0b3b8ae0c55aca6519924c6116b9b90611ee54743"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/browser/mobile-detail.png",
+      "bytes": 56941,
+      "sha256": "d4d0ad1145b7e02ae2390380e7c6d8278347618a1402e8af0b508386a57f5365"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/browser/result.json",
+      "bytes": 966,
+      "sha256": "4a19aa5d127a87bc1b2a98d6ca2caea33e077e55eb10d3692ecb7a4dab75fb97"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/browser.log",
+      "bytes": 4464,
+      "sha256": "401dd1c986b8e364704e9b048134eea0f90446aaa4926dba4fbc1e63c1eeff63"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/build.log",
+      "bytes": 6969,
+      "sha256": "ee6e47d91f4983d940e104af89884aa9800cfb49fa4e5f431cadd33d5a11b321"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-1.log",
+      "bytes": 915,
+      "sha256": "4ff5288af258f5b56568308da5fe2e9fa21ff6e83d9641a1853b37a7a576bbf4"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-10.log",
+      "bytes": 815,
+      "sha256": "a8a704cb9848523438c7a2181e2cd5fa2740e72c5a2b38cb3011a1fbf6225889"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-11.log",
+      "bytes": 935,
+      "sha256": "3275a5edd8579e68cbdf1377381fc4b13b6a4106a83649d606a9683f615279e1"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-12.log",
+      "bytes": 767,
+      "sha256": "cc643bc3aa19bf4efd34970353982d75c361ded4a2b83f332e72314a3f96fe21"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-2.log",
+      "bytes": 293,
+      "sha256": "d93afb7d84337fce0fb443fb79883800bb478b4c94635140b8f67f9734ed2b26"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-3.log",
+      "bytes": 122,
+      "sha256": "78fff926f4f8969d8e1705c0a1271cbd63b822579f81d715c2042ad94c80ad45"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-4.log",
+      "bytes": 290,
+      "sha256": "83a7b90bfd2c211c6fb4afcf72e261ef7b42bfd6dc21cfb72d530fb970aef44a"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-5.log",
+      "bytes": 929,
+      "sha256": "c96b1a1c06b05449e077865b20762457f32fdc67c4bb995830dc1aeab1cd177a"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-6.log",
+      "bytes": 530,
+      "sha256": "38c1d85e306b15c18732c81df087390b3dfbd3873bc8836e36be492a1fb8a7fa"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-7.log",
+      "bytes": 913,
+      "sha256": "57960e4dd3ca46d05f3fe269dd3f4df66b3489b0d8ded9c682d26d7c9e034e0f"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-8.log",
+      "bytes": 913,
+      "sha256": "27ee9b3f27455865bb2be85cde563d51de78d45b3fdb1563551817fa6297b6bc"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-9.log",
+      "bytes": 814,
+      "sha256": "48c1cd3fc3863fd068ac38528410fe6b7f788d8c8261332d976d66cc768b7b72"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/commands.json",
+      "bytes": 5213,
+      "sha256": "52836b87e73b4fae1b7494e4016b6bbf578f8de17dcc4be9f70f1a9904442b1d"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/desktop-installed.png",
+      "bytes": 67791,
+      "sha256": "a9e4a6320f6d00d1c266ee9f28932289836eeaae0585f0358cee5546a2c9eef9"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/desktop-selected.png",
+      "bytes": 66852,
+      "sha256": "da855ea00f6340128f86bac8f095c34b92cfefad7d3518edb7ae5e59b7638cc5"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/mobile-selected.png",
+      "bytes": 57446,
+      "sha256": "4001d9a246a680945f91e02e1208aaf097a34508eb67ac342d194b1a50a8cf34"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/result.json",
+      "bytes": 8319,
+      "sha256": "eed11c38e8e5e099a948ebbda9f1a34fe7585d541ae94a71b8cbfa4dbb219d7f"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility.log",
+      "bytes": 3160,
+      "sha256": "1cc4239bfbc96c5255244baced43c3cfe69b90801c5bb2353d27425f81088a74"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/external-author.log",
+      "bytes": 576,
+      "sha256": "7903035256e8592f821051264dc3f45fe245cab48b2cc071afee5f8240e61539"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/focused.json",
+      "bytes": 49983,
+      "sha256": "d8716f0951301e351677e58e6ed34eb3e71fecaa08fced2643eed134b6410c5c"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/focused.log",
+      "bytes": 18798,
+      "sha256": "bd4ec7706dc18a557e00499660ad450e34cef77b69c0e59b0acfad5a4c516cbc"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/marketplace-build.log",
+      "bytes": 72,
+      "sha256": "9f2e1db0d5b81451bd46f3f69be017f4f15e7e70df7217ca244b6f530fa6cd2a"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/registry-storage/1.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/registry-storage/10.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/registry-storage/11.log",
+      "bytes": 285,
+      "sha256": "066fc62cdf8a5dfc9fb9040a4d277c69a02a6c23e45dbb52c7579086724a4f19"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/registry-storage/12.log",
+      "bytes": 285,
+      "sha256": "514743ff7567aa5d8100a572408995647931157f496b9cb4598ed21921e12daf"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/registry-storage/2.log",
+      "bytes": 633,
+      "sha256": "11e0cfcd3b279df251b7f7bbc1730276191f71e3d41542697996e2e4e2334052"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/registry-storage/3.log",
+      "bytes": 212,
+      "sha256": "861d073201051902e41572f64b310a82f320e9cc87bace8fdaafea2632070d37"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/registry-storage/4.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/registry-storage/5.log",
+      "bytes": 633,
+      "sha256": "ae6c255512724d283a361bb615837d68dcde9c7e7802c3aee968b82684bad861"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/registry-storage/6.log",
+      "bytes": 224,
+      "sha256": "c738bc1022f0809d637bf4676ff4b1d6089b620b9601e7e2b69cd3b9e24848ea"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/registry-storage/7.log",
+      "bytes": 629,
+      "sha256": "75898b759c4a3786d3fea3f314d3dc16f8efe7f3a604f0a190320e8f3c8007f6"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/registry-storage/8.log",
+      "bytes": 215,
+      "sha256": "9e815f5ae48dac4232e9e0ed9f1045b1642d324ecd378d58e0a1025cfdf48cbd"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/registry-storage/9.log",
+      "bytes": 285,
+      "sha256": "a83ee3bb093e9b97745ed5e094b4d99ff916dd8021271724c86a8923709b3495"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/registry-storage/result.json",
+      "bytes": 10930,
+      "sha256": "4225b772f09626d56bea5de9707ba77cc2a5a6fbafba491dbf127a9cc37a0673"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/registry-storage/success.json",
+      "bytes": 82,
+      "sha256": "2e10bbc65ddded830bdca3aa9c054008f94d5b8e0f1f58bd8b8b52f9eb04296d"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/registry-storage.log",
+      "bytes": 1078,
+      "sha256": "51ec9323b768b0ade61e911b1da7f6191149e0fcde715d4ae2f922e3ee6d4bee"
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/summary.json",
+      "bytes": 6412,
+      "sha256": "efab76b545c8d9cdae04a8685b46d88882c441f5ad0e55419def51202381f86f"
+    },
+    {
+      "path": ".qa/official/native-run.json",
+      "bytes": 2718,
+      "sha256": "917db81c1482c3980502bb79725f8372db7cffddeb473fdca2e14ecf0c5ae243"
+    },
+    {
+      "path": ".qa/official/operator/command-1.log",
+      "bytes": 145,
+      "sha256": "64422fd51041caf900d5b96b850953cc618fa102166105bcd27e00468b655a77"
+    },
+    {
+      "path": ".qa/official/operator/command-2.log",
+      "bytes": 392,
+      "sha256": "a3c1a73fc7ad73cda88e636654ebdfeeb9fca11422ac891d6a759bef37633f04"
+    },
+    {
+      "path": ".qa/official/operator/command-3.log",
+      "bytes": 62,
+      "sha256": "f13557a940e03312ca474e10a736e7d3ab07214f2cdaef7b9622bbe2c2886d44"
+    },
+    {
+      "path": ".qa/official/operator/command-4.log",
+      "bytes": 1419,
+      "sha256": "619a893ada588cbf9c9f9e3cbf44f0e7787be4629f959e95ab83d7932ba02e65"
+    },
+    {
+      "path": ".qa/official/operator/progress.json",
+      "bytes": 2774,
+      "sha256": "77006e1bc344f73a179fb0ee553c1b48d983db695cebc0ca9bbdbf58befee3ce"
+    },
+    {
+      "path": ".qa/official/operator/result.json",
+      "bytes": 2980,
+      "sha256": "3e1ed8e0f28972a32c610f76b08b64cde1b4b6a97c1e3f9e9c01e1665d950aba"
+    },
+    {
+      "path": ".qa/official/operator-final/command-1.log",
+      "bytes": 145,
+      "sha256": "20e5f0c30aa5826d2a5e1a6742e36df0e5c650b3b5707ccf3a8798a7629da38f"
+    },
+    {
+      "path": ".qa/official/operator-final/command-2.log",
+      "bytes": 392,
+      "sha256": "88ac6e072f56e473bb1043e953afbd1af5068afad4069f0a76ff5f0e4cade575"
+    },
+    {
+      "path": ".qa/official/operator-final/command-3.log",
+      "bytes": 62,
+      "sha256": "f13557a940e03312ca474e10a736e7d3ab07214f2cdaef7b9622bbe2c2886d44"
+    },
+    {
+      "path": ".qa/official/operator-final/command-4.log",
+      "bytes": 1419,
+      "sha256": "60667884f0e2a9a5b53b8e028ee56706e4abe455315ac3c13c680f322445463f"
+    },
+    {
+      "path": ".qa/official/operator-final/progress.json",
+      "bytes": 2916,
+      "sha256": "7bcdd47ac30196d651ed4c70b67df4527ad7d2bac00e9f9c1de66fb704a27d0e"
+    },
+    {
+      "path": ".qa/official/operator-final/result.json",
+      "bytes": 3123,
+      "sha256": "fb4f83a69a9b28d1d3ce50f4b8d3b6f3ed7970770269c6b63838917716bc61f8"
+    },
+    {
+      "path": ".qa/official/runtime/child-1.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/official/runtime/child-2.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": ".qa/official/runtime/progress.json",
+      "bytes": 1750,
+      "sha256": "4268665ba68a02ef8e671b5c30d1e35837904f535b3d15b1d9cb058bfc610061"
+    },
+    {
+      "path": ".qa/official/runtime/result.json",
+      "bytes": 2087,
+      "sha256": "5aaac79b24a70e3cfc3b89458443c2b9ec8e754932651d308c85595ed87fbaae"
+    },
+    {
+      "path": ".qa/official/wrangler-dryrun.log",
+      "bytes": 4765,
+      "sha256": "ca7c3463da08db0cca26299642fa04c227490e12e6e254f86850b621ce43082c"
+    }
+  ],
+  "limits": [
+    "17 operator domain/runtime/CLI checks plus 2 dummy-transport remote contract checks; no provider execution",
+    "Official Drupal browser test contains 8 grouped checkpoints; four specific graph edges verified among 66 extension edges",
+    "Official CLI/Worker tested on Linux local HTTP; native jobs use the separate Node backend",
+    "Latest automatic Node HTTPS compatibility passes, publisher browser cannot start due to ENOTFOUND; prior successful Node HTTPS evidence retained",
+    "No verified Cloudflare account/resources/hostname/provider persistence/remote backup/Free CPU fit",
+    "Previous full Linux suite at 37d4dd8 and broader corpus evidence reused, not a latest whole-suite claim"
+  ],
+  "headlessCommandGroups": [
+    {
+      "path": ".qa/official/compatibility/commands.json",
+      "commands": [
+        {
+          "receipt": {
+            "command": [
+              "/usr/local/bin/node",
+              "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "compatible-demo",
+              "--registry",
+              "http://127.0.0.1:44731",
+              "--path",
+              "/tmp/cg-compatible-9Om5qw/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 1.646
+          },
+          "log": {
+            "path": ".qa/official/compatibility/command-1.log",
+            "bytes": 243,
+            "sha256": "64f1ac60c8ad25f6569563d24914759b70acf1b73e5cffeef4feb12ce4c226b9"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/usr/local/bin/node",
+              "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "compatible-demo",
+              "--registry",
+              "http://127.0.0.1:44731",
+              "--version",
+              "9.0.0",
+              "--path",
+              "/tmp/cg-compatible-9Om5qw/headless-python-project"
+            ],
+            "exit": 1,
+            "seconds": 0.49
+          },
+          "log": {
+            "path": ".qa/official/compatibility/command-2.log",
+            "bytes": 293,
+            "sha256": "d93afb7d84337fce0fb443fb79883800bb478b4c94635140b8f67f9734ed2b26"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/usr/local/bin/node",
+              "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "update",
+              "unavailable-demo",
+              "--registry",
+              "http://127.0.0.1:44731",
+              "--path",
+              "/tmp/cg-compatible-9Om5qw/headless-python-project"
+            ],
+            "exit": 1,
+            "seconds": 0.333
+          },
+          "log": {
+            "path": ".qa/official/compatibility/command-3.log",
+            "bytes": 122,
+            "sha256": "78fff926f4f8969d8e1705c0a1271cbd63b822579f81d715c2042ad94c80ad45"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/usr/local/bin/node",
+              "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "unavailable-demo",
+              "--registry",
+              "http://127.0.0.1:44731",
+              "--path",
+              "/tmp/cg-compatible-9Om5qw/headless-python-project"
+            ],
+            "exit": 1,
+            "seconds": 0.399
+          },
+          "log": {
+            "path": ".qa/official/compatibility/command-4.log",
+            "bytes": 290,
+            "sha256": "83a7b90bfd2c211c6fb4afcf72e261ef7b42bfd6dc21cfb72d530fb970aef44a"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/usr/local/bin/node",
+              "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "compatible-demo",
+              "--registry",
+              "http://127.0.0.1:44731",
+              "--version",
+              "20.0.0-beta.1",
+              "--path",
+              "/tmp/cg-compatible-9Om5qw/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 1.75
+          },
+          "log": {
+            "path": ".qa/official/compatibility/command-5.log",
+            "bytes": 257,
+            "sha256": "5a0ae6eb30e6659515338894feeb98ebeabbcd4f66e01f425110e75e83d7986d"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/usr/local/bin/node",
+              "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "update",
+              "compatible-demo",
+              "--registry",
+              "http://127.0.0.1:44731",
+              "--path",
+              "/tmp/cg-compatible-9Om5qw/headless-python-project"
+            ],
+            "exit": 1,
+            "seconds": 0.404
+          },
+          "log": {
+            "path": ".qa/official/compatibility/command-6.log",
+            "bytes": 530,
+            "sha256": "38c1d85e306b15c18732c81df087390b3dfbd3873bc8836e36be492a1fb8a7fa"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/usr/local/bin/node",
+              "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "compatible-demo",
+              "--registry",
+              "http://127.0.0.1:44731",
+              "--version",
+              "1.9.0",
+              "--path",
+              "/tmp/cg-compatible-9Om5qw/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 1.638
+          },
+          "log": {
+            "path": ".qa/official/compatibility/command-7.log",
+            "bytes": 241,
+            "sha256": "74798a107028fa391113eb0b6fa7efac8bfee9c644dbb121892993443666f2f0"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/usr/local/bin/node",
+              "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "update",
+              "compatible-demo",
+              "--registry",
+              "http://127.0.0.1:44731",
+              "--path",
+              "/tmp/cg-compatible-9Om5qw/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 1.622
+          },
+          "log": {
+            "path": ".qa/official/compatibility/command-8.log",
+            "bytes": 241,
+            "sha256": "be1f77d7dd153abaab34b2a75bdd5c2d036b406fc11da38ee8d4362bd4c26387"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/usr/local/bin/node",
+              "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "http://127.0.0.1:44731/api/download/compatible-demo/1.9.0",
+              "--path",
+              "/tmp/cg-compatible-9Om5qw/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 1.557
+          },
+          "log": {
+            "path": ".qa/official/compatibility/command-9.log",
+            "bytes": 142,
+            "sha256": "fec96b4acb520e5ee4d8a42660e9a876f54f08d60c1fc98bcc7b1dcfd2ba6748"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/usr/local/bin/node",
+              "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "/tmp/cg-compatible-9Om5qw/pinned.cgext",
+              "--path",
+              "/tmp/cg-compatible-9Om5qw/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 1.509
+          },
+          "log": {
+            "path": ".qa/official/compatibility/command-10.log",
+            "bytes": 143,
+            "sha256": "f03135c33691b92a8cd0834b0ab07175f81eb68d071d2e495c7ef96f6cbb5e69"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/usr/local/bin/node",
+              "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "compatible-demo",
+              "--registry",
+              "http://127.0.0.1:44731",
+              "--version",
+              "1.10.0+fixture.1",
+              "--path",
+              "/tmp/cg-compatible-9Om5qw/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 1.958
+          },
+          "log": {
+            "path": ".qa/official/compatibility/command-11.log",
+            "bytes": 263,
+            "sha256": "08588ddba0b05a3667ca2e4858c6625aaa7cfdd4b248283e284b36ca7bfd3b0f"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/usr/local/bin/node",
+              "/data/workspace/Chats/109197f0a288be0afa6b7f8902925630f5a0bfde/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "remove",
+              "compatible-demo",
+              "--path",
+              "/tmp/cg-compatible-9Om5qw/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 1.535
+          },
+          "log": {
+            "path": ".qa/official/compatibility/command-12.log",
+            "bytes": 95,
+            "sha256": "303e141e174839575e69f0ae0ddf92ead0470e6dca049ac1edd45fb64b607bde"
+          }
+        }
+      ]
+    },
+    {
+      "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/commands.json",
+      "commands": [
+        {
+          "receipt": {
+            "command": [
+              "/opt/hostedtoolcache/node/22.23.2/x64/bin/node",
+              "/home/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "compatible-demo",
+              "--registry",
+              "https://matters-specified-whilst-likewise.trycloudflare.com",
+              "--path",
+              "/tmp/cg-compatible-QInabi/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 0.752
+          },
+          "log": {
+            "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-1.log",
+            "bytes": 243,
+            "sha256": "64f1ac60c8ad25f6569563d24914759b70acf1b73e5cffeef4feb12ce4c226b9"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/opt/hostedtoolcache/node/22.23.2/x64/bin/node",
+              "/home/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "compatible-demo",
+              "--registry",
+              "https://matters-specified-whilst-likewise.trycloudflare.com",
+              "--version",
+              "9.0.0",
+              "--path",
+              "/tmp/cg-compatible-QInabi/headless-python-project"
+            ],
+            "exit": 1,
+            "seconds": 0.198
+          },
+          "log": {
+            "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-2.log",
+            "bytes": 293,
+            "sha256": "d93afb7d84337fce0fb443fb79883800bb478b4c94635140b8f67f9734ed2b26"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/opt/hostedtoolcache/node/22.23.2/x64/bin/node",
+              "/home/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "update",
+              "unavailable-demo",
+              "--registry",
+              "https://matters-specified-whilst-likewise.trycloudflare.com",
+              "--path",
+              "/tmp/cg-compatible-QInabi/headless-python-project"
+            ],
+            "exit": 1,
+            "seconds": 0.095
+          },
+          "log": {
+            "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-3.log",
+            "bytes": 122,
+            "sha256": "78fff926f4f8969d8e1705c0a1271cbd63b822579f81d715c2042ad94c80ad45"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/opt/hostedtoolcache/node/22.23.2/x64/bin/node",
+              "/home/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "unavailable-demo",
+              "--registry",
+              "https://matters-specified-whilst-likewise.trycloudflare.com",
+              "--path",
+              "/tmp/cg-compatible-QInabi/headless-python-project"
+            ],
+            "exit": 1,
+            "seconds": 0.199
+          },
+          "log": {
+            "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-4.log",
+            "bytes": 290,
+            "sha256": "83a7b90bfd2c211c6fb4afcf72e261ef7b42bfd6dc21cfb72d530fb970aef44a"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/opt/hostedtoolcache/node/22.23.2/x64/bin/node",
+              "/home/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "compatible-demo",
+              "--registry",
+              "https://matters-specified-whilst-likewise.trycloudflare.com",
+              "--version",
+              "20.0.0-beta.1",
+              "--path",
+              "/tmp/cg-compatible-QInabi/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 2.289
+          },
+          "log": {
+            "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-5.log",
+            "bytes": 257,
+            "sha256": "5a0ae6eb30e6659515338894feeb98ebeabbcd4f66e01f425110e75e83d7986d"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/opt/hostedtoolcache/node/22.23.2/x64/bin/node",
+              "/home/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "update",
+              "compatible-demo",
+              "--registry",
+              "https://matters-specified-whilst-likewise.trycloudflare.com",
+              "--path",
+              "/tmp/cg-compatible-QInabi/headless-python-project"
+            ],
+            "exit": 1,
+            "seconds": 0.2
+          },
+          "log": {
+            "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-6.log",
+            "bytes": 530,
+            "sha256": "38c1d85e306b15c18732c81df087390b3dfbd3873bc8836e36be492a1fb8a7fa"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/opt/hostedtoolcache/node/22.23.2/x64/bin/node",
+              "/home/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "compatible-demo",
+              "--registry",
+              "https://matters-specified-whilst-likewise.trycloudflare.com",
+              "--version",
+              "1.9.0",
+              "--path",
+              "/tmp/cg-compatible-QInabi/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 2.786
+          },
+          "log": {
+            "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-7.log",
+            "bytes": 241,
+            "sha256": "74798a107028fa391113eb0b6fa7efac8bfee9c644dbb121892993443666f2f0"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/opt/hostedtoolcache/node/22.23.2/x64/bin/node",
+              "/home/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "update",
+              "compatible-demo",
+              "--registry",
+              "https://matters-specified-whilst-likewise.trycloudflare.com",
+              "--path",
+              "/tmp/cg-compatible-QInabi/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 2.109
+          },
+          "log": {
+            "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-8.log",
+            "bytes": 241,
+            "sha256": "be1f77d7dd153abaab34b2a75bdd5c2d036b406fc11da38ee8d4362bd4c26387"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/opt/hostedtoolcache/node/22.23.2/x64/bin/node",
+              "/home/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "https://matters-specified-whilst-likewise.trycloudflare.com/api/download/compatible-demo/1.9.0",
+              "--path",
+              "/tmp/cg-compatible-QInabi/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 0.899
+          },
+          "log": {
+            "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-9.log",
+            "bytes": 142,
+            "sha256": "fec96b4acb520e5ee4d8a42660e9a876f54f08d60c1fc98bcc7b1dcfd2ba6748"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/opt/hostedtoolcache/node/22.23.2/x64/bin/node",
+              "/home/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "/tmp/cg-compatible-QInabi/pinned.cgext",
+              "--path",
+              "/tmp/cg-compatible-QInabi/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 0.4
+          },
+          "log": {
+            "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-10.log",
+            "bytes": 143,
+            "sha256": "f03135c33691b92a8cd0834b0ab07175f81eb68d071d2e495c7ef96f6cbb5e69"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/opt/hostedtoolcache/node/22.23.2/x64/bin/node",
+              "/home/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "compatible-demo",
+              "--registry",
+              "https://matters-specified-whilst-likewise.trycloudflare.com",
+              "--version",
+              "1.10.0+fixture.1",
+              "--path",
+              "/tmp/cg-compatible-QInabi/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 0.759
+          },
+          "log": {
+            "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-11.log",
+            "bytes": 263,
+            "sha256": "08588ddba0b05a3667ca2e4858c6625aaa7cfdd4b248283e284b36ca7bfd3b0f"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/opt/hostedtoolcache/node/22.23.2/x64/bin/node",
+              "/home/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "remove",
+              "compatible-demo",
+              "--path",
+              "/tmp/cg-compatible-QInabi/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 0.528
+          },
+          "log": {
+            "path": ".qa/official/https-35727987378/marketplace-https-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/compatibility/command-12.log",
+            "bytes": 95,
+            "sha256": "303e141e174839575e69f0ae0ddf92ead0470e6dca049ac1edd45fb64b607bde"
+          }
+        }
+      ]
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/commands.json",
+      "commands": [
+        {
+          "receipt": {
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/Users/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "create",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/codegraph-external-author-1Tiik8/python-events",
+              "--id",
+              "python-events"
+            ],
+            "cwd": "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/codegraph-external-author-1Tiik8",
+            "exit": 0,
+            "seconds": 0.121
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/command-1.log",
+            "bytes": 233,
+            "sha256": "72dff572661a5b2e8e5464d91d7cb9fdafd3e5c9fb0cca0e603ecbefd6759c80"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/lib/node_modules/npm/bin/npm-cli.js",
+              "pack",
+              "--ignore-scripts",
+              "--json",
+              "--pack-destination",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/codegraph-external-author-1Tiik8"
+            ],
+            "cwd": "/Users/runner/work/codegraph/codegraph",
+            "exit": 0,
+            "seconds": 8.427
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/command-2.log",
+            "bytes": 135360,
+            "sha256": "288be01c1e70e1861f67c22fa50ec23cbfeff59e14b9223e6862a37672fefa30"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/lib/node_modules/npm/bin/npm-cli.js",
+              "install",
+              "--ignore-scripts",
+              "--no-audit",
+              "--no-fund",
+              "--save-dev",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/codegraph-external-author-1Tiik8/colbymchenry-codegraph-1.6.0.tgz"
+            ],
+            "cwd": "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/codegraph-external-author-1Tiik8/python-events",
+            "exit": 0,
+            "seconds": 7.793
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/command-3.log",
+            "bytes": 25,
+            "sha256": "67741e1e35aef24633e977d9b9a1672d0e2062f2cd5c357d15cef98b05a3beab"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/Users/runner/work/codegraph/codegraph/node_modules/typescript/bin/tsc",
+              "--allowJs",
+              "--checkJs",
+              "--noEmit",
+              "--skipLibCheck",
+              "--target",
+              "ES2022",
+              "--module",
+              "commonjs",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/codegraph-external-author-1Tiik8/python-events/index.cjs"
+            ],
+            "cwd": "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/codegraph-external-author-1Tiik8/python-events",
+            "exit": 0,
+            "seconds": 0.556
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/command-4.log",
+            "bytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/codegraph-external-author-1Tiik8/python-events/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "test",
+              "."
+            ],
+            "cwd": "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/codegraph-external-author-1Tiik8/python-events",
+            "exit": 0,
+            "seconds": 2.152
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/command-5.log",
+            "bytes": 3685,
+            "sha256": "056ad003c8c804f0e18522f55ed65173262214d2e0332df6fce6d18c922bd3f8"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/codegraph-external-author-1Tiik8/python-events/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "pack",
+              ".",
+              "--out",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/codegraph-external-author-1Tiik8/python-events-0.1.0.cgext"
+            ],
+            "cwd": "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/codegraph-external-author-1Tiik8/python-events",
+            "exit": 0,
+            "seconds": 0.088
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/command-6.log",
+            "bytes": 130,
+            "sha256": "b3bc584e270ae41be04b281554f25d42ef0793bc217ea8f60effd372afef6035"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/codegraph-external-author-1Tiik8/python-events/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "http://127.0.0.1:49217/api/download/python-events/0.1.0",
+              "--path",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/codegraph-external-author-1Tiik8/python-app"
+            ],
+            "cwd": "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/codegraph-external-author-1Tiik8",
+            "exit": 0,
+            "seconds": 0.715
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/command-7.log",
+            "bytes": 812,
+            "sha256": "b08383e3fbcfcea4fcf73e4135bb39b593c7ecaa0c022f80c567646b3de41132"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/codegraph-external-author-1Tiik8/python-events/node_modules/@colbymchenry/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "remove",
+              "python-events",
+              "--path",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/codegraph-external-author-1Tiik8/python-app"
+            ],
+            "cwd": "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/codegraph-external-author-1Tiik8",
+            "exit": 0,
+            "seconds": 0.55
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/command-8.log",
+            "bytes": 767,
+            "sha256": "751c3e7a4861162f2376cfffd567fa90486d04171b454296602440364210075b"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "git",
+              "rev-parse",
+              "HEAD"
+            ],
+            "cwd": "/Users/runner/work/codegraph/codegraph",
+            "exit": 0,
+            "seconds": 0.013
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/author/command-9.log",
+            "bytes": 41,
+            "sha256": "7b2ad7639965df6a69d85364b617d20db711cb8b9526af8242d70e95bf81ac29"
+          }
+        }
+      ]
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/commands.json",
+      "commands": [
+        {
+          "receipt": {
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/Users/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "compatible-demo",
+              "--registry",
+              "http://127.0.0.1:49231",
+              "--path",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/cg-compatible-UeqD62/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 0.713
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-1.log",
+            "bytes": 915,
+            "sha256": "20fa28a5590f5cc732fa936eedbfc69ad6806de1fa0f2621815eeb7941e7b64a"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/Users/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "compatible-demo",
+              "--registry",
+              "http://127.0.0.1:49231",
+              "--version",
+              "9.0.0",
+              "--path",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/cg-compatible-UeqD62/headless-python-project"
+            ],
+            "exit": 1,
+            "seconds": 0.124
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-2.log",
+            "bytes": 293,
+            "sha256": "d93afb7d84337fce0fb443fb79883800bb478b4c94635140b8f67f9734ed2b26"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/Users/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "update",
+              "unavailable-demo",
+              "--registry",
+              "http://127.0.0.1:49231",
+              "--path",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/cg-compatible-UeqD62/headless-python-project"
+            ],
+            "exit": 1,
+            "seconds": 0.073
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-3.log",
+            "bytes": 122,
+            "sha256": "78fff926f4f8969d8e1705c0a1271cbd63b822579f81d715c2042ad94c80ad45"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/Users/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "unavailable-demo",
+              "--registry",
+              "http://127.0.0.1:49231",
+              "--path",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/cg-compatible-UeqD62/headless-python-project"
+            ],
+            "exit": 1,
+            "seconds": 0.091
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-4.log",
+            "bytes": 290,
+            "sha256": "83a7b90bfd2c211c6fb4afcf72e261ef7b42bfd6dc21cfb72d530fb970aef44a"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/Users/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "compatible-demo",
+              "--registry",
+              "http://127.0.0.1:49231",
+              "--version",
+              "20.0.0-beta.1",
+              "--path",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/cg-compatible-UeqD62/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 0.504
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-5.log",
+            "bytes": 929,
+            "sha256": "0fce88f672e44b400b559e9e6fd1091b627b6f644490c188a37f831721cb3a58"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/Users/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "update",
+              "compatible-demo",
+              "--registry",
+              "http://127.0.0.1:49231",
+              "--path",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/cg-compatible-UeqD62/headless-python-project"
+            ],
+            "exit": 1,
+            "seconds": 0.101
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-6.log",
+            "bytes": 530,
+            "sha256": "38c1d85e306b15c18732c81df087390b3dfbd3873bc8836e36be492a1fb8a7fa"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/Users/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "compatible-demo",
+              "--registry",
+              "http://127.0.0.1:49231",
+              "--version",
+              "1.9.0",
+              "--path",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/cg-compatible-UeqD62/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 0.495
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-7.log",
+            "bytes": 913,
+            "sha256": "38fdb7f61e54815bdd5cd252708500216a903b7dff8816282095138d7adde629"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/Users/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "update",
+              "compatible-demo",
+              "--registry",
+              "http://127.0.0.1:49231",
+              "--path",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/cg-compatible-UeqD62/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 0.48
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-8.log",
+            "bytes": 913,
+            "sha256": "7f618bf8d06940ae60c6f8745d37e1d1af67fd7c2fe3627cbe8c4393ec033c51"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/Users/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "http://127.0.0.1:49231/api/download/compatible-demo/1.9.0",
+              "--path",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/cg-compatible-UeqD62/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 0.423
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-9.log",
+            "bytes": 814,
+            "sha256": "53f2cb5654f9a9b910fb9291161ac06ed1d615b198c271a2495c72e7105cb281"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/Users/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/cg-compatible-UeqD62/pinned.cgext",
+              "--path",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/cg-compatible-UeqD62/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 0.433
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-10.log",
+            "bytes": 815,
+            "sha256": "3a6f06e0b35658eba7a658fe7b5b48b960df7a662883bf891410e25581f0a917"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/Users/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "install",
+              "compatible-demo",
+              "--registry",
+              "http://127.0.0.1:49231",
+              "--version",
+              "1.10.0+fixture.1",
+              "--path",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/cg-compatible-UeqD62/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 0.496
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-11.log",
+            "bytes": 935,
+            "sha256": "e7606c84860d7a3acca97a9a2a4caa068b9579c803240be97b5797eff4560c44"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "/Users/runner/hostedtoolcache/node/22.23.2/arm64/bin/node",
+              "/Users/runner/work/codegraph/codegraph/dist/bin/codegraph.js",
+              "extensions",
+              "remove",
+              "compatible-demo",
+              "--path",
+              "/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/cg-compatible-UeqD62/headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 0.461
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-macos-15-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/darwin-arm64/compatibility/command-12.log",
+            "bytes": 767,
+            "sha256": "87d2cbcddec654e795661fe9bf6d06e5d9aaeea58ea249b063d8bc8b0c91598e"
+          }
+        }
+      ]
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/commands.json",
+      "commands": [
+        {
+          "receipt": {
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "D:\\a\\codegraph\\codegraph\\dist\\bin\\codegraph.js",
+              "extensions",
+              "create",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\codegraph-external-author-mODAXF\\python-events",
+              "--id",
+              "python-events"
+            ],
+            "cwd": "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\codegraph-external-author-mODAXF",
+            "exit": 0,
+            "seconds": 0.135
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/command-1.log",
+            "bytes": 209,
+            "sha256": "54c3c6acba8fd9c5ddcfbcc9a4c2590efd918fa1316582d59e2e16eb1e083aa1"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node_modules\\npm\\bin\\npm-cli.js",
+              "pack",
+              "--ignore-scripts",
+              "--json",
+              "--pack-destination",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\codegraph-external-author-mODAXF"
+            ],
+            "cwd": "D:\\a\\codegraph\\codegraph",
+            "exit": 0,
+            "seconds": 7.814
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/command-2.log",
+            "bytes": 135361,
+            "sha256": "38ac157d0a7a2e65cd27e428bea2fb506b85f4d1182bb97d5c1681bd97271b37"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node_modules\\npm\\bin\\npm-cli.js",
+              "install",
+              "--ignore-scripts",
+              "--no-audit",
+              "--no-fund",
+              "--save-dev",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\codegraph-external-author-mODAXF\\colbymchenry-codegraph-1.6.0.tgz"
+            ],
+            "cwd": "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\codegraph-external-author-mODAXF\\python-events",
+            "exit": 0,
+            "seconds": 56.318
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/command-3.log",
+            "bytes": 26,
+            "sha256": "adc6df920a079cf591a5e802501cf07df817878b7e2801164d10e17d8231dacf"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "D:\\a\\codegraph\\codegraph\\node_modules\\typescript\\bin\\tsc",
+              "--allowJs",
+              "--checkJs",
+              "--noEmit",
+              "--skipLibCheck",
+              "--target",
+              "ES2022",
+              "--module",
+              "commonjs",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\codegraph-external-author-mODAXF\\python-events\\index.cjs"
+            ],
+            "cwd": "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\codegraph-external-author-mODAXF\\python-events",
+            "exit": 0,
+            "seconds": 0.607
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/command-4.log",
+            "bytes": 0,
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\codegraph-external-author-mODAXF\\python-events\\node_modules\\@colbymchenry\\codegraph\\dist\\bin\\codegraph.js",
+              "extensions",
+              "test",
+              "."
+            ],
+            "cwd": "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\codegraph-external-author-mODAXF\\python-events",
+            "exit": 0,
+            "seconds": 9.847
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/command-5.log",
+            "bytes": 3685,
+            "sha256": "0d3c3b3c3bea5b81e23e83da78f1d64e5772a54e2b0df0a879544fdc1be9ccdc"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\codegraph-external-author-mODAXF\\python-events\\node_modules\\@colbymchenry\\codegraph\\dist\\bin\\codegraph.js",
+              "extensions",
+              "pack",
+              ".",
+              "--out",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\codegraph-external-author-mODAXF\\python-events-0.1.0.cgext"
+            ],
+            "cwd": "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\codegraph-external-author-mODAXF\\python-events",
+            "exit": 0,
+            "seconds": 0.127
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/command-6.log",
+            "bytes": 118,
+            "sha256": "98eafcea6b231ae38ae17e3ac184e40465f35f0f641d3f00df9e068611fa381a"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\codegraph-external-author-mODAXF\\python-events\\node_modules\\@colbymchenry\\codegraph\\dist\\bin\\codegraph.js",
+              "extensions",
+              "install",
+              "http://127.0.0.1:60650/api/download/python-events/0.1.0",
+              "--path",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\codegraph-external-author-mODAXF\\python-app"
+            ],
+            "cwd": "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\codegraph-external-author-mODAXF",
+            "exit": 0,
+            "seconds": 1.524
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/command-7.log",
+            "bytes": 812,
+            "sha256": "e145ebc377f16ca5124b86d3883fb80f25f06b93dcc156b677d38c4719f4a6b0"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\codegraph-external-author-mODAXF\\python-events\\node_modules\\@colbymchenry\\codegraph\\dist\\bin\\codegraph.js",
+              "extensions",
+              "remove",
+              "python-events",
+              "--path",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\codegraph-external-author-mODAXF\\python-app"
+            ],
+            "cwd": "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\codegraph-external-author-mODAXF",
+            "exit": 0,
+            "seconds": 1.175
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/command-8.log",
+            "bytes": 767,
+            "sha256": "73f08ca8b711d2a0613133145d1f4f1b702a6aa41aea9c7aae8ab4dd968cf36e"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "git",
+              "rev-parse",
+              "HEAD"
+            ],
+            "cwd": "D:\\a\\codegraph\\codegraph",
+            "exit": 0,
+            "seconds": 0.018
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/author/command-9.log",
+            "bytes": 41,
+            "sha256": "7b2ad7639965df6a69d85364b617d20db711cb8b9526af8242d70e95bf81ac29"
+          }
+        }
+      ]
+    },
+    {
+      "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/commands.json",
+      "commands": [
+        {
+          "receipt": {
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "D:\\a\\codegraph\\codegraph\\dist\\bin\\codegraph.js",
+              "extensions",
+              "install",
+              "compatible-demo",
+              "--registry",
+              "http://127.0.0.1:60663",
+              "--path",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\cg-compatible-H3rnbh\\headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 1.942
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-1.log",
+            "bytes": 915,
+            "sha256": "4ff5288af258f5b56568308da5fe2e9fa21ff6e83d9641a1853b37a7a576bbf4"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "D:\\a\\codegraph\\codegraph\\dist\\bin\\codegraph.js",
+              "extensions",
+              "install",
+              "compatible-demo",
+              "--registry",
+              "http://127.0.0.1:60663",
+              "--version",
+              "9.0.0",
+              "--path",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\cg-compatible-H3rnbh\\headless-python-project"
+            ],
+            "exit": 1,
+            "seconds": 0.141
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-2.log",
+            "bytes": 293,
+            "sha256": "d93afb7d84337fce0fb443fb79883800bb478b4c94635140b8f67f9734ed2b26"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "D:\\a\\codegraph\\codegraph\\dist\\bin\\codegraph.js",
+              "extensions",
+              "update",
+              "unavailable-demo",
+              "--registry",
+              "http://127.0.0.1:60663",
+              "--path",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\cg-compatible-H3rnbh\\headless-python-project"
+            ],
+            "exit": 1,
+            "seconds": 0.11
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-3.log",
+            "bytes": 122,
+            "sha256": "78fff926f4f8969d8e1705c0a1271cbd63b822579f81d715c2042ad94c80ad45"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "D:\\a\\codegraph\\codegraph\\dist\\bin\\codegraph.js",
+              "extensions",
+              "install",
+              "unavailable-demo",
+              "--registry",
+              "http://127.0.0.1:60663",
+              "--path",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\cg-compatible-H3rnbh\\headless-python-project"
+            ],
+            "exit": 1,
+            "seconds": 0.138
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-4.log",
+            "bytes": 290,
+            "sha256": "83a7b90bfd2c211c6fb4afcf72e261ef7b42bfd6dc21cfb72d530fb970aef44a"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "D:\\a\\codegraph\\codegraph\\dist\\bin\\codegraph.js",
+              "extensions",
+              "install",
+              "compatible-demo",
+              "--registry",
+              "http://127.0.0.1:60663",
+              "--version",
+              "20.0.0-beta.1",
+              "--path",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\cg-compatible-H3rnbh\\headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 1.338
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-5.log",
+            "bytes": 929,
+            "sha256": "c96b1a1c06b05449e077865b20762457f32fdc67c4bb995830dc1aeab1cd177a"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "D:\\a\\codegraph\\codegraph\\dist\\bin\\codegraph.js",
+              "extensions",
+              "update",
+              "compatible-demo",
+              "--registry",
+              "http://127.0.0.1:60663",
+              "--path",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\cg-compatible-H3rnbh\\headless-python-project"
+            ],
+            "exit": 1,
+            "seconds": 0.141
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-6.log",
+            "bytes": 530,
+            "sha256": "38c1d85e306b15c18732c81df087390b3dfbd3873bc8836e36be492a1fb8a7fa"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "D:\\a\\codegraph\\codegraph\\dist\\bin\\codegraph.js",
+              "extensions",
+              "install",
+              "compatible-demo",
+              "--registry",
+              "http://127.0.0.1:60663",
+              "--version",
+              "1.9.0",
+              "--path",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\cg-compatible-H3rnbh\\headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 1.33
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-7.log",
+            "bytes": 913,
+            "sha256": "57960e4dd3ca46d05f3fe269dd3f4df66b3489b0d8ded9c682d26d7c9e034e0f"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "D:\\a\\codegraph\\codegraph\\dist\\bin\\codegraph.js",
+              "extensions",
+              "update",
+              "compatible-demo",
+              "--registry",
+              "http://127.0.0.1:60663",
+              "--path",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\cg-compatible-H3rnbh\\headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 1.282
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-8.log",
+            "bytes": 913,
+            "sha256": "27ee9b3f27455865bb2be85cde563d51de78d45b3fdb1563551817fa6297b6bc"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "D:\\a\\codegraph\\codegraph\\dist\\bin\\codegraph.js",
+              "extensions",
+              "install",
+              "http://127.0.0.1:60663/api/download/compatible-demo/1.9.0",
+              "--path",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\cg-compatible-H3rnbh\\headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 1.219
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-9.log",
+            "bytes": 814,
+            "sha256": "48c1cd3fc3863fd068ac38528410fe6b7f788d8c8261332d976d66cc768b7b72"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "D:\\a\\codegraph\\codegraph\\dist\\bin\\codegraph.js",
+              "extensions",
+              "install",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\cg-compatible-H3rnbh\\pinned.cgext",
+              "--path",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\cg-compatible-H3rnbh\\headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 1.185
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-10.log",
+            "bytes": 815,
+            "sha256": "a8a704cb9848523438c7a2181e2cd5fa2740e72c5a2b38cb3011a1fbf6225889"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "D:\\a\\codegraph\\codegraph\\dist\\bin\\codegraph.js",
+              "extensions",
+              "install",
+              "compatible-demo",
+              "--registry",
+              "http://127.0.0.1:60663",
+              "--version",
+              "1.10.0+fixture.1",
+              "--path",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\cg-compatible-H3rnbh\\headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 1.476
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-11.log",
+            "bytes": 935,
+            "sha256": "3275a5edd8579e68cbdf1377381fc4b13b6a4106a83649d606a9683f615279e1"
+          }
+        },
+        {
+          "receipt": {
+            "command": [
+              "C:\\hostedtoolcache\\windows\\node\\22.23.2\\x64\\node.exe",
+              "D:\\a\\codegraph\\codegraph\\dist\\bin\\codegraph.js",
+              "extensions",
+              "remove",
+              "compatible-demo",
+              "--path",
+              "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\cg-compatible-H3rnbh\\headless-python-project"
+            ],
+            "exit": 0,
+            "seconds": 1.173
+          },
+          "log": {
+            "path": ".qa/official/native-35727987357/extensions-native-windows-2022-6272db657e8d45511a2059b3fdf89d90bb81ea77-1/win32-x64/compatibility/command-12.log",
+            "bytes": 767,
+            "sha256": "cc643bc3aa19bf4efd34970353982d75c361ded4a2b83f332e72314a3f96fe21"
+          }
+        }
+      ]
+    }
+  ]
+}

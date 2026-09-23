@@ -1,0 +1,12 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "codegraph-marketplace-preview",
+  "main": "worker.ts",
+  "compatibility_date": "2026-09-21",
+  "workers_dev": true,
+  "preview_urls": false,
+  "assets": { "directory": "../public", "binding": "ASSETS", "run_worker_first": ["/api/*"], "not_found_handling": "single-page-application" },
+  "d1_databases": [{ "binding": "DB", "database_name": "codegraph-marketplace-preview", "database_id": "00000000-0000-0000-0000-000000000000", "migrations_dir": "migrations" }],
+  "r2_buckets": [{ "binding": "PACKAGES", "bucket_name": "codegraph-marketplace-preview-packages" }],
+  "vars": { "PUBLISHING_ENABLED": "false" }
+}

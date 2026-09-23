@@ -12,6 +12,25 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- Add a trusted, pinned Drupal import command for the Cloudflare registry, with target/plan verification, atomic owner claims, official backup preservation and local Worker/browser graph acceptance.
+
+
+### Extension preview
+
+- Add a deployed Cloudflare marketplace preview with dedicated D1/private R2, reviewed OAuth operator import/backup/restore, expiring publication windows and actual HTTPS graph acceptance. Provider redeployment and detached restore preserve immutable releases; public publishing is disabled after controlled validation.
+
+- Reconcile global semantic-extension links after sync or explicit file indexing with an atomic candidate rebuild. Failed passes preserve the working graph. Reuse bounded core parse results on warm project instances while rerunning all framework hooks, global resolution and semantic passes; cold or disabled reuse retains full parsing. Reject observed source changes before commit and reclaim interrupted graph-only candidates. Rebuild text search and built-in secondary indexes in bulk inside the atomic replacement transaction.
+
+- Prepare immutable Drupal extension 0.1.1: ignore unrelated static receivers and commented/quoted declarations, and resolve both explicit Symfony event argument orders. Preserve the reviewed 0.1.0 artifact and policy.
+- Keep installed and selected marketplace versions distinct while compatibility metadata refreshes; pending requests no longer display an incompatible catalog version as installed.
+
+- Add project-scoped framework and semantic extensions, managed package installation, worker loading, and graph refresh on install/update/enable/disable/remove. Failed activation preserves the previous project configuration and graph.
+- Add an external Drupal extension for declared routes/forms, services, hooks, plugins and event subscribers. Literal route paths can be explore endpoints; extension edges retain their labels and registration sites. Comments and quoted examples do not count as PHP invocations.
+- Add a local marketplace preview with signed publisher submissions, immutable releases, publisher ownership checks and a companion connection for project selection. Mobile detail pages retain version, compatibility and source information. The dedicated Cloudflare preview now has separate hosted acceptance evidence; this is not a release announcement.
+- Extension authors can generate a starter with `codegraph extensions create`, test real graph contributions and removal with `codegraph extensions test`, and use the public SDK types and author guide without private core imports.
+
+- Marketplace and headless registry installs now select the highest stable semantic version compatible with the connected engine and extension API. Automatic updates refuse downgrades; explicit pins (including prereleases) never substitute another version. Downloaded identity, compatibility and integrity are rechecked locally.
+
 ### Highlights
 
 - **`codegraph ui` — your graph in a browser.** A local, read-only viewer for the project you already indexed: your code with its callers and callees in the margin, a map of the whole repository, and a strip that shows how one symbol reaches another.
@@ -24,6 +43,12 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Upgrading:** re-index your projects after this release — several of the new readings rest on edges that are written while indexing.
 
 ### New Features
+
+- Inspect the exact extension package and every bundled source file before installing, with verified fingerprints and clear repository provenance.
+
+- Prepare a Cloudflare marketplace backend with signed publication, immutable packages, persistent metadata and isolated recovery validation. Hosted setup remains a preview prerequisite.
+
+- Marketplace operators can preserve published extensions across service restarts and restore verified backups into an isolated registry.
 
 - **Codex and Astra read project guidance from `AGENTS.md`.** The canonical agent guide now lives in `AGENTS.md` (with a nested `docs/AGENTS.md` for long validation notes); `CLAUDE.md` is a thin `@AGENTS.md` wrapper for Claude Code. Codex/Astra no longer miss the old CLAUDE-only instructions.
 
@@ -144,6 +169,13 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Trails are plain JSON, one file per trail, under `.codegraph/ui/trails/` — already ignored by git, so they stay yours by default. **Export** hands you the file if you'd rather commit one for the team. This is the only thing the viewer writes: it still never indexes, never changes your graph, and never touches a line of your code. Start it with `codegraph ui --read-only` and it won't write even that — saved trails can still be opened, just not saved or deleted.
 
 ### Fixes
+
+- Extension installation and interrupted-operation recovery now honor `CODEGRAPH_DIR` without creating or modifying the default data directory.
+
+- Managed extensions remain trusted when a project is opened with different path capitalization on Windows and macOS.
+- Publisher forms preserve entered descriptions and source links while package metadata finishes loading.
+
+- Interrupted extension installs and changes recover their last consistent configuration and graph, while conflicting user edits produce repair instructions instead of being overwritten.
 
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 

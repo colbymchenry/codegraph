@@ -5,7 +5,15 @@
  * knowledge graph from any codebase.
  */
 
+import { CoreExtractionReuse } from './extraction/core-reuse';
+import { channel } from 'node:diagnostics_channel';
 import * as path from 'path';
+import * as fs from 'node:fs';
+import { randomUUID, createHash } from 'node:crypto';
+import { recoverExtensions, withExtensionGuard, withExtensionGuardSync, extensionTransition, beginGraphCandidate, finishGraphCandidate } from './plugins/recovery';
+import { loadPlugins, pluginFingerprint } from './plugins/loader';
+import { withPlugins, currentPlugins, type PluginRegistry } from './plugins/registry';
+import { loadPluginEntries } from './project-config';
 import {
   Node,
   NodeKind,
@@ -41,6 +49,7 @@ import {
   SyncResult,
   extractFromSource,
   initGrammars,
+  scanDirectory,
 } from './extraction';
 import {
   ReferenceResolver,
@@ -95,6 +104,12 @@ export {
 export { Mutex, FileLock, processInBatches, debounce, throttle, MemoryMonitor } from './utils';
 export { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './sync';
 export { MCPServer } from './mcp';
+// Public author API: available through the source package and published SDK shim.
+export { defineExtension, EXTENSION_API_VERSION, createExtensionProject, testExtension } from './plugins/author';
+export type { AuthorFixtureCase, AuthorTestReport, AuthorNodeExpectation, AuthorEdgeExpectation } from './plugins/author';
+export { packExtension } from './plugins/package';
+export type { CodeGraphPlugin, PluginContext, PluginManifest, PluginContributions, SynthPass } from './plugins/api';
+export type { FrameworkResolver, ResolutionContext, UnresolvedRef, ResolvedRef } from './resolution/types';
 
 /**
  * Options for initializing a new CodeGraph project
@@ -122,6 +137,10 @@ export interface OpenOptions {
  * Options for indexing
  */
 export interface IndexOptions {
+  /** @internal Managed lifecycle transaction marker, committed with graph data. */
+  extensionTransactionId?: string;
+  /** @internal Revalidate the staged config/trust before the atomic graph commit. */
+  beforeExtensionCommit?: () => void;
   /** Progress callback */
   onProgress?: (progress: IndexProgress) => void;
 
@@ -143,6 +162,8 @@ export class CodeGraph {
   private db: DatabaseConnection;
   private queries: QueryBuilder;
   private projectRoot: string;
+  private extensionCommit: string | null = null;
+  private semanticParseReuse = new CoreExtractionReuse();
   // Assigned via wireLayers() from the constructor (and again on reopen) — the
   // `!` tells TS these are definitely set even though the assignment is one
   // method call away from the constructor body.
@@ -233,6 +254,15 @@ export class CodeGraph {
     );
   }
 
+  private ensureExtensionState(): void {
+    const recovered = recoverExtensions(this.projectRoot);
+    const commit = [this.queries.getMetadata('extension_transaction'), this.queries.getMetadata('semantic_update')].join(':');
+    if (recovered || commit !== this.extensionCommit) {
+      this.queries.clearCache(); this.resolver.clearCaches();
+      this.extensionCommit = commit;
+    }
+  }
+
   /**
    * Heal a stale database handle in place. If `.codegraph/` was removed and
    * recreated at the SAME path while this instance held the DB open — a git
@@ -248,6 +278,7 @@ export class CodeGraph {
    * file can't be unlinked there, and st_ino is unreliable).
    */
   reopenIfReplaced(): boolean {
+    recoverExtensions(this.projectRoot);
     if (!this.db.isReplacedOnDisk()) return false;
     const dbPath = this.db.getPath();
     // Open the live file FIRST — if that throws (e.g. mid-recreate), the old
@@ -278,8 +309,14 @@ export class CodeGraph {
    * @returns A new CodeGraph instance
    */
   static async init(projectRoot: string, options: InitOptions = {}): Promise<CodeGraph> {
+    fs.mkdirSync(path.resolve(projectRoot), { recursive: true });
+    return withExtensionGuard(projectRoot, () => CodeGraph.initGuarded(projectRoot, options));
+  }
+
+  private static async initGuarded(projectRoot: string, options: InitOptions): Promise<CodeGraph> {
     await initGrammars();
     const resolvedRoot = path.resolve(projectRoot);
+    recoverExtensions(resolvedRoot);
 
     // Check if already initialized
     if (isInitialized(resolvedRoot)) {
@@ -308,7 +345,13 @@ export class CodeGraph {
    * Initialize synchronously (without indexing)
    */
   static initSync(projectRoot: string): CodeGraph {
+    fs.mkdirSync(path.resolve(projectRoot), { recursive: true });
+    return withExtensionGuardSync(projectRoot, () => CodeGraph.initSyncGuarded(projectRoot));
+  }
+
+  private static initSyncGuarded(projectRoot: string): CodeGraph {
     const resolvedRoot = path.resolve(projectRoot);
+    recoverExtensions(resolvedRoot);
 
     // Check if already initialized
     if (isInitialized(resolvedRoot)) {
@@ -336,6 +379,7 @@ export class CodeGraph {
   static async open(projectRoot: string, options: OpenOptions = {}): Promise<CodeGraph> {
     await initGrammars();
     const resolvedRoot = path.resolve(projectRoot);
+    recoverExtensions(resolvedRoot);
 
     // Check if initialized
     if (!isInitialized(resolvedRoot)) {
@@ -380,8 +424,13 @@ export class CodeGraph {
    * (and running migrations against) the poisoned database entirely.
    */
   static async recreate(projectRoot: string): Promise<CodeGraph> {
+    return withExtensionGuard(projectRoot, () => CodeGraph.recreateGuarded(projectRoot));
+  }
+
+  private static async recreateGuarded(projectRoot: string): Promise<CodeGraph> {
     await initGrammars();
     const resolvedRoot = path.resolve(projectRoot);
+    recoverExtensions(resolvedRoot);
 
     // Check if initialized — recreate REBUILDS an existing project; it is not a
     // first-time `init`.
@@ -416,6 +465,7 @@ export class CodeGraph {
    */
   static openSync(projectRoot: string): CodeGraph {
     const resolvedRoot = path.resolve(projectRoot);
+    recoverExtensions(resolvedRoot);
 
     // Check if initialized
     if (!isInitialized(resolvedRoot)) {
@@ -448,6 +498,7 @@ export class CodeGraph {
    */
   close(): void {
     this.unwatch();
+    this.semanticParseReuse.clear();
     // Release file lock if held
     this.fileLock.release();
     this.db.close();
@@ -470,6 +521,148 @@ export class CodeGraph {
    * Uses a mutex to prevent concurrent indexing operations.
    */
   async indexAll(options: IndexOptions = {}): Promise<IndexResult> {
+    return withExtensionGuard(this.projectRoot, () => this.indexAllGuarded(options));
+  }
+
+  private async indexAllGuarded(options: IndexOptions = {}): Promise<IndexResult> {
+    const plugins = await loadPlugins(this.projectRoot);
+    return withPlugins(plugins, async () => {
+      const result = await this.indexAllWithPlugins(options);
+      this.queries.setMetadata('plugins_last_run', JSON.stringify(plugins.diagnostics));
+      if (result.success && result.filesErrored === 0) this.queries.setMetadata('indexed_with_plugins', this.extensionStamp(plugins));
+      return result;
+    });
+  }
+
+  /** Last write's diagnostics; reading never evaluates extension modules. */
+  getPluginDiagnostics(): import('./plugins/api').PluginDiagnostic[] {
+    this.ensureExtensionState();
+    try { return JSON.parse(this.queries.getMetadata('plugins_last_run') ?? '[]'); } catch { return []; }
+  }
+
+  /** Build a candidate graph first; failed activation never replaces working data. */
+  async refreshPluginIndex(options: IndexOptions = {}): Promise<IndexResult> {
+    return withExtensionGuard(this.projectRoot, () => this.refreshPluginIndexGuarded(options));
+  }
+
+  /** Observed indexed inputs, not a filesystem lock or a declaration of arbitrary plugin I/O. */
+  private semanticInputStamp(): string {
+    const hash = createHash('sha256');
+    const files = new Set(scanDirectory(this.projectRoot));
+    for (const file of ['codegraph.json', '.gitignore']) if (fs.existsSync(path.join(this.projectRoot, file))) files.add(file);
+    for (const file of [...files].sort()) {
+      const full = path.join(this.projectRoot, file), stat = fs.statSync(full);
+      hash.update(JSON.stringify([file, stat.size, stat.mtimeMs, stat.ctimeMs]));
+      hash.update(fs.readFileSync(full));
+    }
+    return hash.digest('hex');
+  }
+
+  private async refreshPluginIndexGuarded(options: IndexOptions = {}): Promise<IndexResult> {
+    return this.indexMutex.withLock(async () => {
+      this.fileLock.acquire();
+      const candidateId = options.extensionTransactionId ?? randomUUID();
+      const stagingPath = path.join(getCodeGraphDir(this.projectRoot), `extension-stage-${candidateId}.db`);
+      let recorded = false;
+      let candidate: CodeGraph | undefined;
+      let attached = false;
+      try {
+        const configFile = path.join(this.projectRoot, 'codegraph.json');
+        const readConfig = () => fs.existsSync(configFile) ? fs.readFileSync(configFile, 'utf8') : null;
+        const configAtLoad = readConfig();
+        const plugins = await loadPlugins(this.projectRoot);
+        const activatedStamp = this.extensionStamp(plugins);
+        if (readConfig() !== configAtLoad) throw new Error('Project configuration changed while loading extensions; previous graph retained. Retry the update.');
+        if (plugins.diagnostics.some(d => d.state !== 'loaded')) throw new Error(plugins.diagnostics.map(d => `${d.id}: ${d.message ?? d.state}`).join('; '));
+        const inputs = plugins.synthPasses.length ? this.semanticInputStamp() : undefined;
+        if (!options.extensionTransactionId) { beginGraphCandidate(this.projectRoot, candidateId); recorded = true; }
+        const db = DatabaseConnection.initialize(stagingPath);
+        candidate = new CodeGraph(db, new QueryBuilder(db.getDb()), this.projectRoot);
+        candidate.fileLock = new FileLock(stagingPath + '.lock');
+        const reuse = plugins.synthPasses.length && process.env.CODEGRAPH_NO_SEMANTIC_REUSE !== '1' ? this.semanticParseReuse : undefined;
+        const beforeReuse = reuse?.stats();
+        const result = await withPlugins(plugins, () => candidate!.indexAllWithPlugins(options, reuse));
+        const afterReuse = reuse?.stats();
+        channel('codegraph.semantic.update').publish({ projectRoot: this.projectRoot, phase: 'candidate_ready',
+          coreReused: afterReuse ? afterReuse.hits - beforeReuse!.hits : 0,
+          coreParsed: afterReuse ? afterReuse.misses - beforeReuse!.misses : result.filesDiscovered,
+          cacheBytes: afterReuse?.bytes ?? 0 });
+        if (!result.success || result.filesErrored || plugins.diagnostics.some(d => d.state !== 'loaded')) {
+          throw new Error('Extension activation failed: ' + [...result.errors.map(e => e.message), ...plugins.diagnostics.filter(d => d.state !== 'loaded').map(d => d.message)].join('; '));
+        }
+        candidate.close(); candidate = undefined;
+        const connection = this.db.getDb();
+        connection.prepare('ATTACH DATABASE ? AS extension_candidate').run(stagingPath);
+        attached = true;
+        options.beforeExtensionCommit?.();
+        if (inputs !== undefined && inputs !== this.semanticInputStamp())
+          throw new Error('Project sources or configuration changed during semantic indexing; previous graph retained. Retry the update.');
+        channel('codegraph.semantic.update').publish({ projectRoot: this.projectRoot, phase: 'before_commit' });
+        connection.transaction(() => {
+          // Candidate replacement is one bulk load. Keep the FTS trigger window
+          // INSIDE this SQLite transaction so a kill rolls back graph and FTS
+          // schema together; readers keep the prior committed index.
+          const bulkGraphIndexes = process.env.CODEGRAPH_NO_SEMANTIC_BULK !== '1';
+          if (bulkGraphIndexes) { this.db.beginBulkNodeLoad(); this.db.beginBulkParseLoad(); }
+          channel('codegraph.semantic.update').publish({ projectRoot: this.projectRoot, phase: 'copy_started' });
+          this.queries.clear();
+          for (const table of ['files', 'nodes', 'edges', 'unresolved_refs']) {
+            connection.exec(`INSERT INTO main.${table} SELECT * FROM extension_candidate.${table}`);
+          }
+          if (bulkGraphIndexes) { this.db.endAtomicBulkParseLoad(); this.db.endBulkNodeLoad(); }
+          this.queries.setMetadata('plugins_last_run', JSON.stringify(plugins.diagnostics));
+          // Freeze the evaluated configuration. An edit during the SQLite copy
+          // must stay dirty for the next sync, never stamp old output as current.
+          this.queries.setMetadata('indexed_with_plugins', activatedStamp);
+          this.queries.setMetadata('indexed_with_version', CodeGraphPackageVersion);
+          this.queries.setMetadata('indexed_with_extraction_version', String(EXTRACTION_VERSION));
+          this.queries.setMetadata('index_state', 'complete');
+          this.queries.setMetadata('semantic_update', candidateId);
+          channel('codegraph.semantic.update').publish({ projectRoot: this.projectRoot, phase: 'in_commit' });
+          if (options.extensionTransactionId) {
+            this.queries.setMetadata('extension_transaction', options.extensionTransactionId);
+            extensionTransition(this.projectRoot, options.extensionTransactionId, 'graph_before_commit');
+          }
+        })();
+        channel('codegraph.semantic.update').publish({ projectRoot: this.projectRoot, phase: 'committed' });
+        if (options.extensionTransactionId) extensionTransition(this.projectRoot, options.extensionTransactionId, 'graph_committed');
+        connection.exec('DETACH DATABASE extension_candidate'); attached = false;
+        this.orchestrator = new ExtractionOrchestrator(this.projectRoot, this.queries);
+        this.resolver.clearCaches();
+        await this.rebuildNameSegmentVocab();
+        return result;
+      } finally {
+        candidate?.close();
+        if (attached) this.db.getDb().exec('DETACH DATABASE extension_candidate');
+        for (const suffix of ['', '-wal', '-shm', '.lock']) {
+          try { fs.unlinkSync(stagingPath + suffix); } catch { /* candidate cleanup */ }
+        }
+        try { if (recorded) finishGraphCandidate(this.projectRoot); }
+        finally { this.fileLock.release(); }
+      }
+    });
+  }
+
+  private extensionStamp(plugins: PluginRegistry): string {
+    return pluginFingerprint(loadPluginEntries(this.projectRoot)) + ':' +
+      plugins.resolved.map(p => `${p.manifest.id}@${p.version}:${p.digest}`).join(',');
+  }
+
+  private preparePluginWrite(): void {
+    const plugins = currentPlugins();
+    if (!plugins) return;
+    const previous = this.queries.getMetadata('indexed_with_plugins');
+    if ((previous || plugins.resolved.length) && previous !== this.extensionStamp(plugins)) {
+      // Recreate derived graph state when options, replacement choices, code or
+      // the enabled set changes. Unchanged source hashes must not retain old
+      // extension contributions. User source and saved graph trails are untouched.
+      this.queries.clear();
+      this.orchestrator = new ExtractionOrchestrator(this.projectRoot, this.queries);
+    }
+    this.resolver.initialize();
+  }
+
+  private async indexAllWithPlugins(options: IndexOptions = {}, coreReuse?: CoreExtractionReuse): Promise<IndexResult> {
     return this.indexMutex.withLock(async () => {
       try {
         this.fileLock.acquire();
@@ -491,6 +684,7 @@ export class CodeGraph {
       // 'indexing' and a crashed init is re-run from scratch; existing DBs
       // (re-index/sync) never take this path. Kill switch:
       // CODEGRAPH_NO_FAST_INIT=1 (same pattern as CODEGRAPH_NO_WAL_DEFER).
+      try { this.preparePluginWrite(); } catch (err) { this.fileLock.release(); throw err; }
       const freshDb = this.queries.getNodeAndEdgeCount().nodes === 0;
       const fastInit = process.env.CODEGRAPH_NO_FAST_INIT !== '1' && freshDb;
       if (fastInit) {
@@ -547,7 +741,8 @@ export class CodeGraph {
             // Store-writer offload is fresh-DB-only: with any pre-existing
             // data the store path must read (existing-file checks, cross-file
             // edge snapshots) and delete, which belongs on one thread.
-            freshDb ? { dbPath: this.db.getPath(), fastInit } : null
+            freshDb ? { dbPath: this.db.getPath(), fastInit } : null,
+            coreReuse
           );
         } finally {
           if (freshDb) {
@@ -762,6 +957,20 @@ export class CodeGraph {
    * Uses a mutex to prevent concurrent indexing operations.
    */
   async indexFiles(filePaths: string[]): Promise<IndexResult> {
+    return withExtensionGuard(this.projectRoot, () => this.indexFilesGuarded(filePaths));
+  }
+
+  private async indexFilesGuarded(filePaths: string[]): Promise<IndexResult> {
+    const plugins = await loadPlugins(this.projectRoot);
+    if ((plugins.resolved.length || this.queries.getMetadata('indexed_with_plugins')) &&
+        this.queries.getMetadata('indexed_with_plugins') !== this.extensionStamp(plugins)) return this.indexAll();
+    // Semantic passes can connect unchanged files through changed metadata.
+    // A scoped write cannot invalidate those relationships safely.
+    if (plugins.synthPasses.length) return this.refreshPluginIndex();
+    return withPlugins(plugins, () => this.indexFilesWithPlugins(filePaths));
+  }
+
+  private async indexFilesWithPlugins(filePaths: string[]): Promise<IndexResult> {
     return this.indexMutex.withLock(async () => {
       try {
         this.fileLock.acquire();
@@ -782,6 +991,43 @@ export class CodeGraph {
    * Uses a mutex to prevent concurrent indexing operations.
    */
   async sync(options: IndexOptions = {}): Promise<SyncResult> {
+    return withExtensionGuard(this.projectRoot, () => this.syncGuarded(options));
+  }
+
+  private async syncGuarded(options: IndexOptions = {}): Promise<SyncResult> {
+    const plugins = await loadPlugins(this.projectRoot);
+    if ((plugins.resolved.length || this.queries.getMetadata('indexed_with_plugins')) &&
+        this.queries.getMetadata('indexed_with_plugins') !== this.extensionStamp(plugins)) {
+      const result = await withPlugins(plugins, () => this.indexAllWithPlugins(options));
+      this.queries.setMetadata('plugins_last_run', JSON.stringify(plugins.diagnostics));
+      if (!result.success || result.filesErrored) throw new Error('Extension refresh failed; run codegraph index');
+      this.queries.setMetadata('indexed_with_plugins', this.extensionStamp(plugins));
+      return { filesChecked: result.filesIndexed, filesAdded: 0, filesModified: result.filesIndexed, filesRemoved: 0, nodesUpdated: result.nodesCreated, durationMs: result.durationMs };
+    }
+    return withPlugins(plugins, async () => {
+      this.resolver.initialize();
+      if (plugins.synthPasses.length) {
+        const changed = this.orchestrator.getChangedFiles();
+        if (changed.added.length || changed.modified.length || changed.removed.length ||
+            this.queries.getUnresolvedReferencesCount() > 0 || this.getIndexState() === 'indexing') {
+          // API v1 semantic passes have no dependency/invalidation contract.
+          // Rebuild a candidate before touching the working graph, then commit
+          // it atomically. This also removes links whose registration changed
+          // in a different file from either endpoint. Ignore scoped paths here:
+          // a global contribution must observe one consistent project snapshot.
+          const result = await this.refreshPluginIndex({ ...options, paths: undefined });
+          return { filesChecked: result.filesIndexed, filesAdded: changed.added.length,
+            filesModified: changed.modified.length, filesRemoved: changed.removed.length,
+            nodesUpdated: result.nodesCreated, durationMs: result.durationMs };
+        }
+      }
+      const result = await this.syncWithPlugins(options);
+      this.queries.setMetadata('plugins_last_run', JSON.stringify(plugins.diagnostics));
+      return result;
+    });
+  }
+
+  private async syncWithPlugins(options: IndexOptions = {}): Promise<SyncResult> {
     return this.indexMutex.withLock(async () => {
       try {
         this.fileLock.acquire();
@@ -1128,6 +1374,7 @@ export class CodeGraph {
 
   /** The reason live watching degraded, or null if it is healthy (#876). */
   getWatcherDegradedReason(): string | null {
+    this.ensureExtensionState();
     return this.watcher?.getDegradedReason() ?? null;
   }
 
@@ -1144,6 +1391,7 @@ export class CodeGraph {
    * absorb that file.
    */
   getPendingFiles(): PendingFile[] {
+    this.ensureExtensionState();
     return this.watcher?.getPendingFiles() ?? [];
   }
 
@@ -1160,6 +1408,7 @@ export class CodeGraph {
    * Get files that have changed since last index
    */
   getChangedFiles(): { added: string[]; modified: string[]; removed: string[] } {
+    this.ensureExtensionState();
     return this.orchestrator.getChangedFiles();
   }
 
@@ -1169,6 +1418,7 @@ export class CodeGraph {
    * freshness without shelling out to `codegraph status --json`. (#329)
    */
   getLastIndexedAt(): number | null {
+    this.ensureExtensionState();
     return this.queries.getLastIndexedAt();
   }
 
@@ -1178,6 +1428,7 @@ export class CodeGraph {
    * filesystem event a live viewer sees.
    */
   getIndexRevision(): { lastIndexedAt: number | null; fileCount: number } {
+    this.ensureExtensionState();
     return this.queries.getIndexRevision();
   }
 
@@ -1186,6 +1437,7 @@ export class CodeGraph {
    * picked up. `total` is the real count, `paths` is capped at `limit`.
    */
   getFilesIndexedSince(since: number, limit: number): { paths: string[]; total: number } {
+    this.ensureExtensionState();
     return this.queries.getFilesIndexedSince(since, limit);
   }
 
@@ -1219,6 +1471,7 @@ export class CodeGraph {
    * `codegraph status`.
    */
   getIndexState(): 'indexing' | 'complete' | 'partial' | 'failed' | null {
+    this.ensureExtensionState();
     const raw = this.queries.getMetadata('index_state');
     return raw === 'indexing' || raw === 'complete' || raw === 'partial' || raw === 'failed'
       ? raw
@@ -1232,6 +1485,7 @@ export class CodeGraph {
    * `extraction-version.ts` and `isIndexStale()`.
    */
   getIndexBuildInfo(): { version: string | null; extractionVersion: number | null } {
+    this.ensureExtensionState();
     const version = this.queries.getMetadata('indexed_with_version');
     const ev = this.queries.getMetadata('indexed_with_extraction_version');
     const parsed = ev != null ? parseInt(ev, 10) : NaN;
@@ -1246,6 +1500,7 @@ export class CodeGraph {
    * hint and `codegraph upgrade`'s reminder.
    */
   isIndexStale(): boolean {
+    this.ensureExtensionState();
     if (this.queries.getLastIndexedAt() == null) return false;
     const { extractionVersion } = this.getIndexBuildInfo();
     return extractionVersion == null || extractionVersion < EXTRACTION_VERSION;
@@ -1318,6 +1573,7 @@ export class CodeGraph {
    * edges are missing; the next `sync` sweeps them.
    */
   getPendingReferenceCount(): number {
+    this.ensureExtensionState();
     return this.queries.getUnresolvedReferencesCount();
   }
 
@@ -1325,6 +1581,7 @@ export class CodeGraph {
    * Get detected frameworks in the project
    */
   getDetectedFrameworks(): string[] {
+    this.ensureExtensionState();
     return this.resolver.getDetectedFrameworks();
   }
 
@@ -1343,6 +1600,7 @@ export class CodeGraph {
    * Get statistics about the knowledge graph
    */
   getStats(): GraphStats {
+    this.ensureExtensionState();
     const stats = this.queries.getStats();
     stats.dbSizeBytes = this.db.getSize();
     stats.walSizeBytes = this.db.getWalSizeBytes();
@@ -1355,6 +1613,7 @@ export class CodeGraph {
    * `codegraph_status` MCP tool alongside the effective journal mode.
    */
   getBackend(): import('./db').SqliteBackend {
+    this.ensureExtensionState();
     return this.db.getBackend();
   }
 
@@ -1365,6 +1624,7 @@ export class CodeGraph {
    * #238. Surfaced via `codegraph status` and the `codegraph_status` MCP tool.
    */
   getJournalMode(): string {
+    this.ensureExtensionState();
     return this.db.getJournalMode();
   }
 
@@ -1376,6 +1636,7 @@ export class CodeGraph {
    * Get a node by ID
    */
   getNode(id: string): Node | null {
+    this.ensureExtensionState();
     return this.queries.getNodeById(id);
   }
 
@@ -1388,6 +1649,7 @@ export class CodeGraph {
    * queries otherwise. Ids that name nothing are simply absent from the map.
    */
   getNodesByIds(ids: readonly string[]): Map<string, Node> {
+    this.ensureExtensionState();
     return this.queries.getNodesByIds(ids);
   }
 
@@ -1403,6 +1665,7 @@ export class CodeGraph {
    * nothing.
    */
   getNodesByQualifiedName(qualifiedName: string): Node[] {
+    this.ensureExtensionState();
     return this.queries.getNodesByQualifiedNameExact(qualifiedName);
   }
 
@@ -1411,6 +1674,7 @@ export class CodeGraph {
    * {@link getOutgoingEdges}. See {@link QueryBuilder.getOutgoingEdgesFrom}.
    */
   getOutgoingEdgesFrom(nodeIds: readonly string[], kinds?: Edge['kind'][]): Edge[] {
+    this.ensureExtensionState();
     return this.queries.getOutgoingEdgesFrom(nodeIds, kinds);
   }
 
@@ -1419,6 +1683,7 @@ export class CodeGraph {
    * without a query per node. See {@link QueryBuilder.countIncomingEdges}.
    */
   getFanIn(ids: readonly string[]): Map<string, number> {
+    this.ensureExtensionState();
     return this.queries.countIncomingEdges(ids);
   }
 
@@ -1427,6 +1692,7 @@ export class CodeGraph {
    * {@link getOutgoingEdgesFrom}. See {@link QueryBuilder.getIncomingEdgesTo}.
    */
   getIncomingEdgesTo(nodeIds: readonly string[], kinds?: Edge['kind'][]): Edge[] {
+    this.ensureExtensionState();
     return this.queries.getIncomingEdgesTo(nodeIds, kinds);
   }
 
@@ -1435,6 +1701,7 @@ export class CodeGraph {
    * {@link getFanIn}. See {@link QueryBuilder.countOutgoingEdges}.
    */
   getFanOut(ids: readonly string[]): Map<string, number> {
+    this.ensureExtensionState();
     return this.queries.countOutgoingEdges(ids);
   }
 
@@ -1450,6 +1717,7 @@ export class CodeGraph {
     kinds: readonly Node['kind'][],
     limit: number
   ): Array<{ node: Node; generated: boolean }> {
+    this.ensureExtensionState();
     return this.queries.getUnreferencedNodes(kinds, limit);
   }
 
@@ -1459,6 +1727,7 @@ export class CodeGraph {
    * must not be made about, because the resolver may have picked the twin.
    */
   getAmbiguousReferencedNames(names: Iterable<string>): Set<string> {
+    this.ensureExtensionState();
     return this.queries.getAmbiguousReferencedNames(names);
   }
 
@@ -1467,6 +1736,7 @@ export class CodeGraph {
    * language with none has no "reachable from outside" signal at all.
    */
   getLanguagesWithExports(languages: Iterable<string>): Set<string> {
+    this.ensureExtensionState();
     return this.queries.getLanguagesWithExports(languages);
   }
 
@@ -1476,6 +1746,7 @@ export class CodeGraph {
    * such a name can never be called unreferenced.
    */
   getUnresolvedNamesAmong(names: Iterable<string>): Set<string> {
+    this.ensureExtensionState();
     return this.queries.getUnresolvedNamesAmong(names);
   }
 
@@ -1485,6 +1756,7 @@ export class CodeGraph {
    * function has one dependent, and it is dependents a blast radius grows from.
    */
   getTopDependedOn(limit: number): Array<{ nodeId: string; dependents: number }> {
+    this.ensureExtensionState();
     return this.queries.getTopDependedOn(limit);
   }
 
@@ -1497,6 +1769,7 @@ export class CodeGraph {
   getTopCallingFiles(
     limit: number
   ): Array<{ nodeId: string; filePath: string; calls: number; reaches: number; score: number }> {
+    this.ensureExtensionState();
     return this.queries.getTopCallingFiles(limit);
   }
 
@@ -1506,6 +1779,7 @@ export class CodeGraph {
    * A zero means nothing else in the index reaches into that file.
    */
   getFileDependentCounts(filePaths: string[]): Map<string, number> {
+    this.ensureExtensionState();
     return new Map(
       this.queries.getFileDependentCounts(filePaths).map((row) => [row.filePath, row.dependents])
     );
@@ -1517,6 +1791,7 @@ export class CodeGraph {
    * {@link getFileDependentCounts}; a test file's reach is what it exercises.
    */
   getFileReachCounts(filePaths: string[]): Map<string, { reaches: number; refs: number }> {
+    this.ensureExtensionState();
     return new Map(
       this.queries
         .getFileReachCounts(filePaths)
@@ -1526,6 +1801,7 @@ export class CodeGraph {
 
   /** The `file` nodes for the given paths, in one query. */
   getFileNodes(filePaths: string[]): Node[] {
+    this.ensureExtensionState();
     return this.queries.getFileNodes(filePaths);
   }
 
@@ -1547,6 +1823,7 @@ export class CodeGraph {
       pairKinds: readonly Edge['kind'][];
     }
   ): ReturnType<QueryBuilder['aggregateModuleGraph']> {
+    this.ensureExtensionState();
     return this.queries.aggregateModuleGraph(assignments, options);
   }
 
@@ -1555,6 +1832,7 @@ export class CodeGraph {
    * list a cycle finder runs on. See {@link QueryBuilder.getCrossFileDependencyPairs}.
    */
   getFileDependencyPairs(minConfidence = 0): Array<{ source: string; target: string }> {
+    this.ensureExtensionState();
     return this.queries.getCrossFileDependencyPairs(minConfidence);
   }
 
@@ -1564,6 +1842,7 @@ export class CodeGraph {
    * the call sites that have no callee row instead of implying there are none.
    */
   getUnresolvedReferencesFrom(nodeId: string): UnresolvedReference[] {
+    this.ensureExtensionState();
     return this.queries.getUnresolvedReferencesFrom(nodeId);
   }
 
@@ -1575,6 +1854,7 @@ export class CodeGraph {
    * {@link QueryBuilder.getUnresolvedReferencesInFile}.
    */
   getUnresolvedReferencesInFile(filePath: string, limit?: number): UnresolvedReference[] {
+    this.ensureExtensionState();
     return this.queries.getUnresolvedReferencesInFile(filePath, limit);
   }
 
@@ -1582,6 +1862,7 @@ export class CodeGraph {
    * Get all nodes in a file
    */
   getNodesInFile(filePath: string): Node[] {
+    this.ensureExtensionState();
     return this.queries.getNodesByFile(filePath);
   }
 
@@ -1589,6 +1870,7 @@ export class CodeGraph {
    * Get all nodes of a specific kind
    */
   getNodesByKind(kind: Node['kind']): Node[] {
+    this.ensureExtensionState();
     return this.queries.getNodesByKind(kind);
   }
 
@@ -1598,11 +1880,13 @@ export class CodeGraph {
    * definition the caller wants is never dropped below a search cut.
    */
   getNodesByName(name: string): Node[] {
+    this.ensureExtensionState();
     return this.queries.getNodesByName(name);
   }
 
   /** Nodes whose name starts with `prefix` (index range scan, capped). */
   getNodesByNamePrefix(prefix: string, limit = 20): Node[] {
+    this.ensureExtensionState();
     return this.queries.getNodesByNamePrefix(prefix, limit);
   }
 
@@ -1615,6 +1899,7 @@ export class CodeGraph {
     substring: string,
     options: { kinds?: NodeKind[]; limit?: number; excludePrefix?: boolean } = {}
   ): Node[] {
+    this.ensureExtensionState();
     return this.queries
       .findNodesByNameSubstring(substring, options)
       .map((r) => r.node);
@@ -1624,6 +1909,7 @@ export class CodeGraph {
    * Search nodes by text
    */
   searchNodes(query: string, options?: SearchOptions): SearchResult[] {
+    this.ensureExtensionState();
     return this.queries.searchNodes(query, options);
   }
 
@@ -1644,6 +1930,7 @@ export class CodeGraph {
    * returned symbol is guaranteed to exist right now.
    */
   getSegmentMatches(words: string[], limit: number = 6): SegmentMatch[] {
+    this.ensureExtensionState();
     if (words.length === 0) return [];
     // Variant → original word (plural folding), for coverage accounting.
     const variantToWord = new Map<string, string>();
@@ -1795,6 +2082,7 @@ export class CodeGraph {
    * embeds the project name.
    */
   getProjectNameTokens(): Set<string> {
+    this.ensureExtensionState();
     return this.queries.getProjectNameTokens();
   }
 
@@ -1807,6 +2095,7 @@ export class CodeGraph {
    * Glob+Read of `routes.rb`/`urls.py`/etc. otherwise beats codegraph.
    */
   getTopRouteFile(): { filePath: string; routeCount: number; totalRoutes: number } | null {
+    this.ensureExtensionState();
     return this.queries.getTopRouteFile();
   }
 
@@ -1831,6 +2120,7 @@ export class CodeGraph {
     topHandlerFileCount: number;
     totalRoutes: number;
   } | null {
+    this.ensureExtensionState();
     return this.queries.getRoutingManifest(limit);
   }
 
@@ -1842,6 +2132,7 @@ export class CodeGraph {
    * Get outgoing edges from a node
    */
   getOutgoingEdges(nodeId: string): Edge[] {
+    this.ensureExtensionState();
     return this.queries.getOutgoingEdges(nodeId);
   }
 
@@ -1849,6 +2140,7 @@ export class CodeGraph {
    * Get incoming edges to a node
    */
   getIncomingEdges(nodeId: string): Edge[] {
+    this.ensureExtensionState();
     return this.queries.getIncomingEdges(nodeId);
   }
 
@@ -1860,6 +2152,7 @@ export class CodeGraph {
    * Get a file record by path
    */
   getFile(filePath: string): FileRecord | null {
+    this.ensureExtensionState();
     return this.queries.getFileByPath(filePath);
   }
 
@@ -1867,6 +2160,7 @@ export class CodeGraph {
    * Get all tracked files
    */
   getFiles(): FileRecord[] {
+    this.ensureExtensionState();
     return this.queries.getAllFiles();
   }
 
@@ -1880,6 +2174,7 @@ export class CodeGraph {
    * the filename check alone.
    */
   generatedFilePredicate(filePaths: Iterable<string>): (filePath: string) => boolean {
+    this.ensureExtensionState();
     return this.queries.generatedPredicateFor(filePaths);
   }
 
@@ -1893,11 +2188,13 @@ export class CodeGraph {
    * there, in particular why a `types.ts` the codebase imports is NOT flagged.
    */
   ambientDeclarationFilePredicate(filePaths: Iterable<string>): (filePath: string) => boolean {
+    this.ensureExtensionState();
     return this.queries.ambientDeclarationPredicateFor(filePaths);
   }
 
   /** How many indexed files are flagged tool-generated. Reported by `status`. */
   getGeneratedFileCount(): number {
+    this.ensureExtensionState();
     return this.queries.countGeneratedFiles();
   }
 
@@ -1916,6 +2213,7 @@ export class CodeGraph {
    * @returns Context object with all related information
    */
   getContext(nodeId: string): Context {
+    this.ensureExtensionState();
     return this.graphManager.getContext(nodeId);
   }
 
@@ -1930,6 +2228,7 @@ export class CodeGraph {
    * @returns Subgraph containing traversed nodes and edges
    */
   traverse(startId: string, options?: TraversalOptions): Subgraph {
+    this.ensureExtensionState();
     return this.traverser.traverseBFS(startId, options);
   }
 
@@ -1944,6 +2243,7 @@ export class CodeGraph {
    * @returns Subgraph containing the call graph
    */
   getCallGraph(nodeId: string, depth: number = 2): Subgraph {
+    this.ensureExtensionState();
     return this.traverser.getCallGraph(nodeId, depth);
   }
 
@@ -1957,6 +2257,7 @@ export class CodeGraph {
    * @returns Subgraph containing the type hierarchy
    */
   getTypeHierarchy(nodeId: string): Subgraph {
+    this.ensureExtensionState();
     return this.traverser.getTypeHierarchy(nodeId);
   }
 
@@ -1970,6 +2271,7 @@ export class CodeGraph {
    * @returns Array of nodes and edges that reference this symbol
    */
   findUsages(nodeId: string): Array<{ node: Node; edge: Edge }> {
+    this.ensureExtensionState();
     return this.traverser.findUsages(nodeId);
   }
 
@@ -1981,6 +2283,7 @@ export class CodeGraph {
    * @returns Array of nodes that call this function
    */
   getCallers(nodeId: string, maxDepth: number = 1): Array<{ node: Node; edge: Edge }> {
+    this.ensureExtensionState();
     return this.traverser.getCallers(nodeId, maxDepth);
   }
 
@@ -1992,6 +2295,7 @@ export class CodeGraph {
    * @returns Array of nodes called by this function
    */
   getCallees(nodeId: string, maxDepth: number = 1): Array<{ node: Node; edge: Edge }> {
+    this.ensureExtensionState();
     return this.traverser.getCallees(nodeId, maxDepth);
   }
 
@@ -2005,6 +2309,7 @@ export class CodeGraph {
    * @returns Subgraph containing potentially impacted nodes
    */
   getImpactRadius(nodeId: string, maxDepth: number = 3): Subgraph {
+    this.ensureExtensionState();
     return this.traverser.getImpactRadius(nodeId, maxDepth);
   }
 
@@ -2021,6 +2326,7 @@ export class CodeGraph {
     toId: string,
     edgeKinds?: Edge['kind'][]
   ): Array<{ node: Node; edge: Edge | null }> | null {
+    this.ensureExtensionState();
     return this.traverser.findPath(fromId, toId, edgeKinds);
   }
 
@@ -2031,6 +2337,7 @@ export class CodeGraph {
    * @returns Array of ancestor nodes from immediate parent to root
    */
   getAncestors(nodeId: string): Node[] {
+    this.ensureExtensionState();
     return this.traverser.getAncestors(nodeId);
   }
 
@@ -2041,6 +2348,7 @@ export class CodeGraph {
    * @returns Array of child nodes
    */
   getChildren(nodeId: string): Node[] {
+    this.ensureExtensionState();
     return this.traverser.getChildren(nodeId);
   }
 
@@ -2051,6 +2359,7 @@ export class CodeGraph {
    * @returns Array of file paths this file depends on
    */
   getFileDependencies(filePath: string): string[] {
+    this.ensureExtensionState();
     return this.graphManager.getFileDependencies(filePath);
   }
 
@@ -2061,6 +2370,7 @@ export class CodeGraph {
    * @returns Array of file paths that depend on this file
    */
   getFileDependents(filePath: string): string[] {
+    this.ensureExtensionState();
     return this.graphManager.getFileDependents(filePath);
   }
 
@@ -2070,6 +2380,7 @@ export class CodeGraph {
    * @returns Array of cycles, each cycle is an array of file paths
    */
   findCircularDependencies(): string[][] {
+    this.ensureExtensionState();
     return this.graphManager.findCircularDependencies();
   }
 
@@ -2090,6 +2401,7 @@ export class CodeGraph {
    * @returns Array of unreferenced nodes
    */
   findDeadCode(kinds?: Node['kind'][]): Node[] {
+    this.ensureExtensionState();
     return this.graphManager.findDeadCode(kinds);
   }
 
@@ -2107,6 +2419,7 @@ export class CodeGraph {
     childCount: number;
     depth: number;
   } {
+    this.ensureExtensionState();
     return this.graphManager.getNodeMetrics(nodeId);
   }
 
@@ -2123,6 +2436,7 @@ export class CodeGraph {
    * @returns Code string or null if not found
    */
   async getCode(nodeId: string): Promise<string | null> {
+    this.ensureExtensionState();
     return this.contextBuilder.getCode(nodeId);
   }
 
@@ -2140,6 +2454,7 @@ export class CodeGraph {
     query: string,
     options?: FindRelevantContextOptions
   ): Promise<Subgraph> {
+    this.ensureExtensionState();
     // Segment-vocab supplement: FTS keeps camelCase names as single tokens,
     // so a word-level query ("auto-scroll to bottom") can never reach
     // `pinFeedIfNearBottom` through search alone. Resolve the query's words
@@ -2176,6 +2491,7 @@ export class CodeGraph {
     input: TaskInput,
     options?: BuildContextOptions
   ): Promise<TaskContext | string> {
+    this.ensureExtensionState();
     return this.contextBuilder.buildContext(input, options);
   }
 
@@ -2187,14 +2503,14 @@ export class CodeGraph {
    * Optimize the database (vacuum and analyze)
    */
   optimize(): void {
-    this.db.optimize();
+    withExtensionGuardSync(this.projectRoot, () => this.db.optimize());
   }
 
   /**
    * Clear all data from the graph
    */
   clear(): void {
-    this.queries.clear();
+    withExtensionGuardSync(this.projectRoot, () => this.queries.clear());
   }
 
   /**
