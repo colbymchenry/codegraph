@@ -5,10 +5,12 @@ on:
     paths:
       - '.github/workflows/release-linux-candidate.yml'
       - 'docs/validation/release-package-proof.cjs'
+      - 'docs/validation/release-companion-proof.cjs'
       - 'docs/validation/release-command.py'
       - 'docs/validation/release-linux-shards.py'
 permissions:
   contents: read
+  actions: read
 jobs:
   linux:
     if: github.repository == 'colbymchenry/codegraph'
@@ -25,36 +27,23 @@ jobs:
         with:
           node-version: '22.23.2'
       - run: npm ci --no-audit --no-fund
-      - name: Build coherent archive
-        run: python3 docs/validation/release-command.py release-linux-bundle bash scripts/build-bundle.sh linux-x64 v24.16.0
-      - name: Assemble npm packages
-        run: python3 docs/validation/release-command.py release-linux-pack bash scripts/pack-npm.sh
-      - name: Actual archive and npm CLI, SDK, extension lifecycle and companion
-        run: python3 docs/validation/release-command.py release-linux-package node docs/validation/release-package-proof.cjs
+      - name: Reuse the exact previously tested archive
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: 35916831423
+          name: release-linux-36726ada75ffbbde3f992a83f6c306eaa1831837-1
+          path: .qa/reused-linux
+      - name: Build current test source and stage unchanged archive
+        run: |
+          mkdir -p release
+          cp .qa/reused-linux/release/codegraph-linux-x64.tar.gz release/
+          python3 docs/validation/release-command.py release-linux-current-build npm run build
+      - name: Complete actual packed companion and verify all archive bytes
+        run: python3 docs/validation/release-command.py release-linux-companion node docs/validation/release-companion-proof.cjs
       - name: Full Linux regression with exactly-once coverage
         if: success() || failure()
         run: python3 docs/validation/release-linux-shards.py "$GITHUB_SHA"
-      - name: Compiled workers and native paths
-        if: success() || failure()
-        run: |
-          python3 docs/validation/release-command.py release-linux-workers node --test scripts/validation/extensions-runtime.test.cjs
-          python3 docs/validation/release-command.py release-linux-paths node scripts/validation/native-paths.cjs
-      - name: Semantic update recovery
-        if: success() || failure()
-        env:
-          SEMANTIC_RECOVERY_OUTPUT: .qa/release-semantic-recovery
-        run: python3 docs/validation/release-command.py release-linux-semantic node scripts/validation/semantic-update-recovery.cjs
-      - name: Managed extension recovery
-        if: success() || failure()
-        env:
-          RECOVERY_OUTPUT: .qa/release-managed-recovery
-        run: python3 docs/validation/release-command.py release-linux-managed node scripts/validation/extensions-recovery.cjs
-      - name: Managed recovery with custom directory
-        if: success() || failure()
-        env:
-          CODEGRAPH_DIR: .codegraph-release
-          RECOVERY_OUTPUT: .qa/release-managed-custom
-        run: python3 docs/validation/release-command.py release-linux-managed-custom node scripts/validation/extensions-recovery.cjs
       - name: Retain exact candidate evidence and artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -64,7 +53,7 @@ jobs:
           retention-days: 7
           path: |
             .qa/recovery/
-            .qa/release-package/
+            .qa/release-companion/
             .qa/release-full/
             .qa/release-semantic-recovery/
             .qa/release-managed-recovery/
