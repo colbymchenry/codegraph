@@ -5,3 +5,4 @@ node_modules/
 wrangler.deploy.json
 wrangler.window.json
 wrangler.restore.json
+wrangler.source-ui.json

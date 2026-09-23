@@ -25,6 +25,8 @@ CPU inputs: 26 ms per package fetch (largest of three previous deployed 8 MiB sa
 
 [D1 pricing](https://developers.cloudflare.com/d1/platform/pricing/) includes 25 billion read rows, 50 million write rows and 5 GB across the account on Paid. The model bounds metadata reads against both the current 17 releases and the existing 1,000-release cap. The preview databases were 94,208 bytes each at the accepted readback. **Unrelated telemetry already occupied roughly 10 GB at that readback**, so an account-total $5 promise would be unsound even if marketplace queries fit. We did not inspect or change that database or fetch an invoice. Account usage, rounding, taxes, other applications, backups and logging remain separate. Additional retention is not silently free.
 
+The already-enabled Workers observability setting is unchanged. [Workers Logs pricing](https://developers.cloudflare.com/workers/platform/pricing/#workers-logs) includes 20 million events/month on Paid, then $0.60/million. A one-event-per-modeled-request allowance is 180,030–360,030 events (under 2% of that allowance); actual extra console/error events and unrelated services can raise it. No Logpush, retention upgrade or new logging service was enabled.
+
 ## Controls prepared, not account changes
 
 - Keep `PUBLISHING_ENABLED=false`. Any separately authorized acceptance uses the existing absolute `PUBLISHING_UNTIL` deadline and an explicit close. Future publication also requires the reviewed source policy below. An allowlist is not a billing cap.

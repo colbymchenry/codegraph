@@ -12,10 +12,6 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### New Features
-
-- Inspect the exact extension package and every bundled source file before installing, with verified fingerprints and clear repository provenance.
-
 - Add a trusted, pinned Drupal import command for the Cloudflare registry, with target/plan verification, atomic owner claims, official backup preservation and local Worker/browser graph acceptance.
 
 
@@ -47,6 +43,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Upgrading:** re-index your projects after this release — several of the new readings rest on edges that are written while indexing.
 
 ### New Features
+
+- Inspect the exact extension package and every bundled source file before installing, with verified fingerprints and clear repository provenance.
 
 - Prepare a Cloudflare marketplace backend with signed publication, immutable packages, persistent metadata and isolated recovery validation. Hosted setup remains a preview prerequisite.
 
