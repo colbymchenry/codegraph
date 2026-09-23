@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph serve --mcp --no-telemetry` turns telemetry off for one MCP server entry, so a shared MCP config can opt out without an environment variable. (#1908)
+
 ### Fixes
 
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.
