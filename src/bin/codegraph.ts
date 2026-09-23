@@ -2093,13 +2093,19 @@ program
   .option('-p, --path <path>', 'Project path (optional for MCP mode, uses rootUri from client)')
   .option('--mcp', 'Run as MCP server (stdio transport)')
   .option('--no-watch', 'Disable the file watcher (no auto-sync; useful on slow filesystems like WSL2 /mnt drives)')
-  .action(async (options: { path?: string; mcp?: boolean; watch?: boolean }) => {
+  .option('--no-telemetry', 'Send no usage telemetry from this server (same as CODEGRAPH_TELEMETRY=0)')
+  .action(async (options: { path?: string; mcp?: boolean; watch?: boolean; telemetry?: boolean }) => {
     const projectPath = options.path ? resolveProjectPath(options.path) : undefined;
 
     // Commander sets watch=false when --no-watch is passed. Route it through
     // the same env-var chokepoint the watcher and MCP server already honor.
     if (options.watch === false) {
       process.env.CODEGRAPH_NO_WATCH = '1';
+    }
+    // Same for --no-telemetry (#1908): telemetry reads CODEGRAPH_TELEMETRY on
+    // every check, and a daemon this server spawns inherits the env.
+    if (options.telemetry === false) {
+      process.env.CODEGRAPH_TELEMETRY = '0';
     }
 
     try {
