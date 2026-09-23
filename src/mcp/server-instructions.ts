@@ -58,6 +58,10 @@ calls; a grep/read exploration is dozens.
 - Qualified symbol names accept dots, \`::\`, or slashes, including containers whose names contain dots (for example, \`AppWeb.Format.group\`).
 - Named-symbol call paths require exact matches; partial or mistyped names are never silently substituted as flow endpoints. If a graph query reports a missing symbol with did-you-mean suggestions, query the suggested name explicitly.
 
+## Verilog / SystemVerilog
+
+Modules, instances, ports, signals, packages, interfaces/modports, always/assign blocks and generate scopes are indexed; \`codegraph_explore\` follows instantiation from a top module down. Pass one exact signal name with \`hdlAccess\` (\`read\`, \`write\`, \`readwrite\`, \`control\`, \`event\`, \`all\`) to list where it is read or written; an empty result is not proof of no access. Relationships are syntactic: no elaboration, no macro expansion, no timing. An optional \`hdl\` profile in \`codegraph.json\` selects source units and conditional branches, and the explore header reports the indexed profile versus the configured one — on a mismatch, sync before reading the result as the new profile. Evaluated parameters and port widths come only from the explicit \`codegraph hdl-semantic\` CLI with an installed slang.
+
 ## Anti-patterns
 
 - **Trust codegraph's results — don't re-verify them with grep.** They come from a full AST parse; re-checking with grep is slower, less accurate, and wastes context.

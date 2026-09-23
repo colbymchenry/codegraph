@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { formatHdlProfileStatus } from '../hdl/status';
 /**
  * CodeGraph CLI
  *
@@ -1038,7 +1039,9 @@ program
       const journalMode = cg.getJournalMode();
 
       const buildInfo = cg.getIndexBuildInfo();
-      const reindexRecommended = cg.isIndexStale();
+      const hdlProfile = cg.getHdlProfileStatus();
+      const engineReindexRecommended = cg.isIndexStale();
+      const reindexRecommended = engineReindexRecommended || !!hdlProfile?.reindexRecommended;
       const indexState = cg.getIndexState();
       // Zero on a healthy index; non-zero at rest means a resolution pass was
       // interrupted, so some files' call edges are missing (#1187).
@@ -1075,6 +1078,7 @@ program
             builtWithExtractionVersion: buildInfo.extractionVersion,
             currentExtractionVersion: EXTRACTION_VERSION,
             reindexRecommended,
+            hdlProfile,
             // 'complete' | 'partial' (files silently dropped) | 'indexing'
             // (a run was killed mid-index — the index is truncated) |
             // 'failed' | null (predates the marker).
@@ -1175,6 +1179,10 @@ program
           console.log(`  Removed:   ${changes.removed.length} files`);
         }
         info('Run "codegraph sync" to update the index');
+      } else if (hdlProfile?.state === 'configuration-error') {
+        warn('Source files are unchanged; HDL profile configuration requires attention');
+      } else if (hdlProfile?.reindexRecommended) {
+        warn('Source files are unchanged; indexed HDL context needs a rebuild');
       } else {
         success('Index is up to date');
       }
@@ -1182,7 +1190,12 @@ program
 
       // Re-index hint: the index was built by an older engine than the one now
       // running, so a rebuild would add data a migration can't backfill.
-      if (reindexRecommended) {
+      const profileNote = formatHdlProfileStatus(hdlProfile);
+      if (profileNote) {
+        console.log(profileNote);
+        console.log();
+      }
+      if (engineReindexRecommended) {
         const builtWith = buildInfo.version ? `v${buildInfo.version.replace(/^v/, '')}` : 'an earlier version';
         warn(`Index was built by ${builtWith}; re-index to pick up this engine's improvements.`);
         info('Run "codegraph index" (full rebuild) or "codegraph sync"');
@@ -1288,11 +1301,57 @@ program
  * can reach the graph through a plain shell command.
  */
 program
+  .command('hdl-semantic [query]')
+  .description('Compute HDL parameters and port widths with optional slang (exact symbol or instance query)')
+  .option('--slang <executable>', 'Path to the installed slang executable')
+  .option('--python <executable>', 'Python with pinned pyslang for compiler macro source mapping (instead of --slang)')
+  .option('-p, --path <path>', 'Project path')
+  .option('--top <name>', 'Single top module (defaults to the active profile top)')
+  .option('--parameter <name=value...>', 'Top-level parameter overrides')
+  .option('--allow-use-before-declare', 'Explicit slang compatibility mode')
+  .option('--limit <number>', 'Maximum facts (1..1000)', '100')
+  .action(async (query: string | undefined, options: { slang?: string; python?: string; path?: string; top?: string;
+    parameter?: string[]; allowUseBeforeDeclare?: boolean; limit: string }) => {
+    const projectPath = resolveProjectPath(options.path);
+    try {
+      if (!isInitialized(projectPath)) throw new Error('HDL semantic queries require an initialized CodeGraph project');
+      const parameters: Record<string, string> = Object.create(null);
+      for (const argument of options.parameter ?? []) {
+        const separator = argument.indexOf('=');
+        if (separator < 1 || !argument.slice(separator + 1)) throw new Error('Parameter must be NAME=VALUE');
+        const name = argument.slice(0, separator);
+        if (Object.prototype.hasOwnProperty.call(parameters, name)) throw new Error('Duplicate HDL parameter override: ' + name);
+        parameters[name] = argument.slice(separator + 1);
+      }
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      const controller = new AbortController();
+      const interrupt = () => controller.abort();
+      process.once('SIGINT', interrupt);
+      process.once('SIGTERM', interrupt);
+      try {
+        const result = await cg.getHdlSemantics({ executable: options.slang, pythonExecutable: options.python, top: options.top,
+          parameters, allowUseBeforeDeclare: options.allowUseBeforeDeclare, query, limit: Number(options.limit),
+          signal: controller.signal });
+        console.log(JSON.stringify(result));
+      } finally {
+        process.removeListener('SIGINT', interrupt);
+        process.removeListener('SIGTERM', interrupt);
+        cg.close();
+      }
+    } catch (err) {
+      error(`HDL semantics failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exitCode = 1;
+    }
+  });
+
+program
   .command('explore <query...>')
   .description('Explore an area: relevant symbols\' source + call paths in one shot (same output as the codegraph_explore MCP tool)')
   .option('-p, --path <path>', 'Project path')
   .option('--max-files <number>', 'Maximum number of files to include source from')
-  .action(async (queryParts: string[], options: { path?: string; maxFiles?: string }) => {
+  .option('--hdl-access <kind>', 'HDL signal access: read, write, readwrite, control, event, all (query is one exact signal name)')
+  .action(async (queryParts: string[], options: { path?: string; maxFiles?: string; hdlAccess?: string }) => {
     const projectPath = resolveProjectPath(options.path);
 
     try {
@@ -1308,6 +1367,7 @@ program
 
       const args: Record<string, unknown> = { query: queryParts.join(' ') };
       if (options.maxFiles) args.maxFiles = parseInt(options.maxFiles, 10);
+      if (options.hdlAccess) args.hdlAccess = options.hdlAccess;
       const result = await handler.execute('codegraph_explore', args);
 
       console.log(result.content[0]?.text ?? '');
