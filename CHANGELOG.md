@@ -15,6 +15,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixes
 
 - Python calls through an attribute now reach the method your code gives that attribute. `self.sink.stop()` follows `self.sink = Sink()`, a `sink: Sink` annotation, or a typed `__init__` parameter to `Sink`'s `stop`, including a `stop` that `Sink` inherits, and an attribute of a typed local or parameter resolves the same way. An attribute whose type the code never names is left unresolved rather than guessed. Re-index Python projects after upgrading. (#1704)
+- Python attributes set by a factory or a base class now lead to the right method. `self.client.send()` resolves when the class gets `self.client` from `Client.from_env()` or `make_client()` — read from the factory's return type, or from what every `return` in it builds — and when a base class's `__init__` in another file sets it. Calls straight on a factory's result, like `Client.from_env().send()` or `Truncator(value).chars(n)`, resolve the same way. A factory whose returns build different classes, a generator, and a name rebound inside the function are left out rather than guessed. `codegraph sync` re-checks these calls when you edit the factory or base class they depend on; on large projects, an edit to a module much of the project imports can leave a call that only now becomes resolvable for the next full index. Re-index to pick up the change. (#1704, #750)
 
 ## [1.6.2] - 2026-10-03
 
