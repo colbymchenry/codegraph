@@ -20,7 +20,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Re-index after upgrading** to apply the shared extraction and resolution changes.
 - **Viewer commands are deferred.** Neither `codegraph ui` nor its `web` alias is available. Viewer source/assets remain in the package; the extension companion remains available through `codegraph extensions connect`.
 
-### Extensions and marketplace preview
+### New Features
 
 - Authors can create, test and pack semantic/framework extensions using public SDK types. Managed changes rebuild and atomically replace the graph; activation failures and interrupted operations retain or recover the last consistent state.
 - Compatible stable versions are selected using the engine and extension API requirements. Explicit version pins remain available; automatic updates refuse downgrades.
@@ -30,15 +30,21 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
-- Long-lived watchers follow a replacement index and reconcile the project before resuming scoped edits. Interrupted secondary indexes recover off the async caller's event loop. Thanks @beaulieuc22. (#1902, #1887; PRs #1917, #1888)
+- Long-lived watchers pick up changes after the index is replaced. Thanks @danusha2345. (#1902; PR #1917)
+- Interrupted indexing can repair secondary indexes without blocking the recovery watchdog. Thanks @cbeaulieu-gt. (#1887; PR #1888)
 - Empty, schema-less or foreign ancestor databases no longer capture CLI/MCP project discovery. Read-only inspection failures preserve valid-root behavior. Thanks @danusha2345. (#1895; PR #1913)
 - MPEG transport streams with a `.ts` suffix are excluded from TypeScript indexing. Oversized sources are skipped before full reading; reads remain bounded if a file grows after `stat`. Legitimate TypeScript and the 1 MiB boundary remain supported. Thanks @danusha2345. (#1910; PRs #1914, #1915)
 - Repeated dominant-file aggregation is memoized per long-lived connection and invalidated after committed changes; transaction-local results are discarded across rollback. First-call and one-shot CLI costs remain. Thanks @danusha2345. (#1864; PR #1916)
-- Standalone installers, Windows bundle upgrades and the npm download fallback require one matching archive SHA-256 before extraction/replacement. Missing manifests fail closed, including older releases without checksums. Release versions must parse in full before upgrade dispatch; PowerShell destination literals are escaped. (#1367)
 - Preserve calls owned by declaration initializers, Java anonymous-class fields, Kotlin accessors/initializers and Lua/Luau function expressions. Kotlin signatures and Rust unit structs appear in the graph.
 - Improve TypeScript/JavaScript alias, class-field and emitted-extension import resolution, Python quoted annotations and module aliases, and PHP imported static class calls. Exclude unrelated external, collection, file-local and inaccessible closure targets; shared engine fixes apply to CLI/MCP output.
 - Improve route and framework detection in nested workspaces, Express router prefixes/wrapped handlers, FastAPI router prefixes and ASP.NET endpoint groups. Preserve navigation, bridge, call-condition and argument metadata used by graph queries.
 - `affected` finds additional Go, Python and JVM tests; caller/callee/query limits report truncation. Correct test-path classification and improve Claude Code prompt-hook/MCP guidance loading.
+
+### Security
+
+- Installers, Windows bundle upgrades and the npm download fallback verify archive checksums before replacement and refuse missing or ambiguous manifests, including older releases without checksums. (#1367)
+- Upgrade commands reject invalid release versions and preserve quoted Windows installation paths. (#1367)
+- Keep the patched picomatch dependency floor at 4.0.7. (#1367)
 
 The [development history](docs/development/pre-release-history-20260923.md) retains the detailed changes and contributor credits, including withheld viewer work. The [candidate verification report](docs/validation/release-candidate-20260923.md) separates tested fixes from outstanding release gates. Nothing in this section means a release has been published.
 

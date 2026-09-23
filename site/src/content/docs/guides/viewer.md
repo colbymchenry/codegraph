@@ -1,6 +1,6 @@
 ---
 title: Reading Your Graph in the Browser
-description: codegraph ui opens a local viewer for an indexed project — callers, source, and callees on one screen.
+description: The planned local graph viewer is deferred; ui and web are unavailable in the next release candidate.
 ---
 
 :::caution[Deferred feature]
@@ -8,7 +8,7 @@ The `ui` command and `web` alias are unavailable in the next release candidate. 
 :::
 
 
-`codegraph ui` opens a viewer for a project you have already indexed. It is the same graph your agent reads, on screen.
+The planned `codegraph ui` viewer displays a project you have already indexed. Its command and `web` alias are withheld from this release candidate.
 
 ```bash
 codegraph init          # once per project, if you haven't already
@@ -148,7 +148,7 @@ An eight-hop strip comes out around half a megabyte, well inside what GitHub acc
 | `--read-only` | Refuse every write — saved trails can be opened, but not saved or deleted |
 | `CODEGRAPH_BROWSER=<command>` | Choose which browser opens. `CODEGRAPH_BROWSER=none` never opens one |
 
-`codegraph web` is an alias for the same command.
+The planned `codegraph web` alias is also withheld from this release candidate.
 
 ## Privacy
 
