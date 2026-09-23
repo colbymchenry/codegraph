@@ -45,7 +45,12 @@ $entries = @(Get-Content -LiteralPath $sumsPath | Where-Object { $_.Trim() -matc
 if ($entries.Count -ne 1) { throw 'codegraph: missing or ambiguous archive checksum.' }
 $null = $entries[0].Trim() -match $pattern
 $expectedHash = $Matches[1]
-if ((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash -ne $expectedHash) { throw 'codegraph: archive checksum mismatch; installation unchanged.' }
+# Use .NET directly: Windows PowerShell launched from pwsh can lack Get-FileHash.
+$hasher = [System.Security.Cryptography.SHA256]::Create()
+$stream = [System.IO.File]::OpenRead($zip)
+try { $actualHash = [BitConverter]::ToString($hasher.ComputeHash($stream)).Replace('-', '') }
+finally { $stream.Dispose(); $hasher.Dispose() }
+if ($actualHash -ne $expectedHash) { throw 'codegraph: archive checksum mismatch; installation unchanged.' }
 
 
 $dest = Join-Path $installDir 'current'

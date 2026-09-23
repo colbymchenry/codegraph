@@ -1,5 +1,5 @@
 const fs=require('fs'),fsp=require('fs/promises'),path=require('path'),os=require('os'),assert=require('assert/strict');
 const {CodeGraph}=require(path.resolve(process.argv[2]||'dist','index.js'));
-(async()=>{const root=fs.mkdtempSync(path.join(os.tmpdir(),'cg-size-race-'));const file=path.join(root,'grow.py');fs.writeFileSync(file,'# small');let grown=false;const stat=fsp.stat;let cg;
+(async()=>{const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'cg-size-race-')));const file=path.join(root,'grow.py');fs.writeFileSync(file,'# small');let grown=false;const stat=fsp.stat;let cg;
 fsp.stat=async function(p,...a){const s=await stat(p,...a);if(String(p)===file&&!grown){grown=true;fs.writeFileSync(file,Buffer.alloc(1024*1024+1,35));}return s;};
 try{cg=await CodeGraph.init(root,{index:true});const f=cg.getFiles().find(f=>f.path==='grow.py');console.log(JSON.stringify({grown,file:f,node:process.version}));assert(grown);assert.equal(f.size,1024*1024+1);assert(f.errors?.some(e=>e.code==='size_exceeded'));assert.equal(cg.getNodesInFile('grow.py').length,0);}finally{fsp.stat=stat;cg?.close();fs.rmSync(root,{recursive:true,force:true});}})().catch(e=>{console.error(e);process.exitCode=1;});

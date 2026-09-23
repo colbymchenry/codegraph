@@ -39,6 +39,9 @@ try {
    result=run('powershell.exe',['-NoProfile','-ExecutionPolicy','Bypass','-File',script],env);
   }else result=run('sh',[path.join(repo,'install.sh')],env);
   assert.equal(result.status===0,mode==='valid',result.stdout+'\n'+result.stderr);
+  if(mode==='mismatch') assert.match(result.stdout+'\n'+result.stderr,/checksum mismatch/i);
+  if(mode==='duplicate'||mode==='unlisted') assert.match(result.stdout+'\n'+result.stderr,/missing or ambiguous|checksum.*(missing|duplicate)|expected.*checksum/i);
+  if(mode==='missing'&&windows) assert.match(result.stdout+'\n'+result.stderr,/fixture 404/);
   assert.equal(fs.readFileSync(path.join(dest,'bin','codegraph'),'utf8'),mode==='valid'?'replacement':'original');
  });
  console.log(JSON.stringify({platform:process.platform,node:process.version,scope:windows?'native PowerShell install-prefix and full generated upgrade':'actual shell installer with inert download stubs',rows}));

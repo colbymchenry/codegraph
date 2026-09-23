@@ -122,10 +122,16 @@ describe('CodeGraph.reopenIfReplaced (issue #925)', () => {
     let finishOpen!: (connection: DatabaseConnection) => void;
     const openGate = new Promise<DatabaseConnection>((resolve) => { finishOpen = resolve; });
     const replacedSpy = vi.spyOn(stale, 'isReplacedOnDisk').mockReturnValue(true);
-    const openSpy = vi.spyOn(DatabaseConnection, 'openAsync').mockReturnValue(openGate);
+    let enteredOpen!: () => void;
+    const opening = new Promise<void>((resolve) => { enteredOpen = resolve; });
+    const openSpy = vi.spyOn(DatabaseConnection, 'openAsync').mockImplementation(() => {
+      enteredOpen();
+      return openGate;
+    });
 
     try {
       const reopening = server.reopenIfReplacedAsync();
+      await opening; // The guard may yield before the database open starts.
       server.close();
       finishOpen(fresh);
 

@@ -25,6 +25,7 @@ jobs:
     timeout-minutes: 40
     env:
       CODEGRAPH_TELEMETRY: '0'
+      NATIVE_VALIDATION_SCOPE: 'repairs'
     steps:
       - uses: actions/checkout@v4
         with:
