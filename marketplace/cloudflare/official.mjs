@@ -6,6 +6,8 @@ import {createRequire} from 'node:module';
 const require=createRequire(import.meta.url);
 const {parsePackage}=require('../../dist/plugins/package');
 const semver=require('semver');
+const {requireSourceReview}=require('../source-review.cjs');
+const sourcePolicy=require('../source-reviews.json');
 const policy=JSON.parse(fs.readFileSync(new URL('./official-policy.json',import.meta.url),'utf8'));
 export const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
 export function validateTarget(target) {
@@ -21,11 +23,15 @@ function approved(bytes,engineVersion) {
   if(hash(bytes)!==release.sha256||bytes.length!==release.bytes||pkg.name!==release.packageName)throw Error('Official artifact integrity/provenance does not match reviewed policy');
   const entry=JSON.parse(bytes).files[pkg.main];
   if(hash(entry)!==release.entrySha256)throw Error('Official entry point provenance mismatch');
-  return {pkg,release};
+  // Exact historical artifacts remain immutable. New official versions require the same public-byte proof.
+  const legacy={ '0.1.0':'e5015747d02fe50d6af607b6c44f1db9cf7969a0070866ed03c7643377a459c8', '0.1.1':'e5ed73bee51524585e4f4da1d5017fdee3037a3fa71d8f08edab6c318fedc59a' };
+  let sourceReview;
+  if(pkg.codegraph.id!=='drupal'||legacy[pkg.version]!==hash(bytes))sourceReview=requireSourceReview(sourcePolicy.reviews,pkg,hash(bytes),policy.publisherId,{source:release.repository,sourceRevision:release.sourceRevision,sourcePath:release.packagePath});
+  return {pkg,release,sourceReview};
 }
 function listingFor(bytes,engineVersion,publishedAt) {
-  const {pkg,release:r}=approved(bytes,engineVersion);
-  return {id:r.id,version:r.version,name:r.name,description:r.description,publisher:policy.publisher,publisherId:policy.publisherId,official:true,
+  const {pkg,release:r,sourceReview}=approved(bytes,engineVersion);
+  return {...(sourceReview?{sourceReview}:{}),id:r.id,version:r.version,name:r.name,description:r.description,publisher:policy.publisher,publisherId:policy.publisherId,official:true,
     readme:r.readme,source:r.repository+'/tree/'+r.sourceRevision+'/extensions/drupal',apiVersion:pkg.codegraph.apiVersion,engines:pkg.codegraph.engines??'*',capabilities:pkg.codegraph.capabilities,
     integrity:r.sha256,publishedAt,provenance:{repository:r.repository,revision:r.sourceRevision,path:r.sourcePath,sourceSha256:r.sourceSha256,entrySha256:r.entrySha256}};
 }

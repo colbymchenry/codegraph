@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- Inspect the exact extension package and every bundled source file before installing, with verified fingerprints and clear repository provenance.
+
 - Add a trusted, pinned Drupal import command for the Cloudflare registry, with target/plan verification, atomic owner claims, official backup preservation and local Worker/browser graph acceptance.
 
 

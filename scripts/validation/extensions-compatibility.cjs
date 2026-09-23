@@ -30,7 +30,7 @@ async function publish(version, engines = '>=1.6.0 <2', id = 'compatible-demo', 
   fs.writeFileSync(path.join(author, 'index.cjs'), original.replace('Python event dispatch', 'Python event dispatch ' + version).replace('extract(file, source) {', broken ? "extract(file, source) { throw Error('Rejected compatible update');" : 'extract(file, source) {'));
   const bytes = packExtension(author);
   const payload = JSON.stringify({ name: id, description: 'Compatible generated Python event extension', publisher: 'Compatibility validation',
-    source: 'https://example.com/extension-source', readme: 'Generated author template; local release selection acceptance.', artifact: bytes.toString('base64'), timestamp: Date.now(), nonce: randomUUID() });
+    source: 'https://github.com/fixture/source', sourceRevision:'a'.repeat(40), sourcePath:'fixture.cgext', readme: 'Generated author template; local release selection acceptance.', artifact: bytes.toString('base64'), timestamp: Date.now(), nonce: randomUUID() });
   const body = { payload, publicKey: keys.publicKey.export({ format: 'jwk' }), signature: sign('sha256', Buffer.from(payload), { key: keys.privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64') };
   const res = await fetch(registry + '/api/publish', { method: 'POST', body: JSON.stringify(body) });
   assert.equal(res.status, 201, await res.clone().text());

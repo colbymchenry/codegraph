@@ -1,4 +1,6 @@
 import * as semver from 'semver';
+import sourcePolicy from '../source-reviews.json';
+import { requireSourceReview } from '../source-review.cjs';
 import { parsePackage, MAX_PACKAGE_BYTES } from '../../src/plugins/package-validation';
 
 // Worker's bindings are injected by Cloudflare/Miniflare; no Node/native SQLite imports.
@@ -30,25 +32,26 @@ async function readBody(request:Request) {
   const bytes=new Uint8Array(size);let offset=0;for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.length;}
   return JSON.parse(new TextDecoder().decode(bytes));
 }
-export async function validateSubmission(raw:any) {
+export async function validateSubmission(raw:any, reviews:any[] = sourcePolicy.reviews) {
   try {
     if(typeof raw?.payload!=='string'||raw.payload.length>MAX_PACKAGE_BYTES*1.5||typeof raw.signature!=='string'||raw.publicKey?.kty!=='EC'||raw.publicKey?.crv!=='P-256'||raw.publicKey.d)throw Error('Invalid signed submission');
     const key=await crypto.subtle.importKey('jwk',raw.publicKey,{name:'ECDSA',namedCurve:'P-256'},true,['verify']);
     if(!await crypto.subtle.verify({name:'ECDSA',hash:'SHA-256'},key,decodeBase64(raw.signature),utf8.encode(raw.payload)))throw Error('Publisher signature is invalid');
     const p=JSON.parse(raw.payload);
-    if(p.official===true||p.publisherId!==undefined||p.provenance!==undefined)throw Error('Official status and publisher identity require the trusted operator path');
+    if(p.official===true||p.publisherId!==undefined||p.provenance!==undefined||p.sourceReview!==undefined)throw Error('Official status and publisher identity require the trusted operator path');
     if(!Number.isFinite(p.timestamp)||Math.abs(Date.now()-p.timestamp)>600000||typeof p.nonce!=='string'||!p.nonce||p.nonce.length>200)throw Error('Submission expired or invalid nonce');
     for(const field of ['name','description','publisher','readme','source','artifact'])if(typeof p[field]!=='string')throw Error('Missing '+field);
     if(!p.name.trim()||p.name.length>80||!p.publisher.trim()||p.publisher.length>80||p.description.length>240||p.readme.length>30000)throw Error('Listing fields exceed allowed length');
     const source=new URL(p.source);if(source.protocol!=='https:'||source.username||source.password)throw Error('Source repository must be an HTTPS URL');
     const bytes=decodeBase64(p.artifact),pkg=parsePackage(bytes).package;
     const integrity=await digest(bytes),publisherId=await digest(await crypto.subtle.exportKey('spki',key));
-    const listing={id:pkg.codegraph.id,version:pkg.version,name:p.name,description:p.description,publisher:p.publisher,publisherId,official:false,readme:p.readme,source:p.source,apiVersion:pkg.codegraph.apiVersion,engines:pkg.codegraph.engines??'*',capabilities:pkg.codegraph.capabilities,integrity,publishedAt:new Date().toISOString()};
+    const sourceReview=requireSourceReview(reviews,pkg,integrity,publisherId,p);
+    const listing={sourceReview,id:pkg.codegraph.id,version:pkg.version,name:p.name,description:p.description,publisher:p.publisher,publisherId,official:false,readme:p.readme,source:p.source,apiVersion:pkg.codegraph.apiVersion,engines:pkg.codegraph.engines??'*',capabilities:pkg.codegraph.capabilities,integrity,publishedAt:new Date().toISOString()};
     return {bytes,listing,nonce:p.nonce};
   }catch(error){throw new InputError(error instanceof Error?error.message:String(error));}
 }
 // Hooks are injected by the isolated test entrypoint, never controlled by request/env in production.
-export function createHandler(hook: (phase:string)=>Promise<void> = async()=>{}) {
+export function createHandler(hook: (phase:string)=>Promise<void> = async()=>{}, reviews:any[] = sourcePolicy.reviews) {
   return async function handle(request:Request,env:any):Promise<Response> {
     try {
       const url=new URL(request.url);
@@ -90,7 +93,7 @@ export function createHandler(hook: (phase:string)=>Promise<void> = async()=>{})
         const rateKey=await digest(utf8.encode(ip+':'+minute));
         const rate=await env.DB.batch([env.DB.prepare('DELETE FROM rate_limits WHERE expires<?').bind(Date.now()),env.DB.prepare('INSERT INTO rate_limits VALUES(?,?,1) ON CONFLICT(key) DO UPDATE SET count=count+1 RETURNING count').bind(rateKey,(minute+2)*60000)]);
         if(rate[1].results[0].count>10)return json(429,{error:'Too many submissions; try again in a minute'});
-        const {bytes,listing,nonce}=await validateSubmission(await readBody(request));
+        const {bytes,listing,nonce}=await validateSubmission(await readBody(request),reviews);
         const owner=await env.DB.prepare('SELECT publisher FROM extensions WHERE id=?').bind(listing.id).first('publisher');
         if(owner&&owner!==listing.publisherId)throw new InputError('This extension id belongs to another publisher');
         if(await env.DB.prepare('SELECT 1 FROM releases WHERE id=? AND version=?').bind(listing.id,listing.version).first())throw new InputError('This release version is immutable and already exists');

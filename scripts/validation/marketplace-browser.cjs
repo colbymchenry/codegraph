@@ -63,7 +63,7 @@ function routes(root) {
       await page.locator('#name').fill('Browser example');
       await page.locator('#publisher').fill('Recovery publisher');
       await page.locator('#description').fill('A second framework used for end-to-end validation.');
-      await page.locator('#source').fill('https://example.com/recovery-source');
+      await page.locator('#source').fill('https://github.com/fixture/recovery-source');
       await page.locator('#readme').fill('Validation-only extension. Adds one explicit route to each TypeScript file.');
       await page.locator('#package-summary').filter({ hasText: 'v'+version+' ·' }).waitFor();
       if (releaseCatalog) {
@@ -74,7 +74,8 @@ function routes(root) {
         checks.push('late catalog response preserves the entered publisher form and package');
       }
       assert.equal(await page.locator('#description').inputValue(), 'A second framework used for end-to-end validation.');
-      assert.equal(await page.locator('#source').inputValue(), 'https://example.com/recovery-source');
+      assert.equal(await page.locator('#source').inputValue(), 'https://github.com/fixture/recovery-source');
+      await page.locator('#source-revision').fill('a'.repeat(40)); await page.locator('#source-path').fill('fixture.cgext');
       await page.getByRole('button', { name: 'Publish release' }).click();
       console.log('Submitted', version);
       await page.waitForURL('**/extensions/browser-example');
@@ -89,7 +90,8 @@ function routes(root) {
     const other = await otherContext.newPage();
     await other.goto(origin + '/publish');
     await other.locator('#artifact').setInputFiles({ name: 'example.cgext', mimeType: 'application/json', buffer: artifact('9.0.0') });
-    for (const [id, value] of Object.entries({ name: 'Attempted takeover', publisher: 'Other publisher', description: 'Test', source: 'https://example.com/other', readme: 'Test' })) await other.locator('#' + id).fill(value);
+    for (const [id, value] of Object.entries({ name: 'Attempted takeover', publisher: 'Other publisher', description: 'Test', source: 'https://github.com/fixture/other', readme: 'Test' })) await other.locator('#' + id).fill(value);
+    await other.locator('#source-revision').fill('a'.repeat(40)); await other.locator('#source-path').fill('fixture.cgext');
     await other.getByRole('button', { name: 'Publish release' }).click();
     await other.getByText('This extension id belongs to another publisher', { exact: true }).waitFor();
     checks.push('browser publisher ownership rejection');
@@ -98,6 +100,7 @@ function routes(root) {
       const body = route.request().postDataJSON(); body.signature = 'invalid';
       await route.continue({ postData: JSON.stringify(body) });
     });
+    await other.locator('#source-revision').fill('a'.repeat(40)); await other.locator('#source-path').fill('fixture.cgext');
     await other.getByRole('button', { name: 'Publish release' }).click();
     await other.locator('#publish-result').filter({ hasText: /signature/i }).waitFor();
     await other.unroute('**/api/publish');
@@ -105,7 +108,8 @@ function routes(root) {
     const malformed = JSON.parse(artifact('9.0.0')); malformed.format = 'invalid-format';
     await other.locator('#artifact').setInputFiles({ name: 'invalid.cgext', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(malformed)) });
     await other.locator('#description').fill('Invalid package validation');
-    await other.locator('#source').fill('https://example.com/invalid');
+    await other.locator('#source').fill('https://github.com/fixture/invalid');
+    await other.locator('#source-revision').fill('a'.repeat(40)); await other.locator('#source-path').fill('fixture.cgext');
     await other.getByRole('button', { name: 'Publish release' }).click();
     await other.locator('#publish-result').filter({ hasText: /package/i }).waitFor();
     assert.equal((await (await fetch(origin + '/api/extensions')).json()).length, 1);
@@ -188,10 +192,11 @@ function routes(root) {
     await page.setViewportSize({ width: 1440, height: 1000 });
     await page.getByRole('link', { name: 'Publish an extension' }).click();
     await page.locator('#artifact').setInputFiles({ name: 'example.cgext', mimeType: 'application/json', buffer: artifact('4.0.0') });
-    for (const [id, value] of Object.entries({ name: 'Browser example', publisher: 'Recovery publisher', description: 'Outage check', source: 'https://example.com/source', readme: 'Outage check' })) await page.locator('#'+id).fill(value);
+    for (const [id, value] of Object.entries({ name: 'Browser example', publisher: 'Recovery publisher', description: 'Outage check', source: 'https://github.com/fixture/source', readme: 'Outage check' })) await page.locator('#'+id).fill(value);
     await page.locator('#package-summary').filter({ hasText: 'v4.0.0' }).waitFor();
     await server.close(); server = undefined;
-    await page.getByRole('button', { name: 'Publish release' }).click();
+    await page.locator('#source-revision').fill('a'.repeat(40)); await page.locator('#source-path').fill('fixture.cgext');
+      await page.getByRole('button', { name: 'Publish release' }).click();
     await page.locator('#publish-result').filter({ hasText: /marketplace registry/i }).waitFor();
     assert.equal(await page.getByRole('button', { name: 'Publish release' }).isEnabled(), true);
     assert.deepEqual(routes(roots[1]), []);

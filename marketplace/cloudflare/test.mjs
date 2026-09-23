@@ -15,7 +15,7 @@ function artifact(id='worker-demo',version='1.0.0',size){
  return Buffer.from(JSON.stringify(p));
 }
 function signed(bytes,key=keys,nonce=randomUUID()){
- const payload=JSON.stringify({name:'Worker demo',description:'Worker-runtime validation',publisher:'Test',readme:'Test',source:'https://example.com/source',artifact:bytes.toString('base64'),timestamp:Date.now(),nonce});
+ const payload=JSON.stringify({name:'Worker demo',description:'Worker-runtime validation',publisher:'Test',readme:'Test',source:'https://github.com/fixture/source',sourceRevision:'a'.repeat(40),sourcePath:'fixture.cgext',artifact:bytes.toString('base64'),timestamp:Date.now(),nonce});
  return {payload,publicKey:key.publicKey.export({format:'jwk'}),signature:sign('sha256',Buffer.from(payload),{key:key.privateKey,dsaEncoding:'ieee-p1363'}).toString('base64')};
 }
 let sequence=0;
@@ -24,7 +24,7 @@ async function request(server,body,extra={},expected=201){
  const result=await response.json();assert.equal(response.status,expected,JSON.stringify(result));return{result,ms:performance.now()-start};
 }
 const list=async s=>(await fetch('http://127.0.0.1:'+s.port+'/api/extensions')).json();
-const start=async state=>{const s=await startLocal({state,testing:true});services.push(s);return s;};
+const start=async state=>{const s=await startLocal({state,testing:true,fixtureSourceApproval:true});services.push(s);return s;};
 function passed(name){checks.push(name);fs.writeFileSync(path.join(out,'progress.json'),JSON.stringify({checks,receipts,updated:new Date().toISOString()},null,2));console.log('PASS',name);}
 async function child(state){
  const c=fork(new URL('./test-child.mjs',import.meta.url),[state],{stdio:['ignore','pipe','pipe','ipc']});let stdout='',stderr='';c.stdout.on('data',b=>stdout+=b);c.stderr.on('data',b=>stderr+=b);
@@ -65,7 +65,7 @@ async function child(state){
  }
  passed('real test-owned process kills after R2 and D1 boundaries recover in fresh runtime');
  // Production entry point ignores test-only fault headers.
- const production=await startLocal({state:path.join(lab,'production')});services.push(production);await request(production,signed(artifact('prod')),{'x-test-failure':'before-object'});passed('production bundle has no test failure control');const disabled=await startLocal({state:path.join(lab,'disabled'),publishing:false});services.push(disabled);await request(disabled,signed(artifact('disabled')),{},503);assert.deepEqual(await list(disabled),[]);passed('publication stays disabled until explicitly enabled');
+ const production=await startLocal({state:path.join(lab,'production')});services.push(production);const prod=await request(production,signed(artifact('prod')),{'x-test-failure':'before-object'},400);assert.match(prod.result.error,/operator-reviewed/);passed('production ignores test fault headers and refuses unreviewed publication');const disabled=await startLocal({state:path.join(lab,'disabled'),publishing:false});services.push(disabled);await request(disabled,signed(artifact('disabled')),{},503);assert.deepEqual(await list(disabled),[]);passed('publication stays disabled until explicitly enabled');
  fs.writeFileSync(path.join(out,'result.json'),JSON.stringify({revision:execFileSync('git',['rev-parse','HEAD'],{cwd:root,encoding:'utf8'}).trim(),dirty:!!execFileSync('git',['status','--porcelain'],{cwd:root,encoding:'utf8'}).trim(),platform:process.platform,node:process.version,checks,receipts,snapshot,largePackage:{bytes:large.length,wallMilliseconds:timing.ms,note:'Local wall time includes storage I/O; not Cloudflare CPU billing measurement'},success:true},null,2));
  console.log('PASS',checks.length,'Worker-runtime checks');
  }finally{await Promise.allSettled(services.map(s=>s.close()));fs.rmSync(lab,{recursive:true,force:true});}})().catch(error=>{fs.writeFileSync(path.join(out,'failure.json'),JSON.stringify({checks,receipts,error:String(error.stack)},null,2));console.error(error);process.exitCode=1;});

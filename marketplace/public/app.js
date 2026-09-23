@@ -90,21 +90,23 @@ function renderCards() {
     `${e.name} ${e.description} ${e.publisher}`.toLowerCase().includes(state.search.toLowerCase()));
   document.querySelector('#catalog-items').innerHTML = `<div class="catalog">${filtered.length ? filtered.map(card).join('') : `<div class="empty">${state.tab === 'installed' && !state.snapshot ? 'Connect CodeGraph to see your installed extensions.' : state.search ? 'No extensions match your search.' : 'No extensions installed yet.'}</div>`}${state.tab !== 'installed' ? '<aside class="author-card"><span class="eyebrow">FOR BUILDERS</span><div class="author-art" aria-hidden="true">{↗}</div><h2>Your framework.<br>Your contribution.</h2><p>Turn what you know into an extension everyone can use. Start with the public API and publish your first release.</p><a data-link href="/publish">Build an extension <span>↗</span></a></aside>' : ''}</div>`;
 }
+function safeRepositoryLink(value) { try { const u=new URL(value); if(u.protocol==='https:'&&!u.username&&!u.password)return `<a href="${escape(u.href)}" target="_blank" rel="noopener noreferrer">View repository claim ↗</a>`; } catch {} return 'Unavailable'; }
 function renderDetail(id) {
   const item = state.catalog.find(item => item.id === id);
   const e = item && selected(item);
   if (!e) { app.innerHTML = '<section class="section detail"><h1>Extension not found</h1><a data-link href="/">Back to marketplace</a></section>'; return; }
   const current = installed(id);
   const known = releaseKnown(id);
-  app.innerHTML = `<section class="section detail"><div class="breadcrumb"><a data-link href="/">Marketplace</a> / ${escape(e.name)}</div><div class="detail-layout"><article><div class="card-top"><div class="extension-icon">${id === 'drupal' ? icon : escape(e.name.slice(0,1))}</div><div><h2>${escape(e.name)}</h2><div class="byline">${escape(e.publisher)} ${e.official ? '<span class="official">✓ OFFICIAL</span>' : 'Community publisher'}</div></div></div><p class="card-copy">${escape(e.description)}</p><div class="tags">${e.capabilities.map(c => `<span class="tag">${c === 'frameworks' ? 'Framework support' : 'Semantic analysis'}</span>`).join('')}</div><div class="readme">${escape(e.readme)}</div></article><aside class="metadata"><span class="eyebrow">${current ? (current.enabled === false ? 'INSTALLED · DISABLED' : 'INSTALLED') : 'READY FOR YOUR PROJECT'}</span>${button(e,true)}<p class="small muted compatibility">${escape(compatibility(e))}</p>${progress()}<p class="small muted">${project() ? `Destination: ${escape(project().name)}` : 'Connect CodeGraph once to install.'}</p><p class="small muted">Extensions run with your local permissions. Review the publisher and source before installing.</p><dl>${current ? `<dt>Installed version</dt><dd data-installed-version>${escape(current.version)}</dd>` : ''}<dt>${state.snapshot ? 'Selected version' : 'Latest catalog version'}</dt><dd data-selected-version>${escape(releaseVersion(e))}</dd>${known ? `<dt>CodeGraph compatibility</dt><dd>${escape(e.engines)}</dd><dt>Source</dt><dd><a href="${escape(e.source)}" target="_blank" rel="noopener">View source repository ↗</a></dd><dt>Published</dt><dd>${escape(new Date(e.publishedAt).toLocaleDateString(undefined,{year:'numeric',month:'long',day:'numeric'}))}</dd><dt>Publisher identity</dt><dd class="integrity">${escape(e.publisherId)}</dd><dt>Release fingerprint</dt><dd class="integrity">${escape(e.integrity)}</dd>` : ''}</dl>${known ? `<a class="text-link" href="/api/download/${escape(e.id)}/${escape(e.version)}">Download for CLI install ↓</a>` : ''}</aside></div></section>`;
+  app.innerHTML = `<section class="section detail"><div class="breadcrumb"><a data-link href="/">Marketplace</a> / ${escape(e.name)}</div><div class="detail-layout"><article><div class="card-top"><div class="extension-icon">${id === 'drupal' ? icon : escape(e.name.slice(0,1))}</div><div><h2>${escape(e.name)}</h2><div class="byline">${escape(e.publisher)} ${e.official ? '<span class="official">✓ OFFICIAL</span>' : 'Community publisher'}</div></div></div><p class="card-copy">${escape(e.description)}</p><div class="tags">${e.capabilities.map(c => `<span class="tag">${c === 'frameworks' ? 'Framework support' : 'Semantic analysis'}</span>`).join('')}</div><div class="readme">${escape(e.readme)}</div>${sourcePanel(e)}</article><aside class="metadata"><span class="eyebrow">${current ? (current.enabled === false ? 'INSTALLED · DISABLED' : 'INSTALLED') : 'READY FOR YOUR PROJECT'}</span>${button(e,true)}<p><a class="text-link" href="#package-source">Inspect this package’s source ↓</a></p><p class="small muted compatibility">${escape(compatibility(e))}</p>${progress()}<p class="small muted">${project() ? `Destination: ${escape(project().name)}` : 'Connect CodeGraph once to install.'}</p><p class="small muted">Extensions run with your local permissions. Review the publisher and source before installing.</p><dl>${current ? `<dt>Installed version</dt><dd data-installed-version>${escape(current.version)}</dd>` : ''}<dt>${state.snapshot ? 'Selected version' : 'Latest catalog version'}</dt><dd data-selected-version>${escape(releaseVersion(e))}</dd>${known ? `<dt>CodeGraph compatibility</dt><dd>${escape(e.engines)}</dd><dt>Publisher repository claim</dt><dd>${safeRepositoryLink(e.source)}</dd><dt>Published</dt><dd>${escape(new Date(e.publishedAt).toLocaleDateString(undefined,{year:'numeric',month:'long',day:'numeric'}))}</dd><dt>Publisher identity</dt><dd class="integrity">${escape(e.publisherId)}</dd><dt>Release fingerprint</dt><dd class="integrity">${escape(e.integrity)}</dd>` : ''}</dl>${known ? `<a class="text-link" href="/api/download/${escape(e.id)}/${escape(e.version)}">Download for CLI install ↓</a>` : ''}</aside></div></section>`;
 }
 function renderPublish() {
-  app.innerHTML = `<section class="section publish"><a data-link class="breadcrumb" href="/">← Marketplace</a><h1>Share what you know.</h1><p class="publish-intro">Give CodeGraph the framework knowledge your team needs. Upload a versioned extension and publish it to the community.</p><div class="publish-layout"><form id="publish-form"><div class="upload"><label for="artifact">Your extension package</label><p class="small muted">Upload the .cgext file from CodeGraph’s extension pack command.</p><input type="file" id="artifact" accept=".cgext,application/json" required><p id="package-summary" class="small"></p></div><div class="form-row"><div><label for="name">Extension name</label><input id="name" maxlength="80" placeholder="Your framework" required></div><div><label for="publisher">Publisher name</label><input id="publisher" maxlength="80" placeholder="Your name or team" required></div></div><label for="description">Short description</label><input id="description" maxlength="240" placeholder="What does this extension help people understand?" required><label for="source">Source repository</label><input id="source" type="url" placeholder="https://github.com/your-team/your-extension" required><label for="readme">Documentation</label><textarea id="readme" rows="8" maxlength="30000" placeholder="Supported patterns, configuration, examples, and known limitations." required></textarea><div class="form-actions"><button class="primary" type="submit">Publish release <span>↗</span></button><span class="small muted">Published versions are immutable.<br>Community publication does not confer official status.</span></div><p id="publish-result" role="status"></p></form><aside class="aside-notes"><span class="eyebrow">BEFORE YOU PUBLISH</span><h3>Build. Test. Share.</h3><p>Package framework or semantic contributions, and test deterministic indexing before publishing.</p><h3>Your publisher identity</h3><p>Your browser creates a signing key for your releases. Back it up to publish updates from another browser. Your key never leaves this browser during publication.</p><button id="backup-key">Back up publisher key ↓</button><label for="restore-key">Restore an existing publisher key</label><input type="file" id="restore-key" accept=".json"><p class="small">Keep your backup private. Anyone with it can publish your extensions.</p></aside></div></section>`;
+  app.innerHTML = `<section class="section publish"><a data-link class="breadcrumb" href="/">← Marketplace</a><h1>Share what you know.</h1><p class="publish-intro">Give CodeGraph the framework knowledge your team needs. Upload a versioned extension and publish it to the community.</p><div class="publish-layout"><form id="publish-form"><div class="upload"><label for="artifact">Your extension package</label><p class="small muted">Upload the .cgext file from CodeGraph’s extension pack command.</p><input type="file" id="artifact" accept=".cgext,application/json" required><p id="package-summary" class="small"></p></div><div class="form-row"><div><label for="name">Extension name</label><input id="name" maxlength="80" placeholder="Your framework" required></div><div><label for="publisher">Publisher name</label><input id="publisher" maxlength="80" placeholder="Your name or team" required></div></div><label for="description">Short description</label><input id="description" maxlength="240" placeholder="What does this extension help people understand?" required><label for="source">Source repository</label><input id="source" type="url" placeholder="https://github.com/your-team/your-extension" required><label for="source-revision">Public source commit</label><input id="source-revision" pattern="[a-f0-9]{40}" placeholder="Full 40-character commit SHA" required><label for="source-path">Committed package path</label><input id="source-path" placeholder="packages/example-1.0.0.cgext" required><p class="small">Future publication requires an operator-reviewed copy of these exact package bytes in this public commit. Placeholder, private and mismatched sources are rejected. General publication remains disabled on the hosted preview.</p><label for="readme">Documentation</label><textarea id="readme" rows="8" maxlength="30000" placeholder="Supported patterns, configuration, examples, and known limitations." required></textarea><div class="form-actions"><button class="primary" type="submit">Publish release <span>↗</span></button><span class="small muted">Published versions are immutable.<br>Community publication does not confer official status.</span></div><p id="publish-result" role="status"></p></form><aside class="aside-notes"><span class="eyebrow">BEFORE YOU PUBLISH</span><h3>Build. Test. Share.</h3><p>Package framework or semantic contributions, and test deterministic indexing before publishing.</p><h3>Your publisher identity</h3><p>Your browser creates a signing key for your releases. Back it up to publish updates from another browser. Your key never leaves this browser during publication.</p><button id="backup-key">Back up publisher key ↓</button><label for="restore-key">Restore an existing publisher key</label><input type="file" id="restore-key" accept=".json"><p class="small">Keep your backup private. Anyone with it can publish your extensions.</p></aside></div></section>`;
 }
 function render() {
   if (location.pathname === '/publish') renderPublish();
   else if (location.pathname.startsWith('/extensions/')) renderDetail(decodeURIComponent(location.pathname.split('/')[2]));
   else renderCatalog();
+  paintSource();
 }
 async function refresh() {
   state.catalog = await api('/api/extensions');
@@ -169,6 +171,8 @@ async function act(action, id) {
   if (action === 'install' || action === 'update') {
     const release = state.selections[id]?.release;
     if (!release) { toast('Wait for compatibility selection or reconnect.'); return; }
+    const reviewed=inspection.reviewed.get(id);
+    if(reviewed&&(reviewed.pending||reviewed.identity!==sourceIdentity(release))){toast('Source review does not match the selected release. View its source again before installing.');return;}
     command.selected = { version: release.version, integrity: release.integrity };
     if (extension.official && id === 'drupal') command.replaces = ['drupal'];
   }
@@ -221,12 +225,80 @@ document.addEventListener('submit',async event=>{
     const jwk=await signingKey(), key=await crypto.subtle.importKey('jwk',jwk,{name:'ECDSA',namedCurve:'P-256'},false,['sign']);
     const publicKey={kty:jwk.kty,crv:jwk.crv,x:jwk.x,y:jwk.y};
     const fields=Object.fromEntries(['name','publisher','description','source','readme'].map(id=>[id,document.getElementById(id).value]));
-    const payload=JSON.stringify({...fields,artifact,timestamp:Date.now(),nonce:crypto.randomUUID()});
+    const payload=JSON.stringify({...fields,sourceRevision:document.getElementById('source-revision').value,sourcePath:document.getElementById('source-path').value,artifact,timestamp:Date.now(),nonce:crypto.randomUUID()});
     const signature=base64(new Uint8Array(await crypto.subtle.sign({name:'ECDSA',hash:'SHA-256'},key,new TextEncoder().encode(payload))));
     status.textContent='Validating and publishing your release…';
     const result=await api('/api/publish',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({payload,publicKey,signature})});
     state.catalog=await api('/api/extensions');toast('Release published. Back up your publisher key to keep control of updates.');navigate('/extensions/'+result.id);void refreshSelections();
   }catch(e){status.textContent=e.message;}finally{submit.disabled=false;}
 });
+// Package inspection never imports or evaluates extension code. Only verified bytes reach textContent.
+const inspection = { reviewed:new Map(), request:0, active:null, error:'', loading:false, file:'', offset:0 };
+const sourcePageSize = 64000;
+function sourceIdentity(e) { return `${e.id}\n${e.version}\n${e.integrity}`; }
+function safeSourcePath(p) {
+  return typeof p==='string' && p.length>0 && p.length<240 && !/[\\:\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/.test(p) && !p.startsWith('/') && p!=='package.json' && /\.(?:[cm]?js|json|md|txt)$/.test(p) && p.split('/').every(x=>x&&x!=='.'&&x!=='..'&&!x.startsWith('.'));
+}
+async function verifiedSource(response, release) {
+  if(!response.ok)throw Error(`Package source unavailable (HTTP ${response.status}).`);
+  const max=8*1024*1024;
+  if(Number(response.headers.get('content-length'))>max)throw Error('Package exceeds 8 MiB.');
+  const reader=response.body.getReader(),parts=[];let size=0;
+  try{while(true){const {value,done}=await reader.read();if(done)break;size+=value.length;if(size>max)throw Error('Package exceeds 8 MiB.');parts.push(value);}}finally{await reader.cancel();}
+  const bytes=new Uint8Array(size);let pos=0;for(const part of parts){bytes.set(part,pos);pos+=part.length;}
+  const digest=[...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(b=>b.toString(16).padStart(2,'0')).join('');
+  if(!/^[a-f0-9]{64}$/.test(release.integrity)||digest!==release.integrity)throw Error('Package fingerprint changed. Source is not verified; installation from this review is blocked.');
+  const pkg=JSON.parse(new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(bytes));
+  if(pkg?.format!=='codegraph-extension-1'||pkg.package?.codegraph?.id!==release.id||pkg.package?.version!==release.version||!pkg.files||Array.isArray(pkg.files)||typeof pkg.files!=='object')throw Error('Package identity or format does not match the selected release.');
+  const entries=Object.entries(pkg.files);
+  if(entries.length>256||entries.some(([p,s])=>!safeSourcePath(p)||typeof s!=='string'||s.includes('\0'))||!safeSourcePath(pkg.package.main)||!Object.hasOwn(pkg.files,pkg.package.main)||!/[cm]?js$/.test(pkg.package.main))throw Error('Package has an unsafe path, invalid text or missing entry point.');
+  return {release:{...release},bytes,files:{'package.json':JSON.stringify(pkg.package,null,2),...pkg.files},main:pkg.package.main};
+}
+function sourcePanel(e) {
+  const active=inspection.active?.release.id===e.id?inspection.active:null;
+  return `<section id="package-source" class="source-inspection" aria-label="Package source"><h3>Inspect packaged source</h3><p class="small">Read every bundled file before installing. Source availability is not a security review. Extensions run with your local permissions.</p><button data-view-source="${escape(e.id)}" ${releaseKnown(e.id)&&!inspection.loading?'':'disabled'}>${inspection.loading?'Checking package…':'View selected version source'}</button><p class="small" role="status" id="source-status">${escape(inspection.error)}</p>${active?`<p class="source-verified">Verified package bytes · ${escape(active.release.id)} ${escape(active.release.version)}</p><p class="integrity small">SHA-256 ${escape(active.release.integrity)}</p><p class="small">All ${Object.keys(active.files).length} packaged files are available below, including bundled dependencies. Runtime code may still access your files or network.</p>${sourceProvenance(active.release)}<label for="source-file">File</label><select id="source-file">${Object.keys(active.files).sort().map(p=>`<option value="${escape(p)}" ${inspection.file===p?'selected':''}>${escape(p)}${p===active.main?' (entry point)':''}</option>`).join('')}</select><p class="small" id="source-range"></p><pre id="source-content" tabindex="0" aria-label="Inert package source"></pre><div class="source-actions"><button id="source-prev">Previous section</button><button id="source-next">Next section</button><button id="source-file-download">Download file as text</button><button id="source-package-download">Download verified package</button></div>`:''}</section>`;
+}
+function sourceProvenance(e) {
+  const r=e.sourceReview;
+  const valid=r?.verification==='public-committed-package-bytes'&&r.integrity===e.integrity&&/^https:\/\/github\.com\/[\w-]+\/[\w.-]+$/.test(r.repository)&&/^[a-f0-9]{40}$/.test(r.revision)&&typeof r.path==='string'&&r.path.split('/').every(p=>p&&p!=='.'&&p!=='..');
+  if(valid)return `<p class="small">Operator checked the public committed package on ${escape(r.checkedAt)}. <a href="${escape(r.repository+'/blob/'+r.revision+'/'+r.path.split('/').map(encodeURIComponent).join('/'))}" target="_blank" rel="noopener noreferrer">Repository snapshot ↗</a><br>Commit: ${escape(r.revision)}. This proves packaged-byte correspondence at review time, not a reproducible build or malware safety.</p>`;
+  const p=e.provenance;
+  return `<p class="small source-unverified">Repository correspondence unverified under the current source policy.${p?.revision?` Historical publisher provenance: commit ${escape(p.revision)}, path ${escape(p.path)}.`:''} The package fingerprint above verifies the downloaded release only.</p>`;
+}
+function paintSource() {
+  const el=document.querySelector('#source-content'),active=inspection.active;if(!el||!active)return;
+  const source=active.files[inspection.file];if(typeof source!=='string')return;
+  el.textContent=source.slice(inspection.offset,inspection.offset+sourcePageSize);
+  document.querySelector('#source-range').textContent=`Characters ${inspection.offset+1}–${Math.min(source.length,inspection.offset+sourcePageSize)} of ${source.length}. Displayed as text; never executed.`;
+  document.querySelector('#source-prev').disabled=inspection.offset===0;
+  document.querySelector('#source-next').disabled=inspection.offset+sourcePageSize>=source.length;
+}
+async function inspectSource(id) {
+  const catalog=state.catalog.find(e=>e.id===id);if(!catalog||!releaseKnown(id))return;
+  const e={...selected(catalog)},identity=sourceIdentity(e),request=++inspection.request,epoch=state.selectionEpoch;
+  inspection.loading=true;inspection.error='';inspection.active=null;inspection.reviewed.set(id,{identity,pending:true});render();
+  try {
+    const verified=await verifiedSource(await fetch(`/api/download/${encodeURIComponent(id)}/${encodeURIComponent(e.version)}`,{redirect:'error'}),e);
+    if(request!==inspection.request||epoch!==state.selectionEpoch||!releaseKnown(id)||sourceIdentity(selected(state.catalog.find(x=>x.id===id)||{}))!==identity||location.pathname!==`/extensions/${id}`)throw Error('Selection changed while loading. Inspect the current selected version before installing.');
+    inspection.active=verified;inspection.file=verified.main;inspection.offset=0;
+    inspection.reviewed.set(id,{identity,pending:false});
+  }catch(error){if(request===inspection.request)inspection.error=error.message;}
+  finally{if(request===inspection.request){inspection.loading=false;render();}}
+}
+function downloadInspected(file) {
+  const a=inspection.active;if(!a)return;
+  const link=document.createElement('a');link.href=URL.createObjectURL(new Blob([file?a.files[inspection.file]:a.bytes],{type:'text/plain;charset=utf-8'}));
+  link.download=file?inspection.file.replace(/\//g,'_')+'.txt':`${a.release.id}-${a.release.version}.cgext`;
+  link.click();setTimeout(()=>URL.revokeObjectURL(link.href),1000);
+}
+document.addEventListener('click',event=>{
+  const view=event.target.closest('[data-view-source]');if(view){void inspectSource(view.dataset.viewSource);return;}
+  if(event.target.id==='source-prev'){inspection.offset=Math.max(0,inspection.offset-sourcePageSize);paintSource();}
+  if(event.target.id==='source-next'){inspection.offset+=sourcePageSize;paintSource();}
+  if(event.target.id==='source-file-download')downloadInspected(true);
+  if(event.target.id==='source-package-download')downloadInspected(false);
+});
+document.addEventListener('change',event=>{if(event.target.id==='source-file'){inspection.file=event.target.value;inspection.offset=0;paintSource();}});
+
 app.innerHTML='<div class="loading">Loading extensions…</div>';
 refresh().catch(e=>{if(document.querySelector('#publish-form')){toast(e.message);return;}app.innerHTML=`<section class="section detail"><h1>Marketplace unavailable</h1><p>${escape(e.message)}</p><button id="retry">Try again</button></section>`;document.querySelector('#retry').onclick=()=>location.reload();});
