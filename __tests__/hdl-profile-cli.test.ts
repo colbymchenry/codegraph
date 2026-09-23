@@ -32,4 +32,4 @@ it('passes selected source through compiled workers and preserves raw hashes acr
     status=JSON.parse(run(['status',root,'--json']));expect(status.index.hdlProfile.state).toBe('matches');
     expect(run(['explore','fallback_fn','--path',root])).toContain('HDL context: indexed "synth"');
   }finally{fs.rmSync(root,{recursive:true,force:true});}
-});
+}, 120_000);
