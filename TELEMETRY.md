@@ -20,6 +20,13 @@ export CODEGRAPH_TELEMETRY=0   # per-shell / per-CI override
 export DO_NOT_TRACK=1          # the cross-tool standard — always honored
 ```
 
+For one MCP server entry, add `--no-telemetry` to its arguments
+(`"args": ["serve", "--mcp", "--no-telemetry"]`). It works like
+`CODEGRAPH_TELEMETRY=0` for that server and for the background daemon it starts.
+A daemon that is already running for the project, started by a server without
+the flag, keeps its own setting until it exits; `codegraph telemetry off` covers
+every process.
+
 `codegraph telemetry status` shows the current state, what decided it, and your machine ID.
 The interactive installer (`codegraph install`) asks up front with a visible default-on
 toggle and never re-asks. If you never saw the installer (e.g. `npx` straight into `init`),
