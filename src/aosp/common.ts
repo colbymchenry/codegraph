@@ -265,7 +265,7 @@ function looksLikeTestPath(filePath: string): boolean {
 export function testPathEvidence(hits: SourceGrepHit[]): string | null {
   const count = hits.filter((hit) => hit.looksLikeTestPath).length;
   return count > 0
-    ? `${count} hit(s)가 test/CTS/VTS 경로로 보이는 파일에 있습니다 - 프로덕션 코드가 아닐 수 있습니다`
+    ? `${count} hit(s) are in test/CTS/VTS-like paths and may not be production code`
     : null;
 }
 

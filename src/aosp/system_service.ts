@@ -6,7 +6,7 @@
  * grep hits are real signal but not proof on their own. `found` requires the
  * exact `{Name}ManagerService` class AND one of two kinds of corroborating
  * evidence:
- *   - a registration/client-usage hit in the SAME FILE as that class (a
+ *   - a registration hit in the SAME FILE as that class (a
  *     grep hit anywhere else in the repo — a comment, an unrelated service
  *     of a similar name — does not confirm this specific service's
  *     lifecycle); or
@@ -193,7 +193,7 @@ export function analyzeSystemService(cg: CodeGraph, repoRoot: string, serviceNam
     evidence.push(
       `${startupSites.length} startup site(s) name the exact class "${serviceClassName}" ` +
         `(cross-file class-name reference — sufficient alone for "found", unlike the same-file-only ` +
-        `registration/client-usage signals which only match the bare service name)`
+        `registration signals which only match the bare service name)`
     );
   }
 

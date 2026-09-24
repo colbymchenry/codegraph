@@ -1349,7 +1349,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_system_service',
-    description: 'AOSP extension. Analyze a system service\'s lifecycle: the {Name}ManagerService class, its ServiceManager.addService registration, SystemServer startup site, and getSystemService client usage. "found" requires the exact service class AND either (a) a registration/client-usage hit in the SAME FILE as that class, or (b) a startup site naming the exact class (accepted cross-file, since AOSP conventionally starts a service from SystemServer, a different file) — see the response\'s evidence for which one applied. Anything else is convention_derived_candidate.',
+    description: 'AOSP extension. Analyze a system service\'s lifecycle: the {Name}ManagerService class, its ServiceManager.addService registration, SystemServer startup site, and getSystemService client usage. "found" requires the exact service class AND either (a) a registration hit in the SAME FILE as that class, or (b) a startup site naming the exact class (accepted cross-file, since AOSP conventionally starts a service from SystemServer, a different file). Client usage is evidence only and cannot promote a candidate to "found".',
     inputSchema: {
       type: 'object',
       properties: {
