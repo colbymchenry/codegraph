@@ -892,17 +892,138 @@ export function extractImportMappings(
   return mappings;
 }
 
+/** A JavaScript identifier — `$`, `_` and Unicode letters included. Use with the `u` flag. */
+const JS_IDENT = '[$_\\p{ID_Start}][$\\u200c\\u200d\\p{ID_Continue}]*';
+/** A quoted string, escapes included — an ES2022 string-named specifier. */
+const JS_STRING = `"(?:[^"\\\\\\n]|\\\\.)*"|'(?:[^'\\\\\\n]|\\\\.)*'`;
+/** A specifier's name: an identifier, or an ES2022 string name (`"my-fn"`). */
+const SPECIFIER_NAME = `(?:${JS_IDENT}|${JS_STRING})`;
+/** TypeScript's `type` modifier, or Flow's `typeof`. */
+const TYPE_MODIFIER = '(?:type(?:of)?\\s+)';
+const SPECIFIER_ALIAS = new RegExp(`^${TYPE_MODIFIER}?(${SPECIFIER_NAME})\\s+as\\s+(${SPECIFIER_NAME})$`, 'u');
+const SPECIFIER_PLAIN = new RegExp(`^${TYPE_MODIFIER}?(${SPECIFIER_NAME})$`, 'u');
+
+/**
+ * A `{ … }` specifier list: everything up to the closing `}`, with no length
+ * cap, so a barrel's thousand-name list still parses. A list never holds a
+ * brace, so the scan also stops at a `{`: an unclosed list ends at the next
+ * statement's brace instead of rescanning to the end of the file, which keeps
+ * a file of unclosed lists linear. (A brace inside a comment or string name in
+ * the list ends it early, as it always has; handling that needs a real
+ * scanner, not a regex.)
+ */
+const SPECIFIER_LIST = '[^{}]+';
+
+/**
+ * `import [type] [Default][, ]{ … }|* as ns from '…'`. Each run of whitespace
+ * belongs to exactly one quantifier — adjacent optional `\\s*`s backtrack
+ * polynomially on long blank runs. A modifier — TypeScript `type`, Flow
+ * `typeof`, or `defer` (`import defer * as ns`) — is followed directly by
+ * `{`/`*`, or by whitespace and a name that is not `from` — `import type from
+ * '…'` (any spacing) is a default import NAMED `type`.
+ */
+const ES_IMPORT_RE = new RegExp(
+  `(?<![$.\\p{ID_Continue}])import(?:\\s+|(?=[{*]))(?:(?:type(?:of)?|defer)(?:\\s*(?=[{*])|\\s+(?!from(?![$\\p{ID_Continue}]))(?=[$_\\p{ID_Start}])))?` +
+    `(?:(${JS_IDENT})\\s*(?:,\\s*)?)?` +
+    `(?:\\{(${SPECIFIER_LIST})\\}\\s*)?` +
+    `(?:(\\*)\\s*as\\s+(${JS_IDENT})\\s*)?` +
+    `from\\s*['"]([^'"]+)['"]`,
+  'gu'
+);
+
+/** `export [type] * [as ns] from '…'`. */
+const WILDCARD_REEXPORT_RE = new RegExp(
+  `(?<![$.\\p{ID_Continue}])export(?![$\\p{ID_Continue}])\\s*(?:type(?![$\\p{ID_Continue}])\\s*)?\\*(?:\\s*as(?:\\s+${JS_IDENT}|\\s*(?:${JS_STRING})))?\\s*from\\s*['"]([^'"]+)['"]`,
+  'gu'
+);
+
+/** `export [type] { … } from '…'`. */
+const NAMED_REEXPORT_RE = new RegExp(
+  `(?<![$.\\p{ID_Continue}])export(?![$\\p{ID_Continue}])\\s*(?:type(?![$\\p{ID_Continue}])\\s*)?\\{(${SPECIFIER_LIST})\\}\\s*from\\s*['"]([^'"]+)['"]`,
+  'gu'
+);
+
+/**
+ * Split a comment-free specifier list on the commas between specifiers — not
+ * those inside a string name (`"a,b" as c`).
+ */
+function splitSpecifierList(list: string): string[] {
+  const out: string[] = [];
+  let start = 0;
+  let quote: string | null = null;
+  for (let i = 0; i < list.length; i++) {
+    const ch = list[i]!;
+    if (quote !== null) {
+      if (ch === '\\') i++;
+      else if (ch === quote) quote = null;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === ',') {
+      out.push(list.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(list.slice(start));
+  return out;
+}
+
+const SIMPLE_ESCAPES: Record<string, string> = { n: '\n', t: '\t', r: '\r', b: '\b', f: '\f', v: '\v', '0': '\0' };
+
+/** A captured `{ … }` list with its comments stripped (only when it has a `/` — most don't). */
+function cleanSpecifierList(list: string): string {
+  return list.includes('/') ? stripJsComments(list) : list;
+}
+
+/** A multi-line JSDoc `@import { … }` list without its ` * ` line prefixes. */
+function withoutJsDocPrefixes(list: string): string {
+  return list.replace(/^[ \t]*\*(?!\/)/gm, '');
+}
+
+/** A string-named specifier's name without its quotes, escapes decoded. */
+function unquoteSpecifier(name: string): string {
+  if (!/^["']/.test(name)) return name;
+  return name.slice(1, -1).replace(
+    /\\(u\{[0-9a-fA-F]+\}|u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|[\s\S])/g,
+    (_, esc: string) => {
+      if (esc[0] === 'u' || esc[0] === 'x') {
+        const hex = esc[1] === '{' ? esc.slice(2, -1) : esc.slice(1);
+        const code = parseInt(hex, 16);
+        return code <= 0x10ffff ? String.fromCodePoint(code) : esc;
+      }
+      return SIMPLE_ESCAPES[esc] ?? esc;
+    }
+  );
+}
+
+/**
+ * One `{ … }` import/export specifier — `a`, `a as b`, `"a-b" as c`, and the
+ * same with TypeScript's inline `type` modifier (`type a`, `type a as b`) — as
+ * the name it takes from the module and the name it binds (Flow's `typeof`
+ * modifier likewise). `type` alone, or `type as t`, is a specifier NAMED
+ * `type`. Null for anything else. Expects one comment-free item of a list
+ * split by {@link splitSpecifierList}.
+ */
+function parseSpecifier(raw: string): { imported: string; local: string } | null {
+  const item = raw.trim();
+  const alias = SPECIFIER_ALIAS.exec(item);
+  if (alias) return { imported: unquoteSpecifier(alias[1]!), local: unquoteSpecifier(alias[2]!) };
+  const plain = SPECIFIER_PLAIN.exec(item);
+  if (plain) {
+    const name = unquoteSpecifier(plain[1]!);
+    return { imported: name, local: name };
+  }
+  return null;
+}
+
 /**
  * Extract JS/TS import mappings
  */
 function extractJSImports(content: string): ImportMapping[] {
   const mappings: ImportMapping[] = [];
 
-  // ES6 imports
-  const importRegex = /import\s+(?:(\w+)\s*,?\s*)?(?:\{([^}]+)\})?\s*(?:(\*)\s+as\s+(\w+))?\s*from\s*['"]([^'"]+)['"]/g;
-
-  let match;
-  while ((match = importRegex.exec(content)) !== null) {
+  // ES6 imports (see ES_IMPORT_RE). matchAll iterates a copy, so the shared
+  // regex's lastIndex never leaks between calls.
+  for (const match of content.matchAll(ES_IMPORT_RE)) {
     const [, defaultImport, namedImports, star, namespaceAlias, source] = match;
 
     // Default import
@@ -918,21 +1039,17 @@ function extractJSImports(content: string): ImportMapping[] {
 
     // Named imports
     if (namedImports) {
-      const names = namedImports.split(',').map((s) => s.trim());
-      for (const name of names) {
-        const aliasMatch = name.match(/(\w+)\s+as\s+(\w+)/);
-        if (aliasMatch) {
+      // Comments inside the list are stripped first so a `,` in one can't split
+      // it. (Only the list: this regex also runs over whole SFCs, where a
+      // file-wide comment scan would desync on markup like `Don't`.)
+      // A JSDoc `@import` tag's list carries ` * ` line prefixes when it wraps.
+      const list = content[match.index! - 1] === '@' ? withoutJsDocPrefixes(namedImports) : namedImports;
+      for (const name of splitSpecifierList(cleanSpecifierList(list))) {
+        const specifier = parseSpecifier(name);
+        if (specifier) {
           mappings.push({
-            localName: aliasMatch[2]!,
-            exportedName: aliasMatch[1]!,
-            source: source!,
-            isDefault: false,
-            isNamespace: false,
-          });
-        } else if (name) {
-          mappings.push({
-            localName: name,
-            exportedName: name,
+            localName: specifier.local,
+            exportedName: specifier.imported,
             source: source!,
             isDefault: false,
             isNamespace: false,
@@ -954,6 +1071,7 @@ function extractJSImports(content: string): ImportMapping[] {
   }
 
   // Require statements
+  let match: RegExpExecArray | null;
   const requireRegex = /(?:const|let|var)\s+(?:(\w+)|{([^}]+)})\s*=\s*require\(['"]([^'"]+)['"]\)/g;
   while ((match = requireRegex.exec(content)) !== null) {
     const [, defaultName, destructured, source] = match;
@@ -1207,15 +1325,18 @@ export function clearImportMappingCache(): void {
 
 /**
  * Strip JS line + block comments from `content` while preserving
- * string literals (so `"//"` inside a string stays intact). Used by
- * {@link extractReExports} so commented-out export-from statements
- * don't generate phantom re-export edges.
+ * string literals (so `"//"` inside a string stays intact). A block
+ * comment becomes one space, so the tokens either side stay apart. Used by
+ * {@link extractReExports} over a whole file, so commented-out export-from
+ * statements don't generate phantom re-export edges, and by
+ * {@link extractJSImports} over just an import's `{ … }` list (which can come
+ * from an SFC — never run it over SFC markup: `Don't` would open a string).
  *
  * Scanner is deliberately small: it only tracks the three contexts
  * relevant for JS/TS — single-quote string, double-quote string, and
  * template literal. Comment recognition is the JS spec subset, no
  * regex-literal awareness (which is fine for our use case: we don't
- * apply this to function bodies, only to top-level files).
+ * apply this to function bodies, only to top-level files and import lists).
  */
 function stripJsComments(content: string): string {
   let out = '';
@@ -1248,6 +1369,8 @@ function stripJsComments(content: string): string {
       i += 2;
       while (i < content.length && !(content[i] === '*' && content[i + 1] === '/')) i++;
       i += 2;
+      // A space, not nothing: `A/**/as B` must stay two words.
+      out += ' ';
       continue;
     }
     out += ch;
@@ -1265,6 +1388,8 @@ function stripJsComments(content: string): string {
  *   export * from './a';
  *   export * as ns from './a';   (treated as wildcard for chasing)
  *   export { default as Foo } from './a';
+ *   and TypeScript's `type` forms of each: `export type { foo } from`,
+ *   `export { type foo } from`, `export type * from`.
  *
  * The walker intentionally stays regex-based — the import-resolver
  * elsewhere in this file already chooses regex over a fresh
@@ -1290,37 +1415,29 @@ export function extractReExports(content: string, language: Language): ReExport[
   // out of scope.)
   const cleaned = stripJsComments(content);
 
-  // Wildcard: `export * from '...'` or `export * as ns from '...'`
-  const wildcardRe = /export\s*\*(?:\s+as\s+\w+)?\s*from\s*['"]([^'"]+)['"]/g;
-  let m: RegExpExecArray | null;
-  while ((m = wildcardRe.exec(cleaned)) !== null) {
+  // Wildcard: `export * from '...'` or `export * as ns from '...'`, optionally `export type *`
+  for (const m of cleaned.matchAll(WILDCARD_REEXPORT_RE)) {
     out.push({ kind: 'wildcard', source: m[1]! });
   }
 
-  // Named: `export { a, b as c } from '...'`
-  const namedRe = /export\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]/g;
-  while ((m = namedRe.exec(cleaned)) !== null) {
+  // Named: `export { a, b as c } from '...'`, with TypeScript's `type`
+  // modifier on the list (`export type { … } from`) or an item (`{ type a }`).
+  // `[^{}]`, not `[^}]`: a specifier list never holds a brace, so an unclosed
+  // `{` stops at the next one instead of rescanning to the end of the file.
+  for (const m of cleaned.matchAll(NAMED_REEXPORT_RE)) {
     const inner = m[1]!;
     const source = m[2]!;
-    for (const raw of inner.split(',')) {
-      const item = raw.trim();
-      if (!item) continue;
-      const aliasMatch = item.match(/^(\w+)\s+as\s+(\w+)$/);
-      if (aliasMatch) {
-        out.push({
-          kind: 'named',
-          exportedName: aliasMatch[2]!,
-          originalName: aliasMatch[1]!,
-          source,
-        });
-      } else if (/^\w+$/.test(item)) {
-        out.push({
-          kind: 'named',
-          exportedName: item,
-          originalName: item,
-          source,
-        });
-      }
+    // Stripped again here: the file-wide pass above can lose its place (a JSX
+    // `Don't`, a regex literal holding a quote) and leave a comment in the list.
+    for (const raw of splitSpecifierList(cleanSpecifierList(inner))) {
+      const specifier = parseSpecifier(raw);
+      if (!specifier) continue;
+      out.push({
+        kind: 'named',
+        exportedName: specifier.local,
+        originalName: specifier.imported,
+        source,
+      });
     }
   }
 
