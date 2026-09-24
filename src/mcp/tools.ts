@@ -6,7 +6,7 @@
 
 import type CodeGraph from '../index';
 import type { QueryPool } from './query-pool';
-import { findNearestCodeGraphRoot } from '../directory';
+import { findNearestCodeGraphRoot, isSameIndexRoot } from '../directory';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
 // helper in engine.ts. ToolHandler must load to answer tools/list (static
 // schemas), but it must NOT drag in sqlite/query layers before the daemon binds;
@@ -1465,6 +1465,11 @@ const DEFAULT_MCP_TOOLS = new Set(['explore']);
 export class ToolHandler {
   // Cache of opened CodeGraph instances for cross-project queries
   private projectCache: Map<string, CodeGraph> = new Map();
+  // Another spelling of an open root (a symlinked checkout, a case-variant) →
+  // the projectCache key it shares a connection with (#1057). Kept apart from
+  // projectCache so that map still holds ONE key per instance: dropping that
+  // key drops the connection for every spelling, never leaves a closed one.
+  private rootAliases: Map<string, string> = new Map();
   // The directory the server last searched for a default project. Surfaced in
   // the "not initialized" error so users can see why detection missed.
   private defaultProjectHint: string | null = null;
@@ -1771,7 +1776,8 @@ export class ToolHandler {
     // support) that surfaces as intermittent
     // "database is locked" on concurrent tool calls. See issue #238. The
     // default instance is owned/closed by the server, so it's never cached.
-    if (this.cg && this.cg.getProjectRoot() === resolvedRoot) {
+    // Another spelling of the same root counts too (#1057).
+    if (this.cg && isSameIndexRoot(this.cg.getProjectRoot(), resolvedRoot)) {
       return this.freshen(this.cg);
     }
 
@@ -1780,6 +1786,24 @@ export class ToolHandler {
     // a changed resolution maps to a different entry instead of a stale hit.
     const cached = this.projectCache.get(resolvedRoot);
     if (cached) return this.freshen(cached);
+
+    // A new spelling of a root that is already open — a symlinked checkout, or
+    // a case-variant on a case-insensitive mount — is the SAME index. Serve it
+    // from the open connection instead of opening a second one to the same
+    // `.codegraph/codegraph.db` (#1057), and remember the spelling as an alias
+    // of that entry's key. An alias whose entry is gone is dropped, not served.
+    const aliasOf = this.rootAliases.get(resolvedRoot);
+    if (aliasOf !== undefined) {
+      const open = this.projectCache.get(aliasOf);
+      if (open) return this.freshen(open);
+      this.rootAliases.delete(resolvedRoot);
+    }
+    for (const [root, open] of this.projectCache) {
+      if (isSameIndexRoot(root, resolvedRoot)) {
+        this.rootAliases.set(resolvedRoot, root);
+        return this.freshen(open);
+      }
+    }
 
     const cg = loadCodeGraph().openSync(resolvedRoot);
     this.projectCache.set(resolvedRoot, cg);
@@ -1815,10 +1839,13 @@ export class ToolHandler {
    * Close all cached project connections
    */
   closeAll(): void {
-    for (const cg of this.projectCache.values()) {
+    // One key per instance by design; closing through a Set keeps a second
+    // close (which throws on node:sqlite) from ever stopping the loop.
+    for (const cg of new Set(this.projectCache.values())) {
       cg.close();
     }
     this.projectCache.clear();
+    this.rootAliases.clear();
     this.worktreeMismatchCache.clear();
   }
 

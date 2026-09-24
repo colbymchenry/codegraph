@@ -9,7 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { SchemaVersion } from '../types';
 import { runMigrations, getCurrentVersion, CURRENT_SCHEMA_VERSION } from './migrations';
-import { getCodeGraphDir } from '../directory';
+import { getCodeGraphDir, statInode } from '../directory';
 
 export { SqliteDatabase, SqliteBackend } from './sqlite-adapter';
 
@@ -833,23 +833,6 @@ export class DatabaseConnection {
     if (this.openedInode === null) return false;
     const current = statInode(this.dbPath);
     return current !== null && current !== this.openedInode;
-  }
-}
-
-/**
- * `dev:ino` for a path, or null if it can't be stat'd or the platform doesn't
- * report a usable inode. Windows st_ino is unreliable across handle reopens, so
- * we deliberately return null there — the deleted-but-open-inode hazard this
- * guards (#925) is a POSIX file-semantics issue that doesn't arise on Windows
- * (an open file can't be unlinked).
- */
-function statInode(p: string): string | null {
-  if (process.platform === 'win32') return null;
-  try {
-    const s = fs.statSync(p);
-    return `${s.dev}:${s.ino}`;
-  } catch {
-    return null;
   }
 }
 
