@@ -1211,15 +1211,15 @@ const NO_NESTED_FUNCTIONS = new Set<string>(['c', 'cpp']);
 const LOCAL_TYPE_KINDS = new Set<string>(['class', 'struct', 'enum', 'interface', 'trait', 'type_alias']);
 
 /**
- * A function nested inside another FUNCTION is only callable from within its
- * container — Python, JS/TS, and every closure language scope it lexically.
+ * A function nested inside another function, or an anonymous-class method
+ * inside a function, is only callable from within that container.
  * Resolving a bare name from elsewhere to a nested local fabricates an edge
  * scope already rules out: `join(...)` in one function must never bind to a
  * `join` defined inside a DIFFERENT function (#1230). A candidate whose
  * qualifiedName parent is a same-file function/method is kept only when the
- * ref originates inside that parent's line range. Class members are
- * unaffected (their parent resolves to a class-like node), as are top-level
- * symbols and C++ namespace-prefixed names (the prefix has no node).
+ * ref originates inside that parent's line range. Ordinary class members and
+ * top-level symbols have no enclosing function; C++ namespace prefixes have
+ * no function node.
  */
 export function isLexicallyReachable(
   candidate: Node,
@@ -12361,7 +12361,7 @@ export function matchMethodCall(
       return null;
     }
     const methods = methodCandidates.filter(
-      (n) => n.kind === 'method' && n.name === methodName
+      (n) => n.kind === 'method' && n.name === methodName && isLexicallyReachable(n, ref, context)
     );
 
     // Filter to same-language candidates first
