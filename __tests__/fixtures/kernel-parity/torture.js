@@ -92,3 +92,16 @@ function bucketChains(d, k, v) {
   arr[0]().go();
   obj.make().run().again();
 }
+// --- expression receivers ----------------------------------------------------
+async function exprReceivers(x) {
+  (await list()).map(g);
+  (x).run();
+  (a ?? b).map(g);
+  f().list.map(g);
+  (() => 1).call(null);
+  this.a.b.run();
+  new Runner().go();
+  new RegExp(p).exec(s);
+  (new ns.Widget(1)).draw();
+  new (pick())().go();
+}

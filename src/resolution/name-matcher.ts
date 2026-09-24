@@ -200,6 +200,50 @@ function applyLanguageGate(candidates: Node[], ref: UnresolvedRef): Node[] {
 }
 
 /**
+ * Programming languages for {@link isForeignCall}: the known families plus the
+ * singleton languages, with the single-file component formats in the web
+ * family. A language missing here (config, template, CFML, VB.NET…) is never
+ * gated.
+ */
+const CALL_FAMILY: Record<string, string> = {
+  ...LANGUAGE_FAMILY,
+  svelte: 'web', vue: 'web', astro: 'web',
+  python: 'python', go: 'go', rust: 'rust', php: 'php', ruby: 'ruby', dart: 'dart',
+  lua: 'lua', luau: 'lua', r: 'r', erlang: 'erlang', pascal: 'pascal', solidity: 'solidity',
+};
+
+/** Kinds that live inside a type — reachable by a bare name only from that type. */
+const MEMBER_KINDS = new Set(['method', 'property', 'field', 'enum_member']);
+
+/**
+ * Whether a bare-named call would cross a language family into a symbol it
+ * cannot reach. Across families a call is linked only through the C ABI: a
+ * C/C++ symbol, or a symbol a C, Objective-C or Swift caller reaches through a
+ * header (Swift calling a cgo `//export` function, C calling a Rust
+ * `extern "C"` one). Those are free functions, never a class member — a
+ * receiver-less call reaches a member only from inside the member's own type —
+ * and never another language's class or variable.
+ * Without this, a call that HAD a receiver but reached the resolver as the
+ * bare method name (`v.iter().map()` in Rust) matched a TypeScript class's
+ * `map`, and Kotlin's `Log.i(...)` a minified JavaScript function `i`.
+ * Applied to the ONE candidate a strategy would commit to, never to the
+ * candidate set: dropping foreign candidates from a crowd would leave a lone
+ * survivor and hand it every call of that name (`new URL(u).toString()` onto
+ * the one web-family `toString`).
+ */
+function isForeignCall(candidate: Node, ref: UnresolvedRef): boolean {
+  if (ref.referenceKind !== 'calls') return false;
+  const from = CALL_FAMILY[ref.language];
+  const to = CALL_FAMILY[candidate.language];
+  if (from === undefined || to === undefined || from === to) return false;
+  if (MEMBER_KINDS.has(candidate.kind)) return true;
+  if (candidate.kind === 'function') return !(to === 'c' || from === 'c' || from === 'apple');
+  // A C type or global (a struct initializer, a function-pointer variable)
+  // is reachable only from the languages that import C headers directly.
+  return !(to === 'c' && from === 'apple');
+}
+
+/**
  * Resolve a function-as-value reference (#756) — a function name used as a
  * callback/function-pointer value (`register(handler)`, `o->cb = handler`,
  * `{ .cb = handler }`, `signal(SIGINT, handler)`). The ONLY strategy allowed
@@ -786,7 +830,7 @@ export function matchByExactName(
 
   // If only one match, use it — but penalize cross-language matches
   if (candidates.length === 1) {
-    if (!isCrossFileReachable(candidates[0]!, ref, context)) return null;
+    if (!isCrossFileReachable(candidates[0]!, ref, context) || isForeignCall(candidates[0]!, ref)) return null;
     const isCrossLanguage = candidates[0]!.language !== ref.language;
     return {
       original: ref,
@@ -807,7 +851,7 @@ export function matchByExactName(
 
   // Multiple matches - try to narrow down
   const bestMatch = findBestMatch(ref, candidates, context);
-  if (bestMatch && isCrossFileReachable(bestMatch, ref, context)) {
+  if (bestMatch && isCrossFileReachable(bestMatch, ref, context) && !isForeignCall(bestMatch, ref)) {
     // Lower confidence when the match is from a distant/unrelated module
     const proximity = computePathProximity(ref.filePath, bestMatch.filePath);
     const confidence = proximity >= 30 ? 0.7 : 0.4;
@@ -3035,6 +3079,51 @@ function matchStoreAccessorChain(ref: UnresolvedRef, context: ResolutionContext)
   return { original: ref, targetNodeId: callables[0]!.id, confidence: 0.6, resolvedBy: 'exact-match' };
 }
 
+/**
+ * TS/JS constructor receiver `new Runner(args).run()`, encoded by the
+ * extractor as `new Runner().run`. The receiver is an instance of the class
+ * written at the call, so this shape resolves only through that class.
+ */
+export const NEW_RECEIVER_SHAPE = /^new ([\w$.]+)\(\)\.([\w$]+)$/;
+
+/**
+ * The class a `new C().m` ref constructs, as the name its declaration carries:
+ * `ns.Runner` → `Runner`, an aliased named import `R` → `Runner`. A JS/TS
+ * built-in (`RegExp`, `Map`, `Date`…) counts only when the file imports or
+ * declares a class of that name — otherwise a project class that merely
+ * shares the name would take every `new Map().get()` in the repo.
+ */
+export function newReceiverClass(ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const m = ref.referenceName.match(NEW_RECEIVER_SHAPE);
+  if (!m || !m[1]) return null;
+  const written = m[1];
+  const last = written.split('.').pop()!;
+  const imported = written.includes('.')
+    ? undefined
+    : context.getImportMappings(ref.filePath, ref.language).find((i) => i.localName === written);
+  if (imported && !imported.isDefault && !imported.isNamespace && /^[A-Za-z_$][\w$]*$/.test(imported.exportedName)) {
+    return imported.exportedName;
+  }
+  if (!imported && !written.includes('.') && JS_BUILT_INS.has(last) &&
+      !context.getNodesInFile(ref.filePath).some((n) => n.kind === 'class' && n.name === last)) {
+    return null;
+  }
+  return last;
+}
+
+/**
+ * Resolve a {@link NEW_RECEIVER_SHAPE} call on the constructed class or one of
+ * its supertypes (validated by resolveMethodOnType), or not at all: a class
+ * with no project declaration — `new URL(u).toString()` — has no project
+ * method to bind to.
+ */
+export function matchNewReceiverCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const cls = newReceiverClass(ref, context);
+  const method = ref.referenceName.match(NEW_RECEIVER_SHAPE)?.[2];
+  if (!cls || !method) return null;
+  return resolveMethodOnType(cls, method, ref, context, 0.9, 'instance-method');
+}
+
 /** Resolve the implementation inside the identified store, not a namesake or
  * an interface signature elsewhere in the project. Import resolution already
  * follows aliases/barrels; containment already excludes nested action locals. */
@@ -3423,6 +3512,7 @@ export function matchFuzzy(
     finalCandidates.length === 1 &&
     isVisibleAcrossFiles(finalCandidates[0]!, ref, context) &&
     isCrossFileReachable(finalCandidates[0]!, ref, context) &&
+    !isForeignCall(finalCandidates[0]!, ref) &&
     !(isBareJsCall(ref, context) &&
       (finalCandidates[0]!.kind === 'method' ||
         (finalCandidates[0]!.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context)))) &&
@@ -3665,6 +3755,9 @@ export function matchReference(
     ref.referenceName.includes('().') &&
     (ref.language === 'typescript' || ref.language === 'javascript' || ref.language === 'tsx' || ref.language === 'jsx' || ref.language === 'python')
   ) {
+    if (ref.referenceName.startsWith('new ')) {
+      return nmTimed('newReceiver', ref, () => matchNewReceiverCall(ref, context));
+    }
     return nmTimed('storeAccessorChain', ref, () => matchStoreAccessorChain(ref, context));
   }
 
