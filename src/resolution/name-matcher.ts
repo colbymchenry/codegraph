@@ -1705,7 +1705,8 @@ function kotlinDeclaredTypeIn(
     return kotlinReceiverDeclaredType(alias[1], ref, context, depth + 1);
   }
   // `(` or a trailing lambda `{`: `Thread { … }`, `thread { … }`.
-  const assigned = text.match(new RegExp(`\\b(?:val|var)\\s+${r}\\s*=\\s*([A-Za-z_][\\w.]*)\\s*[({]`));
+  // Type arguments are skipped: `WebRtcPlaneSession<IceCandidate>(plane)`.
+  const assigned = text.match(new RegExp(`\\b(?:val|var)\\s+${r}\\s*=\\s*([A-Za-z_][\\w.]*)\\s*(?:<[\\w\\s.,?*<>]*>\\s*)?[({]`));
   if (!assigned || !assigned[1]) {
     // An enum entry or other constant of a type: `var mode = GpsMode.ON`.
     const entry = text.match(new RegExp(`\\b(?:val|var)\\s+${r}\\s*=\\s*([A-Z]\\w*(?:\\.[A-Z]\\w*)*)\\.[A-Z][A-Z0-9_]*\\b(?!\\s*[.(])`));
@@ -1834,6 +1835,115 @@ function kotlinReceiverDeclaredType(
   // WebSocket` in an overridden callback).
   const param = inferLocalReceiverType(name, ref, context);
   return param && /^[A-Z]/.test(param) ? param : null;
+}
+
+/**
+ * The declared type of a Kotlin receiver chain `a.b.c` / `this.a.b`: the first
+ * value typed as a single receiver (`this` is the enclosing class, a type name
+ * its object or companion), each next segment as a property or enum entry
+ * declared in the class of the type before it, read from that class's own
+ * file. KOTLIN_EXTERNAL_TYPE as soon as a segment has a
+ * type the project does not declare; null when any segment's type is unknown
+ * (an inherited property, an ambiguous class name).
+ */
+function kotlinChainDeclaredType(
+  receiver: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  const segments = receiver.split('.');
+  if (segments.length < 2 || segments.length > 4) return null;
+
+  let owner: Node | undefined;
+  if (segments[0] === 'this') {
+    owner = context.getNodesInFile(ref.filePath)
+      .filter((n) => (n.kind === 'class' || n.kind === 'interface') && n.language === 'kotlin' &&
+        n.startLine <= ref.line && (n.endLine ?? n.startLine) >= ref.line)
+      .sort((a, b) => b.startLine - a.startLine)[0];
+    if (!owner) return null;
+  }
+  let type: string | null = owner ? null : kotlinReceiverDeclaredType(segments[0]!, ref, context);
+  if (!owner && !type && /^[A-Z]/.test(segments[0]!)) {
+    // An object or a class's companion: `Registry.current.load()`,
+    // `Mode.ON.next()`.
+    const classes = context.getNodesByName(segments[0]!).filter(
+      (n) => DECLARED_TYPE_KINDS.has(n.kind) && n.language === 'kotlin',
+    );
+    if (classes.length !== 1) return null;
+    owner = classes[0]!;
+  }
+  for (const segment of segments.slice(1)) {
+    if (!owner) {
+      if (!type) return null;
+      if (type === KOTLIN_EXTERNAL_TYPE || !isProjectType(type, ref, context)) return KOTLIN_EXTERNAL_TYPE;
+      const t = type;
+      const classes = context.getNodesByName(t.split('::').pop()!).filter(
+        (n) => DECLARED_TYPE_KINDS.has(n.kind) && n.language === 'kotlin' &&
+          (n.qualifiedName === t || n.qualifiedName.endsWith(`::${t}`)),
+      );
+      if (classes.length !== 1) return null;
+      owner = classes[0]!;
+    }
+    const inFile = context.getNodesInFile(owner.filePath);
+    const qualified = `${owner.qualifiedName}::${segment}`;
+    if (inFile.some((n) => n.kind === 'enum_member' && n.qualifiedName === qualified)) {
+      // An enum entry has its enum's type (`Outer::Mode`, package dropped).
+      type = kotlinTypeName(owner.qualifiedName.split('::').join('.'));
+      owner = undefined;
+      continue;
+    }
+    const property = inFile.find(
+      (n) => (n.kind === 'field' || n.kind === 'constant' || n.kind === 'variable') && n.qualifiedName === qualified,
+    ) ?? null;
+    // Read the declaration in the owner's file, as if the ref sat there.
+    const at: UnresolvedRef = { ...ref, filePath: owner.filePath, line: property?.startLine ?? owner.startLine };
+    type = inferKotlinPropertyType(segment, property, owner, inFile, at, context);
+    owner = undefined;
+  }
+  return type;
+}
+
+/** A Kotlin call through a receiver chain: `a.b.m`, `this.a.m`, `a.b.c.d.m`. */
+const KOTLIN_CHAIN_REF = /^((?:this|[A-Za-z_]\w*)(?:\.[A-Za-z_]\w*){1,3})\.(\w+)$/;
+
+/**
+ * A Kotlin call through a receiver chain (`engine.pump.drain()`), resolved on
+ * the chain's declared type. Null — no edge — when the chain ends in a type
+ * the project does not declare (or passes through one) and the project has
+ * no extension of that name on a library type. When the type is
+ * unknown, `{ method }` names the bare method for the caller to resolve, the
+ * ref the extractor emitted before it kept the chain. Undefined for a ref
+ * that is not a receiver chain.
+ */
+export function matchKotlinReceiverChain(
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null | { method: string } | undefined {
+  const m = ref.referenceName.match(KOTLIN_CHAIN_REF);
+  if (!m) return undefined;
+  const method = m[2]!;
+  const declared = kotlinChainDeclaredType(m[1]!, ref, context);
+  if (!declared) return { method };
+  if (declared !== KOTLIN_EXTERNAL_TYPE) {
+    const typed = resolveMethodOnType(declared, method, ref, context, 0.9, 'instance-method');
+    if (typed) return typed;
+    if (isProjectType(declared, ref, context)) return { method };
+  }
+  // A library type still reaches the project's own extensions of library
+  // types (`view.context.dp(8)` → `fun Context.dp()`).
+  return kotlinDeclaresLibraryExtension(method, ref, context) ? { method } : null;
+}
+
+/**
+ * Whether the project declares a Kotlin extension `method` on a type it does
+ * not declare itself (`fun Context.dp(…)`, indexed as `Context::dp`).
+ */
+function kotlinDeclaresLibraryExtension(method: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  return context.getNodesByName(method).some((n) => {
+    if ((n.kind !== 'method' && n.kind !== 'function') || n.language !== 'kotlin') return false;
+    const owner = n.qualifiedName.split('::').slice(-2, -1)[0];
+    return !!owner && /^[A-Z]/.test(owner) && !isProjectType(owner, ref, context);
+  });
 }
 
 // ── Local-variable receiver-type inference (#1108) ──────────────────────────

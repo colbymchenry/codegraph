@@ -87,6 +87,28 @@ fn strip_js_ws(s: &str) -> String {
     s.chars().filter(|c| !is_js_space(*c)).collect()
 }
 
+/// A receiver chain the resolver can type (TS `KOTLIN_RECEIVER_CHAIN`):
+/// whitespace stripped, `?.` read as `.`, then `this` or an identifier
+/// followed by one to three `.identifier` segments.
+fn kotlin_receiver_chain(text: &str) -> Option<String> {
+    let chain = strip_js_ws(text).replace("?.", ".");
+    let segments: Vec<&str> = chain.split('.').collect();
+    if segments.len() < 2 || segments.len() > 4 {
+        return None;
+    }
+    let ident = |s: &str| {
+        let b = s.as_bytes();
+        !b.is_empty()
+            && (b[0].is_ascii_alphabetic() || b[0] == b'_')
+            && b.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+    };
+    if segments.iter().all(|s| ident(s)) {
+        Some(chain)
+    } else {
+        None
+    }
+}
+
 /// A property's CODE children: the named child right after the `=` token, a
 /// `property_delegate` (`by lazy { … }`), and an accessor the grammar nested
 /// under the declaration (`val x: Int get() = compute()` — written on ONE line;
@@ -1209,9 +1231,17 @@ impl<'t> Walker<'t> {
                     } else {
                         method_name.to_string()
                     };
+                } else if let Some(chain) = receiver
+                    .filter(|r| r.kind() == "navigation_expression")
+                    .and_then(|r| kotlin_receiver_chain(self.text(r)))
+                {
+                    // Receiver chain `a.b` / `this.a` / `a?.b`: kept for the
+                    // resolver to type through the properties' declared types.
+                    callee_name = format!("{chain}.{method_name}");
                 } else {
-                    // this_expression / super_expression / 2-hop nav /
-                    // postfix `!!` / parenthesized → bare method name.
+                    // this_expression / super_expression / a longer or
+                    // non-identifier chain / postfix `!!` / parenthesized →
+                    // bare method name.
                     callee_name = method_name.to_string();
                 }
             }

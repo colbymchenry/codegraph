@@ -145,7 +145,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
-- Kotlin calls through a class property, a primary-constructor property, or a variable set from a function call now resolve on the declared type, and a call on a library type (such as `Regex` or a JDK class) no longer links to an unrelated project method with the same name. Re-index Kotlin projects to pick this up.
+- Kotlin calls through a class property, a primary-constructor property, or a variable set from a function call now resolve on the declared type, and a call on a library type (such as `Regex` or a JDK class) no longer links to an unrelated project method with the same name. Chained receivers such as `engine.pump.drain()`, `this.engine.drain()` and `Mode.ON.next()` resolve the same way. Re-index Kotlin projects to pick this up.
 - Kotlin `fun interface` declarations are indexed, and no longer hide the declaration that follows them.
 
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
