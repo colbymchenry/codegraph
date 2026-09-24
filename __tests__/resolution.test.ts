@@ -89,14 +89,24 @@ public class Selected {
     public static final Creator CREATOR = new Creator() { public int createFromParcel() { return 2; } };
     public interface Creator { int createFromParcel(); }
 }`,
+        'r/A.java': `package r;
+class A { static final Companion INSTANCE = new Companion(); static class Companion { void m() {} } }`,
+        'r/B.java': `package r;
+class B { static final Companion INSTANCE = new Companion(); static class Companion { void m() {} } }`,
         'r/Consumer.java': `package r;
 import p.Selected;
 import java.util.Map;
 interface Runner { void run(); }
+interface Consts { Helper HELPER = new Helper(); }
+class Helper { void go() {} }
+class Parent { static final Helper H = new Helper(); }
+class Child extends Parent {}
+class Util { static class IO { static void read() {} } }
 class Impl implements Runner {
     static final Runner INSTANCE = new Impl();
     public void run() {}
 }
+class Conditional { static final Runner INSTANCE = true ? new Impl() : new Impl(); }
 enum Mode { ON; int label() { return 1; } }
 class Holder { static final Map<String, String> LOOKUP = null; }
 class Decoy { String get(String key) { return key; } boolean equals(Object value) { return false; } }
@@ -106,6 +116,11 @@ public class Consumer {
     int enumCall() { return Mode.ON.label(); }
     boolean enumEquals() { return Mode.ON.equals(null); }
     void interfaceCall() { Impl.INSTANCE.run(); }
+    void conditionalCall() { Conditional.INSTANCE.run(); }
+    void nestedType() { B.INSTANCE.m(); }
+    void interfaceField() { Consts.HELPER.go(); }
+    void inheritedField() { Child.H.go(); }
+    void capsType() { Util.IO.read(); }
 }`,
       })) {
         const target = path.join(tempDir, file);
@@ -124,7 +139,12 @@ public class Consumer {
       expect(targets('miss')).toEqual([]);
       expect(targets('enumCall')).toEqual(['r::Mode::label']);
       expect(targets('enumEquals')).toEqual([]);
-      expect(targets('interfaceCall')).toEqual(['r::Runner::run']);
+      expect(targets('interfaceCall')).toEqual(['r::Impl::run']);
+      expect(targets('conditionalCall')).toEqual(['r::Runner::run']);
+      expect(targets('nestedType')).toEqual(['r::B::Companion::m']);
+      expect(targets('interfaceField')).toEqual(['r::Helper::go']);
+      expect(targets('inheritedField')).toEqual(['r::Helper::go']);
+      expect(targets('capsType')).toEqual(['r::Util::IO::read']);
       const declaration = cg.searchNodes('run').map(r => r.node)
         .find(n => n.qualifiedName === 'r::Runner::run')!;
       expect(cg.getCallees(declaration.id).some(c =>

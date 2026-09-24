@@ -2534,6 +2534,32 @@ export function matchMethodCall(
       (n.kind === 'constant' || n.kind === 'field' || n.kind === 'property' || n.kind === 'enum_member') &&
       n.language === 'java' && n.qualifiedName.endsWith(`::${fieldQn}`) &&
       (!ownerFqn || n.qualifiedName.replace(/::/g, '.') === `${ownerFqn}.${fieldName}`));
+    if (fields.length === 0) {
+      const ownerName = owner!.split('.').pop()!;
+      const ownerNodes = context.getNodesByName(ownerName).filter(n =>
+        n.kind === 'class' && n.language === 'java' &&
+        n.qualifiedName.endsWith(`::${owner!.replace(/\./g, '::')}`) &&
+        (!ownerFqn || n.qualifiedName.replace(/::/g, '.') === ownerFqn));
+      if (ownerNodes.length === 1) {
+        const child = ownerNodes[0]!;
+        const nestedType = `${child.qualifiedName}::${fieldName}`;
+        if (context.getNodesByQualifiedName(nestedType).some(n =>
+          n.kind === 'class' || n.kind === 'interface')) {
+          const nestedMethod = context.getNodesByQualifiedName(`${nestedType}::${methodName}`)
+            .find(n => n.kind === 'method');
+          if (nestedMethod) return { original: ref, targetNodeId: nestedMethod.id,
+            confidence: 0.9, resolvedBy: 'qualified-name' };
+        }
+        const header = context.readFile(child.filePath)?.split('\n')
+          .slice(child.startLine - 1, Math.min(child.endLine, child.startLine + 4)).join(' ') ?? '';
+        const parentName = /\bextends\s+([\w.]+)/.exec(header)?.[1]?.split('.').pop();
+        if (parentName) {
+          fields = context.getNodesByName(fieldName!).filter(n =>
+            (n.kind === 'constant' || n.kind === 'field') && n.language === 'java' &&
+            n.qualifiedName === `${child.qualifiedName.slice(0, child.qualifiedName.lastIndexOf('::'))}::${parentName}::${fieldName}`);
+        }
+      }
+    }
     if (fields.length > 1) {
       const local = fields.filter(n => n.filePath === ref.filePath);
       if (local.length === 1) fields = local;
@@ -2575,8 +2601,30 @@ export function matchMethodCall(
     }
     const declaredType = field.signature?.slice(0, field.signature.lastIndexOf(field.name)).trim();
     const typeName = declaredType ? normalizeInferredTypeName(declaredType) : null;
-    return typeName ? resolveMethodOnType(typeName, methodName!, ref, context, 0.9,
-      'instance-method', importedFqnOf(typeName, ref, context)) : null;
+    if (!typeName) return null;
+    const fieldOwner = field.qualifiedName.slice(0, field.qualifiedName.lastIndexOf('::'));
+    const fieldSource = context.readFile(field.filePath)?.split('\n')
+      .slice(field.startLine - 1, field.endLine).join('\n') ?? '';
+    const initializedType = field.kind === 'constant'
+      ? new RegExp(`\\b${field.name}\\s*=\\s*new\\s+([\\w.]+)\\s*\\(`).exec(fieldSource)?.[1]
+      : undefined;
+    const receiverType = initializedType?.split('.').pop() ?? typeName;
+    const types = context.getNodesByName(receiverType).filter(n =>
+      (n.kind === 'class' || n.kind === 'interface') && n.language === 'java');
+    const nested = types.filter(n => n.qualifiedName === `${fieldOwner}::${receiverType}`);
+    const typeRef = { ...ref, filePath: field.filePath };
+    const importedType = importedFqnOf(receiverType, typeRef, context);
+    const imported = importedType
+      ? types.filter(n => n.qualifiedName.replace(/::/g, '.') === importedType) : [];
+    const packageName = /\bpackage\s+([\w.]+)\s*;/.exec(context.readFile(field.filePath) ?? '')?.[1];
+    const samePackage = packageName
+      ? types.filter(n => n.qualifiedName === `${packageName.replace(/\./g, '::')}::${receiverType}`) : [];
+    const chosen = [nested, imported, samePackage, types].find(group => group.length === 1)?.[0];
+    if (!chosen) return null;
+    const target = context.getNodesByName(methodName!).find(n =>
+      n.kind === 'method' && n.qualifiedName === `${chosen.qualifiedName}::${methodName}`);
+    return target ? { original: ref, targetNodeId: target.id,
+      confidence: 0.9, resolvedBy: 'instance-method' } : null;
   }
 
   // Strategy 1: Direct class name match (existing logic). When the receiver
@@ -3734,8 +3782,23 @@ export function matchReference(
   // 2. Method call pattern
   result = nmTimed('methodCall', ref, () => matchMethodCall(ref, context));
   if (result) return result;
-  if (ref.language === 'java' && ref.referenceKind === 'calls' &&
-      JAVA_STATIC_FIELD_CALL.test(ref.referenceName)) return null;
+  if (ref.language === 'java' && ref.referenceKind === 'calls') {
+    const staticField = JAVA_STATIC_FIELD_CALL.exec(ref.referenceName);
+    if (staticField) {
+      const [, owner, fieldName] = staticField;
+      const ownerName = owner!.split('.').pop()!;
+      const importedOwner = importedFqnOf(owner!.split('.')[0]!, ref, context);
+      const projectOwner = context.getNodesByName(ownerName).some(n =>
+        (n.kind === 'class' || n.kind === 'interface' || n.kind === 'enum') &&
+        n.language === 'java' && n.qualifiedName.endsWith(`::${owner!.replace(/\./g, '::')}`) &&
+        (!importedOwner || n.qualifiedName.replace(/::/g, '.') ===
+          importedOwner + owner!.slice(owner!.split('.')[0]!.length)));
+      const indexedField = context.getNodesByName(fieldName!).some(n =>
+        (n.kind === 'constant' || n.kind === 'field' || n.kind === 'property') &&
+        n.language === 'java' && n.qualifiedName.endsWith(`::${owner!.replace(/\./g, '::')}::${fieldName}`));
+      if (!projectOwner || indexedField) return null;
+    }
+  }
 
   // 3. Exact name match
   result = nmTimed('exactName', ref, () => matchByExactName(ref, context));
