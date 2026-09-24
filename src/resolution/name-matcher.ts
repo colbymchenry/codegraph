@@ -1574,6 +1574,12 @@ function inferJavaFieldReceiverType(
       n.startLine >= enclosing.startLine &&
       (n.endLine ?? n.startLine) <= enclosingEnd,
   );
+  // Kotlin keeps no signature on a property, and a primary-constructor
+  // property (`class A(private val repo: Repo)`) is no node at all, so the
+  // declared type has to be read from the declaration itself.
+  if (ref.language === 'kotlin') {
+    return inferKotlinPropertyType(receiverName, field ?? null, enclosing, inFile, ref, context);
+  }
   if (!field || !field.signature) return null;
 
   // Signature shape: "<TypeName> <fieldName>" (extractField). Pull the type,
@@ -1592,6 +1598,59 @@ function inferJavaFieldReceiverType(
   if (!lastPart) return null;
   if (!/^[A-Z]/.test(lastPart)) return null; // primitives / lowercase → skip
   return lastPart;
+}
+
+/**
+ * The declared type of a Kotlin property named `name` in class `owner`: from
+ * the property's own declaration lines when it is a node (`lateinit var repo:
+ * Repo`, `val repo = Repo(…)`), otherwise from the class header, where a
+ * primary-constructor property (`class A(private val repo: Repo)`) lives. The
+ * header is the class's lines before its first member, so a same-named local
+ * inside a method body is never read as the property. Returns null when no
+ * declaration names a type; resolveMethodOnType still validates the method.
+ */
+function inferKotlinPropertyType(
+  name: string,
+  property: Node | null,
+  owner: Node,
+  inFile: Node[],
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  const lines = context.getFileLines
+    ? context.getFileLines(ref.filePath)
+    : (context.readFile(ref.filePath)?.split(/\r?\n/) ?? null);
+  if (!lines || lines.length === 0) return null;
+
+  const r = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const typed = new RegExp(`\\b(?:val|var)\\s+${r}\\s*:\\s*([A-Z][\\w.]*)`);
+  const constructed = new RegExp(`\\b(?:val|var)\\s+${r}\\s*=\\s*([A-Z][\\w.]*)\\s*\\(`);
+  const readType = (from: number, to: number): string | null => {
+    const text = lines.slice(Math.max(0, from - 1), Math.min(lines.length, to)).join('\n');
+    const m = text.match(typed) ?? text.match(constructed);
+    if (!m || !m[1]) return null;
+    // A nested type (`HardwareLock.Lease`) keeps its outer type, joined the
+    // way qualified names are, so resolveMethodOnType matches that `Lease`
+    // and not another class's; a package prefix (lowercase) is dropped.
+    const segments = m[1].split('.');
+    let first = segments.length;
+    while (first > 0 && /^[A-Z]/.test(segments[first - 1]!)) first--;
+    const typeSegments = segments.slice(first);
+    if (typeSegments.length > 1) return typeSegments.join('::');
+    return normalizeInferredTypeName(m[1]);
+  };
+
+  if (property) return readType(property.startLine, property.endLine ?? property.startLine);
+
+  const ownerEnd = owner.endLine ?? owner.startLine;
+  let firstMember = ownerEnd + 1;
+  for (const n of inFile) {
+    if (n.id === owner.id || n.kind === 'file') continue;
+    if (n.startLine > owner.startLine && n.startLine <= ownerEnd && n.startLine < firstMember) {
+      firstMember = n.startLine;
+    }
+  }
+  return readType(owner.startLine, firstMember - 1);
 }
 
 // ── Local-variable receiver-type inference (#1108) ──────────────────────────
