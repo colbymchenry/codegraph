@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -124,6 +124,18 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
   // when the watched DB files keep advancing (a slow synchronous SQLite
   // statement on degraded storage). ---
 
+  // The watched `db-wal` files each live in their own temp dir; remove them all
+  // once the spawned children are done with them.
+  const walDirs: string[] = [];
+  afterAll(() => {
+    for (const dir of walDirs) fs.rmSync(dir, { recursive: true, force: true });
+  });
+  function mkWal(): string {
+    const dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'cg-wd-'));
+    walDirs.push(dir);
+    return path.join(dir, 'db-wal');
+  }
+
   /** Grow `file` every 150ms for `forMs`; resolves when done. */
   function growFile(file: string, forMs: number): Promise<void> {
     return new Promise((resolve) => {
@@ -133,7 +145,7 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
   }
 
   it('does NOT kill a blocked loop while the watched files advance (slow store, not a wedge)', async () => {
-    const tmp = path.join(fs.mkdtempSync(path.join(require('os').tmpdir(), 'cg-wd-')), 'db-wal');
+    const tmp = mkWal();
     fs.writeFileSync(tmp, 'seed');
     // Base timeout 500ms; the loop blocks for 2.5s (5 timeouts, under the 10×
     // cap) while the test process grows the watched file. Old behavior: killed
@@ -152,7 +164,7 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
   }, 15000);
 
   it('still kills a blocked loop when the watched files do NOT advance (a true wedge)', async () => {
-    const tmp = path.join(fs.mkdtempSync(path.join(require('os').tmpdir(), 'cg-wd-')), 'db-wal');
+    const tmp = mkWal();
     fs.writeFileSync(tmp, 'seed');
     // Same blocked loop, nobody grows the file: the base timeout kills it long
     // before its own exit(5) at 2.5s.
@@ -166,7 +178,7 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
   }, 15000);
 
   it('kills at the hard cap even with ongoing file activity (bounded deferral)', async () => {
-    const tmp = path.join(fs.mkdtempSync(path.join(require('os').tmpdir(), 'cg-wd-')), 'db-wal');
+    const tmp = mkWal();
     fs.writeFileSync(tmp, 'seed');
     // Base timeout 300ms ⇒ cap 3s. The loop blocks for 8s with continuous file
     // growth: deferral carries it past 300ms but the cap kills it around ~3s,

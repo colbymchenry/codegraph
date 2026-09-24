@@ -35,8 +35,17 @@ function hasOpenssl(): boolean {
 }
 const CAN_NET = !isWindows && hasOpenssl();
 
+// Every temp dir the file makes, removed once at the end — the helpers below
+// hand their dirs to many tests, so no single test owns the cleanup.
+const tmpDirs: string[] = [];
+afterAll(() => {
+  for (const dir of tmpDirs) fs.rmSync(dir, { recursive: true, force: true });
+});
+
 function mkTmp(label: string): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), `cg-shim-${label}-`));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `cg-shim-${label}-`));
+  tmpDirs.push(dir);
+  return dir;
 }
 
 // A temp dir standing in for the installed @colbymchenry/codegraph main package.
