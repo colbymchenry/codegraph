@@ -191,15 +191,59 @@ Inspect the warnings and candidate locations before interpreting a result.
 
 ## Public reference projects
 
-These public AOSP revisions provide reproducible source inputs. The targets are
-examples to inspect, not a claim that every tool or extraction backend passes
-every case.
+The following sparse checkout was fetched from the official `android17-release`
+and `androidx-main` branches on 2026-09-24. It contains selected framework,
+SystemUI, Car, HAL, JNI, and RecyclerView paths, not a complete Android checkout.
 
 | Project | Reference revision | Example targets |
 |---------|--------------------|-----------------|
-| Android framework | [1cdfff555f4a](https://android.googlesource.com/platform/frameworks/base/+/1cdfff555f4a21f71ccc978290e2e212e2f8b168) | `IPowerManager`, `Process`, the power service |
-| HAL interfaces | [1a56e38edc2f](https://android.googlesource.com/platform/hardware/interfaces/+/1a56e38edc2f2f6189ef405ee1edce554e15cbc0) | `IVehicle`, `ICameraProvider`, `ITelephony` |
-| Android Automotive services | [6420d77b1b5b](https://android.googlesource.com/platform/packages/services/Car/+/6420d77b1b5b8b47a38c24571757fb40f708fe9e) | `AppCardService`, `BugStorageProvider`, `CarBugreportManagerService` |
+| Android framework | [`94b4c163b7df`](https://android.googlesource.com/platform/frameworks/base/+/94b4c163b7dfe5ce3607f7bb8456f9573f7de57d) | `IPowerManager`, `Process`, SystemUI, power service |
+| HAL interfaces | [`0162af698935`](https://android.googlesource.com/platform/hardware/interfaces/+/0162af698935100a590b7359581ac8b1b80693e5) | `IVehicle` |
+| Android Automotive services | [`9f04df65daa8`](https://android.googlesource.com/platform/packages/services/Car/+/9f04df65daa8b9a65ee05fd4039fe95446874d76) | `CarBugreportManagerService` |
+| AndroidX | [`6cdbceb4ce99`](https://android.googlesource.com/platform/frameworks/support/+/6cdbceb4ce99c517b94fb859776bceebc9aae5ff) | RecyclerView |
+
+### Observed results on these revisions
+
+On macOS with Node 24.21.0, CodeGraph 1.6.0, and `CODEGRAPH_KERNEL=0`,
+the combined sparse checkout indexed 8,485 source files. The commands below
+used the Android tools branch with `codegraph <command> <target> -p <checkout> -j`.
+These are observed source and index matches, not runtime Android tests.
+
+| Command and target | Observed result |
+|--------------------|-----------------|
+| `aidl-impl IPowerManager` | `found`; one `PowerManagerService.BinderService` implementation candidate, package verified |
+| `jni-bridge Process` | `found`; 39 native declarations, 35 implementation matches, 3 registration hits |
+| `hal-interface IVehicle` | `found`; four candidates, including one package mismatch and three unverified packages |
+| `system-service PowerManagerService` | `found`; one `publishBinderService` registration |
+| `trace-permission android.permission.CAMERA` | Two SystemUI manifest XML matches; no check or enforcement site in the sparse checkout |
+| `trace-broadcast android.intent.action.BOOT_COMPLETED` | No sender or receiver literal match in the sparse checkout |
+| `messenger-ipc TakeScreenshot` | `found`; three provider evidence sites, no client site |
+| `content-provider PeopleProvider` | `found`; one manifest declaration, no client site |
+| `local-socket-ipc CarBugreportManagerService` | `found`; three client evidence sites, no server evidence |
+| `messenger-ipc AppCard` / `content-provider BugStorageProvider` | No provider found; those classes were absent from the selected Car paths |
+
+The maintainer's PR #1872 review used 11,489 **decompiled** SystemUI and
+AndroidX Java files. This run uses current source files instead, so the counts
+are not directly comparable. To repeat the review's three Java checks, the
+baseline was upstream `main` at `ba3c21e` and the comparison was the Java/Kotlin
+inheritance branch at `31188e4193eb`. In the combined checkout, the baseline linked the
+`IKeyguardService.Stub` reference in `KeyguardService.java` to an unrelated
+`AllowlistProviderService.Stub`; the comparison left it unresolved because
+the generated Stub class was absent. Seventeen SystemUI `OnClickListener`
+inheritance references (including `View.OnClickListener`) linked to an unrelated
+SystemUI class in the baseline and zero did in the comparison. In isolated
+AndroidX, `LinearLayoutManager` resolved to its
+own `RecyclerView.LayoutManager` only in the comparison. The combined checkout
+also contains an AOSP internal `RecyclerView.LayoutManager`; the core branch
+was updated to disambiguate that collision by source-tree proximity.
+
+For the TypeScript control, the same 240 upstream `src/` files produced 8,439
+nodes and 26,172 edges in both builds; the sorted edge rows had the same
+SHA-256 (`0b5ff27c3eed7ccae74af7f95ccd0f2870a1655a3e726f22d48ab0d55d9f546a`).
+Standalone `aidl-impl IKeyguardService` returned `no_implementation_found`;
+with the core inheritance change applied, it found one verified anonymous Stub
+implementation in `KeyguardService.java:410`. The latter checks the two PRs
+together and is not a standalone claim for the Android tools PR.
 
 Record the CodeGraph commit, source revision, extraction backend, query, and
 actual result when validating a case. Check the returned file and reference
@@ -215,8 +259,7 @@ npm run build
 npx vitest run __tests__/aosp-*.test.ts
 ```
 
-The GitHub CI workflow runs portable-engine tests separately from native kernel
-parity and Android analysis tests. A successful run on one backend does not
-establish parity with the other. See [Contributing](../../CONTRIBUTING.md) for
-the build workflow and [the validation guide](../AGENTS.md) for real-repository
-and agent evaluation requirements.
+A successful run on one extraction backend does not establish parity with the
+other. See the [project guide](../../AGENTS.md) for build commands and the
+[validation guide](../AGENTS.md) for real-repository and agent evaluation
+requirements.
