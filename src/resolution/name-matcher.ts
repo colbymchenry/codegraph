@@ -13645,7 +13645,12 @@ export function matchMethodCall(
       }
 
       const nodesInFile = context.getNodesInFile(classNode.filePath);
-      const methodNode = nodesInFile.find((n) => isClassStrategyMethod(n, classNode, methodName!));
+      const methodNode = nodesInFile.find(
+        (n) =>
+          n.kind === 'method' &&
+          n.name === methodName &&
+          isMemberOf(n, classNode.name)
+      );
 
       if (methodNode) {
         return {
@@ -13726,7 +13731,12 @@ export function matchMethodCall(
         if (classNode.language !== ref.language) continue;
 
         const nodesInFile = context.getNodesInFile(classNode.filePath);
-        const methodNode = nodesInFile.find((n) => isClassStrategyMethod(n, classNode, methodName!));
+        const methodNode = nodesInFile.find(
+          (n) =>
+            n.kind === 'method' &&
+            n.name === methodName &&
+            isMemberOf(n, classNode.name)
+        );
 
         if (methodNode) {
           return {
@@ -14955,6 +14965,19 @@ function matchTsThisFieldCall(
     return resolveMethodOnType(typeName, methodName, ref, context, 0.85, 'instance-method');
   }
   return null;
+}
+
+/**
+ * Whether `member`'s qualified name puts it directly under a type named
+ * `typeName` — the segment before its own name, generic arguments and any
+ * dotted namespace stripped (`ns.Logger<T>::log` → `Logger`). A substring
+ * test is not enough: `FileLogger::log` contains `Logger`.
+ */
+function isMemberOf(member: Node, typeName: string): boolean {
+  const parts = member.qualifiedName.split('::');
+  if (parts.length < 2) return false;
+  const owner = parts[parts.length - 2]!.replace(/<.*$/, '');
+  return owner.slice(owner.lastIndexOf('.') + 1) === typeName;
 }
 
 /**
