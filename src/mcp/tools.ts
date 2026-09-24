@@ -7,6 +7,15 @@
 import type CodeGraph from '../index';
 import type { QueryPool } from './query-pool';
 import { findNearestCodeGraphRoot } from '../directory';
+import { findAidlImpl } from '../aosp/aidl';
+import { findJniBridge } from '../aosp/jni';
+import { findHalInterface } from '../aosp/hal';
+import { analyzeSystemService } from '../aosp/system_service';
+import { tracePermission, traceBroadcast } from '../aosp/permission_broadcast';
+import { findMessengerIpc } from '../aosp/messenger';
+import { findContentProviderImpl } from '../aosp/content_provider';
+import { findLocalSocketIpc } from '../aosp/local_socket';
+import type { PackageReachability } from '../aosp/common';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
 // helper in engine.ts. ToolHandler must load to answer tools/list (static
 // schemas), but it must NOT drag in sqlite/query layers before the daemon binds;
@@ -1286,6 +1295,155 @@ export const tools: ToolDefinition[] = [
     annotations: READ_ONLY_ANNOTATIONS,
   },
   {
+    name: 'codegraph_aidl_impl',
+    description: 'AOSP extension. Find Kotlin/Java implementations of an AIDL interface (Stub subclasses, service registrations) using the indexed graph — no generated stub sources or Gradle classpath required. Fail-closed: an interface with no in-repo implementation returns status "no_implementation_found" with evidence of what was searched, not a false positive.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        interfaceName: {
+          type: 'string',
+          description: 'AIDL interface name as declared in the .aidl file, e.g. "IValetModeService"',
+        },
+        projectPath: projectPathProperty,
+      },
+      required: ['interfaceName'],
+    },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
+    name: 'codegraph_jni_bridge',
+    description: 'AOSP extension. Trace a Java/Kotlin class\'s native/external declarations to a matching native (C/C++) implementation and, independently, a confirmed RegisterNatives registration. Returns status "found" only when BOTH a naming-convention match AND a RegisterNatives registration confirmed to target THIS exact class are present — confirmed either by a nearby FindClass(...) argument naming this package+class (regardless of file), or by same-file correlation with the impl match when no FindClass(...) argument can be found nearby. A registration whose FindClass(...) argument names a different package (a same-file, same-bare-name class collision) is excluded, not counted. A name match alone, or an excluded registration, is reported as "convention_derived_candidate" — never conflated with a confirmed bridge. The status is per-CLASS, not per-method: if the class declares several native methods, "found" means at least one method-name matched and the class-level RegisterNatives call was confirmed — it does not independently confirm every declared method.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        className: {
+          type: 'string',
+          description: 'Simple class name to trace, e.g. "Process"',
+        },
+        projectPath: projectPathProperty,
+      },
+      required: ['className'],
+    },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
+    name: 'codegraph_hal_interface',
+    description: 'AOSP extension. Find who implements an AIDL or HIDL HAL interface declared under hardware/interfaces/. Same declaration -> implementation -> registration contract as codegraph_aidl_impl, extended with a native (c/cpp) implementation-name search since HAL implementations are commonly native.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        halName: {
+          type: 'string',
+          description: 'HAL interface name as declared in the .aidl/.hal file, e.g. "ICamera"',
+        },
+        halType: {
+          type: 'string',
+          description: 'HAL interface style (default: aidl)',
+          enum: ['aidl', 'hidl'],
+        },
+        projectPath: projectPathProperty,
+      },
+      required: ['halName'],
+    },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
+    name: 'codegraph_system_service',
+    description: 'AOSP extension. Analyze a system service\'s lifecycle: the {Name}ManagerService class, its ServiceManager.addService registration, SystemServer startup site, and getSystemService client usage. "found" requires the exact service class AND either (a) a registration hit in the SAME FILE as that class, or (b) a startup site naming the exact class (accepted cross-file, since AOSP conventionally starts a service from SystemServer, a different file). Client usage is evidence only and cannot promote a candidate to "found".',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        serviceName: {
+          type: 'string',
+          description: 'Lowercase service name, e.g. "power", "window", "activity"',
+        },
+        projectPath: projectPathProperty,
+      },
+      required: ['serviceName'],
+    },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
+    name: 'codegraph_trace_permission',
+    description: 'AOSP extension. Pure text-candidate search for a permission string: XML line matches (including uses; not parsed into element kinds), checkPermission call sites, and enforcePermission call sites. Reports only what matched — no found/not-found claim.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        permission: {
+          type: 'string',
+          description: 'Permission string, e.g. "android.permission.CAMERA"',
+        },
+        projectPath: projectPathProperty,
+      },
+      required: ['permission'],
+    },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
+    name: 'codegraph_trace_broadcast',
+    description: 'AOSP extension. Pure text-candidate search for a broadcast action string: sendBroadcast call sites and onReceive sites matching it on the same line (does not catch the common "action checked inside the method body" shape — see evidence). Reports only what matched.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          description: 'Broadcast action string, e.g. "android.intent.action.BOOT_COMPLETED"',
+        },
+        projectPath: projectPathProperty,
+      },
+      required: ['action'],
+    },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
+    name: 'codegraph_messenger_ipc',
+    description: 'AOSP extension. Detect Messenger/Handler-based IPC — a real AOSP/AAOS shape none of the other AOSP tools recognize (a provider class wraps a Handler in `new Messenger(handler)` instead of an AIDL Stub; a client/manager class holds a Messenger reference and calls .send()). Tries the {Name}Service/{Name} provider naming convention and the {Name}ServiceManager/{Name}Manager client convention, same shape as codegraph_system_service. "found" requires the provider class to exist AND touch Messenger somewhere in its own body (construction or field-type reference, in either Java or Kotlin syntax) — a bare naming match alone is convention_derived_candidate.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Base name to build provider/client class-name candidates from, e.g. "AppCard" for AppCardService/AppCardServiceManager',
+        },
+        projectPath: projectPathProperty,
+      },
+      required: ['name'],
+    },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
+    name: 'codegraph_content_provider',
+    description: 'AOSP extension. Find a ContentProvider implementation — a real AOSP/AAOS shape none of the other AOSP tools recognize (data exposed through android.content.ContentProvider rather than a Binder interface). "found" requires a real `extends ContentProvider` clause CodeGraph tried and failed to resolve (the same discipline codegraph_aidl_impl applies to Stub subclasses). Also reports the class\'s AndroidManifest.xml <provider> declaration and authorities, and same-line ContentResolver client usage, as corroborating (never sufficient alone) evidence.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        className: {
+          type: 'string',
+          description: 'Simple class name to check, e.g. "BugStorageProvider"',
+        },
+        projectPath: projectPathProperty,
+      },
+      required: ['className'],
+    },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
+    name: 'codegraph_local_socket_ipc',
+    description: 'AOSP extension. Detect LocalSocket/LocalServerSocket-based IPC in a class — a real AOSP/AAOS shape none of the other AOSP tools recognize (Unix-domain-socket IPC used instead of Binder, commonly to reach a native daemon with no AIDL interface at all). "found" only confirms this class constructs a LocalSocket (client role) or LocalServerSocket (server role) somewhere in its own body — it makes NO claim that a same-repo counterpart exists, since the real AOSP shape this was built against connects to a native daemon outside any indexed source.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        className: {
+          type: 'string',
+          description: 'Simple class name to check, e.g. "CarBugreportManagerService"',
+        },
+        projectPath: projectPathProperty,
+      },
+      required: ['className'],
+    },
+    annotations: READ_ONLY_ANNOTATIONS,
+  },
+  {
     name: 'codegraph_node',
     description: 'Two modes. (1) READ A FILE — use INSTEAD of the Read tool: pass `file` (a path or basename) with no `symbol` and it returns that file\'s current on-disk source with line numbers, exactly the shape Read gives you (`<n>\\t<line>`, safe to Edit from), narrowable with `offset`/`limit` just like Read — PLUS a one-line note of which files depend on it. Same bytes as Read, faster (served from the index), with the blast radius attached. Use it whenever you would Read a source file. (2) ONE SYMBOL you can name — its location, signature, verbatim source (includeCode=true) and caller/callee trail in one call, so before changing it you see what calls it and what your edit would break. For an AMBIGUOUS name it returns EVERY matching definition\'s body in one call (so you never Read a file to find the right overload); pass `file`/`line` to pin one. Use codegraph_explore for several related symbols or the full flow.',
     inputSchema: {
@@ -1429,18 +1587,28 @@ function withRequiredProjectPath(defs: ToolDefinition[]): ToolDefinition[] {
 }
 
 /**
+ * Parse CODEGRAPH_MCP_TOOLS once for every MCP surface. A value with no
+ * non-empty tokens is equivalent to unset and therefore selects the default
+ * surface; a non-empty set replaces that default, even when all names are
+ * unknown.
+ */
+export function parseMcpToolAllowlist(raw: string | undefined = process.env.CODEGRAPH_MCP_TOOLS): Set<string> | null {
+  if (!raw || !raw.trim()) return null;
+  const allow = new Set(raw.split(',').map((s) => s.trim().replace(/^codegraph_/, '')).filter(Boolean));
+  return allow.size > 0 ? allow : null;
+}
+
+/**
  * Allowlist-filtered tool definitions WITHOUT an engine — the static surface the
  * proxy answers `tools/list` with before any project is open. Mirrors
  * `ToolHandler.getTools()` in the no-CodeGraph case (the dynamic per-repo budget
  * note in a description only adds once `cg` is loaded; the schemas are static).
  */
 export function getStaticTools(): ToolDefinition[] {
-  const raw = process.env.CODEGRAPH_MCP_TOOLS;
-  if (!raw || !raw.trim()) {
-    return tools.filter(t => DEFAULT_MCP_TOOLS.has(t.name.replace(/^codegraph_/, '')));
-  }
-  const allow = new Set(raw.split(',').map(s => s.trim().replace(/^codegraph_/, '')).filter(Boolean));
-  return allow.size ? tools.filter(t => allow.has(t.name.replace(/^codegraph_/, ''))) : tools;
+  const allow = parseMcpToolAllowlist();
+  return allow
+    ? tools.filter((t) => allow.has(t.name.replace(/^codegraph_/, '')))
+    : tools.filter((t) => DEFAULT_MCP_TOOLS.has(t.name.replace(/^codegraph_/, '')));
 }
 
 /**
@@ -1603,17 +1771,13 @@ export class ToolHandler {
   /**
    * Optional allowlist of exposed tools, parsed from the CODEGRAPH_MCP_TOOLS
    * env var (comma-separated short names, e.g. "trace,search,node,context").
-   * Unset/empty → every tool is exposed. Lets an operator (or an A/B harness)
-   * trim the tool surface without rebuilding the client config; the ablated
+   * Unset/empty or separator-only input → the default surface. Lets an
+   * operator (or an A/B harness) trim the tool surface without rebuilding the client config; the ablated
    * tool is then truly absent from ListTools rather than merely denied on call.
    * Matching is on the short form, so "node" and "codegraph_node" both work.
    */
   private toolAllowlist(): Set<string> | null {
-    const raw = process.env.CODEGRAPH_MCP_TOOLS;
-    if (!raw || !raw.trim()) return null;
-    const short = (s: string) => s.trim().replace(/^codegraph_/, '');
-    const set = new Set(raw.split(',').map(short).filter(Boolean));
-    return set.size ? set : null;
+    return parseMcpToolAllowlist();
   }
 
   /** Whether a tool name passes the CODEGRAPH_MCP_TOOLS allowlist (if any). */
@@ -1844,6 +2008,45 @@ export class ToolHandler {
       );
     }
     return value;
+  }
+
+  /**
+   * Validate an optional enum-like parameter against its declared
+   * `inputSchema` values. This server hand-rolls its JSON-RPC dispatch
+   * (no JSON Schema validator library — see session.ts's tools/call
+   * handler) so an `inputSchema.enum` is otherwise pure documentation: a
+   * handler that just does `args.x === 'onlyValidValue' ? 'onlyValidValue'
+   * : 'defaultValue'` silently coerces every invalid/misspelled value
+   * (including ones that mean the OPPOSITE of the default) to the default
+   * with no error; `--type HIDL` (capitalized) silently searched `aidl` instead.
+   */
+  private validateEnum<T extends string>(
+    value: unknown,
+    name: string,
+    allowed: readonly T[]
+  ): T | undefined | ToolResult {
+    if (value === undefined) return undefined;
+    if (typeof value === 'string' && (allowed as readonly string[]).includes(value)) {
+      return value as T;
+    }
+    return this.errorResult(`${name} must be one of: ${allowed.join(', ')} (got ${JSON.stringify(value)})`);
+  }
+
+  /**
+   * Strip newlines/control characters from a caller-supplied string before
+   * splicing it into a Markdown response — a raw permission/action/interface
+   * name containing its own fake "Evidence:" block or Markdown heading was
+   * otherwise echoed back verbatim, indistinguishable from real tool output
+   * to a downstream reader of the response (an indirect-prompt-injection
+   * vector when the value originated from untrusted external text rather
+   * than the calling agent's own input).
+   */
+  private sanitizeForDisplay(value: string): string {
+    return value
+      .replace(/[\r\n\u2028\u2029]/g, ' ')
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '')
+      .replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]/g, '')
+      .replace(/[\\`*_{}\[\]()#+.!|>~<>-]/g, '\\$&');
   }
 
   /**
@@ -2295,6 +2498,15 @@ export class ToolHandler {
       case 'codegraph_callers': return await this.handleCallers(args);
       case 'codegraph_callees': return await this.handleCallees(args);
       case 'codegraph_impact': return await this.handleImpact(args);
+      case 'codegraph_aidl_impl': return await this.handleAidlImpl(args);
+      case 'codegraph_jni_bridge': return await this.handleJniBridge(args);
+      case 'codegraph_hal_interface': return await this.handleHalInterface(args);
+      case 'codegraph_system_service': return await this.handleSystemService(args);
+      case 'codegraph_trace_permission': return await this.handleTracePermission(args);
+      case 'codegraph_trace_broadcast': return await this.handleTraceBroadcast(args);
+      case 'codegraph_messenger_ipc': return await this.handleMessengerIpc(args);
+      case 'codegraph_content_provider': return await this.handleContentProvider(args);
+      case 'codegraph_local_socket_ipc': return await this.handleLocalSocketIpc(args);
       case 'codegraph_explore': return await this.handleExplore(args);
       case 'codegraph_node': return await this.handleNode(args);
       case 'codegraph_files': return await this.handleFiles(args);
@@ -2583,6 +2795,310 @@ export class ToolHandler {
       );
     }
     return this.textResult(this.truncateOutput(sections.join('\n') + filterNote));
+  }
+
+  /**
+   * Handle codegraph_aidl_impl (AOSP extension)
+   */
+  private async handleAidlImpl(args: Record<string, unknown>): Promise<ToolResult> {
+    const interfaceName = this.validateString(args.interfaceName, 'interfaceName');
+    if (typeof interfaceName !== 'string') return interfaceName;
+
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const result = findAidlImpl(cg, cg.getProjectRoot(), interfaceName);
+
+    if (result.status === 'declaration_not_found') {
+      return this.textResult(
+        `No .aidl declaration for "${this.sanitizeForDisplay(interfaceName)}" found under the project root.\n\n` +
+        `Evidence:\n${result.evidence.map((e) => `  - ${this.sanitizeForDisplay(e)}`).join('\n')}`
+      );
+    }
+
+    const lines: string[] = [];
+    if (result.declaration) {
+        lines.push(
+          `**${this.sanitizeForDisplay(interfaceName)}** — declared at ${this.sanitizeForDisplay(result.declaration.filePath)}:${result.declaration.line} ` +
+            `(methods: ${result.declaration.methods.map((method) => this.sanitizeForDisplay(method)).join(', ') || 'none parsed'})`
+        );
+    }
+    if (result.status === 'no_implementation_found') {
+      lines.push('', 'No implementation found in this repo (this can be correct — the service may live in a different process/repo).');
+    } else {
+      lines.push('', `**${result.implementations.length} implementation candidate(s):**`);
+      for (const c of result.implementations) {
+        lines.push(`- [${this.sanitizeForDisplay(c.kind)}] ${this.sanitizeForDisplay(c.name)} — ${this.sanitizeForDisplay(c.filePath)}:${c.line} (matched: ${this.sanitizeForDisplay(c.matchedPattern)})${this.packageVerifiedLabel(c.packageVerified)}`);
+      }
+      if (result.registrations.length > 0) {
+        lines.push('', `**${result.registrations.length} service registration site(s):**`);
+        for (const c of result.registrations) {
+          lines.push(`- ${this.sanitizeForDisplay(c.name)} — ${this.sanitizeForDisplay(c.filePath)}:${c.line} (matched: ${this.sanitizeForDisplay(c.matchedPattern)})`);
+        }
+      }
+    }
+    lines.push('', 'Evidence (what was searched):', ...result.evidence.map((e) => `  - ${this.sanitizeForDisplay(e)}`));
+
+    return this.textResult(lines.join('\n'));
+  }
+
+  /**
+   * Render an AospCandidate's optional packageVerified state as a trailing
+   * label — 'verified'/'mismatch' both change how much weight a reader
+   * should give the candidate, and both were previously visible only in the
+   * evidence text, not next to the candidate itself. 'unverifiable' and undefined render nothing: neither
+   * confirms nor contradicts, so no label is the accurate signal.
+   */
+  private packageVerifiedLabel(packageVerified: PackageReachability | undefined): string {
+    if (packageVerified === 'verified') return ' [package-verified]';
+    if (packageVerified === 'mismatch') return ' [package MISMATCH — likely a same-named symbol in a different package]';
+    return '';
+  }
+
+  /**
+   * Handle codegraph_jni_bridge (AOSP extension)
+   */
+  private async handleJniBridge(args: Record<string, unknown>): Promise<ToolResult> {
+    const className = this.validateString(args.className, 'className');
+    if (typeof className !== 'string') return className;
+
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const result = findJniBridge(cg, cg.getProjectRoot(), className);
+
+    if (result.status === 'class_not_found') {
+      return this.textResult(`No class "${this.sanitizeForDisplay(className)}" found in the index.\n\nEvidence:\n${result.evidence.map((e) => `  - ${this.sanitizeForDisplay(e)}`).join('\n')}`);
+    }
+
+    const lines: string[] = [];
+    if (result.status === 'no_bridge_found') {
+      lines.push(`No native declarations (or no native-side match) found for "${this.sanitizeForDisplay(className)}".`);
+    } else {
+      const label = result.status === 'found' ? 'CONFIRMED (name match + RegisterNatives registration)' : 'convention-derived candidate — name match ONLY, no confirmed registration';
+      lines.push(`**${this.sanitizeForDisplay(className)}** — ${label}`, '');
+      lines.push(`**${result.nativeDeclarations.length} native/external declaration(s):**`);
+      for (const d of result.nativeDeclarations) {
+          lines.push(`- ${this.sanitizeForDisplay(d.methodName)} (${this.sanitizeForDisplay(d.declarationStyle)}) — ${this.sanitizeForDisplay(d.filePath)}:${d.line}`);
+      }
+      if (result.nativeImplementations.length > 0) {
+        lines.push('', `**${result.nativeImplementations.length} native-side name match(es):**`);
+        for (const c of result.nativeImplementations) {
+          lines.push(`- ${this.sanitizeForDisplay(c.name)} — ${this.sanitizeForDisplay(c.filePath)}:${c.line} (${this.sanitizeForDisplay(c.matchedPattern)})`);
+        }
+      }
+      if (result.registerNativesHits.length > 0) {
+        lines.push('', `**${result.registerNativesHits.length} RegisterNatives registration(s):**`);
+        for (const c of result.registerNativesHits) {
+          const verifiedLabel =
+            c.packageVerified === 'verified'
+              ? ' [package-verified via FindClass(...)]'
+              : c.packageVerified === 'mismatch'
+                ? ' [package MISMATCH — FindClass(...) nearby names a different package, excluded from correlation]'
+                : '';
+          lines.push(`- ${this.sanitizeForDisplay(c.filePath)}:${c.line}${verifiedLabel}`);
+        }
+      }
+    }
+    lines.push('', 'Evidence (what was searched, each hop independently):', ...result.evidence.map((e) => `  - ${this.sanitizeForDisplay(e)}`));
+
+    return this.textResult(lines.join('\n'));
+  }
+
+  /**
+   * Handle codegraph_hal_interface (AOSP extension)
+   */
+  private async handleHalInterface(args: Record<string, unknown>): Promise<ToolResult> {
+    const halName = this.validateString(args.halName, 'halName');
+    if (typeof halName !== 'string') return halName;
+    const halTypeArg = this.validateEnum(args.halType, 'halType', ['aidl', 'hidl'] as const);
+    if (halTypeArg !== undefined && typeof halTypeArg !== 'string') return halTypeArg;
+    const halType = halTypeArg ?? 'aidl';
+
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const result = findHalInterface(cg, cg.getProjectRoot(), halName, halType);
+
+    if (result.status === 'declaration_not_found') {
+      return this.textResult(
+        `No ${halType === 'hidl' ? '.hal' : '.aidl'} declaration for "${this.sanitizeForDisplay(halName)}" found under any hardware/interfaces/ directory.\n\n` +
+        `Evidence:\n${result.evidence.map((e) => `  - ${this.sanitizeForDisplay(e)}`).join('\n')}`
+      );
+    }
+
+    const lines: string[] = [];
+    if (result.declaration) {
+      lines.push(
+        `**${this.sanitizeForDisplay(halName)}** (${halType}) — declared at ${this.sanitizeForDisplay(result.declaration.filePath)}:${result.declaration.line} ` +
+          `(methods: ${result.declaration.methods.map((method) => this.sanitizeForDisplay(method)).join(', ') || 'none parsed'})`
+      );
+    }
+    if (result.status === 'no_implementation_found') {
+      lines.push('', 'No implementation found in this repo.');
+    } else {
+      lines.push('', `**${result.implementations.length} implementation candidate(s):**`);
+      for (const c of result.implementations) {
+        lines.push(`- [${this.sanitizeForDisplay(c.kind)}] ${this.sanitizeForDisplay(c.name)} — ${this.sanitizeForDisplay(c.filePath)}:${c.line} (matched: ${this.sanitizeForDisplay(c.matchedPattern)})${this.packageVerifiedLabel(c.packageVerified)}`);
+      }
+      if (result.registrations.length > 0) {
+        lines.push('', `**${result.registrations.length} registration site(s):**`);
+        for (const c of result.registrations) {
+          lines.push(`- ${this.sanitizeForDisplay(c.name)} — ${this.sanitizeForDisplay(c.filePath)}:${c.line} (matched: ${this.sanitizeForDisplay(c.matchedPattern)})`);
+        }
+      }
+    }
+    lines.push('', 'Evidence (what was searched):', ...result.evidence.map((e) => `  - ${this.sanitizeForDisplay(e)}`));
+
+    return this.textResult(lines.join('\n'));
+  }
+
+  /**
+   * Handle codegraph_system_service (AOSP extension)
+   */
+  private async handleSystemService(args: Record<string, unknown>): Promise<ToolResult> {
+    const serviceName = this.validateString(args.serviceName, 'serviceName');
+    if (typeof serviceName !== 'string') return serviceName;
+
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const result = analyzeSystemService(cg, cg.getProjectRoot(), serviceName);
+
+    const lines: string[] = [];
+    if (result.status === 'no_service_found') {
+      lines.push(`No "${this.sanitizeForDisplay(result.serviceClassName)}" class or supporting evidence found for "${this.sanitizeForDisplay(serviceName)}".`);
+    } else {
+      // Not always "SAME FILE" — a startup site naming the exact class is
+      // accepted cross-file too (see analyzeSystemService's own docstring);
+      // this label previously overstated the guarantee for every "found"
+      // result, not just the same-file-correlated ones.
+      const label = result.status === 'found' ? 'CONFIRMED (class + same-file or exact-class-name-startup evidence — see evidence below for which)' : 'convention-derived candidate';
+        lines.push(`**${this.sanitizeForDisplay(result.serviceClassName)}** — ${label}`);
+      if (result.serviceClass) lines.push(`- class: ${this.sanitizeForDisplay(result.serviceClass.filePath)}:${result.serviceClass.line}`);
+      for (const c of result.registrations) lines.push(`- registration: ${this.sanitizeForDisplay(c.filePath)}:${c.line}`);
+      for (const c of result.startupSites) lines.push(`- startup: ${this.sanitizeForDisplay(c.filePath)}:${c.line}`);
+      for (const c of result.clientUsageSites) lines.push(`- client usage: ${this.sanitizeForDisplay(c.filePath)}:${c.line}`);
+    }
+    lines.push('', 'Evidence (what was searched):', ...result.evidence.map((e) => `  - ${this.sanitizeForDisplay(e)}`));
+
+    return this.textResult(lines.join('\n'));
+  }
+
+  /**
+   * Handle codegraph_trace_permission (AOSP extension)
+   */
+  private async handleTracePermission(args: Record<string, unknown>): Promise<ToolResult> {
+    const permission = this.validateString(args.permission, 'permission');
+    if (typeof permission !== 'string') return permission;
+
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const result = tracePermission(cg, cg.getProjectRoot(), permission);
+
+    const lines: string[] = [`**${this.sanitizeForDisplay(permission)}**`, ''];
+    lines.push(`XML matches, including uses (${result.xmlMatches.length}):`, ...result.xmlMatches.map((c) => `- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`));
+    lines.push('', `Check points (${result.checkPoints.length}):`, ...result.checkPoints.map((c) => `- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`));
+    lines.push('', `Enforcement (${result.enforcement.length}):`, ...result.enforcement.map((c) => `- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`));
+    lines.push('', 'Evidence:', ...result.evidence.map((e) => `  - ${this.sanitizeForDisplay(e)}`));
+
+    return this.textResult(lines.join('\n'));
+  }
+
+  /**
+   * Handle codegraph_trace_broadcast (AOSP extension)
+   */
+  private async handleTraceBroadcast(args: Record<string, unknown>): Promise<ToolResult> {
+    const action = this.validateString(args.action, 'action');
+    if (typeof action !== 'string') return action;
+
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const result = traceBroadcast(cg, cg.getProjectRoot(), action);
+
+    const lines: string[] = [`**${this.sanitizeForDisplay(action)}**`, ''];
+    lines.push(`Senders (${result.senders.length}):`, ...result.senders.map((c) => `- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`));
+    lines.push('', `Receivers (${result.receivers.length}):`, ...result.receivers.map((c) => `- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`));
+    lines.push('', 'Evidence:', ...result.evidence.map((e) => `  - ${this.sanitizeForDisplay(e)}`));
+
+    return this.textResult(lines.join('\n'));
+  }
+
+  /**
+   * Handle codegraph_messenger_ipc (AOSP extension)
+   */
+  private async handleMessengerIpc(args: Record<string, unknown>): Promise<ToolResult> {
+    const name = this.validateString(args.name, 'name');
+    if (typeof name !== 'string') return name;
+
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const result = findMessengerIpc(cg, cg.getProjectRoot(), name);
+
+    const label = result.status === 'found' ? 'CONFIRMED' : result.status === 'convention_derived_candidate' ? 'convention-derived candidate' : 'not found';
+    const lines: string[] = [`**${this.sanitizeForDisplay(name)}** — ${label}`, ''];
+    lines.push(
+      `- provider: ${this.sanitizeForDisplay(result.providerClassName)}` +
+        (result.providerClass ? ` — ${this.sanitizeForDisplay(result.providerClass.filePath)}:${result.providerClass.line}` : ' (no class match)')
+    );
+    lines.push(
+      `- client: ${this.sanitizeForDisplay(result.clientClassName)}` +
+        (result.clientClass ? ` — ${this.sanitizeForDisplay(result.clientClass.filePath)}:${result.clientClass.line}` : ' (no class match)')
+    );
+    if (result.providerEvidence.length > 0) {
+      lines.push('', `**${result.providerEvidence.length} provider-side Messenger reference(s):**`);
+      for (const c of result.providerEvidence) lines.push(`- ${this.sanitizeForDisplay(c.filePath)}:${c.line} (${this.sanitizeForDisplay(c.matchedPattern)})`);
+    }
+    if (result.clientEvidence.length > 0) {
+      lines.push('', `**${result.clientEvidence.length} client-side Messenger reference(s):**`);
+      for (const c of result.clientEvidence) lines.push(`- ${this.sanitizeForDisplay(c.filePath)}:${c.line} (${this.sanitizeForDisplay(c.matchedPattern)})`);
+    }
+    lines.push('', 'Evidence (what was searched):', ...result.evidence.map((e) => `  - ${this.sanitizeForDisplay(e)}`));
+
+    return this.textResult(lines.join('\n'));
+  }
+
+  /**
+   * Handle codegraph_content_provider (AOSP extension)
+   */
+  private async handleContentProvider(args: Record<string, unknown>): Promise<ToolResult> {
+    const className = this.validateString(args.className, 'className');
+    if (typeof className !== 'string') return className;
+
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const result = findContentProviderImpl(cg, cg.getProjectRoot(), className);
+
+    const label = result.status === 'found' ? 'CONFIRMED (extends ContentProvider)' : result.status === 'convention_derived_candidate' ? 'convention-derived candidate' : 'not found';
+    const lines: string[] = [`**${this.sanitizeForDisplay(className)}** — ${label}`, ''];
+    if (result.providerClass) lines.push(`- class: ${this.sanitizeForDisplay(result.providerClass.filePath)}:${result.providerClass.line}`);
+    if (result.manifestDeclarations.length > 0) {
+      lines.push('', `**${result.manifestDeclarations.length} manifest declaration(s):**`);
+      for (const d of result.manifestDeclarations) {
+        lines.push(`- ${this.sanitizeForDisplay(d.filePath)}:${d.line} (authorities: ${d.authorities.map((a) => this.sanitizeForDisplay(a)).join(', ') || 'none parsed'})`);
+      }
+    }
+    if (result.clientUsageSites.length > 0) {
+      lines.push('', `**${result.clientUsageSites.length} client usage site(s):**`);
+      for (const c of result.clientUsageSites) lines.push(`- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`);
+    }
+    lines.push('', 'Evidence (what was searched):', ...result.evidence.map((e) => `  - ${this.sanitizeForDisplay(e)}`));
+
+    return this.textResult(lines.join('\n'));
+  }
+
+  /**
+   * Handle codegraph_local_socket_ipc (AOSP extension)
+   */
+  private async handleLocalSocketIpc(args: Record<string, unknown>): Promise<ToolResult> {
+    const className = this.validateString(args.className, 'className');
+    if (typeof className !== 'string') return className;
+
+    const cg = this.getCodeGraph(args.projectPath as string | undefined);
+    const result = findLocalSocketIpc(cg, cg.getProjectRoot(), className);
+
+    const label = result.status === 'found' ? `CONFIRMED (role: ${result.role})` : result.status === 'convention_derived_candidate' ? 'convention-derived candidate' : 'not found';
+    const lines: string[] = [`**${this.sanitizeForDisplay(className)}** — ${label}`, ''];
+    if (result.matchedClass) lines.push(`- class: ${this.sanitizeForDisplay(result.matchedClass.filePath)}:${result.matchedClass.line}`);
+    if (result.clientEvidence.length > 0) {
+      lines.push('', `**${result.clientEvidence.length} LocalSocket (client) site(s):**`);
+      for (const c of result.clientEvidence) lines.push(`- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`);
+    }
+    if (result.serverEvidence.length > 0) {
+      lines.push('', `**${result.serverEvidence.length} LocalServerSocket (server) site(s):**`);
+      for (const c of result.serverEvidence) lines.push(`- ${this.sanitizeForDisplay(c.filePath)}:${c.line}`);
+    }
+    lines.push('', 'Evidence (what was searched):', ...result.evidence.map((e) => `  - ${this.sanitizeForDisplay(e)}`));
+
+    return this.textResult(lines.join('\n'));
   }
 
   /**

@@ -108,3 +108,63 @@ default project — but the tools are available and work **per project**:
   if it comes up they can run \`codegraph init\` in a project to enable codegraph
   there (a new index is picked up live, no restart).
 `;
+
+/**
+ * Short names (matching CODEGRAPH_MCP_TOOLS's format) of the nine AOSP tools
+ * defined in src/aosp/*.ts and src/mcp/tools.ts. Unlike the rest of the
+ * DEFAULT_MCP_TOOLS-gated tools (node/search/callers/...), these are NOT
+ * redundant with codegraph_explore: they compute a confidence-graded
+ * status/evidence (AIDL/HIDL HAL implementation, JNI bridge, system-service
+ * lifecycle, permission/broadcast candidates, Messenger/ContentProvider/
+ * LocalSocket IPC) explore cannot reproduce. When a user opts one in via
+ * CODEGRAPH_MCP_TOOLS, the agent needs to be told; see
+ * {@link aospToolsAddendum}. Kept in sync with docs/design/android-platform-analysis.md.
+ */
+export const AOSP_MCP_TOOL_NAMES = [
+  'aidl_impl',
+  'jni_bridge',
+  'hal_interface',
+  'system_service',
+  'trace_permission',
+  'trace_broadcast',
+  'messenger_ipc',
+  'content_provider',
+  'local_socket_ipc',
+] as const;
+
+/**
+ * Conditional addendum for the `initialize` instructions: a short paragraph
+ * naming the AOSP tools that are actually enabled (via CODEGRAPH_MCP_TOOLS)
+ * for THIS server, and when to reach for them instead of codegraph_explore
+ * alone. Returns '' when none are enabled, so the common non-Android case
+ * pays nothing extra (same "keep it tight" constraint as the rest of this
+ * file). See docs/design/android-platform-analysis.md's Exposure section for why this
+ * exists: before it, opting a tool in via the env var still left the
+ * agent's system prompt talking only about codegraph_explore, so it had no
+ * reason to ever call the newly-enabled tool.
+ */
+export function aospToolsAddendum(enabledToolNames: ReadonlySet<string>): string {
+  const enabled = AOSP_MCP_TOOL_NAMES.filter((name) => enabledToolNames.has(name));
+  if (enabled.length === 0) return '';
+  const lines = [
+    '\n\n## AOSP tools enabled on this server',
+    '',
+    'This server also has AOSP platform tools enabled. Reach for one of these instead of',
+    '`codegraph_explore` alone for the question it answers, since explore cannot compute',
+    'their confidence-graded status:',
+    '',
+  ];
+  const descriptions: Record<(typeof AOSP_MCP_TOOL_NAMES)[number], string> = {
+    aidl_impl: '- `codegraph_aidl_impl`: who implements this AIDL interface (declaration -> Stub subclass -> registration).',
+    jni_bridge: '- `codegraph_jni_bridge`: what native code backs this class\'s native/external methods.',
+    hal_interface: '- `codegraph_hal_interface`: who implements this AIDL/HIDL HAL interface under hardware/interfaces/.',
+    system_service: '- `codegraph_system_service`: a system service\'s class, registration, startup, and client usage.',
+    trace_permission: '- `codegraph_trace_permission`: where a permission string is defined and checked (candidates only, no found/not-found claim).',
+    trace_broadcast: '- `codegraph_trace_broadcast`: where a broadcast action is sent and received (candidates only, no found/not-found claim).',
+    messenger_ipc: '- `codegraph_messenger_ipc`: Messenger/Handler-based IPC (a shape the other AOSP tools do not look for) — provider/client class pair.',
+    content_provider: '- `codegraph_content_provider`: a ContentProvider implementation, its manifest authorities, and ContentResolver client usage.',
+    local_socket_ipc: '- `codegraph_local_socket_ipc`: LocalSocket/LocalServerSocket-based IPC usage in a class.',
+  };
+  for (const name of enabled) lines.push(descriptions[name]);
+  return lines.join('\n');
+}

@@ -1579,6 +1579,42 @@ export class CodeGraph {
   }
 
   /**
+   * Every unresolved reference recorded against a given name, across the whole
+   * project. The AOSP extension's primary signal for cross-boundary contracts
+   * (AIDL, protobuf, generated interfaces) that never became a node: a class
+   * declaring `: IFoo.Stub()` records an `extends` reference to `IFoo` here
+   * when `IFoo` isn't a Kotlin/Java node (it's defined in a `.aidl` file
+   * outside the language extractors). See {@link QueryBuilder.getUnresolvedByName}.
+   */
+  getUnresolvedReferencesByName(name: string): UnresolvedReference[] {
+    return this.queries.getUnresolvedByName(name);
+  }
+
+  /**
+   * Same as {@link getUnresolvedReferencesByName}, but also matches `name`
+   * followed by a single `.member` qualifier (`IFoo.Stub`, `IFoo.Stub.Proxy`,
+   * ...). Extraction stores a superclass/interface clause's text verbatim, so
+   * a real Java `class Foo extends IBar.Stub` records the unresolved
+   * reference as `"IBar.Stub"`, not bare `"IBar"`, and the bare-only lookup
+   * above would silently miss it whenever the reference genuinely stays
+   * unresolved. See {@link QueryBuilder.getUnresolvedByQualifiedName} for
+   * the limits of what "genuinely unresolved" covers.
+   */
+  getUnresolvedReferencesByQualifiedName(name: string): UnresolvedReference[] {
+    return this.queries.getUnresolvedByQualifiedName(name);
+  }
+
+  /**
+   * Same as {@link getUnresolvedReferencesByQualifiedName}, but additionally
+   * matches `name` reached through a C++ `::`-qualified prefix (`ns::name`).
+   * See {@link QueryBuilder.getUnresolvedByNamespacedSuffix} for why this is
+   * split out rather than folded into the generic lookup above.
+   */
+  getUnresolvedReferencesByNamespacedSuffix(name: string): UnresolvedReference[] {
+    return this.queries.getUnresolvedByNamespacedSuffix(name);
+  }
+
+  /**
    * Get all nodes in a file
    */
   getNodesInFile(filePath: string): Node[] {
