@@ -810,7 +810,9 @@ export function matchByExactName(
   if (bestMatch && isCrossFileReachable(bestMatch, ref, context)) {
     // Lower confidence when the match is from a distant/unrelated module
     const proximity = computePathProximity(ref.filePath, bestMatch.filePath);
-    const confidence = proximity >= 30 ? 0.7 : 0.4;
+    const confidence = isDecisiveSameFileMatch(bestMatch, ref, candidates, context)
+      ? 0.9
+      : proximity >= 30 ? 0.7 : 0.4;
     return {
       original: ref,
       targetNodeId: bestMatch.id,
@@ -3274,6 +3276,43 @@ function computePathProximity(filePath1: string, filePath2: string): number {
   const dir1 = filePath1.split('/');
   dir1.pop();
   return pathProximityFromDirs(dir1, filePath2);
+}
+
+/**
+ * Whether `findBestMatch` picked `best` because it is THE definition in the
+ * call site's own file, so the edge deserves a same-file confidence rather than
+ * the directory-proximity one. Proximity measures shared folders, so a
+ * same-file match in a shallow path (`scripts/x.py` → its own `main`) scored
+ * 0.4 like a guess across unrelated modules. Decisive only when:
+ * - `best` is the ONLY same-file candidate — several (two classes' `run` in
+ *   one file) are separated by line distance, which is not evidence; and
+ * - a method target belongs to the caller's own type — a bare call does not
+ *   reach a sibling class's method just because it is written in that file;
+ * - `best` is not the caller itself — `super.onCreate()`,
+ *   `parent::__construct()` and `json.dumps` inside `dumps` all arrive here
+ *   without their receiver, and recursion cannot be told apart from them.
+ * 0.9 matches the unique exact-match above: the same-file bonus in
+ * findBestMatch outweighs any directory proximity, so a lone same-file
+ * definition is as settled as a lone candidate. The resolver keeps the most
+ * confident strategy, so this also outranks a sub-0.9 framework guess that
+ * sent the name to another file (`errorHandler(...)` to a test class's
+ * method, a Kotlin `Endpoint(...)` to a Go struct) — the file's own
+ * definition is the one the name means.
+ */
+function isDecisiveSameFileMatch(
+  best: Node,
+  ref: UnresolvedRef,
+  candidates: Node[],
+  context: ResolutionContext
+): boolean {
+  if (best.filePath !== ref.filePath || best.id === ref.fromNodeId) return false;
+  if (candidates.some((c) => c !== best && c.filePath === ref.filePath)) return false;
+  if (best.kind !== 'method') return true;
+  const sep = best.qualifiedName.lastIndexOf('::');
+  if (sep <= 0) return false;
+  const owner = best.qualifiedName.slice(0, sep);
+  const from = context.getNodeById?.(ref.fromNodeId);
+  return !!from && (from.qualifiedName === owner || from.qualifiedName.startsWith(`${owner}::`));
 }
 
 /**
