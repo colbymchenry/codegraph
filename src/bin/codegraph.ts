@@ -436,8 +436,7 @@ function cliDefinition(group: Node[]) {
  * error; these CLI commands had no equivalent check, so `codegraph
  * aidl-impl ""` silently ran a full unresolved_refs/naming-convention/
  * addService scan over the entire repo before reporting
- * declaration_not_found — wasted work a one-line guard avoids (Red Team
- * round-2 finding, 2026-09-04, verified live).
+ * declaration_not_found — wasted work a one-line guard avoids.
  */
 function requireNonEmpty(value: string, name: string): void {
   if (value.length === 0) {
@@ -2718,7 +2717,7 @@ program
 /**
  * codegraph hal-interface <hal-name>
  *
- * AOSP extension (Phase 3). Same declaration -> implementation ->
+ * Same declaration -> implementation ->
  * registration contract as aidl-impl, scoped to hardware/interfaces/ and
  * extended with a native (c/cpp) implementation search.
  */
@@ -2734,8 +2733,7 @@ program
     // fix — see tools.ts's validateEnum), Commander DOES reject an
     // undeclared --type value on its own; this only needs to reject a
     // wrong-but-otherwise-valid-looking one (a typo'd case) rather than
-    // silently defaulting to 'aidl' (Red Team round-2 finding, 2026-09-04:
-    // `--type HIDL` silently searched aidl instead).
+    // silently defaulting to 'aidl'; `--type HIDL` searched aidl instead.
     if (options.type !== undefined && options.type !== 'aidl' && options.type !== 'hidl') {
       error(`--type must be "aidl" or "hidl" (got "${options.type}")`);
       process.exit(1);
@@ -2777,7 +2775,7 @@ program
 /**
  * codegraph system-service <service-name>
  *
- * AOSP extension (Phase 3). Analyze a system service's lifecycle.
+ * Analyze a system service's lifecycle.
  */
 program
   .command('system-service <service-name>')
@@ -2822,7 +2820,7 @@ program
 /**
  * codegraph trace-permission <permission>
  *
- * AOSP extension (Phase 3). Pure text-candidate search, no found/not-found claim.
+ * Pure text-candidate search, no found/not-found claim.
  */
 program
   .command('trace-permission <permission>')
@@ -2864,7 +2862,7 @@ program
 /**
  * codegraph trace-broadcast <action>
  *
- * AOSP extension (Phase 3). Pure text-candidate search, no found/not-found claim.
+ * Pure text-candidate search, no found/not-found claim.
  */
 program
   .command('trace-broadcast <action>')

@@ -30,9 +30,8 @@
  * (`new LocalSocket(...)`, `new LocalServerSocket(...)`) against a match
  * instead.
  *
- * Two structural corroboration checks apply before a hit counts as evidence
- * (Codex adversarial review, 2026-09-12, findings HIGH-1 and HIGH-2, the
- * first version of this tool had neither): class ownership via
+ * Two structural corroboration checks apply before a hit counts as evidence:
+ * class ownership via
  * `isDirectMemberOfClass` (a same-line sibling class or a nested class must
  * not falsely inherit a construction that belongs to a different class,
  * the first version's same-file + overlapping-line-range check could not

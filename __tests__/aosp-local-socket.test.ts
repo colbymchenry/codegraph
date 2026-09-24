@@ -155,7 +155,7 @@ describe('AOSP extension: findLocalSocketIpc', () => {
     expect(result.status).toBe('convention_derived_candidate');
   });
 
-  it('does not treat an unrelated same-named import as android.net.LocalSocket (Codex adversarial review, 2026-09-12, HIGH-1)', async () => {
+  it('does not treat an unrelated same-named import as android.net.LocalSocket', async () => {
     write(
       'src/SocketUser.java',
       'package p;\n\nimport unrelated.LocalSocket;\n\nclass SocketUser {\n    Object x = new LocalSocket();\n}\n'
@@ -169,7 +169,7 @@ describe('AOSP extension: findLocalSocketIpc', () => {
     expect(result.status).not.toBe('found');
   });
 
-  it('does not attribute a sibling class construction on the same source line to the matched class (Codex adversarial review, 2026-09-12, HIGH-2)', async () => {
+  it('does not attribute a sibling class construction on the same source line to the matched class', async () => {
     write(
       'src/Both.java',
       'import android.net.LocalSocket;\nclass EmptyService {} class Other { Object s = new LocalSocket(); }\n'
@@ -184,7 +184,7 @@ describe('AOSP extension: findLocalSocketIpc', () => {
     expect(result.status).toBe('convention_derived_candidate');
   });
 
-  it('does not attribute a nested static class construction to the enclosing class (Codex adversarial review, 2026-09-12, HIGH-2)', async () => {
+  it('does not attribute a nested static class construction to the enclosing class', async () => {
     write(
       'src/OuterService.java',
       'import android.net.LocalSocket;\nclass OuterService {\n static class Independent {\n Object s = new LocalSocket();\n }\n}\n'

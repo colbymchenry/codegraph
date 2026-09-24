@@ -1,5 +1,5 @@
 /**
- * AOSP extension — find_aidl_impl (Connect Built-in Apps audit PoC port).
+ * AOSP extension — AIDL implementation discovery.
  *
  * codegraph does not index `.aidl` files (no language extractor for them),
  * so an AIDL interface never becomes a node. But when a Kotlin class
@@ -110,7 +110,7 @@ describe('AOSP extension: findAidlImpl', () => {
     expect(result.evidence.some((e) => e.includes('WARNING:') && e.includes('상한'))).toBe(true);
   });
 
-  it('demotes an unresolved_refs hit to convention_derived_candidate when the implementing class cannot reach this interface\'s package — a same-named interface in an unrelated package (Codex 3rd-pass review, 2026-09-04)', () => {
+  it('demotes an unresolved_refs hit to convention_derived_candidate when the implementing class cannot reach this interface\'s package — a same-named interface in an unrelated package', () => {
     write(
       'src/IAmbiguous.aidl',
       'package com.example.test;\ninterface IAmbiguous {\n    void ping();\n}\n'
@@ -135,7 +135,7 @@ describe('AOSP extension: findAidlImpl', () => {
     });
   });
 
-  it('resolves the second of two interfaces declared in the same .aidl file, instead of returning a mismatched status/implementations pair (Green Team round-1 finding, 2026-09-04)', () => {
+  it('resolves the second of two interfaces declared in the same .aidl file, instead of returning a mismatched status/implementations pair', () => {
     write(
       'src/IMulti.aidl',
       'package com.example.test;\n' +
@@ -158,7 +158,7 @@ describe('AOSP extension: findAidlImpl', () => {
     });
   });
 
-  it('does not let a commented-out stale declaration bleed another interface\'s data under its name (Blue Team round-2 finding, 2026-09-04)', () => {
+  it('does not let a commented-out stale declaration bleed another interface\'s data under its name', () => {
     write(
       'src/ICommented.aidl',
       'package com.example.test;\n' +
@@ -174,7 +174,7 @@ describe('AOSP extension: findAidlImpl', () => {
     expect(result.declaration).toBeNull();
   });
 
-  it('finds an implementation named without the leading "I" (AOSP convention: IFoo -> FooImpl), not just {Interface}Impl (Blue Team round-2 finding, 2026-09-04)', () => {
+  it('finds an implementation named without the leading "I" (AOSP convention: IFoo -> FooImpl), not just {Interface}Impl', () => {
     write('src/IWidget.aidl', 'package com.example.test;\ninterface IWidget {\n    void spin();\n}\n');
     write('src/WidgetImpl.kt', 'package com.example.test\n\nclass WidgetImpl\n');
 
@@ -187,7 +187,7 @@ describe('AOSP extension: findAidlImpl', () => {
     });
   });
 
-  it('picks the declaration whose package a candidate can actually verify, when the same interface name is declared in two different packages (Blue Team round-2 finding, 2026-09-04)', () => {
+  it('picks the declaration whose package a candidate can actually verify, when the same interface name is declared in two different packages', () => {
     write('moduleA/IShared.aidl', 'package com.example.a;\ninterface IShared {\n    void ping();\n}\n');
     write('moduleB/IShared.aidl', 'package com.example.b;\ninterface IShared {\n    void ping();\n}\n');
     write(
@@ -217,7 +217,7 @@ describe('AOSP extension: findAidlImpl', () => {
     // .aidl text directly) now handles Unicode correctly — verified
     // separately below. But CodeGraph's own Kotlin extractor does not
     // record an extends/implements clause at all when either side of it is
-    // a non-ASCII identifier (verified live, 2026-09-05:
+    // a non-ASCII identifier:
     // `cg.getUnresolvedReferencesByName('I가나다')` returns empty even when
     // the implementing class name is plain ASCII) — so the primary signal
     // this whole module is built on never fires for a Unicode interface,
@@ -239,7 +239,7 @@ describe('AOSP extension: findAidlImpl', () => {
     expect(declarations[0]?.packageName).toBe('com.example.test');
   });
 
-  it('matches a lower/camelCase addService registration string against the PascalCase bare interface name (Green Team round-1 finding, 2026-09-04)', () => {
+  it('matches a lower/camelCase addService registration string against the PascalCase bare interface name', () => {
     write('src/IHybrid.aidl', 'package com.example.test;\ninterface IHybrid {\n    void ping();\n}\n');
     write(
       'src/HybridService.kt',
@@ -257,7 +257,7 @@ describe('AOSP extension: findAidlImpl', () => {
     });
   });
 
-  it('verifies a wildcard import against the declaration\'s package, not just an exact FQCN import (Red Team round-1 finding, 2026-09-04)', () => {
+  it('verifies a wildcard import against the declaration\'s package, not just an exact FQCN import', () => {
     write('src/IWild.aidl', 'package com.example.test;\ninterface IWild {\n    void ping();\n}\n');
     write(
       'src/WildStub.kt',
@@ -273,7 +273,7 @@ describe('AOSP extension: findAidlImpl', () => {
     });
   });
 
-  it('surfaces in evidence when package verification could not run at all (no parseable package clause), instead of silently treating it as verified (Black Hat + Blue Team round-1 findings, 2026-09-04)', () => {
+  it('surfaces in evidence when package verification could not run at all (no parseable package clause), instead of silently treating it as verified', () => {
     write('src/INoPackage.aidl', 'interface INoPackage {\n    void ping();\n}\n');
     write('src/NoPackageStub.kt', 'package com.example.whatever\n\nclass NoPackageStub : INoPackage.Stub() {\n    override fun ping() {}\n}\n');
 
@@ -287,8 +287,7 @@ describe('AOSP extension: findAidlImpl', () => {
     });
   });
 
-  // Regression coverage for the 2026-09-04 code review: a naming-convention
-  // match (or a bare addService hit) is real signal but not proof of
+  // A naming-convention match (or a bare addService hit) is real signal but not proof of
   // implementation — it must never be promoted to `found` on its own.
   describe('naming-convention and registration matches stay convention_derived_candidate, not found', () => {
     it('a class named {Interface}Impl with NO extends/implements clause referencing the interface', () => {
@@ -338,7 +337,7 @@ describe('AOSP extension: findAidlImpl', () => {
       });
     });
 
-    it('does not throw on an interface name containing regex metacharacters (registration-search interpolation was unescaped until this fix, 2026-09-04 self-review)', () => {
+    it('does not throw on an interface name containing regex metacharacters', () => {
       expect(() => findAidlImpl(cg, dir, 'IFoo(Bar)')).not.toThrow();
       const result = findAidlImpl(cg, dir, 'IFoo(Bar)');
       expect(result.status).toBe('declaration_not_found');
@@ -364,10 +363,9 @@ describe('AOSP extension: findAidlImpl', () => {
 
   // Symmetric with aosp-hal.test.ts's equivalent case — findAidlFiles has
   // its own directory walk (app-level AIDL, not scoped to
-  // hardware/interfaces/ like findHalFiles) and needed its own regression
-  // coverage rather than relying on hal.ts's test to stand in for it (#20
-  // scope check, 2026-09-05).
-  it('refuses to follow a symlinked subdirectory when discovering .aidl files (symmetric with the hal.ts Black Hat round-2 finding, 2026-09-04)', async () => {
+  // hardware/interfaces/ like findHalFiles), so it needs its own symlink
+  // regression coverage.
+  it('refuses to follow a symlinked subdirectory when discovering .aidl files', async () => {
     const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-aosp-aidl-outside-'));
     fs.writeFileSync(
       path.join(outsideDir, 'ISecretAidl.aidl'),
@@ -389,9 +387,8 @@ describe('AOSP extension: findAidlImpl', () => {
     fs.rmSync(outsideDir, { recursive: true, force: true });
   });
 
-  // Regression coverage for the 2026-09-05 round-3/4 fixes.
-  describe('round 3+4 fixes (2026-09-05)', () => {
-    it('finds a real AIDL declaration living under a vendor/ directory instead of skipping it outright (Black Hat round-4 finding: vendor/ is a first-class AOSP source dir, not vendored dependency code)', async () => {
+  describe('AIDL declaration and candidate regressions', () => {
+    it('finds a real AIDL declaration living under a vendor/ directory instead of skipping it outright', async () => {
       write(
         'vendor/oem/interfaces/IVendorOnly.aidl',
         'package com.oem.vendor;\ninterface IVendorOnly {\n    void doVendorThing();\n}\n'
@@ -420,7 +417,7 @@ describe('AOSP extension: findAidlImpl', () => {
       expect(result.declaration?.filePath).toBe('vendor/oem/interfaces/IVendorOnly.aidl');
     });
 
-    it('prefers a genuinely package-verified declaration over an earlier unverifiable one, instead of stopping at the first non-mismatch (Codex round-4 Blue Team finding)', async () => {
+    it('prefers a genuinely package-verified declaration over an earlier unverifiable one, instead of stopping at the first non-mismatch', async () => {
       // First declaration on the file-system walk has no parseable package
       // clause (unverifiable for any candidate). Second has a real package,
       // and a real implementer that imports it.
@@ -443,7 +440,7 @@ describe('AOSP extension: findAidlImpl', () => {
       expect(hit?.packageVerified).toBe('verified');
     });
 
-    it('does not truncate the method list at a nested enum\'s closing brace (Red Team round-4 finding)', async () => {
+    it('does not truncate the method list at a nested enum\'s closing brace', async () => {
       write(
         'src/INested.aidl',
         'package com.example.nested;\n' +
@@ -459,7 +456,7 @@ describe('AOSP extension: findAidlImpl', () => {
     });
   });
 
-  describe('HIGH-1 regression: a C++ `::`-qualified extends must not leak into this Kotlin/Java-only signal (Codex adversarial review, 2026-09-10)', () => {
+  describe('a C++ `::`-qualified extends must not leak into this Kotlin/Java-only signal', () => {
     it('does not promote a C++ class that reaches the bare interface name only through a `::` namespace qualifier', async () => {
       write('src/IPlainFoo.aidl', 'interface IPlainFoo {\n    void doWork();\n}\n');
       // Before the fix, getUnresolvedByQualifiedName's shared `::`-suffix

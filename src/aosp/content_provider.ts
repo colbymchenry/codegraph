@@ -28,9 +28,8 @@
  * extending some unrelated `unrelated.ContentProvider` type as real Android
  * IPC evidence, and separately never recognized a fully-qualified
  * `extends android.content.ContentProvider` clause at all, since that
- * reference's name is the FQCN string, not the bare name
- * (Codex adversarial review, 2026-09-12, HIGH-1 and MEDIUM-4). Both are
- * fixed by `findAllContentProviderCandidates` below: the bare-name lookup
+ * reference's name is the FQCN string, not the bare name. Both are fixed by
+ * `findAllContentProviderCandidates` below: the bare-name lookup
  * now runs with `packageName: 'android.content'` so a `mismatch` is
  * dropped, and a second, FQCN-qualified lookup catches the fully-qualified
  * spelling directly (a real FQCN clause commits to the package textually,
@@ -150,14 +149,14 @@ function findAllContentProviderCandidates(cg: CodeGraph): { candidates: AospCand
 // `<grant-uri-permission>`, ...) for `android:name`/`android:authorities`,
 // so a `<meta-data android:name="GhostProvider" .../>` nested inside a real
 // `<provider android:name="RealProvider" ...>` could be mistaken for the
-// provider's own name (Codex adversarial review, 2026-09-12, LOW-8). Every
+// provider's own name. Every
 // attribute this tool needs (name, authorities) is always on the provider's
 // own opening tag, never on a child, so scoping to just that tag is strictly
 // more correct, not just narrower.
 const PROVIDER_OPEN_TAG_RE = /<provider\b[^>]*>/g;
 // AOSP manifests use both quote styles for XML attributes; the first
 // version only recognized double quotes and silently missed every
-// single-quoted attribute (Codex adversarial review, 2026-09-12, LOW-8).
+// single-quoted attribute.
 const NAME_ATTR_RE = /android:name\s*=\s*["']([^"']+)["']/;
 const AUTHORITIES_ATTR_RE = /android:authorities\s*=\s*["']([^"']+)["']/;
 
@@ -263,8 +262,7 @@ export function findContentProviderImpl(cg: CodeGraph, repoRoot: string, classNa
     // content:// URI literal's own "//" exactly like a line comment and
     // deletes everything after it, silently erasing the authority this
     // search is looking for on the ordinary single-line client shape
-    // (`query(Uri.parse("content://authority/path"), ...)`) (Codex
-    // adversarial review, 2026-09-12, MEDIUM-7). See grepIndexedSources'
+    // (`query(Uri.parse("content://authority/path"), ...)`). See grepIndexedSources'
     // own docstring for why this is a deliberate per-caller opt-out, not a
     // global behavior change.
     const clientHits = grepIndexedSources(
