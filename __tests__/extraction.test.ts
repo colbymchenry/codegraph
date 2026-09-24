@@ -12744,6 +12744,10 @@ describe('Unsupported-language projects report what they skipped (#1502)', () =>
     tempDir = createTempDir();
   });
 
+  afterEach(() => {
+    cleanupTempDir(tempDir);
+  });
+
   it('counts files it could not index, by extension, on the git path', async () => {
     const runGit = (...args: string[]) =>
       execFileSync('git', args, { cwd: tempDir, stdio: 'pipe' });

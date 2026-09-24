@@ -77,6 +77,7 @@ describe('Old git without `ls-files -s --recurse-submodules` support (#1549)', (
   afterEach(() => {
     if (originalPath !== undefined) process.env.PATH = originalPath;
     originalPath = undefined;
+    fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
   it('still honours includeIgnored when `ls-files --recurse-submodules` is unsupported', () => {
