@@ -319,7 +319,7 @@ describe('validateProjectPath — sensitive directory blocking', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-validate-link-'));
     const link = path.join(dir, 'allowed-looking-link');
     try {
-      fs.symlinkSync(path.join(os.homedir(), '.ssh'), link, 'dir');
+      fs.symlinkSync('/etc', link, 'dir');
       expect(validateProjectPath(link)).toMatch(/sensitive system directory|sensitive directory/i);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });

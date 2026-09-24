@@ -45,6 +45,9 @@ const SENSITIVE_PATHS = new Set([
   '/root', '/boot', '/lib', '/lib64', '/opt',
   'c:\\', 'c:\\windows', 'c:\\windows\\system32',
 ]);
+const SENSITIVE_REAL_PATHS = new Set([...SENSITIVE_PATHS].map((entry) => {
+  try { return fs.realpathSync(entry); } catch { return entry; }
+}));
 
 /**
  * Config "languages" whose nodes are pure key/value DATA lifted from a config
@@ -186,7 +189,7 @@ export function validateProjectPath(dirPath: string): string | null {
   const homeDir = require('os').homedir();
   const sensitiveHomeDirs = ['.ssh', '.gnupg', '.aws', '.config'];
   for (const candidate of pathsToCheck) {
-    if (SENSITIVE_PATHS.has(candidate) || SENSITIVE_PATHS.has(candidate.toLowerCase())) {
+    if (SENSITIVE_REAL_PATHS.has(candidate) || SENSITIVE_PATHS.has(candidate.toLowerCase())) {
       return `Refusing to operate on sensitive system directory: ${candidate}`;
     }
     for (const dir of sensitiveHomeDirs) {
