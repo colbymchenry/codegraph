@@ -359,22 +359,23 @@ export function matchFunctionRef(
 const NO_NESTED_FUNCTIONS = new Set<string>(['c', 'cpp']);
 
 /**
- * A function nested inside another FUNCTION is only callable from within its
- * container — Python, JS/TS, and every closure language scope it lexically.
+ * A function nested inside another function, or an anonymous-class method
+ * inside a function, is only callable from within that container.
  * Resolving a bare name from elsewhere to a nested local fabricates an edge
  * scope already rules out: `join(...)` in one function must never bind to a
  * `join` defined inside a DIFFERENT function (#1230). A candidate whose
  * qualifiedName parent is a same-file function/method is kept only when the
- * ref originates inside that parent's line range. Class members are
- * unaffected (their parent resolves to a class-like node), as are top-level
- * symbols and C++ namespace-prefixed names (the prefix has no node).
+ * ref originates inside that parent's line range. Ordinary class members and
+ * top-level symbols have no enclosing function; C++ namespace prefixes have
+ * no function node.
  */
 function isLexicallyReachable(
   candidate: Node,
   ref: UnresolvedRef,
   context: ResolutionContext
 ): boolean {
-  if (candidate.kind !== 'function') return true;
+  if (candidate.kind !== 'function' && candidate.kind !== 'method') return true;
+  if (candidate.kind === 'method' && !candidate.qualifiedName.includes('$anon@')) return true;
   // C and C++ have no nested named functions, so a function the graph shows
   // inside another is an extraction artifact, not a scope: tree-sitter-c
   // cannot parse a macro call whose arguments are designated initializers
@@ -385,21 +386,22 @@ function isLexicallyReachable(
   if (NO_NESTED_FUNCTIONS.has(candidate.language)) return true;
   const qn = candidate.qualifiedName;
   if (!qn || !qn.includes('::')) return true;
-  const parentQn = qn.slice(0, qn.lastIndexOf('::'));
-  const containers = context
-    .getNodesByQualifiedName(parentQn)
-    .filter(
-      (p) =>
-        p.filePath === candidate.filePath &&
-        (p.kind === 'function' || p.kind === 'method') &&
-        p.startLine <= candidate.startLine &&
-        p.endLine >= candidate.endLine
+  let parentQn = qn.slice(0, qn.lastIndexOf('::'));
+  while (parentQn) {
+    const containers = context.getNodesByQualifiedName(parentQn).filter((p) =>
+      p.filePath === candidate.filePath &&
+      (p.kind === 'function' || p.kind === 'method') &&
+      p.startLine <= candidate.startLine && p.endLine >= candidate.endLine
     );
-  if (containers.length === 0) return true;
-  return (
-    ref.filePath === candidate.filePath &&
-    containers.some((p) => ref.line >= p.startLine && ref.line <= p.endLine)
-  );
+    if (containers.length > 0) {
+      return ref.filePath === candidate.filePath &&
+        containers.some((p) => ref.line >= p.startLine && ref.line <= p.endLine);
+    }
+    const separator = parentQn.lastIndexOf('::');
+    if (separator < 0) break;
+    parentQn = parentQn.slice(0, separator);
+  }
+  return true;
 }
 
 /** Languages whose module boundary is `import`/`export` (or CommonJS). */
@@ -3212,7 +3214,7 @@ export function matchMethodCall(
       return null;
     }
     const methods = methodCandidates.filter(
-      (n) => n.kind === 'method' && n.name === methodName
+      (n) => n.kind === 'method' && n.name === methodName && isLexicallyReachable(n, ref, context)
     );
 
     // Filter to same-language candidates first

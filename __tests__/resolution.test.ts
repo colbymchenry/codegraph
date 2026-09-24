@@ -37,6 +37,33 @@ describe('Resolution Module', () => {
   });
 
   describe('Name Matcher', () => {
+    it('does not match a Kotlin local anonymous-object method from a sibling function', () => {
+      const node = (id: string, kind: Node['kind'], name: string, qualifiedName: string, filePath: string, startLine: number, endLine: number): Node => ({
+        id, kind, name, qualifiedName, filePath, language: 'kotlin',
+        startLine, endLine, startColumn: 0, endColumn: 0, updatedAt: 0,
+      });
+      const outer = node('outer', 'method', 'otherTest', 'ProbeTest::otherTest', 'ProbeTest.kt', 10, 20);
+      const anon = node('anon', 'class', '<Probe$anon@12:8>', 'ProbeTest::otherTest::<Probe$anon@12:8>', 'ProbeTest.kt', 12, 18);
+      const localMethod = node('local', 'method', 'probe', `${anon.qualifiedName}::probe`, 'ProbeTest.kt', 13, 17);
+      const interfaceMethod = node('interface', 'method', 'probe', 'Probe::probe', 'Probe.kt', 1, 2);
+      const nodes = [outer, anon, localMethod, interfaceMethod];
+      const context = {
+        getNodesByName: (name: string) => nodes.filter((n) => n.name === name),
+        getNodesByQualifiedName: (name: string) => nodes.filter((n) => n.qualifiedName === name),
+        getNodesInFile: (filePath: string) => nodes.filter((n) => n.filePath === filePath),
+        getNodesByKind: (kind: Node['kind']) => nodes.filter((n) => n.kind === kind),
+        fileExists: () => true, readFile: () => null,
+        getProjectRoot: () => tempDir, getAllFiles: () => ['ProbeTest.kt', 'Probe.kt'],
+      } as ResolutionContext;
+      const ref: UnresolvedRef = {
+        fromNodeId: 'testA', referenceName: 'probe.probe', referenceKind: 'calls',
+        filePath: 'ProbeTest.kt', language: 'kotlin', line: 5, column: 0,
+      };
+
+      expect(matchMethodCall(ref, context)?.targetNodeId).toBe(interfaceMethod.id);
+      expect(matchMethodCall({ ...ref, fromNodeId: outer.id, line: 15 }, context)?.targetNodeId).toBe(localMethod.id);
+    });
+
     it('accepts every supported supertype kind in exact-name inheritance matching', () => {
       for (const kind of ['component', 'namespace'] as const) {
         const target: Node = {
