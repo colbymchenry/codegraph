@@ -127,7 +127,7 @@ describe('ToolHandler connection cache (#1057)', () => {
 
     const first = open(real);
     expect(open(link)).toBe(first);
-    // And the alias is remembered: the same spelling is a direct cache hit.
+    // And the alias is remembered: the same spelling is served again.
     expect(open(link)).toBe(first);
   });
 
@@ -160,6 +160,31 @@ describe('ToolHandler connection cache (#1057)', () => {
     cg.close = () => { closes++; close(); };
     handler.closeAll();
     expect(closes).toBe(1);
+  });
+
+  it('never serves a connection that was evicted under another spelling', async () => {
+    const real = await makeIndexed('proj');
+    const link = path.join(tmp, 'projLink');
+    fs.symlinkSync(real, link, 'junction');
+
+    const first = open(real);
+    expect(open(link)).toBe(first);
+
+    // Evict the entry the way a bounded cache does: drop the key, close the
+    // connection. The other spelling must not be left holding a closed handle.
+    const cache = (handler as unknown as { projectCache: Map<string, CodeGraph> }).projectCache;
+    for (const [key, cg] of cache) {
+      if (cg === first) {
+        cache.delete(key);
+        break;
+      }
+    }
+    first.close();
+
+    const again = open(link);
+    expect(again).not.toBe(first);
+    expect(() => again.getStats()).not.toThrow();
+    expect(open(real)).toBe(again);
   });
 
   posixOnly('still heals a root recreated at the same path in place (#925)', async () => {
