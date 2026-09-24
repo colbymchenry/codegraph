@@ -1465,6 +1465,8 @@ const DEFAULT_MCP_TOOLS = new Set(['explore']);
 export class ToolHandler {
   // Cache of opened CodeGraph instances for cross-project queries
   private projectCache: Map<string, CodeGraph> = new Map();
+  private static readonly MAX_PROJECT_CACHE_ENTRIES = 20;
+  private activeOperations = 0;
   // The directory the server last searched for a default project. Surfaced in
   // the "not initialized" error so users can see why detection missed.
   private defaultProjectHint: string | null = null;
@@ -1779,11 +1781,26 @@ export class ToolHandler {
     // path. One key per instance means closeAll() closes each exactly once, and
     // a changed resolution maps to a different entry instead of a stale hit.
     const cached = this.projectCache.get(resolvedRoot);
-    if (cached) return this.freshen(cached);
+    if (cached) {
+      this.projectCache.delete(resolvedRoot);
+      this.projectCache.set(resolvedRoot, cached);
+      return this.freshen(cached);
+    }
 
     const cg = loadCodeGraph().openSync(resolvedRoot);
     this.projectCache.set(resolvedRoot, cg);
     return cg;
+  }
+
+  /** Close old project connections only after all calls using them finish. */
+  private trimProjectCache(): void {
+    if (this.activeOperations !== 0) return;
+    while (this.projectCache.size > ToolHandler.MAX_PROJECT_CACHE_ENTRIES) {
+      const oldestRoot = this.projectCache.keys().next().value as string;
+      const oldest = this.projectCache.get(oldestRoot)!;
+      this.projectCache.delete(oldestRoot);
+      try { oldest.close(); } catch { /* cache cleanup must not fail a tool call */ }
+    }
   }
 
   /**
@@ -2105,6 +2122,7 @@ export class ToolHandler {
     args: Record<string, unknown>,
     sessionState?: ExploreSessionState,
   ): Promise<ToolResult> {
+    this.activeOperations++;
     try {
       // Block the first tool call on the engine's post-open reconcile so we
       // never serve rows for files deleted/edited while no MCP server was
@@ -2198,6 +2216,9 @@ export class ToolHandler {
         'This is an internal codegraph error — retry the call once; if it persists, ' +
         'continue without codegraph for this task.'
       );
+    } finally {
+      this.activeOperations--;
+      this.trimProjectCache();
     }
   }
 
@@ -2266,6 +2287,7 @@ export class ToolHandler {
    * path validation already ran in {@link execute} before routing here.
    */
   async executeReadTool(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+    this.activeOperations++;
     try {
       return await this.dispatchTool(toolName, args);
     } catch (err) {
@@ -2280,6 +2302,9 @@ export class ToolHandler {
         'This is an internal codegraph error — retry the call once; if it persists, ' +
         'continue without codegraph for this task.'
       );
+    } finally {
+      this.activeOperations--;
+      this.trimProjectCache();
     }
   }
 
