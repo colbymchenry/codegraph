@@ -26,7 +26,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type CodeGraph from '../index';
 import type { NodeKind } from '../types';
-import { grepIndexedSources, escapeRegExp, candidateReachesPackagedSymbol, stripCLikeComments, indexingCaveat, findMatchingBraceEnd, testPathEvidence } from './common';
+import { grepIndexedSources, escapeRegExp, candidateReachesPackagedSymbol, stripCLikeComments, indexingCaveat, findMatchingBraceEnd, testPathEvidence, walkDeclarationFiles, DECLARATION_WALK_MAX_DEPTH, DECLARATION_WALK_MAX_ENTRIES } from './common';
 import type { AospCandidate, FindAidlImplStatus, AidlDeclaration } from './aidl';
 
 // HIDL interfaces commonly declare a parent (`interface IFoo extends IBase {`);
@@ -75,10 +75,9 @@ const IGNORED_DIR_NAMES = new Set([
   'node_modules', '.git', 'build', '.codegraph', 'out', '.gradle', '.idea', 'bin', 'dist', 'aidl_api',
 ]);
 const CANDIDATE_NODE_KINDS: NodeKind[] = ['class', 'interface', 'struct'];
-export const HAL_WALK_MAX_DEPTH = 40;
-export const HAL_WALK_MAX_ENTRIES = 200_000;
+export const HAL_WALK_MAX_DEPTH = DECLARATION_WALK_MAX_DEPTH;
+export const HAL_WALK_MAX_ENTRIES = DECLARATION_WALK_MAX_ENTRIES;
 export interface HalWalkLimits { maxDepth?: number; maxEntries?: number; }
-interface HalFileWalkResult { files: string[]; truncated: boolean; }
 
 export type HalType = 'aidl' | 'hidl';
 
@@ -93,48 +92,6 @@ export interface FindHalInterfaceResult {
 }
 
 /**
- * HAL interfaces live under `hardware/interfaces/**`, not repo-root-wide like
- * app-level `.aidl` — restricting the walk to that subtree avoids false
- * matches against an app's own AIDL files that happen to share a HAL's name.
- *
- * Refuses to follow symlinks — both symlinked directories, for the same
- * repoRoot-boundary reasoning as aidl.ts's `findAidlFiles` (Codex 3rd-pass
- * review, 2026-09-04), and a symlinked FILE with a `.aidl`/`.hal`-looking
- * name, which the directory-only check left unguarded (Red Team round-3
- * finding, 2026-09-05 — symmetric with aidl.ts's fix).
- */
-function findHalFiles(root: string, extension: string, limits: HalWalkLimits = {}): HalFileWalkResult {
-  const maxDepth = limits.maxDepth ?? HAL_WALK_MAX_DEPTH;
-  const maxEntries = limits.maxEntries ?? HAL_WALK_MAX_ENTRIES;
-  const results: string[] = [];
-  let visited = 0;
-  let truncated = false;
-  const walk = (dir: string, underHalRoot: boolean, depth: number): void => {
-    if (truncated || depth > maxDepth) { truncated = true; return; }
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      if (visited >= maxEntries) { truncated = true; return; }
-      visited++;
-      if (entry.isSymbolicLink()) continue;
-      if (entry.isDirectory()) {
-        if (IGNORED_DIR_NAMES.has(entry.name)) continue;
-        const nowUnderHal = underHalRoot || entry.name === 'interfaces' && path.basename(dir) === 'hardware';
-        walk(path.join(dir, entry.name), nowUnderHal, depth + 1);
-      } else if (underHalRoot && entry.name.endsWith(extension)) {
-        results.push(path.join(dir, entry.name));
-      }
-    }
-  };
-  walk(root, false, 0);
-  return { files: results, truncated };
-}
-
-/**
  * Parse every HAL declaration named `halName` under `hardware/interfaces/`
  * — not just the first file-system-order match. Same rationale as aidl.ts's
  * `parseAidlDeclarations`: versioned HIDL directories routinely declare the
@@ -143,7 +100,7 @@ function findHalFiles(root: string, extension: string, limits: HalWalkLimits = {
  */
 function parseHalDeclarationsWithWalk(repoRoot: string, halName: string, extension: string, limits: HalWalkLimits = {}): { declarations: AidlDeclaration[]; truncated: boolean } {
   const declarations: AidlDeclaration[] = [];
-  const walk = findHalFiles(repoRoot, extension, limits);
+  const walk = walkDeclarationFiles(repoRoot, extension, IGNORED_DIR_NAMES, limits, true);
   for (const file of walk.files) {
     let rawText: string;
     try {
