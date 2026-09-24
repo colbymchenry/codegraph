@@ -48,10 +48,16 @@ export const playResolver: FrameworkResolver = {
     if (!m) return null;
     const [, className, methodName] = m;
     const classNodes = context.getNodesByName(className!).filter((n) => CLASS_KINDS.has(n.kind));
+    // Only a member of THAT class counts: a file can hold many classes (Java
+    // nested classes, a Scala class + its companion + siblings), and the first
+    // same-named method in the file is usually another class's. A Scala
+    // companion shares its class's qualifiedName, so it is covered too. An
+    // inherited member isn't looked up here — decline to the generic resolver.
     for (const cls of classNodes) {
+      const memberQn = `${cls.qualifiedName}::${methodName}`;
       const method = context
         .getNodesInFile(cls.filePath)
-        .find((n) => METHOD_KINDS.has(n.kind) && n.name === methodName);
+        .find((n) => METHOD_KINDS.has(n.kind) && n.name === methodName && n.qualifiedName === memberQn);
       if (method) {
         return { original: ref, targetNodeId: method.id, confidence: 0.9, resolvedBy: 'framework' };
       }

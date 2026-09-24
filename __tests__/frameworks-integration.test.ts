@@ -1443,3 +1443,88 @@ describe('Terraform follow-ups: remote-state bridge, provider alias, moved block
     }
   });
 });
+
+describe('Play end-to-end — Class.method resolves to a member of that class', () => {
+  let tmpDir: string;
+  afterEach(() => {
+    if (tmpDir && fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  const targetOf = (cg: CodeGraph, fromName: string, calleeName: string): string | undefined => {
+    const from = cg.getNodesByKind('method').find((n) => n.name === fromName);
+    expect(from).toBeDefined();
+    const edge = cg
+      .getOutgoingEdges(from!.id)
+      .filter((e) => e.kind === 'calls' || e.kind === 'references')
+      .map((e) => cg.getNode(e.target))
+      .find((t) => t?.name === calleeName);
+    return edge?.qualifiedName;
+  };
+
+  it('picks the named nested class member, not the first same-named method in its file', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-play-member-'));
+    fs.mkdirSync(path.join(tmpDir, 'conf'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'app/controllers'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'app/util'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'conf/routes'), 'GET  /  controllers.Application.index\n');
+    fs.writeFileSync(path.join(tmpDir, 'app/controllers/Application.java'), [
+      'package controllers;',
+      'public class Application {',
+      '  public static class Helper {',
+      '    public static String index() { return "helper"; }',
+      '  }',
+      '  public static String index() { return "app"; }',
+      '}',
+    ].join('\n'));
+    fs.writeFileSync(path.join(tmpDir, 'app/util/Http.java'), [
+      'package util;',
+      'public class Http {',
+      '  public static class Cookie {',
+      '    public static String parse(String s) { return s; }',
+      '  }',
+      '  public static class MediaType {',
+      '    public static String parse(String s) { return s; }',
+      '  }',
+      '}',
+    ].join('\n'));
+    fs.writeFileSync(path.join(tmpDir, 'app/util/Scheme.scala'), [
+      'package util',
+      'object Scheme {',
+      '  def parse(s: String): String = s',
+      '}',
+      'object AuthorityPort {',
+      '  def parse(s: String): String = s',
+      '}',
+    ].join('\n'));
+    fs.writeFileSync(path.join(tmpDir, 'app/util/Caller.java'), [
+      'package util;',
+      'public class Caller {',
+      '  public String javaCall() { return MediaType.parse("x"); }',
+      '  public String javaCookie() { return Cookie.parse("x"); }',
+      '}',
+    ].join('\n'));
+    fs.writeFileSync(path.join(tmpDir, 'app/util/ScalaCaller.scala'), [
+      'package util',
+      'class ScalaCaller {',
+      '  def scalaCall(): String = AuthorityPort.parse("x")',
+      '  def scalaScheme(): String = Scheme.parse("x")',
+      '}',
+    ].join('\n'));
+
+    const cg = await CodeGraph.init(tmpDir, { index: true });
+    try {
+      expect(targetOf(cg, 'javaCall', 'parse')).toBe('util::Http::MediaType::parse');
+      expect(targetOf(cg, 'javaCookie', 'parse')).toBe('util::Http::Cookie::parse');
+      expect(targetOf(cg, 'scalaCall', 'parse')).toBe('AuthorityPort::parse');
+      expect(targetOf(cg, 'scalaScheme', 'parse')).toBe('Scheme::parse');
+
+      const route = cg.getNodesByKind('route').find((n) => n.name === 'GET /');
+      expect(route).toBeDefined();
+      const handlers = cg.getOutgoingEdges(route!.id).map((e) => cg.getNode(e.target)?.qualifiedName);
+      expect(handlers).toContain('controllers::Application::index');
+      expect(handlers).not.toContain('controllers::Application::Helper::index');
+    } finally {
+      cg.close();
+    }
+  });
+});
