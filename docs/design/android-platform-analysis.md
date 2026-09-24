@@ -236,6 +236,8 @@ AndroidX, `LinearLayoutManager` resolved to its
 own `RecyclerView.LayoutManager` only in the comparison. The combined checkout
 also contains an AOSP internal `RecyclerView.LayoutManager`; the core branch
 was updated to disambiguate that collision by source-tree proximity.
+The baseline indexed 291,893 nodes and 658,555 edges; the comparison indexed
+292,709 nodes and 661,745 edges over the same 8,485 files.
 
 For the TypeScript control, the same 240 upstream `src/` files produced 8,439
 nodes and 26,172 edges in both builds; the sorted edge rows had the same
