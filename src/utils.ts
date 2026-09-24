@@ -174,19 +174,26 @@ export function validatePathWithinRoot(
  */
 export function validateProjectPath(dirPath: string): string | null {
   const resolved = path.resolve(dirPath);
+  let realResolved = resolved;
+  try {
+    realResolved = fs.realpathSync(resolved);
+  } catch {
+    // Preserve the existing error handling for paths that do not exist yet.
+  }
+  const pathsToCheck = realResolved === resolved ? [resolved] : [resolved, realResolved];
 
   // Block sensitive system directories
-  if (SENSITIVE_PATHS.has(resolved) || SENSITIVE_PATHS.has(resolved.toLowerCase())) {
-    return `Refusing to operate on sensitive system directory: ${resolved}`;
-  }
-
-  // Also block common sensitive home subdirectories
   const homeDir = require('os').homedir();
   const sensitiveHomeDirs = ['.ssh', '.gnupg', '.aws', '.config'];
-  for (const dir of sensitiveHomeDirs) {
-    const sensitivePath = path.join(homeDir, dir);
-    if (resolved === sensitivePath || resolved.startsWith(sensitivePath + path.sep)) {
-      return `Refusing to operate on sensitive directory: ${resolved}`;
+  for (const candidate of pathsToCheck) {
+    if (SENSITIVE_PATHS.has(candidate) || SENSITIVE_PATHS.has(candidate.toLowerCase())) {
+      return `Refusing to operate on sensitive system directory: ${candidate}`;
+    }
+    for (const dir of sensitiveHomeDirs) {
+      const sensitivePath = path.join(homeDir, dir);
+      if (candidate === sensitivePath || candidate.startsWith(sensitivePath + path.sep)) {
+        return `Refusing to operate on sensitive directory: ${candidate}`;
+      }
     }
   }
 
