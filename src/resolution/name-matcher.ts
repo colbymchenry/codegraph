@@ -13138,7 +13138,16 @@ export function matchByQualifiedName(
         : endsAtScopeBoundary(candidate.qualifiedName, ref.referenceName)), ref, context), ref, context);
     const ownLanguage = partialCandidates.filter((candidate) => sameLanguageFamily(candidate.language, ref.language));
     const pool = ownLanguage.length > 0 ? ownLanguage : partialCandidates;
-    const chosen = preferCallSiteFile(pool, ref.filePath)[0];
+    // `RecyclerView.LayoutManager` can exist in both AndroidX and the
+    // framework. For inheritance, pick the uniquely closest source tree;
+    // an equal-distance tie has no safe target.
+    const closest = isInheritanceRef(ref) && pool.length > 1
+      ? pool.map((node) => ({ node, distance: computePathProximity(ref.filePath, node.filePath) }))
+          .sort((a, b) => b.distance - a.distance)
+      : null;
+    const chosen = closest
+      ? (closest[0]!.distance > closest[1]!.distance ? closest[0]!.node : null)
+      : preferCallSiteFile(pool, ref.filePath)[0];
     if (chosen) {
       return {
         original: ref,
