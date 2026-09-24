@@ -13,7 +13,9 @@ vi.mock('child_process', async importOriginal => {
 });
 vi.mock('fs', async importOriginal => {
   const actual = await importOriginal<typeof import('fs')>();
-  return { ...actual, readFileSync: vi.fn(actual.readFileSync) };
+  // openSync too: a bounded source reader opens a descriptor instead of
+  // calling readFileSync, and the injected read failure must reach either.
+  return { ...actual, readFileSync: vi.fn(actual.readFileSync), openSync: vi.fn(actual.openSync) };
 });
 // The real entry points, for the injecting implementations to fall through to
 // and for afterEach to reinstate. Under Vitest 4 `vi.spyOn` on a mocked
@@ -26,9 +28,12 @@ const injectExecFileSync = (impl: (real: typeof cp.execFileSync, ...args: any[])
   vi.mocked(cp.execFileSync).mockImplementation(((...args: any[]) => impl(actualCp.execFileSync, ...args)) as typeof cp.execFileSync);
 const injectReadFileSync = (impl: (real: typeof fs.readFileSync, ...args: any[]) => unknown) =>
   vi.mocked(fs.readFileSync).mockImplementation(((...args: any[]) => impl(actualFs.readFileSync, ...args)) as typeof fs.readFileSync);
+const injectOpenSync = (impl: (real: typeof fs.openSync, ...args: any[]) => unknown) =>
+  vi.mocked(fs.openSync).mockImplementation(((...args: any[]) => impl(actualFs.openSync, ...args)) as typeof fs.openSync);
 const reinstateIo = () => {
   vi.mocked(cp.execFileSync).mockImplementation(actualCp.execFileSync as typeof cp.execFileSync);
   vi.mocked(fs.readFileSync).mockImplementation(actualFs.readFileSync as typeof fs.readFileSync);
+  vi.mocked(fs.openSync).mockImplementation(actualFs.openSync as typeof fs.openSync);
 };
 
 describe('git index currency across commits and restores (#1829)', () => {
@@ -147,10 +152,12 @@ describe('git index currency across commits and restores (#1829)', () => {
   it('keeps a committed path pending when sync cannot read it', async () => {
     write('new.ts', 'newSymbol'); commit();
     let injected = 0;
-    injectReadFileSync((real, file: any, ...args: any[]) => {
+    const failNewTs = (real: (...args: any[]) => unknown, file: any, ...args: any[]) => {
       if (String(file) === path.join(root, 'new.ts')) { injected++; throw new Error('Injected transient read error'); }
-      return (real as any)(file, ...args);
-    });
+      return real(file, ...args);
+    };
+    injectReadFileSync(failNewTs);
+    injectOpenSync(failNewTs);
     await cg.sync();
     expect(injected).toBeGreaterThan(0);
     expect(symbols('newSymbol')).not.toContain('newSymbol');
