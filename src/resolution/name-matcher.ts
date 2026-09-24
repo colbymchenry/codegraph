@@ -1566,9 +1566,11 @@ function inferJavaFieldReceiverType(
   if (!enclosing) return null;
 
   const enclosingEnd = enclosing.endLine ?? enclosing.startLine;
+  // Kotlin indexes a `val` property as a `constant`, a `var` as a `field`, and
+  // a companion-object property as a `variable`.
   const field = inFile.find(
     (n) =>
-      n.kind === 'field' &&
+      (n.kind === 'field' || (ref.language === 'kotlin' && (n.kind === 'constant' || n.kind === 'variable'))) &&
       n.name === receiverName &&
       n.language === ref.language &&
       n.startLine >= enclosing.startLine &&
@@ -1691,20 +1693,58 @@ function kotlinDeclaredTypeIn(
   name: string,
   ref: UnresolvedRef,
   context: ResolutionContext,
+  depth = 0,
 ): string | null {
   const r = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const typed = text.match(new RegExp(`\\b(?:val|var)\\s+${r}\\s*:\\s*([A-Z][\\w.]*)`));
   if (typed && typed[1]) return kotlinTypeName(typed[1]);
-  const assigned = text.match(new RegExp(`\\b(?:val|var)\\s+${r}\\s*=\\s*([A-Za-z_][\\w.]*)\\s*\\(`));
-  if (!assigned || !assigned[1]) return null;
+  // An alias of another value: `val old = ws`, `val s = current ?: return`,
+  // `val s = current!!` — typed as that value.
+  const alias = text.match(new RegExp(`\\b(?:val|var)\\s+${r}\\s*=\\s*([a-z_]\\w*)\\s*(?:!!|\\?:\\s*(?:return|continue|break|throw)\\b[^\\n]*)?\\s*$`, 'm'));
+  if (alias && alias[1] && alias[1] !== name && depth < 3) {
+    return kotlinReceiverDeclaredType(alias[1], ref, context, depth + 1);
+  }
+  // `(` or a trailing lambda `{`: `Thread { … }`, `thread { … }`.
+  const assigned = text.match(new RegExp(`\\b(?:val|var)\\s+${r}\\s*=\\s*([A-Za-z_][\\w.]*)\\s*[({]`));
+  if (!assigned || !assigned[1]) {
+    // An enum entry or other constant of a type: `var mode = GpsMode.ON`.
+    const entry = text.match(new RegExp(`\\b(?:val|var)\\s+${r}\\s*=\\s*([A-Z]\\w*(?:\\.[A-Z]\\w*)*)\\.[A-Z][A-Z0-9_]*\\b(?!\\s*[.(])`));
+    if (!entry || !entry[1]) return null;
+    // Only an entry of a project enum names its type; `Limits.MAX` is an Int.
+    const type = kotlinTypeName(entry[1]);
+    const simple = type?.split('::').pop();
+    return simple && context.getNodesByName(simple).some(
+      (n) => n.kind === 'enum' && sameLanguageFamily(n.language, ref.language),
+    ) ? type : null;
+  }
   const segments = assigned[1].split('.');
   const last = segments.pop()!;
   if (/^[A-Z]/.test(last)) return kotlinTypeName(assigned[1]);
   // A call. Only an owner written as a type chain (`Lock.tryBegin`) or none at
   // all (`beginOp()`) can be typed; `a.b.fn()` goes through values.
   if (segments.length > 0 && !segments.every((seg) => /^[A-Z]/.test(seg))) return null;
+  if (segments.length === 0 && KOTLIN_ARGUMENT_PASSTHROUGH.has(last)) {
+    const arg = text.match(new RegExp(`\\b${last}\\s*\\(\\s*([A-Za-z_]\\w*)\\s*[,)]`));
+    if (!arg || !arg[1] || arg[1] === name) return null;
+    // The argument is a parameter or local of the same scope.
+    const argType = inferLocalReceiverType(arg[1], ref, context);
+    return argType && /^[A-Z]/.test(argType) ? argType : null;
+  }
   return kotlinCallResultType(segments.length > 0 ? segments.join('::') : undefined, last, ref, context);
 }
+
+/** Kotlin stdlib functions whose result is always a library type. */
+const KOTLIN_LIBRARY_FACTORIES = new Set([
+  'listOf', 'mutableListOf', 'arrayListOf', 'emptyList', 'listOfNotNull',
+  'setOf', 'mutableSetOf', 'hashSetOf', 'linkedSetOf', 'sortedSetOf', 'emptySet',
+  'mapOf', 'mutableMapOf', 'hashMapOf', 'linkedMapOf', 'sortedMapOf', 'emptyMap',
+  'arrayOf', 'arrayOfNulls', 'emptyArray', 'intArrayOf', 'longArrayOf', 'byteArrayOf',
+  'sequenceOf', 'emptySequence', 'buildList', 'buildSet', 'buildMap', 'buildString',
+  'lazy', 'thread', 'mutableStateOf', 'Channel', 'MutableStateFlow', 'MutableSharedFlow',
+]);
+
+/** Stdlib functions that return their (non-null) argument: `requireNotNull(x)`. */
+const KOTLIN_ARGUMENT_PASSTHROUGH = new Set(['requireNotNull', 'checkNotNull']);
 
 /**
  * The declared return type of Kotlin `owner.fn` (or of an unqualified `fn`, a
@@ -1736,7 +1776,10 @@ function kotlinCallResultType(
     const inFile = candidates.filter((n) => n.filePath === ref.filePath);
     candidates = inOwnClass.length > 0 ? inOwnClass : inFile.length > 0 ? inFile : candidates;
   }
-  if (candidates.length === 0) return null;
+  // No project function of that name. A known stdlib factory returns a
+  // library type; any other library function (`requireNotNull`, `let`) may
+  // return a project value, so its result stays unknown.
+  if (candidates.length === 0) return !owner && KOTLIN_LIBRARY_FACTORIES.has(fn) ? KOTLIN_EXTERNAL_TYPE : null;
 
   let result: string | null = null;
   for (const c of candidates) {
@@ -1767,6 +1810,7 @@ function kotlinReceiverDeclaredType(
   name: string,
   ref: UnresolvedRef,
   context: ResolutionContext,
+  depth = 0,
 ): string | null {
   const lines = context.getFileLines
     ? context.getFileLines(ref.filePath)
@@ -1779,12 +1823,17 @@ function kotlinReceiverDeclaredType(
     for (let i = callIdx; i >= startIdx; i--) {
       const line = lines[i];
       if (!line || line.length > 10_000 || !declares.test(line)) continue;
-      const local = kotlinDeclaredTypeIn(line, name, ref, context);
+      const local = kotlinDeclaredTypeIn(line, name, ref, context, depth);
       if (local) return local;
       break;
     }
   }
-  return inferJavaFieldReceiverType(name, ref, context);
+  const property = inferJavaFieldReceiverType(name, ref, context);
+  if (property) return property;
+  // A typed parameter of the enclosing function or lambda (`webSocket:
+  // WebSocket` in an overridden callback).
+  const param = inferLocalReceiverType(name, ref, context);
+  return param && /^[A-Z]/.test(param) ? param : null;
 }
 
 // ── Local-variable receiver-type inference (#1108) ──────────────────────────

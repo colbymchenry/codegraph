@@ -66,6 +66,21 @@ internal interface SessionEvents {
     fun onLost(reason: String)
 }
 class Pattern { fun find(text: String): Int = 0 }
+class Conn { fun close() {} }
+class Buffer(val size: Int) { fun drain(): Int = 0 }
+class Pump { fun drain(): Int = 1 }
+enum class Mode { ON, OFF; fun next(): Mode = this }
+class Wheel { fun next(): Int = 0 }
+class Worker { fun start() {}; fun join(ms: Long) {} }
+class Vm {
+    fun refresh() {}
+    fun tick() {
+        activeController?.refresh()
+    }
+    companion object {
+        @Volatile private var activeController: Vm? = null
+    }
+}
 `);
     fs.writeFileSync(path.join(src, 'Users.kt'), `package p
 class LateinitUser {
@@ -95,6 +110,44 @@ class CallResultUser {
 }
 class Supervisor(private val events: SessionEvents) {
     fun lost() { events.onLost("gone") }
+}
+class ValUser {
+    private val pending = Buffer(
+        size = 4,
+    )
+    @Volatile private var current = Mode.ON
+    fun work() {
+        listOf(1).forEach {
+            pending.drain()
+        }
+    }
+    fun toggle() { current.next() }
+}
+class Socket2 { fun cancel() {} }
+class Session { fun cancel() {} }
+abstract class Listener { abstract fun onOpen(socket: java.net.Socket) }
+class AliasUser {
+    @Volatile private var current: Session? = null
+    fun stop() {
+        val old = current ?: return
+        old.cancel()
+    }
+    fun listen(): Listener = object : Listener() {
+        override fun onOpen(socket: java.net.Socket) {
+            socket.close()
+        }
+    }
+}
+class ThreadUser {
+    fun run() {
+        val serverThread = Thread {
+            println("x")
+        }
+        serverThread.start()
+        val later = lazy { 1 }
+        val items = mutableListOf(1)
+        items.clear()
+    }
 }
 class LibraryUser {
     private val regex = Regex("[0-9]+")
@@ -152,6 +205,28 @@ class LibraryUser {
     // `Regex.find` must not bind to the project's `Pattern.find`.
     expect(callees('LibraryUser', 'first')).toEqual([]);
     expect(callees('LibraryUser', 'scheduled')).toEqual([]);
+  });
+
+  it('a val property (indexed as a constant) and an enum-entry var are typed, inside a lambda too', () => {
+    expect(callees('ValUser', 'work')).toContain('p::Buffer::drain');
+    expect(callees('ValUser', 'work')).not.toContain('p::Pump::drain');
+    expect(callees('ValUser', 'toggle')).toEqual(['p::Mode::next']);
+  });
+
+  it('a companion-object property is typed', () => {
+    expect(callees('Vm', 'tick')).toEqual(['p::Vm::refresh']);
+  });
+
+  it('a trailing-lambda constructor or a library call types a local as a library type', () => {
+    // `Thread { … }.start()` must not bind to the project's `Worker.start`.
+    expect(callees('ThreadUser', 'run')).toEqual([]);
+  });
+
+  it('an alias takes the aliased value type; a library-typed parameter gets no edge', () => {
+    expect(callees('AliasUser', 'stop')).toEqual(['p::Session::cancel']);
+    const onOpen = cg.searchNodes('onOpen').map((r) => r.node).find((n) => n.filePath.endsWith('Users.kt'));
+    expect(onOpen).toBeDefined();
+    expect(cg.getCallees(onOpen!.id).filter((c) => c.edge.kind === 'calls')).toEqual([]);
   });
 
   it('a nested type keeps its outer type', () => {
