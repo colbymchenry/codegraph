@@ -162,7 +162,7 @@ describe('AOSP extension: findContentProviderImpl', () => {
     expect(result.status).toBe('found');
   });
 
-  it('does not treat an unrelated same-named import as android.content.ContentProvider (Codex adversarial review, 2026-09-12, HIGH-1)', async () => {
+  it('does not treat an unrelated same-named import as android.content.ContentProvider', async () => {
     write(
       'src/DemoProvider.java',
       'package p;\n\nimport unrelated.ContentProvider;\n\nclass DemoProvider extends ContentProvider {}\n'
@@ -176,7 +176,7 @@ describe('AOSP extension: findContentProviderImpl', () => {
     expect(result.status).not.toBe('found');
   });
 
-  it('recognizes a fully qualified "extends android.content.ContentProvider" clause with no import (Codex adversarial review, 2026-09-12, MEDIUM-4)', async () => {
+  it('recognizes a fully qualified "extends android.content.ContentProvider" clause with no import', async () => {
     write(
       'src/FqProvider.java',
       'package p;\n\nclass FqProvider extends android.content.ContentProvider {}\n'
@@ -190,7 +190,7 @@ describe('AOSP extension: findContentProviderImpl', () => {
     expect(result.status).toBe('found');
   });
 
-  it('handles single-quoted XML attributes in a <provider> declaration (Codex adversarial review, 2026-09-12, LOW-8)', async () => {
+  it('handles single-quoted XML attributes in a <provider> declaration', async () => {
     write(
       'AndroidManifest.xml',
       "<manifest><application><provider android:name='Demo' android:authorities='p.demo' /></application></manifest>\n"
@@ -204,7 +204,7 @@ describe('AOSP extension: findContentProviderImpl', () => {
     expect(result.manifestDeclarations[0]!.authorities).toEqual(['p.demo']);
   });
 
-  it('does not read a nested <meta-data> child element name as the enclosing <provider>\'s own name (Codex adversarial review, 2026-09-12, LOW-8)', async () => {
+  it('does not read a nested <meta-data> child element name as the enclosing <provider>\'s own name', async () => {
     write(
       'AndroidManifest.xml',
       '<manifest><application><provider android:name="RealProvider" android:authorities="real.provider">' +
@@ -219,7 +219,7 @@ describe('AOSP extension: findContentProviderImpl', () => {
     expect(result.status).toBe('no_content_provider_found');
   });
 
-  it('finds an ordinary same-line ContentResolver content:// URI client call (Codex adversarial review, 2026-09-12, MEDIUM-7)', async () => {
+  it('finds an ordinary same-line ContentResolver content:// URI client call', async () => {
     write(
       'src/DemoProvider.java',
       'import android.content.ContentProvider;\nclass DemoProvider extends ContentProvider {}\n'

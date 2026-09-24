@@ -143,7 +143,7 @@ describe('AOSP extension: findMessengerIpc', () => {
     expect(result.status).toBe('convention_derived_candidate');
   });
 
-  it('does not treat an unrelated same-named import as android.os.Messenger (Codex adversarial review, 2026-09-12, HIGH-1)', async () => {
+  it('does not treat an unrelated same-named import as android.os.Messenger', async () => {
     write(
       'src/DecoyService.java',
       'package p;\n\nimport unrelated.Messenger;\n\nclass DecoyService {\n    Object x = new Messenger();\n}\n'
@@ -157,7 +157,7 @@ describe('AOSP extension: findMessengerIpc', () => {
     expect(result.status).not.toBe('found');
   });
 
-  it('does not attribute a sibling class construction on the same source line to the matched class (Codex adversarial review, 2026-09-12, HIGH-2)', async () => {
+  it('does not attribute a sibling class construction on the same source line to the matched class', async () => {
     write(
       'src/Both.java',
       'import android.os.Messenger;\nclass EmptyService {} class Other { Object m = new Messenger(null); }\n'
@@ -172,7 +172,7 @@ describe('AOSP extension: findMessengerIpc', () => {
     expect(result.status).toBe('convention_derived_candidate');
   });
 
-  it('does not attribute a nested static class construction to the enclosing class (Codex adversarial review, 2026-09-12, HIGH-2)', async () => {
+  it('does not attribute a nested static class construction to the enclosing class', async () => {
     write(
       'src/OuterService.java',
       'import android.os.Messenger;\nclass OuterService {\n static class Independent {\n Object m = new Messenger(null);\n }\n}\n'
@@ -187,7 +187,7 @@ describe('AOSP extension: findMessengerIpc', () => {
     expect(result.status).toBe('convention_derived_candidate');
   });
 
-  it('prefers a corroborated bare-name provider over an uncorroborated {Name}Service decoy (Codex adversarial review, 2026-09-12, MEDIUM-6)', async () => {
+  it('prefers a corroborated bare-name provider over an uncorroborated {Name}Service decoy', async () => {
     write('src/DemoService.java', 'class DemoService {}\n');
     write(
       'src/Demo.java',

@@ -8,8 +8,7 @@
  * don't record the modifier on the node) and pairing it, independently,
  * with a JNI naming-convention match on the C/C++ side and an explicit
  * `RegisterNatives` registration. `found` requires BOTH; a name match alone
- * is `convention_derived_candidate` — the two states must stay distinct
- * (Codex's review, 2026-09-02).
+ * is `convention_derived_candidate` — the two states must stay distinct.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs';
@@ -74,7 +73,7 @@ describe('AOSP extension: findJniBridge', () => {
     // convention the primary signal above searches for; it registers an
     // explicit table of {"javaName", "sig", (void*)nativeFn} entries via
     // RegisterMethodsOrDie/RegisterNatives/jniRegisterNativeMethods (verified
-    // against a real frameworks/base core/jni/ checkout, 2026-09-06: 119 of
+    // against a frameworks/base core/jni/ checkout: 119 of
     // 119 registration sites use this shape, 0 use Java_*). Without reading
     // the table, `found` was structurally unreachable for any real AOSP
     // platform bridge.
@@ -109,7 +108,7 @@ describe('AOSP extension: findJniBridge', () => {
     expect(result.status).toBe('found');
   });
 
-  it('ignores a JNINativeMethod table entry for a method this class never declared, even in a file that DOES register this class (Codex review finding, 2026-09-06)', async () => {
+  it('ignores a JNINativeMethod table entry for a method this class never declared, even in a file that DOES register this class', async () => {
     write(
       'src/Qux.java',
       'package com.example.jni;\n\n' +
@@ -206,7 +205,7 @@ describe('AOSP extension: findJniBridge', () => {
     expect(result.status).toBe('convention_derived_candidate');
   });
 
-  it('ignores a JNINativeMethod table entry sitting in a comment (Codex review finding, 2026-09-06)', async () => {
+  it('ignores a JNINativeMethod table entry sitting in a comment', async () => {
     write(
       'src/Comment.java',
       'package com.example.jni;\n\n' +
@@ -308,8 +307,7 @@ describe('AOSP extension: findJniBridge', () => {
     expect(result.status).toBe('class_not_found');
   });
 
-  // Regression coverage for the 2026-09-04 code review.
-  describe('code review fixes (2026-09-04)', () => {
+  describe('JNI registration regressions', () => {
     it('mangles a literal underscore in the package name per the JNI spec (not the previous bare passthrough)', async () => {
       write(
         'src/Qux.kt',
@@ -405,7 +403,7 @@ describe('AOSP extension: findJniBridge', () => {
       expect(result.status).toBe('class_not_found');
     });
 
-    it('does not throw on a class name containing regex metacharacters (Codex 3rd-pass review, 2026-09-04: the aidl.ts fix had a regression test but jni.ts did not)', async () => {
+    it('does not throw on a class name containing regex metacharacters', async () => {
       write('src/Unrelated.kt', 'package com.example.jni\n\nclass Unrelated\n');
       cg = CodeGraph.initSync(dir);
       await cg.indexAll();
@@ -415,8 +413,7 @@ describe('AOSP extension: findJniBridge', () => {
     });
   });
 
-  // Regression coverage for the 2026-09-04 Red Team round-1 finding.
-  describe('same-file, different-package same-name class (Red Team round-1, 2026-09-04)', () => {
+  describe('same-file, different-package same-name class', () => {
     it('does NOT report "found" from a RegisterNatives hit whose FindClass(...) argument names an unrelated package\'s same-named class', async () => {
       write(
         'src/Shared.kt',
@@ -514,7 +511,7 @@ describe('AOSP extension: findJniBridge', () => {
     });
   });
 
-  describe('round-4 JNI refactor regressions', () => {
+  describe('JNI correlation regressions', () => {
     it('matches a native method declared inside a nested Kotlin class using the JNI inner-class mangling', async () => {
       write(
         'src/Outer.kt',

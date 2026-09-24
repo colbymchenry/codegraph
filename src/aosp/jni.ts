@@ -6,8 +6,7 @@
  * fires for a broken extends/implements clause (a cross-language type that
  * never resolved), which is the AIDL Stub/Proxy shape. A `native`/`external`
  * method declaration is a leaf, not an extends clause — there's nothing for
- * the resolver to fail to resolve. Codex's review (2026-09-02) called this
- * out explicitly: JNI needs its own primary signal — the native declaration
+ * the resolver to fail to resolve. JNI needs its own primary signal — the native declaration
  * paired with the `JNIEXPORT Java_*` naming convention or an explicit
  * `RegisterNatives` table entry — not a reuse of the AIDL signal.
  *
@@ -19,8 +18,7 @@
  * find_aidl_impl uses for `.aidl` files.
  *
  * Each hop (Java/Kotlin declaration -> JNI-convention name match -> explicit
- * RegisterNatives registration) is reported as INDEPENDENT evidence, per
- * Codex's guidance — a name-convention match alone is a weaker claim than a
+ * RegisterNatives registration) is reported as INDEPENDENT evidence: a name-convention match alone is a weaker claim than a
  * confirmed RegisterNatives registration, and the two must not be collapsed
  * into a single boolean.
  */
@@ -49,8 +47,7 @@ export interface JniCandidate {
    * matches on the bare class name alone, so a source file that handles two
    * different packages' same-named class (e.g. `com.a.Foo` and `com.b.Foo`
    * both touched in one .cpp file) would let a registration for the WRONG
-   * package corroborate this bridge purely by sharing a file (Red Team
-   * round-1 finding, 2026-09-04). `verifyRegisterNativesTarget` below checks
+   * package corroborate this bridge purely by sharing a file. `verifyRegisterNativesTarget` below checks
    * the `env->FindClass("com/a/Foo")` argument feeding the call, when one can
    * be found nearby, against this class's actual package.
    */
@@ -67,8 +64,7 @@ export interface JniCandidate {
    * its own. It exists because `found`/`correlatedRegistrations` otherwise
    * combine "a native impl with SOME method exists" and "a RegisterNatives
    * call for this class exists" purely as two independent counts, which can
-   * both be true for methods that have nothing to do with each other (Codex
-   * round-4 Blue Team + Black Hat findings, 2026-09-05) — this is a partial,
+   * both be true for methods that have nothing to do with each other — this is a partial,
    * best-effort signal surfaced so a reader isn't left with zero visibility
    * into whether method-level correlation looks plausible.
    */
@@ -101,10 +97,7 @@ const JAVA_NATIVE_METHOD_RE = /\bnative\s+[\w<>[\],.\s]+?\b(\w+)\s*\(/;
  * stale relative to disk), but it does close the narrower window where
  * `findNativeDeclarations` and `verifyRegisterNativesTarget` independently
  * re-read the same file and could observe two DIFFERENT states of it if an
- * edit landed in between (White Hat round-4 finding, 2026-09-05: a
- * TOCTOU-shaped integrity gap an attacker with write access and precise
- * timing could exploit to make one read see planted evidence the other
- * doesn't, or vice versa).
+ * edit landed in between.
  */
 function makeFileCache(repoRoot: string): (filePath: string) => string | null {
   const cache = new Map<string, string | null>();
@@ -162,8 +155,7 @@ function findNativeDeclarations(
  * followed by the 4-hex-digit UTF-16 code unit, e.g. `$` (U+0024) -> `_00024`.
  *
  * The previous version only replaced `.` and `$` with a bare `_`, which
- * silently mis-mangled any package/class containing a literal underscore
- * (a real, if less common, false negative — code review finding, 2026-09-04).
+ * silently mis-mangled any package/class containing a literal underscore.
  */
 function jniMangle(qualifiedDotted: string): string {
   let out = '';
@@ -190,7 +182,7 @@ const FIND_CLASS_RE = /FindClass\s*\(\s*"([^"]+)"\s*\)/g;
  * name converted to dotted form) against the class this bridge search is
  * actually about — the only way to tell apart a real registration for THIS
  * class from a same-file, same-bare-name registration for an unrelated
- * package's class of the same name (Red Team round-1 finding, 2026-09-04).
+ * package's class of the same name.
  *
  * Takes the LAST `FindClass(...)` match in the window (closest to the
  * `RegisterNatives` line), not the first — `windowText` is built
@@ -200,8 +192,7 @@ const FIND_CLASS_RE = /FindClass\s*\(\s*"([^"]+)"\s*\)/g;
  * several classes a few lines apart (a common real shape, e.g.
  * `android_util_*.cpp`/`android_view_*.cpp` files with multiple
  * `register_android_xxx()` functions) — that misattributed a completely
- * correct registration as a `mismatch` (Blue Team round-3 finding,
- * 2026-09-05, reproduced live via a Node REPL).
+ * correct registration as a `mismatch`.
  *
  * Returns `'unverifiable'`, not `'mismatch'`, when no `FindClass(...)` is
  * found nearby — plenty of real registration code builds the `jclass` a
@@ -265,8 +256,7 @@ function registrationMentionsAnyMethod(
  * sample of 119 registration call sites under a real `frameworks/base`
  * `core/jni/` found ZERO `Java_*`-named functions and 100% table-based
  * registration, so without this, `find_jni_bridge` structurally could never
- * reach `found` on genuine AOSP platform code (found via a real benchmark,
- * 2026-09-06).
+ * reach `found` on genuine AOSP platform code.
  *
  * Deliberately scoped to `candidateFiles` (the files a RegisterNatives-family
  * call ALREADY named this exact class in, computed by the caller), and then to
@@ -276,15 +266,13 @@ function registrationMentionsAnyMethod(
  * function names that collide across unrelated classes, so an unscoped scan
  * could pull in a same-named method's implementation from a completely
  * different bridge and, combined with a package-verified registration
- * elsewhere, produce a false `found` (Codex review finding, 2026-09-06).
+ * elsewhere, produce a false `found`.
  * Restricting to the class's registered table keeps this signal tied to the
  * actual class being queried.
  *
  * Comments are stripped before matching (the same `stripCLikeComments` every
  * other text-candidate search in this module uses) so a table entry left in
- * a `//` or `/* ... *\/` comment does not count as live code (Codex review
- * finding, 2026-09-06: the previous version only skipped a `//`-prefixed
- * line, not a block comment or a same-line trailing comment).
+ * a `//` or `/* ... *\/` comment does not count as live code.
  *
  * Only matches a SINGLE-LINE entry (the overwhelmingly common real shape,
  * verified against android_util_Process.cpp): an entry whose
@@ -453,7 +441,7 @@ interface ClassNodeForJni {
  * chain a real JNI symbol must encode as `Outer_00024Inner`. A native
  * method declared inside a nested class was therefore structurally
  * unfindable — not degraded confidence, a hard miss with no signal that the
- * search itself was malformed (Red Team round-4 finding, 2026-09-05).
+ * search itself was malformed.
  */
 function classBinaryNameAndPackage(classNode: ClassNodeForJni): { packageName?: string; classBinaryName: string } {
   const parts = classNode.qualifiedName.split('::');
@@ -476,8 +464,7 @@ interface JniBridgeEvaluation {
  * `findJniBridge` so multiple same-named class nodes (see that function's
  * docstring) can each be tried independently and the strongest result kept,
  * rather than the first exact-name match winning unconditionally regardless
- * of whether it actually has anything to do with JNI (Black Hat round-4
- * finding, 2026-09-05).
+ * of whether it actually has anything to do with JNI.
  */
 function evaluateJniBridgeForClass(
   cg: CodeGraph,
@@ -511,9 +498,7 @@ function evaluateJniBridgeForClass(
   const nativeImplementations: JniCandidate[] = [];
   for (const decl of nativeDeclarations) {
     // The method name itself can carry a literal underscore just as a
-    // package/class name can — mangle it too, not just the class portion
-    // (Red Team round-4 finding, 2026-09-05: the previous version left
-    // `decl.methodName` unmangled).
+    // package/class name can — mangle it too, not just the class portion.
     const mangledMethod = jniMangle(decl.methodName);
     const jniSymbol = `Java_${mangledClass}_${mangledMethod}`;
     const matches = cg.searchNodes(jniSymbol, { kinds: ['function'], limit: 20 });
@@ -532,8 +517,7 @@ function evaluateJniBridgeForClass(
         // Overloaded native method: JNI appends a mangled type-descriptor
         // suffix (`__<signature>`) to disambiguate overloads. The previous
         // version only checked the exact short name, so a legitimately
-        // bridged overloaded method reported no_bridge_found (code review
-        // finding, 2026-09-04). This doesn't verify the suffix matches the
+        // bridged overloaded method reported no_bridge_found. This doesn't verify the suffix matches the
         // DECLARED overload's actual parameter types — that needs a JVM
         // descriptor computed from the Kotlin/Java signature, which CodeGraph
         // doesn't expose here — so it's still a convention-derived match, not
@@ -557,8 +541,7 @@ function evaluateJniBridgeForClass(
   // The registration-table wrapper helpers AOSP platform code actually uses
   // are at least as common as a bare `RegisterNatives` call — a bare-call
   // scan alone missed every bridge wired through one of these, reporting a
-  // real registration as `no confirmed registration` (Green Team round-4
-  // finding, 2026-09-05). Computed BEFORE the JNINativeMethod table scan
+  // real registration as `no confirmed registration`. Computed BEFORE the JNINativeMethod table scan
   // below so that scan can be restricted to files and table arguments this
   // search already corroborated for THIS class (see findNativeMethodTableEntries's
   // docstring for why an unscoped table scan is unsafe).
@@ -638,7 +621,7 @@ function evaluateJniBridgeForClass(
     evidence.push(
       `${mismatchedRegistrations.length} of those registration hit(s) matched the bare class name "${className}" ` +
         `but the nearby FindClass(...) argument names a different package — excluded, this would otherwise let a ` +
-        'same-file, same-named class from an unrelated package corroborate this bridge (Red Team round-1 finding, 2026-09-04)'
+        'same-file, same-named class from an unrelated package corroborate this bridge'
     );
   }
   const noMethodMentionCount = registerNativesHits.filter((c) => c.packageVerified !== 'mismatch' && !c.methodMentioned).length;
@@ -647,7 +630,7 @@ function evaluateJniBridgeForClass(
       `${noMethodMentionCount} of those registration hit(s) don't mention any of this class's declared native ` +
         `method name(s) as a nearby string literal — "found" below is still a CLASS-level correlation (a native ` +
         `impl exists for SOME declared method, and a registration call exists for this class), not proof that the ` +
-        'SAME method is what got registered (Codex round-4 Blue Team + Black Hat findings, 2026-09-05)'
+        'SAME method is what got registered'
     );
   }
 
@@ -657,9 +640,7 @@ function evaluateJniBridgeForClass(
   // because it's in the SAME FILE as a native-impl name match — a
   // RegisterNatives line mentioning this class elsewhere in the repo (a
   // comment, an unrelated registration table, a different overload set) is
-  // not evidence for THIS bridge on its own (code review finding,
-  // 2026-09-04: the previous version combined any impl match with any
-  // registration hit anywhere in the repo). Same-file correlation is still
+  // not evidence for THIS bridge on its own. Same-file correlation is still
   // not full method/signature-level proof; a package mismatch always
   // disqualifies a hit even if it happens to share a file.
   const implFiles = new Set(nativeImplementations.map((c) => c.filePath));
@@ -699,7 +680,7 @@ const STATUS_RANK: Record<FindJniBridgeStatus, number> = {
  * Find the Java/Kotlin native declarations in `className`, then search for a
  * matching native implementation by the `Java_<package>_<Class>_<method>`
  * naming convention and an explicit `RegisterNatives` registration —
- * independently, per Codex's review: a name match alone is not the same
+ * independently: a name match alone is not the same
  * claim as a confirmed registration.
  */
 export function findJniBridge(cg: CodeGraph, repoRoot: string, className: string): FindJniBridgeResult {
@@ -713,8 +694,7 @@ export function findJniBridge(cg: CodeGraph, repoRoot: string, className: string
   // Exact match only — searchNodes is FTS/fuzzy, so falling back to its first
   // hit when no exact match exists (the previous behavior) silently swapped
   // in an unrelated class (e.g. "FooManager" for a "Foo" query) and reported
-  // findings against it. Report class_not_found instead (code review
-  // finding, 2026-09-04) — the same fail-closed discipline the native-impl
+  // findings against it. Report class_not_found instead — the same fail-closed discipline the native-impl
   // search below already applies.
   const exactMatches = classMatches.filter((m) => m.node.name === className).map((m) => m.node);
 
@@ -736,7 +716,7 @@ export function findJniBridge(cg: CodeGraph, repoRoot: string, className: string
   // The previous version picked `classMatches.find(...)`'s first hit
   // unconditionally; a decoy class sharing the bare name but with no real
   // JNI bridge (or, worse, a DIFFERENT class's bridge) could silently be
-  // reported as this one's result (Black Hat round-4 finding, 2026-09-05).
+  // reported as this one's result.
   // Evaluating every exact-name candidate and keeping the strongest result
   // doesn't recover the caller's true intent — it can't, from a bare name
   // alone — but it stops an arbitrary pick from masquerading as a specific

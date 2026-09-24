@@ -3085,7 +3085,7 @@ export class QueryBuilder {
    * `getUnresolvedByName('IBar')` alone would silently miss any such
    * reference that stays genuinely unresolved. Note this method covers only
    * the case where the reference reaches `unresolved_refs` at all: a
-   * separate cross-file resolver bug (fixed 2026-09-06, see
+   * separate cross-file resolver bug (see
    * src/resolution/name-matcher.ts) could mis-resolve a dotted `extends`
    * reference to an unrelated same-named method BEFORE it ever became
    * "unresolved", which this method has no visibility into. AOSP-only
@@ -3095,8 +3095,7 @@ export class QueryBuilder {
    * that broader match previously lived here and leaked into every caller
    * (including aidl-impl's Kotlin/Java-only contract), letting an unrelated
    * C++ `class Decoy : public ns::IFoo {}` get promoted to a false
-   * "found" implementation for a Kotlin/Java-only AIDL interface (Codex
-   * adversarial review, 2026-09-10, HIGH-1). The `::`-suffix match now lives
+   * "found" implementation for a Kotlin/Java-only AIDL interface. The `::`-suffix match now lives
    * in {@link getUnresolvedByNamespacedSuffix}, used only by hal.ts's
    * AIDL-specific Bn{Name} Binder-native stub check.
    */
@@ -3138,8 +3137,7 @@ export class QueryBuilder {
    * SQLite's `LIKE` is ASCII case-insensitive by default, which would let
    * `%::BnFoo` also match an unrelated `ns::bnfoo` (a different C++
    * identifier) — filtered back out here with an exact, case-sensitive
-   * suffix check on the returned rows (Codex adversarial review, 2026-09-10,
-   * MEDIUM-2).
+   * suffix check on the returned rows.
    */
   getUnresolvedByNamespacedSuffix(name: string): UnresolvedReference[] {
     if (!this.stmts.getUnresolvedByNamespacedSuffix) {

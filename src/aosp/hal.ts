@@ -13,9 +13,8 @@
  * HAL implementations are commonly native (C++), unlike app-level AIDL Stubs
  * which are Kotlin/Java — so this adds a c/cpp implementation-name search
  * alongside the Kotlin/Java unresolved-refs signal used by find_aidl_impl.
- * Per Codex's Phase 3 scoping review (2026-09-04): reuse the Phase 1
- * contract, add only the HAL-specific path/extension/native-impl pieces —
- * do not invent a new status model.
+ * It uses the AIDL result model, adding HAL-specific path, extension, and
+ * native implementation searches.
  *
  * Scope limitation: this module tracks source declarations, implementations,
  * and registration text only. It does not inspect VINTF manifests,
@@ -31,9 +30,7 @@ import type { AospCandidate, FindAidlImplStatus, AidlDeclaration } from './aidl'
 
 // HIDL interfaces commonly declare a parent (`interface IFoo extends IBase {`);
 // AIDL interfaces never do. The optional `extends` clause covers both without
-// a separate HIDL-only regex (Codex cross-review finding, 2026-09-04: the
-// original pattern only matched the parentless AIDL shape and silently
-// treated every HIDL-with-parent declaration as "no declaration found").
+// a separate HIDL-only regex.
 // Unicode-aware for the same reason as aidl.ts's AIDL_INTERFACE_RE.
 //
 // The extends-target character class also needs `.`, `@`, and `:` — real
@@ -43,17 +40,14 @@ import type { AospCandidate, FindAidlImplStatus, AidlDeclaration } from './aidl'
 // case. The previous class excluded all three characters, so the whole
 // `extends` clause failed to match and the no-extends fallback branch also
 // failed (the character right after the interface name is `e`, not `{`) —
-// the entire declaration went unmatched, not just mis-parsed (Red Team
-// round-4 finding, 2026-09-05).
+// the entire declaration went unmatched, not just mis-parsed.
 const HAL_INTERFACE_RE = /\binterface\s+([\p{L}\p{N}_$]+)(?:\s+extends\s+[\p{L}\p{N}_$.@:]+)?\s*\{/gu;
 const HAL_METHOD_RE = /^\s*(?:oneway\s+)?[\w<>[\],.\s]+?\s+([\p{L}\p{N}_$]+)\s*\([^;{]*\)\s*;/gmu;
 // HIDL's package clause carries a version suffix (`package android.hardware.foo@1.0;`).
 // The bare package (with `@version` stripped) still needs to be captured for the
 // same-package-membership check, but the version itself is captured separately —
 // HIDL's actual generated Java import is `android.hardware.foo.V1_0.IFoo`, not
-// `android.hardware.foo.IFoo` (Codex 3rd-pass review, 2026-09-04: stripping the
-// version and comparing only the bare package demoted every real HIDL Java
-// implementation, because its import never matches the version-less FQCN).
+// `android.hardware.foo.IFoo`.
 const HAL_PACKAGE_RE = /^\s*package\s+([\p{L}\p{N}_.]+)(?:@(\d+)\.(\d+))?\s*;/mu;
 // NOT a generic "vendored third-party code" list — see aidl.ts's identical
 // note. `vendor/` is a first-class AOSP source directory (the Treble vendor
@@ -62,7 +56,7 @@ const HAL_PACKAGE_RE = /^\s*package\s+([\p{L}\p{N}_.]+)(?:@(\d+)\.(\d+))?\s*;/mu
 // segment, and Treble-compliant vendor trees commonly place their OWN
 // `hardware/interfaces/` under `vendor/<oem>/...` — skipping `vendor/`
 // outright means that entire subtree is NEVER walked, not just one
-// declaration missed (Black Hat round-4 finding, 2026-09-05).
+// declaration missed.
 //
 // `aidl_api` IS excluded, deliberately and for a different reason: AIDL API
 // freeze directories (`.../aidl/aidl_api/<pkg>/{1,2,...,current}/**/*.aidl`)
@@ -70,7 +64,7 @@ const HAL_PACKAGE_RE = /^\s*package\s+([\p{L}\p{N}_.]+)(?:@(\d+)\.(\d+))?\s*;/mu
 // second independent declaration. Without this, `parseHalDeclarations`
 // reported every frozen version as a same-named "declaration collision",
 // producing disambiguation noise for the exact versioned-AIDL-HAL shape this
-// tool targets (Green Team round-4 finding, 2026-09-05).
+// tool targets.
 const IGNORED_DIR_NAMES = new Set([
   'node_modules', '.git', 'build', '.codegraph', 'out', '.gradle', '.idea', 'bin', 'dist', 'aidl_api',
 ]);
@@ -116,9 +110,7 @@ function parseHalDeclarationsWithWalk(repoRoot: string, halName: string, extensi
 
       // Scope the method scan to this interface's own body via brace-depth
       // tracking, not a plain indexOf — same fix and rationale as aidl.ts's
-      // parseAidlDeclarations (self-review finding, 2026-09-05; brace-depth
-      // fix for nested enum/struct/union, Red Team round-4 finding,
-      // 2026-09-05).
+      // parseAidlDeclarations.
       const bodyStart = match.index + match[0].length;
       const bodyEnd = findMatchingBraceEnd(text, bodyStart);
       const body = bodyEnd === -1 ? text.slice(bodyStart) : text.slice(bodyStart, bodyEnd);
@@ -189,7 +181,7 @@ function findUnresolvedExtendsCandidates(
  * the interface (`DefaultVehicleHal`, `ExternalCameraProvider`, ...) — the
  * only structural signal that a class IS a HAL's implementation is that it
  * inherits the AIDL compiler's generated `Bn{Name}` Binder-native stub
- * (`class DefaultVehicleHal final : public BnVehicle`), the C++ analog of
+ * (`class DefaultVehicleHal final: public BnVehicle`), the C++ analog of
  * Java's `{Name}.Stub`. `Bn{Name}` is generated at build time and is never
  * checked into source, so — exactly like a Kotlin/Java `.Stub()` reference —
  * it shows up as an UNRESOLVED extends/implements reference, not a resolved
@@ -199,8 +191,7 @@ function findUnresolvedExtendsCandidates(
  * Real HAL implementations are the specific case that motivated this: the
  * old naming-convention-only search (bare name / `Impl` suffix) silently
  * missed IVehicle/ICameraProvider/ITelephony's actual C++ implementations
- * entirely, because none of them are named after the interface (found by
- * validating against the real hardware/interfaces mirror, 2026-09-10).
+ * entirely, because none of them are named after the interface.
  *
  * C++ has no Java-style `import`, so there is no package-membership check
  * to run here the way `candidateReachesPackagedSymbol` does for Kotlin/Java
@@ -217,7 +208,7 @@ function findUnresolvedExtendsCandidates(
  * without following the convention (`Interface` -> `nterface`, `Ifoo` ->
  * `foo`, `I` -> ``), which never matches what the real AIDL compiler
  * generates and produced `no_implementation_found` false negatives on those
- * boundary names (Codex adversarial review, 2026-09-10, MEDIUM-1).
+ * boundary names.
  */
 function aidlBareName(interfaceName: string): string {
   if (interfaceName.length >= 2 && interfaceName[0] === 'I' && /[A-Z]/.test(interfaceName[1]!)) {
@@ -233,15 +224,14 @@ function aidlBareName(interfaceName: string): string {
  * to `halType === 'aidl'` because HIDL's native wrapper naming is a
  * different family (`BnHw{Name}`), and applying this AIDL-only pattern to a
  * HIDL lookup previously let an unrelated `Bn{Name}` hit falsely promote a
- * HIDL interface too (Codex adversarial review, 2026-09-10, HIGH-3).
+ * HIDL interface too.
  *
  * Deliberately reported as `unverifiable` (never `verified`) and, per
  * `findHalInterface`, deliberately excluded from the candidate set that can
  * promote a result to `found` — an unrelated project-internal class that
  * happens to share the `Bn{Name}` string is not distinguishable here from a
  * real AIDL-generated stub subclass without inspecting the actual generated
- * header, so this alone can only ever raise a `convention_derived_candidate`
- * (Codex adversarial review, 2026-09-10, HIGH-2).
+ * header, so this alone can only ever raise a `convention_derived_candidate`.
  */
 function findBnStubCandidates(cg: CodeGraph, halName: string, halType: HalType): AospCandidate[] {
   if (halType !== 'aidl') return [];
@@ -268,12 +258,11 @@ function findBnStubCandidates(cg: CodeGraph, halName: string, halType: HalType):
 
 function findNamingConventionCandidates(cg: CodeGraph, halName: string, seen: Set<string>, evidence: string[]): AospCandidate[] {
   // Also try the bare name with a leading "I" dropped (`IFoo` -> `FooImpl`)
-  // — aidl.ts's equivalent search already does this (Blue Team round-2
-  // finding, 2026-09-04), but this HAL search never inherited it, even
+  // — aidl.ts's equivalent search already does this, but this HAL search never inherited it, even
   // though HAL's own native-impl search two functions below already drops
   // the `I` for C/C++. A mock/test HAL implemented in Kotlin/Java as
   // `FooImpl` (the far more common shape in practice) went entirely
-  // unmatched here (Green Team round-3 finding, 2026-09-05).
+  // unmatched here.
   const bareName = halName.replace(/^I/, '');
   const patterns = [`${halName}Stub`, `${halName}Impl`, `${bareName}Impl`];
   const candidates: AospCandidate[] = [];
@@ -302,15 +291,14 @@ function findNamingConventionCandidates(cg: CodeGraph, halName: string, seen: Se
 /**
  * HAL implementations are commonly native, so also look for a c/cpp
  * class/struct exactly named `{HalName}` (the implementation class usually
- * reuses the interface's bare name, e.g. `class Foo : public IFoo` for a
+ * reuses the interface's bare name, e.g. `class Foo: public IFoo` for a
  * HAL named `IFoo` — this checks for a class dropping the leading `I`, the
  * AOSP HAL convention) or `{HalName}Impl` / `{HalName}Hal`.
  *
  * Legacy HAL implementations are frequently plain C (a `struct` with
  * function-pointer members), not C++ — CodeGraph tags these `c`, distinct
  * from `cpp`. Accepting only `cpp` here silently excluded every C-only HAL
- * even though the registration search two lines below already scans both
- * (Codex cross-review finding, 2026-09-04).
+ * even though the registration search two lines below already scans both.
  */
 function findNativeImplCandidates(cg: CodeGraph, halName: string, seen: Set<string>, evidence: string[]): AospCandidate[] {
   const bareName = halName.replace(/^I/, '');
@@ -359,11 +347,8 @@ export function findHalInterface(
   }
 
   // Same multi-declaration disambiguation as findAidlImpl — versioned HIDL
-  // directories are the canonical case this matters for (Blue Team
-  // 2nd-round finding, 2026-09-04). Priority is `verified` > `unverifiable`
-  // > "matched the most candidates", not just "any non-mismatch candidate" —
-  // see aidl.ts's identical fix for the Codex round-4 Blue Team finding this
-  // corrects (2026-09-05).
+  // directories are the canonical case this matters for. Priority is `verified`
+  // > `unverifiable` > "matched the most candidates".
   let declaration: AidlDeclaration = declarations[0]!;
   let unresolvedCandidates: AospCandidate[] = [];
   let verifiedUnresolvedCandidates: AospCandidate[] = [];

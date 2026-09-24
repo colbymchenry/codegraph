@@ -3,9 +3,7 @@
  *
  * Both are intentionally thin: pure text-candidate search over
  * CodeGraph-indexed sources with no found/not-found claim beyond "these
- * patterns matched or they didn't" (Codex's Phase 3 scoping review,
- * 2026-09-04: "순수 텍스트 후보 탐색으로 제공하되, 결과에 검색 범위·정규식·
- * 파일/줄을 남기는 얇은 래퍼면 충분"). Unlike find_aidl_impl/find_jni_bridge/
+ * patterns matched or they didn't". Unlike find_aidl_impl/find_jni_bridge/
  * analyze_system_service there is no single symbol whose existence a status
  * model could hang off of — a permission or broadcast action is just a
  * string, so this only reports what matched, never a synthesized confidence
@@ -34,14 +32,11 @@ export function tracePermission(cg: CodeGraph, repoRoot: string, permission: str
   // runtime-permission check) was missing from this alternation: it matched
   // checkCallingOrSelfPermission/checkCallingPermission/checkComponentPermission
   // but not the bare checkSelfPermission a real app/service overwhelmingly
-  // uses (11 real call sites found in a small real AOSP frameworks/base
-  // checkout alone, 2026-09-06).
+  // uses.
   // `\b` after the pattern (not just after the optional prefix) so a longer
   // real method sharing this prefix, like `checkPermissionForPreflight` or
   // `checkSelfPermissionGranted`, doesn't get counted as a checkpoint just
-  // because it starts with one of these names (Codex review finding,
-  // 2026-09-06: neither variant is a real check-point call, but both were
-  // matching before this boundary was added).
+  // because it starts with one of these names.
   const checkPermissionPattern = `check(?:CallingOrSelf|Calling|Self|Component)?Permission\\b`;
   const checkPointHits = grepIndexedSources(
     cg, repoRoot, ['kotlin', 'java'], new RegExp(`${checkPermissionPattern}.*${escapeRegExp(permission)}`), `${checkPermissionPattern}.*${permission}`

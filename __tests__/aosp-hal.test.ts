@@ -1,5 +1,5 @@
 /**
- * AOSP extension — find_hal_interface (Phase 3).
+ * AOSP extension — HAL interface discovery.
  *
  * Same contract as find_aidl_impl, scoped to hardware/interfaces/ and
  * extended with a native (c/cpp) implementation search.
@@ -71,7 +71,7 @@ describe('AOSP extension: findHalInterface', () => {
     expect(nativeHit?.name).toBe('Foo');
   });
 
-  it('reaches "found" for a real C++ HIDL implementation reached via the primary unresolved-extends signal, even though the declaration has a known package (real AOSP shape: `struct DrmPlugin : public IDrmPlugin` in hardware/interfaces/drm; found by validating against the real hardware/interfaces mirror, 2026-09-11)', async () => {
+  it('finds a C++ HIDL implementation through unresolved extends when the declaration has a package', async () => {
     write(
       'hardware/interfaces/drm/1.0/IDrmPlugin.hal',
       'package android.hardware.drm@1.0;\ninterface IDrmPlugin {\n    doWork();\n};\n'
@@ -82,7 +82,7 @@ describe('AOSP extension: findHalInterface', () => {
     // declaration's package happens to be known — that previously demoted
     // a genuinely correct C++ implementation caught by the SAME primary
     // unresolved-extends signal a real Kotlin/Java `.Stub()` extends already
-    // promotes to `found` (Codex/real-AOSP-mirror finding, 2026-09-11).
+    // promotes to `found`.
     write(
       'hardware/interfaces/drm/1.0/default/DrmPlugin.h',
       '#include <hardware/drm/1.0/IDrmPlugin.h>\n\nstruct DrmPlugin : public IDrmPlugin {\npublic:\n    void doWork() {}\n};\n'
@@ -98,7 +98,7 @@ describe('AOSP extension: findHalInterface', () => {
     expect(hit?.packageVerified).toBe('unverifiable');
   });
 
-  it('finds a native (c/cpp) implementation via its Bn{InterfaceName} Binder-native stub inheritance, even when the class name bears no textual resemblance to the interface (real AOSP AIDL C++ codegen convention — BnVehicle/BnTelephony/BnCameraProvider, all extended by arbitrarily-named classes like DefaultVehicleHal; found by validating against the real hardware/interfaces mirror, 2026-09-10)', async () => {
+  it('finds a native implementation through Bn{InterfaceName} inheritance despite an unrelated class name', async () => {
     write(
       'hardware/interfaces/foo/IFoo.aidl',
       'package android.hardware.foo;\ninterface IFoo {\n    void doWork();\n}\n'
@@ -123,7 +123,7 @@ describe('AOSP extension: findHalInterface', () => {
     // happens to share the `Bn{Name}` string cannot be told apart from a
     // real AIDL-generated stub subclass here. It surfaces as evidence and
     // raises `convention_derived_candidate`, but must never alone reach
-    // `found` (Codex adversarial review, 2026-09-10, HIGH-2).
+    // `found`.
     expect(result.status).toBe('convention_derived_candidate');
     const hit = result.implementations.find((c) => c.name === 'DefaultFooHal');
     expect(hit).toBeDefined();
@@ -131,7 +131,7 @@ describe('AOSP extension: findHalInterface', () => {
     expect(hit?.matchedPattern).toContain('Binder-native stub');
   });
 
-  it('finds a Bn{InterfaceName} inheritance written through a C++ namespace alias, not just the bare name (real AOSP shape: `class DefaultVehicleHal final : public aidlvhal::BnVehicle` where `namespace aidlvhal = ...`; the bare-name-only qualified lookup missed this even after adding Bn{Name} support, found by validating against the real hardware/interfaces mirror, 2026-09-10)', async () => {
+  it('finds Bn{InterfaceName} inheritance through a C++ namespace alias', async () => {
     write(
       'hardware/interfaces/foo/IFoo.aidl',
       'package android.hardware.foo;\ninterface IFoo {\n    void doWork();\n}\n'
@@ -154,8 +154,8 @@ describe('AOSP extension: findHalInterface', () => {
     expect(hit?.matchedPattern).toContain('Binder-native stub');
   });
 
-  describe('Bn{Name} negative/edge coverage (Codex adversarial review, 2026-09-10)', () => {
-    it('does not match a lowercase `bnfoo` against a `BnFoo` search — SQLite LIKE is ASCII case-insensitive by default (MEDIUM-2)', async () => {
+  describe('Bn{Name} negative/edge coverage', () => {
+    it('does not match a lowercase `bnfoo` against a `BnFoo` search — SQLite LIKE is ASCII case-insensitive by default', async () => {
       write(
         'hardware/interfaces/foo/IFoo.aidl',
         'package android.hardware.foo;\ninterface IFoo {\n    void doWork();\n}\n'
@@ -173,7 +173,7 @@ describe('AOSP extension: findHalInterface', () => {
       expect(result.implementations.some((c) => c.name === 'Decoy')).toBe(false);
     });
 
-    it('does not apply the AIDL-only Bn{Name} check to a HIDL lookup — HIDL native wrappers are named BnHw{Name}, a different family (HIGH-3)', async () => {
+    it('does not apply the AIDL-only Bn{Name} check to a HIDL lookup — HIDL native wrappers are named BnHw{Name}, a different family', async () => {
       write('hardware/interfaces/foo/1.0/IFoo.hal', 'package android.hardware.foo@1.0;\ninterface IFoo {\n    doWork();\n};\n');
       // An unrelated C++ class that happens to inherit a bare `BnFoo` — under
       // the old code this alone would have promoted a HIDL "IFoo" lookup,
@@ -192,7 +192,7 @@ describe('AOSP extension: findHalInterface', () => {
       expect(result.implementations.some((c) => c.name === 'Decoy')).toBe(false);
     });
 
-    it('does not promote an unrelated struct that merely shares the Bn{Name} string to "found" without any other correlation (HIGH-2)', async () => {
+    it('does not promote an unrelated struct that merely shares the Bn{Name} string to "found" without any other correlation', async () => {
       write(
         'hardware/interfaces/foo/IFoo.aidl',
         'package android.hardware.foo;\ninterface IFoo {\n    void doWork();\n}\n'
@@ -240,7 +240,7 @@ describe('AOSP extension: findHalInterface', () => {
     );
   });
 
-  it('demotes an unresolved_refs hit to convention_derived_candidate when the implementing class cannot reach this HAL\'s package — a same-named interface in an unrelated package (Codex 3rd-pass review, 2026-09-04)', async () => {
+  it('demotes an unresolved_refs hit to convention_derived_candidate when the implementing class cannot reach this HAL\'s package — a same-named interface in an unrelated package', async () => {
     write(
       'hardware/interfaces/foo/IShared.aidl',
       'package android.hardware.foo;\ninterface IShared {\n    void doWork();\n}\n'
@@ -290,7 +290,7 @@ describe('AOSP extension: findHalInterface', () => {
     expect(result.implementations).toHaveLength(0);
   });
 
-  it('parses a HIDL declaration that extends a parent interface (Codex cross-review finding, 2026-09-04)', async () => {
+  it('parses a HIDL declaration that extends a parent interface', async () => {
     write(
       'hardware/interfaces/bar/1.0/IBar.hal',
       'package android.hardware.bar@1.0;\n\ninterface IBar extends IBase {\n    ping();\n};\n'
@@ -311,7 +311,7 @@ describe('AOSP extension: findHalInterface', () => {
     expect(result.status).toBe('found');
   });
 
-  it('verifies against HIDL\'s actual versioned Java import ({package}.V{major}_{minor}.{Name}), not just the plain package (Red Team round-1 finding, 2026-09-04)', async () => {
+  it('verifies against HIDL\'s actual versioned Java import ({package}.V{major}_{minor}.{Name}), not just the plain package', async () => {
     write(
       'hardware/interfaces/baz2/1.0/IBaz2.hal',
       'package android.hardware.baz2@1.0;\n\ninterface IBaz2 {\n    ping();\n};\n'
@@ -332,7 +332,7 @@ describe('AOSP extension: findHalInterface', () => {
     expect(hit?.packageVerified).toBe('verified');
   });
 
-  it('refuses to follow a symlinked subdirectory when discovering .aidl/.hal files (Black Hat round-2 finding, 2026-09-04)', async () => {
+  it('refuses to follow a symlinked subdirectory when discovering .aidl/.hal files', async () => {
     const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-aosp-hal-outside-'));
     fs.mkdirSync(path.join(outsideDir, 'secret'), { recursive: true });
     fs.writeFileSync(
@@ -356,7 +356,7 @@ describe('AOSP extension: findHalInterface', () => {
     fs.rmSync(outsideDir, { recursive: true, force: true });
   });
 
-  it('does not let a commented-out stale HAL declaration bleed another interface\'s data under its name (Blue Team round-2 finding, 2026-09-04)', async () => {
+  it('does not let a commented-out stale HAL declaration bleed another interface\'s data under its name', async () => {
     write(
       'hardware/interfaces/qux/IQux.aidl',
       'package android.hardware.qux;\n' +
@@ -374,7 +374,7 @@ describe('AOSP extension: findHalInterface', () => {
     expect(result.declaration).toBeNull();
   });
 
-  it('picks the versioned declaration whose package a candidate can actually verify, when two HIDL versions declare the same bare interface name (Blue Team round-2 finding, 2026-09-04)', async () => {
+  it('picks the versioned declaration whose package a candidate can actually verify, when two HIDL versions declare the same bare interface name', async () => {
     write(
       'hardware/interfaces/ver/1.0/IVer.hal',
       'package android.hardware.ver@1.0;\n\ninterface IVer {\n    void ping();\n};\n'
@@ -398,7 +398,7 @@ describe('AOSP extension: findHalInterface', () => {
     expect(result.declaration?.filePath).toBe('hardware/interfaces/ver/2.0/IVer.hal');
   });
 
-  it('finds a native implementation candidate written in plain C, not just C++ (Codex cross-review finding, 2026-09-04)', async () => {
+  it('finds a native implementation candidate written in plain C, not just C++', async () => {
     write(
       'hardware/interfaces/baz/IBaz.aidl',
       'package android.hardware.baz;\ninterface IBaz {\n    void doWork();\n}\n'
@@ -417,9 +417,8 @@ describe('AOSP extension: findHalInterface', () => {
     expect(nativeHit?.name).toBe('Baz');
   });
 
-  // Regression coverage for the 2026-09-05 round-3/4 fixes.
-  describe('round 3+4 fixes (2026-09-05)', () => {
-    it('parses a HIDL interface extending a VERSIONED parent (Red Team round-4 finding: `@` and `:` were excluded from the extends-target character class)', async () => {
+  describe('HAL declaration and candidate regressions', () => {
+    it('parses a HIDL interface extending a VERSIONED parent', async () => {
       write(
         'hardware/interfaces/gnss/2.0/IGnssCallback.hal',
         'package android.hardware.gnss@2.0;\n\ninterface IGnssCallback extends @1.0::IGnssCallback {\n    ping();\n};\n'
@@ -440,7 +439,7 @@ describe('AOSP extension: findHalInterface', () => {
       expect(result.status).toBe('found');
     });
 
-    it('does not treat an aidl_api frozen-version snapshot as a second, colliding declaration (Green Team round-4 finding)', async () => {
+    it('does not treat an aidl_api frozen-version snapshot as a second, colliding declaration', async () => {
       write(
         'hardware/interfaces/foo/aidl/IFoo.aidl',
         'package android.hardware.foo;\ninterface IFoo {\n    void doWork();\n}\n'
@@ -462,7 +461,7 @@ describe('AOSP extension: findHalInterface', () => {
       expect(result.evidence.some((e) => e.includes('declaration(s) named'))).toBe(false);
     });
 
-    it('finds a HAL implemented in Kotlin/Java as "FooImpl" (leading "I" dropped), matching aidl.ts\'s existing convention (Green Team round-3 finding)', async () => {
+    it('finds a HAL implemented in Kotlin/Java as "FooImpl" (leading "I" dropped), matching aidl.ts\'s existing convention', async () => {
       write(
         'hardware/interfaces/qux/IQux.aidl',
         'package android.hardware.qux;\ninterface IQux {\n    void doWork();\n}\n'
@@ -478,7 +477,7 @@ describe('AOSP extension: findHalInterface', () => {
       expect(hit?.name).toBe('QuxImpl');
     });
 
-    it('walks into a hardware/interfaces/ subtree located under vendor/ instead of skipping the whole vendor/ subtree (Black Hat round-4 finding)', async () => {
+    it('walks into a hardware/interfaces/ subtree located under vendor/ instead of skipping the whole vendor/ subtree', async () => {
       write(
         'vendor/oem/hardware/interfaces/IVendorHal.aidl',
         'package com.oem.hardware;\ninterface IVendorHal {\n    void doWork();\n}\n'
@@ -492,7 +491,7 @@ describe('AOSP extension: findHalInterface', () => {
       expect(result.declaration?.filePath).toBe('vendor/oem/hardware/interfaces/IVendorHal.aidl');
     });
 
-    it('does not truncate the method list at a nested enum\'s closing brace (Red Team round-4 finding, symmetric with aidl.ts)', async () => {
+    it('does not truncate the method list at a nested enum\'s closing brace', async () => {
       write(
         'hardware/interfaces/nested/INested.hal',
         'package android.hardware.nested@1.0;\n\n' +
@@ -507,7 +506,7 @@ describe('AOSP extension: findHalInterface', () => {
       expect(declarations[0]?.methods).toContain('afterEnum');
     });
 
-    it('prefers a genuinely package-verified declaration over an earlier unverifiable one (Codex round-4 Blue Team finding, symmetric with aidl.ts)', async () => {
+    it('prefers a genuinely package-verified declaration over an earlier unverifiable one', async () => {
       write('hardware/interfaces/amb/1.0/IAmb.hal', 'interface IAmb {\n    ping();\n};\n');
       write(
         'hardware/interfaces/amb/2.0/IAmb.hal',
