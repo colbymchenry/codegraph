@@ -13,7 +13,10 @@ function run(...args: string[]) {
     cwd: root,
     encoding: 'utf8',
     timeout: 30_000,
-    env: { ...process.env, CODEGRAPH_NO_DAEMON: '1', CODEGRAPH_WASM_RELAUNCHED: '1', NO_COLOR: '1' },
+    // NODE_NO_WARNINGS: skipping the relaunch also skips its
+    // --disable-warning=ExperimentalWarning, and Node 22 then prints the
+    // node:sqlite warning to stderr, which the quiet case counts line by line.
+    env: { ...process.env, CODEGRAPH_NO_DAEMON: '1', CODEGRAPH_WASM_RELAUNCHED: '1', NO_COLOR: '1', NODE_NO_WARNINGS: '1' },
   });
 }
 
