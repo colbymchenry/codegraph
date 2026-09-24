@@ -124,7 +124,7 @@ describe('expression receivers', () => {
       .map((r) => r.referenceName);
     expect(refs).toEqual([
       'list().map', 'list', 'x.run', 'y.run', 'x.stop', 'getTarget().install', 'getTarget',
-      'f', 'run', 'go', 'start',
+      'f', 'run', 'new Runner().go', 'start',
     ]);
   });
 });

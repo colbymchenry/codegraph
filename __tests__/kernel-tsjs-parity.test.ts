@@ -142,6 +142,9 @@ async function exprReceivers(x, y) {
   this.a.b.run();
   super.stop();
   new Runner().go();
+  (new ns.Widget(1)).draw();
+  new (pick())().go();
+  new Runner().a.run();
   window.Api.start();
 }
 `, language);
@@ -150,7 +153,7 @@ async function exprReceivers(x, y) {
       .map((r) => r.referenceName)).toEqual([
         'list().map', 'list', 'x.run',
         ...(typed ? ['x.run', 'y.run', 'x.stop', 'getTarget().install', 'getTarget', 'has'] : []),
-        'f', 'run', 'stop', 'go', 'start',
+        'f', 'run', 'stop', 'new Runner().go', 'new ns.Widget().draw', 'pick', 'start',
       ]);
   });
 

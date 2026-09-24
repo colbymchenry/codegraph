@@ -457,10 +457,9 @@ function peelTsJsReceiver(node: SyntaxNode): SyntaxNode {
 
 /**
  * Whether a TS/JS receiver still collapses to the bare method name: `this` /
- * `super` (the resolver reads the owner off the enclosing class), a member
+ * `super` (the resolver reads the owner off the enclosing class) and a member
  * chain rooted at either or at `window` (the project-global escape of
- * {@link isUnresolvedTsJsChain}), and `new C()` (its class is written at the
- * call).
+ * {@link isUnresolvedTsJsChain}). `new C().m()` has its own encoding.
  */
 function keepsBareTsJsReceiver(node: SyntaxNode, source: string): boolean {
   let cur: SyntaxNode | null = node;
@@ -470,8 +469,7 @@ function keepsBareTsJsReceiver(node: SyntaxNode, source: string): boolean {
   }
   if (!cur) return false;
   if (cur.type === 'this' || cur.type === 'super') return true;
-  if (cur.type === 'identifier') return getNodeText(cur, source) === 'window';
-  return cur === node && cur.type === 'new_expression';
+  return cur.type === 'identifier' && getNodeText(cur, source) === 'window';
 }
 
 /**
@@ -4945,6 +4943,21 @@ export class TreeSitterExtractor {
               const chain = getNodeText(func, this.source).replace(/\s+/g, '').replace(/\?\./g, '.');
               if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*){2,}$/.test(chain)) return;
               calleeName = chain;
+            } else if (TS_JS_CHAIN_LANGUAGES.has(this.language) && receiver?.type === 'new_expression') {
+              // Constructor receiver — `new Runner().run()`, `new RegExp(p).exec(s)`.
+              // The class is written at the call, so keep it: `new Runner().run`
+              // tells the resolver the receiver is an INSTANCE of `Runner`, and
+              // the method resolves on that class (or a supertype) or nowhere —
+              // a built-in or external class has no project method to bind to.
+              // The bare method name this used to emit exact-matched any
+              // same-named project method (`new RegExp(p).exec()` onto a
+              // database wrapper's `exec`). A constructor that is not a plain
+              // name or member chain (`new (f())().m()`) emits nothing.
+              // Mirrored in the kernel's extract_call (tsjs/extractors.rs).
+              const ctor = getChildByField(receiver, 'constructor');
+              const ctorName = ctor ? getNodeText(ctor, this.source).replace(/\s+/g, '') : '';
+              if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(ctorName)) return;
+              calleeName = `new ${ctorName}().${methodName}`;
             } else if (
               TS_JS_CHAIN_LANGUAGES.has(this.language) &&
               receiver &&

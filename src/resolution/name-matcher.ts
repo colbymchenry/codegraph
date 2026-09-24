@@ -3079,6 +3079,51 @@ function matchStoreAccessorChain(ref: UnresolvedRef, context: ResolutionContext)
   return { original: ref, targetNodeId: callables[0]!.id, confidence: 0.6, resolvedBy: 'exact-match' };
 }
 
+/**
+ * TS/JS constructor receiver `new Runner(args).run()`, encoded by the
+ * extractor as `new Runner().run`. The receiver is an instance of the class
+ * written at the call, so this shape resolves only through that class.
+ */
+export const NEW_RECEIVER_SHAPE = /^new ([\w$.]+)\(\)\.([\w$]+)$/;
+
+/**
+ * The class a `new C().m` ref constructs, as the name its declaration carries:
+ * `ns.Runner` → `Runner`, an aliased named import `R` → `Runner`. A JS/TS
+ * built-in (`RegExp`, `Map`, `Date`…) counts only when the file imports or
+ * declares a class of that name — otherwise a project class that merely
+ * shares the name would take every `new Map().get()` in the repo.
+ */
+export function newReceiverClass(ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const m = ref.referenceName.match(NEW_RECEIVER_SHAPE);
+  if (!m || !m[1]) return null;
+  const written = m[1];
+  const last = written.split('.').pop()!;
+  const imported = written.includes('.')
+    ? undefined
+    : context.getImportMappings(ref.filePath, ref.language).find((i) => i.localName === written);
+  if (imported && !imported.isDefault && !imported.isNamespace && /^[A-Za-z_$][\w$]*$/.test(imported.exportedName)) {
+    return imported.exportedName;
+  }
+  if (!imported && !written.includes('.') && JS_BUILT_INS.has(last) &&
+      !context.getNodesInFile(ref.filePath).some((n) => n.kind === 'class' && n.name === last)) {
+    return null;
+  }
+  return last;
+}
+
+/**
+ * Resolve a {@link NEW_RECEIVER_SHAPE} call on the constructed class or one of
+ * its supertypes (validated by resolveMethodOnType), or not at all: a class
+ * with no project declaration — `new URL(u).toString()` — has no project
+ * method to bind to.
+ */
+export function matchNewReceiverCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const cls = newReceiverClass(ref, context);
+  const method = ref.referenceName.match(NEW_RECEIVER_SHAPE)?.[2];
+  if (!cls || !method) return null;
+  return resolveMethodOnType(cls, method, ref, context, 0.9, 'instance-method');
+}
+
 /** Resolve the implementation inside the identified store, not a namesake or
  * an interface signature elsewhere in the project. Import resolution already
  * follows aliases/barrels; containment already excludes nested action locals. */
@@ -3710,6 +3755,9 @@ export function matchReference(
     ref.referenceName.includes('().') &&
     (ref.language === 'typescript' || ref.language === 'javascript' || ref.language === 'tsx' || ref.language === 'jsx' || ref.language === 'python')
   ) {
+    if (ref.referenceName.startsWith('new ')) {
+      return nmTimed('newReceiver', ref, () => matchNewReceiverCall(ref, context));
+    }
     return nmTimed('storeAccessorChain', ref, () => matchStoreAccessorChain(ref, context));
   }
 

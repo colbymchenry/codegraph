@@ -1206,6 +1206,19 @@ impl<'t> Walker<'t> {
                         // TreeSitterExtractor.extractCall.
                         let Some(inner) = self.plain_inner_callee(r) else { return };
                         callee_name = format!("{inner}().{method_name}");
+                    } else if let Some(r) = receiver.filter(|r| r.kind() == "new_expression") {
+                        // Constructor receiver — `new Runner().run()`: keep the
+                        // class as `new <Class>().<method>` so the resolver
+                        // resolves the method on it or nowhere; emit nothing for
+                        // a constructor that is not a plain name / member chain.
+                        // Mirrors TreeSitterExtractor.extractCall.
+                        let Some(ctor) = r
+                            .child_by_field_name("constructor")
+                            .and_then(|c| Self::plain_member_name(self.text(c)))
+                        else {
+                            return;
+                        };
+                        callee_name = format!("new {ctor}().{method_name}");
                     } else if receiver.is_some_and(|r| !keeps_bare_receiver(r, self.src)) {
                         // An expression receiver with no static type
                         // (`(a ?? b).map()`, `f().list.map()`): emit nothing
@@ -1541,9 +1554,8 @@ fn peel_receiver(node: Node<'_>) -> Node<'_> {
     cur
 }
 
-/// `this` / `super`, a member chain rooted at either or at `window`, or
-/// `new C()` still collapse to the bare method name (mirrors
-/// keepsBareTsJsReceiver).
+/// `this` / `super`, or a member chain rooted at either or at `window`, still
+/// collapse to the bare method name (mirrors keepsBareTsJsReceiver).
 fn keeps_bare_receiver(node: Node<'_>, src: &str) -> bool {
     let mut cur = node;
     while matches!(cur.kind(), "member_expression" | "subscript_expression") {
@@ -1555,7 +1567,6 @@ fn keeps_bare_receiver(node: Node<'_>, src: &str) -> bool {
     match cur.kind() {
         "this" | "super" => true,
         "identifier" => &src[cur.byte_range()] == "window",
-        "new_expression" => cur.id() == node.id(),
         _ => false,
     }
 }
