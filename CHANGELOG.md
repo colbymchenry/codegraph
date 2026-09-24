@@ -248,6 +248,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Routes and framework detection
 
+- **An Express route keeps its named handler when a middleware before it contains an arrow function.** `rateLimit({ keyGenerator: (req) => req.ip })` or `(req, res, next) => next()` no longer hides the handler at the end of the route (re-index to update an existing project).
+
+- **An Express `function (req, res) { … }` handler now links the calls in its body.** Such routes used to connect to nothing.
+
 - **A SvelteKit layout is no longer a second screen at a page's address.** `+layout.svelte` and `+error.svelte` sit at the same path as the `+page.svelte` beside them and were each indexed as a route, so one address appeared in the index two and three times over. Only a page is a route now.
 
 - **A framework whose package lives in a subfolder is detected again.** In a project that keeps its dependencies one level down — a `frontend/` and a `backend/`, or an `apps/web/` — the framework check ran once before any file had been indexed, found no folders to look in, and remembered that empty answer for the rest of the run. Every React, React Router and Next.js behaviour that depends on knowing the framework is there silently did nothing for those projects.
