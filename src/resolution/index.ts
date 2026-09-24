@@ -5,6 +5,7 @@
  */
 
 import * as fs from 'fs';
+import { readBoundedSourceSync } from '../file-limits';
 import * as path from 'path';
 import { Language, Node, UnresolvedReference, Edge } from '../types';
 import { QueryBuilder } from '../db/queries';
@@ -422,7 +423,10 @@ export class ReferenceResolver {
     }
     const fullPath = path.join(this.projectRoot, filePath);
     try {
-      const content = fs.readFileSync(fullPath, 'utf-8');
+      // Import resolvers may follow package metadata to an archive (`file:*.har`,
+      // for example). Reject anything extraction would not accept before UTF-8
+      // decoding can multiply a large binary blob into gigabytes of V8 heap.
+      const content = readBoundedSourceSync(fullPath).bytes?.toString('utf8') ?? null;
       this.fileCache.set(filePath, content);
       return content;
     } catch (error) {
