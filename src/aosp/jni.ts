@@ -502,7 +502,7 @@ function evaluateJniBridgeForClass(
     const mangledMethod = jniMangle(decl.methodName);
     const jniSymbol = `Java_${mangledClass}_${mangledMethod}`;
     const matches = cg.searchNodes(jniSymbol, { kinds: ['function'], limit: 20 });
-    if (matches.length === 20) evidence.push(`WARNING: searchNodes("${jniSymbol}") 결과가 20개 제한에 도달해 추가 매치가 있을 수 있습니다`);
+    if (matches.length === 20) evidence.push(`WARNING: searchNodes("${jniSymbol}") reached the 20-result limit; more matches may exist`);
     for (const { node } of matches) {
       if (node.name === jniSymbol) {
         // Non-overloaded short form: Java_pkg_Class_method.
@@ -690,7 +690,7 @@ export function findJniBridge(cg: CodeGraph, repoRoot: string, className: string
   const readFile = makeFileCache(repoRoot);
 
   const classMatches = cg.searchNodes(className, { kinds: ['class'], limit: 20 });
-  if (classMatches.length === 20) evidence.push(`WARNING: searchNodes("${className}") 결과가 20개 제한에 도달해 추가 매치가 있을 수 있습니다`);
+  if (classMatches.length === 20) evidence.push(`WARNING: searchNodes("${className}") reached the 20-result limit; more matches may exist`);
   // Exact match only — searchNodes is FTS/fuzzy, so falling back to its first
   // hit when no exact match exists (the previous behavior) silently swapped
   // in an unrelated class (e.g. "FooManager" for a "Foo" query) and reported
