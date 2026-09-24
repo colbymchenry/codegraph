@@ -14,6 +14,7 @@ import { resolveWorkspaceImport } from './workspace-packages';
 import {
   resolveMethodOnType,
   resolveObjectLiteralMember,
+  objectLiteralMemberBinding,
   localReceiverTypePatterns,
   normalizeInferredTypeName,
 } from './name-matcher';
@@ -1891,17 +1892,7 @@ function resolveObjectLiteralAlias(
 ): ResolvedRef | null {
   if (container.kind !== 'constant' && container.kind !== 'variable') return null;
   if (!JS_FAMILY_FILE.test(container.filePath)) return null;
-  if (!/^[A-Za-z_$][\w$]*$/.test(member)) return null;
-  const lines = context.getFileLines?.(container.filePath) ?? context.readFile(container.filePath)?.split('\n');
-  if (!lines) return null;
-  const extent = lines.slice(container.startLine - 1, container.endLine).join('\n');
-  const brace = extent.indexOf('{');
-  if (brace < 0) return null;
-  const body = extent.slice(brace);
-  const keyed = new RegExp(`[{,\\s]${member}\\s*:\\s*([A-Za-z_$][\\w$]*)\\s*[,}]`);
-  const shorthand = new RegExp(`[{,\\s]${member}\\s*[,}]`);
-  const k = body.match(keyed);
-  const binding = k ? k[1]! : shorthand.test(body) ? member : null;
+  const binding = objectLiteralMemberBinding(container, member, context);
   if (binding === null) return null;
 
   const callable = (n: Node) => n.kind === 'function' || n.kind === 'method' || n.kind === 'class';

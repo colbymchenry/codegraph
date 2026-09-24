@@ -145,6 +145,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- In TypeScript and JavaScript, calling a function through an object that lists it by name (`const api = { getUser }` or `{ getUser: getUser }`) now counts as a caller in the object's own file too, so the function no longer looks unused. (#1932)
+
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
 - Turning telemetry off now resets its identity and stops running processes from recording, sending, or restoring unsent data. (#1869)

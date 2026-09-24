@@ -1031,6 +1031,102 @@ export function resolveObjectLiteralMember(
   };
 }
 
+/**
+ * The binding an object-literal member names when it is a shorthand property
+ * (`{ getUser }`) or a pair whose value is a bare identifier (`{ getUser:
+ * fetchUser }`) — the usual way an API module assembles its namespace from
+ * standalone functions (#1932). Only the literal's own members count: a member
+ * of a nested object, a word inside a member's body, a comment or a string
+ * never donates one. Null when the member is absent, or when its value is not
+ * a bare identifier (`{ fn: 1 }` names nothing).
+ */
+export function objectLiteralMemberBinding(
+  container: Node,
+  member: string,
+  context: ResolutionContext,
+): string | null {
+  if (!/^[A-Za-z_$][\w$]*$/.test(member)) return null;
+  const lines = context.getFileLines?.(container.filePath) ?? context.readFile(container.filePath)?.split('\n');
+  if (!lines) return null;
+  const extent = lines.slice(container.startLine - 1, container.endLine).join('\n');
+  const code = blankStringContents(stripCommentsForRegex(extent, 'typescript'));
+  const open = /=\s*\{/.exec(code);
+  if (!open) return null;
+
+  // Split the literal's body into its top-level members.
+  const members: string[] = [];
+  let depth = 0;
+  let start = open.index + open[0].length;
+  for (let i = start; i < code.length; i++) {
+    const ch = code[i];
+    if (ch === '{' || ch === '(' || ch === '[') depth++;
+    else if (ch === ')' || ch === ']') depth--;
+    else if (ch === '}') {
+      if (depth === 0) {
+        members.push(code.slice(start, i));
+        break;
+      }
+      depth--;
+    } else if (ch === ',' && depth === 0) {
+      members.push(code.slice(start, i));
+      start = i + 1;
+    }
+  }
+
+  const pair = /^([A-Za-z_$][\w$]*)\s*:\s*([A-Za-z_$][\w$]*)$/;
+  for (const raw of members) {
+    const text = raw.trim();
+    if (text === member) return member;
+    const m = pair.exec(text);
+    if (m && m[1] === member) return m[2]!;
+  }
+  return null;
+}
+
+/**
+ * Same-file half of the namespace-object alias (#1932): `api.getUser()` where
+ * `api` is `const api = { getUser }` (or `{ getUser: fetchUser }`) in the
+ * caller's own file. The member's function is declared OUTSIDE the literal, so
+ * containment (`resolveObjectLiteralMember`) finds nothing. Follow the binding
+ * the member names — a symbol of this file, else one of its imports — unless a
+ * parameter or nearer declaration shadows that name where the literal is
+ * written (the edge would then name the wrong function).
+ */
+function resolveObjectLiteralBinding(
+  container: Node,
+  member: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  const binding = objectLiteralMemberBinding(container, member, context);
+  if (!binding) return null;
+  const at: UnresolvedRef = { ...ref, line: container.startLine, column: container.startColumn };
+  if (importShadowedAt(binding, at, context, true)) return null;
+
+  const callable = (n: Node) => n.kind === 'function' || n.kind === 'method' || n.kind === 'class';
+  const accepts =
+    ref.referenceKind === 'calls'
+      ? callable
+      : (n: Node) => callable(n) || n.kind === 'constant' || n.kind === 'variable' || n.kind === 'component';
+
+  const local = context
+    .getNodesInFile(container.filePath)
+    .filter(
+      (n) =>
+        n.name === binding && n.id !== container.id && accepts(n) &&
+        !rangeWithin(n, container) && isLexicallyReachable(n, at, context)
+    )
+    .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0];
+  if (local) return { original: ref, targetNodeId: local.id, confidence: 0.85, resolvedBy: 'instance-method' };
+
+  const imported = context.resolveImport?.({ ...at, referenceName: binding });
+  const target = imported ? context.getNodeById?.(imported.targetNodeId) : null;
+  if (target && accepts(target)) {
+    return { original: ref, targetNodeId: target.id, confidence: 0.85, resolvedBy: 'instance-method' };
+  }
+  return null;
+}
+
 // Exported for the precedence unit tests (#1079): they assert the
 // preferredFqn → same-file → matches[0] ordering directly.
 export function resolveMethodOnType(
@@ -2508,7 +2604,9 @@ export function matchMethodCall(
         (n) => (n.kind === 'constant' || n.kind === 'variable') && n.filePath === ref.filePath
       );
       for (const holder of holders) {
-        const hit = resolveObjectLiteralMember(holder, methodName!, ref, context, 0.85, 'instance-method');
+        const hit =
+          resolveObjectLiteralMember(holder, methodName!, ref, context, 0.85, 'instance-method') ??
+          resolveObjectLiteralBinding(holder, methodName!, ref, context);
         if (hit) return hit;
       }
       return null;
@@ -3186,8 +3284,10 @@ function matchSelectedStoreCall(ref: UnresolvedRef, context: ResolutionContext):
 }
 
 /** Import resolution names the module binding; a nearer parameter or block
- * declaration can shadow that binding at this particular call site. */
-function importShadowedAt(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+ * declaration can shadow that binding at this particular call site.
+ * `nestedOnly` ignores top-level declarations — for a name whose module-level
+ * declaration is itself the binding being checked. */
+function importShadowedAt(name: string, ref: UnresolvedRef, context: ResolutionContext, nestedOnly = false): boolean {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   for (const fn of context.getNodesInFile(ref.filePath)) {
     if ((fn.kind === 'function' || fn.kind === 'method') && fn.startLine <= ref.line && fn.endLine >= ref.line &&
@@ -3206,7 +3306,10 @@ function importShadowedAt(name: string, ref: UnresolvedRef, context: ResolutionC
   };
   const scope = stackAt(code.length);
   const declarations = new RegExp(`\\b(?:const|let|var|function|class)\\s+(?:${escaped}\\b|\\{[^}]*\\b${escaped}\\b)`, 'g');
-  return [...code.matchAll(declarations)].some(m => stackAt(m.index!).every((p, i) => scope[i] === p));
+  return [...code.matchAll(declarations)].some(m => {
+    const at = stackAt(m.index!);
+    return (!nestedOnly || at.length > 0) && at.every((p, i) => scope[i] === p);
+  });
 }
 
 /** Balanced parameter lists also cover function-typed parameters, whose own
