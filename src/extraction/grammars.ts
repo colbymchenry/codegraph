@@ -40,6 +40,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   r: 'tree-sitter-r.wasm',
   luau: 'tree-sitter-luau.wasm',
   objc: 'tree-sitter-objc.wasm',
+  slint: 'tree-sitter-slint.wasm',
   cfml: 'tree-sitter-cfml.wasm',
   cfscript: 'tree-sitter-cfscript.wasm',
   cfquery: 'tree-sitter-cfquery.wasm',
@@ -123,6 +124,7 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.luau': 'luau',
   '.m': 'objc',
   '.mm': 'objc',
+  '.slint': 'slint',
   '.sol': 'solidity',
   // CFML: .cfc/.cfm parse with the tag-aware `cfml` grammar (custom CfmlExtractor
   // dialect-switches to cfscript for bare-script content); .cfs is pure CFScript.
@@ -271,6 +273,7 @@ export async function initGrammars(): Promise<void> {
  * nix-community/tree-sitter-nix @ 3d0173d (MIT) with tree-sitter-cli 0.25.10
  * (`generate` + `build --wasm`, ABI 15 — upstream's checked-in parser.c is
  * still ABI 13; all 54 upstream corpus tests pass on the regenerated parser).
+ * Slint has no tree-sitter-wasms package entry, so its ABI-15 grammar is vendored.
  *
  * TypeScript/TSX/JavaScript (+jsx, which shares the javascript grammar): the
  * tree-sitter-wasms builds are 2023-era (^0.20.x); we vendor wasm built from
@@ -289,7 +292,7 @@ export async function initGrammars(): Promise<void> {
  * the vendored wasm together.
  */
 const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
-  'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'cfml', 'cfscript', 'cfquery',
+  'pascal', 'scala', 'lua', 'luau', 'csharp', 'r', 'slint', 'cfml', 'cfscript', 'cfquery',
   'cobol', 'vbnet', 'erlang', 'terraform', 'arkts', 'nix',
   'typescript', 'tsx', 'javascript', 'jsx', 'java', 'python', 'go',
   // R7a (C/C++ kernel port prep): tree-sitter-c v0.24.2 (b780e47) +
@@ -693,6 +696,7 @@ export function getLanguageDisplayName(language: Language): string {
     lua: 'Lua',
     luau: 'Luau',
     objc: 'Objective-C',
+    slint: 'Slint',
     solidity: 'Solidity',
     nix: 'Nix',
     yaml: 'YAML',

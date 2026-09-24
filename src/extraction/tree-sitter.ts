@@ -1570,7 +1570,8 @@ export class TreeSitterExtractor {
       parentNode.kind === 'interface' ||
       parentNode.kind === 'trait' ||
       parentNode.kind === 'enum' ||
-      parentNode.kind === 'module'
+      parentNode.kind === 'module' ||
+      (parentNode.kind === 'component' && parentNode.language === 'slint')
     );
   }
 
@@ -1975,6 +1976,8 @@ export class TreeSitterExtractor {
     // Skip forward declarations and type references (no body = not a definition)
     // — EXCEPT C# positional records (`record struct M(decimal Amount);`),
     // complete definitions with no body block. (#831)
+    const body = this.extractor.resolveBody?.(node, this.extractor.bodyField)
+      ?? getChildByField(node, this.extractor.bodyField);
     //
     // `allowBodilessStruct` is the per-language escape hatch for the same
     // situation: a bodiless struct that IS a complete definition (Rust's unit
@@ -1982,7 +1985,6 @@ export class TreeSitterExtractor {
     // (#1093) because the two defaults differ — a bodiless CLASS is kept
     // unless a language opts into skipping, a bodiless STRUCT is skipped
     // unless a language opts into keeping.
-    const body = getChildByField(node, this.extractor.bodyField);
     if (!body && node.type !== 'record_declaration' && !this.extractor.allowBodilessStruct)
       return;
 

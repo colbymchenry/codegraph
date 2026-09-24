@@ -31,3 +31,4 @@ Language support is automatic from the file extension — there's nothing to con
 | Lua | `.lua` | Full support (functions, methods, locals, `require` imports, call edges) |
 | R | `.R`, `.r` | Full support (functions, S4/R5/R6 classes with methods, `library`/`require` imports, `source()` file references, call edges) |
 | Luau | `.luau` | Full support (Lua, plus typed signatures, `type` aliases, Roblox `require`) |
+| Slint | `.slint` | Full support (components, globals, interfaces, structs, enums, properties, callbacks, functions, imports, call edges) |
