@@ -85,6 +85,15 @@ export class MCPEngine {
   constructor(opts: MCPEngineOptions = {}) {
     this.opts = { watch: opts.watch ?? true, queryPool: opts.queryPool ?? false };
     this.toolHandler = new ToolHandler(null);
+    // A tool call found the default project's database replaced on disk (a
+    // `codegraph index` rebuild) and reopened it (#1902). Reconcile the new
+    // file with the usual catch-up — `sync()` serializes on the index mutex,
+    // so it never overlaps an in-flight watcher sync. Only when this engine is
+    // watching, i.e. it is the project's writer: a read-only engine (writer
+    // lock held elsewhere, watching disabled) must not start writing.
+    this.toolHandler.setOnDatabaseReopened((cg) => {
+      if (cg === this.cg && cg.isWatching()) this.catchUpSync();
+    });
     if (opts.writerLockRoot) {
       const writer = tryAcquireWriterLock(opts.writerLockRoot, 'fallback');
       if (writer.kind === 'taken') {
