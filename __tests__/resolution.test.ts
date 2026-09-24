@@ -37,6 +37,100 @@ describe('Resolution Module', () => {
   });
 
   describe('Name Matcher', () => {
+    it('follows a Java static field to its anonymous method without guessing a different field', () => {
+      const makeNode = (id: string, kind: Node['kind'], name: string, qualifiedName: string,
+        filePath: string): Node => ({ id, kind, name, qualifiedName, filePath,
+          language: 'java', startLine: 1, endLine: 10, startColumn: 0, endColumn: 0, updatedAt: 0 });
+      const field = makeNode('field', 'constant', 'CREATOR', 'pkg::SelectGesture::CREATOR', 'SelectGesture.java');
+      field.signature = 'Creator<SelectGesture> CREATOR';
+      const anon = makeNode('anon', 'class', '<Creator$anon@2>',
+        'pkg::SelectGesture::CREATOR::<Creator$anon@2>', 'SelectGesture.java');
+      const correct = makeNode('correct', 'method', 'createFromParcel',
+        `${anon.qualifiedName}::createFromParcel`, 'SelectGesture.java');
+      const wrong = makeNode('wrong', 'method', 'createFromParcel',
+        'pkg::Other::createFromParcel', 'Other.java');
+      const entry = makeNode('entry', 'enum_member', 'KEYGUARD', 'pkg::ScrimState::KEYGUARD', 'ScrimState.java');
+      const enumMethod = makeNode('enum-method', 'method', 'getBehindTint',
+        'pkg::ScrimState::getBehindTint', 'ScrimState.java');
+      const object = { ...makeNode('object', 'class', 'ComposeInitializer',
+        'pkg::ComposeInitializer', 'ComposeInitializer.kt'), language: 'kotlin' as const };
+      const objectMethod = { ...makeNode('object-method', 'method', 'onDetachedFromWindow',
+        'pkg::ComposeInitializer::onDetachedFromWindow', 'ComposeInitializer.kt'), language: 'kotlin' as const };
+      const nodes = [field, anon, correct, wrong, entry, enumMethod, object, objectMethod];
+      const context = {
+        getNodesByName: (name: string) => nodes.filter(n => n.name === name),
+        getNodesByLowerName: (name: string) => nodes.filter(n => n.name.toLowerCase() === name),
+        getNodesByQualifiedName: (name: string) => nodes.filter(n => n.qualifiedName === name),
+        getNodesInFile: (filePath: string) => nodes.filter(n => n.filePath === filePath),
+        getNodesByKind: (kind: Node['kind']) => nodes.filter(n => n.kind === kind),
+        getNodeById: (id: string) => nodes.find(n => n.id === id) ?? null,
+        getImportMappings: () => [], getAllFiles: () => ['SelectGesture.java', 'Other.java'],
+        fileExists: () => true, readFile: (path: string) => path === 'ComposeInitializer.kt'
+          ? 'object ComposeInitializer {\n    fun onDetachedFromWindow() {}\n}' : null,
+        getProjectRoot: () => tempDir,
+      } as ResolutionContext;
+      const ref: UnresolvedRef = { fromNodeId: 'reader', referenceName: 'SelectGesture.CREATOR.createFromParcel',
+        referenceKind: 'calls', filePath: 'Reader.java', language: 'java', line: 5, column: 0 };
+      expect(matchReference(ref, context)?.targetNodeId).toBe(correct.id);
+      expect(matchReference({ ...ref, referenceName: 'TextUtils.CHAR_SEQUENCE_CREATOR.createFromParcel' }, context)).toBeNull();
+      expect(matchReference({ ...ref, referenceName: 'ScrimState.KEYGUARD.getBehindTint' }, context)?.targetNodeId).toBe(enumMethod.id);
+      expect(matchReference({ ...ref, referenceName: 'ComposeInitializer.INSTANCE.onDetachedFromWindow' }, context)?.targetNodeId).toBe(objectMethod.id);
+    });
+
+    it('resolves Java field calls through imports and declared types in an indexed project', async () => {
+      for (const [file, source] of Object.entries({
+        'p/Selected.java': `package p;
+public class Selected {
+    public static final Creator CREATOR = new Creator() { public int createFromParcel() { return 1; } };
+    public interface Creator { int createFromParcel(); }
+}`,
+        'q/Selected.java': `package q;
+public class Selected {
+    public static final Creator CREATOR = new Creator() { public int createFromParcel() { return 2; } };
+    public interface Creator { int createFromParcel(); }
+}`,
+        'r/Consumer.java': `package r;
+import p.Selected;
+import java.util.Map;
+interface Runner { void run(); }
+class Impl implements Runner {
+    static final Runner INSTANCE = new Impl();
+    public void run() {}
+}
+enum Mode { ON; int label() { return 1; } }
+class Holder { static final Map<String, String> LOOKUP = null; }
+class Decoy { String get(String key) { return key; } boolean equals(Object value) { return false; } }
+public class Consumer {
+    int select() { return Selected.CREATOR.createFromParcel(); }
+    String miss() { return Holder.LOOKUP.get("x"); }
+    int enumCall() { return Mode.ON.label(); }
+    boolean enumEquals() { return Mode.ON.equals(null); }
+    void interfaceCall() { Impl.INSTANCE.run(); }
+}`,
+      })) {
+        const target = path.join(tempDir, file);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, source);
+      }
+      cg = CodeGraph.initSync(tempDir, { config: { include: ['**/*.java'], exclude: [] } });
+      await cg.indexAll();
+      const targets = (method: string) => {
+        const caller = cg.searchNodes(method).map(r => r.node)
+          .find(n => n.qualifiedName === `r::Consumer::${method}`)!;
+        return cg.getCallees(caller.id).filter(c => c.edge.kind === 'calls')
+          .map(c => c.node.qualifiedName);
+      };
+      expect(targets('select')).toEqual([expect.stringMatching(/^p::Selected::CREATOR::<.*>::createFromParcel$/)]);
+      expect(targets('miss')).toEqual([]);
+      expect(targets('enumCall')).toEqual(['r::Mode::label']);
+      expect(targets('enumEquals')).toEqual([]);
+      expect(targets('interfaceCall')).toEqual(['r::Runner::run']);
+      const declaration = cg.searchNodes('run').map(r => r.node)
+        .find(n => n.qualifiedName === 'r::Runner::run')!;
+      expect(cg.getCallees(declaration.id).some(c =>
+        c.node.qualifiedName === 'r::Impl::run' && c.edge.metadata?.synthesizedBy === 'interface-impl')).toBe(true);
+    });
+
     it('should match exact name references', () => {
       // Create a mock context
       const mockNodes: Node[] = [

@@ -1534,6 +1534,7 @@ function importedFqnOf(
   return imports.find((i) => i.localName === typeName)?.source;
 }
 
+
 /**
  * Java/Kotlin: infer a receiver's declared type by walking field declarations
  * in the class enclosing the call site. The field's `signature` is already in
@@ -2282,6 +2283,8 @@ function inferPhpAssignedPropertyType(
 /**
  * Try to resolve by method name on a class/object
  */
+const JAVA_STATIC_FIELD_CALL = /^([A-Z]\w*(?:\.[A-Z]\w*)*)\.([A-Z][A-Z0-9_]*)\.(\w+)$/;
+
 export function matchMethodCall(
   ref: UnresolvedRef,
   context: ResolutionContext
@@ -2514,6 +2517,66 @@ export function matchMethodCall(
       return null;
     });
     if (literalMatch) return literalMatch;
+  }
+
+  // Java Type.FIELD.method(): the field names a value, not a receiver type.
+  // Follow that exact field to its anonymous initializer before name matching.
+  const staticField = ref.language === 'java'
+    ? ref.referenceName.match(JAVA_STATIC_FIELD_CALL)
+    : null;
+  if (staticField) {
+    const [, owner, fieldName] = staticField;
+    const fieldQn = `${owner!.replace(/\./g, '::')}::${fieldName}`;
+    const firstOwner = owner!.split('.')[0]!;
+    const importedOwner = importedFqnOf(firstOwner, ref, context);
+    const ownerFqn = importedOwner ? importedOwner + owner!.slice(firstOwner.length) : null;
+    let fields = context.getNodesByName(fieldName!).filter(n =>
+      (n.kind === 'constant' || n.kind === 'field' || n.kind === 'property' || n.kind === 'enum_member') &&
+      n.language === 'java' && n.qualifiedName.endsWith(`::${fieldQn}`) &&
+      (!ownerFqn || n.qualifiedName.replace(/::/g, '.') === `${ownerFqn}.${fieldName}`));
+    if (fields.length > 1) {
+      const local = fields.filter(n => n.filePath === ref.filePath);
+      if (local.length === 1) fields = local;
+    }
+    if (fields.length === 0 && fieldName === 'INSTANCE') {
+      let objects = context.getNodesByName(owner!.split('.').pop()!).filter(n =>
+        n.kind === 'class' && n.language === 'kotlin' &&
+        n.qualifiedName.endsWith(`::${owner!.replace(/\./g, '::')}`) &&
+        (!ownerFqn || n.qualifiedName.replace(/::/g, '.') === ownerFqn) &&
+        context.readFile(n.filePath)?.split('\n')[n.startLine - 1]?.includes(`object ${n.name}`));
+      if (objects.length > 1) {
+        const local = objects.filter(n => n.filePath === ref.filePath);
+        if (local.length === 1) objects = local;
+      }
+      if (objects.length === 1) {
+        const method = context.getNodesInFile(objects[0]!.filePath).find(n =>
+          n.kind === 'method' && n.qualifiedName === `${objects[0]!.qualifiedName}::${methodName}`);
+        if (method) return { original: ref, targetNodeId: method.id,
+          confidence: 0.9, resolvedBy: 'qualified-name' };
+      }
+    }
+    if (fields.length !== 1) return null;
+    const field = fields[0]!;
+    if (field.kind === 'enum_member') {
+      const enumName = field.qualifiedName.slice(0, field.qualifiedName.lastIndexOf('::'));
+      const method = context.getNodesInFile(field.filePath).find(n =>
+        n.kind === 'method' && n.qualifiedName === `${enumName}::${methodName}`);
+      return method ? { original: ref, targetNodeId: method.id,
+        confidence: 0.9, resolvedBy: 'qualified-name' } : null;
+    }
+    const inFile = context.getNodesInFile(field.filePath);
+    const owners = inFile.filter(n => n.kind === 'class' &&
+      n.qualifiedName.startsWith(`${field.qualifiedName}::<`) && n.qualifiedName.includes('$anon@'));
+    const methods = owners.flatMap(ownerNode => inFile.filter(n =>
+      n.kind === 'method' && n.qualifiedName === `${ownerNode.qualifiedName}::${methodName}`));
+    if (methods.length === 1) {
+      return { original: ref, targetNodeId: methods[0]!.id,
+        confidence: 0.9, resolvedBy: 'qualified-name' };
+    }
+    const declaredType = field.signature?.slice(0, field.signature.lastIndexOf(field.name)).trim();
+    const typeName = declaredType ? normalizeInferredTypeName(declaredType) : null;
+    return typeName ? resolveMethodOnType(typeName, methodName!, ref, context, 0.9,
+      'instance-method', importedFqnOf(typeName, ref, context)) : null;
   }
 
   // Strategy 1: Direct class name match (existing logic). When the receiver
@@ -3671,6 +3734,8 @@ export function matchReference(
   // 2. Method call pattern
   result = nmTimed('methodCall', ref, () => matchMethodCall(ref, context));
   if (result) return result;
+  if (ref.language === 'java' && ref.referenceKind === 'calls' &&
+      JAVA_STATIC_FIELD_CALL.test(ref.referenceName)) return null;
 
   // 3. Exact name match
   result = nmTimed('exactName', ref, () => matchByExactName(ref, context));
