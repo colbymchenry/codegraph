@@ -8144,22 +8144,6 @@ function isMethodOwnerKind(n: Node): boolean {
 }
 
 /**
- * Is `n` the method `name` of the class `cls` a receiver is taken to name
- * (the class-name and capitalized-receiver strategies of matchMethodCall)?
- * In C and C++, only one of exactly that class: protobuf's `arena.get()`
- * took the `get` of `Arena::UniquePtr`, a class nested in `Arena`, since its
- * qualified name has `Arena` in it, as `ThreadSafeArena::get`'s does. In
- * other languages, any method of the name whose qualified name has the
- * class's name in it, as before.
- */
-function isClassStrategyMethod(n: Node, cls: Node, name: string): boolean {
-  if (n.kind !== 'method' || n.name !== name) return false;
-  return cls.language === 'c' || cls.language === 'cpp'
-    ? n.qualifiedName === `${cls.qualifiedName}::${name}`
-    : n.qualifiedName.includes(cls.name);
-}
-
-/**
  * When a symbol name is ambiguous across files, prefer the candidate(s) declared
  * in the call site's own file, keeping the rest in their original order (#1079).
  * A same-file definition is the strongest language-agnostic signal for which of
@@ -13644,13 +13628,7 @@ export function matchMethodCall(
         return { original: ref, targetNodeId: method.id, confidence: own ? 0.85 : 0.8, resolvedBy: 'qualified-name' };
       }
 
-      const nodesInFile = context.getNodesInFile(classNode.filePath);
-      const methodNode = nodesInFile.find(
-        (n) =>
-          n.kind === 'method' &&
-          n.name === methodName &&
-          isMemberOf(n, classNode.name)
-      );
+      const methodNode = findOwnMethod(context.getNodesInFile(classNode.filePath), classNode, methodName!);
 
       if (methodNode) {
         return {
@@ -13718,7 +13696,7 @@ export function matchMethodCall(
   }
 
   // Strategy 2: Instance variable receiver - try capitalized form to find class
-  // e.g., "permissionEngine" → look for classes containing "PermissionEngine"
+  // e.g., "permissionEngine" → look for a class named "PermissionEngine"
   const capitalizedReceiver = objectOrClass!.charAt(0).toUpperCase() + objectOrClass!.slice(1);
   if (capitalizedReceiver !== objectOrClass) {
     const strat2 = nmTimedT('mc-capital', ref, (): ResolvedRef | null => {
@@ -13730,13 +13708,7 @@ export function matchMethodCall(
         // Skip cross-language class matches
         if (classNode.language !== ref.language) continue;
 
-        const nodesInFile = context.getNodesInFile(classNode.filePath);
-        const methodNode = nodesInFile.find(
-          (n) =>
-            n.kind === 'method' &&
-            n.name === methodName &&
-            isMemberOf(n, classNode.name)
-        );
+        const methodNode = findOwnMethod(context.getNodesInFile(classNode.filePath), classNode, methodName!);
 
         if (methodNode) {
           return {
@@ -14968,16 +14940,21 @@ function matchTsThisFieldCall(
 }
 
 /**
- * Whether `member`'s qualified name puts it directly under a type named
- * `typeName` — the segment before its own name, generic arguments and any
- * dotted namespace stripped (`ns.Logger<T>::log` → `Logger`). A substring
- * test is not enough: `FileLogger::log` contains `Logger`.
+ * The `method` named `methodName` declared on `classNode` itself, among the
+ * nodes of the class's file. The class's exact qualified name is tried first,
+ * so a same-named class elsewhere in the file (`Outer::Logger`) cannot take
+ * the call; then the owner-by-name form the resolver uses elsewhere
+ * (`Logger::log`, `ns::Logger::log`). Never a substring test:
+ * `FileLogger::log` contains `Logger`.
  */
-function isMemberOf(member: Node, typeName: string): boolean {
-  const parts = member.qualifiedName.split('::');
-  if (parts.length < 2) return false;
-  const owner = parts[parts.length - 2]!.replace(/<.*$/, '');
-  return owner.slice(owner.lastIndexOf('.') + 1) === typeName;
+function findOwnMethod(nodesInFile: Node[], classNode: Node, methodName: string): Node | undefined {
+  const methods = nodesInFile.filter((n) => n.kind === 'method' && n.name === methodName);
+  const exact = `${classNode.qualifiedName}::${methodName}`;
+  const byName = `${classNode.name}::${methodName}`;
+  return (
+    methods.find((n) => n.qualifiedName === exact) ??
+    methods.find((n) => n.qualifiedName === byName || n.qualifiedName.endsWith(`::${byName}`))
+  );
 }
 
 /**

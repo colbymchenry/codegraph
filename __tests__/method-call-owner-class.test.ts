@@ -41,6 +41,23 @@ export function viaStatic(): void {
   Logger.log();
 }
 `);
+  // R allows dots in a class name: the owner is `Bank.Account`, whole.
+  fs.writeFileSync(path.join(dir, 'account.R'), `Bank.Account <- R6::R6Class("Bank.Account",
+  public = list(
+    deposit = function(x) { x }
+  )
+)
+`);
+  fs.writeFileSync(path.join(dir, 'main.R'), `BankAccount <- R6::R6Class("BankAccount",
+  public = list(
+    deposit = function(x) { x }
+  )
+)
+
+run_it <- function() {
+  Bank.Account$deposit(1)
+}
+`);
   cg = await CodeGraph.init(dir, { index: true });
 });
 
@@ -64,6 +81,7 @@ describe('method call binds to the receiver class itself, not a class whose name
 
   it('Python: logger.log() (capitalized receiver) → Logger::log', () => {
     const callees = calleesOf('via_instance', 'log.py');
+    expect(callees).toContain('Logger::log');
     expect(callees).not.toContain('FileLogger::log');
   });
 
@@ -71,5 +89,11 @@ describe('method call binds to the receiver class itself, not a class whose name
     const callees = calleesOf('viaStatic', 'log.ts');
     expect(callees).toContain('Logger::log');
     expect(callees).not.toContain('FileLogger::log');
+  });
+
+  it('R: a dotted class name is the owner as a whole', () => {
+    const callees = calleesOf('run_it', 'main.R');
+    expect(callees).toContain('Bank.Account::deposit');
+    expect(callees).not.toContain('BankAccount::deposit');
   });
 });
