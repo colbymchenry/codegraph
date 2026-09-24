@@ -19,7 +19,7 @@ import {
   isInheritanceRef,
   isImportableKind,
 } from './types';
-import { matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
+import { matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily, dumpNameMatcherProfile, clearNameMatcherMemos, GO_STDLIB_PACKAGES } from './name-matcher';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
@@ -104,20 +104,6 @@ const PYTHON_BUILT_IN_METHODS = new Set([
   'startswith', 'endswith', 'find', 'index', 'count', 'encode', 'decode',
   'format', 'isdigit', 'isalpha', 'isalnum',
   'read', 'write', 'readline', 'readlines', 'close', 'flush', 'seek',
-]);
-
-const GO_STDLIB_PACKAGES = new Set([
-  'fmt', 'os', 'io', 'net', 'http', 'log', 'math', 'sort', 'sync',
-  'time', 'path', 'bytes', 'strings', 'strconv', 'errors', 'context',
-  'json', 'xml', 'csv', 'html', 'template', 'regexp', 'reflect',
-  'runtime', 'testing', 'flag', 'bufio', 'crypto', 'encoding',
-  'filepath', 'hash', 'mime', 'rand', 'signal', 'sql', 'syscall',
-  'unicode', 'unsafe', 'atomic', 'binary', 'debug', 'exec', 'heap',
-  'ring', 'scanner', 'tar', 'zip', 'gzip', 'zlib', 'tls', 'url',
-  'user', 'pprof', 'trace', 'ast', 'build', 'parser', 'printer',
-  'token', 'types', 'cgo', 'plugin', 'race', 'ioutil',
-  // Kubernetes-common stdlib aliases
-  'utilruntime', 'utilwait', 'utilnet',
 ]);
 
 const GO_BUILT_INS = new Set([
@@ -2257,7 +2243,17 @@ export class ReferenceResolver {
       const dotIdx = name.indexOf('.');
       if (dotIdx > 0) {
         const pkg = name.substring(0, dotIdx);
-        if (GO_STDLIB_PACKAGES.has(pkg)) {
+        // Only when the file imports it: an unimported `ring` / `list` / `url`
+        // is a local variable (`func flush(ring *ringLog) { ring.Write(b) }`),
+        // and skipping it here dropped every method call made through it.
+        // Matched on any path segment, not the import's local name, so a
+        // versioned path (`math/rand/v2`) still counts as importing `rand`.
+        if (
+          GO_STDLIB_PACKAGES.has(pkg) &&
+          this.context
+            .getImportMappings(ref.filePath, 'go')
+            .some((i) => i.localName === pkg || i.source.split('/').includes(pkg))
+        ) {
           return true;
         }
       }

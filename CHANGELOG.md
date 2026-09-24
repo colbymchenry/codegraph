@@ -147,6 +147,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
+- Go method calls now resolve through the receiver's declared type — an unexported or package-qualified parameter, a constructor's result, or a variable named like a standard-library package (`ring`, `token`) — and a receiver typed outside the project (`net.Conn`, `*bytes.Buffer`, `error`) no longer links to an unrelated project method of the same name; re-index to pick this up.
+
 - Turning telemetry off now resets its identity and stops running processes from recording, sending, or restoring unsent data. (#1869)
 
 - Calls between JavaScript, JSX and TypeScript files keep their callers and callback flows.
