@@ -149,6 +149,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - A method called on the result of an expression, such as `(await list()).map(...)` in TypeScript or `v.iter().map(...)` in Rust, no longer links to an unrelated same-named method, and calls no longer link into another language they cannot reach, such as Rust onto a TypeScript class or Kotlin onto a JavaScript function.
 
+- Standard-library calls on a value of unknown type, such as `name.len()` in Rust, `list.isEmpty()` in Kotlin, `options.setdefault(...)` in Python, `conn.Close()` in Go, `opt.map(...)` in Scala or `Task.Run(...)` in C#, no longer link to a project method that merely shares the name.
+
 - Turning telemetry off now resets its identity and stops running processes from recording, sending, or restoring unsent data. (#1869)
 
 - Calls between JavaScript, JSX and TypeScript files keep their callers and callback flows.

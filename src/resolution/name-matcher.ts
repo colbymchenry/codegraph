@@ -9,6 +9,7 @@ import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, SUPERTYPE_TARGET_KINDS, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_BUILT_INS, TS_PRIMITIVE_TYPES } from './js-builtins';
+import { LIBRARY_METHOD_NAMES } from './library-methods';
 
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
@@ -241,6 +242,103 @@ function isForeignCall(candidate: Node, ref: UnresolvedRef): boolean {
   // A C type or global (a struct initializer, a function-pointer variable)
   // is reachable only from the languages that import C headers directly.
   return !(to === 'c' && from === 'apple');
+}
+
+/** A receiver that is the calling type itself, or its base. */
+const OWN_TYPE_RECEIVER = /^(?:self|this|super|base|cls)$/;
+
+/** Lower-cased words of an identifier or path: camel, snake and digit-camel boundaries. */
+function nameWords(s: string): string[] {
+  return s
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .split(/[^A-Za-z0-9]+/)
+    .filter((w) => w.length > 1)
+    .map((w) => w.toLowerCase());
+}
+
+/**
+ * The name a receiver expression ends in — the object the method is called
+ * on: `state.log` → `log`, `data.iter()` → `iter`, `myForm.field("x")` →
+ * `field`, `x?` / `x!!` → `x`. Trailing argument, index, generic and lambda
+ * groups are peeled; '' when the receiver ends in something else (a literal).
+ */
+function receiverTailName(receiver: string): string {
+  let s = receiver;
+  for (let guard = 0; guard < 50; guard++) {
+    s = s.replace(/[\s?!]+$/, '');
+    const close = s[s.length - 1];
+    const open = close === ')' ? '(' : close === ']' ? '[' : close === '}' ? '{' : close === '>' ? '<' : null;
+    if (!open) break;
+    let depth = 0;
+    let i = s.length - 1;
+    for (; i >= 0; i--) {
+      if (s[i] === close) depth++;
+      else if (s[i] === open && --depth === 0) break;
+    }
+    if (i <= 0) return '';
+    s = s.slice(0, i);
+  }
+  return /([A-Za-z_]\w*)$/.exec(s)?.[1] ?? '';
+}
+
+/**
+ * Whether a member call on a receiver of unknown type would bind a
+ * standard-library method name (`len`, `iter`, `isEmpty`, `setdefault`,
+ * `map`…) to a project symbol with nothing but the name to go on. The call
+ * is almost always the library's own method on a library value
+ * (`name.len()`, `v.iter().all()`, `d.setdefault(k, [])`), and the one
+ * project `len`/`all`/`setdefault` collected every such call — on a Rust
+ * GUI, ~500 edges into a log buffer's `len`. The candidate is kept when the
+ * receiver's name says it is that type (`self.state.log.clear()` →
+ * `AppLog::clear`, `cache.set(...)` → `AsyncCacheApi::set`); typed receivers
+ * resolve before any name-only strategy and never reach this check.
+ */
+function isUnevidencedLibraryCall(candidates: Node[], receiver: string, methodName: string, ref: UnresolvedRef): boolean {
+  if (ref.referenceKind !== 'calls' || !LIBRARY_METHOD_NAMES[ref.language]?.has(methodName)) return false;
+  // The enclosing type's own method (`base.Dispose()` in C#) is not a guess.
+  if (OWN_TYPE_RECEIVER.test(receiver)) return false;
+  // The receiver's own name, plus a capitalized chain root — a type or
+  // companion whose members return it (`GpsMode.ON.next()`,
+  // `Lock.tryBegin(1)!!.close()`).
+  const root = /^[A-Z]\w*/.exec(receiver)?.[0] ?? '';
+  const receiverWords = nameWords(`${receiverTailName(receiver)} ${root}`);
+  if (receiverWords.length === 0) return true;
+  return !candidates.some((c) => {
+    const owner = c.qualifiedName.split('::').slice(0, -1).filter((seg) => !seg.includes('.'));
+    // A free function's "owner" is its module: `flask.json.dumps` → flask/json.
+    const words = MEMBER_KINDS.has(c.kind) ? nameWords(owner.join(' ')) : nameWords(`${owner.join(' ')} ${c.filePath.replace(/\.\w+$/, '')}`);
+    return words.some((w) => receiverWords.includes(w));
+  });
+}
+
+/**
+ * The receiver a bare-named call ref was written on, read from the call site:
+ * `data.iter().all(...)` reaches the resolver as the bare `all` (the chain has
+ * no static type), and so does `self.m()` in Python and an implicit-this call
+ * in Kotlin. Returns the receiver text when the source shows a receiver other
+ * than the calling type itself (`self`, `this`, `super`, `base`, `cls`), else
+ * null (a plain `all(...)` call, or a site the text doesn't match).
+ */
+function writtenCallReceiver(ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split('\n');
+  const first = lines?.[ref.line - 1];
+  if (!lines || first === undefined) return null;
+  let text = first.slice(ref.column);
+  for (let i = ref.line; i < lines.length && i < ref.line + 20 && text.length < 4000; i++) text += '\n' + lines[i];
+  const name = ref.referenceName;
+  if (new RegExp(`^${name}(?!\\w)`).test(text)) return null;
+  const member = new RegExp(`(?:\\.|->)\\s*${name}(?!\\w)`).exec(text);
+  if (!member) return null;
+  const receiver = text.slice(0, member.index).trim();
+  return OWN_TYPE_RECEIVER.test(receiver) ? null : receiver;
+}
+
+/** {@link isUnevidencedLibraryCall} for a bare-named ref, whose receiver only the call site shows. */
+function isUnevidencedBareLibraryCall(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.referenceKind !== 'calls' || !LIBRARY_METHOD_NAMES[ref.language]?.has(ref.referenceName)) return false;
+  const receiver = writtenCallReceiver(ref, context);
+  return receiver !== null && isUnevidencedLibraryCall([candidate], receiver, ref.referenceName, ref);
 }
 
 /**
@@ -830,7 +928,8 @@ export function matchByExactName(
 
   // If only one match, use it — but penalize cross-language matches
   if (candidates.length === 1) {
-    if (!isCrossFileReachable(candidates[0]!, ref, context) || isForeignCall(candidates[0]!, ref)) return null;
+    if (!isCrossFileReachable(candidates[0]!, ref, context) || isForeignCall(candidates[0]!, ref) ||
+      isUnevidencedBareLibraryCall(candidates[0]!, ref, context)) return null;
     const isCrossLanguage = candidates[0]!.language !== ref.language;
     return {
       original: ref,
@@ -851,7 +950,8 @@ export function matchByExactName(
 
   // Multiple matches - try to narrow down
   const bestMatch = findBestMatch(ref, candidates, context);
-  if (bestMatch && isCrossFileReachable(bestMatch, ref, context) && !isForeignCall(bestMatch, ref)) {
+  if (bestMatch && isCrossFileReachable(bestMatch, ref, context) && !isForeignCall(bestMatch, ref) &&
+    !isUnevidencedBareLibraryCall(bestMatch, ref, context)) {
     // Lower confidence when the match is from a distant/unrelated module
     const proximity = computePathProximity(ref.filePath, bestMatch.filePath);
     const confidence = proximity >= 30 ? 0.7 : 0.4;
@@ -2658,6 +2758,8 @@ export function matchMethodCall(
     const sameLanguageMethods = methods.filter(m => m.language === ref.language);
     const targetMethods = sameLanguageMethods.length > 0 ? sameLanguageMethods : methods;
 
+    if (isUnevidencedLibraryCall(targetMethods, objectOrClass!, methodName!, ref)) return null;
+
     // If only one same-language method with this name exists, use it
     if (targetMethods.length === 1 && targetMethods[0]!.language === ref.language) {
       return {
@@ -3468,6 +3570,7 @@ export function matchFuzzy(
     isVisibleAcrossFiles(finalCandidates[0]!, ref, context) &&
     isCrossFileReachable(finalCandidates[0]!, ref, context) &&
     !isForeignCall(finalCandidates[0]!, ref) &&
+    !isUnevidencedBareLibraryCall(finalCandidates[0]!, ref, context) &&
     !(isBareJsCall(ref, context) &&
       (finalCandidates[0]!.kind === 'method' ||
         (finalCandidates[0]!.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context)))) &&
