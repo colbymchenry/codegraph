@@ -425,6 +425,56 @@ function isUnresolvedTsJsChain(node: SyntaxNode, source: string): boolean {
 }
 
 /**
+ * TS/JS wrappers that leave a member call's receiver the same object:
+ * `(x).m()`, `x!.m()`, `(x as T).m()`, `(x satisfies T).m()`, `(<T>x).m()`
+ * and `(await x).m()` all call `m` on what `x` holds.
+ */
+const TS_JS_TRANSPARENT_RECEIVER_TYPES = new Set([
+  'parenthesized_expression', 'non_null_expression', 'as_expression',
+  'satisfies_expression', 'type_assertion', 'await_expression',
+]);
+
+/**
+ * Strip {@link TS_JS_TRANSPARENT_RECEIVER_TYPES} wrappers off a receiver.
+ * tree-sitter-typescript parses `a && b!.c()` as `(a && b)!.c()`; the `!`
+ * belongs to the right operand, so a non-null over a binary expression peels
+ * to that operand.
+ */
+function peelTsJsReceiver(node: SyntaxNode): SyntaxNode {
+  let cur = node;
+  while (TS_JS_TRANSPARENT_RECEIVER_TYPES.has(cur.type)) {
+    let inner = cur.type === 'type_assertion'
+      ? cur.namedChild(cur.namedChildCount - 1)
+      : cur.namedChild(0);
+    if (cur.type === 'non_null_expression') {
+      while (inner?.type === 'binary_expression') inner = getChildByField(inner, 'right');
+    }
+    if (!inner) break;
+    cur = inner;
+  }
+  return cur;
+}
+
+/**
+ * Whether a TS/JS receiver still collapses to the bare method name: `this` /
+ * `super` (the resolver reads the owner off the enclosing class), a member
+ * chain rooted at either or at `window` (the project-global escape of
+ * {@link isUnresolvedTsJsChain}), and `new C()` (its class is written at the
+ * call).
+ */
+function keepsBareTsJsReceiver(node: SyntaxNode, source: string): boolean {
+  let cur: SyntaxNode | null = node;
+  while (cur && TS_JS_CHAIN_RECEIVER_TYPES.has(cur.type)) {
+    const object = getChildByField(cur, 'object');
+    cur = object ? peelTsJsReceiver(object) : null;
+  }
+  if (!cur) return false;
+  if (cur.type === 'this' || cur.type === 'super') return true;
+  if (cur.type === 'identifier') return getNodeText(cur, source) === 'window';
+  return cur === node && cur.type === 'new_expression';
+}
+
+/**
  * React hooks that bind a NAME to a handler function (`const onPress =
  * useCallback(() => {…}, [])`). The arrow inside is extracted as a function
  * node named by the declarator — see `reactHookBoundName`.
@@ -4686,11 +4736,18 @@ export class TreeSitterExtractor {
             // This helps the resolver distinguish method calls from bare function calls
             // (e.g., Python's console.print() vs builtin print())
             // Skip self/this/cls as they don't aid resolution
-            const receiver =
+            const rawReceiver =
               getChildByField(func, 'object') ||
               getChildByField(func, 'operand') ||
               getChildByField(func, 'argument') ||
               func.namedChild(0);
+            // TS/JS: look through wrappers that keep the receiver the same
+            // object (`(x).m()`, `x!.m()`, `(x as T).m()`, `(await f()).m()`),
+            // so the branches below see the identifier / call / chain the
+            // call is really made on.
+            const receiver = rawReceiver && TS_JS_CHAIN_LANGUAGES.has(this.language)
+              ? peelTsJsReceiver(rawReceiver)
+              : rawReceiver;
             // A LITERAL receiver — `", ".join(...)`, `"x".toUpperCase()`,
             // `5.times`, `[].concat(...)` — calls a builtin of the literal's
             // type, never a project symbol. The bare-name fallback below let
@@ -4888,6 +4945,19 @@ export class TreeSitterExtractor {
               const chain = getNodeText(func, this.source).replace(/\s+/g, '').replace(/\?\./g, '.');
               if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*){2,}$/.test(chain)) return;
               calleeName = chain;
+            } else if (
+              TS_JS_CHAIN_LANGUAGES.has(this.language) &&
+              receiver &&
+              !keepsBareTsJsReceiver(receiver, this.source)
+            ) {
+              // Any other TS/JS receiver is an expression with no static
+              // type here — `(a ?? b).map()`, `f().list.map()`,
+              // `arr[0].run()`, `(() => {}).call()`. The bare method name this
+              // used to emit exact-matched whichever project method shared the
+              // name (`(await list()).map()` onto an adapter class's `map`).
+              // Emit nothing: a silent miss, never a wrong edge. Mirrored in
+              // the kernel's extract_call (tsjs/extractors.rs).
+              return;
             } else {
               calleeName = methodName;
             }
