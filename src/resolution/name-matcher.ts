@@ -1622,23 +1622,9 @@ function inferKotlinPropertyType(
     : (context.readFile(ref.filePath)?.split(/\r?\n/) ?? null);
   if (!lines || lines.length === 0) return null;
 
-  const r = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const typed = new RegExp(`\\b(?:val|var)\\s+${r}\\s*:\\s*([A-Z][\\w.]*)`);
-  const constructed = new RegExp(`\\b(?:val|var)\\s+${r}\\s*=\\s*([A-Z][\\w.]*)\\s*\\(`);
-  const readType = (from: number, to: number): string | null => {
-    const text = lines.slice(Math.max(0, from - 1), Math.min(lines.length, to)).join('\n');
-    const m = text.match(typed) ?? text.match(constructed);
-    if (!m || !m[1]) return null;
-    // A nested type (`HardwareLock.Lease`) keeps its outer type, joined the
-    // way qualified names are, so resolveMethodOnType matches that `Lease`
-    // and not another class's; a package prefix (lowercase) is dropped.
-    const segments = m[1].split('.');
-    let first = segments.length;
-    while (first > 0 && /^[A-Z]/.test(segments[first - 1]!)) first--;
-    const typeSegments = segments.slice(first);
-    if (typeSegments.length > 1) return typeSegments.join('::');
-    return normalizeInferredTypeName(m[1]);
-  };
+  const readType = (from: number, to: number): string | null =>
+    kotlinDeclaredTypeIn(
+      lines.slice(Math.max(0, from - 1), Math.min(lines.length, to)).join('\n'), name, ref, context);
 
   if (property) return readType(property.startLine, property.endLine ?? property.startLine);
 
@@ -1651,6 +1637,154 @@ function inferKotlinPropertyType(
     }
   }
   return readType(owner.startLine, firstMember - 1);
+}
+
+
+/** Node kinds that declare a type a receiver can have. */
+const DECLARED_TYPE_KINDS = new Set<Node['kind']>([
+  'class', 'interface', 'struct', 'enum', 'type_alias', 'trait', 'protocol', 'union',
+]);
+
+/**
+ * Whether the project declares `typeName` (simple, or `Outer::Inner`) in the
+ * ref's language family. False for library types (`Regex`, `Properties`).
+ */
+function isProjectType(typeName: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const simple = typeName.split('::').pop()!;
+  return context.getNodesByName(simple).some(
+    (n) =>
+      DECLARED_TYPE_KINDS.has(n.kind) &&
+      sameLanguageFamily(n.language, ref.language) &&
+      (!typeName.includes('::') || n.qualifiedName === typeName || n.qualifiedName.endsWith(`::${typeName}`)),
+  );
+}
+
+/**
+ * A Kotlin type written in source (`Lease?`, `HardwareLock.Lease`,
+ * `List<Foo>`) as a name resolveMethodOnType matches: nullability and type
+ * arguments dropped, a nested type joined with `::`, a package prefix
+ * (lowercase segments) dropped. Null when it is not a type name.
+ */
+function kotlinTypeName(raw: string): string | null {
+  const cleaned = raw.replace(/<[^>]*>/g, '').replace(/\?/g, '').trim();
+  const segments = cleaned.split('.').filter(Boolean);
+  let first = segments.length;
+  while (first > 0 && /^[A-Z]\w*$/.test(segments[first - 1]!)) first--;
+  const typeSegments = segments.slice(first);
+  return typeSegments.length > 0 ? typeSegments.join('::') : null;
+}
+
+/**
+ * Stands for "a type the project does not declare" — a library class, or the
+ * result of a call on one — so the caller can refuse a name-only guess.
+ */
+export const KOTLIN_EXTERNAL_TYPE = '\u0000external';
+
+/**
+ * The type a Kotlin declaration of `name` in `text` gives it: `name: Type`, a
+ * constructor call `name = Type(…)`, or a call `name = Owner.fn(…)` /
+ * `name = fn(…)`, typed by `fn`'s declared return type. KOTLIN_EXTERNAL_TYPE
+ * when the owner is not a project type; null when nothing names a type.
+ */
+function kotlinDeclaredTypeIn(
+  text: string,
+  name: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  const r = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const typed = text.match(new RegExp(`\\b(?:val|var)\\s+${r}\\s*:\\s*([A-Z][\\w.]*)`));
+  if (typed && typed[1]) return kotlinTypeName(typed[1]);
+  const assigned = text.match(new RegExp(`\\b(?:val|var)\\s+${r}\\s*=\\s*([A-Za-z_][\\w.]*)\\s*\\(`));
+  if (!assigned || !assigned[1]) return null;
+  const segments = assigned[1].split('.');
+  const last = segments.pop()!;
+  if (/^[A-Z]/.test(last)) return kotlinTypeName(assigned[1]);
+  // A call. Only an owner written as a type chain (`Lock.tryBegin`) or none at
+  // all (`beginOp()`) can be typed; `a.b.fn()` goes through values.
+  if (segments.length > 0 && !segments.every((seg) => /^[A-Z]/.test(seg))) return null;
+  return kotlinCallResultType(segments.length > 0 ? segments.join('::') : undefined, last, ref, context);
+}
+
+/**
+ * The declared return type of Kotlin `owner.fn` (or of an unqualified `fn`, a
+ * method of the ref's own class first, then one in the same file). Every
+ * candidate must declare the same return type. A return type nested in the
+ * callee's owner keeps that owner (`Lease` in `HardwareLock` →
+ * `HardwareLock::Lease`). KOTLIN_EXTERNAL_TYPE for a call on a type the
+ * project does not declare (`Executors.newSingleThreadScheduledExecutor()`).
+ */
+function kotlinCallResultType(
+  owner: string | undefined,
+  fn: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  if (owner && !isProjectType(owner, ref, context)) return KOTLIN_EXTERNAL_TYPE;
+  let candidates = context.getNodesByName(fn).filter(
+    (n) => (n.kind === 'method' || n.kind === 'function') && n.language === 'kotlin' && !!n.signature,
+  );
+  if (owner) {
+    candidates = candidates.filter((n) => n.qualifiedName.endsWith(`${owner}::${fn}`));
+  } else {
+    const ownClass = context.getNodesInFile(ref.filePath)
+      .filter((n) => (n.kind === 'class' || n.kind === 'interface') && n.startLine <= ref.line && (n.endLine ?? n.startLine) >= ref.line)
+      .sort((a, b) => b.startLine - a.startLine)[0];
+    const inOwnClass = ownClass
+      ? candidates.filter((n) => n.qualifiedName === `${ownClass.qualifiedName}::${fn}`)
+      : [];
+    const inFile = candidates.filter((n) => n.filePath === ref.filePath);
+    candidates = inOwnClass.length > 0 ? inOwnClass : inFile.length > 0 ? inFile : candidates;
+  }
+  if (candidates.length === 0) return null;
+
+  let result: string | null = null;
+  for (const c of candidates) {
+    const sig = c.signature!;
+    const at = sig.lastIndexOf('):');
+    if (at < 0) return null;
+    let type = kotlinTypeName(sig.slice(at + 2));
+    if (!type) return null;
+    if (!type.includes('::')) {
+      const container = c.qualifiedName.slice(0, c.qualifiedName.lastIndexOf('::'));
+      const containerName = container.split('::').pop();
+      if (containerName && context.getNodesByQualifiedName(`${container}::${type}`).some((n) => DECLARED_TYPE_KINDS.has(n.kind))) {
+        type = `${containerName}::${type}`;
+      }
+    }
+    if (result !== null && result !== type) return null;
+    result = type;
+  }
+  return result;
+}
+
+/**
+ * The declared type of Kotlin receiver `name` at `ref`: the nearest local
+ * declaration in the enclosing scope (typed, constructed, or bound to a call),
+ * else a property of the enclosing class. Null when none names a type.
+ */
+function kotlinReceiverDeclaredType(
+  name: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  const lines = context.getFileLines
+    ? context.getFileLines(ref.filePath)
+    : (context.readFile(ref.filePath)?.split(/\r?\n/) ?? null);
+  if (lines && lines.length > 0) {
+    const r = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const declares = new RegExp(`\\b(?:val|var)\\s+${r}\\b`);
+    const callIdx = Math.max(0, Math.min(lines.length - 1, ref.line - 1));
+    const startIdx = Math.max(0, enclosingScopeStartLine(ref, context) - 1);
+    for (let i = callIdx; i >= startIdx; i--) {
+      const line = lines[i];
+      if (!line || line.length > 10_000 || !declares.test(line)) continue;
+      const local = kotlinDeclaredTypeIn(line, name, ref, context);
+      if (local) return local;
+      break;
+    }
+  }
+  return inferJavaFieldReceiverType(name, ref, context);
 }
 
 // ── Local-variable receiver-type inference (#1108) ──────────────────────────
@@ -2551,6 +2685,26 @@ export function matchMethodCall(
       if (typedMatch) {
         return typedMatch;
       }
+    }
+  }
+
+  // Kotlin: a receiver whose type is known — a local bound to a call
+  // (`val lease = HardwareLock.tryBegin()`, typed by the callee's declared
+  // return type), a local constructor call, or a property — resolves on that
+  // type. A type the project does not declare (`Regex`, `Properties`, a JDK or
+  // Android class) has none of the project's methods, so the call gets NO
+  // edge instead of the name-only guesses below, which bind it to whatever
+  // project class declares a method of the same name.
+  if (ref.language === 'kotlin' && dotMatch && !objectOrClass!.includes('.')) {
+    const declared = nmTimedT('mc-kt-declared', ref, () =>
+      kotlinReceiverDeclaredType(objectOrClass!, ref, context));
+    if (declared === KOTLIN_EXTERNAL_TYPE) return null;
+    if (declared) {
+      const typedMatch = nmTimedT('mc-rmot', ref, () => resolveMethodOnType(
+        declared, methodName!, ref, context, 0.9, 'instance-method',
+      ));
+      if (typedMatch) return typedMatch;
+      if (!isProjectType(declared, ref, context)) return null;
     }
   }
 
