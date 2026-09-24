@@ -2537,7 +2537,7 @@ export function matchMethodCall(
           (n) =>
             n.kind === 'method' &&
             n.name === methodName &&
-            n.qualifiedName.includes(classNode.name)
+            isMemberOf(n, classNode.name)
         );
 
         if (methodNode) {
@@ -2573,7 +2573,7 @@ export function matchMethodCall(
             (n) =>
               n.kind === 'method' &&
               n.name === methodName &&
-              n.qualifiedName.includes(classNode.name)
+              isMemberOf(n, classNode.name)
           );
 
           if (methodNode) {
@@ -3006,6 +3006,19 @@ function matchTsThisFieldCall(
     }
   }
   return null;
+}
+
+/**
+ * Whether `member`'s qualified name puts it directly under a type named
+ * `typeName` — the segment before its own name, generic arguments and any
+ * dotted namespace stripped (`ns.Logger<T>::log` → `Logger`). A substring
+ * test is not enough: `FileLogger::log` contains `Logger`.
+ */
+function isMemberOf(member: Node, typeName: string): boolean {
+  const parts = member.qualifiedName.split('::');
+  if (parts.length < 2) return false;
+  const owner = parts[parts.length - 2]!.replace(/<.*$/, '');
+  return owner.slice(owner.lastIndexOf('.') + 1) === typeName;
 }
 
 /**
