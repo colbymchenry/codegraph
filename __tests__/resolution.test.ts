@@ -3595,9 +3595,23 @@ export function crossFileCaller() {
 `
       );
       fs.writeFileSync(path.join(tmpDir, 'd.ts'), `export function imported() { return 5; }\n`);
+      fs.writeFileSync(
+        path.join(tmpDir, 'e.ts'),
+        `function frozenFn() { return 6; }
+export const frozen = Object.freeze({ frozenFn });
+`
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'f.ts'),
+        `import { frozen } from './e';
+export function frozenCaller() { return frozen.frozenFn(); }
+`
+      );
       try {
         const cg = CodeGraph.initSync(tmpDir);
         await cg.indexAll();
+        // A literal handed straight to a wrapper still names its members.
+        expect(callersOf(cg, 'frozenFn', 'e.ts')).toEqual(['frozenCaller']);
 
         expect(callersOf(cg, 'inline', 'a.ts')).toEqual(['sameFileCaller']);
         for (const fn of ['viaArrow', 'viaDecl', 'longForm', 'renamed']) {
