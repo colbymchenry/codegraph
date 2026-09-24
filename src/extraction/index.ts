@@ -35,7 +35,7 @@ import ignore, { Ignore } from 'ignore';
 import { detectFrameworks } from '../resolution/frameworks';
 import type { ResolutionContext } from '../resolution/types';
 import { createYielder, type MaybeYield } from '../resolution/cooperative-yield';
-import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
+import { MAX_SOURCE_FILE_SIZE_BYTES, readBoundedSource, readBoundedSourceSync } from '../file-limits';
 
 /**
  * Number of files to read in parallel during indexing.
@@ -176,8 +176,8 @@ export function oversizeStamp(size: number): string {
  * limit, the size stamp when it is over — an oversize file is never decoded.
  */
 function readSourceOrStamp(fullPath: string): string {
-  const size = fs.statSync(fullPath).size;
-  return size > MAX_SOURCE_FILE_SIZE_BYTES ? oversizeStamp(size) : fs.readFileSync(fullPath, 'utf-8');
+  const { stats, bytes } = readBoundedSourceSync(fullPath);
+  return bytes === null ? oversizeStamp(stats.size) : bytes.toString('utf8');
 }
 
 /**
@@ -1900,8 +1900,7 @@ export class ExtractionOrchestrator {
         try {
           // Framework detectors scan source by name; a file over the size
           // limit was never indexed and must not be decoded here either (#1910).
-          if (fs.statSync(full).size > MAX_SOURCE_FILE_SIZE_BYTES) return null;
-          return fs.readFileSync(full, 'utf-8');
+          return readBoundedSourceSync(full).bytes?.toString('utf8') ?? null;
         } catch {
           return null;
         }
@@ -2321,14 +2320,13 @@ export class ExtractionOrchestrator {
             // Stat first: a file over the size limit is stored as skipped
             // without ever being read or decoded (#1910), so ten oversize
             // fixtures in one I/O batch no longer cost their size in RSS.
-            const stats = await fsp.stat(fullPath);
-            if (stats.size > MAX_SOURCE_FILE_SIZE_BYTES) {
+            const { stats, bytes } = await readBoundedSource(fullPath);
+            if (bytes === null) {
               return { filePath: fp, content: oversizeStamp(stats.size), stats, error: null as Error | null };
             }
             // Read bytes, not text: a `.ts` that is really an MPEG transport
             // stream (#1910) is recognised from its head here, at no extra I/O,
             // and never decoded or parsed.
-            const bytes = await fsp.readFile(fullPath);
             if (hasMpegTsExtension(fp) && isMpegTransportStream(bytes.subarray(0, MPEG_TS_SNIFF_BYTES))) {
               logDebug('Skipping MPEG transport stream named .ts — not TypeScript', { filePath: fp });
               return { filePath: fp, content: null as string | null, stats: null as fs.Stats | null, error: null as Error | null, skipped: true };
@@ -2662,9 +2660,10 @@ export class ExtractionOrchestrator {
     let content: string;
     let stats: fs.Stats;
     try {
-      stats = await fsp.stat(fullPath);
       // An oversize file is stored as skipped; its bytes are never needed (#1910).
-      content = stats.size > MAX_SOURCE_FILE_SIZE_BYTES ? oversizeStamp(stats.size) : await fsp.readFile(fullPath, 'utf-8');
+      const read = await readBoundedSource(fullPath);
+      stats = read.stats;
+      content = read.bytes === null ? oversizeStamp(stats.size) : read.bytes.toString('utf8');
     } catch (error) {
       return {
         nodes: [],
