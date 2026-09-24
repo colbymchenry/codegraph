@@ -13,6 +13,45 @@ import * as path from 'path';
 import type CodeGraph from '../index';
 import type { EdgeKind, Language, Node } from '../types';
 
+export interface DeclarationWalkLimits { maxDepth?: number; maxEntries?: number; }
+export const DECLARATION_WALK_MAX_DEPTH = 40;
+export const DECLARATION_WALK_MAX_ENTRIES = 200_000;
+
+/** Find declarations within the project without following directory or file symlinks. */
+export function walkDeclarationFiles(
+  root: string,
+  extension: string,
+  ignoredDirs: Set<string>,
+  limits: DeclarationWalkLimits,
+  halOnly = false,
+): { files: string[]; truncated: boolean } {
+  const maxDepth = limits.maxDepth ?? DECLARATION_WALK_MAX_DEPTH;
+  const maxEntries = limits.maxEntries ?? DECLARATION_WALK_MAX_ENTRIES;
+  const files: string[] = [];
+  let visited = 0;
+  let truncated = false;
+  const walk = (dir: string, depth: number, underHalRoot: boolean): void => {
+    if (truncated || depth > maxDepth) { truncated = true; return; }
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    catch { return; }
+    for (const entry of entries) {
+      if (visited >= maxEntries) { truncated = true; return; }
+      visited++;
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) {
+        if (ignoredDirs.has(entry.name)) continue;
+        const inHal = underHalRoot || (entry.name === 'interfaces' && path.basename(dir) === 'hardware');
+        walk(path.join(dir, entry.name), depth + 1, inHal);
+      } else if ((!halOnly || underHalRoot) && entry.name.endsWith(extension)) {
+        files.push(path.join(dir, entry.name));
+      }
+    }
+  };
+  walk(root, 0, false);
+  return { files, truncated };
+}
+
 /**
  * Result of a package-reachability check — three states, not a boolean,
  * because "we couldn't tell" and "we checked and it doesn't reach" must be
