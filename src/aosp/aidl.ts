@@ -32,7 +32,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type CodeGraph from '../index';
 import type { NodeKind } from '../types';
-import { grepIndexedSources, escapeRegExp, candidateReachesPackagedSymbol, stripCLikeComments, indexingCaveat, findMatchingBraceEnd, testPathEvidence } from './common';
+import { grepIndexedSources, escapeRegExp, candidateReachesPackagedSymbol, stripCLikeComments, indexingCaveat, findMatchingBraceEnd, testPathEvidence, walkDeclarationFiles, DECLARATION_WALK_MAX_DEPTH, DECLARATION_WALK_MAX_ENTRIES } from './common';
 import type { PackageReachability } from './common';
 
 export interface AidlDeclaration {
@@ -152,53 +152,9 @@ const IGNORED_DIR_NAMES = new Set([
   'node_modules', '.git', 'build', '.codegraph', 'out', '.gradle', '.idea', 'bin', 'dist',
 ]);
 const CANDIDATE_NODE_KINDS: NodeKind[] = ['class', 'interface'];
-export const AIDL_WALK_MAX_DEPTH = 40;
-export const AIDL_WALK_MAX_ENTRIES = 200_000;
+export const AIDL_WALK_MAX_DEPTH = DECLARATION_WALK_MAX_DEPTH;
+export const AIDL_WALK_MAX_ENTRIES = DECLARATION_WALK_MAX_ENTRIES;
 export interface AidlWalkLimits { maxDepth?: number; maxEntries?: number; }
-interface AidlFileWalkResult { files: string[]; truncated: boolean; }
-
-/**
- * Walk `root` for `.aidl` files, refusing to follow symlinks — both a
- * symlinked subdirectory (a caller-supplied interface name could otherwise
- * pull in a declaration from outside the project boundary the caller asked
- * to search, Codex 3rd-pass review, 2026-09-04) and a symlinked FILE with an
- * `.aidl`-looking name (the directory check alone left the file branch
- * unguarded — a `.aidl` symlink pointing outside `root` was parsed as if it
- * were a real in-repo declaration, Red Team round-3 finding, 2026-09-05).
- * This does NOT protect against `repoRoot` itself being attacker-controlled
- * (a caller passing `../../etc` or a symlinked root) — that trust boundary
- * belongs to the CLI/MCP layer that accepts `repoRoot`/`projectPath`, not
- * to this file-discovery helper.
- */
-function findAidlFiles(root: string, limits: AidlWalkLimits = {}): AidlFileWalkResult {
-  const maxDepth = limits.maxDepth ?? AIDL_WALK_MAX_DEPTH;
-  const maxEntries = limits.maxEntries ?? AIDL_WALK_MAX_ENTRIES;
-  const results: string[] = [];
-  let visited = 0;
-  let truncated = false;
-  const walk = (dir: string, depth: number): void => {
-    if (truncated || depth > maxDepth) { truncated = true; return; }
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return; // unreadable dir — skip rather than abort the whole search
-    }
-    for (const entry of entries) {
-      if (visited >= maxEntries) { truncated = true; return; }
-      visited++;
-      if (entry.isSymbolicLink()) continue;
-      if (entry.isDirectory()) {
-        if (IGNORED_DIR_NAMES.has(entry.name)) continue;
-        walk(path.join(dir, entry.name), depth + 1);
-      } else if (entry.name.endsWith('.aidl')) {
-        results.push(path.join(dir, entry.name));
-      }
-    }
-  };
-  walk(root, 0);
-  return { files: results, truncated };
-}
 
 /**
  * Parse every `.aidl` declaration named `interfaceName` in the repo — not
@@ -217,7 +173,7 @@ function findAidlFiles(root: string, limits: AidlWalkLimits = {}): AidlFileWalkR
  */
 function parseAidlDeclarationsWithWalk(repoRoot: string, interfaceName: string, limits: AidlWalkLimits = {}): { declarations: AidlDeclaration[]; truncated: boolean } {
   const declarations: AidlDeclaration[] = [];
-  const walk = findAidlFiles(repoRoot, limits);
+  const walk = walkDeclarationFiles(repoRoot, '.aidl', IGNORED_DIR_NAMES, limits);
   for (const aidlFile of walk.files) {
     let rawText: string;
     try {
