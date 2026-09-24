@@ -6135,5 +6135,43 @@ class UiModeManagerService {
       // the sole same-named constructor elsewhere in the project.
       expect(rows.filter((row) => row.targetKind === 'method')).toEqual([]);
     });
+
+    it('resolves a nested Java supertype to the closest source tree', async () => {
+      for (const tree of ['framework', 'androidx']) {
+        const dir = path.join(tempDir, tree);
+        fs.mkdirSync(dir);
+        fs.writeFileSync(path.join(dir, 'RecyclerView.java'),
+          `package ${tree}; class RecyclerView { static class LayoutManager {} }`);
+      }
+      fs.writeFileSync(path.join(tempDir, 'androidx', 'LinearLayoutManager.java'),
+        'package androidx; class LinearLayoutManager extends RecyclerView.LayoutManager {}');
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+      const rows = db.getDb().prepare(
+        `select dst.file_path as targetPath from edges e
+         join nodes src on src.id = e.source
+         join nodes dst on dst.id = e.target
+         where e.kind = 'extends' and src.name = 'LinearLayoutManager'`
+      ).all() as Array<{ targetPath: string }>;
+      expect(rows.map((row) => row.targetPath)).toEqual(['androidx/RecyclerView.java']);
+    });
+
+    it('does not let Spring naming conventions invent an inheritance edge', async () => {
+      fs.writeFileSync(path.join(tempDir, 'Service.java'),
+        '@Service class Service {} class Child implements View.OnClickListener {}');
+      fs.writeFileSync(path.join(tempDir, 'OnClickListener.java'),
+        'package unrelated; class OnClickListener {}');
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const db = DatabaseConnection.open(path.join(tempDir, '.codegraph', 'codegraph.db'));
+      const rows = db.getDb().prepare(
+        `select dst.qualified_name as target from edges e
+         join nodes src on src.id = e.source
+         join nodes dst on dst.id = e.target
+         where e.kind = 'implements' and src.name = 'Child'`
+      ).all() as Array<{ target: string }>;
+      expect(rows).toEqual([]);
+    });
   });
 });

@@ -126,6 +126,10 @@ export const springResolver: FrameworkResolver = {
       }
     }
 
+    // Name-based Spring conventions cannot identify a Java supertype. A
+    // same-named class in another package would create a false inheritance edge.
+    if (ref.referenceKind === 'extends' || ref.referenceKind === 'implements') return null;
+
     // Pattern 1: Service references (dependency injection)
     if (ref.referenceName.endsWith('Service')) {
       const result = resolveByNameAndKind(ref.referenceName, SERVICE_KINDS, SERVICE_DIRS, context);

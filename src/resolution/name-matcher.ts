@@ -957,7 +957,16 @@ export function matchByQualifiedName(
           ? endsWithQualifiedSegment(candidate.qualifiedName, normalizedQualifiedRef)
           : candidate.qualifiedName.endsWith(normalizedQualifiedRef)
       );
-    const chosen = preferCallSiteFile(partialCandidates, ref.filePath)[0];
+    // `RecyclerView.LayoutManager` can exist in both AndroidX and the
+    // framework. For inheritance, pick the uniquely closest source tree;
+    // an equal-distance tie has no safe target.
+    const closest = isInheritanceRef(ref) && partialCandidates.length > 1
+      ? partialCandidates.map((node) => ({ node, distance: computePathProximity(ref.filePath, node.filePath) }))
+          .sort((a, b) => b.distance - a.distance)
+      : null;
+    const chosen = closest
+      ? (closest[0]!.distance > closest[1]!.distance ? closest[0]!.node : null)
+      : preferCallSiteFile(partialCandidates, ref.filePath)[0];
     if (chosen) {
       return {
         original: ref,
