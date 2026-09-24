@@ -31,8 +31,7 @@
  * equally valid "this class touches Messenger" evidence.
  *
  * Two structural corroboration checks apply before a hit counts as evidence
- * for a specific class (Codex adversarial review, 2026-09-12, findings
- * HIGH-1 and HIGH-2, the first version of this tool had neither):
+ * for a specific class:
  *
  * 1. **Class ownership** (`isDirectMemberOfClass`): a repo-wide unresolved
  *    reference to `Messenger` says nothing about which class it belongs to
@@ -60,8 +59,7 @@
  * own body) somewhere. When more than one naming-convention candidate
  * exists, the first one with real corroborating evidence wins, not simply
  * the first one found by name, so a decoy class matching the convention
- * first no longer hides a genuinely corroborated second candidate (Codex
- * adversarial review, 2026-09-12, MEDIUM-6).
+ * first no longer hides a genuinely corroborated second candidate.
  */
 import type CodeGraph from '../index';
 import {
@@ -119,8 +117,7 @@ const MESSENGER_KIND_LABEL: Record<string, string> = {
  * own class body (not a sibling or nested class, see module docstring) and
  * (b) can actually reach `android.os.Messenger` from their file (not a
  * same-named type from an unrelated package). Both checks are real
- * corroboration; neither alone was sufficient (Codex adversarial review,
- * 2026-09-12, HIGH-1/HIGH-2).
+ * corroboration; neither alone was sufficient.
  *
  * Also checks the RESOLVED graph via `findResolvedReferencesToType`: a
  * project that indexes real (or stub) `android.os.Messenger` source of its
@@ -178,8 +175,7 @@ interface ClassCandidateEvaluation {
  * that actually has any, falling back to the first name match only when
  * none of the candidates have real evidence. Fixes a real false negative:
  * a decoy `{Name}Service` class with no Messenger evidence previously won
- * outright and the tool never even looked at `{Name}` (Codex adversarial
- * review, 2026-09-12, MEDIUM-6).
+ * outright and the tool never even looked at `{Name}`.
  */
 function evaluateClassCandidates(cg: CodeGraph, candidateNames: string[]): ClassCandidateEvaluation {
   const evaluations: ClassCandidateEvaluation[] = [];

@@ -1,7 +1,7 @@
 /**
- * AOSP extension — analyze_system_service (Phase 3).
+ * AOSP extension — system-service analysis.
  *
- * Same same-file correlation discipline as find_jni_bridge's post-review fix:
+ * The service class and its supporting evidence need the same-file correlation:
  * the service class and its supporting evidence must share a file for
  * "found"; anything else is convention_derived_candidate.
  */
@@ -159,7 +159,7 @@ describe('AOSP extension: analyzeSystemService', () => {
     expect(result.serviceClass).toBeNull();
   });
 
-  it('reports "found" when a cross-file startup site names the exact class, even without same-file evidence (Codex cross-review finding, 2026-09-04: JNI\'s same-file rule does not fit the AOSP shape where SystemServer starts the service from a different file than the service class itself)', async () => {
+  it('reports "found" when a cross-file startup site names the exact class, even without same-file evidence', async () => {
     write('src/BazManagerService.kt', 'package com.example.services\n\nclass BazManagerService\n');
     write(
       'src/SystemServer.kt',
@@ -180,7 +180,7 @@ describe('AOSP extension: analyzeSystemService', () => {
     expect(result.status).toBe('found');
   });
 
-  it('does NOT report "found" from a bare diagnostic log line mentioning the class name — only an actual start<...>(...) call site counts (Blue Team round-2 finding, 2026-09-04)', async () => {
+  it('does NOT report "found" from a bare diagnostic log line mentioning the class name — only an actual start<...>(...) call site counts', async () => {
     write('src/QuxManagerService.kt', 'package com.example.services\n\nclass QuxManagerService\n');
     write(
       'src/SomeUnrelatedFile.kt',
@@ -243,7 +243,7 @@ describe('AOSP extension: analyzeSystemService', () => {
     expect(result.status).toBe('convention_derived_candidate');
   });
 
-  it('does not throw and does not over-match on a service name containing regex metacharacters (Codex cross-review finding, 2026-09-04: unescaped interpolation)', async () => {
+  it('does not throw and does not over-match on a service name containing regex metacharacters', async () => {
     write(
       'src/Foo.BarManagerService.kt',
       'package com.example.services\n\nclass FooXBarManagerService\n'

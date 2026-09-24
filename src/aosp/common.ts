@@ -57,9 +57,7 @@ export function walkDeclarationFiles(
  * because "we couldn't tell" and "we checked and it doesn't reach" must be
  * distinguishable to the caller (and to evidence output). Collapsing them
  * into one boolean is what let a parse failure silently behave exactly like
- * a real mismatch check with no trace in the output (self-review finding,
- * 2026-09-05, 2nd self-review round: a package parse failure demoted
- * nothing and left no evidence that verification never ran).
+ * a real mismatch check with no trace in the output.
  */
 export type PackageReachability = 'verified' | 'unverifiable' | 'mismatch';
 
@@ -68,17 +66,14 @@ export type PackageReachability = 'verified' | 'unverifiable' | 'mismatch';
  * `{packageName}.{symbolName}` — a matching import (exact FQCN or a
  * wildcard covering the package), living in that same package (Kotlin/Java
  * resolve same-package symbols without an import), or matching one of
- * `alternateFqcns` (e.g. HIDL's versioned Java package,
- * `android.hardware.foo.V1_0.IFoo`, which a plain `@1.0` strip doesn't
- * reproduce — Codex 3rd-pass review, 2026-09-04)?
+ * `alternateFqcns` ?
  *
  * find_aidl_impl/find_hal_interface match an interface purely by its bare
  * name (`IFoo`) via `unresolved_refs`, which has no package/version field —
  * if two different `.aidl`/`.hal` declarations in the repo happen to share
  * a bare name (a real AOSP shape: `hardware/interfaces/foo/1.0/IFoo.aidl`
  * vs. an unrelated `hardware/interfaces/bar/2.0/IFoo.aidl`), a class that
- * implements one could get reported as implementing the other (Codex
- * 3rd-pass review, 2026-09-04). CodeGraph already indexes each file's
+ * implements one could get reported as implementing the other. CodeGraph already indexes each file's
  * import statements as `kind: 'import'` nodes carrying the full dotted
  * path (verified live: `import android.hardware.foo.IFoo` becomes a node
  * named exactly `android.hardware.foo.IFoo`) and each file's package
@@ -148,7 +143,7 @@ export function candidateReachesPackagedSymbol(
   // correct. Falling through to an unconditional `mismatch` treated "this
   // language has no way to pass the check" the same as "we checked and it's
   // wrong" — silently demoting a real C++ HIDL/AIDL implementation caught by
-  // the primary unresolved-extends signal (`struct DrmPlugin : public
+  // the primary unresolved-extends signal (`struct DrmPlugin: public
   // IDrmPlugin`) below the `found` threshold whenever the declaration's
   // package happened to be known, which is the common case for a real
   // `.hal`/`.aidl` file.
@@ -190,8 +185,7 @@ export function candidateReachesPackagedSymbol(
  * mid-index looks identical to a query against a fully-indexed, genuinely
  * empty repo. A caller polling right after `indexAll()` starts (or a CI
  * step that doesn't wait for completion) gets a silent false negative with
- * no signal that the answer might change once indexing finishes (White/Blue
- * Team round-2 finding, 2026-09-05). `cg.isIndexing()` already exists on the
+ * no signal that the answer might change once indexing finishes. `cg.isIndexing()` already exists on the
  * core CodeGraph class; this just standardizes the caveat text so every
  * aosp module surfaces it the same way instead of each reinventing wording.
  */
@@ -217,11 +211,7 @@ export interface SourceGrepHit {
  * commented-out character is replaced with a space, newlines are kept as
  * newlines. Used before scanning `.aidl`/`.hal` text for interface
  * declarations so a `interface IFoo {` example inside a docstring, or a
- * commented-out stale declaration, can never be mistaken for a live one
- * (Codex 3rd-pass review, 2026-09-04: `AIDL_INTERFACE_RE`/`HAL_INTERFACE_RE`
- * took the file's first raw regex match with no comment awareness at all —
- * unlike `grepIndexedSources` below, which at least skips whole-line
- * comments in already-indexed Kotlin/Java/C/C++/XML sources).
+ * commented-out stale declaration, can never be mistaken for a live one.
  *
  * Not a full lexer — a `//`/`/* *\/` sequence inside a string literal is
  * still blanked out. AIDL/HAL declaration files essentially never contain
@@ -237,8 +227,7 @@ export interface SourceGrepHit {
  * are not brace-free — a nested `enum`/`struct`/`union`/`parcelable`
  * declaration inside the interface has its own `{ ... }`, and a plain
  * `text.indexOf('}', bodyStart)` truncates the body at THAT inner closing
- * brace, silently dropping every real method declared after it (Red Team
- * round-4 finding, 2026-09-05). Comments must already be stripped from
+ * brace, silently dropping every real method declared after it. Comments must already be stripped from
  * `text` (see `stripCLikeComments`) before calling this, or a `}` inside a
  * comment would be counted.
  */
@@ -286,9 +275,7 @@ export function testPathEvidence(hits: SourceGrepHit[]): string | null {
  * name, permission string, broadcast action, HAL name) must run its
  * interpolated pieces through this first — an unescaped `.`/`[`/`(` etc.
  * either silently widens the match (false positives) or throws on
- * `new RegExp()` (Codex cross-review finding, 2026-09-04: hal.ts and
- * system_service.ts interpolated names unescaped while
- * permission_broadcast.ts already did this correctly).
+ * `new RegExp()`.
  */
 export function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -300,8 +287,7 @@ export function escapeRegExp(value: string): string {
  * using that prefix for every language (the original fix) left every XML
  * caller (tracePermission's manifest scan) exposed to a permission string
  * sitting inside `<!-- ... -->`, verified live: a `<!--`-commented-out
- * `<uses-permission>` line matched identically to a real one (self-review
- * gap in the Codex-driven `//`-only fix, 2026-09-04).
+ * `<uses-permission>` line matched identically to a real one.
  */
 const LINE_COMMENT_PREFIX: Partial<Record<Language, string>> = {
   kotlin: '//',
@@ -324,7 +310,7 @@ const LINE_COMMENT_PREFIX: Partial<Record<Language, string>> = {
  * opens on an earlier line, or a string literal still passes through.
  * Callers must not treat a hit here as semantic proof; the `AospCandidate`/
  * evidence types this feeds all describe it as supplementary text-match
- * signal, never sufficient alone (Codex cross-review finding, 2026-09-04).
+ * signal, never sufficient alone.
  */
 /**
  * `{base}{suffix}` without duplicating the overlap when `base` already ends
@@ -413,9 +399,7 @@ function isWithinRoot(candidate: string, root: string): boolean {
  * itself followed during indexing). Extracted here so any other AOSP module
  * that reads CodeGraph-indexed files directly, rather than through
  * `grepIndexedSources`, gets the same defense instead of re-deriving it ad
- * hoc (self-review finding while adding `content_provider.ts`'s
- * `AndroidManifest.xml` scan, 2026-09-12: that scan originally read files by
- * resolved path with no containment check at all).
+ * hoc.
  */
 export function resolveContainedFilePath(root: ContainedRepoRoot, filePath: string): string | null {
   const absolutePath = path.resolve(root.resolvedRepoRoot, filePath);
@@ -444,12 +428,7 @@ export function resolveContainedFilePath(root: ContainedRepoRoot, filePath: stri
  * real false-positive shapes a same-file + overlapping-line-range check
  * cannot distinguish: `class Outer { static class Inner { Messenger m; }
  * }` querying `Outer`, and `class A {} class B { Messenger m; }` on one
- * source line querying `A` (Codex adversarial review, 2026-09-12, HIGH-2:
- * messenger.ts/local_socket.ts originally scoped "is this reference inside
- * the matched class's own body" purely by `ref.line` falling inside
- * `[classNode.startLine, classNode.endLine]`, which both of those real
- * shapes satisfy without the reference belonging to the queried class at
- * all).
+ * source line querying `A`.
  */
 export function isDirectMemberOfClass(memberQualifiedName: string, classQualifiedName: string): boolean {
   if (memberQualifiedName === classQualifiedName) return true;
@@ -476,7 +455,7 @@ export interface ResolvedTypeReference {
  * tree, or a synthetic fixture that defines them) resolves every reference
  * successfully, so it never reaches `unresolved_refs` at all, and all three
  * detectors silently lost their only evidence path for an otherwise
- * genuinely correct target (Codex adversarial review, 2026-09-12, MEDIUM-3).
+ * genuinely correct target.
  * This is the second evidence path that closes that gap: same shape as the
  * unresolved path (a `fromNode` to check with `isDirectMemberOfClass`), but
  * read from real graph edges instead. A resolved edge needs no separate
@@ -513,9 +492,7 @@ export interface GrepIndexedSourcesOptions {
    * scanning specifically for a `content://` URI literal: the literal's own
    * `//` gets blanked exactly like a real comment, silently deleting
    * everything after it on that line, including the authority the caller
-   * was searching for (Codex adversarial review, 2026-09-12, MEDIUM-7,
-   * found scanning `content_provider.ts`'s ContentResolver client-usage
-   * search). Set `stripComments: false` for exactly that kind of scan. The
+   * was searching for. Set `stripComments: false` for exactly that kind of scan. The
    * line-starts-with-comment-prefix skip below is unaffected either way:
    * it only rejects a line whose first non-whitespace characters ARE the
    * comment marker, which a URI embedded mid-line never matches.
