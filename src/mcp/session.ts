@@ -15,8 +15,8 @@
 import * as path from 'path';
 import { JsonRpcRequest, JsonRpcNotification, JsonRpcTransport, ErrorCodes } from './transport';
 import { MCPEngine } from './engine';
-import { tools } from './tools';
-import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_NO_ROOT_INDEX } from './server-instructions';
+import { tools, getStaticTools } from './tools';
+import { SERVER_INSTRUCTIONS, SERVER_INSTRUCTIONS_NO_ROOT_INDEX, aospToolsAddendum } from './server-instructions';
 import { CodeGraphPackageVersion } from './version';
 import { resolveServerRoot } from '../directory';
 import { getTelemetry, ClientInfo } from '../telemetry';
@@ -53,6 +53,18 @@ export function initializeInstructions(base: string, notice: string | null = get
     `${base}\n\n---\n${notice} This server keeps running the old version until ` +
     `the user upgrades — mention it when convenient; do not run the upgrade yourself.`
   );
+}
+
+/**
+ * The AOSP-tools addendum for THIS server's actual enabled tool set (reads
+ * CODEGRAPH_MCP_TOOLS via getStaticTools, no CodeGraph instance needed).
+ * Exported so the proxy's local handshake composes the identical payload,
+ * matching every other export here. Returns '' when no AOSP tool is
+ * enabled, so the common case pays nothing extra.
+ */
+export function enabledAospAddendum(): string {
+  const enabled = new Set(getStaticTools().map((t) => t.name.replace(/^codegraph_/, '')));
+  return aospToolsAddendum(enabled);
 }
 
 /** MCP Protocol Version (latest the server claims). */
@@ -253,7 +265,9 @@ export class MCPSession {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: { tools: {} },
       serverInfo: SERVER_INFO,
-      instructions: initializeInstructions(indexed ? SERVER_INSTRUCTIONS : SERVER_INSTRUCTIONS_NO_ROOT_INDEX),
+      instructions: initializeInstructions(
+        (indexed ? SERVER_INSTRUCTIONS : SERVER_INSTRUCTIONS_NO_ROOT_INDEX) + enabledAospAddendum()
+      ),
     });
 
     if (explicitPath) {
