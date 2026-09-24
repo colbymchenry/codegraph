@@ -4983,6 +4983,103 @@ object Main {
       // Bar has no onlyOther() — must not mis-attach to the same-named Other::onlyOther.
       expect(callerNamesOf('Other::onlyOther')).toEqual([]);
     });
+
+    describe('Scala Outer.Inner(args) apply vs a Java constructor', () => {
+      function write(rel: string, body: string): void {
+        fs.mkdirSync(path.dirname(path.join(tempDir, rel)), { recursive: true });
+        fs.writeFileSync(path.join(tempDir, rel), body);
+      }
+      function edgesFrom(name: string): { kind: string; qn: string; lang: string }[] {
+        const from = cg.getNodesByKind('method').find((n) => n.name === name);
+        if (!from) return [];
+        return cg
+          .getOutgoingEdges(from.id)
+          .filter((e) => e.kind !== 'contains' && e.kind !== 'references')
+          .map((e) => {
+            const t = cg.getNode(e.target)!;
+            return { kind: e.kind, qn: t.qualifiedName, lang: t.language };
+          });
+      }
+
+      beforeEach(() => {
+        write('java/com/acme/http/WebSocket.java', `package com.acme.http;
+public abstract class WebSocket {
+  public static WebSocket fromString(String s) { return null; }
+  public static class Accepted {
+    public Accepted(String flow) {}
+  }
+}
+`);
+        // A second Java class sharing the method names, so the receiver-word
+        // strategy (not a unique-name shortcut) is what decides.
+        write('java/com/acme/http/Other.java', `package com.acme.http;
+public class Other {
+  public static Other fromString(String s) { return null; }
+  public static class Accepted {
+    public Accepted(String flow) {}
+  }
+}
+`);
+      });
+
+      it('resolves WebSocket.Accepted(...) to the Scala case class, never the Java constructor', async () => {
+        write('scala/app/WebSocket.scala', `package app
+trait WebSocket
+object WebSocket {
+  final case class Accepted[In, Out](flow: String, sub: Option[String])
+}
+`);
+        write('scala/app/Use.scala', `package app
+class Use {
+  def accept(): Unit = { WebSocket.Accepted("f", None) }
+}
+`);
+        cg = await CodeGraph.init(tempDir, { index: true });
+        const out = edgesFrom('accept');
+        expect(out.filter((e) => e.lang === 'java')).toEqual([]);
+        expect(out).toContainEqual({ kind: 'instantiates', qn: 'WebSocket::Accepted', lang: 'scala' });
+      });
+
+      it('does not take a Java constructor from a return-type annotation read as the receiver type', async () => {
+        // `def f(): WebSocket = WebSocket.Accepted(...)` — the local-declaration
+        // pattern reads `WebSocket = WebSocket.Accepted` as the receiver's type.
+        write('scala/app/WebSocket.scala', `package app
+trait WebSocket
+object WebSocket {
+  final case class Accepted(flow: String) extends WebSocket
+}
+`);
+        write('scala/app/Use.scala', `package app
+class Use {
+  def accept(flow: String): WebSocket = WebSocket.Accepted(flow)
+}
+`);
+        cg = await CodeGraph.init(tempDir, { index: true });
+        const out = edgesFrom('accept');
+        expect(out.filter((e) => e.lang === 'java')).toEqual([]);
+        expect(out).toContainEqual({ kind: 'instantiates', qn: 'WebSocket::Accepted', lang: 'scala' });
+      });
+
+      it('does not guess a Java constructor for a Scala Outer.Inner(...) call by receiver words alone', async () => {
+        write('scala/app/Use.scala', `package app
+class Use {
+  def accept(): Unit = { WebSocket.Accepted("f") }
+}
+`);
+        cg = await CodeGraph.init(tempDir, { index: true });
+        expect(edgesFrom('accept').filter((e) => e.qn.endsWith('::Accepted::Accepted'))).toEqual([]);
+      });
+
+      it('still resolves a Scala call to a real Java static method', async () => {
+        write('scala/app/Use.scala', `package app
+class Use {
+  def load(): Unit = { WebSocket.fromString("y") }
+}
+`);
+        cg = await CodeGraph.init(tempDir, { index: true });
+        expect(edgesFrom('load')).toContainEqual({ kind: 'calls', qn: 'com.acme.http::WebSocket::fromString', lang: 'java' });
+      });
+    });
   });
 
   describe('Dart chained static-factory / factory-constructor call resolution (#645/#608 mechanism)', () => {
