@@ -107,7 +107,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(sourceNames(cg, callEdges)).toEqual(['direct_caller']);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -151,7 +150,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(sourceNames(cg, fnRefEdgesInto(cg, 'handleClick'))).toEqual(['wire']);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -181,7 +179,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(target?.filePath.endsWith('handlers.ts')).toBe(true);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -206,7 +203,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(sourceNames(cg, edges)).not.toContain('wire');
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -234,7 +230,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(target?.filePath.endsWith('real.c')).toBe(true);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -259,7 +254,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(fnRef).toHaveLength(0);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -283,7 +277,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(selfLoops).toHaveLength(0);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -348,7 +341,6 @@ describe('Function-as-value capture (#756)', () => {
       }
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -405,7 +397,6 @@ describe('Function-as-value capture (#756)', () => {
       ]);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -455,7 +446,6 @@ describe('Function-as-value capture (#756)', () => {
       }
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -495,7 +485,6 @@ describe('Function-as-value capture (#756)', () => {
       ).toHaveLength(0);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -542,7 +531,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(sourceNames(cg, fnRefEdgesInto(cg, 'run0'))).toEqual(['thisRef']);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -587,7 +575,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(cg.getIncomingEdges(decoy.id).filter((e) => e.metadata?.fnRef === true)).toHaveLength(0);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -616,7 +603,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(sourceNames(cg, edges)).toEqual(['wire']);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -660,7 +646,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(fnRefEdgesInto(cg, 'dupCmd')).toHaveLength(0);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -701,7 +686,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(sourceNames(cg, fnRefEdgesInto(cg, 'load'))).toEqual(['sorter']);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -742,7 +726,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(fnRefEdgesInto(cg, 'title')).toHaveLength(0);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -822,7 +805,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(callers.some((c) => c.node.name === 'get_serializer_class')).toBe(true);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -855,7 +837,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(fnRefEdgesInto(cg, 'unknown_thing')).toHaveLength(0);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 
@@ -899,7 +880,6 @@ describe('Function-as-value capture (#756)', () => {
       expect(sourceNames(cg, fnRefEdgesInto(cg, 'cb_a'))).toEqual(['wire']);
     } finally {
       cg.destroy();
-      tmpDir = undefined;
     }
   });
 });
