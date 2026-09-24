@@ -6289,4 +6289,48 @@ bracketed()
       expect(reachedFrom('consumer.ts', 'HiddenFace')).toBe(false);
     }, 30000);
   });
+
+  describe('Name-only method match never binds a delegating call to its own caller', () => {
+    const selfLoops = (g: CodeGraph, file: string): string[] =>
+      g.getNodesInFile(file)
+        .filter((n) => n.kind === 'method' || n.kind === 'function')
+        .flatMap((n) => g.getOutgoingEdges(n.id)
+          .filter((e) => e.kind === 'calls' && e.target === n.id)
+          .map(() => n.name));
+
+    it('drops the self-loop for a Scala delegating wrapper', async () => {
+      fs.writeFileSync(path.join(tempDir, 'Form.scala'), `
+package play.api.data
+class WrappedMapping(wrapped: Mapping) {
+  def unbind(value: String): String = wrapped.unbind(value)
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+      expect(selfLoops(cg, 'Form.scala')).toEqual([]);
+    }, 30000);
+
+    it('keeps real recursion through this./bare calls and a Go named receiver', async () => {
+      fs.writeFileSync(path.join(tempDir, 'Tree.java'), `
+public class Tree {
+  public int depth(int n) { return n == 0 ? 0 : this.depth(n - 1); }
+  public int size(int n) { return n == 0 ? 0 : size(n - 1); }
+}
+`);
+      fs.writeFileSync(path.join(tempDir, 'relay.go'), `
+package relay
+type relayClient struct{}
+func (r *relayClient) sendBatchAttempt(retry bool) error {
+	if retry {
+		return r.sendBatchAttempt(false)
+	}
+	return nil
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+      expect(selfLoops(cg, 'Tree.java').sort()).toEqual(['depth', 'size']);
+      expect(selfLoops(cg, 'relay.go')).toEqual(['sendBatchAttempt']);
+    }, 30000);
+  });
 });
