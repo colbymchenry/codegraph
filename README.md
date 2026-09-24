@@ -902,6 +902,11 @@ MIT
 
 ---
 
+
+## Android platform analysis
+
+Use the Android platform commands to inspect AIDL and HIDL implementations, JNI bindings, system services, permissions, broadcasts, and IPC evidence in an indexed project. See the [Android platform guide](docs/design/android-platform-analysis.md) for commands, MCP opt-in, and result limits.
+
 <div align="center">
 
 **Made for AI coding agents — Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, and GitHub Copilot**

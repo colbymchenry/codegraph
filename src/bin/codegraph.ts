@@ -54,6 +54,15 @@ import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime
 import { installCommandSupervision } from './command-supervision';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
 import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
+import { findAidlImpl } from '../aosp/aidl';
+import { findJniBridge } from '../aosp/jni';
+import { findHalInterface } from '../aosp/hal';
+import { analyzeSystemService } from '../aosp/system_service';
+import { tracePermission, traceBroadcast } from '../aosp/permission_broadcast';
+import { findMessengerIpc } from '../aosp/messenger';
+import { findContentProviderImpl } from '../aosp/content_provider';
+import { findLocalSocketIpc } from '../aosp/local_socket';
+import { validateProjectPath } from '../utils';
 // Value import, but dependency-free by design so `--help` text can name the
 // default port without dragging node:http into every other subcommand; the
 // server itself is loaded lazily inside the `ui` action. See ui-server/constants.
@@ -209,6 +218,29 @@ const chalk = {
   white: (s: string) => `${colors.white}${s}${colors.reset}`,
   gray: (s: string) => `${colors.gray}${s}${colors.reset}`,
 };
+
+// Keep the CLI's confidence signals consistent with the MCP text renderers.
+// An absent/unverifiable value is intentionally silent: it is neither proof
+// nor a contradiction.
+function packageVerifiedLabel(packageVerified: string | undefined): string {
+  if (packageVerified === 'verified') return ' [package-verified]';
+  if (packageVerified === 'mismatch') return ' [package MISMATCH — likely a same-named symbol in a different package]';
+  return '';
+}
+
+function jniRegistrationLabels(candidate: { packageVerified?: string; methodMentioned?: boolean }): string {
+  const packageLabel = candidate.packageVerified === 'verified'
+    ? ' [package-verified via FindClass(...)]'
+    : candidate.packageVerified === 'mismatch'
+      ? ' [package MISMATCH — FindClass(...) nearby names a different package, excluded from correlation]'
+      : '';
+  const methodLabel = candidate.methodMentioned === true
+    ? ' [method-mentioned]'
+    : candidate.methodMentioned === false && candidate.packageVerified !== 'mismatch'
+      ? ' [method not mentioned nearby]'
+      : '';
+  return packageLabel + methodLabel;
+}
 
 program
   .name('codegraph')
@@ -384,6 +416,30 @@ function cliDefinition(group: Node[]) {
     definition: { ...cliNode(head), id: head.id, qualifiedName: head.qualifiedName, language: head.language },
     roots: group.map((node) => node.id),
   };
+}
+
+/**
+ * Reject an empty positional argument before doing any real work. The MCP
+ * server's `validateString()` already rejects an empty string with an
+ * error; these CLI commands had no equivalent check, so `codegraph
+ * aidl-impl ""` silently ran a full unresolved_refs/naming-convention/
+ * addService scan over the entire repo before reporting
+ * declaration_not_found — wasted work a one-line guard avoids (Red Team
+ * round-2 finding, 2026-09-04, verified live).
+ */
+function requireNonEmpty(value: string, name: string): void {
+  if (value.length === 0) {
+    error(`${name} must be a non-empty string`);
+    process.exit(1);
+  }
+}
+
+function validateAospCliProjectPath(projectPath: string): void {
+  const errorMessage = validateProjectPath(projectPath);
+  if (errorMessage) {
+    error(errorMessage);
+    process.exit(1);
+  }
 }
 
 type IndexResult = {
@@ -2418,6 +2474,443 @@ program
       }
     } catch (err) {
       error(`impact failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph aidl-impl <interface>
+ *
+ * AOSP extension. Find who implements an AIDL interface — the checked-in
+ * `.aidl` declaration plus the Kotlin/Java Stub/Proxy/service-registration
+ * candidates, using CodeGraph's own indexed graph (unresolved_refs +
+ * naming-convention search) rather than a generated-stub or Gradle-classpath
+ * dependent approach. See src/aosp/aidl.ts for the algorithm and its
+ * fail-closed rationale.
+ */
+program
+  .command('aidl-impl <interface>')
+  .description('Find Kotlin/Java implementations of an AIDL interface (AOSP extension)')
+  .option('-p, --path <path>', 'Project path')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (interfaceName: string, options: { path?: string; json?: boolean }) => {
+    requireNonEmpty(interfaceName, 'interface');
+    const projectPath = resolveProjectPath(options.path);
+    validateAospCliProjectPath(projectPath);
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      const result = findAidlImpl(cg, projectPath, interfaceName);
+      cg.destroy();
+
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      if (result.status === 'declaration_not_found') {
+        warn(`No .aidl declaration for "${interfaceName}" found under ${projectPath}`);
+      } else if (result.status === 'no_implementation_found') {
+        info(`No implementation of "${interfaceName}" found in this repo.`);
+      } else {
+        console.log(chalk.bold(`\n"${interfaceName}" — ${result.implementations.length} implementation candidate(s), ${result.registrations.length} registration site(s):\n`));
+        for (const c of result.implementations) {
+          console.log(`  ${chalk.dim(c.kind.padEnd(18))}${c.name}  ${chalk.cyan(`${c.filePath}:${c.line}`)}  ${chalk.dim(`(${c.matchedPattern})`)}${packageVerifiedLabel(c.packageVerified)}`);
+        }
+        for (const c of result.registrations) {
+          console.log(`  ${chalk.dim(c.kind.padEnd(18))}${c.name}  ${chalk.cyan(`${c.filePath}:${c.line}`)}  ${chalk.dim(`(${c.matchedPattern})`)}`);
+        }
+      }
+      console.log(chalk.dim(`\nEvidence:\n${result.evidence.map((e) => `  - ${e}`).join('\n')}`));
+    } catch (err) {
+      error(`aidl-impl failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph jni-bridge <class>
+ *
+ * AOSP extension. Trace a Java/Kotlin class's native declarations to a
+ * matching native (C/C++) implementation and, independently, a confirmed
+ * RegisterNatives registration. Unlike aidl-impl, this does NOT collapse to
+ * a binary found/not-found: a naming-convention match without a confirmed
+ * registration is reported as `convention_derived_candidate`, distinct from
+ * `found` — see src/aosp/jni.ts for the rationale.
+ */
+program
+  .command('jni-bridge <class>')
+  .description('Trace a class\'s native declarations to their C/C++ implementation (AOSP extension)')
+  .option('-p, --path <path>', 'Project path')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (className: string, options: { path?: string; json?: boolean }) => {
+    requireNonEmpty(className, 'class');
+    const projectPath = resolveProjectPath(options.path);
+    validateAospCliProjectPath(projectPath);
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      const result = findJniBridge(cg, projectPath, className);
+      cg.destroy();
+
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      if (result.status === 'class_not_found') {
+        warn(`No class "${className}" found in the index`);
+      } else if (result.status === 'no_bridge_found') {
+        info(`No native declarations (or no native-side match) found for "${className}".`);
+      } else {
+        const label = result.status === 'found' ? 'CONFIRMED' : 'convention-derived candidate (unconfirmed)';
+        console.log(chalk.bold(`\n"${className}" JNI bridge — ${label}:\n`));
+        for (const d of result.nativeDeclarations) {
+          console.log(`  ${chalk.dim('declared'.padEnd(18))}${d.methodName}  ${chalk.cyan(`${d.filePath}:${d.line}`)}  ${chalk.dim(`(${d.declarationStyle})`)}`);
+        }
+        for (const c of result.nativeImplementations) {
+          console.log(`  ${chalk.dim(c.kind.padEnd(18))}${c.name}  ${chalk.cyan(`${c.filePath}:${c.line}`)}`);
+        }
+        for (const c of result.registerNativesHits) {
+          console.log(`  ${chalk.dim(c.kind.padEnd(18))}${c.name}  ${chalk.cyan(`${c.filePath}:${c.line}`)}${jniRegistrationLabels(c)}`);
+        }
+      }
+      console.log(chalk.dim(`\nEvidence:\n${result.evidence.map((e) => `  - ${e}`).join('\n')}`));
+    } catch (err) {
+      error(`jni-bridge failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph hal-interface <hal-name>
+ *
+ * AOSP extension (Phase 3). Same declaration -> implementation ->
+ * registration contract as aidl-impl, scoped to hardware/interfaces/ and
+ * extended with a native (c/cpp) implementation search.
+ */
+program
+  .command('hal-interface <hal-name>')
+  .description('Find implementations of a HAL interface under hardware/interfaces/ (AOSP extension)')
+  .option('-p, --path <path>', 'Project path')
+  .option('-t, --type <type>', 'HAL type: aidl or hidl (default: aidl)', 'aidl')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (halName: string, options: { path?: string; type?: string; json?: boolean }) => {
+    requireNonEmpty(halName, 'hal-name');
+    // Unlike the MCP server's inputSchema.enum (also unenforced until this
+    // fix — see tools.ts's validateEnum), Commander DOES reject an
+    // undeclared --type value on its own; this only needs to reject a
+    // wrong-but-otherwise-valid-looking one (a typo'd case) rather than
+    // silently defaulting to 'aidl' (Red Team round-2 finding, 2026-09-04:
+    // `--type HIDL` silently searched aidl instead).
+    if (options.type !== undefined && options.type !== 'aidl' && options.type !== 'hidl') {
+      error(`--type must be "aidl" or "hidl" (got "${options.type}")`);
+      process.exit(1);
+    }
+    const projectPath = resolveProjectPath(options.path);
+    validateAospCliProjectPath(projectPath);
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      const halType = options.type === 'hidl' ? 'hidl' : 'aidl';
+      const result = findHalInterface(cg, projectPath, halName, halType);
+      cg.destroy();
+
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      if (result.status === 'declaration_not_found') {
+        warn(`No ${halType} declaration for "${halName}" found under any hardware/interfaces/ directory`);
+      } else if (result.status === 'no_implementation_found') {
+        info(`No implementation of "${halName}" found in this repo.`);
+      } else {
+        console.log(chalk.bold(`\n"${halName}" (${halType}) — ${result.implementations.length} implementation candidate(s), ${result.registrations.length} registration site(s):\n`));
+        for (const c of [...result.implementations, ...result.registrations]) {
+          console.log(`  ${chalk.dim(c.kind.padEnd(18))}${c.name}  ${chalk.cyan(`${c.filePath}:${c.line}`)}  ${chalk.dim(`(${c.matchedPattern})`)}${packageVerifiedLabel(c.packageVerified)}`);
+        }
+      }
+      console.log(chalk.dim(`\nEvidence:\n${result.evidence.map((e) => `  - ${e}`).join('\n')}`));
+    } catch (err) {
+      error(`hal-interface failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph system-service <service-name>
+ *
+ * AOSP extension (Phase 3). Analyze a system service's lifecycle.
+ */
+program
+  .command('system-service <service-name>')
+  .description('Analyze a system service\'s lifecycle: class, registration, startup, client usage (AOSP extension)')
+  .option('-p, --path <path>', 'Project path')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (serviceName: string, options: { path?: string; json?: boolean }) => {
+    requireNonEmpty(serviceName, 'service-name');
+    const projectPath = resolveProjectPath(options.path);
+    validateAospCliProjectPath(projectPath);
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      const result = analyzeSystemService(cg, projectPath, serviceName);
+      cg.destroy();
+
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      if (result.status === 'no_service_found') {
+        info(`No "${result.serviceClassName}" class or supporting evidence found for "${serviceName}".`);
+      } else {
+        const label = result.status === 'found' ? 'CONFIRMED' : 'convention-derived candidate';
+        console.log(chalk.bold(`\n"${result.serviceClassName}" — ${label}:\n`));
+        if (result.serviceClass) console.log(`  class          ${chalk.cyan(`${result.serviceClass.filePath}:${result.serviceClass.line}`)}`);
+        for (const c of result.registrations) console.log(`  registration   ${chalk.cyan(`${c.filePath}:${c.line}`)}  ${chalk.dim(`(${c.matchedPattern})`)}`);
+        for (const c of result.startupSites) console.log(`  startup        ${chalk.cyan(`${c.filePath}:${c.line}`)}  ${chalk.dim(`(${c.matchedPattern})`)}`);
+        for (const c of result.clientUsageSites) console.log(`  client usage   ${chalk.cyan(`${c.filePath}:${c.line}`)}  ${chalk.dim(`(${c.matchedPattern})`)}`);
+      }
+      console.log(chalk.dim(`\nEvidence:\n${result.evidence.map((e) => `  - ${e}`).join('\n')}`));
+    } catch (err) {
+      error(`system-service failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph trace-permission <permission>
+ *
+ * AOSP extension (Phase 3). Pure text-candidate search, no found/not-found claim.
+ */
+program
+  .command('trace-permission <permission>')
+  .description('Search for permission XML matches, check points, and enforcement (AOSP extension)')
+  .option('-p, --path <path>', 'Project path')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (permission: string, options: { path?: string; json?: boolean }) => {
+    requireNonEmpty(permission, 'permission');
+    const projectPath = resolveProjectPath(options.path);
+    validateAospCliProjectPath(projectPath);
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      const result = tracePermission(cg, projectPath, permission);
+      cg.destroy();
+
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      console.log(chalk.bold(`\n"${permission}"\n`));
+      console.log(`XML matches, including uses (${result.xmlMatches.length}):`);
+      for (const c of result.xmlMatches) console.log(`  ${chalk.cyan(`${c.filePath}:${c.line}`)}  ${chalk.dim(`(${c.matchedPattern})`)}`);
+      console.log(`Check points (${result.checkPoints.length}):`);
+      for (const c of result.checkPoints) console.log(`  ${chalk.cyan(`${c.filePath}:${c.line}`)}  ${chalk.dim(`(${c.matchedPattern})`)}`);
+      console.log(`Enforcement (${result.enforcement.length}):`);
+      for (const c of result.enforcement) console.log(`  ${chalk.cyan(`${c.filePath}:${c.line}`)}  ${chalk.dim(`(${c.matchedPattern})`)}`);
+      console.log(chalk.dim(`\nEvidence:\n${result.evidence.map((e) => `  - ${e}`).join('\n')}`));
+    } catch (err) {
+      error(`trace-permission failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph trace-broadcast <action>
+ *
+ * AOSP extension (Phase 3). Pure text-candidate search, no found/not-found claim.
+ */
+program
+  .command('trace-broadcast <action>')
+  .description('Search for a broadcast action\'s senders and receivers (AOSP extension)')
+  .option('-p, --path <path>', 'Project path')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (action: string, options: { path?: string; json?: boolean }) => {
+    requireNonEmpty(action, 'action');
+    const projectPath = resolveProjectPath(options.path);
+    validateAospCliProjectPath(projectPath);
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      const result = traceBroadcast(cg, projectPath, action);
+      cg.destroy();
+
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      console.log(chalk.bold(`\n"${action}"\n`));
+      console.log(`Senders (${result.senders.length}):`);
+      for (const c of result.senders) console.log(`  ${chalk.cyan(`${c.filePath}:${c.line}`)}  ${chalk.dim(`(${c.matchedPattern})`)}`);
+      console.log(`Receivers (${result.receivers.length}):`);
+      for (const c of result.receivers) console.log(`  ${chalk.cyan(`${c.filePath}:${c.line}`)}  ${chalk.dim(`(${c.matchedPattern})`)}`);
+      console.log(chalk.dim(`\nEvidence:\n${result.evidence.map((e) => `  - ${e}`).join('\n')}`));
+    } catch (err) {
+      error(`trace-broadcast failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph messenger-ipc <name>
+ *
+ * AOSP extension. Detect Messenger/Handler-based IPC (a shape none of the
+ * other AOSP tools recognize — see src/aosp/messenger.ts). Tries the
+ * {Name}Service/{Name} provider naming convention and the
+ * {Name}ServiceManager/{Name}Manager client convention, same shape as
+ * `system-service <name>`.
+ */
+program
+  .command('messenger-ipc <name>')
+  .description('Detect Messenger/Handler-based IPC provider/client classes (AOSP extension)')
+  .option('-p, --path <path>', 'Project path')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (name: string, options: { path?: string; json?: boolean }) => {
+    requireNonEmpty(name, 'name');
+    const projectPath = resolveProjectPath(options.path);
+    validateAospCliProjectPath(projectPath);
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      const result = findMessengerIpc(cg, projectPath, name);
+      cg.destroy();
+
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      const label = result.status === 'found' ? 'CONFIRMED' : result.status === 'convention_derived_candidate' ? 'convention-derived candidate' : 'not found';
+      console.log(chalk.bold(`\n"${name}" — ${label}\n`));
+      console.log(`  provider: ${result.providerClassName}${result.providerClass ? `  ${chalk.cyan(`${result.providerClass.filePath}:${result.providerClass.line}`)}` : chalk.dim(' (no class match)')}`);
+      console.log(`  client:   ${result.clientClassName}${result.clientClass ? `  ${chalk.cyan(`${result.clientClass.filePath}:${result.clientClass.line}`)}` : chalk.dim(' (no class match)')}`);
+      for (const c of result.providerEvidence) console.log(`  ${chalk.dim('provider evidence:')} ${chalk.cyan(`${c.filePath}:${c.line}`)}  ${chalk.dim(`(${c.matchedPattern})`)}`);
+      for (const c of result.clientEvidence) console.log(`  ${chalk.dim('client evidence:  ')} ${chalk.cyan(`${c.filePath}:${c.line}`)}  ${chalk.dim(`(${c.matchedPattern})`)}`);
+      console.log(chalk.dim(`\nEvidence:\n${result.evidence.map((e) => `  - ${e}`).join('\n')}`));
+    } catch (err) {
+      error(`messenger-ipc failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph content-provider <class>
+ *
+ * AOSP extension. Find a real `extends ContentProvider` implementation (the
+ * same unresolved-extends discipline as aidl-impl's Stub check), its
+ * manifest declaration and authorities, and same-line ContentResolver
+ * client usage — a shape none of the other AOSP tools recognize (see
+ * src/aosp/content_provider.ts).
+ */
+program
+  .command('content-provider <class>')
+  .description('Find a ContentProvider implementation, its manifest authorities, and client usage (AOSP extension)')
+  .option('-p, --path <path>', 'Project path')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (className: string, options: { path?: string; json?: boolean }) => {
+    requireNonEmpty(className, 'class');
+    const projectPath = resolveProjectPath(options.path);
+    validateAospCliProjectPath(projectPath);
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      const result = findContentProviderImpl(cg, projectPath, className);
+      cg.destroy();
+
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      const label = result.status === 'found' ? 'CONFIRMED (extends ContentProvider)' : result.status === 'convention_derived_candidate' ? 'convention-derived candidate' : 'not found';
+      console.log(chalk.bold(`\n"${className}" — ${label}\n`));
+      if (result.providerClass) console.log(`  class: ${chalk.cyan(`${result.providerClass.filePath}:${result.providerClass.line}`)}`);
+      for (const d of result.manifestDeclarations) {
+        console.log(`  manifest: ${chalk.cyan(`${d.filePath}:${d.line}`)}  ${chalk.dim(`authorities: ${d.authorities.join(', ') || 'none parsed'}`)}`);
+      }
+      for (const c of result.clientUsageSites) console.log(`  client usage: ${chalk.cyan(`${c.filePath}:${c.line}`)}`);
+      console.log(chalk.dim(`\nEvidence:\n${result.evidence.map((e) => `  - ${e}`).join('\n')}`));
+    } catch (err) {
+      error(`content-provider failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph local-socket-ipc <class>
+ *
+ * AOSP extension. Detect LocalSocket/LocalServerSocket-based IPC — a shape
+ * none of the other AOSP tools recognize (see src/aosp/local_socket.ts).
+ * Makes no claim about a same-repo counterpart existing (the other end is
+ * commonly a native daemon outside indexed source); see the tool's own
+ * "NOTE" evidence line.
+ */
+program
+  .command('local-socket-ipc <class>')
+  .description('Detect LocalSocket/LocalServerSocket-based IPC usage in a class (AOSP extension)')
+  .option('-p, --path <path>', 'Project path')
+  .option('-j, --json', 'Output as JSON')
+  .action(async (className: string, options: { path?: string; json?: boolean }) => {
+    requireNonEmpty(className, 'class');
+    const projectPath = resolveProjectPath(options.path);
+    validateAospCliProjectPath(projectPath);
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph not initialized in ${projectPath}`);
+        process.exit(1);
+      }
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      const result = findLocalSocketIpc(cg, projectPath, className);
+      cg.destroy();
+
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      const label = result.status === 'found' ? `CONFIRMED (role: ${result.role})` : result.status === 'convention_derived_candidate' ? 'convention-derived candidate' : 'not found';
+      console.log(chalk.bold(`\n"${className}" — ${label}\n`));
+      if (result.matchedClass) console.log(`  class: ${chalk.cyan(`${result.matchedClass.filePath}:${result.matchedClass.line}`)}`);
+      for (const c of result.clientEvidence) console.log(`  ${chalk.dim('client (LocalSocket):      ')} ${chalk.cyan(`${c.filePath}:${c.line}`)}`);
+      for (const c of result.serverEvidence) console.log(`  ${chalk.dim('server (LocalServerSocket):')} ${chalk.cyan(`${c.filePath}:${c.line}`)}`);
+      console.log(chalk.dim(`\nEvidence:\n${result.evidence.map((e) => `  - ${e}`).join('\n')}`));
+    } catch (err) {
+      error(`local-socket-ipc failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
   });
