@@ -5753,7 +5753,7 @@ in
     });
   });
 
-  describe('A dotted qualified extends/implements reference resolves to a real nested type (2026-09-11)', () => {
+  describe('A dotted qualified extends/implements reference resolves to a real nested type', () => {
     it('resolves `extends Outer.Inner` (named class) and `new Outer.Inner() { ... }` (anonymous class) to the SAME real, indexed nested type', async () => {
       // Every qualifiedName the engine builds joins scope with `::`
       // (buildQualifiedName), but a Java/C# extends clause or anonymous-class

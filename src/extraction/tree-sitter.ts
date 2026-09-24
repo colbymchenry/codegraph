@@ -5293,12 +5293,8 @@ export class TreeSitterExtractor {
     // `extends` reference itself must NOT be truncated to the bare last
     // segment the way the anon class's own name and the `instantiates` edge
     // are: a NAMED class's real `extends IFoo.Stub` clause is extracted
-    // verbatim (untruncated) precisely because AOSP-style qualified-name
-    // lookups (e.g. hal.ts/aidl.ts's `IFoo` / `IFoo.%` prefix match) depend on
-    // the full dotted text surviving. Truncating this to "Stub" made a real
-    // AIDL `new ICarPropertyEventListener.Stub() { ... }` field initializer
-    // invisible to aidl-impl even after the anon class body itself started
-    // being extracted.
+    // verbatim (untruncated) so qualified-name resolution can find the
+    // nested type. Truncating this to "Stub" loses the enclosing interface.
     // We can't tell at extraction time whether T is a class or an interface,
     // so emit `extends`. Resolution will still bind T to whatever it is, and
     // Phase 5.5 (which already handles both `extends` and `implements`) will
@@ -5339,8 +5335,7 @@ export class TreeSitterExtractor {
    * Before this function existed, `object_literal` was not in
    * INSTANTIATION_KINDS and had no anonymous-class handling at all, so this
    * idiom produced neither an `instantiates` nor an `extends` reference —
-   * the interface→impl synthesizer (Phase 5.5) and aidl.ts's unresolved_refs
-   * lookup never saw these implementations.
+   * the interface→impl synthesizer cannot see these implementations.
    */
   private extractKotlinObjectLiteral(node: SyntaxNode): void {
     if (!this.extractor) return;

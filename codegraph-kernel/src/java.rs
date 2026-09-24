@@ -928,9 +928,8 @@ impl<'t> Walker<'t> {
             .or_else(|| node.named_child(0));
         let raw_type_name = type_node.map(|t| self.text(t).to_string()).unwrap_or_else(|| "Object".to_string());
         // The `extends` reference must carry the FULL dotted name (generics
-        // stripped, qualifier kept) — AOSP-style qualified-name lookups
-        // (hal.ts/aidl.ts's `IFoo` / `IFoo.%` prefix match) depend on it
-        // surviving. Only the anon class's own cosmetic name is truncated to
+        // stripped, qualifier kept) so nested-type resolution can find it.
+        // Only the anon class's own cosmetic name is truncated to
         // the bare last segment, matching the portable extractor.
         let full_type_name = {
             let mut n = raw_type_name.clone();

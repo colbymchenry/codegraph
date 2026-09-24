@@ -1853,13 +1853,9 @@ class T {
     // `instantiates` resolves (by bare class name). But the `extends`
     // reference is a DIFFERENT resolution path: a real named class's
     // `extends IFoo.Stub` clause is extracted verbatim (untruncated), and
-    // AOSP-style qualified lookups (hal.ts/aidl.ts's `IFoo`/`IFoo.%` prefix
-    // match) depend on that full dotted text surviving. Truncating the
-    // anon-class extends reference to "Stub" the same way made a real field
-    // initializer like `new ICarPropertyEventListener.Stub() { ... }`
-    // invisible to `aidl-impl` even after the anon body itself was extracted
-    // (found on the real platform_packages_services_car AOSP mirror,
-    // 2026-09-11).
+    // qualified lookups depend on that full dotted text surviving.
+    // Truncating the anonymous class's extends reference to "Stub" would
+    // lose the relationship to `ICarPropertyEventListener.Stub`.
     const code = `
 package p;
 interface ICarPropertyEventListener {
