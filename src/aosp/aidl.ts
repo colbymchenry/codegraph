@@ -238,11 +238,16 @@ export function findUnresolvedExtendsCandidates(
   alternateFqcns: string[] = []
 ): AospCandidate[] {
   const candidates: AospCandidate[] = [];
-  for (const ref of cg.getUnresolvedReferencesByQualifiedName(interfaceName)) {
+  const fqcn = packageName ? `${packageName}.${interfaceName}` : null;
+  const refs = cg.getUnresolvedReferencesByQualifiedName(interfaceName);
+  if (fqcn) refs.push(...cg.getUnresolvedReferencesByQualifiedName(fqcn));
+  for (const ref of refs) {
     if (ref.referenceKind !== 'extends' && ref.referenceKind !== 'implements') continue;
     const node = cg.getNode(ref.fromNodeId);
     if (!node) continue;
-    const packageVerified = candidateReachesPackagedSymbol(cg, node.filePath, packageName, interfaceName, alternateFqcns);
+    const packageVerified = fqcn && (ref.referenceName === fqcn || ref.referenceName.startsWith(`${fqcn}.`))
+      ? 'verified'
+      : candidateReachesPackagedSymbol(cg, node.filePath, packageName, interfaceName, alternateFqcns);
     candidates.push({
       kind: ref.referenceKind === 'extends' ? 'stub_subclass' : 'impl_by_interface',
       nodeKind: node.kind,
@@ -289,7 +294,7 @@ function findNamingConventionCandidates(
   const candidates: AospCandidate[] = [];
   for (const pattern of patterns) {
     const results = cg.searchNodes(pattern, { kinds: CANDIDATE_NODE_KINDS, limit: 20 });
-    if (results.length === 20) evidence.push(`WARNING: searchNodes("${pattern}") 결과가 20개 제한에 도달해 추가 매치가 있을 수 있습니다`);
+    if (results.length === 20) evidence.push(`WARNING: searchNodes("${pattern}") reached the 20-result limit; more matches may exist`);
     for (const { node } of results) {
       if (node.name !== pattern) continue; // exact match only — FTS ranking is not evidence
       const key = `${node.filePath}:${node.startLine}`;
@@ -367,7 +372,7 @@ export function findAidlImpl(cg: CodeGraph, repoRoot: string, interfaceName: str
   const evidence: string[] = [];
   const caveat = indexingCaveat(cg);
   if (caveat) evidence.push(caveat);
-  if (parsed.truncated) evidence.push(`WARNING: 파일 순회가 상한(${AIDL_WALK_MAX_ENTRIES}개 또는 깊이 ${AIDL_WALK_MAX_DEPTH})에 도달해 중단되었습니다 - 결과가 불완전할 수 있습니다`);
+  if (parsed.truncated) evidence.push(`WARNING: declaration walk reached its limit (${AIDL_WALK_MAX_ENTRIES} entries or depth ${AIDL_WALK_MAX_DEPTH}); results may be incomplete`);
 
   if (declarations.length === 0) {
     evidence.push(`no .aidl declaration for "${interfaceName}" found under the project root`);

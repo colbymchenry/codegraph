@@ -88,7 +88,7 @@ describe('AOSP extension: grepIndexedSources integration regressions', () => {
     const result = findAidlImpl(cg, dir, 'IFoo');
 
     expect(result.evidence).toContain(
-      '1 hit(s)가 test/CTS/VTS 경로로 보이는 파일에 있습니다 - 프로덕션 코드가 아닐 수 있습니다'
+      '1 hit(s) are in test/CTS/VTS-like paths and may not be production code'
     );
   });
 

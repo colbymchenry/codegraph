@@ -81,6 +81,20 @@ describe('AOSP extension: findAidlImpl', () => {
     expect(result.registrations[0]?.matchedPattern).toContain('addService.*TestService');
   });
 
+  it('finds a fully qualified Stub reference from another package', async () => {
+    write('src/IFullyQualified.aidl', 'package com.example.test;\ninterface IFullyQualified { void ping(); }\n');
+    write('src/Client.java', 'package com.example.other;\nclass Client extends com.example.test.IFullyQualified.Stub {}\n');
+    write('src/Decoy.java', 'package com.example.other;\nclass Decoy extends com.example.decoy.IFullyQualified.Stub {}\n');
+    await cg.indexAll();
+
+    const result = findAidlImpl(cg, dir, 'IFullyQualified');
+    expect(result.status).toBe('found');
+    expect(result.implementations).toContainEqual(expect.objectContaining({
+      name: 'Client', kind: 'stub_subclass', packageVerified: 'verified',
+    }));
+    expect(result.implementations.some((candidate) => candidate.name === 'Decoy')).toBe(false);
+  });
+
   it('fails closed when a declared AIDL interface has no in-repo implementation', () => {
     const result = findAidlImpl(cg, dir, 'IOrphanCallback');
 
@@ -107,7 +121,7 @@ describe('AOSP extension: findAidlImpl', () => {
     const result = findAidlImpl(cg, dir, 'ITestService', { maxDepth: 0 });
 
     expect(result.status).toBe('declaration_not_found');
-    expect(result.evidence.some((e) => e.includes('WARNING:') && e.includes('상한'))).toBe(true);
+    expect(result.evidence.some((e) => e.includes('WARNING:') && e.includes('declaration walk reached its limit'))).toBe(true);
   });
 
   it('demotes an unresolved_refs hit to convention_derived_candidate when the implementing class cannot reach this interface\'s package — a same-named interface in an unrelated package', () => {
