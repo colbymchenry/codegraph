@@ -47,6 +47,25 @@ class SessionLock {
         fun close() {}
     }
 }
+class AAValidator { fun validate(v: String): List<String> = emptyList() }
+object HardwareGate {
+    fun tryBegin(): HardwareLock.Lease? = null
+}
+class Checker {
+    fun validate(v: String): List<String> = emptyList()
+    companion object {
+        fun load(): Checker = Checker()
+    }
+}
+internal fun interface Reply {
+    fun send(message: String): Boolean
+}
+
+/** Events of one session, for the application layer. */
+internal interface SessionEvents {
+    fun onLost(reason: String)
+}
+class Pattern { fun find(text: String): Int = 0 }
 `);
     fs.writeFileSync(path.join(src, 'Users.kt'), `package p
 class LateinitUser {
@@ -65,6 +84,25 @@ class InitUser {
 }
 class NestedUser(private val lease: HardwareLock.Lease) {
     fun release() { lease.close() }
+}
+class CallResultUser {
+    private val schema = Checker.load()
+    fun check() { schema.validate("x") }
+    fun locked() {
+        val lease = HardwareGate.tryBegin()
+        lease?.close()
+    }
+}
+class Supervisor(private val events: SessionEvents) {
+    fun lost() { events.onLost("gone") }
+}
+class LibraryUser {
+    private val regex = Regex("[0-9]+")
+    fun first(text: String) = regex.find(text)
+    fun scheduled() {
+        val scheduler = java.util.concurrent.Executors.newSingleThreadScheduledExecutor()
+        scheduler.shutdown()
+    }
 }
 `);
     cg = CodeGraph.initSync(dir, { config: { include: ['**/*.kt'], exclude: [] } });
@@ -96,6 +134,24 @@ class NestedUser(private val lease: HardwareLock.Lease) {
 
   it('a property initialized by a constructor call resolves on that type', () => {
     expect(callees('InitUser', 'stop')).toEqual(['p::HttpProbe::close']);
+  });
+
+  it('a local or property bound to a call is typed by the callee return type', () => {
+    expect(callees('CallResultUser', 'check')).toEqual(['p::Checker::validate']);
+    expect(callees('CallResultUser', 'locked').sort()).toEqual(['p::HardwareGate::tryBegin', 'p::HardwareLock::Lease::close']);
+  });
+
+  it('a fun interface does not swallow the declaration after it', () => {
+    const events = cg.searchNodes('SessionEvents').map((r) => r.node)
+      .find((n) => n.qualifiedName === 'p::SessionEvents');
+    expect(events?.kind).toBe('interface');
+    expect(callees('Supervisor', 'lost')).toEqual(['p::SessionEvents::onLost']);
+  });
+
+  it('a receiver of a library type gets no edge instead of a same-named project method', () => {
+    // `Regex.find` must not bind to the project's `Pattern.find`.
+    expect(callees('LibraryUser', 'first')).toEqual([]);
+    expect(callees('LibraryUser', 'scheduled')).toEqual([]);
   });
 
   it('a nested type keeps its outer type', () => {
