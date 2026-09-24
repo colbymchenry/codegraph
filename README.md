@@ -902,6 +902,10 @@ MIT
 
 ---
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for source builds, validation, and pull request preparation. The [documentation index](docs/README.md) links to the project guides.
+
 <div align="center">
 
 **Made for AI coding agents — Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, and GitHub Copilot**
