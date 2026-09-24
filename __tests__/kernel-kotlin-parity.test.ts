@@ -117,16 +117,19 @@ describe.skipIf(!kernelBuilt)('kernel Kotlin extraction parity', () => {
     });
   }
 
-  it('fun-interface files defer to the wasm extractor (grammar-inherent error)', () => {
-    const src = 'package p\n\nfun interface Transformer {\n    fun transform(x: Int): Int\n}\n\nfun after() { work() }\n';
+  it('fun-interface files parse on both paths once `fun` is blanked (preParse)', () => {
+    // tree-sitter-kotlin has no `fun interface`; the extractor's preParse
+    // blanks the `fun` (offset-preserving), so the kernel no longer defers
+    // and the declaration after it — here behind a doc comment, the shape
+    // whose error recovery used to swallow it — is extracted too.
+    const src = 'package p\n\nfun interface Transformer {\n    fun transform(x: Int): Int\n}\n\n/** Next. */\ninterface Sink {\n    fun put(x: Int)\n}\n\nfun after() { work() }\n';
+    assertParity('src/FunIface.kt', src, 4);
     process.env.CODEGRAPH_KERNEL_LANGS = 'all';
     delete process.env.CODEGRAPH_KERNEL;
-    expect(tryKernelExtract('src/FunIface.kt', src, 'kotlin')).toBeNull();
-    process.env.CODEGRAPH_KERNEL = '0';
-    const viaWasm = extractFromSource('src/FunIface.kt', src, 'kotlin');
-    delete process.env.CODEGRAPH_KERNEL;
-    // The wasm arm's misparse-recovery hook still mints the interface node.
-    expect(viaWasm.nodes.some((n) => n.kind === 'interface' && n.name === 'Transformer')).toBe(true);
+    const result = tryKernelExtract('src/FunIface.kt', src, 'kotlin')!;
+    expect(result.nodes.some((n) => n.kind === 'interface' && n.name === 'Transformer')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'interface' && n.name === 'Sink')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'method' && n.qualifiedName.endsWith('Sink::put'))).toBe(true);
   });
 
   it('PHANTOM errors defer too — hasError with a complete, ERROR-node-free CST', () => {
