@@ -2395,7 +2395,11 @@ export function matchMethodCall(
           if (!target || (target.qualifiedName.startsWith(`${inferredType}::`) && target.filePath !== awaited.filePath)) return null;
           return { ...typedMatch, original: ref };
         }
-        return typedMatch;
+        // A Scala call never lands on another language's constructor here: a
+        // `def f(): T = T.Inner(...)` return annotation reads as `T`'s type and
+        // hands `Inner::Inner` over. Fall through to the Scala type lookup.
+        const target = ref.language === 'scala' ? context.getNodeById?.(typedMatch.targetNodeId) : null;
+        if (!target || !isOtherLanguageConstructor(target, ref.language)) return typedMatch;
       }
       if (awaited) return null;
       // A known JS/TS builtin receiver is external when it has no project
@@ -2591,6 +2595,22 @@ export function matchMethodCall(
     if (strat2) return strat2;
   }
 
+  // Scala `Outer.Inner(args)`: a case-class / companion `apply` on the nested
+  // Scala type `Outer::Inner` (Scala qualified names carry no package). Taken
+  // only when every match sits in one file (a class and its companion share
+  // the name), or else from the call site's own file.
+  if (ref.language === 'scala' && dotMatch && /^[A-Z]/.test(methodName!)) {
+    const typeQn = `${objectOrClass!.replace(/\./g, '::')}::${methodName}`;
+    const types = context
+      .getNodesByQualifiedName(typeQn)
+      .filter((n) => n.language === 'scala' && (n.kind === 'class' || n.kind === 'trait'));
+    const oneFile = types.length > 0 && types.every((n) => n.filePath === types[0]!.filePath);
+    const chosen = oneFile ? types[0] : types.find((n) => n.filePath === ref.filePath);
+    if (chosen) {
+      return { original: ref, targetNodeId: chosen.id, confidence: 0.85, resolvedBy: 'qualified-name' };
+    }
+  }
+
   // Strategy 3: Find methods by name across the codebase, match by receiver
   // name similarity with the containing class. Handles abbreviated variable
   // names like permissionEngine → PermissionRuleEngine.
@@ -2612,7 +2632,15 @@ export function matchMethodCall(
 
     // Filter to same-language candidates first
     const sameLanguageMethods = methods.filter(m => m.language === ref.language);
-    const targetMethods = sameLanguageMethods.length > 0 ? sameLanguageMethods : methods;
+    let targetMethods = sameLanguageMethods.length > 0 ? sameLanguageMethods : methods;
+    // Scala `Outer.Inner(args)` is a case-class / companion `apply`, not a Java
+    // constructor: a Java ctor (`Outer::Inner::Inner`) found only by receiver-
+    // word overlap names no class the call pins, and it steals calls meant for
+    // the Scala type of the same name. An imported / `new`-constructed Java
+    // class resolves through the import and instantiate paths, not this guess.
+    if (ref.language === 'scala' && sameLanguageMethods.length === 0) {
+      targetMethods = targetMethods.filter((m) => !isOtherLanguageConstructor(m, ref.language));
+    }
 
     // If only one same-language method with this name exists, use it
     if (targetMethods.length === 1 && targetMethods[0]!.language === ref.language) {
@@ -2661,6 +2689,17 @@ export function matchMethodCall(
   }
 
   return null;
+}
+
+/**
+ * A constructor node of another language: a method named like its owner
+ * (`pkg::Outer::Inner::Inner`), which is how the Java/Kotlin extractors record
+ * an explicit constructor.
+ */
+function isOtherLanguageConstructor(node: Node, language: string): boolean {
+  if (node.language === language) return false;
+  const segs = node.qualifiedName.split('::');
+  return segs.length >= 2 && segs[segs.length - 1] === segs[segs.length - 2];
 }
 
 /** Go builtin/primitive field types that can never carry a project method. */
