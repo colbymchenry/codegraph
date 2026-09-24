@@ -268,7 +268,7 @@ function findNamingConventionCandidates(cg: CodeGraph, halName: string, seen: Se
   const candidates: AospCandidate[] = [];
   for (const pattern of patterns) {
     const results = cg.searchNodes(pattern, { kinds: CANDIDATE_NODE_KINDS, limit: 20 });
-    if (results.length === 20) evidence.push(`WARNING: searchNodes("${pattern}") 결과가 20개 제한에 도달해 추가 매치가 있을 수 있습니다`);
+    if (results.length === 20) evidence.push(`WARNING: searchNodes("${pattern}") reached the 20-result limit; more matches may exist`);
     for (const { node } of results) {
       if (node.name !== pattern) continue;
       const key = `${node.filePath}:${node.startLine}`;
@@ -306,7 +306,7 @@ function findNativeImplCandidates(cg: CodeGraph, halName: string, seen: Set<stri
   const candidates: AospCandidate[] = [];
   for (const pattern of patterns) {
     const results = cg.searchNodes(pattern, { kinds: ['class', 'struct'], limit: 20 });
-    if (results.length === 20) evidence.push(`WARNING: searchNodes("${pattern}") 결과가 20개 제한에 도달해 추가 매치가 있을 수 있습니다`);
+    if (results.length === 20) evidence.push(`WARNING: searchNodes("${pattern}") reached the 20-result limit; more matches may exist`);
     for (const { node } of results) {
       if (node.name !== pattern || (node.language !== 'cpp' && node.language !== 'c')) continue;
       const key = `${node.filePath}:${node.startLine}`;
@@ -339,7 +339,7 @@ export function findHalInterface(
   const evidence: string[] = [];
   const caveat = indexingCaveat(cg);
   if (caveat) evidence.push(caveat);
-  if (parsed.truncated) evidence.push(`WARNING: 파일 순회가 상한(${HAL_WALK_MAX_ENTRIES}개 또는 깊이 ${HAL_WALK_MAX_DEPTH})에 도달해 중단되었습니다 - 결과가 불완전할 수 있습니다`);
+  if (parsed.truncated) evidence.push(`WARNING: declaration walk reached its limit (${HAL_WALK_MAX_ENTRIES} entries or depth ${HAL_WALK_MAX_DEPTH}); results may be incomplete`);
 
   if (declarations.length === 0) {
     evidence.push(`no ${extension} declaration for "${halName}" found under any hardware/interfaces/ directory`);
