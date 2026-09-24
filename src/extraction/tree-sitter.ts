@@ -405,6 +405,8 @@ const LITERAL_RECEIVER_TYPES = new Set([
 /**
  * Languages whose member calls go through the TS/JS grammars.
  */
+/** A Kotlin receiver chain the resolver can type: `a.b`, `this.a`, up to four segments. */
+const KOTLIN_RECEIVER_CHAIN = /^(?:this|[A-Za-z_]\w*)(?:\.[A-Za-z_]\w*){1,3}$/;
 const TS_JS_CHAIN_LANGUAGES = new Set(['typescript', 'tsx', 'javascript', 'jsx']);
 
 /** Receiver node types (TS/JS grammars) that continue a member chain downward. */
@@ -4876,6 +4878,21 @@ export class TreeSitterExtractor {
               // Go receivers resolve strictly via validated field-hop
               // inference (see matchGoFieldChainCall) or stay unresolved.
               calleeName = `${getNodeText(receiver, this.source).replace(/\s+/g, '')}.${methodName}`;
+            } else if (
+              this.language === 'kotlin' &&
+              receiver &&
+              receiver.type === 'navigation_expression' &&
+              KOTLIN_RECEIVER_CHAIN.test(getNodeText(receiver, this.source).replace(/\s+/g, '').replace(/\?\./g, '.'))
+            ) {
+              // Kotlin call through a receiver chain — `engine.pump.drain()`,
+              // `this.engine.drain()`, `a?.b?.c()`. Keep the chain: the
+              // resolver types it segment by segment through the properties'
+              // declared types and resolves the method on that type, leaves a
+              // library type unresolved, and resolves an untyped chain as the
+              // bare method name this used to emit. Mirrored in the kernel's
+              // extract_call (kotlin.rs).
+              const chain = getNodeText(receiver, this.source).replace(/\s+/g, '').replace(/\?\./g, '.');
+              calleeName = `${chain}.${methodName}`;
             } else if (
               TS_JS_CHAIN_LANGUAGES.has(this.language) &&
               receiver &&
