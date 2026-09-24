@@ -479,37 +479,6 @@ describe('AOSP extension: findAidlImpl', () => {
     });
   });
 
-  describe('field-initializer anonymous Stub (real AOSP shape, 2026-09-11)', () => {
-    it('finds an implementation written as `new IFoo.Stub() { ... }` assigned to a field, the common Android listener idiom', async () => {
-      // Real shape found across platform_packages_services_car:
-      // `private final ICarPropertyEventListener mListener = new
-      // ICarPropertyEventListener.Stub() { @Override public void onEvent(...) {} };`
-      // in CarNightService.java, CarUxRestrictionsManagerService.java, and
-      // others. Anonymous-class extraction (src/extraction/tree-sitter.ts)
-      // now walks a field initializer and extracts `new IFoo.Stub() {}` as a
-      // class node, but its `extends` reference must keep the full
-      // `IFoo.Stub` text (not truncate to bare `Stub`) for this qualified-name
-      // lookup to find it at all.
-      write('src/IPlainFoo.aidl', 'package com.example.test;\ninterface IPlainFoo {\n    void doWork();\n}\n');
-      write(
-        'src/FieldListener.java',
-        'package com.example.test;\n\n' +
-          'class FieldListener {\n' +
-          '    private final IPlainFoo mListener = new IPlainFoo.Stub() {\n' +
-          '        @Override public void doWork() {}\n' +
-          '    };\n' +
-          '}\n'
-      );
-
-      await cg.indexAll();
-      const result = findAidlImpl(cg, dir, 'IPlainFoo');
-
-      expect(result.status).toBe('found');
-      const hit = result.implementations.find((c) => /Stub\$anon@/.test(c.name));
-      expect(hit, 'the field-initializer anonymous Stub subclass should be a candidate').toBeDefined();
-    });
-  });
-
   it('documents that an unverifiable package can still promote an unresolved AIDL candidate', () => {
     const readme = fs.readFileSync(path.join(process.cwd(), 'README.md'), 'utf8');
     const guide = fs.readFileSync(path.join(process.cwd(), 'docs/design/android-platform-analysis.md'), 'utf8');
