@@ -266,7 +266,7 @@ export const javaExtractor: LanguageExtractor = {
   importTypes: ['import_declaration'],
   callTypes: ['method_invocation'],
   variableTypes: ['local_variable_declaration'],
-  fieldTypes: ['field_declaration'],
+  fieldTypes: ['field_declaration', 'constant_declaration'],
   nameField: 'name',
   bodyField: 'body',
   paramsField: 'parameters',
@@ -293,6 +293,7 @@ export const javaExtractor: LanguageExtractor = {
     return undefined;
   },
   isStatic: (node) => {
+    if (node.type === 'constant_declaration') return true;
     for (let i = 0; i < node.childCount; i++) {
       const child = node.child(i);
       if (child?.type === 'modifiers' && child.text.includes('static')) {
@@ -305,6 +306,7 @@ export const javaExtractor: LanguageExtractor = {
   // shared config). Drives `constant` kind so value-reference edges target it;
   // instance / `final`-only / `static`-only fields stay mutable `field`s.
   isConst: (node) => {
+    if (node.type === 'constant_declaration') return true;
     for (let i = 0; i < node.childCount; i++) {
       const child = node.child(i);
       if (child?.type === 'modifiers') {
