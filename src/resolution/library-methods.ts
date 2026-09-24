@@ -100,6 +100,44 @@ const CSHARP = [
   'Substring', 'StartsWith', 'EndsWith', 'Format', 'Join',
 ];
 
+/**
+ * java.lang / java.util / java.util.stream + the Android framework calls
+ * (`Handler`, `Context`, `View`) Java code makes on values whose type the
+ * resolver cannot see — a lambda parameter, a `var`, a call result, an
+ * inherited field. Names Java projects commonly declare themselves (`post`,
+ * `of`, `apply`, `run`, `start`, `getId`, `getWidth`) stay out.
+ */
+const JAVA = [
+  // java.lang.Object / Comparable
+  'equals', 'hashCode', 'toString', 'getClass', 'compareTo',
+  // collections / maps / iterators
+  'get', 'put', 'add', 'remove', 'contains', 'containsKey', 'containsValue', 'size', 'isEmpty',
+  'clear', 'iterator', 'hasNext', 'next', 'stream', 'forEach', 'keySet', 'values', 'entrySet',
+  'addAll', 'removeAll', 'putAll', 'putIfAbsent', 'getOrDefault', 'computeIfAbsent', 'indexOf',
+  'toArray', 'subList',
+  // String
+  'length', 'charAt', 'substring', 'trim', 'split', 'startsWith', 'endsWith', 'equalsIgnoreCase',
+  'toLowerCase', 'toUpperCase', 'replace', 'format', 'valueOf',
+  // Optional / Stream
+  'map', 'filter', 'orElse', 'orElseGet', 'orElseThrow', 'ifPresent', 'isPresent', 'collect',
+  'findFirst', 'anyMatch', 'allMatch',
+  // Android framework
+  'postDelayed', 'removeCallbacks', 'obtainMessage', 'getResources', 'getSystemService',
+  'findViewById', 'setVisibility', 'startActivity',
+];
+
+/**
+ * java.lang / java.util classes Java code calls statically — `Objects.hash(…)`,
+ * `Collections.emptyMap()`, `String.valueOf(…)` — which a wildcard
+ * `import java.util.*` (or no import at all, for java.lang) brings into scope
+ * without naming them. A call on one is a library call whatever the method
+ * is named, unless the project declares a type of that name.
+ */
+export const JAVA_STD_CLASSES: ReadonlySet<string> = new Set([
+  'Objects', 'Arrays', 'Collections', 'Optional', 'List', 'Map', 'Set', 'UUID', 'String', 'Integer',
+  'Long', 'Short', 'Byte', 'Boolean', 'Double', 'Float', 'Character', 'Math', 'System', 'Thread',
+]);
+
 export const LIBRARY_METHOD_NAMES: Readonly<Record<string, ReadonlySet<string>>> = {
   rust: new Set(RUST),
   go: new Set(GO),
@@ -107,4 +145,5 @@ export const LIBRARY_METHOD_NAMES: Readonly<Record<string, ReadonlySet<string>>>
   kotlin: new Set(KOTLIN),
   scala: new Set(SCALA),
   csharp: new Set(CSHARP),
+  java: new Set(JAVA),
 };

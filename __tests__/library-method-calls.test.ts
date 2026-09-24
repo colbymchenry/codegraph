@@ -72,6 +72,40 @@ const files: Record<string, string> = {
     '        runner.Run();\n' +
     '    }\n' +
     '}\n',
+  'java/com/app/Registry.java':
+    'package com.app;\n' +
+    'public class Registry {\n' +
+    '    public static final String KEY = "k";\n' +
+    '    public Object get(String k) { return null; }\n' +
+    '    public int size() { return 0; }\n' +
+    '    public int hash() { return 0; }\n' +
+    '    public boolean equals(Object o) { return false; }\n' +
+    '    public String toString() { return "r"; }\n' +
+    '    int count() { return size(); }\n' +
+    '    Object own(String k) { return this.get(k); }\n' +
+    '}\n',
+  'java/com/app/Maps.java':
+    'package com.app;\n' +
+    'public class Maps {\n' +
+    '    public static Object emptyMap() { return null; }\n' +
+    '}\n',
+  'java/com/app/Use.java':
+    'package com.app;\n' +
+    'import java.util.*;\n' +
+    'public class Use {\n' +
+    '    private Registry registry;\n' +
+    '    Object untyped(List<String> list, Object s, String a) {\n' +
+    '        Object first = list.get(0);\n' +
+    '        s.toString();\n' +
+    '        Objects.hash(a);\n' +
+    '        Collections.emptyMap();\n' +
+    '        Registry.KEY.equals(a);\n' +
+    '        return first;\n' +
+    '    }\n' +
+    '    Object typed(String k) { return registry.get(k); }\n' +
+    '    int named() { var userRegistry = make(); return userRegistry.size(); }\n' +
+    '    Registry make() { return null; }\n' +
+    '}\n',
 };
 
 beforeAll(async () => {
@@ -131,5 +165,16 @@ describe('library-method calls on untyped receivers', () => {
       .filter(({ edge }) => edge.kind === 'calls')
       .map(({ edge }) => edge.line);
     expect(lines).toEqual([6]);
+  });
+
+  it('Java: `list.get(0)`, `s.toString()`, `Objects.hash(a)`, `Collections.emptyMap()` and a constant\'s `equals` do not bind to a lone project method', () => {
+    expect(calleesOf('untyped', 'Use.java')).toEqual([]);
+  });
+
+  it('Java: a typed field, an own-class call and a receiver named after the type keep their method', () => {
+    expect(calleesOf('typed', 'Use.java')).toEqual(['Registry::get']);
+    expect(calleesOf('count', 'Registry.java')).toEqual(['Registry::size']);
+    expect(calleesOf('own', 'Registry.java')).toEqual(['Registry::get']);
+    expect(calleesOf('named', 'Use.java')).toEqual(['Registry::size', 'Use::make']);
   });
 });

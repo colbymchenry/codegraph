@@ -151,6 +151,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Standard-library calls on a value of unknown type, such as `name.len()` in Rust, `list.isEmpty()` in Kotlin, `options.setdefault(...)` in Python, `conn.Close()` in Go, `opt.map(...)` in Scala or `Task.Run(...)` in C#, no longer link to a project method that merely shares the name.
 
+- Java calls on a value of unknown type, such as `map.put(...)`, `s.toString()`, `KEY.equals(...)` on a constant, or `Objects.hash(...)` and `Collections.emptyMap()` under a wildcard `java.util.*` import, no longer link to a project method that merely shares the name.
+
 - Turning telemetry off now resets its identity and stops running processes from recording, sending, or restoring unsent data. (#1869)
 
 - Calls between JavaScript, JSX and TypeScript files keep their callers and callback flows.
