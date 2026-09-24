@@ -7,8 +7,7 @@
  * against a genuinely empty repo. This is a pure unit test against a mock
  * CodeGraph rather than a real indexAll() run, because reliably catching
  * indexAll() mid-flight in a test would be racy; the aosp modules' own
- * integration tests already cover the fully-indexed path (White/Blue Team
- * round-2 finding, 2026-09-05).
+ * integration tests already cover the fully-indexed path.
  */
 import { describe, it, expect } from 'vitest';
 import * as fs from 'fs';
