@@ -295,6 +295,16 @@ export class FileLock {
     }
   }
 
+  /** PID written in the lock file, or null when absent/unreadable. */
+  readHolderPid(): number | null {
+    try {
+      const pid = parseInt(fs.readFileSync(this.lockPath, 'utf-8').trim(), 10);
+      return Number.isNaN(pid) ? null : pid;
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * Release the lock
    */

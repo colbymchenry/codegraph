@@ -61,6 +61,7 @@ import { BROWSER_ENV, DEFAULT_UI_PORT } from '../ui-server/constants';
 import type { UiServerHandle } from '../ui-server';
 import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../graph/symbol-lookup';
 import type { Node, Edge } from '../types';
+import type { SyncResult } from '../extraction';
 import { isTestPath } from '../search/query-utils';
 
 // Decided once, before `--color`/`--no-color` are stripped from argv below
@@ -955,9 +956,24 @@ program
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
 
+      // sync() returns all-zero counts when another process (an MCP server
+      // or another CLI mid-index) holds the index lock. That is not "up to
+      // date": say why, and exit 1 even under --quiet, which suppresses
+      // progress but never a failure.
+      const lockedMessage = (result: SyncResult): string | null => {
+        if (result.skippedReason !== 'locked') return null;
+        const holder = result.lockHolderPid != null ? ` (PID ${result.lockHolderPid})` : '';
+        return `Nothing synced: another process holds the index lock${holder}. Retry, or run "codegraph sync" when it exits.`;
+      };
+
       if (options.quiet) {
-        await cg.sync();
+        const result = await cg.sync();
         cg.destroy();
+        const locked = lockedMessage(result);
+        if (locked) {
+          process.stderr.write(`codegraph sync: ${locked}\n`);
+          process.exit(1);
+        }
         return;
       }
 
@@ -972,6 +988,12 @@ program
       });
 
       await progress.stop();
+
+      const locked = lockedMessage(result);
+      if (locked) {
+        cg.destroy();
+        throw new Error(locked);
+      }
 
       const totalChanges = result.filesAdded + result.filesModified + result.filesRemoved;
 
