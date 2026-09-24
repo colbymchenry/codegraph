@@ -289,6 +289,9 @@ export class CodeGraph {
     this.db = fresh;
     this.queries = new QueryBuilder(fresh.getDb());
     this.wireLayers();
+    // Whoever reopened — a sync, or a tool call's self-heal — the next sync
+    // must reconcile the whole tree (#1902).
+    this.pendingFullReconcile = true;
     // Releasing the dead handle also frees the leaked db/-wal/-shm fds that were
     // pinning the unlinked inode (#925).
     try { stale.close(); } catch { /* the old inode is gone; closing just frees fds */ }
@@ -829,7 +832,7 @@ export class CodeGraph {
       // If the reopen fails (the rebuild is mid-way), report the lock-busy
       // shape so the watcher keeps its pending files and retries.
       try {
-        if (this.reopenReplacedDatabase()) this.pendingFullReconcile = true;
+        this.reopenReplacedDatabase();
       } catch {
         this.fileLock.release();
         return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
@@ -846,7 +849,8 @@ export class CodeGraph {
           this.fileLock.release();
           return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
         }
-        this.pendingFullReconcile = false;
+        // Cleared only once this run completes (below): a sync that throws
+        // must leave the full catch-up for the next one.
         options = { ...options, paths: undefined };
       }
       // Defer WAL auto-checkpointing for the whole incremental run, exactly
@@ -1099,6 +1103,7 @@ export class CodeGraph {
 
         this.orchestrator.finishGitIndexState(gitState, fullReconcile, result.failedFilePaths);
 
+        if (fullReconcile && result.filesChecked > 0) this.pendingFullReconcile = false;
         return result;
       } finally {
         // Mirror indexAll's teardown: stop the valve, then restore the

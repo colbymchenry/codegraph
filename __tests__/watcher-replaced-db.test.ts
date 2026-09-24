@@ -226,4 +226,53 @@ describe('live sync after the index is rebuilt by another process (#1902)', () =
       }
     });
   });
+
+  posixOnly('a reopen by a tool call widens the next scoped sync to the whole tree', async () => {
+    const server = CodeGraph.initSync(root);
+    await server.indexAll();
+    try {
+      await rebuild(root);
+      // The self-heal on the tool-call path, not a sync, follows the path.
+      expect(server.reopenIfReplaced()).toBe(true);
+      const live = (server as any).orchestrator;
+      const calls: Array<string[] | undefined> = [];
+      const sync = live.sync.bind(live);
+      live.sync = (onProgress: unknown, paths: string[] | undefined, ...rest: unknown[]) => {
+        calls.push(paths);
+        return sync(onProgress, paths, ...rest);
+      };
+      await server.sync({ paths: ['src/a.ts'] });
+      await server.sync({ paths: ['src/a.ts'] });
+      // The first sync after the reopen reconciled everything; the next stays scoped.
+      expect(calls).toEqual([undefined, ['src/a.ts']]);
+    } finally {
+      server.close();
+    }
+  });
+
+  posixOnly('a catch-up sync that fails keeps the full reconcile for the next one', async () => {
+    const server = CodeGraph.initSync(root);
+    await server.indexAll();
+    try {
+      await rebuild(root);
+      expect(server.reopenIfReplaced()).toBe(true);
+      const live = (server as any).orchestrator;
+      const calls: Array<string[] | undefined> = [];
+      const sync = live.sync.bind(live);
+      let failNext = true;
+      live.sync = (onProgress: unknown, paths: string[] | undefined, ...rest: unknown[]) => {
+        calls.push(paths);
+        if (failNext) {
+          failNext = false;
+          return Promise.reject(new Error('injected sync failure'));
+        }
+        return sync(onProgress, paths, ...rest);
+      };
+      await expect(server.sync({ paths: ['src/a.ts'] })).rejects.toThrow('injected sync failure');
+      await server.sync({ paths: ['src/a.ts'] });
+      expect(calls).toEqual([undefined, undefined]);
+    } finally {
+      server.close();
+    }
+  });
 });
