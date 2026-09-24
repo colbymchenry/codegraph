@@ -93,6 +93,25 @@ public class Selected {
 class A { static final Companion INSTANCE = new Companion(); static class Companion { void m() {} } }`,
         'r/B.java': `package r;
 class B { static final Companion INSTANCE = new Companion(); static class Companion { void m() {} } }`,
+        'r/Interpolators.java': `package r;
+import android.view.animation.Interpolator;
+import android.view.animation.PathInterpolator;
+class Interpolators {
+    static final Interpolator ALPHA_OUT = new PathInterpolator(0, 0, 1, 1);
+    static final Interpolator DIRECT = new android.view.animation.PathInterpolator(0, 0, 1, 1);
+}`,
+        'r/WildcardInterpolators.java': `package r;
+import android.view.animation.*;
+class WildcardInterpolators { static final Interpolator ALPHA_OUT = new PathInterpolator(0, 0, 1, 1); }`,
+        'q/PathInterpolatorBuilder.java': `package q;
+class PathInterpolatorBuilder {
+    private static class PathInterpolator { float getInterpolation(float t) { return t; } }
+}`,
+        'p/ProjectInterpolator.java': `package p;
+public class ProjectInterpolator { public float getInterpolation(float t) { return t; } }`,
+        'r/ProjectInterpolators.java': `package r;
+import p.ProjectInterpolator;
+class ProjectInterpolators { static final ProjectInterpolator LOCAL = new ProjectInterpolator(); }`,
         'r/Consumer.java': `package r;
 import p.Selected;
 import java.util.Map;
@@ -121,6 +140,10 @@ public class Consumer {
     void interfaceField() { Consts.HELPER.go(); }
     void inheritedField() { Child.H.go(); }
     void capsType() { Util.IO.read(); }
+    float frameworkCall() { return Interpolators.ALPHA_OUT.getInterpolation(1); }
+    float qualifiedFrameworkCall() { return Interpolators.DIRECT.getInterpolation(1); }
+    float wildcardFrameworkCall() { return WildcardInterpolators.ALPHA_OUT.getInterpolation(1); }
+    float projectCall() { return ProjectInterpolators.LOCAL.getInterpolation(1); }
 }`,
       })) {
         const target = path.join(tempDir, file);
@@ -145,6 +168,10 @@ public class Consumer {
       expect(targets('interfaceField')).toEqual(['r::Helper::go']);
       expect(targets('inheritedField')).toEqual(['r::Helper::go']);
       expect(targets('capsType')).toEqual(['r::Util::IO::read']);
+      expect(targets('frameworkCall')).toEqual([]);
+      expect(targets('qualifiedFrameworkCall')).toEqual([]);
+      expect(targets('wildcardFrameworkCall')).toEqual([]);
+      expect(targets('projectCall')).toEqual(['p::ProjectInterpolator::getInterpolation']);
       const declaration = cg.searchNodes('run').map(r => r.node)
         .find(n => n.qualifiedName === 'r::Runner::run')!;
       expect(cg.getCallees(declaration.id).some(c =>

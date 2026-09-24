@@ -2610,16 +2610,21 @@ export function matchMethodCall(
       : undefined;
     const receiverType = initializedType?.split('.').pop() ?? typeName;
     const types = context.getNodesByName(receiverType).filter(n =>
-      (n.kind === 'class' || n.kind === 'interface') && n.language === 'java');
+      (n.kind === 'class' || n.kind === 'interface') && n.language === 'java' &&
+      (n.visibility !== 'private' || n.filePath === field.filePath));
     const nested = types.filter(n => n.qualifiedName === `${fieldOwner}::${receiverType}`);
     const typeRef = { ...ref, filePath: field.filePath };
-    const importedType = importedFqnOf(receiverType, typeRef, context);
+    const qualifiedType = initializedType?.includes('.') ? initializedType : undefined;
+    const importedType = qualifiedType ?? importedFqnOf(receiverType, typeRef, context);
     const imported = importedType
       ? types.filter(n => n.qualifiedName.replace(/::/g, '.') === importedType) : [];
     const packageName = /\bpackage\s+([\w.]+)\s*;/.exec(context.readFile(field.filePath) ?? '')?.[1];
     const samePackage = packageName
       ? types.filter(n => n.qualifiedName === `${packageName.replace(/\./g, '::')}::${receiverType}`) : [];
-    const chosen = [nested, imported, samePackage, types].find(group => group.length === 1)?.[0];
+    const chosen = qualifiedType ? (imported.length === 1 ? imported[0] : undefined)
+      : nested.length === 1 ? nested[0]
+      : importedType ? (imported.length === 1 ? imported[0] : undefined)
+      : [samePackage, types].find(group => group.length === 1)?.[0];
     if (!chosen) return null;
     const target = context.getNodesByName(methodName!).find(n =>
       n.kind === 'method' && n.qualifiedName === `${chosen.qualifiedName}::${methodName}`);
