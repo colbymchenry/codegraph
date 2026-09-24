@@ -124,6 +124,36 @@ function nested(holder) {
     expect(result.unresolvedReferences.some((r) => r.referenceName === 'values.get')).toBe(true);
   });
 
+  it.each([
+    ['ts', 'typescript'], ['tsx', 'tsx'], ['js', 'javascript'], ['jsx', 'jsx'],
+  ] as const)('peels transparent receivers and drops untyped expression receivers: %s', (ext, language) => {
+    const typed = language === 'typescript' || language === 'tsx';
+    const result = assertParity(`fixture.${ext}`, `
+function list() { return []; }
+class Runner { go() { return 1; } }
+async function exprReceivers(x, y) {
+  (await list()).map(g);
+  (x).run();
+  ${typed ? 'x!.run(); (y as X).run(); (x satisfies X).stop(); getTarget("a")!.install(); if (x && y!.c.has(1)) {} if (x && this.e!.c.has(1)) {}' : ''}
+  (a ?? b).map(g);
+  arr[0].run();
+  f().list.map(g);
+  (() => 1).call(null);
+  this.a.b.run();
+  super.stop();
+  new Runner().go();
+  window.Api.start();
+}
+`, language);
+    const fn = result.nodes.find((n) => n.name === 'exprReceivers');
+    expect(result.unresolvedReferences.filter((r) => r.referenceKind === 'calls' && r.fromNodeId === fn!.id)
+      .map((r) => r.referenceName)).toEqual([
+        'list().map', 'list', 'x.run',
+        ...(typed ? ['x.run', 'y.run', 'x.stop', 'getTarget().install', 'getTarget', 'has'] : []),
+        'f', 'run', 'stop', 'go', 'start',
+      ]);
+  });
+
   it('torture fixture (tsx): components, stores, RTK, fn-refs, value-refs, decorators', () => {
     const file = path.join(FIXTURE_DIR, 'torture.tsx');
     assertParity('fixtures/torture.tsx', fs.readFileSync(file, 'utf8'), 'tsx');
