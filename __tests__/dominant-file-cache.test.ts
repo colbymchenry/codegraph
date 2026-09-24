@@ -90,4 +90,29 @@ describe('dominant file — computed once per index state (#1864)', () => {
 
     expect(queriesOf(reader).getDominantFile()?.filePath).toBe('ext/plugin.ts');
   });
+
+  it('does not keep a result read inside a transaction that is rolled back', async () => {
+    const cg = await setup();
+    const q = queriesOf(cg);
+    const before = q.getDominantFile();
+    const db = (cg as any).db.getDb();
+    db.exec('BEGIN');
+    try {
+      db.exec('DELETE FROM edges');
+      expect(q.getDominantFile()).toBeNull();
+    } finally {
+      db.exec('ROLLBACK');
+    }
+    expect(q.getDominantFile()).toEqual(before);
+  });
+
+  it.runIf(process.platform !== 'win32')('sees a database rebuilt and reopened under it', async () => {
+    const reader = await setup();
+    expect(queriesOf(reader).getDominantFile()?.filePath).toBe('core/engine.ts');
+    fs.writeFileSync(path.join(dir, 'ext', 'plugin.ts'), chain('pluginStep', 120));
+    const rebuilt = await CodeGraph.recreate(dir);
+    try { await rebuilt.indexAll(); } finally { rebuilt.close(); }
+    expect(reader.reopenIfReplaced()).toBe(true);
+    expect(queriesOf(reader).getDominantFile()?.filePath).toBe('ext/plugin.ts');
+  });
 });
