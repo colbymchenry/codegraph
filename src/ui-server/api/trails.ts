@@ -39,7 +39,9 @@
  */
 
 import { execFileSync } from 'child_process';
+import * as fs from 'fs';
 import * as os from 'os';
+import * as path from 'path';
 import type { CodeGraph } from '../../index';
 import type { Node } from '../../types';
 import { ApiError, badRequest, notFound } from './respond';
@@ -434,21 +436,32 @@ function parseSaveRequest(body: unknown): { name: string; note: string; hops: Sa
  *
  * Git's `user.name` first, because a trail is a thing one person wrote for
  * others to read and that is the name they already sign work with in this
- * project; the OS user is the fallback. Read ONCE per process — `git config` is
+ * project; the OS user is the fallback. Read once per PROJECT — `git config` is
  * a subprocess, and a save should not pay for it twice — and never sent
  * anywhere: it goes into a file inside the user's own `.codegraph/`.
  */
-let cachedAuthor: string | null = null;
+const cachedAuthors = new Map<string, string>();
 
 export function trailAuthor(projectRoot: string): string {
-  if (cachedAuthor !== null) return cachedAuthor;
-  cachedAuthor = gitUserName(projectRoot) ?? osUserName() ?? '';
-  return cachedAuthor;
+  const key = authorCacheKey(projectRoot);
+  const cached = cachedAuthors.get(key);
+  if (cached !== undefined) return cached;
+  const author = gitUserName(projectRoot) ?? osUserName() ?? '';
+  cachedAuthors.set(key, author);
+  return author;
 }
 
 /** Test seam: forget the cached author. */
 export function resetTrailAuthor(): void {
-  cachedAuthor = null;
+  cachedAuthors.clear();
+}
+
+function authorCacheKey(projectRoot: string): string {
+  try {
+    return fs.realpathSync(projectRoot);
+  } catch {
+    return path.resolve(projectRoot);
+  }
 }
 
 function gitUserName(projectRoot: string): string | null {

@@ -19,6 +19,13 @@
   "workspaces": [
     "ui"
   ],
+  "devEngines": {
+    "runtime": {
+      "name": "node",
+      "version": ">=22.12.0",
+      "onFail": "error"
+    }
+  },
   "scripts": {
     "build": "tsc && npm run copy-assets && npm run build:ui && node -e \"require('fs').chmodSync('dist/bin/codegraph.js', 0o755)\"",
     "build:ui": "npm run build --workspace ui && node scripts/check-ui-build.mjs",
@@ -29,6 +36,7 @@
     "build:kernel": "bash scripts/build-kernel.sh",
     "cli": "npm run build && node dist/bin/codegraph.js",
     "test": "vitest run",
+    "test:perf": "vitest run __tests__/ui-server-api.test.ts --maxWorkers=1 --no-file-parallelism",
     "test:watch": "vitest",
     "test:eval": "vitest run __tests__/evaluation/",
     "eval": "npm run build && npx tsx __tests__/evaluation/runner.ts",
@@ -54,13 +62,13 @@
     "web-tree-sitter": "^0.25.3"
   },
   "devDependencies": {
-    "@sveltejs/vite-plugin-svelte": "^4.0.4",
+    "@sveltejs/vite-plugin-svelte": "^6.2.4",
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^20.19.30",
     "@types/picomatch": "^4.0.2",
     "jsdom": "^25.0.1",
     "typescript": "^5.0.0",
-    "vitest": "^2.1.9"
+    "vitest": "^4.1.11"
   },
   "engines": {
     "node": ">=20.0.0 <25.0.0"
