@@ -186,6 +186,54 @@ class Owner(private val engine: Motor, private val site: Plant) {
     fun extension() { engine.runner.label() }
 }
 `);
+    // A property a class inherits: from a base in another file (a body
+    // property and a primary-constructor one, two levels up), or in the same
+    // file. Variable names differ from type names so no capitalized-name
+    // guess can land on the right type.
+    fs.writeFileSync(path.join(src, 'Bases.kt'), `package p
+class Ledger { fun post() {} }
+class Feed { fun refresh() {} }
+abstract class BaseScreen(protected val source: Feed) : java.io.Serializable {
+    protected lateinit var model: Ledger
+}
+open class MidScreen(origin: Feed) : BaseScreen(origin)
+`);
+    fs.writeFileSync(path.join(src, 'Screens.kt'), `package p
+class Cache { fun post() {}; fun refresh() {}; fun twist() {}; fun open() {} }
+class Knob { fun twist() {} }
+class Sink { fun drainAll() {} }
+open class Panel { val widget = Knob() }
+class SidePanel : Panel() {
+    fun turn() { widget.twist() }
+}
+class HomeScreen(start: Feed) : MidScreen(start), Runnable {
+    override fun run() {}
+    fun show() { model.post() }
+    fun pull() { source.refresh() }
+    fun viaThis() { this.model.post() }
+}
+class LibScreen : android.app.Activity() {
+    fun go() { helper.drainAll() }
+}
+abstract class Hook { abstract fun fire(code: Int) }
+class Gate { fun open() {} }
+class Rig { val gate = Gate() }
+class Wiring {
+    fun wire(): Hook {
+        val motor = Rig()
+        return object : Hook() {
+            override fun fire(code: Int) { motor.gate.open() }
+        }
+    }
+    fun siblings(): Hook {
+        val latch = Gate()
+        return object : Hook() {
+            fun prep() { val latch = Cache() }
+            override fun fire(code: Int) { latch.open() }
+        }
+    }
+}
+`);
     cg = CodeGraph.initSync(dir, { config: { include: ['**/*.kt'], exclude: [] } });
     await cg.indexAll();
   });
@@ -283,6 +331,39 @@ class Owner(private val engine: Motor, private val site: Plant) {
     expect(callees('Owner', 'library')).toEqual([]);
     // The project's own extension of that library type is still reached.
     expect(callees('Owner', 'extension')).toEqual(['Thread::label']);
+  });
+
+  it('a property inherited from a superclass is typed, in the same file or another', () => {
+    expect(callees('SidePanel', 'turn')).toEqual(['p::Knob::twist']);
+    // Two levels up, past a library interface in the supertype list.
+    expect(callees('HomeScreen', 'show')).toEqual(['p::Ledger::post']);
+    expect(callees('HomeScreen', 'viaThis')).toEqual(['p::Ledger::post']);
+    // A primary-constructor property of the base.
+    expect(callees('HomeScreen', 'pull')).toEqual(['p::Feed::refresh']);
+  });
+
+  it('a receiver not found up to a library base class keeps the name-only resolution', () => {
+    // The property may come from the library base, so it is neither typed
+    // nor treated as a library type.
+    expect(callees('LibScreen', 'go')).toEqual(['p::Sink::drainAll']);
+  });
+
+  it('a local of the outer function is typed inside an anonymous object', () => {
+    /** Callees of the `fire` override declared inside `Wiring::<fn>`. */
+    const fire = (fn: string): string[] => {
+      const outer = cg.searchNodes(fn).map((r) => r.node).find((n) => n.qualifiedName.endsWith(`Wiring::${fn}`));
+      expect(outer, fn).toBeDefined();
+      const node = cg.searchNodes('fire').map((r) => r.node).find(
+        (n) => n.filePath.endsWith('Screens.kt') && n.startLine > outer!.startLine && n.startLine <= (outer!.endLine ?? outer!.startLine),
+      );
+      expect(node, `${fn} fire`).toBeDefined();
+      return cg.getCallees(node!.id)
+        .filter((c) => c.edge.kind === 'calls' && !c.edge.metadata?.synthesizedBy)
+        .map((c) => c.node.qualifiedName);
+    };
+    expect(fire('wire')).toEqual(['p::Gate::open']);
+    // A sibling member's same-named local is not visible from `fire`.
+    expect(fire('siblings')).toEqual(['p::Gate::open']);
   });
 
   it('a nested type keeps its outer type', () => {

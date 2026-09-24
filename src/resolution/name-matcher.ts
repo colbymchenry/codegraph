@@ -1619,17 +1619,29 @@ function inferKotlinPropertyType(
   ref: UnresolvedRef,
   context: ResolutionContext,
 ): string | null {
+  const lines = kotlinFileLines(ref.filePath, context);
+  if (!lines) return null;
+
+  if (property) {
+    const text = lines.slice(Math.max(0, property.startLine - 1), Math.min(lines.length, property.endLine ?? property.startLine));
+    return kotlinDeclaredTypeIn(text.join('\n'), name, ref, context);
+  }
+  return kotlinDeclaredTypeIn(kotlinClassHeader(owner, inFile, lines), name, ref, context);
+}
+
+/** A file's lines through the context's per-file cache; null when unreadable. */
+function kotlinFileLines(filePath: string, context: ResolutionContext): string[] | null {
   const lines = context.getFileLines
-    ? context.getFileLines(ref.filePath)
-    : (context.readFile(ref.filePath)?.split(/\r?\n/) ?? null);
-  if (!lines || lines.length === 0) return null;
+    ? context.getFileLines(filePath)
+    : (context.readFile(filePath)?.split(/\r?\n/) ?? null);
+  return lines && lines.length > 0 ? lines : null;
+}
 
-  const readType = (from: number, to: number): string | null =>
-    kotlinDeclaredTypeIn(
-      lines.slice(Math.max(0, from - 1), Math.min(lines.length, to)).join('\n'), name, ref, context);
-
-  if (property) return readType(property.startLine, property.endLine ?? property.startLine);
-
+/**
+ * A Kotlin class's lines before its first member: its annotations, name,
+ * primary constructor and supertype list.
+ */
+function kotlinClassHeader(owner: Node, inFile: Node[], lines: string[]): string {
   const ownerEnd = owner.endLine ?? owner.startLine;
   let firstMember = ownerEnd + 1;
   for (const n of inFile) {
@@ -1638,7 +1650,117 @@ function inferKotlinPropertyType(
       firstMember = n.startLine;
     }
   }
-  return readType(owner.startLine, firstMember - 1);
+  return lines.slice(Math.max(0, owner.startLine - 1), Math.min(lines.length, firstMember - 1)).join('\n');
+}
+
+/**
+ * The supertype names a Kotlin class header lists after its primary
+ * constructor (`class A(…) : Base(…), Iface<T>, Api by impl {`), as
+ * kotlinTypeName gives them. Colons and commas inside the constructor or
+ * type arguments are skipped; a `where` clause or the body ends the list.
+ */
+function kotlinSupertypeNames(header: string, className: string): string[] {
+  const r = className.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const decl = new RegExp(`\\b(?:class|object|interface)\\s+${r}\\b`).exec(header);
+  if (!decl) return [];
+  const entries: string[] = [];
+  let paren = 0;
+  let angle = 0;
+  let start = -1;
+  let i = decl.index + decl[0].length;
+  for (; i < header.length; i++) {
+    const c = header[i]!;
+    if (c === '(') paren++;
+    else if (c === ')') paren--;
+    else if (paren > 0) continue;
+    else if (c === '<') angle++;
+    else if (c === '>') angle--;
+    else if (angle > 0) continue;
+    else if (c === '{') break;
+    else if (start >= 0 && c === 'w' && /^where\b/.test(header.slice(i, i + 6)) && !/\w/.test(header[i - 1] ?? '')) break;
+    else if (c === ':' && start < 0) start = i + 1;
+    else if (c === ',' && start >= 0) {
+      entries.push(header.slice(start, i));
+      start = i + 1;
+    }
+  }
+  if (start >= 0) entries.push(header.slice(start, i));
+  const names: string[] = [];
+  for (const entry of entries) {
+    const m = entry.match(/^\s*(?:@\w+\s+)*([A-Za-z_][\w.]*)/);
+    const type = m && m[1] ? kotlinTypeName(m[1]) : null;
+    if (type) names.push(type);
+  }
+  return names;
+}
+
+/**
+ * The declared type of Kotlin property `name` if class `owner` declares it —
+ * as a member node or a primary-constructor `val`/`var` — read in the
+ * owner's own file. Undefined when the owner does not declare it; null when
+ * it does without a type the declaration names.
+ */
+function kotlinOwnPropertyType(
+  name: string,
+  owner: Node,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null | undefined {
+  const inFile = context.getNodesInFile(owner.filePath);
+  const qualified = `${owner.qualifiedName}::${name}`;
+  const property = inFile.find(
+    (n) => (n.kind === 'field' || n.kind === 'constant' || n.kind === 'variable') && n.qualifiedName === qualified,
+  ) ?? null;
+  if (!property) {
+    const lines = kotlinFileLines(owner.filePath, context);
+    const r = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (!lines || !new RegExp(`\\b(?:val|var)\\s+${r}\\b`).test(kotlinClassHeader(owner, inFile, lines))) {
+      return undefined;
+    }
+  }
+  // Read the declaration in the owner's file, as if the ref sat there.
+  const at: UnresolvedRef = { ...ref, filePath: owner.filePath, line: property?.startLine ?? owner.startLine };
+  return inferKotlinPropertyType(name, property, owner, inFile, at, context);
+}
+
+/**
+ * The declared type of Kotlin property `name` that class `owner` inherits: the
+ * nearest project supertype (breadth-first, at most four levels) declaring it,
+ * with supertypes read from each class header. A supertype the project does
+ * not declare, or whose name is ambiguous, is not walked — the property may
+ * come from it — so the result is then null (unknown), never external.
+ */
+function kotlinInheritedPropertyType(
+  name: string,
+  owner: Node,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  const seen = new Set<string>([owner.id]);
+  let level: Node[] = [owner];
+  for (let depth = 0; depth < 4 && level.length > 0; depth++) {
+    const next: Node[] = [];
+    for (const cls of level) {
+      const lines = kotlinFileLines(cls.filePath, context);
+      if (!lines) continue;
+      const header = kotlinClassHeader(cls, context.getNodesInFile(cls.filePath), lines);
+      for (const superName of kotlinSupertypeNames(header, cls.name)) {
+        const simple = superName.split('::').pop()!;
+        const supers = context.getNodesByName(simple).filter(
+          (n) => (n.kind === 'class' || n.kind === 'interface') && n.language === 'kotlin' &&
+            (n.qualifiedName === superName || n.qualifiedName.endsWith(`::${superName}`)),
+        );
+        if (supers.length !== 1 || seen.has(supers[0]!.id)) continue;
+        const sup = supers[0]!;
+        seen.add(sup.id);
+        const type = kotlinOwnPropertyType(name, sup, ref, context);
+        if (type !== undefined) return type;
+        next.push(sup);
+      }
+    }
+    level = next;
+  }
+  return null;
 }
 
 
@@ -1805,7 +1927,8 @@ function kotlinCallResultType(
 /**
  * The declared type of Kotlin receiver `name` at `ref`: the nearest local
  * declaration in the enclosing scope (typed, constructed, or bound to a call),
- * else a property of the enclosing class. Null when none names a type.
+ * else a property of the enclosing class, else a parameter, else a property
+ * the enclosing class inherits. Null when none names a type.
  */
 function kotlinReceiverDeclaredType(
   name: string,
@@ -1813,19 +1936,17 @@ function kotlinReceiverDeclaredType(
   context: ResolutionContext,
   depth = 0,
 ): string | null {
-  const lines = context.getFileLines
-    ? context.getFileLines(ref.filePath)
-    : (context.readFile(ref.filePath)?.split(/\r?\n/) ?? null);
-  if (lines && lines.length > 0) {
+  const lines = kotlinFileLines(ref.filePath, context);
+  let localDeclared = false;
+  if (lines) {
     const r = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const declares = new RegExp(`\\b(?:val|var)\\s+${r}\\b`);
-    const callIdx = Math.max(0, Math.min(lines.length - 1, ref.line - 1));
-    const startIdx = Math.max(0, enclosingScopeStartLine(ref, context) - 1);
-    for (let i = callIdx; i >= startIdx; i--) {
+    for (const i of kotlinLocalScanLines(ref, context, lines.length)) {
       const line = lines[i];
       if (!line || line.length > 10_000 || !declares.test(line)) continue;
       const local = kotlinDeclaredTypeIn(line, name, ref, context, depth);
       if (local) return local;
+      localDeclared = true;
       break;
     }
   }
@@ -1834,7 +1955,57 @@ function kotlinReceiverDeclaredType(
   // A typed parameter of the enclosing function or lambda (`webSocket:
   // WebSocket` in an overridden callback).
   const param = inferLocalReceiverType(name, ref, context);
-  return param && /^[A-Z]/.test(param) ? param : null;
+  if (param) return /^[A-Z]/.test(param) ? param : null;
+  if (localDeclared) return null;
+  // A property of a superclass: `viewModel` declared in `BaseActivity`.
+  const owner = kotlinEnclosingClass(ref, context);
+  if (!owner || kotlinOwnPropertyType(name, owner, ref, context) !== undefined) return null;
+  return kotlinInheritedPropertyType(name, owner, ref, context);
+}
+
+/** The tightest Kotlin class or interface enclosing `ref`'s line. */
+function kotlinEnclosingClass(ref: UnresolvedRef, context: ResolutionContext): Node | undefined {
+  return context.getNodesInFile(ref.filePath)
+    .filter((n) => (n.kind === 'class' || n.kind === 'interface') && n.language === 'kotlin' &&
+      n.startLine <= ref.line && (n.endLine ?? n.startLine) >= ref.line)
+    .sort((a, b) => b.startLine - a.startLine)[0];
+}
+
+/**
+ * The 0-based lines a Kotlin local visible at `ref` may be declared on,
+ * nearest first: the enclosing function above the call, then — when that
+ * function is nested in another (a member of an anonymous object, a local
+ * function) — each outer function above the nested one, whose locals it
+ * captures. Lines of a function nested in a scanned one that does not
+ * enclose `ref` are skipped: its locals are not visible. Outside any
+ * function, every line above the call.
+ */
+function kotlinLocalScanLines(ref: UnresolvedRef, context: ResolutionContext, lineCount: number): number[] {
+  const callIdx = Math.max(0, Math.min(lineCount - 1, ref.line - 1));
+  const fns = context.getNodesInFile(ref.filePath).filter(
+    (n) => (n.kind === 'function' || n.kind === 'method') && n.language === 'kotlin',
+  );
+  const enclosing = fns
+    .filter((n) => n.startLine <= ref.line && (n.endLine ?? n.startLine) >= ref.line)
+    .sort((a, b) => b.startLine - a.startLine);
+  const out: number[] = [];
+  if (enclosing.length === 0) {
+    for (let i = callIdx; i >= 0; i--) out.push(i);
+    return out;
+  }
+  let hi = callIdx;
+  for (const fn of enclosing) {
+    const fnEnd = fn.endLine ?? fn.startLine;
+    const hidden = fns.filter(
+      (n) => n.startLine > fn.startLine && (n.endLine ?? n.startLine) <= fnEnd &&
+        !(n.startLine <= ref.line && (n.endLine ?? n.startLine) >= ref.line),
+    );
+    for (let i = hi; i >= fn.startLine - 1; i--) {
+      if (!hidden.some((n) => i + 1 >= n.startLine && i + 1 <= (n.endLine ?? n.startLine))) out.push(i);
+    }
+    hi = Math.min(hi, fn.startLine - 2);
+  }
+  return out;
 }
 
 /**
@@ -1856,10 +2027,7 @@ function kotlinChainDeclaredType(
 
   let owner: Node | undefined;
   if (segments[0] === 'this') {
-    owner = context.getNodesInFile(ref.filePath)
-      .filter((n) => (n.kind === 'class' || n.kind === 'interface') && n.language === 'kotlin' &&
-        n.startLine <= ref.line && (n.endLine ?? n.startLine) >= ref.line)
-      .sort((a, b) => b.startLine - a.startLine)[0];
+    owner = kotlinEnclosingClass(ref, context);
     if (!owner) return null;
   }
   let type: string | null = owner ? null : kotlinReceiverDeclaredType(segments[0]!, ref, context);
@@ -1892,12 +2060,8 @@ function kotlinChainDeclaredType(
       owner = undefined;
       continue;
     }
-    const property = inFile.find(
-      (n) => (n.kind === 'field' || n.kind === 'constant' || n.kind === 'variable') && n.qualifiedName === qualified,
-    ) ?? null;
-    // Read the declaration in the owner's file, as if the ref sat there.
-    const at: UnresolvedRef = { ...ref, filePath: owner.filePath, line: property?.startLine ?? owner.startLine };
-    type = inferKotlinPropertyType(segment, property, owner, inFile, at, context);
+    const own = kotlinOwnPropertyType(segment, owner, ref, context);
+    type = own !== undefined ? own : kotlinInheritedPropertyType(segment, owner, ref, context);
     owner = undefined;
   }
   return type;
