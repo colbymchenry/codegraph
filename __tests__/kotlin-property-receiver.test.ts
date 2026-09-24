@@ -158,6 +158,34 @@ class LibraryUser {
     }
 }
 `);
+    fs.writeFileSync(path.join(src, 'Machines.kt'), `package p
+class Tank { fun flush() {} }
+class Motor {
+    val reservoir = Tank()
+    val runner = Thread { }
+}
+class Plant(val unit: Motor)
+class Crate<T> { fun seal() {} }
+object Registry { val primary = Motor() }
+enum class Gear { LOW, HIGH; fun shift() {} }
+fun Thread.label(): String = name
+`);
+    // The decoy `flush` sits in the caller's own file, where a name-only
+    // guess would look first.
+    fs.writeFileSync(path.join(src, 'Chains.kt'), `package p
+class Other { fun flush() {}; fun seal() {}; fun shift() {} }
+class Owner(private val engine: Motor, private val site: Plant) {
+    private val box = Crate<Int>()
+    fun generic() { box.seal() }
+    fun viaObject() { Registry.primary.reservoir.flush() }
+    fun viaEnum() { Gear.LOW.shift() }
+    fun go() { engine.reservoir.flush() }
+    fun viaThis() { this.engine.reservoir.flush() }
+    fun deep() { site.unit.reservoir.flush() }
+    fun library() { engine.runner.start() }
+    fun extension() { engine.runner.label() }
+}
+`);
     cg = CodeGraph.initSync(dir, { config: { include: ['**/*.kt'], exclude: [] } });
     await cg.indexAll();
   });
@@ -224,9 +252,37 @@ class LibraryUser {
 
   it('an alias takes the aliased value type; a library-typed parameter gets no edge', () => {
     expect(callees('AliasUser', 'stop')).toEqual(['p::Session::cancel']);
-    const onOpen = cg.searchNodes('onOpen').map((r) => r.node).find((n) => n.filePath.endsWith('Users.kt'));
+    // The anonymous object's `onOpen`, not the abstract `Listener::onOpen`
+    // (which may carry a synthesized override edge to it).
+    const listen = cg.searchNodes('listen').map((r) => r.node)
+      .find((n) => n.qualifiedName.endsWith('AliasUser::listen'));
+    expect(listen).toBeDefined();
+    const onOpens = cg.searchNodes('onOpen').map((r) => r.node).filter((n) => n.filePath.endsWith('Users.kt'));
+    const onOpen = onOpens.find((n) => n.qualifiedName.includes('$anon')) ??
+      onOpens.find((n) => n.startLine > listen!.startLine && n.startLine <= (listen!.endLine ?? listen!.startLine));
     expect(onOpen).toBeDefined();
-    expect(cg.getCallees(onOpen!.id).filter((c) => c.edge.kind === 'calls')).toEqual([]);
+    const calls = cg.getCallees(onOpen!.id)
+      .filter((c) => c.edge.kind === 'calls' && !c.edge.metadata?.synthesizedBy && !c.edge.metadata?.registeredAt);
+    expect(calls).toEqual([]);
+  });
+
+  it('a receiver chain is typed through each property declared type', () => {
+    expect(callees('Owner', 'go')).toEqual(['p::Tank::flush']);
+    expect(callees('Owner', 'viaThis')).toEqual(['p::Tank::flush']);
+    expect(callees('Owner', 'deep')).toEqual(['p::Tank::flush']);
+  });
+
+  it('a chain may start at an object or an enum entry; a generic constructor types its property', () => {
+    expect(callees('Owner', 'viaObject')).toEqual(['p::Tank::flush']);
+    expect(callees('Owner', 'viaEnum')).toEqual(['p::Gear::shift']);
+    expect(callees('Owner', 'generic')).toEqual(['p::Crate::seal']);
+  });
+
+  it('a receiver chain through a library type gets no edge', () => {
+    // `Thread.start` must not bind to the project's `Worker.start`.
+    expect(callees('Owner', 'library')).toEqual([]);
+    // The project's own extension of that library type is still reached.
+    expect(callees('Owner', 'extension')).toEqual(['Thread::label']);
   });
 
   it('a nested type keeps its outer type', () => {

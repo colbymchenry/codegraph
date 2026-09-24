@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
+import { matchKotlinReceiverChain, matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath } from './import-resolver';
@@ -922,6 +922,19 @@ export class ReferenceResolver {
     // A local C++ object construction (`T obj(args)`, ref `ns::T::T/1`)
     // resolves ONLY to a constructor of the lexically nearest `T` (#1839).
     if (isCppConstructorRef(ref)) return matchCppConstructor(ref, this.context);
+
+    // A Kotlin call through a receiver chain (`engine.pump.drain()`) resolves
+    // on the chain's declared type, or gets no edge when that type is a
+    // library one. An untyped chain resolves as the bare method name, the ref
+    // the extractor emitted before it kept the chain.
+    if (ref.language === 'kotlin' && ref.referenceKind === 'calls') {
+      const chain = matchKotlinReceiverChain(ref, this.context);
+      if (chain && 'method' in chain) {
+        const bare = this.resolveOneInner({ ...ref, referenceName: chain.method });
+        return bare ? { ...bare, original: ref } : null;
+      }
+      if (chain !== undefined) return this.gateLanguage(chain, ref);
+    }
 
     // Skip built-in/external references
     if (this.isBuiltInOrExternal(ref)) {
