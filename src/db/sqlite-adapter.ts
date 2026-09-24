@@ -32,6 +32,8 @@ export interface SqliteDatabase {
   transaction<T>(fn: (...args: any[]) => T): (...args: any[]) => T;
   close(): void;
   readonly open: boolean;
+  /** Undefined on a runtime without `isTransaction`; callers must then not memoize. */
+  readonly inTransaction?: boolean;
 }
 
 /**
@@ -71,6 +73,10 @@ class NodeSqliteAdapter implements SqliteDatabase {
    */
   private failure(err: unknown): unknown {
     return toWslSharedIndexError(err, this._dbPath) ?? err;
+  }
+
+  get inTransaction(): boolean | undefined {
+    return this._db.isTransaction;
   }
 
   get open(): boolean {
