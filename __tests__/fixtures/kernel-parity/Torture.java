@@ -101,6 +101,7 @@ public class TortureService extends BaseService implements Runnable, AutoCloseab
   }
 
   interface Listener {
+    int DEFAULT_PRIORITY = 1;
     void onChange(TortureService svc);
   }
 }
