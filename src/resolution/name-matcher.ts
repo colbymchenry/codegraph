@@ -1534,6 +1534,34 @@ function importedFqnOf(
   return imports.find((i) => i.localName === typeName)?.source;
 }
 
+function kotlinImportedType(name: string, ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+  // ponytail: scan explicit imports here; cache per file only if indexing profiles justify it.
+  const source = context.readFile(ref.filePath);
+  if (!source) return undefined;
+  for (const match of source.matchAll(/^[ \t]*import[ \t]+([\w.]+)(?:[ \t]+as[ \t]+(\w+))?[ \t]*;?[ \t]*(?:\/\/[^\n]*)?$/gm)) {
+    const fqn = match[1]!;
+    if ((match[2] || fqn.split('.').pop()) !== name) continue;
+    const importedNode = context.getNodesByName(fqn.split('.').pop()!).find(n =>
+      n.qualifiedName.replace(/::/g, '.') === fqn);
+    if (importedNode && !['class', 'interface', 'enum', 'type_alias'].includes(importedNode.kind)) return undefined;
+    return fqn;
+  }
+  return undefined;
+}
+
+function kotlinExtensionInScope(target: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (target.filePath === ref.filePath) return true;
+  const declaration = context.readFile(target.filePath) ?? '';
+  const caller = context.readFile(ref.filePath) ?? '';
+  const targetPackage = /^\s*package\s+([\w.]+)/m.exec(declaration)?.[1] ?? '';
+  const callerPackage = /^\s*package\s+([\w.]+)/m.exec(caller)?.[1] ?? '';
+  if (targetPackage === callerPackage) return true;
+  for (const match of caller.matchAll(/^[ \t]*import[ \t]+([\w.]+(?:\.\*)?)(?:[ \t]+as[ \t]+\w+)?[ \t]*(?:\/\/[^\n]*)?$/gm)) {
+    if (match[1] === `${targetPackage}.${target.name}` || match[1] === `${targetPackage}.*`) return true;
+  }
+  return false;
+}
+
 /**
  * Java/Kotlin: infer a receiver's declared type by walking field declarations
  * in the class enclosing the call site. The field's `signature` is already in
@@ -2351,6 +2379,44 @@ export function matchMethodCall(
   }
 
   const [, objectOrClass, methodName] = match;
+  // An explicit Kotlin type import fixes the receiver's identity. Resolve
+  // only that type (including Java interop), never a same-named local method.
+  const importedType = ref.language === 'kotlin' && dotMatch && /^[A-Z]\w*$/.test(objectOrClass!)
+    ? kotlinImportedType(objectOrClass!, ref, context) : undefined;
+  if (importedType) {
+    const localExtension = context.getNodesInFile(ref.filePath).find(n =>
+      n.kind === 'method' && n.qualifiedName === `${objectOrClass}::${methodName}`);
+    if (localExtension) return { original: ref, targetNodeId: localExtension.id,
+      confidence: 0.9, resolvedBy: 'qualified-name' };
+    const simpleName = importedType.split('.').pop()!;
+    const owners = context.getNodesByName(simpleName).filter(n =>
+      (n.kind === 'class' || n.kind === 'interface' || n.kind === 'enum') &&
+      (n.language === 'kotlin' || n.language === 'java') &&
+      n.qualifiedName.replace(/::/g, '.') === importedType);
+    const methods = owners.flatMap(owner => context.getNodesInFile(owner.filePath).filter(n =>
+      n.kind === 'method' && (n.language === 'kotlin' || n.language === 'java') &&
+      (n.qualifiedName === `${owner.qualifiedName}::${methodName}` ||
+        n.qualifiedName === `${owner.qualifiedName}::Companion::${methodName}`)));
+    if (owners.length === 1 && methods.length === 0) {
+      const constructor = context.getNodesInFile(owners[0]!.filePath).find(n =>
+        n.kind === 'method' &&
+        n.qualifiedName === `${owners[0]!.qualifiedName}::${methodName}::${methodName}`);
+      if (constructor) return { original: ref, targetNodeId: constructor.id,
+        confidence: 0.9, resolvedBy: 'qualified-name' };
+    }
+    if (owners.length === 1 && methods.length > 0) return { original: ref, targetNodeId: methods[0]!.id,
+      confidence: 0.9, resolvedBy: 'qualified-name' };
+    const extensions = context.getNodesByName(methodName!).filter(n =>
+      n.kind === 'method' && n.language === 'kotlin' &&
+      n.qualifiedName === `${objectOrClass}::${methodName}`);
+    if (extensions.length > 0) {
+      const visible = extensions.filter(n => kotlinExtensionInScope(n, ref, context));
+      if (visible.length === 1) return { original: ref, targetNodeId: visible[0]!.id,
+        confidence: 0.9, resolvedBy: 'qualified-name' };
+      return null;
+    }
+    if (owners.length === 0) return null;
+  }
   // A simple `receiver.method` / `receiver:method` / `receiver$method` shape whose
   // receiver type we can try to infer from its local declaration.
   const inferableReceiver = dotMatch || luaColonMatch || rDollarMatch;
@@ -3671,6 +3737,15 @@ export function matchReference(
   // 2. Method call pattern
   result = nmTimed('methodCall', ref, () => matchMethodCall(ref, context));
   if (result) return result;
+  if (ref.language === 'kotlin' && ref.referenceKind === 'calls') {
+    const importedReceiver = ref.referenceName.match(/^([A-Z]\w*)\.\w+$/)?.[1];
+    if (importedReceiver) {
+      const importedType = kotlinImportedType(importedReceiver, ref, context);
+      if (importedType && !context.getNodesByName(importedType.split('.').pop()!).some(n =>
+        (n.kind === 'class' || n.kind === 'interface' || n.kind === 'enum') &&
+        n.qualifiedName.replace(/::/g, '.') === importedType)) return null;
+    }
+  }
 
   // 3. Exact name match
   result = nmTimed('exactName', ref, () => matchByExactName(ref, context));
