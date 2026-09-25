@@ -112,8 +112,28 @@ public class ProjectInterpolator { public float getInterpolation(float t) { retu
         'r/ProjectInterpolators.java': `package r;
 import p.ProjectInterpolator;
 class ProjectInterpolators { static final ProjectInterpolator LOCAL = new ProjectInterpolator(); }`,
+        'r/WildcardProjectInterpolators.java': `package r;
+import p.*;
+class WildcardProjectInterpolators { static final ProjectInterpolator LOCAL = new ProjectInterpolator(); }`,
+        'com/app/W.java': `package com.app;
+import android.view.animation.*;
+public class W { public static final Interpolator DECEL = new DecelerateInterpolator(); }`,
+        'com/third/DecelerateInterpolator.java': `package com.third;
+public class DecelerateInterpolator { public float getInterpolation(float t) { return t; } }`,
+        'com/app/ExternalConsts.java': `package com.app;
+public interface ExternalConsts { ExternalHelper HELPER = new ExternalHelper(); }`,
+        'com/app/ExternalHelper.java': `package com.app;
+public class ExternalHelper { public void go() {} }`,
+        'com/lib/ProjectInterpolator.java': `package com.lib;
+public class ProjectInterpolator { public float getInterpolation(float t) { return t; } }`,
+        'com/app/WildcardProject.java': `package com.app;
+import com.lib.*;
+public class WildcardProject { public static final ProjectInterpolator LOCAL = new ProjectInterpolator(); }`,
         'r/Consumer.java': `package r;
 import p.Selected;
+import com.app.W;
+import com.app.ExternalConsts;
+import com.app.WildcardProject;
 import java.util.Map;
 interface Runner { void run(); }
 interface Consts { Helper HELPER = new Helper(); }
@@ -144,6 +164,10 @@ public class Consumer {
     float qualifiedFrameworkCall() { return Interpolators.DIRECT.getInterpolation(1); }
     float wildcardFrameworkCall() { return WildcardInterpolators.ALPHA_OUT.getInterpolation(1); }
     float projectCall() { return ProjectInterpolators.LOCAL.getInterpolation(1); }
+    float wildcardProjectCall() { return WildcardProjectInterpolators.LOCAL.getInterpolation(1); }
+    float unrelatedWildcardCall() { return W.DECEL.getInterpolation(1); }
+    void dottedPackageInterfaceCall() { ExternalConsts.HELPER.go(); }
+    float dottedWildcardCall() { return WildcardProject.LOCAL.getInterpolation(1); }
 }`,
       })) {
         const target = path.join(tempDir, file);
@@ -172,6 +196,10 @@ public class Consumer {
       expect(targets('qualifiedFrameworkCall')).toEqual([]);
       expect(targets('wildcardFrameworkCall')).toEqual([]);
       expect(targets('projectCall')).toEqual(['p::ProjectInterpolator::getInterpolation']);
+      expect(targets('wildcardProjectCall')).toEqual(['p::ProjectInterpolator::getInterpolation']);
+      expect(targets('unrelatedWildcardCall')).toEqual([]);
+      expect(targets('dottedPackageInterfaceCall')).toEqual(['com.app::ExternalHelper::go']);
+      expect(targets('dottedWildcardCall')).toEqual(['com.lib::ProjectInterpolator::getInterpolation']);
       const declaration = cg.searchNodes('run').map(r => r.node)
         .find(n => n.qualifiedName === 'r::Runner::run')!;
       expect(cg.getCallees(declaration.id).some(c =>

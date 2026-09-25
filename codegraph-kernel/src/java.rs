@@ -422,6 +422,7 @@ impl<'t> Walker<'t> {
     }
 
     fn is_static(&self, node: Node) -> bool {
+        if node.kind() == "constant_declaration" { return true; }
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
                 if child.kind() == "modifiers" && self.text(child).contains("static") {
@@ -434,6 +435,7 @@ impl<'t> Walker<'t> {
 
     /// javaExtractor.isConst: `static final` field → constant.
     fn is_const(&self, node: Node) -> bool {
+        if node.kind() == "constant_declaration" { return true; }
         for i in 0..node.child_count() {
             if let Some(child) = node.child(i) {
                 if child.kind() == "modifiers" {
@@ -503,7 +505,7 @@ impl<'t> Walker<'t> {
         } else if kind == "enum_declaration" {
             self.extract_enum(node);
             skip_children = true;
-        } else if kind == "field_declaration" && self.inside_class_like() {
+        } else if matches!(kind, "field_declaration" | "constant_declaration") && self.inside_class_like() {
             self.extract_field(node);
             self.scan_fn_ref_subtree(node, 0);
             skip_children = true;

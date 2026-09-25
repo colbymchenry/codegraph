@@ -2603,8 +2603,9 @@ export function matchMethodCall(
     const typeName = declaredType ? normalizeInferredTypeName(declaredType) : null;
     if (!typeName) return null;
     const fieldOwner = field.qualifiedName.slice(0, field.qualifiedName.lastIndexOf('::'));
-    const fieldSource = context.readFile(field.filePath)?.split('\n')
-      .slice(field.startLine - 1, field.endLine).join('\n') ?? '';
+    const fieldContent = context.readFile(field.filePath) ?? '';
+    const fieldSource = fieldContent.split('\n')
+      .slice(field.startLine - 1, field.endLine).join('\n');
     const initializedType = field.kind === 'constant'
       ? new RegExp(`\\b${field.name}\\s*=\\s*new\\s+([\\w.]+)\\s*\\(`).exec(fieldSource)?.[1]
       : undefined;
@@ -2618,13 +2619,18 @@ export function matchMethodCall(
     const importedType = qualifiedType ?? importedFqnOf(receiverType, typeRef, context);
     const imported = importedType
       ? types.filter(n => n.qualifiedName.replace(/::/g, '.') === importedType) : [];
-    const packageName = /\bpackage\s+([\w.]+)\s*;/.exec(context.readFile(field.filePath) ?? '')?.[1];
+    const packageName = /\bpackage\s+([\w.]+)\s*;/.exec(fieldContent)?.[1];
     const samePackage = packageName
-      ? types.filter(n => n.qualifiedName === `${packageName.replace(/\./g, '::')}::${receiverType}`) : [];
+      ? types.filter(n => n.qualifiedName === `${packageName}::${receiverType}`) : [];
+    const wildcardPackages = [...fieldContent.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '')
+      .matchAll(/^\s*import\s+([\w.]+)\.\*\s*;/gm)]
+      .map(m => m[1]!);
+    const wildcard = types.filter(n => wildcardPackages.some(pkg =>
+      n.qualifiedName === `${pkg}::${receiverType}`));
     const chosen = qualifiedType ? (imported.length === 1 ? imported[0] : undefined)
       : nested.length === 1 ? nested[0]
       : importedType ? (imported.length === 1 ? imported[0] : undefined)
-      : [samePackage, types].find(group => group.length === 1)?.[0];
+      : [samePackage, wildcard].find(group => group.length === 1)?.[0];
     if (!chosen) return null;
     const target = context.getNodesByName(methodName!).find(n =>
       n.kind === 'method' && n.qualifiedName === `${chosen.qualifiedName}::${methodName}`);
