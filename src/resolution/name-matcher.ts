@@ -2613,7 +2613,12 @@ export function matchMethodCall(
     const types = context.getNodesByName(receiverType).filter(n =>
       (n.kind === 'class' || n.kind === 'interface') && n.language === 'java' &&
       (n.visibility !== 'private' || n.filePath === field.filePath));
-    const nested = types.filter(n => n.qualifiedName === `${fieldOwner}::${receiverType}`);
+    let nested: Node[] = [];
+    for (let scope = fieldOwner; scope.includes('::'); scope = scope.slice(0, scope.lastIndexOf('::'))) {
+      nested = types.filter(n => n.qualifiedName === scope ||
+        n.qualifiedName === `${scope}::${receiverType}`);
+      if (nested.length) break;
+    }
     const typeRef = { ...ref, filePath: field.filePath };
     const qualifiedType = initializedType?.includes('.') ? initializedType : undefined;
     const importedType = qualifiedType ?? importedFqnOf(receiverType, typeRef, context);

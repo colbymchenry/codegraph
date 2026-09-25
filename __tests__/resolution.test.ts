@@ -129,8 +129,18 @@ public class ProjectInterpolator { public float getInterpolation(float t) { retu
         'com/app/WildcardProject.java': `package com.app;
 import com.lib.*;
 public class WildcardProject { public static final ProjectInterpolator LOCAL = new ProjectInterpolator(); }`,
+        'p/Outer.java': `package p;
+public class Outer {
+    public static class Sibling { public int getId() { return 1; } }
+    public static class Inner {
+        public static final Inner A = new Inner();
+        public static final Sibling B = new Sibling();
+        public int getId() { return 0; }
+    }
+}`,
         'r/Consumer.java': `package r;
 import p.Selected;
+import p.Outer;
 import com.app.W;
 import com.app.ExternalConsts;
 import com.app.WildcardProject;
@@ -168,6 +178,8 @@ public class Consumer {
     float unrelatedWildcardCall() { return W.DECEL.getInterpolation(1); }
     void dottedPackageInterfaceCall() { ExternalConsts.HELPER.go(); }
     float dottedWildcardCall() { return WildcardProject.LOCAL.getInterpolation(1); }
+    int nestedOwnerFieldCall() { return Outer.Inner.A.getId(); }
+    int enclosingTypeFieldCall() { return Outer.Inner.B.getId(); }
 }`,
       })) {
         const target = path.join(tempDir, file);
@@ -200,6 +212,8 @@ public class Consumer {
       expect(targets('unrelatedWildcardCall')).toEqual([]);
       expect(targets('dottedPackageInterfaceCall')).toEqual(['com.app::ExternalHelper::go']);
       expect(targets('dottedWildcardCall')).toEqual(['com.lib::ProjectInterpolator::getInterpolation']);
+      expect(targets('nestedOwnerFieldCall')).toEqual(['p::Outer::Inner::getId']);
+      expect(targets('enclosingTypeFieldCall')).toEqual(['p::Outer::Sibling::getId']);
       const declaration = cg.searchNodes('run').map(r => r.node)
         .find(n => n.qualifiedName === 'r::Runner::run')!;
       expect(cg.getCallees(declaration.id).some(c =>
