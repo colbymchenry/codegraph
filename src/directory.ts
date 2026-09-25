@@ -155,6 +155,46 @@ export function unsafeIndexRootReason(projectRoot: string): string | null {
   return null;
 }
 
+/**
+ * `dev:ino` for a path, or null if it can't be stat'd or the platform doesn't
+ * report a usable inode. Read as bigints: WSL DrvFs (`/mnt/c`) reports inodes
+ * above 2^53, where a plain number rounds nearby inodes onto one value. Windows
+ * st_ino is unreliable across handle reopens, so we deliberately return null
+ * there — the deleted-but-open-inode hazard this guards (#925) is a POSIX
+ * file-semantics issue that doesn't arise on Windows (an open file can't be
+ * unlinked).
+ */
+export function statInode(p: string): string | null {
+  if (process.platform === 'win32') return null;
+  try {
+    const s = fs.statSync(p, { bigint: true });
+    return `${s.dev}:${s.ino}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether two resolved index roots are one index spelled two ways — a symlinked
+ * checkout, or a case-variant on a case-insensitive mount (macOS, NTFS, WSL
+ * DrvFs `/mnt/c`), where `realpathSync` keeps the caller's casing (#1057).
+ * Compares the identity of both data directories as they are NOW, so an inode
+ * reused after a delete can't match: the deleted root no longer stats. Windows
+ * has no usable inode, so it compares the on-disk-cased realpath, case-folded.
+ */
+export function isSameIndexRoot(a: string, b: string): boolean {
+  if (a === b) return true;
+  if (process.platform === 'win32') {
+    try {
+      return fs.realpathSync.native(a).toLowerCase() === fs.realpathSync.native(b).toLowerCase();
+    } catch {
+      return false;
+    }
+  }
+  const id = statInode(getCodeGraphDir(a));
+  return id !== null && id === statInode(getCodeGraphDir(b));
+}
+
 export function findNearestCodeGraphRoot(startPath: string): string | null {
   let current = path.resolve(startPath);
   const root = path.parse(current).root;
