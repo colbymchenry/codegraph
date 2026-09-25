@@ -6,7 +6,7 @@
 
 import type CodeGraph from '../index';
 import type { QueryPool } from './query-pool';
-import { findNearestCodeGraphRoot } from '../directory';
+import { findNearestCodeGraphRoot, isSameIndexRoot } from '../directory';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
 // helper in engine.ts. ToolHandler must load to answer tools/list (static
 // schemas), but it must NOT drag in sqlite/query layers before the daemon binds;
@@ -1475,6 +1475,8 @@ export class ToolHandler {
   // retry) — tool calls themselves never scan.
   private knownSubprojects: string[] = [];
   private knownSubprojectsBase: string | null = null;
+  private static readonly MAX_PROJECT_CACHE_ENTRIES = 20;
+  private activeProjectRoots = new Map<string, number>();
   // Per-start-path cache of the git worktree/index mismatch (issue #155). The
   // mismatch is a fixed property of (where the request came from → which
   // .codegraph/ it resolves to), so the up-to-two `git rev-parse` spawns run
@@ -1779,11 +1781,40 @@ export class ToolHandler {
     // path. One key per instance means closeAll() closes each exactly once, and
     // a changed resolution maps to a different entry instead of a stale hit.
     const cached = this.projectCache.get(resolvedRoot);
-    if (cached) return this.freshen(cached);
+    if (cached) {
+      this.projectCache.delete(resolvedRoot);
+      this.projectCache.set(resolvedRoot, cached);
+      return this.freshen(cached);
+    }
 
     const cg = loadCodeGraph().openSync(resolvedRoot);
     this.projectCache.set(resolvedRoot, cg);
     return cg;
+  }
+
+  private pinProject(projectPath: unknown): string | null {
+    const root = typeof projectPath === 'string' ? findNearestCodeGraphRoot(projectPath) : null;
+    if (root) this.activeProjectRoots.set(root, (this.activeProjectRoots.get(root) ?? 0) + 1);
+    return root;
+  }
+
+  private unpinProject(root: string | null): void {
+    if (!root) return;
+    const count = this.activeProjectRoots.get(root)!;
+    if (count === 1) this.activeProjectRoots.delete(root);
+    else this.activeProjectRoots.set(root, count - 1);
+  }
+
+  /** Close old project connections only when that project's calls finish. */
+  private trimProjectCache(): void {
+    while (this.projectCache.size > ToolHandler.MAX_PROJECT_CACHE_ENTRIES) {
+      const oldestRoot = [...this.projectCache.keys()].find(root =>
+        ![...this.activeProjectRoots.keys()].some(active => isSameIndexRoot(root, active)));
+      if (!oldestRoot) break; // all excess connections are in use
+      const oldest = this.projectCache.get(oldestRoot)!;
+      this.projectCache.delete(oldestRoot);
+      try { oldest.close(); } catch { /* cache cleanup must not fail a tool call */ }
+    }
   }
 
   /**
@@ -2105,6 +2136,7 @@ export class ToolHandler {
     args: Record<string, unknown>,
     sessionState?: ExploreSessionState,
   ): Promise<ToolResult> {
+    let pinnedRoot: string | null = null;
     try {
       // Block the first tool call on the engine's post-open reconcile so we
       // never serve rows for files deleted/edited while no MCP server was
@@ -2132,6 +2164,7 @@ export class ToolHandler {
       if (typeof pathCheck === 'object' && pathCheck !== undefined) {
         return pathCheck;
       }
+      pinnedRoot = this.pinProject(pathCheck);
       // The `path` and `pattern` properties used by codegraph_files are
       // also path-shaped — apply the same cap.
       if (args.path !== undefined) {
@@ -2198,6 +2231,9 @@ export class ToolHandler {
         'This is an internal codegraph error — retry the call once; if it persists, ' +
         'continue without codegraph for this task.'
       );
+    } finally {
+      this.unpinProject(pinnedRoot);
+      this.trimProjectCache();
     }
   }
 
@@ -2266,6 +2302,7 @@ export class ToolHandler {
    * path validation already ran in {@link execute} before routing here.
    */
   async executeReadTool(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+    const pinnedRoot = this.pinProject(args.projectPath);
     try {
       return await this.dispatchTool(toolName, args);
     } catch (err) {
@@ -2280,6 +2317,9 @@ export class ToolHandler {
         'This is an internal codegraph error — retry the call once; if it persists, ' +
         'continue without codegraph for this task.'
       );
+    } finally {
+      this.unpinProject(pinnedRoot);
+      this.trimProjectCache();
     }
   }
 
