@@ -154,6 +154,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Steps diagrams retain database operations made through external client chains without inventing internal dependencies.
 - Direct React Native bridge calls retain their native implementations and cross-platform relationships.
 - Dart extension-type getters remain searchable when using the WebAssembly parser.
+- Kotlin calls through imported types now avoid unrelated same-named methods while retaining inherited members and project extension functions. (#1948)
 
 - Calling a built-in method on an awaited value no longer records a call into an unrelated class that happens to declare a method of the same name, and a variable bound to an awaited call now resolves methods on the type that call returns. Thanks @maxmilian. (#1840)
 - Spring mappings now include every declared path combination and resolve constants declared in the same file, while unresolved paths no longer appear as false root routes. (#1461)
