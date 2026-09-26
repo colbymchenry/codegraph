@@ -18,6 +18,13 @@ describe('config parsing', () => {
     expect(parseWatchdogTimeoutMs('1500')).toBe(1500);
   });
 
+  it('parseWatchdogTimeoutMs caps at the largest delay a timer can hold (#1966)', () => {
+    // Node runs a setTimeout delay above 2^31-1 ms after 1 ms instead.
+    expect(parseWatchdogTimeoutMs('2147483647')).toBe(2147483647);
+    expect(parseWatchdogTimeoutMs('2147483648')).toBe(2147483647);
+    expect(parseWatchdogTimeoutMs('3000000000')).toBe(2147483647);
+  });
+
   it('deriveCheckIntervalMs stays within [50, 2000] and scales with the timeout', () => {
     expect(deriveCheckIntervalMs(60_000)).toBe(2000); // clamped high
     expect(deriveCheckIntervalMs(500)).toBe(100); // 500/5
@@ -89,6 +96,15 @@ describe('liveness watchdog (spawned, real watchdog process)', () => {
   function expectKilled(r: { code: number | null; signal: NodeJS.Signals | 'TIMEOUT' | null }): void {
     expect(r.signal === 'SIGKILL' || (r.signal === null && r.code !== 0 && r.code !== null)).toBe(true);
   }
+
+  it('leaves a healthy process alone when the timeout is set past what a timer can hold (#1966)', async () => {
+    const r = await runChild(
+      { CODEGRAPH_WATCHDOG_TIMEOUT_MS: '3000000000' },
+      'setTimeout(() => process.exit(0), 1000);',
+      8000
+    );
+    expect(r).toEqual({ code: 0, signal: null });
+  }, 12000);
 
   it('SIGKILLs a process whose main thread wedges in a sync loop', async () => {
     const r = await runChild(

@@ -71,14 +71,24 @@ function isEnvTruthy(raw: string | undefined): boolean {
   return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
 }
 
-/** Parse the timeout env, falling back to the default for missing/invalid values. */
+/**
+ * The longest delay a Node timer holds: anything above 2^31-1 ms is run after
+ * 1 ms instead (with a TimeoutOverflowWarning), so a huge value meant as
+ * "effectively never" would fire at once (#1966).
+ */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/**
+ * Parse the timeout env, falling back to the default for missing/invalid values
+ * and capping at {@link MAX_TIMER_DELAY_MS}.
+ */
 export function parseWatchdogTimeoutMs(
   raw: string | undefined,
   fallback: number = DEFAULT_WATCHDOG_TIMEOUT_MS
 ): number {
   if (raw === undefined) return fallback;
   const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? n : fallback;
+  return Number.isFinite(n) && n > 0 ? Math.min(n, MAX_TIMER_DELAY_MS) : fallback;
 }
 
 /** Derive a heartbeat cadence that emits several beats inside the timeout window. */
