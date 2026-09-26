@@ -162,6 +162,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- While auto-sync is off, `codegraph_explore` no longer answers from files that changed since their last sync: it names them so they can be read directly, and keeps answering from files that did not change. (#1959)
 - `codegraph_status` over MCP now reports when files were last indexed and how many were added, changed or removed since, computed without blocking other requests, so a frozen index shows up as numbers rather than only a banner. (#1959)
 - After a long stretch of contention for the index lock, the next MCP call restarts file watching and runs a full catch-up instead of leaving auto-sync off for the rest of the session; answers say the index may be stale until the catch-up finishes. (#1959)
 - File watching no longer drops the full re-scan a removed directory asks for when that sync fails, so the deleted files leave the index instead of lingering. (#1964)

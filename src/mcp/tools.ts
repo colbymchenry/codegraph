@@ -1975,7 +1975,7 @@ export class ToolHandler {
    * are handled by the existing not-found paths, and a wrong "stale" flag
    * would needlessly push the agent back to Read.
    */
-  private isFileStaleOnDisk(cg: CodeGraph, relPath: string, content?: string): boolean {
+  private isFileStaleOnDisk(cg: CodeGraph, relPath: string, content?: string, forceHash = false): boolean {
     let root: string;
     try {
       root = cg.getProjectRoot();
@@ -1985,7 +1985,7 @@ export class ToolHandler {
     const key = `${root}\0${relPath}`;
     const now = Date.now();
     const hit = this.driftCache.get(key);
-    if (hit && now - hit.at < ToolHandler.DRIFT_TTL_MS) return hit.stale;
+    if (!forceHash && hit && now - hit.at < ToolHandler.DRIFT_TTL_MS) return hit.stale;
     let stale = false;
     try {
       const rec = cg.getFile(relPath);
@@ -1994,7 +1994,7 @@ export class ToolHandler {
         const st = statSync(absPath);
         // Same freshness test as the sync fast path (extraction/index.ts):
         // equal size + equal floored mtime ⇒ unchanged, no read needed.
-        if (st.size !== rec.size || Math.floor(st.mtimeMs) !== Math.floor(rec.modifiedAt)) {
+        if (forceHash || st.size !== rec.size || Math.floor(st.mtimeMs) !== Math.floor(rec.modifiedAt)) {
           const data = content ?? readFileSync(absPath, 'utf-8');
           // Must stay byte-identical to extraction's `hashContent` (sha256 over
           // the utf-8 string) — the identical-rewrite test in
@@ -2002,9 +2002,11 @@ export class ToolHandler {
           // to keep the extraction module off the MCP startup path.
           stale = createHash('sha256').update(data).digest('hex') !== rec.contentHash;
         }
+      } else if (forceHash) {
+        stale = true; // deleted/inaccessible since this response was rendered
       }
     } catch {
-      stale = false;
+      stale = forceHash;
     }
     this.driftCache.set(key, { at: now, stale });
     return stale;
@@ -2198,6 +2200,21 @@ export class ToolHandler {
       const raw = (this.queryPool && this.queryPool.healthy && this.queryPool.ready)
         ? await this.queryPool.run(toolName, dispatchArgs)
         : await this.executeReadTool(toolName, dispatchArgs);
+      if (toolName === 'codegraph_explore' && project.isWatcherDegraded?.()) {
+        const emission = raw[EXPLORE_EMISSION_KEY];
+        const stalePaths = emission?.files
+          ?.filter(file => this.isFileStaleOnDisk(project, file.path, undefined, true))
+          .map(file => file.path) ?? [];
+        if (stalePaths.length > 0) {
+          // Do not show graph/source derived from changed files, and do not
+          // record this rejected emission as source the session has seen.
+          return this.textResult(
+            '⚠️ CodeGraph cannot answer from this index: these files changed after their last sync:\n' +
+            stalePaths.map(file => `- ${file}`).join('\n') +
+            '\nRead those files directly or retry after a successful codegraph sync.'
+          );
+        }
+      }
       // Record + STRIP before anything else touches the result: the emission is
       // internal bookkeeping and must never reach the client, whether or not a
       // caller passed session state.
