@@ -162,6 +162,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- A shared MCP daemon no longer hangs on shutdown behind a connection that never finished its handshake, and a fallback server whose project is being written by another process now answers read-only instead of refusing, so sessions keep CodeGraph. (#1963)
 - Daemon startup and cleanup now preserve live legacy PID-only locks while still reclaiming dead or identity-disproved records, preventing two writers from serving the same project.
 - Incremental sync now keeps edge rebinding crash-safe: replacing a resolved edge with its recovery reference commits atomically, so an interruption cannot permanently remove the relationship.
 - Status now detects committed but unindexed changes and restored edits without scanning every source file; thanks @inth3shadows. (#1829)

@@ -50,7 +50,6 @@ import {
 import { clearStaleDaemonArtifacts } from './daemon-registry';
 import { connectWithHello, runLocalHandshakeProxy } from './proxy';
 import {
-  getWriterPidPath,
   readWriterLock,
   releaseWriterLock,
   tryAcquireWriterLock,
@@ -114,12 +113,12 @@ function makeFallbackEngine(root: string): MCPEngine {
   }
   const writer = readWriterLock(root);
   if (writer && writer.pid > 0 && isProcessAlive(writer.pid)) {
-    throw new Error(writerLockHeldMessage(writer, getWriterPidPath(root)));
+    // Another process owns updates. A fallback may still serve read-only WAL
+    // queries without claiming a second writer or starting a watcher (#1963).
+    return new MCPEngine({ watch: false });
   }
   if (existing && isProcessAlive(existing.pid)) {
-    throw new Error(
-      `Cannot start an in-process fallback while live daemon pid ${existing.pid} holds the project lock.`
-    );
+    return new MCPEngine({ watch: false });
   }
   return new MCPEngine({ writerLockRoot: root });
 }
