@@ -38,6 +38,24 @@ describe('parseStartupHandshakeTimeoutMs', () => {
   it('floors fractional values', () => {
     expect(parseStartupHandshakeTimeoutMs('2500.7')).toBe(2500);
   });
+
+  it('caps at the largest delay a timer can hold (#1966)', () => {
+    expect(parseStartupHandshakeTimeoutMs('2147483647')).toBe(2147483647);
+    expect(parseStartupHandshakeTimeoutMs('2147483648')).toBe(2147483647);
+    expect(parseStartupHandshakeTimeoutMs('3000000000')).toBe(2147483647);
+  });
+
+  it('does not abandon a launch at once when the timeout is set past what a timer can hold (#1966)', async () => {
+    let abandoned = false;
+    const disarm = armStartupHandshakeTimeout(
+      () => { abandoned = true; },
+      new PassThrough(),
+      parseStartupHandshakeTimeoutMs('3000000000'),
+    );
+    await sleep(100);
+    disarm();
+    expect(abandoned).toBe(false);
+  });
 });
 
 describe('armStartupHandshakeTimeout', () => {

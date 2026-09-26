@@ -145,6 +145,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Setting `CODEGRAPH_WATCHDOG_TIMEOUT_MS` or `CODEGRAPH_STARTUP_HANDSHAKE_TIMEOUT_MS` to a very large value no longer makes it fire at once and stop the MCP server; values past about 24 days are now treated as that maximum. (#1966)
+
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
 - Turning telemetry off now resets its identity and stops running processes from recording, sending, or restoring unsent data. (#1869)
