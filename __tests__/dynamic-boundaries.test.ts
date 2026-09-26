@@ -391,3 +391,29 @@ describe('codegraph_explore — interface dispatch', () => {
     expect(text).not.toContain('**Interface dispatch');
   });
 });
+
+describe('scanDynamicDispatch — dynamic import arguments (#1967)', () => {
+  const forms = (body: string): string[] =>
+    scanDynamicDispatch(body, 'typescript', 1).map((m) => m.form);
+
+  it('flags an import built from a template literal with a substitution', () => {
+    expect(forms('async function load(lang) {\n  return import(`./locales/${lang}.js`);\n}')).toEqual(['dynamic-import']);
+    expect(forms('function load(name) {\n  return require(`./plugins/${name}`);\n}')).toEqual(['dynamic-import']);
+  });
+
+  it('flags an import built by string concatenation', () => {
+    expect(forms("async function load(lang) {\n  return import('./locales/' + lang + '.js');\n}")).toEqual(['dynamic-import']);
+    expect(forms('function load(dir) {\n  return require(dir + "/index");\n}')).toEqual(['dynamic-import']);
+  });
+
+  it('still flags an import of a bare expression', () => {
+    expect(forms('async function load(p) {\n  return import(p);\n}')).toEqual(['dynamic-import']);
+  });
+
+  it('leaves a single complete literal alone', () => {
+    expect(forms("async function a() {\n  return import('./fixed.js');\n}")).toEqual([]);
+    expect(forms('async function a() {\n  return import(`./fixed.js`);\n}')).toEqual([]);
+    expect(forms('function a() {\n  return require("./fixed");\n}')).toEqual([]);
+    expect(forms("async function a() {\n  return import('./data.json', { with: { type: 'json' } });\n}")).toEqual([]);
+  });
+});
