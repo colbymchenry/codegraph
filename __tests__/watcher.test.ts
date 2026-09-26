@@ -968,6 +968,78 @@ describe('FileWatcher', () => {
       expect(calls[0]).toBeUndefined();
     });
 
+    it.each([
+      ['lock contention', () => new LockUnavailableError()],
+      ['sync failure', () => new Error('injected sync failure')],
+    ])('retries a full-only directory removal after %s (#1964)', async (_case, failure) => {
+      const syncFn = vi.fn()
+        .mockRejectedValueOnce(failure())
+        .mockResolvedValue({ filesChanged: 0, durationMs: 5 });
+      const watcher = newWatcher(syncFn, { debounceMs: 25 });
+      watcher.start();
+      try {
+        await watcher.waitUntilReady();
+        __emitWatchEventForTests(testDir, 'src/removed-dir');
+        await waitFor(() => syncFn.mock.calls.length >= 2, 4000);
+        expect(syncFn.mock.calls.map(call => call[0])).toEqual([undefined, undefined]);
+      } finally {
+        watcher.stop();
+      }
+    });
+
+    it('follows a scoped sync with a full scan when a directory is removed mid-sync (#1964)', async () => {
+      let release!: () => void;
+      const firstRun = new Promise<void>(resolve => { release = resolve; });
+      const calls: (string[] | undefined)[] = [];
+      const syncFn: SyncFn = async paths => {
+        calls.push(paths);
+        if (calls.length === 1) await firstRun;
+        return { filesChanged: 0, durationMs: 5 };
+      };
+      const watcher = newWatcher(syncFn, { debounceMs: 25 });
+      watcher.start();
+      try {
+        await watcher.waitUntilReady();
+        fs.writeFileSync(path.join(testDir, 'src', 'a.ts'), 'export const a = 1;');
+        __emitWatchEventForTests(testDir, 'src/a.ts');
+        await waitFor(() => calls.length === 1, 4000);
+        __emitWatchEventForTests(testDir, 'src/removed-dir');
+        release();
+        await waitFor(() => calls.length >= 2, 4000);
+        expect(calls).toEqual([['src/a.ts'], undefined]);
+      } finally {
+        release();
+        watcher.stop();
+      }
+    });
+
+    it('follows a scoped sync with a full scan when scope changes mid-sync (#1964)', async () => {
+      let release!: () => void;
+      const firstRun = new Promise<void>(resolve => { release = resolve; });
+      const calls: (string[] | undefined)[] = [];
+      const syncFn: SyncFn = async paths => {
+        calls.push(paths);
+        if (calls.length === 1) await firstRun;
+        return { filesChanged: 0, durationMs: 5 };
+      };
+      const watcher = newWatcher(syncFn, { debounceMs: 25 });
+      watcher.start();
+      try {
+        await watcher.waitUntilReady();
+        fs.writeFileSync(path.join(testDir, 'src', 'a.ts'), 'export const a = 1;');
+        __emitWatchEventForTests(testDir, 'src/a.ts');
+        await waitFor(() => calls.length === 1, 4000);
+        fs.writeFileSync(path.join(testDir, '.gitignore'), 'src/ignored/\n');
+        __emitWatchEventForTests(testDir, '.gitignore');
+        release();
+        await waitFor(() => calls.length >= 2, 4000);
+        expect(calls).toEqual([['src/a.ts'], undefined]);
+      } finally {
+        release();
+        watcher.stop();
+      }
+    });
+
     it('a lone file event fires on the quick window, well before the full debounce', async () => {
       const calls: (string[] | undefined)[] = [];
       const syncFn: SyncFn = async (paths?: string[]) => {
