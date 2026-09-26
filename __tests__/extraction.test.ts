@@ -1845,6 +1845,46 @@ class T {
     expect(callersOf('target')).toEqual(['directCall', 'fieldLambda', 'run']);
     expect(callersOf('compute')).toEqual(['eager']);
   });
+
+  it('keeps the full qualified name on the extends reference of `new Outer.Inner() { ... }` (real AOSP AIDL shape: `new ICarPropertyEventListener.Stub() { ... }`)', () => {
+    // The anon class's OWN name and the enclosing `instantiates` edge are
+    // correctly truncated to the bare last segment ("Stub") — that matches
+    // how a real in-project nested class's own node is named, and how
+    // `instantiates` resolves (by bare class name). But the `extends`
+    // reference is a DIFFERENT resolution path: a real named class's
+    // `extends IFoo.Stub` clause is extracted verbatim (untruncated), and
+    // qualified lookups depend on that full dotted text surviving.
+    // Truncating the anonymous class's extends reference to "Stub" would
+    // lose the relationship to `ICarPropertyEventListener.Stub`.
+    const code = `
+package p;
+interface ICarPropertyEventListener {
+  interface Stub {}
+}
+class CarNightService {
+    private final ICarPropertyEventListener mListener =
+        new ICarPropertyEventListener.Stub() {
+            public void onEvent() {}
+        };
+}
+`;
+    const result = extractFromSource('CarNightService.java', code);
+    const anon = result.nodes.find((n) => n.kind === 'class' && /Stub\$anon@/.test(n.name));
+    expect(anon, 'anonymous Stub subclass should be extracted as a class').toBeDefined();
+
+    const extendsRef = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'extends' && r.fromNodeId === anon!.id
+    );
+    expect(extendsRef, 'anon class should carry an extends reference').toBeDefined();
+    expect(extendsRef!.referenceName).toBe('ICarPropertyEventListener.Stub');
+
+    // The anon class's own cosmetic name and the instantiates edge stay
+    // truncated to the bare last segment — unaffected by this fix.
+    const instantiatesRef = result.unresolvedReferences.find(
+      (r) => r.referenceKind === 'instantiates' && r.referenceName === 'Stub'
+    );
+    expect(instantiatesRef, 'enclosing field should still instantiate the bare Stub name').toBeDefined();
+  });
 });
 
 describe('C# Extraction', () => {

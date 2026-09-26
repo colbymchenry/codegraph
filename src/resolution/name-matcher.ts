@@ -359,22 +359,23 @@ export function matchFunctionRef(
 const NO_NESTED_FUNCTIONS = new Set<string>(['c', 'cpp']);
 
 /**
- * A function nested inside another FUNCTION is only callable from within its
- * container — Python, JS/TS, and every closure language scope it lexically.
+ * A function nested inside another function, or an anonymous-class method
+ * inside a function, is only callable from within that container.
  * Resolving a bare name from elsewhere to a nested local fabricates an edge
  * scope already rules out: `join(...)` in one function must never bind to a
  * `join` defined inside a DIFFERENT function (#1230). A candidate whose
  * qualifiedName parent is a same-file function/method is kept only when the
- * ref originates inside that parent's line range. Class members are
- * unaffected (their parent resolves to a class-like node), as are top-level
- * symbols and C++ namespace-prefixed names (the prefix has no node).
+ * ref originates inside that parent's line range. Ordinary class members and
+ * top-level symbols have no enclosing function; C++ namespace prefixes have
+ * no function node.
  */
 function isLexicallyReachable(
   candidate: Node,
   ref: UnresolvedRef,
   context: ResolutionContext
 ): boolean {
-  if (candidate.kind !== 'function') return true;
+  if (candidate.kind !== 'function' && candidate.kind !== 'method') return true;
+  if (candidate.kind === 'method' && !candidate.qualifiedName.includes('$anon@')) return true;
   // C and C++ have no nested named functions, so a function the graph shows
   // inside another is an extraction artifact, not a scope: tree-sitter-c
   // cannot parse a macro call whose arguments are designated initializers
@@ -385,21 +386,22 @@ function isLexicallyReachable(
   if (NO_NESTED_FUNCTIONS.has(candidate.language)) return true;
   const qn = candidate.qualifiedName;
   if (!qn || !qn.includes('::')) return true;
-  const parentQn = qn.slice(0, qn.lastIndexOf('::'));
-  const containers = context
-    .getNodesByQualifiedName(parentQn)
-    .filter(
-      (p) =>
-        p.filePath === candidate.filePath &&
-        (p.kind === 'function' || p.kind === 'method') &&
-        p.startLine <= candidate.startLine &&
-        p.endLine >= candidate.endLine
+  let parentQn = qn.slice(0, qn.lastIndexOf('::'));
+  while (parentQn) {
+    const containers = context.getNodesByQualifiedName(parentQn).filter((p) =>
+      p.filePath === candidate.filePath &&
+      (p.kind === 'function' || p.kind === 'method') &&
+      p.startLine <= candidate.startLine && p.endLine >= candidate.endLine
     );
-  if (containers.length === 0) return true;
-  return (
-    ref.filePath === candidate.filePath &&
-    containers.some((p) => ref.line >= p.startLine && ref.line <= p.endLine)
-  );
+    if (containers.length > 0) {
+      return ref.filePath === candidate.filePath &&
+        containers.some((p) => ref.line >= p.startLine && ref.line <= p.endLine);
+    }
+    const separator = parentQn.lastIndexOf('::');
+    if (separator < 0) break;
+    parentQn = parentQn.slice(0, separator);
+  }
+  return true;
 }
 
 /** Languages whose module boundary is `import`/`export` (or CommonJS). */
@@ -734,6 +736,10 @@ function isLocallyBoundJsName(name: string, filePath: string, context: Resolutio
   return bound;
 }
 
+function filterCandidatesForReference(ref: UnresolvedRef, nodes: Node[]): Node[] {
+  return isInheritanceRef(ref) ? nodes.filter((node) => SUPERTYPE_TARGET_KINDS.has(node.kind)) : nodes;
+}
+
 /**
  * Try to resolve a reference by exact name match
  */
@@ -755,8 +761,11 @@ export function matchByExactName(
     const storeAction = matchJsStoreBindingCall(ref, context);
     if (storeAction) return storeAction;
   }
-  const candidates = applyLanguageGate(context.getNodesByName(ref.referenceName), ref)
-    .filter((n) => n.kind !== 'import')
+  const candidates = filterCandidatesForReference(
+    ref,
+    applyLanguageGate(context.getNodesByName(ref.referenceName), ref)
+      .filter((n) => n.kind !== 'import'),
+  )
     // Nested locals are only reachable from inside their container (#1230).
     .filter((n) => isLexicallyReachable(n, ref, context))
     // Preserve import ranking; calls reject the winner without promoting another.
@@ -767,15 +776,7 @@ export function matchByExactName(
     // A name the file binds itself (a parameter, a const) shadows every other
     // file's symbol of that name, so a bare call has no cross-file candidate.
     .filter((n) => !(bareJs && n.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context)))
-    // An `extends`/`implements` ref names a supertype, so anything that can't
-    // BE one is not a candidate at all. This is eligibility, not
-    // ranking: kind is only a scoring bonus below (and none is awarded for
-    // inheritance refs), so without this a same-named `enum_member` outranked
-    // the real `trait`, and as the sole candidate was adopted outright by the
-    // single-match shortcut. Restricting the pool BEFORE ranking lets the
-    // legitimate supertype win instead of merely dropping the false edge.
-    .filter((n) => !isInheritanceRef(ref) || SUPERTYPE_TARGET_KINDS.has(n.kind))
-    // Likewise for `imports`: a member that only exists inside a type is not
+    // For `imports`, a member that only exists inside a type is not
     // importable, so it is not a candidate. Without this a `path`/`id`/`url`
     // import resolved to some interface's same-named property.
     .filter((n) => ref.referenceKind !== 'imports' || isImportableKind(n.kind));
@@ -823,6 +824,26 @@ export function matchByExactName(
 }
 
 /**
+ * Whether `qualifiedName` ends with `suffix` at a real `::` scope boundary —
+ * NOT a plain `String.endsWith`, which false-matches across an identifier
+ * boundary purely by character coincidence: `"Aaa::operator+"` ends with the
+ * literal substring `"a::operator+"` only because `Aaa` itself happens to
+ * end in the letter `a`, even though `"a"` there was never meant as a scope
+ * qualifier at all — it was a C++ receiver *variable* named `a` in a
+ * `a.operator+(b)` call, decoy-matching the unrelated `Aaa::operator+`
+ * method instead of leaving receiver-type inference (`matchMethodCall`) to
+ * find the real `V::operator+`. A match only counts when the
+ * suffix is the WHOLE qualifiedName, or the two characters immediately
+ * preceding it are a real `::` separator.
+ */
+function endsWithQualifiedSegment(qualifiedName: string, suffix: string): boolean {
+  if (qualifiedName === suffix) return true;
+  if (!qualifiedName.endsWith(suffix)) return false;
+  const boundary = qualifiedName.length - suffix.length;
+  return boundary >= 2 && qualifiedName[boundary - 1] === ':' && qualifiedName[boundary - 2] === ':';
+}
+
+/**
  * Try to resolve by qualified name
  */
 export function matchByQualifiedName(
@@ -841,14 +862,31 @@ export function matchByQualifiedName(
   // must never resolve to a yaml/properties config node — that's a wrong edge
   // AND it hides the real callee. Drop those from both the exact and the partial
   // candidate sets so resolution falls through to method resolution below (#1180).
-  const keepForRef = (nodes: Node[]): Node[] =>
-    ref.referenceKind === 'calls'
-      ? nodes.filter(
-          (n) => !(n.kind === 'constant' && (n.language === 'yaml' || n.language === 'properties')),
-        )
-      : nodes;
+  const keepForRef = (nodes: Node[]): Node[] => {
+    let kept = nodes;
+    if (ref.referenceKind === 'calls') {
+      kept = kept.filter(
+        (n) => !(n.kind === 'constant' && (n.language === 'yaml' || n.language === 'properties')),
+      );
+    }
+    return filterCandidatesForReference(ref, kept);
+  };
 
-  const candidates = keepForRef(context.getNodesByQualifiedName(ref.referenceName));
+  // The GENERIC class-hierarchy walker's qualifiedName always joins scope
+  // with `::` (buildQualifiedName in tree-sitter.ts) regardless of source
+  // language, but an extends/implements clause's own text is recorded
+  // verbatim from the language's own syntax — so a Java/C# dotted supertype
+  // (`Outer.Inner`, `IFoo.Stub`) never matched a real indexed type's
+  // `::`-joined qualifiedName without normalizing the separator first.
+  // Scoped to ONLY inheritance references: several non-generic extractors
+  // (MyBatis XML statements, for one) deliberately build a MIXED
+  // qualifiedName that keeps literal dots from an already-dotted Java
+  // package/namespace string and adds `::` only at one specific boundary —
+  // blanket-normalizing every reference's dots to `::` mangled those.
+  const normalizedQualifiedRef = isInheritanceRef(ref)
+    ? ref.referenceName.replace(/\./g, '::')
+    : ref.referenceName;
+  const candidates = keepForRef(context.getNodesByQualifiedName(normalizedQualifiedRef));
 
   if (candidates.length === 1) {
     return {
@@ -909,9 +947,28 @@ export function matchByQualifiedName(
   const parts = ref.referenceName.split(/[:.]/);
   const lastName = parts[parts.length - 1];
   if (lastName) {
+    // The strict `::`-boundary check only matters where normalization
+    // actually ran (inheritance refs) — every other reference kind keeps
+    // the original, deliberately loose `endsWith` (e.g. Expo's JS call site
+    // binds a shortened alias like `Haptics` that only matches the END of
+    // the native module's `...::ExpoHaptics.method` qualifiedName by design,
+    // with no `::` immediately before it).
     const partialCandidates = keepForRef(context.getNodesByName(lastName))
-      .filter((candidate) => candidate.qualifiedName.endsWith(ref.referenceName));
-    const chosen = preferCallSiteFile(partialCandidates, ref.filePath)[0];
+      .filter((candidate) =>
+        isInheritanceRef(ref)
+          ? endsWithQualifiedSegment(candidate.qualifiedName, normalizedQualifiedRef)
+          : candidate.qualifiedName.endsWith(normalizedQualifiedRef)
+      );
+    // `RecyclerView.LayoutManager` can exist in both AndroidX and the
+    // framework. For inheritance, pick the uniquely closest source tree;
+    // an equal-distance tie has no safe target.
+    const closest = isInheritanceRef(ref) && partialCandidates.length > 1
+      ? partialCandidates.map((node) => ({ node, distance: computePathProximity(ref.filePath, node.filePath) }))
+          .sort((a, b) => b.distance - a.distance)
+      : null;
+    const chosen = closest
+      ? (closest[0]!.distance > closest[1]!.distance ? closest[0]!.node : null)
+      : preferCallSiteFile(partialCandidates, ref.filePath)[0];
     if (chosen) {
       return {
         original: ref,
@@ -1052,6 +1109,11 @@ export function resolveMethodOnType(
   /** Recursion guard for the supertype/conformance walk. */
   depth = 0,
 ): ResolvedRef | null {
+  // This helper resolves a receiver's invoked member, never a type/member
+  // reference such as Java `class Foo extends IBar.Stub`. Keep the guard here
+  // as a backstop for every current and future caller of this call-only API.
+  if (ref.referenceKind !== 'calls') return null;
+
   // Look up methods by name and match by qualifiedName ending in
   // `<typeName>::<methodName>`. This works whether the method is defined
   // in-class (`class Foo { int bar() { ... } }`) or out-of-line in a separate
@@ -1374,6 +1436,7 @@ export function matchCppCallChain(
   ref: UnresolvedRef,
   context: ResolutionContext,
 ): ResolvedRef | null {
+  if (ref.referenceKind !== 'calls') return null;
   const m = ref.referenceName.match(/^(.+)\(\)\.(\w+)$/);
   if (!m || !m[1] || !m[2]) return null;
   const cls = resolveCppCallResultType(m[1], ref, context);
@@ -1396,6 +1459,7 @@ export function matchScopedCallChain(
   ref: UnresolvedRef,
   context: ResolutionContext,
 ): ResolvedRef | null {
+  if (ref.referenceKind !== 'calls') return null;
   const m = ref.referenceName.match(/^(.+)\(\)\.(\w+)$/);
   if (!m || !m[1] || !m[2]) return null;
   const inner = m[1];
@@ -1435,6 +1499,7 @@ export function matchDottedCallChain(
   ref: UnresolvedRef,
   context: ResolutionContext,
 ): ResolvedRef | null {
+  if (ref.referenceKind !== 'calls') return null;
   const m = ref.referenceName.match(/^(.+)\(\)\.(\w+)$/);
   if (!m || !m[1] || !m[2]) return null;
   const inner = m[1]; // `Foo.getInstance`
@@ -1566,14 +1631,22 @@ function inferJavaFieldReceiverType(
   if (!enclosing) return null;
 
   const enclosingEnd = enclosing.endLine ?? enclosing.startLine;
+  // Kotlin indexes a `val` property as a `constant`, a `var` as a `field`, and
+  // a companion-object property as a `variable`.
   const field = inFile.find(
     (n) =>
-      n.kind === 'field' &&
+      (n.kind === 'field' || (ref.language === 'kotlin' && (n.kind === 'constant' || n.kind === 'variable'))) &&
       n.name === receiverName &&
       n.language === ref.language &&
       n.startLine >= enclosing.startLine &&
       (n.endLine ?? n.startLine) <= enclosingEnd,
   );
+  // Kotlin keeps no signature on a property, and a primary-constructor
+  // property (`class A(private val repo: Repo)`) is no node at all, so the
+  // declared type has to be read from the declaration itself.
+  if (ref.language === 'kotlin') {
+    return inferKotlinPropertyType(receiverName, field ?? null, enclosing, inFile, ref, context);
+  }
   if (!field || !field.signature) return null;
 
   // Signature shape: "<TypeName> <fieldName>" (extractField). Pull the type,
@@ -1592,6 +1665,514 @@ function inferJavaFieldReceiverType(
   if (!lastPart) return null;
   if (!/^[A-Z]/.test(lastPart)) return null; // primitives / lowercase → skip
   return lastPart;
+}
+
+/**
+ * The declared type of a Kotlin property named `name` in class `owner`: from
+ * the property's own declaration lines when it is a node (`lateinit var repo:
+ * Repo`, `val repo = Repo(…)`), otherwise from the class header, where a
+ * primary-constructor property (`class A(private val repo: Repo)`) lives. The
+ * header is the class's lines before its first member, so a same-named local
+ * inside a method body is never read as the property. Returns null when no
+ * declaration names a type; resolveMethodOnType still validates the method.
+ */
+function inferKotlinPropertyType(
+  name: string,
+  property: Node | null,
+  owner: Node,
+  inFile: Node[],
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  const lines = kotlinFileLines(ref.filePath, context);
+  if (!lines) return null;
+
+  if (property) {
+    const text = lines.slice(Math.max(0, property.startLine - 1), Math.min(lines.length, property.endLine ?? property.startLine));
+    return kotlinDeclaredTypeIn(text.join('\n'), name, ref, context);
+  }
+  return kotlinDeclaredTypeIn(kotlinClassHeader(owner, inFile, lines), name, ref, context);
+}
+
+/** A file's lines through the context's per-file cache; null when unreadable. */
+function kotlinFileLines(filePath: string, context: ResolutionContext): string[] | null {
+  const lines = context.getFileLines
+    ? context.getFileLines(filePath)
+    : (context.readFile(filePath)?.split(/\r?\n/) ?? null);
+  return lines && lines.length > 0 ? lines : null;
+}
+
+/**
+ * A Kotlin class's lines before its first member: its annotations, name,
+ * primary constructor and supertype list.
+ */
+function kotlinClassHeader(owner: Node, inFile: Node[], lines: string[]): string {
+  const ownerEnd = owner.endLine ?? owner.startLine;
+  let firstMember = ownerEnd + 1;
+  for (const n of inFile) {
+    if (n.id === owner.id || n.kind === 'file') continue;
+    if (n.startLine > owner.startLine && n.startLine <= ownerEnd && n.startLine < firstMember) {
+      firstMember = n.startLine;
+    }
+  }
+  return lines.slice(Math.max(0, owner.startLine - 1), Math.min(lines.length, firstMember - 1)).join('\n');
+}
+
+/**
+ * The supertype names a Kotlin class header lists after its primary
+ * constructor (`class A(…) : Base(…), Iface<T>, Api by impl {`), as
+ * kotlinTypeName gives them. Colons and commas inside the constructor or
+ * type arguments are skipped; a `where` clause or the body ends the list.
+ */
+function kotlinSupertypeNames(header: string, className: string): string[] {
+  const r = className.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const decl = new RegExp(`\\b(?:class|object|interface)\\s+${r}\\b`).exec(header);
+  if (!decl) return [];
+  const entries: string[] = [];
+  let paren = 0;
+  let angle = 0;
+  let start = -1;
+  let i = decl.index + decl[0].length;
+  for (; i < header.length; i++) {
+    const c = header[i]!;
+    if (c === '(') paren++;
+    else if (c === ')') paren--;
+    else if (paren > 0) continue;
+    else if (c === '<') angle++;
+    else if (c === '>') angle--;
+    else if (angle > 0) continue;
+    else if (c === '{') break;
+    else if (start >= 0 && c === 'w' && /^where\b/.test(header.slice(i, i + 6)) && !/\w/.test(header[i - 1] ?? '')) break;
+    else if (c === ':' && start < 0) start = i + 1;
+    else if (c === ',' && start >= 0) {
+      entries.push(header.slice(start, i));
+      start = i + 1;
+    }
+  }
+  if (start >= 0) entries.push(header.slice(start, i));
+  const names: string[] = [];
+  for (const entry of entries) {
+    const m = entry.match(/^\s*(?:@\w+\s+)*([A-Za-z_][\w.]*)/);
+    const type = m && m[1] ? kotlinTypeName(m[1]) : null;
+    if (type) names.push(type);
+  }
+  return names;
+}
+
+/**
+ * The declared type of Kotlin property `name` if class `owner` declares it —
+ * as a member node or a primary-constructor `val`/`var` — read in the
+ * owner's own file. Undefined when the owner does not declare it; null when
+ * it does without a type the declaration names.
+ */
+function kotlinOwnPropertyType(
+  name: string,
+  owner: Node,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null | undefined {
+  const inFile = context.getNodesInFile(owner.filePath);
+  const qualified = `${owner.qualifiedName}::${name}`;
+  const property = inFile.find(
+    (n) => (n.kind === 'field' || n.kind === 'constant' || n.kind === 'variable') && n.qualifiedName === qualified,
+  ) ?? null;
+  if (!property) {
+    const lines = kotlinFileLines(owner.filePath, context);
+    const r = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (!lines || !new RegExp(`\\b(?:val|var)\\s+${r}\\b`).test(kotlinClassHeader(owner, inFile, lines))) {
+      return undefined;
+    }
+  }
+  // Read the declaration in the owner's file, as if the ref sat there.
+  const at: UnresolvedRef = { ...ref, filePath: owner.filePath, line: property?.startLine ?? owner.startLine };
+  return inferKotlinPropertyType(name, property, owner, inFile, at, context);
+}
+
+/**
+ * The declared type of Kotlin property `name` that class `owner` inherits: the
+ * nearest project supertype (breadth-first, at most four levels) declaring it,
+ * with supertypes read from each class header. A supertype the project does
+ * not declare, or whose name is ambiguous, is not walked — the property may
+ * come from it — so the result is then null (unknown), never external.
+ */
+function kotlinInheritedPropertyType(
+  name: string,
+  owner: Node,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  const seen = new Set<string>([owner.id]);
+  let level: Node[] = [owner];
+  for (let depth = 0; depth < 4 && level.length > 0; depth++) {
+    const next: Node[] = [];
+    for (const cls of level) {
+      const lines = kotlinFileLines(cls.filePath, context);
+      if (!lines) continue;
+      const header = kotlinClassHeader(cls, context.getNodesInFile(cls.filePath), lines);
+      for (const superName of kotlinSupertypeNames(header, cls.name)) {
+        const simple = superName.split('::').pop()!;
+        const supers = context.getNodesByName(simple).filter(
+          (n) => (n.kind === 'class' || n.kind === 'interface') && n.language === 'kotlin' &&
+            (n.qualifiedName === superName || n.qualifiedName.endsWith(`::${superName}`)),
+        );
+        if (supers.length !== 1 || seen.has(supers[0]!.id)) continue;
+        const sup = supers[0]!;
+        seen.add(sup.id);
+        const type = kotlinOwnPropertyType(name, sup, ref, context);
+        if (type !== undefined) return type;
+        next.push(sup);
+      }
+    }
+    level = next;
+  }
+  return null;
+}
+
+
+/** Node kinds that declare a type a receiver can have. */
+const DECLARED_TYPE_KINDS = new Set<Node['kind']>([
+  'class', 'interface', 'struct', 'enum', 'type_alias', 'trait', 'protocol', 'union',
+]);
+
+/**
+ * Whether the project declares `typeName` (simple, or `Outer::Inner`) in the
+ * ref's language family. False for library types (`Regex`, `Properties`).
+ */
+function isProjectType(typeName: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const simple = typeName.split('::').pop()!;
+  return context.getNodesByName(simple).some(
+    (n) =>
+      DECLARED_TYPE_KINDS.has(n.kind) &&
+      sameLanguageFamily(n.language, ref.language) &&
+      (!typeName.includes('::') || n.qualifiedName === typeName || n.qualifiedName.endsWith(`::${typeName}`)),
+  );
+}
+
+/**
+ * A Kotlin type written in source (`Lease?`, `HardwareLock.Lease`,
+ * `List<Foo>`) as a name resolveMethodOnType matches: nullability and type
+ * arguments dropped, a nested type joined with `::`, a package prefix
+ * (lowercase segments) dropped. Null when it is not a type name.
+ */
+function kotlinTypeName(raw: string): string | null {
+  const cleaned = raw.replace(/<[^>]*>/g, '').replace(/\?/g, '').trim();
+  const segments = cleaned.split('.').filter(Boolean);
+  let first = segments.length;
+  while (first > 0 && /^[A-Z]\w*$/.test(segments[first - 1]!)) first--;
+  const typeSegments = segments.slice(first);
+  return typeSegments.length > 0 ? typeSegments.join('::') : null;
+}
+
+/**
+ * Stands for "a type the project does not declare" — a library class, or the
+ * result of a call on one — so the caller can refuse a name-only guess.
+ */
+export const KOTLIN_EXTERNAL_TYPE = '\u0000external';
+
+/**
+ * The type a Kotlin declaration of `name` in `text` gives it: `name: Type`, a
+ * constructor call `name = Type(…)`, or a call `name = Owner.fn(…)` /
+ * `name = fn(…)`, typed by `fn`'s declared return type. KOTLIN_EXTERNAL_TYPE
+ * when the owner is not a project type; null when nothing names a type.
+ */
+function kotlinDeclaredTypeIn(
+  text: string,
+  name: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  depth = 0,
+): string | null {
+  const r = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const typed = text.match(new RegExp(`\\b(?:val|var)\\s+${r}\\s*:\\s*([A-Z][\\w.]*)`));
+  if (typed && typed[1]) return kotlinTypeName(typed[1]);
+  // An alias of another value: `val old = ws`, `val s = current ?: return`,
+  // `val s = current!!` — typed as that value.
+  const alias = text.match(new RegExp(`\\b(?:val|var)\\s+${r}\\s*=\\s*([a-z_]\\w*)\\s*(?:!!|\\?:\\s*(?:return|continue|break|throw)\\b[^\\n]*)?\\s*$`, 'm'));
+  if (alias && alias[1] && alias[1] !== name && depth < 3) {
+    return kotlinReceiverDeclaredType(alias[1], ref, context, depth + 1);
+  }
+  // `(` or a trailing lambda `{`: `Thread { … }`, `thread { … }`.
+  // Type arguments are skipped: `WebRtcPlaneSession<IceCandidate>(plane)`.
+  const assigned = text.match(new RegExp(`\\b(?:val|var)\\s+${r}\\s*=\\s*([A-Za-z_][\\w.]*)\\s*(?:<[\\w\\s.,?*<>]*>\\s*)?[({]`));
+  if (!assigned || !assigned[1]) {
+    // An enum entry or other constant of a type: `var mode = GpsMode.ON`.
+    const entry = text.match(new RegExp(`\\b(?:val|var)\\s+${r}\\s*=\\s*([A-Z]\\w*(?:\\.[A-Z]\\w*)*)\\.[A-Z][A-Z0-9_]*\\b(?!\\s*[.(])`));
+    if (!entry || !entry[1]) return null;
+    // Only an entry of a project enum names its type; `Limits.MAX` is an Int.
+    const type = kotlinTypeName(entry[1]);
+    const simple = type?.split('::').pop();
+    return simple && context.getNodesByName(simple).some(
+      (n) => n.kind === 'enum' && sameLanguageFamily(n.language, ref.language),
+    ) ? type : null;
+  }
+  const segments = assigned[1].split('.');
+  const last = segments.pop()!;
+  if (/^[A-Z]/.test(last)) return kotlinTypeName(assigned[1]);
+  // A call. Only an owner written as a type chain (`Lock.tryBegin`) or none at
+  // all (`beginOp()`) can be typed; `a.b.fn()` goes through values.
+  if (segments.length > 0 && !segments.every((seg) => /^[A-Z]/.test(seg))) return null;
+  if (segments.length === 0 && KOTLIN_ARGUMENT_PASSTHROUGH.has(last)) {
+    const arg = text.match(new RegExp(`\\b${last}\\s*\\(\\s*([A-Za-z_]\\w*)\\s*[,)]`));
+    if (!arg || !arg[1] || arg[1] === name) return null;
+    // The argument is a parameter or local of the same scope.
+    const argType = inferLocalReceiverType(arg[1], ref, context);
+    return argType && /^[A-Z]/.test(argType) ? argType : null;
+  }
+  return kotlinCallResultType(segments.length > 0 ? segments.join('::') : undefined, last, ref, context);
+}
+
+/** Kotlin stdlib functions whose result is always a library type. */
+const KOTLIN_LIBRARY_FACTORIES = new Set([
+  'listOf', 'mutableListOf', 'arrayListOf', 'emptyList', 'listOfNotNull',
+  'setOf', 'mutableSetOf', 'hashSetOf', 'linkedSetOf', 'sortedSetOf', 'emptySet',
+  'mapOf', 'mutableMapOf', 'hashMapOf', 'linkedMapOf', 'sortedMapOf', 'emptyMap',
+  'arrayOf', 'arrayOfNulls', 'emptyArray', 'intArrayOf', 'longArrayOf', 'byteArrayOf',
+  'sequenceOf', 'emptySequence', 'buildList', 'buildSet', 'buildMap', 'buildString',
+  'lazy', 'thread', 'mutableStateOf', 'Channel', 'MutableStateFlow', 'MutableSharedFlow',
+]);
+
+/** Stdlib functions that return their (non-null) argument: `requireNotNull(x)`. */
+const KOTLIN_ARGUMENT_PASSTHROUGH = new Set(['requireNotNull', 'checkNotNull']);
+
+/**
+ * The declared return type of Kotlin `owner.fn` (or of an unqualified `fn`, a
+ * method of the ref's own class first, then one in the same file). Every
+ * candidate must declare the same return type. A return type nested in the
+ * callee's owner keeps that owner (`Lease` in `HardwareLock` →
+ * `HardwareLock::Lease`). KOTLIN_EXTERNAL_TYPE for a call on a type the
+ * project does not declare (`Executors.newSingleThreadScheduledExecutor()`).
+ */
+function kotlinCallResultType(
+  owner: string | undefined,
+  fn: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  if (owner && !isProjectType(owner, ref, context)) return KOTLIN_EXTERNAL_TYPE;
+  let candidates = context.getNodesByName(fn).filter(
+    (n) => (n.kind === 'method' || n.kind === 'function') && n.language === 'kotlin' && !!n.signature,
+  );
+  if (owner) {
+    candidates = candidates.filter((n) => n.qualifiedName.endsWith(`${owner}::${fn}`));
+  } else {
+    const ownClass = context.getNodesInFile(ref.filePath)
+      .filter((n) => (n.kind === 'class' || n.kind === 'interface') && n.startLine <= ref.line && (n.endLine ?? n.startLine) >= ref.line)
+      .sort((a, b) => b.startLine - a.startLine)[0];
+    const inOwnClass = ownClass
+      ? candidates.filter((n) => n.qualifiedName === `${ownClass.qualifiedName}::${fn}`)
+      : [];
+    const inFile = candidates.filter((n) => n.filePath === ref.filePath);
+    candidates = inOwnClass.length > 0 ? inOwnClass : inFile.length > 0 ? inFile : candidates;
+  }
+  // No project function of that name. A known stdlib factory returns a
+  // library type; any other library function (`requireNotNull`, `let`) may
+  // return a project value, so its result stays unknown.
+  if (candidates.length === 0) return !owner && KOTLIN_LIBRARY_FACTORIES.has(fn) ? KOTLIN_EXTERNAL_TYPE : null;
+
+  let result: string | null = null;
+  for (const c of candidates) {
+    const sig = c.signature!;
+    const at = sig.lastIndexOf('):');
+    if (at < 0) return null;
+    let type = kotlinTypeName(sig.slice(at + 2));
+    if (!type) return null;
+    if (!type.includes('::')) {
+      const container = c.qualifiedName.slice(0, c.qualifiedName.lastIndexOf('::'));
+      const containerName = container.split('::').pop();
+      if (containerName && context.getNodesByQualifiedName(`${container}::${type}`).some((n) => DECLARED_TYPE_KINDS.has(n.kind))) {
+        type = `${containerName}::${type}`;
+      }
+    }
+    if (result !== null && result !== type) return null;
+    result = type;
+  }
+  return result;
+}
+
+/**
+ * The declared type of Kotlin receiver `name` at `ref`: the nearest local
+ * declaration in the enclosing scope (typed, constructed, or bound to a call),
+ * else a property of the enclosing class, else a parameter, else a property
+ * the enclosing class inherits. Null when none names a type.
+ */
+function kotlinReceiverDeclaredType(
+  name: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+  depth = 0,
+): string | null {
+  const lines = kotlinFileLines(ref.filePath, context);
+  let localDeclared = false;
+  if (lines) {
+    const r = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const declares = new RegExp(`\\b(?:val|var)\\s+${r}\\b`);
+    for (const i of kotlinLocalScanLines(ref, context, lines.length)) {
+      const line = lines[i];
+      if (!line || line.length > 10_000 || !declares.test(line)) continue;
+      const local = kotlinDeclaredTypeIn(line, name, ref, context, depth);
+      if (local) return local;
+      localDeclared = true;
+      break;
+    }
+  }
+  const property = inferJavaFieldReceiverType(name, ref, context);
+  if (property) return property;
+  // A typed parameter of the enclosing function or lambda (`webSocket:
+  // WebSocket` in an overridden callback).
+  const param = inferLocalReceiverType(name, ref, context);
+  if (param) return /^[A-Z]/.test(param) ? param : null;
+  if (localDeclared) return null;
+  // A property of a superclass: `viewModel` declared in `BaseActivity`.
+  const owner = kotlinEnclosingClass(ref, context);
+  if (!owner || kotlinOwnPropertyType(name, owner, ref, context) !== undefined) return null;
+  return kotlinInheritedPropertyType(name, owner, ref, context);
+}
+
+/** The tightest Kotlin class or interface enclosing `ref`'s line. */
+function kotlinEnclosingClass(ref: UnresolvedRef, context: ResolutionContext): Node | undefined {
+  return context.getNodesInFile(ref.filePath)
+    .filter((n) => (n.kind === 'class' || n.kind === 'interface') && n.language === 'kotlin' &&
+      n.startLine <= ref.line && (n.endLine ?? n.startLine) >= ref.line)
+    .sort((a, b) => b.startLine - a.startLine)[0];
+}
+
+/**
+ * The 0-based lines a Kotlin local visible at `ref` may be declared on,
+ * nearest first: the enclosing function above the call, then — when that
+ * function is nested in another (a member of an anonymous object, a local
+ * function) — each outer function above the nested one, whose locals it
+ * captures. Lines of a function nested in a scanned one that does not
+ * enclose `ref` are skipped: its locals are not visible. Outside any
+ * function, every line above the call.
+ */
+function kotlinLocalScanLines(ref: UnresolvedRef, context: ResolutionContext, lineCount: number): number[] {
+  const callIdx = Math.max(0, Math.min(lineCount - 1, ref.line - 1));
+  const fns = context.getNodesInFile(ref.filePath).filter(
+    (n) => (n.kind === 'function' || n.kind === 'method') && n.language === 'kotlin',
+  );
+  const enclosing = fns
+    .filter((n) => n.startLine <= ref.line && (n.endLine ?? n.startLine) >= ref.line)
+    .sort((a, b) => b.startLine - a.startLine);
+  const out: number[] = [];
+  if (enclosing.length === 0) {
+    for (let i = callIdx; i >= 0; i--) out.push(i);
+    return out;
+  }
+  let hi = callIdx;
+  for (const fn of enclosing) {
+    const fnEnd = fn.endLine ?? fn.startLine;
+    const hidden = fns.filter(
+      (n) => n.startLine > fn.startLine && (n.endLine ?? n.startLine) <= fnEnd &&
+        !(n.startLine <= ref.line && (n.endLine ?? n.startLine) >= ref.line),
+    );
+    for (let i = hi; i >= fn.startLine - 1; i--) {
+      if (!hidden.some((n) => i + 1 >= n.startLine && i + 1 <= (n.endLine ?? n.startLine))) out.push(i);
+    }
+    hi = Math.min(hi, fn.startLine - 2);
+  }
+  return out;
+}
+
+/**
+ * The declared type of a Kotlin receiver chain `a.b.c` / `this.a.b`: the first
+ * value typed as a single receiver (`this` is the enclosing class, a type name
+ * its object or companion), each next segment as a property or enum entry
+ * declared in the class of the type before it, read from that class's own
+ * file. KOTLIN_EXTERNAL_TYPE as soon as a segment has a
+ * type the project does not declare; null when any segment's type is unknown
+ * (an inherited property, an ambiguous class name).
+ */
+function kotlinChainDeclaredType(
+  receiver: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | null {
+  const segments = receiver.split('.');
+  if (segments.length < 2 || segments.length > 4) return null;
+
+  let owner: Node | undefined;
+  if (segments[0] === 'this') {
+    owner = kotlinEnclosingClass(ref, context);
+    if (!owner) return null;
+  }
+  let type: string | null = owner ? null : kotlinReceiverDeclaredType(segments[0]!, ref, context);
+  if (!owner && !type && /^[A-Z]/.test(segments[0]!)) {
+    // An object or a class's companion: `Registry.current.load()`,
+    // `Mode.ON.next()`.
+    const classes = context.getNodesByName(segments[0]!).filter(
+      (n) => DECLARED_TYPE_KINDS.has(n.kind) && n.language === 'kotlin',
+    );
+    if (classes.length !== 1) return null;
+    owner = classes[0]!;
+  }
+  for (const segment of segments.slice(1)) {
+    if (!owner) {
+      if (!type) return null;
+      if (type === KOTLIN_EXTERNAL_TYPE || !isProjectType(type, ref, context)) return KOTLIN_EXTERNAL_TYPE;
+      const t = type;
+      const classes = context.getNodesByName(t.split('::').pop()!).filter(
+        (n) => DECLARED_TYPE_KINDS.has(n.kind) && n.language === 'kotlin' &&
+          (n.qualifiedName === t || n.qualifiedName.endsWith(`::${t}`)),
+      );
+      if (classes.length !== 1) return null;
+      owner = classes[0]!;
+    }
+    const inFile = context.getNodesInFile(owner.filePath);
+    const qualified = `${owner.qualifiedName}::${segment}`;
+    if (inFile.some((n) => n.kind === 'enum_member' && n.qualifiedName === qualified)) {
+      // An enum entry has its enum's type (`Outer::Mode`, package dropped).
+      type = kotlinTypeName(owner.qualifiedName.split('::').join('.'));
+      owner = undefined;
+      continue;
+    }
+    const own = kotlinOwnPropertyType(segment, owner, ref, context);
+    type = own !== undefined ? own : kotlinInheritedPropertyType(segment, owner, ref, context);
+    owner = undefined;
+  }
+  return type;
+}
+
+/** A Kotlin call through a receiver chain: `a.b.m`, `this.a.m`, `a.b.c.d.m`. */
+const KOTLIN_CHAIN_REF = /^((?:this|[A-Za-z_]\w*)(?:\.[A-Za-z_]\w*){1,3})\.(\w+)$/;
+
+/**
+ * A Kotlin call through a receiver chain (`engine.pump.drain()`), resolved on
+ * the chain's declared type. Null — no edge — when the chain ends in a type
+ * the project does not declare (or passes through one) and the project has
+ * no extension of that name on a library type. When the type is
+ * unknown, `{ method }` names the bare method for the caller to resolve, the
+ * ref the extractor emitted before it kept the chain. Undefined for a ref
+ * that is not a receiver chain.
+ */
+export function matchKotlinReceiverChain(
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null | { method: string } | undefined {
+  const m = ref.referenceName.match(KOTLIN_CHAIN_REF);
+  if (!m) return undefined;
+  const method = m[2]!;
+  const declared = kotlinChainDeclaredType(m[1]!, ref, context);
+  if (!declared) return { method };
+  if (declared !== KOTLIN_EXTERNAL_TYPE) {
+    const typed = resolveMethodOnType(declared, method, ref, context, 0.9, 'instance-method');
+    if (typed) return typed;
+    if (isProjectType(declared, ref, context)) return { method };
+  }
+  // A library type still reaches the project's own extensions of library
+  // types (`view.context.dp(8)` → `fun Context.dp()`).
+  return kotlinDeclaresLibraryExtension(method, ref, context) ? { method } : null;
+}
+
+/**
+ * Whether the project declares a Kotlin extension `method` on a type it does
+ * not declare itself (`fun Context.dp(…)`, indexed as `Context::dp`).
+ */
+function kotlinDeclaresLibraryExtension(method: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  return context.getNodesByName(method).some((n) => {
+    if ((n.kind !== 'method' && n.kind !== 'function') || n.language !== 'kotlin') return false;
+    const owner = n.qualifiedName.split('::').slice(-2, -1)[0];
+    return !!owner && /^[A-Z]/.test(owner) && !isProjectType(owner, ref, context);
+  });
 }
 
 // ── Local-variable receiver-type inference (#1108) ──────────────────────────
@@ -2286,6 +2867,12 @@ export function matchMethodCall(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  // A dotted/scoped name is not necessarily an invocation: Java inheritance
+  // refs such as `IBar.Stub` have the same surface shape. Let type-reference
+  // strategies handle non-call refs rather than falling through to the
+  // same-named-method heuristics below.
+  if (ref.referenceKind !== 'calls') return null;
+
   // Parse method call patterns like "obj.method" or "Class::method". The method
   // part allows trailing `:` keywords so Objective-C selectors resolve
   // (`SDImageCache.storeImage:`, `obj.setX:y:`); colons never appear in other
@@ -2495,6 +3082,26 @@ export function matchMethodCall(
     }
   }
 
+  // Kotlin: a receiver whose type is known — a local bound to a call
+  // (`val lease = HardwareLock.tryBegin()`, typed by the callee's declared
+  // return type), a local constructor call, or a property — resolves on that
+  // type. A type the project does not declare (`Regex`, `Properties`, a JDK or
+  // Android class) has none of the project's methods, so the call gets NO
+  // edge instead of the name-only guesses below, which bind it to whatever
+  // project class declares a method of the same name.
+  if (ref.language === 'kotlin' && dotMatch && !objectOrClass!.includes('.')) {
+    const declared = nmTimedT('mc-kt-declared', ref, () =>
+      kotlinReceiverDeclaredType(objectOrClass!, ref, context));
+    if (declared === KOTLIN_EXTERNAL_TYPE) return null;
+    if (declared) {
+      const typedMatch = nmTimedT('mc-rmot', ref, () => resolveMethodOnType(
+        declared, methodName!, ref, context, 0.9, 'instance-method',
+      ));
+      if (typedMatch) return typedMatch;
+      if (!isProjectType(declared, ref, context)) return null;
+    }
+  }
+
   // Object-literal namespace receiver (#1573): `api.call()` where `api` is a
   // same-file `const api = { call() {…}, get: () => {…} }`. Its members are
   // plain functions with bare names inside the constant's extent — no
@@ -2607,7 +3214,7 @@ export function matchMethodCall(
       return null;
     }
     const methods = methodCandidates.filter(
-      (n) => n.kind === 'method' && n.name === methodName
+      (n) => n.kind === 'method' && n.name === methodName && isLexicallyReachable(n, ref, context)
     );
 
     // Filter to same-language candidates first
@@ -3393,12 +4000,12 @@ export function matchFuzzy(
   // Use pre-built lowercase index for O(1) lookup instead of scanning all nodes
   const candidates = context.getNodesByLowerName(lowerName);
 
-  // Filter to callable kinds only (function, method, class)
-  const callableKinds = new Set(['function', 'method', 'class']);
-  const callableCandidates = applyLanguageGate(
-    candidates.filter((n) => callableKinds.has(n.kind)),
-    ref
-  );
+  // Calls use callable kinds; inheritance is a type reference and must never
+  // fall through to a same-named method/function (HIGH-1).
+  const eligibleCandidates = isInheritanceRef(ref)
+    ? filterCandidatesForReference(ref, candidates)
+    : candidates.filter((n) => n.kind === 'function' || n.kind === 'method' || n.kind === 'class');
+  const callableCandidates = applyLanguageGate(eligibleCandidates, ref);
 
   // Prefer same-language matches
   const sameLanguageCandidates = callableCandidates.filter(n => n.language === ref.language);
