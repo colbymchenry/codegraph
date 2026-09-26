@@ -1016,6 +1016,26 @@ function pointerLineFor(filePath: string, nodes: readonly Node[]): string {
 const EPILOGUE_LOST_NOTE = '> (Trailing pointer list omitted for size. The source above is complete and verbatim — treat it as already Read. For anything this call did not cover, run another codegraph_explore with the specific names rather than reading those files.)';
 
 /**
+ * Whether `text` names `relPath` as a whole path, not as the start or end of a
+ * longer one: `src/app.ts` is not in `src/app.tsx`, and `app.ts` is not in
+ * `src/app.ts`. A following `.` or `/` only continues the path when a path
+ * character comes after it, so `src/app.ts.` at the end of a sentence counts.
+ */
+function mentionsPath(text: string, relPath: string): boolean {
+  const pathChar = /[\w-]/;
+  for (let at = text.indexOf(relPath); at !== -1; at = text.indexOf(relPath, at + 1)) {
+    const before = text[at - 1] ?? '';
+    if (pathChar.test(before) || before === '/' || before === '.') continue;
+    const end = at + relPath.length;
+    const after = text[end] ?? '';
+    if (pathChar.test(after)) continue;
+    if ((after === '.' || after === '/') && pathChar.test(text[end + 1] ?? '')) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
  * Per-file staleness banner emitted at the top of a tool response when the
  * file watcher has pending events for files referenced by the response.
  * The agent uses this to fall back to Read for those specific files
@@ -2070,10 +2090,10 @@ export class ToolHandler {
     const inResponse: PendingFile[] = [];
     const elsewhere: PendingFile[] = [];
     for (const p of pending) {
-      // Substring match against the project-relative POSIX path — that's
-      // exactly the format both the watcher and every codegraph response
-      // emit, so a plain includes() is sufficient and avoids regex pitfalls.
-      if (text.includes(p.path)) inResponse.push(p);
+      // Project-relative POSIX path — the format both the watcher and every
+      // codegraph response emit — matched as a whole path, so a pending
+      // `src/app.ts` isn't "referenced" by a response that shows `src/app.tsx`.
+      if (mentionsPath(text, p.path)) inResponse.push(p);
       else elsewhere.push(p);
     }
 
