@@ -35,6 +35,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 import * as fs from 'fs';
+import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
@@ -198,6 +199,25 @@ describe('Shared MCP daemon (issue #411)', () => {
     servers.length = 0;
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
+
+  it.runIf(process.platform !== 'win32')('stops despite a socket still waiting for its client hello (#1963)', async () => {
+    const server = spawnServer(tempDir);
+    servers.push(server);
+    sendInitialize(server.child, `file://${tempDir}`, 1);
+    await waitFor(() => findResponse(server.stdout, 1), 10000);
+    const pid = await waitFor(() => readLockPid(realRoot), 10000);
+    const raw = net.connect(getDaemonSocketPath(realRoot));
+    try {
+      await new Promise<void>((resolve, reject) => {
+        raw.once('data', () => resolve());
+        raw.once('error', reject);
+      });
+      process.kill(pid, 'SIGTERM');
+      expect(await waitProcessExit(pid, 1500)).toBe(true);
+    } finally {
+      raw.destroy();
+    }
+  }, 20000);
 
   it('two invocations share ONE detached daemon; both attach as proxies', async () => {
     const env = { CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS: '15000' };
@@ -394,9 +414,9 @@ describe('Shared MCP daemon (issue #411)', () => {
       params: { name: 'codegraph_status', arguments: {} },
     });
     const toolResponse = await waitFor(() => findResponse(second.stdout, 3), 5000);
-    expect(toolResponse).toMatchObject({
-      error: { message: expect.stringContaining('writer lock held') },
-    });
+    expect(toolResponse.error).toBeUndefined();
+    expect(toolResponse.result?.isError).not.toBe(true);
+    expect(JSON.stringify(toolResponse.result)).toContain('CodeGraph Status');
   }, 50000);
 
   it('does not replace a live legacy lock with a second daemon', async () => {
@@ -461,7 +481,7 @@ describe('Shared MCP daemon (issue #411)', () => {
     });
   }, 30000);
 
-  it('proxy falls back to direct mode on a daemon version mismatch', async () => {
+  it('proxy falls back to read-only mode on a daemon version mismatch', async () => {
     const net = await import('net');
     const sockPath = getDaemonSocketPath(realRoot);
     // Plant a live-pid lockfile so the launcher treats the lock as held, and a
@@ -501,9 +521,9 @@ describe('Shared MCP daemon (issue #411)', () => {
         params: { name: 'codegraph_status', arguments: {} },
       });
       const toolResponse = await waitFor(() => findResponse(server.stdout, 2), 5000);
-      expect(toolResponse).toMatchObject({
-        error: { message: expect.stringContaining('live daemon') },
-      });
+      expect(toolResponse.error).toBeUndefined();
+      expect(toolResponse.result?.isError).not.toBe(true);
+      expect(JSON.stringify(toolResponse.result)).toContain('CodeGraph Status');
       expect(fs.existsSync(path.join(realRoot, '.codegraph', 'writer.pid'))).toBe(false);
     } finally {
       await new Promise<void>((resolve) => miniServer.close(() => resolve()));

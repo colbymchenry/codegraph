@@ -170,6 +170,9 @@ export interface DaemonStartResult {
  */
 export class Daemon {
   private server: net.Server | null = null;
+  // Includes sockets waiting for the optional client hello, before a session
+  // exists. server.close() waits for these too, so stop must destroy them.
+  private acceptedSockets = new Set<net.Socket>();
   private clients = new Set<MCPSession>();
   /** Per-client peer pids from the optional client-hello, for the liveness sweep. */
   private clientPeers = new Map<MCPSession, { pid: number | null; hostPid: number | null }>();
@@ -362,6 +365,8 @@ export class Daemon {
       try { session.stop(); } catch { /* best-effort */ }
     }
     this.clients.clear();
+    for (const socket of this.acceptedSockets) socket.destroy();
+    this.acceptedSockets.clear();
     if (this.server) {
       await new Promise<void>((resolve) => this.server!.close(() => resolve()));
       this.server = null;
@@ -379,6 +384,9 @@ export class Daemon {
   }
 
   private handleConnection(socket: net.Socket): void {
+    if (this.stopping) { socket.destroy(); return; }
+    this.acceptedSockets.add(socket);
+    socket.once('close', () => this.acceptedSockets.delete(socket));
     // Hello first so the proxy can verify versions before piping any
     // application bytes. The proxy reads exactly one line, then forwards.
     const hello: DaemonHello = {
@@ -394,6 +402,7 @@ export class Daemon {
     // timeout, a non-hello first line, an early close — yields null pids and we
     // fall back to the socket-close lifecycle exactly as before (#692).
     void readClientHello(socket).then((peers) => {
+      if (this.stopping || socket.destroyed) { socket.destroy(); return; }
       const transport = new SocketTransport(socket);
       const session = new MCPSession(transport, this.engine, {
         explicitProjectPath: this.projectRoot,
