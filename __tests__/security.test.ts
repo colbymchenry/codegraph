@@ -344,6 +344,27 @@ describe('validateProjectPath — sensitive directory blocking', () => {
     }
   });
 
+  it.runIf(process.platform !== 'win32')('blocks a sensitive home directory that is itself a symlink', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ssh-link-'));
+    const home = path.join(dir, 'home');
+    const sshReal = path.join(dir, 'ssh-real');
+    const link = path.join(dir, 'project-link');
+    const originalHome = process.env.HOME;
+    try {
+      fs.mkdirSync(home);
+      fs.mkdirSync(sshReal);
+      fs.symlinkSync(sshReal, path.join(home, '.ssh'), 'dir');
+      fs.symlinkSync(path.join(home, '.ssh'), link, 'dir');
+      process.env.HOME = home;
+      expect(validateProjectPath(link)).toMatch(/sensitive directory/i);
+      expect(validateProjectPath(sshReal)).toMatch(/sensitive directory/i);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   // SENSITIVE_PATHS stores the Windows entries lowercase and validateProjectPath
   // matches via resolved.toLowerCase(), so 'C:\\Windows' and 'c:\\windows' are
   // both blocked. path.resolve is platform-specific, so this only runs on Windows.
