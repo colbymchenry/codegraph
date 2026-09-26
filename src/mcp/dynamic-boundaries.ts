@@ -64,6 +64,12 @@ interface FormSpec {
    * must leave this unset (the anchor relies on the slice ending at the match).
    */
   keyWindow?: number;
+  /**
+   * Final say on a regex match, for forms whose argument decides it: given the
+   * stripped and original text and the offset just past the match, return
+   * false to drop it.
+   */
+  accept?: (stripped: string, original: string, end: number) => boolean;
 }
 
 const JS_FAMILY = new Set(['typescript', 'javascript', 'tsx', 'jsx', 'vue', 'svelte', 'astro', 'arkts']);
@@ -72,6 +78,30 @@ const RB = new Set(['ruby']);
 const PHP = new Set(['php']);
 const JVM_CS_GO = new Set(['java', 'kotlin', 'scala', 'csharp', 'go']);
 const SWIFT_OBJC = new Set(['swift', 'objc', 'objcpp', 'objective-c']);
+
+/**
+ * Whether the call argument starting at `start` is anything but ONE complete
+ * string literal: `import('./a')` or a backtick string without a substitution
+ * is an ordinary import, while a template with a `${}` substitution, a
+ * concatenation or a bare expression picks the module at runtime. String
+ * contents are blank in `stripped` (quotes kept), so the substitution check
+ * reads `original` at the same offsets.
+ */
+function isRuntimeImportArgument(stripped: string, original: string, start: number): boolean {
+  let i = start;
+  while (/\s/.test(stripped[i] ?? '')) i++;
+  const quote = stripped[i];
+  if (quote === ')') return false; // `import()` — nothing to resolve
+  if (quote !== '"' && quote !== "'" && quote !== '`') return true;
+  const close = stripped.indexOf(quote, i + 1);
+  if (close === -1) return false;
+  if (quote === '`' && original.slice(i + 1, close).includes('${')) return true;
+  let j = close + 1;
+  while (/\s/.test(stripped[j] ?? '')) j++;
+  // `)` ends the call; `,` starts import()'s options argument. Anything else
+  // (`+`, `.concat(`, …) builds the specifier at runtime.
+  return stripped[j] !== ')' && stripped[j] !== ',';
+}
 
 /** Exactly one quoted literal and no concatenation → that literal is the key. */
 function singleStringLiteral(text: string): string | undefined {
@@ -99,7 +129,8 @@ const FORMS: FormSpec[] = [
     form: 'dynamic-import',
     label: 'dynamic import',
     langs: JS_FAMILY,
-    re: /\b(?:import|require)\s*\(\s*(?![\s'"`)])/g,
+    re: /\b(?:import|require)\s*\(/g,
+    accept: isRuntimeImportArgument,
   },
   {
     form: 'dynamic-import',
@@ -248,6 +279,7 @@ export function scanDynamicDispatch(body: string, language: string, fileStartLin
     spec.re.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = spec.re.exec(stripped)) !== null) {
+      if (spec.accept && !spec.accept(stripped, original, m.index + m[0].length)) continue;
       let sliceEnd = m.index + m[0].length;
       if (spec.keyWindow) {
         const windowEnd = Math.min(original.length, sliceEnd + spec.keyWindow);
