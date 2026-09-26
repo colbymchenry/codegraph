@@ -197,7 +197,7 @@ describe('codegraph_explore output respects the adaptive budget', () => {
     const result = await handler.execute('codegraph_explore', { query: 'Session method helper' });
     const text = result.content?.[0]?.text ?? '';
     expect(text).not.toContain('### Additional relevant files');
-    expect(text).not.toContain('Complete source code is included above');
+    expect(text).not.toContain('files is included above');
     expect(text).not.toContain('advisory only, NOT a quota');
   });
 
