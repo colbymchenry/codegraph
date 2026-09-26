@@ -31,7 +31,7 @@ import {
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
-import { isTestFile, normalizeNameToken } from '../search/query-utils';
+import { isTestFile, isTestPath, normalizeNameToken } from '../search/query-utils';
 import { groupDefinitions, lastQualifierPart, matchesSymbol } from '../graph/symbol-lookup';
 import { extractQueryPaths, queryMightContainPaths } from '../search/query-paths';
 import {
@@ -6290,6 +6290,7 @@ export class ToolHandler {
     }
 
     const filePath = resolved.path;
+    const testLabel = isTestPath(filePath) ? ' · test file' : '';
     const nodes = cg.getNodesInFile(filePath)
       .filter((n) => n.kind !== 'file' && n.kind !== 'import' && n.kind !== 'export')
       .sort((a, b) => a.startLine - b.startLine);
@@ -6313,7 +6314,7 @@ export class ToolHandler {
 
     // symbolsOnly → the cheap structural overview, no source.
     if (opts.symbolsOnly) {
-      const out = [`**${filePath}** — ${nodes.length} symbol${nodes.length === 1 ? '' : 's'}, ${depSummary}`, ''];
+      const out = [`**${filePath}**${testLabel} — ${nodes.length} symbol${nodes.length === 1 ? '' : 's'}, ${depSummary}`, ''];
       if (nodes.length) out.push(...symbolMap('**Symbols**'));
       else out.push('_No indexed symbols in this file._');
       out.push('', '> Drop `symbolsOnly` (or pass `offset`/`limit`) to read the source, like Read.');
@@ -6323,7 +6324,7 @@ export class ToolHandler {
     // SECURITY (#383): never dump a raw config/data file — a yaml/properties
     // line is `key: <secret>`. Summarize by key and point to a real Read.
     if (CONFIG_LEAF_LANGUAGES.has(resolved.language)) {
-      const out = [`**${filePath}** — configuration/data file, ${depSummary}`, ''];
+      const out = [`**${filePath}**${testLabel} — configuration/data file, ${depSummary}`, ''];
       if (nodes.length) out.push(...symbolMap('**Keys (values withheld for safety)**'));
       out.push('', '> Values may be secrets, so codegraph indexes keys only. Read the file directly if you need a value.');
       return this.textResult(this.truncateOutput(out.join('\n')));
@@ -6337,7 +6338,7 @@ export class ToolHandler {
       try { content = readFileSync(abs, 'utf-8'); } catch { content = null; }
     }
     if (content === null) {
-      const out = [`**${filePath}** — could not read from disk (it may have moved since indexing). ${depSummary}`, ''];
+      const out = [`**${filePath}**${testLabel} — could not read from disk (it may have moved since indexing). ${depSummary}`, ''];
       if (nodes.length) out.push(...symbolMap('**Symbols**'));
       out.push('', `> Read \`${filePath}\` directly for its current content.`);
       return this.textResult(this.truncateOutput(out.join('\n')));
@@ -6357,11 +6358,11 @@ export class ToolHandler {
     const DEFAULT_LIMIT = 2000;
     const offset = Math.max(1, opts.offset ?? 1);
     if (offset > total) {
-      return this.textResult(`**${filePath}** has ${total} line${total === 1 ? '' : 's'} — offset ${offset} is past the end. ${depSummary}`);
+      return this.textResult(`**${filePath}**${testLabel} has ${total} line${total === 1 ? '' : 's'} — offset ${offset} is past the end. ${depSummary}`);
     }
     const maxLines = Math.max(1, opts.limit ?? DEFAULT_LIMIT);
     const start = offset - 1; // 0-based
-    const header = `**${filePath}** — ${total} lines, ${nodes.length} symbol${nodes.length === 1 ? '' : 's'} · ${depSummary}`;
+    const header = `**${filePath}**${testLabel} — ${total} lines, ${nodes.length} symbol${nodes.length === 1 ? '' : 's'} · ${depSummary}`;
 
     // Numbered lines, byte-for-byte Read's shape: `<n>\t<line>`, no left-pad.
     const numbered: string[] = [];
