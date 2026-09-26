@@ -210,3 +210,53 @@ describe('MCP staleness banner', () => {
     expect(text.startsWith('⚠️')).toBe(false);
   });
 });
+
+describe('MCP staleness banner — matching whole paths (#1968)', () => {
+  let testDir: string;
+  let cg: CodeGraph;
+  let handler: ToolHandler;
+
+  beforeEach(async () => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-stale-paths-'));
+    fs.mkdirSync(path.join(testDir, 'src'));
+    fs.writeFileSync(path.join(testDir, 'src', 'app.tsx'), 'export function appView() { return 1; }\n');
+    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts', '**/*.tsx'], exclude: [] } });
+    await cg.indexAll();
+    handler = new ToolHandler(cg);
+    cg.watch({ debounceMs: 4000, inertForTests: true });
+    await cg.waitUntilWatcherReady();
+  });
+
+  afterEach(() => {
+    try { cg.unwatch(); } catch { /* ignore */ }
+    try { cg.close(); } catch { /* ignore */ }
+    if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  async function pend(rel: string): Promise<void> {
+    fs.writeFileSync(path.join(testDir, rel), 'export const edited = 1;\n');
+    __emitWatchEventForTests(testDir, rel);
+    await waitFor(() => cg.getPendingFiles().some((p) => p.path === rel));
+  }
+
+  it('does not name a pending file whose path only starts a path the response shows', async () => {
+    await pend('src/app.ts'); // the response shows src/app.tsx
+    const text = (await handler.execute('codegraph_search', { query: 'appView' })).content[0].text;
+    expect(text).toContain('src/app.tsx');
+    expect(text.startsWith('⚠️')).toBe(false);
+    expect(text).toMatch(/elsewhere in this project are pending index sync/);
+  });
+
+  it('does not name a pending file whose path only ends a path the response shows', async () => {
+    await pend('app.tsx'); // the response shows src/app.tsx
+    const text = (await handler.execute('codegraph_search', { query: 'appView' })).content[0].text;
+    expect(text.startsWith('⚠️')).toBe(false);
+    expect(text).toMatch(/elsewhere in this project are pending index sync/);
+  });
+
+  it('still names a pending file the response shows', async () => {
+    await pend('src/app.tsx');
+    const text = (await handler.execute('codegraph_search', { query: 'appView' })).content[0].text;
+    expect(text.startsWith('⚠️')).toBe(true);
+  });
+});
