@@ -719,4 +719,11 @@ export async function offerWatchFallback(
       'Run `codegraph sync` after changes instead.',
     );
   }
+  if (result.unsupported && result.unsupported.length > 0) {
+    clack.log.warn(
+      `Left your ${result.unsupported.join(', ')} hook${result.unsupported.length > 1 ? 's' : ''} unchanged — ` +
+      `${result.unsupported.length > 1 ? 'they are' : 'it is'} not a shell script. ` +
+      `Add \`codegraph sync ${projectPath}\` to ${result.unsupported.length > 1 ? 'them' : 'it'} to refresh the index there too.`,
+    );
+  }
 }
