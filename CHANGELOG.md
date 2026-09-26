@@ -162,6 +162,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- While auto-sync is off, `codegraph_search`, `codegraph_callers`, `codegraph_callees` and `codegraph_impact` likewise refuse an answer that names a file changed since its last sync, and name that file instead. (#1959)
+- While auto-sync is off, `codegraph_explore` no longer answers from files that changed since their last sync: it names them so they can be read directly, and keeps answering from files that did not change. (#1959)
+- `codegraph_status` over MCP now reports when files were last indexed and how many were added, changed or removed since, computed without blocking other requests, so a frozen index shows up as numbers rather than only a banner. (#1959)
+- After a long stretch of contention for the index lock, the next MCP call restarts file watching and runs a full catch-up instead of leaving auto-sync off for the rest of the session; answers say the index may be stale until the catch-up finishes. (#1959)
+- File watching no longer drops the full re-scan a removed directory asks for when that sync fails, so the deleted files leave the index instead of lingering. (#1964)
 - Daemon startup and cleanup now preserve live legacy PID-only locks while still reclaiming dead or identity-disproved records, preventing two writers from serving the same project.
 - Incremental sync now keeps edge rebinding crash-safe: replacing a resolved edge with its recovery reference commits atomically, so an interruption cannot permanently remove the relationship.
 - Status now detects committed but unindexed changes and restored edits without scanning every source file; thanks @inth3shadows. (#1829)

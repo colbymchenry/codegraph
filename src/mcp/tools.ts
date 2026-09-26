@@ -49,6 +49,7 @@ import {
   resolveNamedSymbolFlow,
 } from '../graph/named-symbol-flow';
 import { getUpdateNotice } from '../upgrade/update-check';
+import { measurePendingChanges } from './index-freshness';
 import { ExploreDiagnostics } from './explore-diagnostics';
 import {
   EXPLORE_EMISSION_KEY,
@@ -1074,6 +1075,15 @@ export function formatDegradedBanner(reason: string | null): string {
   );
 }
 
+/** Re-armed watches are not proof of freshness until their full scan commits. */
+export function formatRecoveringBanner(): string {
+  return (
+    '⚠️ CodeGraph auto-sync is RECOVERING — file watching restarted after lock contention, ' +
+    'but the full index catch-up has not completed. Read files directly to confirm ' +
+    'current content before relying on these results.'
+  );
+}
+
 /**
  * MCP Tool definition
  */
@@ -1353,7 +1363,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_status',
-    description: 'Index health check (files / nodes / edges). Skip unless debugging.',
+    description: 'Index health check: files, nodes, edges, last indexed time, and added/modified/removed counts. Skip unless debugging.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1941,6 +1951,17 @@ export class ToolHandler {
    */
   private driftCache = new Map<string, { at: number; stale: boolean }>();
   private static readonly DRIFT_TTL_MS = 2000;
+  /**
+   * Tools whose answer is read off the graph of the files it names, and so is
+   * refused like explore's when one of those files changed while auto-sync was
+   * off (#1959). codegraph_node is absent on purpose: its drift gate already
+   * serves a changed file's current bytes instead of the indexed slice (#1474).
+   */
+  private static readonly GRAPH_ANSWER_TOOLS = new Set([
+    'codegraph_search', 'codegraph_callers', 'codegraph_callees', 'codegraph_impact',
+  ]);
+  /** Bounds the per-call hashing a degraded-index check may do. */
+  private static readonly MAX_ANSWER_PATHS = 200;
 
   /**
    * On-disk drift check for a single indexed file (issue #1474). The code
@@ -1965,7 +1986,7 @@ export class ToolHandler {
    * are handled by the existing not-found paths, and a wrong "stale" flag
    * would needlessly push the agent back to Read.
    */
-  private isFileStaleOnDisk(cg: CodeGraph, relPath: string, content?: string): boolean {
+  private isFileStaleOnDisk(cg: CodeGraph, relPath: string, content?: string, forceHash = false): boolean {
     let root: string;
     try {
       root = cg.getProjectRoot();
@@ -1975,7 +1996,7 @@ export class ToolHandler {
     const key = `${root}\0${relPath}`;
     const now = Date.now();
     const hit = this.driftCache.get(key);
-    if (hit && now - hit.at < ToolHandler.DRIFT_TTL_MS) return hit.stale;
+    if (!forceHash && hit && now - hit.at < ToolHandler.DRIFT_TTL_MS) return hit.stale;
     let stale = false;
     try {
       const rec = cg.getFile(relPath);
@@ -1984,7 +2005,7 @@ export class ToolHandler {
         const st = statSync(absPath);
         // Same freshness test as the sync fast path (extraction/index.ts):
         // equal size + equal floored mtime ⇒ unchanged, no read needed.
-        if (st.size !== rec.size || Math.floor(st.mtimeMs) !== Math.floor(rec.modifiedAt)) {
+        if (forceHash || st.size !== rec.size || Math.floor(st.mtimeMs) !== Math.floor(rec.modifiedAt)) {
           const data = content ?? readFileSync(absPath, 'utf-8');
           // Must stay byte-identical to extraction's `hashContent` (sha256 over
           // the utf-8 string) — the identical-rewrite test in
@@ -1992,12 +2013,26 @@ export class ToolHandler {
           // to keep the extraction module off the MCP startup path.
           stale = createHash('sha256').update(data).digest('hex') !== rec.contentHash;
         }
+      } else if (forceHash) {
+        stale = true; // deleted/inaccessible since this response was rendered
       }
     } catch {
-      stale = false;
+      stale = forceHash;
     }
     this.driftCache.set(key, { at: now, stale });
     return stale;
+  }
+
+  /** Indexed files a graph tool's answer names as locations (#1959). */
+  private indexedPathsIn(cg: CodeGraph, result: ToolResult): string[] {
+    const head = result.content[0];
+    if (!head || head.type !== 'text') return [];
+    const found = new Set<string>();
+    for (const [token] of head.text.matchAll(/[\w@$+\-./]+\.\w+/g)) {
+      if (found.size >= ToolHandler.MAX_ANSWER_PATHS) break;
+      if (!found.has(token) && cg.getFile(token)) found.add(token);
+    }
+    return [...found];
   }
 
   private withStalenessNotice(result: ToolResult, projectPath?: string): ToolResult {
@@ -2043,6 +2078,10 @@ export class ToolHandler {
     if (degraded) {
       const [head, ...tail] = result.content;
       if (!head || head.type !== 'text') return result;
+      if (cg.isWatcherRecovering?.()) {
+        const composed = `${formatRecoveringBanner()}\n\n${head.text}`;
+        return { ...result, content: [{ type: 'text', text: composed }, ...tail] };
+      }
       let reason: string | null = null;
       try {
         reason = cg.getWatcherDegradedReason?.() ?? null;
@@ -2143,6 +2182,14 @@ export class ToolHandler {
         if (typeof check === 'object' && check !== undefined) return check;
       }
 
+      const project = await this.getCodeGraph(args.projectPath as string | undefined);
+      // Recover a watcher disabled by prolonged lock contention on the next call.
+      // The stale banner remains until the watcher finishes its full scan;
+      // frequent calls cannot bypass its cooldown (#1959).
+      if (project.rearmWatcherAfterLockContention?.()) {
+        process.stderr.write('[CodeGraph MCP] Re-armed file watcher; full catch-up pending.\n');
+      }
+
       // codegraph_status reports watcher state (pending files, degraded mode,
       // worktree warning) and embeds its own sections — it must run on the MAIN
       // thread against the watched default instance, so it is NEVER off-loaded to
@@ -2176,6 +2223,23 @@ export class ToolHandler {
       const raw = (this.queryPool && this.queryPool.healthy && this.queryPool.ready)
         ? await this.queryPool.run(toolName, dispatchArgs)
         : await this.executeReadTool(toolName, dispatchArgs);
+      if (project.isWatcherDegraded?.()) {
+        // Explore reports the files it rendered; the graph tools name theirs as
+        // `path:line` locations in the text (#1959).
+        const answeredFrom = toolName === 'codegraph_explore'
+          ? raw[EXPLORE_EMISSION_KEY]?.files?.map(file => file.path) ?? []
+          : ToolHandler.GRAPH_ANSWER_TOOLS.has(toolName) ? this.indexedPathsIn(project, raw) : [];
+        const stalePaths = answeredFrom.filter(file => this.isFileStaleOnDisk(project, file, undefined, true));
+        if (stalePaths.length > 0) {
+          // Do not show graph/source derived from changed files, and do not
+          // record this rejected emission as source the session has seen.
+          return this.textResult(
+            '⚠️ CodeGraph cannot answer from this index: these files changed after their last sync:\n' +
+            stalePaths.map(file => `- ${file}`).join('\n') +
+            '\nRead those files directly or retry after a successful codegraph sync.'
+          );
+        }
+      }
       // Record + STRIP before anything else touches the result: the emission is
       // internal bookkeeping and must never reach the client, whether or not a
       // caller passed session state.
@@ -6552,6 +6616,18 @@ export class ToolHandler {
       `**Database size:** ${(stats.dbSizeBytes / 1024 / 1024).toFixed(2)} MB`,
     );
 
+    // Exact CLI-parity change counts are measured on a worker: Git or the
+    // filesystem fallback can stall on a large/busy checkout, but status must
+    // not block the shared daemon's transport (#1959). Unknown is never zero.
+    const lastIndexedAt = cg.getLastIndexedAt();
+    const changes = await measurePendingChanges(cg.getProjectRoot());
+    lines.push(
+      `**Latest file indexed:** ${lastIndexedAt == null ? 'never' : new Date(lastIndexedAt).toISOString()}`,
+      changes
+        ? `**Changes since index:** ${changes.added} added, ${changes.modified} modified, ${changes.removed} removed`
+        : '**Changes since index:** unknown (measurement timed out or failed; do not assume the index is current)',
+    );
+
     // Surface the active SQLite backend (node:sqlite, Node's built-in real
     // SQLite — full WAL + FTS5, no native build).
     lines.push(`**Backend:** node:sqlite (Node built-in) — full WAL + FTS5`);
@@ -6611,11 +6687,14 @@ export class ToolHandler {
     // but the index is frozen — call that out explicitly here, the one place an
     // agent asks "is the index caught up?".
     if (cg.isWatcherDegraded()) {
+      const recovering = cg.isWatcherRecovering();
       lines.push(
         '',
-        '**Auto-sync disabled:**',
-        `- ${cg.getWatcherDegradedReason() ?? 'live file watching stopped'}`,
-        '- The index is frozen; Read files directly for current content.'
+        recovering ? '**Auto-sync recovering:**' : '**Auto-sync disabled:**',
+        recovering
+          ? '- File watching restarted; full index catch-up has not completed.'
+          : `- ${cg.getWatcherDegradedReason() ?? 'live file watching stopped'}`,
+        '- The index may be stale; Read files directly for current content.'
       );
     }
 

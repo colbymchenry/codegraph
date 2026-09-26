@@ -1115,12 +1115,11 @@ export class CodeGraph {
   }
 
   /**
-   * True once live watching has permanently degraded (OS watch-resource
-   * exhaustion, or a write lock held past the retry budget) and auto-sync is
-   * disabled until the next {@link watch} call. Distinct from `!isWatching()`:
-   * a stopped/never-started watcher is inactive but NOT degraded. MCP tools use
-   * this to surface a whole-index "results may be stale" notice, since
-   * `getPendingFiles()` goes empty once watching stops (#876).
+   * True once live watching has degraded, or while a re-armed watcher has not
+   * completed its full catch-up. Distinct from `!isWatching()`: a stopped or
+   * never-started watcher is inactive but NOT degraded. MCP tools use this for
+   * a whole-index stale notice, since pending files are lost when watching
+   * stops (#876, #1959).
    */
   isWatcherDegraded(): boolean {
     return this.watcher?.isDegraded() ?? false;
@@ -1129,6 +1128,16 @@ export class CodeGraph {
   /** The reason live watching degraded, or null if it is healthy (#876). */
   getWatcherDegradedReason(): string | null {
     return this.watcher?.getDegradedReason() ?? null;
+  }
+
+  /** Re-arm a lock-degraded watcher; its stale state persists until a full sync. */
+  rearmWatcherAfterLockContention(): boolean {
+    return this.watcher?.rearmAfterLockContention() ?? false;
+  }
+
+  /** True while a re-armed watcher owes a full reconcile of missed changes. */
+  isWatcherRecovering(): boolean {
+    return this.watcher?.isRecoveringFromLock() ?? false;
   }
 
   /**
