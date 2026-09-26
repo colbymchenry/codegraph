@@ -194,16 +194,21 @@ export function validateProjectPath(dirPath: string): string | null {
     // Keep the lexical home path when it cannot be resolved.
   }
   const sensitiveHomeDirs = ['.ssh', '.gnupg', '.aws', '.config'];
+  const sensitiveHomePaths = new Set<string>();
+  for (const home of [homeDir, realHomeDir]) {
+    for (const dir of sensitiveHomeDirs) {
+      const sensitivePath = path.join(home, dir);
+      sensitiveHomePaths.add(sensitivePath);
+      try { sensitiveHomePaths.add(fs.realpathSync(sensitivePath)); } catch { /* keep the lexical path */ }
+    }
+  }
   for (const candidate of pathsToCheck) {
     if (SENSITIVE_REAL_PATHS.has(candidate) || SENSITIVE_PATHS.has(candidate.toLowerCase())) {
       return `Refusing to operate on sensitive system directory: ${candidate}`;
     }
-    for (const dir of sensitiveHomeDirs) {
-      for (const home of [homeDir, realHomeDir]) {
-        const sensitivePath = path.join(home, dir);
-        if (candidate === sensitivePath || candidate.startsWith(sensitivePath + path.sep)) {
-          return `Refusing to operate on sensitive directory: ${candidate}`;
-        }
+    for (const sensitivePath of sensitiveHomePaths) {
+      if (candidate === sensitivePath || candidate.startsWith(sensitivePath + path.sep)) {
+        return `Refusing to operate on sensitive directory: ${candidate}`;
       }
     }
   }
