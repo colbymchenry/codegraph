@@ -7,7 +7,7 @@ import { ExploreSessionState } from '../src/mcp/explore-session-state';
 import { ToolHandler } from '../src/mcp/tools';
 import { __setFsWatchForTests } from '../src/sync/watcher';
 
-describe('degraded explore refuses changed source (#1959)', () => {
+describe('a degraded index refuses answers from changed files (#1959)', () => {
   let root: string;
   let cg: CodeGraph;
   let handler: ToolHandler;
@@ -16,6 +16,10 @@ describe('degraded explore refuses changed source (#1959)', () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-stale-refusal-'));
     fs.writeFileSync(path.join(root, 'alpha.ts'), 'export function alphaOnly() { return 1; }\n');
     fs.writeFileSync(path.join(root, 'beta.ts'), 'export function betaOnly() { return 2; }\n');
+    fs.writeFileSync(
+      path.join(root, 'gamma.ts'),
+      "import { alphaOnly } from './alpha';\nexport function gammaUses() { return alphaOnly(); }\n"
+    );
     cg = CodeGraph.initSync(root);
     await cg.indexAll();
     handler = new ToolHandler(cg);
@@ -67,5 +71,28 @@ describe('degraded explore refuses changed source (#1959)', () => {
     expect(refreshed.content[0].text).toContain('export function alphaOnly');
     expect(refreshed.content[0].text).toContain('return 9');
     expect(refreshed.content[0].text).not.toContain('cannot answer from this index');
+  });
+
+  it('refuses a graph answer that names a changed file, and serves one that does not', async () => {
+    const callers = await handler.execute('codegraph_callers', { symbol: 'alphaOnly' });
+    expect(callers.content[0].text).toContain('gammaUses');
+
+    fs.writeFileSync(
+      path.join(root, 'gamma.ts'),
+      "import { alphaOnly } from './alpha';\nexport function gammaUses() { return 0; }\n"
+    );
+
+    const refused = await handler.execute('codegraph_callers', { symbol: 'alphaOnly' });
+    expect(refused.isError).toBeFalsy();
+    expect(refused.content[0].text).toContain('cannot answer from this index');
+    expect(refused.content[0].text).toContain('- gamma.ts');
+    expect(refused.content[0].text).not.toContain('gammaUses');
+
+    const search = await handler.execute('codegraph_search', { query: 'gammaUses' });
+    expect(search.content[0].text).toContain('cannot answer from this index');
+
+    const unaffected = await handler.execute('codegraph_search', { query: 'betaOnly' });
+    expect(unaffected.content[0].text).toContain('beta.ts');
+    expect(unaffected.content[0].text).not.toContain('cannot answer from this index');
   });
 });

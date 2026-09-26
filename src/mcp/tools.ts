@@ -1951,6 +1951,17 @@ export class ToolHandler {
    */
   private driftCache = new Map<string, { at: number; stale: boolean }>();
   private static readonly DRIFT_TTL_MS = 2000;
+  /**
+   * Tools whose answer is read off the graph of the files it names, and so is
+   * refused like explore's when one of those files changed while auto-sync was
+   * off (#1959). codegraph_node is absent on purpose: its drift gate already
+   * serves a changed file's current bytes instead of the indexed slice (#1474).
+   */
+  private static readonly GRAPH_ANSWER_TOOLS = new Set([
+    'codegraph_search', 'codegraph_callers', 'codegraph_callees', 'codegraph_impact',
+  ]);
+  /** Bounds the per-call hashing a degraded-index check may do. */
+  private static readonly MAX_ANSWER_PATHS = 200;
 
   /**
    * On-disk drift check for a single indexed file (issue #1474). The code
@@ -2010,6 +2021,18 @@ export class ToolHandler {
     }
     this.driftCache.set(key, { at: now, stale });
     return stale;
+  }
+
+  /** Indexed files a graph tool's answer names as locations (#1959). */
+  private indexedPathsIn(cg: CodeGraph, result: ToolResult): string[] {
+    const head = result.content[0];
+    if (!head || head.type !== 'text') return [];
+    const found = new Set<string>();
+    for (const [token] of head.text.matchAll(/[\w@$+\-./]+\.\w+/g)) {
+      if (found.size >= ToolHandler.MAX_ANSWER_PATHS) break;
+      if (!found.has(token) && cg.getFile(token)) found.add(token);
+    }
+    return [...found];
   }
 
   private withStalenessNotice(result: ToolResult, projectPath?: string): ToolResult {
@@ -2200,11 +2223,13 @@ export class ToolHandler {
       const raw = (this.queryPool && this.queryPool.healthy && this.queryPool.ready)
         ? await this.queryPool.run(toolName, dispatchArgs)
         : await this.executeReadTool(toolName, dispatchArgs);
-      if (toolName === 'codegraph_explore' && project.isWatcherDegraded?.()) {
-        const emission = raw[EXPLORE_EMISSION_KEY];
-        const stalePaths = emission?.files
-          ?.filter(file => this.isFileStaleOnDisk(project, file.path, undefined, true))
-          .map(file => file.path) ?? [];
+      if (project.isWatcherDegraded?.()) {
+        // Explore reports the files it rendered; the graph tools name theirs as
+        // `path:line` locations in the text (#1959).
+        const answeredFrom = toolName === 'codegraph_explore'
+          ? raw[EXPLORE_EMISSION_KEY]?.files?.map(file => file.path) ?? []
+          : ToolHandler.GRAPH_ANSWER_TOOLS.has(toolName) ? this.indexedPathsIn(project, raw) : [];
+        const stalePaths = answeredFrom.filter(file => this.isFileStaleOnDisk(project, file, undefined, true));
         if (stalePaths.length > 0) {
           // Do not show graph/source derived from changed files, and do not
           // record this rejected emission as source the session has seen.
