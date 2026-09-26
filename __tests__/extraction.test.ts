@@ -8248,6 +8248,29 @@ describe('Nested non-submodule git repos', () => {
     expect(ig.ignores('scratch/tmp.ts')).toBe(true);
   });
 
+  it('filesystem fallback retains git info/exclude and core.excludesFile when ls-files fails (#1959)', async () => {
+    const { execFileSync } = await import('child_process');
+    const root = path.join(tempDir, 'fallback-excludes-root');
+    fs.mkdirSync(root, { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: root, stdio: 'pipe' });
+    const globalExcludes = path.join(tempDir, 'fallback-global-excludes');
+    fs.writeFileSync(globalExcludes, 'scratch/\n');
+    execFileSync('git', ['config', 'core.excludesFile', globalExcludes], { cwd: root, stdio: 'pipe' });
+    fs.writeFileSync(path.join(root, '.git', 'info', 'exclude'), 'worktrees/\n');
+    fs.mkdirSync(path.join(root, 'scratch'));
+    fs.mkdirSync(path.join(root, 'worktrees'));
+    fs.writeFileSync(path.join(root, 'app.ts'), 'export const app = 1;\n');
+    fs.writeFileSync(path.join(root, 'scratch', 'hidden.ts'), 'export const hidden = 1;\n');
+    fs.writeFileSync(path.join(root, 'worktrees', 'hidden.ts'), 'export const hidden = 2;\n');
+
+    // rev-parse/config still work, but both ls-files and status fail as they
+    // would under a Git timeout. This exercises the real filesystem walk.
+    fs.writeFileSync(path.join(root, '.git', 'index'), 'not a git index');
+    expect(() => execFileSync('git', ['ls-files'], { cwd: root, stdio: 'pipe' })).toThrow();
+    expect(scanDirectory(root)).toEqual(['app.ts']);
+    expect(await scanDirectoryAsync(root)).toEqual(['app.ts']);
+  });
+
   it('buildScopeIgnore prunes dirs ignored only by a nested .gitignore (#1728)', async () => {
     const { execFileSync } = await import('child_process');
     const git = (cwd: string, ...args: string[]) =>

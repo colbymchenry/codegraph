@@ -47,6 +47,8 @@ import { watchDisabledReason } from './watch-policy';
  * few cycles) stays under this; a long-lived external writer crosses it.
  */
 const MAX_LOCK_RETRIES = 5;
+/** A failed re-arm must not turn frequent MCP calls into a lock-polling loop. */
+const LOCK_REARM_COOLDOWN_MS = 30_000;
 /**
  * Number of consecutive GENERIC (non-lock) sync failures the watcher tolerates
  * before it degrades auto-sync. A deterministic failure — a tree-sitter
@@ -277,12 +279,16 @@ export class FileWatcher {
    */
   private inotifyLimitWarned = false;
   /**
-   * One-way latch: the reason live watching was permanently disabled at runtime
+   * The reason live watching was disabled at runtime
    * (watch-resource exhaustion, lock contention past the retry budget, or a
    * persistent generic sync failure past the retry budget), or null while
-   * healthy. Set by {@link degrade}; cleared only by a fresh start().
+   * healthy. Set by {@link degrade}; a lock-contention recovery keeps it until
+   * a full reconciliation succeeds.
    */
   private degradedReason: string | null = null;
+  private degradedByLock = false;
+  private recoveringFromLock = false;
+  private lastLockRearmMs = 0;
   /** Consecutive lock-contention retries for watcher-triggered syncs. */
   private lockRetryCount = 0;
   /** Consecutive generic (non-lock) sync failures; reset only by a clean sync. */
@@ -370,6 +376,8 @@ export class FileWatcher {
     if (this.recursiveWatcher || this.dirWatchers.size > 0 || this.inert) return true; // Already watching
     this.stopped = false;
     this.degradedReason = null;
+    this.degradedByLock = false;
+    this.recoveringFromLock = false;
     this.lockRetryCount = 0;
     this.syncFailureRetryCount = 0;
 
@@ -480,7 +488,7 @@ export class FileWatcher {
     // watches to a watcher that is shutting down. `inotifyLimitWarned` does the
     // same after ENOSPC — the kernel budget is gone, so stop trying the rest of
     // the tree (every add would fail) while keeping the watches already set.
-    if (this.stopped || this.degradedReason || this.inotifyLimitWarned) return;
+    if (this.stopped || (this.degradedReason && !this.recoveringFromLock) || this.inotifyLimitWarned) return;
     if (this.dirWatchers.has(dir)) return;
     if (this.dirWatchers.size >= maxDirWatches()) {
       if (!this.dirCapWarned) {
@@ -718,15 +726,17 @@ export class FileWatcher {
   }
 
   /**
-   * Permanently disable live watching after a terminal runtime failure
+   * Disable live watching after a terminal runtime failure
    * (watch-resource exhaustion, lock contention past the retry budget, or a
    * persistent generic sync failure past the retry budget).
    * Idempotent: logs one actionable warning, fires {@link WatchOptions.onDegraded}
    * once, and stops the watcher. A subsequent start() clears the latch.
    */
-  private degrade(reason: string, context: Record<string, unknown> = {}): void {
-    if (this.degradedReason) return;
+  private degrade(reason: string, context: Record<string, unknown> = {}, byLock = false): void {
+    if (this.degradedReason && !this.recoveringFromLock) return;
     this.degradedReason = reason;
+    this.degradedByLock = byLock;
+    this.recoveringFromLock = false;
     logWarn('File watcher disabled', { projectRoot: this.projectRoot, reason, ...context });
     this.onDegraded?.(reason);
     this.stop();
@@ -747,7 +757,7 @@ export class FileWatcher {
   }
 
   /**
-   * Whether live watching has degraded permanently (until the next start()).
+   * Whether live watching has degraded or is still catching up after re-arm.
    * Distinct from {@link isActive}: a degraded watcher is inactive, but an
    * inactive watcher is not necessarily degraded (it may simply be stopped or
    * never started). Hosts use this to tell the user auto-sync is off.
@@ -761,11 +771,47 @@ export class FileWatcher {
     return this.degradedReason;
   }
 
+  /** Watches are live again, but the full catch-up has not committed yet. */
+  isRecoveringFromLock(): boolean {
+    return this.recoveringFromLock;
+  }
+
+  /**
+   * Re-arm a watcher disabled by lock contention when a caller next uses the
+   * graph. Keep the whole-index stale banner until a FULL scan reconciles edits
+   * missed while watches were off. Resource exhaustion and deterministic sync
+   * failures are not automatically retried. Repeated unsuccessful re-arms are
+   * throttled so many MCP sessions cannot hammer a long-lived writer.
+   */
+  rearmAfterLockContention(): boolean {
+    if (!this.degradedByLock || this.isActive()) return false;
+    const now = Date.now();
+    if (this.lastLockRearmMs && now - this.lastLockRearmMs < LOCK_REARM_COOLDOWN_MS) return false;
+    const reason = this.degradedReason;
+    this.lastLockRearmMs = now;
+    if (!this.start()) {
+      // A disabled platform can reject start() without calling degrade().
+      // Preserve the old stale-index signal in that case; a new resource
+      // failure has its own more precise degraded reason.
+      if (!this.degradedReason) {
+        this.degradedReason = reason;
+        this.degradedByLock = true;
+      }
+      return false;
+    }
+    this.degradedReason = reason;
+    this.recoveringFromLock = true;
+    this.needsFullScan = true;
+    this.scheduleSync();
+    return true;
+  }
+
   /**
    * Stop watching for file changes.
    */
   stop(): void {
     this.stopped = true;
+    this.recoveringFromLock = false;
 
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
@@ -913,6 +959,10 @@ export class FileWatcher {
     try {
       const result = await this.syncFn(scoped);
       if (!scoped) this.needsFullScan = false;
+      if (this.recoveringFromLock && !scoped) {
+        this.degradedReason = null;
+        this.recoveringFromLock = false;
+      }
       this.lockRetryCount = 0; // a clean sync clears any contention backoff
       this.syncFailureRetryCount = 0; // ...and any generic-failure backoff
       // Remove entries whose most recent event predates this sync — those
@@ -945,7 +995,8 @@ export class FileWatcher {
             'CodeGraph file lock held by another process past the retry budget; ' +
               'auto-sync disabled. Run `codegraph sync` once the other writer finishes ' +
               '(or install git sync hooks) to refresh the graph.',
-            { pendingFiles: this.pendingFiles.size, retryCount: this.lockRetryCount }
+            { pendingFiles: this.pendingFiles.size, retryCount: this.lockRetryCount },
+            true
           );
         }
       } else {

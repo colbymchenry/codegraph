@@ -322,6 +322,53 @@ describe('FileWatcher', () => {
 
       watcher.stop();
     });
+
+    it('re-arms after lock contention and keeps the stale banner until a full catch-up (#1959)', async () => {
+      let finishCatchUp!: () => void;
+      const catchUp = new Promise<void>(resolve => { finishCatchUp = resolve; });
+      const syncFn = vi.fn().mockRejectedValue(new LockUnavailableError());
+      const watcher = newWatcher(syncFn, { debounceMs: 25 });
+      watcher.start();
+      try {
+        await watcher.waitUntilReady();
+        __emitWatchEventForTests(testDir, 'src/locked.ts');
+        await waitFor(() => watcher.isDegraded() && !watcher.isActive(), 8000);
+
+        syncFn.mockImplementation(async () => {
+          await catchUp;
+          return { filesChanged: 1, durationMs: 5 };
+        });
+        expect(watcher.rearmAfterLockContention()).toBe(true);
+        expect(watcher.isActive()).toBe(true);
+        expect(watcher.isDegraded()).toBe(true);
+        expect(watcher.rearmAfterLockContention()).toBe(false);
+        await waitFor(() => syncFn.mock.calls.length >= 7, 4000);
+        expect(syncFn.mock.calls.at(-1)?.[0]).toBeUndefined();
+        expect(watcher.isDegraded()).toBe(true);
+        finishCatchUp();
+        await waitFor(() => !watcher.isDegraded(), 4000);
+        expect(watcher.isActive()).toBe(true);
+      } finally {
+        finishCatchUp?.();
+        watcher.stop();
+      }
+    });
+
+    it('throttles a failed re-arm across tool calls (#1959)', async () => {
+      const syncFn = vi.fn().mockRejectedValue(new LockUnavailableError());
+      const watcher = newWatcher(syncFn, { debounceMs: 25 });
+      watcher.start();
+      try {
+        await watcher.waitUntilReady();
+        __emitWatchEventForTests(testDir, 'src/locked.ts');
+        await waitFor(() => watcher.isDegraded() && !watcher.isActive(), 8000);
+        expect(watcher.rearmAfterLockContention()).toBe(true);
+        await waitFor(() => watcher.isDegraded() && !watcher.isActive(), 8000);
+        expect(watcher.rearmAfterLockContention()).toBe(false);
+      } finally {
+        watcher.stop();
+      }
+    });
   });
 
   describe('persistent sync-failure degradation (#1127)', () => {
@@ -349,6 +396,7 @@ describe('FileWatcher', () => {
 
       expect(syncFn.mock.calls.length).toBeGreaterThanOrEqual(6); // MAX_SYNC_FAILURE_RETRIES + 1
       expect(watcher.isDegraded()).toBe(true);
+      expect(watcher.rearmAfterLockContention()).toBe(false);
       expect(onDegraded).toHaveBeenCalledTimes(1);
       expect(onDegraded).toHaveBeenCalledWith(expect.stringContaining('auto-sync disabled'));
       // The degrade reason carries the underlying error so the user can act.
