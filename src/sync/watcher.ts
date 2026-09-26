@@ -986,8 +986,10 @@ export class FileWatcher {
       // sync resets both counters so normal edits keep the fast debounce. Use
       // the larger streak so interleaved failures still back off. A degrade()
       // above already set `stopped`, so this won't reschedule a watcher that
-      // has given up.
-      if (this.pendingFiles.size > 0 && !this.stopped) {
+      // has given up. A directory removal whose full sync failed adds no
+      // pending file, only `needsFullScan` — it still owes the full reconcile
+      // it asked for (#1964).
+      if ((this.pendingFiles.size > 0 || this.needsFullScan) && !this.stopped) {
         const retryCount = Math.max(this.lockRetryCount, this.syncFailureRetryCount);
         if (retryCount > 0) {
           const retryDelayMs = Math.min(
