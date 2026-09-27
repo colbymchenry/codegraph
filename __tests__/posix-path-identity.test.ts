@@ -117,6 +117,13 @@ describe.runIf(process.platform !== 'win32')('POSIX pathname identity', () => {
         expect(result.isError).toBeFalsy();
         expect(result.content[0]!.text).toContain(symbol);
         expect(result.content[0]!.text).not.toContain(other);
+        // Upstream's line-reference parsing must preserve the same identity.
+        for (const suffix of [':1', ':1-1', '#L1', '#L1-L1']) {
+          const referenced = await handler.execute('codegraph_node', { file: `${file}${suffix}` });
+          expect(referenced.isError).toBeFalsy();
+          expect(referenced.content[0]!.text).toContain(symbol);
+          expect(referenced.content[0]!.text).not.toContain(other);
+        }
         const listing = await handler.execute('codegraph_files', { path: file, format: 'flat' });
         expect(listing.content[0]!.text).toContain(file);
         const source = await buildSource(cg, root, new URLSearchParams({ file: file! }));

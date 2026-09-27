@@ -144,6 +144,13 @@ function nested(holder) {
     assertParity('fixtures/torture.py', fs.readFileSync(file, 'utf8'), 'python');
   });
 
+  it.each(['LF', 'CRLF'])('Python body docstrings parity (%s, #1905)', (ending) => {
+    const source = fs.readFileSync(path.join(FIXTURE_DIR, 'docstrings.py'), 'utf8');
+    const result = assertParity('ledger.py', ending === 'CRLF' ? source.replace(/\n/g, '\r\n') : source, 'python');
+    expect(result.nodes.find((n) => n.kind === 'file')?.docstring).toBe('Ledger module documentation.');
+    expect(result.nodes.find((n) => n.name === 'settle')?.docstring).toBe('Method comment.\n\nSettle the ledger.');
+  });
+
   it('torture fixture (go): receivers, embedding, interfaces, composite literals', () => {
     const file = path.join(FIXTURE_DIR, 'torture.go');
     assertParity('fixtures/torture.go', fs.readFileSync(file, 'utf8'), 'go');

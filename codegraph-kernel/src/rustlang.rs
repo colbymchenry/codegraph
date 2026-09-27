@@ -76,6 +76,7 @@ struct Scope {
 #[derive(Default)]
 struct Extra {
     docstring: Option<String>,
+    decorators: Option<String>,
     signature: Option<String>,
     return_type: Option<String>,
     qualified_name: Option<String>,
@@ -281,6 +282,7 @@ impl<'t> Walker<'t> {
         let id_ref = self.arena.put(&id);
         let doc_ref = opt_str(&mut self.arena, extra.docstring.as_deref());
         let sig_ref = opt_str(&mut self.arena, extra.signature.as_deref());
+        let decorators_ref = opt_str(&mut self.arena, extra.decorators.as_deref());
         let ret_ref = opt_str(&mut self.arena, extra.return_type.as_deref());
         let row = self.tables.push_node(&NodeRow {
             kind: node_kind_index(kind).unwrap(),
@@ -295,7 +297,7 @@ impl<'t> Walker<'t> {
             id: id_ref,
             docstring: doc_ref,
             signature: sig_ref,
-            decorators: NONE_STR,
+            decorators: decorators_ref,
             type_parameters: NONE_STR,
             return_type: ret_ref,
             extra_json: NONE_STR,
@@ -515,7 +517,31 @@ impl<'t> Walker<'t> {
             return;
         }
 
+        // Match the wasm walker's sibling-attribute handling for Tauri commands.
+        let mut decorators = None;
+        if node.kind() == "function_item" {
+            let mut sibling = node.prev_named_sibling();
+            while let Some(item) = sibling {
+                match item.kind() {
+                    "line_comment" | "block_comment" => {},
+                    "attribute_item" => {
+                        let name = item.named_child(0).and_then(|a| a.named_child(0));
+                        if let Some(name) = name {
+                            let text: String = self.src[name.byte_range()].chars()
+                                .filter(|c| !c.is_whitespace()).collect();
+                            if text == "tauri::command" {
+                                decorators = Some("tauri::command".to_string());
+                                break;
+                            }
+                        }
+                    },
+                    _ => break,
+                }
+                sibling = item.prev_named_sibling();
+            }
+        }
         let extra = Extra {
+            decorators,
             docstring: preceding_docstring(node, self.src),
             signature: self.signature_of(node),
             visibility: Some(self.visibility_of(node)),
@@ -558,8 +584,6 @@ impl<'t> Walker<'t> {
         }
 
         self.extract_type_annotations(node, row);
-        // extractDecoratorsFor: rust attribute_items are siblings, not
-        // decorator/annotation/attribute node types — complete no-op.
         self.stack.push(Scope { row, kind, name });
         if let Some(body) = node.child_by_field_name("body") {
             self.visit_function_body(body);

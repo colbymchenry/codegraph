@@ -20,8 +20,8 @@
  * TortureIndent: Scala-3 indentation syntax through the external scanner;
  * TortureMisc: package objects/braced packages/self-types/super-ctor args/
  * unicode columns; TortureScript.sc: top-level statements from the FILE)
- * and their CRLF variants (derived in-memory — #1329), plus phantom and
- * real-error defer pins.
+ * and their CRLF variants (derived in-memory — #1329), plus MISSING-only and
+ * real-error defer pins and the #1823 grammar-bump pins.
  *
  * The full-repo sweeps live in scripts/kernel-parity.mjs (os-lib/cats +
  * scala3 compiler/src + library/src with --max-deferral 0.3); this suite
@@ -142,23 +142,46 @@ describe.skipIf(!kernelBuilt)('kernel Scala extraction parity', () => {
     );
   });
 
-  it('scala-3 PHANTOM hasError defers (flag-true, zero ERROR nodes)', () => {
-    // Capture-checking postfix `^` — a complete, correct CST whose hasError
-    // flag is still true. The kernel must defer on the FLAG.
-    const phantom = 'def f(x: List[Int]^): Int = 1\n';
+  it('a hasError flag without ERROR nodes defers (MISSING-only tree)', () => {
+    // A tree whose only defect is a MISSING node: hasError is true, yet there
+    // is no ERROR node to find. The kernel must defer on the FLAG.
+    const missingOnly = 'object O { val x = }\n';
     process.env.CODEGRAPH_KERNEL_LANGS = 'all';
     delete process.env.CODEGRAPH_KERNEL;
-    expect(tryKernelExtract('src/phantom.scala', phantom, 'scala')).toBeNull();
+    expect(tryKernelExtract('src/missing.scala', missingOnly, 'scala')).toBeNull();
     process.env.CODEGRAPH_KERNEL = '0';
-    const viaWasm = extractFromSource('src/phantom.scala', phantom, 'scala');
+    const viaWasm = extractFromSource('src/missing.scala', missingOnly, 'scala');
     delete process.env.CODEGRAPH_KERNEL;
     expect(viaWasm.nodes.some((n) => n.kind === 'file')).toBe(true);
   });
 
-  it('real parse errors defer (given-with syntax)', () => {
-    const broken = 'trait C\ngiven x: C with { def y = 1 }\n';
+  it('real parse errors defer', () => {
+    const broken = 'class A {\n  def f( = 1\n}\n';
     process.env.CODEGRAPH_KERNEL_LANGS = 'all';
     delete process.env.CODEGRAPH_KERNEL;
-    expect(tryKernelExtract('src/gw.scala', broken, 'scala')).toBeNull();
+    expect(tryKernelExtract('src/broken.scala', broken, 'scala')).toBeNull();
+  });
+
+  it('Scala 3 syntax the old grammar pin rejected now parses on both paths', () => {
+    // Capture-checking `^` and given-with bodies were parse errors under the
+    // master@0aca5d0a6f pin and deferred to wasm; v0.26.2 reads them (#1823).
+    assertParity('src/capture.scala', 'def f(x: List[Int]^): Int = 1\n', 2);
+    assertParity('src/given.scala', 'trait C\ngiven x: C with { def y = 1 }\n', 2);
+  });
+
+  it('keeps every parent after a parent with several argument lists (#1823)', () => {
+    const src = [
+      'class MExtAgreement(agreement: Agreement, ext: Ext)(implicit qs: QueryService)',
+      '  extends MAgreement(agreement)(qs) with ExtAgreement with Other {',
+      '  def foo: Int = 1',
+      '}',
+      '',
+    ].join('\n');
+    const result = assertParity('src/agreement.scala', src, 3);
+    const parents = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'extends' || r.referenceKind === 'implements')
+      .map((r) => r.referenceName)
+      .sort();
+    expect(parents).toEqual(['ExtAgreement', 'MAgreement', 'Other']);
   });
 });

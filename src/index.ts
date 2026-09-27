@@ -357,7 +357,12 @@ export class CodeGraph {
 
     // Sync if requested
     if (options.sync) {
-      await instance.sync();
+      try {
+        await instance.sync();
+      } catch (err) {
+        instance.destroy();
+        throw err;
+      }
     }
 
     return instance;
@@ -777,7 +782,8 @@ export class CodeGraph {
   }
 
   /**
-   * Sync with current file state (incremental update)
+   * Sync with current file state (incremental update).
+   * Throws LockUnavailableError if the cross-process write lock is unavailable.
    *
    * Uses a mutex to prevent concurrent indexing operations.
    */
@@ -785,8 +791,10 @@ export class CodeGraph {
     return this.indexMutex.withLock(async () => {
       try {
         this.fileLock.acquire();
-      } catch {
-        return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
+      } catch (err) {
+        throw new LockUnavailableError(
+          `Sync could not acquire the file lock; retry when the index is available. ${err instanceof Error ? err.message : String(err)}`
+        );
       }
       // Defer WAL auto-checkpointing for the whole incremental run, exactly
       // as indexAll does for the bulk path (#1231): sync's store loop and its
@@ -1080,14 +1088,6 @@ export class CodeGraph {
       this.projectRoot,
       async (paths?: string[]) => {
         const result = await this.sync({ paths });
-        // sync() returns this exact zero-shape iff it failed to acquire the
-        // file lock (a real empty sync always has filesChecked > 0 because
-        // scanDirectory ran). Surface that to the watcher as a typed error
-        // so it keeps pendingFiles + reschedules instead of clearing them
-        // (#449).
-        if (result.filesChecked === 0 && result.durationMs === 0) {
-          throw new LockUnavailableError();
-        }
         const filesChanged = result.filesAdded + result.filesModified + result.filesRemoved;
         return { filesChanged, durationMs: result.durationMs };
       },
@@ -1480,6 +1480,14 @@ export class CodeGraph {
   }
 
   /**
+   * Which of the given symbols extend or implement a type outside the index —
+   * an ancestor the resolver could not follow, so it has no edge (#1973).
+   */
+  getUnresolvedSupertypeSourcesAmong(nodeIds: Iterable<string>): Set<string> {
+    return this.queries.getUnresolvedSupertypeSourcesAmong(nodeIds);
+  }
+
+  /**
    * The symbols with the most distinct dependents, most first — the index's
    * hubs. Distinct dependents, not edges: a helper called forty times from one
    * function has one dependent, and it is dependents a blast radius grows from.
@@ -1583,6 +1591,13 @@ export class CodeGraph {
    */
   getNodesInFile(filePath: string): Node[] {
     return this.queries.getNodesByFile(filePath);
+  }
+
+  /**
+   * Get all nodes in several files, in one batched query.
+   */
+  getNodesInFiles(filePaths: readonly string[]): Node[] {
+    return this.queries.getNodesByFiles(filePaths);
   }
 
   /**

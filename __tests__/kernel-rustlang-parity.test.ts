@@ -91,6 +91,28 @@ describe.skipIf(!kernelBuilt)('kernel Rust extraction parity', () => {
     expect(viaWasm.nodes.length).toBeGreaterThanOrEqual(minNodes);
   }
 
+  it('preserves Tauri command attributes without treating comments or strings as registrations', () => {
+    const source = `
+#[tauri::command]
+fn port() -> u16 { 4000 }
+#[tauri :: command(rename_all = "snake_case")]
+/* between attributes */
+#[allow(dead_code)]
+pub async fn settings() {}
+// #[tauri::command]
+fn ordinary() {}
+const TEXT: &str = r#"#[tauri::command]"#;
+fn after_string() {}
+#[other::command]
+fn unrelated() {}
+#[tauri::command]
+fn outer() { fn inner() {} }
+fn next() {}
+`;
+    assertParity('commands.rs', source);
+    assertParity('commands.rs', source.replace(/\n/g, '\r\n'));
+  });
+
   it('torture fixture: impl/trait quirks, use bindings, chains, fn-refs, value-refs, route macros', () => {
     const file = path.join(FIXTURE_DIR, 'torture.rs');
     assertParity('fixtures/torture.rs', fs.readFileSync(file, 'utf8'), 20);

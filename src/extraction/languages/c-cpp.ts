@@ -28,6 +28,55 @@ function findDeclaratorQualifiedId(declarator: SyntaxNode): SyntaxNode | undefin
 }
 
 /**
+ * Single-argument macros are ambiguous without their definition (#1373).
+ * Require a preceding local #define whose replacement uses its sole parameter
+ * as the function declarator; registration, token-pasting, and K&R forms stay
+ * untouched. Walk enclosing scopes, but never guess across conditional macros.
+ */
+function recoverSingleArgMacroDefinedName(node: SyntaxNode, source: string): string | undefined {
+  if (node.type !== 'function_definition') return undefined;
+  const declarator = getChildByField(node, 'declarator');
+  let macro: SyntaxNode | null = null;
+  let argument: SyntaxNode | null = null;
+  if (declarator?.type === 'parenthesized_declarator' && declarator.namedChildCount === 1) {
+    // C: NATIVE_FN is parsed as the return type, (name) as the declarator.
+    macro = getChildByField(node, 'type');
+    argument = declarator.namedChild(0);
+    if (macro?.type !== 'type_identifier' || argument?.type !== 'identifier') return undefined;
+  } else if (declarator?.type === 'function_declarator' && !getChildByField(node, 'type')) {
+    // C++: NATIVE_FN(name) is parsed as an implicit-return-type function.
+    macro = getChildByField(declarator, 'declarator');
+    const params = getChildByField(declarator, 'parameters');
+    const param = params?.namedChild(0);
+    if (macro?.type !== 'identifier' || params?.namedChildCount !== 1 ||
+        param?.type !== 'parameter_declaration' || param.namedChildCount !== 1) return undefined;
+    argument = param.namedChild(0);
+    if (argument?.type !== 'type_identifier') return undefined;
+  }
+  if (!macro || !argument) return undefined;
+  const macroName = getNodeText(macro, source);
+  for (let scope: SyntaxNode | null = node; scope; scope = scope.parent) {
+    if (scope.type === 'preproc_else' || scope.type.startsWith('preproc_elif')) return undefined;
+    for (let prev = scope.previousNamedSibling; prev; prev = prev.previousNamedSibling) {
+      if (prev.type.startsWith('preproc_if')) return undefined;
+      if (prev.type === 'preproc_call' && getChildByField(prev, 'directive')?.text === '#undef' &&
+          getChildByField(prev, 'argument')?.text.trim() === macroName) return undefined;
+      if (prev.type !== 'preproc_function_def' && prev.type !== 'preproc_def') continue;
+      if (getChildByField(prev, 'name')?.text !== macroName) continue;
+      const params = getChildByField(prev, 'parameters');
+      const param = params?.namedChild(0);
+      const value = getChildByField(prev, 'value');
+      if (params?.namedChildCount !== 1 || param?.type !== 'identifier' || !value) return undefined;
+      const replacement = getNodeText(value, source).replace(/\\\r?\n/g, ' ').trim();
+      const match = replacement.match(/^(?:[A-Za-z_][A-Za-z0-9_:]*\s+)+[*&\s]*([A-Za-z_]\w*)\s*\([^(){};#]*\)\s*$/);
+      if (!match || /\btypedef\b/.test(replacement) || match[1] !== param.text) return undefined;
+      return getNodeText(argument, source);
+    }
+  }
+  return undefined;
+}
+
+/**
  * Recover the real function name from the macro-definition idiom
  * `MACRO_NAME(real_name, typed args…) { body }` — flash-attention's
  * `DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_kernel, bool Is_dropout, …) { … }`
@@ -73,7 +122,7 @@ function recoverCppMacroDefinedName(node: SyntaxNode, source: string): string | 
 }
 
 function extractCppQualifiedMethodName(node: SyntaxNode, source: string): string | undefined {
-  const macroDefined = recoverCppMacroDefinedName(node, source);
+  const macroDefined = recoverSingleArgMacroDefinedName(node, source) ?? recoverCppMacroDefinedName(node, source);
   if (macroDefined) return macroDefined;
   const declarator = getChildByField(node, 'declarator');
   if (!declarator) return undefined;
@@ -207,6 +256,7 @@ function extractCppReturnType(node: SyntaxNode, source: string): string | undefi
 }
 
 export const cExtractor: LanguageExtractor = {
+  resolveName: recoverSingleArgMacroDefinedName,
   // CUDA in C-detected headers (content-gated blank; see preParseCSource).
   preParse: preParseCSource,
   // Universal net: recover a real name from any macro-mangled function name.
@@ -868,6 +918,34 @@ function restoreDirectiveLines(original: string, blanked: string): string {
   return changed ? b.join('\n') : blanked;
 }
 
+/** Recover MSVC's COM alias only at type-definition sites. Match on a lexical
+ * mask so comments, literals and directives cannot supply declaration evidence;
+ * replace just the keyword, preserving source offsets on both parser arms. */
+function normalizeCppComInterfaces(source: string): string {
+  if (!source.includes('interface')) return source;
+  // Raw strings have already been masked by preParseCppSource.
+  let code = source.replace(
+    /\/\/(?:\\\r?\n|[^\r\n])*|\/\*[\s\S]*?(?:\*\/|$)|"(?:\\[\s\S]|[^"\\])*(?:"|$)|(?<!\w)(?:u8|[LuU])?'(?:\\[\s\S]|[^'\\])*(?:'|$)/g,
+    (m) => m.replace(/[^\r\n]/g, ' ')
+  );
+  const hasAlias = /^[ \t]*#[ \t]*define[ \t]+interface[ \t]+struct\b/m.test(code);
+  code = code.replace(/^[ \t]*#(?:\\\r?\n|[^\r\n])*/gm, (m) => m.replace(/[^\r\n]/g, '\0'));
+  const declaration = /(^|[;{}])\s*\binterface\s+[A-Za-z_]\w*\s*(:[^;{}]+)?\{/gm;
+  const offsets: number[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = declaration.exec(code)) !== null) {
+    const bodyEnd = code.indexOf('}', declaration.lastIndex);
+    const hasVirtual = /\bvirtual\b/.test(code.slice(declaration.lastIndex, bodyEnd < 0 ? code.length : bodyEnd));
+    if (!hasAlias && !match[2] && !hasVirtual) continue;
+    offsets.push(match.index + match[0].indexOf('interface'));
+    declaration.lastIndex--; // allow the opening brace to start a nested declaration
+  }
+  for (const offset of offsets) {
+    source = source.slice(0, offset) + 'struct   ' + source.slice(offset + 9);
+  }
+  return source;
+}
+
 /** C/C++ source pre-processing before tree-sitter: recover macro-annotated class
  * definitions, macro-prefixed function definitions, macro-prefixed members, and
  * macro-decorated members (Unreal-Engine reflection markup) — plus the non-C++
@@ -885,7 +963,7 @@ function preParseCppSource(source: string, filePath?: string): string {
     blankCLeadingAttrMacros(
       blankCppAnnotationMacroCalls(
         blankCppInlineAnnotationMacros(
-          blankCppApiPrefixMacros(blankCppInlineMacros(blankCppExportMacros(source)))
+          blankCppApiPrefixMacros(blankCppInlineMacros(blankCppExportMacros(normalizeCppComInterfaces(source))))
         )
       )
     )

@@ -6,7 +6,7 @@
 
 import type CodeGraph from '../index';
 import type { QueryPool } from './query-pool';
-import { findNearestCodeGraphRoot } from '../directory';
+import { findNearestCodeGraphRoot, isSameIndexRoot } from '../directory';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
 // helper in engine.ts. ToolHandler must load to answer tools/list (static
 // schemas), but it must NOT drag in sqlite/query layers before the daemon binds;
@@ -37,6 +37,7 @@ import { extractQueryPaths, queryMightContainPaths } from '../search/query-paths
 import {
   existsSync,
   readFileSync,
+  realpathSync,
   statSync,
 } from 'fs';
 import { createHash } from 'crypto';
@@ -155,6 +156,25 @@ export function normalizeQuerySpelling(query: string): string {
       /(^|[\s,()[\]])(?!(?:kind|lang|language|path|name):)([a-z_][\w@]*):([A-Za-z_][\w@]*)(?=$|[\s,()[\]])/g,
       '$1$2.$3'
     );
+}
+
+/**
+ * Does this query-named span point at a real FILE inside the project?
+ *
+ * The `existsOnDisk` predicate `extractQueryPaths` takes (that module is pure —
+ * no DB, no fs — so the fs access lives here, where the project root is known).
+ * Only a REGULAR FILE counts: a directory span (`src/search`) is not a file
+ * reference and must keep flowing to the normal matching pipeline. Containment
+ * is enforced by `validatePathWithinRoot`, so a `../` span in a query cannot
+ * probe outside the project, and every fs error answers `false`.
+ */
+function pathIsProjectFile(projectRoot: string, relPath: string): boolean {
+  try {
+    const abs = validatePathWithinRoot(projectRoot, relPath);
+    return abs !== null && statSync(abs).isFile();
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -1016,6 +1036,26 @@ function pointerLineFor(filePath: string, nodes: readonly Node[]): string {
 const EPILOGUE_LOST_NOTE = '> (Trailing pointer list omitted for size. The source above is complete and verbatim — treat it as already Read. For anything this call did not cover, run another codegraph_explore with the specific names rather than reading those files.)';
 
 /**
+ * Match response delimiters rather than ASCII "path characters": filenames
+ * can contain Unicode, @, +, and other punctuation. Keep line references and
+ * a sentence-ending period, but reject prefixes/suffixes of longer paths.
+ */
+function mentionsPath(text: string, relPath: string): boolean {
+  const delimiter = /[\s`"'()[\]{}*]/;
+  for (let at = text.indexOf(relPath); at !== -1; at = text.indexOf(relPath, at + 1)) {
+    if (at > 0 && !delimiter.test(text[at - 1] ?? '')) continue;
+    const end = at + relPath.length;
+    if (end === text.length || delimiter.test(text[end] ?? '')) return true;
+    const suffix = text.slice(end);
+    if (/^:\d+(?::\d+|[-–]\d+)?(?=$|[\s`"'()[\]{}*])/.test(suffix)) return true;
+    if (/^:(?=$|\s)/.test(suffix)) return true; // file-list label
+    if (/^\.(?=$|\s)/.test(suffix)) return true; // prose punctuation
+    if (/^[,;](?=$|\s)/.test(suffix)) return true; // list separator
+  }
+  return false;
+}
+
+/**
  * Per-file staleness banner emitted at the top of a tool response when the
  * file watcher has pending events for files referenced by the response.
  * The agent uses this to fall back to Read for those specific files
@@ -1491,17 +1531,15 @@ export class ToolHandler {
   // huge repo can't hang the first call (#905); cleared on first await so
   // subsequent calls don't pay any cost.
   private catchUpGate: Promise<void> | null = null;
-  // Optional worker-thread pool for off-loop read-tool dispatch (daemon mode).
-  // When set + healthy, the heavy read tools run on a worker so the daemon's
-  // main loop stays free for the MCP transport under concurrent load. Null in
-  // direct/in-process mode (one client, no concurrency to parallelize).
+  // Optional worker-thread pool for off-loop read-tool dispatch. When ready +
+  // healthy, heavy reads leave the main loop free for the MCP transport.
   private queryPool: QueryPool | null = null;
 
   constructor(private cg: CodeGraph | null) {}
 
   /**
    * Engine-only: attach (or detach with null) the worker-thread query pool. The
-   * shared daemon sets this once its default project is open; the workers each
+   * engine sets this after resolving its default project; the workers each
    * hold their own WAL read connection and run {@link executeReadTool}. A
    * worker's own ToolHandler never has a pool, so there is no nested off-loading.
    */
@@ -1771,7 +1809,8 @@ export class ToolHandler {
     // support) that surfaces as intermittent
     // "database is locked" on concurrent tool calls. See issue #238. The
     // default instance is owned/closed by the server, so it's never cached.
-    if (this.cg && this.cg.getProjectRoot() === resolvedRoot) {
+    // Another spelling of the same root counts too (#1057).
+    if (this.cg && isSameIndexRoot(this.cg.getProjectRoot(), resolvedRoot)) {
       return this.freshen(this.cg);
     }
 
@@ -1781,8 +1820,19 @@ export class ToolHandler {
     const cached = this.projectCache.get(resolvedRoot);
     if (cached) return this.freshen(cached);
 
-    const cg = loadCodeGraph().openSync(resolvedRoot);
-    this.projectCache.set(resolvedRoot, cg);
+    // Compare current identities on every cache miss: a previously seen alias
+    // may have been retargeted or recreated since the last call (#1057).
+    for (const [root, open] of this.projectCache) {
+      if (isSameIndexRoot(root, resolvedRoot)) {
+        return this.freshen(open);
+      }
+    }
+
+    // Pin the owner to the symlink target, so retargeting the first spelling
+    // cannot move an existing connection onto another cached project.
+    const ownerRoot = realpathSync.native(resolvedRoot);
+    const cg = loadCodeGraph().openSync(ownerRoot);
+    this.projectCache.set(ownerRoot, cg);
     return cg;
   }
 
@@ -1815,7 +1865,9 @@ export class ToolHandler {
    * Close all cached project connections
    */
   closeAll(): void {
-    for (const cg of this.projectCache.values()) {
+    // One key per instance by design; closing through a Set keeps a second
+    // close (which throws on node:sqlite) from ever stopping the loop.
+    for (const cg of new Set(this.projectCache.values())) {
       cg.close();
     }
     this.projectCache.clear();
@@ -2070,10 +2122,10 @@ export class ToolHandler {
     const inResponse: PendingFile[] = [];
     const elsewhere: PendingFile[] = [];
     for (const p of pending) {
-      // Substring match against the project-relative POSIX path — that's
-      // exactly the format both the watcher and every codegraph response
-      // emit, so a plain includes() is sufficient and avoids regex pitfalls.
-      if (text.includes(p.path)) inResponse.push(p);
+      // Project-relative POSIX path — the format both the watcher and every
+      // codegraph response emit — matched as a whole path, so a pending
+      // `src/app.ts` isn't "referenced" by a response that shows `src/app.tsx`.
+      if (mentionsPath(text, p.path)) inResponse.push(p);
       else elsewhere.push(p);
     }
 
@@ -2153,15 +2205,15 @@ export class ToolHandler {
       }
 
       // Read tools: off-load the CPU-heavy dispatch to the worker pool when one
-      // is attached, healthy, AND has finished its first cold start (daemon
-      // mode), so the daemon's single event loop stays free for the MCP
+      // is attached, healthy, AND has finished its first cold start,
+      // so the server's single event loop stays free for the MCP
       // transport under concurrent load — otherwise N concurrent explores
       // serialize AND starve the transport until the whole batch drains
       // (clients then time out). Before the first worker is warm, calls run
       // in-process: a call queued behind a cold start sat invisible until the
       // 45s busy backstop — the daemon's first tool call stalling for however
       // long a worker spawn takes on a loaded machine (the #662 flake). With
-      // no pool (direct mode) or a degraded one, dispatch runs in-process
+      // no pool or a degraded one, dispatch runs in-process
       // exactly as before. Either way the result flows through the
       // cross-cutting notices — worktree-index mismatch (#155) and per-file
       // staleness (#403) — which need the watched MAIN instance and so are
@@ -2173,8 +2225,12 @@ export class ToolHandler {
       // structured-clone boundary into a worker, where a closure or a handler
       // field could not follow.
       const dispatchArgs = this.withSessionView(toolName, args, sessionState);
-      const raw = (this.queryPool && this.queryPool.healthy && this.queryPool.ready)
-        ? await this.queryPool.run(toolName, dispatchArgs)
+      // The default may have appeared after the workers started. Pass the
+      // main thread's current root explicitly; with no root or projectPath,
+      // keep the main handler's workspace-specific not-indexed guidance.
+      const projectPath = args.projectPath ?? this.cg?.getProjectRoot();
+      const raw = (projectPath && this.queryPool && this.queryPool.healthy && this.queryPool.ready)
+        ? await this.queryPool.run(toolName, { ...dispatchArgs, projectPath })
         : await this.executeReadTool(toolName, dispatchArgs);
       // Record + STRIP before anything else touches the result: the emission is
       // internal bookkeeping and must never reach the client, whether or not a
@@ -3318,7 +3374,7 @@ export class ToolHandler {
         const extraction = extractQueryPaths(
           rawQuery,
           cg.getFiles().map((f) => f.path),
-          { maxPins: maxFiles },
+          { maxPins: maxFiles, existsOnDisk: (rel) => pathIsProjectFile(projectRoot, rel) },
         );
         if (extraction.pinnedFiles.length > 0 || extraction.unresolvedPathSpans.length > 0) {
           pinnedFiles = extraction.pinnedFiles;
@@ -6263,23 +6319,63 @@ export class ToolHandler {
     opts: { offset?: number; limit?: number; symbolsOnly?: boolean } = {},
   ): Promise<ToolResult> {
     const normalize = (p: string) => normalizePath(p).replace(/^(?:\.?\/+)+/, '').replace(/\/+$/, '');
-    const wantLower = normalize(fileArg).toLowerCase();
     const allFiles = cg.getFiles();
     if (allFiles.length === 0) return this.textResult('No files indexed. Run `codegraph index` first.');
 
-    let resolved = allFiles.find((f) => f.path.toLowerCase() === wantLower);
-    let candidates: typeof allFiles = [];
+    // Resolve ONE spelling of the path against the index: exact, then
+    // suffix-of-path, then substring — narrowing to a single file or handing
+    // back the ambiguous set.
+    const resolveOne = (want: string): { file?: (typeof allFiles)[number]; candidates: typeof allFiles } => {
+      const wantLower = normalize(want).toLowerCase();
+      let file = allFiles.find((f) => f.path.toLowerCase() === wantLower);
+      let found: typeof allFiles = [];
+      if (!file) {
+        found = allFiles.filter((f) => f.path.toLowerCase().endsWith('/' + wantLower));
+        if (found.length === 1) file = found[0];
+      }
+      if (!file && found.length === 0) {
+        found = allFiles.filter((f) => f.path.toLowerCase().includes(wantLower));
+        if (found.length === 1) file = found[0];
+      }
+      return { file, candidates: found };
+    };
+
+    // Agents and humans paste file references WITH a line suffix — `a.ts:12`,
+    // `a.ts:12-40`, `a.ts#L88`, `a.ts#L12-L40`. explore already strips exactly
+    // these shapes (src/search/query-paths.ts); file-view used to treat them as
+    // part of the filename and report an indexed file as missing (#1831).
+    // The literal spelling is tried FIRST, so a file genuinely named `foo:12`
+    // still resolves to itself; only when that finds nothing is the suffix
+    // stripped, and then the range becomes the read window.
+    const LINE_SUFFIX = /(?::(\d+)(?:-(\d+))?|#L(\d+)(?:-L?(\d+))?)$/;
+    let { file: resolved, candidates } = resolveOne(fileArg);
+    let shownArg = fileArg;
     if (!resolved) {
-      candidates = allFiles.filter((f) => f.path.toLowerCase().endsWith('/' + wantLower));
-      if (candidates.length === 1) resolved = candidates[0];
-    }
-    if (!resolved && candidates.length === 0) {
-      candidates = allFiles.filter((f) => f.path.toLowerCase().includes(wantLower));
-      if (candidates.length === 1) resolved = candidates[0];
+      const m = LINE_SUFFIX.exec(normalize(fileArg));
+      const stripped = m ? fileArg.slice(0, fileArg.length - m[0].length) : '';
+      const retry = stripped ? resolveOne(stripped) : undefined;
+      if (m && retry && (retry.file || retry.candidates.length > 0)) {
+        resolved = retry.file;
+        candidates = retry.candidates;
+        shownArg = stripped;
+        const startLine = Number(m[1] ?? m[3]);
+        const endRaw = m[2] ?? m[4];
+        const endLine = endRaw === undefined ? undefined : Number(endRaw);
+        if (Number.isFinite(startLine) && startLine > 0) {
+          // An explicit offset/limit from the caller always wins over the
+          // suffix. `:12` alone is a "start here" pointer (Read given only an
+          // offset); `:12-40` pins both ends.
+          opts = {
+            ...opts,
+            offset: opts.offset ?? startLine,
+            limit: opts.limit ?? (endLine !== undefined && endLine >= startLine ? endLine - startLine + 1 : undefined),
+          };
+        }
+      }
     }
     if (!resolved && candidates.length > 1) {
       return this.textResult(
-        [`"${fileArg}" matches ${candidates.length} indexed files — pass a longer path:`, '',
+        [`"${shownArg}" matches ${candidates.length} indexed files — pass a longer path:`, '',
           ...candidates.slice(0, 25).map((f) => `- ${f.path}`)].join('\n'),
       );
     }

@@ -72,6 +72,9 @@ import { armStartupHandshakeTimeout } from './startup-handshake';
 import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
 
+/** Default worker cap for a direct (single-client) session; see MCPEngineOptions.queryPoolDefaultMax (#1465). */
+const DIRECT_QUERY_POOL_MAX = 2;
+
 /**
  * Env var that marks a process as the *detached daemon* itself (set by
  * {@link spawnDetachedDaemon} when it re-invokes the CLI). Without it a
@@ -121,7 +124,7 @@ function makeFallbackEngine(root: string): MCPEngine {
       `Cannot start an in-process fallback while live daemon pid ${existing.pid} holds the project lock.`
     );
   }
-  return new MCPEngine({ writerLockRoot: root });
+  return new MCPEngine({ writerLockRoot: root, queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX });
 }
 
 /**
@@ -428,7 +431,7 @@ export class MCPServer {
       this.writerLockRoot = writerRoot;
     }
 
-    this.engine = new MCPEngine();
+    this.engine = new MCPEngine({ queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX });
     const transport = new StdioTransport();
     this.session = new MCPSession(transport, this.engine, {
       explicitProjectPath: this.projectPath,

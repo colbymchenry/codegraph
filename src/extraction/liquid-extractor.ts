@@ -125,15 +125,95 @@ export class LiquidExtractor {
   }
 
   /**
+   * Every occurrence of a Liquid tag, in BOTH spellings it can be written in.
+   *
+   * Inside a `{% liquid %}` tag, each line of the body is a tag
+   * WITHOUT braces of its own:
+   *
+   *   {% liquid
+   *     assign heading = section.settings.title
+   *     render 'card', title: heading
+   *   %}
+   *
+   * A pattern anchored on `{%` misses these references and assignments.
+   *
+   * Returns real offsets into `this.source`, so callers keep using
+   * getLineNumber/getLineStart unchanged.
+   */
+  private findTagOccurrences(
+    tagPattern: string,
+    argPattern: string,
+  ): Array<{ fullMatch: string; groups: string[]; index: number }> {
+    const found: Array<{ fullMatch: string; groups: string[]; index: number }> = [];
+
+    // Consume complete braced tags so strings and comments cannot start a
+    // second match inside the same tag. Skip non-executing regions entirely.
+    const blocks: Array<{ bodyStart: number; body: string }> = [];
+    const tags = /\{%[-]?\s*(\w+|#)([\s\S]*?)[-]?%\}/g;
+    const braced = new RegExp(`^\\{%[-]?\\s*(${tagPattern})\\s+${argPattern}`);
+    let suppressed: string | undefined;
+    let tag;
+    while ((tag = tags.exec(this.source)) !== null) {
+      const name = tag[1]!;
+      if (suppressed) {
+        if (name === `end${suppressed}`) suppressed = undefined;
+        continue;
+      }
+      if (name === 'comment' || name === 'raw') {
+        suppressed = name;
+        continue;
+      }
+      if (name === 'liquid') {
+        blocks.push({
+          bodyStart: tag.index + tag[0].indexOf(name) + name.length,
+          body: tag[2]!,
+        });
+        continue;
+      }
+      const match = braced.exec(tag[0]);
+      if (match) {
+        found.push({ fullMatch: match[0], groups: match.slice(1) as string[], index: tag.index });
+      }
+    }
+
+    /* Inside a `{% liquid %}` body each tag starts its own line. Anchoring on
+       the line start keeps prose, filters and inline `#` comments out. */
+    const bare = new RegExp(`^[ \\t]*(${tagPattern})[ \\t]+${argPattern}`);
+    for (const b of blocks) {
+      let offset = b.bodyStart;
+      let suppressed: string | undefined;
+      for (const line of b.body.split('\n')) {
+        const name = /^[ \t]*(\w+)/.exec(line)?.[1];
+        if (suppressed) {
+          if (name === `end${suppressed}`) suppressed = undefined;
+        } else if (name === 'comment' || name === 'raw') {
+          suppressed = name;
+        } else {
+          const inner = bare.exec(line);
+          if (inner) {
+            found.push({
+              fullMatch: inner[0].trimStart(),
+              groups: inner.slice(1) as string[],
+              index: offset + (inner[0].length - inner[0].trimStart().length),
+            });
+          }
+        }
+        offset += line.length + 1;
+      }
+    }
+
+    return found.sort((a, b) => a.index - b.index);
+  }
+
+  /**
    * Extract {% render 'snippet' %} and {% include 'snippet' %} references
    */
   private extractSnippetReferences(fileNodeId: string): void {
-    // Match {% render 'name' %} or {% include 'name' %} with optional parameters
-    const renderRegex = /\{%[-]?\s*(render|include)\s+['"]([^'"]+)['"]/g;
-    let match;
-
-    while ((match = renderRegex.exec(this.source)) !== null) {
-      const [fullMatch, tagType, snippetName] = match;
+    // Both spellings: {% render 'name' %} and a bare `render 'name'` line
+    // inside a {% liquid %} block.
+    for (const match of this.findTagOccurrences('render|include', `['"]([^'"]+)['"]`)) {
+      const fullMatch = match.fullMatch;
+      const [tagType, snippetName] = match.groups;
       const line = this.getLineNumber(match.index);
 
       // Create an import node for searchability
@@ -202,12 +282,10 @@ export class LiquidExtractor {
    * Extract {% section 'name' %} references
    */
   private extractSectionReferences(fileNodeId: string): void {
-    // Match {% section 'name' %}
-    const sectionRegex = /\{%[-]?\s*section\s+['"]([^'"]+)['"]/g;
-    let match;
-
-    while ((match = sectionRegex.exec(this.source)) !== null) {
-      const [fullMatch, sectionName] = match;
+    // Both spellings, as for render/include above.
+    for (const match of this.findTagOccurrences('section', `['"]([^'"]+)['"]`)) {
+      const fullMatch = match.fullMatch;
+      const sectionName = match.groups[1];
       const line = this.getLineNumber(match.index);
 
       // Create an import node for searchability
@@ -335,12 +413,9 @@ export class LiquidExtractor {
    * Extract {% assign var = value %} statements
    */
   private extractAssignments(fileNodeId: string): void {
-    // Match {% assign variable_name = ... %}
-    const assignRegex = /\{%[-]?\s*assign\s+(\w+)\s*=/g;
-    let match;
-
-    while ((match = assignRegex.exec(this.source)) !== null) {
-      const [, variableName] = match;
+    // Both spellings. Most of a modern theme's assigns are the bare kind.
+    for (const match of this.findTagOccurrences('assign', `(\\w+)\\s*=`)) {
+      const variableName = match.groups[1];
       const line = this.getLineNumber(match.index);
 
       // Create a variable node
@@ -356,7 +431,7 @@ export class LiquidExtractor {
         startLine: line,
         endLine: line,
         startColumn: match.index - this.getLineStart(line),
-        endColumn: match.index - this.getLineStart(line) + match[0].length,
+        endColumn: match.index - this.getLineStart(line) + match.fullMatch.length,
         updatedAt: Date.now(),
       };
 

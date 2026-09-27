@@ -39,14 +39,17 @@ export interface MCPEngineOptions {
    */
   watch?: boolean;
   /**
-   * Whether to off-load read-tool dispatch to a worker-thread pool. Only the
-   * SHARED daemon wants this — it serves many concurrent clients on one event
-   * loop, so without a pool concurrent explores serialize and starve the MCP
-   * transport. Direct mode (one stdio client, no concurrency) leaves it off so a
-   * single call never pays a worker round-trip. `CODEGRAPH_QUERY_POOL_SIZE=0`
-   * disables it even in daemon mode.
+   * Whether to off-load read-tool dispatch to a worker-thread pool. Both daemon
+   * and direct sessions can issue concurrent calls on one event loop.
+   * `CODEGRAPH_QUERY_POOL_SIZE=0` disables it in either mode.
    */
   queryPool?: boolean;
+  /**
+   * Worker cap when `CODEGRAPH_QUERY_POOL_SIZE` is unset. A direct (single-client)
+   * session sets a small cap so every session doesn't hold one worker per core;
+   * the shared daemon leaves it unset and scales with the machine.
+   */
+  queryPoolDefaultMax?: number;
   /**
    * Project root whose writer slot must be claimed synchronously before this
    * engine can open the graph. Used by proxy fallback to fence catch-up sync,
@@ -76,14 +79,14 @@ export class MCPEngine {
   private watcherStarted = false;
   /** Set when this engine holds writer.pid (#1740). */
   private writerLockRoot: string | null = null;
-  private opts: Required<Omit<MCPEngineOptions, 'writerLockRoot'>>;
+  private opts: Required<Omit<MCPEngineOptions, 'writerLockRoot' | 'queryPoolDefaultMax'>> & Pick<MCPEngineOptions, 'queryPoolDefaultMax'>;
   private closed = false;
-  // Off-loop read-tool pool (daemon mode only). Created lazily once the default
-  // project is open — workers each hold their own WAL read connection.
+  // Off-loop read-tool pool. Workers each hold their own WAL read connections;
+  // sessions without a default index open projects lazily via projectPath.
   private queryPool: QueryPool | null = null;
 
   constructor(opts: MCPEngineOptions = {}) {
-    this.opts = { watch: opts.watch ?? true, queryPool: opts.queryPool ?? false };
+    this.opts = { watch: opts.watch ?? true, queryPool: opts.queryPool ?? false, queryPoolDefaultMax: opts.queryPoolDefaultMax };
     this.toolHandler = new ToolHandler(null);
     if (opts.writerLockRoot) {
       const writer = tryAcquireWriterLock(opts.writerLockRoot, 'fallback');
@@ -95,14 +98,18 @@ export class MCPEngine {
   }
 
   /**
-   * Start the worker-thread query pool once a default project is open (daemon
-   * mode only; honors `CODEGRAPH_QUERY_POOL_SIZE`). Idempotent and best-effort:
+   * Start the worker-thread query pool after resolving the default project
+   * (which may be absent). Honors `CODEGRAPH_QUERY_POOL_SIZE`; best-effort:
    * if workers can't spawn on this platform the ToolHandler keeps serving reads
    * in-process, so the pool can only help, never break, tool calls.
    */
-  private maybeStartPool(root: string): void {
+  private maybeStartPool(root: string | null): void {
     if (!this.opts.queryPool || this.queryPool || this.closed) return;
-    const size = resolvePoolSize(process.env.CODEGRAPH_QUERY_POOL_SIZE, os.cpus().length);
+    const envSize = process.env.CODEGRAPH_QUERY_POOL_SIZE;
+    let size = resolvePoolSize(envSize, os.cpus().length);
+    if ((envSize === undefined || envSize === '') && this.opts.queryPoolDefaultMax !== undefined) {
+      size = Math.min(size, this.opts.queryPoolDefaultMax);
+    }
     if (size <= 0) {
       process.stderr.write('[CodeGraph MCP] Query pool disabled (CODEGRAPH_QUERY_POOL_SIZE=0); serving reads in-process.\n');
       return;
@@ -263,6 +270,7 @@ export class MCPEngine {
           `[CodeGraph MCP] Indexed sub-projects found: ${rels.join(', ')}. Pass \`projectPath\` per call, or launch with --path.\n`
         );
       }
+      this.maybeStartPool(null);
       return;
     }
     if (res.viaSubScan) this.logSubprojectAdoption(searchFrom, resolvedRoot);

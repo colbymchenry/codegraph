@@ -93,6 +93,12 @@ fn has_lower_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"[a-z]").unwrap())
 }
+fn single_arg_macro_replacement_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(
+        r"^(?:[A-Za-z_][A-Za-z0-9_:]*[ \t\r\n]+)+[*& \t\r\n]*([A-Za-z_][A-Za-z0-9_]*)[ \t\r\n]*\([^(){};#]*\)[ \t\r\n]*$"
+    ).unwrap())
+}
 /// normalizeCppReturnType: smart-pointer/optional unwrap.
 fn ret_wrapper_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -593,6 +599,9 @@ impl<'t> Walker<'t> {
     /// extractNameRaw for the c/cpp extractor configs (nameField 'declarator';
     /// cpp resolveName = extractCppQualifiedMethodName).
     fn extract_name_raw(&self, node: Node) -> String {
+        if let Some(name) = self.recover_single_arg_macro_defined_name(node) {
+            return name;
+        }
         if self.variant == Variant::Cpp {
             if let Some(hook) = self.extract_cpp_qualified_method_name(node) {
                 return hook;
@@ -648,6 +657,84 @@ impl<'t> Walker<'t> {
         let text = self.text(qid).trim();
         let parts: Vec<&str> = text.split("::").filter(|p| !p.is_empty()).collect();
         parts.last().map(|s| s.to_string())
+    }
+
+    /// recoverSingleArgMacroDefinedName: only a local macro definition proves
+    /// that its argument is the function name, in either parser shape (#1373).
+    fn recover_single_arg_macro_defined_name(&self, node: Node) -> Option<String> {
+        if node.kind() != "function_definition" {
+            return None;
+        }
+        let declarator = node.child_by_field_name("declarator")?;
+        let (macro_node, argument) = if declarator.kind() == "parenthesized_declarator"
+            && declarator.named_child_count() == 1
+        {
+            let m = node.child_by_field_name("type")?;
+            let a = declarator.named_child(0)?;
+            if m.kind() != "type_identifier" || a.kind() != "identifier" {
+                return None;
+            }
+            (m, a)
+        } else if declarator.kind() == "function_declarator"
+            && node.child_by_field_name("type").is_none()
+        {
+            let m = declarator.child_by_field_name("declarator")?;
+            let params = declarator.child_by_field_name("parameters")?;
+            let param = params.named_child(0)?;
+            if m.kind() != "identifier" || params.named_child_count() != 1
+                || param.kind() != "parameter_declaration" || param.named_child_count() != 1
+            {
+                return None;
+            }
+            let a = param.named_child(0)?;
+            if a.kind() != "type_identifier" {
+                return None;
+            }
+            (m, a)
+        } else {
+            return None;
+        };
+        let macro_name = self.text(macro_node);
+        let mut scope = Some(node);
+        while let Some(current) = scope {
+            if current.kind() == "preproc_else" || current.kind().starts_with("preproc_elif") {
+                return None;
+            }
+            let mut previous = current.prev_named_sibling();
+            while let Some(prev) = previous {
+                previous = prev.prev_named_sibling();
+                if prev.kind().starts_with("preproc_if") {
+                    return None;
+                }
+                if prev.kind() == "preproc_call"
+                    && prev.child_by_field_name("directive").map(|n| self.text(n)) == Some("#undef")
+                    && prev.child_by_field_name("argument").map(|n| self.text(n).trim()) == Some(macro_name)
+                {
+                    return None;
+                }
+                if !matches!(prev.kind(), "preproc_function_def" | "preproc_def")
+                    || prev.child_by_field_name("name").map(|n| self.text(n)) != Some(macro_name)
+                {
+                    continue;
+                }
+                let params = prev.child_by_field_name("parameters")?;
+                let param = params.named_child(0)?;
+                let value = prev.child_by_field_name("value")?;
+                if params.named_child_count() != 1 || param.kind() != "identifier" {
+                    return None;
+                }
+                let replacement = self.text(value).replace("\\\r\n", " ").replace("\\\n", " ");
+                let captures = single_arg_macro_replacement_re().captures(replacement.trim())?;
+                if replacement.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').any(|s| s == "typedef")
+                    || captures.get(1)?.as_str() != self.text(param)
+                {
+                    return None;
+                }
+                return Some(self.text(argument).to_string());
+            }
+            scope = current.parent();
+        }
+        None
     }
 
     /// recoverCppMacroDefinedName (languages/c-cpp.ts:49).

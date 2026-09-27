@@ -1,15 +1,20 @@
 /**
- * QueryPool — the off-loop worker pool that keeps the shared daemon's main
+ * QueryPool — the off-loop worker pool that keeps the MCP server's main
  * event loop free for the MCP transport under concurrent read load (the
- * "10 subagents time out" report). These tests drive the pool's queue / growth /
+ * "10 subagents time out" report). Unit tests drive the pool's queue / growth /
  * crash-recovery / backstop logic with INJECTED fake workers, so they exercise
  * the real scheduling code without spawning threads or needing a built dist.
  *
- * End-to-end behavior with real worker threads (a worker opens its own WAL read
- * connection and runs codegraph_explore) is validated separately against a real
- * index; here we pin the orchestration that makes that safe and fair.
+ * Integration tests below use the built engine and real worker threads against
+ * real indexes to cover direct-mode routing, session accounting, and teardown.
  */
-import { describe, it, expect } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { CodeGraph } from '../src';
+import { ExploreSessionState, EXPLORE_EMISSION_KEY } from '../src/mcp/explore-session-state';
+import type { MCPEngine } from '../src/mcp/engine';
 import { QueryPool, resolvePoolSize, type PoolWorker } from '../src/mcp/query-pool';
 import type { ToolResult } from '../src/mcp/tools';
 
@@ -195,4 +200,120 @@ describe('QueryPool', () => {
     expect(pool.ready).toBe(false); // hard open failure — keep serving in-process
     await pool.destroy();
   });
+});
+
+// Use the built engine so its pool loads the real compiled worker sibling.
+const BuiltEngine: typeof MCPEngine = require('../dist/mcp/engine').MCPEngine;
+
+describe('MCP query pool with real projects (#1465)', () => {
+  let tempDir: string;
+  let engine: MCPEngine | undefined;
+  let pool: QueryPool | null;
+
+  beforeEach(() => {
+    tempDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-query-pool-')));
+    pool = null;
+    vi.stubEnv('CODEGRAPH_QUERY_POOL_SIZE', '2');
+  });
+
+  afterEach(async () => {
+    await pool?.destroy();
+    engine?.stop();
+    engine = undefined;
+    vi.unstubAllEnvs();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  async function indexProject(name: string, symbol: string): Promise<string> {
+    const root = path.join(tempDir, name);
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(path.join(root, 'app.ts'), `export function ${symbol}() { return 42; }\n`);
+    const cg = await CodeGraph.init(root);
+    try { await cg.indexAll(); } finally { cg.close(); }
+    return root;
+  }
+
+  async function start(root: string): Promise<MCPEngine> {
+    engine = new BuiltEngine({ watch: false, queryPool: true });
+    await engine.ensureInitialized(root);
+    pool = (engine as unknown as { queryPool: QueryPool | null }).queryPool;
+    return engine;
+  }
+
+  it.each([true, false])('routes concurrent reads across projects with default=%s, preserving output and session state', async (hasDefault) => {
+    const alpha = await indexProject('alpha', 'alphaSymbol');
+    const beta = await indexProject('beta', 'betaSymbol');
+    const workspace = path.join(tempDir, 'workspace');
+    fs.mkdirSync(workspace);
+    const activeEngine = await start(hasDefault ? alpha : workspace);
+    expect(pool).not.toBeNull();
+    await vi.waitFor(() => expect(pool!.ready).toBe(true), { timeout: 15000 });
+    const handler = activeEngine.getToolHandler();
+    // Drain catch-up before comparing the worker and in-process paths.
+    await handler.execute('codegraph_status', { projectPath: alpha });
+    const session = new ExploreSessionState();
+    const calls = Array.from({ length: 6 }, (_, i) => {
+      const projectPath = i % 2 ? beta : alpha;
+      const query = i % 2 ? 'betaSymbol' : 'alphaSymbol';
+      return handler.execute('codegraph_explore', { projectPath, query }, session);
+    });
+    expect(pool!.liveWorkers).toBe(2);
+    const results = await Promise.all(calls);
+    for (const [i, result] of results.entries()) {
+      expect(result.isError).toBeFalsy();
+      expect(result.content[0].text).toContain(i % 2 ? 'betaSymbol' : 'alphaSymbol');
+      expect(result.content[0].text).not.toContain(i % 2 ? 'alphaSymbol' : 'betaSymbol');
+      expect(result).not.toHaveProperty(EXPLORE_EMISSION_KEY);
+    }
+    expect(session.callCount(alpha)).toBe(3);
+    expect(session.callCount(beta)).toBe(3);
+    const args = { projectPath: beta, query: 'betaSymbol' };
+    const pooled = await handler.execute('codegraph_explore', args);
+    handler.setQueryPool(null);
+    expect(await handler.execute('codegraph_explore', args)).toEqual(pooled);
+    handler.setQueryPool(pool);
+    if (!hasDefault) {
+      const missing = await handler.execute('codegraph_explore', { query: 'alphaSymbol' });
+      expect(missing.isError).toBeFalsy();
+      expect(missing.content[0].text).toContain(workspace);
+      expect(missing.content[0].text).toContain('No CodeGraph project');
+      // A default index can appear after rootless workers are already warm.
+      await indexProject('workspace', 'lateSymbol');
+      activeEngine.retryInitializeSync(workspace);
+      const late = await handler.execute('codegraph_explore', { query: 'lateSymbol' });
+      expect(late.isError).toBeFalsy();
+      expect(late.content[0].text).toContain('lateSymbol');
+    }
+  }, 30000);
+
+  it('honors size=0 for projectPath-only sessions', async () => {
+    const alpha = await indexProject('alpha', 'alphaSymbol');
+    const workspace = path.join(tempDir, 'workspace');
+    fs.mkdirSync(workspace);
+    vi.stubEnv('CODEGRAPH_QUERY_POOL_SIZE', '0');
+    const activeEngine = await start(workspace);
+    expect(pool).toBeNull();
+    const result = await activeEngine.getToolHandler().execute('codegraph_explore', {
+      projectPath: alpha, query: 'alphaSymbol',
+    });
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0].text).toContain('alphaSymbol');
+  }, 30000);
+
+  it('stops real workers and settles queued calls on engine teardown', async () => {
+    const alpha = await indexProject('alpha', 'alphaSymbol');
+    const activeEngine = await start(alpha);
+    expect(pool).not.toBeNull();
+    const calls = Array.from({ length: 6 }, () => pool!.run('codegraph_explore', { query: 'alphaSymbol' }));
+    const workers = (pool as unknown as { workers: Set<import('worker_threads').Worker> }).workers;
+    const exits = [...workers].map((worker) => new Promise<void>((resolve) => worker.once('exit', () => resolve())));
+    activeEngine.stop();
+    const results = await Promise.all(calls);
+    await Promise.all(exits);
+    expect(results.every((r) => r.content[0].text.includes('shutting down'))).toBe(true);
+    expect(pool!.liveWorkers).toBe(0);
+    expect(pool!.healthy).toBe(false);
+    await activeEngine.ensureInitialized(alpha);
+    expect((activeEngine as unknown as { queryPool: QueryPool | null }).queryPool).toBeNull();
+  }, 30000);
 });

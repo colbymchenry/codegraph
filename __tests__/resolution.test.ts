@@ -28,12 +28,43 @@ describe('Resolution Module', () => {
   });
 
   afterEach(() => {
-    // Clean up
+    // destroy() is an alias for close(): it releases the database but leaves
+    // the project directory on disk, so removing tempDir cannot be the
+    // alternative to it. Both must run, on every test. maxRetries covers
+    // Windows releasing the SQLite handles slightly after close() returns.
     if (cg) {
       cg.destroy();
-    } else if (fs.existsSync(tempDir)) {
-      fs.rmSync(tempDir, { recursive: true });
+      cg = undefined as unknown as CodeGraph;
     }
+    fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 5 });
+  });
+
+  it.each(['c', 'cpp'] as const)('connects single-argument function macros in %s (#1373)', async (language) => {
+    const file = `main.${language}`;
+    fs.writeFileSync(path.join(tempDir, file), [
+      '#define NATIVE_FN(name) int name(void)',
+      'int helper(void) { return 1; }',
+      'NATIVE_FN(get_version) { return helper(); }',
+      'int use_it(void) { return get_version(); }',
+      'int plain_func(void) { return 42; }',
+      '',
+    ].join('\n'));
+    cg = await CodeGraph.init(tempDir, { index: true });
+    const functions = cg.getNodesByKind('function');
+    const recovered = functions.find((n) => n.name === 'get_version');
+    expect(recovered).toBeDefined();
+    expect(cg.getCallers(recovered!.id).map((c) => c.node.name)).toContain('use_it');
+    expect(cg.getCallees(recovered!.id).map((c) => c.node.name)).toContain('helper');
+    const caller = functions.find((n) => n.name === 'use_it')!;
+    expect(cg.getCallees(caller.id).map((c) => c.node.id)).toContain(recovered!.id);
+    expect(functions.map((n) => n.name)).toContain('plain_func');
+    const { ToolHandler } = await import('../src/mcp/tools');
+    const result = await new ToolHandler(cg).execute('codegraph_explore', { query: 'use_it get_version helper' });
+    expect(result.isError).toBeUndefined();
+    const text = result.content[0]!.text!;
+    expect(text).toContain('Flow');
+    expect(text).toMatch(/use_it[^\n]*get_version[^\n]*helper/);
+
   });
 
   describe('Name Matcher', () => {
@@ -3947,6 +3978,7 @@ int run() {
             and src.kind = 'file'
             and src.file_path = 'src/main.cpp'
         `).all() as Array<{ dstKind: string; dstPath: string }>;
+        db.close();
         const resolvedToHeader = rows.find(
           (r) => r.dstKind === 'file' && r.dstPath === 'include/utils.h'
         );
@@ -3957,6 +3989,13 @@ int run() {
         );
         expect(stdlibFile).toBeUndefined();
       } finally {
+        // The graph opened on tempProject has to be closed here: the outer
+        // afterEach runs after this finally, so on Windows the still-open
+        // database makes the removal fail with EPERM.
+        if (cg) {
+          cg.close();
+          cg = undefined as unknown as CodeGraph;
+        }
         fs.rmSync(tempProject, { recursive: true, force: true });
       }
     });
@@ -3994,6 +4033,7 @@ class Both : public Base<char>, public Plain {}; // templated + plain in one cla
             where e.kind = 'extends'`
         )
         .all() as Array<{ fromName: string; toName: string }>;
+      db.close();
       const has = (from: string, to: string) =>
         edges.some((r) => r.fromName === from && r.toName === to);
 
@@ -4056,11 +4096,19 @@ class Both : public Base<char>, public Plain {}; // templated + plain in one cla
             and src.kind = 'file'
             and src.file_path = 'src/page.php'
         `).all() as Array<{ dstKind: string; dstPath: string }>;
+        db.close();
         const resolved = rows.find(
           (r) => r.dstKind === 'file' && r.dstPath === 'src/lib.php'
         );
         expect(resolved, 'page.php → src/lib.php imports edge missing').toBeDefined();
       } finally {
+        // The graph opened on tempProject has to be closed here: the outer
+        // afterEach runs after this finally, so on Windows the still-open
+        // database makes the removal fail with EPERM.
+        if (cg) {
+          cg.close();
+          cg = undefined as unknown as CodeGraph;
+        }
         fs.rmSync(tempProject, { recursive: true, force: true });
       }
     });
@@ -4090,11 +4138,19 @@ class Both : public Base<char>, public Plain {}; // templated + plain in one cla
             and src.kind = 'file'
             and src.file_path = 'index.php'
         `).all() as Array<{ dstKind: string; dstPath: string }>;
+        db.close();
         expect(
           rows.find((r) => r.dstKind === 'file' && r.dstPath === 'inc/db.php'),
           'index.php → inc/db.php imports edge missing'
         ).toBeDefined();
       } finally {
+        // The graph opened on tempProject has to be closed here: the outer
+        // afterEach runs after this finally, so on Windows the still-open
+        // database makes the removal fail with EPERM.
+        if (cg) {
+          cg.close();
+          cg = undefined as unknown as CodeGraph;
+        }
         fs.rmSync(tempProject, { recursive: true, force: true });
       }
     });
@@ -4129,11 +4185,19 @@ class Both : public Base<char>, public Plain {}; // templated + plain in one cla
             and src.kind = 'file'
             and src.file_path = 'app/page.php'
         `).all() as Array<{ dstKind: string; dstPath: string }>;
+        db.close();
         expect(
           rows.find((r) => r.dstKind === 'file' && r.dstPath === 'lib/inc/db.php'),
           'app/page.php must NOT mis-connect to unrelated lib/inc/db.php'
         ).toBeUndefined();
       } finally {
+        // The graph opened on tempProject has to be closed here: the outer
+        // afterEach runs after this finally, so on Windows the still-open
+        // database makes the removal fail with EPERM.
+        if (cg) {
+          cg.close();
+          cg = undefined as unknown as CodeGraph;
+        }
         fs.rmSync(tempProject, { recursive: true, force: true });
       }
     });

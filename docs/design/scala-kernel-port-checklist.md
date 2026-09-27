@@ -39,6 +39,17 @@ child list, not "the" field (§Extractor config, §Extension).
 
 ## Grammar prep (NO wasm bump — vendored-C kernel build only)
 
+> **Superseded (2026-09-23, #1823):** both copies were bumped to the
+> tree-sitter-scala **v0.26.2** release (tag commit `b931fcc338`). The
+> `0aca5d0a6f` pin parsed `class A(x: X)(implicit y: Y) extends B(x)(y) with C
+> with D` with an ERROR and cut the `extends` clause after `B(x)(y)`, so `C`
+> and `D` never became inheritance edges. v0.26.2 is additive over the pin (no
+> node type or field removed; new ones: capture checking, XML literals,
+> `uses_clause`, `early_defs`, …). Wasm = the release asset, sha256
+> `37d7fe5a91ca98941dc05493b0c05a0df0f36df5035890fa00b02497c68aaac3`; C sources
+> from the tag's `src/` (shas in `codegraph-kernel/build.rs`). The record below
+> describes the original port.
+
 - **Production wasm**: `src/extraction/wasm/tree-sitter-scala.wasm`, sha256
   `7945b13e6f9b15b578c5e5e4e60253c049fec07c531518163f3415a76c0621aa`
   (src == dist byte-identical), ABI **15**, STATE_COUNT 26650, 357+5 symbols,

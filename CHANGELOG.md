@@ -145,6 +145,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- The Claude Code prompt hook no longer runs on the task-notification messages Claude Code injects when a background agent finishes, removing a multi-second stall on every such turn. (#1832)
+
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
 - Turning telemetry off now resets its identity and stops running processes from recording, sending, or restoring unsent data. (#1869)
@@ -157,16 +159,20 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Calling a built-in method on an awaited value no longer records a call into an unrelated class that happens to declare a method of the same name, and a variable bound to an awaited call now resolves methods on the type that call returns. Thanks @maxmilian. (#1840)
 - Spring mappings now include every declared path combination and resolve constants declared in the same file, while unresolved paths no longer appear as false root routes. (#1461)
+- `codegraph node` now accepts a file reference that carries a line number — `src/app.ts:42`, `src/app.ts:42-80`, `src/app.ts#L42`, `src/app.ts#L42-L80` — instead of reporting the file as not indexed; the line range becomes the window that is read, and an `--offset`/`--limit` you pass yourself still wins. A path that really is named that way is still looked up as written. (#1831)
 - `codegraph callers`, `codegraph callees` and `codegraph impact` now resolve qualified names, group results and JSON edges by definition, and accept `--file` to narrow ambiguous names; thanks @ferrine. (#1512, #1656)
 - `codegraph callers`, `codegraph callees` and `codegraph impact` (CLI and MCP) now report missing names with did-you-mean suggestions instead of another symbol's results, and exact matches with no callers stay empty; thanks @uvmplus. (#1473, #1481)
 
 #### MCP / indexing
 
+- File watching no longer drops the full re-scan a removed directory asks for when that sync fails, so the deleted files leave the index instead of lingering. (#1964)
 - Daemon startup and cleanup now preserve live legacy PID-only locks while still reclaiming dead or identity-disproved records, preventing two writers from serving the same project.
 - Incremental sync now keeps edge rebinding crash-safe: replacing a resolved edge with its recovery reference commits atomically, so an interruption cannot permanently remove the relationship.
 - Status now detects committed but unindexed changes and restored edits without scanning every source file; thanks @inth3shadows. (#1829)
 
 - The prompt hook no longer injects unrelated projects when run from your home directory or a broader directory containing a stray workspace manifest. (#1454)
+
+- `codegraph_explore` now says so when a query names an extension-less file the index doesn't hold. A path like `scripts/deploy` has no extension on its last segment, so it failed the shape test that decides a span is a path beyond doubt — the name was left in the query, shredded into `scripts` and `deploy`, and the answer came back as a pile of unrelated source with no hint that the file you named was never consulted. Such a span is now checked against the project directory: if it is a real file, the answer carries the same `No indexed file uniquely matches ...` note a misspelled `src/foo.ts` already got. Slashed prose — `and/or`, `input/output`, `gen_server:call/2` — has no file behind it and is still left in the query untouched. (#1830)
 
 - Indexing now succeeds when Node.js's SQLite lacks FTS5, with search falling back to name and fuzzy matching; thanks @aniruddhaadak80. (#1532)
 
@@ -191,6 +197,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Indexing no longer checks whether files outside your project exist. A relative import that points above the project directory (`../../something`) made CodeGraph probe that location on disk while resolving it. Nothing outside the project was ever read, and no such file was ever added to the index or linked to, but the check itself should not have happened — such an import now simply resolves to nothing. Symlinks inside your project that point at code kept elsewhere are unaffected and still index as before. Thanks @ErQrYfkrju. (#1631)
 
 - `codegraph install` now honors `CLAUDE_CONFIG_DIR` and `CODEX_HOME` for global Claude Code and Codex setup so CodeGraph loads in your chosen profile (thanks @seanchann; #1627).
+
+- `codegraph install --refresh` no longer leaves a `.backup` file beside the config of an agent it isn't set up for. Checking whether an agent already has CodeGraph meant reading its config, and a config that wasn't valid JSON — an empty `mcp_config.json` next to an Antigravity install, say — got copied aside with a warning that CodeGraph was about to overwrite it, even though the agent was then skipped untouched. Checking is silent now; a config that can't be read is still backed up, but only when CodeGraph really is replacing it. Thanks @Gotman08. (#1870)
 
 - Files opted in with `includeIgnored` now stay indexed on Git older than 2.36, and embedded repositories remain visible to the watcher (thanks @maxmilian and @newshowardz777; #1549).
 
@@ -266,6 +274,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### Symbols, tests and the viewer
 
+- In `codegraph ui`, routes whose handlers live in more than 60 different files are all linked to their handler, instead of the later ones showing "not in the index". (#1975)
 - Kotlin functions and methods now carry their signature — `(params): ReturnType` — in `codegraph_explore`, `node` and the viewer, instead of no signature at all. Re-index Kotlin projects after upgrading. (#1495)
 - TypeScript/JavaScript value aliases — `export const alias = fn`, `export { fn as alias }`, object-literal `api = { run: fn }`, and same-file `const local = fn` — now forward calls edges to the aliased function, so callers and impact on the implementation include consumers that call through the alias instead of stopping at the binding. Genuine wrappers (`() => fn()`) are unchanged. Re-index after upgrading. Thanks @valkyriweb. (#1482, #1485)
 - `codegraph affected` now finds Go, Python and JVM test files that previously went unreported, while preserving custom `--filter` behavior (thanks @danusha2345; #1507, #1688).
@@ -279,6 +288,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Imports from Node built-ins or npm packages no longer connect to unrelated type members with matching names; re-index after upgrading to clear existing false dependencies. Thanks @ctype-lab. (#1537)
 
 - Inheritance relationships no longer attach external Rust or npm supertypes to unrelated local symbols with the same name, including in Svelte, Vue and Astro components; re-index after upgrading to clear existing false relationships. Thanks @ctype-lab. (#1536)
+
+- Spring's dependency-injection resolution patterns no longer capture inheritance references or references from other languages. In a polyglot repository where Spring is detected (a sibling Java module is enough), a Scala or Kotlin `extends`/`implements` reference could be resolved by Spring's directory-convention heuristics to an unrelated same-named class — for example a test fixture — corrupting the inheritance graph that `codegraph_impact` and `codegraph_explore` walk. Inheritance now always resolves through imports and name matching, and the Spring DI patterns only apply to Java/Kotlin references. Re-index after upgrading. (#1825)
 
 - PHP static calls through imported class aliases now reach the correct class when services and repositories share method names, so callers and impact analysis show the right dependencies after re-indexing. (#1545)
 - TypeScript/JavaScript: a call through a field of the enclosing class — `this.mailer.send()` — now resolves on the field's declared type, so a delegating wrapper that shares the method's name no longer records itself as its own callee and `callers`, `impact` and trace stop lying on that shape. A field whose type is external or a builtin stays unresolved rather than guessed. Re-index after upgrading. (#1496)

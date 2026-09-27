@@ -49,8 +49,8 @@ interface SpawnedServer {
   stderr: string[];
 }
 
-function spawnServer(cwd: string, env: NodeJS.ProcessEnv = {}): SpawnedServer {
-  const child = spawn(process.execPath, [BIN, 'serve', '--mcp'], {
+function spawnServer(cwd: string, env: NodeJS.ProcessEnv = {}, args: string[] = []): SpawnedServer {
+  const child = spawn(process.execPath, [BIN, 'serve', '--mcp', ...args], {
     cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
     // #618: the daemon-attach log line is now off by default; opt the test
@@ -309,6 +309,102 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(fs.existsSync(path.join(realRoot, '.codegraph', 'daemon.pid'))).toBe(false);
     expect(fs.existsSync(path.join(realRoot, '.codegraph', 'daemon.log'))).toBe(false);
   }, 20000);
+
+  it.each(['2', '0'])('direct stdio honors query pool size=%s and exits after concurrent reads', async (size) => {
+    fs.writeFileSync(path.join(tempDir, 'app.ts'), 'export function directSymbol() { return 42; }\n');
+    const cg = await CodeGraph.open(tempDir);
+    try { await cg.indexAll(); } finally { cg.close(); }
+    const server = spawnServer(tempDir, {
+      CODEGRAPH_NO_DAEMON: '1', CODEGRAPH_QUERY_POOL_SIZE: size,
+    }, ['--no-watch', '--path', tempDir]);
+    servers.push(server);
+    sendInitialize(server.child, `file://${tempDir}`, 1);
+    await waitFor(() => findResponse(server.stdout, 1), 10000);
+    await waitFor(() => server.stderr.some((l) => l.includes(size === '0'
+      ? 'Query pool disabled' : 'Query pool: up to 2 worker thread(s)')), 10000, 25, 'direct query pool configuration');
+    const ids = [2, 3, 4, 5, 6, 7];
+    for (const id of ids) {
+      sendMessage(server.child, {
+        jsonrpc: '2.0', id, method: 'tools/call',
+        params: { name: 'codegraph_explore', arguments: { query: 'directSymbol' } },
+      });
+    }
+    const replies = await Promise.all(ids.map((id) => waitFor(() => findResponse(server.stdout, id), 15000)));
+    for (const reply of replies) {
+      expect(reply.error).toBeUndefined();
+      expect(reply.result.isError).toBeFalsy();
+      expect(reply.result.content[0].text).toContain('directSymbol');
+      expect(reply.result).not.toHaveProperty('_cgExploreEmission');
+    }
+    const exited = new Promise<number | null>((resolve) => server.child.once('exit', resolve));
+    server.child.stdin.end();
+    expect(await exited).toBe(0);
+  }, 30000);
+
+  it('direct stdio queries multiple projects without a default index', async () => {
+    fs.rmSync(path.join(tempDir, '.codegraph'), { recursive: true, force: true });
+    for (const name of ['alpha', 'beta']) {
+      const root = path.join(tempDir, name);
+      fs.mkdirSync(root);
+      fs.writeFileSync(path.join(root, 'app.ts'), `export function ${name}Symbol() { return 42; }\n`);
+      const cg = await CodeGraph.init(root);
+      try { await cg.indexAll(); } finally { cg.close(); }
+    }
+    const server = spawnServer(tempDir, {
+      CODEGRAPH_NO_DAEMON: '1', CODEGRAPH_QUERY_POOL_SIZE: '2',
+    }, ['--no-watch', '--path', tempDir]);
+    servers.push(server);
+    sendInitialize(server.child, `file://${tempDir}`, 1);
+    await waitFor(() => findResponse(server.stdout, 1), 10000);
+    await waitFor(() => server.stderr.some((l) => l.includes('Query pool: up to 2')), 10000);
+    for (const [i, name] of ['alpha', 'beta'].entries()) {
+      sendMessage(server.child, {
+        jsonrpc: '2.0', id: i + 2, method: 'tools/call',
+        params: { name: 'codegraph_explore', arguments: { query: `${name}Symbol`, projectPath: path.join(tempDir, name) } },
+      });
+    }
+    for (const [i, name] of ['alpha', 'beta'].entries()) {
+      const reply = await waitFor(() => findResponse(server.stdout, i + 2), 15000);
+      expect(reply.result.isError).toBeFalsy();
+      expect(reply.result.content[0].text).toContain(`${name}Symbol`);
+    }
+    sendMessage(server.child, {
+      jsonrpc: '2.0', id: 4, method: 'tools/call',
+      params: { name: 'codegraph_explore', arguments: { query: 'alphaSymbol' } },
+    });
+    const missing = await waitFor(() => findResponse(server.stdout, 4), 10000);
+    expect(missing.result.isError).toBeFalsy();
+    expect(missing.result.content[0].text).toContain('projectPath');
+    expect(fs.existsSync(path.join(tempDir, '.codegraph'))).toBe(false);
+  }, 30000);
+
+  it('proxy fallback enables the query pool when no live writer holds the project', async () => {
+    const net = await import('net');
+    const sockPath = getDaemonSocketPath(realRoot);
+    const miniServer = net.createServer((sock) => {
+      sock.end(JSON.stringify({
+        codegraph: '0.0.0-mismatch', pid: process.pid, socketPath: sockPath, protocol: 1,
+      }) + '\n');
+    });
+    await new Promise<void>((resolve) => miniServer.listen(sockPath, resolve));
+    try {
+      const server = spawnServer(tempDir, { CODEGRAPH_QUERY_POOL_SIZE: '2' }, ['--no-watch']);
+      servers.push(server);
+      sendInitialize(server.child, `file://${tempDir}`, 1);
+      await waitFor(() => findResponse(server.stdout, 1), 10000);
+      sendMessage(server.child, {
+        jsonrpc: '2.0', id: 2, method: 'tools/call',
+        params: { name: 'codegraph_files', arguments: {} },
+      });
+      const reply = await waitFor(() => findResponse(server.stdout, 2), 10000);
+      expect(reply.error).toBeUndefined();
+      expect(reply.result.isError).toBeFalsy();
+      expect(server.stderr.some((l) => l.includes('serving this session in-process'))).toBe(true);
+      expect(server.stderr.some((l) => l.includes('Query pool: up to 2'))).toBe(true);
+    } finally {
+      await new Promise<void>((resolve) => miniServer.close(() => resolve()));
+    }
+  }, 30000);
 
   it('clears a stale (dead-pid) lockfile and a fresh daemon takes over', async () => {
     // Plant a lockfile pointing at a definitely-dead pid + the real socket path.

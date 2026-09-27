@@ -4001,6 +4001,52 @@ enum class EDenseMode : uint8
     });
   });
 
+  describe('C/C++ single-argument function macros (#1373)', () => {
+    it.each(['c', 'cpp'] as const)('recovers single-argument function macros in %s (#1373)', (language) => {
+      const code = '#define NATIVE_FN(name) int name(void)\n'
+        + 'NATIVE_FN(get_version) { return helper(); }\n'
+        + 'int use_it(void) { return get_version(); }\n';
+      const result = extractFromSource(`main.${language}`, code, language);
+      const functions = result.nodes.filter((n) => n.kind === 'function');
+      expect(functions.map((n) => n.name)).toEqual(['get_version', 'use_it']);
+      expect(functions[0]).toMatchObject({ qualifiedName: 'get_version', startLine: 2, endLine: 2, startColumn: 0 });
+      expect(result.unresolvedReferences).toEqual(expect.arrayContaining([
+        expect.objectContaining({ fromNodeId: functions[0].id, referenceName: 'helper', referenceKind: 'calls' }),
+        expect.objectContaining({ fromNodeId: functions[1].id, referenceName: 'get_version', referenceKind: 'calls' }),
+      ]));
+    });
+
+    it.each(['c', 'cpp'] as const)('does not guess single-argument macro names in %s (#1373)', (language) => {
+      for (const prefix of [
+        '',
+        '// #define NATIVE_FN(name) int name(void)\n',
+        '#define NATIVE_FN(name) int fixed(name)\n',
+        '#define NATIVE_FN(name) int test_ ## name(void)\n',
+        '#define NATIVE_FN(name) register_test(name)\n',
+        '#define NATIVE_FN(name) typedef int name(void)\n',
+        '#define NATIVE_FN(name) int name(void)\n#define NATIVE_FN int\n',
+        '#define NATIVE_FN(name) int name(void)\n#ifdef OTHER\n#undef NATIVE_FN\n#endif\n',
+        '#define NATIVE_FN(name) int name(void)\n#undef NATIVE_FN\n',
+        '#define NATIVE_FN(name) int name(void)\n#define NATIVE_FN(name) int fixed(name)\n',
+      ]) {
+        const result = extractFromSource(`main.${language}`, prefix + 'NATIVE_FN(candidate) { return 1; }\n', language);
+        expect(result.nodes.filter((n) => n.kind === 'function').map((n) => n.name)).not.toContain('candidate');
+      }
+      const alternate = extractFromSource(`main.${language}`, [
+        '#ifdef OTHER', '#define NATIVE_FN(name) int name(void)', '#else',
+        'NATIVE_FN(candidate) { return 1; }', '#endif', '',
+      ].join('\n'), language);
+      expect(alternate.nodes.filter((n) => n.kind === 'function').map((n) => n.name)).not.toContain('candidate');
+      const ordinary = extractFromSource(`main.${language}`, 'int (parenthesized)(void) { return 1; }\n', language);
+      expect(ordinary.nodes.find((n) => n.kind === 'function')?.name).toBe('(parenthesized)');
+      if (language === 'c') {
+        const knr = extractFromSource('knr.c', 'int old_style(arg) int arg; { return arg; }\n', 'c');
+        expect(knr.nodes.find((n) => n.kind === 'function')?.name).toBe('old_style');
+      }
+    });
+
+  });
+
   describe('CUDA extraction (#387)', () => {
     // CUDA parses with the C++ grammar. Three CUDA-only shapes misparse:
     // execution-space specifiers (`__global__ void f(…)`) shunt the real return
@@ -5060,6 +5106,121 @@ import 'package:flutter/material.dart';
       expect(importNode?.name).toBe('price');
     });
 
+    /* Inside a {% liquid %} tag, each body line is a tag with no braces of
+       its own. Patterns anchored on `{%` miss these references. */
+    it('should extract render inside a {% liquid %} block', () => {
+      const code = [
+        '{% liquid',
+        '  assign heading = section.settings.title',
+        "  render 'card', title: heading",
+        '%}',
+      ].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).toContain('card');
+    });
+
+    it('should extract assign inside a {% liquid %} block', () => {
+      const code = ['{% liquid', '  assign heading = section.settings.title', '%}'].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const vars = result.nodes.filter((n) => n.kind === 'variable').map((n) => n.name);
+      expect(vars).toContain('heading');
+    });
+
+    it('should extract section inside a {% liquid %} block', () => {
+      const code = ['{% liquid', "  section 'header'", '%}'].join('\n');
+      const result = extractFromSource('layout/theme.liquid', code);
+
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).toContain('header');
+    });
+
+    it('should report the real line number for a tag inside a {% liquid %} block', () => {
+      const code = ['<div>', '{% liquid', '  assign x = 1', "  render 'card'", '%}'].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const card = result.nodes.find((n) => n.kind === 'import' && n.name === 'card');
+      expect(card?.startLine).toBe(4);
+    });
+
+    it('should not count a tag twice when both spellings appear', () => {
+      const code = ["{% render 'card' %}", '{% liquid', "  render 'card'", '%}'].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const cards = result.nodes.filter((n) => n.kind === 'import' && n.name === 'card');
+      expect(cards.length).toBe(2);
+      expect(new Set(cards.map((n) => n.startLine)).size).toBe(2);
+    });
+
+    it('should not read a bare `render` outside a {% liquid %} block as a tag', () => {
+      // Prose and filters mentioning the word must not become references.
+      const code = ['<p>We render the card below.</p>', "{{ product | render_as: 'card' }}"].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).not.toContain('card');
+    });
+
+    it('should handle whitespace control on the {% liquid %} tag itself', () => {
+      const code = ['{%- liquid', "  render 'card'", '-%}'].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+
+      const names = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(names).toContain('card');
+    });
+
+    it('does not scan tag-like strings or inline comments twice', () => {
+      const code = [
+        `{% assign example = "{% render 'ghost'" %}`,
+        `{% # {% render 'ghost' %}`,
+        '{% liquid', `  assign example = "{% include 'ghost'"`,
+        "  # section 'ghost'", "  echo 'render ghost'", '%}',
+        "{% liquid render 'live' %}", "{% liquid include 'after' %}",
+      ].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+      expect(result.nodes.filter((n) => n.kind === 'import').map((n) => [n.name, n.startLine, n.startColumn]))
+        .toEqual([['live', 8, 10], ['after', 9, 10]]);
+      expect(result.unresolvedReferences.map((r) => r.referenceName))
+        .toEqual(['snippets/live.liquid', 'snippets/after.liquid']);
+    });
+
+    it.each(['\n', '\r\n'])('preserves Liquid block positions with %j line endings', (newline) => {
+      const code = [
+        '<div>', '{%- liquid', "  assign heading = 'x'", "\tinclude 'legacy'",
+        "  render 'card'", "  section 'footer'", '-%}', "  {% render 'after' %}",
+      ].join(newline);
+      const result = extractFromSource('sections/featured.liquid', code);
+      expect(result.nodes.filter((n) => n.kind === 'variable' || n.kind === 'import')
+        .map((n) => [n.name, n.startLine, n.startColumn, n.endColumn]).sort())
+        .toEqual([
+          ['after', 8, 2, 19], ['card', 5, 2, 15], ['footer', 6, 2, 18],
+          ['heading', 3, 2, 18], ['legacy', 4, 1, 17],
+        ]);
+      expect(result.unresolvedReferences.map((r) => [r.referenceName, r.line, r.column]).sort())
+        .toEqual([
+          ['sections/footer.liquid', 6, 2], ['snippets/after.liquid', 8, 2],
+          ['snippets/card.liquid', 5, 2], ['snippets/legacy.liquid', 4, 1],
+        ]);
+    });
+
+    it.each(['comment', 'raw'])('ignores %s regions in both tag spellings', (tag) => {
+      const code = [
+        `{%- ${tag} -%}`, "{% render 'ghost' %}", "{% include 'ghost' %}",
+        "{% section 'ghost' %}", '{% assign ghost = 1 %}',
+        '{% liquid', "  render 'ghost'", '%}', `{%- end${tag} -%}`,
+        '{% liquid', `  ${tag}`, "  render 'ghost'", "  include 'ghost'",
+        "  section 'ghost'", '  assign ghost = 1', `  end${tag}`,
+        "  # render 'ghost'", "  render 'live'", '%}', "{% include 'after' %}",
+      ].join('\n');
+      const result = extractFromSource('sections/featured.liquid', code);
+      expect(result.nodes.filter((n) => n.kind !== 'file').map((n) => n.name))
+        .toEqual(['live', 'live', 'after', 'after']);
+      expect(result.unresolvedReferences.map((r) => [r.referenceName, r.line]))
+        .toEqual([['snippets/live.liquid', 18], ['snippets/after.liquid', 20]]);
+    });
+
     it('should extract multiple imports', () => {
       const code = `
 {% section 'header' %}
@@ -5705,6 +5866,89 @@ end`;
 
     const components = result.nodes.filter((n) => n.kind === 'component');
     expect(components.length).toBe(2);
+  });
+
+  describe('component source ranges (#1350)', () => {
+    let tempDir: string;
+    let cg: CodeGraph | undefined;
+
+    beforeEach(() => {
+      tempDir = createTempDir();
+    });
+
+    afterEach(() => {
+      cg?.close();
+      cg = undefined;
+      cleanupTempDir(tempDir);
+    });
+
+    it.each(['dfm', 'fmx'])('persists complete nested %s bodies and retrieves event bindings', async (extension) => {
+      const source = `inherited Form1: TForm1
+  inline Frame1: TFrame
+    object Button1: TButton
+      Caption = 'Click'
+      Items.Strings = (
+        'First'
+        'Second')
+      Panels = <
+        item
+          Width = 100
+        end
+        item
+          Width = 200
+        end>
+      OnClick = Button1Click
+    end
+    OnEnter = FrameEnter
+  end
+  object Label1: TLabel
+    Caption = 'Sibling'
+  end
+end`;
+      const fileName = `Form1.${extension}`;
+      fs.writeFileSync(path.join(tempDir, fileName), source);
+      cg = CodeGraph.initSync(tempDir);
+      expect((await cg.indexAll()).filesIndexed).toBe(1);
+
+      const nodes = cg.getNodesInFile(fileName);
+      const components = nodes.filter((node) => node.kind === 'component');
+      expect(components.map(({ name, startLine, endLine, endColumn }) => ({
+        name, startLine, endLine, endColumn,
+      }))).toEqual(expect.arrayContaining([
+        { name: 'Form1', startLine: 1, endLine: 22, endColumn: 3 },
+        { name: 'Frame1', startLine: 2, endLine: 18, endColumn: 5 },
+        { name: 'Button1', startLine: 3, endLine: 16, endColumn: 7 },
+        { name: 'Label1', startLine: 19, endLine: 21, endColumn: 5 },
+      ]));
+      expect(components).toHaveLength(4);
+
+      const extracted = extractFromSource(fileName, source);
+      const file = extracted.nodes.find((node) => node.kind === 'file')!;
+      const form = components.find((node) => node.name === 'Form1')!;
+      const frame = components.find((node) => node.name === 'Frame1')!;
+      const button = components.find((node) => node.name === 'Button1')!;
+      const label = components.find((node) => node.name === 'Label1')!;
+      for (const [parent, child] of [[file, form], [form, frame], [frame, button], [form, label]]) {
+        expect(extracted.edges).toContainEqual({ source: parent!.id, target: child!.id, kind: 'contains' });
+      }
+      expect(extracted.unresolvedReferences).toEqual([
+        expect.objectContaining({ fromNodeId: button.id, referenceName: 'Button1Click' }),
+        expect.objectContaining({ fromNodeId: frame.id, referenceName: 'FrameEnter' }),
+      ]);
+      expect(file.endLine).toBe(22);
+
+      const { ToolHandler } = await import('../src/mcp/tools');
+      const handler = new ToolHandler(cg);
+      for (const [tool, args] of [
+        ['codegraph_node', { symbol: 'Button1', includeCode: true }],
+        ['codegraph_explore', { query: 'Button1' }],
+      ] as const) {
+        const result = await handler.execute(tool, args);
+        expect(result.isError).toBeUndefined();
+        expect(result.content[0]!.text).toContain("Caption = 'Click'");
+        expect(result.content[0]!.text).toContain('OnClick = Button1Click');
+      }
+    });
   });
 
   describe('Full fixture: MainForm.dfm', () => {
@@ -7038,6 +7282,29 @@ describe('Liquid Shopify JSON template section resolution', () => {
     if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
+  it('resolves Liquid block snippets and sections without linking commented references', async () => {
+    for (const dir of ['sections', 'snippets', 'layout']) fs.mkdirSync(path.join(tempDir, dir));
+    for (const file of ['snippets/card.liquid', 'snippets/legacy.liquid', 'snippets/ghost.liquid', 'sections/footer.liquid']) {
+      fs.writeFileSync(path.join(tempDir, file), '<div>content</div>');
+    }
+    fs.writeFileSync(path.join(tempDir, 'layout/theme.liquid'), [
+      '{% liquid', "  assign heading = 'x'", "  render 'card'", "  include 'legacy'",
+      "  section 'footer'", '  comment', "  render 'ghost'", '  endcomment', '%}',
+      '{% raw %}', "{% render 'ghost' %}", '{% endraw %}',
+    ].join('\n'));
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    for (const name of ['card', 'legacy', 'footer', 'ghost']) {
+      const file = cg.getNodesByKind('file').find((n) => n.name === `${name}.liquid`)!;
+      expect(file).toBeDefined();
+      expect(cg.getFileDependents(file.filePath).some((p) => p.endsWith('layout/theme.liquid')))
+        .toBe(name !== 'ghost');
+    }
+    expect(cg.getNodesByKind('variable').some((n) => n.name === 'heading')).toBe(true);
+  });
+
   it('links a Shopify JSON template section `type` to its sections/<type>.liquid', async () => {
     // Shopify OS 2.0 templates are JSON, referencing sections by `type` — not
     // a `{% section %}` Liquid tag — so a section used only from a JSON template
@@ -8269,6 +8536,117 @@ describe('Nested non-submodule git repos', () => {
     expect(scope.ignores('pkg/app.ts')).toBe(false);
     expect(scope.ignores('pkg/build/')).toBe(true);
     expect(scope.ignores('pkg/build/out.ts')).toBe(true);
+  });
+
+  it.each(['filesystem', 'untracked', 'tracked'])(
+    'keeps Java packages named build while excluding build output (%s, #1642)',
+    async (mode) => {
+      const sources = ['', 'module/'].flatMap((prefix) => ['main', 'test'].flatMap((sourceSet) => [
+        `${prefix}src/${sourceSet}/java/com/acme/build/RealtimePlusService.java`,
+        `${prefix}src/${sourceSet}/java/build/nested/build/Example.java`,
+      ]).concat([
+        `${prefix}src/androidTest/java/com/acme/build/DeviceProbe.java`,
+        `${prefix}src/main/kotlin/com/acme/build/KotlinProbe.kt`,
+        `${prefix}src/test/scala/com/acme/build/ScalaProbe.scala`,
+      ]));
+      const ignored = [
+        'build/generated/Generated.java',
+        'module/build/generated/Generated.java',
+        'build/src/main/java/com/build/Generated.java',
+        'module/build/src/test/java/build/Generated.java',
+        'src/main/resources/build/Generated.java',
+        'node_modules/pkg/src/main/java/com/build/Generated.java',
+        'target/src/test/java/com/build/Generated.java',
+        ...['src/main/java/com/build/', 'module/src/test/java/build/'].flatMap((prefix) => [
+          `${prefix}node_modules/pkg/a.js`,
+          `${prefix}target/A.java`,
+          `${prefix}target/build/A.java`,
+          `${prefix}dist/A.java`,
+          `${prefix}vendor/A.java`,
+          `${prefix}cmake-build-debug/A.java`,
+          `${prefix}res/layout/A.xml`,
+        ]),
+      ];
+      for (const rel of [...sources, ...ignored]) {
+        const abs = path.join(tempDir, rel);
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
+        fs.writeFileSync(abs, 'class Example {}\n');
+      }
+      if (mode !== 'filesystem') {
+        execFileSync('git', ['init', '-q'], { cwd: tempDir });
+        if (mode === 'tracked') execFileSync('git', ['add', '-f', '.'], { cwd: tempDir });
+      }
+
+      const defaults = buildDefaultIgnore(tempDir);
+      const scope = buildScopeIgnore(tempDir);
+      const files = scanDirectory(tempDir);
+      expect(await scanDirectoryAsync(tempDir)).toEqual(files);
+      for (const rel of sources) {
+        expect(defaults.ignores(rel), rel).toBe(false);
+        expect(scope.ignores(rel), rel).toBe(false);
+        // The watcher and filesystem walker must be able to reach each file.
+        const parts = rel.split('/');
+        for (let i = 1; i < parts.length; i++) {
+          expect(scope.ignores(parts.slice(0, i).join('/') + '/'), rel).toBe(false);
+        }
+        expect(files).toContain(rel);
+      }
+      for (const rel of ignored) {
+        expect(defaults.ignores(rel), rel).toBe(true);
+        expect(scope.ignores(rel), rel).toBe(true);
+        expect(files).not.toContain(rel);
+      }
+    },
+  );
+
+  it.each(['.gitignore', 'codegraph.json', 'src/main/java/.gitignore'])(
+    'lets explicit %s rules exclude a Java package named build (#1642)',
+    (ignoreFile) => {
+      const sourceFile = 'src/main/java/com/acme/build/Hidden.java';
+      const abs = path.join(tempDir, sourceFile);
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, 'class Hidden {}\n');
+      execFileSync('git', ['init', '-q'], { cwd: tempDir });
+      fs.writeFileSync(path.join(tempDir, ignoreFile), ignoreFile === 'codegraph.json'
+        ? JSON.stringify({ exclude: ['src/main/java/**/build/'] })
+        : 'build/\n');
+
+      expect(buildScopeIgnore(tempDir).ignores(sourceFile)).toBe(true);
+      expect(scanDirectory(tempDir)).not.toContain(sourceFile);
+    },
+  );
+
+  it('retrieves and syncs indexed Java packages named build (#1642)', async () => {
+    const { ToolHandler } = await import('../src/mcp/tools');
+    const sourceFile = 'src/main/java/com/ctrip/panda/es/build/RealtimePlusService.java';
+    const ignoredFile = 'src/main/java/com/ctrip/panda/es/build/target/Generated.java';
+    for (const rel of [sourceFile, ignoredFile]) {
+      fs.mkdirSync(path.dirname(path.join(tempDir, rel)), { recursive: true });
+    }
+    const source = 'package com.ctrip.panda.es.build;\npublic class RealtimePlusService { public int run() { return 1; } }\n';
+    fs.writeFileSync(path.join(tempDir, sourceFile), source);
+    fs.writeFileSync(path.join(tempDir, ignoredFile), 'public class Generated {}\n');
+    const cg = CodeGraph.initSync(tempDir);
+    try {
+      expect((await cg.indexAll()).filesIndexed).toBe(1);
+      expect(cg.getNodesInFile(sourceFile).some((node) => node.name === 'RealtimePlusService')).toBe(true);
+      const result = await new ToolHandler(cg).execute('codegraph_explore', { query: 'RealtimePlusService' });
+      expect(result.isError).toBeUndefined();
+      expect(result.content[0]!.text).toContain('public class RealtimePlusService');
+
+      fs.writeFileSync(path.join(tempDir, sourceFile), source.replace('run()', 'updatedRun()'));
+      await cg.sync({ paths: [sourceFile, ignoredFile] });
+      expect(cg.getNodesInFile(sourceFile).some((node) => node.name === 'updatedRun')).toBe(true);
+      expect(cg.getNodesInFile(ignoredFile)).toEqual([]);
+
+      const addedFile = 'src/test/java/com/build/ServiceTest.java';
+      fs.mkdirSync(path.dirname(path.join(tempDir, addedFile)), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, addedFile), 'package com.build; public class ServiceTest {}\n');
+      expect((await cg.sync()).filesAdded).toBe(1);
+      expect(cg.getNodesInFile(addedFile).some((node) => node.name === 'ServiceTest')).toBe(true);
+    } finally {
+      cg.close();
+    }
   });
 });
 
@@ -12787,5 +13165,72 @@ describe('Unsupported-language projects report what they skipped (#1502)', () =>
 
     expect(files).toEqual(['a.ts']);
     expect(stats.unsupportedByExtension.size).toBe(0);
+  });
+});
+
+
+describe('C++ COM interface declarations (#1519)', () => {
+  let tempDir: string;
+  let cg: CodeGraph | undefined;
+  afterEach(() => {
+    cg?.close();
+    cg = undefined;
+    if (tempDir) cleanupTempDir(tempDir);
+  });
+
+  it.each(['\n', '\r\n'])('indexes COM owners, methods and inheritance with %j line endings', async (eol) => {
+    const source = [
+      '#define interface struct',
+      'struct IParentInterface { virtual void Parent() = 0; };',
+      'interface IMyComInterface : IParentInterface {',
+      '    virtual void Foo() = 0;',
+      '    virtual void Bar() = 0;',
+      '};',
+      'interface IStandalone { virtual void Run() = 0; };',
+      '',
+    ].join(eol);
+    expect(detectLanguage('MyInterface.h', source)).toBe('cpp');
+    tempDir = createTempDir();
+    fs.writeFileSync(path.join(tempDir, 'MyInterface.h'), source);
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+    const nodes = cg.getNodesInFile('MyInterface.h');
+    const owner = nodes.find((n) => n.name === 'IMyComInterface');
+    expect(owner).toMatchObject({ kind: 'struct', startLine: 3 });
+    for (const [name, line] of [['Foo', 4], ['Bar', 5]] as const) {
+      expect(nodes.find((n) => n.name === name)).toMatchObject({
+        kind: 'method', qualifiedName: `IMyComInterface::${name}`, isAbstract: true, startLine: line,
+      });
+    }
+    expect(nodes.find((n) => n.name === 'IStandalone')).toMatchObject({ kind: 'struct' });
+    expect(nodes.find((n) => n.name === 'Run')).toMatchObject({ qualifiedName: 'IStandalone::Run', isAbstract: true });
+    expect(nodes.filter((n) => n.kind === 'function')).toEqual([]);
+    const parent = nodes.find((n) => n.name === 'IParentInterface');
+    expect(cg.getOutgoingEdges(owner!.id)).toContainEqual(expect.objectContaining({ kind: 'extends', target: parent!.id }));
+    expect(await cg.getCode(owner!.id)).toContain('interface IMyComInterface');
+  });
+
+  it('normalizes declaration evidence without a local alias and preserves all other bytes', async () => {
+    const { cppExtractor } = await import('../src/extraction/languages/c-cpp');
+    const source = [
+      '// interface Comment : Base {};',
+      '/* interface Block { virtual void Fake() = 0; }; */',
+      'const char* text = "interface String : Base {};";',
+      'const char* raw = R"tag(interface Raw : Base {})tag";',
+      '#define SAMPLE interface Macro : Base {}',
+      '#define MULTI \\',
+      'interface Continued : Base {}',
+      'int interface = 1;',
+      'void interface();',
+      'interface value;',
+      'interface ordinary{};',
+      'interface IDerived : Base { virtual void Foo() = 0; };',
+      'interface IStandalone { virtual void Run() = 0; };',
+      '',
+    ].join('\r\n');
+    const expected = source.replace('interface IDerived', 'struct    IDerived').replace('interface IStandalone', 'struct    IStandalone');
+    expect(cppExtractor.preParse!(source, 'com.hpp')).toBe(expected);
+    expect(Buffer.byteLength(expected)).toBe(Buffer.byteLength(source));
   });
 });
