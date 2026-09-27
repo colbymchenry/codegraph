@@ -145,6 +145,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Vue templates are indexed as uses: `:prop="x"`, `@event="save"`, `v-if` / `v-for` / `v-model` values and `{{ mustache }}` expressions now link to the script state, functions and imports they bind, so "where is `myLinkBrandingLocked` used" answers from the graph and `codegraph_explore` shows the template lines that bind a symbol you named.
+
+- `codegraph_explore` no longer spends its budget on files that match only a plain word in the query when the query also names a symbol exactly: after the named symbol's file, files wired to that symbol come before an unrelated file that shares a word like "section".
+
 - The Claude Code prompt hook no longer runs on the task-notification messages Claude Code injects when a background agent finishes, removing a multi-second stall on every such turn. (#1832)
 
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)

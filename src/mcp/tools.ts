@@ -3962,6 +3962,10 @@ export class ToolHandler {
     // Files declaring a TYPE the query named by name — the counter-case guard
     // for the declaration-only penalty (CG-28). Populated in the token loop.
     const namedTypeFiles = new Set<string>();
+    // The query's shape-precise tokens (camelCase, PascalCase, snake_case,
+    // qualified), lowercased and split at `.`/`::`/`/`. Populated in the token
+    // loop; read by the precise-before-plain file tier below.
+    const preciseQueryTerms = new Set<string>();
     {
       const FILE_EXT = /\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl)$/i;
       const CALLABLE = new Set(['method', 'function', 'component', 'constructor']);
@@ -4011,6 +4015,12 @@ export class ToolHandler {
       const lcTokens = new Set(tokens.map((x) => x.toLowerCase()));
       const isPreciseToken = (x: string) =>
         /[._$]|::|\//.test(x) || /[a-z][A-Z]/.test(x) || /^[A-Z]/.test(x);
+      for (const t of tokens) {
+        if (!isPreciseToken(t)) continue;
+        for (const part of t.toLowerCase().split(/::|[./]/)) {
+          if (part.length >= 3) preciseQueryTerms.add(part);
+        }
+      }
       const fileNameSets = new Map<string, Set<string>>();
       const coNamedInFile = (t: string, fp: string): boolean => {
         let names = fileNameSets.get(fp);
@@ -4437,6 +4447,42 @@ export class ToolHandler {
       fileTermHits.set(fp, hits);
     }
 
+    // Precise-before-plain: once a precise token resolved to a named seed, a
+    // file whose only claim is a PLAIN query word is an English-word collision.
+    // `WorkspaceMyLinkView appearance section myLinkBrandingLocked` spent the
+    // budget after the view on a PHP layout class that matched only "section":
+    // as an FTS root the entry-file gate protected it. A word-only file holds
+    // no named seed, matches no precise term, and has no symbol one edge from
+    // a seed; it loses gate protection and centrality and sorts last, so it
+    // only takes leftover budget. Inert when no precise token resolved.
+    const wordOnlyFiles = new Set<string>();
+    if (tierSeedIds.size > 0 && preciseQueryTerms.size > 0) {
+      const seedFiles = new Set<string>();
+      const seedNeighbourFiles = new Set<string>();
+      for (const id of tierSeedIds) {
+        const seed = subgraph.nodes.get(id) ?? cg.getNode(id);
+        if (!seed) continue;
+        seedFiles.add(seed.filePath);
+        let edges: Edge[] = [];
+        try {
+          edges = [...cg.getIncomingEdges(id), ...cg.getOutgoingEdges(id)];
+        } catch { /* a probe failure only means fewer neighbours are protected */ }
+        for (const e of edges.slice(0, 400)) {
+          if (e.kind === 'contains') continue;
+          const otherId = e.source === id ? e.target : e.source;
+          const other = subgraph.nodes.get(otherId) ?? cg.getNode(otherId);
+          if (other) seedNeighbourFiles.add(other.filePath);
+        }
+      }
+      for (const [fp, group] of relevantFiles) {
+        if (pinnedSet.has(fp) || seedFiles.has(fp) || seedNeighbourFiles.has(fp)) continue;
+        const hay = fp.toLowerCase() + ' ' + group.nodes.map((n) => n.name.toLowerCase()).join(' ');
+        let precise = false;
+        for (const t of preciseQueryTerms) if (hay.includes(t)) { precise = true; break; }
+        if (!precise) wordOnlyFiles.add(fp);
+      }
+    }
+
     // PRIMARY relevance: graph connectivity (Random-Walk-with-Restart from the
     // matched seeds — see computeGraphRelevance). Aggregate each file's nodes'
     // walk mass. This is the signal text search lacks: the real cluster
@@ -4493,7 +4539,7 @@ export class ToolHandler {
     // falls to generous full-method sectioning — never a whole dump).
     const centralFiles = new Set(
       [...fileGraphScore.entries()]
-        .filter(([fp, g]) => g > 0 && (fileTermHits.get(fp) ?? 0) >= 1)
+        .filter(([fp, g]) => g > 0 && (fileTermHits.get(fp) ?? 0) >= 1 && !wordOnlyFiles.has(fp))
         .sort((a, b) => b[1] - a[1] || (fileTermHits.get(b[0]) ?? 0) - (fileTermHits.get(a[0]) ?? 0))
         .slice(0, 2)
         .map(([f]) => f),
@@ -4551,7 +4597,7 @@ export class ToolHandler {
         pinnedSet.has(fp)
         || (fileGraphScore.get(fp) ?? 0) >= maxGraph * 0.06
         || centralFiles.has(fp)
-        || entryFiles.has(fp)
+        || (entryFiles.has(fp) && !wordOnlyFiles.has(fp))
         || changeSurfaceFiles.has(fp)
         || (fileTermHits.get(fp) ?? 0) >= 2,
       );
@@ -4617,6 +4663,11 @@ export class ToolHandler {
       const aNamed = namedSeedFiles.has(a[0]) ? 1 : 0;
       const bNamed = namedSeedFiles.has(b[0]) ? 1 : 0;
       if (aNamed !== bNamed) return bNamed - aNamed;
+
+      // Word-only files (see precise-before-plain above) after everything else.
+      const aWord = wordOnlyFiles.has(a[0]) ? 1 : 0;
+      const bWord = wordOnlyFiles.has(b[0]) ? 1 : 0;
+      if (aWord !== bWord) return aWord - bWord;
 
       // Corroborated (entry/central + ≥2 terms) tier, above the graph signal.
       const aCorr = isCorroborated(a[0]) ? 1 : 0;
@@ -6013,6 +6064,24 @@ export class ToolHandler {
           const targetNode = subgraph.nodes.get(edge.target);
           const targetName = targetNode?.name ?? edge.kind;
           ranges.push({ start: edge.line, end: edge.line, name: targetName, kind: edge.kind, importance: 2, spine: false });
+        }
+      }
+
+      // Same-file USE sites of a symbol the agent named: a Vue/Svelte template
+      // binding (`:locked="myLinkBrandingLocked"`) is where that state renders,
+      // and its source is the whole-file component node, dropped above as an
+      // envelope, so the loop above never sees it.
+      for (const n of rangeNodes.values()) {
+        if (!entryNodeIds.has(n.id) && !flow.namedNodeIds.has(n.id)) continue;
+        let incoming: Edge[] = [];
+        try { incoming = cg.getIncomingEdges(n.id); } catch { continue; }
+        for (const edge of incoming.slice(0, 40)) {
+          if (!edge.line || edge.line <= 0 || edge.kind === 'contains') continue;
+          if (cg.getNode(edge.source)?.filePath !== filePath) continue;
+          const key = `${edge.line}:${edge.target}`;
+          if (edgeLines.has(key)) continue;
+          edgeLines.add(key);
+          ranges.push({ start: edge.line, end: edge.line, name: n.name, kind: edge.kind, importance: 8, spine: false });
         }
       }
 

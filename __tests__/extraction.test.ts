@@ -9219,6 +9219,50 @@ import MyButton from './MyButton.vue';
     expect(refs).not.toContain('Span');
   });
 
+  it('should extract identifiers the Vue template binds, skipping locals, keys and globals', () => {
+    const code = `<template>
+  <section v-if="!myLinkBrandingLocked" :class="{ active: isActive }">
+    <OwnDomainSection
+      :locked="myLinkBrandingLocked"
+      @save="saveDomain"
+    />
+    <li v-for="(item, index) in domains" :key="item.id">{{ formatDomain(item) }} {{ Math.max(index, 1) }}</li>
+    <Row #default="{ row }">{{ row.label }}</Row>
+    <p>{{ $t('label') }} {{ 'isActive' }}</p>
+  </section>
+</template>
+
+<script setup lang="ts">
+import { computed, ref } from 'vue';
+import OwnDomainSection from './OwnDomainSection.vue';
+import { formatDomain } from './format';
+
+const isActive = ref(false);
+const domains = ref<string[]>([]);
+const myLinkBrandingLocked = computed(() => false);
+function saveDomain() {}
+</script>
+`;
+    const result = extractFromSource('WorkspaceMyLinkView.vue', code);
+    const templateRefs = result.unresolvedReferences.filter((r) => r.line <= 11);
+    const named = (kind: string) => templateRefs.filter((r) => r.referenceKind === kind).map((r) => r.referenceName);
+
+    // Bound script state is a reference, on the template line that binds it.
+    const locked = templateRefs.filter((r) => r.referenceName === 'myLinkBrandingLocked');
+    expect(locked.map((r) => r.line).sort()).toEqual([2, 4]);
+    expect(named('references')).toContain('isActive');
+    expect(named('references')).toContain('domains');
+    // A bare event handler and a template call are calls.
+    expect(named('calls')).toContain('saveDomain');
+    expect(named('calls')).toContain('formatDomain');
+    // Locals, object keys, member tails, globals, $-helpers and string contents bind nothing.
+    const all = templateRefs.map((r) => r.referenceName);
+    for (const absent of ['item', 'index', 'row', 'active', 'id', 'label', 'Math', 'max', '$t']) {
+      expect(all).not.toContain(absent);
+    }
+    expect(templateRefs.filter((r) => r.referenceName === 'isActive')).toHaveLength(1);
+  });
+
   it('should extract from both <script> and <script setup> blocks', () => {
     const code = `<template>
   <div>{{ msg }}</div>

@@ -18,6 +18,50 @@ const VUE_BUILTIN_COMPONENTS = new Set([
   'Slot',
 ]);
 
+/** Keywords and literals a template expression can contain that bind nothing. */
+const TEMPLATE_NON_BINDINGS = new Set([
+  'true', 'false', 'null', 'undefined', 'this', 'in', 'of', 'typeof', 'instanceof',
+  'new', 'void', 'delete', 'await', 'async', 'return', 'if', 'else', 'let', 'const',
+  'var', 'function', 'class', 'NaN', 'Infinity',
+]);
+
+/** Globals Vue exposes to templates; a call to one is not a call into the repo. */
+const JS_GLOBALS = new Set([
+  'Math', 'JSON', 'Object', 'Array', 'Number', 'String', 'Boolean', 'Date', 'RegExp',
+  'Map', 'Set', 'Promise', 'Symbol', 'BigInt', 'Intl', 'Error', 'console', 'window',
+  'document', 'parseInt', 'parseFloat', 'isNaN', 'isFinite', 'encodeURI',
+  'encodeURIComponent', 'decodeURI', 'decodeURIComponent', 'require',
+]);
+
+/**
+ * Local names a `<script>` block's ES imports bind: `Foo` from `import Foo`,
+ * `a` and `c` from `import { a, b as c }`, `ns` from `import * as ns`.
+ * Type-only imports bind nothing a template can use.
+ */
+function importedLocalNames(script: string): string[] {
+  const names: string[] = [];
+  const importRegex = /(?:^|[\n;])\s*import\s+(?!type\s)([^'";]+?)\s+from\s*['"]/g;
+  let m: RegExpExecArray | null;
+  while ((m = importRegex.exec(script)) !== null) {
+    const clause = m[1]!;
+    const braces = /\{([\s\S]*)\}/.exec(clause);
+    const outside = braces ? clause.replace(braces[0], '') : clause;
+    for (const part of outside.split(',')) {
+      const ns = /\*\s*as\s+([A-Za-z_$][\w$]*)/.exec(part);
+      const id = ns ? ns[1] : /^\s*([A-Za-z_$][\w$]*)\s*$/.exec(part)?.[1];
+      if (id) names.push(id);
+    }
+    if (braces) {
+      for (const spec of braces[1]!.split(',')) {
+        if (/^\s*type\s/.test(spec)) continue;
+        const id = /([A-Za-z_$][\w$]*)\s*$/.exec(spec.trim())?.[1];
+        if (id) names.push(id);
+      }
+    }
+  }
+  return names;
+}
+
 /** `my-component` → `MyComponent` (Vue allows either form in templates). */
 function kebabToPascal(name: string): string {
   return name
@@ -61,8 +105,12 @@ export class VueExtractor {
       // Extract and process script blocks
       const scriptBlocks = this.extractScriptBlocks();
 
+      // Names the <script> blocks bind (declarations + imports) — the only
+      // names a template identifier can reach in Vue besides globals.
+      const scriptBindings = new Set<string>();
       for (const block of scriptBlocks) {
-        this.processScriptBlock(block, componentNode.id);
+        for (const name of this.processScriptBlock(block, componentNode.id)) scriptBindings.add(name);
+        for (const name of importedLocalNames(block.content)) scriptBindings.add(name);
       }
 
       // Extract component usages from the <template> (<ComponentName>).
@@ -70,6 +118,13 @@ export class VueExtractor {
       // markup (incl. through a barrel import) is invisible to callers /
       // impact (#629 follow-up).
       this.extractTemplateComponents(componentNode.id);
+
+      // Extract identifiers the template binds (`:prop="x"`, `@click="save"`,
+      // `v-if="locked"`, `{{ label }}`). This is where a component's state is
+      // actually rendered, so without it "where is `myLinkBrandingLocked`
+      // used" had no answer from the graph and explore never reached the
+      // template lines that bind it.
+      this.extractTemplateBindings(componentNode.id, scriptBindings);
     } catch (error) {
       this.errors.push({
         message: `Vue extraction error: ${error instanceof Error ? error.message : String(error)}`,
@@ -171,7 +226,7 @@ export class VueExtractor {
   private processScriptBlock(
     block: { content: string; startLine: number; isSetup: boolean; isTypeScript: boolean },
     componentNodeId: string
-  ): void {
+  ): string[] {
     const scriptLanguage: Language = block.isTypeScript ? 'typescript' : 'javascript';
 
     // Check if the script language parser is available
@@ -180,7 +235,7 @@ export class VueExtractor {
         message: `Parser for ${scriptLanguage} not available, cannot parse Vue script block`,
         severity: 'warning',
       });
-      return;
+      return [];
     }
 
     // Delegate to TreeSitterExtractor
@@ -225,6 +280,129 @@ export class VueExtractor {
         error.line += block.startLine;
       }
       this.errors.push(error);
+    }
+
+    return result.nodes
+      .filter((n) => n.kind !== 'import' && n.kind !== 'export')
+      .map((n) => n.name);
+  }
+
+  /**
+   * Extract the identifiers a Vue `<template>` binds as references.
+   *
+   * Scans directive values (`:prop` / `v-bind:`, `@event` / `v-on:`, `v-if`,
+   * `v-show`, `v-model`, `v-for`'s source, ...) and `{{ mustache }}`
+   * interpolations. In each expression:
+   *
+   * - `fn(...)` is a `calls` reference (as the Svelte extractor does for
+   *   `{fn(...)}`), unless `fn` is a JS global, a `$`-prefixed Vue instance
+   *   helper (`$emit`, `$t`) or a template-local.
+   * - A bare identifier is a `references` reference ONLY when a `<script>`
+   *   block declares or imports that name. Template scope is exactly those
+   *   bindings plus globals, so the restriction drops nothing real, and it
+   *   keeps object-literal keys and props-only names from name-matching a
+   *   same-named symbol elsewhere in the repo (silent beats wrong).
+   * - An `@event="save"` handler that is a bare name is a `calls` reference:
+   *   Vue invokes it.
+   *
+   * `v-for` aliases and slot props (`v-slot="{ item }"`, `#row="{ item }"`)
+   * are template-locals and never emitted.
+   */
+  private extractTemplateBindings(componentNodeId: string, scriptBindings: Set<string>): void {
+    // Blank out <script>/<style> blocks and HTML comments, keeping every
+    // newline, so offsets in the masked text are offsets in the file.
+    const blank = (m: string) => m.replace(/[^\n]/g, ' ');
+    const masked = this.source
+      .replace(/<(script|style)(\s[^>]*)?>[\s\S]*?<\/\1>/g, blank)
+      .replace(/<!--[\s\S]*?-->/g, blank);
+
+    const lineStarts: number[] = [0];
+    for (let i = 0; i < masked.length; i++) if (masked[i] === '\n') lineStarts.push(i + 1);
+    const lineOf = (offset: number): number => {
+      let lo = 0;
+      let hi = lineStarts.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (lineStarts[mid]! <= offset) lo = mid;
+        else hi = mid - 1;
+      }
+      return lo; // 0-indexed
+    };
+
+    // Directive attributes: `:x`, `@x`, `#x`, `v-xxx[:arg][.mod]`, with a quoted value.
+    const directiveRegex = /\s((?:v-[a-z][\w-]*|[:@#])[^\s=>"']*)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+    const expressions: Array<{ text: string; offset: number; handler: boolean }> = [];
+    const templateLocals = new Set<string>();
+    let m: RegExpExecArray | null;
+    while ((m = directiveRegex.exec(masked)) !== null) {
+      const name = m[1]!;
+      const value = m[2] ?? m[3] ?? '';
+      const valueOffset = m.index + m[0].length - value.length - 1;
+      if (name.startsWith('#') || name.startsWith('v-slot')) {
+        // Slot props declare template-locals; they reference nothing.
+        for (const id of value.match(/[A-Za-z_$][\w$]*/g) ?? []) templateLocals.add(id);
+        continue;
+      }
+      if (name === 'v-for') {
+        // `(item, index) in items` / `item of items`: aliases are locals,
+        // the source expression is a reference.
+        const split = /^\s*([\s\S]*?)\s+(?:in|of)\s+([\s\S]*)$/.exec(value);
+        if (split) {
+          for (const id of split[1]!.match(/[A-Za-z_$][\w$]*/g) ?? []) templateLocals.add(id);
+          expressions.push({ text: split[2]!, offset: valueOffset + value.length - split[2]!.length, handler: false });
+        }
+        continue;
+      }
+      const handler = name.startsWith('@') || name.startsWith('v-on');
+      expressions.push({ text: value, offset: valueOffset, handler });
+    }
+    const mustacheRegex = /\{\{([\s\S]*?)\}\}/g;
+    while ((m = mustacheRegex.exec(masked)) !== null) {
+      expressions.push({ text: m[1]!, offset: m.index + 2, handler: false });
+    }
+
+    const seen = new Set<string>();
+    const emit = (name: string, kind: 'calls' | 'references', offset: number) => {
+      const line = lineOf(offset);
+      const key = `${kind}:${name}:${line}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      this.unresolvedReferences.push({
+        fromNodeId: componentNodeId,
+        referenceName: name,
+        referenceKind: kind,
+        line: line + 1, // 1-indexed
+        column: offset - lineStarts[line]! + 1,
+        filePath: this.filePath,
+        language: 'vue',
+      });
+    };
+
+    for (const expr of expressions) {
+      // Blank string literals (keeping length) so their words aren't read as identifiers.
+      const text = expr.text.replace(/(['"`])(?:\\.|(?!\1)[^\\])*\1/g, blank);
+      const handlerName = expr.handler ? /^\s*([A-Za-z_$][\w$]*)\s*$/.exec(text)?.[1] : undefined;
+      const idRegex = /[A-Za-z_$][\w$]*/g;
+      let id: RegExpExecArray | null;
+      while ((id = idRegex.exec(text)) !== null) {
+        const name = id[0];
+        const start = id.index;
+        const before = text.slice(0, start).replace(/\s+$/, '');
+        // A member (`obj.name`, `obj?.name`) is not a template binding; its head is.
+        if (before.endsWith('.')) continue;
+        // The tail of a number literal (`1e5`), not an identifier.
+        if (start > 0 && /[\w$]/.test(text[start - 1]!)) continue;
+        if (name.startsWith('$') || TEMPLATE_NON_BINDINGS.has(name) || templateLocals.has(name)) continue;
+        const after = text.slice(start + name.length);
+        // Object-literal key (`{ active: isActive }`), not a reference.
+        if (/^\s*:(?!:)/.test(after) && /[{,]$/.test(before)) continue;
+        const offset = expr.offset + start;
+        if (/^\s*\(/.test(after)) {
+          if (!JS_GLOBALS.has(name)) emit(name, 'calls', offset);
+        } else if (scriptBindings.has(name)) {
+          emit(name, name === handlerName ? 'calls' : 'references', offset);
+        }
+      }
     }
   }
 
