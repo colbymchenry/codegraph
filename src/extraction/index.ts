@@ -35,7 +35,8 @@ import ignore, { Ignore } from 'ignore';
 import { detectFrameworks } from '../resolution/frameworks';
 import type { ResolutionContext } from '../resolution/types';
 import { createYielder, type MaybeYield } from '../resolution/cooperative-yield';
-import { MAX_SOURCE_FILE_SIZE_BYTES, readBoundedSource, readBoundedSourceSync } from '../file-limits';
+import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp, readBoundedSource, readBoundedSourceSync } from '../file-limits';
+export { oversizeStamp };
 
 /**
  * Number of files to read in parallel during indexing.
@@ -158,18 +159,6 @@ export function hashContent(content: string): string {
   return crypto.createHash('sha256').update(content).digest('hex');
 }
 
-/**
- * What stands in for the content of a file over MAX_SOURCE_FILE_SIZE_BYTES. Such a file is
- * never parsed, so its bytes are never needed — reading them only to hash and
- * discard cost multi-GB RSS spikes on committed video/blob fixtures and could
- * fail outright with `Invalid string length` (#1910). The stamp is a function
- * of size alone: change detection compares it to the stored hash, so a
- * same-size rewrite of an oversize file is not a change (nothing about it is
- * indexed), while crossing the limit in either direction is.
- */
-export function oversizeStamp(size: number): string {
-  return `codegraph:oversize:${size}`;
-}
 
 /**
  * What change detection hashes for a file: its text when it is under the size

@@ -4,6 +4,8 @@ import * as os from 'os';
 import * as path from 'path';
 import { CodeGraph } from '../src';
 import { oversizeStamp, hashContent } from '../src/extraction';
+import { hasDriftedOnDisk, readFileShape } from '../src/ui-server/api/source';
+import { ToolHandler } from '../src/mcp/tools';
 
 /**
  * A file over the size limit is stored as skipped without ever being read
@@ -72,6 +74,38 @@ describe('oversize files are stat-gated, never read (#1910)', () => {
       expect(process.memoryUsage().rss - before).toBeLessThan(100 * 1024 * 1024);
       expect(cg.getFiles().map(f => f.path).sort()).toEqual(['huge.ts', 'ok.ts']);
       expect(cg.getChangedFiles()).toEqual({ added: [], modified: [], removed: [] });
+    } finally {
+      cg.close();
+    }
+  });
+});
+
+describe('an unchanged file over the size limit is not reported as drifted (#1910, #1915 review)', () => {
+  let dir: string;
+  afterEach(() => { if (dir) fs.rmSync(dir, { recursive: true, force: true }); });
+
+  it('reads as current in the viewer and in MCP until its size changes', async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-oversize-drift-'));
+    fs.writeFileSync(path.join(dir, 'app.ts'), 'export function alpha() { return 1; }\n');
+    // 1.4 MB of ordinary text: over the index limit, under the viewer's 8 MB read cap.
+    const line = 'const x = 1;\n';
+    fs.writeFileSync(path.join(dir, 'big.js'), line.repeat(Math.ceil((1.4 * 1024 * 1024) / line.length)));
+    const cg = await CodeGraph.init(dir, { index: true });
+    try {
+      const record = cg.getFiles().find((f) => f.path === 'big.js')!;
+      expect(record).toBeDefined();
+      // Touch it: the stat fast path no longer answers, so the hash has to.
+      const later = new Date(Date.now() + 5000);
+      fs.utimesSync(path.join(dir, 'big.js'), later, later);
+
+      expect(readFileShape(dir, 'big.js', record).drift).toBe(false);
+      expect(hasDriftedOnDisk(dir, 'big.js', record)).toBe(false);
+      expect((new ToolHandler(cg) as any).isFileStaleOnDisk(cg, 'big.js')).toBe(false);
+
+      // A different size is a different stamp, and that is drift.
+      fs.appendFileSync(path.join(dir, 'big.js'), line);
+      expect(readFileShape(dir, 'big.js', record).drift).toBe(true);
+      expect(hasDriftedOnDisk(dir, 'big.js', record)).toBe(true);
     } finally {
       cg.close();
     }
