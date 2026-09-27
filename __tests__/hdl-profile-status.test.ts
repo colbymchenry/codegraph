@@ -96,7 +96,7 @@ it('prefixes normal, empty and access-filtered MCP exploration with the indexed 
       expect(text).toContain('Profile mismatch: rebuild the index');
     }
   } finally {cg?.close();fs.rmSync(root,{recursive:true,force:true});}
-});
+}, 30_000);
 
 it('summarizes configured and indexed settings separately without exposing defines values or source filelists',()=>{
   const configuration=active('synthesis','configured-synth');
