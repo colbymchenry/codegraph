@@ -299,8 +299,14 @@ function matchMemberFunctionRef(ref: UnresolvedRef, context: ResolutionContext):
   }
   if (ref.language === 'go') {
     if (receiver.includes('.')) return matchGoFieldChainCall(receiver, member, ref, context);
-    const type = inferLocalReceiverType(receiver, ref, context);
-    if (type) return resolveMethodOnType(type, member, ref, context, 0.9, 'function-ref');
+    // A Go inferred type carries its package directory (see matchMethodCall).
+    const typeRef = inferLocalReceiverType(receiver, ref, context);
+    if (typeRef === GO_EXTERNAL_TYPE) return null;
+    if (typeRef) {
+      const { dir, type } = splitGoTypeRef(typeRef);
+      return resolveMethodOnType(type, member, ref, context, 0.9, 'function-ref',
+        dir !== undefined ? GO_DIR_HINT + dir : undefined);
+    }
     const types = context.getNodesByName(receiver).filter(n => n.language === 'go' && (n.kind === 'struct' || n.kind === 'interface'));
     if (types.length) return types.length === 1 ? resolveMethodOnType(receiver, member, ref, context, 0.9, 'function-ref') : null;
   } else {
