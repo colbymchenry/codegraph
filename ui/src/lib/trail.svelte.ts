@@ -17,6 +17,13 @@ export type { HopDirection, TrailHop } from './trail-codec';
 let hops = $state<TrailHop[]>([]);
 
 /**
+ * Hops one trail keeps — the trail store's `MAX_TRAIL_HOPS`, which `/api/flow`
+ * reads up to as well, so any trail on the bar can be saved and read as a flow.
+ * Past it the oldest hop falls off the front (#1976).
+ */
+const MAX_TRAIL_HOPS = 64;
+
+/**
  * Every name this session has learned, by id.
  *
  * The hop objects cannot carry it: truncating the trail throws them away, and
@@ -70,7 +77,7 @@ export const trail = {
         kind: hop.kind ?? null,
         dir: hop.dir ?? (hops.length === 0 ? 'start' : 'down'),
       },
-    ];
+    ].slice(-MAX_TRAIL_HOPS);
   },
 
   /**
@@ -119,7 +126,7 @@ export const trail = {
     if (encodeTrail(decoded) === encodeTrail(hops)) return;
     // Names survive the change — including for hops this trail dropped earlier
     // and history has just brought back.
-    hops = decoded.map((h) => {
+    hops = decoded.slice(-MAX_TRAIL_HOPS).map((h) => {
       const seen = known.get(h.id);
       return seen ? { ...h, name: seen.name, kind: seen.kind } : h;
     });
