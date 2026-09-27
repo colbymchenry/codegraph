@@ -1487,10 +1487,9 @@ export function resolveMethodOnType(
   /** Recursion guard for the supertype/conformance walk. */
   depth = 0,
 ): ResolvedRef | null {
-  // This helper resolves a receiver's invoked member, never a type/member
-  // reference such as Java `class Foo extends IBar.Stub`. Keep the guard here
-  // as a backstop for every current and future caller of this call-only API.
-  if (ref.referenceKind !== 'calls') return null;
+  // Only calls and captured method values have a callable receiver. Inheritance
+  // references such as `class Foo extends IBar.Stub` must not reach this helper.
+  if (ref.referenceKind !== 'calls' && ref.referenceKind !== 'function_ref') return null;
 
   // Look up methods by name and match by qualifiedName ending in
   // `<typeName>::<methodName>`. This works whether the method is defined
