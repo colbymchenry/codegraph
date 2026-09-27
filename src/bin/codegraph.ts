@@ -41,7 +41,7 @@ try {
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection } from '../directory';
+import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection } from '../directory';
 import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
@@ -919,69 +919,91 @@ program
         process.exit(1);
       }
 
-      const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
-      // `index` is a FULL re-index — identical to a fresh `init`. RECREATE the
-      // database from scratch (discard .codegraph/codegraph.db + its WAL) rather
-      // than opening the old graph and DELETE-ing every row. The clear-then-index
-      // approach reported "0 nodes" without the clear (#874); the recreate keeps
-      // that fixed AND avoids the failure mode where, on a large or pre-fix
-      // poisoned index, the per-row FTS delete churn wedged the main thread long
-      // enough to trip the liveness watchdog before scanning even began (#1067).
-      // recreate() hands back a fresh, empty instance — no clear() needed. For
-      // fast incremental updates use `sync`.
-      const cg = await CodeGraph.recreate(projectPath);
-
-      // Supervise the indexer: self-terminate if orphaned (parent shim killed)
-      // or if the main thread wedges — neither was guarded on this path (#999).
-      // The DB + WAL paths let the liveness watchdog tell a slow store on
-      // degraded storage from a true wedge (#1231).
-      const dbPath = getDatabasePath(projectPath);
-      const supervision = installCommandSupervision('index', { progressPaths: [dbPath, `${dbPath}-wal`] });
+      const { tryAcquireWriterLock, releaseWriterLock, writerLockHeldMessage } = await import('../mcp/writer-lock');
+      const rebuild = tryAcquireWriterLock(projectPath, 'rebuild', 'rebuild.pid');
+      if (rebuild.kind === 'taken') throw new Error('Another index rebuild is already in progress.');
       try {
-        if (options.quiet) {
-          // Quiet mode: no UI, just run against the freshly-recreated graph.
-          const result = await cg.indexAll();
-          if (!result.success) process.exit(1);
-          cg.destroy();
-          return;
+        // A live MCP daemon keeps SQLite handles open. Verify it by its socket
+        // before stopping it so a stale pidfile can never signal another process.
+        const { stopDaemonAt } = await import('../mcp/daemon-registry');
+        const daemonStop = await stopDaemonAt(fs.realpathSync(projectPath), { preserveUnverified: true });
+        if (daemonStop.outcome === 'unverified' || daemonStop.outcome === 'still-running') {
+          throw new Error('Could not verify that the active CodeGraph daemon has stopped. Run `codegraph daemon stop` to stop it, then retry `codegraph index`.');
         }
 
-        const clack = await importESM('@clack/prompts');
-        clack.intro('Indexing project');
+        // Keep the writer slot through recreation AND indexing. A reconnecting
+        // proxy/daemon must not open the replacement database halfway through.
+        const writer = tryAcquireWriterLock(projectPath, 'rebuild');
+        if (writer.kind === 'taken') throw new Error(writerLockHeldMessage(writer.existing, writer.pidPath));
+        try {
+          const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
+          // `index` is a FULL re-index — identical to a fresh `init`. RECREATE the
+          // database from scratch (discard .codegraph/codegraph.db + its WAL) rather
+          // than opening the old graph and DELETE-ing every row. The clear-then-index
+          // approach reported "0 nodes" without the clear (#874); the recreate keeps
+          // that fixed AND avoids the failure mode where, on a large or pre-fix
+          // poisoned index, the per-row FTS delete churn wedged the main thread long
+          // enough to trip the liveness watchdog before scanning even began (#1067).
+          // recreate() hands back a fresh, empty instance — no clear() needed. For
+          // fast incremental updates use `sync`.
+          const cg = await CodeGraph.recreate(projectPath);
 
-        // A closure so a re-index (after opting gitignored child repos in, #1156)
-        // renders identically. Supervision already wraps the whole command.
-        const renderIndex = async (): Promise<IndexResult> => {
-          if (options.verbose) {
-            return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
+          // Supervise the indexer: self-terminate if orphaned (parent shim killed)
+          // or if the main thread wedges — neither was guarded on this path (#999).
+          // The DB + WAL paths let the liveness watchdog tell a slow store on
+          // degraded storage from a true wedge (#1231).
+          const dbPath = getDatabasePath(projectPath);
+          const supervision = installCommandSupervision('index', { progressPaths: [dbPath, `${dbPath}-wal`] });
+          try {
+            if (options.quiet) {
+              // Quiet mode: no UI, just run against the freshly-recreated graph.
+              const result = await cg.indexAll();
+              if (!result.success) process.exit(1);
+              return;
+            }
+
+            const clack = await importESM('@clack/prompts');
+            clack.intro('Indexing project');
+
+            // A closure so a re-index (after opting gitignored child repos in, #1156)
+            // renders identically. Supervision already wraps the whole command.
+            const renderIndex = async (): Promise<IndexResult> => {
+              if (options.verbose) {
+                return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
+              }
+              process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
+              const progress = createShimmerProgress();
+              const r = await cg.indexAll({ onProgress: progress.onProgress });
+              await progress.stop();
+              return r;
+            };
+
+            const result = await renderIndex();
+
+            printIndexResult(clack, result, projectPath);
+            await recordIndexTelemetry(cg, result);
+
+            // Empty graph at a git super-repo → likely `.gitignore`d child repos;
+            // name them and offer to opt in instead of a silent 0-node result (#1156).
+            let finalResult = result;
+            if (result.nodesCreated === 0) {
+              finalResult = (await offerIndexIgnoredRepos(clack, projectPath, renderIndex, { interactive: true })) ?? result;
+            }
+
+            if (!finalResult.success) {
+              process.exit(1);
+            }
+
+            clack.outro('Done');
+          } finally {
+            supervision.stop();
+            cg.destroy();
           }
-          process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-          const progress = createShimmerProgress();
-          const r = await cg.indexAll({ onProgress: progress.onProgress });
-          await progress.stop();
-          return r;
-        };
-
-        const result = await renderIndex();
-
-        printIndexResult(clack, result, projectPath);
-        await recordIndexTelemetry(cg, result);
-
-        // Empty graph at a git super-repo → likely `.gitignore`d child repos;
-        // name them and offer to opt in instead of a silent 0-node result (#1156).
-        let finalResult = result;
-        if (result.nodesCreated === 0) {
-          finalResult = (await offerIndexIgnoredRepos(clack, projectPath, renderIndex, { interactive: true })) ?? result;
+        } finally {
+          releaseWriterLock(projectPath);
         }
-
-        if (!finalResult.success) {
-          process.exit(1);
-        }
-
-        clack.outro('Done');
-        cg.destroy();
       } finally {
-        supervision.stop();
+        releaseWriterLock(projectPath, 'rebuild.pid');
       }
     } catch (err) {
       error(`Failed to index: ${err instanceof Error ? err.message : String(err)}`);
@@ -1010,39 +1032,45 @@ program
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
 
-      if (options.quiet) {
-        await cg.sync();
+      try {
+        if (options.quiet) {
+          await cg.sync();
+          return;
+        }
+
+        const clack = await importESM('@clack/prompts');
+        clack.intro('Syncing CodeGraph');
+
+        process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
+        const progress = createShimmerProgress();
+
+        const result = await cg.sync({
+          onProgress: progress.onProgress,
+        }).finally(() => progress.stop());
+
+        const totalChanges = result.filesAdded + result.filesModified + result.filesRemoved;
+
+        if (totalChanges === 0 && !result.pendingRefsProcessed) {
+          clack.log.info('Already up to date');
+        } else if (totalChanges > 0) {
+          clack.log.success(`Synced ${formatNumber(totalChanges)} changed files`);
+          const details: string[] = [];
+          if (result.filesAdded > 0) details.push(`Added: ${result.filesAdded}`);
+          if (result.filesModified > 0) details.push(`Modified: ${result.filesModified}`);
+          if (result.filesRemoved > 0) details.push(`Removed: ${result.filesRemoved}`);
+          clack.log.info(`${details.join(', ')} ${getGlyphs().dash} ${formatNumber(result.nodesUpdated)} nodes in ${formatDuration(result.durationMs)}`);
+        }
+
+        if (result.pendingRefsProcessed) {
+          const unresolved = result.pendingRefsUnresolved
+            ? ` (${formatNumber(result.pendingRefsUnresolved)} unresolved)` : '';
+          clack.log.info(`Resolved ${formatNumber(result.pendingRefsResolved ?? 0)} pending references${unresolved}`);
+        }
+
+        clack.outro('Done');
+      } finally {
         cg.destroy();
-        return;
       }
-
-      const clack = await importESM('@clack/prompts');
-      clack.intro('Syncing CodeGraph');
-
-      process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-      const progress = createShimmerProgress();
-
-      const result = await cg.sync({
-        onProgress: progress.onProgress,
-      });
-
-      await progress.stop();
-
-      const totalChanges = result.filesAdded + result.filesModified + result.filesRemoved;
-
-      if (totalChanges === 0) {
-        clack.log.info('Already up to date');
-      } else {
-        clack.log.success(`Synced ${formatNumber(totalChanges)} changed files`);
-        const details: string[] = [];
-        if (result.filesAdded > 0) details.push(`Added: ${result.filesAdded}`);
-        if (result.filesModified > 0) details.push(`Modified: ${result.filesModified}`);
-        if (result.filesRemoved > 0) details.push(`Removed: ${result.filesRemoved}`);
-        clack.log.info(`${details.join(', ')} ${getGlyphs().dash} ${formatNumber(result.nodesUpdated)} nodes in ${formatDuration(result.durationMs)}`);
-      }
-
-      clack.outro('Done');
-      cg.destroy();
     } catch (err) {
       if (!options.quiet) {
         error(`Failed to sync: ${err instanceof Error ? err.message : String(err)}`);
@@ -1468,6 +1496,9 @@ program
       let input: { prompt?: string; cwd?: string } = {};
       try { input = JSON.parse(raw); } catch { return; }
       const prompt = String(input.prompt || '');
+      // System-injected task notifications are not user prompts: exit before
+      // any project lookup or explore work (#1832).
+      if (isTaskNotification(prompt)) return;
 
       // Gate telemetry: how often each tier fires vs. no-ops — counter names
       // only, NEVER prompt content (see TELEMETRY.md). This is the data that
@@ -2296,13 +2327,16 @@ for (const direction of ['callers', 'callees'] as const) {
             return { group, nodes: [...nodes.values()], edges: [...edges.values()] };
           });
 
+          const relationships = (node: Node, edges: Edge[]) => [...new Set(edges
+            .filter((edge) => (direction === 'callers' ? edge.source : edge.target) === node.id)
+            .map((edge) => edge.kind))];
           if (options.json) {
             const definitions = collected.map(({ group, nodes, edges }) => {
               const limited = nodes.slice(0, limit);
               const shown = new Set(limited.map((node) => node.id));
               return {
                 ...cliDefinition(group),
-                [direction]: limited.map((node) => ({ id: node.id, ...cliNode(node) })),
+                [direction]: limited.map((node) => ({ id: node.id, ...cliNode(node), relationships: relationships(node, edges) })),
                 edges: edges.filter((edge) => shown.has(direction === 'callers' ? edge.source : edge.target)),
                 total: nodes.length,
                 limit,
@@ -2323,7 +2357,8 @@ for (const direction of ['callers', 'callees'] as const) {
               filteredOut,
               note,
               definitions,
-              [direction]: [...union.values()].slice(0, limit).map(cliNode),
+              [direction]: [...union.values()].slice(0, limit).map((node) => ({ ...cliNode(node),
+                relationships: relationships(node, collected.flatMap((entry) => entry.edges)) })),
               total,
               limit,
               truncated: total > limit,
@@ -2333,7 +2368,7 @@ for (const direction of ['callers', 'callees'] as const) {
             if (ambiguous) {
               console.log(chalk.bold(`\n${title} of "${symbol}" — ${groups.length} distinct definitions (narrow with --file):`));
             }
-            for (const { group, nodes } of collected) {
+            for (const { group, nodes, edges } of collected) {
               const limited = nodes.slice(0, limit);
               const total = nodes.length;
               const truncated = total > limit;
@@ -2350,7 +2385,9 @@ for (const direction of ['callers', 'callees'] as const) {
               }
               for (const node of limited) {
                 const loc = node.startLine ? `:${node.startLine}` : '';
-                console.log(chalk.cyan(node.kind.padEnd(12)) + chalk.white(node.name));
+                const kinds = relationships(node, edges).filter((kind) => kind !== 'calls');
+                const relation = kinds.length ? ` [${kinds.join(', ')}]` : '';
+                console.log(chalk.cyan(node.kind.padEnd(12)) + chalk.white(node.name) + chalk.dim(relation));
                 console.log(chalk.dim(`  ${node.filePath}${loc}`));
                 console.log();
               }

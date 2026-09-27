@@ -20,6 +20,7 @@ import * as os from 'os';
 import * as path from 'path';
 import CodeGraph from '../src/index';
 import { createGraphApi, startUiServer, type GraphApi, type UiServerHandle } from '../src/ui-server';
+import { buildRoutes } from '../src/ui-server/api/routes';
 
 interface Response {
   status: number;
@@ -905,6 +906,39 @@ describe('GET /api/routes', () => {
       expect(body.code).toBe('bad-request');
     }
   });
+
+  it('links every route to its handler, however many files the handlers live in (#1975)', async () => {
+    // 70 handlers, one file each: the lookup used to stop at the 60th file and
+    // report the rest as "not in the index".
+    const root = path.join(tempDir, 'many-handlers');
+    fs.mkdirSync(path.join(root, 'src', 'handlers'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ dependencies: { express: '^4.0.0' } }));
+    const imports: string[] = [];
+    const mounts: string[] = [];
+    for (let n = 1; n <= 70; n++) {
+      fs.writeFileSync(
+        path.join(root, 'src', 'handlers', `h${n}.ts`),
+        `export function h${n}(req: any, res: any): void { res.json(${n}); }\n`
+      );
+      imports.push(`import { h${n} } from './handlers/h${n}';`);
+      mounts.push(`app.get('/r${n}', h${n});`);
+    }
+    fs.writeFileSync(
+      path.join(root, 'src', 'app.ts'),
+      `import express from 'express';\n${imports.join('\n')}\nconst app = express();\n${mounts.join('\n')}\nexport default app;\n`
+    );
+    const cg = CodeGraph.initSync(root, { config: { include: ['src/**/*.ts'], exclude: [] } });
+    try {
+      await cg.indexAll();
+      cg.resolveReferences();
+      const body = buildRoutes(cg, new URLSearchParams('limit=200'));
+      expect(body.entries).toHaveLength(70);
+      const unlinked = body.entries.filter((e) => !e.handlerId).map((e) => e.url);
+      expect(unlinked).toEqual([]);
+    } finally {
+      cg.close();
+    }
+  }, 120_000);
 
   describe('a project that IS routed', () => {
     let routedApi: GraphApi;

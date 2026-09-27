@@ -35,6 +35,7 @@ import ignore, { Ignore } from 'ignore';
 import { detectFrameworks } from '../resolution/frameworks';
 import type { ResolutionContext } from '../resolution/types';
 import { createYielder, type MaybeYield } from '../resolution/cooperative-yield';
+import { MAX_SOURCE_FILE_SIZE_BYTES } from '../file-limits';
 
 /**
  * Number of files to read in parallel during indexing.
@@ -119,6 +120,12 @@ export interface IndexResult {
  * Result of a sync operation
  */
 export interface SyncResult {
+  /** References attempted by the pending-reference recovery sweep, if run. */
+  pendingRefsProcessed?: number;
+  /** Pending references successfully resolved by the recovery sweep. */
+  pendingRefsResolved?: number;
+  /** Pending references the recovery sweep could not resolve. */
+  pendingRefsUnresolved?: number;
   filesChecked: number;
   filesAdded: number;
   filesModified: number;
@@ -150,13 +157,6 @@ export interface SyncResult {
 export function hashContent(content: string): string {
   return crypto.createHash('sha256').update(content).digest('hex');
 }
-
-/**
- * Skip files larger than this (bytes). Generated bundles, minified JS, and
- * vendored blobs blow the WASM heap and the worker-recycle budget for no useful
- * symbols. 1 MB covers essentially all hand-written source.
- */
-const MAX_FILE_SIZE = 1024 * 1024;
 
 /**
  * Directory names that are dependency, build, cache, or tooling output across the
@@ -239,6 +239,13 @@ const DEFAULT_IGNORE_PATTERNS: string[] = [
   'bazel-*/',        // Bazel output symlink trees
   // Android resource dirs at any depth, with their qualifier variants (#1047).
   ...ANDROID_RES_TYPES.map((t) => `**/res/${t}*/`),
+  // `build` is also a legal JVM package segment. Keep it under conventional
+  // source roots (any source set: main, test, androidTest, ...) while continuing
+  // to exclude module/build output (#1642). Unignore only the directory, not its
+  // subtree: other defaults still apply.
+  '!**/src/*/java/**/build/',
+  '!**/src/*/kotlin/**/build/',
+  '!**/src/*/scala/**/build/',
 ];
 
 /** True if `buf` decodes as strict UTF-8 (no invalid byte sequences). */
@@ -2280,18 +2287,18 @@ export class ExtractionOrchestrator {
           continue;
         }
 
-        // Honour MAX_FILE_SIZE. Without this check, vendored generated
+        // Honour MAX_SOURCE_FILE_SIZE_BYTES. Without this check, vendored generated
         // headers, minified bundles, and other multi-MB files get indexed,
         // wasting WASM heap and the worker recycle budget on inputs with no
         // useful symbols. The single-file extractFile path already enforces
         // this; the bulk path used to silently skip the check.
-        if (stats.size > MAX_FILE_SIZE) {
+        if (stats.size > MAX_SOURCE_FILE_SIZE_BYTES) {
           await storeResult(filePath, content, stats, {
             nodes: [],
             edges: [],
             unresolvedReferences: [],
             errors: [{
-              message: `File exceeds max size (${stats.size} > ${MAX_FILE_SIZE})`,
+              message: `File exceeds max size (${stats.size} > ${MAX_SOURCE_FILE_SIZE_BYTES})`,
               filePath,
               severity: 'warning',
               code: 'size_exceeded',
@@ -2621,14 +2628,14 @@ export class ExtractionOrchestrator {
     const language = detectLanguage(relativePath, content, loadExtensionOverrides(this.rootDir));
 
     // Check file size
-    if (stats.size > MAX_FILE_SIZE) {
+    if (stats.size > MAX_SOURCE_FILE_SIZE_BYTES) {
       const result: ExtractionResult = {
         nodes: [],
         edges: [],
         unresolvedReferences: [],
         errors: [
           {
-            message: `File exceeds max size (${stats.size} > ${MAX_FILE_SIZE})`,
+            message: `File exceeds max size (${stats.size} > ${MAX_SOURCE_FILE_SIZE_BYTES})`,
             filePath: relativePath,
             severity: 'warning',
             code: 'size_exceeded',
@@ -3030,7 +3037,9 @@ export class ExtractionOrchestrator {
      * is stored, when no extraction transaction is open, so a checkpoint can
      * safely catch up before the next file grows the WAL further.
      */
-    backpressure?: () => Promise<void> | null
+    backpressure?: () => Promise<void> | null,
+    /** Inspect changed inputs before deletion/re-extraction cascades their edges. */
+    onFileChange?: (filePath: string, content?: string) => void
   ): Promise<SyncResult> {
     await initGrammars(); // Initialize WASM runtime (grammars loaded lazily below)
     const startTime = Date.now();
@@ -3146,6 +3155,7 @@ export class ExtractionOrchestrator {
             this.queries.insertUnresolvedRefsBatch(resurrected);
           }
         }
+        onFileChange?.(tracked.path);
         this.queries.deleteFile(tracked.path);
         filesRemoved++;
       }
@@ -3195,10 +3205,12 @@ export class ExtractionOrchestrator {
       const contentHash = hashContent(content);
 
       if (!tracked) {
+        onFileChange?.(filePath, content);
         filesToIndex.push(filePath);
         changedFilePaths.push(filePath);
         filesAdded++;
       } else if (tracked.contentHash !== contentHash) {
+        onFileChange?.(filePath, content);
         filesToIndex.push(filePath);
         changedFilePaths.push(filePath);
         filesModified++;

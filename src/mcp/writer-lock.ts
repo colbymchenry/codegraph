@@ -30,10 +30,10 @@ function isProcessAlive(pid: number): boolean {
 
 
 /** Absolute path to the writer pid lockfile for `projectRoot`. */
-export function getWriterPidPath(projectRoot: string): string {
+export function getWriterPidPath(projectRoot: string, lockName: 'writer.pid' | 'rebuild.pid' = 'writer.pid'): string {
   let root = projectRoot;
   try { root = fs.realpathSync(projectRoot); } catch { /* keep lexical */ }
-  return path.join(getCodeGraphDir(root), 'writer.pid');
+  return path.join(getCodeGraphDir(root), lockName);
 }
 
 /** Structured contents of the writer pidfile. */
@@ -42,6 +42,8 @@ export interface WriterLockInfo {
   /** `direct` | `daemon` | `fallback` — for actionable error text only. */
   mode: string;
   startedAt: number;
+  /** False until the MCP owner has finished its initial catch-up. */
+  ready?: boolean;
 }
 
 export type WriterAcquireResult =
@@ -60,6 +62,7 @@ export function decodeWriterLockInfo(raw: string): WriterLockInfo | null {
       pid: parsed.pid,
       mode: parsed.mode,
       startedAt: typeof parsed.startedAt === 'number' ? parsed.startedAt : 0,
+      ...(typeof parsed.ready === 'boolean' ? { ready: parsed.ready } : {}),
     };
   } catch {
     return null;
@@ -73,14 +76,16 @@ export function decodeWriterLockInfo(raw: string): WriterLockInfo | null {
 export function tryAcquireWriterLock(
   projectRoot: string,
   mode: string,
+  lockName: 'writer.pid' | 'rebuild.pid' = 'writer.pid',
 ): WriterAcquireResult {
-  const pidPath = getWriterPidPath(projectRoot);
+  const pidPath = getWriterPidPath(projectRoot, lockName);
   fs.mkdirSync(path.dirname(pidPath), { recursive: true });
 
   const info: WriterLockInfo = {
     pid: process.pid,
     mode,
     startedAt: Date.now(),
+    ready: false,
   };
 
   const attempt = (): WriterAcquireResult => {
@@ -146,9 +151,23 @@ export function tryAcquireWriterLock(
   return result;
 }
 
-/** Release if we still own the lock (pid match). */
-export function releaseWriterLock(projectRoot: string): void {
+/** Publish catch-up readiness without exposing a partially-written pidfile. */
+export function markWriterReady(projectRoot: string): void {
   const pidPath = getWriterPidPath(projectRoot);
+  const info = readWriterLock(projectRoot);
+  if (!info || info.pid !== process.pid) return;
+  const tmp = `${pidPath}.${process.pid}.ready.tmp`;
+  try {
+    fs.writeFileSync(tmp, encode({ ...info, ready: true }), { mode: 0o600 });
+    fs.renameSync(tmp, pidPath);
+  } finally {
+    try { fs.unlinkSync(tmp); } catch { /* best-effort */ }
+  }
+}
+
+/** Release if we still own the lock (pid match). */
+export function releaseWriterLock(projectRoot: string, lockName: 'writer.pid' | 'rebuild.pid' = 'writer.pid'): void {
+  const pidPath = getWriterPidPath(projectRoot, lockName);
   try {
     if (!fs.existsSync(pidPath)) return;
     const info = decodeWriterLockInfo(fs.readFileSync(pidPath, 'utf8'));
@@ -159,8 +178,8 @@ export function releaseWriterLock(projectRoot: string): void {
 }
 
 /** Read current lock without acquiring. */
-export function readWriterLock(projectRoot: string): WriterLockInfo | null {
-  const pidPath = getWriterPidPath(projectRoot);
+export function readWriterLock(projectRoot: string, lockName: 'writer.pid' | 'rebuild.pid' = 'writer.pid'): WriterLockInfo | null {
+  const pidPath = getWriterPidPath(projectRoot, lockName);
   try {
     return decodeWriterLockInfo(fs.readFileSync(pidPath, 'utf8'));
   } catch {
@@ -185,4 +204,24 @@ export function writerLockHeldMessage(
     'or unset CODEGRAPH_NO_DAEMON so additional clients proxy to the shared daemon. ' +
     'If this is stale, delete ' + pidPath
   );
+}
+
+/** Rebuild intent is separate from writer ownership: acquire BEFORE stopping
+ * the daemon, so its disconnected proxies cannot reopen SQLite in the gap. */
+/**
+ * An index rebuild (`codegraph index`) owns the database. Expected and brief,
+ * so the MCP layer answers it as guidance, never as a tool error (#1325).
+ */
+export class RebuildInProgressError extends Error {
+  constructor() {
+    super('CodeGraph index rebuild is in progress; retry when it finishes.');
+    this.name = 'RebuildInProgressError';
+  }
+}
+
+export function assertNoRebuild(root: string): void {
+  const lock = readWriterLock(root, 'rebuild.pid');
+  if (lock && lock.pid !== process.pid && isProcessAlive(lock.pid)) {
+    throw new RebuildInProgressError();
+  }
 }

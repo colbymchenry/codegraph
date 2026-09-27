@@ -66,6 +66,23 @@ describe('FileLock', () => {
     lock1.release();
   });
 
+  it('keeps a live holder protected after its lock file is older than two minutes (#1959)', () => {
+    const holder = new FileLock(lockPath);
+    const contender = new FileLock(lockPath);
+    holder.acquire();
+    const old = new Date(Date.now() - 3 * 60_000);
+    fs.utimesSync(lockPath, old, old);
+
+    try {
+      expect(() => contender.acquire()).toThrow(/locked by another process/);
+      expect(fs.readFileSync(lockPath, 'utf8')).toBe(String(process.pid));
+    } finally {
+      holder.release();
+      contender.release();
+    }
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
   it('should detect and remove stale locks from dead processes', () => {
     // Write a lock file with a PID that doesn't exist
     // PID 99999999 is extremely unlikely to be a real process
@@ -408,6 +425,7 @@ describe('MCP Input Validation', () => {
     }));
     const fakeCg = {
       searchNodes: () => many,
+      getFile: () => undefined,
       // Search down-ranks generated files, and since #1500 that verdict comes
       // from the index (path convention ∪ content banner) rather than the
       // filename alone. No database here — none of these paths is generated.

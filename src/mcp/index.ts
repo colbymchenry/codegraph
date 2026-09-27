@@ -50,8 +50,8 @@ import {
 import { clearStaleDaemonArtifacts } from './daemon-registry';
 import { connectWithHello, runLocalHandshakeProxy } from './proxy';
 import {
-  getWriterPidPath,
   readWriterLock,
+  assertNoRebuild,
   releaseWriterLock,
   tryAcquireWriterLock,
   writerLockHeldMessage,
@@ -72,6 +72,9 @@ import { armStartupHandshakeTimeout } from './startup-handshake';
 import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
 
+/** Default worker cap for a direct (single-client) session; see MCPEngineOptions.queryPoolDefaultMax (#1465). */
+const DIRECT_QUERY_POOL_MAX = 2;
+
 /**
  * Env var that marks a process as the *detached daemon* itself (set by
  * {@link spawnDetachedDaemon} when it re-invokes the CLI). Without it a
@@ -89,11 +92,22 @@ const TAKEOVER_MAX_RETRIES = 5;
 const TAKEOVER_RETRY_DELAY_MS = 100;
 
 /**
+ * A fallback that serves reads without a watcher or a writer lock (#1963).
+ * Say so on stderr: otherwise a session that quietly stopped syncing looks
+ * the same as a healthy one in the logs.
+ */
+function readOnlyFallback(holder: string): MCPEngine {
+  process.stderr.write(`[CodeGraph MCP] Serving reads in-process without auto-sync: ${holder}.\n`);
+  return new MCPEngine({ readOnly: true });
+}
+
+/**
  * Create an in-process fallback only when it cannot conflict with a live
  * legacy daemon. Plain-PID locks cannot prove daemon identity, but they still
  * prove that a process owns the legacy writer slot.
  */
 function makeFallbackEngine(root: string): MCPEngine {
+  assertNoRebuild(root);
   let existing: ReturnType<typeof decodeLockInfo> = null;
   try {
     existing = decodeLockInfo(fs.readFileSync(getDaemonPidPath(root), 'utf8'));
@@ -114,14 +128,14 @@ function makeFallbackEngine(root: string): MCPEngine {
   }
   const writer = readWriterLock(root);
   if (writer && writer.pid > 0 && isProcessAlive(writer.pid)) {
-    throw new Error(writerLockHeldMessage(writer, getWriterPidPath(root)));
+    // Another process owns updates. A fallback may still serve read-only WAL
+    // queries without claiming a second writer or starting a watcher (#1963).
+    return readOnlyFallback(`writer lock held by PID ${writer.pid} (${writer.mode} mode)`);
   }
   if (existing && isProcessAlive(existing.pid)) {
-    throw new Error(
-      `Cannot start an in-process fallback while live daemon pid ${existing.pid} holds the project lock.`
-    );
+    return readOnlyFallback(`live daemon PID ${existing.pid} holds the project lock`);
   }
-  return new MCPEngine({ writerLockRoot: root });
+  return new MCPEngine({ writerLockRoot: root, queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX });
 }
 
 /**
@@ -378,13 +392,9 @@ export class MCPServer {
    * connected session; in direct mode it mirrors the pre-#411 behavior (close
    * cg, exit). Proxy mode never routes through here — the proxy exits itself.
    */
-  stop(): void {
+  async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
-    if (this.writerLockRoot) {
-      releaseWriterLock(this.writerLockRoot);
-      this.writerLockRoot = null;
-    }
     if (this.ppidWatchdog) {
       clearInterval(this.ppidWatchdog);
       this.ppidWatchdog = null;
@@ -403,8 +413,12 @@ export class MCPServer {
       this.session = null;
     }
     if (this.engine) {
-      this.engine.stop();
+      await this.engine.stop();
       this.engine = null;
+    }
+    if (this.writerLockRoot) {
+      releaseWriterLock(this.writerLockRoot);
+      this.writerLockRoot = null;
     }
     process.exit(0);
   }
@@ -419,6 +433,7 @@ export class MCPServer {
     // mode multiplexes clients; direct mode is single-writer-per-project.
     const writerRoot = resolveDaemonRoot(this.projectPath);
     if (writerRoot) {
+      assertNoRebuild(writerRoot);
       const writer = tryAcquireWriterLock(writerRoot, 'direct');
       if (writer.kind === 'taken') {
         const msg = writerLockHeldMessage(writer.existing, writer.pidPath);
@@ -428,8 +443,8 @@ export class MCPServer {
       this.writerLockRoot = writerRoot;
     }
 
-    this.engine = new MCPEngine();
-    const transport = new StdioTransport();
+    this.engine = new MCPEngine({ queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX });
+    const transport = new StdioTransport({ exitOnClose: false, onClose: () => { void this.stop(); } });
     this.session = new MCPSession(transport, this.engine, {
       explicitProjectPath: this.projectPath,
     });
@@ -442,7 +457,7 @@ export class MCPServer {
     this.session.start();
 
     // Detect parent-process death — same logic as pre-refactor. When stdin
-    // closes we go through StdioTransport's `process.exit(0)` already, but
+    // closes the transport drains the engine through stop(), but
     // SIGKILL of the parent doesn't reliably close stdin on Linux (#277).
     // Also treat a stdin `'error'` (a socket-backed stdin can fail with
     // ECONNRESET/hangup instead of a clean close) as shutdown, and destroy the

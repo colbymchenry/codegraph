@@ -105,7 +105,7 @@ CREATE TABLE IF NOT EXISTS unresolved_refs (
 -- =============================================================================
 
 -- Node indexes
-CREATE INDEX IF NOT EXISTS idx_nodes_kind ON nodes(kind);
+CREATE INDEX IF NOT EXISTS idx_nodes_kind ON nodes(kind, file_path, start_line, id);
 CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
 CREATE INDEX IF NOT EXISTS idx_nodes_qualified_name ON nodes(qualified_name);
 CREATE INDEX IF NOT EXISTS idx_nodes_file_path ON nodes(file_path);
@@ -198,6 +198,16 @@ CREATE INDEX IF NOT EXISTS idx_unresolved_from_name ON unresolved_refs(from_node
 CREATE INDEX IF NOT EXISTS idx_unresolved_status ON unresolved_refs(status);
 CREATE INDEX IF NOT EXISTS idx_unresolved_failed_tail ON unresolved_refs(name_tail) WHERE status = 'failed';
 CREATE INDEX IF NOT EXISTS idx_edges_provenance ON edges(provenance);
+-- Sync's third-file wiring lookup must not scan every synthesized edge.
+-- CASE short-circuits malformed metadata; keep these expressions identical
+-- in migrations and synthesis queries so SQLite can use the partial index.
+CREATE INDEX IF NOT EXISTS idx_edges_synthesis_site ON edges(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.registeredAt') END)
+    WHERE CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.synthesizedBy') END IS NOT NULL;
+
+-- Retain the cheap source-gate verdict when a later sync deletes the source.
+CREATE TABLE IF NOT EXISTS synthesis_inputs (
+    file_path TEXT PRIMARY KEY REFERENCES files(path) ON DELETE CASCADE
+);
 
 -- Project metadata for version/provenance tracking
 CREATE TABLE IF NOT EXISTS project_metadata (

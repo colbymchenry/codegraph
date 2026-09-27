@@ -31,14 +31,14 @@ describe('calls through an alias binding reach the aliased symbol', () => {
     for (const [name, content] of Object.entries(files)) {
       fs.writeFileSync(path.join(dir, name), content);
     }
-    cg = CodeGraph.initSync(dir, { config: { include: ['**/*.ts'], exclude: [] } });
+    cg = CodeGraph.initSync(dir, { config: { include: ['**/*.ts', '**/*.js'], exclude: [] } });
     await cg.indexAll();
   };
 
   const callersOf = (name: string): string[] => {
     const target = cg.getNodesByKind('function').find((n) => n.name === name);
     expect(target, `fixture symbol ${name} was not indexed`).toBeDefined();
-    return cg.getCallers(target!.id).map((c) => c.node.name);
+    return cg.getCallers(target!.id).filter(c => c.edge.kind === 'calls').map((c) => c.node.name);
   };
 
   it('follows `export const alias = fn`', async () => {
@@ -65,6 +65,88 @@ describe('calls through an alias binding reach the aliased symbol', () => {
       'consumer.ts': "import { api } from './impl';\nexport function consumerFn(): number { return api.run(); }\n",
     });
     expect(callersOf('realImpl')).toContain('consumerFn');
+  });
+
+  describe.each(['ts', 'js'])('object member boundaries (%s)', (ext) => {
+    it.each([
+      ['sibling literals', 'const first = { wrong }; export const api = { run: right };', 'run', true],
+      ['unicode before literal', "const label = 'é🙂'; export const api = { run: right };", 'run', true],
+      ['absent sibling member', 'const first = { wrong }; export const api = { right };', 'wrong', false],
+      ['duplicate key', 'export const api = { run: wrong, run: right };', 'run', true],
+      ['non-callable overwrite', 'export const api = { wrong, wrong: 0 };', 'wrong', false],
+      ['nested member', 'export const api = { box: { wrong }, method() { return { wrong }; } };', 'wrong', false],
+      ['unknown spread', 'export const api = { wrong, ...unknown };', 'wrong', false],
+      ['explicit after spread', 'export const api = { ...unknown, run: right };', 'run', true],
+      ['quoted overwrite', "export const api = { wrong, 'wrong': 0 };", 'wrong', false],
+      ['computed overwrite', 'export const api = { wrong, [unknown]: 0 };', 'wrong', false],
+      ['frozen literal', 'export const api = Object.freeze({ run: right });', 'run', true],
+      ['parenthesized literal', 'export const api = ({ run: right });', 'run', true],
+      ['inline overwrite', 'export const api = { run() { return 0; }, run: right };', 'run', true],
+      ['nested inline', 'export const api = { box: { wrong() { return 0; } } };', 'wrong', false],
+    ])('%s', async (_name, declaration, member, resolves) => {
+      await index({
+        [`impl.${ext}`]: `function wrong() { return 1; }
+function right() { return 2; }
+${declaration}
+export function sameCaller() { return api.${member}(); }
+`,
+        [`consumer.${ext}`]: `import { api } from './impl';
+export function crossCaller() { return api.${member}(); }
+`,
+      });
+      for (const caller of ['sameCaller', 'crossCaller']) {
+        expect(callersOf('wrong')).not.toContain(caller);
+        if (resolves) expect(callersOf('right')).toContain(caller);
+        else expect(callersOf('right')).not.toContain(caller);
+      }
+      const inline = cg.getNodesByKind('function').filter(n => n.name === member && n.name !== 'right' && n.name !== 'wrong');
+      for (const node of inline) {
+        expect(cg.getCallers(node.id).map(c => c.node.name)).not.toContain('sameCaller');
+        expect(cg.getCallers(node.id).map(c => c.node.name)).not.toContain('crossCaller');
+      }
+    });
+  });
+
+  it('does not cross parameter or value shadows', async () => {
+    await index({
+      'impl.ts': `function target() { return 0; }
+export function parameter(target: () => number) {
+  const api = { target };
+  return api.target();
+}
+export function value() {
+  const target = 0;
+  const api = { target };
+  return api.target();
+}
+export function later() {
+  const api = { target };
+  const target = 0;
+  return api.target();
+}
+`,
+    });
+    const targets = cg.getNodesByKind('function').filter(n => n.name === 'target').sort((a, b) => a.startLine - b.startLine);
+    expect(targets).toHaveLength(1);
+    const outer = cg.getCallers(targets[0]!.id).filter(c => c.edge.kind === 'calls').map(c => c.node.name);
+    for (const name of ['parameter', 'value', 'later']) expect(outer).not.toContain(name);
+  });
+
+  it('resolves renamed imports at the literal and ignores unrelated nested bindings', async () => {
+    await index({
+      'target.ts': 'export function actual() { return 1; }',
+      'impl.ts': `import { actual as renamed } from './target';
+function unrelated() { function renamed() { return 0; } return renamed(); }
+export const api = { run: renamed };
+export function sameCaller() { return api.run(); }
+`,
+      'consumer.ts': `import { api as facade } from './impl';
+export function crossCaller() { return facade.run(); }
+`,
+    });
+    expect(callersOf('actual')).toEqual(expect.arrayContaining(['sameCaller', 'crossCaller']));
+    expect(callersOf('renamed')).not.toContain('sameCaller');
+    expect(callersOf('renamed')).not.toContain('crossCaller');
   });
 
   it('follows a same-file alias binding', async () => {

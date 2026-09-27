@@ -221,6 +221,14 @@ export class FieldDelegator {
   direct(): void { this.send('x'); super.toString(); }
 }
 
+// --- call through an ES private field (#1987) --------------------------------
+export class PrivateDelegator {
+  #mailer = new FieldDelegator({ send: (m: string) => m }, []);
+  #items = new Set<string>();
+  send(msg: string): string { return this.#mailer.send(msg); }
+  add(x: string): void { this.#items.add(x); }
+}
+
 // --- const-bound functions inside a body (#1669) -----------------------------
 export function NestedHandlers({ items, onPick }: { items: string[]; onPick: (a: unknown, b: unknown) => void }) {
   const handleClear = () => { onPick(null, null); };

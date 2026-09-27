@@ -5,14 +5,15 @@
  * for the RIGHT project — including the monorepo case where the agent's cwd is
  * an un-indexed workspace root and the index lives in a sub-project. These test
  * `planFrontload` / `findIndexedSubprojectRoots` directly (the hook's decision
- * logic), since the end-to-end hook is validated by a live agent run, not a
- * unit test.
+ * logic), plus the built CLI's confidence tiers against a real index.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { planFrontload, findIndexedSubprojectRoots, unsafeIndexRootReason, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens, PROMPT_HOOK_INJECTION_MAX, CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT, capPromptHookInjection } from '../src/directory';
+import { spawnSync } from 'node:child_process';
+import { CodeGraph } from '../src';
+import { planFrontload, isTaskNotification, findIndexedSubprojectRoots, unsafeIndexRootReason, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens, PROMPT_HOOK_INJECTION_MAX, CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT, capPromptHookInjection } from '../src/directory';
 
 // Make the built-in exports configurable so HOME can point at a real temp
 // fixture without changing the process environment or the user's home files.
@@ -302,6 +303,84 @@ describe('hasStructuralKeyword — Latin-script languages, Cyrillic, JA/KO (#112
   });
 });
 
+describe('prompt-hook ambiguous words need corroboration (#1654)', () => {
+  let tmp: string;
+
+  beforeEach(async () => {
+    tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-hook-ambiguous-')));
+    fs.writeFileSync(path.join(tmp, 'orders.ts'), `
+export class OrderStateMachine {
+  submitOrder() { return true; }
+}
+`);
+    const cg = await CodeGraph.init(tmp, { silent: true });
+    try { await cg.indexAll(); } finally { cg.destroy(); }
+  });
+  afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
+
+  function hook(prompt: string): string {
+    const result = spawnSync(process.execPath, [path.resolve(__dirname, '../dist/bin/codegraph.js'), 'prompt-hook'], {
+      cwd: tmp,
+      input: JSON.stringify({ cwd: tmp, prompt }),
+      encoding: 'utf8',
+      timeout: 15_000,
+      env: {
+        ...process.env,
+        CODEGRAPH_TELEMETRY: '0', DO_NOT_TRACK: '1', CODEGRAPH_NO_DAEMON: '1',
+        CODEGRAPH_NO_RELAUNCH: '1', CODEGRAPH_WASM_RELAUNCHED: '1',
+        // Enable only the hook subprocess under test.
+        CODEGRAPH_NO_PROMPT_HOOK: '0', CODEGRAPH_PROMPT_HOOK: '1',
+      },
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    return result.stdout;
+  }
+
+  it('stays silent for everyday Portuguese, Spanish and German without indexed evidence', () => {
+    for (const prompt of [
+      'eu como pizza toda sexta',
+      'faz como a gente combinou ontem',
+      'roda os testes como esta e me diz o resultado',
+      'commita isso como fix, nao como feat',
+      'hazlo como ayer',
+      'mach es wie gestern',
+      'COMO combinado ontem',
+      'Wie gestern bitte',
+      'como JavaScript?',
+      'wie MissingService?',
+      'run the tests and report back',
+    ]) {
+      expect.soft(hasStructuralKeyword(prompt), prompt).toBe(false);
+      expect.soft(hook(prompt), prompt).toBe('');
+    }
+  });
+
+  it('keeps HIGH for verified identifiers or another structural keyword', () => {
+    for (const prompt of [
+      'como OrderStateMachine?',
+      'como submitOrder()?',
+      'wie OrderStateMachine?',
+      'como funciona a máquina de estados?',
+      'wie funktioniert die Zustandsmaschine?',
+      'onde fica a lógica dos pedidos?',
+      '¿cómo se procesan los pedidos?',
+      'how does OrderStateMachine work?',
+    ]) {
+      expect.soft(hook(prompt), prompt).toContain('Structural context from CodeGraph');
+    }
+  });
+
+  it('uses MEDIUM for indexed prose segments without a strong keyword or verified token', () => {
+    for (const prompt of ['como state machine?', 'wie state machine?']) {
+      const output = hook(prompt);
+      expect(output, prompt).toContain('CodeGraph found indexed symbols matching this prompt');
+      expect(output).toContain('OrderStateMachine');
+      expect(output).not.toContain('Structural context from CodeGraph');
+    }
+  });
+});
+
 describe('extractCodeTokens — candidate symbols the hook verifies against the graph', () => {
   it('pulls camelCase / PascalCase / snake_case / call / member tokens', () => {
     expect(extractCodeTokens('prepareArticlePublish 的调用链')).toContain('prepareArticlePublish');
@@ -374,5 +453,18 @@ describe('prompt-hook injection cap (#1694)', () => {
     expect(out).toContain('…(truncated; call codegraph_explore for the rest)');
     // Capped body alone must still fit under the host inline limit.
     expect(out.length).toBeLessThan(CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT);
+  });
+});
+
+describe('system task notifications (#1832)', () => {
+  it('skips the complete system envelope', () => {
+    expect(isTaskNotification('<task-notification>trace AuthService login flow</task-notification>')).toBe(true);
+    expect(isTaskNotification(' <task-notification>\n<task-id>abc</task-id>\n<summary>done</summary>\n</task-notification>\n')).toBe(true);
+  });
+  it('does not suppress a user question that mentions the marker', () => {
+    expect(isTaskNotification('Why does <task-notification>trace</task-notification> trigger the hook?')).toBe(false);
+    expect(isTaskNotification('<task-notification>trace</task-notification> Explain this.')).toBe(false);
+    expect(isTaskNotification('<other-tag>trace AuthService</other-tag>')).toBe(false);
+    expect(isTaskNotification('trace AuthService login')).toBe(false);
   });
 });

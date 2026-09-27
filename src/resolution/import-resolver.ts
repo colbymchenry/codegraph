@@ -14,6 +14,7 @@ import { resolveWorkspaceImport } from './workspace-packages';
 import {
   resolveMethodOnType,
   resolveObjectLiteralMember,
+  resolveObjectLiteralBinding,
   localReceiverTypePatterns,
   normalizeInferredTypeName,
 } from './name-matcher';
@@ -1647,12 +1648,18 @@ export function resolveViaImport(
   for (const imp of imports) {
     if (imp.localName === ref.referenceName || ref.referenceName.startsWith(imp.localName + '.')) {
       // Resolve the import path
-      const resolvedPath = resolveImportPath(
+      let resolvedPath = resolveImportPath(
         imp.source,
         ref.filePath,
         ref.language,
         context
       );
+
+      // Named Python imports need the same absolute-module lookup as namespace
+      // imports, including aliases used as receiver types (#1820).
+      if (!resolvedPath && ref.language === 'python') {
+        resolvedPath = findPythonModuleFile(imp.source, context, ref.filePath)?.filePath ?? null;
+      }
 
       if (resolvedPath) {
         const exportedName = imp.isDefault ? 'default' : imp.exportedName;
@@ -1666,7 +1673,11 @@ export function resolveViaImport(
           ref.language,
           context,
           new Set()
-        );
+        ) ?? (ref.language === 'python'
+          ? context.getNodesInFile(resolvedPath).find(n =>
+              n.name === (memberName ?? exportedName) && !n.qualifiedName.includes('::') &&
+              (n.kind === 'class' || n.kind === 'function' || n.kind === 'variable' || n.kind === 'constant'))
+          : undefined);
 
         if (targetNode) {
           // `Foo.bar()` / `Foo.CONST` — a NAMED (non-namespace) class import
@@ -1714,6 +1725,13 @@ export function resolveViaImport(
             // constant edge below rather than fabricating a wrong one.
             const instanceMember = resolveImportedInstanceMember(targetNode, ref, imp.localName, context);
             if (instanceMember) return instanceMember;
+
+            // Finding a named Python import proves the receiver exists, not
+            // its requested attribute. In particular, task.delay() enqueues
+            // work; it does not call the imported task function directly.
+            // Keep unknown members unresolved (including callback values)
+            // instead of falling back to the receiver as their target.
+            if (ref.language === 'python') return null;
           }
 
           return {
@@ -1891,54 +1909,8 @@ function resolveObjectLiteralAlias(
 ): ResolvedRef | null {
   if (container.kind !== 'constant' && container.kind !== 'variable') return null;
   if (!JS_FAMILY_FILE.test(container.filePath)) return null;
-  if (!/^[A-Za-z_$][\w$]*$/.test(member)) return null;
-  const lines = context.getFileLines?.(container.filePath) ?? context.readFile(container.filePath)?.split('\n');
-  if (!lines) return null;
-  const extent = lines.slice(container.startLine - 1, container.endLine).join('\n');
-  const brace = extent.indexOf('{');
-  if (brace < 0) return null;
-  const body = extent.slice(brace);
-  const keyed = new RegExp(`[{,\\s]${member}\\s*:\\s*([A-Za-z_$][\\w$]*)\\s*[,}]`);
-  const shorthand = new RegExp(`[{,\\s]${member}\\s*[,}]`);
-  const k = body.match(keyed);
-  const binding = k ? k[1]! : shorthand.test(body) ? member : null;
-  if (binding === null) return null;
-
-  const callable = (n: Node) => n.kind === 'function' || n.kind === 'method' || n.kind === 'class';
-  const accepts =
-    ref.referenceKind === 'calls'
-      ? callable
-      : (n: Node) => callable(n) || n.kind === 'constant' || n.kind === 'variable' || n.kind === 'component';
-
-  // Declared in the object's own file, outside the literal.
-  const local = context
-    .getNodesInFile(container.filePath)
-    .filter((n) => n.name === binding && n.id !== container.id && accepts(n))
-    .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0];
-  if (local) return { original: ref, targetNodeId: local.id, confidence: 0.9, resolvedBy: 'import' };
-
-  // Imported into the object's file.
-  for (const imp of context.getImportMappings(container.filePath, container.language)) {
-    if (imp.localName !== binding || imp.isNamespace) continue;
-    const resolvedPath = resolveImportPath(imp.source, container.filePath, container.language, context);
-    if (!resolvedPath) continue;
-    const target = findExportedSymbol(
-      resolvedPath,
-      {
-        isDefault: imp.isDefault,
-        isNamespace: false,
-        exportedName: imp.isDefault ? 'default' : imp.exportedName,
-        memberName: null,
-      },
-      container.language,
-      context,
-      new Set()
-    );
-    if (target && accepts(target)) {
-      return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
-    }
-  }
-  return null;
+  const resolved = resolveObjectLiteralBinding(container, member, ref, context);
+  return resolved ? { ...resolved, confidence: 0.9, resolvedBy: 'import' } : null;
 }
 
 function resolveModuleImportToFile(

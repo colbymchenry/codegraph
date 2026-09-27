@@ -9,7 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { SchemaVersion } from '../types';
 import { runMigrations, getCurrentVersion, CURRENT_SCHEMA_VERSION } from './migrations';
-import { getCodeGraphDir } from '../directory';
+import { getCodeGraphDir, statInode } from '../directory';
 
 export { SqliteDatabase, SqliteBackend } from './sqlite-adapter';
 
@@ -27,10 +27,10 @@ export { SqliteDatabase, SqliteBackend } from './sqlite-adapter';
  * on a writer, so this timeout only governs cross-process write contention
  * (e.g. the git-hook `codegraph sync` running while the MCP server writes).
  */
-function configureConnection(db: SqliteDatabase): void {
+function configureConnection(db: SqliteDatabase, readOnly = false): void {
   db.pragma('busy_timeout = 5000');      // MUST be first — see above
   db.pragma('foreign_keys = ON');
-  db.pragma('journal_mode = WAL');       // node:sqlite supports WAL on every platform
+  if (!readOnly) db.pragma('journal_mode = WAL');       // node:sqlite supports WAL on every platform
   db.pragma('synchronous = NORMAL');     // safe with WAL mode
   db.pragma('cache_size = -64000');      // 64 MB page cache
   db.pragma('temp_store = MEMORY');      // temp tables in memory
@@ -89,7 +89,7 @@ export class DatabaseConnection {
    */
   readonly fts5Available: boolean;
 
-  private constructor(db: SqliteDatabase, dbPath: string, backend: SqliteBackend, fts5Available: boolean) {
+  private constructor(db: SqliteDatabase, dbPath: string, backend: SqliteBackend, fts5Available: boolean, readonly readOnly = false) {
     this.db = db;
     this.dbPath = dbPath;
     this.backend = backend;
@@ -162,14 +162,14 @@ export class DatabaseConnection {
   /**
    * Open an existing database
    */
-  static open(dbPath: string): DatabaseConnection {
+  static open(dbPath: string, options: { readOnly?: boolean } = {}): DatabaseConnection {
     if (!fs.existsSync(dbPath)) {
       throw new Error(`Database not found: ${dbPath}`);
     }
 
-    const { db, backend } = createDatabase(dbPath);
+    const { db, backend } = createDatabase(dbPath, options);
 
-    configureConnection(db);
+    configureConnection(db, options.readOnly);
 
     // Detect FTS5 availability for search fallback (#1532)
     let fts5Available = true;
@@ -180,7 +180,10 @@ export class DatabaseConnection {
     }
 
     // Check and run migrations if needed
-    const conn = new DatabaseConnection(db, dbPath, backend, fts5Available);
+    const conn = new DatabaseConnection(db, dbPath, backend, fts5Available, options.readOnly);
+    // A concurrent reader must leave migrations, bulk-load repair, and WAL
+    // maintenance to the writer, including when versions differ (#1963).
+    if (options.readOnly) return conn;
     const currentVersion = getCurrentVersion(db);
 
     if (currentVersion < CURRENT_SCHEMA_VERSION) {
@@ -361,6 +364,7 @@ export class DatabaseConnection {
     'idx_edges_source_kind',
     'idx_edges_target_kind',
     'idx_edges_provenance',
+    'idx_edges_synthesis_site',
   ] as const;
 
   /**
@@ -833,23 +837,6 @@ export class DatabaseConnection {
     if (this.openedInode === null) return false;
     const current = statInode(this.dbPath);
     return current !== null && current !== this.openedInode;
-  }
-}
-
-/**
- * `dev:ino` for a path, or null if it can't be stat'd or the platform doesn't
- * report a usable inode. Windows st_ino is unreliable across handle reopens, so
- * we deliberately return null there — the deleted-but-open-inode hazard this
- * guards (#925) is a POSIX file-semantics issue that doesn't arise on Windows
- * (an open file can't be unlinked).
- */
-function statInode(p: string): string | null {
-  if (process.platform === 'win32') return null;
-  try {
-    const s = fs.statSync(p);
-    return `${s.dev}:${s.ino}`;
-  } catch {
-    return null;
   }
 }
 

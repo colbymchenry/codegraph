@@ -2,6 +2,8 @@
 //! `generateNodeId` in `src/extraction/tree-sitter-helpers.ts`:
 //!
 //!   `${kind}:${sha256(`${filePath}:${kind}:${name}:${line}`).hex[0..32]}`
+//! NodeIdAllocator appends `:<UTF-16 column>` only for later, distinct source
+//! positions sharing that legacy ID within an extraction.
 //!
 //! and the file-node special case in `TreeSitterExtractor.extract()`:
 //!
@@ -12,6 +14,33 @@
 //! in `__tests__/kernel-scaffold.test.ts`.
 
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+
+/// Per-extraction collision handling, matching NodeIdAllocator in the wasm path.
+#[derive(Default)]
+pub struct NodeIdAllocator {
+    first_columns: HashMap<String, u32>,
+}
+
+impl NodeIdAllocator {
+    pub fn generate(
+        &mut self,
+        file_path: &str,
+        kind: &str,
+        name: &str,
+        line: u32,
+        column: u32,
+    ) -> String {
+        let id = node_id(file_path, kind, name, line);
+        // Zero-based UTF-16 column (util::col16), never tree-sitter's byte column.
+        let first_column = self.first_columns.entry(id.clone()).or_insert(column);
+        if *first_column == column {
+            id
+        } else {
+            format!("{id}:{column}")
+        }
+    }
+}
 
 pub fn node_id(file_path: &str, kind: &str, name: &str, line: u32) -> String {
     let mut hasher = Sha256::new();
@@ -40,6 +69,32 @@ pub fn file_node_id(file_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collision_only_identity_vectors() {
+        let mut ids = NodeIdAllocator::default();
+        let base = "function:bfb15544fed707794274a5c61006ea7b";
+        for (column, expected) in [
+            (2, base.to_string()),
+            (24, format!("{base}:24")),
+            (48, format!("{base}:48")),
+            (24, format!("{base}:24")),
+            (2, base.to_string()),
+        ] {
+            assert_eq!(
+                ids.generate("src/a.ts", "function", "foo", 3, column),
+                expected
+            );
+        }
+        assert_eq!(
+            ids.generate("src/b.ts", "function", "foo", 3, 24),
+            node_id("src/b.ts", "function", "foo", 3)
+        );
+        assert_eq!(
+            NodeIdAllocator::default().generate("src/a.ts", "function", "foo", 3, 24),
+            base
+        );
+    }
 
     #[test]
     fn matches_known_ts_output() {

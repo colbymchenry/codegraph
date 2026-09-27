@@ -152,6 +152,13 @@ export interface LanguageExtractor {
 
   /** Extract signature from node */
   getSignature?: (node: SyntaxNode, source: string) => string | undefined;
+  /**
+   * Extract a docstring that lives INSIDE the node's body rather than as a
+   * preceding comment sibling — the shape `getPrecedingDocstring` cannot see.
+   * Python puts a bare string literal first in the body; Julia and Elixir have
+   * their own variants. Returns cleaned prose, or undefined when there is none.
+   */
+  getBodyDocstring?: (node: SyntaxNode, source: string) => string | undefined;
   /** Extract visibility from node */
   getVisibility?: (node: SyntaxNode) => 'public' | 'private' | 'protected' | 'internal' | undefined;
   /** Check if node is exported */
@@ -229,7 +236,7 @@ export interface LanguageExtractor {
    * Classify a class_declaration node when the grammar reuses one node type
    * for multiple concepts (e.g. Swift uses class_declaration for classes, structs, and enums).
    */
-  classifyClassNode?: (node: SyntaxNode) => 'class' | 'struct' | 'enum' | 'interface' | 'trait';
+  classifyClassNode?: (node: SyntaxNode) => 'class' | 'struct' | 'enum' | 'interface' | 'trait' | 'module';
 
   /**
    * Classify a methodTypes node when the grammar reuses one node type for

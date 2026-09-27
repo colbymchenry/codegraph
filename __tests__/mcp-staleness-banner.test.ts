@@ -20,7 +20,7 @@
  * left untouched.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -72,6 +72,7 @@ describe('MCP staleness banner', () => {
 
   afterEach(() => {
     __setFsWatchForTests(null); // reset the injected fs.watch seam
+    vi.restoreAllMocks();
     try { cg.unwatch(); } catch { /* ignore */ }
     try { cg.close(); } catch { /* ignore */ }
     if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
@@ -208,5 +209,135 @@ describe('MCP staleness banner', () => {
     expect(text).toContain('OS watch/file limit exhausted');
     // status renders the notice inline, so the auto-banner is not also prepended.
     expect(text.startsWith('⚠️')).toBe(false);
+  });
+
+  it('distinguishes a re-armed but not-yet-caught-up watcher from a disabled one (#1959)', async () => {
+    vi.spyOn(cg, 'isWatcherDegraded').mockReturnValue(true);
+    vi.spyOn(cg, 'isWatcherRecovering').mockReturnValue(true);
+
+    const search = await handler.execute('codegraph_search', { query: 'alphaOnly' });
+    expect(search.content[0].text).toMatch(/auto-sync is RECOVERING/);
+    expect(search.content[0].text).not.toMatch(/auto-sync is DISABLED/);
+
+    const status = await handler.execute('codegraph_status', {});
+    expect(status.content[0].text).toContain('**Auto-sync recovering:**');
+    expect(status.content[0].text).not.toContain('**Auto-sync disabled:**');
+  });
+
+  it('asks the owned watcher to re-arm on the next MCP tool call (#1959)', async () => {
+    const rearm = vi.spyOn(cg, 'rearmWatcherAfterLockContention').mockReturnValue(false);
+
+    await handler.execute('codegraph_status', {});
+    expect(rearm).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('MCP staleness banner — matching whole paths (#1968)', () => {
+  let testDir: string;
+  let cg: CodeGraph;
+  let handler: ToolHandler;
+
+  beforeEach(async () => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-stale-paths-'));
+    fs.mkdirSync(path.join(testDir, 'src'));
+    fs.writeFileSync(path.join(testDir, 'src', 'app.tsx'), 'export function appView() { return 1; }\n');
+    cg = CodeGraph.initSync(testDir, { config: { include: ['**/*.ts', '**/*.tsx'], exclude: [] } });
+    await cg.indexAll();
+    handler = new ToolHandler(cg);
+    cg.watch({ debounceMs: 4000, inertForTests: true });
+    await cg.waitUntilWatcherReady();
+  });
+
+  afterEach(() => {
+    try { cg.unwatch(); } catch { /* ignore */ }
+    try { cg.close(); } catch { /* ignore */ }
+    if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  async function pend(rel: string): Promise<void> {
+    fs.writeFileSync(path.join(testDir, rel), 'export const edited = 1;\n');
+    __emitWatchEventForTests(testDir, rel);
+    await waitFor(() => cg.getPendingFiles().some((p) => p.path === rel));
+  }
+
+  it('does not name a pending file whose path only starts a path the response shows', async () => {
+    await pend('src/app.ts'); // the response shows src/app.tsx
+    const text = (await handler.execute('codegraph_search', { query: 'appView' })).content[0].text;
+    expect(text).toContain('src/app.tsx');
+    expect(text.startsWith('⚠️')).toBe(false);
+    expect(text).toMatch(/elsewhere in this project are pending index sync/);
+  });
+
+  it('does not name a pending file whose path only ends a path the response shows', async () => {
+    await pend('app.tsx'); // the response shows src/app.tsx
+    const text = (await handler.execute('codegraph_search', { query: 'appView' })).content[0].text;
+    expect(text.startsWith('⚠️')).toBe(false);
+    expect(text).toMatch(/elsewhere in this project are pending index sync/);
+  });
+
+  it.each([
+    'src/app.ts中文.ts',
+    '目录src/app.ts',
+    'src/app.ts@backup.ts',
+    'src/app.ts+backup.ts',
+    'src/app.ts%backup.ts',
+    'src/app.ts,backup.ts',
+    'src/app.ts#backup.ts',
+    'src/app.ts.backup.ts',
+    'src/app.ts/child.ts',
+    '@src/app.ts',
+    'src/app.ts🦀.ts',
+  ])('keeps a pending prefix or suffix out of the banner for %s', async (shown) => {
+    fs.mkdirSync(path.dirname(path.join(testDir, shown)), { recursive: true });
+    fs.writeFileSync(path.join(testDir, shown), 'export function otherView() { return 2; }\n');
+    await cg.indexAll();
+    // A directory can also have a filename-like component; use a root suffix
+    // for that case so the pending file and directory can coexist on disk.
+    await pend(shown.includes('/child') ? 'child.ts' : 'src/app.ts');
+    const text = (await handler.execute('codegraph_search', { query: 'otherView' })).content[0].text;
+    expect(text).toContain(shown);
+    expect(text.startsWith('⚠️')).toBe(false);
+    expect(text).toMatch(/elsewhere in this project are pending index sync/);
+  });
+
+  it.each([
+    'src/app.ts',
+    '**`src/app.ts`**',
+    '**src/app.ts**',
+    '(src/app.ts:12)',
+    'src/app.ts:12:3',
+    'src/app.ts:12-20',
+    '"src/app.ts"',
+    'File: src/app.ts\n',
+    'See src/app.ts.',
+    '`src/app.tsx` then `src/app.ts`',
+    'src/app.ts, src/other.ts',
+    'src/app.ts; src/other.ts',
+  ])('preserves a truthful banner for the rendered reference %s', async (reference) => {
+    await pend('src/app.ts');
+    // Exercise renderer variants through the notice wrapper with the real
+    // index and watcher pending set, without mocking the database.
+    const result = (handler as any).withStalenessNotice({
+      content: [{ type: 'text', text: reference }],
+    });
+    expect(result.content[0].text.startsWith('⚠️')).toBe(true);
+    expect(result.content[0].text).not.toContain('elsewhere in this project');
+  });
+
+  it.each(['src/目录.ts', 'src/app@backup.ts', 'src/app+backup.ts'])(
+    'still warns for an exact Unicode or punctuation path: %s', async (rel) => {
+      fs.writeFileSync(path.join(testDir, rel), 'export function specialView() { return 3; }\n');
+      await cg.indexAll();
+      await pend(rel);
+      const text = (await handler.execute('codegraph_search', { query: 'specialView' })).content[0].text;
+      expect(text.startsWith('⚠️')).toBe(true);
+      expect(text).toContain(rel);
+    },
+  );
+
+  it('still names a pending file the response shows', async () => {
+    await pend('src/app.tsx');
+    const text = (await handler.execute('codegraph_search', { query: 'appView' })).content[0].text;
+    expect(text.startsWith('⚠️')).toBe(true);
   });
 });
