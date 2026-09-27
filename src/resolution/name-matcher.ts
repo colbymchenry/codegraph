@@ -5981,12 +5981,14 @@ export function matchMethodCall(
   // Scala `Outer.Inner(args)`: a case-class / companion `apply` on the nested
   // Scala type `Outer::Inner` (Scala qualified names carry no package). Taken
   // only when every match sits in one file (a class and its companion share
-  // the name), or else from the call site's own file.
+  // the name), or else from the call site's own file. A Scala `object` is a
+  // `module`; a class / trait of the same name is preferred over it.
   if (ref.language === 'scala' && dotMatch && /^[A-Z]/.test(methodName!)) {
     const typeQn = `${objectOrClass!.replace(/\./g, '::')}::${methodName}`;
     const types = context
       .getNodesByQualifiedName(typeQn)
-      .filter((n) => n.language === 'scala' && (n.kind === 'class' || n.kind === 'trait'));
+      .filter((n) => n.language === 'scala' && (n.kind === 'class' || n.kind === 'trait' || n.kind === 'module'))
+      .sort((a, b) => Number(a.kind === 'module') - Number(b.kind === 'module'));
     const oneFile = types.length > 0 && types.every((n) => n.filePath === types[0]!.filePath);
     const chosen = oneFile ? types[0] : types.find((n) => n.filePath === ref.filePath);
     if (chosen) {
