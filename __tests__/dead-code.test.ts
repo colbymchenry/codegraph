@@ -483,3 +483,50 @@ describe('GET /api/map — generated files and islands', () => {
     }
   });
 });
+
+describe('an ancestor outside the index (#1973)', () => {
+  let root: string;
+  let graph: CodeGraph;
+
+  beforeAll(async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-deadcode-external-'));
+    write(
+      root,
+      'src/clock.tsx',
+      `import React from 'react';
+import { Transform } from 'stream';
+import { OnModuleInit } from '@nestjs/common';
+export class Clock extends React.Component { componentDidMount() {} componentWillUnmount() {} render() { return null; } }
+export class Upper extends Transform { _transform(c, e, cb) { cb(null, c); } }
+export class Boot implements OnModuleInit { onModuleInit() {} }
+export class Ticker extends Clock { componentDidUpdate() {} }
+export class Plain { neverCalledMember() {} }
+function reallyUnused() {}
+`
+    );
+    write(root, 'src/main.ts', `import { Clock, Upper, Boot, Ticker, Plain } from './clock';\nexport const all = [Clock, Upper, Boot, Ticker, Plain];\n`);
+    graph = CodeGraph.initSync(root, { config: { include: ['src/**/*.ts', 'src/**/*.tsx'], exclude: [] } });
+    await graph.indexAll();
+  }, 60_000);
+
+  afterAll(() => {
+    graph?.close();
+    if (root) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('does not list members a framework base class calls', () => {
+    const report = buildDeadCodeReport(graph);
+    for (const name of ['componentDidMount', 'componentWillUnmount', 'render', '_transform', 'onModuleInit']) {
+      expect(names(report)).not.toContain(name);
+    }
+    // A project class whose own ancestor extends an external base inherits the doubt.
+    expect(names(report)).not.toContain('componentDidUpdate');
+    expect(report.excluded.overriding).toBeGreaterThanOrEqual(6);
+  });
+
+  it('still lists what nothing reaches outside such a class', () => {
+    const report = buildDeadCodeReport(graph);
+    expect(names(report)).toContain('reallyUnused');
+    expect(names(report)).toContain('neverCalledMember');
+  });
+});
