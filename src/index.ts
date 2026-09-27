@@ -1586,6 +1586,13 @@ export class CodeGraph {
   }
 
   /**
+   * Get all nodes in several files, in one batched query.
+   */
+  getNodesInFiles(filePaths: readonly string[]): Node[] {
+    return this.queries.getNodesByFiles(filePaths);
+  }
+
+  /**
    * Get all nodes of a specific kind
    */
   getNodesByKind(kind: Node['kind']): Node[] {
