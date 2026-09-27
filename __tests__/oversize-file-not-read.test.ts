@@ -6,6 +6,7 @@ import { CodeGraph } from '../src';
 import { oversizeStamp, hashContent } from '../src/extraction';
 import { hasDriftedOnDisk, readFileShape } from '../src/ui-server/api/source';
 import { ToolHandler } from '../src/mcp/tools';
+import { validateAnswerFiles } from '../src/mcp/answer-freshness';
 
 /**
  * A file over the size limit is stored as skipped without ever being read
@@ -101,11 +102,14 @@ describe('an unchanged file over the size limit is not reported as drifted (#191
       expect(readFileShape(dir, 'big.js', record).drift).toBe(false);
       expect(hasDriftedOnDisk(dir, 'big.js', record)).toBe(false);
       expect((new ToolHandler(cg) as any).isFileStaleOnDisk(cg, 'big.js')).toBe(false);
+      const answer = [{ path: 'big.js', contentHash: record.contentHash }];
+      expect((await validateAnswerFiles(dir, answer)).stale).toEqual([]);
 
       // A different size is a different stamp, and that is drift.
       fs.appendFileSync(path.join(dir, 'big.js'), line);
       expect(readFileShape(dir, 'big.js', record).drift).toBe(true);
       expect(hasDriftedOnDisk(dir, 'big.js', record)).toBe(true);
+      expect((await validateAnswerFiles(dir, answer)).stale).toEqual(['big.js']);
     } finally {
       cg.close();
     }
