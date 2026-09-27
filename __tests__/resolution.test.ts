@@ -5280,6 +5280,47 @@ class Use {
         cg = await CodeGraph.init(tempDir, { index: true });
         expect(edgesFrom('load')).toContainEqual({ kind: 'calls', qn: 'com.acme.http::WebSocket::fromString', lang: 'java' });
       });
+
+      it('resolves Outer.Inner(...) to a nested Scala object that defines apply', async () => {
+        // A Scala `object` is indexed as a `module`, not a class.
+        write('scala/app/WebSocket.scala', `package app
+object WebSocket {
+  object Accepted {
+    def apply(flow: String): String = flow
+  }
+}
+`);
+        write('scala/app/Use.scala', `package app
+class Use {
+  def accept(): Unit = { WebSocket.Accepted("f") }
+}
+`);
+        cg = await CodeGraph.init(tempDir, { index: true });
+        const out = edgesFrom('accept');
+        expect(out.filter((e) => e.lang === 'java')).toEqual([]);
+        expect(out).toContainEqual({ kind: 'calls', qn: 'WebSocket::Accepted', lang: 'scala' });
+      });
+
+      it('prefers the case class over its companion object declared first', async () => {
+        write('scala/app/WebSocket.scala', `package app
+object WebSocket {
+  object Accepted {
+    def apply(): Accepted = Accepted("default")
+  }
+  final case class Accepted(flow: String)
+}
+`);
+        write('scala/app/Use.scala', `package app
+class Use {
+  def accept(): Unit = { WebSocket.Accepted("f") }
+}
+`);
+        cg = await CodeGraph.init(tempDir, { index: true });
+        const out = edgesFrom('accept');
+        expect(out.filter((e) => e.lang === 'java')).toEqual([]);
+        expect(out).toContainEqual({ kind: 'instantiates', qn: 'WebSocket::Accepted', lang: 'scala' });
+        expect(out).not.toContainEqual({ kind: 'calls', qn: 'WebSocket::Accepted', lang: 'scala' });
+      });
     });
   });
 
