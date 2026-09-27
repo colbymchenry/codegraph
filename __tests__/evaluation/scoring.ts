@@ -19,7 +19,7 @@ export function scoreSearchNodes(
     const idx = resultNames.indexOf(expectedLower[i]);
     if (idx !== -1) {
       found.push(expectedSymbols[i]);
-      if (firstRank === 0) firstRank = idx + 1;
+      if (firstRank === 0 || idx + 1 < firstRank) firstRank = idx + 1;
     } else {
       missed.push(expectedSymbols[i]);
     }
