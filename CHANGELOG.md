@@ -145,7 +145,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
-- `codegraph sync` no longer reports success when another process (an MCP server or another CLI mid-index) holds the index lock: it now exits with status 1 and prints one line on stderr naming the lock holder and asking you to retry — also with `--quiet`, so a git hook that fails on the exit code shows why.
+- `codegraph sync` no longer reports success when it could not take the index lock: it exits with status 1 and prints one line on stderr, also with `--quiet`. When another process (an MCP server or another CLI mid-index) holds the lock, the line names it and asks you to retry; any other lock problem keeps its `codegraph unlock` hint. A script of your own that checks the exit code can now tell a skipped sync from an up-to-date one.
 - Rust calls on `self` now stay with the enclosing type instead of linking to an unrelated type’s same-named method. Thanks @L4XB. (#1861)
 
 - Turning telemetry off now resets its identity and stops running processes from recording, sending, or restoring unsent data. (#1869)

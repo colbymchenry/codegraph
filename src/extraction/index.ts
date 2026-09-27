@@ -126,13 +126,17 @@ export interface SyncResult {
   nodesUpdated: number;
   durationMs: number;
   /**
-   * Set when NO reconciliation ran because another process holds the index
-   * lock (`.codegraph/codegraph.lock`, e.g. an MCP server mid-sync). The
+   * Set when NO reconciliation ran because the index lock
+   * (`.codegraph/codegraph.lock`) could not be taken: `locked` when a live
+   * process holds it (an MCP server or another CLI mid-sync), `lock-failed`
+   * for anything else (an unreadable lock, a directory in its place). The
    * counts above are then all zero and must not be read as "up to date".
    */
-  skippedReason?: 'locked';
-  /** PID of the process holding the lock, when it could be read. */
+  skippedReason?: 'locked' | 'lock-failed';
+  /** PID of the live process holding the lock (`locked`). */
   lockHolderPid?: number;
+  /** The lock's own error message, with its `codegraph unlock` hint (`lock-failed`). */
+  lockError?: string;
   changedFilePaths?: string[];
   /** Paths not absorbed because reading or extraction failed; retain for status/retry. */
   failedFilePaths?: string[];

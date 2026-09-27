@@ -956,14 +956,19 @@ program
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
 
-      // sync() returns all-zero counts when another process (an MCP server
-      // or another CLI mid-index) holds the index lock. That is not "up to
-      // date": say why, and exit 1 even under --quiet, which suppresses
-      // progress but never a failure.
+      // sync() returns all-zero counts when it could not take the index lock.
+      // That is not "up to date": say why, and exit 1 even under --quiet,
+      // which suppresses progress but never a failure. Only a live holder is
+      // contention; any other lock failure keeps the lock's own message.
       const lockedMessage = (result: SyncResult): string | null => {
-        if (result.skippedReason !== 'locked') return null;
-        const holder = result.lockHolderPid != null ? ` (PID ${result.lockHolderPid})` : '';
-        return `Nothing synced: another process holds the index lock${holder}. Retry, or run "codegraph sync" when it exits.`;
+        if (result.skippedReason === 'locked') {
+          const holder = result.lockHolderPid != null ? ` (PID ${result.lockHolderPid})` : '';
+          return `Nothing synced: another process holds the index lock${holder}. Retry, or run "codegraph sync" when it exits.`;
+        }
+        if (result.skippedReason === 'lock-failed') {
+          return `Nothing synced: the index lock could not be taken. ${result.lockError ?? ''}`.trimEnd();
+        }
+        return null;
       };
 
       if (options.quiet) {

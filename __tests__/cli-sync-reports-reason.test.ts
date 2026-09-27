@@ -65,6 +65,36 @@ describe('codegraph sync while another process holds the index lock', () => {
     try { expect(cg.getStats().fileCount).toBe(1); } finally { cg.close(); }
   });
 
+  it('does not call a lock nobody holds contention, and keeps its unlock hint', async () => {
+    // A directory where the lock file should be: acquire fails, but no process holds it.
+    fs.mkdirSync(lockPath());
+    const cg = CodeGraph.openSync(root);
+    try {
+      const result = await cg.sync();
+      expect(result.skippedReason).toBe('lock-failed');
+      expect(result.lockHolderPid).toBeUndefined();
+      expect(result.lockError).toContain('codegraph unlock');
+    } finally { cg.close(); }
+
+    const cli = run('sync', '--quiet');
+    expect(cli.status).toBe(1);
+    expect(cli.stderr).not.toContain('another process holds the index lock');
+    expect(cli.stderr).toContain('the index lock could not be taken');
+    expect(cli.stderr).toContain('codegraph unlock');
+  });
+
+  it('does not call a lock left by a dead process contention', async () => {
+    // A PID that cannot be alive: sync reclaims the stale lock and runs.
+    fs.writeFileSync(lockPath(), '2147483646');
+    fs.writeFileSync(path.join(root, 'added.ts'), 'export const added = 2;\n');
+    const cg = CodeGraph.openSync(root);
+    try {
+      const result = await cg.sync();
+      expect(result.skippedReason).toBeUndefined();
+      expect(result.filesAdded).toBe(1);
+    } finally { cg.close(); }
+  });
+
   it.each([false, true])('syncs normally once the lock is released, quiet=%s', (quiet) => {
     fs.writeFileSync(path.join(root, 'added.ts'), 'export const added = 2;\n');
     const result = run('sync', ...(quiet ? ['--quiet'] : []));

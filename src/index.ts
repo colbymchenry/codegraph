@@ -785,11 +785,15 @@ export class CodeGraph {
     return this.indexMutex.withLock(async () => {
       try {
         this.fileLock.acquire();
-      } catch {
-        const lockHolderPid = this.fileLock.readHolderPid();
+      } catch (err) {
+        // Contention is a live process named in the lock file. Anything else
+        // (an unreadable lock, a directory where the file should be) is not
+        // contention, and keeps the lock's own message and its unlock hint.
+        const lockHolderPid = this.fileLock.readLiveHolderPid();
         return {
-          skippedReason: 'locked',
-          ...(lockHolderPid != null ? { lockHolderPid } : {}),
+          ...(lockHolderPid != null
+            ? { skippedReason: 'locked' as const, lockHolderPid }
+            : { skippedReason: 'lock-failed' as const, lockError: err instanceof Error ? err.message : String(err) }),
           filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0,
         };
       }
