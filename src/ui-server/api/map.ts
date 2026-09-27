@@ -126,6 +126,25 @@ export interface WireMapModule {
   facade: boolean;
   /** Its files, capped — what the side panel lists when the module is selected. */
   fileList: WireList<string>;
+  /**
+   * What a change in here reaches: files OUTSIDE this module holding a direct,
+   * confident reference into one of its files, and how many modules those
+   * files span.
+   *
+   * DIRECT, deliberately. The transitive closure was measured first and it is
+   * useless on a real repository: any dependency cycle — and a mobile app had
+   * nine mutual pairs — saturates it, so every module comes out reaching
+   * nearly every file (139–282 of 377, a flat 2× spread that says nothing but
+   * "this repo has cycles"). The direct count on the same repository spreads
+   * 0–127 and names the modules a reader would name by hand: the shared types
+   * at the top, the CLI at zero.
+   *
+   * The counts are FILES, not symbols: a module is a set of files, and "94
+   * files would have to be re-read if this changed" is a claim the index can
+   * stand behind. It is a floor on blast radius, not the whole of it — a
+   * symbol-level answer for one symbol is what the Symbol view is for.
+   */
+  dependents: { files: number; modules: number };
 }
 
 export interface WireMapLink {
@@ -276,6 +295,107 @@ export function pickDefaultRoot(
   return bestSymbols * 2 > total ? best : '';
 }
 
+/**
+ * A box holding more than this share of the mapped symbols IS the program, and
+ * a map whose subject is one box has not said anything.
+ */
+const DOMINANT_SHARE = 0.4;
+
+/**
+ * …but only if there is something inside it. A dominant box of four files is a
+ * small project honestly drawn; opening it just spreads four files over four
+ * boxes. This is the line between "grouped too coarsely" and "actually small".
+ */
+const DOMINANT_MIN_FILES = 25;
+
+/** Fewer boxes than this is a list, not a picture. */
+const MIN_MODULES = 4;
+
+/** More than this and a deeper grouping has traded one unreadable map for another. */
+const MAX_MODULES = 60;
+
+/** The non-test modules a given depth would draw, and how concentrated they are. */
+function tallyModules(
+  files: ReadonlyArray<{ path: string; symbols: number; test: boolean }>,
+  root: string,
+  depth: number
+): { count: number; share: number; largestFiles: number } {
+  const byModule = new Map<string, { symbols: number; files: number }>();
+  let total = 0;
+  for (const file of files) {
+    if (file.test) continue;
+    const assigned = moduleIdFor(file.path, root, depth);
+    if (assigned === null) continue;
+    let entry = byModule.get(assigned.id);
+    if (!entry) byModule.set(assigned.id, (entry = { symbols: 0, files: 0 }));
+    entry.symbols += file.symbols;
+    entry.files += 1;
+    total += file.symbols;
+  }
+  let largest = { symbols: 0, files: 0 };
+  for (const entry of byModule.values()) {
+    if (entry.symbols > largest.symbols) largest = entry;
+  }
+  return {
+    count: byModule.size,
+    share: total === 0 ? 0 : largest.symbols / total,
+    largestFiles: largest.files,
+  };
+}
+
+/**
+ * How many segments name a module, when the reader has not said.
+ *
+ * Depth is not a property of the reader's taste, it is a property of the
+ * repository: one level under the root is the right grouping for a project
+ * whose directories ARE its modules, and the wrong one for the very common
+ * shape where every line of the program lives under a single `src/`. Drawing
+ * that project at depth 1 produces the map this rule exists to prevent — a box
+ * labelled `src`, holding two thirds of the code, with nothing to say about it.
+ *
+ * So: take the shallowest depth that is neither dominated by one box worth
+ * opening nor too small to be a picture; stop before a deeper one becomes a
+ * crowd; and never go past the last level the directory tree actually has.
+ *
+ * The walk does NOT stop at the first depth that fails to add boxes. A repo
+ * packaged as `frontend/src/...` plateaus at two boxes for two levels running
+ * before the third splits it, and a rule that gave up on the plateau would
+ * draw exactly the picture this function exists to avoid.
+ */
+export function pickDefaultDepth(
+  files: ReadonlyArray<{ path: string; symbols: number; test: boolean }>,
+  root: string
+): number {
+  // Past the deepest directory, a bigger number only renames boxes to
+  // `src/a/(root files)`. There is nothing below the leaves.
+  let deepest = DEFAULT_DEPTH;
+  for (const file of files) {
+    if (file.test) continue;
+    const path = toPosixPath(file.path);
+    if (root && !path.startsWith(`${root}/`)) continue;
+    const rel = root ? path.slice(root.length + 1) : path;
+    deepest = Math.max(deepest, rel.split('/').filter(Boolean).length - 1);
+  }
+
+  let fallback = DEFAULT_DEPTH;
+  let fallbackCount = 0;
+  for (let depth = DEFAULT_DEPTH; depth <= Math.min(MAX_DEPTH, deepest); depth += 1) {
+    const tally = tallyModules(files, root, depth);
+    if (tally.count === 0) break;
+    // Deeper only gets more crowded from here.
+    if (tally.count > MAX_MODULES) break;
+    const dominated = tally.share > DOMINANT_SHARE && tally.largestFiles >= DOMINANT_MIN_FILES;
+    if (tally.count >= MIN_MODULES && !dominated) return depth;
+    // Not a picture yet. Worth keeping only if it drew more than the last one:
+    // a deeper grouping that splits nothing is the same map with longer labels.
+    if (tally.count > fallbackCount) {
+      fallback = depth;
+      fallbackCount = tally.count;
+    }
+  }
+  return fallback;
+}
+
 // =============================================================================
 // Cache
 // =============================================================================
@@ -301,9 +421,17 @@ export function resetMapCache(): void {
 // Build
 // =============================================================================
 
-export function parseMapQuery(query: URLSearchParams): { root: string | null; depth: number } {
+/**
+ * `null` for either field means "nobody said" — the answer picks. Absence has
+ * to survive parsing: a depth defaulted to 1 here is indistinguishable from a
+ * reader who asked for 1, and {@link pickDefaultDepth} would never run.
+ */
+export function parseMapQuery(query: URLSearchParams): {
+  root: string | null;
+  depth: number | null;
+} {
   const rawDepth = query.get('depth');
-  let depth = DEFAULT_DEPTH;
+  let depth: number | null = null;
   if (rawDepth !== null && rawDepth !== '') {
     depth = Number.parseInt(rawDepth, 10);
     if (!Number.isFinite(depth) || depth < 1 || depth > MAX_DEPTH) {
@@ -314,9 +442,45 @@ export function parseMapQuery(query: URLSearchParams): { root: string | null; de
   return { root: rawRoot === null ? null : normalizeRoot(rawRoot), depth };
 }
 
+/**
+ * Rename `x/(root files)` to `x` wherever the bucket is all `x` has.
+ *
+ * The bucket earns its name only when it stands beside something: `src` holding
+ * both `src/api` and three loose files needs a box for the loose ones, and that
+ * box has to say it is not the whole of `src`. But a `backend/controllers` with
+ * no subdirectories in it is not a directory with a bucket in it — it IS the
+ * directory, and drawing it as `backend/controllers/(root files)` names a thing
+ * the repository does not have. Deeper groupings hit this constantly (every
+ * leaf directory becomes a bucket), which is what makes it worth a pass.
+ *
+ * Returns only the ids that move, so a caller can leave the rest alone.
+ */
+function collapseLoneRootFiles(ids: ReadonlySet<string>): Map<string, string> {
+  const renamed = new Map<string, string>();
+  for (const id of ids) {
+    const cut = id.lastIndexOf('/(root files)');
+    // A bucket at the very top (`(root files)`) has no directory to become.
+    if (cut <= 0 || cut + '/(root files)'.length !== id.length) continue;
+    const dir = id.slice(0, cut);
+    let alone = true;
+    for (const other of ids) {
+      // A façade counts: `src/utils` beside `src/utils/index.tsx` would read as
+      // if the box contained the file drawn next to it.
+      if (other !== id && other.startsWith(`${dir}/`)) {
+        alone = false;
+        break;
+      }
+    }
+    // `dir` can only already be a module if something lives BELOW it, which is
+    // exactly the case `alone` just ruled out — so this rename cannot collide.
+    if (alone) renamed.set(id, dir);
+  }
+  return renamed;
+}
+
 export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchParams): WireMapPayload {
   const started = Date.now();
-  let { root: requestedRoot, depth } = parseMapQuery(query);
+  const { root: requestedRoot, depth: requestedDepth } = parseMapQuery(query);
 
   const fileRecords = cg.getFiles().map((file) => {
     const path = toPosixPath(file.path);
@@ -330,10 +494,10 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
   });
 
   const root = requestedRoot ?? pickDefaultRoot(fileRecords);
-  // Left to choose, and choosing the whole project (two substantial roots):
-  // one level deeper, so the boxes are `src/app` and `ios/CaptureView`, not
-  // `src` and `ios`.
-  if (requestedRoot === null && root === '' && !query.has('depth')) depth = 2;
+  // Root first, then depth against THAT root: how finely to cut depends on
+  // what is being cut. Choosing `src` and then asking for one level under it
+  // is the same question as choosing the whole project and asking for two.
+  const depth = requestedDepth ?? pickDefaultDepth(fileRecords, root);
   const stats = cg.getStats();
   const key = [
     projectRoot,
@@ -367,16 +531,24 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
   >();
   const moduleOfFile = new Map<string, string>();
 
+  const assigned = new Map<string, { id: string; facade: boolean }>();
   for (const file of fileRecords) {
-    const assigned = moduleIdFor(file.path, root, depth);
-    if (assigned === null) continue;
-    assignments.push({ filePath: file.path, module: assigned.id });
-    moduleOfFile.set(file.path, assigned.id);
-    let entry = modules.get(assigned.id);
+    const at = moduleIdFor(file.path, root, depth);
+    if (at !== null) assigned.set(file.path, at);
+  }
+  const renamed = collapseLoneRootFiles(new Set([...assigned.values()].map((a) => a.id)));
+
+  for (const file of fileRecords) {
+    const at = assigned.get(file.path);
+    if (at === undefined) continue;
+    const id = renamed.get(at.id) ?? at.id;
+    assignments.push({ filePath: file.path, module: id });
+    moduleOfFile.set(file.path, id);
+    let entry = modules.get(id);
     if (!entry) {
       entry = {
-        id: assigned.id,
-        facade: assigned.facade,
+        id,
+        facade: at.facade,
         files: 0,
         symbols: 0,
         testFiles: 0,
@@ -385,7 +557,7 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
         languages: new Map(),
         paths: [],
       };
-      modules.set(assigned.id, entry);
+      modules.set(id, entry);
     }
     entry.files += 1;
     entry.paths.push(file.path);
@@ -438,6 +610,12 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
     }
   }
 
+  // ONE fetch of the file edge list, read twice: the cycle finder and the
+  // dependent counts are both questions about it, and it is the expensive query
+  // on this screen.
+  const filePairs = cg.getFileDependencyPairs(UNCERTAIN_BELOW);
+  const dependents = countDependents(filePairs, moduleOfFile);
+
   const payload: WireMapPayload = {
     root,
     depth,
@@ -460,6 +638,7 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
           // draws are the same list — the count-equals-list rule.
           generatedFiles: shown.filter((path) => entry.generatedPaths.has(path)),
           fileList: wireList(shown, entry.files),
+          dependents: dependents.get(entry.id) ?? { files: 0, modules: 0 },
         };
       })
       // Sorted so two runs over one index produce byte-identical payloads —
@@ -468,7 +647,7 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
     links: [...links.values()].sort(
       (a, b) => a.source.localeCompare(b.source) || a.target.localeCompare(b.target)
     ),
-    cycles: fileCycles(cg, moduleOfFile),
+    cycles: fileCycles(filePairs, moduleOfFile),
     excluded: { uncertainEdges, confidenceBelow: UNCERTAIN_BELOW },
     index: {
       lastIndexedAt: cg.getLastIndexedAt(),
@@ -487,6 +666,38 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
 }
 
 /**
+ * Per module: how many files outside it reference into it, and across how many
+ * modules those files sit.
+ *
+ * One pass over the edge list. A pair whose two ends land in the same module is
+ * internal cohesion, not blast radius, and is skipped; a pair touching a file
+ * outside the chosen root has no module and is skipped too. The `Set` per
+ * module is what makes the count DISTINCT FILES rather than distinct
+ * references — twelve calls from one file are one file that has to be re-read.
+ */
+function countDependents(
+  pairs: ReadonlyArray<{ source: string; target: string }>,
+  moduleOfFile: Map<string, string>
+): Map<string, { files: number; modules: number }> {
+  const incoming = new Map<string, Set<string>>();
+  for (const pair of pairs) {
+    const from = moduleOfFile.get(pair.source);
+    const to = moduleOfFile.get(pair.target);
+    if (from === undefined || to === undefined || from === to) continue;
+    let seen = incoming.get(to);
+    if (!seen) incoming.set(to, (seen = new Set()));
+    seen.add(pair.source);
+  }
+  const out = new Map<string, { files: number; modules: number }>();
+  for (const [module, files] of incoming) {
+    const modules = new Set<string>();
+    for (const file of files) modules.add(moduleOfFile.get(file)!);
+    out.set(module, { files: files.size, modules: modules.size });
+  }
+  return out;
+}
+
+/**
  * File-level circular dependencies, as strongly connected components.
  *
  * Tarjan over the one-query file edge list. Components of size 1 are not
@@ -496,11 +707,11 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
  * list anybody reads.
  */
 function fileCycles(
-  cg: CodeGraph,
+  pairs: ReadonlyArray<{ source: string; target: string }>,
   moduleOfFile: Map<string, string>
 ): WireMapPayload['cycles'] {
   const adjacency = new Map<string, string[]>();
-  for (const pair of cg.getFileDependencyPairs(UNCERTAIN_BELOW)) {
+  for (const pair of pairs) {
     if (!moduleOfFile.has(pair.source) || !moduleOfFile.has(pair.target)) continue;
     let out = adjacency.get(pair.source);
     if (!out) adjacency.set(pair.source, (out = []));

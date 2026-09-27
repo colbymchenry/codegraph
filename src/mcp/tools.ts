@@ -6,7 +6,7 @@
 
 import type CodeGraph from '../index';
 import type { QueryPool } from './query-pool';
-import { findNearestCodeGraphRoot } from '../directory';
+import { findNearestCodeGraphRoot, isSameIndexRoot } from '../directory';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
 // helper in engine.ts. ToolHandler must load to answer tools/list (static
 // schemas), but it must NOT drag in sqlite/query layers before the daemon binds;
@@ -37,6 +37,7 @@ import { extractQueryPaths, queryMightContainPaths } from '../search/query-paths
 import {
   existsSync,
   readFileSync,
+  realpathSync,
   statSync,
 } from 'fs';
 import { createHash } from 'crypto';
@@ -49,6 +50,8 @@ import {
   resolveNamedSymbolFlow,
 } from '../graph/named-symbol-flow';
 import { getUpdateNotice } from '../upgrade/update-check';
+import { measurePendingChanges } from './index-freshness';
+import { validateAnswerFiles, type AnswerFile } from './answer-freshness';
 import { ExploreDiagnostics } from './explore-diagnostics';
 import {
   EXPLORE_EMISSION_KEY,
@@ -155,6 +158,25 @@ export function normalizeQuerySpelling(query: string): string {
       /(^|[\s,()[\]])(?!(?:kind|lang|language|path|name):)([a-z_][\w@]*):([A-Za-z_][\w@]*)(?=$|[\s,()[\]])/g,
       '$1$2.$3'
     );
+}
+
+/**
+ * Does this query-named span point at a real FILE inside the project?
+ *
+ * The `existsOnDisk` predicate `extractQueryPaths` takes (that module is pure —
+ * no DB, no fs — so the fs access lives here, where the project root is known).
+ * Only a REGULAR FILE counts: a directory span (`src/search`) is not a file
+ * reference and must keep flowing to the normal matching pipeline. Containment
+ * is enforced by `validatePathWithinRoot`, so a `../` span in a query cannot
+ * probe outside the project, and every fs error answers `false`.
+ */
+function pathIsProjectFile(projectRoot: string, relPath: string): boolean {
+  try {
+    const abs = validatePathWithinRoot(projectRoot, relPath);
+    return abs !== null && statSync(abs).isFile();
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -1016,6 +1038,26 @@ function pointerLineFor(filePath: string, nodes: readonly Node[]): string {
 const EPILOGUE_LOST_NOTE = '> (Trailing pointer list omitted for size. The source above is complete and verbatim — treat it as already Read. For anything this call did not cover, run another codegraph_explore with the specific names rather than reading those files.)';
 
 /**
+ * Match response delimiters rather than ASCII "path characters": filenames
+ * can contain Unicode, @, +, and other punctuation. Keep line references and
+ * a sentence-ending period, but reject prefixes/suffixes of longer paths.
+ */
+function mentionsPath(text: string, relPath: string): boolean {
+  const delimiter = /[\s`"'()[\]{}*]/;
+  for (let at = text.indexOf(relPath); at !== -1; at = text.indexOf(relPath, at + 1)) {
+    if (at > 0 && !delimiter.test(text[at - 1] ?? '')) continue;
+    const end = at + relPath.length;
+    if (end === text.length || delimiter.test(text[end] ?? '')) return true;
+    const suffix = text.slice(end);
+    if (/^:\d+(?::\d+|[-–]\d+)?(?=$|[\s`"'()[\]{}*])/.test(suffix)) return true;
+    if (/^:(?=$|\s)/.test(suffix)) return true; // file-list label
+    if (/^\.(?=$|\s)/.test(suffix)) return true; // prose punctuation
+    if (/^[,;](?=$|\s)/.test(suffix)) return true; // list separator
+  }
+  return false;
+}
+
+/**
  * Per-file staleness banner emitted at the top of a tool response when the
  * file watcher has pending events for files referenced by the response.
  * The agent uses this to fall back to Read for those specific files
@@ -1071,6 +1113,15 @@ export function formatDegradedBanner(reason: string | null): string {
     'frozen and any file edited since then is stale here. Read files directly to confirm ' +
     'current content before relying on it.' +
     (reason ? `\n  Reason: ${reason}` : '')
+  );
+}
+
+/** Re-armed watches are not proof of freshness until their full scan commits. */
+export function formatRecoveringBanner(): string {
+  return (
+    '⚠️ CodeGraph auto-sync is RECOVERING — file watching restarted after lock contention, ' +
+    'but the full index catch-up has not completed. Read files directly to confirm ' +
+    'current content before relying on these results.'
   );
 }
 
@@ -1146,6 +1197,9 @@ export interface ToolResult {
    * {@link EXPLORE_EMISSION_KEY}; the two must stay in sync.
    */
   _cgExploreEmission?: ExploreEmission;
+  /** Internal structured provenance, preserved by query workers and stripped by execute. */
+  _cgAnswerFiles?: AnswerFile[];
+  structuredContent?: Record<string, unknown>;
 }
 
 /**
@@ -1353,7 +1407,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_status',
-    description: 'Index health check (files / nodes / edges). Skip unless debugging.',
+    description: 'Index health check: files, nodes, edges, last indexed time, and added/modified/removed counts. Skip unless debugging.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1456,6 +1510,38 @@ export function getStaticTools(): ToolDefinition[] {
  */
 const DEFAULT_MCP_TOOLS = new Set(['explore']);
 
+/** realpath when the path exists, the path itself otherwise — never throws. */
+function canonicalPath(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
+/**
+ * How many explicit-`projectPath` projects a handler keeps open at once
+ * (#1835). Each cached project may hold a file watcher, a writer lock and a
+ * SQLite connection, so the cache is bounded LRU: opening one more than this
+ * closes the least recently used. Small on purpose — a session that queries
+ * many repositories still leaks nothing; it only pays a reopen + catch-up.
+ */
+export const MAX_CACHED_PROJECTS = 8;
+
+/**
+ * Engine-side lifecycle for a project the ToolHandler opened for an explicit
+ * `projectPath` (#1835). `activate` gives it the same treatment the default
+ * project gets — a file watcher while it stays open and a catch-up sync — and
+ * returns the catch-up promise, which the handler awaits (time-boxed) before
+ * calls against that project. `release` runs after active calls drain, so the
+ * engine can release shared ownership safely on LRU eviction or shutdown.
+ */
+export interface ProjectLifecycle {
+  open(root: string, open: () => CodeGraph): CodeGraph;
+  activate(cg: CodeGraph): Promise<void>;
+  release(cg: CodeGraph): void | Promise<void>;
+}
+
 /**
  * Tool handler that executes tools against a CodeGraph instance
  *
@@ -1463,8 +1549,19 @@ const DEFAULT_MCP_TOOLS = new Set(['explore']);
  * Other projects are opened on-demand and cached for performance.
  */
 export class ToolHandler {
-  // Cache of opened CodeGraph instances for cross-project queries
+  // Cache of opened CodeGraph instances for cross-project queries, keyed by the
+  // CANONICAL (realpath) index root. Map insertion order doubles as LRU order:
+  // a hit re-inserts, and `MAX_CACHED_PROJECTS` bounds the size (#1835).
   private projectCache: Map<string, CodeGraph> = new Map();
+  // Engine hook that watches + catches up an explicit project (null for the
+  // CLI and worker-thread handlers, which never own a watcher).
+  private projectLifecycle: ProjectLifecycle | null = null;
+  // Every concurrent call shares its project's pending catch-up promise.
+  private projectGates: Map<CodeGraph, Promise<void>> = new Map();
+  private activeCalls = 0;
+  private closing = false;
+  private pendingCloses = 0;
+  private closeWaiters: Array<() => void> = [];
   // The directory the server last searched for a default project. Surfaced in
   // the "not initialized" error so users can see why detection missed.
   private defaultProjectHint: string | null = null;
@@ -1488,25 +1585,30 @@ export class ToolHandler {
   // per-file staleness banner can't help, because `getPendingFiles()` is
   // populated by the watcher, not by catch-up. The wait is time-boxed
   // (see {@link resolveCatchUpGateTimeoutMs}) so a minutes-long reconcile on a
-  // huge repo can't hang the first call (#905); cleared on first await so
-  // subsequent calls don't pay any cost.
+  // huge repo can't hang a call (#905); cleared when the reconcile settles.
   private catchUpGate: Promise<void> | null = null;
-  // Optional worker-thread pool for off-loop read-tool dispatch (daemon mode).
-  // When set + healthy, the heavy read tools run on a worker so the daemon's
-  // main loop stays free for the MCP transport under concurrent load. Null in
-  // direct/in-process mode (one client, no concurrency to parallelize).
+  // Optional worker-thread pool for off-loop read-tool dispatch. When ready +
+  // healthy, heavy reads leave the main loop free for the MCP transport.
   private queryPool: QueryPool | null = null;
 
   constructor(private cg: CodeGraph | null) {}
 
   /**
    * Engine-only: attach (or detach with null) the worker-thread query pool. The
-   * shared daemon sets this once its default project is open; the workers each
+   * engine sets this after resolving its default project; the workers each
    * hold their own WAL read connection and run {@link executeReadTool}. A
    * worker's own ToolHandler never has a pool, so there is no nested off-loading.
    */
   setQueryPool(pool: QueryPool | null): void {
     this.queryPool = pool;
+  }
+
+  /**
+   * Engine-only: own the lifecycle (watcher, catch-up, writer lock) of every
+   * project this handler opens for an explicit `projectPath` (#1835).
+   */
+  setProjectLifecycle(lifecycle: ProjectLifecycle | null): void {
+    this.projectLifecycle = lifecycle;
   }
 
   /**
@@ -1525,6 +1627,11 @@ export class ToolHandler {
    */
   setCatchUpGate(p: Promise<void> | null): void {
     this.catchUpGate = p;
+    void p?.then(() => {
+      if (this.catchUpGate === p) this.catchUpGate = null;
+    }, () => {
+      if (this.catchUpGate === p) this.catchUpGate = null;
+    });
   }
 
   /**
@@ -1754,8 +1861,11 @@ export class ToolHandler {
     // (#926). The DB connection itself is still cached (by resolved root,
     // below), so re-resolving costs only the stat walk, never a reopen.
     const resolvedRoot = findNearestCodeGraphRoot(projectPath);
+    // Two spellings of one root (a symlinked checkout, `/tmp` vs
+    // `/private/tmp`) must share one connection and one watcher (#1835).
+    const canonicalRoot = resolvedRoot ? canonicalPath(resolvedRoot) : null;
 
-    if (!resolvedRoot) {
+    if (!resolvedRoot || !canonicalRoot) {
       throw new NotIndexedError(
         `The project at ${projectPath} isn't indexed with codegraph (no .codegraph/ directory found ` +
         'walking up from it), so codegraph cannot query it. Use your built-in tools (Read/Grep/Glob) ' +
@@ -1771,19 +1881,72 @@ export class ToolHandler {
     // support) that surfaces as intermittent
     // "database is locked" on concurrent tool calls. See issue #238. The
     // default instance is owned/closed by the server, so it's never cached.
-    if (this.cg && this.cg.getProjectRoot() === resolvedRoot) {
+    // Another spelling of the same root counts too (#1057).
+    if (this.cg && isSameIndexRoot(this.cg.getProjectRoot(), resolvedRoot)) {
       return this.freshen(this.cg);
     }
 
-    // Cache the open DB connection by RESOLVED ROOT only — never by the input
+    // Cache the open DB connection by CANONICAL ROOT only — never by the input
     // path. One key per instance means closeAll() closes each exactly once, and
     // a changed resolution maps to a different entry instead of a stale hit.
-    const cached = this.projectCache.get(resolvedRoot);
-    if (cached) return this.freshen(cached);
+    const cached = this.projectCache.get(canonicalRoot);
+    if (cached) {
+      // Refresh LRU position.
+      this.projectCache.delete(canonicalRoot);
+      this.projectCache.set(canonicalRoot, cached);
+      return this.freshen(cached);
+    }
 
-    const cg = loadCodeGraph().openSync(resolvedRoot);
-    this.projectCache.set(resolvedRoot, cg);
+    // Compare current identities on every cache miss: a previously seen alias
+    // may have been retargeted or recreated since the last call (#1057).
+    for (const [root, open] of this.projectCache) {
+      if (isSameIndexRoot(root, resolvedRoot)) {
+        this.projectCache.delete(root);
+        this.projectCache.set(root, open);
+        return this.freshen(open);
+      }
+    }
+
+    const open = () => loadCodeGraph().openSync(canonicalRoot);
+    const cg = this.projectLifecycle?.open(canonicalRoot, open) ?? open();
+    this.projectCache.set(canonicalRoot, cg);
+    this.trimProjects();
     return cg;
+  }
+
+  private async awaitProjectGate(projectPath: string): Promise<void> {
+    const cg = this.getCodeGraph(projectPath);
+    if (!this.projectLifecycle || cg === this.cg) return;
+    let gate = this.projectGates.get(cg);
+    if (!gate) {
+      gate = this.projectLifecycle.activate(cg).catch(() => { /* engine logs */ });
+      this.projectGates.set(cg, gate);
+      void gate.then(() => {
+        if (this.projectGates.get(cg) === gate) this.projectGates.delete(cg);
+        this.trimProjects();
+      });
+    }
+    await this.awaitCatchUpGate(gate);
+  }
+
+  /** Never evict a graph while a tool call or its timed-out reconcile uses it. */
+  private trimProjects(): void {
+    if (this.activeCalls > 0) return;
+    for (const [root, cg] of this.projectCache) {
+      if (!this.closing && this.projectCache.size <= MAX_CACHED_PROJECTS) break;
+      if (this.projectGates.has(cg)) continue;
+      this.projectCache.delete(root);
+      if (this.projectLifecycle) {
+        this.pendingCloses++;
+        void Promise.resolve(this.projectLifecycle.release(cg)).finally(() => {
+          this.pendingCloses--;
+          this.trimProjects();
+        });
+      } else cg.close();
+    }
+    if (this.closing && this.projectCache.size === 0 && this.pendingCloses === 0) {
+      for (const resolve of this.closeWaiters.splice(0)) resolve();
+    }
   }
 
   /**
@@ -1814,12 +1977,12 @@ export class ToolHandler {
   /**
    * Close all cached project connections
    */
-  closeAll(): void {
-    for (const cg of this.projectCache.values()) {
-      cg.close();
-    }
-    this.projectCache.clear();
+  closeAll(): Promise<void> {
+    this.closing = true;
     this.worktreeMismatchCache.clear();
+    this.trimProjects();
+    if (this.projectCache.size === 0 && this.activeCalls === 0 && this.pendingCloses === 0) return Promise.resolve();
+    return new Promise((resolve) => this.closeWaiters.push(resolve));
   }
 
   /**
@@ -1941,7 +2104,6 @@ export class ToolHandler {
    */
   private driftCache = new Map<string, { at: number; stale: boolean }>();
   private static readonly DRIFT_TTL_MS = 2000;
-
   /**
    * On-disk drift check for a single indexed file (issue #1474). The code
    * renderers slice CURRENT bytes at INDEXED line ranges; when the file
@@ -2000,6 +2162,15 @@ export class ToolHandler {
     return stale;
   }
 
+  private answerResult(cg: CodeGraph, text: string, paths: Iterable<string>): ToolResult {
+    const result = this.textResult(text);
+    result._cgAnswerFiles = [...new Set(paths)].map(file => ({
+      path: file,
+      contentHash: cg.getFile(file)?.contentHash ?? null,
+    }));
+    return result;
+  }
+
   private withStalenessNotice(result: ToolResult, projectPath?: string): ToolResult {
     if (result.isError) return result;
 
@@ -2010,13 +2181,11 @@ export class ToolHandler {
       return result; // no default project — leave as is
     }
 
-    // Cross-project `projectPath` calls open a cached CodeGraph WITHOUT a
-    // watcher (watchers are only attached to the default session project).
+    // A cross-project `projectPath` call's cached CodeGraph only has a watcher
+    // when the engine owns its lifecycle (#1835) — the CLI's handler has none.
     // When the cross-project path happens to be the same project as the
-    // default cg, the cached instance is the wrong one — its pendingFiles is
-    // permanently empty. Detect the equal-path case and prefer the default
-    // cg so the staleness signal still fires when an agent passes the
-    // explicit projectPath form of its own project.
+    // default cg, prefer the default cg so the staleness signal still fires
+    // when an agent passes the explicit projectPath form of its own project.
     if (this.cg && cg !== this.cg) {
       try {
         const sameProject =
@@ -2031,9 +2200,9 @@ export class ToolHandler {
     // stopped, getPendingFiles() is empty so the per-file banner below can't
     // fire — but the index is now FROZEN and silently drifting stale. Surface
     // one global notice instead, so the agent Reads for current content rather
-    // than trusting a response off a no-longer-updating index. (Cross-project
-    // calls open a watcher-less CodeGraph, so this is false there — correct: we
-    // only know degraded state for the default session project.)
+    // than trusting a response off a no-longer-updating index. (A cross-project
+    // instance without an engine-owned watcher reports false here — correct: we
+    // only know degraded state for a project we watch.)
     let degraded = false;
     try {
       degraded = cg.isWatcherDegraded?.() ?? false;
@@ -2043,6 +2212,10 @@ export class ToolHandler {
     if (degraded) {
       const [head, ...tail] = result.content;
       if (!head || head.type !== 'text') return result;
+      if (cg.isWatcherRecovering?.()) {
+        const composed = `${formatRecoveringBanner()}\n\n${head.text}`;
+        return { ...result, content: [{ type: 'text', text: composed }, ...tail] };
+      }
       let reason: string | null = null;
       try {
         reason = cg.getWatcherDegradedReason?.() ?? null;
@@ -2070,10 +2243,10 @@ export class ToolHandler {
     const inResponse: PendingFile[] = [];
     const elsewhere: PendingFile[] = [];
     for (const p of pending) {
-      // Substring match against the project-relative POSIX path — that's
-      // exactly the format both the watcher and every codegraph response
-      // emit, so a plain includes() is sufficient and avoids regex pitfalls.
-      if (text.includes(p.path)) inResponse.push(p);
+      // Project-relative POSIX path — the format both the watcher and every
+      // codegraph response emit — matched as a whole path, so a pending
+      // `src/app.ts` isn't "referenced" by a response that shows `src/app.tsx`.
+      if (mentionsPath(text, p.path)) inResponse.push(p);
       else elsewhere.push(p);
     }
 
@@ -2105,18 +2278,19 @@ export class ToolHandler {
     args: Record<string, unknown>,
     sessionState?: ExploreSessionState,
   ): Promise<ToolResult> {
+    if (this.closing) return this.textResult('This MCP session is closing; retry with a connected session.');
+    this.activeCalls++;
     try {
       // Block the first tool call on the engine's post-open reconcile so we
       // never serve rows for files deleted/edited while no MCP server was
       // running. The wait is time-boxed (#905): a huge-repo reconcile takes
       // minutes, and blocking the first call on all of it reads as a hang, so
       // we wait briefly then serve and let it finish in the background. The
-      // gate is cleared after first await — subsequent calls pay nothing.
+      // gate stays installed until reconciliation settles, including on timeout.
       // Catch-up failures are logged by the engine; we proceed regardless so a
       // transient sync error never breaks tools.
       if (this.catchUpGate) {
         const gate = this.catchUpGate;
-        this.catchUpGate = null;
         await this.awaitCatchUpGate(gate);
       }
       // Honor the optional tool allowlist (CODEGRAPH_MCP_TOOLS): a trimmed
@@ -2132,6 +2306,13 @@ export class ToolHandler {
       if (typeof pathCheck === 'object' && pathCheck !== undefined) {
         return pathCheck;
       }
+      // An explicit project gets the same first-call guarantee as the default
+      // (#1835): its post-open catch-up sync finishes (time-boxed) before we
+      // serve it. Resolved on the main thread so the watcher lives here even
+      // when dispatch is off-loaded to a worker.
+      if (typeof pathCheck === 'string') {
+        await this.awaitProjectGate(pathCheck);
+      }
       // The `path` and `pattern` properties used by codegraph_files are
       // also path-shaped — apply the same cap.
       if (args.path !== undefined) {
@@ -2141,6 +2322,14 @@ export class ToolHandler {
       if (args.pattern !== undefined) {
         const check = this.validateOptionalPath(args.pattern, 'pattern');
         if (typeof check === 'object' && check !== undefined) return check;
+      }
+
+      const project = await this.getCodeGraph(args.projectPath as string | undefined);
+      // Recover a watcher disabled by prolonged lock contention on the next call.
+      // The stale banner remains until the watcher finishes its full scan;
+      // frequent calls cannot bypass its cooldown (#1959).
+      if (project.rearmWatcherAfterLockContention?.()) {
+        process.stderr.write('[CodeGraph MCP] Re-armed file watcher; full catch-up pending.\n');
       }
 
       // codegraph_status reports watcher state (pending files, degraded mode,
@@ -2153,15 +2342,15 @@ export class ToolHandler {
       }
 
       // Read tools: off-load the CPU-heavy dispatch to the worker pool when one
-      // is attached, healthy, AND has finished its first cold start (daemon
-      // mode), so the daemon's single event loop stays free for the MCP
+      // is attached, healthy, AND has finished its first cold start,
+      // so the server's single event loop stays free for the MCP
       // transport under concurrent load — otherwise N concurrent explores
       // serialize AND starve the transport until the whole batch drains
       // (clients then time out). Before the first worker is warm, calls run
       // in-process: a call queued behind a cold start sat invisible until the
       // 45s busy backstop — the daemon's first tool call stalling for however
       // long a worker spawn takes on a loaded machine (the #662 flake). With
-      // no pool (direct mode) or a degraded one, dispatch runs in-process
+      // no pool or a degraded one, dispatch runs in-process
       // exactly as before. Either way the result flows through the
       // cross-cutting notices — worktree-index mismatch (#155) and per-file
       // staleness (#403) — which need the watched MAIN instance and so are
@@ -2173,9 +2362,35 @@ export class ToolHandler {
       // structured-clone boundary into a worker, where a closure or a handler
       // field could not follow.
       const dispatchArgs = this.withSessionView(toolName, args, sessionState);
-      const raw = (this.queryPool && this.queryPool.healthy && this.queryPool.ready)
-        ? await this.queryPool.run(toolName, dispatchArgs)
+      // The default may have appeared after the workers started. Pass the
+      // main thread's current root explicitly; with no root or projectPath,
+      // keep the main handler's workspace-specific not-indexed guidance.
+      const pooled = !!(this.queryPool && this.queryPool.healthy && this.queryPool.ready);
+      const projectPath = pooled ? args.projectPath ?? this.cg?.getProjectRoot() : undefined;
+      const wasDegraded = project.isWatcherDegraded?.();
+      const raw = (pooled && projectPath)
+        ? await this.queryPool!.run(toolName, { ...dispatchArgs, projectPath })
         : await this.executeReadTool(toolName, dispatchArgs);
+      const answeredFrom = raw._cgAnswerFiles;
+      delete raw._cgAnswerFiles;
+      if (!raw.isError && answeredFrom && (wasDegraded || project.isWatcherDegraded?.())) {
+        const validation = await validateAnswerFiles(project.getProjectRoot(), answeredFrom);
+        if (validation.stale.length || validation.unchecked.length) {
+          // Rejected source must not enter the session's emission history.
+          const lines = ['⚠️ CodeGraph cannot answer from this index:'];
+          if (validation.stale.length) {
+            lines.push('These files changed or became unavailable after their last sync:',
+              ...validation.stale.map(file => `- ${file}`));
+          }
+          if (validation.unchecked.length) {
+            lines.push(`Freshness could not be verified within the validation budget for ${validation.unchecked.length} files:`,
+              ...validation.unchecked.slice(0, 20).map(file => `- ${file}`));
+            if (validation.unchecked.length > 20) lines.push(`- … ${validation.unchecked.length - 20} more (narrow the query)`);
+          }
+          lines.push('Retry after a successful codegraph sync, or narrow the query.');
+          return { ...this.textResult(lines.join('\n')), structuredContent: { freshness: validation } };
+        }
+      }
       // Record + STRIP before anything else touches the result: the emission is
       // internal bookkeeping and must never reach the client, whether or not a
       // caller passed session state.
@@ -2198,6 +2413,9 @@ export class ToolHandler {
         'This is an internal codegraph error — retry the call once; if it persists, ' +
         'continue without codegraph for this task.'
       );
+    } finally {
+      this.activeCalls--;
+      this.trimProjects();
     }
   }
 
@@ -2338,7 +2556,7 @@ export class ToolHandler {
     });
 
     const formatted = this.formatSearchResults(ranked);
-    return this.textResult(this.truncateOutput(formatted));
+    return this.answerResult(cg, this.truncateOutput(formatted), ranked.map(r => r.node.filePath));
   }
 
   /**
@@ -2375,10 +2593,11 @@ export class ToolHandler {
 
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
-      return this.textResult(`Symbol "${symbol}" not found in the codebase`);
+      return this.textResult(`Symbol "${symbol}" not found in the codebase${allMatches.note}`);
     }
 
     const { groups, filteredOut } = this.groupDefinitions(allMatches.nodes, fileFilter);
+    const answerPaths = new Set(groups.flat().map(node => node.filePath));
     const filterNote = filteredOut
       ? `\n\n> **Note:** no definition of "${symbol}" matches file "${fileFilter}" — showing all definitions instead.`
       : '';
@@ -2392,6 +2611,7 @@ export class ToolHandler {
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
             callers.push(c.node);
+            answerPaths.add(c.node.filePath);
             const label = this.edgeLabel(c.edge);
             if (label) labels.set(c.node.id, label);
           }
@@ -2404,7 +2624,7 @@ export class ToolHandler {
     if (groups.length === 1) {
       const { callers, labels } = collect(groups[0]!);
       if (callers.length === 0) {
-        return this.textResult(`No callers found for "${symbol}"${allMatches.note}${filterNote}`);
+        return this.answerResult(cg, `No callers found for "${symbol}"${allMatches.note}${filterNote}`, answerPaths);
       }
       // A successful `file` narrowing makes the multi-symbol aggregation note
       // stale — suppress it.
@@ -2415,7 +2635,7 @@ export class ToolHandler {
         ? `\n\n> Showing ${limit} of ${callers.length} callers; pass \`limit\` (up to 100) to widen.`
         : '';
       const formatted = this.formatNodeList(callers.slice(0, limit), `Callers of ${symbol}`, labels) + cut + note + filterNote;
-      return this.textResult(this.truncateOutput(formatted));
+      return this.answerResult(cg, this.truncateOutput(formatted), answerPaths);
     }
 
     // Multiple DISTINCT definitions (#764): one section per definition so an
@@ -2440,7 +2660,7 @@ export class ToolHandler {
         lines.push(`- … +${callers.length - limit} more (pass \`limit\` to widen)`);
       }
     }
-    return this.textResult(this.truncateOutput(lines.join('\n') + filterNote));
+    return this.answerResult(cg, this.truncateOutput(lines.join('\n') + filterNote), answerPaths);
   }
 
   /**
@@ -2456,10 +2676,11 @@ export class ToolHandler {
 
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
-      return this.textResult(`Symbol "${symbol}" not found in the codebase`);
+      return this.textResult(`Symbol "${symbol}" not found in the codebase${allMatches.note}`);
     }
 
     const { groups, filteredOut } = this.groupDefinitions(allMatches.nodes, fileFilter);
+    const answerPaths = new Set(groups.flat().map(node => node.filePath));
     const filterNote = filteredOut
       ? `\n\n> **Note:** no definition of "${symbol}" matches file "${fileFilter}" — showing all definitions instead.`
       : '';
@@ -2473,6 +2694,7 @@ export class ToolHandler {
           if (!seen.has(c.node.id)) {
             seen.add(c.node.id);
             callees.push(c.node);
+            answerPaths.add(c.node.filePath);
             const label = this.edgeLabel(c.edge);
             if (label) labels.set(c.node.id, label);
           }
@@ -2484,7 +2706,7 @@ export class ToolHandler {
     if (groups.length === 1) {
       const { callees, labels } = collect(groups[0]!);
       if (callees.length === 0) {
-        return this.textResult(`No callees found for "${symbol}"${allMatches.note}${filterNote}`);
+        return this.answerResult(cg, `No callees found for "${symbol}"${allMatches.note}${filterNote}`, answerPaths);
       }
       // A successful `file` narrowing makes the multi-symbol aggregation note
       // stale — suppress it.
@@ -2495,7 +2717,7 @@ export class ToolHandler {
         ? `\n\n> Showing ${limit} of ${callees.length} callees; pass \`limit\` (up to 100) to widen.`
         : '';
       const formatted = this.formatNodeList(callees.slice(0, limit), `Callees of ${symbol}`, labels) + cut + note + filterNote;
-      return this.textResult(this.truncateOutput(formatted));
+      return this.answerResult(cg, this.truncateOutput(formatted), answerPaths);
     }
 
     // Multiple DISTINCT definitions (#764): per-definition sections.
@@ -2518,7 +2740,7 @@ export class ToolHandler {
         lines.push(`- … +${callees.length - limit} more (pass \`limit\` to widen)`);
       }
     }
-    return this.textResult(this.truncateOutput(lines.join('\n') + filterNote));
+    return this.answerResult(cg, this.truncateOutput(lines.join('\n') + filterNote), answerPaths);
   }
 
   /**
@@ -2534,10 +2756,11 @@ export class ToolHandler {
 
     const allMatches = this.findAllSymbols(cg, symbol);
     if (allMatches.nodes.length === 0) {
-      return this.textResult(`Symbol "${symbol}" not found in the codebase`);
+      return this.textResult(`Symbol "${symbol}" not found in the codebase${allMatches.note}`);
     }
 
     const { groups, filteredOut } = this.groupDefinitions(allMatches.nodes, fileFilter);
+    const answerPaths = new Set(groups.flat().map(node => node.filePath));
     const filterNote = filteredOut
       ? `\n\n> **Note:** no definition of "${symbol}" matches file "${fileFilter}" — showing all definitions instead.`
       : '';
@@ -2550,6 +2773,7 @@ export class ToolHandler {
         const impact = cg.getImpactRadius(node.id, depth);
         for (const [id, n] of impact.nodes) {
           mergedNodes.set(id, n);
+          answerPaths.add(n.filePath);
         }
         for (const e of impact.edges) {
           const key = `${e.source}->${e.target}:${e.kind}`;
@@ -2565,7 +2789,7 @@ export class ToolHandler {
     // Single definition (or same-file overloads): the familiar merged report.
     if (groups.length === 1) {
       const formatted = this.formatImpact(symbol, impactOf(groups[0]!)) + (fileFilter && !filteredOut ? "" : allMatches.note) + filterNote;
-      return this.textResult(this.truncateOutput(formatted));
+      return this.answerResult(cg, this.truncateOutput(formatted), answerPaths);
     }
 
     // Multiple DISTINCT definitions (#764): a blast radius PER definition —
@@ -2582,7 +2806,7 @@ export class ToolHandler {
         this.formatImpact(`${head.qualifiedName} (${head.filePath}${line})`, impactOf(group))
       );
     }
-    return this.textResult(this.truncateOutput(sections.join('\n') + filterNote));
+    return this.answerResult(cg, this.truncateOutput(sections.join('\n') + filterNote), answerPaths);
   }
 
   /**
@@ -3294,8 +3518,11 @@ export class ToolHandler {
     // pre-#185 behavior for callers that hit the rare stats failure.
     let budget: ExploreOutputBudget;
     let indexedFileCount = -1;
+    let indexedNodeCount = -1;
     try {
-      indexedFileCount = cg.getStats().fileCount;
+      const stats = cg.getStats();
+      indexedFileCount = stats.fileCount;
+      indexedNodeCount = stats.nodeCount;
       budget = getExploreOutputBudget(indexedFileCount);
     } catch {
       budget = getExploreOutputBudget(Infinity);
@@ -3318,7 +3545,7 @@ export class ToolHandler {
         const extraction = extractQueryPaths(
           rawQuery,
           cg.getFiles().map((f) => f.path),
-          { maxPins: maxFiles },
+          { maxPins: maxFiles, existsOnDisk: (rel) => pathIsProjectFile(projectRoot, rel) },
         );
         if (extraction.pinnedFiles.length > 0 || extraction.unresolvedPathSpans.length > 0) {
           pinnedFiles = extraction.pinnedFiles;
@@ -3413,12 +3640,38 @@ export class ToolHandler {
       const missNote = unresolvedPathSpans.length > 0
         ? ` (no indexed file uniquely matches ${unresolvedPathSpans.map((s) => `\`${s}\``).join(', ')})`
         : '';
-      const empty = `No relevant code found for "${query}"${missNote}`;
+      let explanation = '\n\nExplore matches symbol/file names and indexed code words lexically, not by meaning.';
+      if (indexedNodeCount === 0) {
+        explanation += '\nThis project has nothing indexed.';
+      } else {
+        const miss = cg.getExploreMissDiagnostics(matchQuery);
+        const list = (words: string[]) => words.map(w => `\`${w}\``).join(', ');
+        // Separate caps preserve the retry instruction and complete candidate
+        // names even with long queries or generated identifiers.
+        const cappedList = (words: string[], cap: number) => {
+          const kept: string[] = [];
+          for (const word of words) {
+            if (list([...kept, word]).length > cap) break;
+            kept.push(word);
+          }
+          return list(kept) + (kept.length < words.length ? ' …' : '');
+        };
+        explanation += '\nChecked indexed names, signatures, docstrings (FTS prefixes) and live name segments; not all source text.';
+        if (miss.limited) explanation += '\nWord check limited to 16 words of at most 64 characters.';
+        explanation += `\nNo lexical matches for checked words: ${cappedList(miss.unmatched, 250) || '(none)'}.`;
+        if (miss.matched.length > 0) {
+          explanation += `\nMatched indexed words: ${cappedList(miss.matched, 200)}; these did not yield a relevant result after filtering/scoring.`;
+        }
+        explanation += miss.candidates.length > 0
+          ? `\nCandidates to retry with codegraph_explore (shared words, not confirmed answers): ${cappedList(miss.candidates, 350)}`
+          : '\nNo shared-word symbol candidates found; retry codegraph_explore with literal symbol/file names or code terms.';
+      }
+      const empty = `No relevant code found for "${query}"${missNote}${explanation}`;
       // Still an explore call, so it is still recorded: an empty answer spends a
       // call against the tier budget even though it emits no source.
-      return this.exploreResult(empty, {
+      return { ...this.textResult(empty), [EXPLORE_EMISSION_KEY]: {
         projectRoot, query, files: [], sourceBytes: 0, responseBytes: empty.length,
-      });
+      } };
     }
 
     // Graph-aware glue: findRelevantContext builds the subgraph from name/text
@@ -6105,23 +6358,20 @@ export class ToolHandler {
       });
       sourceBytes += emitted.bytes;
     }
-    return this.exploreResult(finalText, {
+    // Include graph-only and omitted/deleted files, not just emitted source.
+    const answerPaths = new Set(fileGroups.keys());
+    for (const id of [...flow.pathNodeIds, ...flow.namedNodeIds]) {
+      const node = cg.getNode(id);
+      if (node) answerPaths.add(node.filePath);
+    }
+    const result = this.answerResult(cg, finalText, answerPaths);
+    result[EXPLORE_EMISSION_KEY] = {
       projectRoot,
       query,
       files: emittedFiles,
       sourceBytes,
       responseBytes: finalText.length,
-    });
-  }
-
-  /**
-   * An explore response plus the record of what it emitted (CG-17). The record
-   * rides the result only as far as {@link execute}, which files it into the
-   * calling session's state and deletes it — see {@link EXPLORE_EMISSION_KEY}.
-   */
-  private exploreResult(text: string, emission: ExploreEmission): ToolResult {
-    const result = this.textResult(text);
-    result[EXPLORE_EMISSION_KEY] = emission;
+    };
     return result;
   }
 
@@ -6263,23 +6513,63 @@ export class ToolHandler {
     opts: { offset?: number; limit?: number; symbolsOnly?: boolean } = {},
   ): Promise<ToolResult> {
     const normalize = (p: string) => p.replace(/\\/g, '/').replace(/^(?:\.?\/+)+/, '').replace(/\/+$/, '');
-    const wantLower = normalize(fileArg).toLowerCase();
     const allFiles = cg.getFiles();
     if (allFiles.length === 0) return this.textResult('No files indexed. Run `codegraph index` first.');
 
-    let resolved = allFiles.find((f) => f.path.toLowerCase() === wantLower);
-    let candidates: typeof allFiles = [];
+    // Resolve ONE spelling of the path against the index: exact, then
+    // suffix-of-path, then substring — narrowing to a single file or handing
+    // back the ambiguous set.
+    const resolveOne = (want: string): { file?: (typeof allFiles)[number]; candidates: typeof allFiles } => {
+      const wantLower = normalize(want).toLowerCase();
+      let file = allFiles.find((f) => f.path.toLowerCase() === wantLower);
+      let found: typeof allFiles = [];
+      if (!file) {
+        found = allFiles.filter((f) => f.path.toLowerCase().endsWith('/' + wantLower));
+        if (found.length === 1) file = found[0];
+      }
+      if (!file && found.length === 0) {
+        found = allFiles.filter((f) => f.path.toLowerCase().includes(wantLower));
+        if (found.length === 1) file = found[0];
+      }
+      return { file, candidates: found };
+    };
+
+    // Agents and humans paste file references WITH a line suffix — `a.ts:12`,
+    // `a.ts:12-40`, `a.ts#L88`, `a.ts#L12-L40`. explore already strips exactly
+    // these shapes (src/search/query-paths.ts); file-view used to treat them as
+    // part of the filename and report an indexed file as missing (#1831).
+    // The literal spelling is tried FIRST, so a file genuinely named `foo:12`
+    // still resolves to itself; only when that finds nothing is the suffix
+    // stripped, and then the range becomes the read window.
+    const LINE_SUFFIX = /(?::(\d+)(?:-(\d+))?|#L(\d+)(?:-L?(\d+))?)$/;
+    let { file: resolved, candidates } = resolveOne(fileArg);
+    let shownArg = fileArg;
     if (!resolved) {
-      candidates = allFiles.filter((f) => f.path.toLowerCase().endsWith('/' + wantLower));
-      if (candidates.length === 1) resolved = candidates[0];
-    }
-    if (!resolved && candidates.length === 0) {
-      candidates = allFiles.filter((f) => f.path.toLowerCase().includes(wantLower));
-      if (candidates.length === 1) resolved = candidates[0];
+      const m = LINE_SUFFIX.exec(normalize(fileArg));
+      const stripped = m ? fileArg.slice(0, fileArg.length - m[0].length) : '';
+      const retry = stripped ? resolveOne(stripped) : undefined;
+      if (m && retry && (retry.file || retry.candidates.length > 0)) {
+        resolved = retry.file;
+        candidates = retry.candidates;
+        shownArg = stripped;
+        const startLine = Number(m[1] ?? m[3]);
+        const endRaw = m[2] ?? m[4];
+        const endLine = endRaw === undefined ? undefined : Number(endRaw);
+        if (Number.isFinite(startLine) && startLine > 0) {
+          // An explicit offset/limit from the caller always wins over the
+          // suffix. `:12` alone is a "start here" pointer (Read given only an
+          // offset); `:12-40` pins both ends.
+          opts = {
+            ...opts,
+            offset: opts.offset ?? startLine,
+            limit: opts.limit ?? (endLine !== undefined && endLine >= startLine ? endLine - startLine + 1 : undefined),
+          };
+        }
+      }
     }
     if (!resolved && candidates.length > 1) {
       return this.textResult(
-        [`"${fileArg}" matches ${candidates.length} indexed files — pass a longer path:`, '',
+        [`"${shownArg}" matches ${candidates.length} indexed files — pass a longer path:`, '',
           ...candidates.slice(0, 25).map((f) => `- ${f.path}`)].join('\n'),
       );
     }
@@ -6552,6 +6842,18 @@ export class ToolHandler {
       `**Database size:** ${(stats.dbSizeBytes / 1024 / 1024).toFixed(2)} MB`,
     );
 
+    // Exact CLI-parity change counts are measured on a worker: Git or the
+    // filesystem fallback can stall on a large/busy checkout, but status must
+    // not block the shared daemon's transport (#1959). Unknown is never zero.
+    const lastIndexedAt = cg.getLastIndexedAt();
+    const changes = await measurePendingChanges(cg.getProjectRoot());
+    lines.push(
+      `**Latest file indexed:** ${lastIndexedAt == null ? 'never' : new Date(lastIndexedAt).toISOString()}`,
+      changes
+        ? `**Changes since index:** ${changes.added} added, ${changes.modified} modified, ${changes.removed} removed`
+        : '**Changes since index:** unknown (measurement timed out or failed; do not assume the index is current)',
+    );
+
     // Surface the active SQLite backend (node:sqlite, Node's built-in real
     // SQLite — full WAL + FTS5, no native build).
     lines.push(`**Backend:** node:sqlite (Node built-in) — full WAL + FTS5`);
@@ -6611,11 +6913,14 @@ export class ToolHandler {
     // but the index is frozen — call that out explicitly here, the one place an
     // agent asks "is the index caught up?".
     if (cg.isWatcherDegraded()) {
+      const recovering = cg.isWatcherRecovering();
       lines.push(
         '',
-        '**Auto-sync disabled:**',
-        `- ${cg.getWatcherDegradedReason() ?? 'live file watching stopped'}`,
-        '- The index is frozen; Read files directly for current content.'
+        recovering ? '**Auto-sync recovering:**' : '**Auto-sync disabled:**',
+        recovering
+          ? '- File watching restarted; full index catch-up has not completed.'
+          : `- ${cg.getWatcherDegradedReason() ?? 'live file watching stopped'}`,
+        '- The index may be stale; Read files directly for current content.'
       );
     }
 
@@ -6634,7 +6939,9 @@ export class ToolHandler {
       }
     }
 
-    return this.textResult(lines.join('\n'));
+    return { ...this.textResult(lines.join('\n')), structuredContent: {
+      freshness: { lastIndexedAt, changes, complete: changes !== null },
+    } };
   }
 
   /**

@@ -88,6 +88,7 @@ pub struct Walker<'t> {
     file_path: &'t str,
     line_starts: Vec<usize>,
     arena: Arena,
+    node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
     stack: Vec<Scope>,
     nodes_meta: Vec<NodeMeta>,
@@ -119,6 +120,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
         file_path,
         line_starts: util::line_starts(source),
         arena: Arena::default(),
+        node_id_allocator: ids::NodeIdAllocator::default(),
         tables: Tables::default(),
         stack: Vec::new(),
         nodes_meta: Vec::new(),
@@ -224,7 +226,8 @@ impl<'t> Walker<'t> {
             return None;
         }
         let start_line = self.line_of(node);
-        let id = ids::node_id(self.file_path, kind, name, start_line);
+        let column = self.col_of(node);
+        let id = self.node_id_allocator.generate(self.file_path, kind, name, start_line, column);
         let end_line = node.end_position().row as u32 + 1;
 
         let qualified = extra.qualified_name.unwrap_or_else(|| {
@@ -1006,6 +1009,31 @@ impl<'t> Walker<'t> {
                     row: p.row,
                 });
             }
+            // #1820: preserve the receiver of a method value.
+            "selector_expression" => {
+                let field = v
+                    .child_by_field_name("field")
+                    .or_else(|| v.named_child(v.named_child_count().saturating_sub(1)));
+                let Some(field) = field else { return };
+                let name = self.text(field);
+                if name.is_empty() || is_stoplisted(name) {
+                    return;
+                }
+                let value = self.text(v);
+                if !value.split('.').all(|part| {
+                    !part.is_empty() && part.chars().enumerate().all(|(i, c)| {
+                        c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit())
+                    })
+                }) { return; }
+                let p = field.start_position();
+                self.fn_ref_cands.push(Cand {
+                    from,
+                    name: value.to_string(),
+                    line: p.row as u32 + 1,
+                    column_byte: field.start_byte(),
+                    row: p.row,
+                });
+            }
             "literal_element" | "expression_list" => {
                 for i in 0..v.named_child_count() {
                     if let Some(c) = v.named_child(i) {
@@ -1047,6 +1075,7 @@ impl<'t> Walker<'t> {
         let mut seen: HashSet<(String, String)> = HashSet::new();
         for c in cands {
             if !c.name.starts_with("this.")
+                && !c.name.contains('.')
                 && !c.name.contains("::")
                 && !self.defined_fn_names.contains(&c.name)
                 && !self.imported_names.contains(&c.name)

@@ -47,9 +47,21 @@ import {
   isProcessAlive,
   tryAcquireDaemonLock,
 } from './daemon';
+import { clearStaleDaemonArtifacts } from './daemon-registry';
 import { connectWithHello, runLocalHandshakeProxy } from './proxy';
-import { releaseWriterLock, tryAcquireWriterLock, writerLockHeldMessage } from './writer-lock';
-import { getDaemonSocketCandidates, probeDaemonIdentity } from './daemon-paths';
+import {
+  readWriterLock,
+  releaseWriterLock,
+  tryAcquireWriterLock,
+  writerLockHeldMessage,
+} from './writer-lock';
+import {
+  canProbeDaemonIdentity,
+  decodeLockInfo,
+  getDaemonPidPath,
+  getDaemonSocketCandidates,
+  probeDaemonIdentity,
+} from './daemon-paths';
 import { getTelemetry } from '../telemetry';
 import { checkForUpdateInBackground } from '../upgrade/update-check';
 import { EARLY_PPID } from './early-ppid';
@@ -58,6 +70,9 @@ import { installMainThreadWatchdog, WatchdogHandle } from './liveness-watchdog';
 import { armStartupHandshakeTimeout } from './startup-handshake';
 import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
+
+/** Default worker cap for a direct (single-client) session; see MCPEngineOptions.queryPoolDefaultMax (#1465). */
+const DIRECT_QUERY_POOL_MAX = 2;
 
 /**
  * Env var that marks a process as the *detached daemon* itself (set by
@@ -74,6 +89,52 @@ const DAEMON_INTERNAL_ENV = 'CODEGRAPH_DAEMON_INTERNAL';
  */
 const TAKEOVER_MAX_RETRIES = 5;
 const TAKEOVER_RETRY_DELAY_MS = 100;
+
+/**
+ * A fallback that serves reads without a watcher or a writer lock (#1963).
+ * Say so on stderr: otherwise a session that quietly stopped syncing looks
+ * the same as a healthy one in the logs.
+ */
+function readOnlyFallback(holder: string): MCPEngine {
+  process.stderr.write(`[CodeGraph MCP] Serving reads in-process without auto-sync: ${holder}.\n`);
+  return new MCPEngine({ readOnly: true });
+}
+
+/**
+ * Create an in-process fallback only when it cannot conflict with a live
+ * legacy daemon. Plain-PID locks cannot prove daemon identity, but they still
+ * prove that a process owns the legacy writer slot.
+ */
+function makeFallbackEngine(root: string): MCPEngine {
+  let existing: ReturnType<typeof decodeLockInfo> = null;
+  try {
+    existing = decodeLockInfo(fs.readFileSync(getDaemonPidPath(root), 'utf8'));
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== 'ENOENT') {
+      throw new Error(`The daemon lock could not be read (${code ?? 'unknown error'}); refusing an in-process fallback.`);
+    }
+  }
+  if (
+    existing &&
+    isProcessAlive(existing.pid) &&
+    !canProbeDaemonIdentity(existing)
+  ) {
+    throw new Error(
+      `Cannot start an in-process fallback while live legacy daemon pid ${existing.pid} holds the project lock.`
+    );
+  }
+  const writer = readWriterLock(root);
+  if (writer && writer.pid > 0 && isProcessAlive(writer.pid)) {
+    // Another process owns updates. A fallback may still serve read-only WAL
+    // queries without claiming a second writer or starting a watcher (#1963).
+    return readOnlyFallback(`writer lock held by PID ${writer.pid} (${writer.mode} mode)`);
+  }
+  if (existing && isProcessAlive(existing.pid)) {
+    return readOnlyFallback(`live daemon PID ${existing.pid} holds the project lock`);
+  }
+  return new MCPEngine({ writerLockRoot: root, queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX });
+}
 
 /**
  * How long a launcher waits for a freshly-spawned daemon to bind its socket
@@ -329,13 +390,9 @@ export class MCPServer {
    * connected session; in direct mode it mirrors the pre-#411 behavior (close
    * cg, exit). Proxy mode never routes through here — the proxy exits itself.
    */
-  stop(): void {
+  async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
-    if (this.writerLockRoot) {
-      releaseWriterLock(this.writerLockRoot);
-      this.writerLockRoot = null;
-    }
     if (this.ppidWatchdog) {
       clearInterval(this.ppidWatchdog);
       this.ppidWatchdog = null;
@@ -354,8 +411,12 @@ export class MCPServer {
       this.session = null;
     }
     if (this.engine) {
-      this.engine.stop();
+      await this.engine.stop();
       this.engine = null;
+    }
+    if (this.writerLockRoot) {
+      releaseWriterLock(this.writerLockRoot);
+      this.writerLockRoot = null;
     }
     process.exit(0);
   }
@@ -379,8 +440,8 @@ export class MCPServer {
       this.writerLockRoot = writerRoot;
     }
 
-    this.engine = new MCPEngine();
-    const transport = new StdioTransport();
+    this.engine = new MCPEngine({ queryPool: true, queryPoolDefaultMax: DIRECT_QUERY_POOL_MAX });
+    const transport = new StdioTransport({ exitOnClose: false, onClose: () => { void this.stop(); } });
     this.session = new MCPSession(transport, this.engine, {
       explicitProjectPath: this.projectPath,
     });
@@ -393,7 +454,7 @@ export class MCPServer {
     this.session.start();
 
     // Detect parent-process death — same logic as pre-refactor. When stdin
-    // closes we go through StdioTransport's `process.exit(0)` already, but
+    // closes the transport drains the engine through stop(), but
     // SIGKILL of the parent doesn't reliably close stdin on Linux (#277).
     // Also treat a stdin `'error'` (a socket-backed stdin can fail with
     // ECONNRESET/hangup instead of a clean close) as shutdown, and destroy the
@@ -449,23 +510,43 @@ export class MCPServer {
       // Taken. If the holder is alive, another daemon already serves (or is
       // binding) — we're redundant; exit cleanly so the launcher proxies to it.
       const existing = lock.existing;
+      let disprovedLiveIdentity = false;
       if (existing && existing.pid > 0 && isProcessAlive(existing.pid)) {
         // Give a newly-elected daemon time to bind, then require its socket hello
         // to match the lock PID/version. PID existence alone accepts an unrelated
         // process after OS PID reuse and permanently wedges startup (#1553).
         const age = Date.now() - existing.startedAt;
-        const stillStarting = existing.startedAt > 0 && age >= 0 && age < 10_000;
-        if (stillStarting || await probeDaemonIdentity(existing)) {
+        const startupGraceMs = 10_000;
+        const stillStarting = existing.startedAt > 0 && age >= 0 && age < startupGraceMs;
+        // Legacy plain-PID locks have no socket identity to test. Preserve those
+        // live holders: an inconclusive probe is not permission to create a
+        // second writer.
+        if (
+          !canProbeDaemonIdentity(existing) ||
+          stillStarting ||
+          await probeDaemonIdentity(existing)
+        ) {
           process.stderr.write(
             `[CodeGraph daemon] Another daemon (pid ${existing.pid}) already holds the lock; exiting.\n`
           );
           process.exit(0);
         }
+        disprovedLiveIdentity = true;
       }
 
-      // Holder is dead (or the record is unreadable) — clear it (pid-verified,
-      // so we never delete a live daemon's lock) and retry the acquire.
-      clearStaleDaemonLock(lock.pidPath, existing?.pid, { allowLivePid: true });
+      // The holder is dead, the record is unreadable, or a completed socket
+      // hello disproved a live PID's identity. Revalidate the exact record and
+      // retry the acquire only after cleanup succeeds safely.
+      if (disprovedLiveIdentity) {
+        // Re-probe and claim writer.pid before cleanup. A daemon that is merely
+        // delayed already owns that writer lock, and a paired live-PID record is
+        // ambiguous under the legacy lock format, so both cases fail closed.
+        await clearStaleDaemonArtifacts(root);
+      } else if (lock.lockContents !== null) {
+        clearStaleDaemonLock(lock.pidPath, existing?.pid, {
+          expectedLockContents: lock.lockContents,
+        });
+      }
       await sleep(TAKEOVER_RETRY_DELAY_MS);
     }
 
@@ -515,7 +596,7 @@ export class MCPServer {
       }
       return null; // never bound — the proxy serves this session in-process
     };
-    await runLocalHandshakeProxy({ getDaemonSocket, makeEngine: () => new MCPEngine(), root });
+    await runLocalHandshakeProxy({ getDaemonSocket, makeEngine: () => makeFallbackEngine(root), root });
   }
 
   /** Standard SIGINT/SIGTERM handlers that route to our `stop()` (direct mode). */

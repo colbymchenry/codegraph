@@ -41,8 +41,8 @@ Answer, in aggregate and anonymously:
 1. **The schema is the allowlist.** Client sends only the events below; the ingest Worker
    validates against the same allowlist and drops anything else. Adding a field = PR that
    edits this doc + `TELEMETRY.md` + the Worker allowlist together.
-2. **Telemetry may never cost the user anything**: zero added latency on the MCP tool-call
-   hot path (the repo's core invariant), zero new npm dependencies (global `fetch`, Node ≥18),
+2. **Telemetry may never cost the user anything**: no network requests or queue writes on the MCP tool-call
+   hot path (only a small local consent-file read), zero new npm dependencies (global `fetch`, Node ≥18),
    zero bytes on stdout (stdio is the MCP protocol channel), zero retries, zero error noise.
    Every failure mode is silence.
 3. **Off is off.** When disabled, no process opens a socket to the telemetry endpoint — not
@@ -53,7 +53,7 @@ Answer, in aggregate and anonymously:
 
 ## Events
 
-Common envelope on every batch (computed once per process):
+Common envelope on every batch (identity revalidated before each request):
 
 | field | example | notes |
 |---|---|---|
@@ -131,7 +131,12 @@ Surfaces:
   `codegraph collects anonymous usage stats (no code or paths) — "codegraph telemetry off" or CODEGRAPH_TELEMETRY=0 disables. Details: TELEMETRY.md`
 - **CLI:** `codegraph telemetry status|on|off` (status prints the machine ID, current
   state, and what decided it). Deleting `~/.codegraph/telemetry.json` resets everything,
-  including the machine ID.
+  including the machine ID. Turning telemetry off stores a null `machine_id` and removes
+  both queued and claimed unsent data. Turning it back on mints a new ID; processes
+  discard memory from the previous identity even if they missed the off/on transition.
+  Requests already in flight cannot be recalled, but every later request chunk and
+  requeue checks current consent and identity again. Config writes use atomic replacement
+  so concurrent readers never see a half-written choice.
 
 `~/.codegraph/telemetry.json`:
 
@@ -154,7 +159,8 @@ other filenames.)
 New module `src/telemetry/` (single small module, no deps):
 
 - **Counters in memory** — recording a tool call/CLI command is an in-memory increment.
-  Nothing on the hot path touches disk or network. MCP tool handlers call
+  The small consent file is refreshed before recording so another process's opt-out is
+  observed. No queue writes or network requests run on this path. MCP tool handlers call
   `telemetry.count('mcp_tool', name, ok)` and move on.
 - **Buffer** — counters persist (debounced, async) to `~/.codegraph/telemetry-queue.jsonl`.
   Hard cap ~256 KB; on overflow drop oldest lines. Corrupt buffer → truncate, never throw.

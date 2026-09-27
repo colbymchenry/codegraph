@@ -139,6 +139,7 @@ function mod(id: string, over: Partial<WireMapModule> = {}): WireMapModule {
     test: over.test ?? false,
     facade: over.facade ?? false,
     fileList: over.fileList ?? { total: 3, shown: 3, truncated: false, items: [] },
+    dependents: over.dependents ?? { files: 0, modules: 0 },
   };
 }
 
@@ -447,6 +448,37 @@ describe('mapSvg', () => {
     expect(svg).toContain('>1218 symbols · 54 files</text>');
     // Tests were filtered out of the layout, so they are not in the image.
     expect(svg).not.toContain('>__tests__</text>');
+  });
+
+  it('exports the weight bar the canvas draws, scaled the same way', () => {
+    const weighted = buildMapLayout(
+      {
+        modules: [
+          mod('src/types', { dependents: { files: 80, modules: 4 } }),
+          mod('src/db', { dependents: { files: 20, modules: 2 } }),
+          mod('src/bin'),
+        ],
+        links: [link('src/db', 'src/types', 30), link('src/bin', 'src/db', 30)],
+      },
+      { includeTests: false }
+    );
+    const svg = mapSvg(weighted);
+    const nodeOf = (id: string) => weighted.nodes.find((n) => n.id === id)!;
+    // Full bar for the heaviest, a quarter for the module a quarter as leaned
+    // on, and NO rect at all for the one nothing depends on.
+    // The export rounds to a tenth, as every coordinate in this file does.
+    const tenth = (n: number) => Math.round(n * 10) / 10;
+    const full = nodeOf('src/types');
+    const quarter = nodeOf('src/db');
+    expect(quarter.weight).toBeCloseTo(0.25, 5);
+    expect(svg).toContain(`width="${tenth(full.width)}" height="4" fill="${EXPORT_COLORS.ink}"`);
+    expect(svg).toContain(
+      `width="${tenth(quarter.width * 0.25)}" height="4" fill="${EXPORT_COLORS.ink}"`
+    );
+    expect(nodeOf('src/bin').weight).toBe(0);
+    expect(svg.match(/height="4" fill=/g)?.length).toBe(2);
+    // …and the count rides in the meta line, as on screen.
+    expect(svg).toContain('· 80 depend on it</text>');
   });
 
   it('names the top and bottom bands', () => {

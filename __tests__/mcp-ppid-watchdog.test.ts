@@ -55,6 +55,7 @@ describe.skipIf(process.platform === 'win32')('MCP PPID watchdog (#277)', () => 
   let wrapper: ChildProcessWithoutNullStreams | null = null;
   let childPid: number | null = null;
   let stdinHolderPid: number | null = null;
+  let tmpDir: string | null = null;
 
   afterEach(() => {
     if (wrapper && !wrapper.killed) {
@@ -69,6 +70,8 @@ describe.skipIf(process.platform === 'win32')('MCP PPID watchdog (#277)', () => 
     wrapper = null;
     childPid = null;
     stdinHolderPid = null;
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = null;
   });
 
   it("shuts down when its parent is SIGKILL'd and stdin stays open", async () => {
@@ -83,10 +86,8 @@ describe.skipIf(process.platform === 'win32')('MCP PPID watchdog (#277)', () => 
     //
     // CODEGRAPH_PPID_POLL_MS=200 keeps the watchdog responsive in test; the
     // production default is 5000ms.
-    const stderrLog = path.join(
-      fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ppid-watchdog-')),
-      'codegraph.stderr.log',
-    );
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-ppid-watchdog-'));
+    const stderrLog = path.join(tmpDir, 'codegraph.stderr.log');
     // The wrapper waits 800ms before reporting the PIDs so the codegraph
     // child has time to finish its async start() (dynamic import + transport
     // setup + watchdog registration). Otherwise the test races: it
@@ -119,6 +120,9 @@ describe.skipIf(process.platform === 'win32')('MCP PPID watchdog (#277)', () => 
     `;
     wrapper = spawn(process.execPath, ['-e', wrapperSrc], {
       stdio: ['pipe', 'pipe', 'pipe'],
+      // All descendants inherit an isolated project. An editor's live writer
+      // lock in the repository must not terminate the child before the watchdog.
+      cwd: tmpDir,
     }) as ChildProcessWithoutNullStreams;
 
     const pids = await new Promise<{ pid: number; stdinHolderPid: number }>((resolve, reject) => {

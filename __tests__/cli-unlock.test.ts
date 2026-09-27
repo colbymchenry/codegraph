@@ -99,4 +99,35 @@ describe('codegraph unlock — daemon artifact recovery (#1553)', () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
+
+  it('preserves a live legacy lock whose daemon identity cannot be probed', () => {
+    const pidPath = getDaemonPidPath(tempDir);
+    fs.writeFileSync(pidPath, `${process.pid}\n`);
+
+    const output = runCodegraph(['unlock', tempDir], tempDir);
+
+    expect(output).toContain('No stale lock files found');
+    expect(fs.readFileSync(pidPath, 'utf8')).toBe(`${process.pid}\n`);
+    expect(() => process.kill(process.pid, 0)).not.toThrow();
+  });
+
+  it('removes a legacy lock whose PID is dead', () => {
+    const pidPath = getDaemonPidPath(tempDir);
+    fs.writeFileSync(pidPath, '999999\n');
+
+    const output = runCodegraph(['unlock', tempDir], tempDir);
+
+    expect(output).toContain('Removed stale lock artifacts');
+    expect(fs.existsSync(pidPath)).toBe(false);
+  });
+
+  it('removes a malformed daemon lock', () => {
+    const pidPath = getDaemonPidPath(tempDir);
+    fs.writeFileSync(pidPath, 'not-a-lock\n');
+
+    const output = runCodegraph(['unlock', tempDir], tempDir);
+
+    expect(output).toContain('Removed stale lock artifacts');
+    expect(fs.existsSync(pidPath)).toBe(false);
+  });
 });

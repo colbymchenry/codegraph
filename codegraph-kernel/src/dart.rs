@@ -126,6 +126,7 @@ pub struct Walker<'t> {
     file_path: &'t str,
     line_starts: Vec<usize>,
     arena: Arena,
+    node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
     stack: Vec<Scope>,
     node_ids: Vec<String>,
@@ -156,6 +157,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
         file_path,
         line_starts: util::line_starts(source),
         arena: Arena::default(),
+        node_id_allocator: ids::NodeIdAllocator::default(),
         tables: Tables::default(),
         stack: Vec::new(),
         node_ids: Vec::new(),
@@ -265,7 +267,8 @@ impl<'t> Walker<'t> {
             return None;
         }
         let start_line = self.line_of(node);
-        let id = ids::node_id(self.file_path, kind, name, start_line);
+        let column = self.col_of(node);
+        let id = self.node_id_allocator.generate(self.file_path, kind, name, start_line, column);
 
         let qualified = {
             let mut parts: Vec<&str> = Vec::new();
@@ -398,7 +401,7 @@ impl<'t> Walker<'t> {
         while let Some(parent) = p {
             if matches!(
                 parent.kind(),
-                "class_definition" | "mixin_declaration" | "extension_declaration" | "enum_declaration"
+                "class_definition" | "mixin_declaration" | "extension_declaration" | "extension_type_declaration" | "enum_declaration"
             ) {
                 return parent.child_by_field_name("name").map(|n| self.text(n));
             }
@@ -630,7 +633,11 @@ impl<'t> Walker<'t> {
                 self.extract_function(node);
                 return;
             }
-            "class_definition" | "mixin_declaration" | "extension_declaration" => {
+            // `extension_type_declaration` is Dart 3.3's extension type. It is a
+            // different node from `extension_declaration` above, which is the
+            // older `extension` — the names are near neighbours and only one of
+            // them was listed.
+            "class_definition" | "mixin_declaration" | "extension_declaration" | "extension_type_declaration" => {
                 self.extract_class(node);
                 return;
             }

@@ -41,7 +41,7 @@ try {
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection } from '../directory';
+import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection } from '../directory';
 import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
@@ -363,6 +363,13 @@ function info(message: string): void {
  */
 function warn(message: string): void {
   console.log(chalk.yellow(getGlyphs().warn) + ' ' + message);
+}
+
+/** "not found" (+ optional did-you-mean) when no exact symbol matches. */
+function formatSymbolNotFound(symbol: string, fuzzyNames: string[]): string {
+  const suggestions = [...new Set(fuzzyNames.filter((n) => n !== symbol))].slice(0, 3);
+  if (suggestions.length === 0) return `Symbol "${symbol}" not found`;
+  return `Symbol "${symbol}" not found — did you mean: ${suggestions.join(', ')}?`;
 }
 
 /** Compact node shape retained by the CLI's existing JSON lists. */
@@ -948,39 +955,45 @@ program
       const { default: CodeGraph } = await loadCodeGraph();
       const cg = await CodeGraph.open(projectPath);
 
-      if (options.quiet) {
-        await cg.sync();
+      try {
+        if (options.quiet) {
+          await cg.sync();
+          return;
+        }
+
+        const clack = await importESM('@clack/prompts');
+        clack.intro('Syncing CodeGraph');
+
+        process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
+        const progress = createShimmerProgress();
+
+        const result = await cg.sync({
+          onProgress: progress.onProgress,
+        }).finally(() => progress.stop());
+
+        const totalChanges = result.filesAdded + result.filesModified + result.filesRemoved;
+
+        if (totalChanges === 0 && !result.pendingRefsProcessed) {
+          clack.log.info('Already up to date');
+        } else if (totalChanges > 0) {
+          clack.log.success(`Synced ${formatNumber(totalChanges)} changed files`);
+          const details: string[] = [];
+          if (result.filesAdded > 0) details.push(`Added: ${result.filesAdded}`);
+          if (result.filesModified > 0) details.push(`Modified: ${result.filesModified}`);
+          if (result.filesRemoved > 0) details.push(`Removed: ${result.filesRemoved}`);
+          clack.log.info(`${details.join(', ')} ${getGlyphs().dash} ${formatNumber(result.nodesUpdated)} nodes in ${formatDuration(result.durationMs)}`);
+        }
+
+        if (result.pendingRefsProcessed) {
+          const unresolved = result.pendingRefsUnresolved
+            ? ` (${formatNumber(result.pendingRefsUnresolved)} unresolved)` : '';
+          clack.log.info(`Resolved ${formatNumber(result.pendingRefsResolved ?? 0)} pending references${unresolved}`);
+        }
+
+        clack.outro('Done');
+      } finally {
         cg.destroy();
-        return;
       }
-
-      const clack = await importESM('@clack/prompts');
-      clack.intro('Syncing CodeGraph');
-
-      process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-      const progress = createShimmerProgress();
-
-      const result = await cg.sync({
-        onProgress: progress.onProgress,
-      });
-
-      await progress.stop();
-
-      const totalChanges = result.filesAdded + result.filesModified + result.filesRemoved;
-
-      if (totalChanges === 0) {
-        clack.log.info('Already up to date');
-      } else {
-        clack.log.success(`Synced ${formatNumber(totalChanges)} changed files`);
-        const details: string[] = [];
-        if (result.filesAdded > 0) details.push(`Added: ${result.filesAdded}`);
-        if (result.filesModified > 0) details.push(`Modified: ${result.filesModified}`);
-        if (result.filesRemoved > 0) details.push(`Removed: ${result.filesRemoved}`);
-        clack.log.info(`${details.join(', ')} ${getGlyphs().dash} ${formatNumber(result.nodesUpdated)} nodes in ${formatDuration(result.durationMs)}`);
-      }
-
-      clack.outro('Done');
-      cg.destroy();
     } catch (err) {
       if (!options.quiet) {
         error(`Failed to sync: ${err instanceof Error ? err.message : String(err)}`);
@@ -1406,6 +1419,9 @@ program
       let input: { prompt?: string; cwd?: string } = {};
       try { input = JSON.parse(raw); } catch { return; }
       const prompt = String(input.prompt || '');
+      // System-injected task notifications are not user prompts: exit before
+      // any project lookup or explore work (#1832).
+      if (isTaskNotification(prompt)) return;
 
       // Gate telemetry: how often each tier fires vs. no-ops — counter names
       // only, NEVER prompt content (see TELEMETRY.md). This is the data that
@@ -2212,7 +2228,7 @@ for (const direction of ['callers', 'callees'] as const) {
           const limit = parseInt(options.limit || '20', 10);
           const { nodes: targets } = lookupSymbolNodes(cg, symbol);
           if (targets.length === 0) {
-            info(`Symbol "${symbol}" not found`);
+            info(formatSymbolNotFound(symbol, cg.searchNodes(symbol, { limit: 5 }).map((m) => m.node.name)));
             return;
           }
 
@@ -2234,13 +2250,16 @@ for (const direction of ['callers', 'callees'] as const) {
             return { group, nodes: [...nodes.values()], edges: [...edges.values()] };
           });
 
+          const relationships = (node: Node, edges: Edge[]) => [...new Set(edges
+            .filter((edge) => (direction === 'callers' ? edge.source : edge.target) === node.id)
+            .map((edge) => edge.kind))];
           if (options.json) {
             const definitions = collected.map(({ group, nodes, edges }) => {
               const limited = nodes.slice(0, limit);
               const shown = new Set(limited.map((node) => node.id));
               return {
                 ...cliDefinition(group),
-                [direction]: limited.map((node) => ({ id: node.id, ...cliNode(node) })),
+                [direction]: limited.map((node) => ({ id: node.id, ...cliNode(node), relationships: relationships(node, edges) })),
                 edges: edges.filter((edge) => shown.has(direction === 'callers' ? edge.source : edge.target)),
                 total: nodes.length,
                 limit,
@@ -2261,7 +2280,8 @@ for (const direction of ['callers', 'callees'] as const) {
               filteredOut,
               note,
               definitions,
-              [direction]: [...union.values()].slice(0, limit).map(cliNode),
+              [direction]: [...union.values()].slice(0, limit).map((node) => ({ ...cliNode(node),
+                relationships: relationships(node, collected.flatMap((entry) => entry.edges)) })),
               total,
               limit,
               truncated: total > limit,
@@ -2271,7 +2291,7 @@ for (const direction of ['callers', 'callees'] as const) {
             if (ambiguous) {
               console.log(chalk.bold(`\n${title} of "${symbol}" — ${groups.length} distinct definitions (narrow with --file):`));
             }
-            for (const { group, nodes } of collected) {
+            for (const { group, nodes, edges } of collected) {
               const limited = nodes.slice(0, limit);
               const total = nodes.length;
               const truncated = total > limit;
@@ -2288,7 +2308,9 @@ for (const direction of ['callers', 'callees'] as const) {
               }
               for (const node of limited) {
                 const loc = node.startLine ? `:${node.startLine}` : '';
-                console.log(chalk.cyan(node.kind.padEnd(12)) + chalk.white(node.name));
+                const kinds = relationships(node, edges).filter((kind) => kind !== 'calls');
+                const relation = kinds.length ? ` [${kinds.join(', ')}]` : '';
+                console.log(chalk.cyan(node.kind.padEnd(12)) + chalk.white(node.name) + chalk.dim(relation));
                 console.log(chalk.dim(`  ${node.filePath}${loc}`));
                 console.log();
               }
@@ -2330,7 +2352,7 @@ program
         const depth = Math.min(Math.max(parseInt(options.depth || '2', 10), 1), 10);
         const { nodes: targets } = lookupSymbolNodes(cg, symbol);
         if (targets.length === 0) {
-          info(`Symbol "${symbol}" not found`);
+          info(formatSymbolNotFound(symbol, cg.searchNodes(symbol, { limit: 5 }).map((m) => m.node.name)));
           return;
         }
 

@@ -28,6 +28,13 @@
  * Tune with `CODEGRAPH_STARTUP_HANDSHAKE_TIMEOUT_MS`; `0` disables.
  */
 
+/**
+ * The longest delay a Node timer holds (2^31-1 ms). Kept here rather than
+ * imported from liveness-watchdog.ts because early-ppid.ts loads this module
+ * at startup and must stay free of that module's imports.
+ */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
 /** Default wait for the first byte of MCP traffic before assuming orphaned. */
 export const DEFAULT_STARTUP_HANDSHAKE_TIMEOUT_MS = 900_000; // 15 min
 
@@ -35,14 +42,16 @@ export const STARTUP_HANDSHAKE_TIMEOUT_ENV = 'CODEGRAPH_STARTUP_HANDSHAKE_TIMEOU
 
 /**
  * Parse the timeout env override. Missing/invalid → default; `<= 0` → `0`
- * (disabled), the same disable convention as `CODEGRAPH_PPID_POLL_MS`.
+ * (disabled), the same disable convention as `CODEGRAPH_PPID_POLL_MS`. Capped
+ * at {@link MAX_TIMER_DELAY_MS}: a larger delay makes Node fire the timer after
+ * 1 ms, abandoning a healthy launch at once (#1966).
  */
 export function parseStartupHandshakeTimeoutMs(raw: string | undefined): number {
   if (raw === undefined || raw === '') return DEFAULT_STARTUP_HANDSHAKE_TIMEOUT_MS;
   const parsed = Number(raw);
   if (!Number.isFinite(parsed)) return DEFAULT_STARTUP_HANDSHAKE_TIMEOUT_MS;
   if (parsed <= 0) return 0;
-  return Math.floor(parsed);
+  return Math.min(Math.floor(parsed), MAX_TIMER_DELAY_MS);
 }
 
 /**

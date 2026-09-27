@@ -102,13 +102,23 @@ export interface DaemonLockInfo {
   startedAt: number;
 }
 
+/** Whether a lock record contains enough identity data for a socket hello. */
+export function canProbeDaemonIdentity(info: DaemonLockInfo): boolean {
+  return (
+    Number.isInteger(info.pid) &&
+    info.pid > 0 &&
+    typeof info.socketPath === 'string' &&
+    info.socketPath.length > 0
+  );
+}
+
 /**
  * Verify that the process named by a lockfile is the CodeGraph daemon serving
  * its socket. A bare PID liveness probe is insufficient because OSes reuse PIDs
  * after an OOM/SIGKILL (#1553).
  */
 export function probeDaemonIdentity(info: DaemonLockInfo, timeoutMs = 1_000): Promise<boolean> {
-  if (!Number.isInteger(info.pid) || info.pid <= 0 || !info.socketPath) return Promise.resolve(false);
+  if (!canProbeDaemonIdentity(info)) return Promise.resolve(false);
   return new Promise<boolean>((resolve) => {
     let socket: net.Socket;
     let buffer = '';
@@ -178,12 +188,12 @@ export function decodeLockInfo(raw: string): DaemonLockInfo | null {
     ) {
       return parsed as DaemonLockInfo;
     }
-    return null;
   } catch {
     // Fall through to legacy plain-pid handling.
   }
+  if (!/^[1-9]\d*$/.test(trimmed)) return null;
   const pid = Number(trimmed);
-  if (Number.isFinite(pid) && pid > 0) {
+  if (Number.isSafeInteger(pid)) {
     return { pid, version: 'unknown', socketPath: '', startedAt: 0 };
   }
   return null;

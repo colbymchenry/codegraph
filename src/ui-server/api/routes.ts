@@ -79,9 +79,6 @@ export function splitRouteName(url: string): { method: string | null; path: stri
   return { method: head.toUpperCase(), path: url.slice(space + 1).trimStart() };
 }
 
-/** Distinct handler files we will resolve node ids for. */
-const MAX_HANDLER_FILES = 60;
-
 /**
  * The engine needs three surviving rows to call a project routed, and applies
  * `limit` before that test — so anything below three is a question that cannot
@@ -111,18 +108,16 @@ export function buildRoutes(cg: CodeGraph, query: URLSearchParams): WireRoutes {
   const truncated = manifest.entries.length > limit;
   const rows = manifest.entries.slice(0, limit);
 
-  // One `getNodesInFile` per distinct handler file — typically one or two, and
-  // capped so a project that scatters handlers across hundreds of files cannot
-  // turn one request into hundreds of queries.
-  const handlerFiles = [...new Set(rows.map((e) => e.handlerFile))].slice(0, MAX_HANDLER_FILES);
+  // Every row's handler file in one batched query, so a project that scatters
+  // handlers across hundreds of files still costs one query per chunk, and no
+  // row past a cap is reported as "not in the index" (#1975).
+  const handlerFiles = [...new Set(rows.map((e) => e.handlerFile))];
   const byFileLineName = new Map<string, string>();
-  for (const file of handlerFiles) {
-    for (const node of cg.getNodesInFile(file)) {
-      // Keyed on what the manifest actually knows: file, line and name. Two
-      // symbols can share a line (a decorator and its method); the name breaks
-      // the tie, and a miss simply leaves that entry unlinked.
-      byFileLineName.set(`${node.filePath} ${node.startLine} ${node.name}`, node.id);
-    }
+  for (const node of cg.getNodesInFiles(handlerFiles)) {
+    // Keyed on what the manifest actually knows: file, line and name. Two
+    // symbols can share a line (a decorator and its method); the name breaks
+    // the tie, and a miss simply leaves that entry unlinked.
+    byFileLineName.set(`${node.filePath} ${node.startLine} ${node.name}`, node.id);
   }
 
   const entries: WireRoute[] = rows.map((entry) => ({

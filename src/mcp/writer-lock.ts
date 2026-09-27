@@ -42,6 +42,8 @@ export interface WriterLockInfo {
   /** `direct` | `daemon` | `fallback` — for actionable error text only. */
   mode: string;
   startedAt: number;
+  /** False until the MCP owner has finished its initial catch-up. */
+  ready?: boolean;
 }
 
 export type WriterAcquireResult =
@@ -60,6 +62,7 @@ export function decodeWriterLockInfo(raw: string): WriterLockInfo | null {
       pid: parsed.pid,
       mode: parsed.mode,
       startedAt: typeof parsed.startedAt === 'number' ? parsed.startedAt : 0,
+      ...(typeof parsed.ready === 'boolean' ? { ready: parsed.ready } : {}),
     };
   } catch {
     return null;
@@ -81,6 +84,7 @@ export function tryAcquireWriterLock(
     pid: process.pid,
     mode,
     startedAt: Date.now(),
+    ready: false,
   };
 
   const attempt = (): WriterAcquireResult => {
@@ -144,6 +148,20 @@ export function tryAcquireWriterLock(
     }
   }
   return result;
+}
+
+/** Publish catch-up readiness without exposing a partially-written pidfile. */
+export function markWriterReady(projectRoot: string): void {
+  const pidPath = getWriterPidPath(projectRoot);
+  const info = readWriterLock(projectRoot);
+  if (!info || info.pid !== process.pid) return;
+  const tmp = `${pidPath}.${process.pid}.ready.tmp`;
+  try {
+    fs.writeFileSync(tmp, encode({ ...info, ready: true }), { mode: 0o600 });
+    fs.renameSync(tmp, pidPath);
+  } finally {
+    try { fs.unlinkSync(tmp); } catch { /* best-effort */ }
+  }
 }
 
 /** Release if we still own the lock (pid match). */

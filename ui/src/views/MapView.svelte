@@ -18,6 +18,7 @@
   import ModuleNode from '../components/map/ModuleNode.svelte';
   import ModuleEdge from '../components/map/ModuleEdge.svelte';
   import MapSidePanel from '../components/map/MapSidePanel.svelte';
+  import MapKey from '../components/map/MapKey.svelte';
   import { exportFilename, mapSvg } from '../lib/export-svg';
   import { fetchMap, type WireMapPayload } from '../lib/api';
   import { live } from '../lib/live.svelte';
@@ -31,7 +32,8 @@
 
   interface Props {
     root: string | null;
-    depth: number;
+    /** `null` = nobody has chosen; the answer picks a grouping for this repo. */
+    depth: number | null;
     tests: boolean;
   }
 
@@ -55,6 +57,26 @@
    */
   const FIT = { fitViewOptions: { padding: 0.12, maxZoom: 1, minZoom: 0.45 } };
 
+  // The key stays open until the reader closes it; the choice survives a reload
+  // but is per browser — a preference, not a fact about the project. Same
+  // storage shape as the Screens and Steps keys.
+  const LEGEND_KEY = 'codegraph-ui:map-legend';
+  let legendOpen = $state(readLegendOpen());
+  function readLegendOpen(): boolean {
+    try {
+      return localStorage.getItem(LEGEND_KEY) !== 'closed';
+    } catch {
+      return true;
+    }
+  }
+  $effect(() => {
+    try {
+      localStorage.setItem(LEGEND_KEY, legendOpen ? 'open' : 'closed');
+    } catch {
+      // Storage refused (private mode): the key simply reopens next time.
+    }
+  });
+
   const nodeTypes = { module: ModuleNode };
   const edgeTypes = { module: ModuleEdge };
 
@@ -72,7 +94,7 @@
     const controller = new AbortController();
     loading = true;
     error = null;
-    fetchMap({ root: wantRoot, depth: wantDepth }, controller.signal)
+    fetchMap({ root: wantRoot, depth: wantDepth ?? undefined }, controller.signal)
       .then((next) => {
         payload = next;
         loading = false;
@@ -165,7 +187,16 @@
 
   function setRoot(next: string): void {
     selected = null;
-    navigate(mapHref({ root: next, depth, tests }));
+    // Deliberately dropping the depth: how finely to cut `ios` is a different
+    // question from how finely to cut the whole project, and carrying the old
+    // answer over is how a reader lands on a one-box map.
+    navigate(mapHref({ root: next, tests }));
+  }
+
+  /** `null` hands the grouping back to the answering side. */
+  function setDepth(next: number | null): void {
+    selected = null;
+    navigate(mapHref({ root, depth: next, tests }));
   }
 
   /**
@@ -191,6 +222,7 @@
     selected = null;
     navigate(mapHref({ root, depth, tests: next }));
   }
+
 </script>
 
 <div class="mapview">
@@ -256,6 +288,15 @@
         <Controls position="bottom-right" showLock={false} />
       </SvelteFlow>
 
+      <!-- The key, on the picture it explains. -->
+      <MapKey
+        minWeight={layout.minWeight}
+        thinCount={layout.edges.filter((e) => e.thin && !e.back).length}
+        declaredBasis={layout.basis.kind === 'declared'}
+        open={legendOpen}
+        onToggle={(next) => (legendOpen = next)}
+      />
+
       {#if hovered !== null}
         <div class="tip" style={`left:${hovered.x}px;top:${hovered.y}px`}>
           <div class="mono"><b>{hovered.edge.source}</b> → {hovered.edge.target}</div>
@@ -291,6 +332,8 @@
       exportName={exportFilename('map', payload.root ?? '')}
       onToggleTests={setTests}
       onSelectRoot={setRoot}
+      chosenDepth={depth}
+      onSelectDepth={setDepth}
       onSelect={(id) => (selected = id)}
     />
   {/if}

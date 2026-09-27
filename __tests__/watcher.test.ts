@@ -56,11 +56,22 @@ function waitFor(
 
 describe('FileWatcher', () => {
   let testDir: string;
+  const graphs = new Set<CodeGraph>();
+  const unitWatchers = new Set<FileWatcher>();
+
+  const initGraph = (...args: Parameters<typeof CodeGraph.initSync>) => {
+    const cg = CodeGraph.initSync(...args);
+    graphs.add(cg);
+    return cg;
+  };
 
   // Inert by default — unit tests drive events via __emitWatchEventForTests
   // and never depend on real OS watch delivery.
-  const newWatcher = (syncFn: SyncFn, opts: WatchOptions = {}) =>
-    new FileWatcher(testDir, syncFn, { inertForTests: true, ...opts });
+  const newWatcher = (syncFn: SyncFn, opts: WatchOptions = {}) => {
+    const watcher = new FileWatcher(testDir, syncFn, { inertForTests: true, ...opts });
+    unitWatchers.add(watcher);
+    return watcher;
+  };
 
   beforeEach(() => {
     testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-watcher-'));
@@ -70,7 +81,18 @@ describe('FileWatcher', () => {
     fs.writeFileSync(path.join(srcDir, 'index.ts'), 'export const x = 1;');
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // DB mutations become visible before async sync maintenance finishes.
+    // Stop new work and drain it BEFORE closing SQLite or removing the fixture;
+    // nested afterEach hooks run too late to protect this outer cleanup.
+    for (const watcher of unitWatchers) watcher.stop();
+    unitWatchers.clear();
+    for (const cg of graphs) {
+      cg.unwatch();
+      await waitFor(() => !cg.isIndexing(), 8000);
+      cg.close();
+    }
+    graphs.clear();
     __setFsWatchForTests(null); // reset the injected fs.watch seam
     vi.restoreAllMocks();
     if (fs.existsSync(testDir)) {
@@ -322,6 +344,53 @@ describe('FileWatcher', () => {
 
       watcher.stop();
     });
+
+    it('re-arms after lock contention and keeps the stale banner until a full catch-up (#1959)', async () => {
+      let finishCatchUp!: () => void;
+      const catchUp = new Promise<void>(resolve => { finishCatchUp = resolve; });
+      const syncFn = vi.fn().mockRejectedValue(new LockUnavailableError());
+      const watcher = newWatcher(syncFn, { debounceMs: 25 });
+      watcher.start();
+      try {
+        await watcher.waitUntilReady();
+        __emitWatchEventForTests(testDir, 'src/locked.ts');
+        await waitFor(() => watcher.isDegraded() && !watcher.isActive(), 8000);
+
+        syncFn.mockImplementation(async () => {
+          await catchUp;
+          return { filesChanged: 1, durationMs: 5 };
+        });
+        expect(watcher.rearmAfterLockContention()).toBe(true);
+        expect(watcher.isActive()).toBe(true);
+        expect(watcher.isDegraded()).toBe(true);
+        expect(watcher.rearmAfterLockContention()).toBe(false);
+        await waitFor(() => syncFn.mock.calls.length >= 7, 4000);
+        expect(syncFn.mock.calls.at(-1)?.[0]).toBeUndefined();
+        expect(watcher.isDegraded()).toBe(true);
+        finishCatchUp();
+        await waitFor(() => !watcher.isDegraded(), 4000);
+        expect(watcher.isActive()).toBe(true);
+      } finally {
+        finishCatchUp?.();
+        watcher.stop();
+      }
+    });
+
+    it('throttles a failed re-arm across tool calls (#1959)', async () => {
+      const syncFn = vi.fn().mockRejectedValue(new LockUnavailableError());
+      const watcher = newWatcher(syncFn, { debounceMs: 25 });
+      watcher.start();
+      try {
+        await watcher.waitUntilReady();
+        __emitWatchEventForTests(testDir, 'src/locked.ts');
+        await waitFor(() => watcher.isDegraded() && !watcher.isActive(), 8000);
+        expect(watcher.rearmAfterLockContention()).toBe(true);
+        await waitFor(() => watcher.isDegraded() && !watcher.isActive(), 8000);
+        expect(watcher.rearmAfterLockContention()).toBe(false);
+      } finally {
+        watcher.stop();
+      }
+    });
   });
 
   describe('persistent sync-failure degradation (#1127)', () => {
@@ -349,6 +418,7 @@ describe('FileWatcher', () => {
 
       expect(syncFn.mock.calls.length).toBeGreaterThanOrEqual(6); // MAX_SYNC_FAILURE_RETRIES + 1
       expect(watcher.isDegraded()).toBe(true);
+      expect(watcher.rearmAfterLockContention()).toBe(false);
       expect(onDegraded).toHaveBeenCalledTimes(1);
       expect(onDegraded).toHaveBeenCalledWith(expect.stringContaining('auto-sync disabled'));
       // The degrade reason carries the underlying error so the user can act.
@@ -482,7 +552,7 @@ describe('FileWatcher', () => {
       fs.mkdirSync(deep, { recursive: true });
       fs.writeFileSync(path.join(deep, 'inner.ts'), 'export const i = 2;');
 
-      const cg = CodeGraph.initSync(testDir);
+      const cg = initGraph(testDir);
       await cg.indexAll();
       const before = cg.getFiles().map((f) => f.path);
       expect(before).toContain('docs/a/b/inner.ts');
@@ -507,7 +577,6 @@ describe('FileWatcher', () => {
       expect(after.some((p) => p.startsWith('docs/'))).toBe(false);
 
       watcher.stop();
-      cg.close();
     });
 
     it('should ignore .codegraph directory changes', async () => {
@@ -865,12 +934,8 @@ describe('FileWatcher', () => {
   describe('CodeGraph integration', () => {
     let cg: CodeGraph;
 
-    afterEach(() => {
-      if (cg) cg.close();
-    });
-
     it('should watch and unwatch via CodeGraph API', async () => {
-      cg = CodeGraph.initSync(testDir, {
+      cg = initGraph(testDir, {
         config: { include: ['**/*.ts'], exclude: [] },
       });
       await cg.indexAll();
@@ -886,7 +951,7 @@ describe('FileWatcher', () => {
     });
 
     it('should stop watching on close', async () => {
-      cg = CodeGraph.initSync(testDir, {
+      cg = initGraph(testDir, {
         config: { include: ['**/*.ts'], exclude: [] },
       });
       await cg.indexAll();
@@ -903,7 +968,7 @@ describe('FileWatcher', () => {
     it('should auto-sync when files change while watching (real fs.watch end-to-end)', async () => {
       // The one test that exercises the genuine native watcher: a real file
       // write must propagate through fs.watch → debounce → sync into the graph.
-      cg = CodeGraph.initSync(testDir, {
+      cg = initGraph(testDir, {
         config: { include: ['**/*.ts'], exclude: [] },
       });
       await cg.indexAll();
@@ -932,6 +997,161 @@ describe('FileWatcher', () => {
       expect(results.length).toBeGreaterThan(0);
 
       cg.unwatch();
+    });
+
+  });
+
+  describe('symlink directory watching (#770)', () => {
+    let cg: CodeGraph | undefined;
+    const externalDirs: string[] = [];
+    const watchers: FileWatcher[] = [];
+    const external = () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-linked-'));
+      externalDirs.push(dir);
+      return dir;
+    };
+    // Junctions exercise Windows directory links without requiring symlink privileges.
+    const link = (target: string, name: string) =>
+      fs.symlinkSync(target, name, process.platform === 'win32' ? 'junction' : 'dir');
+    const has = (name: string) => cg!.getNodesByName(name).length > 0;
+    const start = async () => {
+      cg = initGraph(testDir, { config: { include: ['**/*.ts'], exclude: [] } });
+      await cg.indexAll();
+      expect(cg.watch({ debounceMs: 100 })).toBe(true);
+      // FSEvents can coalesce writes made while a new stream is being registered.
+      await new Promise(resolve => setTimeout(resolve, 700));
+    };
+
+    afterEach(() => {
+      cg = undefined;
+      for (const watcher of watchers.splice(0)) watcher.stop();
+      for (const dir of externalDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+      vi.unstubAllEnvs();
+    });
+
+    it('auto-syncs edits, creates and deletes through an external directory link', async () => {
+      const dir = external();
+      fs.mkdirSync(path.join(dir, 'src'));
+      const file = path.join(dir, 'src', 'item.ts');
+      fs.writeFileSync(file, 'export function linkedBefore() {}');
+      link(dir, path.join(testDir, 'linked-project'));
+      await start();
+      expect(has('linkedBefore')).toBe(true);
+      fs.writeFileSync(file, 'export function linkedAfter() {}');
+      await waitFor(() => has('linkedAfter') && !has('linkedBefore'), 8000);
+      expect(cg!.getNodesByName('linkedAfter')[0].filePath).toBe('linked-project/src/item.ts');
+      fs.mkdirSync(path.join(dir, 'new'));
+      fs.writeFileSync(path.join(dir, 'new', 'added.ts'), 'export function linkedAdded() {}');
+      await waitFor(() => has('linkedAdded'), 8000);
+      fs.unlinkSync(file);
+      await waitFor(() => !has('linkedAfter'), 8000);
+    }, 30000);
+
+    it('watches both targets of a real cycle and deduplicates aliases', async () => {
+      const a = external();
+      const b = external();
+      link(b, path.join(a, 'toB'));
+      link(a, path.join(b, 'toA'));
+      link(testDir, path.join(a, 'toRoot'));
+      link(a, path.join(testDir, 'linked'));
+      link(a, path.join(testDir, 'duplicate'));
+      await start();
+      fs.writeFileSync(path.join(a, 'a.ts'), 'export function cycleAddedA() {}');
+      fs.writeFileSync(path.join(b, 'b.ts'), 'export function cycleAddedB() {}');
+      await waitFor(() => has('cycleAddedA') && has('cycleAddedB'), 8000);
+      expect(cg!.getNodesByName('cycleAddedA')).toHaveLength(1);
+      expect(cg!.getNodesByName('cycleAddedB')).toHaveLength(1);
+    }, 15000);
+
+    it('discovers new links, retargets them, removes stale paths and restarts', async () => {
+      const a = external();
+      const b = external();
+      fs.writeFileSync(path.join(a, 'a.ts'), 'export function firstTarget() {}');
+      fs.writeFileSync(path.join(b, 'b.ts'), 'export function secondTarget() {}');
+      await start();
+      const alias = path.join(testDir, 'linked');
+      link(a, alias);
+      await waitFor(() => has('firstTarget'), 8000);
+      fs.unlinkSync(alias);
+      link(b, alias);
+      await waitFor(() => has('secondTarget') && !has('firstTarget'), 8000);
+      fs.writeFileSync(path.join(b, 'b.ts'), 'export function retargetEdit() {}');
+      await waitFor(() => has('retargetEdit'), 8000);
+      cg!.unwatch();
+      expect(cg!.watch({ debounceMs: 100 })).toBe(true);
+      fs.writeFileSync(path.join(b, 'b.ts'), 'export function restartedEdit() {}');
+      await waitFor(() => has('restartedEdit'), 8000);
+      fs.unlinkSync(alias);
+      await waitFor(() => !has('restartedEdit'), 8000);
+    }, 45000);
+
+    it('refreshes excluded link scope without watching ignored targets', async () => {
+      const dir = external();
+      link(dir, path.join(testDir, 'linked'));
+      fs.writeFileSync(path.join(dir, 'a.ts'), 'export function scopeLinked() {}');
+      fs.writeFileSync(path.join(testDir, '.gitignore'), 'linked/\n');
+      await start();
+      expect(has('scopeLinked')).toBe(false);
+      fs.writeFileSync(path.join(testDir, '.gitignore'), '');
+      await waitFor(() => has('scopeLinked'), 8000);
+      fs.writeFileSync(path.join(dir, 'a.ts'), 'export function scopeEdited() {}');
+      await waitFor(() => has('scopeEdited'), 8000);
+      fs.writeFileSync(path.join(testDir, '.gitignore'), 'linked/\n');
+      await waitFor(() => !has('scopeEdited'), 8000);
+    }, 30000);
+
+    it('bounds watch handles, skips ignored targets and closes every handle on stop', () => {
+      const dir = external();
+      link(dir, path.join(testDir, 'linked'));
+      link(dir, path.join(testDir, 'duplicate'));
+      link(testDir, path.join(dir, 'cycle'));
+      const ignored = external();
+      link(ignored, path.join(testDir, 'node_modules'));
+      const opened: string[] = [];
+      const closed: string[] = [];
+      __setFsWatchForTests(((dir: fs.PathLike) => {
+        opened.push(String(dir));
+        const w = new EventEmitter() as fs.FSWatcher;
+        w.close = () => { closed.push(String(dir)); };
+        return w;
+      }) as typeof fs.watch);
+      const watcher = new FileWatcher(testDir, async () => ({ filesChanged: 0, durationMs: 0 }));
+      watchers.push(watcher);
+      expect(watcher.start()).toBe(true);
+      expect(opened.some(d => d.includes('node_modules'))).toBe(false);
+      expect(opened.filter(d => fs.realpathSync(d) === fs.realpathSync(dir))).toHaveLength(1);
+      watcher.stop();
+      expect(closed.sort()).toEqual(opened.sort());
+      expect(watcher.start()).toBe(true);
+      watcher.stop();
+      expect(closed.sort()).toEqual(opened.sort());
+    });
+
+    it.runIf(process.platform === 'darwin' || process.platform === 'win32')('caps supplemental recursive streams and degrades on their exhaustion', () => {
+      link(external(), path.join(testDir, 'first'));
+      link(external(), path.join(testDir, 'second'));
+      vi.stubEnv('CODEGRAPH_MAX_DIR_WATCHES', '1');
+      const close = vi.fn();
+      const watch = vi.fn(() => {
+        const w = new EventEmitter() as fs.FSWatcher;
+        w.close = close;
+        return w;
+      });
+      __setFsWatchForTests(watch as typeof fs.watch);
+      const watcher = new FileWatcher(testDir, async () => ({ filesChanged: 0, durationMs: 0 }));
+      watchers.push(watcher);
+      expect(watcher.start()).toBe(true);
+      expect(watch).toHaveBeenCalledTimes(2); // root + capped supplemental stream
+      watcher.stop();
+      expect(close).toHaveBeenCalledTimes(2);
+      watch.mockImplementationOnce(() => {
+        const w = new EventEmitter() as fs.FSWatcher;
+        w.close = close;
+        return w;
+      }).mockImplementation(() => { throw Object.assign(new Error('EMFILE'), { code: 'EMFILE' }); });
+      expect(watcher.start()).toBe(false);
+      expect(watcher.isDegraded()).toBe(true);
+      expect(close).toHaveBeenCalledTimes(3);
     });
   });
 
@@ -966,6 +1186,101 @@ describe('FileWatcher', () => {
       watcher.stop();
       expect(calls.length).toBeGreaterThan(0);
       expect(calls[0]).toBeUndefined();
+    });
+
+    it.each([
+      ['lock contention', () => new LockUnavailableError()],
+      ['sync failure', () => new Error('injected sync failure')],
+    ])('retries a full-only directory removal after %s (#1964)', async (_case, failure) => {
+      const syncFn = vi.fn()
+        .mockRejectedValueOnce(failure())
+        .mockResolvedValue({ filesChanged: 0, durationMs: 5 });
+      const watcher = newWatcher(syncFn, { debounceMs: 25 });
+      watcher.start();
+      try {
+        await watcher.waitUntilReady();
+        __emitWatchEventForTests(testDir, 'src/removed-dir');
+        await waitFor(() => syncFn.mock.calls.length >= 2, 4000);
+        expect(syncFn.mock.calls.map(call => call[0])).toEqual([undefined, undefined]);
+      } finally {
+        watcher.stop();
+      }
+    });
+
+    it('follows a scoped sync with a full scan when a directory is removed mid-sync (#1964)', async () => {
+      let release!: () => void;
+      const firstRun = new Promise<void>(resolve => { release = resolve; });
+      const calls: (string[] | undefined)[] = [];
+      const syncFn: SyncFn = async paths => {
+        calls.push(paths);
+        if (calls.length === 1) await firstRun;
+        return { filesChanged: 0, durationMs: 5 };
+      };
+      const watcher = newWatcher(syncFn, { debounceMs: 25 });
+      watcher.start();
+      try {
+        await watcher.waitUntilReady();
+        fs.writeFileSync(path.join(testDir, 'src', 'a.ts'), 'export const a = 1;');
+        __emitWatchEventForTests(testDir, 'src/a.ts');
+        await waitFor(() => calls.length === 1, 4000);
+        __emitWatchEventForTests(testDir, 'src/removed-dir');
+        release();
+        await waitFor(() => calls.length >= 2, 4000);
+        expect(calls).toEqual([['src/a.ts'], undefined]);
+      } finally {
+        release();
+        watcher.stop();
+      }
+    });
+
+    it('follows a scoped sync with a full scan when scope changes mid-sync (#1964)', async () => {
+      let release!: () => void;
+      const firstRun = new Promise<void>(resolve => { release = resolve; });
+      const calls: (string[] | undefined)[] = [];
+      const syncFn: SyncFn = async paths => {
+        calls.push(paths);
+        if (calls.length === 1) await firstRun;
+        return { filesChanged: 0, durationMs: 5 };
+      };
+      const watcher = newWatcher(syncFn, { debounceMs: 25 });
+      watcher.start();
+      try {
+        await watcher.waitUntilReady();
+        fs.writeFileSync(path.join(testDir, 'src', 'a.ts'), 'export const a = 1;');
+        __emitWatchEventForTests(testDir, 'src/a.ts');
+        await waitFor(() => calls.length === 1, 4000);
+        fs.writeFileSync(path.join(testDir, '.gitignore'), 'src/ignored/\n');
+        __emitWatchEventForTests(testDir, '.gitignore');
+        release();
+        await waitFor(() => calls.length >= 2, 4000);
+        expect(calls).toEqual([['src/a.ts'], undefined]);
+      } finally {
+        release();
+        watcher.stop();
+      }
+    });
+
+    it('reconciles again when directory topology changes during a full sync', async () => {
+      let release!: () => void;
+      const firstRun = new Promise<void>(resolve => { release = resolve; });
+      const calls: (string[] | undefined)[] = [];
+      const watcher = newWatcher(async paths => {
+        calls.push(paths);
+        if (calls.length === 1) await firstRun;
+        return { filesChanged: 0, durationMs: 1 };
+      }, { debounceMs: 25 });
+      watcher.start();
+      try {
+        __emitWatchEventForTests(testDir, 'removed-link');
+        await waitFor(() => calls.length === 1);
+        __emitWatchEventForTests(testDir, 'another-removed-link');
+        release();
+        await waitFor(() => calls.length === 2);
+        expect(calls).toEqual([undefined, undefined]);
+      } finally {
+        release();
+        watcher.stop();
+      }
     });
 
     it('a lone file event fires on the quick window, well before the full debounce', async () => {

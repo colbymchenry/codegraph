@@ -29,6 +29,23 @@ export function generateNodeId(
   return `${kind}:${hash}`;
 }
 
+/** Per-extraction identities: preserve legacy IDs unless distinct source positions collide. */
+export class NodeIdAllocator {
+  private firstColumns = new Map<string, number>();
+
+  generate(filePath: string, kind: NodeKind, name: string, line: number, column: number): string {
+    const id = generateNodeId(filePath, kind, name, line);
+    const firstColumn = this.firstColumns.get(id);
+    if (firstColumn === undefined) {
+      this.firstColumns.set(id, column);
+      return id;
+    }
+    // Columns are zero-based UTF-16 code units in both wasm and the kernel.
+    // Revisiting the same declaration must still produce the same identity.
+    return firstColumn === column ? id : `${id}:${column}`;
+  }
+}
+
 /**
  * Extract text from a syntax node
  */

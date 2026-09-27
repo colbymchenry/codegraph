@@ -339,6 +339,7 @@ export function buildOrderModel(payload: WireStepsPayload): StepsModel | null {
       generatedFiles: [],
       facade: false,
       fileList: { total: 1, shown: 1, truncated: false, items: [step.node?.file ?? step.sub] },
+      dependents: { files: 0, modules: 0 },
     });
   }
   // Each decision is a point of its own on the canvas: a small box asking the
@@ -357,6 +358,7 @@ export function buildOrderModel(payload: WireStepsPayload): StepsModel | null {
       generatedFiles: [],
       facade: false,
       fileList: { total: 0, shown: 0, truncated: false, items: [] },
+      dependents: { files: 0, modules: 0 },
     });
   }
   const drawn = (id: string): boolean => nodes.has(id) || forks.has(id);
@@ -422,8 +424,24 @@ export function buildOrderModel(payload: WireStepsPayload): StepsModel | null {
   const polylines = new Map<string, Point[]>();
   for (const [id, curve] of curves) polylines.set(id, samplePolyline(curve, HIT_SAMPLES));
   // The order reading needs no regions: its rows already say when. Its
-  // decisions are points between steps, not captions under a box.
-  return { layout, nodes, edges, layerGap: SCREEN_LAYER_GAP, curves, polylines, counts, regions: null, regionEntries: null, forks, decisions: [] };
+  // decisions are points between steps, not captions under a box. It keeps
+  // every line: a reading of when things happen is the lines, and its rows are
+  // short enough that they stay local — `stubbed` empty leaves the filter be.
+  return {
+    layout,
+    nodes,
+    edges,
+    layerGap: SCREEN_LAYER_GAP,
+    curves,
+    polylines,
+    counts,
+    regions: null,
+    regionEntries: null,
+    forks,
+    decisions: [],
+    stubs: new Map(),
+    stubbed: new Set(),
+  };
 }
 
 /**

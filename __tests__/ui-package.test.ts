@@ -42,6 +42,7 @@ import {
   setNavigationDriver,
   symbolHref,
   trail,
+  resolveTrailNames,
   type GraphAdapter,
   type NavigationDriver,
   type WireFlowPayload,
@@ -674,6 +675,46 @@ describe('@colbymchenry/codegraph-ui — the seams', () => {
     expect(symbolHref('function:x')).toBe('#/s/function%3Ax');
   });
 
+  it('gives the Symbol tab an address of its own when no symbol is chosen', async () => {
+    const { parseHash } = await import('../ui/src/lib/router.svelte');
+
+    // The regression this pins: the tab used to fall back to `#/`, and `#/` is
+    // the landing page — which renders the SCREENS tab on any project that has
+    // screens. Clicking Symbol landed you on somebody else's view.
+    expect(symbolHref(null)).toBe('#/s');
+    expect(parseHash('#/').route.view).toBe('home');
+
+    const empty = parseHash(symbolHref(null)).route;
+    expect(empty.view).toBe('symbol');
+    expect(empty).toMatchObject({ view: 'symbol', id: null });
+
+    // …and a chosen symbol still round-trips, id and all.
+    const chosen = parseHash(symbolHref('function:x')).route;
+    expect(chosen).toMatchObject({ view: 'symbol', id: 'function:x' });
+  });
+
+  it('sends every nav tab to its own view', async () => {
+    const { parseHash } = await import('../ui/src/lib/router.svelte');
+    const { entryHref, screensHref, stepsHref, deadHref } = await import(
+      '../ui/src/lib/navigation'
+    );
+
+    // One href per tab in the top bar, each parsed back. A tab whose link
+    // resolves to a different tab's view is the bug above, in general form.
+    const tabs: Array<[string, string]> = [
+      ['screens', screensHref()],
+      ['steps', stepsHref()],
+      ['entry', entryHref()],
+      ['map', mapHref()],
+      ['symbol', symbolHref(null)],
+      ['flow', flowHref()],
+      ['dead', deadHref()],
+    ];
+    for (const [view, href] of tabs) {
+      expect(parseHash(href).route.view, `${href} should open the ${view} view`).toBe(view);
+    }
+  });
+
   it('the default adapter is the loopback JSON API and asks for `api/...`', async () => {
     const asked: string[] = [];
     const adapter = createHttpAdapter({
@@ -742,5 +783,41 @@ describe('@colbymchenry/codegraph-ui — the published shape', () => {
     // The canvas library is a real dependency: the Map and the Flow strip are
     // unusable without it and a host must not have to know its version.
     expect(manifest.dependencies['@xyflow/svelte']).toBeDefined();
+  });
+});
+
+describe('a long trail (#1976)', () => {
+  it('keeps at most the 64 hops the store saves and /api/flow reads, dropping the oldest', () => {
+    for (let i = 0; i < 70; i++) trail.push({ id: `function:h${i}` });
+    expect(trail.hops).toHaveLength(64);
+    expect(trail.hops[0]?.id).toBe('function:h6');
+    expect(trail.hops[63]?.id).toBe('function:h69');
+  });
+
+  it('asks for its names in batches /api/nodes accepts', async () => {
+    const { adapter } = mockAdapter();
+    const batches: number[] = [];
+    adapter.nodes = (ids) => {
+      batches.push(ids.length);
+      const items = ids.map(
+        (id) =>
+          ({
+            id,
+            kind: 'function',
+            name: id.slice('function:'.length),
+            qualifiedName: id,
+            file: 'src/a.ts',
+            line: 1,
+            endLine: 1,
+            language: 'typescript',
+          }) as WireNodeRef
+      );
+      return Promise.resolve({ items, missing: [] });
+    };
+    setGraphAdapter(adapter);
+    for (let i = 0; i < 64; i++) trail.push({ id: `function:h${i}` });
+    await resolveTrailNames();
+    expect(batches).toEqual([60, 4]);
+    expect(trail.hops.every((hop) => hop.name)).toBe(true);
   });
 });

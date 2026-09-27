@@ -306,7 +306,8 @@ describe('React Native cross-platform pairing — end to end', () => {
     fs.writeFileSync(path.join(dir, 'package.json'), '{"dependencies":{"react-native":"^0.74.0"}}');
     fs.writeFileSync(path.join(dir, 'index.ts'),
       "import { NativeModules } from 'react-native';\n" +
-      "export function ping() { return NativeModules.RNThing.uniquePingMethod(); }\n");
+      "export function ping() { return NativeModules.RNThing.uniquePingMethod(); }\n" +
+      "export function wrongModule() { return NativeModules.Missing.uniquePingMethod(); }\n");
     fs.writeFileSync(path.join(dir, 'RNThing.java'),
       "public class RNThing extends ReactContextBaseJavaModule {\n" +
       "  @Override public String getName() { return \"RNThing\"; }\n" +
@@ -336,6 +337,8 @@ describe('React Native cross-platform pairing — end to end', () => {
          AND s.name LIKE 'uniquePingMethod%' AND t.name LIKE 'uniquePingMethod%'
          AND s.language != t.language`
     ).get();
+    const wrong = cg.getNodesByKind('function').find(n => n.name === 'wrongModule')!;
+    expect(cg.getOutgoingEdges(wrong.id).filter(e => e.kind === 'calls')).toEqual([]);
     cg.close?.();
     expect(pair.c).toBeGreaterThanOrEqual(2); // java<->objc both directions
   });

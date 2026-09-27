@@ -363,3 +363,54 @@ describe('migration v6: dedup edges + add identity index on upgrade (#1034)', ()
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });
+
+describe('edge traversal order', () => {
+  let dir: string;
+  let db: DatabaseConnection;
+  let q: QueryBuilder;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'db-edge-order-'));
+    db = DatabaseConnection.initialize(path.join(dir, 'test.db'));
+    q = new QueryBuilder(db.getDb());
+    q.insertNodes(['hub', 'file:a', 'function:b', 'function:z'].map(id => makeNode(id)));
+  });
+
+  afterEach(() => {
+    db.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it.each(['incoming', 'outgoing'] as const)
+  ('keeps calls ahead of imports with deterministic %s ties across rewrites', direction => {
+    const peerKey = direction === 'incoming' ? 'source' : 'target';
+    const hubKey = direction === 'incoming' ? 'target' : 'source';
+    const shapes: Array<[string, Edge['kind'], number, number]> = [
+      ['function:z', 'calls', 4, 2],
+      ['file:a', 'imports', 1, 0],
+      ['function:b', 'calls', 7, 2],
+      ['file:a', 'references', 2, 0],
+      ['function:b', 'calls', 3, 2],
+      ['function:b', 'calls', 3, 1],
+    ];
+    const edges: Edge[] = shapes.map(([peer, kind, line, column]) => ({
+      source: '', target: '', [hubKey]: 'hub', [peerKey]: peer,
+      kind, line, column, provenance: 'tree-sitter',
+    }));
+    const expected = [shapes[5], shapes[4], shapes[2], shapes[0], shapes[1], shapes[3]];
+    for (const insertionOrder of [edges, [...edges].reverse()]) {
+      db.getDb().exec('DELETE FROM edges');
+      q.insertEdges(insertionOrder);
+      // Exercise both the cached unfiltered query and the dynamic filtered one.
+      for (const kinds of [undefined, ['references', 'imports', 'calls'] as Edge['kind'][]]) {
+        const result = direction === 'incoming'
+          ? q.getIncomingEdges('hub', kinds) : q.getOutgoingEdges('hub', kinds);
+        expect(result.map(edge => [edge[peerKey], edge.kind, edge.line, edge.column])).toEqual(expected);
+      }
+      if (direction === 'outgoing') {
+        expect(q.getOutgoingEdges('hub', undefined, 'tree-sitter')
+          .map(edge => [edge[peerKey], edge.kind, edge.line, edge.column])).toEqual(expected);
+      }
+    }
+  });
+});

@@ -93,6 +93,12 @@ fn has_lower_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"[a-z]").unwrap())
 }
+fn single_arg_macro_replacement_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(
+        r"^(?:[A-Za-z_][A-Za-z0-9_:]*[ \t\r\n]+)+[*& \t\r\n]*([A-Za-z_][A-Za-z0-9_]*)[ \t\r\n]*\([^(){};#]*\)[ \t\r\n]*$"
+    ).unwrap())
+}
 /// normalizeCppReturnType: smart-pointer/optional unwrap.
 fn ret_wrapper_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -337,6 +343,7 @@ pub struct Walker<'t> {
     variant: Variant,
     line_starts: Vec<usize>,
     arena: Arena,
+    node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
     stack: Vec<Scope>,
     nodes_meta: Vec<NodeMeta>,
@@ -382,6 +389,7 @@ pub fn extract(file_path: &str, source: &str, language: &str) -> Result<EmitOut,
         variant,
         line_starts: util::line_starts(source),
         arena: Arena::default(),
+        node_id_allocator: ids::NodeIdAllocator::default(),
         tables: Tables::default(),
         stack: Vec::new(),
         nodes_meta: Vec::new(),
@@ -489,7 +497,8 @@ impl<'t> Walker<'t> {
             return None;
         }
         let start_line = self.line_of(node);
-        let id = ids::node_id(self.file_path, kind, name, start_line);
+        let column = self.col_of(node);
+        let id = self.node_id_allocator.generate(self.file_path, kind, name, start_line, column);
         // (c/cpp define no resolveBody hook, so createNode's endLine extension
         // for sibling-body grammars never fires — endLine is the node's own.)
         let end_line = node.end_position().row as u32 + 1;
@@ -593,6 +602,9 @@ impl<'t> Walker<'t> {
     /// extractNameRaw for the c/cpp extractor configs (nameField 'declarator';
     /// cpp resolveName = extractCppQualifiedMethodName).
     fn extract_name_raw(&self, node: Node) -> String {
+        if let Some(name) = self.recover_single_arg_macro_defined_name(node) {
+            return name;
+        }
         if self.variant == Variant::Cpp {
             if let Some(hook) = self.extract_cpp_qualified_method_name(node) {
                 return hook;
@@ -648,6 +660,84 @@ impl<'t> Walker<'t> {
         let text = self.text(qid).trim();
         let parts: Vec<&str> = text.split("::").filter(|p| !p.is_empty()).collect();
         parts.last().map(|s| s.to_string())
+    }
+
+    /// recoverSingleArgMacroDefinedName: only a local macro definition proves
+    /// that its argument is the function name, in either parser shape (#1373).
+    fn recover_single_arg_macro_defined_name(&self, node: Node) -> Option<String> {
+        if node.kind() != "function_definition" {
+            return None;
+        }
+        let declarator = node.child_by_field_name("declarator")?;
+        let (macro_node, argument) = if declarator.kind() == "parenthesized_declarator"
+            && declarator.named_child_count() == 1
+        {
+            let m = node.child_by_field_name("type")?;
+            let a = declarator.named_child(0)?;
+            if m.kind() != "type_identifier" || a.kind() != "identifier" {
+                return None;
+            }
+            (m, a)
+        } else if declarator.kind() == "function_declarator"
+            && node.child_by_field_name("type").is_none()
+        {
+            let m = declarator.child_by_field_name("declarator")?;
+            let params = declarator.child_by_field_name("parameters")?;
+            let param = params.named_child(0)?;
+            if m.kind() != "identifier" || params.named_child_count() != 1
+                || param.kind() != "parameter_declaration" || param.named_child_count() != 1
+            {
+                return None;
+            }
+            let a = param.named_child(0)?;
+            if a.kind() != "type_identifier" {
+                return None;
+            }
+            (m, a)
+        } else {
+            return None;
+        };
+        let macro_name = self.text(macro_node);
+        let mut scope = Some(node);
+        while let Some(current) = scope {
+            if current.kind() == "preproc_else" || current.kind().starts_with("preproc_elif") {
+                return None;
+            }
+            let mut previous = current.prev_named_sibling();
+            while let Some(prev) = previous {
+                previous = prev.prev_named_sibling();
+                if prev.kind().starts_with("preproc_if") {
+                    return None;
+                }
+                if prev.kind() == "preproc_call"
+                    && prev.child_by_field_name("directive").map(|n| self.text(n)) == Some("#undef")
+                    && prev.child_by_field_name("argument").map(|n| self.text(n).trim()) == Some(macro_name)
+                {
+                    return None;
+                }
+                if !matches!(prev.kind(), "preproc_function_def" | "preproc_def")
+                    || prev.child_by_field_name("name").map(|n| self.text(n)) != Some(macro_name)
+                {
+                    continue;
+                }
+                let params = prev.child_by_field_name("parameters")?;
+                let param = params.named_child(0)?;
+                let value = prev.child_by_field_name("value")?;
+                if params.named_child_count() != 1 || param.kind() != "identifier" {
+                    return None;
+                }
+                let replacement = self.text(value).replace("\\\r\n", " ").replace("\\\n", " ");
+                let captures = single_arg_macro_replacement_re().captures(replacement.trim())?;
+                if replacement.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').any(|s| s == "typedef")
+                    || captures.get(1)?.as_str() != self.text(param)
+                {
+                    return None;
+                }
+                return Some(self.text(argument).to_string());
+            }
+            scope = current.parent();
+        }
+        None
     }
 
     /// recoverCppMacroDefinedName (languages/c-cpp.ts:49).
@@ -818,6 +908,18 @@ impl<'t> Walker<'t> {
         let kind = node.kind();
         let mut skip_children = false;
 
+        // C/C++ function-like macros become `constant` nodes carrying the
+        // directive as their signature — a value, never a callee (#1838).
+        // Mirrors tree-sitter.ts visitNode.
+        if kind == "preproc_function_def" {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let name = self.text(name_node).to_string();
+                let signature = Some(self.text(node).trim().to_string());
+                self.create_node("constant", &name, node, Extra { signature, ..Extra::default() });
+            }
+            return;
+        }
+
         // C++ namespace blocks: prefix-only, no node (#1291/#1093). Anonymous
         // namespaces fall through to the generic walk.
         if self.variant == Variant::Cpp && kind == "namespace_definition" {
@@ -839,7 +941,10 @@ impl<'t> Walker<'t> {
 
         self.maybe_capture_fn_refs(node);
 
-        if kind == "function_definition" {
+        if self.is_cpp_constructor_declaration(node) {
+            self.extract_method(node);
+            skip_children = true;
+        } else if kind == "function_definition" {
             // functionTypes for both; cpp's methodTypes also lists it, so
             // inside a class-like scope it extracts as a method.
             if self.inside_class_like() && self.variant == Variant::Cpp {
@@ -926,6 +1031,7 @@ impl<'t> Walker<'t> {
 
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
+            signature: self.constructor_signature(node),
             visibility: if self.variant == Variant::Cpp { self.visibility_of(node) } else { None },
             return_type: self.return_type_of(node),
             ..Extra::default()
@@ -962,6 +1068,7 @@ impl<'t> Walker<'t> {
 
         let extra = Extra {
             docstring: preceding_docstring(node, self.src),
+            signature: self.constructor_signature(node),
             visibility: if self.variant == Variant::Cpp { self.visibility_of(node) } else { None },
             is_abstract: if self.variant == Variant::Cpp && self.is_cpp_pure_virtual_method_decl(node) {
                 Some(true)
@@ -1454,27 +1561,117 @@ impl<'t> Walker<'t> {
         }
     }
 
-    /// isCppStackConstruction (#1035).
-    fn is_cpp_stack_construction(&self, node: Node) -> bool {
-        let Some(type_node) = node.child_by_field_name("type") else { return false };
+    fn is_cpp_constructor_declaration(&self, node: Node<'t>) -> bool {
+        if self.variant != Variant::Cpp || node.kind() != "declaration" || node.child_by_field_name("type").is_some() {
+            return false;
+        }
+        let Some(owner) = node.parent().and_then(|p| p.parent()) else { return false };
+        if !matches!(owner.kind(), "class_specifier" | "struct_specifier" | "union_specifier") { return false; }
+        let Some(decl) = node.child_by_field_name("declarator") else { return false };
+        decl.kind() == "function_declarator" && decl.child_by_field_name("declarator").map(|n| self.text(n))
+            == owner.child_by_field_name("name").map(|n| self.text(n))
+    }
+
+    /// cppExtractor.getSignature (languages/c-cpp.ts): a C++ constructor
+    /// definition or class-body prototype carries its parameter
+    /// list as the signature so a local `T obj(args)` can pick the overload
+    /// by arity (#1839); a trailing semicolon marks a prototype. Macro-shaped definitions whose real name was
+    /// recovered from an argument are excluded.
+    fn constructor_signature(&self, node: Node<'t>) -> Option<String> {
+        if self.variant != Variant::Cpp || (node.kind() != "function_definition" && !self.is_cpp_constructor_declaration(node)) {
+            return None;
+        }
+        if node.child_by_field_name("type").is_some() || self.recover_cpp_macro_defined_name(node).is_some() {
+            return None;
+        }
+        let params = node.child_by_field_name("declarator")?.child_by_field_name("parameters")?;
+        Some(format!("{}{}", self.text(params), if node.kind() == "declaration" { ";" } else { "" }))
+    }
+
+    /// cppStackConstructions (tree-sitter.ts, #1035 / #1839): whether the
+    /// declaration constructs with arguments (→ `instantiates`), and one
+    /// arity per constructed object (→ `calls T::T/arity`). `extern`,
+    /// pointer / reference / function declarators construct nothing; an
+    /// array's braces hold elements, not constructor arguments.
+    fn cpp_stack_constructions(&self, node: Node<'t>) -> (bool, Vec<usize>) {
+        let none = (false, Vec::new());
+        let Some(type_node) = node.child_by_field_name("type") else { return none };
         if !matches!(
             type_node.kind(),
             "type_identifier" | "template_type" | "qualified_identifier"
         ) {
-            return false;
+            return none;
         }
+        let mut instantiates = false;
+        let mut arities = Vec::new();
         for i in 0..node.named_child_count() {
             let Some(child) = node.named_child(i) else { continue };
+            if child.kind() == "storage_class_specifier" && self.text(child) == "extern" {
+                return none;
+            }
+            if matches!(child.kind(), "identifier" | "array_declarator") {
+                if child.kind() == "array_declarator" && !self.cpp_object_array(child) { continue; }
+                arities.push(0);
+                continue;
+            }
             if child.kind() != "init_declarator" {
                 continue;
             }
-            if let Some(value) = child.child_by_field_name("value") {
-                if matches!(value.kind(), "argument_list" | "initializer_list") {
-                    return true;
+            let Some(declarator) = child.child_by_field_name("declarator") else { continue };
+            if !matches!(declarator.kind(), "identifier" | "array_declarator") {
+                continue;
+            }
+            let Some(value) = child.child_by_field_name("value") else { continue };
+            if !matches!(value.kind(), "argument_list" | "initializer_list") {
+                continue;
+            }
+            instantiates = true;
+            if declarator.kind() == "identifier" {
+                let count = (0..value.named_child_count())
+                    .filter(|&j| value.named_child(j).map(|n| n.kind() != "comment").unwrap_or(false))
+                    .count();
+                arities.push(count);
+            } else if self.cpp_object_array(declarator) {
+                let mut dimensions = Vec::new();
+                let mut array = Some(declarator);
+                while let Some(n) = array.filter(|n| n.kind() == "array_declarator") {
+                    dimensions.insert(0, n.child_by_field_name("size").map(|s| self.text(s))
+                        .filter(|s| s.bytes().all(|b| b.is_ascii_digit()))
+                        .and_then(|s| s.parse::<usize>().ok()).filter(|&n| n <= 9_007_199_254_740_991));
+                    array = n.child_by_field_name("declarator");
                 }
+                Self::cpp_array_arities(value, &dimensions, &mut arities);
             }
         }
-        false
+        (instantiates, arities)
+    }
+
+    fn cpp_array_arities(list: Node<'t>, dimensions: &[Option<usize>], arities: &mut Vec<usize>) {
+        let entries: Vec<_> = (0..list.named_child_count()).filter_map(|j| list.named_child(j))
+            .filter(|n| n.kind() != "comment").collect();
+        let mut elided = false;
+        for entry in &entries {
+            if dimensions.len() > 1 {
+                if entry.kind() == "initializer_list" { Self::cpp_array_arities(*entry, &dimensions[1..], arities); }
+                else { elided = true; }
+            } else {
+                arities.push(if entry.kind() == "initializer_list" {
+                    (0..entry.named_child_count()).filter_map(|j| entry.named_child(j))
+                        .filter(|n| n.kind() != "comment").count()
+                } else { 1 });
+            }
+        }
+        if !elided && (entries.is_empty() || dimensions[0].map(|n| n > entries.len()).unwrap_or(false)) {
+            arities.push(0);
+        }
+    }
+
+    fn cpp_object_array(&self, node: Node<'t>) -> bool {
+        let mut element = node.child_by_field_name("declarator");
+        while element.map(|n| n.kind() == "array_declarator").unwrap_or(false) {
+            element = element.and_then(|n| n.child_by_field_name("declarator"));
+        }
+        element.map(|n| n.kind() == "identifier").unwrap_or(false)
     }
 
     /// recordCppFnPtrBinding (tree-sitter.ts:5089).
@@ -1570,6 +1767,11 @@ impl<'t> Walker<'t> {
     fn visit_for_calls_and_structure(&mut self, node: Node<'t>) {
         stack_guard!();
         let kind = node.kind();
+        // A function-like macro defined inside a body is still a macro (#1838).
+        if kind == "preproc_function_def" {
+            self.visit_node(node);
+            return;
+        }
         self.maybe_capture_fn_refs(node);
 
         if kind == "call_expression" {
@@ -1578,12 +1780,25 @@ impl<'t> Walker<'t> {
             self.extract_instantiation(node);
         }
 
-        // C++ stack construction `Calculator calc(0)` / `Widget w{1,2}` (#1035).
-        if kind == "declaration"
-            && self.variant == Variant::Cpp
-            && self.is_cpp_stack_construction(node)
-        {
-            self.extract_instantiation(node);
+        // C++ stack construction `Calculator calc(0)` / `Widget w{1,2}` (#1035),
+        // plus one constructor ref `ns::T::T/arity` per constructed object (#1839).
+        if kind == "declaration" && self.variant == Variant::Cpp {
+            let (instantiates, arities) = self.cpp_stack_constructions(node);
+            if instantiates {
+                self.extract_instantiation(node);
+            }
+            if !arities.is_empty() && !self.stack.is_empty() {
+                if let Some(type_node) = node.child_by_field_name("type") {
+                    let from = self.top_row();
+                    let class_name = strip_cpp_template_args(self.text(type_node));
+                    if let Some(name) = class_name.split("::").filter(|s| !s.is_empty()).last() {
+                        let calls = edge_kind_index("calls").unwrap();
+                        for arity in arities {
+                            self.push_ref_at(from, &format!("{class_name}::{name}/{arity}"), calls, node);
+                        }
+                    }
+                }
+            }
         }
 
         // C++ local fn-pointer bindings: declarations and branch reassignments.

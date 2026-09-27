@@ -77,6 +77,23 @@ describe('CodeGraph.reopenIfReplaced (issue #925)', () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
+  posixOnly('preserves read-only access after replacing the database (#1963)', async () => {
+    const initial = CodeGraph.initSync(root);
+    await initial.indexAll();
+    initial.close();
+    const reader = CodeGraph.openSync(root, { readOnly: true });
+    try {
+      fs.rmSync(getCodeGraphDir(root), { recursive: true, force: true });
+      const replacement = CodeGraph.initSync(root);
+      await replacement.indexAll();
+      replacement.close();
+      expect(reader.reopenIfReplaced()).toBe(true);
+      expect(reader.searchNodes('fooOld').length).toBeGreaterThan(0);
+      // The reopened handle must not silently become a writer.
+      expect(() => reader.clear()).toThrow(/readonly|read-only/i);
+    } finally { reader.close(); }
+  });
+
   posixOnly('heals a held connection after the index is removed and recreated at the same path', async () => {
     // The "server" opens and holds the DB for its lifetime.
     const server = CodeGraph.initSync(root);

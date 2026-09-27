@@ -25,6 +25,9 @@
     files: string[];
     onToggleTests: (value: boolean) => void;
     onSelectRoot: (root: string) => void;
+    /** What the reader asked for, or `null` when the depth in `payload` was chosen for them. */
+    chosenDepth: number | null;
+    onSelectDepth: (depth: number | null) => void;
     onSelect: (id: string | null) => void;
     /** Builds the map as an SVG at a given device-pixel scale. */
     buildSvg: (scale: number) => string;
@@ -40,10 +43,30 @@
     files,
     onToggleTests,
     onSelectRoot,
+    chosenDepth,
+    onSelectDepth,
     onSelect,
     buildSvg,
     exportName,
   }: Props = $props();
+
+  /**
+   * The grouping options.
+   *
+   * The first one is the default and is not a number: the answering side reads
+   * the repository and picks the shallowest grouping that is not one box
+   * holding the whole program. The numbers below it are there for when its
+   * choice is wrong for what the reader is looking at — an escape hatch, not
+   * the thing anybody should have to reach for.
+   */
+  const DEPTHS = [1, 2, 3, 4] as const;
+
+  function depthLabel(depth: number): string {
+    return depth === 1 ? 'top-level folders' : `${depth} folders deep`;
+  }
+
+  /** An em dash the mono face has; the select is narrow enough to notice a tofu. */
+  const DASH = '\u2014';
 
   const selectedNode = $derived(
     selected === null ? null : (layout.nodes.find((n) => n.id === selected) ?? null)
@@ -92,6 +115,25 @@
     >
       {#each payload.roots as option (option.root)}
         <option value={option.root}>{option.label} · {option.files} files</option>
+      {/each}
+    </select>
+  </label>
+
+  <!-- The grouping. A repository whose whole program sits under one directory
+       draws as one box at the shallowest setting, which is why the default is
+       chosen from the repository rather than fixed at 1. -->
+  <label class="field">
+    <span>Grouping</span>
+    <select
+      value={chosenDepth === null ? 'auto' : String(chosenDepth)}
+      onchange={(event) => {
+        const value = (event.currentTarget as HTMLSelectElement).value;
+        onSelectDepth(value === 'auto' ? null : Number(value));
+      }}
+    >
+      <option value="auto">automatic {DASH} {depthLabel(payload.depth)}</option>
+      {#each DEPTHS as option (option)}
+        <option value={String(option)}>{depthLabel(option)}</option>
       {/each}
     </select>
   </label>
@@ -215,6 +257,15 @@
         {/if}
       </p>
 
+      {#if (selectedModule.dependents?.files ?? 0) > 0}
+        <p class="reach">
+          <b>{plural(selectedModule.dependents.files, 'file')}</b> outside it, across
+          {plural(selectedModule.dependents.modules, 'module')}, reference straight into it — the
+          floor on what a change here has to be checked against, and the bar along the bottom of
+          the box.
+        </p>
+      {/if}
+
       {#if selectedNode?.island}
         <p class="island">
           Nothing in the index depends on this module — no import, call or reference crosses into
@@ -288,6 +339,10 @@
   .notes p {
     font-size: 11.5px;
     margin-bottom: 8px;
+  }
+  .reach {
+    font-size: 11.5px;
+    margin: 0 0 8px;
   }
   .field {
     display: flex;

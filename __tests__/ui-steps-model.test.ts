@@ -278,15 +278,60 @@ describe('a screen laid out by region', () => {
 
   it('keeps a step above what it sets in motion, inside its region', () => {
     expect(at(anchor.id).y).toBeLessThan(at(a1.id).y);
-    expect(at(a1.id).y).toBe(at(a2.id).y);
     expect(at(a3.id).y).toBeGreaterThan(at(a1.id).y);
+    // A step that fires something is drawn as a cluster of its own — itself,
+    // then what it fires under it, stepped in. A step that fires nothing does
+    // not need one, so the two are no longer on the same line.
+    expect(at(a3.id).x).toBeGreaterThan(at(a1.id).x);
+  });
+
+  it('spreads the steps that fire nothing along one line, and clusters the ones that do', () => {
+    // A screen's handlers are siblings, not a hierarchy: giving each its own
+    // line turned a flat region into a column. Only a step that sets something
+    // in motion earns a cluster.
+    const D = { id: 'component:PanelD', label: 'PanelD' };
+    const root = step('/', 'screen', 0, { anchor: true });
+    const flat = [0, 1, 2].map((i) => step(`tap${i}`, 'trigger', 1, { order: i, region: D }));
+    const hub = step('tapRun', 'trigger', 1, { order: 3, region: D });
+    const under = step('runThing', 'store', 2, { order: 4, region: D, node: ref('runThing', 'src/d.storage.ts') });
+    const m = buildStepsModel(
+      payload(
+        [root, ...flat, hub, under],
+        [...[...flat, hub].map((s) => link(root, s)), link(hub, under, { kind: 'store' })]
+      )
+    );
+    const y = (id: string) => m.layout.nodes.find((n) => n.id === id)!.y;
+    expect(new Set(flat.map((s) => y(s.id))).size).toBe(1);
+    expect(y(hub.id)).toBeGreaterThan(y(flat[0]!.id));
+    expect(y(under.id)).toBeGreaterThan(y(hub.id));
+  });
+
+  it('settles a region that holds a cycle instead of running to the bound', () => {
+    // Relaxation over a cyclic graph never stops moving: one real screen sent
+    // sixty-five of its boxes to rows 294-301 while the rest sat at 0-2.
+    const E = { id: 'component:PanelE', label: 'PanelE' };
+    const root = step('/', 'screen', 0, { anchor: true });
+    const p1 = step('one', 'trigger', 1, { order: 0, region: E });
+    const p2 = step('two', 'trigger', 2, { order: 1, region: E });
+    const p3 = step('three', 'trigger', 3, { order: 2, region: E });
+    const m = buildStepsModel(
+      payload([root, p1, p2, p3], [link(root, p1), link(p1, p2), link(p2, p3), link(p3, p1)])
+    );
+    const ys = [p1, p2, p3].map((s) => m.layout.nodes.find((n) => n.id === s.id)!.y);
+    const pitch = 40 + m.layerGap;
+    // Three boxes, so at most three lines of them — not one line per pass.
+    expect((Math.max(...ys) - Math.min(...ys)) / pitch).toBeLessThanOrEqual(2);
   });
 
   it('at rest hides only the screen’s own fan and what points back up; every other lead-to draws', () => {
-    expect(model.regionEntries).toEqual(new Set([a1.id, b1.id]));
+    // The screen's one line into a region lands on the box nearest the region's
+    // top-left that the screen leads to — `tapUndo`, which fires nothing and so
+    // sits on the region's first line, not `tapSave`, which clustering moves
+    // below it because it fires the store.
+    expect(model.regionEntries).toEqual(new Set([a2.id, b1.id]));
     // One line from the screen into each region stands in for its whole fan.
-    expect(stepEdgeVisible(model, edge(anchor.id, a1.id), null)).toBe(true);
-    expect(stepEdgeVisible(model, edge(anchor.id, a2.id), null)).toBe(false);
+    expect(stepEdgeVisible(model, edge(anchor.id, a2.id), null)).toBe(true);
+    expect(stepEdgeVisible(model, edge(anchor.id, a1.id), null)).toBe(false);
     expect(stepEdgeVisible(model, edge(anchor.id, b1.id), null)).toBe(true);
     // A region's internal line, and another region's way into a shared step.
     expect(stepEdgeVisible(model, edge(a1.id, a3.id), null)).toBe(true);
@@ -295,7 +340,7 @@ describe('a screen laid out by region', () => {
     expect(stepEdgeVisible(model, edge(a1.id, b1.id), null)).toBe(false);
     // Selecting a step brings out everything that touches it, and only that.
     expect(stepEdgeVisible(model, edge(a1.id, b1.id), a1.id)).toBe(true);
-    expect(stepEdgeVisible(model, edge(anchor.id, a2.id), a1.id)).toBe(false);
+    expect(stepEdgeVisible(model, edge(anchor.id, b1.id), a1.id)).toBe(false);
   });
 
   it('stacks a handler above the store it calls, even when both are one hop from the screen', () => {
@@ -318,5 +363,153 @@ describe('a screen laid out by region', () => {
     const plain = buildStepsModel(payload([step('/x', 'screen', 0, { anchor: true }), step('go', 'trigger', 1)], [link(step('/x', 'screen', 0, { anchor: true }), step('go', 'trigger', 1))]));
     expect(plain.regions).toBeNull();
     expect(plain.regionEntries).toBeNull();
+  });
+});
+
+describe('a link too far to draw is said in words', () => {
+  // Two chains in one region, and a link from the tail of the first to the
+  // tail of the second. The clusters are drawn one under the other, so that
+  // one link has to cross the whole region — the kind of line that, times a
+  // hundred, crossed itself six hundred and fifty-two times on a real screen.
+  const G = { id: 'component:PanelG', label: 'PanelG' };
+  const anchor = step('/', 'screen', 0, { anchor: true });
+  const chain = (p: string) =>
+    [0, 1, 2, 3].map((i) => step(`${p}${i}`, 'trigger', i + 1, { order: i, region: G, node: ref(`${p}${i}`, 'src/g.tsx') }));
+  const a = chain('a');
+  const b = chain('b');
+  const links = [
+    link(anchor, a[0]!),
+    link(anchor, b[0]!),
+    ...a.slice(1).map((s, i) => link(a[i]!, s)),
+    ...b.slice(1).map((s, i) => link(b[i]!, s)),
+    // The long one, from the bottom of the first cluster to the bottom of the second.
+    link(a[3]!, b[3]!),
+  ];
+  const model = buildStepsModel(payload([anchor, ...a, ...b], links));
+  const far = model.layout.edges.find((e) => e.source === a[3]!.id && e.target === b[3]!.id)!;
+  const near = model.layout.edges.find((e) => e.source === a[0]!.id && e.target === a[1]!.id)!;
+
+  it('draws the hop a reader can follow and words the one they cannot', () => {
+    expect(stepEdgeVisible(model, near, null)).toBe(true);
+    expect(stepEdgeVisible(model, far, null)).toBe(false);
+    expect(model.stubbed.has(far.id)).toBe(true);
+    expect(model.stubbed.has(near.id)).toBe(false);
+  });
+
+  it('says it at BOTH ends, so neither box reads as wired to nothing', () => {
+    expect(model.stubs.get(a[3]!.id) ?? []).toContainEqual(
+      expect.objectContaining({ edge: far.id, dir: 'out', label: 'b3' })
+    );
+    expect(model.stubs.get(b[3]!.id) ?? []).toContainEqual(
+      expect.objectContaining({ edge: far.id, dir: 'in', label: 'a3' })
+    );
+  });
+
+  it('draws every one of a box\u2019s real lines again when it is selected', () => {
+    expect(stepEdgeVisible(model, far, a[3]!.id)).toBe(true);
+    expect(stepEdgeVisible(model, far, b[3]!.id)).toBe(true);
+    // ...and still not for an unrelated selection.
+    expect(stepEdgeVisible(model, far, a[1]!.id)).toBe(false);
+  });
+
+  it('never words the screen\u2019s own fan \u2014 that is already one line per region', () => {
+    for (const list of model.stubs.values()) {
+      for (const stub of list) expect(stub.other).not.toBe(anchor.id);
+    }
+  });
+
+  it('leaves a picture whose every line is local alone', () => {
+    const plain = buildStepsModel(
+      payload([step('/x', 'screen', 0, { anchor: true }), step('go', 'trigger', 1)], [
+        link(step('/x', 'screen', 0, { anchor: true }), step('go', 'trigger', 1)),
+      ])
+    );
+    expect(plain.stubbed.size).toBe(0);
+    expect(plain.stubs.size).toBe(0);
+  });
+});
+
+describe('a stub names the box without its kind mark', () => {
+  it('drops the ⇢ / ⇠ a bridge or an event wears, so the direction reads alone', () => {
+    const H = { id: 'component:PanelH', label: 'PanelH' };
+    const anchor = step('/', 'screen', 0, { anchor: true });
+    const mk = (p: string) => [
+      step(`${p}0`, 'trigger', 1, { order: 0, region: H, node: ref(`${p}0`, 'src/h.tsx') }),
+      step(`${p}1`, 'trigger', 2, { order: 1, region: H, node: ref(`${p}1`, 'src/h.tsx') }),
+      step(`${p}2`, 'trigger', 3, { order: 2, region: H, node: ref(`${p}2`, 'src/h.tsx') }),
+      step(`${p}3`, 'bridge', 4, { order: 3, region: H, node: ref(`${p}3`, 'ios/H.swift', 'swift') }),
+    ];
+    const a = mk('a');
+    const b = mk('b');
+    const links = [
+      link(anchor, a[0]!),
+      link(anchor, b[0]!),
+      ...a.slice(1).map((s, i) => link(a[i]!, s)),
+      ...b.slice(1).map((s, i) => link(b[i]!, s)),
+      link(a[3]!, b[3]!),
+    ];
+    const m = buildStepsModel(payload([anchor, ...a, ...b], links));
+    expect(stepLabel(b[3]!)).toBe('⇢ b3');
+    expect(m.stubs.get(a[3]!.id) ?? []).toContainEqual(
+      expect.objectContaining({ dir: 'out', label: 'b3' })
+    );
+  });
+});
+
+describe('regions fill the canvas instead of squaring off into rows', () => {
+  it('lets a short region tuck under another short one, without reordering them', () => {
+    // Squaring the regions into rows made every row as tall as its tallest
+    // member: one real screen's canvas came out 44% region and 56% nothing.
+    const anchor = step('/', 'screen', 0, { anchor: true });
+    const region = (n: string) => ({ id: `component:${n}`, label: n });
+    const short = (n: string, order: number) =>
+      step(n, 'trigger', 1, { order, region: region('R' + n), node: ref(n, `src/${n}.tsx`) });
+    // One tall region (a chain), then several short ones beside it.
+    const tallR = region('Tall');
+    const chain = [0, 1, 2, 3, 4, 5].map((i) =>
+      step(`t${i}`, 'trigger', i + 1, { order: i, region: tallR, node: ref(`t${i}`, 'src/t.tsx') })
+    );
+    const a = short('alpha', 10), b = short('beta', 11), c = short('gamma', 12);
+    const steps = [anchor, ...chain, a, b, c];
+    const links = [
+      ...[chain[0]!, a, b, c].map((s) => link(anchor, s)),
+      ...chain.slice(1).map((s, i) => link(chain[i]!, s)),
+    ];
+    const m = buildStepsModel(payload(steps, links));
+    const zone = (n: string) => m.regions!.find((z) => z.label === n)!;
+    const tall = zone('Tall');
+    // The short regions are laid out after the tall one and do not wait for it.
+    for (const n of ['Ralpha', 'Rbeta', 'Rgamma']) {
+      expect(zone(n).y).toBeLessThan(tall.y + tall.height);
+    }
+    // …and the order still reads left to right: an earlier region is never
+    // pushed below a later one.
+    expect(zone('Ralpha').y).toBeLessThanOrEqual(zone('Rgamma').y);
+    // The canvas is not taller than the tall region needs it to be.
+    const H = Math.max(...m.layout.nodes.map((n) => n.y + n.height));
+    expect(H).toBeLessThan(tall.y + tall.height + 200);
+  });
+});
+
+describe('the width a picture wraps at is tried, not estimated', () => {
+  it('lets a wide spread run wide instead of wrapping into a column', () => {
+    // A cluster spends lines on its own structure, so `total width / line
+    // width` badly under-counts the lines a region takes: a formula tuned on
+    // that estimate wrapped a 98-box region into a 4,356px column. The widths
+    // are cheap to try exactly, so they are tried.
+    const R = { id: 'component:Wide', label: 'Wide' };
+    const anchor = step('/', 'screen', 0, { anchor: true });
+    const hub = step('startEverything', 'trigger', 1, { order: 0, region: R, node: ref('startEverything', 'src/w.tsx') });
+    const leaves = Array.from({ length: 24 }, (_, i) =>
+      step(`writeSomeValue${i}`, 'store', 2, { order: i + 1, region: R, node: ref(`writeSomeValue${i}`, 'src/w.storage.ts') })
+    );
+    const m = buildStepsModel(
+      payload([anchor, hub, ...leaves], [link(anchor, hub), ...leaves.map((l) => link(hub, l, { kind: 'store' }))])
+    );
+    const W = Math.max(...m.layout.nodes.map((n) => n.x + n.width));
+    const H = Math.max(...m.layout.nodes.map((n) => n.y + n.height));
+    // At a fixed 720px these twenty-four boxes wrapped into eight lines and the
+    // picture came out taller than wide; it should now be at least as wide.
+    expect(W).toBeGreaterThan(H);
   });
 });

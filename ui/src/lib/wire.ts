@@ -610,6 +610,12 @@ export interface WireMapModule {
   facade: boolean;
   /** Its files, capped — the side panel's list when the module is selected. */
   fileList: { total: number; shown: number; truncated: boolean; items: string[] };
+  /**
+   * Files OUTSIDE this module with a direct reference into it, and how many
+   * modules they span — what a change in here reaches. Direct, not transitive:
+   * a cycle saturates the transitive count and it stops discriminating.
+   */
+  dependents: { files: number; modules: number };
 }
 
 export interface WireMapLink {
