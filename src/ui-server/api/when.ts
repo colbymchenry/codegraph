@@ -10,6 +10,7 @@
  * Symbol view into a parse of the repository.
  */
 
+import { normalizePath } from '../../utils';
 import * as fs from 'fs';
 import type CodeGraph from '../../index';
 import type { Language } from '../../types';
@@ -145,7 +146,7 @@ export function createSiteReader(cg: CodeGraph, projectRoot: string, maxSites = 
   const texts = new Map<string, string | null>();
   let sites = 0;
   const resolve = (caller: { filePath: string; language: Language }): { abs: string; language: Language } | null => {
-    const posix = caller.filePath.replace(/\\/g, '/');
+    const posix = normalizePath(caller.filePath);
     let file = files.get(posix);
     if (file === undefined) {
       file = null;

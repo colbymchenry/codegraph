@@ -7,6 +7,7 @@
  * into workspace member crates.
  */
 
+import { normalizePath } from '../../utils';
 import picomatch from 'picomatch';
 import { ResolutionContext } from '../types';
 
@@ -163,7 +164,7 @@ function addCrateAlias(map: Map<string, string>, crateName: string, memberPath: 
 }
 
 function cleanPath(memberPath: string): string {
-  return memberPath.replace(/\\/g, '/').replace(/\/$/, '');
+  return normalizePath(memberPath).replace(/\/$/, '');
 }
 
 function expandGlobMember(member: string, context: ResolutionContext): string[] {

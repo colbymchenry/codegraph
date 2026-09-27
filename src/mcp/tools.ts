@@ -40,7 +40,7 @@ import {
   statSync,
 } from 'fs';
 import { createHash } from 'crypto';
-import { clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
+import { normalizePath, clamp, validatePathWithinRoot, validateProjectPath, isConfigLeafNode, CONFIG_LEAF_LANGUAGES } from '../utils';
 import { guardLabel, guardsForFileSync, siteKey, supportsBranchGuards, warmBranchGuardGrammars } from '../graph/branch-guards';
 import { findDynamicBoundaries, type BoundarySite } from '../graph/dynamic-boundary-report';
 import { countImplementers } from '../graph/type-hierarchy';
@@ -3010,7 +3010,7 @@ export class ToolHandler {
     const MIN_SUPPORT = 2;  // >= this many sampled definers must share the supertype (ties it to the token)
     const SAMPLE = 40;      // family members inspected per token
     const MAX_NOTES = 3;
-    const rel = (p: string) => p.replace(/\\/g, '/');
+    const rel = normalizePath;
     const containerOf = (m: Node): Node | null => {
       try { const ce = cg.getIncomingEdges(m.id).find((e) => e.kind === 'contains'); return ce ? cg.getNode(ce.source) : null; }
       catch { return null; }
@@ -3107,7 +3107,7 @@ export class ToolHandler {
       'function', 'method', 'class', 'interface', 'struct', 'union', 'trait', 'protocol',
       'enum', 'type_alias', 'component', 'constant', 'variable', 'property', 'field',
     ]);
-    const rel = (p: string) => p.replace(/\\/g, '/');
+    const rel = normalizePath;
 
     const roots = subgraph.roots
       .map((id) => subgraph.nodes.get(id))
@@ -6163,7 +6163,7 @@ export class ToolHandler {
     // def whose body contains it, else the nearest start. Only narrows (never
     // empties — if a hint matches nothing it's ignored).
     if (matches.length > 1 && (fileHint || lineHint !== undefined)) {
-      const norm = (p: string) => p.replace(/\\/g, '/').toLowerCase();
+      const norm = (p: string) => normalizePath(p).toLowerCase();
       let narrowed = matches;
       if (fileHint) {
         const fh = norm(fileHint);
@@ -6262,7 +6262,7 @@ export class ToolHandler {
     fileArg: string,
     opts: { offset?: number; limit?: number; symbolsOnly?: boolean } = {},
   ): Promise<ToolResult> {
-    const normalize = (p: string) => p.replace(/\\/g, '/').replace(/^(?:\.?\/+)+/, '').replace(/\/+$/, '');
+    const normalize = (p: string) => normalizePath(p).replace(/^(?:\.?\/+)+/, '').replace(/\/+$/, '');
     const wantLower = normalize(fileArg).toLowerCase();
     const allFiles = cg.getFiles();
     if (allFiles.length === 0) return this.textResult('No files indexed. Run `codegraph index` first.');
@@ -6657,12 +6657,11 @@ export class ToolHandler {
 
     // Filter by path prefix. Stored paths are project-relative POSIX (e.g.
     // "src/foo.ts"), but agents commonly pass project-root variants like "/",
-    // ".", "./", "" or Windows-style "src\foo" — and prefixes with leading
-    // "/", "./" or "\". Normalize all of those before matching so the agent
+    // ".", "./", "" — and on Windows, native backslash separators. Normalize
+    // those before matching, preserving literal POSIX filename backslashes so the agent
     // gets results instead of falling back to Read/Glob (see #426).
     const normalizedFilter = pathFilter
-      ? pathFilter
-          .replace(/\\/g, '/')
+      ? normalizePath(pathFilter)
           .replace(/^(?:\.?\/+)+/, '')
           .replace(/^\.$/, '')
           .replace(/\/+$/, '')

@@ -423,7 +423,7 @@ describe('resolveProjectFile — the source read chokepoint', () => {
   });
 
   it('refuses traversal out of the project', () => {
-    for (const escape of ['../secret.txt', 'src/../../secret.txt', '..%2fsecret.txt']) {
+    for (const escape of ['../secret.txt', 'src/../../secret.txt', new URLSearchParams('file=..%2fsecret.txt').get('file')!]) {
       expect(() => resolveProjectFile(projectRoot, escape), escape).toThrow(PathRefusalError);
     }
   });
@@ -440,7 +440,29 @@ describe('resolveProjectFile — the source read chokepoint', () => {
   });
 
   it('refuses a NUL byte', () => {
-    expect(() => resolveProjectFile(projectRoot, 'src/auth.ts%00.png')).toThrow(PathRefusalError);
+    expect(() => resolveProjectFile(projectRoot, 'src/auth.ts\u0000.png')).toThrow(PathRefusalError);
+  });
+
+  it('preserves literal percent sequences in native source paths', () => {
+    for (const name of ['src/foo%5cbar.ts', 'src/foo%2fbar.ts', 'src/foo%00bar.ts', 'src/100%.ts']) {
+      const file = path.join(projectRoot, name);
+      fs.writeFileSync(file, 'export const value = 1;\n');
+      expect(resolveProjectFile(projectRoot, name)).toBe(fs.realpathSync(file));
+    }
+  });
+
+  it.runIf(process.platform !== 'win32')('preserves literal backslashes without allowing symlink escapes', () => {
+    const name = 'src/auth\\local.ts';
+    const file = path.join(projectRoot, name);
+    fs.writeFileSync(file, 'export const local = 1;\n');
+    expect(resolveProjectFile(projectRoot, name)).toBe(fs.realpathSync(file));
+    fs.unlinkSync(file);
+    fs.symlinkSync(path.join(tempDir, 'secret.txt'), file);
+    try {
+      expect(() => resolveProjectFile(projectRoot, name)).toThrow(PathRefusalError);
+    } finally {
+      fs.unlinkSync(file);
+    }
   });
 
   // `/etc` resolves to a non-existent `C:\etc` on Windows, so the sensitive-path

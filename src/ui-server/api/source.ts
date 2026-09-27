@@ -33,6 +33,7 @@
  * there is always a hash to compare against.
  */
 
+import { normalizePath } from '../../utils';
 import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -91,7 +92,7 @@ export function findIndexedFile(
  * chokepoint's absolute-path rule with nothing to catch.
  */
 export function toRequestPath(requested: string): string {
-  return requested.replace(/\\/g, '/').replace(/^\.\//, '');
+  return normalizePath(requested).replace(/^\.\//, '');
 }
 
 /**
@@ -351,7 +352,7 @@ export async function buildSource(
   const onDrift = parseOnDrift(query);
 
   const base: SourceResult = {
-    file: storedPath.replace(/\\/g, '/'),
+    file: normalizePath(storedPath),
     language: record.language,
     drift: false,
     showing: 'indexed',

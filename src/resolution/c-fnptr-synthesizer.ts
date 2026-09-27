@@ -80,6 +80,7 @@
  * The extraction sweep is also the step-2 boundary: a native per-file extractor
  * can replace the sweep's scans without touching the linking stages.
  */
+import { normalizePath } from '../utils';
 import * as path from 'node:path';
 import type { Edge, Node } from '../types';
 import type { QueryBuilder } from '../db/queries';
@@ -509,7 +510,7 @@ export async function cFnPointerDispatchEdges(
   // project root. Returns a project-root-relative path that exists on disk
   // (even if it was never indexed — e.g. redis' generated `commands.def`).
   const resolveInclude = (includer: string, inc: string): string | null => {
-    const dir = path.posix.dirname(includer.replace(/\\/g, '/'));
+    const dir = path.posix.dirname(normalizePath(includer));
     const cand = path.posix.normalize(path.posix.join(dir, inc));
     if (ctx.fileExists(cand)) return cand;
     if (ctx.fileExists(inc)) return inc;

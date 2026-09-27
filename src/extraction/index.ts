@@ -686,8 +686,8 @@ function classifyGitDir(absDir: string): 'embedded' | 'worktree' | 'none' {
     // either the top-level repo's (`.git/worktrees/`) or, for a worktree of a
     // submodule, that submodule's gitdir (`.git/modules/<module>/worktrees/`).
     // The optional `modules/<module>` segment covers the submodule case (#945).
-    // Match both separators so a Windows-style pointer is recognized too.
-    if (gitdir && /(^|[\\/])\.git[\\/](modules[\\/][^\\/]+[\\/])?worktrees[\\/]/.test(gitdir)) return 'worktree';
+    // Interpret directory separators using the host filesystem's semantics.
+    if (gitdir && /(^|\/)\.git\/(modules\/[^/]+\/)?worktrees\//.test(normalizePath(gitdir))) return 'worktree';
   } catch {
     // Unreadable `.git` pointer — fall back to the prior "index it" behavior.
   }

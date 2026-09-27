@@ -25,6 +25,7 @@
  * commas, which JSON.parse rejects. We strip those before parsing.
  */
 
+import { normalizePath } from '../utils';
 import * as fs from 'fs';
 import * as path from 'path';
 import { logDebug } from '../errors';
@@ -356,7 +357,7 @@ export function applyAliases(
       // Skip if the rewrite escapes the project root (unsafe + can't
       // be looked up via the file index anyway).
       if (relative.startsWith('..')) continue;
-      out.push(relative.replace(/\\/g, '/'));
+      out.push(normalizePath(relative));
     }
     return out;
   }

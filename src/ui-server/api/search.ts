@@ -19,6 +19,7 @@
  * palette actually has to answer.
  */
 
+import { normalizePath } from '../../utils';
 import type { CodeGraph } from '../../index';
 import type { Node, NodeKind } from '../../types';
 import { parseQuery, type ParsedQuery } from '../../search/query-parser';
@@ -87,7 +88,7 @@ function classify(node: Node, needle: string): MatchKind | null {
   if (name.startsWith(needle)) return 'prefix';
   if (name.includes(needle)) return 'substring';
   if (node.qualifiedName.toLowerCase().includes(needle)) return 'qualified';
-  if (node.filePath.toLowerCase().replace(/\\/g, '/').includes(needle)) return 'file';
+  if (normalizePath(node.filePath.toLowerCase()).includes(needle)) return 'file';
   return null;
 }
 
@@ -196,7 +197,7 @@ export function buildSearch(cg: CodeGraph, query: URLSearchParams): unknown {
  * example below an unrelated production symbol.
  */
 function isTestPath(filePath: string): boolean {
-  const lower = filePath.toLowerCase().replace(/\\/g, '/');
+  const lower = normalizePath(filePath.toLowerCase());
   return (
     /(^|\/)(tests?|specs?|__tests__)\//.test(lower) ||
     /[._-](test|tests|spec|specs)\.[a-z0-9]+$/.test(lower)

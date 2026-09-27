@@ -1,3 +1,4 @@
+import { normalizePath } from '../utils';
 import type { Node as SyntaxNode } from 'web-tree-sitter';
 import { Node, Edge, ExtractionResult, ExtractionError, UnresolvedReference, Language } from '../types';
 import { generateNodeId } from './tree-sitter-helpers';
@@ -123,7 +124,7 @@ export class CfmlExtractor {
     const fileNode: Node = {
       id,
       kind: 'file',
-      name: this.filePath.split(/[/\\]/).pop() || this.filePath,
+      name: normalizePath(this.filePath).split('/').pop() || this.filePath,
       qualifiedName: this.filePath,
       filePath: this.filePath,
       language: this.language,
@@ -474,7 +475,7 @@ export class CfmlExtractor {
   }
 
   private componentNameFromPath(): string {
-    const fileName = this.filePath.split(/[/\\]/).pop() || this.filePath;
+    const fileName = normalizePath(this.filePath).split('/').pop() || this.filePath;
     return fileName.replace(/\.(cfc|cfm|cfs)$/i, '');
   }
 }

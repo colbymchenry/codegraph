@@ -5,6 +5,7 @@
  * Nuxt auto-imports, and Nuxt file-based routing patterns.
  */
 
+import { normalizePath } from '../../utils';
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 
@@ -192,7 +193,7 @@ export const vueResolver: FrameworkResolver = {
     const now = Date.now();
 
     // Normalize to forward slashes
-    const normalized = filePath.replace(/\\/g, '/');
+    const normalized = normalizePath(filePath);
 
     // Detect Nuxt page routes (pages/ directory)
     const pagesIndex = normalized.indexOf('/pages/');
@@ -286,7 +287,7 @@ function resolveComponent(
   const matches: string[] = [];
   for (const file of context.getAllFiles()) {
     if (!file.endsWith('.vue')) continue;
-    const fileName = file.split(/[/\\]/).pop() || '';
+    const fileName = normalizePath(file).split('/').pop() || '';
     if (fileName.replace(/\.vue$/, '') === name) matches.push(file);
   }
   if (matches.length === 0) return null;

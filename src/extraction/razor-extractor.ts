@@ -1,3 +1,4 @@
+import { normalizePath } from '../utils';
 import { Node, Edge, ExtractionResult, ExtractionError, UnresolvedReference } from '../types';
 import { generateNodeId } from './tree-sitter-helpers';
 import { TreeSitterExtractor } from './tree-sitter';
@@ -93,7 +94,7 @@ export class RazorExtractor {
 
   private createComponentNode(): Node {
     const lines = this.source.split('\n');
-    const fileName = this.filePath.split(/[/\\]/).pop() || this.filePath;
+    const fileName = normalizePath(this.filePath).split('/').pop() || this.filePath;
     const componentName = fileName.replace(/\.(razor|cshtml)$/i, '');
     const node: Node = {
       id: generateNodeId(this.filePath, 'component', componentName, 1),

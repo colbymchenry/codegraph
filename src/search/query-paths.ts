@@ -27,6 +27,8 @@
  * and safe inside the query-pool workers.
  */
 
+import { normalizePath } from '../utils';
+
 export interface QueryPathExtraction {
   /** The query with resolved/clearly-path spans removed, whitespace-joined. */
   strippedQuery: string;
@@ -91,7 +93,8 @@ const LAST_EXTENSION = /\.[A-Za-z][A-Za-z0-9]{0,7}$/;
 function buildBasenameStems(indexedPaths: readonly string[]): Map<string, string[]> {
   const stems = new Map<string, string[]>();
   for (const p of indexedPaths) {
-    const basename = p.slice(Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\')) + 1);
+    const normalized = normalizePath(p);
+    const basename = normalized.slice(normalized.lastIndexOf('/') + 1);
     if (!basename.includes('-')) continue;
     const stem = basename.replace(LAST_EXTENSION, '').toLowerCase();
     if (!stem) continue;
@@ -138,8 +141,7 @@ function stripWrapping(token: string): string {
 
 /** Normalize a span into the repo-relative shape the files table stores. */
 function normalizeSpan(span: string): string {
-  return span
-    .replace(/\\/g, '/')
+  return normalizePath(span)
     .replace(/^(?:\.\/)+/, '')
     .replace(/\/{2,}/g, '/')
     .replace(/\/+$/, '');

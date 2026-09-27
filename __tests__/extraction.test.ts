@@ -7649,7 +7649,7 @@ export function multiply(a: number, b: number): number {
 });
 
 describe('Path Normalization', () => {
-  it('should convert backslashes to forward slashes', () => {
+  it.runIf(process.platform === 'win32')('should convert Windows separators to forward slashes', () => {
     expect(normalizePath('gui\\node_modules\\foo')).toBe('gui/node_modules/foo');
     expect(normalizePath('src\\components\\Button.tsx')).toBe('src/components/Button.tsx');
   });

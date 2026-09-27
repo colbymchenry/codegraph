@@ -4,6 +4,7 @@
  * Resolves import paths to actual files and symbols.
  */
 
+import { normalizePath } from '../utils';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Language, Node } from '../types';
@@ -263,7 +264,7 @@ function resolveCobolCopybook(
   if (!index) {
     index = new Map();
     for (const fileNode of context.getNodesByKind('file')) {
-      const normalized = fileNode.filePath.replace(/\\/g, '/');
+      const normalized = normalizePath(fileNode.filePath);
       const base = normalized.split('/').pop() ?? '';
       const dot = base.lastIndexOf('.');
       const stem = (dot > 0 ? base.slice(0, dot) : base).toLowerCase();
@@ -277,11 +278,11 @@ function resolveCobolCopybook(
   const candidates = index.get(member.toLowerCase());
   if (!candidates || candidates.length === 0) return null;
 
-  const fromDir = fromFile.replace(/\\/g, '/').split('/').slice(0, -1).join('/');
+  const fromDir = normalizePath(fromFile).split('/').slice(0, -1).join('/');
   let best: string | null = null;
   let bestScore = -1;
   for (const candidate of candidates) {
-    const normalized = candidate.replace(/\\/g, '/');
+    const normalized = normalizePath(candidate);
     const ext = normalized.slice(normalized.lastIndexOf('.')).toLowerCase();
     let score = 0;
     if (ext === '.cpy') score += 4;
@@ -458,7 +459,7 @@ function resolveRelativeImport(
     const up = '../'.repeat(Math.max(0, dots - 1));    // 1 dot = current dir
     const rest = importPath.slice(dots).replace(/\./g, '/'); // 'sub.mod' -> 'sub/mod'
     const pyBase = path.resolve(fromDir, up + rest);
-    const pyRel = path.relative(projectRoot, pyBase).replace(/\\/g, '/');
+    const pyRel = normalizePath(path.relative(projectRoot, pyBase));
     for (const ext of extensions) {
       if (context.fileExists(pyRel + ext)) return pyRel + ext;
     }
@@ -468,7 +469,7 @@ function resolveRelativeImport(
 
   // Try the path as-is first
   const basePath = path.resolve(fromDir, importPath);
-  const relativePath = path.relative(projectRoot, basePath).replace(/\\/g, '/');
+  const relativePath = normalizePath(path.relative(projectRoot, basePath));
 
   // Try each extension
   for (const ext of extensions) {
@@ -690,7 +691,7 @@ function loadCppIncludeDirsFromCompileDB(projectRoot: string): string[] | null {
           const absPath = path.isAbsolute(includeDir)
             ? includeDir
             : path.resolve(dir, includeDir);
-          const relPath = path.relative(projectRoot, absPath).replace(/\\/g, '/');
+          const relPath = normalizePath(path.relative(projectRoot, absPath));
           // Skip system directories and paths outside the project
           // (relative paths starting with .. or absolute paths like
           // /usr/include or C:\usr on Windows)
@@ -791,7 +792,7 @@ function resolveCppIncludePath(
   const extensions = EXTENSION_RESOLUTION[language] ?? [];
 
   for (const dir of includeDirs) {
-    const normalizedDir = dir.replace(/\\/g, '/');
+    const normalizedDir = normalizePath(dir);
     for (const ext of extensions) {
       const candidate = normalizedDir + '/' + importPath + ext;
       if (context.fileExists(candidate)) return candidate;
@@ -845,7 +846,7 @@ function resolvePhpIncludePath(
   const projectRoot = context.getProjectRoot();
   const fromDir = path.dirname(path.join(projectRoot, fromFile));
   const basePath = path.resolve(fromDir, includePath);
-  const relativePath = path.relative(projectRoot, basePath).replace(/\\/g, '/');
+  const relativePath = normalizePath(path.relative(projectRoot, basePath));
   if (context.fileExists(relativePath)) return relativePath;
   // The literal may omit the .php extension (e.g. include "config").
   for (const ext of EXTENSION_RESOLUTION.php ?? []) {
@@ -2087,7 +2088,7 @@ function resolveRustPathReference(
 /** The crate-root directory (holds `lib.rs`/`main.rs`), walking up from a file. */
 function rustCrateRootDir(fromFileAbs: string, context: ResolutionContext): string | null {
   const projectRoot = context.getProjectRoot();
-  const toRel = (p: string) => path.relative(projectRoot, p).replace(/\\/g, '/');
+  const toRel = (p: string) => normalizePath(path.relative(projectRoot, p));
   let dir = path.dirname(fromFileAbs);
   for (let i = 0; i < 64; i++) {
     if (context.fileExists(toRel(path.join(dir, 'lib.rs'))) ||
@@ -2123,7 +2124,7 @@ function resolveRustModuleFile(
   if (segments.length === 0) return null;
   const projectRoot = context.getProjectRoot();
   const fromAbs = path.join(projectRoot, fromFile);
-  const toRel = (p: string) => path.relative(projectRoot, p).replace(/\\/g, '/');
+  const toRel = (p: string) => normalizePath(path.relative(projectRoot, p));
 
   // Walk a sequence of module segments down from `startDir`, mapping each to a
   // `<seg>.rs` or `<seg>/mod.rs` file. Returns the leaf module's file, or null
@@ -2208,7 +2209,7 @@ function resolveJavaImportedReference(
     const candidates = context.getNodesByName(memberName);
     for (const node of candidates) {
       if (node.language !== ref.language) continue;
-      const fp = node.filePath.replace(/\\/g, '/');
+      const fp = normalizePath(node.filePath);
       if (fp.endsWith(fqnPath) || fp.endsWith('/' + fqnPath)) {
         return {
           original: ref,
@@ -2230,7 +2231,7 @@ function resolveJavaImportedReference(
         const ownerPath = ownerFqn.replace(/\./g, '/') + ext;
         for (const node of candidates) {
           if (node.language !== ref.language) continue;
-          const fp = node.filePath.replace(/\\/g, '/');
+          const fp = normalizePath(node.filePath);
           if (fp.endsWith(ownerPath) || fp.endsWith('/' + ownerPath)) {
             return {
               original: ref,
@@ -2288,7 +2289,7 @@ function resolveGoCrossPackageReference(
     for (const node of candidates) {
       if (node.language !== 'go') continue;
       if (!node.isExported) continue;
-      const fp = node.filePath.replace(/\\/g, '/');
+      const fp = normalizePath(node.filePath);
       const lastSlash = fp.lastIndexOf('/');
       const fileDir = lastSlash >= 0 ? fp.substring(0, lastSlash) : '';
       if (fileDir === pkgDir) {

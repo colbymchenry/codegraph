@@ -24,6 +24,7 @@
  *     package repos pay nothing and see no behaviour change.
  */
 
+import { normalizePath } from '../utils';
 import * as fs from 'fs';
 import * as path from 'path';
 import { logDebug } from '../errors';
@@ -101,7 +102,7 @@ function readOhpmMain(projectRoot: string, dirRel: string): string | null {
   const main = (parsed as { main?: unknown } | null)?.main;
   if (typeof main !== 'string' || !main.trim()) return null;
   const entryAbs = path.resolve(projectRoot, dirRel, main.trim());
-  const entryRel = path.relative(projectRoot, entryAbs).replace(/\\/g, '/');
+  const entryRel = normalizePath(path.relative(projectRoot, entryAbs));
   if (entryRel.startsWith('..')) return null;
   return entryRel;
 }
@@ -159,7 +160,7 @@ function collectOhpmFileDeps(projectRoot: string): Map<string, string> {
       const deps = readOhpmFileDeps(path.join(abs, e.name));
       for (const [name, target] of deps) {
         const targetAbs = path.resolve(abs, target);
-        const targetRel = path.relative(projectRoot, targetAbs).replace(/\\/g, '/');
+        const targetRel = normalizePath(path.relative(projectRoot, targetAbs));
         if (targetRel.startsWith('..')) continue; // escapes the project
         const existing = byName.get(name);
         if (existing === undefined) {
@@ -293,7 +294,7 @@ function parsePnpmPackages(yaml: string): string[] {
 
 /** Expand one level of a `packages/*` / `apps/**` glob to member dirs. */
 function expandWorkspaceGlob(projectRoot: string, pattern: string): string[] {
-  const norm = pattern.replace(/\\/g, '/').replace(/\/+$/, '');
+  const norm = normalizePath(pattern).replace(/\/+$/, '');
   const star = norm.indexOf('*');
   if (star === -1) return [norm]; // exact directory
 

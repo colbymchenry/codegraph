@@ -38,6 +38,7 @@ import type { Node, NodeKind } from '../../types';
 import { intParam } from './respond';
 import { buildRoutes, type WireRoute } from './routes';
 import { isTestFile, isTestPath } from '../../search/query-utils';
+import { normalizePath } from '../../utils';
 import { toNodeRef, toPosixPath, wireList, type WireList, type WireNodeRef } from './wire';
 
 /** Rows per derived list, and the default for `limit`. */
@@ -336,7 +337,7 @@ function hubs(cg: CodeGraph, limit: number): WireList<WireEntryHub> {
 
 /** `src/bin/codegraph.ts` -> `src/bin`; a root file -> `.`. */
 function directoryOf(filePath: string): string {
-  const normalized = filePath.replace(/\\/g, '/');
+  const normalized = normalizePath(filePath);
   const cut = normalized.lastIndexOf('/');
   return cut < 0 ? '.' : normalized.slice(0, cut);
 }

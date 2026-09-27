@@ -576,7 +576,7 @@ export class FileWatcher {
    * — it drops node_modules/dist/.git churn before any sync is scheduled.
    */
   private handleChange(rel: string): void {
-    if (!rel || rel === '.' || rel.startsWith('..')) return;
+    if (!rel || rel === '.' || rel === '..' || rel.startsWith('../') || path.isAbsolute(rel)) return;
     // `.git/info/exclude` is otherwise always-ignored with the rest of `.git/`,
     // but it feeds `buildScopeIgnore` — allow it through as a scope refresh
     // when the platform delivers the event (recursive watchers may; Linux
@@ -711,7 +711,7 @@ export class FileWatcher {
    */
   private shouldIgnoreDir(dirPath: string): boolean {
     const rel = normalizePath(path.relative(this.projectRoot, dirPath));
-    if (!rel || rel === '.' || rel.startsWith('..')) return false; // root / outside
+    if (!rel || rel === '.' || rel === '..' || rel.startsWith('../') || path.isAbsolute(rel)) return false; // root / outside
     if (this.isAlwaysIgnored(rel)) return true;
     if (!this.ignoreMatcher) return false;
     return this.ignoreMatcher.ignores(rel + '/');
