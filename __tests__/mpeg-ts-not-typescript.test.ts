@@ -33,27 +33,36 @@ function makeMpegTs(packets: number, seed = 1): Buffer {
 }
 
 /**
- * Real TypeScript engineered to put the letter `G` (0x47) at offsets 0, 188,
- * 376 and 564 — the sync-byte pattern alone. It must stay TypeScript.
+ * Real TypeScript engineered to put the letter `G` (0x47) at the start of each
+ * of its first `packets` 188-byte strides — the sync-byte pattern alone. With
+ * `nul`, one raw NUL sits inside a comment (the review's counterexample on
+ * #1915). It must stay TypeScript either way.
  */
-function makeGammaSource(): string {
-  const lines: string[] = [];
+function makeGammaSource(packets = 4, nul = false): string {
   let text = '';
-  for (let i = 0; i < 4; i++) {
-    const line = `Gamma${i}();`;
+  for (let i = 0; i < packets; i++) {
+    const line = `Gamma${i}();` + (nul && i === 1 ? ' // \u0000' : '');
     const pad = PACKET - line.length - 1;
     text += line + ' '.repeat(pad) + '\n';
-    lines.push(line);
   }
-  text += 'export function Gamma0() { return 0; }\n';
-  text += 'export function Gamma1() { return 1; }\n';
-  text += 'export function Gamma2() { return 2; }\n';
-  text += 'export function Gamma3() { return 3; }\n';
-  for (const off of [0, PACKET, 2 * PACKET, 3 * PACKET]) {
+  for (let i = 0; i < packets; i++) text += `export function Gamma${i}() { return ${i}; }\n`;
+  text += 'export function realFn() { return 1; }\n';
+  for (let off = 0; off < packets * PACKET; off += PACKET) {
     if (text.charCodeAt(off) !== 0x47) throw new Error(`fixture: expected G at ${off}`);
   }
-  void lines;
   return text;
+}
+
+/** A stream that opens the usual way: PAT and PMT packets stuffed with 0xFF, then payload. */
+function makePsiLedMpegTs(packets: number): Buffer {
+  const buf = makeMpegTs(packets, 7);
+  for (const start of [0, PACKET]) {
+    buf.fill(0xff, start + 4, start + PACKET);
+    buf[start + 1] = 0x40;
+    buf[start + 2] = start === 0 ? 0x00 : 0x10;
+    buf[start + 3] = 0x10;
+  }
+  return buf;
 }
 
 const tempDirs: string[] = [];
@@ -74,13 +83,19 @@ describe('isMpegTransportStream', () => {
     expect(isMpegTransportStream(ts)).toBe(true);
   });
 
-  it('needs four aligned sync bytes — a head too short, or one packet off, is not video', () => {
+  it('needs sixteen aligned sync bytes — a head too short, or one packet off, is not video', () => {
     const ts = makeMpegTs(40);
-    expect(isMpegTransportStream(ts.subarray(0, 3 * PACKET))).toBe(false);
-    const broken = Buffer.from(ts);
-    broken[2 * PACKET] = 0x48;
-    expect(isMpegTransportStream(broken)).toBe(false);
+    expect(isMpegTransportStream(ts.subarray(0, 15 * PACKET))).toBe(false);
+    for (const packet of [2, 15]) {
+      const broken = Buffer.from(ts);
+      broken[packet * PACKET] = 0x48;
+      expect(isMpegTransportStream(broken)).toBe(false);
+    }
     expect(isMpegTransportStream(Buffer.alloc(0))).toBe(false);
+  });
+
+  it('recognises a stream that opens with 0xFF-stuffed PAT and PMT packets', () => {
+    expect(isMpegTransportStream(makePsiLedMpegTs(40).subarray(0, MPEG_TS_SNIFF_BYTES))).toBe(true);
   });
 
   it('does not take source text with G at every 188th byte for video', () => {
@@ -89,6 +104,14 @@ describe('isMpegTransportStream', () => {
     expect(bytes[3 * PACKET]).toBe(0x47);
     expect(isMpegTransportStream(bytes)).toBe(false);
     expect(detectLanguage('gamma.ts', makeGammaSource())).toBe('typescript');
+  });
+
+  it('does not take source with G at every stride and a NUL in a comment for video (#1915 review)', () => {
+    for (const packets of [4, 16, 20]) {
+      const bytes = Buffer.from(makeGammaSource(packets, true), 'utf-8');
+      expect(bytes.includes(0)).toBe(true);
+      expect(isMpegTransportStream(bytes.subarray(0, MPEG_TS_SNIFF_BYTES))).toBe(false);
+    }
   });
 });
 
@@ -99,23 +122,26 @@ describe('MPEG-TS video named .ts is skipped, real TypeScript is indexed (#1910)
     fs.writeFileSync(path.join(dir, 'testdata', 'clip.ts'), makeMpegTs(40));
     fs.writeFileSync(path.join(dir, 'app.ts'), 'export function greet(n: string) { return `hi ${n}`; }\n');
     fs.writeFileSync(path.join(dir, 'gamma.ts'), makeGammaSource());
+    fs.writeFileSync(path.join(dir, 'gamma-nul.ts'), makeGammaSource(16, true));
 
     const stats: ScanSkipStats = { unsupportedByExtension: new Map() };
     const scanned = await scanDirectoryAsync(dir, undefined, stats);
-    expect(scanned.sort()).toEqual(['app.ts', 'gamma.ts']);
+    expect(scanned.sort()).toEqual(['app.ts', 'gamma-nul.ts', 'gamma.ts']);
     expect(stats.unsupportedByExtension.size).toBe(0);
 
     const cg = await CodeGraph.init(dir, { index: true });
     try {
       const files = cg.getFiles().map((f) => f.path).sort();
-      expect(files).toEqual(['app.ts', 'gamma.ts']);
+      expect(files).toEqual(['app.ts', 'gamma-nul.ts', 'gamma.ts']);
       expect(cg.searchNodes('greet').some((r) => r.node.name === 'greet')).toBe(true);
       expect(cg.searchNodes('Gamma2').some((r) => r.node.name === 'Gamma2')).toBe(true);
+      // The review's counterexample: G at every stride and a NUL in a comment.
+      expect(cg.searchNodes('realFn').filter((r) => r.node.filePath === 'gamma-nul.ts')).toHaveLength(1);
 
       // A named re-sync (the watcher / `sync` path hands files in by name) must
       // not let the clip back in either.
       await cg.sync({ paths: ['testdata/clip.ts', 'app.ts'] });
-      expect(cg.getFiles().map((f) => f.path).sort()).toEqual(['app.ts', 'gamma.ts']);
+      expect(cg.getFiles().map((f) => f.path).sort()).toEqual(['app.ts', 'gamma-nul.ts', 'gamma.ts']);
     } finally {
       await cg.close();
     }

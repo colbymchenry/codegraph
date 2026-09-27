@@ -175,8 +175,18 @@ export const EXTENSION_MAP: Record<string, Language> = {
 /** MPEG transport stream: fixed 188-byte packets, each opening with 0x47. */
 const MPEG_TS_PACKET_SIZE = 188;
 const MPEG_TS_SYNC_BYTE = 0x47;
-/** Consecutive packets whose sync byte must line up before a file counts as video. */
-const MPEG_TS_MIN_PACKETS = 4;
+/**
+ * Consecutive packets whose sync byte must line up before a file counts as
+ * video — 3 KB of head. A stream shorter than that is cheap to parse anyway;
+ * the cost #1910 is about comes from clips hundreds of KB long.
+ */
+const MPEG_TS_MIN_PACKETS = 16;
+/**
+ * Share of the head that must be control bytes (below 0x20, other than the
+ * whitespace ones) for it to count as binary. Compressed audio and video put
+ * about one byte in eight there; source text puts none.
+ */
+const MPEG_TS_MIN_CONTROL_SHARE = 1 / 64;
 /**
  * How many bytes of a file's head `isMpegTransportStream` needs — enough to
  * see `MPEG_TS_MIN_PACKETS` sync bytes plus the packets between them.
@@ -191,14 +201,15 @@ export const MPEG_TS_SNIFF_BYTES = MPEG_TS_PACKET_SIZE * MPEG_TS_MIN_PACKETS;
  * of the file, before any parse.
  *
  * Two conditions, both required:
- *   1. the sync byte 0x47 sits at offsets 0, 188, 376 and 564 — every packet
- *      of a transport stream opens with it, and nothing else pads to 188;
- *   2. a NUL byte appears somewhere in the head — every stream carries one
- *      within its first packets (the PSI pointer field, table reserved bits,
- *      the `00 00 01` PES start codes), and UTF-8 source text never does.
- * 0x47 is the letter `G`, so (1) alone could in principle match a source file
- * whose lines happen to put a `G` at four 188-byte strides; (2) closes that
- * door, because a text file with a NUL in it is not TypeScript either.
+ *   1. the sync byte 0x47 sits at every 188-byte packet boundary of the first
+ *      `MPEG_TS_MIN_PACKETS` packets — every packet of a transport stream
+ *      opens with it, and nothing else pads to 188;
+ *   2. the head is binary: at least `MPEG_TS_MIN_CONTROL_SHARE` of it is
+ *      control bytes, as any compressed payload is.
+ * 0x47 is the letter `G`, so (1) alone could match source whose lines happen
+ * to put a `G` at every 188-byte stride. Checking for a single NUL was not
+ * enough to close that: one NUL in a comment is still TypeScript. (2) asks for
+ * dozens of control bytes, which no source file carries.
  *
  * `head` is the first `MPEG_TS_SNIFF_BYTES` (or fewer) bytes of the file.
  */
@@ -208,10 +219,13 @@ export function isMpegTransportStream(head: Uint8Array): boolean {
   for (let off = 0; off <= lastSync; off += MPEG_TS_PACKET_SIZE) {
     if (head[off] !== MPEG_TS_SYNC_BYTE) return false;
   }
+  let control = 0;
   for (let i = 0; i < head.length; i++) {
-    if (head[i] === 0) return true;
+    const b = head[i]!;
+    // Tab, newline, vertical tab, form feed and carriage return are text.
+    if (b < 0x20 && (b < 0x09 || b > 0x0d)) control++;
   }
-  return false;
+  return control >= head.length * MPEG_TS_MIN_CONTROL_SHARE;
 }
 
 /** Whether `filePath` carries the one extension MPEG-TS shares with a language. */
