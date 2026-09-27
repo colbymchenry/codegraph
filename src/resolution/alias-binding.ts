@@ -21,6 +21,7 @@
 
 import type { Node } from '../types';
 import type { ResolutionContext } from './types';
+import { resolveObjectLiteralBinding } from './name-matcher';
 
 /** Kinds that can be a pure alias for another symbol. */
 const ALIAS_BINDING_KINDS = new Set<string>(['constant', 'variable', 'property']);
@@ -78,6 +79,15 @@ export function resolveAliasBinding(
   context: ResolutionContext
 ): Node | null {
   if (!ALIAS_BINDING_KINDS.has(aliasNode.kind)) return null;
+
+  if (memberName && ['typescript', 'tsx', 'javascript', 'jsx', 'arkts'].includes(aliasNode.language)) {
+    const resolved = resolveObjectLiteralBinding(aliasNode, memberName, {
+      fromNodeId: aliasNode.id, referenceName: memberName, referenceKind: 'calls',
+      filePath: aliasNode.filePath, language: aliasNode.language,
+      line: aliasNode.startLine, column: aliasNode.startColumn,
+    }, context);
+    return resolved ? context.getNodeById?.(resolved.targetNodeId) ?? null : null;
+  }
 
   const targetName = aliasTargetName(aliasNode.signature, memberName);
   if (!targetName || targetName === aliasNode.name) return null;

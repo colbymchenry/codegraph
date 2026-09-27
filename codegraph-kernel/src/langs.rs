@@ -23,8 +23,8 @@ extern "C" {
 extern "C" {
     fn tree_sitter_lua() -> *const ();
 }
-// Vendored scala grammar (build.rs-compiled C — the wasm is master@0aca5d0a6f,
-// 30 states past the v0.26.0 crate; see grammars/scala and the scala checklist).
+// Vendored scala grammar (build.rs-compiled C — the wasm and these sources are
+// the v0.26.2 release; see grammars/scala and the scala checklist).
 extern "C" {
     fn tree_sitter_scala() -> *const ();
 }
@@ -83,8 +83,8 @@ pub fn grammar_for(language: &str) -> Option<Language> {
         // R7b batch 4: crate =1.2.0, sha-identical to the v1.2.0 tag the
         // vendored wasm was built from (lua-luau checklist §Grammar prep).
         "luau" => Some(tree_sitter_luau::LANGUAGE.into()),
-        // R7b batch 4: master@0aca5d0a6f vendored C compiled in build.rs (the
-        // revision is not a release — crate 0.26.0 is 30 states behind).
+        // R7b batch 4: vendored C compiled in build.rs, now the v0.26.2
+        // release (#1823), kept byte-identical with the vendored wasm.
         "scala" => {
             Some(unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_scala) }.into())
         }

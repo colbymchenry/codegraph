@@ -10,7 +10,7 @@
  * is what the app-root gate has to get right. Mirrors `nextjs.test.ts`.
  */
 
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -493,5 +493,103 @@ describe('react-router: the shapes proshop is written in', () => {
       expect(screens.links.some((l) => l.from === s.id)).toBe(true);
     }
     expect(screens.dropped).toBe(0);
+  });
+});
+
+
+describe('react-router: route declaration boundaries (#1348)', () => {
+  let tmpDir: string;
+  let cg: CodeGraph | undefined;
+
+  afterEach(() => {
+    cg?.close();
+    cg = undefined;
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  async function index(source: string, extension: string) {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-rr-boundaries-'));
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), JSON.stringify({ dependencies: { react: '18' } }));
+    fs.writeFileSync(path.join(tmpDir, `App.${extension}`), source);
+    cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+    const routes = cg.getNodesByKind('route');
+    return {
+      paths: routes.map((route) => route.name).sort(),
+      bindings: routes.flatMap((route) => cg!.getOutgoingEdges(route.id)
+        .filter((edge) => edge.kind === 'references')
+        .map((edge) => `${route.name}->${cg!.getNode(edge.target)?.name}`)).sort(),
+    };
+  }
+
+  it.each(['tsx', 'jsx', 'js'])('keeps nested/index JSX routes and long attributes local in %s', async (extension) => {
+    const result = await index(`
+      import { Routes, Route } from 'react-router-dom';
+      function DashboardHome() { return null; }
+      function Settings() { return null; }
+      function Shell() { return null; }
+      const comparison = count<limit;
+      const fake = '<Route path="/fake" element={<DashboardHome/>}/>';
+      export function App() {
+        return <Routes>
+          <Route path="/dashboard">
+            <Route index element={<DashboardHome/>}/>
+            <Route path="settings" element={<Settings/>}/>
+          </Route>
+          <Route path="/empty"></Route>
+          <Route element={<Settings/>} path="/sibling"/>
+          <Route element={<Shell title="a > b"><Settings path="/nested"/></Shell>}
+            check={/}/.test('}')}
+            handle={{ text: 'path="/borrowed"', nested: { element: <DashboardHome/> } }}
+            title="${'x'.repeat(600)}" path="/long"/>
+          <Route path="/no-element" handle={{ element: <DashboardHome/> }}/>
+          <Route component={Settings} path="/legacy"/>
+        </Routes>;
+      }
+    `, extension);
+    expect(result).toEqual({
+      paths: ['/dashboard', '/empty', '/legacy', '/long', '/no-element', '/sibling', 'settings'],
+      bindings: ['/legacy->Settings', '/long->Shell', '/sibling->Settings', 'settings->Settings'],
+    });
+  });
+
+  it.each(['tsx', 'jsx', 'ts', 'js'])('pairs only direct data-router properties in either order in %s', async (extension) => {
+    const result = await index(`
+      import { createBrowserRouter } from 'react-router-dom';
+      function DataIndex() { return null; }
+      function DataSettings() { return null; }
+      const routes = createBrowserRouter([
+        { path: '/data', children: [
+          { index: true, Component: DataIndex },
+          { Component: DataSettings, path: 'prefs' }
+        ] },
+        { path: '/empty' },
+        { Component: DataSettings, path: '/sibling' },
+        { path: '/metadata', handle: { Component: DataIndex } },
+        { Component: DataSettings, handle: { path: '/not-own' } },
+        { path: '/long', handle: { text: '${'x'.repeat(600)}' }, Component: DataSettings },
+        { 'Component': DataSettings, /* path: '/fake' */ 'path': '/quoted' /* trailing comment */ },
+        { path: '', Component: DataSettings }
+      ]);
+    `, extension);
+    expect(result).toEqual({
+      paths: ['/', '/long', '/quoted', '/sibling', 'prefs'],
+      bindings: ['/->DataSettings', '/long->DataSettings', '/quoted->DataSettings', '/sibling->DataSettings', 'prefs->DataSettings'],
+    });
+  });
+
+  it('keeps nested JSX and comma-containing expressions inside their data-router property', async () => {
+    const result = await index(`
+      import { createMemoryRouter } from 'react-router-dom';
+      function Shell() { return null; }
+      function Child() { return null; }
+      const router = createMemoryRouter([
+        { element: <Shell title="a > b"><Child path="/fake"/>hello, world</Shell>,
+          handle: { text: "}, path: '/fake'", callback: () => ({ path: '/also-fake' }) }, path: '/shell' },
+        { path: '/none', handle: { element: <Child/> } },
+        { path: '/child', element: <Child/> }
+      ]);
+    `, 'tsx');
+    expect(result).toEqual({ paths: ['/child', '/shell'], bindings: ['/child->Child', '/shell->Shell'] });
   });
 });

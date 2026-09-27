@@ -155,6 +155,7 @@ pub struct Walker<'t> {
     file_path: &'t str,
     line_starts: Vec<usize>,
     arena: Arena,
+    node_id_allocator: ids::NodeIdAllocator,
     tables: Tables,
     stack: Vec<Scope>,
     node_ids: Vec<String>,
@@ -187,6 +188,7 @@ pub fn extract(file_path: &str, source: &str) -> Result<EmitOut, String> {
         file_path,
         line_starts: util::line_starts(source),
         arena: Arena::default(),
+        node_id_allocator: ids::NodeIdAllocator::default(),
         tables: Tables::default(),
         stack: Vec::new(),
         node_ids: Vec::new(),
@@ -297,7 +299,8 @@ impl<'t> Walker<'t> {
             return None;
         }
         let start_line = self.line_of(node);
-        let id = ids::node_id(self.file_path, kind, name, start_line);
+        let column = self.col_of(node);
+        let id = self.node_id_allocator.generate(self.file_path, kind, name, start_line, column);
 
         // buildQualifiedName (:1447-1460) — non-file stack names, `::`-joined;
         // namespacePrefix always empty (no C++ namespaces, no scala namespace).
@@ -548,8 +551,12 @@ impl<'t> Walker<'t> {
                 self.extract_method_or_function(node);
                 return; // skipChildren
             }
-            "class_definition" | "object_definition" => {
+            "class_definition" => {
                 self.extract_class(node, "class");
+                return;
+            }
+            "object_definition" => {
+                self.extract_class(node, "module");
                 return;
             }
             "trait_definition" => {
@@ -1193,8 +1200,12 @@ impl<'t> Walker<'t> {
         // the inverse of kotlin). Body-local classes/objects/traits/enums DO
         // extract fully.
         match kind {
-            "class_definition" | "object_definition" => {
+            "class_definition" => {
                 self.extract_class(node, "class");
+                return;
+            }
+            "object_definition" => {
+                self.extract_class(node, "module");
                 return;
             }
             "trait_definition" => {

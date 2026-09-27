@@ -201,6 +201,42 @@ describe('reference target-kind gate', () => {
     expect(rows.filter((r) => r.tgtKind === 'property' || r.tgtKind === 'field')).toEqual([]);
   });
 
+  it.each([
+    ['value declared first', 'const'],
+    ['interface declared first', 'interface'],
+  ])('binds implements to the interface of a value+interface pair (%s)', async (_label, first) => {
+    // VS Code declares every service twice under one name — the DI identifier
+    // `export const IFooService = createDecorator<IFooService>(…)` and
+    // `export interface IFooService` — so the import resolves to a file holding
+    // both. The gate rejected the value and left the ref failed, dropping every
+    // `implements IFooService` in the codebase instead of taking the interface.
+    const value = `export const IFooService = createDecorator<IFooService>('fooService');\n`;
+    const type = `export interface IFooService {\n  run(): void;\n}\n`;
+    write('src/instantiation.ts', `export function createDecorator<T>(id: string): { id: string } { return { id }; }\n`);
+    write(
+      'src/foo.ts',
+      `import { createDecorator } from './instantiation';\n\n` + (first === 'const' ? value + type : type + value)
+    );
+    write(
+      'src/fooService.ts',
+      `import { IFooService } from './foo';\n\nexport class FooService implements IFooService {\n  run(): void {}\n}\n`
+    );
+    const { edges, failed } = await load();
+    expect(has(edges, 'FooService', 'IFooService', 'interface')).toBe(true);
+    expect(has(edges, 'FooService', 'IFooService', 'constant')).toBe(false);
+    expect(failed.some((r) => r.name === 'IFooService')).toBe(false);
+  });
+
+  it('still drops an implements whose only same-named target is a value', async () => {
+    write('src/foo.ts', `export const IBarService = { id: 'bar' };\n`);
+    write(
+      'src/barService.ts',
+      `import { IBarService } from './foo';\n\nexport class BarService implements IBarService {\n  id = 'bar';\n}\n`
+    );
+    const { edges } = await load();
+    expect(edges.filter((e) => e.tgt === 'IBarService')).toEqual([]);
+  });
+
   it('keeps class extends class and class implements interface', async () => {
     write(
       'src/base.ts',

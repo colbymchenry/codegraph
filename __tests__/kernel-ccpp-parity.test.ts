@@ -95,6 +95,47 @@ describe.skipIf(!kernelBuilt)('kernel C/C++ extraction parity', () => {
     expect(viaWasm.nodes.length).toBeGreaterThanOrEqual(minNodes);
   }
 
+  it.each(['c', 'cpp'] as const)('single-argument function macros and negative controls: %s (#1373)', (language) => {
+    const source = [
+      '#define NATIVE_FN(name) int name(void)',
+      'NATIVE_FN(get_version) { return helper(); }',
+      'int use_it(void) { return get_version(); }',
+      '#define FN(name) int name(void)',
+      'FN(short_macro) { return 0; }',
+      '#define POINTER_FN(name) const char *name(void)',
+      'POINTER_FN(get_text) { return 0; }',
+      '#define TEST_CASE(name) int test_ ## name(void)',
+      'TEST_CASE(candidate) { return 0; }',
+      '#define REGISTER_FN(name) register_test(name)',
+      'REGISTER_FN(registration) { return 0; }',
+      'int (parenthesized)(void) { return 1; }',
+      '',
+    ].join('\n');
+    assertParity(`fixtures/macros.${language}`, source, language);
+    assertParity(`fixtures/macros-crlf.${language}`, source.replace(/\n/g, '\r\n'), language);
+    const result = tryKernelExtract(`fixtures/macros.${language}`, source, language)!;
+    const names = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+    expect(names).toContain('get_version');
+    expect(names).toContain('get_text');
+    expect(names).toContain('short_macro');
+    expect(names).not.toContain('candidate');
+    expect(names).not.toContain('registration');
+  });
+
+  it.each(['\n', '\r\n'])('COM interface declarations retain native/wasm parity (%j)', (eol) => {
+    const source = [
+      '#define interface struct',
+      'struct IParentInterface { virtual void Parent() = 0; };',
+      'interface IMyComInterface : IParentInterface {',
+      '    virtual void Foo() = 0;',
+      '    virtual void Bar() = 0;',
+      '};',
+      'interface IStandalone { virtual void Run() = 0; };',
+      '',
+    ].join(eol);
+    assertParity('MyInterface.h', source, 'cpp', 8);
+  });
+
   it('torture fixture (c): fn-ptr tables, typedefs, file-scope consts, value-refs', () => {
     const file = path.join(FIXTURE_DIR, 'torture.c');
     assertParity('fixtures/torture.c', fs.readFileSync(file, 'utf8'), 'c');
@@ -108,6 +149,61 @@ describe.skipIf(!kernelBuilt)('kernel C/C++ extraction parity', () => {
   it('torture fixture (hpp): fwd decls, extern "C", header templates, reflection markup', () => {
     const file = path.join(FIXTURE_DIR, 'torture.hpp');
     assertParity('fixtures/torture.hpp', fs.readFileSync(file, 'utf8'), 'cpp');
+  });
+
+  it('macro + constructor fixture (cpp): #define constants, constructor signatures, per-declarator ctor refs (#1838/#1839)', () => {
+    const file = path.join(FIXTURE_DIR, 'torture-macros-ctors.cpp');
+    const source = fs.readFileSync(file, 'utf8');
+    assertParity('fixtures/torture-macros-ctors.cpp', source, 'cpp');
+    // Pin the shapes the resolver relies on, so parity is never empty-vs-empty.
+    process.env.CODEGRAPH_KERNEL = '0';
+    const result = extractFromSource('fixtures/torture-macros-ctors.cpp', source, 'cpp');
+    delete process.env.CODEGRAPH_KERNEL;
+    expect(result.nodes.filter((n) => n.kind === 'constant').map((n) => n.qualifiedName).sort()).toEqual([
+      'TRACE_POINT',
+      'app::APP_LOG',
+      'app::constructions::LOCAL_TRACE',
+    ]);
+    expect(
+      result.nodes.filter((n) => n.kind === 'method' && n.name === 'Widget').map((n) => n.signature).sort()
+    ).toEqual(['()', '();', '(int a, int b = 2)', '(int value)', '(int value);']);
+    const ctorRefs = result.unresolvedReferences
+      .filter((r) => r.referenceKind === 'calls' && r.referenceName.includes('/'))
+      .map((r) => r.referenceName);
+    expect(ctorRefs).toEqual([
+      'Aggregate::Aggregate/0',
+      'Widget::Widget/0',
+      'Widget::Widget/0',
+      'Widget::Widget/1',
+      'Widget::Widget/2',
+      'Widget::Widget/0',
+      'Widget::Widget/1',
+      'Widget::Widget/2',
+      'app::Widget::Widget/1',
+      'Box::Box/1',
+      'Widget::Widget/0',
+    ]);
+  });
+
+  it.each(['\n', '\r\n'])('constructor prototypes and array elements remain in parity (%j)', (eol) => {
+    const source = ['struct Widget {', ' Widget(int value = 1);', '};',
+      'Widget::Widget(int renamed) {}', 'int argument() { return 2; }',
+      'void run() { Widget plain[2]; Widget empty[2]{}; Widget items[3]{{argument()}, {2}}; Widget grid[2][2]{{{1}, {2}}, {{3}}}; Widget scalars[2]{1, 2}; Widget hex[0x2]{{1}}; Widget sized[2u]{{1}}; }', ''].join(eol);
+    assertParity('arrays.cpp', source, 'cpp');
+  });
+
+  it('macro fixture (c): #define constants at file scope and inside a body (#1838)', () => {
+    const file = path.join(FIXTURE_DIR, 'torture-macros.c');
+    const source = fs.readFileSync(file, 'utf8');
+    assertParity('fixtures/torture-macros.c', source, 'c');
+    process.env.CODEGRAPH_KERNEL = '0';
+    const result = extractFromSource('fixtures/torture-macros.c', source, 'c');
+    delete process.env.CODEGRAPH_KERNEL;
+    expect(result.nodes.filter((n) => n.kind === 'constant').map((n) => n.name).sort()).toEqual([
+      'LOCAL_TRACE',
+      'MAX',
+      'TRACE_POINT',
+    ]);
   });
 
   // Metal rides the cpp route: `.metal` maps to language 'cpp' and the
@@ -144,6 +240,8 @@ describe.skipIf(!kernelBuilt)('kernel C/C++ extraction parity', () => {
     ['torture.c', 'c'],
     ['torture.cpp', 'cpp'],
     ['torture.hpp', 'cpp'],
+    ['torture-macros-ctors.cpp', 'cpp'],
+    ['torture-macros.c', 'c'],
   ] as const)('torture fixture CRLF parity: %s', (name, lang) => {
     const file = path.join(FIXTURE_DIR, name);
     const crlf = fs.readFileSync(file, 'utf8').replace(/(?<!\r)\n/g, '\r\n');

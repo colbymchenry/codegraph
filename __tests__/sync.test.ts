@@ -6,12 +6,13 @@
  * Claude Code hooks integration.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { execFileSync } from 'child_process';
-import CodeGraph from '../src/index';
+import CodeGraph, { LockUnavailableError } from '../src/index';
+import { __emitWatchEventForTests } from '../src/sync/watcher';
 
 describe('Sync Module', () => {
   describe('Sync Functionality', () => {
@@ -90,6 +91,58 @@ describe('Sync Module', () => {
     });
 
     describe('sync()', () => {
+      it('rejects a live lock and applies the pending edit after release (#1361)', async () => {
+        const lockPath = path.join(testDir, '.codegraph', 'codegraph.lock');
+        fs.writeFileSync(path.join(testDir, 'src', 'index.ts'),
+          'export function changedUnderLock() { return 2; }');
+        fs.writeFileSync(lockPath, String(process.pid));
+
+        await expect(cg.sync()).rejects.toBeInstanceOf(LockUnavailableError);
+        expect(fs.readFileSync(lockPath, 'utf8')).toBe(String(process.pid));
+        expect(cg.searchNodes('changedUnderLock')).toHaveLength(0);
+
+        fs.unlinkSync(lockPath);
+        const result = await cg.sync();
+        expect(result.filesModified).toBe(1);
+        expect(cg.searchNodes('changedUnderLock')).toHaveLength(1);
+      });
+
+      it('open with sync rejects contention without removing the held lock (#1361)', async () => {
+        const lockPath = path.join(testDir, '.codegraph', 'codegraph.lock');
+        fs.writeFileSync(lockPath, String(process.pid));
+        await expect(CodeGraph.open(testDir, { sync: true })).rejects.toBeInstanceOf(LockUnavailableError);
+        expect(fs.readFileSync(lockPath, 'utf8')).toBe(String(process.pid));
+      });
+
+      it('watch retains pending edits under a live lock and retries after release (#1361)', async () => {
+        const lockPath = path.join(testDir, '.codegraph', 'codegraph.lock');
+        const sync = vi.spyOn(cg, 'sync');
+        const onSyncComplete = vi.fn();
+        const onSyncError = vi.fn();
+        try {
+          cg.watch({ inertForTests: true, debounceMs: 20, onSyncComplete, onSyncError });
+          fs.writeFileSync(path.join(testDir, 'src', 'index.ts'),
+            'export function changedUnderLock() { return 2; }');
+          fs.writeFileSync(lockPath, String(process.pid));
+          __emitWatchEventForTests(testDir, 'src/index.ts');
+
+          await vi.waitFor(() => expect(sync).toHaveBeenCalled());
+          await expect(sync.mock.results[0].value).rejects.toBeInstanceOf(LockUnavailableError);
+          expect(cg.getPendingFiles().map((f) => f.path)).toContain('src/index.ts');
+          expect(onSyncComplete).not.toHaveBeenCalled();
+          expect(onSyncError).not.toHaveBeenCalled();
+
+          fs.unlinkSync(lockPath);
+          await vi.waitFor(() => expect(onSyncComplete).toHaveBeenCalled(), { timeout: 5000 });
+          expect(cg.getPendingFiles()).toHaveLength(0);
+          expect(cg.searchNodes('changedUnderLock')).toHaveLength(1);
+          expect(onSyncError).not.toHaveBeenCalled();
+        } finally {
+          cg.unwatch();
+          sync.mockRestore();
+        }
+      });
+
       it('should reindex added files', async () => {
         // Add a new file
         fs.writeFileSync(
@@ -1041,5 +1094,49 @@ describe('committed-but-unindexed changes (#1829)', () => {
     // ...and it self-heals: the sync writes a stamp, so the next read is clean.
     await cg.sync();
     expect(cg.getChangedFiles().added).toHaveLength(0);
+  });
+});
+
+
+describe('sync pending-reference recovery reporting (#1360)', () => {
+  let testDir: string;
+  let cg: CodeGraph;
+
+  beforeEach(async () => {
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-sync-recovery-'));
+    fs.writeFileSync(path.join(testDir, 'index.ts'),
+      'export function caller() { return target(); }\nexport function target() { return 1; }\n');
+    cg = CodeGraph.initSync(testDir);
+    await cg.indexAll();
+  });
+
+  afterEach(() => {
+    cg?.destroy();
+    fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it.each([true, false])('reports sweep outcomes without file changes (resolvable=%s)', async (resolvable) => {
+    const queries = (cg as unknown as { queries: import('../src/db/queries').QueryBuilder }).queries;
+    const caller = cg.searchNodes('caller').find(r => r.node.name === 'caller')!.node;
+    const target = cg.searchNodes('target').find(r => r.node.name === 'target')!.node;
+    queries.db.prepare("DELETE FROM edges WHERE source = ? AND target = ? AND kind = 'calls'")
+      .run(caller.id, target.id);
+    queries.insertUnresolvedRef({
+      fromNodeId: caller.id, referenceName: resolvable ? 'target' : 'missingTarget',
+      referenceKind: 'calls', line: 1, column: 35, filePath: 'index.ts', language: 'typescript',
+    });
+    expect(cg.getPendingReferenceCount()).toBe(1);
+
+    const result = await cg.sync();
+    expect(result).toMatchObject({
+      filesAdded: 0, filesModified: 0, filesRemoved: 0,
+      pendingRefsProcessed: 1, pendingRefsResolved: resolvable ? 1 : 0,
+      pendingRefsUnresolved: resolvable ? 0 : 1,
+    });
+    expect(cg.getPendingReferenceCount()).toBe(0);
+    expect(cg.getCallees(caller.id).some(r => r.node.id === target.id)).toBe(resolvable);
+    expect(await cg.sync()).toMatchObject({
+      pendingRefsProcessed: 0, pendingRefsResolved: 0, pendingRefsUnresolved: 0,
+    });
   });
 });

@@ -3,19 +3,19 @@ import os from 'os';
 import path from 'path';
 import { afterEach, expect, it, vi } from 'vitest';
 import CodeGraph from '../src/index';
-import { ToolHandler, __setLoadCodeGraphForTests } from '../src/mcp/tools';
+import { ToolHandler, MAX_CACHED_PROJECTS, __setLoadCodeGraphForTests } from '../src/mcp/tools';
 
 const roots: string[] = [];
 let handler: ToolHandler | null = null;
 
-afterEach(() => {
-  handler?.closeAll();
+afterEach(async () => {
+  await handler?.closeAll();
   handler = null;
   __setLoadCodeGraphForTests(null);
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-it('trims idle projects while another project call remains active', async () => {
+it('evicts idle projects while a call through an alias holds one connection open', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-project-cache-'));
   roots.push(root);
   __setLoadCodeGraphForTests(CodeGraph);
@@ -23,44 +23,35 @@ it('trims idle projects while another project call remains active', async () => 
   const cache = handler as unknown as {
     projectCache: Map<string, CodeGraph>;
     getCodeGraph(projectPath: string): CodeGraph;
-    trimProjectCache(): void;
   };
-  let oldest: CodeGraph | undefined;
-  for (let i = 0; i < 21; i++) {
-    const project = path.join(root, `project-${i}`);
-    fs.mkdirSync(project);
-    CodeGraph.initSync(project).close();
-    const opened = cache.getCodeGraph(project);
-    if (i === 0) oldest = opened;
-  }
+  const project = (name: string): string => {
+    const dir = path.join(root, name);
+    fs.mkdirSync(dir);
+    CodeGraph.initSync(dir).close();
+    return dir;
+  };
+  const first = project('first');
+  const opened = cache.getCodeGraph(first);
+  const close = vi.spyOn(opened, 'close');
+  const alias = path.join(root, 'alias');
+  if (process.platform !== 'win32') fs.symlinkSync(first, alias, 'dir');
+
+  let started!: () => void;
+  const dispatched = new Promise<void>(resolve => { started = resolve; });
   let finish!: (result: { content: [{ type: 'text'; text: string }] }) => void;
   const pending = new Promise<{ content: [{ type: 'text'; text: string }] }>(resolve => { finish = resolve; });
-  vi.spyOn(cache as unknown as { dispatchTool(): typeof pending }, 'dispatchTool')
-    .mockReturnValue(pending);
-  const alias = path.join(root, 'active-alias');
-  if (process.platform !== 'win32') fs.symlinkSync(path.join(root, 'project-0'), alias, 'dir');
-  const activeCall = handler.executeReadTool('codegraph_search', {
-    projectPath: process.platform === 'win32' ? path.join(root, 'project-0') : alias,
+  vi.spyOn(handler, 'executeReadTool').mockImplementation(async () => { started(); return pending; });
+  const active = handler.execute('codegraph_explore', {
+    projectPath: process.platform === 'win32' ? first : alias,
+    query: 'first',
   });
-  const close = vi.spyOn(oldest!, 'close');
-  cache.trimProjectCache();
-  expect(cache.projectCache.size).toBe(20);
-  expect(close).not.toHaveBeenCalled();
-
-  const extra = path.join(root, 'project-extra');
-  fs.mkdirSync(extra);
-  CodeGraph.initSync(extra).close();
-  cache.getCodeGraph(extra);
-  cache.trimProjectCache();
-  expect(cache.projectCache.size).toBe(20);
+  await dispatched;
+  for (let i = 0; i < MAX_CACHED_PROJECTS + 1; i++) cache.getCodeGraph(project(`idle-${i}`));
+  expect(cache.projectCache.size).toBe(MAX_CACHED_PROJECTS);
   expect(close).not.toHaveBeenCalled();
 
   finish({ content: [{ type: 'text', text: 'done' }] });
-  await activeCall;
-  const last = path.join(root, 'project-last');
-  fs.mkdirSync(last);
-  CodeGraph.initSync(last).close();
-  cache.getCodeGraph(last);
-  cache.trimProjectCache();
+  await active;
+  for (let i = 0; i < MAX_CACHED_PROJECTS + 1; i++) cache.getCodeGraph(project(`later-${i}`));
   expect(close).toHaveBeenCalledOnce();
 });

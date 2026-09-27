@@ -797,6 +797,13 @@ function containersOf(cg: CodeGraph, nodes: readonly Node[]): Map<string, Node> 
  * only choice that keeps the list's promise; the alternative puts every
  * implementation of every signature-only interface at the top of a screen that
  * says "nothing reaches this".
+ *
+ * An ancestor **outside the index** is opaque in the same way, and more so: a
+ * class that extends `React.Component` or `stream.Transform`, or implements a
+ * framework interface, has lifecycle methods the framework calls, and the
+ * ancestor leaves no edge to walk at all — only the resolver's failed
+ * `extends` / `implements` row. A container with such a row, or a project
+ * ancestor of one that has it, counts as having an opaque ancestor (#1973).
  */
 function overrideCandidates(
   cg: CodeGraph,
@@ -811,7 +818,7 @@ function overrideCandidates(
   // level rather than one per container. `reach` maps an ancestor back to the
   // containers it is an ancestor of.
   const reach = new Map<string, Set<string>>();
-  const seen = new Set<string>(containerIds);
+  const seen = new Map(containerIds.map((id) => [id, new Set([id])]));
   let frontier = containerIds.map((id) => ({ id, roots: new Set<string>([id]) }));
 
   for (let depth = 0; depth < MAX_OVERRIDE_ANCESTOR_DEPTH && frontier.length > 0; depth++) {
@@ -826,21 +833,32 @@ function overrideCandidates(
       const roots = rootsOf.get(edge.source);
       if (!roots) continue;
       const merged = next.get(edge.target) ?? new Set<string>();
-      for (const root of roots) merged.add(root);
-      next.set(edge.target, merged);
+      const visited = seen.get(edge.target) ?? new Set<string>();
       const known = reach.get(edge.target) ?? new Set<string>();
-      for (const root of roots) known.add(root);
-      reach.set(edge.target, known);
+      // An ancestor may already be a candidate root. Only skip pairs we have
+      // propagated, so later descendants still reach all of its ancestors.
+      for (const root of roots) {
+        if (visited.has(root)) continue;
+        visited.add(root);
+        merged.add(root);
+        known.add(root);
+      }
+      seen.set(edge.target, visited);
+      if (merged.size > 0) next.set(edge.target, merged);
+      if (known.size > 0) reach.set(edge.target, known);
     }
     frontier = [];
     for (const [id, roots] of next) {
-      if (seen.has(id)) continue;
-      seen.add(id);
       frontier.push({ id, roots });
     }
   }
 
-  if (reach.size === 0) return dropped;
+  const opaqueContainers = new Set<string>();
+  const externalBased = cg.getUnresolvedSupertypeSourcesAmong([...containerIds, ...reach.keys()]);
+  for (const id of containerIds) if (externalBased.has(id)) opaqueContainers.add(id);
+  for (const [ancestorId, roots] of reach) {
+    if (externalBased.has(ancestorId)) for (const root of roots) opaqueContainers.add(root);
+  }
 
   // What each ancestor declares, and whether it declares anything at all.
   const ancestorIds = [...reach.keys()];
@@ -855,7 +873,6 @@ function overrideCandidates(
 
   /** Member names an ancestor declares, and whether it declares none we can read. */
   const namesByContainer = new Map<string, Set<string>>();
-  const opaqueContainers = new Set<string>();
   for (const [ancestorId, roots] of reach) {
     const names: string[] = [];
     for (const memberId of memberIdsByAncestor.get(ancestorId) ?? []) {
