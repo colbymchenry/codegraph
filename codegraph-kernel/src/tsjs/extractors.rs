@@ -1226,14 +1226,17 @@ impl<'t> Walker<'t> {
 
     // --- extractInstantiation -----------------------------------------------------------
 
-    /// `this.<field>` as a member_expression receiver → Some(field) (#1496).
+    /// `this.<field>` as a member_expression receiver → Some(field) (#1496, #1987).
     fn this_field_of(&self, receiver: Node<'t>) -> Option<String> {
         if receiver.kind() != "member_expression" {
             return None;
         }
         let object = receiver.child_by_field_name("object")?;
         let property = receiver.child_by_field_name("property")?;
-        if object.kind() != "this" || property.kind() != "property_identifier" {
+        // An ES private field (`this.#items`) keeps its `#` (#1987).
+        if object.kind() != "this"
+            || !matches!(property.kind(), "property_identifier" | "private_property_identifier")
+        {
             return None;
         }
         Some(self.text(property).to_string())

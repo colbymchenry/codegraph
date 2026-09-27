@@ -2345,6 +2345,15 @@ export function matchMethodCall(
     );
   }
 
+  // A TS/JS call through an ES private field of the enclosing class —
+  // `this.#items.add()`, emitted as `this.#items.add` (#1987) — resolves
+  // exactly like `this.<field>` below (#1496). `#` is outside dotMatch's
+  // receiver class, so the shape is matched here.
+  if (ref.language === 'typescript' || ref.language === 'javascript' || ref.language === 'tsx' || ref.language === 'jsx') {
+    const privateField = ref.referenceName.match(/^this\.(#[\w$]+)\.(\w+)$/);
+    if (privateField) return matchTsThisFieldCall(privateField[1]!, privateField[2]!, ref, context);
+  }
+
   const match = dotMatch || colonMatch || luaColonMatch || rDollarMatch;
   if (!match) {
     return null;
@@ -2931,6 +2940,9 @@ function matchTsThisFieldCall(
     (n) => (n.kind === 'class' || n.kind === 'component') && sameLanguageFamily(n.language, ref.language)
   );
   const fieldEsc = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // `\b` can't open a name that starts with `#` (an ES private field, #1987):
+  // there is no word boundary between a space and `#`.
+  const fieldStart = field.startsWith('#') ? '(?<![\\w$])' : '\\b';
   const patterns: Array<{ re: RegExp; valueType: boolean }> = [
     // `storage: typeof DraftHubStorage` — the type OF a value: an object
     // literal used as a namespace. Its members are bare-named functions inside
@@ -2938,18 +2950,18 @@ function matchTsThisFieldCall(
     // `Type::method`. Tried first: the declared-type pattern below would
     // otherwise capture the word `typeof`.
     {
-      re: new RegExp(`\\b${fieldEsc}\\b\\s*[?!]?\\s*:\\s*(?:readonly\\s+)?typeof\\s+([A-Za-z_$][\\w.$]*)`),
+      re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*[?!]?\\s*:\\s*(?:readonly\\s+)?typeof\\s+([A-Za-z_$][\\w.$]*)`),
       valueType: true,
     },
     // `private readonly mailer?: Mailer` — a class field or a constructor
     // parameter property; the capture stops at `<`, `[` or `|`, so a generic
     // or union type yields its head and resolveMethodOnType decides.
     {
-      re: new RegExp(`\\b${fieldEsc}\\b\\s*[?!]?\\s*:\\s*(?:readonly\\s+)?([A-Za-z_$][\\w.$]*)`),
+      re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*[?!]?\\s*:\\s*(?:readonly\\s+)?([A-Za-z_$][\\w.$]*)`),
       valueType: false,
     },
     // `mailer = new Mailer()` / `this.mailer = new Mailer()`
-    { re: new RegExp(`\\b${fieldEsc}\\b\\s*=\\s*new\\s+([A-Za-z_$][\\w.$]*)`), valueType: false },
+    { re: new RegExp(`${fieldStart}${fieldEsc}\\b\\s*=\\s*new\\s+([A-Za-z_$][\\w.$]*)`), valueType: false },
   ];
   for (const cls of owners) {
     const source = context.readFile(cls.filePath);

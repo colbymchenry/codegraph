@@ -409,6 +409,8 @@ const TS_JS_CHAIN_LANGUAGES = new Set(['typescript', 'tsx', 'javascript', 'jsx']
 
 /** Receiver node types (TS/JS grammars) that continue a member chain downward. */
 const TS_JS_CHAIN_RECEIVER_TYPES = new Set(['member_expression', 'subscript_expression']);
+/** The field of a `this.<field>.<method>()` receiver: public or ES private (#1496, #1987). */
+const THIS_FIELD_PROPERTY_TYPES = new Set(['property_identifier', 'private_property_identifier']);
 
 /**
  * Identifier-rooted member chains have no inferred property type (#1566),
@@ -4820,7 +4822,7 @@ export class TreeSitterExtractor {
               receiver &&
               receiver.type === 'member_expression' &&
               getChildByField(receiver, 'object')?.type === 'this' &&
-              getChildByField(receiver, 'property')?.type === 'property_identifier'
+              THIS_FIELD_PROPERTY_TYPES.has(getChildByField(receiver, 'property')?.type ?? '')
             ) {
               // TS/JS call through a field of the enclosing class —
               // `this.mailer.send()` (#1496). Keep the `this.<field>` prefix:
@@ -4833,6 +4835,8 @@ export class TreeSitterExtractor {
               // itself when the two share a name, a self-edge not in the
               // source. Same discipline as Rust's `self.<field>` (#1585).
               // Mirrored in the kernel's extract_call (tsjs/extractors.rs).
+              // An ES private field (`this.#items.add()`) is the same shape;
+              // its name keeps the `#` (#1987).
               const fieldName = getNodeText(getChildByField(receiver, 'property')!, this.source);
               calleeName = `this.${fieldName}.${methodName}`;
             } else if (

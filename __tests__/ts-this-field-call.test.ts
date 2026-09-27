@@ -65,6 +65,23 @@ beforeAll(async () => {
       '  async settings(): Promise<object> { return this.storage.getSettings(); }\n' +
       '}\n'
   );
+  // ES private fields (#1987). `Outbox::send` and `Cart::add` sit in the same
+  // file, so a bare-name guess would pick them over the field's real type.
+  w(
+    'vault.ts',
+    "import { Mailer } from './mailer';\n" +
+      'export class Outbox {\n  send(msg: string): string { return msg; }\n}\n' +
+      'export class Cart {\n  add(item: string): void {}\n}\n' +
+      'export class Vault {\n' +
+      '  #mailer: Mailer;\n' +
+      '  #backup = new Mailer();\n' +
+      '  #items = new Set<string>();\n' +
+      '  constructor(m: Mailer) { this.#mailer = m; }\n' +
+      '  notify(msg: string): string { return this.#mailer.send(msg); }\n' +
+      '  fallback(msg: string): string { return this.#backup.send(msg); }\n' +
+      '  put(x: string): void { this.#items.add(x); }\n' +
+      '}\n'
+  );
   cg = CodeGraph.initSync(dir);
   await cg.indexAll();
 });
@@ -102,5 +119,15 @@ describe('this.<field>.<method>() (#1496)', () => {
     expect(calleesOf('Keeper::get')).toEqual(['get']);
     const self = cg.getCallers(method('Keeper::get').id).some(({ node }) => node.id === method('Keeper::get').id);
     expect(self).toBe(false);
+  });
+
+  it('resolves an ES private field on its declared or constructed type (#1987)', () => {
+    expect(calleesOf('Vault::notify')).toEqual(['Mailer::send']);
+    expect(calleesOf('Vault::fallback')).toEqual(['Mailer::send']);
+  });
+
+  it('leaves a builtin-typed ES private field unresolved (#1987)', () => {
+    // `this.#items.add()` on a Set must not bind to the project's `Cart::add`.
+    expect(calleesOf('Vault::put')).toEqual([]);
   });
 });
