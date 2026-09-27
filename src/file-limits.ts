@@ -8,6 +8,29 @@ import * as fsp from 'fs/promises';
  */
 export const MAX_SOURCE_FILE_SIZE_BYTES = 1024 * 1024;
 
+/**
+ * What stands in for the content of a file over MAX_SOURCE_FILE_SIZE_BYTES. Such a file is
+ * never parsed, so its bytes are never needed — reading them only to hash and
+ * discard cost multi-GB RSS spikes on committed video/blob fixtures and could
+ * fail outright with `Invalid string length` (#1910). The stamp is a function
+ * of size alone: change detection compares it to the stored hash, so a
+ * same-size rewrite of an oversize file is not a change (nothing about it is
+ * indexed), while crossing the limit in either direction is.
+ */
+export function oversizeStamp(size: number): string {
+  return `codegraph:oversize:${size}`;
+}
+
+/**
+ * The text whose hash the index stores for a file of `size` bytes: its content
+ * within the limit, the size stamp over it. Anything that checks a file on disk
+ * against its stored `contentHash` has to hash this, or every unchanged file
+ * over the limit reads as drifted. `content` is only read within the limit.
+ */
+export function indexedHashInput(size: number, content: () => string): string {
+  return size > MAX_SOURCE_FILE_SIZE_BYTES ? oversizeStamp(size) : content();
+}
+
 /** A source file's stats, and its bytes when they are within the limit (null = oversize). */
 export interface BoundedSource {
   stats: fs.Stats;
