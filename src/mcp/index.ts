@@ -92,6 +92,16 @@ const TAKEOVER_RETRY_DELAY_MS = 100;
  * legacy daemon. Plain-PID locks cannot prove daemon identity, but they still
  * prove that a process owns the legacy writer slot.
  */
+/**
+ * A fallback that serves reads without a watcher or a writer lock (#1963).
+ * Say so on stderr: otherwise a session that quietly stopped syncing looks
+ * the same as a healthy one in the logs.
+ */
+function readOnlyFallback(holder: string): MCPEngine {
+  process.stderr.write(`[CodeGraph MCP] Serving reads in-process without auto-sync: ${holder}.\n`);
+  return new MCPEngine({ watch: false });
+}
+
 function makeFallbackEngine(root: string): MCPEngine {
   let existing: ReturnType<typeof decodeLockInfo> = null;
   try {
@@ -115,10 +125,10 @@ function makeFallbackEngine(root: string): MCPEngine {
   if (writer && writer.pid > 0 && isProcessAlive(writer.pid)) {
     // Another process owns updates. A fallback may still serve read-only WAL
     // queries without claiming a second writer or starting a watcher (#1963).
-    return new MCPEngine({ watch: false });
+    return readOnlyFallback(`writer lock held by PID ${writer.pid} (${writer.mode} mode)`);
   }
   if (existing && isProcessAlive(existing.pid)) {
-    return new MCPEngine({ watch: false });
+    return readOnlyFallback(`live daemon PID ${existing.pid} holds the project lock`);
   }
   return new MCPEngine({ writerLockRoot: root });
 }

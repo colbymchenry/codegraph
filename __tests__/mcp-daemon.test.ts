@@ -417,6 +417,7 @@ describe('Shared MCP daemon (issue #411)', () => {
     expect(toolResponse.error).toBeUndefined();
     expect(toolResponse.result?.isError).not.toBe(true);
     expect(JSON.stringify(toolResponse.result)).toContain('CodeGraph Status');
+    expect(second.stderr.some((line) => line.includes('Serving reads in-process without auto-sync'))).toBe(true);
   }, 50000);
 
   it('does not replace a live legacy lock with a second daemon', async () => {
@@ -525,6 +526,7 @@ describe('Shared MCP daemon (issue #411)', () => {
       expect(toolResponse.result?.isError).not.toBe(true);
       expect(JSON.stringify(toolResponse.result)).toContain('CodeGraph Status');
       expect(fs.existsSync(path.join(realRoot, '.codegraph', 'writer.pid'))).toBe(false);
+      expect(server.stderr.some((l) => l.includes('Serving reads in-process without auto-sync: live daemon PID'))).toBe(true);
     } finally {
       await new Promise<void>((resolve) => miniServer.close(() => resolve()));
     }
