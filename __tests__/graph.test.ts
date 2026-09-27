@@ -612,4 +612,42 @@ describe('Traversal edge-completeness & limits (#1086–#1090)', () => {
     // The regression: this direct dependency edge used to vanish.
     expect(sub.edges.some((e) => e.source === 'Q' && e.target === 'P' && e.kind === 'calls')).toBe(true);
   });
+
+  // The issue's graph: a→t, b→a, b→t, c→b. Edge order sends the walk to b
+  // through a first, at the depth limit, before the direct b→t edge (#1974).
+  const depthNodes = ['t', 'a', 'b', 'c'].map((n) => tNode(n));
+  const depthEdges: Edge[] = [
+    { source: 'a', target: 't', kind: 'calls', line: 1 },
+    { source: 'b', target: 'a', kind: 'calls', line: 2 },
+    { source: 'b', target: 't', kind: 'calls', line: 3 },
+    { source: 'c', target: 'b', kind: 'calls', line: 4 },
+  ];
+
+  it('getImpactRadius finds a dependent within the depth even when a longer path reaches its parent first (#1974)', () => {
+    const sub = tGraph(depthNodes, depthEdges).getImpactRadius('t', 2);
+    // c → b → t is two hops. Pre-fix: b was first reached via a at depth 2 and
+    // never expanded again, so c was missing.
+    expect([...sub.nodes.keys()].sort()).toEqual(['a', 'b', 'c', 't']);
+    expect(sub.edges.some((e) => e.source === 'c' && e.target === 'b')).toBe(true);
+    // Re-expanding b does not record its incoming edges twice.
+    const keys = sub.edges.map((e) => `${e.source}>${e.target}:${e.line}`);
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
+  it('getCallers at depth N finds every caller within N hops, each once (#1974)', () => {
+    const callers = tGraph(depthNodes, depthEdges).getCallers('t', 2);
+    expect(callers.map((c) => c.node.id).sort()).toEqual(['a', 'b', 'c']);
+  });
+
+  it('getCallees at depth N finds every callee within N hops, each once (#1974)', () => {
+    // Mirror image: t→a, a→b, t→b, b→c. From t, b is 1 hop and c is 2.
+    const edges: Edge[] = [
+      { source: 't', target: 'a', kind: 'calls', line: 1 },
+      { source: 'a', target: 'b', kind: 'calls', line: 2 },
+      { source: 't', target: 'b', kind: 'calls', line: 3 },
+      { source: 'b', target: 'c', kind: 'calls', line: 4 },
+    ];
+    const callees = tGraph(depthNodes, edges).getCallees('t', 2);
+    expect(callees.map((c) => c.node.id).sort()).toEqual(['a', 'b', 'c']);
+  });
 });
