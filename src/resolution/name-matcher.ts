@@ -726,7 +726,10 @@ function pythonModuleAliases(filePath: string, moduleFile: string, context: Reso
       : /^\.+$/.test(m.source) ? `${m.source}${m.exportedName}` : `${m.source}.${m.exportedName}`;
     const files = pythonModuleFiles(dotted, filePath, context);
     if (!files.includes(moduleFile)) continue;
-    const plainDotted = m.isNamespace && m.source.includes('.') && m.localName === m.source.split('.').pop();
+    // The mapping cannot tell `import a.b` from `import a.b as b`; the source line can.
+    const explicit = new RegExp(`\\bimport\\s[^\\n]*\\b${m.source.replace(/\./g, '\\.')}\\s+as\\s+${m.localName}\\b`);
+    const plainDotted = m.isNamespace && m.source.includes('.') && m.localName === m.source.split('.').pop() &&
+      !pythonMemberLines(filePath, context).some(line => explicit.test(line));
     (files.length === 1 ? aliases : ambiguous).add(plainDotted ? m.source : m.localName);
   }
   return { aliases: [...aliases], ambiguous: [...ambiguous] };
@@ -739,7 +742,9 @@ function pythonMainBlockLines(filePath: string, context: ResolutionContext): Set
     const lines = pythonMemberLines(filePath, context);
     const inside = new Set<number>();
     for (let i = 0; i < lines.length; i++) {
-      if (!PYTHON_MAIN_GUARD.test(lines[i]!)) continue;
+      const guard = lines[i]!.match(PYTHON_MAIN_GUARD);
+      if (!guard) continue;
+      if (lines[i]!.slice(guard[0].length).trim()) inside.add(i); // `if __name__ == "__main__": stmt`
       for (let j = i + 1; j < lines.length && !/^\S/.test(lines[j]!); j++) inside.add(j);
     }
     return inside;
@@ -815,12 +820,17 @@ function pythonExternalWrites(global: Node, context: ResolutionContext): { write
 function pythonDynamicGlobalWrite(name: string, filePath: string, context: ResolutionContext): boolean {
   const lines = pythonMemberLines(filePath, context);
   const statements = pythonStatementStarts(filePath, context);
-  const namespace = /\bglobals\(\s*\)|\bvars\(\s*\)|\bsys\.modules\s*\[\s*__name__\s*\]/g;
+  const script = pythonMainBlockLines(filePath, context);
+  // `vars()` is the module dict only at module scope; inside a function it is the locals.
+  const moduleLines = new Set(pythonOwnLines(null, filePath, context));
   for (let i = 0; i < lines.length; i++) {
-    if (!statements[i]) continue;
+    if (!statements[i] || script.has(i)) continue;
     let statement = lines[i]!;
     for (let j = i + 1; j < lines.length && !statements[j]; j++) statement += '\n' + lines[j];
     const code = blankPythonStrings(statement);
+    const namespace = moduleLines.has(i)
+      ? /\bglobals\(\s*\)|\bvars\(\s*\)|\bsys\.modules\s*\[\s*__name__\s*\]/g
+      : /\bglobals\(\s*\)|\bsys\.modules\s*\[\s*__name__\s*\]/g;
     const uses = code.match(namespace)?.length ?? 0;
     if (!uses) continue;
     const targets = pythonAssignment(statement)?.targets ?? [];
