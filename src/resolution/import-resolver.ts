@@ -11,6 +11,7 @@ import { UnresolvedRef, ResolvedRef, ResolutionContext, ImportMapping, ReExport 
 import { applyAliases } from './path-aliases';
 import { extractLocalExportAliases } from './alias-binding';
 import { resolveWorkspaceImport } from './workspace-packages';
+import { stripCommentsForRegex } from './strip-comments';
 import {
   resolveMethodOnType,
   resolveObjectLiteralMember,
@@ -879,7 +880,7 @@ export function extractImportMappings(
     // whole SFC (markup + styles included) is safe.
     mappings.push(...extractJSImports(content));
   } else if (language === 'python') {
-    mappings.push(...extractPythonImports(content));
+    mappings.push(...extractPythonImports(stripCommentsForRegex(content, 'python')));
   } else if (language === 'go') {
     mappings.push(...extractGoImports(content));
   } else if (language === 'java' || language === 'kotlin') {
@@ -1003,13 +1004,14 @@ function extractJSImports(content: string): ImportMapping[] {
 function extractPythonImports(content: string): ImportMapping[] {
   const mappings: ImportMapping[] = [];
 
-  // from X import Y
-  const fromImportRegex = /from\s+([\w.]+)\s+import\s+([^#\n]+)/g;
+  // from X import Y, and the parenthesized form `from X import (\n Y,\n Z,\n)`
+  const fromImportRegex = /from\s+([\w.]+)\s+import\s+(\([^)]*\)|[^#\n]+)/g;
   let match;
 
   while ((match = fromImportRegex.exec(content)) !== null) {
     const [, source, imports] = match;
-    const names = imports!.split(',').map((s) => s.trim());
+    const names = imports!.trim().replace(/^\(|\)$/g, '')
+      .split(',').map((s) => s.trim());
 
     for (const name of names) {
       const aliasMatch = name.match(/(\w+)\s+as\s+(\w+)/);
