@@ -11,7 +11,7 @@ import { UnresolvedRef, ResolvedRef, ResolutionContext, isSupertypeTarget, CPP_D
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
-import { isTestFile, isTestPath } from '../search/query-utils';
+import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
 /**
@@ -640,7 +640,8 @@ function scanPythonGlobalBindings(name: string, filePath: string, context: Resol
     const scope = scopes.filter(n => n.startLine <= i + 1 && n.endLine >= i + 1).sort((a, b) => b.startLine - a.startLine)[0];
     if (scope && scope.kind !== 'class') regions.push(pythonOwnLines(scope, filePath, context));
   }
-  return regions.flatMap(region => region.flatMap(i => pythonLineBindings(lines, i, statements, name)))
+  const script = pythonMainBlockLines(filePath, context);
+  return regions.flatMap(region => region.filter(i => !script.has(i)).flatMap(i => pythonLineBindings(lines, i, statements, name)))
     .filter(b => b.kind !== 'global');
 }
 
@@ -686,33 +687,73 @@ function pythonGlobalClasses(global: Node, ref: UnresolvedRef, context: Resoluti
   return classes;
 }
 
-/** `a/b/c.py` → `a.b.c`; a package's `__init__.py` → the package. */
-function pythonModulePath(filePath: string): string {
-  return filePath.replace(/\\/g, '/').replace(/\.pyi?$/, '').replace(/\/__init__$/, '').split('/').join('.');
+/**
+ * The repo files a Python module path can name from `fromFile`. Relative
+ * paths (`..settings`) resolve exactly; absolute ones match a file path
+ * suffix, so a source root (`src/`) still resolves — and two files sharing
+ * the tail (`x/settings.py`, `y/settings.py`) both come back.
+ */
+function pythonModuleFiles(dotted: string, fromFile: string, context: ResolutionContext): string[] {
+  const dots = dotted.match(/^\.+/)?.[0].length ?? 0;
+  const parts = dotted.slice(dots).split('.').filter(Boolean);
+  if (!parts.length) return [];
+  let dir = '';
+  if (dots) {
+    dir = path.posix.dirname(fromFile.replace(/\\/g, '/'));
+    for (let i = 1; i < dots; i++) dir = path.posix.dirname(dir);
+    if (dir === '.') dir = '';
+  }
+  const rel = [dir, ...parts].filter(Boolean).join('/');
+  const matches = (file: string, want: string) => dots ? file === want : file === want || file.endsWith(`/${want}`);
+  const last = parts[parts.length - 1]!;
+  return [
+    ...context.getNodesByName(`${last}.py`), ...context.getNodesByName(`${last}.pyi`), ...context.getNodesByName('__init__.py'),
+  ].filter(n => n.kind === 'file' && (matches(n.filePath, `${rel}.py`) || matches(n.filePath, `${rel}.pyi`) || matches(n.filePath, `${rel}/__init__.py`)))
+    .map(n => n.filePath);
 }
 
-/** Names in `filePath` that bind module `module` (dotted; matched as a suffix, so source roots don't matter). */
-function pythonModuleAliases(filePath: string, module: string, context: ResolutionContext): string[] {
-  const names = (dotted: string) => dotted === module || module.endsWith(`.${dotted}`);
+/**
+ * How `filePath` spells the module `moduleFile`: `aliases` import exactly that
+ * file; `ambiguous` could also be another file sharing its dotted tail.
+ * `import a.b` binds `a`, so that module is spelled `a.b` (the mapping's
+ * last-segment `localName` is not a binding); `import a.b as c` binds `c`.
+ */
+function pythonModuleAliases(filePath: string, moduleFile: string, context: ResolutionContext): { aliases: string[]; ambiguous: string[] } {
   const aliases = new Set<string>();
+  const ambiguous = new Set<string>();
   for (const m of context.getImportMappings(filePath, 'python')) {
-    let source = m.source;
-    const dots = source.match(/^\.+/)?.[0].length ?? 0;
-    if (dots) {
-      // `from . import x` in `pkg/mod.py` → `pkg.x`; one more dot per level up.
-      const here = pythonModulePath(filePath).split('.');
-      const pkg = /\/__init__\.pyi?$/.test(filePath.replace(/\\/g, '/')) ? here : here.slice(0, -1);
-      source = [...pkg.slice(0, pkg.length - (dots - 1)), ...source.slice(dots).split('.').filter(Boolean)].join('.');
-    }
-    if (m.isNamespace) {
-      if (!names(source)) continue;
-      aliases.add(m.localName);
-      aliases.add(source); // `import a.b` binds `a`, so the module is spelled `a.b`
-    } else if (names(source ? `${source}.${m.exportedName}` : m.exportedName)) {
-      aliases.add(m.localName);
-    }
+    const dotted = m.isNamespace ? m.source
+      : /^\.+$/.test(m.source) ? `${m.source}${m.exportedName}` : `${m.source}.${m.exportedName}`;
+    const files = pythonModuleFiles(dotted, filePath, context);
+    if (!files.includes(moduleFile)) continue;
+    const plainDotted = m.isNamespace && m.source.includes('.') && m.localName === m.source.split('.').pop();
+    (files.length === 1 ? aliases : ambiguous).add(plainDotted ? m.source : m.localName);
   }
-  return [...aliases];
+  return { aliases: [...aliases], ambiguous: [...ambiguous] };
+}
+
+const PYTHON_MAIN_GUARD = /^if\s+(?:__name__\s*==\s*(['"])__main__\1|(['"])__main__\2\s*==\s*__name__)\s*:/;
+/** Line indexes inside a top-level `if __name__ == "__main__":` block — script code, not module state. */
+function pythonMainBlockLines(filePath: string, context: ResolutionContext): Set<number> {
+  return pythonNameScan(context, `main\0${filePath}`, () => {
+    const lines = pythonMemberLines(filePath, context);
+    const inside = new Set<number>();
+    for (let i = 0; i < lines.length; i++) {
+      if (!PYTHON_MAIN_GUARD.test(lines[i]!)) continue;
+      for (let j = i + 1; j < lines.length && !/^\S/.test(lines[j]!); j++) inside.add(j);
+    }
+    return inside;
+  });
+}
+
+/** Blank single-line string contents (triple-quoted strings are already blanked by the comment stripper). */
+function blankPythonStrings(text: string): string {
+  return text.replace(/(['"])(?:\\.|(?!\1)[^\\\n])*\1/g, m => m[0] + ' '.repeat(m.length - 2) + m[0]);
+}
+
+/** Test code installs doubles: the narrow test-suite set, plus pytest's `conftest.py` wherever it sits. */
+function isPythonTestFile(filePath: string): boolean {
+  return isTestPath(filePath) || /(?:^|\/)conftest\.py$/.test(filePath.replace(/\\/g, '/'));
 }
 
 /**
@@ -726,22 +767,25 @@ function pythonModuleAliases(filePath: string, module: string, context: Resoluti
 function pythonExternalWrites(global: Node, context: ResolutionContext): { writes: Array<{ type: string; file: string }>; unknown: boolean; writers: Set<string> } {
   return pythonNameScan(context, `external\0${global.id}`, () => {
     const out = { writes: [] as Array<{ type: string; file: string }>, unknown: false, writers: new Set<string>() };
-    const module = pythonModulePath(global.filePath);
     const name = global.name;
     const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     for (const file of context.getAllFiles()) {
       if (file === global.filePath || !/\.pyi?$/.test(file) || !context.readFile(file)?.includes(name)) continue;
-      const test = isTestFile(file);
-      const aliases = pythonModuleAliases(file, module, context);
-      if (!test && !aliases.length) continue;
-      const receiver = test ? '[\\w.]+' : `(?:${aliases.map(escape).join('|')})`;
+      const test = isPythonTestFile(file);
+      const { aliases, ambiguous } = pythonModuleAliases(file, global.filePath, context);
+      if (!test && !aliases.length && !ambiguous.length) continue;
+      const spell = (names: string[]) => `(?:${names.map(escape).join('|')})`;
+      // Test files: any receiver (the double may sit on any spelling of the module).
+      const receiver = test ? '[\\w.]+' : spell([...aliases, ...ambiguous]);
       const target = new RegExp(`(?<![\\w.])${receiver}\\.${name}\\b(?!\\s*[.\\[(])`);
-      const exact = new RegExp(`^${receiver}\\.${name}$`);
-      const dynamic = new RegExp(`\\b(?:setattr|patch\\.object)\\s*\\(\\s*${receiver}\\s*,\\s*['"]${name}['"]`);
+      const exact = new RegExp(`^${test ? receiver : spell(aliases.length ? aliases : ['\\0'])}\\.${name}(?:\\s*:[^=]*)?$`);
+      const dynamic = new RegExp(`\\b(?:setattr|patch\\.object)\\s*\\(\\s*${receiver}\\s*,\\s*['"]${name}['"]` +
+        `|(?<![\\w.])${receiver}\\.__dict__\\s*(?:\\[|\\.\\s*update\\s*\\()`);
       const lines = pythonMemberLines(file, context);
       const statements = pythonStatementStarts(file, context);
+      const script = pythonMainBlockLines(file, context);
       for (let i = 0; i < lines.length; i++) {
-        if (!statements[i]) continue;
+        if (!statements[i] || script.has(i)) continue;
         let statement = lines[i]!;
         for (let j = i + 1; j < lines.length && !statements[j]; j++) statement += '\n' + lines[j];
         if (!statement.includes(name)) continue;
@@ -749,6 +793,7 @@ function pythonExternalWrites(global: Node, context: ResolutionContext): { write
         const assigned = assignment?.targets.some(t => target.test(t.trim())) ?? false;
         if (!assigned && !dynamic.test(statement)) continue;
         if (test) { out.writers.add(file); continue; }
+        // A write through an ambiguous spelling may land on another module: unknown.
         const single = assignment && assignment.targets.length === 1 && !assignment.augmented && exact.test(assignment.targets[0]!.trim());
         const value = single ? assignment!.value.trim() : '';
         if (value === 'None') continue;
@@ -761,15 +806,34 @@ function pythonExternalWrites(global: Node, context: ResolutionContext): { write
   });
 }
 
-/** `globals()[...] = ...` naming the global (or with a computed key), or `globals().update(...)`, in its own module. */
+/**
+ * Whether the global's own module can write it through its namespace dict:
+ * `globals()` / `vars()` / `sys.modules[__name__]` used as anything but a
+ * literal-key read or `.get`, or a literal-key write of this name. Read per
+ * statement (continuations joined), with string contents ignored.
+ */
 function pythonDynamicGlobalWrite(name: string, filePath: string, context: ResolutionContext): boolean {
-  return pythonMemberLines(filePath, context).some(line => {
-    if (/\bglobals\(\)\s*\.\s*update\s*\(/.test(line)) return true;
-    const key = line.match(/\bglobals\(\)\s*\[\s*([^\]]+?)\s*\]\s*=(?!=)/)?.[1];
-    if (!key) return false;
-    const literal = key.match(/^(['"])(\w+)\1$/);
-    return !literal || literal[2] === name;
-  });
+  const lines = pythonMemberLines(filePath, context);
+  const statements = pythonStatementStarts(filePath, context);
+  const namespace = /\bglobals\(\s*\)|\bvars\(\s*\)|\bsys\.modules\s*\[\s*__name__\s*\]/g;
+  for (let i = 0; i < lines.length; i++) {
+    if (!statements[i]) continue;
+    let statement = lines[i]!;
+    for (let j = i + 1; j < lines.length && !statements[j]; j++) statement += '\n' + lines[j];
+    const code = blankPythonStrings(statement);
+    const uses = code.match(namespace)?.length ?? 0;
+    if (!uses) continue;
+    const targets = pythonAssignment(statement)?.targets ?? [];
+    let safe = 0;
+    for (const m of statement.matchAll(/\bglobals\(\s*\)\s*(?:\[\s*(['"])(\w+)\1\s*\]|\.\s*get\s*\()/g)) {
+      const key = m[2];
+      const written = key !== undefined && targets.some(t => t.includes(m[0]));
+      if (written && key === name) return true;
+      safe++;
+    }
+    if (uses > safe) return true;
+  }
+  return false;
 }
 
 /**
@@ -805,6 +869,17 @@ function pythonGlobalMembers(global: Node, member: string, ref: UnresolvedRef, c
 
 /** `Cls(...)` / `pkg.mod.Cls(...)` as the WHOLE (possibly multi-line) value; else null (`Cls() if x else y`). */
 function pythonConstructorCall(text: string): string | null {
+  // `(Cls())` is the same value; peel parentheses that wrap the whole expression.
+  for (let wrapped = text.trim(); wrapped.startsWith('('); ) {
+    let depth = 0;
+    let close = -1;
+    for (let i = 0; i < wrapped.length && close < 0; i++) {
+      if (wrapped[i] === '(') depth++;
+      else if (wrapped[i] === ')' && --depth === 0) close = i;
+    }
+    if (close !== wrapped.length - 1) break;
+    text = wrapped = wrapped.slice(1, -1).trim();
+  }
   const callee = text.match(/^((?:[A-Za-z_]\w*\.)*[A-Z]\w*)\s*\(/);
   if (!callee) return null;
   let depth = 0;
