@@ -11,7 +11,7 @@ import { UnresolvedRef, ResolvedRef, ResolutionContext, isSupertypeTarget, CPP_D
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
-import { isTestPath } from '../search/query-utils';
+import { isTestFile, isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
 import { getCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
 /**
@@ -650,37 +650,126 @@ const PYTHON_GLOBAL_CLASSES = new WeakMap<ResolutionContext, Map<string, Node[] 
  * rebound by `global conn; conn = Backend()`), so its type is the set of
  * classes its module assigns to it: at module scope, or in a function that
  * declares it `global`. Any other binding of it there (an opaque value, a
- * tuple target, `for`/`with`/import, a star import) makes the type unknown
- * (null). Not seen: rebinding from ANOTHER module (`settings.conn = X`) and
- * dynamic writes (`globals()["conn"] = X`).
+ * tuple target, `for`/`with`/import, a star import, a `globals()` write)
+ * makes the type unknown (null). Production writes from other modules
+ * (`settings.conn = X`) join the set; see pythonExternalWrites.
  */
 function pythonGlobalClasses(global: Node, ref: UnresolvedRef, context: ResolutionContext): Node[] | null {
   let memo = PYTHON_GLOBAL_CLASSES.get(context);
   if (!memo) { memo = new Map(); PYTHON_GLOBAL_CLASSES.set(context, memo); }
   if (memo.has(global.id)) return memo.get(global.id)!;
   const file = global.filePath;
-  const types = new Set<string>();
-  let classes: Node[] | null = [];
-  for (const b of pythonGlobalBindings(global.name, file, context)) {
+  const external = pythonExternalWrites(global, context);
+  // Each type is resolved in the file that wrote it (its imports name the class).
+  const writes: Array<{ type: string; file: string }> = [...external.writes];
+  let classes: Node[] | null = external.unknown || pythonDynamicGlobalWrite(global.name, file, context) ? null : [];
+  for (const b of classes ? pythonGlobalBindings(global.name, file, context) : []) {
     if (b.kind !== 'assign') { classes = null; break; }
     const constructor = b.value && b.value !== 'None' ? pythonConstructorCall(b.value) : null;
     if (b.type) {
       // `conn: Base = make()` trusts the annotation; `conn: A = B()` contradicts it.
       if (constructor && constructor.split('.').pop() !== b.type.split('.').pop()) { classes = null; break; }
-      types.add(b.type);
+      writes.push({ type: b.type, file });
       continue;
     }
     if (b.value === 'None') continue;
     if (!constructor) { classes = null; break; }
-    types.add(constructor);
+    writes.push({ type: constructor, file });
   }
-  for (const type of classes ? types : []) {
-    const cls = pythonRefClass(type, { ...ref, filePath: file }, context);
+  const seen = new Set<string>();
+  for (const write of classes ? writes : []) {
+    const cls = pythonRefClass(write.type, { ...ref, filePath: write.file }, context);
     if (!cls) { classes = null; break; }
-    classes!.push(cls);
+    if (!seen.has(cls.id)) { seen.add(cls.id); classes!.push(cls); }
   }
   memo.set(global.id, classes);
   return classes;
+}
+
+/** `a/b/c.py` → `a.b.c`; a package's `__init__.py` → the package. */
+function pythonModulePath(filePath: string): string {
+  return filePath.replace(/\\/g, '/').replace(/\.pyi?$/, '').replace(/\/__init__$/, '').split('/').join('.');
+}
+
+/** Names in `filePath` that bind module `module` (dotted; matched as a suffix, so source roots don't matter). */
+function pythonModuleAliases(filePath: string, module: string, context: ResolutionContext): string[] {
+  const names = (dotted: string) => dotted === module || module.endsWith(`.${dotted}`);
+  const aliases = new Set<string>();
+  for (const m of context.getImportMappings(filePath, 'python')) {
+    let source = m.source;
+    const dots = source.match(/^\.+/)?.[0].length ?? 0;
+    if (dots) {
+      // `from . import x` in `pkg/mod.py` → `pkg.x`; one more dot per level up.
+      const here = pythonModulePath(filePath).split('.');
+      const pkg = /\/__init__\.pyi?$/.test(filePath.replace(/\\/g, '/')) ? here : here.slice(0, -1);
+      source = [...pkg.slice(0, pkg.length - (dots - 1)), ...source.slice(dots).split('.').filter(Boolean)].join('.');
+    }
+    if (m.isNamespace) {
+      if (!names(source)) continue;
+      aliases.add(m.localName);
+      aliases.add(source); // `import a.b` binds `a`, so the module is spelled `a.b`
+    } else if (names(source ? `${source}.${m.exportedName}` : m.exportedName)) {
+      aliases.add(m.localName);
+    }
+  }
+  return [...aliases];
+}
+
+/**
+ * Writes to module global `global` from OTHER files. A production write
+ * `<module>.<name> = Cls(...)` adds a type; any other production write
+ * (another value, a tuple target, `setattr`) makes the type unknown. Test
+ * files install doubles (`settings.conn = MagicMock()`, `monkeypatch.setattr`)
+ * that do not define the production type; they are recorded as `writers`, and
+ * a ref inside a writer resolves nothing through the global.
+ */
+function pythonExternalWrites(global: Node, context: ResolutionContext): { writes: Array<{ type: string; file: string }>; unknown: boolean; writers: Set<string> } {
+  return pythonNameScan(context, `external\0${global.id}`, () => {
+    const out = { writes: [] as Array<{ type: string; file: string }>, unknown: false, writers: new Set<string>() };
+    const module = pythonModulePath(global.filePath);
+    const name = global.name;
+    const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    for (const file of context.getAllFiles()) {
+      if (file === global.filePath || !/\.pyi?$/.test(file) || !context.readFile(file)?.includes(name)) continue;
+      const test = isTestFile(file);
+      const aliases = pythonModuleAliases(file, module, context);
+      if (!test && !aliases.length) continue;
+      const receiver = test ? '[\\w.]+' : `(?:${aliases.map(escape).join('|')})`;
+      const target = new RegExp(`(?<![\\w.])${receiver}\\.${name}\\b(?!\\s*[.\\[(])`);
+      const exact = new RegExp(`^${receiver}\\.${name}$`);
+      const dynamic = new RegExp(`\\b(?:setattr|patch\\.object)\\s*\\(\\s*${receiver}\\s*,\\s*['"]${name}['"]`);
+      const lines = pythonMemberLines(file, context);
+      const statements = pythonStatementStarts(file, context);
+      for (let i = 0; i < lines.length; i++) {
+        if (!statements[i]) continue;
+        let statement = lines[i]!;
+        for (let j = i + 1; j < lines.length && !statements[j]; j++) statement += '\n' + lines[j];
+        if (!statement.includes(name)) continue;
+        const assignment = pythonAssignment(statement);
+        const assigned = assignment?.targets.some(t => target.test(t.trim())) ?? false;
+        if (!assigned && !dynamic.test(statement)) continue;
+        if (test) { out.writers.add(file); continue; }
+        const single = assignment && assignment.targets.length === 1 && !assignment.augmented && exact.test(assignment.targets[0]!.trim());
+        const value = single ? assignment!.value.trim() : '';
+        if (value === 'None') continue;
+        const constructor = value ? pythonConstructorCall(value) : null;
+        if (!constructor) { out.unknown = true; return out; }
+        out.writes.push({ type: constructor, file });
+      }
+    }
+    return out;
+  });
+}
+
+/** `globals()[...] = ...` naming the global (or with a computed key), or `globals().update(...)`, in its own module. */
+function pythonDynamicGlobalWrite(name: string, filePath: string, context: ResolutionContext): boolean {
+  return pythonMemberLines(filePath, context).some(line => {
+    if (/\bglobals\(\)\s*\.\s*update\s*\(/.test(line)) return true;
+    const key = line.match(/\bglobals\(\)\s*\[\s*([^\]]+?)\s*\]\s*=(?!=)/)?.[1];
+    if (!key) return false;
+    const literal = key.match(/^(['"])(\w+)\1$/);
+    return !literal || literal[2] === name;
+  });
 }
 
 /**
@@ -689,6 +778,8 @@ function pythonGlobalClasses(global: Node, ref: UnresolvedRef, context: Resoluti
  * as a base-typed receiver does. Otherwise, no edge.
  */
 function pythonGlobalMembers(global: Node, member: string, ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  // A test that installs its own double sees the double, not the production type.
+  if (pythonExternalWrites(global, context).writers.has(ref.filePath)) return [];
   const classes = pythonGlobalClasses(global, ref, context);
   if (!classes) return [];
   const targets = [...new Map(classes.flatMap(cls => pythonMembers(cls, member, ref, context)).map(n => [n.id, n])).values()];
