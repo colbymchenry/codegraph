@@ -1,0 +1,41 @@
+[
+  {
+    "name": "reserved_declaration",
+    "source": "pub fn export() void {}\npub fn entry() void { @\"export\"(); }",
+    "astAccepted": false,
+    "wasmAccepted": true,
+    "nodes": [
+      "function:entry"
+    ],
+    "calls": []
+  },
+  {
+    "name": "unparenthesized_initializer",
+    "source": "const Shape=struct { value:u8, pub fn run(self:Shape)void{_=self;} }; pub fn entry()void{consume(Shape{.value=1}.run());} pub fn consume(_:void)void{}",
+    "astAccepted": false,
+    "wasmAccepted": true,
+    "nodes": [
+      "struct:Shape",
+      "field:Shape::value",
+      "method:Shape::run",
+      "function:entry",
+      "function:consume"
+    ],
+    "calls": [
+      "entry->consume"
+    ]
+  },
+  {
+    "name": "reserved_field",
+    "source": "const Adapter=struct { value:u8, pub fn init()void{} const table=.{.resume=handler}; };",
+    "astAccepted": false,
+    "wasmAccepted": true,
+    "nodes": [
+      "struct:Adapter",
+      "field:Adapter::value",
+      "method:Adapter::init",
+      "constant:Adapter::table"
+    ],
+    "calls": []
+  }
+]

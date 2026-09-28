@@ -77,6 +77,8 @@ echo "[bundle] installing production dependencies"
 ( cd "$STAGE/lib" && npm ci --omit=dev --ignore-scripts >/dev/null 2>&1 )
 rm -f "$STAGE/lib/package-lock.json"
 
+node --liftoff-only "$ROOT/scripts/check-zig-package.mjs" "$STAGE/lib"
+
 # 3b. Native extraction kernel (optional). Included when a prebuilt .node for
 #     the target exists — release/kernel/<target>/codegraph-kernel.node (the
 #     release workflow's prebuild artifacts) or the locally staged

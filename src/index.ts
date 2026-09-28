@@ -42,6 +42,7 @@ import {
   SyncResult,
   extractFromSource,
   initGrammars,
+  loadGrammarsForLanguages,
 } from './extraction';
 import {
   ReferenceResolver,
@@ -354,6 +355,7 @@ export class CodeGraph {
     const dbPath = getDatabasePath(resolvedRoot);
     const db = DatabaseConnection.open(dbPath, { readOnly: options.readOnly });
     const queries = new QueryBuilder(db.getDb());
+    if (!options.readOnly && queries.getDistinctFileLanguages().has('zig')) await loadGrammarsForLanguages(['zig']);
 
     const instance = new CodeGraph(db, queries, resolvedRoot);
 

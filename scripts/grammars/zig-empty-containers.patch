@@ -1,0 +1,34 @@
+--- a/grammar.js
++++ b/grammar.js
+@@ -243,6 +243,6 @@
+       'struct',
+       optional(seq('(', $.expression, ')')),
+       '{',
+-      $._container_members,
++      optional($._container_members),
+       '}',
+     ),
+@@ -251,6 +251,6 @@
+       optional(choice('extern', 'packed')),
+       'opaque',
+       '{',
+-      $._container_members,
++      optional($._container_members),
+       '}',
+     ),
+@@ -260,6 +260,6 @@
+       'enum',
+       optional(seq('(', $.expression, ')')),
+       '{',
+-      $._container_members,
++      optional($._container_members),
+       '}',
+     ),
+@@ -276,6 +276,6 @@
+         ')',
+       )),
+       '{',
+-      $._container_members,
++      optional($._container_members),
+       '}',
+     ),

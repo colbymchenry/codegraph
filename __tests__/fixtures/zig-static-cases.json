@@ -1,0 +1,172 @@
+[
+  {
+    "name": "plain_import",
+    "files": {
+      "main.zig": "const lib = @import(\"lib.zig\"); pub fn entry() void { lib.run(); } test { entry(); }",
+      "lib.zig": "pub fn run() void {}\n"
+    },
+    "caller": "main.zig::entry",
+    "target": "lib.zig::run"
+  },
+  {
+    "name": "inline_import",
+    "files": {
+      "main.zig": "pub fn entry() void { @import(\"lib.zig\").run(); } test { entry(); }",
+      "lib.zig": "pub fn run() void {}\n"
+    },
+    "caller": "main.zig::entry",
+    "target": "lib.zig::run"
+  },
+  {
+    "name": "quoted_spaces",
+    "files": {
+      "main.zig": "pub fn @\"two words\"() void {}\npub fn @\"twowords\"() void {}\npub fn entry() void { @\"two words\"(); } test { entry(); }"
+    },
+    "caller": "main.zig::entry",
+    "target": "main.zig::@\"two words\""
+  },
+  {
+    "name": "quoted_plain",
+    "files": {
+      "main.zig": "pub fn @\"run\"() void {}\npub fn entry() void { run(); } test { entry(); }"
+    },
+    "caller": "main.zig::entry",
+    "target": "main.zig::run"
+  },
+  {
+    "name": "escaped_import",
+    "files": {
+      "main.zig": "const lib = @import(\"lib\\u{2e}zig\"); pub fn entry() void { lib.run(); } test { entry(); }",
+      "lib.zig": "pub fn run() void {}\n"
+    },
+    "caller": "main.zig::entry",
+    "target": "lib.zig::run"
+  },
+  {
+    "name": "call_plain",
+    "files": {
+      "main.zig": "const lib = @import(\"lib.zig\"); pub fn entry() void { @call(.auto, lib.run, .{}); } test { entry(); }",
+      "lib.zig": "pub fn run() void {}\n"
+    },
+    "caller": "main.zig::entry",
+    "target": "lib.zig::run"
+  },
+  {
+    "name": "call_comment",
+    "files": {
+      "main.zig": "const lib = @import(\"lib.zig\"); pub fn entry() void { @call(.auto, // note\nlib.run, .{}); } test { entry(); }",
+      "lib.zig": "pub fn run() void {}\n"
+    },
+    "caller": "main.zig::entry",
+    "target": "lib.zig::run"
+  },
+  {
+    "name": "root_module",
+    "files": {
+      "main.zig": "const lib = @import(\"lib.zig\"); pub fn callback() void {} pub fn entry() void { lib.run(); } pub fn main() void { entry(); }",
+      "lib.zig": "const root = @import(\"root\"); pub fn run() void { root.callback(); }"
+    },
+    "caller": "lib.zig::run",
+    "target": "main.zig::callback"
+  },
+  {
+    "name": "reexport",
+    "files": {
+      "main.zig": "const api = @import(\"api.zig\"); pub fn entry() void { api.run(); } test { entry(); }",
+      "api.zig": "const impl = @import(\"lib.zig\"); pub const run = impl.run;",
+      "lib.zig": "pub fn run() void {}\n"
+    },
+    "caller": "main.zig::entry",
+    "target": "lib.zig::run"
+  },
+  {
+    "name": "comptime_local",
+    "files": {
+      "main.zig": "pub fn entry() void { comptime var value: u8 = 0; value += 1; } test { entry(); }"
+    },
+    "caller": "main.zig::entry",
+    "target": null
+  },
+  {
+    "name": "container_visibility",
+    "files": {
+      "main.zig": "const lib = @import(\"lib.zig\"); pub fn entry() void { lib.Public.run(); } test { entry(); }",
+      "lib.zig": "const Internal = struct { pub fn run() void {} }; pub const Public = Internal;"
+    },
+    "caller": "main.zig::entry",
+    "target": "lib.zig::Internal::run"
+  },
+  {
+    "name": "build_module",
+    "files": {
+      "main.zig": "const helper = @import(\"helper\"); pub fn entry() void { helper.run(); } test { entry(); }",
+      "lib.zig": "pub fn run() void {}",
+      "build.zig": "const std = @import(\"std\");\npub fn build(b: *std.Build) void {\n    const target = b.standardTargetOptions(.{});\n    const lib = b.createModule(.{ .root_source_file = b.path(\"lib.zig\"), .target = target });\n    const root = b.createModule(.{ .root_source_file = b.path(\"main.zig\"), .target = target });\n    root.addImport(\"helper\", lib);\n    const tests = b.addTest(.{ .root_module = root });\n    b.step(\"test\", \"Run tests\").dependOn(&b.addRunArtifact(tests).step);\n}"
+    },
+    "caller": "main.zig::entry",
+    "target": "lib.zig::run"
+  },
+  {
+    "name": "quoted_members",
+    "files": {
+      "main.zig": "const @\"mod.name\" = @import(\"lib.zig\"); pub fn entry() void { @\"mod.name\".@\"do.work\"(); } test { entry(); }",
+      "lib.zig": "pub fn @\"do.work\"() void {}"
+    },
+    "caller": "main.zig::entry",
+    "target": "lib.zig::@\"do.work\""
+  },
+  {
+    "name": "unicode_identifier",
+    "files": {
+      "main.zig": "pub fn @\"\\u{72}un\"() void {} pub fn entry() void { run(); } test { entry(); }"
+    },
+    "caller": "main.zig::entry",
+    "target": "main.zig::run"
+  },
+  {
+    "name": "alias_chain",
+    "files": {
+      "main.zig": "const api=@import(\"api.zig\");pub fn entry() void {api.execute();} test{entry();}",
+      "api.zig": "const lib=@import(\"lib.zig\"); const other=lib; pub const execute=other.run;",
+      "lib.zig": "pub fn run() void {}"
+    },
+    "caller": "main.zig::entry",
+    "target": "lib.zig::run"
+  },
+  {
+    "name": "instance_receiver",
+    "files": {
+      "main.zig": "const Engine=struct{pub fn init() Engine{return .{};} pub fn run(self:*Engine)void{_=self;}}; pub fn entry()void{var engine=Engine.init();engine.run();} test{entry();}"
+    },
+    "caller": "main.zig::entry",
+    "target": [
+      "main.zig::Engine::init",
+      "main.zig::Engine::run"
+    ]
+  },
+  {
+    "name": "enum_receiver",
+    "files": {
+      "main.zig": "const State=enum{unknown, pub fn run(self:State)void{_=self;}}; pub fn entry()void{State.unknown.run();} test{entry();}"
+    },
+    "caller": "main.zig::entry",
+    "target": "main.zig::State::run"
+  },
+  {
+    "name": "quoted_keyword",
+    "files": {
+      "main.zig": "pub fn @\"export\"() void {} pub fn entry() void { @\"export\"(); } test { entry(); }"
+    },
+    "caller": "main.zig::entry",
+    "target": "main.zig::@\"export\""
+  },
+  {
+    "name": "imported_enum_receiver",
+    "files": {
+      "main.zig": "const lib=@import(\"lib.zig\");pub fn entry()void{lib.State.unknown.run();} test{entry();}",
+      "lib.zig": "pub const State=enum{unknown,pub fn run(self:State)void{_=self;}};"
+    },
+    "caller": "main.zig::entry",
+    "target": "lib.zig::State::run"
+  }
+]

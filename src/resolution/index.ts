@@ -4,6 +4,7 @@
  * Coordinates all reference resolution strategies.
  */
 
+import { resolveZigImport } from './zig';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Language, Node, UnresolvedReference, Edge } from '../types';
@@ -748,6 +749,7 @@ export class ReferenceResolver {
       filePath: ref.filePath || this.getFilePathFromNodeId(ref.fromNodeId),
       language: ref.language || this.getLanguageFromNodeId(ref.fromNodeId),
       rowId: ref.rowId,
+      candidates: ref.candidates,
     }));
 
     const total = refs.length;
@@ -919,6 +921,9 @@ export class ReferenceResolver {
   }
 
   private resolveOneInner(ref: UnresolvedRef): ResolvedRef | null {
+    const zigImport = resolveZigImport(ref, this.context);
+    if (zigImport !== undefined) return zigImport;
+
     // A local C++ object construction (`T obj(args)`, ref `ns::T::T/1`)
     // resolves ONLY to a constructor of the lexically nearest `T` (#1839).
     if (isCppConstructorRef(ref)) return matchCppConstructor(ref, this.context);
@@ -1224,6 +1229,7 @@ export class ReferenceResolver {
           // wrong rebind; edges without refName (pre-#1240, synthesized) are
           // deliberately NOT resurrected for the same reason.
           refName: ref.original.referenceName,
+          ...(ref.original.candidates?.length ? { refCandidates: ref.original.candidates } : {}),
           ...(ref.original.referenceKind !== kind ? { refKind: ref.original.referenceKind } : {}),
           // Uniform marker for function-as-value edges (#756), regardless of
           // which strategy resolved them (import vs matchFunctionRef) — lets
@@ -1513,6 +1519,7 @@ export class ReferenceResolver {
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
         rowId: raw.rowId,
+        candidates: raw.candidates,
       };
       const result = this.resolveOneTimed(ref);
       if (result) {
@@ -1633,6 +1640,7 @@ export class ReferenceResolver {
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
         rowId: raw.rowId,
+        candidates: raw.candidates,
       };
       const result = this.resolveOneTimed(ref);
       if (result) {
@@ -2340,6 +2348,20 @@ export class ReferenceResolver {
       if (C_BUILT_INS.has(name) || CPP_BUILT_INS.has(name)) {
         return !this.hasAnyPossibleMatch(name);
       }
+    }
+
+    // Zig standard library and builtins. The `std` namespace and `@`-prefixed
+    // builtin functions are always external — no project declares symbols there.
+    if (ref.language === 'zig') {
+      // @-prefixed compiler builtins: @import, @sizeOf, @intFromPtr, etc.
+      if (/^@[A-Za-z_][A-Za-z_0-9]*$/.test(name)) return true;
+      // std library namespace: std.debug.print, std.mem.eql, std.ArrayList, etc.
+      // The bare `std` is the @import("std") module itself (an imports ref).
+      if (name === 'std' || name.startsWith('std.')) return true;
+      // builtin module: builtin.is_test, builtin.mode, etc. — same bare/import form.
+      if (name === 'builtin' || name.startsWith('builtin.')) return true;
+      // root module reference
+      if (name === 'root') return true;
     }
 
     return false;
