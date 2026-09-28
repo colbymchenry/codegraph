@@ -33,6 +33,9 @@ Thumbs.db
 *.log
 npm-debug.log*
 
+# Qoder project-level MCP config
+.qoder/
+
 # TypeScript build info
 *.tsbuildinfo
 

@@ -1387,6 +1387,7 @@ describe('Installer targets — registry', () => {
     expect(getTarget('copilot-vscode')?.id).toBe('copilot-vscode');
     expect(getTarget('copilot-cli')?.id).toBe('copilot-cli');
     expect(getTarget('copilot-jetbrains')?.id).toBe('copilot-jetbrains');
+    expect(getTarget('qoder')?.id).toBe('qoder');
     expect(getTarget('not-a-real-target')).toBeUndefined();
   });
 

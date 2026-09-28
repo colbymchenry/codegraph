@@ -143,6 +143,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   Trails are plain JSON, one file per trail, under `.codegraph/ui/trails/` — already ignored by git, so they stay yours by default. **Export** hands you the file if you'd rather commit one for the team. This is the only thing the viewer writes: it still never indexes, never changes your graph, and never touches a line of your code. Start it with `codegraph ui --read-only` and it won't write even that — saved trails can still be opened, just not saved or deleted.
 
+- **Qoder joins the list of agents `codegraph install` sets up for you.** The MCP server is written into Qoder's own config — its user-level `SharedClientCache/mcp.json`, or a project's `.qoder/mcp.json` — exactly where Qoder looks for MCP servers, and `codegraph uninstall` takes it back out. Qoder is an AI-native editor built on a VS Code fork, so it takes the same JSON entry shape every other target does.
+
 ### Fixes
 
 - The Claude Code prompt hook no longer runs on the task-notification messages Claude Code injects when a background agent finishes, removing a multi-second stall on every such turn. (#1832)
