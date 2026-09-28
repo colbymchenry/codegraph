@@ -143,6 +143,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   Trails are plain JSON, one file per trail, under `.codegraph/ui/trails/` — already ignored by git, so they stay yours by default. **Export** hands you the file if you'd rather commit one for the team. This is the only thing the viewer writes: it still never indexes, never changes your graph, and never touches a line of your code. Start it with `codegraph ui --read-only` and it won't write even that — saved trails can still be opened, just not saved or deleted.
 
+- **`codegraph init` writes the MCP config your agent actually finds, pinned to the project.** It creates a project-level entry for opencode (`opencode.jsonc`) and Claude Code (`.mcp.json`) with `--path <project_root>`. An agent that launches the server from somewhere other than the project root — a sandboxed worktree, most visibly opencode's — otherwise left the server unable to locate `.codegraph/`, and the session quietly answered from no project at all. The write is idempotent: re-running `codegraph init` never rewrites an identical entry.
+
 ### Fixes
 
 - The Claude Code prompt hook no longer runs on the task-notification messages Claude Code injects when a background agent finishes, removing a multi-second stall on every such turn. (#1832)

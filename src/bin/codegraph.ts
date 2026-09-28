@@ -752,6 +752,25 @@ async function runInit(
       await offerWatchFallback(clack, projectPath, { yes: options.yes });
     } catch { /* non-fatal */ }
 
+    // Pin the project-level MCP configs to this project with --path. An agent
+    // that launches the server from somewhere other than the project root — a
+    // sandboxed worktree, most visibly opencode's — otherwise leaves the server
+    // unable to find `.codegraph/`, and the session silently answers from no
+    // project. The entries are written idempotently, so re-running `init` does
+    // not rewrite an identical file. Non-fatal: an unwritable project is not a
+    // reason to fail an init that already built the index.
+    for (const [label, write] of [
+      ['opencode', async () => (await import('../installer/targets/opencode')).writeProjectMcpEntry(projectPath)],
+      ['Claude Code', async () => (await import('../installer/targets/claude')).writeLocalMcpEntry(projectPath)],
+    ] as const) {
+      try {
+        const res = await write();
+        if (res.action !== 'unchanged') {
+          clack.log.info(`Configured ${label} MCP (${res.action})`);
+        }
+      } catch { /* non-fatal */ }
+    }
+
     clack.outro('Done');
     cg.destroy();
   } catch (err) {
