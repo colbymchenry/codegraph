@@ -155,3 +155,9 @@ console.log(
   `[check-ui-build] dist/viewer ok (index.html + ${assets} referenced asset(s)); ` +
     `dist/extraction/wasm ok (${grammarCount} grammars); dist/ engine intact`
 );
+
+// The grammar is vendored, so its upstream notice must travel with every copy.
+const zigNotice = join(root, 'dist', 'extraction', 'wasm', 'LICENSE.tree-sitter-zig');
+if (!existsSync(zigNotice) || !readFileSync(zigNotice, 'utf8').includes('Amaan Qureshi')) {
+  fail('missing or invalid Zig grammar notice', 'run npm run copy-assets before packaging');
+}

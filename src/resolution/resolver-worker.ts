@@ -20,6 +20,7 @@ try {
   (require('node:module') as { enableCompileCache?: () => void }).enableCompileCache?.();
 } catch { /* cache is best-effort */ }
 
+import { initGrammars, loadGrammarsForLanguages } from '../extraction/grammars';
 import { parentPort, threadId } from 'worker_threads';
 import { createDatabase, SqliteDatabase } from '../db/sqlite-adapter';
 import { QueryBuilder } from '../db/queries';
@@ -46,7 +47,7 @@ type InMessage =
 
 let dbPath: string | null = null;
 
-port.on('message', (msg: InMessage) => {
+port.on('message', async (msg: InMessage) => {
   try {
     switch (msg.type) {
       case 'open': {
@@ -86,6 +87,10 @@ port.on('message', (msg: InMessage) => {
       case 'resolve': {
         if (!resolver) throw new Error('resolver-worker: resolve before open');
         const tRes = Date.now();
+        if (msg.refs.some(ref => ref.language === 'zig')) {
+          await initGrammars();
+          await loadGrammarsForLanguages(['zig']);
+        }
         const out = resolver.resolveListForAdmission(msg.refs);
         if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[pool-timing] worker resolve: ${msg.refs.length} refs in ${Date.now() - tRes}ms`);
         port.postMessage({ type: 'result', id: msg.id, ...out });

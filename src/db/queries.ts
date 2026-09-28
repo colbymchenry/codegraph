@@ -3649,6 +3649,30 @@ export class QueryBuilder {
     return out;
   }
 
+  /** Failed refs have no edge dependency metadata. A Zig edit may repair an
+   * alias or module binding without changing any declaration names. */
+  retryFailedZigReferences(): number {
+    return this.db.prepare("UPDATE unresolved_refs SET status = 'pending' WHERE language = 'zig' AND status = 'failed'").run().changes;
+  }
+
+  /** Edges whose Zig alias/module evidence includes a changed source file. */
+  getZigDependencyEdges(files: string[]): Array<Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language }> {
+    const out = new Map<number, Edge & { edgeId: number; sourceFilePath: string; sourceLanguage: Language }>();
+    for (let i = 0; i < files.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = files.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const rows = this.db.prepare(`SELECT e.*, src.file_path AS source_file_path, src.language AS source_language
+        FROM edges e JOIN nodes src ON src.id = e.source
+        WHERE src.language = 'zig' AND json_valid(e.metadata) AND (
+          json_extract(e.metadata, '$.zigRootContext') = 1 OR EXISTS (
+            SELECT 1 FROM json_each(e.metadata, '$.zigDependencyFiles') dep
+            WHERE dep.value IN (${chunk.map(() => '?').join(',')})
+          ))`).all(...chunk) as Array<EdgeRow & { source_file_path: string; source_language: Language }>;
+      for (const row of rows) out.set(row.id, { ...rowToEdge(row), edgeId: row.id,
+        sourceFilePath: row.source_file_path, sourceLanguage: row.source_language });
+    }
+    return [...out.values()];
+  }
+
   /** Delete edges by primary key — the rebind pass's half of a re-resolution. */
   deleteEdgesByIds(edgeIds: number[]): number {
     if (edgeIds.length === 0) return 0;
