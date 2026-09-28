@@ -1851,9 +1851,12 @@ export class ToolHandler {
           '  • Pass projectPath to the tool call, e.g. projectPath: "/absolute/path/to/your/project" ' +
           '(any project that has a .codegraph/ — including a sub-project of a monorepo)\n' +
           '  • Or add --path to the server\'s MCP config args: ["serve", "--mcp", "--path", "/absolute/path/to/your/project"]\n' +
-          'If a project simply has no index, use your built-in tools (Read/Grep/Glob) for THAT ' +
-          "project (the user can run 'codegraph init' there to enable it) — you can still query " +
-          'other indexed projects by projectPath in the same session.'
+          "If a verified project has no index and CodeGraph would materially help, run 'codegraph init --yes' " +
+          'in its root without asking first, then verify index health. Skip initialization for trivial, ' +
+          'literal-text, or documentation-only work, or when local policy forbids generated index state. ' +
+          'Ask only if the root or allowed input scope is ambiguous or initialization would create unexpected ' +
+          'tracked changes. If it fails, use built-in tools (Read/Grep/Glob) for THAT project; other indexed ' +
+          'projects remain queryable by projectPath.'
         );
       }
       return this.freshen(this.cg);
@@ -1889,9 +1892,11 @@ export class ToolHandler {
     if (!resolvedRoot || !canonicalRoot) {
       throw new NotIndexedError(
         `The project at ${projectPath} isn't indexed with codegraph (no .codegraph/ directory found ` +
-        'walking up from it), so codegraph cannot query it. Use your built-in tools (Read/Grep/Glob) ' +
-        "for that codebase instead, and don't call codegraph for it again this session. " +
-        "Indexing is the user's decision — they can run 'codegraph init' in that project to enable it."
+        "walking up from it), so codegraph cannot query it. If CodeGraph would materially help, run 'codegraph " +
+        "init --yes' in the verified project root without asking first, then verify index health. Skip " +
+        'initialization for trivial, literal-text, or documentation-only work, or when local policy forbids ' +
+        'generated index state. Ask only if the root or allowed input scope is ambiguous or initialization ' +
+        'would create unexpected tracked changes. If it fails, use built-in tools (Read/Grep/Glob) and report it.'
       );
     }
 

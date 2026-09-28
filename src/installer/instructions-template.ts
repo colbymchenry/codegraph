@@ -47,5 +47,12 @@ In repositories indexed by CodeGraph (a \`.codegraph/\` directory exists at the 
 - **MCP tool** (when available): \`codegraph_explore\` answers most code questions in one call — the relevant symbols' verbatim source plus the call paths between them, including dynamic-dispatch hops grep can't follow. Name a file or symbol in the query to read its current line-numbered source. If it's listed but deferred, load it by name via tool search.
 - **Shell** (always works): \`codegraph explore "<symbol names or question>"\` prints the same output.
 
-If there is no \`.codegraph/\` directory, skip CodeGraph entirely — indexing is the user's decision.
+If there is no \`.codegraph/\` directory and CodeGraph would materially help
+with structural discovery, impact analysis, debugging, architecture work, or
+implementation, run \`codegraph init --yes\` in the verified project root
+without asking first, then verify index health. Skip initialization for trivial
+tasks, literal-text searches, documentation-only work, or repositories whose
+local policy forbids generated index state. Ask only when the root or allowed
+input scope is ambiguous or initialization would create unexpected tracked
+changes; if initialization fails, continue with built-in tools and report it.
 ${CODEGRAPH_SECTION_END}`;

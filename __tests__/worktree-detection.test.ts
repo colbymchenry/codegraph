@@ -101,7 +101,7 @@ describe('detectWorktreeIndexMismatch (issue #155)', () => {
     const msg = worktreeMismatchWarning(detectWorktreeIndexMismatch(worktree, mainRepo)!);
     expect(msg).toContain(real(worktree));
     expect(msg).toContain(real(mainRepo));
-    expect(msg).toContain('codegraph init');
+    expect(msg).toContain('codegraph init --yes');
   });
 });
 
@@ -153,7 +153,7 @@ describe('worktree mismatch surfaces on hot read tools (issue #155)', () => {
     expect(res.isError).toBeFalsy();
     expect(text).toContain('different git worktree');
     expect(text).toContain(real(worktree));
-    expect(text).toContain('codegraph init');
+    expect(text).toContain('codegraph init --yes');
   });
 
   it('does NOT prefix when the default project is the main checkout itself', async () => {
@@ -270,7 +270,7 @@ describe('worktree mismatch verdict re-resolves when the index root changes (iss
  * super-repo descends into its submodules and gitlinked clones, so a query run
  * from inside one resolves up to the parent index — which genuinely contains
  * that nested repo's symbols. The warning's premise is false there, and its
- * "run codegraph init -i" advice would fragment the unified index. (#1031, #1033)
+ * "run codegraph init --yes" advice would fragment the unified index. (#1031, #1033)
  */
 describe('detectWorktreeIndexMismatch — nested repos covered by the parent index (#1031, #1033)', () => {
   let parent: string;     // super-repo that owns the .codegraph index
