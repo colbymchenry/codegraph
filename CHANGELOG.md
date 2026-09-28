@@ -167,6 +167,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 #### MCP / indexing
 
+- **A Windows project whose path is spelled with a different drive-letter case no longer falls back to serving the graph on its own.** `d:\work\codegraph` and `D:\work\codegraph` are the same folder, but they named two different background helpers, so a session that did not spell the path exactly like the already-running one could not join it: it started a helper of its own, that one exited immediately because the first still held the project, and the session quietly served the graph in-process — no shared file watching or auto-sync, and one extra copy of the index per open window. Both spellings now name the same helper, and `codegraph list` / `codegraph stop --all` see one entry per project instead of two. If an older background helper is still running when you upgrade, the first session may fall back until it idles out (a few minutes); `codegraph stop` ends it immediately.
+
 - File watching no longer drops the full re-scan a removed directory asks for when that sync fails, so the deleted files leave the index instead of lingering. (#1964)
 - Daemon startup and cleanup now preserve live legacy PID-only locks while still reclaiming dead or identity-disproved records, preventing two writers from serving the same project.
 - Incremental sync now keeps edge rebinding crash-safe: replacing a resolved edge with its recovery reference commits atomically, so an interruption cannot permanently remove the relationship.

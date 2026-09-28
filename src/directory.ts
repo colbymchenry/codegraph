@@ -210,6 +210,40 @@ export function statInode(p: string): string | null {
 }
 
 /**
+ * Canonicalize a project root for IDENTITY: hashing it into a rendezvous key
+ * (the daemon's named pipe / tmpdir socket, a registry record). Not for display
+ * — the caller-visible root keeps its own spelling.
+ *
+ * The contract is that two spellings of ONE directory yield ONE string, because
+ * a client that derives a different key silently fails to meet the daemon that
+ * is already running: it probes a socket nobody bound, spawns a redundant
+ * daemon, and that daemon dies on the lock the first one holds, so the session
+ * degrades to a single-process engine. `path.resolve` alone does NOT satisfy
+ * that contract — NTFS is case-insensitive, so `d:\work\codegraph` and
+ * `D:\work\codegraph` name one directory but two strings, and non-native
+ * `fs.realpathSync` keeps whichever casing the caller passed (only `.native`
+ * asks the filesystem for the on-disk name — the same reason
+ * {@link isSameIndexRoot} uses it). Both spellings really do occur: a
+ * cwd-derived root is the on-disk case, while a client-supplied
+ * `rootUri`/`workspaceFolders` path arrives as `file:///d%3A/…`.
+ *
+ * The Windows lowercase is belt-and-braces on top of the native realpath — NTFS
+ * can't hold two directories differing only by case, and it also absorbs a
+ * `\\?\`-prefixed native result diverging from a plain one.
+ */
+export function canonicalProjectRoot(projectRoot: string): string {
+  const resolved = path.resolve(projectRoot);
+  let canonical = resolved;
+  try {
+    canonical = fs.realpathSync.native(resolved);
+  } catch {
+    // ENOENT/EACCES/ELOOP — the root is normally there (`.codegraph/` lives in
+    // it), so this is a fallback rather than a path we expect to take.
+  }
+  return process.platform === 'win32' ? canonical.toLowerCase() : canonical;
+}
+
+/**
  * Whether two resolved index roots are one index spelled two ways — a symlinked
  * checkout, or a case-variant on a case-insensitive mount (macOS, NTFS, WSL
  * DrvFs `/mnt/c`), where `realpathSync` keeps the caller's casing (#1057).
