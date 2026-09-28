@@ -281,6 +281,17 @@ function matchMemberFunctionRef(ref: UnresolvedRef, context: ResolutionContext):
     if (ref.language === 'python') {
       const cls = pythonRefClass(receiver, ref, context);
       if (cls) return result(pythonMembers(cls, member, ref, context));
+      // `mod.global` / an imported `global` itself — never a deeper chain (`mod.global.field`).
+      const segments = receiver.split('.');
+      const hit = segments.length <= 2 ? context.resolveImport?.({ ...ref, referenceName: receiver, referenceKind: 'references' }) : null;
+      const global = hit && context.getNodeById?.(hit.targetNodeId);
+      // A local import of the root binds what the file imports, unless the file imports it from two places.
+      if (global && global.name === segments[segments.length - 1] && isPythonModuleGlobal(global, context) &&
+          pythonImportKeys(segments[0]!, ref.filePath, context).size === 1 &&
+          !pythonGlobalBindings(segments[0]!, ref.filePath, context).some(b => b.kind !== 'import') &&
+          !pythonBindsLocally(segments[0]!, ref, context, false)) {
+        return result(pythonGlobalMembers(global, member, ref, context));
+      }
     }
     const imported = context.resolveImport?.(ref);
     const node = imported && context.getNodeById?.(imported.targetNodeId);
@@ -305,6 +316,11 @@ function matchMemberFunctionRef(ref: UnresolvedRef, context: ResolutionContext):
       type = pythonFieldType(receiver, owner, ref, context);
     } else {
       type = pythonLocalType(receiver, ref, context);
+      const global = type === null
+        ? context.getNodesInFile(ref.filePath).find(n => n.name === receiver && isPythonModuleGlobal(n, context)) : undefined;
+      if (global && !pythonBindsLocally(receiver, ref, context, true)) {
+        return result(pythonGlobalMembers(global, member, ref, context));
+      }
     }
     // A type name used directly (`Store.fetch`) is scoped just like an annotation.
     if (!type && /^[A-Z]\w*$/.test(receiver)) type = receiver;
@@ -337,6 +353,14 @@ function matchMemberFunctionRef(ref: UnresolvedRef, context: ResolutionContext):
 
 function pythonRefClass(name: string, ref: UnresolvedRef, context: ResolutionContext): Node | null {
   const imports = context.getImportMappings(ref.filePath, 'python');
+  // `import pkg.mod` then `pkg.mod.Cls`: the mapping keys the module by its last segment.
+  const module = imports.find(i => i.isNamespace && name.startsWith(`${i.source}.`) &&
+    /^\w+$/.test(name.slice(i.source.length + 1)));
+  if (module) {
+    // Two modules with the same last segment (`import a.foo`, `import b.foo`) share the key: refuse.
+    if (imports.filter(i => i.localName === module.localName).length !== 1) return null;
+    name = `${module.localName}.${name.slice(module.source.length + 1)}`;
+  }
   if (imports.some(i => i.localName === name.split('.')[0])) {
     const hit = context.resolveImport?.({ ...ref, referenceName: name, referenceKind: 'references' });
     const node = hit && context.getNodeById?.(hit.targetNodeId);
@@ -409,6 +433,301 @@ function pythonLocalType(receiver: string, ref: UnresolvedRef, context: Resoluti
     if (declared) return declared;
   }
   return caller?.signature?.match(new RegExp(`\\b${receiver}\\s*:\\s*["']?([\\w.]+)`))?.[1] ?? null;
+}
+
+/** A module-scope Python variable (not a class attribute or a function local). */
+function isPythonModuleGlobal(node: Node, context: ResolutionContext): boolean {
+  return node.language === 'python' && (node.kind === 'variable' || node.kind === 'constant') &&
+    !context.getNodesInFile(node.filePath).some(n =>
+      (n.kind === 'class' || n.kind === 'function' || n.kind === 'method') &&
+      n.startLine <= node.startLine && n.endLine >= node.startLine);
+}
+
+/** How one line binds a name: `global`, a plain `name = value` / `name: T`, an import, or any other binding. */
+type PythonBinding =
+  | { kind: 'global' }
+  | { kind: 'assign'; type: string | null; value: string; line: number }
+  | { kind: 'import'; key: string }
+  | { kind: 'other' };
+
+const PYTHON_STATEMENT_STARTS = new WeakMap<ResolutionContext, Map<string, boolean[]>>();
+/** Per line: does it start a statement (bracket depth 0, no `\` continuation)? String contents are skipped. */
+function pythonStatementStarts(filePath: string, context: ResolutionContext): boolean[] {
+  let files = PYTHON_STATEMENT_STARTS.get(context);
+  if (!files) { files = new Map(); PYTHON_STATEMENT_STARTS.set(context, files); }
+  let starts = files.get(filePath);
+  if (starts) return starts;
+  starts = [];
+  let depth = 0;
+  let continued = false;
+  for (const line of pythonMemberLines(filePath, context)) {
+    starts.push(depth === 0 && !continued);
+    let quote = '';
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i]!;
+      if (quote) { if (c === '\\') i++; else if (c === quote) quote = ''; continue; }
+      if (c === '"' || c === "'") quote = c;
+      else if (c === '(' || c === '[' || c === '{') depth++;
+      else if (c === ')' || c === ']' || c === '}') depth = Math.max(0, depth - 1);
+    }
+    continued = /\\\s*$/.test(line);
+  }
+  files.set(filePath, starts);
+  return starts;
+}
+
+/** Line indexes that belong to `scope` itself (null: the module), not to a def or class nested in it. */
+function pythonOwnLines(scope: Node | null, filePath: string, context: ResolutionContext): number[] {
+  const count = pythonMemberLines(filePath, context).length;
+  const from = scope ? scope.startLine : 1;
+  const to = scope ? Math.min(scope.endLine, count) : count;
+  const nested = new Uint8Array(to - from + 1);
+  for (const n of context.getNodesInFile(filePath)) {
+    if ((n.kind !== 'function' && n.kind !== 'method' && n.kind !== 'class') || n.id === scope?.id) continue;
+    if (n.startLine < from || n.endLine > to || (scope && n.startLine <= scope.startLine)) continue;
+    nested.fill(1, n.startLine - from, n.endLine - from + 1);
+  }
+  const own: number[] = [];
+  for (let l = from; l <= to; l++) if (!nested[l - from]) own.push(l - 1);
+  return own;
+}
+
+/** Split `a = b = value` at its top-level assignment operators; null when the line assigns nothing. */
+function pythonAssignment(line: string): { targets: string[]; value: string; augmented: boolean } | null {
+  const targets: string[] = [];
+  let depth = 0;
+  let quote = '';
+  let start = 0;
+  let augmented = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]!;
+    if (quote) { if (c === '\\') i++; else if (c === quote) quote = ''; continue; }
+    if (c === '"' || c === "'") { quote = c; continue; }
+    if (c === '(' || c === '[' || c === '{') { depth++; continue; }
+    if (c === ')' || c === ']' || c === '}') { depth--; continue; }
+    if (c !== '=' || depth !== 0) continue;
+    const prev = line[i - 1] ?? '';
+    if (line[i + 1] === '=') { i++; continue; } // ==
+    if (prev === '!' || prev === ':') continue; // != and the walrus
+    if ((prev === '<' || prev === '>') && line[i - 2] !== prev) continue; // <= >=
+    const op = line.slice(start, i).match(/(?:\/\/|\*\*|>>|<<|[-+*/%&|^@])$/)?.[0];
+    if (op) augmented = true;
+    targets.push(line.slice(start, i - (op?.length ?? 0)));
+    start = i + 1;
+  }
+  return targets.length ? { targets, value: line.slice(start), augmented } : null;
+}
+
+/**
+ * Every way the statement starting at line `index` binds `name`, read across
+ * its continuation lines. Only statement lines can assign or import; any line
+ * can bind through `as`, a loop, a lambda or the walrus.
+ */
+function pythonLineBindings(lines: string[], index: number, statements: boolean[], name: string): PythonBinding[] {
+  let line = lines[index]!;
+  if (statements[index]) for (let j = index + 1; j < lines.length && !statements[j]; j++) line += '\n' + lines[j];
+  const out: PythonBinding[] = [];
+  // An import statement can name `name` on a continuation line: `from x import (\n    name,\n)`.
+  const imported = statements[index] ? line.match(/^\s*(?:from\s+([\w.]+)\s+)?import\s+([\s\S]*)$/) : null;
+  if (imported) {
+    const names = imported[2]!;
+    // `from x import *` can bind any name.
+    if (imported[1] && names.trim() === '*') return [{ kind: 'other' }];
+    if (!names.includes(name)) return out;
+    for (const part of names.replace(/[()\\]/g, ' ').split(',')) {
+      const m = part.trim().match(/^([\w.]+)(?:\s+as\s+(\w+))?$/);
+      const local = m && (m[2] ?? (imported[1] ? m[1]! : m[1]!.split('.')[0]!));
+      if (local !== name) continue;
+      out.push({ kind: 'import', key: imported[1] ? `${imported[1]}:${m![1]}` : `${m![2] ? m![1] : local}:*` });
+    }
+    return out;
+  }
+  if (!line.includes(name)) return out;
+  const word = new RegExp(`(?<![\\w.])${name}\\b(?!\\s*[.\\[])`);
+  if (!word.test(line)) return out;
+  const declared = line.match(/^\s*(global|nonlocal)\s+([\w\s,]+)$/);
+  if (declared) {
+    return declared[2]!.split(',').some(s => s.trim() === name)
+      ? [declared[1] === 'global' ? { kind: 'global' } : { kind: 'other' }] : [];
+  }
+  if (statements[index]) {
+    // A `case` pattern binds its capture names (`case [name]:`, `case Cls(k=name):`, `case name:`).
+    if (/^\s*case\b/.test(line)) return [{ kind: 'other' }];
+    const assignment = pythonAssignment(line);
+    if (assignment) {
+      const target = assignment.targets.length === 1 && !assignment.augmented ? assignment.targets[0]!.trim() : '';
+      const annotated = target.match(new RegExp(`^${name}\\s*:\\s*["']?([\\w.]+)["']?$`));
+      if (target === name || annotated) {
+        out.push({ kind: 'assign', type: annotated?.[1] ?? null, value: assignment.value.trim(), line: index });
+      } else if (assignment.targets.some(t => word.test(t))) {
+        out.push({ kind: 'other' });
+      }
+    } else {
+      const annotated = line.match(new RegExp(`^\\s*${name}\\s*:\\s*["']?([\\w.]+)["']?\\s*$`));
+      if (annotated) out.push({ kind: 'assign', type: annotated[1]!, value: '', line: index });
+      else if (new RegExp(`^\\s*del\\b`).test(line)) out.push({ kind: 'other' });
+    }
+  }
+  if (new RegExp(`\\b${name}[ \\t]*:=|\\bas[ \\t]+${name}\\b`).test(line)) out.push({ kind: 'other' });
+  for (const loop of line.matchAll(/\bfor\s+([^:]+?)\s+in\b/g)) if (word.test(loop[1]!)) out.push({ kind: 'other' });
+  for (const lambda of line.matchAll(/\blambda\b([^:]*):/g)) if (word.test(lambda[1]!)) out.push({ kind: 'other' });
+  return out;
+}
+
+/**
+ * Whether `name`, read at the ref, is bound by the calling function or one that
+ * encloses it (parameter, assignment, loop, `as`, lambda, import) rather than
+ * being the module global. With `importsBind` false, an import of the name is
+ * not a shadow: it binds the same module the file imports.
+ */
+function pythonBindsLocally(name: string, ref: UnresolvedRef, context: ResolutionContext, importsBind: boolean): boolean {
+  const lines = pythonMemberLines(ref.filePath, context);
+  const statements = pythonStatementStarts(ref.filePath, context);
+  const param = new RegExp(`[(,]\\s*\\*{0,2}${name}\\s*[:=,)]`);
+  const scopes = context.getNodesInFile(ref.filePath).filter(n =>
+    (n.kind === 'function' || n.kind === 'method') && n.startLine <= ref.line && n.endLine >= ref.line)
+    .sort((a, b) => b.startLine - a.startLine);
+  for (const scope of scopes) {
+    const own = pythonOwnLines(scope, ref.filePath, context);
+    const bindings = own.flatMap(i => pythonLineBindings(lines, i, statements, name));
+    if (bindings.some(b => b.kind === 'global')) return false;
+    const def = own.find(i => /^\s*(?:async\s+)?def\b/.test(lines[i]!));
+    let header = scope.signature ?? '';
+    for (let j = def ?? lines.length; j < lines.length && (j === def || !statements[j]); j++) header += lines[j];
+    if (param.test(header)) return true;
+    if (bindings.some(b => b.kind !== 'global' && (b.kind !== 'import' || importsBind))) return true;
+  }
+  return false;
+}
+
+/** Distinct sources a file imports `name` from, at any scope (`from a import x` → `a:x`). */
+function pythonImportKeys(name: string, filePath: string, context: ResolutionContext): Set<string> {
+  return pythonNameScan(context, `imports\0${filePath}\0${name}`, () => scanPythonImportKeys(name, filePath, context));
+}
+
+const PYTHON_NAME_SCANS = new WeakMap<ResolutionContext, Map<string, unknown>>();
+/** Per-file, per-name scans are shared by every ref in the file; cleared with the other memos on sync. */
+function pythonNameScan<T>(context: ResolutionContext, key: string, scan: () => T): T {
+  let memo = PYTHON_NAME_SCANS.get(context);
+  if (!memo) { memo = new Map(); PYTHON_NAME_SCANS.set(context, memo); }
+  if (!memo.has(key)) memo.set(key, scan());
+  return memo.get(key) as T;
+}
+
+function scanPythonImportKeys(name: string, filePath: string, context: ResolutionContext): Set<string> {
+  const lines = pythonMemberLines(filePath, context);
+  const statements = pythonStatementStarts(filePath, context);
+  const keys = new Set<string>();
+  for (let i = 0; i < lines.length; i++) {
+    if (!statements[i] || !/\bimport\b/.test(lines[i]!)) continue;
+    for (const b of pythonLineBindings(lines, i, statements, name)) if (b.kind === 'import') keys.add(b.key);
+  }
+  return keys;
+}
+
+/** Every binding of module global `name` in `filePath`: at module scope, and in each function that declares it `global`. */
+function pythonGlobalBindings(name: string, filePath: string, context: ResolutionContext): PythonBinding[] {
+  return pythonNameScan(context, `globals\0${filePath}\0${name}`, () => scanPythonGlobalBindings(name, filePath, context));
+}
+
+function scanPythonGlobalBindings(name: string, filePath: string, context: ResolutionContext): PythonBinding[] {
+  const lines = pythonMemberLines(filePath, context);
+  const statements = pythonStatementStarts(filePath, context);
+  const scopes = context.getNodesInFile(filePath).filter(n => n.kind === 'class' || n.kind === 'function' || n.kind === 'method');
+  const regions = [pythonOwnLines(null, filePath, context)];
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^\s*global\b/.test(lines[i]!) || !pythonLineBindings(lines, i, statements, name).length) continue;
+    const scope = scopes.filter(n => n.startLine <= i + 1 && n.endLine >= i + 1).sort((a, b) => b.startLine - a.startLine)[0];
+    if (scope && scope.kind !== 'class') regions.push(pythonOwnLines(scope, filePath, context));
+  }
+  return regions.flatMap(region => region.flatMap(i => pythonLineBindings(lines, i, statements, name)))
+    .filter(b => b.kind !== 'global');
+}
+
+const PYTHON_GLOBAL_CLASSES = new WeakMap<ResolutionContext, Map<string, Node[] | null>>();
+/**
+ * The classes a module global can hold. It has no static type (`conn = None`,
+ * rebound by `global conn; conn = Backend()`), so its type is the set of
+ * classes its module assigns to it: at module scope, or in a function that
+ * declares it `global`. Any other binding of it there (an opaque value, a
+ * tuple target, `for`/`with`/import, a star import) makes the type unknown
+ * (null). Not seen: rebinding from ANOTHER module (`settings.conn = X`) and
+ * dynamic writes (`globals()["conn"] = X`).
+ */
+function pythonGlobalClasses(global: Node, ref: UnresolvedRef, context: ResolutionContext): Node[] | null {
+  let memo = PYTHON_GLOBAL_CLASSES.get(context);
+  if (!memo) { memo = new Map(); PYTHON_GLOBAL_CLASSES.set(context, memo); }
+  if (memo.has(global.id)) return memo.get(global.id)!;
+  const file = global.filePath;
+  const types = new Set<string>();
+  let classes: Node[] | null = [];
+  for (const b of pythonGlobalBindings(global.name, file, context)) {
+    if (b.kind !== 'assign') { classes = null; break; }
+    const constructor = b.value && b.value !== 'None' ? pythonConstructorCall(b.value) : null;
+    if (b.type) {
+      // `conn: Base = make()` trusts the annotation; `conn: A = B()` contradicts it.
+      if (constructor && constructor.split('.').pop() !== b.type.split('.').pop()) { classes = null; break; }
+      types.add(b.type);
+      continue;
+    }
+    if (b.value === 'None') continue;
+    if (!constructor) { classes = null; break; }
+    types.add(constructor);
+  }
+  for (const type of classes ? types : []) {
+    const cls = pythonRefClass(type, { ...ref, filePath: file }, context);
+    if (!cls) { classes = null; break; }
+    classes!.push(cls);
+  }
+  memo.set(global.id, classes);
+  return classes;
+}
+
+/**
+ * The method a module global's value can dispatch to: one class resolves to
+ * its own method; several bind to the nearest declaration they all inherit,
+ * as a base-typed receiver does. Otherwise, no edge.
+ */
+function pythonGlobalMembers(global: Node, member: string, ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  const classes = pythonGlobalClasses(global, ref, context);
+  if (!classes) return [];
+  const targets = [...new Map(classes.flatMap(cls => pythonMembers(cls, member, ref, context)).map(n => [n.id, n])).values()];
+  if (targets.length <= 1) return targets;
+  // Several targets: the nearest declaration every candidate class inherits,
+  // whether or not a candidate overrides it.
+  const owner = (n: Node) => context.getNodesInFile(n.filePath).find(c =>
+    c.kind === 'class' && n.qualifiedName === `${c.qualifiedName}::${member}`);
+  const declarations = new Map<string, { decl: Node; cls: Node }>();
+  const queue = [...targets];
+  while (queue.length && declarations.size < 32) {
+    const decl = queue.shift()!;
+    const cls = decl && owner(decl);
+    if (!cls || declarations.has(decl.id)) continue;
+    declarations.set(decl.id, { decl, cls });
+    queue.push(...pythonBases(cls, ref, context).flatMap(base => pythonMembers(base, member, ref, context)));
+  }
+  const inherits = (cls: Node, base: Node) => cls.id === base.id || pythonDerivesFrom(cls, base, ref, context);
+  const shared = [...declarations.values()].filter(d => classes.every(c => inherits(c, d.cls)));
+  const nearest = shared.filter(d => shared.every(o => inherits(d.cls, o.cls)));
+  return nearest.length === 1 ? [nearest[0]!.decl] : targets;
+}
+
+/** `Cls(...)` / `pkg.mod.Cls(...)` as the WHOLE (possibly multi-line) value; else null (`Cls() if x else y`). */
+function pythonConstructorCall(text: string): string | null {
+  const callee = text.match(/^((?:[A-Za-z_]\w*\.)*[A-Z]\w*)\s*\(/);
+  if (!callee) return null;
+  let depth = 0;
+  let quote = '';
+  for (let i = callee[0].length - 1; i < text.length; i++) {
+    const c = text[i]!;
+    if (quote) { if (c === '\\') i++; else if (c === quote) quote = ''; continue; }
+    if (c === '"' || c === "'") quote = c;
+    else if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') {
+      if (--depth === 0) return /^[\s\\]*$/.test(text.slice(i + 1)) ? callee[1]! : null;
+    }
+  }
+  return null;
 }
 
 /** Read a field's own annotation/initializer, or a constructor parameter assigned to it. */
@@ -6094,6 +6413,9 @@ function getInferScanStates(context: ResolutionContext): Map<string, InferScanSt
 export function clearNameMatcherMemos(context: ResolutionContext): void {
   INFER_SCAN_STATES.delete(context);
   PYTHON_MEMBER_LINES.delete(context);
+  PYTHON_STATEMENT_STARTS.delete(context);
+  PYTHON_GLOBAL_CLASSES.delete(context);
+  PYTHON_NAME_SCANS.delete(context);
   AWAITED_TYPE_MEMO.delete(context);
   AWAITED_FILES.delete(context);
   C_STATIC_MEMO.delete(context);
