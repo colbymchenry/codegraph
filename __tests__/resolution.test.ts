@@ -1163,6 +1163,94 @@ impl Describe for Ctl { fn describe(&self) -> String { "ctl".into() } }
       ).toBe('interface-impl');
     });
 
+    it('bridges a Python base method to every override, through bases that do not redeclare it (python-override)', async () => {
+      // A call bound to `Base.fetch` (a base-typed receiver, or a module global
+      // holding one of several backends) dispatches at runtime to the subclass
+      // override. `Mid` does not redeclare `fetch`, so `Leaf.fetch` overrides
+      // `Base.fetch` directly. Constructors do not dispatch: `Base()` never runs
+      // `Leaf.__init__`. An unrelated class with the same method name is not a
+      // subclass and gets nothing.
+      fs.writeFileSync(
+        path.join(tempDir, 'base.py'),
+        `class Base:
+    def __init__(self):
+        self.ready = True
+
+    def fetch(self, ids):
+        raise NotImplementedError("backend")
+
+    def close(self):
+        return None
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'backends.py'),
+        `from base import Base
+
+class Mid(Base):
+    def helper(self):
+        return 1
+
+class Leaf(Mid):
+    def __init__(self):
+        super().__init__()
+
+    def fetch(self, ids):
+        return ids
+
+class Direct(Base):
+    def fetch(self, ids):
+        return list(ids)
+
+class Refined(Direct):
+    def fetch(self, ids):
+        return sorted(ids)
+
+class Unrelated:
+    def fetch(self, ids):
+        return []
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'consumer.py'),
+        `from base import Base
+
+def gc(store: Base, ids):
+    return store.fetch(ids)
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const methods = cg.getNodesByKind('method');
+      const find = (q: string) => methods.find((n) => n.qualifiedName === q);
+      const baseFetch = find('Base::fetch')!;
+      const leafFetch = find('Leaf::fetch')!;
+      const directFetch = find('Direct::fetch')!;
+      const unrelatedFetch = find('Unrelated::fetch')!;
+      const baseInit = find('Base::__init__')!;
+      for (const [name, node] of Object.entries({ baseFetch, leafFetch, directFetch, unrelatedFetch, baseInit })) {
+        expect(node, `${name} should be in the graph`).toBeDefined();
+      }
+
+      const synth = cg.getOutgoingEdges(baseFetch.id)
+        .filter((e) => e.kind === 'calls' && e.provenance === 'heuristic');
+      expect(new Set(synth.map((e) => e.target))).toEqual(new Set([leafFetch.id, directFetch.id]));
+      expect(new Set(synth.map((e) => (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy)))
+        .toEqual(new Set(['python-override']));
+      expect(cg.getOutgoingEdges(baseInit.id).filter((e) => e.provenance === 'heuristic')).toHaveLength(0);
+      // Refined overrides Direct's override: only the nearest declaration links to it.
+      const refinedFetch = find('Refined::fetch')!;
+      expect(cg.getOutgoingEdges(directFetch.id).filter((e) => e.provenance === 'heuristic').map((e) => e.target))
+        .toEqual([refinedFetch.id]);
+      expect(cg.getCallers(refinedFetch.id, 3).map((c) => c.node.name)).toContain('gc');
+
+      // The reported question: who reaches the override? The base-typed call site does.
+      const reach = cg.getCallers(leafFetch.id, 2).map((c) => c.node.name);
+      expect(reach).toContain('gc');
+      expect(cg.getCallers(unrelatedFetch.id, 2).map((c) => c.node.name)).not.toContain('gc');
+    });
+
     it('qualifies a generic impl by its type, so trait dispatch reaches it and no edge is invented from its body (#1588)', async () => {
       // `impl<T> Source for BufSource<T>`: the implementing type parses as a
       // generic_type, so the old positional receiver scan picked the TRAIT.
