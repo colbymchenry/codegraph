@@ -706,6 +706,12 @@ export interface ExploreAllocationCandidate {
    * share stands, bounded only by the pool.
    */
   named?: boolean;
+  /**
+   * One edge from a symbol the query named exactly, while a file that matched
+   * only a plain query word is also in the running (precise-before-plain).
+   * Exempt from the cliff only; its weight, and so its share, is unchanged.
+   */
+  anchored?: boolean;
 }
 
 export interface ExploreAllocation {
@@ -775,7 +781,7 @@ export function allocateExploreBudget(
   const cliffed: string[] = [];
   let admitted: ExploreAllocationCandidate[] = [];
   for (const c of candidates) {
-    if (!c.spine && !c.pinned && (weights.get(c.path) ?? 0) < cliffAt) cliffed.push(c.path);
+    if (!c.spine && !c.pinned && !c.anchored && (weights.get(c.path) ?? 0) < cliffAt) cliffed.push(c.path);
     else admitted.push(c);
   }
   // Never cliff every candidate: an empty response costs a whole round-trip.
@@ -4456,9 +4462,12 @@ export class ToolHandler {
     // a seed; it loses gate protection and centrality and sorts last, so it
     // only takes leftover budget. Inert when no precise token resolved.
     const wordOnlyFiles = new Set<string>();
+    // Files one edge from a named seed (its callers and callees). The relevance
+    // gate below keeps them: a caller of the exact symbol the agent named is the
+    // answer to "where is X used", even when it matches no query word itself.
+    const seedNeighbourFiles = new Set<string>();
     if (tierSeedIds.size > 0 && preciseQueryTerms.size > 0) {
       const seedFiles = new Set<string>();
-      const seedNeighbourFiles = new Set<string>();
       for (const id of tierSeedIds) {
         const seed = subgraph.nodes.get(id) ?? cg.getNode(id);
         if (!seed) continue;
@@ -4598,6 +4607,7 @@ export class ToolHandler {
         || (fileGraphScore.get(fp) ?? 0) >= maxGraph * 0.06
         || centralFiles.has(fp)
         || (entryFiles.has(fp) && !wordOnlyFiles.has(fp))
+        || seedNeighbourFiles.has(fp)
         || changeSurfaceFiles.has(fp)
         || (fileTermHits.get(fp) ?? 0) >= 2,
       );
@@ -4848,6 +4858,10 @@ export class ToolHandler {
           || anchorSpans.has(fp),
         pinned: pinnedSet.has(fp),
         named: namedSeedFiles.has(fp),
+        // A caller of the named seed matches no query word, so it scores low and
+        // would fall under the cliff while a word-only file below it keeps its
+        // bytes. Only while such a file exists: otherwise the cliff is unchanged.
+        anchored: wordOnlyFiles.size > 0 && seedNeighbourFiles.has(fp),
       })),
       budget,
       maxFiles,
