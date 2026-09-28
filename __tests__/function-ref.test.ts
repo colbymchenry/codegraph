@@ -1439,6 +1439,16 @@ def init():
       namespace_import_binds_root: [{ 'pkg/__init__.py': '', 'pkg/settings.py': header,
         'c.py': 'import pkg.settings\nfrom decoy import Decoy\n\nsettings = Bag()\nsettings.conn = Decoy()\n',
         'd.py': 'from pkg import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n' }, ['cb -> Store::fetch']],
+      // `other.pkg.settings as settings` is not an explicit alias of `pkg.settings`: the
+      // write goes to the other module, so pkg's global keeps its type (the consumer's
+      // relative import names pkg/settings.py exactly).
+      alias_of_longer_module_is_not_explicit: [{ 'pkg/__init__.py': '', 'pkg/settings.py': header,
+        'other/__init__.py': '', 'other/pkg/__init__.py': '', 'other/pkg/settings.py': 'conn = None\n',
+        'reset.py': 'import pkg.settings\nimport other.pkg.settings as settings\nfrom decoy import Decoy\n\ndef reset():\n    settings.conn = Decoy()\n',
+        'pkg/d.py': 'from . import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n' }, ['cb -> Store::fetch']],
+      alias_in_string_is_not_explicit: [{ 'pkg/__init__.py': '', 'pkg/settings.py': 'conn = None\n',
+        'reset.py': 'import pkg.settings\nfrom decoy import Decoy\nnote = "import pkg.settings as settings"\n\ndef reset():\n    settings.conn = Decoy()\n',
+        'd.py': 'from pkg import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n' }, []],
       explicit_alias_equal_to_leaf: [{ 'pkg/__init__.py': '', 'pkg/settings.py': header,
         'reset.py': 'import pkg.settings as settings\nfrom decoy import Decoy\n\ndef reset():\n    settings.conn = Decoy()\n',
         'd.py': 'from pkg import settings\n\ndef cb(pool):\n    pool.submit(settings.conn.fetch)\n' }, []],

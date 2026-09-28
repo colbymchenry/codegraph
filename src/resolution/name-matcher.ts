@@ -727,9 +727,10 @@ function pythonModuleAliases(filePath: string, moduleFile: string, context: Reso
     const files = pythonModuleFiles(dotted, filePath, context);
     if (!files.includes(moduleFile)) continue;
     // The mapping cannot tell `import a.b` from `import a.b as b`; the source line can.
-    const explicit = new RegExp(`\\bimport\\s[^\\n]*\\b${m.source.replace(/\./g, '\\.')}\\s+as\\s+${m.localName}\\b`);
+    // Exactly this module (not `other.a.b`), outside string literals.
+    const explicit = new RegExp(`\\bimport\\s[^\\n]*(?<![\\w.])${m.source.replace(/\./g, '\\.')}\\s+as\\s+${m.localName}\\b`);
     const plainDotted = m.isNamespace && m.source.includes('.') && m.localName === m.source.split('.').pop() &&
-      !pythonMemberLines(filePath, context).some(line => explicit.test(line));
+      !pythonMemberLines(filePath, context).some(line => explicit.test(blankPythonStrings(line)));
     (files.length === 1 ? aliases : ambiguous).add(plainDotted ? m.source : m.localName);
   }
   return { aliases: [...aliases], ambiguous: [...ambiguous] };
