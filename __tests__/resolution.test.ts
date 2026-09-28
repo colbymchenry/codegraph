@@ -1190,6 +1190,11 @@ impl Describe for Ctl { fn describe(&self) -> String { "ctl".into() } }
     def load(cls, ids):
         return cls()
 
+    @classmethod
+    # a comment between the decorator and the def
+    def build(cls):
+        return cls()
+
     @property
     def label(self):
         return "base"
@@ -1217,6 +1222,9 @@ class Leaf(Mid):
     @classmethod
     def load(cls, ids):
         return cls()
+
+    def build(self):
+        return self
 
     @property
     def label(self):
@@ -1263,7 +1271,7 @@ def gc(store: Base, ids):
       expect(new Set(synth.map((e) => (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy)))
         .toEqual(new Set(['python-override']));
       // Constructors, static/class methods and properties do not dispatch to the override.
-      for (const q of ['Base::__init__', 'Base::make', 'Base::load', 'Base::label']) {
+      for (const q of ['Base::__init__', 'Base::make', 'Base::load', 'Base::build', 'Base::label']) {
         expect(find(q), `${q} should be in the graph`).toBeDefined();
         expect(cg.getOutgoingEdges(find(q)!.id).filter((e) => e.provenance === 'heuristic'), q).toHaveLength(0);
       }
@@ -1280,11 +1288,17 @@ def gc(store: Base, ids):
     });
 
     it('does not link a Python override through a supertype guessed by bare name (python-override)', async () => {
-      // `Base` exists in two files and `child.py` imports neither: the extends
-      // edge is a low-confidence name guess, so it must not carry dispatch.
-      fs.writeFileSync(path.join(tempDir, 'a.py'), 'class Base:\n    def fetch(self):\n        return 1\n');
+      // `Base` exists in two files. `child.py` / `src/app/deep.py` import
+      // neither, so their extends edges are name guesses — whatever confidence
+      // proximity gives them — and must not carry dispatch. An import, or a
+      // base in the same file, is not a guess.
+      fs.writeFileSync(path.join(tempDir, 'a.py'),
+        'class Base:\n    def fetch(self):\n        return 1\n\nclass Local(Base):\n    def fetch(self):\n        return 5\n');
       fs.writeFileSync(path.join(tempDir, 'b.py'), 'class Base:\n    def fetch(self):\n        return 2\n');
       fs.writeFileSync(path.join(tempDir, 'child.py'), 'class Child(Base):\n    def fetch(self):\n        return 3\n');
+      fs.mkdirSync(path.join(tempDir, 'src', 'app'), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, 'src', 'app', 'a.py'), 'class Base:\n    def fetch(self):\n        return 6\n');
+      fs.writeFileSync(path.join(tempDir, 'src', 'app', 'deep.py'), 'class Deep(Base):\n    def fetch(self):\n        return 7\n');
       fs.writeFileSync(path.join(tempDir, 'imported.py'),
         'from a import Base\n\nclass Known(Base):\n    def fetch(self):\n        return 4\n');
 
@@ -1294,7 +1308,9 @@ def gc(store: Base, ids):
       const into = (q: string) => cg.getIncomingEdges(methods.find((n) => n.qualifiedName === q)!.id)
         .filter((e) => (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy === 'python-override');
       expect(into('Child::fetch')).toHaveLength(0);
+      expect(into('Deep::fetch')).toHaveLength(0);
       expect(into('Known::fetch')).toHaveLength(1);
+      expect(into('Local::fetch')).toHaveLength(1);
     });
 
     it('qualifies a generic impl by its type, so trait dispatch reaches it and no edge is invented from its body (#1588)', async () => {

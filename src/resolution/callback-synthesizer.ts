@@ -1098,21 +1098,26 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
  * redeclare the method (`Leaf(Mid(Base))`, only Base and Leaf define it).
  * Not dispatch, so skipped on either side: class-creation hooks (`Base()`
  * never runs `Leaf.__init__`), static and class methods (`Base.fetch()` names
- * its class), and properties (read, not called). A guessed supertype (an
- * `extends` edge resolved by bare name below 0.7 confidence) is not followed.
+ * its class), and properties (read, not called). A supertype is followed when
+ * its `extends` edge was resolved through an import or lies in the same file;
+ * a cross-file bare-name guess (`exact-match` / `fuzzy`) is not.
  * Over-approximation accepted (reachability-correct), like interface-impl; no
  * cap, since each override yields one edge per nearest declaration.
  */
 const PYTHON_NON_VIRTUAL = new Set(['__init__', '__new__', '__init_subclass__', '__class_getitem__']);
 const PYTHON_NON_DISPATCH_DECORATOR = /^@?(?:staticmethod|classmethod|(?:functools\.)?cached_property|property|\w+\.(?:setter|getter|deleter))\b/;
-const MIN_SUPERTYPE_CONFIDENCE = 0.7;
+const GUESSED_SUPERTYPE = new Set(['exact-match', 'fuzzy']);
 async function pythonOverrideEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
-  // Python decorators are not on the node (only `isStatic`); read the `@` lines above the def.
+  // Python decorators are not on the node (only `isStatic`); read the `@` lines
+  // above the def, past blank and comment lines between them.
   const isPythonDispatchMethod = (m: Node): boolean => {
     if (PYTHON_NON_VIRTUAL.has(m.name) || m.isStatic) return false;
     const lines = ctx.getFileLines?.(m.filePath) ?? ctx.readFile(m.filePath)?.split('\n') ?? [];
-    for (let i = m.startLine - 2; i >= 0 && lines[i]!.trim().startsWith('@'); i--) {
-      if (PYTHON_NON_DISPATCH_DECORATOR.test(lines[i]!.trim())) return false;
+    for (let i = m.startLine - 2; i >= 0; i--) {
+      const line = lines[i]!.trim();
+      if (line === '' || line.startsWith('#')) continue;
+      if (!line.startsWith('@')) break;
+      if (PYTHON_NON_DISPATCH_DECORATOR.test(line)) return false;
     }
     return true;
   };
@@ -1133,18 +1138,17 @@ async function pythonOverrideEdges(queries: QueryBuilder, ctx: ResolutionContext
     methodsMemo.set(classId, byName);
     return byName;
   };
-  const basesOf = (classId: string): Node[] =>
-    queries.getOutgoingEdges(classId, ['extends'])
-      .filter((e) => {
-        const confidence = (e.metadata as { confidence?: number } | undefined)?.confidence;
-        return confidence === undefined || confidence >= MIN_SUPERTYPE_CONFIDENCE;
-      })
-      .map((e) => queries.getNodeById(e.target))
-      .filter((n): n is Node => !!n && n.kind === 'class' && n.language === 'python' && n.id !== classId);
+  const basesOf = (cls: Node): Node[] =>
+    queries.getOutgoingEdges(cls.id, ['extends'])
+      .map((e) => ({ e, base: queries.getNodeById(e.target) }))
+      .filter(({ e, base }) => !!base && base.kind === 'class' && base.language === 'python' && base.id !== cls.id &&
+        (base.filePath === cls.filePath ||
+          !GUESSED_SUPERTYPE.has(String((e.metadata as { resolvedBy?: string } | undefined)?.resolvedBy))))
+      .map(({ base }) => base!);
   for (const cls of queries.iterateNodesByKind('class')) {
     if ((++scanned & 63) === 0) await onYield();
     if (cls.language !== 'python') continue;
-    const bases = basesOf(cls.id);
+    const bases = basesOf(cls);
     if (bases.length === 0) continue;
     for (const [name, all] of methodsOf(cls.id)) {
       const overrides = all.filter(isPythonDispatchMethod);
@@ -1158,7 +1162,7 @@ async function pythonOverrideEdges(queries: QueryBuilder, ctx: ResolutionContext
           if (visited.has(base.id)) continue;
           visited.add(base.id);
           const declared = methodsOf(base.id).get(name);
-          if (!declared) { next.push(...basesOf(base.id)); continue; }
+          if (!declared) { next.push(...basesOf(base)); continue; }
           // The nearest declaration ends this branch even when it is static or a property.
           for (const bm of declared.filter(isPythonDispatchMethod)) {
             for (const m of overrides) {
