@@ -1181,6 +1181,18 @@ impl Describe for Ctl { fn describe(&self) -> String { "ctl".into() } }
 
     def close(self):
         return None
+
+    @staticmethod
+    def make(ids):
+        return ids
+
+    @classmethod
+    def load(cls, ids):
+        return cls()
+
+    @property
+    def label(self):
+        return "base"
 `
       );
       fs.writeFileSync(
@@ -1197,6 +1209,18 @@ class Leaf(Mid):
 
     def fetch(self, ids):
         return ids
+
+    @staticmethod
+    def make(ids):
+        return list(ids)
+
+    @classmethod
+    def load(cls, ids):
+        return cls()
+
+    @property
+    def label(self):
+        return "leaf"
 
 class Direct(Base):
     def fetch(self, ids):
@@ -1238,7 +1262,11 @@ def gc(store: Base, ids):
       expect(new Set(synth.map((e) => e.target))).toEqual(new Set([leafFetch.id, directFetch.id]));
       expect(new Set(synth.map((e) => (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy)))
         .toEqual(new Set(['python-override']));
-      expect(cg.getOutgoingEdges(baseInit.id).filter((e) => e.provenance === 'heuristic')).toHaveLength(0);
+      // Constructors, static/class methods and properties do not dispatch to the override.
+      for (const q of ['Base::__init__', 'Base::make', 'Base::load', 'Base::label']) {
+        expect(find(q), `${q} should be in the graph`).toBeDefined();
+        expect(cg.getOutgoingEdges(find(q)!.id).filter((e) => e.provenance === 'heuristic'), q).toHaveLength(0);
+      }
       // Refined overrides Direct's override: only the nearest declaration links to it.
       const refinedFetch = find('Refined::fetch')!;
       expect(cg.getOutgoingEdges(directFetch.id).filter((e) => e.provenance === 'heuristic').map((e) => e.target))
@@ -1249,6 +1277,24 @@ def gc(store: Base, ids):
       const reach = cg.getCallers(leafFetch.id, 2).map((c) => c.node.name);
       expect(reach).toContain('gc');
       expect(cg.getCallers(unrelatedFetch.id, 2).map((c) => c.node.name)).not.toContain('gc');
+    });
+
+    it('does not link a Python override through a supertype guessed by bare name (python-override)', async () => {
+      // `Base` exists in two files and `child.py` imports neither: the extends
+      // edge is a low-confidence name guess, so it must not carry dispatch.
+      fs.writeFileSync(path.join(tempDir, 'a.py'), 'class Base:\n    def fetch(self):\n        return 1\n');
+      fs.writeFileSync(path.join(tempDir, 'b.py'), 'class Base:\n    def fetch(self):\n        return 2\n');
+      fs.writeFileSync(path.join(tempDir, 'child.py'), 'class Child(Base):\n    def fetch(self):\n        return 3\n');
+      fs.writeFileSync(path.join(tempDir, 'imported.py'),
+        'from a import Base\n\nclass Known(Base):\n    def fetch(self):\n        return 4\n');
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const methods = cg.getNodesByKind('method').filter((n) => n.name === 'fetch');
+      const into = (q: string) => cg.getIncomingEdges(methods.find((n) => n.qualifiedName === q)!.id)
+        .filter((e) => (e.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy === 'python-override');
+      expect(into('Child::fetch')).toHaveLength(0);
+      expect(into('Known::fetch')).toHaveLength(1);
     });
 
     it('qualifies a generic impl by its type, so trait dispatch reaches it and no edge is invented from its body (#1588)', async () => {

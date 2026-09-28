@@ -1096,13 +1096,26 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
  * Link each override to the NEAREST declaration of the same name up its
  * `extends` chain: Python classes often inherit through a base that does not
  * redeclare the method (`Leaf(Mid(Base))`, only Base and Leaf define it).
- * Constructors are not virtual — `Base()` never runs `Leaf.__init__` — so
- * class-creation hooks are skipped. Over-approximation accepted
- * (reachability-correct), like interface-impl; no cap, since each override
- * yields one edge per nearest declaration.
+ * Not dispatch, so skipped on either side: class-creation hooks (`Base()`
+ * never runs `Leaf.__init__`), static and class methods (`Base.fetch()` names
+ * its class), and properties (read, not called). A guessed supertype (an
+ * `extends` edge resolved by bare name below 0.7 confidence) is not followed.
+ * Over-approximation accepted (reachability-correct), like interface-impl; no
+ * cap, since each override yields one edge per nearest declaration.
  */
 const PYTHON_NON_VIRTUAL = new Set(['__init__', '__new__', '__init_subclass__', '__class_getitem__']);
-async function pythonOverrideEdges(queries: QueryBuilder, onYield: MaybeYield): Promise<Edge[]> {
+const PYTHON_NON_DISPATCH_DECORATOR = /^@?(?:staticmethod|classmethod|(?:functools\.)?cached_property|property|\w+\.(?:setter|getter|deleter))\b/;
+const MIN_SUPERTYPE_CONFIDENCE = 0.7;
+async function pythonOverrideEdges(queries: QueryBuilder, ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
+  // Python decorators are not on the node (only `isStatic`); read the `@` lines above the def.
+  const isPythonDispatchMethod = (m: Node): boolean => {
+    if (PYTHON_NON_VIRTUAL.has(m.name) || m.isStatic) return false;
+    const lines = ctx.getFileLines?.(m.filePath) ?? ctx.readFile(m.filePath)?.split('\n') ?? [];
+    for (let i = m.startLine - 2; i >= 0 && lines[i]!.trim().startsWith('@'); i--) {
+      if (PYTHON_NON_DISPATCH_DECORATOR.test(lines[i]!.trim())) return false;
+    }
+    return true;
+  };
   let scanned = 0;
   const edges: Edge[] = [];
   const seen = new Set<string>();
@@ -1122,6 +1135,10 @@ async function pythonOverrideEdges(queries: QueryBuilder, onYield: MaybeYield): 
   };
   const basesOf = (classId: string): Node[] =>
     queries.getOutgoingEdges(classId, ['extends'])
+      .filter((e) => {
+        const confidence = (e.metadata as { confidence?: number } | undefined)?.confidence;
+        return confidence === undefined || confidence >= MIN_SUPERTYPE_CONFIDENCE;
+      })
       .map((e) => queries.getNodeById(e.target))
       .filter((n): n is Node => !!n && n.kind === 'class' && n.language === 'python' && n.id !== classId);
   for (const cls of queries.iterateNodesByKind('class')) {
@@ -1129,8 +1146,9 @@ async function pythonOverrideEdges(queries: QueryBuilder, onYield: MaybeYield): 
     if (cls.language !== 'python') continue;
     const bases = basesOf(cls.id);
     if (bases.length === 0) continue;
-    for (const [name, overrides] of methodsOf(cls.id)) {
-      if (PYTHON_NON_VIRTUAL.has(name)) continue;
+    for (const [name, all] of methodsOf(cls.id)) {
+      const overrides = all.filter(isPythonDispatchMethod);
+      if (overrides.length === 0) continue;
       // Breadth-first up the bases; a branch stops at its first declaration.
       const visited = new Set<string>([cls.id]);
       let frontier = bases;
@@ -1141,7 +1159,8 @@ async function pythonOverrideEdges(queries: QueryBuilder, onYield: MaybeYield): 
           visited.add(base.id);
           const declared = methodsOf(base.id).get(name);
           if (!declared) { next.push(...basesOf(base.id)); continue; }
-          for (const bm of declared) {
+          // The nearest declaration ends this branch even when it is static or a property.
+          for (const bm of declared.filter(isPythonDispatchMethod)) {
             for (const m of overrides) {
               const key = `${bm.id}>${m.id}`;
               if (bm.id === m.id || seen.has(key)) continue;
@@ -3747,7 +3766,7 @@ export const SYNTH_PASSES: SynthPassDef[] = [
     gate: (has) => has('java', 'kotlin', 'csharp', 'swift', 'scala', 'go', 'rust', 'arkts', ...JS_FAMILY),
     run: (q, _c, y) => interfaceOverrideEdges(q, y),
   },
-  { name: 'pythonOverrideEdges', gate: (has) => has('python'), run: (q, _c, y) => pythonOverrideEdges(q, y) },
+  { name: 'pythonOverrideEdges', gate: (has) => has('python'), run: (q, c, y) => pythonOverrideEdges(q, c, y) },
   { name: 'kotlinExpectActual', gate: (has) => has('kotlin'), run: (q, _c, y) => kotlinExpectActualEdges(q, y) },
   { name: 'goGrpcEdges', gate: (has) => has('go'), run: (q, _c, y) => goGrpcStubImplEdges(q, y) },
   { name: 'rnEventEdgesList', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => rnEventEdges(c, y) },
