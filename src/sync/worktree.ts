@@ -110,7 +110,7 @@ export function detectWorktreeIndexMismatch(
   // and gitlinked clones, so a query run from inside one resolves up to the
   // parent index — whose graph *does* contain that nested repo's files. The
   // warning's premise ("results are a different branch; symbols changed only
-  // here are missing") is false there, and its "run codegraph init -i" advice
+  // here are missing") is false there, and its "run codegraph init --yes" advice
   // would needlessly fragment the unified workspace index. A genuine borrowed
   // worktree and the index root are the SAME repository (they share a git
   // common dir); a submodule/embedded clone is a DIFFERENT repository and does
@@ -129,7 +129,7 @@ export function worktreeMismatchWarning(m: WorktreeIndexMismatch): string {
     `  Running in: ${m.worktreeRoot}\n` +
     `  Index from: ${m.indexRoot}\n` +
     `Results reflect that tree's code (often a different branch), not this worktree — ` +
-    `symbols changed only here are missing. Run "codegraph init -i" in this worktree ` +
+    `symbols changed only here are missing. Run "codegraph init --yes" in this worktree ` +
     `for a worktree-local index.`
   );
 }
@@ -143,7 +143,7 @@ export function worktreeMismatchNotice(m: WorktreeIndexMismatch): string {
   return (
     `⚠ CodeGraph results below come from a different git worktree (${m.indexRoot}), ` +
     `not where you're working (${m.worktreeRoot}) — they may reflect another branch, ` +
-    `and symbols changed only here are missing. Run "codegraph init -i" here for a ` +
+    `and symbols changed only here are missing. Run "codegraph init --yes" here for a ` +
     `worktree-local index.`
   );
 }

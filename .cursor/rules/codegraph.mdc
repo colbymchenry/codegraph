@@ -20,5 +20,11 @@ Reach for `codegraph_explore` before grep/find or Read for any **structural** qu
 
 ### If `.codegraph/` doesn't exist
 
-The MCP server returns "not initialized." Ask the user: *"I notice this project doesn't have CodeGraph initialized. Want me to run `codegraph init -i` to build the index?"*
+When CodeGraph would materially help, treat a missing index as authorization to
+run `codegraph init --yes` in the verified project root without asking first,
+then verify index health. Skip initialization for trivial tasks, literal-text
+searches, documentation-only work, or repositories whose local policy forbids
+generated index state. Ask only when the root or allowed input scope is
+ambiguous or initialization would create unexpected tracked changes; if
+initialization fails, continue with built-in tools and report it.
 <!-- CODEGRAPH_END -->

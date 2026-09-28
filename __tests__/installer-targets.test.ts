@@ -264,6 +264,9 @@ describe('Installer targets — partial-state idempotency', () => {
     const body = fs.readFileSync(agentsMd, 'utf-8');
     expect(body).toContain('## CodeGraph');
     expect(body).toContain('codegraph explore');
+    expect(body).toContain('codegraph init --yes');
+    expect(body).toMatch(/without asking first/i);
+    expect(body).not.toMatch(/indexing is the user's decision/i);
     // Re-install is fully unchanged (byte-equal block → idempotent).
     const second = codex.install('global', { autoAllow: false });
     for (const f of second.files) expect(f.action).toBe('unchanged');
