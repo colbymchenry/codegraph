@@ -3,12 +3,12 @@
  *
  * Golden video fixtures (`testdata/*.ts`) share TypeScript's extension; fed to
  * the tree-sitter TypeScript parser a 900 KB clip costs ~28 s of CPU for zero
- * symbols. The fix recognises the stream from the head of the file (0x47 sync
- * byte at each 188-byte packet boundary, plus a NUL byte no UTF-8 source has)
- * and drops it at discovery — not indexed, not parsed, not counted, not
- * reported as an unsupported language.
+ * symbols. The fix recognises the stream from the bytes it reads anyway (0x47
+ * sync byte at each 188-byte packet boundary, and a binary head) and never
+ * indexes it — not parsed, not stored, not reported as an unsupported
+ * language, and never pending on a later sync.
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -16,6 +16,9 @@ import { execFileSync } from 'child_process';
 import { CodeGraph } from '../src';
 import { scanDirectoryAsync, type ScanSkipStats } from '../src/extraction';
 import { detectLanguage, isMpegTransportStream, MPEG_TS_SNIFF_BYTES } from '../src/extraction/grammars';
+
+// A configurable `fs`, so a test can watch the opens discovery makes.
+vi.mock('fs', async (importOriginal) => ({ ...await importOriginal<typeof import('fs')>() }));
 
 const PACKET = 188;
 
@@ -116,7 +119,7 @@ describe('isMpegTransportStream', () => {
 });
 
 describe('MPEG-TS video named .ts is skipped, real TypeScript is indexed (#1910)', () => {
-  it('drops the clip at discovery: no file record, no nodes, no unsupported-language report', async () => {
+  it('never indexes the clip: no file record, no nodes, no unsupported-language report', async () => {
     const dir = createProject();
     fs.mkdirSync(path.join(dir, 'testdata'));
     fs.writeFileSync(path.join(dir, 'testdata', 'clip.ts'), makeMpegTs(40));
@@ -124,9 +127,12 @@ describe('MPEG-TS video named .ts is skipped, real TypeScript is indexed (#1910)
     fs.writeFileSync(path.join(dir, 'gamma.ts'), makeGammaSource());
     fs.writeFileSync(path.join(dir, 'gamma-nul.ts'), makeGammaSource(16, true));
 
+    // Discovery lists every `.ts` by name and reads none of them: sniffing each
+    // one's head there would be a random read per file per scan. The bytes are
+    // judged where they are read anyway.
     const stats: ScanSkipStats = { unsupportedByExtension: new Map() };
     const scanned = await scanDirectoryAsync(dir, undefined, stats);
-    expect(scanned.sort()).toEqual(['app.ts', 'gamma-nul.ts', 'gamma.ts']);
+    expect(scanned.sort()).toEqual(['app.ts', 'gamma-nul.ts', 'gamma.ts', 'testdata/clip.ts']);
     expect(stats.unsupportedByExtension.size).toBe(0);
 
     const cg = await CodeGraph.init(dir, { index: true });
@@ -144,6 +150,33 @@ describe('MPEG-TS video named .ts is skipped, real TypeScript is indexed (#1910)
       expect(cg.getFiles().map((f) => f.path).sort()).toEqual(['app.ts', 'gamma-nul.ts', 'gamma.ts']);
     } finally {
       await cg.close();
+    }
+  });
+
+  it('discovery opens no file, on the directory walk or the git path', async () => {
+    for (const withGit of [false, true]) {
+      const dir = createProject();
+      fs.writeFileSync(path.join(dir, 'clip.ts'), makeMpegTs(40));
+      fs.writeFileSync(path.join(dir, 'app.ts'), 'export const a = 1;\n');
+      if (withGit) {
+        const git = (...a: string[]) => execFileSync('git', a, { cwd: dir, stdio: 'pipe' });
+        git('init', '-q'); git('config', 'user.email', 't@t'); git('config', 'user.name', 't');
+        git('add', '.'); git('commit', '-qm', 'init');
+      }
+      const opened: string[] = [];
+      const real = fs.openSync;
+      const spy = vi.spyOn(fs, 'openSync').mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+        opened.push(String(file));
+        return (real as (...args: unknown[]) => number)(file, ...rest);
+      }) as typeof fs.openSync);
+      let scanned: string[];
+      try {
+        scanned = await scanDirectoryAsync(dir);
+      } finally {
+        spy.mockRestore();
+      }
+      expect(scanned.sort()).toEqual(['app.ts', 'clip.ts']);
+      expect(opened.filter((f) => f.endsWith('.ts'))).toEqual([]);
     }
   });
 

@@ -163,10 +163,22 @@ export function hashContent(content: string): string {
 /**
  * What change detection hashes for a file: its text when it is under the size
  * limit, the size stamp when it is over — an oversize file is never decoded.
+ * `null` when the bytes show a `.ts` file is an MPEG transport stream, not
+ * TypeScript (#1910): decided from the bytes already read, so it costs no I/O
+ * and runs only for a file that is new or changed — never once per `.ts` file
+ * at discovery, which on a slow disk is a random read per file per scan.
  */
-function readSourceOrStamp(fullPath: string): string {
+function readSourceOrStamp(fullPath: string): string | null {
   const { stats, bytes } = readBoundedSourceSync(fullPath);
-  return bytes === null ? oversizeStamp(stats.size) : bytes.toString('utf8');
+  if (bytes === null) return oversizeStamp(stats.size);
+  return isMpegTsBytes(fullPath, bytes) ? null : bytes.toString('utf8');
+}
+
+/** Whether these bytes, read from `filePath`, are a `.ts` MPEG transport stream (#1910). */
+function isMpegTsBytes(filePath: string, bytes: Buffer): boolean {
+  if (!hasMpegTsExtension(filePath) || !isMpegTransportStream(bytes.subarray(0, MPEG_TS_SNIFF_BYTES))) return false;
+  logDebug('Skipping MPEG transport stream named .ts — not TypeScript', { filePath });
+  return true;
 }
 
 /**
@@ -577,7 +589,6 @@ function collectIncludedFiles(
       if (!include.ignores(rel)) return;
       if (exclude && exclude.ignores(rel)) return;
       if (!isSourceFile(rel, overrides)) return;
-      if (isMpegTsVideoFile(rootDir, rel)) return;
       out.add(rel);
     }
   };
@@ -1516,7 +1527,6 @@ export function scanDirectory(
     let count = 0;
     for (const filePath of gitFiles) {
       if (isSourceFile(filePath, overrides)) {
-        if (isMpegTsVideoFile(rootDir, filePath)) continue;
         files.push(filePath);
         count++;
         onProgress?.(count, filePath);
@@ -1533,30 +1543,6 @@ export function scanDirectory(
  * Async variant of scanDirectory that yields to the event loop periodically,
  * allowing worker threads to receive and render progress messages.
  */
-/**
- * Whether a `.ts` file on disk is an MPEG transport stream rather than
- * TypeScript (#1910). Reads only the file's head — `MPEG_TS_SNIFF_BYTES`, under
- * 1 KB — so the check costs one small read per `.ts` file at discovery, never a
- * whole-file read; any file the extension does not make ambiguous is not
- * touched at all. A file that cannot be read is left to the indexing path,
- * which reports the read error itself.
- */
-function isMpegTsVideoFile(rootDir: string, relativePath: string): boolean {
-  if (!hasMpegTsExtension(relativePath)) return false;
-  let fd: number | null = null;
-  try {
-    fd = fs.openSync(path.join(rootDir, relativePath), 'r');
-    const head = Buffer.allocUnsafe(MPEG_TS_SNIFF_BYTES);
-    const n = fs.readSync(fd, head, 0, head.length, 0);
-    if (!isMpegTransportStream(head.subarray(0, n))) return false;
-  } catch {
-    return false;
-  } finally {
-    if (fd !== null) fs.closeSync(fd);
-  }
-  logDebug('Skipping MPEG transport stream named .ts — not TypeScript', { filePath: relativePath });
-  return true;
-}
 
 /**
  * What a scan saw but could not index, tallied by extension.
@@ -1592,7 +1578,6 @@ export async function scanDirectoryAsync(
     let count = 0;
     for (const filePath of gitFiles) {
       if (isSourceFile(filePath, overrides)) {
-        if (isMpegTsVideoFile(rootDir, filePath)) continue;
         files.push(filePath);
         count++;
         onProgress?.(count, filePath);
@@ -1701,7 +1686,6 @@ function scanDirectoryWalk(
           } else if (stat.isFile()) {
             if (!isIgnored(fullPath, false, active)) {
               if (isSourceFile(relativePath, overrides)) {
-                if (isMpegTsVideoFile(rootDir, relativePath)) continue;
                 files.push(relativePath);
                 count++;
                 onProgress?.(count, relativePath);
@@ -1723,7 +1707,6 @@ function scanDirectoryWalk(
       } else if (entry.isFile()) {
         if (!isIgnored(fullPath, false, active)) {
           if (isSourceFile(relativePath, overrides)) {
-            if (isMpegTsVideoFile(rootDir, relativePath)) continue;
             files.push(relativePath);
             count++;
             onProgress?.(count, relativePath);
@@ -2316,8 +2299,7 @@ export class ExtractionOrchestrator {
             // Read bytes, not text: a `.ts` that is really an MPEG transport
             // stream (#1910) is recognised from its head here, at no extra I/O,
             // and never decoded or parsed.
-            if (hasMpegTsExtension(fp) && isMpegTransportStream(bytes.subarray(0, MPEG_TS_SNIFF_BYTES))) {
-              logDebug('Skipping MPEG transport stream named .ts — not TypeScript', { filePath: fp });
+            if (isMpegTsBytes(fp, bytes)) {
               return { filePath: fp, content: null as string | null, stats: null as fs.Stats | null, error: null as Error | null, skipped: true };
             }
             const content = bytes.toString('utf-8');
@@ -2657,6 +2639,10 @@ export class ExtractionOrchestrator {
       // An oversize file is stored as skipped; its bytes are never needed (#1910).
       const read = await readBoundedSource(fullPath);
       stats = read.stats;
+      // An MPEG transport stream named `.ts` is not TypeScript (#1910).
+      if (read.bytes !== null && isMpegTsBytes(relativePath, read.bytes)) {
+        return { nodes: [], edges: [], unresolvedReferences: [], errors: [], durationMs: 0 };
+      }
       content = read.bytes === null ? oversizeStamp(stats.size) : read.bytes.toString('utf8');
     } catch (error) {
       return {
@@ -2698,12 +2684,6 @@ export class ExtractionOrchestrator {
         errors: [{ message: 'Path traversal blocked', filePath: relativePath, severity: 'error', code: 'path_traversal' }],
         durationMs: 0,
       };
-    }
-
-    // An MPEG transport stream named `.ts` is not TypeScript (#1910): one
-    // sub-KB head read decides it, before the language lookup and the parse.
-    if (isMpegTsVideoFile(this.rootDir, relativePath)) {
-      return { nodes: [], edges: [], unresolvedReferences: [], errors: [], durationMs: 0 };
     }
 
     const language = detectLanguage(relativePath, content, loadExtensionOverrides(this.rootDir));
@@ -3177,10 +3157,7 @@ export class ExtractionOrchestrator {
         (p) =>
           isSourceFile(p, overrides) &&
           !scope.ignores(p) &&
-          fs.existsSync(path.join(this.rootDir, p)) &&
-          // Same rule as the scan (#1910): a reported video clip is not a
-          // source file, so a tracked one is removed and a new one ignored.
-          !isMpegTsVideoFile(this.rootDir, p)
+          fs.existsSync(path.join(this.rootDir, p))
       );
       trackedFiles = [];
       for (const p of unique) {
@@ -3218,30 +3195,33 @@ export class ExtractionOrchestrator {
     // `reconcileChecks` drives the cooperative yield shared with the adds/mods loop
     // below (see SYNC_RECONCILE_YIELD_INTERVAL / issue #905).
     let reconcileChecks = 0;
+    const removeTracked = (tracked: FileRecord): void => {
+      // Before the cascade deletes them, resurrect incoming cross-file
+      // resolution edges as their original refs (#1240 removal case): the
+      // callers live in files this sync will NOT revisit, so this is their
+      // only chance to rebind to an alternative definition — or to park as
+      // failed until the symbol reappears somewhere. (A deleted file whose
+      // CALLERS are also being deleted is fine: their nodes cascade later
+      // in this loop and take the resurrected rows with them.)
+      // Every name this file defined is about to stop existing here, which
+      // narrows the candidate set for that name repo-wide (CG-33).
+      for (const pair of this.queries.getNodeNamePairsByFiles([tracked.path])) pairsBefore.add(pair);
+      const incoming = this.queries.getCrossFileIncomingEdgesWithTarget(tracked.path);
+      if (incoming.length > 0) {
+        const resurrected = incoming
+          .map((e) => resurrectRefFromDroppedEdge(e))
+          .filter((r): r is UnresolvedReference => r !== null);
+        if (resurrected.length > 0) {
+          this.queries.insertUnresolvedRefsBatch(resurrected);
+        }
+      }
+      onFileChange?.(tracked.path);
+      this.queries.deleteFile(tracked.path);
+      filesRemoved++;
+    };
     for (const tracked of trackedFiles) {
       if (!currentSet.has(tracked.path) || !fs.existsSync(path.join(this.rootDir, tracked.path))) {
-        // Before the cascade deletes them, resurrect incoming cross-file
-        // resolution edges as their original refs (#1240 removal case): the
-        // callers live in files this sync will NOT revisit, so this is their
-        // only chance to rebind to an alternative definition — or to park as
-        // failed until the symbol reappears somewhere. (A deleted file whose
-        // CALLERS are also being deleted is fine: their nodes cascade later
-        // in this loop and take the resurrected rows with them.)
-        // Every name this file defined is about to stop existing here, which
-        // narrows the candidate set for that name repo-wide (CG-33).
-        for (const pair of this.queries.getNodeNamePairsByFiles([tracked.path])) pairsBefore.add(pair);
-        const incoming = this.queries.getCrossFileIncomingEdgesWithTarget(tracked.path);
-        if (incoming.length > 0) {
-          const resurrected = incoming
-            .map((e) => resurrectRefFromDroppedEdge(e))
-            .filter((r): r is UnresolvedReference => r !== null);
-          if (resurrected.length > 0) {
-            this.queries.insertUnresolvedRefsBatch(resurrected);
-          }
-        }
-        onFileChange?.(tracked.path);
-        this.queries.deleteFile(tracked.path);
-        filesRemoved++;
+        removeTracked(tracked);
       }
       if (++reconcileChecks % SYNC_RECONCILE_YIELD_INTERVAL === 0) {
         await new Promise<void>((resolve) => setImmediate(resolve));
@@ -3279,12 +3259,18 @@ export class ExtractionOrchestrator {
 
       // New, or size/mtime changed — read + hash to confirm a real content change.
       // (An oversize file hashes as its size stamp, unread — #1910.)
-      let content: string;
+      let content: string | null;
       try {
         content = readSourceOrStamp(fullPath);
       } catch (error) {
         logDebug('Skipping unreadable file during sync', { filePath, error: String(error) });
         failedFilePaths.push(filePath);
+        continue;
+      }
+      // Not source after all — an MPEG transport stream named `.ts` (#1910):
+      // a new one is ignored, a tracked file that became one is removed.
+      if (content === null) {
+        if (tracked) removeTracked(tracked);
         continue;
       }
       const contentHash = hashContent(content);
@@ -3439,18 +3425,20 @@ export class ExtractionOrchestrator {
       for (const filePath of candidates) {
         const tracked = this.queries.getFileByPath(filePath);
         const fullPath = path.join(this.rootDir, filePath);
-        // A `.ts` that is an MPEG transport stream is not source (#1910): the
-        // scan never lists it, so git must not report it as pending either —
-        // an untracked clip would otherwise stay "added" after every sync.
-        if (!isSourceFile(filePath, overrides) || scope.ignores(filePath) || !fs.existsSync(fullPath)
-          || isMpegTsVideoFile(this.rootDir, filePath)) {
+        if (!isSourceFile(filePath, overrides) || scope.ignores(filePath) || !fs.existsSync(fullPath)) {
           if (tracked) removed.push(filePath);
           continue;
         }
-        let content: string;
+        let content: string | null;
         try { content = readSourceOrStamp(fullPath); }
         catch (error) {
           logDebug('Skipping unreadable file while detecting changes', { filePath, error: String(error) });
+          continue;
+        }
+        // A `.ts` that is an MPEG transport stream is not source (#1910), so an
+        // untracked clip is never pending and a tracked file that became one is gone.
+        if (content === null) {
+          if (tracked) removed.push(filePath);
           continue;
         }
         if (!tracked) added.push(filePath);
@@ -3484,7 +3472,7 @@ export class ExtractionOrchestrator {
     // Find added and modified files
     for (const filePath of currentFiles) {
       const fullPath = path.join(this.rootDir, filePath);
-      let content: string;
+      let content: string | null;
       try {
         content = readSourceOrStamp(fullPath);
       } catch (error) {
@@ -3492,8 +3480,13 @@ export class ExtractionOrchestrator {
         continue;
       }
 
-      const contentHash = hashContent(content);
       const tracked = trackedMap.get(filePath);
+      // An MPEG transport stream named `.ts` (#1910) is not source.
+      if (content === null) {
+        if (tracked) removed.push(filePath);
+        continue;
+      }
+      const contentHash = hashContent(content);
 
       if (!tracked) {
         added.push(filePath);
