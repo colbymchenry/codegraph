@@ -394,6 +394,33 @@ interface StepRecord extends WireStep {
   root: Node | null;
 }
 
+/**
+ * The string a Java / Kotlin return expression builds, when it starts with a
+ * literal: `"owners/ownerDetails"`, `"redirect:/owners/" + owner.getId()` →
+ * `redirect:/owners/${…}`. Null for anything else — a variable, a call.
+ */
+function springViewString(expression: string): string | null {
+  let out = '';
+  let rest = expression.trim();
+  let first = true;
+  while (rest.length > 0) {
+    const lit = /^"((?:[^"\\]|\\.)*)"/.exec(rest);
+    if (lit) {
+      out += lit[1]!.replace(/\$\{[^}]*\}|\$\w+/g, '${…}');
+      rest = rest.slice(lit[0].length).trim();
+    } else {
+      if (first) return null;
+      const operand = /^[^+]+/.exec(rest);
+      out += '${…}';
+      rest = rest.slice(operand ? operand[0].length : rest.length).trim();
+    }
+    first = false;
+    if (rest.startsWith('+')) rest = rest.slice(1).trim();
+    else break;
+  }
+  return first ? null : out;
+}
+
 export async function buildSteps(cg: CodeGraph, projectRoot: string, query: URLSearchParams): Promise<WireStepsPayload> {
   const started = Date.now();
   const depthCap = intParam(query, 'depth', { min: 1, max: MAX_DEPTH, default: DEFAULT_DEPTH });
@@ -808,6 +835,35 @@ export async function buildSteps(cg: CodeGraph, projectRoot: string, query: URLS
     return record;
   };
 
+  /**
+   * How a Spring MVC handler answers: each `return` of a view name — a string,
+   * or a same-class constant holding one (`VIEWS_OWNER_CREATE_OR_UPDATE_FORM`)
+   * — renders that view (200); `"redirect:/owners/" + id` sends a 302 and
+   * `"forward:/x"` hands the request on. Only for a mapped method of a class
+   * that renders views: a `@RestController` or `@ResponseBody` method returns
+   * its body, and a returned value that is not a literal is not guessed at.
+   */
+  const springMvcReplies = async (node: Node): Promise<Array<{ text: string; status: number | null; line: number; column: number }>> => {
+    if ((node.language !== 'java' && node.language !== 'kotlin') || node.kind !== 'method') return [];
+    const decs = await calls.decorators(node);
+    if (!decs || !decs.own.some((d) => /^(?:Get|Post|Put|Patch|Delete|Request)Mapping\b/.test(d))) return [];
+    if (decs.class.some((d) => /^RestController\b/.test(d)) || decs.own.some((d) => /^ResponseBody\b/.test(d))) return [];
+    const out: Array<{ text: string; status: number | null; line: number; column: number }> = [];
+    for (const r of await calls.returns(node)) {
+      const view = r.value ?? springViewString(r.expression);
+      if (view === null) continue;
+      const redirect = /^redirect:(.*)$/.exec(view);
+      const forward = /^forward:(.*)$/.exec(view);
+      out.push({
+        text: redirect ? `redirect:${redirect[1]}` : forward ? `forward:${forward[1]}` : `view ${view}`,
+        status: redirect ? 302 : forward ? null : 200,
+        line: r.line,
+        column: r.column,
+      });
+    }
+    return out;
+  };
+
   /** One effect site: the call as written, what it passes, when, what fires it, and — for a response — the status. */
   const effectLink = async (
     step: StepRecord,
@@ -815,10 +871,12 @@ export async function buildSteps(cg: CodeGraph, projectRoot: string, query: URLS
     ref: { referenceName: string; referenceKind: 'calls' | 'instantiates'; line: number; column?: number },
     trigger: WireStepTrigger | null,
     fallbackArgs: string | null = null,
-    requireReceiver = false
+    requireReceiver = false,
+    /** A site that is no call — a handler's `return "redirect:/x"` — arrives already classified. */
+    preset: { effect: Effect; status: number | null } | null = null
   ): Promise<boolean> => {
     const at = { line: ref.line, column: ref.column };
-    const site = await callAt(fold.node, { ...at, callee: ref.referenceName });
+    const site = preset ? null : await callAt(fold.node, { ...at, callee: ref.referenceName });
     // The site read must be THIS call: its last segment is the reference's.
     const last = (n: string) => n.replace(/\([^()]*\)/g, '').split(/[.:]/).pop() ?? n;
     const usable = !!site && site.callee !== '' && last(site.callee) === last(ref.referenceName);
@@ -829,24 +887,28 @@ export async function buildSteps(cg: CodeGraph, projectRoot: string, query: URLS
     // index through it: a library's `Repository<Cat>`, or the project's own
     // `OwnerRepository` interface whose `save` comes from Spring Data — never
     // a project class that declares the method, which is a place to walk into.
-    const declared = await receiverTypeFor(fold.node, text);
-    const receiverType = declared && (await resolveByReceiver(fold.node, text)) === null ? declared : null;
-    const effect = classifyEffect({
-      text,
-      kind: ref.referenceKind,
-      language: fold.node.language,
-      project,
-      receiverType,
-      args,
-    });
+    let effect: Effect | null = preset?.effect ?? null;
+    if (!preset) {
+      const declared = await receiverTypeFor(fold.node, text);
+      const receiverType = declared && (await resolveByReceiver(fold.node, text)) === null ? declared : null;
+      effect = classifyEffect({
+        text,
+        kind: ref.referenceKind,
+        language: fold.node.language,
+        project,
+        receiverType,
+        args,
+      });
+    }
     if (effect === null) return false;
     // A reply's status, read before its box exists — the box is per outcome.
     // `NextResponse.json(user, { status: 201 })`: the code sits in an object
     // the abbreviation reduced to its keys; the site reader kept it. And a
     // body-sending reply that sets none is a 200, so a success has a box of
     // its own beside the 401's.
-    const status =
-      effect.category === 'response'
+    const status = preset
+      ? preset.status
+      : effect.category === 'response'
         ? (responseStatus(text, args, ref.referenceKind) ?? (usable && typeof site.status === 'number' ? site.status : null) ?? implicitResponseStatus(text))
         : null;
     // What fires this call, read before its box is made: a call bound inside
@@ -1090,6 +1152,11 @@ export async function buildSteps(cg: CodeGraph, projectRoot: string, query: URLS
             if (ref.referenceKind !== 'calls' && ref.referenceKind !== 'instantiates') continue;
             if (channelLines.has(ref.line)) continue;
             await effectLink(step, fold, { referenceName: ref.referenceName, referenceKind: ref.referenceKind, line: ref.line, column: ref.column }, null);
+          }
+          // A Spring MVC handler answers by what it returns, which is no call.
+          for (const reply of await springMvcReplies(fold.node)) {
+            await effectLink(step, fold, { referenceName: reply.text, referenceKind: 'calls', line: reply.line, column: reply.column },
+              null, null, false, { effect: { category: 'response' }, status: reply.status });
           }
         }
 

@@ -933,6 +933,35 @@ function isBareGoCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
   return ref.language === 'go' && isReceiverLessCall(ref, context);
 }
 
+/**
+ * Whether a PHP `calls` ref is a bare function call — `redirect($url)`,
+ * `view('books.show')` — rather than `$this->redirect()` / `$obj->view()` /
+ * `Foo::view()`. PHP has no implicit `$this`: a call written without a
+ * receiver can only be a function, so a method, field or property that shares
+ * the name is never what it calls. Name-matching used to bind BookStack's
+ * every `return redirect(…)` to ApiDocsController::redirect and every
+ * `return view(…)` to a `$view` field.
+ *
+ * PHP refs record the column of the call EXPRESSION — `$this->setPageTitle(`
+ * sits at `$this` — so a bare call is the one whose text at its column is the
+ * name itself (a leading `\` for a fully qualified function is allowed).
+ */
+function isBarePhpCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'php' || ref.referenceKind !== 'calls') return false;
+  if (!/^\w+$/.test(ref.referenceName)) return false;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1]
+    ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return false;
+  const at = line[ref.column] === '\\' ? ref.column + 1 : ref.column;
+  if (!line.startsWith(ref.referenceName, at)) return false;
+  CALL_OPENER.lastIndex = at + ref.referenceName.length;
+  if (!CALL_OPENER.test(line)) return false;
+  let end = at;
+  while (end > 0 && WHITESPACE.test(line[end - 1]!)) end--;
+  // `$obj->name(` / `Foo::name(` / `$obj?->name(`, should a column ever land on the name.
+  return !(end > 0 && (line[end - 1] === '>' || line[end - 1] === ':'));
+}
+
 function isReceiverLessCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (ref.referenceKind !== 'calls') return false;
   if (ref.referenceName.includes('.')) return false;
@@ -1147,6 +1176,7 @@ export function matchByExactName(
   // large import-heavy (front-end + back-end) repos (#915).
   const bareJs = isBareJsCall(ref, context);
   const bareGo = isBareGoCall(ref, context);
+  const barePhp = isBarePhpCall(ref, context);
   if (bareJs) {
     const storeAction = matchJsStoreBindingCall(ref, context);
     if (storeAction) return storeAction;
@@ -1174,6 +1204,8 @@ export function matchByExactName(
     n.kind !== 'import' &&
     // A receiver-less JS/TS or Go call cannot reach a method (#1714, #1857).
     !((bareJs || bareGo) && n.kind === 'method') &&
+    // A bare PHP call is a function call: nothing else is callable without a receiver.
+    !(barePhp && n.kind !== 'function') &&
     // An `extends`/`implements` ref names a supertype, so anything that can't
     // BE one is not a candidate at all. This is eligibility, not
     // ranking: kind is only a scoring bonus below (and none is awarded for
@@ -4162,6 +4194,9 @@ export function matchFuzzy(
       (finalCandidates[0]!.kind === 'method' ||
         (finalCandidates[0]!.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context)))) &&
     !(finalCandidates[0]!.kind === 'method' && isBareGoCall(ref, context)) &&
+    // A bare PHP call is a function call (case-insensitive, so fuzzy may find
+    // one) — never the class `View` for `view(…)`, never a method.
+    !(finalCandidates[0]!.kind !== 'function' && isBarePhpCall(ref, context)) &&
     isLexicallyReachable(finalCandidates[0]!, ref, context)
   ) {
     const isCrossLanguage = finalCandidates[0]!.language !== ref.language;

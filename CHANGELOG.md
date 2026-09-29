@@ -16,6 +16,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Laravel routes are now named by the path a request takes: a leading `/` is added where the routes file leaves it out, `Route::prefix()` and `Route::group(['prefix' => …])` groups are applied, and routes in `routes/api.php` carry the `/api` prefix Laravel serves them under, read from your `RouteServiceProvider`, `bootstrap/app.php` or any file that mounts a routes file. A front-end `fetch('/api/…')` now connects to the Laravel route that serves it. Re-index Laravel projects after upgrading.
 - Controllers that Spring or Laravel tests exercise by URL now count as tested. That covers MockMvc's `perform(post("/owners/new"))`, WebTestClient, TestRestTemplate, RestAssured, Laravel's `$this->postJson('api/me')`, Pest's `get('/about')`, and a project's own request helpers built on them. `codegraph_explore` now names the test suite that reaches such an endpoint, where before every one of them looked untested. Re-index Spring and Laravel projects after upgrading.
+- A PHP call written without a receiver, such as `redirect($url)`, `view('books.show')`, `auth()` or `basename($path)`, is a function call, and no longer links to a same-named method, field or class elsewhere in the project. These wrong links showed up in callers, impact and `codegraph_explore` answers wherever a Laravel helper or PHP built-in shared its name with a project member. Re-index PHP projects after upgrading.
 
 ## [1.6.1] - 2026-09-29
 

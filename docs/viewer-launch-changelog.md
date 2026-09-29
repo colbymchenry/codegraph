@@ -137,6 +137,8 @@ These describe `codegraph ui` and its screens. They were taken out of `## [Unrel
 
 ## Fixes — Steps — what a call does, and when
 
+- **A server-rendered endpoint's Steps picture shows how it answers.** A Spring MVC handler answers by what it returns: a view name, a constant holding one, `"redirect:/owners/" + id`, a `ModelAndView` or a `RedirectView`. Each is now a reply, a render (`200`) or a redirect (`302`), under the condition it's returned in. petclinic's `POST /owners/new` draws the form re-rendered `WHEN result.hasErrors()` and the redirect otherwise. A Laravel controller's `view(…)`, `redirect(…)`, `redirect()->back()`, `back()`, `to_route(…)` and `response()->json(…)` are replies too, so BookStack's book page draws the page it renders beside its `404` and its old-slug redirect. PHP's own programming-error exceptions (`InvalidArgumentException`, `LogicException`, …) thrown deep in a helper are no longer drawn as one of the endpoint's answers.
+
 - **A handler called from under a binding says what it passes.** A press that runs `tryCatchSync(onClosePress)` drew a box for the wrapper and stopped — leaving the one thing a reader asks ("what is being wrapped?") unsaid, even though every other call-shaped site already prints its arguments. The panel and tooltip now say `tryCatchSync(onClosePress)` — the argument is the answer.
 
 - **A step the walk stopped at keeps its whole name.** A boundary — another screen, or a cap the walk hit — ends its name with an ellipsis by design, but the box was not sized for it, so a longer name lost its last letters instead (`/scan-to-verif…` for `/scan-to-verify …`). The anchor's start mark clipped a long path the same way (`/sheets/forgot-passw…`). The box now makes room for both.

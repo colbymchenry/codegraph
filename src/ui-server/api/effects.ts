@@ -92,6 +92,8 @@ export const EFFECT_RULES: ReadonlyArray<EffectRule> = [
     only: ['py'],
   },
   { category: 'response', test: /^ResponseEntity(?:\.\w+)*$|^ResponseStatusException$|^(?:ServerResponse|Mono\.just\(ResponseEntity)/, only: ['jvm'] },
+  // Spring MVC's other two answers: a view to render, and a redirect.
+  { category: 'response', test: /^(?:ModelAndView|RedirectView)$/, only: ['jvm'], instantiates: true },
   {
     category: 'response',
     test: /^(?:Ok|NotFound|BadRequest|Created|CreatedAtAction|CreatedAtRoute|NoContent|Unauthorized|Forbid|Accepted|AcceptedAtAction|Problem|StatusCode|Conflict|UnprocessableEntity|Redirect|RedirectPermanent|RedirectToAction|RedirectToPage|RedirectToRoute|LocalRedirect|View|PartialView|Json|File|PhysicalFile|Content|Challenge|SignIn|SignOut|ValidationProblem|Page)$|^(?:Results|TypedResults)\.\w+$|^(?:Response|HttpContext\.Response)\.(?:WriteAsync|WriteAsJsonAsync|Redirect|StatusCode)$/,
@@ -104,7 +106,9 @@ export const EFFECT_RULES: ReadonlyArray<EffectRule> = [
   },
   { category: 'response', test: /^(?:Abort|Response|HTTPStatus\.\w+|req\.redirect|request\.redirect)$/, only: ['swift'] },
   { category: 'response', test: /^(?:render|redirect_to|redirect_back|head|respond_to|respond_with|send_data|send_file|render_to_string)$/, only: ['rb'] },
-  { category: 'response', test: /^(?:response|abort|abort_if|abort_unless|redirect|view|back|json)(?:\(\)->\w+)?$/, only: ['php'] },
+  // Chains reach the rules without their argument lists: `response()->json(…)`
+  // is `response->json`, `redirect()->back()->withErrors(…)` is `redirect->back->withErrors`.
+  { category: 'response', test: /^(?:response|abort|abort_if|abort_unless|redirect|view|back|json|to_route)(?:->\w+)*$/, only: ['php'] },
   { category: 'response', test: /^(?:HttpResponse|Json|StatusCode|Redirect|NamedFile|HttpResponseBuilder)(?:::\w+)*$/, only: ['rs'] },
 
   // ---------------------------------------------------------------- database --
@@ -213,8 +217,8 @@ export const EFFECT_RULES: ReadonlyArray<EffectRule> = [
  * response. Only in a project with endpoints: in an app, `new
  * ValidationError` is an error, not a reply.
  */
-const EXCEPTION_RESPONSE = /(?:^|[.:])(?:\w+Exception|\w*HttpError|ApiError|\w+ApiError|HttpProblem|ProblemDetails|Abort|ResponseStatusException|ErrorResponse|\w+ErrorResponse|HTTPError|HTTPException|APIException|Http\d{3}|\w*(?:NotFound|BadRequest|Unauthorized|Unauthenticated|Forbidden|Conflict|Validation|Unprocessable|TooManyRequests|Gone|NotAllowed|MethodNotAllowed|Unsupported|RequestTimeout|InternalServer|ServiceUnavailable|PaymentRequired|PreconditionFailed|NotAcceptable|NotImplemented|BadGateway|RateLimit)Error)$/;
-const NOT_A_RESPONSE = /^(?:Error|TypeError|RangeError|SyntaxError|ReferenceError|EvalError|URIError|AggregateError|Exception|RuntimeException|IllegalArgumentException|IllegalStateException|NullPointerException|IndexOutOfBoundsException|UnsupportedOperationException|ArgumentException|ArgumentNullException|ArgumentOutOfRangeException|InvalidOperationException|NotImplementedException|NotSupportedException|ValueError|TypeError|KeyError|IndexError|RuntimeError|NotImplementedError|AssertionError|StopIteration|InterruptedException|IOException|FileNotFoundException|ClassNotFoundException|NoSuchElementException|NumberFormatException|CloneNotSupportedException|ExecutionException|TimeoutException|OperationCanceledException|TaskCanceledException|ObjectDisposedException|FormatException|OverflowException|DivideByZeroException|JsonException|SerializationException|ParseException|DateTimeParseException|MalformedURLException|URISyntaxException|SQLException|DataAccessException|DbUpdateException|ConcurrencyException|EntityNotFoundException|NoResultException|OptimisticLockException)$/;
+const EXCEPTION_RESPONSE = /(?:^|[.:\\])(?:\w+Exception|\w*HttpError|ApiError|\w+ApiError|HttpProblem|ProblemDetails|Abort|ResponseStatusException|ErrorResponse|\w+ErrorResponse|HTTPError|HTTPException|APIException|Http\d{3}|\w*(?:NotFound|BadRequest|Unauthorized|Unauthenticated|Forbidden|Conflict|Validation|Unprocessable|TooManyRequests|Gone|NotAllowed|MethodNotAllowed|Unsupported|RequestTimeout|InternalServer|ServiceUnavailable|PaymentRequired|PreconditionFailed|NotAcceptable|NotImplemented|BadGateway|RateLimit)Error)$/;
+const NOT_A_RESPONSE = /^(?:Error|TypeError|RangeError|SyntaxError|ReferenceError|EvalError|URIError|AggregateError|Exception|RuntimeException|IllegalArgumentException|IllegalStateException|NullPointerException|IndexOutOfBoundsException|UnsupportedOperationException|ArgumentException|ArgumentNullException|ArgumentOutOfRangeException|InvalidOperationException|NotImplementedException|NotSupportedException|ValueError|TypeError|KeyError|IndexError|RuntimeError|NotImplementedError|AssertionError|StopIteration|InterruptedException|IOException|FileNotFoundException|ClassNotFoundException|NoSuchElementException|NumberFormatException|CloneNotSupportedException|ExecutionException|TimeoutException|OperationCanceledException|TaskCanceledException|ObjectDisposedException|FormatException|OverflowException|DivideByZeroException|JsonException|SerializationException|ParseException|DateTimeParseException|MalformedURLException|URISyntaxException|SQLException|DataAccessException|DbUpdateException|ConcurrencyException|EntityNotFoundException|NoResultException|OptimisticLockException|InvalidArgumentException|LogicException|DomainException|LengthException|OutOfRangeException|OutOfBoundsException|UnexpectedValueException|BadMethodCallException|BadFunctionCallException|RangeException|UnderflowException|ErrorException|JsonException|TypeError)$/;
 
 /** Receiver types that say what a call into them is, when the graph declared one. */
 const RECEIVER_TYPE_RULES: ReadonlyArray<{ category: EffectCategory; test: RegExp }> = [
@@ -302,7 +306,8 @@ export function classifyEffect(input: EffectInput): Effect | null {
 
   // A thrown web exception is a response, in a project that has endpoints.
   if (project !== 'app' && (input.kind === 'instantiates' || families.includes('py') || families.includes('swift'))) {
-    const last = text.split(/[.:]/).pop() ?? text;
+    // `\\InvalidArgumentException`, `Foo\\BarException`: the class, not its namespace.
+    const last = (text.split(/[.:]/).pop() ?? text).replace(/^.*\\/, '');
     if (EXCEPTION_RESPONSE.test(text) && !NOT_A_RESPONSE.test(last)) return { category: 'response' };
   }
   return null;
@@ -445,7 +450,11 @@ export function responseStatus(text: string, args: string | null | undefined, _k
     if (s !== null) return s;
     break;
   }
-  if (/^(?:redirect|redirect_to|RedirectResponse|HttpResponseRedirect|RedirectToAction|RedirectToPage|RedirectToRoute|LocalRedirect|permanentRedirect|Redirect)$/.test(last)) return /permanent/i.test(last) ? 308 : 302;
+  if (/^(?:redirect|redirect_to|RedirectResponse|HttpResponseRedirect|RedirectToAction|RedirectToPage|RedirectToRoute|LocalRedirect|permanentRedirect|Redirect|RedirectView)$/.test(last)) return /permanent/i.test(last) ? 308 : 302;
+  // `new ModelAndView("redirect:/owners")` redirects; any other view renders (implicitResponseStatus).
+  if (last === 'ModelAndView' && /^\s*"redirect:/.test(a)) return 302;
+  // Laravel: `redirect()->route('home')`, `redirect()->back()->withErrors(…)`, `back()`, `to_route('home')`.
+  if (/^(?:redirect->\w+|back|to_route)(?:->\w+)*$/.test(call.replace(/\([^()]*\)/g, ''))) return 302;
   if (/^(?:Created|CreatedAtAction|CreatedAtRoute|created)$/.test(last)) return 201;
   return null;
 }
@@ -468,6 +477,7 @@ export function implicitResponseStatus(text: string): number | null {
   if (/^(?:NextResponse|Response)\.json$/.test(bare)) return 200;
   if (/^(?:JSONResponse|HTMLResponse|PlainTextResponse|ORJSONResponse|UJSONResponse|jsonify|render_template|render|make_response|HttpResponse|JsonResponse|send_file|send_from_directory)$/.test(bare)) return 200;
   if (/^(?:render|render_to_string|respond_with)$/.test(bare)) return 200;
+  if (/^ModelAndView$/.test(bare)) return 200;
   if (/^response\(\)->(?:json|view)$|^response->json$|^view$/.test(call.replace(/\s+/g, ''))) return 200;
   return null;
 }
