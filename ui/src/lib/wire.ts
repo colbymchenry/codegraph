@@ -596,6 +596,7 @@ export interface WireFlowPayload {
 export interface WireMapModule {
   /** Directory path, the `(root files)` bucket, or a façade file's own path. */
   id: string;
+  /** What the box says: the id, a folder chain nothing forks in written `first/…/last`. */
   label: string;
   files: number;
   symbols: number;

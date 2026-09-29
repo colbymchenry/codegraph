@@ -161,6 +161,8 @@ These describe `codegraph ui` and its screens. They were taken out of `## [Unrel
 
 ## Fixes — Symbols, tests and the viewer
 
+- **The Map opens a Maven or Gradle project on its packages.** A Java project keeps every file under `src/main/java/org/<company>/<app>/`, and those folders hold nothing but the next one, so the Map drew the whole program as one `src/main/java/org` box and no grouping option reached further. A folder with one subfolder and no files of its own no longer counts as a level: petclinic opens on `owner`, `vet`, `model` and `system`, each labelled `src/main/java/…/petclinic/owner`, with the full path on hover.
+
 - In `codegraph ui`, routes whose handlers live in more than 60 different files are all linked to their handler, instead of the later ones showing "not in the index". (#1975)
 
 - The viewer continues to count module-level initializer calls as top-level file activity in entry points and file screens.
