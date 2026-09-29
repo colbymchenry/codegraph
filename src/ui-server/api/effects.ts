@@ -112,9 +112,14 @@ export const EFFECT_RULES: ReadonlyArray<EffectRule> = [
   { category: 'response', test: /^(?:HttpResponse|Json|StatusCode|Redirect|NamedFile|HttpResponseBuilder)(?:::\w+)*$/, only: ['rs'] },
 
   // ---------------------------------------------------------------- database --
+  // A keychain is storage, whatever its method is named: Swift's generic
+  // `x.delete` database row below would take `keychain.delete(key)`.
+  // The receiver is the keychain (`keychain`, `appKeychain`, `KeychainSwift`), not `keychainAccounts`.
+  { category: 'storage', test: /^(?:self\.)?(?:\w*[kK]eychain|Keychain\w*)(?:\.\w+)+$/, only: ['swift'] },
   { category: 'database', test: /^(?:this\.)?(?:prisma|db|database|orm|em|entityManager|dataSource|queryRunner|knex|kysely|sequelize|mongoose|drizzle|sql|pool|pg|pgClient|conn|connection|repo|repository|collection|trx|tx|typeorm|dbClient|mongo|mongoClient)\.(?:\w+\.)?\$?\w+$/, only: ['js'] },
   { category: 'database', test: /^(?:this\.)?_?\w*(?:Repository|Repo|Dao|DAO|Mapper|EntityManager|DataSource|Knex|Prisma|Kysely|Drizzle|Sequelize|DbContext|DbSet)\.(?:\w+\.)?\w+$/, only: ['js', 'jvm', 'cs', 'go', 'rs', 'swift', 'rb'] },
-  { category: 'database', test: new RegExp(`^(?:this\\.)?_?\\w*(?:Model|Entity|Collection|Table|Db|DB|Database|Datastore)\\.(?:\\w+\\.)?${DB_OP}$`), only: ['js', 'jvm', 'cs', 'go', 'rs', 'swift', 'rb'] },
+  // `viewModel.votes.firstIndex(of:)`: a view model is UI state, not a table.
+  { category: 'database', test: new RegExp(`^(?:this\\.)?_?\\w*(?<![Vv]iew)(?:Model|Entity|Collection|Table|Db|DB|Database|Datastore)\\.(?:\\w+\\.)?${DB_OP}$`), only: ['js', 'jvm', 'cs', 'go', 'rs', 'swift', 'rb'] },
   { category: 'database', test: new RegExp(`^(?!${BUILTIN_RECEIVERS.source.slice(1, -1)}\\b)[A-Z]\\w*\\.${ORM_STATIC_OPS}$`), only: ['js', 'rb', 'swift', 'php'] },
   { category: 'database', test: /^(?:self\.)?(?:\w*_)?(?:session|db|database|engine|cursor|conn|connection|Session)\.(?:session\.)?(?:query|add|add_all|commit|execute|executemany|exec|delete|refresh|flush|rollback|get|merge|scalars?|scalar_one\w*|one|one_or_none|first|all|begin|close|expunge|bulk_\w+|select|insert|update|fetchone|fetchall|fetchmany|create_all|drop_all|run_sync)$/, only: ['py'] },
   { category: 'database', test: /^[A-Z]\w*\.(?:objects|query|_default_manager)(?:\.\w+)*$|^\w+\.objects\.\w+$|^(?:select|insert|update|delete|text|func\.\w+|bulk_create|bulk_update|get_object_or_404)$|^\w+\.(?:save|delete|refresh_from_db|get_or_create|update_or_create|filter|exclude|annotate|aggregate|values|values_list|select_related|prefetch_related|bulk_create|bulk_update|create|update|count|exists)$/, only: ['py'] },
@@ -192,7 +197,7 @@ export const EFFECT_RULES: ReadonlyArray<EffectRule> = [
   { category: 'network', test: /^(?:Net::HTTP(?:\.\w+)*|HTTParty\.\w+|Faraday(?:\.\w+)*|RestClient\.\w+|HTTP\.\w+|Excon\.\w+|Typhoeus\.\w+|OpenURI\.open_uri|URI\.open|open-uri|Socket\.\w+|TCPSocket\.\w+|WebSocket::\w+|ActionCable\.server\.broadcast|\w+Channel\.broadcast_to|\w+Channel\.broadcast|\w+\.broadcast)$|^\w+\.(?:get|post|put|patch|delete|head|request)$/, only: ['rb'] },
   { category: 'network', test: /^(?:Http::\w+|Http::\w+::\w+|curl_init|curl_exec|curl_setopt\w*|curl_close|file_get_contents|fsockopen|stream_socket_client|socket_create|socket_connect|socket_send|socket_recv|\$client->(?:request|get|post|put|patch|delete|send|sendAsync|requestAsync)|\$guzzle->\w+|\$http->\w+)(?:\(\)->\w+)*$/, only: ['php'] },
   { category: 'network', test: /^(?:reqwest|hyper|ureq|isahc|surf|tonic|tungstenite|tokio_tungstenite|websocket|TcpStream|TcpListener|UdpSocket|Client|ClientBuilder|Request|awc)(?:::\w+)*$|^\w+\.(?:get|post|put|patch|delete|head|send|execute|connect|bind|send_to|recv_from|write_all|read_to_end)$/, only: ['rs'] },
-  { category: 'network', test: /^URLSession(?:\.|$)|^(?:Alamofire|AF)\.|\.(?:dataTask|uploadTask|downloadTask|webSocketTask|data|upload|download|responseDecodable|responseJSON|responseData)$|^(?:NWConnection|NWListener|NWBrowser|URLSessionWebSocketTask|WebSocket|Starscream|SocketManager|SocketIOClient|Socket)\b|^(?:this\.|self\.)?(?:client|api|apiClient|http|httpClient|networkService|network|session)\.(?:get|post|put|patch|delete|request|send|fetch|perform|execute|call|data|upload|download)$/, only: ['swift'] },
+  { category: 'network', test: /^URLSession(?:\.|$)|^(?:Alamofire|AF)\.|\.(?:dataTask|uploadTask|downloadTask|webSocketTask|responseDecodable|responseJSON|responseData)$|(?:^|\.)\w*[sS]ession\.(?:data|upload|download|bytes)$|^(?:NWConnection|NWListener|NWBrowser|URLSessionWebSocketTask|WebSocket|Starscream|SocketManager|SocketIOClient|Socket)\b|^(?:this\.|self\.)?(?:client|api|apiClient|http|httpClient|networkService|network|session)\.(?:get|post|put|patch|delete|request|send|fetch|perform|execute|call|data|upload|download)$/, only: ['swift'] },
 
   // ------------------------------------------------------------------ device --
   { category: 'device', test: /^(?:Linking|Share|Clipboard|Notifications|Camera|ImagePicker|MediaLibrary|Haptics|Alert|Vibration|Location|Geolocation|Permissions|UIApplication|AVCaptureSession|AVAudioSession|CLLocationManager|UNUserNotificationCenter|Battery|Brightness|Sensors|Accelerometer|Gyroscope|Magnetometer|Pedometer|Contacts|Calendar|LocalAuthentication|BiometricAuth|DocumentPicker|Print|ScreenOrientation|StatusBar|BackHandler|Appearance|Dimensions|PixelRatio|Keyboard|PushNotification|PushNotificationIOS|messaging|Bluetooth|BleManager|NfcManager|navigator\.\w+|window\.(?:open|print|alert|confirm|prompt)|Notification|speechSynthesis|WebAuthn|Intent|intent|context\.startActivity|startActivity|startService|sendBroadcast|registerReceiver|NotificationManager|notificationManager|NotificationCompat|LocationManager|locationManager|fusedLocationClient|SensorManager|sensorManager|CameraX|cameraProvider|MediaPlayer|mediaPlayer|AudioManager|audioManager|Vibrator|vibrator|ClipboardManager|clipboardManager|UIDevice|UIPasteboard|UIImpactFeedbackGenerator|UINotificationFeedbackGenerator|AVAudioPlayer|AVPlayer|CMMotionManager|PHPhotoLibrary|UIImagePickerController|LAContext|WKWebView|Process\.Start|Environment\.Exit|Clipboard\.\w+|Console\.\w+)\b/ },
@@ -242,6 +247,13 @@ export interface EffectInput {
   receiverType?: string | null;
   /** The argument list, abbreviated, when it was read — where the model of a `knex('users')` comes from. */
   args?: string | null;
+  /**
+   * The call's receiver is a type the project declares — IceCubesApp's
+   * `Notifications` endpoint enum, not expo-notifications. A library name the
+   * table keys on is shadowed then; only the model and reply rows, which are
+   * written for project types, still apply.
+   */
+  projectType?: boolean;
 }
 
 export interface Effect {
@@ -271,6 +283,13 @@ export function normaliseCall(text: string): string {
 }
 
 /**
+ * Swift names the table knows from other stacks: Foundation's `Timer`
+ * schedules work (Micrometer's is telemetry), `Calendar` does date math
+ * (expo-calendar's is the device), and an `intent` is SiriKit configuration.
+ */
+const SWIFT_NOT_AN_EFFECT = /^(?:Timer|Calendar|Intent|intent)\b/;
+
+/**
  * What a call is, when it is one of the things the table names. `null` for
  * everything else — a plain call into a library is not an effect.
  */
@@ -282,8 +301,10 @@ export function classifyEffect(input: EffectInput): Effect | null {
   if (text === '') return null;
   const families = familiesOf(input.language);
   const project = input.project ?? 'app';
+  if (families.includes('swift') && SWIFT_NOT_AN_EFFECT.test(text)) return null;
 
   for (const rule of EFFECT_RULES) {
+    if (input.projectType && rule.category !== 'database' && rule.category !== 'response') continue;
     if (rule.only && !rule.only.some((f) => families.includes(f))) {
       // An ungated language (no family) still gets the JS rows — the table
       // grew up on them and the old tests call with no language.

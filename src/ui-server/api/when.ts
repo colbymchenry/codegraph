@@ -12,7 +12,7 @@
 
 import * as fs from 'fs';
 import type CodeGraph from '../../index';
-import type { Language } from '../../types';
+import type { Language, Node } from '../../types';
 import {
   callArgumentsForFile,
   callSitesForFile,
@@ -33,6 +33,7 @@ import {
   type SiteTrigger,
 } from '../../graph/branch-guards';
 import { resolveProjectFile } from '../security';
+import { declaresExtension } from '../../resolution/swift-type-visibility';
 import { findIndexedFile, hasDriftedOnDisk } from './source';
 import type { WireEdge } from './wire';
 
@@ -130,6 +131,8 @@ export interface SiteReader {
    * action declared inline). Nothing for other languages or unreadable files.
    */
   directive(definition: { filePath: string; language: Language; startLine: number }): Promise<{ file: 'server' | 'client' | null; own: boolean }>;
+  /** A Swift `extension X {}` node — the index keeps it as a class, but it declares no type. */
+  swiftExtension(definition: Pick<Node, 'filePath' | 'language' | 'kind' | 'startLine' | 'startColumn' | 'endLine'>): Promise<boolean>;
 }
 
 const JS_FAMILY: ReadonlySet<string> = new Set(['javascript', 'typescript', 'tsx', 'jsx']);
@@ -164,6 +167,19 @@ export function createSiteReader(cg: CodeGraph, projectRoot: string, maxSites = 
       files.set(posix, file);
     }
     return file;
+  };
+  /** A file's text, once, for the directive and declaration reads; null past the size cap or unreadable. */
+  const readText = (abs: string): string | null => {
+    let text = texts.get(abs);
+    if (text === undefined) {
+      try {
+        text = fs.statSync(abs).size <= MAX_DIRECTIVE_FILE ? fs.readFileSync(abs, 'utf8') : null;
+      } catch {
+        text = null;
+      }
+      texts.set(abs, text);
+    }
+    return text;
   };
   // Named rather than a method, because `createWhenReader` hands `when` out
   // detached: it must not depend on `this`.
@@ -243,15 +259,7 @@ export function createSiteReader(cg: CodeGraph, projectRoot: string, maxSites = 
       if (!JS_FAMILY.has(definition.language)) return none;
       const file = resolve(definition);
       if (!file) return none;
-      let text = texts.get(file.abs);
-      if (text === undefined) {
-        try {
-          text = fs.statSync(file.abs).size <= MAX_DIRECTIVE_FILE ? fs.readFileSync(file.abs, 'utf8') : null;
-        } catch {
-          text = null;
-        }
-        texts.set(file.abs, text);
-      }
+      const text = readText(file.abs);
       if (text === null) return none;
       const head = FILE_DIRECTIVE.exec(text);
       const fileDirective = head ? (head[2] as 'server' | 'client') : null;
@@ -261,6 +269,13 @@ export function createSiteReader(cg: CodeGraph, projectRoot: string, maxSites = 
         own = OWN_DIRECTIVE.test(lines.slice(definition.startLine - 1, definition.startLine + 3).join('\n'));
       }
       return { file: fileDirective, own };
+    },
+    async swiftExtension(definition) {
+      if (definition.language !== 'swift' || definition.kind !== 'class') return false;
+      const file = resolve(definition);
+      if (!file) return false;
+      const text = readText(file.abs);
+      return text !== null && declaresExtension(text.split(/\r?\n/), definition);
     },
   };
 }

@@ -8,6 +8,10 @@ import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 
+// No extract(): a SwiftUI view is its own struct node, and a UIKit controller
+// its class. A one-line `component`/`class` twin per `struct X: View` (and per
+// `@main` app, view controller and UIView subclass) carried no edges and
+// showed up in search and the symbol view as a dead-end duplicate.
 export const swiftUIResolver: FrameworkResolver = {
   name: 'swiftui',
   languages: ['swift'],
@@ -75,61 +79,6 @@ export const swiftUIResolver: FrameworkResolver = {
     }
 
     return null;
-  },
-
-  extract(filePath, content) {
-    if (!filePath.endsWith('.swift')) return { nodes: [], references: [] };
-    const nodes: Node[] = [];
-    const now = Date.now();
-    const safe = stripCommentsForRegex(content, 'swift');
-
-    // Extract SwiftUI View structs
-    // struct ContentView: View { ... }
-    const viewPattern = /struct\s+(\w+)\s*:\s*(?:\w+\s*,\s*)*View/g;
-
-    let match: RegExpExecArray | null;
-    while ((match = viewPattern.exec(safe)) !== null) {
-      const [, viewName] = match;
-      const line = safe.slice(0, match.index).split('\n').length;
-
-      nodes.push({
-        id: `view:${filePath}:${viewName}:${line}`,
-        kind: 'component',
-        name: viewName!,
-        qualifiedName: `${filePath}::${viewName}`,
-        filePath,
-        startLine: line,
-        endLine: line,
-        startColumn: 0,
-        endColumn: match[0].length,
-        language: 'swift',
-        updatedAt: now,
-      });
-    }
-
-    // Extract @main App entry point
-    const appPattern = /@main\s+struct\s+(\w+)\s*:\s*App/g;
-
-    while ((match = appPattern.exec(safe)) !== null) {
-      const [, appName] = match;
-      const line = safe.slice(0, match.index).split('\n').length;
-
-      nodes.push({
-        id: `app:${filePath}:${appName}:${line}`,
-        kind: 'class',
-        name: appName!,
-        qualifiedName: `${filePath}::${appName}`,
-        filePath,
-        startLine: line,
-        endLine: line,
-        startColumn: 0,
-        endColumn: match[0].length,
-        language: 'swift',
-        updatedAt: now,
-      });
-    }
-
-    return { nodes, references: [] };
   },
 };
 
@@ -209,60 +158,6 @@ export const uikitResolver: FrameworkResolver = {
     }
 
     return null;
-  },
-
-  extract(filePath, content) {
-    if (!filePath.endsWith('.swift')) return { nodes: [], references: [] };
-    const nodes: Node[] = [];
-    const now = Date.now();
-    const safe = stripCommentsForRegex(content, 'swift');
-
-    // Extract UIViewController subclasses
-    const vcPattern = /class\s+(\w+)\s*:\s*(?:\w+\s*,\s*)*UIViewController/g;
-
-    let match: RegExpExecArray | null;
-    while ((match = vcPattern.exec(safe)) !== null) {
-      const [, vcName] = match;
-      const line = safe.slice(0, match.index).split('\n').length;
-
-      nodes.push({
-        id: `viewcontroller:${filePath}:${vcName}:${line}`,
-        kind: 'class',
-        name: vcName!,
-        qualifiedName: `${filePath}::${vcName}`,
-        filePath,
-        startLine: line,
-        endLine: line,
-        startColumn: 0,
-        endColumn: match[0].length,
-        language: 'swift',
-        updatedAt: now,
-      });
-    }
-
-    // Extract UIView subclasses
-    const viewPattern = /class\s+(\w+)\s*:\s*(?:\w+\s*,\s*)*UIView[^C]/g;
-
-    while ((match = viewPattern.exec(safe)) !== null) {
-      const [, viewName] = match;
-      const line = safe.slice(0, match.index).split('\n').length;
-
-      nodes.push({
-        id: `uiview:${filePath}:${viewName}:${line}`,
-        kind: 'class',
-        name: viewName!,
-        qualifiedName: `${filePath}::${viewName}`,
-        filePath,
-        startLine: line,
-        endLine: line,
-        startColumn: 0,
-        endColumn: match[0].length,
-        language: 'swift',
-        updatedAt: now,
-      });
-    }
-
-    return { nodes, references: [] };
   },
 };
 
@@ -547,7 +442,7 @@ function resolveVaporHandler(typePath: string | null, method: string, ref: Unres
 
 const SWIFT_TYPE_KINDS = new Set(['class', 'struct', 'enum', 'protocol']);
 
-const VIEW_KINDS = new Set(['struct', 'component']);
+const VIEW_KINDS = new Set(['struct']);
 const CLASS_KINDS = new Set(['class']);
 const MODEL_KINDS = new Set(['struct', 'class']);
 const PROTOCOL_KINDS = new Set(['protocol']);

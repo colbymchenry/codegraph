@@ -534,6 +534,28 @@ export async function buildSteps(cg: CodeGraph, projectRoot: string, query: URLS
     }
     return cls;
   };
+  // Swift has no per-symbol imports: a type the project declares shadows the
+  // SDK name the effect table keys on — IceCubesApp's `Notifications`
+  // endpoint enum is not expo-notifications. An `extension Timer {}` declares
+  // nothing, so it does not count.
+  const projectTypes = new Map<string, boolean>();
+  const declaresSwiftType = async (callee: string): Promise<boolean> => {
+    const root = callee.replace(/^(?:self|Self)\./, '').split(/[.(:<]/)[0] ?? '';
+    if (!/^[A-Z]\w*$/.test(root)) return false;
+    let known = projectTypes.get(root);
+    if (known === undefined) {
+      known = false;
+      for (const n of cg.getNodesByName(root)) {
+        if (n.language !== 'swift' || !['class', 'struct', 'enum', 'interface', 'protocol'].includes(n.kind)) continue;
+        if (!(await reader.swiftExtension(n))) {
+          known = true;
+          break;
+        }
+      }
+      projectTypes.set(root, known);
+    }
+    return known;
+  };
   const resolveByReceiver = async (caller: Node, callee: string): Promise<Node | null> => {
     const segments = callee.replace(/\([^()]*\)/g, '').split(/[.:]+/).filter(Boolean);
     if (segments.length < 2) return null;
@@ -898,6 +920,7 @@ export async function buildSteps(cg: CodeGraph, projectRoot: string, query: URLS
         project,
         receiverType,
         args,
+        projectType: fold.node.language === 'swift' && (await declaresSwiftType(text)),
       });
     }
     if (effect === null) return false;

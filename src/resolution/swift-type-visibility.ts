@@ -64,19 +64,21 @@ export function isSwiftExtension(node: Node, context: ResolutionContext): boolea
   const hit = memo.get(node.id);
   if (hit !== undefined) return hit;
   const lines = linesOf(node.filePath, context);
-  let extension = false;
-  if (lines) {
-    const head = [
-      (lines[node.startLine - 1] ?? '').slice(node.startColumn),
-      ...lines.slice(node.startLine, Math.min(node.endLine, node.startLine + 4)),
-    ]
-      .join(' ')
-      // An attribute's string argument (`message: "use class Foo"`) is not a keyword.
-      .replace(/"(?:[^"\\\n]|\\.)*"/g, '""');
-    extension = DECLARATION_KEYWORD.exec(head)?.[1] === 'extension';
-  }
+  const extension = !!lines && declaresExtension(lines, node);
   memo.set(node.id, extension);
   return extension;
+}
+
+/** Does the class_declaration at `node`'s position open with `extension`? From the file's lines. */
+export function declaresExtension(lines: readonly string[], node: Pick<Node, 'startLine' | 'startColumn' | 'endLine'>): boolean {
+  const head = [
+    (lines[node.startLine - 1] ?? '').slice(node.startColumn),
+    ...lines.slice(node.startLine, Math.min(node.endLine, node.startLine + 4)),
+  ]
+    .join(' ')
+    // An attribute's string argument (`message: "use class Foo"`) is not a keyword.
+    .replace(/"(?:[^"\\\n]|\\.)*"/g, '""');
+  return DECLARATION_KEYWORD.exec(head)?.[1] === 'extension';
 }
 
 /** A declaration's inheritance clause: `struct HomeView: View, Sendable {` → `View, Sendable`. */
