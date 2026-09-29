@@ -78,6 +78,17 @@ function write(root: string, rel: string, body: string): void {
   fs.writeFileSync(full, body);
 }
 
+function writeViewerConfig(config: unknown): void {
+  const file = path.join(projectRoot, 'codegraph.json');
+  fs.writeFileSync(file, JSON.stringify(config));
+  const future = new Date(Math.max(fs.statSync(file).mtimeMs, Date.now()) + 2_000);
+  fs.utimesSync(file, future, future);
+}
+
+function removeViewerConfig(): void {
+  fs.rmSync(path.join(projectRoot, 'codegraph.json'), { force: true });
+}
+
 beforeAll(async () => {
   tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-ui-map-'));
   projectRoot = path.join(tempDir, 'project');
@@ -191,6 +202,35 @@ export function start(): void {
 `
   );
 
+  // These paths differ only after four directory segments beneath `src`.
+  // Depth 5 must separate them; depth 4 must not.
+  write(
+    projectRoot,
+    'src/deep/a/b/c/left/item.ts',
+    `export const left = 'left';\n`
+  );
+  write(
+    projectRoot,
+    'src/deep/a/b/c/right/item.ts',
+    `export const right = 'right';\n`
+  );
+  write(
+    projectRoot,
+    'supabase/functions/_shared/auth.ts',
+    `export const authenticate = (): boolean => true;\n`
+  );
+  write(
+    projectRoot,
+    'supabase/functions/worker/serve.ts',
+    `import { authenticate } from '../_shared/auth';\n\nexport const serve = () => authenticate();\n`
+  );
+  write(projectRoot, 'supabasex/functions/other.ts', `export const other = true;\n`);
+  write(
+    projectRoot,
+    'tools/consumer.ts',
+    `import { Engine } from '../src/core/engine';\n\nexport const consume = () => new Engine().boot();\n`
+  );
+
   write(
     projectRoot,
     '__tests__/engine.test.ts',
@@ -203,7 +243,7 @@ export function testBoot(): string[] {
   );
 
   const cg = CodeGraph.initSync(projectRoot, {
-    config: { include: ['src/**/*.ts', '__tests__/**/*.ts'], exclude: [] },
+    config: { include: ['src/**/*.ts', 'supabase/**/*.ts', 'supabasex/**/*.ts', 'tools/**/*.ts', '__tests__/**/*.ts'], exclude: [] },
   });
   await cg.indexAll();
   cg.resolveReferences();
@@ -406,9 +446,17 @@ describe('GET /api/map', () => {
     const map = await getMap();
     expect(map.root).toBe('src');
     expect(map.depth).toBe(1);
+    expect(map.maxDepth).toBe(4);
 
     const ids = map.modules.map((m: any) => m.id);
-    expect(ids).toEqual(['src/(root files)', 'src/api', 'src/core', 'src/db', 'src/index.ts']);
+    expect(ids).toEqual([
+      'src/(root files)',
+      'src/api',
+      'src/core',
+      'src/db',
+      'src/deep',
+      'src/index.ts',
+    ]);
     expect(map.modules.find((m: any) => m.id === 'src/core').files).toBe(3);
 
     const facade = map.modules.find((m: any) => m.id === 'src/index.ts');
@@ -419,12 +467,16 @@ describe('GET /api/map', () => {
     expect(map.modules.every((m: any) => m.test === false)).toBe(true);
   });
 
-  it('offers every top-level directory as a root, plus the repository itself', async () => {
+  it('offers every indexed directory with descendant file counts, plus the repository itself', async () => {
     const map = await getMap();
     expect(map.roots[0]).toEqual({ root: '', label: 'whole repository', files: map.index.files });
-    expect(map.roots.map((r: any) => r.root)).toEqual(
-      expect.arrayContaining(['', 'src', '__tests__'])
-    );
+    expect(map.roots).toEqual(expect.arrayContaining([
+      { root: 'supabase', label: 'supabase', files: 2 },
+      { root: 'supabase/functions', label: '  ↳ functions', files: 2 },
+      { root: 'supabase/functions/_shared', label: '    ↳ _shared', files: 1 },
+      { root: 'supabase/functions/worker', label: '    ↳ worker', files: 1 },
+    ]));
+    expect(new Set(map.roots.map((r: any) => r.root)).size).toBe(map.roots.length);
   });
 
   it('counts cross-module edges only, with a declared subset and named pairs', async () => {
@@ -520,6 +572,115 @@ describe('GET /api/map', () => {
     expect(slashed.modules).toEqual(deep.modules);
   });
 
+  it('isolates a nested root without sibling files', async () => {
+    const map = await getMap('?root=supabase%2Ffunctions&depth=1');
+    expect(map.root).toBe('supabase/functions');
+    expect(map.modules.flatMap((module: any) => module.fileList.items)).toEqual(
+      expect.arrayContaining([
+        'supabase/functions/_shared/auth.ts',
+        'supabase/functions/worker/serve.ts',
+      ])
+    );
+    expect(map.modules.flatMap((module: any) => module.fileList.items)).not.toContain('src/index.ts');
+  });
+
+  it('uses configured scopes and grouping depths without leaking prefix siblings', async () => {
+    writeViewerConfig({
+      viewer: {
+        map: {
+          maxDepth: 12,
+          scopes: [
+            { label: 'Backend', root: 'supabase' },
+            { label: 'Shared backend', root: 'supabase/functions/_shared' },
+          ],
+        },
+      },
+    });
+    try {
+      const configured = await getMap();
+      expect(configured.maxDepth).toBe(12);
+      expect(configured.roots.slice(0, 3)).toEqual([
+        { root: '', label: 'whole repository', files: configured.index.files },
+        { root: 'supabase', label: 'Backend', files: 2 },
+        { root: 'supabase/functions/_shared', label: 'Shared backend', files: 1 },
+      ]);
+
+      const scoped = await getMap('?root=supabase&depth=1');
+      const paths = scoped.modules.flatMap((module: any) => module.fileList.items);
+      expect(paths).toEqual(expect.arrayContaining([
+        'supabase/functions/_shared/auth.ts',
+        'supabase/functions/worker/serve.ts',
+      ]));
+      expect(paths).not.toContain('supabasex/functions/other.ts');
+
+      const shallow = await getMap('?root=src&depth=4');
+      const deep = await getMap('?root=src&depth=5');
+      expect(shallow.modules.map((module: any) => module.id)).toContain('src/deep/a/b/c');
+      expect(deep.modules.map((module: any) => module.id)).toEqual(
+        expect.arrayContaining(['src/deep/a/b/c/left', 'src/deep/a/b/c/right'])
+      );
+      expect((await request('/api/map?root=src&depth=12')).status).toBe(200);
+    } finally {
+      removeViewerConfig();
+    }
+  });
+
+  it('omits noncanonical configured scopes while a canonical indexed scope remains selectable', async () => {
+    writeViewerConfig({
+      viewer: {
+        map: {
+          scopes: [
+            { label: 'Double separator', root: 'src//api' },
+            { label: 'Dot segment', root: 'src/./api' },
+            { label: 'API', root: 'src/api' },
+          ],
+        },
+      },
+    });
+    try {
+      const configured = await getMap();
+      expect(configured.roots.some((root: any) => root.label === 'Double separator')).toBe(false);
+      expect(configured.roots.some((root: any) => root.label === 'Dot segment')).toBe(false);
+      const api = configured.roots.find((root: any) => root.label === 'API');
+      expect(api).toMatchObject({ root: 'src/api' });
+      expect(api.files).toBeGreaterThan(0);
+
+      const scoped = await getMap('?root=src%2Fapi&depth=1');
+      expect(scoped.modules.flatMap((module: any) => module.fileList.items)).toEqual(
+        expect.arrayContaining(['src/api/routes.ts'])
+      );
+    } finally {
+      removeViewerConfig();
+    }
+  });
+
+  it('caps automatic depth at a smaller configured maximum', async () => {
+    writeViewerConfig({ viewer: { map: { maxDepth: 1 } } });
+    try {
+      const map = await getMap('?root=src');
+      expect(map.maxDepth).toBe(1);
+      expect(map.depth).toBeLessThanOrEqual(1);
+    } finally {
+      removeViewerConfig();
+    }
+  });
+
+  it('refreshes the map configuration cache after edits and removal', async () => {
+    resetMapCache();
+    writeViewerConfig({ viewer: { map: { maxDepth: 12, scopes: [{ label: 'Backend', root: 'supabase' }] } } });
+    expect((await getMap()).maxDepth).toBe(12);
+
+    writeViewerConfig({ viewer: { map: { maxDepth: 1, scopes: [{ label: 'Only source', root: 'src' }] } } });
+    const changed = await getMap();
+    expect(changed.maxDepth).toBe(1);
+    expect(changed.roots[1]).toEqual({ root: 'src', label: 'Only source', files: 11 });
+
+    removeViewerConfig();
+    const removed = await getMap();
+    expect(removed.maxDepth).toBe(4);
+    expect(removed.roots.some((root: any) => root.label === 'Only source')).toBe(false);
+  });
+
   it('counts the files outside each module that reference into it', async () => {
     const map = await getMap('?root=src&depth=1');
     const by = new Map<string, any>(map.modules.map((m: any) => [m.id, m]));
@@ -544,12 +705,18 @@ describe('GET /api/map', () => {
   });
 
   it('rejects an out-of-range depth as JSON, not as a crash', async () => {
-    const res = await request('/api/map?depth=9');
+    const res = await request('/api/map?depth=13');
     expect(res.status).toBe(400);
     expect(res.type).toBe('application/json; charset=utf-8');
     const body = JSON.parse(res.body);
     expect(body.code).toBe('bad-request');
     expect(body.error).toContain('depth');
+  });
+
+  it.each(['0', '1.5', '3x'])('rejects non-whole depth `%s`', async (depth) => {
+    const res = await request(`/api/map?depth=${depth}`);
+    expect(res.status).toBe(400);
+    expect(JSON.parse(res.body).error).toContain('whole number from 1 to 4');
   });
 
   it('serves the second identical request from the cache, byte for byte', async () => {
@@ -571,5 +738,26 @@ describe('GET /api/map', () => {
     const all = await getMap('?root=&depth=1');
     expect(all.root).toBe('');
     expect(all.modules.map((m: any) => m.id)).not.toEqual(src.modules.map((m: any) => m.id));
+  });
+
+  it('uses repository context to retain a nested scope identity and outside callers', async () => {
+    const scoped = await getMap('?root=src&depth=1');
+    const repository = await getMap('?root=src&depth=1&context=repository');
+
+    expect(repository.context).toBe('repository');
+    expect(repository.modules.map((module: any) => module.id)).toEqual(
+      expect.arrayContaining(['src/core', 'tools'])
+    );
+    const scopedCore = scoped.modules.find((module: any) => module.id === 'src/core');
+    const repositoryCore = repository.modules.find((module: any) => module.id === 'src/core');
+    expect(repositoryCore).toMatchObject({
+      id: scopedCore.id,
+      files: scopedCore.files,
+      symbols: scopedCore.symbols,
+      fileList: scopedCore.fileList,
+    });
+    expect(repository.links).toEqual(
+      expect.arrayContaining([expect.objectContaining({ source: 'tools', target: 'src/core' })])
+    );
   });
 });

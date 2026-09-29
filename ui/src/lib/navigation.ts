@@ -24,6 +24,10 @@
  * scope, which a host must never inherit just by rendering a Symbol view.
  */
 
+import type { MapFocusDirection, MapFocusGrouping } from './map-focus';
+
+export type { MapFocusDirection } from './map-focus';
+
 export interface SymbolHrefOptions {
   /** A line to highlight and scroll to in the destination. */
   line?: number;
@@ -42,6 +46,10 @@ export interface MapHrefOptions {
   /** Absent or null leaves the grouping to the answering side. */
   depth?: number | null;
   tests?: boolean;
+  focus?: string | null;
+  direction?: MapFocusDirection | null;
+  /** Resolved grouping identity retained while a focus link is active. */
+  focusGrouping?: MapFocusGrouping | null;
 }
 
 export interface DeadCodeHrefOptions {
@@ -146,6 +154,14 @@ export const hashNavigation: NavigationDriver = {
     // something, and dropping it would hand the choice back to the answer.
     if (opts.depth) params.set('depth', String(opts.depth));
     if (opts.tests) params.set('tests', '1');
+    if (opts.focus && opts.direction) {
+      params.set('focus', opts.focus);
+      params.set('direction', opts.direction);
+      if (opts.focusGrouping) {
+        params.set('focusRoot', opts.focusGrouping.root);
+        params.set('focusDepth', String(opts.focusGrouping.depth));
+      }
+    }
     return `#/map${query(params)}`;
   },
 

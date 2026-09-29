@@ -31,6 +31,7 @@
  */
 
 import { registerHashSync } from './navigation';
+import type { MapFocusDirection, MapFocusGrouping } from './map-focus';
 
 export {
   back,
@@ -52,6 +53,7 @@ export type {
   FileHrefOptions,
   FlowHrefOptions,
   MapHrefOptions,
+  MapFocusDirection,
   NavigationDriver,
   StepsHrefOptions,
   SymbolHrefOptions,
@@ -68,7 +70,16 @@ export type Route =
       /** The whole-file source view rather than the outline (design spec §3.4). */
       source: boolean;
     }
-  | { view: 'map'; root: string | null; depth: number | null; tests: boolean }
+  | {
+      view: 'map';
+      root: string | null;
+      depth: number | null;
+      tests: boolean;
+      focus: string | null;
+      direction: MapFocusDirection | null;
+      focusGrouping: MapFocusGrouping | null;
+      focusError: string | null;
+    }
   | {
       view: 'flow';
       /** "how does X reach Y" — both ends pinned. */
@@ -124,6 +135,12 @@ function parseLine(params: URLSearchParams): number | null {
   return Number.isFinite(line) && line > 0 ? line : null;
 }
 
+function isCanonicalMapRoot(root: string): boolean {
+  if (root === '') return true;
+  if (root.startsWith('/') || /^[a-z]:/i.test(root) || root.includes('\\')) return false;
+  return root.split('/').every((segment) => segment !== '' && segment !== '.' && segment !== '..');
+}
+
 export function parseHash(hash: string): RouterLocation {
   const raw = hash.startsWith('#') ? hash.slice(1) : hash;
   const q = raw.indexOf('?');
@@ -149,12 +166,49 @@ export function parseHash(hash: string): RouterLocation {
     // grouping — top-level directories — that is wrong for every project whose
     // program lives under a single `src/`.
     const root = params.get('root');
-    const depth = Number.parseInt(params.get('depth') ?? '', 10);
+    const rawDepth = params.get('depth');
+    const depth = rawDepth !== null && /^\d+$/.test(rawDepth) ? Number(rawDepth) : Number.NaN;
+    const rawFocus = params.get('focus');
+    const rawDirection = params.get('direction');
+    const rawFocusRoot = params.get('focusRoot');
+    const rawFocusDepth = params.get('focusDepth');
+    const focused =
+      rawFocus !== null ||
+      rawDirection !== null ||
+      rawFocusRoot !== null ||
+      rawFocusDepth !== null;
+    const direction = rawDirection === 'depends-on' || rawDirection === 'used-by' ? rawDirection : null;
+    const focusDepth =
+      rawFocusDepth !== null && /^\d+$/.test(rawFocusDepth) ? Number(rawFocusDepth) : Number.NaN;
+    const hasSnapshotPart = rawFocusRoot !== null || rawFocusDepth !== null;
+    const explicitGrouping =
+      rawFocusRoot !== null &&
+      isCanonicalMapRoot(rawFocusRoot) &&
+      Number.isSafeInteger(focusDepth) &&
+      focusDepth >= 1
+        ? { root: rawFocusRoot, depth: focusDepth }
+        : null;
+    const legacyGrouping =
+      !hasSnapshotPart &&
+      root !== null &&
+      isCanonicalMapRoot(root) &&
+      Number.isSafeInteger(depth) &&
+      depth >= 1
+        ? { root, depth }
+        : null;
+    const focusGrouping = explicitGrouping ?? legacyGrouping;
+    const validFocus = !!rawFocus && direction !== null && focusGrouping !== null;
     route = {
       view: 'map',
       root: root === null ? null : root,
-      depth: Number.isFinite(depth) && depth >= 1 && depth <= 4 ? depth : null,
+      // The server owns the configured upper bound; keep any valid integer
+      // link intact so an explicit configured depth survives the round trip.
+      depth: Number.isSafeInteger(depth) && depth >= 1 ? depth : null,
       tests: params.get('tests') === '1',
+      focus: validFocus ? rawFocus : null,
+      direction: validFocus ? direction : null,
+      focusGrouping: validFocus ? focusGrouping : null,
+      focusError: focused && !validFocus ? 'This focus link is incomplete or invalid.' : null,
     };
   } else if (head === 'entry' && rest.length === 0) {
     route = { view: 'entry' };

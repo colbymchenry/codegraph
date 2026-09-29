@@ -43,6 +43,7 @@
  */
 
 import type { WireMapLink, WireMapModule, WireMapPayload } from './api';
+import { selectEligibleMapGraph } from './map-eligibility';
 
 // Geometry, from the design spec. Changing these changes the picture.
 export const NODE_HEIGHT = 40;
@@ -302,12 +303,10 @@ export function buildMapLayout(
   payload: Pick<WireMapPayload, 'modules' | 'links'>,
   options: MapLayoutOptions
 ): MapLayout {
-  const modules = payload.modules.filter((m) => options.includeTests || !m.test);
-  const present = new Set(modules.map((m) => m.id));
+  const { modules, links } = selectEligibleMapGraph(payload, options.includeTests);
   // Islands come off the UNFILTERED link set: a module a hidden test module
   // depends on is depended on, whatever this screen is currently showing.
   const depended = new Set(payload.links.map((l) => l.target));
-  const links = payload.links.filter((l) => present.has(l.source) && present.has(l.target));
   const minWeight = options.minWeight ?? (options.includeTests ? MIN_WEIGHT_WITH_TESTS : MIN_WEIGHT);
   const layerGap = options.layerGap ?? LAYER_GAP;
   const portPitch = options.portPitch ?? 0;

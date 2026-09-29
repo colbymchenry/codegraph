@@ -16,6 +16,12 @@
   import { plural } from '../../lib/symbol-model';
   import type { WireMapLink, WireMapPayload } from '../../lib/api';
   import type { MapLayout } from '../../lib/map-model';
+  import type { MapFocusDirection } from '../../lib/map-focus';
+
+  /** Older independently packaged adapters did not send `maxDepth`. */
+  const LEGACY_ADAPTER_MAX_DEPTH = 4;
+  /** Focus is a view state, never a normalized indexed directory root. */
+  const FOCUSED_SHOWING_VALUE = '.';
 
   interface Props {
     payload: WireMapPayload;
@@ -33,6 +39,12 @@
     buildSvg: (scale: number) => string;
     /** File stem for a downloaded map, without an extension. */
     exportName: string;
+    focus: { id: string; direction: MapFocusDirection } | null;
+    onFocus: (id: string) => void;
+    onSelectFocusDirection: (direction: MapFocusDirection) => void;
+    onClearFocus: () => void;
+    restoredRoot: string | null;
+    restoredDepth: number | null;
   }
 
   let {
@@ -48,6 +60,12 @@
     onSelect,
     buildSvg,
     exportName,
+    focus,
+    onFocus,
+    onSelectFocusDirection,
+    onClearFocus,
+    restoredRoot,
+    restoredDepth,
   }: Props = $props();
 
   /**
@@ -59,7 +77,9 @@
    * choice is wrong for what the reader is looking at — an escape hatch, not
    * the thing anybody should have to reach for.
    */
-  const DEPTHS = [1, 2, 3, 4] as const;
+  const DEPTHS = $derived(
+    Array.from({ length: payload.maxDepth ?? LEGACY_ADAPTER_MAX_DEPTH }, (_, index) => index + 1)
+  );
 
   function depthLabel(depth: number): string {
     return depth === 1 ? 'top-level folders' : `${depth} folders deep`;
@@ -93,6 +113,10 @@
   );
 
   const thinCount = $derived(layout.edges.filter((e) => e.thin && !e.back).length);
+  const focusDirectionLabel = $derived(focus?.direction === 'depends-on' ? 'Depends on' : 'Used by');
+  const restoredRootLabel = $derived(
+    restoredRoot === null ? 'automatic folder' : restoredRoot || 'whole repository'
+  );
 </script>
 
 <aside class="mapside">
@@ -110,9 +134,17 @@
   <label class="field">
     <span>Showing</span>
     <select
-      value={payload.root}
-      onchange={(event) => onSelectRoot((event.currentTarget as HTMLSelectElement).value)}
+      value={focus === null ? payload.root : FOCUSED_SHOWING_VALUE}
+      onchange={(event) => {
+        const root = (event.currentTarget as HTMLSelectElement).value;
+        if (root !== FOCUSED_SHOWING_VALUE) onSelectRoot(root);
+      }}
     >
+      {#if focus !== null}
+        <option value={FOCUSED_SHOWING_VALUE} disabled
+          >Focus: {focus.id} · {focusDirectionLabel}</option
+        >
+      {/if}
       {#each payload.roots as option (option.root)}
         <option value={option.root}>{option.label} · {option.files} files</option>
       {/each}
@@ -126,6 +158,7 @@
     <span>Grouping</span>
     <select
       value={chosenDepth === null ? 'auto' : String(chosenDepth)}
+      disabled={focus !== null}
       onchange={(event) => {
         const value = (event.currentTarget as HTMLSelectElement).value;
         onSelectDepth(value === 'auto' ? null : Number(value));
@@ -137,6 +170,37 @@
       {/each}
     </select>
   </label>
+  {#if focus !== null}
+    <p class="focusname">
+      <b>Focused module</b><br />
+      <span class="mono">{focus.id}</span><br />
+      {focus.direction === 'depends-on' ? 'Everything it depends on' : 'Everything that uses it'}
+    </p>
+    {#if layout.nodes.length === 1}
+      <p class="dim">
+        No other indexed modules {focus.direction === 'depends-on'
+          ? 'are reachable through its dependencies'
+          : 'depend on it'} under the current filters.
+      </p>
+    {/if}
+    <p class="dim">Grouping stays fixed while focused so module identities remain stable.</p>
+    <label class="field">
+      <span>Direction</span>
+      <select
+        value={focus.direction}
+        onchange={(event) =>
+          onSelectFocusDirection((event.currentTarget as HTMLSelectElement).value as MapFocusDirection)}
+      >
+        <option value="depends-on">Depends on</option>
+        <option value="used-by">Used by</option>
+      </select>
+    </label>
+    <button class="clear" onclick={onClearFocus}
+      >Clear focus · return to {restoredRootLabel} · {restoredDepth === null
+        ? 'automatic grouping'
+        : depthLabel(restoredDepth)}</button
+    >
+  {/if}
 
   <label class="toggle">
     <input
@@ -213,7 +277,7 @@
     </details>
   {/if}
 
-  {#if payload.cycles.total > 0}
+  {#if focus === null && payload.cycles.total > 0}
     <details>
       <summary>
         Circular imports between files
@@ -256,6 +320,9 @@
             : `${selectedModule.generated} tool-generated`}
         {/if}
       </p>
+      {#if focus === null || focus.id !== selectedModule.id}
+        <button class="clear" onclick={() => onFocus(selectedModule.id)}>Focus</button>
+      {/if}
 
       {#if (selectedModule.dependents?.files ?? 0) > 0}
         <p class="reach">
@@ -268,7 +335,7 @@
 
       {#if selectedNode?.island}
         <p class="island">
-          Nothing in the index depends on this module — no import, call or reference crosses into
+          Nothing in this view depends on this module — no import, call or reference crosses into
           it. It may be an entry point, or reached in a way the graph cannot see.
         </p>
       {/if}
@@ -343,6 +410,9 @@
   .reach {
     font-size: 11.5px;
     margin: 0 0 8px;
+  }
+  .focusname {
+    overflow-wrap: anywhere;
   }
   .field {
     display: flex;

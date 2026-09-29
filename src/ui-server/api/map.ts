@@ -36,6 +36,8 @@
 
 import type { CodeGraph } from '../../index';
 import type { EdgeKind, Language } from '../../types';
+import { loadViewerMapConfig } from '../../project-config';
+import { DEFAULT_MAP_MAX_DEPTH, normalizeMapRoot } from '../../lib/map-config';
 import { isTestFile } from '../../search/query-utils';
 import { badRequest } from './respond';
 import { UNCERTAIN_BELOW, toPosixPath, wireList, type WireList } from './wire';
@@ -83,7 +85,7 @@ const MAX_CYCLE_LENGTH = 12;
 
 /** Default segments below the root that name a module. */
 const DEFAULT_DEPTH = 1;
-const MAX_DEPTH = 4;
+const MAX_AUTOMATIC_DEPTH = 4;
 
 /**
  * Basenames that stay their own box when they sit loose in a module root.
@@ -178,6 +180,10 @@ export interface WireMapCycle {
 export interface WireMapPayload {
   root: string;
   depth: number;
+  /** The aggregation extent; older adapters may omit it. */
+  context: 'scope' | 'repository';
+  /** Effective configured upper bound for a reader-selected grouping depth. */
+  maxDepth: number;
   /** Every root the selector may offer, this index's own directories. */
   roots: Array<{ root: string; label: string; files: number }>;
   modules: WireMapModule[];
@@ -202,6 +208,7 @@ export interface WireMapPayload {
 export interface MapQuery {
   root: string;
   depth: number;
+  context: 'scope' | 'repository';
 }
 
 // =============================================================================
@@ -209,13 +216,7 @@ export interface MapQuery {
 // =============================================================================
 
 /** Strip a trailing slash and any leading `./`, so `src/` and `src` are one root. */
-export function normalizeRoot(raw: string | undefined): string {
-  let root = (raw ?? '').trim().replace(/\\/g, '/');
-  while (root.startsWith('./')) root = root.slice(2);
-  while (root.endsWith('/')) root = root.slice(0, -1);
-  if (root === '.' || root === '/') return '';
-  return root;
-}
+export const normalizeRoot = normalizeMapRoot;
 
 function stemOf(basename: string): string {
   const dot = basename.indexOf('.');
@@ -364,7 +365,8 @@ function tallyModules(
  */
 export function pickDefaultDepth(
   files: ReadonlyArray<{ path: string; symbols: number; test: boolean }>,
-  root: string
+  root: string,
+  maxDepth = DEFAULT_MAP_MAX_DEPTH
 ): number {
   // Past the deepest directory, a bigger number only renames boxes to
   // `src/a/(root files)`. There is nothing below the leaves.
@@ -379,7 +381,7 @@ export function pickDefaultDepth(
 
   let fallback = DEFAULT_DEPTH;
   let fallbackCount = 0;
-  for (let depth = DEFAULT_DEPTH; depth <= Math.min(MAX_DEPTH, deepest); depth += 1) {
+  for (let depth = DEFAULT_DEPTH; depth <= Math.min(MAX_AUTOMATIC_DEPTH, maxDepth, deepest); depth += 1) {
     const tally = tallyModules(files, root, depth);
     if (tally.count === 0) break;
     // Deeper only gets more crowded from here.
@@ -426,20 +428,32 @@ export function resetMapCache(): void {
  * to survive parsing: a depth defaulted to 1 here is indistinguishable from a
  * reader who asked for 1, and {@link pickDefaultDepth} would never run.
  */
-export function parseMapQuery(query: URLSearchParams): {
+export function parseMapQuery(query: URLSearchParams, maxDepth = DEFAULT_MAP_MAX_DEPTH): {
   root: string | null;
   depth: number | null;
+  context: 'scope' | 'repository';
 } {
   const rawDepth = query.get('depth');
   let depth: number | null = null;
   if (rawDepth !== null && rawDepth !== '') {
-    depth = Number.parseInt(rawDepth, 10);
-    if (!Number.isFinite(depth) || depth < 1 || depth > MAX_DEPTH) {
-      throw badRequest(`depth must be a whole number from 1 to ${MAX_DEPTH}.`);
+    if (!/^\d+$/.test(rawDepth)) {
+      throw badRequest(`depth must be a whole number from 1 to ${maxDepth}.`);
+    }
+    depth = Number(rawDepth);
+    if (!Number.isSafeInteger(depth) || depth < 1 || depth > maxDepth) {
+      throw badRequest(`depth must be a whole number from 1 to ${maxDepth}.`);
     }
   }
+  const rawContext = query.get('context');
+  if (rawContext !== null && rawContext !== 'scope' && rawContext !== 'repository') {
+    throw badRequest('context must be "scope" or "repository".');
+  }
   const rawRoot = query.get('root');
-  return { root: rawRoot === null ? null : normalizeRoot(rawRoot), depth };
+  return {
+    root: rawRoot === null ? null : normalizeRoot(rawRoot),
+    depth,
+    context: rawContext === 'repository' ? 'repository' : 'scope',
+  };
 }
 
 /**
@@ -480,7 +494,8 @@ function collapseLoneRootFiles(ids: ReadonlySet<string>): Map<string, string> {
 
 export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchParams): WireMapPayload {
   const started = Date.now();
-  const { root: requestedRoot, depth: requestedDepth } = parseMapQuery(query);
+  const viewerMap = loadViewerMapConfig(projectRoot);
+  const { root: requestedRoot, depth: requestedDepth, context } = parseMapQuery(query, viewerMap.maxDepth);
 
   const fileRecords = cg.getFiles().map((file) => {
     const path = toPosixPath(file.path);
@@ -497,7 +512,11 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
   // Root first, then depth against THAT root: how finely to cut depends on
   // what is being cut. Choosing `src` and then asking for one level under it
   // is the same question as choosing the whole project and asking for two.
-  const depth = requestedDepth ?? pickDefaultDepth(fileRecords, root);
+  const depth = requestedDepth ?? pickDefaultDepth(fileRecords, root, viewerMap.maxDepth);
+  const groupingRoot = context === 'repository' ? '' : root;
+  const groupingDepth = context === 'repository'
+    ? depth + root.split('/').filter(Boolean).length
+    : depth;
   const stats = cg.getStats();
   const key = [
     projectRoot,
@@ -506,6 +525,8 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
     stats.fileCount,
     root,
     depth,
+    context,
+    JSON.stringify(viewerMap),
   ].join('\u0000');
   const hit = cache.get(key);
   if (hit) {
@@ -533,7 +554,7 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
 
   const assigned = new Map<string, { id: string; facade: boolean }>();
   for (const file of fileRecords) {
-    const at = moduleIdFor(file.path, root, depth);
+    const at = moduleIdFor(file.path, groupingRoot, groupingDepth);
     if (at !== null) assigned.set(file.path, at);
   }
   const renamed = collapseLoneRootFiles(new Set([...assigned.values()].map((a) => a.id)));
@@ -619,7 +640,9 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
   const payload: WireMapPayload = {
     root,
     depth,
-    roots: rootOptions(fileRecords),
+    context,
+    maxDepth: viewerMap.maxDepth,
+    roots: rootOptions(fileRecords, viewerMap.scopes),
     modules: [...modules.values()]
       .map((entry) => {
         const shown = entry.paths.slice().sort().slice(0, MAX_FILES_PER_MODULE);
@@ -798,24 +821,46 @@ function tarjan(nodes: readonly string[], edgesOf: (id: string) => readonly stri
 }
 
 /**
- * The roots the selector offers: the repository root plus every top-level
- * directory that holds indexed files, biggest first.
+ * The roots the selector offers: the repository root plus every indexed
+ * directory. Top-level directories stay biggest-first; descendants follow
+ * their parent so a native select still reads like a directory tree.
  *
  * A monorepo's answer to "which project am I looking at" — and on a single
  * project it is a one-line list nobody has to use.
  */
 function rootOptions(
-  files: ReadonlyArray<{ path: string; symbols: number }>
+  files: ReadonlyArray<{ path: string; symbols: number }>,
+  scopes: ReadonlyArray<{ label: string; root: string }>
 ): WireMapPayload['roots'] {
   const byDir = new Map<string, number>();
   for (const file of files) {
-    const slash = file.path.indexOf('/');
-    if (slash <= 0) continue;
-    const dir = file.path.slice(0, slash);
-    byDir.set(dir, (byDir.get(dir) ?? 0) + 1);
+    const parts = toPosixPath(file.path).split('/').filter(Boolean);
+    for (let depth = 1; depth < parts.length; depth += 1) {
+      const dir = parts.slice(0, depth).join('/');
+      byDir.set(dir, (byDir.get(dir) ?? 0) + 1);
+    }
   }
   const dirs = [...byDir]
-    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-    .map(([root, count]) => ({ root, label: root, files: count }));
-  return [{ root: '', label: 'whole repository', files: files.length }, ...dirs];
+    .sort(([a], [b]) => {
+      const aTop = a.split('/')[0]!;
+      const bTop = b.split('/')[0]!;
+      const topOrder = (byDir.get(bTop) ?? 0) - (byDir.get(aTop) ?? 0) || aTop.localeCompare(bTop);
+      if (topOrder !== 0) return topOrder;
+      return a.localeCompare(b);
+    })
+    .map(([root, count]) => {
+      const parts = root.split('/');
+      return {
+        root,
+        label: parts.length === 1 ? root : `${'  '.repeat(parts.length - 1)}↳ ${parts.at(-1)}`,
+        files: count,
+      };
+    });
+  const named = scopes.map((scope) => ({
+    root: scope.root,
+    label: scope.label,
+    files: byDir.get(scope.root) ?? 0,
+  }));
+  const namedRoots = new Set(scopes.map((scope) => scope.root));
+  return [{ root: '', label: 'whole repository', files: files.length }, ...named, ...dirs.filter((dir) => !namedRoots.has(dir.root))];
 }
