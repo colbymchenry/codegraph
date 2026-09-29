@@ -20,7 +20,7 @@
  *   codegraph callees <symbol>   Find what a function/method calls
  *   codegraph impact <symbol>    Analyze what code is affected by changing a symbol
  *   codegraph affected [files]   Find test files affected by changes
- *   codegraph ui [path]          Open the browser viewer for an indexed project (alias: web)
+ *   codegraph ui [path]          Open the browser viewer (alias: web; not released yet — needs CODEGRAPH_UI=1)
  *   codegraph upgrade [version]  Update CodeGraph to the latest release
  */
 
@@ -28,6 +28,18 @@
 // launcher is (almost certainly) still alive. A launcher killed mid-startup
 // otherwise blinds the PPID watchdog forever (#1185) — see early-ppid.ts.
 import '../mcp/early-ppid';
+
+// The browser viewer is not part of a release yet (see viewer-gate). Refuse
+// `ui` / `web` — also as `help ui` or `ui --help` — before any startup work,
+// unless CODEGRAPH_UI=1 opts in.
+import { requestedViewerCommand, viewerEnabled } from './viewer-gate';
+{
+  const viewerCommand = requestedViewerCommand(process.argv.slice(2));
+  if (viewerCommand && !viewerEnabled()) {
+    process.stderr.write(`error: 'codegraph ${viewerCommand}' is not in this release yet. The browser viewer is coming in an upcoming release.\n`);
+    process.exit(1);
+  }
+}
 
 // Persist V8 compile artifacts across runs (Node ≥22.8). Every invocation —
 // and every worker thread, which re-requires the whole extraction module
@@ -1984,7 +1996,7 @@ function printNoIndexGuidance(projectPath: string): void {
  * like every other quick command.
  */
 program
-  .command('ui [path]')
+  .command('ui [path]', { hidden: !viewerEnabled() })
   .alias('web')
   .description('Open the CodeGraph viewer in your browser — read your indexed project as a graph')
   .option('--port <number>', `Port to listen on (default: ${DEFAULT_UI_PORT}, or the next free one)`)

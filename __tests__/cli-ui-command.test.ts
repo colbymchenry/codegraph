@@ -25,6 +25,8 @@ const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
 const BASE_ENV = {
   ...process.env,
+  // The viewer is opt-in until it is released (see src/bin/viewer-gate.ts).
+  CODEGRAPH_UI: '1',
   CODEGRAPH_NO_DAEMON: '1',
   CODEGRAPH_WASM_RELAUNCHED: '1',
   NO_COLOR: '1',
