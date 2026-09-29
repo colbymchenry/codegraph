@@ -112,6 +112,28 @@ describe.skipIf(!kernelBuilt)('kernel Swift extraction parity', () => {
     assertParity('fixtures/torture.swift (crlf)', crlf, 40);
   });
 
+  // A composition's `&` line in a type body errored and swallowed the type;
+  // the Swift preParse moves the `&` up a line, hoisted so both arms parse the
+  // same bytes — and the file no longer defers.
+  it('a composition typealias in a type body parses on both arms, LF and CRLF', () => {
+    const source = [
+      'extension StatusEditor {',
+      '    final class EditorStore: NSObject {',
+      '        typealias EditorClient = AutocompleteService.Client',
+      '          & PostingService.Client',
+      '          & CustomEmojiService.Client',
+      '        let service: any Uploading',
+      '          & Describing',
+      '        func post() -> Bool { validate() }',
+      '        func validate() -> Bool { true }',
+      '    }',
+      '}',
+      '',
+    ].join('\n');
+    assertParity('src/EditorStore.swift', source, 5);
+    assertParity('src/EditorStore.swift (crlf)', source.replace(/\n/g, '\r\n'), 5);
+  });
+
   it('files with parse errors defer to the wasm extractor (recovery is encoding-dependent)', () => {
     // A NEW-only regression construct (`#if` between enum cases — the swift
     // checklist's grammar-bump delta 5) — errors on the 0.7.3 grammar.

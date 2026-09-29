@@ -219,8 +219,11 @@ function writtenName(ref: UnresolvedRef, context: ResolutionContext): string {
   if (!text) return name;
   // `EventLoopFuture<Success>.Isolated`: the qualifier's generic arguments are not part of its path.
   const clean = (qualifier: string): string => `${qualifier.replace(GENERIC_ARGS, '').replace(/\s+/g, '')}${name}`;
-  if (text.startsWith(name, ref.column)) {
-    const before = QUALIFIER_BEFORE.exec(text.slice(Math.max(0, ref.column - 240), ref.column));
+  // A composition's `&` line is parsed one column left of the file, its `&`
+  // moved onto the line before (joinSwiftCompositionContinuations).
+  const column = !text.startsWith(name, ref.column) && /^[ \t]*&[ \t]/.test(text) && text.startsWith(name, ref.column + 1) ? ref.column + 1 : ref.column;
+  if (text.startsWith(name, column)) {
+    const before = QUALIFIER_BEFORE.exec(text.slice(Math.max(0, column - 240), column));
     return before ? clean(before[1]!) : name;
   }
   const chain = new RegExp(String.raw`^((?:${QUALIFIER_SEGMENT})+)${name.replace(/[$\\]/g, '\\$&')}\b`).exec(text.slice(ref.column, ref.column + 240));
