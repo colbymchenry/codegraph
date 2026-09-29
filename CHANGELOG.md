@@ -387,7 +387,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A Scala `object` is now indexed as a module, so `extends`/`with` resolves to the trait or class rather than its companion object. Thanks @htarnacki. (#1824)
 - C/C++ functions defined through a single-argument macro are now indexed under their real name when the macro's own `#define` proves it. Thanks @Dshuishui. (#1373)
 - MSVC COM `interface` declarations in C++ headers are now indexed as types with their methods. Thanks @timxx. (#1519)
-- A function-like C/C++ macro invocation no longer binds to a same-named function in another file, and a local C++ object initialization now records a call to its constructor. Thanks @netbrah for the reports and @danusha2345. (#1838, #1839)
+- A function-like C/C++ macro invocation no longer binds to a same-named function or type in another file, a flag the build can still set on the command line keeps both sides of its `#ifdef` reachable, and a local C++ object initialization now records a call to its constructor. Thanks @netbrah and @bompus for the reports and @danusha2345. (#1838, #1839, #2069, #2070)
 - A Delphi DFM component's range now runs to its closing `end`, so its properties and event bindings belong to it. Thanks @inth3shadows. (#1350)
 - Two same-named symbols on one line (a one-line getter/setter pair) no longer collide and drop one; existing symbol IDs are unchanged. Thanks @inth3shadows. (#1349)
 - A callback registered with `subscribe(this.handler)` now links to that exact handler, not the first same-named method in the project. Thanks @inth3shadows. (#1355)

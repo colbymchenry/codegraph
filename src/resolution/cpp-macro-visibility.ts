@@ -306,8 +306,11 @@ function walkTranslationUnit(
       const defining = ev.kind === 'define';
       const macro = defining && ev.functionLike && !ev.wrapsItself;
       const now = active === true ? macro : prior?.macro === macro ? macro : undefined;
+      // A name no directive has touched is unknown, not undefined: the build
+      // can set it on the command line. So an `#undef` under an undecidable
+      // `#if` leaves it unknown (#2069); only a certain one clears it.
       definitions.set(ev.name, {
-        defined: defining ? or(prior?.defined ?? false, active) : and(prior?.defined ?? false, not(active)),
+        defined: defining ? or(prior?.defined, active) : and(prior?.defined, not(active)),
         value: defining && active === true ? condition(ev.value) : undefined,
         macro: now,
       });
