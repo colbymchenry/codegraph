@@ -299,6 +299,12 @@ Hooks PRESENT (port each exactly):
      DEFER-SHIELDED in the kernel**: every `fun interface` (either pattern,
      probed) makes the tree `hasError=true`, so the kernel defers the whole
      FILE to wasm before the walker would run. **Do NOT port branches 2-3.**
+     *(2026-09-24: superseded for `fun interface` — the extractor's
+     `preParse` now blanks the `fun` of a `fun interface` declaration,
+     offset-preserving, so such a file parses cleanly and the kernel extracts
+     it; the wasm recovery branches no longer fire for it. The old defer also
+     lost the declaration AFTER the `fun interface` when a doc comment sat
+     between them.)*
      Walker rule: port branch 1 only; a `defer:` on has_error covers the
      rest. (The parity suite still needs a fun-interface fixture asserting
      the kernel defers and the wasm arm serves the pinned output.)
