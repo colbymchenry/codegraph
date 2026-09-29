@@ -9,7 +9,7 @@
  * "not initialized" guidance. An initialized project is now one whose db
  * carries the codegraph schema.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -17,8 +17,11 @@ import * as path from 'path';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { DatabaseSync } = require('node:sqlite');
 import { CodeGraph } from '../src';
-import { isInitialized, findNearestCodeGraphRoot, resolveServerRoot, planFrontload } from '../src/directory';
+import { isInitialized, findNearestCodeGraphRoot, resolveServerRoot, planFrontload, hasSchemalessDb, hasForeignDbFile } from '../src/directory';
 import { ToolHandler } from '../src/mcp/tools';
+
+// A configurable `fs`, so a test can watch which files the probe opens.
+vi.mock('fs', async (importOriginal) => ({ ...await importOriginal<typeof import('fs')>() }));
 
 const BIN = path.resolve(__dirname, '../dist/bin/codegraph.js');
 
@@ -99,6 +102,30 @@ describe('a schema-less codegraph.db is not an initialized project (#1895)', () 
     } finally {
       fs.chmodSync(dir, 0o755);
     }
+  });
+
+  it('never opens the database through a descriptor of its own while this process holds it', async () => {
+    // Closing any descriptor on a database file drops every POSIX lock the
+    // process holds on it, including an open connection's (the MCP server
+    // resolves projects through isInitialized on every call, as the writer).
+    await indexProject(parent);
+    const live = await CodeGraph.open(parent);
+    const opened: string[] = [];
+    const real = fs.openSync;
+    const spy = vi.spyOn(fs, 'openSync').mockImplementation(((file: fs.PathLike, ...rest: unknown[]) => {
+      opened.push(String(file));
+      return (real as (...args: unknown[]) => number)(file, ...rest);
+    }) as typeof fs.openSync);
+    try {
+      expect(isInitialized(parent)).toBe(true);
+      expect(hasSchemalessDb(parent)).toBe(false);
+      expect(hasForeignDbFile(parent)).toBe(false);
+      expect(live.getNodesByKind('function').map((n) => n.name).sort()).toEqual(['alpha', 'beta']);
+    } finally {
+      spy.mockRestore();
+      live.close();
+    }
+    expect(opened.filter((f) => path.basename(f).startsWith('codegraph.db'))).toEqual([]);
   });
 
   it('a real index still resolves upward from a subdirectory', async () => {
