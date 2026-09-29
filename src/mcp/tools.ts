@@ -1538,7 +1538,6 @@ export interface ToolResult {
   _cgExploreEmission?: ExploreEmission;
   /** Internal structured provenance, preserved by query workers and stripped by execute. */
   _cgAnswerFiles?: AnswerFile[];
-  structuredContent?: Record<string, unknown>;
 }
 
 /**
@@ -2811,7 +2810,9 @@ export class ToolHandler {
             if (validation.unchecked.length > 20) lines.push(`- … ${validation.unchecked.length - 20} more (narrow the query)`);
           }
           lines.push('Retry after a successful codegraph sync, or narrow the query.');
-          return { ...this.textResult(lines.join('\n')), structuredContent: { freshness: validation } };
+          // Text only: Claude Code shows the model a result's structuredContent
+          // in place of its text (#2088), and the text carries every file.
+          return this.textResult(lines.join('\n'));
         }
       }
       // Record + STRIP before anything else touches the result: the emission is
@@ -8060,9 +8061,8 @@ export class ToolHandler {
       }
     }
 
-    return { ...this.textResult(lines.join('\n')), structuredContent: {
-      freshness: { lastIndexedAt, changes, complete: changes !== null },
-    } };
+    // Text only, for the same reason as the stale-answer path (#2088).
+    return this.textResult(lines.join('\n'));
   }
 
   /**
