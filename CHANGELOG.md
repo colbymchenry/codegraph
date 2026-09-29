@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Laravel routes are now named by the path a request takes: a leading `/` is added where the routes file leaves it out, `Route::prefix()` and `Route::group(['prefix' => …])` groups are applied, and routes in `routes/api.php` carry the `/api` prefix Laravel serves them under, read from your `RouteServiceProvider`, `bootstrap/app.php` or any file that mounts a routes file. A front-end `fetch('/api/…')` now connects to the Laravel route that serves it. Re-index Laravel projects after upgrading.
 
 ## [1.6.1] - 2026-09-29
 
