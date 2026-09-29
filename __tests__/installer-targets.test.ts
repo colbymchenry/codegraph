@@ -18,6 +18,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { spawnSync } from 'child_process';
 import { parse as parseJsonc } from 'jsonc-parser';
 import { ALL_TARGETS, getTarget, resolveTargetFlag } from '../src/installer/targets/registry';
 import { uninstallTargets, refreshTargets } from '../src/installer';
@@ -27,6 +28,42 @@ import { cleanupLegacyHooks, writePromptHookEntry, removePromptHookEntry } from 
 function mkTmpDir(label: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), `cg-targets-${label}-`));
 }
+
+describe('standalone installer Windows shell guidance (#1294)', () => {
+  const command = 'irm https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.ps1 | iex';
+  const source = fs.readFileSync(path.join(__dirname, '..', 'install.sh'), 'utf8');
+
+  // Stub uname and downloads, but execute the complete shipped installer.
+  // This exercises shell dispatch on POSIX too without installing anything.
+  it.runIf(process.platform !== 'win32').each([
+    'MINGW64_NT-10.0-26200-ARM64', 'MSYS_NT-10.0-26200', 'CYGWIN_NT-10.0',
+  ])('gives actionable guidance for %s before downloading', (platform) => {
+    const result = spawnSync('sh', ['-s'], {
+      input: `uname() { echo '${platform}'; }\ncurl() { echo UNEXPECTED_DOWNLOAD >&2; exit 99; }\n${source}`,
+      encoding: 'utf8',
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('open PowerShell');
+    expect(result.stderr).toContain(command);
+    expect(result.stderr).not.toContain('UNEXPECTED_DOWNLOAD');
+    expect(result.stderr).not.toContain('unsupported OS');
+  });
+
+  it.runIf(process.platform === 'win32')('guides real Git Bash users to PowerShell', () => {
+    const bash = path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Git', 'bin', 'bash.exe');
+    const result = spawnSync(bash, ['--noprofile', '--norc', '-s'], {
+      input: `curl() { echo UNEXPECTED_DOWNLOAD >&2; exit 99; }\n${source}`,
+      encoding: 'utf8',
+      timeout: 15000,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('open PowerShell');
+    expect(result.stderr).toContain(command);
+    expect(result.stderr).not.toContain('UNEXPECTED_DOWNLOAD');
+    expect(result.stderr).not.toContain('unsupported OS');
+  });
+});
 
 // `os.homedir` is non-configurable on Node, so we redirect it via the
 // `$HOME` (POSIX) / `$USERPROFILE` (Windows) env vars that

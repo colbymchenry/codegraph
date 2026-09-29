@@ -20,7 +20,7 @@
  *   codegraph callees <symbol>   Find what a function/method calls
  *   codegraph impact <symbol>    Analyze what code is affected by changing a symbol
  *   codegraph affected [files]   Find test files affected by changes
- *   codegraph ui [path]          Open the browser viewer for an indexed project (alias: web)
+ *   codegraph ui [path]          Open the browser viewer (alias: web; not released yet — needs CODEGRAPH_UI=1)
  *   codegraph upgrade [version]  Update CodeGraph to the latest release
  */
 
@@ -28,6 +28,18 @@
 // launcher is (almost certainly) still alive. A launcher killed mid-startup
 // otherwise blinds the PPID watchdog forever (#1185) — see early-ppid.ts.
 import '../mcp/early-ppid';
+
+// The browser viewer is not part of a release yet (see viewer-gate). Refuse
+// `ui` / `web` — also as `help ui` or `ui --help` — before any startup work,
+// unless CODEGRAPH_UI=1 opts in.
+import { requestedViewerCommand, viewerEnabled } from './viewer-gate';
+{
+  const viewerCommand = requestedViewerCommand(process.argv.slice(2));
+  if (viewerCommand && !viewerEnabled()) {
+    process.stderr.write(`error: 'codegraph ${viewerCommand}' is not in this release yet. The browser viewer is coming in an upcoming release.\n`);
+    process.exit(1);
+  }
+}
 
 // Persist V8 compile artifacts across runs (Node ≥22.8). Every invocation —
 // and every worker thread, which re-requires the whole extraction module
@@ -41,7 +53,7 @@ try {
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection } from '../directory';
+import { getCodeGraphDir, isInitialized, hasSchemalessDb, hasForeignDbFile, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, isTaskNotification, hasStructuralKeyword, extractCodeTokens, capPromptHookInjection, codeGraphDirName, DEFAULT_CODEGRAPH_DIR } from '../directory';
 import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
@@ -697,9 +709,29 @@ async function runInit(
       return;
     }
 
+    if (hasForeignDbFile(projectPath)) {
+      const dbFile = path.join(getCodeGraphDir(projectPath), 'codegraph.db');
+      clack.log.error(`${dbFile} is not a SQLite database, so it cannot be rebuilt in place.`);
+      clack.log.info('Move or delete that file, then run "codegraph init" again.');
+      clack.outro('');
+      process.exitCode = 1;
+      return;
+    }
+    if (hasSchemalessDb(projectPath)) {
+      clack.log.warn(`Found a codegraph.db without the codegraph schema in ${getCodeGraphDir(projectPath)} (left by an interrupted init?) — rebuilding it.`);
+    }
     const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
     const cg = await CodeGraph.init(projectPath, { index: false });
     clack.log.success(`Initialized in ${projectPath}`);
+    // A fresh index on a Windows drive under WSL gets its own directory (#995).
+    // It isn't the documented name, so say where it went and why.
+    const dataDir = path.basename(getCodeGraphDir(projectPath));
+    if (dataDir !== codeGraphDirName()) {
+      clack.log.info(
+        `The index is in ${dataDir}/: this project is on a Windows drive, so WSL keeps its own index ` +
+        `rather than share ${DEFAULT_CODEGRAPH_DIR}/ with CodeGraph on Windows. Set CODEGRAPH_DIR to choose the name yourself.`
+      );
+    }
 
     // Indexing runs by default now. The legacy -i/--index flag is still
     // accepted (so existing muscle memory and scripts don't break) but is a
@@ -864,69 +896,91 @@ program
         process.exit(1);
       }
 
-      const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
-      // `index` is a FULL re-index — identical to a fresh `init`. RECREATE the
-      // database from scratch (discard .codegraph/codegraph.db + its WAL) rather
-      // than opening the old graph and DELETE-ing every row. The clear-then-index
-      // approach reported "0 nodes" without the clear (#874); the recreate keeps
-      // that fixed AND avoids the failure mode where, on a large or pre-fix
-      // poisoned index, the per-row FTS delete churn wedged the main thread long
-      // enough to trip the liveness watchdog before scanning even began (#1067).
-      // recreate() hands back a fresh, empty instance — no clear() needed. For
-      // fast incremental updates use `sync`.
-      const cg = await CodeGraph.recreate(projectPath);
-
-      // Supervise the indexer: self-terminate if orphaned (parent shim killed)
-      // or if the main thread wedges — neither was guarded on this path (#999).
-      // The DB + WAL paths let the liveness watchdog tell a slow store on
-      // degraded storage from a true wedge (#1231).
-      const dbPath = getDatabasePath(projectPath);
-      const supervision = installCommandSupervision('index', { progressPaths: [dbPath, `${dbPath}-wal`] });
+      const { tryAcquireWriterLock, releaseWriterLock, writerLockHeldMessage } = await import('../mcp/writer-lock');
+      const rebuild = tryAcquireWriterLock(projectPath, 'rebuild', 'rebuild.pid');
+      if (rebuild.kind === 'taken') throw new Error('Another index rebuild is already in progress.');
       try {
-        if (options.quiet) {
-          // Quiet mode: no UI, just run against the freshly-recreated graph.
-          const result = await cg.indexAll();
-          if (!result.success) process.exit(1);
-          cg.destroy();
-          return;
+        // A live MCP daemon keeps SQLite handles open. Verify it by its socket
+        // before stopping it so a stale pidfile can never signal another process.
+        const { stopDaemonAt } = await import('../mcp/daemon-registry');
+        const daemonStop = await stopDaemonAt(fs.realpathSync(projectPath), { preserveUnverified: true });
+        if (daemonStop.outcome === 'unverified' || daemonStop.outcome === 'still-running') {
+          throw new Error('Could not verify that the active CodeGraph daemon has stopped. Run `codegraph daemon stop` to stop it, then retry `codegraph index`.');
         }
 
-        const clack = await importESM('@clack/prompts');
-        clack.intro('Indexing project');
+        // Keep the writer slot through recreation AND indexing. A reconnecting
+        // proxy/daemon must not open the replacement database halfway through.
+        const writer = tryAcquireWriterLock(projectPath, 'rebuild');
+        if (writer.kind === 'taken') throw new Error(writerLockHeldMessage(writer.existing, writer.pidPath));
+        try {
+          const { default: CodeGraph, getDatabasePath } = await loadCodeGraph();
+          // `index` is a FULL re-index — identical to a fresh `init`. RECREATE the
+          // database from scratch (discard .codegraph/codegraph.db + its WAL) rather
+          // than opening the old graph and DELETE-ing every row. The clear-then-index
+          // approach reported "0 nodes" without the clear (#874); the recreate keeps
+          // that fixed AND avoids the failure mode where, on a large or pre-fix
+          // poisoned index, the per-row FTS delete churn wedged the main thread long
+          // enough to trip the liveness watchdog before scanning even began (#1067).
+          // recreate() hands back a fresh, empty instance — no clear() needed. For
+          // fast incremental updates use `sync`.
+          const cg = await CodeGraph.recreate(projectPath);
 
-        // A closure so a re-index (after opting gitignored child repos in, #1156)
-        // renders identically. Supervision already wraps the whole command.
-        const renderIndex = async (): Promise<IndexResult> => {
-          if (options.verbose) {
-            return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
+          // Supervise the indexer: self-terminate if orphaned (parent shim killed)
+          // or if the main thread wedges — neither was guarded on this path (#999).
+          // The DB + WAL paths let the liveness watchdog tell a slow store on
+          // degraded storage from a true wedge (#1231).
+          const dbPath = getDatabasePath(projectPath);
+          const supervision = installCommandSupervision('index', { progressPaths: [dbPath, `${dbPath}-wal`] });
+          try {
+            if (options.quiet) {
+              // Quiet mode: no UI, just run against the freshly-recreated graph.
+              const result = await cg.indexAll();
+              if (!result.success) process.exit(1);
+              return;
+            }
+
+            const clack = await importESM('@clack/prompts');
+            clack.intro('Indexing project');
+
+            // A closure so a re-index (after opting gitignored child repos in, #1156)
+            // renders identically. Supervision already wraps the whole command.
+            const renderIndex = async (): Promise<IndexResult> => {
+              if (options.verbose) {
+                return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
+              }
+              process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
+              const progress = createShimmerProgress();
+              const r = await cg.indexAll({ onProgress: progress.onProgress });
+              await progress.stop();
+              return r;
+            };
+
+            const result = await renderIndex();
+
+            printIndexResult(clack, result, projectPath);
+            await recordIndexTelemetry(cg, result);
+
+            // Empty graph at a git super-repo → likely `.gitignore`d child repos;
+            // name them and offer to opt in instead of a silent 0-node result (#1156).
+            let finalResult = result;
+            if (result.nodesCreated === 0) {
+              finalResult = (await offerIndexIgnoredRepos(clack, projectPath, renderIndex, { interactive: true })) ?? result;
+            }
+
+            if (!finalResult.success) {
+              process.exit(1);
+            }
+
+            clack.outro('Done');
+          } finally {
+            supervision.stop();
+            cg.destroy();
           }
-          process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
-          const progress = createShimmerProgress();
-          const r = await cg.indexAll({ onProgress: progress.onProgress });
-          await progress.stop();
-          return r;
-        };
-
-        const result = await renderIndex();
-
-        printIndexResult(clack, result, projectPath);
-        await recordIndexTelemetry(cg, result);
-
-        // Empty graph at a git super-repo → likely `.gitignore`d child repos;
-        // name them and offer to opt in instead of a silent 0-node result (#1156).
-        let finalResult = result;
-        if (result.nodesCreated === 0) {
-          finalResult = (await offerIndexIgnoredRepos(clack, projectPath, renderIndex, { interactive: true })) ?? result;
+        } finally {
+          releaseWriterLock(projectPath);
         }
-
-        if (!finalResult.success) {
-          process.exit(1);
-        }
-
-        clack.outro('Done');
-        cg.destroy();
       } finally {
-        supervision.stop();
+        releaseWriterLock(projectPath, 'rebuild.pid');
       }
     } catch (err) {
       error(`Failed to index: ${err instanceof Error ? err.message : String(err)}`);
@@ -1942,7 +1996,7 @@ function printNoIndexGuidance(projectPath: string): void {
  * like every other quick command.
  */
 program
-  .command('ui [path]')
+  .command('ui [path]', { hidden: !viewerEnabled() })
   .alias('web')
   .description('Open the CodeGraph viewer in your browser — read your indexed project as a graph')
   .option('--port <number>', `Port to listen on (default: ${DEFAULT_UI_PORT}, or the next free one)`)

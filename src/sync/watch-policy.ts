@@ -15,6 +15,7 @@
  */
 
 import * as fs from 'fs';
+import * as path from 'path';
 import { normalizePath } from '../utils';
 
 let wslChecked = false;
@@ -53,8 +54,20 @@ export function detectWsl(): boolean {
  * Deliberately matches only single-letter drive mounts, so genuinely fast
  * Linux mounts such as `/mnt/wsl/...` are not flagged.
  */
-function isWindowsDriveMount(projectRoot: string): boolean {
+export function isWindowsDriveMount(projectRoot: string): boolean {
   return /^\/mnt\/[a-z](\/|$)/i.test(normalizePath(projectRoot));
+}
+
+let wslWindowsDriveOverride: ((p: string) => boolean) | null = null;
+
+/**
+ * Is `p` on a Windows drive as WSL sees it (`/mnt/c/...`)? There the same
+ * tree is reachable from Windows-native CodeGraph too, and the two must not
+ * share one index (#995). Always false off WSL, without touching the disk.
+ */
+export function isWslWindowsDrive(p: string): boolean {
+  if (wslWindowsDriveOverride) return wslWindowsDriveOverride(p);
+  return detectWsl() && isWindowsDriveMount(path.resolve(p));
 }
 
 /**
@@ -101,4 +114,9 @@ export function watchDisabledReason(projectRoot: string, probe: WatchProbe = {})
 export function __resetWslCacheForTests(): void {
   wslChecked = false;
   wslValue = false;
+}
+
+/** Test-only: decide {@link isWslWindowsDrive} with `fn` (`null` restores detection). */
+export function __setWslWindowsDriveForTests(fn: ((p: string) => boolean) | null): void {
+  wslWindowsDriveOverride = fn;
 }

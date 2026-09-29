@@ -172,6 +172,67 @@ export const EXTENSION_MAP: Record<string, Language> = {
   '.tofu': 'terraform',
 };
 
+/** MPEG transport stream: fixed 188-byte packets, each opening with 0x47. */
+const MPEG_TS_PACKET_SIZE = 188;
+const MPEG_TS_SYNC_BYTE = 0x47;
+/**
+ * Consecutive packets whose sync byte must line up before a file counts as
+ * video — 3 KB of head. A stream shorter than that is cheap to parse anyway;
+ * the cost #1910 is about comes from clips hundreds of KB long.
+ */
+const MPEG_TS_MIN_PACKETS = 16;
+/**
+ * Share of the head that must be control bytes (below 0x20, other than the
+ * whitespace ones) for it to count as binary. Compressed audio and video put
+ * about one byte in eight there; source text puts none.
+ */
+const MPEG_TS_MIN_CONTROL_SHARE = 1 / 64;
+/**
+ * How many bytes of a file's head `isMpegTransportStream` needs — enough to
+ * see `MPEG_TS_MIN_PACKETS` sync bytes plus the packets between them.
+ */
+export const MPEG_TS_SNIFF_BYTES = MPEG_TS_PACKET_SIZE * MPEG_TS_MIN_PACKETS;
+
+/**
+ * Whether these leading bytes are an MPEG transport stream — the OTHER thing a
+ * `.ts` file can be. Golden video fixtures (`testdata/*.ts`, e2e clips) share
+ * TypeScript's extension, and tree-sitter takes ~28 s to chew through a 900 KB
+ * clip for zero symbols (#1910), so the decision has to be made from the head
+ * of the file, before any parse.
+ *
+ * Two conditions, both required:
+ *   1. the sync byte 0x47 sits at every 188-byte packet boundary of the first
+ *      `MPEG_TS_MIN_PACKETS` packets — every packet of a transport stream
+ *      opens with it, and nothing else pads to 188;
+ *   2. the head is binary: at least `MPEG_TS_MIN_CONTROL_SHARE` of it is
+ *      control bytes, as any compressed payload is.
+ * 0x47 is the letter `G`, so (1) alone could match source whose lines happen
+ * to put a `G` at every 188-byte stride. Checking for a single NUL was not
+ * enough to close that: one NUL in a comment is still TypeScript. (2) asks for
+ * dozens of control bytes, which no source file carries.
+ *
+ * `head` is the first `MPEG_TS_SNIFF_BYTES` (or fewer) bytes of the file.
+ */
+export function isMpegTransportStream(head: Uint8Array): boolean {
+  const lastSync = MPEG_TS_PACKET_SIZE * (MPEG_TS_MIN_PACKETS - 1);
+  if (head.length <= lastSync) return false;
+  for (let off = 0; off <= lastSync; off += MPEG_TS_PACKET_SIZE) {
+    if (head[off] !== MPEG_TS_SYNC_BYTE) return false;
+  }
+  let control = 0;
+  for (let i = 0; i < head.length; i++) {
+    const b = head[i]!;
+    // Tab, newline, vertical tab, form feed and carriage return are text.
+    if (b < 0x20 && (b < 0x09 || b > 0x0d)) control++;
+  }
+  return control >= head.length * MPEG_TS_MIN_CONTROL_SHARE;
+}
+
+/** Whether `filePath` carries the one extension MPEG-TS shares with a language. */
+export function hasMpegTsExtension(filePath: string): boolean {
+  return filePath.length > 3 && filePath.slice(-3).toLowerCase() === '.ts';
+}
+
 /**
  * Whether a file is one CodeGraph can parse, based purely on its extension.
  * This is the single source of truth for "should we index this file" — derived

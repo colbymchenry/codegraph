@@ -76,8 +76,15 @@ const exportedSymbolMemos = new WeakMap<ResolutionContext, Map<string, Node | un
  * `getNodesInFile` arrays (a barrel-heavy repo scans its biggest files once
  * per referencing symbol otherwise). First-wins insertion preserves exactly
  * the array-order semantics of the `.find` calls it replaces.
+ *
+ * Built from the file's exported rows alone: every worker of the resolver
+ * pool builds its own index for each file an import reaches, and decoding
+ * whole files there cost more than resolving through them. The two answers
+ * that need more — the default-export binding and names a local export
+ * clause introduces — read the source and name-targeted rows on first use.
  */
 interface FileExportIndex {
+  /** Exported declarations by name. Read through {@link exportedByName}. */
   byName: Map<string, Node>;
   defaultComponent: Node | undefined;
   defaultFnClass: Node | undefined;
@@ -87,9 +94,16 @@ interface FileExportIndex {
    * guess. `const Home = () => …; export default Home` and the namespace
    * object `const UploadApi = { uploadARCapture }; export default UploadApi`
    * are both invisible to the `isExported` index above: neither declaration
-   * has an `export_statement` ancestor.
+   * has an `export_statement` ancestor. `undefined` until first read through
+   * {@link defaultExportBindingNode}; `null` when there is none.
    */
-  defaultBinding: Node | undefined;
+  defaultBinding?: Node | null;
+  /**
+   * Names a local export clause (`export { impl as alias }`) binds to a
+   * declaration the extractor never flagged isExported, for names not in
+   * `byName`. `undefined` until first read through {@link exportedByName}.
+   */
+  clauseAliases?: Map<string, Node>;
 }
 
 const DEFAULT_BINDING_KINDS = new Set<string>(['function', 'class', 'component', 'constant', 'variable']);
@@ -113,38 +127,57 @@ function getFileExportIndex(filePath: string, context: ResolutionContext): FileE
   }
   let idx = perFile.get(filePath);
   if (!idx) {
-    idx = { byName: new Map(), defaultComponent: undefined, defaultFnClass: undefined, defaultBinding: undefined };
-    const nodesInFile = context.getNodesInFile(filePath);
-    // Every declaration, exported or not: a local `export { impl as alias }`
-    // clause exports a declaration the extractor never flagged isExported.
-    const declared = new Map<string, Node>();
-    for (const n of nodesInFile) {
-      if (!declared.has(n.name)) declared.set(n.name, n);
-      if (!n.isExported) continue;
+    idx = { byName: new Map(), defaultComponent: undefined, defaultFnClass: undefined };
+    const exported = context.getExportedNodesInFile?.(filePath) ?? context.getNodesInFile(filePath).filter((n) => n.isExported);
+    for (const n of exported) {
       if (!idx.byName.has(n.name)) idx.byName.set(n.name, n);
       if (idx.defaultComponent === undefined && n.kind === 'component') idx.defaultComponent = n;
       if (idx.defaultFnClass === undefined && (n.kind === 'function' || n.kind === 'class')) idx.defaultFnClass = n;
     }
-    const bound = defaultExportBinding(filePath, context);
-    if (bound !== null) {
-      idx.defaultBinding = nodesInFile
-        .filter((n) => n.name === bound && DEFAULT_BINDING_KINDS.has(n.kind))
-        .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0];
-    }
-    // Bind names introduced by a local export clause to their declarations, so
-    // an importer asking for the renamed name gets the real symbol instead of
-    // falling through to the name-matcher (which cannot cross the rename).
-    const content = context.readFile(filePath);
-    if (content && content.includes('export')) {
-      for (const { exportedName, localName } of extractLocalExportAliases(content)) {
-        if (idx.byName.has(exportedName)) continue;
-        const decl = declared.get(localName);
-        if (decl) idx.byName.set(exportedName, decl);
-      }
-    }
     perFile.set(filePath, idx);
   }
   return idx;
+}
+
+/** The file's nodes named `name`, in `getNodesInFile` order. */
+function nodesInFileNamed(filePath: string, name: string, context: ResolutionContext): Node[] {
+  return context.getNodesInFileNamed?.(filePath, name) ?? context.getNodesInFile(filePath).filter((n) => n.name === name);
+}
+
+/** The declaration `export default NAME` names in this file (see FileExportIndex.defaultBinding). */
+function defaultExportBindingNode(filePath: string, idx: FileExportIndex, context: ResolutionContext): Node | undefined {
+  if (idx.defaultBinding === undefined) {
+    const bound = defaultExportBinding(filePath, context);
+    idx.defaultBinding =
+      bound === null
+        ? null
+        : (nodesInFileNamed(filePath, bound, context)
+            .filter((n) => DEFAULT_BINDING_KINDS.has(n.kind))
+            .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0] ?? null);
+  }
+  return idx.defaultBinding ?? undefined;
+}
+
+/** What this file exports as `name`: an exported declaration, else a local export clause's binding. */
+function exportedByName(filePath: string, idx: FileExportIndex, name: string, context: ResolutionContext): Node | undefined {
+  const direct = idx.byName.get(name);
+  if (direct) return direct;
+  if (idx.clauseAliases === undefined) {
+    // Bind names introduced by a local export clause to their declarations, so
+    // an importer asking for the renamed name gets the real symbol instead of
+    // falling through to the name-matcher (which cannot cross the rename).
+    // The declaration is the file's first node of that name, exported or not.
+    idx.clauseAliases = new Map();
+    const content = context.readFile(filePath);
+    if (content && content.includes('export')) {
+      for (const { exportedName, localName } of extractLocalExportAliases(content)) {
+        if (idx.byName.has(exportedName) || idx.clauseAliases.has(exportedName)) continue;
+        const decl = nodesInFileNamed(filePath, localName, context)[0];
+        if (decl) idx.clauseAliases.set(exportedName, decl);
+      }
+    }
+  }
+  return idx.clauseAliases.get(name);
 }
 
 /** Drop the per-context memo tables (see ReferenceResolver.clearCaches). */
@@ -154,6 +187,7 @@ export function clearImportResolverMemos(context: ResolutionContext): void {
   fileExportIndexes.delete(context);
   luaFileBasenameIndexes.delete(context);
   cobolCopybookIndexes.delete(context);
+  pythonModuleFileMemos.delete(context);
 }
 
 export function resolveImportPath(
@@ -2066,23 +2100,48 @@ function resolveModuleImportToFile(
  * no edge. Shared by absolute `import a.b.c` and absolute `from a.b import c`
  * (where `c` is a submodule) resolution.
  */
+/**
+ * Per-context memo for findPythonModuleFile: module path → the `<mod>.py` and
+ * `<mod>/__init__.py` file nodes whose path ends with it, in name-lookup
+ * order. Only the importing file's own path is excluded per call, so taking
+ * the first survivor returns the node the unmemoized scan found. Without it,
+ * every ref naming a module outside the project (`from unittest import mock`)
+ * rescanned every `__init__.py` in the tree. Same stable window as the name
+ * caches; dropped by clearImportResolverMemos.
+ */
+const pythonModuleFileMemos = new WeakMap<ResolutionContext, Map<string, { module: Node[]; pkg: Node[] }>>();
+
 function findPythonModuleFile(
   mod: string,
   context: ResolutionContext,
   excludeFilePath: string
 ): Node | null {
   if (!mod || mod.startsWith('.')) return null; // relative imports handled elsewhere
-  const rel = mod.replace(/\./g, '/');
-  const lastSeg = mod.split('.').pop()!;
-  const endsWith = (p: string, want: string): boolean => p === want || p.endsWith('/' + want);
-  const moduleFile = context
-    .getNodesByName(`${lastSeg}.py`)
-    .find((n) => n.kind === 'file' && n.filePath !== excludeFilePath && endsWith(n.filePath, `${rel}.py`));
-  if (moduleFile) return moduleFile;
-  const pkgFile = context
-    .getNodesByName('__init__.py')
-    .find((n) => n.kind === 'file' && n.filePath !== excludeFilePath && endsWith(n.filePath, `${rel}/__init__.py`));
-  return pkgFile ?? null;
+  let memo = pythonModuleFileMemos.get(context);
+  if (!memo) {
+    memo = new Map();
+    pythonModuleFileMemos.set(context, memo);
+  }
+  let files = memo.get(mod);
+  if (!files) {
+    const rel = mod.replace(/\./g, '/');
+    const lastSeg = mod.split('.').pop()!;
+    const endsWith = (p: string, want: string): boolean => p === want || p.endsWith('/' + want);
+    files = {
+      module: context
+        .getNodesByName(`${lastSeg}.py`)
+        .filter((n) => n.kind === 'file' && endsWith(n.filePath, `${rel}.py`)),
+      pkg: context
+        .getNodesByName('__init__.py')
+        .filter((n) => n.kind === 'file' && endsWith(n.filePath, `${rel}/__init__.py`)),
+    };
+    memo.set(mod, files);
+  }
+  return (
+    files.module.find((n) => n.filePath !== excludeFilePath) ??
+    files.pkg.find((n) => n.filePath !== excludeFilePath) ??
+    null
+  );
 }
 
 /**
@@ -2442,13 +2501,14 @@ function findExportedSymbolWalk(
     // resolves and the component shows a false 0 callers (#629).
     // A component file IS its default export; otherwise the statement that
     // names the binding beats the first-exported-function guess.
-    const direct = exportIndex.defaultComponent ?? exportIndex.defaultBinding ?? exportIndex.defaultFnClass;
+    const direct =
+      exportIndex.defaultComponent ?? defaultExportBindingNode(filePath, exportIndex, context) ?? exportIndex.defaultFnClass;
     if (direct) return direct;
   } else if (want.isNamespace && want.memberName) {
-    const direct = exportIndex.byName.get(want.memberName);
+    const direct = exportedByName(filePath, exportIndex, want.memberName, context);
     if (direct) return direct;
   } else {
-    const direct = exportIndex.byName.get(want.exportedName);
+    const direct = exportedByName(filePath, exportIndex, want.exportedName, context);
     if (direct) return direct;
   }
 

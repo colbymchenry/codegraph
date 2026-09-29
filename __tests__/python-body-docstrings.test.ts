@@ -27,7 +27,9 @@ function docstrings(code: string): Map<string, string | undefined> {
   return new Map(extractFromSource('ledger.py', code).nodes.map((n) => [n.name, n.docstring]));
 }
 
-const fixture = fs.readFileSync(path.join(__dirname, 'fixtures/kernel-parity/docstrings.py'), 'utf8');
+// Git may check out the fixture as CRLF. Start from LF so the CRLF variant
+// adds exactly one carriage return per newline on either platform.
+const fixture = fs.readFileSync(path.join(__dirname, 'fixtures/kernel-parity/docstrings.py'), 'utf8').replace(/\r\n/g, '\n');
 const kernelBuilt = fs.existsSync(path.join(__dirname, '../codegraph-kernel/prebuilds',
   `${process.platform}-${process.arch}`, 'codegraph-kernel.node'));
 

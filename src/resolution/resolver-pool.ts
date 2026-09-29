@@ -222,6 +222,11 @@ export class ResolverPool {
     this.recycleWaiters.clear();
   }
 
+  /** Number of workers — how many passes the synthesis fan-out keeps in flight. */
+  get size(): number {
+    return this.workers.length;
+  }
+
   /** Whether this batch is worth fanning out. */
   static worthParallel(batchLength: number): boolean {
     return batchLength >= MIN_PARALLEL_BATCH;

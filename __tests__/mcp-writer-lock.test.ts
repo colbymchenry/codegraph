@@ -14,6 +14,7 @@ import type { MCPEngine } from '../src/mcp/engine';
 import { createDatabase } from '../src/db/sqlite-adapter';
 import { getWriterPidPath } from '../src/mcp/writer-lock';
 import { isProcessAlive, stopDaemonAt } from '../src/mcp/daemon-registry';
+import { recordSpawns, removeSpawnLog, settleLosingCandidates } from './daemon-candidates';
 
 // Exercise the shipped lazy CommonJS loader as well as the engine lifecycle.
 const { MCPEngine: BuiltMCPEngine } = require('../dist/mcp/engine') as typeof import('../src/mcp/engine');
@@ -28,10 +29,12 @@ function spawnMcp(
   cwd: string,
   env: NodeJS.ProcessEnv,
 ): { child: ChildProcessWithoutNullStreams; getStderr: () => string } {
-  const child = spawn(process.execPath, [BIN, 'serve', '--mcp'], {
+  // Record the daemon candidates this launcher spawns, for the teardown.
+  const recorder = recordSpawns(cwd);
+  const child = spawn(process.execPath, [...recorder.args, BIN, 'serve', '--mcp'], {
     cwd,
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, ...env },
+    env: { ...process.env, ...recorder.env, ...env },
   }) as ChildProcessWithoutNullStreams;
   child.on('error', () => {});
   child.stdin.on('error', () => {});
@@ -82,15 +85,20 @@ describe('issue #1740 — direct-mode writer lock', () => {
     // daemon stop helper verifies its socket identity before signaling it.
     const childPids = new Set(children.map((c) => c.pid));
     const writerPid = readWriterPid(realRoot);
-    const results = await Promise.allSettled([
-      ...children.map(stopChild),
-      ...(writerPid !== undefined && !childPids.has(writerPid)
-        ? [stopDaemonAt(realRoot).then((result) => {
-          expect(result.pid).toBe(writerPid);
-          expect(result.outcome).not.toBe('unverified');
-        })]
-        : []),
-    ]);
+    // With the launchers gone no new daemon candidate can appear. A loser can
+    // still be starting on a loaded machine; stopping the winner first would
+    // let it take over the fixture being removed (#1773).
+    const stopWriter = async (): Promise<void> => {
+      await settleLosingCandidates(realRoot, () => readWriterPid(realRoot));
+      if (writerPid === undefined || childPids.has(writerPid)) return;
+      const result = await stopDaemonAt(realRoot);
+      expect(result.pid).toBe(writerPid);
+      expect(result.outcome).not.toBe('unverified');
+    };
+    const results = [
+      ...await Promise.allSettled(children.map(stopChild)),
+      ...await Promise.allSettled([stopWriter()]),
+    ];
     for (const result of results) {
       if (result.status === 'rejected') throw result.reason;
     }
@@ -98,11 +106,16 @@ describe('issue #1740 — direct-mode writer lock', () => {
       expect(isProcessAlive(writerPid), `Writer ${writerPid} did not exit`).toBe(false);
     }
     children.length = 0;
-    fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 10 });
+    removeSpawnLog(realRoot);
+    // A stopped daemon's files can stay held for a moment (handle rundown, an
+    // antivirus scan on close) with nothing to wait on. fs.rmSync gives up on
+    // the first Windows access-denied error despite maxRetries (Node 24), so
+    // use the asynchronous removal, which does back off and retry (#1773).
+    await fs.promises.rm(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     expect(fs.existsSync(tempDir)).toBe(false);
   }
 
-  afterEach(cleanup, 15000);
+  afterEach(cleanup, 45_000);
 
   it('second CODEGRAPH_NO_DAEMON serve --mcp exits with writer-lock error', async () => {
     const env = {
@@ -163,6 +176,15 @@ describe('issue #1740 — direct-mode writer lock', () => {
       await sleep(50);
     }
     expect(fs.existsSync(lockPath)).toBe(true);
+    // writer.pid appears before the daemon binds and rewrites daemon.pid.
+    // Attaching proves both happened, so cleanup never probes a daemon that is
+    // still starting (#1773).
+    const attached = () => [a, b].every((p) => p.getStderr().includes('Attached to shared daemon'));
+    const attachDeadline = Date.now() + 30000;
+    while (Date.now() < attachDeadline && !attached()) {
+      await sleep(50);
+    }
+    expect(attached()).toBe(true);
     await sleep(1000);
     expect(a.child.exitCode).toBeNull();
     expect(b.child.exitCode).toBeNull();
@@ -179,7 +201,7 @@ describe('issue #1740 — direct-mode writer lock', () => {
     expect(isProcessAlive(a.child.pid!)).toBe(false);
     expect(isProcessAlive(b.child.pid!)).toBe(false);
     expect(fs.existsSync(tempDir)).toBe(false);
-  }, 25000);
+  }, 90_000);
 });
 
 

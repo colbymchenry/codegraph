@@ -90,6 +90,12 @@ export interface ResolutionResult {
 export interface ResolutionContext {
   /** Get all nodes in a file */
   getNodesInFile(filePath: string): Node[];
+  /** Whether any node in the file is exported (`getNodesInFile(f).some(n => n.isExported)`), as one indexed probe. */
+  fileHasExportedNode?(filePath: string): boolean;
+  /** `getNodesInFile(f).filter(n => n.isExported)`, without decoding the rest of the file. */
+  getExportedNodesInFile?(filePath: string): Node[];
+  /** `getNodesInFile(f).filter(n => n.name === name)`, without decoding the rest of the file. */
+  getNodesInFileNamed?(filePath: string, name: string): Node[];
   /** Get all nodes by name */
   getNodesByName(name: string): Node[];
   /** Get all nodes by qualified name */
@@ -109,6 +115,8 @@ export interface ResolutionContext {
   fileExists(filePath: string): boolean;
   /** Read file content */
   readFile(filePath: string): string | null;
+  /** `readFile(filePath)?.includes(needle) ?? false` for an ASCII `needle`, without decoding a file that lacks it. */
+  fileContains?(filePath: string, needle: string): boolean;
   /**
    * `readFile(filePath)` split into lines, LRU-cached per file. Receiver-type
    * inference scans source lines for EVERY `receiver.method()` ref; splitting

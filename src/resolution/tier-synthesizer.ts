@@ -248,12 +248,13 @@ function decorators(safe: string, name: string): Array<{ args: string; index: nu
 interface FileFacts {
   file: string;
   safe: string;
-  nodes: Node[];
+  /** Read on first use: most files that pass a gate hold no site, and never need them. */
+  readonly nodes: Node[];
   lineOf: (idx: number) => number;
   /** The 0-based column of an index on its line — where the site reader looks for the call. */
   columnOf: (idx: number) => number;
   /** Lines a framework resolver made a route node on — registrations, never client calls. */
-  routeLines: Set<number>;
+  readonly routeLines: Set<number>;
   /** Local names bound to an HTTP client instance, with their literal base URL when written. */
   clients: Map<string, { baseURL: string | null }>;
   /** The module's default export is a client instance. */
@@ -284,9 +285,8 @@ function readFacts(ctx: ResolutionContext, file: string): FileFacts | null {
   const content = ctx.readFile(file);
   if (!content) return null;
   const safe = stripCommentsForRegex(content, 'typescript');
-  const nodes = ctx.getNodesInFile(file);
-  const routeLines = new Set<number>();
-  for (const n of nodes) if (n.kind === 'route') routeLines.add(n.startLine);
+  let nodes: Node[] | null = null;
+  let routeLines: Set<number> | null = null;
   const clients = new Map<string, { baseURL: string | null }>();
   CLIENT_FACTORY.lastIndex = 0;
   let m: RegExpExecArray | null;
@@ -303,10 +303,18 @@ function readFacts(ctx: ResolutionContext, file: string): FileFacts | null {
   return {
     file,
     safe,
-    nodes,
+    get nodes() {
+      return (nodes ??= ctx.getNodesInFile(file));
+    },
     lineOf: makeLineAt(safe, 1),
     columnOf: (idx: number) => idx - (safe.lastIndexOf('\n', idx - 1) + 1),
-    routeLines,
+    get routeLines() {
+      if (!routeLines) {
+        routeLines = new Set<number>();
+        for (const n of this.nodes) if (n.kind === 'route') routeLines.add(n.startLine);
+      }
+      return routeLines;
+    },
     clients,
     defaultClient,
     queues,
@@ -347,9 +355,20 @@ const CLIENT_NAMES =
 const SERVER_NAMES = /^(?:app|router|route|routes|express|fastify|koa|hono|elysia|apiRouter|v1|v2|r)$/;
 /** A type argument between the callee and its `(` — `useSWR<TeamData>('/api/team')`, `ky.get<User>('/x')`. */
 const GENERIC = String.raw`(?:<[^()<>]*(?:<[^()<>]*>[^()<>]*)*>)?`;
+/**
+ * Where a receiver chain (`this.api.client`) may begin: not after an earlier
+ * identifier-start character of the same word (the second lookbehind is the
+ * whole rule; the first is its one-character fast path). A match from the
+ * middle of a word implies one from its first letter — the chain regexes read
+ * the rest of the word either way — and each of their matches ends on a
+ * non-word character, so a scan never resumes mid-word: this only skips starts
+ * bound to fail. Without it every letter of every identifier re-read the
+ * dotted chain behind it, which on vscode made this the slowest pass.
+ */
+const CHAIN_START = String.raw`(?<![A-Za-z_$])(?<![A-Za-z_$][\w$]+)`;
 const BARE_CLIENT_CALL = new RegExp(String.raw`(?:(?:window|globalThis|global)\s*\.\s*)?\b(fetch|\$fetch|ofetch|axios|ky|got|useFetch|useSWR)\s*${GENERIC}\s*\(`, 'g');
 const MEMBER_CLIENT_CALL = new RegExp(
-  String.raw`((?:this\s*\.\s*)?[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\.\s*(get|post|put|patch|delete|head|options|request|\$get|\$post|\$put|\$patch|\$delete)\s*${GENERIC}\s*\(`,
+  String.raw`${CHAIN_START}((?:this\s*\.\s*)?[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\.\s*(get|post|put|patch|delete|head|options|request|\$get|\$post|\$put|\$patch|\$delete)\s*${GENERIC}\s*\(`,
   'g'
 );
 
@@ -508,12 +527,12 @@ function clientFor(
 }
 
 function collectHttpSites(ctx: ResolutionContext, facts: FileFacts, sites: HttpSite[], cache: Map<string, FileFacts | null>): void {
-  const { safe, nodes, lineOf } = facts;
+  const { safe, lineOf } = facts;
   const add = (index: number, open: number, verb: string | null, baseURL: string | null): void => {
     const line = lineOf(index);
     const callee = safe.slice(index, open).replace(/\s+/g, '').replace(/<.*>$/, '');
     if (facts.routeLines.has(line)) return; // a registration the resolver already read
-    const fn = enclosingFn(nodes, line);
+    const fn = enclosingFn(facts.nodes, line);
     if (!fn) return;
     const args = argumentsAt(safe, open);
     if (!args || !args[0]) return;
@@ -556,10 +575,10 @@ function collectHttpSites(ctx: ResolutionContext, facts: FileFacts, sites: HttpS
 // 2. Queue job → consumer
 // =============================================================================
 
-const QUEUE_ADD = /((?:this\s*\.\s*)?[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\.\s*add\s*\(\s*(['"`])([^'"`]+)\2/g;
+const QUEUE_ADD = new RegExp(CHAIN_START + /((?:this\s*\.\s*)?[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\.\s*add\s*\(\s*(['"`])([^'"`]+)\2/.source, 'g');
 const QUEUE_SHAPED = /queue|jobs?$|worker|bull|flow|producer/i;
 const NEW_WORKER = /\bnew\s+Worker\s*(?:<[^>]*>)?\s*\(\s*(['"`])([^'"`]+)\1\s*,\s*/g;
-const QUEUE_PROCESS = /((?:this\s*\.\s*)?[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\.\s*process\s*\(\s*(?:(['"`])([^'"`]+)\2\s*,\s*)?(?:\d+\s*,\s*)?/g;
+const QUEUE_PROCESS = new RegExp(CHAIN_START + /((?:this\s*\.\s*)?[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\.\s*process\s*\(\s*(?:(['"`])([^'"`]+)\2\s*,\s*)?(?:\d+\s*,\s*)?/.source, 'g');
 /** A handler argument: a named function (group 1), or an inline function. */
 const HANDLER_ARG = /^(?:(?:async\s+)?([A-Za-z_$][\w$.]*)\s*(?:[,)]|$)|(?:async\s*)?(?:\(|function\b|[A-Za-z_$][\w$]*\s*=>))/;
 
@@ -644,7 +663,7 @@ function decoratedMethod(facts: FileFacts, end: number, cls: Node | null): Node 
 }
 
 function collectQueue(ctx: ResolutionContext, facts: FileFacts, producers: QueueProducer[], consumers: QueueConsumer[], cache: Map<string, FileFacts | null>): void {
-  const { safe, nodes, lineOf } = facts;
+  const { safe, lineOf } = facts;
   let m: RegExpExecArray | null;
   QUEUE_ADD.lastIndex = 0;
   while ((m = QUEUE_ADD.exec(safe)) !== null) {
@@ -653,7 +672,7 @@ function collectQueue(ctx: ResolutionContext, facts: FileFacts, producers: Queue
     const last = receiver.replace(/\s+/g, '').split('.').pop()!;
     if (queue === null && !QUEUE_SHAPED.test(last)) continue;
     const line = lineOf(m.index);
-    const fn = enclosingFn(nodes, line);
+    const fn = enclosingFn(facts.nodes, line);
     if (!fn) continue;
     producers.push({ fn, file: facts.file, line, column: facts.columnOf(m.index), callee: `${receiver.replace(/\s+/g, '')}.add`, queue, job: m[3]! });
   }
@@ -674,7 +693,7 @@ function collectQueue(ctx: ResolutionContext, facts: FileFacts, producers: Queue
       consumers.push({ node: method, file: facts.file, line, queue, job: firstLiteral(job.args) });
     }
     if (!any) {
-      const process = nodes.find((n) => n.kind === 'method' && n.name === 'process' && n.startLine >= cls.startLine && n.endLine <= cls.endLine);
+      const process = facts.nodes.find((n) => n.kind === 'method' && n.name === 'process' && n.startLine >= cls.startLine && n.endLine <= cls.endLine);
       if (process) consumers.push({ node: process, file: facts.file, line: process.startLine, queue, job: null });
     }
   }
@@ -745,8 +764,10 @@ function pairQueue(producers: readonly QueueProducer[], consumers: readonly Queu
 // 3. Events: a bus, and sockets both ways
 // =============================================================================
 
-const EMIT = /((?:[\w$]+(?:\([^()]*\))?\s*\.\s*)*[\w$]+)\s*\.\s*(emit|emitAsync)\s*\(\s*(['"`])([^'"`\n]+)\3/g;
-const SOCKET_ON = /((?:[\w$]+(?:\([^()]*\))?\s*\.\s*)*[\w$]+)\s*\.\s*(?:on|once)\s*\(\s*(['"`])([^'"`\n]+)\2\s*,\s*/g;
+// A word character opens these chains, so a word's first character is the
+// only start that can match (same argument as CHAIN_START).
+const EMIT = /(?<![\w$])((?:[\w$]+(?:\([^()]*\))?\s*\.\s*)*[\w$]+)\s*\.\s*(emit|emitAsync)\s*\(\s*(['"`])([^'"`\n]+)\3/g;
+const SOCKET_ON = /(?<![\w$])((?:[\w$]+(?:\([^()]*\))?\s*\.\s*)*[\w$]+)\s*\.\s*(?:on|once)\s*\(\s*(['"`])([^'"`\n]+)\2\s*,\s*/g;
 const SOCKET_WORDS = /^(?:socket|io|ws|wss|client|server|namespace|nsp|conn|connection|gateway|broadcast|to|in|of|except|volatile|local|sockets|socketServer|wsServer|room|channel|pusher|ably|ioClient|socketClient|sock)$/;
 const BUS_WORDS = /^(?:eventEmitter|emitter|events|eventBus|bus|dispatcher|pubsub|publisher|eventPublisher|ee|hub|mediator|broker|messageBus|appEvents|domainEvents|eventsService|eventService)$/;
 /** The transport's own events — every socket emits and handles them; pairing them says nothing. */
@@ -782,7 +803,7 @@ function shapeOf(receiver: string): 'bus' | 'socket' | null {
 }
 
 function collectEvents(ctx: ResolutionContext, facts: FileFacts, dispatches: Dispatch[], handlers: Handler[], cache: Map<string, FileFacts | null>): void {
-  const { safe, nodes, lineOf } = facts;
+  const { safe, lineOf } = facts;
   const side: 'server' | 'client' = facts.socketServer ? 'server' : 'client';
   let m: RegExpExecArray | null;
   EMIT.lastIndex = 0;
@@ -790,7 +811,7 @@ function collectEvents(ctx: ResolutionContext, facts: FileFacts, dispatches: Dis
     const shape = shapeOf(m[1]!);
     if (!shape || GENERIC_EVENT.test(m[4]!)) continue;
     const line = lineOf(m.index);
-    const fn = enclosingFn(nodes, line);
+    const fn = enclosingFn(facts.nodes, line);
     if (!fn) continue;
     dispatches.push({ fn, file: facts.file, line, column: facts.columnOf(m.index), callee: `${m[1]!.replace(/\s+/g, '')}.${m[2]!}`, event: m[4]!, shape, side });
   }

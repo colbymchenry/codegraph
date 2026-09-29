@@ -15,7 +15,8 @@ import * as path from 'path';
 import type CodeGraph from '../index';
 import { resolveServerRoot } from '../directory';
 import { ToolHandler } from './tools';
-import { releaseWriterLock, tryAcquireWriterLock, writerLockHeldMessage } from './writer-lock';
+import { WslSharedIndexError } from '../db/wsl-shared-index';
+import { assertNoRebuild, releaseWriterLock, tryAcquireWriterLock, writerLockHeldMessage } from './writer-lock';
 import { QueryPool, resolvePoolSize } from './query-pool';
 import { acquireProject, ProjectLease } from './project-lifecycle';
 
@@ -96,6 +97,9 @@ export class MCPEngine {
     this.toolHandler = new ToolHandler(null);
     this.toolHandler.setProjectLifecycle({
       open: (root, open) => {
+        // Explicit projects and read-only fallbacks also hold SQLite handles.
+        // Fence them before opening, just like the default daemon project.
+        assertNoRebuild(root);
         if (this.opts.readOnly) return loadCodeGraph().openSync(root, { readOnly: true });
         if (!this.opts.watch) return open();
         const lease = acquireProject(root, open, this.watchOptions());
@@ -105,7 +109,17 @@ export class MCPEngine {
       activate: (cg) => this.explicitProjects.get(cg)?.ready() ?? Promise.resolve(),
       release: (cg) => this.releaseExplicitProject(cg),
     });
+    // A tool call found the default project's database replaced on disk (a
+    // `codegraph index` rebuild) and reopened it (#1902). Reconcile the new
+    // file with the usual catch-up — `sync()` serializes on the index mutex,
+    // so it never overlaps an in-flight watcher sync. Only when this engine is
+    // watching, i.e. it is the project's writer: a read-only engine (writer
+    // lock held elsewhere, watching disabled) must not start writing.
+    this.toolHandler.setOnDatabaseReopened((cg) => {
+      if (cg === this.cg && cg.isWatching()) this.catchUpSync(true);
+    });
     if (opts.writerLockRoot && !this.opts.readOnly) {
+      assertNoRebuild(opts.writerLockRoot);
       const writer = tryAcquireWriterLock(opts.writerLockRoot, 'fallback');
       if (writer.kind === 'taken') {
         throw new Error(writerLockHeldMessage(writer.existing, writer.pidPath));
@@ -225,14 +239,16 @@ export class MCPEngine {
         try { this.cg.close(); } catch { /* ignore */ }
         this.cg = null;
       }
+      assertNoRebuild(resolvedRoot);
       this.cg = loadCodeGraph().openSync(resolvedRoot, { readOnly: this.opts.readOnly });
       this.projectPath = resolvedRoot;
       this.toolHandler.setDefaultCodeGraph(this.cg);
       this.startWatching();
       this.catchUpSync();
       this.maybeStartPool(resolvedRoot);
-    } catch {
+    } catch (err) {
       // Still failing — caller will try again on the next tool call.
+      this.toolHandler.setDefaultOpenFailure(err instanceof WslSharedIndexError ? err : null);
     }
   }
 
@@ -348,6 +364,7 @@ export class MCPEngine {
 
     this.projectPath = resolvedRoot;
     try {
+      assertNoRebuild(resolvedRoot);
       const opened = await loadCodeGraph().open(resolvedRoot, { readOnly: this.opts.readOnly });
       if (this.closed) { opened.close(); return; }
       this.cg = opened;
@@ -358,6 +375,8 @@ export class MCPEngine {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(`[CodeGraph MCP] Failed to open project at ${resolvedRoot}: ${msg}\n`);
+      // The agent otherwise hears only "no project loaded" (#995).
+      this.toolHandler.setDefaultOpenFailure(err instanceof WslSharedIndexError ? err : null);
     }
   }
 
@@ -397,10 +416,12 @@ export class MCPEngine {
    * and the per-file staleness banner can't help because `getPendingFiles()`
    * is populated by the watcher, not by catch-up).
    */
-  private catchUpSync(): void {
+  private catchUpSync(afterReopen = false): void {
     const cg = this.cg;
     if (!cg || this.opts.readOnly) return;
-    if (this.defaultLease) {
+    // The lease's gate is the startup reconcile and stays settled once caught
+    // up; a database reopened after a rebuild (#1902) needs a sync of its own.
+    if (this.defaultLease && !afterReopen) {
       this.toolHandler.setCatchUpGate(this.defaultLease.ready());
       return;
     }

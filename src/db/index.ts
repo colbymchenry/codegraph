@@ -394,16 +394,33 @@ export class DatabaseConnection {
    * One yield per statement keeps every stall to a single index build, which
    * stays inside the window.
    */
-  async endBulkEdgeLoad(): Promise<void> {
+  async endBulkEdgeLoad(options: { deferSynthesisSite?: boolean } = {}): Promise<void> {
     const schemaPath = path.join(__dirname, 'schema.sql');
     const schema = fs.readFileSync(schemaPath, 'utf-8');
     for (const idx of DatabaseConnection.BULK_EDGE_INDEX_NAMES) {
+      if (options.deferSynthesisSite && idx === DatabaseConnection.SYNTHESIS_SITE_INDEX) continue;
       const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
       if (!m) throw new Error(`schema.sql: edge index ${idx} not found for bulk-load recreation`);
       this.db.exec(m[0]);
       await new Promise((resolve) => setImmediate(resolve));
     }
   }
+
+  /**
+   * The sync-only synthesis-site index (#1988), which endBulkEdgeLoad can
+   * leave for later. Its partial predicate runs json_valid over the metadata of
+   * every edge — ~1.5M rows, several seconds on vscode — while nothing before
+   * the end of an index reads it, so the resolver builds it while the pool is
+   * busy with synthesis rather than on the critical path. Idempotent.
+   */
+  createSynthesisSiteIndex(): void {
+    const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf-8');
+    const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${DatabaseConnection.SYNTHESIS_SITE_INDEX}\\b[^;]*;`));
+    if (!m) throw new Error(`schema.sql: edge index ${DatabaseConnection.SYNTHESIS_SITE_INDEX} not found`);
+    this.db.exec(m[0]);
+  }
+
+  private static readonly SYNTHESIS_SITE_INDEX = 'idx_edges_synthesis_site';
 
   /** Recreate the FTS triggers + rebuild if a bulk-load window never closed. */
   private healBulkNodeLoad(): void {

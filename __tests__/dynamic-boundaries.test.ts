@@ -402,6 +402,38 @@ describe('codegraph_explore — interface dispatch', () => {
     expect(text).not.toContain('**Interface dispatch');
   });
 
+  // vscode shape: many unrelated classes share a lifecycle base and happen to
+  // share a member name the base never declares. That is not dispatch through
+  // the base — announcing it put "runtime dispatch to 2706 types implementing
+  // Disposable" at the top of every answer whose query said "extension".
+  const lifecycleFamily = () => {
+    const names = ['Editor', 'Terminal', 'Search', 'Debug', 'Scm', 'Chat', 'Notebook', 'Output', 'Tasks', 'Remote'];
+    return [
+      'export abstract class Disposable { dispose(): void {} }',
+      ...names.map((nm, i) => [
+        `export class ${nm}Service extends Disposable {`,
+        `  get extension(): string { return '${nm.toLowerCase()}'; }`,
+        `  dispose(): void { super.dispose(); }`,
+        `  describe${nm}() { return this.extension + ${i}; }`,
+        '}',
+      ].join('\n')),
+    ].join('\n');
+  };
+
+  it('stays SILENT for a shared name the common base never declares', async () => {
+    await setup({ 'services.ts': lifecycleFamily() }, ['**/*.ts']);
+    const res = await handler.execute('codegraph_explore', { query: 'extension describeEditor describeChat' });
+    const text = res.content[0].text as string;
+    expect(text).not.toMatch(/`extension` → runtime dispatch/);
+  });
+
+  it('still announces a member the common base declares', async () => {
+    await setup({ 'services.ts': lifecycleFamily() }, ['**/*.ts']);
+    const res = await handler.execute('codegraph_explore', { query: 'dispose describeEditor describeChat' });
+    const text = res.content[0].text as string;
+    expect(text).toMatch(/`dispose` → runtime dispatch to \*\*10\*\* types implementing `Disposable`/);
+  });
+
   it('stays SILENT when the interface family is below the polymorphism threshold (3 impls)', async () => {
     await setup({ 'nodes.ts': nodeFamily(3), 'registry.ts': registry, 'engine.ts': engine }, ['**/*.ts']);
 

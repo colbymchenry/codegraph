@@ -7,9 +7,17 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { isWslWindowsDrive } from './sync/watch-policy';
 
 /** The default per-project data directory name. */
-const DEFAULT_CODEGRAPH_DIR = '.codegraph';
+export const DEFAULT_CODEGRAPH_DIR = '.codegraph';
+
+/**
+ * The data directory name WSL gives a fresh project on a Windows drive, so it
+ * never shares one index with CodeGraph on Windows (issue #995). Indexing and
+ * watching skip every `.codegraph-*` sibling on both sides (#636).
+ */
+export const WSL_CODEGRAPH_DIR = '.codegraph-wsl';
 
 let warnedBadDirName = false;
 
@@ -80,15 +88,55 @@ export function isCodeGraphDataDir(name: string): boolean {
 }
 
 /**
- * Get the .codegraph directory path for a project
+ * The data directory name for one project: {@link codeGraphDirName}, except
+ * for a project on a Windows drive under WSL (`/mnt/c/...`) with no
+ * `CODEGRAPH_DIR` set. Windows-native CodeGraph opens `.codegraph` in that
+ * same tree, and SQLite's locking doesn't hold across the 9p/DrvFs bridge, so
+ * the two sharing one index fails with "disk I/O error" (issue #995). There:
+ *
+ *   1. `.codegraph-wsl/` exists → it. Once WSL has its own index it keeps it,
+ *      even after Windows builds a `.codegraph` beside it.
+ *   2. `.codegraph/codegraph.db` exists → `.codegraph`. An index built before
+ *      this default is kept rather than silently rebuilt somewhere else.
+ *   3. neither → `.codegraph-wsl`, so a fresh WSL index never shares.
+ *
+ * Every other host keeps the plain name without a stat: the WSL check is
+ * cached per process.
  */
-export function getCodeGraphDir(projectRoot: string): string {
-  return path.join(projectRoot, codeGraphDirName());
+export function codeGraphDirNameFor(projectRoot: string): string {
+  if (process.env.CODEGRAPH_DIR?.trim() || !isWslWindowsDrive(projectRoot)) return codeGraphDirName();
+  try {
+    if (fs.statSync(path.join(projectRoot, WSL_CODEGRAPH_DIR)).isDirectory()) return WSL_CODEGRAPH_DIR;
+  } catch {
+    // absent — fall through
+  }
+  if (fs.existsSync(path.join(projectRoot, DEFAULT_CODEGRAPH_DIR, 'codegraph.db'))) return DEFAULT_CODEGRAPH_DIR;
+  return WSL_CODEGRAPH_DIR;
 }
 
 /**
- * Check if a project has been initialized with CodeGraph
- * Requires both .codegraph/ directory AND codegraph.db to exist
+ * Get the .codegraph directory path for a project
+ */
+export function getCodeGraphDir(projectRoot: string): string {
+  return path.join(projectRoot, codeGraphDirNameFor(projectRoot));
+}
+
+/**
+ * Check if a project has been initialized with CodeGraph.
+ *
+ * Requires `.codegraph/codegraph.db` to exist AND to carry the codegraph
+ * schema. A file that merely exists — empty, or a SQLite database with no
+ * tables, as an interrupted `init` or a stray `touch` leaves behind — used to
+ * count as initialized, so one such file in an ANCESTOR directory (worst
+ * case: `$HOME`) captured the upward resolution of every project beneath it
+ * and made their real indexes unreachable (#1895).
+ *
+ * The probe is cheap and gated so hot callers (the prompt hook, MCP root
+ * resolution on every call) pay one `stat`: file size, then a read-only
+ * SQLite open with a single `sqlite_master` lookup — memoized per path +
+ * mtime + size so an unchanged db is never reopened. A database that cannot
+ * be inspected counts as initialized (see probeSchema) — only a proven-absent
+ * schema, or a file SQLite refuses as not a database, says no.
  */
 export function isInitialized(projectRoot: string): boolean {
   const codegraphDir = getCodeGraphDir(projectRoot);
@@ -97,7 +145,88 @@ export function isInitialized(projectRoot: string): boolean {
   }
   // Must have codegraph.db, not just .codegraph folder
   const dbPath = path.join(codegraphDir, 'codegraph.db');
-  return fs.existsSync(dbPath);
+  let st: fs.Stats;
+  try {
+    st = fs.statSync(dbPath);
+  } catch {
+    return false;
+  }
+  return hasCodeGraphSchema(dbPath, st);
+}
+
+/**
+ * `codegraph.db` exists at `projectRoot` but does not carry the schema, and
+ * `init` can add it in place: an empty file, or a SQLite database without the
+ * codegraph tables (#1895). A file that is not SQLite at all is NOT this case —
+ * see {@link hasForeignDbFile}.
+ */
+export function hasSchemalessDb(projectRoot: string): boolean {
+  const dbPath = path.join(getCodeGraphDir(projectRoot), 'codegraph.db');
+  let st: fs.Stats;
+  try { st = fs.statSync(dbPath); } catch { return false; }
+  if (!st.isFile() || isInitialized(projectRoot)) return false;
+  return st.size === 0 || probeSchema(dbPath) === 'no-schema';
+}
+
+/**
+ * `codegraph.db` exists at `projectRoot` and is not a SQLite database (no
+ * header magic): SQLite refuses to open it, so `init` cannot rebuild it in
+ * place. The caller must say so rather than promise a repair; nothing here
+ * deletes the file.
+ */
+export function hasForeignDbFile(projectRoot: string): boolean {
+  const dbPath = path.join(getCodeGraphDir(projectRoot), 'codegraph.db');
+  let st: fs.Stats;
+  try { st = fs.statSync(dbPath); } catch { return false; }
+  return st.isFile() && st.size > 0 && probeSchema(dbPath) === 'not-sqlite';
+}
+
+/** A SQLite file header is 100 bytes; anything shorter cannot hold a schema. */
+const SQLITE_HEADER_SIZE = 100;
+/** SQLITE_NOTADB: SQLite read the file and it is not a database. */
+const SQLITE_NOTADB = 26;
+const schemaProbeCache = new Map<string, { mtimeMs: number; size: number; ok: boolean }>();
+
+function hasCodeGraphSchema(dbPath: string, st: fs.Stats): boolean {
+  if (!st.isFile() || st.size < SQLITE_HEADER_SIZE) return false;
+  const cached = schemaProbeCache.get(dbPath);
+  if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) return cached.ok;
+  const probe = probeSchema(dbPath);
+  const ok = probe === 'schema' || probe === 'unknown';
+  schemaProbeCache.set(dbPath, { mtimeMs: st.mtimeMs, size: st.size, ok });
+  return ok;
+}
+
+/**
+ * What `codegraph.db` holds, asked of SQLite itself through a read-only
+ * connection: the codegraph schema, a database without it, not a database at
+ * all (SQLITE_NOTADB), or `unknown` — locked, busy, a WAL db in a directory we
+ * cannot create `-shm` in (read-only checkout, mount, another user's tree),
+ * disk I/O. Callers treat `unknown` as initialized: the pre-existing behaviour
+ * for a database we cannot inspect.
+ *
+ * The file is never read through a descriptor of our own, not even for its
+ * 16-byte header. Closing ANY descriptor on a database file drops every POSIX
+ * lock this process holds on it, including those of a connection it already
+ * has open (sqlite.org/howtocorrupt.html §2.2.1) — and the MCP server resolves
+ * projects through isInitialized on every call while it holds the index as
+ * its writer. SQLite's own connections share one lock table per file, so a
+ * second connection opened and closed here leaves the first one's locks alone.
+ */
+function probeSchema(dbPath: string): 'schema' | 'no-schema' | 'not-sqlite' | 'unknown' {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { DatabaseSync } = require('node:sqlite');
+  let db: any = null;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    const row = db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'nodes'").get();
+    return row !== undefined ? 'schema' : 'no-schema';
+  } catch (error) {
+    return (error as { errcode?: number })?.errcode === SQLITE_NOTADB ? 'not-sqlite' : 'unknown';
+  } finally {
+    // Never hold the handle: Windows file locking would block the owner.
+    try { db?.close(); } catch { /* already closed */ }
+  }
 }
 
 /**
@@ -771,11 +900,11 @@ function ensureGitignore(gitignorePath: string): boolean {
  */
 export function createDirectory(projectRoot: string): void {
   const codegraphDir = getCodeGraphDir(projectRoot);
-  const dbPath = path.join(codegraphDir, 'codegraph.db');
 
-  // Only throw if CodeGraph is actually initialized (db exists)
-  // .codegraph/ folder alone is fine
-  if (fs.existsSync(dbPath)) {
+  // Only throw if CodeGraph is actually initialized (db with a schema).
+  // .codegraph/ folder alone — or a schema-less codegraph.db left by an
+  // interrupted init (#1895) — is fine: initialize() adds the schema to it.
+  if (isInitialized(projectRoot)) {
     throw new Error(`CodeGraph already initialized in ${projectRoot}`);
   }
 

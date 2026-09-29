@@ -10,6 +10,8 @@
  * wasm fallback. When run from source instead, it requires Node >= 22.5.
  */
 
+import { toWslSharedIndexError } from './wsl-shared-index';
+
 export interface SqliteStatement {
   run(...params: any[]): { changes: number; lastInsertRowid: number | bigint };
   get(...params: any[]): any;
@@ -30,6 +32,8 @@ export interface SqliteDatabase {
   transaction<T>(fn: (...args: any[]) => T): (...args: any[]) => T;
   close(): void;
   readonly open: boolean;
+  /** Undefined on a runtime without `isTransaction`; callers must then not memoize. */
+  readonly inTransaction?: boolean;
 }
 
 /**
@@ -50,11 +54,29 @@ export type SqliteBackend = 'node-sqlite';
 class NodeSqliteAdapter implements SqliteDatabase {
   private _db: any;
   private _txDepth = 0;
+  private readonly _dbPath: string;
 
   constructor(dbPath: string, opts?: { readOnly?: boolean }) {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { DatabaseSync } = require('node:sqlite');
+    this._dbPath = dbPath;
     this._db = opts?.readOnly ? new DatabaseSync(dbPath, { readOnly: true }) : new DatabaseSync(dbPath);
+  }
+
+  /**
+   * What a failed call throws: the error itself, or — for a "disk I/O error"
+   * on a WSL index that Windows CodeGraph shares — the actionable rewrite
+   * (#995). Every open runs its PRAGMAs and first reads through the methods
+   * below, and so does every later query. `iterate()` is left raw: a
+   * row-by-row wrapper would tax the unbounded scans it exists for, and a
+   * session reads through `get`/`all` long before it reaches one.
+   */
+  private failure(err: unknown): unknown {
+    return toWslSharedIndexError(err, this._dbPath) ?? err;
+  }
+
+  get inTransaction(): boolean | undefined {
+    return this._db.isTransaction;
   }
 
   get open(): boolean {
@@ -65,20 +87,39 @@ class NodeSqliteAdapter implements SqliteDatabase {
     // node:sqlite matches better-sqlite3's calling convention (variadic
     // positional args, or a single object for @named params), so params forward
     // through unchanged.
-    const stmt = this._db.prepare(sql);
+    let stmt: any;
+    try {
+      stmt = this._db.prepare(sql);
+    } catch (err) {
+      throw this.failure(err);
+    }
+    const failure = (err: unknown): unknown => this.failure(err);
     return {
       run(...params: any[]) {
-        const r = stmt.run(...params);
+        let r: any;
+        try {
+          r = stmt.run(...params);
+        } catch (err) {
+          throw failure(err);
+        }
         return {
           changes: Number(r?.changes ?? 0),
           lastInsertRowid: r?.lastInsertRowid ?? 0,
         };
       },
       get(...params: any[]) {
-        return stmt.get(...params);
+        try {
+          return stmt.get(...params);
+        } catch (err) {
+          throw failure(err);
+        }
       },
       all(...params: any[]) {
-        return stmt.all(...params);
+        try {
+          return stmt.all(...params);
+        } catch (err) {
+          throw failure(err);
+        }
       },
       iterate(...params: any[]) {
         return stmt.iterate(...params);
@@ -87,7 +128,11 @@ class NodeSqliteAdapter implements SqliteDatabase {
   }
 
   exec(sql: string): void {
-    this._db.exec(sql);
+    try {
+      this._db.exec(sql);
+    } catch (err) {
+      throw this.failure(err);
+    }
   }
 
   pragma(str: string, options?: { simple?: boolean }): any {
@@ -95,12 +140,12 @@ class NodeSqliteAdapter implements SqliteDatabase {
     // Write pragma ("key = value"): node:sqlite is real SQLite, so every pragma
     // (WAL, mmap, synchronous, …) applies as-is.
     if (trimmed.includes('=')) {
-      this._db.exec(`PRAGMA ${trimmed}`);
+      this.exec(`PRAGMA ${trimmed}`);
       return;
     }
     // Read pragma. Default: the row object (e.g. { journal_mode: 'wal' }).
     // `{ simple: true }` returns just the single column value, like better-sqlite3.
-    const row = this._db.prepare(`PRAGMA ${trimmed}`).get();
+    const row = this.prepare(`PRAGMA ${trimmed}`).get();
     if (options?.simple) {
       return row && typeof row === 'object' ? Object.values(row)[0] : row;
     }
@@ -155,6 +200,9 @@ export function createDatabase(dbPath: string, opts?: { readOnly?: boolean }): {
   try {
     return { db: new NodeSqliteAdapter(dbPath, opts), backend: 'node-sqlite' };
   } catch (error) {
+    // node:sqlite loaded and SQLite itself failed — not a missing-module case.
+    const shared = toWslSharedIndexError(error, dbPath);
+    if (shared) throw shared;
     const msg = error instanceof Error ? error.message : String(error);
     throw new Error(
       'Failed to open SQLite via the built-in node:sqlite module.\n' +

@@ -56,6 +56,57 @@ source.
 > first, so the budget cap never binds it). OkHttp's interceptors stay a pure
 > signature skeleton (no named callable in them, don't define a supertype).
 
+> **Refinement (2026-09-28) — exact targets.** The per-symbol view above still
+> lost the one method the agent asked for by its qualified name. On a fresh django
+> index `SQLCompiler.as_sql pre_sql_setup get_select` returned `get_select` and
+> `pre_sql_setup` in full and `SQLCompiler.as_sql` — step 1 of the rendered Flow,
+> 226 lines — as its signature line, on main and on every branch since. Bodies
+> were chosen in SOURCE order within a tier, so the unnamed bridge
+> `get_qualify_sql` and `get_select` (both above `as_sql` in the file) took the
+> cap. The agents' follow-ups (`SQLCompiler.as_sql full body compiler.py:776`,
+> `compiler.py lines 900-1003 as_sql tail`) pinned the file but dropped the line
+> numbers, returning `SQLInsertCompiler.as_sql` and friends instead; every run
+> Read compiler.py. The fix:
+> 1. **Exact targets** — a qualified name that resolves to ≤3 callables
+>    (`SQLCompiler.as_sql`: 1 of 110), or the callable enclosing a line anchor
+>    (`compiler.py:776`). A bare `as_sql` is NOT exact, so the family rules above
+>    still keep the 110 overrides as signatures.
+> 2. **Tiers in the focused view:** exact → spine step the agent named → unnamed
+>    spine bridge → uniquely-named off-spine → family co-named; the spine in CALL
+>    order within its tier.
+> 3. **Window, never signature, for tiers 0–1.** A body too big for what is left
+>    is cut to its head plus the lines where it calls the question's other
+>    symbols, and each hole names the explore query that returns it
+>    (`codegraph_explore \`compiler.py:871-1001\``).
+> 4. **Line anchors** (`query-paths.ts`): `file:line`, `file:a-b`, `#La-Lb`, and
+>    prose `lines a-b` / `L a-L b` next to a path. A range renders as exactly that
+>    span (cluster path, ranked first).
+> 5. **Priced in rendered chars.** The view counted raw source while it rendered
+>    line numbers and ~20 signature lines; once windows fill the cap the
+>    undercount became a 19% overshoot that zeroed four excalidraw files below it.
+>
+> Deterministic replay (54 queries × 8 repos): 43 byte-identical; `as_sql`
+> complete in all 5 distinct django queries that single it out (was 1, 0, 175,
+> 0 and 226 of 226 lines), the `lines 900-1003` span 104/104 (was 1); named-body
+> lines 8,706 → 9,443. The trade: where the file's budget cannot hold everything, a large named
+> step now wins over several small off-spine bodies (`pb-compiler`: `as_sql` whole,
+> `execute_sql`/`results_iter` to signatures).
+>
+> Agent A/B (`ab-new-vs-baseline.sh`, django, README question pair, Sonnet /
+> `--effort high`, RUNS=3, baseline `e63fe2ec`): **Read 0 in 3/3 new runs vs a
+> Read of compiler.py in 2/3 baseline runs** — each right after the agent's own
+> `SQLCompiler.as_sql … compiler.py:776` explore, the exact follow-up the report
+> described. Tool calls 3 → 4 median, retrieval residual 19.5K vs 22.9K tokens,
+> median cost $0.195 vs $0.229 and 30s vs 35s (n=3, the last two within noise).
+>
+> Rebased onto #2062 (protected members paid before incidental ones across
+> clusters), which leaves this gap open — `as_sql` 1/226 on that main. The two
+> compose: #2062's protected/incidental rule is the cluster path's base, and
+> exact targets sit on top of it (ranked first, every member priced in rendered
+> chars, held back for lower exact clusters). Re-measured against that main, 59
+> queries: 43 byte-identical, named-body lines 9,804 → 10,731, every target span
+> above complete.
+
 ---
 
 ## TL;DR
@@ -260,8 +311,15 @@ the agent's real query — that mismatch is what this refinement corrects.)
     `definesPolymorphicSupertype()` (a node HAS ≥3 incoming `implements`/`extends`
     — i.e. the file is the family base). The skeleton branch:
     `off-spine && isPolymorphicSibling && !(namedInFile && !definesSupertype)`.
+    `exactNodeIds` / `anchorSpans` (the exact targets) and `bodyFocusLines()`
+    (what a window of an oversize body must reach) are shared by the focused
+    view and the cluster path.
+- `src/search/query-paths.ts` — `lineAnchors`: `file:line` / range parsing.
 - `__tests__/adaptive-explore-sizing.test.ts` — 7 cases incl. the named-callable
   spare (RealCall) and the supertype-family override (compiler.py).
+- `__tests__/explore-exact-target.test.ts` — the django shape in miniature:
+  qualified body whole, subclass overrides still signatures, blast-radius lead,
+  `file:line` and `lines a-b` anchors, and a windowed body keeping its tail call.
 
 ## Frontier / future work
 

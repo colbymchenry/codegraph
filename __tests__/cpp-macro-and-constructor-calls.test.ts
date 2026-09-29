@@ -503,3 +503,117 @@ describe('#1839 — local object initialization calls the constructor, not the t
     ]);
   });
 });
+
+/** Every outgoing edge of a function, as `edgeKind kind qualifiedName (file)`. */
+function edges(cg: CodeGraph, caller: string): string[] {
+  return cg
+    .getCallees(fn(cg, caller).id)
+    .map((r) => `${r.edge.kind} ${r.node.kind} ${r.node.qualifiedName} (${r.node.filePath})`)
+    .sort();
+}
+
+describe('#2069 — an #undef under an undecidable #if leaves a never-seen flag unknown', () => {
+  it.each(['c', 'cpp'] as const)('reproduction: the #ifdef branch after it stays possible (%s)', async (language) => {
+    const cg = await indexed({
+      'config.h': '#if FREE_THREADED == 0\n#undef FREE_THREADED\n#endif\n',
+      [`unit.${language}`]: [
+        '#include "config.h"',
+        '#ifdef FREE_THREADED',
+        'static int world_stopped(void) { return 0; }',
+        '#else',
+        '#define world_stopped() 1',
+        '#endif',
+        'int check(void) { return world_stopped(); }',
+        '',
+      ].join('\n'),
+    });
+    try {
+      expect(calls(cg, 'check')).toEqual([`function world_stopped (unit.${language})`]);
+    } finally {
+      cg.close();
+    }
+  });
+
+  it.each(['c', 'cpp'] as const)('control: an #undef on a certain line still makes the flag certainly undefined (%s)', async (language) => {
+    const cg = await indexed({
+      'config.h': '#undef TOP_LEVEL\n#if 1\n#undef TRUE_BRANCH\n#endif\n',
+      [`unit.${language}`]: [
+        '#include "config.h"',
+        '#ifdef TOP_LEVEL',
+        '#else',
+        '#define top_hook() 1',
+        '#endif',
+        '#ifdef TRUE_BRANCH',
+        '#else',
+        '#define branch_hook() 1',
+        '#endif',
+        'int use_top(void) { return top_hook(); }',
+        'int use_branch(void) { return branch_hook(); }',
+        '',
+      ].join('\n'),
+      [`decoy.${language}`]: 'int top_hook(void) { return 0; }\nint branch_hook(void) { return 0; }\n',
+    });
+    try {
+      expect(calls(cg, 'use_top')).toEqual([]);
+      expect(calls(cg, 'use_branch')).toEqual([]);
+    } finally {
+      cg.close();
+    }
+  });
+});
+
+describe('#2070 — a call through a function-like macro never binds to a same-named type', () => {
+  it.each(['c', 'cpp'] as const)('reproduction: PREFIX(scan)(x) reaches no struct PREFIX, in another file or an included header (%s)', async (language) => {
+    const cg = await indexed({
+      [`unit.${language}`]: [
+        '#ifdef TOK_IMPL',
+        '#define PREFIX(ident) ident',
+        '#endif',
+        'int tok(int x) { return PREFIX(scan)(x); }',
+        '',
+      ].join('\n'),
+      [`parser.${language}`]: 'struct PREFIX { int x; };\n',
+      'types.h': 'struct WRAP { int x; };\n',
+      [`wrapped.${language}`]: [
+        '#include "types.h"',
+        '#ifdef WRAP_IMPL',
+        '#define WRAP(ident) ident',
+        '#endif',
+        'int wrapped(int x) { return WRAP(scan)(x); }',
+        '',
+      ].join('\n'),
+    });
+    try {
+      expect(edges(cg, 'tok').filter((e) => e.includes('struct PREFIX'))).toEqual([]);
+      expect(edges(cg, 'wrapped').filter((e) => e.includes('struct WRAP'))).toEqual([]);
+    } finally {
+      cg.close();
+    }
+  });
+
+  it.each(['c', 'cpp'] as const)('control: a same-named function is still the callee when the macro may be off (%s)', async (language) => {
+    const cg = await indexed({
+      [`unit.${language}`]: '#ifdef FAST\n#define helper(x) (x)\n#endif\nint run(int x) { return helper(x); }\n',
+      [`lib.${language}`]: 'int helper(int x) { return x; }\n',
+      [`types.${language}`]: 'struct helper { int x; };\n',
+    });
+    try {
+      expect(edges(cg, 'run')).toEqual([`calls function helper (lib.${language})`]);
+    } finally {
+      cg.close();
+    }
+  });
+
+  it('control: a C++ type whose name is no macro is still constructed', async () => {
+    const cg = await indexed({
+      'widget.hpp': 'struct Widget { int x; };\n',
+      'use.cpp': '#include "widget.hpp"\nvoid make() { auto w = Widget(1); }\n',
+      'other.cpp': '#define OTHER(x) (x)\n',
+    });
+    try {
+      expect(edges(cg, 'make')).toEqual(['instantiates struct Widget (widget.hpp)']);
+    } finally {
+      cg.close();
+    }
+  });
+});

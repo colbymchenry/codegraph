@@ -123,3 +123,54 @@ describe('codegraph_explore — NL-stopword collision guard', () => {
     expect(files[0]).toMatch(/updater\.ts$/);
   });
 });
+
+describe('codegraph_explore — interface members never corroborate a bare word', () => {
+  let testDir: string;
+  let cg: CodeGraph;
+
+  afterEach(() => {
+    cg?.destroy();
+    if (testDir && fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('an options interface\'s `host` does not seed the same file\'s `main()` above the answer', async () => {
+    // vscode's agentHostServerMain.ts: `interface IServerOptions { readonly host… }`
+    // beside `function main()`. Once interface members were indexed (#1638),
+    // `host` in "extension host … main process" counted as a second query
+    // token named in that file, so the English word "main" seeded `main()` into
+    // the named-first tier and the file outranked the ones about the extension
+    // host itself.
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-iface-corroboration-'));
+    const src = path.join(testDir, 'src');
+    fs.mkdirSync(src, { recursive: true });
+    fs.writeFileSync(path.join(src, 'serverMain.ts'),
+      'interface IServerOptions {\n' +
+      '  readonly port: number;\n' +
+      '  readonly host: string | undefined;\n' +
+      '}\n\n' +
+      'export function main(options: IServerOptions): number {\n' +
+      '  return options.port;\n' +
+      '}\n');
+    fs.writeFileSync(path.join(src, 'extensionHostProcess.ts'),
+      'export class ExtensionHostConnection {\n' +
+      '  constructor(private readonly send: (msg: string) => void) {}\n' +
+      '  connectToMainProcess(): void {\n' +
+      "    this.send('hello');\n" +
+      '  }\n' +
+      '}\n\n' +
+      'export function startExtensionHostProcess(): ExtensionHostConnection {\n' +
+      '  const connection = new ExtensionHostConnection((msg) => console.log(msg));\n' +
+      '  connection.connectToMainProcess();\n' +
+      '  return connection;\n' +
+      '}\n');
+    for (let i = 1; i <= 12; i++) fs.writeFileSync(path.join(src, `noise${i}.ts`), `export const n${i} = ${i};\n`);
+    cg = CodeGraph.initSync(testDir);
+    await cg.indexAll();
+
+    const res = await new ToolHandler(cg).execute('codegraph_explore', {
+      query: 'how does the extension host talk to the main process',
+    });
+    const files = sourcedFiles(res.content[0].text as string);
+    expect(files[0]).toBe('src/extensionHostProcess.ts');
+  });
+});

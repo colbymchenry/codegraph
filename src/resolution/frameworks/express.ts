@@ -319,6 +319,8 @@ export const expressResolver: FrameworkResolver = {
     const files = context.getAllFiles().filter((f) => /\.(m?js|tsx?|cjs)$/.test(f));
     const mounts = new Map<string, Array<{ prefix: string; target: string }>>();
     for (const file of files) {
+      // Most files mount nothing: look for `.use(` before decoding the file.
+      if (context.fileContains && !context.fileContains(file, '.use(')) continue;
       const content = context.readFile(file);
       if (!content || !content.includes('.use(')) continue;
       const lang = detectLanguage(file);

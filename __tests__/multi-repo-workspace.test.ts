@@ -212,6 +212,8 @@ describe('multi-repo workspaces (#514) + .gitignore-respect default (#970, #976)
       expect(scope.ignores('src/app.ts')).toBe(false);
     });
 
+    // Indexes, then syncs, through git in two repositories; on a loaded Windows
+    // VM that exceeds the default 5s without anything being wrong (#1773).
     it('sync picks up a change inside an opted-in gitignored embedded repo', async () => {
       write(path.join(ws, 'packages/proj-a/src/auth.ts'), 'export function login() { return 1; }\n');
       makeRepo(path.join(ws, 'packages/proj-a'));
@@ -233,7 +235,7 @@ describe('multi-repo workspaces (#514) + .gitignore-respect default (#970, #976)
       } finally {
         cg.destroy();
       }
-    });
+    }, 60_000);
   });
 
   describe('discovery/classifier machinery (exercised under opt-in)', () => {
