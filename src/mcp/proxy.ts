@@ -30,6 +30,7 @@ import { CodeGraphPackageVersion } from './version';
 import { SERVER_INFO, PROTOCOL_VERSION, initializeInstructions } from './session';
 import { SERVER_INSTRUCTIONS } from './server-instructions';
 import { getStaticTools } from './tools';
+import { ErrorCodes } from './transport';
 import { ExploreSessionState } from './explore-session-state';
 import { getTelemetry, ClientInfo } from '../telemetry';
 import { installMainThreadWatchdog, WatchdogHandle } from './liveness-watchdog';
@@ -332,6 +333,12 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
         writeClient({ jsonrpc: '2.0', id: msg.id, result: { resourceTemplates: [] } });
       } else if (msg.method === 'prompts/list') {
         writeClient({ jsonrpc: '2.0', id: msg.id, result: { prompts: [] } });
+      } else if (msg.method === 'server/discover' && msg.id !== undefined) {
+        // Newer clients (Antigravity 2.5) probe this before `initialize` and wait
+        // for the answer. We don't implement it; Method-not-found is what sends
+        // them on to `initialize`. Answer locally — forwarded, it waited on the
+        // daemon connection and was lost if the client closed stdin first. (#2084)
+        writeClient({ jsonrpc: '2.0', id: msg.id, error: { code: ErrorCodes.MethodNotFound, message: 'Method not found: server/discover' } });
       } else {
         routeToDaemon(line);
       }
