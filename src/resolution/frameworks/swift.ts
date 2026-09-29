@@ -291,7 +291,24 @@ export const vaporResolver: FrameworkResolver = {
     return false;
   },
 
+  // A route's handler ref (`SearchController@show`, `@index`) names no declared
+  // symbol, so resolveOne's pre-filter would drop it before resolve() runs.
+  claimsReference(name: string): boolean {
+    return VAPOR_HANDLER.test(name);
+  },
+
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // Pattern 0: a route's handler — `use: SearchController.show` arrives as
+    // `SearchController@show`, `use: self.index` / `use: index` as `@index`.
+    // Resolved on the type the route names, never by the method's name alone:
+    // every controller has a `show`. No match, or two, is left unresolved.
+    const handler = VAPOR_HANDLER.exec(ref.referenceName);
+    if (handler) {
+      if (ref.language !== 'swift') return null;
+      const target = resolveVaporHandler(handler[1] ?? null, handler[2]!, ref, context);
+      return target ? { original: ref, targetNodeId: target, confidence: 0.9, resolvedBy: 'framework' } : null;
+    }
+
     // Pattern 1: Controller references
     if (ref.referenceName.endsWith('Controller')) {
       const result = resolveByNameAndKind(ref.referenceName, VAPOR_CONTROLLER_KINDS, VAPOR_CONTROLLER_DIRS, context);
@@ -378,6 +395,10 @@ export const vaporResolver: FrameworkResolver = {
     // be indexed as a route (groups `["req","get","foo.","bar"]`) where both
     // this pattern and the original match nothing.
     const routeRegex = /\b(\w+)\.(get|post|put|patch|delete|head|options)\s*\(\s*((?:[^,()]+,)*\s*)use:\s*([A-Za-z_][\w.]*)/g;
+    // `let todos = TodoController()` — what a `use: todos.index` receiver is.
+    const receiverTypes = new Map<string, string>();
+    const receiverRegex = /\b(?:let|var)\s+([a-z_]\w*)\s*(?::\s*([A-Z]\w*)\s*)?=\s*([A-Z][\w.]*)\s*\(/g;
+    while ((gm = receiverRegex.exec(safe)) !== null) receiverTypes.set(gm[1]!, gm[2] ?? gm[3]!);
     let match: RegExpExecArray | null;
     while ((match = routeRegex.exec(safe)) !== null) {
       const [, receiver, method, segsStr, handlerExpr] = match;
@@ -400,8 +421,7 @@ export const vaporResolver: FrameworkResolver = {
       };
       nodes.push(routeNode);
 
-      // Last segment of a dotted handler (self.list / UserController.list -> list)
-      const handlerName = handlerExpr!.split('.').pop();
+      const handlerName = vaporHandlerRef(handlerExpr!, receiverTypes);
       if (handlerName) {
         references.push({
           fromNodeId: routeNode.id,
@@ -429,6 +449,103 @@ const CELL_DIRS = ['/Cells/', '/Cell/', '/Views/', '/TableViewCells/', '/Collect
 const VAPOR_CONTROLLER_DIRS = ['/Controllers/', '/Controller/', '/Routes/'];
 const FLUENT_MODEL_DIRS = ['/Models/', '/Model/', '/Entities/', '/Database/'];
 const VAPOR_MIDDLEWARE_DIRS = ['/Middleware/', '/Middlewares/'];
+
+/** A Vapor route's handler ref: `Type@method` (the type may be dotted), or `@method`. */
+const VAPOR_HANDLER = /^((?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*)?@([A-Za-z_]\w*)$/;
+
+/**
+ * The handler ref for `use: <expr>`, keeping the type the method is on:
+ * `API.PackageController.get` → `API.PackageController@get`; `self.index` and
+ * a bare `index` → `@index` (the type the route is written in); `todos.index`
+ * → the type `todos` was made from, when the file says.
+ */
+function vaporHandlerRef(expr: string, receiverTypes: ReadonlyMap<string, string>): string | null {
+  const segs = expr.split('.').filter((s) => s.length > 0);
+  const method = segs.pop();
+  if (!method) return null;
+  if (segs[0] === 'self' || segs[0] === 'Self') segs.shift();
+  if (segs.length === 0) return `@${method}`;
+  if (/^[A-Z]/.test(segs[0]!)) return `${segs.join('.')}@${method}`;
+  const type = segs.length === 1 ? receiverTypes.get(segs[0]!) : undefined;
+  return type ? `${type}@${method}` : `@${method}`;
+}
+
+/**
+ * One type's method among `candidates`, or null when they belong to different
+ * types. Of a type's overloads, the one declared to take a `Request` — what
+ * Vapor calls a handler with — else the earliest.
+ */
+function oneOwnersMethod(candidates: Node[], ownerOf: (n: Node) => string, context: ResolutionContext): string | null {
+  if (candidates.length === 0) return null;
+  if (new Set(candidates.map(ownerOf)).size > 1) return null;
+  const earliest = (nodes: Node[]) => nodes.reduce((a, b) => (a.startLine <= b.startLine ? a : b)).id;
+  if (candidates.length === 1) return candidates[0]!.id;
+  const takesRequest = candidates.filter((n) => {
+    const lines = context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
+    const head = lines.slice(n.startLine - 1, Math.min(n.endLine, n.startLine + 2)).join(' ');
+    return /\(\s*(?:\w+\s+)?\w+\s*:\s*Request\b/.test(head);
+  });
+  return earliest(takesRequest.length > 0 ? takesRequest : candidates);
+}
+
+function resolveVaporHandler(typePath: string | null, method: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const callables = context
+    .getNodesByName(method)
+    .filter((n) => (n.kind === 'method' || n.kind === 'function') && n.language === 'swift');
+  if (callables.length === 0) return null;
+  const ownerOf = (n: Node): string => n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.length - method.length - 2));
+
+  if (typePath === null) {
+    // `use: self.index` / `use: index`: the type whose body holds the route —
+    // its own method in this file, else one declared in another extension of it.
+    const owner = context
+      .getNodesInFile(ref.filePath)
+      .filter((n) => SWIFT_TYPE_KINDS.has(n.kind) && n.startLine <= ref.line && n.endLine >= ref.line)
+      .reduce<Node | null>((inner, n) => (!inner || n.startLine >= inner.startLine ? n : inner), null);
+    if (!owner) {
+      // A route in a top-level `func routes(_ app:)` names a function in scope.
+      const functions = callables.filter((n) => n.kind === 'function');
+      const sameFile = functions.filter((n) => n.filePath === ref.filePath);
+      if (sameFile.length > 0) return oneOwnersMethod(sameFile, ownerOf, context);
+      return functions.length === 1 ? functions[0]!.id : null;
+    }
+    const own = callables.filter(
+      (n) => n.filePath === ref.filePath && n.startLine >= owner.startLine && n.endLine <= owner.endLine
+    );
+    if (own.length > 0) return oneOwnersMethod(own, ownerOf, context);
+    typePath = owner.qualifiedName.replace(/::/g, '.');
+  }
+
+  const segs = typePath.split('.');
+  const type = segs[segs.length - 1]!;
+  const full = segs.join('::');
+  const exact = callables.filter((n) => ownerOf(n) === full);
+  if (exact.length > 0) return oneOwnersMethod(exact, ownerOf, context);
+  const nested = callables.filter((n) => ownerOf(n).endsWith(`::${full}`));
+  if (nested.length > 0) return oneOwnersMethod(nested, ownerOf, context);
+  if (segs.length > 1) {
+    // `extension API.PackageController { static func get }` names its node by
+    // the last segment (`PackageController::get`) — the same QN a top-level
+    // `PackageController`'s method has, so the extension's own line decides.
+    const declared = new RegExp(String.raw`\bextension\s+${segs.join(String.raw`\s*\.\s*`)}\b`);
+    const inExtension = callables.filter((n) => {
+      if (ownerOf(n) !== type) return false;
+      const owner = context
+        .getNodesInFile(n.filePath)
+        .filter((o) => SWIFT_TYPE_KINDS.has(o.kind) && o.name === type && o.startLine <= n.startLine && o.endLine >= n.endLine)
+        .reduce<Node | null>((inner, o) => (!inner || o.startLine >= inner.startLine ? o : inner), null);
+      if (!owner) return false;
+      // The node starts at its attributes (`@available(…)`), the keyword a line or two on.
+      const head = (context.readFile(n.filePath)?.split(/\r?\n/) ?? []).slice(owner.startLine - 1, owner.startLine + 2).join(' ');
+      return declared.test(head);
+    });
+    return oneOwnersMethod(inExtension, ownerOf, context);
+  }
+  // A type named without the namespace it is nested in — only when one type fits.
+  return oneOwnersMethod(callables.filter((n) => ownerOf(n).endsWith(`::${type}`)), ownerOf, context);
+}
+
+const SWIFT_TYPE_KINDS = new Set(['class', 'struct', 'enum', 'protocol']);
 
 const VIEW_KINDS = new Set(['struct', 'component']);
 const CLASS_KINDS = new Set(['class']);
