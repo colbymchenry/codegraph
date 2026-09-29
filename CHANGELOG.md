@@ -160,6 +160,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A PHP call written without a receiver, such as `redirect($url)`, `view('books.show')`, `auth()` or `basename($path)`, is a function call, and no longer links to a same-named method, field or class elsewhere in the project. These wrong links showed up in callers, impact and `codegraph_explore` answers wherever a Laravel helper or PHP built-in shared its name with a project member. Re-index PHP projects after upgrading.
 - The Claude Code prompt hook no longer runs on the messages Claude Code uses to hand a subagent's report back to the main session. Before, such a long report could keep the hook busy past Claude Code's 30-second hook timeout and inject context unrelated to what you asked. Thanks @danusha2345, and @tippmar-nr for the report. (#2184)
 - Newer MCP clients such as Antigravity 2.5 connect again: the server now answers their `server/discover` probe right away with "method not found", so they go straight on to the regular handshake instead of waiting on a reply that could take seconds or never come. Thanks @danusha2345, and @samem26 for the report. (#2084)
+- A CodeGraph session that queried another project through `projectPath` no longer keeps that project locked for as long as it runs: after 10 minutes without a query it lets the project go, so the project's own session and `codegraph index` can take over again (tune with `CODEGRAPH_PROJECT_IDLE_TIMEOUT_MS`, `0` keeps it open). (#2087)
 
 ## [1.6.1] - 2026-09-29
 
