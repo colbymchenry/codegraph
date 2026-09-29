@@ -14,7 +14,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import CodeGraph from '../src';
-import type { QueryBuilder } from '../src/db/queries';
+import { QueryBuilder } from '../src/db/queries';
+import { DatabaseConnection, getDatabasePath } from '../src/db';
 
 /** A file whose functions call each other in a chain: `n` in-file call edges. */
 function chain(prefix: string, n: number): string {
@@ -104,6 +105,27 @@ describe('dominant file — computed once per index state (#1864)', () => {
       db.exec('ROLLBACK');
     }
     expect(q.getDominantFile()).toEqual(before);
+  });
+
+  it('forgets the answer when rebound to another connection (a pool worker following a rebuilt index)', async () => {
+    await setup();
+    const other = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-dominant-other-'));
+    const conns: DatabaseConnection[] = [];
+    try {
+      fs.mkdirSync(path.join(other, 'ext'));
+      fs.writeFileSync(path.join(other, 'ext', 'plugin.ts'), chain('pluginStep', 120));
+      (await CodeGraph.init(other, { index: true })).close();
+      conns.push(DatabaseConnection.open(getDatabasePath(dir)), DatabaseConnection.open(getDatabasePath(other)));
+      const q = new QueryBuilder(conns[0]!.getDb());
+      expect(q.getDominantFile()?.filePath).toBe('core/engine.ts');
+      // Two fresh connections to different databases can report the same
+      // change stamp, so only dropping the memo on rebind keeps this honest.
+      q.rebind(conns[1]!.getDb());
+      expect(q.getDominantFile()?.filePath).toBe('ext/plugin.ts');
+    } finally {
+      for (const c of conns) c.close();
+      fs.rmSync(other, { recursive: true, force: true });
+    }
   });
 
   it.runIf(process.platform !== 'win32')('sees a database rebuilt and reopened under it', async () => {
