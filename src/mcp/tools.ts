@@ -2752,8 +2752,7 @@ export class ToolHandler {
           }
           if (validation.unchecked.length) {
             lines.push(`Freshness could not be verified within the validation budget for ${validation.unchecked.length} files:`,
-              ...validation.unchecked.slice(0, 20).map(file => `- ${file}`));
-            if (validation.unchecked.length > 20) lines.push(`- … ${validation.unchecked.length - 20} more (narrow the query)`);
+              ...validation.unchecked.map(file => `- ${file}`));
           }
           lines.push('Retry after a successful codegraph sync, or narrow the query.');
           // Text only: Claude Code shows the model a result's structuredContent
