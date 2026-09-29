@@ -24,6 +24,7 @@ import {
 import { matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
+import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
@@ -446,6 +447,7 @@ export class ReferenceResolver {
       clearImportResolverMemos(this.context);
       clearNameMatcherMemos(this.context);
       clearCppMacroVisibility(this.context);
+      clearSwiftTypeVisibility(this.context);
     }
   }
 
@@ -724,6 +726,14 @@ export class ReferenceResolver {
               const target = this.nodeById(edge.target);
               if (target?.name && target.name !== typeName) supertypes.add(target.name);
             }
+            // A Swift conformance to a type the project only extends (SwiftUI's
+            // `View`) resolves to nothing — the extension is not the type — yet
+            // the members its extensions add are still the conformer's.
+            if (language === 'swift') {
+              for (const name of swiftExtendedConformances(tn, this.context)) {
+                if (name !== typeName) supertypes.add(name);
+              }
+            }
           }
           supers = [...supertypes];
         }
@@ -969,7 +979,9 @@ export class ReferenceResolver {
     // translation unit is a macro expansion, not a call — it must never bind
     // to a same-named function in another file (#1838).
     if (isVisibleCppMacro(ref, this.context)) return null;
-    const candidate = this.gateTargetKind(this.resolveOneInner(ref), ref);
+    // A Swift type reference never lands on an `extension X {}` node, nor on a
+    // nested type it cannot name bare (see ./swift-type-visibility).
+    const candidate = gateSwiftTypeTarget(this.gateTargetKind(this.resolveOneInner(ref), ref), ref, this.context);
     const resolved = candidate?.resolvedBy === 'framework'
       ? this.gateFrameworkLanguage(candidate, ref)
       : this.gateLanguage(candidate, ref);
