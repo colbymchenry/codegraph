@@ -139,7 +139,7 @@ describe('a degraded index refuses answers from changed files (#1959)', () => {
   );
 
   it('refuses rather than silently validating only the first 200 contributing files', async () => {
-    for (let i = 0; i < 201; i++) {
+    for (let i = 0; i < 230; i++) {
       fs.writeFileSync(path.join(root, `caller${i}.ts`),
         `import { alphaOnly } from './alpha'; export function caller${i}() { return alphaOnly(); }\n`);
     }
@@ -149,7 +149,10 @@ describe('a degraded index refuses answers from changed files (#1959)', () => {
     const result = await handler.execute('codegraph_impact', { symbol: 'alphaOnly' });
     expect(result.isError).toBeFalsy();
     expect(result.content[0].text).toContain('validation budget');
-    expect(result.content[0].text).toMatch(/validation budget for \d+ files/);
+    const text = result.content[0].text;
+    const total = Number(text.match(/validation budget for (\d+) files/)![1]);
+    // The text is the whole result, so it names every unchecked file.
+    expect(text.split('\n').filter(line => line.startsWith('- '))).toHaveLength(total);
     expect(result).not.toHaveProperty('structuredContent');
     expect(result.content[0].text).not.toContain('**Impact');
   });
