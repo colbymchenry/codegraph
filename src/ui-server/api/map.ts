@@ -37,6 +37,7 @@
 import type { CodeGraph } from '../../index';
 import type { EdgeKind, Language } from '../../types';
 import { isTestFile } from '../../search/query-utils';
+import { normalizePath } from '../../utils';
 import { badRequest } from './respond';
 import { UNCERTAIN_BELOW, toPosixPath, wireList, type WireList } from './wire';
 
@@ -210,7 +211,7 @@ export interface MapQuery {
 
 /** Strip a trailing slash and any leading `./`, so `src/` and `src` are one root. */
 export function normalizeRoot(raw: string | undefined): string {
-  let root = (raw ?? '').trim().replace(/\\/g, '/');
+  let root = normalizePath((raw ?? '').trim());
   while (root.startsWith('./')) root = root.slice(2);
   while (root.endsWith('/')) root = root.slice(0, -1);
   if (root === '.' || root === '/') return '';

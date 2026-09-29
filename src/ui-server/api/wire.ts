@@ -17,6 +17,7 @@
 
 import type { Edge, EdgeKind, Language, Node, NodeKind } from '../../types';
 import { isTestFile } from '../../search/query-utils';
+import { normalizePath } from '../../utils';
 
 // =============================================================================
 // Caps and thresholds
@@ -118,7 +119,7 @@ export interface WireNodeDetail extends WireNodeRef {
   lines: number;
 }
 
-const rel = (p: string): string => p.replace(/\\/g, '/');
+const rel = (p: string): string => normalizePath(p);
 
 export function toNodeRef(node: Node): WireNodeRef {
   const file = rel(node.filePath);

@@ -50,6 +50,7 @@ import { nextRouteForFile } from '../../resolution/frameworks/nextjs';
 import { splitRouteName } from './routes';
 import { HUB_THRESHOLD, UNCERTAIN_BELOW, toNodeRef, type WireNodeRef } from './wire';
 import { isTestPath } from '../../search/query-utils';
+import { normalizePath } from '../../utils';
 
 // =============================================================================
 // Wire shapes
@@ -311,7 +312,7 @@ export function crossing(from: Language, to: Language, meta: Record<string, unkn
 export const STORE_FILE = /(?:^|\/)(?:stores?|storage|state|slices?|reducers?)\/|\.(?:store|storage|slice|reducer)\.[cm]?[jt]sx?$/i;
 
 export function isStoreFile(file: string): boolean {
-  return STORE_FILE.test(file.replace(/\\/g, '/'));
+  return STORE_FILE.test(normalizePath(file));
 }
 
 /**
@@ -1646,5 +1647,5 @@ function hopInside(x: HopSite, y: HopSite): boolean {
 }
 
 function posix(p: string): string {
-  return p.replace(/\\/g, '/');
+  return normalizePath(p);
 }

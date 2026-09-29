@@ -587,6 +587,22 @@ describe('FileWatcher', () => {
       watcher.stop();
     });
 
+    it('drops root, parent and absolute paths before ignore matching', async () => {
+      const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
+      const watcher = newWatcher(syncFn);
+      watcher.start();
+      await watcher.waitUntilReady();
+      try {
+        for (const invalid of ['', '.', '..', '../outside.ts', path.join(testDir, 'src/index.ts')]) {
+          expect(() => __emitWatchEventForTests(testDir, invalid)).not.toThrow();
+        }
+        expect(watcher.getPendingFiles()).toEqual([]);
+        expect(syncFn).not.toHaveBeenCalled();
+      } finally {
+        watcher.stop();
+      }
+    });
+
     it('should ignore .codegraph directory changes', async () => {
       const syncFn = vi.fn().mockResolvedValue({ filesChanged: 0, durationMs: 0 });
       const watcher = newWatcher(syncFn, { debounceMs: 200 });

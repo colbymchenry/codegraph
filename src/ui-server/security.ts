@@ -240,9 +240,8 @@ export function resolveStaticAsset(rootDir: string, urlPath: string): string | n
 /**
  * Percent-decode a URL path and reject the encodings that only ever show up in
  * an attack: NUL (truncates a path in some syscalls), other C0 control bytes,
- * and backslashes (a separator on Windows, a legal filename character on POSIX
- * — treating it as a separator everywhere is the safe direction, and no built
- * asset name contains one).
+ * and backslashes (no built asset name contains one). This is only for raw
+ * URL paths; repository source paths have already been decoded by the caller.
  *
  * @returns the decoded path, or `null` if it is unusable.
  */
@@ -261,6 +260,8 @@ function decodePath(urlPath: string): string | null {
 /**
  * Resolve a project-relative source path to an absolute path that is safe to
  * read and hand to the browser.
+ * Accepts a pathname from the index or URLSearchParams, not an encoded URL:
+ * percent sequences in it are literal filename characters.
  *
  * This is the single read chokepoint for anything served OUT OF THE USER'S
  * REPOSITORY (as opposed to the viewer's own bundled assets). The JSON API
@@ -275,8 +276,10 @@ export function resolveProjectFile(projectRoot: string, relativePath: string): s
   if (typeof relativePath !== 'string' || relativePath.trim() === '') {
     throw new PathRefusalError('No file path was given.');
   }
-  const decoded = decodePath(relativePath);
-  if (decoded === null) {
+  // Do not URL-decode again: the index lookup and disk read must use the same
+  // pathname (e.g. foo%5cbar.ts must not read foo\bar.ts).
+  // eslint-disable-next-line no-control-regex -- rejecting raw control bytes IS the point
+  if (/[\x00-\x1f\x7f]/.test(relativePath) || (process.platform === 'win32' && relativePath.includes('\\'))) {
     throw new PathRefusalError(`Refusing to read an unusable path: ${relativePath}`);
   }
 
@@ -286,13 +289,13 @@ export function resolveProjectFile(projectRoot: string, relativePath: string): s
   const rootError = validateProjectPath(projectRoot);
   if (rootError) throw new PathRefusalError(rootError);
 
-  if (path.isAbsolute(decoded)) {
-    throw new PathRefusalError(`Refusing to read an absolute path: ${decoded}`);
+  if (path.isAbsolute(relativePath)) {
+    throw new PathRefusalError(`Refusing to read an absolute path: ${relativePath}`);
   }
 
-  const absolute = validatePathWithinRoot(projectRoot, decoded);
+  const absolute = validatePathWithinRoot(projectRoot, relativePath);
   if (!absolute) {
-    throw new PathRefusalError(`Refusing to read a path outside the project: ${decoded}`);
+    throw new PathRefusalError(`Refusing to read a path outside the project: ${relativePath}`);
   }
   return absolute;
 }

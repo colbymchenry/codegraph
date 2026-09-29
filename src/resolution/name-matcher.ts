@@ -4,6 +4,7 @@
  * Handles symbol name matching for reference resolution.
  */
 
+import { normalizePath } from '../utils';
 import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, isSupertypeTarget, CPP_DEFINE_SIGNATURE, isInheritanceRef, isImportableKind } from './types';
@@ -1670,7 +1671,7 @@ export function resolveMethodOnType(
     const ext = ref.language === 'kotlin' ? '.kt' : '.java';
     const fqnPath = preferredFqn.replace(/\./g, '/') + ext;
     const chosen = matches.find((m) => {
-      const fp = m.filePath.replace(/\\/g, '/');
+      const fp = normalizePath(m.filePath);
       return fp.endsWith(fqnPath) || fp.endsWith('/' + fqnPath);
     });
     if (chosen) {

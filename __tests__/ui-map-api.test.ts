@@ -265,7 +265,7 @@ describe('normalizeRoot', () => {
     expect(normalizeRoot('src')).toBe('src');
     expect(normalizeRoot('src/')).toBe('src');
     expect(normalizeRoot('./src')).toBe('src');
-    expect(normalizeRoot('src\\')).toBe('src');
+    expect(normalizeRoot('src\\')).toBe(process.platform === 'win32' ? 'src' : 'src\\');
   });
 
   it('treats the repository root as the empty string however it is written', () => {

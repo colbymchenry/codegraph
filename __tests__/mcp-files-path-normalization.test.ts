@@ -58,7 +58,7 @@ describe('codegraph_files path normalization', () => {
 
   // Root-ish filters: every shape an agent might guess for "whole project"
   // must list the same files as no filter at all.
-  for (const rootish of ['/', '.', './', '', '\\', '//', './/']) {
+  for (const rootish of ['/', '.', './', '', '//', './/', ...(process.platform === 'win32' ? ['\\'] : [])]) {
     it(`treats path=${JSON.stringify(rootish)} as project root`, async () => {
       const output = await listed(rootish);
       expect(output).toContain('src/index.ts');
@@ -92,7 +92,7 @@ describe('codegraph_files path normalization', () => {
     expect(output).not.toContain('tests/a.test.ts');
   });
 
-  it('normalizes Windows backslashes', async () => {
+  it.runIf(process.platform === 'win32')('normalizes Windows backslashes', async () => {
     const output = await listed('src\\components');
     expect(output).toContain('src/components/Button.ts');
     expect(output).not.toContain('src/index.ts');

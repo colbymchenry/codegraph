@@ -34,6 +34,7 @@
  * unresolved — an out-of-repo module is a visible boundary, never a guess.
  */
 
+import { normalizePath } from '../../utils';
 import * as path from 'path';
 import type { Node } from '../../types';
 import type { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
@@ -254,6 +255,6 @@ function joinDirs(base: string, rel: string): string {
 
 /** Normalize to the stored path shape: forward slashes, '.' for the root. */
 function normalizeRel(p: string): string {
-  const n = path.normalize(p).replace(/\\/g, '/').replace(/\/+$/, '');
+  const n = normalizePath(path.normalize(p)).replace(/\/+$/, '');
   return n === '' ? '.' : n;
 }

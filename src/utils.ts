@@ -224,11 +224,11 @@ export function clamp(value: number, min: number, max: number): number {
 }
 
 /**
- * Normalize a file path to use forward slashes.
- * Fixes Windows backslash paths so glob matching works consistently.
+ * Normalize native directory separators to forward slashes.
+ * On POSIX, backslashes are filename characters and must retain their identity.
  */
 export function normalizePath(filePath: string): string {
-  return filePath.replace(/\\/g, '/');
+  return process.platform === 'win32' ? filePath.replace(/\\/g, '/') : filePath;
 }
 
 /**

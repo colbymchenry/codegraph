@@ -74,6 +74,7 @@ import type { UiServerHandle } from '../ui-server';
 import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../graph/symbol-lookup';
 import type { Node, Edge } from '../types';
 import { isTestPath } from '../search/query-utils';
+import { normalizePath } from '../utils';
 
 // Decided once, before `--color`/`--no-color` are stripped from argv below
 // (#1281). Piped/redirected stdout, NO_COLOR, or --no-color -> plain output.
@@ -1665,7 +1666,7 @@ program
           args.includeCode = true;
         }
       } else if (name && (name.includes('/') || name.includes('\\'))) {
-        args.file = name.replace(/\\/g, '/');
+        args.file = normalizePath(name);
       } else if (name) {
         args.symbol = name;
         args.includeCode = true;
@@ -1823,7 +1824,7 @@ function normalizeIndexPath(filePath: string, projectPath: string): string {
   if (path.isAbsolute(f)) f = path.relative(projectPath, f);
   // Collapse `.`/`..` segments, then force forward slashes and drop a leading
   // `./` (path.normalize already strips it on POSIX; explicit for Windows).
-  f = path.normalize(f).replace(/\\/g, '/').replace(/^\.\//, '');
+  f = normalizePath(path.normalize(f)).replace(/^\.\//, '');
   return f;
 }
 

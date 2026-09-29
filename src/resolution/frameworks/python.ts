@@ -4,6 +4,7 @@
  * Handles Django, Flask, and FastAPI patterns.
  */
 
+import { normalizePath } from '../../utils';
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolutionContext, FrameworkExtractionResult } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
@@ -247,7 +248,7 @@ export const fastapiResolver: FrameworkResolver = {
     // `backend/app/main.py`): its manifest or its app object sits below the root.
     let looked = 0;
     for (const file of context.getAllFiles()) {
-      const norm = file.replace(/\\/g, '/');
+      const norm = normalizePath(file);
       const base = norm.slice(norm.lastIndexOf('/') + 1);
       if (base === 'requirements.txt' || base === 'pyproject.toml' || base === 'requirements-dev.txt') {
         const content = context.readFile(file);

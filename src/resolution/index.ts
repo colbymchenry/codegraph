@@ -35,7 +35,7 @@ import { loadProjectAliases, type AliasMap } from './path-aliases';
 import { loadGoModule, type GoModule } from './go-module';
 import { loadWorkspacePackages, type WorkspacePackages } from './workspace-packages';
 import { logDebug } from '../errors';
-import { lexicalPathWithinRoot } from '../utils';
+import { normalizePath, lexicalPathWithinRoot } from '../utils';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
 import { JS_BUILT_INS } from './js-builtins';
@@ -613,7 +613,7 @@ export class ReferenceResolver {
       fileExists: (filePath: string) => {
         // Check pre-built known files set first (O(1))
         if (this.knownFiles) {
-          const normalized = filePath.replace(/\\/g, '/');
+          const normalized = normalizePath(filePath);
           if (this.knownFiles.has(filePath) || this.knownFiles.has(normalized)) {
             return true;
           }
@@ -2541,14 +2541,14 @@ export class ReferenceResolver {
             (n.kind === 'class' || n.kind === 'interface') &&
             (n.language === 'cfml' || n.language === 'cfscript')
         );
-    const norm = (p: string): string => p.replace(/\\/g, '/').toLowerCase();
+    const norm = (p: string): string => normalizePath(p).toLowerCase();
 
     // Relative-path form: `../base`, `./base`, `sub/thing` — resolve against
     // the referencing file's directory and require an exact (case-insensitive)
     // file match.
     if (ref.referenceName.includes('/')) {
       const rel = ref.referenceName.replace(/\.cfc$/i, '');
-      const fromDir = ref.filePath.replace(/\\/g, '/').split('/').slice(0, -1);
+      const fromDir = normalizePath(ref.filePath).split('/').slice(0, -1);
       const parts = [...fromDir];
       for (const seg of rel.split('/')) {
         if (seg === '' || seg === '.') continue;
@@ -2578,7 +2578,7 @@ export class ReferenceResolver {
     let bestScore = 0;
     let tie = false;
     for (const cand of cfmlCandidates(className)) {
-      const dirs = cand.filePath.replace(/\\/g, '/').split('/').slice(0, -1);
+      const dirs = normalizePath(cand.filePath).split('/').slice(0, -1);
       // Count matching directory segments right-to-left: for
       // `coldbox.system.web.Controller` vs `system/web/Controller.cfc`,
       // `web` and `system` match, then the repo root ends the run → score 2.

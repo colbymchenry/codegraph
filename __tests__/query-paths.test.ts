@@ -65,6 +65,17 @@ describe('queryMightContainPaths — the cheap pre-gate', () => {
 });
 
 describe('extractQueryPaths — resolution and stripping', () => {
+  it.runIf(process.platform === 'win32')('recognizes native Windows separators', () => {
+    expect(extractQueryPaths('src\\lib\\chat-manager.ts', INDEX).pinnedFiles)
+      .toEqual(['src/lib/chat-manager.ts']);
+  });
+
+  it.runIf(process.platform !== 'win32')('does not split a backslash-bearing basename into a suffix', () => {
+    const files = ['src/foo\\chat-manager.ts', 'src/foo/chat-manager.ts'];
+    expect(extractQueryPaths(files[0]!, files).pinnedFiles).toEqual([files[0]]);
+    expect(extractQueryPaths('chat-manager', files).pinnedFiles).toEqual([files[1]]);
+  });
+
   it('resolves a bracketed SvelteKit path and strips it from the query', () => {
     const q = 'auto-scroll logic in src/routes/m/projects/[id]/runs/[runId]/+page.svelte — atBottom tracking';
     const out = extractQueryPaths(q, INDEX);

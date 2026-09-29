@@ -92,6 +92,7 @@ import path from 'path';
 import type CodeGraph from '../index';
 import type { Node, NodeKind } from '../types';
 import { isTestFile } from '../search/query-utils';
+import { normalizePath } from '../utils';
 
 // =============================================================================
 // Caps and defaults
@@ -739,7 +740,7 @@ export function isTestScope(qualifiedName: string): boolean {
 
 /** Code the repository carries rather than owns — see {@link VENDOR_SEGMENTS}. */
 export function isVendoredPath(filePath: string): boolean {
-  for (const segment of filePath.replace(/\\/g, '/').split('/')) {
+  for (const segment of normalizePath(filePath).split('/')) {
     if (VENDOR_SEGMENTS.has(segment.toLowerCase())) return true;
   }
   return false;

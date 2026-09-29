@@ -27,6 +27,7 @@
  * hundred guarded call sites resolve in tens of milliseconds.
  */
 
+import { normalizePath } from '../../utils';
 import * as fs from 'fs';
 import type CodeGraph from '../../index';
 import type { Edge, Node } from '../../types';
@@ -577,7 +578,7 @@ function mentionsOf(cg: CodeGraph, projectRoot: string, value: Node): Edge[] {
   const word = new RegExp(`(?<![\\w$.])${value.name.replace(/\$/g, '\\$')}(?![\\w$])`);
   for (const file of files.values()) {
     if (file.kind !== 'file') continue;
-    const found = findIndexedFile(cg, file.filePath.replace(/\\/g, '/'));
+    const found = findIndexedFile(cg, normalizePath(file.filePath));
     if (!found || hasDriftedOnDisk(projectRoot, found.storedPath, found.record)) continue;
     let text: string;
     try {
@@ -656,5 +657,5 @@ function complementary(a: string, b: string): boolean {
 }
 
 function toPosix(p: string): string {
-  return p.replace(/\\/g, '/');
+  return normalizePath(p);
 }

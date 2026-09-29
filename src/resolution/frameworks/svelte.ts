@@ -5,6 +5,7 @@
  * store auto-subscriptions, and SvelteKit route/module patterns.
  */
 
+import { normalizePath } from '../../utils';
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 
@@ -150,7 +151,7 @@ export const svelteResolver: FrameworkResolver = {
     const now = Date.now();
 
     // Detect SvelteKit route files
-    const fileName = filePath.split(/[/\\]/).pop() || '';
+    const fileName = normalizePath(filePath).split('/').pop() || '';
     const routeMatch = getSvelteKitRouteInfo(fileName);
 
     // Only a `+page.svelte` is a URL. A `+layout.svelte` and a `+error.svelte`
@@ -263,7 +264,7 @@ function getSvelteKitRouteInfo(fileName: string): string | null {
  */
 function filePathToSvelteKitRoute(filePath: string): string | null {
   // Normalize to forward slashes
-  const normalized = filePath.replace(/\\/g, '/');
+  const normalized = normalizePath(filePath);
 
   // Find the routes directory
   const routesIndex = normalized.indexOf('/routes/');

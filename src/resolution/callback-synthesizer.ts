@@ -37,6 +37,7 @@ import { svelteKitLinkEdges, svelteKitPageComponentEdges } from './sveltekit-syn
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { crossTierEdges, hasCrossTierPattern } from './tier-synthesizer';
 import { enclosingFn, makeLineAt } from './synth-utils';
+import { normalizePath } from '../utils';
 import { resolveImportPath } from './import-resolver';
 import { crossesCodeBoundary } from './name-matcher';
 
@@ -897,7 +898,7 @@ async function goCrossFileMethodContainsEdges(queries: QueryBuilder, onYield: Ma
   const seen = new Set<string>();
   const TYPE_KINDS = new Set<NodeKind>(['struct', 'class', 'interface', 'enum', 'type_alias']);
   const dirOf = (p: string): string => {
-    const i = p.replace(/\\/g, '/').lastIndexOf('/');
+    const i = normalizePath(p).lastIndexOf('/');
     return i >= 0 ? p.slice(0, i) : '';
   };
 
@@ -2555,7 +2556,7 @@ const VUEX_FANOUT_CAP = 120;
 /** A path segment (dir or filename stem) equals `seg` — `…/modules/user.js` has
  *  the segment `user` for namespace `user`. */
 function pathHasSegment(filePath: string, seg: string): boolean {
-  return new RegExp('[\\\\/]' + seg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '[\\\\/.]').test(filePath);
+  return new RegExp('/' + seg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '[/.]').test(normalizePath(filePath));
 }
 
 async function vuexDispatchEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {

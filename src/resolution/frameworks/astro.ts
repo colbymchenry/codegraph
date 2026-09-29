@@ -5,6 +5,7 @@
  * module imports, and Astro's `src/pages/` file-based routing.
  */
 
+import { normalizePath } from '../../utils';
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 
@@ -97,7 +98,7 @@ export const astroResolver: FrameworkResolver = {
     const now = Date.now();
 
     // Normalize to forward slashes
-    const normalized = filePath.replace(/\\/g, '/');
+    const normalized = normalizePath(filePath);
 
     // Astro file-based routing lives under src/pages/ — .astro files are
     // pages, .ts/.js files are API endpoints. (.md/.mdx pages exist too but
