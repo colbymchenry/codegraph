@@ -1431,6 +1431,84 @@ function dartHeadOf(decl: Node, context: ResolutionContext): { supers: string[];
   };
 }
 
+const CFML_CHAINS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
+
+/**
+ * Whether a bare CFML call written in a component can mean `method`: its own
+ * component's, or one of the components it `extends` (read from source — a
+ * dotted path matched against the indexed files by its longest suffix). A
+ * call in a `.cfm` template is not judged: a ColdBox view runs inside the
+ * renderer's scope. coldbox's `now()` — the built-in — went to a date
+ * helper's `now` 228 times; chained `.then()` calls arrive bare too, and keep
+ * their method.
+ */
+function isCfmlMethodInScope(method: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!/\.cfc$/i.test(ref.filePath) || !hasNoReceiverOnLine(ref, context)) return true;
+  return cfmlChain(ref.filePath, context).has(method.filePath);
+}
+
+/** A component file and every component file it extends. */
+function cfmlChain(file: string, context: ResolutionContext): Set<string> {
+  let memo = CFML_CHAINS.get(context);
+  if (!memo) CFML_CHAINS.set(context, (memo = new Map()));
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const chain = new Set<string>();
+  const queue = [file];
+  while (queue.length > 0 && chain.size < 30) {
+    const f = queue.shift()!;
+    if (chain.has(f)) continue;
+    chain.add(f);
+    const text = context.readFile(f) ?? '';
+    const head = text.slice(0, text.search(/\bfunction\b|<cffunction/i) >>> 0 || text.length);
+    const ext = /\bextends\s*=\s*["']?([\w.\/:-]+)["']?/i.exec(head)?.[1];
+    if (ext) queue.push(...cfmlComponentFiles(ext, f, context));
+  }
+  memo.set(file, chain);
+  return chain;
+}
+
+/** The indexed `.cfc` files a component path names: the same directory first, else the longest path suffix. */
+function cfmlComponentFiles(dotted: string, from: string, context: ResolutionContext): string[] {
+  const segments = dotted.replace(/\//g, '.').split('.').filter(Boolean);
+  const name = segments[segments.length - 1]!.toLowerCase();
+  const files = [...new Set(context.getNodesByLowerName(name)
+    .filter((n) => n.kind === 'class' && /\.cfc$/i.test(n.filePath))
+    .map((n) => n.filePath))];
+  if (files.length === 0) return [];
+  const dir = from.slice(0, from.lastIndexOf('/') + 1);
+  if (segments.length === 1) {
+    const local = files.filter((f) => f.slice(0, f.lastIndexOf('/') + 1) === dir);
+    return local.length > 0 ? local : files;
+  }
+  for (let take = segments.length; take >= 1; take--) {
+    const suffix = '/' + segments.slice(-take).join('/').toLowerCase() + '.cfc';
+    const hits = files.filter((f) => ('/' + f.toLowerCase()).endsWith(suffix));
+    if (hits.length > 0) return hits;
+  }
+  return files;
+}
+
+/**
+ * Whether a bare reference is receiver-less at its call site, name case
+ * aside: the name is not preceded by a `.` on its line (true when the line
+ * can't tell). An extractor that keeps one receiver level hands the later
+ * links of a chain (`newFuture(f).then(g)`) over bare.
+ */
+function hasNoReceiverOnLine(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return true;
+  const lower = line.toLowerCase();
+  const name = ref.referenceName.toLowerCase();
+  let start = -1;
+  if (lower.startsWith(name, ref.column)) start = ref.column;
+  else if (ref.column >= name.length && lower.startsWith(name, ref.column - name.length)) start = ref.column - name.length;
+  else start = lower.search(new RegExp(`(?<![\\w$])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\(`));
+  // Not on its line at all: a link of a chain written across lines.
+  if (start < 0) return false;
+  return !/\.\s*$/.test(line.slice(0, start));
+}
+
 const RUBY_ANCESTRY = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
 
 /**
@@ -1976,9 +2054,11 @@ export function matchByExactName(
   const dartBare = ref.language === 'dart' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName) && isReceiverLessDartCall(ref, context);
   const kotlinCall = ref.language === 'kotlin' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const rubyBare = ref.language === 'ruby' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*[?!]?$/.test(ref.referenceName);
+  const cfmlBare = (ref.language === 'cfml' || ref.language === 'cfscript') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
   const phpSelf = phpSelfReceiver(ref, context);
   const filtered = sameName.filter((n) =>
     !(rubyBare && n.kind === 'method' && !isRubyMethodInScope(n, ref, context)) &&
+    !(cfmlBare && n.kind === 'method' && !isCfmlMethodInScope(n, ref, context)) &&
     !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)) &&
     !(kotlinCall && !isKotlinTopLevelVisible(n, ref, context)) &&
     !(dartBare && isDartMember(n) && !isDartMethodInScope(n, ref, context)) &&
@@ -3096,6 +3176,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   DART_HIERARCHIES.delete(context);
   KOTLIN_FILE_SCOPES.delete(context);
   RUBY_ANCESTRY.delete(context);
+  CFML_CHAINS.delete(context);
   LUA_LOCALS.delete(context);
   PHP_FILE_SCOPES.delete(context);
   JAVA_STATIC_IMPORTS.delete(context);
@@ -4085,7 +4166,7 @@ export function matchMethodCall(
     // `node.loc` on a rubocop-ast node went to the one `loc` in the project
     // 1,201 times; lobsters' `value.to_s` to a short-id class's.
     if (targetMethods.length === 1 && !narrowed && targetMethods[0]!.language === ref.language &&
-        !(ref.language === 'ruby' && objectOrClass !== 'self' && objectOrClass !== 'self.class' &&
+        !(UNTYPED_RECEIVER_LANGUAGES.has(ref.language) && !/^(?:self|self\.class|this|super)$/i.test(objectOrClass!) &&
           !sharesReceiverWord(objectOrClass!, targetMethods[0]!))) {
       return {
         original: ref,
@@ -4888,12 +4969,27 @@ function hasParameterBinding(code: string, escapedName: string): boolean {
 /**
  * Split a camelCase or PascalCase string into words.
  */
-/** Whether a receiver's name and the owner of `method` have a word in common, case aside. */
+/**
+ * Languages whose receivers nothing types, where a unique method name alone
+ * is no evidence: CFML's `server.keyExists()` is the struct member function,
+ * not the one component method named `keyExists`.
+ */
+const UNTYPED_RECEIVER_LANGUAGES: ReadonlySet<string> = new Set(['ruby', 'cfml', 'cfscript']);
+
+/**
+ * Whether a receiver is named after the owner of `method`, case aside: the
+ * receiver's last segment is the owner's name (`cbsecurity` → CBSecurity), or
+ * they share a word (`web_push_request` → WebPushRequest, `executor1` →
+ * Executor).
+ */
 function sharesReceiverWord(receiver: string, method: Node): boolean {
   const cut = method.qualifiedName.lastIndexOf('::');
   if (cut < 0) return false;
-  const owner = new Set(splitCamelCase(method.qualifiedName.slice(0, cut)).map((w) => w.toLowerCase()));
-  return splitCamelCase(receiver).some((w) => owner.has(w.toLowerCase()));
+  const ownerQn = method.qualifiedName.slice(0, cut);
+  const flat = (w: string) => w.replace(/[^A-Za-z0-9]/g, '').replace(/\d+$/, '').toLowerCase();
+  if (flat(receiver.split('.').pop()!) === flat(ownerQn.split(/::|\./).pop()!)) return true;
+  const owner = new Set(splitCamelCase(ownerQn).map(flat));
+  return splitCamelCase(receiver).some((w) => owner.has(flat(w)));
 }
 
 function splitCamelCase(str: string): string[] {
@@ -5067,6 +5163,7 @@ export function matchFuzzy(
   const dartBare = ref.language === 'dart' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName) && isReceiverLessDartCall(ref, context);
   const kotlinCall = ref.language === 'kotlin' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const rubyBare = ref.language === 'ruby' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*[?!]?$/.test(ref.referenceName);
+  const cfmlBare = (ref.language === 'cfml' || ref.language === 'cfscript') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
   const phpSelf = phpSelfReceiver(ref, context);
   // Names are case-sensitive in every language but a handful: Rust's
   // `Bytes` is not the method `bytes`, Python's builtin `dir(…)` not a class
@@ -5084,6 +5181,7 @@ export function matchFuzzy(
     !(dartBare && isDartMember(n) && !isDartMethodInScope(n, ref, context)) &&
     !(kotlinCall && !isKotlinTopLevelVisible(n, ref, context)) &&
     !(rubyBare && n.kind === 'method' && !isRubyMethodInScope(n, ref, context)) &&
+    !(cfmlBare && n.kind === 'method' && !isCfmlMethodInScope(n, ref, context)) &&
     !(phpSelf && (n.kind !== 'method' || !isPhpMethodInScope(n, ref, phpSelf, context))))
     .filter((n) => (ref.referenceKind !== 'references' && ref.referenceKind !== 'function_ref') ||
       sameLanguageFamily(n.language, ref.language));
