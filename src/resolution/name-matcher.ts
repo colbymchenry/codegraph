@@ -1431,6 +1431,53 @@ function dartHeadOf(decl: Node, context: ResolutionContext): { supers: string[];
   };
 }
 
+const VB_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'field', 'enum_member', 'constant', 'variable']);
+
+/**
+ * What a VB.NET member access is written on, read at the call site: the
+ * extractor keeps a call's last name only, so `Me.CMB.Buttons.Add(x)` and
+ * `New System.Drawing.Size(1, 2)` arrive as bare `Add` / `Size`. Returns null
+ * for a genuinely bare name, `''` for a `With` block's `.Name`, else the
+ * text before the dot (`Me.CMB.Buttons`, `System.Drawing`).
+ */
+function vbReceiverOf(ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return null;
+  const lower = line.toLowerCase();
+  const name = ref.referenceName.toLowerCase();
+  let start = lower.startsWith(name, ref.column) ? ref.column : -1;
+  if (start < 0) {
+    const m = new RegExp(`(?<![\\w])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w])`).exec(lower);
+    start = m ? m.index : -1;
+  }
+  if (start < 0) return null;
+  const before = line.slice(0, start);
+  const dot = /([\w.()]*?)\s*\.\s*$/.exec(before);
+  if (!dot) return null;
+  // `GetService(Of TrayNotifierService).Notify()` — the type argument names the receiver.
+  const typeArg = /\(\s*Of\s+([\w.]+)\s*\)\s*\.\s*$/i.exec(before);
+  if (typeArg) return typeArg[1]!;
+  return dot[1]!.replace(/\([^()]*\)/g, '');
+}
+
+/**
+ * Whether a VB.NET member access can mean `n`: through `Me` / `MyBase` /
+ * `MyClass`, or through a name that is `n`'s own type or module
+ * (`Module1.Log()`, `Colors.Red`). Any other receiver has a type nothing here
+ * names — SCrawler's `New System.Drawing.Size(…)` went to a nested enum's
+ * `Size` case 713 times, its designer's `Controls.Add(…)` to a collection
+ * class's `Add` 547.
+ */
+function isVbMemberReachable(n: Node, receiver: string): boolean {
+  if (!VB_MEMBER_KINDS.has(n.kind)) return true;
+  const cut = n.qualifiedName.lastIndexOf('::');
+  if (cut < 0) return true;
+  const last = receiver.split('.').pop()!.toLowerCase();
+  if (/^(?:me|mybase|myclass)$/.test(last) && !receiver.includes('.')) return true;
+  const owner = n.qualifiedName.slice(0, cut).split(/::|\./).pop()!.toLowerCase();
+  return last !== '' && last === owner;
+}
+
 const CFML_CHAINS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
 
 /**
@@ -2055,8 +2102,11 @@ export function matchByExactName(
   const kotlinCall = ref.language === 'kotlin' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const rubyBare = ref.language === 'ruby' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*[?!]?$/.test(ref.referenceName);
   const cfmlBare = (ref.language === 'cfml' || ref.language === 'cfscript') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
+  const vbReceiver = ref.language === 'vbnet' && (ref.referenceKind === 'calls' || ref.referenceKind === 'instantiates') && /^\w+$/.test(ref.referenceName)
+    ? vbReceiverOf(ref, context) : null;
   const phpSelf = phpSelfReceiver(ref, context);
   const filtered = sameName.filter((n) =>
+    !(vbReceiver !== null && !isVbMemberReachable(n, vbReceiver)) &&
     !(rubyBare && n.kind === 'method' && !isRubyMethodInScope(n, ref, context)) &&
     !(cfmlBare && n.kind === 'method' && !isCfmlMethodInScope(n, ref, context)) &&
     !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)) &&
@@ -5164,6 +5214,8 @@ export function matchFuzzy(
   const kotlinCall = ref.language === 'kotlin' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const rubyBare = ref.language === 'ruby' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*[?!]?$/.test(ref.referenceName);
   const cfmlBare = (ref.language === 'cfml' || ref.language === 'cfscript') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
+  const vbReceiver = ref.language === 'vbnet' && (ref.referenceKind === 'calls' || ref.referenceKind === 'instantiates') && /^\w+$/.test(ref.referenceName)
+    ? vbReceiverOf(ref, context) : null;
   const phpSelf = phpSelfReceiver(ref, context);
   // Names are case-sensitive in every language but a handful: Rust's
   // `Bytes` is not the method `bytes`, Python's builtin `dir(…)` not a class
@@ -5182,6 +5234,7 @@ export function matchFuzzy(
     !(kotlinCall && !isKotlinTopLevelVisible(n, ref, context)) &&
     !(rubyBare && n.kind === 'method' && !isRubyMethodInScope(n, ref, context)) &&
     !(cfmlBare && n.kind === 'method' && !isCfmlMethodInScope(n, ref, context)) &&
+    !(vbReceiver !== null && !isVbMemberReachable(n, vbReceiver)) &&
     !(phpSelf && (n.kind !== 'method' || !isPhpMethodInScope(n, ref, phpSelf, context))))
     .filter((n) => (ref.referenceKind !== 'references' && ref.referenceKind !== 'function_ref') ||
       sameLanguageFamily(n.language, ref.language));
