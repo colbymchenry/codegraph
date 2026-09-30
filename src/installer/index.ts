@@ -3,8 +3,8 @@
  *
  * Multi-target: writes MCP server config + instructions for the
  * agents the user picks (Claude Code, Cursor, Codex CLI, opencode,
- * Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, and GitHub
- * Copilot in VS Code / the Copilot CLI / JetBrains IDEs).
+ * Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, GitHub Copilot in
+ * VS Code / the Copilot CLI / JetBrains IDEs, and Pi).
  * Defaults to the Claude-only behavior for backwards compatibility
  * when no targets are explicitly chosen and nothing else is detected.
  *
