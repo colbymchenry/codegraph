@@ -1248,6 +1248,136 @@ function javaStaticImportsOf(filePath: string, context: ResolutionContext): { ow
   return found;
 }
 
+const PHP_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'trait', 'interface', 'enum']);
+const PHP_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
+
+/**
+ * How a bare PHP method name was written at its call site: `$this->m()` /
+ * `self::m()` / `static::m()` are the enclosing class's own (or inherited)
+ * methods, `parent::m()` an ancestor's; null for anything else.
+ */
+function phpSelfReceiver(ref: UnresolvedRef, context: ResolutionContext): 'self' | 'parent' | null {
+  if (ref.language !== 'php' || ref.referenceKind !== 'calls' || !/^\w+$/.test(ref.referenceName)) return null;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (!line) return null;
+  const name = ref.referenceName;
+  if (new RegExp(String.raw`\$this\s*\??->\s*${name}\s*\(|\b(?:self|static)\s*::\s*${name}\s*\(`).test(line)) return 'self';
+  if (new RegExp(String.raw`\bparent\s*::\s*${name}\s*\(`).test(line)) return 'parent';
+  return null;
+}
+
+/**
+ * Whether `method` belongs to the class the call is written in, one it
+ * extends, or a trait any of them uses — read from source, since the
+ * resolver's supertype edges don't exist yet on the first pass, and resolved
+ * the way PHP resolves a class name: through the file's `namespace` and `use`
+ * imports (aliases included) to one fully qualified class. A parent outside
+ * the repository (PHPUnit's TestCase, Orchestra's) ends the chain. Drupal's
+ * `$this->assertEquals()` is PHPUnit's; it went to the one in-repo
+ * `assertEquals`, a comparator's, 8,832 times.
+ */
+function isPhpMethodInScope(method: Node, ref: UnresolvedRef, via: 'self' | 'parent', context: ResolutionContext): boolean {
+  const cut = method.qualifiedName.lastIndexOf('::');
+  if (cut < 0) return true;
+  const ownerQn = method.qualifiedName.slice(0, cut);
+  const enclosing = context
+    .getNodesInFile(ref.filePath)
+    .filter((n) => PHP_TYPE_KINDS.has(n.kind) && n.startLine <= ref.line && n.endLine >= ref.line)
+    .sort((a, b) => b.startLine - a.startLine)[0];
+  // Inside a trait, `$this` is whichever class uses it: Laravel's
+  // ValidatesAttributes calls the Validator's `getValue()`.
+  if (!enclosing || enclosing.kind === 'trait') return true;
+  const up = phpAncestry(via === 'parent' ? phpSupertypeQns(enclosing, context) : [enclosing.qualifiedName], context);
+  if (up.qns.has(ownerQn)) return true;
+  // A base class may call what a subclass defines (BookStack's Entity calls
+  // `$this->chapter()`, a Page method): the owner descends from the caller.
+  if (via === 'self' && phpAncestry([ownerQn], context).qns.has(enclosing.qualifiedName)) return true;
+  // Past an ancestor outside the repository (Orchestra's TestCase) that
+  // ancestor's members are unseen — the repository's traits it uses among
+  // them. A trait's method may still be the one meant; an unrelated class's
+  // (Drupal's comparator `assertEquals`) never is.
+  return up.leavesRepo && context.getNodesByQualifiedName(ownerQn).some((d) => d.kind === 'trait');
+}
+
+/** Every type `start` reaches through `extends` and trait `use`, and whether it left the repository on the way. */
+function phpAncestry(start: readonly string[], context: ResolutionContext): { qns: Set<string>; leavesRepo: boolean } {
+  const qns = new Set<string>();
+  const queue = [...start];
+  let leavesRepo = false;
+  while (queue.length > 0 && qns.size < 80) {
+    const qn = queue.shift()!;
+    if (qns.has(qn)) continue;
+    qns.add(qn);
+    const decls = context.getNodesByQualifiedName(qn).filter((d) => d.language === 'php' && PHP_TYPE_KINDS.has(d.kind));
+    if (decls.length === 0) leavesRepo = true;
+    for (const decl of decls) queue.push(...phpSupertypeQns(decl, context));
+  }
+  return { qns, leavesRepo };
+}
+
+const PHP_FILE_SCOPES = new WeakMap<ResolutionContext, Map<string, { namespace: string; uses: Map<string, string> }>>();
+
+/** A PHP file's `namespace` and its `use A\B\C [as D];` imports, alias → fully qualified name. */
+function phpFileScope(file: string, context: ResolutionContext): { namespace: string; uses: Map<string, string> } {
+  let memo = PHP_FILE_SCOPES.get(context);
+  if (!memo) PHP_FILE_SCOPES.set(context, (memo = new Map()));
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const text = context.readFile(file) ?? '';
+  const namespace = /^\s*namespace\s+([\w\\]+)\s*[;{]/m.exec(text)?.[1] ?? '';
+  const uses = new Map<string, string>();
+  // File-level imports sit before the first type; a trait `use` inside a class body is not one.
+  const header = text.slice(0, text.search(/^\s*(?:(?:abstract|final|readonly)\s+)*(?:class|trait|interface|enum)\s/m) >>> 0 || text.length);
+  for (const m of header.matchAll(/^\s*use\s+(?:function\s+|const\s+)?([\w\\]+)(?:\s+as\s+(\w+))?\s*;/gm)) {
+    const fqn = m[1]!.replace(/^\\/, '');
+    uses.set(m[2] ?? fqn.split('\\').pop()!, fqn);
+  }
+  const scope = { namespace, uses };
+  memo.set(file, scope);
+  return scope;
+}
+
+/** The qualified name (`A\B::C`) a PHP class name written in `file` refers to. */
+function phpTypeQn(name: string, file: string, context: ResolutionContext): string {
+  let fqn: string;
+  if (name.startsWith('\\')) fqn = name.slice(1);
+  else {
+    const { namespace, uses } = phpFileScope(file, context);
+    const [head, ...rest] = name.split('\\');
+    const imported = uses.get(head!);
+    fqn = imported ? [imported, ...rest].join('\\') : namespace ? `${namespace}\\${name}` : name;
+  }
+  const at = fqn.lastIndexOf('\\');
+  return at < 0 ? fqn : `${fqn.slice(0, at)}::${fqn.slice(at + 1)}`;
+}
+
+/** The qualified names a PHP class or trait extends and the traits it uses. */
+function phpSupertypeQns(decl: Node, context: ResolutionContext): string[] {
+  let memo = PHP_SUPERS.get(context);
+  if (!memo) {
+    memo = new Map();
+    PHP_SUPERS.set(context, memo);
+  }
+  const hit = memo.get(decl.id);
+  if (hit) return hit;
+  const names: string[] = [];
+  const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+  const head = lines.slice(decl.startLine - 1, decl.startLine + 4).join(' ');
+  const extended = /\bextends\s+([^{]*?)(?:\bimplements\b|\{)/.exec(head)?.[1] ?? '';
+  for (const m of extended.matchAll(/(\\?[A-Za-z_][\w\\]*)/g)) names.push(m[1]!);
+  // `use StringTranslationTrait, MessengerTrait;` at the top of the body —
+  // one per line or one list across several (Laravel's Command, Model).
+  const bodyLines = lines.slice(decl.startLine, Math.min(decl.endLine, decl.startLine + 80));
+  const firstFunction = bodyLines.findIndex((l) => /\bfunction\b/.test(l));
+  const body = bodyLines.slice(0, firstFunction < 0 ? bodyLines.length : firstFunction).join('\n');
+  for (const used of body.matchAll(/^\s*use\s+([\w\\,\s]+?)\s*[;{]/gm)) {
+    for (const t of used[1]!.split(',')) if (t.trim()) names.push(t.trim());
+  }
+  const qns = names.map((n) => phpTypeQn(n, decl.filePath, context));
+  memo.set(decl.id, qns);
+  return qns;
+}
+
 /** Names the Rust prelude puts in every module; a project item of the same name needs a `use` to shadow one. */
 const RUST_PRELUDE = new Set([
   'Ok', 'Err', 'Some', 'None', 'Result', 'Option', 'Box', 'Vec', 'String', 'Default', 'Drop', 'Iterator',
@@ -1545,8 +1675,10 @@ export function matchByExactName(
   const rustBare = ref.language === 'rust' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
   const pythonShape = pythonCallShape(ref, context);
   const javaBare = ref.language === 'java' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
+  const phpSelf = phpSelfReceiver(ref, context);
   const candidates = sameName.filter((n) =>
     !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)) &&
+    !(phpSelf && (n.kind !== 'method' || !isPhpMethodInScope(n, ref, phpSelf, context))) &&
     !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)) &&
     !(rustBare && !isRustNameInScope(n, ref, context)) &&
     !(cMacroCall && n.kind !== 'function' && n.kind !== 'method') &&
@@ -2654,6 +2786,8 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   RUST_USES.delete(context);
   LEXICAL_SCOPE_MEMO.delete(context);
   JAVA_SUPERS.delete(context);
+  PHP_SUPERS.delete(context);
+  PHP_FILE_SCOPES.delete(context);
   JAVA_STATIC_IMPORTS.delete(context);
   PY_IMPORTS.delete(context);
   PY_MODULE_LOCAL.delete(context);
@@ -4605,6 +4739,7 @@ export function matchFuzzy(
   const rustBare = ref.language === 'rust' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
   const pythonShape = pythonCallShape(ref, context);
   const javaBare = ref.language === 'java' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
+  const phpSelf = phpSelfReceiver(ref, context);
   // Names are case-sensitive in every language but a handful: Rust's
   // `Bytes` is not the method `bytes`, Python's builtin `dir(…)` not a class
   // `Dir`, halo's `type RsbuildConfig` not its local `rsbuildConfig`, a Java
@@ -4617,7 +4752,8 @@ export function matchFuzzy(
     !(rustBare && !isRustNameInScope(n, ref, context)) &&
     !(!CASE_INSENSITIVE_LANGUAGES.has(ref.language) && n.name !== ref.referenceName) &&
     !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)) &&
-    !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)))
+    !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)) &&
+    !(phpSelf && (n.kind !== 'method' || !isPhpMethodInScope(n, ref, phpSelf, context))))
     .filter((n) => (ref.referenceKind !== 'references' && ref.referenceKind !== 'function_ref') ||
       sameLanguageFamily(n.language, ref.language));
 
