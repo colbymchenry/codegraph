@@ -1477,8 +1477,12 @@ function pythonCallShape(ref: UnresolvedRef, context: ResolutionContext): Python
 function fitsPythonCallShape(n: Node, shape: PythonCallShape, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (shape.kind === 'bare') {
     if (n.kind === 'method') return false;
+    if (n.filePath === ref.filePath) return true;
     // `from django.shortcuts import render`: the call is the package's.
-    return !(n.filePath !== ref.filePath && isPythonNameImportedFromOutside(ref.referenceName, ref, context));
+    if (isPythonNameImportedFromOutside(ref.referenceName, ref, context)) return false;
+    // `view = UserView.as_view()` … `view(request)`: the file's own value —
+    // unless it is a pytest fixture, which a test takes as a parameter of that name.
+    return isPytestFixture(n) || !isPythonLocallyBound(ref.referenceName, ref, context);
   }
   // A member of what the chain names: a method of a class of that name, or a
   // function / class in a module of that name (`helpers.slugify()`).
@@ -1492,6 +1496,62 @@ function fitsPythonCallShape(n: Node, shape: PythonCallShape, ref: UnresolvedRef
   const parts = n.filePath.split('/');
   const stem = parts[parts.length - 1]!.replace(/\.pyi?$/, '');
   return stem === shape.owner || (stem === '__init__' && parts[parts.length - 2] === shape.owner);
+}
+
+/** A pytest fixture: `@pytest.fixture` / `@fixture`, or anything a `conftest.py` defines. */
+function isPytestFixture(n: Node): boolean {
+  return /(?:^|\/)conftest\.py$/.test(n.filePath) || (n.decorators ?? []).some((d) => /(?:^|\.)fixture\b/.test(d));
+}
+
+const PY_LOCAL_BINDS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * Whether the function around a Python call — or its module, at top level —
+ * binds `name` itself: an assignment (`view = X.as_view()`, `a, view = …`,
+ * `view: T = …`), a parameter, a `for` / `with … as` / `except … as` target.
+ * DRF's tests write `view = SomeView.as_view()` then `view(request)`, and
+ * every such call went to one test file's `def view`.
+ */
+function isPythonLocallyBound(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const fn = context.getNodesInFile(ref.filePath)
+    .filter((f) => (f.kind === 'function' || f.kind === 'method') && f.startLine <= ref.line && f.endLine >= ref.line)
+    .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
+  let memo = PY_LOCAL_BINDS.get(context);
+  if (!memo) PY_LOCAL_BINDS.set(context, (memo = new Map()));
+  const key = `${ref.filePath}\0${fn?.id ?? ''}\0${name}\0${fn ? '' : ref.line}`;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  // An imported name is the import's (the import resolver's to follow).
+  if (pythonFromImports(ref.filePath, context).has(name)) {
+    memo.set(key, false);
+    return false;
+  }
+  // Code only: `{% user_display user as user_display %}` in a docstring binds nothing.
+  const lines = stripCommentsForRegex(context.readFile(ref.filePath) ?? '', 'python').split(/\r?\n/);
+  const n = name;
+  const assigns = new RegExp(`^\\s*(?:[\\w\\s,*()\\[\\]]*,\\s*)?\\(?\\*?${n}\\)?\\s*(?:,[\\w\\s,*()\\[\\]]*)?(?::[^=]+)?=(?!=)`);
+  const targets = new RegExp(`\\bfor\\s+[\\w\\s,()]*\\b${n}\\b[\\w\\s,()]*\\s+in\\b|\\bas\\s+${n}\\b`);
+  const params = new RegExp(`[(,]\\s*\\*{0,2}${n}\\s*(?:[:=,)]|$)`);
+  let bound = false;
+  if (fn) {
+    // The signature up to its `:` (it may span lines), then the body above the call.
+    let i = fn.startLine - 1;
+    let signature = '';
+    for (; i < Math.min(lines.length, fn.startLine + 20); i++) {
+      signature += lines[i] ?? '';
+      if (/\)\s*(?:->[^:]*)?:\s*(?:#.*)?$/.test(lines[i] ?? '')) break;
+    }
+    bound = params.test(signature.replace(/^[^(]*/, ''));
+    for (let line = i + 1; !bound && line < ref.line - 1; line++) {
+      const text = lines[line] ?? '';
+      bound = assigns.test(text) || targets.test(text);
+    }
+  }
+  // A module-level binding (`view = api_view(['GET'])(handler)`).
+  const top = new RegExp(`^(?:[\\w,\\s]*,\\s*)?${n}\\s*(?:,[\\w\\s,]*)?(?::[^=]+)?=(?!=)`);
+  for (let line = 0; !bound && line < lines.length; line++) bound = top.test(lines[line] ?? '');
+  memo.set(key, bound);
+  return bound;
 }
 
 const PY_IMPORTS = new WeakMap<ResolutionContext, Map<string, Map<string, string>>>();
@@ -4974,6 +5034,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   LUA_LOCALS.delete(context);
   LUA_MEMBERS.delete(context);
   JVM_PACKAGES.delete(context);
+  PY_LOCAL_BINDS.delete(context);
   PHP_FILE_SCOPES.delete(context);
   JAVA_STATIC_IMPORTS.delete(context);
   PY_IMPORTS.delete(context);
