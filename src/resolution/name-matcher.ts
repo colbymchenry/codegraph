@@ -944,7 +944,7 @@ const JS_FAMILY = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx', 'vu
 const JS_TS = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx']);
 
 /** Languages whose identifiers resolve regardless of case. */
-const CASE_INSENSITIVE_LANGUAGES = new Set<string>(['php', 'pascal', 'cfml', 'cfscript', 'cfquery', 'cobol', 'vbnet']);
+export const CASE_INSENSITIVE_LANGUAGES = new Set<string>(['php', 'pascal', 'cfml', 'cfscript', 'cfquery', 'cobol', 'vbnet']);
 
 /**
  * Whether a JS/TS `calls` ref is a RECEIVER-LESS call — `serialize(x)`, not
@@ -999,8 +999,9 @@ function isBarePhpCall(ref: UnresolvedRef, context: ResolutionContext): boolean 
   if (!CALL_OPENER.test(line)) return false;
   let end = at;
   while (end > 0 && WHITESPACE.test(line[end - 1]!)) end--;
-  // `$obj->name(` / `Foo::name(` / `$obj?->name(`, should a column ever land on the name.
-  return !(end > 0 && (line[end - 1] === '>' || line[end - 1] === ':'));
+  // `$obj->name(` / `Foo::name(` / `$obj?->name(`, should a column ever land on
+  // the name — but not `'size' => filesize($zip)` or `$x ? a : name()`.
+  return !(end > 1 && ((line[end - 1] === '>' && line[end - 2] === '-') || (line[end - 1] === ':' && line[end - 2] === ':')));
 }
 
 function isReceiverLessCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
@@ -4611,6 +4612,8 @@ export function matchFuzzy(
   // resolve a name without regard to case, which is what this fallback's
   // lowercase index is for.
   const callableCandidates = candidates.filter((n) => callableKinds.has(n.kind) && !(typeRef && !canNameInTypePosition(n)) &&
+    // `new …MockData()` makes an instance of a type; a method is never what it names.
+    !(ref.referenceKind === 'instantiates' && n.kind === 'method') &&
     !(rustBare && !isRustNameInScope(n, ref, context)) &&
     !(!CASE_INSENSITIVE_LANGUAGES.has(ref.language) && n.name !== ref.referenceName) &&
     !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)) &&

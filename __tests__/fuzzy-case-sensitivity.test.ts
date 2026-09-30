@@ -66,4 +66,45 @@ public class ParserTest {
       cg.close();
     }
   });
+
+  it('PHP still resolves a function whatever case the call is written in', async () => {
+    const cg = await project({
+      'src/helpers.php': `<?php
+function FormatPrice($amount) { return $amount; }
+`,
+      'src/view.php': `<?php
+function render() { return formatprice(10); }
+`,
+    });
+    try {
+      expect(targetsFrom(cg, 'src/view.php')).toContain('function:FormatPrice');
+    } finally {
+      cg.close();
+    }
+  });
+
+  it('PHP: a call written after `=>` in an array is a function call, not some class’s method', async () => {
+    const cg = await project({
+      'app/CommentTree.php': `<?php
+class CommentTree {
+  public function count(): int { return 0; }
+}
+`,
+      'app/helpers.php': `<?php
+function user() { return null; }
+`,
+      'app/Controller.php': `<?php
+function summary($items) {
+  return ['total' => count($items), 'by' => user()];
+}
+`,
+    });
+    try {
+      const targets = targetsFrom(cg, 'app/Controller.php');
+      expect(targets).not.toContain('method:count');
+      expect(targets).toContain('function:user');
+    } finally {
+      cg.close();
+    }
+  });
 });

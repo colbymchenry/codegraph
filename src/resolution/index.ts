@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope } from './name-matcher';
+import { matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope, CASE_INSENSITIVE_LANGUAGES } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
@@ -445,6 +445,7 @@ export class ReferenceResolver {
     this.fileExistsMemo.clear();
     this.manifestScopes.clear();
     this.knownNames = null;
+    this.knownLowerNames = null;
     this.knownFiles = null;
     this.cachesWarmed = false;
     // The import-resolver's and name-matcher's per-context memos assume the
@@ -884,6 +885,21 @@ export class ReferenceResolver {
     };
   }
 
+  /** Lowercased `knownNames`, built the first time a case-insensitive language asks. */
+  private knownLowerNames: Set<string> | null = null;
+
+  /** `hasAnyPossibleMatch` for a language whose names ignore case: the name, or any `.`/`::`/`->` part of it. */
+  private hasAnyPossibleMatchIgnoringCase(name: string): boolean {
+    if (!this.knownNames) return true;
+    if (!this.knownLowerNames || this.knownLowerNames.size === 0) {
+      this.knownLowerNames = new Set();
+      for (const known of this.knownNames) this.knownLowerNames.add(known.toLowerCase());
+    }
+    const lower = name.toLowerCase();
+    if (this.knownLowerNames.has(lower)) return true;
+    return lower.split(/::|->|\./).some((part) => part.length > 0 && this.knownLowerNames!.has(part));
+  }
+
   /**
    * Check if a reference name has any possible match in the codebase.
    * Uses the pre-built knownNames set to skip expensive resolution
@@ -1070,6 +1086,9 @@ export class ReferenceResolver {
     const preFilterPass =
       isNixPathImportRef(ref) ||
       this.hasAnyPossibleMatch(existenceName) ||
+      // PHP, Pascal, CFML, COBOL and VB.NET names ignore case: `formatprice()`
+      // calls `FormatPrice`, which the exact-name set never lists.
+      (CASE_INSENSITIVE_LANGUAGES.has(ref.language) && this.hasAnyPossibleMatchIgnoringCase(existenceName)) ||
       this.matchesAnyImport(ref) ||
       this.frameworks.some((f) => f.claimsReference?.(ref.referenceName));
     if (this.profileStages) this.stageAdd('preFilter', ref, preFilterPass, tPre);
