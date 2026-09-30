@@ -181,8 +181,15 @@ function readDocument(r: Reader): ScipDocument {
   return doc;
 }
 
+/**
+ * Decodes a whole index. Concatenated indexes (one per sub-project, see
+ * IndexerRun) decode as one; a file claimed by two overlapping projects keeps
+ * its first document — the indexers here emit each file once per run, and a
+ * second copy only repeats the same occurrences.
+ */
 export function decodeScipIndex(buf: Buffer): ScipIndex {
   const ix: ScipIndex = { toolName: '', toolVersion: '', projectRoot: '', documents: [] };
+  const seen = new Set<string>();
   const r = new Reader(buf, 0, buf.length);
   while (!r.done()) {
     const tag = r.varint();
@@ -207,7 +214,10 @@ export function decodeScipIndex(buf: Buffer): ScipIndex {
       }
     } else if (field === 2 && wire === WIRE_LEN) {
       const doc = readDocument(r.sub());
-      if (doc.relativePath) ix.documents.push(doc);
+      if (doc.relativePath && !seen.has(doc.relativePath)) {
+        seen.add(doc.relativePath);
+        ix.documents.push(doc);
+      }
     } else {
       r.skip(wire);
     }

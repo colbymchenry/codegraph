@@ -3,7 +3,8 @@
  *
  * 1. snapshot the content hash of every file of the language (the hash gate's
  *    reference point — taken BEFORE the indexer reads anything)
- * 2. run the indexer, niced, into a temp file
+ * 2. run the indexer, niced, into a temp file — as one process, or one per
+ *    sub-project with the outputs concatenated (see IndexerRun)
  * 3. refuse the new index when its resolved-call count dropped more than
  *    20% below the installed one (a half-broken build usually shows up as a
  *    collapse in resolution, not as a failed exit) — the old index stays
@@ -25,7 +26,7 @@ export const MAX_RESOLUTION_DROP = 0.2;
 const INDEXER_TIMEOUT_MS = 30 * 60 * 1000;
 
 export type ProduceResult =
-  | { status: 'installed'; lang: ScipLanguage; documents: number; resolvedCalls: number; durationMs: number }
+  | { status: 'installed'; lang: ScipLanguage; documents: number; resolvedCalls: number; durationMs: number; warnings: string[] }
   | { status: 'skipped'; lang: ScipLanguage; reason: string }
   | { status: 'rejected'; lang: ScipLanguage; reason: string }
   | { status: 'failed'; lang: ScipLanguage; reason: string };
@@ -81,14 +82,33 @@ export async function produceIndex(
 
   const started = Date.now();
   const hashes = snapshotHashes(db, projectRoot, INDEXERS[lang].codegraphLanguages);
+  const warnings: string[] = indexer.warning ? [indexer.warning] : [];
+  if (indexer.warning) opts.log?.(`${lang}: ${indexer.warning}`);
+  const { runs } = indexer;
   try {
-    const useNice = opts.nice && process.platform !== 'win32';
-    const [cmd, args] = useNice ? ['nice', ['-n', '10', indexer.cmd, ...indexer.args]] : [indexer.cmd, indexer.args];
-    if (indexer.warning) opts.log?.(`${lang}: ${indexer.warning}`);
-    opts.log?.(`running ${indexer.cmd} ${indexer.args.join(' ')}`);
-    const { code, stderr } = await run(cmd, args, projectRoot, indexer.env, opts.signal);
-    if (code !== 0) return { status: 'failed', lang, reason: `${indexer.cmd} exited ${code}: ${stderr.trim().split('\n').slice(-3).join(' | ')}` };
-    if (!fs.existsSync(tmp)) return { status: 'failed', lang, reason: `${indexer.cmd} exited 0 but wrote no index at ${tmp}` };
+    // One process per run, one after another (parallel runs would stack the
+    // very memory the split exists to bound). A failed part of a split run is
+    // a warning — its files stay heuristic-only; only a total failure fails.
+    const parts: string[] = [];
+    for (const [i, r] of runs.entries()) {
+      if (opts.signal?.aborted) return { status: 'failed', lang, reason: 'aborted' };
+      const label = runs.length > 1 ? `[${i + 1}/${runs.length}] ${r.label}: ` : '';
+      opts.log?.(`${label}running ${indexer.cmd} ${r.args.join(' ')}`);
+      const useNice = opts.nice && process.platform !== 'win32';
+      const [cmd, args] = useNice ? ['nice', ['-n', '10', indexer.cmd, ...r.args]] : [indexer.cmd, r.args];
+      const { code, stderr } = await run(cmd, args, projectRoot, indexer.env, opts.signal);
+      const why = code !== 0 ? `${indexer.cmd} exited ${code}: ${stderr.trim().split('\n').slice(-3).join(' | ')}`
+        : !fs.existsSync(r.output) ? `${indexer.cmd} exited 0 but wrote no index at ${r.output}` : null;
+      if (!why) {
+        parts.push(r.output);
+        continue;
+      }
+      if (runs.length === 1) return { status: 'failed', lang, reason: why };
+      warnings.push(`${r.label}: ${why} — its files stay heuristic-only`);
+      opts.log?.(`${label}failed — ${why}`);
+    }
+    if (parts.length === 0) return { status: 'failed', lang, reason: `all ${runs.length} runs failed; first: ${warnings[warnings.length - runs.length]}` };
+    if (parts.length > 1 || parts[0] !== tmp) concatenate(parts, tmp);
 
     let ix: ScipIndex;
     try {
@@ -110,10 +130,17 @@ export async function produceIndex(
     fs.renameSync(tmp, final);
     const meta: ScipMeta = { tool: ix.toolName, toolVersion: ix.toolVersion, producedAt: started, hashes, resolvedCalls };
     writeFileAtomic(metaPath(projectRoot, lang), JSON.stringify(meta));
-    return { status: 'installed', lang, documents: ix.documents.length, resolvedCalls, durationMs: Date.now() - started };
+    return { status: 'installed', lang, documents: ix.documents.length, resolvedCalls, durationMs: Date.now() - started, warnings };
   } finally {
     fs.rmSync(tmp, { force: true });
+    for (const r of runs) fs.rmSync(r.output, { force: true });
   }
+}
+
+/** Concatenated SCIP `Index` messages are one valid index (protobuf merges repeated fields). */
+function concatenate(parts: string[], into: string): void {
+  fs.writeFileSync(into, '');
+  for (const p of parts) fs.appendFileSync(into, fs.readFileSync(p));
 }
 
 function run(

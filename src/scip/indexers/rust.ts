@@ -18,7 +18,7 @@ export const rustIndexer: IndexerSpec = {
   detect: root => fs.existsSync(path.join(root, 'Cargo.toml')),
   cmd: 'rust-analyzer',
   probe: ['--version'],
-  invocation: (_root, outFile) => ({ args: ['scip', '.', '--output', outFile] }),
+  invocation: (_root, outFile) => ({ runs: [{ label: 'rust', args: ['scip', '.', '--output', outFile], output: outFile }] }),
   // Struct literals `T { … }`, `T::<U> { … }`, `path::T { … }` build a T.
   literalShape: (tail, head) => {
     let t: string | null = tail.trimStart();

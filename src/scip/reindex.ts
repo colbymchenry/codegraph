@@ -85,7 +85,10 @@ export class ScipReindexScheduler {
       if (this.abort.signal.aborted) return;
       try {
         const r = await produceIndex(this.host.scipReadDb(), root, lang, { nice: true, signal: this.abort.signal, log: this.log });
-        if (r.status === 'installed') installed++;
+        if (r.status === 'installed') {
+          installed++;
+          for (const w of r.warnings) this.log(`${lang} reindex: ${w}`);
+        }
         else this.log(`${lang} reindex ${r.status}: ${r.reason}`);
       } catch (err) {
         this.log(`${lang} reindex failed: ${err instanceof Error ? err.message : String(err)}`);

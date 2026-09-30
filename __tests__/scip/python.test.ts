@@ -111,7 +111,8 @@ describe('scip-python adapter', () => {
     const bare = pythonIndexer.invocation(dir, out);
     expect(bare.warning).toMatch(/third-party/);
     expect(JSON.parse(fs.readFileSync(manifest, 'utf8'))).toEqual([]);
-    expect(bare.args).toEqual(expect.arrayContaining(['--environment', manifest, '--output', out]));
+    expect(bare.runs).toHaveLength(1);
+    expect(bare.runs[0]!.args).toEqual(expect.arrayContaining(['--environment', manifest, '--output', out]));
 
     const venv = makeVenv();
     const inv = pythonIndexer.invocation(dir, out);
@@ -139,6 +140,6 @@ describe('scip-python adapter', () => {
       scip: { python: { cmd: process.execPath, args: ['-y', '@sourcegraph/scip-python', '{args}'] } },
     }));
     const r = resolveIndexer(dir, 'python', path.join(dir, '.codegraph', 'scip', 'out.tmp'));
-    expect('skip' in r ? r.skip : r.args.slice(0, 4)).toEqual(['-y', '@sourcegraph/scip-python', 'index', '.']);
+    expect('skip' in r ? r.skip : r.runs[0]!.args.slice(0, 4)).toEqual(['-y', '@sourcegraph/scip-python', 'index', '.']);
   });
 });

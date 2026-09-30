@@ -103,13 +103,14 @@ export const pythonIndexer: IndexerSpec = {
     const manifest = path.join(path.dirname(outFile), 'python-environment.json');
     fs.writeFileSync(manifest, JSON.stringify(venv ? venvPackages(venv) : []));
     const args = ['index', '.', '--project-name', projectName(root).replace(/\s+/g, '-'), '--environment', manifest, '--output', outFile];
+    const runs = [{ label: 'python', args, output: outFile }];
     if (!venv) {
       return {
-        args,
+        runs,
         warning: `no ${VENV_DIRS.join(' or ')} with pyvenv.cfg — indexing without third-party packages (calls into dependencies won't resolve)`,
       };
     }
     const bin = path.join(venv, process.platform === 'win32' ? 'Scripts' : 'bin');
-    return { args, env: { VIRTUAL_ENV: venv, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}` } };
+    return { runs, env: { VIRTUAL_ENV: venv, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}` } };
   },
 };

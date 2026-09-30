@@ -15,7 +15,7 @@ export const goIndexer: IndexerSpec = {
   codegraphLanguages: ['go'],
   detect: root => fs.existsSync(path.join(root, 'go.mod')),
   cmd: 'scip-go',
-  invocation: (_root, outFile) => ({ args: ['index', '--quiet', '--output', outFile] }),
+  invocation: (_root, outFile) => ({ runs: [{ label: 'go', args: ['index', '--quiet', '--output', outFile], output: outFile }] }),
   // Composite literals `&T{…}`, `pkg.T{…}`, `Box[int]{…}` build a T. `[]T{`, `map[K]T{`, `[]*T{`
   // build the container; `) T {` / `) *pkg.T {` is a return type before a function body.
   literalShape: (tail, head) => {

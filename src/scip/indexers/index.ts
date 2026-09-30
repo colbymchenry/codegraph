@@ -25,9 +25,22 @@ import { pythonIndexer } from './python';
 import { rustIndexer } from './rust';
 import { typescriptIndexer } from './typescript';
 
-/** How to run an indexer for one project. */
-export interface Invocation {
+/** One indexer process: its arguments and the file it writes. */
+export interface IndexerRun {
+  /** what this run covers, for logs and warnings (`src`, `extensions/git`, …) */
+  label: string;
   args: string[];
+  output: string;
+}
+
+/**
+ * How to index one project. Usually a single run; an adapter may split a large
+ * repo into several (one process per sub-project keeps peak memory at the size
+ * of the largest part). Their outputs are concatenated — concatenated SCIP
+ * `Index` messages are themselves one valid index.
+ */
+export interface Invocation {
+  runs: IndexerRun[];
   env?: Record<string, string>;
   /** something the user should know about the result's quality (shown, never fatal) */
   warning?: string;
@@ -49,7 +62,10 @@ export interface IndexerSpec {
    * behind them doesn't (rustup's `rust-analyzer` without the component).
    */
   probe?: string[];
-  /** May write helper files next to `outFile` (e.g. an environment manifest). */
+  /**
+   * Runs writing `outFile` (or parts of it next to `outFile`). May write helper
+   * files beside it too (e.g. an environment manifest).
+   */
   invocation(projectRoot: string, outFile: string): Invocation;
   /** for languages that construct values with `Type{…}` rather than a call */
   literalShape?: LiteralShape;
@@ -102,7 +118,7 @@ const isStringRecord = (v: unknown): v is Record<string, string> =>
 export interface ResolvedIndexer {
   lang: ScipLanguage;
   cmd: string;
-  args: string[];
+  runs: IndexerRun[];
   env: Record<string, string>;
   warning?: string;
 }
@@ -140,12 +156,16 @@ export function resolveIndexer(projectRoot: string, lang: ScipLanguage, outFile:
       return { skip: `\`${cmd} ${spec.probe.join(' ')}\` failed (${why}) — the command is on PATH but not usable` };
     }
   }
-  // The adapter's environment (e.g. an activated venv) applies even when the args are overridden.
+  // The adapter's environment (e.g. an activated venv) and its split into runs
+  // apply even when the args are overridden: `{args}` / `{out}` are per run.
   const inv = spec.invocation(projectRoot, outFile);
-  const args = override?.args
-    ? override.args.flatMap(a => (a === '{args}' ? inv.args : [a.split('{out}').join(outFile)]))
-    : inv.args;
-  return { lang, cmd, args, env: { ...inv.env, ...override?.env }, warning: inv.warning };
+  const runs = override?.args
+    ? inv.runs.map(run => ({
+      ...run,
+      args: override.args!.flatMap(a => (a === '{args}' ? run.args : [a.split('{out}').join(run.output)])),
+    }))
+    : inv.runs;
+  return { lang, cmd, runs, env: { ...inv.env, ...override?.env }, warning: inv.warning };
 }
 
 export function onPath(cmd: string): boolean {

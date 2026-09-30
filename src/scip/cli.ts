@@ -81,6 +81,7 @@ export function registerScipCommands(program: Command, h: CliHelpers): void {
           if (r.status === 'installed') {
             installed++;
             h.success(`${lang}: ${r.documents} documents, ${r.resolvedCalls} resolved calls in ${(r.durationMs / 1000).toFixed(1)}s`);
+            for (const w of r.warnings) h.warn(`${lang}: ${w}`);
           } else if (r.status === 'skipped') {
             if (only) h.warn(`${lang}: skipped — ${r.reason}`);
             else h.info(`${lang}: skipped — ${r.reason}`);

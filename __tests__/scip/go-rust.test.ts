@@ -5,6 +5,7 @@ import * as path from 'path';
 import CodeGraph from '../../src/index';
 import { importScipFile, runScipPass } from '../../src/scip';
 import { INDEXERS, resolveIndexer } from '../../src/scip/indexers';
+import { tsProjects } from '../../src/scip/indexers/typescript';
 import { callShape } from '../../src/scip/syntax';
 
 const FIXTURES = path.join(__dirname, '..', 'fixtures');
@@ -106,8 +107,32 @@ describe('go / rust adapters', () => {
     expect(resolveIndexer(dir, 'go', out)).toEqual({ skip: 'no go project markers found' });
     fs.writeFileSync(path.join(dir, 'go.mod'), 'module x\n');
     fs.writeFileSync(path.join(dir, 'Cargo.toml'), '[package]\nname = "x"\n');
-    expect(resolveIndexer(dir, 'go', out)).toMatchObject({ args: ['index', '--quiet', '--output', out] });
-    expect(resolveIndexer(dir, 'rust', out)).toMatchObject({ args: ['scip', '.', '--output', out] });
+    expect(resolveIndexer(dir, 'go', out)).toMatchObject({ runs: [{ args: ['index', '--quiet', '--output', out], output: out }] });
+    expect(resolveIndexer(dir, 'rust', out)).toMatchObject({ runs: [{ args: ['scip', '.', '--output', out], output: out }] });
+  });
+
+  it('TS: one run per tsconfig/jsconfig project (node_modules ignored), a single project stays one run', () => {
+    const out = path.join(dir, 'out.tmp');
+    fs.writeFileSync(path.join(dir, 'package.json'), '{}');
+    fs.writeFileSync(path.join(dir, 'tsconfig.json'), '{}');
+    fs.writeFileSync(path.join(dir, 'codegraph.json'), JSON.stringify({ scip: { typescript: { cmd: process.execPath } } }));
+    expect(resolveIndexer(dir, 'typescript', out)).toMatchObject({ runs: [{ label: 'typescript', output: out }] });
+
+    for (const p of ['src', 'extensions/git', 'extensions/web', 'node_modules/dep']) fs.mkdirSync(path.join(dir, p), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'src/tsconfig.json'), '{}');
+    fs.writeFileSync(path.join(dir, 'extensions/git/tsconfig.json'), '{}');
+    fs.writeFileSync(path.join(dir, 'extensions/web/jsconfig.json'), '{}');
+    fs.writeFileSync(path.join(dir, 'node_modules/dep/tsconfig.json'), '{}');
+    expect(tsProjects(dir)).toEqual(['.', 'extensions/git', 'extensions/web', 'src']);
+    const r = resolveIndexer(dir, 'typescript', out);
+    if ('skip' in r) throw new Error(r.skip);
+    expect(r.runs.map(x => x.args)).toEqual([
+      ['index', '--output', `${out}.part0`, '.'],
+      ['index', '--output', `${out}.part1`, 'extensions/git'],
+      ['index', '--output', `${out}.part2`, 'extensions/web', '--infer-tsconfig'],
+      ['index', '--output', `${out}.part3`, 'src'],
+    ]);
+    expect(r.env.NODE_OPTIONS).toMatch(/--max-old-space-size=\d+/);
   });
 
   it.runIf(process.platform !== 'win32')('skips a rust-analyzer that is on PATH but broken (the rustup shim without the component)', () => {

@@ -203,6 +203,35 @@ describe('SCIP merge (TypeScript fixture)', () => {
     expect(await produceIndex(cg.scipReadDb(), dir, 'typescript')).toMatchObject({ status: 'skipped', reason: expect.stringMatching(/cmd/) });
   });
 
+  it('indexes a multi-project repo one project per process; a failed project is a warning, not a failure', async () => {
+    for (const p of ['packages/a', 'packages/bad']) {
+      fs.mkdirSync(path.join(dir, p), { recursive: true });
+      fs.writeFileSync(path.join(dir, p, 'tsconfig.json'), '{}');
+    }
+    // Each run gets its own `{out}`; `{args}` carries the project dir, so the fake fails for one of them.
+    writeConfig({
+      typescript: {
+        cmd: process.execPath,
+        args: ['-e', 'const fs=require("fs");fs.appendFileSync(process.argv[3],"x");if(process.argv.includes("packages/bad"))process.exit(3);fs.copyFileSync(process.argv[1],process.argv[2])',
+          path.join(FIXTURE, 'index.scip'), '{out}', path.join(dir, 'runs.log'), '{args}'],
+      },
+    });
+    const r = await produceIndex(cg.scipReadDb(), dir, 'typescript');
+    expect(runs()).toBe(3); // '.', packages/a, packages/bad
+    expect(r).toMatchObject({ status: 'installed', documents: 2 }); // two copies of the same index, deduplicated
+    expect(r.status === 'installed' && r.warnings).toEqual([expect.stringMatching(/^packages\/bad: .*exited 3/)]);
+    expect(fs.readdirSync(scipDir(dir)).filter(f => /\.tmp|\.part\d/.test(f))).toEqual([]);
+    await cg.scipWrite(db => runScipPass(db, dir));
+    expect(edge('sum', 'Invoice::totalPrice')?.provenance).toBe('scip');
+  });
+
+  it('a split run fails only when every project fails', async () => {
+    fs.mkdirSync(path.join(dir, 'packages/a'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'packages/a/tsconfig.json'), '{}');
+    writeConfig({ typescript: { cmd: process.execPath, args: ['-e', 'process.exit(2)'] } });
+    expect(await produceIndex(cg.scipReadDb(), dir, 'typescript')).toMatchObject({ status: 'failed', reason: expect.stringMatching(/all 2 runs failed/) });
+  });
+
   it('skips (never installs) an indexer that is not on PATH', async () => {
     writeConfig({ typescript: { cmd: 'definitely-not-a-scip-indexer' } });
     const r = await produceIndex(cg.scipReadDb(), dir, 'typescript');
