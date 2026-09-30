@@ -1079,3 +1079,13 @@ export function validateDirectory(projectRoot: string): {
 export function isTaskNotification(prompt: string): boolean {
   return /^\s*<task-notification>[\s\S]*<\/task-notification>\s*$/.test(prompt);
 }
+
+/**
+ * Claude Code hands a subagent's report back to the parent session as a
+ * `<agent-message from="…">…</agent-message>` prompt, which UserPromptSubmit
+ * hooks also receive (#2184). Same rule as {@link isTaskNotification}: only a
+ * prompt that is entirely that envelope is skipped.
+ */
+export function isAgentMessage(prompt: string): boolean {
+  return /^\s*<agent-message(?:\s[^>]*)?>[\s\S]*<\/agent-message>\s*$/.test(prompt);
+}
