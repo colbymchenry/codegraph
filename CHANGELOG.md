@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Kotlin calls inside a DSL lambda now reach the lambda's own receiver. That receiver comes from the function the lambda is passed to, even through a typealias like koin's `Definition<T> = Scope.(…) -> T`. It also wins over other types the project uses as lambda receivers elsewhere. On koin, over 2,000 `get()` calls in `single { … }` now reach `Scope.get` instead of `Koin.get`; on Exposed, `varchar(…)` inside a table object reaches `Table.varchar`; on kotlinx.coroutines, `launch { }` reaches `CoroutineScope.launch`.
 - A Swift call on a property declared with a type, like Kingfisher's `var cache: ImageCache!` or `self.storage.write(…)`, now reaches that type's method or one it inherits. It no longer lands on a subclass override in a test, or on another type's method of the same name.
 - Calls in your own JavaScript no longer link to a same-named function inside a vendored minified script, like a `*.min.js` or a bundle made of a few enormous lines. Those names are mangled. In healthchecks, every jQuery `$(…)` call had gone to a one-letter helper inside `bootstrap-native.min.js`.
 - A Swift call on a value built on the spot, like `JSONDecoder().decode(…)` or `Realm().create(…)`, now resolves to that type's method, or to one it inherits. It no longer lands on some other type's method of the same name: Vapor's `JSONDecoder().decode` calls had gone to a request's private container.

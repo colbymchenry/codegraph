@@ -2303,7 +2303,14 @@ function kotlinBraceFrames(file: string, context: ResolutionContext): Array<{ st
     if (ch === '{') {
       // `with(x) {`, `x.apply {`, `x.run {`: a receiver of whatever type x is.
       const scoped = /(?:\bwith\s*\([^{}]*\)|\.\s*(?:apply|run)(?:\s*<[^<>]*>)?)\s*$/.test(pending);
-      stack.push({ start: line, names: scoped ? ['*'] : kotlinHeadNames(pending) });
+      let names = scoped ? ['*'] : kotlinHeadNames(pending);
+      // `single { get() }`: a lambda runs on the receiver its function's parameter type names.
+      if (!scoped && (!names || names.length === 0)) {
+        const call = /(?:^|[^\w$])([a-z_]\w*)\s*(?:<[^<>{}]*>)?\s*(?:\([^(){}]*\))?\s*$/.exec(pending)?.[1];
+        const receiver = call && !KOTLIN_BLOCK_WORDS.has(call) ? kotlinLambdaReceiver(call, context) : null;
+        if (receiver) names = [receiver];
+      }
+      stack.push({ start: line, names });
       pending = '';
     } else if (ch === '}') {
       const open = stack.pop();
@@ -2315,6 +2322,63 @@ function kotlinBraceFrames(file: string, context: ResolutionContext): Array<{ st
   }
   memo.set(file, frames);
   return frames;
+}
+
+/** Words before a `{` that open a block, not a lambda argument. */
+const KOTLIN_BLOCK_WORDS: ReadonlySet<string> = new Set([
+  'if', 'else', 'for', 'while', 'do', 'when', 'try', 'catch', 'finally', 'init', 'get', 'set', 'constructor',
+  'fun', 'class', 'object', 'interface', 'return', 'by', 'lazy', 'apply', 'run', 'also', 'let', 'with', 'use',
+]);
+
+const KOTLIN_LAMBDA_RECEIVERS = new WeakMap<ResolutionContext, Map<string, string | null>>();
+
+/**
+ * The receiver a lambda passed to the project's `name` runs with: the type
+ * before `.(` in its last parameter's function type, directly or through a
+ * typealias — koin's `single(…, definition: Definition<T>)` with `typealias
+ * Definition<T> = Scope.(ParametersHolder) -> T` runs its lambda on a Scope.
+ * Null unless every `name` agrees.
+ */
+function kotlinLambdaReceiver(name: string, context: ResolutionContext): string | null {
+  let memo = KOTLIN_LAMBDA_RECEIVERS.get(context);
+  if (!memo) KOTLIN_LAMBDA_RECEIVERS.set(context, (memo = new Map()));
+  if (memo.has(name)) return memo.get(name)!;
+  const receiverOf = (type: string, depth: number): string | null => {
+    const direct = /^\s*(?:suspend\s+)?([A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?\s*\.\s*\(/.exec(type);
+    if (direct) return direct[1]!;
+    const alias = /^\s*([A-Z]\w*)\b/.exec(type)?.[1];
+    if (!alias || depth > 2) return null;
+    for (const decl of context.getNodesByName(alias)) {
+      if (decl.language !== 'kotlin' || decl.kind !== 'type_alias') continue;
+      const text = (context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [])[decl.startLine - 1] ?? '';
+      const rhs = /=\s*(.+)$/.exec(text)?.[1];
+      if (rhs) return receiverOf(rhs, depth + 1);
+    }
+    return null;
+  };
+  const found = new Set<string>();
+  for (const fn of context.getNodesByName(name)) {
+    if (fn.language !== 'kotlin' || (fn.kind !== 'function' && fn.kind !== 'method')) continue;
+    const lines = context.getFileLines?.(fn.filePath) ?? context.readFile(fn.filePath)?.split(/\r?\n/) ?? [];
+    const head = lines.slice(fn.startLine - 1, fn.startLine + 11).join(' ');
+    const open = head.search(new RegExp(`\\b${name}\\s*\\(`));
+    if (open < 0) continue;
+    let depth = 0;
+    let end = -1;
+    for (let i = head.indexOf('(', open); i < head.length; i++) {
+      if (head[i] === '(') depth++;
+      else if (head[i] === ')' && --depth === 0) { end = i; break; }
+    }
+    if (end < 0) continue;
+    const params = splitCppTopLevel(head.slice(head.indexOf('(', open) + 1, end));
+    const last = params[params.length - 1];
+    const type = last ? /:\s*([\s\S]+?)(?:\s*=\s*[^=>][\s\S]*)?$/.exec(last.replace(/^\s*(?:noinline|crossinline)\s+/, ''))?.[1] : undefined;
+    const receiver = type ? receiverOf(type, 0) : null;
+    if (receiver) found.add(receiver);
+  }
+  const result = found.size === 1 ? [...found][0]! : null;
+  memo.set(name, result);
+  return result;
 }
 
 /** The type names a Kotlin block head introduces: a type declaration's name and supertypes, or an extension function's receiver. */
@@ -2366,6 +2430,26 @@ function isKotlinMemberReachable(n: Node, ref: UnresolvedRef, context: Resolutio
   const objectPath = (pkg ? `${pkg}.${owner}` : owner) + (companion ? '.Companion' : '');
   const here = kotlinFileScope(ref.filePath, context);
   return here.imports.has(`${objectPath}.${n.name}`) || here.stars.has(objectPath);
+}
+
+/**
+ * Of the members a bare Kotlin call can reach, the ones the code around it
+ * reaches — its class, an extension's receiver, the lambda it is in — before
+ * those only a lambda type somewhere in the project could: koin's `get()` in
+ * `Scope.new(…)` is Scope's, not Koin's.
+ */
+function lexicalKotlinMembers(candidates: Node[], ref: UnresolvedRef, context: ResolutionContext): Node[] {
+  if (candidates.length < 2) return candidates;
+  const hierarchy = kotlinHierarchyAt(ref, context);
+  if (hierarchy.has('*')) return candidates;
+  const lexical = candidates.filter((n) => {
+    if (n.kind !== 'method') return false;
+    const path = n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))).split(/::|\./);
+    let owner = path.pop() ?? '';
+    if (owner === 'Companion') owner = path.pop() ?? '';
+    return hierarchy.has(owner);
+  });
+  return lexical.length > 0 ? lexical : candidates;
 }
 
 /** Whether a standard-named Kotlin chain link can mean `n`: only through a receiver named after its owner. */
@@ -4014,7 +4098,8 @@ export function matchByExactName(
     !(bareJs && n.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context))
   );
   const candidates = dartBare ? nearestDartMembers(filtered, ref, context)
-    : swiftShape && swiftShape.shape !== 'chained' ? nearestSwiftMembers(filtered, ref, context) : filtered;
+    : swiftShape && swiftShape.shape !== 'chained' ? nearestSwiftMembers(filtered, ref, context)
+    : kotlinBare ? lexicalKotlinMembers(filtered, ref, context) : filtered;
 
   if (candidates.length === 0) {
     return null;
@@ -5083,6 +5168,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   RUST_TRAIT_IMPL_MEMO.delete(context);
   RUST_USES.delete(context);
   LEXICAL_SCOPE_MEMO.delete(context);
+  KOTLIN_LAMBDA_RECEIVERS.delete(context);
   SCALA_IMPORTED_SUPERS.delete(context);
   SCALA_PACKAGE_OBJECTS.delete(context);
   LOCAL_DECL_MEMO.delete(context);
