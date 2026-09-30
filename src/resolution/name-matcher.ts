@@ -1431,6 +1431,70 @@ function dartHeadOf(decl: Node, context: ResolutionContext): { supers: string[];
   };
 }
 
+const RUBY_ANCESTRY = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
+
+/**
+ * Whether a bare Ruby call written inside a class body can mean `method`: a
+ * receiver-less call is a call on `self`, so it reaches the class's own
+ * methods, its superclasses', and those of the modules any of them
+ * `include`s, `extend`s or `prepend`s — read from source, resolved against
+ * the lexical nesting (`class Foo < Base` inside `module RuboCop::Cop` is
+ * `RuboCop::Cop::Base`). A call in a module body, a block at the top of a
+ * file (a spec, a DSL) or a script is not judged: a module's methods run on
+ * whatever includes it, and a block may be evaluated on anything. rubocop's
+ * `format(…)` — Kernel's — went to the LSP runtime's `format` 411 times.
+ */
+function isRubyMethodInScope(method: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const cut = method.qualifiedName.lastIndexOf('::');
+  if (cut < 0) return true;
+  const here = context
+    .getNodesInFile(ref.filePath)
+    .filter((n) => (n.kind === 'class' || n.kind === 'module') && n.startLine <= ref.line && n.endLine >= ref.line)
+    .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
+  if (!here || here.kind !== 'class') return true;
+  return rubyAncestry(here.qualifiedName, context).has(method.qualifiedName.slice(0, cut));
+}
+
+/** A Ruby class's qualified name, those of its superclasses, and of every module mixed into any of them. */
+function rubyAncestry(qn: string, context: ResolutionContext): Set<string> {
+  let memo = RUBY_ANCESTRY.get(context);
+  if (!memo) RUBY_ANCESTRY.set(context, (memo = new Map()));
+  const hit = memo.get(qn);
+  if (hit) return hit;
+  const seen = new Set<string>();
+  const queue = [qn];
+  while (queue.length > 0 && seen.size < 60) {
+    const q = queue.shift()!;
+    if (seen.has(q)) continue;
+    seen.add(q);
+    for (const decl of context.getNodesByQualifiedName(q)) {
+      if (decl.language !== 'ruby' || (decl.kind !== 'class' && decl.kind !== 'module')) continue;
+      const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+      const outer = q.includes('::') ? q.slice(0, q.lastIndexOf('::')) : '';
+      const sup = /^\s*class\s+[\w:]+\s*<\s*(::)?([A-Z][\w:]*)/.exec(lines[decl.startLine - 1] ?? '');
+      if (sup) queue.push(rubyConstantQn(sup[2]!, sup[1] ? '' : outer, context));
+      for (const line of lines.slice(decl.startLine, decl.endLine)) {
+        const mix = /^\s*(?:include|extend|prepend)\s+([A-Z:][\w:]*(?:\s*,\s*[A-Z:][\w:]*)*)/.exec(line);
+        if (!mix) continue;
+        for (const name of mix[1]!.split(/\s*,\s*/)) {
+          queue.push(name.startsWith('::') ? rubyConstantQn(name.slice(2), '', context) : rubyConstantQn(name, q, context));
+        }
+      }
+    }
+  }
+  memo.set(qn, seen);
+  return seen;
+}
+
+/** The class or module a constant written inside `scope` names: the nearest enclosing namespace that has it, else the name itself. */
+function rubyConstantQn(name: string, scope: string, context: ResolutionContext): string {
+  for (let prefix = scope; ; prefix = prefix.includes('::') ? prefix.slice(0, prefix.lastIndexOf('::')) : '') {
+    const qn = prefix ? `${prefix}::${name}` : name;
+    if (context.getNodesByQualifiedName(qn).some((n) => n.language === 'ruby' && (n.kind === 'class' || n.kind === 'module'))) return qn;
+    if (!prefix) return name;
+  }
+}
+
 const KOTLIN_FILE_SCOPES = new WeakMap<ResolutionContext, Map<string, { pkg: string; imports: Set<string>; stars: Set<string> }>>();
 /** Packages every Kotlin file imports without writing it. */
 const KOTLIN_DEFAULT_IMPORTS: ReadonlySet<string> = new Set([
@@ -1911,8 +1975,10 @@ export function matchByExactName(
   const javaBare = ref.language === 'java' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const dartBare = ref.language === 'dart' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName) && isReceiverLessDartCall(ref, context);
   const kotlinCall = ref.language === 'kotlin' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
+  const rubyBare = ref.language === 'ruby' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*[?!]?$/.test(ref.referenceName);
   const phpSelf = phpSelfReceiver(ref, context);
   const filtered = sameName.filter((n) =>
+    !(rubyBare && n.kind === 'method' && !isRubyMethodInScope(n, ref, context)) &&
     !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)) &&
     !(kotlinCall && !isKotlinTopLevelVisible(n, ref, context)) &&
     !(dartBare && isDartMember(n) && !isDartMethodInScope(n, ref, context)) &&
@@ -3029,6 +3095,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   DART_SUPERS.delete(context);
   DART_HIERARCHIES.delete(context);
   KOTLIN_FILE_SCOPES.delete(context);
+  RUBY_ANCESTRY.delete(context);
   LUA_LOCALS.delete(context);
   PHP_FILE_SCOPES.delete(context);
   JAVA_STATIC_IMPORTS.delete(context);
@@ -4011,8 +4078,15 @@ export function matchMethodCall(
       targetMethods = kept;
     }
 
-    // If only one same-language method with this name exists, use it
-    if (targetMethods.length === 1 && !narrowed && targetMethods[0]!.language === ref.language) {
+    // If only one same-language method with this name exists, use it —
+    // except in Ruby, where nothing types a receiver: there the one method
+    // must also belong to something the receiver is named after
+    // (`web_push_request.legacy_encrypt` → WebPushRequest). rubocop's
+    // `node.loc` on a rubocop-ast node went to the one `loc` in the project
+    // 1,201 times; lobsters' `value.to_s` to a short-id class's.
+    if (targetMethods.length === 1 && !narrowed && targetMethods[0]!.language === ref.language &&
+        !(ref.language === 'ruby' && objectOrClass !== 'self' && objectOrClass !== 'self.class' &&
+          !sharesReceiverWord(objectOrClass!, targetMethods[0]!))) {
       return {
         original: ref,
         targetNodeId: targetMethods[0]!.id,
@@ -4814,6 +4888,14 @@ function hasParameterBinding(code: string, escapedName: string): boolean {
 /**
  * Split a camelCase or PascalCase string into words.
  */
+/** Whether a receiver's name and the owner of `method` have a word in common, case aside. */
+function sharesReceiverWord(receiver: string, method: Node): boolean {
+  const cut = method.qualifiedName.lastIndexOf('::');
+  if (cut < 0) return false;
+  const owner = new Set(splitCamelCase(method.qualifiedName.slice(0, cut)).map((w) => w.toLowerCase()));
+  return splitCamelCase(receiver).some((w) => owner.has(w.toLowerCase()));
+}
+
 function splitCamelCase(str: string): string[] {
   return str.replace(/([a-z])([A-Z])/g, '$1 $2')
     .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
@@ -4984,6 +5066,7 @@ export function matchFuzzy(
   const javaBare = ref.language === 'java' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const dartBare = ref.language === 'dart' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName) && isReceiverLessDartCall(ref, context);
   const kotlinCall = ref.language === 'kotlin' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
+  const rubyBare = ref.language === 'ruby' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*[?!]?$/.test(ref.referenceName);
   const phpSelf = phpSelfReceiver(ref, context);
   // Names are case-sensitive in every language but a handful: Rust's
   // `Bytes` is not the method `bytes`, Python's builtin `dir(…)` not a class
@@ -5000,6 +5083,7 @@ export function matchFuzzy(
     !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)) &&
     !(dartBare && isDartMember(n) && !isDartMethodInScope(n, ref, context)) &&
     !(kotlinCall && !isKotlinTopLevelVisible(n, ref, context)) &&
+    !(rubyBare && n.kind === 'method' && !isRubyMethodInScope(n, ref, context)) &&
     !(phpSelf && (n.kind !== 'method' || !isPhpMethodInScope(n, ref, phpSelf, context))))
     .filter((n) => (ref.referenceKind !== 'references' && ref.referenceKind !== 'function_ref') ||
       sameLanguageFamily(n.language, ref.language));
