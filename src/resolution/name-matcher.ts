@@ -8774,15 +8774,28 @@ export function newReceiverClass(ref: UnresolvedRef, context: ResolutionContext)
 
 /**
  * Resolve a {@link NEW_RECEIVER_SHAPE} call on the constructed class or one of
- * its supertypes (validated by resolveMethodOnType), or not at all: a class
- * with no project declaration — `new URL(u).toString()` — has no project
- * method to bind to.
+ * its supertypes (validated by resolveMethodOnType), or on a function assigned
+ * onto an ES5 constructor function's prototype in its file, or not at all: a
+ * class with no project declaration — `new URL(u).toString()` — has no
+ * project method to bind to.
  */
 export function matchNewReceiverCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
   const cls = newReceiverClass(ref, context);
   const method = ref.referenceName.match(NEW_RECEIVER_SHAPE)?.[2];
   if (!cls || !method) return null;
-  return resolveMethodOnType(cls, method, ref, context, 0.9, 'instance-method');
+  const onClass = resolveMethodOnType(cls, method, ref, context, 0.9, 'instance-method');
+  if (onClass) return onClass;
+  // An ES5 constructor function (`function Params() {}`) keeps its methods as
+  // functions assigned onto its prototype in its own file
+  // (`prototype.render = function render() {…}`).
+  const ctors = context.getNodesByName(cls).filter((n) => n.kind === 'function' && sameLanguageFamily(n.language, ref.language));
+  if (ctors.length !== 1) return null;
+  const lines = context.getFileLines?.(ctors[0]!.filePath) ?? context.readFile(ctors[0]!.filePath)?.split(/\r?\n/);
+  const onProto = context.getNodesInFile(ctors[0]!.filePath).filter((n) =>
+    n.name === method && (n.kind === 'function' || n.kind === 'method') && /\bprototype\b/.test(lines?.[n.startLine - 1] ?? ''));
+  return onProto.length === 1
+    ? { original: ref, targetNodeId: onProto[0]!.id, confidence: 0.8, resolvedBy: 'instance-method' }
+    : null;
 }
 
 /** Resolve the implementation inside the identified store, not a namesake or
