@@ -8,6 +8,8 @@ import { MAX_SOURCE_FILE_SIZE_BYTES } from '../../src/file-limits';
 import { resolveIndexer } from '../../src/scip/indexers';
 import { indexProjects } from '../../src/scip/indexers/tsgo-index';
 import { findTsgo } from '../../src/scip/indexers/typescript';
+import { scipFlowNote } from '../../src/scip/notes';
+import type { Edge } from '../../src/types';
 
 const FIXTURE = path.join(__dirname, '..', 'fixtures', 'scip-ts');
 /** TypeScript ≥ 7.1 to index with: `CODEGRAPH_TSGO_DIR`, else wherever the adapter would find one. */
@@ -43,6 +45,41 @@ describe.runIf(TSGO)('tsgo indexer (TypeScript fixture)', () => {
     cg.close();
     fs.rmSync(dir, { recursive: true, force: true });
   });
+
+  it('implements/extends edges come from the compiler', async () => {
+    fs.writeFileSync(path.join(dir, 'src', 'shapes.ts'),
+      'export interface Shape { area(): number }\nexport class Square implements Shape { area() { return 1; } }\nexport class Rect extends Square {}\n' +
+      // vscode's service idiom: a value declared before the interface it merges with
+      'export const Svc = {} as unknown;\nexport interface Svc { go(): void }\nexport class SvcImpl implements Svc { go() {} }\n');
+    await cg.indexAll();
+    await index();
+    expect(edge('Square', 'Shape')).toMatchObject({ kind: 'implements', provenance: 'scip' });
+    expect(edge('Rect', 'Square')).toMatchObject({ kind: 'extends', provenance: 'scip' });
+    expect(edge('SvcImpl', 'Svc')).toMatchObject({ kind: 'implements', provenance: 'scip' });
+  }, 30_000);
+
+  it('a call through an interface with no node verifies the edge to an implementation, and only that', async () => {
+    // The interface lives in a file over codegraph's size limit, so the compiler's target has no node.
+    fs.writeFileSync(path.join(dir, 'src', 'api.ts'), `export interface Api { launch(): void }\n// ${'x'.repeat(MAX_SOURCE_FILE_SIZE_BYTES)}\n`);
+    fs.writeFileSync(path.join(dir, 'src', 'impl.ts'),
+      "import { Api } from './api';\nexport class Impl implements Api { launch() {} }\nexport class Other { launch() {} }\n");
+    fs.writeFileSync(path.join(dir, 'src', 'use.ts'), "import { Api } from './api';\nexport function useApi(a: Api) {\n  a.launch();\n}\n");
+    await cg.indexAll();
+    const id = (qn: string) => (cg.scipReadDb().prepare('SELECT id FROM nodes WHERE qualified_name = ?').get(qn) as { id: string }).id;
+    const db = cg.scipReadDb();
+    db.prepare(`DELETE FROM edges WHERE source = ? AND kind = 'calls'`).run(id('useApi'));
+    for (const target of ['Impl::launch', 'Other::launch']) {
+      db.prepare(`INSERT INTO edges (source, target, kind, line, col) VALUES (?, ?, 'calls', 3, 2)`).run(id('useApi'), id(target));
+    }
+    const { report } = await index();
+    expect(report.outcome.dispatchVerified).toBe(1);
+    expect(edge('useApi', 'Impl::launch')?.provenance).toBe('scip'); // Impl implements Api.launch
+    const via = cg.scipReadDb().prepare(`SELECT e.metadata FROM edges e JOIN nodes t ON t.id = e.target WHERE t.qualified_name = 'Impl::launch' AND e.kind = 'calls'`).get() as { metadata: string };
+    expect(scipFlowNote({ provenance: 'scip', metadata: JSON.parse(via.metadata) } as unknown as Edge)).toMatch(/through the interface/);
+    expect(edge('useApi', 'Other::launch')).toMatchObject({ provenance: null }); // same name, unrelated: unverified, kept
+    await cg.scipWrite(db => runScipPass(db, dir)); // a re-merge keeps it
+    expect(edge('useApi', 'Impl::launch')?.provenance).toBe('scip');
+  }, 30_000);
 
   it('resolves the fixture like scip-typescript', async () => {
     await index();

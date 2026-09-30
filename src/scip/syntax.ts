@@ -12,7 +12,12 @@ export type LiteralShape = (tail: string, head: string) => boolean;
 
 export type CallShape = 'call' | 'new' | 'literal';
 
-export type SiteKind = 'calls' | 'instantiates';
+/**
+ * What a site is about: a call, an instantiation, or (`inherits`) a type's
+ * `implements`/`extends` edge — one key kind for both, since codegraph and the
+ * compiler may label the same base differently (`class A implements B` with B a class).
+ */
+export type SiteKind = 'calls' | 'instantiates' | 'inherits';
 
 /** Symbol kinds a call can target: types (instantiated), methods and values (called). */
 export function isCallTarget(kind: DescriptorKind | undefined): boolean {
@@ -27,7 +32,7 @@ export function isCallTarget(kind: DescriptorKind | undefined): boolean {
  * an argument list is a call. `shape` reads source text, so it is only asked
  * for kinds that can be call targets.
  */
-export function siteKind(kind: DescriptorKind | undefined, shape: () => CallShape | null): SiteKind | null {
+export function siteKind(kind: DescriptorKind | undefined, shape: () => CallShape | null): 'calls' | 'instantiates' | null {
   if (kind === 'type') return shape() ? 'instantiates' : null;
   if (kind === 'method' || kind === 'term') return shape() === 'call' ? 'calls' : null;
   return null;

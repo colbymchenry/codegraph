@@ -27,7 +27,18 @@ export const EXTERNAL = '<external>';
 export const HEURISTIC_PROVENANCE = "(provenance IS NULL OR provenance = 'tree-sitter')";
 
 const CALLABLE_KINDS: readonly string[] = ['function', 'method'];
-const TYPE_KINDS: readonly string[] = ['class', 'struct'];
+const TYPE_KINDS: readonly string[] = ['class', 'struct', 'interface', 'trait'];
+const INTERFACE_KINDS: readonly string[] = ['interface', 'trait'];
+
+/** codegraph's label for a type → base edge: a class/struct implements an interface/trait, anything else extends. */
+export function inheritanceKind(sourceKind: string, targetKind: string): 'implements' | 'extends' {
+  return INTERFACE_KINDS.includes(targetKind) && !INTERFACE_KINDS.includes(sourceKind) ? 'implements' : 'extends';
+}
+
+/** The site kind an edge is keyed by: `implements`/`extends` share `inherits`. */
+export function siteKindOfEdge(kind: string): SiteKind {
+  return kind === 'implements' || kind === 'extends' ? 'inherits' : (kind as SiteKind);
+}
 /**
  * What a called `term` (a value) may be: a function-valued binding codegraph
  * extracted as a function, or one it keeps as a constant/variable — `export
@@ -58,6 +69,8 @@ export interface SiteTarget {
   target: string;
   /** 0-based column of the callee name, for inserted edges */
   col: number;
+  /** edge kind to insert when it differs from the site kind (`inherits` → implements/extends) */
+  edgeKind?: string;
 }
 
 export interface ScipSites {
@@ -65,6 +78,12 @@ export interface ScipSites {
   sites: Map<string, Map<string, SiteTarget>>;
   /** sites SCIP saw but couldn't judge (target defined in the project, yet unmapped or stale) */
   unknown: Set<string>;
+  /**
+   * Call sites whose compiler target has no node (unknown or external) → the
+   * nodes that implement that target: a heuristic edge to one of them is the
+   * call reaching its implementation through the interface, so it is verified.
+   */
+  dispatch: Map<string, Set<string>>;
   stats: Record<string, number>;
 }
 
@@ -223,9 +242,57 @@ export function scipSites(
   for (const s of ambiguous) symToNode.delete(s); // still a project symbol: its calls read as unknown
   stats.def_ambiguous = ambiguous.size;
 
-  // Pass 2: references that are calls, keyed by the caller codegraph would name.
   const sites = new Map<string, Map<string, SiteTarget>>();
   const unknown = new Set<string>();
+
+  // Implementation relationships (fresh documents: those are the symbols with nodes).
+  // type → base: the type's `implements`/`extends` edges, keyed like a call site at
+  // the type's own line (where codegraph puts them). method → method: which nodes a
+  // call through an interface method reaches, transitively.
+  const implemented = new Map<string, string[]>();
+  for (const { docs } of indexes) {
+    for (const doc of docs) {
+      if (!fresh.has(doc.relativePath)) continue;
+      for (const { symbol, target } of doc.implementations ?? []) {
+        const list = implemented.get(symbol);
+        if (list) list.push(target);
+        else implemented.set(symbol, [target]);
+        if (parse(symbol)?.last.kind !== 'type' || parse(target)?.last.kind !== 'type') continue;
+        const src = symToNode.get(symbol);
+        if (!src) continue;
+        const base = symToNode.get(target);
+        const key = siteKey(src.id, src.start_line, base?.name ?? parse(target)!.last.name, 'inherits');
+        if (base) addTarget(sites, key, base.id, src.start_column, inheritanceKind(src.kind, base.kind));
+        else if (projectSymbols.has(target)) unknown.add(key);
+        else addTarget(sites, key, EXTERNAL, src.start_column);
+        bump(base ? 'inherits_resolved' : 'inherits_unresolved');
+      }
+    }
+  }
+  const implementers = new Map<string, Set<string>>();
+  for (const [symbol, node] of symToNode) {
+    if (!implemented.has(symbol) || parse(symbol)?.last.kind === 'type') continue;
+    const seen = new Set<string>();
+    for (let todo = [...implemented.get(symbol)!]; todo.length;) {
+      const t = todo.pop()!;
+      if (seen.has(t)) continue;
+      seen.add(t);
+      let set = implementers.get(t);
+      if (!set) implementers.set(t, (set = new Set()));
+      set.add(node.id);
+      todo.push(...(implemented.get(t) ?? []));
+    }
+  }
+  const dispatch = new Map<string, Set<string>>();
+  const via = (key: string, symbol: string) => {
+    const impls = implementers.get(symbol);
+    if (!impls) return;
+    let set = dispatch.get(key);
+    if (!set) dispatch.set(key, (set = new Set()));
+    for (const id of impls) set.add(id);
+  };
+
+  // Pass 2: references that are calls, keyed by the caller codegraph would name.
   for (const { lang, docs } of indexes) {
     const literal = INDEXERS[lang].literalShape;
     for (const doc of docs) {
@@ -245,9 +312,11 @@ export function scipSites(
           bump(`${call.kind}_resolved`);
         } else if (projectSymbols.has(call.symbol)) {
           unknown.add(key);
+          via(key, call.symbol);
           bump('call_unknown');
         } else {
           addTarget(sites, key, EXTERNAL, startCol);
+          via(key, call.symbol);
           bump('call_external');
         }
       }
@@ -255,13 +324,13 @@ export function scipSites(
   }
   // A site SCIP resolved at all is judged; "unknown" only matters where it resolved nothing.
   for (const k of sites.keys()) unknown.delete(k);
-  return { sites, unknown, stats };
+  return { sites, unknown, dispatch, stats };
 }
 
-function addTarget(sites: Map<string, Map<string, SiteTarget>>, key: string, target: string, col: number): void {
+function addTarget(sites: Map<string, Map<string, SiteTarget>>, key: string, target: string, col: number, edgeKind?: string): void {
   let m = sites.get(key);
   if (!m) sites.set(key, (m = new Map()));
-  if (!m.has(target)) m.set(target, { target, col });
+  if (!m.has(target)) m.set(target, { target, col, edgeKind });
 }
 
 interface Call {
@@ -312,13 +381,13 @@ export function heuristicSites(db: SqliteDatabase, files: Iterable<string>): Heu
     FROM nodes s
     JOIN edges e ON e.source = s.id
     JOIN nodes t ON t.id = e.target
-    WHERE s.file_path = ? AND e.kind IN ('calls', 'instantiates') AND e.line IS NOT NULL
+    WHERE s.file_path = ? AND e.kind IN ('calls', 'instantiates', 'implements', 'extends') AND e.line IS NOT NULL
       AND ${HEURISTIC_PROVENANCE} -- unambiguous: only edges have a provenance column
   `);
   const out: HeuristicSites = new Map();
   for (const f of files) {
-    for (const r of stmt.all(f) as { id: number; source: string; line: number; kind: SiteKind; name: string; target: string }[]) {
-      const key = siteKey(r.source, r.line, r.name, r.kind);
+    for (const r of stmt.all(f) as { id: number; source: string; line: number; kind: string; name: string; target: string }[]) {
+      const key = siteKey(r.source, r.line, r.name, siteKindOfEdge(r.kind));
       let targets = out.get(key);
       if (!targets) out.set(key, (targets = new Map()));
       const ids = targets.get(r.target);

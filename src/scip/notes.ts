@@ -19,6 +19,9 @@ export function scipVerdict(edge: Edge | null | undefined): ScipVerdict | null {
 /** Suffix for a Flow step's edge label. */
 export function scipFlowNote(edge: Edge | null | undefined): string {
   const v = scipVerdict(edge);
+  if (v === 'verified' && (edge?.metadata as Record<string, unknown> | undefined)?.scipDispatch === true) {
+    return ' (compiler-verified, through the interface it implements)';
+  }
   if (v === 'verified') return ' (compiler-verified)';
   if (v === 'unverified') return ' (unverified: the type checker could not confirm this call)';
   return '';

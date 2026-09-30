@@ -7,7 +7,8 @@
  * project symbol from an external one), and references that read as a call,
  * `new`, or struct literal. Everything else is dropped. The result is still a
  * standard SCIP index, a fraction of the size, and it decodes in a fraction of
- * the time on every later merge. The merge re-checks the call shape against
+ * the time on every later merge. Implementation relationships between those
+ * symbols (class → base, method → the method it implements) are kept too. The merge re-checks the call shape against
  * the (hash-gated, identical) source, so compaction can't change an outcome.
  *
  * Indexer outputs are added one at a time and only the current document is
@@ -55,7 +56,11 @@ export class Compactor {
         kept.push(o);
         this.callRefs.set(o.symbol, (this.callRefs.get(o.symbol) ?? 0) + 1);
       }
-      this.chunks.push(encodeDocument({ ...doc, occurrences: kept }, s => this.bytes(s)));
+      // Class → base/interface and method → the method it implements: what `implements`/`extends`
+      // edges and calls made through an interface are judged by (see relations.ts).
+      const implementations = (doc.implementations ?? []).filter(i =>
+        isCallTarget(this.parse(i.symbol)?.last.kind) && isCallTarget(this.parse(i.target)?.last.kind));
+      this.chunks.push(encodeDocument({ ...doc, occurrences: kept, implementations }, s => this.bytes(s)));
       this.paths.push(doc.relativePath);
     });
     this.meta ??= meta;

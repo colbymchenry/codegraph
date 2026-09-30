@@ -32,9 +32,13 @@ function fixtureSuite(name: string, lang: 'go' | 'rust', checks: (edge: EdgeLook
     });
 
     it('verifies, corrects and completes the heuristic call graph', () => {
-      checks((src, tgt, kind) => cg.scipReadDb().prepare(`
-        SELECT e.kind, e.line, e.provenance FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
-        WHERE e.kind = ? AND s.qualified_name = ? AND t.qualified_name = ?`).get(kind ?? 'calls', src, tgt) as EdgeRow | undefined);
+      checks((src, tgt, kind) => {
+        const rows = cg.scipReadDb().prepare(`
+          SELECT e.kind, e.line, e.provenance FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+          WHERE e.kind = ? AND s.qualified_name = ? AND t.qualified_name = ?`).all(kind ?? 'calls', src, tgt) as EdgeRow[];
+        if (rows.length > 1) throw new Error(`${rows.length} ${kind ?? 'calls'} edges ${src} → ${tgt}: ${JSON.stringify(rows)}`);
+        return rows[0];
+      });
     });
   });
 }
@@ -50,6 +54,9 @@ fixtureSuite('scip-go', 'go', (edge) => {
   expect(edge('Total', 'Invoice::TotalPrice')?.provenance).toBe('scip'); // missed by the heuristic
   expect(edge('Pricer::TotalPrice', 'Invoice::TotalPrice')?.provenance).toBe('heuristic'); // synthesized, untouched
   expect(edge('Generic', 'Invoice', 'instantiates')).toBeUndefined(); // []*Invoice{…} builds a slice
+  // Structural `implements`: codegraph synthesizes it, SCIP states it too — one edge, not two.
+  expect(edge('Invoice', 'Pricer', 'implements')?.provenance).toBe('heuristic');
+  expect(edge('Order', 'Pricer', 'implements')?.provenance).toBe('heuristic');
 });
 
 fixtureSuite('scip-rust', 'rust', (edge) => {

@@ -30,11 +30,19 @@ export interface ScipOccurrence {
   roles: number;
 }
 
+/** `symbol` implements (or overrides) `target` — a class its base or interface, a method the one it implements. */
+export interface ScipImplementation {
+  symbol: string;
+  target: string;
+}
+
 export interface ScipDocument {
   relativePath: string;
   language: string;
   positionEncoding: number;
   occurrences: ScipOccurrence[];
+  /** from the document's SymbolInformation relationships marked `is_implementation` */
+  implementations?: ScipImplementation[];
 }
 
 export interface ScipIndex {
@@ -164,8 +172,34 @@ function readOccurrence(r: Reader): ScipOccurrence | null {
   return { range, symbol, roles };
 }
 
+/** SymbolInformation (symbol=1, relationships=4 → Relationship: symbol=1, is_implementation=3); everything else skipped. */
+function readSymbolInformation(r: Reader, into: ScipImplementation[]): void {
+  let symbol = '';
+  const targets: string[] = [];
+  while (!r.done()) {
+    const tag = r.varint();
+    const field = Math.floor(tag / 8);
+    const wire = tag & 7;
+    if (field === 1) symbol = r.string();
+    else if (field === 4) {
+      const rel = r.sub();
+      let target = '';
+      let impl = false;
+      while (!rel.done()) {
+        const t = rel.varint();
+        const f = Math.floor(t / 8);
+        if (f === 1) target = rel.string();
+        else if (f === 3 && (t & 7) === WIRE_VARINT) impl = rel.varint() !== 0;
+        else rel.skip(t & 7);
+      }
+      if (impl && target) targets.push(target);
+    } else r.skip(wire);
+  }
+  if (symbol) for (const target of targets) into.push({ symbol, target });
+}
+
 function readDocument(r: Reader): ScipDocument {
-  const doc: ScipDocument = { relativePath: '', language: '', positionEncoding: 0, occurrences: [] };
+  const doc: ScipDocument = { relativePath: '', language: '', positionEncoding: 0, occurrences: [], implementations: [] };
   while (!r.done()) {
     const tag = r.varint();
     const field = Math.floor(tag / 8);
@@ -174,7 +208,8 @@ function readDocument(r: Reader): ScipDocument {
     else if (field === 2) {
       const o = readOccurrence(r.sub());
       if (o) doc.occurrences.push(o);
-    } else if (field === 4) doc.language = r.string();
+    } else if (field === 3) readSymbolInformation(r.sub(), doc.implementations!);
+    else if (field === 4) doc.language = r.string();
     else if (field === 6) doc.positionEncoding = r.varint();
     else r.skip(wire);
   }
@@ -288,6 +323,24 @@ export function encodeDocument(doc: ScipDocument, symbolBytes: (symbol: string) 
       pushVarint(occ, o.roles);
     }
     pushLen(d, 2, occ);
+  }
+  const bySymbol = new Map<string, string[]>();
+  for (const { symbol, target } of doc.implementations ?? []) {
+    const t = bySymbol.get(symbol);
+    if (t) t.push(target);
+    else bySymbol.set(symbol, [target]);
+  }
+  for (const [symbol, targets] of bySymbol) {
+    const info: number[] = [];
+    pushLen(info, 1, symbolBytes(symbol));
+    for (const target of targets) {
+      const rel: number[] = [];
+      pushLen(rel, 1, symbolBytes(target));
+      pushVarint(rel, 3 * 8 + WIRE_VARINT);
+      pushVarint(rel, 1);
+      pushLen(info, 4, rel);
+    }
+    pushLen(d, 3, info);
   }
   if (doc.language) pushLen(d, 4, Buffer.from(doc.language));
   if (doc.positionEncoding) {

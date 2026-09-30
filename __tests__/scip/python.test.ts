@@ -42,6 +42,9 @@ describe('SCIP merge (Python fixture)', () => {
     expect(edge('total', 'Invoice::total_price')?.provenance).toBe('scip');
     expect(edge('Service::run', 'Child::step')?.provenance).toBe('scip'); // Child().step()
     expect(edge('Child::step', 'Base::step')?.provenance).toBe('scip'); // super().step()
+    expect(cg.scipReadDb().prepare(`SELECT e.provenance FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+      WHERE e.kind = 'extends' AND s.qualified_name = 'Child' AND t.qualified_name = 'Base'`).all())
+      .toEqual([{ provenance: 'scip' }]); // class Child(Base): verified from SCIP relationships
     expect(edge('Service::run', 'Service::step')?.provenance).toBe('scip'); // self.step(), same line, same name
   });
 

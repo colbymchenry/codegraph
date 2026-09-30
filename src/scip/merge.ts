@@ -8,6 +8,8 @@
  * |                                        | confirm are deleted, SCIP's are inserted        |
  * | SCIP-only                              | insert `provenance='scip'` (nothing if external)|
  * | heuristic-only, caller file fresh      | keep, `metadata.scipSilent = true`              |
+ * | compiler target has no node, heuristic | verify, `metadata.scipDispatch = true` — the    |
+ * |   target implements it                 | call reaches it through an interface            |
  * | earlier SCIP edge SCIP no longer makes | delete (both ends fresh) or `scipStale = true`  |
  *
  * The flags are how answers tell a compiler-verified edge from an unverified one.
@@ -18,12 +20,14 @@
  */
 
 import type { SqliteDatabase } from '../db/sqlite-adapter';
-import { EXTERNAL, HeuristicSites, ScipSites, SiteKind, parseSiteKey, siteKey } from './sites';
+import { EXTERNAL, HeuristicSites, ScipSites, parseSiteKey, siteKey, siteKindOfEdge } from './sites';
 
 export interface MergeOutcome {
   agree: number;
   conflict: number;
   scipOnly: number;
+  /** heuristic edges to an implementation of an interface method that has no node, verified through it */
+  dispatchVerified: number;
   scipOnlyExternal: number;
   alreadyVerified: number;
   silent: number;
@@ -58,7 +62,7 @@ function byIds(db: SqliteDatabase, sqlPrefix: string, ids: number[]): number {
 
 export function merge(db: SqliteDatabase, scip: ScipSites, heuristic: HeuristicSites, freshFiles: Set<string>): MergeOutcome {
   const c: MergeOutcome = {
-    agree: 0, conflict: 0, scipOnly: 0, scipOnlyExternal: 0, alreadyVerified: 0, silent: 0,
+    agree: 0, conflict: 0, scipOnly: 0, dispatchVerified: 0, scipOnlyExternal: 0, alreadyVerified: 0, silent: 0,
     edgesUpdated: 0, edgesDeleted: 0, edgesInserted: 0,
     scipEdgesKept: 0, scipEdgesDropped: 0, scipEdgesStale: 0,
   };
@@ -68,30 +72,38 @@ export function merge(db: SqliteDatabase, scip: ScipSites, heuristic: HeuristicS
   // the same site, keeps its own column and is not duplicated.
   const existing = reconcileScipEdges(db, scip, freshFiles, c);
   const synthesized = db.prepare(`SELECT source, target, kind, line FROM edges
-    WHERE provenance = 'heuristic' AND kind IN ('calls', 'instantiates') AND line IS NOT NULL`).all() as
+    WHERE provenance = 'heuristic' AND kind IN ('calls', 'instantiates', 'implements', 'extends') AND line IS NOT NULL`).all() as
     Array<{ source: string; target: string; kind: string; line: number }>;
   for (const e of synthesized) existing.add(edgeKey(e.source, e.target, e.kind, e.line));
 
   const verify: number[] = [];
+  const verifyDispatch: number[] = [];
   const remove: number[] = [];
   const silent: number[] = [];
-  const insert: Array<[string, string, SiteKind, number, number]> = [];
+  const insert: Array<[string, string, string, number, number]> = [];
 
   for (const key of new Set([...heuristic.keys(), ...scip.sites.keys()])) {
     const hs = heuristic.get(key);
     const resolved = scip.sites.get(key);
+    const dispatch = scip.dispatch.get(key);
+    const viaInterface = (target: string, ids: number[]) => {
+      if (!dispatch?.has(target)) return false;
+      verifyDispatch.push(...ids);
+      c.dispatchVerified += ids.length;
+      return true;
+    };
     if (!resolved) {
-      for (const ids of hs?.values() ?? []) silent.push(...ids);
+      for (const [target, ids] of hs ?? []) if (!viaInterface(target, ids)) silent.push(...ids);
       continue;
     }
     const { source, line, kind } = parseSiteKey(key);
     let added = 0;
-    for (const { target, col } of resolved.values()) {
+    for (const { target, col, edgeKind = kind } of resolved.values()) {
       if (target === EXTERNAL || hs?.has(target)) continue;
-      const k = edgeKey(source, target, kind, line);
+      const k = edgeKey(source, target, edgeKind, line);
       if (existing.has(k)) continue;
       existing.add(k);
-      insert.push([source, target, kind, line, col]);
+      insert.push([source, target, edgeKind, line, col]);
       added++;
     }
     if (!hs) {
@@ -106,6 +118,8 @@ export function merge(db: SqliteDatabase, scip: ScipSites, heuristic: HeuristicS
       if (resolved.has(target)) {
         verify.push(...ids);
         confirmed++;
+      } else if (viaInterface(target, ids)) {
+        confirmed++;
       } else {
         remove.push(...ids); // the compiler resolved this call elsewhere
       }
@@ -114,7 +128,8 @@ export function merge(db: SqliteDatabase, scip: ScipSites, heuristic: HeuristicS
     else c.conflict++;
   }
 
-  c.edgesUpdated += byIds(db, `UPDATE edges SET provenance = 'scip' WHERE id IN`, verify);
+  c.edgesUpdated += byIds(db, `UPDATE edges SET provenance = 'scip', ${CLEAR_FLAG('scipDispatch')} WHERE id IN`, verify);
+  c.edgesUpdated += byIds(db, `UPDATE edges SET provenance = 'scip', ${SET_FLAG('scipDispatch')} WHERE id IN`, verifyDispatch);
   c.edgesDeleted += byIds(db, 'DELETE FROM edges WHERE id IN', remove);
   c.silent += byIds(db, `UPDATE edges SET ${SET_FLAG('scipSilent')} WHERE id IN`, silent);
   insert.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); // by source: the identity index's leading column
@@ -139,7 +154,7 @@ function reconcileScipEdges(db: SqliteDatabase, scip: ScipSites, freshFiles: Set
     SELECT e.id, e.source, e.target, e.kind, e.line, t.name AS name, s.file_path AS src_file, t.file_path AS tgt_file
     FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
     WHERE e.provenance = 'scip'`).all() as Array<{
-      id: number; source: string; target: string; kind: SiteKind; line: number | null;
+      id: number; source: string; target: string; kind: string; line: number | null;
       name: string; src_file: string; tgt_file: string;
     }>;
   const kept = new Set<string>();
@@ -147,8 +162,8 @@ function reconcileScipEdges(db: SqliteDatabase, scip: ScipSites, freshFiles: Set
   const drop: number[] = [];
   const stale: number[] = [];
   for (const r of rows) {
-    const key = r.line === null ? null : siteKey(r.source, r.line, r.name, r.kind);
-    if (key && scip.sites.get(key)?.has(r.target)) {
+    const key = r.line === null ? null : siteKey(r.source, r.line, r.name, siteKindOfEdge(r.kind));
+    if (key && (scip.sites.get(key)?.has(r.target) || scip.dispatch.get(key)?.has(r.target))) {
       keep.push(r.id);
       kept.add(edgeKey(r.source, r.target, r.kind, r.line!));
     } else if (freshFiles.has(r.src_file) && freshFiles.has(r.tgt_file) && !(key && scip.unknown.has(key))) {

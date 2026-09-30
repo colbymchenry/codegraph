@@ -22,7 +22,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { pathToFileURL } from 'url';
-import { ROLE_DEFINITION, ScipOccurrence, encodeDocument, encodeMetadata, escapeIdentifier as esc } from '../reader';
+import { ROLE_DEFINITION, ScipImplementation, ScipOccurrence, encodeDocument, encodeMetadata, escapeIdentifier as esc } from '../reader';
 import { RUN_WARNING } from './index';
 import { packageVersion } from './typescript';
 
@@ -40,6 +40,11 @@ interface TsNode {
   name?: TsNode;
   expression?: TsNode;
   parent?: TsNode;
+  // class/interface heritage: clauses → types → the base's name (Identifier, QualifiedName.right, PropertyAccess.name)
+  heritageClauses?: Iterable<{ types: Iterable<TsNode> }>;
+  typeName?: TsNode;
+  right?: TsNode;
+  members?: Iterable<TsNode>;
   forEachChild(visit: (n: TsNode) => unknown): unknown;
 }
 interface TsSourceFile extends TsNode {
@@ -49,9 +54,11 @@ interface TsSourceFile extends TsNode {
 interface TsSymbol {
   id: number;
   name: string;
+  escapedName: string;
+  getMembers(): ReadonlyMap<string, TsSymbol>;
   flags: number;
   checkFlags: number;
-  declarations?: readonly { path: string; index: number }[];
+  declarations?: readonly { path: string; index: number; kind: number }[];
 }
 interface TsProject {
   configFileName: string;
@@ -67,7 +74,7 @@ interface TsApi {
 interface Loaded {
   api: TsApi;
   SyntaxKind: Record<string, number>;
-  SymbolFlags: Record<'Alias' | 'Class' | 'Function' | 'Method' | 'Variable' | 'Property', number>;
+  SymbolFlags: Record<'Alias' | 'Class' | 'Interface' | 'Function' | 'Method' | 'Variable' | 'Property', number>;
   CheckFlags: Record<'Synthetic', number>;
   skipTrivia(text: string, pos: number): number;
   version: string;
@@ -117,6 +124,7 @@ export async function indexProjects(tsDir: string, output: string, root: string,
   const F = ts.SymbolFlags;
   const C = ts.CheckFlags;
   const CALLEE_HOLDERS = new Set([K.CallExpression, K.NewExpression]);
+  const TYPE_DECLS = new Set([K.ClassDeclaration, K.ClassExpression, K.InterfaceDeclaration]);
   const NAMES = new Set([K.Identifier, K.PrivateIdentifier]);
   const UNWRAP = new Set([K.NonNullExpression, K.ParenthesizedExpression]);
 
@@ -126,6 +134,8 @@ export async function indexProjects(tsDir: string, output: string, root: string,
 
   /** repo-relative path → the occurrences of its document (files indexed, plus files holding definitions) */
   const docs = new Map<string, ScipOccurrence[]>();
+  /** repo-relative path → its types' and members' implementation relationships */
+  const implementations = new Map<string, ScipImplementation[]>();
   const docOf = (file: string) => {
     let occ = docs.get(file);
     if (!occ) docs.set(file, (occ = []));
@@ -190,14 +200,24 @@ export async function indexProjects(tsDir: string, output: string, root: string,
     };
 
     /**
+     * The declaration a symbol is named after: its first — except that a type
+     * (`#`) is named after its class/interface declaration, not a value merged
+     * into it (vscode's `const IFoo = createDecorator<IFoo>()` beside `interface IFoo`).
+     */
+    const primary = (t: TsSymbol, suffix: string): Decl | undefined => {
+      const decls = t.declarations ?? [];
+      return (suffix === '#' && decls.find(d => TYPE_DECLS.has(d.kind))) || decls[0];
+    };
+
+    /**
      * The declarations a callee stands for: its first one (an overload's first
      * signature), or — for a member of a union/intersection type, a synthetic
      * symbol whose declarations are every constituent's — the first per
      * constituent, since the call may reach any of them.
      */
-    const targetsOf = (t: TsSymbol): Decl[] => {
+    const targetsOf = (t: TsSymbol, suffix: string): Decl[] => {
       const decls = t.declarations ?? [];
-      if (!(t.checkFlags & C.Synthetic)) return decls.slice(0, 1);
+      if (!(t.checkFlags & C.Synthetic)) return decls.length ? [primary(t, suffix)!] : [];
       const seen = new Set<string>();
       return decls.filter(d => {
         const parent = nodeOf(d)?.node?.parent;
@@ -206,38 +226,94 @@ export async function indexProjects(tsDir: string, output: string, root: string,
       });
     };
 
-    /** The SCIP symbols of a callee; for project declarations, also records the definition. */
-    const symbolsOf = (s: TsSymbol, isNew: boolean): string[] => {
-      let t = s;
-      if (s.flags & F.Alias) {
-        let a = aliases.get(s.id);
-        if (!a) aliases.set(s.id, (a = checker.getAliasedSymbol(s)));
-        t = a;
+    const resolve = (s: TsSymbol) => {
+      if (!(s.flags & F.Alias)) return s;
+      let a = aliases.get(s.id);
+      if (!a) aliases.set(s.id, (a = checker.getAliasedSymbol(s)));
+      return a;
+    };
+
+    /**
+     * The SCIP symbol for `t` declared at `decl`; for a project declaration also
+     * records its definition. External ones carry their package path and node
+     * index, so two same-named declarations never read as one symbol.
+     */
+    const named = (t: TsSymbol, decl: Decl, suffix: string): string => {
+      if (!inRepo(decl.path)) {
+        const nm = decl.path.lastIndexOf('/node_modules/');
+        const where = nm >= 0 ? decl.path.slice(nm + '/node_modules/'.length) : path.basename(decl.path);
+        return `tsgo npm . . ${esc(where)}/${decl.index}/${esc(t.name)}${suffix}`;
       }
+      const file = rel(decl.path);
+      const symbol = `tsgo . . . ${esc(file)}/${decl.index}/${esc(t.name)}${suffix}`;
+      if (defined.has(symbol)) return symbol;
+      defined.add(symbol);
+      // Defined at the declaration's name (its start when it has none, e.g. `export default class {`).
+      // Always defined somewhere: a project symbol without a definition would read as external.
+      const at = nodeOf(decl);
+      let range = { startLine: 0, startCol: 0, endLine: 0, endCol: 0 };
+      if (at?.node) {
+        const { sf, node } = at;
+        const start = ts.skipTrivia(sf.text, (node.name ?? node).pos);
+        range = span(decl.path, sf.text, start, node.name ? node.name.end : start);
+      }
+      docOf(file).push({ range, symbol, roles: ROLE_DEFINITION });
+      return symbol;
+    };
+    const first = (t: TsSymbol, suffix: string) => { const d = primary(t, suffix); return d ? named(t, d, suffix) : null; };
+
+    /** The SCIP symbols of a callee. */
+    const symbolsOf = (s: TsSymbol, isNew: boolean): string[] => {
+      const t = resolve(s);
       const suffix = t.flags & F.Class ? '#'
         : isNew ? null // `new` of a non-class value: nothing codegraph models
         : t.flags & (F.Function | F.Method) ? '().'
         : t.flags & (F.Variable | F.Property) ? '.' // a function-valued binding; the merge keeps it only if it maps to a callable
         : null;
       if (!suffix) return [];
-      return targetsOf(t).map(decl => {
-        if (!inRepo(decl.path)) return `tsgo npm . . ${esc(t.name)}${suffix}`;
-        const file = rel(decl.path);
-        const symbol = `tsgo . . . ${esc(file)}/${decl.index}/${esc(t.name)}${suffix}`;
-        if (defined.has(symbol)) return symbol;
-        defined.add(symbol);
-        // Defined at the declaration's name (its start when it has none, e.g. `export default class {`).
-        // Always defined somewhere: a project symbol without a definition would read as external.
-        const at = nodeOf(decl);
-        let range = { startLine: 0, startCol: 0, endLine: 0, endCol: 0 };
-        if (at?.node) {
-          const { sf, node } = at;
-          const start = ts.skipTrivia(sf.text, (node.name ?? node).pos);
-          range = span(decl.path, sf.text, start, node.name ? node.name.end : start);
+      return targetsOf(t, suffix).map(decl => named(t, decl, suffix));
+    };
+
+    /** Where a heritage entry names its base (Identifier, QualifiedName.right, PropertyAccess.name). */
+    const heritageName = (text: string, t: TsNode): number | null => {
+      const n = t.typeName ?? t.expression;
+      const leaf = n && (n.kind === K.Identifier ? n : n.right ?? n.name);
+      return leaf && leaf.kind === K.Identifier ? ts.skipTrivia(text, leaf.pos) : null;
+    };
+
+    /** A member's suffix, for relationships: methods and properties (a property may hold a function). */
+    const memberSuffix = (t: TsSymbol) => (t.flags & F.Method ? '().' : t.flags & F.Property ? '.' : null);
+    const members = new Map<number, ReadonlyMap<string, TsSymbol>>();
+    const membersOf = (t: TsSymbol) => {
+      let m = members.get(t.id);
+      if (!m) members.set(t.id, (m = t.getMembers()));
+      return m;
+    };
+    /** A class/interface's own bases, from its declarations' heritage clauses. */
+    const basesOfCache = new Map<number, TsSymbol[]>();
+    const basesOf = (t: TsSymbol): TsSymbol[] => {
+      let out = basesOfCache.get(t.id);
+      if (out) return out;
+      basesOfCache.set(t.id, (out = []));
+      for (const d of t.declarations ?? []) {
+        const at = nodeOf(d);
+        const positions: number[] = [];
+        for (const clause of at?.node?.heritageClauses ?? []) {
+          for (const h of clause.types) { const p = heritageName(at!.sf.text, h); if (p !== null) positions.push(p); }
         }
-        docOf(file).push({ range, symbol, roles: ROLE_DEFINITION });
-        return symbol;
-      });
+        if (positions.length === 0) continue;
+        for (const b of checker.getSymbolAtPosition(d.path, positions)) if (b) out.push(resolve(b));
+      }
+      return out;
+    };
+    /** The member `name` a type declares or inherits (nearest base first). */
+    const memberOf = (t: TsSymbol, name: string, seen = new Set<number>()): TsSymbol | undefined => {
+      if (seen.has(t.id)) return undefined;
+      seen.add(t.id);
+      const own = membersOf(t).get(name);
+      if (own) return own;
+      for (const b of basesOf(t)) { const m = memberOf(b, name, seen); if (m) return m; }
+      return undefined;
     };
 
     for (const f of program.getSourceFileNames()) {
@@ -250,7 +326,17 @@ export async function indexProjects(tsDir: string, output: string, root: string,
       if (!sf) continue;
       indexed.add(rel(f));
       const sites: { start: number; end: number; isNew: boolean }[] = [];
+      /** classes/interfaces with bases: positions of their name, each base's name, each member's name */
+      const types: { at: number; bases: number[]; members: number[] }[] = [];
+      const baseName = (t: TsNode) => heritageName(sf.text, t);
       const visit = (n: TsNode): undefined => {
+        if (TYPE_DECLS.has(n.kind) && n.name && n.heritageClauses) {
+          const bases: number[] = [];
+          for (const clause of n.heritageClauses) for (const t of clause.types) { const at = baseName(t); if (at !== null) bases.push(at); }
+          const mem: number[] = [];
+          for (const m of n.members ?? []) if (m.name && NAMES.has(m.name.kind)) mem.push(ts.skipTrivia(sf.text, m.name.pos));
+          if (bases.length) types.push({ at: ts.skipTrivia(sf.text, n.name.pos), bases, members: mem });
+        }
         if (CALLEE_HOLDERS.has(n.kind) && n.expression) {
           let e: TsNode | undefined = n.expression;
           while (e && UNWRAP.has(e.kind)) e = e.expression;
@@ -262,13 +348,41 @@ export async function indexProjects(tsDir: string, output: string, root: string,
       };
       sf.forEachChild(visit);
       const occ = docOf(rel(f));
-      const symbols = sites.length ? checker.getSymbolAtPosition(f, sites.map(s => s.start)) : [];
-      symbols.forEach((s, i) => {
-        const site = sites[i]!;
+      // One round trip per file: call sites first, then the types' names, bases and members.
+      const positions = sites.map(s => s.start);
+      for (const t of types) positions.push(t.at, ...t.bases, ...t.members);
+      const symbols = positions.length ? checker.getSymbolAtPosition(f, positions) : [];
+      sites.forEach((site, i) => {
+        const s = symbols[i];
         if (!s) return;
         const range = span(f, sf.text, site.start, site.end);
         for (const symbol of new Set(symbolsOf(s, site.isNew))) occ.push({ range, symbol, roles: 0 });
       });
+      // Type → base and member → the base's member of the same name: what `implements`/`extends`
+      // edges and calls through an interface are judged by.
+      let i = sites.length;
+      const rels: ScipImplementation[] = [];
+      for (const t of types) {
+        const self = symbols[i++];
+        const bases = t.bases.map(() => symbols[i++]).filter((b): b is TsSymbol => !!b).map(resolve)
+          .filter(b => b.flags & (F.Class | F.Interface));
+        const mems = t.members.map(() => symbols[i++]);
+        const selfName = self && first(self, '#');
+        if (!selfName) continue;
+        for (const b of bases) {
+          const target = first(b, '#');
+          if (target) rels.push({ symbol: selfName, target });
+          for (const m of mems) {
+            const suffix = m && memberSuffix(m);
+            const bm = suffix ? memberOf(b, m!.escapedName) : undefined;
+            const bSuffix = bm && memberSuffix(bm);
+            const from = bSuffix ? first(m!, suffix!) : null;
+            const to = from && first(bm!, bSuffix!);
+            if (from && to) rels.push({ symbol: from, target: to });
+          }
+        }
+      }
+      if (rels.length) implementations.set(rel(f), rels);
       // Fetched ASTs stay cached client-side; on a large project that's gigabytes.
       // Drop them (and our line tables) now and then — a file needed again is refetched.
       if (indexed.size % CACHE_FILES === 0) {
@@ -313,7 +427,10 @@ export async function indexProjects(tsDir: string, output: string, root: string,
     };
     for (const [file, occurrences] of docs) {
       if (!indexed.has(file)) continue;
-      fs.writeSync(fd, encodeDocument({ relativePath: file, language: 'typescript', positionEncoding: POSITION_ENCODING_UTF16, occurrences }, symbolBytes));
+      fs.writeSync(fd, encodeDocument({
+        relativePath: file, language: 'typescript', positionEncoding: POSITION_ENCODING_UTF16, occurrences,
+        implementations: implementations.get(file),
+      }, symbolBytes));
     }
   } finally {
     fs.closeSync(fd);

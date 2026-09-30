@@ -116,6 +116,21 @@ Differences from the POC:
 - With tsgo, an object-literal method *definition* that implements an interface (`{ listen(e) { … } }`) is not a call. scip-typescript records it as a reference to the interface method, so the merge used to add a `calls` edge for it.
 - Protobuf is read and written by a small hand-written codec (`src/scip/reader.ts`) instead of `@bufbuild/protobuf` plus codegen. The fork adds no runtime dependency. It accepts both the legacy `int32` ranges and the typed ranges, and streams documents one at a time.
 
+### Types and calls through interfaces
+
+Indexers record implementation relationships: class → base class or interface, and method → the method it implements or overrides. scip-typescript, scip-python and scip-go emit them, and tsgo-index computes them from heritage clauses, following inherited members through base types. rust-analyzer emits none, so Rust gets neither of the uses below.
+
+- **`implements` / `extends` edges** are judged like call sites. They are keyed at the type's own line (where codegraph puts them) under one kind, `inherits`, since codegraph and the compiler may label the same base differently. The inserted kind comes from the node kinds: a class/struct → interface/trait `implements`, anything else `extends`. codegraph's own synthesized Go `implements` edges are left alone and not duplicated. In tsgo-index a type symbol is named after its class/interface declaration, not a value merged into it. Otherwise vscode's `const IFoo = createDecorator<IFoo>()` beside `interface IFoo` would leave most of its `implements` edges unjudged.
+- **Calls through an interface that has no node.** An example is the target declared in a file over codegraph's size limit, such as Playwright's generated `types.d.ts`. A heuristic edge to a method that (transitively) implements the compiler's target is verified with `metadata.scipDispatch`, and MCP reads it as *compiler-verified, through the interface it implements*. A same-named method that doesn't implement it stays unverified. Nothing is deleted on the strength of an implementation set, since structural typing makes such sets incomplete. When the interface method *does* have a node, the compiler's caller → interface edge still wins, as before.
+
+| corpus | `implements`/`extends` compiler-backed | left heuristic | calls verified through an interface | unverified call edges |
+|---|---|---|---|---|
+| Playwright | 164 / 337 | 16 | 15,130 | 29,629 → 14,682 |
+| vscode | 5,875 / 10,293 | 146 / 104 | 779 | 100,429 → 99,770 |
+| Django | – / 8,229 | – / 933 | 44 | |
+
+The eval gates are unchanged on all four languages.
+
 MCP output: Flow steps read `↓ calls (compiler-verified)` or `(unverified: …)`. Trail entries get ` [unverified]`.
 
 ## Eval gate
@@ -211,4 +226,4 @@ Known residue: ripgrep's multi-line `const X: T = T { … }` items. codegraph at
 - Phase 2 (Python): done.
 - Phase 3 (Go) and Phase 4 (Rust): done.
 - TS/JS via tsgo (TypeScript ≥ 7.1): done; preferred over scip-typescript when installed.
-- Next: Phase 5, `implements`/`extends` from SCIP relationships, and `references`.
+- Phase 5: `implements`/`extends` and calls through interfaces from SCIP relationships: done (Rust excluded: rust-analyzer emits no relationships). `references` edges were not needed for the gaps found and are not done.
