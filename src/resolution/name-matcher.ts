@@ -784,6 +784,21 @@ function isCrossFileReachable(
   );
 }
 
+const LUA_LOCALS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/** Whether a Lua variable or function is declared `local` (`local x = …`, `local function f`, `local a, x = …`). */
+function isLuaLocal(candidate: Node, context: ResolutionContext): boolean {
+  if (candidate.kind !== 'variable' && candidate.kind !== 'constant' && candidate.kind !== 'function') return false;
+  let memo = LUA_LOCALS.get(context);
+  if (!memo) LUA_LOCALS.set(context, (memo = new Map()));
+  const hit = memo.get(candidate.id);
+  if (hit !== undefined) return hit;
+  const line = (context.getFileLines?.(candidate.filePath) ?? context.readFile(candidate.filePath)?.split(/\r?\n/))?.[candidate.startLine - 1] ?? '';
+  const local = /^\s*local\b/.test(line);
+  memo.set(candidate.id, local);
+  return local;
+}
+
 /**
  * Languages in which `visibility: 'private'` on a definition means no other
  * FILE can name it: a Kotlin `private fun` is file- or class-local, and the
@@ -929,6 +944,9 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
     return ref.filePath.startsWith(owner + '/');
   }
   if (PRIVATE_IS_FILE_LOCAL.has(lang)) return candidate.visibility !== 'private';
+  // A Lua `local` belongs to its chunk: kong's spec helpers' `local it = it`
+  // took busted's `it(…)` in every other spec file, 4,166 times.
+  if ((lang === 'lua' || lang === 'luau') && isLuaLocal(candidate, context)) return false;
   // JS/TS/ArkTS sealed modules + markdown/JSON call-target guards (#1719).
   // Same predicate matchByExactName / matchFuzzy apply to their survivors so a
   // rejection here cannot fall through to a promoted runner-up.
@@ -2787,6 +2805,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   LEXICAL_SCOPE_MEMO.delete(context);
   JAVA_SUPERS.delete(context);
   PHP_SUPERS.delete(context);
+  LUA_LOCALS.delete(context);
   PHP_FILE_SCOPES.delete(context);
   JAVA_STATIC_IMPORTS.delete(context);
   PY_IMPORTS.delete(context);
