@@ -1493,6 +1493,116 @@ function dartHeadOf(decl: Node, context: ResolutionContext): { supers: string[];
   };
 }
 
+/**
+ * How a bare Rust or Go name is written at its call: `path` after `::` (left
+ * to the path strategies), `chained` after a `.` — with the receiver it is
+ * written on, call and type arguments dropped — or `bare`. The extractors
+ * keep one receiver level, so `sym.filename().map(From::from)` and
+ * `child.Flags().String("f", …)` arrive as bare `map` / `String`.
+ */
+function rustGoCallShape(ref: UnresolvedRef, context: ResolutionContext): { shape: 'path' } | { shape: 'bare' } | { shape: 'chained'; receiver: string } | null {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return null;
+  const name = ref.referenceName;
+  let start = line.startsWith(name, ref.column) ? ref.column : -1;
+  if (start < 0) {
+    const m = new RegExp(`(?<![\\w$])${name}\\s*(?:\\(|::<|!)`).exec(line);
+    start = m ? m.index : -1;
+  }
+  if (start < 0) return null;
+  const before = line.slice(0, start);
+  if (/::\s*$/.test(before)) return { shape: 'path' };
+  if (!/\.\s*$/.test(before)) return { shape: 'bare' };
+  return { shape: 'chained', receiver: rustGoReceiverName(before.replace(/\?\s*\.\s*$/, '')) };
+}
+
+/**
+ * The receiver a Rust / Go `….name(` is written on, as its path and dotted
+ * identifiers with arguments dropped — `Command::new("x").short_flag('f')` →
+ * `Command::new.short_flag`, a macro `arg!(…)` → `arg`, a Go composite
+ * literal `(JSON{data})` → `JSON`. Read backwards to the expression's start.
+ */
+function rustGoReceiverName(text: string): string {
+  let out = '';
+  let i = text.replace(/\s*\.\s*$/, '').length - 1;
+  const src = text.replace(/\s*\.\s*$/, '');
+  while (i >= 0) {
+    const ch = src[i]!;
+    if (ch === ')' || ch === ']' || ch === '}') {
+      const open = ch === ')' ? '(' : ch === ']' ? '[' : '{';
+      let depth = 0;
+      let j = i;
+      for (; j >= 0; j--) {
+        if (src[j] === ch) depth++;
+        else if (src[j] === open && --depth === 0) break;
+      }
+      if (j < 0) return '';
+      // `(JSON{data})` — a parenthesized composite literal names its type.
+      if (ch === ')' && out === '') {
+        const literal = /^\(\s*&?\s*([A-Za-z_][\w.]*)\s*\{/.exec(src.slice(j, i + 1));
+        if (literal) return literal[1]!;
+      }
+      i = j - 1;
+    } else if (/[\w$.:!]/.test(ch)) {
+      if (ch !== '!') out = ch + out;
+      i--;
+    } else break;
+  }
+  return out.replace(/^[.:]+|[.:]+$/g, '');
+}
+
+/**
+ * Whether a Rust / Go call of that shape can mean `n`. A bare call never
+ * reaches a method (Rust needs `self.` / `Type::`, Go a receiver): axum's
+ * routing `get(handler)` went to a cookie jar's `get`. A chained call reaches
+ * a method of what its receiver is named after (or of `self`), never a free
+ * function: tokio's `sym.filename().map(…)` went to `MutexGuard::map` 156
+ * times, cobra's `c.Flags().String(…)` to a test type's `String`.
+ */
+function isRustGoCallTarget(n: Node, shape: ReturnType<typeof rustGoCallShape>): boolean {
+  if (!shape || shape.shape === 'path') return true;
+  const member = n.kind === 'method';
+  if (shape.shape === 'bare') return !member;
+  if (!member) return n.kind !== 'function';
+  // A name the standard library's own types all carry (`unwrap`, `clone`,
+  // `iter`, Go's `String` / `Get`) needs a receiver named after the owner; a
+  // project-specific one keeps its match — clap's `flag("n").short('n')` is
+  // `Arg::short`, cobra's `c.Root().Name()` `Command::Name`.
+  const std = (n.language === 'go' ? GO_STD_METHODS : RUST_STD_METHODS).has(n.name);
+  return !std || /^(?:self|Self)$/.test(shape.receiver) || (shape.receiver !== '' && sharesReceiverWord(shape.receiver, n));
+}
+
+/**
+ * Methods of Rust's Option / Result / iterators / collections / strings /
+ * smart pointers — names a project type rarely carries itself. Ones it often
+ * does (`get`, `set`, `insert`, `next`, `call`, `read`) are left out: serde's
+ * `Attr::set`, clap's own `get`.
+ */
+const RUST_STD_METHODS: ReadonlySet<string> = new Set([
+  'unwrap', 'unwrap_or', 'unwrap_or_else', 'unwrap_or_default', 'unwrap_err', 'unwrap_unchecked', 'expect',
+  'expect_err', 'ok', 'err', 'map', 'map_err', 'map_or', 'map_or_else', 'and_then', 'or_else', 'ok_or',
+  'ok_or_else', 'is_some', 'is_none', 'is_ok', 'is_err', 'is_some_and', 'as_ref', 'as_mut', 'as_deref', 'clone',
+  'cloned', 'copied', 'iter', 'iter_mut', 'into_iter', 'collect', 'enumerate', 'zip', 'rev', 'chain', 'skip',
+  'step_by', 'peekable', 'flat_map', 'filter_map', 'flatten', 'any', 'all', 'len', 'is_empty', 'push', 'push_str',
+  'pop', 'extend', 'drain', 'clear', 'retain', 'truncate', 'reserve', 'with_capacity', 'capacity', 'sort',
+  'sort_by', 'sort_by_key', 'dedup', 'split_off', 'contains_key', 'to_string', 'to_owned', 'to_vec', 'as_str',
+  'as_bytes', 'as_slice', 'as_ptr', 'into', 'try_into', 'borrow', 'borrow_mut', 'deref', 'deref_mut', 'chars',
+  'bytes', 'lines', 'starts_with', 'ends_with', 'trim', 'to_lowercase', 'to_uppercase', 'windows', 'chunks',
+  'then', 'then_some', 'eq', 'cmp', 'partial_cmp', 'read_to_end', 'read_to_string', 'fetch_add', 'fetch_sub',
+]);
+
+/**
+ * Methods of Go's standard types and interfaces — `fmt.Stringer`, `error`,
+ * `http.ResponseWriter`, `sync` locks, `reflect`, `time`. Ones a project type
+ * often carries itself (`Get`, `Set`, `Close`, `Value`, `Next`) are left out:
+ * gin's `c.Set(…)` is its Context's.
+ */
+const GO_STD_METHODS: ReadonlySet<string> = new Set([
+  'String', 'Error', 'Unwrap', 'Is', 'As', 'Header', 'WriteHeader', 'WriteString', 'Lock', 'Unlock', 'RLock',
+  'RUnlock', 'Err', 'Deadline', 'Int', 'Bool', 'Float64', 'Int64', 'Uint64', 'Bytes', 'Len', 'Cap', 'Seconds',
+  'Unix', 'Before', 'After', 'Equal', 'IsNil', 'IsValid', 'Elem', 'NumField', 'Interface', 'Kind',
+]);
+
 const SCALA_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'trait', 'interface', 'enum', 'struct', 'module', 'namespace']);
 const SCALA_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'field', 'property', 'variable', 'constant']);
 const SCALA_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
@@ -2640,8 +2750,11 @@ export function matchByExactName(
     ? objcCallShape(ref, context) : null;
   const csharpBare = ref.language === 'csharp' && (ref.referenceKind === 'calls' || ref.referenceKind === 'references') && /^[A-Za-z_]\w*$/.test(ref.referenceName);
   const scalaBare = ref.language === 'scala' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
+  const rustGoShape = (ref.language === 'rust' || ref.language === 'go') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)
+    ? rustGoCallShape(ref, context) : null;
   const phpSelf = phpSelfReceiver(ref, context);
   const filtered = sameName.filter((n) =>
+    !(rustGoShape && !isRustGoCallTarget(n, rustGoShape)) &&
     !(scalaBare && !isScalaMemberInScope(n, ref, context)) &&
     !(csharpBare && !isCsharpMemberInScope(n, ref, context)) &&
     !(objcShape === 'c-call' && OBJC_MEMBER_KINDS.has(n.kind)) &&
@@ -4779,6 +4892,11 @@ export function matchMethodCall(
     // 1,201 times; lobsters' `value.to_s` to a short-id class's.
     if (targetMethods.length === 1 && !narrowed && targetMethods[0]!.language === ref.language &&
         !((ref.language === 'lua' || ref.language === 'luau') && isLuaLibraryCall(objectOrClass!, methodName!, ref, targetMethods[0]!)) &&
+        // Rust / Go: a standard-library method name on an untyped receiver
+        // (`sym.map(…)`, `w.Header().Get(…)`) is the library type's.
+        !((ref.language === 'rust' || ref.language === 'go') &&
+          (ref.language === 'go' ? GO_STD_METHODS : RUST_STD_METHODS).has(methodName!) &&
+          !/^(?:self|Self)$/.test(objectOrClass!) && !sharesReceiverWord(objectOrClass!, targetMethods[0]!)) &&
         !(UNTYPED_RECEIVER_LANGUAGES.has(ref.language) && !/^(?:self|self\.class|this|super|weak_?self|strong_?self)$/i.test(objectOrClass!) &&
           !sharesReceiverWord(objectOrClass!, targetMethods[0]!) &&
           !(ref.language === 'objc' && objcReceiverReaches(objectOrClass!, targetMethods[0]!, context)) &&
@@ -5894,6 +6012,8 @@ export function matchFuzzy(
     ? objcCallShape(ref, context) : null;
   const csharpBare = ref.language === 'csharp' && (ref.referenceKind === 'calls' || ref.referenceKind === 'references') && /^[A-Za-z_]\w*$/.test(ref.referenceName);
   const scalaBare = ref.language === 'scala' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
+  const rustGoShape = (ref.language === 'rust' || ref.language === 'go') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)
+    ? rustGoCallShape(ref, context) : null;
   const phpSelf = phpSelfReceiver(ref, context);
   // Names are case-sensitive in every language but a handful: Rust's
   // `Bytes` is not the method `bytes`, Python's builtin `dir(…)` not a class
@@ -5917,6 +6037,7 @@ export function matchFuzzy(
     !(objcShape === 'self-send' && !isObjcSelfSendTarget(n, ref, context)) &&
     !(csharpBare && !isCsharpMemberInScope(n, ref, context)) &&
     !(scalaBare && !isScalaMemberInScope(n, ref, context)) &&
+    !(rustGoShape && !isRustGoCallTarget(n, rustGoShape)) &&
     !(phpSelf && (n.kind !== 'method' || !isPhpMethodInScope(n, ref, phpSelf, context))))
     .filter((n) => (ref.referenceKind !== 'references' && ref.referenceKind !== 'function_ref') ||
       sameLanguageFamily(n.language, ref.language));

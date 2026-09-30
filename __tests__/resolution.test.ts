@@ -1339,12 +1339,9 @@ impl<T> Source for BufSource<T> {
       // The two ways this could overreach. `self.missing()` names nothing on
       // the owner, so it must not fall back to some other type's `missing`.
       //
-      // The receiver-less half is pinned as it BEHAVES, not as it should: a
-      // bare `reset()` is a free-function call, and it already resolved to
-      // `Target::reset` before this change — the mirror image of #1861, where
-      // a call with no receiver is given one. That is a separate defect in the
-      // bare-name strategy, measured on this branch's parent; the cell is here
-      // so this change is pinned to not make it worse.
+      // And a bare `reset()` is a free-function call: Rust reaches a method
+      // only through `self.` or `Type::`, so it is the free `reset`, never
+      // `Target::reset` (it used to be — the mirror image of #1861).
       writeRustCrate(tempDir, {
         'lib.rs':
           'pub fn reset() {}\n\n' +
@@ -1355,8 +1352,7 @@ impl<T> Source for BufSource<T> {
       });
       cg = await CodeGraph.init(tempDir, { index: true });
 
-      // Unchanged by this commit — see the note above.
-      expect(callsFrom('Target::free').map((c) => c.target)).toEqual(['Target::reset']);
+      expect(callsFrom('Target::free').map((c) => c.target)).toEqual(['reset']);
       // Nothing on the owner is named `missing`, so no edge at all.
       expect(callsFrom('Target::absent')).toEqual([]);
     });
