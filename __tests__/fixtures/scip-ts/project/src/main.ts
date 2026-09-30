@@ -1,4 +1,4 @@
-import { Invoice, Order, helper } from './models';
+import { Invoice, Order, Registry, helper } from './models';
 
 export function sum(invoices: Invoice[]): number {
   const list: number[] = [];
@@ -24,4 +24,9 @@ class Service {
   private step(): number {
     return helper(1);
   }
+}
+
+export function usesOverloads(r: Registry): number {
+  r.lookup('a');
+  return r.lookup(1);
 }

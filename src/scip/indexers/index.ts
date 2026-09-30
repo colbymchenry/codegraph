@@ -31,13 +31,19 @@ export interface IndexerRun {
   label: string;
   args: string[];
   output: string;
+  /** added to the invocation's env for this run (e.g. a smaller heap for a light batch) */
+  env?: Record<string, string>;
+  /** light enough to run alongside other light runs; heavy runs always run alone */
+  light?: boolean;
+  /** runs to try instead when this one fails (a batch retried one project at a time) */
+  fallback?: IndexerRun[];
 }
 
 /**
  * How to index one project. Usually a single run; an adapter may split a large
- * repo into several (one process per sub-project keeps peak memory at the size
- * of the largest part). Their outputs are concatenated — concatenated SCIP
- * `Index` messages are themselves one valid index.
+ * repo into several — heavy parts alone, light parts batched and in parallel —
+ * so peak memory is bounded by the largest part. The outputs are combined into
+ * one index (see compact.ts).
  */
 export interface Invocation {
   runs: IndexerRun[];
@@ -159,13 +165,15 @@ export function resolveIndexer(projectRoot: string, lang: ScipLanguage, outFile:
   // The adapter's environment (e.g. an activated venv) and its split into runs
   // apply even when the args are overridden: `{args}` / `{out}` are per run.
   const inv = spec.invocation(projectRoot, outFile);
-  const runs = override?.args
-    ? inv.runs.map(run => ({
-      ...run,
-      args: override.args!.flatMap(a => (a === '{args}' ? run.args : [a.split('{out}').join(run.output)])),
-    }))
-    : inv.runs;
-  return { lang, cmd, runs, env: { ...inv.env, ...override?.env }, warning: inv.warning };
+  const apply = (run: IndexerRun): IndexerRun => ({
+    ...run,
+    args: override?.args
+      ? override.args.flatMap(a => (a === '{args}' ? run.args : [a.split('{out}').join(run.output)]))
+      : run.args,
+    env: run.env && { ...run.env, ...override?.env }, // the user's env wins over the adapter's per-run env
+    fallback: run.fallback?.map(apply),
+  });
+  return { lang, cmd, runs: inv.runs.map(apply), env: { ...inv.env, ...override?.env }, warning: inv.warning };
 }
 
 export function onPath(cmd: string): boolean {

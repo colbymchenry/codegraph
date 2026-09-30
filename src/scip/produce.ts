@@ -13,11 +13,12 @@
 
 import { spawn, ChildProcess } from 'child_process';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import type { SqliteDatabase } from '../db/sqlite-adapter';
-import { ROLE_DEFINITION, ScipIndex, isLocalSymbol, loadScipIndex, parseSymbol } from './reader';
-import { INDEXERS, resolveIndexer } from './indexers';
-import { callShape } from './syntax';
+import { Compactor } from './compact';
+import { INDEXERS, IndexerRun, resolveIndexer } from './indexers';
+import { ScipDecodeError } from './reader';
 import { ScipLanguage, ScipMeta, indexPath, metaPath, readMeta, snapshotHashes, writeFileAtomic } from './store';
 
 /** Largest drop in resolved calls a new index may show before it is rejected. */
@@ -30,37 +31,6 @@ export type ProduceResult =
   | { status: 'skipped'; lang: ScipLanguage; reason: string }
   | { status: 'rejected'; lang: ScipLanguage; reason: string }
   | { status: 'failed'; lang: ScipLanguage; reason: string };
-
-/**
- * Calls and instantiations the compiler resolved to a symbol the project itself
- * defines — the guard's measure of "how much the index resolved". Imports and
- * type references are left out on purpose: a broken build can keep those while
- * call resolution collapses. Reads the current sources for the call shape.
- */
-export function resolvedCallCount(ix: ScipIndex, projectRoot: string, lang: ScipLanguage): number {
-  const literal = INDEXERS[lang].literalShape;
-  const defined = new Set<string>();
-  for (const d of ix.documents) {
-    for (const o of d.occurrences) if (o.roles & ROLE_DEFINITION && !isLocalSymbol(o.symbol)) defined.add(o.symbol);
-  }
-  let n = 0;
-  for (const d of ix.documents) {
-    let lines: string[];
-    try {
-      lines = fs.readFileSync(path.join(projectRoot, d.relativePath), 'utf8').split(/\r?\n/);
-    } catch {
-      continue; // unreadable source: its calls can't be told from other references
-    }
-    for (const o of d.occurrences) {
-      if (o.roles & ROLE_DEFINITION || !defined.has(o.symbol)) continue;
-      const kind = parseSymbol(o.symbol)?.last.kind;
-      const shape = callShape(o, d.positionEncoding, lines, literal);
-      if ((kind === 'method' || kind === 'term') && shape === 'call') n++;
-      else if (kind === 'type' && shape) n++;
-    }
-  }
-  return n;
-}
 
 export interface ProduceOptions {
   /** install even when the regression guard would reject */
@@ -85,38 +55,57 @@ export async function produceIndex(
   const warnings: string[] = indexer.warning ? [indexer.warning] : [];
   if (indexer.warning) opts.log?.(`${lang}: ${indexer.warning}`);
   const { runs } = indexer;
+  const all = (rs: typeof runs): typeof runs => rs.flatMap(r => [r, ...all(r.fallback ?? [])]);
   try {
-    // One process per run, one after another (parallel runs would stack the
-    // very memory the split exists to bound). A failed part of a split run is
-    // a warning — its files stay heuristic-only; only a total failure fails.
-    const parts: string[] = [];
-    for (const [i, r] of runs.entries()) {
-      if (opts.signal?.aborted) return { status: 'failed', lang, reason: 'aborted' };
-      const label = runs.length > 1 ? `[${i + 1}/${runs.length}] ${r.label}: ` : '';
-      opts.log?.(`${label}running ${indexer.cmd} ${r.args.join(' ')}`);
+    // Heavy runs one at a time (parallel heavy runs would stack the very memory
+    // the split exists to bound), then light runs in a small pool. A failed run
+    // with a fallback is retried as its parts; any other failed part of a split
+    // run is a warning — its files stay heuristic-only. Only a total failure fails.
+    const outputs = new Map<IndexerRun, string[]>();
+    const failures: string[] = [];
+    let done = 0;
+    const attempt = async (r: IndexerRun): Promise<string[]> => {
+      if (opts.signal?.aborted) return [];
+      opts.log?.(`${runs.length > 1 ? `[${++done}/${runs.length}] ${r.label}: ` : ''}running ${indexer.cmd} ${r.args.join(' ')}`);
       const useNice = opts.nice && process.platform !== 'win32';
       const [cmd, args] = useNice ? ['nice', ['-n', '10', indexer.cmd, ...r.args]] : [indexer.cmd, r.args];
-      const { code, stderr } = await run(cmd, args, projectRoot, indexer.env, opts.signal);
+      const { code, stderr } = await run(cmd, args, projectRoot, { ...indexer.env, ...r.env }, opts.signal);
       const why = code !== 0 ? `${indexer.cmd} exited ${code}: ${stderr.trim().split('\n').slice(-3).join(' | ')}`
         : !fs.existsSync(r.output) ? `${indexer.cmd} exited 0 but wrote no index at ${r.output}` : null;
-      if (!why) {
-        parts.push(r.output);
-        continue;
+      if (!why) return [r.output];
+      if (r.fallback?.length) {
+        opts.log?.(`${r.label}: failed as a batch, retrying its ${r.fallback.length} projects one by one — ${why}`);
+        const parts: string[] = [];
+        for (const f of r.fallback) parts.push(...await attempt(f));
+        return parts;
       }
-      if (runs.length === 1) return { status: 'failed', lang, reason: why };
-      warnings.push(`${r.label}: ${why} — its files stay heuristic-only`);
-      opts.log?.(`${label}failed — ${why}`);
+      failures.push(`${r.label}: ${why}`);
+      opts.log?.(`${r.label}: failed — ${why}`);
+      return [];
+    };
+    for (const r of runs.filter(r => !r.light)) outputs.set(r, await attempt(r));
+    const light = runs.filter(r => r.light);
+    await Promise.all(Array.from({ length: Math.min(lightConcurrency(), light.length) }, async () => {
+      for (let r = light.shift(); r; r = light.shift()) outputs.set(r, await attempt(r));
+    }));
+    if (opts.signal?.aborted) return { status: 'failed', lang, reason: 'aborted' };
+    const parts = runs.flatMap(r => outputs.get(r) ?? []); // plan order, whatever finished first
+    if (parts.length === 0) {
+      return { status: 'failed', lang, reason: failures.length === 1 ? failures[0]! : `all ${failures.length} runs failed; first: ${failures[0]}` };
     }
-    if (parts.length === 0) return { status: 'failed', lang, reason: `all ${runs.length} runs failed; first: ${warnings[warnings.length - runs.length]}` };
-    if (parts.length > 1 || parts[0] !== tmp) concatenate(parts, tmp);
+    for (const f of failures) warnings.push(`${f} — its files stay heuristic-only`);
 
-    let ix: ScipIndex;
+    // Compact while combining: one part in memory at a time (see compact.ts).
+    const compact = new Compactor(projectRoot, lang);
     try {
-      ix = loadScipIndex(tmp);
+      for (const p of parts) compact.add(fs.readFileSync(p));
     } catch (err) {
-      return { status: 'failed', lang, reason: err instanceof Error ? err.message : String(err) };
+      if (!(err instanceof ScipDecodeError)) throw err;
+      return { status: 'failed', lang, reason: `${indexer.cmd} wrote an unreadable index: ${err.message}` };
     }
-    const resolvedCalls = resolvedCallCount(ix, projectRoot, lang);
+    if (compact.paths.length === 0) return { status: 'failed', lang, reason: `${indexer.cmd} wrote an index with no documents` };
+    compact.write(tmp);
+    const resolvedCalls = compact.resolvedCalls();
     const previous = fs.existsSync(final) ? readMeta(projectRoot, lang)?.resolvedCalls ?? null : null;
     if (!opts.force && previous !== null && resolvedCalls < previous * (1 - MAX_RESOLUTION_DROP)) {
       return {
@@ -128,19 +117,22 @@ export async function produceIndex(
     // between the two leaves a new index under an old snapshot, which only makes
     // more documents read as stale — never a wrong edge.
     fs.renameSync(tmp, final);
-    const meta: ScipMeta = { tool: ix.toolName, toolVersion: ix.toolVersion, producedAt: started, hashes, resolvedCalls };
+    const meta: ScipMeta = { tool: compact.meta!.toolName, toolVersion: compact.meta!.toolVersion, producedAt: started, hashes, resolvedCalls };
     writeFileAtomic(metaPath(projectRoot, lang), JSON.stringify(meta));
-    return { status: 'installed', lang, documents: ix.documents.length, resolvedCalls, durationMs: Date.now() - started, warnings };
+    return { status: 'installed', lang, documents: compact.paths.length, resolvedCalls, durationMs: Date.now() - started, warnings };
   } finally {
     fs.rmSync(tmp, { force: true });
-    for (const r of runs) fs.rmSync(r.output, { force: true });
+    for (const r of all(runs)) fs.rmSync(r.output, { force: true });
   }
 }
 
-/** Concatenated SCIP `Index` messages are one valid index (protobuf merges repeated fields). */
-function concatenate(parts: string[], into: string): void {
-  fs.writeFileSync(into, '');
-  for (const p of parts) fs.appendFileSync(into, fs.readFileSync(p));
+/**
+ * Light runs at once: up to 4, at most half the cores, and as many ~3 GB
+ * processes as 60% of physical memory holds.
+ */
+function lightConcurrency(): number {
+  const byMemory = Math.floor((os.totalmem() * 0.6) / (3 * 1024 ** 3));
+  return Math.max(1, Math.min(4, Math.floor(os.cpus().length / 2), byMemory));
 }
 
 function run(

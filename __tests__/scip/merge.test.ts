@@ -7,6 +7,7 @@ import type { Edge } from '../../src/types';
 import { importScipFile, runScipPass, scipStatus } from '../../src/scip';
 import { scipVerdict } from '../../src/scip/notes';
 import { produceIndex } from '../../src/scip/produce';
+import { loadScipIndex } from '../../src/scip/reader';
 import { ScipReindexScheduler } from '../../src/scip/reindex';
 import { indexPath, scipDir } from '../../src/scip/store';
 
@@ -182,9 +183,32 @@ describe('SCIP merge (TypeScript fixture)', () => {
   it('the regression guard counts resolved calls, not every reference', () => {
     const r = importFixture();
     expect(r.documents).toBe(2);
-    // main.ts: helper(2), inv.totalPrice(), o.totalPrice(), new Invoice(3), this.step(), sum(), make(), helper(1).
-    // Imports, `Invoice[]` annotations and `this.amount` don't count; `o.soloMethod()` on `any` is unresolved.
-    expect(JSON.parse(fs.readFileSync(path.join(scipDir(dir), 'typescript.meta.json'), 'utf8')).resolvedCalls).toBe(8);
+    // main.ts: helper(2), inv.totalPrice(), o.totalPrice(), new Invoice(3), this.step(), sum(), make(), helper(1),
+    // r.lookup('a'), r.lookup(1). Imports, `Invoice[]` annotations and `this.amount` don't count;
+    // `o.soloMethod()` on `any` is unresolved.
+    expect(JSON.parse(fs.readFileSync(path.join(scipDir(dir), 'typescript.meta.json'), 'utf8')).resolvedCalls).toBe(10);
+  });
+
+  it('maps an overloaded method to its first signature, like the heuristic', async () => {
+    importFixture();
+    await pass();
+    const lookups = cg.scipReadDb().prepare(`
+      SELECT t.start_line AS line, e.provenance FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+      WHERE s.name = 'usesOverloads' AND t.name = 'lookup' ORDER BY e.line`).all();
+    expect(lookups).toEqual([{ line: 31, provenance: 'scip' }, { line: 31, provenance: 'scip' }]); // verified, not moved
+  });
+
+  it('installs a compact index: definitions and call-shaped references only, same outcome', async () => {
+    const raw = fs.statSync(path.join(FIXTURE, 'index.scip')).size;
+    importFixture();
+    const installed = loadScipIndex(indexPath(dir, 'typescript'));
+    expect(fs.statSync(indexPath(dir, 'typescript')).size).toBeLessThan(raw);
+    const symbols = installed.documents.flatMap(d => d.occurrences.map(o => o.symbol));
+    expect(symbols.some(s => s.startsWith('local '))).toBe(false); // locals dropped
+    expect(symbols.some(s => s.endsWith('(invoices)'))).toBe(false); // parameters dropped
+    expect(symbols.some(s => s.endsWith('Invoice#totalPrice().'))).toBe(true); // callables kept
+    await pass();
+    expect(edge('sum', 'Invoice::totalPrice')?.provenance).toBe('scip');
   });
 
   it('status reads without creating tables', () => {
@@ -217,7 +241,7 @@ describe('SCIP merge (TypeScript fixture)', () => {
       },
     });
     const r = await produceIndex(cg.scipReadDb(), dir, 'typescript');
-    expect(runs()).toBe(3); // '.', packages/a, packages/bad
+    expect(runs()).toBe(4); // the light batch ('.', packages/a, packages/bad) fails, then each project alone
     expect(r).toMatchObject({ status: 'installed', documents: 2 }); // two copies of the same index, deduplicated
     expect(r.status === 'installed' && r.warnings).toEqual([expect.stringMatching(/^packages\/bad: .*exited 3/)]);
     expect(fs.readdirSync(scipDir(dir)).filter(f => /\.tmp|\.part\d/.test(f))).toEqual([]);
@@ -229,7 +253,7 @@ describe('SCIP merge (TypeScript fixture)', () => {
     fs.mkdirSync(path.join(dir, 'packages/a'), { recursive: true });
     fs.writeFileSync(path.join(dir, 'packages/a/tsconfig.json'), '{}');
     writeConfig({ typescript: { cmd: process.execPath, args: ['-e', 'process.exit(2)'] } });
-    expect(await produceIndex(cg.scipReadDb(), dir, 'typescript')).toMatchObject({ status: 'failed', reason: expect.stringMatching(/all 2 runs failed/) });
+    expect(await produceIndex(cg.scipReadDb(), dir, 'typescript')).toMatchObject({ status: 'failed', reason: expect.stringMatching(/all 2 runs failed/) }); // both retried projects
   });
 
   it('skips (never installs) an indexer that is not on PATH', async () => {

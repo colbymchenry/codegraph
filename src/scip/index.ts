@@ -13,10 +13,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { SqliteDatabase } from '../db/sqlite-adapter';
+import { Compactor } from './compact';
 import { languageOfTool } from './indexers';
 import { MergeOutcome, markStaleForFiles, merge } from './merge';
-import { resolvedCallCount } from './produce';
-import { decodeScipIndex, loadScipIndex } from './reader';
+import { loadScipIndex, scanIndex } from './reader';
 import { heuristicSites, scipSites } from './sites';
 import {
   MergedDocument, ScipLanguage, ScipMeta, SCIP_LANGUAGES, availableIndexes, indexPath,
@@ -42,6 +42,8 @@ export interface ScipPassReport {
   stats: Record<string, number>;
   outcome: MergeOutcome;
   durationMs: number;
+  /** wall time per phase, ms: decode, hashGate, scipSites, heuristicSites, merge */
+  phases: Record<string, number>;
 }
 
 /**
@@ -51,8 +53,24 @@ export interface ScipPassReport {
 export function runScipPass(db: SqliteDatabase, projectRoot: string): ScipPassReport | null {
   const installed = availableIndexes(projectRoot);
   if (installed.length === 0) return null;
+  // A big pass reads and rewrites hundreds of thousands of rows across a
+  // multi-GB table: give this connection a larger page cache for the pass.
+  const cacheSize = db.pragma('cache_size', { simple: true }) as number;
+  db.pragma('cache_size = -524288'); // 512 MB
+  try {
+    return pass(db, projectRoot, installed);
+  } finally {
+    db.pragma(`cache_size = ${cacheSize}`);
+  }
+}
+
+function pass(db: SqliteDatabase, projectRoot: string, installed: ReturnType<typeof availableIndexes>): ScipPassReport {
   const started = Date.now();
+  const phases: Record<string, number> = {};
+  let mark = started;
+  const lap = (name: string) => { const now = Date.now(); phases[name] = now - mark; mark = now; };
   const indexes = installed.map(({ lang, meta }) => ({ lang, meta, docs: loadScipIndex(indexPath(projectRoot, lang)).documents }));
+  lap('decode');
 
   // Hash gate: snapshot (what the indexer saw) == files.content_hash (what
   // codegraph extracted) == disk (what we read the call text from).
@@ -75,14 +93,18 @@ export function runScipPass(db: SqliteDatabase, projectRoot: string): ScipPassRe
     }
     merged.set(lang, list);
   }
+  lap('hashGate');
 
   const scip = scipSites(db, indexes, fresh);
+  lap('scipSites');
   const heuristic = heuristicSites(db, fresh.keys());
+  lap('heuristicSites');
   const outcome = db.transaction(() => {
     const o = merge(db, scip, heuristic, new Set(fresh.keys()));
     for (const { lang, meta } of indexes) recordMergedDocuments(db, lang, meta, merged.get(lang) ?? []);
     return o;
   })();
+  lap('merge');
   return {
     documents: indexes.reduce((n, i) => n + i.docs.length, 0),
     freshDocuments: fresh.size,
@@ -90,6 +112,7 @@ export function runScipPass(db: SqliteDatabase, projectRoot: string): ScipPassRe
     stats: scip.stats,
     outcome,
     durationMs: Date.now() - started,
+    phases,
   };
 }
 
@@ -120,35 +143,40 @@ export function importScipFile(
 ): { lang: ScipLanguage; documents: number; newerThanIndex: string[] } {
   const builtAt = fs.statSync(file).mtimeMs;
   const bytes = fs.readFileSync(file);
-  const ix = decodeScipIndex(bytes);
-  if (ix.documents.length === 0) throw new Error(`${file} has no documents — the indexer failed or this is not a SCIP index`);
-  const resolved = lang ?? languageOfTool(ix.toolName);
+  const { toolName } = scanIndex(bytes);
+  const resolved = lang ?? languageOfTool(toolName);
   if (!resolved) {
-    throw new Error(`can't tell which language ${file} covers (tool "${ix.toolName}") — pass --lang (${SCIP_LANGUAGES.join('|')})`);
+    throw new Error(`can't tell which language ${file} covers (tool "${toolName}") — pass --lang (${SCIP_LANGUAGES.join('|')})`);
   }
+  const compact = new Compactor(projectRoot, resolved);
+  compact.add(bytes);
+  if (compact.paths.length === 0) throw new Error(`${file} has no documents — the indexer failed or this is not a SCIP index`);
   const hashes: Record<string, string> = {};
   const newerThanIndex: string[] = [];
-  for (const d of ix.documents) {
+  for (const p of compact.paths) {
     let mtime: number;
     try {
-      mtime = fs.statSync(path.join(projectRoot, d.relativePath)).mtimeMs;
+      mtime = fs.statSync(path.join(projectRoot, p)).mtimeMs;
     } catch {
       continue; // gone from disk — nothing to vouch for
     }
     if (mtime > builtAt) {
-      newerThanIndex.push(d.relativePath);
+      newerThanIndex.push(p);
       continue;
     }
-    const h = readHashed(projectRoot, d.relativePath)?.hash;
-    if (h) hashes[d.relativePath] = h;
+    const h = readHashed(projectRoot, p)?.hash;
+    if (h) hashes[p] = h;
   }
-  writeFileAtomic(indexPath(projectRoot, resolved), bytes);
+  const target = indexPath(projectRoot, resolved);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  compact.write(`${target}.${process.pid}.tmp`);
+  fs.renameSync(`${target}.${process.pid}.tmp`, target);
   const meta: ScipMeta = {
-    tool: ix.toolName, toolVersion: ix.toolVersion, producedAt: builtAt, hashes,
-    resolvedCalls: resolvedCallCount(ix, projectRoot, resolved),
+    tool: compact.meta!.toolName, toolVersion: compact.meta!.toolVersion, producedAt: builtAt, hashes,
+    resolvedCalls: compact.resolvedCalls(),
   };
   writeFileAtomic(metaPath(projectRoot, resolved), JSON.stringify(meta));
-  return { lang: resolved, documents: ix.documents.length, newerThanIndex };
+  return { lang: resolved, documents: compact.paths.length, newerThanIndex };
 }
 
 export interface ScipStatus {

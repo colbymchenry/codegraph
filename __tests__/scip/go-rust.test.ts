@@ -5,7 +5,7 @@ import * as path from 'path';
 import CodeGraph from '../../src/index';
 import { importScipFile, runScipPass } from '../../src/scip';
 import { INDEXERS, resolveIndexer } from '../../src/scip/indexers';
-import { tsProjects } from '../../src/scip/indexers/typescript';
+import { planRuns, projectWeights, tsProjects } from '../../src/scip/indexers/typescript';
 import { callShape } from '../../src/scip/syntax';
 
 const FIXTURES = path.join(__dirname, '..', 'fixtures');
@@ -126,13 +126,27 @@ describe('go / rust adapters', () => {
     expect(tsProjects(dir)).toEqual(['.', 'extensions/git', 'extensions/web', 'src']);
     const r = resolveIndexer(dir, 'typescript', out);
     if ('skip' in r) throw new Error(r.skip);
-    expect(r.runs.map(x => x.args)).toEqual([
-      ['index', '--output', `${out}.part0`, '.'],
-      ['index', '--output', `${out}.part1`, 'extensions/git'],
-      ['index', '--output', `${out}.part2`, 'extensions/web', '--infer-tsconfig'],
-      ['index', '--output', `${out}.part3`, 'src'],
+    // All light: tsconfig projects share one batch (retried one by one if it fails); jsconfig ones infer theirs.
+    expect(r.runs.map(x => x.args.slice(3))).toEqual([['.', 'extensions/git', 'src'], ['extensions/web', '--infer-tsconfig']]);
+    expect(r.runs[0]!.fallback?.map(f => f.label)).toEqual(['.', 'extensions/git', 'src']);
+    expect(r.runs.every(x => x.light && /--max-old-space-size=\d+/.test(x.env?.NODE_OPTIONS ?? ''))).toBe(true);
+  });
+
+  it('TS: heavy projects run alone with the big heap, light ones are batched by size', () => {
+    const projects = ['core', 'a', 'b', 'c'];
+    const weights = new Map([['core', 5000], ['a', 900], ['b', 900], ['c', 10]]);
+    for (const p of projects) fs.mkdirSync(path.join(dir, p));
+    for (const p of projects) fs.writeFileSync(path.join(dir, p, 'tsconfig.json'), '{}');
+    const runs = planRuns(dir, projects, weights, path.join(dir, 'out'));
+    expect(runs.map(r => [r.args.slice(3), !!r.light])).toEqual([
+      [['core'], false], // heavy first, alone
+      [['a'], true], // a + b would pass 1,500 files
+      [['b', 'c'], true],
     ]);
-    expect(r.env.NODE_OPTIONS).toMatch(/--max-old-space-size=\d+/);
+    const heap = (r: typeof runs[number]) => Number(/--max-old-space-size=(\d+)/.exec(r.env?.NODE_OPTIONS ?? '')?.[1]);
+    if (!process.env.NODE_OPTIONS?.includes('--max-old-space-size')) expect(heap(runs[0]!)).toBeGreaterThanOrEqual(heap(runs[1]!));
+    expect(projectWeights(['.', 'src', 'src/sub'], ['a.ts', 'src/x.ts', 'src/sub/y.ts', 'src/sub/z.js', 'README.md']))
+      .toEqual(new Map([['.', 1], ['src', 1], ['src/sub', 2]])); // each file counted for its deepest project
   });
 
   it.runIf(process.platform !== 'win32')('skips a rust-analyzer that is on PATH but broken (the rustup shim without the component)', () => {

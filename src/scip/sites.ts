@@ -10,7 +10,7 @@
 
 import type { SqliteDatabase } from '../db/sqlite-adapter';
 import { INDEXERS } from './indexers';
-import { ROLE_DEFINITION, ScipDocument, ScipOccurrence, parseSymbol } from './reader';
+import { ParsedSymbol, ROLE_DEFINITION, ScipDocument, ScipOccurrence, parseSymbol } from './reader';
 import type { ScipLanguage } from './store';
 import { LiteralShape, callShape } from './syntax';
 
@@ -74,28 +74,63 @@ const endOf = (n: NodeRow): Pos => [n.end_line, n.end_column];
 const before = (a: Pos, b: Pos) => a[0] < b[0] || (a[0] === b[0] && a[1] < b[1]);
 const size = (n: NodeRow) => (n.end_line - n.start_line) * 1_000_000 + (n.end_column - n.start_column);
 
-/** The nodes of each fresh file, loaded once, answering both questions the merge asks of them. */
-class FileNodes {
-  private byFile = new Map<string, NodeRow[]>();
+interface FileIndex {
+  byName: Map<string, NodeRow[]>;
+  /** callables + containers covering each 1-based line, built on first use */
+  byLine?: NodeRow[][];
+  rows: NodeRow[];
+  file: string | null;
+}
 
-  constructor(db: SqliteDatabase, files: Iterable<string>) {
+/**
+ * The nodes of each fresh file, loaded in one query, answering both questions
+ * the merge asks of them. Lookups go through per-file indexes (by name, by
+ * line) — a large repo has hundreds of thousands of call sites, and scanning a
+ * file's every node per site was most of the merge.
+ */
+class FileNodes {
+  private byFile = new Map<string, FileIndex>();
+
+  constructor(db: SqliteDatabase, files: Set<string>) {
     const kinds = [...new Set([...CALLABLE_KINDS, ...TYPE_KINDS, ...CONTAINER_KINDS, 'file'])];
-    const stmt = db.prepare(
-      `SELECT id, kind, name, start_line, end_line, start_column, end_column FROM nodes
-       WHERE file_path = ? AND kind IN (${kinds.map(() => '?').join(',')})`
-    );
-    for (const f of files) this.byFile.set(f, stmt.all(f, ...kinds) as NodeRow[]);
+    const rows = db.prepare(
+      `SELECT id, kind, name, file_path, start_line, end_line, start_column, end_column FROM nodes
+       WHERE kind IN (${kinds.map(() => '?').join(',')})`
+    ).all(...kinds) as Array<NodeRow & { file_path: string }>;
+    for (const r of rows) {
+      if (!files.has(r.file_path)) continue;
+      let f = this.byFile.get(r.file_path);
+      if (!f) this.byFile.set(r.file_path, (f = { byName: new Map(), rows: [], file: null }));
+      if (r.kind === 'file') {
+        f.file = r.id;
+        continue;
+      }
+      f.rows.push(r);
+      const named = f.byName.get(r.name);
+      if (named) named.push(r);
+      else f.byName.set(r.name, [r]);
+    }
   }
 
   /** The node a SCIP definition names: same file, same name, its (0-based) line inside the node. */
   definition(file: string, line0: number, name: string, kinds: readonly string[]): NodeRow | null {
     const line = line0 + 1;
     let best: NodeRow | null = null;
-    for (const n of this.byFile.get(file) ?? []) {
-      if (n.name !== name || !kinds.includes(n.kind) || n.start_line > line || n.end_line < line) continue;
+    for (const n of this.byFile.get(file)?.byName.get(name) ?? []) {
+      if (!kinds.includes(n.kind) || n.start_line > line || n.end_line < line) continue;
       if (!best || size(n) < size(best)) best = n;
     }
     return best;
+  }
+
+  private lines(f: FileIndex): NodeRow[][] {
+    if (f.byLine) return f.byLine;
+    const byLine: NodeRow[][] = [];
+    for (const n of f.rows) {
+      if (!CALLABLE_KINDS.includes(n.kind) && !CONTAINER_KINDS.includes(n.kind)) continue;
+      for (let l = n.start_line; l <= n.end_line; l++) (byLine[l] ??= []).push(n);
+    }
+    return (f.byLine = byLine);
   }
 
   /**
@@ -107,21 +142,19 @@ class FileNodes {
    * defined in a method) is narrower — else narrowest container, else the file.
    */
   callerAt(file: string, line0: number, col: number): { id: string; inFunction: boolean } | null {
-    const rows = this.byFile.get(file) ?? [];
+    const f = this.byFile.get(file);
+    if (!f) return null;
     const at: Pos = [line0 + 1, col];
     let fn: NodeRow | null = null;
     let holder: NodeRow | null = null;
-    let fileId: string | null = null;
-    for (const n of rows) {
-      if (n.kind === 'file') fileId = n.id;
-      else if (!before(at, startOf(n)) && before(at, endOf(n))) { // [start, end) — end column is exclusive
-        if (CALLABLE_KINDS.includes(n.kind) && (!fn || size(n) < size(fn))) fn = n;
-        if (CONTAINER_KINDS.includes(n.kind) && (!holder || size(n) < size(holder))) holder = n;
-      }
+    for (const n of this.lines(f)[line0 + 1] ?? []) {
+      if (before(at, startOf(n)) || !before(at, endOf(n))) continue; // [start, end) — end column is exclusive
+      if (CALLABLE_KINDS.includes(n.kind) && (!fn || size(n) < size(fn))) fn = n;
+      if (CONTAINER_KINDS.includes(n.kind) && (!holder || size(n) < size(holder))) holder = n;
     }
     const nested = fn && holder && !before(startOf(holder), startOf(fn)) && !before(endOf(fn), endOf(holder));
     if (fn && !nested) return { id: fn.id, inFunction: true };
-    const id = holder?.id ?? fileId;
+    const id = holder?.id ?? f.file;
     return id ? { id, inFunction: false } : null;
   }
 }
@@ -139,9 +172,16 @@ export function scipSites(
 ): ScipSites {
   const stats: Record<string, number> = {};
   const bump = (k: string) => { stats[k] = (stats[k] ?? 0) + 1; };
-  const nodes = new FileNodes(db, fresh.keys());
+  const nodes = new FileNodes(db, new Set(fresh.keys()));
   const symToNode = new Map<string, NodeRow>();
   const projectSymbols = new Set<string>();
+  // Symbols repeat at every occurrence; parse each once.
+  const parsedCache = new Map<string, ParsedSymbol | null>();
+  const parse = (symbol: string) => {
+    let p = parsedCache.get(symbol);
+    if (p === undefined) parsedCache.set(symbol, (p = parseSymbol(symbol)));
+    return p;
+  };
 
   // Pass 1: definitions → nodes, across all docs so cross-file targets resolve.
   for (const { docs } of indexes) {
@@ -149,11 +189,13 @@ export function scipSites(
       const known = fresh.has(doc.relativePath);
       for (const o of doc.occurrences) {
         if (!(o.roles & ROLE_DEFINITION)) continue;
-        const parsed = parseSymbol(o.symbol);
+        const parsed = parse(o.symbol);
         if (!parsed) continue;
         projectSymbols.add(o.symbol);
         const { name, kind } = parsed.last;
-        if (!known || (kind !== 'method' && kind !== 'term' && kind !== 'type')) continue;
+        // An overloaded function has one SCIP symbol defined at every signature, while
+        // codegraph has a node per signature; like the heuristic, map it to the first.
+        if (!known || symToNode.has(o.symbol) || (kind !== 'method' && kind !== 'term' && kind !== 'type')) continue;
         const node = nodes.definition(doc.relativePath, o.range.startLine, CONSTRUCTOR_NAMES[name] ?? name,
           kind === 'type' ? TYPE_KINDS : CALLABLE_KINDS);
         if (node) {
@@ -176,7 +218,7 @@ export function scipSites(
       if (!lines) continue;
       for (const o of doc.occurrences) {
         if (o.roles & ROLE_DEFINITION) continue;
-        const call = classify(o, doc.positionEncoding, lines, literal, symToNode);
+        const call = classify(o, doc.positionEncoding, lines, literal, symToNode, parse);
         if (!call) continue;
         const { startLine, startCol } = o.range;
         const caller = nodes.callerAt(doc.relativePath, startLine, startCol);
@@ -218,12 +260,14 @@ interface Call {
 }
 
 function classify(
-  o: ScipOccurrence, encoding: number, lines: string[], literal: LiteralShape | undefined, symToNode: Map<string, NodeRow>
+  o: ScipOccurrence, encoding: number, lines: string[], literal: LiteralShape | undefined,
+  symToNode: Map<string, NodeRow>, parse: (symbol: string) => ParsedSymbol | null
 ): Call | null {
-  const parsed = parseSymbol(o.symbol);
+  const parsed = parse(o.symbol);
   if (!parsed) return null;
-  const shape = callShape(o, encoding, lines, literal);
   const { name, kind } = parsed.last;
+  if (kind !== 'type' && kind !== 'method' && kind !== 'term') return null; // before the (costlier) text check
+  const shape = callShape(o, encoding, lines, literal);
 
   if (kind === 'type') {
     if (!shape) return null; // Foo(…), new Foo, Foo{…}
@@ -233,7 +277,7 @@ function classify(
   if (shape !== 'call') return null;
   if (kind === 'method' && name === '<constructor>') {
     const cls = symToNode.get(parsed.owner);
-    return { kind: 'instantiates', name: cls?.name ?? parseSymbol(parsed.owner)?.last.name ?? name, target: cls?.id ?? null, symbol: parsed.owner };
+    return { kind: 'instantiates', name: cls?.name ?? parse(parsed.owner)?.last.name ?? name, target: cls?.id ?? null, symbol: parsed.owner };
   }
   const node = symToNode.get(o.symbol);
   if (kind === 'method') return { kind: 'calls', name: node?.name ?? name, target: node?.id ?? null, symbol: o.symbol };
@@ -243,22 +287,32 @@ function classify(
 }
 
 /** codegraph's own edges at the same kind of site, for callers in `files`. */
-export function heuristicSites(db: SqliteDatabase, files: Iterable<string>): Map<string, Set<string>> {
+/** site key → target node id → ids of the heuristic edges joining them (several when only `col` differs) */
+export type HeuristicSites = Map<string, Map<string, number[]>>;
+
+/**
+ * codegraph's own edges at the same kind of site, for callers in `files`.
+ * Per file on purpose: through the file_path and source indexes this reads only
+ * the fresh files' edges (measured faster than one scan joining every edge).
+ */
+export function heuristicSites(db: SqliteDatabase, files: Iterable<string>): HeuristicSites {
   const stmt = db.prepare(`
-    SELECT e.source, e.line, e.kind, t.name, e.target
+    SELECT e.id, e.source, e.line, e.kind, t.name, e.target
     FROM nodes s
     JOIN edges e ON e.source = s.id
     JOIN nodes t ON t.id = e.target
     WHERE s.file_path = ? AND e.kind IN ('calls', 'instantiates') AND e.line IS NOT NULL
       AND ${HEURISTIC_PROVENANCE} -- unambiguous: only edges have a provenance column
   `);
-  const out = new Map<string, Set<string>>();
+  const out: HeuristicSites = new Map();
   for (const f of files) {
-    for (const r of stmt.all(f) as { source: string; line: number; kind: SiteKind; name: string; target: string }[]) {
+    for (const r of stmt.all(f) as { id: number; source: string; line: number; kind: SiteKind; name: string; target: string }[]) {
       const key = siteKey(r.source, r.line, r.name, r.kind);
-      let s = out.get(key);
-      if (!s) out.set(key, (s = new Set()));
-      s.add(r.target);
+      let targets = out.get(key);
+      if (!targets) out.set(key, (targets = new Map()));
+      const ids = targets.get(r.target);
+      if (ids) ids.push(r.id);
+      else targets.set(r.target, [r.id]);
     }
   }
   return out;

@@ -52,7 +52,14 @@ To run one through `npx` instead, put this in `codegraph.json`:
 
 `"python": false` disables a language. `cmd`, `args` and `env` replace the defaults. In `args`, `{args}` splices in the adapter's own arguments and `{out}` is the output path.
 
-**TS/JS monorepos.** A repo with several projects (a `tsconfig.json` / `jsconfig.json` per package, as in vscode's `src/` plus one per extension) is indexed **one project per process**. Projects are found with `git ls-files`, or by walking the tree outside git; `node_modules` is ignored. The outputs are concatenated; SCIP `Index` messages concatenate into one valid index. scip-typescript holds each project's whole type-checked program in memory, so one process over all of them runs out of heap on large monorepos. Split, peak memory is the largest single project. A project that fails (e.g. a test fixture with a broken tsconfig) is reported as a warning and its files stay heuristic-only. The run fails only if every project fails. The indexer's Node heap defaults to 60% of physical memory (vscode's `src/` alone needs over 6 GB) unless `NODE_OPTIONS` sets one; `scip.typescript.env` overrides it. `{args}` / `{out}` in an override apply per project.
+**TS/JS monorepos.** A repo with several projects (a `tsconfig.json` / `jsconfig.json` per package, as in vscode's `src/` plus one per extension) is **split by project size**. Projects and their source-file counts come from one `git ls-files` (or a tree walk outside git; `node_modules` is ignored); each file counts once, for its deepest project. scip-typescript holds a project's whole type-checked program in memory, so one process over everything runs out of heap on a large monorepo, while a process per project pays TypeScript's start-up cost dozens of times.
+- A **heavy** project (≥1,500 source files) runs alone, with a Node heap of 60% of physical memory. vscode's `src/` needs over 6 GB.
+- **Light** projects are packed into batches of up to 1,500 files or 16 projects, one process per batch with a 3 GB heap. Batches run in parallel: up to 4, at most half the cores, as many as 60% of memory holds.
+- A batch that fails is **retried one project at a time**, so one broken project doesn't cost its batch-mates.
+- A project that still fails is reported as a warning, and its files stay heuristic-only. The run fails only if everything fails.
+- `NODE_OPTIONS` with a heap, or `scip.typescript.env`, overrides the heap defaults. `{args}` / `{out}` in an override apply per run.
+
+**Compact indexes.** Parts are combined through a compaction pass (`src/scip/compact.ts`) before install. It keeps definitions of callables and types, and references that read as a call, `new` or struct literal. Locals, parameters, type annotations and imports are dropped. On vscode the index went from 1,103 MB to 176 MB, and the merge's decode from 6.5 s to 0.9 s. The result is still a standard SCIP file. The merge re-checks every call shape against the (hash-gated, identical) source, so compaction changes size and speed, never an outcome. `scip import` compacts too.
 
 **Python environments.** A `.venv/` or `venv/` (with `pyvenv.cfg`) is activated for the indexer (`VIRTUAL_ENV`, `PATH`). Its packages are passed to scip-python as an `--environment` manifest read from `*.dist-info/RECORD`, so uv venvs without `pip` work. Without a venv the manifest is empty and `scip index` warns. Project code still resolves; calls into dependencies don't.
 
@@ -77,7 +84,8 @@ Differences from the POC:
 - A target that the index *defines* but that has no codegraph node (or sits in a stale document) is **unknown**, not external. It never deletes a heuristic edge.
 - Callable-ness comes from the mapped node kind, not the symbol suffix. This lets TS `const f = () => …` count.
 - `new X()` (TS, via scip-typescript's `` `<constructor>` `` symbol) and Python's `X()` (a class symbol followed by `(`) → `instantiates`, matching codegraph's own edge kind. So are Go composite literals (`&X{…}`, `X[T]{…}`) and Rust struct literals (`X { … }`). Go excludes slice/map element types and return types before a body. Rust excludes `impl`/`where` headers, `-> X {`, and destructuring patterns.
-- Protobuf is decoded by a ~250-line reader (`src/scip/reader.ts`) instead of `@bufbuild/protobuf` plus codegen. The fork adds no runtime dependency. It accepts both the legacy `int32` ranges and the typed ranges.
+- An overloaded method is one SCIP symbol defined at every signature, but codegraph has a node per signature. The symbol maps to the **first** signature, which is where the heuristic's edges point, so they verify instead of moving. On vscode this turned about 16.5k "replaced" edges into agreements.
+- Protobuf is read and written by a small hand-written codec (`src/scip/reader.ts`) instead of `@bufbuild/protobuf` plus codegen. The fork adds no runtime dependency. It accepts both the legacy `int32` ranges and the typed ranges, and streams documents one at a time.
 
 MCP output: Flow steps read `↓ calls (compiler-verified)` or `(unverified: …)`. Trail entries get ` [unverified]`.
 

@@ -181,15 +181,15 @@ function readDocument(r: Reader): ScipDocument {
   return doc;
 }
 
+export type IndexMeta = Omit<ScipIndex, 'documents'>;
+
 /**
- * Decodes a whole index. Concatenated indexes (one per sub-project, see
- * IndexerRun) decode as one; a file claimed by two overlapping projects keeps
- * its first document — the indexers here emit each file once per run, and a
- * second copy only repeats the same occurrences.
+ * Walks an index one document at a time — nothing but the current document is
+ * held, so a multi-GB index can be filtered without decoding it whole.
+ * Concatenated indexes (one per sub-project, see IndexerRun) read as one.
  */
-export function decodeScipIndex(buf: Buffer): ScipIndex {
-  const ix: ScipIndex = { toolName: '', toolVersion: '', projectRoot: '', documents: [] };
-  const seen = new Set<string>();
+export function scanIndex(buf: Buffer, onDocument?: (doc: ScipDocument) => void): IndexMeta {
+  const meta: IndexMeta = { toolName: '', toolVersion: '', projectRoot: '' };
   const r = new Reader(buf, 0, buf.length);
   while (!r.done()) {
     const tag = r.varint();
@@ -205,24 +205,98 @@ export function decodeScipIndex(buf: Buffer): ScipIndex {
           while (!tool.done()) {
             const tt = tool.varint();
             const tf = Math.floor(tt / 8);
-            if (tf === 1) ix.toolName = tool.string();
-            else if (tf === 2) ix.toolVersion = tool.string();
+            if (tf === 1) meta.toolName = tool.string();
+            else if (tf === 2) meta.toolVersion = tool.string();
             else tool.skip(tt & 7);
           }
-        } else if (f === 3) ix.projectRoot = m.string();
+        } else if (f === 3) meta.projectRoot = m.string();
         else m.skip(t & 7);
       }
-    } else if (field === 2 && wire === WIRE_LEN) {
+    } else if (field === 2 && wire === WIRE_LEN && onDocument) {
       const doc = readDocument(r.sub());
-      if (doc.relativePath && !seen.has(doc.relativePath)) {
-        seen.add(doc.relativePath);
-        ix.documents.push(doc);
-      }
-    } else {
+      if (doc.relativePath) onDocument(doc);
+    } else { // including documents when only the metadata is wanted
       r.skip(wire);
     }
   }
-  return ix;
+  return meta;
+}
+
+/**
+ * Decodes a whole index. A file claimed by two overlapping projects keeps its
+ * first document — the indexers here emit each file once per run, and a second
+ * copy only repeats the same occurrences.
+ */
+export function decodeScipIndex(buf: Buffer): ScipIndex {
+  const documents: ScipDocument[] = [];
+  const seen = new Set<string>();
+  const meta = scanIndex(buf, doc => {
+    if (seen.has(doc.relativePath)) return;
+    seen.add(doc.relativePath);
+    documents.push(doc);
+  });
+  return { ...meta, documents };
+}
+
+// --- protobuf wire encoding (the same subset) ------------------------------------
+
+function pushVarint(out: number[], n: number): void {
+  while (n > 0x7f) {
+    out.push((n & 0x7f) | 0x80);
+    n = Math.floor(n / 128);
+  }
+  out.push(n);
+}
+
+function pushLen(out: number[], field: number, bytes: ArrayLike<number>): void {
+  pushVarint(out, field * 8 + WIRE_LEN);
+  pushVarint(out, bytes.length);
+  for (let i = 0; i < bytes.length; i++) out.push(bytes[i]!);
+}
+
+/** Index metadata: tool name/version and project root — what the reader reads back. */
+export function encodeMetadata(meta: IndexMeta): Buffer {
+  const tool: number[] = [];
+  pushLen(tool, 1, Buffer.from(meta.toolName));
+  pushLen(tool, 2, Buffer.from(meta.toolVersion));
+  const m: number[] = [];
+  pushLen(m, 2, tool);
+  if (meta.projectRoot) pushLen(m, 3, Buffer.from(meta.projectRoot));
+  const out: number[] = [];
+  pushLen(out, 1, m);
+  return Buffer.from(out);
+}
+
+/**
+ * One `Index.documents` entry. Ranges are written as the packed int32 field —
+ * three numbers for a single-line range — the densest form every SCIP reader accepts.
+ */
+export function encodeDocument(doc: ScipDocument, symbolBytes: (symbol: string) => Buffer): Buffer {
+  const d: number[] = [];
+  pushLen(d, 1, Buffer.from(doc.relativePath));
+  const occ: number[] = [];
+  const range: number[] = [];
+  for (const o of doc.occurrences) {
+    occ.length = 0;
+    range.length = 0;
+    const { startLine, startCol, endLine, endCol } = o.range;
+    for (const v of startLine === endLine ? [startLine, startCol, endCol] : [startLine, startCol, endLine, endCol]) pushVarint(range, v);
+    pushLen(occ, 1, range);
+    pushLen(occ, 2, symbolBytes(o.symbol));
+    if (o.roles) {
+      pushVarint(occ, 3 * 8 + WIRE_VARINT);
+      pushVarint(occ, o.roles);
+    }
+    pushLen(d, 2, occ);
+  }
+  if (doc.language) pushLen(d, 4, Buffer.from(doc.language));
+  if (doc.positionEncoding) {
+    pushVarint(d, 6 * 8 + WIRE_VARINT);
+    pushVarint(d, doc.positionEncoding);
+  }
+  const out: number[] = [];
+  pushLen(out, 2, d);
+  return Buffer.from(out);
 }
 
 /** Reads and decodes a `.scip` file; an index with no documents is an indexer failure, not an empty project. */

@@ -31,7 +31,7 @@ function parseLang(raw: string | undefined): ScipLanguage | undefined {
 function describe(r: ScipPassReport): string {
   const o = r.outcome;
   return [
-    `${r.freshDocuments}/${r.documents} documents merged (${r.staleDocuments.length} stale) in ${r.durationMs}ms`,
+    `${r.freshDocuments}/${r.documents} documents merged (${r.staleDocuments.length} stale) in ${r.durationMs}ms (${Object.entries(r.phases).map(([k, v]) => `${k} ${v}`).join(', ')})`,
     `sites: ${o.agree} agree, ${o.conflict} conflict, ${o.scipOnly} added, ${o.alreadyVerified} already verified, ${o.scipOnlyExternal} external-only, ${o.silent} unverified heuristic edges`,
     `edges: ${o.edgesUpdated} verified, ${o.edgesDeleted} wrong removed, ${o.edgesInserted} missing added` +
       (o.scipEdgesDropped || o.scipEdgesStale ? `, ${o.scipEdgesDropped} outdated dropped, ${o.scipEdgesStale} stale` : ''),

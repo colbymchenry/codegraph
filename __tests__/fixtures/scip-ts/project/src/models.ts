@@ -26,3 +26,11 @@ export class Solo {
 export function helper(x: number): number {
   return x + 1;
 }
+
+export class Registry {
+  lookup(key: number): number;
+  lookup(key: string): string;
+  lookup(key: number | string): number | string {
+    return key;
+  }
+}
