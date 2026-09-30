@@ -3984,7 +3984,9 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
       ];
     case 'python':
       return [
-        new RegExp(`\\b${r}\\b\\s*=\\s*([A-Z][\\w.]*)\\s*\\(`), // lg = Logger(...)
+        // lg = Logger(...) — a statement of its own: `prefix=IPNetwork(…),`
+        // inside a call's arguments is a keyword argument, not a binding.
+        new RegExp(`(?:^|;)\\s*${r}\\s*=(?!=)\\s*([A-Z][\\w.]*)\\s*\\((?![^\\n]*,\\s*$)`),
         // A quoted forward reference (`lg: "Logger"`, `lg: 'pkg.Logger'`) is the
         // same annotation — and what every file under `from __future__ import
         // annotations` or with a not-yet-defined class writes. The unquoted
@@ -4679,6 +4681,17 @@ export function matchMethodCall(
         ESM_FAMILY.has(ref.language) &&
         (JS_BUILT_INS.has(inferredType) || TS_PRIMITIVE_TYPES.has(inferredType))
       ) {
+        return null;
+      }
+      // The receiver's declared type is one the project doesn't declare —
+      // `List<Roshambo> list`, `String s`, `val sb = StringBuilder()` — so the
+      // method is that outside type's. gson's `list.add(…)` went to a project
+      // list wrapper's `add`, commons-lang's `s.length()` to a writer's.
+      // (Only a type name — `java.util.List`, not a call chain like Python's
+      // `Device.objects.create(…)` the initializer pattern also captures.)
+      const typeName = inferredType.split('.').pop()!;
+      if (/^[A-Z]/.test(typeName) &&
+          !context.getNodesByName(typeName).some((n) => isMethodOwnerKind(n) && sameLanguageFamily(n.language, ref.language))) {
         return null;
       }
     }
