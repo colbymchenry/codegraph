@@ -12,6 +12,9 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixes
+
+- Kotlin `fun interface` declarations are indexed, and no longer hide the declaration that follows them.
 
 ## [1.6.2] - 2026-10-03
 

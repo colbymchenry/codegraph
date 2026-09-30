@@ -162,6 +162,24 @@ function isFunInterfaceNode(node: SyntaxNode): boolean {
 }
 
 /**
+ * tree-sitter-kotlin predates functional interfaces (Kotlin 1.4): `fun
+ * interface Reply { … }` parses as a broken function declaration, and its
+ * error recovery swallows the NEXT declaration as well, so that interface and
+ * its methods go missing and its members surface as top-level functions.
+ * Blanking the `fun` of a `fun interface` declaration (three spaces for three
+ * letters, so every offset holds) lets it parse as the plain interface it is.
+ * Only a declaration position is touched: the start of a line, after optional
+ * visibility / multiplatform modifiers.
+ */
+export function blankKotlinFunInterface(source: string): string {
+  if (!source.includes('interface')) return source;
+  return source.replace(
+    /^([ \t]*(?:(?:public|private|internal|protected|expect|actual)[ \t]+)*)fun([ \t]+interface\b)/gm,
+    (_match, before: string, after: string) => `${before}   ${after}`,
+  );
+}
+
+/**
  * The qualifier of a function type's receiver — `DatabaseConfig.` in
  * `configure: (DatabaseConfig.Builder.() -> Unit)?`. The grammar reads a
  * single-segment receiver (`Builder.() -> Unit`) but not a qualified one, and
@@ -225,7 +243,7 @@ export function rewriteNewerKotlinSyntax(source: string): string {
 }
 
 function preParseKotlin(source: string): string {
-  return rewriteNewerKotlinSyntax(joinKotlinSplitConstructors(blankKotlinQualifiedReceivers(source)));
+  return rewriteNewerKotlinSyntax(joinKotlinSplitConstructors(blankKotlinQualifiedReceivers(blankKotlinFunInterface(source))));
 }
 
 export const kotlinExtractor: LanguageExtractor = {
