@@ -27,6 +27,21 @@ Upstream files the fork touches (keep these hunks small):
 
 Everything else is new, under `src/scip/`, `__tests__/scip/`, `__tests__/fixtures/scip-ts/` and `scripts/scip-eval/`.
 
+## Installing it as `codegraph`
+
+Build a self-contained bundle with upstream's recipe ([`BUNDLING.md`](BUNDLING.md)): vendored Node 24 plus the native extraction kernel. It runs whatever Node the machine has, including 25+, which the plain build refuses. Then install it where `install.sh` would:
+
+```sh
+scripts/build-kernel.sh                      # native kernel (cargo); without it the bundle falls back to the slower wasm path
+scripts/build-bundle.sh linux-x64            # -> release/codegraph-linux-x64.tar.gz
+V="v$(node -p "require('./package.json').version")-scip.$(git rev-parse --short HEAD)"
+mkdir -p ~/.codegraph/versions/$V && tar -xzf release/codegraph-linux-x64.tar.gz -C ~/.codegraph/versions/$V --strip-components=1
+ln -sfn ~/.codegraph/versions/$V ~/.codegraph/current
+ln -sfn ~/.codegraph/versions/$V/bin/codegraph ~/.local/bin/codegraph
+```
+
+MCP clients that launch `codegraph` pick it up on restart. To go back to the npm install: `ln -sfn ../lib/node_modules/@colbymchenry/codegraph/npm-shim.js ~/.local/bin/codegraph`, or run `npm i -g @colbymchenry/codegraph`, which re-links it (so does any `npm update -g`).
+
 ## Using it
 
 ```sh
