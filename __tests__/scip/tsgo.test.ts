@@ -9,6 +9,7 @@ import { resolveIndexer } from '../../src/scip/indexers';
 import { indexProjects } from '../../src/scip/indexers/tsgo-index';
 import { findTsgo } from '../../src/scip/indexers/typescript';
 import { scipFlowNote } from '../../src/scip/notes';
+import { ROLE_DEFINITION, decodeScipIndex } from '../../src/scip/reader';
 import type { Edge } from '../../src/types';
 
 const FIXTURE = path.join(__dirname, '..', 'fixtures', 'scip-ts');
@@ -45,6 +46,22 @@ describe.runIf(TSGO)('tsgo indexer (TypeScript fixture)', () => {
     cg.close();
     fs.rmSync(dir, { recursive: true, force: true });
   });
+
+  it('names symbols by where they are declared: stable across edits, distinct when the names alone collide', async () => {
+    const src = 'function run(f: () => void) { f(); }\nrun(() => { function input() { return 1; } input(); });\nrun(() => { function input() { return 2; } input(); });\n';
+    const defs = async () => {
+      const out = path.join(dir, 'names.scip');
+      await indexProjects(TSGO!, out, dir, [path.join(dir, 'tsconfig.json')]);
+      const doc = decodeScipIndex(fs.readFileSync(out)).documents.find(d => d.relativePath === 'src/dup.ts')!;
+      return doc.occurrences.filter(o => o.roles & ROLE_DEFINITION).map(o => o.symbol).sort();
+    };
+    fs.writeFileSync(path.join(dir, 'src', 'dup.ts'), src);
+    const before = await defs();
+    expect(before.filter(s => s.endsWith('input().'))).toHaveLength(2); // two declarations, two symbols
+    expect(before).toContain('tsgo . . . `src/dup.ts`/run().');
+    fs.writeFileSync(path.join(dir, 'src', 'dup.ts'), `// shifted\n\n${src}`); // every node index moves
+    expect((await defs()).filter(s => !s.endsWith('input().'))).toEqual(before.filter(s => !s.endsWith('input().')));
+  }, 30_000);
 
   it('implements/extends edges come from the compiler', async () => {
     fs.writeFileSync(path.join(dir, 'src', 'shapes.ts'),

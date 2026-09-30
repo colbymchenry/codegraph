@@ -8,8 +8,9 @@
  * It writes exactly what the merge reads (see compact.ts) and nothing more: a
  * reference at the callee name of every call and `new` in a project file, and
  * the definition of every callee the project declares. A symbol is named after
- * its first declaration (file + node index), so an overload maps to its first
- * signature, and a declaration reached from two projects is one symbol.
+ * its first declaration — its file and the named declarations enclosing it — so
+ * an overload maps to its first signature, a declaration reached from two
+ * projects is one symbol, and the name survives edits elsewhere in the file.
  *
  * Projects are opened one at a time in a single process. A file is indexed by
  * the deepest project containing it (its own tsconfig resolves its imports), or
@@ -37,6 +38,7 @@ interface TsNode {
   kind: number;
   pos: number;
   end: number;
+  text?: string;
   name?: TsNode;
   expression?: TsNode;
   parent?: TsNode;
@@ -125,6 +127,13 @@ export async function indexProjects(tsDir: string, output: string, root: string,
   const C = ts.CheckFlags;
   const CALLEE_HOLDERS = new Set([K.CallExpression, K.NewExpression]);
   const TYPE_DECLS = new Set([K.ClassDeclaration, K.ClassExpression, K.InterfaceDeclaration]);
+  /** Descriptor suffix of each named declaration that can enclose another (see `named`). */
+  const CONTAINER_SUFFIX = new Map<number, string>([
+    ...[K.ClassDeclaration, K.ClassExpression, K.InterfaceDeclaration, K.EnumDeclaration].map(k => [k!, '#'] as const),
+    [K.ModuleDeclaration!, '/'],
+    ...[K.FunctionDeclaration, K.FunctionExpression, K.MethodDeclaration, K.MethodSignature, K.GetAccessor, K.SetAccessor].map(k => [k!, '().'] as const),
+    ...[K.VariableDeclaration, K.PropertyDeclaration, K.PropertySignature, K.PropertyAssignment].map(k => [k!, '.'] as const),
+  ]);
   const NAMES = new Set([K.Identifier, K.PrivateIdentifier]);
   const UNWRAP = new Set([K.NonNullExpression, K.ParenthesizedExpression]);
 
@@ -143,6 +152,9 @@ export async function indexProjects(tsDir: string, output: string, root: string,
   };
   const indexed = new Set<string>();
   const defined = new Set<string>();
+  const names = new Map<string, string>();
+  /** symbol → the declaration (path + node index) that named it first */
+  const claimed = new Map<string, string>();
   const lines = new Map<string, number[]>();
   const starts = (file: string, text: string) => {
     let s = lines.get(file);
@@ -244,13 +256,36 @@ export async function indexProjects(tsDir: string, output: string, root: string,
         const where = nm >= 0 ? decl.path.slice(nm + '/node_modules/'.length) : path.basename(decl.path);
         return `tsgo npm . . ${esc(where)}/${decl.index}/${esc(t.name)}${suffix}`;
       }
+      const cacheKey = `${decl.path}\0${decl.index}\0${suffix}`;
+      const cached = names.get(cacheKey);
+      if (cached) return cached;
       const file = rel(decl.path);
-      const symbol = `tsgo . . . ${esc(file)}/${decl.index}/${esc(t.name)}${suffix}`;
+      const at = nodeOf(decl);
+      // Named by where it is declared — the chain of named declarations around it,
+      // as scip-typescript does — so a symbol keeps its name while edits elsewhere
+      // shift node indexes: an index built partly from an earlier run still links up.
+      let chain = '';
+      if (at?.node) {
+        for (let n = at.node.parent; n; n = n.parent) {
+          const s = CONTAINER_SUFFIX.get(n.kind);
+          const nm = n.name?.text;
+          if (s && nm) chain = `${esc(nm)}${s}${chain}`;
+        }
+      } else {
+        chain = `${decl.index}/`; // no node to name it by: unique within this run at least
+      }
+      let symbol = `tsgo . . . ${esc(file)}/${chain}${esc(t.name)}${suffix}`;
+      // Two declarations the chain can't tell apart (a `function input()` in each of two
+      // anonymous callbacks): the second is named by its node index instead of colliding.
+      const declKey = `${decl.path}\0${decl.index}`;
+      const owner = claimed.get(symbol);
+      if (owner === undefined) claimed.set(symbol, declKey);
+      else if (owner !== declKey) symbol = `tsgo . . . ${esc(file)}/${chain}${decl.index}/${esc(t.name)}${suffix}`;
+      names.set(cacheKey, symbol);
       if (defined.has(symbol)) return symbol;
       defined.add(symbol);
       // Defined at the declaration's name (its start when it has none, e.g. `export default class {`).
       // Always defined somewhere: a project symbol without a definition would read as external.
-      const at = nodeOf(decl);
       let range = { startLine: 0, startCol: 0, endLine: 0, endCol: 0 };
       if (at?.node) {
         const { sf, node } = at;
