@@ -6141,6 +6141,25 @@ export class TreeSitterExtractor {
       const child = node.namedChild(i);
       if (!child) continue;
 
+      // Dart: `class A = B with M implements I;` keeps its supertypes in a
+      // `mixin_application` — the same shapes as a class body's clauses.
+      if (this.language === 'dart' && child.type === 'mixin_application_class') {
+        const application = child.namedChildren.find((c: SyntaxNode) => c.type === 'mixin_application');
+        for (const t of application?.namedChildren ?? []) {
+          const targets = t.type === 'type_identifier' ? [t] : t.type === 'mixins' ? t.namedChildren.filter((m: SyntaxNode) => m.type === 'type_identifier') : t.type === 'interfaces' ? t.namedChildren : [];
+          for (const target of targets) {
+            this.unresolvedReferences.push({
+              fromNodeId: classId,
+              referenceName: getNodeText(target, this.source),
+              referenceKind: t.type === 'type_identifier' ? 'extends' : 'implements',
+              line: target.startPosition.row + 1,
+              column: target.startPosition.column,
+            });
+          }
+        }
+        continue;
+      }
+
       if (
         child.type === 'extends_clause' ||
         child.type === 'superclass' ||

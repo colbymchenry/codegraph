@@ -247,6 +247,13 @@ export const dartExtractor: LanguageExtractor = {
     return false;
   },
   resolveName: (node) => {
+    // `class A = B with C;` — a mixin application — names its class inside
+    // the `mixin_application_class`, not in a `name` field.
+    if (node.type === 'class_definition') {
+      const application = node.namedChildren.find((c: SyntaxNode) => c.type === 'mixin_application_class');
+      const id = application?.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
+      if (id) return id.text;
+    }
     // Name a factory / named constructor by its constructor name — the 2nd
     // identifier (`create` in `factory Foo.create()`, `_` in `Foo._()`) — not
     // the class, so a call `Foo.create()` resolves to `Foo::create` (#750). The
