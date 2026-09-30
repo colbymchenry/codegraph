@@ -4927,6 +4927,58 @@ function headTypeArguments(cls: Node, sup: string, context: ResolutionContext): 
   return angleArguments(head.slice(at.index)).map((a) => a.replace(/<[\s\S]*$/, '').split('.').pop()!.trim());
 }
 
+/**
+ * The supertypes a class declaration names in its own head, for the
+ * languages whose heads say it plainly: Pascal `TX = class(TBase, IFoo)`,
+ * Python `class X(Base):`, Ruby `class X < Base`, PHP / TS / JS `extends
+ * Base`, and the Java-family heads.
+ */
+function declaredSupertypes(cls: Node, context: ResolutionContext): string[] {
+  switch (cls.language) {
+    case 'java': case 'csharp': case 'kotlin': return classHeadSupertypes(cls, context);
+    case 'dart': return dartSupertypesOf(cls.name, context);
+    case 'swift': return swiftDeclOf(cls.name, context).supers;
+    case 'objc': return objcSupertypesOf(cls.name, context);
+    case 'scala': return scalaSupertypesOf(cls.name, context);
+    default: break;
+  }
+  const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
+  const head = lines.slice(cls.startLine - 1, cls.startLine + 2).join(' ');
+  const names = (text: string | undefined): string[] =>
+    text ? [...text.matchAll(/([A-Za-z_][\w.:\\]*)/g)].map((m) => m[1]!.split(/::|\.|\\/).pop()!).filter((w) => !/^(?:metaclass|object)$/.test(w)) : [];
+  switch (cls.language) {
+    case 'pascal': return names(/=\s*class\s*\(([^)]*)\)/i.exec(head)?.[1]);
+    case 'python': return names(/\bclass\s+\w+\s*\(([^)]*)\)/.exec(head)?.[1]?.replace(/\w+\s*=\s*[\w.]+/g, ''));
+    case 'ruby': return names(/\bclass\s+[\w:]+\s*<\s*([\w:]+)/.exec(head)?.[1]);
+    case 'php': case 'typescript': case 'tsx': case 'javascript': case 'jsx':
+      return names(/\bextends\s+([\w.\\]+)/.exec(head)?.[1]);
+    default: return [];
+  }
+}
+
+/** A method named `name` on a supertype of the given classes, nearest first. */
+function inheritedClassMethod(classes: Node[], name: string, context: ResolutionContext): Node | null {
+  const seen = new Set<string>(classes.map((c) => c.id));
+  let frontier = classes;
+  for (let depth = 0; depth < 5 && frontier.length > 0; depth++) {
+    const next: Node[] = [];
+    for (const cls of frontier) {
+      for (const sup of declaredSupertypes(cls, context)) {
+        for (const decl of context.getNodesByName(sup)) {
+          if (decl.language !== cls.language || !isMethodOwnerKind(decl) || seen.has(decl.id)) continue;
+          seen.add(decl.id);
+          const method = context.getNodesInFile(decl.filePath).find((n) => n.kind === 'method' && n.name === name &&
+            n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))).split(/::|\./).pop() === decl.name);
+          if (method) return method;
+          next.push(decl);
+        }
+      }
+    }
+    frontier = next;
+  }
+  return null;
+}
+
 /** The simple names a Java / C# / Kotlin class declaration's head extends or implements. */
 function classHeadSupertypes(cls: Node, context: ResolutionContext): string[] {
   const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
@@ -5749,6 +5801,10 @@ export function matchMethodCall(
         };
       }
     }
+    // A class method the named class inherits — Horse's `THorse.Get(…)` is
+    // THorseCore's, three `class(…)` heads up — before any guess by name.
+    const inherited = inheritedClassMethod(classCandidates.filter((c) => c.language === ref.language), methodName!, context);
+    if (inherited) return { original: ref, targetNodeId: inherited.id, confidence: 0.8, resolvedBy: 'qualified-name' };
     return null;
   });
   if (strat1) return strat1;
