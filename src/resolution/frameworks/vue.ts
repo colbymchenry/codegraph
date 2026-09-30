@@ -9,6 +9,9 @@ import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { dependsOn } from './package-deps';
 
+/** The languages a Vue app's scripts are written in. */
+const VUE_SCRIPT_LANGUAGES: ReadonlySet<string> = new Set(['vue', 'javascript', 'typescript', 'tsx', 'jsx']);
+
 /**
  * Vue 3 compiler macros — compiler-provided, not user code
  */
@@ -102,6 +105,11 @@ export const vueResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // Vue's macros, auto-imports and components are a script's, never a
+    // backend's: mealie's Python `QueryFilterBuilder(...)` is not the
+    // `QueryFilterBuilder.vue` component.
+    if (!VUE_SCRIPT_LANGUAGES.has(ref.language)) return null;
+
     // Pattern 1: Vue compiler macros (defineProps, defineEmits, etc.)
     if (VUE_COMPILER_MACROS.has(ref.referenceName)) {
       return {
