@@ -169,6 +169,8 @@ These describe `codegraph ui` and its screens. They were taken out of `## [Unrel
 
 ## Fixes — Symbols, tests and the viewer
 
+- **Stopping `codegraph ui` stops the server.** Killing the command by its process id, as a process manager, an editor task or `kill` does, left the server running on its port with no way to reach it, until the machine restarted. The server now notices it has been left behind and shuts down, closing the index first. Ctrl+C was never affected.
+
 - **A SwiftUI view with a preview is no longer listed as a file that runs something.** A `#Preview { … }` sits at the top level of a view's file, so every view with one showed up under entry points as if it ran code. A preview is Xcode's canvas, not code the app runs: its calls no longer count, and a file whose only top-level code is previews leaves the list.
 
 - **The Map opens a Maven or Gradle project on its packages.** A Java project keeps every file under `src/main/java/org/<company>/<app>/`, and those folders hold nothing but the next one, so the Map drew the whole program as one `src/main/java/org` box and no grouping option reached further. A folder with one subfolder and no files of its own no longer counts as a level: petclinic opens on `owner`, `vet`, `model` and `system`, each labelled `src/main/java/…/petclinic/owner`, with the full path on hover.
