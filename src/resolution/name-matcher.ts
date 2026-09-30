@@ -1317,6 +1317,8 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   // A test suite is not linked into the program: typeorm's `Record<K, V>` is
   // not a test entity `Record`, tokio's `Output` not a `runtime/tests` type.
   if (isTestSuitePath(candidate.filePath) && !isTestPath(ref.filePath)) return false;
+  if (candidate.language === 'csharp' && ref.language === 'csharp' && CSHARP_TYPE_KINDS.has(candidate.kind) &&
+      /^[A-Za-z_]\w*$/.test(ref.referenceName) && !isCsharpTypeVisible(candidate, ref, context)) return false;
   const lang = candidate.language as string;
   if (lang === 'c' || lang === 'cpp') {
     return (
@@ -3207,6 +3209,98 @@ function csharpProjectStaticUsings(dir: string, context: ResolutionContext, memo
   }
   memo.set(key, owners);
   return owners;
+}
+
+const CSHARP_NAMESPACE_SCOPES = new WeakMap<ResolutionContext, Map<string, { namespaces: string[]; usings: Set<string>; aliases: Map<string, string> }>>();
+const CSHARP_PROJECT_USINGS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
+
+/**
+ * The namespaces a C# file's code runs in and the ones it imports: its
+ * `namespace` declarations, its `using X;`, every file's `global using X;`
+ * and the `<Using Include="X" />` of the project files above it.
+ */
+function csharpNamespaceScope(file: string, context: ResolutionContext): { namespaces: string[]; usings: Set<string>; aliases: Map<string, string> } {
+  let memo = CSHARP_NAMESPACE_SCOPES.get(context);
+  if (!memo) CSHARP_NAMESPACE_SCOPES.set(context, (memo = new Map()));
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const text = stripCommentsForRegex(context.readFile(file) ?? '', 'java');
+  const namespaces = [...text.matchAll(/^\s*namespace\s+([\w.]+)/gm)].map((m) => m[1]!);
+  let projectMemo = CSHARP_PROJECT_USINGS.get(context);
+  if (!projectMemo) CSHARP_PROJECT_USINGS.set(context, (projectMemo = new Map()));
+  const usings = new Set<string>(csharpProjectUsings(path.posix.dirname(file), context, projectMemo));
+  const aliases = new Map<string, string>();
+  for (const m of text.matchAll(/^\s*(?:global\s+)?using\s+(?!static\b)(?:([A-Za-z_]\w*)\s*=\s*)?([\w.]+)\s*;/gm)) {
+    if (m[1]) aliases.set(m[1], m[2]!);
+    else usings.add(m[2]!);
+  }
+  const scope = { namespaces, usings, aliases };
+  memo.set(file, scope);
+  return scope;
+}
+
+/** `global using X;` from any file, and `<Using Include="X" />` of the project files from `dir` up. */
+function csharpProjectUsings(dir: string, context: ResolutionContext, memo: Map<string, Set<string>>): Set<string> {
+  const key = dir;
+  const hit = memo.get(key);
+  if (hit) return hit;
+  let usings: Set<string>;
+  if (dir === '.' || dir === '' || dir === '/') {
+    usings = new Set();
+    for (const f of context.getAllFiles()) {
+      if (!f.endsWith('.cs') || (context.fileContains && !context.fileContains(f, 'global using'))) continue;
+      for (const m of (context.readFile(f) ?? '').matchAll(/^\s*global\s+using\s+(?!static\b)([\w.]+)\s*;/gm)) usings.add(m[1]!);
+    }
+  } else {
+    usings = new Set(csharpProjectUsings(path.posix.dirname(dir), context, memo));
+  }
+  let entries: string[] = [];
+  try {
+    entries = fs.readdirSync(path.join(context.getProjectRoot(), dir === '.' ? '' : dir));
+  } catch {
+    entries = [];
+  }
+  for (const entry of entries) {
+    if (!/\.(?:csproj|props)$/i.test(entry)) continue;
+    let project = '';
+    try {
+      project = fs.readFileSync(path.join(context.getProjectRoot(), dir === '.' ? '' : dir, entry), 'utf8');
+    } catch {
+      continue;
+    }
+    for (const m of project.matchAll(/<Using\s+Include\s*=\s*"([\w.]+)"(?![^>]*\bStatic\s*=\s*"true")[^>]*>/gi)) usings.add(m[1]!);
+    // The SDK's implicit usings (serilog's own `System.TimeProvider` polyfill is seen through them).
+    if (/<ImplicitUsings>\s*(?:enable|true)\s*<\/ImplicitUsings>/i.test(project)) {
+      for (const ns of CSHARP_IMPLICIT_USINGS) usings.add(ns);
+    }
+  }
+  memo.set(key, usings);
+  return usings;
+}
+
+/** The namespaces `<ImplicitUsings>enable</ImplicitUsings>` imports into every file (Microsoft.NET.Sdk). */
+const CSHARP_IMPLICIT_USINGS: readonly string[] = [
+  'System', 'System.Collections.Generic', 'System.IO', 'System.Linq', 'System.Net.Http', 'System.Threading', 'System.Threading.Tasks',
+];
+
+/**
+ * Whether a bare C# type name can mean `n` — a type in namespace `N` is seen
+ * from `N` and the namespaces inside it, and through a `using N;` —
+ * Newtonsoft's `async Task` tests (`using System.Threading.Tasks;`) bound
+ * `Task` to a test class of that name in `Newtonsoft.Json.Tests.Schema`, 433
+ * times. A type in the global namespace is seen everywhere.
+ */
+function isCsharpTypeVisible(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const cut = n.qualifiedName.indexOf('::');
+  if (cut < 0) return true;
+  const ns = n.qualifiedName.slice(0, cut);
+  // A nested type (`Outer::Inner`) is judged by its outermost type's namespace.
+  const scope = csharpNamespaceScope(ref.filePath, context);
+  // `using License = AutoMapper.Licensing.License;` names that type, whatever the file's usings.
+  const aliased = scope.aliases.get(ref.referenceName);
+  if (aliased !== undefined) return aliased === `${ns}.${n.qualifiedName.slice(cut + 2).replace(/::/g, '.')}`;
+  if (scope.namespaces.some((own) => own === ns || own.startsWith(ns + '.'))) return true;
+  return scope.usings.has(ns);
 }
 
 const OBJC_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
@@ -5357,6 +5451,8 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   OBJC_SUPERS.delete(context);
   CSHARP_SUPERS.delete(context);
   CSHARP_STATIC_USINGS.delete(context);
+  CSHARP_NAMESPACE_SCOPES.delete(context);
+  CSHARP_PROJECT_USINGS.delete(context);
   SCALA_SUPERS.delete(context);
   SCALA_IMPORTS.delete(context);
   ESM_EXPORT_LISTS.delete(context);
