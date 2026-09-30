@@ -933,6 +933,24 @@ function isLuaLocal(candidate: Node, context: ResolutionContext): boolean {
 const JVM_CALLABLE_KINDS: ReadonlySet<string> = new Set(['method', 'function']);
 const JVM_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'enum', 'struct', 'trait', 'type_alias', 'annotation']);
 
+/**
+ * A test suite — a test source set, a `tests/` / `__tests__/` / `spec/`
+ * directory, a `FooTest.kt` / `test_foo.py` / `foo.test.ts` file — as opposed
+ * to test-support code a project ships (`testing/`, `fakes/`, a `*-test`
+ * module like kotlinx-coroutines-test), which its own code may use.
+ */
+function isTestSuitePath(filePath: string): boolean {
+  if (!isTestPath(filePath)) return false;
+  const lower = filePath.toLowerCase();
+  const name = lower.slice(lower.lastIndexOf('/') + 1);
+  const original = filePath.slice(filePath.lastIndexOf('/') + 1);
+  // (`…Spec.java` alone is no test: halo's `IndexSpecs`, okhttp's `ConnectionSpec`.)
+  if (name.startsWith('test_') || /[._-](?:test|tests)\.[a-z0-9]+$|[._](?:spec|specs)\.[a-z0-9]+$/.test(name) ||
+      // CamelCase suffixes where the language names tests so: not `useTests.ts`, a React hook.
+      /(?:Test|Tests|TestCase)\.(?:java|kt|kts|swift|cs|scala|groovy|m|mm|vb|fs)$/.test(original) || name === 'conftest.py') return true;
+  return /(?:^|\/)(?:tests?|__tests__|specs?|e2e)\//.test(lower) || /(?:^|\/)[A-Za-z0-9]*(?:Test|Tests|Spec)\//.test(filePath);
+}
+
 const MINIFIED_SCRIPTS = new WeakMap<ResolutionContext, Map<string, boolean>>();
 
 /** A minified / bundled script, by name (`jquery.min.js`) or by its text. */
@@ -1295,6 +1313,9 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   // A vendored minified bundle's names are mangled: healthchecks' 369 `$(…)`
   // (jQuery, a global) went to a one-letter helper inside bootstrap-native.min.js.
   if (isMinifiedScript(candidate.filePath, context)) return false;
+  // A test suite is not linked into the program: typeorm's `Record<K, V>` is
+  // not a test entity `Record`, tokio's `Output` not a `runtime/tests` type.
+  if (isTestSuitePath(candidate.filePath) && !isTestPath(ref.filePath)) return false;
   const lang = candidate.language as string;
   if (lang === 'c' || lang === 'cpp') {
     return (
