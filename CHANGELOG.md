@@ -12,6 +12,11 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- QML, the declarative language used with the Qt framework, is now indexed, including component structure, module imports and flows from QML handlers into C++ through Qt signals, slots, invokable methods and properties.
+- Qt macros in C++ files no longer disturb the parser: source positions stay exact, comments and string literals are untouched, and QML objects, bindings and multi-line functions keep their place in the component hierarchy with their full bodies.
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)

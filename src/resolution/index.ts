@@ -1141,6 +1141,7 @@ export class ReferenceResolver {
       filePath: ref.filePath || this.getFilePathFromNodeId(ref.fromNodeId),
       language: ref.language || this.getLanguageFromNodeId(ref.fromNodeId),
       rowId: ref.rowId,
+      candidates: ref.candidates,
     }));
 
     const total = refs.length;
@@ -1661,7 +1662,7 @@ export class ReferenceResolver {
       // calls `FormatPrice`, which the exact-name set never lists.
       (CASE_INSENSITIVE_LANGUAGES.has(ref.language) && this.hasAnyPossibleMatchIgnoringCase(existenceName)) ||
       this.matchesAnyImport(ref) ||
-      this.frameworksFor(ref.language).some((f) => f.claimsReference?.(ref.referenceName));
+      this.frameworksFor(ref.language).some((f) => f.claimsReference?.(ref.referenceName, ref));
     if (this.profileStages) this.stageAdd('preFilter', ref, preFilterPass, tPre);
     if (!preFilterPass) {
       return this.gateLanguage(matchJsStoreBindingCall(ref, this.context), ref);
@@ -1788,6 +1789,39 @@ export class ReferenceResolver {
       const target = viaNamespace ? this.nodeById(viaNamespace.targetNodeId) : null;
       return target && (target.kind === 'function' || target.kind === 'method' || target.kind === 'class' || target.kind === 'constant' || target.kind === 'variable')
         ? viaNamespace : null;
+    }
+
+    // A QML import names a file or module that Qt either proves or does not:
+    // name matching would land it on the import node of the same name.
+    if (ref.language === 'qml' && ref.referenceKind === 'imports') {
+      return candidates.length > 0
+        ? candidates.reduce((best, curr) => curr.confidence > best.confidence ? curr : best)
+        : null;
+    }
+
+    // A Q_PROPERTY accessor is owner-qualified too: when Qt cannot prove the
+    // accessor, name matching must not bind it to the property of the same name.
+    if (ref.candidates?.some((candidate) => candidate.startsWith('qt.property-accessor|'))) {
+      return candidates.length > 0
+        ? candidates.reduce((best, curr) => curr.confidence > best.confidence ? curr : best)
+        : null;
+    }
+
+    // Owner-qualified QML refs are terminal: if Qt cannot prove the owner,
+    // generic name matching must not guess among same-named members.
+    if (
+      ref.language === 'qml' &&
+      ref.candidates?.some(
+        (candidate) =>
+          candidate.startsWith('qt.qml-id|') ||
+          candidate.startsWith('qt.context-property|') ||
+          candidate.startsWith('qt.enum-member|') ||
+          (ref.referenceKind === 'references' && candidate.endsWith(`::${ref.referenceName}`)),
+      )
+    ) {
+      return candidates.length > 0
+        ? candidates.reduce((best, curr) => curr.confidence > best.confidence ? curr : best)
+        : null;
     }
 
     // Strategy 2: Try import-based resolution
@@ -2305,6 +2339,7 @@ export class ReferenceResolver {
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
         rowId: raw.rowId,
+        candidates: raw.candidates,
       };
       const result = this.resolveOneTimed(ref);
       if (result) {
@@ -2425,6 +2460,7 @@ export class ReferenceResolver {
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
         rowId: raw.rowId,
+        candidates: raw.candidates,
       };
       const result = this.resolveOneTimed(ref);
       if (result) {
