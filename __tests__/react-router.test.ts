@@ -548,8 +548,9 @@ describe('react-router: route declaration boundaries (#1348)', () => {
       }
     `, extension);
     expect(result).toEqual({
-      paths: ['/dashboard', '/empty', '/legacy', '/long', '/no-element', '/sibling', 'settings'],
-      bindings: ['/legacy->Settings', '/long->Shell', '/sibling->Settings', 'settings->Settings'],
+      // A nested route's path is relative to its parent's (`settings` under `/dashboard`).
+      paths: ['/dashboard', '/dashboard/settings', '/empty', '/legacy', '/long', '/no-element', '/sibling'],
+      bindings: ['/dashboard/settings->Settings', '/legacy->Settings', '/long->Shell', '/sibling->Settings'],
     });
   });
 
@@ -573,8 +574,8 @@ describe('react-router: route declaration boundaries (#1348)', () => {
       ]);
     `, extension);
     expect(result).toEqual({
-      paths: ['/', '/long', '/quoted', '/sibling', 'prefs'],
-      bindings: ['/->DataSettings', '/long->DataSettings', '/quoted->DataSettings', '/sibling->DataSettings', 'prefs->DataSettings'],
+      paths: ['/', '/data/prefs', '/long', '/quoted', '/sibling'],
+      bindings: ['/->DataSettings', '/data/prefs->DataSettings', '/long->DataSettings', '/quoted->DataSettings', '/sibling->DataSettings'],
     });
   });
 

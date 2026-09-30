@@ -28,11 +28,12 @@
  * in JavaScript, so the receiver has to name a router — a bare `push` is an
  * array's, and is never claimed.
  *
- * Known limits, both deliberate: a nested route's path is relative to its
- * parent (`<Route path="team">` inside `<Route path="/dashboard">`), and the
- * markup scan does not compose that tree, so only an absolute path is a
- * destination an href can name; and a splat (`/admin/*`) matches anything, so
- * it is never the answer to a concrete href.
+ * A nested route's path is relative to its parent's (`<Route path="team">`
+ * inside `<Route path="/dashboard">`, a data router's `children`); the markup
+ * scan composes that tree, a constant path (`paths.app.root.path`) included,
+ * and a `lazy: () => import('./routes/x')` route renders that module's default
+ * export (`frameworks/react.ts`). Known limit, deliberate: a splat
+ * (`/admin/*`) matches anything, so it is never the answer to a concrete href.
  */
 
 import type { Language, Node } from '../../types';
@@ -70,13 +71,16 @@ export const reactRouterRoot = appRootFor;
  *
  * Its id is a verbatim reconstruction of the node's own fields, which no
  * other framework's route id is: a server route carries its METHOD
- * (`route:file:12:POST:/login`), a file-based page carries no line.
+ * (`route:file:12:POST:/login`), a file-based page carries no line. A path
+ * built from a constant keeps the id it was extracted with.
  */
 function isReactRouterRoute(node: Node): boolean {
-  return (
-    (node.language === 'tsx' || node.language === 'jsx') &&
-    node.id === `route:${node.filePath}:${node.startLine}:${node.name}`
-  );
+  const prefix = `route:${node.filePath}:${node.startLine}:`;
+  if ((node.language !== 'tsx' && node.language !== 'jsx') || !node.id.startsWith(prefix)) return false;
+  // Its name, or — for a path built from a constant, renamed after extraction
+  // — the path as the file wrote it; never a server route's `METHOD:`.
+  const rest = node.id.slice(prefix.length);
+  return rest === node.name || (!/^[A-Z]+:/.test(rest) && Boolean(node.signature?.startsWith('route-parts:')));
 }
 
 /** `:id?` — a parameter React Router serves the route with or without. */

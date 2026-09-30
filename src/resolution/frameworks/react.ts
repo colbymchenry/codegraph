@@ -8,6 +8,7 @@
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { dependsOn } from './package-deps';
+import { resolveImportPath } from '../import-resolver';
 
 export const reactResolver: FrameworkResolver = {
   name: 'react',
@@ -27,7 +28,16 @@ export const reactResolver: FrameworkResolver = {
     return allFiles.some((f) => f.endsWith('.jsx') || f.endsWith('.tsx'));
   },
 
+  // A data-router `lazy: () => import('./routes/x')` route names a module, not a symbol.
+  claimsReference(name: string): boolean {
+    return name.startsWith(LAZY_ROUTE_PREFIX);
+  },
+
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    if (ref.referenceName.startsWith(LAZY_ROUTE_PREFIX)) {
+      const target = lazyRouteComponent(ref.referenceName.slice(LAZY_ROUTE_PREFIX.length), ref.filePath, context);
+      return target ? { original: ref, targetNodeId: target, confidence: 0.9, resolvedBy: 'framework' } : null;
+    }
     // A component, hook or context the file IMPORTS is the import's: the
     // package's (`useQuery` from `@tanstack/react-query`, `<Button>` from a UI
     // kit), or the module the import names, which import resolution finds.
@@ -109,7 +119,7 @@ export const reactResolver: FrameworkResolver = {
 
     // Read only each opening tag's own attributes, including expression values.
     const declarations = scanRouteDeclarations(content, !/\.(?:ts|mts|cts)$/.test(filePath));
-    for (const { path: routePath, component, at } of declarations) {
+    for (const { path: routePath, parts, component, lazy, at } of declarations) {
       const line = content.slice(0, at).split('\n').length;
       const routeNode: Node = {
         id: `route:${filePath}:${line}:${routePath}`,
@@ -123,12 +133,15 @@ export const reactResolver: FrameworkResolver = {
         endColumn: 0,
         language: filePath.endsWith('.tsx') ? 'tsx' : 'jsx',
         updatedAt: now,
+        // A path built from a constant (`paths.app.root.path`) is named in postExtract.
+        ...(parts.some((p) => p.expr) ? { signature: ROUTE_PARTS_PREFIX + JSON.stringify(parts) } : {}),
       };
       nodes.push(routeNode);
-      if (component) {
+      const target = component ?? (lazy ? LAZY_ROUTE_PREFIX + lazy : undefined);
+      if (target) {
         references.push({
           fromNodeId: routeNode.id,
-          referenceName: component,
+          referenceName: target,
           referenceKind: 'references',
           line,
           column: 0,
@@ -142,29 +155,175 @@ export const reactResolver: FrameworkResolver = {
 
     return { nodes, references };
   },
+
+  /**
+   * Name the routes whose path is built from a constant — bulletproof-react's
+   * `path: paths.app.discussions.path` under `path: paths.app.root.path` is
+   * `/app/discussions` — by reading the constant's object literal where it is
+   * declared. Idempotent: the parts ride on the node's signature.
+   */
+  postExtract(context: ResolutionContext): Node[] {
+    const updates: Node[] = [];
+    for (const route of context.getNodesByKind('route')) {
+      if (!route.signature?.startsWith(ROUTE_PARTS_PREFIX)) continue;
+      let parts: RoutePart[];
+      try {
+        parts = JSON.parse(route.signature.slice(ROUTE_PARTS_PREFIX.length)) as RoutePart[];
+      } catch {
+        continue;
+      }
+      const values = parts.map((p) => p.lit ?? (p.expr ? constantPathValue(p.expr, route.filePath, context) : null));
+      if (values.some((v) => v === null)) continue;
+      const name = composeRoutePath(values as string[]);
+      if (name !== route.name) updates.push({ ...route, name });
+    }
+    return updates;
+  },
 };
 
+const LAZY_ROUTE_PREFIX = 'lazy-import:';
+const ROUTE_PARTS_PREFIX = 'route-parts:';
+
+/** One segment of a nested route's path: a literal, or a constant's member expression. */
+interface RoutePart {
+  lit?: string;
+  expr?: string;
+}
+
+/** React Router's nesting: a child path is relative unless it starts with `/`. */
+function composeRoutePath(parts: string[]): string {
+  let path = '';
+  for (const part of parts) {
+    if (part.startsWith('/')) path = part;
+    else if (part) path = `${path.replace(/\/+$/, '')}/${part}`;
+  }
+  return ('/' + path.replace(/^\/+/, '')).replace(/\/{2,}/g, '/').replace(/(.)\/$/, '$1');
+}
+
+/**
+ * The string a member expression like `paths.app.root.path` reads from a
+ * constant object literal — the constant found through the route file's
+ * import of its root name, or in the file itself.
+ */
+function constantPathValue(expr: string, fromFile: string, context: ResolutionContext): string | null {
+  const [root, ...keys] = expr.split('.');
+  if (!root || keys.length === 0) return null;
+  let file = fromFile;
+  let name = root;
+  const mapping = context.getImportMappings(fromFile, 'tsx').find((m) => m.localName === root) ??
+    context.getImportMappings(fromFile, 'typescript').find((m) => m.localName === root);
+  if (mapping) {
+    const resolved = resolveImportPath(mapping.source, fromFile, 'typescript', context);
+    if (!resolved) return null;
+    file = resolved;
+    if (mapping.exportedName && mapping.exportedName !== 'default' && mapping.exportedName !== '*') name = mapping.exportedName;
+  }
+  const decl = context.getNodesInFile(file).find((n) => n.name === name && (n.kind === 'constant' || n.kind === 'variable'));
+  if (!decl) return null;
+  const lines = context.readFile(file)?.split('\n') ?? [];
+  const text = lines.slice(decl.startLine - 1, decl.endLine).join('\n');
+  const open = text.indexOf('{', Math.max(0, text.search(new RegExp(`\\b${name}\\b`))));
+  return open < 0 ? null : readObjectPath(text, open, keys);
+}
+
+/** Walk `keys` into the object literal opening at `at`; the string literal at the end, or null. */
+function readObjectPath(text: string, at: number, keys: string[]): string | null {
+  const skipString = (j: number): number => {
+    const quote = text[j]!;
+    for (j++; j < text.length && text[j] !== quote; j++) if (text[j] === '\\') j++;
+    return j + 1;
+  };
+  const skipValue = (j: number): number => {
+    let depth = 0;
+    for (; j < text.length; j++) {
+      const ch = text[j]!;
+      if (ch === '"' || ch === "'" || ch === '`') { j = skipString(j) - 1; continue; }
+      if (ch === '{' || ch === '[' || ch === '(') depth++;
+      else if (ch === '}' || ch === ']' || ch === ')') { if (depth === 0) return j; depth--; }
+      else if (ch === ',' && depth === 0) return j;
+    }
+    return j;
+  };
+  let i = at + 1;
+  while (i < text.length) {
+    const m = /^\s*(?:([A-Za-z_$][\w$]*)|["']([^"']+)["'])\s*:\s*/.exec(text.slice(i));
+    if (!m) {
+      const next = skipValue(i);
+      if (text[next] !== ',') return null;
+      i = next + 1;
+      continue;
+    }
+    const key = m[1] ?? m[2]!;
+    const valueAt = i + m[0].length;
+    if (key === keys[0]) {
+      if (keys.length === 1) {
+        const lit = /^(["'])((?:\\.|(?!\1).)*)\1/.exec(text.slice(valueAt));
+        return lit ? lit[2]! : null;
+      }
+      return text[valueAt] === '{' ? readObjectPath(text, valueAt, keys.slice(1)) : null;
+    }
+    const end = skipValue(valueAt);
+    if (text[end] !== ',') return null;
+    i = end + 1;
+  }
+  return null;
+}
+
+/** The component a lazy route module renders: its default export, else its `Component` export. */
+function lazyRouteComponent(spec: string, fromFile: string, context: ResolutionContext): string | null {
+  const file = resolveImportPath(spec, fromFile, 'typescript', context);
+  if (!file) return null;
+  const source = context.readFile(file) ?? '';
+  const named = /\bexport\s+default\s+(?:async\s+)?(?:function\s*\*?\s*|class\s+)?([A-Za-z_$][\w$]*)/.exec(source)?.[1] ??
+    (/\bexport\s+(?:const|function|class)\s+Component\b/.test(source) ? 'Component' : null);
+  if (!named) return null;
+  const node = context.getNodesInFile(file).find((n) => n.name === named &&
+    (n.kind === 'function' || n.kind === 'component' || n.kind === 'class' || n.kind === 'constant' || n.kind === 'variable'));
+  return node?.id ?? null;
+}
+
 interface RouteDeclaration {
+  /** The route's full path as far as the file tells: nesting composed, a constant part shown as `{expr}`. */
   path: string;
+  /** Its path parts, outermost first. */
+  parts: RoutePart[];
   component?: string;
+  /** A `lazy: () => import('…')` module. */
+  lazy?: string;
   at: number;
+}
+
+/** A path-bearing route object or `<Route>` element, with the extent its children sit in. */
+interface RouteScope {
+  part: RoutePart;
+  at: number;
+  end: number;
+  component?: string;
+  lazy?: string;
+  /** A `<Route path>` element: a route even with nothing to render (a layout's path). */
+  jsx?: boolean;
 }
 
 /** Structural scanner: strings, comments, JSX and balanced expressions are units. */
 function scanRouteDeclarations(source: string, allowJsx: boolean): RouteDeclaration[] {
   const routes: RouteDeclaration[] = [];
+  const scopes: RouteScope[] = [];
   const dataRouter = /\b(?:createBrowserRouter|createHashRouter|createMemoryRouter|createRoutesFromElements)\b/.test(source);
   if (!dataRouter && !/<Route\b/.test(source)) return routes;
   const literal = (value: string): string | undefined => {
     const match = /^(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)')$/.exec(value.trim());
     return match ? match[1] ?? match[2] : undefined;
   };
+  // A guard or boundary wrapping the screen (`<ProtectedRoute><AppRoot/></ProtectedRoute>`,
+  // `<Suspense>`) is not what the route renders; the first element inside it is.
+  const WRAPPER = /^(?:Suspense|ErrorBoundary|\w*(?:Guard|Provider)|(?:Protected|Private|Auth|Require\w*)\w*)$/;
   const componentName = (value: string | undefined, jsx: boolean): string | undefined => {
     if (!value) return undefined;
-    const match = jsx
-      ? /^\s*<\s*([A-Z][\w]*)\s*(?=[\s/>])/.exec(value)
-      : /^\s*([A-Z][\w]*)\s*$/.exec(value);
-    return match?.[1];
+    if (!jsx) return /^\s*([A-Z][\w]*)\s*$/.exec(value)?.[1];
+    const inner = value.replace(/^\s*\(\s*/, '');
+    if (!/^<\s*[A-Z]/.test(inner)) return undefined;
+    const tags = [...inner.matchAll(/<\s*([A-Z][\w]*)\s*(?=[\s/>])/g)].map((m) => m[1]!);
+    return tags.find((t) => !WRAPPER.test(t)) ?? tags[0];
   };
   // The few characters before `at`, trailing whitespace skipped: enough for the
   // end-anchored checks below without copying the whole prefix per `/` or `<`.
@@ -246,9 +405,13 @@ function scanRouteDeclarations(source: string, allowJsx: boolean): RouteDeclarat
     if (dataRouter && ch === '{' && source[i] === close) {
       const pathField = fields.get('path');
       const path = pathField && literal(pathField.value);
+      const expr = pathField && path === undefined && /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/.test(pathField.value) ? pathField.value : undefined;
       const component = componentName(fields.get('element')?.value, true)
         ?? componentName(fields.get('Component')?.value, false);
-      if (path !== undefined && component) routes.push({ path: path || '/', component, at: pathField!.at });
+      const lazy = /\bimport\s*\(\s*["']([^"']+)["']\s*\)/.exec(fields.get('lazy')?.value ?? '')?.[1];
+      if (pathField && (path !== undefined || expr)) {
+        scopes.push({ part: path !== undefined ? { lit: path } : { expr }, at: pathField.at, end: i, component, lazy });
+      }
     }
     return i < source.length ? i + 1 : i;
   }
@@ -266,27 +429,49 @@ function scanRouteDeclarations(source: string, allowJsx: boolean): RouteDeclarat
       i = unit(i);
       attrs.set(attr[0], source.slice(start, i));
     }
+    let scope: RouteScope | undefined;
     if (tag[1] === 'Route' && i < source.length) {
       const path = literal(attrs.get('path') ?? '');
       const expression = (name: string) => attrs.get(name)?.replace(/^\{([\s\S]*)\}$/, '$1');
       const component = componentName(expression('component'), false) ?? componentName(expression('element'), true);
-      if (path) routes.push({ path, component, at });
+      const lazy = /\bimport\s*\(\s*["']([^"']+)["']\s*\)/.exec(expression('lazy') ?? '')?.[1];
+      if (path) {
+        scope = { part: { lit: path }, at, end: source.length, component, lazy, jsx: true };
+        scopes.push(scope);
+      }
     }
-    if (source.startsWith('/>', i)) return i + 2;
+    if (source.startsWith('/>', i)) {
+      if (scope) scope.end = i + 2;
+      return i + 2;
+    }
     i++;
     while (i < source.length) {
       if (source.startsWith('</', i)) {
         const end = source.indexOf('>', i + 2);
-        return end < 0 ? source.length : end + 1;
+        const after = end < 0 ? source.length : end + 1;
+        if (scope) scope.end = after;
+        return after;
       }
       if (source[i] === '<' && /^<(?:[A-Za-z]|>)/.test(source.slice(i))) i = jsx(i);
       else if (source[i] === '{') i = unit(i);
       else i++;
     }
+    if (scope) scope.end = i;
     return i;
   }
   let at = 0;
   while ((at = trivia(at)) < source.length) at = unit(at);
+  // A child route's path is relative to the routes around it: compose each
+  // rendering route's path from the path-bearing scopes that contain it.
+  for (const scope of scopes) {
+    if (!scope.component && !scope.lazy && !scope.jsx) continue;
+    const chain = scopes
+      .filter((outer) => outer !== scope && outer.at < scope.at && outer.end >= scope.end)
+      .sort((a, b) => a.at - b.at);
+    const parts = [...chain.map((c) => c.part), scope.part];
+    const shown = parts.map((p) => p.lit ?? `{${p.expr}}`);
+    routes.push({ path: composeRoutePath(shown), parts, component: scope.component, lazy: scope.lazy, at: scope.at });
+  }
   return routes.sort((a, b) => a.at - b.at);
 }
 

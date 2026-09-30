@@ -307,6 +307,8 @@ export class ReferenceResolver {
   // `null` = computed and absent. Treated as immutable for the
   // resolver's lifetime; callers re-create the resolver if config changes.
   private projectAliases: AliasMap | null | undefined = undefined;
+  // Per directory: the aliases of the nearest non-root tsconfig declaring `paths`.
+  private dirAliases = new Map<string, AliasMap | null>();
   // go.mod module path. Same lazy/immutable convention as projectAliases.
   private goModule: GoModule | null | undefined = undefined;
   // Monorepo workspace member packages. Same lazy/immutable convention.
@@ -774,6 +776,31 @@ export class ReferenceResolver {
           this.projectAliases = loadProjectAliases(this.projectRoot);
         }
         return this.projectAliases;
+      },
+
+      getNearestAliases: (fromFile: string) => {
+        let dir = path.posix.dirname(fromFile.replace(/\\/g, '/'));
+        const walked: string[] = [];
+        let found: AliasMap | null = null;
+        while (dir && dir !== '.' && dir !== '/') {
+          const hit = this.dirAliases.get(dir);
+          if (hit !== undefined) {
+            found = hit;
+            break;
+          }
+          walked.push(dir);
+          const abs = path.join(this.projectRoot, dir);
+          if (['tsconfig.json', 'jsconfig.json'].some((name) => fs.existsSync(path.join(abs, name)))) {
+            const aliases = loadProjectAliases(abs);
+            if (aliases) {
+              found = aliases;
+              break;
+            }
+          }
+          dir = path.posix.dirname(dir);
+        }
+        for (const d of walked) this.dirAliases.set(d, found);
+        return found;
       },
 
       getGoModule: () => {
