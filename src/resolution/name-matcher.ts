@@ -4547,6 +4547,9 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   KOTLIN_RECEIVER_TYPES.delete(context);
   KOTLIN_HIERARCHIES.delete(context);
   KOTLIN_FRAMES.delete(context);
+  CPP_NS_MACROS.delete(context);
+  CPP_NS_FRAMES.delete(context);
+  CPP_NS_ALIASES.delete(context);
   MEMBER_TYPE_MEMO.delete(context);
   CSHARP_ALIASES.delete(context);
   SWIFT_HIERARCHIES.delete(context);
@@ -7315,5 +7318,140 @@ function matchReferenceInner(
   result = nmTimed('fuzzy', ref, () => matchFuzzy(ref, context));
   if (result) return result;
 
+  // 5. A C / C++ name qualified by a namespace the project opens with a macro
+  // (`fmt::format` — `FMT_BEGIN_NAMESPACE`), which the index cannot see.
+  if ((ref.language === 'cpp' || ref.language === 'c') && ref.referenceName.includes('::')) {
+    return matchCppMacroNamespaced(ref, context);
+  }
+
   return null;
+}
+
+const CPP_NS_MACROS = new WeakMap<ResolutionContext, { openers: Map<string, string[]>; openerFns: Set<string>; closers: Map<string, number>; aliases: Map<string, string> }>();
+const CPP_NS_FRAMES = new WeakMap<ResolutionContext, Map<string, Array<{ start: number; end: number; path: string[] }>>>();
+/** A closing macro's body: `}` / `} }`, maybe beside a pragma macro (`PYBIND11_WARNING_POP }`). */
+const CPP_CLOSER_BODY = /^(?:[A-Za-z_]\w*\s+)*\}(?:\s*\})*\s*;?$/;
+const CPP_NS_ALIASES = new WeakMap<ResolutionContext, Map<string, string>>();
+
+/** The project's namespace aliases: `namespace py = pybind11;`. */
+function cppNamespaceAliases(context: ResolutionContext): Map<string, string> {
+  const hit = CPP_NS_ALIASES.get(context);
+  if (hit) return hit;
+  const aliases = new Map<string, string>();
+  for (const file of context.getAllFiles()) {
+    if (!/\.(?:h|hh|hpp|hxx|inl|c|cc|cpp|cxx)$/i.test(file)) continue;
+    const source = context.readFile(file);
+    if (!source || !source.includes('namespace')) continue;
+    for (const m of source.matchAll(/^[ \t]*namespace[ \t]+([A-Za-z_]\w*)[ \t]*=[ \t]*(?:::)?([A-Za-z_][\w:]*)[ \t]*;/gm)) {
+      if (!aliases.has(m[1]!)) aliases.set(m[1]!, m[2]!);
+    }
+  }
+  CPP_NS_ALIASES.set(context, aliases);
+  return aliases;
+}
+
+/**
+ * The project's namespace-opening macros — `#define FMT_BEGIN_NAMESPACE
+ * namespace fmt { inline namespace v12 {`, `#define RAPIDJSON_NAMESPACE_BEGIN
+ * namespace RAPIDJSON_NAMESPACE {` (through `#define RAPIDJSON_NAMESPACE
+ * rapidjson`) — as the namespace path each opens (inline namespaces are
+ * transparent), and the closing macros as how many scopes each closes.
+ */
+function cppNamespaceMacros(context: ResolutionContext): { openers: Map<string, string[]>; openerFns: Set<string>; closers: Map<string, number>; aliases: Map<string, string> } {
+  const hit = CPP_NS_MACROS.get(context);
+  if (hit) return hit;
+  const openers = new Map<string, string[]>();
+  // `#define PYBIND11_NAMESPACE_BEGIN(name) namespace name {`, used as `PYBIND11_NAMESPACE_BEGIN(detail)`.
+  const openerFns = new Set<string>();
+  const closers = new Map<string, number>();
+  const aliases = new Map<string, string>();
+  const bodies: Array<[string, string]> = [];
+  for (const file of context.getAllFiles()) {
+    if (!/\.(?:h|hh|hpp|hxx|h\+\+|inl|ipp|tcc)$/i.test(file)) continue;
+    const raw = context.readFile(file);
+    if (!raw || !raw.includes('#') || !raw.includes('define')) continue;
+    const source = stripCommentsForRegex(raw.replace(/\\\r?\n/g, ' '), 'cpp');
+    for (const m of source.matchAll(/^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)(\(\s*([A-Za-z_]\w*)?\s*\))?[ \t]+([^\n]*)$/gm)) {
+      const body = m[4]!.trim();
+      if (m[2] !== undefined) {
+        // (a trailing pragma macro — `PYBIND11_WARNING_PUSH` — rides along)
+        if (m[3] && new RegExp(`^namespace\\s+${m[3]}\\s*\\{[\\w\\s]*$`).test(body)) openerFns.add(m[1]!);
+        else if (CPP_CLOSER_BODY.test(body)) closers.set(m[1]!, (body.match(/\}/g) ?? []).length);
+        continue;
+      }
+      if (/^[A-Za-z_]\w*$/.test(body)) aliases.set(m[1]!, body);
+      else if (CPP_CLOSER_BODY.test(body)) closers.set(m[1]!, (body.match(/\}/g) ?? []).length);
+      // An inline namespace (transparent, and often named by a macro call) is skipped.
+      else if (/^(?:inline\s+namespace\s+[^{}]*\{\s*|namespace\s+[A-Za-z_]\w*\s*\{\s*)+[\w\s]*$/.test(body)) bodies.push([m[1]!, body]);
+    }
+  }
+  for (const [name, body] of bodies) {
+    if (openers.has(name)) continue;
+    const path = [...body.replace(/inline\s+namespace\s+[^{}]*\{/g, '').matchAll(/namespace\s+([A-Za-z_]\w*)/g)]
+      .map((m) => aliases.get(m[1]!) ?? m[1]!);
+    if (path.length > 0) openers.set(name, path);
+  }
+  const macros = { openers, openerFns, closers, aliases };
+  CPP_NS_MACROS.set(context, macros);
+  return macros;
+}
+
+/** The line ranges of a C / C++ file each namespace macro opens, with the namespace path it opens. */
+function cppMacroNamespaceFrames(file: string, context: ResolutionContext): Array<{ start: number; end: number; path: string[] }> {
+  let memo = CPP_NS_FRAMES.get(context);
+  if (!memo) {
+    memo = new Map();
+    CPP_NS_FRAMES.set(context, memo);
+  }
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const frames: Array<{ start: number; end: number; path: string[] }> = [];
+  const { openers, openerFns, closers, aliases } = cppNamespaceMacros(context);
+  if (openers.size > 0 || openerFns.size > 0) {
+    const lines = context.getFileLines?.(file) ?? context.readFile(file)?.split(/\r?\n/) ?? [];
+    const open: Array<{ start: number; path: string[] }> = [];
+    lines.forEach((text, i) => {
+      const m = /^[ \t]*([A-Z_][A-Z0-9_]*)(?:\(\s*([A-Za-z_]\w*)?\s*\))?[ \t]*;?[ \t]*(?:\/\/.*|\/\*.*\*\/[ \t]*)?\r?$/.exec(text);
+      const token = m?.[1];
+      if (!token) return;
+      const arg = m[2];
+      const path = arg !== undefined && openerFns.has(token) ? [aliases.get(arg) ?? arg] : arg === undefined ? openers.get(token) : undefined;
+      if (path) open.push({ start: i + 1, path });
+      else if (closers.has(token) && open.length > 0) frames.push({ ...open.pop()!, end: i + 1 });
+    });
+    for (const frame of open) frames.push({ ...frame, end: lines.length });
+  }
+  memo.set(file, frames);
+  return frames;
+}
+
+/**
+ * Resolve `fmt::format` / `fmt::detail::to_unsigned` to the declaration a
+ * namespace macro puts there: a node named `format` (qualified `format` or
+ * `detail::to_unsigned` in the index, which cannot see the macro) inside a
+ * `FMT_BEGIN_NAMESPACE` … `FMT_END_NAMESPACE` range. On fmt, 1,728
+ * `fmt::format(…)` calls resolved to nothing.
+ */
+function matchCppMacroNamespaced(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  let target = ref.referenceName.replace(/^::/, '');
+  const head = target.slice(0, target.indexOf('::'));
+  const alias = cppNamespaceAliases(context).get(head);
+  // `py::str` under `namespace py = pybind11;` is `pybind11::str`.
+  if (alias) target = alias + target.slice(head.length);
+  const name = target.slice(target.lastIndexOf('::') + 2);
+  if (!/^[A-Za-z_~]\w*$/.test(name)) return null;
+  let best: Node | null = null;
+  for (const n of context.getNodesByName(name)) {
+    if (n.language !== 'cpp' && n.language !== 'c') continue;
+    if (!['function', 'method', 'class', 'struct', 'enum', 'type_alias', 'union', 'variable', 'constant'].includes(n.kind)) continue;
+    const prefix = cppMacroNamespaceFrames(n.filePath, context)
+      .filter((f) => f.start <= n.startLine && f.end >= n.startLine)
+      .sort((a, b) => a.start - b.start)
+      .flatMap((f) => f.path);
+    const effective = prefix.length > 0 ? `${prefix.join('::')}::${n.qualifiedName}` : alias ? n.qualifiedName : '';
+    if (effective !== target) continue;
+    // One of an overload set is as good as another; a declaration outside the tests over one in them.
+    if (!best || (isTestPath(best.filePath) && !isTestPath(n.filePath))) best = n;
+  }
+  return best ? { original: ref, targetNodeId: best.id, confidence: 0.8, resolvedBy: 'qualified-name' } : null;
 }
