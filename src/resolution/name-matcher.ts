@@ -2590,19 +2590,20 @@ const OBJC_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'f
  * never a method), `self-send` for a message to `self` / `super` /
  * `[self class]`, whose receiver the extractor drops; null otherwise.
  */
-function objcCallShape(ref: UnresolvedRef, context: ResolutionContext): 'c-call' | 'self-send' | null {
+function objcCallShape(ref: UnresolvedRef, context: ResolutionContext): 'c-call' | 'self-send' | 'super-send' | null {
   const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
   if (line === undefined) return null;
   const name = ref.referenceName.split(':')[0]!;
   if (!name) return null;
   const at = new RegExp(`(?<![\\w.])${name}\\b`, 'g');
   let m: RegExpExecArray | null;
-  let shape: 'c-call' | 'self-send' | null = null;
+  let shape: 'c-call' | 'self-send' | 'super-send' | null = null;
   while ((m = at.exec(line))) {
     const before = line.slice(0, m.index);
     const after = line.slice(m.index + name.length);
     if (/^\s*\(/.test(after) && !/\[\s*[\w.]+\s+$/.test(before)) shape ??= 'c-call';
-    else if (/\[\s*(?:self|super|\[\s*self\s+class\s*\])\s+$/.test(before)) return 'self-send';
+    else if (/\[\s*super\s+$/.test(before)) return 'super-send';
+    else if (/\[\s*(?:self|\[\s*self\s+class\s*\])\s+$/.test(before)) return 'self-send';
   }
   return shape;
 }
@@ -2614,13 +2615,19 @@ function objcCallShape(ref: UnresolvedRef, context: ResolutionContext): 'c-call'
  * the class they extend). Null outside any class.
  */
 function objcHierarchyAt(ref: UnresolvedRef, context: ResolutionContext): Set<string> | null {
-  const here = context
-    .getNodesInFile(ref.filePath)
+  const inFile = context.getNodesInFile(ref.filePath);
+  let here = inFile
     .filter((c) => c.kind === 'class' && c.startLine <= ref.line && c.endLine >= ref.line)
-    .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
+    .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0]?.name;
+  // An `@implementation` whose range the index lost still names its class in
+  // its methods: `SDWebImageDownloaderDecryptor::initWithBlock:`.
+  if (!here) {
+    const method = inFile.find((c) => c.kind === 'method' && c.startLine <= ref.line && c.endLine >= ref.line && c.qualifiedName.includes('::'));
+    here = method?.qualifiedName.slice(0, method.qualifiedName.lastIndexOf('::'));
+  }
   if (!here) return null;
   const seen = new Set<string>();
-  const queue = [here.name];
+  const queue = [here];
   while (queue.length > 0 && seen.size < 30) {
     const name = queue.shift()!;
     if (seen.has(name)) continue;
@@ -2639,15 +2646,19 @@ function objcHierarchyAt(ref: UnresolvedRef, context: ResolutionContext): Set<st
  * hierarchy, still counts (as does any, when the sender's own class was lost
  * too). A function elsewhere is never what `[super init]` sends to.
  */
-function isObjcSelfSendTarget(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+function isObjcSelfSendTarget(n: Node, ref: UnresolvedRef, context: ResolutionContext, toSuper = false): boolean {
   const hierarchy = objcHierarchyAt(ref, context);
   if (OBJC_MEMBER_KINDS.has(n.kind)) {
     const cut = n.qualifiedName.lastIndexOf('::');
-    return cut < 0 || hierarchy === null || hierarchy.has(n.qualifiedName.slice(0, cut));
+    if (cut < 0 || hierarchy === null) return true;
+    const owner = n.qualifiedName.slice(0, cut);
+    // `[super init]` goes past the class it is written in.
+    return hierarchy.has(owner) && !(toSuper && owner === [...hierarchy][0]);
   }
-  if (n.filePath === ref.filePath || hierarchy === null) return true;
+  if (n.filePath === ref.filePath) return !toSuper;
+  if (hierarchy === null) return true;
   const base = n.filePath.slice(n.filePath.lastIndexOf('/') + 1).replace(/\.\w+$/, '');
-  return hierarchy.has(base);
+  return hierarchy.has(base) && !(toSuper && base === [...hierarchy][0]);
 }
 
 /**
@@ -3451,6 +3462,7 @@ export function matchByExactName(
     !(csharpBare && !isCsharpMemberInScope(n, ref, context)) &&
     !(objcShape === 'c-call' && OBJC_MEMBER_KINDS.has(n.kind)) &&
     !(objcShape === 'self-send' && !isObjcSelfSendTarget(n, ref, context)) &&
+    !(objcShape === 'super-send' && !isObjcSelfSendTarget(n, ref, context, true)) &&
     !(vbReceiver !== null && !isVbMemberReachable(n, vbReceiver)) &&
     !(rubyBare && n.kind === 'method' && !isRubyMethodInScope(n, ref, context)) &&
     !(cfmlBare && n.kind === 'method' && !isCfmlMethodInScope(n, ref, context)) &&
@@ -7061,6 +7073,7 @@ export function matchFuzzy(
     !(vbReceiver !== null && !isVbMemberReachable(n, vbReceiver)) &&
     !(objcShape === 'c-call' && OBJC_MEMBER_KINDS.has(n.kind)) &&
     !(objcShape === 'self-send' && !isObjcSelfSendTarget(n, ref, context)) &&
+    !(objcShape === 'super-send' && !isObjcSelfSendTarget(n, ref, context, true)) &&
     !(csharpBare && !isCsharpMemberInScope(n, ref, context)) &&
     !(scalaBare && !isScalaMemberInScope(n, ref, context)) &&
     !(rustGoShape && !isRustGoCallTarget(n, rustGoShape)) &&
