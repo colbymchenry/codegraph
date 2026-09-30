@@ -58,7 +58,7 @@ After a project opts in with `scip index`, the MCP server (and anything else tha
 
 ## How edges are decided
 
-Call sites are keyed by (caller node, line, callee name, kind), as in the POC. The caller comes from **codegraph's own node spans**, not SCIP's ranges. That is the narrowest enclosing function or method, unless a class defined inside it is narrower. Failing that it is the narrowest enclosing class, struct, variable or constant node, and failing that the file. This is the same caller codegraph's extractors record, so decorators belong to the class, calls in a local class body to that class, and top-level code to the file. An earlier version used SCIP's definition ranges, which include decorators. It disagreed with the heuristic's caller on thousands of Django sites and produced parallel edges.
+Call sites are keyed by (caller node, line, callee name, kind), as in the POC. The caller comes from **codegraph's own node spans**, not SCIP's ranges. That is the narrowest enclosing function or method, unless a class defined inside it is narrower. Failing that it is the narrowest enclosing container node (the kinds are listed in `CONTAINER_KINDS` in `src/scip/sites.ts`), and failing that the file. This is the same caller codegraph's extractors record, so decorators belong to the class, calls in a local class body to that class, and top-level code to the file. An earlier version used SCIP's definition ranges, which include decorators. It disagreed with the heuristic's caller on thousands of Django sites and produced parallel edges.
 
 | case | action |
 |---|---|
@@ -107,7 +107,14 @@ Indexers used: scip-typescript 0.4.0, scip-python 0.6.6, scip-go 0.2.7, rust-ana
 | cobra | 2,637 | 160 | 1 | 48 |
 | ripgrep | 4,447 | 1,080 | 5,964 | 2,442 |
 
-After the merge, `django.urls.base.reverse` has 1,267 caller edges from 867 distinct callers, up from 1, matching the POC. On cobra, the removed edges are the heuristic linking `buf.String()` / `bv.String()` to a test type's `String`, and pflag's `FlagSet.HasFlags` to `Command.HasFlags`. On ripgrep they include `Vec::new()` → a project `new` and `.push()` → a project `push`.
+After the merge, `django.urls.base.reverse` has 1,267 caller edges from 867 distinct callers, up from 1, matching the POC.
+
+The Django codegraph-only baseline (75–78% recall) is higher than the POC's 47–60%, for three reasons:
+- The targets differ. `compare.ts` samples with a seeded mulberry32, the POC with Python's `random`, so seed 1 does not pick the same 50 callables.
+- The heuristic here is upstream v1.6.1, where the POC used v1.6.0.
+- The POC's hand-picked targets were deliberately chosen from its conflict samples.
+
+The merged result reproduces the POC: 100%/100% here, 99%/100% there. On cobra, the removed edges are the heuristic linking `buf.String()` / `bv.String()` to a test type's `String`, and pflag's `FlagSet.HasFlags` to `Command.HasFlags`. On ripgrep they include `Vec::new()` → a project `new` and `.push()` → a project `push`.
 
 Known residue: ripgrep's multi-line `const X: T = T { … }` items. codegraph attributes their calls to a variable node whose span is one line, so 18 sites get a parallel file-level SCIP edge. Rust tests defined through macros (`rgtest!(name, |…| {…})`) have no function node, so their calls are attributed to the file. This matches codegraph's convention for top-level code; the heuristic has no edges there at all.
 

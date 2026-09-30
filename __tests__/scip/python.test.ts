@@ -5,7 +5,7 @@ import * as path from 'path';
 import CodeGraph from '../../src/index';
 import { importScipFile, runScipPass } from '../../src/scip';
 import { resolveIndexer } from '../../src/scip/indexers';
-import { projectName, pythonIndexer, venvPackages } from '../../src/scip/indexers/python';
+import { findVenv, projectName, pythonIndexer, venvPackages } from '../../src/scip/indexers/python';
 
 const FIXTURE = path.join(__dirname, '..', 'fixtures', 'scip-py');
 
@@ -65,11 +65,27 @@ describe('SCIP merge (Python fixture)', () => {
 
 describe('scip-python adapter', () => {
   let dir: string;
+  const activeVenv = process.env.VIRTUAL_ENV;
   beforeEach(() => {
+    delete process.env.VIRTUAL_ENV; // the runner's own venv must not leak into "no venv"
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-scip-pyadapter-'));
     fs.mkdirSync(path.join(dir, '.codegraph', 'scip'), { recursive: true });
   });
-  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+  afterEach(() => {
+    if (activeVenv !== undefined) process.env.VIRTUAL_ENV = activeVenv;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('falls back to the active $VIRTUAL_ENV', () => {
+    const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-scip-venv-'));
+    try {
+      fs.writeFileSync(path.join(elsewhere, 'pyvenv.cfg'), 'home = /usr/bin\n');
+      process.env.VIRTUAL_ENV = elsewhere;
+      expect(findVenv(dir)).toBe(elsewhere);
+    } finally {
+      fs.rmSync(elsewhere, { recursive: true, force: true });
+    }
+  });
 
   const makeVenv = () => {
     const venv = path.join(dir, '.venv');
@@ -101,7 +117,7 @@ describe('scip-python adapter', () => {
     const inv = pythonIndexer.invocation(dir, out);
     expect(inv.warning).toBeUndefined();
     expect(inv.env?.VIRTUAL_ENV).toBe(venv);
-    expect(inv.env?.PATH?.startsWith(path.join(venv, 'bin'))).toBe(true);
+    expect(inv.env?.PATH?.startsWith(path.join(venv, process.platform === 'win32' ? 'Scripts' : 'bin'))).toBe(true);
     expect(JSON.parse(fs.readFileSync(manifest, 'utf8'))[0].name).toBe('foo');
   });
 

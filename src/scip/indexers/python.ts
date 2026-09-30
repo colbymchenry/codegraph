@@ -26,26 +26,28 @@ export interface PythonPackage {
   files: string[];
 }
 
-export function findVenv(root: string): string | null {
-  for (const d of VENV_DIRS) {
-    const dir = path.join(root, d);
-    if (fs.existsSync(path.join(dir, 'pyvenv.cfg'))) return dir;
+/** A missing file is an answer (null); any other read failure is an error worth reporting. */
+function readIfExists<T>(read: () => T): T | null {
+  try {
+    return read();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
   }
-  return null;
+}
+
+/** The project's own venv (`.venv/`, `venv/`), else the one active in the environment (`$VIRTUAL_ENV`). */
+export function findVenv(root: string): string | null {
+  const candidates = [...VENV_DIRS.map(d => path.join(root, d)), process.env.VIRTUAL_ENV].filter((d): d is string => !!d);
+  return candidates.find(dir => fs.existsSync(path.join(dir, 'pyvenv.cfg'))) ?? null;
 }
 
 function sitePackages(venv: string): string[] {
   const win = path.join(venv, 'Lib', 'site-packages');
   if (fs.existsSync(win)) return [win];
   const lib = path.join(venv, 'lib');
-  let entries: string[];
-  try {
-    entries = fs.readdirSync(lib);
-  } catch {
-    return [];
-  }
-  return entries
-    .filter(e => e.startsWith('python'))
+  return (readIfExists(() => fs.readdirSync(lib)) ?? [])
+    .filter(e => e.startsWith('python') || e.startsWith('pypy'))
     .map(e => path.join(lib, e, 'site-packages'))
     .filter(p => fs.existsSync(p));
 }
@@ -62,14 +64,9 @@ export function venvPackages(venv: string): PythonPackage[] {
     for (const entry of fs.readdirSync(site)) {
       if (!entry.endsWith('.dist-info')) continue;
       const info = path.join(site, entry);
-      let metadata: string;
-      let record: string;
-      try {
-        metadata = fs.readFileSync(path.join(info, 'METADATA'), 'utf8');
-        record = fs.readFileSync(path.join(info, 'RECORD'), 'utf8');
-      } catch {
-        continue; // incomplete install — nothing reliable to report
-      }
+      const metadata = readIfExists(() => fs.readFileSync(path.join(info, 'METADATA'), 'utf8'));
+      const record = readIfExists(() => fs.readFileSync(path.join(info, 'RECORD'), 'utf8'));
+      if (metadata === null || record === null) continue; // incomplete install — nothing reliable to report
       const name = metadataField(metadata, 'Name');
       const version = metadataField(metadata, 'Version');
       if (!name || !version) continue;
@@ -85,17 +82,13 @@ export function venvPackages(venv: string): PythonPackage[] {
 
 /** `[project]` / `[tool.poetry]` name from pyproject.toml, else setup.cfg's, else the directory name. */
 export function projectName(root: string): string {
-  try {
-    const toml = fs.readFileSync(path.join(root, 'pyproject.toml'), 'utf8');
-    const section = /^\[(?:project|tool\.poetry)\]\s*$([\s\S]*?)(?=^\[|$(?![\s\S]))/m.exec(toml);
-    const name = section && /^name\s*=\s*["']([^"']+)["']/m.exec(section[1]!);
-    if (name) return name[1]!;
-  } catch { /* no pyproject.toml */ }
-  try {
-    const cfg = fs.readFileSync(path.join(root, 'setup.cfg'), 'utf8');
-    const name = /^name\s*=\s*(\S+)/m.exec(cfg);
-    if (name) return name[1]!;
-  } catch { /* no setup.cfg */ }
+  const toml = readIfExists(() => fs.readFileSync(path.join(root, 'pyproject.toml'), 'utf8'));
+  const section = toml && /^\[(?:project|tool\.poetry)\]\s*$([\s\S]*?)(?=^\[|$(?![\s\S]))/m.exec(toml);
+  const fromToml = section && /^name\s*=\s*["']([^"']+)["']/m.exec(section[1]!);
+  if (fromToml) return fromToml[1]!;
+  const cfg = readIfExists(() => fs.readFileSync(path.join(root, 'setup.cfg'), 'utf8'));
+  const fromCfg = cfg && /^name\s*=\s*(\S+)/m.exec(cfg);
+  if (fromCfg) return fromCfg[1]!;
   return path.basename(path.resolve(root));
 }
 

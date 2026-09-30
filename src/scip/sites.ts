@@ -11,7 +11,7 @@
 import type { SqliteDatabase } from '../db/sqlite-adapter';
 import {
   POSITION_ENCODING_UTF8, ROLE_DEFINITION, ScipDocument, ScipOccurrence,
-  parseSymbol, spanContains, spanSize,
+  parseSymbol, spanSize,
 } from './reader';
 
 export type SiteKind = 'calls' | 'instantiates';
@@ -117,25 +117,31 @@ class Callers {
   at(file: string, line0: number, col: number): { id: string; inFunction: boolean } | null {
     const entry = this.byFile.get(file);
     if (!entry) return null;
+    const at: Pos = [line0 + 1, col];
     const narrowest = (rows: SpanRow[]) => {
       let best: SpanRow | null = null;
-      let bestSize = Infinity;
       for (const n of rows) {
-        const span = { startLine: n.start_line - 1, startCol: n.start_column, endLine: n.end_line - 1, endCol: n.end_column };
-        if (!spanContains(span, line0, col)) continue;
-        const size = spanSize(span);
-        if (size < bestSize) [best, bestSize] = [n, size];
+        if (before(at, startOf(n)) || !before(at, endOf(n))) continue; // [start, end) — end column is exclusive
+        if (!best || spanSize(spanOf(n)) < spanSize(spanOf(best))) best = n;
       }
       return best;
     };
     const fn = narrowest(entry.callables);
     const holder = narrowest(entry.containers);
     // A container nested INSIDE the function (a class defined in a method) is the caller of its own body.
-    if (fn && !(holder && holder.start_line >= fn.start_line && holder.end_line <= fn.end_line)) return { id: fn.id, inFunction: true };
+    const nested = fn && holder && !before(startOf(holder), startOf(fn)) && !before(endOf(fn), endOf(holder));
+    if (fn && !nested) return { id: fn.id, inFunction: true };
     const id = holder?.id ?? entry.file;
     return id ? { id, inFunction: false } : null;
   }
 }
+
+/** (1-based line, 0-based column) — codegraph's node coordinates. */
+type Pos = [number, number];
+const startOf = (n: SpanRow): Pos => [n.start_line, n.start_column];
+const endOf = (n: SpanRow): Pos => [n.end_line, n.end_column];
+const before = (a: Pos, b: Pos) => a[0] < b[0] || (a[0] === b[0] && a[1] < b[1]);
+const spanOf = (n: SpanRow) => ({ startLine: n.start_line, startCol: n.start_column, endLine: n.end_line, endCol: n.end_column });
 
 /** Text after the callee name opens an argument list: `(`, `?.(`, or TS type arguments `<…>(`. */
 export function looksLikeCall(tail: string): boolean {
@@ -166,20 +172,21 @@ const LITERAL_SHAPES: Record<string, (tail: string, head: string) => boolean> = 
   go: (tail, head) => {
     const t = skipGroup(tail.trimStart(), '[', ']'); // generic instantiation: Box[int]{…}
     if (!t?.startsWith('{')) return false;
-    // `[]T{`, `map[K]T{`, `[]*T{` build the container; `) T {` / `) *T {` is a return type before a body.
-    return !/[\])]\s*\**$/.test(head.trimEnd());
+    // `[]T{`, `map[K]T{`, `[]*T{` build the container; `) T {` / `) *pkg.T {` is a return type before a body.
+    return !/[\])]\s*\**\s*(\w+\.)?$/.test(head.trimEnd());
   },
   rust: (tail, head) => {
     let t: string | null = tail.trimStart();
     if (t.startsWith('::')) t = t.slice(2).trimStart(); // turbofish: Foo::<T> { … }
     t = skipGroup(t, '<', '>');
     if (!t?.startsWith('{')) return false;
-    // A type before a block: `-> Foo {`, `impl Foo {`, `impl T for Foo {`, `where T: Foo {`.
-    if (/(->|\bimpl\b[^{};]*|\bwhere\b[^{};]*)\s*[&'\w\s]*$/.test(head)) return false;
-    // A pattern, not a construction: `let Foo { a } = x`, `Foo { .. } =>`, `Foo { a }: Foo`.
-    if (/\blet\s+(mut\s+)?$/.test(head)) return false;
+    // A type before a block: `-> Foo {`, `-> models::Foo {`, `impl Foo {`, `impl T for Foo {`, `where T: Foo {`.
+    if (/(->|\bimpl\b[^{};]*|\bwhere\b[^{};]*)\s*[&'\w\s:]*$/.test(head)) return false;
+    // A pattern, not a construction: `let Foo { a } = x`, `for Foo { a } in xs`,
+    // `Foo { .. } =>`, `Some(Foo { a }) =>`, `Foo { a }: Foo`.
+    if (/\b(let(\s+mut)?|for)\s+$/.test(head)) return false;
     const after = skipGroup(t, '{', '}');
-    return after === null || !/^(=>|=(?!=)|:(?!:)|\|)/.test(after);
+    return after === null || !/^[)\]\s]*(=>|=(?!=)|:(?!:)|\||\bin\b)/.test(after);
   },
 };
 

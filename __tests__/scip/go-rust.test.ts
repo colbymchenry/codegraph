@@ -74,6 +74,8 @@ describe('literal call shapes', () => {
     expect(shape('a.go', 'xs := []*Invoice{a, b}', 'Invoice')).toBeNull();
     expect(shape('a.go', 'm := map[string]Invoice{}', 'Invoice')).toBeNull();
     expect(shape('a.go', 'func Make() *Invoice {', 'Invoice')).toBeNull();
+    expect(shape('a.go', 'func Make() *shop.Invoice {', 'Invoice')).toBeNull();
+    expect(shape('a.go', 'return shop.Invoice{Amount: 1}', 'Invoice')).toBe('literal');
   });
 
   it('Rust: struct literals, not impl headers, return types or patterns', () => {
@@ -84,6 +86,10 @@ describe('literal call shapes', () => {
     expect(shape('a.rs', 'pub fn make() -> Invoice {', 'Invoice')).toBeNull();
     expect(shape('a.rs', 'let Invoice { amount } = inv;', 'Invoice')).toBeNull();
     expect(shape('a.rs', '    Invoice { amount: 0 } => 0,', 'Invoice')).toBeNull();
+    expect(shape('a.rs', 'pub fn make() -> models::Invoice {', 'Invoice')).toBeNull();
+    expect(shape('a.rs', '    Some(Invoice { amount }) => amount,', 'Invoice')).toBeNull();
+    expect(shape('a.rs', 'for Invoice { amount } in all {', 'Invoice')).toBeNull();
+    expect(shape('a.rs', '    let v = models::Invoice { amount: 1 };', 'Invoice')).toBe('literal');
     expect(shape('a.ts', 'class A extends Invoice {', 'Invoice')).toBeNull(); // braces mean nothing in TS
   });
 });
@@ -101,5 +107,21 @@ describe('go / rust adapters', () => {
     fs.writeFileSync(path.join(dir, 'Cargo.toml'), '[package]\nname = "x"\n');
     expect(resolveIndexer(dir, 'go', out)).toMatchObject({ args: ['index', '--quiet', '--output', out] });
     expect(resolveIndexer(dir, 'rust', out)).toMatchObject({ args: ['scip', '.', '--output', out] });
+  });
+
+  it.runIf(process.platform !== 'win32')('skips a rust-analyzer that is on PATH but broken (the rustup shim without the component)', () => {
+    fs.writeFileSync(path.join(dir, 'Cargo.toml'), '[package]\nname = "x"\n');
+    const bin = path.join(dir, 'bin');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, 'rust-analyzer'), "#!/bin/sh\necho \"error: Unknown binary 'rust-analyzer'\" >&2\nexit 1\n", { mode: 0o755 });
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${savedPath}`;
+    try {
+      expect(resolveIndexer(dir, 'rust', path.join(dir, 'out.tmp'))).toEqual({
+        skip: expect.stringMatching(/rust-analyzer --version` failed \(error: Unknown binary/),
+      });
+    } finally {
+      process.env.PATH = savedPath;
+    }
   });
 });

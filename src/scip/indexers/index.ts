@@ -14,6 +14,7 @@
  * that isn't on PATH is reported and skipped.
  */
 
+import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { PROJECT_CONFIG_FILENAME } from '../../project-config';
@@ -36,6 +37,12 @@ export interface IndexerSpec {
   /** true when the project has this language's marker files */
   detect(projectRoot: string): boolean;
   cmd: string;
+  /**
+   * Args for a cheap run that must succeed before the indexer counts as
+   * installed — for commands that exist on PATH as shims even when the tool
+   * behind them doesn't (rustup's `rust-analyzer` without the component).
+   */
+  probe?: string[];
   /** May write helper files next to `outFile` (e.g. an environment manifest). */
   invocation(projectRoot: string, outFile: string): Invocation;
 }
@@ -122,6 +129,13 @@ export function resolveIndexer(projectRoot: string, lang: ScipLanguage, outFile:
   if (!spec.detect(projectRoot)) return { skip: `no ${lang} project markers found` };
   const cmd = override?.cmd ?? spec.cmd;
   if (!onPath(cmd)) return { skip: `\`${cmd}\` not found on PATH — install it or set scip.${lang}.cmd in ${PROJECT_CONFIG_FILENAME}` };
+  if (spec.probe && !override?.cmd) {
+    const probe = spawnSync(cmd, spec.probe, { encoding: 'utf8', timeout: 20_000 });
+    if (probe.status !== 0) {
+      const why = (probe.error?.message ?? probe.stderr ?? '').trim().split('\n')[0];
+      return { skip: `\`${cmd} ${spec.probe.join(' ')}\` failed (${why}) — the command is on PATH but not usable` };
+    }
+  }
   // The adapter's environment (e.g. an activated venv) applies even when the args are overridden.
   const inv = spec.invocation(projectRoot, outFile);
   const args = override?.args

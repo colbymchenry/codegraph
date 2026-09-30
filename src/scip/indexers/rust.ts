@@ -14,5 +14,6 @@ export const rustIndexer: IndexerSpec = {
   lang: 'rust',
   detect: root => fs.existsSync(path.join(root, 'Cargo.toml')),
   cmd: 'rust-analyzer',
+  probe: ['--version'],
   invocation: (_root, outFile) => ({ args: ['scip', '.', '--output', outFile] }),
 };
