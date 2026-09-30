@@ -523,7 +523,7 @@ export function matchFunctionRef(
     };
   }
 
-  let candidates = context
+  const named = context
     .getNodesByName(ref.referenceName)
     .filter(
       (n) =>
@@ -533,7 +533,19 @@ export function matchFunctionRef(
         sameLanguageFamily(n.language, ref.language) &&
         n.id !== ref.fromNodeId // a function registering itself is not a dependency edge
     );
+  // A function declared inside another is in scope only in there: httpx's
+  // `self._build_auth(auth)` passes its own parameter, not the `auth` a test
+  // defines inside `test_custom_auth`. Those still count against a lone
+  // cross-file guess below — a name several functions use for themselves is
+  // as likely a local's.
+  let candidates = named.filter((n) => isLexicallyReachable(n, ref, context));
   if (candidates.length === 0) return null;
+  // A Python name the function around it binds — a parameter, an assignment —
+  // is that local's value: httpx's `auth_flow(self, request)` handing `request`
+  // on is not the package's `request()` function. A pytest fixture is what a
+  // test's parameter of its name receives.
+  if (ref.language === 'python' && !candidates.some((n) => isFixtureInReach(n, ref.filePath, context)) &&
+      isPythonLocallyBound(ref.referenceName, ref, context)) return null;
 
   // Swift implicit-self: a bare identifier can name a METHOD only of the
   // ENCLOSING type (`Button(action: handleTap)` written inside that type) —
@@ -593,8 +605,11 @@ export function matchFunctionRef(
   }
 
   // Cross-file (imported names the import resolver didn't already claim):
-  // only an unambiguous match resolves.
-  if (candidates.length === 1) {
+  // only an unambiguous match resolves — or, in Python, the one in reach of
+  // a name the file imports (netbox's `sender=CustomField` beside a test's
+  // own nested `CustomField`).
+  if (candidates.length === 1 && (named.length === 1 ||
+      (ref.language === 'python' && pythonFromImports(ref.filePath, context).has(ref.referenceName)))) {
     return {
       original: ref,
       targetNodeId: candidates[0]!.id,
@@ -1557,7 +1572,7 @@ function fitsPythonCallShape(n: Node, shape: PythonCallShape, ref: UnresolvedRef
     if (isPythonNameImportedFromOutside(ref.referenceName, ref, context)) return false;
     // `view = UserView.as_view()` … `view(request)`: the file's own value —
     // unless it is a pytest fixture, which a test takes as a parameter of that name.
-    return isPytestFixture(n) || !isPythonLocallyBound(ref.referenceName, ref, context);
+    return isFixtureInReach(n, ref.filePath, context) || !isPythonLocallyBound(ref.referenceName, ref, context);
   }
   // A member of what the chain names: a method of a class of that name, or a
   // function / class in a module of that name (`helpers.slugify()`).
@@ -1573,9 +1588,41 @@ function fitsPythonCallShape(n: Node, shape: PythonCallShape, ref: UnresolvedRef
   return stem === shape.owner || (stem === '__init__' && parts[parts.length - 2] === shape.owner);
 }
 
-/** A pytest fixture: `@pytest.fixture` / `@fixture`, or anything a `conftest.py` defines. */
-function isPytestFixture(n: Node): boolean {
-  return /(?:^|\/)conftest\.py$/.test(n.filePath) || (n.decorators ?? []).some((d) => /(?:^|\.)fixture\b/.test(d));
+/**
+ * A pytest fixture: `@pytest.fixture` / `@fixture`, or anything a `conftest.py`
+ * defines. Python decorators are not kept on the node, so they are read from
+ * the lines above its `def` (a decorator's arguments may span lines).
+ */
+function isPytestFixture(n: Node, context: ResolutionContext): boolean {
+  if (/(?:^|\/)conftest\.py$/.test(n.filePath) || (n.decorators ?? []).some((d) => /(?:^|\.)fixture\b/.test(d))) return true;
+  return isDecoratedFixture(n, context);
+}
+
+/**
+ * A fixture a test at `filePath` can take by name: one its own module defines,
+ * or one a `conftest.py` of its directory or a parent does. A test module's
+ * fixture is that module's alone — pytest's `_run_both(func)` is handing on its
+ * parameter, not a doc example's `func` fixture.
+ */
+function isFixtureInReach(n: Node, filePath: string, context: ResolutionContext): boolean {
+  if (n.filePath === filePath) return isPytestFixture(n, context);
+  const conftest = /^(.*?)(?:^|\/)conftest\.py$/.exec(n.filePath);
+  return conftest !== null && (conftest[1] === '' || filePath.startsWith(`${conftest[1]}/`));
+}
+
+function isDecoratedFixture(n: Node, context: ResolutionContext): boolean {
+  if (n.language !== 'python' || n.kind !== 'function') return false;
+  const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
+  // Upward through the decorator lines: each one starts with `@`, or sits inside one's parentheses.
+  let open = 0;
+  for (let i = n.startLine - 2; i >= 0 && i >= n.startLine - 16; i--) {
+    const text = lines[i]?.trim() ?? '';
+    open += (text.match(/\)/g)?.length ?? 0) - (text.match(/\(/g)?.length ?? 0);
+    if (open > 0) continue;
+    if (!text.startsWith('@')) return false;
+    if (/^@(?:\w+\.)*fixture\b/.test(text)) return true;
+  }
+  return false;
 }
 
 const PY_LOCAL_BINDS = new WeakMap<ResolutionContext, Map<string, boolean>>();
