@@ -1353,11 +1353,11 @@ export function extractReExports(content: string, language: Language): ReExport[
   // out of scope.)
   const cleaned = stripJsComments(content);
 
-  // Wildcard: `export * from '...'` or `export * as ns from '...'`
-  const wildcardRe = /export\s*\*(?:\s+as\s+\w+)?\s*from\s*['"]([^'"]+)['"]/g;
+  // Wildcard: `export * from '...'`; `export * as ns from '...'` exports `ns` alone.
+  const wildcardRe = /export\s*\*(?:\s+as\s+([A-Za-z_$][\w$]*))?\s*from\s*['"]([^'"]+)['"]/g;
   let m: RegExpExecArray | null;
   while ((m = wildcardRe.exec(cleaned)) !== null) {
-    out.push({ kind: 'wildcard', source: m[1]! });
+    out.push(m[1] ? { kind: 'namespace', exportedName: m[1], source: m[2]! } : { kind: 'wildcard', source: m[2]! });
   }
 
   // Named: `export { a, b as c } from '...'`
@@ -2466,8 +2466,9 @@ function findExportedSymbolWalk(
   const reExports = context.getReExports?.(filePath, language) ?? [];
   if (reExports.length === 0) return undefined;
 
-  // Look for explicit `export { want } from './other'` (with optional rename).
-  const targetName = want.isDefault ? 'default' : want.exportedName;
+  // Look for explicit `export { want } from './other'` (with optional rename) — for
+  // `ns.member` through `import * as ns`, the member is the name wanted.
+  const targetName = want.isDefault ? 'default' : want.isNamespace && want.memberName ? want.memberName : want.exportedName;
   for (const rex of reExports) {
     if (rex.kind === 'named' && rex.exportedName === targetName) {
       const next = resolveImportPath(rex.source, filePath, language, context);
@@ -2488,6 +2489,20 @@ function findExportedSymbolWalk(
         depth + 1
       );
       if (chained) return chained;
+    }
+  }
+
+  // `z.core.util.fn` through `export * as core from './core'`: the member continues in that module.
+  if (want.isNamespace && want.memberName) {
+    const dot = want.memberName.indexOf('.');
+    const head = dot < 0 ? want.memberName : want.memberName.slice(0, dot);
+    const rex = dot < 0 ? undefined : reExports.find((r) => r.kind === 'namespace' && r.exportedName === head);
+    if (rex) {
+      const next = resolveImportPath(rex.source, filePath, language, context);
+      const rest = want.memberName.slice(dot + 1);
+      return next
+        ? findExportedSymbol(next, { ...want, exportedName: rest.split('.')[0]!, memberName: rest }, language, context, visited, depth + 1)
+        : undefined;
     }
   }
 

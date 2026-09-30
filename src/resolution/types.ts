@@ -328,6 +328,12 @@ export type ReExport =
       kind: 'wildcard';
       /** Module specifier of the upstream module. */
       source: string;
+    }
+  | {
+      /** `export * as ns from './other'`: only `ns` is exported, the module's members through it. */
+      kind: 'namespace';
+      exportedName: string;
+      source: string;
     };
 
 /**

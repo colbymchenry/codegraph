@@ -1204,7 +1204,17 @@ export class ReferenceResolver {
     if (fwEarly) return fwEarly;
     // A retained untyped chain supplies effect/call-site evidence only. In
     // particular, importing its root does not make the root its call target.
-    if (isUnresolvedJsMemberCall(ref)) return null;
+    // A path through module namespaces is not untyped: `z.coerce.number()`
+    // after `import * as z`, where the barrel has `export * as coerce`.
+    if (isUnresolvedJsMemberCall(ref)) {
+      const root = ref.referenceName.slice(0, ref.referenceName.indexOf('.'));
+      const namespace = this.context.getImportMappings(ref.filePath, ref.language).some((m) => m.isNamespace && m.localName === root);
+      if (!namespace) return null;
+      const viaNamespace = this.gateLanguage(resolveViaImport(ref, this.context), ref);
+      const target = viaNamespace ? this.nodeById(viaNamespace.targetNodeId) : null;
+      return target && (target.kind === 'function' || target.kind === 'method' || target.kind === 'class' || target.kind === 'constant' || target.kind === 'variable')
+        ? viaNamespace : null;
+    }
 
     // Strategy 2: Try import-based resolution
     // A TS/JS/Python call-receiver chain (`useStore.getState().reset`, #1683)
