@@ -1932,6 +1932,16 @@ const DISPATCHED_ACTIONS: ReadonlySet<string> = new Set([
 /** A test double's name: Fake…, Mock…, Stub…, Dummy…, Spy…, …Fake, …Mock, …Stub. */
 const TEST_DOUBLE_OWNER = /\b(?:fake|mock|mocked|stub|dummy|spy)\b/i;
 
+/** A method of a test double (`MockedResponse`, `_FakeHTTPResponse`) the receiver and the calling file never name. */
+function isUnnamedTestDouble(method: Node, receiver: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const cut = method.qualifiedName.lastIndexOf('::');
+  if (cut <= 0) return false;
+  const owner = method.qualifiedName.slice(0, cut).split(/::|\./).pop()!;
+  if (!TEST_DOUBLE_OWNER.test(splitCamelCase(owner).join(' '))) return false;
+  if (splitCamelCase(receiverLink(receiver)).some((w) => TEST_DOUBLE_OWNER.test(w))) return false;
+  return !(context.readFile(ref.filePath) ?? '').includes(owner);
+}
+
 /**
  * The link of a dotted receiver its value is named after: the last, or for a
  * constant (`InitializationPhase.CONTROLLERS`, `Foo.INSTANCE`) the type it
@@ -6383,6 +6393,10 @@ export function matchMethodCall(
     // `node.loc` on a rubocop-ast node went to the one `loc` in the project
     // 1,201 times; lobsters' `value.to_s` to a short-id class's.
     if (targetMethods.length === 1 && !narrowed && targetMethods[0]!.language === ref.language &&
+        // A test double is only what a test names — as in the scoring below:
+        // allauth's `resp.json()` on a Django test response is not the one
+        // `json` of its `MockedResponse`.
+        !isUnnamedTestDouble(targetMethods[0]!, objectOrClass!, ref, context) &&
         !((ref.language === 'lua' || ref.language === 'luau') && isLuaLibraryCall(objectOrClass!, methodName!, ref, targetMethods[0]!)) &&
         // Rust / Go / Kotlin / C#: a standard-library method name on an
         // untyped receiver (`sym.map(…)`, `w.Header().Get(…)`,
