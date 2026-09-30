@@ -1,0 +1,126 @@
+/**
+ * `codegraph scip …` subcommands (fork).
+ *
+ *   scip index  [path] [--lang <l>] [--force]   run the indexer(s) on PATH, then merge
+ *   scip import <file> [path] [--lang <l>]      install an index built elsewhere, then merge
+ *   scip status [path] [--json]
+ */
+
+import type { Command } from 'commander';
+import { SCIP_LANGUAGES, ScipLanguage, ScipPassReport, importScipFile, runScipPass, scipStatus } from './index';
+import { produceIndex } from './produce';
+
+export interface CliHelpers {
+  resolveProjectPath(pathArg?: string): string;
+  isInitialized(projectPath: string): boolean;
+  loadCodeGraph(): Promise<typeof import('../index')>;
+  success(msg: string): void;
+  info(msg: string): void;
+  warn(msg: string): void;
+  error(msg: string): void;
+}
+
+function parseLang(raw: string | undefined): ScipLanguage | undefined {
+  if (raw === undefined) return undefined;
+  if (!(SCIP_LANGUAGES as readonly string[]).includes(raw)) {
+    throw new Error(`--lang must be one of ${SCIP_LANGUAGES.join(', ')} (got "${raw}")`);
+  }
+  return raw as ScipLanguage;
+}
+
+function describe(r: ScipPassReport): string {
+  const o = r.outcome;
+  return [
+    `${r.freshDocuments}/${r.documents} documents merged (${r.staleDocuments.length} stale) in ${r.durationMs}ms`,
+    `sites: ${o.agree} agree, ${o.conflict} conflict, ${o.scipOnly} added, ${o.alreadyVerified} already verified, ${o.scipOnlyExternal} external-only, ${o.silent} unverified heuristic edges`,
+    `edges: ${o.edgesUpdated} verified, ${o.edgesDeleted} wrong removed, ${o.edgesInserted} missing added` +
+      (o.scipEdgesDropped || o.scipEdgesStale ? `, ${o.scipEdgesDropped} outdated dropped, ${o.scipEdgesStale} stale` : ''),
+  ].join('\n');
+}
+
+export function registerScipCommands(program: Command, h: CliHelpers): void {
+  const scip = program.command('scip').description('Compiler-grade call edges from SCIP indexers (fork)');
+
+  const withGraph = async (pathArg: string | undefined, fn: (cg: import('../index').CodeGraph) => Promise<void>) => {
+    const projectPath = h.resolveProjectPath(pathArg);
+    try {
+      if (!h.isInitialized(projectPath)) {
+        h.error(`CodeGraph not initialized in ${projectPath} — run \`codegraph init\` first`);
+        process.exit(1);
+      }
+      const { default: CodeGraph } = await h.loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      try {
+        await fn(cg);
+      } finally {
+        cg.close();
+      }
+    } catch (err) {
+      h.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+  };
+
+  const mergeAndReport = async (cg: import('../index').CodeGraph) => {
+    const report = await cg.scipWrite((db) => runScipPass(db, cg.getProjectRoot()));
+    if (report) h.success(describe(report));
+    else h.info('No SCIP index installed — nothing to merge');
+  };
+
+  scip
+    .command('index [path]')
+    .description('Run the SCIP indexer for each detected language (must be on PATH), then merge')
+    .option('--lang <lang>', `Only this language (${SCIP_LANGUAGES.join('|')})`)
+    .option('-f, --force', 'Install the new index even if resolution dropped sharply')
+    .action((pathArg: string | undefined, opts: { lang?: string; force?: boolean }) =>
+      withGraph(pathArg, async (cg) => {
+        const only = parseLang(opts.lang);
+        let installed = 0;
+        for (const lang of only ? [only] : SCIP_LANGUAGES) {
+          const r = await produceIndex(cg.scipReadDb(), cg.getProjectRoot(), lang, { force: opts.force, log: h.info });
+          if (r.status === 'installed') {
+            installed++;
+            h.success(`${lang}: ${r.documents} documents, ${r.resolvedRefs} resolved references in ${(r.durationMs / 1000).toFixed(1)}s`);
+          } else if (r.status === 'skipped') {
+            if (only) h.warn(`${lang}: skipped — ${r.reason}`);
+            else h.info(`${lang}: skipped — ${r.reason}`);
+          } else {
+            h.warn(`${lang}: ${r.status} — ${r.reason}`);
+          }
+        }
+        if (installed > 0) await mergeAndReport(cg);
+        else if (only) process.exitCode = 1;
+      }));
+
+  scip
+    .command('import <file> [path]')
+    .description('Install a SCIP index built elsewhere (from the current sources), then merge')
+    .option('--lang <lang>', 'Language the index covers (default: inferred from the indexer name)')
+    .action((file: string, pathArg: string | undefined, opts: { lang?: string }) =>
+      withGraph(pathArg, async (cg) => {
+        const { lang, documents } = importScipFile(cg.getProjectRoot(), file, parseLang(opts.lang));
+        h.info(`${lang}: installed ${documents} documents`);
+        await mergeAndReport(cg);
+      }));
+
+  scip
+    .command('status [path]')
+    .description('Installed SCIP indexes and how much of the graph they verify')
+    .option('-j, --json', 'Output as JSON')
+    .action((pathArg: string | undefined, opts: { json?: boolean }) =>
+      withGraph(pathArg, async (cg) => {
+        const s = scipStatus(cg.scipReadDb(), cg.getProjectRoot());
+        if (opts.json) {
+          console.log(JSON.stringify(s, null, 2));
+          return;
+        }
+        if (s.indexes.length === 0) {
+          h.info('No SCIP index installed. Run `codegraph scip index` (needs e.g. scip-typescript on PATH).');
+          return;
+        }
+        for (const i of s.indexes) {
+          h.info(`${i.lang}: ${i.tool} ${i.toolVersion}, built ${new Date(i.producedAt).toISOString()}, ${i.mergedDocuments}/${i.files} files merged`);
+        }
+        h.info(`edges: ${s.edges.scip} compiler-verified (${s.edges.stale} stale), ${s.edges.silent} unverified heuristic`);
+      }));
+}

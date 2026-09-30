@@ -74,6 +74,11 @@ import type { UiServerHandle } from '../ui-server';
 import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../graph/symbol-lookup';
 import type { Node, Edge } from '../types';
 import { isTestPath } from '../search/query-utils';
+import { registerScipCommands } from '../scip/cli';
+
+// Fork: never nag about (or check for) upstream releases — this build is
+// replaced by installing a newer codegraph-scip tarball, not by `upgrade`.
+process.env.CODEGRAPH_NO_UPDATE_CHECK ??= '1';
 
 // Decided once, before `--color`/`--no-color` are stripped from argv below
 // (#1281). Piped/redirected stdout, NO_COLOR, or --no-color -> plain output.
@@ -2838,6 +2843,8 @@ program
   .option('--check', 'Check whether an update is available without installing')
   .option('-f, --force', 'Reinstall even if already on the target version')
   .action(async (versionArg: string | undefined, options: { check?: boolean; force?: boolean }) => {
+    error('This is the codegraph-scip fork: `upgrade` would replace it with upstream. Install a newer fork tarball instead (see FORK.md).');
+    process.exit(1);
     const up = await import('../upgrade');
     const method = up.detectInstallMethod({
       filename: __filename,
@@ -2881,6 +2888,9 @@ program
   .action(() => {
     console.log(packageJson.version);
   });
+
+// Fork: `codegraph scip …` (src/scip/cli.ts)
+registerScipCommands(program, { resolveProjectPath, isInitialized, loadCodeGraph, success, info, warn, error });
 
 // Parse and run
 program.parse();

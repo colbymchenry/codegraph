@@ -62,6 +62,9 @@ import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
 import { minRefsForPool } from './resolution/resolver-pool';
+import { onSynced, runScipPass } from './scip';
+import { ScipReindexScheduler } from './scip/reindex';
+import type { SqliteDatabase } from './db/sqlite-adapter';
 
 // Re-export types for consumers
 export * from './types';
@@ -162,6 +165,9 @@ export class CodeGraph {
 
   // File watcher for auto-sync on file changes
   private watcher: FileWatcher | null = null;
+
+  // Fork: background SCIP reindex, created on the first watched change
+  private scipReindex: ScipReindexScheduler | null = null;
 
   private constructor(
     db: DatabaseConnection,
@@ -697,6 +703,7 @@ export class CodeGraph {
           const tDeferred = Date.now();
           await this.resolver.resolveDeferredThisMemberRefs();
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[synth-timing] deferredThisMember: ${Date.now() - tDeferred}ms`);
+          this.scipHook(() => runScipPass(this.db.getDb(), this.projectRoot));
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
@@ -1115,6 +1122,11 @@ export class CodeGraph {
           this.queries.setMetadata('synthesis_pending', '0');
         }
 
+        if (result.changedFilePaths) {
+          const changed = result.changedFilePaths;
+          this.scipHook(() => onSynced(this.db.getDb(), this.projectRoot, changed));
+        }
+
         // Refresh planner stats + checkpoint the WAL after bulk writes.
         // Off-thread — see indexAll's call site.
         if (filesChanged || result.filesRemoved > 0 || orphanCount > 0 || refreshSynthesis) {
@@ -1211,6 +1223,7 @@ export class CodeGraph {
       async (paths?: string[]) => {
         const result = await this.sync({ paths });
         const filesChanged = result.filesAdded + result.filesModified + result.filesRemoved;
+        if (filesChanged > 0) (this.scipReindex ??= new ScipReindexScheduler(this)).notifyChange();
         return { filesChanged, durationMs: result.durationMs };
       },
       options,
@@ -1229,6 +1242,38 @@ export class CodeGraph {
     if (this.watcher) {
       this.watcher.stop();
       this.watcher = null;
+    }
+    this.scipReindex?.stop();
+    this.scipReindex = null;
+  }
+
+  // ===========================================================================
+  // SCIP (fork) — see src/scip/
+  // ===========================================================================
+
+  /** Raw connection for SCIP reads. */
+  scipReadDb(): SqliteDatabase {
+    return this.db.getDb();
+  }
+
+  /** Runs `fn` under the same in-process mutex and cross-process lock as indexing. */
+  async scipWrite<T>(fn: (db: SqliteDatabase) => T): Promise<T> {
+    return this.indexMutex.withLock(async () => {
+      this.fileLock.acquire();
+      try {
+        return fn(this.db.getDb());
+      } finally {
+        this.fileLock.release();
+      }
+    });
+  }
+
+  /** A failed SCIP merge must never fail the index or sync that triggered it. */
+  private scipHook(fn: () => unknown): void {
+    try {
+      fn();
+    } catch (err) {
+      process.stderr.write(`[CodeGraph SCIP] merge skipped: ${err instanceof Error ? err.message : String(err)}\n`);
     }
   }
 

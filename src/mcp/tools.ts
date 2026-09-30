@@ -56,6 +56,7 @@ import {
   resolveNamedSymbolFlow,
 } from '../graph/named-symbol-flow';
 import { getUpdateNotice } from '../upgrade/update-check';
+import { scipFlowNote, scipTrailNote } from '../scip/notes';
 import { measurePendingChanges } from './index-freshness';
 import { validateAnswerFiles, type AnswerFile } from './answer-freshness';
 import { ExploreDiagnostics } from './explore-diagnostics';
@@ -3518,7 +3519,7 @@ export class ToolHandler {
           if (step.edge) {
             const sy = this.synthEdgeNote(step.edge);
             const when = i > 0 ? this.whenLabel(cg, best![i - 1]!.node, step.edge) : '';
-            out.push(`   ↓ ${sy ? sy.compact : step.edge.kind}${when ? ` (when ${when})` : ''}`);
+            out.push(`   ↓ ${sy ? sy.compact : step.edge.kind}${scipFlowNote(step.edge)}${when ? ` (when ${when})` : ''}`);
           }
           out.push(`${i + 1}. ${step.node.name} (${step.node.filePath}:${step.node.startLine})`);
         }
@@ -7843,7 +7844,7 @@ export class ToolHandler {
   private formatTrail(cg: CodeGraph, node: Node): string {
     const TRAIL_CAP = 12;
     const fmt = (e: { node: Node; edge: Edge }) => {
-      const base = `${e.node.name} (${e.node.filePath}:${e.node.startLine})`;
+      const base = `${e.node.name} (${e.node.filePath}:${e.node.startLine})${scipTrailNote(e.edge)}`;
       const synth = this.synthEdgeNote(e.edge);
       return synth ? `${base} [${synth.compact}]` : base;
     };

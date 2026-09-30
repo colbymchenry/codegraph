@@ -1,0 +1,26 @@
+# Fork CI: upstream's engine suite + the SCIP suite, on the `scip` branch.
+# Prebuilt .scip fixtures are committed, so no indexer toolchains are needed.
+name: scip CI
+
+on:
+  push:
+    branches: [scip]
+  pull_request:
+    branches: [scip]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: SCIP suite
+        run: npx vitest run __tests__/scip/
+      - name: Upstream engine suite
+        run: npx vitest run --project engine
