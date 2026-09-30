@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- A `super` call in an overriding method, like `super.viewDidLoad()`, `[super init]`, `base.Handle()`, `parent::setUp()` or `super().dispatch(…)`, no longer makes the method look like it calls itself. The call goes to the parent's version, so an override stops showing up as recursive and no longer lists itself among its own callers.
 - Expo Router API routes (`app/hello+api.ts`) are now endpoints, one per exported method, like `GET /hello`, bound to the function that handles them. They used to show up as a screen named `/hello+api`. In a repository whose root declares Expo Router for an example app, a Next.js app in its own folder, like react-native-true-sheet's `docs/`, no longer gets Expo screens made from its files.
 - Calls into an Expo module now reach the module's native functions even when the JavaScript names the module something else, like expo-camera's `CameraManager` for `requireNativeModule('ExpoCamera')`. Both the iOS and the Android implementations are linked. expo-camera's calls used to link back to the same-named method making the call, so a method looked like it called itself.
 - A JavaScript or TypeScript call on something the file imports, like `fireEvent.click(…)` or `util.omit(…)`, no longer links to a same-named method declared in the calling file itself.
