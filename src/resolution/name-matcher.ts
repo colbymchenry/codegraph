@@ -5257,6 +5257,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   JVM_PACKAGES.delete(context);
   MINIFIED_SCRIPTS.delete(context);
   PY_LOCAL_BINDS.delete(context);
+  OVERLOAD_SETS.delete(context);
   PHP_FILE_SCOPES.delete(context);
   JAVA_STATIC_IMPORTS.delete(context);
   PY_IMPORTS.delete(context);
@@ -7976,30 +7977,51 @@ const OVERLOADING_LANGUAGES: ReadonlySet<string> = new Set(['csharp', 'java', 'k
  * bound to itself, so the two-argument overload never saw the one-argument
  * one among its callers. The same-owner overload the argument count fits.
  */
+type Arity = { min: number; max: number } | null;
+/** Per context: node id → its same-owner overloads with their arities (null: none). */
+const OVERLOAD_SETS = new WeakMap<ResolutionContext, Map<string, { name: string; own: Arity; siblings: Array<{ id: string; arity: Arity }> } | null>>();
+
 function retargetSelfOverload(result: ResolvedRef, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef {
-  if (result.targetNodeId !== ref.fromNodeId || ref.referenceKind !== 'calls' || !OVERLOADING_LANGUAGES.has(ref.language)) return result;
-  const self = context.getNodeById?.(ref.fromNodeId);
-  if (!self || (self.kind !== 'method' && self.kind !== 'function')) return result;
-  const name = self.name;
-  const args = cppParenListAfter(ref.filePath, ref.line, Math.max(0, ref.column), name, context);
+  if (ref.referenceKind !== 'calls' || !OVERLOADING_LANGUAGES.has(ref.language)) return result;
+  // C++ overload sets (templates, SFINAE tags, a `data()` on any container) are
+  // only trusted for a method's call to itself.
+  if (ref.language === 'cpp' && result.targetNodeId !== ref.fromNodeId) return result;
+  let memo = OVERLOAD_SETS.get(context);
+  if (!memo) OVERLOAD_SETS.set(context, (memo = new Map()));
+  let set = memo.get(result.targetNodeId);
+  if (set === undefined) {
+    set = overloadSetOf(result.targetNodeId, context);
+    memo.set(result.targetNodeId, set);
+  }
+  // Only an overload set has a sibling to move to.
+  if (!set || set.own === null) return result;
+  const args = cppParenListAfter(ref.filePath, ref.line, Math.max(0, ref.column), set.name, context);
   if (args === null) return result;
   const argc = args.trim() === '' ? 0 : splitCppTopLevel(args).length;
-  const arity = (n: Node): { min: number; max: number } | null => {
+  if (argc >= set.own.min && argc <= set.own.max) return result;
+  const fits = set.siblings.filter((s) => s.arity !== null && argc >= s.arity.min && argc <= s.arity.max);
+  return fits.length === 1 ? { ...result, targetNodeId: fits[0]!.id } : result;
+}
+
+/** A method's same-owner overloads and every one's arity, read from its declaration. */
+function overloadSetOf(id: string, context: ResolutionContext): { name: string; own: Arity; siblings: Array<{ id: string; arity: Arity }> } | null {
+  const self = context.getNodeById?.(id);
+  if (!self || (self.kind !== 'method' && self.kind !== 'function')) return null;
+  const name = self.name;
+  const owner = self.qualifiedName.slice(0, Math.max(0, self.qualifiedName.lastIndexOf('::')));
+  const siblings = (context.getNodesInFileNamed?.(self.filePath, name) ?? context.getNodesInFile(self.filePath).filter((n) => n.name === name))
+    .filter((n) => n.id !== self.id && (n.kind === 'method' || n.kind === 'function') &&
+      n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))) === owner);
+  if (siblings.length === 0) return null;
+  const arity = (n: Node): Arity => {
     const list = cppParenListAfter(n.filePath, n.startLine, 0, name, context);
     if (list === null) return null;
     const params = splitCppTopLevel(list).filter((p) => p !== '' && p !== 'void');
-    const variadic = params.some((p) => /\.\.\.|\bparams\s|\bvararg\s/.test(p.replace(/<[^<>]*>/g, '')));
-    const min = params.filter((p) => !/=/.test(p) && !/\.\.\.|\bparams\s|\bvararg\s/.test(p.replace(/<[^<>]*>/g, ''))).length;
-    return { min, max: variadic ? Infinity : params.length };
+    const pack = (p: string) => /\.\.\.|\bparams\s|\bvararg\s/.test(p.replace(/<[^<>]*>/g, ''));
+    const min = params.filter((p) => !/=/.test(p) && !pack(p)).length;
+    return { min, max: params.some(pack) ? Infinity : params.length };
   };
-  const own = arity(self);
-  if (!own || (argc >= own.min && argc <= own.max)) return result;
-  const owner = self.qualifiedName.slice(0, Math.max(0, self.qualifiedName.lastIndexOf('::')));
-  const fits = context.getNodesInFile(self.filePath).filter((n) =>
-    n.id !== self.id && n.name === name && (n.kind === 'method' || n.kind === 'function') &&
-    n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))) === owner &&
-    ((a) => a !== null && argc >= a.min && argc <= a.max)(arity(n)));
-  return fits.length === 1 ? { ...result, targetNodeId: fits[0]!.id } : result;
+  return { name, own: arity(self), siblings: siblings.map((n) => ({ id: n.id, arity: arity(n) })) };
 }
 
 function matchReferenceInner(

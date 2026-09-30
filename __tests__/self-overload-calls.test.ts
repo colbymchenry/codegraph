@@ -1,9 +1,9 @@
 /**
- * A method calling its own name with arguments its own parameters cannot
- * take calls another overload — `toInstant(instant)` delegating to
- * `toInstant(instant, Instant.EPOCH)` — not itself: the self-edge hid the
- * convenience overloads from the full overload's callers (commons-lang had
- * 180 such, Newtonsoft 107).
+ * A call that lands on an overload its arguments cannot fit is to the one
+ * sibling overload they do: `toInstant(instant)` delegating to
+ * `toInstant(instant, Instant.EPOCH)` bound to itself (commons-lang had 180
+ * such self-edges, Newtonsoft 107), and `HashCodeBuilder.reflectionHashCode(this)`
+ * to the first overload indexed, a three-parameter one.
  */
 import { describe, it, expect, afterAll, beforeAll } from 'vitest';
 import * as fs from 'fs';
@@ -30,6 +30,26 @@ public class Instants {
 
   public static int depth(final int n) {
     return n <= 0 ? 0 : depth(n - 1);
+  }
+}
+`,
+    'src/main/java/app/HashCodeBuilder.java': `package app;
+
+public class HashCodeBuilder {
+  public static int reflectionHashCode(final int initial, final int multiplier, final Object object) {
+    return initial * multiplier;
+  }
+
+  public static int reflectionHashCode(final Object object, final String... excludeFields) {
+    return 1;
+  }
+}
+`,
+    'src/main/java/app/Point.java': `package app;
+
+public class Point {
+  public int hash() {
+    return HashCodeBuilder.reflectionHashCode(this);
   }
 }
 `,
@@ -74,6 +94,13 @@ describe('a method calling its own name', () => {
   it('Java: reaches the overload the arguments fit; real recursion stays', () => {
     expect(selfNamed('src/main/java/app/Instants.java', 'toInstant')).toEqual(['4 -> 8']);
     expect(selfNamed('src/main/java/app/Instants.java', 'depth')).toEqual(['12 -> 12']);
+  });
+
+  it('from another class: reaches the overload the arguments fit, not the first indexed', () => {
+    const hash = cg.getNodesInFile('src/main/java/app/Point.java').find((n) => n.name === 'hash')!;
+    const lines = cg.getOutgoingEdges(hash.id).filter((e) => e.kind === 'calls').map((e) => cg.getNode(e.target)!)
+      .filter((t) => t.name === 'reflectionHashCode').map((t) => t.startLine);
+    expect(lines).toEqual([8]);
   });
 
   it('C#: reaches the overload the arguments fit', () => {

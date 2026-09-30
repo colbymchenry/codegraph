@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- In Java, C#, Kotlin, Swift, Scala, Dart and VB.NET, a call now reaches the overload whose parameters fit its arguments, not whichever same-named overload was indexed first. For example, `HashCodeBuilder.reflectionHashCode(this)` now reaches the one-argument overload with varargs, not a three-parameter one. Each overload's callers are now its own.
 - A method that calls another overload of itself now links to that overload rather than to itself. An example is `toInstant(instant)` returning `toInstant(instant, Instant.EPOCH)`. The fuller overload now lists its convenience overloads among its callers, so its impact includes them. This applies to Java, C#, Kotlin, Swift, C++, Scala, Dart and VB.NET. Real recursion is unchanged.
 - In a project with a React front end, the React rules for hooks (`use…`) and contexts (`…Context`, `…Provider`) no longer apply to backend code. In halo, a Spring app with a React UI, Java imports such as `SecurityContext` and `ObjectProvider` had been handled as React contexts.
 - In a project with a Vue front end, the backend's calls no longer land on Vue components. mealie's Python `QueryFilterBuilder(…)` had been linking to the `QueryFilterBuilder.vue` component. The Vue rules (compiler macros, Nuxt auto-imports, components by name) now apply only to the app's scripts.
