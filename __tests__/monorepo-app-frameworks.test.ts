@@ -85,4 +85,44 @@ describe('file-based routers in a monorepo', () => {
       cg.close();
     }
   });
+
+  it('the nearest manifest that names a router decides: a Next docs app under an Expo root', async () => {
+    const cg = await project({
+      'package.json': JSON.stringify({ name: 'true-sheet', devDependencies: { expo: '*', 'expo-router': '*', react: '*' } }),
+      'docs/package.json': JSON.stringify({ name: 'docs', dependencies: { next: '*', react: '*' } }),
+      'docs/app/layout.tsx': `export default function RootLayout({ children }: { children: unknown }) { return children; }
+`,
+      'docs/app/(docs)/[...slug]/page.tsx': `export default function DocPage() { return null; }
+`,
+      'example/app/_layout.tsx': `export default function Layout() { return null; }
+`,
+      'example/app/sheet.tsx': `export default function Sheet() { return null; }
+`,
+    });
+    try {
+      expect(routesIn(cg, 'docs/')).toEqual(['/:slug*']);
+      expect(routesIn(cg, 'example/')).toEqual(['/sheet']);
+    } finally {
+      cg.close();
+    }
+  });
+
+  it('an Expo API route is an endpoint per exported method, not a screen', async () => {
+    const cg = await project({
+      'package.json': JSON.stringify({ name: 'site', dependencies: { expo: '*', 'expo-router': '*' } }),
+      'app/index.tsx': `export default function Home() { return null; }
+`,
+      'app/blog/og-image/[post]+api.ts': `export async function GET(request: Request) { return new Response('png'); }
+export const POST = async () => new Response('ok');
+`,
+    });
+    try {
+      expect(routesIn(cg, 'app/')).toEqual(['/', 'GET /blog/og-image/:post', 'POST /blog/og-image/:post']);
+      const get = cg.getNodesByKind('route').find((n) => n.name.startsWith('GET '))!;
+      const handler = cg.getOutgoingEdges(get.id).map((e) => cg.getNode(e.target)!).find((n) => n.name === 'GET');
+      expect(handler?.kind).toBe('function');
+    } finally {
+      cg.close();
+    }
+  });
 });

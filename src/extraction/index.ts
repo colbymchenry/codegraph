@@ -1948,13 +1948,19 @@ export class ExtractionOrchestrator {
     const key = `${dir}|${name}`;
     const memo = this.appFrameworkMemo.get(key);
     if (memo !== undefined) return memo;
+    // The nearest manifest that names ANY gated framework decides: true-sheet's
+    // root package.json declares expo-router for its example app, and its
+    // `docs/` Next.js app — whose own package.json declares `next` — is not
+    // an Expo app for it.
     let applies = false;
     for (let d: string | null = dir; d !== null; d = d === '' ? null : d.includes('/') ? d.slice(0, d.lastIndexOf('/')) : '') {
       const declared = this.dependenciesDeclaredIn(d);
-      if (declared && deps.some((dep) => declared.has(dep))) {
+      if (!declared) continue;
+      if (deps.some((dep) => declared.has(dep))) {
         applies = true;
         break;
       }
+      if ([...this.gatedFrameworks].some(([other, otherDeps]) => other !== name && otherDeps.some((dep) => declared.has(dep)))) break;
     }
     this.appFrameworkMemo.set(key, applies);
     return applies;
