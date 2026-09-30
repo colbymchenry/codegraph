@@ -390,6 +390,8 @@ const VENDORED_WASM_LANGS: ReadonlySet<GrammarLanguage> = new Set([
   // crate is UNUSABLE by the kernel (pins tree-sitter <0.23) and
   // tree-sitter-kotlin-ng is a different grammar — the kernel compiles the
   // same vendored C sources instead (codegraph-kernel/grammars/kotlin).
+  // Both carry docs/grammars/tree-sitter-kotlin.patch (scanner: no automatic
+  // semicolon before a same-line `e` word, e.g. an `eq` infix call).
   'kotlin',
   // R7b batch 4 (Dart kernel port prep): the byte-copied tree-sitter-wasms
   // 0.1.13 artifact (sha256 7f5364e4…, built from UserNobody14/

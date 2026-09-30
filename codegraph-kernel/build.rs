@@ -9,6 +9,9 @@ fn main() {
     // against the crates.io tarball (kotlin checklist §Grammar prep):
     //   parser.c  54104a7ef1555c265b746c790e0f8bb953cc17806e9df0c3af82f7f62c06a70a
     //   scanner.c 27f73337ec357fc341fa57538f34c14277b0346980c3405dc30beab6202ec6d0
+    // scanner.c carries docs/grammars/tree-sitter-kotlin.patch (same-line
+    // `e`-word semicolon fix), shared with the wasm build:
+    //   scanner.c 2ca842dd04b60b0a6df59a03e9ad01209d8c5641f079a79a84d65708669b6cb6 (patched)
     // Flags crib the tarball's own bindings/rust/build.rs.
     let mut c = cc::Build::new();
     c.include("grammars/kotlin");
