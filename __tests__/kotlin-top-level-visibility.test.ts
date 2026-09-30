@@ -31,21 +31,26 @@ beforeAll(async () => {
 
 class JdbcTransaction
 
+fun withTables(statement: JdbcTransaction.() -> Unit) {}
+
 fun <T> JdbcTransaction.assertEquals(exp: T, act: T) {}
 `,
     'r2dbc/src/main/kotlin/app/r2dbc/tests/Assert.kt': `package app.r2dbc.tests
 
 class R2dbcTransaction
 
+fun withTables(statement: R2dbcTransaction.() -> Unit) {}
+
 fun <T> R2dbcTransaction.assertEquals(exp: T, act: T) {}
 `,
     'jdbc/src/test/kotlin/app/jdbc/JdbcTest.kt': `package app.jdbc
 
 import app.jdbc.tests.assertEquals
+import app.jdbc.tests.withTables
 
 class JdbcTest {
   fun works() {
-    assertEquals(1, 1)
+    withTables { assertEquals(1, 1) }
   }
 }
 `,
@@ -55,7 +60,7 @@ import app.r2dbc.tests.*
 
 class R2dbcTest {
   fun works() {
-    assertEquals(1, 1)
+    withTables { assertEquals(1, 1) }
   }
 }
 `,
@@ -72,7 +77,7 @@ class PlainTest {
     'jdbc/src/main/kotlin/app/jdbc/tests/Local.kt': `package app.jdbc.tests
 
 fun check() {
-  assertEquals(1, 1)
+  withTables { assertEquals(1, 1) }
 }
 `,
     'jdbc/src/main/kotlin/app/jdbc/tests/DatabaseTestsBase.kt': `package app.jdbc.tests

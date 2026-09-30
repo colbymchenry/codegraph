@@ -1680,6 +1680,244 @@ function kotlinChainReceiver(ref: UnresolvedRef, context: ResolutionContext): st
   return rustGoReceiverName(before.replace(/\?\s*\.\s*$/, '').replace(/!!\s*$/, ''));
 }
 
+/** Whether a bare Kotlin name is written with no receiver at its call — not a later link of a chain (`….name(`). */
+function isReceiverLessKotlinCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return false;
+  const name = ref.referenceName;
+  let start = line.startsWith(name, ref.column) && !/[\w$]/.test(line[ref.column - 1] ?? '') ? ref.column : -1;
+  if (start < 0) {
+    const m = new RegExp(`(?<![\\w$])${name.replace(/\$/g, '\\$')}\\s*[({<]`).exec(line);
+    start = m ? m.index : -1;
+  }
+  return start >= 0 && !/[.:]\s*$/.test(line.slice(0, start));
+}
+
+/**
+ * Whether a bare `require(…)` / `check(…)` / `assert(…)` is Kotlin's
+ * precondition: its condition is a comparison or boolean expression, or a
+ * lazy message follows it.
+ */
+function isKotlinPreconditionCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!/^(?:require|check|assert)$/.test(ref.referenceName)) return false;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  const at = line ? new RegExp(`(?<![\\w.])${ref.referenceName}\\s*\\(`).exec(line) : null;
+  if (!line || !at) return false;
+  let depth = 0;
+  let args = '';
+  let rest = '';
+  for (let i = at.index + at[0].length; i < line.length; i++) {
+    const ch = line[i]!;
+    if (ch === '(') depth++;
+    else if (ch === ')' && depth-- === 0) {
+      rest = line.slice(i + 1);
+      break;
+    }
+    args += ch;
+  }
+  return /[<>=!]=|&&|\|\||(?:^|[\s(])!|\s[<>]\s|\bis\b|\bin\b|\btrue\b|\bfalse\b/.test(args) || /^\s*\{/.test(rest);
+}
+
+const KOTLIN_RECEIVER_TYPES = new WeakMap<ResolutionContext, Set<string>>();
+
+/**
+ * Every type a Kotlin function type in the project takes as its receiver —
+ * `Module` in `typealias ModuleDeclaration = Module.() -> Unit`, `Scope` in
+ * `Scope.(ParametersHolder) -> T`, `JdbcTransaction` in `statement:
+ * JdbcTransaction.(TestDB) -> Unit`. A lambda of such a type runs with that
+ * receiver, so a bare call inside one reaches its members.
+ */
+function kotlinReceiverTypes(context: ResolutionContext): Set<string> {
+  const hit = KOTLIN_RECEIVER_TYPES.get(context);
+  if (hit) return hit;
+  const types = new Set<string>();
+  const outside = new Set<string>();
+  for (const file of context.getAllFiles()) {
+    if (!/\.kts?$/.test(file)) continue;
+    const source = stripCommentsForRegex(context.readFile(file) ?? '', 'java');
+    for (const m of source.matchAll(/\b([A-Z]\w*)(?:<[^<>()]*(?:<[^<>()]*>[^<>()]*)*>)?\s*\.\s*\(/g)) types.add(m[1]!);
+    // An extension on a type from outside the project (`fun
+    // MacrobenchmarkScope.waitForContent()`, `fun StringBuilder.padInt(…)`)
+    // is written to be called inside that library's lambdas.
+    for (const m of source.matchAll(/\bfun\s+(?:<[^>]*>\s*)?([A-Z]\w*(?:\.[A-Z]\w*)*)(?:<[^<>()]*(?:<[^<>()]*>[^<>()]*)*>)?\??\.[A-Za-z_`][\w`]*\s*\(/g)) {
+      for (const part of m[1]!.split('.')) outside.add(part);
+    }
+  }
+  for (const name of outside) {
+    if (!context.getNodesByName(name).some((n) => MEMBER_CLASS_KINDS.has(n.kind) && (n.language === 'kotlin' || n.language === 'java'))) types.add(name);
+  }
+  // A receiver's members include those it inherits: Exposed's `mergeFrom`
+  // body runs on a MergeTableStatement, whose `whenMatchedDelete` is
+  // MergeStatement's.
+  const queue = [...types];
+  while (queue.length > 0 && types.size < 5000) {
+    const name = queue.shift()!;
+    for (const decl of context.getNodesByName(name)) {
+      if (decl.language !== 'kotlin' || !MEMBER_CLASS_KINDS.has(decl.kind)) continue;
+      for (const sup of classHeadSupertypes(decl, context)) {
+        if (!types.has(sup)) {
+          types.add(sup);
+          queue.push(sup);
+        }
+      }
+    }
+  }
+  KOTLIN_RECEIVER_TYPES.set(context, types);
+  return types;
+}
+
+/**
+ * What the Android framework and AndroidX classes a Kotlin class commonly
+ * extends inherit, so an extension on `ComponentCallbacks` or
+ * `ComponentActivity` is in reach of an `AppCompatActivity` subclass.
+ */
+const KOTLIN_PLATFORM_SUPERS: Readonly<Record<string, readonly string[]>> = {
+  AppCompatActivity: ['FragmentActivity'], FragmentActivity: ['ComponentActivity'],
+  ComponentActivity: ['Activity', 'LifecycleOwner', 'ViewModelStoreOwner', 'SavedStateRegistryOwner'],
+  Activity: ['ContextThemeWrapper', 'ComponentCallbacks2'], ContextThemeWrapper: ['ContextWrapper'],
+  ContextWrapper: ['Context'], Application: ['ContextWrapper', 'ComponentCallbacks2'],
+  Service: ['ContextWrapper', 'ComponentCallbacks2'], ComponentCallbacks2: ['ComponentCallbacks'],
+  Fragment: ['ComponentCallbacks', 'LifecycleOwner', 'ViewModelStoreOwner', 'SavedStateRegistryOwner'],
+  DialogFragment: ['Fragment'], AppCompatDialogFragment: ['DialogFragment'],
+  BottomSheetDialogFragment: ['AppCompatDialogFragment'], AndroidViewModel: ['ViewModel'],
+};
+
+const KOTLIN_HIERARCHIES = new WeakMap<ResolutionContext, WeakMap<UnresolvedRef, Set<string>>>();
+
+/**
+ * The Kotlin types a bare call is written inside — the classes and objects
+ * around it and the receiver of the extension function it is in — and what
+ * they inherit.
+ */
+function kotlinHierarchyAt(ref: UnresolvedRef, context: ResolutionContext): Set<string> {
+  let memo = KOTLIN_HIERARCHIES.get(context);
+  if (!memo) {
+    memo = new WeakMap();
+    KOTLIN_HIERARCHIES.set(context, memo);
+  }
+  const hit = memo.get(ref);
+  if (hit) return hit;
+  const queue: string[] = [];
+  for (const n of context.getNodesInFile(ref.filePath)) {
+    if (n.startLine > ref.line || n.endLine < ref.line) continue;
+    if (MEMBER_CLASS_KINDS.has(n.kind)) queue.push(n.name);
+    // `fun Foo.bar() { baz() }`: Foo is the implicit receiver.
+    else if ((n.kind === 'method' || n.kind === 'function') && n.qualifiedName.includes('::')) {
+      queue.push(n.qualifiedName.slice(0, n.qualifiedName.lastIndexOf('::')).split(/::|\./).pop()!);
+    }
+  }
+  // A Gradle build script runs on the Project (a settings script on Settings).
+  if (ref.filePath.endsWith('.gradle.kts')) queue.push(/(?:^|\/)settings\.gradle\.kts$/.test(ref.filePath) ? 'Settings' : 'Project');
+  // The same read from the source's braces, which also sees an anonymous
+  // `object : Table("t") { … }` and survives a class the parser lost.
+  for (const frame of kotlinBraceFrames(ref.filePath, context)) {
+    if (frame.start <= ref.line && frame.end >= ref.line) queue.push(...frame.names);
+  }
+  const names = new Set<string>();
+  while (queue.length > 0 && names.size < 60) {
+    const name = queue.shift()!;
+    if (names.has(name)) continue;
+    names.add(name);
+    queue.push(...(KOTLIN_PLATFORM_SUPERS[name] ?? []));
+    for (const decl of context.getNodesByName(name)) {
+      if (decl.language === 'kotlin' && MEMBER_CLASS_KINDS.has(decl.kind)) queue.push(...classHeadSupertypes(decl, context));
+    }
+  }
+  memo.set(ref, names);
+  return names;
+}
+
+const KOTLIN_FRAMES = new WeakMap<ResolutionContext, Map<string, Array<{ start: number; end: number; names: string[] }>>>();
+
+/**
+ * The type bodies of a Kotlin file by line range, read from its braces: each
+ * `class` / `object` / `interface` body with its name and supertypes, an
+ * anonymous `object : Base(…)` with its base, and an extension function's
+ * body with its receiver type.
+ */
+function kotlinBraceFrames(file: string, context: ResolutionContext): Array<{ start: number; end: number; names: string[] }> {
+  let memo = KOTLIN_FRAMES.get(context);
+  if (!memo) {
+    memo = new Map();
+    KOTLIN_FRAMES.set(context, memo);
+  }
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const frames: Array<{ start: number; end: number; names: string[] }> = [];
+  const source = blankStringContents(stripCommentsForRegex(context.readFile(file) ?? '', 'java'));
+  const stack: Array<{ start: number; names: string[] | null }> = [];
+  let line = 1;
+  let pending = '';
+  for (const ch of source) {
+    if (ch === '\n') line++;
+    if (ch === '{') {
+      // `with(x) {`, `x.apply {`, `x.run {`: a receiver of whatever type x is.
+      const scoped = /(?:\bwith\s*\([^{}]*\)|\.\s*(?:apply|run)(?:\s*<[^<>]*>)?)\s*$/.test(pending);
+      stack.push({ start: line, names: scoped ? ['*'] : kotlinHeadNames(pending) });
+      pending = '';
+    } else if (ch === '}') {
+      const open = stack.pop();
+      if (open?.names && open.names.length > 0) frames.push({ start: open.start, end: line, names: open.names });
+      pending = '';
+    } else if (ch === ';') pending = '';
+    else if (pending.length < 600) pending += ch;
+    else pending = pending.slice(300) + ch;
+  }
+  memo.set(file, frames);
+  return frames;
+}
+
+/** The type names a Kotlin block head introduces: a type declaration's name and supertypes, or an extension function's receiver. */
+function kotlinHeadNames(head: string): string[] | null {
+  let depth = 0;
+  let flat = '';
+  for (const ch of head) {
+    if (ch === '<' || ch === '(') depth++;
+    else if (ch === '>' || ch === ')') depth = Math.max(0, depth - 1);
+    else if (depth === 0) flat += ch;
+  }
+  const decl = /\b(?:class|interface|object)\b(?:\s+([A-Za-z_]\w*))?([^=]*)$/.exec(flat);
+  if (decl) {
+    const supers = /:\s*([\s\S]*)$/.exec(decl[2] ?? '')?.[1] ?? '';
+    const names = [...supers.replace(/\bwhere\b[\s\S]*$/, '').matchAll(/([A-Z]\w*)\s*(?=,|$|\bby\b)/g)].map((m) => m[1]!);
+    return decl[1] ? [decl[1], ...names] : names;
+  }
+  const receiver = /\bfun\s+(?:<[^>]*>\s*)?([A-Z]\w*)(?:<[^>]*>)?\??\.[A-Za-z_]\w*\s*\(/.exec(head)?.[1];
+  return receiver ? [receiver] : null;
+}
+
+/**
+ * Whether a bare Kotlin call can reach method `n`: a member of a type around
+ * the call or of what it inherits, or of a type the project's function types
+ * take as a lambda receiver (a DSL). koin's `error("…")` — Kotlin's — went to
+ * a Logger's `error`, and `module { … }` in one test to another test class's
+ * private `module`.
+ */
+function isKotlinMemberReachable(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  // A Java class's method, too: Kotlin calls it bare only from a subclass or through a static import.
+  if (n.kind !== 'method' || (n.language !== 'kotlin' && n.language !== 'java')) return true;
+  // `require(n >= 0) { … }`, `check(!closed)`: Kotlin's preconditions, not a
+  // member `require(byteCount: Long)` of the type around the call.
+  if (isKotlinPreconditionCall(ref, context)) return false;
+  // A Gradle script's DSL blocks run on the build tool's own types.
+  if (ref.filePath.endsWith('.kts')) return true;
+  const cut = n.qualifiedName.lastIndexOf('::');
+  if (cut <= 0) return true;
+  const path = n.qualifiedName.slice(0, cut).split(/::|\./);
+  let owner = path.pop()!;
+  const companion = owner === 'Companion' && path.length > 0;
+  if (companion) owner = path.pop()!;
+  // A (Java) constructor is the type's, called by its name.
+  if (n.name === owner) return true;
+  const hierarchy = kotlinHierarchyAt(ref, context);
+  if (hierarchy.has('*') || kotlinReceiverTypes(context).has(owner) || hierarchy.has(owner)) return true;
+  // `import okio.TestUtil.deepCopy` / `import okio.TestUtil.*` names an object's members.
+  const pkg = kotlinFileScope(n.filePath, context).pkg;
+  const objectPath = (pkg ? `${pkg}.${owner}` : owner) + (companion ? '.Companion' : '');
+  const here = kotlinFileScope(ref.filePath, context);
+  return here.imports.has(`${objectPath}.${n.name}`) || here.stars.has(objectPath);
+}
+
 /** Whether a standard-named Kotlin chain link can mean `n`: only through a receiver named after its owner. */
 function isKotlinStdChainTarget(n: Node, receiver: string): boolean {
   if (n.kind !== 'method' && n.kind !== 'function') return true;
@@ -3118,6 +3356,7 @@ export function matchByExactName(
   const javaBare = ref.language === 'java' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const dartBare = ref.language === 'dart' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName) && isReceiverLessDartCall(ref, context);
   const kotlinCall = ref.language === 'kotlin' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
+  const kotlinBare = kotlinCall && isReceiverLessKotlinCall(ref, context);
   const rubyBare = ref.language === 'ruby' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*[?!]?$/.test(ref.referenceName);
   const cfmlBare = (ref.language === 'cfml' || ref.language === 'cfscript') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
   const vbReceiver = ref.language === 'vbnet' && (ref.referenceKind === 'calls' || ref.referenceKind === 'instantiates') && /^\w+$/.test(ref.referenceName)
@@ -3146,6 +3385,7 @@ export function matchByExactName(
     !(cfmlBare && n.kind === 'method' && !isCfmlMethodInScope(n, ref, context)) &&
     !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)) &&
     !(kotlinCall && !isKotlinTopLevelVisible(n, ref, context)) &&
+    !(kotlinBare && !isKotlinMemberReachable(n, ref, context)) &&
     !(dartBare && isDartMember(n) && !isDartMethodInScope(n, ref, context)) &&
     !(phpSelf && (n.kind !== 'method' || !isPhpMethodInScope(n, ref, phpSelf, context))) &&
     !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)) &&
@@ -4267,6 +4507,9 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   DART_SUPERS.delete(context);
   DART_HIERARCHIES.delete(context);
   SWIFT_DECLS.delete(context);
+  KOTLIN_RECEIVER_TYPES.delete(context);
+  KOTLIN_HIERARCHIES.delete(context);
+  KOTLIN_FRAMES.delete(context);
   MEMBER_TYPE_MEMO.delete(context);
   CSHARP_ALIASES.delete(context);
   SWIFT_HIERARCHIES.delete(context);
@@ -6668,6 +6911,7 @@ export function matchFuzzy(
   const javaBare = ref.language === 'java' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const dartBare = ref.language === 'dart' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName) && isReceiverLessDartCall(ref, context);
   const kotlinCall = ref.language === 'kotlin' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
+  const kotlinBare = kotlinCall && isReceiverLessKotlinCall(ref, context);
   const rubyBare = ref.language === 'ruby' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*[?!]?$/.test(ref.referenceName);
   const cfmlBare = (ref.language === 'cfml' || ref.language === 'cfscript') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
   const vbReceiver = ref.language === 'vbnet' && (ref.referenceKind === 'calls' || ref.referenceKind === 'instantiates') && /^\w+$/.test(ref.referenceName)
@@ -6698,6 +6942,7 @@ export function matchFuzzy(
     !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)) &&
     !(dartBare && isDartMember(n) && !isDartMethodInScope(n, ref, context)) &&
     !(kotlinCall && !isKotlinTopLevelVisible(n, ref, context)) &&
+    !(kotlinBare && !isKotlinMemberReachable(n, ref, context)) &&
     !(rubyBare && n.kind === 'method' && !isRubyMethodInScope(n, ref, context)) &&
     !(cfmlBare && n.kind === 'method' && !isCfmlMethodInScope(n, ref, context)) &&
     !(vbReceiver !== null && !isVbMemberReachable(n, vbReceiver)) &&
