@@ -13,6 +13,7 @@ import { JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-built
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
 import { isTestPath } from '../search/query-utils';
 import { isMinifiedContent } from '../extraction/generated-detection';
+import { getCargoWorkspaceCrateMap } from './frameworks/cargo-workspace';
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
  * score. A name defined more times than this is "ubiquitous" — a method/symbol
@@ -3775,6 +3776,59 @@ interface RustUses {
   names: Set<string>;
   /** `X` of each `use …::X::*` (`super` for `use super::*`). */
   globs: Set<string>;
+  /** Names the file imports from outside the project — `use std::task::{Context, Poll}`, `use futures::Stream`. */
+  external: Set<string>;
+  /** The items the file's project `use`s bind — their leaves, not the paths they walk. */
+  bound: Set<string>;
+}
+
+const RUST_CRATES = new WeakMap<ResolutionContext, Set<string>>();
+const RUST_DEPENDENCIES = new WeakMap<ResolutionContext, Set<string>>();
+
+/**
+ * The crates the project's manifests depend on (`[dependencies]`,
+ * `[dev-dependencies]`, `[build-dependencies]`, per-target ones), by the name
+ * code writes them (`futures_util`), less the project's own.
+ */
+function rustDependencyCrates(context: ResolutionContext): Set<string> {
+  const hit = RUST_DEPENDENCIES.get(context);
+  if (hit) return hit;
+  const deps = new Set<string>();
+  const manifests = ['Cargo.toml', ...[...getCargoWorkspaceCrateMap(context).values()].map((dir) => `${dir}/Cargo.toml`)];
+  for (const manifest of new Set(manifests)) {
+    const text = context.readFile(manifest) ?? '';
+    let inDeps = false;
+    for (const raw of text.split(/\r?\n/)) {
+      const line = raw.replace(/#.*$/, '').trim();
+      const header = /^\[([^\]]+)\]$/.exec(line);
+      if (header) {
+        const table = header[1]!.trim();
+        // `[dependencies.tokio]` names one dependency in its header.
+        const named = /(?:^|\.)(?:dev-|build-)?dependencies\.([A-Za-z0-9_-]+)$/.exec(table);
+        if (named) deps.add(named[1]!.replace(/-/g, '_'));
+        inDeps = /(?:^|\.)(?:dev-|build-)?dependencies$/.test(table);
+        continue;
+      }
+      const key = inDeps ? /^([A-Za-z0-9_-]+)\s*=/.exec(line)?.[1] : undefined;
+      if (key) deps.add(key.replace(/-/g, '_'));
+    }
+  }
+  for (const own of rustProjectCrates(context)) deps.delete(own);
+  RUST_DEPENDENCIES.set(context, deps);
+  return deps;
+}
+
+/** The project's own crate names (`tokio`, `tokio_util`), from its Cargo.toml files. */
+function rustProjectCrates(context: ResolutionContext): Set<string> {
+  const hit = RUST_CRATES.get(context);
+  if (hit) return hit;
+  const crates = new Set<string>();
+  // The manifests are not indexed files: the root's package, and the workspace's members.
+  const root = /\[package\][^[]*?\bname\s*=\s*"([^"]+)"/.exec(context.readFile('Cargo.toml') ?? '')?.[1];
+  if (root) crates.add(root.replace(/-/g, '_'));
+  for (const name of getCargoWorkspaceCrateMap(context).keys()) crates.add(name.replace(/-/g, '_'));
+  RUST_CRATES.set(context, crates);
+  return crates;
 }
 const RUST_USES = new WeakMap<ResolutionContext, Map<string, RustUses>>();
 
@@ -3786,12 +3840,28 @@ function rustUsesOf(filePath: string, context: ResolutionContext): RustUses {
   }
   const hit = memo.get(filePath);
   if (hit) return hit;
-  const uses: RustUses = { names: new Set(), globs: new Set() };
+  const uses: RustUses = { names: new Set(), globs: new Set(), external: new Set(), bound: new Set() };
+  const leaves = (tree: string): string[] => [
+    ...[...tree.matchAll(/([A-Za-z_]\w*)\s*(?=[,}]|$|\s+as\b)|\bas\s+([A-Za-z_]\w*)/g)]
+      .map((leaf) => leaf[2] ?? leaf[1]!).filter((id) => id !== 'self' && id !== 'as'),
+    // `use std::io::{self, Read}` binds `io` too.
+    ...[...tree.matchAll(/([A-Za-z_]\w*)\s*::\s*\{[^{}]*\bself\b/g)].map((m) => m[1]!),
+  ];
   // Comments first: a doc comment's prose ("…use the Option…") is not a `use`.
   const text = stripCommentsForRegex(context.readFile(filePath) ?? '', 'rust');
+  const dependencies = rustDependencyCrates(context);
   for (const m of text.matchAll(/(?:^|[;{}\s])use\s+([^;]{1,2000});/g)) {
     const tree = m[1]!;
-    if (/^\s*(?:::)?(?:std|core|alloc)\b/.test(tree)) continue;
+    const root = /^\s*(?:::)?([A-Za-z_]\w*)/.exec(tree)?.[1] ?? '';
+    // Outside: the standard library or a crate the manifests depend on — not a
+    // module of the project's (`mod support { … }` inline in a test).
+    const outside = root === 'std' || root === 'core' || root === 'alloc' || (root !== '' && dependencies.has(root));
+    // The items it binds: each leaf (`as` aliases by their alias), never the path it walks.
+    if (outside) {
+      for (const id of leaves(tree)) uses.external.add(id);
+      continue;
+    }
+    for (const id of leaves(tree)) uses.bound.add(id);
     for (const id of tree.matchAll(/[A-Za-z_]\w*/g)) uses.names.add(id[0]);
     for (const g of tree.matchAll(/(\w+)\s*::\s*(?:\{[^}]*)?\*/g)) uses.globs.add(g[1]!);
   }
@@ -3829,7 +3899,27 @@ export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: 
   // Bare in the SOURCE: the index keeps `crate::error::Result` by its last
   // segment, and a path is not a prelude lookup.
   const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
-  if (line !== undefined && line.startsWith(name, ref.column) && /::\s*$/.test(line.slice(0, ref.column))) return true;
+  // Written through a path on its line (`jsont::SubMatch { … }`, `io::Result<…>`),
+  // wherever the reference's column points.
+  const pathed = line === undefined ? null
+    : (line.startsWith(name, ref.column) && /::\s*$/.test(line.slice(0, ref.column)) ? /((?:[A-Za-z_]\w*\s*::\s*)*)([A-Za-z_]\w*)?\s*::\s*$/.exec(line.slice(0, ref.column))
+      : !new RegExp(`(?<![\\w$:])${name}\\b`).test(line) ? new RegExp(`((?:[A-Za-z_]\\w*\\s*::\\s*)*)([A-Za-z_]\\w*)\\s*::\\s*${name}\\b`).exec(line) : null);
+  if (pathed) {
+    // Through a path: `crate::` / `self::` / `super::` look it up relatively;
+    // `io::Result` is the `io` module's — tokio's `runtime/task` alias is not —
+    // and a path from std (`std::io::Error`) is std's.
+    const seg = pathed[2] ?? '';
+    const root = /^([A-Za-z_]\w*)/.exec(pathed[1] ?? '')?.[1] ?? seg;
+    if ((root === 'std' || root === 'core' || root === 'alloc') && candidate.filePath !== ref.filePath) return false;
+    // A project crate's name re-exports as `crate::` does: `clap::Command` is clap_builder's.
+    if (seg === '' || seg === 'crate' || seg === 'self' || seg === 'super' || seg === 'Self' || candidate.filePath === ref.filePath ||
+        rustProjectCrates(context).has(seg)) return true;
+    // `io::Error` under `use std::io;` is std's, whatever `io/` directory the project has.
+    const pathUses = rustUsesOf(ref.filePath, context);
+    if (pathUses.external.has(seg) && !pathUses.bound.has(seg)) return false;
+    return rustModuleName(candidate.filePath) === seg || candidate.filePath.includes(`/${seg}/`) ||
+      candidate.qualifiedName.split('::').includes(seg);
+  }
   if (candidate.kind === 'enum_member') {
     if (ref.referenceKind === 'references') return false;
     const uses = rustUsesOf(ref.filePath, context);
@@ -3837,8 +3927,24 @@ export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: 
     const owner = cut >= 0 ? candidate.qualifiedName.slice(0, cut).split('::').pop()! : '';
     return (owner !== '' && uses.globs.has(owner)) || (uses.names.has(name) && uses.names.has(owner));
   }
-  if (!RUST_PRELUDE.has(name) || candidate.filePath === ref.filePath) return true;
+  if (candidate.filePath === ref.filePath) return true;
   const uses = rustUsesOf(ref.filePath, context);
+  // `use std::task::{Context, Poll}`: the file's `Context` is std's, not tokio's
+  // `runtime::context::Context`. (A method call `.env(…)` is no imported name.)
+  if (uses.external.has(name) && !uses.bound.has(name) && line !== undefined) {
+    // Not on its line at all: a later link of a chain written across lines (`Arg::new(…)\n.env(…)`).
+    const at = new RegExp(`(?<![\\w$])${name}\\b`).exec(line.slice(Math.max(0, ref.column)));
+    if (at && !/\.\s*$/.test(line.slice(0, Math.max(0, ref.column) + at.index))) return false;
+  }
+  if (!RUST_PRELUDE.has(name)) {
+    // Another file's item — a type, a function — is in scope only through a
+    // `use` that binds it or a glob over its module: tokio's `Context<'_>` is
+    // not `runtime::task::trace`'s `Context` unless the file brings that one
+    // in. A method is reached through a value, never a `use`.
+    if (TYPE_MEMBER_KINDS.has(candidate.kind) || ref.referenceKind === 'imports' ||
+        candidate.kind === 'file' || candidate.kind === 'module' || candidate.kind === 'namespace') return true;
+    return uses.bound.has(name) || rustGlobCovers(uses, candidate, ref);
+  }
   return uses.names.has(name) || rustGlobCovers(uses, candidate, ref);
 }
 
@@ -5217,6 +5323,8 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   C_STATIC_MEMO.delete(context);
   RUST_TRAIT_IMPL_MEMO.delete(context);
   RUST_USES.delete(context);
+  RUST_CRATES.delete(context);
+  RUST_DEPENDENCIES.delete(context);
   LEXICAL_SCOPE_MEMO.delete(context);
   KOTLIN_LAMBDA_RECEIVERS.delete(context);
   SCALA_IMPORTED_SUPERS.delete(context);

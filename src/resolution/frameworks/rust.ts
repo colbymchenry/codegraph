@@ -8,6 +8,17 @@ import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 import { getCargoWorkspaceCrateMap } from './cargo-workspace';
+import { isRustNameInScope } from '../name-matcher';
+
+/**
+ * Whether the item a name heuristic found is one the reference can name:
+ * `Context<'_>` under `use std::task::{Context, Poll}` is std's, not tokio's
+ * `runtime::context::Context` (642 of them).
+ */
+function inRustScope(id: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const node = context.getNodeById?.(id);
+  return !node || isRustNameInScope(node, ref, context);
+}
 
 const cargoWorkspaceMapCache = new WeakMap<ResolutionContext, Map<string, string>>();
 
@@ -32,7 +43,7 @@ export const rustResolver: FrameworkResolver = {
     // Pattern 1: Handler references
     if (ref.referenceName.endsWith('_handler') || ref.referenceName.startsWith('handle_')) {
       const result = resolveByNameAndKind(ref.referenceName, FUNCTION_KINDS, HANDLER_DIRS, context);
-      if (result) {
+      if (result && inRustScope(result, ref, context)) {
         return {
           original: ref,
           targetNodeId: result,
@@ -45,7 +56,7 @@ export const rustResolver: FrameworkResolver = {
     // Pattern 2: Service/Repository trait implementations
     if (ref.referenceName.endsWith('Service') || ref.referenceName.endsWith('Repository')) {
       const result = resolveByNameAndKind(ref.referenceName, SERVICE_KINDS, SERVICE_DIRS, context);
-      if (result) {
+      if (result && inRustScope(result, ref, context)) {
         return {
           original: ref,
           targetNodeId: result,
@@ -58,7 +69,7 @@ export const rustResolver: FrameworkResolver = {
     // Pattern 3: Struct references (PascalCase)
     if (/^[A-Z][a-zA-Z]+$/.test(ref.referenceName)) {
       const result = resolveByNameAndKind(ref.referenceName, STRUCT_KINDS, MODEL_DIRS, context);
-      if (result) {
+      if (result && inRustScope(result, ref, context)) {
         return {
           original: ref,
           targetNodeId: result,
