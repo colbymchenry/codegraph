@@ -50,6 +50,30 @@ const RESERVED_CALLS = new Set([
 ]);
 
 /**
+ * The calls an inline handler's body makes, each once, framework noise aside.
+ * A member call keeps its receiver (`userService.find`, `c.text`) so it
+ * resolves as one: bare, hono's `c.text('…')` matched its client's
+ * `ClientResponse.text` 423 times. A member of an expression (`a.b().c(`)
+ * names nothing this can follow.
+ */
+function handlerCallNames(body: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const callRe = /((?:[A-Za-z_$][\w$]*\s*\??\.\s*)*)([A-Za-z_$][\w$]*)\s*\(/g;
+  let cm: RegExpExecArray | null;
+  while ((cm = callRe.exec(body)) !== null) {
+    const method = cm[2]!;
+    const receiver = cm[1]!.replace(/\s|\?/g, '').replace(/\.$/, '');
+    if (!receiver && /\.\s*$/.test(body.slice(0, cm.index))) continue;
+    const name = receiver ? `${receiver}.${method}` : method;
+    if (seen.has(name) || RESERVED_CALLS.has(method)) continue;
+    seen.add(name);
+    out.push(name);
+  }
+  return out;
+}
+
+/**
  * The replies an inline handler makes — `res.status(404).json({…})`,
  * `res.json(user)`, `reply.send(…)`, `ctx.body = …` aside — as references the
  * Steps view's effect table reads at their own line and column. The body's
@@ -205,13 +229,7 @@ export const expressResolver: FrameworkResolver = {
             bodyStart += braceAt + 1;
           }
         }
-        const callRe = /\b([A-Za-z_$][\w$]*)\s*\(/g;
-        const seen = new Set<string>();
-        let cm: RegExpExecArray | null;
-        while ((cm = callRe.exec(body)) !== null) {
-          const name = cm[1]!;
-          if (seen.has(name) || RESERVED_CALLS.has(name)) continue;
-          seen.add(name);
+        for (const name of handlerCallNames(body)) {
           references.push({
             fromNodeId: routeNode.id,
             referenceName: name,
@@ -272,13 +290,7 @@ export const expressResolver: FrameworkResolver = {
         };
         nodes.push(routeNode);
         if (args.includes('=>')) {
-          const callRe = /\b([A-Za-z_$][\w$]*)\s*\(/g;
-          const seen = new Set<string>();
-          let cm: RegExpExecArray | null;
-          while ((cm = callRe.exec(args)) !== null) {
-            const name = cm[1]!;
-            if (seen.has(name) || RESERVED_CALLS.has(name)) continue;
-            seen.add(name);
+          for (const name of handlerCallNames(args)) {
             references.push({ fromNodeId: routeNode.id, referenceName: name, referenceKind: 'calls', line, column: 0, filePath, language: lang });
           }
           references.push(...replyRefs(safe, openParen + 1, closeParen, routeNode.id, filePath, lang));

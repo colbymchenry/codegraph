@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Calls inside an inline route handler now keep their receivers, so they resolve like any other method call. Before, Hono's `app.get('/', (c) => c.text('Hello'))` linked the route to the one other `text` method in the project, its client's `ClientResponse.text`; that happened in over 400 routes. A call like `userService.lookup(id)` reaches the service it names.
 - A Scala chained call like `xs.map { … }` no longer lands on an object that happens to be named `map`, as with cats' `alleycats.std.map` and its `syntax`/`instances` objects. A type or object in a chain is only matched when the receiver names what holds it, as in `sttp.client4.Response(…)`.
 - A Python call to a name the function or module binds itself now means that local value, not a same-named function in another file. In Django REST Framework's tests, `view = SomeView.as_view()` followed by `view(request)` had pointed at one test file's `def view`. The same goes for a parameter or a `for`/`with … as` target. A pytest fixture a test takes as a parameter is still the fixture.
 - A method call on a variable is no longer guessed to be a test double's method just because the double has the only method of that name. That covered classes named `Mocked…`, `Fake…`, `Stub…` or `Dummy…`: django-allauth's `resp.json()` calls had all gone to its `MockedResponse`. A test that names the double still calls it.
