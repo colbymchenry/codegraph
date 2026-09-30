@@ -208,14 +208,22 @@ export const nestjsResolver: FrameworkResolver = {
   postExtract(context: ResolutionContext): Node[] {
     const moduleToPrefix = new Map<string, string>();
     const controllerToModule = new Map<string, string>();
+    const bootstraps: NestBootstrap[] = [];
 
     for (const filePath of context.getAllFiles()) {
-      if (!/\.module\.(m?[jt]s|cjs)$/.test(filePath)) continue;
+      if (!/\.(m?[jt]s|cjs)$/.test(filePath)) continue;
+      const isModule = /\.module\.(m?[jt]s|cjs)$/.test(filePath);
+      if (!isModule && !(context.fileContains?.(filePath, 'NestFactory') ?? true)) continue;
       const content = context.readFile(filePath);
       if (!content) continue;
       const safe = stripCommentsForRegex(content, detectLanguage(filePath));
-      collectRouterModuleRegistrations(safe, moduleToPrefix);
-      collectModuleControllers(safe, controllerToModule);
+      if (isModule) {
+        collectRouterModuleRegistrations(safe, moduleToPrefix);
+        collectModuleControllers(safe, controllerToModule);
+      }
+      // Every app counts, even one that adds nothing: its routes must not
+      // borrow another app's prefix.
+      if (/\bNestFactory\s*\.\s*create/.test(safe)) bootstraps.push({ root: appRootOf(filePath), config: readBootstrap(safe) });
     }
 
     const controllerToPrefix = new Map<string, string>();
@@ -228,34 +236,242 @@ export const nestjsResolver: FrameworkResolver = {
       }
     }
 
-    if (controllerToPrefix.size === 0) return [];
+    const adds = bootstraps.some((b) => b.config.prefix !== '' || b.config.uri);
+    if (controllerToPrefix.size === 0 && !adds) return [];
 
-    const updates: Node[] = [];
+    // Route → what the app adds to it. A RouterModule prefix binds through the
+    // controller class's line range; the bootstrap's prefix and versioning
+    // only to a route its source shows is in a `@Controller` — an Express
+    // route has the same qualified-name shape.
+    const plan = new Map<string, { route: Node; modulePrefix: string; config: NestAppConfig | null; version: string | null | undefined }>();
     for (const [controllerName, prefix] of controllerToPrefix) {
-      const classes = context
-        .getNodesByName(controllerName)
-        .filter((n) => n.kind === 'class');
-      for (const cls of classes) {
-        const routes = context
-          .getNodesInFile(cls.filePath)
-          .filter((n) => n.kind === 'route');
+      for (const cls of context.getNodesByName(controllerName).filter((n) => n.kind === 'class')) {
+        for (const route of context.getNodesInFile(cls.filePath)) {
+          if (route.kind !== 'route' || route.startLine < cls.startLine || route.startLine > cls.endLine) continue;
+          plan.set(route.id, { route, modulePrefix: prefix, config: null, version: undefined });
+        }
+      }
+    }
+    if (adds) {
+      for (const filePath of context.getAllFiles()) {
+        if (!/\.(m?[jt]s|cjs)$/.test(filePath)) continue;
+        if (!(context.fileContains?.(filePath, '@Controller') ?? true)) continue;
+        const config = bootstrapFor(bootstraps, filePath);
+        if (!config || (config.prefix === '' && !config.uri)) continue;
+        const routes = context.getNodesInFile(filePath).filter((n) => n.kind === 'route' && HTTP_ROUTE_QN.test(n.qualifiedName));
+        if (routes.length === 0) continue;
+        const content = context.readFile(filePath);
+        if (!content) continue;
+        const safe = stripCommentsForRegex(content, detectLanguage(filePath));
+        const scopes = buildClassScopes(safe);
+        const hits = findDecorators(safe, HTTP_METHODS);
         for (const route of routes) {
-          // Multiple controllers can live in one file (covered by the
-          // existing "attributes methods to the right controller" test);
-          // each route must be associated with the controller whose line
-          // range contains it.
-          if (route.startLine < cls.startLine || route.startLine > cls.endLine) {
-            continue;
-          }
-          const updated = applyModulePrefix(route, prefix);
-          if (updated && updated.name !== route.name) updates.push(updated);
+          const hit = hits.find((h) => lineAt(safe, h.index) === route.startLine);
+          const scope = hit ? scopeFor(scopes, hit.index) : null;
+          if (!hit || !scope || scope.kind !== 'controller') continue;
+          const planned = plan.get(route.id);
+          plan.set(route.id, { route, modulePrefix: planned?.modulePrefix ?? '', config, version: routeVersion(safe, hit, scope) });
         }
       }
     }
 
+    const updates: Node[] = [];
+    for (const { route, modulePrefix, config, version } of plan.values()) {
+      const updated = applyAppConfig(route, modulePrefix, config, version);
+      if (updated && updated.name !== route.name) updates.push(updated);
+    }
     return updates;
   },
 };
+
+// ---------------------------------------------------------------------------
+// The app's bootstrap: global prefix and URI versioning
+// ---------------------------------------------------------------------------
+
+/** A route's in-file shape in its qualified name: `file::GET:/users`. */
+const HTTP_ROUTE_QN = /::(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|ALL):/;
+
+/** The version marker for `VERSION_NEUTRAL`: served without a version segment. */
+const NEUTRAL = '\u0000neutral';
+
+interface NestAppConfig {
+  /** `setGlobalPrefix('api')` — '' when none, or not a literal. */
+  prefix: string;
+  /** Paths the prefix skips: `exclude: ['health', { path: 'metrics', method }]`, without a leading `/`. */
+  excludes: string[];
+  /** URI versioning is on (`enableVersioning({ type: VersioningType.URI })`, the default type). */
+  uri: boolean;
+  /** `defaultVersion: '1'` — the version a route without its own is served at; null for none. */
+  defaultVersion: string | null;
+  /** The segment's prefix: `v` unless `prefix:` says otherwise (`false` is none). */
+  versionPrefix: string;
+}
+
+interface NestBootstrap {
+  root: string;
+  config: NestAppConfig;
+}
+
+/** The app a file belongs to: the directory above its `src/` (`apps/api/`), else the repository. */
+function appRootOf(filePath: string): string {
+  const m = /^((?:[^/]+\/)*?)src\//.exec(filePath);
+  return m ? m[1]! : '';
+}
+
+/**
+ * The config of the app that holds `filePath`: the bootstrap with the longest
+ * root above it, else — for a file outside every app, like an Nx `libs/`
+ * controller — the app, when there is only one.
+ */
+function bootstrapFor(bootstraps: readonly NestBootstrap[], filePath: string): NestAppConfig | null {
+  let root: string | null = null;
+  for (const b of bootstraps) {
+    if (filePath.startsWith(b.root) && (root === null || b.root.length > root.length)) root = b.root;
+  }
+  if (root === null) {
+    if (new Set(bootstraps.map((b) => b.root)).size !== 1) return null;
+    root = bootstraps[0]!.root;
+  }
+  // A seed or migration script creates the same app without serving it: the
+  // bootstrap that configures the app is the one that serves it.
+  const here = bootstraps.filter((b) => b.root === root);
+  return (here.find((b) => b.config.prefix !== '' || b.config.uri) ?? here[0])?.config ?? null;
+}
+
+/** One version value: `'2'`, `['1', '2']` (the first), `VERSION_NEUTRAL`. */
+function versionValue(text: string): string | null {
+  const t = text.trim();
+  if (/^VERSION_NEUTRAL\b/.test(t)) return NEUTRAL;
+  const lit = /^\[?\s*(['"`])([^'"`]*)\1/.exec(t);
+  return lit ? lit[2]! : null;
+}
+
+/** `setGlobalPrefix` and `enableVersioning` from the file that calls `NestFactory.create`. */
+function readBootstrap(safe: string): NestAppConfig {
+  const config: NestAppConfig = { prefix: '', excludes: [], uri: false, defaultVersion: null, versionPrefix: 'v' };
+  const prefixCall = /\.setGlobalPrefix\s*\(/.exec(safe);
+  if (prefixCall) {
+    const open = prefixCall.index + prefixCall[0].length - 1;
+    const close = matchingClose(safe, open);
+    const args = close > open ? safe.slice(open + 1, close) : '';
+    const lit = /^\s*(['"`])([^'"`$]*)\1/.exec(args);
+    if (lit) {
+      config.prefix = lit[2]!.replace(/^\/+|\/+$/g, '');
+      const ex = /\bexclude\s*:\s*\[/.exec(args);
+      if (ex) {
+        const exOpen = ex.index + ex[0].length - 1;
+        const exClose = matchingClose(args, exOpen);
+        const list = exClose > exOpen ? args.slice(exOpen + 1, exClose) : '';
+        for (const item of splitTopLevel(list)) {
+          const text = item.trim();
+          const path = /^(['"])([^'"]*)\1$/.exec(text)?.[2] ?? /\bpath\s*:\s*(['"])([^'"]*)\1/.exec(text)?.[2];
+          if (path !== undefined) config.excludes.push(path.replace(/^\/+/, ''));
+        }
+      }
+    }
+  }
+  const versioning = /\.enableVersioning\s*\(/.exec(safe);
+  if (versioning) {
+    const open = versioning.index + versioning[0].length - 1;
+    const close = matchingClose(safe, open);
+    const args = close > open ? safe.slice(open + 1, close) : '';
+    const type = /\btype\s*:\s*VersioningType\s*\.\s*(\w+)/.exec(args)?.[1];
+    config.uri = type === undefined || type === 'URI';
+    const def = /\bdefaultVersion\s*:\s*/.exec(args);
+    if (def) config.defaultVersion = versionValue(args.slice(def.index + def[0].length));
+    const pre = /\bprefix\s*:\s*(false|(['"`])([^'"`]*)\2)/.exec(args);
+    if (pre) config.versionPrefix = pre[1] === 'false' ? '' : pre[3]!;
+  }
+  return config;
+}
+
+/** A route excluded from the global prefix: `health`, `health/(.*)`, `health{/*wildcard}`, `health/*`. */
+function isExcluded(path: string, excludes: readonly string[]): boolean {
+  const route = path.replace(/^\/+/, '');
+  for (const pattern of excludes) {
+    const wild = /(?:\{\/?\*\w*\}|\/?\(\.\*\)|\/?\*\w*)$/.exec(pattern);
+    const base = wild ? pattern.slice(0, wild.index).replace(/\/+$/, '') : pattern.replace(/\/+$/, '');
+    if (route === base || (wild && route.startsWith(`${base}/`))) return true;
+  }
+  return false;
+}
+
+/**
+ * The version a route is served at: `@Version(…)` among its own decorators,
+ * else its controller's (`@Version(…)` on the class, `@Controller({ version })`).
+ * Undefined when neither says.
+ */
+function routeVersion(safe: string, hit: DecoratorHit, scope: ClassScope): string | null | undefined {
+  // The method's decorators: back through the ones stacked above this one…
+  const from = decoratorChainStart(safe, hit.index, scope.start);
+  // …and on to the handler itself — past the decorators between (`@UseGuards(…)`, `@Version('2')`).
+  const handler = methodNameAfter(safe, hit.end);
+  const at = handler ? new RegExp(String.raw`(?<![@\w$])${handler.replace(/\$/g, '\\$')}\s*\(`).exec(safe.slice(hit.end)) : null;
+  const to = at ? hit.end + at.index : hit.end;
+  const own = /@Version\s*\(([^)]*)\)/.exec(safe.slice(from, to));
+  if (own) return versionValue(own[1]!);
+  // The class's decorators, on either side of `@Controller`.
+  const cls = /\bclass\b/g;
+  cls.lastIndex = scope.start;
+  const head = safe.slice(decoratorChainStart(safe, scope.start, 0), cls.exec(safe)?.index ?? scope.start + 400);
+  const onClass = /@Version\s*\(([^)]*)\)/.exec(head);
+  if (onClass) return versionValue(onClass[1]!);
+  const inController = /@Controller\s*\(\s*\{[^)]*\bversion\s*:\s*([^,}]+)/.exec(head);
+  if (inController) return versionValue(inController[1]!);
+  return undefined;
+}
+
+/**
+ * Where the stack of decorators ending at `at` begins: back over each
+ * `@Name(…)` / `@Name` above it. A decorator's arguments may hold an object
+ * (`@ApiResponse({ status: 200 })`), so this steps over balanced parentheses
+ * rather than stopping at the first brace.
+ */
+function decoratorChainStart(safe: string, at: number, floor: number): number {
+  let start = at;
+  for (;;) {
+    let i = start;
+    while (i > floor && /\s/.test(safe[i - 1]!)) i--;
+    if (safe[i - 1] === ')') {
+      let depth = 0;
+      let j = i - 1;
+      for (; j >= floor; j--) {
+        if (safe[j] === ')') depth++;
+        else if (safe[j] === '(' && --depth === 0) break;
+      }
+      if (j < floor) return start;
+      i = j;
+    }
+    let name = i;
+    while (name > floor && /[\w$.]/.test(safe[name - 1]!)) name--;
+    if (name === i || safe[name - 1] !== '@') return start;
+    start = name - 1;
+  }
+}
+
+/**
+ * A route's name with everything the app adds to it, in NestJS's order:
+ * `/{globalPrefix}/{v}{version}/{RouterModule prefix}/{controller}/{method}`.
+ * Recomputed from the in-file `method:path` in the qualified name, so the pass
+ * is idempotent.
+ */
+function applyAppConfig(route: Node, modulePrefix: string, config: NestAppConfig | null, version: string | null | undefined): Node | null {
+  const sep = route.qualifiedName.indexOf('::');
+  if (sep < 0) return null;
+  const tail = route.qualifiedName.slice(sep + 2);
+  const colon = tail.indexOf(':');
+  if (colon < 0) return null;
+  const method = tail.slice(0, colon);
+  const inner = joinHttpPath(modulePrefix, tail.slice(colon + 1));
+  let path = inner;
+  if (config) {
+    const v = version === undefined ? config.defaultVersion : version;
+    const versionSeg = config.uri && v !== null && v !== NEUTRAL ? `${config.versionPrefix}${v}` : '';
+    const prefix = config.prefix && !isExcluded(inner, config.excludes) ? config.prefix : '';
+    path = joinHttpPath(joinHttpPath(prefix, versionSeg), inner);
+  }
+  return { ...route, name: `${method} ${path}`, updatedAt: Date.now() };
+}
 
 // ---------------------------------------------------------------------------
 // Provider resolution conventions
@@ -646,28 +862,35 @@ function classNameAfter(safe: string, start: number): string | null {
   return m ? m[1]! : null;
 }
 
-/**
- * Recompute a route node's `name` by prepending `prefix` to the *original*
- * in-file path. The original is recovered from `qualifiedName`, which the
- * per-file extract emits as `${filePath}::${method}:${path}` and which this
- * pass deliberately never mutates — that's what keeps the update idempotent.
- */
-function applyModulePrefix(route: Node, prefix: string): Node | null {
-  const sep = '::';
-  const idx = route.qualifiedName.indexOf(sep);
-  if (idx < 0) return null;
-  const tail = route.qualifiedName.slice(idx + sep.length);
-  const colon = tail.indexOf(':');
-  if (colon < 0) return null;
-  const method = tail.slice(0, colon);
-  const original = tail.slice(colon + 1);
-  const newName = `${method} ${joinHttpPath(prefix, original)}`;
-  return { ...route, name: newName, updatedAt: Date.now() };
-}
 
 // ---------------------------------------------------------------------------
 // Small string utilities (object/array literal splitters)
 // ---------------------------------------------------------------------------
+
+/** A list's comma-separated items at depth 0, strings and brackets stepped over. */
+function splitTopLevel(list: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let inStr: string | null = null;
+  let start = 0;
+  for (let i = 0; i < list.length; i++) {
+    const ch = list[i]!;
+    if (inStr) {
+      if (ch === '\\') { i++; continue; }
+      if (ch === inStr) inStr = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') { inStr = ch; continue; }
+    if (ch === '[' || ch === '{' || ch === '(') depth++;
+    else if (ch === ']' || ch === '}' || ch === ')') depth--;
+    else if (ch === ',' && depth === 0) {
+      out.push(list.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(list.slice(start));
+  return out.filter((item) => item.trim().length > 0);
+}
 
 /** Return the index of the bracket that closes the one at `open`, or -1. */
 function matchingClose(s: string, open: number): number {
