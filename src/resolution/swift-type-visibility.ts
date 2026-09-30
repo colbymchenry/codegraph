@@ -39,13 +39,14 @@ interface Memo {
   conformances: Map<string, string[]>;
   clauses: Map<string, string[]>;
   inherited: Map<string, ReadonlySet<string>>;
+  owners: Map<string, string | null>;
 }
 const memos = new WeakMap<ResolutionContext, Memo>();
 
 function memoFor(context: ResolutionContext): Memo {
   let memo = memos.get(context);
   if (!memo) {
-    memo = { extension: new Map(), declaration: new Map(), conformances: new Map(), clauses: new Map(), inherited: new Map() };
+    memo = { extension: new Map(), declaration: new Map(), conformances: new Map(), clauses: new Map(), inherited: new Map(), owners: new Map() };
     memos.set(context, memo);
   }
   return memo;
@@ -339,4 +340,121 @@ export function gateSwiftTypeTarget(result: ResolvedRef | null, ref: UnresolvedR
   const declared = declarationFor(target.name, written, ref, from, context);
   if (!declared) return null;
   return declared.id === result.targetNodeId ? result : { ...result, targetNodeId: declared.id };
+}
+
+/**
+ * A call through a type path, `API.PackageController.GetRoute.query` — at
+ * least two capitalized segments before the member (the extractor keeps the
+ * path only for those; see SWIFT_TYPE_PATH_RECEIVER in tree-sitter.ts).
+ */
+export const SWIFT_TYPE_PATH_CALL = /^(?!Self\.)[A-Z]\w*(?:\.[A-Z]\w*)+\.[A-Za-z_]\w*$/;
+
+/** What a type-path call can name: a method, or a case with associated values (`Gitlab.Error.requestFailed(status:)`). */
+const PATH_MEMBER_KINDS: ReadonlySet<Node['kind']> = new Set<Node['kind']>(['method', 'function', 'enum_member']);
+
+/**
+ * `API.PackageController.GetRoute.query(on:)` lands on the `query` of the
+ * type the path names, and `API.PackageController.Model(name:)` on that
+ * nested type — never on the member's name alone: in a Vapor app every
+ * route's type has a `query`. A path the call's own namespace lets it
+ * shorten (`PackageController.GetRoute` inside `extension API`) or a module
+ * qualifier (`Vapor.HTTPStatus`) still fits. No type on the path, or two,
+ * leaves the call unresolved.
+ */
+export function resolveSwiftTypePathCall(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const name = ref.referenceName;
+  const dot = name.lastIndexOf('.');
+  const member = name.slice(dot + 1);
+  const path = name.slice(0, dot).split('.').join('::');
+  const onPath = (kinds: ReadonlySet<Node['kind']>): Node[] => {
+    const exact: Node[] = [];
+    const shortened: Node[] = [];
+    for (const n of context.getNodesByName(member)) {
+      if (n.language !== 'swift' || !kinds.has(n.kind)) continue;
+      if (TYPE_KINDS.has(n.kind) && isSwiftExtension(n, context)) continue;
+      const owner = ownerPath(n, context);
+      if (owner === null) continue;
+      if (owner === path) exact.push(n);
+      else if (owner.endsWith(`::${path}`) || moduleQualified(owner, path, context)) shortened.push(n);
+    }
+    return exact.length > 0 ? exact : shortened;
+  };
+  // `API.PackageController.Model(name:)` constructs a nested type.
+  let fit = /^[A-Z]/.test(member) ? onPath(TYPE_KINDS) : [];
+  if (fit.length === 0) fit = onPath(PATH_MEMBER_KINDS);
+  // The Composable Architecture's `@Reducer enum Path { case detail(Detail) }`
+  // generates `Path.State` and `Path.Action` with the same cases, so
+  // `Path.State.detail(…)` constructs the case written in `Path`.
+  if (fit.length === 0) {
+    const reducer = /^(.+)::(?:State|Action)$/.exec(path)?.[1];
+    if (reducer) {
+      fit = context.getNodesByName(member).filter((n) => {
+        if (n.language !== 'swift' || n.kind !== 'enum_member') return false;
+        const owner = ownerPath(n, context);
+        return owner !== null && (owner === reducer || owner.endsWith(`::${reducer}`)) && isReducerEnum(n, context);
+      });
+    }
+  }
+  if (fit.length === 0 || new Set(fit.map((n) => ownerPath(n, context))).size > 1) return null;
+  // Of one type's overloads, the first declared.
+  const target = fit.reduce((a, b) => (a.filePath < b.filePath || (a.filePath === b.filePath && a.startLine <= b.startLine) ? a : b));
+  return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'qualified-name' };
+}
+
+/** Is this case declared in a `@Reducer enum`? */
+function isReducerEnum(member: Node, context: ResolutionContext): boolean {
+  const owner = context
+    .getNodesInFile(member.filePath)
+    .filter((t) => t.kind === 'enum' && t.startLine <= member.startLine && t.endLine >= member.endLine)
+    .reduce<Node | null>((inner, t) => (!inner || t.startLine >= inner.startLine ? t : inner), null);
+  if (!owner) return false;
+  const lines = linesOf(owner.filePath, context) ?? [];
+  // The node starts at its attributes; `@Reducer` may also sit on the line above.
+  return /@Reducer\b/.test(lines.slice(Math.max(0, owner.startLine - 2), owner.startLine + 1).join(' '));
+}
+
+/** `Vapor::HTTPStatus` for a type `HTTPStatus`: a qualifier that names no project type is a module. */
+function moduleQualified(owner: string, path: string, context: ResolutionContext): boolean {
+  if (!path.endsWith(`::${owner}`)) return false;
+  const head = path.slice(0, path.length - owner.length - 2);
+  return !head.includes('::') && !context.getNodesByName(head).some((n) => n.language === 'swift' && TYPE_KINDS.has(n.kind));
+}
+
+/**
+ * The full path of the type a member is declared on. Its qualified name
+ * starts at the outermost declaration in its file, and an extension is named
+ * by its last segment — the members of `extension API.PackageController {
+ * enum GetRoute { … } }` are `PackageController::GetRoute::…` — so the
+ * outermost extension's written path is read back from its line. Null for a
+ * top-level function.
+ */
+function ownerPath(member: Node, context: ResolutionContext): string | null {
+  const memo = memoFor(context).owners;
+  const hit = memo.get(member.id);
+  if (hit !== undefined) return hit;
+  const cut = member.qualifiedName.lastIndexOf('::');
+  let path: string | null = cut < 0 ? null : member.qualifiedName.slice(0, cut);
+  if (path !== null) {
+    const first = path.split('::')[0]!;
+    const outer = context
+      .getNodesInFile(member.filePath)
+      .filter((t) => t.name === first && TYPE_KINDS.has(t.kind) && t.startLine <= member.startLine && t.endLine >= member.endLine)
+      .reduce<Node | null>((out, t) => (!out || t.startLine < out.startLine ? t : out), null);
+    const extended = outer ? extendedPath(outer, context) : null;
+    if (extended) path = extended + path.slice(first.length);
+  }
+  memo.set(member.id, path);
+  return path;
+}
+
+/** `extension API.PackageController {` → `API::PackageController`; null for anything but an extension of a nested type. */
+function extendedPath(node: Node, context: ResolutionContext): string | null {
+  if (!isSwiftExtension(node, context)) return null;
+  const lines = linesOf(node.filePath, context);
+  if (!lines) return null;
+  const head = [(lines[node.startLine - 1] ?? '').slice(node.startColumn), ...lines.slice(node.startLine, node.startLine + 3)]
+    .join(' ')
+    .replace(/"(?:[^"\\\n]|\\.)*"/g, '""');
+  const written = /\bextension\s+((?:[A-Za-z_]\w*\s*\.\s*)+[A-Za-z_]\w*)/.exec(head)?.[1];
+  return written ? written.replace(/\s+/g, '').split('.').join('::') : null;
 }

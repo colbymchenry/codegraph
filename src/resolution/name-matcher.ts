@@ -9,6 +9,7 @@ import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, isSupertypeTarget, CPP_DEFINE_SIGNATURE, isInheritanceRef, isImportableKind } from './types';
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
+import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
  * score. A name defined more times than this is "ubiquitous" — a method/symbol
@@ -4382,6 +4383,13 @@ function matchReferenceInner(
   }
 
   if (isUnresolvedJsMemberCall(ref)) return null;
+
+  // A Swift call through a type path (`API.PackageController.GetRoute.query`)
+  // resolves on the type the path names, or not at all: the strategies below
+  // would bind it by the member's name alone.
+  if (ref.language === 'swift' && ref.referenceKind === 'calls' && SWIFT_TYPE_PATH_CALL.test(ref.referenceName)) {
+    return nmTimed('swiftTypePath', ref, () => resolveSwiftTypePathCall(ref, context));
+  }
 
   // Try strategies in order of confidence
   let result: ResolvedRef | null;
