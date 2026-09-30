@@ -2646,6 +2646,15 @@ function isScalaMemberInScope(n: Node, ref: UnresolvedRef, context: ResolutionCo
     // A later link of a chain: a member of what the receiver is named after,
     // never a package object's function — unless it is an `extension` method.
     if (n.filePath === ref.filePath) return true;
+    // A type or object as a chain link (`pkg.Obj(…)`) is named by what holds it:
+    // cats' `arbitrary[Int].map { … }` is no call of alleycats' `object map`.
+    if (SCALA_TYPE_KINDS.has(n.kind)) {
+      // Scala qualified names leave the package out: a top-level type's holder is its file's package.
+      const outer = n.qualifiedName.split('::').slice(-2, -1)[0];
+      const holder = outer !== undefined ? outer.split('.').pop()!
+        : [...(context.readFile(n.filePath) ?? '').matchAll(/^\s*package\s+([\w.]+)\s*$/gm)].pop()?.[1]?.split('.').pop() ?? '';
+      return holder !== '' && scalaReceiverName(before).split('.').pop() === holder;
+    }
     if (!SCALA_MEMBER_KINDS.has(n.kind)) return n.kind !== 'function' || isScalaExtensionMethod(n, context);
     const receiver = scalaReceiverName(before);
     return receiver !== '' && sharesReceiverWord(receiver, n);
