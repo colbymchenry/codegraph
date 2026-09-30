@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Vapor routes whose handler is a trailing closure (`app.get("hello") { req in … }`), WebSocket routes (`app.webSocket("chat") { … }`) and `routes.on(.POST, "x", use: handler)` registrations are now found. Only routes with a `use:` handler were read before: the Swift Package Index server went from 13 routes to 34, and a WebSocket-only chat server from none to one.
 - Play projects kept in subdirectories are recognized, so each one's `conf/routes` is read. A repository with no Play build at its root, like playframework's samples, went from no routes to over 130.
 - Rails routes are now read with their nesting: `namespace` and `scope` add their path and controller module, nested `resources` sit under their parent's `:id`, and `member` / `collection` blocks add their actions. A namespaced route now links to its own module's controller. Routes in a Rails engine's `config/routes.rb` are found too: solidus went from no routes to over 600, and mastodon's route-to-action links nearly tripled.
 - Flask routes registered with `add_url_rule(…)` are now found and linked to their view function or class-based view. So are routes registered through a project's own helper that passes a list of paths and a `view_func=`. flaskbb, which registers every view that way, went from no routes to over 100.

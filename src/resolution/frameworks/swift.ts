@@ -330,6 +330,53 @@ export const vaporResolver: FrameworkResolver = {
       }
     }
 
+    // `routes.on(.POST, "x", use: handler)` names its method as the first argument.
+    // Arguments may hold one level of parentheses (`body: .collect(maxSize: "1mb")`);
+    // only unlabeled string arguments are path segments.
+    const onRegex = /\b(\w+)\.on\s*\(\s*\.([A-Z]+)\s*,\s*((?:(?:[^,()]|\([^()]*\))+,)*\s*)use:\s*([A-Za-z_][\w.]*)/g;
+    const pathArgs = (argText: string) => argText.split(',').filter((a) => /^\s*"[^"]*"\s*$/.test(a)).join(',');
+    while ((match = onRegex.exec(safe)) !== null) {
+      const [, receiver, method, segsStr, handlerExpr] = match;
+      const line = safe.slice(0, match.index).split('\n').length;
+      const routePath = (groupPrefix.get(receiver!) ?? '') + segJoin('', pathArgs(segsStr!)) || '/';
+      const id = `route:${filePath}:${line}:${method}:${routePath}`;
+      nodes.push({
+        id, kind: 'route', name: `${method} ${routePath}`, qualifiedName: `${filePath}::route:${routePath}`,
+        filePath, startLine: line, endLine: line, startColumn: 0, endColumn: match[0].length, language: 'swift', updatedAt: now,
+      });
+      const handlerName = vaporHandlerRef(handlerExpr!, receiverTypes);
+      if (handlerName) references.push({ fromNodeId: id, referenceName: handlerName, referenceKind: 'references', line, column: 0, filePath, language: 'swift' });
+    }
+
+    // A route whose handler is a trailing closure — `app.get("hello") { req in … }`,
+    // `app.webSocket("chat") { req, ws in … }`, `routes.on(.GET, "x") { … }`. It has
+    // no handler symbol; the closure's calls belong to the function registering it.
+    // An HTTP client's `req.client.get("https://…") { … }` is not a route.
+    const closureRegex = /\b(\w+)\.(get|post|put|patch|delete|head|options|webSocket|on)\s*\(([^()]*)\)\s*\{/g;
+    while ((match = closureRegex.exec(safe)) !== null) {
+      const [, receiver, verb, args] = match;
+      if (/\buse:/.test(args!) || receiver === 'client' || /^\s*"https?:/.test(args!)) continue;
+      // A route registration is a statement: `if let v = req.parameters.get("x") {`
+      // opens the `if` body, not a trailing closure.
+      const lineStart = safe.lastIndexOf('\n', match.index) + 1;
+      if (!/^\s*(?:(?:try|await)\s+)*$/.test(safe.slice(lineStart, match.index))) continue;
+      let method = verb === 'webSocket' ? 'WS' : verb!.toUpperCase();
+      let segs = args!;
+      if (verb === 'on') {
+        const on = /^\s*\.([A-Z]+)\s*,?(.*)$/s.exec(args!);
+        if (!on) continue;
+        method = on[1]!;
+        segs = on[2]!;
+      }
+      const line = safe.slice(0, match.index).split('\n').length;
+      const routePath = (groupPrefix.get(receiver!) ?? '') + segJoin('', segs) || '/';
+      nodes.push({
+        id: `route:${filePath}:${line}:${method}:${routePath}`, kind: 'route', name: `${method} ${routePath}`,
+        qualifiedName: `${filePath}::route:${routePath}`, filePath, startLine: line, endLine: line,
+        startColumn: 0, endColumn: match[0].length, language: 'swift', updatedAt: now,
+      });
+    }
+
     return { nodes, references };
   },
 };
