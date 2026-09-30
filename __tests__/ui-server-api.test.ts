@@ -1047,7 +1047,11 @@ export default app;
 
 /**
  * The acceptance bar from the issue, against the engine's OWN index rather than
- * a fixture: `LRUCache.get` in `src/resolution/lru-cache.ts`, 500+ callers.
+ * a fixture: `LRUCache.get` in `src/resolution/lru-cache.ts`, a hub with
+ * hundreds of callers — past the 300-row cap, which is what this checks. (It
+ * had 500+ when the bar was set; sharper resolution has since taken away
+ * `get` calls on maps and caches that were never LRUCache's, so the count is
+ * held to the cap, not to that number.)
  *
  * `.codegraph/` is gitignored, so this only runs on a machine that has indexed
  * this repository. The fixture test above covers the same properties in CI; this
@@ -1096,7 +1100,7 @@ describe.runIf(CodeGraph.isInitialized(path.resolve(__dirname, '..')))(
       expect(res.status).toBe(200);
       const body = JSON.parse(res.body);
 
-      expect(body.counts.fanIn).toBeGreaterThanOrEqual(500);
+      expect(body.counts.fanIn).toBeGreaterThan(300);
       expect(body.counts.hub).toBe(true);
       // Grouped by calling symbol, so the row count is the distinct-caller
       // count, never the edge count.
