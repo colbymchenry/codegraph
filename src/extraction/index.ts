@@ -801,6 +801,8 @@ export function preloadLanguagesForFiles(
   overrides?: Record<string, Language>
 ): Language[] {
   const languages = [...new Set(files.map((f) => detectLanguage(f, undefined, overrides)))];
+  // A Flow-typed `.js` is read with the TSX grammar (see detectLanguage).
+  if ((languages.includes('javascript') || languages.includes('jsx')) && !languages.includes('tsx')) languages.push('tsx');
   if (languages.includes('c')) {
     for (const ambiguous of ['cpp', 'objc'] as const) {
       if (!languages.includes(ambiguous)) languages.push(ambiguous);

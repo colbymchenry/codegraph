@@ -548,6 +548,11 @@ export function detectLanguage(filePath: string, source?: string, overrides?: Re
   if (isErlangAppFile(filePath)) return 'erlang';
   const lang = (overrides && overrides[ext]) || EXTENSION_MAP[ext] || 'unknown';
 
+  // A Flow-typed `.js` (`// @flow` in its leading comments) parses as TSX:
+  // the JavaScript grammar can't read its annotations — `render(): React.Node`
+  // cut a class short — and TypeScript's syntax covers most of Flow's.
+  if ((lang === 'javascript' || lang === 'jsx') && source && hasFlowPragma(source)) return 'tsx';
+
   // .h files could be C, C++, or Objective-C — check source content
   if (lang === 'c' && ext === '.h' && source) {
     if (looksLikeCpp(source)) return 'cpp';
@@ -555,6 +560,13 @@ export function detectLanguage(filePath: string, source?: string, overrides?: Re
   }
 
   return lang;
+}
+
+/** Whether a JavaScript file's leading comments carry Flow's `@flow` pragma (and not `@noflow`). */
+export function hasFlowPragma(source: string): boolean {
+  const head = source.slice(0, 4096).replace(/^#![^\n]*\n/, '');
+  const lead = /^(?:\s*(?:\/\/[^\n]*|\/\*[\s\S]*?\*\/))*/.exec(head)?.[0] ?? '';
+  return /@flow\b/.test(lead) && !/@noflow\b/.test(lead);
 }
 
 /**

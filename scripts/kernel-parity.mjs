@@ -88,9 +88,12 @@ function collect(p, out) {
     const lang = EXTS.get(path.extname(p).toLowerCase());
     // 'detect' (.h) resolves per file in the run loop; under --lang it rides
     // along whenever either C-family language is requested.
+    // A Flow-typed `.js` routes as tsx (detectLanguage reads its pragma), so
+    // it rides along when tsx is requested and is re-detected per file below.
     const passes =
       !langFilter ||
-      (lang === 'detect' ? langFilter.has('c') || langFilter.has('cpp') : langFilter.has(lang));
+      (lang === 'detect' ? langFilter.has('c') || langFilter.has('cpp') : langFilter.has(lang)) ||
+      ((lang === 'javascript' || lang === 'jsx') && langFilter.has('tsx'));
     if (passes) out.push({ file: p, lang });
   }
 }
@@ -196,7 +199,7 @@ for (const { file, lang: extLang } of files) {
   const source = fs.readFileSync(file, 'utf8');
   const rel = path.relative(ROOT, file);
   // `.h` resolves C vs C++ by content — the same call the indexer makes.
-  const lang = extLang === 'detect' ? detectLanguage(rel, source) : extLang;
+  const lang = extLang === 'detect' || extLang === 'javascript' || extLang === 'jsx' ? detectLanguage(rel, source) : extLang;
   if (!KERNEL_LANGS.has(lang)) continue;
   if (langFilter && !langFilter.has(lang)) continue;
   processed++;
