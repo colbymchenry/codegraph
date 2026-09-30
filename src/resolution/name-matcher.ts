@@ -3389,6 +3389,7 @@ export function matchByExactName(
   // large import-heavy (front-end + back-end) repos (#915).
   const bareJs = isBareJsCall(ref, context);
   const bareNoMembers = isBareGoCall(ref, context) || isBareRCall(ref, context);
+  const solidityBare = isReceiverLessSolidityCall(ref, context);
   const barePhp = isBarePhpCall(ref, context);
   // A type, a value or an import the file binds from a package outside the
   // repository names nothing in it, whatever kind of reference it is.
@@ -3457,6 +3458,7 @@ export function matchByExactName(
     !(kotlinCall && !isKotlinTopLevelVisible(n, ref, context)) &&
     !(kotlinBare && !isKotlinMemberReachable(n, ref, context)) &&
     !isKotlinNumberBitwise(n, ref) &&
+    !(solidityBare && !isSolidityMemberInScope(n, ref, context)) &&
     !(dartBare && isDartMember(n) && !isDartMethodInScope(n, ref, context)) &&
     !(phpSelf && (n.kind !== 'method' || !isPhpMethodInScope(n, ref, phpSelf, context))) &&
     !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)) &&
@@ -4584,6 +4586,8 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   CPP_NS_MACROS.delete(context);
   CPP_NS_FRAMES.delete(context);
   CPP_NS_ALIASES.delete(context);
+  SOLIDITY_SUPERS.delete(context);
+  SOLIDITY_HIERARCHIES.delete(context);
   MEMBER_TYPE_MEMO.delete(context);
   CSHARP_ALIASES.delete(context);
   SWIFT_HIERARCHIES.delete(context);
@@ -7038,8 +7042,10 @@ export function matchFuzzy(
   // resolve a name without regard to case, which is what this fallback's
   // lowercase index is for.
   const bareR = isBareRCall(ref, context);
+  const solidityBare = isReceiverLessSolidityCall(ref, context);
   const callableCandidates = candidates.filter((n) => callableKinds.has(n.kind) && !(typeRef && !canNameInTypePosition(n)) &&
     !(bareR && n.kind === 'method') &&
+    !(solidityBare && !isSolidityMemberInScope(n, ref, context)) &&
     // `new …MockData()` makes an instance of a type; a method is never what it names.
     !(ref.referenceKind === 'instantiates' && n.kind === 'method') &&
     !(rustBare && !isRustNameInScope(n, ref, context)) &&
@@ -7261,6 +7267,19 @@ function matchReferenceInner(
         if (sameFile) {
           return { original: ref, targetNodeId: sameFile.id, confidence: 0.95, resolvedBy: 'exact-match' };
         }
+        // Another module's function is called bare only through `-import(Mod,
+        // [f/N])` (or from a `.hrl` a module includes): cowboy's
+        // `-import(req_SUITE, [do_get/3])` went to compress_SUITE's `do_get/3`.
+        const imported = erlangImportedModule(am[1]!, am[2]!, ref, context);
+        if (imported !== undefined) {
+          const chosen = candidates.find((n) => n.qualifiedName.startsWith(`${imported}::`));
+          return chosen ? { original: ref, targetNodeId: chosen.id, confidence: 0.9, resolvedBy: 'exact-match' } : null;
+        }
+        if (!/\.hrl$/.test(ref.filePath)) {
+          const included = candidates.filter((n) => /\.hrl$/.test(n.filePath));
+          if (included.length === 0) return null;
+          candidates.splice(0, candidates.length, ...included);
+        }
         if (candidates.length === 1) {
           return { original: ref, targetNodeId: candidates[0]!.id, confidence: 0.8, resolvedBy: 'exact-match' };
         }
@@ -7370,6 +7389,85 @@ function matchReferenceInner(
   }
 
   return null;
+}
+
+const SOLIDITY_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
+const SOLIDITY_HIERARCHIES = new WeakMap<ResolutionContext, WeakMap<UnresolvedRef, Set<string>>>();
+const SOLIDITY_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'struct', 'module', 'trait']);
+
+/** What a Solidity contract, interface or library inherits: `contract Governor is Context, ERC165(…), IGovernor {`. */
+function soliditySupertypesOf(name: string, context: ResolutionContext): string[] {
+  let memo = SOLIDITY_SUPERS.get(context);
+  if (!memo) SOLIDITY_SUPERS.set(context, (memo = new Map()));
+  const hit = memo.get(name);
+  if (hit) return hit;
+  const supers: string[] = [];
+  for (const decl of context.getNodesByName(name)) {
+    if (decl.language !== 'solidity' || !SOLIDITY_TYPE_KINDS.has(decl.kind)) continue;
+    const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+    let depth = 0;
+    let head = '';
+    for (const ch of lines.slice(decl.startLine - 1, decl.startLine + 10).join(' ').replace(/\/\/[^\n]*|\/\*.*?\*\//g, ' ')) {
+      if (ch === '{' && depth === 0) break;
+      if (ch === '(') depth++;
+      else if (ch === ')') depth = Math.max(0, depth - 1);
+      else if (depth === 0) head += ch;
+    }
+    const clause = /\bis\b([\s\S]*)$/.exec(head)?.[1] ?? '';
+    for (const m of clause.matchAll(/([A-Za-z_]\w*)\s*(?=,|$)/g)) supers.push(m[1]!);
+  }
+  memo.set(name, supers);
+  return supers;
+}
+
+/**
+ * Whether a bare Solidity call can reach method `n`: a function of the
+ * contract around the call or of one it inherits, or a free function.
+ * OpenZeppelin's `_msgSender()` in Governor (a Context) went to
+ * ERC2771Context's override 83 times.
+ */
+function isSolidityMemberInScope(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (n.kind !== 'method' || n.language !== 'solidity') return true;
+  const cut = n.qualifiedName.lastIndexOf('::');
+  if (cut <= 0) return true;
+  const owner = n.qualifiedName.slice(0, cut).split('::').pop()!;
+  let memo = SOLIDITY_HIERARCHIES.get(context);
+  if (!memo) SOLIDITY_HIERARCHIES.set(context, (memo = new WeakMap()));
+  let names = memo.get(ref);
+  if (!names) {
+    names = new Set<string>();
+    const queue = context.getNodesInFile(ref.filePath)
+      .filter((c) => SOLIDITY_TYPE_KINDS.has(c.kind) && c.startLine <= ref.line && c.endLine >= ref.line)
+      .map((c) => c.name);
+    while (queue.length > 0 && names.size < 60) {
+      const name = queue.shift()!;
+      if (names.has(name)) continue;
+      names.add(name);
+      queue.push(...soliditySupertypesOf(name, context));
+    }
+    memo.set(ref, names);
+  }
+  return names.has(owner);
+}
+
+/** Whether a Solidity call is written with no receiver (`_msgSender()`, not `token._msgSender()`). */
+function isReceiverLessSolidityCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'solidity' || ref.referenceKind !== 'calls' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return false;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (!line) return false;
+  const m = new RegExp(`(?<![\\w$])${ref.referenceName}\\s*\\(`).exec(line);
+  return !!m && !/\.\s*$/.test(line.slice(0, m.index));
+}
+
+/** The module an Erlang file `-import`s `name/arity` from, or undefined. */
+function erlangImportedModule(name: string, arity: string, ref: UnresolvedRef, context: ResolutionContext): string | undefined {
+  const source = context.readFile(ref.filePath);
+  if (!source || !source.includes('-import')) return undefined;
+  const fn = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  for (const m of source.matchAll(/^-import\(\s*'?([A-Za-z_][\w@]*)'?\s*,\s*\[([^\]]*)\]\s*\)\s*\./gm)) {
+    if (new RegExp(`(?:^|[\\s,])'?${fn}'?\\s*/\\s*${arity}\\b`).test(m[2]!)) return m[1]!;
+  }
+  return undefined;
 }
 
 const CPP_NS_MACROS = new WeakMap<ResolutionContext, { openers: Map<string, string[]>; openerFns: Set<string>; closers: Map<string, number>; aliases: Map<string, string> }>();
