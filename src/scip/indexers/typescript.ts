@@ -21,6 +21,8 @@ function hasWorkspaces(root: string): boolean {
 
 export const typescriptIndexer: IndexerSpec = {
   lang: 'typescript',
+  tool: 'scip-typescript',
+  codegraphLanguages: ['typescript', 'javascript', 'tsx', 'jsx'],
   detect: root => has(root, 'tsconfig.json') || has(root, 'jsconfig.json') || has(root, 'package.json'),
   cmd: 'scip-typescript',
   invocation(root, outFile) {

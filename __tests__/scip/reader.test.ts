@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import * as path from 'path';
 import { decodeScipIndex, loadScipIndex, parseSymbol, ROLE_DEFINITION } from '../../src/scip/reader';
-import { looksLikeCall } from '../../src/scip/sites';
+import { looksLikeCall } from '../../src/scip/syntax';
 
 const FIXTURE = path.join(__dirname, '..', 'fixtures', 'scip-ts');
 
@@ -29,22 +29,22 @@ describe('SCIP reader', () => {
     const main = ix.documents.find(d => d.relativePath === 'src/main.ts')!;
     const sumDef = main.occurrences.find(o => o.roles & ROLE_DEFINITION && o.symbol.endsWith('/sum().'))!;
     expect(sumDef.range).toEqual({ startLine: 2, startCol: 16, endLine: 2, endCol: 19 });
-    expect(sumDef.enclosingRange).toMatchObject({ startLine: 2, endLine: 6 });
   });
 
-  it('prefers typed ranges over the deprecated int32 ones', () => {
+  it('prefers typed ranges over the deprecated int32 ones, and skips fields it does not use', () => {
     const occ = [
       ...len(1, [...varint(9), ...varint(9), ...varint(9)]), // legacy range, packed
       ...str(2, 'scip-typescript npm p 1.0.0 src/`a.ts`/f().'),
-      ...len(8, [...int(1, 4), ...int(2, 2), ...int(3, 5)]), // SingleLineRange
-      ...len(11, [...int(1, 3), ...int(2, 0), ...int(3, 7), ...int(4, 1)]), // MultiLineRange enclosing
+      ...len(9, [...int(1, 4), ...int(2, 2), ...int(3, 6), ...int(4, 1)]), // MultiLineRange
+      ...len(11, [...int(1, 3), ...int(2, 0), ...int(3, 7), ...int(4, 1)]), // enclosing range: unused
     ];
     const doc = [...str(1, 'src/a.ts'), ...len(2, occ), ...str(4, 'TypeScript')];
     const ix = decodeScipIndex(Buffer.from([...len(2, doc)]));
-    expect(ix.documents[0]!.occurrences[0]).toMatchObject({
-      range: { startLine: 4, startCol: 2, endLine: 4, endCol: 5 },
-      enclosingRange: { startLine: 3, startCol: 0, endLine: 7, endCol: 1 },
-    });
+    expect(ix.documents[0]!.occurrences).toEqual([{
+      range: { startLine: 4, startCol: 2, endLine: 6, endCol: 1 },
+      symbol: 'scip-typescript npm p 1.0.0 src/`a.ts`/f().',
+      roles: 0,
+    }]);
   });
 
   it('rejects an index with no documents', () => {

@@ -19,7 +19,7 @@ import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ROLE_DEFINITION, ScipIndex, loadScipIndex, parseSymbol } from '../../src/scip/reader';
-import { looksLikeCall } from '../../src/scip/sites';
+import { callShape } from '../../src/scip/syntax';
 
 type Line = string; // `${path}:${line}`
 
@@ -50,8 +50,7 @@ function scipCalls(ix: ScipIndex, repo: string): Map<string, Set<string>> {
       if (o.roles & ROLE_DEFINITION) continue;
       const p = parseSymbol(o.symbol);
       if (!p || (p.last.kind !== 'method' && p.last.kind !== 'term')) continue;
-      const text = lines[o.range.endLine];
-      if (text === undefined || !looksLikeCall(text.slice(o.range.endCol))) continue;
+      if (callShape(o, doc.positionEncoding, lines) !== 'call') continue; // the merge's own call test
       const key = `${doc.relativePath}:${o.range.startLine + 1}:${p.last.name}`;
       let s = out.get(key);
       if (!s) out.set(key, (s = new Set()));

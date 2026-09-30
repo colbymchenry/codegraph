@@ -4,8 +4,8 @@ import * as os from 'os';
 import * as path from 'path';
 import CodeGraph from '../../src/index';
 import { importScipFile, runScipPass } from '../../src/scip';
-import { resolveIndexer } from '../../src/scip/indexers';
-import { callShape } from '../../src/scip/sites';
+import { INDEXERS, resolveIndexer } from '../../src/scip/indexers';
+import { callShape } from '../../src/scip/syntax';
 
 const FIXTURES = path.join(__dirname, '..', 'fixtures');
 
@@ -62,10 +62,11 @@ fixtureSuite('scip-rust', 'rust', (edge) => {
 });
 
 describe('literal call shapes', () => {
+  const LANG: Record<string, keyof typeof INDEXERS> = { go: 'go', rs: 'rust', ts: 'typescript' };
   const shape = (file: string, line: string, name: string) => {
     const col = line.indexOf(name);
-    const o = { range: { startLine: 0, startCol: col, endLine: 0, endCol: col + name.length }, symbol: '', roles: 0, enclosingRange: null };
-    return callShape(o, { relativePath: file, positionEncoding: 0 }, [line]);
+    const o = { range: { startLine: 0, startCol: col, endLine: 0, endCol: col + name.length }, symbol: '', roles: 0 };
+    return callShape(o, 0, [line], INDEXERS[LANG[file.split('.').pop()!]!].literalShape);
   };
 
   it('Go: composite literals, not container element types or return types', () => {

@@ -94,6 +94,8 @@ export function projectName(root: string): string {
 
 export const pythonIndexer: IndexerSpec = {
   lang: 'python',
+  tool: 'scip-python',
+  codegraphLanguages: ['python'],
   detect: root => MARKERS.some(m => fs.existsSync(path.join(root, m))),
   cmd: 'scip-python',
   invocation(root, outFile) {

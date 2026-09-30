@@ -4,7 +4,7 @@
  * Decodes only the fields the SCIP merge uses, straight from the protobuf wire
  * format, so the fork ships no protobuf runtime or generated code. Field numbers
  * follow https://github.com/sourcegraph/scip/blob/main/scip.proto — both the
- * deprecated `repeated int32` ranges and the typed `SingleLineRange` /
+ * deprecated `repeated int32` range and the typed `SingleLineRange` /
  * `MultiLineRange` replacements are accepted (typed wins when both are set).
  */
 
@@ -28,7 +28,6 @@ export interface ScipOccurrence {
   range: Span;
   symbol: string;
   roles: number;
-  enclosingRange: Span | null;
 }
 
 export interface ScipDocument {
@@ -46,18 +45,6 @@ export interface ScipIndex {
 }
 
 export class ScipDecodeError extends Error {}
-
-export function spanContains(s: Span, line: number, col: number): boolean {
-  if (line < s.startLine || line > s.endLine) return false;
-  if (line === s.startLine && col < s.startCol) return false;
-  if (line === s.endLine && col > s.endCol) return false;
-  return true;
-}
-
-/** Orders spans so the narrowest enclosing one sorts first. */
-export function spanSize(s: Span): number {
-  return (s.endLine - s.startLine) * 1_000_000 + (s.endCol - s.startCol);
-}
 
 function spanOf(r: number[]): Span | null {
   if (r.length === 3) return { startLine: r[0]!, startCol: r[1]!, endLine: r[0]!, endCol: r[2]! };
@@ -152,11 +139,11 @@ function readTyped(r: Reader, multi: boolean): Span {
     : { startLine: v[0]!, startCol: v[1]!, endLine: v[0]!, endCol: v[2]! };
 }
 
+// Enclosing ranges (fields 7/10/11) are skipped: a call's caller comes from
+// codegraph's own node spans, which is what its edges are keyed by (sites.ts).
 function readOccurrence(r: Reader): ScipOccurrence | null {
   const legacyRange: number[] = [];
-  const legacyEnclosing: number[] = [];
   let typedRange: Span | null = null;
-  let typedEnclosing: Span | null = null;
   let symbol = '';
   let roles = 0;
   while (!r.done()) {
@@ -167,17 +154,14 @@ function readOccurrence(r: Reader): ScipOccurrence | null {
       case 1: r.int32s(wire, legacyRange); break;
       case 2: symbol = r.string(); break;
       case 3: roles = r.varint(); break;
-      case 7: r.int32s(wire, legacyEnclosing); break;
       case 8: typedRange = readTyped(r.sub(), false); break;
       case 9: typedRange = readTyped(r.sub(), true); break;
-      case 10: typedEnclosing = readTyped(r.sub(), false); break;
-      case 11: typedEnclosing = readTyped(r.sub(), true); break;
       default: r.skip(wire);
     }
   }
   const range = typedRange ?? spanOf(legacyRange);
   if (!range) return null; // malformed occurrence — nothing to anchor it to
-  return { range, symbol, roles, enclosingRange: typedEnclosing ?? spanOf(legacyEnclosing) };
+  return { range, symbol, roles };
 }
 
 function readDocument(r: Reader): ScipDocument {

@@ -15,8 +15,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { SqliteDatabase } from '../db/sqlite-adapter';
 import { ROLE_DEFINITION, ScipIndex, isLocalSymbol, loadScipIndex, parseSymbol } from './reader';
-import { resolveIndexer } from './indexers';
-import { callShape } from './sites';
+import { INDEXERS, resolveIndexer } from './indexers';
+import { callShape } from './syntax';
 import { ScipLanguage, ScipMeta, indexPath, metaPath, readMeta, snapshotHashes, writeFileAtomic } from './store';
 
 /** Largest drop in resolved calls a new index may show before it is rejected. */
@@ -36,7 +36,8 @@ export type ProduceResult =
  * type references are left out on purpose: a broken build can keep those while
  * call resolution collapses. Reads the current sources for the call shape.
  */
-export function resolvedCallCount(ix: ScipIndex, projectRoot: string): number {
+export function resolvedCallCount(ix: ScipIndex, projectRoot: string, lang: ScipLanguage): number {
+  const literal = INDEXERS[lang].literalShape;
   const defined = new Set<string>();
   for (const d of ix.documents) {
     for (const o of d.occurrences) if (o.roles & ROLE_DEFINITION && !isLocalSymbol(o.symbol)) defined.add(o.symbol);
@@ -52,7 +53,7 @@ export function resolvedCallCount(ix: ScipIndex, projectRoot: string): number {
     for (const o of d.occurrences) {
       if (o.roles & ROLE_DEFINITION || !defined.has(o.symbol)) continue;
       const kind = parseSymbol(o.symbol)?.last.kind;
-      const shape = callShape(o, d, lines);
+      const shape = callShape(o, d.positionEncoding, lines, literal);
       if ((kind === 'method' || kind === 'term') && shape === 'call') n++;
       else if (kind === 'type' && shape) n++;
     }
@@ -79,7 +80,7 @@ export async function produceIndex(
   if ('skip' in indexer) return { status: 'skipped', lang, reason: indexer.skip };
 
   const started = Date.now();
-  const hashes = snapshotHashes(db, projectRoot, lang);
+  const hashes = snapshotHashes(db, projectRoot, INDEXERS[lang].codegraphLanguages);
   try {
     const useNice = opts.nice && process.platform !== 'win32';
     const [cmd, args] = useNice ? ['nice', ['-n', '10', indexer.cmd, ...indexer.args]] : [indexer.cmd, indexer.args];
@@ -95,7 +96,7 @@ export async function produceIndex(
     } catch (err) {
       return { status: 'failed', lang, reason: err instanceof Error ? err.message : String(err) };
     }
-    const resolvedCalls = resolvedCallCount(ix, projectRoot);
+    const resolvedCalls = resolvedCallCount(ix, projectRoot, lang);
     const previous = fs.existsSync(final) ? readMeta(projectRoot, lang)?.resolvedCalls ?? null : null;
     if (!opts.force && previous !== null && resolvedCalls < previous * (1 - MAX_RESOLUTION_DROP)) {
       return {

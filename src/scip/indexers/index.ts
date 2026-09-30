@@ -19,6 +19,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { PROJECT_CONFIG_FILENAME } from '../../project-config';
 import type { ScipLanguage } from '../store';
+import type { LiteralShape } from '../syntax';
 import { goIndexer } from './go';
 import { pythonIndexer } from './python';
 import { rustIndexer } from './rust';
@@ -32,8 +33,13 @@ export interface Invocation {
   warning?: string;
 }
 
+/** Everything the fork knows about one language — the single place to add or change one. */
 export interface IndexerSpec {
   lang: ScipLanguage;
+  /** `ToolInfo.name` in the indexes this indexer writes (tells `scip import` the language) */
+  tool: string;
+  /** codegraph `files.language` values the index covers (the hash-gate snapshot) */
+  codegraphLanguages: readonly string[];
   /** true when the project has this language's marker files */
   detect(projectRoot: string): boolean;
   cmd: string;
@@ -45,6 +51,8 @@ export interface IndexerSpec {
   probe?: string[];
   /** May write helper files next to `outFile` (e.g. an environment manifest). */
   invocation(projectRoot: string, outFile: string): Invocation;
+  /** for languages that construct values with `Type{…}` rather than a call */
+  literalShape?: LiteralShape;
 }
 
 export interface IndexerOverride {
@@ -53,20 +61,17 @@ export interface IndexerOverride {
   env?: Record<string, string>;
 }
 
-export const INDEXERS: Partial<Record<ScipLanguage, IndexerSpec>> = {
+export const INDEXERS: Record<ScipLanguage, IndexerSpec> = {
   typescript: typescriptIndexer,
   python: pythonIndexer,
   go: goIndexer,
   rust: rustIndexer,
 };
 
-/** Tool name in an index's metadata → the language it covers (for `scip import`). */
-export const TOOL_LANGUAGES: Record<string, ScipLanguage> = {
-  'scip-typescript': 'typescript',
-  'scip-python': 'python',
-  'scip-go': 'go',
-  'rust-analyzer': 'rust',
-};
+/** The language an index covers, from the tool that wrote it. */
+export function languageOfTool(tool: string): ScipLanguage | undefined {
+  return Object.values(INDEXERS).find(s => s.tool === tool)?.lang;
+}
 
 type ScipConfig = Partial<Record<ScipLanguage, IndexerOverride | false>>;
 
@@ -108,7 +113,6 @@ export interface ResolvedIndexer {
  */
 export function resolveIndexer(projectRoot: string, lang: ScipLanguage, outFile: string): ResolvedIndexer | { skip: string } {
   const spec = INDEXERS[lang];
-  if (!spec) return { skip: `no SCIP indexer adapter for ${lang} yet` };
   const config = readScipConfig(projectRoot);
   if (typeof config === 'string') return { skip: config };
   const override = config[lang];

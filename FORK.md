@@ -98,14 +98,14 @@ Pass bar per language (2 seeds × 50 random targets): precision ≥ 95%, recall 
 | Rust | BurntSushi/ripgrep @ 3fce3b5 (104 docs) | 1 | 100% / 7% | 37% / 83% | **100% / 99%** | 12.6 s + 1.0 s |
 | Rust | same | 2 | 100% / 22% | 20% / 73% | **100% / 99%** | |
 
-Indexers used: scip-typescript 0.4.0, scip-python 0.6.6, scip-go 0.2.7, rust-analyzer 2026-09-28. Flags: `--rg-type py --prefix django/`, `--rg-type go`, `--rg-type rust`.
+Raw per-seed output (`compare.ts --json`): [`scripts/scip-eval/results/`](scripts/scip-eval/results/). Indexers used: scip-typescript 0.4.0, scip-python 0.6.6, scip-go 0.2.7, rust-analyzer 2026-09-28. Flags: `--rg-type py --prefix django/`, `--rg-type go`, `--rg-type rust`.
 
 | corpus | heuristic edges verified | wrong removed | missing added | left unverified |
 |---|---|---|---|---|
 | codegraph `src/` | 8,417 | 127 | 647 | 1,389 |
 | Django | 53,139 | 12,035 | 23,904 | 33,601 |
 | cobra | 2,637 | 160 | 1 | 48 |
-| ripgrep | 4,447 | 1,080 | 5,964 | 2,442 |
+| ripgrep | 4,447 | 1,080 | 5,957 | 2,442 |
 
 After the merge, `django.urls.base.reverse` has 1,267 caller edges from 867 distinct callers, up from 1, matching the POC.
 

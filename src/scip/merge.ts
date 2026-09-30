@@ -13,7 +13,7 @@
  */
 
 import type { SqliteDatabase } from '../db/sqlite-adapter';
-import { EXTERNAL, ScipSites, SiteKind, parseSiteKey, siteKey } from './sites';
+import { EXTERNAL, HEURISTIC_PROVENANCE, ScipSites, SiteKind, parseSiteKey, siteKey } from './sites';
 
 export interface MergeOutcome {
   agree: number;
@@ -30,7 +30,6 @@ export interface MergeOutcome {
   scipEdgesStale: number;
 }
 
-const HEURISTIC = '(provenance IS NULL OR provenance = \'tree-sitter\')';
 const SET_FLAG = (flag: string) => `metadata = json_set(COALESCE(metadata, '{}'), '$.${flag}', json('true'))`;
 const CLEAR_FLAG = (flag: string) => `metadata = json_remove(metadata, '$.${flag}')`;
 
@@ -59,15 +58,15 @@ export function merge(
   };
   const upd = db.prepare(
     `UPDATE edges SET provenance = 'scip'
-     WHERE source = ? AND target = ? AND kind = ? AND line = ? AND ${HEURISTIC}`);
-  const del = db.prepare(`DELETE FROM edges WHERE source = ? AND target = ? AND kind = ? AND line = ? AND ${HEURISTIC}`);
+     WHERE source = ? AND target = ? AND kind = ? AND line = ? AND ${HEURISTIC_PROVENANCE}`);
+  const del = db.prepare(`DELETE FROM edges WHERE source = ? AND target = ? AND kind = ? AND line = ? AND ${HEURISTIC_PROVENANCE}`);
   // Column is not part of a site's identity (see sites.ts), so "already there"
   // is judged without it — an earlier import's edge keeps codegraph's column.
   const ins = db.prepare(
     `INSERT OR IGNORE INTO edges (source, target, kind, metadata, line, col, provenance)
      SELECT ?1, ?2, ?3, '{"resolvedBy":"scip"}', ?4, ?5, 'scip'
      WHERE NOT EXISTS (SELECT 1 FROM edges WHERE source = ?1 AND target = ?2 AND kind = ?3 AND line = ?4)`);
-  const silent = db.prepare(`UPDATE edges SET ${SET_FLAG('scipSilent')} WHERE source = ? AND target = ? AND kind = ? AND line = ? AND ${HEURISTIC}`);
+  const silent = db.prepare(`UPDATE edges SET ${SET_FLAG('scipSilent')} WHERE source = ? AND target = ? AND kind = ? AND line = ? AND ${HEURISTIC_PROVENANCE}`);
 
   db.exec(`UPDATE edges SET ${CLEAR_FLAG('scipSilent')} WHERE metadata LIKE '%scipSilent%'`);
   reconcileScipEdges(db, scip, freshFiles, c);

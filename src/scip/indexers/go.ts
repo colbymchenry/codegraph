@@ -6,11 +6,20 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { skipGroup } from '../syntax';
 import type { IndexerSpec } from './index';
 
 export const goIndexer: IndexerSpec = {
   lang: 'go',
+  tool: 'scip-go',
+  codegraphLanguages: ['go'],
   detect: root => fs.existsSync(path.join(root, 'go.mod')),
   cmd: 'scip-go',
   invocation: (_root, outFile) => ({ args: ['index', '--quiet', '--output', outFile] }),
+  // Composite literals `&T{…}`, `pkg.T{…}`, `Box[int]{…}` build a T. `[]T{`, `map[K]T{`, `[]*T{`
+  // build the container; `) T {` / `) *pkg.T {` is a return type before a function body.
+  literalShape: (tail, head) => {
+    const t = skipGroup(tail.trimStart(), '[', ']');
+    return !!t?.startsWith('{') && !/[\])]\s*\**\s*(\w+\.)?$/.test(head.trimEnd());
+  },
 };

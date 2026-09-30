@@ -25,14 +25,6 @@ import type { SqliteDatabase } from '../db/sqlite-adapter';
 export const SCIP_LANGUAGES = ['typescript', 'python', 'go', 'rust'] as const;
 export type ScipLanguage = (typeof SCIP_LANGUAGES)[number];
 
-/** codegraph `files.language` values each SCIP indexer covers. */
-export const CODEGRAPH_LANGUAGES: Record<ScipLanguage, readonly string[]> = {
-  typescript: ['typescript', 'javascript', 'tsx', 'jsx'],
-  python: ['python'],
-  go: ['go'],
-  rust: ['rust'],
-};
-
 export interface ScipMeta {
   tool: string;
   toolVersion: string;
@@ -89,26 +81,30 @@ export function writeFileAtomic(file: string, data: string | Buffer): void {
   fs.renameSync(tmp, file);
 }
 
-/** Hash one file the way the extractor does, or null when it can't be read. */
-export function hashFile(projectRoot: string, relPath: string): string | null {
+/**
+ * A file's content hash the way the extractor computes it, plus its text —
+ * null text for a file over codegraph's size limit (hashed by size, never read).
+ * Null when it can't be read: an unreadable file can't be vouched for.
+ */
+export function readHashed(projectRoot: string, relPath: string): { hash: string; text: string | null } | null {
   try {
     const abs = path.join(projectRoot, relPath);
-    const size = fs.statSync(abs).size;
-    return hashContent(indexedHashInput(size, () => fs.readFileSync(abs, 'utf8')));
+    let text: string | null = null;
+    const hash = hashContent(indexedHashInput(fs.statSync(abs).size, () => (text = fs.readFileSync(abs, 'utf8'))));
+    return { hash, text };
   } catch {
     return null;
   }
 }
 
-/** Snapshot the current content hash of every tracked file of this language. */
-export function snapshotHashes(db: SqliteDatabase, projectRoot: string, lang: ScipLanguage): Record<string, string> {
-  const langs = CODEGRAPH_LANGUAGES[lang];
+/** Snapshot the current content hash of every tracked file in the given codegraph languages. */
+export function snapshotHashes(db: SqliteDatabase, projectRoot: string, languages: readonly string[]): Record<string, string> {
   const rows = db
-    .prepare(`SELECT path FROM files WHERE language IN (${langs.map(() => '?').join(',')})`)
-    .all(...langs) as { path: string }[];
+    .prepare(`SELECT path FROM files WHERE language IN (${languages.map(() => '?').join(',')})`)
+    .all(...languages) as { path: string }[];
   const out: Record<string, string> = {};
   for (const { path: p } of rows) {
-    const h = hashFile(projectRoot, p);
+    const h = readHashed(projectRoot, p)?.hash;
     if (h) out[p] = h;
   }
   return out;
