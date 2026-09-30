@@ -796,7 +796,8 @@ const ESM_EXPORT_LISTS = new WeakMap<ResolutionContext, Map<string, { module: bo
  * symbol: sveltekit's `generate_manifest.js` keeps an unexported `resolve`
  * that twenty other files' `resolve(…)` calls went to. Classic scripts,
  * CommonJS, `declare global` and `.d.ts` files, members of a class or
- * namespace (qualified names), names a default-exported object literal lists,
+ * namespace (qualified names), names a default-exported or returned object
+ * literal lists,
  * and anything not declared by a statement of its own (an object literal's
  * member, `proto.x = function x() {}`) are exempt.
  */
@@ -820,9 +821,11 @@ function isUnexportedModuleBinding(candidate: Node, context: ResolutionContext):
         }
       }
       for (const m of source.matchAll(/^[ \t]*export\s+(?:default|=)\s+([A-Za-z_$][\w$]*)\s*;?\s*$/gm)) names.add(m[1]!);
-      // `export default { getAdapter, adapters: known }` exposes its shorthand and value names.
-      for (const m of code.matchAll(/^[ \t]*export\s+default\s+\{([^}]*)\}/gm)) {
-        for (const item of m[1]!.split(',')) {
+      // `export default { getAdapter, adapters: known }` exposes its shorthand and
+      // value names; so does a `return { getDefaultActivityRoute, … }` (a
+      // composable hands the function out through its result).
+      for (const m of code.matchAll(/^[ \t]*export\s+default\s+\{([^}]*)\}|\breturn\s*\{([^{}]*)\}/gm)) {
+        for (const item of (m[1] ?? m[2])!.split(',')) {
           const value = item.includes(':') ? item.split(':').pop()! : item;
           const id = /^\s*([A-Za-z_$][\w$]*)\s*$/.exec(value)?.[1];
           if (id) names.add(id);
@@ -2602,6 +2605,8 @@ export function matchByExactName(
   if (bareJs) {
     const storeAction = matchJsStoreBindingCall(ref, context);
     if (storeAction) return storeAction;
+    const returned = matchDestructuredCallResult(ref, context);
+    if (returned) return returned;
     // `import { useQuery } from '@tanstack/react-query'`: the call means the
     // package's, and no same-named project symbol.
     if (isOutOfRepoBinding(ref.referenceName, ref, context)) return null;
@@ -5462,6 +5467,72 @@ function matchDestructuredStoreCall(ref: UnresolvedRef, context: ResolutionConte
     // Keep the guard when another declaration shadows the captured const.
     if (new RegExp(`\\b(?:const|let|var|function|class)\\s+(?:${name}\\b|\\{[^}]*\\b${name}\\b)`).test(rest)) return null;
     return resolveStoreAction(`${m[2]}.getState`, ref.referenceName, ref, context);
+  }
+  return null;
+}
+
+/**
+ * A bare call through a name destructured from a call's result — a composable
+ * or custom hook, `const { getDefaultActivityRoute } = useDefaultActivity()`
+ * (mealie), `const { login } = useAuth()` — is the function the callee returns
+ * under that key: one declared in the callee's own body, else a top-level one
+ * of the callee's module (returned as `{ getDefaultActivityRoute, … }`). The
+ * callee is resolved through the file's imports (or found in the same file),
+ * and its source must return the key; a later declaration of the name at the
+ * call's scope shadows the binding. The local binding otherwise ruled out
+ * every cross-file candidate, so the call resolved to nothing.
+ */
+function matchDestructuredCallResult(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const source = context.readFile(ref.filePath);
+  if (!source || !/\b(?:const|let|var)\s*\{/.test(source)) return null;
+  const name = ref.referenceName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const lines = source.split('\n');
+  const before = lines.slice(0, ref.line - 1).concat(lines[ref.line - 1]?.slice(0, ref.column) ?? '').join('\n');
+  const code = blankStringContents(stripCommentsForRegex(before, 'typescript'));
+  const binding = /\b(?:const|let|var)\s*\{([^{}]*)\}\s*=\s*(?:await\s+)?([A-Za-z_$][\w$]*)\s*(?:<[^<>()]*>)?\s*\(/g;
+  const stackAt = (end: number): number[] => {
+    const stack: number[] = [];
+    for (let i = 0; i < end; i++) {
+      if (code[i] === '{') stack.push(i);
+      else if (code[i] === '}') stack.pop();
+    }
+    return stack;
+  };
+  const callScope = stackAt(code.length);
+  for (const m of [...code.matchAll(binding)].reverse()) {
+    let key: string | null = null;
+    for (const part of m[1]!.split(',')) {
+      const [k, v] = part.split(':').map((x) => x.trim().replace(/\s*=.*$/, ''));
+      if ((v ?? k) === ref.referenceName && /^[A-Za-z_$][\w$]*$/.test(k ?? '')) key = k!;
+    }
+    if (!key) continue;
+    if (!stackAt(m.index!).every((pos, i) => callScope[i] === pos)) continue;
+    const rest = code.slice(m.index! + m[0].length);
+    if (new RegExp(`\\b(?:const|let|var|function|class)\\s+(?:${name}\\b|\\{[^}]*\\b${name}\\b)`).test(rest)) return null;
+    const calleeName = m[2]!;
+    const imported = context.resolveImport?.({ ...ref, referenceName: calleeName, referenceKind: 'calls' });
+    // Through the import; else the same file's; else the one function of that
+    // name in the project (an alias the import resolver can't follow, like
+    // Nuxt's `~/composables/…`) — the returned key is checked below either way.
+    const holders = context.getNodesByName(calleeName).filter((n) =>
+      (n.kind === 'function' || n.kind === 'constant' || n.kind === 'variable') && sameLanguageFamily(n.language, ref.language));
+    const callee = (imported && context.getNodeById?.(imported.targetNodeId)) ??
+      holders.find((n) => n.filePath === ref.filePath) ??
+      (holders.length === 1 ? holders[0] : undefined);
+    if (!callee || !sameLanguageFamily(callee.language, ref.language)) return null;
+    const calleeText = (context.getFileLines?.(callee.filePath) ?? context.readFile(callee.filePath)?.split('\n') ?? [])
+      .slice(callee.startLine - 1, callee.endLine).join('\n');
+    if (!new RegExp(`\\breturn\\s*\\{[^]*?\\b${key}\\b`).test(calleeText)) return null;
+    const callable = (n: Node) => n.kind === 'function' || n.kind === 'method' || n.kind === 'constant' || n.kind === 'variable';
+    const inFile = context.getNodesInFile(callee.filePath);
+    const inner = inFile.filter((n) => n.name === key && callable(n) && n.id !== callee.id && rangeWithin(n, callee) &&
+      !inFile.some((f) => f.id !== callee.id && f.id !== n.id && (f.kind === 'function' || f.kind === 'method') &&
+        rangeWithin(f, callee) && rangeWithin(n, f) && !sameRange(f, n)));
+    const top = inner.length > 0 ? inner : inFile.filter((n) => n.name === key && callable(n) && !n.qualifiedName.includes('::') &&
+      !inFile.some((f) => (f.kind === 'function' || f.kind === 'method') && f.id !== n.id && rangeWithin(n, f) && !sameRange(f, n)));
+    const target = top.sort((a, b) => Number(b.kind === 'function') - Number(a.kind === 'function'))[0];
+    if (!target) return null;
+    return { original: ref, targetNodeId: target.id, confidence: 0.85, resolvedBy: 'instance-method' };
   }
   return null;
 }
