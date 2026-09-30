@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- Play projects kept in subdirectories are recognized, so each one's `conf/routes` is read. A repository with no Play build at its root, like playframework's samples, went from no routes to over 130.
 - Rails routes are now read with their nesting: `namespace` and `scope` add their path and controller module, nested `resources` sit under their parent's `:id`, and `member` / `collection` blocks add their actions. A namespaced route now links to its own module's controller. Routes in a Rails engine's `config/routes.rb` are found too: solidus went from no routes to over 600, and mastodon's route-to-action links nearly tripled.
 - Flask routes registered with `add_url_rule(…)` are now found and linked to their view function or class-based view. So are routes registered through a project's own helper that passes a list of paths and a `view_func=`. flaskbb, which registers every view that way, went from no routes to over 100.
 - In Lua and Luau, a call through a standard or host library table (`string`, `table`, `io`, `vim`, `ngx`, busted's `assert`…) or a string method like `line:find(…)` no longer lands on the one project method with the same name. Functions the project itself defines on those tables still link. On kong, the specs' `assert.truthy(…)` and `assert.falsy(…)` used to land on a condition helper over 1,700 times; on telescope, `line:find(…)` on the picker's `find`.
