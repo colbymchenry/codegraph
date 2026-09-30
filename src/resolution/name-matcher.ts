@@ -4308,7 +4308,9 @@ export function matchByExactName(
     // A Scala type position (`Arbitrary[B]`) never names a method: an
     // `implicit def A: Order[A]` shares its name with half of cats' type
     // parameters. Scala's value references only read a file's own vals.
-    !(ref.language === 'scala' && ref.referenceKind === 'references' && /^[A-Z]/.test(ref.referenceName) &&
+    // Nor does a kind-projector placeholder (`F[*]`, `G[?]`): cats' 567 `*`
+    // type arguments went to an algebra `Sign`'s `*` method.
+    !(ref.language === 'scala' && ref.referenceKind === 'references' && /^(?:[A-Z]|[^\w\s]+$)/.test(ref.referenceName) &&
       (n.kind === 'method' || n.kind === 'function')) &&
     // Type/value references retain same-family eligibility: a native namesake
     // must not hide the actual web type. Calls still gate only the winner.
@@ -8276,6 +8278,14 @@ function matchReferenceInner(
   if ((ref.language === 'java' || ref.language === 'kotlin') && ref.referenceKind !== 'imports' &&
       isJavaOutsideImport(ref.referenceName.split('.')[0]!, ref, context)) {
     return null;
+  }
+
+  // A symbolic name in a Scala type is a type (`F ~> G`) or a kind-projector
+  // placeholder (`Either[A, *]`) — never an operator method, by any strategy.
+  if (ref.language === 'scala' && ref.referenceKind === 'references' && /^[^\w\s]+$/.test(ref.referenceName)) {
+    const types = context.getNodesByName(ref.referenceName).filter((n) => n.language === 'scala' && (SCALA_TYPE_KINDS.has(n.kind) || n.kind === 'type_alias'));
+    const chosen = types.length > 1 ? preferCallSiteFile(types, ref.filePath) : types;
+    return chosen.length === 1 ? { original: ref, targetNodeId: chosen[0]!.id, confidence: 0.8, resolvedBy: 'exact-match' } : null;
   }
 
   // A bare Lua call through a `local` alias reaches what the alias names.
