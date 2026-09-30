@@ -25,7 +25,7 @@ import { matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath } from './import-resolver';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks } from './frameworks';
@@ -499,6 +499,10 @@ export class ReferenceResolver {
   private createContext(): ResolutionContext {
     return {
       resolveImport: (ref) => resolveViaImport(ref, this.context),
+      isOutOfRepoImport: (source, fromFile, language) =>
+        isExternalImport(source, language, this.context) &&
+        !this.isOwnPackage(source) &&
+        resolveImportPath(source, fromFile, language, this.context) === null,
       getNodesInFile: (filePath: string) => {
         if (!this.nodeCache.has(filePath)) {
           this.nodeCache.set(filePath, this.queries.getNodesByFile(filePath));
@@ -2846,6 +2850,23 @@ export class ReferenceResolver {
     }
     if (isBoundToOutOfRepoImport(ref, this.context)) return null;
     return result;
+  }
+
+  /** The repository's own package name, from its root package.json; null without one. */
+  private ownPackageName: string | null | undefined;
+
+  /** `axios` (or `axios/unsafe/…`) inside the axios repository: a package importing itself. */
+  private isOwnPackage(source: string): boolean {
+    if (this.ownPackageName === undefined) {
+      let name: string | null = null;
+      try {
+        const json = JSON.parse(this.context.readFile('package.json') ?? 'null') as { name?: unknown } | null;
+        if (json && typeof json.name === 'string' && json.name.length > 0) name = json.name;
+      } catch { /* no or unreadable package.json */ }
+      this.ownPackageName = name;
+    }
+    const own = this.ownPackageName;
+    return own !== null && (source === own || source.startsWith(`${own}/`));
   }
 
   /** The one supertype-kind node a TypeScript value shares its name and file with. */

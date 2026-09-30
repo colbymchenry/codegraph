@@ -390,7 +390,7 @@ const RUST_STDLIB_ROOTS = new Set(['std', 'core', 'alloc', 'proc_macro']);
  * like `@components/*` would fail the bare-specifier heuristic and
  * be classified as external before alias resolution can run.
  */
-function isExternalImport(
+export function isExternalImport(
   importPath: string,
   language: Language,
   context?: ResolutionContext

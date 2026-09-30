@@ -995,6 +995,9 @@ const BARE_CALL_KEYWORDS: ReadonlySet<string> = new Set([
   'return', 'await', 'yield', 'typeof', 'void', 'new', 'else', 'case', 'throw', 'in', 'of', 'instanceof', 'go', 'defer',
 ]);
 
+/** What only exists inside a type, reachable through a receiver alone. */
+const TYPE_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'field', 'enum_member']);
+
 /** Per-context memo: `file\0name` → "the file binds this name locally". */
 const LOCAL_BINDING_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
 
@@ -1181,6 +1184,9 @@ export function matchByExactName(
   if (bareJs) {
     const storeAction = matchJsStoreBindingCall(ref, context);
     if (storeAction) return storeAction;
+    // `import { useQuery } from '@tanstack/react-query'`: the call means the
+    // package's, and no same-named project symbol.
+    if (isOutOfRepoBinding(ref.referenceName, ref, context)) return null;
   }
   // Every rule below judges one candidate on its own, so they run as ONE pass,
   // the kind/language checks before the ones that read source: a common name
@@ -1203,8 +1209,11 @@ export function matchByExactName(
     // must not hide the actual web type. Calls still gate only the winner.
     (!valueRef || sameLanguageFamily(n.language, ref.language)) &&
     n.kind !== 'import' &&
-    // A receiver-less JS/TS or Go call cannot reach a method (#1714, #1857).
-    !((bareJs || bareGo) && n.kind === 'method') &&
+    // A receiver-less JS/TS or Go call cannot reach a member of a type — a
+    // method (#1714, #1857), nor a property, field or case: mocha's global
+    // `it(…)` bound to an interface's `it` property, `describe(…)` to a
+    // command class's `describe` string.
+    !((bareJs || bareGo) && TYPE_MEMBER_KINDS.has(n.kind)) &&
     // A bare PHP call is a function call: nothing else is callable without a receiver.
     !(barePhp && n.kind !== 'function') &&
     // An `extends`/`implements` ref names a supertype, so anything that can't
@@ -3176,6 +3185,16 @@ export function matchMethodCall(
       objectOrClass !== 'this' && objectOrClass !== 'super' &&
       JS_BUILTIN_METHODS.has(methodName!)) return null;
 
+  // A receiver the file imports is past guessing. A namespace import is the
+  // module object, whose members are its exports, never some class's method;
+  // a binding from a package outside the repository names nothing in it. The
+  // import resolver placed what it could, and a method picked by name alone is
+  // wrong: zod's `z.string()` (`import * as z from "zod/v4"`) bound 3,207 calls
+  // to a test helper's `string` getter, trpc's `z.record()` another class's.
+  if (ref.referenceKind === 'calls' && JS_FAMILY.has(ref.language) && isImportedModuleReceiver(objectOrClass!, ref, context)) {
+    return null;
+  }
+
   // Strategy 2: Instance variable receiver - try capitalized form to find class
   // e.g., "permissionEngine" → look for classes containing "PermissionEngine"
   const capitalizedReceiver = objectOrClass!.charAt(0).toUpperCase() + objectOrClass!.slice(1);
@@ -3281,6 +3300,23 @@ export function matchMethodCall(
   }
 
   return null;
+}
+
+/**
+ * Is a member call's receiver (`z` in `z.string`, `ns` in `ns.util.fn`) an
+ * import binding that is a module namespace, or one from outside the repo?
+ */
+function isImportedModuleReceiver(receiver: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const root = receiver.split('.')[0]!;
+  const binding = context.getImportMappings?.(ref.filePath, ref.language)?.find((m) => m.localName === root);
+  if (!binding) return false;
+  return binding.isNamespace || context.isOutOfRepoImport?.(binding.source, ref.filePath, ref.language) === true;
+}
+
+/** Does the file bind `name` by importing it from outside the repository? */
+function isOutOfRepoBinding(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const binding = context.getImportMappings?.(ref.filePath, ref.language)?.find((m) => m.localName === name);
+  return !!binding && context.isOutOfRepoImport?.(binding.source, ref.filePath, ref.language) === true;
 }
 
 /** Go builtin/primitive field types that can never carry a project method. */
@@ -4192,7 +4228,7 @@ export function matchFuzzy(
     isVisibleAcrossFiles(finalCandidates[0]!, ref, context) &&
     isCrossFileReachable(finalCandidates[0]!, ref, context) &&
     !(isBareJsCall(ref, context) &&
-      (finalCandidates[0]!.kind === 'method' ||
+      (TYPE_MEMBER_KINDS.has(finalCandidates[0]!.kind) || isOutOfRepoBinding(ref.referenceName, ref, context) ||
         (finalCandidates[0]!.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context)))) &&
     !(finalCandidates[0]!.kind === 'method' && isBareGoCall(ref, context)) &&
     // A bare PHP call is a function call (case-insensitive, so fuzzy may find

@@ -167,6 +167,13 @@ export interface ResolutionContext {
    * Minimal contexts without import resolution may omit this capability. */
   resolveImport?(ref: UnresolvedRef): ResolvedRef | null;
   /**
+   * Whether an import specifier, written in `fromFile`, names a module outside
+   * the repository: a package that is not a relative path, a tsconfig alias, a
+   * workspace member or the repository's own package name, and that resolves
+   * to no project file. Supplied by the coordinator, like `resolveImport`.
+   */
+  isOutOfRepoImport?(source: string, fromFile: string, language: Language): boolean;
+  /**
    * Project import-path aliases (tsconfig/jsconfig `paths`). Returns
    * `null` when the project doesn't define any. Cached per resolver
    * instance — safe to call from any resolver code path. Optional so
