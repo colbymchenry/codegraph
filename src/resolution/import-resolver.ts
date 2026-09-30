@@ -1177,8 +1177,8 @@ function extractJavaImports(content: string): ImportMapping[] {
   const stripped = content
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/\/\/[^\n]*/g, '');
-  // `import [static] <fqn>[.*];`
-  const re = /^\s*import\s+(static\s+)?([\w.]+(?:\.\*)?)\s*;/gm;
+  // `import [static] <fqn>[.*];` — and Kotlin's `import <fqn> [as Alias]`, with no `;`.
+  const re = /^\s*import\s+(static\s+)?([\w.]+(?:\.\*)?)(?:\s+as\s+([\w]+))?\s*(?:;|$)/gm;
   let match: RegExpExecArray | null;
   while ((match = re.exec(stripped)) !== null) {
     const fqn = match[2]!;
@@ -1187,11 +1187,11 @@ function extractJavaImports(content: string): ImportMapping[] {
     // through the wildcard. (Future enhancement: enumerate package files.)
     if (fqn.endsWith('.*')) continue;
     const parts = fqn.split('.');
-    const localName = parts[parts.length - 1];
+    const localName = match[3] ?? parts[parts.length - 1];
     if (!localName) continue;
     mappings.push({
       localName,
-      exportedName: localName,
+      exportedName: parts[parts.length - 1]!,
       source: fqn,
       isDefault: false,
       isNamespace: false,
@@ -1434,6 +1434,26 @@ export function resolveJvmImport(
     confidence: 0.95,
     resolvedBy: 'import',
   };
+}
+
+/** `Alias` / `Alias.member` through a renaming Kotlin import, by the imported FQN. */
+function resolveJvmAlias(ref: UnresolvedRef, imports: ImportMapping[], context: ResolutionContext): ResolvedRef | null {
+  const dot = ref.referenceName.indexOf('.');
+  const root = dot < 0 ? ref.referenceName : ref.referenceName.slice(0, dot);
+  const imp = imports.find((m) => m.localName === root && m.localName !== m.exportedName);
+  if (!imp) return null;
+  const parts = imp.source.split('.');
+  // The package is some prefix of the FQN; the rest is the type path (`Outer::Inner`).
+  for (let i = parts.length - 1; i > 0; i--) {
+    const target = context.getNodesByQualifiedName(`${parts.slice(0, i).join('.')}::${parts.slice(i).join('::')}`)[0];
+    if (!target) continue;
+    const member = dot < 0 ? null : ref.referenceName.slice(dot + 1);
+    if (member === null) return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
+    if (member.includes('.')) return null;
+    const found = context.getNodesByQualifiedName(`${target.qualifiedName}::${member}`)[0];
+    return found ? { original: ref, targetNodeId: found.id, confidence: 0.9, resolvedBy: 'import' } : null;
+  }
+  return null;
 }
 
 /**
@@ -1704,6 +1724,13 @@ export function resolveViaImport(
   ) {
     const moduleFile = resolveModuleImportToFile(ref, imports, context);
     if (moduleFile) return moduleFile;
+  }
+
+  // Kotlin's `import app.model.Outer.Inner as Made`: `Made.create()` is the
+  // aliased class's member, found by its FQN — nothing else binds the alias.
+  if (ref.language === 'kotlin' && ref.referenceKind !== 'imports') {
+    const aliased = resolveJvmAlias(ref, imports, context);
+    if (aliased) return aliased;
   }
 
   // Check if the reference name matches any import

@@ -5,7 +5,8 @@
  * jsoup's W3C converter (`import org.w3c.dom.Document;`) to jsoup's own
  * `Document`. A static import (`import static org.junit.Assert.assertEquals;`)
  * likewise owns its name. Imports of the project's own classes — nested ones
- * included — resolve as before.
+ * included — resolve as before. Kotlin imports (no `;`, optional `as`) are read
+ * the same way; a member the file itself declares still comes first.
  */
 import { describe, it, expect, afterAll, beforeAll } from 'vitest';
 import * as fs from 'fs';
@@ -53,6 +54,22 @@ public class Reflect {
   }
 }
 `,
+    'src/main/kotlin/app/Dates.kt': `package app
+
+import java.lang.reflect.Field
+import kotlinx.datetime.toLocalDateTime
+import app.model.Outer.Inner as Made
+
+class Dates {
+    private fun toLocalDateTime(value: Long): Long = value
+
+    fun parse(value: Long, field: Field): Long {
+        field.getName()
+        Made.create()
+        return toLocalDateTime(value)
+    }
+}
+`,
     'src/test/java/app/ReflectTest.java': `package app;
 
 import static org.junit.Assert.assertEquals;
@@ -90,6 +107,13 @@ describe('Java single-type and static imports from outside the project', () => {
   it('own their names; the project’s own imports still resolve', () => {
     const edges = edgesFrom('src/main/java/app/Reflect.java');
     expect(edges).not.toContain('references app.functional::TypesTest::Field');
+    expect(edges).toContain('calls app.model::Outer::Inner::create');
+  });
+
+  it('Kotlin: an outside import owns its name, but a member the file declares comes first; `as` aliases bind', () => {
+    const edges = edgesFrom('src/main/kotlin/app/Dates.kt');
+    expect(edges).not.toContain('references app.functional::TypesTest::Field');
+    expect(edges).toContain('calls app::Dates::toLocalDateTime');
     expect(edges).toContain('calls app.model::Outer::Inner::create');
   });
 

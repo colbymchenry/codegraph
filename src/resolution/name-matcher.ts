@@ -929,6 +929,9 @@ function isLuaLocal(candidate: Node, context: ResolutionContext): boolean {
   return local;
 }
 
+const JVM_CALLABLE_KINDS: ReadonlySet<string> = new Set(['method', 'function']);
+const JVM_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'enum', 'struct', 'trait', 'type_alias', 'annotation']);
+
 /** Per context: every package the project's JVM sources declare. */
 const JVM_PACKAGES = new WeakMap<ResolutionContext, Set<string>>();
 
@@ -939,8 +942,16 @@ const JVM_PACKAGES = new WeakMap<ResolutionContext, Set<string>>();
  * type (`import com.acme.Outer.Inner;`) is under a project package, so it is not.
  */
 function isJavaOutsideImport(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
-  const binding = context.getImportMappings(ref.filePath, 'java').find((m) => m.localName === name);
+  const binding = context.getImportMappings(ref.filePath, ref.language).find((m) => m.localName === name);
   if (!binding) return false;
+  // A member the file declares itself is in scope before any import —
+  // Exposed's `toLocalDateTime(value)` inside the column type that defines it —
+  // in the same namespace only: gson's `new URI(…)` is `java.net.URI` beside
+  // `TypeAdapters`' field `URI`, as a type always is beside a value.
+  const call = ref.referenceKind === 'calls' && name === ref.referenceName;
+  const kinds = call ? JVM_CALLABLE_KINDS : JVM_TYPE_KINDS;
+  if ((context.getNodesInFileNamed?.(ref.filePath, name) ?? context.getNodesInFile(ref.filePath).filter((n) => n.name === name))
+    .some((n) => kinds.has(n.kind))) return false;
   let packages = JVM_PACKAGES.get(context);
   if (!packages) {
     packages = new Set<string>();
@@ -7702,7 +7713,8 @@ function matchReferenceInner(
   // `import java.lang.reflect.Field;` — the file's `Field` is the JDK's, never
   // a project class of that name (gson's production code bound it to a test's
   // nested `ParameterizedTypesTest.Field`).
-  if (ref.language === 'java' && ref.referenceKind !== 'imports' && isJavaOutsideImport(ref.referenceName.split('.')[0]!, ref, context)) {
+  if ((ref.language === 'java' || ref.language === 'kotlin') && ref.referenceKind !== 'imports' &&
+      isJavaOutsideImport(ref.referenceName.split('.')[0]!, ref, context)) {
     return null;
   }
 
