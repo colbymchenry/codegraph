@@ -394,6 +394,13 @@ interface StepRecord extends WireStep {
   root: Node | null;
 }
 
+/** A trigger an edge carries in its metadata (a template binding), when it has one. */
+function siteTriggerOf(meta: Record<string, unknown>): SiteTrigger | null {
+  const t = meta.trigger as Partial<SiteTrigger> | undefined;
+  if (!t || typeof t !== 'object' || t.kind !== 'prop' || typeof t.name !== 'string') return null;
+  return { kind: 'prop', name: t.name, of: typeof t.of === 'string' ? t.of : null };
+}
+
 /**
  * The string a Java / Kotlin return expression builds, when it starts with a
  * literal: `"owners/ownerDetails"`, `"redirect:/owners/" + owner.getId()` →
@@ -1296,7 +1303,10 @@ export async function buildSteps(cg: CodeGraph, projectRoot: string, query: URLS
           // every call-shaped hop, so a store action or an effect fired by
           // a tap says so on its link too.
           const isCall = e.kind === 'calls' || e.kind === 'instantiates' || (e.kind === 'references' && meta.fnRef === true);
-          const trigger = isCall ? await triggerAt(fold.node, { line: e.line, column: e.column }) : null;
+          // An Angular template's `(click)` binding rides on its edge: the
+          // template is a file of its own, not the source at `e.line`.
+          const carried = siteTriggerOf(meta);
+          const trigger = carried ? { ...carried, in: fold.node.name } : isCall ? await triggerAt(fold.node, { line: e.line, column: e.column }) : null;
 
           // A server action, by its directive: a function in a `'use server'`
           // file (or opening with the directive) called from a file that is

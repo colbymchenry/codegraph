@@ -2,7 +2,7 @@
  * Angular templates: what a component renders and where it links.
  *
  * An Angular component's markup is a template — a `templateUrl` file beside
- * it, or an inline `template:` string — that the index never parses, so two
+ * it, or an inline `template:` string — that the index never parses, so three
  * things a reader relies on were missing from the graph:
  *
  * - **The component tree.** `<app-article-list [config]="listConfig">` in the
@@ -17,6 +17,12 @@
  *   holds a route constant (`[routerLink]="routerLinkAbout"` with
  *   `routerLinkAbout = publicRoutes.about.routerLink`) each become a
  *   `navigates` edge from the component to the route it names.
+ *
+ * - **Event bindings.** `(click)="toggleFavorite()"` is the only caller a
+ *   handler method has. A `calls` edge from the component to its own method
+ *   (`synthesizedBy: 'angular-event'`) carries the binding as its
+ *   `trigger`, the label Steps puts on the hop — read from the template, so
+ *   it cannot be read back from the source at the edge's line.
  *
  * A child is matched by its element selector (`selector: 'app-article-list'`),
  * in the same app first; a selector two components share there is left
@@ -132,6 +138,19 @@ export function angularComponents(ctx: ResolutionContext): AngularComponent[] {
 
 /** `routerLink="…"` (plain) and `[routerLink]="…"` (bound), either quote. `routerLinkActive` is neither. */
 const ROUTER_LINK = /(\[routerLink\]|\brouterLink)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+/** `(click)="save()"` / `(ngSubmit)="submitForm()"` — an event binding, not `[(ngModel)]`'s two-way half. */
+const EVENT_BINDING = /(?<!\[)\(([A-Za-z][\w.-]*)\)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+/** A call a template statement makes on its component: `save()`, `this.toggle(item)` — not `form.reset()`. */
+const OWN_CALL = /(?<![\w$.])(?:this\s*\.\s*)?([A-Za-z_$][\w$]*)\s*\(/g;
+
+/** The element a binding at `at` is written on: the last opening tag before it. */
+function elementAt(text: string, at: number): string | null {
+  const open = text.lastIndexOf('<', at);
+  if (open < 0) return null;
+  const tag = /^<([a-zA-Z][\w-]*)/.exec(text.slice(open, open + 64));
+  return tag ? tag[1]! : null;
+}
+
 /** A `routerLink:` field of an object literal written in a class. */
 const ROUTER_LINK_FIELD = /(?<![\w$.])routerLink\s*:\s*/g;
 
@@ -226,6 +245,47 @@ export async function angularTemplateEdges(ctx: ResolutionContext, onYield: Mayb
         provenance: 'heuristic',
         metadata: { synthesizedBy: 'angular-template', via: t[1]!, registeredAt: registeredAt(t.index) },
       });
+    }
+
+    // Event bindings: `(click)="toggleFavorite()"` runs the component's own
+    // method when the user acts. The binding is the trigger Steps draws —
+    // known only from the template, so it rides on the edge.
+    const members = new Map(
+      ctx
+        .getNodesInFile(component.file)
+        .filter((n) => n.kind === 'method' && n.qualifiedName.startsWith(`${component.node.qualifiedName}::`))
+        .map((n) => [n.name, n])
+    );
+    let handlers = 0;
+    EVENT_BINDING.lastIndex = 0;
+    let ev: RegExpExecArray | null;
+    while ((ev = EVENT_BINDING.exec(text)) !== null && handlers < MAX_CHILDREN_PER_COMPONENT) {
+      const statement = ev[2] ?? ev[3] ?? '';
+      const event = `(${ev[1]!})`;
+      const element = elementAt(text, ev.index);
+      OWN_CALL.lastIndex = 0;
+      let c: RegExpExecArray | null;
+      while ((c = OWN_CALL.exec(statement)) !== null) {
+        const method = members.get(c[1]!);
+        if (!method) continue;
+        const key = `${component.node.id}>${method.id}>${event}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        handlers++;
+        edges.push({
+          source: component.node.id,
+          target: method.id,
+          kind: 'calls',
+          line: siteLine(ev.index),
+          provenance: 'heuristic',
+          metadata: {
+            synthesizedBy: 'angular-event',
+            via: event,
+            registeredAt: registeredAt(ev.index),
+            trigger: { kind: 'prop', name: event, of: element },
+          },
+        });
+      }
     }
 
     const routes = angularRoutesFor(table, component.file);

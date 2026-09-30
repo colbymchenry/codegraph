@@ -15,6 +15,7 @@ import * as path from 'path';
 import { CodeGraph } from '../src';
 import { commandsHref, localizeDefault, parseAngularRoutes, staticString } from '../src/resolution/frameworks/angular-router';
 import { buildScreens } from '../src/ui-server/api/screens';
+import { buildSteps } from '../src/ui-server/api/steps';
 
 describe('parseAngularRoutes', () => {
   const file = (body: string) => `import { Routes } from '@angular/router';\n${body}`;
@@ -189,7 +190,13 @@ export class AdminRoutingModule {}
 <a [routerLink]="['/account', 'access', 7]">Access</a>
 <a routerLink="relative">Relative</a>
 `,
-      'src/app/shared/card.component.ts': component('CardComponent', 'app-card', `<button (click)="save()">Save</button>`, `  save() { this.router.navigate(internalRoutes.account.subRoutes.access.routerLink('me')); }`).replace(
+      'src/app/shared/card.component.ts': component(
+        'CardComponent',
+        'app-card',
+        `<button (click)="save()">Save</button><input [(ngModel)]="name" /><a (click)="closed.emit(true)">x</a>`,
+        `  name = '';
+  save() { this.router.navigate(internalRoutes.account.subRoutes.access.routerLink('me')); }`
+      ).replace(
         "import { Router } from '@angular/router';",
         "import { Router } from '@angular/router';\nimport { internalRoutes } from '../routes.constants';"
       ),
@@ -268,6 +275,27 @@ export class AdminRoutingModule {}
           .map((e) => `${c.name} -> ${cg.getNode(e.target)?.name} <${(e.metadata as Record<string, unknown>).via}>`)
       );
     expect(renders).toEqual(['HomeComponent -> CardComponent <app-card>']);
+  });
+
+  it("links a template's event bindings to the component's own methods, the binding as the trigger", async () => {
+    const bindings = cg
+      .getNodesByKind('class')
+      .flatMap((c) =>
+        cg
+          .getOutgoingEdgesFrom([c.id], ['calls'])
+          .filter((e) => (e.metadata as Record<string, unknown> | undefined)?.synthesizedBy === 'angular-event')
+          .map((e) => {
+            const meta = e.metadata as Record<string, unknown>;
+            return `${c.name} -> ${cg.getNode(e.target)?.name} ${JSON.stringify(meta.trigger)}`;
+          })
+      );
+    // `[(ngModel)]` is a two-way binding and `closed.emit()` raises the component's own output: neither calls a method.
+    expect(bindings).toEqual(['CardComponent -> save {"kind":"prop","name":"(click)","of":"button"}']);
+
+    const home = cg.getNodesByKind('route').find((r) => r.name === '/home')!;
+    const payload = await buildSteps(cg, root, new URLSearchParams({ anchor: home.id }));
+    const save = payload.steps.find((st) => st.label === 'save');
+    expect(save?.trigger).toMatchObject({ kind: 'prop', name: '(click)', of: 'button', in: 'CardComponent' });
   });
 
   it("draws the Screens picture: a child component's navigation on its screen, a layout's on each screen inside it", async () => {

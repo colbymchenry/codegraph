@@ -56,7 +56,10 @@ Angular is the one whose markup is not indexed: a component's template is a
 which also yields the component tree (`<app-foo>` by element selector) — the
 edge a navigation in a child component rides to its screen. A `routerLink:`
 field written in a component's class (a tab bar's or a menu's config, bound
-in a loop elsewhere) counts as a link from that component. A route with
+in a loop elsewhere) counts as a link from that component. An event binding
+(`(click)="save()"`) is a `calls` edge from the component to its own method
+carrying `metadata.trigger`, which Steps uses in place of reading a trigger
+at the edge's line (the binding is in the template, not the source there). A route with
 `children` is a layout: its component carries a `references` edge marked
 `layout: true` from each screen nested in it, and `routeLayouts` in
 `route-roots.ts` gives Screens every screen a layout serves. Known limits: a
