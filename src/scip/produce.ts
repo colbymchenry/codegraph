@@ -19,7 +19,7 @@ import type { SqliteDatabase } from '../db/sqlite-adapter';
 import { Compactor } from './compact';
 import { INDEXERS, IndexerRun, RUN_WARNING, resolveIndexer } from './indexers';
 import { ScipDecodeError } from './reader';
-import { ScipLanguage, ScipMeta, indexPath, metaPath, readMeta, snapshotHashes, writeFileAtomic } from './store';
+import { ScipLanguage, indexPath, installIndex, readMeta, snapshotHashes } from './store';
 
 /** Largest drop in resolved calls a new index may show before it is rejected. */
 export const MAX_RESOLUTION_DROP = 0.2;
@@ -45,9 +45,9 @@ export async function produceIndex(
   db: SqliteDatabase, projectRoot: string, lang: ScipLanguage, opts: ProduceOptions = {}
 ): Promise<ProduceResult> {
   const final = indexPath(projectRoot, lang);
-  const tmp = `${final}.${process.pid}.tmp`;
+  const raw = `${final}.${process.pid}.raw`; // the indexer's own output, compacted into the installed index
   fs.mkdirSync(path.dirname(final), { recursive: true }); // adapters may write helper files beside the output
-  const indexer = resolveIndexer(projectRoot, lang, tmp);
+  const indexer = resolveIndexer(projectRoot, lang, raw);
   if ('skip' in indexer) return { status: 'skipped', lang, reason: indexer.skip };
 
   const started = Date.now();
@@ -107,7 +107,6 @@ export async function produceIndex(
       return { status: 'failed', lang, reason: `${indexer.cmd} wrote an unreadable index: ${err.message}` };
     }
     if (compact.paths.length === 0) return { status: 'failed', lang, reason: `${indexer.cmd} wrote an index with no documents` };
-    compact.write(tmp);
     const resolvedCalls = compact.resolvedCalls();
     const previous = fs.existsSync(final) ? readMeta(projectRoot, lang)?.resolvedCalls ?? null : null;
     if (!opts.force && previous !== null && resolvedCalls < previous * (1 - MAX_RESOLUTION_DROP)) {
@@ -116,15 +115,10 @@ export async function produceIndex(
         reason: `resolved calls fell from ${previous} to ${resolvedCalls} (>${MAX_RESOLUTION_DROP * 100}% drop) — kept the previous index; fix the build or pass --force`,
       };
     }
-    // Swap order: index first, then the snapshot that vouches for it. A crash
-    // between the two leaves a new index under an old snapshot, which only makes
-    // more documents read as stale — never a wrong edge.
-    fs.renameSync(tmp, final);
-    const meta: ScipMeta = { tool: compact.meta!.toolName, toolVersion: compact.meta!.toolVersion, producedAt: started, hashes, resolvedCalls };
-    writeFileAtomic(metaPath(projectRoot, lang), JSON.stringify(meta));
+    installIndex(projectRoot, lang, f => compact.write(f),
+      { tool: compact.meta!.toolName, toolVersion: compact.meta!.toolVersion, producedAt: started, hashes, resolvedCalls });
     return { status: 'installed', lang, documents: compact.paths.length, resolvedCalls, durationMs: Date.now() - started, warnings };
   } finally {
-    fs.rmSync(tmp, { force: true });
     for (const r of all(runs)) fs.rmSync(r.output, { force: true });
   }
 }

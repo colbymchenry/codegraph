@@ -164,7 +164,7 @@ describe('SCIP merge (TypeScript fixture)', () => {
     const bad = await produceIndex(cg.scipReadDb(), dir, 'typescript');
     expect(bad.status).toBe('rejected');
     expect(fs.readFileSync(indexPath(dir, 'typescript')).equals(installed)).toBe(true);
-    expect(fs.readdirSync(scipDir(dir)).filter(f => f.endsWith('.tmp'))).toEqual([]);
+    expect(fs.readdirSync(scipDir(dir)).filter(f => /\.(tmp|raw)$/.test(f))).toEqual([]);
 
     const forced = await produceIndex(cg.scipReadDb(), dir, 'typescript', { force: true });
     expect(forced.status).toBe('installed');
@@ -263,7 +263,7 @@ describe('SCIP merge (TypeScript fixture)', () => {
     expect(runs()).toBe(4); // the light batch ('.', packages/a, packages/bad) fails, then each project alone
     expect(r).toMatchObject({ status: 'installed', documents: 2 }); // two copies of the same index, deduplicated
     expect(r.status === 'installed' && r.warnings).toEqual([expect.stringMatching(/^packages\/bad: .*exited 3/)]);
-    expect(fs.readdirSync(scipDir(dir)).filter(f => /\.tmp|\.part\d/.test(f))).toEqual([]);
+    expect(fs.readdirSync(scipDir(dir)).filter(f => /\.tmp|\.raw|\.part\d/.test(f))).toEqual([]);
     await cg.scipWrite(db => runScipPass(db, dir));
     expect(edge('sum', 'Invoice::totalPrice')?.provenance).toBe('scip');
   });

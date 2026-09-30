@@ -5,12 +5,33 @@
  * Language-specific literal rules live with their adapter (`indexers/*.ts`).
  */
 
-import { POSITION_ENCODING_UTF8, ScipOccurrence } from './reader';
+import { DescriptorKind, POSITION_ENCODING_UTF8, ScipOccurrence } from './reader';
 
 /** Given the text after and before a type reference: does the brace that follows build that type? */
 export type LiteralShape = (tail: string, head: string) => boolean;
 
 export type CallShape = 'call' | 'new' | 'literal';
+
+export type SiteKind = 'calls' | 'instantiates';
+
+/** Symbol kinds a call can target: types (instantiated), methods and values (called). */
+export function isCallTarget(kind: DescriptorKind | undefined): boolean {
+  return kind === 'type' || kind === 'method' || kind === 'term';
+}
+
+/**
+ * The call-site rule. Compaction (which references an index keeps) and the
+ * merge (which it judges) both ask it, so the two can't drift apart — a
+ * reference compaction dropped is one the merge never sees. A type read as
+ * `X(…)`, `new X` or `X{…}` is an instantiation; a method or value followed by
+ * an argument list is a call. `shape` reads source text, so it is only asked
+ * for kinds that can be call targets.
+ */
+export function siteKind(kind: DescriptorKind | undefined, shape: () => CallShape | null): SiteKind | null {
+  if (kind === 'type') return shape() ? 'instantiates' : null;
+  if (kind === 'method' || kind === 'term') return shape() === 'call' ? 'calls' : null;
+  return null;
+}
 
 /** Strips one balanced `open…close` group (type arguments) from the start of `t`; null when it never closes. */
 export function skipGroup(t: string, open: string, close: string): string | null {

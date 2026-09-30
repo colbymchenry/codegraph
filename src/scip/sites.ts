@@ -12,9 +12,9 @@ import type { SqliteDatabase } from '../db/sqlite-adapter';
 import { INDEXERS } from './indexers';
 import { ParsedSymbol, ROLE_DEFINITION, ScipDocument, ScipOccurrence, parseSymbol } from './reader';
 import type { ScipLanguage } from './store';
-import { LiteralShape, callShape } from './syntax';
+import { LiteralShape, SiteKind, callShape, isCallTarget, siteKind } from './syntax';
 
-export type SiteKind = 'calls' | 'instantiates';
+export type { SiteKind } from './syntax';
 
 /** A call SCIP resolved to something outside the project (stdlib, dependency). */
 export const EXTERNAL = '<external>';
@@ -200,7 +200,7 @@ export function scipSites(
         if (!parsed) continue;
         projectSymbols.add(o.symbol);
         const { name, kind } = parsed.last;
-        if (!known || (kind !== 'method' && kind !== 'term' && kind !== 'type')) continue;
+        if (!known || !isCallTarget(kind)) continue;
         const node = nodes.definition(doc.relativePath, o.range.startLine, CONSTRUCTOR_NAMES[name] ?? name,
           kind === 'type' ? TYPE_KINDS : kind === 'term' ? CALLED_VALUE_KINDS : CALLABLE_KINDS);
         const first = symToNode.get(o.symbol);
@@ -281,15 +281,12 @@ function classify(
   const parsed = parse(o.symbol);
   if (!parsed) return null;
   const { name, kind } = parsed.last;
-  if (kind !== 'type' && kind !== 'method' && kind !== 'term') return null; // before the (costlier) text check
-  const shape = callShape(o, encoding, lines, literal);
-
-  if (kind === 'type') {
-    if (!shape) return null; // Foo(…), new Foo, Foo{…}
+  const site = siteKind(kind, () => callShape(o, encoding, lines, literal));
+  if (!site) return null;
+  if (site === 'instantiates') { // Foo(…), new Foo, Foo{…}
     const node = symToNode.get(o.symbol);
     return { kind: 'instantiates', name: node?.name ?? name, target: node?.id ?? null, symbol: o.symbol };
   }
-  if (shape !== 'call') return null;
   if (kind === 'method' && name === '<constructor>') {
     const cls = symToNode.get(parsed.owner);
     return { kind: 'instantiates', name: cls?.name ?? parse(parsed.owner)?.last.name ?? name, target: cls?.id ?? null, symbol: parsed.owner };
@@ -297,8 +294,7 @@ function classify(
   const node = symToNode.get(o.symbol);
   if (kind === 'method') return { kind: 'calls', name: node?.name ?? name, target: node?.id ?? null, symbol: o.symbol };
   // A called `term` is a function-valued binding (`const f = () => …`, `const expect: Expect`, a Go interface method) — judged only when it maps to a node.
-  if (kind === 'term' && node) return { kind: 'calls', name: node.name, target: node.id, symbol: o.symbol };
-  return null;
+  return node ? { kind: 'calls', name: node.name, target: node.id, symbol: o.symbol } : null;
 }
 
 /** codegraph's own edges at the same kind of site, for callers in `files`. */

@@ -19,8 +19,8 @@ import { MergeOutcome, markStaleForFiles, merge } from './merge';
 import { loadScipIndex, scanIndex } from './reader';
 import { heuristicSites, scipSites } from './sites';
 import {
-  MergedDocument, ScipLanguage, ScipMeta, SCIP_LANGUAGES, availableIndexes, indexPath,
-  indexedHashes, mergedDocumentCounts, metaPath, readHashed, recordMergedDocuments, writeFileAtomic,
+  MergedDocument, ScipLanguage, SCIP_LANGUAGES, availableIndexes, indexPath,
+  indexedHashes, installIndex, mergedDocumentCounts, readHashed, recordMergedDocuments,
 } from './store';
 
 export { ScipLanguage, SCIP_LANGUAGES } from './store';
@@ -168,15 +168,10 @@ export function importScipFile(
     const h = readHashed(projectRoot, p)?.hash;
     if (h) hashes[p] = h;
   }
-  const target = indexPath(projectRoot, resolved);
-  fs.mkdirSync(path.dirname(target), { recursive: true });
-  compact.write(`${target}.${process.pid}.tmp`);
-  fs.renameSync(`${target}.${process.pid}.tmp`, target);
-  const meta: ScipMeta = {
+  installIndex(projectRoot, resolved, f => compact.write(f), {
     tool: compact.meta!.toolName, toolVersion: compact.meta!.toolVersion, producedAt: builtAt, hashes,
     resolvedCalls: compact.resolvedCalls(),
-  };
-  writeFileAtomic(metaPath(projectRoot, resolved), JSON.stringify(meta));
+  });
   return { lang: resolved, documents: compact.paths.length, newerThanIndex };
 }
 

@@ -6,9 +6,11 @@
  *   <lang>.meta.json  tool info + the content hash of every file as it was when
  *                     the indexer STARTED (the "snapshot")
  *
- * A SCIP document is trusted only when its snapshot hash equals the hash
- * codegraph stored for the file (`files.content_hash`) — i.e. both indexes saw
- * the same bytes. Anything else is stale and its call sites are left alone.
+ * A SCIP document is trusted only when its snapshot hash, the hash codegraph
+ * stored for the file (`files.content_hash`) and the file on disk all agree —
+ * both indexes saw the bytes the merge reads call text from. Anything else is
+ * stale and its call sites are left alone. The gate itself runs in the pass
+ * (index.ts); this module owns the hashes it compares.
  *
  * `scip_documents` records which documents are currently merged into the graph.
  * It is created lazily and sits outside the upstream migration chain, so an
@@ -71,6 +73,25 @@ export function readMeta(projectRoot: string, lang: ScipLanguage): ScipMeta | nu
   } catch {
     return null;
   }
+}
+
+/**
+ * Installs an index (`write` produces it at a temp path) and then the snapshot
+ * that vouches for it — in that order: a crash between the two leaves a new
+ * index under an old snapshot, which only makes more documents read as stale,
+ * never a wrong edge.
+ */
+export function installIndex(projectRoot: string, lang: ScipLanguage, write: (file: string) => void, meta: ScipMeta): void {
+  const final = indexPath(projectRoot, lang);
+  const tmp = `${final}.${process.pid}.tmp`;
+  fs.mkdirSync(path.dirname(final), { recursive: true });
+  try {
+    write(tmp);
+    fs.renameSync(tmp, final);
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
+  writeFileAtomic(metaPath(projectRoot, lang), JSON.stringify(meta));
 }
 
 /** Atomic write: a concurrent reader sees the old file or the new one, never half of either. */

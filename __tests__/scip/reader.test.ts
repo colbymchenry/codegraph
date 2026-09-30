@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import * as path from 'path';
-import { decodeScipIndex, loadScipIndex, parseSymbol, ROLE_DEFINITION } from '../../src/scip/reader';
+import { decodeScipIndex, escapeIdentifier, loadScipIndex, parseSymbol, ROLE_DEFINITION } from '../../src/scip/reader';
 import { looksLikeCall } from '../../src/scip/syntax';
 
 const FIXTURE = path.join(__dirname, '..', 'fixtures', 'scip-ts');
@@ -63,6 +63,14 @@ describe('SCIP reader', () => {
     expect(parseSymbol('scip-go gomod example.com/x v1 `example.com/x`/Server#Serve(+1).')?.last)
       .toEqual({ name: 'Serve', kind: 'method' });
     expect(parseSymbol('local 12')).toBeNull();
+  });
+
+  it('reads back what escapeIdentifier writes', () => {
+    for (const name of ['plain_Name$1', '#private', 'src/a b.ts', 'we`ird', '<constructor>']) {
+      const symbol = `tsgo . . . ${escapeIdentifier('src/dir/file.ts')}/12/${escapeIdentifier(name)}().`;
+      expect(parseSymbol(symbol)?.last).toEqual({ name, kind: 'method' });
+    }
+    expect(escapeIdentifier('plain')).toBe('plain');
   });
 
   it('recognizes call shapes', () => {

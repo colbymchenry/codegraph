@@ -22,7 +22,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { pathToFileURL } from 'url';
-import { ROLE_DEFINITION, ScipOccurrence, encodeDocument, encodeMetadata } from '../reader';
+import { ROLE_DEFINITION, ScipOccurrence, encodeDocument, encodeMetadata, escapeIdentifier as esc } from '../reader';
 import { RUN_WARNING } from './index';
 import { packageVersion } from './typescript';
 
@@ -92,9 +92,6 @@ async function load(tsDir: string, root: string): Promise<Loaded> {
     version,
   };
 }
-
-/** A SCIP identifier: plain when it can be, else backtick-quoted. */
-const esc = (s: string) => (/^[\w+$-]+$/.test(s) ? s : '`' + s.replace(/`/g, '``') + '`');
 
 /** 0-based starts of each line, split exactly like the merge splits text (`\r?\n`). */
 function lineStarts(text: string): number[] {

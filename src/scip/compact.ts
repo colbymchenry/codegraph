@@ -19,7 +19,7 @@ import * as path from 'path';
 import { INDEXERS } from './indexers';
 import { IndexMeta, ParsedSymbol, ROLE_DEFINITION, ScipOccurrence, encodeDocument, encodeMetadata, parseSymbol, scanIndex } from './reader';
 import type { ScipLanguage } from './store';
-import { callShape } from './syntax';
+import { callShape, isCallTarget, siteKind } from './syntax';
 
 export class Compactor {
   meta: IndexMeta | null = null;
@@ -43,16 +43,15 @@ export class Compactor {
       const lines = readLines(path.join(this.projectRoot, doc.relativePath));
       const kept: ScipOccurrence[] = [];
       for (const o of doc.occurrences) {
-        const kind = this.parse(o.symbol)?.last.kind; // null for locals
-        if (kind !== 'method' && kind !== 'term' && kind !== 'type') continue;
+        const kind = this.parse(o.symbol)?.last.kind; // undefined for locals
+        if (!isCallTarget(kind)) continue;
         if (o.roles & ROLE_DEFINITION) {
           kept.push(o);
           this.defined.add(o.symbol);
           continue;
         }
         if (!lines) continue; // unreadable now: the merge would treat the file as stale anyway
-        const shape = callShape(o, doc.positionEncoding, lines, literal);
-        if (kind === 'type' ? !shape : shape !== 'call') continue;
+        if (!siteKind(kind, () => callShape(o, doc.positionEncoding, lines, literal))) continue;
         kept.push(o);
         this.callRefs.set(o.symbol, (this.callRefs.get(o.symbol) ?? 0) + 1);
       }

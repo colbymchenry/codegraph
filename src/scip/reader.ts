@@ -386,6 +386,13 @@ export function parseSymbol(symbol: string): ParsedSymbol | null {
   return last ? { owner: symbol.slice(0, lastStart), last } : null;
 }
 
+const PLAIN_IDENTIFIER = /^[\w+$-]+$/;
+
+/** A descriptor name as SCIP spells it — plain when it can be, else backtick-quoted — so parseSymbol reads it back. */
+export function escapeIdentifier(name: string): string {
+  return PLAIN_IDENTIFIER.test(name) ? name : '`' + name.replace(/`/g, '``') + '`';
+}
+
 function readIdentifier(s: string, i: number): { name: string; end: number } | null {
   if (s[i] === '`') {
     let name = '';
@@ -400,6 +407,6 @@ function readIdentifier(s: string, i: number): { name: string; end: number } | n
     }
   }
   let j = i;
-  while (j < s.length && /[\w+$-]/.test(s[j]!)) j++;
+  while (j < s.length && PLAIN_IDENTIFIER.test(s[j]!)) j++;
   return j > i ? { name: s.slice(i, j), end: j } : null;
 }
