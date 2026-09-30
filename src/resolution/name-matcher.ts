@@ -935,7 +935,13 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   return isCrossFileReachable(candidate, ref, context);
 }
 
-const JS_FAMILY = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx']);
+/**
+ * Languages whose calls are JS/TS calls — Vue, Svelte and Astro components'
+ * scripts and template expressions included: a bare `t('key')` in a `.vue`
+ * file resolves lexically exactly as in a `.ts` one.
+ */
+const JS_FAMILY = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx', 'vue', 'svelte', 'astro']);
+const JS_TS = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx']);
 
 /**
  * Whether a JS/TS `calls` ref is a RECEIVER-LESS call — `serialize(x)`, not
@@ -4283,9 +4289,11 @@ export function matchJsStoreBindingCall(ref: UnresolvedRef, context: ResolutionC
 }
 
 /** A qualified untyped chain is useful source evidence, not permission to
- * infer a property type. Framework resolution runs before this guard. */
+ * infer a property type. Framework resolution runs before this guard. Vue,
+ * Svelte and Astro files keep resolving them: there `api.groupReports.getAll()`
+ * reaches its API client class far more often than a wrong namesake. */
 export function isUnresolvedJsMemberCall(ref: UnresolvedRef): boolean {
-  return ref.referenceKind === 'calls' && JS_FAMILY.has(ref.language) &&
+  return ref.referenceKind === 'calls' && JS_TS.has(ref.language) &&
     !/^(?:this|window)\./.test(ref.referenceName) &&
     /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*){2,}$/.test(ref.referenceName);
 }

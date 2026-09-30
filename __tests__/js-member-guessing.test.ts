@@ -12,6 +12,12 @@
  *   interface's `it` property or a class's `describe` field.
  *
  * A default import of a local module's instance still resolves by method.
+ *
+ * Vue, Svelte and Astro files follow the same rules (halo's 562 `t(…)` calls
+ * went to an interface's `t`). "Outside the repository" means a package the
+ * file's package.json declares, a Node built-in or a framework's virtual
+ * module: an alias the resolver doesn't know (SvelteKit's `$lib/…`, a nested
+ * Nuxt app's `~/…`) is still the project's.
  */
 import { describe, it, expect, afterAll } from 'vitest';
 import * as fs from 'fs';
@@ -116,6 +122,105 @@ describe('JS/TS: a member picked by name alone', () => {
       const fromApp = callsFrom('src/App.tsx');
       expect(fromApp.filter((q) => q.endsWith('useQuery'))).toEqual([]);
       expect(fromApp).toContain('useAuth');
+    } finally {
+      cg.close();
+    }
+  });
+
+  it('applies to Vue and Svelte files, and an unknown alias is still the project', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-js-sfc-guess-'));
+    roots.push(root);
+    const files: Record<string, string> = {
+      'frontend/package.json': JSON.stringify({ name: 'frontend', dependencies: { 'vue-i18n': '*', dayjs: '*', '@app/shared': 'workspace:*' } }),
+      'shared/index.ts': `export function formatUrl(u: string) { return u; }
+`,
+      'frontend/types/context.ts': `export interface ProvidersContext {
+  t: (key: string) => string;
+}
+`,
+      'frontend/test/mocks.ts': `export function dayjs() { return 0; }
+`,
+      'frontend/composables/store.ts': `export function useLabelStore() { return {}; }
+`,
+      'frontend/composables/use-labels.ts': `import { useLabelStore } from '~/composables/store';
+export function useLabels() { return useLabelStore(); }
+`,
+      'frontend/pages/labels.vue': `<script setup lang="ts">
+import { useI18n } from 'vue-i18n';
+import dayjs from 'dayjs';
+import { useLabelStore } from '~/composables/store';
+import { formatUrl } from '@app/shared';
+const { t } = useI18n();
+const url = formatUrl('/labels');
+const title = t('labels.title');
+const today = dayjs();
+const store = useLabelStore();
+</script>
+<template><h1>{{ title }}</h1></template>
+`,
+      'docs/package.json': JSON.stringify({ name: 'docs', devDependencies: { '@sveltejs/kit': '*' } }),
+      'docs/src/lib/design.ts': `export function useDesignSystem() { return 1; }
+`,
+      'docs/src/lib/router.ts': `export function goto(path: string) { return path; }
+`,
+      'docs/src/lib/use.ts': `import { useDesignSystem } from '$lib/design';
+export const current = () => useDesignSystem();
+`,
+      'docs/src/lib/instance.js': `export const DEV = true;
+if (DEV) {
+  const fetch = globalThis.fetch;
+  globalThis.fetch = async (info) => fetch(info);
+}
+`,
+      'docs/src/lib/Map.svelte': `<div>map</div>
+`,
+      'docs/src/routes/+page.svelte': `<script lang="ts">
+  import Map from '../lib/Map.svelte';
+  import { useDesignSystem } from '$lib/design';
+  import { goto } from '$app/navigation';
+  const ds = useDesignSystem();
+  function go() { goto('/'); fetch('/api'); }
+</script>
+<button on:click={go}>{ds}</button>
+`,
+      // Deno: the import map says `@std/assert` comes from JSR.
+      'deno/deno.json': JSON.stringify({ imports: { '@std/assert': 'jsr:@std/assert@^1', 'app/': '../src/' } }),
+      'deno/test/assert.ts': `export function assertEquals(a: unknown, b: unknown) { return a === b; }
+`,
+      'deno/app.test.ts': `import { assertEquals } from '@std/assert';
+assertEquals(1, 1);
+`,
+    };
+    for (const [rel, content] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+      fs.writeFileSync(path.join(root, rel), content);
+    }
+    const cg = await CodeGraph.init(root, { index: true });
+    try {
+      const callsFrom = (file: string): string[] => {
+        const ids = cg.getNodesInFile(file).map((n) => n.id);
+        return cg
+          .getOutgoingEdgesFrom(ids, ['calls'])
+          .map((e) => cg.getNode(e.target)?.qualifiedName ?? '?')
+          .sort();
+      };
+      const fromVue = callsFrom('frontend/pages/labels.vue');
+      expect(fromVue).not.toContain('ProvidersContext::t');
+      expect(fromVue).not.toContain('dayjs');
+      expect(fromVue).toContain('useLabelStore');
+      // A `workspace:*` dependency is in the repository.
+      expect(fromVue).toContain('formatUrl');
+      expect(callsFrom('frontend/composables/use-labels.ts')).toContain('useLabelStore');
+      const fromSvelte = callsFrom('docs/src/routes/+page.svelte');
+      expect(fromSvelte).toContain('useDesignSystem');
+      expect(fromSvelte).not.toContain('goto');
+      expect(fromSvelte).not.toContain('fetch');
+      expect(callsFrom('deno/app.test.ts')).not.toContain('assertEquals');
+      // A built-in's name imported from the project is the import.
+      const svelteIds = cg.getNodesInFile('docs/src/routes/+page.svelte').map((n) => n.id);
+      const imported = cg.getOutgoingEdgesFrom(svelteIds, ['imports']).map((e) => cg.getNode(e.target)!.filePath);
+      expect(imported).toContain('docs/src/lib/Map.svelte');
+      expect(callsFrom('docs/src/lib/use.ts')).toContain('useDesignSystem');
     } finally {
       cg.close();
     }

@@ -41,6 +41,10 @@ import { lexicalPathWithinRoot } from '../utils';
 import type { ReExport } from './types';
 import { LRUCache } from './lru-cache';
 import { JS_BUILT_INS } from './js-builtins';
+import { builtinModules } from 'module';
+import { parse as parseJsonc } from 'jsonc-parser';
+
+const NODE_BUILTINS = new Set(builtinModules);
 
 /** Node kinds that can declare supertypes (extends/implements). */
 const SUPERTYPE_BEARING_KINDS = new Set<Node['kind']>([
@@ -439,6 +443,7 @@ export class ReferenceResolver {
     this.supertypeGen++;
     this.nodesByKindCache.clear();
     this.fileExistsMemo.clear();
+    this.manifestScopes.clear();
     this.knownNames = null;
     this.knownFiles = null;
     this.cachesWarmed = false;
@@ -503,8 +508,8 @@ export class ReferenceResolver {
       resolveImport: (ref) => resolveViaImport(ref, this.context),
       isOutOfRepoImport: (source, fromFile, language) =>
         isExternalImport(source, language, this.context) &&
-        !this.isOwnPackage(source) &&
-        resolveImportPath(source, fromFile, language, this.context) === null,
+        resolveImportPath(source, fromFile, language, this.context) === null &&
+        this.isDeclaredOutsidePackage(source, fromFile),
       getNodesInFile: (filePath: string) => {
         if (!this.nodeCache.has(filePath)) {
           this.nodeCache.set(filePath, this.queries.getNodesByFile(filePath));
@@ -2343,10 +2348,13 @@ export class ReferenceResolver {
   private isBuiltInOrExternal(ref: UnresolvedRef): boolean {
     const name = ref.referenceName;
     const isJsTs = ref.language === 'typescript' || ref.language === 'javascript'
-      || ref.language === 'tsx' || ref.language === 'jsx' || ref.language === 'arkts';
+      || ref.language === 'tsx' || ref.language === 'jsx' || ref.language === 'arkts'
+      || ref.language === 'vue' || ref.language === 'svelte' || ref.language === 'astro';
 
-    // JavaScript/TypeScript built-ins
-    if (isJsTs && JS_BUILT_INS.has(name)) {
+    // JavaScript/TypeScript built-ins — unless the file imports its own
+    // binding of that name (`import Map from './Map.svelte'`).
+    if (isJsTs && JS_BUILT_INS.has(name) &&
+        !this.context.getImportMappings(ref.filePath, ref.language).some((m) => m.localName === name)) {
       return true;
     }
 
@@ -2873,20 +2881,67 @@ export class ReferenceResolver {
   }
 
   /** The repository's own package name, from its root package.json; null without one. */
-  private ownPackageName: string | null | undefined;
+  /** Per directory: the package names its package.json and every enclosing one own and depend on. */
+  private manifestScopes = new Map<string, { own: Set<string>; deps: Set<string> }>();
 
-  /** `axios` (or `axios/unsafe/…`) inside the axios repository: a package importing itself. */
-  private isOwnPackage(source: string): boolean {
-    if (this.ownPackageName === undefined) {
-      let name: string | null = null;
-      try {
-        const json = JSON.parse(this.context.readFile('package.json') ?? 'null') as { name?: unknown } | null;
-        if (json && typeof json.name === 'string' && json.name.length > 0) name = json.name;
-      } catch { /* no or unreadable package.json */ }
-      this.ownPackageName = name;
+  /**
+   * Is `source` a package from outside the repository? Only when the importing
+   * file's package.json (or an enclosing one) declares it, or it is a Node
+   * built-in or a runtime's virtual module. A specifier nothing declares is
+   * an alias this resolver does not know — SvelteKit's `$lib/…`, Nuxt's
+   * `~/…`, a nested app's own `@/…` — and stays the project's.
+   */
+  private isDeclaredOutsidePackage(source: string, fromFile: string): boolean {
+    // Deno's standard library is `@std/…` from JSR.
+    if (/^(?:node|bun|jsr|npm|https?):/.test(source) || source.startsWith('@std/') || NODE_BUILTINS.has(source)) return true;
+    const name = source.startsWith('@') ? source.split('/').slice(0, 2).join('/') : source.split('/')[0]!;
+    const normalized = fromFile.replace(/\\/g, '/');
+    const scope = this.manifestScope(normalized.includes('/') ? normalized.slice(0, normalized.lastIndexOf('/')) : '');
+    if (scope.own.has(name)) return false;
+    if (scope.deps.has(name)) return true;
+    // SvelteKit's `$app/…` and Astro's `astro:…` belong to the framework —
+    // unless this repository is that framework.
+    const provider = source.startsWith('astro:') ? 'astro' : /^\$(?:app|env|service-worker)(?:\/|$)/.test(source) ? '@sveltejs/kit' : null;
+    return provider !== null && !scope.own.has(provider) && !this.context.getWorkspacePackages?.()?.byName.has(provider);
+  }
+
+  private manifestScope(dir: string): { own: Set<string>; deps: Set<string> } {
+    const memo = this.manifestScopes.get(dir);
+    if (memo) return memo;
+    const parent = dir === '' ? null : this.manifestScope(dir.includes('/') ? dir.slice(0, dir.lastIndexOf('/')) : '');
+    let scope = parent ?? { own: new Set<string>(), deps: new Set<string>() };
+    try {
+      const json = JSON.parse(this.context.readFile(dir ? `${dir}/package.json` : 'package.json') ?? 'null') as Record<string, unknown> | null;
+      if (json && typeof json === 'object') {
+        scope = { own: new Set(scope.own), deps: new Set(scope.deps) };
+        if (typeof json.name === 'string' && json.name.length > 0) scope.own.add(json.name);
+        for (const field of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+          const deps = json[field];
+          if (!deps || typeof deps !== 'object') continue;
+          for (const [dep, version] of Object.entries(deps)) {
+            // `workspace:*`, `file:../shared`, `link:…`: a package in this repository.
+            if (typeof version === 'string' && /^(?:workspace|file|link|portal):/.test(version)) scope.own.add(dep);
+            else scope.deps.add(dep);
+          }
+        }
+      }
+    } catch { /* no or unreadable package.json */ }
+    // A Deno import map names packages the same way — an entry that maps to a
+    // registry or a URL, not one that maps to a path in the repository.
+    for (const file of ['deno.json', 'deno.jsonc']) {
+      const raw = this.context.readFile(dir ? `${dir}/${file}` : file);
+      if (!raw) continue;
+      const json = parseJsonc(raw) as { imports?: Record<string, unknown> } | undefined;
+      const imports = json && typeof json === 'object' ? json.imports : undefined;
+      if (!imports || typeof imports !== 'object') continue;
+      for (const [key, target] of Object.entries(imports)) {
+        if (typeof target !== 'string' || !/^(?:jsr|npm|https?):/.test(target)) continue;
+        if (scope === parent) scope = { own: new Set(scope.own), deps: new Set(scope.deps) };
+        scope.deps.add(key.replace(/\/$/, ''));
+      }
     }
-    const own = this.ownPackageName;
-    return own !== null && (source === own || source.startsWith(`${own}/`));
+    this.manifestScopes.set(dir, scope);
+    return scope;
   }
 
   /** The one supertype-kind node a TypeScript value shares its name and file with. */
