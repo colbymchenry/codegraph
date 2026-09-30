@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- A C++ call into a macro-opened namespace, like `fmt::format("{}", x)`, now picks the overload its arguments fit. Before, the first overload indexed won: fmt's 1,400 `fmt::format` calls all reached the `text_style` overload in `color.h`. A narrow string literal now fits a narrow format string, a wide `L"…"` fits the wide overload, and the argument count has to fit too.
 - Calls inside an inline route handler now keep their receivers, so they resolve like any other method call. Before, Hono's `app.get('/', (c) => c.text('Hello'))` linked the route to the one other `text` method in the project, its client's `ClientResponse.text`; that happened in over 400 routes. A call like `userService.lookup(id)` reaches the service it names.
 - A Scala chained call like `xs.map { … }` no longer lands on an object that happens to be named `map`, as with cats' `alleycats.std.map` and its `syntax`/`instances` objects. A type or object in a chain is only matched when the receiver names what holds it, as in `sttp.client4.Response(…)`.
 - A Python call to a name the function or module binds itself now means that local value, not a same-named function in another file. In Django REST Framework's tests, `view = SomeView.as_view()` followed by `view(request)` had pointed at one test file's `def view`. The same goes for a parameter or a `for`/`with … as` target. A pytest fixture a test takes as a parameter is still the fixture.

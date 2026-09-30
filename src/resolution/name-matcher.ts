@@ -8178,7 +8178,7 @@ function matchCppMacroNamespaced(ref: UnresolvedRef, context: ResolutionContext)
   if (alias) target = alias + target.slice(head.length);
   const name = target.slice(target.lastIndexOf('::') + 2);
   if (!/^[A-Za-z_~]\w*$/.test(name)) return null;
-  let best: Node | null = null;
+  const matches: Node[] = [];
   for (const n of context.getNodesByName(name)) {
     if (n.language !== 'cpp' && n.language !== 'c') continue;
     if (!['function', 'method', 'class', 'struct', 'enum', 'type_alias', 'union', 'variable', 'constant'].includes(n.kind)) continue;
@@ -8187,9 +8187,92 @@ function matchCppMacroNamespaced(ref: UnresolvedRef, context: ResolutionContext)
       .sort((a, b) => a.start - b.start)
       .flatMap((f) => f.path);
     const effective = prefix.length > 0 ? `${prefix.join('::')}::${n.qualifiedName}` : alias ? n.qualifiedName : '';
-    if (effective !== target) continue;
-    // One of an overload set is as good as another; a declaration outside the tests over one in them.
-    if (!best || (isTestPath(best.filePath) && !isTestPath(n.filePath))) best = n;
+    if (effective === target) matches.push(n);
+  }
+  // A declaration outside the tests over one in them; among an overload set,
+  // the one the call's arguments fit: `fmt::format("{}", v)` is format.h's
+  // `format(format_string, T&&...)`, not color.h's `format(const text_style&, …)`.
+  const args = matches.length > 1 && ref.referenceKind === 'calls' ? cppCallArguments(ref, name, context) : null;
+  let best: Node | null = null;
+  let bestScore = -Infinity;
+  for (const n of matches) {
+    const score = (isTestPath(n.filePath) ? -10 : 0) + (args ? cppOverloadFit(n, name, args, context) : 0);
+    if (score > bestScore) { best = n; bestScore = score; }
   }
   return best ? { original: ref, targetNodeId: best.id, confidence: 0.8, resolvedBy: 'qualified-name' } : null;
+}
+
+/** Split `a, f(b, c), d<e, f>` at its top-level commas. */
+function splitCppTopLevel(text: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let cur = '';
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (ch === '"' || ch === "'") {
+      let j = i + 1;
+      while (j < text.length && text[j] !== ch) j += text[j] === '\\' ? 2 : 1;
+      cur += text.slice(i, j + 1);
+      i = j;
+      continue;
+    }
+    if (ch === '(' || ch === '[' || ch === '{' || ch === '<') depth++;
+    else if (ch === ')' || ch === ']' || ch === '}' || (ch === '>' && text[i - 1] !== '-')) depth = Math.max(0, depth - 1);
+    if (ch === ',' && depth === 0) { out.push(cur.trim()); cur = ''; continue; }
+    cur += ch;
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+
+/** The balanced `( … )` after `name` from `line`/`column` of `file` (up to a dozen lines), or null. */
+function cppParenListAfter(file: string, line: number, column: number, name: string, context: ResolutionContext): string | null {
+  const lines = context.getFileLines?.(file) ?? context.readFile(file)?.split(/\r?\n/) ?? [];
+  const text = lines.slice(line - 1, line + 11).join('\n');
+  const at = new RegExp(`\\b${name.replace(/[~]/g, '\\$&')}\\s*(?:<[^<>()]*>)?\\s*\\(`).exec(text.slice(column));
+  if (!at) return null;
+  const open = column + at.index + at[0].length - 1;
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    if (text[i] === '(') depth++;
+    else if (text[i] === ')' && --depth === 0) return text.slice(open + 1, i);
+  }
+  return null;
+}
+
+function cppCallArguments(ref: UnresolvedRef, name: string, context: ResolutionContext): string[] | null {
+  const list = cppParenListAfter(ref.filePath, ref.line, Math.max(0, ref.column), name, context);
+  return list === null ? null : splitCppTopLevel(list);
+}
+
+/** How well a call's arguments fit an overload's parameters: arity, and a string literal's first slot. */
+function cppOverloadFit(n: Node, name: string, args: string[], context: ResolutionContext): number {
+  if (n.kind !== 'function' && n.kind !== 'method') return -1;
+  const list = cppParenListAfter(n.filePath, n.startLine, 0, name, context);
+  if (list === null) return 0;
+  const params = splitCppTopLevel(list).filter((p) => p !== 'void');
+  // A pack is `T&&... args`, not the `...` inside `format_string<T...>`.
+  const isPack = (p: string): boolean => {
+    let flat = p;
+    for (let prev = ''; prev !== flat;) { prev = flat; flat = flat.replace(/<[^<>]*>/g, ''); }
+    return flat.includes('...');
+  };
+  const variadic = params.some(isPack);
+  const required = params.filter((p) => !isPack(p) && !/=/.test(p)).length;
+  let score = 0;
+  if (args.length < required || (!variadic && args.length > params.length)) score -= 3;
+  // Each string literal against its parameter: a string type by name over a
+  // template parameter that might be one (`const S&`), and a narrow literal
+  // never a wide parameter (`fmt::join(v, ", ")` is not xchar.h's `wstring_view`).
+  for (let i = 0; i < args.length && i < params.length; i++) {
+    const arg = args[i]!;
+    const param = params[i]!;
+    if (isPack(param)) break;
+    if (!/^(?:u8|u|U|L)?"|^FMT_STRING\s*\(/.test(arg)) continue;
+    const wideArg = /^L"/.test(arg);
+    const wideParam = /\bw(?:string|char_t|format|string_view)|wchar_t/.test(param);
+    if (wideArg !== wideParam && /string|char|Char|format/.test(param)) score -= 2;
+    else score += /string|char|Char|\bstr\b/.test(param) ? 3 : /^(?:const\s+)?[A-Z]\w{0,2}\s*[&*]{0,2}\s*\w*$/.test(param) ? 1 : -2;
+  }
+  return score;
 }
