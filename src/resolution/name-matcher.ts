@@ -2065,8 +2065,37 @@ function stdMethodNames(language: string): ReadonlySet<string> | null {
     case 'rust': return RUST_STD_METHODS;
     case 'kotlin': return KOTLIN_STD_METHODS;
     case 'csharp': return CSHARP_STD_METHODS;
+    case 'dart': return DART_STD_METHODS;
     default: return null;
   }
+}
+
+/** Methods of Dart's String, List, Iterable, Map and Set — names a project type rarely carries itself. */
+const DART_STD_METHODS: ReadonlySet<string> = new Set([
+  'endsWith', 'startsWith', 'contains', 'split', 'substring', 'trim', 'trimLeft', 'trimRight', 'toLowerCase',
+  'toUpperCase', 'replaceAll', 'replaceFirst', 'replaceRange', 'indexOf', 'lastIndexOf', 'padLeft', 'padRight',
+  'codeUnitAt', 'allMatches', 'firstMatch', 'hasMatch', 'addAll', 'removeAt', 'removeWhere', 'removeLast',
+  'retainWhere', 'insertAll', 'where', 'whereType', 'forEach', 'toList', 'toSet', 'join', 'reduce', 'fold',
+  'any', 'every', 'firstWhere', 'lastWhere', 'singleWhere', 'containsKey', 'containsValue', 'putIfAbsent',
+  'sublist', 'take', 'takeWhile', 'skip', 'skipWhile', 'expand', 'cast', 'compareTo', 'elementAt', 'followedBy',
+  'asMap', 'getRange', 'setAll', 'fillRange', 'shuffle', 'sort', 'indexWhere', 'lastIndexWhere',
+]);
+
+/**
+ * Whether a receiver is named after the owner of `method` — for a Dart
+ * extension, after the type it is `on`: getx's `ext.endsWith(".avi")` on a
+ * String shares a word with `RxStringExt`, none with its `Rx<String>`.
+ */
+function receiverNamesOwner(receiver: string, method: Node, context: ResolutionContext): boolean {
+  if (method.language === 'dart') {
+    const cut = method.qualifiedName.lastIndexOf('::');
+    const owner = cut > 0 ? method.qualifiedName.slice(0, cut).split('::').pop()! : '';
+    const decl = owner ? context.getNodesByName(owner).find((n) => n.language === 'dart' && n.filePath === method.filePath) : undefined;
+    const line = decl ? (context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [])[decl.startLine - 1] ?? '' : '';
+    const on = /\bextension\s+\w*\s*(?:<[^>]*>)?\s*on\s+([\w<>, ?]+?)\s*\{/.exec(line)?.[1];
+    if (on) return sharesReceiverWord(receiver, { ...method, qualifiedName: `${on.replace(/[<>, ?]+/g, '')}::${method.name}` });
+  }
+  return sharesReceiverWord(receiver, method);
 }
 
 const CSHARP_ALIASES = new WeakMap<ResolutionContext, Map<string, Map<string, string>>>();
@@ -6635,7 +6664,7 @@ export function matchMethodCall(
         // untyped receiver (`sym.map(…)`, `w.Header().Get(…)`,
         // `reader.Value.ToString()`) is the library type's.
         !(stdMethodNames(ref.language)?.has(methodName!) &&
-          !/^(?:self|Self|this|base)$/.test(objectOrClass!) && !sharesReceiverWord(receiverLink(objectOrClass!), targetMethods[0]!)) &&
+          !/^(?:self|Self|this|base)$/.test(objectOrClass!) && !receiverNamesOwner(receiverLink(objectOrClass!), targetMethods[0]!, context)) &&
         !(UNTYPED_RECEIVER_LANGUAGES.has(ref.language) && !/^(?:self|self\.class|this|super|weak_?self|strong_?self)$/i.test(objectOrClass!) &&
           !sharesReceiverWord(objectOrClass!, targetMethods[0]!) &&
           !(ref.language === 'objc' && objcReceiverReaches(objectOrClass!, targetMethods[0]!, context)) &&
@@ -6662,7 +6691,7 @@ export function matchMethodCall(
       // first-indexed duplicate (#1079).
       const std = stdMethodNames(ref.language)?.has(methodName!) && !/^(?:self|Self|this|base)$/.test(objectOrClass!);
       for (const method of preferCallSiteFile(targetMethods, ref.filePath)) {
-        if (std && !sharesReceiverWord(receiverLink(objectOrClass!), method)) continue;
+        if (std && !receiverNamesOwner(receiverLink(objectOrClass!), method, context)) continue;
         // The owner type's own name — not its namespace (`eShop.ClientApp…`
         // shares `Client` with every `httpClient`) nor the method's.
         const cut = method.qualifiedName.lastIndexOf('::');

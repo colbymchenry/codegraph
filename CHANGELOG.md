@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- A Dart call like `ext.endsWith(".avi")` or `map.putIfAbsent(…)` on a value whose type isn't known now counts as Dart's own String, List or Map method. It no longer lands on a project method of the same name. A Dart extension is also matched by the type it extends, not by its own name, so getx's `ext.endsWith` on a String stopped reaching `extension RxStringExt on Rx<String>`.
 - Kotlin calls inside a DSL lambda now reach the lambda's own receiver. That receiver comes from the function the lambda is passed to, even through a typealias like koin's `Definition<T> = Scope.(…) -> T`. It also wins over other types the project uses as lambda receivers elsewhere. On koin, over 2,000 `get()` calls in `single { … }` now reach `Scope.get` instead of `Koin.get`; on Exposed, `varchar(…)` inside a table object reaches `Table.varchar`; on kotlinx.coroutines, `launch { }` reaches `CoroutineScope.launch`.
 - A Swift call on a property declared with a type, like Kingfisher's `var cache: ImageCache!` or `self.storage.write(…)`, now reaches that type's method or one it inherits. It no longer lands on a subclass override in a test, or on another type's method of the same name.
 - Calls in your own JavaScript no longer link to a same-named function inside a vendored minified script, like a `*.min.js` or a bundle made of a few enormous lines. Those names are mangled. In healthchecks, every jQuery `$(…)` call had gone to a one-letter helper inside `bootstrap-native.min.js`.
