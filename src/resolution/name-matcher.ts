@@ -1516,6 +1516,46 @@ const OBJC_SYSTEM_SUPERS: Readonly<Record<string, string>> = {
   NSControl: 'NSView', NSImageView: 'NSControl', NSButton: 'NSControl', NSTextField: 'NSControl', NSTableView: 'NSControl',
 };
 
+/**
+ * Whether an Objective-C receiver's type owns `method`, in its hierarchy: the
+ * receiver names a class (`[AllTypesObject objectsInRealm:…]` — a class
+ * method inherited from RLMObject), or is a property one of whose
+ * `@property … Type *name` declarations gives such a type
+ * (`managed.anyDataObj` → RLMSet, for `containsObject:`).
+ */
+function objcReceiverReaches(receiver: string, method: Node, context: ResolutionContext): boolean {
+  const cut = method.qualifiedName.lastIndexOf('::');
+  if (cut < 0) return false;
+  const owner = method.qualifiedName.slice(0, cut);
+  let types: string[] = [];
+  if (/^[A-Z]\w*$/.test(receiver)) {
+    if (context.getNodesByName(receiver).some((n) => n.kind === 'class' && n.language === 'objc')) types = [receiver];
+  } else if (receiver.includes('.')) types = objcPropertyTypes(receiver.split('.').pop()!, context);
+  const seen = new Set<string>();
+  const queue = [...types];
+  while (queue.length > 0 && seen.size < 40) {
+    const name = queue.shift()!;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    if (name === owner) return true;
+    queue.push(...objcSupertypesOf(name, context));
+  }
+  return false;
+}
+
+/** The classes the `@property … Type *name` declarations of `name` give. */
+function objcPropertyTypes(name: string, context: ResolutionContext): string[] {
+  const types = new Set<string>();
+  const decl = new RegExp(`@property\\s*(?:\\([^)]*\\)\\s*)?([A-Z]\\w*)\\s*(?:<[^;]*>\\s*)?\\*\\s*(?:_Nullable\\s+|_Nonnull\\s+)?${name}\\b`);
+  for (const n of context.getNodesByName(name)) {
+    if (n.kind !== 'property' || n.language !== 'objc') continue;
+    const line = context.getFileLines?.(n.filePath)?.[n.startLine - 1] ?? context.readFile(n.filePath)?.split('\n')[n.startLine - 1] ?? '';
+    const t = decl.exec(line)?.[1];
+    if (t) types.add(t);
+  }
+  return [...types];
+}
+
 /** The superclasses an Objective-C class's `@interface` declarations name. */
 function objcSupertypesOf(name: string, context: ResolutionContext): string[] {
   let memo = OBJC_SUPERS.get(context);
@@ -4333,7 +4373,8 @@ export function matchMethodCall(
     // 1,201 times; lobsters' `value.to_s` to a short-id class's.
     if (targetMethods.length === 1 && !narrowed && targetMethods[0]!.language === ref.language &&
         !(UNTYPED_RECEIVER_LANGUAGES.has(ref.language) && !/^(?:self|self\.class|this|super|weak_?self|strong_?self)$/i.test(objectOrClass!) &&
-          !sharesReceiverWord(objectOrClass!, targetMethods[0]!))) {
+          !sharesReceiverWord(objectOrClass!, targetMethods[0]!) &&
+          !(ref.language === 'objc' && objcReceiverReaches(objectOrClass!, targetMethods[0]!, context)))) {
       return {
         original: ref,
         targetNodeId: targetMethods[0]!.id,
