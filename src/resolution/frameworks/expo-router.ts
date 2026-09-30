@@ -713,6 +713,7 @@ function scoreMatch(href: string[], route: string[]): number | null {
 export const expoRouterResolver: FrameworkResolver = {
   name: 'expo-router',
   languages: [...ROUTE_LANGUAGES],
+  appDependencies: ['expo-router'],
 
   detect(context: ResolutionContext): boolean {
     if (dependsOn(context, 'expo-router')) return true;
