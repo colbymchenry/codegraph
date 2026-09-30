@@ -7962,7 +7962,44 @@ export function matchReference(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
-  return gateLanguageMatch(matchReferenceInner(ref, context), ref, context);
+  const result = gateLanguageMatch(matchReferenceInner(ref, context), ref, context);
+  return result ? retargetSelfOverload(result, ref, context) : result;
+}
+
+/** Languages whose methods overload by arity. */
+const OVERLOADING_LANGUAGES: ReadonlySet<string> = new Set(['csharp', 'java', 'kotlin', 'swift', 'cpp', 'scala', 'dart', 'vbnet']);
+
+/**
+ * A call a method makes to its own name, with arguments its own parameters
+ * cannot take, is to another overload of it: Newtonsoft's
+ * `DeserializeXNode(value)` body `return DeserializeXNode(value, null);`
+ * bound to itself, so the two-argument overload never saw the one-argument
+ * one among its callers. The same-owner overload the argument count fits.
+ */
+function retargetSelfOverload(result: ResolvedRef, ref: UnresolvedRef, context: ResolutionContext): ResolvedRef {
+  if (result.targetNodeId !== ref.fromNodeId || ref.referenceKind !== 'calls' || !OVERLOADING_LANGUAGES.has(ref.language)) return result;
+  const self = context.getNodeById?.(ref.fromNodeId);
+  if (!self || (self.kind !== 'method' && self.kind !== 'function')) return result;
+  const name = self.name;
+  const args = cppParenListAfter(ref.filePath, ref.line, Math.max(0, ref.column), name, context);
+  if (args === null) return result;
+  const argc = args.trim() === '' ? 0 : splitCppTopLevel(args).length;
+  const arity = (n: Node): { min: number; max: number } | null => {
+    const list = cppParenListAfter(n.filePath, n.startLine, 0, name, context);
+    if (list === null) return null;
+    const params = splitCppTopLevel(list).filter((p) => p !== '' && p !== 'void');
+    const variadic = params.some((p) => /\.\.\.|\bparams\s|\bvararg\s/.test(p.replace(/<[^<>]*>/g, '')));
+    const min = params.filter((p) => !/=/.test(p) && !/\.\.\.|\bparams\s|\bvararg\s/.test(p.replace(/<[^<>]*>/g, ''))).length;
+    return { min, max: variadic ? Infinity : params.length };
+  };
+  const own = arity(self);
+  if (!own || (argc >= own.min && argc <= own.max)) return result;
+  const owner = self.qualifiedName.slice(0, Math.max(0, self.qualifiedName.lastIndexOf('::')));
+  const fits = context.getNodesInFile(self.filePath).filter((n) =>
+    n.id !== self.id && n.name === name && (n.kind === 'method' || n.kind === 'function') &&
+    n.qualifiedName.slice(0, Math.max(0, n.qualifiedName.lastIndexOf('::'))) === owner &&
+    ((a) => a !== null && argc >= a.min && argc <= a.max)(arity(n)));
+  return fits.length === 1 ? { ...result, targetNodeId: fits[0]!.id } : result;
 }
 
 function matchReferenceInner(

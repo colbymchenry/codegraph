@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- A method that calls another overload of itself now links to that overload rather than to itself. An example is `toInstant(instant)` returning `toInstant(instant, Instant.EPOCH)`. The fuller overload now lists its convenience overloads among its callers, so its impact includes them. This applies to Java, C#, Kotlin, Swift, C++, Scala, Dart and VB.NET. Real recursion is unchanged.
 - In a project with a React front end, the React rules for hooks (`use…`) and contexts (`…Context`, `…Provider`) no longer apply to backend code. In halo, a Spring app with a React UI, Java imports such as `SecurityContext` and `ObjectProvider` had been handled as React contexts.
 - In a project with a Vue front end, the backend's calls no longer land on Vue components. mealie's Python `QueryFilterBuilder(…)` had been linking to the `QueryFilterBuilder.vue` component. The Vue rules (compiler macros, Nuxt auto-imports, components by name) now apply only to the app's scripts.
 - Production code no longer links to a same-named symbol inside a test suite, since tests aren't built into the program. Before, typeorm's `Record<string, …>` types reached a test entity called `Record`, and okhttp's sample `@Override` annotations reached a test's nested `Override` class. Test-support code a project ships, such as a `testing/` folder or a `*-test` module, stays in reach.
