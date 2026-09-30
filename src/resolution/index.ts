@@ -21,7 +21,7 @@ import {
   isImportableKind,
   CPP_DEFINE_SIGNATURE,
 } from './types';
-import { matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos } from './name-matcher';
+import { matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles, matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesCodeBoundary, gateLanguageMatch, dumpNameMatcherProfile, clearNameMatcherMemos, isRustNameInScope } from './name-matcher';
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
@@ -994,9 +994,10 @@ export class ReferenceResolver {
       ref,
       this.context,
     );
-    const resolved = candidate?.resolvedBy === 'framework'
-      ? this.gateFrameworkLanguage(candidate, ref)
-      : this.gateLanguage(candidate, ref);
+    const scoped = this.gateRustScope(candidate, ref);
+    const resolved = scoped?.resolvedBy === 'framework'
+      ? this.gateFrameworkLanguage(scoped, ref)
+      : this.gateLanguage(scoped, ref);
     if (!resolved || ref.referenceKind !== 'calls') return resolved;
 
     const target = this.nodeById(resolved.targetNodeId);
@@ -2858,6 +2859,17 @@ export class ReferenceResolver {
     }
     if (isBoundToOutOfRepoImport(ref, this.context)) return null;
     return result;
+  }
+
+  /**
+   * A bare Rust name reaches only what is in scope — every strategy's result,
+   * a framework resolver's `Ok(x)` → `struct Ok` construction included (see
+   * isRustNameInScope).
+   */
+  private gateRustScope(result: ResolvedRef | null, ref: UnresolvedRef): ResolvedRef | null {
+    if (!result || ref.language !== 'rust' || !/^[A-Za-z_]\w*$/.test(ref.referenceName)) return result;
+    const target = this.nodeById(result.targetNodeId);
+    return target && !isRustNameInScope(target, ref, this.context) ? null : result;
   }
 
   /** The repository's own package name, from its root package.json; null without one. */
