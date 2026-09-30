@@ -616,9 +616,9 @@ function isLexicallyReachable(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): boolean {
-  // A function — or a type (`case class B()` in a test method) — declared
-  // inside a function is only in scope in there.
-  if (candidate.kind !== 'function' && !LOCAL_TYPE_KINDS.has(candidate.kind)) return true;
+  // A function — or a type (`case class B()` in a test method), or a method
+  // of such a type — declared inside a function is only in scope in there.
+  if (candidate.kind !== 'function' && candidate.kind !== 'method' && !LOCAL_TYPE_KINDS.has(candidate.kind)) return true;
   // C and C++ have no nested named functions, so a function the graph shows
   // inside another is an extraction artifact, not a scope: tree-sitter-c
   // cannot parse a macro call whose arguments are designated initializers
@@ -627,23 +627,50 @@ function isLexicallyReachable(
   // the file, nesting every function after it. Trusting that nesting rejected
   // 117 real calls into pid.c on that tree; the functions are reachable.
   if (NO_NESTED_FUNCTIONS.has(candidate.language)) return true;
-  const qn = candidate.qualifiedName;
-  if (!qn || !qn.includes('::')) return true;
-  const parentQn = qn.slice(0, qn.lastIndexOf('::'));
-  const containers = context
-    .getNodesByQualifiedName(parentQn)
-    .filter(
-      (p) =>
-        p.filePath === candidate.filePath &&
-        (p.kind === 'function' || p.kind === 'method') &&
-        p.startLine <= candidate.startLine &&
-        p.endLine >= candidate.endLine
-    );
-  if (containers.length === 0) return true;
-  return (
-    ref.filePath === candidate.filePath &&
-    containers.some((p) => ref.line >= p.startLine && ref.line <= p.endLine)
-  );
+  const scope = lexicalScopeOf(candidate, context);
+  return scope === null || (ref.filePath === candidate.filePath && ref.line >= scope.start && ref.line <= scope.end);
+}
+
+/** Per context: a candidate's scoping function body, or null when nothing scopes it. */
+const LEXICAL_SCOPE_MEMO = new WeakMap<ResolutionContext, Map<string, { start: number; end: number } | null>>();
+
+/**
+ * The innermost function or method BODY that scopes a declaration, walking out
+ * through its qualified name (`test_x::Request::User::has_perm` → `test_x`).
+ * A method directly on a class is reachable through its instances, and an
+ * object-literal method a function returns through the object — neither is
+ * scoped by the function it sits in.
+ */
+function lexicalScopeOf(candidate: Node, context: ResolutionContext): { start: number; end: number } | null {
+  let memo = LEXICAL_SCOPE_MEMO.get(context);
+  if (!memo) {
+    memo = new Map();
+    LEXICAL_SCOPE_MEMO.set(context, memo);
+  }
+  const hit = memo.get(candidate.id);
+  if (hit !== undefined) return hit;
+  let scope: { start: number; end: number } | null = null;
+  const own = candidate.qualifiedName ?? '';
+  const parentQn = own.includes('::') ? own.slice(0, own.lastIndexOf('::')) : '';
+  let qn = own;
+  while (qn.includes('::')) {
+    qn = qn.slice(0, qn.lastIndexOf('::'));
+    const container = context
+      .getNodesByQualifiedName(qn)
+      .find(
+        (p) =>
+          p.filePath === candidate.filePath &&
+          (p.kind === 'function' || p.kind === 'method') &&
+          p.startLine <= candidate.startLine &&
+          p.endLine >= candidate.endLine
+      );
+    if (!container) continue;
+    if (candidate.kind === 'method' && qn === parentQn) break;
+    scope = { start: container.startLine, end: container.endLine };
+    break;
+  }
+  memo.set(candidate.id, scope);
+  return scope;
 }
 
 /** Languages whose module boundary is `import`/`export` (or CommonJS). */
@@ -1039,6 +1066,99 @@ function canNameInTypePosition(n: Node): boolean {
   return !(n.kind === 'property' || n.kind === 'method' || n.kind === 'enum_member' || n.kind === 'field');
 }
 
+/**
+ * The shape of a Python call that reaches the resolver as a bare name — the
+ * column is the call's start. `bare`: `get(1)`, which cannot mean a method
+ * (Python has no implicit self). `chained`: a receiver the extractor could not
+ * keep — `User.objects.get(…)`, `self.client.login(…)`, `request.POST.get(…)`
+ * arrive as `get` / `login`, and can only mean a member of what the chain
+ * names last (`POST`, `client`, `objects`). netbox bound 3,610 `.all()` calls
+ * to one `UserConfig.all`, healthchecks 880 `objects.get` to a test case's
+ * `get`. `self.x()` / `cls.x()`, and a chain split across lines, are null:
+ * today's behavior.
+ */
+type PythonCallShape = { kind: 'bare' } | { kind: 'chained'; owner: string };
+
+function pythonCallShape(ref: UnresolvedRef, context: ResolutionContext): PythonCallShape | null {
+  if (ref.language !== 'python' || ref.referenceKind !== 'calls') return null;
+  const name = ref.referenceName;
+  if (!/^[A-Za-z_]\w*$/.test(name)) return null;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return null;
+  const text = line.slice(ref.column);
+  if (text.startsWith(name) && /^\s*\(/.test(text.slice(name.length))) return { kind: 'bare' };
+  if (new RegExp(String.raw`^(?:self|cls)\s*\.\s*${name}\s*\(`).test(text)) return null;
+  // The call starts at its receiver, so everything up to `.name(` is the receiver chain.
+  const chain = new RegExp(String.raw`^(.*?)\.\s*${name}\s*\(`).exec(text);
+  if (!chain) return null;
+  const owner = /(\w+)\s*(?:\([^()]*\)|\[[^\[\]]*\])?\s*$/.exec(chain[1]!)?.[1];
+  return owner ? { kind: 'chained', owner } : null;
+}
+
+/** Can a Python call of this shape mean the candidate? */
+function fitsPythonCallShape(n: Node, shape: PythonCallShape, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (shape.kind === 'bare') {
+    if (n.kind === 'method') return false;
+    // `from django.shortcuts import render`: the call is the package's.
+    return !(n.filePath !== ref.filePath && isPythonNameImportedFromOutside(ref.referenceName, ref, context));
+  }
+  // A member of what the chain names: a method of a class of that name, or a
+  // function / class in a module of that name (`helpers.slugify()`).
+  if (n.kind === 'method') {
+    // `self.store.fetch()` on a `Store`, `self.user_service.find()` on a `UserService`.
+    const cut = n.qualifiedName.lastIndexOf('::');
+    const owner = cut >= 0 ? n.qualifiedName.slice(0, cut).split('::').pop()! : '';
+    const plain = (s: string): string => s.replace(/_/g, '').toLowerCase();
+    return owner !== '' && plain(owner) === plain(shape.owner);
+  }
+  const parts = n.filePath.split('/');
+  const stem = parts[parts.length - 1]!.replace(/\.pyi?$/, '');
+  return stem === shape.owner || (stem === '__init__' && parts[parts.length - 2] === shape.owner);
+}
+
+const PY_IMPORTS = new WeakMap<ResolutionContext, Map<string, Map<string, string>>>();
+const PY_MODULE_LOCAL = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/** `name` → the module a `from <module> import name` line takes it from, per file. */
+function pythonFromImports(filePath: string, context: ResolutionContext): Map<string, string> {
+  let memo = PY_IMPORTS.get(context);
+  if (!memo) {
+    memo = new Map();
+    PY_IMPORTS.set(context, memo);
+  }
+  const hit = memo.get(filePath);
+  if (hit) return hit;
+  const names = new Map<string, string>();
+  const text = context.readFile(filePath) ?? '';
+  for (const m of text.matchAll(/^\s*from\s+([\w.]+)\s+import\s+(\([^)]*\)|[^\n#]+)/gm)) {
+    const module = m[1]!;
+    for (const item of m[2]!.replace(/[()]/g, '').split(',')) {
+      const bound = /(\w+)\s*$/.exec(item.trim())?.[1];
+      if (bound && bound !== '*') names.set(bound, module);
+    }
+  }
+  memo.set(filePath, names);
+  return names;
+}
+
+function isPythonNameImportedFromOutside(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const module = pythonFromImports(ref.filePath, context).get(name);
+  if (!module || module.startsWith('.')) return false;
+  let memo = PY_MODULE_LOCAL.get(context);
+  if (!memo) {
+    memo = new Map();
+    PY_MODULE_LOCAL.set(context, memo);
+  }
+  let local = memo.get(module);
+  if (local === undefined) {
+    const rel = module.replace(/\./g, '/');
+    local = context.getAllFiles().some((f) =>
+      f === `${rel}.py` || f.endsWith(`/${rel}.py`) || f === `${rel}/__init__.py` || f.endsWith(`/${rel}/__init__.py`));
+    memo.set(module, local);
+  }
+  return !local;
+}
+
 /** Names the Rust prelude puts in every module; a project item of the same name needs a `use` to shadow one. */
 const RUST_PRELUDE = new Set([
   'Ok', 'Err', 'Some', 'None', 'Result', 'Option', 'Box', 'Vec', 'String', 'Default', 'Drop', 'Iterator',
@@ -1328,7 +1448,9 @@ export function matchByExactName(
     sameName.some((n) => n.kind === 'constant' && CPP_DEFINE_SIGNATURE.test(n.signature ?? ''));
   const typeRef = isDotNetTypeRef(ref, context);
   const rustBare = ref.language === 'rust' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
+  const pythonShape = pythonCallShape(ref, context);
   const candidates = sameName.filter((n) =>
+    !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)) &&
     !(rustBare && !isRustNameInScope(n, ref, context)) &&
     !(cMacroCall && n.kind !== 'function' && n.kind !== 'method') &&
     !(typeRef && !canNameInTypePosition(n)) &&
@@ -2430,6 +2552,9 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   C_STATIC_MEMO.delete(context);
   RUST_TRAIT_IMPL_MEMO.delete(context);
   RUST_USES.delete(context);
+  LEXICAL_SCOPE_MEMO.delete(context);
+  PY_IMPORTS.delete(context);
+  PY_MODULE_LOCAL.delete(context);
   SEALED_MODULES.delete(context);
   LOCAL_BINDING_MEMO.delete(context);
   LOCAL_BINDING_SITES.delete(context);
@@ -4335,9 +4460,13 @@ export function matchFuzzy(
   const callableKinds = new Set(['function', 'method', 'class']);
   const typeRef = isDotNetTypeRef(ref, context);
   const rustBare = ref.language === 'rust' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
-  // Rust names are case-sensitive: `Bytes` is not the method `bytes`, `Ok` not a function `ok`.
+  const pythonShape = pythonCallShape(ref, context);
+  // Rust and Python names are case-sensitive: `Bytes` is not the method `bytes`,
+  // Python's builtin `dir(…)` not a class `Dir`.
   const callableCandidates = candidates.filter((n) => callableKinds.has(n.kind) && !(typeRef && !canNameInTypePosition(n)) &&
-    !(rustBare && (n.name !== ref.referenceName || !isRustNameInScope(n, ref, context))))
+    !(rustBare && (n.name !== ref.referenceName || !isRustNameInScope(n, ref, context))) &&
+    !(ref.language === 'python' && n.name !== ref.referenceName) &&
+    !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)))
     .filter((n) => (ref.referenceKind !== 'references' && ref.referenceKind !== 'function_ref') ||
       sameLanguageFamily(n.language, ref.language));
 
