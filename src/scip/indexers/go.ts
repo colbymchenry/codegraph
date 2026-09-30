@@ -11,7 +11,7 @@ import type { IndexerSpec } from './index';
 
 export const goIndexer: IndexerSpec = {
   lang: 'go',
-  tool: 'scip-go',
+  tools: ['scip-go'],
   codegraphLanguages: ['go'],
   detect: root => fs.existsSync(path.join(root, 'go.mod')),
   cmd: 'scip-go',

@@ -66,13 +66,17 @@ export async function produceIndex(
     let done = 0;
     const attempt = async (r: IndexerRun): Promise<string[]> => {
       if (opts.signal?.aborted) return [];
-      opts.log?.(`${runs.length > 1 ? `[${++done}/${runs.length}] ${r.label}: ` : ''}running ${indexer.cmd} ${r.args.join(' ')}`);
+      opts.log?.(`${runs.length > 1 ? `[${++done}/${runs.length}] ${r.label}: ` : ''}running ${indexer.cmd} ${r.args.slice(0, 8).join(' ')}${r.args.length > 8 ? ` … (+${r.args.length - 8} more)` : ''}`);
       const useNice = opts.nice && process.platform !== 'win32';
       const [cmd, args] = useNice ? ['nice', ['-n', '10', indexer.cmd, ...r.args]] : [indexer.cmd, r.args];
       const { code, stderr } = await run(cmd, args, projectRoot, { ...indexer.env, ...r.env }, opts.signal);
       const why = code !== 0 ? `${indexer.cmd} exited ${code}: ${stderr.trim().split('\n').slice(-3).join(' | ')}`
         : !fs.existsSync(r.output) ? `${indexer.cmd} exited 0 but wrote no index at ${r.output}` : null;
-      if (!why) return [r.output];
+      if (!why) {
+        // An indexer that covers several projects reports the ones it had to skip this way.
+        for (const w of stderr.split('\n')) if (w.startsWith('warning: ')) warnings.push(`${r.label}: ${w.slice(9)} — its files stay heuristic-only`);
+        return [r.output];
+      }
       if (r.fallback?.length) {
         opts.log?.(`${r.label}: failed as a batch, retrying its ${r.fallback.length} projects one by one — ${why}`);
         const parts: string[] = [];

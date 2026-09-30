@@ -1,5 +1,8 @@
 # Fork CI: upstream's engine suite + the SCIP suite, on the `scip` branch.
-# Prebuilt .scip fixtures are committed, so no indexer toolchains are needed.
+# Prebuilt .scip fixtures are committed, so no indexer toolchains are needed —
+# except TypeScript 7.1 for the tsgo indexer tests, installed outside the repo
+# (a second `typescript` in node_modules would shadow the build's TS 5). Pinned:
+# its API is unstable; bump together with src/scip/indexers/tsgo-index.ts.
 name: scip CI
 
 on:
@@ -20,7 +23,11 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
+      - name: TypeScript 7.1 for the tsgo indexer
+        run: npm install --prefix "$RUNNER_TEMP/tsgo" --no-save typescript@7.1.0-dev.20260930.4
       - name: SCIP suite
         run: npx vitest run __tests__/scip/
+        env:
+          CODEGRAPH_TSGO_DIR: ${{ runner.temp }}/tsgo/node_modules/typescript
       - name: Upstream engine suite
         run: npx vitest run --project engine

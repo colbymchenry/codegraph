@@ -13,7 +13,7 @@ import type { IndexerSpec } from './index';
 
 export const rustIndexer: IndexerSpec = {
   lang: 'rust',
-  tool: 'rust-analyzer',
+  tools: ['rust-analyzer'],
   codegraphLanguages: ['rust'],
   detect: root => fs.existsSync(path.join(root, 'Cargo.toml')),
   cmd: 'rust-analyzer',

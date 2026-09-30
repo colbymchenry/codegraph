@@ -11,6 +11,11 @@
  * small heap. A batch that fails is retried one project at a time, so one
  * broken project doesn't cost its batch-mates. A repo with one project (or
  * none) is a single run; without a tsconfig.json it infers one (plain JS).
+ *
+ * Preferred over all of that when installed: TypeScript ≥ 7.1 (the native
+ * compiler, tsgo) through its API — see tsgo-index.ts. It type-checks several
+ * times faster in far less memory, so every project runs in one process.
+ * Found in the project's node_modules, else the global npm root.
  */
 
 import { spawnSync } from 'child_process';
@@ -31,6 +36,8 @@ const BATCH_FILES = 1500;
 const BATCH_PROJECTS = 16;
 /** Heap for a light batch; small enough that several run side by side. */
 const LIGHT_HEAP_MB = 3072;
+/** The first TypeScript whose API tsgo-index.ts is written against. */
+const TSGO_MIN = [7, 1];
 
 function hasWorkspaces(root: string): boolean {
   try {
@@ -132,9 +139,27 @@ export function planRuns(root: string, projects: string[], weights: Map<string, 
   return runs;
 }
 
+/** The directory of a TypeScript package with the tsgo API (≥ 7.1), or null. */
+export function findTsgo(root: string): string | null {
+  const npmRoot = spawnSync('npm', ['root', '-g'], { encoding: 'utf8', timeout: 10_000, shell: process.platform === 'win32' });
+  const candidates = [path.join(root, 'node_modules', 'typescript')];
+  if (npmRoot.status === 0 && npmRoot.stdout.trim()) candidates.push(path.join(npmRoot.stdout.trim(), 'typescript'));
+  for (const dir of candidates) {
+    let version: string;
+    try {
+      version = (JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')) as { version: string }).version;
+    } catch {
+      continue; // not installed there
+    }
+    const [major = 0, minor = 0] = version.split('.').map(Number);
+    if ((major > TSGO_MIN[0]! || (major === TSGO_MIN[0] && minor >= TSGO_MIN[1]!)) && has(dir, 'dist/api/sync/api.js')) return dir;
+  }
+  return null;
+}
+
 export const typescriptIndexer: IndexerSpec = {
   lang: 'typescript',
-  tool: 'scip-typescript',
+  tools: ['scip-typescript', 'tsgo-index'],
   codegraphLanguages: ['typescript', 'javascript', 'tsx', 'jsx'],
   detect: root => has(root, 'tsconfig.json') || has(root, 'jsconfig.json') || has(root, 'package.json'),
   cmd: 'scip-typescript',
@@ -147,5 +172,19 @@ export const typescriptIndexer: IndexerSpec = {
     else if (has(root, 'yarn.lock') && hasWorkspaces(root)) args.push('--yarn-workspaces');
     else if (!has(root, 'tsconfig.json')) args.push('--infer-tsconfig');
     return { runs: [{ label: 'typescript', args, output: outFile, env: heapEnv(bigHeapMb()) }] };
+  },
+  preferred(root, outFile) {
+    const files = repoFiles(root);
+    const projects = tsProjects(root, files);
+    if (projects.length === 0) return null; // nothing to open: scip-typescript infers a config
+    // tsgo-index loads the (ES module) API with require().
+    const tsDir = (process.features as { require_module?: boolean }).require_module ? findTsgo(root) : null;
+    if (!tsDir) return null;
+    // Heaviest first: a file shared by several projects is indexed by the first that loads it.
+    const weights = projectWeights(projects, files);
+    const configs = [...projects].sort((a, b) => weights.get(b)! - weights.get(a)!)
+      .map(p => path.posix.join(p, has(path.join(root, p), 'tsconfig.json') ? 'tsconfig.json' : 'jsconfig.json'));
+    const args = [path.join(__dirname, 'tsgo-index.js'), tsDir, outFile, root, ...configs];
+    return { cmd: process.execPath, runs: [{ label: 'typescript (tsgo)', args, output: outFile }] };
   },
 };

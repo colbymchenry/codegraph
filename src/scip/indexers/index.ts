@@ -55,8 +55,8 @@ export interface Invocation {
 /** Everything the fork knows about one language — the single place to add or change one. */
 export interface IndexerSpec {
   lang: ScipLanguage;
-  /** `ToolInfo.name` in the indexes this indexer writes (tells `scip import` the language) */
-  tool: string;
+  /** `ToolInfo.name` in the indexes this language's indexers write (tells `scip import` the language) */
+  tools: readonly string[];
   /** codegraph `files.language` values the index covers (the hash-gate snapshot) */
   codegraphLanguages: readonly string[];
   /** true when the project has this language's marker files */
@@ -73,6 +73,11 @@ export interface IndexerSpec {
    * files beside it too (e.g. an environment manifest).
    */
   invocation(projectRoot: string, outFile: string): Invocation;
+  /**
+   * A better indexer to run instead of `cmd` when it is installed, or null.
+   * Used only when `cmd` and `args` aren't overridden in codegraph.json.
+   */
+  preferred?(projectRoot: string, outFile: string): (Invocation & { cmd: string }) | null;
   /** for languages that construct values with `Type{…}` rather than a call */
   literalShape?: LiteralShape;
 }
@@ -92,7 +97,7 @@ export const INDEXERS: Record<ScipLanguage, IndexerSpec> = {
 
 /** The language an index covers, from the tool that wrote it. */
 export function languageOfTool(tool: string): ScipLanguage | undefined {
-  return Object.values(INDEXERS).find(s => s.tool === tool)?.lang;
+  return Object.values(INDEXERS).find(s => s.tools.includes(tool))?.lang;
 }
 
 type ScipConfig = Partial<Record<ScipLanguage, IndexerOverride | false>>;
@@ -153,6 +158,12 @@ export function resolveIndexer(projectRoot: string, lang: ScipLanguage, outFile:
     return { skip: `${at}.env must be an object of string values` };
   }
   if (!spec.detect(projectRoot)) return { skip: `no ${lang} project markers found` };
+  const preferred = override?.cmd || override?.args ? null : spec.preferred?.(projectRoot, outFile);
+  if (preferred) {
+    const env = override?.env;
+    const withEnv = (run: IndexerRun): IndexerRun => ({ ...run, env: run.env && { ...run.env, ...env }, fallback: run.fallback?.map(withEnv) });
+    return { lang, cmd: preferred.cmd, runs: preferred.runs.map(withEnv), env: { ...preferred.env, ...env }, warning: preferred.warning };
+  }
   const cmd = override?.cmd ?? spec.cmd;
   if (!onPath(cmd)) return { skip: `\`${cmd}\` not found on PATH — install it or set scip.${lang}.cmd in ${PROJECT_CONFIG_FILENAME}` };
   if (spec.probe && !override?.cmd) {

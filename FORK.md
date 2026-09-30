@@ -39,7 +39,7 @@ Indexers are never auto-installed:
 
 | language | indexer | detected by |
 |---|---|---|
-| TS/JS | `npm i -g @sourcegraph/scip-typescript` | `tsconfig.json`, `jsconfig.json`, `package.json` |
+| TS/JS | preferred: `npm i -g typescript@next` (≥ 7.1, see below); else `npm i -g @sourcegraph/scip-typescript` | `tsconfig.json`, `jsconfig.json`, `package.json` |
 | Python | `npm i -g @sourcegraph/scip-python` | `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt` |
 | Go | `go install github.com/scip-code/scip-go/cmd/scip-go@latest` (packages must build) | `go.mod` |
 | Rust | `rustup component add rust-analyzer` (uses its `scip` subcommand; needs `cargo`) | `Cargo.toml` |
@@ -52,7 +52,17 @@ To run one through `npx` instead, put this in `codegraph.json`:
 
 `"python": false` disables a language. `cmd`, `args` and `env` replace the defaults. In `args`, `{args}` splices in the adapter's own arguments and `{out}` is the output path.
 
-**TS/JS monorepos.** A repo with several projects (a `tsconfig.json` / `jsconfig.json` per package, as in vscode's `src/` plus one per extension) is **split by project size**. Projects and their source-file counts come from one `git ls-files` (or a tree walk outside git; `node_modules` is ignored); each file counts once, for its deepest project. scip-typescript holds a project's whole type-checked program in memory, so one process over everything runs out of heap on a large monorepo, while a process per project pays TypeScript's start-up cost dozens of times.
+**TS/JS with tsgo.** When TypeScript ≥ 7.1 (the native compiler) is installed, in the project's `node_modules` or the global npm root, `scip index` uses it instead of scip-typescript, through its API (`typescript/unstable/sync`). The indexer is `src/scip/indexers/tsgo-index.ts`, run as `node dist/scip/indexers/tsgo-index.js`:
+- It opens every `tsconfig.json` / `jsconfig.json` project, heaviest first, one at a time in one process. A file is indexed by the first project that loads it.
+- It writes only what the merge reads: a reference at the callee name of every call and `new`, and a definition for every callee the project declares. A symbol is named after its first declaration (`` `file`/node-index/Name ``). So an overload maps to its first signature, and a declaration seen from two projects is one symbol.
+- A call on a union- or intersection-typed receiver (`a.equals(b)` with `a: A | B`) targets every member's method.
+- A project that fails to open is a warning; its files stay heuristic-only.
+- Needs Node ≥ 20.19 / 22.12, because it `require()`s the ES-module API. Setting `scip.typescript.cmd` (or `args`) in `codegraph.json` forces scip-typescript.
+- The API is marked unstable. The indexer checks for the exports it uses and fails with a clear message if they change. CI pins the nightly it was written against (`.github/workflows/scip-ci.yml`).
+
+On vscode (94 projects, 13.8k files) it indexes in 66 s instead of scip-typescript's 361 s, and writes a 101 MB index instead of 176 MB. Peak memory is 7.7 GB for tsgo plus 2.1 GB for Node. Accuracy is at least scip-typescript's (see the eval below).
+
+**TS/JS monorepos with scip-typescript.** A repo with several projects (a `tsconfig.json` / `jsconfig.json` per package, as in vscode's `src/` plus one per extension) is **split by project size**. Projects and their source-file counts come from one `git ls-files` (or a tree walk outside git; `node_modules` is ignored); each file counts once, for its deepest project. scip-typescript holds a project's whole type-checked program in memory, so one process over everything runs out of heap on a large monorepo, while a process per project pays TypeScript's start-up cost dozens of times.
 - A **heavy** project (≥1,500 source files) runs alone, with a Node heap of 60% of physical memory. vscode's `src/` needs over 6 GB.
 - **Light** projects are packed into batches of up to 1,500 files or 16 projects, one process per batch with a 3 GB heap. Batches run in parallel: up to 4, at most half the cores, as many as 60% of memory holds.
 - A batch that fails is **retried one project at a time**, so one broken project doesn't cost its batch-mates.
@@ -85,6 +95,7 @@ Differences from the POC:
 - Callable-ness comes from the mapped node kind, not the symbol suffix. This lets TS `const f = () => …` count.
 - `new X()` (TS, via scip-typescript's `` `<constructor>` `` symbol) and Python's `X()` (a class symbol followed by `(`) → `instantiates`, matching codegraph's own edge kind. So are Go composite literals (`&X{…}`, `X[T]{…}`) and Rust struct literals (`X { … }`). Go excludes slice/map element types and return types before a body. Rust excludes `impl`/`where` headers, `-> X {`, and destructuring patterns.
 - An overloaded method is one SCIP symbol defined at every signature, but codegraph has a node per signature. The symbol maps to the **first** signature, which is where the heuristic's edges point, so they verify instead of moving. On vscode this turned about 16.5k "replaced" edges into agreements.
+- With tsgo, an object-literal method *definition* that implements an interface (`{ listen(e) { … } }`) is not a call. scip-typescript records it as a reference to the interface method, so the merge used to add a `calls` edge for it.
 - Protobuf is read and written by a small hand-written codec (`src/scip/reader.ts`) instead of `@bufbuild/protobuf` plus codegen. The fork adds no runtime dependency. It accepts both the legacy `int32` ranges and the typed ranges, and streams documents one at a time.
 
 MCP output: Flow steps read `↓ calls (compiler-verified)` or `(unverified: …)`. Trail entries get ` [unverified]`.
@@ -101,12 +112,37 @@ Pass bar per language (2 seeds × 50 random targets): precision ≥ 95%, recall 
 |---|---|---|---|---|---|---|
 | TS | codegraph v1.6.1 `src/` (250 docs) | 1 | 100% / 44% | 90% / 100% | **100% / 100%** | 7.5 s + 0.5 s |
 | TS | same | 2 | 100% / 56% | 90% / 100% | **100% / 100%** | |
+| TS (tsgo) | same, judged by scip-typescript's index | 1 | 100% / 44% | 90% / 100% | **100% / 100%** | 1.4 s + 0.3 s |
+| TS (tsgo) | same | 2 | 100% / 56% | 90% / 100% | **100% / 100%** | |
 | Python | Django (`bench-corpus/arm_grep` @ 026b005, 2,928 docs, no venv) | 1 | 99% / 10% | 78% / 82% | **100% / 100%** | 98.5 s + 3.6 s |
 | Python | same | 2 | 100% / 24% | 75% / 96% | **100% / 100%** | |
 | Go | spf13/cobra @ adbc881 (37 docs) | 1 | 100% / 87% | 100% / 99% | **100% / 100%** | 6.5 s + 0.2 s |
 | Go | same | 2 | 100% / 98% | 100% / 99% | **100% / 100%** | |
 | Rust | BurntSushi/ripgrep @ 3fce3b5 (104 docs) | 1 | 100% / 7% | 37% / 83% | **100% / 99%** | 12.6 s + 1.0 s |
 | Rust | same | 2 | 100% / 22% | 20% / 73% | **100% / 99%** | |
+
+The tsgo rows are judged by **scip-typescript's** index. An index can't be checked against itself, and this gives an independent compiler's view. Judged by its own index, tsgo also scores 100% / 100% on both seeds.
+
+**Large repo: vscode** @ 73d5322b (14,054 TS files, 4.4M lines, 94 projects), on a 16 GB / 16-thread machine:
+
+| pipeline | build | index size | merge | total |
+|---|---|---|---|---|
+| codegraph 1.6.1 alone (tree-sitter) | 2m09s | – | – | 2m09s |
+| + scip-typescript, one process per project (first version) | 9m56s | 1,103 MB | 67 s | 11m05s |
+| + scip-typescript, batched + compacted | 6m01s | 176 MB | 25.6 s | 6m28s |
+| + **tsgo** | **66.5 s** | **101 MB** | **22.8 s** | **1m30s** |
+
+(SCIP build and merge times come on top of the 2m09s codegraph index.)
+
+Seeds 1 and 2, judged by scip-typescript's index:
+
+| method | seed 1 R / P | seed 2 R / P |
+|---|---|---|
+| codegraph only | 82% / 93% | 74% / 94% |
+| + scip-typescript | 100% / 100% | 100% / 100% |
+| + tsgo | 100% / 100% | 98% / 100% |
+
+tsgo's 13 seed-2 "misses" are all object-literal method definitions that scip-typescript counts as calls (see above), so the gap is scip-typescript's error. On the graph, tsgo verified 557k heuristic edges where scip-typescript verified 540k, and left 112k unverified instead of 130k.
 
 Raw per-seed output (`compare.ts --json`): [`scripts/scip-eval/results/`](scripts/scip-eval/results/). Indexers used: scip-typescript 0.4.0, scip-python 0.6.6, scip-go 0.2.7, rust-analyzer 2026-09-28. Flags: `--rg-type py --prefix django/`, `--rg-type go`, `--rg-type rust`.
 
@@ -134,4 +170,5 @@ Known residue: ripgrep's multi-line `const X: T = T { … }` items. codegraph at
 - Phase 1 (core + TS/JS): done.
 - Phase 2 (Python): done.
 - Phase 3 (Go) and Phase 4 (Rust): done.
+- TS/JS via tsgo (TypeScript ≥ 7.1): done; preferred over scip-typescript when installed.
 - Next: Phase 5, `implements`/`extends` from SCIP relationships, and `references`.

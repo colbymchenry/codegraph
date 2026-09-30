@@ -1,0 +1,43 @@
+{
+  "seed": 1,
+  "targets": 50,
+  "truth": 366,
+  "rows": [
+    {
+      "method": "grep naive",
+      "candidates": 27286,
+      "true": 365,
+      "wrong": 25404,
+      "unknown": 1517,
+      "recall": 0.9972677595628415,
+      "recallMedian": 1,
+      "good": 49,
+      "precision": 0.014164305949008499,
+      "kb": 3126.41015625
+    },
+    {
+      "method": "codegraph",
+      "candidates": 329,
+      "true": 299,
+      "wrong": 23,
+      "unknown": 7,
+      "recall": 0.8169398907103825,
+      "recallMedian": 1,
+      "good": 36,
+      "precision": 0.9285714285714286,
+      "kb": null
+    },
+    {
+      "method": "codegraph+SCIP",
+      "candidates": 373,
+      "true": 365,
+      "wrong": 1,
+      "unknown": 7,
+      "recall": 0.9972677595628415,
+      "recallMedian": 1,
+      "good": 49,
+      "precision": 0.9972677595628415,
+      "kb": null
+    }
+  ]
+}
