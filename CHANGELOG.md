@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- A Swift call on a property declared with a type, like Kingfisher's `var cache: ImageCache!` or `self.storage.write(…)`, now reaches that type's method or one it inherits. It no longer lands on a subclass override in a test, or on another type's method of the same name.
 - Calls in your own JavaScript no longer link to a same-named function inside a vendored minified script, like a `*.min.js` or a bundle made of a few enormous lines. Those names are mangled. In healthchecks, every jQuery `$(…)` call had gone to a one-letter helper inside `bootstrap-native.min.js`.
 - A Swift call on a value built on the spot, like `JSONDecoder().decode(…)` or `Realm().create(…)`, now resolves to that type's method, or to one it inherits. It no longer lands on some other type's method of the same name: Vapor's `JSONDecoder().decode` calls had gone to a request's private container.
 - A bare Lua call like `ipairs(t)`, `error("…")` or busted's `setup()` now means Lua's own function unless the file defines one. It no longer lands on a table method of the same name: telescope's `ipairs` calls had gone to a linked list's `ipairs`, and kong's `error` calls to its response module. A function's own alias of a host table member, like `local get_query = kong.request.get_query`, is now followed as well.

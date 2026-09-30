@@ -2643,6 +2643,11 @@ function isSwiftCallTarget(n: Node, shape: SwiftCallShape | null, ref: Unresolve
     if (shape.constructed && !context.getNodesByName(shape.constructed).some((f) => f.kind === 'function')) {
       return swiftTypeClosure(shape.constructed, context).has(owner);
     }
+    // A property the type around the call declares with a type — Kingfisher's
+    // `var cache: ImageCache!` — is that type: `cache.imageCachedType(…)` is
+    // ImageCache's, not a test subclass's override.
+    const typed = /^(?:self\.)?[A-Za-z_]\w*$/.test(shape.receiver) ? inferMemberReceiverType(shape.receiver, ref, context) : null;
+    if (typed && /^[A-Z]/.test(typed)) return swiftTypeClosure(typed, context).has(owner);
     if (shape.receiver === '' || !SWIFT_STD_METHODS.has(n.name)) return true;
     return sharesReceiverWord(shape.receiver.split('.').pop()!, n) || !swiftDeclOf(owner, context).projectType ||
       swiftDeclaresLabel(n, shape.label, context);
@@ -5315,7 +5320,7 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
 }
 
 /** Languages whose fields and properties declare their type where the class declares them. */
-const MEMBER_TYPED_LANGUAGES: ReadonlySet<string> = new Set(['csharp', 'java', 'kotlin']);
+const MEMBER_TYPED_LANGUAGES: ReadonlySet<string> = new Set(['csharp', 'java', 'kotlin', 'swift']);
 const MEMBER_CLASS_KINDS: ReadonlySet<string> = new Set(['class', 'struct', 'interface', 'enum', 'record']);
 const MEMBER_TYPE_MEMO = new WeakMap<ResolutionContext, Map<string, string | null>>();
 /** Words that can stand where a declaration's type does without being one. */
@@ -5336,7 +5341,7 @@ const MEMBER_TYPE_NON_TYPES: ReadonlySet<string> = new Set([
  * TraceJsonWriter went to TraceJsonWriter's own `WriteValue` by name.
  */
 function inferMemberReceiverType(receiver: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
-  const name = receiver.replace(/^this\./, '');
+  const name = receiver.replace(/^(?:this|self)\./, '');
   if (!/^[A-Za-z_]\w*$/.test(name)) return null;
   const inFile = context.getNodesInFile(ref.filePath).filter((n) => n.language === ref.language);
   let cls: Node | undefined;
@@ -5368,7 +5373,7 @@ function bindsNameItself(fn: Node, name: string, context: ResolutionContext): bo
   const lines = context.getFileLines?.(fn.filePath) ?? context.readFile(fn.filePath)?.split(/\r?\n/) ?? [];
   const body = lines.slice(fn.startLine - 1, fn.endLine).join('\n');
   const r = name.replace(/\$/g, '\\$');
-  const binds = new RegExp(`\\b(?:var|val|out\\s+[\\w.<>?]+|foreach\\s*\\(\\s*[\\w.<>?,\\s]+?)\\s+${r}\\b|\\bfor\\s*\\([^;)]*\\s${r}\\s*:|\\b${r}\\s*=>|[(,]\\s*${r}\\s*(?:,[^()]*)?\\)\\s*=>|\\b${r}\\s*(?:,[^{}]*)?->`).test(body);
+  const binds = new RegExp(`\\b(?:var|val|let|out\\s+[\\w.<>?]+|foreach\\s*\\(\\s*[\\w.<>?,\\s]+?)\\s+${r}\\b|\\bfor\\s*\\([^;)]*\\s${r}\\s*:|\\b${r}\\s*=>|[(,]\\s*${r}\\s*(?:,[^()]*)?\\)\\s*=>|\\b${r}\\s*(?:,[^{}]*)?->`).test(body);
   memo.set(key, binds);
   return binds;
 }
@@ -5567,8 +5572,8 @@ function classMemberType(cls: Node, name: string, context: ResolutionContext): s
   const key = `${cls.id}|${name}`;
   if (memo.has(key)) return memo.get(key)!;
   const r = name.replace(/\$/g, '\\$');
-  const pattern = cls.language === 'kotlin'
-    ? new RegExp(`\\b(?:val|var)\\s+${r}\\s*:\\s*([A-Z][\\w.]*)`)
+  const pattern = cls.language === 'kotlin' || cls.language === 'swift'
+    ? new RegExp(`\\b(?:val|var|let)\\s+${r}\\s*:\\s*([A-Z][\\w.]*)`)
     : new RegExp(`(?:^|[\\s(,])([A-Za-z_][\\w.]*)\\s*${TYPE_ARGS}\\??\\s+${r}\\s*(?:[=;,)]|\\{)`);
   let found: string | null = null;
   for (const { text, depth } of classMemberLines(cls, context)) {
