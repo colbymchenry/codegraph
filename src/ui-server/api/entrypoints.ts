@@ -396,15 +396,18 @@ function testFiles(cg: CodeGraph, limit: number): WireList<WireEntryTest> {
   return wireList(items, Math.max(ranked.length, items.length));
 }
 
-/** The most depended-on symbols, tests and non-navigable kinds removed. */
+/** The most depended-on symbols, tests, generated files and non-navigable kinds removed. */
 function hubs(cg: CodeGraph, limit: number): WireList<WireEntryHub> {
-  const ranked = cg.getTopDependedOn(SCAN_ROWS);
+  const ranked = cg
+    .getTopDependedOn(SCAN_ROWS)
+    .map((row) => ({ row, node: cg.getNode(row.nodeId) }));
+  // A vendored bundle's one-letter functions are depended on by the bundle alone.
+  const generated = cg.generatedFilePredicate(ranked.flatMap(({ node }) => (node ? [node.filePath] : [])));
 
   const items: WireEntryHub[] = [];
   let eligible = 0;
-  for (const row of ranked) {
-    const node = cg.getNode(row.nodeId);
-    if (!node || NON_HUB_KINDS.has(node.kind) || isTestFile(node.filePath)) continue;
+  for (const { row, node } of ranked) {
+    if (!node || NON_HUB_KINDS.has(node.kind) || isTestFile(node.filePath) || generated(node.filePath)) continue;
     eligible += 1;
     if (items.length >= limit) continue;
     items.push({ ...toNodeRef(node), dependents: row.dependents });

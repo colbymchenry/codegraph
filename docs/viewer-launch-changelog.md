@@ -169,6 +169,8 @@ These describe `codegraph ui` and its screens. They were taken out of `## [Unrel
 
 ## Fixes — Symbols, tests and the viewer
 
+- **Entry points' most-depended-on list shows your code, not a vendored bundle's.** A minified library or bundled docs script (`n`, `t`, `Buffer` with thousands of callers, all from inside the bundle) could top the list. Symbols in generated files are now left out of it, like test files.
+
 - **Stopping `codegraph ui` stops the server.** Killing the command by its process id, as a process manager, an editor task or `kill` does, left the server running on its port with no way to reach it, until the machine restarted. The server now notices it has been left behind and shuts down, closing the index first. Ctrl+C was never affected.
 
 - **A SwiftUI view with a preview is no longer listed as a file that runs something.** A `#Preview { … }` sits at the top level of a view's file, so every view with one showed up under entry points as if it ran code. A preview is Xcode's canvas, not code the app runs: its calls no longer count, and a file whose only top-level code is previews leaves the list.

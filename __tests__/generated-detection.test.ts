@@ -20,6 +20,7 @@ import {
   isGeneratedFile,
   hasGeneratedHeader,
   detectGeneratedFile,
+  isMinifiedContent,
 } from '../src/extraction/generated-detection';
 
 describe('isGeneratedFile', () => {
@@ -218,5 +219,39 @@ describe('detectGeneratedFile — the union the indexer persists', () => {
     expect(
       detectGeneratedFile('internal/payroll/workflow.go', 'package payroll\n\n// RunPayrollWorkflow drives the monthly run.\nfunc RunPayrollWorkflow() {}\n')
     ).toBe(false);
+  });
+});
+
+describe('isMinifiedContent — a bundle not named .min.js', () => {
+  const bundle = Array.from({ length: 300 }, (_, i) => `function f${i}(e){return n(e,${i})+t(e)}`).join(';');
+
+  it('recognizes a minified script by its enormous code lines', () => {
+    expect(isMinifiedContent('docs/assets/bundle.js', bundle)).toBe(true);
+    expect(isMinifiedContent('site/app.mjs', bundle)).toBe(true);
+    expect(detectGeneratedFile('docs/assets/bundle.js', bundle)).toBe(true);
+  });
+
+  it('recognizes a readable webpack build by its module loader, and `-min.js` by name', () => {
+    const webpack = `/*! lib */\n(function(modules) {\n  function __webpack_require__(moduleId) {\n    return modules[moduleId];\n  }\n${'  var x = 1;\n'.repeat(400)}})([]);\n`;
+    expect(isMinifiedContent('assets/js/syntaxhighlighter.js', webpack)).toBe(true);
+    expect(isGeneratedFile('vendor/underscore/underscore-min.js')).toBe(true);
+  });
+
+  it('leaves an ordinary file with one long string literal alone', () => {
+    const fixture = [
+      'export function decode(input) {',
+      '  return atob(input);',
+      '}',
+      `export const LOGO = "${'QUJD'.repeat(4000)}";`,
+      'export function size() { return LOGO.length; }',
+    ].join('\n');
+    expect(isMinifiedContent('src/logo.js', fixture)).toBe(false);
+  });
+
+  it('leaves hand-written code, TypeScript and short files alone', () => {
+    const code = Array.from({ length: 400 }, (_, i) => `export function f${i}(e) {\n  return e + ${i};\n}`).join('\n');
+    expect(isMinifiedContent('src/code.js', code)).toBe(false);
+    expect(isMinifiedContent('src/bundle.ts', bundle)).toBe(false);
+    expect(isMinifiedContent('src/tiny.js', 'function n(e){return e};function t(e){return n(e)}')).toBe(false);
   });
 });
