@@ -10,6 +10,9 @@ import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from
 import { dependsOn } from './package-deps';
 import { resolveImportPath } from '../import-resolver';
 
+/** The languages React components, hooks and contexts are written and used in. */
+const REACT_SCRIPT_LANGUAGES: ReadonlySet<string> = new Set(['typescript', 'javascript', 'tsx', 'jsx']);
+
 export const reactResolver: FrameworkResolver = {
   name: 'react',
   // Includes 'tsx'/'jsx' so route extraction runs on JSX files (where
@@ -34,6 +37,9 @@ export const reactResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // Components, hooks and contexts are a script's: halo's Java
+    // `import org.springframework…SecurityContext` is no React context.
+    if (!REACT_SCRIPT_LANGUAGES.has(ref.language)) return null;
     if (ref.referenceName.startsWith(LAZY_ROUTE_PREFIX)) {
       const target = lazyRouteComponent(ref.referenceName.slice(LAZY_ROUTE_PREFIX.length), ref.filePath, context);
       return target ? { original: ref, targetNodeId: target, confidence: 0.9, resolvedBy: 'framework' } : null;
