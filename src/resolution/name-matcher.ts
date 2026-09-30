@@ -943,6 +943,9 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
 const JS_FAMILY = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx', 'vue', 'svelte', 'astro']);
 const JS_TS = new Set<string>(['typescript', 'tsx', 'javascript', 'jsx']);
 
+/** Languages whose identifiers resolve regardless of case. */
+const CASE_INSENSITIVE_LANGUAGES = new Set<string>(['php', 'pascal', 'cfml', 'cfscript', 'cfquery', 'cobol', 'vbnet']);
+
 /**
  * Whether a JS/TS `calls` ref is a RECEIVER-LESS call — `serialize(x)`, not
  * `this.serialize(x)` / `obj.serialize(x)`. The extractor emits `this.m()`
@@ -4577,14 +4580,15 @@ export function matchFuzzy(
   const rustBare = ref.language === 'rust' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
   const pythonShape = pythonCallShape(ref, context);
   const javaBare = ref.language === 'java' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
-  // Rust and Python names are case-sensitive: `Bytes` is not the method `bytes`,
-  // Python's builtin `dir(…)` not a class `Dir`.
+  // Names are case-sensitive in every language but a handful: Rust's
+  // `Bytes` is not the method `bytes`, Python's builtin `dir(…)` not a class
+  // `Dir`, halo's `type RsbuildConfig` not its local `rsbuildConfig`, a Java
+  // `Node` not a `node()`. Only PHP, Pascal/Delphi, CFML, COBOL and VB.NET
+  // resolve a name without regard to case, which is what this fallback's
+  // lowercase index is for.
   const callableCandidates = candidates.filter((n) => callableKinds.has(n.kind) && !(typeRef && !canNameInTypePosition(n)) &&
-    !(rustBare && (n.name !== ref.referenceName || !isRustNameInScope(n, ref, context))) &&
-    !(ref.language === 'python' && n.name !== ref.referenceName) &&
-    // JS and TS too: halo's `type RsbuildConfig` (imported from @rsbuild/core)
-    // is not its local `rsbuildConfig`, kit's vitest `Mock` not a `mock`.
-    !(JS_FAMILY.has(ref.language) && n.name !== ref.referenceName) &&
+    !(rustBare && !isRustNameInScope(n, ref, context)) &&
+    !(!CASE_INSENSITIVE_LANGUAGES.has(ref.language) && n.name !== ref.referenceName) &&
     !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)) &&
     !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)))
     .filter((n) => (ref.referenceKind !== 'references' && ref.referenceKind !== 'function_ref') ||

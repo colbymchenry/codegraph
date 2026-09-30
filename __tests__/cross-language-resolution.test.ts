@@ -132,8 +132,11 @@ describe('cross-language name resolution (#1986)', () => {
     expect(matchByQualifiedName(ref(method.qualifiedName), context)?.targetNodeId).toBe(method.id);
     expect(matchReference(ref(method.qualifiedName), context)).toBeNull();
     expect(matchReference(ref('Foreign.act'), context)).toBeNull();
-    expect(matchFuzzy(ref('FUZZYNAME'), context)).not.toBeNull();
-    expect(matchReference(ref('FUZZYNAME'), context)).toBeNull();
+    // Fuzzy is case-sensitive outside PHP/Pascal/CFML/COBOL/VB.NET, so the
+    // fuzzy winner here shares the exact name; the language gate still rejects it.
+    expect(matchFuzzy(ref('fuzzyName'), context)).not.toBeNull();
+    expect(matchReference(ref('fuzzyName'), context)).toBeNull();
+    expect(matchFuzzy(ref('FUZZYNAME'), context)).toBeNull();
     // Exact qualified match selects Python even though a Swift type has the
     // same bare name. Rejection must not fall through to that Swift type.
     const foreign = graph.getNodesByName('Winner').find((n) => n.language === 'python')!;
