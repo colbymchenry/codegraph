@@ -105,6 +105,7 @@ export const LANGUAGES = [
   'luau',
   'objc',
   'r',
+  'slint',
   'solidity',
   'nix',
   'yaml',
