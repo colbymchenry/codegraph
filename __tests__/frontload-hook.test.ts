@@ -13,7 +13,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { spawnSync } from 'node:child_process';
 import { CodeGraph } from '../src';
-import { planFrontload, isTaskNotification, findIndexedSubprojectRoots, unsafeIndexRootReason, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens, PROMPT_HOOK_INJECTION_MAX, CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT, capPromptHookInjection } from '../src/directory';
+import { planFrontload, isTaskNotification, isAgentMessage, findIndexedSubprojectRoots, unsafeIndexRootReason, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens, PROMPT_HOOK_INJECTION_MAX, CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT, capPromptHookInjection } from '../src/directory';
 
 // Make the built-in exports configurable so HOME can point at a real temp
 // fixture without changing the process environment or the user's home files.
@@ -374,6 +374,12 @@ export class OrderStateMachine {
     }
   });
 
+  it('stays silent on a subagent hand-back envelope, even one that names indexed symbols (#2184)', () => {
+    const report = 'how does OrderStateMachine work? submitOrder() calls into the state machine.';
+    expect(hook(report)).toContain('Structural context from CodeGraph');
+    expect(hook(`<agent-message from="agent-7f3e">\n[Subagent hand-back] ${report}\n</agent-message>`)).toBe('');
+  });
+
   it('uses MEDIUM for indexed prose segments without a strong keyword or verified token', () => {
     for (const prompt of ['como state machine?', 'wie state machine?']) {
       const output = hook(prompt);
@@ -469,5 +475,22 @@ describe('system task notifications (#1832)', () => {
     expect(isTaskNotification('<task-notification>trace</task-notification> Explain this.')).toBe(false);
     expect(isTaskNotification('<other-tag>trace AuthService</other-tag>')).toBe(false);
     expect(isTaskNotification('trace AuthService login')).toBe(false);
+  });
+});
+
+describe('subagent hand-backs (#2184)', () => {
+  const handBack = '<agent-message from="a1b2c3">\n[Subagent hand-back] Traced how AuthService.login calls TokenStore.save and which callers are affected.\n</agent-message>';
+
+  it('skips the complete hand-back envelope', () => {
+    expect(isAgentMessage(handBack)).toBe(true);
+    expect(isAgentMessage(` \n${handBack}\n`)).toBe(true);
+    expect(isAgentMessage('<agent-message>trace AuthService login flow</agent-message>')).toBe(true);
+  });
+  it('does not suppress a user question that mentions the marker', () => {
+    expect(isAgentMessage(`Why does ${handBack} trigger the hook?`)).toBe(false);
+    expect(isAgentMessage(`${handBack} Explain this.`)).toBe(false);
+    expect(isAgentMessage('<agent-messages>trace AuthService</agent-messages>')).toBe(false);
+    expect(isAgentMessage('<agent-message from="x">trace AuthService')).toBe(false);
+    expect(isAgentMessage('trace AuthService login')).toBe(false);
   });
 });
