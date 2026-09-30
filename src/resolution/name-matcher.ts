@@ -4599,6 +4599,11 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   CPP_NS_FRAMES.delete(context);
   CPP_NS_ALIASES.delete(context);
   SOLIDITY_SUPERS.delete(context);
+  DECLARED_SUPERS.delete(context);
+  INHERITED_METHODS.delete(context);
+  MEMBER_SHADOWS.delete(context);
+  MEMBER_WALKS.delete(context);
+  MEMBER_LINES.delete(context);
   SOLIDITY_HIERARCHIES.delete(context);
   MEMBER_TYPE_MEMO.delete(context);
   CSHARP_ALIASES.delete(context);
@@ -4837,30 +4842,52 @@ function inferMemberReceiverType(receiver: string, ref: UnresolvedRef, context: 
   if (!/^[A-Za-z_]\w*$/.test(name)) return null;
   const inFile = context.getNodesInFile(ref.filePath).filter((n) => n.language === ref.language);
   let cls: Node | undefined;
+  let fn: Node | undefined;
   for (const n of inFile) {
-    if (!MEMBER_CLASS_KINDS.has(n.kind) || n.startLine > ref.line || n.endLine < ref.line) continue;
-    if (!cls || n.startLine >= cls.startLine) cls = n;
+    if (n.startLine > ref.line || n.endLine < ref.line) continue;
+    if (MEMBER_CLASS_KINDS.has(n.kind) && (!cls || n.startLine >= cls.startLine)) cls = n;
+    else if ((n.kind === 'method' || n.kind === 'function') && (!fn || n.startLine >= fn.startLine)) fn = n;
   }
   if (!cls) return null;
-  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
-  if (!lines) return null;
+  const found = memberTypeThroughHierarchy(cls, name, context);
+  if (!found) return null;
   // A lambda parameter, `var` local, `out` variable or `foreach` binding in
   // the calling method shadows the field, and the local inference that ran
   // first cannot type those.
-  let fn: Node | undefined;
-  for (const n of inFile) {
-    if ((n.kind !== 'method' && n.kind !== 'function') || n.startLine > ref.line || n.endLine < ref.line) continue;
-    if (!fn || n.startLine >= fn.startLine) fn = n;
-  }
+  return fn && bindsNameItself(fn, name, context) ? null : found;
+}
+
+const MEMBER_SHADOWS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+const MEMBER_WALKS = new WeakMap<ResolutionContext, Map<string, string | null>>();
+
+/** Whether a C# / Java / Kotlin function body binds `name` itself — a `var`/`val`, an `out` or loop variable, a lambda parameter. */
+function bindsNameItself(fn: Node, name: string, context: ResolutionContext): boolean {
+  let memo = MEMBER_SHADOWS.get(context);
+  if (!memo) MEMBER_SHADOWS.set(context, (memo = new Map()));
+  const key = `${fn.id}|${name}`;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  const lines = context.getFileLines?.(fn.filePath) ?? context.readFile(fn.filePath)?.split(/\r?\n/) ?? [];
+  const body = lines.slice(fn.startLine - 1, fn.endLine).join('\n');
   const r = name.replace(/\$/g, '\\$');
-  if (fn) {
-    const body = lines.slice(fn.startLine - 1, ref.line).join('\n');
-    if (new RegExp(`\\b(?:var|val|out\\s+[\\w.<>?]+|foreach\\s*\\(\\s*[\\w.<>?,\\s]+?)\\s+${r}\\b|\\bfor\\s*\\([^;)]*\\s${r}\\s*:|\\b${r}\\s*=>|[(,]\\s*${r}\\s*(?:,[^()]*)?\\)\\s*=>|\\b${r}\\s*(?:,[^{}]*)?->`).test(body)) return null;
-  }
-  // The class's own members first, then those it inherits (a base class's
-  // `internal readonly JsonSerializer Serializer;`).
-  // Each inherited class carries what its type parameters stand for in the
-  // class the walk came from (`: IntegrationTest<DatabaseInitializer>`).
+  const binds = new RegExp(`\\b(?:var|val|out\\s+[\\w.<>?]+|foreach\\s*\\(\\s*[\\w.<>?,\\s]+?)\\s+${r}\\b|\\bfor\\s*\\([^;)]*\\s${r}\\s*:|\\b${r}\\s*=>|[(,]\\s*${r}\\s*(?:,[^()]*)?\\)\\s*=>|\\b${r}\\s*(?:,[^{}]*)?->`).test(body);
+  memo.set(key, binds);
+  return binds;
+}
+
+/**
+ * The type `cls` declares a member `name` with, or one of its supertypes
+ * does — the class's own members first, then those it inherits (a base
+ * class's `internal readonly JsonSerializer Serializer;`), each inherited
+ * class carrying what its type parameters stand for in the class the walk
+ * came from (`: IntegrationTest<DatabaseInitializer>`).
+ */
+function memberTypeThroughHierarchy(cls: Node, name: string, context: ResolutionContext): string | null {
+  let memo = MEMBER_WALKS.get(context);
+  if (!memo) MEMBER_WALKS.set(context, (memo = new Map()));
+  const key = `${cls.id}|${name}`;
+  if (memo.has(key)) return memo.get(key)!;
+  let result: string | null = null;
   const seen = new Set<string>();
   const queue: Array<{ type: Node; args: Map<string, string> }> = [{ type: cls, args: new Map() }];
   while (queue.length > 0 && seen.size < 8) {
@@ -4869,14 +4896,21 @@ function inferMemberReceiverType(receiver: string, ref: UnresolvedRef, context: 
     seen.add(type.id);
     const found = classMemberType(type, name, context);
     if (found) {
-      if (type === cls) return found;
+      if (type === cls) {
+        result = found;
+        break;
+      }
       // A member typed by the declaring class's own type parameter
       // (`protected TFixture Fixture { get; }`) is the argument the subclass
       // gave it, else its bound — with neither, only `object`'s members.
       const given = args.get(found);
-      if (given) return given;
+      if (given) {
+        result = given;
+        break;
+      }
       const bound = typeParameterBoundIn(found, [type], context);
-      return bound === undefined ? found : bound ?? 'object';
+      result = bound === undefined ? found : bound ?? 'object';
+      break;
     }
     for (const sup of classHeadSupertypes(type, context)) {
       const given = headTypeArguments(type, sup, context).map((a) => args.get(a) ?? a);
@@ -4887,7 +4921,8 @@ function inferMemberReceiverType(receiver: string, ref: UnresolvedRef, context: 
       }
     }
   }
-  return null;
+  memo.set(key, result);
+  return result;
 }
 
 /** The first `<…>` of a declaration's head, split at its top-level commas. */
@@ -4933,7 +4968,20 @@ function headTypeArguments(cls: Node, sup: string, context: ResolutionContext): 
  * Python `class X(Base):`, Ruby `class X < Base`, PHP / TS / JS `extends
  * Base`, and the Java-family heads.
  */
+const DECLARED_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
+const INHERITED_METHODS = new WeakMap<ResolutionContext, Map<string, Node | null>>();
+
 function declaredSupertypes(cls: Node, context: ResolutionContext): string[] {
+  let memo = DECLARED_SUPERS.get(context);
+  if (!memo) DECLARED_SUPERS.set(context, (memo = new Map()));
+  const hit = memo.get(cls.id);
+  if (hit) return hit;
+  const supers = readDeclaredSupertypes(cls, context);
+  memo.set(cls.id, supers);
+  return supers;
+}
+
+function readDeclaredSupertypes(cls: Node, context: ResolutionContext): string[] {
   switch (cls.language) {
     case 'java': case 'csharp': case 'kotlin': return classHeadSupertypes(cls, context);
     case 'dart': return dartSupertypesOf(cls.name, context);
@@ -4958,6 +5006,17 @@ function declaredSupertypes(cls: Node, context: ResolutionContext): string[] {
 
 /** A method named `name` on a supertype of the given classes, nearest first. */
 function inheritedClassMethod(classes: Node[], name: string, context: ResolutionContext): Node | null {
+  if (classes.length === 0) return null;
+  let memo = INHERITED_METHODS.get(context);
+  if (!memo) INHERITED_METHODS.set(context, (memo = new Map()));
+  const key = `${classes.map((c) => c.id).join(',')}|${name}`;
+  if (memo.has(key)) return memo.get(key)!;
+  const found = findInheritedClassMethod(classes, name, context);
+  memo.set(key, found);
+  return found;
+}
+
+function findInheritedClassMethod(classes: Node[], name: string, context: ResolutionContext): Node | null {
   const seen = new Set<string>(classes.map((c) => c.id));
   let frontier = classes;
   for (let depth = 0; depth < 5 && frontier.length > 0; depth++) {
@@ -5009,15 +5068,45 @@ function classMemberType(cls: Node, name: string, context: ResolutionContext): s
   }
   const key = `${cls.id}|${name}`;
   if (memo.has(key)) return memo.get(key)!;
-  const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
   const r = name.replace(/\$/g, '\\$');
   const pattern = cls.language === 'kotlin'
     ? new RegExp(`\\b(?:val|var)\\s+${r}\\s*:\\s*([A-Z][\\w.]*)`)
     : new RegExp(`(?:^|[\\s(,])([A-Za-z_][\\w.]*)\\s*${TYPE_ARGS}\\??\\s+${r}\\s*(?:[=;,)]|\\{)`);
   let found: string | null = null;
+  for (const { text, depth } of classMemberLines(cls, context)) {
+    if (!text.includes(name)) continue;
+    const m = pattern.exec(text);
+    // Inside parentheses at member depth is a method's parameter list; only
+    // the header's (a primary constructor's) declares members.
+    const inParens = m !== null && depth === 1 &&
+      (text.slice(0, m.index).match(/\(/g)?.length ?? 0) > (text.slice(0, m.index).match(/\)/g)?.length ?? 0);
+    if (m && !inParens && !MEMBER_TYPE_NON_TYPES.has(m[1]!)) {
+      found = normalizeInferredTypeName(m[1]!);
+      break;
+    }
+  }
+  memo.set(key, found);
+  return found;
+}
+
+const MEMBER_LINES = new WeakMap<ResolutionContext, Map<string, Array<{ text: string; depth: number }>>>();
+
+/**
+ * A class's own member-declaration lines — those at its body's brace depth,
+ * or its header (a primary constructor's parameters) — with comments and
+ * string contents dropped; method, accessor and indexer bodies and nested
+ * types are deeper and left out. Read once per class.
+ */
+function classMemberLines(cls: Node, context: ResolutionContext): Array<{ text: string; depth: number }> {
+  let memo = MEMBER_LINES.get(context);
+  if (!memo) MEMBER_LINES.set(context, (memo = new Map()));
+  const hit = memo.get(cls.id);
+  if (hit) return hit;
+  const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
+  const out: Array<{ text: string; depth: number }> = [];
   let depth = 0;
   let inComment = false;
-  for (let line = cls.startLine; line <= cls.endLine && !found; line++) {
+  for (let line = cls.startLine; line <= cls.endLine; line++) {
     let raw = lines[line - 1] ?? '';
     if (inComment) {
       const close = raw.indexOf('*/');
@@ -5031,21 +5120,14 @@ function classMemberType(cls: Node, name: string, context: ResolutionContext): s
       text = text.slice(0, open);
       inComment = true;
     }
-    if (depth <= 1) {
-      const m = pattern.exec(text);
-      // Inside parentheses at member depth is a method's parameter list; only
-      // the header's (a primary constructor's) declares members.
-      const inParens = m !== null && depth === 1 &&
-        (text.slice(0, m.index).match(/\(/g)?.length ?? 0) > (text.slice(0, m.index).match(/\)/g)?.length ?? 0);
-      if (m && !inParens && !MEMBER_TYPE_NON_TYPES.has(m[1]!)) found = normalizeInferredTypeName(m[1]!);
-    }
+    if (depth <= 1 && text.trim() !== '') out.push({ text, depth });
     for (const ch of text) {
       if (ch === '{') depth++;
       else if (ch === '}') depth = Math.max(0, depth - 1);
     }
   }
-  memo.set(key, found);
-  return found;
+  memo.set(cls.id, out);
+  return out;
 }
 
 /**
@@ -5588,7 +5670,7 @@ export function matchMethodCall(
         ? inferCppReceiverType(objectOrClass!, ref, context)
         : inferLocalReceiverType(objectOrClass!, ref, context));
     if (!inferredType && MEMBER_TYPED_LANGUAGES.has(ref.language) && dotMatch) {
-      inferredType = inferMemberReceiverType(objectOrClass!, ref, context);
+      inferredType = nmTimedT('mc-member', ref, () => inferMemberReceiverType(objectOrClass!, ref, context));
       // A field of a built-in type (`string _name`, `int count`) has no project method.
       if (inferredType && /^[a-z]/.test(inferredType)) return null;
     }
