@@ -2369,6 +2369,8 @@ interface SwiftCallShape {
   label: string;
   /** `name[…]`: a subscript of a value, not a call. */
   subscript: boolean;
+  /** `URLEncodedFormDecoder().decode(…)`: the type the link before the call constructs. */
+  constructed?: string;
 }
 
 function swiftCallShape(ref: UnresolvedRef, context: ResolutionContext): SwiftCallShape | null {
@@ -2393,6 +2395,7 @@ function swiftCallShape(ref: UnresolvedRef, context: ResolutionContext): SwiftCa
     shape: 'chained',
     receiver: rustGoReceiverName(before.replace(/[?!]\s*\./g, '.')),
     label: /^\s*\(\s*([A-Za-z_]\w*)\s*:(?!:)/.exec(after)?.[1] ?? '',
+    constructed: /(?<![\w$.])([A-Z][\w$]*)\s*(?:<[^<>()]*>)?\s*\([^()]*\)\s*[?!]?\s*\.\s*$/.exec(before)?.[1],
   };
 }
 
@@ -2522,6 +2525,19 @@ function swiftHierarchyAt(ref: UnresolvedRef, context: ResolutionContext): Map<s
   return depths;
 }
 
+/** A Swift type and every supertype and protocol the project says it has. */
+function swiftTypeClosure(typeName: string, context: ResolutionContext): Set<string> {
+  const seen = new Set<string>();
+  const queue = [typeName];
+  while (queue.length > 0 && seen.size < 40) {
+    const name = queue.shift()!;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    queue.push(...swiftDeclOf(name, context).supers);
+  }
+  return seen;
+}
+
 /**
  * Of the in-scope members a bare / `self.` / `super.` Swift call could mean,
  * the nearest: the type's own, else its superclass's — Alamofire's
@@ -2601,6 +2617,13 @@ function isSwiftCallTarget(n: Node, shape: SwiftCallShape | null, ref: Unresolve
   }
   if (owner === null) return true;
   if (shape.shape === 'chained') {
+    // A member of what the link before constructs, or of what that inherits:
+    // vapor's `URLEncodedFormDecoder().decode(…)` is not a request's private
+    // `_URLQueryContainer.decode`, `JSONDecoder().decode(…)` no project type's.
+    // (A capitalized C function — realm's `RLMObjectBaseObjectSchema(obj)!` — constructs nothing.)
+    if (shape.constructed && !context.getNodesByName(shape.constructed).some((f) => f.kind === 'function')) {
+      return swiftTypeClosure(shape.constructed, context).has(owner);
+    }
     if (shape.receiver === '' || !SWIFT_STD_METHODS.has(n.name)) return true;
     return sharesReceiverWord(shape.receiver.split('.').pop()!, n) || !swiftDeclOf(owner, context).projectType ||
       swiftDeclaresLabel(n, shape.label, context);

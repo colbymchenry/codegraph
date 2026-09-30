@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- A Swift call on a value built on the spot, like `JSONDecoder().decode(…)` or `Realm().create(…)`, now resolves to that type's method, or to one it inherits. It no longer lands on some other type's method of the same name: Vapor's `JSONDecoder().decode` calls had gone to a request's private container.
 - A bare Lua call like `ipairs(t)`, `error("…")` or busted's `setup()` now means Lua's own function unless the file defines one. It no longer lands on a table method of the same name: telescope's `ipairs` calls had gone to a linked list's `ipairs`, and kong's `error` calls to its response module. A function's own alias of a host table member, like `local get_query = kong.request.get_query`, is now followed as well.
 - A C++ call into a macro-opened namespace, like `fmt::format("{}", x)`, now picks the overload its arguments fit. Before, the first overload indexed won: fmt's 1,400 `fmt::format` calls all reached the `text_style` overload in `color.h`. A narrow string literal now fits a narrow format string, a wide `L"…"` fits the wide overload, and the argument count has to fit too.
 - Calls inside an inline route handler now keep their receivers, so they resolve like any other method call. Before, Hono's `app.get('/', (c) => c.text('Hello'))` linked the route to the one other `text` method in the project, its client's `ClientResponse.text`; that happened in over 400 routes. A call like `userService.lookup(id)` reaches the service it names.
