@@ -234,6 +234,9 @@ function rowToFileRecord(row: FileRow): FileRecord {
 /**
  * Query builder for the knowledge graph database
  */
+/** Distinct-name lists longer than this are recomputed rather than held. */
+const MAX_MEMOIZED_NODE_NAMES = 250_000;
+
 export class QueryBuilder {
   private db: SqliteDatabase;
 
@@ -251,12 +254,11 @@ export class QueryBuilder {
   private nodeCache: Map<string, Node> = new Map();
   private readonly maxCacheSize = 1000;
 
-  // getDominantFile()'s answer, tagged with the database change stamp it was
-  // computed under (see getChangeStamp). Query-independent, so one value
+  // Whole-graph answers that do not depend on the query (the dominant file,
+  // the distinct name list, the stats counts), each tagged with the database
+  // change stamp it was computed under (see memoizeByChangeStamp). One value
   // serves every explore until the database changes (#1864).
-  private dominantFileMemo:
-    | { stamp: string; value: { filePath: string; edgeCount: number; nextEdgeCount: number } | null }
-    | undefined;
+  private stampMemos = new Map<string, { stamp: string; value: unknown }>();
 
   // Prepared statements (lazily initialized)
   private stmts: {
@@ -390,7 +392,7 @@ export class QueryBuilder {
     // The change stamp is per connection, and fresh connections to two
     // different databases report the same one — the memo goes with the old
     // connection, or a worker following a rebuilt index keeps its answer (#1864).
-    this.dominantFileMemo = undefined;
+    this.stampMemos.clear();
   }
 
   private edgeKindStmt(sql: string): SqliteStatement {
@@ -1074,18 +1076,28 @@ export class QueryBuilder {
    * stamp: recomputed only after something wrote to the database.
    */
   getDominantFile(): { filePath: string; edgeCount: number; nextEdgeCount: number } | null {
+    return this.memoizeByChangeStamp('dominantFile', () => this.computeDominantFile());
+  }
+
+  /**
+   * `compute()`'s value, reused until the database changes (see getChangeStamp).
+   * `keep` can decline to hold a value (e.g. one too large to pin in memory).
+   */
+  private memoizeByChangeStamp<T>(key: string, compute: () => T, keep: (value: T) => boolean = () => true): T {
     // total_changes() counts writes that are later rolled back, so a result
     // read inside a transaction could outlive a ROLLBACK under an unchanged
     // stamp. Never keep one; `undefined` (a runtime without the getter) is
     // treated the same way.
     if (this.db.inTransaction !== false) {
-      this.dominantFileMemo = undefined;
-      return this.computeDominantFile();
+      this.stampMemos.delete(key);
+      return compute();
     }
     const stamp = this.getChangeStamp();
-    if (this.dominantFileMemo?.stamp === stamp) return this.dominantFileMemo.value;
-    const value = this.computeDominantFile();
-    this.dominantFileMemo = { stamp, value };
+    const memo = this.stampMemos.get(key);
+    if (memo?.stamp === stamp) return memo.value as T;
+    const value = compute();
+    if (keep(value)) this.stampMemos.set(key, { stamp, value });
+    else this.stampMemos.delete(key);
     return value;
   }
 
@@ -3459,12 +3471,21 @@ export class QueryBuilder {
   /**
    * Get all distinct node names (lightweight — just name strings for pre-filtering)
    */
-  getAllNodeNames(): string[] {
-    if (!this.stmts.getAllNodeNames) {
-      this.stmts.getAllNodeNames = this.db.prepare('SELECT DISTINCT name FROM nodes');
-    }
-    const rows = this.stmts.getAllNodeNames.all() as Array<{ name: string }>;
-    return rows.map((r) => r.name);
+  getAllNodeNames(): readonly string[] {
+    // Fuzzy search walks this list on every call. Held until the database
+    // changes, unless it is large enough that pinning it would cost real
+    // memory for the life of a long-running server.
+    return this.memoizeByChangeStamp(
+      'allNodeNames',
+      () => {
+        if (!this.stmts.getAllNodeNames) {
+          this.stmts.getAllNodeNames = this.db.prepare('SELECT DISTINCT name FROM nodes');
+        }
+        const rows = this.stmts.getAllNodeNames.all() as Array<{ name: string }>;
+        return Object.freeze(rows.map((r) => r.name));
+      },
+      (names) => names.length <= MAX_MEMOIZED_NODE_NAMES
+    );
   }
 
   /**
@@ -3878,6 +3899,19 @@ export class QueryBuilder {
    * Get graph statistics
    */
   getStats(): GraphStats {
+    // Explore sizes its output from these counts on every call. Callers fill
+    // in the size fields, so each gets its own copy of the memoized counts.
+    const stats = this.memoizeByChangeStamp('stats', () => this.computeStats());
+    return {
+      ...stats,
+      nodesByKind: { ...stats.nodesByKind },
+      edgesByKind: { ...stats.edgesByKind },
+      filesByLanguage: { ...stats.filesByLanguage },
+      lastUpdated: Date.now(),
+    };
+  }
+
+  private computeStats(): GraphStats {
     // Single query for all three aggregate counts
     const counts = this.db.prepare(`
       SELECT

@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph_explore` answers sooner from a long-running MCP server or agent session. Each call used to recount the whole graph, reload every symbol name for typo-tolerant search, and look for a `codegraph.json` once per candidate it ranked; the first two are now kept until the index changes, and the config check is cheap when there is no config file. Answers are unchanged.
+
 ### Fixes
 
 - Laravel routes are now named by the path a request takes: a leading `/` is added where the routes file leaves it out, `Route::prefix()` and `Route::group(['prefix' => …])` groups are applied, and routes in `routes/api.php` carry the `/api` prefix Laravel serves them under, read from your `RouteServiceProvider`, `bootstrap/app.php` or any file that mounts a routes file. A front-end `fetch('/api/…')` now connects to the Laravel route that serves it. Re-index Laravel projects after upgrading.
