@@ -1566,6 +1566,9 @@ export function matchByExactName(
     !((bareJs || bareGo) && TYPE_MEMBER_KINDS.has(n.kind)) &&
     // A bare PHP call is a function call: nothing else is callable without a receiver.
     !(barePhp && n.kind !== 'function') &&
+    // A Vue component's own method is `this.m()` inside that component — not
+    // `this.$refs['input'].click()` on an element another component renders.
+    !(ref.referenceKind === 'calls' && JS_FAMILY.has(ref.language) && isVueComponentMethod(n) && !isThisCallInOwnFile(n, ref, context)) &&
     // An `extends`/`implements` ref names a supertype, so anything that can't
     // BE one is not a candidate at all. This is eligibility, not
     // ranking: kind is only a scoring bonus below (and none is awarded for
@@ -3620,6 +3623,15 @@ export function matchMethodCall(
       narrowed = kept.length !== targetMethods.length;
       targetMethods = kept;
     }
+    // A Vue component's own method is reached as `this.m()` inside it —
+    // never as `e.preventDefault()` on an event, nor `this.editor.setValue()`
+    // on something the component holds. A template ref
+    // (`this.$refs.form.validate()`) names a child this cannot tell apart.
+    if (JS_FAMILY.has(ref.language)) {
+      const kept = targetMethods.filter((m) => !isVueComponentMethod(m) || (objectOrClass === 'this' && m.filePath === ref.filePath));
+      narrowed ||= kept.length !== targetMethods.length;
+      targetMethods = kept;
+    }
 
     // If only one same-language method with this name exists, use it
     if (targetMethods.length === 1 && !narrowed && targetMethods[0]!.language === ref.language) {
@@ -3679,6 +3691,18 @@ function isImportedModuleReceiver(receiver: string, ref: UnresolvedRef, context:
   const binding = context.getImportMappings?.(ref.filePath, ref.language)?.find((m) => m.localName === root);
   if (!binding) return false;
   return binding.isNamespace || context.isOutOfRepoImport?.(binding.source, ref.filePath, ref.language) === true;
+}
+
+/** A method a Vue Options API component declares for itself (`index::handleLogin` in `index.vue`). */
+function isVueComponentMethod(n: Node): boolean {
+  return n.kind === 'method' && n.filePath.endsWith('.vue') && n.qualifiedName === `${path.posix.basename(n.filePath, '.vue')}::${n.name}`;
+}
+
+/** Is `ref` written as `this.<name>(` in the file that declares `n`? */
+function isThisCallInOwnFile(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (n.filePath !== ref.filePath) return false;
+  const line = (context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/))?.[ref.line - 1] ?? '';
+  return new RegExp(String.raw`\bthis\s*\??\.\s*${n.name.replace(/\$/g, '\\$')}\s*\(`).test(line);
 }
 
 /** Is the root of a member call's receiver (`CameraManager` in `CameraManager.x`) one of the file's imports? */
