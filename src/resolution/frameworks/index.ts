@@ -18,7 +18,7 @@ import { vueRouterResolver } from './vue-router';
 import { angularRouterResolver } from './angular-router';
 import { svelteKitRouterResolver } from './sveltekit-router';
 import { svelteResolver } from './svelte';
-import { vueResolver } from './vue';
+import { vueResolver, nuxtResolver } from './vue';
 import { astroResolver } from './astro';
 import { djangoResolver, flaskResolver, fastapiResolver } from './python';
 import { railsResolver } from './ruby';
@@ -58,6 +58,8 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   // SvelteKit — `src/routes/**/+page.svelte` routes are `svelteResolver`'s; `goto('/x')` / `redirect(303, '/x')` → navigates edges
   svelteKitRouterResolver,
   vueResolver,
+  // Nuxt — `pages/**` screens, `server/api/**` endpoints and `middleware/`, in a Nuxt app only
+  nuxtResolver,
   // Vue Router — `createRouter({ routes })` → route nodes; `router.push({ name })` / `router.push('/x')` → navigates edges
   vueRouterResolver,
   angularRouterResolver,
@@ -162,7 +164,7 @@ export { vueRouterResolver } from './vue-router';
 export { angularRouterResolver } from './angular-router';
 export { svelteKitRouterResolver } from './sveltekit-router';
 export { svelteResolver } from './svelte';
-export { vueResolver } from './vue';
+export { vueResolver, nuxtResolver } from './vue';
 export { astroResolver } from './astro';
 export { djangoResolver, flaskResolver, fastapiResolver } from './python';
 export { railsResolver } from './ruby';

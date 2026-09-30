@@ -218,7 +218,7 @@ function writtenHere(edge: Edge, holder: Node): boolean {
  * Entry points, which is the list of what a request or a user can arrive at.
  */
 function isScreenRoute(route: Node): boolean {
-  return route.name.startsWith('/') && !route.filePath.includes('/server/api/');
+  return route.name.startsWith('/') && !`/${route.filePath}`.includes('/server/api/');
 }
 
 export async function buildScreens(cg: CodeGraph, projectRoot: string): Promise<WireScreensPayload> {
