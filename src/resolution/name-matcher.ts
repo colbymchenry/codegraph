@@ -12,6 +12,7 @@ import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
 import { isTestPath } from '../search/query-utils';
+import { isMinifiedContent } from '../extraction/generated-detection';
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
  * score. A name defined more times than this is "ubiquitous" — a method/symbol
@@ -932,6 +933,21 @@ function isLuaLocal(candidate: Node, context: ResolutionContext): boolean {
 const JVM_CALLABLE_KINDS: ReadonlySet<string> = new Set(['method', 'function']);
 const JVM_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'enum', 'struct', 'trait', 'type_alias', 'annotation']);
 
+const MINIFIED_SCRIPTS = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/** A minified / bundled script, by name (`jquery.min.js`) or by its text. */
+function isMinifiedScript(filePath: string, context: ResolutionContext): boolean {
+  if (!/\.(?:m?js|cjs)$/i.test(filePath)) return false;
+  let memo = MINIFIED_SCRIPTS.get(context);
+  if (!memo) MINIFIED_SCRIPTS.set(context, (memo = new Map()));
+  let hit = memo.get(filePath);
+  if (hit === undefined) {
+    hit = /[.-]min\.m?js$/i.test(filePath) || isMinifiedContent(filePath, context.readFile(filePath) ?? '');
+    memo.set(filePath, hit);
+  }
+  return hit;
+}
+
 /** Per context: every package the project's JVM sources declare. */
 const JVM_PACKAGES = new WeakMap<ResolutionContext, Set<string>>();
 
@@ -1276,6 +1292,9 @@ function rustModuleDir(filePath: string): string {
  */
 export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
   if (candidate.filePath === ref.filePath) return true;
+  // A vendored minified bundle's names are mangled: healthchecks' 369 `$(…)`
+  // (jQuery, a global) went to a one-letter helper inside bootstrap-native.min.js.
+  if (isMinifiedScript(candidate.filePath, context)) return false;
   const lang = candidate.language as string;
   if (lang === 'c' || lang === 'cpp') {
     return (
@@ -5095,6 +5114,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   LUA_LOCALS.delete(context);
   LUA_MEMBERS.delete(context);
   JVM_PACKAGES.delete(context);
+  MINIFIED_SCRIPTS.delete(context);
   PY_LOCAL_BINDS.delete(context);
   PHP_FILE_SCOPES.delete(context);
   JAVA_STATIC_IMPORTS.delete(context);
