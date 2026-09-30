@@ -25,6 +25,7 @@ import { matchJsStoreBindingCall, isUnresolvedJsMemberCall, isVisibleAcrossFiles
 import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibility';
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
+import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
 import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
@@ -448,6 +449,7 @@ export class ReferenceResolver {
       clearNameMatcherMemos(this.context);
       clearCppMacroVisibility(this.context);
       clearSwiftTypeVisibility(this.context);
+      clearTypeParameterMemos(this.context);
     }
   }
 
@@ -985,7 +987,13 @@ export class ReferenceResolver {
     if (isVisibleCppMacro(ref, this.context)) return null;
     // A Swift type reference never lands on an `extension X {}` node, nor on a
     // nested type it cannot name bare (see ./swift-type-visibility).
-    const candidate = gateSwiftTypeTarget(this.gateTargetKind(this.resolveOneInner(ref), ref), ref, this.context);
+    // A name a declaration around the reference declares as a type parameter
+    // (`def f[A]`, `class Foo<T>`) is that parameter (see ./type-parameters).
+    const candidate = gateTypeParameter(
+      gateSwiftTypeTarget(this.gateTargetKind(this.resolveOneInner(ref), ref), ref, this.context),
+      ref,
+      this.context,
+    );
     const resolved = candidate?.resolvedBy === 'framework'
       ? this.gateFrameworkLanguage(candidate, ref)
       : this.gateLanguage(candidate, ref);

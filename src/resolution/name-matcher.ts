@@ -597,6 +597,8 @@ export function matchFunctionRef(
 
 /** Languages with no nested named functions: nesting in the graph is never a scope. */
 const NO_NESTED_FUNCTIONS = new Set<string>(['c', 'cpp']);
+/** Types a function body can declare for itself. */
+const LOCAL_TYPE_KINDS = new Set<string>(['class', 'struct', 'enum', 'interface', 'trait', 'type_alias']);
 
 /**
  * A function nested inside another FUNCTION is only callable from within its
@@ -614,7 +616,9 @@ function isLexicallyReachable(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): boolean {
-  if (candidate.kind !== 'function') return true;
+  // A function — or a type (`case class B()` in a test method) — declared
+  // inside a function is only in scope in there.
+  if (candidate.kind !== 'function' && !LOCAL_TYPE_KINDS.has(candidate.kind)) return true;
   // C and C++ have no nested named functions, so a function the graph shows
   // inside another is an extraction artifact, not a scope: tree-sitter-c
   // cannot parse a macro call whose arguments are designated initializers
@@ -1247,6 +1251,11 @@ export function matchByExactName(
   const candidates = sameName.filter((n) =>
     !(cMacroCall && n.kind !== 'function' && n.kind !== 'method') &&
     !(typeRef && !canNameInTypePosition(n)) &&
+    // A Scala type position (`Arbitrary[B]`) never names a method: an
+    // `implicit def A: Order[A]` shares its name with half of cats' type
+    // parameters. Scala's value references only read a file's own vals.
+    !(ref.language === 'scala' && ref.referenceKind === 'references' && /^[A-Z]/.test(ref.referenceName) &&
+      (n.kind === 'method' || n.kind === 'function')) &&
     // Type/value references retain same-family eligibility: a native namesake
     // must not hide the actual web type. Calls still gate only the winner.
     (!valueRef || sameLanguageFamily(n.language, ref.language)) &&
