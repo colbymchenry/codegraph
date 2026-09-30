@@ -4516,6 +4516,7 @@ export function matchMethodCall(
     // `node.loc` on a rubocop-ast node went to the one `loc` in the project
     // 1,201 times; lobsters' `value.to_s` to a short-id class's.
     if (targetMethods.length === 1 && !narrowed && targetMethods[0]!.language === ref.language &&
+        !((ref.language === 'lua' || ref.language === 'luau') && isLuaLibraryCall(objectOrClass!, methodName!, ref, targetMethods[0]!)) &&
         !(UNTYPED_RECEIVER_LANGUAGES.has(ref.language) && !/^(?:self|self\.class|this|super|weak_?self|strong_?self)$/i.test(objectOrClass!) &&
           !sharesReceiverWord(objectOrClass!, targetMethods[0]!) &&
           !(ref.language === 'objc' && objcReceiverReaches(objectOrClass!, targetMethods[0]!, context)) &&
@@ -5330,6 +5331,32 @@ function hasParameterBinding(code: string, escapedName: string): boolean {
  * service's.
  */
 const UNTYPED_RECEIVER_LANGUAGES: ReadonlySet<string> = new Set(['ruby', 'cfml', 'cfscript', 'objc', 'php']);
+
+/**
+ * Lua's standard and host libraries: a call through one of these tables is
+ * the library's, never the one project method that shares its name (busted's
+ * `assert.truthy` went to a condition helper 987 times, `string.find` to a
+ * picker's `find`, Neovim's `vim.split` to a build module's).
+ */
+const LUA_LIBRARY_TABLES: ReadonlySet<string> = new Set([
+  'string', 'table', 'math', 'io', 'os', 'coroutine', 'debug', 'utf8', 'package', 'bit', 'bit32', 'jit', 'ffi',
+  'vim', 'ngx', 'assert', 'spy', 'stub', 'mock', 'love',
+]);
+/** Lua string methods, reached with `s:find(…)` on any string. */
+const LUA_STRING_METHODS: ReadonlySet<string> = new Set([
+  'find', 'match', 'gmatch', 'gsub', 'sub', 'format', 'upper', 'lower', 'len', 'rep', 'byte', 'reverse',
+]);
+
+/**
+ * Whether a Lua call is a library's rather than `candidate`: through a library
+ * table the project doesn't patch itself (kong's globalpatches do define
+ * `ngx.sleep`), or a string method on a value.
+ */
+function isLuaLibraryCall(receiver: string, method: string, ref: UnresolvedRef, candidate: Node): boolean {
+  const root = receiver.split(/[.:]/)[0]!;
+  if (LUA_LIBRARY_TABLES.has(root)) return candidate.qualifiedName.split(/::|\./)[0] !== root;
+  return LUA_STRING_METHODS.has(method) && ref.referenceName.endsWith(`:${method}`);
+}
 
 /**
  * Whether a receiver is named after the owner of `method`, case aside: the
