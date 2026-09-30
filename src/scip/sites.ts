@@ -207,16 +207,27 @@ interface Call {
   symbol: string;
 }
 
+/**
+ * How the source text around an occurrence reads: `'call'` when an argument
+ * list follows it, `'new'` when only a `new` keyword precedes it (`new Foo`),
+ * null otherwise (a callback passed by name, a type annotation, …).
+ */
+export function callShape(o: ScipOccurrence, lines: string[], encoding: number): 'call' | 'new' | null {
+  const { startLine, startCol, endLine, endCol } = o.range;
+  const endText = lines[endLine];
+  if (endText === undefined) return null;
+  if (looksLikeCall(endText.slice(toStringOffset(endText, endCol, encoding)))) return 'call';
+  const startText = lines[startLine] ?? '';
+  return /\bnew\s+$/.test(startText.slice(0, toStringOffset(startText, startCol, encoding))) ? 'new' : null;
+}
+
 function classify(
   o: ScipOccurrence, lines: string[], encoding: number, symToNode: Map<string, NodeRow>
 ): Call | null {
   const parsed = parseSymbol(o.symbol);
   if (!parsed) return null;
-  const { startLine, startCol, endLine, endCol } = o.range;
-  const endText = lines[endLine];
-  if (endText === undefined) return null;
-  const tail = endText.slice(toStringOffset(endText, endCol, encoding));
-  const isCall = looksLikeCall(tail);
+  const shape = callShape(o, lines, encoding);
+  const isCall = shape === 'call';
   const { name, kind } = parsed.last;
 
   if (kind === 'method' && name === '<constructor>') {
@@ -226,9 +237,7 @@ function classify(
     return { kind: 'instantiates', name: cls?.name ?? owner?.last.name ?? name, target: cls?.id ?? null, symbol: parsed.owner };
   }
   if (kind === 'type') {
-    const startText = lines[startLine] ?? '';
-    const head = startText.slice(0, toStringOffset(startText, startCol, encoding));
-    if (!isCall && !/\bnew\s+$/.test(head)) return null;
+    if (!shape) return null;
     const node = symToNode.get(o.symbol);
     return { kind: 'instantiates', name: node?.name ?? name, target: node?.id ?? null, symbol: o.symbol };
   }

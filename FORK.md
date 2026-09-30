@@ -31,7 +31,7 @@ Everything else is new, under `src/scip/`, `__tests__/scip/`, `__tests__/fixture
 
 ```sh
 codegraph scip index            # run each detected language's indexer (must be on PATH), then merge
-codegraph scip import out.scip  # install an index built elsewhere from the current sources, then merge
+codegraph scip import out.scip  # install an index built elsewhere, then merge
 codegraph scip status
 ```
 
@@ -43,7 +43,7 @@ Indexers are never auto-installed. For TS/JS: `npm i -g @sourcegraph/scip-typesc
 
 Put this in `codegraph.json`. `"python": false` disables a language. `cmd`, `args` and `env` replace the defaults.
 
-After a project opts in with `scip index`, the MCP server (and anything else that `watch`es) re-indexes on its own. That happens 60 s after the last synced edit, at most every 10 min, niced. A new index replaces the old one only when its resolved-reference count dropped by no more than 20%. Otherwise the old index stays and the reason is logged.
+After a project opts in with `scip index`, the MCP server (and anything else that `watch`es) re-indexes on its own. That happens 60 s after the last synced edit, at most every 10 min, niced. A new index replaces the old one only when its count of resolved calls (calls and instantiations of project symbols; imports and type references don't count) dropped by no more than 20%. Otherwise the old index stays and the reason is logged.
 
 ## How edges are decided
 
@@ -57,7 +57,7 @@ Call sites are keyed by (caller node, line, callee name, kind), as in the POC.
 | heuristic-only in a file SCIP covers | kept, `metadata.scipSilent = true` → shown as *unverified* |
 | SCIP edge into or out of a file edited since the index | `metadata.scipStale = true` until the next reindex |
 
-The **hash gate** decides whether a document is used. It is used only when three hashes are equal: the file's content hash when the indexer started, `files.content_hash`, and the file on disk. Synthesized dynamic-dispatch edges (`provenance='heuristic'`) are never touched.
+The **hash gate** decides whether a document is used. It is used only when three hashes are equal: the file's content hash when the indexer started, `files.content_hash`, and the file on disk. `scip import` has no indexer start to snapshot, so the index file's mtime stands in for it: a source modified after the index was written is left to the heuristic until a reindex. Copy an index with its mtime intact (`cp -p`), or the copy time becomes the build time. Synthesized dynamic-dispatch edges (`provenance='heuristic'`) are never touched.
 
 Differences from the POC:
 

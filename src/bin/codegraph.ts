@@ -2839,10 +2839,12 @@ program
  */
 program
   .command('upgrade [version]')
-  .description('Update CodeGraph to the latest release (or a specific version)')
+  .description('Disabled in the codegraph-scip fork (would replace it with upstream)')
   .option('--check', 'Check whether an update is available without installing')
   .option('-f, --force', 'Reinstall even if already on the target version')
   .action(async (versionArg: string | undefined, options: { check?: boolean; force?: boolean }) => {
+    // Fork: refuse up front. Upstream's body below is left unreachable rather
+    // than deleted so this hunk stays three lines on every rebase.
     error('This is the codegraph-scip fork: `upgrade` would replace it with upstream. Install a newer fork tarball instead (see FORK.md).');
     process.exit(1);
     const up = await import('../upgrade');

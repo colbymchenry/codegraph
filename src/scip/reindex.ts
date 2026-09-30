@@ -81,7 +81,7 @@ export class ScipReindexScheduler {
   private async runOnce(): Promise<void> {
     const root = this.host.getProjectRoot();
     let installed = 0;
-    for (const lang of availableIndexes(root)) {
+    for (const { lang } of availableIndexes(root)) {
       if (this.abort.signal.aborted) return;
       try {
         const r = await produceIndex(this.host.scipReadDb(), root, lang, { nice: true, signal: this.abort.signal, log: this.log });

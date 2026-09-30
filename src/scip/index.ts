@@ -17,12 +17,12 @@ import { hashContent } from '../extraction';
 import { indexedHashInput } from '../file-limits';
 import { TOOL_LANGUAGES } from './indexers';
 import { MergeOutcome, markStaleForFiles, merge } from './merge';
-import { resolvedRefCount } from './produce';
-import { ScipDocument, loadScipIndex } from './reader';
+import { resolvedCallCount } from './produce';
+import { ScipDocument, decodeScipIndex, loadScipIndex } from './reader';
 import { heuristicSites, scipSites } from './sites';
 import {
   MergedDocument, ScipLanguage, ScipMeta, SCIP_LANGUAGES, availableIndexes, hashFile, indexPath,
-  indexedHashes, mergedDocumentCounts, metaPath, readMeta, recordMergedDocuments, writeFileAtomic,
+  indexedHashes, mergedDocumentCounts, metaPath, recordMergedDocuments, writeFileAtomic,
 } from './store';
 
 export { ScipLanguage, SCIP_LANGUAGES } from './store';
@@ -52,15 +52,15 @@ export interface ScipPassReport {
  * Must run with the write lock held (the index hooks already hold it).
  */
 export function runScipPass(db: SqliteDatabase, projectRoot: string): ScipPassReport | null {
-  const languages = availableIndexes(projectRoot);
-  if (languages.length === 0) return null;
+  const installed = availableIndexes(projectRoot);
+  if (installed.length === 0) return null;
   const started = Date.now();
 
   const docs: ScipDocument[] = [];
   const perLang: Array<{ lang: ScipLanguage; meta: ScipMeta; docs: ScipDocument[] }> = [];
-  for (const lang of languages) {
+  for (const { lang, meta } of installed) {
     const ix = loadScipIndex(indexPath(projectRoot, lang));
-    perLang.push({ lang, meta: readMeta(projectRoot, lang)!, docs: ix.documents });
+    perLang.push({ lang, meta, docs: ix.documents });
     docs.push(...ix.documents);
   }
 
@@ -95,7 +95,7 @@ export function runScipPass(db: SqliteDatabase, projectRoot: string): ScipPassRe
     return o;
   })();
   return {
-    languages,
+    languages: installed.map(i => i.lang),
     documents: docs.length,
     freshDocuments: fresh.size,
     staleDocuments,
@@ -123,36 +123,56 @@ function readIfHash(projectRoot: string, rel: string, expected: string): string 
  * caught up with the edit — in which case the full pass re-verifies it.
  */
 export function onSynced(db: SqliteDatabase, projectRoot: string, changedFiles: readonly string[]): ScipPassReport | null {
-  const languages = availableIndexes(projectRoot);
-  if (languages.length === 0 || changedFiles.length === 0) return null;
+  const installed = availableIndexes(projectRoot);
+  if (installed.length === 0 || changedFiles.length === 0) return null;
   markStaleForFiles(db, changedFiles);
   const indexed = indexedHashes(db, changedFiles);
-  const metas = languages.map(l => readMeta(projectRoot, l)!);
-  const nowFresh = changedFiles.some(f => metas.some(m => m.hashes[f] !== undefined && m.hashes[f] === indexed.get(f)));
+  const nowFresh = changedFiles.some(f => installed.some(({ meta }) => meta.hashes[f] !== undefined && meta.hashes[f] === indexed.get(f)));
   return nowFresh ? runScipPass(db, projectRoot) : null;
 }
 
 /**
- * Install an index produced outside codegraph. Its snapshot is the current
- * disk content — the caller vouches that the index was built from it.
+ * Install an index produced outside codegraph.
+ *
+ * There is no indexer-start snapshot to trust, so the index file's own mtime
+ * stands in for "when it was built": a source file modified after that is left
+ * out of the snapshot, and its document stays stale until a reindex. A file
+ * edited and reverted before the import still counts — its bytes match.
  */
-export function importScipFile(projectRoot: string, file: string, lang?: ScipLanguage): { lang: ScipLanguage; documents: number } {
-  const ix = loadScipIndex(file);
+export function importScipFile(
+  projectRoot: string, file: string, lang?: ScipLanguage
+): { lang: ScipLanguage; documents: number; newerThanIndex: string[] } {
+  const builtAt = fs.statSync(file).mtimeMs;
+  const bytes = fs.readFileSync(file);
+  const ix = decodeScipIndex(bytes);
+  if (ix.documents.length === 0) throw new Error(`${file} has no documents — the indexer failed or this is not a SCIP index`);
   const resolved = lang ?? TOOL_LANGUAGES[ix.toolName];
   if (!resolved) {
     throw new Error(`can't tell which language ${file} covers (tool "${ix.toolName}") — pass --lang (${SCIP_LANGUAGES.join('|')})`);
   }
   const hashes: Record<string, string> = {};
+  const newerThanIndex: string[] = [];
   for (const d of ix.documents) {
+    let mtime: number;
+    try {
+      mtime = fs.statSync(path.join(projectRoot, d.relativePath)).mtimeMs;
+    } catch {
+      continue; // gone from disk — nothing to vouch for
+    }
+    if (mtime > builtAt) {
+      newerThanIndex.push(d.relativePath);
+      continue;
+    }
     const h = hashFile(projectRoot, d.relativePath);
     if (h) hashes[d.relativePath] = h;
   }
-  writeFileAtomic(indexPath(projectRoot, resolved), fs.readFileSync(file));
+  writeFileAtomic(indexPath(projectRoot, resolved), bytes);
   const meta: ScipMeta = {
-    tool: ix.toolName, toolVersion: ix.toolVersion, producedAt: Date.now(), hashes, resolvedRefs: resolvedRefCount(ix),
+    tool: ix.toolName, toolVersion: ix.toolVersion, producedAt: builtAt, hashes,
+    resolvedCalls: resolvedCallCount(ix, projectRoot),
   };
   writeFileAtomic(metaPath(projectRoot, resolved), JSON.stringify(meta));
-  return { lang: resolved, documents: ix.documents.length };
+  return { lang: resolved, documents: ix.documents.length, newerThanIndex };
 }
 
 export interface ScipStatus {
@@ -162,13 +182,10 @@ export interface ScipStatus {
 
 export function scipStatus(db: SqliteDatabase, projectRoot: string): ScipStatus {
   const counts = mergedDocumentCounts(db);
-  const indexes = availableIndexes(projectRoot).map(lang => {
-    const m = readMeta(projectRoot, lang)!;
-    return {
-      lang, tool: m.tool, toolVersion: m.toolVersion, producedAt: m.producedAt,
-      files: Object.keys(m.hashes).length, mergedDocuments: counts.get(lang) ?? 0,
-    };
-  });
+  const indexes = availableIndexes(projectRoot).map(({ lang, meta: m }) => ({
+    lang, tool: m.tool, toolVersion: m.toolVersion, producedAt: m.producedAt,
+    files: Object.keys(m.hashes).length, mergedDocuments: counts.get(lang) ?? 0,
+  }));
   const one = (sql: string) => (db.prepare(sql).get() as { n: number }).n;
   return {
     indexes,

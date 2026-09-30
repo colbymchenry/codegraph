@@ -48,14 +48,29 @@ export const TOOL_LANGUAGES: Record<string, ScipLanguage> = {
 
 type ScipConfig = Partial<Record<ScipLanguage, IndexerOverride | false>>;
 
-function readScipConfig(projectRoot: string): ScipConfig {
+/** The `scip` block, or an error string. No config file at all means no overrides. */
+function readScipConfig(projectRoot: string): ScipConfig | string {
+  let raw: string;
   try {
-    const parsed = JSON.parse(fs.readFileSync(path.join(projectRoot, PROJECT_CONFIG_FILENAME), 'utf8')) as { scip?: unknown };
-    return parsed.scip && typeof parsed.scip === 'object' ? (parsed.scip as ScipConfig) : {};
-  } catch {
-    return {};
+    raw = fs.readFileSync(path.join(projectRoot, PROJECT_CONFIG_FILENAME), 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return {};
+    return `can't read ${PROJECT_CONFIG_FILENAME}: ${err instanceof Error ? err.message : String(err)}`;
   }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    return `${PROJECT_CONFIG_FILENAME} is not valid JSON: ${err instanceof Error ? err.message : String(err)}`;
+  }
+  const scip = (parsed as { scip?: unknown } | null)?.scip;
+  if (scip === undefined) return {};
+  if (typeof scip !== 'object' || scip === null || Array.isArray(scip)) return `${PROJECT_CONFIG_FILENAME} "scip" must be an object`;
+  return scip as ScipConfig;
 }
+
+const isStringRecord = (v: unknown): v is Record<string, string> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v) && Object.values(v).every(x => typeof x === 'string');
 
 export interface ResolvedIndexer {
   lang: ScipLanguage;
@@ -71,15 +86,24 @@ export interface ResolvedIndexer {
 export function resolveIndexer(projectRoot: string, lang: ScipLanguage, outFile: string): ResolvedIndexer | { skip: string } {
   const spec = INDEXERS[lang];
   if (!spec) return { skip: `no SCIP indexer adapter for ${lang} yet` };
-  const override = readScipConfig(projectRoot)[lang];
+  const config = readScipConfig(projectRoot);
+  if (typeof config === 'string') return { skip: config };
+  const override = config[lang];
+  const at = `${PROJECT_CONFIG_FILENAME} scip.${lang}`;
   if (override === false) return { skip: `disabled in ${PROJECT_CONFIG_FILENAME}` };
-  if (override !== undefined && (typeof override !== 'object' || override === null)) {
-    return { skip: `${PROJECT_CONFIG_FILENAME} scip.${lang} must be false or an object` };
+  if (override !== undefined && (typeof override !== 'object' || override === null || Array.isArray(override))) {
+    return { skip: `${at} must be false or an object` };
+  }
+  if (override?.cmd !== undefined && (typeof override.cmd !== 'string' || override.cmd === '')) {
+    return { skip: `${at}.cmd must be a non-empty string` };
   }
   if (override?.args !== undefined && (!Array.isArray(override.args) || !override.args.every(a => typeof a === 'string'))) {
-    return { skip: `${PROJECT_CONFIG_FILENAME} scip.${lang}.args must be an array of strings` };
+    return { skip: `${at}.args must be an array of strings` };
   }
-  if (!override && !spec.detect(projectRoot)) return { skip: `no ${lang} project markers found` };
+  if (override?.env !== undefined && !isStringRecord(override.env)) {
+    return { skip: `${at}.env must be an object of string values` };
+  }
+  if (!spec.detect(projectRoot)) return { skip: `no ${lang} project markers found` };
   const cmd = override?.cmd ?? spec.cmd;
   const args = override?.args ? override.args.map(a => a.split('{out}').join(outFile)) : spec.args(projectRoot, outFile);
   if (!onPath(cmd)) return { skip: `\`${cmd}\` not found on PATH — install it or set scip.${lang}.cmd in ${PROJECT_CONFIG_FILENAME}` };

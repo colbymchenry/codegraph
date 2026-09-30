@@ -41,7 +41,7 @@ export interface ScipMeta {
   /** repo-relative path → content hash, as codegraph computes it */
   hashes: Record<string, string>;
   /** the regression guard's baseline — see produce.ts */
-  resolvedRefs?: number;
+  resolvedCalls?: number;
 }
 
 export function scipDir(projectRoot: string): string {
@@ -56,9 +56,20 @@ export function metaPath(projectRoot: string, lang: ScipLanguage): string {
   return path.join(scipDir(projectRoot), `${lang}.meta.json`);
 }
 
-/** Languages that have both an index and a readable snapshot on disk. */
-export function availableIndexes(projectRoot: string): ScipLanguage[] {
-  return SCIP_LANGUAGES.filter(l => fs.existsSync(indexPath(projectRoot, l)) && readMeta(projectRoot, l) !== null);
+export interface InstalledIndex {
+  lang: ScipLanguage;
+  meta: ScipMeta;
+}
+
+/** Languages that have both an index and a readable snapshot on disk — with the snapshot, read once. */
+export function availableIndexes(projectRoot: string): InstalledIndex[] {
+  const out: InstalledIndex[] = [];
+  for (const lang of SCIP_LANGUAGES) {
+    if (!fs.existsSync(indexPath(projectRoot, lang))) continue;
+    const meta = readMeta(projectRoot, lang);
+    if (meta) out.push({ lang, meta });
+  }
+  return out;
 }
 
 export function readMeta(projectRoot: string, lang: ScipLanguage): ScipMeta | null {
@@ -144,8 +155,10 @@ export function recordMergedDocuments(
   for (const d of docs) ins.run(d.path, lang, d.contentHash, meta.tool, meta.toolVersion, now);
 }
 
+/** Read-only: never creates the table (callers may not hold the write lock). */
 export function mergedDocumentCounts(db: SqliteDatabase): Map<string, number> {
-  ensureDocumentsTable(db);
+  const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'scip_documents'").get();
+  if (!exists) return new Map();
   const rows = db.prepare('SELECT language, COUNT(*) AS n FROM scip_documents GROUP BY language').all() as
     { language: string; n: number }[];
   return new Map(rows.map(r => [r.language, r.n]));

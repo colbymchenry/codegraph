@@ -80,7 +80,7 @@ export function registerScipCommands(program: Command, h: CliHelpers): void {
           const r = await produceIndex(cg.scipReadDb(), cg.getProjectRoot(), lang, { force: opts.force, log: h.info });
           if (r.status === 'installed') {
             installed++;
-            h.success(`${lang}: ${r.documents} documents, ${r.resolvedRefs} resolved references in ${(r.durationMs / 1000).toFixed(1)}s`);
+            h.success(`${lang}: ${r.documents} documents, ${r.resolvedCalls} resolved calls in ${(r.durationMs / 1000).toFixed(1)}s`);
           } else if (r.status === 'skipped') {
             if (only) h.warn(`${lang}: skipped — ${r.reason}`);
             else h.info(`${lang}: skipped — ${r.reason}`);
@@ -98,8 +98,11 @@ export function registerScipCommands(program: Command, h: CliHelpers): void {
     .option('--lang <lang>', 'Language the index covers (default: inferred from the indexer name)')
     .action((file: string, pathArg: string | undefined, opts: { lang?: string }) =>
       withGraph(pathArg, async (cg) => {
-        const { lang, documents } = importScipFile(cg.getProjectRoot(), file, parseLang(opts.lang));
+        const { lang, documents, newerThanIndex } = importScipFile(cg.getProjectRoot(), file, parseLang(opts.lang));
         h.info(`${lang}: installed ${documents} documents`);
+        if (newerThanIndex.length > 0) {
+          h.warn(`${newerThanIndex.length} file(s) changed after ${file} was written — left to the heuristic until a reindex (e.g. ${newerThanIndex.slice(0, 3).join(', ')})`);
+        }
         await mergeAndReport(cg);
       }));
 

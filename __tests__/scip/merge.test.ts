@@ -29,6 +29,12 @@ describe('SCIP merge (TypeScript fixture)', () => {
     cg.scipReadDb().prepare(`INSERT INTO edges (source, target, kind, line, col, provenance) VALUES (?, ?, 'calls', ?, 2, ?)`)
       .run(nodeId(src), nodeId(tgt), line, provenance);
   const pass = () => cg.scipWrite(db => runScipPass(db, dir));
+  /** `scip import` of the prebuilt index, "built" now — i.e. after the sources were copied in. */
+  const importFixture = (index = 'index.scip') => {
+    const copy = path.join(dir, `built-${index}`);
+    fs.copyFileSync(path.join(FIXTURE, index), copy);
+    return importScipFile(dir, copy);
+  };
   const writeConfig = (scip: unknown) => fs.writeFileSync(path.join(dir, 'codegraph.json'), JSON.stringify({ scip }));
   /** A fake indexer: copies a prebuilt index to `{out}` (and counts its runs). */
   const fakeIndexer = (index: string) => writeConfig({
@@ -58,7 +64,7 @@ describe('SCIP merge (TypeScript fixture)', () => {
 
   it('verifies agreeing edges and adds the calls the heuristic missed', async () => {
     expect(edge('sum', 'Invoice::totalPrice')).toBeUndefined(); // call inside a reduce() callback
-    importScipFile(dir, path.join(FIXTURE, 'index.scip'));
+    importFixture();
     const report = (await pass())!;
     expect(report.freshDocuments).toBe(2);
     expect(edge('sum', 'helper')?.provenance).toBe('scip');
@@ -70,7 +76,7 @@ describe('SCIP merge (TypeScript fixture)', () => {
 
   it('replaces a wrong heuristic target with the compiler-resolved one', async () => {
     inject('sum', 'Order::totalPrice', 6);
-    importScipFile(dir, path.join(FIXTURE, 'index.scip'));
+    importFixture();
     const report = (await pass())!;
     expect(report.outcome.conflict).toBeGreaterThanOrEqual(1);
     expect(edge('sum', 'Order::totalPrice')).toBeUndefined();
@@ -79,20 +85,20 @@ describe('SCIP merge (TypeScript fixture)', () => {
 
   it('removes a heuristic edge where SCIP resolved the call outside the project', async () => {
     inject('sum', 'Stack::push', 5); // `list.push(1)` is Array#push
-    importScipFile(dir, path.join(FIXTURE, 'index.scip'));
+    importFixture();
     await pass();
     expect(edge('sum', 'Stack::push')).toBeUndefined();
   });
 
   it('never touches synthesized dynamic-dispatch edges', async () => {
     inject('sum', 'Stack::push', 5, 'heuristic');
-    importScipFile(dir, path.join(FIXTURE, 'index.scip'));
+    importFixture();
     await pass();
     expect(edge('sum', 'Stack::push')?.provenance).toBe('heuristic');
   });
 
   it('keeps a heuristic edge SCIP could not judge, flagged unverified', async () => {
-    importScipFile(dir, path.join(FIXTURE, 'index.scip'));
+    importFixture();
     await pass();
     const e = edge('dyn', 'Solo::soloMethod'); // `o: any` — no type to resolve through
     expect(e?.provenance).toBeNull();
@@ -101,7 +107,7 @@ describe('SCIP merge (TypeScript fixture)', () => {
   });
 
   it('is idempotent', async () => {
-    importScipFile(dir, path.join(FIXTURE, 'index.scip'));
+    importFixture();
     await pass();
     const first = edges();
     const again = (await pass())!;
@@ -110,7 +116,7 @@ describe('SCIP merge (TypeScript fixture)', () => {
   });
 
   it('hash gate: a file edited after the index was built is left to the heuristic', async () => {
-    importScipFile(dir, path.join(FIXTURE, 'index.scip'));
+    importFixture();
     fs.appendFileSync(path.join(dir, 'src/main.ts'), '\nexport const later = () => helper(3);\n');
     await cg.sync();
     const report = (await pass())!;
@@ -124,7 +130,7 @@ describe('SCIP merge (TypeScript fixture)', () => {
   it('sync demotes SCIP edges into a rewritten file, and re-verifies once it matches the index again', async () => {
     const models = path.join(dir, 'src/models.ts');
     const original = fs.readFileSync(models, 'utf8');
-    importScipFile(dir, path.join(FIXTURE, 'index.scip'));
+    importFixture();
     await pass();
 
     fs.writeFileSync(models, `// shifted\n${original}`);
@@ -142,7 +148,7 @@ describe('SCIP merge (TypeScript fixture)', () => {
   });
 
   it('a full re-index re-merges the installed index', async () => {
-    importScipFile(dir, path.join(FIXTURE, 'index.scip'));
+    importFixture();
     await cg.indexAll();
     expect(edge('sum', 'Invoice::totalPrice')?.provenance).toBe('scip');
   });
@@ -161,6 +167,40 @@ describe('SCIP merge (TypeScript fixture)', () => {
 
     const forced = await produceIndex(cg.scipReadDb(), dir, 'typescript', { force: true });
     expect(forced.status).toBe('installed');
+  });
+
+  it('scip import vouches only for sources not modified after the index was written', async () => {
+    const later = new Date(Date.now() + 60_000);
+    fs.utimesSync(path.join(dir, 'src/models.ts'), later, later);
+    const r = importFixture();
+    expect(r.newerThanIndex).toEqual(['src/models.ts']);
+    const report = (await pass())!;
+    expect(report.staleDocuments).toEqual(['src/models.ts']);
+    expect(edge('sum', 'helper')?.provenance).toBeNull(); // target file unvouched → call left unjudged
+  });
+
+  it('the regression guard counts resolved calls, not every reference', () => {
+    const r = importFixture();
+    expect(r.documents).toBe(2);
+    // main.ts: helper(2), inv.totalPrice(), o.totalPrice(), new Invoice(3), this.step(), sum(), make(), helper(1).
+    // Imports, `Invoice[]` annotations and `this.amount` don't count; `o.soloMethod()` on `any` is unresolved.
+    expect(JSON.parse(fs.readFileSync(path.join(scipDir(dir), 'typescript.meta.json'), 'utf8')).resolvedCalls).toBe(8);
+  });
+
+  it('status reads without creating tables', () => {
+    const tables = () => cg.scipReadDb().prepare("SELECT name FROM sqlite_master WHERE name = 'scip_documents'").all();
+    expect(tables()).toEqual([]);
+    expect(scipStatus(cg.scipReadDb(), dir).indexes).toEqual([]);
+    expect(tables()).toEqual([]);
+  });
+
+  it('a malformed codegraph.json or override is reported, never silently ignored', async () => {
+    fs.writeFileSync(path.join(dir, 'codegraph.json'), '{ "scip": ');
+    expect(await produceIndex(cg.scipReadDb(), dir, 'typescript')).toMatchObject({ status: 'skipped', reason: expect.stringMatching(/not valid JSON/) });
+    writeConfig({ typescript: { cmd: process.execPath, env: { N: 1 } } });
+    expect(await produceIndex(cg.scipReadDb(), dir, 'typescript')).toMatchObject({ status: 'skipped', reason: expect.stringMatching(/env/) });
+    writeConfig({ typescript: { cmd: 42 } });
+    expect(await produceIndex(cg.scipReadDb(), dir, 'typescript')).toMatchObject({ status: 'skipped', reason: expect.stringMatching(/cmd/) });
   });
 
   it('skips (never installs) an indexer that is not on PATH', async () => {
