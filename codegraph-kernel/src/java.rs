@@ -267,7 +267,7 @@ impl<'t> Walker<'t> {
     fn inside_class_like(&self) -> bool {
         self.stack
             .last()
-            .map(|s| matches!(s.kind, "class" | "struct" | "interface" | "trait" | "enum" | "module"))
+            .map(|s| matches!(s.kind, "class" | "struct" | "interface" | "trait" | "enum" | "module" | "enum_member"))
             .unwrap_or(false)
     }
 
@@ -695,7 +695,8 @@ impl<'t> Walker<'t> {
         for i in 0..body.named_child_count() {
             let Some(child) = body.named_child(i) else { continue };
             if child.kind() == "enum_constant" {
-                self.extract_enum_members(child);
+                let member = self.extract_enum_members(child);
+                self.visit_enum_constant_body(child, member);
             } else {
                 self.visit_node(child);
             }
@@ -703,12 +704,26 @@ impl<'t> Walker<'t> {
         self.stack.pop();
     }
 
-    fn extract_enum_members(&mut self, node: Node<'t>) {
-        if let Some(name_node) = node.child_by_field_name("name") {
-            let name = self.text(name_node).to_string();
-            self.create_node("enum_member", &name, node, Extra::default());
-        }
+    fn extract_enum_members(&mut self, node: Node<'t>) -> Option<(u32, String)> {
+        let name_node = node.child_by_field_name("name")?;
+        let name = self.text(name_node).to_string();
+        let row = self.create_node("enum_member", &name, node, Extra::default())?;
         // (identifier-children / leaf fallbacks are other grammars' shapes)
+        Some((row, name))
+    }
+
+    /// `PLUS { int apply(…) { … } }`: a constant's own class_body declares
+    /// members of its own, scoped under the constant.
+    fn visit_enum_constant_body(&mut self, node: Node<'t>, member: Option<(u32, String)>) {
+        let Some((row, name)) = member else { return };
+        let Some(body) = (0..node.named_child_count()).filter_map(|i| node.named_child(i)).find(|c| c.kind() == "class_body") else { return };
+        self.stack.push(Scope { row, kind: "enum_member", name });
+        for i in 0..body.named_child_count() {
+            if let Some(c) = body.named_child(i) {
+                self.visit_node(c);
+            }
+        }
+        self.stack.pop();
     }
 
     /// extractField — each declarator becomes a field/constant node.

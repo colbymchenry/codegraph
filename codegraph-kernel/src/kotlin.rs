@@ -330,7 +330,7 @@ impl<'t> Walker<'t> {
     fn inside_class_like(&self) -> bool {
         self.stack
             .last()
-            .map(|s| matches!(s.kind, "class" | "struct" | "interface" | "trait" | "enum" | "module"))
+            .map(|s| matches!(s.kind, "class" | "struct" | "interface" | "trait" | "enum" | "module" | "enum_member"))
             .unwrap_or(false)
     }
 
@@ -1089,7 +1089,8 @@ impl<'t> Walker<'t> {
         for i in 0..body.named_child_count() {
             let Some(child) = body.named_child(i) else { continue };
             if child.kind() == "enum_entry" {
-                self.extract_enum_members(child);
+                let member = self.extract_enum_members(child);
+                self.visit_enum_entry_body(child, member);
             } else {
                 self.visit_node(child);
             }
@@ -1097,18 +1098,36 @@ impl<'t> Walker<'t> {
         self.stack.pop();
     }
 
-    fn extract_enum_members(&mut self, node: Node<'t>) {
+    fn extract_enum_members(&mut self, node: Node<'t>) -> Option<(u32, String)> {
         // name field → null (zero fields) → the identifier-children scan: one
         // enum_member per direct simple_identifier, positioned AT the
-        // identifier. Entry value_arguments and entry class_bodies (override
-        // methods!) are never visited — invisible (quirk).
+        // identifier. Entry value_arguments are never visited.
+        let mut first: Option<(u32, String)> = None;
         for i in 0..node.named_child_count() {
             let Some(child) = node.named_child(i) else { continue };
             if matches!(child.kind(), "simple_identifier" | "identifier" | "property_identifier") {
                 let name = self.text(child).to_string();
-                self.create_node("enum_member", &name, child, Extra::default());
+                let row = self.create_node("enum_member", &name, child, Extra::default());
+                if first.is_none() {
+                    first = row.map(|r| (r, name));
+                }
             }
         }
+        first
+    }
+
+    /// `NewBuffer { override fun pipe() … }`: an entry's own class_body
+    /// declares members of its own, scoped under the entry.
+    fn visit_enum_entry_body(&mut self, node: Node<'t>, member: Option<(u32, String)>) {
+        let Some((row, name)) = member else { return };
+        let Some(body) = (0..node.named_child_count()).filter_map(|i| node.named_child(i)).find(|c| c.kind() == "class_body") else { return };
+        self.stack.push(Scope { row, kind: "enum_member", name });
+        for i in 0..body.named_child_count() {
+            if let Some(c) = body.named_child(i) {
+                self.visit_node(c);
+            }
+        }
+        self.stack.pop();
     }
 
     /// extractTypeAlias — plain node; the alias-value ref walk reads the
