@@ -1674,10 +1674,30 @@ function kotlinChainReceiver(ref: UnresolvedRef, context: ResolutionContext): st
     const m = new RegExp(`(?<![\\w$])${name}\\s*[({]`).exec(line);
     start = m ? m.index : -1;
   }
-  if (start < 0) return null;
+  if (start < 0) {
+    // An infix call on an expression — `alias(libs.x) apply false` — whose
+    // receiver the extractor could not name.
+    const infix = new RegExp(`(?<=[\\w)\\]"'}]\\s+)${name}\\s+(?=[^\\s=])`).exec(line);
+    return infix ? rustGoReceiverName(line.slice(0, infix.index).trimEnd()) : null;
+  }
   const before = line.slice(0, start);
   if (!/\.\s*$/.test(before)) return null;
   return rustGoReceiverName(before.replace(/\?\s*\.\s*$/, '').replace(/!!\s*$/, ''));
+}
+
+const KOTLIN_BITWISE_INFIX: ReadonlySet<string> = new Set(['and', 'or', 'xor', 'shl', 'shr', 'ushr', 'inv']);
+const KOTLIN_NUMBER_TYPES: ReadonlySet<string> = new Set(['Byte', 'Short', 'Int', 'Long', 'UByte', 'UShort', 'UInt', 'ULong', 'Char']);
+
+/**
+ * A project's bitwise extension on a number type — okio's `infix fun
+ * Byte.and(mask: Int)` — is indistinguishable, without the operand's type,
+ * from the standard library's own `Int.and` / `Long.shr` members every other
+ * `x and 0xff` / `h shr 8` calls; neither is a safe edge.
+ */
+function isKotlinNumberBitwise(n: Node, ref: UnresolvedRef): boolean {
+  if (ref.language !== 'kotlin' || !KOTLIN_BITWISE_INFIX.has(n.name)) return false;
+  const cut = n.qualifiedName.lastIndexOf('::');
+  return cut > 0 && KOTLIN_NUMBER_TYPES.has(n.qualifiedName.slice(0, cut).split(/::|\./).pop()!);
 }
 
 /** Whether a bare Kotlin name is written with no receiver at its call — not a later link of a chain (`….name(`). */
@@ -3386,6 +3406,7 @@ export function matchByExactName(
     !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)) &&
     !(kotlinCall && !isKotlinTopLevelVisible(n, ref, context)) &&
     !(kotlinBare && !isKotlinMemberReachable(n, ref, context)) &&
+    !isKotlinNumberBitwise(n, ref) &&
     !(dartBare && isDartMember(n) && !isDartMethodInScope(n, ref, context)) &&
     !(phpSelf && (n.kind !== 'method' || !isPhpMethodInScope(n, ref, phpSelf, context))) &&
     !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)) &&
@@ -5478,6 +5499,11 @@ export function matchMethodCall(
         'instance-method',
         importedFqn,
       ));
+      if (typedMatch && ref.language === 'kotlin') {
+        // `medium and 0xff` on an Int: the standard library's member, not a project `Int.and(Long)`.
+        const target = context.getNodeById?.(typedMatch.targetNodeId);
+        if (target && isKotlinNumberBitwise(target, ref)) return null;
+      }
       if (typedMatch) {
         if (awaited) {
           const target = context.getNodeById?.(typedMatch.targetNodeId);
@@ -5766,6 +5792,7 @@ export function matchMethodCall(
       narrowed = kept.length !== targetMethods.length;
       targetMethods = kept;
     }
+    targetMethods = targetMethods.filter((m) => !isKotlinNumberBitwise(m, ref));
     // Production code never calls into a test suite: a guess from
     // rest_framework/renderers.py's `view.reverse_action(…)` is not a test's
     // `DummyView`. The test's methods were never in the running.
@@ -6943,6 +6970,7 @@ export function matchFuzzy(
     !(dartBare && isDartMember(n) && !isDartMethodInScope(n, ref, context)) &&
     !(kotlinCall && !isKotlinTopLevelVisible(n, ref, context)) &&
     !(kotlinBare && !isKotlinMemberReachable(n, ref, context)) &&
+    !isKotlinNumberBitwise(n, ref) &&
     !(rubyBare && n.kind === 'method' && !isRubyMethodInScope(n, ref, context)) &&
     !(cfmlBare && n.kind === 'method' && !isCfmlMethodInScope(n, ref, context)) &&
     !(vbReceiver !== null && !isVbMemberReachable(n, vbReceiver)) &&

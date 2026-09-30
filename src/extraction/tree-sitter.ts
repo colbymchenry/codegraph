@@ -1423,6 +1423,9 @@ export class TreeSitterExtractor {
     else if (this.extractor.callTypes.includes(nodeType)) {
       this.extractCall(node);
     }
+    else if (this.language === 'kotlin' && nodeType === 'infix_expression') {
+      this.extractKotlinInfixCall(node);
+    }
     // `new Foo(...)` / `Foo::new(...)` / object_creation_expression —
     // produce an `instantiates` reference. Children still walked so
     // nested calls inside the constructor args (`new Foo(bar())`) get
@@ -4064,6 +4067,31 @@ export class TreeSitterExtractor {
     return this.erlangAtomMacros.get(macroName) ?? null;
   }
 
+  /**
+   * A Kotlin infix call — `Users.id eq id1`, `a to b`, `x shouldBe y` — is a
+   * call of the infix function in the middle: `receiver.fn` when the left
+   * operand is a plain name (as `receiver.fn(arg)` would be), else the bare
+   * name. Nothing records it otherwise, so a project's infix DSL had no
+   * callers. Mirrored in the kernel's extract_infix_call (kotlin.rs).
+   */
+  private extractKotlinInfixCall(node: SyntaxNode): void {
+    if (this.nodeStack.length === 0 || node.namedChildCount !== 3) return;
+    const lhs = node.namedChild(0);
+    const fn = node.namedChild(1);
+    if (!lhs || !fn || fn.type !== 'simple_identifier' || LITERAL_RECEIVER_TYPES.has(lhs.type)) return;
+    const callerId = this.nodeStack[this.nodeStack.length - 1];
+    if (!callerId) return;
+    const name = getNodeText(fn, this.source);
+    const receiver = lhs.type === 'simple_identifier' ? getNodeText(lhs, this.source) : '';
+    this.unresolvedReferences.push({
+      fromNodeId: callerId,
+      referenceName: receiver && receiver !== 'this' && receiver !== 'super' ? `${receiver}.${name}` : name,
+      referenceKind: 'calls',
+      line: node.startPosition.row + 1,
+      column: node.startPosition.column,
+    });
+  }
+
   private extractCall(node: SyntaxNode): void {
     if (this.nodeStack.length === 0) return;
 
@@ -5904,6 +5932,8 @@ export class TreeSitterExtractor {
           this.extractAnonymousClass(node, anonBody);
           return;
         }
+      } else if (this.language === 'kotlin' && nodeType === 'infix_expression') {
+        this.extractKotlinInfixCall(node);
       } else if (this.extractor!.extractBareCall) {
         const calleeName = this.extractor!.extractBareCall(node, this.source);
         if (calleeName && this.nodeStack.length > 0) {
