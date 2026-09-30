@@ -38,6 +38,7 @@ import { parseHrefExpression, routesForFile, toHref, type HrefLiteral } from './
 import { matchBracket } from './frameworks/object-literal';
 import { destinationsForHref } from './frameworks/nextjs';
 import { reactRouterTable } from './frameworks/react-router';
+import { configHrefExpression } from './frameworks/react';
 import { enclosingFn, makeLineAt } from './synth-utils';
 import { resolveImportPath } from './import-resolver';
 
@@ -48,7 +49,8 @@ const LINK_TAGS = ['Link', 'NavLink', 'Navigate', 'Redirect', 'LinkContainer', '
 
 /** `<Tag … to=…>` for any of `tags`, the attribute anywhere in the tag. */
 function linkTagPattern(tags: readonly string[]): RegExp {
-  return new RegExp(`<(${tags.map((t) => t.replace(/[$]/g, '\\$&')).join('|')})\\b([^>]*?)\\bto\\s*=\\s*(?:"([^"]*)"|'([^']*)'|(?=\\{))`, 'g');
+  // An attribute before `to` may hold an arrow (`onMouseEnter={() => …}`), whose `>` is not the tag's end.
+  return new RegExp(`<(${tags.map((t) => t.replace(/[$]/g, '\\$&')).join('|')})\\b((?:[^>]|=>)*?)\\bto\\s*=\\s*(?:"([^"]*)"|'([^']*)'|(?=\\{))`, 'g');
 }
 
 const LINK_TAG = linkTagPattern(LINK_TAGS);
@@ -150,7 +152,13 @@ export async function reactRouterLinkEdges(ctx: ResolutionContext, onYield: Mayb
         const at = m.index + m[0].length;
         const close = matchBracket(safe, at);
         if (close < 0) continue;
-        href = parseHrefExpression(safe.slice(at + 1, close));
+        const expr = safe.slice(at + 1, close);
+        href = parseHrefExpression(expr);
+        // `to={paths.app.discussion.getHref(id)}`: a route-config object's href.
+        if (!href) {
+          const configured = configHrefExpression(expr, file, ctx);
+          if (configured) href = parseHrefExpression(configured);
+        }
       }
       // A relative `to` is resolved against the route this markup renders
       // under — a nesting this scan does not read, so it is not a destination.

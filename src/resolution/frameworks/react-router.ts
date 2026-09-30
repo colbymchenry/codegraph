@@ -54,6 +54,7 @@ import {
 // two arms). It lives in `nextjs.ts` because that is where it was first
 // needed; duplicating it here would be a second derivation of the same rule.
 import { destinationsForHref } from './nextjs';
+import { configHrefExpression } from './react';
 
 const ROUTE_LANGUAGES: readonly Language[] = ['typescript', 'javascript', 'tsx', 'jsx'];
 
@@ -180,6 +181,11 @@ export const reactRouterResolver: FrameworkResolver = {
     const arg = firstArgumentText(lines, ref.line, ref.column, verb);
     if (arg === null) return null;
     let href = parseHrefExpression(arg);
+    // `navigate(paths.auth.login.getHref())`: a route-config object's href.
+    if (!href) {
+      const configured = configHrefExpression(arg, ref.filePath, context);
+      if (configured) href = parseHrefExpression(configured);
+    }
     if (!href) {
       const enclosing = context.getNodeById?.(ref.fromNodeId);
       const start = enclosing && enclosing.filePath === ref.filePath ? enclosing.startLine : Math.max(1, ref.line - 40);

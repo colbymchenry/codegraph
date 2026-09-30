@@ -226,6 +226,112 @@ function constantPathValue(expr: string, fromFile: string, context: ResolutionCo
   return open < 0 ? null : readObjectPath(text, open, keys);
 }
 
+/**
+ * The href a route-config object names — `paths.app.discussion.getHref(id)`
+ * or `paths.app.discussion.path` against `export const paths = { app: {
+ * discussion: { path: 'discussions/:discussionId', getHref: (id: string) =>
+ * \`/app/discussions/${id}\` } } }` (bulletproof-react's `config/paths.ts`)
+ * — as the string or template literal it returns, ready for the href reader.
+ * A `${…}` glued to a segment (a `?redirectTo=` suffix) is dropped; one
+ * that is a whole segment stays a hole. Null for anything else.
+ */
+export function configHrefExpression(expr: string, fromFile: string, context: ResolutionContext): string | null {
+  const m = /^\s*([A-Za-z_$][\w$]*)((?:\s*\??\.\s*[A-Za-z_$][\w$]*)+)\s*(\((?:[^()]|\([^()]*\))*\))?\s*$/.exec(expr);
+  if (!m) return null;
+  const root = m[1]!;
+  const keys = m[2]!.split('.').map((k) => k.replace(/[?\s]/g, '')).filter(Boolean);
+  let file = fromFile;
+  let name = root;
+  const mapping = context.getImportMappings(fromFile, 'tsx').find((x) => x.localName === root) ??
+    context.getImportMappings(fromFile, 'typescript').find((x) => x.localName === root);
+  if (mapping) {
+    const resolved = resolveImportPath(mapping.source, fromFile, 'typescript', context);
+    if (!resolved) return null;
+    file = resolved;
+    if (mapping.exportedName && mapping.exportedName !== 'default' && mapping.exportedName !== '*') name = mapping.exportedName;
+  }
+  const decl = context.getNodesInFile(file).find((n) => n.name === name && (n.kind === 'constant' || n.kind === 'variable'));
+  if (!decl) return null;
+  const lines = context.readFile(file)?.split('\n') ?? [];
+  const text = lines.slice(decl.startLine - 1, decl.endLine).join('\n');
+  const open = text.indexOf('{', Math.max(0, text.search(new RegExp(`\\b${name}\\b`))));
+  if (open < 0) return null;
+  let value = readObjectValue(text, open, keys);
+  if (value === null) return null;
+  // A function's value is what it returns: `(id: string) => \`/app/…\``, `() => { return '/'; }`.
+  if (m[3] !== undefined) {
+    const body = /^(?:async\s+)?(?:\([^()]*(?:\([^()]*\)[^()]*)*\)|[A-Za-z_$][\w$]*)\s*(?::\s*[^=]+?)?=>\s*/.exec(value);
+    if (!body) return null;
+    value = value.slice(body[0].length).trim();
+    if (value.startsWith('{')) value = /\breturn\s+([`'"][\s\S]*?[`'"])\s*;?\s*}/.exec(value)?.[1] ?? '';
+  }
+  if (!/^[`'"]/.test(value)) return null;
+  // `/auth/login${redirectTo ? … : ''}`: a hole glued to a segment is a suffix, not a segment.
+  return value.startsWith('`') ? dropGluedTemplateHoles(value) : value;
+}
+
+/** Remove each `${…}` of a template literal that is not a whole path segment. */
+function dropGluedTemplateHoles(template: string): string {
+  let out = '';
+  for (let i = 0; i < template.length; i++) {
+    if (template[i] === '$' && template[i + 1] === '{') {
+      let depth = 0;
+      let j = i + 1;
+      for (; j < template.length; j++) {
+        if (template[j] === '{') depth++;
+        else if (template[j] === '}' && --depth === 0) break;
+      }
+      const hole = template.slice(i, j + 1);
+      const next = template[j + 1];
+      if (out.endsWith('/') && (next === '/' || next === '`' || next === '?' || next === undefined)) out += hole;
+      i = j;
+      continue;
+    }
+    out += template[i];
+  }
+  return out;
+}
+
+/** Walk `keys` into the object literal opening at `at`; the final value's source text, or null. */
+function readObjectValue(text: string, at: number, keys: string[]): string | null {
+  const skipString = (j: number): number => {
+    const quote = text[j]!;
+    for (j++; j < text.length && text[j] !== quote; j++) if (text[j] === '\\') j++;
+    return j + 1;
+  };
+  const skipValue = (j: number): number => {
+    let depth = 0;
+    for (; j < text.length; j++) {
+      const ch = text[j]!;
+      if (ch === '"' || ch === "'" || ch === '`') { j = skipString(j) - 1; continue; }
+      if (ch === '{' || ch === '[' || ch === '(') depth++;
+      else if (ch === '}' || ch === ']' || ch === ')') { if (depth === 0) return j; depth--; }
+      else if (ch === ',' && depth === 0) return j;
+    }
+    return j;
+  };
+  let i = at + 1;
+  while (i < text.length) {
+    const m = /^\s*(?:([A-Za-z_$][\w$]*)|["']([^"']+)["'])\s*:\s*/.exec(text.slice(i));
+    if (!m) {
+      const next = skipValue(i);
+      if (text[next] !== ',') return null;
+      i = next + 1;
+      continue;
+    }
+    const key = m[1] ?? m[2]!;
+    const valueAt = i + m[0].length;
+    const end = skipValue(valueAt);
+    if (key === keys[0]) {
+      if (keys.length === 1) return text.slice(valueAt, end).trim();
+      return text[valueAt] === '{' ? readObjectValue(text, valueAt, keys.slice(1)) : null;
+    }
+    if (text[end] !== ',') return null;
+    i = end + 1;
+  }
+  return null;
+}
+
 /** Walk `keys` into the object literal opening at `at`; the string literal at the end, or null. */
 function readObjectPath(text: string, at: number, keys: string[]): string | null {
   const skipString = (j: number): number => {
