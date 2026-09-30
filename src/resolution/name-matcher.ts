@@ -781,8 +781,66 @@ function isCrossFileReachable(
   return (
     candidate.filePath === ref.filePath ||
     !ESM_FAMILY.has(candidate.language) ||
-    !isSealedModule(candidate.filePath, context)
+    (!isSealedModule(candidate.filePath, context) && !isUnexportedModuleBinding(candidate, context))
   );
+}
+
+const ESM_BINDING_KINDS: ReadonlySet<string> = new Set(['function', 'variable', 'constant', 'class', 'interface', 'type_alias', 'enum', 'component']);
+const ESM_EXPORT_LISTS = new WeakMap<ResolutionContext, Map<string, { module: boolean; names: Set<string> }>>();
+
+/**
+ * Whether `candidate` is a top-level binding of an ES module that the module
+ * doesn't export — declared without `export` and absent from its `export { … }`
+ * / `export default x` lists. No other file can name it. The sealed-module
+ * rule above covers files that export nothing; this is the same boundary per
+ * symbol: sveltekit's `generate_manifest.js` keeps an unexported `resolve`
+ * that twenty other files' `resolve(…)` calls went to. Classic scripts,
+ * CommonJS, `declare global` and `.d.ts` files, members of a class or
+ * namespace (qualified names), names a default-exported object literal lists,
+ * and anything not declared by a statement of its own (an object literal's
+ * member, `proto.x = function x() {}`) are exempt.
+ */
+function isUnexportedModuleBinding(candidate: Node, context: ResolutionContext): boolean {
+  if (candidate.isExported || !ESM_BINDING_KINDS.has(candidate.kind)) return false;
+  if (candidate.qualifiedName.includes('::') || /\.d\.[cm]?ts$/.test(candidate.filePath)) return false;
+  let memo = ESM_EXPORT_LISTS.get(context);
+  if (!memo) ESM_EXPORT_LISTS.set(context, (memo = new Map()));
+  let info = memo.get(candidate.filePath);
+  if (!info) {
+    const source = context.readFile(candidate.filePath) ?? '';
+    const code = blankStringContents(stripCommentsForRegex(source, 'typescript'));
+    const module = (HAS_IMPORT_STATEMENT.test(code) || HAS_ESM_EXPORT.test(code)) &&
+      !HAS_CJS_EXPORT.test(source) && !/\bdeclare\s+global\b/.test(code);
+    const names = new Set<string>();
+    if (module) {
+      for (const m of source.matchAll(/^[ \t]*export\s+(?:type\s+)?\{([^}]*)\}/gm)) {
+        for (const item of m[1]!.split(',')) {
+          const local = item.trim().replace(/^type\s+/, '').split(/\s+as\s+/)[0]!.trim();
+          if (local) names.add(local);
+        }
+      }
+      for (const m of source.matchAll(/^[ \t]*export\s+(?:default|=)\s+([A-Za-z_$][\w$]*)\s*;?\s*$/gm)) names.add(m[1]!);
+      // `export default { getAdapter, adapters: known }` exposes its shorthand and value names.
+      for (const m of code.matchAll(/^[ \t]*export\s+default\s+\{([^}]*)\}/gm)) {
+        for (const item of m[1]!.split(',')) {
+          const value = item.includes(':') ? item.split(':').pop()! : item;
+          const id = /^\s*([A-Za-z_$][\w$]*)\s*$/.exec(value)?.[1];
+          if (id) names.add(id);
+        }
+      }
+    }
+    info = { module, names };
+    memo.set(candidate.filePath, info);
+  }
+  if (!info.module || info.names.has(candidate.name)) return false;
+  const line = (context.getFileLines?.(candidate.filePath) ?? context.readFile(candidate.filePath)?.split('\n'))?.[candidate.startLine - 1] ?? '';
+  // Its own line says `export` (a node's flag can miss a form), or it is
+  // `prototype.toString = function toString() {…}`, reached through instances.
+  if (/^\s*export\b/.test(line)) return false;
+  // Only a declaration statement is a module binding: an object literal's
+  // member (a zustand store action `setZipUri: (v) => set(…)`) is reached
+  // through the object, and so is `proto.x = function x() {}`.
+  return /^\s*(?:declare\s+)?(?:async\s+)?(?:function\*?|const|let|var|(?:abstract\s+)?class|interface|type|enum)\s/.test(line);
 }
 
 const LUA_LOCALS = new WeakMap<ResolutionContext, Map<string, boolean>>();
@@ -3709,6 +3767,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   CSHARP_STATIC_USINGS.delete(context);
   SCALA_SUPERS.delete(context);
   SCALA_IMPORTS.delete(context);
+  ESM_EXPORT_LISTS.delete(context);
   LUA_LOCALS.delete(context);
   PHP_FILE_SCOPES.delete(context);
   JAVA_STATIC_IMPORTS.delete(context);
