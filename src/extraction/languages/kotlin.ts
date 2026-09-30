@@ -194,8 +194,38 @@ export function joinKotlinSplitConstructors(source: string): string {
   return source.replace(SPLIT_PRIMARY_CONSTRUCTOR, (_m, head: string, ctor: string) => head + ' '.repeat(ctor.length));
 }
 
+/**
+ * Kotlin syntax newer than the grammar (tree-sitter-kotlin 0.3.8), rewritten
+ * to an older equivalent of the same length so every offset survives — each
+ * one otherwise made error recovery drop the class around it (Exposed: 158 of
+ * 1,004 files):
+ *
+ * - a `when` guard (Kotlin 2.1), `is H2Dialect if dialect.mode == X ->`,
+ *   becomes a second condition, `is H2Dialect,   dialect.mode == X ->`, so
+ *   the guard's references are kept;
+ * - an open-ended range (1.9), `1..<n`, becomes `1.. n`;
+ * - a multi-dollar string (2.1), `$$"?(@.a == $x)"`, loses its prefix;
+ * - a nullable receiver in a function type, `Op<Boolean>?.() -> Op<Boolean>`,
+ *   becomes `Op<Boolean>.( ) -> …`.
+ */
+const WHEN_GUARD = /^([ \t]*!?(?:is|in)[ \t]+(?:(?!->)[^\n])*?[\w>?)\]'"])([ \t]+)if(?=[ \t(])/gm;
+const MULTI_DOLLAR_STRING = /(?<![\w$"])\$\$+(?=")/g;
+const NULLABLE_RECEIVER_FN = /([\w>])\?\.\(\)(?=\s*->)/g;
+
+export function rewriteNewerKotlinSyntax(source: string): string {
+  let out = source;
+  if (out.includes(' if')) {
+    // (the condition stops short of `->`: `is X -> if (…)` is a branch whose body is an if)
+    out = out.replace(WHEN_GUARD, (_m, cond: string, gap: string) => `${cond},${' '.repeat(gap.length + 1)}`);
+  }
+  if (out.includes('..<')) out = out.replace(/\.\.</g, '.. ');
+  if (out.includes('$$')) out = out.replace(MULTI_DOLLAR_STRING, (m) => ' '.repeat(m.length));
+  if (out.includes('?.()')) out = out.replace(NULLABLE_RECEIVER_FN, '$1.( )');
+  return out;
+}
+
 function preParseKotlin(source: string): string {
-  return joinKotlinSplitConstructors(blankKotlinQualifiedReceivers(source));
+  return rewriteNewerKotlinSyntax(joinKotlinSplitConstructors(blankKotlinQualifiedReceivers(source)));
 }
 
 export const kotlinExtractor: LanguageExtractor = {
