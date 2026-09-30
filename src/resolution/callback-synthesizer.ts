@@ -1513,8 +1513,79 @@ const RN_JVM_EMIT_RE = /\.emit\s*\(\s*"([^"]+)"\s*,/g;
 // is followed by `… ) {`) never matches. Multi-line tolerant. (java/kotlin/swift)
 const RN_NATIVE_SENDEVENT_RE = /\bsendEvent\s*\([^;{}]*?"([^"]+)"/g;
 
+// The same calls with the event named by a CONSTANT — NetInfo listens with
+// `addListener(PrivateTypes.DEVICE_CONNECTIVITY_EVENT, …)`, many libraries emit
+// with `.emit(EVENT_NAME, …)` or `sendEventWithName:kLocationEvent`.
+const RN_OBJC_SEND_CONST_RE = /\bsendEventWithName\s*:\s*([A-Za-z_]\w*)\b/g;
+const RN_SWIFT_SEND_CONST_RE = /\bsendEvent\s*\(\s*withName\s*:\s*([A-Za-z_][\w.]*)/g;
+const RN_JVM_EMIT_CONST_RE = /\.emit\s*\(\s*([A-Za-z_][\w.]*)\s*,/g;
+const RN_NATIVE_SENDEVENT_CONST_RE = /\bsendEvent\s*\(\s*[A-Za-z_][\w.]*\s*,\s*([A-Za-z_][\w.]*)\s*,/g;
+const RN_JS_LISTEN_CONST_RE = /\.(?:on|once|addListener)\(\s*((?:[A-Za-z_$][\w$]*\.)*[A-Za-z_$][\w$]*)\s*,\s*([A-Za-z_$][\w$.]*|(?:async\s*)?(?:\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>|function\s*\())/g;
+
+const CONSTANT_KINDS = new Set<NodeKind>(['constant', 'variable', 'field', 'property', 'enum_member']);
+
+/**
+ * The string an event-name constant holds, read off its declaration line:
+ * `export const DEVICE_CONNECTIVITY_EVENT = 'netInfo.networkStatusDidChange'`,
+ * `static final String EVENT = "x"`, `const val EVENT = "x"`,
+ * `NSString *const kEvent = @"x"`, `#define kEvent @"x"`, `static let event = "x"`,
+ * an enum case `Changed = 'changed'`.
+ *
+ * Scoped as the language scopes the name, never by the name alone — a
+ * parameter `eventName` is not some test's `eventName = "pong"`:
+ * - a bare `NAME` is a declaration in the same file, or (JS) the one an
+ *   import of that name points at;
+ * - `Owner.NAME` is a declaration inside `Owner`, or (JS) `NAME` in the file
+ *   a namespace import `Owner` points at.
+ * Null unless those declarations agree on one literal.
+ */
+function constantEventName(expr: string, file: string, ctx: ResolutionContext, memo: Map<string, string | null>): string | null {
+  const key = `${file}\0${expr}`;
+  if (memo.has(key)) return memo.get(key)!;
+  const parts = expr.replace(/\.rawValue$/, '').split('.');
+  const name = parts[parts.length - 1]!;
+  const owner = parts.length > 1 ? parts[parts.length - 2]! : null;
+  let value: string | null = null;
+  if (/^[A-Za-z_$][\w$]*$/.test(name) && name !== 'this' && (parts.length <= 2 || parts[0] !== 'this')) {
+    const read = (n: Node): string | null => {
+      const line = (ctx.getFileLines?.(n.filePath) ?? ctx.readFile(n.filePath)?.split(/\r?\n/))?.[n.startLine - 1] ?? '';
+      const at = line.indexOf(name);
+      if (at < 0) return null;
+      const rest = line.slice(at + name.length);
+      const m = /^\s*(?::[^=;]*)?[=:]\s*@?(["'`])([^"'`]+)\1/.exec(rest) ?? /^\s+@?(")([^"]+)"/.exec(rest);
+      return m ? m[2]! : null;
+    };
+    const declaredIn = (f: string) => ctx.getNodesInFile(f).filter((n) => n.name === name && CONSTANT_KINDS.has(n.kind));
+    const js = /\.(?:[cm]?[jt]sx?)$/.test(file);
+    const language: Language = /\.tsx$/.test(file) ? 'tsx' : /\.[cm]?ts$/.test(file) ? 'typescript' : file.endsWith('.jsx') ? 'jsx' : 'javascript';
+    const importedFile = (local: string): string | null => {
+      if (!js) return null;
+      const binding = ctx.getImportMappings(file, language).find((m) => m.localName === local);
+      return binding ? resolveImportPath(binding.source, file, language, ctx) : null;
+    };
+    let decls: Node[] = [];
+    if (owner === null) {
+      decls = declaredIn(file);
+      if (decls.length === 0) {
+        const from = importedFile(name);
+        if (from) decls = declaredIn(from);
+      }
+    } else {
+      const from = importedFile(owner);
+      decls = from
+        ? declaredIn(from)
+        : ctx.getNodesByName(name).filter((n) => CONSTANT_KINDS.has(n.kind) && new RegExp(`(?:^|[.:])${owner}(?:[.:]|$)`).test(n.qualifiedName.slice(0, n.qualifiedName.lastIndexOf(name))));
+    }
+    const values = new Set(decls.map(read).filter((v): v is string => v !== null));
+    value = values.size === 1 ? [...values][0]! : null;
+  }
+  memo.set(key, value);
+  return value;
+}
+
 async function rnEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Promise<Edge[]> {
   let scannedFiles = 0;
+  const constants = new Map<string, string | null>();
   // Native dispatchers (source = the native method whose body sends the
   // event) and JS handlers (target = the function/method registered as
   // the listener) keyed by event name.
@@ -1544,6 +1615,11 @@ async function rnEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Promis
       while ((m = RN_OBJC_SEND_RE.exec(content))) {
         if (m[1]) addDispatcher(m[1], lineOf(m.index));
       }
+      RN_OBJC_SEND_CONST_RE.lastIndex = 0;
+      while ((m = RN_OBJC_SEND_CONST_RE.exec(content))) {
+        const event = constantEventName(m[1]!, file, ctx, constants);
+        if (event) addDispatcher(event, lineOf(m.index));
+      }
     }
 
     // Swift side: same RCTEventEmitter method, parens/named-args syntax.
@@ -1556,6 +1632,11 @@ async function rnEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Promis
       RN_NATIVE_SENDEVENT_RE.lastIndex = 0;
       while ((m = RN_NATIVE_SENDEVENT_RE.exec(content))) {
         if (m[1]) addDispatcher(m[1], lineOf(m.index));
+      }
+      RN_SWIFT_SEND_CONST_RE.lastIndex = 0;
+      while ((m = RN_SWIFT_SEND_CONST_RE.exec(content))) {
+        const event = constantEventName(m[1]!, file, ctx, constants);
+        if (event) addDispatcher(event, lineOf(m.index));
       }
     }
 
@@ -1572,6 +1653,13 @@ async function rnEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Promis
       RN_NATIVE_SENDEVENT_RE.lastIndex = 0;
       while ((m = RN_NATIVE_SENDEVENT_RE.exec(content))) {
         if (m[1]) addDispatcher(m[1], lineOf(m.index));
+      }
+      for (const re of [RN_JVM_EMIT_CONST_RE, RN_NATIVE_SENDEVENT_CONST_RE]) {
+        re.lastIndex = 0;
+        while ((m = re.exec(content))) {
+          const event = constantEventName(m[1]!, file, ctx, constants);
+          if (event) addDispatcher(event, lineOf(m.index));
+        }
       }
     }
 
@@ -1656,6 +1744,23 @@ async function rnEventEdges(ctx: ResolutionContext, onYield: MaybeYield): Promis
         if (!enclosing) continue;
         const map = jsHandlersByEvent.get(event) ?? new Map<string, string>();
         if (!map.has(enclosing.id)) map.set(enclosing.id, `${file}:${lineOf(m.index)}`);
+        jsHandlersByEvent.set(event, map);
+      }
+      // A constant event name: the listener lands where a literal one would —
+      // the named handler when it is a node, else the enclosing function.
+      RN_JS_LISTEN_CONST_RE.lastIndex = 0;
+      while ((m = RN_JS_LISTEN_CONST_RE.exec(content))) {
+        const event = constantEventName(m[1]!, file, ctx, constants);
+        if (!event) continue;
+        const arg = m[2]!;
+        const bare = /^[A-Za-z_$][\w$.]*$/.test(arg) ? arg.slice(arg.lastIndexOf('.') + 1) : null;
+        const line = lineOf(m.index);
+        // The handler this file names — never a same-named function elsewhere.
+        const named = bare ? nodesInFile.find((n) => (n.kind === 'function' || n.kind === 'method') && n.name === bare) : undefined;
+        const target = named ?? enclosingFn(nodesInFile, line);
+        if (!target) continue;
+        const map = jsHandlersByEvent.get(event) ?? new Map<string, string>();
+        if (!map.has(target.id)) map.set(target.id, `${file}:${line}`);
         jsHandlersByEvent.set(event, map);
       }
     }
