@@ -1061,6 +1061,20 @@ function isBareGoCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
 }
 
 /**
+ * Whether an R call is a plain function call — `range(x)`, `vars(a)` — not a
+ * ggproto / R6 method through `obj$m(…)` or `self$m(…)`. A method is only
+ * reached through its object: ggplot2's `range(data$x)` (base R's) went to a
+ * Coord's `range` method.
+ */
+function isBareRCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'r' || ref.referenceKind !== 'calls' || !/^[A-Za-z_.][\w.]*$/.test(ref.referenceName)) return false;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (!line) return false;
+  const m = new RegExp(`(?<![\\w.])${ref.referenceName.replace(/\./g, '\\.')}\\s*\\(`).exec(line);
+  return !!m && !/(?:\$|@|::)\s*$/.test(line.slice(0, m.index));
+}
+
+/**
  * Whether a PHP `calls` ref is a bare function call — `redirect($url)`,
  * `view('books.show')` — rather than `$this->redirect()` / `$obj->view()` /
  * `Foo::view()`. PHP has no implicit `$this`: a call written without a
@@ -1502,13 +1516,28 @@ function dartHeadOf(decl: Node, context: ResolutionContext): { supers: string[];
  * `child.Flags().String("f", …)` arrive as bare `map` / `String`.
  */
 function rustGoCallShape(ref: UnresolvedRef, context: ResolutionContext): { shape: 'path' } | { shape: 'bare' } | { shape: 'chained'; receiver: string } | null {
-  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split('\n');
+  let line = lines?.[ref.line - 1];
   if (line === undefined) return null;
   const name = ref.referenceName;
+  const at = new RegExp(`(?<![\\w$])${name}\\s*(?:\\(|::<|!)`);
   let start = line.startsWith(name, ref.column) ? ref.column : -1;
   if (start < 0) {
-    const m = new RegExp(`(?<![\\w$])${name}\\s*(?:\\(|::<|!)`).exec(line);
+    const m = at.exec(line);
     start = m ? m.index : -1;
+  }
+  // A link further down a chain the call's line starts — `bat()\n  .arg(…)\n  .stdout(…)` —
+  // is recorded at the chain's first line.
+  for (let next = ref.line; start < 0 && lines && next < Math.min(lines.length, ref.line + 20); next++) {
+    const m = /^\s*\./.test(lines[next]!) ? at.exec(lines[next]!) : null;
+    if (m) {
+      // Named after the chain's head: `Command::new("true")` for its `.stdout(…)`.
+      if (/^\s*\.\s*$/.test(lines[next]!.slice(0, m.index))) {
+        return { shape: 'chained', receiver: rustGoReceiverName(line.trimEnd().replace(/[?;]+$/, '')) };
+      }
+      line = lines[next]!;
+      start = m.index;
+    }
   }
   if (start < 0) return null;
   const before = line.slice(0, start);
@@ -1569,6 +1598,8 @@ function isRustGoCallTarget(n: Node, shape: ReturnType<typeof rustGoCallShape>):
   // `iter`, Go's `String` / `Get`) needs a receiver named after the owner; a
   // project-specific one keeps its match — clap's `flag("n").short('n')` is
   // `Arg::short`, cobra's `c.Root().Name()` `Command::Name`.
+  // Go's `w.Header().Get(…)` / `r.Header.Set(…)`: net/http's Header map.
+  if (n.language === 'go' && /(?:^|\.)Header$/.test(shape.receiver) && /^(?:Get|Set|Add|Del|Values|Clone|Write)$/.test(n.name)) return false;
   const std = (n.language === 'go' ? GO_STD_METHODS : RUST_STD_METHODS).has(n.name);
   return !std || /^(?:self|Self)$/.test(shape.receiver) || (shape.receiver !== '' && sharesReceiverWord(shape.receiver, n));
 }
@@ -2231,6 +2262,9 @@ const RUST_STD_METHODS: ReadonlySet<string> = new Set([
   'as_bytes', 'as_slice', 'as_ptr', 'into', 'try_into', 'borrow', 'borrow_mut', 'deref', 'deref_mut', 'chars',
   'bytes', 'lines', 'starts_with', 'ends_with', 'trim', 'to_lowercase', 'to_uppercase', 'windows', 'chunks',
   'then', 'then_some', 'eq', 'cmp', 'partial_cmp', 'read_to_end', 'read_to_string', 'fetch_add', 'fetch_sub',
+  // std::process::Command's pipes and the assert_cmd assertions tests chain
+  // onto it (not `arg` / `env`, which clap's own builders carry)
+  'current_dir', 'stdout', 'stderr', 'stdin', 'success', 'failure',
 ]);
 
 /**
@@ -3354,7 +3388,7 @@ export function matchByExactName(
   // findBestMatch — O(K²) per package, the dominant cost of "Resolving refs" on
   // large import-heavy (front-end + back-end) repos (#915).
   const bareJs = isBareJsCall(ref, context);
-  const bareGo = isBareGoCall(ref, context);
+  const bareNoMembers = isBareGoCall(ref, context) || isBareRCall(ref, context);
   const barePhp = isBarePhpCall(ref, context);
   // A type, a value or an import the file binds from a package outside the
   // repository names nothing in it, whatever kind of reference it is.
@@ -3442,7 +3476,7 @@ export function matchByExactName(
     // method (#1714, #1857), nor a property, field or case: mocha's global
     // `it(…)` bound to an interface's `it` property, `describe(…)` to a
     // command class's `describe` string.
-    !((bareJs || bareGo) && TYPE_MEMBER_KINDS.has(n.kind)) &&
+    !((bareJs || bareNoMembers) && TYPE_MEMBER_KINDS.has(n.kind)) &&
     // A bare PHP call is a function call: nothing else is callable without a receiver.
     !(barePhp && n.kind !== 'function') &&
     // A Vue component's own method is `this.m()` inside that component — not
@@ -5734,10 +5768,16 @@ export function matchMethodCall(
   // In C# and Java a capitalized receiver the class around it doesn't declare
   // is a type — a project property of that name elsewhere (a test object's
   // `DateTime`) does not make `DateTime.Parse(…)` the project's.
-  const typesOnly = ref.language === 'csharp' || ref.language === 'java';
+  const typesOnly = ref.language === 'csharp' || ref.language === 'java' || ref.language === 'rust';
   if (namesExternalType(objectOrClass!, ref.language) &&
       !context.getNodesByName(objectOrClass!).some((n) => sameLanguageFamily(n.language, ref.language) &&
-        (!typesOnly || isMethodOwnerKind(n) || n.kind === 'enum' || n.kind === 'namespace' || n.kind === 'module'))) {
+        (!typesOnly || isMethodOwnerKind(n) || n.kind === 'enum' || n.kind === 'namespace' || n.kind === 'module' ||
+          n.kind === 'trait' || n.kind === 'type_alias'))) {
+    return null;
+  }
+  // Rust `task::spawn(…)` / `io::stdout()`: a function through a module path —
+  // never a method some type of that name owns.
+  if (ref.language === 'rust' && match === colonMatch && /^[a-z_][\w]*(?:::[a-z_]\w*)*$/.test(objectOrClass!)) {
     return null;
   }
   // `string.Equals(…)`, `object.ReferenceEquals(…)`: a C# keyword type.
@@ -6746,7 +6786,10 @@ function hasParameterBinding(code: string, escapedName: string): boolean {
 function namesExternalType(receiver: string, language: string): boolean {
   if (!/^[A-Z][A-Za-z0-9_]*$/.test(receiver)) return false;
   if (language === 'pascal') return /^(?:[TEI][A-Z]\w*|Exception)$/.test(receiver);
-  return !['go', 'c', 'cpp', 'rust', 'cuda', 'metal'].includes(language);
+  // Rust: `Vec::new()`, `String::from(…)`, `Default::default()` — but `Self::` is the impl's own type,
+  // and a SCREAMING_CASE receiver (`REQ_ID.scope(…)`) a static.
+  if (language === 'rust') return receiver !== 'Self' && /[a-z]/.test(receiver);
+  return !['go', 'c', 'cpp', 'cuda', 'metal'].includes(language);
 }
 
 /**
@@ -6994,7 +7037,9 @@ export function matchFuzzy(
   // `Node` not a `node()`. Only PHP, Pascal/Delphi, CFML, COBOL and VB.NET
   // resolve a name without regard to case, which is what this fallback's
   // lowercase index is for.
+  const bareR = isBareRCall(ref, context);
   const callableCandidates = candidates.filter((n) => callableKinds.has(n.kind) && !(typeRef && !canNameInTypePosition(n)) &&
+    !(bareR && n.kind === 'method') &&
     // `new …MockData()` makes an instance of a type; a method is never what it names.
     !(ref.referenceKind === 'instantiates' && n.kind === 'method') &&
     !(rustBare && !isRustNameInScope(n, ref, context)) &&
