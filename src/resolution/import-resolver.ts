@@ -119,6 +119,24 @@ function defaultExportBinding(filePath: string, context: ResolutionContext): str
 }
 const fileExportIndexes = new WeakMap<ResolutionContext, Map<string, FileExportIndex>>();
 
+/**
+ * `module.exports = …` (also `exports = module.exports = …`): the name it
+ * binds (`createApplication`, `function name(`, `class Name`) or the module
+ * it forwards (`require('./lib/express')`), or null.
+ */
+const COMMONJS_DEFAULT_EXPORT =
+  /^[ \t]*(?:exports\s*=\s*)?module\.exports\s*=\s*(?:exports\s*=\s*)?(?:require\(\s*['"]([^'"]+)['"]\s*\)\s*;?[ \t]*$|(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\(|class\s+([A-Za-z_$][\w$]*)|([A-Za-z_$][\w$]*)\s*;?[ \t]*$)/m;
+
+function commonJsDefaultExport(filePath: string, context: ResolutionContext): { source?: string; name?: string } | null {
+  if (!JS_FAMILY_FILE.test(filePath)) return null;
+  if (context.fileContains && !context.fileContains(filePath, 'module.exports')) return null;
+  const source = context.readFile(filePath);
+  if (!source || !source.includes('module.exports')) return null;
+  const m = COMMONJS_DEFAULT_EXPORT.exec(source);
+  if (!m) return null;
+  return m[1] ? { source: m[1] } : { name: m[2] ?? m[3] ?? m[4] };
+}
+
 function getFileExportIndex(filePath: string, context: ResolutionContext): FileExportIndex {
   let perFile = fileExportIndexes.get(context);
   if (!perFile) {
@@ -505,9 +523,10 @@ function resolveRelativeImport(
   const basePath = path.resolve(fromDir, importPath);
   const relativePath = path.relative(projectRoot, basePath).replace(/\\/g, '/');
 
-  // Try each extension
+  // Try each extension. `require('..')` up to the project root is its `index.js`.
   for (const ext of extensions) {
-    const candidatePath = relativePath + ext;
+    if (relativePath === '' && !ext.startsWith('/')) continue;
+    const candidatePath = relativePath === '' ? ext.slice(1) : relativePath + ext;
     if (context.fileExists(candidatePath)) {
       return candidatePath;
     }
@@ -996,17 +1015,18 @@ function extractJSImports(content: string): ImportMapping[] {
     }
   }
 
-  // Require statements
-  const requireRegex = /(?:const|let|var)\s+(?:(\w+)|{([^}]+)})\s*=\s*require\(['"]([^'"]+)['"]\)/g;
+  // Require statements — each declarator of a list too (`var express = require('../'),
+  // request = require('supertest')`), and a member of the module (`require('./utils').methods`).
+  const requireRegex = /(?:\b(?:const|let|var)\s+|,\s*)(?:([A-Za-z_$][\w$]*)|{([^}]+)})\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)(?:\s*\.\s*([A-Za-z_$][\w$]*))?/g;
   while ((match = requireRegex.exec(content)) !== null) {
-    const [, defaultName, destructured, source] = match;
+    const [, defaultName, destructured, source, member] = match;
 
     if (defaultName) {
       mappings.push({
         localName: defaultName,
-        exportedName: 'default',
+        exportedName: member ?? 'default',
         source: source!,
-        isDefault: true,
+        isDefault: member === undefined,
         isNamespace: false,
       });
     }
@@ -2423,6 +2443,17 @@ function findExportedSymbolWalk(
     const direct =
       exportIndex.defaultComponent ?? defaultExportBindingNode(filePath, exportIndex, context) ?? exportIndex.defaultFnClass;
     if (direct) return direct;
+    // CommonJS: `module.exports = createApplication`, or `= require('./lib/express')`.
+    const commonJs = commonJsDefaultExport(filePath, context);
+    if (commonJs?.source) {
+      const next = resolveImportPath(commonJs.source, filePath, language, context);
+      if (next) return findExportedSymbol(next, want, language, context, visited, depth + 1);
+    } else if (commonJs?.name) {
+      const bound = nodesInFileNamed(filePath, commonJs.name, context)
+        .filter((n) => DEFAULT_BINDING_KINDS.has(n.kind))
+        .sort((a, b) => a.startLine - b.startLine || a.startColumn - b.startColumn)[0];
+      if (bound) return bound;
+    }
   } else if (want.isNamespace && want.memberName) {
     const direct = exportedByName(filePath, exportIndex, want.memberName, context);
     if (direct) return direct;
