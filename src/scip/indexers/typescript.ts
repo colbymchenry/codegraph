@@ -23,11 +23,11 @@ export const typescriptIndexer: IndexerSpec = {
   lang: 'typescript',
   detect: root => has(root, 'tsconfig.json') || has(root, 'jsconfig.json') || has(root, 'package.json'),
   cmd: 'scip-typescript',
-  args(root, outFile) {
+  invocation(root, outFile) {
     const args = ['index', '--output', outFile];
     if (has(root, 'pnpm-workspace.yaml')) args.push('--pnpm-workspaces');
     else if (has(root, 'yarn.lock') && hasWorkspaces(root)) args.push('--yarn-workspaces');
     else if (!has(root, 'tsconfig.json')) args.push('--infer-tsconfig');
-    return args;
+    return { args };
   },
 };

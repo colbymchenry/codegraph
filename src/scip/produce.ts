@@ -74,15 +74,16 @@ export async function produceIndex(
 ): Promise<ProduceResult> {
   const final = indexPath(projectRoot, lang);
   const tmp = `${final}.${process.pid}.tmp`;
+  fs.mkdirSync(path.dirname(final), { recursive: true }); // adapters may write helper files beside the output
   const indexer = resolveIndexer(projectRoot, lang, tmp);
   if ('skip' in indexer) return { status: 'skipped', lang, reason: indexer.skip };
 
   const started = Date.now();
   const hashes = snapshotHashes(db, projectRoot, lang);
-  fs.mkdirSync(path.dirname(final), { recursive: true });
   try {
     const useNice = opts.nice && process.platform !== 'win32';
     const [cmd, args] = useNice ? ['nice', ['-n', '10', indexer.cmd, ...indexer.args]] : [indexer.cmd, indexer.args];
+    if (indexer.warning) opts.log?.(`${lang}: ${indexer.warning}`);
     opts.log?.(`running ${indexer.cmd} ${indexer.args.join(' ')}`);
     const { code, stderr } = await run(cmd, args, projectRoot, indexer.env, opts.signal);
     if (code !== 0) return { status: 'failed', lang, reason: `${indexer.cmd} exited ${code}: ${stderr.trim().split('\n').slice(-3).join(' | ')}` };

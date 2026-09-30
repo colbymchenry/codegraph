@@ -35,13 +35,22 @@ codegraph scip import out.scip  # install an index built elsewhere, then merge
 codegraph scip status
 ```
 
-Indexers are never auto-installed. For TS/JS: `npm i -g @sourcegraph/scip-typescript`, or point the config at `npx`:
+Indexers are never auto-installed:
+
+| language | indexer | detected by |
+|---|---|---|
+| TS/JS | `npm i -g @sourcegraph/scip-typescript` | `tsconfig.json`, `jsconfig.json`, `package.json` |
+| Python | `npm i -g @sourcegraph/scip-python` | `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt` |
+
+To run one through `npx` instead, put this in `codegraph.json`:
 
 ```json
-{ "scip": { "typescript": { "cmd": "npx", "args": ["-y", "@sourcegraph/scip-typescript", "index", "--output", "{out}"] } } }
+{ "scip": { "python": { "cmd": "npx", "args": ["-y", "@sourcegraph/scip-python", "{args}"] } } }
 ```
 
-Put this in `codegraph.json`. `"python": false` disables a language. `cmd`, `args` and `env` replace the defaults.
+`"python": false` disables a language. `cmd`, `args` and `env` replace the defaults. In `args`, `{args}` splices in the adapter's own arguments and `{out}` is the output path.
+
+**Python environments.** A `.venv/` or `venv/` (with `pyvenv.cfg`) is activated for the indexer (`VIRTUAL_ENV`, `PATH`). Its packages are passed to scip-python as an `--environment` manifest read from `*.dist-info/RECORD`, so uv venvs without `pip` work. Without a venv the manifest is empty and `scip index` warns. Project code still resolves; calls into dependencies don't.
 
 After a project opts in with `scip index`, the MCP server (and anything else that `watch`es) re-indexes on its own. That happens 60 s after the last synced edit, at most every 10 min, niced. A new index replaces the old one only when its count of resolved calls (calls and instantiations of project symbols; imports and type references don't count) dropped by no more than 20%. Otherwise the old index stays and the reason is logged.
 
@@ -63,7 +72,7 @@ Differences from the POC:
 
 - A target that the index *defines* but that has no codegraph node (or sits in a stale document) is **unknown**, not external. It never deletes a heuristic edge.
 - Callable-ness comes from the mapped node kind, not the symbol suffix. This lets TS `const f = () => …` count.
-- `new X()` → `instantiates` (via scip-typescript's `` `<constructor>` `` symbol).
+- `new X()` (TS, via scip-typescript's `` `<constructor>` `` symbol) and Python's `X()` (a class symbol followed by `(`) → `instantiates`, matching codegraph's own edge kind.
 - Protobuf is decoded by a ~250-line reader (`src/scip/reader.ts`) instead of `@bufbuild/protobuf` plus codegen. The fork adds no runtime dependency. It accepts both the legacy `int32` ranges and the typed ranges.
 
 MCP output: Flow steps read `↓ calls (compiler-verified)` or `(unverified: …)`. Trail entries get ` [unverified]`.
@@ -80,11 +89,16 @@ Pass bar per language (2 seeds × 50 random targets): precision ≥ 95%, recall 
 |---|---|---|---|---|---|---|
 | TS | codegraph v1.6.1 `src/` (250 docs) | 1 | 100% / 44% | 90% / 100% | **100% / 100%** | 7.5 s + 0.5 s |
 | TS | same | 2 | 100% / 56% | 90% / 100% | **100% / 100%** | |
+| Python | Django (`bench-corpus/arm_grep` @ 026b005, 2,928 docs, no venv) | 1 | 99% / 10% | 78% / 82% | **100% / 100%** | 98.5 s + 3.1 s |
+| Python | same | 2 | 100% / 24% | 75% / 96% | **100% / 100%** | |
 
-On that corpus the merge verified 6,826 edges, removed 102 wrong ones and added 832 missing ones.
+On codegraph's own `src/`, the merge verified 6,826 edges, removed 102 wrong ones and added 832 missing ones. On Django it verified 46,577, removed 11,426 wrong ones and added 22,476, of which 8,929 were `instantiates`. After the merge `django.urls.base.reverse` has 1,267 caller edges from 867 distinct callers, up from 1, matching the POC.
+
+`--rg-type py --prefix django/` for Python.
 
 ## Status
 
 - Phase 0 (fork setup): done, except the release script (see the job report).
 - Phase 1 (core + TS/JS): done.
-- Next: Python (Phase 2, `.venv` detection, Django eval), Go, Rust, then `implements`/`extends`/`references`.
+- Phase 2 (Python): done.
+- Next: Go (Phase 3, scip-go, eval on spf13/cobra), Rust (Phase 4), then `implements`/`extends`/`references`.

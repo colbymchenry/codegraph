@@ -4,28 +4,38 @@
  * project's `codegraph.json`:
  *
  *   "scip": {
- *     "typescript": { "cmd": "npx", "args": ["-y", "@sourcegraph/scip-typescript", "index", "--output", "{out}"] },
+ *     "typescript": { "cmd": "npx", "args": ["-y", "@sourcegraph/scip-typescript", "{args}"] },
  *     "python": false
  *   }
  *
  * `false` disables a language; `cmd` / `args` / `env` replace the defaults.
- * `{out}` in args is the output path. Indexers are never auto-installed: a
- * command that isn't on PATH is reported and skipped.
+ * In args, an element `{args}` splices in the adapter's own arguments and
+ * `{out}` is the output path. Indexers are never auto-installed: a command
+ * that isn't on PATH is reported and skipped.
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import { PROJECT_CONFIG_FILENAME } from '../../project-config';
 import type { ScipLanguage } from '../store';
+import { pythonIndexer } from './python';
 import { typescriptIndexer } from './typescript';
+
+/** How to run an indexer for one project. */
+export interface Invocation {
+  args: string[];
+  env?: Record<string, string>;
+  /** something the user should know about the result's quality (shown, never fatal) */
+  warning?: string;
+}
 
 export interface IndexerSpec {
   lang: ScipLanguage;
   /** true when the project has this language's marker files */
   detect(projectRoot: string): boolean;
   cmd: string;
-  args(projectRoot: string, outFile: string): string[];
-  env?: Record<string, string>;
+  /** May write helper files next to `outFile` (e.g. an environment manifest). */
+  invocation(projectRoot: string, outFile: string): Invocation;
 }
 
 export interface IndexerOverride {
@@ -36,6 +46,7 @@ export interface IndexerOverride {
 
 export const INDEXERS: Partial<Record<ScipLanguage, IndexerSpec>> = {
   typescript: typescriptIndexer,
+  python: pythonIndexer,
 };
 
 /** Tool name in an index's metadata → the language it covers (for `scip import`). */
@@ -77,6 +88,7 @@ export interface ResolvedIndexer {
   cmd: string;
   args: string[];
   env: Record<string, string>;
+  warning?: string;
 }
 
 /**
@@ -105,9 +117,13 @@ export function resolveIndexer(projectRoot: string, lang: ScipLanguage, outFile:
   }
   if (!spec.detect(projectRoot)) return { skip: `no ${lang} project markers found` };
   const cmd = override?.cmd ?? spec.cmd;
-  const args = override?.args ? override.args.map(a => a.split('{out}').join(outFile)) : spec.args(projectRoot, outFile);
   if (!onPath(cmd)) return { skip: `\`${cmd}\` not found on PATH — install it or set scip.${lang}.cmd in ${PROJECT_CONFIG_FILENAME}` };
-  return { lang, cmd, args, env: { ...spec.env, ...override?.env } };
+  // The adapter's environment (e.g. an activated venv) applies even when the args are overridden.
+  const inv = spec.invocation(projectRoot, outFile);
+  const args = override?.args
+    ? override.args.flatMap(a => (a === '{args}' ? inv.args : [a.split('{out}').join(outFile)]))
+    : inv.args;
+  return { lang, cmd, args, env: { ...inv.env, ...override?.env }, warning: inv.warning };
 }
 
 export function onPath(cmd: string): boolean {
