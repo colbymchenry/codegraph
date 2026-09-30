@@ -1573,6 +1573,50 @@ function isRustGoCallTarget(n: Node, shape: ReturnType<typeof rustGoCallShape>):
 }
 
 /**
+ * Kotlin's scope functions and standard collection / string / conversion
+ * methods: on an untyped chain link (`builder.apply { … }`, `list.map { … }`)
+ * they are the standard library's, never a project type's same-named member.
+ * Names project types commonly carry (`get`, `write`, `close`, `add`) are left
+ * out — okio's `sink.write(…)` is its own Buffer's.
+ */
+const KOTLIN_STD_METHODS: ReadonlySet<string> = new Set([
+  'apply', 'also', 'let', 'run', 'takeIf', 'takeUnless', 'toString', 'equals', 'hashCode', 'map', 'mapNotNull',
+  'mapIndexed', 'filter', 'filterNot', 'filterIsInstance', 'forEach', 'forEachIndexed', 'first', 'firstOrNull',
+  'last', 'lastOrNull', 'single', 'singleOrNull', 'isEmpty', 'isNotEmpty', 'isNullOrEmpty', 'isNullOrBlank',
+  'isBlank', 'isNotBlank', 'orEmpty', 'joinToString', 'toList', 'toMutableList', 'toSet', 'toMutableSet', 'toMap',
+  'toTypedArray', 'any', 'all', 'none', 'count', 'sumOf', 'maxOf', 'minOf', 'maxOrNull', 'minOrNull', 'sortedBy',
+  'sortedByDescending', 'sorted', 'sortedWith', 'reversed', 'drop', 'dropLast', 'take', 'takeLast', 'zip',
+  'flatMap', 'flatten', 'distinct', 'groupBy', 'associate', 'associateBy', 'associateWith', 'partition',
+  'contains', 'containsKey', 'getOrElse', 'getOrNull', 'getOrPut', 'getOrDefault', 'trim', 'trimEnd', 'trimStart',
+  'split', 'substring', 'startsWith', 'endsWith', 'replace', 'lowercase', 'uppercase', 'toInt', 'toLong',
+  'toDouble', 'toFloat', 'toIntOrNull', 'toLongOrNull', 'encodeToByteArray', 'decodeToString',
+  'copyOf', 'copyOfRange', 'indexOf', 'lastIndexOf', 'withIndex', 'asSequence', 'asList', 'ifEmpty', 'ifBlank',
+  'padStart', 'padEnd', 'repeat', 'lines', 'toCharArray', 'coerceAtLeast', 'coerceAtMost', 'coerceIn',
+]);
+
+/** The receiver a Kotlin chain link `….name(` / `?.name {` is written on, or null for a call with none. */
+function kotlinChainReceiver(ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return null;
+  const name = ref.referenceName;
+  let start = line.startsWith(name, ref.column) ? ref.column : -1;
+  if (start < 0) {
+    const m = new RegExp(`(?<![\\w$])${name}\\s*[({]`).exec(line);
+    start = m ? m.index : -1;
+  }
+  if (start < 0) return null;
+  const before = line.slice(0, start);
+  if (!/\.\s*$/.test(before)) return null;
+  return rustGoReceiverName(before.replace(/\?\s*\.\s*$/, '').replace(/!!\s*$/, ''));
+}
+
+/** Whether a standard-named Kotlin chain link can mean `n`: only through a receiver named after its owner. */
+function isKotlinStdChainTarget(n: Node, receiver: string): boolean {
+  if (n.kind !== 'method' && n.kind !== 'function') return true;
+  return receiver === 'this' || (receiver !== '' && sharesReceiverWord(receiver, n));
+}
+
+/**
  * Methods of Rust's Option / Result / iterators / collections / strings /
  * smart pointers — names a project type rarely carries itself. Ones it often
  * does (`get`, `set`, `insert`, `next`, `call`, `read`) are left out: serde's
@@ -2752,8 +2796,11 @@ export function matchByExactName(
   const scalaBare = ref.language === 'scala' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const rustGoShape = (ref.language === 'rust' || ref.language === 'go') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)
     ? rustGoCallShape(ref, context) : null;
+  const kotlinStdChain = ref.language === 'kotlin' && ref.referenceKind === 'calls' && KOTLIN_STD_METHODS.has(ref.referenceName)
+    ? kotlinChainReceiver(ref, context) : null;
   const phpSelf = phpSelfReceiver(ref, context);
   const filtered = sameName.filter((n) =>
+    !(kotlinStdChain !== null && !isKotlinStdChainTarget(n, kotlinStdChain)) &&
     !(rustGoShape && !isRustGoCallTarget(n, rustGoShape)) &&
     !(scalaBare && !isScalaMemberInScope(n, ref, context)) &&
     !(csharpBare && !isCsharpMemberInScope(n, ref, context)) &&
@@ -4894,9 +4941,9 @@ export function matchMethodCall(
         !((ref.language === 'lua' || ref.language === 'luau') && isLuaLibraryCall(objectOrClass!, methodName!, ref, targetMethods[0]!)) &&
         // Rust / Go: a standard-library method name on an untyped receiver
         // (`sym.map(…)`, `w.Header().Get(…)`) is the library type's.
-        !((ref.language === 'rust' || ref.language === 'go') &&
-          (ref.language === 'go' ? GO_STD_METHODS : RUST_STD_METHODS).has(methodName!) &&
-          !/^(?:self|Self)$/.test(objectOrClass!) && !sharesReceiverWord(objectOrClass!, targetMethods[0]!)) &&
+        !((ref.language === 'rust' || ref.language === 'go' || ref.language === 'kotlin') &&
+          (ref.language === 'go' ? GO_STD_METHODS : ref.language === 'kotlin' ? KOTLIN_STD_METHODS : RUST_STD_METHODS).has(methodName!) &&
+          !/^(?:self|Self|this)$/.test(objectOrClass!) && !sharesReceiverWord(objectOrClass!, targetMethods[0]!)) &&
         !(UNTYPED_RECEIVER_LANGUAGES.has(ref.language) && !/^(?:self|self\.class|this|super|weak_?self|strong_?self)$/i.test(objectOrClass!) &&
           !sharesReceiverWord(objectOrClass!, targetMethods[0]!) &&
           !(ref.language === 'objc' && objcReceiverReaches(objectOrClass!, targetMethods[0]!, context)) &&
@@ -6014,6 +6061,8 @@ export function matchFuzzy(
   const scalaBare = ref.language === 'scala' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const rustGoShape = (ref.language === 'rust' || ref.language === 'go') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)
     ? rustGoCallShape(ref, context) : null;
+  const kotlinStdChain = ref.language === 'kotlin' && ref.referenceKind === 'calls' && KOTLIN_STD_METHODS.has(ref.referenceName)
+    ? kotlinChainReceiver(ref, context) : null;
   const phpSelf = phpSelfReceiver(ref, context);
   // Names are case-sensitive in every language but a handful: Rust's
   // `Bytes` is not the method `bytes`, Python's builtin `dir(…)` not a class
@@ -6038,6 +6087,7 @@ export function matchFuzzy(
     !(csharpBare && !isCsharpMemberInScope(n, ref, context)) &&
     !(scalaBare && !isScalaMemberInScope(n, ref, context)) &&
     !(rustGoShape && !isRustGoCallTarget(n, rustGoShape)) &&
+    !(kotlinStdChain !== null && !isKotlinStdChainTarget(n, kotlinStdChain)) &&
     !(phpSelf && (n.kind !== 'method' || !isPhpMethodInScope(n, ref, phpSelf, context))))
     .filter((n) => (ref.referenceKind !== 'references' && ref.referenceKind !== 'function_ref') ||
       sameLanguageFamily(n.language, ref.language));
