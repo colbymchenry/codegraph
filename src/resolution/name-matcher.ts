@@ -995,6 +995,46 @@ const BARE_CALL_KEYWORDS: ReadonlySet<string> = new Set([
   'return', 'await', 'yield', 'typeof', 'void', 'new', 'else', 'case', 'throw', 'in', 'of', 'instanceof', 'go', 'defer',
 ]);
 
+/**
+ * A C# / VB.NET reference whose site is a TYPE position: `Type sourceType`,
+ * `List<int>`, `new TypeMap()`, `Exception? e`, `Dictionary<string, Type>`,
+ * VB's `As Type` / `New List(Of T)`. Read from the source at the reference's
+ * column; anything else — a member read (`Builder.Services`), a method group
+ * (`MapGet("/x", GetItems)`), a route's handler — keeps every candidate.
+ */
+function isDotNetTypeRef(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'csharp' && ref.language !== 'vbnet') return false;
+  if (ref.referenceKind !== 'references' && ref.referenceKind !== 'instantiates' &&
+    ref.referenceKind !== 'type_of' && ref.referenceKind !== 'returns') return false;
+  const name = ref.referenceName;
+  if (!/^[A-Za-z_]\w*$/.test(name)) return false;
+  // `new TypeMap()` constructs a type; the reference's column is the `new`.
+  if (ref.referenceKind === 'instantiates') return true;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1]
+    ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined || !line.startsWith(name, ref.column)) return false;
+  const before = line.slice(0, ref.column);
+  const after = line.slice(ref.column + name.length);
+  if (ref.language === 'vbnet') return /\b(?:As|New|Of)\s+$/i.test(before);
+  if (/\bnew\s+$/.test(before)) return true;
+  // `Type name` — a declaration names its type first.
+  if (/^\s+@?[A-Za-z_]/.test(after)) return !/^\s+(?:is|as|and|or|not|when|in|switch|with)\b/.test(after);
+  // `List<int>`, `Type?`, `Type[]`, and the arguments of a generic.
+  if (/^<|^\?(?![.?\[])|^\[\s*[,\]]/.test(after)) return true;
+  return /^\s*[,>]/.test(after) && /<[^<>()]*$/.test(before);
+}
+
+/**
+ * Whether a candidate can be what a .NET type position names. A property, a
+ * method (a constructor is one) or an enum case shares the type's name, not
+ * its meaning: AutoMapper's `Type sourceType` bound to an attribute's `Type`
+ * property and `TypeMap typeMap` to a `TypeMap` property beside the `TypeMap`
+ * class. A field never names a type either.
+ */
+function canNameInTypePosition(n: Node): boolean {
+  return !(n.kind === 'property' || n.kind === 'method' || n.kind === 'enum_member' || n.kind === 'field');
+}
+
 /** What only exists inside a type, reachable through a receiver alone. */
 const TYPE_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'field', 'enum_member']);
 
@@ -1203,8 +1243,10 @@ export function matchByExactName(
   // upstream's language gate on the chosen result.
   const cMacroCall = ref.referenceKind === 'calls' && (ref.language === 'c' || ref.language === 'cpp') &&
     sameName.some((n) => n.kind === 'constant' && CPP_DEFINE_SIGNATURE.test(n.signature ?? ''));
+  const typeRef = isDotNetTypeRef(ref, context);
   const candidates = sameName.filter((n) =>
     !(cMacroCall && n.kind !== 'function' && n.kind !== 'method') &&
+    !(typeRef && !canNameInTypePosition(n)) &&
     // Type/value references retain same-family eligibility: a native namesake
     // must not hide the actual web type. Calls still gate only the winner.
     (!valueRef || sameLanguageFamily(n.language, ref.language)) &&
@@ -4200,7 +4242,8 @@ export function matchFuzzy(
 
   // Filter to callable kinds only (function, method, class)
   const callableKinds = new Set(['function', 'method', 'class']);
-  const callableCandidates = candidates.filter((n) => callableKinds.has(n.kind))
+  const typeRef = isDotNetTypeRef(ref, context);
+  const callableCandidates = candidates.filter((n) => callableKinds.has(n.kind) && !(typeRef && !canNameInTypePosition(n)))
     .filter((n) => (ref.referenceKind !== 'references' && ref.referenceKind !== 'function_ref') ||
       sameLanguageFamily(n.language, ref.language));
 
