@@ -618,6 +618,13 @@ function isLexicallyReachable(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): boolean {
+  // A `val` / `const` declared in a function body is that body's alone —
+  // okio's `(source as Source).buffer()` bound to a `val buffer = Buffer()`
+  // inside another test file's `pipe()`.
+  if (candidate.kind === 'variable' || candidate.kind === 'constant' || (candidate.kind === 'field' && candidate.language === 'scala')) {
+    const scope = localDeclarationScope(candidate, context);
+    return scope === null || (ref.filePath === candidate.filePath && ref.line >= scope.start && ref.line <= scope.end);
+  }
   // A function — or a type (`case class B()` in a test method), or a method
   // of such a type — declared inside a function is only in scope in there.
   if (candidate.kind !== 'function' && candidate.kind !== 'method' && !LOCAL_TYPE_KINDS.has(candidate.kind)) return true;
@@ -631,6 +638,66 @@ function isLexicallyReachable(
   if (NO_NESTED_FUNCTIONS.has(candidate.language)) return true;
   const scope = lexicalScopeOf(candidate, context);
   return scope === null || (ref.filePath === candidate.filePath && ref.line >= scope.start && ref.line <= scope.end);
+}
+
+/** Per context: node id → the function body (or Scala block) a declaration is local to. */
+const LOCAL_DECL_MEMO = new WeakMap<ResolutionContext, Map<string, { start: number; end: number } | null>>();
+
+/**
+ * The lines a variable declaration is in scope for when it is local: the
+ * innermost function or method of its file whose lines hold it — or, for a
+ * Scala `val` the graph files under its class but written inside a block of
+ * the class body (cats' `test("…") { val f = … }`), that block. Null for a
+ * declaration at file, class or object level. A Lua global assigned inside a
+ * function is still global; C and C++ nesting is not trusted (see below).
+ */
+function localDeclarationScope(candidate: Node, context: ResolutionContext): { start: number; end: number } | null {
+  if (NO_NESTED_FUNCTIONS.has(candidate.language)) return null;
+  let memo = LOCAL_DECL_MEMO.get(context);
+  if (!memo) LOCAL_DECL_MEMO.set(context, (memo = new Map()));
+  const hit = memo.get(candidate.id);
+  if (hit !== undefined) return hit;
+  let scope: { start: number; end: number } | null = null;
+  if (!((candidate.language === 'lua' || candidate.language === 'luau') && !isLuaLocal(candidate, context))) {
+    for (const n of context.getNodesInFile(candidate.filePath)) {
+      if ((n.kind !== 'function' && n.kind !== 'method') || n.id === candidate.id) continue;
+      if (n.startLine > candidate.startLine || n.endLine < candidate.startLine || n.startLine === n.endLine) continue;
+      if (n.startLine === candidate.startLine && (n.startColumn ?? 0) >= (candidate.startColumn ?? 0)) continue;
+      if (!scope || n.endLine - n.startLine < scope.end - scope.start) scope = { start: n.startLine, end: n.endLine };
+    }
+    if (!scope && candidate.kind === 'field' && candidate.language === 'scala') scope = scalaBlockOf(candidate, context);
+  }
+  memo.set(candidate.id, scope);
+  return scope;
+}
+
+/** The `{ … }` block, deeper than its class body, that a Scala `val` is written in; null for a member. */
+function scalaBlockOf(candidate: Node, context: ResolutionContext): { start: number; end: number } | null {
+  const owner = candidate.qualifiedName.includes('::') ? candidate.qualifiedName.slice(0, candidate.qualifiedName.lastIndexOf('::')) : '';
+  const cls = context.getNodesInFile(candidate.filePath).find((n) =>
+    n.qualifiedName === owner && (n.kind === 'class' || n.kind === 'trait' || n.kind === 'struct' || n.kind === 'module'));
+  if (!cls || cls.startLine >= candidate.startLine) return null;
+  const lines = context.getFileLines?.(candidate.filePath) ?? context.readFile(candidate.filePath)?.split(/\r?\n/) ?? [];
+  const clean = (l: string) => l.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)'/g, '""').replace(/\/\/.*$/, '');
+  // Depth at the start of each line, counted from the class header; the body is depth 1.
+  const opens: number[] = [];
+  let depth = 0;
+  for (let line = cls.startLine; line < candidate.startLine; line++) {
+    for (const ch of clean(lines[line - 1] ?? '')) {
+      if (ch === '{') { depth++; opens.push(line); }
+      else if (ch === '}') { depth = Math.max(0, depth - 1); opens.pop(); }
+    }
+  }
+  if (depth <= 1) return null;
+  const start = opens[opens.length - 1]!;
+  let d = depth;
+  for (let line = candidate.startLine; line <= cls.endLine; line++) {
+    for (const ch of clean(lines[line - 1] ?? '')) {
+      if (ch === '{') d++;
+      else if (ch === '}' && --d < depth) return { start, end: line };
+    }
+  }
+  return { start, end: cls.endLine };
 }
 
 /** Per context: a candidate's scoping function body, or null when nothing scopes it. */
@@ -2445,7 +2512,7 @@ const GO_STD_METHODS: ReadonlySet<string> = new Set([
 const SCALA_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'trait', 'interface', 'enum', 'struct', 'module', 'namespace']);
 const SCALA_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'field', 'property', 'variable', 'constant']);
 const SCALA_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
-const SCALA_IMPORTS = new WeakMap<ResolutionContext, Map<string, { owners: Set<string>; members: Set<string> }>>();
+const SCALA_IMPORTS = new WeakMap<ResolutionContext, Map<string, { owners: Set<string>; members: Set<string>; values: Set<string> }>>();
 
 /**
  * Whether a bare Scala name can mean the member `n`, read at its site. Three
@@ -2484,7 +2551,10 @@ function isScalaMemberInScope(n: Node, ref: UnresolvedRef, context: ResolutionCo
   const imports = scalaImportsOf(ref.filePath, context);
   if (imports.owners.has(owner) || imports.members.has(`${owner}.${name}`)) return true;
   // `import builder._` brings in a VALUE's members, of a type the file doesn't say.
-  if ([...imports.owners].some((o) => /^[a-z]/.test(o))) return true;
+  if (imports.values.size > 0) return true;
+  // An imported object's inherited members: `import sttp.client4._` is
+  // `package object client4 extends SttpApi`, so `multipart(…)` is SttpApi's.
+  if (scalaImportedSupertypes(ref.filePath, imports, context).has(owner)) return true;
   const around = context
     .getNodesInFile(ref.filePath)
     .filter((t) => SCALA_TYPE_KINDS.has(t.kind) && t.startLine <= ref.line && t.endLine >= ref.line);
@@ -2564,17 +2634,40 @@ function isScalaExtensionMethod(n: Node, context: ResolutionContext): boolean {
  * `val` / `var` / `def`, a lambda or `for` parameter — or null.
  */
 function scalaLocalBinder(name: string, ref: UnresolvedRef, context: ResolutionContext): Node | null {
-  const fn = context
-    .getNodesInFile(ref.filePath)
-    .filter((f) => (f.kind === 'method' || f.kind === 'function') && f.startLine <= ref.line && f.endLine >= ref.line)
+  const nodes = context.getNodesInFile(ref.filePath);
+  const innermost = (kinds: ReadonlySet<string>) => nodes
+    .filter((f) => kinds.has(f.kind) && f.startLine <= ref.line && f.endLine >= ref.line)
     .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
-  if (!fn) return null;
+  const fn = innermost(SCALA_FUNCTION_KINDS);
+  // A test suite's body runs in its class: `test("…") { forAll { (e: E, f: A => B) => f(1) } }`.
+  const scope = fn ?? innermost(SCALA_TYPE_KINDS);
+  if (!scope) return null;
   const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split('\n') ?? [];
-  const text = lines.slice(fn.startLine - 1, ref.line).join('\n');
+  const text = lines.slice(scope.startLine - 1, ref.line).join('\n');
   const n = name.replace(/[$]/g, '\\$');
-  const binds = new RegExp(`(?:[(,\\[]\\s*(?:implicit\\s+|using\\s+)?${n}\\s*:)|(?:\\b(?:val|var|def|lazy\\s+val)\\s+${n}\\b)|(?:(?<![\\w$.])${n}\\s*(?:=>|<-))|(?:\\(\\s*${n}\\s*(?:,[^)]*)?\\)\\s*=>)`).test(text);
-  return binds ? fn : null;
+  const binder = new RegExp(`(?:[(,\\[]\\s*(?:implicit\\s+|using\\s+)?${n}\\s*:)|(?:\\b(?:val|var|def|lazy\\s+val)\\s+${n}\\b)|(?:(?<![\\w$.])${n}\\s*(?:=>|<-))|(?:\\(\\s*${n}\\s*(?:,[^)]*)?\\)\\s*=>)`, 'g');
+  if (fn) return binder.test(text) ? fn : null;
+  // In a class body, a binder counts only inside a block still open at the site —
+  // not a sibling test's `val f`, not the class's own members at its body's depth.
+  const blockAt: number[] = new Array(text.length);
+  const open: number[] = [];
+  let next = 0;
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '{') { open.push(++next); depth++; }
+    else if (ch === '}') { open.pop(); depth--; }
+    blockAt[i] = open.length > 1 ? open[open.length - 1]! : 0;
+  }
+  const live = new Set(open.slice(1));
+  for (const m of text.matchAll(binder)) {
+    const block = blockAt[m.index!] ?? 0;
+    if (block !== 0 && live.has(block)) return scope;
+  }
+  return null;
 }
+
+const SCALA_FUNCTION_KINDS: ReadonlySet<string> = new Set(['method', 'function']);
 
 /** The simple names a Scala type's declarations extend or mix in. */
 function scalaSupertypesOf(typeName: string, context: ResolutionContext): string[] {
@@ -2607,15 +2700,62 @@ function scalaSupertypesOf(typeName: string, context: ResolutionContext): string
   return names.slice(1);
 }
 
+const SCALA_IMPORTED_SUPERS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
+const SCALA_PACKAGE_OBJECTS = new WeakMap<ResolutionContext, Map<string, string[]>>();
+
+/** `package object client4 extends SttpApi with …` — the graph holds no node for one. */
+function scalaPackageObjects(context: ResolutionContext): Map<string, string[]> {
+  const hit = SCALA_PACKAGE_OBJECTS.get(context);
+  if (hit) return hit;
+  const out = new Map<string, string[]>();
+  for (const file of context.getAllFiles()) {
+    if (!file.endsWith('.scala') || (context.fileContains && !context.fileContains(file, 'package object'))) continue;
+    const source = context.readFile(file) ?? '';
+    for (const m of source.matchAll(/\bpackage\s+object\s+([\w$]+)\s+extends\s+([^{\n]+)/g)) {
+      const names = m[2]!.replace(/\[[^\]]*\]/g, '').split(/\bwith\b/).map((t) => t.trim().split('.').pop()!.replace(/\(.*$/, '').trim()).filter(Boolean);
+      out.set(m[1]!, [...(out.get(m[1]!) ?? []), ...names]);
+    }
+  }
+  SCALA_PACKAGE_OBJECTS.set(context, out);
+  return out;
+}
+
+/** Every supertype of the objects a Scala file imports wholesale (`import Obj._`). */
+function scalaImportedSupertypes(file: string, imports: { owners: Set<string> }, context: ResolutionContext): Set<string> {
+  let memo = SCALA_IMPORTED_SUPERS.get(context);
+  if (!memo) SCALA_IMPORTED_SUPERS.set(context, (memo = new Map()));
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const seen = new Set<string>();
+  // Code in `package sttp.client4` (or under it) sees `package object client4`'s members unimported.
+  const packages = [...(context.readFile(file) ?? '').matchAll(/^\s*package\s+([\w.]+)\s*$/gm)].flatMap((m) => m[1]!.split('.'));
+  const queue = [...imports.owners, ...packages];
+  const packageObjects = scalaPackageObjects(context);
+  while (queue.length > 0 && seen.size < 120) {
+    const typeName = queue.shift()!;
+    for (const sup of [...scalaSupertypesOf(typeName, context), ...(packageObjects.get(typeName) ?? [])]) {
+      if (!seen.has(sup)) { seen.add(sup); queue.push(sup); }
+    }
+  }
+  memo.set(file, seen);
+  return seen;
+}
+
 /** A Scala file's `import a.b.Obj._` / `import a.b.Obj.*` owners and `import a.b.Obj.{x, y}` / `Obj.x` members. */
-function scalaImportsOf(file: string, context: ResolutionContext): { owners: Set<string>; members: Set<string> } {
+function scalaImportsOf(file: string, context: ResolutionContext): { owners: Set<string>; members: Set<string>; values: Set<string> } {
   let memo = SCALA_IMPORTS.get(context);
   if (!memo) SCALA_IMPORTS.set(context, (memo = new Map()));
   const hit = memo.get(file);
   if (hit) return hit;
-  const found = { owners: new Set<string>(), members: new Set<string>() };
-  for (const m of (context.readFile(file) ?? '').matchAll(/^\s*import\s+([\w.]+?)\.(?:(_|\*)|\{([^}]*)\}|([\w$]+))\s*$/gm)) {
+  const found = { owners: new Set<string>(), members: new Set<string>(), values: new Set<string>() };
+  const source = context.readFile(file) ?? '';
+  for (const m of source.matchAll(/^\s*import\s+([\w.]+?)\.(?:(_|\*)|\{([^}]*)\}|([\w$]+))\s*$/gm)) {
     const owner = m[1]!.split('.').pop()!;
+    // `import builder._` — rooted at a value the file declares, whose type it doesn't say.
+    const root = m[1]!.split('.')[0]!;
+    if (/^[a-z]/.test(root) && (root === m[1] || new RegExp(`\\b(?:val|var|lazy\\s+val)\\s+${root}\\b|[(,]\\s*${root}\\s*:`).test(source))) {
+      found.values.add(owner);
+    }
     if (m[2]) found.owners.add(owner);
     else for (const member of (m[3] ?? m[4] ?? '').split(',')) {
       const id = member.trim().split(/\s*=>\s*/)[0]!;
@@ -4750,6 +4890,9 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   RUST_TRAIT_IMPL_MEMO.delete(context);
   RUST_USES.delete(context);
   LEXICAL_SCOPE_MEMO.delete(context);
+  SCALA_IMPORTED_SUPERS.delete(context);
+  SCALA_PACKAGE_OBJECTS.delete(context);
+  LOCAL_DECL_MEMO.delete(context);
   JAVA_SUPERS.delete(context);
   PHP_SUPERS.delete(context);
   DART_SUPERS.delete(context);
