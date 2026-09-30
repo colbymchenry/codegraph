@@ -1432,6 +1432,191 @@ function dartHeadOf(decl: Node, context: ResolutionContext): { supers: string[];
   };
 }
 
+const SCALA_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'trait', 'interface', 'enum', 'struct', 'module', 'namespace']);
+const SCALA_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'field', 'property', 'variable', 'constant']);
+const SCALA_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
+const SCALA_IMPORTS = new WeakMap<ResolutionContext, Map<string, { owners: Set<string>; members: Set<string> }>>();
+
+/**
+ * Whether a bare Scala name can mean the member `n`, read at its site. Three
+ * shapes:
+ * - a later link of a chain (`fa.iterator.map(f)` — the extractor keeps one
+ *   receiver level, the line still shows the dot): the receiver must be named
+ *   after `n`'s owner (`Foo.bar` on object Foo). cats's chained `.map(…)` went
+ *   to a lazy-list ops class's `map` 186 times;
+ * - a name the enclosing definition binds — a parameter `f: A => B`, a
+ *   `val` — is that local: `f(true)` is not a case class's field `f` (396);
+ * - otherwise a member of the types around it or their `extends` / `with`
+ *   supertypes, of a companion, of the same file, or of an object the file
+ *   imports (`import Foo._`, `import Foo.{bar}`).
+ */
+function isScalaMemberInScope(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return true;
+  const name = ref.referenceName;
+  const at = new RegExp(`(?<![\\w$])${name.replace(/[$]/g, '\\$')}\\b`).exec(line);
+  if (!at) return true;
+  const before = line.slice(0, at.index);
+  if (/\.\s*$/.test(before)) {
+    // A later link of a chain: a member of what the receiver is named after,
+    // never a package object's function — unless it is an `extension` method.
+    if (n.filePath === ref.filePath) return true;
+    if (!SCALA_MEMBER_KINDS.has(n.kind)) return n.kind !== 'function' || isScalaExtensionMethod(n, context);
+    const receiver = scalaReceiverName(before);
+    return receiver !== '' && sharesReceiverWord(receiver, n);
+  }
+  const local = scalaLocalBinder(name, ref, context);
+  if (local) return n.filePath === ref.filePath && n.startLine >= local.startLine && n.endLine <= local.endLine;
+  if (!SCALA_MEMBER_KINDS.has(n.kind)) return true;
+  const cut = n.qualifiedName.lastIndexOf('::');
+  if (cut < 0 || n.filePath === ref.filePath) return true;
+  const owner = n.qualifiedName.slice(0, cut).split('::').pop()!;
+  const imports = scalaImportsOf(ref.filePath, context);
+  if (imports.owners.has(owner) || imports.members.has(`${owner}.${name}`)) return true;
+  // `import builder._` brings in a VALUE's members, of a type the file doesn't say.
+  if ([...imports.owners].some((o) => /^[a-z]/.test(o))) return true;
+  const around = context
+    .getNodesInFile(ref.filePath)
+    .filter((t) => SCALA_TYPE_KINDS.has(t.kind) && t.startLine <= ref.line && t.endLine >= ref.line);
+  if (around.length === 0) return true;
+  const seen = new Set<string>();
+  const queue = [...around.map((t) => t.name), ...scalaAnonymousBases(ref, context)];
+  while (queue.length > 0 && seen.size < 60) {
+    const typeName = queue.shift()!;
+    if (seen.has(typeName)) continue;
+    seen.add(typeName);
+    if (typeName === owner) return true;
+    queue.push(...scalaSupertypesOf(typeName, context));
+  }
+  return false;
+}
+
+/**
+ * The types an anonymous class around a Scala site instantiates — `new
+ * scopt.OptionParser[Config]("scopt") { head("scopt") }` puts OptionParser's
+ * members in scope. Read backwards over the open braces above the site.
+ */
+function scalaAnonymousBases(ref: UnresolvedRef, context: ResolutionContext): string[] {
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split('\n') ?? [];
+  const bases: string[] = [];
+  let depth = 0;
+  for (let i = ref.line - 1; i >= 0 && i >= ref.line - 400; i--) {
+    const text = lines[i]!;
+    for (let c = text.length - 1; c >= 0; c--) {
+      if (text[c] === '}') depth++;
+      else if (text[c] === '{') {
+        if (depth > 0) { depth--; continue; }
+        const head = /\bnew\s+([\w.]+(?:\s*\[[^\]]*\])?(?:\s*\([^)]*\))?(?:\s+with\s+[\w.]+(?:\s*\[[^\]]*\])?)*)\s*$/.exec(text.slice(0, c));
+        if (head) for (const m of head[1]!.replace(/\[[^\]]*\]|\([^)]*\)/g, '').split(/\s+with\s+/)) bases.push(m.trim().split('.').pop()!);
+      }
+    }
+  }
+  return bases;
+}
+
+/**
+ * The receiver a Scala `….name` is written on, as its dotted identifiers with
+ * call and type arguments dropped: `proc("bash").call()` → `proc`,
+ * `Alternative[List].unite` → `Alternative`, `checker.value.onWrite` →
+ * `checker.value`. Read backwards to the expression's start.
+ */
+function scalaReceiverName(before: string): string {
+  const text = before.replace(/\s*\.\s*$/, '');
+  let out = '';
+  let i = text.length - 1;
+  while (i >= 0) {
+    const ch = text[i]!;
+    if (ch === ')' || ch === ']') {
+      const open = ch === ')' ? '(' : '[';
+      let depth = 0;
+      for (; i >= 0; i--) {
+        if (text[i] === ch) depth++;
+        else if (text[i] === open && --depth === 0) break;
+      }
+      if (i < 0) return '';
+      i--;
+    } else if (/[\w$.]/.test(ch)) {
+      out = ch + out;
+      i--;
+    } else break;
+  }
+  return out.replace(/^\.+|\.+$/g, '');
+}
+
+/** Whether a Scala function is declared in an `extension (…)` block. */
+function isScalaExtensionMethod(n: Node, context: ResolutionContext): boolean {
+  const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split('\n') ?? [];
+  return lines.slice(Math.max(0, n.startLine - 4), n.startLine).some((l) => /^\s*extension\b/.test(l));
+}
+
+/**
+ * The definition around a Scala site that binds `name` itself — a parameter, a
+ * `val` / `var` / `def`, a lambda or `for` parameter — or null.
+ */
+function scalaLocalBinder(name: string, ref: UnresolvedRef, context: ResolutionContext): Node | null {
+  const fn = context
+    .getNodesInFile(ref.filePath)
+    .filter((f) => (f.kind === 'method' || f.kind === 'function') && f.startLine <= ref.line && f.endLine >= ref.line)
+    .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
+  if (!fn) return null;
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split('\n') ?? [];
+  const text = lines.slice(fn.startLine - 1, ref.line).join('\n');
+  const n = name.replace(/[$]/g, '\\$');
+  const binds = new RegExp(`(?:[(,\\[]\\s*(?:implicit\\s+|using\\s+)?${n}\\s*:)|(?:\\b(?:val|var|def|lazy\\s+val)\\s+${n}\\b)|(?:(?<![\\w$.])${n}\\s*(?:=>|<-))|(?:\\(\\s*${n}\\s*(?:,[^)]*)?\\)\\s*=>)`).test(text);
+  return binds ? fn : null;
+}
+
+/** The simple names a Scala type's declarations extend or mix in. */
+function scalaSupertypesOf(typeName: string, context: ResolutionContext): string[] {
+  let memo = SCALA_SUPERS.get(context);
+  if (!memo) SCALA_SUPERS.set(context, (memo = new Map()));
+  const hit = memo.get(typeName);
+  if (hit) return hit;
+  const names: string[] = [typeName];
+  for (const decl of context.getNodesByName(typeName)) {
+    if (decl.language !== 'scala' || !SCALA_TYPE_KINDS.has(decl.kind)) continue;
+    const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+    const text = lines.slice(decl.startLine - 1, decl.startLine + 12).join(' ');
+    let depth = 0;
+    let flat = '';
+    for (const ch of text) {
+      if (ch === '[' || ch === '(') depth++;
+      else if (ch === ']' || ch === ')') depth = Math.max(0, depth - 1);
+      else if (depth === 0) {
+        if (ch === '{' || ch === '=') break;
+        flat += ch;
+      }
+    }
+    const clause = /\bextends\b(.*)$/.exec(flat)?.[1] ?? '';
+    for (const m of clause.matchAll(/([A-Za-z_][\w.]*)/g)) {
+      const simple = m[1]!.split('.').pop()!;
+      if (simple !== 'with' && simple !== 'derives' && simple !== typeName) names.push(simple);
+    }
+  }
+  memo.set(typeName, names.slice(1));
+  return names.slice(1);
+}
+
+/** A Scala file's `import a.b.Obj._` / `import a.b.Obj.*` owners and `import a.b.Obj.{x, y}` / `Obj.x` members. */
+function scalaImportsOf(file: string, context: ResolutionContext): { owners: Set<string>; members: Set<string> } {
+  let memo = SCALA_IMPORTS.get(context);
+  if (!memo) SCALA_IMPORTS.set(context, (memo = new Map()));
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const found = { owners: new Set<string>(), members: new Set<string>() };
+  for (const m of (context.readFile(file) ?? '').matchAll(/^\s*import\s+([\w.]+?)\.(?:(_|\*)|\{([^}]*)\}|([\w$]+))\s*$/gm)) {
+    const owner = m[1]!.split('.').pop()!;
+    if (m[2]) found.owners.add(owner);
+    else for (const member of (m[3] ?? m[4] ?? '').split(',')) {
+      const id = member.trim().split(/\s*=>\s*/)[0]!;
+      if (id === '_' || id === '*') found.owners.add(owner);
+      else if (id) found.members.add(`${owner}.${id}`);
+    }
+  }
+  memo.set(file, found);
+  return found;
+}
+
 const CSHARP_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'enum', 'struct', 'record']);
 const CSHARP_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'field', 'enum_member', 'constant', 'event']);
 const CSHARP_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
@@ -2391,8 +2576,10 @@ export function matchByExactName(
   const objcShape = ref.language === 'objc' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*:*(?:\w+:)*$/.test(ref.referenceName)
     ? objcCallShape(ref, context) : null;
   const csharpBare = ref.language === 'csharp' && (ref.referenceKind === 'calls' || ref.referenceKind === 'references') && /^[A-Za-z_]\w*$/.test(ref.referenceName);
+  const scalaBare = ref.language === 'scala' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const phpSelf = phpSelfReceiver(ref, context);
   const filtered = sameName.filter((n) =>
+    !(scalaBare && !isScalaMemberInScope(n, ref, context)) &&
     !(csharpBare && !isCsharpMemberInScope(n, ref, context)) &&
     !(objcShape === 'c-call' && OBJC_MEMBER_KINDS.has(n.kind)) &&
     !(objcShape === 'self-send' && !isObjcSelfSendTarget(n, ref, context)) &&
@@ -3520,6 +3707,8 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   OBJC_SUPERS.delete(context);
   CSHARP_SUPERS.delete(context);
   CSHARP_STATIC_USINGS.delete(context);
+  SCALA_SUPERS.delete(context);
+  SCALA_IMPORTS.delete(context);
   LUA_LOCALS.delete(context);
   PHP_FILE_SCOPES.delete(context);
   JAVA_STATIC_IMPORTS.delete(context);
@@ -5552,6 +5741,7 @@ export function matchFuzzy(
   const objcShape = ref.language === 'objc' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*:*(?:\w+:)*$/.test(ref.referenceName)
     ? objcCallShape(ref, context) : null;
   const csharpBare = ref.language === 'csharp' && (ref.referenceKind === 'calls' || ref.referenceKind === 'references') && /^[A-Za-z_]\w*$/.test(ref.referenceName);
+  const scalaBare = ref.language === 'scala' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const phpSelf = phpSelfReceiver(ref, context);
   // Names are case-sensitive in every language but a handful: Rust's
   // `Bytes` is not the method `bytes`, Python's builtin `dir(…)` not a class
@@ -5574,6 +5764,7 @@ export function matchFuzzy(
     !(objcShape === 'c-call' && OBJC_MEMBER_KINDS.has(n.kind)) &&
     !(objcShape === 'self-send' && !isObjcSelfSendTarget(n, ref, context)) &&
     !(csharpBare && !isCsharpMemberInScope(n, ref, context)) &&
+    !(scalaBare && !isScalaMemberInScope(n, ref, context)) &&
     !(phpSelf && (n.kind !== 'method' || !isPhpMethodInScope(n, ref, phpSelf, context))))
     .filter((n) => (ref.referenceKind !== 'references' && ref.referenceKind !== 'function_ref') ||
       sameLanguageFamily(n.language, ref.language));
