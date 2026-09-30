@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- A link made by a framework or bridge resolver now records which one made it (`metadata.framework`, such as `swift-objc-bridge` or `react-native-bridge`), as the README describes. Before, only synthesized event and view channels were named.
 - ASP.NET apps built with FastEndpoints now have their routes: each endpoint class's `Get(…)` / `Post(…)` in `Configure()` becomes a route linked to its own `HandleAsync` / `ExecuteAsync`, including paths kept in a request class's `Route` constant. ardalis/CleanArchitecture went from no routes to 24. Minimal API routes written without a leading slash (`app.MapGet("api/todos", …)`) are now named `/api/todos`.
 - Vapor routes whose handler is a trailing closure (`app.get("hello") { req in … }`), WebSocket routes (`app.webSocket("chat") { … }`) and `routes.on(.POST, "x", use: handler)` registrations are now found. Only routes with a `use:` handler were read before: the Swift Package Index server went from 13 routes to 34, and a WebSocket-only chat server from none to one.
 - Play projects kept in subdirectories are recognized, so each one's `conf/routes` is read. A repository with no Play build at its root, like playframework's samples, went from no routes to over 130.
