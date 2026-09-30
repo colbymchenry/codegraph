@@ -1431,6 +1431,57 @@ function dartHeadOf(decl: Node, context: ResolutionContext): { supers: string[];
   };
 }
 
+const KOTLIN_FILE_SCOPES = new WeakMap<ResolutionContext, Map<string, { pkg: string; imports: Set<string>; stars: Set<string> }>>();
+/** Packages every Kotlin file imports without writing it. */
+const KOTLIN_DEFAULT_IMPORTS: ReadonlySet<string> = new Set([
+  'kotlin', 'kotlin.annotation', 'kotlin.collections', 'kotlin.comparisons', 'kotlin.io', 'kotlin.ranges',
+  'kotlin.sequences', 'kotlin.text', 'kotlin.jvm', 'java.lang', 'kotlin.js',
+]);
+const KOTLIN_ENCLOSING_KINDS: ReadonlySet<string> = new Set([
+  'class', 'interface', 'enum', 'struct', 'trait', 'protocol', 'module', 'namespace', 'function', 'method',
+]);
+
+/** A Kotlin file's `package` and the names and packages its `import`s bring in. */
+function kotlinFileScope(file: string, context: ResolutionContext): { pkg: string; imports: Set<string>; stars: Set<string> } {
+  let memo = KOTLIN_FILE_SCOPES.get(context);
+  if (!memo) KOTLIN_FILE_SCOPES.set(context, (memo = new Map()));
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const text = (context.readFile(file) ?? '').replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/`/g, '');
+  const pkg = /^\s*package\s+([\w.]+)/m.exec(text)?.[1] ?? '';
+  const imports = new Set<string>();
+  const stars = new Set<string>();
+  for (const m of text.matchAll(/^\s*import\s+([\w.]+?)(\.\*)?(?:\s+as\s+\w+)?\s*;?\s*(?:\/\/.*)?$/gm)) {
+    if (m[2]) stars.add(m[1]!);
+    else imports.add(m[1]!);
+  }
+  const scope = { pkg, imports, stars };
+  memo.set(file, scope);
+  return scope;
+}
+
+/**
+ * Whether a top-level Kotlin declaration — a function, an extension function
+ * (indexed under its receiver type, `JdbcTransaction::assertEquals`), a
+ * property — can be named from the file a call is written in: its own
+ * package, an `import` of it, or a star import of its package. A member of a
+ * class is not judged here; a lambda's receiver can put any type's members in
+ * scope. Exposed's tests call `assertEquals(…)` from kotlin.test and JUnit, or
+ * import the JDBC suite's extension; the calls went to the R2DBC suite's
+ * extension 3,075 times.
+ */
+function isKotlinTopLevelVisible(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (n.language !== 'kotlin' || n.filePath === ref.filePath) return true;
+  const enclosed = context
+    .getNodesInFile(n.filePath)
+    .some((o) => o.id !== n.id && KOTLIN_ENCLOSING_KINDS.has(o.kind) && o.startLine <= n.startLine && o.endLine >= n.endLine &&
+      (o.startLine < n.startLine || o.endLine > n.endLine));
+  if (enclosed) return true;
+  const pkg = kotlinFileScope(n.filePath, context).pkg;
+  const here = kotlinFileScope(ref.filePath, context);
+  return pkg === here.pkg || here.stars.has(pkg) || here.imports.has(pkg ? `${pkg}.${n.name}` : n.name) || KOTLIN_DEFAULT_IMPORTS.has(pkg);
+}
+
 const PHP_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'trait', 'interface', 'enum']);
 const PHP_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
 
@@ -1859,9 +1910,11 @@ export function matchByExactName(
   const pythonShape = pythonCallShape(ref, context);
   const javaBare = ref.language === 'java' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const dartBare = ref.language === 'dart' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName) && isReceiverLessDartCall(ref, context);
+  const kotlinCall = ref.language === 'kotlin' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const phpSelf = phpSelfReceiver(ref, context);
   const filtered = sameName.filter((n) =>
     !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)) &&
+    !(kotlinCall && !isKotlinTopLevelVisible(n, ref, context)) &&
     !(dartBare && isDartMember(n) && !isDartMethodInScope(n, ref, context)) &&
     !(phpSelf && (n.kind !== 'method' || !isPhpMethodInScope(n, ref, phpSelf, context))) &&
     !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)) &&
@@ -2975,6 +3028,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   PHP_SUPERS.delete(context);
   DART_SUPERS.delete(context);
   DART_HIERARCHIES.delete(context);
+  KOTLIN_FILE_SCOPES.delete(context);
   LUA_LOCALS.delete(context);
   PHP_FILE_SCOPES.delete(context);
   JAVA_STATIC_IMPORTS.delete(context);
@@ -4929,6 +4983,7 @@ export function matchFuzzy(
   const pythonShape = pythonCallShape(ref, context);
   const javaBare = ref.language === 'java' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const dartBare = ref.language === 'dart' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName) && isReceiverLessDartCall(ref, context);
+  const kotlinCall = ref.language === 'kotlin' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const phpSelf = phpSelfReceiver(ref, context);
   // Names are case-sensitive in every language but a handful: Rust's
   // `Bytes` is not the method `bytes`, Python's builtin `dir(…)` not a class
@@ -4944,6 +4999,7 @@ export function matchFuzzy(
     !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)) &&
     !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)) &&
     !(dartBare && isDartMember(n) && !isDartMethodInScope(n, ref, context)) &&
+    !(kotlinCall && !isKotlinTopLevelVisible(n, ref, context)) &&
     !(phpSelf && (n.kind !== 'method' || !isPhpMethodInScope(n, ref, phpSelf, context))))
     .filter((n) => (ref.referenceKind !== 'references' && ref.referenceKind !== 'function_ref') ||
       sameLanguageFamily(n.language, ref.language));
