@@ -1093,9 +1093,16 @@ describe.runIf(CodeGraph.isInitialized(path.resolve(__dirname, '..')))(
 
       await repoGet(`/api/node/${hit.id}`); // warm
 
-      const started = performance.now();
-      const res = await repoGet(`/api/node/${hit.id}`);
-      const elapsed = performance.now() - started;
+      // The fastest of a few requests: one sample, taken while the rest of the
+      // suite runs in parallel, measured the machine's load (250–430 ms) as
+      // often as the endpoint. A real slowdown is slow on every request.
+      let res!: Response;
+      let elapsed = Infinity;
+      for (let i = 0; i < 5; i++) {
+        const started = performance.now();
+        res = await repoGet(`/api/node/${hit.id}`);
+        elapsed = Math.min(elapsed, performance.now() - started);
+      }
 
       expect(res.status).toBe(200);
       const body = JSON.parse(res.body);
