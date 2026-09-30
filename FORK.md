@@ -41,6 +41,8 @@ Indexers are never auto-installed:
 |---|---|---|
 | TS/JS | `npm i -g @sourcegraph/scip-typescript` | `tsconfig.json`, `jsconfig.json`, `package.json` |
 | Python | `npm i -g @sourcegraph/scip-python` | `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt` |
+| Go | `go install github.com/scip-code/scip-go/cmd/scip-go@latest` (packages must build) | `go.mod` |
+| Rust | `rustup component add rust-analyzer` (uses its `scip` subcommand; needs `cargo`) | `Cargo.toml` |
 
 To run one through `npx` instead, put this in `codegraph.json`:
 
@@ -56,7 +58,7 @@ After a project opts in with `scip index`, the MCP server (and anything else tha
 
 ## How edges are decided
 
-Call sites are keyed by (caller node, line, callee name, kind), as in the POC.
+Call sites are keyed by (caller node, line, callee name, kind), as in the POC. The caller comes from **codegraph's own node spans**, not SCIP's ranges. That is the narrowest enclosing function or method, unless a class defined inside it is narrower. Failing that it is the narrowest enclosing class, struct, variable or constant node, and failing that the file. This is the same caller codegraph's extractors record, so decorators belong to the class, calls in a local class body to that class, and top-level code to the file. An earlier version used SCIP's definition ranges, which include decorators. It disagreed with the heuristic's caller on thousands of Django sites and produced parallel edges.
 
 | case | action |
 |---|---|
@@ -72,7 +74,7 @@ Differences from the POC:
 
 - A target that the index *defines* but that has no codegraph node (or sits in a stale document) is **unknown**, not external. It never deletes a heuristic edge.
 - Callable-ness comes from the mapped node kind, not the symbol suffix. This lets TS `const f = () => …` count.
-- `new X()` (TS, via scip-typescript's `` `<constructor>` `` symbol) and Python's `X()` (a class symbol followed by `(`) → `instantiates`, matching codegraph's own edge kind.
+- `new X()` (TS, via scip-typescript's `` `<constructor>` `` symbol) and Python's `X()` (a class symbol followed by `(`) → `instantiates`, matching codegraph's own edge kind. So are Go composite literals (`&X{…}`, `X[T]{…}`) and Rust struct literals (`X { … }`). Go excludes slice/map element types and return types before a body. Rust excludes `impl`/`where` headers, `-> X {`, and destructuring patterns.
 - Protobuf is decoded by a ~250-line reader (`src/scip/reader.ts`) instead of `@bufbuild/protobuf` plus codegen. The fork adds no runtime dependency. It accepts both the legacy `int32` ranges and the typed ranges.
 
 MCP output: Flow steps read `↓ calls (compiler-verified)` or `(unverified: …)`. Trail entries get ` [unverified]`.
@@ -89,16 +91,30 @@ Pass bar per language (2 seeds × 50 random targets): precision ≥ 95%, recall 
 |---|---|---|---|---|---|---|
 | TS | codegraph v1.6.1 `src/` (250 docs) | 1 | 100% / 44% | 90% / 100% | **100% / 100%** | 7.5 s + 0.5 s |
 | TS | same | 2 | 100% / 56% | 90% / 100% | **100% / 100%** | |
-| Python | Django (`bench-corpus/arm_grep` @ 026b005, 2,928 docs, no venv) | 1 | 99% / 10% | 78% / 82% | **100% / 100%** | 98.5 s + 3.1 s |
+| Python | Django (`bench-corpus/arm_grep` @ 026b005, 2,928 docs, no venv) | 1 | 99% / 10% | 78% / 82% | **100% / 100%** | 98.5 s + 3.6 s |
 | Python | same | 2 | 100% / 24% | 75% / 96% | **100% / 100%** | |
+| Go | spf13/cobra @ adbc881 (37 docs) | 1 | 100% / 87% | 100% / 99% | **100% / 100%** | 6.5 s + 0.2 s |
+| Go | same | 2 | 100% / 98% | 100% / 99% | **100% / 100%** | |
+| Rust | BurntSushi/ripgrep @ 3fce3b5 (104 docs) | 1 | 100% / 7% | 37% / 83% | **100% / 99%** | 12.6 s + 1.0 s |
+| Rust | same | 2 | 100% / 22% | 20% / 73% | **100% / 99%** | |
 
-On codegraph's own `src/`, the merge verified 6,826 edges, removed 102 wrong ones and added 832 missing ones. On Django it verified 46,577, removed 11,426 wrong ones and added 22,476, of which 8,929 were `instantiates`. After the merge `django.urls.base.reverse` has 1,267 caller edges from 867 distinct callers, up from 1, matching the POC.
+Indexers used: scip-typescript 0.4.0, scip-python 0.6.6, scip-go 0.2.7, rust-analyzer 2026-09-28. Flags: `--rg-type py --prefix django/`, `--rg-type go`, `--rg-type rust`.
 
-`--rg-type py --prefix django/` for Python.
+| corpus | heuristic edges verified | wrong removed | missing added | left unverified |
+|---|---|---|---|---|
+| codegraph `src/` | 8,417 | 127 | 647 | 1,389 |
+| Django | 53,139 | 12,035 | 23,904 | 33,601 |
+| cobra | 2,637 | 160 | 1 | 48 |
+| ripgrep | 4,447 | 1,080 | 5,964 | 2,442 |
+
+After the merge, `django.urls.base.reverse` has 1,267 caller edges from 867 distinct callers, up from 1, matching the POC. On cobra, the removed edges are the heuristic linking `buf.String()` / `bv.String()` to a test type's `String`, and pflag's `FlagSet.HasFlags` to `Command.HasFlags`. On ripgrep they include `Vec::new()` → a project `new` and `.push()` → a project `push`.
+
+Known residue: ripgrep's multi-line `const X: T = T { … }` items. codegraph attributes their calls to a variable node whose span is one line, so 18 sites get a parallel file-level SCIP edge. Rust tests defined through macros (`rgtest!(name, |…| {…})`) have no function node, so their calls are attributed to the file. This matches codegraph's convention for top-level code; the heuristic has no edges there at all.
 
 ## Status
 
 - Phase 0 (fork setup): done, except the release script (see the job report).
 - Phase 1 (core + TS/JS): done.
 - Phase 2 (Python): done.
-- Next: Go (Phase 3, scip-go, eval on spf13/cobra), Rust (Phase 4), then `implements`/`extends`/`references`.
+- Phase 3 (Go) and Phase 4 (Rust): done.
+- Next: Phase 5, `implements`/`extends` from SCIP relationships, and `references`.

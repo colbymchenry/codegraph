@@ -18,7 +18,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { PROJECT_CONFIG_FILENAME } from '../../project-config';
 import type { ScipLanguage } from '../store';
+import { goIndexer } from './go';
 import { pythonIndexer } from './python';
+import { rustIndexer } from './rust';
 import { typescriptIndexer } from './typescript';
 
 /** How to run an indexer for one project. */
@@ -47,6 +49,8 @@ export interface IndexerOverride {
 export const INDEXERS: Partial<Record<ScipLanguage, IndexerSpec>> = {
   typescript: typescriptIndexer,
   python: pythonIndexer,
+  go: goIndexer,
+  rust: rustIndexer,
 };
 
 /** Tool name in an index's metadata → the language it covers (for `scip import`). */

@@ -22,3 +22,20 @@ class Service:
 
     def step(self) -> int:
         return helper(1)
+
+
+def register(name: str):
+    def wrap(fn):
+        return fn
+    return wrap
+
+
+class Registry:
+    @register("build")
+    def build(self) -> int:
+        return helper(5)
+
+    def nested(self) -> int:
+        class Local:
+            size = helper(6)
+        return Local.size

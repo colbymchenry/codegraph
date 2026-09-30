@@ -10,7 +10,7 @@
 
 import type { SqliteDatabase } from '../db/sqlite-adapter';
 import {
-  POSITION_ENCODING_UTF8, ROLE_DEFINITION, ScipDocument, ScipOccurrence, Span,
+  POSITION_ENCODING_UTF8, ROLE_DEFINITION, ScipDocument, ScipOccurrence,
   parseSymbol, spanContains, spanSize,
 } from './reader';
 
@@ -75,21 +75,118 @@ class NodeMap {
   }
 }
 
+/**
+ * Non-callable nodes codegraph uses as the caller of code that runs outside any
+ * function — class bodies, initializers, top-level statements. These are the
+ * non-callable source kinds its own call edges carry; with none enclosing a
+ * call, the file node is the caller.
+ */
+const CONTAINER_KINDS = ['class', 'struct', 'constant', 'variable', 'component', 'field', 'property'] as const;
+
+interface SpanRow { id: string; kind: string; start_line: number; end_line: number; start_column: number; end_column: number }
+
+/**
+ * Who calls from a given position — decided from codegraph's OWN node spans,
+ * not SCIP's ranges, so both sides key a call site by the same caller. (SCIP's
+ * definition range includes decorators; codegraph's function node starts at
+ * `def`, so a decorator call belongs to the enclosing class or file. And a
+ * callback codegraph extracted as a function has no SCIP definition at all.)
+ * Precedence: narrowest function/method — unless a container nested inside it
+ * (a class defined in a method) is narrower — else narrowest container, else file.
+ */
+class Callers {
+  private byFile = new Map<string, { callables: SpanRow[]; containers: SpanRow[]; file: string | null }>();
+
+  constructor(db: SqliteDatabase, files: Iterable<string>) {
+    const kinds = [...CALLABLE_KINDS, ...CONTAINER_KINDS, 'file'];
+    const stmt = db.prepare(
+      `SELECT id, kind, start_line, end_line, start_column, end_column FROM nodes
+       WHERE file_path = ? AND kind IN (${kinds.map(() => '?').join(',')})`
+    );
+    for (const f of files) {
+      const rows = stmt.all(f, ...kinds) as SpanRow[];
+      this.byFile.set(f, {
+        callables: rows.filter(r => (CALLABLE_KINDS as readonly string[]).includes(r.kind)),
+        containers: rows.filter(r => (CONTAINER_KINDS as readonly string[]).includes(r.kind)),
+        file: rows.find(r => r.kind === 'file')?.id ?? null,
+      });
+    }
+  }
+
+  /** Caller at 0-based `line0`/`col`, or null when the file has no nodes at all. */
+  at(file: string, line0: number, col: number): { id: string; inFunction: boolean } | null {
+    const entry = this.byFile.get(file);
+    if (!entry) return null;
+    const narrowest = (rows: SpanRow[]) => {
+      let best: SpanRow | null = null;
+      let bestSize = Infinity;
+      for (const n of rows) {
+        const span = { startLine: n.start_line - 1, startCol: n.start_column, endLine: n.end_line - 1, endCol: n.end_column };
+        if (!spanContains(span, line0, col)) continue;
+        const size = spanSize(span);
+        if (size < bestSize) [best, bestSize] = [n, size];
+      }
+      return best;
+    };
+    const fn = narrowest(entry.callables);
+    const holder = narrowest(entry.containers);
+    // A container nested INSIDE the function (a class defined in a method) is the caller of its own body.
+    if (fn && !(holder && holder.start_line >= fn.start_line && holder.end_line <= fn.end_line)) return { id: fn.id, inFunction: true };
+    const id = holder?.id ?? entry.file;
+    return id ? { id, inFunction: false } : null;
+  }
+}
+
 /** Text after the callee name opens an argument list: `(`, `?.(`, or TS type arguments `<…>(`. */
 export function looksLikeCall(tail: string): boolean {
   let t = tail.trimStart();
   if (t.startsWith('?.')) t = t.slice(2).trimStart();
-  if (t.startsWith('<')) {
-    let depth = 0;
-    let i = 0;
-    for (; i < t.length; i++) {
-      if (t[i] === '<') depth++;
-      else if (t[i] === '>' && --depth === 0) break;
-    }
-    if (depth !== 0 && i >= t.length) return false;
-    t = t.slice(i + 1).trimStart();
+  return skipGroup(t, '<', '>')?.startsWith('(') ?? false;
+}
+
+/** Strips one balanced `open…close` group (type arguments) from the start of `t`; null when it never closes. */
+function skipGroup(t: string, open: string, close: string): string | null {
+  if (!t.startsWith(open)) return t;
+  let depth = 0;
+  for (let i = 0; i < t.length; i++) {
+    if (t[i] === open) depth++;
+    else if (t[i] === close && --depth === 0) return t.slice(i + 1).trimStart();
   }
-  return t.startsWith('(');
+  return null;
+}
+
+/**
+ * Languages that construct values with `Type{…}` literals rather than a call.
+ * Each takes the text after and before a type reference and says whether the
+ * brace that follows builds that type. The false friends are braces that
+ * open a block right after a type: a return type before a function body, an
+ * element type of a slice/map literal, an `impl` header.
+ */
+const LITERAL_SHAPES: Record<string, (tail: string, head: string) => boolean> = {
+  go: (tail, head) => {
+    const t = skipGroup(tail.trimStart(), '[', ']'); // generic instantiation: Box[int]{…}
+    if (!t?.startsWith('{')) return false;
+    // `[]T{`, `map[K]T{`, `[]*T{` build the container; `) T {` / `) *T {` is a return type before a body.
+    return !/[\])]\s*\**$/.test(head.trimEnd());
+  },
+  rust: (tail, head) => {
+    let t: string | null = tail.trimStart();
+    if (t.startsWith('::')) t = t.slice(2).trimStart(); // turbofish: Foo::<T> { … }
+    t = skipGroup(t, '<', '>');
+    if (!t?.startsWith('{')) return false;
+    // A type before a block: `-> Foo {`, `impl Foo {`, `impl T for Foo {`, `where T: Foo {`.
+    if (/(->|\bimpl\b[^{};]*|\bwhere\b[^{};]*)\s*[&'\w\s]*$/.test(head)) return false;
+    // A pattern, not a construction: `let Foo { a } = x`, `Foo { .. } =>`, `Foo { a }: Foo`.
+    if (/\blet\s+(mut\s+)?$/.test(head)) return false;
+    const after = skipGroup(t, '{', '}');
+    return after === null || !/^(=>|=(?!=)|:(?!:)|\|)/.test(after);
+  },
+};
+
+/** Language of a SCIP document, from its path — indexers don't reliably fill `Document.language`. */
+function literalShapeFor(relativePath: string): ((tail: string, head: string) => boolean) | undefined {
+  const ext = relativePath.slice(relativePath.lastIndexOf('.') + 1);
+  return LITERAL_SHAPES[{ go: 'go', rs: 'rust' }[ext] ?? ''];
 }
 
 /** Maps a SCIP column to a JS string offset in `line`. */
@@ -117,13 +214,11 @@ export function scipSites(db: SqliteDatabase, docs: ScipDocument[], fresh: Map<s
   const nodes = new NodeMap(db, fresh.keys());
   const symToNode = new Map<string, NodeRow>();
   const projectSymbols = new Set<string>();
-  const owners = new Map<string, Array<{ span: Span; id: string }>>();
   const sources: DocSource[] = [];
 
   // Pass 1: definitions → nodes, across all docs so cross-file targets resolve.
   for (const doc of docs) {
     const lines = fresh.get(doc.relativePath);
-    const encl: Array<{ span: Span; id: string }> = [];
     for (const o of doc.occurrences) {
       if (!(o.roles & ROLE_DEFINITION)) continue;
       const parsed = parseSymbol(o.symbol);
@@ -141,37 +236,25 @@ export function scipSites(db: SqliteDatabase, docs: ScipDocument[], fresh: Map<s
       }
       symToNode.set(o.symbol, node);
       bump('def_mapped');
-      if (callable) {
-        const span = o.enclosingRange ?? { startLine: node.start_line - 1, startCol: 0, endLine: node.end_line - 1, endCol: Number.MAX_SAFE_INTEGER };
-        encl.push({ span, id: node.id });
-      }
     }
-    if (lines) {
-      owners.set(doc.relativePath, encl);
-      sources.push({ doc, lines });
-    }
+    if (lines) sources.push({ doc, lines });
   }
 
   const sites = new Map<string, Map<string, SiteTarget>>();
   const unknown = new Set<string>();
 
-  // Pass 2: references that are calls, attributed to the narrowest enclosing callable.
+  // Pass 2: references that are calls, attributed to the caller codegraph would name (see Callers).
+  const callers = new Callers(db, fresh.keys());
   for (const { doc, lines } of sources) {
-    const encl = owners.get(doc.relativePath) ?? [];
     for (const o of doc.occurrences) {
       if (o.roles & ROLE_DEFINITION) continue;
-      const call = classify(o, lines, doc.positionEncoding, symToNode);
+      const call = classify(o, doc, lines, symToNode);
       if (!call) continue;
       const { startLine, startCol } = o.range;
-      let owner: { span: Span; id: string } | null = null;
-      for (const e of encl) {
-        if (spanContains(e.span, startLine, startCol) && (!owner || spanSize(e.span) < spanSize(owner.span))) owner = e;
-      }
-      if (!owner) {
-        bump('call_module_level');
-        continue;
-      }
-      const key = siteKey(owner.id, startLine + 1, call.name, call.kind);
+      const caller = callers.at(doc.relativePath, startLine, startCol);
+      if (!caller) continue;
+      if (!caller.inFunction) bump('call_outside_functions');
+      const key = siteKey(caller.id, startLine + 1, call.name, call.kind);
       if (call.target === null) {
         if (projectSymbols.has(call.symbol)) {
           unknown.add(key);
@@ -210,23 +293,30 @@ interface Call {
 /**
  * How the source text around an occurrence reads: `'call'` when an argument
  * list follows it, `'new'` when only a `new` keyword precedes it (`new Foo`),
- * null otherwise (a callback passed by name, a type annotation, …).
+ * `'literal'` for a Go/Rust `Type{…}` value, null otherwise (a callback passed
+ * by name, a type annotation, …).
  */
-export function callShape(o: ScipOccurrence, lines: string[], encoding: number): 'call' | 'new' | null {
+export function callShape(
+  o: ScipOccurrence, doc: Pick<ScipDocument, 'relativePath' | 'positionEncoding'>, lines: string[]
+): 'call' | 'new' | 'literal' | null {
+  const encoding = doc.positionEncoding;
   const { startLine, startCol, endLine, endCol } = o.range;
   const endText = lines[endLine];
   if (endText === undefined) return null;
-  if (looksLikeCall(endText.slice(toStringOffset(endText, endCol, encoding)))) return 'call';
+  const tail = endText.slice(toStringOffset(endText, endCol, encoding));
+  if (looksLikeCall(tail)) return 'call';
   const startText = lines[startLine] ?? '';
-  return /\bnew\s+$/.test(startText.slice(0, toStringOffset(startText, startCol, encoding))) ? 'new' : null;
+  const head = startText.slice(0, toStringOffset(startText, startCol, encoding));
+  if (/\bnew\s+$/.test(head)) return 'new';
+  return literalShapeFor(doc.relativePath)?.(tail, head) ? 'literal' : null;
 }
 
 function classify(
-  o: ScipOccurrence, lines: string[], encoding: number, symToNode: Map<string, NodeRow>
+  o: ScipOccurrence, doc: ScipDocument, lines: string[], symToNode: Map<string, NodeRow>
 ): Call | null {
   const parsed = parseSymbol(o.symbol);
   if (!parsed) return null;
-  const shape = callShape(o, lines, encoding);
+  const shape = callShape(o, doc, lines);
   const isCall = shape === 'call';
   const { name, kind } = parsed.last;
 

@@ -45,6 +45,15 @@ describe('SCIP merge (Python fixture)', () => {
     expect(edge('Service::run', 'Service::step')?.provenance).toBe('scip'); // self.step(), same line, same name
   });
 
+  it('keys calls by the caller codegraph names: decorators → class, nested class body → that class', async () => {
+    await cg.scipWrite(db => runScipPass(db, dir));
+    // SCIP's range for `build` includes its decorator; codegraph's node starts at `def`.
+    expect(edge('Registry', 'register')).toEqual({ kind: 'calls', line: 34, provenance: 'scip' });
+    expect(edge('Registry::build', 'register')).toBeUndefined();
+    expect(edge('Registry::nested::Local', 'helper')?.provenance).toBe('scip');
+    expect(edge('Registry::nested', 'helper')).toBeUndefined();
+  });
+
   it('drops a heuristic guess where the call resolved to the standard library', async () => {
     // `items.append(1)` is list.append — the POC's classic false edge (ListMixin.append on Django).
     cg.scipReadDb().prepare(`INSERT INTO edges (source, target, kind, line, col) VALUES (?, ?, 'calls', 6, 4)`)

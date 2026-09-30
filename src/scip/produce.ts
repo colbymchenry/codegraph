@@ -52,7 +52,7 @@ export function resolvedCallCount(ix: ScipIndex, projectRoot: string): number {
     for (const o of d.occurrences) {
       if (o.roles & ROLE_DEFINITION || !defined.has(o.symbol)) continue;
       const kind = parseSymbol(o.symbol)?.last.kind;
-      const shape = callShape(o, lines, d.positionEncoding);
+      const shape = callShape(o, d, lines);
       if ((kind === 'method' || kind === 'term') && shape === 'call') n++;
       else if (kind === 'type' && shape) n++;
     }
