@@ -1618,6 +1618,22 @@ const CSHARP_STD_METHODS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * A request handler the web framework dispatches to: a Django / DRF / Flask
+ * view's `get` / `post` / …, a controller's `index` / `store` / `update` /
+ * `destroy`. Nothing calls one through an instance by name, so a guess from
+ * a Django test's `client.post(…)` (allauth: 425 times on a
+ * ClientRegistrationView) or an Eloquent `$page->update(…)` is never one.
+ */
+const DISPATCHED_OWNER = /(?:View|ViewSet|APIView|Controller|Endpoint|ViewMixin)$/;
+const DISPATCHED_ACTIONS: ReadonlySet<string> = new Set([
+  'get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'index', 'show', 'store', 'update', 'destroy',
+  'create', 'edit', 'list', 'retrieve', 'partial_update',
+]);
+
+/** A test double's name: Fake…, Mock…, Stub…, Dummy…, Spy…, …Fake, …Mock, …Stub. */
+const TEST_DOUBLE_OWNER = /\b(?:fake|mock|mocked|stub|dummy|spy)\b/i;
+
+/**
  * The link of a dotted receiver its value is named after: the last, or for a
  * constant (`InitializationPhase.CONTROLLERS`, `Foo.INSTANCE`) the type it
  * belongs to.
@@ -4594,6 +4610,9 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
       ];
     case 'python':
       return [
+        // group = VLANGroup.objects.create(…) — a Django manager call that
+        // returns one instance of the model (not `filter`/`all`, a QuerySet).
+        new RegExp(`(?:^|;)\\s*${r}\\s*=(?!=)\\s*([A-Z]\\w*)\\.objects\\.(?:create|get|first|last|latest|earliest|get_by_natural_key)\\s*\\(`),
         // lg = Logger(...) — a statement of its own: `prefix=IPNetwork(…),`
         // inside a call's arguments is a keyword argument, not a binding.
         new RegExp(`(?:^|;)\\s*${r}\\s*=(?!=)\\s*([A-Z][\\w.]*)\\s*\\((?![^\\n]*,\\s*$)`),
@@ -5792,7 +5811,14 @@ export function matchMethodCall(
       narrowed = kept.length !== targetMethods.length;
       targetMethods = kept;
     }
-    targetMethods = targetMethods.filter((m) => !isKotlinNumberBitwise(m, ref));
+    // Ruling these out must not leave a lone other `destroy` to guess at.
+    {
+      const kept = targetMethods.filter((m) => !(DISPATCHED_ACTIONS.has(m.name) &&
+        DISPATCHED_OWNER.test(m.qualifiedName.slice(0, Math.max(0, m.qualifiedName.lastIndexOf('::'))).split(/::|\./).pop()!)) &&
+        !isKotlinNumberBitwise(m, ref));
+      narrowed ||= kept.length !== targetMethods.length;
+      targetMethods = kept;
+    }
     // Production code never calls into a test suite: a guess from
     // rest_framework/renderers.py's `view.reverse_action(…)` is not a test's
     // `DummyView`. The test's methods were never in the running.
@@ -5854,6 +5880,11 @@ export function matchMethodCall(
         let score = receiverWords.filter(w =>
           classWords.some(cw => cw.toLowerCase() === w.toLowerCase())
         ).length;
+        // A test double is only what a test constructs or names — never a
+        // guess from `response.json()` (mealie's `_FakeHTTPResponse`) in a
+        // file that never mentions it.
+        if (TEST_DOUBLE_OWNER.test(classWords.join(' ')) && !receiverWords.some((w) => TEST_DOUBLE_OWNER.test(w)) &&
+            !(context.readFile(ref.filePath) ?? '').includes(method.qualifiedName.slice(0, cut).split(/::|\./).pop()!)) continue;
         // The receiver's head noun naming the owner's: `bookPage` is a Page
         // before it is anything of a Book's.
         if (head !== undefined && head === classWords[classWords.length - 1]?.toLowerCase()) score += 1;
