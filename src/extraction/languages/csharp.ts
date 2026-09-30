@@ -52,6 +52,9 @@ function extractCsharpReturnType(node: SyntaxNode, source: string): string | und
   return last;
 }
 
+/** Where a C# declaration with no access modifier defaults to `internal`. */
+const CSHARP_TYPE_SCOPES = new Set(['compilation_unit', 'namespace_declaration', 'file_scoped_namespace_declaration']);
+
 export const csharpExtractor: LanguageExtractor = {
   preParse: blankCsharpPreprocessorDirectives,
   functionTypes: [],
@@ -110,7 +113,12 @@ export const csharpExtractor: LanguageExtractor = {
         if (text === 'internal') return 'internal';
       }
     }
-    return 'private'; // C# defaults to private
+    // No modifier: an interface's members are public, a type declared in a
+    // namespace (or the file) is internal, and a class or struct member is private.
+    const container = node.parent?.type === 'declaration_list' ? node.parent.parent : node.parent;
+    if (container?.type === 'interface_declaration') return 'public';
+    if (!container || CSHARP_TYPE_SCOPES.has(container.type)) return 'internal';
+    return 'private';
   },
   isStatic: (node) => {
     for (let i = 0; i < node.childCount; i++) {

@@ -11,6 +11,7 @@ import { UnresolvedRef, ResolvedRef, ResolutionContext, isSupertypeTarget, CPP_D
 import { blankStringContents, stripCommentsForRegex } from './strip-comments';
 import { JS_BUILT_INS, JS_BUILTIN_METHODS, TS_PRIMITIVE_TYPES } from './js-builtins';
 import { SWIFT_TYPE_PATH_CALL, resolveSwiftTypePathCall } from './swift-type-visibility';
+import { isTestPath } from '../search/query-utils';
 /**
  * Ceiling on how many same-named definitions a FUZZY name-match strategy will
  * score. A name defined more times than this is "ubiquitous" — a method/symbol
@@ -1593,6 +1594,75 @@ const KOTLIN_STD_METHODS: ReadonlySet<string> = new Set([
   'copyOf', 'copyOfRange', 'indexOf', 'lastIndexOf', 'withIndex', 'asSequence', 'asList', 'ifEmpty', 'ifBlank',
   'padStart', 'padEnd', 'repeat', 'lines', 'toCharArray', 'coerceAtLeast', 'coerceAtMost', 'coerceIn',
 ]);
+
+/**
+ * Methods of .NET's base types, collections, streams, strings, LINQ and
+ * reflection — names a project type overrides or wraps, which a call through
+ * an untyped receiver means only when the receiver is named after the owner.
+ * Newtonsoft's `reader.Value.ToString()` went to its JValue's `ToString`,
+ * `table.Columns.Add(…)` to a name table's `Add`.
+ */
+const CSHARP_STD_METHODS: ReadonlySet<string> = new Set([
+  'ToString', 'Equals', 'GetHashCode', 'GetType', 'CompareTo', 'Add', 'AddRange', 'Remove', 'RemoveAt', 'RemoveAll',
+  'Contains', 'ContainsKey', 'ContainsValue', 'Clear', 'Insert', 'IndexOf', 'CopyTo', 'ToArray', 'ToList',
+  'ToDictionary', 'GetEnumerator', 'MoveNext', 'Reset', 'TryGetValue', 'GetValueOrDefault', 'TryAdd', 'Write',
+  'WriteLine', 'WriteAsync', 'WriteLineAsync', 'Read', 'ReadAsync', 'ReadLine', 'ReadToEnd', 'Flush', 'FlushAsync',
+  'Close', 'Dispose', 'DisposeAsync', 'Parse', 'TryParse', 'Format', 'Join', 'Split', 'Replace', 'Substring', 'Trim',
+  'TrimStart', 'TrimEnd', 'StartsWith', 'EndsWith', 'ToUpper', 'ToLower', 'ToUpperInvariant', 'ToLowerInvariant',
+  'Select', 'Where', 'First', 'FirstOrDefault', 'Single', 'SingleOrDefault', 'Last', 'LastOrDefault', 'Any', 'All',
+  'Count', 'Sum', 'Max', 'Min', 'OrderBy', 'OrderByDescending', 'GroupBy', 'Skip', 'Take', 'Distinct', 'Concat',
+  'Cast', 'OfType', 'Aggregate', 'Invoke', 'DynamicInvoke', 'GetMethod', 'GetProperty', 'GetField', 'GetConstructor',
+  'GetCustomAttributes', 'GetGenericArguments', 'MakeGenericType', 'IsAssignableFrom', 'ConfigureAwait', 'Wait',
+  'ContinueWith', 'Append', 'AppendLine', 'Peek', 'Push', 'Pop', 'Enqueue', 'Dequeue', 'HasFlag', 'Find', 'FindAll',
+  'ForEach', 'Sort', 'Reverse', 'Clone', 'Seek', 'SetLength',
+]);
+
+/**
+ * The link of a dotted receiver its value is named after: the last, or for a
+ * constant (`InitializationPhase.CONTROLLERS`, `Foo.INSTANCE`) the type it
+ * belongs to.
+ */
+function receiverLink(receiver: string): string {
+  const links = receiver.split('.');
+  const last = links[links.length - 1]!;
+  return links.length > 1 && /^[A-Z][A-Z0-9_]+$/.test(last) ? links[links.length - 2]! : last;
+}
+
+/** The standard-library method names of a language whose receiver-less guesses need the receiver to name the owner. */
+function stdMethodNames(language: string): ReadonlySet<string> | null {
+  switch (language) {
+    case 'go': return GO_STD_METHODS;
+    case 'rust': return RUST_STD_METHODS;
+    case 'kotlin': return KOTLIN_STD_METHODS;
+    case 'csharp': return CSHARP_STD_METHODS;
+    default: return null;
+  }
+}
+
+const CSHARP_ALIASES = new WeakMap<ResolutionContext, Map<string, Map<string, string>>>();
+
+/**
+ * The type a C# file's `using Name = Some.Namespace.Type;` (or `global using`)
+ * aliases `name` to, as its simple name — or null.
+ */
+function csharpUsingAlias(name: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  if (!/^[A-Za-z_]\w*$/.test(name)) return null;
+  let memo = CSHARP_ALIASES.get(context);
+  if (!memo) {
+    memo = new Map();
+    CSHARP_ALIASES.set(context, memo);
+  }
+  let aliases = memo.get(ref.filePath);
+  if (!aliases) {
+    aliases = new Map();
+    const source = context.readFile(ref.filePath) ?? '';
+    for (const m of source.matchAll(/^\s*(?:global\s+)?using\s+([A-Za-z_]\w*)\s*=\s*(?:global::)?([\w.]+)\s*(?:<[^;>]*>)?\s*;/gm)) {
+      aliases.set(m[1]!, m[2]!.split('.').pop()!);
+    }
+    memo.set(ref.filePath, aliases);
+  }
+  return aliases.get(name) ?? null;
+}
 
 /** The receiver a Kotlin chain link `….name(` / `?.name {` is written on, or null for a call with none. */
 function kotlinChainReceiver(ref: UnresolvedRef, context: ResolutionContext): string | null {
@@ -4121,6 +4191,12 @@ export function normalizeInferredTypeName(raw: string): string | null {
 }
 
 /**
+ * A Java / C# type's optional type arguments (one level of nesting) and array
+ * ranks, as a regex source: `<L, R>`, `<string, List<int>>`, `[]`, `[,]`.
+ */
+const TYPE_ARGS = '(?:<[^;=(){}<>]*(?:<[^;=(){}<>]*>[^;=(){}<>]*)*>)?\\s*(?:\\[[\\s,]*\\]\\s*)*';
+
+/**
  * Per-language patterns that recover a local variable's (or typed parameter's)
  * type from its declaration/initializer. Each regex captures the type in group
  * 1; `r` is the already-escaped receiver name. Ordered most-specific first.
@@ -4191,6 +4267,8 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   DART_SUPERS.delete(context);
   DART_HIERARCHIES.delete(context);
   SWIFT_DECLS.delete(context);
+  MEMBER_TYPE_MEMO.delete(context);
+  CSHARP_ALIASES.delete(context);
   SWIFT_HIERARCHIES.delete(context);
   KOTLIN_FILE_SCOPES.delete(context);
   RUBY_ANCESTRY.delete(context);
@@ -4266,7 +4344,8 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
     case 'java':
       return [
         new RegExp(`\\b${r}\\b\\s*=\\s*new\\s+([A-Za-z_][\\w.]*)`), // = new Logger()
-        new RegExp(`\\b([A-Z][\\w.]*)\\s+${r}\\b\\s*[=;,)]`), // Logger lg;  / param
+        new RegExp(`\\b([A-Z][\\w.]*)\\s*${TYPE_ARGS}\\s+${r}\\b\\s*[=;,)]`), // Logger lg;  / Pair<L, R> pair / String[] args
+        new RegExp(`\\bfor\\s*\\(\\s*(?:final\\s+)?([A-Z][\\w.]*)\\s*${TYPE_ARGS}\\s+${r}\\s*:`), // for (Element el : els)
       ];
     case 'kotlin':
       return [
@@ -4276,7 +4355,8 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
     case 'csharp':
       return [
         new RegExp(`\\b${r}\\b\\s*=\\s*new\\s+([A-Za-z_][\\w.]*)`), // = new Logger()
-        new RegExp(`\\b([A-Z][\\w.]*)\\s+${r}\\b\\s*[=;,)]`), // Logger lg;  / param
+        new RegExp(`\\b([A-Z][\\w.]*)\\s*${TYPE_ARGS}\\??\\s+${r}\\b\\s*[=;,)]`), // Logger lg;  / List<string> names / JProperty? p
+        new RegExp(`\\bforeach\\s*\\(\\s*([A-Z][\\w.]*)\\s*${TYPE_ARGS}\\??\\s+${r}\\s+in\\b`), // foreach (JProperty p in props)
       ];
     case 'objc':
       return [
@@ -4393,6 +4473,220 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
     default:
       return [];
   }
+}
+
+/** Languages whose fields and properties declare their type where the class declares them. */
+const MEMBER_TYPED_LANGUAGES: ReadonlySet<string> = new Set(['csharp', 'java', 'kotlin']);
+const MEMBER_CLASS_KINDS: ReadonlySet<string> = new Set(['class', 'struct', 'interface', 'enum', 'record']);
+const MEMBER_TYPE_MEMO = new WeakMap<ResolutionContext, Map<string, string | null>>();
+/** Words that can stand where a declaration's type does without being one. */
+const MEMBER_TYPE_NON_TYPES: ReadonlySet<string> = new Set([
+  'return', 'new', 'case', 'throw', 'else', 'in', 'out', 'ref', 'params', 'await', 'yield', 'is', 'as', 'using',
+  'var', 'val', 'goto', 'nameof', 'typeof', 'sizeof', 'default', 'when', 'where', 'get', 'set', 'init',
+  'class', 'interface', 'enum', 'struct', 'record', 'object', 'namespace', 'package', 'import', 'extends',
+  'implements', 'fun', 'static', 'final', 'abstract', 'sealed', 'override', 'virtual', 'delegate', 'event',
+]);
+
+/**
+ * The type a C# / Java / Kotlin receiver has as a field or property of the
+ * class around the call — `private readonly JsonWriter _innerWriter;`,
+ * `public JsonReader Reader { get; }`, `private val sink: BufferedSink` — or
+ * null when the class declares no such member or the calling method binds
+ * the name itself. Only the class's own lines are read, never a method body
+ * or a nested type. Newtonsoft's `_innerWriter.WriteValue(…)` inside
+ * TraceJsonWriter went to TraceJsonWriter's own `WriteValue` by name.
+ */
+function inferMemberReceiverType(receiver: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  const name = receiver.replace(/^this\./, '');
+  if (!/^[A-Za-z_]\w*$/.test(name)) return null;
+  const inFile = context.getNodesInFile(ref.filePath).filter((n) => n.language === ref.language);
+  let cls: Node | undefined;
+  for (const n of inFile) {
+    if (!MEMBER_CLASS_KINDS.has(n.kind) || n.startLine > ref.line || n.endLine < ref.line) continue;
+    if (!cls || n.startLine >= cls.startLine) cls = n;
+  }
+  if (!cls) return null;
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
+  if (!lines) return null;
+  // A lambda parameter, `var` local, `out` variable or `foreach` binding in
+  // the calling method shadows the field, and the local inference that ran
+  // first cannot type those.
+  let fn: Node | undefined;
+  for (const n of inFile) {
+    if ((n.kind !== 'method' && n.kind !== 'function') || n.startLine > ref.line || n.endLine < ref.line) continue;
+    if (!fn || n.startLine >= fn.startLine) fn = n;
+  }
+  const r = name.replace(/\$/g, '\\$');
+  if (fn) {
+    const body = lines.slice(fn.startLine - 1, ref.line).join('\n');
+    if (new RegExp(`\\b(?:var|val|out\\s+[\\w.<>?]+|foreach\\s*\\(\\s*[\\w.<>?,\\s]+?)\\s+${r}\\b|\\bfor\\s*\\([^;)]*\\s${r}\\s*:|\\b${r}\\s*=>|[(,]\\s*${r}\\s*(?:,[^()]*)?\\)\\s*=>|\\b${r}\\s*(?:,[^{}]*)?->`).test(body)) return null;
+  }
+  // The class's own members first, then those it inherits (a base class's
+  // `internal readonly JsonSerializer Serializer;`).
+  // Each inherited class carries what its type parameters stand for in the
+  // class the walk came from (`: IntegrationTest<DatabaseInitializer>`).
+  const seen = new Set<string>();
+  const queue: Array<{ type: Node; args: Map<string, string> }> = [{ type: cls, args: new Map() }];
+  while (queue.length > 0 && seen.size < 8) {
+    const { type, args } = queue.shift()!;
+    if (seen.has(type.id)) continue;
+    seen.add(type.id);
+    const found = classMemberType(type, name, context);
+    if (found) {
+      if (type === cls) return found;
+      // A member typed by the declaring class's own type parameter
+      // (`protected TFixture Fixture { get; }`) is the argument the subclass
+      // gave it, else its bound — with neither, only `object`'s members.
+      const given = args.get(found);
+      if (given) return given;
+      const bound = typeParameterBoundIn(found, [type], context);
+      return bound === undefined ? found : bound ?? 'object';
+    }
+    for (const sup of classHeadSupertypes(type, context)) {
+      const given = headTypeArguments(type, sup, context).map((a) => args.get(a) ?? a);
+      for (const decl of context.getNodesByName(sup)) {
+        if (decl.language !== type.language || !MEMBER_CLASS_KINDS.has(decl.kind)) continue;
+        const params = declaredTypeParameters(decl, context);
+        queue.push({ type: decl, args: new Map(params.map((p, i) => [p, given[i] ?? ''] as [string, string]).filter(([, a]) => a !== '')) });
+      }
+    }
+  }
+  return null;
+}
+
+/** The first `<…>` of a declaration's head, split at its top-level commas. */
+function angleArguments(text: string): string[] {
+  const open = text.indexOf('<');
+  if (open < 0) return [];
+  const out: string[] = [];
+  let depth = 0;
+  let cur = '';
+  for (const ch of text.slice(open + 1)) {
+    if (ch === '<') depth++;
+    else if (ch === '>' && depth-- === 0) break;
+    if (ch === ',' && depth === 0) {
+      out.push(cur);
+      cur = '';
+    } else cur += ch;
+  }
+  out.push(cur);
+  return out.map((a) => a.trim());
+}
+
+/** The type parameters a class declares: `TDbContextFixture` for `class IntegrationTest<TDbContextFixture>`. */
+function declaredTypeParameters(decl: Node, context: ResolutionContext): string[] {
+  const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+  const head = lines.slice(decl.startLine - 1, decl.startLine + 3).join(' ');
+  const at = new RegExp(`\\b${decl.name}\\s*<`).exec(head);
+  if (!at) return [];
+  return angleArguments(head.slice(at.index)).map((p) => /([A-Za-z_]\w*)\s*(?:extends\b.*|:.*)?$/.exec(p.replace(/^(?:in|out|reified)\s+/, ''))?.[1] ?? '');
+}
+
+/** The type arguments a class's head gives a supertype, as simple names: `DatabaseInitializer` for `: IntegrationTest<ParameterizedQueries.DatabaseInitializer>`. */
+function headTypeArguments(cls: Node, sup: string, context: ResolutionContext): string[] {
+  const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
+  const head = lines.slice(cls.startLine - 1, cls.startLine + 8).join(' ').split('{')[0]!;
+  const at = new RegExp(`(?:[:,]|\\bextends|\\bimplements)\\s*(?:[\\w.]+\\.)?${sup}\\s*<`).exec(head);
+  if (!at) return [];
+  return angleArguments(head.slice(at.index)).map((a) => a.replace(/<[\s\S]*$/, '').split('.').pop()!.trim());
+}
+
+/** The simple names a Java / C# / Kotlin class declaration's head extends or implements. */
+function classHeadSupertypes(cls: Node, context: ResolutionContext): string[] {
+  const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
+  let depth = 0;
+  let head = '';
+  for (const ch of lines.slice(cls.startLine - 1, cls.startLine + 8).join(' ').replace(/\/\/[^\n]*|\/\*.*?\*\//g, ' ')) {
+    if (ch === '{' && depth === 0) break;
+    if (ch === '<' || ch === '(') depth++;
+    else if (ch === '>' || ch === ')') depth = Math.max(0, depth - 1);
+    else if (depth === 0) head += ch;
+  }
+  const clause = /\b(?:extends|implements)\b([\s\S]*)$/.exec(head)?.[1] ??
+    /\b(?:class|interface|struct|record|object)\s+\w+[^:]*:([\s\S]*)$/.exec(head)?.[1] ?? '';
+  return [...clause.replace(/\bwhere\b[\s\S]*$/, '').matchAll(/([A-Z]\w*)\s*(?=,|$|\bimplements\b)/g)].map((m) => m[1]!);
+}
+
+/**
+ * The type a class declares a member `name` with, read from the lines at its
+ * body's own brace depth (or its header, for a primary constructor's
+ * parameters) — deeper ones are method, accessor and indexer bodies or
+ * nested types.
+ */
+function classMemberType(cls: Node, name: string, context: ResolutionContext): string | null {
+  let memo = MEMBER_TYPE_MEMO.get(context);
+  if (!memo) {
+    memo = new Map();
+    MEMBER_TYPE_MEMO.set(context, memo);
+  }
+  const key = `${cls.id}|${name}`;
+  if (memo.has(key)) return memo.get(key)!;
+  const lines = context.getFileLines?.(cls.filePath) ?? context.readFile(cls.filePath)?.split(/\r?\n/) ?? [];
+  const r = name.replace(/\$/g, '\\$');
+  const pattern = cls.language === 'kotlin'
+    ? new RegExp(`\\b(?:val|var)\\s+${r}\\s*:\\s*([A-Z][\\w.]*)`)
+    : new RegExp(`(?:^|[\\s(,])([A-Za-z_][\\w.]*)\\s*${TYPE_ARGS}\\??\\s+${r}\\s*(?:[=;,)]|\\{)`);
+  let found: string | null = null;
+  let depth = 0;
+  let inComment = false;
+  for (let line = cls.startLine; line <= cls.endLine && !found; line++) {
+    let raw = lines[line - 1] ?? '';
+    if (inComment) {
+      const close = raw.indexOf('*/');
+      if (close < 0) continue;
+      raw = raw.slice(close + 2);
+      inComment = false;
+    }
+    let text = raw.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, '""').replace(/\/\*.*?\*\//g, ' ').replace(/\/\/.*$/, '');
+    const open = text.indexOf('/*');
+    if (open >= 0) {
+      text = text.slice(0, open);
+      inComment = true;
+    }
+    if (depth <= 1) {
+      const m = pattern.exec(text);
+      // Inside parentheses at member depth is a method's parameter list; only
+      // the header's (a primary constructor's) declares members.
+      const inParens = m !== null && depth === 1 &&
+        (text.slice(0, m.index).match(/\(/g)?.length ?? 0) > (text.slice(0, m.index).match(/\)/g)?.length ?? 0);
+      if (m && !inParens && !MEMBER_TYPE_NON_TYPES.has(m[1]!)) found = normalizeInferredTypeName(m[1]!);
+    }
+    for (const ch of text) {
+      if (ch === '{') depth++;
+      else if (ch === '}') depth = Math.max(0, depth - 1);
+    }
+  }
+  memo.set(key, found);
+  return found;
+}
+
+/**
+ * What a Java / C# / Kotlin type parameter of the class or method around a
+ * call is bounded by: `ExceptionContext` for `T` in `class Test<T extends
+ * ExceptionContext & Serializable>` / `where T : ExceptionContext` / `<T :
+ * ExceptionContext>`, null when it is a type parameter with no named bound,
+ * undefined when it is not a type parameter there at all.
+ */
+function typeParameterBound(typeName: string, ref: UnresolvedRef, context: ResolutionContext): string | null | undefined {
+  const around = context.getNodesInFile(ref.filePath).filter((n) => n.startLine <= ref.line && n.endLine >= ref.line &&
+    (MEMBER_CLASS_KINDS.has(n.kind) || n.kind === 'method' || n.kind === 'function'));
+  return typeParameterBoundIn(typeName, around, context);
+}
+
+/** {@link typeParameterBound}, over the heads of the given declarations. */
+function typeParameterBoundIn(typeName: string, decls: Node[], context: ResolutionContext): string | null | undefined {
+  if (!/^[A-Z]\w*$/.test(typeName)) return undefined;
+  const t = typeName;
+  let declared = false;
+  for (const n of decls) {
+    const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
+    const head = lines.slice(n.startLine - 1, n.startLine + 5).join(' ').split('{')[0]!;
+    const bound = new RegExp(`[<,]\\s*(?:in\\s+|out\\s+|reified\\s+)?${t}\\s*(?:extends|:)\\s*([A-Z][\\w.]*)`).exec(head)?.[1] ??
+      new RegExp(`\\bwhere\\s+${t}\\s*:\\s*([A-Z][\\w.]*)`).exec(head)?.[1];
+    if (bound) return bound.split('.').pop()!;
+    if (new RegExp(`[<,]\\s*(?:in\\s+|out\\s+|reified\\s+)?${t}\\s*[,>]`).test(head)) declared = true;
+  }
+  return declared ? null : undefined;
 }
 
 /** 1-based start line of the tightest function/method enclosing the call. */
@@ -4905,6 +5199,18 @@ export function matchMethodCall(
       ref.language === 'cpp'
         ? inferCppReceiverType(objectOrClass!, ref, context)
         : inferLocalReceiverType(objectOrClass!, ref, context));
+    if (!inferredType && MEMBER_TYPED_LANGUAGES.has(ref.language) && dotMatch) {
+      inferredType = inferMemberReceiverType(objectOrClass!, ref, context);
+      // A field of a built-in type (`string _name`, `int count`) has no project method.
+      if (inferredType && /^[a-z]/.test(inferredType)) return null;
+    }
+    // A type parameter is its bound; with none, only `Object`'s methods.
+    if (inferredType && MEMBER_TYPED_LANGUAGES.has(ref.language) &&
+        !context.getNodesByName(inferredType).some(isMethodOwnerKind)) {
+      const bound = typeParameterBound(inferredType, ref, context);
+      if (bound === null) return null;
+      if (bound !== undefined) inferredType = bound;
+    }
     const awaited = !inferredType && ESM_FAMILY.has(ref.language)
       ? inferEsmAwaitedCallType(objectOrClass!, ref, context) : null;
     if (awaited) {
@@ -5128,8 +5434,23 @@ export function matchMethodCall(
   // (`Exception.Create(…)` in Delphi, `Collections.sort(…)`) is a type from
   // outside it: a same-named method of some project type is a guess. horse's
   // `Exception.Create` went to its own `EHorseException::Create` 44 times.
+  // A C# using alias names its type: `using Assert = Newtonsoft.Json.Tests.XUnitAssert;`.
+  const aliased = ref.language === 'csharp' ? csharpUsingAlias(objectOrClass!, ref, context) : null;
+  if (aliased) {
+    return resolveMethodOnType(aliased, methodName!, ref, context, 0.9, 'instance-method', undefined);
+  }
+
+  // In C# and Java a capitalized receiver the class around it doesn't declare
+  // is a type — a project property of that name elsewhere (a test object's
+  // `DateTime`) does not make `DateTime.Parse(…)` the project's.
+  const typesOnly = ref.language === 'csharp' || ref.language === 'java';
   if (namesExternalType(objectOrClass!, ref.language) &&
-      !context.getNodesByName(objectOrClass!).some((n) => sameLanguageFamily(n.language, ref.language))) {
+      !context.getNodesByName(objectOrClass!).some((n) => sameLanguageFamily(n.language, ref.language) &&
+        (!typesOnly || isMethodOwnerKind(n) || n.kind === 'enum' || n.kind === 'namespace' || n.kind === 'module'))) {
+    return null;
+  }
+  // `string.Equals(…)`, `object.ReferenceEquals(…)`: a C# keyword type.
+  if (ref.language === 'csharp' && /^(?:string|object|int|long|short|byte|bool|char|double|float|decimal|uint|ulong|ushort|sbyte)$/.test(objectOrClass!)) {
     return null;
   }
 
@@ -5202,6 +5523,10 @@ export function matchMethodCall(
       narrowed = kept.length !== targetMethods.length;
       targetMethods = kept;
     }
+    // Production code never calls into a test suite: a guess from
+    // rest_framework/renderers.py's `view.reverse_action(…)` is not a test's
+    // `DummyView`. The test's methods were never in the running.
+    if (!isTestPath(ref.filePath)) targetMethods = targetMethods.filter((m) => !isTestPath(m.filePath));
     // A Vue component's own method is reached as `this.m()` inside it —
     // never as `e.preventDefault()` on an event, nor `this.editor.setValue()`
     // on something the component holds. A template ref
@@ -5220,11 +5545,11 @@ export function matchMethodCall(
     // 1,201 times; lobsters' `value.to_s` to a short-id class's.
     if (targetMethods.length === 1 && !narrowed && targetMethods[0]!.language === ref.language &&
         !((ref.language === 'lua' || ref.language === 'luau') && isLuaLibraryCall(objectOrClass!, methodName!, ref, targetMethods[0]!)) &&
-        // Rust / Go: a standard-library method name on an untyped receiver
-        // (`sym.map(…)`, `w.Header().Get(…)`) is the library type's.
-        !((ref.language === 'rust' || ref.language === 'go' || ref.language === 'kotlin') &&
-          (ref.language === 'go' ? GO_STD_METHODS : ref.language === 'kotlin' ? KOTLIN_STD_METHODS : RUST_STD_METHODS).has(methodName!) &&
-          !/^(?:self|Self|this)$/.test(objectOrClass!) && !sharesReceiverWord(objectOrClass!, targetMethods[0]!)) &&
+        // Rust / Go / Kotlin / C#: a standard-library method name on an
+        // untyped receiver (`sym.map(…)`, `w.Header().Get(…)`,
+        // `reader.Value.ToString()`) is the library type's.
+        !(stdMethodNames(ref.language)?.has(methodName!) &&
+          !/^(?:self|Self|this|base)$/.test(objectOrClass!) && !sharesReceiverWord(receiverLink(objectOrClass!), targetMethods[0]!)) &&
         !(UNTYPED_RECEIVER_LANGUAGES.has(ref.language) && !/^(?:self|self\.class|this|super|weak_?self|strong_?self)$/i.test(objectOrClass!) &&
           !sharesReceiverWord(objectOrClass!, targetMethods[0]!) &&
           !(ref.language === 'objc' && objcReceiverReaches(objectOrClass!, targetMethods[0]!, context)) &&
@@ -5239,18 +5564,29 @@ export function matchMethodCall(
 
     // Multiple methods: score by receiver name word overlap with class name
     if (targetMethods.length > 1) {
-      const receiverWords = splitCamelCase(objectOrClass!);
+      // What the receiver is named after is its last link: `builder.tokeniser`
+      // is a Tokeniser, `table.Columns` no kind of table.
+      const receiverWords = splitCamelCase(receiverLink(objectOrClass!));
+      const head = receiverWords[receiverWords.length - 1]?.toLowerCase();
       let bestMatch: typeof targetMethods[0] | undefined;
       let bestScore = 0;
 
       // Same-file candidates first, so a score tie (`score > bestScore` keeps
       // the first seen) resolves to the call site's own file rather than the
       // first-indexed duplicate (#1079).
+      const std = stdMethodNames(ref.language)?.has(methodName!) && !/^(?:self|Self|this|base)$/.test(objectOrClass!);
       for (const method of preferCallSiteFile(targetMethods, ref.filePath)) {
-        const classWords = splitCamelCase(method.qualifiedName);
+        if (std && !sharesReceiverWord(receiverLink(objectOrClass!), method)) continue;
+        // The owner type's own name — not its namespace (`eShop.ClientApp…`
+        // shares `Client` with every `httpClient`) nor the method's.
+        const cut = method.qualifiedName.lastIndexOf('::');
+        const classWords = cut > 0 ? splitCamelCase(method.qualifiedName.slice(0, cut).split(/::|\./).pop()!) : [];
         let score = receiverWords.filter(w =>
           classWords.some(cw => cw.toLowerCase() === w.toLowerCase())
         ).length;
+        // The receiver's head noun naming the owner's: `bookPage` is a Page
+        // before it is anything of a Book's.
+        if (head !== undefined && head === classWords[classWords.length - 1]?.toLowerCase()) score += 1;
         // Bonus for same language
         if (method.language === ref.language) score += 1;
         if (score > bestScore) {
