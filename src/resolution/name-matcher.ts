@@ -1431,6 +1431,110 @@ function dartHeadOf(decl: Node, context: ResolutionContext): { supers: string[];
   };
 }
 
+const OBJC_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
+const OBJC_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'field']);
+
+/**
+ * How a bare Objective-C name is written at its site: `c-call` for C call
+ * syntax (`completionBlock()` — a function, a block or a function pointer,
+ * never a method), `self-send` for a message to `self` / `super` /
+ * `[self class]`, whose receiver the extractor drops; null otherwise.
+ */
+function objcCallShape(ref: UnresolvedRef, context: ResolutionContext): 'c-call' | 'self-send' | null {
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split('\n')[ref.line - 1];
+  if (line === undefined) return null;
+  const name = ref.referenceName.split(':')[0]!;
+  if (!name) return null;
+  const at = new RegExp(`(?<![\\w.])${name}\\b`, 'g');
+  let m: RegExpExecArray | null;
+  let shape: 'c-call' | 'self-send' | null = null;
+  while ((m = at.exec(line))) {
+    const before = line.slice(0, m.index);
+    const after = line.slice(m.index + name.length);
+    if (/^\s*\(/.test(after) && !/\[\s*[\w.]+\s+$/.test(before)) shape ??= 'c-call';
+    else if (/\[\s*(?:self|super|\[\s*self\s+class\s*\])\s+$/.test(before)) return 'self-send';
+  }
+  return shape;
+}
+
+/**
+ * The classes a message to `self` / `super` can reach: the class it is
+ * written in and every class that one inherits from (read from its
+ * `@interface Name : Super` declarations; category methods are indexed under
+ * the class they extend). Null outside any class.
+ */
+function objcHierarchyAt(ref: UnresolvedRef, context: ResolutionContext): Set<string> | null {
+  const here = context
+    .getNodesInFile(ref.filePath)
+    .filter((c) => c.kind === 'class' && c.startLine <= ref.line && c.endLine >= ref.line)
+    .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
+  if (!here) return null;
+  const seen = new Set<string>();
+  const queue = [here.name];
+  while (queue.length > 0 && seen.size < 30) {
+    const name = queue.shift()!;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    queue.push(...objcSupertypesOf(name, context));
+  }
+  return seen;
+}
+
+/**
+ * Whether a message to `self` / `super` can mean `n`: a method of a class in
+ * the sender's hierarchy — SDWebImage's `[self class]` went to SDWeakProxy's
+ * `class` 71 times. When tree-sitter-objc loses an `@implementation`
+ * (AFNetworking's AFURLSessionManager) its methods are indexed as functions:
+ * one in the sender's own file, or in the file named after a class of its
+ * hierarchy, still counts (as does any, when the sender's own class was lost
+ * too). A function elsewhere is never what `[super init]` sends to.
+ */
+function isObjcSelfSendTarget(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const hierarchy = objcHierarchyAt(ref, context);
+  if (OBJC_MEMBER_KINDS.has(n.kind)) {
+    const cut = n.qualifiedName.lastIndexOf('::');
+    return cut < 0 || hierarchy === null || hierarchy.has(n.qualifiedName.slice(0, cut));
+  }
+  if (n.filePath === ref.filePath || hierarchy === null) return true;
+  const base = n.filePath.slice(n.filePath.lastIndexOf('/') + 1).replace(/\.\w+$/, '');
+  return hierarchy.has(base);
+}
+
+/**
+ * UIKit / AppKit superclasses, for a category on a system class: an
+ * `UIImageView (WebCache)` method sending `[self sd_internalSetImageWithURL:…]`
+ * reaches the `UIView (WebCache)` category.
+ */
+const OBJC_SYSTEM_SUPERS: Readonly<Record<string, string>> = {
+  UIResponder: 'NSObject', UIView: 'UIResponder', UIViewController: 'UIResponder', UIWindow: 'UIView',
+  UIControl: 'UIView', UIButton: 'UIControl', UITextField: 'UIControl', UISwitch: 'UIControl', UISlider: 'UIControl',
+  UIImageView: 'UIView', UILabel: 'UIView', UIScrollView: 'UIView', UITableView: 'UIScrollView',
+  UICollectionView: 'UIScrollView', UITextView: 'UIScrollView', UITableViewCell: 'UIView',
+  UICollectionReusableView: 'UIView', UICollectionViewCell: 'UICollectionReusableView',
+  MKAnnotationView: 'UIView', MKMapView: 'UIView',
+  NSResponder: 'NSObject', NSView: 'NSResponder', NSViewController: 'NSResponder', NSWindow: 'NSResponder',
+  NSControl: 'NSView', NSImageView: 'NSControl', NSButton: 'NSControl', NSTextField: 'NSControl', NSTableView: 'NSControl',
+};
+
+/** The superclasses an Objective-C class's `@interface` declarations name. */
+function objcSupertypesOf(name: string, context: ResolutionContext): string[] {
+  let memo = OBJC_SUPERS.get(context);
+  if (!memo) OBJC_SUPERS.set(context, (memo = new Map()));
+  const hit = memo.get(name);
+  if (hit) return hit;
+  const supers: string[] = [];
+  for (const decl of context.getNodesByName(name)) {
+    if (decl.kind !== 'class' || decl.language !== 'objc') continue;
+    const line = context.getFileLines?.(decl.filePath)?.[decl.startLine - 1] ?? context.readFile(decl.filePath)?.split('\n')[decl.startLine - 1] ?? '';
+    const sup = /@interface\s+\w+\s*:\s*(\w+)/.exec(line)?.[1];
+    if (sup && !supers.includes(sup)) supers.push(sup);
+  }
+  const system = OBJC_SYSTEM_SUPERS[name];
+  if (supers.length === 0 && system) supers.push(system);
+  memo.set(name, supers);
+  return supers;
+}
+
 const VB_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'field', 'enum_member', 'constant', 'variable']);
 
 /**
@@ -2104,8 +2208,12 @@ export function matchByExactName(
   const cfmlBare = (ref.language === 'cfml' || ref.language === 'cfscript') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
   const vbReceiver = ref.language === 'vbnet' && (ref.referenceKind === 'calls' || ref.referenceKind === 'instantiates') && /^\w+$/.test(ref.referenceName)
     ? vbReceiverOf(ref, context) : null;
+  const objcShape = ref.language === 'objc' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*:*(?:\w+:)*$/.test(ref.referenceName)
+    ? objcCallShape(ref, context) : null;
   const phpSelf = phpSelfReceiver(ref, context);
   const filtered = sameName.filter((n) =>
+    !(objcShape === 'c-call' && OBJC_MEMBER_KINDS.has(n.kind)) &&
+    !(objcShape === 'self-send' && !isObjcSelfSendTarget(n, ref, context)) &&
     !(vbReceiver !== null && !isVbMemberReachable(n, vbReceiver)) &&
     !(rubyBare && n.kind === 'method' && !isRubyMethodInScope(n, ref, context)) &&
     !(cfmlBare && n.kind === 'method' && !isCfmlMethodInScope(n, ref, context)) &&
@@ -3227,6 +3335,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   KOTLIN_FILE_SCOPES.delete(context);
   RUBY_ANCESTRY.delete(context);
   CFML_CHAINS.delete(context);
+  OBJC_SUPERS.delete(context);
   LUA_LOCALS.delete(context);
   PHP_FILE_SCOPES.delete(context);
   JAVA_STATIC_IMPORTS.delete(context);
@@ -3301,6 +3410,13 @@ function buildLocalReceiverTypePatterns(language: Language, r: string): RegExp[]
       return [
         new RegExp(`\\b${r}\\b\\s*=\\s*new\\s+([A-Za-z_][\\w.]*)`), // = new Logger()
         new RegExp(`\\b([A-Z][\\w.]*)\\s+${r}\\b\\s*[=;,)]`), // Logger lg;  / param
+      ];
+    case 'objc':
+      return [
+        // FMResultSet *rs = …  /  NSString * _Nullable name;  /  a block's ^(FMResultSet *rs)
+        new RegExp(`\\b([A-Z]\\w*)\\s*(?:<[^<>;]*>\\s*)?\\*\\s*(?:(?:_Nullable|_Nonnull|__strong|__weak|__unsafe_unretained|const)\\s+)*${r}\\b(?!\\s*\\()`),
+        // a method parameter: - (void)read:(nullable FMResultSet *)rs
+        new RegExp(`\\(\\s*(?:(?:nullable|nonnull|__kindof)\\s+)*([A-Z]\\w*)\\s*(?:<[^<>)]*>\\s*)?\\*[^)]*\\)\\s*${r}\\b`),
       ];
     case 'swift':
       return [
@@ -4216,7 +4332,7 @@ export function matchMethodCall(
     // `node.loc` on a rubocop-ast node went to the one `loc` in the project
     // 1,201 times; lobsters' `value.to_s` to a short-id class's.
     if (targetMethods.length === 1 && !narrowed && targetMethods[0]!.language === ref.language &&
-        !(UNTYPED_RECEIVER_LANGUAGES.has(ref.language) && !/^(?:self|self\.class|this|super)$/i.test(objectOrClass!) &&
+        !(UNTYPED_RECEIVER_LANGUAGES.has(ref.language) && !/^(?:self|self\.class|this|super|weak_?self|strong_?self)$/i.test(objectOrClass!) &&
           !sharesReceiverWord(objectOrClass!, targetMethods[0]!))) {
       return {
         original: ref,
@@ -5022,15 +5138,16 @@ function hasParameterBinding(code: string, escapedName: string): boolean {
 /**
  * Languages whose receivers nothing types, where a unique method name alone
  * is no evidence: CFML's `server.keyExists()` is the struct member function,
- * not the one component method named `keyExists`.
+ * not the one component method named `keyExists`; Objective-C's
+ * `image.respondsToSelector:` is NSObject's, not a proxy class's override.
  */
-const UNTYPED_RECEIVER_LANGUAGES: ReadonlySet<string> = new Set(['ruby', 'cfml', 'cfscript']);
+const UNTYPED_RECEIVER_LANGUAGES: ReadonlySet<string> = new Set(['ruby', 'cfml', 'cfscript', 'objc']);
 
 /**
  * Whether a receiver is named after the owner of `method`, case aside: the
  * receiver's last segment is the owner's name (`cbsecurity` → CBSecurity), or
- * they share a word (`web_push_request` → WebPushRequest, `executor1` →
- * Executor).
+ * they share a word of three letters or more (`web_push_request` →
+ * WebPushRequest, `executor1` → Executor, `decodedImage` → UIImage).
  */
 function sharesReceiverWord(receiver: string, method: Node): boolean {
   const cut = method.qualifiedName.lastIndexOf('::');
@@ -5038,7 +5155,8 @@ function sharesReceiverWord(receiver: string, method: Node): boolean {
   const ownerQn = method.qualifiedName.slice(0, cut);
   const flat = (w: string) => w.replace(/[^A-Za-z0-9]/g, '').replace(/\d+$/, '').toLowerCase();
   if (flat(receiver.split('.').pop()!) === flat(ownerQn.split(/::|\./).pop()!)) return true;
-  const owner = new Set(splitCamelCase(ownerQn).map(flat));
+  // Two-letter words are class prefixes (`SD`, `NS`, `UI`), not names.
+  const owner = new Set(splitCamelCase(ownerQn).map(flat).filter((w) => w.length > 2));
   return splitCamelCase(receiver).some((w) => owner.has(flat(w)));
 }
 
@@ -5216,6 +5334,8 @@ export function matchFuzzy(
   const cfmlBare = (ref.language === 'cfml' || ref.language === 'cfscript') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
   const vbReceiver = ref.language === 'vbnet' && (ref.referenceKind === 'calls' || ref.referenceKind === 'instantiates') && /^\w+$/.test(ref.referenceName)
     ? vbReceiverOf(ref, context) : null;
+  const objcShape = ref.language === 'objc' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*:*(?:\w+:)*$/.test(ref.referenceName)
+    ? objcCallShape(ref, context) : null;
   const phpSelf = phpSelfReceiver(ref, context);
   // Names are case-sensitive in every language but a handful: Rust's
   // `Bytes` is not the method `bytes`, Python's builtin `dir(…)` not a class
@@ -5235,6 +5355,8 @@ export function matchFuzzy(
     !(rubyBare && n.kind === 'method' && !isRubyMethodInScope(n, ref, context)) &&
     !(cfmlBare && n.kind === 'method' && !isCfmlMethodInScope(n, ref, context)) &&
     !(vbReceiver !== null && !isVbMemberReachable(n, vbReceiver)) &&
+    !(objcShape === 'c-call' && OBJC_MEMBER_KINDS.has(n.kind)) &&
+    !(objcShape === 'self-send' && !isObjcSelfSendTarget(n, ref, context)) &&
     !(phpSelf && (n.kind !== 'method' || !isPhpMethodInScope(n, ref, phpSelf, context))))
     .filter((n) => (ref.referenceKind !== 'references' && ref.referenceKind !== 'function_ref') ||
       sameLanguageFamily(n.language, ref.language));
