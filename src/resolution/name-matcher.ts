@@ -4,6 +4,7 @@
  * Handles symbol name matching for reference resolution.
  */
 
+import * as fs from 'fs';
 import * as path from 'path';
 import { Language, Node } from '../types';
 import { UnresolvedRef, ResolvedRef, ResolutionContext, isSupertypeTarget, CPP_DEFINE_SIGNATURE, isInheritanceRef, isImportableKind } from './types';
@@ -1431,6 +1432,123 @@ function dartHeadOf(decl: Node, context: ResolutionContext): { supers: string[];
   };
 }
 
+const CSHARP_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'enum', 'struct', 'record']);
+const CSHARP_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'field', 'enum_member', 'constant', 'event']);
+const CSHARP_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
+const CSHARP_STATIC_USINGS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
+
+/**
+ * Whether a bare C# name — `TestContext`, `Easing`, `Helper()` — can mean the
+ * member `n`: C# reads a bare name as a member of the types around it (outer
+ * classes included) or of their base types, or of a `using static` type.
+ * Never some unrelated class's: eShop's `TestContext.CancellationToken` in
+ * one test class went to another test class's `TestContext` property, MAUI's
+ * `Easing.Linear` to an animation class's `Easing`. Chain links the line
+ * shows a receiver for are not judged.
+ */
+function isCsharpMemberInScope(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!CSHARP_MEMBER_KINDS.has(n.kind)) return true;
+  const cut = n.qualifiedName.lastIndexOf('::');
+  if (cut < 0 || !hasNoReceiverOnLine(ref, context)) return true;
+  const owner = n.qualifiedName.slice(0, cut).split(/::|\./).pop()!;
+  if (csharpStaticUsings(ref.filePath, context).has(owner)) return true;
+  const around = context
+    .getNodesInFile(ref.filePath)
+    .filter((t) => CSHARP_TYPE_KINDS.has(t.kind) && t.startLine <= ref.line && t.endLine >= ref.line);
+  // No type around the name: the declaration wasn't recovered — nothing to judge by.
+  if (around.length === 0) return true;
+  const seen = new Set<string>();
+  const queue = around.map((t) => t.name);
+  while (queue.length > 0 && seen.size < 40) {
+    const name = queue.shift()!;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    if (name === owner) return true;
+    queue.push(...csharpSupertypesOf(name, context));
+  }
+  return false;
+}
+
+/** The simple names a C# type's declarations (every `partial` one) derive from. */
+function csharpSupertypesOf(typeName: string, context: ResolutionContext): string[] {
+  let memo = CSHARP_SUPERS.get(context);
+  if (!memo) CSHARP_SUPERS.set(context, (memo = new Map()));
+  const hit = memo.get(typeName);
+  if (hit) return hit;
+  const names: string[] = [];
+  for (const decl of context.getNodesByName(typeName)) {
+    if (decl.language !== 'csharp' || !CSHARP_TYPE_KINDS.has(decl.kind)) continue;
+    const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+    let head = lines.slice(decl.startLine - 1, decl.startLine + 8).join(' ');
+    head = head.slice(0, (head.indexOf('{') + 1 || head.length + 1) - 1);
+    let depth = 0;
+    let flat = '';
+    for (const ch of head) {
+      if (ch === '<' || ch === '(') depth++;
+      else if (ch === '>' || ch === ')') depth = Math.max(0, depth - 1);
+      else if (depth === 0) flat += ch;
+    }
+    const bases = new RegExp(`\\b${typeName}\\s*:\\s*(.*?)(?:\\bwhere\\b|$)`).exec(flat)?.[1] ?? '';
+    for (const m of bases.matchAll(/([A-Za-z_][\w.]*)/g)) names.push(m[1]!.split('.').pop()!);
+  }
+  memo.set(typeName, names);
+  return names;
+}
+
+/**
+ * The types a C# file sees through static usings: its own `using static
+ * A.B.Type;`, any file's `global using static`, and `<Using Include="A.B.Type"
+ * Static="true"/>` in the `.csproj` / `Directory.Build.props` files above it
+ * (AutoMapper imports its ExpressionBuilder helpers project-wide that way).
+ */
+function csharpStaticUsings(file: string, context: ResolutionContext): Set<string> {
+  let memo = CSHARP_STATIC_USINGS.get(context);
+  if (!memo) CSHARP_STATIC_USINGS.set(context, (memo = new Map()));
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const owners = new Set<string>(csharpProjectStaticUsings(path.posix.dirname(file), context, memo));
+  for (const m of (context.readFile(file) ?? '').matchAll(/^\s*(?:global\s+)?using\s+static\s+([\w.]+)\s*;/gm)) owners.add(m[1]!.split('.').pop()!);
+  memo.set(file, owners);
+  return owners;
+}
+
+/** Static usings that apply to every file under `dir`: project files on the way up, and every `global using static`. */
+function csharpProjectStaticUsings(dir: string, context: ResolutionContext, memo: Map<string, Set<string>>): Set<string> {
+  const key = `dir:${dir}`;
+  const hit = memo.get(key);
+  if (hit) return hit;
+  let owners: Set<string>;
+  if (dir === '.' || dir === '' || dir === '/') {
+    owners = new Set();
+    for (const f of context.getAllFiles()) {
+      if (!f.endsWith('.cs')) continue;
+      const text = context.readFile(f) ?? '';
+      if (!text.includes('global using static')) continue;
+      for (const m of text.matchAll(/^\s*global\s+using\s+static\s+([\w.]+)\s*;/gm)) owners.add(m[1]!.split('.').pop()!);
+    }
+  } else {
+    owners = new Set(csharpProjectStaticUsings(path.posix.dirname(dir), context, memo));
+  }
+  let entries: string[] = [];
+  try {
+    entries = fs.readdirSync(path.join(context.getProjectRoot(), dir === '.' ? '' : dir));
+  } catch {
+    entries = [];
+  }
+  for (const entry of entries) {
+    if (!/\.(?:csproj|props)$/i.test(entry)) continue;
+    let text = '';
+    try {
+      text = fs.readFileSync(path.join(context.getProjectRoot(), dir === '.' ? '' : dir, entry), 'utf8');
+    } catch {
+      continue;
+    }
+    for (const m of text.matchAll(/<Using\s+Include\s*=\s*"([\w.]+)"[^>]*\bStatic\s*=\s*"true"/gi)) owners.add(m[1]!.split('.').pop()!);
+  }
+  memo.set(key, owners);
+  return owners;
+}
+
 const OBJC_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
 const OBJC_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'field']);
 
@@ -2250,8 +2368,10 @@ export function matchByExactName(
     ? vbReceiverOf(ref, context) : null;
   const objcShape = ref.language === 'objc' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*:*(?:\w+:)*$/.test(ref.referenceName)
     ? objcCallShape(ref, context) : null;
+  const csharpBare = ref.language === 'csharp' && (ref.referenceKind === 'calls' || ref.referenceKind === 'references') && /^[A-Za-z_]\w*$/.test(ref.referenceName);
   const phpSelf = phpSelfReceiver(ref, context);
   const filtered = sameName.filter((n) =>
+    !(csharpBare && !isCsharpMemberInScope(n, ref, context)) &&
     !(objcShape === 'c-call' && OBJC_MEMBER_KINDS.has(n.kind)) &&
     !(objcShape === 'self-send' && !isObjcSelfSendTarget(n, ref, context)) &&
     !(vbReceiver !== null && !isVbMemberReachable(n, vbReceiver)) &&
@@ -3376,6 +3496,8 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   RUBY_ANCESTRY.delete(context);
   CFML_CHAINS.delete(context);
   OBJC_SUPERS.delete(context);
+  CSHARP_SUPERS.delete(context);
+  CSHARP_STATIC_USINGS.delete(context);
   LUA_LOCALS.delete(context);
   PHP_FILE_SCOPES.delete(context);
   JAVA_STATIC_IMPORTS.delete(context);
@@ -5377,6 +5499,7 @@ export function matchFuzzy(
     ? vbReceiverOf(ref, context) : null;
   const objcShape = ref.language === 'objc' && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*:*(?:\w+:)*$/.test(ref.referenceName)
     ? objcCallShape(ref, context) : null;
+  const csharpBare = ref.language === 'csharp' && (ref.referenceKind === 'calls' || ref.referenceKind === 'references') && /^[A-Za-z_]\w*$/.test(ref.referenceName);
   const phpSelf = phpSelfReceiver(ref, context);
   // Names are case-sensitive in every language but a handful: Rust's
   // `Bytes` is not the method `bytes`, Python's builtin `dir(…)` not a class
@@ -5398,6 +5521,7 @@ export function matchFuzzy(
     !(vbReceiver !== null && !isVbMemberReachable(n, vbReceiver)) &&
     !(objcShape === 'c-call' && OBJC_MEMBER_KINDS.has(n.kind)) &&
     !(objcShape === 'self-send' && !isObjcSelfSendTarget(n, ref, context)) &&
+    !(csharpBare && !isCsharpMemberInScope(n, ref, context)) &&
     !(phpSelf && (n.kind !== 'method' || !isPhpMethodInScope(n, ref, phpSelf, context))))
     .filter((n) => (ref.referenceKind !== 'references' && ref.referenceKind !== 'function_ref') ||
       sameLanguageFamily(n.language, ref.language));
