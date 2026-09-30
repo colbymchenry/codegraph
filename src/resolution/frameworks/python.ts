@@ -223,9 +223,10 @@ export const flaskResolver: FrameworkResolver = {
       language: 'python',
     });
     const restful = extractFlaskRestful(filePath, safe);
+    const rules = extractFlaskUrlRules(filePath, safe);
     return {
-      nodes: [...decorator.nodes, ...restful.nodes],
-      references: [...decorator.references, ...restful.references],
+      nodes: [...decorator.nodes, ...restful.nodes, ...rules.nodes],
+      references: [...decorator.references, ...restful.references, ...rules.references],
     };
   },
 };
@@ -535,6 +536,96 @@ function extractFlaskRestful(filePath: string, safe: string): FrameworkExtractio
     }
   }
   return { nodes, references };
+}
+
+/**
+ * Flask's imperative registration: `bp.add_url_rule('/path', 'name',
+ * view_func=View.as_view('name'), methods=[…])`, and a project's own wrapper
+ * around it — any call handing a list of path strings and a `view_func=`
+ * over, like flaskbb's `register_view(auth, routes=["/login"],
+ * view_func=Login.as_view("login"))`. A class-based view (`X.as_view(…)`)
+ * serves whatever verbs it defines, so its route is ANY unless `methods=`
+ * says; a plain function defaults to GET, as Flask does.
+ */
+function extractFlaskUrlRules(filePath: string, safe: string): FrameworkExtractionResult {
+  const nodes: Node[] = [];
+  const references: UnresolvedRef[] = [];
+  const now = Date.now();
+  const seen = new Set<string>();
+  const opener = /(\.add_url_rule|\b[A-Za-z_]\w*)\s*\(/g;
+  let m: RegExpExecArray | null;
+  while ((m = opener.exec(safe)) !== null) {
+    const open = m.index + m[0].length;
+    const args = balancedArgs(safe, open);
+    if (args === null || !/\bview_func\s*=|\.add_url_rule/.test(m[1]! + args)) continue;
+    const isRule = m[1] === '.add_url_rule';
+    let paths: string[] = [];
+    if (isRule) {
+      const first = /^\s*(?:rule\s*=\s*)?(['"])([^'"]*)\1/.exec(args);
+      if (first) paths = [first[2]!];
+    } else {
+      const list = /(?:^|,)\s*(?:routes|rules|urls|paths)?\s*=?\s*\[((?:\s*(['"])[^'"]*\2\s*,?)+)\]/.exec(args);
+      if (list) paths = (list[1]!.match(/(['"])([^'"]*)\1/g) ?? []).map((q) => q.slice(1, -1));
+    }
+    paths = paths.filter((p) => p.startsWith('/'));
+    if (paths.length === 0) continue;
+    // `view_func=X` / `view_func=X.as_view(…)`, or add_url_rule's third positional argument.
+    const expr = /\bview_func\s*=\s*([A-Za-z_][\w.]*)/.exec(args)?.[1] ??
+      (isRule ? /^\s*(['"])[^'"]*\1\s*,\s*(?:(['"])[^'"]*\2|None)\s*,\s*([A-Za-z_][\w.]*)/.exec(args)?.[3] : undefined);
+    if (!expr) continue;
+    const classView = expr.endsWith('.as_view');
+    const target = classView ? expr.slice(0, -'.as_view'.length) : expr;
+    const listed = /\bmethods\s*=\s*[[(]([^\])]*)[\])]/.exec(args)?.[1];
+    const methods = listed
+      ? (listed.match(/['"](\w+)['"]/g) ?? []).map((q) => q.slice(1, -1).toUpperCase())
+      : [classView ? 'ANY' : 'GET'];
+    const line = safe.slice(0, m.index).split('\n').length;
+    const name = target.split('.').pop()!;
+    for (const routePath of paths) {
+      for (const method of methods) {
+        const id = `route:${filePath}:${line}:${method}:${routePath}`;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        nodes.push({
+          id,
+          kind: 'route',
+          name: `${method} ${routePath}`,
+          qualifiedName: `${filePath}::${method}:${routePath}`,
+          filePath,
+          startLine: line,
+          endLine: line,
+          startColumn: 0,
+          endColumn: 0,
+          language: 'python',
+          updatedAt: now,
+        });
+        references.push({ fromNodeId: id, referenceName: name, referenceKind: 'references', line, column: 0, filePath, language: 'python' });
+      }
+    }
+    opener.lastIndex = open + args.length;
+  }
+  return { nodes, references };
+}
+
+/** The text between an opening `(` at `open` and its matching `)`, or null. Strings are skipped. */
+function balancedArgs(text: string, open: number): string | null {
+  let depth = 1;
+  let quote = '';
+  for (let i = open; i < text.length && i < open + 4000; i++) {
+    const ch = text[i]!;
+    if (quote) {
+      if (ch === '\\') i++;
+      else if (ch === quote) quote = '';
+      continue;
+    }
+    if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === '(' || ch === '[' || ch === '{') depth++;
+    else if (ch === ')' || ch === ']' || ch === '}') {
+      depth--;
+      if (depth === 0) return text.slice(open, i);
+    }
+  }
+  return null;
 }
 
 // Directory patterns
