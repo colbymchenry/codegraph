@@ -1159,6 +1159,85 @@ function isPythonNameImportedFromOutside(name: string, ref: UnresolvedRef, conte
   return !local;
 }
 
+const JAVA_TYPE_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'enum', 'struct', 'record', 'trait']);
+const JAVA_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
+const JAVA_STATIC_IMPORTS = new WeakMap<ResolutionContext, Map<string, { owners: Set<string>; members: Set<string> }>>();
+
+/**
+ * A bare Java call — `verify(mock)`, `helper()`, `this.x()`, `super.x()` —
+ * reaches a method of a class around it, of one of that class's supertypes, or
+ * one the file imports statically. Not some other class's method of that name:
+ * halo's tests' Mockito `verify(…)` and `eq(…)` bound 1,038 calls to an
+ * `EmailVerificationService.verify` and 845 to a builder's `eq`. Supertypes are
+ * read from the declarations — the resolved `extends` edges do not exist yet on
+ * the first pass.
+ */
+function isJavaMethodInScope(method: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const cut = method.qualifiedName.lastIndexOf('::');
+  if (cut < 0) return true;
+  const owner = method.qualifiedName.slice(0, cut).split('::').pop()!;
+  const imports = javaStaticImportsOf(ref.filePath, context);
+  if (imports.owners.has(owner) || imports.members.has(`${owner}.${ref.referenceName}`)) return true;
+  const around = context
+    .getNodesInFile(ref.filePath)
+    .filter((n) => JAVA_TYPE_KINDS.has(n.kind) && n.startLine <= ref.line && n.endLine >= ref.line);
+  const seen = new Set<string>();
+  const queue = around.map((n) => n.name);
+  while (queue.length > 0 && seen.size < 40) {
+    const name = queue.shift()!;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    if (name === owner) return true;
+    queue.push(...javaSupertypesOf(name, context));
+  }
+  return false;
+}
+
+/** The simple names a Java type's declarations extend or implement. */
+function javaSupertypesOf(typeName: string, context: ResolutionContext): string[] {
+  let memo = JAVA_SUPERS.get(context);
+  if (!memo) {
+    memo = new Map();
+    JAVA_SUPERS.set(context, memo);
+  }
+  const hit = memo.get(typeName);
+  if (hit) return hit;
+  const names: string[] = [];
+  for (const decl of context.getNodesByName(typeName)) {
+    if (decl.language !== 'java' || !JAVA_TYPE_KINDS.has(decl.kind)) continue;
+    const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+    const head = lines.slice(decl.startLine - 1, decl.startLine + 5).join(' ');
+    const clause = /\b(?:extends|implements)\b([^{]*)\{/.exec(head)?.[1] ?? '';
+    const flat = clause.replace(/<[^<>]*(?:<[^<>]*>[^<>]*)*>/g, '');
+    for (const m of flat.matchAll(/([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)/g)) {
+      const simple = m[1]!.split('.').pop()!;
+      if (simple !== 'extends' && simple !== 'implements') names.push(simple);
+    }
+  }
+  memo.set(typeName, names);
+  return names;
+}
+
+/** A Java file's `import static a.b.Owner.member;` / `import static a.b.Owner.*;`. */
+function javaStaticImportsOf(filePath: string, context: ResolutionContext): { owners: Set<string>; members: Set<string> } {
+  let memo = JAVA_STATIC_IMPORTS.get(context);
+  if (!memo) {
+    memo = new Map();
+    JAVA_STATIC_IMPORTS.set(context, memo);
+  }
+  const hit = memo.get(filePath);
+  if (hit) return hit;
+  const found = { owners: new Set<string>(), members: new Set<string>() };
+  const text = context.readFile(filePath) ?? '';
+  for (const m of text.matchAll(/^\s*import\s+static\s+([\w.$]+)\s*\.\s*(\*|[\w$]+)\s*;/gm)) {
+    const owner = m[1]!.split('.').pop()!;
+    if (m[2] === '*') found.owners.add(owner);
+    else found.members.add(`${owner}.${m[2]}`);
+  }
+  memo.set(filePath, found);
+  return found;
+}
+
 /** Names the Rust prelude puts in every module; a project item of the same name needs a `use` to shadow one. */
 const RUST_PRELUDE = new Set([
   'Ok', 'Err', 'Some', 'None', 'Result', 'Option', 'Box', 'Vec', 'String', 'Default', 'Drop', 'Iterator',
@@ -1449,7 +1528,9 @@ export function matchByExactName(
   const typeRef = isDotNetTypeRef(ref, context);
   const rustBare = ref.language === 'rust' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
   const pythonShape = pythonCallShape(ref, context);
+  const javaBare = ref.language === 'java' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   const candidates = sameName.filter((n) =>
+    !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)) &&
     !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)) &&
     !(rustBare && !isRustNameInScope(n, ref, context)) &&
     !(cMacroCall && n.kind !== 'function' && n.kind !== 'method') &&
@@ -2553,6 +2634,8 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   RUST_TRAIT_IMPL_MEMO.delete(context);
   RUST_USES.delete(context);
   LEXICAL_SCOPE_MEMO.delete(context);
+  JAVA_SUPERS.delete(context);
+  JAVA_STATIC_IMPORTS.delete(context);
   PY_IMPORTS.delete(context);
   PY_MODULE_LOCAL.delete(context);
   SEALED_MODULES.delete(context);
@@ -4461,12 +4544,14 @@ export function matchFuzzy(
   const typeRef = isDotNetTypeRef(ref, context);
   const rustBare = ref.language === 'rust' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
   const pythonShape = pythonCallShape(ref, context);
+  const javaBare = ref.language === 'java' && ref.referenceKind === 'calls' && /^[A-Za-z_$][\w$]*$/.test(ref.referenceName);
   // Rust and Python names are case-sensitive: `Bytes` is not the method `bytes`,
   // Python's builtin `dir(…)` not a class `Dir`.
   const callableCandidates = candidates.filter((n) => callableKinds.has(n.kind) && !(typeRef && !canNameInTypePosition(n)) &&
     !(rustBare && (n.name !== ref.referenceName || !isRustNameInScope(n, ref, context))) &&
     !(ref.language === 'python' && n.name !== ref.referenceName) &&
-    !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)))
+    !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)) &&
+    !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)))
     .filter((n) => (ref.referenceKind !== 'references' && ref.referenceKind !== 'function_ref') ||
       sameLanguageFamily(n.language, ref.language));
 
