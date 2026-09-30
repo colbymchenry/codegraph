@@ -15,6 +15,12 @@
  * flags remain possible, so only definite macro visibility suppresses a call.
  * Object-like definitions participate in conditions but never enter the cached
  * call-site timelines (vendor headers can contain tens of thousands of them).
+ *
+ * A guard the walk cannot decide (`#define X_H 1`, or any header reached under
+ * an unknown `#if`) re-enters its header on every inclusion path, which is
+ * exponential in the include graph's depth (#2127). A re-entry that provably
+ * repeats an earlier visit which changed nothing is skipped, and a hard budget
+ * bounds whatever is left: past it, nothing is known and nothing is suppressed.
  */
 import * as path from 'path';
 import { maskCppRawStrings } from '../extraction/languages/c-cpp';
@@ -29,17 +35,22 @@ type FileEvent =
   | { kind: 'branch'; op: string; expression: string; guard: boolean; line: number }
   | { kind: 'once'; line: number };
 type Event = { line: number; defined: Truth };
+/** Macro name → events in root-file line order; from `cutoff` on, nothing is known. */
+type Timeline = { events: Map<string, Event[]>; cutoff: number };
 type Cache = {
   summaries: Map<string, FileEvent[]>;
   includes: Map<string, string | null>;
   /** Indexed files by basename, for `#include "dir/name.h"` that no include root explains. */
   byBasename: Map<string, string[]> | null;
   /** Per root file: macro name → define/undef events in root-file line order. */
-  roots: Map<string, Map<string, Event[]>>;
+  roots: Map<string, Timeline>;
 };
 
 const memo = new WeakMap<ResolutionContext, Cache>();
 const ROOT_TIMELINE_CAP = 32;
+/** Directive events one translation-unit walk may evaluate (#2127). */
+const WALK_EVENT_BUDGET = 1_000_000;
+const NO_CUTS: string[] = [];
 
 const and = (a: Truth, b: Truth): Truth =>
   a === false || b === false ? false : a === true && b === true ? true : undefined;
@@ -79,7 +90,8 @@ export function isVisibleCppMacro(ref: UnresolvedRef, context: ResolutionContext
     if (cache.roots.size >= ROOT_TIMELINE_CAP) cache.roots.delete(cache.roots.keys().next().value!);
     cache.roots.set(rootKey, timeline);
   }
-  const before = (timeline.get(ref.referenceName) ?? []).filter((e) => e.line <= ref.line);
+  if (ref.line >= timeline.cutoff) return false;
+  const before = (timeline.events.get(ref.referenceName) ?? []).filter((e) => e.line <= ref.line);
   return before.length > 0 && before[before.length - 1]!.defined === true;
 }
 
@@ -250,12 +262,24 @@ function walkTranslationUnit(
   language: UnresolvedRef['language'],
   context: ResolutionContext,
   cache: Cache
-): Map<string, Event[]> {
+): Timeline {
   const timeline = new Map<string, Event[]>();
   const definitions = new Map<string, { defined: Truth; value: Truth; macro: Truth }>();
   const scanning = new Set<string>();
   const macroNames = new Set<string>();
   const once = new Map<string, Truth>();
+  // Every change a later directive could observe (definitions, `#pragma once`,
+  // the macro-name set) bumps `version`. A visit that left it unchanged, entered
+  // again with the same inherited truth while it is still unchanged, starts from
+  // the same state, so it would take the same branches and change nothing again;
+  // the events it would push repeat each name's current state, which is already
+  // its last event. Include cycles cut by the recursion stack (`cuts`) must still
+  // be cut for the repeat to hold.
+  let version = 0;
+  const cuts: string[] = [];
+  const visits = new Map<string, { inherited: Truth; start: number; end: number; cuts: string[] }>();
+  let budget = WALK_EVENT_BUDGET;
+  let cutoff = Infinity;
   const condition = (expression: string): Truth => {
     const text = expression.trim();
     if (/^(?:0x[\da-f]+|\d+)[uUlL]*$/i.test(text)) return Number(text.replace(/[uUlL]+$/, '')) !== 0;
@@ -267,12 +291,28 @@ function walkTranslationUnit(
     return /^\w+$/.test(text) ? definitions.get(text)?.value : undefined;
   };
   const scan = (file: string, inherited: Truth, includeLine?: number): void => {
-    if (inherited === false || scanning.has(file) || once.get(file) === true) return;
+    if (inherited === false || once.get(file) === true || cutoff !== Infinity) return;
+    if (scanning.has(file)) {
+      cuts.push(file);
+      return;
+    }
+    const seen = visits.get(file);
+    if (
+      seen && seen.inherited === inherited && seen.start === seen.end && seen.end === version &&
+      seen.cuts.every((c) => scanning.has(c))
+    ) {
+      cuts.push(...seen.cuts);
+      return;
+    }
+    const start = version;
+    const firstCut = cuts.length;
     scanning.add(file);
     let active: Truth = inherited;
     const frames: Array<{ parent: Truth; taken: Truth }> = [];
     for (const ev of summarize(file, context, cache)) {
       const line = includeLine ?? ev.line;
+      if (cutoff === Infinity && --budget < 0) cutoff = line;
+      if (cutoff !== Infinity) break;
       if (ev.kind === 'branch') {
         if (ev.op === 'if' || ev.op === 'ifdef' || ev.op === 'ifndef') {
           const known = definitions.get(ev.expression.trim())?.defined;
@@ -294,7 +334,9 @@ function walkTranslationUnit(
       }
       if (active === false) continue;
       if (ev.kind === 'once') {
-        once.set(file, or(once.get(file) ?? false, active));
+        const next = or(once.get(file) ?? false, active);
+        if (next !== (once.get(file) ?? false)) version++;
+        once.set(file, next);
         continue;
       }
       if (ev.kind === 'include') {
@@ -309,12 +351,17 @@ function walkTranslationUnit(
       // A name no directive has touched is unknown, not undefined: the build
       // can set it on the command line. So an `#undef` under an undecidable
       // `#if` leaves it unknown (#2069); only a certain one clears it.
-      definitions.set(ev.name, {
+      const next = {
         defined: defining ? or(prior?.defined, active) : and(prior?.defined, not(active)),
         value: defining && active === true ? condition(ev.value) : undefined,
         macro: now,
-      });
-      if (ev.functionLike) macroNames.add(ev.name);
+      };
+      if (next.defined !== prior?.defined || next.value !== prior?.value || next.macro !== prior?.macro) version++;
+      definitions.set(ev.name, next);
+      if (ev.functionLike && !macroNames.has(ev.name)) {
+        macroNames.add(ev.name);
+        version++;
+      }
       if (macroNames.has(ev.name)) {
         const events = timeline.get(ev.name) ?? [];
         events.push({ line, defined: now });
@@ -322,8 +369,11 @@ function walkTranslationUnit(
       }
     }
     scanning.delete(file);
+    const own = cuts.length > firstCut ? [...new Set(cuts.splice(firstCut))] : NO_CUTS;
+    cuts.push(...own);
+    visits.set(file, { inherited, start, end: version, cuts: own });
   };
 
   scan(rootFile, true);
-  return timeline;
+  return { events: timeline, cutoff };
 }
