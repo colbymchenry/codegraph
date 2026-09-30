@@ -1984,6 +1984,28 @@ function isPhpMethodInScope(method: Node, ref: UnresolvedRef, via: 'self' | 'par
   return up.leavesRepo && context.getNodesByQualifiedName(ownerQn).some((d) => d.kind === 'trait');
 }
 
+/**
+ * Whether a PHP receiver is named after a class that has `method` in its
+ * ancestry: `$page->save()` → Page, which extends Entity; `$newRole->users()`
+ * → Role. BookStack's `$role->save()` is not Entity's (Role is a Model).
+ */
+function phpReceiverReaches(receiver: string, method: Node, context: ResolutionContext): boolean {
+  const cut = method.qualifiedName.lastIndexOf('::');
+  if (cut < 0) return false;
+  const owner = method.qualifiedName.slice(0, cut);
+  const last = receiver.split('.').pop()!.replace(/^\$/, '');
+  if (!last) return false;
+  const words = splitCamelCase(last);
+  const names = new Set([last, words[words.length - 1] ?? last].map((w) => w.charAt(0).toUpperCase() + w.slice(1)));
+  for (const name of names) {
+    for (const decl of context.getNodesByName(name)) {
+      if (decl.language !== 'php' || !PHP_TYPE_KINDS.has(decl.kind)) continue;
+      if (phpAncestry([decl.qualifiedName], context).qns.has(owner)) return true;
+    }
+  }
+  return false;
+}
+
 /** Every type `start` reaches through `extends` and trait `use`, and whether it left the repository on the way. */
 function phpAncestry(start: readonly string[], context: ResolutionContext): { qns: Set<string>; leavesRepo: boolean } {
   const qns = new Set<string>();
@@ -4496,7 +4518,8 @@ export function matchMethodCall(
     if (targetMethods.length === 1 && !narrowed && targetMethods[0]!.language === ref.language &&
         !(UNTYPED_RECEIVER_LANGUAGES.has(ref.language) && !/^(?:self|self\.class|this|super|weak_?self|strong_?self)$/i.test(objectOrClass!) &&
           !sharesReceiverWord(objectOrClass!, targetMethods[0]!) &&
-          !(ref.language === 'objc' && objcReceiverReaches(objectOrClass!, targetMethods[0]!, context)))) {
+          !(ref.language === 'objc' && objcReceiverReaches(objectOrClass!, targetMethods[0]!, context)) &&
+          !(ref.language === 'php' && phpReceiverReaches(objectOrClass!, targetMethods[0]!, context)))) {
       return {
         original: ref,
         targetNodeId: targetMethods[0]!.id,
@@ -5302,9 +5325,11 @@ function hasParameterBinding(code: string, escapedName: string): boolean {
  * Languages whose receivers nothing types, where a unique method name alone
  * is no evidence: CFML's `server.keyExists()` is the struct member function,
  * not the one component method named `keyExists`; Objective-C's
- * `image.respondsToSelector:` is NSObject's, not a proxy class's override.
+ * `image.respondsToSelector:` is NSObject's, not a proxy class's override;
+ * PHP's `$request->has()` is the framework request's, not a settings
+ * service's.
  */
-const UNTYPED_RECEIVER_LANGUAGES: ReadonlySet<string> = new Set(['ruby', 'cfml', 'cfscript', 'objc']);
+const UNTYPED_RECEIVER_LANGUAGES: ReadonlySet<string> = new Set(['ruby', 'cfml', 'cfscript', 'objc', 'php']);
 
 /**
  * Whether a receiver is named after the owner of `method`, case aside: the
