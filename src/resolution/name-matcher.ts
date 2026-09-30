@@ -1012,6 +1012,22 @@ function luaLocalDecl(name: string, file: string, line: number, context: Resolut
     if (!isLuaLocal(n, context)) continue;
     if (!best || n.startLine > best.startLine) best = n;
   }
+  // A function's own locals are not nodes: kong's `local clear_header =
+  // kong.response.clear_header` inside an access handler. Read the nearest
+  // one above the call within the innermost function around it.
+  const fn = fns.filter((f) => f.startLine <= line && line <= f.endLine && f.startLine < line)
+    .sort((a, b) => (a.endLine - a.startLine) - (b.endLine - b.startLine))[0];
+  if (fn && (!best || best.startLine < fn.startLine)) {
+    const lines = context.getFileLines?.(file) ?? context.readFile(file)?.split(/\r?\n/) ?? [];
+    const decl = new RegExp(`^\\s*local\\s+${name}\\s*=\\s*(.+?)\\s*$`);
+    for (let at = line - 1; at > fn.startLine; at--) {
+      const m = decl.exec(lines[at - 1] ?? '');
+      if (!m) continue;
+      const fileNode = nodes.find((n) => n.kind === 'file');
+      if (!fileNode) break;
+      return { ...fileNode, name, kind: 'variable', signature: `= ${m[1]}`, startLine: at, endLine: at };
+    }
+  }
   return best;
 }
 
@@ -1044,7 +1060,17 @@ function luaAliasExpr(rhs: string, site: LuaSite, context: ResolutionContext, de
     return undefined;
   }
   if (path.length === 0) return LUA_GLOBAL_FUNCTIONS.has(root) ? null : undefined;
-  if (!LUA_LIBRARY_TABLES.has(root) || path.length !== 1) return undefined;
+  if (!LUA_LIBRARY_TABLES.has(root)) {
+    // A member of a global table the host provides — kong's `local clear_header =
+    // kong.response.clear_header` — is the one method of a table named after its holder.
+    const member = path[path.length - 1]!;
+    const holder = path.length > 1 ? path[path.length - 2]! : root;
+    const owned = context.getNodesByName(member).filter((n) =>
+      (n.language === 'lua' || n.language === 'luau') && n.kind === 'method' && sharesReceiverWord(holder, n) &&
+      !(isTestPath(n.filePath) && !isTestPath(site.file)));
+    return owned.length === 1 ? owned[0]! : undefined;
+  }
+  if (path.length !== 1) return undefined;
   // A library function the project patches itself (kong's `ngx.sleep`) is the project's —
   // a test's stand-in (`function ngx.get_phase()` in a spec) only for that test.
   const patched = context.getNodesByName(path[0]!).filter((n) =>
@@ -3822,6 +3848,7 @@ export function matchByExactName(
   const bareNoMembers = isBareGoCall(ref, context) || isBareRCall(ref, context);
   const solidityBare = isReceiverLessSolidityCall(ref, context);
   const barePhp = isBarePhpCall(ref, context);
+  const luaBareCall = (ref.language === 'lua' || ref.language === 'luau') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName);
   // A type, a value or an import the file binds from a package outside the
   // repository names nothing in it, whatever kind of reference it is.
   if (!bareJs && JS_FAMILY.has(ref.language) && ref.referenceKind !== 'calls' &&
@@ -3913,6 +3940,8 @@ export function matchByExactName(
     !((bareJs || bareNoMembers) && TYPE_MEMBER_KINDS.has(n.kind)) &&
     // A bare PHP call is a function call: nothing else is callable without a receiver.
     !(barePhp && n.kind !== 'function') &&
+    // Nor is a table's method (`function M.x`, `function M:x`) in Lua, without its table.
+    !(luaBareCall && n.kind === 'method') &&
     // A Vue component's own method is `this.m()` inside that component — not
     // `this.$refs['input'].click()` on an element another component renders.
     !(ref.referenceKind === 'calls' && JS_FAMILY.has(ref.language) && isVueComponentMethod(n) && !isThisCallInOwnFile(n, ref, context)) &&
@@ -7806,6 +7835,10 @@ function matchReferenceInner(
   if ((ref.language === 'lua' || ref.language === 'luau') && ref.referenceKind === 'calls' && /^[A-Za-z_]\w*$/.test(ref.referenceName)) {
     const aliased = luaAliasTarget(ref, context);
     if (aliased !== undefined) return aliased;
+    // `ipairs(t)` is Lua's, unless the file defines its own: telescope's 122
+    // `for _, v in ipairs(…)` went to a linked list's `ipairs` method.
+    if (LUA_GLOBAL_FUNCTIONS.has(ref.referenceName) &&
+        !context.getNodesInFile(ref.filePath).some((n) => n.name === ref.referenceName && n.kind === 'function')) return null;
   }
 
   // Erlang `-behaviour(m)` refs target a MODULE. Letting them fall through to
