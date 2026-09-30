@@ -944,6 +944,11 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
     return ref.filePath.startsWith(owner + '/');
   }
   if (PRIVATE_IS_FILE_LOCAL.has(lang)) return candidate.visibility !== 'private';
+  // An R test file runs in an environment of its own (testthat): its top-level
+  // `c <- ggplot(…)` is not what the package's 2,843 `c(…)` calls mean. The
+  // `helper-*.R` / `setup-*.R` files are sourced for every test, so theirs are shared.
+  if (lang === 'r' && (candidate.kind === 'variable' || candidate.kind === 'constant') &&
+      /(?:^|\/)tests?\//.test(candidate.filePath) && !/(?:^|\/)(?:helper|setup)[^/]*\.[rR]$/.test(candidate.filePath)) return false;
   // A Lua `local` belongs to its chunk: kong's spec helpers' `local it = it`
   // took busted's `it(…)` in every other spec file, 4,166 times.
   if ((lang === 'lua' || lang === 'luau') && isLuaLocal(candidate, context)) return false;
