@@ -172,6 +172,16 @@ function pathSegments(text: string): string[] | null {
     return value.split('/').filter((s) => s.length > 0);
   }
   if (CONSTANT_PATH.test(trimmed)) return [`{${trimmed.replace(/\s+/g, '')}}`];
+  // `` `issue/:${ProjectConst.IssueId}` ``: a template whose holes are constants.
+  if (trimmed.startsWith('`') && skipString(trimmed, 0) === trimmed.length - 1) {
+    let ok = true;
+    const body = trimmed.slice(1, -1).replace(/\$\{([^}]*)\}/g, (_all, hole: string) => {
+      if (!CONSTANT_PATH.test(hole.trim())) ok = false;
+      return `{${hole.replace(/\s+/g, '')}}`;
+    });
+    if (ok && !body.includes('**')) return body.split('/').filter((seg) => seg.length > 0);
+    return null;
+  }
   // `internalRoutes.account.subRoutes.access.path + '/:id'`: each part a
   // string or a constant, the constant a whole segment of its own.
   if (trimmed.includes('+')) {
@@ -225,8 +235,11 @@ function componentRef(field: 'component' | 'loadComponent', text: string): Angul
 function lazyImport(text: string): { spec: string; member: string | null } | null {
   const imp = /\bimport\s*\(\s*(['"`])([^'"`]+)\1\s*\)/.exec(text);
   if (!imp) return null;
-  const then = /\.then\s*\(\s*\(?\s*([A-Za-z_$][\w$]*)\s*\)?\s*=>\s*\(?\s*\1\s*\.\s*([A-Za-z_$][\w$]*)/.exec(text.slice(imp.index + imp[0].length));
-  return { spec: imp[2]!, member: then ? then[2]! : null };
+  const after = text.slice(imp.index + imp[0].length);
+  const then = /^\s*\.then\s*\(\s*\(?\s*([A-Za-z_$][\w$]*)\s*\)?\s*=>\s*\(?\s*\1\s*\.\s*([A-Za-z_$][\w$]*)/.exec(after);
+  // `async () => (await import('./x')).HomeModule`
+  const awaited = /^\s*\)\s*\.\s*([A-Za-z_$][\w$]*)/.exec(after);
+  return { spec: imp[2]!, member: then ? then[2]! : awaited ? awaited[1]! : null };
 }
 
 function joinPath(segs: readonly string[]): string {
@@ -395,9 +408,12 @@ function resolvedSegments(pathText: string, file: string, context: ResolutionCon
     .split('/')
     .filter((seg) => seg.length > 0)
     .flatMap((seg) => {
-      if (!seg.startsWith('{') || !seg.endsWith('}')) return [seg];
-      const value = constantValue(seg.slice(1, -1), file, context);
-      return value === null ? [seg] : value.split('/').filter((v) => v.length > 0);
+      if (seg.startsWith('{') && seg.endsWith('}') && seg.indexOf('{', 1) < 0) {
+        const value = constantValue(seg.slice(1, -1), file, context);
+        return value === null ? [seg] : value.split('/').filter((v) => v.length > 0);
+      }
+      // `:{ProjectConst.IssueId}` — a constant inside a segment.
+      return [seg.replace(/\{([^{}]+)\}/g, (all, expr: string) => constantValue(expr, file, context) ?? all)];
     });
 }
 
@@ -413,21 +429,48 @@ function routeComponent(encoded: string, fromFile: string, context: ResolutionCo
 // The cross-file pass: mounts and constant paths
 // =============================================================================
 
-/** The file a routes import names, and — for an NgModule — the routing modules it imports. */
+/**
+ * The file a routes import names, and — for an NgModule — the routing modules
+ * it imports. A barrel is looked through first: an Nx library is imported by
+ * its alias (`@angular-spotify/web/home/feature`), which names the library's
+ * `src/index.ts`, whose `export * from './lib/home.module'` names the module.
+ */
 function routeFilesLoadedBy(spec: string, fromFile: string, context: ResolutionContext, routeFiles: ReadonlySet<string>, mountFiles: ReadonlySet<string>): string[] {
   const target = resolveImportPath(spec, fromFile, 'typescript', context);
-  if (!target) return [];
-  if (routeFiles.has(target) || mountFiles.has(target)) return [target];
-  // `loadChildren: () => import('./layout/layout.module').then(m => m.LayoutModule)`:
-  // the module holds no routes; the routing module it imports does.
-  const content = context.readFile(target);
-  if (!content) return [];
+  const seen = new Set<string>();
   const out: string[] = [];
-  const imports = /\bimport\s+[^'"]*?from\s+(['"])([^'"]+)\1/g;
-  let m: RegExpExecArray | null;
-  while ((m = imports.exec(content)) !== null) {
-    const file = resolveImportPath(m[2]!, target, 'typescript', context);
-    if (file && (routeFiles.has(file) || mountFiles.has(file))) out.push(file);
+  // A barrel can re-export another barrel; a few hops settle it.
+  let barrels = target ? [target] : [];
+  for (let hop = 0; hop < 4 && barrels.length > 0; hop++) {
+    const next: string[] = [];
+    for (const file of barrels) {
+      if (seen.has(file)) continue;
+      seen.add(file);
+      if (routeFiles.has(file) || mountFiles.has(file)) {
+        out.push(file);
+        continue;
+      }
+      const content = context.readFile(file);
+      if (!content) continue;
+      // `loadChildren: () => import('./layout/layout.module').then(m => m.LayoutModule)`:
+      // the module holds no routes; the routing module it imports does.
+      if (/@NgModule\s*\(/.test(content)) {
+        const imports = /\bimport\s+[^'"]*?from\s+(['"])([^'"]+)\1/g;
+        let m: RegExpExecArray | null;
+        while ((m = imports.exec(content)) !== null) {
+          const imported = resolveImportPath(m[2]!, file, 'typescript', context);
+          if (imported && (routeFiles.has(imported) || mountFiles.has(imported)) && !out.includes(imported)) out.push(imported);
+        }
+        continue;
+      }
+      const reexports = /\bexport\s+(?:\*|\{[^}]*\})\s*(?:as\s+[\w$]+\s*)?from\s+(['"])([^'"]+)\1/g;
+      let m: RegExpExecArray | null;
+      while ((m = reexports.exec(content)) !== null) {
+        const reexported = resolveImportPath(m[2]!, file, 'typescript', context);
+        if (reexported && !seen.has(reexported)) next.push(reexported);
+      }
+    }
+    barrels = next;
   }
   return out;
 }
@@ -458,27 +501,66 @@ export function constantText(expr: string, fromFile: string, context: Resolution
   const [root, ...chain] = expr.split('.').map((part) => part.trim());
   let value: string | null = null;
   const file = root ? declaringFile(root, fromFile, context) : null;
-  const content = file ? context.readFile(file) : null;
-  if (content && chain.length > 0) {
+  const content = file && root ? declarationSource(root, file, context, 0) : null;
+  if (content && root && chain.length > 0) {
     const safe = stripCommentsForRegex(content, 'typescript');
-    const decl = new RegExp(String.raw`\b(?:const|let)\s+${root}\s*(?::[^=]+)?=\s*\{`).exec(safe);
-    if (decl) {
-      let start = decl.index + decl[0].length - 1;
+    const readChain = (open: number, links: readonly string[]): string | null => {
+      let start = open;
       let end = matchBracket(safe, start);
-      for (let i = 0; i < chain.length && end > start; i++) {
-        const field = readFields(safe, start, end).get(chain[i]!);
-        if (!field) break;
-        if (i === chain.length - 1) {
-          value = field.text.trim();
-          break;
-        }
+      for (let i = 0; i < links.length && end > start; i++) {
+        const field = readFields(safe, start, end).get(links[i]!);
+        if (!field) return null;
+        if (i === links.length - 1) return field.text.trim();
         start = safe.indexOf('{', field.at);
         end = start < 0 ? -1 : matchBracket(safe, start);
+      }
+      return null;
+    };
+    const decl = new RegExp(String.raw`\b(?:const|let)\s+${root}\s*(?::[^=]+)?=\s*\{`).exec(safe);
+    const enumDecl = decl ? null : new RegExp(String.raw`\benum\s+${root}\s*\{`).exec(safe);
+    const classDecl = decl || enumDecl ? null : new RegExp(String.raw`\bclass\s+${root}\b[^{]*\{`).exec(safe);
+    if (decl) value = readChain(decl.index + decl[0].length - 1, chain);
+    else if (enumDecl && chain.length === 1) {
+      // `enum Paths { Board = 'board' }`
+      const open = enumDecl.index + enumDecl[0].length - 1;
+      const body = safe.slice(open, Math.max(open, matchBracket(safe, open)));
+      value = new RegExp(String.raw`\b${chain[0]}\s*=\s*(['"\`][^'"\`]*['"\`])`).exec(body)?.[1] ?? null;
+    } else if (classDecl) {
+      // `class ProjectConst { static readonly IssueId = 'issueId' }`, and
+      // `class RouterUtil { static Configuration = { Visualizer: 'visualizer' } }`.
+      const open = classDecl.index + classDecl[0].length - 1;
+      const close = matchBracket(safe, open);
+      const body = close > open ? safe.slice(open, close) : '';
+      const field = new RegExp(String.raw`\bstatic\s+(?:readonly\s+)?${chain[0]}\s*(?::[^=;]+)?=\s*`).exec(body);
+      if (field) {
+        const at = open + field.index + field[0].length;
+        if (safe[at] === '{') value = chain.length > 1 ? readChain(at, chain.slice(1)) : null;
+        else if (chain.length === 1) value = /^(['"\`])[^'"\`]*\1/.exec(safe.slice(at))?.[0] ?? null;
       }
     }
   }
   memo.set(key, value);
   return value;
+}
+
+/**
+ * The source that declares `root`: `file` itself, or — when `file` is a
+ * barrel (an Nx library's `src/index.ts`) — the module it re-exports it from.
+ */
+function declarationSource(root: string, file: string, context: ResolutionContext, hops: number): string | null {
+  const content = context.readFile(file);
+  if (!content) return null;
+  if (new RegExp(String.raw`\b(?:const|let|class|enum)\s+${root}\b`).test(content)) return content;
+  if (hops >= 3) return null;
+  const reexports = /\bexport\s+(\*|\{[^}]*\})\s*from\s+(['"])([^'"]+)\2/g;
+  let m: RegExpExecArray | null;
+  while ((m = reexports.exec(content)) !== null) {
+    if (m[1] !== '*' && !new RegExp(String.raw`\b${root}\b`).test(m[1]!)) continue;
+    const target = resolveImportPath(m[3]!, file, 'typescript', context);
+    const found = target ? declarationSource(root, target, context, hops + 1) : null;
+    if (found) return found;
+  }
+  return null;
 }
 
 /** `create.path` as the chain its root was destructured from in `fromFile`, or null when the root is no local alias. */
@@ -522,6 +604,93 @@ function declaringFile(name: string, fromFile: string, context: ResolutionContex
 // Route table
 // =============================================================================
 
+interface AngularMounts {
+  /** Every file that lazy-loads routes, whether or not it declares a screen of its own. */
+  mountFiles: ReadonlySet<string>;
+  /** The path segments a file's routes sit under: its parent's prefix plus the mount's. */
+  prefixOf(file: string): string[];
+}
+
+const mountMemo = new WeakMap<ResolutionContext, { source: readonly Node[]; mounts: AngularMounts }>();
+
+/**
+ * Where every routes file is mounted — the `loadChildren` chain from the app
+ * down, settled from the top. Shared by the cross-file pass, which names the
+ * routes, and the route table, which reads the redirects in files that only
+ * mount others (jira-clone's `app.routes.ts` holds nothing but two mounts and
+ * `'' → 'project'`).
+ */
+function angularMounts(context: ResolutionContext, routes: readonly Node[]): AngularMounts {
+  const source = context.getNodesByKind('route');
+  const cached = mountMemo.get(context);
+  if (cached && cached.source === source) return cached.mounts;
+  const routeFiles = new Set(routes.map((r) => r.filePath));
+  const mountsByFile = new Map<string, AngularMount[]>();
+  for (const file of context.getAllFiles()) {
+    if (!/\.[cm]?ts$/.test(file) || !(context.fileContains?.(file, 'loadChildren') ?? context.readFile(file)?.includes('loadChildren'))) continue;
+    const content = context.readFile(file);
+    if (!content) continue;
+    const { mounts } = parseAngularRoutes(content);
+    if (mounts.length > 0) mountsByFile.set(file, mounts);
+  }
+  const mountFiles = new Set(mountsByFile.keys());
+  const loadedBy = new Map<string, { parent: string; prefix: string }>();
+  for (const [file, mounts] of mountsByFile) {
+    for (const mount of mounts) {
+      for (const target of routeFilesLoadedBy(mount.spec, file, context, routeFiles, mountFiles)) {
+        // A file mounted from two places keeps its first mount.
+        if (target !== file && !loadedBy.has(target)) loadedBy.set(target, { parent: file, prefix: mount.prefix });
+      }
+    }
+  }
+  const memo = new Map<string, string[]>();
+  const prefixOf = (file: string, seen: Set<string> = new Set()): string[] => {
+    const hit = memo.get(file);
+    if (hit !== undefined) return hit;
+    const mount = loadedBy.get(file);
+    let prefix: string[] = [];
+    if (mount && !seen.has(file)) {
+      seen.add(file);
+      prefix = [...prefixOf(mount.parent, seen), ...resolvedSegments(mount.prefix, mount.parent, context)];
+    }
+    memo.set(file, prefix);
+    return prefix;
+  };
+  const mounts: AngularMounts = { mountFiles, prefixOf: (file) => prefixOf(file) };
+  mountMemo.set(context, { source, mounts });
+  return mounts;
+}
+
+const workspaceRoots = new WeakMap<ResolutionContext, Map<string, string | null>>();
+
+/**
+ * The app a routes file belongs to. An Angular workspace — the directory an
+ * `angular.json` or an Nx `nx.json` sits in — is one app however its routes
+ * are split: angular-spotify declares its screens across a dozen `libs/*`
+ * packages, each with a `src/` of its own, and keyed by those every
+ * template's `routerLink` looked for its routes in the wrong table. Outside a
+ * workspace, the conventional app root.
+ */
+function angularAppRoot(filePath: string, context: ResolutionContext): string {
+  let memo = workspaceRoots.get(context);
+  if (!memo) workspaceRoots.set(context, (memo = new Map()));
+  const slash = filePath.lastIndexOf('/');
+  const dir = slash < 0 ? '' : filePath.slice(0, slash);
+  let found = memo.get(dir);
+  if (found === undefined) {
+    found = null;
+    for (let d: string | null = dir; d !== null; d = d === '' ? null : d.includes('/') ? d.slice(0, d.lastIndexOf('/')) : '') {
+      const at = d === '' ? '' : `${d}/`;
+      if (context.fileExists(`${at}angular.json`) || context.fileExists(`${at}nx.json`)) {
+        found = at;
+        break;
+      }
+    }
+    memo.set(dir, found);
+  }
+  return found ?? appRootFor(filePath);
+}
+
 export type AngularRouteTable = RootedRouteTable;
 
 const tables = new WeakMap<ResolutionContext, AngularRouteTable>();
@@ -534,7 +703,7 @@ export function angularRouteTable(context: ResolutionContext): AngularRouteTable
   const byFile = new Map<string, Node>();
   for (const node of all) {
     if (!isAngularRoute(node) || !node.name.startsWith('/')) continue;
-    const root = appRootFor(node.filePath);
+    const root = angularAppRoot(node.filePath, context);
     let t = byRoot.get(root);
     if (!t) byRoot.set(root, (t = { source: all, exact: new Map(), dynamic: [] }));
     addRouteTo(t, node.name, node);
@@ -545,13 +714,21 @@ export function angularRouteTable(context: ResolutionContext): AngularRouteTable
   // in-file paths. A chain (`/` → `/pages` → `/pages/dashboard`) settles in
   // a few passes.
   const aliases: Array<{ table: RouteTable; from: string; to: string }> = [];
+  const mounts = byFile.size > 0 ? angularMounts(context, all.filter(isAngularRoute)) : null;
+  const redirectFiles = new Map<string, string[]>();
   for (const [file, sample] of byFile) {
-    const content = context.readFile(file);
-    if (!content || !content.includes('redirectTo')) continue;
     const own = resolvedSegments(inFilePath(sample), file, context);
     const full = sample.name.split('/').filter((seg) => seg.length > 0);
-    const prefix = full.slice(0, Math.max(0, full.length - own.length));
-    const table = byRoot.get(appRootFor(file));
+    redirectFiles.set(file, full.slice(0, Math.max(0, full.length - own.length)));
+  }
+  // A file that only mounts others can still redirect: its prefix is where it is mounted.
+  for (const file of mounts?.mountFiles ?? []) {
+    if (!redirectFiles.has(file)) redirectFiles.set(file, mounts!.prefixOf(file));
+  }
+  for (const [file, prefix] of redirectFiles) {
+    const content = context.readFile(file);
+    if (!content || !content.includes('redirectTo')) continue;
+    const table = byRoot.get(angularAppRoot(file, context)) ?? (byRoot.size === 1 ? [...byRoot.values()][0]! : undefined);
     if (!table) continue;
     for (const r of parseAngularRoutes(content).redirects) {
       const from = joinPath([...prefix, ...resolvedSegments(r.from, file, context)]);
@@ -601,7 +778,7 @@ export function angularRoutesFor(table: AngularRouteTable, filePath: string): Ro
 const NAV_CALL = /^(?:this\.)?_?[rR]outer\.(navigate|navigateByUrl|createUrlTree|parseUrl)$/;
 
 /** The destination a command array names: `['/article', slug]` is `/article/${…}`; null when it is relative or not a literal array. */
-export function commandsHref(text: string): HrefLiteral | null {
+export function commandsHref(text: string, fromRoot = false): HrefLiteral | null {
   const arr = text.trim();
   if (arr[0] !== '[') return null;
   const close = matchBracket(arr, 0);
@@ -644,11 +821,13 @@ export function commandsHref(text: string): HrefLiteral | null {
     i++;
   }
   flush();
-  // Only an absolute destination: `['/login']`. `['../', id]` and a bare
-  // `['edit']` are relative to wherever the component is.
+  // Only an absolute destination: `['/login']`. In a template, `['../', id]`
+  // and a bare `['edit']` are relative to wherever the component is; a
+  // `router.navigate(['project', 'issue', id])` with no `relativeTo` starts
+  // from the root.
   const firstElement = arr.slice(1, close).split(',')[0] ?? '';
   const first = staticString(firstElement);
-  if (first === null || !first.startsWith('/')) return null;
+  if (first === null || (!first.startsWith('/') && !(fromRoot && !first.startsWith('.')))) return null;
   const pathText = '/' + parts.filter((p) => p.length > 0).join('/');
   return namesSomewhere({ path: pathText, display: pathText.split(HOLE).join('${…}') });
 }
@@ -725,14 +904,14 @@ function arrowReturn(fn: string): string | null {
  *
  * `owner` is the class the expression is written in, for `this.` properties.
  */
-export function angularDestination(expr: string, file: string, owner: Node | null, context: ResolutionContext, depth = 0): HrefLiteral | null {
-  return namesSomewhere(destinationOf(expr, file, owner, context, depth));
+export function angularDestination(expr: string, file: string, owner: Node | null, context: ResolutionContext, depth = 0, fromRoot = false): HrefLiteral | null {
+  return namesSomewhere(destinationOf(expr, file, owner, context, depth, fromRoot));
 }
 
-function destinationOf(expr: string, file: string, owner: Node | null, context: ResolutionContext, depth: number): HrefLiteral | null {
+function destinationOf(expr: string, file: string, owner: Node | null, context: ResolutionContext, depth: number, fromRoot: boolean): HrefLiteral | null {
   const text = expr.trim();
   if (text.length === 0 || depth > 4) return null;
-  if (text[0] === '[') return commandsHref(text);
+  if (text[0] === '[') return commandsHref(text, fromRoot);
   const literal = staticString(text);
   if (literal !== null) return toHref(literal);
   // `'/editor/' + article.slug`: the literal head, a hole for the rest.
@@ -743,7 +922,7 @@ function destinationOf(expr: string, file: string, owner: Node | null, context: 
   // `this.routerLinkAdminControlUsers.concat(userId)`: one segment more.
   const concat = /^(.*?)\.concat\s*\((.*)\)$/s.exec(text);
   if (concat) {
-    const base = angularDestination(concat[1]!, file, owner, context, depth + 1);
+    const base = angularDestination(concat[1]!, file, owner, context, depth + 1, fromRoot);
     const added = concat[2]!.split(',').filter((a) => a.trim().length > 0).length;
     return base && added > 0 ? toHref(base.path.replace(/\/$/, '') + ('/' + HOLE).repeat(added)) : base;
   }
@@ -753,7 +932,7 @@ function destinationOf(expr: string, file: string, owner: Node | null, context: 
   if (call) {
     const fn = constantText(call[1]!.replace(/\s+/g, '').replace(/^this\./, ''), file, context);
     const returned = fn ? arrowReturn(fn) : null;
-    return returned ? commandsHref(returned) : null;
+    return returned ? commandsHref(returned, fromRoot) : null;
   }
   const chain = /^(?:this\s*\.\s*)?([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)$/.exec(text);
   if (!chain) return parseHrefExpression(text);
@@ -762,12 +941,12 @@ function destinationOf(expr: string, file: string, owner: Node | null, context: 
   if (content && owner && (text.startsWith('this') || parts.length === 1)) {
     const init = propertyInitializer(owner, parts[0]!, content);
     if (init !== null) {
-      if (parts.length === 1) return angularDestination(init, file, owner, context, depth + 1);
-      return angularDestination(`${init}.${parts.slice(1).join('.')}`, file, owner, context, depth + 1);
+      if (parts.length === 1) return angularDestination(init, file, owner, context, depth + 1, fromRoot);
+      return angularDestination(`${init}.${parts.slice(1).join('.')}`, file, owner, context, depth + 1, fromRoot);
     }
   }
   const constant = constantText(parts.join('.'), file, context);
-  return constant ? angularDestination(constant, file, owner, context, depth + 1) : null;
+  return constant ? angularDestination(constant, file, owner, context, depth + 1, fromRoot) : null;
 }
 
 // =============================================================================
@@ -837,44 +1016,8 @@ export const angularRouterResolver: FrameworkResolver = {
   postExtract(context: ResolutionContext): Node[] {
     const routes = context.getNodesByKind('route').filter(isAngularRoute);
     if (routes.length === 0) return [];
-    const routeFiles = new Set(routes.map((r) => r.filePath));
-    // Every file that lazy-loads routes, whether or not it declares a screen of its own.
-    const mountsByFile = new Map<string, AngularMount[]>();
-    for (const file of context.getAllFiles()) {
-      if (!/\.[cm]?ts$/.test(file) || !(context.fileContains?.(file, 'loadChildren') ?? context.readFile(file)?.includes('loadChildren'))) continue;
-      const content = context.readFile(file);
-      if (!content) continue;
-      const { mounts } = parseAngularRoutes(content);
-      if (mounts.length > 0) mountsByFile.set(file, mounts);
-    }
-    const mountFiles = new Set(mountsByFile.keys());
-    // file → the prefix it is mounted under (the parent file's own prefix
-    // plus the mount's), settled from the top down.
-    const loadedBy = new Map<string, { parent: string; prefix: string }>();
-    for (const [file, mounts] of mountsByFile) {
-      for (const mount of mounts) {
-        for (const target of routeFilesLoadedBy(mount.spec, file, context, routeFiles, mountFiles)) {
-          // A file mounted from two places keeps its first mount.
-          if (target !== file && !loadedBy.has(target)) loadedBy.set(target, { parent: file, prefix: mount.prefix });
-        }
-      }
-    }
+    const { prefixOf } = angularMounts(context, routes);
     const resolved = (pathText: string, file: string): string[] => resolvedSegments(pathText, file, context);
-
-    const memo = new Map<string, string[]>();
-    const prefixOf = (file: string, seen: Set<string> = new Set()): string[] => {
-      const hit = memo.get(file);
-      if (hit !== undefined) return hit;
-      const mount = loadedBy.get(file);
-      let prefix: string[] = [];
-      if (mount && !seen.has(file)) {
-        seen.add(file);
-        prefix = [...prefixOf(mount.parent, seen), ...resolved(mount.prefix, mount.parent)];
-      }
-      memo.set(file, prefix);
-      return prefix;
-    };
-
     const changed: Node[] = [];
     for (const route of routes) {
       const name = joinPath([...prefixOf(route.filePath), ...resolved(inFilePath(route), route.filePath)]);
@@ -915,7 +1058,7 @@ export const angularRouterResolver: FrameworkResolver = {
       .getNodesInFile(ref.filePath)
       .filter((n) => n.kind === 'class' && n.startLine <= ref.line && n.endLine >= ref.line)
       .reduce<Node | null>((inner, n) => (!inner || n.startLine >= inner.startLine ? n : inner), null);
-    const href = angularDestination(arg, ref.filePath, owner, context);
+    const href = angularDestination(arg, ref.filePath, owner, context, 0, true);
     if (!href || !href.path.startsWith('/')) return null;
     const targets = destinationsForHref(href, routes);
     const target = targets[0];

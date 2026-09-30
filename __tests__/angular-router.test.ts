@@ -317,3 +317,143 @@ export class AdminRoutingModule {}
     ]);
   });
 });
+
+describe('an Angular workspace split across libraries', () => {
+  const roots: string[] = [];
+  afterAll(() => {
+    for (const r of roots.splice(0)) fs.rmSync(r, { recursive: true, force: true });
+  });
+
+  async function project(files: Record<string, string>): Promise<CodeGraph> {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-angular-ws-'));
+    roots.push(root);
+    for (const [rel, content] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+      fs.writeFileSync(path.join(root, rel), content);
+    }
+    return CodeGraph.init(root, { index: true });
+  }
+  const routeNames = (cg: CodeGraph) => cg.getNodesByKind('route').map((n) => n.name).sort();
+  const navs = (cg: CodeGraph) =>
+    cg
+      .getNodesByKind('route')
+      .flatMap((r) => cg.getIncomingEdges(r.id).filter((e) => e.kind === 'navigates').map((e) => `${cg.getNode(e.source)!.name} -> ${r.name}`))
+      .sort();
+  const component = (name: string, selector: string, template: string) => `import { Component } from '@angular/core';
+@Component({ selector: '${selector}', template: \`${template}\` })
+export class ${name} {}
+`;
+
+  it('angular-spotify: Nx libraries behind barrels, `(await import(…)).M`, a class-static path constant', async () => {
+    const cg = await project({
+      'package.json': JSON.stringify({ name: 'ws', dependencies: { '@angular/core': '*', '@angular/router': '*' } }),
+      'nx.json': '{}',
+      'tsconfig.base.json': JSON.stringify({
+        compilerOptions: {
+          paths: {
+            '@ws/home': ['libs/home/src/index.ts'],
+            '@ws/lyrics': ['libs/lyrics/src/index.ts'],
+            '@ws/utils': ['libs/utils/src/index.ts'],
+          },
+        },
+      }),
+      'libs/utils/src/index.ts': `export * from './lib/router-util';\n`,
+      'libs/utils/src/lib/router-util.ts': `export class RouterUtil {
+  static Configuration = { Lyrics: 'lyrics' };
+}
+`,
+      'libs/shell/src/lib/shell.routes.ts': `import { Route } from '@angular/router';
+import { RouterUtil } from '@ws/utils';
+
+export const shellRoutes: Route[] = [
+  { path: '', loadChildren: async () => (await import('@ws/home')).HomeModule },
+  { path: RouterUtil.Configuration.Lyrics, loadChildren: async () => (await import('@ws/lyrics')).LyricsModule },
+];
+`,
+      'libs/home/src/index.ts': `export * from './lib/home.module';\n`,
+      'libs/home/src/lib/home.module.ts': `import { NgModule } from '@angular/core';
+import { RouterModule } from '@angular/router';
+import { HomeComponent } from './home.component';
+@NgModule({ imports: [RouterModule.forChild([{ path: '', component: HomeComponent }])] })
+export class HomeModule {}
+`,
+      'libs/home/src/lib/home.component.ts': component('HomeComponent', 'as-home', '<a routerLink="/lyrics">Lyrics</a>'),
+      'libs/lyrics/src/index.ts': `export * from './lib/lyrics.module';\n`,
+      'libs/lyrics/src/lib/lyrics.module.ts': `import { NgModule } from '@angular/core';
+import { RouterModule } from '@angular/router';
+import { LyricsComponent } from './lyrics.component';
+@NgModule({ imports: [RouterModule.forChild([{ path: '', component: LyricsComponent }])] })
+export class LyricsModule {}
+`,
+      'libs/lyrics/src/lib/lyrics.component.ts': component('LyricsComponent', 'as-lyrics', '<a routerLink="/">Home</a>'),
+    });
+    try {
+      expect(routeNames(cg)).toEqual(['/', '/lyrics']);
+      // A template in one library links to a screen another library declares.
+      expect(navs(cg)).toEqual(['HomeComponent -> /lyrics', 'LyricsComponent -> /']);
+    } finally {
+      cg.close();
+    }
+  });
+
+  it('jira-clone: a template-literal path, a redirect in a file that only mounts, navigate() from the root', async () => {
+    const cg = await project({
+      'package.json': JSON.stringify({ name: 'jira', dependencies: { '@angular/core': '*', '@angular/router': '*' } }),
+      'angular.json': '{}',
+      'src/app/app.routes.ts': `import { Routes } from '@angular/router';
+export const appRoutes: Routes = [
+  { path: 'project', loadChildren: () => import('./project/project.routes').then((m) => m.PROJECT_ROUTES) },
+  { path: '', redirectTo: 'project', pathMatch: 'full' },
+];
+`,
+      'src/app/project/config/const.ts': `export class ProjectConst {
+  static readonly IssueId = 'issueId';
+}
+`,
+      'src/app/project/project.routes.ts': `import { Routes } from '@angular/router';
+import { ProjectComponent } from './project.component';
+import { BoardComponent } from './board.component';
+import { IssueComponent } from './issue.component';
+import { ProjectConst } from './config/const';
+export const PROJECT_ROUTES: Routes = [
+  {
+    path: '',
+    component: ProjectComponent,
+    children: [
+      { path: 'board', component: BoardComponent },
+      { path: \`issue/:\${ProjectConst.IssueId}\`, component: IssueComponent },
+      { path: '', redirectTo: 'board', pathMatch: 'full' },
+    ],
+  },
+];
+`,
+      'src/app/project/project.component.ts': component('ProjectComponent', 'j-project', '<router-outlet></router-outlet>'),
+      'src/app/project/board.component.ts': `import { Component } from '@angular/core';
+import { Router } from '@angular/router';
+@Component({ selector: 'j-board', template: '<div></div>' })
+export class BoardComponent {
+  constructor(private _router: Router) {}
+  openIssuePage(issueId: string) {
+    this._router.navigate(['project', 'issue', issueId]);
+  }
+}
+`,
+      'src/app/project/issue.component.ts': `import { Component } from '@angular/core';
+import { Router } from '@angular/router';
+@Component({ selector: 'j-issue', template: '<div></div>' })
+export class IssueComponent {
+  constructor(private _router: Router) {}
+  backHome() {
+    this._router.navigate(['/']);
+  }
+}
+`,
+    });
+    try {
+      expect(routeNames(cg)).toEqual(['/project/board', '/project/issue/:issueId']);
+      expect(navs(cg)).toEqual(['backHome -> /project/board', 'openIssuePage -> /project/issue/:issueId']);
+    } finally {
+      cg.close();
+    }
+  });
+});
