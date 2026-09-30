@@ -4683,6 +4683,15 @@ export function matchMethodCall(
     return null;
   }
 
+  // A receiver written as a type name the project doesn't declare
+  // (`Exception.Create(…)` in Delphi, `Collections.sort(…)`) is a type from
+  // outside it: a same-named method of some project type is a guess. horse's
+  // `Exception.Create` went to its own `EHorseException::Create` 44 times.
+  if (namesExternalType(objectOrClass!, ref.language) &&
+      !context.getNodesByName(objectOrClass!).some((n) => sameLanguageFamily(n.language, ref.language))) {
+    return null;
+  }
+
   // Strategy 2: Instance variable receiver - try capitalized form to find class
   // e.g., "permissionEngine" → look for classes containing "PermissionEngine"
   const capitalizedReceiver = objectOrClass!.charAt(0).toUpperCase() + objectOrClass!.slice(1);
@@ -5641,6 +5650,19 @@ function hasParameterBinding(code: string, escapedName: string): boolean {
 /**
  * Split a camelCase or PascalCase string into words.
  */
+/**
+ * Whether a receiver written as `Name` is a type in `language`'s conventions.
+ * Not in Go (an exported package variable is `FormPost`), nor C / C++ / Rust
+ * (their type paths use `::`); in Pascal every identifier is capitalized, so
+ * only Delphi's type prefixes (`TFoo`, `EFoo`, `IFoo`) and `Exception` count —
+ * `AWebRequest` / `LRequest` are a parameter and a local.
+ */
+function namesExternalType(receiver: string, language: string): boolean {
+  if (!/^[A-Z][A-Za-z0-9_]*$/.test(receiver)) return false;
+  if (language === 'pascal') return /^(?:[TEI][A-Z]\w*|Exception)$/.test(receiver);
+  return !['go', 'c', 'cpp', 'rust', 'cuda', 'metal'].includes(language);
+}
+
 /**
  * Languages whose receivers nothing types, where a unique method name alone
  * is no evidence: CFML's `server.keyExists()` is the struct member function,

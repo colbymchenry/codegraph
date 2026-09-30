@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- A call on a type from outside the project, like `Integer.valueOf(…)`, `Arrays.asList(…)`, `Object.assign(…)` or Delphi's `Exception.Create(…)`, no longer lands on the project's own method with that name. On commons-lang, `Integer.valueOf` used to land on `StringUtils.valueOf` over 800 times. Go's exported variables and Pascal's capitalized parameters and locals are not mistaken for type names.
 - Imports through a tsconfig or jsconfig path alias now use the config nearest the importing file, so each app in a monorepo resolves its own `@/…` or `~/…` alias. On bulletproof-react and trpc's examples, those imports used to fail or land in a different app.
 - React Router data-router routes are named by their full path: nested `children` paths are joined to their parent's, `path: paths.app.root.path` constants are read, and `lazy: () => import('./routes/x')` routes link to the module's component. A guard wrapper like `<ProtectedRoute>` no longer stands in for the page. On bulletproof-react, every route now has its real path and page.
 - In JavaScript, TypeScript and Vue, a call through a name destructured from a composable or custom hook, like `const { getDefaultActivityRoute } = useDefaultActivity()` or `const { t } = useI18n()`, now reaches the function the hook returns. These calls used to resolve to nothing. mealie, elk, halo and excalidraw each gained dozens to over a hundred such links.
