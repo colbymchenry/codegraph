@@ -57,7 +57,8 @@ To run one through `npx` instead, put this in `codegraph.json`:
 - It writes only what the merge reads: a reference at the callee name of every call and `new`, and a definition for every callee the project declares. A symbol is named after its first declaration (`` `file`/node-index/Name ``). So an overload maps to its first signature, and a declaration seen from two projects is one symbol.
 - A call on a union- or intersection-typed receiver (`a.equals(b)` with `a: A | B`) targets every member's method.
 - A project that fails to open is a warning; its files stay heuristic-only.
-- Needs Node ≥ 20.19 / 22.12, because it `require()`s the ES-module API. Setting `scip.typescript.cmd` (or `args`) in `codegraph.json` forces scip-typescript.
+- Needs Node ≥ 20.19 / 22.12, because it `require()`s the ES-module API. Setting `scip.typescript.cmd` (or `args`) in `codegraph.json` forces scip-typescript. So does a repo without any `tsconfig.json` / `jsconfig.json`, since there is no project to open; scip-typescript infers one.
+- An older TypeScript is just not a candidate. A TypeScript ≥ 7.1 that can't be used (unreadable `package.json`, no `dist/api`, a Node too old to load it) falls back to scip-typescript **with a warning** saying why.
 - The API is marked unstable. The indexer checks for the exports it uses and fails with a clear message if they change. CI pins the nightly it was written against (`.github/workflows/scip-ci.yml`).
 
 On vscode (94 projects, 13.8k files) it indexes in 66 s instead of scip-typescript's 361 s, and writes a 101 MB index instead of 176 MB. Peak memory is 7.7 GB for tsgo plus 2.1 GB for Node. Accuracy is at least scip-typescript's (see the eval below).
@@ -96,7 +97,7 @@ Differences from the POC:
 - A called value (`term`) maps to a function node, or to the constant/variable node codegraph keeps for `export const expect: Expect<…>`. codegraph's own edges already target such nodes. On Playwright this let the compiler judge about 20k heuristic `expect()`/`test()` edges; 4,952 of them had pointed at an unrelated package's `expect`.
 - A file over codegraph's size limit (1 MB, e.g. a generated `types.d.ts`) has no nodes, so it's skipped like any file codegraph doesn't index, not reported as stale. Its definitions still make calls into it *unknown* rather than external.
 - `new X()` (TS, via scip-typescript's `` `<constructor>` `` symbol) and Python's `X()` (a class symbol followed by `(`) → `instantiates`, matching codegraph's own edge kind. So are Go composite literals (`&X{…}`, `X[T]{…}`) and Rust struct literals (`X { … }`). Go excludes slice/map element types and return types before a body. Rust excludes `impl`/`where` headers, `-> X {`, and destructuring patterns.
-- An overloaded method is one SCIP symbol defined at every signature, but codegraph has a node per signature. The symbol maps to the **first** signature, which is where the heuristic's edges point, so they verify instead of moving. On vscode this turned about 16.5k "replaced" edges into agreements.
+- An overloaded method is one SCIP symbol defined at every signature, but codegraph has a node per signature. The symbol maps to the **first** signature, which is where the heuristic's edges point, so they verify instead of moving. On vscode this turned about 16.5k "replaced" edges into agreements. Overloads share a qualified name. When one symbol is defined at nodes with **different** qualified names, it is left unjudged: no edge is verified, moved or added through it. rust-analyzer does this, naming every nested `fn imp` in a module `module/imp()`, and first-wins sent all four of ripgrep's `pathutil.rs` `imp()` calls to the first one.
 - With tsgo, an object-literal method *definition* that implements an interface (`{ listen(e) { … } }`) is not a call. scip-typescript records it as a reference to the interface method, so the merge used to add a `calls` edge for it.
 - Protobuf is read and written by a small hand-written codec (`src/scip/reader.ts`) instead of `@bufbuild/protobuf` plus codegen. The fork adds no runtime dependency. It accepts both the legacy `int32` ranges and the typed ranges, and streams documents one at a time.
 
@@ -120,7 +121,7 @@ Pass bar per language (2 seeds × 50 random targets): precision ≥ 95%, recall 
 | Python | same | 2 | 100% / 24% | 75% / 96% | **100% / 100%** | |
 | Go | spf13/cobra @ adbc881 (37 docs) | 1 | 100% / 87% | 100% / 99% | **100% / 100%** | 6.5 s + 0.2 s |
 | Go | same | 2 | 100% / 98% | 100% / 99% | **100% / 100%** | |
-| Rust | BurntSushi/ripgrep @ 3fce3b5 (104 docs) | 1 | 100% / 7% | 37% / 83% | **100% / 99%** | 12.6 s + 1.0 s |
+| Rust | BurntSushi/ripgrep @ 3fce3b5 (104 docs) | 1 | 100% / 7% | 37% / 83% | **99% / 99%**⁴ | 12.6 s + 1.0 s |
 | Rust | same | 2 | 100% / 22% | 20% / 73% | **100% / 99%** | |
 
 The tsgo rows are judged by **scip-typescript's** index. An index can't be checked against itself, and this gives an independent compiler's view. Judged by its own index, tsgo also scores 100% / 100% on both seeds.
@@ -165,6 +166,8 @@ Regular: `npx @colbymchenry/codegraph@1.6.1 init`. Fork: `codegraph init` (the s
 ³ The remaining "wrong" lines are calls typed against the public `Page` interface in `types/types.d.ts`. That file is over codegraph's size limit and has no nodes, so the heuristic's edge to the implementation (`client/page.ts`) stays, and the judge scores it wrong. Regular codegraph gets the same lines wrong (172 of them for seed 1).
 
 The tree-sitter step is the same code in both builds. The regular build alone took 13.5–19.0 s across three Playwright runs, so the difference between the two columns is within run-to-run variation. vscode had one run each.
+
+⁴ The eval's truth comes from the same colliding symbol. It counts `pathutil.rs`'s three other `imp()` calls as calls to the target `file_name::imp`, and the merge now correctly declines to link them. Before the collision rule it scored 100% by linking all four calls to one `imp`. The Python, Go, Rust and TS rows were re-run after `c0993ab` and the collision rule; the rest are unchanged.
 
 Raw per-seed output (`compare.ts --json`): [`scripts/scip-eval/results/`](scripts/scip-eval/results/). Indexers used: scip-typescript 0.4.0, scip-python 0.6.6, scip-go 0.2.7, rust-analyzer 2026-09-28. Flags: `--rg-type py --prefix django/`, `--rg-type go`, `--rg-type rust`.
 

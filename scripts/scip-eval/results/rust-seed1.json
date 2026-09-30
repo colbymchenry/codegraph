@@ -29,14 +29,14 @@
     },
     {
       "method": "codegraph+SCIP",
-      "candidates": 456,
-      "true": 433,
+      "candidates": 453,
+      "true": 430,
       "wrong": 6,
       "unknown": 17,
-      "recall": 1,
+      "recall": 0.9930715935334873,
       "recallMedian": 1,
-      "good": 50,
-      "precision": 0.9863325740318907,
+      "good": 49,
+      "precision": 0.9862385321100917,
       "kb": null
     }
   ]

@@ -40,6 +40,12 @@ export interface IndexerRun {
 }
 
 /**
+ * Prefix of a stderr line in which an indexer the fork ships (tsgo-index)
+ * reports a part it skipped; a successful run's such lines become warnings.
+ */
+export const RUN_WARNING = 'codegraph-scip warning: ';
+
+/**
  * How to index one project. Usually a single run; an adapter may split a large
  * repo into several — heavy parts alone, light parts batched and in parallel —
  * so peak memory is bounded by the largest part. The outputs are combined into
@@ -74,10 +80,11 @@ export interface IndexerSpec {
    */
   invocation(projectRoot: string, outFile: string): Invocation;
   /**
-   * A better indexer to run instead of `cmd` when it is installed, or null.
-   * Used only when `cmd` and `args` aren't overridden in codegraph.json.
+   * A better indexer to run instead of `cmd` when it is installed; null when it
+   * isn't, or why an installed one can't be used (then `cmd` runs, with that as
+   * a warning). Consulted only when `cmd` and `args` aren't overridden.
    */
-  preferred?(projectRoot: string, outFile: string): (Invocation & { cmd: string }) | null;
+  preferred?(projectRoot: string, outFile: string): (Invocation & { cmd: string }) | { unusable: string } | null;
   /** for languages that construct values with `Type{…}` rather than a call */
   literalShape?: LiteralShape;
 }
@@ -159,13 +166,14 @@ export function resolveIndexer(projectRoot: string, lang: ScipLanguage, outFile:
   }
   if (!spec.detect(projectRoot)) return { skip: `no ${lang} project markers found` };
   const preferred = override?.cmd || override?.args ? null : spec.preferred?.(projectRoot, outFile);
-  if (preferred) {
-    const env = override?.env;
-    const withEnv = (run: IndexerRun): IndexerRun => ({ ...run, env: run.env && { ...run.env, ...env }, fallback: run.fallback?.map(withEnv) });
-    return { lang, cmd: preferred.cmd, runs: preferred.runs.map(withEnv), env: { ...preferred.env, ...env }, warning: preferred.warning };
+  if (preferred && 'runs' in preferred) {
+    return { lang, cmd: preferred.cmd, runs: preferred.runs, env: { ...preferred.env, ...override?.env }, warning: preferred.warning };
   }
+  const unusable = preferred?.unusable;
   const cmd = override?.cmd ?? spec.cmd;
-  if (!onPath(cmd)) return { skip: `\`${cmd}\` not found on PATH — install it or set scip.${lang}.cmd in ${PROJECT_CONFIG_FILENAME}` };
+  if (!onPath(cmd)) {
+    return { skip: `\`${cmd}\` not found on PATH — install it or set scip.${lang}.cmd in ${PROJECT_CONFIG_FILENAME}${unusable ? ` (${unusable})` : ''}` };
+  }
   if (spec.probe && !override?.cmd) {
     const probe = spawnSync(cmd, spec.probe, { encoding: 'utf8', timeout: 20_000 });
     if (probe.status !== 0) {
@@ -184,7 +192,8 @@ export function resolveIndexer(projectRoot: string, lang: ScipLanguage, outFile:
     env: run.env && { ...run.env, ...override?.env }, // the user's env wins over the adapter's per-run env
     fallback: run.fallback?.map(apply),
   });
-  return { lang, cmd, runs: inv.runs.map(apply), env: { ...inv.env, ...override?.env }, warning: inv.warning };
+  const warning = [inv.warning, unusable && `${unusable} — using ${cmd}`].filter(Boolean).join('; ') || undefined;
+  return { lang, cmd, runs: inv.runs.map(apply), env: { ...inv.env, ...override?.env }, warning };
 }
 
 export function onPath(cmd: string): boolean {

@@ -69,7 +69,7 @@ export interface ScipSites {
 }
 
 interface NodeRow {
-  id: string; kind: string; name: string;
+  id: string; kind: string; name: string; qualified_name: string;
   start_line: number; end_line: number; start_column: number; end_column: number;
 }
 
@@ -100,7 +100,7 @@ class FileNodes {
   constructor(db: SqliteDatabase, files: Set<string>) {
     const kinds = [...new Set([...CALLABLE_KINDS, ...TYPE_KINDS, ...CONTAINER_KINDS, 'file'])];
     const rows = db.prepare(
-      `SELECT id, kind, name, file_path, start_line, end_line, start_column, end_column FROM nodes
+      `SELECT id, kind, name, qualified_name, file_path, start_line, end_line, start_column, end_column FROM nodes
        WHERE kind IN (${kinds.map(() => '?').join(',')})`
     ).all(...kinds) as Array<NodeRow & { file_path: string }>;
     for (const r of rows) {
@@ -181,6 +181,7 @@ export function scipSites(
   const nodes = new FileNodes(db, new Set(fresh.keys()));
   const symToNode = new Map<string, NodeRow>();
   const projectSymbols = new Set<string>();
+  const ambiguous = new Set<string>();
   // Symbols repeat at every occurrence; parse each once.
   const parsedCache = new Map<string, ParsedSymbol | null>();
   const parse = (symbol: string) => {
@@ -199,12 +200,17 @@ export function scipSites(
         if (!parsed) continue;
         projectSymbols.add(o.symbol);
         const { name, kind } = parsed.last;
-        // An overloaded function has one SCIP symbol defined at every signature, while
-        // codegraph has a node per signature; like the heuristic, map it to the first.
-        if (!known || symToNode.has(o.symbol) || (kind !== 'method' && kind !== 'term' && kind !== 'type')) continue;
+        if (!known || (kind !== 'method' && kind !== 'term' && kind !== 'type')) continue;
         const node = nodes.definition(doc.relativePath, o.range.startLine, CONSTRUCTOR_NAMES[name] ?? name,
           kind === 'type' ? TYPE_KINDS : kind === 'term' ? CALLED_VALUE_KINDS : CALLABLE_KINDS);
-        if (node) {
+        const first = symToNode.get(o.symbol);
+        if (node && first) {
+          // One symbol defined more than once. An overload — a node per signature,
+          // all one qualified name — maps to the first, like the heuristic. Distinct
+          // functions sharing a symbol (rust-analyzer names every nested `fn imp` in
+          // a module alike) can't be told apart: the symbol stays unjudged.
+          if (node.qualified_name !== first.qualified_name) ambiguous.add(o.symbol);
+        } else if (node) {
           symToNode.set(o.symbol, node);
           bump('def_mapped');
         } else if (kind !== 'term') {
@@ -213,6 +219,9 @@ export function scipSites(
       }
     }
   }
+
+  for (const s of ambiguous) symToNode.delete(s); // still a project symbol: its calls read as unknown
+  stats.def_ambiguous = ambiguous.size;
 
   // Pass 2: references that are calls, keyed by the caller codegraph would name.
   const sites = new Map<string, Map<string, SiteTarget>>();

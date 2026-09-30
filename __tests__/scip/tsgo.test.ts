@@ -11,7 +11,10 @@ import { findTsgo } from '../../src/scip/indexers/typescript';
 
 const FIXTURE = path.join(__dirname, '..', 'fixtures', 'scip-ts');
 /** TypeScript ≥ 7.1 to index with: `CODEGRAPH_TSGO_DIR`, else wherever the adapter would find one. */
-const TSGO = process.env.CODEGRAPH_TSGO_DIR ?? findTsgo(path.join(__dirname, '..', '..'));
+const TSGO = process.env.CODEGRAPH_TSGO_DIR ?? (() => {
+  const found = findTsgo(path.join(__dirname, '..', '..'));
+  return found && 'dir' in found ? found.dir : undefined;
+})();
 
 describe.runIf(TSGO)('tsgo indexer (TypeScript fixture)', () => {
   let dir: string;
@@ -100,8 +103,10 @@ describe.runIf(TSGO)('tsgo indexer (TypeScript fixture)', () => {
 
 describe('typescript adapter: tsgo when installed', () => {
   let dir: string;
+  const savedPrefix = process.env.NPM_CONFIG_PREFIX;
   beforeEach(() => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-tsgo-adapter-'));
+    process.env.NPM_CONFIG_PREFIX = path.join(dir, 'no-global'); // `npm root -g` → an empty prefix: only what the test installs counts
     fs.writeFileSync(path.join(dir, 'tsconfig.json'), '{}');
     fs.mkdirSync(path.join(dir, 'pkg'));
     fs.writeFileSync(path.join(dir, 'pkg', 'jsconfig.json'), '{}');
@@ -110,7 +115,12 @@ describe('typescript adapter: tsgo when installed', () => {
     fs.writeFileSync(path.join(ts, 'package.json'), '{"version":"7.1.0"}');
     fs.writeFileSync(path.join(ts, 'dist', 'api', 'sync', 'api.js'), '');
   });
-  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+  afterEach(() => {
+    if (savedPrefix === undefined) delete process.env.NPM_CONFIG_PREFIX;
+    else process.env.NPM_CONFIG_PREFIX = savedPrefix;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const tsPackage = (json: string) => fs.writeFileSync(path.join(dir, 'node_modules', 'typescript', 'package.json'), json);
 
   it('runs tsgo-index over every project in one process, unless the command is overridden', () => {
     const out = path.join(dir, 'out.tmp');
@@ -130,7 +140,27 @@ describe('typescript adapter: tsgo when installed', () => {
   });
 
   it('ignores a TypeScript older than 7.1', () => {
-    fs.writeFileSync(path.join(dir, 'node_modules', 'typescript', 'package.json'), '{"version":"7.0.2"}');
-    expect(findTsgo(dir)).not.toBe(path.join(dir, 'node_modules', 'typescript'));
+    tsPackage('{"version":"7.0.2"}');
+    expect(findTsgo(dir)).toBeNull();
+  });
+
+  it.runIf(process.platform !== 'win32')('a TypeScript ≥ 7.1 that can\'t be used is a warning on the scip-typescript run', () => {
+    tsPackage('{"name":"typescript"}'); // no version
+    expect(findTsgo(dir)).toEqual({ unusable: expect.stringMatching(/package\.json has no version/) });
+    tsPackage('{"version":"7.1.0"}');
+    fs.rmSync(path.join(dir, 'node_modules', 'typescript', 'dist'), { recursive: true });
+    const bin = path.join(dir, 'bin');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, 'scip-typescript'), '#!/bin/sh\n', { mode: 0o755 });
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${savedPath}`;
+    try {
+      const r = resolveIndexer(dir, 'typescript', path.join(dir, 'out.tmp'));
+      if ('skip' in r) throw new Error(r.skip);
+      expect(r.cmd).toBe('scip-typescript');
+      expect(r.warning).toMatch(/TypeScript 7\.1\.0 at .* has no API .* — using scip-typescript/);
+    } finally {
+      process.env.PATH = savedPath;
+    }
   });
 });

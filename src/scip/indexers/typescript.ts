@@ -139,22 +139,51 @@ export function planRuns(root: string, projects: string[], weights: Map<string, 
   return runs;
 }
 
-/** The directory of a TypeScript package with the tsgo API (≥ 7.1), or null. */
-export function findTsgo(root: string): string | null {
-  const npmRoot = spawnSync('npm', ['root', '-g'], { encoding: 'utf8', timeout: 10_000, shell: process.platform === 'win32' });
-  const candidates = [path.join(root, 'node_modules', 'typescript')];
-  if (npmRoot.status === 0 && npmRoot.stdout.trim()) candidates.push(path.join(npmRoot.stdout.trim(), 'typescript'));
-  for (const dir of candidates) {
-    let version: string;
-    try {
-      version = (JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')) as { version: string }).version;
-    } catch {
-      continue; // not installed there
-    }
-    const [major = 0, minor = 0] = version.split('.').map(Number);
-    if ((major > TSGO_MIN[0]! || (major === TSGO_MIN[0] && minor >= TSGO_MIN[1]!)) && has(dir, 'dist/api/sync/api.js')) return dir;
+/** The version of the package at `dir`; null when there is none. An unreadable package.json is an error, not "absent". */
+export function packageVersion(dir: string): string | null {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(path.join(dir, 'package.json'), 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw err;
   }
-  return null;
+  const version = (JSON.parse(raw) as { version?: unknown }).version;
+  if (typeof version !== 'string') throw new Error(`${dir}/package.json has no version`);
+  return version;
+}
+
+/**
+ * Where tsgo-index can load TypeScript ≥ 7.1 from: the project's node_modules,
+ * else the global npm root (not consulted when the local one will do). An
+ * older TypeScript is simply not a candidate; one that should work but can't
+ * (a broken install, a Node that can't load it) is reported as `unusable`.
+ */
+export function findTsgo(root: string): { dir: string } | { unusable: string } | null {
+  const problems: string[] = [];
+  const tryDir = (dir: string): string | null => {
+    let version: string | null;
+    try {
+      version = packageVersion(dir);
+    } catch (err) {
+      problems.push(`can't read TypeScript at ${dir}: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
+    const [major = 0, minor = 0] = (version ?? '0').split('.').map(Number);
+    if (major < TSGO_MIN[0]! || (major === TSGO_MIN[0] && minor < TSGO_MIN[1]!)) return null;
+    if (!has(dir, 'dist/api/sync/api.js')) problems.push(`TypeScript ${version} at ${dir} has no API (dist/api/sync/api.js)`);
+    // tsgo-index loads the (ES module) API with require().
+    else if (!(process.features as { require_module?: boolean }).require_module) problems.push(`Node ${process.version} can't load TypeScript ${version}'s API (needs ≥ 20.19 / 22.12)`);
+    else return dir;
+    return null;
+  };
+  const local = tryDir(path.join(root, 'node_modules', 'typescript'));
+  if (local) return { dir: local };
+  // No npm (or no global root) just means no global candidate.
+  const npmRoot = spawnSync('npm', ['root', '-g'], { encoding: 'utf8', timeout: 10_000, shell: process.platform === 'win32' });
+  const global = npmRoot.status === 0 && npmRoot.stdout.trim() ? tryDir(path.join(npmRoot.stdout.trim(), 'typescript')) : null;
+  if (global) return { dir: global };
+  return problems.length ? { unusable: problems.join('; ') } : null;
 }
 
 export const typescriptIndexer: IndexerSpec = {
@@ -174,17 +203,16 @@ export const typescriptIndexer: IndexerSpec = {
     return { runs: [{ label: 'typescript', args, output: outFile, env: heapEnv(bigHeapMb()) }] };
   },
   preferred(root, outFile) {
+    const ts = findTsgo(root);
+    if (!ts || 'unusable' in ts) return ts;
     const files = repoFiles(root);
     const projects = tsProjects(root, files);
     if (projects.length === 0) return null; // nothing to open: scip-typescript infers a config
-    // tsgo-index loads the (ES module) API with require().
-    const tsDir = (process.features as { require_module?: boolean }).require_module ? findTsgo(root) : null;
-    if (!tsDir) return null;
-    // Heaviest first: a file shared by several projects is indexed by the first that loads it.
+    // Heaviest first; this only decides which project indexes a file its owner never loaded (see tsgo-index.ts).
     const weights = projectWeights(projects, files);
     const configs = [...projects].sort((a, b) => weights.get(b)! - weights.get(a)!)
       .map(p => path.posix.join(p, has(path.join(root, p), 'tsconfig.json') ? 'tsconfig.json' : 'jsconfig.json'));
-    const args = [path.join(__dirname, 'tsgo-index.js'), tsDir, outFile, root, ...configs];
+    const args = [path.join(__dirname, 'tsgo-index.js'), ts.dir, outFile, root, ...configs];
     return { cmd: process.execPath, runs: [{ label: 'typescript (tsgo)', args, output: outFile }] };
   },
 };

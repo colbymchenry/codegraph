@@ -11,16 +11,20 @@
  * its first declaration (file + node index), so an overload maps to its first
  * signature, and a declaration reached from two projects is one symbol.
  *
- * Projects are opened one at a time in a single process: each file is indexed
- * by the first project that loads it, and every definition lands in its file's
- * document whichever project referenced it. A project that fails to open is
- * reported on stderr as `warning: …` and its files stay heuristic-only.
+ * Projects are opened one at a time in a single process. A file is indexed by
+ * the deepest project containing it (its own tsconfig resolves its imports), or
+ * — when that project never loads it — by the first project that does. Every
+ * definition lands in its file's document whichever project referenced it. A
+ * project that fails to open is reported on stderr (RUN_WARNING) and its files
+ * stay heuristic-only.
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import { pathToFileURL } from 'url';
 import { ROLE_DEFINITION, ScipOccurrence, encodeDocument, encodeMetadata } from '../reader';
+import { RUN_WARNING } from './index';
+import { packageVersion } from './typescript';
 
 /** SCIP `PositionEncoding.UTF16CodeUnitOffsetFromLineStart`: the API's positions index JS strings. */
 const POSITION_ENCODING_UTF16 = 2;
@@ -73,7 +77,7 @@ async function load(tsDir: string, root: string): Promise<Loaded> {
   // An ES module package; the CommonJS build turns this into require(), which loads ESM on Node ≥ 20.19 / 22.12.
   const mod = (sub: string): Promise<Record<string, unknown>> => import(path.join(tsDir, sub));
   const [sync, ast, scanner] = await Promise.all([mod('dist/api/sync/api.js'), mod('dist/ast/index.js'), mod('dist/ast/scanner.js')]);
-  const version = (JSON.parse(fs.readFileSync(path.join(tsDir, 'package.json'), 'utf8')) as { version: string }).version;
+  const version = packageVersion(tsDir) ?? 'unknown';
   // The API is unstable: fail with a clear message rather than index wrongly.
   const missing = [[sync, 'API'], [sync, 'SymbolFlags'], [sync, 'CheckFlags'], [ast, 'SyntaxKind'], [scanner, 'skipTrivia']]
     .filter(([m, k]) => !(m as Record<string, unknown>)[k as string]).map(([, k]) => k);
@@ -125,6 +129,11 @@ export async function indexProjects(tsDir: string, output: string, root: string,
 
   /** repo-relative path → the occurrences of its document (files indexed, plus files holding definitions) */
   const docs = new Map<string, ScipOccurrence[]>();
+  const docOf = (file: string) => {
+    let occ = docs.get(file);
+    if (!occ) docs.set(file, (occ = []));
+    return occ;
+  };
   const indexed = new Set<string>();
   const defined = new Set<string>();
   const lines = new Map<string, number[]>();
@@ -221,15 +230,15 @@ export async function indexProjects(tsDir: string, output: string, root: string,
         if (defined.has(symbol)) return symbol;
         defined.add(symbol);
         // Defined at the declaration's name (its start when it has none, e.g. `export default class {`).
+        // Always defined somewhere: a project symbol without a definition would read as external.
         const at = nodeOf(decl);
+        let range = { startLine: 0, startCol: 0, endLine: 0, endCol: 0 };
         if (at?.node) {
           const { sf, node } = at;
           const start = ts.skipTrivia(sf.text, (node.name ?? node).pos);
-          const end = node.name ? node.name.end : start;
-          let occ = docs.get(file);
-          if (!occ) docs.set(file, (occ = []));
-          occ.push({ range: span(decl.path, sf.text, start, end), symbol, roles: ROLE_DEFINITION });
+          range = span(decl.path, sf.text, start, node.name ? node.name.end : start);
         }
+        docOf(file).push({ range, symbol, roles: ROLE_DEFINITION });
         return symbol;
       });
     };
@@ -255,26 +264,24 @@ export async function indexProjects(tsDir: string, output: string, root: string,
         return undefined;
       };
       sf.forEachChild(visit);
-      const file = rel(f);
-      let occ = docs.get(file);
-      if (!occ) docs.set(file, (occ = []));
-      if (sites.length === 0) continue;
-      const symbols = checker.getSymbolAtPosition(f, sites.map(s => s.start));
+      const occ = docOf(rel(f));
+      const symbols = sites.length ? checker.getSymbolAtPosition(f, sites.map(s => s.start)) : [];
       symbols.forEach((s, i) => {
         const site = sites[i]!;
         if (!s) return;
         const range = span(f, sf.text, site.start, site.end);
-        for (const symbol of new Set(symbolsOf(s, site.isNew))) occ!.push({ range, symbol, roles: 0 });
+        for (const symbol of new Set(symbolsOf(s, site.isNew))) occ.push({ range, symbol, roles: 0 });
       });
-      lines.delete(f);
       // Fetched ASTs stay cached client-side; on a large project that's gigabytes.
-      // Drop them now and then — a declaration file needed again is refetched.
+      // Drop them (and our line tables) now and then — a file needed again is refetched.
       if (indexed.size % CACHE_FILES === 0) {
         ts.api.clearSourceFileCache();
         files.clear();
+        lines.clear();
       }
     }
     ts.api.clearSourceFileCache(); // this project's ASTs; the next project fetches its own
+    lines.clear();
     return others;
   };
 
@@ -325,7 +332,7 @@ if (require.main === module) {
   }
   indexProjects(path.resolve(tsDir), path.resolve(output), path.resolve(root), configs.map(c => path.resolve(root, c)))
     .then(({ warnings, documents }) => {
-      for (const w of warnings) process.stderr.write(`warning: ${w}\n`);
+      for (const w of warnings) process.stderr.write(`${RUN_WARNING}${w}\n`);
       if (documents === 0) {
         process.stderr.write('no project could be indexed\n');
         process.exit(1);

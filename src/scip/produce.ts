@@ -17,7 +17,7 @@ import * as os from 'os';
 import * as path from 'path';
 import type { SqliteDatabase } from '../db/sqlite-adapter';
 import { Compactor } from './compact';
-import { INDEXERS, IndexerRun, resolveIndexer } from './indexers';
+import { INDEXERS, IndexerRun, RUN_WARNING, resolveIndexer } from './indexers';
 import { ScipDecodeError } from './reader';
 import { ScipLanguage, ScipMeta, indexPath, metaPath, readMeta, snapshotHashes, writeFileAtomic } from './store';
 
@@ -73,8 +73,7 @@ export async function produceIndex(
       const why = code !== 0 ? `${indexer.cmd} exited ${code}: ${stderr.trim().split('\n').slice(-3).join(' | ')}`
         : !fs.existsSync(r.output) ? `${indexer.cmd} exited 0 but wrote no index at ${r.output}` : null;
       if (!why) {
-        // An indexer that covers several projects reports the ones it had to skip this way.
-        for (const w of stderr.split('\n')) if (w.startsWith('warning: ')) warnings.push(`${r.label}: ${w.slice(9)} — its files stay heuristic-only`);
+        for (const w of stderr.split('\n')) if (w.startsWith(RUN_WARNING)) warnings.push(`${r.label}: ${w.slice(RUN_WARNING.length)} — its files stay heuristic-only`);
         return [r.output];
       }
       if (r.fallback?.length) {

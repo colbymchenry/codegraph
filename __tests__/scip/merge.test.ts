@@ -7,7 +7,7 @@ import type { Edge } from '../../src/types';
 import { importScipFile, runScipPass, scipStatus } from '../../src/scip';
 import { scipVerdict } from '../../src/scip/notes';
 import { produceIndex } from '../../src/scip/produce';
-import { loadScipIndex } from '../../src/scip/reader';
+import { ROLE_DEFINITION, encodeDocument, encodeMetadata, loadScipIndex } from '../../src/scip/reader';
 import { ScipReindexScheduler } from '../../src/scip/reindex';
 import { indexPath, scipDir } from '../../src/scip/store';
 
@@ -196,6 +196,25 @@ describe('SCIP merge (TypeScript fixture)', () => {
       SELECT t.start_line AS line, e.provenance FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
       WHERE s.name = 'usesOverloads' AND t.name = 'lookup' ORDER BY e.line`).all();
     expect(lookups).toEqual([{ line: 31, provenance: 'scip' }, { line: 31, provenance: 'scip' }]); // verified, not moved
+  });
+
+  it('leaves a symbol shared by distinct functions unjudged (rust-analyzer names nested `fn imp`s alike)', async () => {
+    // One symbol defined at both Invoice.totalPrice and Order.totalPrice, called from sum() and arrow().
+    const symbol = 'scip-typescript npm fixture 1.0.0 src/models/totalPrice().';
+    const occ = (line: number, col: number, roles = 0) => ({ range: { startLine: line, startCol: col, endLine: line, endCol: col + 10 }, symbol, roles });
+    const doc = (relativePath: string, occurrences: ReturnType<typeof occ>[]) =>
+      encodeDocument({ relativePath, language: 'typescript', positionEncoding: 0, occurrences }, s => Buffer.from(s));
+    const file = path.join(dir, 'shared.scip');
+    fs.writeFileSync(file, Buffer.concat([
+      encodeMetadata({ toolName: 'scip-typescript', toolVersion: '0', projectRoot: `file://${dir}` }),
+      doc('src/models.ts', [occ(2, 2, ROLE_DEFINITION), occ(8, 2, ROLE_DEFINITION)]),
+      doc('src/main.ts', [occ(5, 49), occ(8, 37)]),
+    ]));
+    importScipFile(dir, file);
+    const report = (await pass())!;
+    expect(report.stats.def_ambiguous).toBe(1);
+    expect(edge('sum', 'Invoice::totalPrice')).toBeUndefined(); // not added on a guess
+    expect(edge('arrow', 'Order::totalPrice')?.provenance).toBeNull(); // not "corrected" to Invoice's
   });
 
   it('installs a compact index: definitions and call-shaped references only, same outcome', async () => {
