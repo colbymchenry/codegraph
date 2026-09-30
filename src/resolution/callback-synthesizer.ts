@@ -1222,6 +1222,15 @@ const JSX_CHILD_KINDS = new Set<NodeKind>(['component', 'function', 'class']);
  */
 const JSX_CHILD_LANGUAGES = [...JS_FAMILY, 'vue', 'svelte'];
 
+function languageForJsxFile(file: string): Language {
+  if (file.endsWith('.tsx')) return 'tsx';
+  if (/\.[cm]?ts$/.test(file)) return 'typescript';
+  if (file.endsWith('.jsx')) return 'jsx';
+  if (file.endsWith('.vue')) return 'vue';
+  if (file.endsWith('.svelte')) return 'svelte';
+  return 'javascript';
+}
+
 /** `localName` → the project file it is imported from, for one file's imports. */
 function importedFrom(ctx: ResolutionContext, file: string, language: Language): Map<string, string> {
   const out = new Map<string, string>();
@@ -1259,7 +1268,21 @@ function jsxChild(
   importsOf: () => Map<string, string>
 ): Node | undefined {
   const candidates = ctx.getNodesByName(name).filter((n) => JSX_CHILD_KINDS.has(n.kind));
-  if (candidates.length <= 1) return candidates[0];
+  if (candidates.length === 0) {
+    // A name nothing declares is the file's DEFAULT import of a module's one
+    // component under another name: segmented-control renders
+    // `<RNCSegmentedControlNativeComponent>`, the default export of a module
+    // that is `requireNativeComponent('RNCSegmentedControl')`; element-plus's
+    // tests render `<Autocomplete>` from `autocomplete.vue`. A named import
+    // names an export of its own, which a barrel's one component is not.
+    const isDefault = ctx
+      .getImportMappings(file, languageForJsxFile(file))
+      .some((m) => m.localName === name && m.isDefault);
+    const from = isDefault ? importsOf().get(name) : undefined;
+    const components = from ? ctx.getNodesInFile(from).filter((n) => n.kind === 'component') : [];
+    return components.length === 1 ? components[0] : undefined;
+  }
+  if (candidates.length === 1) return candidates[0];
   const local = candidates.find((n) => n.filePath === file);
   if (local) return local;
   const from = importsOf().get(name);

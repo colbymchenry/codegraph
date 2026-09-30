@@ -365,7 +365,7 @@ Real iOS and React Native codebases live across multiple languages — a Swift c
 | **RN native → JS events** | JS `new NativeEventEmitter(...).addListener('e', cb)` | ObjC `[self sendEventWithName:@"e" body:...]` · Swift `sendEvent(withName: "e", ...)` · Java/Kotlin `.emit("e", ...)` | Synthesized cross-language event channel keyed by literal event name |
 | **Expo Modules** | JS `requireNativeModule('X').fn(...)`, directly or through a binding (`export default requireNativeModule<T>('X')`) | Swift / Kotlin `Module { Name("X"); AsyncFunction("fn") { ... } }` | Parses the Expo DSL literals into method nodes; a call on a binding resolves to module `X`'s `fn` on both platforms, else to the method on the binding's declared type |
 | **Fabric view components** | JSX `<MyView prop={v}/>` | TS Codegen spec + native impl class | Spec → `component` node; convention-based name+suffix lookup (`View`/`ComponentView`/`Manager`/`ViewManager`) bridges to native |
-| **Legacy Paper view managers** | JSX `<MyView prop={v}/>` | ObjC `RCT_EXPORT_VIEW_PROPERTY` · Java/Kotlin `@ReactProp` | Same as Fabric — Paper-era declarations also produce `component` + `property` nodes |
+| **Legacy Paper view managers** | JSX `<MyView prop={v}/>`, through a `requireNativeComponent('X')` module | ObjC `RCT_EXPORT_VIEW_PROPERTY` · Java/Kotlin `@ReactProp` | Same as Fabric — `requireNativeComponent('X')` is a JS `component` node, and Paper-era declarations also produce `component` + `property` nodes |
 
 **Validated on real codebases** (small + medium + large for each bridge):
 
