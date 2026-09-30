@@ -929,6 +929,33 @@ function isLuaLocal(candidate: Node, context: ResolutionContext): boolean {
   return local;
 }
 
+/** Per context: every package the project's JVM sources declare. */
+const JVM_PACKAGES = new WeakMap<ResolutionContext, Set<string>>();
+
+/**
+ * Whether a Java file binds `name` with a single-type (or static) import from
+ * a package the project does not declare — `import java.lang.reflect.Field;`,
+ * `import static org.junit.Assert.assertEquals;`. A nested class of a project
+ * type (`import com.acme.Outer.Inner;`) is under a project package, so it is not.
+ */
+function isJavaOutsideImport(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const binding = context.getImportMappings(ref.filePath, 'java').find((m) => m.localName === name);
+  if (!binding) return false;
+  let packages = JVM_PACKAGES.get(context);
+  if (!packages) {
+    packages = new Set<string>();
+    for (const n of context.getNodesByKind('namespace')) {
+      if (n.language === 'java' || n.language === 'kotlin' || n.language === 'scala') packages.add(n.qualifiedName);
+    }
+    JVM_PACKAGES.set(context, packages);
+  }
+  const parts = binding.source.split('.');
+  for (let i = 1; i < parts.length; i++) {
+    if (packages.has(parts.slice(0, i).join('.'))) return false;
+  }
+  return true;
+}
+
 /** Lua's global functions, and the test runner's: `local type = type` is the standard library's `type`. */
 const LUA_GLOBAL_FUNCTIONS: ReadonlySet<string> = new Set([
   'assert', 'error', 'ipairs', 'pairs', 'next', 'type', 'tostring', 'tonumber', 'setmetatable', 'getmetatable',
@@ -4925,6 +4952,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   ESM_EXPORT_LISTS.delete(context);
   LUA_LOCALS.delete(context);
   LUA_MEMBERS.delete(context);
+  JVM_PACKAGES.delete(context);
   PHP_FILE_SCOPES.delete(context);
   JAVA_STATIC_IMPORTS.delete(context);
   PY_IMPORTS.delete(context);
@@ -7669,6 +7697,13 @@ function matchReferenceInner(
       confidence: 0.85,
       resolvedBy: 'exact-match',
     };
+  }
+
+  // `import java.lang.reflect.Field;` — the file's `Field` is the JDK's, never
+  // a project class of that name (gson's production code bound it to a test's
+  // nested `ParameterizedTypesTest.Field`).
+  if (ref.language === 'java' && ref.referenceKind !== 'imports' && isJavaOutsideImport(ref.referenceName.split('.')[0]!, ref, context)) {
+    return null;
   }
 
   // A bare Lua call through a `local` alias reaches what the alias names.
