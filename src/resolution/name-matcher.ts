@@ -325,8 +325,14 @@ function matchMemberFunctionRef(ref: UnresolvedRef, context: ResolutionContext):
     }
   }
   // Unknown receivers retain the old unique-or-drop discipline, across ALL
-  // files. Tests and abstract-looking bodies are candidates too.
-  return result(context.getNodesByName(member), 0.8);
+  // files. Tests and abstract-looking bodies are candidates too. A lone method
+  // stands only when the receiver is named after its owner: netbox's
+  // `device=self.parent.device` is a model field, not the project's one
+  // `device` method (a GraphQL filter's). A veto, never a filter — filtering
+  // first would promote some other lone match into a new guess.
+  const unique = result(context.getNodesByName(member), 0.8);
+  const target = unique ? context.getNodeById?.(unique.targetNodeId) : null;
+  return target && target.kind === 'method' && !sharesReceiverWord(receiverLink(receiver), target) ? null : unique;
 }
 
 function pythonRefClass(name: string, ref: UnresolvedRef, context: ResolutionContext): Node | null {
