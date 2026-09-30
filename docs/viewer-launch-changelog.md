@@ -5,7 +5,7 @@ These describe `codegraph ui` and its screens. They were taken out of `## [Unrel
 ## Highlights, as written for the viewer launch
 
 - **`codegraph ui` — your graph in a browser.** A local, read-only viewer for the project you already indexed: your code with its callers and callees in the margin, a map of the whole repository, and a strip that shows how one symbol reaches another.
-- **See your app the way its users meet it.** A Screens tab draws every screen and the navigation between them, for Expo Router, React Router, Next.js, TanStack Router, Vue Router / Nuxt and SvelteKit apps.
+- **See your app the way its users meet it.** A Screens tab draws every screen and the navigation between them, for Expo Router, React Router, Next.js, TanStack Router, Vue Router / Nuxt, SvelteKit and Angular apps.
 - **See what happens from a screen or an endpoint.** A Steps tab draws what one action sets in motion — the handlers it fires, the state it writes, the calls that leave your code, and every way it can answer — with the condition on each arrow.
 - **APIs too, and across tiers.** Endpoints in Express, NestJS, Fastify, Koa, Hono, FastAPI, Flask, Django, Spring, ASP.NET, Vapor and Gin, with a page's `fetch` following through to the route that serves it, a queued job to its consumer, an event to its handler.
 - **Read a handler in the order its code runs.** The same picture laid out by when things happen rather than by distance, so a reply sits below the token it carries. Where the code chooses, the condition is said once and each arrow answers it.
@@ -14,6 +14,8 @@ These describe `codegraph ui` and its screens. They were taken out of `## [Unrel
 - **Upgrading:** re-index your projects after this release — several of the new readings rest on edges that are written while indexing.
 
 ## New Features
+
+- **The Screens tab draws Angular apps.** Every screen in an Angular app's routes, with the navigation between them: `router.navigate(…)`, a guard's redirect and each template's `routerLink`, under the condition the code checks first. A button in a child component, like an article's favorite button, is drawn from the screen that renders it. A layout's tabs and buttons are drawn from every screen inside that layout. Re-index Angular projects after upgrading.
 
 - **A big screen's picture stops wrapping into a column.** How wide a screen's lines run before they wrap was worked out with a formula, and the formula was wrong for the way these pictures are actually drawn: a part of a screen spends lines on its own structure — a step that fires things gets a line to itself, and what it fires starts another — so estimating the lines from the boxes alone badly undercounted them, and one screen's 98 boxes wrapped into a 4,356px column. Laying a picture out is cheap and exact, so the widths are now simply tried and the one that comes out closest to the shape of a window is kept. Across one app's 51 screens the tallest picture went from 4,356px to 3,796px, total height fell 8%, and — because a shorter picture is also a picture whose lines have less far to go — lines running over other boxes fell by a third and lines crossing each other went from 13 to 5.
 

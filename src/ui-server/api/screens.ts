@@ -30,7 +30,7 @@
 import * as fs from 'fs';
 import type CodeGraph from '../../index';
 import type { Edge, Node } from '../../types';
-import { routeRoots } from './route-roots';
+import { routeLayouts, routeRoots } from './route-roots';
 import { resolveProjectFile } from '../security';
 import { findIndexedFile, hasDriftedOnDisk } from './source';
 import { createWhenReader } from './when';
@@ -194,6 +194,9 @@ const SHARED_CHROME_MIN = 3;
 
 /** True when the edge's destination is written at the line the edge points to. */
 function writtenHere(edge: Edge, holder: Node): boolean {
+  // An Angular template names its destination where it is written — in a
+  // file of its own, beside the component the edge leaves from.
+  if ((edge.metadata as Record<string, unknown> | undefined)?.template === true) return true;
   const at = (edge.metadata as Record<string, unknown> | undefined)?.registeredAt;
   if (typeof at !== 'string') return edge.provenance !== 'heuristic';
   return at === `${holder.filePath}:${edge.line}`;
@@ -269,6 +272,15 @@ export async function buildScreens(cg: CodeGraph, projectRoot: string): Promise<
     const serves = screenOfComponent.get(root.node.id);
     if (serves) serves.push(routeId);
     else screenOfComponent.set(root.node.id, [routeId]);
+  }
+  // A layout serves every screen nested in it: ProfileComponent's tabs are on
+  // both `/profile/:username` and `/profile/:username/favorites`.
+  for (const [routeId, layouts] of routeLayouts(cg, routes)) {
+    for (const layout of layouts) {
+      const serves = screenOfComponent.get(layout);
+      if (!serves) screenOfComponent.set(layout, [routeId]);
+      else if (!serves.includes(routeId)) serves.push(routeId);
+    }
   }
   const nodesById = cg.getNodesByIds([...componentOf.values()].map((n) => n.id).concat(navEdges.map((e) => e.source)));
 

@@ -33,6 +33,7 @@ import { nextLinkEdges } from './next-router-synthesizer';
 import { reactRouterLinkEdges } from './react-router-synthesizer';
 import { tanstackLinkEdges } from './tanstack-router-synthesizer';
 import { vueRouterLinkEdges } from './vue-router-synthesizer';
+import { angularTemplateEdges } from './angular-template-synthesizer';
 import { svelteKitLinkEdges, svelteKitPageComponentEdges } from './sveltekit-synthesizer';
 import { createYielder, type MaybeYield } from './cooperative-yield';
 import { crossTierEdges, hasCrossTierPattern, hasTestRequestPattern, testRequestEdges } from './tier-synthesizer';
@@ -3757,6 +3758,8 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'reactRouterLinkEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => reactRouterLinkEdges(c, y) },
   { name: 'tanstackLinkEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => tanstackLinkEdges(c, y) },
   { name: 'vueRouterLinkEdges', gate: (has) => has('vue', ...JS_FAMILY), run: (_q, c, y) => vueRouterLinkEdges(c, y) },
+  // An Angular template: the child components it renders and its `routerLink`s.
+  { name: 'angularTemplateEdges', gate: (has) => has('typescript'), run: (_q, c, y) => angularTemplateEdges(c, y) },
   { name: 'svelteKitPageEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitPageComponentEdges(c, y) },
   { name: 'svelteKitLinkEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitLinkEdges(c, y) },
   { name: 'nixOptionEdges', gate: (has) => has('nix'), run: (q, _c, y) => nixOptionPathEdges(q, y) },

@@ -15,6 +15,7 @@ import { nextjsResolver } from './nextjs';
 import { reactRouterResolver } from './react-router';
 import { tanstackRouterResolver } from './tanstack-router';
 import { vueRouterResolver } from './vue-router';
+import { angularRouterResolver } from './angular-router';
 import { svelteKitRouterResolver } from './sveltekit-router';
 import { svelteResolver } from './svelte';
 import { vueResolver } from './vue';
@@ -59,6 +60,7 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   vueResolver,
   // Vue Router — `createRouter({ routes })` → route nodes; `router.push({ name })` / `router.push('/x')` → navigates edges
   vueRouterResolver,
+  angularRouterResolver,
   astroResolver,
   // Python
   djangoResolver,
@@ -157,6 +159,7 @@ export { reactResolver } from './react';
 export { reactRouterResolver } from './react-router';
 export { tanstackRouterResolver } from './tanstack-router';
 export { vueRouterResolver } from './vue-router';
+export { angularRouterResolver } from './angular-router';
 export { svelteKitRouterResolver } from './sveltekit-router';
 export { svelteResolver } from './svelte';
 export { vueResolver } from './vue';
