@@ -1339,7 +1339,8 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   // not a test entity `Record`, tokio's `Output` not a `runtime/tests` type.
   if (isTestSuitePath(candidate.filePath) && !isTestPath(ref.filePath)) return false;
   if (candidate.language === 'csharp' && ref.language === 'csharp' && CSHARP_TYPE_KINDS.has(candidate.kind) &&
-      /^[A-Za-z_]\w*$/.test(ref.referenceName) && !isCsharpTypeVisible(candidate, ref, context)) return false;
+      /^[A-Za-z_]\w*$/.test(ref.referenceName) &&
+      (!isCsharpTypeVisible(candidate, ref, context) || !isCsharpNestedTypeInScope(candidate, ref, context))) return false;
   const lang = candidate.language as string;
   if (lang === 'c' || lang === 'cpp') {
     return (
@@ -3265,12 +3266,13 @@ function csharpProjectStaticUsings(dir: string, context: ResolutionContext, memo
 }
 
 const CSHARP_NAMESPACE_SCOPES = new WeakMap<ResolutionContext, Map<string, { namespaces: string[]; usings: Set<string>; aliases: Map<string, string> }>>();
-const CSHARP_PROJECT_USINGS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
+const CSHARP_PROJECT_USINGS = new WeakMap<ResolutionContext, Map<string, { usings: Set<string>; project: boolean }>>();
 
 /**
  * The namespaces a C# file's code runs in and the ones it imports: its
- * `namespace` declarations, its `using X;`, every file's `global using X;`
- * and the `<Using Include="X" />` of the project files above it.
+ * `namespace` declarations, its `using X;`, the `global using X;` of its
+ * project's files (every file's, outside any project) and the
+ * `<Using Include="X" />` of the project files above it.
  */
 function csharpNamespaceScope(file: string, context: ResolutionContext): { namespaces: string[]; usings: Set<string>; aliases: Map<string, string> } {
   let memo = CSHARP_NAMESPACE_SCOPES.get(context);
@@ -3281,7 +3283,9 @@ function csharpNamespaceScope(file: string, context: ResolutionContext): { names
   const namespaces = [...text.matchAll(/^\s*namespace\s+([\w.]+)/gm)].map((m) => m[1]!);
   let projectMemo = CSHARP_PROJECT_USINGS.get(context);
   if (!projectMemo) CSHARP_PROJECT_USINGS.set(context, (projectMemo = new Map()));
-  const usings = new Set<string>(csharpProjectUsings(path.posix.dirname(file), context, projectMemo));
+  const project = csharpProjectUsings(path.posix.dirname(file), context, projectMemo);
+  const usings = new Set<string>(project.usings);
+  if (!project.project) for (const u of csharpGlobalUsings('.', context)) usings.add(u);
   const aliases = new Map<string, string>();
   for (const m of text.matchAll(/^\s*(?:global\s+)?using\s+(?!static\b)(?:([A-Za-z_]\w*)\s*=\s*)?([\w.]+)\s*;/gm)) {
     if (m[1]) aliases.set(m[1], m[2]!);
@@ -3292,42 +3296,65 @@ function csharpNamespaceScope(file: string, context: ResolutionContext): { names
   return scope;
 }
 
-/** `global using X;` from any file, and `<Using Include="X" />` of the project files from `dir` up. */
-function csharpProjectUsings(dir: string, context: ResolutionContext, memo: Map<string, Set<string>>): Set<string> {
+/**
+ * The `<Using Include="X" />` of the project files from `dir` up, and the
+ * `global using X;` of each project's own files — a global using is its
+ * project's alone: serilog's Serilog.Tests and Serilog.PerformanceTests each
+ * `global using` their own `Support` namespace, and both define `Some`.
+ * `project` says whether a `.csproj` sits at `dir` or above it.
+ */
+function csharpProjectUsings(dir: string, context: ResolutionContext, memo: Map<string, { usings: Set<string>; project: boolean }>): { usings: Set<string>; project: boolean } {
   const key = dir;
   const hit = memo.get(key);
   if (hit) return hit;
-  let usings: Set<string>;
-  if (dir === '.' || dir === '' || dir === '/') {
-    usings = new Set();
-    for (const f of context.getAllFiles()) {
-      if (!f.endsWith('.cs') || (context.fileContains && !context.fileContains(f, 'global using'))) continue;
-      for (const m of (context.readFile(f) ?? '').matchAll(/^\s*global\s+using\s+(?!static\b)([\w.]+)\s*;/gm)) usings.add(m[1]!);
-    }
-  } else {
-    usings = new Set(csharpProjectUsings(path.posix.dirname(dir), context, memo));
-  }
+  const root = dir === '.' || dir === '' || dir === '/';
+  const parent = root ? null : csharpProjectUsings(path.posix.dirname(dir), context, memo);
+  const usings = new Set<string>(parent?.usings ?? []);
+  let project = parent?.project ?? false;
   let entries: string[] = [];
   try {
-    entries = fs.readdirSync(path.join(context.getProjectRoot(), dir === '.' ? '' : dir));
+    entries = fs.readdirSync(path.join(context.getProjectRoot(), root ? '' : dir));
   } catch {
     entries = [];
   }
   for (const entry of entries) {
     if (!/\.(?:csproj|props)$/i.test(entry)) continue;
-    let project = '';
+    let text = '';
     try {
-      project = fs.readFileSync(path.join(context.getProjectRoot(), dir === '.' ? '' : dir, entry), 'utf8');
+      text = fs.readFileSync(path.join(context.getProjectRoot(), root ? '' : dir, entry), 'utf8');
     } catch {
       continue;
     }
-    for (const m of project.matchAll(/<Using\s+Include\s*=\s*"([\w.]+)"(?![^>]*\bStatic\s*=\s*"true")[^>]*>/gi)) usings.add(m[1]!);
+    if (/\.csproj$/i.test(entry) && !project) {
+      project = true;
+      for (const u of csharpGlobalUsings(root ? '.' : dir, context)) usings.add(u);
+    }
+    for (const m of text.matchAll(/<Using\s+Include\s*=\s*"([\w.]+)"(?![^>]*\bStatic\s*=\s*"true")[^>]*>/gi)) usings.add(m[1]!);
     // The SDK's implicit usings (serilog's own `System.TimeProvider` polyfill is seen through them).
-    if (/<ImplicitUsings>\s*(?:enable|true)\s*<\/ImplicitUsings>/i.test(project)) {
+    if (/<ImplicitUsings>\s*(?:enable|true)\s*<\/ImplicitUsings>/i.test(text)) {
       for (const ns of CSHARP_IMPLICIT_USINGS) usings.add(ns);
     }
   }
-  memo.set(key, usings);
+  const result = { usings, project };
+  memo.set(key, result);
+  return result;
+}
+
+const CSHARP_GLOBAL_USINGS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
+
+/** The `global using X;` of the `.cs` files under `dir` (`.` = the whole repository). */
+function csharpGlobalUsings(dir: string, context: ResolutionContext): Set<string> {
+  let memo = CSHARP_GLOBAL_USINGS.get(context);
+  if (!memo) CSHARP_GLOBAL_USINGS.set(context, (memo = new Map()));
+  const hit = memo.get(dir);
+  if (hit) return hit;
+  const usings = new Set<string>();
+  const prefix = dir === '.' ? '' : `${dir}/`;
+  for (const f of context.getAllFiles()) {
+    if (!f.endsWith('.cs') || !f.startsWith(prefix) || (context.fileContains && !context.fileContains(f, 'global using'))) continue;
+    for (const m of (context.readFile(f) ?? '').matchAll(/^\s*global\s+using\s+(?!static\b)([\w.]+)\s*;/gm)) usings.add(m[1]!);
+  }
+  memo.set(dir, usings);
   return usings;
 }
 
@@ -3354,6 +3381,60 @@ function isCsharpTypeVisible(n: Node, ref: UnresolvedRef, context: ResolutionCon
   if (aliased !== undefined) return aliased === `${ns}.${n.qualifiedName.slice(cut + 2).replace(/::/g, '.')}`;
   if (scope.namespaces.some((own) => own === ns || own.startsWith(ns + '.'))) return true;
   return scope.usings.has(ns);
+}
+
+/**
+ * Whether a bare C# name can reach `n` as a nested type: only from inside the
+ * type that declares it (any partial part, any depth) or a class deriving from
+ * it. AutoMapper's tests each declare their own nested `Source`, and a
+ * same-file `new Source()` went to whichever test class came first.
+ */
+function isCsharpNestedTypeInScope(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const cut = n.qualifiedName.lastIndexOf('::');
+  if (cut < 0) return true;
+  const owner = n.qualifiedName.slice(0, cut);
+  const ownerType = context.getNodesInFile(n.filePath).find((p) => CSHARP_TYPE_KINDS.has(p.kind) && p.qualifiedName === owner);
+  // Declared in a namespace, not a type.
+  if (!ownerType) return true;
+  const enclosing = context.getNodesInFile(ref.filePath)
+    .filter((p) => CSHARP_TYPE_KINDS.has(p.kind) && p.startLine <= ref.line && p.endLine >= ref.line);
+  if (enclosing.some((p) => p.qualifiedName === owner || p.qualifiedName.startsWith(`${owner}::`))) return true;
+  // Inherited: a type around the ref derives from the owner (`class SourceA :
+  // Source`), through any partial part — Newtonsoft's JsonTextReader.Async.cs
+  // is `partial class JsonTextReader` with no base list, reading JsonReader's `State`.
+  return enclosing.some((p) => csharpAncestorNames(p.qualifiedName, context).has(ownerType.name));
+}
+
+const CSHARP_ANCESTORS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
+
+/** The simple names of the C# types `qn` derives from, through every partial part and base, a few levels up. */
+function csharpAncestorNames(qn: string, context: ResolutionContext, depth = 0): Set<string> {
+  let memo = CSHARP_ANCESTORS.get(context);
+  if (!memo) CSHARP_ANCESTORS.set(context, (memo = new Map()));
+  const hit = memo.get(qn);
+  if (hit) return hit;
+  const names = new Set<string>();
+  memo.set(qn, names); // a cycle reads what is gathered so far
+  for (const decl of context.getNodesByQualifiedName(qn)) {
+    if (decl.language !== 'csharp' || !CSHARP_TYPE_KINDS.has(decl.kind)) continue;
+    const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+    let header = '';
+    for (let i = decl.startLine - 1; i < Math.min(lines.length, decl.startLine + 6) && !header.includes('{'); i++) header += `${lines[i] ?? ''} `;
+    const list = /:\s*([^{;]*)/.exec(header.split('{')[0]!.replace(/\bwhere\b[\s\S]*$/, ''))?.[1] ?? '';
+    for (const base of splitCppTopLevel(list)) {
+      const name = /([A-Za-z_]\w*)\s*(?:<.*)?$/.exec(base.trim())?.[1];
+      if (name) names.add(name);
+    }
+  }
+  if (depth < 4) {
+    for (const base of [...names]) {
+      for (const t of context.getNodesByName(base)) {
+        if (t.language !== 'csharp' || !CSHARP_TYPE_KINDS.has(t.kind) || t.qualifiedName === qn) continue;
+        for (const up of csharpAncestorNames(t.qualifiedName, context, depth + 1)) names.add(up);
+      }
+    }
+  }
+  return names;
 }
 
 const OBJC_SUPERS = new WeakMap<ResolutionContext, Map<string, string[]>>();
@@ -4395,6 +4476,13 @@ export function matchByExactName(
     (!importRef || isImportableKind(n.kind)) &&
     // Nested locals are only reachable from inside their container (#1230).
     isLexicallyReachable(n, ref, context) &&
+    // A C# type name is a type its namespaces can see — ahead of the ranking,
+    // so a visible namesake wins where the veto after it would drop the
+    // ref: eShop's `WebhookType.OrderPaid` under `using Webhooks.API.Model;`.
+    // A nested type, only from inside its owner: AutoMapper's same-file `new
+    // Source()` in one test class is not the previous test class's `Source`.
+    !(ref.language === 'csharp' && n.language === 'csharp' && CSHARP_TYPE_KINDS.has(n.kind) && /^[A-Za-z_]\w*$/.test(ref.referenceName) &&
+      (!isCsharpNestedTypeInScope(n, ref, context) || (n.filePath !== ref.filePath && !isCsharpTypeVisible(n, ref, context)))) &&
     // Preserve import ranking; calls reject the winner without promoting another.
     (!importRef || n.filePath === ref.filePath ||
       !ESM_FAMILY.has(n.language) || !isSealedModule(n.filePath, context)) &&
@@ -4474,7 +4562,14 @@ export function matchByQualifiedName(
         )
       : nodes;
 
-  const candidates = keepForRef(context.getNodesByQualifiedName(ref.referenceName));
+  let candidates = keepForRef(context.getNodesByQualifiedName(ref.referenceName));
+  // A C# `using X.Y;` names a namespace: one the project declares, else it is
+  // the file's own (external) using — never another file's using of that name.
+  if (ref.language === 'csharp' && ref.referenceKind === 'imports') {
+    const namespaces = candidates.filter((n) => n.kind === 'namespace');
+    candidates = namespaces.length > 0 ? preferCallSiteFile(namespaces, ref.filePath).slice(0, 1)
+      : candidates.filter((n) => n.kind !== 'import' || n.filePath === ref.filePath);
+  }
 
   if (candidates.length === 1) {
     return {
@@ -5508,6 +5603,8 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   CSHARP_STATIC_USINGS.delete(context);
   CSHARP_NAMESPACE_SCOPES.delete(context);
   CSHARP_PROJECT_USINGS.delete(context);
+  CSHARP_GLOBAL_USINGS.delete(context);
+  CSHARP_ANCESTORS.delete(context);
   SCALA_SUPERS.delete(context);
   SCALA_IMPORTS.delete(context);
   ESM_EXPORT_LISTS.delete(context);
@@ -6756,10 +6853,18 @@ export function matchMethodCall(
   // own file first — otherwise the first-indexed class wins and a call in `b/`
   // resolves to `a/`'s method (#1079).
   const strat1 = nmTimedT('mc-class', ref, (): ResolvedRef | null => {
-    const classCandidates = preferCallSiteFile(
+    let classCandidates = preferCallSiteFile(
       context.getNodesByName(objectOrClass!).filter(isMethodOwnerKind),
       ref.filePath,
     );
+    // A C# class the call's namespaces can see before one they can't:
+    // serilog's `Some.InformationEvent()` in Serilog.Tests is its own
+    // Support namespace's `Some`, not the performance tests'.
+    if (ref.language === 'csharp' && classCandidates.length > 1) {
+      const typeRef = { ...ref, referenceName: objectOrClass! };
+      const visible = classCandidates.filter((c) => c.language !== 'csharp' || isCsharpTypeVisible(c, typeRef, context));
+      classCandidates = [...visible, ...classCandidates.filter((c) => !visible.includes(c))];
+    }
 
     for (const classNode of classCandidates) {
       // Skip cross-language class matches

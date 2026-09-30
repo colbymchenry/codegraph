@@ -82,10 +82,10 @@ export const csharpExtractor: LanguageExtractor = {
   typeAliasTypes: [],
   // Namespaces qualify type names so same-named types in different namespaces are
   // distinguishable (e.g. `ApplicationCore.Entities.CatalogBrand` vs
-  // `BlazorShared.Models.CatalogBrand`). Both block (`namespace Foo { … }`, which
-  // nests its types) and file-scoped (`namespace Foo;`) forms — extractFilePackage
-  // pushes the namespace onto the scope so nested/top-level types pick it up.
-  packageTypes: ['namespace_declaration', 'file_scoped_namespace_declaration'],
+  // `BlazorShared.Models.CatalogBrand`). A file-scoped `namespace Foo;` covers the
+  // whole file (extractFilePackage); a block `namespace Foo { … }` only its body
+  // (the visitor scopes it).
+  packageTypes: ['file_scoped_namespace_declaration'],
   extractPackage: (node: SyntaxNode, source: string) => {
     const name =
       node.childForFieldName('name') ??
