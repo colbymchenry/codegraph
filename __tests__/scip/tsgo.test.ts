@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import CodeGraph from '../../src/index';
 import { importScipFile, runScipPass } from '../../src/scip';
+import { MAX_SOURCE_FILE_SIZE_BYTES } from '../../src/file-limits';
 import { resolveIndexer } from '../../src/scip/indexers';
 import { indexProjects } from '../../src/scip/indexers/tsgo-index';
 import { findTsgo } from '../../src/scip/indexers/typescript';
@@ -22,8 +23,8 @@ describe.runIf(TSGO)('tsgo indexer (TypeScript fixture)', () => {
     const out = path.join(dir, 'tsgo.scip');
     const result = await indexProjects(TSGO!, out, dir, configs.map(c => path.join(dir, c)));
     importScipFile(dir, out); // language from the tool name
-    await cg.scipWrite(db => runScipPass(db, dir));
-    return result;
+    const report = await cg.scipWrite(db => runScipPass(db, dir));
+    return { ...result, report: report! };
   };
 
   beforeEach(async () => {
@@ -53,6 +54,41 @@ describe.runIf(TSGO)('tsgo indexer (TypeScript fixture)', () => {
     await index();
     expect(edge('both', 'A::run')?.provenance).toBe('scip');
     expect(edge('both', 'B::run')?.provenance).toBe('scip');
+  }, 30_000);
+
+  it('a call through a constant of callable type is judged against the constant node', async () => {
+    fs.writeFileSync(path.join(dir, 'src', 'consts.ts'), [
+      'type Fn = (n: number) => number;',
+      'function makeDoubler(): Fn { return n => n * 2; }',
+      'export const twice: Fn = makeDoubler();',
+      'export function useConst() {',
+      '  return twice(2);',
+      '}',
+    ].join('\n'));
+    await cg.indexAll();
+    await index();
+    expect(cg.scipReadDb().prepare(`SELECT kind FROM nodes WHERE name = 'twice'`).get()).toEqual({ kind: 'constant' });
+    expect(edge('useConst', 'twice')?.provenance).toBe('scip');
+  }, 30_000);
+
+  it('a file over codegraph\'s size limit is skipped, not reported stale', async () => {
+    fs.writeFileSync(path.join(dir, 'src', 'big.ts'), `export function big() { return 1; }\n// ${'x'.repeat(MAX_SOURCE_FILE_SIZE_BYTES)}\n`);
+    await cg.indexAll();
+    const { report } = await index();
+    expect(report.staleDocuments).toEqual([]);
+    expect(report.freshDocuments).toBe(3);
+  }, 30_000);
+
+  it('a file is indexed by the deepest project containing it, whose paths resolve its imports', async () => {
+    // The root config claims everything (no `include`); only sub/'s config maps `@models`.
+    fs.writeFileSync(path.join(dir, 'tsconfig.json'), '{"compilerOptions":{"strict":true,"target":"es2020","module":"commonjs"}}');
+    fs.mkdirSync(path.join(dir, 'sub'));
+    fs.writeFileSync(path.join(dir, 'sub', 'tsconfig.json'),
+      '{"compilerOptions":{"strict":true,"target":"es2020","module":"commonjs","paths":{"@models":["../src/models.ts"]}}}');
+    fs.writeFileSync(path.join(dir, 'sub', 'use.ts'), "import { helper } from '@models';\nexport function viaAlias() {\n  helper();\n}\n");
+    await cg.indexAll();
+    await index(['tsconfig.json', 'sub/tsconfig.json']); // root first, as heaviest-first would order it
+    expect(edge('viaAlias', 'helper')?.provenance).toBe('scip');
   }, 30_000);
 
   it('a project it cannot open is a warning; the others are indexed', async () => {

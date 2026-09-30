@@ -29,6 +29,12 @@ export const HEURISTIC_PROVENANCE = "(provenance IS NULL OR provenance = 'tree-s
 const CALLABLE_KINDS: readonly string[] = ['function', 'method'];
 const TYPE_KINDS: readonly string[] = ['class', 'struct'];
 /**
+ * What a called `term` (a value) may be: a function-valued binding codegraph
+ * extracted as a function, or one it keeps as a constant/variable — `export
+ * const expect: Expect` — which its own edges already use as a call target.
+ */
+const CALLED_VALUE_KINDS: readonly string[] = [...CALLABLE_KINDS, 'constant', 'variable'];
+/**
  * Non-callable nodes codegraph uses as the caller of code that runs outside any
  * function — class bodies, initializers, top-level statements (the non-callable
  * source kinds its own call edges carry). With none enclosing a call, the file is the caller.
@@ -197,12 +203,12 @@ export function scipSites(
         // codegraph has a node per signature; like the heuristic, map it to the first.
         if (!known || symToNode.has(o.symbol) || (kind !== 'method' && kind !== 'term' && kind !== 'type')) continue;
         const node = nodes.definition(doc.relativePath, o.range.startLine, CONSTRUCTOR_NAMES[name] ?? name,
-          kind === 'type' ? TYPE_KINDS : CALLABLE_KINDS);
+          kind === 'type' ? TYPE_KINDS : kind === 'term' ? CALLED_VALUE_KINDS : CALLABLE_KINDS);
         if (node) {
           symToNode.set(o.symbol, node);
           bump('def_mapped');
         } else if (kind !== 'term') {
-          bump('def_unmapped'); // an unmapped `term` is just a variable
+          bump('def_unmapped'); // an unmapped `term` is a value codegraph has no node for (a parameter, a field, …)
         }
       }
     }
@@ -281,8 +287,8 @@ function classify(
   }
   const node = symToNode.get(o.symbol);
   if (kind === 'method') return { kind: 'calls', name: node?.name ?? name, target: node?.id ?? null, symbol: o.symbol };
-  // A called `term` is a function-valued binding (`const f = () => …`, a Go interface method) — a call only when it maps to a callable node.
-  if (kind === 'term' && node && CALLABLE_KINDS.includes(node.kind)) return { kind: 'calls', name: node.name, target: node.id, symbol: o.symbol };
+  // A called `term` is a function-valued binding (`const f = () => …`, `const expect: Expect`, a Go interface method) — judged only when it maps to a node.
+  if (kind === 'term' && node) return { kind: 'calls', name: node.name, target: node.id, symbol: o.symbol };
   return null;
 }
 

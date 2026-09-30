@@ -84,6 +84,7 @@ function pass(db: SqliteDatabase, projectRoot: string, installed: ReturnType<typ
       const cg = indexed.get(d.relativePath);
       if (!cg) continue; // not a file codegraph indexes (excluded, generated, …)
       const disk = meta.hashes[d.relativePath] === cg ? readHashed(projectRoot, d.relativePath) : null;
+      if (disk?.hash === cg && disk.text === null) continue; // over the size limit: codegraph extracted nothing from it
       if (disk?.hash !== cg || disk.text === null) {
         staleDocuments.push(d.relativePath);
         continue;

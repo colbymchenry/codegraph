@@ -141,21 +141,34 @@ export async function indexProjects(tsDir: string, output: string, root: string,
   };
   const warnings: string[] = [];
 
+  // A file belongs to the deepest project containing it — its own tsconfig's
+  // paths/options resolve its imports (a root config without `include` claims
+  // everything, but a nested `tests/tsconfig.json` is the one written for tests/).
+  const ownerDirs = configs.map(c => path.dirname(c)).sort((a, b) => b.length - a.length);
+  const owner = (file: string) => ownerDirs.find(d => file.startsWith(`${d}/`));
+
   let snapshot: TsSnapshot | null = null;
   let previous: string | null = null;
-  for (const config of configs) {
-    let project: TsProject | undefined;
+  const open = (config: string): TsProject | null => {
     try {
       snapshot?.dispose();
-      snapshot = ts.api.createSnapshot({ openProjects: [config], ...(previous ? { closeProjects: [previous] } : {}) });
-      project = snapshot.getProjects().find(p => p.configFileName === config);
+      snapshot = ts.api.createSnapshot({ openProjects: [config], ...(previous && previous !== config ? { closeProjects: [previous] } : {}) });
+      const project = snapshot.getProjects().find(p => p.configFileName === config);
       if (!project) throw new Error('not loaded');
+      return project;
     } catch (err) {
       warnings.push(`${rel(config)}: can't open the project (${err instanceof Error ? err.message : String(err)})`);
-      continue;
+      return null;
     } finally {
       previous = config;
     }
+  };
+
+  /** Indexes the files of `config`'s program that `want` accepts; returns the other repo files it loaded. */
+  const indexIn = (config: string, want: (file: string) => boolean): string[] => {
+    const project = open(config);
+    if (!project) return [];
+    const others: string[] = [];
     const { program, checker } = project;
     const files = new Map<string, TsSourceFile | undefined>();
     const sourceFile = (f: string) => {
@@ -223,6 +236,10 @@ export async function indexProjects(tsDir: string, output: string, root: string,
 
     for (const f of program.getSourceFileNames()) {
       if (!inRepo(f) || !SOURCE.test(f) || indexed.has(rel(f))) continue;
+      if (!want(f)) {
+        others.push(f);
+        continue;
+      }
       const sf = sourceFile(f);
       if (!sf) continue;
       indexed.add(rel(f));
@@ -258,8 +275,25 @@ export async function indexProjects(tsDir: string, output: string, root: string,
       }
     }
     ts.api.clearSourceFileCache(); // this project's ASTs; the next project fetches its own
+    return others;
+  };
+
+  // Each project indexes its own files; a file its owner never loaded (excluded
+  // there, or the owner failed to open) goes to the first project that did load it.
+  const loadedBy = new Map<string, string>();
+  for (const config of configs) {
+    const dir = path.dirname(config);
+    for (const f of indexIn(config, f => owner(f) === dir)) if (!loadedBy.has(f)) loadedBy.set(f, config);
   }
-  snapshot?.dispose();
+  const leftovers = new Map<string, Set<string>>();
+  for (const [f, config] of loadedBy) {
+    if (indexed.has(rel(f))) continue;
+    let set = leftovers.get(config);
+    if (!set) leftovers.set(config, (set = new Set()));
+    set.add(f);
+  }
+  for (const [config, set] of leftovers) indexIn(config, f => set.has(f));
+  (snapshot as TsSnapshot | null)?.dispose(); // assigned inside open()
   ts.api.close();
 
   // Only indexed files are documents: a definition in a file no project loaded

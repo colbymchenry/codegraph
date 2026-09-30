@@ -53,7 +53,7 @@ To run one through `npx` instead, put this in `codegraph.json`:
 `"python": false` disables a language. `cmd`, `args` and `env` replace the defaults. In `args`, `{args}` splices in the adapter's own arguments and `{out}` is the output path.
 
 **TS/JS with tsgo.** When TypeScript ≥ 7.1 (the native compiler) is installed, in the project's `node_modules` or the global npm root, `scip index` uses it instead of scip-typescript, through its API (`typescript/unstable/sync`). The indexer is `src/scip/indexers/tsgo-index.ts`, run as `node dist/scip/indexers/tsgo-index.js`:
-- It opens every `tsconfig.json` / `jsconfig.json` project, heaviest first, one at a time in one process. A file is indexed by the first project that loads it.
+- It opens every `tsconfig.json` / `jsconfig.json` project, one at a time in one process. A file is indexed by the **deepest project containing it**, whose own `paths`/options resolve its imports. (Playwright's root `tsconfig.json` has no `include`, so it claims `tests/` too, but only `tests/tsconfig.json` maps what those files import.) A file its owner never loads goes to the first project that does.
 - It writes only what the merge reads: a reference at the callee name of every call and `new`, and a definition for every callee the project declares. A symbol is named after its first declaration (`` `file`/node-index/Name ``). So an overload maps to its first signature, and a declaration seen from two projects is one symbol.
 - A call on a union- or intersection-typed receiver (`a.equals(b)` with `a: A | B`) targets every member's method.
 - A project that fails to open is a warning; its files stay heuristic-only.
@@ -93,6 +93,8 @@ Differences from the POC:
 
 - A target that the index *defines* but that has no codegraph node (or sits in a stale document) is **unknown**, not external. It never deletes a heuristic edge.
 - Callable-ness comes from the mapped node kind, not the symbol suffix. This lets TS `const f = () => …` count.
+- A called value (`term`) maps to a function node, or to the constant/variable node codegraph keeps for `export const expect: Expect<…>`. codegraph's own edges already target such nodes. On Playwright this let the compiler judge about 20k heuristic `expect()`/`test()` edges; 4,952 of them had pointed at an unrelated package's `expect`.
+- A file over codegraph's size limit (1 MB, e.g. a generated `types.d.ts`) has no nodes, so it's skipped like any file codegraph doesn't index, not reported as stale. Its definitions still make calls into it *unknown* rather than external.
 - `new X()` (TS, via scip-typescript's `` `<constructor>` `` symbol) and Python's `X()` (a class symbol followed by `(`) → `instantiates`, matching codegraph's own edge kind. So are Go composite literals (`&X{…}`, `X[T]{…}`) and Rust struct literals (`X { … }`). Go excludes slice/map element types and return types before a body. Rust excludes `impl`/`where` headers, `-> X {`, and destructuring patterns.
 - An overloaded method is one SCIP symbol defined at every signature, but codegraph has a node per signature. The symbol maps to the **first** signature, which is where the heuristic's edges point, so they verify instead of moving. On vscode this turned about 16.5k "replaced" edges into agreements.
 - With tsgo, an object-literal method *definition* that implements an interface (`{ listen(e) { … } }`) is not a call. scip-typescript records it as a reference to the interface method, so the merge used to add a `calls` edge for it.
@@ -143,6 +145,26 @@ Seeds 1 and 2, judged by scip-typescript's index:
 | + tsgo | 100% / 100% | 98% / 100% |
 
 tsgo's 13 seed-2 "misses" are all object-literal method definitions that scip-typescript counts as calls (see above), so the gap is scip-typescript's error. On the graph, tsgo verified 557k heuristic edges where scip-typescript verified 540k, and left 112k unverified instead of 130k.
+
+### Fork vs regular codegraph, from scratch
+
+Regular: `npx @colbymchenry/codegraph@1.6.1 init`. Fork: `codegraph init` (the same tree-sitter indexer), then `codegraph scip index` with tsgo. Accuracy is judged by scip-typescript's index, over 50 random functions/methods per seed.
+
+| | vscode, regular | vscode, fork | Playwright¹, regular | Playwright¹, fork |
+|---|---|---|---|---|
+| time | 2m06s | 2m20s + 1m31s = 3m51s | 18 s | 16 s + 8.7 s = 25 s |
+| `.codegraph` size | 1,769 MB | 1,975 MB | 193 MB | 213 MB |
+| call/instantiate edges | 804k | 915k | 99k | 116k |
+| compiler-verified | – | 773k (84%) | – | 65k (56%) |
+| wrong edges removed / missing added | – | 90k / 201k | – | 7.5k / 23.7k |
+| recall, seeds 1 / 2 | 82% / 74% | **100% / 98%** | 6% / 54%² | **100% / 100%** |
+| precision, seeds 1 / 2 | 93% / 94% | **100% / 100%** | 67% / 74%² | **97% / 85%**³ |
+
+¹ microsoft/playwright @ a8c1a59 (1,588 TS/JS files, 648k lines, 6 projects), after `npm ci --ignore-scripts`. It was not used during development. Targets are from `packages/`; on `tests/` targets both seeds score 100% / 100% (regular: 78–96% / 100%).
+² Seed 1's truth is dominated by one target: `GenericAssertions::toBe` accounts for 4,968 of its 5,490 call lines.
+³ The remaining "wrong" lines are calls typed against the public `Page` interface in `types/types.d.ts`. That file is over codegraph's size limit and has no nodes, so the heuristic's edge to the implementation (`client/page.ts`) stays, and the judge scores it wrong. Regular codegraph gets the same lines wrong (172 of them for seed 1).
+
+The tree-sitter step is the same code in both builds. The regular build alone took 13.5–19.0 s across three Playwright runs, so the difference between the two columns is within run-to-run variation. vscode had one run each.
 
 Raw per-seed output (`compare.ts --json`): [`scripts/scip-eval/results/`](scripts/scip-eval/results/). Indexers used: scip-typescript 0.4.0, scip-python 0.6.6, scip-go 0.2.7, rust-analyzer 2026-09-28. Flags: `--rg-type py --prefix django/`, `--rg-type go`, `--rg-type rust`.
 
