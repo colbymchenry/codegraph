@@ -42,7 +42,12 @@ import type { Node } from '../../types';
 import {
   FrameworkExtractionResult,
   FrameworkResolver,
+  ResolutionContext,
+  ResolvedRef,
+  UnresolvedRef,
 } from '../types';
+import { resolveImportPath } from '../import-resolver';
+import { stripCommentsForRegex } from '../strip-comments';
 
 /**
  * Match `Function("name")`, `AsyncFunction("name")`, or `Property("name")`
@@ -193,6 +198,106 @@ export const expoModulesResolver: FrameworkResolver = {
    * here is correct.
    */
   resolve() {
+    return null;
+  },
+};
+
+// =============================================================================
+// The JS side: `ExpoCamera.scanFromURLAsync(…)` → the module's function
+// =============================================================================
+
+/** `requireNativeModule('ExpoCamera')`, typed or not, optional or not. */
+const REQUIRE_NATIVE = /\brequire(?:Optional)?NativeModule\s*(?:<\s*([A-Za-z_$][\w$]*)[^>]*>)?\s*\(\s*['"]([A-Za-z_$][\w$]*)['"]\s*\)/;
+
+interface NativeBinding {
+  /** The `Name("…")` the module declares. */
+  module: string;
+  /** The declared JS type, from `requireNativeModule<CameraNativeModule>(…)`. */
+  type: string | null;
+  /** The file the binding (and its type) is written in. */
+  file: string;
+}
+
+const bindingMemo = new WeakMap<ResolutionContext, Map<string, NativeBinding | null>>();
+
+/**
+ * What `name` is bound to in `file`: `const X = requireNativeModule('N')`
+ * here, or the import of a module whose default export (or a named export)
+ * is one — expo-camera's `import CameraManager from './ExpoCameraManager'`,
+ * whose whole body is `export default requireNativeModule<CameraNativeModule>('ExpoCamera')`.
+ */
+function nativeBinding(name: string, file: string, context: ResolutionContext): NativeBinding | null {
+  let memo = bindingMemo.get(context);
+  if (!memo) bindingMemo.set(context, (memo = new Map()));
+  const key = `${file}\0${name}`;
+  if (memo.has(key)) return memo.get(key)!;
+  let found: NativeBinding | null = null;
+  const own = context.readFile(file);
+  if (own && own.includes('NativeModule')) {
+    const local = new RegExp(String.raw`\b(?:const|let|var)\s+${name}\s*(?::[^=]+)?=\s*` + REQUIRE_NATIVE.source).exec(stripCommentsForRegex(own, 'typescript'));
+    if (local) found = { type: local[1] ?? null, module: local[2]!, file };
+  }
+  if (!found) {
+    const language = /\.tsx$/.test(file) ? 'tsx' : /\.[cm]?ts$/.test(file) ? 'typescript' : /\.jsx$/.test(file) ? 'jsx' : 'javascript';
+    const binding = context.getImportMappings(file, language).find((m) => m.localName === name);
+    const target = binding && binding.source.startsWith('.') ? resolveImportPath(binding.source, file, language, context) : null;
+    const content = target ? context.readFile(target) : null;
+    if (target && content && content.includes('NativeModule')) {
+      const safe = stripCommentsForRegex(content, 'typescript');
+      const pattern = binding!.isDefault
+        ? new RegExp(String.raw`\bexport\s+default\s+` + REQUIRE_NATIVE.source)
+        : new RegExp(String.raw`\bexport\s+(?:const|let)\s+${binding!.exportedName}\s*(?::[^=]+)?=\s*` + REQUIRE_NATIVE.source);
+      const m = pattern.exec(safe);
+      if (m) found = { type: m[1] ?? null, module: m[2]!, file: target };
+    }
+  }
+  memo.set(key, found);
+  return found;
+}
+
+/**
+ * JS calls into an Expo module, bound by the module's NAME, not by the
+ * method name alone: expo-camera calls its module `CameraManager`, so
+ * `CameraManager.isAvailableAsync()` went to `CameraView`'s own static
+ * `isAvailableAsync` in the same file. The native functions the module
+ * declares are the targets — Swift first, Kotlin beside it — and when it
+ * declares none of that name, the method on the type the binding is given
+ * (`requireNativeModule<CameraNativeModule>`).
+ */
+export const expoModulesJsResolver: FrameworkResolver = {
+  name: 'expo-modules-js',
+  languages: ['typescript', 'tsx', 'javascript', 'jsx'],
+
+  detect(context) {
+    return expoModulesResolver.detect(context);
+  },
+
+  resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    if (ref.referenceKind !== 'calls') return null;
+    const m = /^([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)$/.exec(ref.referenceName);
+    if (!m) return null;
+    const binding = nativeBinding(m[1]!, ref.filePath, context);
+    if (!binding) return null;
+    const fn = m[2]!;
+    const declared = context
+      .getNodesByName(fn)
+      .filter((n) => n.id.startsWith('expo-module:') && n.qualifiedName.endsWith(`::${binding.module}.${fn}`))
+      .sort((a, b) => (a.language === 'swift' ? 0 : 1) - (b.language === 'swift' ? 0 : 1));
+    if (declared.length > 0) {
+      return {
+        original: ref,
+        targetNodeId: declared[0]!.id,
+        ...(declared.length > 1 ? { alsoTargets: declared.slice(1).map((n) => ({ targetNodeId: n.id })) } : {}),
+        confidence: 0.95,
+        resolvedBy: 'framework',
+      };
+    }
+    if (binding.type) {
+      const typed = context
+        .getNodesByName(fn)
+        .find((n) => (n.kind === 'method' || n.kind === 'property' || n.kind === 'field') && n.qualifiedName.endsWith(`${binding.type}::${fn}`));
+      if (typed) return { original: ref, targetNodeId: typed.id, confidence: 0.9, resolvedBy: 'framework' };
+    }
     return null;
   },
 };

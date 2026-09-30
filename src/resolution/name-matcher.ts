@@ -1509,6 +1509,12 @@ export function matchByExactName(
   const bareJs = isBareJsCall(ref, context);
   const bareGo = isBareGoCall(ref, context);
   const barePhp = isBarePhpCall(ref, context);
+  // A type, a value or an import the file binds from a package outside the
+  // repository names nothing in it, whatever kind of reference it is.
+  if (!bareJs && JS_FAMILY.has(ref.language) && ref.referenceKind !== 'calls' &&
+      /^[A-Za-z_$][\w$]*$/.test(ref.referenceName) && isOutOfRepoBinding(ref.referenceName, ref, context)) {
+    return null;
+  }
   if (bareJs) {
     const storeAction = matchJsStoreBindingCall(ref, context);
     if (storeAction) return storeAction;
@@ -3598,10 +3604,22 @@ export function matchMethodCall(
 
     // Filter to same-language candidates first
     const sameLanguageMethods = methods.filter(m => m.language === ref.language);
-    const targetMethods = sameLanguageMethods.length > 0 ? sameLanguageMethods : methods;
+    let targetMethods = sameLanguageMethods.length > 0 ? sameLanguageMethods : methods;
+    // A receiver the file imports is another module's value: never a method
+    // declared in the calling file. expo-camera's `CameraManager.isAvailableAsync()`
+    // (`import CameraManager from './ExpoCameraManager'`) went to `CameraView`'s
+    // own static `isAvailableAsync` — the method making the call.
+    // Ruling the caller's file out may reject a guess; it must never
+    // manufacture one — the one method left is then no likelier than before.
+    let narrowed = false;
+    if (JS_FAMILY.has(ref.language) && isImportBinding(objectOrClass!, ref, context)) {
+      const kept = targetMethods.filter((m) => m.filePath !== ref.filePath);
+      narrowed = kept.length !== targetMethods.length;
+      targetMethods = kept;
+    }
 
     // If only one same-language method with this name exists, use it
-    if (targetMethods.length === 1 && targetMethods[0]!.language === ref.language) {
+    if (targetMethods.length === 1 && !narrowed && targetMethods[0]!.language === ref.language) {
       return {
         original: ref,
         targetNodeId: targetMethods[0]!.id,
@@ -3658,6 +3676,12 @@ function isImportedModuleReceiver(receiver: string, ref: UnresolvedRef, context:
   const binding = context.getImportMappings?.(ref.filePath, ref.language)?.find((m) => m.localName === root);
   if (!binding) return false;
   return binding.isNamespace || context.isOutOfRepoImport?.(binding.source, ref.filePath, ref.language) === true;
+}
+
+/** Is the root of a member call's receiver (`CameraManager` in `CameraManager.x`) one of the file's imports? */
+function isImportBinding(receiver: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const root = receiver.split('.')[0]!;
+  return context.getImportMappings?.(ref.filePath, ref.language)?.some((m) => m.localName === root) === true;
 }
 
 /** Does the file bind `name` by importing it from outside the repository? */
@@ -4558,6 +4582,9 @@ export function matchFuzzy(
   const callableCandidates = candidates.filter((n) => callableKinds.has(n.kind) && !(typeRef && !canNameInTypePosition(n)) &&
     !(rustBare && (n.name !== ref.referenceName || !isRustNameInScope(n, ref, context))) &&
     !(ref.language === 'python' && n.name !== ref.referenceName) &&
+    // JS and TS too: halo's `type RsbuildConfig` (imported from @rsbuild/core)
+    // is not its local `rsbuildConfig`, kit's vitest `Mock` not a `mock`.
+    !(JS_FAMILY.has(ref.language) && n.name !== ref.referenceName) &&
     !(pythonShape && !fitsPythonCallShape(n, pythonShape, ref, context)) &&
     !(javaBare && n.kind === 'method' && !isJavaMethodInScope(n, ref, context)))
     .filter((n) => (ref.referenceKind !== 'references' && ref.referenceKind !== 'function_ref') ||
@@ -4587,8 +4614,9 @@ export function matchFuzzy(
     isVisibleAcrossFiles(finalCandidates[0]!, ref, context) &&
     isCrossFileReachable(finalCandidates[0]!, ref, context) &&
     !(isBareJsCall(ref, context) &&
-      (TYPE_MEMBER_KINDS.has(finalCandidates[0]!.kind) || isOutOfRepoBinding(ref.referenceName, ref, context) ||
+      (TYPE_MEMBER_KINDS.has(finalCandidates[0]!.kind) ||
         (finalCandidates[0]!.filePath !== ref.filePath && isLocallyBoundJsName(ref.referenceName, ref.filePath, context)))) &&
+    !(JS_FAMILY.has(ref.language) && isOutOfRepoBinding(ref.referenceName, ref, context)) &&
     !(finalCandidates[0]!.kind === 'method' && isBareGoCall(ref, context)) &&
     // A bare PHP call is a function call (case-insensitive, so fuzzy may find
     // one) — never the class `View` for `view(…)`, never a method.

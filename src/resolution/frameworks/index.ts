@@ -31,7 +31,7 @@ import { aspnetResolver } from './csharp';
 import { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
 import { swiftObjcBridgeResolver } from './swift-objc';
 import { reactNativeBridgeResolver } from './react-native';
-import { expoModulesResolver } from './expo-modules';
+import { expoModulesResolver, expoModulesJsResolver } from './expo-modules';
 import { expoRouterResolver } from './expo-router';
 import { fabricViewResolver } from './fabric';
 import { cicsResolver } from './cics';
@@ -90,6 +90,8 @@ const FRAMEWORK_RESOLVERS: FrameworkResolver[] = [
   reactNativeBridgeResolver,
   // Expo Modules — Function/AsyncFunction/Property DSL on Swift/Kotlin
   expoModulesResolver,
+  // Expo Modules, JS side — `M.fn()` on a `requireNativeModule('N')` binding → module N's `fn`
+  expoModulesJsResolver,
   // Expo Router — `app/` screen files → route nodes; `router.push('/x')` → navigates edges
   expoRouterResolver,
   // React Native Fabric / Codegen view components — TS spec → component nodes
@@ -177,6 +179,6 @@ export { aspnetResolver } from './csharp';
 export { swiftUIResolver, uikitResolver, vaporResolver } from './swift';
 export { swiftObjcBridgeResolver } from './swift-objc';
 export { reactNativeBridgeResolver } from './react-native';
-export { expoModulesResolver } from './expo-modules';
+export { expoModulesResolver, expoModulesJsResolver } from './expo-modules';
 export { expoRouterResolver } from './expo-router';
 export { fabricViewResolver } from './fabric';

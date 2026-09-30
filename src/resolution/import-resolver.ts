@@ -933,8 +933,11 @@ export function extractImportMappings(
 function extractJSImports(content: string): ImportMapping[] {
   const mappings: ImportMapping[] = [];
 
-  // ES6 imports
-  const importRegex = /import\s+(?:(\w+)\s*,?\s*)?(?:\{([^}]+)\})?\s*(?:(\*)\s+as\s+(\w+))?\s*from\s*['"]([^'"]+)['"]/g;
+  // ES6 imports. `import type { X }` / `import type * as ns` is TypeScript's
+  // type-only form, not a default import named `type` — which every such
+  // line used to add, making `type.innerType()` a call on an import.
+  // (`import type from './x'` still binds `type`: backtracking gives it back.)
+  const importRegex = /import\s+(?:type\s+(?=[{*]|(?!from\b)\w))?(?:(\w+)\s*,?\s*)?(?:\{([^}]+)\})?\s*(?:(\*)\s+as\s+(\w+))?\s*from\s*['"]([^'"]+)['"]/g;
 
   let match;
   while ((match = importRegex.exec(content)) !== null) {
@@ -953,7 +956,8 @@ function extractJSImports(content: string): ImportMapping[] {
 
     // Named imports
     if (namedImports) {
-      const names = namedImports.split(',').map((s) => s.trim());
+      // `{ util, type objectUtil }`: an inline `type` modifier is not part of the name.
+      const names = namedImports.split(',').map((s) => s.trim().replace(/^type\s+(?=\w)/, ''));
       for (const name of names) {
         const aliasMatch = name.match(/(\w+)\s+as\s+(\w+)/);
         if (aliasMatch) {
