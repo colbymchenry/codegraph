@@ -60,6 +60,11 @@ export interface Invocation {
   env?: Record<string, string>;
   /** something the user should know about the result's quality (shown, never fatal) */
   warning?: string;
+  /**
+   * A file the runs read codegraph's reference sites from (tsgo-index `--refs`), named
+   * `${outFile}.*` like any helper file: produce.ts writes it before they run.
+   */
+  referenceSites?: string;
 }
 
 /** Everything the fork knows about one language — the single place to add or change one. */
@@ -174,6 +179,7 @@ export interface ResolvedIndexer {
   runs: IndexerRun[];
   env: Record<string, string>;
   warning?: string;
+  referenceSites?: string;
 }
 
 /**
@@ -204,7 +210,7 @@ export function resolveIndexer(projectRoot: string, lang: ScipLanguage, outFile:
   if (preferred && 'runs' in preferred) {
     return {
       lang, tool: preferred.tool ?? spec.tools[0]!, cmd: preferred.cmd, runs: preferred.runs,
-      env: { ...preferred.env, ...override?.env }, warning: preferred.warning,
+      env: { ...preferred.env, ...override?.env }, warning: preferred.warning, referenceSites: preferred.referenceSites,
     };
   }
   const unusable = preferred?.unusable;
@@ -231,7 +237,10 @@ export function resolveIndexer(projectRoot: string, lang: ScipLanguage, outFile:
     fallback: run.fallback?.map(apply),
   });
   const warning = [inv.warning, unusable && `${unusable} — using ${cmd}`].filter(Boolean).join('; ') || undefined;
-  return { lang, tool: inv.tool ?? spec.tools[0]!, cmd, runs: inv.runs.map(apply), env: { ...inv.env, ...override?.env }, warning };
+  return {
+    lang, tool: inv.tool ?? spec.tools[0]!, cmd, runs: inv.runs.map(apply), env: { ...inv.env, ...override?.env }, warning,
+    referenceSites: inv.referenceSites,
+  };
 }
 
 export function onPath(cmd: string): boolean {

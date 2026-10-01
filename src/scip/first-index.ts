@@ -13,7 +13,7 @@ import type { CodeGraph } from '../index';
 import type { FileLock } from '../utils';
 import { describe } from './cli';
 import { runScipPass } from './index';
-import { ProduceResult, StartedIndex, startIndex } from './produce';
+import { StartedIndex, startIndex } from './produce';
 import { pendingReferenceSites } from './sites';
 import { SCIP_LANGUAGES, tryReindexLock } from './store';
 
@@ -29,7 +29,7 @@ export interface FirstIndexScip {
 export function firstIndexScip(cg: CodeGraph): FirstIndexScip {
   const root = cg.getProjectRoot();
   let lock: FileLock | null = null;
-  let started: Array<StartedIndex | ProduceResult> = [];
+  let started: StartedIndex[] = [];
   const messages: FirstIndexMessage[] = [];
   return {
     onExtracted() {
@@ -42,10 +42,10 @@ export function firstIndexScip(cg: CodeGraph): FirstIndexScip {
       const db = cg.scipReadDb();
       const refs = pendingReferenceSites(db);
       // One language's runs at a time, as `scip index` does: each starts when the previous one's runs end.
-      let after: Promise<unknown> | undefined;
+      let after: Promise<void> | undefined;
       started = SCIP_LANGUAGES.map(lang => {
         const s = startIndex(db, root, lang, refs, { after });
-        if ('ran' in s) after = s.ran;
+        after = s.ran;
         return s;
       });
     },
@@ -53,7 +53,7 @@ export function firstIndexScip(cg: CodeGraph): FirstIndexScip {
       try {
         let installed = 0;
         for (const s of started) {
-          const r = 'finish' in s ? await s.finish(cg.scipReadDb()) : s;
+          const r = await s.finish(cg.scipReadDb());
           if (r.status === 'installed') {
             installed++;
             messages.push({ level: 'success', message: `${r.lang}: ${r.documents} documents, ${r.resolvedCalls} resolved calls in ${(r.durationMs / 1000).toFixed(1)}s` });

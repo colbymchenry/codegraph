@@ -589,12 +589,10 @@ export async function indexProjects(
   return { warnings, documents: indexed.size };
 }
 
-/** A `--refs` list as path → lines; a missing file is no sites (the merge then judges no references). */
+/** A `--refs` list as path → lines. */
 function readRefs(file: string): Map<string, Set<number>> {
   const out = new Map<string, Set<number>>();
-  let text = '';
-  try { text = fs.readFileSync(file, 'utf8'); } catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err; }
-  for (const l of text.split('\n')) {
+  for (const l of fs.readFileSync(file, 'utf8').split('\n')) {
     const [p, line] = l.split('\t');
     if (!p || !line) continue;
     let lines = out.get(p);

@@ -256,8 +256,11 @@ export const typescriptIndexer: IndexerSpec = {
     const weights = projectWeights(projects, files);
     const configs = [...projects].sort((a, b) => weights.get(b)! - weights.get(a)!)
       .map(p => path.posix.join(p, has(path.join(root, p), 'tsconfig.json') ? 'tsconfig.json' : 'jsconfig.json'));
-    // produce.ts writes codegraph's reference sites beside the output (`.refs`).
-    const args = [path.join(__dirname, 'tsgo-index.js'), ts.dir, outFile, root, '--refs', `${outFile}.refs`, ...configs];
-    return { cmd: process.execPath, tool: 'tsgo-index', runs: [{ label: 'typescript (tsgo)', args, output: outFile }], warning: missingDependencies(root) };
+    const referenceSites = `${outFile}.refs`;
+    const args = [path.join(__dirname, 'tsgo-index.js'), ts.dir, outFile, root, '--refs', referenceSites, ...configs];
+    return {
+      cmd: process.execPath, tool: 'tsgo-index', runs: [{ label: 'typescript (tsgo)', args, output: outFile }],
+      warning: missingDependencies(root), referenceSites,
+    };
   },
 };

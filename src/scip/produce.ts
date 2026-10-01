@@ -117,15 +117,14 @@ export async function produceIndex(
 ): Promise<ProduceResult> {
   const prepared = prepare(projectRoot, lang);
   if ('status' in prepared) return prepared;
-  // codegraph's references: compaction keeps the SCIP references there, and tsgo-index
-  // (which resolves only what the merge reads) is told where they are.
+  // codegraph's references: compaction keeps the SCIP references there, and an indexer
+  // that resolves only what the merge reads (tsgo-index) is told where they are.
   const refs = referenceSites(db);
-  writeReferenceSites(`${prepared.raw}.refs`, refs);
   if (opts.incremental) {
     const patched = await patchIndex(db, projectRoot, lang, prepared.indexer, prepared.raw, opts, refs);
     if (patched) return patched;
   }
-  return fullRun(db, projectRoot, lang, prepared, opts).finish(db);
+  return fullRun(db, projectRoot, lang, prepared, refs, opts).finish(db);
 }
 
 /** A full run whose indexer runs are under way; `finish` compacts and installs their output. */
@@ -142,15 +141,17 @@ export interface StartedIndex {
  * far (sites.ts pendingReferenceSites), a superset of the lines the resolved
  * edges will sit on, which is all tsgo-index needs. `after`: start the runs
  * only once it settles (one language's runs at a time, as produceIndex does).
+ * A language with nothing to run finishes as its skip, once `after` settles.
  */
 export function startIndex(
-  db: SqliteDatabase, projectRoot: string, lang: ScipLanguage, refs: Set<string>, opts: ProduceOptions & { after?: Promise<unknown> } = {}
-): StartedIndex | ProduceResult {
+  db: SqliteDatabase, projectRoot: string, lang: ScipLanguage, refs: Set<string>, opts: StartOptions = {}
+): StartedIndex {
   const prepared = prepare(projectRoot, lang);
-  if ('status' in prepared) return prepared;
-  writeReferenceSites(`${prepared.raw}.refs`, refs);
-  return fullRun(db, projectRoot, lang, prepared, opts);
+  if (!('status' in prepared)) return fullRun(db, projectRoot, lang, prepared, refs, opts);
+  return { ran: (opts.after ?? Promise.resolve()).then(() => undefined, () => undefined), finish: async () => prepared };
 }
+
+type StartOptions = ProduceOptions & { after?: Promise<unknown> };
 
 interface Prepared { final: string; raw: string; indexer: ResolvedIndexer }
 
@@ -163,13 +164,13 @@ function prepare(projectRoot: string, lang: ScipLanguage): Prepared | ProduceRes
   return { final, raw, indexer };
 }
 
-/** Starts the full run's indexer now (once `after` settles); see StartedIndex. */
+/** Starts the full run's indexer now (once `after` settles); see StartedIndex. `refs`: what the runs read (Invocation.referenceSites). */
 function fullRun(
-  db: SqliteDatabase, projectRoot: string, lang: ScipLanguage, { final, raw, indexer }: Prepared,
-  opts: ProduceOptions & { after?: Promise<unknown> }
+  db: SqliteDatabase, projectRoot: string, lang: ScipLanguage, { final, indexer }: Prepared, refs: Set<string>, opts: StartOptions
 ): StartedIndex {
   const started = Date.now();
   const hashes = snapshotHashes(db, projectRoot, INDEXERS[lang].codegraphLanguages);
+  if (indexer.referenceSites) writeReferenceSites(indexer.referenceSites, refs);
   const warnings: string[] = indexer.warning ? [indexer.warning] : [];
   if (indexer.warning) opts.log?.(`${lang}: ${indexer.warning}`);
   const { runs } = indexer;
@@ -218,7 +219,6 @@ function fullRun(
       runMs = Date.now() - runStart;
     }
   })();
-  ran.catch(() => undefined); // finish rethrows; until then a failure is not "unhandled"
 
   const finish = async (db: SqliteDatabase): Promise<ProduceResult> => {
     try {
@@ -254,9 +254,10 @@ function fullRun(
       return { status: 'installed', lang, documents: compact.paths.length, resolvedCalls, durationMs, warnings };
     } finally {
       for (const r of all(runs)) fs.rmSync(r.output, { force: true });
-      fs.rmSync(`${raw}.refs`, { force: true });
+      if (indexer.referenceSites) fs.rmSync(indexer.referenceSites, { force: true });
     }
   };
+  // `finish` rethrows a failure of the runs; the handler here keeps it from being "unhandled" until then.
   return { ran: ran.catch(() => undefined), finish };
 }
 
@@ -293,6 +294,7 @@ async function patchIndex(
     let partial: ScipDocument[] = [];
     let tool = { toolName: previous.tool, toolVersion: previous.toolVersion, projectRoot: '' };
     if (runs.length) {
+      if (indexer.referenceSites) writeReferenceSites(indexer.referenceSites, refs); // a helper file: swept below
       opts.log?.(`${lang}: re-indexing ${present.length} changed or dependent file(s) — ${units.length} unit(s), ~${Math.round(plan.estimateMs / 1000)}s`);
       const outputs: string[] = [];
       let failed: string | null = null;

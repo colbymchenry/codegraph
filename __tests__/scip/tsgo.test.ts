@@ -10,6 +10,7 @@ import { resolveIndexer } from '../../src/scip/indexers';
 import { indexProjects } from '../../src/scip/indexers/tsgo-index';
 import { findTsgo, toolsDir } from '../../src/scip/indexers/typescript';
 import { scipFlowNote } from '../../src/scip/notes';
+import { scipDir } from '../../src/scip/store';
 import { ROLE_DEFINITION, decodeScipIndex } from '../../src/scip/reader';
 import type { Edge } from '../../src/types';
 
@@ -385,6 +386,7 @@ describe.runIf(TSGO)('incremental reindex (tsgo, through the CLI)', () => {
     expect((await edge('sum', 'helper'))?.provenance).toBe('scip'); // untouched files keep theirs
     expect((await edge('usesOverloads', 'Registry::lookup'))?.provenance).toBe('scip'); // a call into models.ts, which was not re-indexed
     expect(cli('scip', 'index', dir, '--lang', 'typescript', '--changed')).toMatch(/up to date/);
+    expect(fs.readdirSync(scipDir(dir)).filter(f => f.includes('.raw'))).toEqual([]); // an up-to-date run leaves no helper files
   }, 60_000);
 
   it('rebuilds in full when a patch would not save much: its estimate is half the last full run or more', () => {
