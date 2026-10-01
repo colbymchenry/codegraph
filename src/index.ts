@@ -206,27 +206,36 @@ export class CodeGraph {
     // CodeGraph per root for its whole lifetime, so editing `codegraph.json`
     // would appear to do nothing until the process restarted — `exclude` and
     // `include` do not behave that way. `loadDeprioritizePatterns` is
-    // mtime-cached, so this costs one `stat`; the compiled matcher is memoized
-    // on the pattern array's identity, which the cache keeps stable.
+    // mtime-cached, so this costs one `stat` per ranking pass (a pass takes
+    // one predicate for all its candidates, #2184); the compiled matcher is
+    // memoized on the pattern array's identity, which the cache keeps stable.
     let cachedPatterns: string[] | undefined;
     let cachedMatcher: ReturnType<typeof ignore> | undefined;
-    this.queries.setDeprioritizedPathMatcher((filePath: string): boolean => {
+    this.queries.setDeprioritizedPathMatcher(() => {
+      let matcher: ReturnType<typeof ignore> | undefined;
       try {
         const patterns = loadDeprioritizePatterns(this.projectRoot);
-        if (patterns.length === 0) return false;
+        if (patterns.length === 0) return undefined;
         if (patterns !== cachedPatterns) {
           cachedPatterns = patterns;
           cachedMatcher = ignore().add(patterns);
         }
-        const rel = path.isAbsolute(filePath)
-          ? path.relative(this.projectRoot, filePath)
-          : filePath;
-        if (!rel || rel.startsWith('..')) return false;
-        return cachedMatcher!.ignores(rel.split(path.sep).join('/'));
+        matcher = cachedMatcher;
       } catch {
         // Ranking must never take the search down with it.
-        return false;
+        return undefined;
       }
+      return (filePath: string): boolean => {
+        try {
+          const rel = path.isAbsolute(filePath)
+            ? path.relative(this.projectRoot, filePath)
+            : filePath;
+          if (!rel || rel.startsWith('..')) return false;
+          return matcher!.ignores(rel.split(path.sep).join('/'));
+        } catch {
+          return false;
+        }
+      };
     });
 
     this.orchestrator = new ExtractionOrchestrator(this.projectRoot, this.queries);
