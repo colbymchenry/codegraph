@@ -454,7 +454,8 @@ export async function indexProjects(
           if (e && e.kind === K.PropertyAccessExpression) e = e.name;
           if (e && NAMES.has(e.kind)) sites.push({ start: ts.skipTrivia(sf.text, e.pos), end: e.end, isNew: n.kind === K.NewExpression });
         }
-        if (fileRefs && n.kind === K.Identifier) {
+        // Not a declaration's own name: that is its definition, and `f(x) {` would read as a call to itself.
+        if (fileRefs && n.kind === K.Identifier && n.parent?.name !== n) {
           const start = ts.skipTrivia(sf.text, n.pos);
           if (fileRefs.has(lineOf(starts(f, sf.text), start) + 1)) refSites.push({ start, end: n.end });
         }
@@ -503,9 +504,10 @@ export async function indexProjects(
         }
       }
       if (rels.length) implementations.set(rel(f), rels);
+      const callees = new Set(sites.map(c => c.start)); // already referenced, as the callee
       for (const r of refSites) {
         const s = symbols[i++];
-        if (!s) continue;
+        if (!s || callees.has(r.start)) continue;
         const range = span(f, sf.text, r.start, r.end);
         for (const symbol of new Set(referencedAs(s))) occ.push({ range, symbol, roles: 0 });
       }

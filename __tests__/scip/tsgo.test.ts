@@ -338,6 +338,7 @@ describe.runIf(TSGO)('incremental reindex (tsgo, through the CLI)', () => {
     // produce.ts hands tsgo-index the reference sites (--refs) and compaction keeps its references there.
     cli('scip', 'index', dir, '--lang', 'typescript');
     expect(await refs()).toEqual(['use->Shape2:3:scip']); // `Blob` is lib.dom's
+    expect(await edge('use', 'use')).toBeUndefined(); // the declaration's own name on a reference line is no call
     fs.writeFileSync(path.join(dir, 'src', 'saver.ts'), `// moved\n${saver}`);
     cli('sync', dir);
     slowFullRun();
