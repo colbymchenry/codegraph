@@ -140,7 +140,8 @@ export function routeRow(route: WireEntryRoute): EntryRow {
     target: route.handlerId
       ? { type: 'symbol', id: route.handlerId, name: route.handler, kind: route.handlerKind }
       : null,
-    flowFrom: route.handlerId ? route.handler : null,
+    // An inline handler has no name of its own to draw a Flow from.
+    flowFrom: route.handlerId && !route.inline ? route.handler : null,
     title: `${route.url} → ${route.handler} (${route.file}:${route.line}), registered at ${route.routeFile}:${route.routeLine}`,
   };
 }
