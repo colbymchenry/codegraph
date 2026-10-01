@@ -39,3 +39,9 @@ class Registry:
         class Local:
             size = helper(6)
         return Local.size
+
+
+def chained() -> int:
+    # A call keyed where its expression starts: total_price sits on the next line.
+    return (Invoice(4)
+            .total_price())

@@ -228,9 +228,9 @@ describe('SCIP merge (TypeScript fixture)', () => {
     const r = importFixture();
     expect(r.documents).toBe(2);
     // main.ts: helper(2), inv.totalPrice(), o.totalPrice(), new Invoice(3), this.step(), sum(), make(), helper(1),
-    // r.lookup('a'), r.lookup(1). Imports, `Invoice[]` annotations and `this.amount` don't count;
-    // `o.soloMethod()` on `any` is unresolved.
-    expect(JSON.parse(fs.readFileSync(path.join(scipDir(dir), 'typescript.meta.json'), 'utf8')).resolvedCalls).toBe(10);
+    // r.lookup('a'), r.lookup(1), new Invoice(4), .totalPrice(). Imports, `Invoice[]` annotations and
+    // `this.amount` don't count; `o.soloMethod()` on `any` is unresolved.
+    expect(JSON.parse(fs.readFileSync(path.join(scipDir(dir), 'typescript.meta.json'), 'utf8')).resolvedCalls).toBe(12);
   });
 
   it('maps an overloaded method to its first signature, like the heuristic', async () => {

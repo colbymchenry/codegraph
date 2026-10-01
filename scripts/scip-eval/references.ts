@@ -15,7 +15,7 @@
  * pass graphs of that same snapshot — corpora.sh does.
  */
 
-import { DatabaseSync } from 'node:sqlite';
+import { createDatabase } from '../../src/db/sqlite-adapter';
 import { ROLE_DEFINITION, loadScipIndex, parseSymbol } from '../../src/scip/reader';
 
 const args = process.argv.slice(2);
@@ -59,7 +59,7 @@ for (const j of judges) {
 }
 
 const rows = graphs.map(([name, file]) => {
-  const db = new DatabaseSync(file, { readOnly: true });
+  const db = createDatabase(file, { readOnly: true }).db;
   // The node a judge symbol is defined in: same file and name, narrowest span around its definition.
   const narrowest = db.prepare(`SELECT id FROM nodes WHERE file_path = ? AND name = ?
     AND start_line <= ? AND end_line >= ? ORDER BY end_line - start_line LIMIT 1`);

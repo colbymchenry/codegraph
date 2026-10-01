@@ -23,6 +23,8 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
+      - name: Typecheck the eval scripts (outside the build's rootDir)
+        run: npx tsc -p tsconfig.scripts.json
       - name: TypeScript 7.1 for the tsgo indexer
         run: npm install --prefix "$RUNNER_TEMP/tsgo" --no-save typescript@7.1.0-dev.20260930.4
       - name: SCIP suite

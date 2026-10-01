@@ -14,7 +14,7 @@
  * Gate (FORK.md): codegraph+SCIP precision >= 95%, recall >= codegraph-only.
  */
 
-import { DatabaseSync } from 'node:sqlite';
+import { SqliteDatabase, createDatabase } from '../../src/db/sqlite-adapter';
 import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -66,7 +66,7 @@ function scipCalls(ix: ScipIndex, repo: string, atChainStart = false): Map<strin
   return out;
 }
 
-function randomTargets(ix: ScipIndex, db: DatabaseSync, calls: Map<string, Set<string>>, n: number, seed: number, prefix: string): Target[] {
+function randomTargets(ix: ScipIndex, db: SqliteDatabase, calls: Map<string, Set<string>>, n: number, seed: number, prefix: string): Target[] {
   const called = new Map<string, number>();
   for (const syms of calls.values()) for (const s of syms) called.set(s, (called.get(s) ?? 0) + 1);
   const lookup = db.prepare(`SELECT qualified_name FROM nodes WHERE file_path = ? AND name = ? AND kind IN ('function','method')
@@ -118,7 +118,88 @@ function grep(repo: string, pattern: string, rgType: string): { hits: Set<Line>;
   return { hits, bytes };
 }
 
-function graphCallers(db: DatabaseSync, t: Target): Set<Line> {
+interface CallSite { file: string; line: number; name: string; symbol: string }
+
+/**
+ * Every call site in the index, by this file's own test — the name is followed by
+ * `(`, optionally after generic arguments — not the merge's (syntax.ts callShape):
+ * the caller table below shares no site logic with what it judges.
+ */
+function callSites(ix: ScipIndex, repo: string): { bySymbol: Map<string, CallSite[]>; byFileName: Map<string, CallSite[]> } {
+  const bySymbol = new Map<string, CallSite[]>();
+  const byFileName = new Map<string, CallSite[]>(); // `${file}\0${callee name}`
+  const add = (m: Map<string, CallSite[]>, k: string, s: CallSite) => {
+    const list = m.get(k);
+    if (list) list.push(s);
+    else m.set(k, [s]);
+  };
+  for (const doc of ix.documents) {
+    let lines: string[];
+    try {
+      lines = fs.readFileSync(path.join(repo, doc.relativePath), 'utf8').split(/\r?\n/);
+    } catch {
+      continue;
+    }
+    for (const o of doc.occurrences) {
+      if (o.roles & ROLE_DEFINITION) continue;
+      const after = (lines[o.range.startLine] ?? '').slice(o.range.endCol);
+      if (!/^\s*(::)?(<[^()]*>)?\s*\(/.test(after)) continue;
+      const name = parseSymbol(o.symbol)?.last.name;
+      if (!name) continue;
+      const site = { file: doc.relativePath, line: o.range.startLine + 1, name, symbol: o.symbol };
+      add(bySymbol, o.symbol, site);
+      add(byFileName, `${site.file}\0${name}`, site);
+    }
+  }
+  return { bySymbol, byFileName };
+}
+
+/**
+ * "Who calls X?" by caller rather than by line: the functions SCIP shows calling
+ * the target (each site's narrowest enclosing function or method, else its file)
+ * against the distinct sources of the graph's `calls` edges into it. A graph
+ * caller is judged by the calls of the target's name inside its span: one
+ * resolved to the target, true; all resolved elsewhere, wrong; none at all (an
+ * untyped receiver SCIP could not resolve, or no document), unknown.
+ */
+function callerScore(db: SqliteDatabase, t: Target, sites: ReturnType<typeof callSites>) {
+  const enclosing = db.prepare(`SELECT id FROM nodes WHERE file_path = ? AND kind IN ('function','method')
+    AND start_line <= ? AND end_line >= ? ORDER BY end_line - start_line LIMIT 1`);
+  const fileNode = db.prepare(`SELECT id FROM nodes WHERE file_path = ? AND kind = 'file'`);
+  const truthOf = new Map<CallSite, string>(); // each call to the target → the caller SCIP shows
+  for (const s of sites.bySymbol.get(t.symbol) ?? []) {
+    const row = (enclosing.get(s.file, s.line, s.line) ?? fileNode.get(s.file)) as { id: string } | undefined;
+    if (row) truthOf.set(s, row.id);
+  }
+  const truth = new Set(truthOf.values());
+  const covered = new Set<string>(); // SCIP's callers some graph caller accounts for
+  const callers = db.prepare(`SELECT DISTINCT s.id, s.file_path AS file, s.kind, s.start_line AS start, s.end_line AS end
+    FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes n ON n.id = e.target
+    WHERE e.kind = 'calls' AND n.qualified_name = ? AND n.file_path = ?`)
+    .all(t.qualifiedName, t.filePath) as { id: string; file: string; kind: string; start: number; end: number }[];
+  let tp = 0;
+  let wrong = 0;
+  let unknown = 0;
+  for (const c of callers) {
+    if (truth.has(c.id)) {
+      tp++;
+      covered.add(c.id);
+      continue;
+    }
+    // A caller codegraph names differently (a class body, a property's initializer) still holds the call.
+    const inside = (sites.byFileName.get(`${c.file}\0${t.name}`) ?? [])
+      .filter(s => c.kind === 'file' || (s.line >= c.start && s.line <= c.end));
+    const hits = inside.filter(s => s.symbol === t.symbol);
+    if (hits.length > 0) {
+      tp++;
+      for (const s of hits) covered.add(truthOf.get(s)!);
+    } else if (inside.length > 0) wrong++;
+    else unknown++;
+  }
+  return { candidates: callers.length, tp, found: covered.size, wrong, unknown, truth: truth.size };
+}
+
+function graphCallers(db: SqliteDatabase, t: Target): Set<Line> {
   const rows = db.prepare(`SELECT s.file_path AS p, e.line AS ln FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes n ON n.id = e.target
     WHERE e.kind = 'calls' AND n.qualified_name = ? AND n.file_path = ?`).all(t.qualifiedName, t.filePath) as { p: string; ln: number }[];
   return new Set(rows.map(r => `${r.p}:${r.ln}`));
@@ -135,13 +216,27 @@ function main(): void {
   const ix = loadScipIndex(scipFile);
   const calls = scipCalls(ix, repo);
   const graphCalls = scipCalls(ix, repo, true);
-  const hDb = new DatabaseSync(hPath, { readOnly: true });
-  const mDb = new DatabaseSync(mPath, { readOnly: true });
+  const hDb = createDatabase(hPath, { readOnly: true }).db;
+  const mDb = createDatabase(mPath, { readOnly: true }).db;
   const targets = randomTargets(ix, hDb, calls, n, seed, arg('prefix', '')!);
 
-  type Tot = { candidates: number; true: number; wrong: number; unknown: number; truth: number; bytes: number; recalls: number[] };
+  type Tot = { candidates: number; true: number; wrong: number; unknown: number; truth: number; bytes: number; recalls: number[]; found?: number };
   const tot = new Map<string, Tot>();
+  const sites = callSites(ix, repo);
+  const byCaller = new Map<string, Tot>();
   for (const t of targets) {
+    for (const [name, db] of [['codegraph', hDb], ['codegraph+SCIP', mDb]] as const) {
+      const s = callerScore(db, t, sites);
+      let c = byCaller.get(name);
+      if (!c) byCaller.set(name, (c = { candidates: 0, true: 0, wrong: 0, unknown: 0, truth: 0, bytes: 0, recalls: [] }));
+      c.candidates += s.candidates;
+      c.true += s.tp;
+      c.found = (c.found ?? 0) + s.found;
+      c.wrong += s.wrong;
+      c.unknown += s.unknown;
+      c.truth += s.truth;
+      c.recalls.push(s.truth ? s.found / s.truth : 1);
+    }
     const truthIn = (m: Map<string, Set<string>>) => { let n = 0; for (const [k, syms] of m) if (k.endsWith(`:${t.name}`) && syms.has(t.symbol)) n++; return n; };
     const g = grep(repo, t.grep, arg('rg-type', 'ts')!);
     const methods: Record<string, { hits: Set<Line>; bytes: number; calls: Map<string, Set<string>> }> = {
@@ -173,16 +268,18 @@ function main(): void {
     const s = [...xs].sort((a, b) => a - b);
     return s.length ? s[Math.floor((s.length - 1) / 2)]! : 0;
   };
-  const rows = [...tot.entries()].map(([name, c]) => ({
+  const toRows = (m: Map<string, Tot>) => [...m.entries()].map(([name, c]) => ({
     method: name, candidates: c.candidates, true: c.true, wrong: c.wrong, unknown: c.unknown,
-    recall: c.truth ? c.true / c.truth : 0,
+    recall: c.truth ? (c.found ?? c.true) / c.truth : 0, // by caller: SCIP callers covered
     recallMedian: median(c.recalls),
     good: c.recalls.filter(r => r >= 0.9).length,
     precision: c.true + c.wrong ? c.true / (c.true + c.wrong) : null,
     kb: name.startsWith('grep') ? c.bytes / 1024 : null,
   }));
+  const rows = toRows(tot);
+  const callerRows = toRows(byCaller);
   if (process.argv.includes('--json')) {
-    console.log(JSON.stringify({ seed, targets: targets.length, truth: tot.get('codegraph')?.truth ?? 0, rows }, null, 2));
+    console.log(JSON.stringify({ seed, targets: targets.length, truth: tot.get('codegraph')?.truth ?? 0, rows, callerRows }, null, 2));
     return;
   }
   console.log(`${targets.length} random targets (seed ${seed}), SCIP-resolved call lines total: ${tot.get('codegraph')?.truth ?? 0}\n`);
@@ -192,6 +289,12 @@ function main(): void {
     console.log(`| ${r.method} | ${r.candidates} | ${r.true} | ${r.wrong} | ${r.unknown} | ${pct(r.recall)} | ${pct(r.recallMedian)} | ${r.good}/${targets.length} | ${r.precision === null ? '–' : pct(r.precision)} | ${r.kb === null ? '–' : r.kb.toFixed(0)} |`);
   }
   console.log('\n* precision over lines SCIP could judge (true+wrong); unknown excluded.');
+  console.log(`\nBy caller, judged without the merge's site keys or call test (SCIP callers total: ${byCaller.get('codegraph')?.truth ?? 0}):\n`);
+  console.log('| method | callers | true | wrong | unknown | recall (micro) | recall (median target) | targets ≥90% recall | precision |');
+  console.log('|---|---|---|---|---|---|---|---|---|');
+  for (const r of callerRows) {
+    console.log(`| ${r.method} | ${r.candidates} | ${r.true} | ${r.wrong} | ${r.unknown} | ${pct(r.recall)} | ${pct(r.recallMedian)} | ${r.good}/${targets.length} | ${r.precision === null ? '–' : pct(r.precision)} |`);
+  }
 }
 
 main();

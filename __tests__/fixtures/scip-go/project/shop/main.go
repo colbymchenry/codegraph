@@ -38,3 +38,9 @@ func (s Service) Run() int {
 func (s Service) step() int {
 	return Helper(1)
 }
+
+// A call keyed where its expression starts: TotalPrice sits on the next line.
+func Chained() int {
+	return NewInvoice(4).
+		TotalPrice()
+}

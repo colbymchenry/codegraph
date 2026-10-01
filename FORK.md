@@ -227,6 +227,19 @@ Pass bar per language (2 seeds × 50 random targets): precision ≥ 95%, recall 
 
 The tsgo rows are judged by **scip-typescript's** index. An index can't be checked against itself, and this gives an independent compiler's view. Judged by its own index, tsgo also scores 100% / 100% on both seeds.
 
+**By caller.** The table above keys calls by line with the merge's own code (`site.ts` callLine, `syntax.ts` callShape), so a keying bug in the merge is also in its judge. `compare.ts` therefore prints a second table that shares neither: which functions call the target, with its own call test (the name followed by `(`) and node spans. A graph caller is right when a call inside its span resolves to the target, wrong when every such call resolves elsewhere, and unknown when SCIP resolved none (an untyped receiver). Measured 2026-10-01, same DBs:
+
+| corpus | seed | codegraph R / P | codegraph+SCIP R / P |
+|---|---|---|---|
+| codegraph `src/` | 1 / 2 | 89% / 100%, 89% / 100% | 100% / 100%, 100% / 100% |
+| Django | 1 / 2 | 75% / 80%, 78% / 97% | 100% / **98%**, 100% / 100% |
+| cobra | 1 / 2 | 100% / 99%, 100% / 99% | 100% / 100%, 100% / 100% |
+| ripgrep | 1 / 2 | 55% / 84%, 54% / 68% | 99% / 99%, 100% / 100% |
+
+Django seed 1's 8 merged callers judged wrong are not examined yet.
+
+**Invariants.** `__tests__/scip/invariants.test.ts` checks, on every language's fixture, that no call is left as a SCIP edge beside an unverified heuristic edge, and that a multi-line chain's call is verified at the line its expression starts on. With `callLine` disabled, 7 of its 8 tests fail. The fixtures' committed indexes are rebuilt with `scripts/scip-eval/fixtures.sh` after their sources change. The eval scripts are typechecked in CI (`tsconfig.scripts.json`).
+
 **Large repo: vscode** @ 73d5322b (14,054 TS files, 4.4M lines, 94 projects), on a 16 GB / 16-thread machine:
 
 | pipeline | build | index size | merge | total |
@@ -292,11 +305,4 @@ Known residue: ripgrep's multi-line `const X: T = T { … }` items. codegraph at
 
 ## Status
 
-- Phase 0 (fork setup): done, except the release script (see the job report).
-- Phase 1 (core + TS/JS): done.
-- Phase 2 (Python): done.
-- Phase 3 (Go) and Phase 4 (Rust): done.
-- TS/JS via tsgo (TypeScript ≥ 7.1): done; preferred over scip-typescript when installed.
-- Incremental reindex for tsgo and scip-python indexes: done.
-- Phase 5: `implements`/`extends` and calls through interfaces from SCIP relationships: done (Rust: `implements` from `impl` headers; no dispatch, since rust-analyzer emits no relationships). `references` edges: verified or deleted at their own site (see "`references` edges").
-- Next: [`docs/scip-roadmap.md`](docs/scip-roadmap.md).
+What is done and what is next: [`docs/scip-roadmap.md`](docs/scip-roadmap.md).

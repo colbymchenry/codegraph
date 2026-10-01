@@ -30,3 +30,9 @@ export function usesOverloads(r: Registry): number {
   r.lookup('a');
   return r.lookup(1);
 }
+
+// A call keyed where its expression starts: totalPrice sits on the next line.
+export function chained(): number {
+  return new Invoice(4)
+    .totalPrice();
+}
