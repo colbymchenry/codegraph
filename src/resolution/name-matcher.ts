@@ -8566,11 +8566,41 @@ export function matchReference(
     // selected = useStore(s => s.reset); selected()` is the store's `reset`.)
     if (target && target.name === ref.referenceName && isOutsideJsLocal(target, ref, context)) return null;
   }
+  // A type never inherits from itself: cats' `trait BigDecimalInstances extends
+  // cats.kernel.instances.BigDecimalInstances` and `trait AllOps … with
+  // Bifoldable.AllOps` name another type of their own name.
+  if (result && result.targetNodeId === ref.fromNodeId && isInheritanceRef(ref)) return otherSupertypeNamed(ref, context);
   // Nor does a value's initializer call the value: sttp's `val response =
   // basicRequest.get(…).response(asStringAlways)` is a request's `response`.
   if (result && result.targetNodeId === ref.fromNodeId && ref.referenceKind === 'calls' &&
       VALUE_KINDS.has(context.getNodeById?.(ref.fromNodeId)?.kind ?? '')) return null;
   return result ? retargetSelfOverload(result, ref, context) : result;
+}
+
+/**
+ * The supertype an inheritance ref names when the name is the declaring
+ * type's own: another type of that name — the one the written qualifier
+ * (`cats.kernel.instances.`, `Bifoldable.`) leads to, by its owner and its
+ * file's package. Null unless exactly one fits.
+ */
+function otherSupertypeNamed(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+  const name = ref.referenceName.split(/::|\./).pop()!;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1] ?? '';
+  const written = new RegExp(`^\\s*((?:[\\w$]+\\.)+)${name.replace(/\$/g, '\\$')}\\b`).exec(line.slice(Math.max(0, ref.column)));
+  const qualifier = written ? written[1]!.slice(0, -1) : '';
+  const candidates = context.getNodesByName(name).filter((n) =>
+    n.id !== ref.fromNodeId && isSupertypeTarget(n) && sameLanguageFamily(n.language, ref.language) &&
+    (qualifier === '' || ownerPathOf(n, context) === qualifier || ownerPathOf(n, context).endsWith(`.${qualifier}`)));
+  return candidates.length === 1 ? { original: ref, targetNodeId: candidates[0]!.id, confidence: 0.8, resolvedBy: 'qualified-name' } : null;
+}
+
+/** A declaration's dotted owner path — its file's package clauses, then its enclosing types (`cats.kernel.instances`, `cats.Bifoldable`). */
+function ownerPathOf(n: Node, context: ResolutionContext): string {
+  const text = context.readFile(n.filePath) ?? '';
+  const pkg = [...text.matchAll(/^\s*package\s+([\w.]+)\s*;?\s*$/gm)].map((m) => m[1]!).join('.');
+  const cut = n.qualifiedName.lastIndexOf('::');
+  const owners = cut > 0 ? n.qualifiedName.slice(0, cut).replace(/::/g, '.') : '';
+  return [pkg, owners].filter((p) => p !== '' && !(pkg !== '' && p === owners && owners.startsWith(pkg))).join('.');
 }
 
 /** Reference kinds a bare JS/TS local can be: a call, a value, a construction. */
