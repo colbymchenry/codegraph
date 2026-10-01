@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -441,4 +441,38 @@ describe.runIf(TSGO)('incremental reindex (tsgo, through the CLI)', () => {
     cli('scip', 'index', dir, '--lang', 'typescript');
     expect(patched).toEqual(await graph());
   }, 60_000);
+
+  it('a watched edit is re-indexed on its own: watcher → sync → patch → merge', async () => {
+    cli('init', '-y', dir);
+    cli('scip', 'index', dir, '--lang', 'typescript');
+    slowFullRun();
+    const metaFile = path.join(dir, '.codegraph', 'scip', 'typescript.meta.json');
+    const before = JSON.parse(fs.readFileSync(metaFile, 'utf8')) as { producedAt: number };
+
+    // What the MCP server does: open the project and watch it (from dist, which holds tsgo-index.js).
+    const dist = path.join(__dirname, '..', '..', 'dist', 'index.js');
+    const watcher = spawn(process.execPath, ['-e',
+      `require(${JSON.stringify(dist)}).default.open(${JSON.stringify(dir)}).then(cg => { cg.watch({ debounceMs: 50 }); console.log('ready'); setInterval(() => {}, 1000); })`],
+    { env: { ...process.env, CODEGRAPH_SCIP_REINDEX_IDLE_MS: '200', CODEGRAPH_NO_UPDATE_CHECK: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    watcher.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
+    const until = async (what: string, ok: () => boolean | Promise<boolean>) => {
+      for (const end = Date.now() + 40_000; Date.now() < end; await new Promise(r => setTimeout(r, 200))) if (await ok()) return;
+      throw new Error(`timed out waiting for ${what}; watcher stderr:\n${stderr}`);
+    };
+    try {
+      await new Promise<void>((resolve, reject) => {
+        watcher.stdout.on('data', (d: Buffer) => { if (d.toString().includes('ready')) resolve(); });
+        watcher.on('exit', code => reject(new Error(`watcher exited ${code}: ${stderr}`)));
+      });
+      fs.appendFileSync(path.join(dir, 'src', 'main.ts'), '\nexport function extra(): number {\n  return helper(3);\n}\n');
+
+      await until('the reindex', () => JSON.parse(fs.readFileSync(metaFile, 'utf8')).producedAt !== before.producedAt);
+      expect(JSON.parse(fs.readFileSync(metaFile, 'utf8')).fullRunMs).toBe(60_000); // a patch keeps the last full run's time
+      await until('the merge', async () => (await edge('extra', 'helper'))?.provenance === 'scip');
+      expect((await edge('sum', 'helper'))?.provenance).toBe('scip');
+    } finally {
+      watcher.kill();
+    }
+  }, 90_000);
 });

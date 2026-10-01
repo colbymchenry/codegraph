@@ -37,7 +37,8 @@ export class ScipReindexScheduler {
   private readonly log: (msg: string) => void;
 
   constructor(private readonly host: ScipHost, opts: ReindexOptions = {}) {
-    this.idleMs = opts.idleMs ?? DEFAULT_IDLE_MS;
+    // `CODEGRAPH_SCIP_REINDEX_IDLE_MS`: the watcher builds its scheduler with no options (tests shorten the wait).
+    this.idleMs = opts.idleMs ?? (Number(process.env.CODEGRAPH_SCIP_REINDEX_IDLE_MS) || DEFAULT_IDLE_MS);
     this.minIntervalMs = opts.minIntervalMs ?? DEFAULT_MIN_INTERVAL_MS;
     this.incrementalIntervalMs = opts.incrementalIntervalMs ?? DEFAULT_INCREMENTAL_INTERVAL_MS;
     this.log = opts.log ?? ((m) => process.stderr.write(`[CodeGraph SCIP] ${m}\n`));
