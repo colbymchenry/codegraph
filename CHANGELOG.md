@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- A call in C code is no longer linked to a C++ class's method, since C has no methods and can't call one. Before, redis's POSIX `read(fd, buf, n)` calls and hiredis's `c->funcs->read(…)` function pointer pointed at a Qt adapter's `read` method.
 - In Go, a name written through an imported package from outside the module, like `context.Context`, `http.ResponseWriter` or testify's `require.Contains`, is no longer linked to a project symbol of that name. Before, fiber's `context.Context` parameters pointed at a method `Stream.Context`, its `require.Contains(…)` assertions at an extractor's `Contains`, and gin's `http.ResponseWriter` at its own `ResponseWriter` interface.
 - Bare calls in Gradle Kotlin scripts (`build.gradle.kts`), like `plugins { }`, `dependencies { }` or `api(…)`, are no longer linked to a method or property of one of the project's own classes. Build logic's extension functions on Gradle's types still resolve. Before, nowinandroid's build scripts pointed every `plugins { }` and `dependencies { }` block at its build logic's `Graph` class, and every `api(…)` at a lint registry's `api` property.
 - In Rust, `Self::Error` in a signature now resolves to the enclosing impl's or trait's own associated type. A path through a generic parameter, like `V::Value`, no longer resolves to an unrelated struct of that name. Before, serde's `Self::Error` signatures pointed at its one `struct Error`, and axum's `Self::Error` at `axum-core`'s error type.

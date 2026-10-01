@@ -8692,6 +8692,10 @@ export function matchReference(
     // selected = useStore(s => s.reset); selected()` is the store's `reset`.)
     if (target && target.name === ref.referenceName && isOutsideJsLocal(target, ref, context)) return null;
   }
+  // C has no methods, and C code cannot call a C++ one: hiredis' function
+  // pointer `c->funcs->read(c, buf, …)` is no Qt adapter's `read`.
+  if (result && ref.language === 'c' && ref.referenceKind === 'calls' &&
+      context.getNodeById?.(result.targetNodeId)?.kind === 'method') return null;
   // A type never inherits from itself: cats' `trait BigDecimalInstances extends
   // cats.kernel.instances.BigDecimalInstances` and `trait AllOps … with
   // Bifoldable.AllOps` name another type of their own name.
