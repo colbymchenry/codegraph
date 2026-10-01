@@ -24,7 +24,7 @@ import type { SqliteDatabase } from '../db/sqlite-adapter';
 import { Compactor } from './compact';
 import { INDEXERS, IndexerRun, RUN_WARNING, ResolvedIndexer, resolveIndexer } from './indexers';
 import {
-  ROLE_DEFINITION, ScipDecodeError, ScipDocument, decodeScipIndex, encodeDocument, encodeMetadata, loadScipIndex,
+  ScipDecodeError, ScipDocument, decodeScipIndex, encodeDocument, encodeMetadata, loadScipIndex,
 } from './reader';
 import { ScipLanguage, indexPath, installIndex, readHashed, readMeta, snapshotHashes } from './store';
 
@@ -241,20 +241,11 @@ async function patchIndex(
       }
     }
 
-    // Splice: the plan's files get their new documents (or none); every other file keeps
-    // its installed document plus any definitions the new references need from it.
+    // Splice: the plan's files get their new documents (or none); every other file keeps its
+    // installed one. Each document defines everything its file declares, so nothing else moves.
     const replaced = new Set([...plan.files, ...plan.deleted]);
     const docs = new Map(loadScipIndex(final).documents.filter(d => !replaced.has(d.relativePath)).map(d => [d.relativePath, d]));
-    for (const d of partial) {
-      if (replaced.has(d.relativePath)) {
-        docs.set(d.relativePath, d);
-        continue;
-      }
-      const kept = docs.get(d.relativePath);
-      if (!kept) continue; // outside the plan and not indexed before: a patch doesn't widen coverage
-      const defined = new Set(kept.occurrences.filter(o => o.roles & ROLE_DEFINITION).map(o => o.symbol));
-      for (const o of d.occurrences) if (o.roles & ROLE_DEFINITION && !defined.has(o.symbol)) kept.occurrences.push(o);
-    }
+    for (const d of partial) if (replaced.has(d.relativePath)) docs.set(d.relativePath, d);
     const compact = new Compactor(projectRoot, lang);
     compact.add(Buffer.concat([encodeMetadata(tool), ...[...docs.values()].map(d => encodeDocument(d, s => Buffer.from(s)))]));
     const resolvedCalls = compact.resolvedCalls();

@@ -16,7 +16,7 @@ Status: planned, not started. Decided 2026-10-01. For what is already built, see
 | Question | Decision |
 |---|---|
 | Keep supporting scip-typescript now that tsgo is preferred? | **Yes.** Project-level patching (2.4) and plain-JS coverage (4.6) are in scope for it. |
-| Accept larger tsgo indexes (~101 → ~120 MB on vscode) for one splice rule? | **Yes** (1.1). |
+| Accept larger tsgo indexes (~101 → ~120 MB on vscode) for one splice rule? | **Yes** (1.1). Measured: 144 → 178 MB, tsgo 75 → 82 s, merge 23 → 26 s. |
 | When to run the agent eval? | **After the fix phases** (Phase 6 follows 0–5). |
 | Fixed patch caps or per-unit cost estimates (2.2)? | **Measured cost, with a hard cap.** Patch when the estimated patch time is under half of the last full run's time (recorded in the index metadata); never past 500 files. |
 | May the fork publish its own GitHub releases (7.4)? | **Not yet.** 7.4 is deferred; install stays local (build the bundle, re-link). |
@@ -25,7 +25,7 @@ Status: planned, not started. Decided 2026-10-01. For what is already built, see
 
 Once these hold, the shared core needs no per-indexer special cases:
 
-1. **Every document defines everything its file declares.**
+1. **Every document defines everything its file declares** that another file can call (a function-local is reachable only from its own file, which is re-indexed whenever it changes).
 2. **Paths are made relative to the repo whenever an index is read.**
 3. **Symbol names don't change when other code is edited.** Each indexer declares this.
 
@@ -33,7 +33,7 @@ A language adapter (`IndexerSpec`) then only declares its capabilities: detectio
 
 | Indexer | Smallest unit | Names survive edits | Defines all it declares | Patchable |
 |---|---|---|---|---|
-| tsgo-index | file (`--only`) | yes | partial runs only (fixed by 1.1) | yes |
+| tsgo-index | file (`--only`) | yes | yes (1.1) | yes |
 | scip-typescript | project (tsconfig) | yes | yes | planned (2.4) |
 | scip-python | directory (`--target-only`; ~10–15 s per run) | yes | yes | yes |
 | scip-go | package (`index ./pkg/...`) | yes | yes | planned (2.3) |
@@ -52,9 +52,9 @@ A language adapter (`IndexerSpec`) then only declares its capabilities: detectio
 
 | # | Task | How | Check |
 |---|---|---|---|
-| 1.1 | tsgo defines everything it declares, in full runs too | Always collect declarations (today only in `--only` runs) | Index size recorded; vscode merge identical edge for edge |
-| 1.2 | Rebase paths whenever an index is read | Move the rebasing out of `patchIndex` into the reader; it also fixes `scip import` of a subfolder-rooted index | Existing tests; a new import test with a subfolder-rooted index |
-| 1.3 | Simplify the splice | With 1.1, replace whole documents and drop the "add missing definitions" step | Patch equals full: 0 differences on vscode and Django |
+| 1.1 | **Done.** tsgo defines everything it declares, in full runs too | Always collect declarations outside function bodies (before: only in `--only` runs). Locals too would double the index (307 MB) and tsgo time (138 s) for nothing | vscode: 144 → 178 MB, 75 → 82 s; graph identical (0 of 2,081,375 edges differ) |
+| 1.2 | **Done.** Rebase paths whenever an index is read | Move the rebasing out of `patchIndex` into the reader; it also fixes `scip import` of a subfolder-rooted index | Existing tests; a new import test with a subfolder-rooted index |
+| 1.3 | **Done.** Simplify the splice | With 1.1, replace whole documents and drop the "add missing definitions" step | Patch equals full, with a new call into a function nothing called before: 0 of 2,081,396 edges differ on vscode (patch 47 s vs full 105 s), 0 of 216,198 on Django (42 s vs 98 s) |
 
 ## Phase 2: one shared planner for re-indexing changed files
 

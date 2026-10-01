@@ -122,9 +122,8 @@ function lineOf(starts: number[], pos: number): number {
 
 /**
  * `only` (repo-relative paths) indexes just those files — the partial run of an
- * incremental reindex. Only projects owning one of them are opened, and the
- * output also carries definitions-only documents for other files the listed
- * ones call into, so the caller can splice it into the installed index.
+ * incremental reindex, whose documents replace theirs in the installed index.
+ * Only projects owning one of them are opened.
  */
 export async function indexProjects(
   tsDir: string, output: string, root: string, configs: string[], only?: ReadonlySet<string>
@@ -142,6 +141,8 @@ export async function indexProjects(
     ...[K.FunctionDeclaration, K.FunctionExpression, K.MethodDeclaration, K.MethodSignature, K.GetAccessor, K.SetAccessor].map(k => [k!, '().'] as const),
     ...[K.VariableDeclaration, K.PropertyDeclaration, K.PropertySignature, K.PropertyAssignment].map(k => [k!, '.'] as const),
   ]);
+  /** Bodies whose declarations are local: no other file can call into them. */
+  const FUNCTION_LIKE = new Set([K.FunctionDeclaration, K.FunctionExpression, K.ArrowFunction, K.MethodDeclaration, K.Constructor, K.GetAccessor, K.SetAccessor]);
   const NAMES = new Set([K.Identifier, K.PrivateIdentifier]);
   const UNWRAP = new Set([K.NonNullExpression, K.ParenthesizedExpression]);
 
@@ -375,10 +376,11 @@ export async function indexProjects(
       /** classes/interfaces with bases: positions of their name, each base's name, each member's name */
       const types: { at: number; bases: number[]; members: number[] }[] = [];
       const baseName = (t: TsNode) => heritageName(sf.text, t);
-      /** a partial run's declarations (see below): positions of their names */
+      /** the file's named declarations outside function bodies (see below): positions of their names */
       const declared: number[] = [];
+      let local = 0; // function bodies we are inside
       const visit = (n: TsNode): undefined => {
-        if (only && CONTAINER_SUFFIX.has(n.kind) && n.kind !== K.ModuleDeclaration && n.name && NAMES.has(n.name.kind)) {
+        if (!local && CONTAINER_SUFFIX.has(n.kind) && n.kind !== K.ModuleDeclaration && n.name && NAMES.has(n.name.kind)) {
           declared.push(ts.skipTrivia(sf.text, n.name.pos));
         }
         if (TYPE_DECLS.has(n.kind) && n.name && n.heritageClauses) {
@@ -394,7 +396,10 @@ export async function indexProjects(
           if (e && e.kind === K.PropertyAccessExpression) e = e.name;
           if (e && NAMES.has(e.kind)) sites.push({ start: ts.skipTrivia(sf.text, e.pos), end: e.end, isNew: n.kind === K.NewExpression });
         }
+        const body = FUNCTION_LIKE.has(n.kind);
+        if (body) local++;
         n.forEachChild(visit);
+        if (body) local--;
         return undefined;
       };
       sf.forEachChild(visit);
@@ -435,9 +440,10 @@ export async function indexProjects(
         }
       }
       if (rels.length) implementations.set(rel(f), rels);
-      // A partial run replaces this file's document in the installed index, where
-      // unchanged files still call into it: define everything it declares, not just
-      // what this run referenced, or those calls would lose their target.
+      // Define everything another file could call, not just what was referenced: a
+      // partial run replaces this document while unchanged files still call into it,
+      // and a changed file may start calling what nothing called before. (A local is
+      // only reachable from its own file, which is re-indexed whenever it changes.)
       for (const d of symbols.slice(i)) {
         const suffix = d && (d.flags & (F.Class | F.Interface) ? '#' : d.flags & (F.Function | F.Method) ? '().' : d.flags & (F.Variable | F.Property) ? '.' : null);
         if (suffix) first(d!, suffix);
@@ -481,9 +487,7 @@ export async function indexProjects(
   (snapshot as TsSnapshot | null)?.dispose(); // assigned inside open()
   ts.api.close();
 
-  // Indexed files are documents. A partial run adds definitions-only documents for
-  // the other files its references land in (the caller merges those into the
-  // installed documents); a full run has indexed every such file itself.
+  // Indexed files are documents; every file a reference lands in defines its target itself.
   const fd = fs.openSync(output, 'w');
   try {
     fs.writeSync(fd, encodeMetadata({ toolName: 'tsgo-index', toolVersion: ts.version, projectRoot: pathToFileURL(root).href }));
@@ -494,7 +498,7 @@ export async function indexProjects(
       return b;
     };
     for (const [file, occurrences] of docs) {
-      if (!indexed.has(file) && !only) continue;
+      if (!indexed.has(file)) continue;
       fs.writeSync(fd, encodeDocument({
         relativePath: file, language: 'typescript', positionEncoding: POSITION_ENCODING_UTF16, occurrences,
         implementations: implementations.get(file),

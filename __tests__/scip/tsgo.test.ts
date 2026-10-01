@@ -256,15 +256,18 @@ describe.runIf(TSGO)('incremental reindex (tsgo, through the CLI)', () => {
   afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
 
   it('re-indexes only the edited file (and its importers), splicing it into the installed index', async () => {
+    fs.writeFileSync(path.join(dir, 'src', 'spare.ts'), 'export function spare(): number {\n  return 0;\n}\n'); // called by nothing yet
     cli('init', '-y', dir);
     expect(cli('scip', 'index', dir, '--lang', 'typescript')).not.toMatch(/patched/);
     expect((await edge('sum', 'helper'))?.provenance).toBe('scip');
 
-    fs.appendFileSync(path.join(dir, 'src', 'main.ts'), '\nexport function extra(): number {\n  return helper(3);\n}\n');
+    fs.appendFileSync(path.join(dir, 'src', 'main.ts'),
+      "\nimport { spare } from './spare';\nexport function extra(): number {\n  return helper(3) + spare();\n}\n");
     cli('sync', dir);
     const out = cli('scip', 'index', dir, '--lang', 'typescript', '--changed');
     expect(out).toMatch(/patched: 1 file\(s\) re-indexed/); // main.ts; nothing imports it
     expect((await edge('extra', 'helper'))?.provenance).toBe('scip'); // the new call, compiler-verified
+    expect((await edge('extra', 'spare'))?.provenance).toBe('scip'); // into a file not re-indexed, whose document defined `spare` already
     expect((await edge('sum', 'helper'))?.provenance).toBe('scip'); // untouched files keep theirs
     expect((await edge('usesOverloads', 'Registry::lookup'))?.provenance).toBe('scip'); // a call into models.ts, which was not re-indexed
     expect(cli('scip', 'index', dir, '--lang', 'typescript', '--changed')).toMatch(/up to date/);
