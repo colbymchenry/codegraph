@@ -128,9 +128,16 @@ export const expressResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // A JS/TS module reaches another file's middleware, controller or service
+    // only through an `import` / `require` — the import resolver's — never by
+    // name: SvelteKit's remote functions' `validate(arg)` went to the config
+    // loader's `validate` in another package. The patterns below stay for the
+    // file's own declarations.
+    const sameFile = (id: string | null): string | null =>
+      id !== null && context.getNodeById?.(id)?.filePath === ref.filePath ? id : null;
     // Pattern 1: Middleware references
     if (isMiddlewareName(ref.referenceName)) {
-      const result = resolveMiddleware(ref.referenceName, context);
+      const result = sameFile(resolveMiddleware(ref.referenceName, context, ref.filePath));
       if (result) {
         return {
           original: ref,
@@ -145,7 +152,7 @@ export const expressResolver: FrameworkResolver = {
     const controllerMatch = ref.referenceName.match(/^(\w+)Controller\.(\w+)$/);
     if (controllerMatch) {
       const [, controller, method] = controllerMatch;
-      const result = resolveControllerMethod(controller!, method!, context);
+      const result = sameFile(resolveControllerMethod(controller!, method!, context));
       if (result) {
         return {
           original: ref,
@@ -160,7 +167,7 @@ export const expressResolver: FrameworkResolver = {
     const serviceMatch = ref.referenceName.match(/^(\w+)(Service|Helper|Utils?)\.(\w+)$/);
     if (serviceMatch) {
       const [, name, suffix, method] = serviceMatch;
-      const result = resolveServiceMethod(name! + suffix!, method!, context);
+      const result = sameFile(resolveServiceMethod(name! + suffix!, method!, context));
       if (result) {
         return {
           original: ref,
@@ -475,10 +482,11 @@ function isMiddlewareName(name: string): boolean {
  */
 function resolveMiddleware(
   name: string,
-  context: ResolutionContext
+  context: ResolutionContext,
+  fromFile?: string,
 ): string | null {
-  // Try exact name first
-  const candidates = context.getNodesByName(name);
+  // Try exact name first — the calling file's own first.
+  const candidates = context.getNodesByName(name).sort((a, b) => Number(b.filePath === fromFile) - Number(a.filePath === fromFile));
   const match = candidates.find((n) =>
     n.name.toLowerCase() === name.toLowerCase() ||
     n.name.toLowerCase() === name.replace(/Middleware$/i, '').toLowerCase()
