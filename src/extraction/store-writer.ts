@@ -30,6 +30,8 @@ export interface KernelStoreBundle {
   language: Language;
   buffers: NonNullable<ExtractionResult['kernelBuffers']>;
   file: FileRecord;
+  /** References read beside the kernel's tables (a CommonJS `require`). */
+  extraRefs?: ExtractionResult['unresolvedReferences'];
 }
 
 /**

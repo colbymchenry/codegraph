@@ -70,6 +70,7 @@ function decodeKernelBundle(bundle: KernelStoreBundle): StoreBundle {
     bundle.filePath,
     bundle.language
   );
+  if (bundle.extraRefs?.length) decoded.unresolvedReferences.push(...bundle.extraRefs);
   return finalizeStoreBundle(decoded, bundle.filePath, bundle.language, bundle.file);
 }
 

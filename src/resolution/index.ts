@@ -26,7 +26,7 @@ import { isVisibleCppMacro, clearCppMacroVisibility } from './cpp-macro-visibili
 import { isCppConstructorRef, matchCppConstructor } from './cpp-constructor';
 import { gateSwiftTypeTarget, clearSwiftTypeVisibility, swiftExtendedConformances } from './swift-type-visibility';
 import { gateTypeParameter, clearTypeParameterMemos } from './type-parameters';
-import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
+import { resolveViaImport, resolvePhpImportedStaticCall, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef, isJsPathImportRef, isBoundToOutOfRepoImport, clearImportResolverMemos, resolveImportPath, isExternalImport } from './import-resolver';
 import { ResolverPool, minRefsForPool } from './resolver-pool';
 import { resolveAliasBinding } from './alias-binding';
 import { detectFrameworks } from './frameworks';
@@ -1100,8 +1100,9 @@ export class ReferenceResolver {
     // ArkTS chained-attribute refs carry a leading dot (`.titleStyle`) that
     // routes them to the decorator-gated matcher; the symbol itself is
     // indexed under the bare name, so the existence check strips the dot.
-    // Nix static path imports (`import ./x.nix`) name a FILE, not a symbol —
-    // they bypass the symbol-existence check and resolve via resolveViaImport.
+    // Nix static path imports (`import ./x.nix`) and JS/TS module paths
+    // (`require('./x')`) name a FILE, not a symbol — they bypass the
+    // symbol-existence check and resolve via resolveViaImport.
     let existenceName =
       ref.language === 'arkts' && ref.referenceName.startsWith('.')
         ? ref.referenceName.slice(1)
@@ -1112,6 +1113,7 @@ export class ReferenceResolver {
     const tPre = this.profileStages ? process.hrtime.bigint() : 0n;
     const preFilterPass =
       isNixPathImportRef(ref) ||
+      isJsPathImportRef(ref) ||
       this.hasAnyPossibleMatch(existenceName) ||
       // PHP, Pascal, CFML, COBOL and VB.NET names ignore case: `formatprice()`
       // calls `FormatPrice`, which the exact-name set never lists.

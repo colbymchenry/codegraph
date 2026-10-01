@@ -32,6 +32,7 @@ import { VueExtractor } from './vue-extractor';
 import { MyBatisExtractor } from './mybatis-extractor';
 import { CfmlExtractor } from './cfml-extractor';
 import { tryKernelExtract, takeDeferredPreParse } from './kernel';
+import { commonJsRequireRefs } from './commonjs-requires';
 import {
   getAllFrameworkResolvers,
   getApplicableFrameworks,
@@ -7613,6 +7614,9 @@ export function extractFromSource(
       );
       result = extractor.extract();
     }
+    // A CommonJS `require('./x')` is a file import, like ESM's `import` — read
+    // after either extractor so both arms record it.
+    result.unresolvedReferences.push(...commonJsRequireRefs(filePath, source, detectedLanguage));
   }
 
   // Framework-specific extraction (routes, middleware, etc.)

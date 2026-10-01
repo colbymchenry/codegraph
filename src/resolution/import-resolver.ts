@@ -1529,10 +1529,41 @@ export function resolvePhpImportedStaticCall(
   return { original: ref, targetNodeId: methods[0]!.id, confidence: 0.95, resolvedBy: 'import' };
 }
 
+const JS_MODULE_LANGUAGES: ReadonlySet<string> = new Set(['javascript', 'jsx', 'typescript', 'tsx', 'arkts']);
+
+/**
+ * A module specifier written as a path — relative (`./x`, `../x`), rooted, or
+ * an alias with a folder in it (`@/lib/x`, `~/x`, `$lib/x`) — rather than an
+ * imported binding's name or a bare package (`react`, `lodash`).
+ */
+function isJsPathSpecifier(name: string): boolean {
+  return name.startsWith('./') || name.startsWith('../') || name === '.' || name === '..' ||
+    (name.includes('/') && !/\s/.test(name) && !/^@[\w.-]+\/[\w.-]+$/.test(name));
+}
+
+/**
+ * A JS/TS `imports` reference that names a module by path. It names a FILE, not
+ * a symbol, so it skips the resolver's name-exists pre-filter — a CommonJS
+ * `require('./x')` has no import node of that name to pass it.
+ */
+export function isJsPathImportRef(ref: UnresolvedRef): boolean {
+  return ref.referenceKind === 'imports' && JS_MODULE_LANGUAGES.has(ref.language) && isJsPathSpecifier(ref.referenceName);
+}
+
 export function resolveViaImport(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
+  // A JS/TS module specifier — `import './polyfills'`, the module of `import x
+  // from '../lib/a'`, a CommonJS `require('./application')` — names a FILE,
+  // found the way the runtime finds it: extensions, `index` files, path
+  // aliases. Matching the basename instead missed every extensionless one
+  // (the common spelling) and could land on a same-named file elsewhere.
+  if (isJsPathImportRef(ref)) {
+    const file = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
+    const fileNode = file && file !== ref.filePath ? context.getNodesInFile(file).find((n) => n.kind === 'file') : undefined;
+    if (fileNode) return { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' };
+  }
   // C/C++ #include references — resolve directly to the included file
   // (file→file edge), bypassing symbol lookup. The extractor emits these
   // with `referenceKind: 'imports'` and `referenceName: <include path>`
