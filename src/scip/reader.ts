@@ -295,81 +295,123 @@ function rebase(indexRoot: string, projectRoot: string, relativePath: string): s
 
 // --- protobuf wire encoding (the same subset) ------------------------------------
 
-function pushVarint(out: number[], n: number): void {
-  while (n > 0x7f) {
-    out.push((n & 0x7f) | 0x80);
-    n = Math.floor(n / 128);
-  }
-  out.push(n);
-}
+/**
+ * A growable protobuf byte buffer: varints byte by byte, everything else copied
+ * natively. A nested message is written into a scratch writer, then copied in
+ * with its length — one copy per level, not one array push per byte.
+ */
+class Writer {
+  private buf = new Uint8Array(1024);
+  private len = 0;
 
-function pushLen(out: number[], field: number, bytes: ArrayLike<number>): void {
-  pushVarint(out, field * 8 + WIRE_LEN);
-  pushVarint(out, bytes.length);
-  for (let i = 0; i < bytes.length; i++) out.push(bytes[i]!);
+  private room(n: number): void {
+    if (this.len + n <= this.buf.length) return;
+    let size = this.buf.length * 2;
+    while (size < this.len + n) size *= 2;
+    const next = new Uint8Array(size);
+    next.set(this.buf.subarray(0, this.len));
+    this.buf = next;
+  }
+
+  varint(n: number): void {
+    this.room(10);
+    while (n > 0x7f) {
+      this.buf[this.len++] = (n & 0x7f) | 0x80;
+      n = Math.floor(n / 128);
+    }
+    this.buf[this.len++] = n;
+  }
+
+  /** A length-delimited field. */
+  bytes(field: number, bytes: Uint8Array): void {
+    this.varint(field * 8 + WIRE_LEN);
+    this.varint(bytes.length);
+    this.room(bytes.length);
+    this.buf.set(bytes, this.len);
+    this.len += bytes.length;
+  }
+
+  /** A nested message: `fill` writes it into `scratch` (emptied first). */
+  message(field: number, scratch: Writer, fill: (w: Writer) => void): void {
+    scratch.len = 0;
+    fill(scratch);
+    this.bytes(field, scratch.buf.subarray(0, scratch.len));
+  }
+
+  toBuffer(): Buffer {
+    return Buffer.from(this.buf.subarray(0, this.len));
+  }
 }
 
 /** Index metadata: tool name/version and project root — what the reader reads back. */
 export function encodeMetadata(meta: IndexMeta): Buffer {
-  const tool: number[] = [];
-  pushLen(tool, 1, Buffer.from(meta.toolName));
-  pushLen(tool, 2, Buffer.from(meta.toolVersion));
-  const m: number[] = [];
-  pushLen(m, 2, tool);
-  if (meta.projectRoot) pushLen(m, 3, Buffer.from(meta.projectRoot));
-  const out: number[] = [];
-  pushLen(out, 1, m);
-  return Buffer.from(out);
+  const out = new Writer();
+  out.message(1, new Writer(), m => {
+    m.message(2, new Writer(), tool => {
+      tool.bytes(1, Buffer.from(meta.toolName));
+      tool.bytes(2, Buffer.from(meta.toolVersion));
+    });
+    if (meta.projectRoot) m.bytes(3, Buffer.from(meta.projectRoot));
+  });
+  return out.toBuffer();
 }
+
+// encodeDocument's scratch writers, one per nesting level: encoding is synchronous, so one set serves every call.
+const docW = new Writer();
+const occW = new Writer();
+const rangeW = new Writer();
+const infoW = new Writer();
+const relW = new Writer();
 
 /**
  * One `Index.documents` entry. Ranges are written as the packed int32 field —
  * three numbers for a single-line range — the densest form every SCIP reader accepts.
  */
 export function encodeDocument(doc: ScipDocument, symbolBytes: (symbol: string) => Buffer): Buffer {
-  const d: number[] = [];
-  pushLen(d, 1, Buffer.from(doc.relativePath));
-  const occ: number[] = [];
-  const range: number[] = [];
-  for (const o of doc.occurrences) {
-    occ.length = 0;
-    range.length = 0;
-    const { startLine, startCol, endLine, endCol } = o.range;
-    for (const v of startLine === endLine ? [startLine, startCol, endCol] : [startLine, startCol, endLine, endCol]) pushVarint(range, v);
-    pushLen(occ, 1, range);
-    pushLen(occ, 2, symbolBytes(o.symbol));
-    if (o.roles) {
-      pushVarint(occ, 3 * 8 + WIRE_VARINT);
-      pushVarint(occ, o.roles);
+  const out = new Writer();
+  out.message(2, docW, d => {
+    d.bytes(1, Buffer.from(doc.relativePath));
+    for (const o of doc.occurrences) {
+      d.message(2, occW, occ => {
+        const { startLine, startCol, endLine, endCol } = o.range;
+        occ.message(1, rangeW, r => {
+          r.varint(startLine);
+          r.varint(startCol);
+          if (startLine !== endLine) r.varint(endLine);
+          r.varint(endCol);
+        });
+        occ.bytes(2, symbolBytes(o.symbol));
+        if (o.roles) {
+          occ.varint(3 * 8 + WIRE_VARINT);
+          occ.varint(o.roles);
+        }
+      });
     }
-    pushLen(d, 2, occ);
-  }
-  const bySymbol = new Map<string, string[]>();
-  for (const { symbol, target } of doc.implementations ?? []) {
-    const t = bySymbol.get(symbol);
-    if (t) t.push(target);
-    else bySymbol.set(symbol, [target]);
-  }
-  for (const [symbol, targets] of bySymbol) {
-    const info: number[] = [];
-    pushLen(info, 1, symbolBytes(symbol));
-    for (const target of targets) {
-      const rel: number[] = [];
-      pushLen(rel, 1, symbolBytes(target));
-      pushVarint(rel, 3 * 8 + WIRE_VARINT);
-      pushVarint(rel, 1);
-      pushLen(info, 4, rel);
+    const bySymbol = new Map<string, string[]>();
+    for (const { symbol, target } of doc.implementations ?? []) {
+      const t = bySymbol.get(symbol);
+      if (t) t.push(target);
+      else bySymbol.set(symbol, [target]);
     }
-    pushLen(d, 3, info);
-  }
-  if (doc.language) pushLen(d, 4, Buffer.from(doc.language));
-  if (doc.positionEncoding) {
-    pushVarint(d, 6 * 8 + WIRE_VARINT);
-    pushVarint(d, doc.positionEncoding);
-  }
-  const out: number[] = [];
-  pushLen(out, 2, d);
-  return Buffer.from(out);
+    for (const [symbol, targets] of bySymbol) {
+      d.message(3, infoW, info => {
+        info.bytes(1, symbolBytes(symbol));
+        for (const target of targets) {
+          info.message(4, relW, rel => {
+            rel.bytes(1, symbolBytes(target));
+            rel.varint(3 * 8 + WIRE_VARINT);
+            rel.varint(1);
+          });
+        }
+      });
+    }
+    if (doc.language) d.bytes(4, Buffer.from(doc.language));
+    if (doc.positionEncoding) {
+      d.varint(6 * 8 + WIRE_VARINT);
+      d.varint(doc.positionEncoding);
+    }
+  });
+  return out.toBuffer();
 }
 
 /** Reads and decodes a `.scip` file; an index with no documents is an indexer failure, not an empty project. */

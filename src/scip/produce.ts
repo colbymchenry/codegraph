@@ -26,7 +26,7 @@ import { Compactor } from './compact';
 import { ReferenceSites, referenceSites } from './sites';
 import { INDEXERS, IndexerRun, RUN_WARNING, ResolvedIndexer, resolveIndexer } from './indexers';
 import {
-  ROLE_DEFINITION, ScipDecodeError, ScipDocument, decodeScipIndex, encodeDocument, encodeMetadata, loadScipIndex,
+  ROLE_DEFINITION, ScipDecodeError, ScipDocument, decodeScipIndex, loadScipIndex,
 } from './reader';
 import { ScipLanguage, indexPath, installIndex, readHashed, readMeta, snapshotHashes } from './store';
 
@@ -336,7 +336,7 @@ async function patchIndex(
       defines(d);
     }
     const compact = new Compactor(projectRoot, lang, refs);
-    compact.add(Buffer.concat([encodeMetadata(tool), ...[...docs.values()].map(d => encodeDocument(d, s => Buffer.from(s)))]));
+    compact.addDocuments(tool, docs.values()); // decoded already: no encode and re-scan of the whole index
     const resolvedCalls = compact.resolvedCalls();
     if (!opts.force && previous.resolvedCalls !== undefined && resolvedCalls < previous.resolvedCalls * (1 - MAX_RESOLUTION_DROP)) {
       return { status: 'rejected', lang, reason: `resolved calls fell from ${previous.resolvedCalls} to ${resolvedCalls} after a partial reindex — kept the previous index` };

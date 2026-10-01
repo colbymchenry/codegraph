@@ -21,7 +21,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { pathToFileURL } from 'url';
 import { INDEXERS } from './indexers';
-import { IndexMeta, ParsedSymbol, ROLE_DEFINITION, ScipOccurrence, encodeDocument, encodeMetadata, parseSymbol, scanIndex } from './reader';
+import { IndexMeta, ParsedSymbol, ROLE_DEFINITION, ScipDocument, ScipOccurrence, encodeDocument, encodeMetadata, parseSymbol, scanIndex } from './reader';
 import type { ScipLanguage } from './store';
 import type { ReferenceSites } from './sites';
 import { callShape, isCallTarget, siteKind } from './syntax';
@@ -41,46 +41,54 @@ export class Compactor {
 
   /** Adds one indexer output. A file already added (overlapping projects) keeps its first document. */
   add(index: Buffer): void {
-    const { literalShape: literal, implHeader } = INDEXERS[this.lang];
-    const meta = scanIndex(index, doc => {
-      if (this.seen.has(doc.relativePath)) return;
-      this.seen.add(doc.relativePath);
-      const lines = readLines(path.join(this.projectRoot, doc.relativePath));
-      const kept: ScipOccurrence[] = [];
-      const fileRefs = this.refs.get(doc.relativePath);
-      for (const o of doc.occurrences) {
-        const parsed = this.parse(o.symbol); // null for locals
-        if (parsed && !(o.roles & ROLE_DEFINITION) && fileRefs?.get(o.range.startLine + 1)?.has(parsed.last.name)) {
-          kept.push(o); // judged as a reference whatever its shape; counted below if it is also a call
-          if (isCallTarget(parsed.last.kind) && lines && siteKind(parsed.last.kind, () => callShape(o, doc.positionEncoding, lines, literal))) {
-            this.callRefs.set(o.symbol, (this.callRefs.get(o.symbol) ?? 0) + 1);
-          }
-          continue;
-        }
-        const kind = parsed?.last.kind;
-        if (!isCallTarget(kind)) continue;
-        if (o.roles & ROLE_DEFINITION) {
-          kept.push(o);
-          this.defined.add(o.symbol);
-          continue;
-        }
-        if (!lines) continue; // unreadable now: the merge would treat the file as stale anyway
-        if (kind === 'type' && implHeader?.(lines[o.range.startLine] ?? '')) { // `impl Trait for Type`: see sites.ts
-          kept.push(o);
-          continue;
-        }
-        if (!siteKind(kind, () => callShape(o, doc.positionEncoding, lines, literal))) continue;
-        kept.push(o);
-        this.callRefs.set(o.symbol, (this.callRefs.get(o.symbol) ?? 0) + 1);
-      }
-      // Class → base/interface and method → the method it implements: what `implements`/`extends`
-      // edges and calls made through an interface are judged by (see sites.ts scipDefinitions, scipSites).
-      const implementations = (doc.implementations ?? []).filter(i =>
-        isCallTarget(this.parse(i.symbol)?.last.kind) && isCallTarget(this.parse(i.target)?.last.kind));
-      this.chunks.push(encodeDocument({ ...doc, occurrences: kept, implementations }, s => this.bytes(s)));
-      this.paths.push(doc.relativePath);
-    }, this.projectRoot);
+    const meta = scanIndex(index, doc => this.keep(doc), this.projectRoot);
     this.meta ??= meta;
+  }
+
+  /** Adds documents already decoded (and rebased onto the project): a patch's splice. */
+  addDocuments(meta: IndexMeta, docs: Iterable<ScipDocument>): void {
+    this.meta ??= meta;
+    for (const doc of docs) this.keep(doc);
+  }
+
+  private keep(doc: ScipDocument): void {
+    const { literalShape: literal, implHeader } = INDEXERS[this.lang];
+    if (this.seen.has(doc.relativePath)) return;
+    this.seen.add(doc.relativePath);
+    const lines = readLines(path.join(this.projectRoot, doc.relativePath));
+    const kept: ScipOccurrence[] = [];
+    const fileRefs = this.refs.get(doc.relativePath);
+    for (const o of doc.occurrences) {
+      const parsed = this.parse(o.symbol); // null for locals
+      if (parsed && !(o.roles & ROLE_DEFINITION) && fileRefs?.get(o.range.startLine + 1)?.has(parsed.last.name)) {
+        kept.push(o); // judged as a reference whatever its shape; counted below if it is also a call
+        if (isCallTarget(parsed.last.kind) && lines && siteKind(parsed.last.kind, () => callShape(o, doc.positionEncoding, lines, literal))) {
+          this.callRefs.set(o.symbol, (this.callRefs.get(o.symbol) ?? 0) + 1);
+        }
+        continue;
+      }
+      const kind = parsed?.last.kind;
+      if (!isCallTarget(kind)) continue;
+      if (o.roles & ROLE_DEFINITION) {
+        kept.push(o);
+        this.defined.add(o.symbol);
+        continue;
+      }
+      if (!lines) continue; // unreadable now: the merge would treat the file as stale anyway
+      if (kind === 'type' && implHeader?.(lines[o.range.startLine] ?? '')) { // `impl Trait for Type`: see sites.ts
+        kept.push(o);
+        continue;
+      }
+      if (!siteKind(kind, () => callShape(o, doc.positionEncoding, lines, literal))) continue;
+      kept.push(o);
+      this.callRefs.set(o.symbol, (this.callRefs.get(o.symbol) ?? 0) + 1);
+    }
+    // Class → base/interface and method → the method it implements: what `implements`/`extends`
+    // edges and calls made through an interface are judged by (see sites.ts scipDefinitions, scipSites).
+    const implementations = (doc.implementations ?? []).filter(i =>
+      isCallTarget(this.parse(i.symbol)?.last.kind) && isCallTarget(this.parse(i.target)?.last.kind));
+    this.chunks.push(encodeDocument({ ...doc, occurrences: kept, implementations }, s => this.bytes(s)));
+    this.paths.push(doc.relativePath);
   }
 
   /**
