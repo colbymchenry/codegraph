@@ -166,7 +166,7 @@ function prepare(projectRoot: string, lang: ScipLanguage): Prepared | ProduceRes
 
 /** Starts the full run's indexer now (once `after` settles); see StartedIndex. `refs`: what the runs read (Invocation.referenceSites). */
 function fullRun(
-  db: SqliteDatabase, projectRoot: string, lang: ScipLanguage, { final, indexer }: Prepared, refs: ReferenceSites, opts: StartOptions
+  db: SqliteDatabase, projectRoot: string, lang: ScipLanguage, { final, raw, indexer }: Prepared, refs: ReferenceSites, opts: StartOptions
 ): StartedIndex {
   const started = Date.now();
   const hashes = snapshotHashes(db, projectRoot, INDEXERS[lang].codegraphLanguages);
@@ -174,7 +174,6 @@ function fullRun(
   const warnings: string[] = indexer.warning ? [indexer.warning] : [];
   if (indexer.warning) opts.log?.(`${lang}: ${indexer.warning}`);
   const { runs } = indexer;
-  const all = (rs: typeof runs): typeof runs => rs.flatMap(r => [r, ...all(r.fallback ?? [])]);
 
   // Heavy runs one at a time (parallel heavy runs would stack the very memory
   // the split exists to bound), then light runs in a small pool. A failed run
@@ -186,13 +185,9 @@ function fullRun(
   const attempt = async (r: IndexerRun): Promise<string[]> => {
     if (opts.signal?.aborted) return [];
     opts.log?.(`${runs.length > 1 ? `[${++done}/${runs.length}] ${r.label}: ` : ''}running ${indexer.cmd} ${r.args.slice(0, 8).join(' ')}${r.args.length > 8 ? ` … (+${r.args.length - 8} more)` : ''}`);
-    const useNice = opts.nice && process.platform !== 'win32';
-    const [cmd, args] = useNice ? ['nice', ['-n', '10', indexer.cmd, ...r.args]] : [indexer.cmd, r.args];
-    const { code, stderr } = await runIndexer(cmd, args, path.join(projectRoot, r.cwd ?? '.'), { ...indexer.env, ...r.env }, opts.signal);
-    const why = code !== 0 ? `${indexer.cmd} exited ${code}: ${stderr.trim().split('\n').slice(-3).join(' | ')}`
-      : !fs.existsSync(r.output) ? `${indexer.cmd} exited 0 but wrote no index at ${r.output}` : null;
+    const { why, runWarnings } = await runOnce(projectRoot, indexer, r, opts);
     if (!why) {
-      for (const w of stderr.split('\n')) if (w.startsWith(RUN_WARNING)) warnings.push(`${r.label}: ${w.slice(RUN_WARNING.length)} — its files stay heuristic-only`);
+      for (const w of runWarnings) warnings.push(`${r.label}: ${w} — its files stay heuristic-only`);
       return [r.output];
     }
     if (r.fallback?.length) {
@@ -253,8 +248,7 @@ function fullRun(
         { tool: compact.meta!.toolName, toolVersion: compact.meta!.toolVersion, producedAt: started, hashes, resolvedCalls, fullRunMs: durationMs });
       return { status: 'installed', lang, documents: compact.paths.length, resolvedCalls, durationMs, warnings };
     } finally {
-      for (const r of all(runs)) fs.rmSync(r.output, { force: true });
-      if (indexer.referenceSites) fs.rmSync(indexer.referenceSites, { force: true });
+      sweep(raw);
     }
   };
   // `finish` rethrows a failure of the runs; the handler here keeps it from being "unhandled" until then.
@@ -299,12 +293,10 @@ async function patchIndex(
       const outputs: string[] = [];
       let failed: string | null = null;
       const one = async (r: IndexerRun) => {
-        const useNice = opts.nice && process.platform !== 'win32';
-        const [cmd, args] = useNice ? ['nice', ['-n', '10', indexer.cmd, ...r.args]] : [indexer.cmd, r.args];
-        const { code, stderr } = await runIndexer(cmd, args, path.join(projectRoot, r.cwd ?? '.'), { ...indexer.env, ...r.env }, opts.signal);
-        if (code !== 0 || !fs.existsSync(r.output)) failed ??= `${r.label}: ${indexer.cmd} exited ${code}: ${stderr.trim().split('\n').slice(-1)[0] ?? ''}`;
+        const { why, runWarnings } = await runOnce(projectRoot, indexer, r, opts);
+        if (why) failed ??= `${r.label}: ${why}`;
         else outputs.push(r.output);
-        for (const w of stderr.split('\n')) if (w.startsWith(RUN_WARNING)) warnings.push(w.slice(RUN_WARNING.length));
+        warnings.push(...runWarnings);
       };
       const queue = [...runs];
       const width = runs.every(r => r.light) ? Math.min(lightConcurrency(), runs.length) : 1;
@@ -359,10 +351,34 @@ async function patchIndex(
       warnings, incremental: present.length, scope: { files: [...replaced], symbols: [...symbols] },
     };
   } finally {
-    // The runs' outputs and helper files, all named after the raw output (IndexerSpec.patch).
-    const dir = path.dirname(raw);
-    for (const f of fs.readdirSync(dir)) if (f === path.basename(raw) || f.startsWith(`${path.basename(raw)}.`)) fs.rmSync(path.join(dir, f), { force: true });
+    sweep(raw);
   }
+}
+
+/**
+ * Removes what a run of `raw` may leave: the output, its parts (`.partN`) and
+ * helper files (`.refs`) — adapters name them all after the raw output.
+ */
+function sweep(raw: string): void {
+  const dir = path.dirname(raw);
+  const base = path.basename(raw);
+  for (const f of fs.readdirSync(dir)) if (f === base || f.startsWith(`${base}.`)) fs.rmSync(path.join(dir, f), { force: true });
+}
+
+/**
+ * One indexer run, niced when asked: why it failed (a non-zero exit, or no
+ * output), or null; and the warnings it reported (RUN_WARNING lines).
+ */
+async function runOnce(
+  projectRoot: string, indexer: ResolvedIndexer, r: IndexerRun, opts: ProduceOptions
+): Promise<{ why: string | null; runWarnings: string[] }> {
+  const useNice = opts.nice && process.platform !== 'win32';
+  const [cmd, args] = useNice ? ['nice', ['-n', '10', indexer.cmd, ...r.args]] : [indexer.cmd, r.args];
+  const { code, stderr } = await runIndexer(cmd, args, path.join(projectRoot, r.cwd ?? '.'), { ...indexer.env, ...r.env }, opts.signal);
+  const why = code !== 0 ? `${indexer.cmd} exited ${code}: ${stderr.trim().split('\n').slice(-3).join(' | ')}`
+    : !fs.existsSync(r.output) ? `${indexer.cmd} exited 0 but wrote no index at ${r.output}` : null;
+  const runWarnings = stderr.split('\n').filter(w => w.startsWith(RUN_WARNING)).map(w => w.slice(RUN_WARNING.length));
+  return { why, runWarnings };
 }
 
 /** The reference sites as tsgo-index's `--refs` list: `path<TAB>line` per line (1-based lines). */

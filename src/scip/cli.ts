@@ -7,8 +7,8 @@
  */
 
 import type { Command } from 'commander';
-import { MergeScope, SCIP_LANGUAGES, ScipLanguage, ScipPassReport, importScipFile, joinScopes, runScipPass, scipStatus } from './index';
-import { produceIndex } from './produce';
+import { SCIP_LANGUAGES, ScipLanguage, ScipPassReport, importScipFile, mergeInstalled, runScipPass, scipStatus } from './index';
+import { ProduceResult, produceIndex } from './produce';
 import { referenceSites } from './sites';
 import { scipDir, tryReindexLock } from './store';
 
@@ -76,8 +76,8 @@ export function registerScipCommands(program: Command, h: CliHelpers): void {
     }
   };
 
-  const mergeAndReport = async (cg: import('../index').CodeGraph, scope?: MergeScope) => {
-    const report = await cg.scipWrite((db) => runScipPass(db, cg.getProjectRoot(), scope));
+  const mergeAndReport = async (cg: import('../index').CodeGraph) => {
+    const report = await cg.scipWrite((db) => runScipPass(db, cg.getProjectRoot()));
     if (report) h.success(describe(report));
     else h.info('No SCIP index installed — nothing to merge');
   };
@@ -91,14 +91,12 @@ export function registerScipCommands(program: Command, h: CliHelpers): void {
     .action((pathArg: string | undefined, opts: { lang?: string; force?: boolean; changed?: boolean }) =>
       withGraph(pathArg, (cg) => exclusively(cg, async () => {
         const only = parseLang(opts.lang);
-        let installed = 0;
         let current = 0;
-        let scopes: MergeScope[] | null = []; // null once any index was rebuilt in full
+        const results: ProduceResult[] = [];
         for (const lang of only ? [only] : SCIP_LANGUAGES) {
           const r = await produceIndex(cg.scipReadDb(), cg.getProjectRoot(), lang, { force: opts.force, incremental: opts.changed, log: h.info });
+          results.push(r);
           if (r.status === 'installed') {
-            installed++;
-            scopes = r.scope && scopes ? [...scopes, r.scope] : null;
             const how = r.incremental !== undefined ? ` (patched: ${r.incremental} file(s) re-indexed)` : '';
             h.success(`${lang}: ${r.documents} documents, ${r.resolvedCalls} resolved calls in ${(r.durationMs / 1000).toFixed(1)}s${how}`);
             for (const w of r.warnings) h.warn(`${lang}: ${w}`);
@@ -112,8 +110,9 @@ export function registerScipCommands(program: Command, h: CliHelpers): void {
             h.warn(`${lang}: ${r.status} — ${r.reason}`);
           }
         }
-        if (installed > 0) await mergeAndReport(cg, scopes ? joinScopes(scopes) : undefined);
-        else if (only && current === 0) process.exitCode = 1;
+        const report = await mergeInstalled(cg, results);
+        if (report) h.success(describe(report));
+        else if (only && current === 0 && !results.some(r => r.status === 'installed')) process.exitCode = 1;
       })));
 
   scip

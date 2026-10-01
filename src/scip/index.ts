@@ -18,6 +18,7 @@ import type { SqliteDatabase } from '../db/sqlite-adapter';
 import { Compactor } from './compact';
 import { languageOfTool } from './indexers';
 import { MergeOutcome, addOutcome, emptyOutcome, markStaleForFiles, merge } from './merge';
+import type { ProduceResult } from './produce';
 import { ROLE_DEFINITION, ScipDocument, loadScipIndex, scanIndex } from './reader';
 import { ReferenceSites, heuristicSites, referenceSites, scipDefinitions, scipSites } from './sites';
 import {
@@ -48,8 +49,21 @@ export interface MergeScope {
   symbols: string[];
 }
 
-export function joinScopes(scopes: MergeScope[]): MergeScope {
+function joinScopes(scopes: MergeScope[]): MergeScope {
   return { files: [...new Set(scopes.flatMap(s => s.files))], symbols: [...new Set(scopes.flatMap(s => s.symbols))] };
+}
+
+/**
+ * The merge after a re-index round (`scip index`, the watcher's reindex, `init
+ * --scip`): of just what the patches changed, of everything once any language
+ * was rebuilt in full, and none when nothing was installed.
+ */
+export function mergeInstalled(host: ScipHost, results: readonly ProduceResult[]): Promise<ScipPassReport | null> {
+  const scopes: Array<MergeScope | undefined> = [];
+  for (const r of results) if (r.status === 'installed') scopes.push(r.scope);
+  if (scopes.length === 0) return Promise.resolve(null);
+  const scope = scopes.every((s): s is MergeScope => s !== undefined) ? joinScopes(scopes) : undefined;
+  return host.scipWrite(db => runScipPass(db, host.getProjectRoot(), scope));
 }
 
 export interface ScipPassReport {

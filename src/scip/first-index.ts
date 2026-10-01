@@ -12,8 +12,8 @@
 import type { CodeGraph } from '../index';
 import type { FileLock } from '../utils';
 import { describe } from './cli';
-import { runScipPass } from './index';
-import { StartedIndex, startIndex } from './produce';
+import { mergeInstalled } from './index';
+import { ProduceResult, StartedIndex, startIndex } from './produce';
 import { pendingReferenceSites, referenceSites } from './sites';
 import { SCIP_LANGUAGES, tryReindexLock } from './store';
 
@@ -51,22 +51,20 @@ export function firstIndexScip(cg: CodeGraph): FirstIndexScip {
     },
     async finish() {
       try {
-        let installed = 0;
+        const results: ProduceResult[] = [];
         const refs = started.length ? referenceSites(cg.scipReadDb()) : new Map(); // resolved now: what compaction keeps
         for (const s of started) {
           const r = await s.finish(refs);
+          results.push(r);
           if (r.status === 'installed') {
-            installed++;
             messages.push({ level: 'success', message: `${r.lang}: ${r.documents} documents, ${r.resolvedCalls} resolved calls in ${(r.durationMs / 1000).toFixed(1)}s` });
             for (const w of r.warnings) messages.push({ level: 'warn', message: `${r.lang}: ${w}` });
           } else if (r.status !== 'skipped' && r.status !== 'current') {
             messages.push({ level: 'warn', message: `${r.lang}: ${r.status} — ${r.reason}` });
           }
         }
-        if (installed > 0) {
-          const report = await cg.scipWrite(db => runScipPass(db, root));
-          if (report) messages.push({ level: 'success', message: describe(report) });
-        }
+        const report = await mergeInstalled(cg, results);
+        if (report) messages.push({ level: 'success', message: describe(report) });
         return messages;
       } finally {
         lock?.release();

@@ -74,7 +74,7 @@ export class Compactor {
         this.callRefs.set(o.symbol, (this.callRefs.get(o.symbol) ?? 0) + 1);
       }
       // Class → base/interface and method → the method it implements: what `implements`/`extends`
-      // edges and calls made through an interface are judged by (see relations.ts).
+      // edges and calls made through an interface are judged by (see sites.ts scipDefinitions, scipSites).
       const implementations = (doc.implementations ?? []).filter(i =>
         isCallTarget(this.parse(i.symbol)?.last.kind) && isCallTarget(this.parse(i.target)?.last.kind));
       this.chunks.push(encodeDocument({ ...doc, occurrences: kept, implementations }, s => this.bytes(s)));

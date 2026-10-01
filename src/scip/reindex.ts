@@ -10,8 +10,8 @@
  * left alone — no surprise indexer runs.
  */
 
-import { MergeScope, joinScopes, runScipPass, ScipHost } from './index';
-import { incrementalPlan, produceIndex } from './produce';
+import { ScipHost, mergeInstalled } from './index';
+import { ProduceResult, incrementalPlan, produceIndex } from './produce';
 import { availableIndexes, tryReindexLock } from './store';
 
 export interface ReindexOptions {
@@ -111,16 +111,13 @@ export class ScipReindexScheduler {
   }
 
   private async reindex(root: string): Promise<void> {
-    let installed = 0;
-    /** what the patches changed; null once any index was rebuilt in full */
-    let scopes: MergeScope[] | null = [];
+    const results: ProduceResult[] = [];
     for (const { lang } of availableIndexes(root)) {
       if (this.abort.signal.aborted) return;
       try {
         const r = await produceIndex(this.host.scipReadDb(), root, lang, { nice: true, incremental: true, signal: this.abort.signal, log: this.log });
+        results.push(r);
         if (r.status === 'installed') {
-          installed++;
-          scopes = r.scope && scopes ? [...scopes, r.scope] : null;
           if (r.incremental !== undefined) this.log(`${lang}: patched ${r.incremental} file(s) in ${r.durationMs}ms`);
           for (const w of r.warnings) this.log(`${lang} reindex: ${w}`);
         }
@@ -129,9 +126,9 @@ export class ScipReindexScheduler {
         this.log(`${lang} reindex failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
-    if (installed === 0 || this.abort.signal.aborted) return;
+    if (this.abort.signal.aborted) return;
     try {
-      const report = await this.host.scipWrite((db) => runScipPass(db, root, scopes ? joinScopes(scopes) : undefined));
+      const report = await mergeInstalled(this.host, results);
       if (report) this.log(`merged ${report.freshDocuments}/${report.documents} documents (${report.judgedDocuments} re-judged) in ${report.durationMs}ms`);
     } catch (err) {
       this.log(`merge after reindex failed: ${err instanceof Error ? err.message : String(err)}`);
