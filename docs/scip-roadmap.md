@@ -18,8 +18,8 @@ Status: planned, not started. Decided 2026-10-01. For what is already built, see
 | Keep supporting scip-typescript now that tsgo is preferred? | **Yes.** Project-level patching (2.4) and plain-JS coverage (4.6) are in scope for it. |
 | Accept larger tsgo indexes (~101 → ~120 MB on vscode) for one splice rule? | **Yes** (1.1). |
 | When to run the agent eval? | **After the fix phases** (Phase 6 follows 0–5). |
-| Fixed patch caps or per-unit cost estimates (2.2)? | Open. |
-| May the fork publish its own GitHub releases (7.4)? | Open. |
+| Fixed patch caps or per-unit cost estimates (2.2)? | **Measured cost, with a hard cap.** Patch when the estimated patch time is under half of the last full run's time (recorded in the index metadata); never past 500 files. |
+| May the fork publish its own GitHub releases (7.4)? | **Not yet.** 7.4 is deferred; install stays local (build the bundle, re-link). |
 
 ## Rules every indexer's output must meet
 
@@ -61,7 +61,7 @@ A language adapter (`IndexerSpec`) then only declares its capabilities: detectio
 | # | Task | How | Check |
 |---|---|---|---|
 | 2.1 | Indexers declare a re-index unit | `unitOf(file)` (file, directory, package, project or workspace), `runsFor(units)`, rough cost per unit | Unit tests per indexer |
-| 2.2 | Decide patch vs full in one place | The planner maps changed files plus importers to units and decides; fixed caps or cost estimates per the open decision | tsgo and Python behave as today on the vscode/Django edits |
+| 2.2 | Decide patch vs full in one place | The planner maps changed files plus importers to units. Each adapter declares a cost per unit (tsgo ~0.1 s per file, scip-python ~15 s per directory, scip-go per package, measured in 2.3); the index metadata records the last full run's duration. Patch when units × cost < ½ × last full run, never past 500 files | tsgo and Python patch the vscode/Django edits as today; a change too big for a patch falls back to a full run |
 | 2.3 | Go patching | Unit = package: `scip-go index ./pkg/... --output …` | Patch equals full on cobra and one larger Go repo; time measured |
 | 2.4 | scip-typescript patching | Unit = tsconfig project; small projects take seconds, vscode's `src/` doesn't, so that one stays a full run | Patch equals full on vscode with an edit in a small project |
 | 2.5 | Patch-equals-full as a permanent check | `scripts/scip-eval/patch-equivalence.ts`: edit → patch → full rebuild → diff, per language corpus | Runs in CI on the small fixtures |
@@ -111,7 +111,7 @@ Deferred:
 | 7.1 | TypeScript 7.1 stable | When it ships: re-pin CI and the tool folder, rerun the evals | Evals unchanged |
 | 7.2 | Upstream health | Run upstream's suite on `scip`; rebase per upstream release (only 3 upstream files touched) | Suite green |
 | 7.3 | Multi-OS | CI matrix (Linux/macOS/Windows) for the SCIP suite; fix tsgo-index's `/`-only paths; build every platform's bundle | Green on all three |
-| 7.4 | Releases and upgrade | Per the open decision: CI builds bundles (with the native kernel) on tag, and `codegraph upgrade` installs from the fork's release | A tag gives an installable bundle; `upgrade` works |
+| 7.4 | Releases and upgrade (**deferred**: no releases yet) | Later: CI builds bundles (with the native kernel) on tag, and `codegraph upgrade` installs from the fork's release | — |
 
 ## Order
 
@@ -123,4 +123,4 @@ Deferred:
 6. **The rest of Phase 4.**
 7. **Phase 5.**
 8. **Phase 6:** the agent eval, then 6.2 and 6.3.
-9. **Phase 7.** 7.1 whenever TypeScript 7.1 ships; 7.2 at each upstream release.
+9. **Phase 7.** 7.1 whenever TypeScript 7.1 ships; 7.2 at each upstream release; 7.4 when releases are wanted.
