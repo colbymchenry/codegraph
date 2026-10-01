@@ -206,6 +206,7 @@ export function clearImportResolverMemos(context: ResolutionContext): void {
   luaFileBasenameIndexes.delete(context);
   cobolCopybookIndexes.delete(context);
   pythonModuleFileMemos.delete(context);
+  PY_MODULE_SYMBOLS.delete(context);
 }
 
 export function resolveImportPath(
@@ -1763,9 +1764,7 @@ export function resolveViaImport(
           context,
           new Set()
         ) ?? (ref.language === 'python'
-          ? context.getNodesInFile(resolvedPath).find(n =>
-              n.name === (memberName ?? exportedName) && !n.qualifiedName.includes('::') &&
-              (n.kind === 'class' || n.kind === 'function' || n.kind === 'variable' || n.kind === 'constant'))
+          ? pythonModuleSymbol(resolvedPath, memberName ?? exportedName, context, 0)
           : undefined);
 
         if (targetNode) {
@@ -2076,6 +2075,49 @@ function resolveModuleImportToFile(
  * caches; dropped by clearImportResolverMemos.
  */
 const pythonModuleFileMemos = new WeakMap<ResolutionContext, Map<string, { module: Node[]; pkg: Node[] }>>();
+
+/**
+ * A top-level class / function / value named `name` in a Python module, or
+ * one the module re-exports — `from .users import *`, `from .users import
+ * User` — a few packages deep. netbox's `from users.models import User` names
+ * `users/models/__init__.py`, which star-imports `.users`, where `User` is.
+ */
+const PY_MODULE_SYMBOLS = new WeakMap<ResolutionContext, Map<string, Node | null>>();
+
+function pythonModuleSymbol(file: string, name: string, context: ResolutionContext, depth: number): Node | undefined {
+  let memo = PY_MODULE_SYMBOLS.get(context);
+  if (!memo) PY_MODULE_SYMBOLS.set(context, (memo = new Map()));
+  const key = `${file}\0${name}`;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit ?? undefined;
+  // (A cycle of star imports reads as "not here" while it is being walked.)
+  memo.set(key, null);
+  const found = pythonModuleSymbolUncached(file, name, context, depth);
+  memo.set(key, found ?? null);
+  return found;
+}
+
+function pythonModuleSymbolUncached(file: string, name: string, context: ResolutionContext, depth: number): Node | undefined {
+  const own = context.getNodesInFile(file).find((n) =>
+    n.name === name && !n.qualifiedName.includes('::') &&
+    (n.kind === 'class' || n.kind === 'function' || n.kind === 'variable' || n.kind === 'constant'));
+  if (own || depth >= 3) return own;
+  // Re-exported by name (`from .users import User`), else through a star import
+  // (`from .users import *` — not among the import mappings, so read here).
+  const sources: Array<{ source: string; exported: string }> = context.getImportMappings(file, 'python')
+    .filter((imp) => !imp.isNamespace && imp.localName === name)
+    .map((imp) => ({ source: imp.source, exported: imp.exportedName }));
+  for (const m of (context.readFile(file) ?? '').matchAll(/^\s*from\s+([\w.]+)\s+import\s+\*/gm)) {
+    sources.push({ source: m[1]!, exported: name });
+  }
+  for (const { source, exported } of sources) {
+    const target = resolveImportPath(source, file, 'python', context) ?? findPythonModuleFile(source, context, file)?.filePath ?? null;
+    if (!target || target === file) continue;
+    const found = pythonModuleSymbol(target, exported, context, depth + 1);
+    if (found) return found;
+  }
+  return undefined;
+}
 
 function findPythonModuleFile(
   mod: string,
