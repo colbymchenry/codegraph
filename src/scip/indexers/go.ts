@@ -4,18 +4,28 @@
  * scip-go type-checks them.
  */
 
-import * as fs from 'fs';
-import * as path from 'path';
 import { skipGroup } from '../syntax';
 import type { IndexerSpec } from './index';
+import { markerDirs } from './repo-files';
+
+/** Each module is its own run: a nested go.mod is a separate module, left out of the one around it. */
+const modules = (root: string) => markerDirs(root, 'go.mod', { skip: ['testdata', 'vendor'] });
 
 export const goIndexer: IndexerSpec = {
   lang: 'go',
   tools: ['scip-go'],
   codegraphLanguages: ['go'],
-  detect: root => fs.existsSync(path.join(root, 'go.mod')),
+  detect: root => modules(root).length > 0,
   cmd: 'scip-go',
-  invocation: (_root, outFile) => ({ runs: [{ label: 'go', args: ['index', '--quiet', '--output', outFile], output: outFile }] }),
+  invocation: (root, outFile) => {
+    const dirs = modules(root);
+    return {
+      runs: dirs.map((cwd, i) => {
+        const output = dirs.length === 1 ? outFile : `${outFile}.part${i}`;
+        return { label: cwd === '.' ? 'go' : `go (${cwd})`, args: ['index', '--quiet', '--output', output], output, cwd };
+      }),
+    };
+  },
   // Composite literals `&T{…}`, `pkg.T{…}`, `Box[int]{…}` build a T. `[]T{`, `map[K]T{`, `[]*T{`
   // build the container; `) T {` / `) *pkg.T {` is a return type before a function body.
   literalShape: (tail, head) => {

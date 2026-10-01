@@ -27,7 +27,8 @@ import { pathToFileURL } from 'url';
 import { ROLE_DEFINITION, ScipImplementation, ScipOccurrence, encodeDocument, encodeMetadata, escapeIdentifier as esc } from '../reader';
 import { MAX_SOURCE_FILE_SIZE_BYTES } from '../../file-limits';
 import { RUN_WARNING } from './index';
-import { packageVersion, repoFiles } from './typescript';
+import { repoFiles } from './repo-files';
+import { packageVersion } from './typescript';
 
 /** SCIP `PositionEncoding.UTF16CodeUnitOffsetFromLineStart`: the API's positions index JS strings. */
 const POSITION_ENCODING_UTF16 = 2;

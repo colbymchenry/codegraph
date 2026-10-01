@@ -128,7 +128,7 @@ export async function produceIndex(
       opts.log?.(`${runs.length > 1 ? `[${++done}/${runs.length}] ${r.label}: ` : ''}running ${indexer.cmd} ${r.args.slice(0, 8).join(' ')}${r.args.length > 8 ? ` … (+${r.args.length - 8} more)` : ''}`);
       const useNice = opts.nice && process.platform !== 'win32';
       const [cmd, args] = useNice ? ['nice', ['-n', '10', indexer.cmd, ...r.args]] : [indexer.cmd, r.args];
-      const { code, stderr } = await runIndexer(cmd, args, projectRoot, { ...indexer.env, ...r.env }, opts.signal);
+      const { code, stderr } = await runIndexer(cmd, args, path.join(projectRoot, r.cwd ?? '.'), { ...indexer.env, ...r.env }, opts.signal);
       const why = code !== 0 ? `${indexer.cmd} exited ${code}: ${stderr.trim().split('\n').slice(-3).join(' | ')}`
         : !fs.existsSync(r.output) ? `${indexer.cmd} exited 0 but wrote no index at ${r.output}` : null;
       if (!why) {
@@ -218,7 +218,7 @@ async function patchIndex(
       const one = async (r: IndexerRun) => {
         const useNice = opts.nice && process.platform !== 'win32';
         const [cmd, args] = useNice ? ['nice', ['-n', '10', indexer.cmd, ...r.args]] : [indexer.cmd, r.args];
-        const { code, stderr } = await runIndexer(cmd, args, projectRoot, { ...indexer.env, ...r.env }, opts.signal);
+        const { code, stderr } = await runIndexer(cmd, args, path.join(projectRoot, r.cwd ?? '.'), { ...indexer.env, ...r.env }, opts.signal);
         if (code !== 0 || !fs.existsSync(r.output)) failed ??= `${r.label}: ${indexer.cmd} exited ${code}: ${stderr.trim().split('\n').slice(-1)[0] ?? ''}`;
         else outputs.push(r.output);
         for (const w of stderr.split('\n')) if (w.startsWith(RUN_WARNING)) warnings.push(w.slice(RUN_WARNING.length));

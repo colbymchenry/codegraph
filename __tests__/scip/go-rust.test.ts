@@ -4,7 +4,8 @@ import * as os from 'os';
 import * as path from 'path';
 import CodeGraph from '../../src/index';
 import { importScipFile, runScipPass } from '../../src/scip';
-import { INDEXERS, resolveIndexer } from '../../src/scip/indexers';
+import { INDEXERS, onPath, resolveIndexer } from '../../src/scip/indexers';
+import { produceIndex } from '../../src/scip/produce';
 import { planRuns, projectWeights, tsProjects } from '../../src/scip/indexers/typescript';
 import { callShape } from '../../src/scip/syntax';
 
@@ -103,6 +104,32 @@ describe('literal call shapes', () => {
   });
 });
 
+describe.runIf(onPath('scip-go') && onPath('go'))('a go module below the repo root (scip-go)', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-scip-nested-'));
+    fs.cpSync(path.join(FIXTURES, 'scip-go', 'project'), path.join(dir, 'backend'), { recursive: true });
+  });
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  it('is indexed in its folder and its paths land on the repo\'s files', async () => {
+    const cg = await CodeGraph.init(dir);
+    try {
+      await cg.indexAll();
+      const r = await produceIndex(cg.scipReadDb(), dir, 'go');
+      expect(r).toMatchObject({ status: 'installed' });
+      const report = await cg.scipWrite(db => runScipPass(db, dir));
+      expect(report?.staleDocuments).toEqual([]);
+      expect(report?.freshDocuments).toBeGreaterThan(0);
+      const row = cg.scipReadDb().prepare(`SELECT e.provenance FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+        WHERE e.kind = 'calls' AND s.qualified_name = 'Total' AND t.qualified_name = 'Invoice::TotalPrice'`).get() as { provenance: string } | undefined;
+      expect(row?.provenance).toBe('scip');
+    } finally {
+      cg.close();
+    }
+  }, 120_000);
+});
+
 describe('go / rust adapters', () => {
   let dir: string;
   beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-scip-adapters-')); });
@@ -114,8 +141,27 @@ describe('go / rust adapters', () => {
     expect(resolveIndexer(dir, 'go', out)).toEqual({ skip: 'no go project markers found' });
     fs.writeFileSync(path.join(dir, 'go.mod'), 'module x\n');
     fs.writeFileSync(path.join(dir, 'Cargo.toml'), '[package]\nname = "x"\n');
-    expect(resolveIndexer(dir, 'go', out)).toMatchObject({ runs: [{ args: ['index', '--quiet', '--output', out], output: out }] });
-    expect(resolveIndexer(dir, 'rust', out)).toMatchObject({ runs: [{ args: ['scip', '.', '--output', out], output: out }] });
+    expect(resolveIndexer(dir, 'go', out)).toMatchObject({ runs: [{ args: ['index', '--quiet', '--output', out], output: out, cwd: '.' }] });
+    expect(resolveIndexer(dir, 'rust', out)).toMatchObject({ runs: [{ args: ['scip', '.', '--output', out], output: out, cwd: '.' }] });
+  });
+
+  it('finds go modules and cargo workspaces below the root: one run each, in its folder', () => {
+    const out = path.join(dir, 'out.tmp');
+    fs.writeFileSync(path.join(dir, 'codegraph.json'), JSON.stringify({ scip: { go: { cmd: process.execPath }, rust: { cmd: process.execPath } } }));
+    const put = (f: string, text: string) => { fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true }); fs.writeFileSync(path.join(dir, f), text); };
+    put('svc/go.mod', 'module svc\n');
+    put('tools/gen/go.mod', 'module gen\n');
+    put('svc/testdata/mod/go.mod', 'module fixture\n'); // test input, not a module to index
+    put('cli/Cargo.toml', '[workspace]\n');
+    put('cli/crates/a/Cargo.toml', '[package]\nname = "a"\n'); // a member: indexed with its workspace
+    put('kernel/Cargo.toml', '[package]\nname = "k"\n');
+    const plan = (lang: 'go' | 'rust') => {
+      const r = resolveIndexer(dir, lang, out);
+      if ('skip' in r) throw new Error(r.skip);
+      return r.runs.map(x => [x.cwd, x.output]);
+    };
+    expect(plan('go')).toEqual([['svc', `${out}.part0`], ['tools/gen', `${out}.part1`]]);
+    expect(plan('rust')).toEqual([['cli', `${out}.part0`], ['kernel', `${out}.part1`]]);
   });
 
   it('TS: one run per tsconfig/jsconfig project (node_modules ignored), a single project stays one run', () => {

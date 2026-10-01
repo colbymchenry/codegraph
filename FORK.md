@@ -53,10 +53,10 @@ Indexers are never auto-installed:
 
 | language | indexer | detected by |
 |---|---|---|
-| TS/JS | preferred: `npm i --prefix ~/.codegraph/tools typescript@next` (≥ 7.1, see below); else `npm i -g @sourcegraph/scip-typescript` | `tsconfig.json`, `jsconfig.json`, `package.json` |
+| TS/JS | preferred: `npm i --prefix ~/.codegraph/tools typescript@next` (≥ 7.1, see below); else `npm i -g @sourcegraph/scip-typescript` | `tsconfig.json`, `jsconfig.json`, `package.json`; with tsgo, files outside every tsconfig (or a repo with none) are indexed as one inferred program |
 | Python | `npm i -g @sourcegraph/scip-python` | `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt` |
-| Go | `go install github.com/scip-code/scip-go/cmd/scip-go@latest` (packages must build) | `go.mod` |
-| Rust | `rustup component add rust-analyzer` (uses its `scip` subcommand; needs `cargo`) | `Cargo.toml` |
+| Go | `go install github.com/scip-code/scip-go/cmd/scip-go@latest` (packages must build) | `go.mod`, at the root or below: one run per module, in its folder (`testdata/`, `vendor/` skipped) |
+| Rust | `rustup component add rust-analyzer` (uses its `scip` subcommand; needs `cargo`) | `Cargo.toml`, at the root or below: one run per topmost one (a workspace's members are indexed with it) |
 
 To run one through `npx` instead, put this in `codegraph.json`:
 
@@ -166,6 +166,7 @@ MCP output: Flow steps read `↓ calls (compiler-verified)` or `(unverified: …
 - **Target without node:** SCIP resolved the call to a project definition that maps to no node. In vscode it was almost all **overloaded functions**: tsgo (like scip-typescript) defines one at its first signature, codegraph's node is the implementation further down (`localize` alone: 25,762 edges). Fixed (roadmap 4.2): a definition no node contains maps to the file's only node of that name and kind starting below it. Tracing the rest found a lookup bug: every method named like an `Object.prototype` member (`toString`, `valueOf`, …) never mapped, in any language.
 
   After both, vscode: **64,103 unverified (7.1%, from 12.9%)**; target without node 51,798 → 1,955; the merge removed 3,260 wrong heuristic edges (mostly `toString` calls aimed at a same-named class in another copy of the file) and added 15,373 missing ones. Eval gates unchanged on all corpora.
+- **No document** (roadmap 4.3): tsgo now indexes TS/JS files outside every tsconfig as one inferred program (also a repo with no tsconfig at all), and Go modules / Cargo workspaces below the repo root get a run each. Unverified call edges: Playwright 30.2% → 14.3%, codegraph 68.4% → 5.3% (`__tests__` and `codegraph-kernel/`), vscode 7.1% → 6.3% (no document 14,839 → 293; Rust `cli/` indexed); Django's JS indexed. Eval gates unchanged. Nothing judges the inferred program independently (scip-typescript indexes the same tsconfig projects); spot checks of removed edges in codegraph's tests read right (`spawn` → `child_process`, `controller.enqueue` → a stream controller).
 - **No reference:** SCIP resolved nothing at the call: an untyped receiver (most of Django: `self.apps.check_models_ready()`), an `any`, an unresolved import. Some of these heuristic edges are wrong guesses (`self.label.title()` → `defaultfilters.title`) that the merge can't judge.
 - **No document:** no index covers the caller's file. TS files no `tsconfig.json` includes (vscode `extensions/copilot`: 8,009; codegraph `__tests__`), a language root below the repo root that detection misses (vscode's Rust `cli/`: 3,201; codegraph's `codegraph-kernel/`: 3,709), and vendored JS (Playwright `tests/assets`: 17,343).
 - **Not a call to SCIP / later line (Rust):** rust-analyzer names `Ok(…)`, `Some(…)` and tuple-struct constructors as types, so the merge keys them as instantiations while the heuristic edge is a call; and in a multi-line chain codegraph puts the call on the chain's first line, SCIP on the method name's.

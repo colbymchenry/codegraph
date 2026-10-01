@@ -24,11 +24,11 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import type { IndexerRun, IndexerSpec } from './index';
+import { repoFiles } from './repo-files';
 
 const has = (root: string, f: string) => fs.existsSync(path.join(root, f));
 const PROJECT_FILES = new Set(['tsconfig.json', 'jsconfig.json']);
 const SOURCE = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
-const NEVER = new Set(['node_modules', '.git', '.codegraph']);
 
 /** Projects with at least this many source files run alone, with the big heap. */
 const HEAVY_FILES = 1500;
@@ -47,29 +47,6 @@ function hasWorkspaces(root: string): boolean {
   } catch {
     return false;
   }
-}
-
-/**
- * The repo's files (repo-relative, `/`-separated): tracked plus
- * untracked-but-not-ignored, so it sees what codegraph indexes; a tree walk
- * when this isn't a git checkout. `node_modules` never counts.
- */
-export function repoFiles(root: string): string[] {
-  const git = spawnSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard'],
-    { cwd: root, encoding: 'utf8', maxBuffer: 512 * 1024 * 1024 });
-  const files = git.status === 0 ? git.stdout.split('\0').filter(Boolean) : walk(root, '');
-  return files.filter(f => !f.split('/').some(seg => NEVER.has(seg)));
-}
-
-function walk(root: string, rel: string): string[] {
-  const out: string[] = [];
-  for (const e of fs.readdirSync(path.join(root, rel), { withFileTypes: true })) {
-    if (NEVER.has(e.name)) continue;
-    const child = rel ? `${rel}/${e.name}` : e.name;
-    if (e.isDirectory()) out.push(...walk(root, child));
-    else out.push(child);
-  }
-  return out;
 }
 
 /** Directories (`.` for the root) holding a tsconfig.json / jsconfig.json. */

@@ -1,54 +1,61 @@
 {
   "repo": "codegraph",
-  "verified": 10847,
-  "unverified": 23532,
+  "verified": 33751,
+  "unverified": 1889,
   "causes": {
-    "no document": 23218,
-    "not a call to SCIP": 142,
-    "later line": 108,
-    "no reference": 62,
-    "target without node": 2
+    "no document": 1169,
+    "no reference": 292,
+    "later line": 210,
+    "not a call to SCIP": 195,
+    "target without node": 23
   },
   "targets": {
     "no document": {
-      "codegraph-kernel/src (.rs)": 3709,
-      "__tests__/extraction.test.ts (.ts)": 1463,
-      "scripts/agent-eval (.mjs)": 859,
-      "__tests__/resolution.test.ts (.ts)": 787,
-      "__tests__/fixtures (.ts)": 550,
       "ui/src (.svelte)": 550,
-      "__tests__/installer-targets.test.ts (.ts)": 469,
-      "__tests__/watcher.test.ts (.ts)": 451
+      "codegraph-kernel/grammars (.c)": 311,
+      "__tests__/fixtures (.go)": 95,
+      "__tests__/fixtures (.kt)": 38,
+      "__tests__/fixtures (.dart)": 31,
+      "__tests__/fixtures (.cpp)": 26,
+      "__tests__/fixtures (.scala)": 19,
+      "assets/generate-language-tiles.py (.py)": 18
     },
     "target without node": {
-      "src/installer/clack.d.ts (cancel().)": 1,
-      "src/resolution/callback-synthesizer.ts (synthesizeCallbackEdges().runSynthPass().)": 1
+      "__tests__/fixtures/starved-cluster-ts/src/pipeline/types.ts (Interceptor#intercept().proceed().)": 3,
+      "__tests__/refs-by-files-spread.test.ts (queries.queries.insertUnresolvedRefsBatch().)": 2,
+      "__tests__/segment-vocab.test.ts (queries.queries.isNameSegmentVocabEmpty().)": 2,
+      "__tests__/segment-vocab.test.ts (clearNameSegmentVocab().)": 2,
+      "__tests__/segment-vocab.test.ts (isNameSegmentVocabEmpty().)": 2,
+      "__tests__/segment-vocab.test.ts (insertNameSegmentsBatch().)": 2,
+      "__tests__/kernel-retry-materialize.test.ts (orchestrator.orchestrator.storeExtractionResult().)": 1,
+      "__tests__/orphaned-refs-sweep.test.ts (resolver.resolver.resolveAndPersistBatched().)": 1
     }
   },
   "examples": {
-    "no document": [
-      "__tests__/adaptive-explore-sizing.test.ts:76 __tests__/adaptive-explore-sizing.test.ts → write (__tests__/adaptive-explore-sizing.test.ts)",
-      "__tests__/adaptive-explore-sizing.test.ts:87 __tests__/adaptive-explore-sizing.test.ts → write (__tests__/adaptive-explore-sizing.test.ts)",
-      "__tests__/adaptive-explore-sizing.test.ts:110 __tests__/adaptive-explore-sizing.test.ts → write (__tests__/adaptive-explore-sizing.test.ts)"
-    ],
-    "not a call to SCIP": [
-      "src/bin/codegraph.ts:147 src/bin/codegraph.ts → runInstaller (src/installer/index.ts)",
-      "src/bin/codegraph.ts:554 main::offerIndexIgnoredRepos → findUnindexedIgnoredRepos (src/extraction/index.ts)",
-      "src/bin/codegraph.ts:596 main::offerIndexIgnoredRepos → addIncludeIgnoredPatterns (src/project-config.ts)"
-    ],
     "later line": [
-      "src/bin/codegraph.ts:225 main → name (src/web-tree-sitter.d.ts)",
-      "src/db/index.ts:428 DatabaseConnection::healBulkNodeLoad → prepare (src/db/sqlite-adapter.ts)",
-      "src/db/index.ts:445 DatabaseConnection::healBulkSecondaryIndexes → prepare (src/db/sqlite-adapter.ts)"
+      "__tests__/arkts-resolution.test.ts:91 __tests__/arkts-resolution.test.ts → getNodesByKind (src/index.ts)",
+      "__tests__/arkts-resolution.test.ts:287 __tests__/arkts-resolution.test.ts → getOutgoingEdges (src/index.ts)",
+      "__tests__/arkts-resolution.test.ts:320 __tests__/arkts-resolution.test.ts → getOutgoingEdges (src/index.ts)"
     ],
     "no reference": [
-      "src/bin/codegraph.ts:1367 main → ToolHandler (src/mcp/tools.ts)",
-      "src/bin/codegraph.ts:1536 main → ToolHandler (src/mcp/tools.ts)",
-      "src/bin/codegraph.ts:1649 main → ToolHandler (src/mcp/tools.ts)"
+      "__tests__/beta-signup.test.ts:150 __tests__/beta-signup.test.ts → EMAIL_RE (src/installer/beta-signup.ts)",
+      "__tests__/beta-signup.test.ts:151 __tests__/beta-signup.test.ts → EMAIL_RE (src/installer/beta-signup.ts)",
+      "__tests__/beta-signup.test.ts:152 __tests__/beta-signup.test.ts → EMAIL_RE (src/installer/beta-signup.ts)"
+    ],
+    "not a call to SCIP": [
+      "__tests__/c-fnptr-synthesizer.test.ts:420 __tests__/c-fnptr-synthesizer.test.ts → cFnPointerDispatchEdges (src/resolution/c-fnptr-synthesizer.ts)",
+      "__tests__/cli-unlock.test.ts:29 runCodegraphAsync → reject (src/extraction/parse-pool.ts)",
+      "__tests__/explore-named-file-valve.test.ts:133 __tests__/explore-named-file-valve.test.ts → file (ui/src/lib/adapter.ts)"
+    ],
+    "no document": [
+      "__tests__/fixtures/kernel-parity/ScalaCompanions.scala:2 ObjectFirst::create → ObjectFirst (__tests__/fixtures/kernel-parity/ScalaCompanions.scala)",
+      "__tests__/fixtures/kernel-parity/ScalaCompanions.scala:14 Live::run → value (__tests__/fixtures/kernel-parity/ScalaCompanions.scala)",
+      "__tests__/fixtures/kernel-parity/ScalaCompanions.scala:22 scope → localMethod (__tests__/fixtures/kernel-parity/ScalaCompanions.scala)"
     ],
     "target without node": [
-      "src/installer/index.ts:644 resolveTargets → cancel (__tests__/fixtures/dense-header-ts/src/core/types.ts)",
-      "src/resolution/callback-synthesizer.ts:3924 synthesizeCallbackEdges::runPooled → runSynthPass (src/resolution/resolver-pool.ts)"
+      "__tests__/fixtures/starved-cluster-ts/src/pipeline/interceptors.ts:8 retryInterceptor → proceed (__tests__/fixtures/starved-cluster-ts/src/pipeline/chain.ts)",
+      "__tests__/fixtures/starved-cluster-ts/src/pipeline/interceptors.ts:12 headerInterceptor → proceed (__tests__/fixtures/starved-cluster-ts/src/pipeline/chain.ts)",
+      "__tests__/fixtures/starved-cluster-ts/src/pipeline/interceptors.ts:16 logInterceptor → proceed (__tests__/fixtures/starved-cluster-ts/src/pipeline/chain.ts)"
     ]
   }
 }

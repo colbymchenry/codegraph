@@ -6,19 +6,29 @@
  * until the component exists, which the `--version` probe catches.
  */
 
-import * as fs from 'fs';
-import * as path from 'path';
 import { skipGroup } from '../syntax';
 import type { IndexerSpec } from './index';
+import { markerDirs } from './repo-files';
+
+/** Each topmost Cargo.toml is a run: a workspace's members are indexed with it. */
+const workspaces = (root: string) => markerDirs(root, 'Cargo.toml', { topmost: true });
 
 export const rustIndexer: IndexerSpec = {
   lang: 'rust',
   tools: ['rust-analyzer'],
   codegraphLanguages: ['rust'],
-  detect: root => fs.existsSync(path.join(root, 'Cargo.toml')),
+  detect: root => workspaces(root).length > 0,
   cmd: 'rust-analyzer',
   probe: ['--version'],
-  invocation: (_root, outFile) => ({ runs: [{ label: 'rust', args: ['scip', '.', '--output', outFile], output: outFile }] }),
+  invocation: (root, outFile) => {
+    const dirs = workspaces(root);
+    return {
+      runs: dirs.map((cwd, i) => {
+        const output = dirs.length === 1 ? outFile : `${outFile}.part${i}`;
+        return { label: cwd === '.' ? 'rust' : `rust (${cwd})`, args: ['scip', '.', '--output', output], output, cwd };
+      }),
+    };
+  },
   // Struct literals `T { … }`, `T::<U> { … }`, `path::T { … }` build a T.
   literalShape: (tail, head) => {
     let t: string | null = tail.trimStart();

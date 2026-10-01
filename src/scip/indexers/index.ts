@@ -37,6 +37,8 @@ export interface IndexerRun {
   light?: boolean;
   /** runs to try instead when this one fails (a batch retried one project at a time) */
   fallback?: IndexerRun[];
+  /** repo-relative folder to run in (a module or workspace below the root); the root by default */
+  cwd?: string;
 }
 
 /**
