@@ -303,6 +303,40 @@ def view():
     expect(targets('views.py', 'app/views.py', 'imports')).toEqual([]);
   });
 
+  it('never binds a name imported from a third-party package to a copy of it nested in a test fixture', async () => {
+    write({
+      'tests/fixtures/proj/pyproject.toml': '[project]\nname = "proj"\n',
+      'tests/fixtures/proj/requests/__init__.py': 'def get(u):\n    return u\n',
+      'app/__init__.py': '',
+      'app/client.py': `from requests import get
+
+
+def fetch():
+    return get("x")
+`,
+    });
+    cg = await CodeGraph.init(tempDir, { index: true });
+
+    expect(targets('fetch', 'app/client.py', 'calls')).toEqual([]);
+    expect(targets('client.py', 'app/client.py', 'imports')).toEqual([]);
+  });
+
+  it('still binds a name imported from a package the project provides at a root', async () => {
+    write({
+      'requests/__init__.py': 'def get(u):\n    return u\n',
+      'app/__init__.py': '',
+      'app/client.py': `from requests import get
+
+
+def fetch():
+    return get("x")
+`,
+    });
+    cg = await CodeGraph.init(tempDir, { index: true });
+
+    expect(targets('fetch', 'app/client.py', 'calls')).toEqual(['get@requests/__init__.py']);
+  });
+
   it('binds a top-level module the project really provides at a package root', async () => {
     write({
       'yaml.py': 'def safe_load(s):\n    return s\n',

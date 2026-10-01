@@ -513,6 +513,8 @@ export class ReferenceResolver {
         isExternalImport(source, language, this.context) &&
         resolveImportPath(source, fromFile, language, this.context) === null &&
         this.isDeclaredOutsidePackage(source, fromFile),
+      resolveModuleFile: (source, fromFile, language) =>
+        resolveImportPath(source, fromFile, language, this.context),
       getNodesInFile: (filePath: string) => {
         if (!this.nodeCache.has(filePath)) {
           this.nodeCache.set(filePath, this.queries.getNodesByFile(filePath));

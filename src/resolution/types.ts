@@ -174,6 +174,12 @@ export interface ResolutionContext {
    */
   isOutOfRepoImport?(source: string, fromFile: string, language: Language): boolean;
   /**
+   * The project file a module specifier, written in `fromFile`, names — the
+   * import resolver's own answer (for Python: from the package roots), or null
+   * when no project file provides it. Supplied by the coordinator.
+   */
+  resolveModuleFile?(source: string, fromFile: string, language: Language): string | null;
+  /**
    * Project import-path aliases (tsconfig/jsconfig `paths`). Returns
    * `null` when the project doesn't define any. Cached per resolver
    * instance — safe to call from any resolver code path. Optional so
