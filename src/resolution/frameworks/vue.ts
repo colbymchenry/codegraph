@@ -8,6 +8,7 @@
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { dependsOn } from './package-deps';
+import { pageComponentRef, resolvePageComponent } from './page-component';
 
 /** The languages a Vue app's scripts are written in. */
 const VUE_SCRIPT_LANGUAGES: ReadonlySet<string> = new Set(['vue', 'javascript', 'typescript', 'tsx', 'jsx']);
@@ -212,12 +213,14 @@ export const nuxtResolver: FrameworkResolver = {
     return context.getAllFiles().some((f) => /(?:^|\/)nuxt\.config\.(?:[cm]?[jt]s)$/.test(f));
   },
 
-  resolve(): ResolvedRef | null {
-    return null;
+  resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // A page route names the component its file is.
+    return resolvePageComponent(ref, context);
   },
 
   extract(filePath: string, _content: string) {
     const nodes: Node[] = [];
+    const references: UnresolvedRef[] = [];
     const now = Date.now();
 
     // Forward slashes, and a leading `/` so an app at the repository root
@@ -229,7 +232,7 @@ export const nuxtResolver: FrameworkResolver = {
     if (pagesIndex !== -1 && normalized.endsWith('.vue')) {
       const routePath = filePathToNuxtRoute(normalized, pagesIndex + '/pages/'.length);
       if (routePath !== null) {
-        nodes.push({
+        const route: Node = {
           id: `route:${filePath}:${routePath}:1`,
           kind: 'route',
           name: routePath,
@@ -241,7 +244,9 @@ export const nuxtResolver: FrameworkResolver = {
           endColumn: 0,
           language: 'vue',
           updatedAt: now,
-        });
+        };
+        nodes.push(route);
+        references.push(pageComponentRef(route, '.vue', 'vue'));
       }
     }
 
@@ -292,7 +297,7 @@ export const nuxtResolver: FrameworkResolver = {
       });
     }
 
-    return { nodes, references: [] };
+    return { nodes, references };
   },
 };
 
