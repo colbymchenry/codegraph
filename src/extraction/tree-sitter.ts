@@ -658,6 +658,10 @@ export class TreeSitterExtractor {
       if (packageNodeId) this.nodeStack.pop();
       this.nodeStack.pop();
 
+      // A CommonJS `require('./x')` is a file import, like ESM's `import`. The
+      // kernel reads the same (kernel/index.ts and the parse worker's transport).
+      this.unresolvedReferences.push(...commonJsRequireRefs(this.filePath, this.source, this.language));
+
       // hasError is routine for several grammars; warn only when no symbols survived.
       const symbolCount = this.nodes.filter((n) => n.kind !== 'file').length;
       if (this.tree?.rootNode.hasError && symbolCount === 0) {
@@ -7614,9 +7618,6 @@ export function extractFromSource(
       );
       result = extractor.extract();
     }
-    // A CommonJS `require('./x')` is a file import, like ESM's `import` — read
-    // after either extractor so both arms record it.
-    result.unresolvedReferences.push(...commonJsRequireRefs(filePath, source, detectedLanguage));
   }
 
   // Framework-specific extraction (routes, middleware, etc.)
