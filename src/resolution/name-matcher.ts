@@ -1355,6 +1355,134 @@ function isPhpClassVisible(candidate: Node, ref: UnresolvedRef, context: Resolut
   return fqn.toLowerCase() === (scope.namespace ? `${scope.namespace}\\${name}` : name).toLowerCase();
 }
 
+const JAVA_TYPE_KINDS_VISIBLE: ReadonlySet<string> = new Set(['class', 'interface', 'enum', 'record', 'annotation']);
+const JAVA_FILE_SCOPES = new WeakMap<ResolutionContext, Map<string, { pkg: string; single: Set<string>; demand: Set<string> }>>();
+const JAVA_ANCESTORS = new WeakMap<ResolutionContext, Map<string, Set<string>>>();
+
+/** A Java file's package, its single-type imports and its on-demand (`.*`) imports, static ones included. */
+function javaFileScope(file: string, context: ResolutionContext): { pkg: string; single: Set<string>; demand: Set<string> } {
+  let memo = JAVA_FILE_SCOPES.get(context);
+  if (!memo) JAVA_FILE_SCOPES.set(context, (memo = new Map()));
+  const hit = memo.get(file);
+  if (hit) return hit;
+  const text = stripCommentsForRegex(context.readFile(file) ?? '', 'java');
+  const pkg = /^\s*package\s+([\w.]+)\s*;/m.exec(text)?.[1] ?? '';
+  const single = new Set<string>();
+  const demand = new Set<string>();
+  for (const m of text.matchAll(/^\s*import\s+(?:static\s+)?([\w.]+?)(\.\*)?\s*;/gm)) (m[2] ? demand : single).add(m[1]!);
+  const scope = { pkg, single, demand };
+  memo.set(file, scope);
+  return scope;
+}
+
+/** The simple names of the Java types `qn` extends or implements, a few levels up. */
+function javaAncestorNames(qn: string, context: ResolutionContext, depth = 0): Set<string> {
+  let memo = JAVA_ANCESTORS.get(context);
+  if (!memo) JAVA_ANCESTORS.set(context, (memo = new Map()));
+  const hit = memo.get(qn);
+  if (hit) return hit;
+  const names = new Set<string>();
+  memo.set(qn, names);
+  for (const decl of context.getNodesByQualifiedName(qn)) {
+    if (decl.language !== 'java' || !JAVA_TYPE_KINDS_VISIBLE.has(decl.kind)) continue;
+    const lines = context.getFileLines?.(decl.filePath) ?? context.readFile(decl.filePath)?.split(/\r?\n/) ?? [];
+    let header = '';
+    for (let i = decl.startLine - 1; i < Math.min(lines.length, decl.startLine + 6) && !header.includes('{'); i++) header += `${lines[i] ?? ''} `;
+    const list = /\b(?:extends|implements)\b([^{]*)/.exec(header.split('{')[0]!)?.[1] ?? '';
+    for (const m of list.replace(/<[^<>]*(?:<[^<>]*>[^<>]*)*>/g, '').matchAll(/([A-Za-z_]\w*)\s*(?=,|$|\bimplements\b|\s*$)/g)) {
+      if (m[1] !== 'implements' && m[1] !== 'extends') names.add(m[1]!);
+    }
+  }
+  if (depth < 4) {
+    for (const base of [...names]) {
+      for (const t of context.getNodesByName(base)) {
+        if (t.language !== 'java' || !JAVA_TYPE_KINDS_VISIBLE.has(t.kind) || t.qualifiedName === qn) continue;
+        for (const up of javaAncestorNames(t.qualifiedName, context, depth + 1)) names.add(up);
+      }
+    }
+  }
+  return names;
+}
+
+/**
+ * Whether a bare Java type name at `ref` can mean `candidate`. A top-level type
+ * is in reach from its own package and through a single-type or on-demand
+ * import; a nested type from inside its owner (or a type deriving from it) or
+ * through an import of it or of its owner's members. halo's `Context`,
+ * retrofit's `Builder`, jsoup's `Attribute` (meant: `Evaluator.Attribute`)
+ * reached a same-named type nothing imported.
+ */
+function isJavaTypeVisible(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'java' || candidate.language !== 'java') return true;
+  if (!/^[A-Za-z_$][\w$]*$/.test(ref.referenceName)) return true;
+  // A constructor is in reach where its type is: lombok's `@Builder` and
+  // okhttp's `new OkHttpClient.Builder()` are no project `Builder`'s constructor.
+  if (candidate.kind === 'method') {
+    const segs = candidate.qualifiedName.split('::');
+    if (segs.length < 2 || segs[segs.length - 2] !== candidate.name || ref.referenceKind === 'calls') return true;
+    const owner = context.getNodesInFile(candidate.filePath).find((n) =>
+      n.qualifiedName === segs.slice(0, -1).join('::') && JAVA_TYPE_KINDS_VISIBLE.has(n.kind));
+    return !owner || isJavaTypeVisible(owner, ref, context);
+  }
+  // An enum constant by its bare name: inside its enum, a `case` label, a
+  // static import, or written through its enum — never `java.lang.Character`'s
+  // `Character.MIN_SUPPLEMENTARY_CODE_POINT` (jsoup's `TokenType.Character`).
+  if (candidate.kind === 'enum_member') {
+    if (candidate.filePath === ref.filePath) return true;
+    const segs = candidate.qualifiedName.split('::');
+    const enumName = segs[segs.length - 2] ?? '';
+    const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1] ?? '';
+    const name = ref.referenceName.replace(/\$/g, '\\$');
+    if (new RegExp(`\\bcase\\b[^:;]*\\b${name}\\b`).test(line) || new RegExp(`\\b${enumName}\\s*\\.\\s*${name}\\b`).test(line)) return true;
+    const here = javaFileScope(ref.filePath, context);
+    const enumFqn = [javaFileScope(candidate.filePath, context).pkg, ...segs.slice(1, -1)].filter((p) => p !== '').join('.');
+    return here.single.has(`${enumFqn}.${ref.referenceName}`) || here.demand.has(enumFqn);
+  }
+  if (!JAVA_TYPE_KINDS_VISIBLE.has(candidate.kind)) return true;
+  const segs = candidate.qualifiedName.split('::');
+  const candidateScope = javaFileScope(candidate.filePath, context);
+  // The QN leads with the package when there is one.
+  const typePath = candidateScope.pkg && segs[0] === candidateScope.pkg ? segs.slice(1) : segs;
+  const fqn = [candidateScope.pkg, ...typePath].filter((p) => p !== '').join('.');
+  const here = javaFileScope(ref.filePath, context);
+  // Written with a qualifier — `RequestFactory.Builder`, `java.util.Map`, an
+  // inner class's `outer.new Inner()` — the qualifier says which: the owner
+  // (or the package) of this candidate.
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1] ?? '';
+  if (new RegExp(`\\.\\s*new\\s+${ref.referenceName.replace(/\$/g, '\\$')}\\b`).test(line)) return true;
+  // (A type annotation may sit between them: jsoup's `Range.@Nullable Spans`.)
+  const qualifiers = [...line.matchAll(new RegExp(`([A-Za-z_$][\\w$.]*)\\s*\\.\\s*(?:@[\\w.]+(?:\\([^)]*\\))?\\s+)*${ref.referenceName.replace(/\$/g, '\\$')}\\b`, 'g'))].map((m) => m[1]!);
+  // Nested only inside a type the file declares; a class local to a method is
+  // the lexical rule's to judge.
+  const ownerQn = segs.slice(0, -1).join('::');
+  const ownerNode = segs.length > 1
+    ? context.getNodesInFile(candidate.filePath).find((n) => n.qualifiedName === ownerQn && n.kind !== 'namespace' && n.kind !== 'file')
+    : undefined;
+  if (ownerNode && !JAVA_TYPE_KINDS_VISIBLE.has(ownerNode.kind)) return true;
+  const nested = ownerNode !== undefined;
+  const ownerName = nested ? ownerNode.name : '';
+  if (qualifiers.some((q) => (nested && (q === ownerName || q.endsWith(`.${ownerName}`))) || (!nested && q === candidateScope.pkg))) return true;
+  if (!nested) {
+    if (candidate.filePath === ref.filePath || candidateScope.pkg === here.pkg) return true;
+    return here.single.has(fqn) || here.demand.has(candidateScope.pkg);
+  }
+  // Nested: inside its owner, a subtype of it, or imported.
+  const enclosing = context.getNodesInFile(ref.filePath)
+    .filter((p) => JAVA_TYPE_KINDS_VISIBLE.has(p.kind) && p.startLine <= ref.line && p.endLine >= ref.line);
+  if (enclosing.some((p) => p.qualifiedName === ownerQn || p.qualifiedName.startsWith(`${ownerQn}::`))) return true;
+  // An anonymous class (`new NodeFilter() { … }`, named `<NodeFilter$anon@N>`) derives from what it instantiates.
+  const supertypesAround = (p: Node): string[] => {
+    const anon = /<([A-Za-z_$][\w$]*)\$anon@\d+>$/.exec(p.name)?.[1] ?? /<([A-Za-z_$][\w$]*)\$anon@\d+>/.exec(p.qualifiedName.split('::').pop() ?? '')?.[1];
+    if (!anon) return [...javaAncestorNames(p.qualifiedName, context)];
+    const ups = [anon];
+    for (const t of context.getNodesByName(anon)) if (t.language === 'java' && JAVA_TYPE_KINDS_VISIBLE.has(t.kind)) ups.push(...javaAncestorNames(t.qualifiedName, context));
+    return ups;
+  };
+  if (enclosing.some((p) => supertypesAround(p).includes(ownerName))) return true;
+  const ownerFqn = fqn.slice(0, fqn.lastIndexOf('.'));
+  return here.single.has(fqn) || here.demand.has(ownerFqn);
+}
+
 const SCALA_OBJECT_PACKAGES = new WeakMap<ResolutionContext, Map<string, string | null>>();
 
 /** The full package a Scala file's `package object X` opens (`algebra`, `cats.syntax`), or null for none. */
@@ -1485,6 +1613,8 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   if (isSfcPrivate(candidate, context)) return false;
   // A bare PHP class name is its namespace's class, or the one a `use` names.
   if (!isPhpClassVisible(candidate, ref, context)) return false;
+  // A bare Java type name is its package's, an import's, or a nested type in reach.
+  if (!isJavaTypeVisible(candidate, ref, context)) return false;
   // A Scala package object's member is in scope in its package and those under
   // it, or through an import: cats.laws' `Eq` is the `cats` package object's
   // alias, not the `algebra` one's (752 refs went there).
@@ -4839,6 +4969,9 @@ export function matchByExactName(
     // the ranking, so koel's `extends Request` under `use App\Http\Requests\API\Request;`
     // is that class, not the first `Request` indexed.
     isPhpClassVisible(n, ref, context) &&
+    // Likewise a bare Java type name: retrofit's tests' `new Builder()` is not
+    // a wire converter test's nested `CrashingPhone.Builder`.
+    isJavaTypeVisible(n, ref, context) &&
     // A Scala package object's member, only where it is in scope — ahead of
     // the ranking, so cats.laws' `Eq` can be the `cats` package object's.
     !(ref.language === 'scala' && n.language === 'scala' && n.filePath !== ref.filePath &&
@@ -5973,6 +6106,8 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   PY_PLUGGED_MODULES.delete(context);
   SCALA_OBJECT_PACKAGES.delete(context);
   GO_EXTERNAL_QUALIFIED.delete(context);
+  JAVA_FILE_SCOPES.delete(context);
+  JAVA_ANCESTORS.delete(context);
   SCALA_SUPERS.delete(context);
   SCALA_IMPORTS.delete(context);
   ESM_EXPORT_LISTS.delete(context);
