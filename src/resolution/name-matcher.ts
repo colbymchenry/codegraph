@@ -1300,6 +1300,42 @@ function rustModuleDir(filePath: string): string {
   return path.posix.join(dir, base.replace(/\.rs$/, ''));
 }
 
+const GO_EXTERNAL_QUALIFIED = new WeakMap<ResolutionContext, Map<string, boolean>>();
+
+/**
+ * Whether a Go reference is written through an imported package from outside
+ * the module — `context.Context`, `fmt.Errorf`, a third-party `gin.H` — read
+ * from its line, since the index keeps only the name.
+ */
+function isGoExternalQualified(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.referenceKind === 'imports') return false;
+  const name = ref.referenceName.split('.').pop()!;
+  if (!/^[A-Za-z_]\w*$/.test(name)) return false;
+  let memo = GO_EXTERNAL_QUALIFIED.get(context);
+  if (!memo) GO_EXTERNAL_QUALIFIED.set(context, (memo = new Map()));
+  const key = `${ref.filePath}\0${ref.line}\0${ref.column}\0${ref.referenceName}`;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  let external = false;
+  const line = context.getFileLines?.(ref.filePath)?.[ref.line - 1] ?? context.readFile(ref.filePath)?.split(/\r?\n/)[ref.line - 1] ?? '';
+  const at = Math.max(0, ref.column);
+  // The qualifier right before the name at the reference's column, or the
+  // line's only spelling of the name.
+  const before = line.startsWith(name, at) ? /(?:^|[^\w.])([A-Za-z_]\w*)\.$/.exec(line.slice(0, at))?.[1]
+    : !new RegExp(`(?<![\\w.])${name}\\b`).test(line) ? new RegExp(`(?:^|[^\\w.])([A-Za-z_]\\w*)\\.${name}\\b`).exec(line)?.[1] : undefined;
+  if (before) {
+    const imported = context.getImportMappings(ref.filePath, 'go').find((m) => m.localName === before);
+    if (imported) {
+      const mod = context.getGoModule?.();
+      const local = imported.source.startsWith('.') || imported.source.includes('/internal/') ||
+        (mod !== undefined && mod !== null && (imported.source === mod.modulePath || imported.source.startsWith(`${mod.modulePath}/`)));
+      external = !local;
+    }
+  }
+  memo.set(key, external);
+  return external;
+}
+
 const SCALA_OBJECT_PACKAGES = new WeakMap<ResolutionContext, Map<string, string | null>>();
 
 /** The full package a Scala file's `package object X` opens (`algebra`, `cats.syntax`), or null for none. */
@@ -1413,6 +1449,10 @@ function isSfcPrivate(n: Node, context: ResolutionContext): boolean {
  * checks its own survivor as well, since nothing runs after it.
  */
 export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  // Go's `context.Context`, `http.Handler`: written through a package from
+  // outside the module, so nothing in it — not even the same file's method
+  // `Stream.Context` (fiber's 85 `context.Context` parameters went there).
+  if (ref.language === 'go' && candidate.language === 'go' && isGoExternalQualified(ref, context)) return false;
   if (candidate.filePath === ref.filePath) return true;
   // A vendored minified bundle's names are mangled: healthchecks' 369 `$(…)`
   // (jQuery, a global) went to a one-letter helper inside bootstrap-native.min.js.
@@ -5907,6 +5947,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   PY_FIXTURE_TYPES.delete(context);
   PY_PLUGGED_MODULES.delete(context);
   SCALA_OBJECT_PACKAGES.delete(context);
+  GO_EXTERNAL_QUALIFIED.delete(context);
   SCALA_SUPERS.delete(context);
   SCALA_IMPORTS.delete(context);
   ESM_EXPORT_LISTS.delete(context);
