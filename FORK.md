@@ -24,20 +24,19 @@ Upstream files the fork touches (keep these hunks small):
 - `src/index.ts`: the `runScipPass` hook in `indexAll`, the `onSynced` hook in `sync`, the reindex scheduler in `watch`/`unwatch`, and `scipReadDb`/`scipWrite`
 - `src/bin/codegraph.ts`: `registerScipCommands`, the update-check default, and the `upgrade` refusal
 - `src/mcp/tools.ts`: `scipFlowNote` and `scipTrailNote`
+- `install.sh`: `CODEGRAPH_ARCHIVE`, to install a locally built bundle
 
 Everything else is new, under `src/scip/`, `__tests__/scip/`, `__tests__/fixtures/scip-ts/` and `scripts/scip-eval/`.
 
 ## Installing it as `codegraph`
 
-Build a self-contained bundle with upstream's recipe ([`BUNDLING.md`](BUNDLING.md)): vendored Node 24 plus the native extraction kernel. It runs whatever Node the machine has, including 25+, which the plain build refuses. Then install it where `install.sh` would:
+Build a self-contained bundle with upstream's recipe ([`BUNDLING.md`](BUNDLING.md)): vendored Node 24 plus the native extraction kernel. It runs whatever Node the machine has, including 25+, which the plain build refuses. Then install it with upstream's `install.sh`, which links it and removes older versions:
 
 ```sh
 scripts/build-kernel.sh                      # native kernel (cargo); without it the bundle falls back to the slower wasm path
 scripts/build-bundle.sh linux-x64            # -> release/codegraph-linux-x64.tar.gz
-V="v$(node -p "require('./package.json').version")-scip.$(git rev-parse --short HEAD)"
-mkdir -p ~/.codegraph/versions/$V && tar -xzf release/codegraph-linux-x64.tar.gz -C ~/.codegraph/versions/$V --strip-components=1
-ln -sfn ~/.codegraph/versions/$V ~/.codegraph/current
-ln -sfn ~/.codegraph/versions/$V/bin/codegraph ~/.local/bin/codegraph
+CODEGRAPH_ARCHIVE=release/codegraph-linux-x64.tar.gz \
+CODEGRAPH_VERSION="v$(node -p "require('./package.json').version")-scip.$(git rev-parse --short HEAD)" sh install.sh
 ```
 
 MCP clients that launch `codegraph` pick it up on restart. To go back to the npm install: `ln -sfn ../lib/node_modules/@colbymchenry/codegraph/npm-shim.js ~/.local/bin/codegraph`, or run `npm i -g @colbymchenry/codegraph`, which re-links it (so does any `npm update -g`).

@@ -15,6 +15,8 @@
 #   CODEGRAPH_VERSION      release tag to install (default: latest)
 #   CODEGRAPH_INSTALL_DIR  bundle location   (default: ~/.codegraph)
 #   CODEGRAPH_BIN_DIR      symlink location  (default: ~/.local/bin)
+#   CODEGRAPH_ARCHIVE      install this local bundle archive instead of downloading
+#                          one (needs CODEGRAPH_VERSION to name it)
 set -eu
 
 REPO="colbymchenry/codegraph"
@@ -56,6 +58,10 @@ target="${os}-${arch}"
 # redirect (github.com/<repo>/releases/latest -> .../releases/tag/vX.Y.Z) has no
 # such limit. Fall back to the API if the redirect can't be read.
 version="${CODEGRAPH_VERSION:-}"
+if [ -n "${CODEGRAPH_ARCHIVE:-}" ] && [ -z "$version" ]; then
+  echo "codegraph: CODEGRAPH_ARCHIVE needs CODEGRAPH_VERSION to name the install." >&2
+  exit 1
+fi
 if [ -z "$version" ]; then
   version="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" \
     | sed -n 's#.*/releases/tag/##p')"
@@ -73,7 +79,11 @@ url="https://github.com/$REPO/releases/download/$version/codegraph-${target}.tar
 echo "Installing CodeGraph $version ($target)..."
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-curl -fsSL "$url" -o "$tmp/cg.tar.gz" || { echo "codegraph: download failed: $url" >&2; exit 1; }
+if [ -n "${CODEGRAPH_ARCHIVE:-}" ]; then
+  cp "$CODEGRAPH_ARCHIVE" "$tmp/cg.tar.gz" || { echo "codegraph: can't read $CODEGRAPH_ARCHIVE" >&2; exit 1; }
+else
+  curl -fsSL "$url" -o "$tmp/cg.tar.gz" || { echo "codegraph: download failed: $url" >&2; exit 1; }
+fi
 
 dest="$INSTALL_DIR/versions/$version"
 rm -rf "$dest"
