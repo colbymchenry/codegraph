@@ -129,6 +129,17 @@ describe.runIf(TSGO)('tsgo indexer (TypeScript fixture)', () => {
     expect(edge('useConst', 'twice')?.provenance).toBe('scip');
   }, 30_000);
 
+  it('indexes files outside every tsconfig in one inferred program', async () => {
+    fs.mkdirSync(path.join(dir, 'scripts'));
+    fs.writeFileSync(path.join(dir, 'scripts', 'tool.ts'), "import { helper } from '../src/models';\nexport function tool() {\n  return helper(1);\n}\n");
+    fs.writeFileSync(path.join(dir, 'scripts', 'plain.js'), "import { Invoice } from '../src/models';\nexport function viaJs(i) {\n  return new Invoice(i).totalPrice();\n}\n");
+    await cg.indexAll();
+    const { report } = await index();
+    expect(report.staleDocuments).toEqual([]);
+    expect(edge('tool', 'helper')?.provenance).toBe('scip');
+    expect(edge('viaJs', 'Invoice::totalPrice')?.provenance).toBe('scip');
+  }, 30_000);
+
   it('a method named like an Object.prototype member (toString) maps to its node', async () => {
     fs.writeFileSync(path.join(dir, 'src', 'named.ts'), [
       'export class Money {',
@@ -304,6 +315,13 @@ describe.runIf(TSGO)('incremental reindex (tsgo, through the CLI)', () => {
     expect((await edge('sum', 'helper'))?.provenance).toBe('scip'); // untouched files keep theirs
     expect((await edge('usesOverloads', 'Registry::lookup'))?.provenance).toBe('scip'); // a call into models.ts, which was not re-indexed
     expect(cli('scip', 'index', dir, '--lang', 'typescript', '--changed')).toMatch(/up to date/);
+  }, 60_000);
+
+  it('a repo with no tsconfig is indexed by tsgo, as one inferred program', async () => {
+    fs.rmSync(path.join(dir, 'tsconfig.json'));
+    cli('init', '-y', dir);
+    expect(cli('scip', 'index', dir, '--lang', 'typescript')).toMatch(/tsgo-index/);
+    expect((await edge('sum', 'helper'))?.provenance).toBe('scip');
   }, 60_000);
 
   it('merges only what a patch can change, and ends where a full rebuild does', async () => {

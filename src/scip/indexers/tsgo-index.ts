@@ -3,7 +3,7 @@
  * its API (`typescript/unstable/sync`, TypeScript ≥ 7.1). The typescript
  * adapter runs it as its own process when that API is installed:
  *
- *   node tsgo-index.js <typescript package dir> <output> <root> <tsconfig>...
+ *   node tsgo-index.js <typescript package dir> <output> <root> [--only <listfile>] [<tsconfig>...]
  *
  * It writes exactly what the merge reads (see compact.ts) and nothing more: a
  * reference at the callee name of every call and `new` in a project file, and
@@ -17,21 +17,29 @@
  * — when that project never loads it — by the first project that does. Every
  * definition lands in its file's document whichever project referenced it. A
  * project that fails to open is reported on stderr (RUN_WARNING) and its files
- * stay heuristic-only.
+ * stay heuristic-only. Repo files no project indexed (outside every tsconfig, or
+ * a repo with none) are indexed last, together, in one inferred program.
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import { pathToFileURL } from 'url';
 import { ROLE_DEFINITION, ScipImplementation, ScipOccurrence, encodeDocument, encodeMetadata, escapeIdentifier as esc } from '../reader';
+import { MAX_SOURCE_FILE_SIZE_BYTES } from '../../file-limits';
 import { RUN_WARNING } from './index';
-import { packageVersion } from './typescript';
+import { packageVersion, repoFiles } from './typescript';
 
 /** SCIP `PositionEncoding.UTF16CodeUnitOffsetFromLineStart`: the API's positions index JS strings. */
 const POSITION_ENCODING_UTF16 = 2;
 const SOURCE = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
 /** Files indexed between drops of the client-side AST cache. */
 const CACHE_FILES = 1000;
+/** Compiler options for files outside every tsconfig — what an editor infers for a loose file. */
+const INFERRED_OPTIONS = {
+  allowJs: true, jsx: 1 /* Preserve */, module: 99 /* ESNext */, moduleResolution: 100 /* Bundler */, target: 99 /* ESNext */,
+  allowImportingTsExtensions: true, resolveJsonModule: true, skipLibCheck: true, noEmit: true,
+};
+const DECLARATION_FILE = /\.d\.[cm]?ts$/;
 
 // The slice of the (unstable, untyped here) API this indexer uses.
 interface TsNode {
@@ -67,9 +75,16 @@ interface TsProject {
   program: { getSourceFileNames(): readonly string[]; getSourceFile(file: string): TsSourceFile | undefined };
   checker: { getSymbolAtPosition(file: string, positions: readonly number[]): (TsSymbol | undefined)[]; getAliasedSymbol(s: TsSymbol): TsSymbol };
 }
-interface TsSnapshot { getProjects(): readonly TsProject[]; dispose(): void }
+interface TsSnapshot {
+  getProjects(): readonly TsProject[];
+  operation: { createdPrograms?: readonly { project: TsProject }[] };
+  dispose(): void;
+}
 interface TsApi {
-  createSnapshot(params: { openProjects?: string[]; closeProjects?: string[] }): TsSnapshot;
+  createSnapshot(params: {
+    openProjects?: string[]; closeProjects?: string[];
+    createPrograms?: { rootFiles: string[]; compilerOptions: Record<string, unknown> }[];
+  }): TsSnapshot;
   clearSourceFileCache(): void;
   close(): void;
 }
@@ -186,23 +201,32 @@ export async function indexProjects(
 
   let snapshot: TsSnapshot | null = null;
   let previous: string | null = null;
-  const open = (config: string): TsProject | null => {
+  /** A tsconfig's project, or (a list of files) an inferred program rooted at them. */
+  const open = (target: string | string[]): TsProject | null => {
+    const close = previous && previous !== target ? { closeProjects: [previous] } : {};
     try {
       snapshot?.dispose();
-      snapshot = ts.api.createSnapshot({ openProjects: [config], ...(previous && previous !== config ? { closeProjects: [previous] } : {}) });
-      const project = snapshot.getProjects().find(p => p.configFileName === config);
+      let project: TsProject | undefined;
+      if (typeof target === 'string') {
+        snapshot = ts.api.createSnapshot({ openProjects: [target], ...close });
+        project = snapshot.getProjects().find(p => p.configFileName === target);
+      } else {
+        snapshot = ts.api.createSnapshot({ ...close, createPrograms: [{ rootFiles: target, compilerOptions: INFERRED_OPTIONS }] });
+        project = snapshot.operation.createdPrograms?.[0]?.project;
+      }
       if (!project) throw new Error('not loaded');
       return project;
     } catch (err) {
-      warnings.push(`${rel(config)}: can't open the project (${err instanceof Error ? err.message : String(err)})`);
+      const what = typeof target === 'string' ? rel(target) : `${target.length} file(s) outside every tsconfig`;
+      warnings.push(`${what}: can't open the project (${err instanceof Error ? err.message : String(err)})`);
       return null;
     } finally {
-      previous = config;
+      previous = typeof target === 'string' ? target : null;
     }
   };
 
-  /** Indexes the files of `config`'s program that `want` accepts; returns the other repo files it loaded. */
-  const indexIn = (config: string, want: (file: string) => boolean): string[] => {
+  /** Indexes the files of `config`'s program (see open) that `want` accepts; returns the other repo files it loaded. */
+  const indexIn = (config: string | string[], want: (file: string) => boolean): string[] => {
     const project = open(config);
     if (!project) return [];
     const others: string[] = [];
@@ -484,6 +508,14 @@ export async function indexProjects(
     set.add(f);
   }
   for (const [config, set] of leftovers) indexIn(config, f => set.has(f));
+  // What no project indexed — outside every tsconfig, or a repo with none — as one inferred program.
+  const small = (f: string) => { try { return fs.statSync(path.join(root, f)).size <= MAX_SOURCE_FILE_SIZE_BYTES; } catch { return false; } };
+  const orphans = (only ? [...only] : repoFiles(root))
+    .filter(f => SOURCE.test(f) && !DECLARATION_FILE.test(f) && !indexed.has(f) && small(f)).map(f => path.join(root, f));
+  if (orphans.length) {
+    const set = new Set(orphans);
+    indexIn(orphans, f => set.has(f));
+  }
   (snapshot as TsSnapshot | null)?.dispose(); // assigned inside open()
   ts.api.close();
 
@@ -515,8 +547,8 @@ if (require.main === module) {
   const onlyAt = args.indexOf('--only');
   const onlyList = onlyAt >= 0 ? args.splice(onlyAt, 2)[1] : undefined;
   const [tsDir, output, root, ...configs] = args;
-  if (!tsDir || !output || !root || configs.length === 0 || (onlyAt >= 0 && !onlyList)) {
-    process.stderr.write('usage: tsgo-index <typescript package dir> <output> <root> [--only <file with one path per line>] <tsconfig>...\n');
+  if (!tsDir || !output || !root || (onlyAt >= 0 && !onlyList)) {
+    process.stderr.write('usage: tsgo-index <typescript package dir> <output> <root> [--only <file with one path per line>] [<tsconfig>...]\n');
     process.exit(2);
   }
   const only = onlyList ? new Set(fs.readFileSync(onlyList, 'utf8').split('\n').filter(Boolean)) : undefined;

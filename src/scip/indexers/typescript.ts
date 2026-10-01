@@ -54,7 +54,7 @@ function hasWorkspaces(root: string): boolean {
  * untracked-but-not-ignored, so it sees what codegraph indexes; a tree walk
  * when this isn't a git checkout. `node_modules` never counts.
  */
-function repoFiles(root: string): string[] {
+export function repoFiles(root: string): string[] {
   const git = spawnSync('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard'],
     { cwd: root, encoding: 'utf8', maxBuffer: 512 * 1024 * 1024 });
   const files = git.status === 0 ? git.stdout.split('\0').filter(Boolean) : walk(root, '');
@@ -229,7 +229,7 @@ export const typescriptIndexer: IndexerSpec = {
     if (!ts || 'unusable' in ts) return ts;
     const files = repoFiles(root);
     const projects = tsProjects(root, files);
-    if (projects.length === 0) return null; // nothing to open: scip-typescript infers a config
+    if (projects.length === 0 && !files.some(f => SOURCE.test(f))) return null; // no sources at all; with no tsconfig, tsgo-index infers one
     // Heaviest first; this only decides which project indexes a file its owner never loaded (see tsgo-index.ts).
     const weights = projectWeights(projects, files);
     const configs = [...projects].sort((a, b) => weights.get(b)! - weights.get(a)!)
