@@ -137,7 +137,7 @@ export const springResolver: FrameworkResolver = {
 
     // Pattern 1: Service references (dependency injection)
     if (ref.referenceName.endsWith('Service')) {
-      const result = resolveByNameAndKind(ref.referenceName, SERVICE_KINDS, SERVICE_DIRS, context);
+      const result = resolveByNameAndKind(ref, SERVICE_KINDS, SERVICE_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -150,7 +150,7 @@ export const springResolver: FrameworkResolver = {
 
     // Pattern 2: Repository references
     if (ref.referenceName.endsWith('Repository')) {
-      const result = resolveByNameAndKind(ref.referenceName, SERVICE_KINDS, REPO_DIRS, context);
+      const result = resolveByNameAndKind(ref, SERVICE_KINDS, REPO_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -163,7 +163,7 @@ export const springResolver: FrameworkResolver = {
 
     // Pattern 3: Controller references
     if (ref.referenceName.endsWith('Controller')) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, CONTROLLER_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, CONTROLLER_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -176,7 +176,7 @@ export const springResolver: FrameworkResolver = {
 
     // Pattern 4: Entity/Model references
     if (/^[A-Z][a-zA-Z]+$/.test(ref.referenceName)) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, ENTITY_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, ENTITY_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -189,7 +189,7 @@ export const springResolver: FrameworkResolver = {
 
     // Pattern 5: Component references
     if (ref.referenceName.endsWith('Component') || ref.referenceName.endsWith('Config')) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, COMPONENT_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, COMPONENT_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -555,18 +555,29 @@ function joinPath(prefix: string, sub: string): string {
 
 /**
  * Resolve a symbol by name using indexed queries instead of scanning all files.
+ * What the reference's own scope declares comes first — its file, then its
+ * package (directory) — and a class nested in another file's class is out of
+ * reach by its bare name: every MyBatis `XExample` declares its own nested
+ * `Criteria`, and mall's 8,747 `new Criteria()` went to the first one.
  */
 function resolveByNameAndKind(
-  name: string,
+  ref: UnresolvedRef,
   kinds: Set<string>,
   preferredDirPatterns: string[],
   context: ResolutionContext,
 ): string | null {
-  const candidates = context.getNodesByName(name);
+  const candidates = context.getNodesByName(ref.referenceName);
   if (candidates.length === 0) return null;
 
-  const kindFiltered = candidates.filter((n) => kinds.has(n.kind));
+  const kindFiltered = candidates.filter((n) => kinds.has(n.kind) &&
+    (n.filePath === ref.filePath || !isNestedType(n, context)));
   if (kindFiltered.length === 0) return null;
+
+  const sameFile = kindFiltered.find((n) => n.filePath === ref.filePath);
+  if (sameFile) return sameFile.id;
+  const dir = ref.filePath.slice(0, ref.filePath.lastIndexOf('/') + 1);
+  const samePackage = kindFiltered.find((n) => n.filePath.startsWith(dir) && !n.filePath.slice(dir.length).includes('/'));
+  if (samePackage) return samePackage.id;
 
   // Prefer candidates in framework-conventional directories
   const preferred = kindFiltered.filter((n) =>
@@ -577,4 +588,13 @@ function resolveByNameAndKind(
 
   // Fall back to any match
   return kindFiltered[0]!.id;
+}
+
+/** Whether a JVM type is declared inside another type of its file. */
+function isNestedType(n: Node, context: ResolutionContext): boolean {
+  const cut = n.qualifiedName.lastIndexOf('::');
+  if (cut < 0) return false;
+  const owner = n.qualifiedName.slice(0, cut);
+  return context.getNodesInFile(n.filePath).some((p) =>
+    p.qualifiedName === owner && (p.kind === 'class' || p.kind === 'interface' || p.kind === 'enum' || p.kind === 'struct' || p.kind === 'trait'));
 }
