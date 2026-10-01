@@ -18,7 +18,7 @@ import {
   SearchResult,
 } from '../types';
 import { safeJsonParse } from '../utils';
-import { kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-utils';
+import { kindBonus, nameMatchBonus, preparePathRelevanceQuery, scorePreparedPathRelevance } from '../search/query-utils';
 import { parseQuery, boundedEditDistance } from '../search/query-parser';
 import { isGeneratedFile } from '../extraction/generated-detection';
 import { splitIdentifierSegments } from '../search/identifier-segments';
@@ -242,7 +242,7 @@ export class QueryBuilder {
   // whole project, not a symbol, so it carries no discriminative signal (#720).
   // Set once by the CodeGraph instance; empty by default (no down-weighting).
   private projectNameTokens: Set<string> = new Set();
-  private isDeprioritizedPath: ((filePath: string) => boolean) | undefined;
+  private deprioritizedPathMatcher: (() => ((filePath: string) => boolean) | undefined) | undefined;
 
   // FTS5 availability flag — detected once at construction time (#1532)
   private _fts5Available: boolean | undefined;
@@ -257,6 +257,12 @@ export class QueryBuilder {
   private dominantFileMemo:
     | { stamp: string; value: { filePath: string; edgeCount: number; nextEdgeCount: number } | null }
     | undefined;
+
+  // getAllNodeNames()'s list under the same change stamp. The fuzzy search
+  // pass asks for it once per query term, so it has to outlive one search
+  // (#2184); held weakly because on a multi-million-name index it is too large
+  // to pin in a long-lived server between retrievals.
+  private nodeNamesMemo: { stamp: string; names: WeakRef<readonly string[]> } | undefined;
 
   // Prepared statements (lazily initialized)
   private stmts: {
@@ -391,6 +397,7 @@ export class QueryBuilder {
     // different databases report the same one — the memo goes with the old
     // connection, or a worker following a rebuilt index keeps its answer (#1864).
     this.dominantFileMemo = undefined;
+    this.nodeNamesMemo = undefined;
   }
 
   private edgeKindStmt(sql: string): SqliteStatement {
@@ -415,18 +422,22 @@ export class QueryBuilder {
   }
 
   /**
-   * Set the predicate that marks a path as de-prioritized by the project's
-   * `codegraph.json` `deprioritize` patterns (#982). Ranking-only: those paths
-   * stay indexed and findable, they just stop outranking first-party code.
-   * Called once when the project opens; undefined disables the lever.
+   * Set the source of the predicate that marks a path as de-prioritized by the
+   * project's `codegraph.json` `deprioritize` patterns (#982). Ranking-only:
+   * those paths stay indexed and findable, they just stop outranking
+   * first-party code. Called once when the project opens; undefined disables
+   * the lever. The source returns the predicate for the config in force when it
+   * is called (undefined: nothing is de-prioritized), so a ranking pass takes
+   * one and applies it to every candidate instead of re-reading the config per
+   * path (#2184).
    */
-  setDeprioritizedPathMatcher(matcher: ((filePath: string) => boolean) | undefined): void {
-    this.isDeprioritizedPath = matcher;
+  setDeprioritizedPathMatcher(matcher: (() => ((filePath: string) => boolean) | undefined) | undefined): void {
+    this.deprioritizedPathMatcher = matcher;
   }
 
-  /** The `deprioritize` predicate (#982), so other rankers apply the same lever. */
+  /** The `deprioritize` predicate (#982) for the current config, so other rankers apply the same lever. */
   getDeprioritizedPathMatcher(): ((filePath: string) => boolean) | undefined {
-    return this.isDeprioritizedPath;
+    return this.deprioritizedPathMatcher?.();
   }
 
   // ===========================================================================
@@ -1546,6 +1557,8 @@ export class QueryBuilder {
     // Apply multi-signal scoring
     if (results.length > 0 && (text || query)) {
       const scoringQuery = text || query;
+      const pathQuery = preparePathRelevanceQuery(scoringQuery, this.projectNameTokens);
+      const isDeprioritized = this.getDeprioritizedPathMatcher();
       results = results.map(r => {
         // A path the project de-prioritized is saying its symbol NAMES are not
         // the answer, so the exact-name bonus has to be damped too. The -15 path
@@ -1553,14 +1566,14 @@ export class QueryBuilder {
         // on #982's repro, a `usage()` helper sat at 74.8 vs 51.2 for the top
         // product symbol — -15 lands at 59.8, still ahead). Damped, not zeroed,
         // so the tree stays findable when it genuinely is what you asked for.
-        // Evaluated once and reused: the predicate stats the config file.
-        const deprioritized = this.isDeprioritizedPath?.(r.node.filePath) ?? false;
+        // Evaluated once and reused.
+        const deprioritized = isDeprioritized?.(r.node.filePath) ?? false;
         const nameBonus = nameMatchBonus(r.node.name, scoringQuery);
         return {
           ...r,
           score: r.score
             + kindBonus(r.node.kind)
-            + scorePathRelevance(r.node.filePath, scoringQuery, this.projectNameTokens, deprioritized)
+            + scorePreparedPathRelevance(r.node.filePath, pathQuery, deprioritized)
             + (deprioritized ? Math.round(nameBonus * DEPRIORITIZED_NAME_BONUS_SCALE) : nameBonus),
         };
       });
@@ -3457,9 +3470,26 @@ export class QueryBuilder {
   }
 
   /**
-   * Get all distinct node names (lightweight — just name strings for pre-filtering)
+   * Get all distinct node names (lightweight — just name strings for pre-filtering).
+   * Memoized per database change stamp, like {@link getDominantFile}; the list
+   * is shared between callers, so it must not be modified.
    */
-  getAllNodeNames(): string[] {
+  getAllNodeNames(): readonly string[] {
+    // Same transaction rule as getDominantFile: a stamp read inside one could
+    // outlive a ROLLBACK.
+    if (this.db.inTransaction !== false) {
+      this.nodeNamesMemo = undefined;
+      return this.readAllNodeNames();
+    }
+    const stamp = this.getChangeStamp();
+    const memo = this.nodeNamesMemo?.stamp === stamp ? this.nodeNamesMemo.names.deref() : undefined;
+    if (memo) return memo;
+    const names = this.readAllNodeNames();
+    this.nodeNamesMemo = { stamp, names: new WeakRef(names) };
+    return names;
+  }
+
+  private readAllNodeNames(): string[] {
     if (!this.stmts.getAllNodeNames) {
       this.stmts.getAllNodeNames = this.db.prepare('SELECT DISTINCT name FROM nodes');
     }
