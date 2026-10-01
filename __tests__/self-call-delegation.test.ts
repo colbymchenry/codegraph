@@ -1,11 +1,13 @@
 /**
  * A method that hands its call on to another object — a wrapper — is not
- * calling itself. TS/JS calls through `this.<field>…` or `window.<x>…` reach
- * the resolver by their bare name, so BookStack's `toggle()` doing
- * `this.container.classList.toggle('open')` and `listen()` doing
- * `window.$events.listen(…)` bound to themselves; a guess from a receiver's
- * name alone (`FileStorage::delete` doing `$storage->delete($path)`) did too.
- * A recursion through a field the class declares as its own type stays.
+ * calling itself. Calls through `this.<field>…` / `window.<x>…` (TS/JS) or
+ * through an expression's value (Scala `requestToArmeria(request).execute()`,
+ * Rust `self.0.into_route(state)`) reach the resolver by their bare name, so
+ * BookStack's `toggle()` doing `this.container.classList.toggle('open')`
+ * bound to itself; a guess from a receiver's name alone (`FileStorage::delete`
+ * doing `$storage->delete($path)`) did too, and a value's initializer chain
+ * (`val response = basicRequest.get(…).response(…)`) to the value. A recursion
+ * through a field the class declares as its own type stays.
  */
 import { describe, it, expect, afterAll, beforeAll } from 'vitest';
 import * as fs from 'fs';
@@ -65,6 +67,30 @@ class ImageStorage
     }
 }
 `,
+    'core/src/main/scala/sttp/ArmeriaBackend.scala': `package sttp
+
+class ArmeriaBackend {
+  def requestToArmeria(request: String): Client = new Client
+
+  def execute(request: String): Unit = {
+    val armeriaRes = requestToArmeria(request).execute()
+  }
+}
+
+class CurlTest {
+  val response = basicRequest
+    .get("http://example.com")
+    .response(asString)
+}
+`,
+    'src/routing/route.rs': `pub struct BoxedIntoRoute(Box<dyn ErasedIntoRoute>);
+
+impl BoxedIntoRoute {
+    pub fn into_route(self, state: u32) -> u32 {
+        self.0.into_route(state)
+    }
+}
+`,
   };
   for (const [rel, content] of Object.entries(files)) {
     fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
@@ -91,6 +117,11 @@ describe('a call a method hands on', () => {
 
   it('through a field of the class’s own type is a recursion', () => {
     expect(selfCallLines('resources/js/tree.ts')).toEqual([5]);
+  });
+
+  it('through another expression’s value is not the method itself', () => {
+    expect(selfCallLines('core/src/main/scala/sttp/ArmeriaBackend.scala')).toEqual([]);
+    expect(selfCallLines('src/routing/route.rs')).toEqual([]);
   });
 
   it('through a receiver named like the caller’s class is not the method itself', () => {

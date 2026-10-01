@@ -1403,31 +1403,35 @@ export const CASE_INSENSITIVE_LANGUAGES = new Set<string>(['php', 'pascal', 'cfm
  * used to pick over the module-scope function the call actually means.
  */
 /**
- * The links between `this` / `super` / `window` and the method of a TS/JS
- * call the extractor recorded by its bare name — `this.container.classList
- * .toggle()` reaches the resolver as `toggle`, with links `container`,
- * `classList`. Null for a call not written that way, `this.toggle()` included.
+ * The receiver a call the extractor recorded by its bare name is written on,
+ * read from the source: TS/JS keeps `this.container.classList.toggle()` and
+ * `window.$events.listen()` bare, Scala `requestToArmeria(request).execute()`
+ * and `_.get.whenRequestMatchesPartial(…)`. `'self'` for `this.m()` /
+ * `self.m()` / `super.m()` / `super().m()`; null for a call written bare (or
+ * not found). `links` are the member names between `this` and the method.
  */
-function collapsedJsChain(ref: UnresolvedRef, context: ResolutionContext): { root: string; links: string[] } | null {
-  if (!JS_FAMILY.has(ref.language) || ref.referenceKind !== 'calls' || !/^[A-Za-z_$][\w$]*$/.test(ref.referenceName)) return null;
+function bareCallReceiver(ref: UnresolvedRef, context: ResolutionContext): { receiver: string; links: string[] } | null {
+  if (ref.referenceKind !== 'calls' || !/^[A-Za-z_$][\w$]*$/.test(ref.referenceName)) return null;
   const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
   if (!lines) return null;
-  const text = lines.slice(ref.line - 1, ref.line + 3).join('\n').slice(ref.column);
+  const text = lines.slice(ref.line - 1, ref.line + 7).join('\n').slice(Math.max(0, ref.column));
   const name = ref.referenceName.replace(/\$/g, '\\$');
-  const m = new RegExp(`^(this|super|window)((?:\\s*\\??\\.\\s*#?[\\w$]+(?:\\([^()]*\\))?)+?)\\s*\\??\\.\\s*${name}\\s*(?:<[^<>()]*>)?\\s*\\(`).exec(text);
-  if (!m) return null;
-  return { root: m[1]!, links: m[2]!.split('.').map((l) => l.replace(/[\s?]/g, '')).filter((l) => l !== '') };
+  const at = new RegExp(`(?<![\\w$])${name}\\s*(?:<[^<>()]*>|\\[(?:[^\\[\\]]|\\[[^\\[\\]]*\\])*\\])?\\s*[({]`).exec(text);
+  if (!at) return null;
+  const before = text.slice(0, at.index).replace(/\s+$/, '');
+  if (!/\??\.$/.test(before)) return null;
+  const head = before.replace(/\??\.$/, '').replace(/\s+$/, '');
+  if (/(?:^|[^\w$.])(?:this|self|super|Self)$/.test(head) || /(?:^|[^\w$.])super\s*\([^()]*\)$/.test(head)) return { receiver: 'self', links: [] };
+  const chain = /(?:^|[^\w$.#])((?:this|super)(?:\s*\??\.\s*#?[\w$]+)+)$/.exec(head);
+  const links = chain ? chain[1]!.split('.').slice(1).map((l) => l.replace(/[\s?]/g, '')) : [];
+  return { receiver: head.slice(-40), links };
 }
 
-/**
- * Whether a collapsed `this.<field>.m()` inside `m` can be `m` itself: only
- * when the class declares the field as its own type — a tree node's
- * `this.left.insert(v)` — never through a field of another type
- * (`this.editor.input.focus()`, `this.container.classList.toggle()`).
- */
+/** Whether a call recorded by its bare name is written on something other than the caller's own object. */
 function isCollapsedNonRecursion(ref: UnresolvedRef, context: ResolutionContext): boolean {
-  const chain = collapsedJsChain(ref, context);
-  return chain !== null && !isCollapsedSelfRecursion(chain, ref, context);
+  const written = bareCallReceiver(ref, context);
+  if (!written || written.receiver === 'self') return false;
+  return !(JS_FAMILY.has(ref.language) && isCollapsedSelfRecursion({ root: 'this', links: written.links }, ref, context));
 }
 
 function isCollapsedSelfRecursion(chain: { root: string; links: string[] }, ref: UnresolvedRef, context: ResolutionContext): boolean {
@@ -8379,11 +8383,19 @@ export function matchReference(
 ): ResolvedRef | null {
   const result = gateLanguageMatch(matchReferenceInner(ref, context), ref, context);
   // `this.container.classList.toggle()` inside `toggle()`, `window.$events
-  // .listen()` inside `listen()`: a member of what the chain reaches, which is
-  // the calling method only through a field of the caller's own type.
+  // .listen()` inside `listen()`, Scala's `requestToArmeria(request).execute()`
+  // inside `execute()`: a member of what the receiver is, which is the calling
+  // method only through a TS/JS field of the caller's own type.
   if (result && result.targetNodeId === ref.fromNodeId && isCollapsedNonRecursion(ref, context)) return null;
+  // Nor does a value's initializer call the value: sttp's `val response =
+  // basicRequest.get(…).response(asStringAlways)` is a request's `response`.
+  if (result && result.targetNodeId === ref.fromNodeId && ref.referenceKind === 'calls' &&
+      VALUE_KINDS.has(context.getNodeById?.(ref.fromNodeId)?.kind ?? '')) return null;
   return result ? retargetSelfOverload(result, ref, context) : result;
 }
+
+/** Node kinds that hold a value rather than run code. */
+const VALUE_KINDS: ReadonlySet<string> = new Set(['variable', 'constant', 'field', 'property']);
 
 /** Languages whose methods overload by arity. */
 const OVERLOADING_LANGUAGES: ReadonlySet<string> = new Set(['csharp', 'java', 'kotlin', 'swift', 'cpp', 'scala', 'dart', 'vbnet']);
