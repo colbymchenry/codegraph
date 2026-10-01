@@ -73,6 +73,9 @@ fixtureSuite('scip-rust', 'rust', (edge) => {
   expect(edge('shapes', 'Shape::Square', 'instantiates')?.provenance).toBe('scip'); // a struct-like variant literal
   expect(edge('wrapped', 'Maybe::Some')).toBeUndefined(); // std's Some, not the project's
   expect(edge('chained', 'Invoice::total_price')).toMatchObject({ line: 56, provenance: 'scip' }); // keyed where the chain starts, once
+  // rust-analyzer emits no relationships: `impl Pricer for Invoice {` itself is the edge, at the header's line.
+  expect(edge('Invoice', 'Pricer', 'implements')).toMatchObject({ line: 15, provenance: 'scip' });
+  expect(edge('Order', 'Pricer', 'implements')).toMatchObject({ line: 23, provenance: 'scip' });
 });
 
 describe('literal call shapes', () => {
@@ -297,5 +300,23 @@ describe('go / rust adapters', () => {
     } finally {
       process.env.PATH = savedPath;
     }
+  });
+});
+
+describe('Rust impl headers', () => {
+  // [trait text, implementing type text] as the merge reads them, or null
+  const read = (line: string) => {
+    const h = INDEXERS.rust.implHeader!(line);
+    return h && [line.slice(h.traitFrom, h.selfFrom - 3).trim(), line.slice(h.selfFrom).trim()];
+  };
+
+  it('names the trait after the impl generics and the type after `for`; an inherent impl is no header', () => {
+    expect(read('impl Pricer for Invoice {')).toEqual(['Pricer', 'Invoice {']);
+    expect(read('impl<T: Display> From<T> for Wrapper<T> {')).toEqual(['From<T>', 'Wrapper<T> {']);
+    expect(read("    impl<'a> Iterator for Parents<'a> {")).toEqual(['Iterator', "Parents<'a> {"]);
+    expect(read('unsafe impl Send for Handle {}')).toEqual(['Send', 'Handle {}']);
+    expect(read('impl fmt::Display for Error {')).toEqual(['fmt::Display', 'Error {']);
+    expect(read('impl Invoice {')).toBeNull();
+    expect(read('let x = impl_for(y);')).toBeNull();
   });
 });

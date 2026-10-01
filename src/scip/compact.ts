@@ -41,7 +41,7 @@ export class Compactor {
 
   /** Adds one indexer output. A file already added (overlapping projects) keeps its first document. */
   add(index: Buffer): void {
-    const literal = INDEXERS[this.lang].literalShape;
+    const { literalShape: literal, implHeader } = INDEXERS[this.lang];
     const meta = scanIndex(index, doc => {
       if (this.seen.has(doc.relativePath)) return;
       this.seen.add(doc.relativePath);
@@ -65,6 +65,10 @@ export class Compactor {
           continue;
         }
         if (!lines) continue; // unreadable now: the merge would treat the file as stale anyway
+        if (kind === 'type' && implHeader?.(lines[o.range.startLine] ?? '')) { // `impl Trait for Type`: see sites.ts
+          kept.push(o);
+          continue;
+        }
         if (!siteKind(kind, () => callShape(o, doc.positionEncoding, lines, literal))) continue;
         kept.push(o);
         this.callRefs.set(o.symbol, (this.callRefs.get(o.symbol) ?? 0) + 1);

@@ -19,7 +19,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { PROJECT_CONFIG_FILENAME } from '../../project-config';
 import type { ScipLanguage } from '../store';
-import type { LiteralShape } from '../syntax';
+import type { ImplHeader, LiteralShape } from '../syntax';
 import { goIndexer } from './go';
 import { pythonIndexer } from './python';
 import { rustIndexer } from './rust';
@@ -98,6 +98,8 @@ export interface IndexerSpec {
    * starts on, where codegraph puts it (Rust, as rustfmt lays chains out).
    */
   chainCallsAtStart?: boolean;
+  /** `impl Trait for Type` headers, judged as the type's `implements` edge (see syntax.ts ImplHeader) */
+  implHeader?: ImplHeader;
   /**
    * Patching an installed index instead of rebuilding it (produce.ts patchIndex),
    * per tool that wrote it: its symbols must be named the same whatever else was

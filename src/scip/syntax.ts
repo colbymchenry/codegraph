@@ -13,6 +13,14 @@ export type LiteralShape = (tail: string, head: string) => boolean;
 export type CallShape = 'call' | 'new' | 'literal';
 
 /**
+ * Where a trait implementation's header names the trait and the implementing
+ * type (string offsets in the line), or null when the line is no such header.
+ * For indexers that emit no implementation relationships (rust-analyzer): the
+ * header's own references stand in for them.
+ */
+export type ImplHeader = (line: string) => { traitFrom: number; selfFrom: number } | null;
+
+/**
  * What a site is about: a call, an instantiation, (`inherits`) a type's
  * `implements`/`extends` edge — one key kind for both, since codegraph and the
  * compiler may label the same base differently (`class A implements B` with B a class)
@@ -39,6 +47,23 @@ export function siteKind(kind: DescriptorKind | undefined, shape: () => CallShap
   return null;
 }
 
+/**
+ * A trait implementation header's two types among `refs`, the type references on
+ * its line (any order): the trait is the first after the impl's generics and before
+ * `for`, the implementing type the first after `for`. Null when either is missing.
+ */
+export function implTypes<T extends ScipOccurrence>(
+  header: ImplHeader, line: string, encoding: number, refs: readonly T[]
+): { trait: T; self: T } | null {
+  const h = header(line);
+  if (!h) return null;
+  const at = (o: T) => toStringOffset(line, o.range.startCol, encoding);
+  const sorted = [...refs].sort((a, b) => a.range.startCol - b.range.startCol);
+  const trait = sorted.find(o => at(o) >= h.traitFrom && at(o) < h.selfFrom);
+  const self = sorted.find(o => at(o) >= h.selfFrom);
+  return trait && self ? { trait, self } : null;
+}
+
 /** Strips one balanced `open…close` group (type arguments) from the start of `t`; null when it never closes. */
 export function skipGroup(t: string, open: string, close: string): string | null {
   if (!t.startsWith(open)) return t;
@@ -58,7 +83,7 @@ export function looksLikeCall(tail: string): boolean {
 }
 
 /** Maps a SCIP column to a JS string offset in `line`. */
-function toStringOffset(line: string, col: number, encoding: number): number {
+export function toStringOffset(line: string, col: number, encoding: number): number {
   if (encoding !== POSITION_ENCODING_UTF8 || /^[\x00-\x7f]*$/.test(line)) return col;
   return Buffer.from(line, 'utf8').subarray(0, col).toString('utf8').length;
 }

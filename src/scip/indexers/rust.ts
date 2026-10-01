@@ -22,6 +22,16 @@ export const rustIndexer: IndexerSpec = {
   probe: ['--version'],
   variantCalls: true,
   chainCallsAtStart: true,
+  // `impl<…> path::Trait<…> for Type<…> {` on one line; an inherent `impl Type {` has no `for`.
+  implHeader: line => {
+    const m = /^\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?impl\b\s*/.exec(line);
+    if (!m) return null;
+    const rest = skipGroup(line.slice(m[0].length), '<', '>'); // the impl's own generics
+    if (rest === null) return null;
+    const traitFrom = line.length - rest.length;
+    const f = /\bfor\b/.exec(rest);
+    return f ? { traitFrom, selfFrom: traitFrom + f.index + 3 } : null;
+  },
   invocation: (root, outFile) => {
     const dirs = workspaces(root);
     return {

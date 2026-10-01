@@ -12,7 +12,7 @@ import type { SqliteDatabase } from '../db/sqlite-adapter';
 import { INDEXERS } from './indexers';
 import { ParsedSymbol, ROLE_DEFINITION, ScipDocument, ScipOccurrence, parseSymbol } from './reader';
 import type { ScipLanguage } from './store';
-import { CallShape, LiteralShape, SiteKind, callShape, isCallTarget, siteKind } from './syntax';
+import { CallShape, LiteralShape, SiteKind, callShape, implTypes, isCallTarget, siteKind } from './syntax';
 
 export type { SiteKind } from './syntax';
 
@@ -32,7 +32,7 @@ const TYPE_KINDS: readonly string[] = ['class', 'struct', 'interface', 'trait'];
 const NESTED_TYPE_KINDS: readonly string[] = [...TYPE_KINDS, 'enum_member'];
 const INTERFACE_KINDS: readonly string[] = ['interface', 'trait'];
 /** What a `references` edge may point at, by SCIP descriptor: a type (also an alias or enum), a member, a value. */
-const REFERENCED_TYPE_KINDS: readonly string[] = [...TYPE_KINDS, 'type_alias', 'enum'];
+const REFERENCED_TYPE_KINDS: readonly string[] = [...TYPE_KINDS, 'type_alias', 'enum', 'union'];
 
 /** codegraph's label for a type → base edge: a class/struct implements an interface/trait, anything else extends. */
 export function inheritanceKind(sourceKind: string, targetKind: string): 'implements' | 'extends' {
@@ -118,7 +118,7 @@ export interface ScipSites {
 }
 
 interface NodeRow {
-  id: string; kind: string; name: string; qualified_name: string;
+  id: string; kind: string; name: string; qualified_name: string; file_path: string;
   start_line: number; end_line: number; start_column: number; end_column: number;
 }
 
@@ -151,7 +151,7 @@ class FileNodes {
     const rows = db.prepare(
       `SELECT id, kind, name, qualified_name, file_path, start_line, end_line, start_column, end_column FROM nodes
        WHERE kind IN (${kinds.map(() => '?').join(',')})`
-    ).all(...kinds) as Array<NodeRow & { file_path: string }>;
+    ).all(...kinds) as NodeRow[];
     for (const r of rows) {
       if (!files.has(r.file_path)) continue;
       let f = this.byFile.get(r.file_path);
@@ -242,7 +242,7 @@ export function scipSites(
   const bump = (k: string) => { stats[k] = (stats[k] ?? 0) + 1; };
   const nodes = new FileNodes(db, new Set(fresh.keys()));
   const symToNode = new Map<string, NodeRow>();
-  /** symbol → the node a reference to it points at: like symToNode, over the kinds a `references` edge targets */
+  /** symbol → the node a reference to it points at: like symToNode, over the kinds a `references` edge (or an `impl` header) names */
   const refToNode = new Map<string, NodeRow>();
   const projectSymbols = new Set<string>();
   const ambiguous = new Set<string>();
@@ -266,7 +266,7 @@ export function scipSites(
         const { name, kind } = parsed.last;
         if (!known || !isCallTarget(kind)) continue;
         const nested = kind === 'type' && parse(parsed.owner)?.last.kind === 'type';
-        if (refs && !refToNode.has(o.symbol)) {
+        if (!refToNode.has(o.symbol)) {
           const kinds = kind === 'type' ? (nested ? [...REFERENCED_TYPE_KINDS, 'enum_member'] : REFERENCED_TYPE_KINDS)
             : kind === 'method' ? REFERENCED_METHOD_KINDS : REFERENCED_VALUE_KINDS;
           const target = nodes.definition(doc.relativePath, o.range.startLine, name, kinds);
@@ -358,10 +358,34 @@ export function scipSites(
 
   // Pass 2: references that are calls, keyed by the caller codegraph would name.
   for (const { lang, docs } of indexes) {
-    const { literalShape: literal, variantCalls = false, chainCallsAtStart = false } = INDEXERS[lang];
+    const { literalShape: literal, variantCalls = false, chainCallsAtStart = false, implHeader } = INDEXERS[lang];
     for (const doc of docs) {
       const lines = fresh.get(doc.relativePath);
       if (!lines || (judged && !judged.has(doc.relativePath))) continue;
+      if (implHeader) {
+        // `impl Trait for Type` with no relationship in the index (rust-analyzer emits none): the
+        // header's references are the type's `implements` edge — keyed like codegraph's, from the
+        // type to the trait at the header's line, and only for a type declared in this file (the
+        // only one codegraph links). A generic `impl<T> Trait for T` names no type node.
+        const byLine = new Map<number, ScipOccurrence[]>();
+        for (const o of doc.occurrences) {
+          if (o.roles & ROLE_DEFINITION || parse(o.symbol)?.last.kind !== 'type') continue;
+          const list = byLine.get(o.range.startLine);
+          if (list) list.push(o);
+          else byLine.set(o.range.startLine, [o]);
+        }
+        for (const [line, refsHere] of byLine) {
+          const pair = implTypes(implHeader, lines[line] ?? '', doc.positionEncoding, refsHere);
+          const src = pair && refToNode.get(pair.self.symbol);
+          if (!pair || !src || src.file_path !== doc.relativePath) continue;
+          const base = refToNode.get(pair.trait.symbol);
+          const key = siteKey(src.id, line + 1, base?.name ?? parse(pair.trait.symbol)!.last.name, 'inherits');
+          if (base) addTarget(sites, key, base.id, pair.trait.range.startCol, inheritanceKind(src.kind, base.kind));
+          else if (projectSymbols.has(pair.trait.symbol)) unknown.add(key);
+          else addTarget(sites, key, EXTERNAL, pair.trait.range.startCol);
+          bump(base ? 'impl_resolved' : 'impl_unresolved');
+        }
+      }
       for (const occurrence of doc.occurrences) {
         if (occurrence.roles & ROLE_DEFINITION) continue;
         const symbol = defined(occurrence.symbol);

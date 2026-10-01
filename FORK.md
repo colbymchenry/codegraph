@@ -139,7 +139,7 @@ Differences from the POC:
 
 ### Types and calls through interfaces
 
-Indexers record implementation relationships: class → base class or interface, and method → the method it implements or overrides. scip-typescript, scip-python and scip-go emit them, and tsgo-index computes them from heritage clauses, following inherited members through base types. rust-analyzer emits none, so Rust gets neither of the uses below.
+Indexers record implementation relationships: class → base class or interface, and method → the method it implements or overrides. scip-typescript, scip-python and scip-go emit them, and tsgo-index computes them from heritage clauses, following inherited members through base types. rust-analyzer emits none. For Rust, the `impl Trait for Type {` header stands in: its own references name the trait (the first type after the impl's generics) and the implementing type (the first after `for`), and the edge is judged where codegraph keys it, from the type to the trait at the header's line, for a type declared in the same file. A generic `impl<T> Trait for T` names no type node and stays unverified. Calls through a trait still get no dispatch verification (no method → method relationships).
 
 - **`implements` / `extends` edges** are judged like call sites. They are keyed at the type's own line (where codegraph puts them) under one kind, `inherits`, since codegraph and the compiler may label the same base differently. The inserted kind comes from the node kinds: a class/struct → interface/trait `implements`, anything else `extends`. codegraph's own synthesized Go `implements` edges are left alone and not duplicated. In tsgo-index a type symbol is named after its class/interface declaration, not a value merged into it. Otherwise vscode's `const IFoo = createDecorator<IFoo>()` beside `interface IFoo` would leave most of its `implements` edges unjudged.
 - **Calls through an interface that has no node.** An example is the target declared in a file over codegraph's size limit, such as Playwright's generated `types.d.ts`. A heuristic edge to a method that (transitively) implements the compiler's target is verified with `metadata.scipDispatch`, and MCP reads it as *compiler-verified, through the interface it implements*. A same-named method that doesn't implement it stays unverified. Nothing is deleted on the strength of an implementation set, since structural typing makes such sets incomplete. When the interface method *does* have a node, the compiler's caller → interface edge still wins, as before.
@@ -149,6 +149,7 @@ Indexers record implementation relationships: class → base class or interface,
 | Playwright | 164 / 337 | 16 | 15,130 | 29,629 → 14,682 |
 | vscode | 5,875 / 10,293 | 146 / 104 | 779 | 100,429 → 99,770 |
 | Django | – / 8,229 | – / 933 | 44 | |
+| ripgrep (from `impl` headers) | 125 / – | 0 | – | |
 
 The eval gates are unchanged on all four languages.
 
@@ -292,5 +293,5 @@ Known residue: ripgrep's multi-line `const X: T = T { … }` items. codegraph at
 - Phase 3 (Go) and Phase 4 (Rust): done.
 - TS/JS via tsgo (TypeScript ≥ 7.1): done; preferred over scip-typescript when installed.
 - Incremental reindex for tsgo and scip-python indexes: done.
-- Phase 5: `implements`/`extends` and calls through interfaces from SCIP relationships: done (Rust excluded: rust-analyzer emits no relationships). `references` edges: verified or deleted at their own site (see "`references` edges").
+- Phase 5: `implements`/`extends` and calls through interfaces from SCIP relationships: done (Rust: `implements` from `impl` headers; no dispatch, since rust-analyzer emits no relationships). `references` edges: verified or deleted at their own site (see "`references` edges").
 - Next: [`docs/scip-roadmap.md`](docs/scip-roadmap.md).
