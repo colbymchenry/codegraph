@@ -174,3 +174,52 @@ describe('codegraph_explore — interface members never corroborate a bare word'
     expect(files[0]).toBe('src/extensionHostProcess.ts');
   });
 });
+
+describe('codegraph_explore — precise-before-plain file tier', () => {
+  let testDir: string;
+  let cg: CodeGraph;
+
+  afterEach(() => {
+    cg?.destroy();
+    if (testDir && fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('a file tied to the exactly-named symbol outranks files that match only a plain query word', async () => {
+    // `WorkspaceMyLinkView appearance section myLinkBrandingLocked` rendered the
+    // view first and then filled the budget with a PHP layout class that matched
+    // only "section", ahead of everything wired to `myLinkBrandingLocked`.
+    testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-precise-first-'));
+    const profile = path.join(testDir, 'src', 'profile');
+    const layout = path.join(testDir, 'src', 'layout');
+    fs.mkdirSync(profile, { recursive: true });
+    fs.mkdirSync(layout, { recursive: true });
+    fs.writeFileSync(path.join(profile, 'branding.ts'),
+      'export function myLinkBrandingLocked(plan: string): boolean {\n' +
+      "  return plan !== 'pro';\n" +
+      '}\n');
+    fs.writeFileSync(path.join(profile, 'panel.ts'),
+      "import { myLinkBrandingLocked } from './branding';\n" +
+      'export function drawOwnDomainPanel(plan: string): string {\n' +
+      "  return myLinkBrandingLocked(plan) ? 'upgrade' : 'edit';\n" +
+      '}\n');
+    // A dense mesh of `section` symbols: FTS roots for the plain word "section".
+    fs.writeFileSync(path.join(layout, 'sections.ts'),
+      'export function section(name: string): string {\n  return renderSection(name);\n}\n' +
+      'export function renderSection(name: string): string {\n  return sectionHeader(name) + sectionBody(name);\n}\n' +
+      'export function sectionHeader(name: string): string {\n  return `<h2>${name}</h2>`;\n}\n' +
+      'export function sectionBody(name: string): string {\n  return section.name + name;\n}\n' +
+      'export function sectionList(names: string[]): string {\n  return names.map(section).join("");\n}\n');
+    cg = CodeGraph.initSync(testDir);
+    await cg.indexAll();
+
+    const res = await new ToolHandler(cg).execute('codegraph_explore', {
+      query: 'myLinkBrandingLocked appearance section',
+    });
+    const files = sourcedFiles(res.content[0].text as string);
+    const panel = files.indexOf('src/profile/panel.ts');
+    const sections = files.indexOf('src/layout/sections.ts');
+    expect(files[0]).toBe('src/profile/branding.ts');
+    expect(panel).toBeGreaterThan(0);
+    if (sections !== -1) expect(panel).toBeLessThan(sections);
+  });
+});
