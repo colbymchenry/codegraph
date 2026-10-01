@@ -14,7 +14,7 @@ import type { FileLock } from '../utils';
 import { describe } from './cli';
 import { runScipPass } from './index';
 import { StartedIndex, startIndex } from './produce';
-import { pendingReferenceSites } from './sites';
+import { pendingReferenceSites, referenceSites } from './sites';
 import { SCIP_LANGUAGES, tryReindexLock } from './store';
 
 export interface FirstIndexMessage { level: 'info' | 'success' | 'warn'; message: string }
@@ -52,8 +52,9 @@ export function firstIndexScip(cg: CodeGraph): FirstIndexScip {
     async finish() {
       try {
         let installed = 0;
+        const refs = started.length ? referenceSites(cg.scipReadDb()) : new Map(); // resolved now: what compaction keeps
         for (const s of started) {
-          const r = await s.finish(cg.scipReadDb());
+          const r = await s.finish(refs);
           if (r.status === 'installed') {
             installed++;
             messages.push({ level: 'success', message: `${r.lang}: ${r.documents} documents, ${r.resolvedCalls} resolved calls in ${(r.durationMs / 1000).toFixed(1)}s` });

@@ -50,7 +50,7 @@ const LOCKFILES: ReadonlyArray<readonly [string, string]> = [
  * types, so calls into them read as unknown and some project calls on their
  * values go unresolved. Worth a warning that says how to fix it.
  */
-export function missingDependencies(root: string): string | undefined {
+function missingDependencies(root: string): string | undefined {
   const lock = LOCKFILES.find(([f]) => has(root, f));
   if (!lock || has(root, 'node_modules')) return undefined;
   return `${lock[0]} but no node_modules — calls into dependencies won't resolve; run \`${lock[1]}\` and reindex`;

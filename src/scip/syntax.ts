@@ -52,12 +52,12 @@ export function siteKind(kind: DescriptorKind | undefined, shape: () => CallShap
  * its line (any order): the trait is the first after the impl's generics and before
  * `for`, the implementing type the first after `for`. Null when either is missing.
  */
-export function implTypes<T extends ScipOccurrence>(
-  header: ImplHeader, line: string, encoding: number, refs: readonly T[]
-): { trait: T; self: T } | null {
+export function implTypes(
+  header: ImplHeader, line: string, encoding: number, refs: readonly ScipOccurrence[]
+): { trait: ScipOccurrence; self: ScipOccurrence } | null {
   const h = header(line);
   if (!h) return null;
-  const at = (o: T) => toStringOffset(line, o.range.startCol, encoding);
+  const at = (o: ScipOccurrence) => toStringOffset(line, o.range.startCol, encoding);
   const sorted = [...refs].sort((a, b) => a.range.startCol - b.range.startCol);
   const trait = sorted.find(o => at(o) >= h.traitFrom && at(o) < h.selfFrom);
   const self = sorted.find(o => at(o) >= h.selfFrom);
@@ -83,7 +83,7 @@ export function looksLikeCall(tail: string): boolean {
 }
 
 /** Maps a SCIP column to a JS string offset in `line`. */
-export function toStringOffset(line: string, col: number, encoding: number): number {
+function toStringOffset(line: string, col: number, encoding: number): number {
   if (encoding !== POSITION_ENCODING_UTF8 || /^[\x00-\x7f]*$/.test(line)) return col;
   return Buffer.from(line, 'utf8').subarray(0, col).toString('utf8').length;
 }

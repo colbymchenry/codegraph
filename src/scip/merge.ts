@@ -20,7 +20,7 @@
  */
 
 import type { SqliteDatabase } from '../db/sqlite-adapter';
-import { EXTERNAL, HeuristicSites, ScipSites, edgeSiteKey, parseSiteKey } from './sites';
+import { EXTERNAL, HeuristicSites, ScipSites, bySource, edgeSiteKey, parseSiteKey } from './sites';
 
 export interface MergeOutcome {
   agree: number;
@@ -71,15 +71,6 @@ function byIds(db: SqliteDatabase, sqlPrefix: string, ids: number[]): number {
     changed += db.prepare(`${sqlPrefix} (${chunk.map(() => '?').join(',')})`).run(...chunk).changes;
   }
   return changed;
-}
-
-/**
- * Rows of `sql` (which joins the edge's source as `s` and ends in a WHERE clause),
- * for sources in `files` — one indexed query per file.
- */
-function bySource<T>(db: SqliteDatabase, sql: string, files: Set<string>): T[] {
-  const stmt = db.prepare(`${sql} AND s.file_path = ?`);
-  return [...files].flatMap(f => stmt.all(f) as T[]);
 }
 
 /** `judged`: only sites whose caller is in these files are re-judged (a chunk of files, a patch's); edges elsewhere stay as they are. */

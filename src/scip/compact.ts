@@ -23,7 +23,7 @@ import { pathToFileURL } from 'url';
 import { INDEXERS } from './indexers';
 import { IndexMeta, ParsedSymbol, ROLE_DEFINITION, ScipOccurrence, encodeDocument, encodeMetadata, parseSymbol, scanIndex } from './reader';
 import type { ScipLanguage } from './store';
-import { referenceKey } from './sites';
+import type { ReferenceSites } from './sites';
 import { callShape, isCallTarget, siteKind } from './syntax';
 
 export class Compactor {
@@ -37,7 +37,7 @@ export class Compactor {
   private symbols = new Map<string, Buffer>();
   private chunks: Buffer[] = [];
 
-  constructor(private readonly projectRoot: string, private readonly lang: ScipLanguage, private readonly refs?: Set<string>) {}
+  constructor(private readonly projectRoot: string, private readonly lang: ScipLanguage, private readonly refs: ReferenceSites = new Map()) {}
 
   /** Adds one indexer output. A file already added (overlapping projects) keeps its first document. */
   add(index: Buffer): void {
@@ -47,10 +47,10 @@ export class Compactor {
       this.seen.add(doc.relativePath);
       const lines = readLines(path.join(this.projectRoot, doc.relativePath));
       const kept: ScipOccurrence[] = [];
+      const fileRefs = this.refs.get(doc.relativePath);
       for (const o of doc.occurrences) {
         const parsed = this.parse(o.symbol); // null for locals
-        if (this.refs && parsed && !(o.roles & ROLE_DEFINITION)
-          && this.refs.has(referenceKey(doc.relativePath, o.range.startLine + 1, parsed.last.name))) {
+        if (parsed && !(o.roles & ROLE_DEFINITION) && fileRefs?.get(o.range.startLine + 1)?.has(parsed.last.name)) {
           kept.push(o); // judged as a reference whatever its shape; counted below if it is also a call
           if (isCallTarget(parsed.last.kind) && lines && siteKind(parsed.last.kind, () => callShape(o, doc.positionEncoding, lines, literal))) {
             this.callRefs.set(o.symbol, (this.callRefs.get(o.symbol) ?? 0) + 1);

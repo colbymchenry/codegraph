@@ -34,7 +34,6 @@ if (!args[0] || judges.length === 0 || graphs.length === 0) {
   process.exit(2);
 }
 
-interface NodeSpan { id: string; start_line: number; end_line: number }
 /** Judge definitions and references, independent of any graph. */
 const definedAt = new Map<string, { file: string; line: number }>(); // symbol → first definition (1-based line)
 const refs = new Map<string, Array<{ name: string; symbol: string }>>(); // file\0line → references
@@ -62,17 +61,15 @@ for (const j of judges) {
 const rows = graphs.map(([name, file]) => {
   const db = new DatabaseSync(file, { readOnly: true });
   // The node a judge symbol is defined in: same file and name, narrowest span around its definition.
-  const byName = db.prepare('SELECT id, start_line, end_line FROM nodes WHERE file_path = ? AND name = ?');
+  const narrowest = db.prepare(`SELECT id FROM nodes WHERE file_path = ? AND name = ?
+    AND start_line <= ? AND end_line >= ? ORDER BY end_line - start_line LIMIT 1`);
   const nodeOf = new Map<string, string | null>();
   const node = (symbol: string, name: string) => {
     let id = nodeOf.get(symbol);
     if (id === undefined) {
       const at = definedAt.get(symbol);
-      let best: NodeSpan | null = null;
-      for (const n of at ? (byName.all(at.file, name) as unknown as NodeSpan[]) : []) {
-        if (n.start_line <= at!.line && n.end_line >= at!.line && (!best || n.end_line - n.start_line < best.end_line - best.start_line)) best = n;
-      }
-      nodeOf.set(symbol, (id = best?.id ?? null));
+      const row = at && (narrowest.get(at.file, name, at.line, at.line) as { id: string } | undefined);
+      nodeOf.set(symbol, (id = row ? row.id : null));
     }
     return id;
   };

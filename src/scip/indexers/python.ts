@@ -28,7 +28,7 @@ const VENV_SETUP: ReadonlyArray<readonly [string, string]> = [
 ];
 
 /** The no-venv warning, with how to create one when the project says what it needs. */
-export function missingVenv(root: string): string {
+function missingVenv(root: string): string {
   const setup = VENV_SETUP.find(([f]) => fs.existsSync(path.join(root, f)));
   return `no ${VENV_DIRS.join(' or ')} with pyvenv.cfg — indexing without third-party packages (calls into dependencies won't resolve)` +
     (setup ? `; ${setup[0]} found: run \`${setup[1]}\` and reindex` : '');

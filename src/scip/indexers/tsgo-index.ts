@@ -8,7 +8,7 @@
  * It writes exactly what the merge reads (see compact.ts) and nothing more: a
  * reference at the callee name of every call and `new` in a project file, and
  * the definition of every callee the project declares — plus, at the sites
- * `--refs` lists (codegraph's `references` edges: path, line, name), a reference
+ * `--refs` lists (the lines of codegraph's `references` edges: path, line), a reference
  * for every identifier on that line — whatever its text, since an import alias
  * (`Node as SyntaxNode`) names its target differently — which the merge judges
  * those edges by. A symbol is named after
@@ -610,7 +610,7 @@ if (require.main === module) {
   const refsList = refsAt >= 0 ? args.splice(refsAt, 2)[1] : undefined;
   const [tsDir, output, root, ...configs] = args;
   if (!tsDir || !output || !root || (onlyAt >= 0 && !onlyList) || (refsAt >= 0 && !refsList)) {
-    process.stderr.write('usage: tsgo-index <typescript package dir> <output> <root> [--only <file with one path per line>] [--refs <file with path<TAB>line<TAB>name lines>] [<tsconfig>...]\n');
+    process.stderr.write('usage: tsgo-index <typescript package dir> <output> <root> [--only <file with one path per line>] [--refs <file with path<TAB>line lines>] [<tsconfig>...]\n');
     process.exit(2);
   }
   const only = onlyList ? new Set(fs.readFileSync(onlyList, 'utf8').split('\n').filter(Boolean)) : undefined;

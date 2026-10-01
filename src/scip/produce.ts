@@ -23,7 +23,7 @@ import * as path from 'path';
 import type { SqliteDatabase } from '../db/sqlite-adapter';
 import type { MergeScope } from './index';
 import { Compactor } from './compact';
-import { parseSiteKey, referenceSites } from './sites';
+import { ReferenceSites, referenceSites } from './sites';
 import { INDEXERS, IndexerRun, RUN_WARNING, ResolvedIndexer, resolveIndexer } from './indexers';
 import {
   ROLE_DEFINITION, ScipDecodeError, ScipDocument, decodeScipIndex, encodeDocument, encodeMetadata, loadScipIndex,
@@ -124,15 +124,15 @@ export async function produceIndex(
     const patched = await patchIndex(db, projectRoot, lang, prepared.indexer, prepared.raw, opts, refs);
     if (patched) return patched;
   }
-  return fullRun(db, projectRoot, lang, prepared, refs, opts).finish(db);
+  return fullRun(db, projectRoot, lang, prepared, refs, opts).finish(refs);
 }
 
 /** A full run whose indexer runs are under way; `finish` compacts and installs their output. */
 export interface StartedIndex {
   /** settles when the runs are done (whatever their outcome): the next language's runs may start */
   ran: Promise<void>;
-  /** compacts against the graph's references as they are now, installs, and cleans up — call it exactly once */
-  finish(db: SqliteDatabase): Promise<ProduceResult>;
+  /** compacts against `refs`, the graph's reference sites as they are now (resolved), installs, and cleans up — call it exactly once */
+  finish(refs: ReferenceSites): Promise<ProduceResult>;
 }
 
 /**
@@ -144,7 +144,7 @@ export interface StartedIndex {
  * A language with nothing to run finishes as its skip, once `after` settles.
  */
 export function startIndex(
-  db: SqliteDatabase, projectRoot: string, lang: ScipLanguage, refs: Set<string>, opts: StartOptions = {}
+  db: SqliteDatabase, projectRoot: string, lang: ScipLanguage, refs: ReferenceSites, opts: StartOptions = {}
 ): StartedIndex {
   const prepared = prepare(projectRoot, lang);
   if (!('status' in prepared)) return fullRun(db, projectRoot, lang, prepared, refs, opts);
@@ -166,7 +166,7 @@ function prepare(projectRoot: string, lang: ScipLanguage): Prepared | ProduceRes
 
 /** Starts the full run's indexer now (once `after` settles); see StartedIndex. `refs`: what the runs read (Invocation.referenceSites). */
 function fullRun(
-  db: SqliteDatabase, projectRoot: string, lang: ScipLanguage, { final, indexer }: Prepared, refs: Set<string>, opts: StartOptions
+  db: SqliteDatabase, projectRoot: string, lang: ScipLanguage, { final, indexer }: Prepared, refs: ReferenceSites, opts: StartOptions
 ): StartedIndex {
   const started = Date.now();
   const hashes = snapshotHashes(db, projectRoot, INDEXERS[lang].codegraphLanguages);
@@ -220,7 +220,7 @@ function fullRun(
     }
   })();
 
-  const finish = async (db: SqliteDatabase): Promise<ProduceResult> => {
+  const finish = async (compactRefs: ReferenceSites): Promise<ProduceResult> => {
     try {
       await ran;
       const compactStart = Date.now();
@@ -232,7 +232,7 @@ function fullRun(
       for (const f of failures) warnings.push(`${f} — its files stay heuristic-only`);
 
       // Compact while combining: one part in memory at a time (see compact.ts).
-      const compact = new Compactor(projectRoot, lang, referenceSites(db));
+      const compact = new Compactor(projectRoot, lang, compactRefs);
       try {
         for (const p of parts) compact.add(fs.readFileSync(p));
       } catch (err) {
@@ -269,7 +269,7 @@ function fullRun(
  */
 async function patchIndex(
   db: SqliteDatabase, projectRoot: string, lang: ScipLanguage, indexer: ResolvedIndexer, raw: string, opts: ProduceOptions,
-  refs: Set<string>
+  refs: ReferenceSites
 ): Promise<ProduceResult | null> {
   const final = indexPath(projectRoot, lang);
   const previous = readMeta(projectRoot, lang);
@@ -365,10 +365,10 @@ async function patchIndex(
   }
 }
 
-/** The reference sites as tsgo-index's `--refs` list: `path<TAB>line<TAB>name` per line (1-based lines). */
-function writeReferenceSites(file: string, refs: Set<string>): void {
+/** The reference sites as tsgo-index's `--refs` list: `path<TAB>line` per line (1-based lines). */
+function writeReferenceSites(file: string, refs: ReferenceSites): void {
   const out: string[] = [];
-  for (const k of refs) { const { source, line, name } = parseSiteKey(k); out.push(`${source}\t${line}\t${name}`); }
+  for (const [p, lines] of refs) for (const line of lines.keys()) out.push(`${p}\t${line}`);
   fs.writeFileSync(file, out.join('\n'));
 }
 

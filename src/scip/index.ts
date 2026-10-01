@@ -19,7 +19,7 @@ import { Compactor } from './compact';
 import { languageOfTool } from './indexers';
 import { MergeOutcome, addOutcome, emptyOutcome, markStaleForFiles, merge } from './merge';
 import { ROLE_DEFINITION, ScipDocument, loadScipIndex, scanIndex } from './reader';
-import { heuristicSites, referenceSites, scipDefinitions, scipSites } from './sites';
+import { ReferenceSites, heuristicSites, referenceSites, scipDefinitions, scipSites } from './sites';
 import {
   MergedDocument, ScipLanguage, SCIP_LANGUAGES, availableIndexes, indexPath,
   indexedHashes, installIndex, mergedDocumentCounts, readHashed, recordMergedDocuments,
@@ -237,7 +237,7 @@ export function onSynced(db: SqliteDatabase, projectRoot: string, changedFiles: 
  * edited and reverted before the import still counts — its bytes match.
  */
 export function importScipFile(
-  projectRoot: string, file: string, lang?: ScipLanguage, refs?: Set<string>
+  projectRoot: string, file: string, lang?: ScipLanguage, refs?: ReferenceSites
 ): { lang: ScipLanguage; documents: number; newerThanIndex: string[] } {
   const builtAt = fs.statSync(file).mtimeMs;
   const bytes = fs.readFileSync(file);

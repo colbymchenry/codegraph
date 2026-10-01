@@ -71,20 +71,30 @@ export function referenceKey(file: string, line: number, name: string): string {
   return siteKey(file, line, name, 'references');
 }
 
+/** codegraph's `references` sites: file → 1-based line → the names referenced there. */
+export type ReferenceSites = Map<string, Map<number, Set<string>>>;
+
+function toReferenceSites(rows: unknown[]): ReferenceSites {
+  const out: ReferenceSites = new Map();
+  for (const { file, line, name } of rows as { file: string; line: number; name: string }[]) {
+    let lines = out.get(file);
+    if (!lines) out.set(file, (lines = new Map()));
+    let names = lines.get(line);
+    if (!names) lines.set(line, (names = new Set()));
+    names.add(name);
+  }
+  return out;
+}
+
 /**
  * The sites of codegraph's `references` edges (any provenance) in `files`, or
  * everywhere: what compaction keeps references for, what tsgo-index resolves
- * (`--refs`), and what the merge judges. Keyed by referenceKey.
+ * (`--refs`), and what the merge judges.
  */
-export function referenceSites(db: SqliteDatabase, files?: Iterable<string>): Set<string> {
+export function referenceSites(db: SqliteDatabase, files?: Iterable<string>): ReferenceSites {
   const sql = `SELECT s.file_path AS file, e.line, t.name FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
     WHERE e.kind = 'references' AND e.line IS NOT NULL`;
-  let rows: unknown[];
-  if (files) {
-    const stmt = db.prepare(`${sql} AND s.file_path = ?`);
-    rows = [...files].flatMap(f => stmt.all(f));
-  } else rows = db.prepare(sql).all();
-  return new Set((rows as { file: string; line: number; name: string }[]).map(r => referenceKey(r.file, r.line, r.name)));
+  return toReferenceSites(files ? bySource(db, sql, files) : db.prepare(sql).all());
 }
 
 /**
@@ -92,11 +102,19 @@ export function referenceSites(db: SqliteDatabase, files?: Iterable<string>): Se
  * during a first index, before resolution turns them into edges (a superset of
  * those edges' lines — see produce.ts startIndex).
  */
-export function pendingReferenceSites(db: SqliteDatabase): Set<string> {
+export function pendingReferenceSites(db: SqliteDatabase): ReferenceSites {
   // A function passed by name is extracted as `function_ref` and stored as a `references` edge (resolution/index.ts).
-  const rows = db.prepare(`SELECT file_path AS file, line, reference_name AS name FROM unresolved_refs
-    WHERE reference_kind IN ('references', 'function_ref')`).all();
-  return new Set((rows as { file: string; line: number; name: string }[]).map(r => referenceKey(r.file, r.line, r.name)));
+  return toReferenceSites(db.prepare(`SELECT file_path AS file, line, reference_name AS name FROM unresolved_refs
+    WHERE reference_kind IN ('references', 'function_ref')`).all());
+}
+
+/**
+ * Rows of `sql` (which joins the edge's source as `s` and ends in a WHERE clause),
+ * for sources in `files` — one indexed query per file.
+ */
+export function bySource<T>(db: SqliteDatabase, sql: string, files: Iterable<string>): T[] {
+  const stmt = db.prepare(`${sql} AND s.file_path = ?`);
+  return [...files].flatMap(f => stmt.all(f) as T[]);
 }
 
 export function siteKey(source: string, line: number, name: string, kind: SiteKind): string {
@@ -387,7 +405,7 @@ export function scipDefinitions(
  */
 export function scipSites(
   defs: ScipDefinitions, indexes: Array<{ lang: ScipLanguage; docs: ScipDocument[] }>, fresh: Map<string, string[]>,
-  refs: ReadonlySet<string>
+  refs: ReferenceSites
 ): ScipSites {
   const { nodes, symToNode, refToNode, projectSymbols, implementers, parse, defined } = defs;
   const stats: Record<string, number> = {};
@@ -432,6 +450,7 @@ export function scipSites(
     for (const doc of docs) {
       const lines = fresh.get(doc.relativePath);
       if (!lines) continue;
+      const fileRefs = refs.get(doc.relativePath);
       // `impl Trait for Type`: the type's `implements` edge, keyed like codegraph's — from the
       // type to the trait at the header's line, and only for a type declared in this file (the
       // only one codegraph links). A generic `impl<T> Trait for T` names no type node.
@@ -448,9 +467,10 @@ export function scipSites(
         const symbol = defined(occurrence.symbol);
         const o = symbol === occurrence.symbol ? occurrence : { ...occurrence, symbol };
         // One of codegraph's references, judged by the symbol here — wherever it is called or not.
-        const ref = parse(symbol);
-        const refKey = ref && referenceKey(doc.relativePath, o.range.startLine + 1, ref.last.name);
-        if (refKey && refs.has(refKey)) {
+        const names = fileRefs?.get(o.range.startLine + 1);
+        const ref = names && parse(symbol);
+        if (ref && names.has(ref.last.name)) {
+          const refKey = referenceKey(doc.relativePath, o.range.startLine + 1, ref.last.name);
           const node = refToNode.get(symbol);
           judge(refKey, symbol, node, o.range.startCol);
           bump(node ? 'references_resolved' : 'references_unresolved');
