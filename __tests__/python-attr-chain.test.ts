@@ -297,4 +297,48 @@ describe('python attribute-chain receivers', () => {
       expect(cg.getOutgoingEdges(r.id).filter((e) => e.kind === 'calls')).toEqual([]);
     }
   });
+  describe('review round 2026-09-30', () => {
+    const write = (rel: string, src: string) => {
+      fs.mkdirSync(path.dirname(path.join(tempDir, rel)), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, rel), src);
+    };
+
+    it('an attribute assigned in the calling method still needs the whole value to be a call', async () => {
+      write('pool.py', 'class Pool:\n    def acquire(self):\n        return object()\n\n    def send(self, x):\n        return x\n');
+      write('svc.py', 'from pool import Pool\n\nclass Svc:\n    def run(self):\n        self.conn = Pool().acquire()\n        return self.conn.send(1)\n');
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callsFrom('method', 'run')).not.toContain('method:send@pool.py');
+    });
+
+    it('an attribute assigned in the calling method from a rebound class name is not that class', async () => {
+      write('backend.py', 'class Backend:\n    def run(self):\n        return 1\n');
+      write('svc.py', 'from backend import Backend\n\ndef load():\n    return object\n\nclass Svc:\n    def go(self):\n        Backend = load()\n        self.b = Backend()\n        return self.b.run()\n');
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callsFrom('method', 'go')).not.toContain('method:run@backend.py');
+    });
+
+    it('an attribute assigned in the calling method from an out-of-repo class is not a same-named project class', async () => {
+      write('app/local.py', 'class Session:\n    def get(self, url):\n        return url\n');
+      write('app/api.py', 'from requests import Session\n\nclass Api:\n    def fetch(self):\n        self.session = Session()\n        return self.session.get("x")\n');
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callsFrom('method', 'fetch')).not.toContain('method:get@app/local.py');
+    });
+
+    it('a parameter rebound before the assignment no longer carries its annotation', async () => {
+      write('box.py', 'class Box:\n    def run(self):\n        return 1\n');
+      write('svc.py', 'from box import Box\n\ndef wrap(b):\n    return b\n\nclass Svc:\n    def __init__(self, box: Box):\n        box = wrap(box)\n        self.box = box\n\n    def go(self):\n        return self.box.run()\n');
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callsFrom('method', 'go')).not.toContain('method:run@box.py');
+    });
+
+    it('descends a dotted module path from a relative package import', async () => {
+      write('app/__init__.py', '');
+      write('app/rel/__init__.py', '');
+      write('app/rel/utils/__init__.py', '');
+      write('app/rel/utils/helpers.py', 'def do_x():\n    return 1\n');
+      write('app/rel/use.py', 'from . import utils\n\ndef rel_caller():\n    return utils.helpers.do_x()\n');
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callsFrom('function', 'rel_caller')).toContain('function:do_x@app/rel/utils/helpers.py');
+    });
+  });
 });
