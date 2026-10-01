@@ -1402,6 +1402,52 @@ export const CASE_INSENSITIVE_LANGUAGES = new Set<string>(['php', 'pascal', 'cfm
  * enclosing method itself least of all, which the same-file proximity term
  * used to pick over the module-scope function the call actually means.
  */
+/**
+ * The links between `this` / `super` / `window` and the method of a TS/JS
+ * call the extractor recorded by its bare name — `this.container.classList
+ * .toggle()` reaches the resolver as `toggle`, with links `container`,
+ * `classList`. Null for a call not written that way, `this.toggle()` included.
+ */
+function collapsedJsChain(ref: UnresolvedRef, context: ResolutionContext): { root: string; links: string[] } | null {
+  if (!JS_FAMILY.has(ref.language) || ref.referenceKind !== 'calls' || !/^[A-Za-z_$][\w$]*$/.test(ref.referenceName)) return null;
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/);
+  if (!lines) return null;
+  const text = lines.slice(ref.line - 1, ref.line + 3).join('\n').slice(ref.column);
+  const name = ref.referenceName.replace(/\$/g, '\\$');
+  const m = new RegExp(`^(this|super|window)((?:\\s*\\??\\.\\s*#?[\\w$]+(?:\\([^()]*\\))?)+?)\\s*\\??\\.\\s*${name}\\s*(?:<[^<>()]*>)?\\s*\\(`).exec(text);
+  if (!m) return null;
+  return { root: m[1]!, links: m[2]!.split('.').map((l) => l.replace(/[\s?]/g, '')).filter((l) => l !== '') };
+}
+
+/**
+ * Whether a collapsed `this.<field>.m()` inside `m` can be `m` itself: only
+ * when the class declares the field as its own type — a tree node's
+ * `this.left.insert(v)` — never through a field of another type
+ * (`this.editor.input.focus()`, `this.container.classList.toggle()`).
+ */
+function isCollapsedNonRecursion(ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const chain = collapsedJsChain(ref, context);
+  return chain !== null && !isCollapsedSelfRecursion(chain, ref, context);
+}
+
+function isCollapsedSelfRecursion(chain: { root: string; links: string[] }, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (chain.root !== 'this' || chain.links.length !== 1 || chain.links[0]!.includes('(')) return false;
+  const field = chain.links[0]!.replace(/^#/, '');
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  const cut = caller ? caller.qualifiedName.lastIndexOf('::') : -1;
+  if (!caller || cut <= 0) return false;
+  const owner = caller.qualifiedName.slice(0, cut).split('::').pop()!;
+  const cls = context.getNodesInFile(ref.filePath).find((n) =>
+    n.kind === 'class' && n.name === owner && n.startLine <= ref.line && n.endLine >= ref.line);
+  if (!cls) return false;
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
+  const body = lines.slice(cls.startLine - 1, cls.endLine).join('\n');
+  const f = field.replace(/\$/g, '\\$');
+  const declared = new RegExp(`(?:^|[\\s(,])#?${f}\\s*[?!]?\\s*:\\s*([A-Za-z_$][\\w$]*)`, 'm').exec(body)?.[1] ??
+    new RegExp(`\\bthis\\.${f}\\s*=\\s*new\\s+([A-Za-z_$][\\w$]*)`).exec(body)?.[1];
+  return declared === owner;
+}
+
 function isBareJsCall(ref: UnresolvedRef, context: ResolutionContext): boolean {
   return JS_FAMILY.has(ref.language) && isReceiverLessCall(ref, context);
 }
@@ -7101,7 +7147,11 @@ export function matchMethodCall(
         }
       }
 
-      if (bestMatch && bestScore >= 2) {
+      // A wrapper handing its call on — BookStack's `FileStorage::delete` doing
+      // `$storage->delete($path)`, `CommentRepo::delete` doing
+      // `$comment->delete()` — names the caller's own class only by a shared
+      // word. The guess is the caller itself, so there is no guess.
+      if (bestMatch && bestScore >= 2 && bestMatch.id !== ref.fromNodeId) {
         return {
           original: ref,
           targetNodeId: bestMatch.id,
@@ -8328,6 +8378,10 @@ export function matchReference(
   context: ResolutionContext
 ): ResolvedRef | null {
   const result = gateLanguageMatch(matchReferenceInner(ref, context), ref, context);
+  // `this.container.classList.toggle()` inside `toggle()`, `window.$events
+  // .listen()` inside `listen()`: a member of what the chain reaches, which is
+  // the calling method only through a field of the caller's own type.
+  if (result && result.targetNodeId === ref.fromNodeId && isCollapsedNonRecursion(ref, context)) return null;
   return result ? retargetSelfOverload(result, ref, context) : result;
 }
 
