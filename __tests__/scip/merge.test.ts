@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { pathToFileURL } from 'url';
 import CodeGraph from '../../src/index';
 import type { Edge } from '../../src/types';
 import { importScipFile, runScipPass, scipStatus } from '../../src/scip';
@@ -178,6 +179,21 @@ describe('SCIP merge (TypeScript fixture)', () => {
     const report = (await pass())!;
     expect(report.staleDocuments).toEqual(['src/models.ts']);
     expect(edge('sum', 'helper')?.provenance).toBeNull(); // target file unvouched → call left unjudged
+  });
+
+  it('scip import rebases an index rooted at a subfolder onto the project', async () => {
+    const ix = loadScipIndex(path.join(FIXTURE, 'index.scip'));
+    const sub = path.join(dir, 'built-sub.scip');
+    fs.writeFileSync(sub, Buffer.concat([
+      encodeMetadata({ toolName: ix.toolName, toolVersion: ix.toolVersion, projectRoot: pathToFileURL(path.join(dir, 'src')).href }),
+      ...ix.documents.map(d => encodeDocument({ ...d, relativePath: path.posix.relative('src', d.relativePath) }, s => Buffer.from(s))),
+    ]));
+    const { documents } = importScipFile(dir, sub);
+    expect(documents).toBe(ix.documents.length);
+    expect(loadScipIndex(indexPath(dir, 'typescript')).documents.map(d => d.relativePath).sort())
+      .toEqual(ix.documents.map(d => d.relativePath).sort());
+    await pass();
+    expect(edge('sum', 'Invoice::totalPrice')?.provenance).toBe('scip');
   });
 
   it('the regression guard counts resolved calls, not every reference', () => {

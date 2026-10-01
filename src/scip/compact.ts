@@ -17,6 +17,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { pathToFileURL } from 'url';
 import { INDEXERS } from './indexers';
 import { IndexMeta, ParsedSymbol, ROLE_DEFINITION, ScipOccurrence, encodeDocument, encodeMetadata, parseSymbol, scanIndex } from './reader';
 import type { ScipLanguage } from './store';
@@ -62,7 +63,7 @@ export class Compactor {
         isCallTarget(this.parse(i.symbol)?.last.kind) && isCallTarget(this.parse(i.target)?.last.kind));
       this.chunks.push(encodeDocument({ ...doc, occurrences: kept, implementations }, s => this.bytes(s)));
       this.paths.push(doc.relativePath);
-    });
+    }, this.projectRoot);
     this.meta ??= meta;
   }
 
@@ -82,7 +83,7 @@ export class Compactor {
   write(file: string): void {
     const fd = fs.openSync(file, 'w');
     try {
-      if (this.meta) fs.writeSync(fd, encodeMetadata(this.meta));
+      if (this.meta) fs.writeSync(fd, encodeMetadata({ ...this.meta, projectRoot: pathToFileURL(this.projectRoot).href })); // paths are rebased onto it
       for (const c of this.chunks) fs.writeSync(fd, c);
     } finally {
       fs.closeSync(fd);

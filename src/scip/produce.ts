@@ -20,7 +20,6 @@ import { spawn, ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { fileURLToPath } from 'url';
 import type { SqliteDatabase } from '../db/sqlite-adapter';
 import { Compactor } from './compact';
 import { INDEXERS, IndexerRun, RUN_WARNING, ResolvedIndexer, resolveIndexer } from './indexers';
@@ -230,18 +229,14 @@ async function patchIndex(
         return null;
       }
       // Several runs may each carry a file (an import both share): the first copy stands.
-      // Paths are relative to each run's own root — scip-python's is its --target-only
-      // path — so they're rebased onto the project's.
       const seen = new Set<string>();
       for (const out of outputs) {
-        const index = decodeScipIndex(fs.readFileSync(out));
-        tool = index;
-        const base = index.projectRoot.startsWith('file:') ? fileURLToPath(index.projectRoot) : projectRoot;
+        const index = decodeScipIndex(fs.readFileSync(out), projectRoot);
+        tool = { toolName: index.toolName, toolVersion: index.toolVersion, projectRoot: '' }; // paths are rebased already
         for (const d of index.documents) {
-          const rel = path.relative(projectRoot, path.resolve(base, d.relativePath)).split(path.sep).join('/');
-          if (rel.startsWith('..') || seen.has(rel)) continue;
-          seen.add(rel);
-          partial.push({ ...d, relativePath: rel });
+          if (seen.has(d.relativePath)) continue;
+          seen.add(d.relativePath);
+          partial.push(d);
         }
       }
     }

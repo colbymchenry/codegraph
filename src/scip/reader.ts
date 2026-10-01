@@ -9,6 +9,8 @@
  */
 
 import * as fs from 'fs';
+import * as path from 'path';
+import { fileURLToPath } from 'url';
 
 /** `SymbolRole.Definition` bit. */
 export const ROLE_DEFINITION = 0x1;
@@ -223,7 +225,7 @@ export type IndexMeta = Omit<ScipIndex, 'documents'>;
  * held, so a multi-GB index can be filtered without decoding it whole.
  * Concatenated indexes (one per sub-project, see IndexerRun) read as one.
  */
-export function scanIndex(buf: Buffer, onDocument?: (doc: ScipDocument) => void): IndexMeta {
+export function scanIndex(buf: Buffer, onDocument?: (doc: ScipDocument) => void, projectRoot?: string): IndexMeta {
   const meta: IndexMeta = { toolName: '', toolVersion: '', projectRoot: '' };
   const r = new Reader(buf, 0, buf.length);
   while (!r.done()) {
@@ -249,7 +251,8 @@ export function scanIndex(buf: Buffer, onDocument?: (doc: ScipDocument) => void)
       }
     } else if (field === 2 && wire === WIRE_LEN && onDocument) {
       const doc = readDocument(r.sub());
-      if (doc.relativePath) onDocument(doc);
+      const rel = doc.relativePath && projectRoot !== undefined ? rebase(meta.projectRoot, projectRoot, doc.relativePath) : doc.relativePath;
+      if (rel) onDocument({ ...doc, relativePath: rel });
     } else { // including documents when only the metadata is wanted
       r.skip(wire);
     }
@@ -260,17 +263,34 @@ export function scanIndex(buf: Buffer, onDocument?: (doc: ScipDocument) => void)
 /**
  * Decodes a whole index. A file claimed by two overlapping projects keeps its
  * first document — the indexers here emit each file once per run, and a second
- * copy only repeats the same occurrences.
+ * copy only repeats the same occurrences. With `projectRoot`, paths are rebased
+ * onto it (see rebase).
  */
-export function decodeScipIndex(buf: Buffer): ScipIndex {
+export function decodeScipIndex(buf: Buffer, projectRoot?: string): ScipIndex {
   const documents: ScipDocument[] = [];
   const seen = new Set<string>();
   const meta = scanIndex(buf, doc => {
     if (seen.has(doc.relativePath)) return;
     seen.add(doc.relativePath);
     documents.push(doc);
-  });
+  }, projectRoot);
   return { ...meta, documents };
+}
+
+/**
+ * A document path made relative to `projectRoot`. An index rooted at a folder
+ * inside the project (scip-python's `--target-only` run, an index built in a
+ * subfolder) has its paths prefixed with that folder; one rooted elsewhere (built
+ * on another machine) keeps them. Null for a path that leaves the project.
+ */
+function rebase(indexRoot: string, projectRoot: string, relativePath: string): string | null {
+  let prefix = '';
+  if (indexRoot.startsWith('file:')) {
+    const inner = path.relative(projectRoot, fileURLToPath(indexRoot));
+    if (!inner.startsWith('..') && !path.isAbsolute(inner)) prefix = inner.split(path.sep).join('/');
+  }
+  const rel = path.posix.normalize(path.posix.join(prefix, relativePath));
+  return rel === '..' || rel.startsWith('../') ? null : rel;
 }
 
 // --- protobuf wire encoding (the same subset) ------------------------------------
