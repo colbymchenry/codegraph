@@ -209,7 +209,8 @@ export const typescriptIndexer: IndexerSpec = {
   patch: {
     'tsgo-index': {
       units: (_root, files) => files, // tsgo-index --only takes files
-      seconds: (_root, files) => files.length * 0.1,
+      // One process: loading the program and the splice (~1 s), then little per file — Playwright: 25 files 1.6 s, 169 files 3.3 s.
+      seconds: (_root, files) => 1 + files.length * 0.015,
       runs([full], files, outFile) {
         if (!full) return null;
         const list = `${outFile}.only`;

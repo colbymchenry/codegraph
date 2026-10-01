@@ -2,10 +2,11 @@
  * Background SCIP reindex for a watched project.
  *
  * Each synced edit restarts an idle timer; once the project has been quiet for
- * `idleMs` every language that ALREADY has an installed index is re-indexed,
- * niced, one at a time, then merged. A tsgo index is patched — only the changed
- * files and their importers are re-indexed (produce.ts incrementalPlan) — and
- * may run every `incrementalIntervalMs`; a full rebuild waits `minIntervalMs`
+ * it, every language that ALREADY has an installed index is re-indexed, niced,
+ * one at a time, then merged. When every index can be patched — only the
+ * changed files and their importers re-indexed (produce.ts incrementalPlan),
+ * a few seconds — the wait is `patchIdleMs` and a patch may run every
+ * `incrementalIntervalMs`; a full rebuild waits `idleMs` and `minIntervalMs`
  * since the last run. Projects never opted in with `codegraph scip index` are
  * left alone — no surprise indexer runs.
  */
@@ -15,15 +16,18 @@ import { ProduceResult, incrementalPlan, produceIndex } from './produce';
 import { availableIndexes, tryReindexLock } from './store';
 
 export interface ReindexOptions {
+  /** quiet time before a full rebuild; also before a patch, unless `patchIdleMs` is given */
   idleMs?: number;
+  patchIdleMs?: number;
   minIntervalMs?: number;
   incrementalIntervalMs?: number;
   log?: (msg: string) => void;
 }
 
 export const DEFAULT_IDLE_MS = 60_000;
+export const DEFAULT_PATCH_IDLE_MS = 10_000;
 export const DEFAULT_MIN_INTERVAL_MS = 10 * 60_000;
-export const DEFAULT_INCREMENTAL_INTERVAL_MS = 60_000;
+export const DEFAULT_INCREMENTAL_INTERVAL_MS = 10_000;
 
 export class ScipReindexScheduler {
   private timer: NodeJS.Timeout | null = null;
@@ -32,13 +36,16 @@ export class ScipReindexScheduler {
   private dirty = false;
   private abort = new AbortController();
   private readonly idleMs: number;
+  private readonly patchIdleMs: number;
   private readonly minIntervalMs: number;
   private readonly incrementalIntervalMs: number;
   private readonly log: (msg: string) => void;
 
   constructor(private readonly host: ScipHost, opts: ReindexOptions = {}) {
-    // `CODEGRAPH_SCIP_REINDEX_IDLE_MS`: the watcher builds its scheduler with no options (tests shorten the wait).
-    this.idleMs = opts.idleMs ?? (Number(process.env.CODEGRAPH_SCIP_REINDEX_IDLE_MS) || DEFAULT_IDLE_MS);
+    // `CODEGRAPH_SCIP_REINDEX_IDLE_MS` sets both waits: the watcher builds its scheduler with no options (tests shorten them).
+    const fixed = opts.idleMs ?? (Number(process.env.CODEGRAPH_SCIP_REINDEX_IDLE_MS) || undefined);
+    this.idleMs = fixed ?? DEFAULT_IDLE_MS;
+    this.patchIdleMs = opts.patchIdleMs ?? fixed ?? DEFAULT_PATCH_IDLE_MS;
     this.minIntervalMs = opts.minIntervalMs ?? DEFAULT_MIN_INTERVAL_MS;
     this.incrementalIntervalMs = opts.incrementalIntervalMs ?? DEFAULT_INCREMENTAL_INTERVAL_MS;
     this.log = opts.log ?? ((m) => process.stderr.write(`[CodeGraph SCIP] ${m}\n`));
@@ -48,7 +55,7 @@ export class ScipReindexScheduler {
   notifyChange(): void {
     if (availableIndexes(this.host.getProjectRoot()).length === 0) return;
     this.dirty = true;
-    this.arm(this.idleMs);
+    this.arm(this.quiet());
   }
 
   stop(): void {
@@ -81,8 +88,13 @@ export class ScipReindexScheduler {
     this.lastRunAt = Date.now();
     this.running = this.runOnce().finally(() => {
       this.running = null;
-      if (this.dirty) this.arm(this.idleMs);
+      if (this.dirty) this.arm(this.quiet());
     });
+  }
+
+  /** How long the project must be quiet: short when the next run is a patch. */
+  private quiet(): number {
+    return this.patchable() ? this.patchIdleMs : this.idleMs;
   }
 
   /** Every installed index can be patched rather than rebuilt. */
