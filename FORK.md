@@ -54,7 +54,7 @@ Indexers are never auto-installed:
 
 | language | indexer | detected by |
 |---|---|---|
-| TS/JS | preferred: `npm i -g typescript@next` (≥ 7.1, see below); else `npm i -g @sourcegraph/scip-typescript` | `tsconfig.json`, `jsconfig.json`, `package.json` |
+| TS/JS | preferred: `npm i --prefix ~/.codegraph/tools typescript@next` (≥ 7.1, see below); else `npm i -g @sourcegraph/scip-typescript` | `tsconfig.json`, `jsconfig.json`, `package.json` |
 | Python | `npm i -g @sourcegraph/scip-python` | `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt` |
 | Go | `go install github.com/scip-code/scip-go/cmd/scip-go@latest` (packages must build) | `go.mod` |
 | Rust | `rustup component add rust-analyzer` (uses its `scip` subcommand; needs `cargo`) | `Cargo.toml` |
@@ -67,9 +67,9 @@ To run one through `npx` instead, put this in `codegraph.json`:
 
 `"python": false` disables a language. `cmd`, `args` and `env` replace the defaults. In `args`, `{args}` splices in the adapter's own arguments and `{out}` is the output path.
 
-**TS/JS with tsgo.** When TypeScript ≥ 7.1 (the native compiler) is installed, in the project's `node_modules` or the global npm root, `scip index` uses it instead of scip-typescript, through its API (`typescript/unstable/sync`). The indexer is `src/scip/indexers/tsgo-index.ts`, run as `node dist/scip/indexers/tsgo-index.js`:
+**TS/JS with tsgo.** When TypeScript ≥ 7.1 (the native compiler) is installed, in the project's `node_modules`, `~/.codegraph/tools/node_modules` (keeps a pre-release out of your global `tsc`) or the global npm root, `scip index` uses it instead of scip-typescript, through its API (`typescript/unstable/sync`). The indexer is `src/scip/indexers/tsgo-index.ts`, run as `node dist/scip/indexers/tsgo-index.js`:
 - It opens every `tsconfig.json` / `jsconfig.json` project, one at a time in one process. A file is indexed by the **deepest project containing it**, whose own `paths`/options resolve its imports. (Playwright's root `tsconfig.json` has no `include`, so it claims `tests/` too, but only `tests/tsconfig.json` maps what those files import.) A file its owner never loads goes to the first project that does.
-- It writes only what the merge reads: a reference at the callee name of every call and `new`, and a definition for every callee the project declares. A symbol is named after its first declaration (`` `file`/node-index/Name ``). So an overload maps to its first signature, and a declaration seen from two projects is one symbol.
+- It writes only what the merge reads: a reference at the callee name of every call and `new`, and a definition for every callee the project declares. A symbol is named after its first declaration's file and container chain (`` `file`/Outer#name(). ``), falling back to its node index when two declarations share a name. Names survive edits elsewhere in the file, an overload maps to its first signature, and a declaration seen from two projects is one symbol.
 - A call on a union- or intersection-typed receiver (`a.equals(b)` with `a: A | B`) targets every member's method.
 - A project that fails to open is a warning; its files stay heuristic-only.
 - Needs Node ≥ 20.19 / 22.12, because it `require()`s the ES-module API. Setting `scip.typescript.cmd` (or `args`) in `codegraph.json` forces scip-typescript. So does a repo without any `tsconfig.json` / `jsconfig.json`, since there is no project to open; scip-typescript infers one.

@@ -15,7 +15,8 @@
  * Preferred over all of that when installed: TypeScript ≥ 7.1 (the native
  * compiler, tsgo) through its API — see tsgo-index.ts. It type-checks several
  * times faster in far less memory, so every project runs in one process.
- * Found in the project's node_modules, else the global npm root.
+ * Found in the project's node_modules, else codegraph's tools folder, else the
+ * global npm root (see findTsgo).
  */
 
 import { spawnSync } from 'child_process';
@@ -154,8 +155,17 @@ export function packageVersion(dir: string): string | null {
 }
 
 /**
+ * A TypeScript installed for codegraph alone, so a 7.1 pre-release needn't be
+ * the machine's global `tsc`: `npm i --prefix ~/.codegraph/tools typescript@next`.
+ */
+export function toolsDir(): string {
+  return path.join(process.env.CODEGRAPH_INSTALL_DIR || path.join(os.homedir(), '.codegraph'), 'tools');
+}
+
+/**
  * Where tsgo-index can load TypeScript ≥ 7.1 from: the project's node_modules,
- * else the global npm root (not consulted when the local one will do). An
+ * else toolsDir(), else the global npm root (each consulted only when the ones
+ * before won't do). An
  * older TypeScript is simply not a candidate; one that should work but can't
  * (a broken install, a Node that can't load it) is reported as `unusable`.
  */
@@ -177,7 +187,7 @@ export function findTsgo(root: string): { dir: string } | { unusable: string } |
     else return dir;
     return null;
   };
-  const local = tryDir(path.join(root, 'node_modules', 'typescript'));
+  const local = tryDir(path.join(root, 'node_modules', 'typescript')) ?? tryDir(path.join(toolsDir(), 'node_modules', 'typescript'));
   if (local) return { dir: local };
   // No npm (or no global root) just means no global candidate.
   const npmRoot = spawnSync('npm', ['root', '-g'], { encoding: 'utf8', timeout: 10_000, shell: process.platform === 'win32' });

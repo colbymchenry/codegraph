@@ -8,7 +8,7 @@ import { importScipFile, runScipPass } from '../../src/scip';
 import { MAX_SOURCE_FILE_SIZE_BYTES } from '../../src/file-limits';
 import { resolveIndexer } from '../../src/scip/indexers';
 import { indexProjects } from '../../src/scip/indexers/tsgo-index';
-import { findTsgo } from '../../src/scip/indexers/typescript';
+import { findTsgo, toolsDir } from '../../src/scip/indexers/typescript';
 import { scipFlowNote } from '../../src/scip/notes';
 import { ROLE_DEFINITION, decodeScipIndex } from '../../src/scip/reader';
 import type { Edge } from '../../src/types';
@@ -159,9 +159,11 @@ describe.runIf(TSGO)('tsgo indexer (TypeScript fixture)', () => {
 describe('typescript adapter: tsgo when installed', () => {
   let dir: string;
   const savedPrefix = process.env.NPM_CONFIG_PREFIX;
+  const savedInstallDir = process.env.CODEGRAPH_INSTALL_DIR;
   beforeEach(() => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-tsgo-adapter-'));
     process.env.NPM_CONFIG_PREFIX = path.join(dir, 'no-global'); // `npm root -g` → an empty prefix: only what the test installs counts
+    process.env.CODEGRAPH_INSTALL_DIR = path.join(dir, 'codegraph-home'); // likewise for codegraph's tools folder
     fs.writeFileSync(path.join(dir, 'tsconfig.json'), '{}');
     fs.mkdirSync(path.join(dir, 'pkg'));
     fs.writeFileSync(path.join(dir, 'pkg', 'jsconfig.json'), '{}');
@@ -173,6 +175,8 @@ describe('typescript adapter: tsgo when installed', () => {
   afterEach(() => {
     if (savedPrefix === undefined) delete process.env.NPM_CONFIG_PREFIX;
     else process.env.NPM_CONFIG_PREFIX = savedPrefix;
+    if (savedInstallDir === undefined) delete process.env.CODEGRAPH_INSTALL_DIR;
+    else process.env.CODEGRAPH_INSTALL_DIR = savedInstallDir;
     fs.rmSync(dir, { recursive: true, force: true });
   });
   const tsPackage = (json: string) => fs.writeFileSync(path.join(dir, 'node_modules', 'typescript', 'package.json'), json);
@@ -192,6 +196,15 @@ describe('typescript adapter: tsgo when installed', () => {
     const scipTs = resolveIndexer(dir, 'typescript', out);
     if ('skip' in scipTs) throw new Error(scipTs.skip);
     expect(scipTs.runs[0]!.args[0]).toBe('index'); // scip-typescript's arguments
+  });
+
+  it('finds TypeScript in codegraph\'s tools folder when the project has none', () => {
+    const tools = path.join(toolsDir(), 'node_modules', 'typescript');
+    fs.renameSync(path.join(dir, 'node_modules', 'typescript'), path.join(dir, 'moved'));
+    expect(findTsgo(dir)).toBeNull();
+    fs.mkdirSync(path.dirname(tools), { recursive: true });
+    fs.renameSync(path.join(dir, 'moved'), tools);
+    expect(findTsgo(dir)).toEqual({ dir: tools });
   });
 
   it('ignores a TypeScript older than 7.1', () => {
