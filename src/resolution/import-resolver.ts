@@ -17,6 +17,7 @@ import {
   resolveObjectLiteralBinding,
   localReceiverTypePatterns,
   normalizeInferredTypeName,
+  isLexicallyReachable,
 } from './name-matcher';
 
 /**
@@ -2186,6 +2187,10 @@ function resolveRustPathReference(
   const file = resolveRustModuleFile(modSegs, ref.filePath, context);
   if (!file || file === ref.filePath) return null;
 
+  // The module's own item. A path never names a method (that is
+  // `Type::method`), nor a fn local to another fn's body: the file's first
+  // same-named node was taken, so an `impl Buf { fn take }` above
+  // `pub fn take` caught every `crate::util::take(…)`.
   const target = context.getNodesInFile(file).find(
     (n) =>
       n.name === leaf &&
@@ -2196,9 +2201,9 @@ function resolveRustPathReference(
         n.kind === 'trait' ||
         n.kind === 'type_alias' ||
         n.kind === 'constant' ||
-        n.kind === 'method' ||
         n.kind === 'class' ||
-        n.kind === 'interface')
+        n.kind === 'interface') &&
+      isLexicallyReachable(n, ref, context)
   );
   if (target) {
     return { original: ref, targetNodeId: target.id, confidence: 0.9, resolvedBy: 'import' };
