@@ -4347,6 +4347,14 @@ export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: 
     // and a path from std (`std::io::Error`) is std's.
     const seg = pathed[2] ?? '';
     const root = /^([A-Za-z_]\w*)/.exec(pathed[1] ?? '')?.[1] ?? seg;
+    // `Self::Error` in a signature is the enclosing impl's (or trait's) own
+    // associated type, and `V::Value` an associated type of a generic's bound —
+    // never a struct of that name: serde's 334 `Self::Error`s went to
+    // `de::value::Error`.
+    if (ref.referenceKind === 'references' && (pathed[1] ?? '') === '' && line !== undefined) {
+      if (seg === 'Self') return candidate.kind === 'type_alias' && isInEnclosingRustImpl(candidate, ref, context);
+      if (isRustGenericParam(seg, ref, context)) return false;
+    }
     if ((root === 'std' || root === 'core' || root === 'alloc') && candidate.filePath !== ref.filePath) return false;
     // A project crate's name re-exports as `crate::` does: `clap::Command` is clap_builder's.
     if (seg === '' || seg === 'crate' || seg === 'self' || seg === 'super' || seg === 'Self' || candidate.filePath === ref.filePath ||
@@ -4383,6 +4391,30 @@ export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: 
     return uses.bound.has(name) || rustGlobCovers(uses, candidate, ref);
   }
   return uses.names.has(name) || rustGlobCovers(uses, candidate, ref);
+}
+
+/** The line of the `impl` / `trait` header above `ref` in its file (0 for none). */
+function rustEnclosingImplLine(ref: UnresolvedRef, context: ResolutionContext): number {
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
+  for (let i = ref.line - 1; i >= 0; i--) {
+    if (/^\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?(?:impl|trait)\b/.test(lines[i] ?? '')) return i + 1;
+  }
+  return 0;
+}
+
+/** Whether `candidate` is declared in the same `impl` / `trait` block as `ref`, above it. */
+function isInEnclosingRustImpl(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const header = rustEnclosingImplLine(ref, context);
+  return header > 0 && candidate.filePath === ref.filePath && candidate.startLine >= header && candidate.startLine <= ref.line;
+}
+
+/** Whether `name` is a generic type parameter of the function or impl around `ref` (`fn f<V: Visitor>`, `impl<'de, E>`). */
+function isRustGenericParam(name: string, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (!/^[A-Z]\w*$/.test(name)) return false;
+  const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
+  const from = Math.max(0, rustEnclosingImplLine(ref, context) - 1);
+  const text = lines.slice(from, ref.line).join('\n');
+  return new RegExp(`<[^<>]*(?:<[^<>]*>[^<>]*)*\\b${name}\\b\\s*(?:[:,>=])`).test(text);
 }
 
 /** What only exists inside a type, reachable through a receiver alone. */
