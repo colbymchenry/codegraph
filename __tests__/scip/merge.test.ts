@@ -9,7 +9,7 @@ import { scipVerdict } from '../../src/scip/notes';
 import { produceIndex } from '../../src/scip/produce';
 import { ROLE_DEFINITION, encodeDocument, encodeMetadata, loadScipIndex } from '../../src/scip/reader';
 import { ScipReindexScheduler } from '../../src/scip/reindex';
-import { indexPath, scipDir } from '../../src/scip/store';
+import { indexPath, scipDir, tryReindexLock } from '../../src/scip/store';
 
 const FIXTURE = path.join(__dirname, '..', 'fixtures', 'scip-ts');
 
@@ -37,11 +37,11 @@ describe('SCIP merge (TypeScript fixture)', () => {
     return importScipFile(dir, copy);
   };
   const writeConfig = (scip: unknown) => fs.writeFileSync(path.join(dir, 'codegraph.json'), JSON.stringify({ scip }));
-  /** A fake indexer: copies a prebuilt index to `{out}` (and counts its runs). */
-  const fakeIndexer = (index: string) => writeConfig({
+  /** A fake indexer: copies a prebuilt index to `{out}` (and counts its runs), after `delayMs`. */
+  const fakeIndexer = (index: string, delayMs = 0) => writeConfig({
     typescript: {
       cmd: process.execPath,
-      args: ['-e', 'const fs=require("fs");fs.appendFileSync(process.argv[3],"x");fs.copyFileSync(process.argv[1],process.argv[2])',
+      args: ['-e', `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,${delayMs});const fs=require("fs");fs.appendFileSync(process.argv[3],"x");fs.copyFileSync(process.argv[1],process.argv[2])`,
         path.join(FIXTURE, index), '{out}', path.join(dir, 'runs.log')],
     },
   });
@@ -303,5 +303,39 @@ describe('SCIP merge (TypeScript fixture)', () => {
     } finally {
       s.stop();
     }
+  });
+
+  it('one reindex per project at a time: a second scheduler skips while the first runs', async () => {
+    fakeIndexer('index.scip');
+    await produceIndex(cg.scipReadDb(), dir, 'typescript');
+    fakeIndexer('index.scip', 300);
+    const before = runs();
+    const logs: string[] = [];
+    const a = new ScipReindexScheduler(cg, { idleMs: 30, minIntervalMs: 60_000, log: () => {} });
+    const b = new ScipReindexScheduler(cg, { idleMs: 30, minIntervalMs: 60_000, log: m => logs.push(m) });
+    try {
+      a.notifyChange();
+      await new Promise(r => setTimeout(r, 80)); // a is inside its indexer run
+      b.notifyChange();
+      await new Promise(r => setTimeout(r, 80));
+      await Promise.all([a.idle(), b.idle()]);
+      expect(runs() - before).toBe(1);
+      expect(logs.some(m => m.includes('reindex skipped'))).toBe(true);
+      expect(tryReindexLock(dir)?.release()).toBeUndefined(); // released afterwards
+    } finally {
+      a.stop();
+      b.stop();
+    }
+  });
+
+  it('the reindex lock is exclusive and a dead holder\'s lock is taken over', () => {
+    const held = tryReindexLock(dir)!;
+    expect(held).not.toBeNull();
+    expect(tryReindexLock(dir)).toBeNull();
+    held.release();
+    fs.writeFileSync(path.join(scipDir(dir), 'reindex.lock'), '2147483646'); // no such pid
+    const taken = tryReindexLock(dir);
+    expect(taken).not.toBeNull();
+    taken!.release();
   });
 });

@@ -9,6 +9,7 @@
 import type { Command } from 'commander';
 import { SCIP_LANGUAGES, ScipLanguage, ScipPassReport, importScipFile, runScipPass, scipStatus } from './index';
 import { produceIndex } from './produce';
+import { scipDir, tryReindexLock } from './store';
 
 export interface CliHelpers {
   resolveProjectPath(pathArg?: string): string;
@@ -61,6 +62,19 @@ export function registerScipCommands(program: Command, h: CliHelpers): void {
     }
   };
 
+  /** index and import replace the installed index and merge: never alongside another re-index. */
+  const exclusively = async (cg: import('../index').CodeGraph, fn: () => Promise<void>) => {
+    const lock = tryReindexLock(cg.getProjectRoot());
+    if (!lock) {
+      throw new Error(`another process (a watcher or a CLI run) is re-indexing this project — retry when it finishes, or delete ${scipDir(cg.getProjectRoot())}/reindex.lock if none is running`);
+    }
+    try {
+      await fn();
+    } finally {
+      lock.release();
+    }
+  };
+
   const mergeAndReport = async (cg: import('../index').CodeGraph) => {
     const report = await cg.scipWrite((db) => runScipPass(db, cg.getProjectRoot()));
     if (report) h.success(describe(report));
@@ -74,7 +88,7 @@ export function registerScipCommands(program: Command, h: CliHelpers): void {
     .option('-f, --force', 'Install the new index even if resolution dropped sharply')
     .option('--changed', 'Re-index only files changed since the installed index, and their importers (tsgo); else a full run')
     .action((pathArg: string | undefined, opts: { lang?: string; force?: boolean; changed?: boolean }) =>
-      withGraph(pathArg, async (cg) => {
+      withGraph(pathArg, (cg) => exclusively(cg, async () => {
         const only = parseLang(opts.lang);
         let installed = 0;
         let current = 0;
@@ -97,21 +111,21 @@ export function registerScipCommands(program: Command, h: CliHelpers): void {
         }
         if (installed > 0) await mergeAndReport(cg);
         else if (only && current === 0) process.exitCode = 1;
-      }));
+      })));
 
   scip
     .command('import <file> [path]')
     .description('Install a SCIP index built elsewhere (from the current sources), then merge')
     .option('--lang <lang>', 'Language the index covers (default: inferred from the indexer name)')
     .action((file: string, pathArg: string | undefined, opts: { lang?: string }) =>
-      withGraph(pathArg, async (cg) => {
+      withGraph(pathArg, (cg) => exclusively(cg, async () => {
         const { lang, documents, newerThanIndex } = importScipFile(cg.getProjectRoot(), file, parseLang(opts.lang));
         h.info(`${lang}: installed ${documents} documents`);
         if (newerThanIndex.length > 0) {
           h.warn(`${newerThanIndex.length} file(s) changed after ${file} was written — left to the heuristic until a reindex (e.g. ${newerThanIndex.slice(0, 3).join(', ')})`);
         }
         await mergeAndReport(cg);
-      }));
+      })));
 
   scip
     .command('status [path]')

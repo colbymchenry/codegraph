@@ -43,7 +43,7 @@ A language adapter (`IndexerSpec`) then only declares its capabilities: detectio
 
 | # | Task | Why | How | Check |
 |---|---|---|---|---|
-| 0.1 | One re-index per repo at a time | Every MCP server watching a repo runs its own background re-index; two sessions on vscode would need ~16 GB | A lock file in `.codegraph/scip/` around the whole re-index; others skip and log it | Test: two schedulers on one repo, only one runs |
+| 0.1 | **Done.** One re-index per repo at a time | Upstream's writer lock already allows one watcher (so one background scheduler) per project, but a CLI `scip index` / `import` could still run beside it: two full indexers, ~16 GB on vscode | `tryReindexLock` (`.codegraph/scip/reindex.lock`, upstream's `FileLock`) around indexers + merge; the scheduler skips and retries when idle, the CLI fails with a message | Test: two schedulers on one repo, only one runs; a dead holder's lock is taken over |
 | 0.2 | Take TypeScript 7.1 out of global npm | The global `tsc` is currently a 7.1 nightly | Install it in a fork-owned folder (e.g. `~/.codegraph/tools/typescript`) that `findTsgo` also searches; then `npm rm -g typescript` | `tsc` back to the user's own; tsgo still found |
 | 0.3 | Remove old bundle versions on install | 285 MB per bundle in `~/.codegraph/versions` | The install step keeps only `current`, as upstream's `install.sh` does | One directory left |
 | 0.4 | Reproducible benchmarks | The corpora and baselines lived in a job's temp folder | `scripts/scip-eval/corpora.sh`: clone pinned commits (vscode 73d5322b, Playwright a8c1a59, Django 026b005, cobra adbc881, ripgrep 3fce3b5), index, run the evals | A rerun matches FORK.md's tables |

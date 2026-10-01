@@ -5,6 +5,7 @@
  *   <lang>.scip       the index
  *   <lang>.meta.json  tool info + the content hash of every file as it was when
  *                     the indexer STARTED (the "snapshot")
+ *   reindex.lock      pid of the process re-indexing (indexers + merge) right now
  *
  * A SCIP document is trusted only when its snapshot hash, the hash codegraph
  * stored for the file (`files.content_hash`) and the file on disk all agree —
@@ -22,6 +23,7 @@ import * as path from 'path';
 import { getCodeGraphDir } from '../directory';
 import { hashContent } from '../extraction';
 import { indexedHashInput } from '../file-limits';
+import { FileLock } from '../utils';
 import type { SqliteDatabase } from '../db/sqlite-adapter';
 
 export const SCIP_LANGUAGES = ['typescript', 'python', 'go', 'rust'] as const;
@@ -92,6 +94,24 @@ export function installIndex(projectRoot: string, lang: ScipLanguage, write: (fi
     fs.rmSync(tmp, { force: true });
   }
   writeFileAtomic(metaPath(projectRoot, lang), JSON.stringify(meta));
+}
+
+/**
+ * One re-index (indexer runs + merge) per repo at a time, across processes: the
+ * watcher's background reindex and a CLI `scip index` would otherwise each start
+ * a full indexer (~8 GB for vscode). Null when another live process holds it;
+ * a dead holder's lock is taken over.
+ */
+export function tryReindexLock(projectRoot: string): FileLock | null {
+  fs.mkdirSync(scipDir(projectRoot), { recursive: true });
+  const lock = new FileLock(path.join(scipDir(projectRoot), 'reindex.lock'));
+  try {
+    lock.acquire();
+    return lock;
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('locked by another')) return null;
+    throw err;
+  }
 }
 
 /** Atomic write: a concurrent reader sees the old file or the new one, never half of either. */

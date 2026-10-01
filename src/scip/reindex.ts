@@ -12,7 +12,7 @@
 
 import { runScipPass, ScipHost } from './index';
 import { incrementalPlan, produceIndex } from './produce';
-import { availableIndexes } from './store';
+import { availableIndexes, tryReindexLock } from './store';
 
 export interface ReindexOptions {
   idleMs?: number;
@@ -97,6 +97,20 @@ export class ScipReindexScheduler {
 
   private async runOnce(): Promise<void> {
     const root = this.host.getProjectRoot();
+    const lock = tryReindexLock(root);
+    if (!lock) {
+      this.log('reindex skipped: another process is re-indexing this project; retrying when idle');
+      this.dirty = true;
+      return;
+    }
+    try {
+      await this.reindex(root);
+    } finally {
+      lock.release();
+    }
+  }
+
+  private async reindex(root: string): Promise<void> {
     let installed = 0;
     for (const { lang } of availableIndexes(root)) {
       if (this.abort.signal.aborted) return;
