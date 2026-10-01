@@ -1821,8 +1821,8 @@ function isReceiverLessCall(ref: UnresolvedRef, context: ResolutionContext): boo
   return BARE_CALL_KEYWORDS.has(line.slice(start, end));
 }
 
-/** `\s*[(<]` from a given index (sticky). */
-const CALL_OPENER = /\s*[(<]/y;
+/** `\s*[(<]` from a given index (sticky) — an optional call's `?.(` too. */
+const CALL_OPENER = /\s*(?:\?\.\s*)?[(<]/y;
 const WHITESPACE = /\s/;
 const WORD_CHAR = /\w/;
 /** A character that ends a receiver: `.`, a word character, `$`, `]` or `)`. */

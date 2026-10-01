@@ -932,6 +932,8 @@ from ..services import auth_service
       const frameworks = detectFrameworks(context);
       const reactResolver = frameworks.find((f) => f.name === 'react');
 
+      // In a JS/TS module another file's hook comes through an import (the
+      // import resolver's), never by name: App.tsx imports nothing here.
       const ref = {
         fromNodeId: 'component:src/App.tsx:App:1',
         referenceName: 'useAuth',
@@ -941,10 +943,11 @@ from ..services import auth_service
         filePath: 'src/App.tsx',
         language: 'typescript' as const,
       };
+      expect(reactResolver!.resolve(ref, context)).toBeNull();
 
-      const result = reactResolver!.resolve(ref, context);
-      expect(result).not.toBeNull();
-      expect(result?.targetNodeId).toBe('hook:src/hooks/useAuth.ts:useAuth:1');
+      // The file's own hook resolves.
+      const own = reactResolver!.resolve({ ...ref, filePath: 'src/hooks/useAuth.ts', fromNodeId: 'function:src/hooks/useAuth.ts:x:30' }, context);
+      expect(own?.targetNodeId).toBe('hook:src/hooks/useAuth.ts:useAuth:1');
     });
   });
 
