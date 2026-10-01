@@ -480,13 +480,20 @@ function isMiddlewareName(name: string): boolean {
 /**
  * Resolve middleware reference using name-based lookup
  */
+/** Node kinds a middleware can be declared as. */
+const MIDDLEWARE_KINDS: ReadonlySet<string> = new Set(['function', 'method', 'variable', 'constant', 'class']);
+
 function resolveMiddleware(
   name: string,
   context: ResolutionContext,
   fromFile?: string,
 ): string | null {
-  // Try exact name first — the calling file's own first.
-  const candidates = context.getNodesByName(name).sort((a, b) => Number(b.filePath === fromFile) - Number(a.filePath === fromFile));
+  // Try exact name first — the calling file's own first. A middleware is a
+  // declaration (a function, a value, a class), never the file's import of a
+  // package (`import cors from 'cors'`) nor a heading or a module node.
+  const candidates = context.getNodesByName(name)
+    .filter((n) => MIDDLEWARE_KINDS.has(n.kind))
+    .sort((a, b) => Number(b.filePath === fromFile) - Number(a.filePath === fromFile));
   const match = candidates.find((n) =>
     n.name.toLowerCase() === name.toLowerCase() ||
     n.name.toLowerCase() === name.replace(/Middleware$/i, '').toLowerCase()
@@ -496,7 +503,7 @@ function resolveMiddleware(
   // Try without Middleware suffix
   const baseName = name.replace(/Middleware$/i, '');
   if (baseName !== name) {
-    const baseCandidates = context.getNodesByName(baseName);
+    const baseCandidates = context.getNodesByName(baseName).filter((n) => MIDDLEWARE_KINDS.has(n.kind));
     const MIDDLEWARE_DIRS = ['/middleware/', '/middlewares/'];
     const preferred = baseCandidates.filter((n) =>
       MIDDLEWARE_DIRS.some((d) => n.filePath.includes(d))
