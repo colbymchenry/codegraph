@@ -33,6 +33,7 @@ import * as fs from 'fs';
 import type { Node as SyntaxNode, Tree } from 'web-tree-sitter';
 import type { Language } from '../types';
 import { getParser, loadGrammarsForLanguages } from '../extraction/grammars';
+import { parseWithinBudget } from '../extraction/parse-budget';
 
 // =============================================================================
 // Public shape
@@ -213,7 +214,7 @@ async function parse(source: string, language: Language): Promise<Tree | null> {
     await loadGrammarsForLanguages([language]);
     const parser = getParser(language);
     if (!parser) return null;
-    return parser.parse(source) ?? null;
+    return parseWithinBudget(parser, source);
   } catch {
     return null;
   }
@@ -293,7 +294,7 @@ export function guardsForFileSync(
     } catch {
       return out;
     }
-    const tree = parser.parse(source);
+    const tree = parseWithinBudget(parser, source);
     if (!tree) return out;
     cached = { key, tree, source };
     remember(absPath, cached);

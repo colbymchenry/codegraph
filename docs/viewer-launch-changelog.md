@@ -171,6 +171,8 @@ These describe `codegraph ui` and its screens. They were taken out of `## [Unrel
 
 ## Fixes — Symbols, tests and the viewer
 
+- **One slow file can no longer freeze the viewer.** Code is highlighted with the same grammars the index uses. The COBOL grammar never finishes a line like `    .`, which free-format COBOL paragraphs end with, so opening a Flow through cobolcraft froze `codegraph ui`, and every page after it waited forever. Highlighting now runs where it can be stopped: a piece of code that takes too long is shown unhighlighted, and everything else keeps working.
+
 - **The Map opens on a picture, not a single box.** A project whose code sits in one flat folder, like Express's `lib/`, an R package's `R/`, an Erlang app's `src/` or fmt's `include/fmt/`, opened as one box with nothing to say. It now opens on the whole repository when that draws more. Files at the repository's top level also count when the Map picks where the program lives: git's hundreds of top-level `.c` files had made `builtin/` look like most of the code.
 
 - **A Flow between two symbols finds names of any shape.** A Flow opened from a Steps link, an entry point or the search box names its two ends by the symbols' own names, and names that don't look like plain identifiers were dropped: an Objective-C selector like `initWithFrame:`, a Ruby method like `save!` or `valid?`, and any name shorter than three letters, like `ok`. The strip then said the other end "names nothing in this index", even though it was there. Both ends are now looked up exactly as written.
