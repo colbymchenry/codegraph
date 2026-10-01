@@ -8957,7 +8957,7 @@ function isRFunctionValue(n: Node, context: ResolutionContext): boolean {
 const VALUE_KINDS: ReadonlySet<string> = new Set(['variable', 'constant', 'field', 'property']);
 
 /** Languages whose methods overload by arity. */
-const OVERLOADING_LANGUAGES: ReadonlySet<string> = new Set(['csharp', 'java', 'kotlin', 'swift', 'cpp', 'scala', 'dart', 'vbnet']);
+const OVERLOADING_LANGUAGES: ReadonlySet<string> = new Set(['csharp', 'java', 'kotlin', 'swift', 'cpp', 'scala', 'dart', 'vbnet', 'solidity']);
 
 /**
  * A call a method makes to its own name, with arguments its own parameters
