@@ -19,6 +19,8 @@ import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ROLE_DEFINITION, ScipIndex, loadScipIndex, parseSymbol } from '../../src/scip/reader';
+import { INDEXERS, languageOfTool } from '../../src/scip/indexers';
+import { chainStart } from '../../src/scip/sites';
 import { callShape } from '../../src/scip/syntax';
 
 type Line = string; // `${path}:${line}`
@@ -36,8 +38,12 @@ function arg(name: string, fallback?: string): string | undefined {
   return i >= 0 ? process.argv[i + 1] : fallback;
 }
 
-/** `${path}:${line}:${callee}` → SCIP symbols called there (external ones included). */
-function scipCalls(ix: ScipIndex, repo: string): Map<string, Set<string>> {
+/**
+ * `${path}:${line}:${callee}` → SCIP symbols called there (external ones included).
+ * `atChainStart`: a chain's `.method()` line counts at the chain's first line,
+ * where codegraph keys it (sites.ts chainStart) — the graph's view, not grep's.
+ */
+function scipCalls(ix: ScipIndex, repo: string, atChainStart = false): Map<string, Set<string>> {
   const out = new Map<string, Set<string>>();
   for (const doc of ix.documents) {
     let lines: string[];
@@ -51,7 +57,8 @@ function scipCalls(ix: ScipIndex, repo: string): Map<string, Set<string>> {
       const p = parseSymbol(o.symbol);
       if (!p || (p.last.kind !== 'method' && p.last.kind !== 'term')) continue;
       if (callShape(o, doc.positionEncoding, lines) !== 'call') continue; // the merge's own call test
-      const key = `${doc.relativePath}:${o.range.startLine + 1}:${p.last.name}`;
+      const line = atChainStart ? chainStart(lines, o.range.startLine, o.range.startCol) : o.range.startLine;
+      const key = `${doc.relativePath}:${line + 1}:${p.last.name}`;
       let s = out.get(key);
       if (!s) out.set(key, (s = new Set()));
       s.add(o.symbol);
@@ -128,6 +135,8 @@ function main(): void {
   const seed = Number(arg('seed', '1'));
   const ix = loadScipIndex(scipFile);
   const calls = scipCalls(ix, repo);
+  const lang = languageOfTool(ix.toolName);
+  const graphCalls = lang && INDEXERS[lang].chainCallsAtStart ? scipCalls(ix, repo, true) : calls;
   const hDb = new DatabaseSync(hPath, { readOnly: true });
   const mDb = new DatabaseSync(mPath, { readOnly: true });
   const targets = randomTargets(ix, hDb, calls, n, seed, arg('prefix', '')!);
@@ -135,15 +144,15 @@ function main(): void {
   type Tot = { candidates: number; true: number; wrong: number; unknown: number; truth: number; bytes: number; recalls: number[] };
   const tot = new Map<string, Tot>();
   for (const t of targets) {
-    let truth = 0;
-    for (const [k, syms] of calls) if (k.endsWith(`:${t.name}`) && syms.has(t.symbol)) truth++;
+    const truthIn = (m: Map<string, Set<string>>) => { let n = 0; for (const [k, syms] of m) if (k.endsWith(`:${t.name}`) && syms.has(t.symbol)) n++; return n; };
     const g = grep(repo, t.grep, arg('rg-type', 'ts')!);
-    const methods: Record<string, { hits: Set<Line>; bytes: number }> = {
-      'grep naive': g,
-      codegraph: { hits: graphCallers(hDb, t), bytes: 0 },
-      'codegraph+SCIP': { hits: graphCallers(mDb, t), bytes: 0 },
+    const methods: Record<string, { hits: Set<Line>; bytes: number; calls: Map<string, Set<string>> }> = {
+      'grep naive': { ...g, calls },
+      codegraph: { hits: graphCallers(hDb, t), bytes: 0, calls: graphCalls },
+      'codegraph+SCIP': { hits: graphCallers(mDb, t), bytes: 0, calls: graphCalls },
     };
-    for (const [name, { hits, bytes }] of Object.entries(methods)) {
+    for (const [name, { hits, bytes, calls }] of Object.entries(methods)) {
+      const truth = truthIn(calls);
       let c = tot.get(name);
       if (!c) tot.set(name, (c = { candidates: 0, true: 0, wrong: 0, unknown: 0, truth: 0, bytes: 0, recalls: [] }));
       let tp = 0;

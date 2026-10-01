@@ -37,3 +37,22 @@ impl Service {
         helper(1)
     }
 }
+
+pub enum Shape {
+    Circle(i64),
+    Square { side: i64 },
+}
+
+pub fn shapes() -> Shape {
+    let _square = Shape::Square { side: 2 };
+    Shape::Circle(1)
+}
+
+pub fn wrapped() -> Option<i64> {
+    Some(helper(1))
+}
+
+pub fn chained() -> i64 {
+    Invoice::new(5)
+        .total_price()
+}

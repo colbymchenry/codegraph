@@ -89,6 +89,13 @@ export interface IndexerSpec {
   preferred?(projectRoot: string, outFile: string): (Invocation & { cmd: string }) | { unusable: string } | null;
   /** for languages that construct values with `Type{…}` rather than a call */
   literalShape?: LiteralShape;
+  /** An enum variant built like a call (Rust `Some(x)`) is a call to the variant — codegraph's view — not an instantiation. */
+  variantCalls?: boolean;
+  /**
+   * A call that is a chain's own `.method()` line is keyed at the line the chain
+   * starts on, where codegraph puts it (Rust, as rustfmt lays chains out).
+   */
+  chainCallsAtStart?: boolean;
   /**
    * Patching an installed index instead of rebuilding it (produce.ts patchIndex).
    * `tools`: whose indexes can be patched — their symbols must be named the same

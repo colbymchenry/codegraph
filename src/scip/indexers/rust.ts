@@ -20,6 +20,8 @@ export const rustIndexer: IndexerSpec = {
   detect: root => workspaces(root).length > 0,
   cmd: 'rust-analyzer',
   probe: ['--version'],
+  variantCalls: true,
+  chainCallsAtStart: true,
   invocation: (root, outFile) => {
     const dirs = workspaces(root);
     return {

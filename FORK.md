@@ -169,7 +169,7 @@ MCP output: Flow steps read `↓ calls (compiler-verified)` or `(unverified: …
 - **No document** (roadmap 4.3): tsgo now indexes TS/JS files outside every tsconfig as one inferred program (also a repo with no tsconfig at all), and Go modules / Cargo workspaces below the repo root get a run each. Unverified call edges: Playwright 30.2% → 14.3%, codegraph 68.4% → 5.3% (`__tests__` and `codegraph-kernel/`), vscode 7.1% → 6.3% (no document 14,839 → 293; Rust `cli/` indexed); Django's JS indexed. Eval gates unchanged. Nothing judges the inferred program independently (scip-typescript indexes the same tsconfig projects); spot checks of removed edges in codegraph's tests read right (`spawn` → `child_process`, `controller.enqueue` → a stream controller).
 - **No reference:** SCIP resolved nothing at the call: an untyped receiver (most of Django: `self.apps.check_models_ready()`), an `any`, an unresolved import. Some of these heuristic edges are wrong guesses (`self.label.title()` → `defaultfilters.title`) that the merge can't judge.
 - **No document:** no index covers the caller's file. TS files no `tsconfig.json` includes (vscode `extensions/copilot`: 8,009; codegraph `__tests__`), a language root below the repo root that detection misses (vscode's Rust `cli/`: 3,201; codegraph's `codegraph-kernel/`: 3,709), and vendored JS (Playwright `tests/assets`: 17,343).
-- **Not a call to SCIP / later line (Rust):** rust-analyzer names `Ok(…)`, `Some(…)` and tuple-struct constructors as types, so the merge keys them as instantiations while the heuristic edge is a call; and in a multi-line chain codegraph puts the call on the chain's first line, SCIP on the method name's.
+- **Not a call to SCIP / later line (Rust):** rust-analyzer names enum variants as types (`Result#Ok#`), so `Ok(…)` / `Some(…)` were keyed as instantiations while codegraph records a call to the variant; and in a multi-line chain codegraph keys a call at the chain's first line, SCIP at the method name's. Fixed (roadmap 4.4): the Rust adapter declares `variantCalls` and `chainCallsAtStart`, and variant definitions map to `enum_member` nodes. ripgrep: unverified 19.1% → **1.1%** (2,460 → 118). The eval now judges the graph at the line codegraph keys a call on, so codegraph-only Rust recall reads a few points higher (37 → 40%, 20 → 24%); codegraph+SCIP is unchanged.
 - **Target outside graph:** a definition in a file codegraph has no nodes for. Only Playwright's `types.d.ts` (over the 1 MB limit): 709 edges.
 
 ## Eval gate
@@ -193,8 +193,8 @@ Pass bar per language (2 seeds × 50 random targets): precision ≥ 95%, recall 
 | Python | same | 2 | 100% / 24% | 75% / 96% | **100% / 100%** | |
 | Go | spf13/cobra @ adbc881 (37 docs) | 1 | 100% / 87% | 100% / 99% | **100% / 100%** | 6.5 s + 0.2 s |
 | Go | same | 2 | 100% / 98% | 100% / 99% | **100% / 100%** | |
-| Rust | BurntSushi/ripgrep @ 3fce3b5 (104 docs) | 1 | 100% / 7% | 37% / 83% | **99% / 99%**⁴ | 12.6 s + 1.0 s |
-| Rust | same | 2 | 100% / 22% | 20% / 73% | **100% / 99%** | |
+| Rust | BurntSushi/ripgrep @ 3fce3b5 (104 docs) | 1 | 100% / 7% | 40% / 84% | **99% / 99%**⁴ | 12.6 s + 1.0 s |
+| Rust | same | 2 | 100% / 22% | 24% / 72% | **100% / 99%** | |
 
 The tsgo rows are judged by **scip-typescript's** index. An index can't be checked against itself, and this gives an independent compiler's view. Judged by its own index, tsgo also scores 100% / 100% on both seeds.
 

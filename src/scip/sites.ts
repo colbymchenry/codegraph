@@ -12,7 +12,7 @@ import type { SqliteDatabase } from '../db/sqlite-adapter';
 import { INDEXERS } from './indexers';
 import { ParsedSymbol, ROLE_DEFINITION, ScipDocument, ScipOccurrence, parseSymbol } from './reader';
 import type { ScipLanguage } from './store';
-import { LiteralShape, SiteKind, callShape, isCallTarget, siteKind } from './syntax';
+import { CallShape, LiteralShape, SiteKind, callShape, isCallTarget, siteKind } from './syntax';
 
 export type { SiteKind } from './syntax';
 
@@ -28,6 +28,8 @@ export const HEURISTIC_PROVENANCE = "(provenance IS NULL OR provenance = 'tree-s
 
 const CALLABLE_KINDS: readonly string[] = ['function', 'method'];
 const TYPE_KINDS: readonly string[] = ['class', 'struct', 'interface', 'trait'];
+/** A type nested in a type: also an enum variant (rust-analyzer names `Result::Ok` `Result#Ok#`). */
+const NESTED_TYPE_KINDS: readonly string[] = [...TYPE_KINDS, 'enum_member'];
 const INTERFACE_KINDS: readonly string[] = ['interface', 'trait'];
 
 /** codegraph's label for a type → base edge: a class/struct implements an interface/trait, anything else extends. */
@@ -117,7 +119,7 @@ class FileNodes {
   private byFile = new Map<string, FileIndex>();
 
   constructor(db: SqliteDatabase, files: Set<string>) {
-    const kinds = [...new Set([...CALLABLE_KINDS, ...TYPE_KINDS, ...CONTAINER_KINDS, 'file'])];
+    const kinds = [...new Set([...CALLABLE_KINDS, ...NESTED_TYPE_KINDS, ...CONTAINER_KINDS, 'file'])];
     const rows = db.prepare(
       `SELECT id, kind, name, qualified_name, file_path, start_line, end_line, start_column, end_column FROM nodes
        WHERE kind IN (${kinds.map(() => '?').join(',')})`
@@ -230,8 +232,9 @@ export function scipSites(
         projectSymbols.add(o.symbol);
         const { name, kind } = parsed.last;
         if (!known || !isCallTarget(kind)) continue;
+        const nested = kind === 'type' && parse(parsed.owner)?.last.kind === 'type';
         const node = nodes.definition(doc.relativePath, o.range.startLine, CONSTRUCTOR_NAMES.get(name) ?? name,
-          kind === 'type' ? TYPE_KINDS : kind === 'term' ? CALLED_VALUE_KINDS : CALLABLE_KINDS);
+          nested ? NESTED_TYPE_KINDS : kind === 'type' ? TYPE_KINDS : kind === 'term' ? CALLED_VALUE_KINDS : CALLABLE_KINDS);
         const first = symToNode.get(o.symbol);
         if (node && first) {
           // One symbol defined more than once. An overload — a node per signature,
@@ -304,19 +307,19 @@ export function scipSites(
 
   // Pass 2: references that are calls, keyed by the caller codegraph would name.
   for (const { lang, docs } of indexes) {
-    const literal = INDEXERS[lang].literalShape;
+    const { literalShape: literal, variantCalls = false, chainCallsAtStart = false } = INDEXERS[lang];
     for (const doc of docs) {
       const lines = fresh.get(doc.relativePath);
       if (!lines || (judged && !judged.has(doc.relativePath))) continue;
       for (const o of doc.occurrences) {
         if (o.roles & ROLE_DEFINITION) continue;
-        const call = classify(o, doc.positionEncoding, lines, literal, symToNode, parse);
+        const call = classify(o, doc.positionEncoding, lines, literal, symToNode, parse, variantCalls);
         if (!call) continue;
         const { startLine, startCol } = o.range;
         const caller = nodes.callerAt(doc.relativePath, startLine, startCol);
         if (!caller) continue;
         if (!caller.inFunction) bump('call_outside_functions');
-        const key = siteKey(caller.id, startLine + 1, call.name, call.kind);
+        const key = siteKey(caller.id, (chainCallsAtStart ? chainStart(lines, startLine, startCol) : startLine) + 1, call.name, call.kind);
         if (call.target !== null) {
           addTarget(sites, key, call.target, startCol);
           bump(`${call.kind}_resolved`);
@@ -355,16 +358,19 @@ interface Call {
 
 function classify(
   o: ScipOccurrence, encoding: number, lines: string[], literal: LiteralShape | undefined,
-  symToNode: Map<string, NodeRow>, parse: (symbol: string) => ParsedSymbol | null
+  symToNode: Map<string, NodeRow>, parse: (symbol: string) => ParsedSymbol | null, variantCalls: boolean
 ): Call | null {
   const parsed = parse(o.symbol);
   if (!parsed) return null;
   const { name, kind } = parsed.last;
-  const site = siteKind(kind, () => callShape(o, encoding, lines, literal));
+  let shape: CallShape | null | undefined;
+  const shapeOf = () => (shape === undefined ? (shape = callShape(o, encoding, lines, literal)) : shape);
+  const site = siteKind(kind, shapeOf);
   if (!site) return null;
   if (site === 'instantiates') { // Foo(…), new Foo, Foo{…}
     const node = symToNode.get(o.symbol);
-    return { kind: 'instantiates', name: node?.name ?? name, target: node?.id ?? null, symbol: o.symbol };
+    const variant = variantCalls && shapeOf() === 'call' && parse(parsed.owner)?.last.kind === 'type'; // `Some(x)`
+    return { kind: variant ? 'calls' : 'instantiates', name: node?.name ?? name, target: node?.id ?? null, symbol: o.symbol };
   }
   if (kind === 'method' && name === '<constructor>') {
     const cls = symToNode.get(parsed.owner);
@@ -374,6 +380,16 @@ function classify(
   if (kind === 'method') return { kind: 'calls', name: node?.name ?? name, target: node?.id ?? null, symbol: o.symbol };
   // A called `term` is a function-valued binding (`const f = () => …`, `const expect: Expect`, a Go interface method) — judged only when it maps to a node.
   return node ? { kind: 'calls', name: node.name, target: node.id, symbol: o.symbol } : null;
+}
+
+/**
+ * The 0-based line a chain starts on, for a call that is a chain's own
+ * `.method()` line (only whitespace and the dot before the name); else `line`.
+ */
+export function chainStart(lines: string[], line: number, col: number): number {
+  if (!/^\s*\??\.\s*$/.test(lines[line]!.slice(0, col))) return line;
+  while (line > 0 && /^\s*\??\./.test(lines[line]!)) line--;
+  return line;
 }
 
 /** codegraph's own edges at the same kind of site, for callers in `files`. */

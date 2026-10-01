@@ -44,3 +44,8 @@ pub fn helper(x: i64) -> i64 {
 pub fn map_all<T, F: Fn(&T) -> i64>(xs: &[T], f: F) -> Vec<i64> {
     xs.iter().map(|x| f(x)).collect()
 }
+
+pub enum Maybe {
+    Some(i64),
+    Nothing,
+}

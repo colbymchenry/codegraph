@@ -68,6 +68,10 @@ fixtureSuite('scip-rust', 'rust', (edge) => {
   expect(edge('total', 'Invoice::total_price')?.provenance).toBe('scip'); // inside a closure
   expect(edge('make', 'Invoice', 'instantiates')).toBeUndefined(); // `-> Invoice {` is a return type
   expect(edge('Service::run', 'Service', 'instantiates')).toBeUndefined(); // `impl Service {`
+  expect(edge('shapes', 'Shape::Circle')?.provenance).toBe('scip'); // a variant built like a call is a call
+  expect(edge('shapes', 'Shape::Square', 'instantiates')?.provenance).toBe('scip'); // a struct-like variant literal
+  expect(edge('wrapped', 'Maybe::Some')).toBeUndefined(); // std's Some, not the project's
+  expect(edge('chained', 'Invoice::total_price')).toMatchObject({ line: 56, provenance: 'scip' }); // keyed where the chain starts, once
 });
 
 describe('literal call shapes', () => {
