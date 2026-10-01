@@ -30,7 +30,7 @@ function parseLang(raw: string | undefined): ScipLanguage | undefined {
   return raw as ScipLanguage;
 }
 
-function describe(r: ScipPassReport): string {
+export function describe(r: ScipPassReport): string {
   const o = r.outcome;
   return [
     `${r.freshDocuments}/${r.documents} documents merged (${r.staleDocuments.length} stale${r.judgedDocuments < r.freshDocuments ? `, ${r.judgedDocuments} re-judged` : ''}) in ${r.durationMs}ms (${Object.entries(r.phases).map(([k, v]) => `${k} ${v}`).join(', ')})`,

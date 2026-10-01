@@ -97,7 +97,7 @@ Ordered by 4.1's measurement (FORK.md, "Why edges stay unverified"). Untyped cal
 
 | # | Task | How | Check |
 |---|---|---|---|
-| 5.1 | Overlap the indexer with codegraph's tree-sitter pass | Start the indexer while codegraph extracts; snapshot hashes after extraction; merge at the end | vscode first index from ~3m50s to ~2m50s |
+| 5.1 | **Done** (`init --scip`). Overlap the indexer with codegraph's tree-sitter pass | Start the indexer once extraction is stored, while references resolve: hashes and the pending references' lines are all it needs; compact against the resolved edges and merge at the end | Playwright 29.2 s → 23.5 s, same graph (edge for edge; fixture test). vscode not measured. Found on the way: tsgo-index emitted a reference at a declaration's own name on a reference line, read as a self-call (Playwright: ~5.5k counted calls, the self-call edges at definitions) |
 | 5.2 | Merge in chunks | Sites and writes by file group instead of all at once | vscode merge memory below ~3.8 GB; same graph |
 
 ## Phase 6: measurement (after the fixes)

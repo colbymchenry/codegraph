@@ -85,6 +85,18 @@ export function referenceSites(db: SqliteDatabase, files?: Iterable<string>): Se
   return new Set((rows as { file: string; line: number; name: string }[]).map(r => referenceKey(r.file, r.line, r.name)));
 }
 
+/**
+ * The sites of the `references` codegraph has extracted but not resolved yet:
+ * during a first index, before resolution turns them into edges (a superset of
+ * those edges' lines — see produce.ts startIndex).
+ */
+export function pendingReferenceSites(db: SqliteDatabase): Set<string> {
+  // A function passed by name is extracted as `function_ref` and stored as a `references` edge (resolution/index.ts).
+  const rows = db.prepare(`SELECT file_path AS file, line, reference_name AS name FROM unresolved_refs
+    WHERE reference_kind IN ('references', 'function_ref')`).all();
+  return new Set((rows as { file: string; line: number; name: string }[]).map(r => referenceKey(r.file, r.line, r.name)));
+}
+
 export function siteKey(source: string, line: number, name: string, kind: SiteKind): string {
   return `${source}\0${line}\0${name}\0${kind}`;
 }

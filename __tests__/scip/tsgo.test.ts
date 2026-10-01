@@ -346,6 +346,28 @@ describe.runIf(TSGO)('incremental reindex (tsgo, through the CLI)', () => {
     expect(await refs()).toEqual(['use->Shape2:4:scip']);
   }, 120_000);
 
+  it('init --scip runs the indexer while references resolve, and ends where init + scip index does', async () => {
+    const graph = async () => {
+      const cg = await CodeGraph.open(dir);
+      try {
+        return cg.scipReadDb().prepare(`SELECT s.qualified_name || '>' || t.qualified_name || ':' || e.kind || ':' || IFNULL(e.line, '') || ':' || IFNULL(e.provenance, '-') AS e
+          FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target ORDER BY 1`).all().map(r => (r as { e: string }).e);
+      } finally {
+        cg.close();
+      }
+    };
+    fs.writeFileSync(path.join(dir, 'src', 'kinds.ts'), 'export enum Kind { Blob, Other }\nexport interface Shape2 { x: number }\n');
+    fs.writeFileSync(path.join(dir, 'src', 'saver.ts'),
+      'import { Shape2 } from "./kinds";\nexport function save(b: Blob): Blob { return b; }\nexport function use(s: Shape2): Shape2 { return s; }\nconst f = () => use({ x: 1 });\nexport const run = [f].map(g => g);\n');
+    cli('init', '-y', dir);
+    cli('scip', 'index', dir);
+    const sequential = await graph();
+    expect(sequential.filter(e => e.endsWith(':scip')).length).toBeGreaterThan(0);
+    fs.rmSync(path.join(dir, '.codegraph'), { recursive: true });
+    expect(cli('init', '-y', '--scip', dir)).toMatch(/typescript: \d+ documents/);
+    expect(await graph()).toEqual(sequential);
+  }, 120_000);
+
   it('re-indexes only the edited file (and its importers), splicing it into the installed index', async () => {
     fs.writeFileSync(path.join(dir, 'src', 'spare.ts'), 'export function spare(): number {\n  return 0;\n}\n'); // called by nothing yet
     cli('init', '-y', dir);

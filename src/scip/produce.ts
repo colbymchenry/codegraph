@@ -115,93 +115,149 @@ export function incrementalPlan(db: SqliteDatabase, projectRoot: string, lang: S
 export async function produceIndex(
   db: SqliteDatabase, projectRoot: string, lang: ScipLanguage, opts: ProduceOptions = {}
 ): Promise<ProduceResult> {
+  const prepared = prepare(projectRoot, lang);
+  if ('status' in prepared) return prepared;
+  // codegraph's references: compaction keeps the SCIP references there, and tsgo-index
+  // (which resolves only what the merge reads) is told where they are.
+  const refs = referenceSites(db);
+  writeReferenceSites(`${prepared.raw}.refs`, refs);
+  if (opts.incremental) {
+    const patched = await patchIndex(db, projectRoot, lang, prepared.indexer, prepared.raw, opts, refs);
+    if (patched) return patched;
+  }
+  return fullRun(db, projectRoot, lang, prepared, opts).finish(db);
+}
+
+/** A full run whose indexer runs are under way; `finish` compacts and installs their output. */
+export interface StartedIndex {
+  /** settles when the runs are done (whatever their outcome): the next language's runs may start */
+  ran: Promise<void>;
+  /** compacts against the graph's references as they are now, installs, and cleans up — call it exactly once */
+  finish(db: SqliteDatabase): Promise<ProduceResult>;
+}
+
+/**
+ * A full run started before codegraph has resolved its references — the first
+ * index's overlap (`init --scip`): `refs` are the reference sites extracted so
+ * far (sites.ts pendingReferenceSites), a superset of the lines the resolved
+ * edges will sit on, which is all tsgo-index needs. `after`: start the runs
+ * only once it settles (one language's runs at a time, as produceIndex does).
+ */
+export function startIndex(
+  db: SqliteDatabase, projectRoot: string, lang: ScipLanguage, refs: Set<string>, opts: ProduceOptions & { after?: Promise<unknown> } = {}
+): StartedIndex | ProduceResult {
+  const prepared = prepare(projectRoot, lang);
+  if ('status' in prepared) return prepared;
+  writeReferenceSites(`${prepared.raw}.refs`, refs);
+  return fullRun(db, projectRoot, lang, prepared, opts);
+}
+
+interface Prepared { final: string; raw: string; indexer: ResolvedIndexer }
+
+function prepare(projectRoot: string, lang: ScipLanguage): Prepared | ProduceResult {
   const final = indexPath(projectRoot, lang);
   const raw = `${final}.${process.pid}.raw`; // the indexer's own output, compacted into the installed index
   fs.mkdirSync(path.dirname(final), { recursive: true }); // adapters may write helper files beside the output
   const indexer = resolveIndexer(projectRoot, lang, raw);
   if ('skip' in indexer) return { status: 'skipped', lang, reason: indexer.skip };
-  // codegraph's references: compaction keeps the SCIP references there, and tsgo-index
-  // (which resolves only what the merge reads) is told where they are.
-  const refs = referenceSites(db);
-  writeReferenceSites(`${raw}.refs`, refs);
-  if (opts.incremental) {
-    const patched = await patchIndex(db, projectRoot, lang, indexer, raw, opts, refs);
-    if (patched) return patched;
-  }
+  return { final, raw, indexer };
+}
 
+/** Starts the full run's indexer now (once `after` settles); see StartedIndex. */
+function fullRun(
+  db: SqliteDatabase, projectRoot: string, lang: ScipLanguage, { final, raw, indexer }: Prepared,
+  opts: ProduceOptions & { after?: Promise<unknown> }
+): StartedIndex {
   const started = Date.now();
   const hashes = snapshotHashes(db, projectRoot, INDEXERS[lang].codegraphLanguages);
   const warnings: string[] = indexer.warning ? [indexer.warning] : [];
   if (indexer.warning) opts.log?.(`${lang}: ${indexer.warning}`);
   const { runs } = indexer;
   const all = (rs: typeof runs): typeof runs => rs.flatMap(r => [r, ...all(r.fallback ?? [])]);
-  try {
-    // Heavy runs one at a time (parallel heavy runs would stack the very memory
-    // the split exists to bound), then light runs in a small pool. A failed run
-    // with a fallback is retried as its parts; any other failed part of a split
-    // run is a warning — its files stay heuristic-only. Only a total failure fails.
-    const outputs = new Map<IndexerRun, string[]>();
-    const failures: string[] = [];
-    let done = 0;
-    const attempt = async (r: IndexerRun): Promise<string[]> => {
-      if (opts.signal?.aborted) return [];
-      opts.log?.(`${runs.length > 1 ? `[${++done}/${runs.length}] ${r.label}: ` : ''}running ${indexer.cmd} ${r.args.slice(0, 8).join(' ')}${r.args.length > 8 ? ` … (+${r.args.length - 8} more)` : ''}`);
-      const useNice = opts.nice && process.platform !== 'win32';
-      const [cmd, args] = useNice ? ['nice', ['-n', '10', indexer.cmd, ...r.args]] : [indexer.cmd, r.args];
-      const { code, stderr } = await runIndexer(cmd, args, path.join(projectRoot, r.cwd ?? '.'), { ...indexer.env, ...r.env }, opts.signal);
-      const why = code !== 0 ? `${indexer.cmd} exited ${code}: ${stderr.trim().split('\n').slice(-3).join(' | ')}`
-        : !fs.existsSync(r.output) ? `${indexer.cmd} exited 0 but wrote no index at ${r.output}` : null;
-      if (!why) {
-        for (const w of stderr.split('\n')) if (w.startsWith(RUN_WARNING)) warnings.push(`${r.label}: ${w.slice(RUN_WARNING.length)} — its files stay heuristic-only`);
-        return [r.output];
-      }
-      if (r.fallback?.length) {
-        opts.log?.(`${r.label}: failed as a batch, retrying its ${r.fallback.length} projects one by one — ${why}`);
-        const parts: string[] = [];
-        for (const f of r.fallback) parts.push(...await attempt(f));
-        return parts;
-      }
-      failures.push(`${r.label}: ${why}`);
-      opts.log?.(`${r.label}: failed — ${why}`);
-      return [];
-    };
-    for (const r of runs.filter(r => !r.light)) outputs.set(r, await attempt(r));
-    const light = runs.filter(r => r.light);
-    await Promise.all(Array.from({ length: Math.min(lightConcurrency(), light.length) }, async () => {
-      for (let r = light.shift(); r; r = light.shift()) outputs.set(r, await attempt(r));
-    }));
-    if (opts.signal?.aborted) return { status: 'failed', lang, reason: 'aborted' };
-    const parts = runs.flatMap(r => outputs.get(r) ?? []); // plan order, whatever finished first
-    if (parts.length === 0) {
-      return { status: 'failed', lang, reason: failures.length === 1 ? failures[0]! : `all ${failures.length} runs failed; first: ${failures[0]}` };
-    }
-    for (const f of failures) warnings.push(`${f} — its files stay heuristic-only`);
 
-    // Compact while combining: one part in memory at a time (see compact.ts).
-    const compact = new Compactor(projectRoot, lang, refs);
+  // Heavy runs one at a time (parallel heavy runs would stack the very memory
+  // the split exists to bound), then light runs in a small pool. A failed run
+  // with a fallback is retried as its parts; any other failed part of a split
+  // run is a warning — its files stay heuristic-only. Only a total failure fails.
+  const outputs = new Map<IndexerRun, string[]>();
+  const failures: string[] = [];
+  let done = 0;
+  const attempt = async (r: IndexerRun): Promise<string[]> => {
+    if (opts.signal?.aborted) return [];
+    opts.log?.(`${runs.length > 1 ? `[${++done}/${runs.length}] ${r.label}: ` : ''}running ${indexer.cmd} ${r.args.slice(0, 8).join(' ')}${r.args.length > 8 ? ` … (+${r.args.length - 8} more)` : ''}`);
+    const useNice = opts.nice && process.platform !== 'win32';
+    const [cmd, args] = useNice ? ['nice', ['-n', '10', indexer.cmd, ...r.args]] : [indexer.cmd, r.args];
+    const { code, stderr } = await runIndexer(cmd, args, path.join(projectRoot, r.cwd ?? '.'), { ...indexer.env, ...r.env }, opts.signal);
+    const why = code !== 0 ? `${indexer.cmd} exited ${code}: ${stderr.trim().split('\n').slice(-3).join(' | ')}`
+      : !fs.existsSync(r.output) ? `${indexer.cmd} exited 0 but wrote no index at ${r.output}` : null;
+    if (!why) {
+      for (const w of stderr.split('\n')) if (w.startsWith(RUN_WARNING)) warnings.push(`${r.label}: ${w.slice(RUN_WARNING.length)} — its files stay heuristic-only`);
+      return [r.output];
+    }
+    if (r.fallback?.length) {
+      opts.log?.(`${r.label}: failed as a batch, retrying its ${r.fallback.length} projects one by one — ${why}`);
+      const parts: string[] = [];
+      for (const f of r.fallback) parts.push(...await attempt(f));
+      return parts;
+    }
+    failures.push(`${r.label}: ${why}`);
+    opts.log?.(`${r.label}: failed — ${why}`);
+    return [];
+  };
+  let runMs = 0; // the runs' own time, not the wait for `after` (what the patch planner compares against)
+  const ran = (async () => {
+    await opts.after?.catch(() => undefined);
+    const runStart = Date.now();
     try {
-      for (const p of parts) compact.add(fs.readFileSync(p));
-    } catch (err) {
-      if (!(err instanceof ScipDecodeError)) throw err;
-      return { status: 'failed', lang, reason: `${indexer.cmd} wrote an unreadable index: ${err.message}` };
+      for (const r of runs.filter(r => !r.light)) outputs.set(r, await attempt(r));
+      const light = runs.filter(r => r.light);
+      await Promise.all(Array.from({ length: Math.min(lightConcurrency(), light.length) }, async () => {
+        for (let r = light.shift(); r; r = light.shift()) outputs.set(r, await attempt(r));
+      }));
+    } finally {
+      runMs = Date.now() - runStart;
     }
-    if (compact.paths.length === 0) return { status: 'failed', lang, reason: `${indexer.cmd} wrote an index with no documents` };
-    const resolvedCalls = compact.resolvedCalls();
-    const previous = fs.existsSync(final) ? readMeta(projectRoot, lang)?.resolvedCalls ?? null : null;
-    if (!opts.force && previous !== null && resolvedCalls < previous * (1 - MAX_RESOLUTION_DROP)) {
-      return {
-        status: 'rejected', lang,
-        reason: `resolved calls fell from ${previous} to ${resolvedCalls} (>${MAX_RESOLUTION_DROP * 100}% drop) — kept the previous index; fix the build or pass --force`,
-      };
+  })();
+  ran.catch(() => undefined); // finish rethrows; until then a failure is not "unhandled"
+
+  const finish = async (db: SqliteDatabase): Promise<ProduceResult> => {
+    try {
+      await ran;
+      const compactStart = Date.now();
+      if (opts.signal?.aborted) return { status: 'failed', lang, reason: 'aborted' };
+      const parts = runs.flatMap(r => outputs.get(r) ?? []); // plan order, whatever finished first
+      if (parts.length === 0) {
+        return { status: 'failed', lang, reason: failures.length === 1 ? failures[0]! : `all ${failures.length} runs failed; first: ${failures[0]}` };
+      }
+      for (const f of failures) warnings.push(`${f} — its files stay heuristic-only`);
+
+      // Compact while combining: one part in memory at a time (see compact.ts).
+      const compact = new Compactor(projectRoot, lang, referenceSites(db));
+      try {
+        for (const p of parts) compact.add(fs.readFileSync(p));
+      } catch (err) {
+        if (!(err instanceof ScipDecodeError)) throw err;
+        return { status: 'failed', lang, reason: `${indexer.cmd} wrote an unreadable index: ${err.message}` };
+      }
+      if (compact.paths.length === 0) return { status: 'failed', lang, reason: `${indexer.cmd} wrote an index with no documents` };
+      const resolvedCalls = compact.resolvedCalls();
+      const previous = fs.existsSync(final) ? readMeta(projectRoot, lang)?.resolvedCalls ?? null : null;
+      if (!opts.force && previous !== null && resolvedCalls < previous * (1 - MAX_RESOLUTION_DROP)) {
+        return {
+          status: 'rejected', lang,
+          reason: `resolved calls fell from ${previous} to ${resolvedCalls} (>${MAX_RESOLUTION_DROP * 100}% drop) — kept the previous index; fix the build or pass --force`,
+        };
+      }
+      const durationMs = runMs + (Date.now() - compactStart);
+      installIndex(projectRoot, lang, f => compact.write(f),
+        { tool: compact.meta!.toolName, toolVersion: compact.meta!.toolVersion, producedAt: started, hashes, resolvedCalls, fullRunMs: durationMs });
+      return { status: 'installed', lang, documents: compact.paths.length, resolvedCalls, durationMs, warnings };
+    } finally {
+      for (const r of all(runs)) fs.rmSync(r.output, { force: true });
+      fs.rmSync(`${raw}.refs`, { force: true });
     }
-    const durationMs = Date.now() - started;
-    installIndex(projectRoot, lang, f => compact.write(f),
-      { tool: compact.meta!.toolName, toolVersion: compact.meta!.toolVersion, producedAt: started, hashes, resolvedCalls, fullRunMs: durationMs });
-    return { status: 'installed', lang, documents: compact.paths.length, resolvedCalls, durationMs, warnings };
-  } finally {
-    for (const r of all(runs)) fs.rmSync(r.output, { force: true });
-    fs.rmSync(`${raw}.refs`, { force: true });
-  }
+  };
+  return { ran: ran.catch(() => undefined), finish };
 }
 
 /**

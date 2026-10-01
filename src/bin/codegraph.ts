@@ -684,7 +684,7 @@ async function recordIndexTelemetry(
  */
 async function runInit(
   projectPath: string,
-  options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean },
+  options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean; scip?: boolean },
 ): Promise<void> {
   const clack = await importESM('@clack/prompts');
 
@@ -747,15 +747,16 @@ async function runInit(
     // A closure so we can re-run the exact same supervised, progress-rendered
     // index if the user opts gitignored child repos in below (#1156).
     const dbPath = getDatabasePath(projectPath);
+    const scip = options.scip ? (await import('../scip/first-index')).firstIndexScip(cg) : null;
     const runIndex = async (): Promise<IndexResult> => {
       const supervision = installCommandSupervision('init', { progressPaths: [dbPath, `${dbPath}-wal`] });
       try {
         if (options.verbose) {
-          return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
+          return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true, onExtracted: scip?.onExtracted });
         }
         process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
         const progress = createShimmerProgress();
-        const r = await cg.indexAll({ onProgress: progress.onProgress });
+        const r = await cg.indexAll({ onProgress: progress.onProgress, onExtracted: scip?.onExtracted });
         await progress.stop();
         return r;
       } finally {
@@ -774,6 +775,7 @@ async function runInit(
     if (result.nodesCreated === 0) {
       await offerIndexIgnoredRepos(clack, projectPath, runIndex, { interactive: !options.yes });
     }
+    if (scip) for (const m of await scip.finish()) clack.log[m.level](m.message);
 
     try {
       const { offerWatchFallback } = await import('../installer');
@@ -798,7 +800,8 @@ program
   .option('-f, --force', 'Initialize even if the path looks like your home directory or a filesystem root')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
   .option('-y, --yes', 'Non-interactive: skip every prompt and take the defaults (for scripts / CI / container bootstraps)')
-  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean }) => {
+  .option('--scip', 'Fork: also build the SCIP indexes, the indexers running while references resolve (see `codegraph scip index`)')
+  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean; scip?: boolean }) => {
     await runInit(path.resolve(pathArg || process.cwd()), options);
   });
 

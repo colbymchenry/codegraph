@@ -137,6 +137,11 @@ export interface IndexOptions {
   verbose?: boolean;
   /** Watcher fast path: reconcile ONLY these project-relative paths (see ExtractionOrchestrator.sync). */
   paths?: string[];
+  /**
+   * Fork: called once every file is extracted and stored, before references are
+   * resolved — `init --scip` starts the SCIP indexers here (src/scip/first-index.ts).
+   */
+  onExtracted?: () => void;
 }
 
 /**
@@ -627,6 +632,7 @@ export class CodeGraph {
           // before resolution so updated names show up in subsequent reads.
           this.resolver.runPostExtract();
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] resolver-reinit: ${Date.now() - tReinit}ms`);
+          options.onExtracted?.();
         }
 
         // Resolve references to create call/import/extends edges

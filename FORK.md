@@ -44,10 +44,13 @@ MCP clients that launch `codegraph` pick it up on restart. To go back to the npm
 ## Using it
 
 ```sh
+codegraph init --scip           # first index: the graph and the SCIP indexes together (below)
 codegraph scip index            # run each detected language's indexer (must be on PATH), then merge
 codegraph scip import out.scip  # install an index built elsewhere, then merge
 codegraph scip status
 ```
+
+**First index.** `codegraph init --scip` starts the indexers as soon as codegraph has extracted every file, so they run while it resolves references (`src/scip/first-index.ts`). The indexer needs only what extraction already stored: the content hashes for the hash gate, and, for tsgo-index, the lines of codegraph's references, taken from the references not yet resolved, a superset of where the resolved edges will sit. Compaction (against the resolved edges) and the merge run at the end. The graph is the same as `init` followed by `scip index`; on Playwright the two took 23.5 s instead of 29.2 s. Languages still run one after another.
 
 Indexers are never auto-installed:
 
