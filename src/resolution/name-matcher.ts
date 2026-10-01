@@ -9036,7 +9036,10 @@ function pythonFactoryTypeUncached(
     if (nested.some((n) => ln >= n.startLine && ln <= n.endLine)) continue;
     const text = (lines[ln - 1] ?? '').trim();
     if (/^yield\b|[=(\s]yield\b/.test(text)) return null; // a generator yields, it does not return
-    const ret = /^return\b\s*(.*)$/.exec(text);
+    // A return may follow a compound header or another statement on the same
+    // line — `if k: return A()`, `else: return B()`, `x = 1; return C()` — and
+    // every one of them must agree, so none may be skipped.
+    const ret = /(?:^|[:;]\s*)return\b\s*(.*)$/.exec(text);
     if (!ret) continue;
     const at = ln;
     const joined = pythonJoinedValue(lines, ln, ret[1]!, fn.endLine);
@@ -9177,6 +9180,15 @@ function matchPythonFactoryChain(ref: UnresolvedRef, context: ResolutionContext)
   const m = /^([A-Za-z_][\w.]*)\(\)\.(\w+)$/.exec(ref.referenceName);
   if (!m) return null;
   const [, callee, methodName] = m as unknown as [string, string, string];
+  // `Backend = load(); Backend().run()`, or a `make` parameter: the name the
+  // call spells is a local there, not the module's class or factory.
+  const lines = pythonLines(context, ref.filePath);
+  let fn: Node | null = null;
+  for (const n of context.getNodesInFile(ref.filePath)) {
+    if ((n.kind !== 'function' && n.kind !== 'method') || n.startLine > ref.line || n.endLine < ref.line) continue;
+    if (!fn || n.startLine > fn.startLine) fn = n;
+  }
+  if (lines && fn && pythonBoundInDef(lines, fn.startLine, ref.line, callee.split('.')[0]!)) return null;
   const read = new Set<string>();
   const made: PythonTypeAnswer = /^[A-Z]/.test(callee.split('.').pop()!)
     ? pythonClassNamed(callee, ref.filePath, context)

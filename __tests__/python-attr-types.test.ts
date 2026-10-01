@@ -495,4 +495,46 @@ describe('python attribute types from factories and base classes', () => {
       expect(await convergeAfter(edit)).toEqual([]);
     });
   });
+  describe('review round 2026-09-30', () => {
+    it('sees a return written on the same line as its condition', async () => {
+      write({
+        'a.py': 'class A:\n    def send(self):\n        pass\n',
+        'b.py': 'class B:\n    def send(self):\n        pass\n',
+        'make.py': 'from a import A\nfrom b import B\n\ndef make(k):\n    if k: return A()\n    return B()\n',
+        'svc.py': 'from make import make\n\nclass Svc:\n    def __init__(self):\n        self.c = make(1)\n\n    def run(self):\n        self.c.send()\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callsFrom('run')).toEqual([]);
+    });
+
+    it('still agrees when every one-line return builds the same class', async () => {
+      write({
+        'a.py': 'class A:\n    def send(self):\n        pass\n',
+        'other.py': DISTRACTOR,
+        'make.py': 'from a import A\n\ndef make(k):\n    if k: return A()\n    else: return A()\n',
+        'svc.py': 'from make import make\n\nclass Svc:\n    def __init__(self):\n        self.c = make(1)\n\n    def run(self):\n        self.c.send()\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callsFrom('run')).toEqual(['A::send@a.py']);
+    });
+
+    it('does not type a chained call through a class name the method rebinds', async () => {
+      write({
+        'backend.py': 'class Backend:\n    def run(self):\n        pass\n',
+        'svc.py': 'from backend import Backend\n\ndef load():\n    return object\n\nclass Svc:\n    def go(self):\n        Backend = load()\n        Backend().run()\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callsFrom('go').filter((c) => c.startsWith('Backend::'))).toEqual([]);
+    });
+
+    it('does not type a chained call through a parameter that shadows a factory', async () => {
+      write({
+        'client.py': 'class Client:\n    def send(self):\n        pass\n',
+        'make.py': 'from client import Client\n\ndef make():\n    return Client()\n',
+        'svc.py': 'from make import make\n\nclass Svc:\n    def go(self, make):\n        make().send()\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callsFrom('go')).not.toContain('Client::send@client.py');
+    });
+  });
 });
