@@ -125,9 +125,20 @@ describe.runIf(onPath('scip-go') && onPath('go'))('a go module below the repo ro
       const report = await cg.scipWrite(db => runScipPass(db, dir));
       expect(report?.staleDocuments).toEqual([]);
       expect(report?.freshDocuments).toBeGreaterThan(0);
-      const row = cg.scipReadDb().prepare(`SELECT e.provenance FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
-        WHERE e.kind = 'calls' AND s.qualified_name = 'Total' AND t.qualified_name = 'Invoice::TotalPrice'`).get() as { provenance: string } | undefined;
-      expect(row?.provenance).toBe('scip');
+      const edge = (src: string, tgt: string) => (cg.scipReadDb().prepare(`SELECT e.provenance FROM edges e JOIN nodes s ON s.id = e.source
+        JOIN nodes t ON t.id = e.target WHERE e.kind = 'calls' AND s.qualified_name = ? AND t.qualified_name = ?`).get(src, tgt) as { provenance: string } | undefined)?.provenance;
+      expect(edge('Total', 'Invoice::TotalPrice')).toBe('scip');
+
+      // A patch: the edited package alone, in the module's folder (a slow full run makes it worth it).
+      const meta = path.join(dir, '.codegraph', 'scip', 'go.meta.json');
+      fs.writeFileSync(meta, JSON.stringify({ ...JSON.parse(fs.readFileSync(meta, 'utf8')), fullRunMs: 60_000 }));
+      const file = fs.readdirSync(path.join(dir, 'backend', 'shop')).find(f => f.endsWith('.go') && !f.endsWith('_test.go'))!;
+      fs.appendFileSync(path.join(dir, 'backend', 'shop', file), '\nfunc probe() int {\n\treturn Total(nil)\n}\n');
+      await cg.sync();
+      const patched = await produceIndex(cg.scipReadDb(), dir, 'go', { incremental: true });
+      expect(patched).toMatchObject({ status: 'installed', incremental: 1 });
+      await cg.scipWrite(db => runScipPass(db, dir, patched.status === 'installed' ? patched.scope : undefined));
+      expect(edge('probe', 'Total')).toBe('scip');
     } finally {
       cg.close();
     }
@@ -166,6 +177,21 @@ describe('go / rust adapters', () => {
     };
     expect(plan('go')).toEqual([['svc', `${out}.part0`], ['tools/gen', `${out}.part1`]]);
     expect(plan('rust')).toEqual([['cli', `${out}.part0`], ['kernel', `${out}.part1`]]);
+  });
+
+  it('go patches by package: each changed file\'s package, in its module\'s run', () => {
+    const out = path.join(dir, 'out.tmp');
+    fs.writeFileSync(path.join(dir, 'codegraph.json'), JSON.stringify({ scip: { go: { cmd: process.execPath } } }));
+    for (const f of ['go.mod', 'tools/gen/go.mod']) {
+      fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true });
+      fs.writeFileSync(path.join(dir, f), 'module x\n');
+    }
+    const r = resolveIndexer(dir, 'go', out);
+    if ('skip' in r) throw new Error(r.skip);
+    const units = INDEXERS.go.patch!.units(dir, ['main.go', 'pkg/a/a.go', 'pkg/a/b.go', 'tools/gen/gen.go', 'tools/gen/sub/x.go']);
+    expect(units).toEqual(['.', 'pkg/a', 'tools/gen', 'tools/gen/sub']);
+    const runs = INDEXERS.go.patch!.runs(r.runs, units, out)!;
+    expect(runs.map(x => [x.cwd, x.args.slice(4)])).toEqual([['.', ['.', './pkg/a']], ['tools/gen', ['.', './sub']]]);
   });
 
   it('TS: one run per tsconfig/jsconfig project (node_modules ignored), a single project stays one run', () => {
