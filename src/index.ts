@@ -564,10 +564,12 @@ export class CodeGraph {
         // marker behind, so `codegraph status` can tell a truncated index
         // from a completed one instead of silently serving partial results.
         try { this.queries.setMetadata('index_state', 'indexing'); } catch { /* metadata is advisory */ }
-        // Segment vocabulary starts empty and is repopulated by the node write
-        // path as every file (re-)indexes below — so a full index is also the
-        // orphan-cleanup pass for names deleted since the last one.
-        try { this.queries.clearNameSegmentVocab(); } catch { /* vocab is advisory — never fail an index over it */ }
+        // Fresh graphs populate the vocabulary through node writes. Existing
+        // graphs skip unchanged files at the store, so keep their vocabulary
+        // until this run succeeds and rebuild it from all surviving names below.
+        if (freshDb) {
+          try { this.queries.clearNameSegmentVocab(); } catch { /* vocab is advisory — never fail an index over it */ }
+        }
         // Bulk FTS mode for the mass-insert phase: drop the per-row FTS sync
         // triggers, rebuild nodes_fts once from the nodes table afterwards.
         // Crash inside the window is healed on the next DatabaseConnection.open.
@@ -771,6 +773,13 @@ export class CodeGraph {
             }
           }
         } catch { /* metadata is advisory — never fail an index over it */ }
+
+        if (result.success && !freshDb) {
+          try {
+            this.queries.clearNameSegmentVocab();
+            await this.rebuildNameSegmentVocab();
+          } catch { /* vocab is advisory — never fail an index over it */ }
+        }
 
         return result;
       } finally {
