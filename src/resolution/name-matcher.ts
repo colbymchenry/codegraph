@@ -636,7 +636,7 @@ const LOCAL_TYPE_KINDS = new Set<string>(['class', 'struct', 'enum', 'interface'
  * unaffected (their parent resolves to a class-like node), as are top-level
  * symbols and C++ namespace-prefixed names (the prefix has no node).
  */
-function isLexicallyReachable(
+export function isLexicallyReachable(
   candidate: Node,
   ref: UnresolvedRef,
   context: ResolutionContext

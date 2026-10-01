@@ -8,7 +8,7 @@ import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 import { getCargoWorkspaceCrateMap } from './cargo-workspace';
-import { isRustNameInScope } from '../name-matcher';
+import { isRustNameInScope, isLexicallyReachable } from '../name-matcher';
 
 /**
  * Whether the item a name heuristic found is one the reference can name:
@@ -42,7 +42,7 @@ export const rustResolver: FrameworkResolver = {
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
     // Pattern 1: Handler references
     if (ref.referenceName.endsWith('_handler') || ref.referenceName.startsWith('handle_')) {
-      const result = resolveByNameAndKind(ref.referenceName, FUNCTION_KINDS, HANDLER_DIRS, context);
+      const result = resolveByNameAndKind(ref, FUNCTION_KINDS, HANDLER_DIRS, context);
       if (result && inRustScope(result, ref, context)) {
         return {
           original: ref,
@@ -55,7 +55,7 @@ export const rustResolver: FrameworkResolver = {
 
     // Pattern 2: Service/Repository trait implementations
     if (ref.referenceName.endsWith('Service') || ref.referenceName.endsWith('Repository')) {
-      const result = resolveByNameAndKind(ref.referenceName, SERVICE_KINDS, SERVICE_DIRS, context);
+      const result = resolveByNameAndKind(ref, SERVICE_KINDS, SERVICE_DIRS, context);
       if (result && inRustScope(result, ref, context)) {
         return {
           original: ref,
@@ -68,7 +68,7 @@ export const rustResolver: FrameworkResolver = {
 
     // Pattern 3: Struct references (PascalCase)
     if (/^[A-Z][a-zA-Z]+$/.test(ref.referenceName)) {
-      const result = resolveByNameAndKind(ref.referenceName, STRUCT_KINDS, MODEL_DIRS, context);
+      const result = resolveByNameAndKind(ref, STRUCT_KINDS, MODEL_DIRS, context);
       if (result && inRustScope(result, ref, context)) {
         return {
           original: ref,
@@ -291,17 +291,30 @@ function findMatchingParen(s: string, openIdx: number): number {
 /**
  * Resolve a symbol by name using indexed queries instead of scanning all files.
  */
+/**
+ * The same-named item of these kinds that the reference can see — in scope
+ * by its `use`s and module paths, and not declared inside some function body
+ * (axum's examples' `Uri`, imported from `http`, went to a `struct Uri` a
+ * routing test declares inside itself) — its own file's first, then a
+ * framework-conventional directory's.
+ */
 function resolveByNameAndKind(
-  name: string,
+  ref: UnresolvedRef,
   kinds: Set<string>,
   preferredDirPatterns: string[],
   context: ResolutionContext,
 ): string | null {
-  const candidates = context.getNodesByName(name);
+  const candidates = context.getNodesByName(ref.referenceName);
   if (candidates.length === 0) return null;
 
-  const kindFiltered = candidates.filter((n) => kinds.has(n.kind));
+  const kindFiltered = candidates.filter((n) => kinds.has(n.kind) &&
+    isLexicallyReachable(n, ref, context) && isRustNameInScope(n, ref, context));
   if (kindFiltered.length === 0) return null;
+
+  // The file is a module: its own items are in scope. A sibling file is
+  // another module, reached only through a `use` — no nearer than any other.
+  const sameFile = kindFiltered.find((n) => n.filePath === ref.filePath);
+  if (sameFile) return sameFile.id;
 
   // Prefer candidates in framework-conventional directories
   const preferred = kindFiltered.filter((n) =>
