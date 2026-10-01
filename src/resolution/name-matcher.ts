@@ -1300,6 +1300,47 @@ function rustModuleDir(filePath: string): string {
   return path.posix.join(dir, base.replace(/\.rs$/, ''));
 }
 
+const SFC_SCRIPT_RANGES = new WeakMap<ResolutionContext, Map<string, Array<{ start: number; end: number; exported: boolean }>>>();
+
+/**
+ * Whether a declaration in a `.svelte` / `.vue` file is the component's own:
+ * anything but the component itself, unless it sits in a block that can export
+ * — Svelte's `<script module>` (`context="module"`), or a Vue `<script>` that
+ * is not `setup` — or is a type a Vue `<script setup>` exports.
+ */
+function isSfcPrivate(n: Node, context: ResolutionContext): boolean {
+  const svelte = n.filePath.endsWith('.svelte');
+  if ((!svelte && !n.filePath.endsWith('.vue')) || n.kind === 'component' || n.kind === 'file') return false;
+  let memo = SFC_SCRIPT_RANGES.get(context);
+  if (!memo) SFC_SCRIPT_RANGES.set(context, (memo = new Map()));
+  let ranges = memo.get(n.filePath);
+  if (!ranges) {
+    ranges = [];
+    const lines = context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [];
+    let open: { start: number; exported: boolean } | null = null;
+    lines.forEach((text, i) => {
+      const tag = /<script\b([^>]*)>/i.exec(text);
+      if (tag && !open) {
+        const attrs = tag[1] ?? '';
+        open = { start: i + 1, exported: svelte ? /\bmodule\b|context\s*=\s*["']module["']/.test(attrs) : !/\bsetup\b/.test(attrs) };
+      }
+      if (open && /<\/script\s*>/i.test(text)) {
+        ranges!.push({ ...open, end: i + 1 });
+        open = null;
+      }
+    });
+    memo.set(n.filePath, ranges);
+  }
+  const block = ranges.find((r) => n.startLine >= r.start && n.startLine <= r.end);
+  if (block?.exported) return false;
+  // Vue hoists the types `<script setup>` exports: mealie imports CrudTable.vue's `TableConfig`.
+  if (!svelte && block) {
+    const line = context.getFileLines?.(n.filePath)?.[n.startLine - 1] ?? context.readFile(n.filePath)?.split(/\r?\n/)[n.startLine - 1] ?? '';
+    if (/^\s*export\s+(?:declare\s+)?(?:interface|type|enum)\b/.test(line)) return false;
+  }
+  return true;
+}
+
 /**
  * Whether `candidate` can be NAMED from a reference in `ref`'s file at all,
  * given what its language says about the definition's visibility. A
@@ -1344,6 +1385,10 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   // A test suite is not linked into the program: typeorm's `Record<K, V>` is
   // not a test entity `Record`, tokio's `Output` not a `runtime/tests` type.
   if (isTestSuitePath(candidate.filePath) && !isTestPath(ref.filePath)) return false;
+  // A Svelte component's instance script, or a Vue SFC's `<script setup>`, is
+  // private to the component: shadcn-svelte's 838 `<Item.Root>` (a namespace
+  // import) went to a `type Item` one example component declares for itself.
+  if (isSfcPrivate(candidate, context)) return false;
   if (candidate.language === 'csharp' && ref.language === 'csharp' && CSHARP_TYPE_KINDS.has(candidate.kind) &&
       /^[A-Za-z_]\w*$/.test(ref.referenceName) &&
       (!isCsharpTypeVisible(candidate, ref, context) || !isCsharpNestedTypeInScope(candidate, ref, context))) return false;
