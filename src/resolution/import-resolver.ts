@@ -1897,16 +1897,10 @@ function resolvePythonModuleMember(
     }
     if (!resolvedPath || resolvedPath === ref.filePath) continue;
 
-    // Find the member as a top-level definition in the module file. Exclude
-    // `method` so `mod.foo` never lands on a same-named class method.
-    const target = context.getNodesInFile(resolvedPath).find(
-      (n) =>
-        n.name === member &&
-        (n.kind === 'function' ||
-          n.kind === 'class' ||
-          n.kind === 'variable' ||
-          n.kind === 'constant')
-    );
+    // Find the member as a top-level definition in the module file, or one it
+    // re-exports (a package's `__init__.py`). Exclude `method` so `mod.foo`
+    // never lands on a same-named class method.
+    const target = pythonModuleSymbol(resolvedPath, member, context, 0);
     if (target) {
       return { original: ref, targetNodeId: target.id, confidence: 0.85, resolvedBy: 'import' };
     }

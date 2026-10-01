@@ -33,6 +33,22 @@ from .users import *
     'netbox/alembic/versions/0001_tokens.py': `class Token:
     pass
 `,
+    'netbox/netbox/__init__.py': '',
+    'netbox/netbox/views/__init__.py': '',
+    'netbox/netbox/views/generic/__init__.py': `from .object_views import *
+`,
+    'netbox/netbox/views/generic/object_views.py': `class ObjectEditView:
+    pass
+`,
+    'netbox/dcim/views.py': `from netbox.views import generic
+
+
+class DeviceEditView(generic.ObjectEditView):
+    pass
+`,
+    'netbox/extras/views.py': `class ObjectEditView:
+    pass
+`,
     'netbox/core/views.py': `from users.models import Token, User
 
 
@@ -53,6 +69,12 @@ afterAll(() => {
 });
 
 describe('Python package re-exports', () => {
+  it('lead a module member to its definition', () => {
+    const ids = cg.getNodesInFile('netbox/dcim/views.py').map((n) => n.id);
+    const bases = cg.getOutgoingEdgesFrom(ids).filter((e) => e.kind === 'extends').map((e) => cg.getNode(e.target)!.filePath);
+    expect(bases).toEqual(['netbox/netbox/views/generic/object_views.py']);
+  });
+
   it('lead an imported name to its definition, through star and named re-exports', () => {
     const ids = cg.getNodesInFile('netbox/core/views.py').map((n) => n.id);
     const targets = cg.getOutgoingEdgesFrom(ids).filter((e) => e.kind === 'instantiates').map((e) => cg.getNode(e.target)!.filePath).sort();
