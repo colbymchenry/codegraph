@@ -7,6 +7,7 @@
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
+import { pickByNameAndKind } from './name-heuristic';
 
 export const aspnetResolver: FrameworkResolver = {
   name: 'aspnet',
@@ -67,7 +68,7 @@ export const aspnetResolver: FrameworkResolver = {
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
     // Pattern 1: Controller references
     if (ref.referenceName.endsWith('Controller')) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, CONTROLLER_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, CONTROLLER_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -80,7 +81,7 @@ export const aspnetResolver: FrameworkResolver = {
 
     // Pattern 2: Service references (dependency injection)
     if (ref.referenceName.endsWith('Service') || ref.referenceName.startsWith('I') && ref.referenceName.length > 1) {
-      const result = resolveByNameAndKind(ref.referenceName, SERVICE_KINDS, SERVICE_DIRS, context);
+      const result = resolveByNameAndKind(ref, SERVICE_KINDS, SERVICE_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -93,7 +94,7 @@ export const aspnetResolver: FrameworkResolver = {
 
     // Pattern 3: Repository references
     if (ref.referenceName.endsWith('Repository')) {
-      const result = resolveByNameAndKind(ref.referenceName, SERVICE_KINDS, REPO_DIRS, context);
+      const result = resolveByNameAndKind(ref, SERVICE_KINDS, REPO_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -106,7 +107,7 @@ export const aspnetResolver: FrameworkResolver = {
 
     // Pattern 4: Model/Entity references
     if (/^[A-Z][a-zA-Z]+$/.test(ref.referenceName)) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, MODEL_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, MODEL_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -119,7 +120,7 @@ export const aspnetResolver: FrameworkResolver = {
 
     // Pattern 5: ViewModel references
     if (ref.referenceName.endsWith('ViewModel') || ref.referenceName.endsWith('Dto')) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, VIEWMODEL_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, VIEWMODEL_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -410,28 +411,12 @@ const VIEWMODEL_DIRS = ['/ViewModels/', '/ViewModel/', '/DTOs/', '/Dto/'];
 const CLASS_KINDS = new Set(['class']);
 const SERVICE_KINDS = new Set(['class', 'interface']);
 
-/**
- * Resolve a symbol by name using indexed queries instead of scanning all files.
- */
+/** A framework name heuristic's pick (see name-heuristic.ts), preferring these folders. */
 function resolveByNameAndKind(
-  name: string,
+  ref: UnresolvedRef,
   kinds: Set<string>,
   preferredDirPatterns: string[],
   context: ResolutionContext,
 ): string | null {
-  const candidates = context.getNodesByName(name);
-  if (candidates.length === 0) return null;
-
-  const kindFiltered = candidates.filter((n) => kinds.has(n.kind));
-  if (kindFiltered.length === 0) return null;
-
-  // Prefer candidates in framework-conventional directories
-  const preferred = kindFiltered.filter((n) =>
-    preferredDirPatterns.some((d) => n.filePath.includes(d))
-  );
-
-  if (preferred.length > 0) return preferred[0]!.id;
-
-  // Fall back to any match
-  return kindFiltered[0]!.id;
+  return pickByNameAndKind(ref, kinds, (f) => preferredDirPatterns.some((d) => f.includes(d)), context);
 }

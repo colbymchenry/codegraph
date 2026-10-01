@@ -7,6 +7,7 @@
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
+import { pickByNameAndKind } from './name-heuristic';
 
 export const springResolver: FrameworkResolver = {
   name: 'spring',
@@ -553,48 +554,13 @@ function joinPath(prefix: string, sub: string): string {
   return '/' + parts.join('/');
 }
 
-/**
- * Resolve a symbol by name using indexed queries instead of scanning all files.
- * What the reference's own scope declares comes first — its file, then its
- * package (directory) — and a class nested in another file's class is out of
- * reach by its bare name: every MyBatis `XExample` declares its own nested
- * `Criteria`, and mall's 8,747 `new Criteria()` went to the first one.
- */
+/** A framework name heuristic's pick (see name-heuristic.ts), preferring these folders. */
 function resolveByNameAndKind(
   ref: UnresolvedRef,
   kinds: Set<string>,
   preferredDirPatterns: string[],
   context: ResolutionContext,
 ): string | null {
-  const candidates = context.getNodesByName(ref.referenceName);
-  if (candidates.length === 0) return null;
-
-  const kindFiltered = candidates.filter((n) => kinds.has(n.kind) &&
-    (n.filePath === ref.filePath || !isNestedType(n, context)));
-  if (kindFiltered.length === 0) return null;
-
-  const sameFile = kindFiltered.find((n) => n.filePath === ref.filePath);
-  if (sameFile) return sameFile.id;
-  const dir = ref.filePath.slice(0, ref.filePath.lastIndexOf('/') + 1);
-  const samePackage = kindFiltered.find((n) => n.filePath.startsWith(dir) && !n.filePath.slice(dir.length).includes('/'));
-  if (samePackage) return samePackage.id;
-
-  // Prefer candidates in framework-conventional directories
-  const preferred = kindFiltered.filter((n) =>
-    preferredDirPatterns.some((d) => n.filePath.includes(d))
-  );
-
-  if (preferred.length > 0) return preferred[0]!.id;
-
-  // Fall back to any match
-  return kindFiltered[0]!.id;
+  return pickByNameAndKind(ref, kinds, (f) => preferredDirPatterns.some((d) => f.includes(d)), context);
 }
 
-/** Whether a JVM type is declared inside another type of its file. */
-function isNestedType(n: Node, context: ResolutionContext): boolean {
-  const cut = n.qualifiedName.lastIndexOf('::');
-  if (cut < 0) return false;
-  const owner = n.qualifiedName.slice(0, cut);
-  return context.getNodesInFile(n.filePath).some((p) =>
-    p.qualifiedName === owner && (p.kind === 'class' || p.kind === 'interface' || p.kind === 'enum' || p.kind === 'struct' || p.kind === 'trait'));
-}

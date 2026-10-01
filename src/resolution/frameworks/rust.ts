@@ -8,7 +8,8 @@ import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 import { getCargoWorkspaceCrateMap } from './cargo-workspace';
-import { isRustNameInScope, isLexicallyReachable } from '../name-matcher';
+import { isRustNameInScope } from '../name-matcher';
+import { pickByNameAndKind } from './name-heuristic';
 
 /**
  * Whether the item a name heuristic found is one the reference can name:
@@ -288,43 +289,18 @@ function findMatchingParen(s: string, openIdx: number): number {
   return -1;
 }
 
-/**
- * Resolve a symbol by name using indexed queries instead of scanning all files.
- */
-/**
- * The same-named item of these kinds that the reference can see — in scope
- * by its `use`s and module paths, and not declared inside some function body
- * (axum's examples' `Uri`, imported from `http`, went to a `struct Uri` a
- * routing test declares inside itself) — its own file's first, then a
- * framework-conventional directory's.
- */
+/** A framework name heuristic's pick (see name-heuristic.ts): in scope by its `use`s and module paths. */
 function resolveByNameAndKind(
   ref: UnresolvedRef,
   kinds: Set<string>,
   preferredDirPatterns: string[],
   context: ResolutionContext,
 ): string | null {
-  const candidates = context.getNodesByName(ref.referenceName);
-  if (candidates.length === 0) return null;
-
-  const kindFiltered = candidates.filter((n) => kinds.has(n.kind) &&
-    isLexicallyReachable(n, ref, context) && isRustNameInScope(n, ref, context));
-  if (kindFiltered.length === 0) return null;
-
-  // The file is a module: its own items are in scope. A sibling file is
-  // another module, reached only through a `use` — no nearer than any other.
-  const sameFile = kindFiltered.find((n) => n.filePath === ref.filePath);
-  if (sameFile) return sameFile.id;
-
-  // Prefer candidates in framework-conventional directories
-  const preferred = kindFiltered.filter((n) =>
-    preferredDirPatterns.some((d) => n.filePath.includes(d))
-  );
-
-  if (preferred.length > 0) return preferred[0]!.id;
-
-  // Fall back to any match
-  return kindFiltered[0]!.id;
+  return pickByNameAndKind(ref, kinds, (f) => preferredDirPatterns.some((d) => f.includes(d)), context, {
+    // The file is a module: a sibling file is another one, reached only through a `use`.
+    sameDirectory: false,
+    accept: (n) => isRustNameInScope(n, ref, context),
+  });
 }
 
 interface ModuleResolution {

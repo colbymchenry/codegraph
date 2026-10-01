@@ -998,11 +998,11 @@ describe('springResolver.resolve — DI heuristics are gated to Java/Kotlin non-
   // hijack a Scala `extends X` to a same-named class found via directory
   // heuristics — inheritance must resolve through imports/name matching.
   const decoyNode: Node = {
-    id: 'class:src/test/model/ExtCustomer.java:ExtCustomer:3',
+    id: 'class:src/main/model/ExtCustomer.java:ExtCustomer:3',
     kind: 'class',
     name: 'ExtCustomer',
-    qualifiedName: 'src/test/model/ExtCustomer.java::ExtCustomer',
-    filePath: 'src/test/model/ExtCustomer.java',
+    qualifiedName: 'src/main/model/ExtCustomer.java::ExtCustomer',
+    filePath: 'src/main/model/ExtCustomer.java',
     language: 'java',
     startLine: 3,
     endLine: 10,

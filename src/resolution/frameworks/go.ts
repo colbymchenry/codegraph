@@ -7,6 +7,7 @@
 import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
+import { pickByNameAndKind } from './name-heuristic';
 
 export const goResolver: FrameworkResolver = {
   name: 'go',
@@ -27,7 +28,7 @@ export const goResolver: FrameworkResolver = {
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
     // Pattern 1: Handler references
     if (ref.referenceName.endsWith('Handler') || ref.referenceName.startsWith('Handle')) {
-      const result = resolveByNameAndKind(ref.referenceName, 'function', HANDLER_DIRS, context);
+      const result = resolveByNameAndKind(ref, 'function', HANDLER_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -40,7 +41,7 @@ export const goResolver: FrameworkResolver = {
 
     // Pattern 2: Service/Repository references
     if (ref.referenceName.endsWith('Service') || ref.referenceName.endsWith('Repository') || ref.referenceName.endsWith('Store')) {
-      const result = resolveByNameAndKind(ref.referenceName, null, SERVICE_DIRS, context, SERVICE_KINDS);
+      const result = resolveByNameAndKind(ref, null, SERVICE_DIRS, context, SERVICE_KINDS);
       if (result) {
         return {
           original: ref,
@@ -53,7 +54,7 @@ export const goResolver: FrameworkResolver = {
 
     // Pattern 3: Middleware references
     if (ref.referenceName.endsWith('Middleware') || ref.referenceName.startsWith('Auth') || ref.referenceName.startsWith('Log')) {
-      const result = resolveByNameAndKind(ref.referenceName, 'function', MIDDLEWARE_DIRS, context);
+      const result = resolveByNameAndKind(ref, 'function', MIDDLEWARE_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -66,7 +67,7 @@ export const goResolver: FrameworkResolver = {
 
     // Pattern 4: Model/Entity references (typically PascalCase structs)
     if (/^[A-Z][a-zA-Z]+$/.test(ref.referenceName)) {
-      const result = resolveByNameAndKind(ref.referenceName, 'struct', MODEL_DIRS, context);
+      const result = resolveByNameAndKind(ref, 'struct', MODEL_DIRS, context);
       if (result) {
         return {
           original: ref,
@@ -172,36 +173,17 @@ const MIDDLEWARE_DIRS = ['middleware', 'middlewares'];
 const MODEL_DIRS = ['model', 'models', 'entity', 'entities', 'domain', 'pkg'];
 const SERVICE_KINDS = new Set(['struct', 'interface']);
 
-/**
- * Resolve a symbol by name using indexed queries instead of scanning all files.
- * Uses getNodesByName (O(log n) indexed lookup) instead of iterating every file.
- */
+/** A framework name heuristic's pick (see name-heuristic.ts), preferring these folders. */
 function resolveByNameAndKind(
-  name: string,
+  ref: UnresolvedRef,
   kind: string | null,
   preferredDirs: string[],
   context: ResolutionContext,
   kinds?: Set<string>
 ): string | null {
-  const candidates = context.getNodesByName(name);
-  if (candidates.length === 0) return null;
-
-  // Filter by kind
-  const kindFiltered = candidates.filter((n) => {
-    if (kinds) return kinds.has(n.kind);
-    if (kind) return n.kind === kind;
-    return true;
-  });
-
-  if (kindFiltered.length === 0) return null;
-
-  // Prefer candidates in framework-conventional directories
-  const preferred = kindFiltered.filter((n) =>
-    preferredDirs.some((d) => n.filePath.includes(`/${d}/`))
-  );
-
-  if (preferred.length > 0) return preferred[0]!.id;
-
-  // Fall back to any match
-  return kindFiltered[0]!.id;
+  const allowed: ReadonlySet<string> = kinds ?? (kind ? new Set([kind]) : GO_NAMED_KINDS);
+  return pickByNameAndKind(ref, allowed, (f) => preferredDirs.some((d) => f.includes(`/${d}/`)), context);
 }
+
+/** Any declaration a name can be (the heuristic with no kind). */
+const GO_NAMED_KINDS: ReadonlySet<string> = new Set(['function', 'method', 'struct', 'interface', 'type_alias', 'variable', 'constant']);

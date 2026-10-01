@@ -8,6 +8,7 @@ import { Node } from '../../types';
 import { FrameworkResolver, UnresolvedRef, ResolutionContext, FrameworkExtractionResult } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 import { resolveImportPath } from '../import-resolver';
+import { pickByNameAndKind } from './name-heuristic';
 
 export const djangoResolver: FrameworkResolver = {
   name: 'django',
@@ -25,15 +26,15 @@ export const djangoResolver: FrameworkResolver = {
 
   resolve(ref, context) {
     if (ref.referenceName.endsWith('Model') || /^[A-Z][a-z]+$/.test(ref.referenceName)) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, MODEL_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, MODEL_DIRS, context);
       if (result) return { original: ref, targetNodeId: result, confidence: 0.8, resolvedBy: 'framework' };
     }
     if (ref.referenceName.endsWith('View') || ref.referenceName.endsWith('ViewSet')) {
-      const result = resolveByNameAndKind(ref.referenceName, VIEW_KINDS, VIEW_DIRS, context);
+      const result = resolveByNameAndKind(ref, VIEW_KINDS, VIEW_DIRS, context);
       if (result) return { original: ref, targetNodeId: result, confidence: 0.8, resolvedBy: 'framework' };
     }
     if (ref.referenceName.endsWith('Form')) {
-      const result = resolveByNameAndKind(ref.referenceName, CLASS_KINDS, FORM_DIRS, context);
+      const result = resolveByNameAndKind(ref, CLASS_KINDS, FORM_DIRS, context);
       if (result) return { original: ref, targetNodeId: result, confidence: 0.8, resolvedBy: 'framework' };
     }
     // ORM dynamic dispatch: QuerySet._fetch_all (and siblings) call
@@ -202,7 +203,7 @@ export const flaskResolver: FrameworkResolver = {
 
   resolve(ref, context) {
     if (ref.referenceName.endsWith('_bp') || ref.referenceName.endsWith('_blueprint')) {
-      const result = resolveByNameAndKind(ref.referenceName, VARIABLE_KINDS, [], context);
+      const result = resolveByNameAndKind(ref, VARIABLE_KINDS, [], context);
       if (result) return { original: ref, targetNodeId: result, confidence: 0.8, resolvedBy: 'framework' };
     }
     return null;
@@ -265,11 +266,11 @@ export const fastapiResolver: FrameworkResolver = {
 
   resolve(ref, context) {
     if (ref.referenceName.endsWith('_router') || ref.referenceName === 'router') {
-      const result = resolveByNameAndKind(ref.referenceName, VARIABLE_KINDS, ROUTER_DIRS, context);
+      const result = resolveByNameAndKind(ref, VARIABLE_KINDS, ROUTER_DIRS, context);
       if (result) return { original: ref, targetNodeId: result, confidence: 0.8, resolvedBy: 'framework' };
     }
     if (ref.referenceName.startsWith('get_') || ref.referenceName.startsWith('Depends')) {
-      const result = resolveByNameAndKind(ref.referenceName, FUNCTION_KINDS, DEP_DIRS, context);
+      const result = resolveByNameAndKind(ref, FUNCTION_KINDS, DEP_DIRS, context);
       if (result) return { original: ref, targetNodeId: result, confidence: 0.75, resolvedBy: 'framework' };
     }
     return null;
@@ -640,29 +641,12 @@ const VIEW_KINDS = new Set(['class', 'function']);
 const VARIABLE_KINDS = new Set(['variable']);
 const FUNCTION_KINDS = new Set(['function']);
 
-/**
- * Resolve a symbol by name using indexed queries instead of scanning all files.
- */
+/** A framework name heuristic's pick (see name-heuristic.ts), preferring these folders. */
 function resolveByNameAndKind(
-  name: string,
+  ref: UnresolvedRef,
   kinds: Set<string>,
   preferredDirPatterns: string[],
   context: ResolutionContext,
 ): string | null {
-  const candidates = context.getNodesByName(name);
-  if (candidates.length === 0) return null;
-
-  const kindFiltered = candidates.filter((n) => kinds.has(n.kind));
-  if (kindFiltered.length === 0) return null;
-
-  // Prefer candidates in framework-conventional directories
-  if (preferredDirPatterns.length > 0) {
-    const preferred = kindFiltered.filter((n) =>
-      preferredDirPatterns.some((d) => n.filePath.includes(d))
-    );
-    if (preferred.length > 0) return preferred[0]!.id;
-  }
-
-  // Fall back to any match
-  return kindFiltered[0]!.id;
+  return pickByNameAndKind(ref, kinds, (f) => preferredDirPatterns.some((d) => f.includes(d)), context);
 }
