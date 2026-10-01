@@ -40,6 +40,10 @@ dump() {
 
 cd "$REPO"
 "${CG[@]}" sync . >/dev/null
+# Test the patch path whatever it would cost: record a slow last full run, so the
+# planner (produce.ts incrementalPlan) doesn't pick a full run on a fast corpus.
+node -e 'const fs = require("fs"); const f = process.argv[1]; fs.writeFileSync(f, JSON.stringify({ ...JSON.parse(fs.readFileSync(f, "utf8")), fullRunMs: 3600000 }));' \
+  "$REPO/.codegraph/scip/$LANG_.meta.json"
 start=$(date +%s)
 "${CG[@]}" scip index . --lang "$LANG_" --changed 2>&1 | grep -E "re-indexing|patched|up to date|documents merged|rejected|failed" || true
 echo "patch: $(( $(date +%s) - start )) s"
@@ -50,6 +54,7 @@ start=$(date +%s)
 echo "full: $(( $(date +%s) - start )) s"
 dump "$WORK/full.txt"
 
+grep -q . "$WORK/patch.txt" || { echo "no edges dumped" >&2; exit 1; }
 differ=$(diff "$WORK/patch.txt" "$WORK/full.txt" | grep -c '^[<>]' || true)
 echo "edges: $(wc -l < "$WORK/full.txt"), differing lines: $differ"
 if [ "$differ" -ne 0 ]; then
