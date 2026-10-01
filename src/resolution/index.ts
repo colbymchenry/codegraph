@@ -682,6 +682,8 @@ export class ReferenceResolver {
         if (resolved !== null && this.isIndexedFile(resolved)) return false;
         return this.isDeclaredOutsidePackage(source, fromFile);
       },
+      resolveModuleFile: (source, fromFile, language) =>
+        resolveImportPath(source, fromFile, language, this.context),
       getNodesInFile: (filePath: string) => {
         if (!this.nodeCache.has(filePath)) {
           this.nodeCache.set(filePath, this.queries.getNodesByFile(filePath));
