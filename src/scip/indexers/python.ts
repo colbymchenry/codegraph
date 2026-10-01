@@ -18,6 +18,22 @@ import type { IndexerSpec } from './index';
 const MARKERS = ['pyproject.toml', 'setup.py', 'setup.cfg', 'requirements.txt'];
 const VENV_DIRS = ['.venv', 'venv'];
 
+/** How to create the venv, from what the project pins its dependencies with (first match). */
+const VENV_SETUP: ReadonlyArray<readonly [string, string]> = [
+  ['uv.lock', 'uv sync'],
+  ['poetry.lock', 'poetry install (or activate its venv: VIRTUAL_ENV)'],
+  ['requirements.txt', 'python -m venv .venv && .venv/bin/pip install -r requirements.txt'],
+  ['pyproject.toml', 'python -m venv .venv && .venv/bin/pip install -e .'],
+  ['setup.py', 'python -m venv .venv && .venv/bin/pip install -e .'],
+];
+
+/** The no-venv warning, with how to create one when the project says what it needs. */
+export function missingVenv(root: string): string {
+  const setup = VENV_SETUP.find(([f]) => fs.existsSync(path.join(root, f)));
+  return `no ${VENV_DIRS.join(' or ')} with pyvenv.cfg — indexing without third-party packages (calls into dependencies won't resolve)` +
+    (setup ? `; ${setup[0]} found: run \`${setup[1]}\` and reindex` : '');
+}
+
 /** One entry of scip-python's `--environment` manifest (its `PythonPackage`). */
 export interface PythonPackage {
   name: string;
@@ -104,12 +120,7 @@ export const pythonIndexer: IndexerSpec = {
     fs.writeFileSync(manifest, JSON.stringify(venv ? venvPackages(venv) : []));
     const args = ['index', '.', '--project-name', projectName(root).replace(/\s+/g, '-'), '--environment', manifest, '--output', outFile];
     const runs = [{ label: 'python', args, output: outFile }];
-    if (!venv) {
-      return {
-        runs,
-        warning: `no ${VENV_DIRS.join(' or ')} with pyvenv.cfg — indexing without third-party packages (calls into dependencies won't resolve)`,
-      };
-    }
+    if (!venv) return { runs, warning: missingVenv(root) };
     const bin = path.join(venv, process.platform === 'win32' ? 'Scripts' : 'bin');
     return { runs, env: { VIRTUAL_ENV: venv, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}` } };
   },

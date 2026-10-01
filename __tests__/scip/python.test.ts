@@ -113,6 +113,9 @@ describe('scip-python adapter', () => {
 
     const bare = pythonIndexer.invocation(dir, out);
     expect(bare.warning).toMatch(/third-party/);
+    expect(bare.warning).not.toMatch(/run `/); // nothing says how this project builds its venv
+    fs.writeFileSync(path.join(dir, 'uv.lock'), '');
+    expect(pythonIndexer.invocation(dir, out).warning).toMatch(/uv\.lock found: run `uv sync` and reindex$/);
     expect(JSON.parse(fs.readFileSync(manifest, 'utf8'))).toEqual([]);
     expect(bare.runs).toHaveLength(1);
     expect(bare.runs[0]!.args).toEqual(expect.arrayContaining(['--environment', manifest, '--output', out]));

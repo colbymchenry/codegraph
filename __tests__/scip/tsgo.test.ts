@@ -243,6 +243,19 @@ describe('typescript adapter: tsgo when installed', () => {
     expect(scipTs.runs[0]!.args[0]).toBe('index'); // scip-typescript's arguments
   });
 
+  it('warns when a lockfile has no node_modules beside it, with the command that installs it', () => {
+    const warning = () => {
+      const r = resolveIndexer(dir, 'typescript', path.join(dir, 'out.tmp'));
+      if ('skip' in r) throw new Error(r.skip);
+      return r.warning;
+    };
+    fs.writeFileSync(path.join(dir, 'pnpm-lock.yaml'), '');
+    expect(warning()).toBeUndefined(); // installed
+    fs.renameSync(path.join(dir, 'node_modules'), path.join(dir, 'moved'));
+    fs.writeFileSync(path.join(dir, 'codegraph.json'), JSON.stringify({ scip: { typescript: { cmd: process.execPath } } })); // scip-typescript's path
+    expect(warning()).toMatch(/pnpm-lock\.yaml but no node_modules — .* run `pnpm install` and reindex/);
+  });
+
   it('finds TypeScript in codegraph\'s tools folder when the project has none', () => {
     const tools = path.join(toolsDir(), 'node_modules', 'typescript');
     fs.renameSync(path.join(dir, 'node_modules', 'typescript'), path.join(dir, 'moved'));

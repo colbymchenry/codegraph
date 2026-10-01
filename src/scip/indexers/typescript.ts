@@ -40,6 +40,22 @@ const LIGHT_HEAP_MB = 3072;
 /** The first TypeScript whose API tsgo-index.ts is written against. */
 const TSGO_MIN = [7, 1];
 
+/** Lockfile → the command that installs what it pins. */
+const LOCKFILES: ReadonlyArray<readonly [string, string]> = [
+  ['package-lock.json', 'npm ci'], ['pnpm-lock.yaml', 'pnpm install'], ['yarn.lock', 'yarn install'], ['bun.lock', 'bun install'], ['bun.lockb', 'bun install'],
+];
+
+/**
+ * A lockfile but no node_modules: the compiler can't load the dependencies'
+ * types, so calls into them read as unknown and some project calls on their
+ * values go unresolved. Worth a warning that says how to fix it.
+ */
+export function missingDependencies(root: string): string | undefined {
+  const lock = LOCKFILES.find(([f]) => has(root, f));
+  if (!lock || has(root, 'node_modules')) return undefined;
+  return `${lock[0]} but no node_modules — calls into dependencies won't resolve; run \`${lock[1]}\` and reindex`;
+}
+
 function hasWorkspaces(root: string): boolean {
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')) as { workspaces?: unknown };
@@ -182,12 +198,13 @@ export const typescriptIndexer: IndexerSpec = {
   invocation(root, outFile) {
     const files = repoFiles(root);
     const projects = tsProjects(root, files);
-    if (projects.length > 1) return { runs: planRuns(root, projects, projectWeights(projects, files), outFile) };
+    const warning = missingDependencies(root);
+    if (projects.length > 1) return { runs: planRuns(root, projects, projectWeights(projects, files), outFile), warning };
     const args = ['index', '--output', outFile];
     if (has(root, 'pnpm-workspace.yaml')) args.push('--pnpm-workspaces');
     else if (has(root, 'yarn.lock') && hasWorkspaces(root)) args.push('--yarn-workspaces');
     else if (!has(root, 'tsconfig.json')) args.push('--infer-tsconfig');
-    return { runs: [{ label: 'typescript', args, output: outFile, env: heapEnv(bigHeapMb()) }] };
+    return { runs: [{ label: 'typescript', args, output: outFile, env: heapEnv(bigHeapMb()) }], warning };
   },
   patch: {
     'tsgo-index': {
@@ -241,6 +258,6 @@ export const typescriptIndexer: IndexerSpec = {
       .map(p => path.posix.join(p, has(path.join(root, p), 'tsconfig.json') ? 'tsconfig.json' : 'jsconfig.json'));
     // produce.ts writes codegraph's reference sites beside the output (`.refs`).
     const args = [path.join(__dirname, 'tsgo-index.js'), ts.dir, outFile, root, '--refs', `${outFile}.refs`, ...configs];
-    return { cmd: process.execPath, tool: 'tsgo-index', runs: [{ label: 'typescript (tsgo)', args, output: outFile }] };
+    return { cmd: process.execPath, tool: 'tsgo-index', runs: [{ label: 'typescript (tsgo)', args, output: outFile }], warning: missingDependencies(root) };
   },
 };
