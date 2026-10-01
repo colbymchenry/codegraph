@@ -546,6 +546,12 @@ export function matchFunctionRef(
   // test's parameter of its name receives.
   if (ref.language === 'python' && !candidates.some((n) => isFixtureInReach(n, ref.filePath, context)) &&
       isPythonLocallyBound(ref.referenceName, ref, context)) return null;
+  // Likewise a JS/TS parameter or local: lodash's `baseHas(object, key)` passes its own `object`.
+  const jsLocal = jsFunctionLocalScope(ref.referenceName, ref, context);
+  if (jsLocal) {
+    candidates = candidates.filter((n) => n.filePath === ref.filePath && n.startLine >= jsLocal.start && n.startLine <= jsLocal.end);
+    if (candidates.length === 0) return null;
+  }
 
   // Swift implicit-self: a bare identifier can name a METHOD only of the
   // ENCLOSING type (`Button(action: handleTap)` written inside that type) —
@@ -4230,6 +4236,51 @@ export function isRustNameInScope(candidate: Node, ref: UnresolvedRef, context: 
 const TYPE_MEMBER_KINDS: ReadonlySet<string> = new Set(['method', 'property', 'field', 'enum_member']);
 
 /** Per-context memo: `file\0name` → "the file binds this name locally". */
+/** Whether `n` lies outside the function that binds the reference's name itself (see jsFunctionLocalScope). */
+function isOutsideJsLocal(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  // `const indexName = this.dataSource.namingStrategy.indexName(…)`: a member, whatever the local's name.
+  if (ref.referenceKind === 'calls' && bareCallReceiver(ref, context) !== null) return false;
+  const scope = jsFunctionLocalScope(ref.referenceName, ref, context);
+  return scope !== null && !(n.filePath === ref.filePath && n.startLine >= scope.start && n.startLine <= scope.end);
+}
+
+const JS_FN_LOCAL_MEMO = new WeakMap<ResolutionContext, Map<string, { start: number; end: number } | null>>();
+
+/**
+ * The lines of the JS/TS function a reference sits in when that function binds
+ * the name itself — a parameter, or a `var`/`let`/`const` above the reference.
+ * Such a name is the local, never a same-named function declared elsewhere:
+ * every lodash helper lives inside `runInContext`, so `baseHas(object, key)`'s
+ * `object` and `mixin`'s `object(this.__wrapped__)` reached a `function
+ * object() {}` an IIFE declares there. Null when the function does not bind it.
+ */
+function jsFunctionLocalScope(name: string, ref: UnresolvedRef, context: ResolutionContext): { start: number; end: number } | null {
+  if (!JS_FAMILY.has(ref.language) || !/^[A-Za-z_$][\w$]*$/.test(name)) return null;
+  let memo = JS_FN_LOCAL_MEMO.get(context);
+  if (!memo) JS_FN_LOCAL_MEMO.set(context, (memo = new Map()));
+  const key = `${ref.fromNodeId}\0${name}\0${ref.line}`;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  let scope: { start: number; end: number } | null = null;
+  const fn = context.getNodeById?.(ref.fromNodeId);
+  if (fn && (fn.kind === 'function' || fn.kind === 'method') && fn.startLine <= ref.line && fn.endLine >= ref.line) {
+    const lines = context.getFileLines?.(ref.filePath) ?? context.readFile(ref.filePath)?.split(/\r?\n/) ?? [];
+    const text = stripCommentsForRegex(lines.slice(fn.startLine - 1, ref.line).join('\n'), 'javascript');
+    const { param } = localBindingPatterns(name, 'g');
+    const n = name.replace(/\$/g, '\\$');
+    // A plain declaration. Destructuring re-binds what a call returns under
+    // the same name — `const { t } = useI18n()`, `const { getLabel } =
+    // useProps(props)` — which is the same-named function more often than not.
+    const declared = new RegExp(`\\b(?:const|let|var)\\s+${n}\\b(?!\\s*[,\\]}])`).test(text);
+    // A parameter list — never a control-flow head (`if (openMarkerClose) {`).
+    // A return type stays on its line, never a ternary's `: data.slice()` below `filter(canRowExpand)`.
+    const parameter = new RegExp(`(?<!\\b(?:if|while|for|switch|with)\\s*)${param.source.replace('(?::[^=;{]*)?', '(?::[^=;{}()\\n]*)?')}`);
+    if (declared || parameter.test(text)) scope = { start: fn.startLine, end: fn.endLine };
+  }
+  memo.set(key, scope);
+  return scope;
+}
+
 const LOCAL_BINDING_MEMO = new WeakMap<ResolutionContext, Map<string, boolean>>();
 
 /**
@@ -8387,12 +8438,24 @@ export function matchReference(
   // inside `execute()`: a member of what the receiver is, which is the calling
   // method only through a TS/JS field of the caller's own type.
   if (result && result.targetNodeId === ref.fromNodeId && isCollapsedNonRecursion(ref, context)) return null;
+  // A name the calling JS/TS function binds itself shadows the file's own:
+  // lodash's `mixin(object, …)` calling `object(this.__wrapped__)` is its
+  // parameter, whichever strategy (fuzzy included) found a `function object`.
+  if (result && JS_LOCAL_REF_KINDS.has(ref.referenceKind)) {
+    const target = context.getNodeById?.(result.targetNodeId);
+    // (A target of another name is what the local was followed to: `const
+    // selected = useStore(s => s.reset); selected()` is the store's `reset`.)
+    if (target && target.name === ref.referenceName && isOutsideJsLocal(target, ref, context)) return null;
+  }
   // Nor does a value's initializer call the value: sttp's `val response =
   // basicRequest.get(…).response(asStringAlways)` is a request's `response`.
   if (result && result.targetNodeId === ref.fromNodeId && ref.referenceKind === 'calls' &&
       VALUE_KINDS.has(context.getNodeById?.(ref.fromNodeId)?.kind ?? '')) return null;
   return result ? retargetSelfOverload(result, ref, context) : result;
 }
+
+/** Reference kinds a bare JS/TS local can be: a call, a value, a construction. */
+const JS_LOCAL_REF_KINDS: ReadonlySet<string> = new Set(['calls', 'references', 'function_ref', 'instantiates']);
 
 /** Node kinds that hold a value rather than run code. */
 const VALUE_KINDS: ReadonlySet<string> = new Set(['variable', 'constant', 'field', 'property']);
