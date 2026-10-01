@@ -9035,14 +9035,17 @@ function pythonFactoryTypeUncached(
   for (let ln = fn.startLine + 1; ln <= fn.endLine; ln++) {
     if (nested.some((n) => ln >= n.startLine && ln <= n.endLine)) continue;
     const text = (lines[ln - 1] ?? '').trim();
-    if (/^yield\b|[=(\s]yield\b/.test(text)) return null; // a generator yields, it does not return
+    // Keywords are read with string contents blanked: `log("note: return x")`
+    // and `print("will yield")` are not statements.
+    const code = pythonBlankStrings(text);
+    if (/^yield\b|[=(\s]yield\b/.test(code)) return null; // a generator yields, it does not return
     // A return may follow a compound header or another statement on the same
     // line — `if k: return A()`, `else: return B()`, `x = 1; return C()` — and
     // every one of them must agree, so none may be skipped.
-    const ret = /(?:^|[:;]\s*)return\b\s*(.*)$/.exec(text);
+    const ret = /(?:^|[:;]\s*)return\b\s*/.exec(code);
     if (!ret) continue;
     const at = ln;
-    const joined = pythonJoinedValue(lines, ln, ret[1]!, fn.endLine);
+    const joined = pythonJoinedValue(lines, ln, text.slice(ret.index + ret[0].length), fn.endLine);
     ln = joined.end;
     const expr = joined.text.trim();
     if (expr === '' || expr === 'None') continue;

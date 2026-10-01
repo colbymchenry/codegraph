@@ -537,4 +537,27 @@ describe('python attribute types from factories and base classes', () => {
       expect(callsFrom('go')).not.toContain('Client::send@client.py');
     });
   });
+  describe('review round 2026-10-01', () => {
+    it('a return or yield inside a string is not a statement', async () => {
+      write({
+        'a.py': 'class A:\n    def send(self):\n        pass\n',
+        'other.py': DISTRACTOR,
+        'fac.py': 'from a import A\n\nK = 1\n\ndef make():\n    if not K:\n        raise ValueError("bad config: return value missing")\n    print("will yield")\n    return A()\n',
+        'svc.py': 'from fac import make\n\nclass Svc:\n    def __init__(self):\n        self.c = make()\n\n    def run(self):\n        self.c.send()\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callsFrom('run')).toEqual(['A::send@a.py']);
+    });
+
+    it('a factory the calling method assigns is typed like the class body\'s', async () => {
+      write({
+        'a.py': 'class A:\n    def send(self):\n        pass\n',
+        'other.py': DISTRACTOR,
+        'fac.py': 'from a import A\n\ndef make() -> A:\n    return A()\n',
+        'svc.py': 'from fac import make\n\nclass Svc:\n    def run(self):\n        self.c = make()\n        self.c.send()\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callsFrom('run').filter((c) => c.includes('::send@'))).toEqual(['A::send@a.py']);
+    });
+  });
 });
