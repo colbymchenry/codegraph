@@ -341,4 +341,72 @@ describe('python attribute-chain receivers', () => {
       expect(callsFrom('function', 'rel_caller')).toContain('function:do_x@app/rel/utils/helpers.py');
     });
   });
+  describe('review round 2026-10-01', () => {
+    const write = (rel: string, src: string) => {
+      fs.mkdirSync(path.dirname(path.join(tempDir, rel)), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, rel), src);
+    };
+    const FOO = 'class Foo:\n    def m(self):\n        return 1\n';
+    const OTHER = 'class Other:\n    def m(self):\n        return 2\n';
+    const resolves = async (svc: string, fn = 'go') => {
+      write('foo.py', FOO);
+      write('other.py', OTHER);
+      write('svc.py', svc);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      return callsFrom('method', fn).filter((c) => c.startsWith('method:m@'));
+    };
+
+    it('a keyword argument passing a parameter through is not a rebinding', async () => {
+      expect(await resolves('from foo import Foo\n\nclass Base:\n    def __init__(self, client=None):\n        pass\n\nclass Svc(Base):\n    def __init__(self, client: Foo):\n        super().__init__(\n            client=client,\n        )\n        validate(client=client)\n        self.client = client\n\n    def go(self):\n        return self.client.m()\n\ndef validate(client=None):\n    return client\n'))
+        .toEqual(['method:m@foo.py']);
+    });
+
+    it('a keyword argument named like the class is not a rebinding', async () => {
+      expect(await resolves('from foo import Foo\n\ndef reg(**kw):\n    return kw\n\nclass Svc:\n    def __init__(self):\n        reg(Foo=1)\n        reg(\n            Foo=2,\n        )\n        self.b = Foo()\n\n    def go(self):\n        return self.b.m()\n'))
+        .toEqual(['method:m@foo.py']);
+    });
+
+    it('a function-local import of the class is not a rebinding', async () => {
+      expect(await resolves('class Svc:\n    def __init__(self):\n        from foo import Foo\n        self.b = Foo()\n\n    def go(self):\n        return self.b.m()\n'))
+        .toEqual(['method:m@foo.py']);
+    });
+
+    it('a nested def above the assignment does not rebind the outer name', async () => {
+      expect(await resolves('from foo import Foo\n\nclass Svc:\n    def __init__(self):\n        def cb(Foo=None):\n            Foo = 1\n            return Foo\n        self.b = Foo()\n\n    def go(self):\n        return self.b.m()\n'))
+        .toEqual(['method:m@foo.py']);
+    });
+
+    it('text in a string is not a rebinding', async () => {
+      expect(await resolves('from foo import Foo\n\nclass Svc:\n    def __init__(self):\n        print("Foo = %s" % 1)\n        self.b = Foo()\n\n    def go(self):\n        return self.b.m()\n'))
+        .toEqual(['method:m@foo.py']);
+    });
+
+    it('a walrus still rebinds', async () => {
+      expect(await resolves('from foo import Foo\n\ndef load():\n    return object\n\nclass Svc:\n    def __init__(self, k):\n        if (Foo := load()):\n            pass\n        self.b = Foo()\n\n    def go(self):\n        return self.b.m()\n')).toEqual([]);
+    });
+
+    it('a one-line compound statement still rebinds', async () => {
+      expect(await resolves('from foo import Foo\n\ndef load():\n    return object\n\nclass Svc:\n    def __init__(self, k):\n        if k: Foo = load()\n        self.b = Foo()\n\n    def go(self):\n        return self.b.m()\n')).toEqual([]);
+    });
+
+    it('resolves a deeper attribute the calling method assigned', async () => {
+      expect(await resolves('from foo import Foo\n\nclass Svc:\n    def go(self):\n        self.a.b = Foo()\n        return self.a.b.m()\n')).toEqual(['method:m@foo.py']);
+    });
+
+    it('resolves an attribute assigned on an untyped parameter in the same method', async () => {
+      write('foo.py', FOO);
+      write('other.py', OTHER);
+      write('svc.py', 'from foo import Foo\n\ndef go(c):\n    c.client = Foo()\n    return c.client.m()\n');
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callsFrom('function', 'go').filter((c) => c.startsWith('method:m@'))).toEqual(['method:m@foo.py']);
+    });
+
+    it('the calling method\'s own assignment decides over a disagreeing one elsewhere', async () => {
+      expect(await resolves('from foo import Foo\nfrom other import Other\n\nclass Svc:\n    def reset(self):\n        self.x = Other()\n\n    def go(self):\n        self.x = Foo()\n        return self.x.m()\n')).toEqual(['method:m@foo.py']);
+    });
+
+    it('the calling method\'s own untyped assignment is no edge, whatever the class body says', async () => {
+      expect(await resolves('from foo import Foo\n\nclass Svc:\n    def __init__(self):\n        self.x = Foo()\n\n    def go(self):\n        self.x = make()\n        return self.x.m()\n\ndef make():\n    return 1\n')).toEqual([]);
+    });
+  });
 });
