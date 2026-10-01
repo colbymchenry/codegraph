@@ -87,6 +87,19 @@ export interface IndexerSpec {
   preferred?(projectRoot: string, outFile: string): (Invocation & { cmd: string }) | { unusable: string } | null;
   /** for languages that construct values with `Type{…}` rather than a call */
   literalShape?: LiteralShape;
+  /**
+   * Patching an installed index instead of rebuilding it (produce.ts patchIndex).
+   * `tools`: whose indexes can be patched — their symbols must be named the same
+   * whatever else was indexed, and their documents must define what they declare.
+   * `runs`: the runs re-indexing `files`, derived from the resolved full run; they
+   * may write helper files named `${outFile}.*`. Null → only a full run will do.
+   */
+  patch?: {
+    tools: readonly string[];
+    /** most files a patch takes on (default produce.ts MAX_INCREMENTAL_FILES) */
+    maxFiles?: number;
+    runs(full: IndexerRun, files: string[], outFile: string): IndexerRun[] | null;
+  };
 }
 
 export interface IndexerOverride {

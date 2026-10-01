@@ -91,12 +91,22 @@ On vscode (94 projects, 13.8k files) it indexes in 66 s instead of scip-typescri
 
 After a project opts in with `scip index`, the MCP server (and anything else that `watch`es) re-indexes on its own, niced, 60 s after the last synced edit.
 
-**Incremental (tsgo).** A tsgo-built index is patched rather than rebuilt (`produce.ts` `incrementalPlan`). The files whose codegraph hash differs from the snapshot are re-indexed with `tsgo-index --only`, together with every file that imports one of them, since their calls into it may now resolve differently. Their documents are spliced into the installed index, and deleted files drop out.
+**Incremental (tsgo, scip-python).** A tsgo- or scip-python-built index is patched rather than rebuilt (`produce.ts` `incrementalPlan`). The files whose codegraph hash differs from the snapshot are re-indexed, together with every file that imports one of them, since their calls into it may now resolve differently. Their documents are spliced into the installed index, and deleted files drop out.
 - **Why splicing works:** a tsgo symbol is named by its file and enclosing declarations (`` `src/a.ts`/Impl#run(). ``), not by node index, so an untouched file's references still link up after an edit elsewhere. The suffix comes from the declaration's kind, so a method reached through a union is still `().`.
 - **Definitions:** a partial run defines everything the re-indexed files declare, not just what it referenced.
-- **Fallbacks:** more than 500 files, or an index not built by tsgo, means a full run. Deeper effects (a type changing two imports away) wait for the next full run.
+- **How each adapter patches (`IndexerSpec.patch`):**
+  - tsgo runs once with `tsgo-index --only`.
+  - scip-python runs once per changed file's directory with `--target-only`. Its paths are relative to that target, so the patch rebases them through the output's `projectRoot`. A file passed as the target is left out of its own output, which is why the directory is the target.
+- **Fallbacks:** more than 500 files (8 for Python), or an index from a tool the language can't patch (for example scip-typescript), means a full run. Deeper effects (a type changing two imports away) wait for the next full run.
 - **Timing:** a patch may run every minute; a full rebuild at most every 10 minutes. `codegraph scip index --changed` does the same by hand, and prints *up to date* when nothing changed.
-- **On vscode:** an edit to a service file meant re-indexing 15 files, about 20 s instead of about 70 s (40 s instead of 95 s with the merge). The resulting graph was edge-for-edge identical to a full rebuild of the same state (933,950 edges, 0 differences). A new index replaces the old one only when its count of resolved calls (calls and instantiations of project symbols; imports and type references don't count) dropped by no more than 20%. Otherwise the old index stays and the reason is logged.
+- **On vscode:** an edit to a service file meant re-indexing 15 files, about 20 s instead of about 70 s (40 s instead of 95 s with the merge). The resulting graph was edge-for-edge identical to a full rebuild of the same state (933,950 edges, 0 differences).
+- **On Django:** an edit to `django/utils/timesince.py` meant re-indexing 3 files in 26 s instead of 95 s. The result was identical to a full rebuild (120,486 edges, 0 differences).
+
+**Why Python full runs stay ~90 s on Django.**
+- **No faster checker emits SCIP:** neither pyrefly nor ty, the Rust-based checkers, does yet.
+- **Splitting doesn't help:** scip-python spends ~10–15 s building the whole program whatever the target, and `--target-only` emits documents for the target's import closure too. Indexing `tests/` alone took 78 s, and a 3-way parallel split of the repo took 78 s against 84 s for one run.
+
+So the speed-up for Python is patching, not a faster full run. A new index replaces the old one only when its count of resolved calls (calls and instantiations of project symbols; imports and type references don't count) dropped by no more than 20%. Otherwise the old index stays and the reason is logged.
 
 ## How edges are decided
 
@@ -233,5 +243,5 @@ Known residue: ripgrep's multi-line `const X: T = T { … }` items. codegraph at
 - Phase 2 (Python): done.
 - Phase 3 (Go) and Phase 4 (Rust): done.
 - TS/JS via tsgo (TypeScript ≥ 7.1): done; preferred over scip-typescript when installed.
-- Incremental reindex for tsgo indexes: done.
+- Incremental reindex for tsgo and scip-python indexes: done.
 - Phase 5: `implements`/`extends` and calls through interfaces from SCIP relationships: done (Rust excluded: rust-analyzer emits no relationships). `references` edges were not needed for the gaps found and are not done.

@@ -20,6 +20,7 @@ import { spawn, ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { fileURLToPath } from 'url';
 import type { SqliteDatabase } from '../db/sqlite-adapter';
 import { Compactor } from './compact';
 import { INDEXERS, IndexerRun, RUN_WARNING, ResolvedIndexer, resolveIndexer } from './indexers';
@@ -70,15 +71,15 @@ export interface IncrementalPlan {
  * What changed since the installed index was built: files whose codegraph hash
  * differs from the snapshot (edited or new) and, because their calls into an
  * edited file may now resolve differently, the files importing one; plus files
- * that are gone. Null when only a full run will do — no snapshot, an index not
- * built by tsgo-index (the one indexer with a partial mode; its symbols are
- * named by declaration, so an unchanged file's references still link up), or
- * too many changes. Deeper effects (a type changing two imports away) wait for
+ * that are gone. Null when only a full run will do — no snapshot, an index
+ * built by a tool the language can't patch (IndexerSpec.patch), or too many
+ * changes. Deeper effects (a type changing two imports away) wait for
  * the next full run.
  */
 export function incrementalPlan(db: SqliteDatabase, projectRoot: string, lang: ScipLanguage): IncrementalPlan | null {
   const meta = readMeta(projectRoot, lang);
-  if (!meta || meta.tool !== 'tsgo-index') return null;
+  const patch = INDEXERS[lang].patch;
+  if (!meta || !patch?.tools.includes(meta.tool)) return null;
   const langs = INDEXERS[lang].codegraphLanguages;
   const rows = db.prepare(`SELECT path, content_hash FROM files WHERE language IN (${langs.map(() => '?').join(',')})`)
     .all(...langs) as { path: string; content_hash: string }[];
@@ -89,7 +90,7 @@ export function incrementalPlan(db: SqliteDatabase, projectRoot: string, lang: S
     JOIN edges e ON e.target = t.id AND e.kind = 'imports' JOIN nodes s ON s.id = e.source WHERE t.file_path = ?`);
   for (const c of changed) for (const { p } of importers.all(c) as { p: string }[]) if (current.has(p)) files.add(p);
   const deleted = Object.keys(meta.hashes).filter(p => !current.has(p));
-  if (files.size > MAX_INCREMENTAL_FILES) return null;
+  if (files.size > (patch.maxFiles ?? MAX_INCREMENTAL_FILES)) return null;
   return { files: [...files].sort(), deleted };
 }
 
@@ -187,9 +188,9 @@ export async function produceIndex(
 async function patchIndex(
   db: SqliteDatabase, projectRoot: string, lang: ScipLanguage, indexer: ResolvedIndexer, raw: string, opts: ProduceOptions
 ): Promise<ProduceResult | null> {
-  const run = indexer.runs[0];
   const final = indexPath(projectRoot, lang);
-  if (indexer.runs.length !== 1 || path.basename(run?.args[0] ?? '') !== 'tsgo-index.js' || !fs.existsSync(final)) return null;
+  const patch = INDEXERS[lang].patch;
+  if (!patch || indexer.runs.length !== 1 || !fs.existsSync(final)) return null;
   const plan = incrementalPlan(db, projectRoot, lang);
   const previous = readMeta(projectRoot, lang);
   if (!plan || !previous) return null;
@@ -202,27 +203,47 @@ async function patchIndex(
     if (h) hashes[f] = h;
   }
   const present = Object.keys(hashes); // a file that can't be read now is dropped with the deleted ones
-  const list = `${final}.${process.pid}.only`;
+  const runs = present.length ? patch.runs(indexer.runs[0]!, present, raw) : [];
+  if (!runs) return null;
   const warnings: string[] = [];
   try {
     let partial: ScipDocument[] = [];
     let tool = { toolName: previous.tool, toolVersion: previous.toolVersion, projectRoot: '' };
-    if (present.length) {
-      fs.writeFileSync(list, present.join('\n'));
-      const args = [...run!.args];
-      args.splice(4, 0, '--only', list); // after <tsDir> <output> <root>, before the configs
+    if (runs.length) {
       opts.log?.(`${lang}: re-indexing ${present.length} changed or dependent file(s)`);
-      const useNice = opts.nice && process.platform !== 'win32';
-      const [cmd, cmdArgs] = useNice ? ['nice', ['-n', '10', indexer.cmd, ...args]] : [indexer.cmd, args];
-      const { code, stderr } = await runIndexer(cmd, cmdArgs, projectRoot, { ...indexer.env, ...run!.env }, opts.signal);
+      const outputs: string[] = [];
+      let failed: string | null = null;
+      const one = async (r: IndexerRun) => {
+        const useNice = opts.nice && process.platform !== 'win32';
+        const [cmd, args] = useNice ? ['nice', ['-n', '10', indexer.cmd, ...r.args]] : [indexer.cmd, r.args];
+        const { code, stderr } = await runIndexer(cmd, args, projectRoot, { ...indexer.env, ...r.env }, opts.signal);
+        if (code !== 0 || !fs.existsSync(r.output)) failed ??= `${r.label}: ${indexer.cmd} exited ${code}: ${stderr.trim().split('\n').slice(-1)[0] ?? ''}`;
+        else outputs.push(r.output);
+        for (const w of stderr.split('\n')) if (w.startsWith(RUN_WARNING)) warnings.push(w.slice(RUN_WARNING.length));
+      };
+      const queue = [...runs];
+      const width = runs.every(r => r.light) ? Math.min(lightConcurrency(), runs.length) : 1;
+      await Promise.all(Array.from({ length: width }, async () => { for (let r = queue.shift(); r; r = queue.shift()) await one(r); }));
       if (opts.signal?.aborted) return { status: 'failed', lang, reason: 'aborted' };
-      if (code !== 0 || !fs.existsSync(raw)) {
-        return { status: 'failed', lang, reason: `${indexer.cmd} exited ${code}: ${stderr.trim().split('\n').slice(-3).join(' | ')}` };
+      if (failed) {
+        opts.log?.(`${lang}: partial reindex failed (${failed}) — running a full one`);
+        return null;
       }
-      for (const w of stderr.split('\n')) if (w.startsWith(RUN_WARNING)) warnings.push(w.slice(RUN_WARNING.length));
-      const index = decodeScipIndex(fs.readFileSync(raw));
-      partial = index.documents;
-      tool = index;
+      // Several runs may each carry a file (an import both share): the first copy stands.
+      // Paths are relative to each run's own root — scip-python's is its --target-only
+      // path — so they're rebased onto the project's.
+      const seen = new Set<string>();
+      for (const out of outputs) {
+        const index = decodeScipIndex(fs.readFileSync(out));
+        tool = index;
+        const base = index.projectRoot.startsWith('file:') ? fileURLToPath(index.projectRoot) : projectRoot;
+        for (const d of index.documents) {
+          const rel = path.relative(projectRoot, path.resolve(base, d.relativePath)).split(path.sep).join('/');
+          if (rel.startsWith('..') || seen.has(rel)) continue;
+          seen.add(rel);
+          partial.push({ ...d, relativePath: rel });
+        }
+      }
     }
 
     // Splice: the plan's files get their new documents (or none); every other file keeps
@@ -230,11 +251,12 @@ async function patchIndex(
     const replaced = new Set([...plan.files, ...plan.deleted]);
     const docs = new Map(loadScipIndex(final).documents.filter(d => !replaced.has(d.relativePath)).map(d => [d.relativePath, d]));
     for (const d of partial) {
-      const kept = docs.get(d.relativePath);
-      if (replaced.has(d.relativePath) || !kept) {
+      if (replaced.has(d.relativePath)) {
         docs.set(d.relativePath, d);
         continue;
       }
+      const kept = docs.get(d.relativePath);
+      if (!kept) continue; // outside the plan and not indexed before: a patch doesn't widen coverage
       const defined = new Set(kept.occurrences.filter(o => o.roles & ROLE_DEFINITION).map(o => o.symbol));
       for (const o of d.occurrences) if (o.roles & ROLE_DEFINITION && !defined.has(o.symbol)) kept.occurrences.push(o);
     }
@@ -254,8 +276,9 @@ async function patchIndex(
       warnings, incremental: present.length,
     };
   } finally {
-    fs.rmSync(list, { force: true });
-    fs.rmSync(raw, { force: true });
+    // The runs' outputs and helper files, all named after the raw output (IndexerSpec.patch).
+    const dir = path.dirname(raw);
+    for (const f of fs.readdirSync(dir)) if (f === path.basename(raw) || f.startsWith(`${path.basename(raw)}.`)) fs.rmSync(path.join(dir, f), { force: true });
   }
 }
 

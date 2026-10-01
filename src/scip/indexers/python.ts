@@ -92,6 +92,13 @@ export function projectName(root: string): string {
   return path.basename(path.resolve(root));
 }
 
+/**
+ * Most files a Python patch re-indexes. Each directory among them is its own
+ * scip-python run (it takes one `--target-only` path) costing ~10-20 s of
+ * program setup, so past this a full run is about as fast.
+ */
+const PATCH_MAX_FILES = 8;
+
 export const pythonIndexer: IndexerSpec = {
   lang: 'python',
   tools: ['scip-python'],
@@ -112,5 +119,23 @@ export const pythonIndexer: IndexerSpec = {
     }
     const bin = path.join(venv, process.platform === 'win32' ? 'Scripts' : 'bin');
     return { runs, env: { VIRTUAL_ENV: venv, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}` } };
+  },
+  patch: {
+    tools: ['scip-python'],
+    maxFiles: PATCH_MAX_FILES,
+    runs(full, files, outFile) {
+      const at = full.args.indexOf('--output');
+      if (at < 0) return null; // overridden args without an output we can redirect
+      // A file passed as --target-only is left out of its own output (scip-python treats the
+      // path as a directory prefix), so each changed file's directory is the target.
+      const dirs = [...new Set(files.map(f => path.posix.dirname(f)))];
+      return dirs.map((dir, i) => {
+        const args = [...full.args];
+        const output = `${outFile}.part${i}`;
+        args[at + 1] = output;
+        args.push('--target-only', dir);
+        return { label: dir, args, output, light: true, env: full.env };
+      });
+    },
   },
 };

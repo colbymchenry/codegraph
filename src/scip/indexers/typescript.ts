@@ -202,6 +202,18 @@ export const typescriptIndexer: IndexerSpec = {
     else if (!has(root, 'tsconfig.json')) args.push('--infer-tsconfig');
     return { runs: [{ label: 'typescript', args, output: outFile, env: heapEnv(bigHeapMb()) }] };
   },
+  patch: {
+    tools: ['tsgo-index'],
+    runs(full, files, outFile) {
+      if (path.basename(full.args[0] ?? '') !== 'tsgo-index.js') return null; // only tsgo has a partial mode
+      const list = `${outFile}.only`;
+      fs.writeFileSync(list, files.join('\n'));
+      const args = [...full.args];
+      args[2] = outFile;
+      args.splice(4, 0, '--only', list); // after <tsDir> <output> <root>, before the configs
+      return [{ label: 'typescript (tsgo, changed files)', args, output: outFile, env: full.env }];
+    },
+  },
   preferred(root, outFile) {
     const ts = findTsgo(root);
     if (!ts || 'unusable' in ts) return ts;
