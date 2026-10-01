@@ -25,7 +25,7 @@ import { GraphTraverser } from '../graph';
 import { formatContextAsMarkdown, formatContextAsJson } from './formatter';
 import { logDebug } from '../errors';
 import { validatePathWithinRoot, isConfigLeafNode } from '../utils';
-import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants, isDistinctiveIdentifier } from '../search/query-utils';
+import { isTestFile, extractSearchTerms, preparePathRelevanceQuery, scorePreparedPathRelevance, getStemVariants, isDistinctiveIdentifier } from '../search/query-utils';
 import { LOW_CONFIDENCE_MARKER } from './markers';
 import { findNamedCopybooks, isCopybookInclude } from '../graph/cobol-copybooks';
 import { describeSynthesizedHop } from '../graph/synthesized-hop';
@@ -220,9 +220,13 @@ export class ContextBuilder {
    * and its non-production budget cap are deliberately NOT joined: those REMOVE
    * content, and `deprioritize` is a ranking lever by definition — `exclude` is
    * the lever for taking things out of reach.
+   *
+   * Taken once per retrieval and applied to every candidate: taking one reads
+   * the config, and doing that per candidate path cost seconds on a long
+   * prompt (#2184).
    */
-  private isDeprioritized(filePath: string): boolean {
-    return this.queries.getDeprioritizedPathMatcher()?.(filePath) ?? false;
+  private deprioritizedPredicate(): (filePath: string) => boolean {
+    return this.queries.getDeprioritizedPathMatcher() ?? (() => false);
   }
 
   /**
@@ -858,6 +862,10 @@ export class ContextBuilder {
       // Track per-node term hits for multi-term boosting
       const camelNodeTerms = new Map<string, { result: SearchResult; termCount: number }>();
       const maxCamelPerTerm = Math.ceil(opts.searchLimit / 2);
+      // Path relevance is scored against the whole query for every candidate
+      // below: split the query and read the deprioritize config once (#2184).
+      const pathQuery = preparePathRelevanceQuery(query);
+      const isDeprioritized = this.deprioritizedPredicate();
 
       for (const sym of symbolsFromQuery) {
         const titleCased = sym.charAt(0).toUpperCase() + sym.slice(1).toLowerCase();
@@ -902,11 +910,10 @@ export class ContextBuilder {
           if (searchIdSet.has(r.node.id)) continue;
           if (isTestFile(r.node.filePath) && !isTestQuery) continue;
 
-          const pathScore = scorePathRelevance(
+          const pathScore = scorePreparedPathRelevance(
             r.node.filePath,
-            query,
-            undefined,
-            this.isDeprioritized(r.node.filePath),
+            pathQuery,
+            isDeprioritized(r.node.filePath),
           );
           const brevityBonus = Math.max(0, 6 - (name.length - titleCased.length) / 4);
           termCandidates.push({ node: r.node, score: 8 + brevityBonus + pathScore });
@@ -994,11 +1001,10 @@ export class ContextBuilder {
         const compoundResults: SearchResult[] = [];
         for (const [, entry] of compoundTermMap) {
           if (entry.terms.size >= 2) {
-            const pathScore = scorePathRelevance(
+            const pathScore = scorePreparedPathRelevance(
               entry.node.filePath,
-              query,
-              undefined,
-              this.isDeprioritized(entry.node.filePath),
+              pathQuery,
+              isDeprioritized(entry.node.filePath),
             );
             const brevityBonus = Math.max(0, 6 - entry.node.name.length / 8);
             compoundResults.push({
