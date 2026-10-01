@@ -89,7 +89,14 @@ On vscode (94 projects, 13.8k files) it indexes in 66 s instead of scip-typescri
 
 **Python environments.** A `.venv/` or `venv/` (with `pyvenv.cfg`) is activated for the indexer (`VIRTUAL_ENV`, `PATH`). Its packages are passed to scip-python as an `--environment` manifest read from `*.dist-info/RECORD`, so uv venvs without `pip` work. Without a venv the manifest is empty and `scip index` warns. Project code still resolves; calls into dependencies don't.
 
-After a project opts in with `scip index`, the MCP server (and anything else that `watch`es) re-indexes on its own. That happens 60 s after the last synced edit, at most every 10 min, niced. A new index replaces the old one only when its count of resolved calls (calls and instantiations of project symbols; imports and type references don't count) dropped by no more than 20%. Otherwise the old index stays and the reason is logged.
+After a project opts in with `scip index`, the MCP server (and anything else that `watch`es) re-indexes on its own, niced, 60 s after the last synced edit.
+
+**Incremental (tsgo).** A tsgo-built index is patched rather than rebuilt (`produce.ts` `incrementalPlan`). The files whose codegraph hash differs from the snapshot are re-indexed with `tsgo-index --only`, together with every file that imports one of them, since their calls into it may now resolve differently. Their documents are spliced into the installed index, and deleted files drop out.
+- **Why splicing works:** a tsgo symbol is named by its file and enclosing declarations (`` `src/a.ts`/Impl#run(). ``), not by node index, so an untouched file's references still link up after an edit elsewhere. The suffix comes from the declaration's kind, so a method reached through a union is still `().`.
+- **Definitions:** a partial run defines everything the re-indexed files declare, not just what it referenced.
+- **Fallbacks:** more than 500 files, or an index not built by tsgo, means a full run. Deeper effects (a type changing two imports away) wait for the next full run.
+- **Timing:** a patch may run every minute; a full rebuild at most every 10 minutes. `codegraph scip index --changed` does the same by hand, and prints *up to date* when nothing changed.
+- **On vscode:** an edit to a service file meant re-indexing 15 files, about 20 s instead of about 70 s (40 s instead of 95 s with the merge). The resulting graph was edge-for-edge identical to a full rebuild of the same state (933,950 edges, 0 differences). A new index replaces the old one only when its count of resolved calls (calls and instantiations of project symbols; imports and type references don't count) dropped by no more than 20%. Otherwise the old index stays and the reason is logged.
 
 ## How edges are decided
 
@@ -226,4 +233,5 @@ Known residue: ripgrep's multi-line `const X: T = T { … }` items. codegraph at
 - Phase 2 (Python): done.
 - Phase 3 (Go) and Phase 4 (Rust): done.
 - TS/JS via tsgo (TypeScript ≥ 7.1): done; preferred over scip-typescript when installed.
+- Incremental reindex for tsgo indexes: done.
 - Phase 5: `implements`/`extends` and calls through interfaces from SCIP relationships: done (Rust excluded: rust-analyzer emits no relationships). `references` edges were not needed for the gaps found and are not done.

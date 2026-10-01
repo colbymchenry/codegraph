@@ -9,6 +9,11 @@
  *    20% below the installed one (a half-broken build usually shows up as a
  *    collapse in resolution, not as a failed exit) — the old index stays
  * 4. otherwise swap it in atomically, then write the snapshot
+ *
+ * With `incremental`, a tsgo-built index is instead patched: only files edited,
+ * added or removed since its snapshot — and the files importing them — are
+ * re-indexed, and their documents are spliced into the installed index (see
+ * incrementalPlan). Anything else falls through to the full run.
  */
 
 import { spawn, ChildProcess } from 'child_process';
@@ -17,9 +22,11 @@ import * as os from 'os';
 import * as path from 'path';
 import type { SqliteDatabase } from '../db/sqlite-adapter';
 import { Compactor } from './compact';
-import { INDEXERS, IndexerRun, RUN_WARNING, resolveIndexer } from './indexers';
-import { ScipDecodeError } from './reader';
-import { ScipLanguage, indexPath, installIndex, readMeta, snapshotHashes } from './store';
+import { INDEXERS, IndexerRun, RUN_WARNING, ResolvedIndexer, resolveIndexer } from './indexers';
+import {
+  ROLE_DEFINITION, ScipDecodeError, ScipDocument, decodeScipIndex, encodeDocument, encodeMetadata, loadScipIndex,
+} from './reader';
+import { ScipLanguage, indexPath, installIndex, readHashed, readMeta, snapshotHashes } from './store';
 
 /** Largest drop in resolved calls a new index may show before it is rejected. */
 export const MAX_RESOLUTION_DROP = 0.2;
@@ -27,8 +34,14 @@ export const MAX_RESOLUTION_DROP = 0.2;
 const INDEXER_TIMEOUT_MS = 30 * 60 * 1000;
 
 export type ProduceResult =
-  | { status: 'installed'; lang: ScipLanguage; documents: number; resolvedCalls: number; durationMs: number; warnings: string[] }
+  | {
+    status: 'installed'; lang: ScipLanguage; documents: number; resolvedCalls: number; durationMs: number; warnings: string[];
+    /** files re-indexed, when the index was patched rather than rebuilt */
+    incremental?: number;
+  }
   | { status: 'skipped'; lang: ScipLanguage; reason: string }
+  /** incremental: nothing changed since the installed index was built */
+  | { status: 'current'; lang: ScipLanguage }
   | { status: 'rejected'; lang: ScipLanguage; reason: string }
   | { status: 'failed'; lang: ScipLanguage; reason: string };
 
@@ -39,6 +52,45 @@ export interface ProduceOptions {
   nice?: boolean;
   signal?: AbortSignal;
   log?: (msg: string) => void;
+  /** patch the installed index when only a few files changed (see incrementalPlan) */
+  incremental?: boolean;
+}
+
+/** Most files a patch re-indexes; beyond this a full run is cheaper to trust. */
+export const MAX_INCREMENTAL_FILES = 500;
+
+export interface IncrementalPlan {
+  /** files to re-index: changed since the snapshot, plus the files importing them */
+  files: string[];
+  /** files the installed index covers that codegraph no longer has */
+  deleted: string[];
+}
+
+/**
+ * What changed since the installed index was built: files whose codegraph hash
+ * differs from the snapshot (edited or new) and, because their calls into an
+ * edited file may now resolve differently, the files importing one; plus files
+ * that are gone. Null when only a full run will do — no snapshot, an index not
+ * built by tsgo-index (the one indexer with a partial mode; its symbols are
+ * named by declaration, so an unchanged file's references still link up), or
+ * too many changes. Deeper effects (a type changing two imports away) wait for
+ * the next full run.
+ */
+export function incrementalPlan(db: SqliteDatabase, projectRoot: string, lang: ScipLanguage): IncrementalPlan | null {
+  const meta = readMeta(projectRoot, lang);
+  if (!meta || meta.tool !== 'tsgo-index') return null;
+  const langs = INDEXERS[lang].codegraphLanguages;
+  const rows = db.prepare(`SELECT path, content_hash FROM files WHERE language IN (${langs.map(() => '?').join(',')})`)
+    .all(...langs) as { path: string; content_hash: string }[];
+  const current = new Set(rows.map(r => r.path));
+  const changed = rows.filter(r => meta.hashes[r.path] !== r.content_hash).map(r => r.path);
+  const files = new Set(changed);
+  const importers = db.prepare(`SELECT DISTINCT s.file_path AS p FROM nodes t
+    JOIN edges e ON e.target = t.id AND e.kind = 'imports' JOIN nodes s ON s.id = e.source WHERE t.file_path = ?`);
+  for (const c of changed) for (const { p } of importers.all(c) as { p: string }[]) if (current.has(p)) files.add(p);
+  const deleted = Object.keys(meta.hashes).filter(p => !current.has(p));
+  if (files.size > MAX_INCREMENTAL_FILES) return null;
+  return { files: [...files].sort(), deleted };
 }
 
 export async function produceIndex(
@@ -49,6 +101,10 @@ export async function produceIndex(
   fs.mkdirSync(path.dirname(final), { recursive: true }); // adapters may write helper files beside the output
   const indexer = resolveIndexer(projectRoot, lang, raw);
   if ('skip' in indexer) return { status: 'skipped', lang, reason: indexer.skip };
+  if (opts.incremental) {
+    const patched = await patchIndex(db, projectRoot, lang, indexer, raw, opts);
+    if (patched) return patched;
+  }
 
   const started = Date.now();
   const hashes = snapshotHashes(db, projectRoot, INDEXERS[lang].codegraphLanguages);
@@ -69,7 +125,7 @@ export async function produceIndex(
       opts.log?.(`${runs.length > 1 ? `[${++done}/${runs.length}] ${r.label}: ` : ''}running ${indexer.cmd} ${r.args.slice(0, 8).join(' ')}${r.args.length > 8 ? ` … (+${r.args.length - 8} more)` : ''}`);
       const useNice = opts.nice && process.platform !== 'win32';
       const [cmd, args] = useNice ? ['nice', ['-n', '10', indexer.cmd, ...r.args]] : [indexer.cmd, r.args];
-      const { code, stderr } = await run(cmd, args, projectRoot, { ...indexer.env, ...r.env }, opts.signal);
+      const { code, stderr } = await runIndexer(cmd, args, projectRoot, { ...indexer.env, ...r.env }, opts.signal);
       const why = code !== 0 ? `${indexer.cmd} exited ${code}: ${stderr.trim().split('\n').slice(-3).join(' | ')}`
         : !fs.existsSync(r.output) ? `${indexer.cmd} exited 0 but wrote no index at ${r.output}` : null;
       if (!why) {
@@ -124,6 +180,86 @@ export async function produceIndex(
 }
 
 /**
+ * The incremental path of produceIndex: re-index the plan's files with
+ * tsgo-index `--only`, splice their documents into the installed index, and
+ * install the result under the same guard. Null → do a full run instead.
+ */
+async function patchIndex(
+  db: SqliteDatabase, projectRoot: string, lang: ScipLanguage, indexer: ResolvedIndexer, raw: string, opts: ProduceOptions
+): Promise<ProduceResult | null> {
+  const run = indexer.runs[0];
+  const final = indexPath(projectRoot, lang);
+  if (indexer.runs.length !== 1 || path.basename(run?.args[0] ?? '') !== 'tsgo-index.js' || !fs.existsSync(final)) return null;
+  const plan = incrementalPlan(db, projectRoot, lang);
+  const previous = readMeta(projectRoot, lang);
+  if (!plan || !previous) return null;
+  if (plan.files.length === 0 && plan.deleted.length === 0) return { status: 'current', lang };
+
+  const started = Date.now();
+  const hashes: Record<string, string> = {};
+  for (const f of plan.files) {
+    const h = readHashed(projectRoot, f)?.hash;
+    if (h) hashes[f] = h;
+  }
+  const present = Object.keys(hashes); // a file that can't be read now is dropped with the deleted ones
+  const list = `${final}.${process.pid}.only`;
+  const warnings: string[] = [];
+  try {
+    let partial: ScipDocument[] = [];
+    let tool = { toolName: previous.tool, toolVersion: previous.toolVersion, projectRoot: '' };
+    if (present.length) {
+      fs.writeFileSync(list, present.join('\n'));
+      const args = [...run!.args];
+      args.splice(4, 0, '--only', list); // after <tsDir> <output> <root>, before the configs
+      opts.log?.(`${lang}: re-indexing ${present.length} changed or dependent file(s)`);
+      const useNice = opts.nice && process.platform !== 'win32';
+      const [cmd, cmdArgs] = useNice ? ['nice', ['-n', '10', indexer.cmd, ...args]] : [indexer.cmd, args];
+      const { code, stderr } = await runIndexer(cmd, cmdArgs, projectRoot, { ...indexer.env, ...run!.env }, opts.signal);
+      if (opts.signal?.aborted) return { status: 'failed', lang, reason: 'aborted' };
+      if (code !== 0 || !fs.existsSync(raw)) {
+        return { status: 'failed', lang, reason: `${indexer.cmd} exited ${code}: ${stderr.trim().split('\n').slice(-3).join(' | ')}` };
+      }
+      for (const w of stderr.split('\n')) if (w.startsWith(RUN_WARNING)) warnings.push(w.slice(RUN_WARNING.length));
+      const index = decodeScipIndex(fs.readFileSync(raw));
+      partial = index.documents;
+      tool = index;
+    }
+
+    // Splice: the plan's files get their new documents (or none); every other file keeps
+    // its installed document plus any definitions the new references need from it.
+    const replaced = new Set([...plan.files, ...plan.deleted]);
+    const docs = new Map(loadScipIndex(final).documents.filter(d => !replaced.has(d.relativePath)).map(d => [d.relativePath, d]));
+    for (const d of partial) {
+      const kept = docs.get(d.relativePath);
+      if (replaced.has(d.relativePath) || !kept) {
+        docs.set(d.relativePath, d);
+        continue;
+      }
+      const defined = new Set(kept.occurrences.filter(o => o.roles & ROLE_DEFINITION).map(o => o.symbol));
+      for (const o of d.occurrences) if (o.roles & ROLE_DEFINITION && !defined.has(o.symbol)) kept.occurrences.push(o);
+    }
+    const compact = new Compactor(projectRoot, lang);
+    compact.add(Buffer.concat([encodeMetadata(tool), ...[...docs.values()].map(d => encodeDocument(d, s => Buffer.from(s)))]));
+    const resolvedCalls = compact.resolvedCalls();
+    if (!opts.force && previous.resolvedCalls !== undefined && resolvedCalls < previous.resolvedCalls * (1 - MAX_RESOLUTION_DROP)) {
+      return { status: 'rejected', lang, reason: `resolved calls fell from ${previous.resolvedCalls} to ${resolvedCalls} after a partial reindex — kept the previous index` };
+    }
+    const snapshot = { ...previous.hashes };
+    for (const f of replaced) delete snapshot[f];
+    Object.assign(snapshot, hashes);
+    installIndex(projectRoot, lang, f => compact.write(f),
+      { tool: tool.toolName, toolVersion: tool.toolVersion, producedAt: started, hashes: snapshot, resolvedCalls });
+    return {
+      status: 'installed', lang, documents: compact.paths.length, resolvedCalls, durationMs: Date.now() - started,
+      warnings, incremental: present.length,
+    };
+  } finally {
+    fs.rmSync(list, { force: true });
+    fs.rmSync(raw, { force: true });
+  }
+}
+
+/**
  * Light runs at once: up to 4, at most half the cores, and as many ~3 GB
  * processes as 60% of physical memory holds.
  */
@@ -132,7 +268,7 @@ function lightConcurrency(): number {
   return Math.max(1, Math.min(4, Math.floor(os.cpus().length / 2), byMemory));
 }
 
-function run(
+function runIndexer(
   cmd: string, args: string[], cwd: string, env: Record<string, string>, signal?: AbortSignal
 ): Promise<{ code: number | null; stderr: string }> {
   return new Promise((resolve) => {

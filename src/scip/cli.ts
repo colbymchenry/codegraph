@@ -72,16 +72,22 @@ export function registerScipCommands(program: Command, h: CliHelpers): void {
     .description('Run the SCIP indexer for each detected language (must be on PATH), then merge')
     .option('--lang <lang>', `Only this language (${SCIP_LANGUAGES.join('|')})`)
     .option('-f, --force', 'Install the new index even if resolution dropped sharply')
-    .action((pathArg: string | undefined, opts: { lang?: string; force?: boolean }) =>
+    .option('--changed', 'Re-index only files changed since the installed index, and their importers (tsgo); else a full run')
+    .action((pathArg: string | undefined, opts: { lang?: string; force?: boolean; changed?: boolean }) =>
       withGraph(pathArg, async (cg) => {
         const only = parseLang(opts.lang);
         let installed = 0;
+        let current = 0;
         for (const lang of only ? [only] : SCIP_LANGUAGES) {
-          const r = await produceIndex(cg.scipReadDb(), cg.getProjectRoot(), lang, { force: opts.force, log: h.info });
+          const r = await produceIndex(cg.scipReadDb(), cg.getProjectRoot(), lang, { force: opts.force, incremental: opts.changed, log: h.info });
           if (r.status === 'installed') {
             installed++;
-            h.success(`${lang}: ${r.documents} documents, ${r.resolvedCalls} resolved calls in ${(r.durationMs / 1000).toFixed(1)}s`);
+            const how = r.incremental !== undefined ? ` (patched: ${r.incremental} file(s) re-indexed)` : '';
+            h.success(`${lang}: ${r.documents} documents, ${r.resolvedCalls} resolved calls in ${(r.durationMs / 1000).toFixed(1)}s${how}`);
             for (const w of r.warnings) h.warn(`${lang}: ${w}`);
+          } else if (r.status === 'current') {
+            h.info(`${lang}: up to date`);
+            if (only) current++;
           } else if (r.status === 'skipped') {
             if (only) h.warn(`${lang}: skipped — ${r.reason}`);
             else h.info(`${lang}: skipped — ${r.reason}`);
@@ -90,7 +96,7 @@ export function registerScipCommands(program: Command, h: CliHelpers): void {
           }
         }
         if (installed > 0) await mergeAndReport(cg);
-        else if (only) process.exitCode = 1;
+        else if (only && current === 0) process.exitCode = 1;
       }));
 
   scip

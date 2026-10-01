@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -217,4 +218,42 @@ describe('typescript adapter: tsgo when installed', () => {
       process.env.PATH = savedPath;
     }
   });
+});
+
+describe.runIf(TSGO)('incremental reindex (tsgo, through the CLI)', () => {
+  let dir: string;
+  const cli = (...args: string[]) => execFileSync(process.execPath, [path.join(__dirname, '..', '..', 'dist', 'bin', 'codegraph.js'), ...args],
+    { encoding: 'utf8', env: { ...process.env, NO_COLOR: '1', CODEGRAPH_NO_UPDATE_CHECK: '1' } });
+  const edge = async (src: string, tgt: string) => {
+    const cg = await CodeGraph.open(dir);
+    try {
+      return cg.scipReadDb().prepare(`SELECT e.provenance FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+        WHERE e.kind = 'calls' AND s.qualified_name = ? AND t.qualified_name = ?`).get(src, tgt) as { provenance: string | null } | undefined;
+    } finally {
+      cg.close();
+    }
+  };
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-tsgo-inc-'));
+    fs.cpSync(path.join(FIXTURE, 'project'), dir, { recursive: true });
+    fs.mkdirSync(path.join(dir, 'node_modules'));
+    fs.symlinkSync(TSGO!, path.join(dir, 'node_modules', 'typescript')); // what the adapter looks for first
+  });
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  it('re-indexes only the edited file (and its importers), splicing it into the installed index', async () => {
+    cli('init', '-y', dir);
+    expect(cli('scip', 'index', dir, '--lang', 'typescript')).not.toMatch(/patched/);
+    expect((await edge('sum', 'helper'))?.provenance).toBe('scip');
+
+    fs.appendFileSync(path.join(dir, 'src', 'main.ts'), '\nexport function extra(): number {\n  return helper(3);\n}\n');
+    cli('sync', dir);
+    const out = cli('scip', 'index', dir, '--lang', 'typescript', '--changed');
+    expect(out).toMatch(/patched: 1 file\(s\) re-indexed/); // main.ts; nothing imports it
+    expect((await edge('extra', 'helper'))?.provenance).toBe('scip'); // the new call, compiler-verified
+    expect((await edge('sum', 'helper'))?.provenance).toBe('scip'); // untouched files keep theirs
+    expect((await edge('usesOverloads', 'Registry::lookup'))?.provenance).toBe('scip'); // a call into models.ts, which was not re-indexed
+    expect(cli('scip', 'index', dir, '--lang', 'typescript', '--changed')).toMatch(/up to date/);
+  }, 60_000);
 });

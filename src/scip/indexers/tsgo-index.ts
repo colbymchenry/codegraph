@@ -120,7 +120,15 @@ function lineOf(starts: number[], pos: number): number {
   return lo;
 }
 
-export async function indexProjects(tsDir: string, output: string, root: string, configs: string[]): Promise<{ warnings: string[]; documents: number }> {
+/**
+ * `only` (repo-relative paths) indexes just those files — the partial run of an
+ * incremental reindex. Only projects owning one of them are opened, and the
+ * output also carries definitions-only documents for other files the listed
+ * ones call into, so the caller can splice it into the installed index.
+ */
+export async function indexProjects(
+  tsDir: string, output: string, root: string, configs: string[], only?: ReadonlySet<string>
+): Promise<{ warnings: string[]; documents: number }> {
   const ts = await load(tsDir, root);
   const K = ts.SyntaxKind;
   const F = ts.SymbolFlags;
@@ -256,6 +264,9 @@ export async function indexProjects(tsDir: string, output: string, root: string,
         const where = nm >= 0 ? decl.path.slice(nm + '/node_modules/'.length) : path.basename(decl.path);
         return `tsgo npm . . ${esc(where)}/${decl.index}/${esc(t.name)}${suffix}`;
       }
+      // One name per declaration, however it is reached: the declaration's own kind decides
+      // the suffix (a method reached through a union's synthetic property is still `().`).
+      if (suffix !== '#') suffix = CONTAINER_SUFFIX.get(decl.kind) ?? suffix;
       const cacheKey = `${decl.path}\0${decl.index}\0${suffix}`;
       const cached = names.get(cacheKey);
       if (cached) return cached;
@@ -364,7 +375,12 @@ export async function indexProjects(tsDir: string, output: string, root: string,
       /** classes/interfaces with bases: positions of their name, each base's name, each member's name */
       const types: { at: number; bases: number[]; members: number[] }[] = [];
       const baseName = (t: TsNode) => heritageName(sf.text, t);
+      /** a partial run's declarations (see below): positions of their names */
+      const declared: number[] = [];
       const visit = (n: TsNode): undefined => {
+        if (only && CONTAINER_SUFFIX.has(n.kind) && n.kind !== K.ModuleDeclaration && n.name && NAMES.has(n.name.kind)) {
+          declared.push(ts.skipTrivia(sf.text, n.name.pos));
+        }
         if (TYPE_DECLS.has(n.kind) && n.name && n.heritageClauses) {
           const bases: number[] = [];
           for (const clause of n.heritageClauses) for (const t of clause.types) { const at = baseName(t); if (at !== null) bases.push(at); }
@@ -386,6 +402,7 @@ export async function indexProjects(tsDir: string, output: string, root: string,
       // One round trip per file: call sites first, then the types' names, bases and members.
       const positions = sites.map(s => s.start);
       for (const t of types) positions.push(t.at, ...t.bases, ...t.members);
+      positions.push(...declared);
       const symbols = positions.length ? checker.getSymbolAtPosition(f, positions) : [];
       sites.forEach((site, i) => {
         const s = symbols[i];
@@ -418,6 +435,13 @@ export async function indexProjects(tsDir: string, output: string, root: string,
         }
       }
       if (rels.length) implementations.set(rel(f), rels);
+      // A partial run replaces this file's document in the installed index, where
+      // unchanged files still call into it: define everything it declares, not just
+      // what this run referenced, or those calls would lose their target.
+      for (const d of symbols.slice(i)) {
+        const suffix = d && (d.flags & (F.Class | F.Interface) ? '#' : d.flags & (F.Function | F.Method) ? '().' : d.flags & (F.Variable | F.Property) ? '.' : null);
+        if (suffix) first(d!, suffix);
+      }
       // Fetched ASTs stay cached client-side; on a large project that's gigabytes.
       // Drop them (and our line tables) now and then — a file needed again is refetched.
       if (indexed.size % CACHE_FILES === 0) {
@@ -433,14 +457,22 @@ export async function indexProjects(tsDir: string, output: string, root: string,
 
   // Each project indexes its own files; a file its owner never loaded (excluded
   // there, or the owner failed to open) goes to the first project that did load it.
+  const wanted = (f: string) => !only || only.has(rel(f));
+  const owners = only ? new Set([...only].map(f => owner(path.join(root, f)))) : null;
   const loadedBy = new Map<string, string>();
   for (const config of configs) {
     const dir = path.dirname(config);
-    for (const f of indexIn(config, f => owner(f) === dir)) if (!loadedBy.has(f)) loadedBy.set(f, config);
+    if (owners && !owners.has(dir)) continue; // owns none of the listed files
+    for (const f of indexIn(config, f => wanted(f) && owner(f) === dir)) if (!loadedBy.has(f)) loadedBy.set(f, config);
+  }
+  // A listed file no opened project loaded (its owner excludes it): look in the others.
+  for (const config of only ? configs.filter(c => !owners!.has(path.dirname(c))) : []) {
+    if ([...only!].every(f => indexed.has(f) || loadedBy.has(path.join(root, f)))) break;
+    for (const f of indexIn(config, () => false)) if (!loadedBy.has(f)) loadedBy.set(f, config);
   }
   const leftovers = new Map<string, Set<string>>();
   for (const [f, config] of loadedBy) {
-    if (indexed.has(rel(f))) continue;
+    if (indexed.has(rel(f)) || !wanted(f)) continue;
     let set = leftovers.get(config);
     if (!set) leftovers.set(config, (set = new Set()));
     set.add(f);
@@ -449,8 +481,9 @@ export async function indexProjects(tsDir: string, output: string, root: string,
   (snapshot as TsSnapshot | null)?.dispose(); // assigned inside open()
   ts.api.close();
 
-  // Only indexed files are documents: a definition in a file no project loaded
-  // can't happen (the declaring file is in the program that referenced it).
+  // Indexed files are documents. A partial run adds definitions-only documents for
+  // the other files its references land in (the caller merges those into the
+  // installed documents); a full run has indexed every such file itself.
   const fd = fs.openSync(output, 'w');
   try {
     fs.writeSync(fd, encodeMetadata({ toolName: 'tsgo-index', toolVersion: ts.version, projectRoot: pathToFileURL(root).href }));
@@ -461,7 +494,7 @@ export async function indexProjects(tsDir: string, output: string, root: string,
       return b;
     };
     for (const [file, occurrences] of docs) {
-      if (!indexed.has(file)) continue;
+      if (!indexed.has(file) && !only) continue;
       fs.writeSync(fd, encodeDocument({
         relativePath: file, language: 'typescript', positionEncoding: POSITION_ENCODING_UTF16, occurrences,
         implementations: implementations.get(file),
@@ -474,15 +507,19 @@ export async function indexProjects(tsDir: string, output: string, root: string,
 }
 
 if (require.main === module) {
-  const [tsDir, output, root, ...configs] = process.argv.slice(2);
-  if (!tsDir || !output || !root || configs.length === 0) {
-    process.stderr.write('usage: tsgo-index <typescript package dir> <output> <root> <tsconfig>...\n');
+  const args = process.argv.slice(2);
+  const onlyAt = args.indexOf('--only');
+  const onlyList = onlyAt >= 0 ? args.splice(onlyAt, 2)[1] : undefined;
+  const [tsDir, output, root, ...configs] = args;
+  if (!tsDir || !output || !root || configs.length === 0 || (onlyAt >= 0 && !onlyList)) {
+    process.stderr.write('usage: tsgo-index <typescript package dir> <output> <root> [--only <file with one path per line>] <tsconfig>...\n');
     process.exit(2);
   }
-  indexProjects(path.resolve(tsDir), path.resolve(output), path.resolve(root), configs.map(c => path.resolve(root, c)))
+  const only = onlyList ? new Set(fs.readFileSync(onlyList, 'utf8').split('\n').filter(Boolean)) : undefined;
+  indexProjects(path.resolve(tsDir), path.resolve(output), path.resolve(root), configs.map(c => path.resolve(root, c)), only)
     .then(({ warnings, documents }) => {
       for (const w of warnings) process.stderr.write(`${RUN_WARNING}${w}\n`);
-      if (documents === 0) {
+      if (documents === 0 && !only) {
         process.stderr.write('no project could be indexed\n');
         process.exit(1);
       }
