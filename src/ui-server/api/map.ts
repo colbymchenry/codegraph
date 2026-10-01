@@ -348,11 +348,13 @@ export function pickDefaultRoot(
   let total = 0;
   for (const file of files) {
     if (file.test) continue;
+    // A file loose in the repository root is program too: git's hundreds of
+    // top-level `.c` files made `builtin/` look like the majority of the code.
+    total += file.symbols;
     const slash = file.path.indexOf('/');
     if (slash <= 0) continue;
     const dir = file.path.slice(0, slash);
     byDir.set(dir, (byDir.get(dir) ?? 0) + file.symbols);
-    total += file.symbols;
   }
   if (total === 0) return '';
   let best = '';
@@ -475,6 +477,26 @@ export function pickDefaultDepth(
   return fallback;
 }
 
+/**
+ * The root and depth the map opens on when the reader named neither.
+ *
+ * A source directory whose files all sit in one folder — Express's `lib/`, an
+ * R package's `R/`, an Erlang app's `src/`, fmt's `include/fmt/` — draws as one
+ * box at any depth, and a map whose subject is one box has said nothing. The
+ * repository around it (that folder beside a CLI, a `src/`, the examples) is
+ * then the picture worth opening on, when it draws more than one box.
+ */
+export function pickDefaultView(
+  files: ReadonlyArray<{ path: string; symbols: number; test: boolean }>,
+  passThrough?: ReadonlySet<string>
+): { root: string; depth: number } {
+  const root = pickDefaultRoot(files);
+  const depth = pickDefaultDepth(files, root, passThrough);
+  if (root === '' || tallyModules(files, root, depth, passThrough).count > 1) return { root, depth };
+  const wholeDepth = pickDefaultDepth(files, '', passThrough);
+  return tallyModules(files, '', wholeDepth, passThrough).count > 1 ? { root: '', depth: wholeDepth } : { root, depth };
+}
+
 // =============================================================================
 // Cache
 // =============================================================================
@@ -572,12 +594,13 @@ export function buildMap(cg: CodeGraph, projectRoot: string, query: URLSearchPar
     };
   });
 
-  const root = requestedRoot ?? pickDefaultRoot(fileRecords);
   const passThrough = passThroughDirs(fileRecords.map((f) => f.path));
   // Root first, then depth against THAT root: how finely to cut depends on
   // what is being cut. Choosing `src` and then asking for one level under it
   // is the same question as choosing the whole project and asking for two.
-  const depth = requestedDepth ?? pickDefaultDepth(fileRecords, root, passThrough);
+  const view = requestedRoot === null ? pickDefaultView(fileRecords, passThrough) : null;
+  const root = view?.root ?? requestedRoot ?? '';
+  const depth = requestedDepth ?? view?.depth ?? pickDefaultDepth(fileRecords, root, passThrough);
   const stats = cg.getStats();
   const key = [
     projectRoot,

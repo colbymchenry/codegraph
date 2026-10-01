@@ -171,6 +171,8 @@ These describe `codegraph ui` and its screens. They were taken out of `## [Unrel
 
 ## Fixes — Symbols, tests and the viewer
 
+- **The Map opens on a picture, not a single box.** A project whose code sits in one flat folder, like Express's `lib/`, an R package's `R/`, an Erlang app's `src/` or fmt's `include/fmt/`, opened as one box with nothing to say. It now opens on the whole repository when that draws more. Files at the repository's top level also count when the Map picks where the program lives: git's hundreds of top-level `.c` files had made `builtin/` look like most of the code.
+
 - **A Flow between two symbols finds names of any shape.** A Flow opened from a Steps link, an entry point or the search box names its two ends by the symbols' own names, and names that don't look like plain identifiers were dropped: an Objective-C selector like `initWithFrame:`, a Ruby method like `save!` or `valid?`, and any name shorter than three letters, like `ok`. The strip then said the other end "names nothing in this index", even though it was there. Both ends are now looked up exactly as written.
 
 - **Entry points and the Symbol view no longer go blank.** The Symbol view of every Vue, Svelte and Astro component stayed on "Loading…", because its member list held the component's script symbols twice, along with the component and its file. Entry points went blank on apps with inline route handlers like `app.get('/x', async (c) => { … })`, which came back once per call in the handler, each call listed as if it were the handler. Each member is now listed once, and each route is one row: the handler it is bound to, or "inline handler" when the handler is written at the registration.
