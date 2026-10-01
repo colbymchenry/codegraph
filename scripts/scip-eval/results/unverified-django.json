@@ -1,0 +1,56 @@
+{
+  "repo": "django",
+  "verified": 78500,
+  "unverified": 32823,
+  "causes": {
+    "no reference": 29998,
+    "not a call to SCIP": 2021,
+    "no document": 453,
+    "target without node": 241,
+    "later line": 110
+  },
+  "targets": {
+    "no document": {
+      "django/contrib (.js)": 224,
+      "js_tests/admin (.js)": 208,
+      "js_tests/gis (.js)": 21
+    },
+    "target without node": {
+      "tests/auth_tests/test_management.py (CreatesuperuserManagementCommandTestCase#test().)": 20,
+      "django/utils/feedgenerator.py (SyndicationFeed#to_str().)": 17,
+      "tests/deprecation/test_deprecate_posargs.py (DeprecatePosargsTests#some_func().)": 15,
+      "tests/migrations/test_loader.py (LoaderTests#num_nodes().)": 14,
+      "tests/admin_changelist/tests.py (ChangeListTests#check_results_order().)": 12,
+      "django/dispatch/dispatcher.py (Signal#asend().)": 11,
+      "tests/decorators/test_http.py (RequireHttpMethodsTest#my_view().)": 10,
+      "tests/migrations/test_state.py (StateTests#get_model_a().)": 8
+    }
+  },
+  "examples": {
+    "no reference": [
+      "django/apps/config.py:42 AppConfig::__init__ → title (django/template/defaultfilters.py)",
+      "django/apps/config.py:231 AppConfig::get_model → check_models_ready (django/apps/registry.py)",
+      "django/apps/config.py:233 AppConfig::get_model → check_apps_ready (django/apps/registry.py)"
+    ],
+    "not a call to SCIP": [
+      "django/apps/registry.py:435 Apps::do_pending_operations → function (django/contrib/gis/gdal/libgdal.py)",
+      "django/contrib/admin/options.py:416 BaseModelAdmin::get_view_on_site_url → view_on_site (tests/admin_views/admin.py)",
+      "django/contrib/admin/options.py:1017 ModelAdmin::get_paginator → paginator (django/contrib/sitemaps/__init__.py)"
+    ],
+    "later line": [
+      "django/contrib/admin/options.py:1371 ModelAdmin::get_search_results → to_python (django/contrib/admin/formfields.py)",
+      "django/contrib/admin/options.py:1422 ModelAdmin::get_preserved_filters → urlencode (django/utils/http.py)",
+      "django/contrib/gis/gdal/geometries.py:95 OGRGeometry::__init__ → encode (django/contrib/auth/hashers.py)"
+    ],
+    "no document": [
+      "django/contrib/admin/static/admin/js/SelectBox.js:11 SelectBox → getOptionGroupName (django/contrib/admin/static/admin/js/SelectBox.js)",
+      "django/contrib/admin/static/admin/js/SelectBox.js:113 SelectBox → getOptionGroupName (django/contrib/admin/static/admin/js/SelectBox.js)",
+      "django/contrib/admin/static/admin/js/SelectBox.js:135 SelectBox → getOptionGroupName (django/contrib/admin/static/admin/js/SelectBox.js)"
+    ],
+    "target without node": [
+      "django/contrib/auth/__init__.py:164 aauthenticate → asend (django/dispatch/dispatcher.py)",
+      "django/contrib/auth/__init__.py:227 alogin → asend (django/dispatch/dispatcher.py)",
+      "django/contrib/auth/__init__.py:255 alogout → asend (django/dispatch/dispatcher.py)"
+    ]
+  }
+}

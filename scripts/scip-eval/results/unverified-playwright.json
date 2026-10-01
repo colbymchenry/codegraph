@@ -1,0 +1,77 @@
+{
+  "repo": "playwright",
+  "verified": 79752,
+  "unverified": 34469,
+  "causes": {
+    "no document": 19796,
+    "no reference": 11135,
+    "not a call to SCIP": 2375,
+    "target outside graph": 709,
+    "later line": 414,
+    "target without node": 40
+  },
+  "targets": {
+    "no document": {
+      "tests/assets (.js)": 17343,
+      "browser_patches/firefox (.js)": 686,
+      "examples/todomvc (.ts)": 365,
+      "utils/doclint (.js)": 301,
+      "browser_patches/webkit (.cpp)": 186,
+      "utils/generate_types (.js)": 90,
+      "packages/utils (.js)": 69,
+      "packages/playwright-core (.java)": 57
+    },
+    "target without node": {
+      "packages/html-reporter/src/utils.ts (formatUrl().)": 12,
+      "packages/playwright/types/test.d.ts (defineConfig().)": 6,
+      "packages/playwright-core/src/server/browser.ts (Browser#contexts().)": 4,
+      "packages/utils/network.ts (createHttpServer().)": 4,
+      "packages/injected/src/highlight.ts (toDOMRect().)": 2,
+      "packages/playwright-core/src/server/browserContext.ts (BrowserContext#addCookies().)": 2,
+      "packages/playwright-core/src/client/locator.ts (Locator#toString().)": 1,
+      "packages/playwright-core/src/server/browserContext.ts (BrowserContext#setGeolocation().)": 1
+    },
+    "target outside graph": {
+      "packages/playwright-core/types/types.d.ts (APIRequestContext#dispose().)": 74,
+      "packages/playwright-core/types/types.d.ts (APIResponse#status().)": 65,
+      "packages/playwright-core/types/types.d.ts (FrameLocator#locator().)": 64,
+      "packages/playwright-core/types/types.d.ts (APIResponse#text().)": 39,
+      "packages/playwright-core/types/types.d.ts (Browser#close().)": 35,
+      "packages/playwright-core/types/types.d.ts (JSHandle#jsonValue().)": 26,
+      "packages/playwright-core/types/types.d.ts (APIResponse#url().)": 26,
+      "packages/playwright-core/types/types.d.ts (WebSocketRoute#send().)": 24
+    }
+  },
+  "examples": {
+    "no document": [
+      "browser_patches/firefox/juggler/ChannelEventSink.sys.mjs:38 browser_patches/firefox/juggler/ChannelEventSink.sys.mjs → unregister (browser_patches/firefox/juggler/SimpleChannel.js)",
+      "browser_patches/firefox/juggler/ChannelEventSink.sys.mjs:61 browser_patches/firefox/juggler/ChannelEventSink.sys.mjs → QueryInterface (browser_patches/firefox/juggler/components/Juggler.js)",
+      "browser_patches/firefox/juggler/ChannelEventSink.sys.mjs:83 browser_patches/firefox/juggler/ChannelEventSink.sys.mjs → QueryInterface (browser_patches/firefox/juggler/components/Juggler.js)"
+    ],
+    "no reference": [
+      "packages/dashboard/src/annotationImage.ts:90 saveAnnotationAsDownload → write (packages/playwright-core/src/client/channels.d.ts)",
+      "packages/dashboard/src/annotationImage.ts:91 saveAnnotationAsDownload → close (packages/playwright-core/src/client/channels.d.ts)",
+      "packages/dashboard/src/dashboardClient.ts:50 DashboardClient::create → Proxy (packages/playwright/types/test.d.ts)"
+    ],
+    "not a call to SCIP": [
+      "packages/dashboard/src/annotations.tsx:131 ColorPicker → onChange (packages/web/src/components/codeMirrorWrapper.tsx)",
+      "packages/dashboard/src/dashboardClient.ts:37 DashboardClient::constructor → onopen (packages/dashboard/src/dashboardClient.ts)",
+      "packages/dashboard/src/dashboardClient.ts:43 DashboardClient::constructor → onclose (packages/dashboard/src/dashboardClient.ts)"
+    ],
+    "target without node": [
+      "packages/html-reporter/playwright.config.ts:26 packages/html-reporter/playwright.config.ts → defineConfig (packages/playwright/src/common/configLoader.ts)",
+      "packages/html-reporter/src/labels.tsx:36 Label → formatUrl (packages/html-reporter/src/utils.ts)",
+      "packages/html-reporter/src/links.tsx:55 Link → formatUrl (packages/html-reporter/src/utils.ts)"
+    ],
+    "target outside graph": [
+      "packages/html-reporter/src/testCaseView.spec.ts:44 packages/html-reporter/src/testCaseView.spec.ts → jsonValue (packages/playwright-core/src/client/channels.d.ts)",
+      "packages/playwright-core/src/server/webkit/webview/wvBrowser.ts:244 WVBrowser::_attachTab → open (utils/generate_types/overrides.d.ts)",
+      "packages/playwright-core/src/tools/backend/browserBackend.ts:63 BrowserBackend::constructor → once (packages/playwright-core/src/client/eventEmitter.ts)"
+    ],
+    "later line": [
+      "packages/playwright/src/reporters/html.ts:474 HtmlBuilder::_writeReportData → pipe (packages/playwright-core/src/client/channels.d.ts)",
+      "tests/android/android.spec.ts:21 tests/android/android.spec.ts → androidTest (tests/android/androidTest.ts)",
+      "tests/android/launch-server.spec.ts:22 tests/android/launch-server.spec.ts → androidTest (tests/android/androidTest.ts)"
+    ]
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "repo": "codegraph",
+  "verified": 10847,
+  "unverified": 23532,
+  "causes": {
+    "no document": 23218,
+    "not a call to SCIP": 142,
+    "later line": 108,
+    "no reference": 62,
+    "target without node": 2
+  },
+  "targets": {
+    "no document": {
+      "codegraph-kernel/src (.rs)": 3709,
+      "__tests__/extraction.test.ts (.ts)": 1463,
+      "scripts/agent-eval (.mjs)": 859,
+      "__tests__/resolution.test.ts (.ts)": 787,
+      "__tests__/fixtures (.ts)": 550,
+      "ui/src (.svelte)": 550,
+      "__tests__/installer-targets.test.ts (.ts)": 469,
+      "__tests__/watcher.test.ts (.ts)": 451
+    },
+    "target without node": {
+      "src/installer/clack.d.ts (cancel().)": 1,
+      "src/resolution/callback-synthesizer.ts (synthesizeCallbackEdges().runSynthPass().)": 1
+    }
+  },
+  "examples": {
+    "no document": [
+      "__tests__/adaptive-explore-sizing.test.ts:76 __tests__/adaptive-explore-sizing.test.ts → write (__tests__/adaptive-explore-sizing.test.ts)",
+      "__tests__/adaptive-explore-sizing.test.ts:87 __tests__/adaptive-explore-sizing.test.ts → write (__tests__/adaptive-explore-sizing.test.ts)",
+      "__tests__/adaptive-explore-sizing.test.ts:110 __tests__/adaptive-explore-sizing.test.ts → write (__tests__/adaptive-explore-sizing.test.ts)"
+    ],
+    "not a call to SCIP": [
+      "src/bin/codegraph.ts:147 src/bin/codegraph.ts → runInstaller (src/installer/index.ts)",
+      "src/bin/codegraph.ts:554 main::offerIndexIgnoredRepos → findUnindexedIgnoredRepos (src/extraction/index.ts)",
+      "src/bin/codegraph.ts:596 main::offerIndexIgnoredRepos → addIncludeIgnoredPatterns (src/project-config.ts)"
+    ],
+    "later line": [
+      "src/bin/codegraph.ts:225 main → name (src/web-tree-sitter.d.ts)",
+      "src/db/index.ts:428 DatabaseConnection::healBulkNodeLoad → prepare (src/db/sqlite-adapter.ts)",
+      "src/db/index.ts:445 DatabaseConnection::healBulkSecondaryIndexes → prepare (src/db/sqlite-adapter.ts)"
+    ],
+    "no reference": [
+      "src/bin/codegraph.ts:1367 main → ToolHandler (src/mcp/tools.ts)",
+      "src/bin/codegraph.ts:1536 main → ToolHandler (src/mcp/tools.ts)",
+      "src/bin/codegraph.ts:1649 main → ToolHandler (src/mcp/tools.ts)"
+    ],
+    "target without node": [
+      "src/installer/index.ts:644 resolveTargets → cancel (__tests__/fixtures/dense-header-ts/src/core/types.ts)",
+      "src/resolution/callback-synthesizer.ts:3924 synthesizeCallbackEdges::runPooled → runSynthPass (src/resolution/resolver-pool.ts)"
+    ]
+  }
+}

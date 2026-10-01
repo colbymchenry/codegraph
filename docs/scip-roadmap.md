@@ -78,16 +78,20 @@ Deferred:
 - **A tsgo process kept running between edits.** Updates would cost milliseconds, but it holds ~8 GB for vscode; only worth it as an opt-in for one big repo.
 - **Verifying edges only when queried.** It changes the product, and the eval and regression guard would no longer apply.
 
-## Phase 4: coverage (the ~11% unverified)
+## Phase 4: coverage (the unverified edges)
+
+Ordered by 4.1's measurement (FORK.md, "Why edges stay unverified"). Untyped call sites ("no reference": vscode 36%, Django 91%) have no fix in the merge; the compiler resolved nothing there.
 
 | # | Task | How | Check |
 |---|---|---|---|
-| 4.1 | Break unverified edges down by cause | Per corpus: target in an oversize file, missing dependency, untyped call site, no matching node | A table in FORK.md; it decides the order of 4.2–4.6 |
-| 4.2 | Oversize declaration files | Let codegraph index declaration-only `.d.ts` over the 1 MB limit, or have the merge create nodes for their definitions | Playwright: unverified edges and dispatch edges fall |
-| 4.3 | Missing-dependency warning | A lockfile present but no `node_modules` / venv → "run `npm ci` / create the venv" | Shown on Django and on a Playwright copy without `npm ci` |
-| 4.4 | Verify `references` edges | Same site machinery, for type references (vscode: 72k method → interface) | New eval rows; precision ≥ 95% |
-| 4.5 | Rust trait edges | Find `impl Trait for X` in the source and check both names against the index's definitions; generic impls stay unverified. Ask upstream to emit relationships and unique nested-function names | ripgrep and the fixture: trait edges verified |
-| 4.6 | Plain JS without a tsconfig | Give tsgo-index an inferred-project mode (scip-typescript keeps `--infer-tsconfig`) | Django's JS indexed by tsgo |
+| 4.1 | **Done.** Break unverified edges down by cause | `scripts/scip-eval/unverified.ts`, six corpora | The table in FORK.md |
+| 4.2 | Overloaded functions | tsgo and scip-typescript define an overloaded function at its first signature; codegraph's node is the implementation. Map a definition no node contains to the file's only node of that name and kind starting after it | vscode: "target without node" 51.8k falls (`localize` alone 25.8k); eval unchanged |
+| 4.3 | Files no project owns | TS/JS files outside every `tsconfig.json`: tsgo-index indexes them in an inferred project (also plain JS without any tsconfig). Language roots below the repo root: detect `Cargo.toml` / `go.mod` / `pyproject.toml` in subfolders | vscode "no document" 14.8k (copilot 8.0k, Rust `cli/` 3.2k); codegraph 23.2k; Django's JS indexed |
+| 4.4 | Rust call sites | `Ok(…)` / `Some(…)` / tuple-struct constructors: rust-analyzer names a type, the heuristic records a call; key them both ways. Multi-line chains: match a call within its expression's lines, not only the first | ripgrep: 2,280 of 2,460 unverified |
+| 4.5 | Verify `references` edges | Same site machinery, for type references (vscode: 72k method → interface) | New eval rows; precision ≥ 95% |
+| 4.6 | Rust trait edges | Find `impl Trait for X` in the source and check both names against the index's definitions; generic impls stay unverified. Ask upstream to emit relationships and unique nested-function names | ripgrep and the fixture: trait edges verified |
+| 4.7 | Missing-dependency warning | A lockfile present but no `node_modules` / venv → "run `npm ci` / create the venv" | Shown on Django and on a Playwright copy without `npm ci` |
+| 4.8 | Oversize declaration files | Let codegraph index declaration-only `.d.ts` over the 1 MB limit, or have the merge create nodes for their definitions. Measured small: Playwright 709 edges | Playwright: those 709 fall |
 
 ## Phase 5: first index (time and memory)
 
@@ -118,7 +122,7 @@ Deferred:
 1. **Phase 0:** cheap, and 0.1 prevents running out of memory.
 2. **Phase 1:** simplifies everything after it.
 3. **Phase 3:** the biggest freshness win.
-4. **4.1, then 4.2:** the biggest accuracy win; 4.1 decides the rest of Phase 4.
+4. **4.1 (done), then 4.2:** overloaded functions are the largest measured cause (vscode 45% of unverified).
 5. **Phase 2**, including Go (2.3) and scip-typescript (2.4).
 6. **The rest of Phase 4.**
 7. **Phase 5.**

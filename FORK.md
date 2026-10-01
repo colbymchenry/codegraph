@@ -150,6 +150,25 @@ The eval gates are unchanged on all four languages.
 
 MCP output: Flow steps read `↓ calls (compiler-verified)` or `(unverified: …)`. Trail entries get ` [unverified]`.
 
+### Why edges stay unverified
+
+`scripts/scip-eval/unverified.ts <repo>` replays the merge's site extraction and gives each heuristic call edge that SCIP left unjudged one cause. Measured 2026-10-01 (raw output with examples and top targets: `scripts/scip-eval/results/unverified-*.json`):
+
+| corpus | unverified / call edges | target without node | no reference | no document | not a call to SCIP | later line | target outside graph |
+|---|---|---|---|---|---|---|---|
+| vscode | 114,524 / 888,110 (12.9%) | **51,798 (45%)** | 41,696 (36%) | 14,839 (13%) | 5,893 (5%) | 298 | 0 |
+| Playwright | 34,469 / 114,221 (30.2%) | 40 | 11,135 (32%) | **19,796 (57%)** | 2,375 (7%) | 414 | 709 (2%) |
+| codegraph | 23,532 / 34,379 (68.4%) | 2 | 62 | **23,218 (99%)** | 142 | 108 | 0 |
+| Django | 32,823 / 111,323 (29.5%) | 241 | **29,998 (91%)** | 453 | 2,021 (6%) | 110 | 0 |
+| cobra | 49 / 2,688 (1.8%) | 5 | 37 | 2 | 5 | 0 | 0 |
+| ripgrep | 2,460 / 12,860 (19.1%) | 46 | 120 | 14 | **1,321 (54%)** | **959 (39%)** | 0 |
+
+- **Target without node:** SCIP resolved the call to a project definition that maps to no node. In vscode it is almost all **overloaded functions**: tsgo (like scip-typescript) defines one at its first signature, codegraph's node is the implementation further down. `localize` alone is 25,762 edges; `append`, `timeout`, `URI#toString`, `observableValue`, `localize2`, `addDisposableListener` and `registerSingleton` another 19,580.
+- **No reference:** SCIP resolved nothing at the call: an untyped receiver (most of Django: `self.apps.check_models_ready()`), an `any`, an unresolved import. Some of these heuristic edges are wrong guesses (`self.label.title()` → `defaultfilters.title`) that the merge can't judge.
+- **No document:** no index covers the caller's file. TS files no `tsconfig.json` includes (vscode `extensions/copilot`: 8,009; codegraph `__tests__`), a language root below the repo root that detection misses (vscode's Rust `cli/`: 3,201; codegraph's `codegraph-kernel/`: 3,709), and vendored JS (Playwright `tests/assets`: 17,343).
+- **Not a call to SCIP / later line (Rust):** rust-analyzer names `Ok(…)`, `Some(…)` and tuple-struct constructors as types, so the merge keys them as instantiations while the heuristic edge is a call; and in a multi-line chain codegraph puts the call on the chain's first line, SCIP on the method name's.
+- **Target outside graph:** a definition in a file codegraph has no nodes for. Only Playwright's `types.d.ts` (over the 1 MB limit): 709 edges.
+
 ## Eval gate
 
 ```sh

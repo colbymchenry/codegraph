@@ -1,0 +1,39 @@
+{
+  "repo": "ripgrep",
+  "verified": 10400,
+  "unverified": 2460,
+  "causes": {
+    "not a call to SCIP": 1321,
+    "later line": 959,
+    "no reference": 120,
+    "target without node": 46,
+    "no document": 14
+  },
+  "examples": {
+    "not a call to SCIP": [
+      "crates/cli/src/decompress.rs:68 DecompressionMatcherBuilder::build → Ok (crates/core/flags/parse.rs)",
+      "crates/cli/src/decompress.rs:141 DecompressionMatcherBuilder::try_associate → Ok (crates/core/flags/parse.rs)",
+      "crates/cli/src/decompress.rs:184 DecompressionMatcher::command → Some (crates/core/flags/lowargs.rs)"
+    ],
+    "later line": [
+      "crates/cli/src/decompress.rs:168 DecompressionMatcher::new → build (crates/cli/src/decompress.rs)",
+      "crates/cli/src/decompress.rs:511 default_decompression_commands::add → map (crates/ignore/src/lib.rs)",
+      "crates/cli/src/process.rs:108 CommandReaderBuilder::build → stderr (crates/cli/src/process.rs)"
+    ],
+    "target without node": [
+      "crates/core/flags/defs.rs:7280 Type::update → Select (crates/core/flags/lowargs.rs)",
+      "crates/core/flags/defs.rs:7290 test_type → Select (crates/core/flags/lowargs.rs)",
+      "crates/core/flags/defs.rs:7371 TypeAdd::update → Add (crates/core/flags/lowargs.rs)"
+    ],
+    "no reference": [
+      "crates/core/flags/doc/mod.rs:33 render_custom_markup → replacement (crates/printer/src/json.rs)",
+      "crates/core/flags/hiargs.rs:426 HiArgs::matcher_pcre2 → fixed_strings (crates/pcre2/src/matcher.rs)",
+      "crates/core/flags/hiargs.rs:426 HiArgs::matcher_pcre2 → multi_line (crates/pcre2/src/matcher.rs)"
+    ],
+    "no document": [
+      "crates/core/index/enabled.rs:4 write → index_write (crates/core/flags/hiargs.rs)",
+      "crates/core/index/enabled.rs:5 write → Ok (crates/core/flags/parse.rs)",
+      "crates/core/index/enabled.rs:9 read → index_read (crates/core/flags/hiargs.rs)"
+    ]
+  }
+}

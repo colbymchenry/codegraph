@@ -1,0 +1,61 @@
+{
+  "repo": "vscode",
+  "verified": 773586,
+  "unverified": 114524,
+  "causes": {
+    "target without node": 51798,
+    "no reference": 41696,
+    "no document": 14839,
+    "not a call to SCIP": 5893,
+    "later line": 298
+  },
+  "targets": {
+    "no document": {
+      "extensions/copilot (.ts)": 8009,
+      "cli/src (.rs)": 3201,
+      "src/vs (.js)": 832,
+      "scripts/mock-policy-server (.ts)": 466,
+      "extensions/vscode-colorize-perf-tests (.ts)": 423,
+      ".github/skills (.mts)": 364,
+      "scripts/chat-simulation (.js)": 229,
+      "test/unit (.js)": 212
+    },
+    "target without node": {
+      "src/vs/nls.ts (localize().)": 25762,
+      "src/vs/base/browser/dom.ts (append().)": 5098,
+      "src/vs/base/common/async.ts (timeout().)": 3929,
+      "src/vs/base/common/uri.ts (URI#toString().)": 3176,
+      "src/vs/base/common/observableInternal/observables/observableValue.ts (observableValue().)": 2624,
+      "src/vs/nls.ts (localize2().)": 2453,
+      "src/vs/base/browser/dom.ts (addDisposableListener().)": 1585,
+      "src/vs/platform/instantiation/common/extensions.ts (registerSingleton().)": 722
+    }
+  },
+  "examples": {
+    "no document": [
+      ".agents/skills/launch/playwrightScripts/focus-chat-input.ts:36 focusIfNeeded → isFocused (.agents/skills/launch/playwrightScripts/focus-chat-input.ts)",
+      ".agents/skills/launch/playwrightScripts/focus-chat-input.ts:39 focusIfNeeded → focus (src/vs/base/browser/ui/findinput/findInput.ts)",
+      ".agents/skills/launch/playwrightScripts/focus-chat-input.ts:40 focusIfNeeded → isFocused (.agents/skills/launch/playwrightScripts/focus-chat-input.ts)"
+    ],
+    "no reference": [
+      ".eslint-plugin-local/code-amd-node-module.ts:17 getModules → join (extensions/copilot/src/util/vs/base/common/path.ts)",
+      ".eslint-plugin-local/code-layering.ts:39 create → dirname (extensions/copilot/src/extension/completions-core/vscode-node/lib/src/util/uri.ts)",
+      ".eslint-plugin-local/code-layering.ts:65 create → join (extensions/copilot/src/util/vs/base/common/path.ts)"
+    ],
+    "not a call to SCIP": [
+      ".eslint-plugin-local/code-no-accessor-after-await.ts:304 walkChildren → visit (src/vs/base/common/json.ts)",
+      ".eslint-plugin-local/code-no-accessor-after-await.ts:308 walkChildren → visit (src/vs/base/common/json.ts)",
+      ".eslint-plugin-local/code-no-accessor-after-await.ts:312 walkChildren → visit (src/vs/base/common/json.ts)"
+    ],
+    "target without node": [
+      ".vscode/extensions/vscode-selfhost-import-aid/src/extension.ts:26 activate → _refresh (src/vs/base/browser/ui/tree/dataTree.ts)",
+      ".vscode/extensions/vscode-selfhost-test-provider/src/coverageProvider.ts:72 Script::report → toString (extensions/copilot/src/util/vs/base/common/uri.ts)",
+      ".vscode/extensions/vscode-selfhost-test-provider/src/coverageProvider.ts:73 Script::report → toString (extensions/copilot/src/util/vs/base/common/uri.ts)"
+    ],
+    "later line": [
+      "extensions/copilot/src/extension/chatSessions/copilotcli/node/copilotcliSession.ts:1831 CopilotCLISession::updateArtifacts → invokeTool (extensions/copilot/src/extension/tools/common/toolsService.ts)",
+      "extensions/copilot/src/extension/chatSessions/copilotcli/node/test/copilotCliBridgeSpanProcessor.spec.ts:17 createMockOTelService → fn (src/vs/workbench/contrib/notebook/browser/view/renderers/webviewPreloads.ts)",
+      "extensions/copilot/src/extension/chatSessions/copilotcli/node/test/copilotCliBridgeSpanProcessor.spec.ts:18 createMockOTelService → fn (src/vs/workbench/contrib/notebook/browser/view/renderers/webviewPreloads.ts)"
+    ]
+  }
+}
