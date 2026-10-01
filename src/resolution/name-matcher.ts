@@ -1709,7 +1709,76 @@ function isPytestFixture(n: Node, context: ResolutionContext): boolean {
 function isFixtureInReach(n: Node, filePath: string, context: ResolutionContext): boolean {
   if (n.filePath === filePath) return isPytestFixture(n, context);
   const conftest = /^(.*?)(?:^|\/)conftest\.py$/.exec(n.filePath);
-  return conftest !== null && (conftest[1] === '' || filePath.startsWith(`${conftest[1]}/`));
+  if (conftest !== null) return conftest[1] === '' || filePath.startsWith(`${conftest[1]}/`);
+  // A fixture module a `conftest.py` above the test pulls in — `from
+  // tests.fixtures.cli import *`, or `pytest_plugins = ["tests.fixtures.cli"]`.
+  if (!isPytestFixture(n, context)) return false;
+  return pluggedFixtureModules(filePath, context).some((m) => n.filePath === m || n.filePath.endsWith(`/${m}`));
+}
+
+const PY_PLUGGED_MODULES = new WeakMap<ResolutionContext, Map<string, string[]>>();
+
+/** The module files (`tests/fixtures/cli.py`) the `conftest.py` files above `filePath` star-import or list in `pytest_plugins`. */
+function pluggedFixtureModules(filePath: string, context: ResolutionContext): string[] {
+  let memo = PY_PLUGGED_MODULES.get(context);
+  if (!memo) PY_PLUGGED_MODULES.set(context, (memo = new Map()));
+  const dir = filePath.includes('/') ? filePath.slice(0, filePath.lastIndexOf('/')) : '';
+  const hit = memo.get(dir);
+  if (hit) return hit;
+  const modules: string[] = [];
+  for (let d = dir; ; d = d.includes('/') ? d.slice(0, d.lastIndexOf('/')) : '') {
+    const text = context.readFile(d ? `${d}/conftest.py` : 'conftest.py');
+    if (text) {
+      for (const m of text.matchAll(/^\s*from\s+([\w.]+)\s+import\s+\*/gm)) modules.push(`${m[1]!.replace(/\./g, '/')}.py`);
+      const plugins = /^\s*pytest_plugins\s*=\s*[[(]([^\])]*)[\])]/m.exec(text)?.[1] ?? '';
+      for (const m of plugins.matchAll(/["']([\w.]+)["']/g)) modules.push(`${m[1]!.replace(/\./g, '/')}.py`);
+    }
+    if (!d) break;
+  }
+  memo.set(dir, modules);
+  return modules;
+}
+
+const PY_FIXTURE_TYPES = new WeakMap<ResolutionContext, Map<string, string | null>>();
+
+/**
+ * The class a pytest fixture returns, for a test parameter of its name — the
+ * fixture in reach (the test's module, else the nearest `conftest.py` above
+ * it) whose body returns or yields `Cls(…)`, directly or through a local
+ * assigned `Cls(…)`. Null for anything else (a parameter that is no fixture's,
+ * a fixture returning a call of a function).
+ */
+function pythonFixtureReturnType(receiver: string, ref: UnresolvedRef, context: ResolutionContext): string | null {
+  if (!/^[a-z_]\w*$/.test(receiver) || receiver === 'self' || receiver === 'cls') return null;
+  let memo = PY_FIXTURE_TYPES.get(context);
+  if (!memo) PY_FIXTURE_TYPES.set(context, (memo = new Map()));
+  const key = `${ref.fromNodeId}\0${receiver}`;
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  let type: string | null = null;
+  const caller = context.getNodeById?.(ref.fromNodeId);
+  const lines = caller ? context.getFileLines?.(caller.filePath) ?? context.readFile(caller.filePath)?.split(/\r?\n/) ?? [] : [];
+  // The receiver must be the test's own parameter.
+  const signature = caller && (caller.kind === 'function' || caller.kind === 'method')
+    ? lines.slice(caller.startLine - 1, caller.startLine + 4).join(' ').split(/\)\s*(?:->[^:]*)?:/)[0] ?? '' : '';
+  if (new RegExp(`[(,]\\s*${receiver}\\s*(?:[:=,)]|$)`).test(signature)) {
+    const fixtures = context.getNodesByName(receiver)
+      .filter((n) => n.kind === 'function' && n.language === 'python' && isFixtureInReach(n, ref.filePath, context))
+      .sort((a, b) => (a.filePath === ref.filePath ? -1 : 0) - (b.filePath === ref.filePath ? -1 : 0) || b.filePath.length - a.filePath.length);
+    const fixture = fixtures[0];
+    if (fixture) {
+      const body = (context.getFileLines?.(fixture.filePath) ?? context.readFile(fixture.filePath)?.split(/\r?\n/) ?? [])
+        .slice(fixture.startLine, fixture.endLine).join('\n');
+      const returned = /^\s*(?:return|yield)\s+([A-Za-z_][\w.]*)\s*(\()?/m.exec(body);
+      if (returned) {
+        const direct = returned[2] ? returned[1]! : new RegExp(`^\\s*${returned[1]!.replace(/\./g, '\\.')}\\s*=\\s*([A-Za-z_][\\w.]*)\\s*\\(`, 'm').exec(body)?.[1];
+        const cls = direct?.split('.').pop();
+        if (cls && /^[A-Z]/.test(cls)) type = cls;
+      }
+    }
+  }
+  memo.set(key, type);
+  return type;
 }
 
 function isDecoratedFixture(n: Node, context: ResolutionContext): boolean {
@@ -5751,6 +5820,8 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   CSHARP_PROJECT_USINGS.delete(context);
   CSHARP_GLOBAL_USINGS.delete(context);
   CSHARP_ANCESTORS.delete(context);
+  PY_FIXTURE_TYPES.delete(context);
+  PY_PLUGGED_MODULES.delete(context);
   SCALA_SUPERS.delete(context);
   SCALA_IMPORTS.delete(context);
   ESM_EXPORT_LISTS.delete(context);
@@ -6811,6 +6882,9 @@ export function matchMethodCall(
       ref.language === 'cpp'
         ? inferCppReceiverType(objectOrClass!, ref, context)
         : inferLocalReceiverType(objectOrClass!, ref, context));
+    // A pytest test's parameter is what its fixture returns: flaskbb's
+    // `cli_runner.invoke(…)` is click's `CliRunner`, not the project's one `invoke`.
+    if (!inferredType && ref.language === 'python' && dotMatch) inferredType = pythonFixtureReturnType(objectOrClass!, ref, context);
     if (!inferredType && MEMBER_TYPED_LANGUAGES.has(ref.language) && dotMatch) {
       inferredType = nmTimedT('mc-member', ref, () => inferMemberReceiverType(objectOrClass!, ref, context));
       // A field of a built-in type (`string _name`, `int count`) has no project method.
