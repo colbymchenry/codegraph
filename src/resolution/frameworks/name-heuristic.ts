@@ -44,8 +44,11 @@ export function pickByNameAndKind(
   context: ResolutionContext,
   options: NamePickOptions = {},
 ): string | null {
+  const inheritance = ref.referenceKind === 'extends' || ref.referenceKind === 'implements';
   const candidates = context.getNodesByName(ref.referenceName).filter((n) =>
     kinds.has(n.kind) &&
+    // A type never inherits from itself.
+    !(inheritance && n.id === ref.fromNodeId) &&
     isLexicallyReachable(n, ref, context) &&
     (n.filePath === ref.filePath || (!isNestedType(n, context) && isVisibleAcrossFiles(n, ref, context))) &&
     (!options.accept || options.accept(n)));

@@ -40,6 +40,9 @@ export const swiftUIResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // Swift's conventions, for Swift's refs: an Objective-C `@interface SDDiskCache
+    // : NSObject <SDDiskCache>` is no SwiftUI view or model (languages gates only extraction).
+    if (ref.language !== 'swift') return null;
     // Pattern 1: View references (SwiftUI views are PascalCase ending in View)
     if (ref.referenceName.endsWith('View') && /^[A-Z]/.test(ref.referenceName)) {
       const result = resolveByNameAndKind(ref, VIEW_KINDS, VIEW_DIRS, context);
@@ -106,6 +109,9 @@ export const uikitResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // Swift's conventions, for Swift's refs: an Objective-C `@interface SDDiskCache
+    // : NSObject <SDDiskCache>` is no SwiftUI view or model (languages gates only extraction).
+    if (ref.language !== 'swift') return null;
     // Pattern 1: ViewController references
     if (ref.referenceName.endsWith('ViewController')) {
       const result = resolveByNameAndKind(ref, CLASS_KINDS, VC_DIRS, context);
@@ -194,13 +200,15 @@ export const vaporResolver: FrameworkResolver = {
   },
 
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
+    // Swift's conventions, for Swift's refs: an Objective-C `@interface SDDiskCache
+    // : NSObject <SDDiskCache>` is no SwiftUI view or model (languages gates only extraction).
+    if (ref.language !== 'swift') return null;
     // Pattern 0: a route's handler — `use: SearchController.show` arrives as
     // `SearchController@show`, `use: self.index` / `use: index` as `@index`.
     // Resolved on the type the route names, never by the method's name alone:
     // every controller has a `show`. No match, or two, is left unresolved.
     const handler = VAPOR_HANDLER.exec(ref.referenceName);
     if (handler) {
-      if (ref.language !== 'swift') return null;
       const target = resolveVaporHandler(handler[1] ?? null, handler[2]!, ref, context);
       return target ? { original: ref, targetNodeId: target, confidence: 0.9, resolvedBy: 'framework' } : null;
     }

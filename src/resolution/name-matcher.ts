@@ -8923,7 +8923,18 @@ function otherSupertypeNamed(ref: UnresolvedRef, context: ResolutionContext): Re
   const candidates = context.getNodesByName(name).filter((n) =>
     n.id !== ref.fromNodeId && isSupertypeTarget(n) && sameLanguageFamily(n.language, ref.language) &&
     (qualifier === '' || ownerPathOf(n, context) === qualifier || ownerPathOf(n, context).endsWith(`.${qualifier}`)));
-  return candidates.length === 1 ? { original: ref, targetNodeId: candidates[0]!.id, confidence: 0.8, resolvedBy: 'qualified-name' } : null;
+  // Among several, the declaring file's own, then (for `implements`) a protocol / interface / trait:
+  // SDWebImage's `@interface SDWebImageCacheKeyFilter : NSObject <SDWebImageCacheKeyFilter>`.
+  let pool = candidates;
+  if (pool.length > 1) {
+    const sameFile = pool.filter((n) => n.filePath === ref.filePath);
+    if (sameFile.length > 0) pool = sameFile;
+  }
+  if (pool.length > 1 && ref.referenceKind === 'implements') {
+    const conformable = pool.filter((n) => n.kind === 'protocol' || n.kind === 'interface' || n.kind === 'trait');
+    if (conformable.length > 0) pool = conformable;
+  }
+  return pool.length === 1 ? { original: ref, targetNodeId: pool[0]!.id, confidence: 0.8, resolvedBy: 'qualified-name' } : null;
 }
 
 /** A declaration's dotted owner path — its file's package clauses, then its enclosing types (`cats.kernel.instances`, `cats.Bifoldable`). */
