@@ -74,7 +74,10 @@ export const astroResolver: FrameworkResolver = {
     // Pattern 3: Component references (PascalCase) — resolve to component
     // nodes. Template tags arrive as `references`, frontmatter expression
     // usages as `calls`.
+    // Only from Astro markup: a `.ts` file's `Page` (Playwright's) or a
+    // declaration file's `image?: Image` is no `Page.astro` / `Image.astro`.
     if (
+      ref.filePath.endsWith('.astro') &&
       isPascalCase(ref.referenceName) &&
       (ref.referenceKind === 'references' || ref.referenceKind === 'calls')
     ) {

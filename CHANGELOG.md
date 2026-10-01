@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- In Astro projects, the component-name convention now applies only inside `.astro` files, where components are used. Before, a TypeScript type with a component's name was linked to that component: astrowind's `image?: Image` and `callToAction?: CallToAction` in its type declarations, and starlight's Playwright `page: Page` in its tests.
 - In JavaScript and TypeScript, the Express conventions for middleware (`validate…`, `auth`, `logger`, …), controllers and services now pick only the calling file's own declaration. Another file's is reached only through an `import` or `require`. Before, SvelteKit's remote functions linked `validate(arg)` to its config loader's `validate` in another package, and Express's examples linked `logger('dev')` to one example's `logger`.
 - An Objective-C class that conforms to a protocol of its own name now links to that protocol instead of to itself. Swift's naming conventions for views, models and controllers also no longer apply to Objective-C code. Before, every one of SDWebImage's `@interface SDDiskCache : NSObject <SDDiskCache>`-style classes implemented itself.
 - In Solidity, a call to an overloaded function now reaches the overload whose parameter count it fits, as in the other languages with overloading. Before, OpenZeppelin's `_checkRole(role, _msgSender())` inside the one-argument `_checkRole(bytes32 role)` was linked to itself.
