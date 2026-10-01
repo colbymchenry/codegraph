@@ -245,3 +245,4 @@ Known residue: ripgrep's multi-line `const X: T = T { … }` items. codegraph at
 - TS/JS via tsgo (TypeScript ≥ 7.1): done; preferred over scip-typescript when installed.
 - Incremental reindex for tsgo and scip-python indexes: done.
 - Phase 5: `implements`/`extends` and calls through interfaces from SCIP relationships: done (Rust excluded: rust-analyzer emits no relationships). `references` edges were not needed for the gaps found and are not done.
+- Next: [`docs/scip-roadmap.md`](docs/scip-roadmap.md).
