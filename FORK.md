@@ -152,8 +152,11 @@ MCP output: Flow steps read `↓ calls (compiler-verified)` or `(unverified: …
 ## Eval gate
 
 ```sh
+scripts/scip-eval/corpora.sh                      # codegraph, Django, cobra, ripgrep at their pinned commits; add playwright / vscode by name
 npx tsx scripts/scip-eval/compare.ts <repo> <index.scip> <heuristic.db> <merged.db> --random 50 --seed 1 --prefix src/ --rg-type ts
 ```
+
+`corpora.sh` clones, indexes with this checkout, and runs `compare.ts` per seed (corpora and pins are listed in the script). A rerun on 2026-10-01 reproduced every row below.
 
 Pass bar per language (2 seeds × 50 random targets): precision ≥ 95%, recall ≥ codegraph-only, import ≤ 30 s.
 
