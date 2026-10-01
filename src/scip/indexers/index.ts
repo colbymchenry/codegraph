@@ -98,11 +98,6 @@ export interface IndexerSpec {
   literalShape?: LiteralShape;
   /** An enum variant built like a call (Rust `Some(x)`) is a call to the variant — codegraph's view — not an instantiation. */
   variantCalls?: boolean;
-  /**
-   * A call that is a chain's own `.method()` line is keyed at the line the chain
-   * starts on, where codegraph puts it (Rust, as rustfmt lays chains out).
-   */
-  chainCallsAtStart?: boolean;
   /** `impl Trait for Type` headers, judged as the type's `implements` edge (see syntax.ts ImplHeader) */
   implHeader?: ImplHeader;
   /**

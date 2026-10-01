@@ -1,20 +1,14 @@
 /**
- * Call sites as SCIP resolves them, keyed so they line up with codegraph's own
- * edges: (caller node, 1-based line, callee name, edge kind).
- *
- * codegraph's edge `col` is where the call EXPRESSION starts (`this.step()` →
- * the `this`), SCIP's range is the callee NAME, so the column can't be part of
- * the key — two same-named calls on one line collapse into one site, which the
- * merge treats identically anyway.
+ * Call sites as SCIP resolves them, and codegraph's own edges at the same sites,
+ * keyed alike (site.ts).
  */
 
 import type { SqliteDatabase, SqliteStatement } from '../db/sqlite-adapter';
 import { INDEXERS } from './indexers';
 import { ParsedSymbol, ROLE_DEFINITION, ScipDocument, ScipOccurrence, parseSymbol } from './reader';
 import type { ScipLanguage } from './store';
+import { callSiteKey, edgeSiteKey, referenceKey, siteKey } from './site';
 import { CallShape, ImplHeader, LiteralShape, SiteKind, callShape, implTypes, isCallTarget, siteKind } from './syntax';
-
-export type { SiteKind } from './syntax';
 
 /** A call SCIP resolved to something outside the project (stdlib, dependency). */
 export const EXTERNAL = '<external>';
@@ -39,10 +33,6 @@ export function inheritanceKind(sourceKind: string, targetKind: string): 'implem
   return INTERFACE_KINDS.includes(targetKind) && !INTERFACE_KINDS.includes(sourceKind) ? 'implements' : 'extends';
 }
 
-/** The site kind an edge is keyed by: `implements`/`extends` share `inherits`. */
-export function siteKindOfEdge(kind: string): SiteKind {
-  return kind === 'implements' || kind === 'extends' ? 'inherits' : (kind as SiteKind);
-}
 /**
  * What a called `term` (a value) may be: a function-valued binding codegraph
  * extracted as a function, or one it keeps as a constant/variable — `export
@@ -60,16 +50,6 @@ const CONTAINER_KINDS: readonly string[] = ['class', 'struct', 'constant', 'vari
 const CONSTRUCTOR_NAMES = new Map([['<constructor>', 'constructor']]); // a Map: a plain object would answer `toString` too
 const REFERENCED_METHOD_KINDS: readonly string[] = [...CALLABLE_KINDS, 'property'];
 const REFERENCED_VALUE_KINDS: readonly string[] = [...CALLED_VALUE_KINDS, 'property', 'field', 'enum_member'];
-
-/**
- * A `references` site is keyed by its file, not its caller: the merge only
- * verifies or removes codegraph's references (it never inserts one, see merge.ts),
- * so it needs no caller node, and codegraph's sources for them (an interface's
- * property, a type alias) are kinds callerAt doesn't name.
- */
-export function referenceKey(file: string, line: number, name: string): string {
-  return siteKey(file, line, name, 'references');
-}
 
 /** codegraph's `references` sites: file → 1-based line → the names referenced there. */
 export type ReferenceSites = Map<string, Map<number, Set<string>>>;
@@ -115,20 +95,6 @@ export function pendingReferenceSites(db: SqliteDatabase): ReferenceSites {
 export function bySource<T>(db: SqliteDatabase, sql: string, files: Iterable<string>): T[] {
   const stmt = db.prepare(`${sql} AND s.file_path = ?`);
   return [...files].flatMap(f => stmt.all(f) as T[]);
-}
-
-export function siteKey(source: string, line: number, name: string, kind: SiteKind): string {
-  return `${source}\0${line}\0${name}\0${kind}`;
-}
-
-/** The site of one of codegraph's edges: from its source node (`file` is that node's file) and its target's name. */
-export function edgeSiteKey(source: string, file: string, line: number, name: string, kind: string): string {
-  return kind === 'references' ? referenceKey(file, line, name) : siteKey(source, line, name, siteKindOfEdge(kind));
-}
-
-export function parseSiteKey(key: string): { source: string; line: number; name: string; kind: SiteKind } {
-  const [source, line, name, kind] = key.split('\0');
-  return { source: source!, line: Number(line), name: name!, kind: kind as SiteKind };
 }
 
 export interface SiteTarget {
@@ -446,7 +412,7 @@ export function scipSites(
 
   // Pass 2: references that are calls, keyed by the caller codegraph would name.
   for (const { lang, docs } of indexes) {
-    const { literalShape: literal, variantCalls = false, chainCallsAtStart = false, implHeader } = INDEXERS[lang];
+    const { literalShape: literal, variantCalls = false, implHeader } = INDEXERS[lang];
     for (const doc of docs) {
       const lines = fresh.get(doc.relativePath);
       if (!lines) continue;
@@ -481,7 +447,7 @@ export function scipSites(
         const caller = nodes.callerAt(doc.relativePath, startLine, startCol);
         if (!caller) continue;
         if (!caller.inFunction) bump('call_outside_functions');
-        const key = siteKey(caller.id, (chainCallsAtStart ? chainStart(lines, startLine, startCol) : startLine) + 1, call.name, call.kind);
+        const key = callSiteKey(caller.id, lines, startLine, startCol, call.name, call.kind);
         if (call.target !== null) {
           addTarget(sites, key, call.target, startCol);
           bump(`${call.kind}_resolved`);
@@ -568,17 +534,6 @@ function classify(
   return node ? { kind: 'calls', name: node.name, target: node.id, symbol: o.symbol } : null;
 }
 
-/**
- * The 0-based line a chain starts on, for a call that is a chain's own
- * `.method()` line (only whitespace and the dot before the name); else `line`.
- */
-export function chainStart(lines: string[], line: number, col: number): number {
-  if (!/^\s*\??\.\s*$/.test(lines[line]!.slice(0, col))) return line;
-  while (line > 0 && /^\s*\??\./.test(lines[line]!)) line--;
-  return line;
-}
-
-/** codegraph's own edges at the same kind of site, for callers in `files`. */
 /** site key → target node id → ids of the heuristic edges joining them (several when only `col` differs) */
 export type HeuristicSites = Map<string, Map<string, number[]>>;
 

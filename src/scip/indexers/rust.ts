@@ -21,7 +21,6 @@ export const rustIndexer: IndexerSpec = {
   cmd: 'rust-analyzer',
   probe: ['--version'],
   variantCalls: true,
-  chainCallsAtStart: true,
   // `impl<…> path::Trait<…> for Type<…> {` on one line; an inherent `impl Type {` has no `for`.
   implHeader: line => {
     const m = /^\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?impl\b\s*/.exec(line);

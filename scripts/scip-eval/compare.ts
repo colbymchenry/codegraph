@@ -19,8 +19,7 @@ import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ROLE_DEFINITION, ScipIndex, loadScipIndex, parseSymbol } from '../../src/scip/reader';
-import { INDEXERS, languageOfTool } from '../../src/scip/indexers';
-import { chainStart } from '../../src/scip/sites';
+import { callLine } from '../../src/scip/site';
 import { callShape } from '../../src/scip/syntax';
 
 type Line = string; // `${path}:${line}`
@@ -40,8 +39,8 @@ function arg(name: string, fallback?: string): string | undefined {
 
 /**
  * `${path}:${line}:${callee}` → SCIP symbols called there (external ones included).
- * `atChainStart`: a chain's `.method()` line counts at the chain's first line,
- * where codegraph keys it (sites.ts chainStart) — the graph's view, not grep's.
+ * `atChainStart`: a call in a multi-line chain counts at the chain's first line,
+ * where codegraph keys it (site.ts callLine) — the graph's view, not grep's.
  */
 function scipCalls(ix: ScipIndex, repo: string, atChainStart = false): Map<string, Set<string>> {
   const out = new Map<string, Set<string>>();
@@ -57,7 +56,7 @@ function scipCalls(ix: ScipIndex, repo: string, atChainStart = false): Map<strin
       const p = parseSymbol(o.symbol);
       if (!p || (p.last.kind !== 'method' && p.last.kind !== 'term')) continue;
       if (callShape(o, doc.positionEncoding, lines) !== 'call') continue; // the merge's own call test
-      const line = atChainStart ? chainStart(lines, o.range.startLine, o.range.startCol) : o.range.startLine;
+      const line = atChainStart ? callLine(lines, o.range.startLine, o.range.startCol) : o.range.startLine;
       const key = `${doc.relativePath}:${line + 1}:${p.last.name}`;
       let s = out.get(key);
       if (!s) out.set(key, (s = new Set()));
@@ -135,8 +134,7 @@ function main(): void {
   const seed = Number(arg('seed', '1'));
   const ix = loadScipIndex(scipFile);
   const calls = scipCalls(ix, repo);
-  const lang = languageOfTool(ix.toolName);
-  const graphCalls = lang && INDEXERS[lang].chainCallsAtStart ? scipCalls(ix, repo, true) : calls;
+  const graphCalls = scipCalls(ix, repo, true);
   const hDb = new DatabaseSync(hPath, { readOnly: true });
   const mDb = new DatabaseSync(mPath, { readOnly: true });
   const targets = randomTargets(ix, hDb, calls, n, seed, arg('prefix', '')!);

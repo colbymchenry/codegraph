@@ -20,7 +20,8 @@
  */
 
 import type { SqliteDatabase } from '../db/sqlite-adapter';
-import { EXTERNAL, HeuristicSites, ScipSites, bySource, edgeSiteKey, parseSiteKey } from './sites';
+import { edgeSiteKey, parseSiteKey } from './site';
+import { EXTERNAL, HeuristicSites, ScipSites, bySource } from './sites';
 
 export interface MergeOutcome {
   agree: number;
