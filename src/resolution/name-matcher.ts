@@ -7865,6 +7865,8 @@ export function matchMethodCall(
   // MODULE path (`pkg.mod.func()`) never gets here: import resolution claims it
   // first, through the module the import names.
   if (pythonAttrReceiver) {
+    const scoped = matchPythonScopedAttrCall(objectOrClass!, methodName!, ref, context);
+    if (scoped !== undefined) return scoped;
     return matchPythonAttrCall(objectOrClass!, methodName!, ref, context);
   }
 
@@ -8413,37 +8415,142 @@ function pythonValueCallees(value: string): string[] {
 }
 
 /**
- * Whether `name` is rebound inside the `def` on line `defLine`, before line
- * `upto` — a parameter (unless `params` is false), an assignment, a loop /
- * `with` / `except` / import target — so a call spelled `name(...)` there is
- * NOT the module's class or function of that name, and a parameter read there
- * no longer holds what its annotation says. `Signer = import_string(backend);
- * return Signer()` constructs whatever the setting names, not the `Signer`
- * class beside it.
+ * `line` with the contents of its string literals blanked (quotes kept), so a
+ * string never reads as code: `log("a: return b")` holds no `return`,
+ * `print("Foo = %s")` no assignment. A quote left open blanks the rest of the
+ * line (a triple-quoted string continuing below).
  */
-function pythonBoundInDef(lines: string[], defLine: number, upto: number, name: string, params = true): boolean {
-  const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function pythonBlankStrings(line: string): string {
+  const out = line.split('');
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]!;
+    if (c !== '"' && c !== "'") continue;
+    const q = line.startsWith(c.repeat(3), i) ? c.repeat(3) : c;
+    let j = i + q.length;
+    while (j < line.length && !line.startsWith(q, j)) j += line[j] === '\\' ? 2 : 1;
+    for (let k = i + q.length; k < Math.min(j, line.length); k++) out[k] = ' ';
+    i = Math.min(j + q.length, line.length) - 1;
+  }
+  return out.join('');
+}
+
+/**
+ * The assignment targets of one python statement (strings blanked): `a, (b,
+ * c) = …` → [`a, (b, c)`], `x: T = …` → [`x`], `x += …` → [`x`], `a = b = …` →
+ * [`a`, `b`], and the statement a one-line compound header guards (`if c: x =
+ * …`). A `=` inside brackets is a keyword argument or a default, `==` / `!=` /
+ * `<=` / `>=` compare, and a `lambda`'s defaults bind nothing here — none is a
+ * target.
+ */
+function pythonAssignTargets(statement: string): string[] {
+  const stmt = statement.replace(/^\s*(?:(?:el)?if|while|else|try|finally|except|with|for)\b[^:]*:(?!=)/, '');
+  const targets: string[] = [];
+  let depth = 0;
+  let from = 0;
+  for (let i = 0; i < stmt.length; i++) {
+    const c = stmt[i]!;
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') depth = Math.max(0, depth - 1);
+    else if (c === '=' && depth === 0) {
+      if (stmt[i + 1] === '=') { i++; continue; }
+      const prev = stmt[i - 1] ?? '';
+      if (prev === '!' || prev === ':') continue; // `!=`, walrus
+      if ((prev === '<' || prev === '>') && stmt[i - 2] !== prev) continue; // `<=`, `>=`
+      let seg = stmt.slice(from, i);
+      if (/\blambda\b/.test(seg)) break;
+      seg = seg.replace(/(?:\*\*|\/\/|>>|<<|[-+*/%&|^@])$/, '');
+      targets.push(seg.split(':')[0]!.trim());
+      from = i + 1;
+    }
+  }
+  return targets;
+}
+
+/**
+ * The statement-level lines of the `def` on line `defLine`, after its header
+ * and before line `upto`: each with its line number and its statements
+ * (strings blanked, split on `;`). A line that continues a bracketed or
+ * `\`-continued statement is not one — `client=client,` inside a call is a
+ * keyword argument — and neither is a line inside a nested `def` or `class`,
+ * whose header is reported as `nested` (its name is bound here).
+ */
+function pythonDefStatements(
+  lines: string[],
+  defLine: number,
+  upto: number,
+): { header: string; body: Array<{ line: number; statements: string[]; nested?: string }> } {
   let header = '';
   let ln = defLine;
   for (; ln <= upto && ln <= lines.length; ln++) {
     header += ' ' + (lines[ln - 1] ?? '').trim();
     if (/\)\s*(?:->[^:]*)?:\s*$/.test(header)) break;
   }
+  const body: Array<{ line: number; statements: string[]; nested?: string }> = [];
+  const indent = (l: string) => l.length - l.trimStart().length;
+  let depth = 0;
+  let continued = false;
+  let nestedIndent = -1;
+  for (let k = ln + 1; k < upto; k++) {
+    const raw = lines[k - 1] ?? '';
+    if (!raw.trim()) continue;
+    const blanked = pythonBlankStrings(raw);
+    const inside = depth > 0 || continued;
+    for (const c of blanked) {
+      if (c === '(' || c === '[' || c === '{') depth++;
+      else if (c === ')' || c === ']' || c === '}') depth = Math.max(0, depth - 1);
+    }
+    continued = /\\\s*$/.test(blanked);
+    if (inside) continue;
+    if (nestedIndent >= 0) {
+      if (indent(raw) > nestedIndent) continue;
+      nestedIndent = -1;
+    }
+    const text = blanked.trim();
+    const nested = /^(?:async\s+)?(?:def|class)\s+(\w+)/.exec(text);
+    if (nested) {
+      nestedIndent = indent(raw);
+      body.push({ line: k, statements: [], nested: nested[1]! });
+      continue;
+    }
+    body.push({ line: k, statements: text.split(';').map((t) => t.trim()).filter(Boolean) });
+  }
+  return { header, body };
+}
+
+/**
+ * Whether `name` is rebound inside the `def` on line `defLine`, before line
+ * `upto` — a parameter (unless `params` is false), an assignment target, a
+ * loop / `with` / `except` target, a walrus, a nested `def` / `class` of that
+ * name — so a call spelled `name(...)` there is NOT the module's class or
+ * function of that name, and a parameter read there no longer holds what its
+ * annotation says. `Signer = import_string(backend); return Signer()`
+ * constructs whatever the setting names, not the `Signer` class beside it.
+ *
+ * Not a rebinding: a keyword argument (`f(name=name)`, also across lines), an
+ * attribute (`obj.name = x`), a comparison, text in a string, a line inside a
+ * nested `def`, or an import of the name — the file's import mappings already
+ * include a function-local import, and every binding of a name must agree
+ * before it types anything.
+ */
+function pythonBoundInDef(lines: string[], defLine: number, upto: number, name: string, params = true): boolean {
+  const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const { header, body } = pythonDefStatements(lines, defLine, upto);
   if (params) {
     const list = /\((.*)\)/.exec(header)?.[1] ?? '';
     const paramNames = list.split(',').map((p) => p.trim().replace(/^\*{1,2}/, '').split(/[:=]/)[0]!.trim());
     if (paramNames.includes(name)) return true;
   }
-  const rebinds = [
-    new RegExp(`^(?:[\\w\\s,*()\\[\\]]*[\\s,(\\[*])?${n}(?:\\s*,[\\w\\s,*()\\[\\]]*)?\\s*(?::[^=]+)?(?:[-+*/%&|^@]|//|\\*\\*|>>|<<)?=(?!=)`),
-    new RegExp(`^(?:async\\s+)?for\\s+[\\w\\s,()]*\\b${n}\\b[\\w\\s,()]*\\bin\\b`),
-    new RegExp(`\\bas\\s+\\(?\\s*${n}\\b`),
-    new RegExp(`^(?:from\\s+\\S+\\s+)?import\\b.*\\b${n}\\b`),
-    new RegExp(`\\(\\s*${n}\\s*:=`),
-  ];
-  for (let k = ln + 1; k < upto; k++) {
-    const text = (lines[k - 1] ?? '').trim();
-    if (text && rebinds.some((r) => r.test(text))) return true;
+  const word = new RegExp(`(?<![.\\w])${n}\\b`);
+  const loop = new RegExp(`^(?:async\\s+)?for\\s+[\\w\\s,()\\[\\]]*(?<![.\\w])${n}\\b[\\w\\s,()\\[\\]]*\\bin\\b`);
+  const as = new RegExp(`\\bas\\s+\\(?\\s*${n}\\b`);
+  const walrus = new RegExp(`(?<![.\\w])${n}\\s*:=`);
+  for (const { statements, nested } of body) {
+    if (nested === name) return true;
+    for (const st of statements) {
+      if (pythonAssignTargets(st).some((t) => word.test(t))) return true;
+      if (loop.test(st) || walrus.test(st)) return true;
+      if (!/^(?:from|import)\b/.test(st) && as.test(st)) return true;
+    }
   }
   return false;
 }
@@ -8481,8 +8588,9 @@ function pythonAttrEvidence(owner: Node, attr: string, context: ResolutionContex
     if (nested.some((n) => ln >= n.startLine && ln <= n.endLine)) continue;
     if (bodyIndent < 0) bodyIndent = indent(line);
     const text = line.trim();
-    if (/^(?:async\s+)?def\s/.test(text)) {
-      // The enclosing method's signature, possibly over several lines.
+    if (/^(?:async\s+)?def\s/.test(text) && indent(line) === bodyIndent) {
+      // The enclosing method's signature, possibly over several lines. A def
+      // nested in a method is not one: its parameters and locals are its own.
       defStart = ln;
       signature = text;
       for (let k = ln; k < owner.endLine && !/\)\s*(?:->[^:]*)?:\s*$/.test(signature); k++) {
@@ -8646,6 +8754,69 @@ function pythonSubclassMethod(
   return descendants.length === 1
     ? { original: ref, targetNodeId: descendants[0]!.id, confidence: 0.8, resolvedBy: 'instance-method' }
     : null;
+}
+
+/**
+ * Python call through an attribute the calling `def` itself assigned before
+ * the call — `self.conn = Pool(); self.conn.send()`, `c.client = Foo();
+ * c.client.m()`, `self.a.b = Foo(); self.a.b.m()` — typed by the nearest such
+ * assignment, under the same rules as the class body: a call counts only as
+ * the whole value, a name the method rebinds first is not the module's class,
+ * and the class is the one the file's imports name. `undefined` when the `def`
+ * assigns no such receiver (the class body decides); null when the nearest
+ * assignment says nothing usable (`Pool().acquire()`), which then decides.
+ */
+function matchPythonScopedAttrCall(
+  receiver: string,
+  methodName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null | undefined {
+  let fn: Node | null = null;
+  for (const n of context.getNodesInFile(ref.filePath)) {
+    if ((n.kind !== 'function' && n.kind !== 'method') || n.startLine >= ref.line || n.endLine < ref.line) continue;
+    if (!fn || n.startLine > fn.startLine) fn = n;
+  }
+  if (!fn) return undefined;
+  const source = context.readFile(ref.filePath);
+  if (!source) return undefined;
+  const lines = stripCommentsForRegex(source, 'python').split('\n');
+  const want = receiver.replace(/\s+/g, '');
+  const { header, body } = pythonDefStatements(lines, fn.startLine, ref.line);
+
+  let found: { line: number; annotation?: string; value?: string } | null = null;
+  for (const { line, statements } of body) {
+    for (const st of statements) {
+      const targets = pythonAssignTargets(st);
+      if (targets.some((t) => t.replace(/\s+/g, '') === want)) {
+        // The raw text after this statement's last top-level `=` (strings intact).
+        const raw = (lines[line - 1] ?? '').trim();
+        const ann = new RegExp(`^${receiver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*:\\s*([^=]+?)\\s*(?:=|$)`).exec(raw);
+        const eq = /(?<![=!<>:])=(?!=)\s*(.*)$/.exec(raw.replace(/^[^=]*?\b(?:if|elif|while|else|try|finally|with)\b[^:]*:/, ''));
+        found = statements.length === 1 && targets.length === 1
+          ? { line, annotation: ann?.[1], value: eq?.[1] }
+          : { line };
+      } else if (targets.some((t) => new RegExp(`(?<![.\\w])${want.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w.])`).test(t.replace(/\s+/g, '')))) {
+        found = { line }; // unpacked or otherwise rebound: untyped
+      }
+    }
+  }
+  if (!found) return undefined;
+
+  let ev: PythonAttrEvidence = null;
+  if (found.annotation) {
+    ev = pythonAnnotationEvidence(found.annotation);
+  } else if (found.value) {
+    const joined = pythonJoinedValue(lines, found.line, found.value, fn.endLine).text.trim();
+    const reads = pythonValueCallees(joined).map((c) => c.split('.')[0]!);
+    if (!reads.some((c) => pythonBoundInDef(lines, fn!.startLine, found!.line, c))) {
+      const bare = /^[A-Za-z_]\w*$/.test(joined);
+      ev = bare && pythonBoundInDef(lines, fn.startLine, found.line, joined, false) ? null : pythonValueEvidence(joined, header.trim());
+    }
+  }
+  if (!ev || ev === 'runtime') return null;
+  const cls = pythonClassNamed(ev.type, ref.filePath, context);
+  return cls ? pythonMethodOnClass(cls, methodName, ref, context) ?? pythonSubclassMethod(cls, methodName, ref, context) : null;
 }
 
 /**
