@@ -1615,6 +1615,12 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   if (!isPhpClassVisible(candidate, ref, context)) return false;
   // A bare Java type name is its package's, an import's, or a nested type in reach.
   if (!isJavaTypeVisible(candidate, ref, context)) return false;
+  // A Dart `extension on Token { … }` has no name: `Token` is analyzer's type,
+  // not bloc_lint's extension block (84 refs went there).
+  if (dartExtensionDecl(candidate, context)?.named === false) return false;
+  // And it applies only in its own library: flutter_test's `find.text(…)` is
+  // no other file's `extension on TaskStatus { String get text }`.
+  if (candidate.filePath !== ref.filePath && isDartUnnamedExtensionMember(candidate, context)) return false;
   // A Scala package object's member is in scope in its package and those under
   // it, or through an import: cats.laws' `Eq` is the `cats` package object's
   // alias, not the `algebra` one's (752 refs went there).
@@ -2574,6 +2580,25 @@ function receiverNamesOwner(receiver: string, method: Node, context: ResolutionC
     if (on) return sharesReceiverWord(receiver, { ...method, qualifiedName: `${on.replace(/[<>, ?]+/g, '')}::${method.name}` });
   }
   return sharesReceiverWord(receiver, method);
+}
+
+/** The Dart `extension` declaration a class node stands for, read from its line: `named` false for `extension on X`. */
+function dartExtensionDecl(n: Node, context: ResolutionContext): { named: boolean } | null {
+  if (n.language !== 'dart' || n.kind !== 'class') return null;
+  const line = (context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [])[n.startLine - 1] ?? '';
+  if (!/^\s*extension\b(?!\s+type\b)/.test(line)) return null;
+  return { named: !/^\s*extension\s+on\b/.test(line) };
+}
+
+/** Whether a Dart method belongs to an unnamed `extension on X`, visible only in its own library. */
+function isDartUnnamedExtensionMember(method: Node, context: ResolutionContext): boolean {
+  if (method.language !== 'dart' || method.kind !== 'method') return false;
+  const cut = method.qualifiedName.lastIndexOf('::');
+  if (cut <= 0) return false;
+  const ownerQn = method.qualifiedName.slice(0, cut);
+  const owner = context.getNodesInFile(method.filePath).find((n) => n.qualifiedName === ownerQn && n.kind === 'class' &&
+    n.startLine <= method.startLine && n.endLine >= method.startLine);
+  return owner !== undefined && dartExtensionDecl(owner, context)?.named === false;
 }
 
 const CSHARP_ALIASES = new WeakMap<ResolutionContext, Map<string, Map<string, string>>>();
@@ -4972,6 +4997,7 @@ export function matchByExactName(
     // Likewise a bare Java type name: retrofit's tests' `new Builder()` is not
     // a wire converter test's nested `CrashingPhone.Builder`.
     isJavaTypeVisible(n, ref, context) &&
+    dartExtensionDecl(n, context)?.named !== false &&
     // A Scala package object's member, only where it is in scope — ahead of
     // the ranking, so cats.laws' `Eq` can be the `cats` package object's.
     !(ref.language === 'scala' && n.language === 'scala' && n.filePath !== ref.filePath &&
@@ -7523,6 +7549,14 @@ export function matchMethodCall(
       const kept = targetMethods.filter((m) => !(DISPATCHED_ACTIONS.has(m.name) &&
         DISPATCHED_OWNER.test(m.qualifiedName.slice(0, Math.max(0, m.qualifiedName.lastIndexOf('::'))).split(/::|\./).pop()!)) &&
         !isKotlinNumberBitwise(m, ref));
+      narrowed ||= kept.length !== targetMethods.length;
+      targetMethods = kept;
+    }
+    // Another library's unnamed Dart extension does not apply here: bloc's
+    // `tester.pumpApp(…)` is the imported `PumpApp`, not flutter_counter's
+    // `extension on WidgetTester`.
+    {
+      const kept = targetMethods.filter((m) => m.filePath === ref.filePath || !isDartUnnamedExtensionMember(m, context));
       narrowed ||= kept.length !== targetMethods.length;
       targetMethods = kept;
     }
