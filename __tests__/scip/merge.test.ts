@@ -60,6 +60,34 @@ describe('SCIP merge (TypeScript fixture)', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it('a merge in chunks (here a file each) ends where a whole merge does', async () => {
+    const graph = (g: CodeGraph) => g.scipReadDb().prepare(`SELECT s.qualified_name || '>' || t.qualified_name || ':' || e.kind || ':' ||
+      IFNULL(e.line, '') || ':' || IFNULL(e.provenance, '-') || ':' || IFNULL(e.metadata, '') AS e
+      FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target ORDER BY 1`).all().map(r => (r as { e: string }).e);
+    importFixture();
+    await pass();
+    const whole = graph(cg);
+    expect(whole.some(e => e.includes(':scip:'))).toBe(true);
+
+    const other = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-scip-chunks-'));
+    fs.cpSync(path.join(FIXTURE, 'project'), other, { recursive: true });
+    const cg2 = await CodeGraph.init(other);
+    process.env.CODEGRAPH_SCIP_MERGE_CHUNK = '1';
+    try {
+      await cg2.indexAll();
+      const copy = path.join(other, 'built-index.scip');
+      fs.copyFileSync(path.join(FIXTURE, 'index.scip'), copy);
+      importScipFile(other, copy);
+      const report = await cg2.scipWrite(db => runScipPass(db, other));
+      expect(report!.judgedDocuments).toBeGreaterThan(1); // more than one chunk
+      expect(graph(cg2)).toEqual(whole);
+    } finally {
+      delete process.env.CODEGRAPH_SCIP_MERGE_CHUNK;
+      cg2.close();
+      fs.rmSync(other, { recursive: true, force: true });
+    }
+  });
+
   it('is a no-op without an installed index', async () => {
     expect(await pass()).toBeNull();
   });

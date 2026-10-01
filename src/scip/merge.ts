@@ -39,6 +39,19 @@ export interface MergeOutcome {
   scipEdgesStale: number;
 }
 
+export function emptyOutcome(): MergeOutcome {
+  return {
+    agree: 0, conflict: 0, scipOnly: 0, dispatchVerified: 0, scipOnlyExternal: 0, alreadyVerified: 0, silent: 0,
+    edgesUpdated: 0, edgesDeleted: 0, edgesInserted: 0,
+    scipEdgesKept: 0, scipEdgesDropped: 0, scipEdgesStale: 0,
+  };
+}
+
+/** Adds `b`'s counts into `a` (the chunks of one merge). */
+export function addOutcome(a: MergeOutcome, b: MergeOutcome): void {
+  for (const k of Object.keys(a) as (keyof MergeOutcome)[]) a[k] += b[k];
+}
+
 const SET_FLAG = (flag: string) => `metadata = json_set(COALESCE(metadata, '{}'), '$.${flag}', json('true'))`;
 const CLEAR_FLAG = (flag: string) => `metadata = json_remove(metadata, '$.${flag}')`;
 const BATCH = 500;
@@ -74,11 +87,7 @@ function bySource<T>(db: SqliteDatabase, sql: string, files?: Set<string>): T[] 
 export function merge(
   db: SqliteDatabase, scip: ScipSites, heuristic: HeuristicSites, freshFiles: Set<string>, judged?: Set<string>
 ): MergeOutcome {
-  const c: MergeOutcome = {
-    agree: 0, conflict: 0, scipOnly: 0, dispatchVerified: 0, scipOnlyExternal: 0, alreadyVerified: 0, silent: 0,
-    edgesUpdated: 0, edgesDeleted: 0, edgesInserted: 0,
-    scipEdgesKept: 0, scipEdgesDropped: 0, scipEdgesStale: 0,
-  };
+  const c = emptyOutcome();
   if (!judged) db.exec(`UPDATE edges SET ${CLEAR_FLAG('scipSilent')} WHERE metadata LIKE '%scipSilent%'`);
   else {
     const flagged = bySource<{ id: number }>(db, `SELECT e.id FROM edges e JOIN nodes s ON s.id = e.source WHERE e.metadata LIKE '%scipSilent%'`, judged);

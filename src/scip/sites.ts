@@ -8,7 +8,7 @@
  * merge treats identically anyway.
  */
 
-import type { SqliteDatabase } from '../db/sqlite-adapter';
+import type { SqliteDatabase, SqliteStatement } from '../db/sqlite-adapter';
 import { INDEXERS } from './indexers';
 import { ParsedSymbol, ROLE_DEFINITION, ScipDocument, ScipOccurrence, parseSymbol } from './reader';
 import type { ScipLanguage } from './store';
@@ -129,7 +129,7 @@ export interface ScipSites {
   stats: Record<string, number>;
 }
 
-interface NodeRow {
+export interface NodeRow {
   id: string; kind: string; name: string; qualified_name: string; file_path: string;
   start_line: number; end_line: number; start_column: number; end_column: number;
 }
@@ -149,34 +149,49 @@ interface FileIndex {
   file: string | null;
 }
 
-/**
- * The nodes of each fresh file, loaded in one query, answering both questions
- * the merge asks of them. Lookups go through per-file indexes (by name, by
- * line) — a large repo has hundreds of thousands of call sites, and scanning a
- * file's every node per site was most of the merge.
- */
-class FileNodes {
-  private byFile = new Map<string, FileIndex>();
+const NODE_KINDS = [...new Set([...CALLABLE_KINDS, ...NESTED_TYPE_KINDS, ...REFERENCED_TYPE_KINDS, ...REFERENCED_VALUE_KINDS, ...CONTAINER_KINDS, 'file'])];
 
-  constructor(db: SqliteDatabase, files: Set<string>) {
-    const kinds = [...new Set([...CALLABLE_KINDS, ...NESTED_TYPE_KINDS, ...REFERENCED_TYPE_KINDS, ...REFERENCED_VALUE_KINDS, ...CONTAINER_KINDS, 'file'])];
-    const rows = db.prepare(
-      `SELECT id, kind, name, qualified_name, file_path, start_line, end_line, start_column, end_column FROM nodes
-       WHERE kind IN (${kinds.map(() => '?').join(',')})`
-    ).all(...kinds) as NodeRow[];
-    for (const r of rows) {
-      if (!files.has(r.file_path)) continue;
-      let f = this.byFile.get(r.file_path);
-      if (!f) this.byFile.set(r.file_path, (f = { byName: new Map(), rows: [], file: null }));
-      if (r.kind === 'file') {
-        f.file = r.id;
-        continue;
+/**
+ * The nodes of a fresh file, answering both questions the merge asks of them.
+ * Loaded per file on first use (one indexed query) and released when its
+ * document is done, so a large repo's nodes are never all in memory at once.
+ * Lookups go through per-file indexes (by name, by line) — a large repo has
+ * hundreds of thousands of call sites, and scanning a file's every node per
+ * site was most of the merge.
+ */
+export class FileNodes {
+  private byFile = new Map<string, FileIndex | null>();
+  private readonly stmt: SqliteStatement;
+
+  constructor(db: SqliteDatabase, private readonly files: ReadonlySet<string>) {
+    this.stmt = db.prepare(`SELECT id, kind, name, qualified_name, file_path, start_line, end_line, start_column, end_column FROM nodes
+      WHERE file_path = ? AND kind IN (${NODE_KINDS.map(() => '?').join(',')})`);
+  }
+
+  private load(file: string): FileIndex | null {
+    let f = this.byFile.get(file);
+    if (f !== undefined) return f;
+    f = null;
+    if (this.files.has(file)) {
+      f = { byName: new Map(), rows: [], file: null };
+      for (const r of this.stmt.all(file, ...NODE_KINDS) as NodeRow[]) {
+        if (r.kind === 'file') {
+          f.file = r.id;
+          continue;
+        }
+        f.rows.push(r);
+        const named = f.byName.get(r.name);
+        if (named) named.push(r);
+        else f.byName.set(r.name, [r]);
       }
-      f.rows.push(r);
-      const named = f.byName.get(r.name);
-      if (named) named.push(r);
-      else f.byName.set(r.name, [r]);
     }
+    this.byFile.set(file, f);
+    return f;
+  }
+
+  /** Done with `file` for now: a later use loads it again. */
+  release(file: string): void {
+    this.byFile.delete(file);
   }
 
   /**
@@ -189,7 +204,7 @@ class FileNodes {
     const line = line0 + 1;
     let best: NodeRow | null = null;
     const below: NodeRow[] = [];
-    for (const n of this.byFile.get(file)?.byName.get(name) ?? []) {
+    for (const n of this.load(file)?.byName.get(name) ?? []) {
       if (!kinds.includes(n.kind)) continue;
       below.push(n);
       if (n.start_line > line || n.end_line < line) continue;
@@ -217,7 +232,7 @@ class FileNodes {
    * defined in a method) is narrower — else narrowest container, else the file.
    */
   callerAt(file: string, line0: number, col: number): { id: string; inFunction: boolean } | null {
-    const f = this.byFile.get(file);
+    const f = this.load(file);
     if (!f) return null;
     const at: Pos = [line0 + 1, col];
     let fn: NodeRow | null = null;
@@ -235,26 +250,34 @@ class FileNodes {
 }
 
 /**
- * Every call/instantiation SCIP resolved in a fresh document, and what it
- * resolved at codegraph's `references` sites (`refs`).
- *
- * `fresh` holds the paths whose SCIP document matches codegraph's view of the
- * file (hash gate) with their source lines; documents outside it still
- * contribute to `projectSymbols` so a call INTO a stale file reads as unknown,
- * never as external.
+ * What every chunk of a merge reads, read once over all documents: each
+ * definition's node (pass 1), which symbols the index defines at all, and which
+ * nodes implement an interface method. `fresh`: the documents that pass the hash
+ * gate — only their definitions map to nodes; the others still make their
+ * symbols project symbols, so a call INTO a stale file reads as unknown, never
+ * as external.
  */
-export function scipSites(
-  db: SqliteDatabase, indexes: Array<{ lang: ScipLanguage; docs: ScipDocument[] }>, fresh: Map<string, string[]>,
-  /** only these files' sites (a patch's, see MergeScope); definitions are read from every document */
-  judged?: Set<string>,
-  /** codegraph's `references` sites to judge (referenceSites) */
-  refs?: Set<string>
-): ScipSites {
+export interface ScipDefinitions {
+  nodes: FileNodes;
+  symToNode: Map<string, NodeRow>;
+  /** symbol → the node a reference to it points at: like symToNode, over the kinds a `references` edge (or an `impl` header) names */
+  refToNode: Map<string, NodeRow>;
+  projectSymbols: Set<string>;
+  /** interface method symbol → the nodes implementing it, transitively */
+  implementers: Map<string, Set<string>>;
+  parse(symbol: string): ParsedSymbol | null;
+  /** a reference's symbol, read as its defined twin when only that is defined (see below) */
+  defined(symbol: string): string;
+  stats: Record<string, number>;
+}
+
+export function scipDefinitions(
+  db: SqliteDatabase, indexes: Array<{ lang: ScipLanguage; docs: ScipDocument[] }>, fresh: ReadonlySet<string>
+): ScipDefinitions {
   const stats: Record<string, number> = {};
   const bump = (k: string) => { stats[k] = (stats[k] ?? 0) + 1; };
-  const nodes = new FileNodes(db, new Set(fresh.keys()));
+  const nodes = new FileNodes(db, fresh);
   const symToNode = new Map<string, NodeRow>();
-  /** symbol → the node a reference to it points at: like symToNode, over the kinds a `references` edge (or an `impl` header) names */
   const refToNode = new Map<string, NodeRow>();
   const projectSymbols = new Set<string>();
   const ambiguous = new Set<string>();
@@ -300,6 +323,7 @@ export function scipSites(
           bump('def_unmapped'); // an unmapped `term` is a value codegraph has no node for (a parameter, a field, …)
         }
       }
+      nodes.release(doc.relativePath);
     }
   }
 
@@ -318,30 +342,15 @@ export function scipSites(
   };
   stats.def_ambiguous = ambiguous.size;
 
-  const sites = new Map<string, Map<string, SiteTarget>>();
-  const unknown = new Set<string>();
-
-  // Implementation relationships (fresh documents: those are the symbols with nodes).
-  // type → base: the type's `implements`/`extends` edges, keyed like a call site at
-  // the type's own line (where codegraph puts them). method → method: which nodes a
-  // call through an interface method reaches, transitively.
+  // method → method: which nodes a call through an interface method reaches, transitively.
   const implemented = new Map<string, string[]>();
   for (const { docs } of indexes) {
     for (const doc of docs) {
-      if (!fresh.has(doc.relativePath)) continue;
+      if (!fresh.has(doc.relativePath)) continue; // those are the symbols with nodes
       for (const { symbol, target } of doc.implementations ?? []) {
         const list = implemented.get(symbol);
         if (list) list.push(target);
         else implemented.set(symbol, [target]);
-        if (parse(symbol)?.last.kind !== 'type' || parse(target)?.last.kind !== 'type') continue;
-        const src = symToNode.get(symbol);
-        if (!src || (judged && !judged.has(doc.relativePath))) continue;
-        const base = symToNode.get(target);
-        const key = siteKey(src.id, src.start_line, base?.name ?? parse(target)!.last.name, 'inherits');
-        if (base) addTarget(sites, key, base.id, src.start_column, inheritanceKind(src.kind, base.kind));
-        else if (projectSymbols.has(target)) unknown.add(key);
-        else addTarget(sites, key, EXTERNAL, src.start_column);
-        bump(base ? 'inherits_resolved' : 'inherits_unresolved');
       }
     }
   }
@@ -357,6 +366,49 @@ export function scipSites(
       if (!set) implementers.set(t, (set = new Set()));
       set.add(node.id);
       todo.push(...(implemented.get(t) ?? []));
+    }
+  }
+  return { nodes, symToNode, refToNode, projectSymbols, implementers, parse, defined, stats };
+}
+
+/**
+ * Every call/instantiation SCIP resolved in the documents `fresh` holds (those
+ * that pass the hash gate, with their source lines), and what it resolved at
+ * codegraph's `references` sites (`refs`). A merge in chunks passes one chunk's
+ * documents and the definitions it read once (`defs`, scipDefinitions); left
+ * out, they are read here from `fresh`.
+ */
+export function scipSites(
+  db: SqliteDatabase, indexes: Array<{ lang: ScipLanguage; docs: ScipDocument[] }>, fresh: Map<string, string[]>,
+  /** only these files' sites (a patch's, see MergeScope, or a chunk's) */
+  judged?: Set<string>,
+  /** codegraph's `references` sites to judge (referenceSites) */
+  refs?: Set<string>,
+  defs?: ScipDefinitions
+): ScipSites {
+  const d = defs ?? scipDefinitions(db, indexes, new Set(fresh.keys()));
+  const { nodes, symToNode, refToNode, projectSymbols, implementers, parse, defined } = d;
+  const stats: Record<string, number> = defs ? {} : { ...d.stats };
+  const bump = (k: string) => { stats[k] = (stats[k] ?? 0) + 1; };
+  const sites = new Map<string, Map<string, SiteTarget>>();
+  const unknown = new Set<string>();
+
+  // type → base: the type's `implements`/`extends` edges, keyed like a call site at
+  // the type's own line (where codegraph puts them).
+  for (const { docs } of indexes) {
+    for (const doc of docs) {
+      if (!fresh.has(doc.relativePath) || (judged && !judged.has(doc.relativePath))) continue;
+      for (const { symbol, target } of doc.implementations ?? []) {
+        if (parse(symbol)?.last.kind !== 'type' || parse(target)?.last.kind !== 'type') continue;
+        const src = symToNode.get(symbol);
+        if (!src) continue;
+        const base = symToNode.get(target);
+        const key = siteKey(src.id, src.start_line, base?.name ?? parse(target)!.last.name, 'inherits');
+        if (base) addTarget(sites, key, base.id, src.start_column, inheritanceKind(src.kind, base.kind));
+        else if (projectSymbols.has(target)) unknown.add(key);
+        else addTarget(sites, key, EXTERNAL, src.start_column);
+        bump(base ? 'inherits_resolved' : 'inherits_unresolved');
+      }
     }
   }
   const dispatch = new Map<string, Set<string>>();
@@ -432,6 +484,7 @@ export function scipSites(
           bump('call_external');
         }
       }
+      nodes.release(doc.relativePath);
     }
   }
   // A site SCIP resolved at all is judged; "unknown" only matters where it resolved nothing.

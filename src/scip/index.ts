@@ -12,12 +12,14 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import * as v8 from 'v8';
+import * as vm from 'vm';
 import type { SqliteDatabase } from '../db/sqlite-adapter';
 import { Compactor } from './compact';
 import { languageOfTool } from './indexers';
-import { MergeOutcome, markStaleForFiles, merge } from './merge';
+import { MergeOutcome, addOutcome, emptyOutcome, markStaleForFiles, merge } from './merge';
 import { ROLE_DEFINITION, ScipDocument, loadScipIndex, scanIndex } from './reader';
-import { heuristicSites, referenceSites, scipSites } from './sites';
+import { heuristicSites, referenceSites, scipDefinitions, scipSites } from './sites';
 import {
   MergedDocument, ScipLanguage, SCIP_LANGUAGES, availableIndexes, indexPath,
   indexedHashes, installIndex, mergedDocumentCounts, readHashed, recordMergedDocuments,
@@ -83,18 +85,43 @@ export function runScipPass(db: SqliteDatabase, projectRoot: string, scope?: Mer
   }
 }
 
+/**
+ * Files per merge chunk: bounds the sites, texts and heuristic edges held at once
+ * (vscode: ~14k documents). `CODEGRAPH_SCIP_MERGE_CHUNK` overrides it (tests use 1).
+ */
+const MERGE_CHUNK_FILES = 1000;
+
+let gcFn: (() => void) | null | undefined;
+/**
+ * A full collection between chunks. Left to itself V8 lets each chunk's garbage
+ * pile up towards its heap limit (vscode merge: 3.6 GB peak RSS instead of 2.3),
+ * which is the memory the chunks exist to bound. `gc` is exposed at run time
+ * (no `--expose-gc` needed); where that fails, chunks still bound what is live.
+ */
+function collectGarbage(): void {
+  if (gcFn === undefined) {
+    try {
+      v8.setFlagsFromString('--expose-gc');
+      gcFn = vm.runInNewContext('gc') as () => void;
+    } catch {
+      gcFn = null;
+    }
+  }
+  gcFn?.();
+}
+
 function pass(db: SqliteDatabase, projectRoot: string, installed: ReturnType<typeof availableIndexes>, scope?: MergeScope): ScipPassReport {
   const started = Date.now();
   const phases: Record<string, number> = {};
   let mark = started;
-  const lap = (name: string) => { const now = Date.now(); phases[name] = now - mark; mark = now; };
+  const lap = (name: string) => { const now = Date.now(); phases[name] = (phases[name] ?? 0) + now - mark; mark = now; };
   const indexes = installed.map(({ lang, meta }) => ({ lang, meta, docs: loadScipIndex(indexPath(projectRoot, lang)).documents }));
   lap('decode');
 
   // Hash gate: snapshot (what the indexer saw) == files.content_hash (what
   // codegraph extracted) == disk (what we read the call text from).
   const indexed = indexedHashes(db, indexes.flatMap(i => i.docs.map(d => d.relativePath)));
-  const fresh = new Map<string, string[]>();
+  const fresh = new Map<string, string>(); // path → text, split into lines per chunk
   const merged = new Map<ScipLanguage, MergedDocument[]>();
   const staleDocuments: string[] = [];
   for (const { lang, meta, docs } of indexes) {
@@ -108,7 +135,7 @@ function pass(db: SqliteDatabase, projectRoot: string, installed: ReturnType<typ
         staleDocuments.push(d.relativePath);
         continue;
       }
-      fresh.set(d.relativePath, disk.text.split(/\r?\n/));
+      fresh.set(d.relativePath, disk.text);
       list.push({ path: d.relativePath, language: lang, contentHash: cg });
     }
     merged.set(lang, list);
@@ -118,23 +145,45 @@ function pass(db: SqliteDatabase, projectRoot: string, installed: ReturnType<typ
   // Definitions, implementations and the hash gate stay whole-index: they are what a
   // site's verdict reads. Only which sites get (re-)judged narrows.
   const judged = scope ? affectedFiles(db, indexes, scope, staleDocuments) : null;
-  const judgedFiles = judged ? [...fresh.keys()].filter(f => judged.has(f)) : [...fresh.keys()];
-  const scip = scipSites(db, indexes, fresh, judged ?? undefined, referenceSites(db, judgedFiles));
+  const freshFiles = new Set(fresh.keys());
+  const defs = scipDefinitions(db, indexes, freshFiles);
   lap('scipSites');
-  const heuristic = heuristicSites(db, judgedFiles);
-  lap('heuristicSites');
+
+  // Sites and their verdicts a chunk of files at a time (one transaction for all):
+  // a large repo's sites, file texts and heuristic edges never sit in memory at once.
+  // The chunks cover every file codegraph has — or the patch's — not just the fresh
+  // ones: the merge also flags and re-judges edges out of files SCIP can't vouch for.
+  const universe = judged ? [...judged].sort() : (db.prepare('SELECT path FROM files ORDER BY path').all() as { path: string }[]).map(r => r.path);
+  const chunkFiles = Number(process.env.CODEGRAPH_SCIP_MERGE_CHUNK) || MERGE_CHUNK_FILES;
+  const stats: Record<string, number> = { ...defs.stats };
+  let judgedDocuments = 0;
   const outcome = db.transaction(() => {
-    const o = merge(db, scip, heuristic, new Set(fresh.keys()), judged ?? undefined);
+    const total = emptyOutcome();
+    for (let i = 0; i < universe.length; i += chunkFiles) {
+      const chunk = new Set(universe.slice(i, i + chunkFiles));
+      const lines = new Map<string, string[]>();
+      for (const f of chunk) { const text = fresh.get(f); if (text !== undefined) lines.set(f, text.split(/\r?\n/)); }
+      judgedDocuments += lines.size;
+      const scip = scipSites(db, indexes, lines, chunk, referenceSites(db, lines.keys()), defs);
+      for (const [k, v] of Object.entries(scip.stats)) stats[k] = (stats[k] ?? 0) + v;
+      lap('scipSites');
+      const heuristic = heuristicSites(db, lines.keys());
+      lap('heuristicSites');
+      addOutcome(total, merge(db, scip, heuristic, freshFiles, chunk));
+      lap('merge');
+      collectGarbage();
+      lap('gc');
+    }
     for (const { lang, meta } of indexes) recordMergedDocuments(db, lang, meta, merged.get(lang) ?? []);
-    return o;
+    return total;
   })();
   lap('merge');
   return {
     documents: indexes.reduce((n, i) => n + i.docs.length, 0),
     freshDocuments: fresh.size,
     staleDocuments,
-    judgedDocuments: judged ? [...fresh.keys()].filter(f => judged.has(f)).length : fresh.size,
-    stats: scip.stats,
+    judgedDocuments,
+    stats,
     outcome,
     durationMs: Date.now() - started,
     phases,
