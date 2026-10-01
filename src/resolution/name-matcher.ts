@@ -1300,6 +1300,41 @@ function rustModuleDir(filePath: string): string {
   return path.posix.join(dir, base.replace(/\.rs$/, ''));
 }
 
+const SCALA_OBJECT_PACKAGES = new WeakMap<ResolutionContext, Map<string, string | null>>();
+
+/** The full package a Scala file's `package object X` opens (`algebra`, `cats.syntax`), or null for none. */
+function scalaPackageObjectPackage(file: string, context: ResolutionContext): string | null {
+  let memo = SCALA_OBJECT_PACKAGES.get(context);
+  if (!memo) SCALA_OBJECT_PACKAGES.set(context, (memo = new Map()));
+  const hit = memo.get(file);
+  if (hit !== undefined) return hit;
+  const text = context.readFile(file) ?? '';
+  const object = /^\s*package\s+object\s+([\w$]+)/m.exec(text)?.[1];
+  const pkg = object ? [...scalaPackageClauses(text), object].join('.') : null;
+  memo.set(file, pkg);
+  return pkg;
+}
+
+/** A Scala file's package clauses, in order (`package cats` / `package laws` → cats, laws). */
+function scalaPackageClauses(text: string): string[] {
+  return [...text.matchAll(/^\s*package\s+(?!object\b)([\w.]+)\s*$/gm)].flatMap((m) => m[1]!.split('.'));
+}
+
+/**
+ * Whether a member of a Scala package object is in scope at `ref`: from its
+ * package and the packages under it, or from a file that imports something
+ * through the package (`import algebra._`, `import algebra.Eq`).
+ */
+function isScalaPackageObjectMemberVisible(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  const objectPkg = scalaPackageObjectPackage(candidate.filePath, context);
+  if (objectPkg === null) return true;
+  const text = context.readFile(ref.filePath) ?? '';
+  const here = scalaPackageClauses(text).join('.');
+  if (here === objectPkg || here.startsWith(`${objectPkg}.`)) return true;
+  const last = objectPkg.split('.').pop()!;
+  return new RegExp(`^\\s*import\\s+[^\\n]*\\b${last.replace(/\$/g, '\\$')}\\b`, 'm').test(text);
+}
+
 const SFC_SCRIPT_RANGES = new WeakMap<ResolutionContext, Map<string, Array<{ start: number; end: number; exported: boolean }>>>();
 
 /**
@@ -1389,6 +1424,10 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   // private to the component: shadcn-svelte's 838 `<Item.Root>` (a namespace
   // import) went to a `type Item` one example component declares for itself.
   if (isSfcPrivate(candidate, context)) return false;
+  // A Scala package object's member is in scope in its package and those under
+  // it, or through an import: cats.laws' `Eq` is the `cats` package object's
+  // alias, not the `algebra` one's (752 refs went there).
+  if (candidate.language === 'scala' && ref.language === 'scala' && !isScalaPackageObjectMemberVisible(candidate, ref, context)) return false;
   if (candidate.language === 'csharp' && ref.language === 'csharp' && CSHARP_TYPE_KINDS.has(candidate.kind) &&
       /^[A-Za-z_]\w*$/.test(ref.referenceName) &&
       (!isCsharpTypeVisible(candidate, ref, context) || !isCsharpNestedTypeInScope(candidate, ref, context))) return false;
@@ -4694,6 +4733,10 @@ export function matchByExactName(
     // A C# type name is a type its namespaces can see — ahead of the ranking,
     // so a visible namesake wins where the veto after it would drop the
     // ref: eShop's `WebhookType.OrderPaid` under `using Webhooks.API.Model;`.
+    // A Scala package object's member, only where it is in scope — ahead of
+    // the ranking, so cats.laws' `Eq` can be the `cats` package object's.
+    !(ref.language === 'scala' && n.language === 'scala' && n.filePath !== ref.filePath &&
+      !isScalaPackageObjectMemberVisible(n, ref, context)) &&
     // A nested type, only from inside its owner: AutoMapper's same-file `new
     // Source()` in one test class is not the previous test class's `Source`.
     !(ref.language === 'csharp' && n.language === 'csharp' && CSHARP_TYPE_KINDS.has(n.kind) && /^[A-Za-z_]\w*$/.test(ref.referenceName) &&
@@ -5822,6 +5865,7 @@ export function clearNameMatcherMemos(context: ResolutionContext): void {
   CSHARP_ANCESTORS.delete(context);
   PY_FIXTURE_TYPES.delete(context);
   PY_PLUGGED_MODULES.delete(context);
+  SCALA_OBJECT_PACKAGES.delete(context);
   SCALA_SUPERS.delete(context);
   SCALA_IMPORTS.delete(context);
   ESM_EXPORT_LISTS.delete(context);
