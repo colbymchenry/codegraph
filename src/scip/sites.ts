@@ -253,6 +253,18 @@ export function scipSites(
   }
 
   for (const s of ambiguous) symToNode.delete(s); // still a project symbol: its calls read as unknown
+
+  /**
+   * A reference to a symbol no document defines, read as its defined method/term
+   * twin (`X#m().` ↔ `X#m.`): scip-go names an interface method `Handle#URI.` where
+   * its package is indexed and `Handle#URI().` from a run that only imports it (a
+   * patch of one package, another module's run). Undefined both ways, it stays.
+   */
+  const defined = (symbol: string): string => {
+    if (projectSymbols.has(symbol)) return symbol;
+    const twin = symbol.endsWith('().') ? `${symbol.slice(0, -3)}.` : symbol.endsWith('.') ? `${symbol.slice(0, -1)}().` : null;
+    return twin && projectSymbols.has(twin) ? twin : symbol;
+  };
   stats.def_ambiguous = ambiguous.size;
 
   const sites = new Map<string, Map<string, SiteTarget>>();
@@ -311,8 +323,10 @@ export function scipSites(
     for (const doc of docs) {
       const lines = fresh.get(doc.relativePath);
       if (!lines || (judged && !judged.has(doc.relativePath))) continue;
-      for (const o of doc.occurrences) {
-        if (o.roles & ROLE_DEFINITION) continue;
+      for (const occurrence of doc.occurrences) {
+        if (occurrence.roles & ROLE_DEFINITION) continue;
+        const symbol = defined(occurrence.symbol);
+        const o = symbol === occurrence.symbol ? occurrence : { ...occurrence, symbol };
         const call = classify(o, doc.positionEncoding, lines, literal, symToNode, parse, variantCalls);
         if (!call) continue;
         const { startLine, startCol } = o.range;

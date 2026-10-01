@@ -59,6 +59,9 @@ export interface ProduceOptions {
   incremental?: boolean;
 }
 
+/** Import edges below this confidence are codegraph's name guesses, not resolved imports. */
+const MIN_IMPORT_CONFIDENCE = 0.5;
+
 /** Most files a patch re-indexes, however cheap it looks; beyond this a full run is easier to trust. */
 export const MAX_INCREMENTAL_FILES = 500;
 
@@ -93,8 +96,11 @@ export function incrementalPlan(db: SqliteDatabase, projectRoot: string, lang: S
   const current = new Set(rows.map(r => r.path));
   const changed = rows.filter(r => meta.hashes[r.path] !== r.content_hash).map(r => r.path);
   const files = new Set(changed);
+  // Name guesses don't count: codegraph matches an unresolved `import { URL } from 'url'` to any
+  // `URL` class (confidence 0.4), which on vscode pulled the 5k-file src/ project into a 1-file patch.
   const importers = db.prepare(`SELECT DISTINCT s.file_path AS p FROM nodes t
-    JOIN edges e ON e.target = t.id AND e.kind = 'imports' JOIN nodes s ON s.id = e.source WHERE t.file_path = ?`);
+    JOIN edges e ON e.target = t.id AND e.kind = 'imports' JOIN nodes s ON s.id = e.source
+    WHERE t.file_path = ? AND COALESCE(json_extract(e.metadata, '$.confidence'), 1) >= ${MIN_IMPORT_CONFIDENCE}`);
   for (const c of changed) for (const { p } of importers.all(c) as { p: string }[]) if (current.has(p)) files.add(p);
   const deleted = Object.keys(meta.hashes).filter(p => !current.has(p));
   if (files.size > MAX_INCREMENTAL_FILES) return null;

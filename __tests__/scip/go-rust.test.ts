@@ -7,6 +7,7 @@ import { importScipFile, runScipPass } from '../../src/scip';
 import { INDEXERS, onPath, resolveIndexer } from '../../src/scip/indexers';
 import { produceIndex } from '../../src/scip/produce';
 import { planRuns, projectWeights, tsProjects } from '../../src/scip/indexers/typescript';
+import { ROLE_DEFINITION, encodeDocument, encodeMetadata, loadScipIndex } from '../../src/scip/reader';
 import { callShape } from '../../src/scip/syntax';
 
 const FIXTURES = path.join(__dirname, '..', 'fixtures');
@@ -105,6 +106,35 @@ describe('literal call shapes', () => {
     expect(shape('a.rs', 'for Invoice { amount } in all {', 'Invoice')).toBeNull();
     expect(shape('a.rs', '    let v = models::Invoice { amount: 1 };', 'Invoice')).toBe('literal');
     expect(shape('a.ts', 'class A extends Invoice {', 'Invoice')).toBeNull(); // braces mean nothing in TS
+  });
+});
+
+describe('scip-go names an interface method two ways', () => {
+  it('a reference to an undefined method/term twin reads as the defined one', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-scip-twin-'));
+    fs.cpSync(path.join(FIXTURES, 'scip-go', 'project'), dir, { recursive: true });
+    const cg = await CodeGraph.init(dir);
+    try {
+      await cg.indexAll();
+      // As a run that only imports the interface's package names it: `Pricer#TotalPrice().`, not `Pricer#TotalPrice.`.
+      const ix = loadScipIndex(path.join(FIXTURES, 'scip-go', 'index.scip'));
+      const twin = (s: string) => (s.endsWith('Pricer#TotalPrice.') ? `${s.slice(0, -1)}().` : s);
+      let renamed = 0;
+      const docs = ix.documents.map(d => ({
+        ...d, occurrences: d.occurrences.map(o => (o.roles & ROLE_DEFINITION || twin(o.symbol) === o.symbol ? o : (renamed++, { ...o, symbol: twin(o.symbol) }))),
+      }));
+      expect(renamed).toBeGreaterThan(0);
+      const built = path.join(dir, 'built.scip');
+      fs.writeFileSync(built, Buffer.concat([encodeMetadata(ix), ...docs.map(d => encodeDocument(d, s => Buffer.from(s)))]));
+      importScipFile(dir, built, 'go');
+      await cg.scipWrite(db => runScipPass(db, dir));
+      const row = cg.scipReadDb().prepare(`SELECT e.provenance FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+        WHERE e.kind = 'calls' AND s.qualified_name = 'Dyn' AND t.qualified_name = 'Pricer::TotalPrice'`).get() as { provenance: string } | undefined;
+      expect(row?.provenance).toBe('scip');
+    } finally {
+      cg.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

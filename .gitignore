@@ -87,3 +87,6 @@ target-linux/
 # once committed three of these, 7.9 MB, into a feature branch).
 *.bundle
 *.gitbundle
+
+# rust-analyzer build output when the fork indexes the Rust fixture (nested Cargo projects)
+__tests__/fixtures/scip-rust/project/target/
