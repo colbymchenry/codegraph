@@ -1336,6 +1336,25 @@ function isGoExternalQualified(ref: UnresolvedRef, context: ResolutionContext): 
   return external;
 }
 
+const PHP_CLASS_KINDS: ReadonlySet<string> = new Set(['class', 'interface', 'trait', 'enum']);
+/**
+ * Whether a bare PHP class name at `ref` can mean `candidate`. An unqualified
+ * class name is the current namespace's class or the one a `use` imports —
+ * PHP never falls back to another namespace for classes. koel's `extends
+ * Request` (under `use Saloon\Http\Request;`, `use App\Http\Requests\API\Request;`,
+ * or in `App\Http\Requests\API` itself) all went to the first `Request` indexed.
+ */
+function isPhpClassVisible(candidate: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  if (ref.language !== 'php' || candidate.language !== 'php' || !PHP_CLASS_KINDS.has(candidate.kind)) return true;
+  const name = ref.referenceName;
+  if (!/^[A-Za-z_]\w*$/.test(name) || /^(?:self|static|parent)$/i.test(name)) return true;
+  const fqn = candidate.qualifiedName.replace(/::/g, '\\');
+  const scope = phpFileScope(ref.filePath, context);
+  const imported = scope.uses.get(name);
+  if (imported !== undefined) return imported.toLowerCase() === fqn.toLowerCase();
+  return fqn.toLowerCase() === (scope.namespace ? `${scope.namespace}\\${name}` : name).toLowerCase();
+}
+
 const SCALA_OBJECT_PACKAGES = new WeakMap<ResolutionContext, Map<string, string | null>>();
 
 /** The full package a Scala file's `package object X` opens (`algebra`, `cats.syntax`), or null for none. */
@@ -1464,6 +1483,8 @@ export function isVisibleAcrossFiles(candidate: Node, ref: UnresolvedRef, contex
   // private to the component: shadcn-svelte's 838 `<Item.Root>` (a namespace
   // import) went to a `type Item` one example component declares for itself.
   if (isSfcPrivate(candidate, context)) return false;
+  // A bare PHP class name is its namespace's class, or the one a `use` names.
+  if (!isPhpClassVisible(candidate, ref, context)) return false;
   // A Scala package object's member is in scope in its package and those under
   // it, or through an import: cats.laws' `Eq` is the `cats` package object's
   // alias, not the `algebra` one's (752 refs went there).
@@ -4814,6 +4835,10 @@ export function matchByExactName(
     // A C# type name is a type its namespaces can see — ahead of the ranking,
     // so a visible namesake wins where the veto after it would drop the
     // ref: eShop's `WebhookType.OrderPaid` under `using Webhooks.API.Model;`.
+    // A bare PHP class name, only its namespace's or the imported one — ahead of
+    // the ranking, so koel's `extends Request` under `use App\Http\Requests\API\Request;`
+    // is that class, not the first `Request` indexed.
+    isPhpClassVisible(n, ref, context) &&
     // A Scala package object's member, only where it is in scope — ahead of
     // the ranking, so cats.laws' `Eq` can be the `cats` package object's.
     !(ref.language === 'scala' && n.language === 'scala' && n.filePath !== ref.filePath &&
