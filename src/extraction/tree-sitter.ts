@@ -3137,6 +3137,24 @@ export class TreeSitterExtractor {
         const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
         this.createNode(kind, target.name, nameNode, { docstring, signature: initSignature, isExported });
       });
+    } else if (this.language === 'tcl') {
+      // Tcl: `set name value` — a `set` node whose first named child is the
+      // variable name (`id`); the remaining children form the initializer.
+      // Only *assignment* sets are tracked: a bare read (`set x` inside
+      // `[set x]`) has no value child and would mint a phantom variable.
+      if (node.type === 'set') {
+        const nameNode = node.namedChildren.find((c) => c.type === 'id');
+        if (!nameNode) return;
+        const valueNode = node.namedChildren.find((c) => c !== nameNode && c.type !== 'comment');
+        if (!valueNode) return;
+        const initValue = getNodeText(valueNode, this.source).slice(0, 100);
+        const initSignature = `= ${initValue}${initValue.length >= 100 ? '...' : ''}`;
+        this.createNode(kind, getNodeText(nameNode, this.source), node, {
+          docstring,
+          signature: initSignature,
+          isExported,
+        });
+      }
     } else if (this.language === 'c') {
       // C: a `declaration` node's name nests inside the `declarator` field —
       // `init_declarator` (with value) or bare/pointer/array declarators (no
@@ -5958,7 +5976,20 @@ export class TreeSitterExtractor {
       if (nodeType === 'macro_invocation') this.extractRustRouteMacro(node);
 
       if (this.extractor!.callTypes.includes(nodeType)) {
-        this.extractCall(node);
+        // Languages with bodyWalkerUsesVisitNode (Tcl): let the visitor hook
+        // claim the node first, mirroring statement-level semantics — without
+        // this, a `source`/builtin command inside a proc body still minted a
+        // call edge even though visitNode claims it at the top level.
+        if (this.extractor!.bodyWalkerUsesVisitNode && this.extractor!.visitNode) {
+          const ctx = this.makeExtractorContext();
+          if (this.extractor!.visitNode(node, ctx)) {
+            // claimed — skip the generic call dispatch
+          } else {
+            this.extractCall(node);
+          }
+        } else {
+          this.extractCall(node);
+        }
       } else if (INSTANTIATION_KINDS.has(nodeType) || this.isVbnetConstructorShapedArrayCreation(node)) {
         // `new Foo()` inside a function body — emit an `instantiates`
         // reference. Without this branch the body walker only knew

@@ -13347,3 +13347,123 @@ describe('C++ COM interface declarations (#1519)', () => {
     expect(Buffer.byteLength(expected)).toBe(Buffer.byteLength(source));
   });
 });
+
+describe('Tcl Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect Tcl files', () => {
+      expect(detectLanguage('main.tcl')).toBe('tcl');
+      expect(detectLanguage('pkgIndex.tcl')).toBe('tcl');
+      expect(detectLanguage('module.tm')).toBe('tcl');
+    });
+
+    it('should report Tcl as supported', () => {
+      expect(isLanguageSupported('tcl')).toBe(true);
+      expect(getSupportedLanguages()).toContain('tcl');
+    });
+  });
+
+  describe('Function extraction', () => {
+    it('should extract top-level procs as functions', () => {
+      const code = `
+proc main {argv} {
+    helper_process $argv
+    return 0
+}
+
+proc helper_process {data} {
+    puts "processing $data"
+}
+`;
+      const result = extractFromSource('main.tcl', code);
+      const funcs = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(funcs).toContain('main');
+      expect(funcs).toContain('helper_process');
+      const main = result.nodes.find((n) => n.name === 'main');
+      expect(main?.language).toBe('tcl');
+      expect(main?.signature).toBe('{argv}');
+    });
+
+    it('should qualify procs inside a namespace eval as methods', () => {
+      const code = `
+namespace eval ::utils {
+    proc log {msg} {
+        puts $msg
+    }
+    proc incr_counter {} {
+        return 1
+    }
+}
+`;
+      const result = extractFromSource('main.tcl', code);
+      const methods = result.nodes.filter((n) => n.kind === 'method');
+      const log = methods.find((m) => m.name === 'log');
+      expect(log?.qualifiedName).toBe('::utils::log');
+      const incr = methods.find((m) => m.name === 'incr_counter');
+      expect(incr?.qualifiedName).toBe('::utils::incr_counter');
+    });
+  });
+
+  describe('Import extraction', () => {
+    it('should emit import nodes for source and package require', () => {
+      const code = `
+source compat.tcl
+package require Tk
+`;
+      const result = extractFromSource('main.tcl', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('compat.tcl');
+      expect(imports).toContain('Tk');
+    });
+  });
+
+  describe('Call and builtin filtering', () => {
+    it('should mint call refs for user procs but claim builtins', () => {
+      const code = `
+proc helper_process {data} {
+    puts "processing $data"
+    return 1
+}
+
+proc main {argv} {
+    helper_process $argv
+    ::utils::log "go"
+    return 0
+}
+`;
+      const result = extractFromSource('main.tcl', code);
+      const callRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(callRefs).toContain('helper_process');
+      expect(callRefs).toContain('::utils::log');
+      expect(callRefs).not.toContain('puts');
+      expect(callRefs).not.toContain('return');
+    });
+
+    it('should claim absolute builtin invocations (::puts, ::set)', () => {
+      const code = `
+::set x 1
+::puts "hi"
+::utils::log "go"
+`;
+      const result = extractFromSource('main.tcl', code);
+      const callRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(callRefs).not.toContain('::set');
+      expect(callRefs).not.toContain('::puts');
+      expect(callRefs).toContain('::utils::log');
+    });
+
+    it('should not mint call refs for dynamic command names', () => {
+      const code = `
+set handler ::utils::log
+$handler "go"
+0 1
+[$obj method] arg
+`;
+      const result = extractFromSource('main.tcl', code);
+      const callRefs = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls').map((r) => r.referenceName);
+      expect(callRefs).not.toContain('$handler');
+      expect(callRefs).not.toContain('0');
+      expect(callRefs).not.toContain('$obj');
+    });
+  });
+});
+
