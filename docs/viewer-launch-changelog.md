@@ -143,6 +143,8 @@ These describe `codegraph ui` and its screens. They were taken out of `## [Unrel
 
 ## Fixes — Steps — what a call does, and when
 
+- **A Steps picture with nothing past its anchor says why.** Starting Steps from a helper that only computes drew one box and no explanation. The panel now says that nothing it sets in motion is a step the picture draws, explains that calls between plain functions fold into the lines, and links to the symbol's callers and callees.
+
 - **Steps no longer goes blank on a function full of checks.** Reading a function in its code's order doubled the ways forward at every `if` with no `else`. A body with dozens of checks that draw nothing, like jsoup's `parse`, never finished, and the page died with a stack overflow. Ways that arrive at the same place are now one way, carrying only the conditions they all share.
 
 - **A Swift app's Steps picture labels what a call leaves for correctly.** `rawValue.data(using: .utf8)` was drawn as a network call, Foundation's `Timer` as telemetry, `Calendar` and a SiriKit `intent` as device calls, and `viewModel.votes.firstIndex(of:)` as a database read. Now only a session's `data`, `upload` and `download` are network, `Timer`, `Calendar` and `intent` are no effect at all, a view model is not a table, and a keychain is storage. A call through a type the app declares itself, like IceCubes' `Notifications` endpoint enum, is no longer read as the library of the same name.
