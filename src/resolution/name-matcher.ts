@@ -8963,10 +8963,42 @@ function retargetSelfOverload(result: ResolvedRef, ref: UnresolvedRef, context: 
   if (!set || set.own === null) return result;
   const args = cppParenListAfter(ref.filePath, ref.line, Math.max(0, ref.column), set.name, context);
   if (args === null) return result;
+  // Swift overloads by argument label as much as by count: Alamofire's
+  // `self.tableView(tableView, numberOfRowsInSection: section)` inside
+  // `tableView(_:titleForHeaderInSection:)` is the other `tableView`.
+  if (ref.language === 'swift') {
+    const labels = args.trim() === '' ? [] : splitCppTopLevel(args).map((a) => /^\s*([A-Za-z_]\w*)\s*:(?!:)/.exec(a)?.[1] ?? '_');
+    const fitsLabels = (id: string): boolean | null => {
+      const decl = context.getNodeById?.(id);
+      const list = decl ? cppParenListAfter(decl.filePath, decl.startLine, 0, set!.name, context) : null;
+      return list === null ? null : swiftLabelsFit(labels, list);
+    };
+    if (fitsLabels(result.targetNodeId) !== false) return result;
+    const fit = set.siblings.filter((sib) => fitsLabels(sib.id) === true);
+    return fit.length === 1 ? { ...result, targetNodeId: fit[0]!.id } : result;
+  }
   const argc = args.trim() === '' ? 0 : splitCppTopLevel(args).length;
   if (argc >= set.own.min && argc <= set.own.max) return result;
   const fits = set.siblings.filter((s) => s.arity !== null && argc >= s.arity.min && argc <= s.arity.max);
   return fits.length === 1 ? { ...result, targetNodeId: fits[0]!.id } : result;
+}
+
+/**
+ * Whether a Swift call's argument labels (`_` for none) fit a declaration's
+ * parameter list: each parameter's external label in order, one with a
+ * default value or a variadic one free to be left out.
+ */
+function swiftLabelsFit(labels: string[], paramList: string): boolean {
+  const params = paramList.trim() === '' ? [] : splitCppTopLevel(paramList).map((p) => {
+    const head = /^\s*(?:@\w+(?:\([^)]*\))?\s+)*(?:inout\s+)?([A-Za-z_]\w*)(?:\s+([A-Za-z_]\w*))?\s*:/.exec(p);
+    return { label: head?.[1] ?? '_', optional: /=/.test(p) || /\.\.\./.test(p) };
+  });
+  let i = 0;
+  for (const param of params) {
+    if (i < labels.length && labels[i] === param.label) { i++; continue; }
+    if (!param.optional) return false;
+  }
+  return i === labels.length;
 }
 
 /** A method's same-owner overloads and every one's arity, read from its declaration. */
