@@ -1529,6 +1529,35 @@ export function resolvePhpImportedStaticCall(
   return { original: ref, targetNodeId: methods[0]!.id, confidence: 0.95, resolvedBy: 'import' };
 }
 
+/**
+ * `use App\Fields as Field;` aliases a namespace, so `new Field\FirstName()`
+ * names `App\Fields\FirstName`. Both extractors emit the written name
+ * ("Field\FirstName") verbatim; expand its first segment through the file's
+ * use map and look the class up by its full qualified name.
+ * undefined means the name does not start with an imported alias; null means
+ * it does but no single project class has the expanded name, so name
+ * fallbacks must not guess.
+ */
+export function resolvePhpNamespaceAliasInstantiation(
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null | undefined {
+  if (ref.language !== 'php' || ref.referenceKind !== 'instantiates') return undefined;
+  const separator = ref.referenceName.indexOf('\\');
+  if (separator <= 0) return undefined;
+  const alias = ref.referenceName.slice(0, separator);
+  const imp = context.getImportMappings(ref.filePath, ref.language)
+    .find((i) => i.localName === alias);
+  if (!imp) return undefined;
+
+  const fqn = imp.source.replace(/^\\/, '') + ref.referenceName.slice(separator);
+  const cut = fqn.lastIndexOf('\\');
+  const classes = context.getNodesByQualifiedName(`${fqn.slice(0, cut)}::${fqn.slice(cut + 1)}`)
+    .filter((n) => n.language === 'php' && STATIC_MEMBER_CONTAINERS.has(n.kind));
+  if (classes.length !== 1) return null;
+  return { original: ref, targetNodeId: classes[0]!.id, confidence: 0.95, resolvedBy: 'import' };
+}
+
 export function resolveViaImport(
   ref: UnresolvedRef,
   context: ResolutionContext
