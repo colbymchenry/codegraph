@@ -12,7 +12,7 @@ import type { SqliteDatabase, SqliteStatement } from '../db/sqlite-adapter';
 import { INDEXERS } from './indexers';
 import { ParsedSymbol, ROLE_DEFINITION, ScipDocument, ScipOccurrence, parseSymbol } from './reader';
 import type { ScipLanguage } from './store';
-import { CallShape, LiteralShape, SiteKind, callShape, implTypes, isCallTarget, siteKind } from './syntax';
+import { CallShape, ImplHeader, LiteralShape, SiteKind, callShape, implTypes, isCallTarget, siteKind } from './syntax';
 
 export type { SiteKind } from './syntax';
 
@@ -79,9 +79,11 @@ export function referenceKey(file: string, line: number, name: string): string {
 export function referenceSites(db: SqliteDatabase, files?: Iterable<string>): Set<string> {
   const sql = `SELECT s.file_path AS file, e.line, t.name FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
     WHERE e.kind = 'references' AND e.line IS NOT NULL`;
-  const rows = files
-    ? [...files].flatMap(f => db.prepare(`${sql} AND s.file_path = ?`).all(f))
-    : db.prepare(sql).all();
+  let rows: unknown[];
+  if (files) {
+    const stmt = db.prepare(`${sql} AND s.file_path = ?`);
+    rows = [...files].flatMap(f => stmt.all(f));
+  } else rows = db.prepare(sql).all();
   return new Set((rows as { file: string; line: number; name: string }[]).map(r => referenceKey(r.file, r.line, r.name)));
 }
 
@@ -99,6 +101,11 @@ export function pendingReferenceSites(db: SqliteDatabase): Set<string> {
 
 export function siteKey(source: string, line: number, name: string, kind: SiteKind): string {
   return `${source}\0${line}\0${name}\0${kind}`;
+}
+
+/** The site of one of codegraph's edges: from its source node (`file` is that node's file) and its target's name. */
+export function edgeSiteKey(source: string, file: string, line: number, name: string, kind: string): string {
+  return kind === 'references' ? referenceKey(file, line, name) : siteKey(source, line, name, siteKindOfEdge(kind));
 }
 
 export function parseSiteKey(key: string): { source: string; line: number; name: string; kind: SiteKind } {
@@ -372,41 +379,40 @@ export function scipDefinitions(
 }
 
 /**
- * Every call/instantiation SCIP resolved in the documents `fresh` holds (those
- * that pass the hash gate, with their source lines), and what it resolved at
- * codegraph's `references` sites (`refs`). A merge in chunks passes one chunk's
- * documents and the definitions it read once (`defs`, scipDefinitions); left
- * out, they are read here from `fresh`.
+ * The sites SCIP resolved in the documents `fresh` holds (those that pass the
+ * hash gate, with their source lines — all of them, or a merge chunk's): every
+ * call and instantiation, each type's bases, and what it resolved at codegraph's
+ * `references` sites (`refs`, referenceSites) — read against the whole index's
+ * definitions (`defs`, scipDefinitions).
  */
 export function scipSites(
-  db: SqliteDatabase, indexes: Array<{ lang: ScipLanguage; docs: ScipDocument[] }>, fresh: Map<string, string[]>,
-  /** only these files' sites (a patch's, see MergeScope, or a chunk's) */
-  judged?: Set<string>,
-  /** codegraph's `references` sites to judge (referenceSites) */
-  refs?: Set<string>,
-  defs?: ScipDefinitions
+  defs: ScipDefinitions, indexes: Array<{ lang: ScipLanguage; docs: ScipDocument[] }>, fresh: Map<string, string[]>,
+  refs: ReadonlySet<string>
 ): ScipSites {
-  const d = defs ?? scipDefinitions(db, indexes, new Set(fresh.keys()));
-  const { nodes, symToNode, refToNode, projectSymbols, implementers, parse, defined } = d;
-  const stats: Record<string, number> = defs ? {} : { ...d.stats };
+  const { nodes, symToNode, refToNode, projectSymbols, implementers, parse, defined } = defs;
+  const stats: Record<string, number> = {};
   const bump = (k: string) => { stats[k] = (stats[k] ?? 0) + 1; };
   const sites = new Map<string, Map<string, SiteTarget>>();
   const unknown = new Set<string>();
+  /** A site resolved to `node`; with none, unknown for a symbol the project defines, else external. */
+  const judge = (key: string, symbol: string, node: NodeRow | undefined, col: number, edgeKind?: string) => {
+    if (node) addTarget(sites, key, node.id, col, edgeKind);
+    else if (projectSymbols.has(symbol)) unknown.add(key);
+    else addTarget(sites, key, EXTERNAL, col);
+  };
 
   // type → base: the type's `implements`/`extends` edges, keyed like a call site at
   // the type's own line (where codegraph puts them).
   for (const { docs } of indexes) {
     for (const doc of docs) {
-      if (!fresh.has(doc.relativePath) || (judged && !judged.has(doc.relativePath))) continue;
+      if (!fresh.has(doc.relativePath)) continue;
       for (const { symbol, target } of doc.implementations ?? []) {
         if (parse(symbol)?.last.kind !== 'type' || parse(target)?.last.kind !== 'type') continue;
         const src = symToNode.get(symbol);
         if (!src) continue;
         const base = symToNode.get(target);
         const key = siteKey(src.id, src.start_line, base?.name ?? parse(target)!.last.name, 'inherits');
-        if (base) addTarget(sites, key, base.id, src.start_column, inheritanceKind(src.kind, base.kind));
-        else if (projectSymbols.has(target)) unknown.add(key);
-        else addTarget(sites, key, EXTERNAL, src.start_column);
+        judge(key, target, base, src.start_column, base && inheritanceKind(src.kind, base.kind));
         bump(base ? 'inherits_resolved' : 'inherits_unresolved');
       }
     }
@@ -425,43 +431,28 @@ export function scipSites(
     const { literalShape: literal, variantCalls = false, chainCallsAtStart = false, implHeader } = INDEXERS[lang];
     for (const doc of docs) {
       const lines = fresh.get(doc.relativePath);
-      if (!lines || (judged && !judged.has(doc.relativePath))) continue;
-      if (implHeader) {
-        // `impl Trait for Type` with no relationship in the index (rust-analyzer emits none): the
-        // header's references are the type's `implements` edge — keyed like codegraph's, from the
-        // type to the trait at the header's line, and only for a type declared in this file (the
-        // only one codegraph links). A generic `impl<T> Trait for T` names no type node.
-        const byLine = new Map<number, ScipOccurrence[]>();
-        for (const o of doc.occurrences) {
-          if (o.roles & ROLE_DEFINITION || parse(o.symbol)?.last.kind !== 'type') continue;
-          const list = byLine.get(o.range.startLine);
-          if (list) list.push(o);
-          else byLine.set(o.range.startLine, [o]);
-        }
-        for (const [line, refsHere] of byLine) {
-          const pair = implTypes(implHeader, lines[line] ?? '', doc.positionEncoding, refsHere);
-          const src = pair && refToNode.get(pair.self.symbol);
-          if (!pair || !src || src.file_path !== doc.relativePath) continue;
-          const base = refToNode.get(pair.trait.symbol);
-          const key = siteKey(src.id, line + 1, base?.name ?? parse(pair.trait.symbol)!.last.name, 'inherits');
-          if (base) addTarget(sites, key, base.id, pair.trait.range.startCol, inheritanceKind(src.kind, base.kind));
-          else if (projectSymbols.has(pair.trait.symbol)) unknown.add(key);
-          else addTarget(sites, key, EXTERNAL, pair.trait.range.startCol);
-          bump(base ? 'impl_resolved' : 'impl_unresolved');
-        }
+      if (!lines) continue;
+      // `impl Trait for Type`: the type's `implements` edge, keyed like codegraph's — from the
+      // type to the trait at the header's line, and only for a type declared in this file (the
+      // only one codegraph links). A generic `impl<T> Trait for T` names no type node.
+      for (const { line, trait, self } of implHeader ? implHeaders(implHeader, doc, lines, parse) : []) {
+        const src = refToNode.get(self.symbol);
+        if (!src || src.file_path !== doc.relativePath) continue;
+        const base = refToNode.get(trait.symbol);
+        const key = siteKey(src.id, line + 1, base?.name ?? parse(trait.symbol)!.last.name, 'inherits');
+        judge(key, trait.symbol, base, trait.range.startCol, base && inheritanceKind(src.kind, base.kind));
+        bump(base ? 'impl_resolved' : 'impl_unresolved');
       }
       for (const occurrence of doc.occurrences) {
         if (occurrence.roles & ROLE_DEFINITION) continue;
         const symbol = defined(occurrence.symbol);
         const o = symbol === occurrence.symbol ? occurrence : { ...occurrence, symbol };
         // One of codegraph's references, judged by the symbol here — wherever it is called or not.
-        const ref = refs && parse(symbol);
+        const ref = parse(symbol);
         const refKey = ref && referenceKey(doc.relativePath, o.range.startLine + 1, ref.last.name);
-        if (refKey && refs!.has(refKey)) {
+        if (refKey && refs.has(refKey)) {
           const node = refToNode.get(symbol);
-          if (node) addTarget(sites, refKey, node.id, o.range.startCol);
-          else if (projectSymbols.has(symbol)) unknown.add(refKey);
-          else addTarget(sites, refKey, EXTERNAL, o.range.startCol);
+          judge(refKey, symbol, node, o.range.startCol);
           bump(node ? 'references_resolved' : 'references_unresolved');
         }
         const call = classify(o, doc.positionEncoding, lines, literal, symToNode, parse, variantCalls);
@@ -490,6 +481,29 @@ export function scipSites(
   // A site SCIP resolved at all is judged; "unknown" only matters where it resolved nothing.
   for (const k of sites.keys()) unknown.delete(k);
   return { sites, unknown, dispatch, stats };
+}
+
+/**
+ * The trait implementation headers in `doc` (IndexerSpec.implHeader), for an indexer
+ * that emits no implementation relationships (rust-analyzer): per line, the trait's
+ * and the implementing type's references (syntax.ts implTypes).
+ */
+function implHeaders(
+  header: ImplHeader, doc: ScipDocument, lines: string[], parse: (symbol: string) => ParsedSymbol | null
+): Array<{ line: number; trait: ScipOccurrence; self: ScipOccurrence }> {
+  const byLine = new Map<number, ScipOccurrence[]>();
+  for (const o of doc.occurrences) {
+    if (o.roles & ROLE_DEFINITION || parse(o.symbol)?.last.kind !== 'type') continue;
+    const list = byLine.get(o.range.startLine);
+    if (list) list.push(o);
+    else byLine.set(o.range.startLine, [o]);
+  }
+  const out: Array<{ line: number; trait: ScipOccurrence; self: ScipOccurrence }> = [];
+  for (const [line, types] of byLine) {
+    const pair = implTypes(header, lines[line] ?? '', doc.positionEncoding, types);
+    if (pair) out.push({ line, ...pair });
+  }
+  return out;
 }
 
 function addTarget(sites: Map<string, Map<string, SiteTarget>>, key: string, target: string, col: number, edgeKind?: string): void {
@@ -565,7 +579,7 @@ export function heuristicSites(db: SqliteDatabase, files: Iterable<string>): Heu
   const out: HeuristicSites = new Map();
   for (const f of files) {
     for (const r of stmt.all(f) as { id: number; source: string; line: number; kind: string; name: string; target: string }[]) {
-      const key = r.kind === 'references' ? referenceKey(f, r.line, r.name) : siteKey(r.source, r.line, r.name, siteKindOfEdge(r.kind));
+      const key = edgeSiteKey(r.source, f, r.line, r.name, r.kind);
       let targets = out.get(key);
       if (!targets) out.set(key, (targets = new Map()));
       const ids = targets.get(r.target);

@@ -164,7 +164,7 @@ function pass(db: SqliteDatabase, projectRoot: string, installed: ReturnType<typ
       const lines = new Map<string, string[]>();
       for (const f of chunk) { const text = fresh.get(f); if (text !== undefined) lines.set(f, text.split(/\r?\n/)); }
       judgedDocuments += lines.size;
-      const scip = scipSites(db, indexes, lines, chunk, referenceSites(db, lines.keys()), defs);
+      const scip = scipSites(defs, indexes, lines, referenceSites(db, lines.keys()));
       for (const [k, v] of Object.entries(scip.stats)) stats[k] = (stats[k] ?? 0) + v;
       lap('scipSites');
       const heuristic = heuristicSites(db, lines.keys());

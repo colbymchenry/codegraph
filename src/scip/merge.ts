@@ -20,7 +20,7 @@
  */
 
 import type { SqliteDatabase } from '../db/sqlite-adapter';
-import { EXTERNAL, HeuristicSites, ScipSites, parseSiteKey, referenceKey, siteKey, siteKindOfEdge } from './sites';
+import { EXTERNAL, HeuristicSites, ScipSites, edgeSiteKey, parseSiteKey } from './sites';
 
 export interface MergeOutcome {
   agree: number;
@@ -75,24 +75,20 @@ function byIds(db: SqliteDatabase, sqlPrefix: string, ids: number[]): number {
 
 /**
  * Rows of `sql` (which joins the edge's source as `s` and ends in a WHERE clause),
- * for sources in `files` — one indexed query per file — or for every edge.
+ * for sources in `files` — one indexed query per file.
  */
-function bySource<T>(db: SqliteDatabase, sql: string, files?: Set<string>): T[] {
-  if (!files) return db.prepare(sql).all() as T[];
+function bySource<T>(db: SqliteDatabase, sql: string, files: Set<string>): T[] {
   const stmt = db.prepare(`${sql} AND s.file_path = ?`);
   return [...files].flatMap(f => stmt.all(f) as T[]);
 }
 
-/** `judged`: only sites whose caller is in these files are re-judged (a patch's scope); edges elsewhere stay as they are. */
+/** `judged`: only sites whose caller is in these files are re-judged (a chunk of files, a patch's); edges elsewhere stay as they are. */
 export function merge(
-  db: SqliteDatabase, scip: ScipSites, heuristic: HeuristicSites, freshFiles: Set<string>, judged?: Set<string>
+  db: SqliteDatabase, scip: ScipSites, heuristic: HeuristicSites, freshFiles: Set<string>, judged: Set<string>
 ): MergeOutcome {
   const c = emptyOutcome();
-  if (!judged) db.exec(`UPDATE edges SET ${CLEAR_FLAG('scipSilent')} WHERE metadata LIKE '%scipSilent%'`);
-  else {
-    const flagged = bySource<{ id: number }>(db, `SELECT e.id FROM edges e JOIN nodes s ON s.id = e.source WHERE e.metadata LIKE '%scipSilent%'`, judged);
-    byIds(db, `UPDATE edges SET ${CLEAR_FLAG('scipSilent')} WHERE id IN`, flagged.map(r => r.id));
-  }
+  const flagged = bySource<{ id: number }>(db, `SELECT e.id FROM edges e JOIN nodes s ON s.id = e.source WHERE e.metadata LIKE '%scipSilent%'`, judged);
+  byIds(db, `UPDATE edges SET ${CLEAR_FLAG('scipSilent')} WHERE id IN`, flagged.map(r => r.id));
   // Column is not part of a site's identity (see sites.ts), so "already there"
   // is judged without it — an earlier import's edge, or a synthesized one at
   // the same site, keeps its own column and is not duplicated.
@@ -126,13 +122,15 @@ export function merge(
     let added = 0;
     // A `references` site is keyed by file (sites.ts referenceKey): its edges are verified or
     // removed, never inserted — SCIP would add one per type annotation codegraph left out.
-    for (const { target, col, edgeKind = kind } of kind === 'references' ? [] : resolved.values()) {
-      if (target === EXTERNAL || hs?.has(target)) continue;
-      const k = edgeKey(source, target, edgeKind, line);
-      if (existing.has(k)) continue;
-      existing.add(k);
-      insert.push([source, target, edgeKind, line, col]);
-      added++;
+    if (kind !== 'references') {
+      for (const { target, col, edgeKind = kind } of resolved.values()) {
+        if (target === EXTERNAL || hs?.has(target)) continue;
+        const k = edgeKey(source, target, edgeKind, line);
+        if (existing.has(k)) continue;
+        existing.add(k);
+        insert.push([source, target, edgeKind, line, col]);
+        added++;
+      }
     }
     if (!hs) {
       // No heuristic edge left here: new, or verified by an earlier import.
@@ -177,7 +175,7 @@ export function merge(
  * rewritten node), the edge can't be re-judged yet — flag it until the next
  * reindex. Returns the keys of the SCIP edges that remain.
  */
-function reconcileScipEdges(db: SqliteDatabase, scip: ScipSites, freshFiles: Set<string>, c: MergeOutcome, judged?: Set<string>): Set<string> {
+function reconcileScipEdges(db: SqliteDatabase, scip: ScipSites, freshFiles: Set<string>, c: MergeOutcome, judged: Set<string>): Set<string> {
   const rows = bySource<{
     id: number; source: string; target: string; kind: string; line: number | null;
     name: string; src_file: string; tgt_file: string;
@@ -190,8 +188,7 @@ function reconcileScipEdges(db: SqliteDatabase, scip: ScipSites, freshFiles: Set
   const drop: number[] = [];
   const stale: number[] = [];
   for (const r of rows) {
-    const key = r.line === null ? null
-      : r.kind === 'references' ? referenceKey(r.src_file, r.line, r.name) : siteKey(r.source, r.line, r.name, siteKindOfEdge(r.kind));
+    const key = r.line === null ? null : edgeSiteKey(r.source, r.src_file, r.line, r.name, r.kind);
     if (key && (scip.sites.get(key)?.has(r.target) || scip.dispatch.get(key)?.has(r.target))) {
       keep.push(r.id);
       kept.add(edgeKey(r.source, r.target, r.kind, r.line!));

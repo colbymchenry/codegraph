@@ -26,7 +26,7 @@ import * as path from 'node:path';
 import { MAX_SOURCE_FILE_SIZE_BYTES } from '../../src/file-limits';
 import type { SqliteDatabase } from '../../src/db/sqlite-adapter';
 import { ROLE_DEFINITION, ScipDocument, loadScipIndex, parseSymbol } from '../../src/scip/reader';
-import { scipSites, siteKey, siteKindOfEdge } from '../../src/scip/sites';
+import { scipDefinitions, scipSites, siteKey, siteKindOfEdge } from '../../src/scip/sites';
 import { ScipLanguage, availableIndexes, indexPath, readHashed } from '../../src/scip/store';
 
 const repo = path.resolve(process.argv[2] ?? '.');
@@ -86,7 +86,7 @@ const CONSTRUCTORS = new Set(['<constructor>', 'constructor', '__init__', 'new']
 // The merge's view: fresh documents' lines, then its sites.
 const lines = new Map<string, string[]>();
 for (const file of docs.keys()) if (fresh(file)) lines.set(file, fs.readFileSync(path.join(repo, file), 'utf8').split(/\r?\n/));
-const scip = scipSites(db as unknown as SqliteDatabase, indexes, lines);
+const scip = scipSites(scipDefinitions(db as unknown as SqliteDatabase, indexes, new Set(lines.keys())), indexes, lines, new Set()); // calls only
 /** The symbol SCIP has on `line` by `name`: what an unknown site resolved to. */
 const symbolAt = (file: string, line: number, name: string, kind: string) =>
   refsAt(file, line).find(r => r.name === name || (kind === 'instantiates' && CONSTRUCTORS.has(r.name)))?.symbol;
