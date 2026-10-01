@@ -953,6 +953,71 @@ describe('Installer targets — partial-state idempotency', () => {
     expect(afterUninstall).toContain('"other"');
   });
 
+  it.each(['"""', "'''"])(
+    'codex: install and uninstall preserve a server example inside %s instructions',
+    (delimiter) => {
+      const codex = getTarget('codex')!;
+      const file = path.join(tmpHome, '.codex', 'config.toml');
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const instructions = [
+        `developer_instructions = ${delimiter}`,
+        'Use this example for CodeGraph:',
+        '[mcp_servers.codegraph]',
+        'command = "example only"',
+        delimiter,
+        '',
+      ].join('\n');
+      const sibling = '[mcp_servers.other]\ncommand = "keep-other"\n';
+      fs.writeFileSync(file, instructions + '\n[mcp_servers.codegraph]\ncommand = "old"\n\n' + sibling);
+
+      expect(codex.detect('global').alreadyConfigured).toBe(true);
+      codex.install('global', { autoAllow: false });
+      const installed = fs.readFileSync(file, 'utf8');
+      expect(installed.startsWith(instructions)).toBe(true);
+      expect(installed.endsWith(sibling)).toBe(true);
+      expect(installed).toContain('command = "codegraph"');
+      expect(codex.install('global', { autoAllow: false }).files[0].action).toBe('unchanged');
+
+      codex.uninstall('global');
+      expect(fs.readFileSync(file, 'utf8')).toBe(instructions + '\n' + sibling);
+      expect(codex.detect('global').alreadyConfigured).toBe(false);
+    },
+  );
+
+  it.each([
+    '[ mcp_servers . codegraph ]',
+    '  [mcp_servers.codegraph] # installed server',
+    '["mcp_servers"."codegraph"]',
+    "['mcp_servers'.'codegraph']",
+  ])('codex: recognizes and replaces a formatted server table %s', (header) => {
+    const codex = getTarget('codex')!;
+    const file = path.join(tmpHome, '.codex', 'config.toml');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const sibling = '[mcp_servers.other]\ncommand = "keep-other"\n';
+    fs.writeFileSync(file, `${header}\ncommand = "old"\n\n${sibling}`);
+
+    expect(codex.detect('global').alreadyConfigured).toBe(true);
+    codex.install('global', { autoAllow: false });
+    expect(fs.readFileSync(file, 'utf8')).toBe(
+      '[mcp_servers.codegraph]\ncommand = "codegraph"\nargs = ["serve", "--mcp"]\n\n' + sibling,
+    );
+    codex.uninstall('global');
+    expect(fs.readFileSync(file, 'utf8')).toBe(sibling);
+  });
+
+  it('codex: a server example alone is unconfigured and is left untouched by refresh and uninstall', () => {
+    const codex = getTarget('codex')!;
+    const file = path.join(tmpHome, '.codex', 'config.toml');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const example = 'developer_instructions = """\n[mcp_servers.codegraph]\ncommand = "example"\n"""\n';
+    fs.writeFileSync(file, example);
+
+    expect(codex.detect('global').alreadyConfigured).toBe(false);
+    refreshTargets([codex], 'global');
+    codex.uninstall('global');
+    expect(fs.readFileSync(file, 'utf8')).toBe(example);
+  });
+
   it('codex: user-added key inside [mcp_servers.codegraph] survives idempotent re-install', () => {
     const codex = getTarget('codex')!;
     codex.install('global', { autoAllow: false });
