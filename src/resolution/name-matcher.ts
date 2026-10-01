@@ -8886,6 +8886,14 @@ export function matchReference(
     // selected = useStore(s => s.reset); selected()` is the store's `reset`.)
     if (target && target.name === ref.referenceName && isOutsideJsLocal(target, ref, context)) return null;
   }
+  // R looks a call's name up among FUNCTIONS only, skipping other bindings:
+  // ggplot2's tests' `c <- data_frame(b = 3)` is never what `c(1, 2)` calls —
+  // base R's `c` is. (A project binding made by a function factory, ggplot2's
+  // `geom_point <- make_constructor(…)`, is a function, and stays.)
+  if (result && ref.language === 'r' && ref.referenceKind === 'calls' && R_BASE_FUNCTIONS.has(ref.referenceName)) {
+    const target = context.getNodeById?.(result.targetNodeId);
+    if (target && (target.kind === 'variable' || target.kind === 'constant') && !isRFunctionValue(target, context)) return null;
+  }
   // C has no methods, and C code cannot call a C++ one: hiredis' function
   // pointer `c->funcs->read(c, buf, …)` is no Qt adapter's `read`.
   if (result && ref.language === 'c' && ref.referenceKind === 'calls' &&
@@ -8929,6 +8937,21 @@ function ownerPathOf(n: Node, context: ResolutionContext): string {
 
 /** Reference kinds a bare JS/TS local can be: a call, a value, a construction. */
 const JS_LOCAL_REF_KINDS: ReadonlySet<string> = new Set(['calls', 'references', 'function_ref', 'instantiates']);
+
+/** Base R functions whose names data often shadows (`c <- data_frame(…)`, `df <- …`, `t <- 1`). */
+const R_BASE_FUNCTIONS: ReadonlySet<string> = new Set([
+  'c', 't', 'q', 'df', 'dt', 'data', 'list', 'length', 'names', 'max', 'min', 'sum', 'mean', 'range', 'rev', 'sort',
+  'order', 'rep', 'seq', 'cat', 'print', 'paste', 'paste0', 'format', 'levels', 'factor', 'matrix', 'vector', 'table',
+  'scale', 'sample', 'exp', 'log', 'abs', 'all', 'any', 'which', 'nchar', 'summary', 'file', 'dir', 'identity', 'unique',
+  'nrow', 'ncol', 'rownames', 'colnames', 'array', 'character', 'numeric', 'integer', 'logical', 'mode', 'class', 'body',
+  'args', 'environment', 'search', 'diff', 'round', 'sign', 'trunc', 'var', 'sd', 'median', 'quantile', 'weights',
+]);
+
+/** Whether an R binding holds a function: `f <- function(…)`, `f = \\(x) …`, a `purrr::partial(…)` aside. */
+function isRFunctionValue(n: Node, context: ResolutionContext): boolean {
+  const line = (context.getFileLines?.(n.filePath) ?? context.readFile(n.filePath)?.split(/\r?\n/) ?? [])[n.startLine - 1] ?? '';
+  return /(?:<<?-|=)\s*(?:function\b|\\\s*\()/.test(line);
+}
 
 /** Node kinds that hold a value rather than run code. */
 const VALUE_KINDS: ReadonlySet<string> = new Set(['variable', 'constant', 'field', 'property']);
