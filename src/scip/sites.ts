@@ -53,7 +53,7 @@ const CALLED_VALUE_KINDS: readonly string[] = [...CALLABLE_KINDS, 'constant', 'v
 const CONTAINER_KINDS: readonly string[] = ['class', 'struct', 'constant', 'variable', 'component', 'field', 'property'];
 
 /** SCIP spells constructors differently from the node codegraph extracts for them. */
-const CONSTRUCTOR_NAMES: Record<string, string> = { '<constructor>': 'constructor' };
+const CONSTRUCTOR_NAMES = new Map([['<constructor>', 'constructor']]); // a Map: a plain object would answer `toString` too
 
 export function siteKey(source: string, line: number, name: string, kind: SiteKind): string {
   return `${source}\0${line}\0${name}\0${kind}`;
@@ -137,15 +137,23 @@ class FileNodes {
     }
   }
 
-  /** The node a SCIP definition names: same file, same name, its (0-based) line inside the node. */
+  /**
+   * The node a SCIP definition names: same file, same name, its (0-based) line
+   * inside the node. Failing that, the file's only node of that name and kind
+   * starting below it: an overloaded function is defined at its first signature,
+   * while codegraph's node is the implementation that follows the signatures.
+   */
   definition(file: string, line0: number, name: string, kinds: readonly string[]): NodeRow | null {
     const line = line0 + 1;
     let best: NodeRow | null = null;
+    const below: NodeRow[] = [];
     for (const n of this.byFile.get(file)?.byName.get(name) ?? []) {
-      if (!kinds.includes(n.kind) || n.start_line > line || n.end_line < line) continue;
+      if (!kinds.includes(n.kind)) continue;
+      below.push(n);
+      if (n.start_line > line || n.end_line < line) continue;
       if (!best || size(n) < size(best)) best = n;
     }
-    return best;
+    return best ?? (below.length === 1 && below[0]!.start_line > line ? below[0]! : null);
   }
 
   private lines(f: FileIndex): NodeRow[][] {
@@ -222,7 +230,7 @@ export function scipSites(
         projectSymbols.add(o.symbol);
         const { name, kind } = parsed.last;
         if (!known || !isCallTarget(kind)) continue;
-        const node = nodes.definition(doc.relativePath, o.range.startLine, CONSTRUCTOR_NAMES[name] ?? name,
+        const node = nodes.definition(doc.relativePath, o.range.startLine, CONSTRUCTOR_NAMES.get(name) ?? name,
           kind === 'type' ? TYPE_KINDS : kind === 'term' ? CALLED_VALUE_KINDS : CALLABLE_KINDS);
         const first = symToNode.get(o.symbol);
         if (node && first) {

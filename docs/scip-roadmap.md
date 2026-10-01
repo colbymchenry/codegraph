@@ -85,7 +85,7 @@ Ordered by 4.1's measurement (FORK.md, "Why edges stay unverified"). Untyped cal
 | # | Task | How | Check |
 |---|---|---|---|
 | 4.1 | **Done.** Break unverified edges down by cause | `scripts/scip-eval/unverified.ts`, six corpora | The table in FORK.md |
-| 4.2 | Overloaded functions | tsgo and scip-typescript define an overloaded function at its first signature; codegraph's node is the implementation. Map a definition no node contains to the file's only node of that name and kind starting after it | vscode: "target without node" 51.8k falls (`localize` alone 25.8k); eval unchanged |
+| 4.2 | **Done.** Overloaded functions | tsgo and scip-typescript define an overloaded function at its first signature; codegraph's node is the implementation. Map a definition no node contains to the file's only node of that name and kind starting after it | vscode "target without node" 51,798 → 1,955 (with a lookup fix for methods named `toString` & co.); unverified 12.9% → 7.1%; eval unchanged |
 | 4.3 | Files no project owns | TS/JS files outside every `tsconfig.json`: tsgo-index indexes them in an inferred project (also plain JS without any tsconfig). Language roots below the repo root: detect `Cargo.toml` / `go.mod` / `pyproject.toml` in subfolders | vscode "no document" 14.8k (copilot 8.0k, Rust `cli/` 3.2k); codegraph 23.2k; Django's JS indexed |
 | 4.4 | Rust call sites | `Ok(…)` / `Some(…)` / tuple-struct constructors: rust-analyzer names a type, the heuristic records a call; key them both ways. Multi-line chains: match a call within its expression's lines, not only the first | ripgrep: 2,280 of 2,460 unverified |
 | 4.5 | Verify `references` edges | Same site machinery, for type references (vscode: 72k method → interface) | New eval rows; precision ≥ 95% |

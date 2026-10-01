@@ -129,6 +129,39 @@ describe.runIf(TSGO)('tsgo indexer (TypeScript fixture)', () => {
     expect(edge('useConst', 'twice')?.provenance).toBe('scip');
   }, 30_000);
 
+  it('a method named like an Object.prototype member (toString) maps to its node', async () => {
+    fs.writeFileSync(path.join(dir, 'src', 'named.ts'), [
+      'export class Money {',
+      '  toString(): string {',
+      '    return "1";',
+      '  }',
+      '}',
+      'export function show(m: Money) {',
+      '  return m.toString();',
+      '}',
+    ].join('\n'));
+    await cg.indexAll();
+    await index();
+    expect(edge('show', 'Money::toString')?.provenance).toBe('scip');
+  }, 30_000);
+
+  it('an overloaded function, defined at its first signature, maps to its implementation\'s node', async () => {
+    fs.writeFileSync(path.join(dir, 'src', 'overloads.ts'), [
+      'export function format(n: number): string;',
+      'export function format(s: string): string;',
+      'export function format(x: number | string): string {',
+      '  return String(x);',
+      '}',
+      'export function useFormat() {',
+      '  return format(1) + format(\'a\');',
+      '}',
+    ].join('\n'));
+    await cg.indexAll();
+    await index();
+    expect(cg.scipReadDb().prepare(`SELECT start_line FROM nodes WHERE name = 'format'`).all()).toEqual([{ start_line: 3 }]); // the implementation only
+    expect(edge('useFormat', 'format')?.provenance).toBe('scip');
+  }, 30_000);
+
   it('a file over codegraph\'s size limit is skipped, not reported stale', async () => {
     fs.writeFileSync(path.join(dir, 'src', 'big.ts'), `export function big() { return 1; }\n// ${'x'.repeat(MAX_SOURCE_FILE_SIZE_BYTES)}\n`);
     await cg.indexAll();

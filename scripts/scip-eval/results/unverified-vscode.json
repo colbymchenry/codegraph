@@ -1,12 +1,12 @@
 {
   "repo": "vscode",
-  "verified": 773586,
-  "unverified": 114524,
+  "verified": 837327,
+  "unverified": 64103,
   "causes": {
-    "target without node": 51798,
     "no reference": 41696,
     "no document": 14839,
-    "not a call to SCIP": 5893,
+    "not a call to SCIP": 5315,
+    "target without node": 1955,
     "later line": 298
   },
   "targets": {
@@ -21,14 +21,14 @@
       "test/unit (.js)": 212
     },
     "target without node": {
-      "src/vs/nls.ts (localize().)": 25762,
-      "src/vs/base/browser/dom.ts (append().)": 5098,
-      "src/vs/base/common/async.ts (timeout().)": 3929,
-      "src/vs/base/common/uri.ts (URI#toString().)": 3176,
-      "src/vs/base/common/observableInternal/observables/observableValue.ts (observableValue().)": 2624,
-      "src/vs/nls.ts (localize2().)": 2453,
-      "src/vs/base/browser/dom.ts (addDisposableListener().)": 1585,
-      "src/vs/platform/instantiation/common/extensions.ts (registerSingleton().)": 722
+      "src/vs/base/common/lifecycle.ts (dispose().)": 297,
+      "src/vscode-dts/vscode.d.ts (executeCommand().)": 260,
+      "src/vscode-dts/vscode.d.ts (getConfiguration().)": 215,
+      "src/vscode-dts/vscode.d.ts (registerCommand().)": 43,
+      "src/vs/workbench/api/common/extHostTypeConverters.ts (to().)": 36,
+      "src/vs/workbench/api/common/extHostTypeConverters.ts (from().)": 32,
+      "src/vs/platform/backup/test/electron-main/backupMainService.test.ts (service.toBackupPath().)": 31,
+      "src/vs/workbench/services/configuration/test/browser/configurationService.test.ts (processExperimentalSettings().)": 29
     }
   },
   "examples": {
@@ -49,8 +49,8 @@
     ],
     "target without node": [
       ".vscode/extensions/vscode-selfhost-import-aid/src/extension.ts:26 activate → _refresh (src/vs/base/browser/ui/tree/dataTree.ts)",
-      ".vscode/extensions/vscode-selfhost-test-provider/src/coverageProvider.ts:72 Script::report → toString (extensions/copilot/src/util/vs/base/common/uri.ts)",
-      ".vscode/extensions/vscode-selfhost-test-provider/src/coverageProvider.ts:73 Script::report → toString (extensions/copilot/src/util/vs/base/common/uri.ts)"
+      ".vscode/extensions/vscode-selfhost-test-provider/src/failingDeepStrictEqualAssertFixer.ts:34 FailingDeepStrictEqualAssertFixer::constructor → registerCommand (src/vs/editor/browser/triggerInlineEditCommandsRegistry.ts)",
+      ".vscode/extensions/vscode-selfhost-test-provider/src/failingDeepStrictEqualAssertFixer.ts:52 FailingDeepStrictEqualAssertFixer::constructor → applyEdit (extensions/copilot/src/platform/ignore/node/test/mockWorkspaceService.ts)"
     ],
     "later line": [
       "extensions/copilot/src/extension/chatSessions/copilotcli/node/copilotcliSession.ts:1831 CopilotCLISession::updateArtifacts → invokeTool (extensions/copilot/src/extension/tools/common/toolsService.ts)",
