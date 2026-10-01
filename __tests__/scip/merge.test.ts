@@ -303,6 +303,8 @@ describe('SCIP merge (TypeScript fixture)', () => {
     fakeIndexer('index.scip');
     await produceIndex(cg.scipReadDb(), dir, 'typescript');
     const before = runs();
+    fs.writeFileSync(path.join(dir, 'src', 'extra.ts'), 'export const e = 1;\n'); // something to reindex
+    await cg.sync();
     const s = new ScipReindexScheduler(cg, { idleMs: 30, minIntervalMs: 60_000, log: () => {} });
     try {
       s.notifyChange();
@@ -325,6 +327,8 @@ describe('SCIP merge (TypeScript fixture)', () => {
     fakeIndexer('index.scip');
     await produceIndex(cg.scipReadDb(), dir, 'typescript');
     fakeIndexer('index.scip', 300);
+    fs.writeFileSync(path.join(dir, 'src', 'extra.ts'), 'export const e = 1;\n'); // something to reindex
+    await cg.sync();
     const before = runs();
     const logs: string[] = [];
     const a = new ScipReindexScheduler(cg, { idleMs: 30, minIntervalMs: 60_000, log: () => {} });

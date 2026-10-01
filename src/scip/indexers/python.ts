@@ -114,22 +114,23 @@ export const pythonIndexer: IndexerSpec = {
     return { runs, env: { VIRTUAL_ENV: venv, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}` } };
   },
   patch: {
-    tools: ['scip-python'],
-    // A file passed as --target-only is left out of its own output (scip-python treats the
-    // path as a directory prefix), so each changed file's directory is the target.
-    units: (_root, files) => [...new Set(files.map(f => path.posix.dirname(f)))],
-    unitSeconds: 15, // a scip-python start-up and its imports, measured on Django
-    parallel: true,
-    runs([full], dirs, outFile) {
-      const at = full?.args.indexOf('--output') ?? -1;
-      if (!full || at < 0) return null; // overridden args without an output we can redirect
-      return dirs.map((dir, i) => {
-        const args = [...full.args];
-        const output = `${outFile}.part${i}`;
-        args[at + 1] = output;
-        args.push('--target-only', dir);
-        return { label: dir, args, output, light: true, env: full.env };
-      });
+    'scip-python': {
+      // A file passed as --target-only is left out of its own output (scip-python treats the
+      // path as a directory prefix), so each changed file's directory is the target.
+      units: (_root, files) => [...new Set(files.map(f => path.posix.dirname(f)))],
+      // ~15 s a run (start-up and imports, measured on Django); light runs go side by side.
+      seconds: (_root, dirs, width) => Math.ceil(dirs.length / width) * 15,
+      runs([full], dirs, outFile) {
+        const at = full?.args.indexOf('--output') ?? -1;
+        if (!full || at < 0) return null; // overridden args without an output we can redirect
+        return dirs.map((dir, i) => {
+          const args = [...full.args];
+          const output = `${outFile}.part${i}`;
+          args[at + 1] = output;
+          args.push('--target-only', dir);
+          return { label: dir, args, output, light: true, env: full.env };
+        });
+      },
     },
   },
 };

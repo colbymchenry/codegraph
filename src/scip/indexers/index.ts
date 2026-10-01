@@ -55,6 +55,8 @@ export const RUN_WARNING = 'codegraph-scip warning: ';
  */
 export interface Invocation {
   runs: IndexerRun[];
+  /** the tool these runs write (`ToolInfo.name`); the adapter's first `tools` entry when unset */
+  tool?: string;
   env?: Record<string, string>;
   /** something the user should know about the result's quality (shown, never fatal) */
   warning?: string;
@@ -97,26 +99,25 @@ export interface IndexerSpec {
    */
   chainCallsAtStart?: boolean;
   /**
-   * Patching an installed index instead of rebuilding it (produce.ts patchIndex).
-   * `tools`: whose indexes can be patched — their symbols must be named the same
-   * whatever else was indexed, and their documents must define what they declare.
-   * The planner (produce.ts incrementalPlan) patches when the estimated time,
-   * ⌈units / parallel runs⌉ × `unitSeconds`, is under half the last full run's.
+   * Patching an installed index instead of rebuilding it (produce.ts patchIndex),
+   * per tool that wrote it: its symbols must be named the same whatever else was
+   * indexed, and its documents must define what they declare. The planner
+   * (produce.ts incrementalPlan) patches when `seconds` is under half the last
+   * full run's time.
    */
-  patch?: {
-    tools: readonly string[];
-    /** the smallest pieces a run re-indexes that cover `files`: a file, its directory, its package, its project */
-    units(projectRoot: string, files: string[]): string[];
-    /** rough seconds to re-index one unit */
-    unitSeconds: number;
-    /** units re-index side by side (light runs) */
-    parallel?: boolean;
-    /**
-     * The runs re-indexing `units`, derived from the resolved full runs; they may
-     * write helper files named `${outFile}.*`. Null → only a full run will do.
-     */
-    runs(full: readonly IndexerRun[], units: string[], outFile: string): IndexerRun[] | null;
-  };
+  patch?: Partial<Record<string, PatchSpec>>;
+}
+
+export interface PatchSpec {
+  /** the smallest pieces a run re-indexes that cover `files`: a file, its directory, its package, its project */
+  units(projectRoot: string, files: string[]): string[];
+  /** rough seconds to re-index `units`, given how many light runs go side by side */
+  seconds(projectRoot: string, units: string[], width: number): number;
+  /**
+   * The runs re-indexing `units`, derived from the resolved full runs; they may
+   * write helper files named `${outFile}.*`. Null → only a full run will do.
+   */
+  runs(full: readonly IndexerRun[], units: string[], outFile: string): IndexerRun[] | null;
 }
 
 export interface IndexerOverride {
@@ -165,6 +166,8 @@ const isStringRecord = (v: unknown): v is Record<string, string> =>
 
 export interface ResolvedIndexer {
   lang: ScipLanguage;
+  /** the tool its runs write (see Invocation.tool) */
+  tool: string;
   cmd: string;
   runs: IndexerRun[];
   env: Record<string, string>;
@@ -197,7 +200,10 @@ export function resolveIndexer(projectRoot: string, lang: ScipLanguage, outFile:
   if (!spec.detect(projectRoot)) return { skip: `no ${lang} project markers found` };
   const preferred = override?.cmd || override?.args ? null : spec.preferred?.(projectRoot, outFile);
   if (preferred && 'runs' in preferred) {
-    return { lang, cmd: preferred.cmd, runs: preferred.runs, env: { ...preferred.env, ...override?.env }, warning: preferred.warning };
+    return {
+      lang, tool: preferred.tool ?? spec.tools[0]!, cmd: preferred.cmd, runs: preferred.runs,
+      env: { ...preferred.env, ...override?.env }, warning: preferred.warning,
+    };
   }
   const unusable = preferred?.unusable;
   const cmd = override?.cmd ?? spec.cmd;
@@ -223,7 +229,7 @@ export function resolveIndexer(projectRoot: string, lang: ScipLanguage, outFile:
     fallback: run.fallback?.map(apply),
   });
   const warning = [inv.warning, unusable && `${unusable} — using ${cmd}`].filter(Boolean).join('; ') || undefined;
-  return { lang, cmd, runs: inv.runs.map(apply), env: { ...inv.env, ...override?.env }, warning };
+  return { lang, tool: inv.tool ?? spec.tools[0]!, cmd, runs: inv.runs.map(apply), env: { ...inv.env, ...override?.env }, warning };
 }
 
 export function onPath(cmd: string): boolean {

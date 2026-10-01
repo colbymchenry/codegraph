@@ -188,9 +188,9 @@ describe('go / rust adapters', () => {
     }
     const r = resolveIndexer(dir, 'go', out);
     if ('skip' in r) throw new Error(r.skip);
-    const units = INDEXERS.go.patch!.units(dir, ['main.go', 'pkg/a/a.go', 'pkg/a/b.go', 'tools/gen/gen.go', 'tools/gen/sub/x.go']);
+    const units = INDEXERS.go.patch!['scip-go']!.units(dir, ['main.go', 'pkg/a/a.go', 'pkg/a/b.go', 'tools/gen/gen.go', 'tools/gen/sub/x.go']);
     expect(units).toEqual(['.', 'pkg/a', 'tools/gen', 'tools/gen/sub']);
-    const runs = INDEXERS.go.patch!.runs(r.runs, units, out)!;
+    const runs = INDEXERS.go.patch!['scip-go']!.runs(r.runs, units, out)!;
     expect(runs.map(x => [x.cwd, x.args.slice(4)])).toEqual([['.', ['.', './pkg/a']], ['tools/gen', ['.', './sub']]]);
   });
 
@@ -213,6 +213,27 @@ describe('go / rust adapters', () => {
     expect(r.runs.map(x => x.args.slice(3))).toEqual([['.', 'extensions/git', 'src'], ['extensions/web', '--infer-tsconfig']]);
     expect(r.runs[0]!.fallback?.map(f => f.label)).toEqual(['.', 'extensions/git', 'src']);
     expect(r.runs.every(x => x.light && /--max-old-space-size=\d+/.test(x.env?.NODE_OPTIONS ?? ''))).toBe(true);
+  });
+
+  it('TS (scip-typescript) patches by project: the changed files\' deepest projects, overrides kept', () => {
+    const out = path.join(dir, 'out.tmp');
+    fs.writeFileSync(path.join(dir, 'package.json'), '{}');
+    fs.writeFileSync(path.join(dir, 'tsconfig.json'), '{}');
+    for (const p of ['src', 'extensions/git', 'extensions/web']) fs.mkdirSync(path.join(dir, p), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'src/tsconfig.json'), '{}');
+    fs.writeFileSync(path.join(dir, 'extensions/git/tsconfig.json'), '{}');
+    fs.writeFileSync(path.join(dir, 'extensions/web/jsconfig.json'), '{}');
+    fs.writeFileSync(path.join(dir, 'codegraph.json'), JSON.stringify({ scip: { typescript: { cmd: 'npx', args: ['-y', 'scip-ts', '{args}'] } } }));
+    const r = resolveIndexer(dir, 'typescript', out);
+    if ('skip' in r) throw new Error(r.skip);
+    expect(r.tool).toBe('scip-typescript');
+    const spec = INDEXERS.typescript.patch!['scip-typescript']!;
+    const units = spec.units(dir, ['extensions/git/a.ts', 'extensions/git/b/c.ts', 'tools/x.ts']);
+    expect(units).toEqual(['extensions/git', '.']);
+    const runs = spec.runs(r.runs, ['extensions/git'], out)!;
+    expect(runs).toHaveLength(1);
+    expect(runs[0]!.args).toEqual(['-y', 'scip-ts', 'index', '--output', `${out}.part0`, 'extensions/git']);
+    expect(runs[0]!.output).toBe(`${out}.part0`);
   });
 
   it('TS: heavy projects run alone with the big heap, light ones are batched by size', () => {

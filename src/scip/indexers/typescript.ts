@@ -190,17 +190,43 @@ export const typescriptIndexer: IndexerSpec = {
     return { runs: [{ label: 'typescript', args, output: outFile, env: heapEnv(bigHeapMb()) }] };
   },
   patch: {
-    tools: ['tsgo-index'],
-    units: (_root, files) => files, // tsgo-index --only takes files
-    unitSeconds: 0.1,
-    runs([full], files, outFile) {
-      if (!full || path.basename(full.args[0] ?? '') !== 'tsgo-index.js') return null; // only tsgo has a partial mode
-      const list = `${outFile}.only`;
-      fs.writeFileSync(list, files.join('\n'));
-      const args = [...full.args];
-      args[2] = outFile;
-      args.splice(4, 0, '--only', list); // after <tsDir> <output> <root>, before the configs
-      return [{ label: 'typescript (tsgo, changed files)', args, output: outFile, env: full.env }];
+    'tsgo-index': {
+      units: (_root, files) => files, // tsgo-index --only takes files
+      seconds: (_root, files) => files.length * 0.1,
+      runs([full], files, outFile) {
+        if (!full) return null;
+        const list = `${outFile}.only`;
+        fs.writeFileSync(list, files.join('\n'));
+        const args = [...full.args];
+        args[2] = outFile;
+        args.splice(4, 0, '--only', list); // after <tsDir> <output> <root>, before the configs
+        return [{ label: 'typescript (tsgo, changed files)', args, output: outFile, env: full.env }];
+      },
+    },
+    // A project at a time: each changed file's deepest tsconfig/jsconfig project, re-indexed whole.
+    'scip-typescript': {
+      units(root, files) {
+        const byDepth = tsProjects(root).sort((a, b) => b.length - a.length);
+        return [...new Set(files.map(f => byDepth.find(p => p === '.' || f.startsWith(`${p}/`)) ?? '.'))];
+      },
+      // A process start-up plus ~0.03 s a file (vscode: 361 s for 13.8k files), per project.
+      seconds(root, projects) {
+        const weights = projectWeights(tsProjects(root), repoFiles(root));
+        return projects.reduce((s, p) => s + 3 + 0.03 * (weights.get(p) ?? 0), 0);
+      },
+      // The full plan's single-project runs (a batch's fallbacks are those), for the projects wanted.
+      runs(full, projects, outFile) {
+        if (full.length === 1 && !projects.includes(full[0]!.label)) return null; // one run for the whole repo: nothing smaller to run
+        const single = full.flatMap(r => (r.fallback?.length ? r.fallback : [r]));
+        const runs: IndexerRun[] = [];
+        for (const p of projects) {
+          const r = single.find(x => x.label === p);
+          if (!r) return null;
+          const output = `${outFile}.part${runs.length}`;
+          runs.push({ ...r, args: r.args.map(a => (a === r.output ? output : a)), output, fallback: undefined });
+        }
+        return runs;
+      },
     },
   },
   preferred(root, outFile) {
@@ -214,6 +240,6 @@ export const typescriptIndexer: IndexerSpec = {
     const configs = [...projects].sort((a, b) => weights.get(b)! - weights.get(a)!)
       .map(p => path.posix.join(p, has(path.join(root, p), 'tsconfig.json') ? 'tsconfig.json' : 'jsconfig.json'));
     const args = [path.join(__dirname, 'tsgo-index.js'), ts.dir, outFile, root, ...configs];
-    return { cmd: process.execPath, runs: [{ label: 'typescript (tsgo)', args, output: outFile }] };
+    return { cmd: process.execPath, tool: 'tsgo-index', runs: [{ label: 'typescript (tsgo)', args, output: outFile }] };
   },
 };

@@ -85,8 +85,8 @@ export interface IncrementalPlan {
  */
 export function incrementalPlan(db: SqliteDatabase, projectRoot: string, lang: ScipLanguage): IncrementalPlan | null {
   const meta = readMeta(projectRoot, lang);
-  const patch = INDEXERS[lang].patch;
-  if (!meta || !patch?.tools.includes(meta.tool)) return null;
+  const patch = meta && INDEXERS[lang].patch?.[meta.tool];
+  if (!meta || !patch) return null;
   const langs = INDEXERS[lang].codegraphLanguages;
   const rows = db.prepare(`SELECT path, content_hash FROM files WHERE language IN (${langs.map(() => '?').join(',')})`)
     .all(...langs) as { path: string; content_hash: string }[];
@@ -100,7 +100,7 @@ export function incrementalPlan(db: SqliteDatabase, projectRoot: string, lang: S
   if (files.size > MAX_INCREMENTAL_FILES) return null;
   const sorted = [...files].sort();
   const units = sorted.length ? patch.units(projectRoot, sorted) : [];
-  const estimateMs = Math.ceil(units.length / (patch.parallel ? lightConcurrency() : 1)) * patch.unitSeconds * 1000;
+  const estimateMs = units.length ? patch.seconds(projectRoot, units, lightConcurrency()) * 1000 : 0;
   if (meta.fullRunMs !== undefined && estimateMs >= meta.fullRunMs / 2) return null;
   return { files: sorted, deleted, units, estimateMs };
 }
@@ -202,11 +202,11 @@ async function patchIndex(
   db: SqliteDatabase, projectRoot: string, lang: ScipLanguage, indexer: ResolvedIndexer, raw: string, opts: ProduceOptions
 ): Promise<ProduceResult | null> {
   const final = indexPath(projectRoot, lang);
-  const patch = INDEXERS[lang].patch;
-  if (!patch || !fs.existsSync(final)) return null;
-  const plan = incrementalPlan(db, projectRoot, lang);
   const previous = readMeta(projectRoot, lang);
-  if (!plan || !previous) return null;
+  const patch = previous && previous.tool === indexer.tool ? INDEXERS[lang].patch?.[previous.tool] : undefined; // another tool now: rebuild
+  if (!previous || !patch || !fs.existsSync(final)) return null;
+  const plan = incrementalPlan(db, projectRoot, lang);
+  if (!plan) return null;
   if (plan.files.length === 0 && plan.deleted.length === 0) return { status: 'current', lang };
 
   const started = Date.now();
