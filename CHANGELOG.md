@@ -14,6 +14,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- A COBOL file whose last line ends inside the sequence area (columns 1-6), such as a closing period indented only four spaces, no longer stalls indexing for over a minute and then ends up in the index with no symbols.
 - In Laravel apps, a route whose controller is named by string now links to its handler, without needing a `Controller` suffix and keeping the namespace it's written with: `'Common\Uploads@inline'`, and `Route::resource('companies', 'Common\Companies', [...])` with an options array. Two same-named controllers in different namespaces are told apart by that namespace. Before, akaunting linked 304 of its 313 routes to nothing.
 - In Nuxt and Astro projects, a file-routed page is now linked to the component its file defines. An Astro endpoint is linked to the HTTP-verb handlers it exports, like `export const GET`. Before, a page route like Nuxt's `pages/admin.vue` or Astro's `src/pages/about.astro` linked to nothing, so callers, impact and flows stopped at the route.
 - In Rails apps, a `resources` line's `only:` and `except:` are now read in every form Rails accepts: `%i[new create index]`, `%w(index show)`, a quoted name, and the older `:only => [...]`. Before, only a bracketed list was read, so maybe's `resources :family_exports, only: %i[new create index]` became all seven routes, four of them to actions the controller doesn't have.
