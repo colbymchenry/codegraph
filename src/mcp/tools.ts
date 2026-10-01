@@ -1898,6 +1898,7 @@ export class ToolHandler {
   // Every concurrent call shares its project's pending catch-up promise.
   private projectGates: Map<CodeGraph, Promise<void>> = new Map();
   private activeCalls = 0;
+  private activeProjectRoots = new Map<string, number>();
   private closing = false;
   private pendingCloses = 0;
   private closeWaiters: Array<() => void> = [];
@@ -2295,12 +2296,26 @@ export class ToolHandler {
     await this.awaitCatchUpGate(gate);
   }
 
+  private pinProject(projectPath: unknown): string | null {
+    const resolved = typeof projectPath === 'string' ? findNearestCodeGraphRoot(projectPath) : null;
+    if (!resolved) return null;
+    const root = canonicalPath(resolved);
+    this.activeProjectRoots.set(root, (this.activeProjectRoots.get(root) ?? 0) + 1);
+    return root;
+  }
+
+  private unpinProject(root: string | null): void {
+    if (!root) return;
+    const count = this.activeProjectRoots.get(root)!;
+    if (count === 1) this.activeProjectRoots.delete(root);
+    else this.activeProjectRoots.set(root, count - 1);
+  }
+
   /** Never evict a graph while a tool call or its timed-out reconcile uses it. */
   private trimProjects(): void {
-    if (this.activeCalls > 0) return;
     for (const [root, cg] of this.projectCache) {
       if (!this.closing && this.projectCache.size <= MAX_CACHED_PROJECTS) break;
-      if (this.projectGates.has(cg)) continue;
+      if (this.activeProjectRoots.has(root) || this.projectGates.has(cg)) continue;
       this.projectCache.delete(root);
       if (this.projectLifecycle) {
         this.pendingCloses++;
@@ -2310,7 +2325,7 @@ export class ToolHandler {
         });
       } else cg.close();
     }
-    if (this.closing && this.projectCache.size === 0 && this.pendingCloses === 0) {
+    if (this.closing && this.projectCache.size === 0 && this.activeCalls === 0 && this.activeProjectRoots.size === 0 && this.pendingCloses === 0) {
       for (const resolve of this.closeWaiters.splice(0)) resolve();
     }
   }
@@ -2348,7 +2363,7 @@ export class ToolHandler {
     this.closing = true;
     this.worktreeMismatchCache.clear();
     this.trimProjects();
-    if (this.projectCache.size === 0 && this.activeCalls === 0 && this.pendingCloses === 0) return Promise.resolve();
+    if (this.projectCache.size === 0 && this.activeCalls === 0 && this.activeProjectRoots.size === 0 && this.pendingCloses === 0) return Promise.resolve();
     return new Promise((resolve) => this.closeWaiters.push(resolve));
   }
 
@@ -2649,6 +2664,7 @@ export class ToolHandler {
   ): Promise<ToolResult> {
     if (this.closing) return this.textResult('This MCP session is closing; retry with a connected session.');
     this.activeCalls++;
+    let pinnedRoot: string | null = null;
     try {
       // Block the first tool call on the engine's post-open reconcile so we
       // never serve rows for files deleted/edited while no MCP server was
@@ -2675,6 +2691,7 @@ export class ToolHandler {
       if (typeof pathCheck === 'object' && pathCheck !== undefined) {
         return pathCheck;
       }
+      pinnedRoot = this.pinProject(pathCheck);
       // An explicit project gets the same first-call guarantee as the default
       // (#1835): its post-open catch-up sync finishes (time-boxed) before we
       // serve it. Resolved on the main thread so the watcher lives here even
@@ -2790,6 +2807,7 @@ export class ToolHandler {
         'continue without codegraph for this task.'
       );
     } finally {
+      this.unpinProject(pinnedRoot);
       this.activeCalls--;
       this.trimProjects();
     }
@@ -2860,6 +2878,7 @@ export class ToolHandler {
    * path validation already ran in {@link execute} before routing here.
    */
   async executeReadTool(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+    const pinnedRoot = this.pinProject(args.projectPath);
     try {
       return await this.dispatchTool(toolName, args);
     } catch (err) {
@@ -2877,6 +2896,9 @@ export class ToolHandler {
         'This is an internal codegraph error — retry the call once; if it persists, ' +
         'continue without codegraph for this task.'
       );
+    } finally {
+      this.unpinProject(pinnedRoot);
+      this.trimProjects();
     }
   }
 
