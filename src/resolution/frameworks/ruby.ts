@@ -8,6 +8,25 @@ import { Node } from '../../types';
 import { FrameworkResolver, FrameworkExtractionResult, UnresolvedRef, ResolvedRef, ResolutionContext } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 
+/**
+ * A `resources` line's `only:` / `except:` action list, written any way Rails
+ * accepts it: `[:index, :show]`, `:show`, `%i[new create index]`, `%w(index
+ * show)`, `"show"`, or the older `:only => [...]`. Null when the option is
+ * absent. maybe's `only: %i[new create index]` was not read, so every
+ * resource drew all seven routes, four of them to actions that do not exist.
+ */
+function railsActionOption(tail: string, key: 'only' | 'except'): Set<string> | null {
+  const m = new RegExp(
+    String.raw`(?:\b${key}:|:${key}\s*=>)\s*(?:\[([^\]]*)\]|%[iIwW]\s*[\[(]([^\])]*)[\])]|:(\w+)|["'](\w+)["'])`
+  ).exec(tail);
+  if (!m) return null;
+  if (m[1] !== undefined) {
+    return new Set(m[1].split(',').map((v) => v.trim().replace(/^:/, '').replace(/^["']|["']$/g, '')).filter(Boolean));
+  }
+  if (m[2] !== undefined) return new Set(m[2].trim().split(/\s+/).filter(Boolean));
+  return new Set([m[3] ?? m[4]!]);
+}
+
 export const railsResolver: FrameworkResolver = {
   name: 'rails',
   languages: ['ruby'],
@@ -165,11 +184,10 @@ export const railsResolver: FrameworkResolver = {
       const resName = match[2]!;
       const tail = match[3] || '';
       let actions = plural ? PLURAL_ACTIONS : SINGULAR_ACTIONS;
-      const only = tail.match(/only:\s*\[([^\]]*)\]/);
-      const except = tail.match(/except:\s*\[([^\]]*)\]/);
-      const symList = (s: string) => new Set(s.split(',').map((x) => x.trim().replace(/^:/, '')));
-      if (only) { const s = symList(only[1]!); actions = actions.filter((a) => s.has(a)); }
-      else if (except) { const s = symList(except[1]!); actions = actions.filter((a) => !s.has(a)); }
+      const only = railsActionOption(tail, 'only');
+      const except = railsActionOption(tail, 'except');
+      if (only) actions = actions.filter((a) => only.has(a));
+      else if (except) actions = actions.filter((a) => !except.has(a));
       // `resources :articles` → ArticlesController; `resource :user` → UsersController.
       const ctrl = plural ? resName : pluralize(resName);
       const line = safe.slice(0, match.index).split('\n').length;
@@ -276,11 +294,10 @@ function extractScopedRailsRoutes(filePath: string, safe: string): FrameworkExtr
       const collectionPath = join(frame.path, segment);
       const memberPath = plural ? join(collectionPath, ':id') : collectionPath;
       let actions = plural ? PLURAL_ACTIONS : SINGULAR_ACTIONS;
-      const only = /only:\s*(?:\[([^\]]*)\]|(:\w+))/.exec(tail);
-      const except = /except:\s*(?:\[([^\]]*)\]|(:\w+))/.exec(tail);
-      const symList = (x: RegExpExecArray) => new Set((x[1] ?? x[2] ?? '').split(',').map((v) => sym(v.trim())));
-      if (only) { const keep = symList(only); actions = actions.filter((a) => keep.has(a)); }
-      else if (except) { const drop = symList(except); actions = actions.filter((a) => !drop.has(a)); }
+      const only = railsActionOption(tail, 'only');
+      const except = railsActionOption(tail, 'except');
+      if (only) actions = actions.filter((a) => only.has(a));
+      else if (except) actions = actions.filter((a) => !except.has(a));
       for (const action of actions) {
         const spec = RESTFUL_ROUTES[action]!;
         const path = action === 'index' || action === 'create' ? collectionPath
