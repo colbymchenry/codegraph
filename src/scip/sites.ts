@@ -31,6 +31,8 @@ const TYPE_KINDS: readonly string[] = ['class', 'struct', 'interface', 'trait'];
 /** A type nested in a type: also an enum variant (rust-analyzer names `Result::Ok` `Result#Ok#`). */
 const NESTED_TYPE_KINDS: readonly string[] = [...TYPE_KINDS, 'enum_member'];
 const INTERFACE_KINDS: readonly string[] = ['interface', 'trait'];
+/** What a `references` edge may point at, by SCIP descriptor: a type (also an alias or enum), a member, a value. */
+const REFERENCED_TYPE_KINDS: readonly string[] = [...TYPE_KINDS, 'type_alias', 'enum'];
 
 /** codegraph's label for a type → base edge: a class/struct implements an interface/trait, anything else extends. */
 export function inheritanceKind(sourceKind: string, targetKind: string): 'implements' | 'extends' {
@@ -56,6 +58,32 @@ const CONTAINER_KINDS: readonly string[] = ['class', 'struct', 'constant', 'vari
 
 /** SCIP spells constructors differently from the node codegraph extracts for them. */
 const CONSTRUCTOR_NAMES = new Map([['<constructor>', 'constructor']]); // a Map: a plain object would answer `toString` too
+const REFERENCED_METHOD_KINDS: readonly string[] = [...CALLABLE_KINDS, 'property'];
+const REFERENCED_VALUE_KINDS: readonly string[] = [...CALLED_VALUE_KINDS, 'property', 'field', 'enum_member'];
+
+/**
+ * A `references` site is keyed by its file, not its caller: the merge only
+ * verifies or removes codegraph's references (it never inserts one, see merge.ts),
+ * so it needs no caller node, and codegraph's sources for them (an interface's
+ * property, a type alias) are kinds callerAt doesn't name.
+ */
+export function referenceKey(file: string, line: number, name: string): string {
+  return siteKey(file, line, name, 'references');
+}
+
+/**
+ * The sites of codegraph's `references` edges (any provenance) in `files`, or
+ * everywhere: what compaction keeps references for, what tsgo-index resolves
+ * (`--refs`), and what the merge judges. Keyed by referenceKey.
+ */
+export function referenceSites(db: SqliteDatabase, files?: Iterable<string>): Set<string> {
+  const sql = `SELECT s.file_path AS file, e.line, t.name FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+    WHERE e.kind = 'references' AND e.line IS NOT NULL`;
+  const rows = files
+    ? [...files].flatMap(f => db.prepare(`${sql} AND s.file_path = ?`).all(f))
+    : db.prepare(sql).all();
+  return new Set((rows as { file: string; line: number; name: string }[]).map(r => referenceKey(r.file, r.line, r.name)));
+}
 
 export function siteKey(source: string, line: number, name: string, kind: SiteKind): string {
   return `${source}\0${line}\0${name}\0${kind}`;
@@ -119,7 +147,7 @@ class FileNodes {
   private byFile = new Map<string, FileIndex>();
 
   constructor(db: SqliteDatabase, files: Set<string>) {
-    const kinds = [...new Set([...CALLABLE_KINDS, ...NESTED_TYPE_KINDS, ...CONTAINER_KINDS, 'file'])];
+    const kinds = [...new Set([...CALLABLE_KINDS, ...NESTED_TYPE_KINDS, ...REFERENCED_TYPE_KINDS, ...REFERENCED_VALUE_KINDS, ...CONTAINER_KINDS, 'file'])];
     const rows = db.prepare(
       `SELECT id, kind, name, qualified_name, file_path, start_line, end_line, start_column, end_column FROM nodes
        WHERE kind IN (${kinds.map(() => '?').join(',')})`
@@ -195,7 +223,8 @@ class FileNodes {
 }
 
 /**
- * Every call/instantiation SCIP resolved in a fresh document.
+ * Every call/instantiation SCIP resolved in a fresh document, and what it
+ * resolved at codegraph's `references` sites (`refs`).
  *
  * `fresh` holds the paths whose SCIP document matches codegraph's view of the
  * file (hash gate) with their source lines; documents outside it still
@@ -205,12 +234,16 @@ class FileNodes {
 export function scipSites(
   db: SqliteDatabase, indexes: Array<{ lang: ScipLanguage; docs: ScipDocument[] }>, fresh: Map<string, string[]>,
   /** only these files' sites (a patch's, see MergeScope); definitions are read from every document */
-  judged?: Set<string>
+  judged?: Set<string>,
+  /** codegraph's `references` sites to judge (referenceSites) */
+  refs?: Set<string>
 ): ScipSites {
   const stats: Record<string, number> = {};
   const bump = (k: string) => { stats[k] = (stats[k] ?? 0) + 1; };
   const nodes = new FileNodes(db, new Set(fresh.keys()));
   const symToNode = new Map<string, NodeRow>();
+  /** symbol → the node a reference to it points at: like symToNode, over the kinds a `references` edge targets */
+  const refToNode = new Map<string, NodeRow>();
   const projectSymbols = new Set<string>();
   const ambiguous = new Set<string>();
   // Symbols repeat at every occurrence; parse each once.
@@ -233,6 +266,12 @@ export function scipSites(
         const { name, kind } = parsed.last;
         if (!known || !isCallTarget(kind)) continue;
         const nested = kind === 'type' && parse(parsed.owner)?.last.kind === 'type';
+        if (refs && !refToNode.has(o.symbol)) {
+          const kinds = kind === 'type' ? (nested ? [...REFERENCED_TYPE_KINDS, 'enum_member'] : REFERENCED_TYPE_KINDS)
+            : kind === 'method' ? REFERENCED_METHOD_KINDS : REFERENCED_VALUE_KINDS;
+          const target = nodes.definition(doc.relativePath, o.range.startLine, name, kinds);
+          if (target) refToNode.set(o.symbol, target);
+        }
         const node = nodes.definition(doc.relativePath, o.range.startLine, CONSTRUCTOR_NAMES.get(name) ?? name,
           nested ? NESTED_TYPE_KINDS : kind === 'type' ? TYPE_KINDS : kind === 'term' ? CALLED_VALUE_KINDS : CALLABLE_KINDS);
         const first = symToNode.get(o.symbol);
@@ -327,6 +366,16 @@ export function scipSites(
         if (occurrence.roles & ROLE_DEFINITION) continue;
         const symbol = defined(occurrence.symbol);
         const o = symbol === occurrence.symbol ? occurrence : { ...occurrence, symbol };
+        // One of codegraph's references, judged by the symbol here — wherever it is called or not.
+        const ref = refs && parse(symbol);
+        const refKey = ref && referenceKey(doc.relativePath, o.range.startLine + 1, ref.last.name);
+        if (refKey && refs!.has(refKey)) {
+          const node = refToNode.get(symbol);
+          if (node) addTarget(sites, refKey, node.id, o.range.startCol);
+          else if (projectSymbols.has(symbol)) unknown.add(refKey);
+          else addTarget(sites, refKey, EXTERNAL, o.range.startCol);
+          bump(node ? 'references_resolved' : 'references_unresolved');
+        }
         const call = classify(o, doc.positionEncoding, lines, literal, symToNode, parse, variantCalls);
         if (!call) continue;
         const { startLine, startCol } = o.range;
@@ -421,13 +470,13 @@ export function heuristicSites(db: SqliteDatabase, files: Iterable<string>): Heu
     FROM nodes s
     JOIN edges e ON e.source = s.id
     JOIN nodes t ON t.id = e.target
-    WHERE s.file_path = ? AND e.kind IN ('calls', 'instantiates', 'implements', 'extends') AND e.line IS NOT NULL
+    WHERE s.file_path = ? AND e.kind IN ('calls', 'instantiates', 'implements', 'extends', 'references') AND e.line IS NOT NULL
       AND ${HEURISTIC_PROVENANCE} -- unambiguous: only edges have a provenance column
   `);
   const out: HeuristicSites = new Map();
   for (const f of files) {
     for (const r of stmt.all(f) as { id: number; source: string; line: number; kind: string; name: string; target: string }[]) {
-      const key = siteKey(r.source, r.line, r.name, siteKindOfEdge(r.kind));
+      const key = r.kind === 'references' ? referenceKey(f, r.line, r.name) : siteKey(r.source, r.line, r.name, siteKindOfEdge(r.kind));
       let targets = out.get(key);
       if (!targets) out.set(key, (targets = new Map()));
       const ids = targets.get(r.target);

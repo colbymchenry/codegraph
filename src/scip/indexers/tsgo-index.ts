@@ -3,11 +3,15 @@
  * its API (`typescript/unstable/sync`, TypeScript ≥ 7.1). The typescript
  * adapter runs it as its own process when that API is installed:
  *
- *   node tsgo-index.js <typescript package dir> <output> <root> [--only <listfile>] [<tsconfig>...]
+ *   node tsgo-index.js <typescript package dir> <output> <root> [--only <listfile>] [--refs <listfile>] [<tsconfig>...]
  *
  * It writes exactly what the merge reads (see compact.ts) and nothing more: a
  * reference at the callee name of every call and `new` in a project file, and
- * the definition of every callee the project declares. A symbol is named after
+ * the definition of every callee the project declares — plus, at the sites
+ * `--refs` lists (codegraph's `references` edges: path, line, name), a reference
+ * for every identifier on that line — whatever its text, since an import alias
+ * (`Node as SyntaxNode`) names its target differently — which the merge judges
+ * those edges by. A symbol is named after
  * its first declaration — its file and the named declarations enclosing it — so
  * an overload maps to its first signature, a declaration reached from two
  * projects is one symbol, and the name survives edits elsewhere in the file.
@@ -92,7 +96,7 @@ interface TsApi {
 interface Loaded {
   api: TsApi;
   SyntaxKind: Record<string, number>;
-  SymbolFlags: Record<'Alias' | 'Class' | 'Interface' | 'Function' | 'Method' | 'Variable' | 'Property', number>;
+  SymbolFlags: Record<'Alias' | 'Class' | 'Interface' | 'Function' | 'Method' | 'Variable' | 'Property' | 'Enum' | 'TypeAlias' | 'EnumMember', number>;
   CheckFlags: Record<'Synthetic', number>;
   skipTrivia(text: string, pos: number): number;
   version: string;
@@ -142,7 +146,9 @@ function lineOf(starts: number[], pos: number): number {
  * Only projects owning one of them are opened.
  */
 export async function indexProjects(
-  tsDir: string, output: string, root: string, configs: string[], only?: ReadonlySet<string>
+  tsDir: string, output: string, root: string, configs: string[], only?: ReadonlySet<string>,
+  /** repo-relative path → 1-based lines: where to emit references (see the header) */
+  refs?: ReadonlyMap<string, ReadonlySet<number>>
 ): Promise<{ warnings: string[]; documents: number }> {
   const ts = await load(tsDir, root);
   const K = ts.SyntaxKind;
@@ -346,6 +352,30 @@ export async function indexProjects(
       return targetsOf(t, suffix).map(decl => named(t, decl, suffix));
     };
 
+    /**
+     * The SCIP symbols of a referenced name: its type (`#`: class, interface, enum,
+     * alias) and/or its value — both for a name that is both (`interface IFoo` merged
+     * with `const IFoo`), since codegraph may have linked either.
+     */
+    const referencedAs = (s: TsSymbol): string[] => {
+      const t = resolve(s);
+      const out: string[] = [];
+      if (t.flags & (F.Class | F.Interface | F.Enum | F.TypeAlias)) {
+        const d = primary(t, '#');
+        if (d) out.push(named(t, d, '#'));
+        // A global interface the project augments (`declare global { interface Window … }`, in
+        // any number of files): the lib declaration names it, but codegraph's nodes are the project's.
+        if (d && !inRepo(d.path)) for (const own of t.declarations ?? []) if (inRepo(own.path) && TYPE_DECLS.has(own.kind)) out.push(named(t, own, '#'));
+      }
+      const v = t.flags & F.Class ? null : t.flags & (F.Function | F.Method) ? '().' : t.flags & (F.Variable | F.Property | F.EnumMember) ? '.' : null;
+      if (v) {
+        const decls = t.checkFlags & C.Synthetic ? targetsOf(t, v)
+          : (t.declarations ?? []).filter(d => d.kind !== K.InterfaceDeclaration && d.kind !== K.TypeAliasDeclaration).slice(0, 1);
+        for (const d of decls) out.push(named(t, d, v));
+      }
+      return out;
+    };
+
     /** Where a heritage entry names its base (Identifier, QualifiedName.right, PropertyAccess.name). */
     const heritageName = (text: string, t: TsNode): number | null => {
       const n = t.typeName ?? t.expression;
@@ -398,6 +428,9 @@ export async function indexProjects(
       if (!sf) continue;
       indexed.add(rel(f));
       const sites: { start: number; end: number; isNew: boolean }[] = [];
+      /** identifiers at codegraph's reference sites in this file (refs) */
+      const fileRefs = refs?.get(rel(f));
+      const refSites: { start: number; end: number }[] = [];
       /** classes/interfaces with bases: positions of their name, each base's name, each member's name */
       const types: { at: number; bases: number[]; members: number[] }[] = [];
       const baseName = (t: TsNode) => heritageName(sf.text, t);
@@ -421,6 +454,10 @@ export async function indexProjects(
           if (e && e.kind === K.PropertyAccessExpression) e = e.name;
           if (e && NAMES.has(e.kind)) sites.push({ start: ts.skipTrivia(sf.text, e.pos), end: e.end, isNew: n.kind === K.NewExpression });
         }
+        if (fileRefs && n.kind === K.Identifier) {
+          const start = ts.skipTrivia(sf.text, n.pos);
+          if (fileRefs.has(lineOf(starts(f, sf.text), start) + 1)) refSites.push({ start, end: n.end });
+        }
         const body = FUNCTION_LIKE.has(n.kind);
         if (body) local++;
         n.forEachChild(visit);
@@ -432,6 +469,7 @@ export async function indexProjects(
       // One round trip per file: call sites first, then the types' names, bases and members.
       const positions = sites.map(s => s.start);
       for (const t of types) positions.push(t.at, ...t.bases, ...t.members);
+      positions.push(...refSites.map(r => r.start));
       positions.push(...declared);
       const symbols = positions.length ? checker.getSymbolAtPosition(f, positions) : [];
       sites.forEach((site, i) => {
@@ -465,6 +503,12 @@ export async function indexProjects(
         }
       }
       if (rels.length) implementations.set(rel(f), rels);
+      for (const r of refSites) {
+        const s = symbols[i++];
+        if (!s) continue;
+        const range = span(f, sf.text, r.start, r.end);
+        for (const symbol of new Set(referencedAs(s))) occ.push({ range, symbol, roles: 0 });
+      }
       // Define everything another file could call, not just what was referenced: a
       // partial run replaces this document while unchanged files still call into it,
       // and a changed file may start calling what nothing called before. (A local is
@@ -543,17 +587,34 @@ export async function indexProjects(
   return { warnings, documents: indexed.size };
 }
 
+/** A `--refs` list as path → lines; a missing file is no sites (the merge then judges no references). */
+function readRefs(file: string): Map<string, Set<number>> {
+  const out = new Map<string, Set<number>>();
+  let text = '';
+  try { text = fs.readFileSync(file, 'utf8'); } catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err; }
+  for (const l of text.split('\n')) {
+    const [p, line] = l.split('\t');
+    if (!p || !line) continue;
+    let lines = out.get(p);
+    if (!lines) out.set(p, (lines = new Set()));
+    lines.add(Number(line));
+  }
+  return out;
+}
+
 if (require.main === module) {
   const args = process.argv.slice(2);
   const onlyAt = args.indexOf('--only');
   const onlyList = onlyAt >= 0 ? args.splice(onlyAt, 2)[1] : undefined;
+  const refsAt = args.indexOf('--refs');
+  const refsList = refsAt >= 0 ? args.splice(refsAt, 2)[1] : undefined;
   const [tsDir, output, root, ...configs] = args;
-  if (!tsDir || !output || !root || (onlyAt >= 0 && !onlyList)) {
-    process.stderr.write('usage: tsgo-index <typescript package dir> <output> <root> [--only <file with one path per line>] [<tsconfig>...]\n');
+  if (!tsDir || !output || !root || (onlyAt >= 0 && !onlyList) || (refsAt >= 0 && !refsList)) {
+    process.stderr.write('usage: tsgo-index <typescript package dir> <output> <root> [--only <file with one path per line>] [--refs <file with path<TAB>line<TAB>name lines>] [<tsconfig>...]\n');
     process.exit(2);
   }
   const only = onlyList ? new Set(fs.readFileSync(onlyList, 'utf8').split('\n').filter(Boolean)) : undefined;
-  indexProjects(path.resolve(tsDir), path.resolve(output), path.resolve(root), configs.map(c => path.resolve(root, c)), only)
+  indexProjects(path.resolve(tsDir), path.resolve(output), path.resolve(root), configs.map(c => path.resolve(root, c)), only, refsList ? readRefs(refsList) : undefined)
     .then(({ warnings, documents }) => {
       for (const w of warnings) process.stderr.write(`${RUN_WARNING}${w}\n`);
       if (documents === 0 && !only) {

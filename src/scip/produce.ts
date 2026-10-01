@@ -23,6 +23,7 @@ import * as path from 'path';
 import type { SqliteDatabase } from '../db/sqlite-adapter';
 import type { MergeScope } from './index';
 import { Compactor } from './compact';
+import { parseSiteKey, referenceSites } from './sites';
 import { INDEXERS, IndexerRun, RUN_WARNING, ResolvedIndexer, resolveIndexer } from './indexers';
 import {
   ROLE_DEFINITION, ScipDecodeError, ScipDocument, decodeScipIndex, encodeDocument, encodeMetadata, loadScipIndex,
@@ -119,8 +120,12 @@ export async function produceIndex(
   fs.mkdirSync(path.dirname(final), { recursive: true }); // adapters may write helper files beside the output
   const indexer = resolveIndexer(projectRoot, lang, raw);
   if ('skip' in indexer) return { status: 'skipped', lang, reason: indexer.skip };
+  // codegraph's references: compaction keeps the SCIP references there, and tsgo-index
+  // (which resolves only what the merge reads) is told where they are.
+  const refs = referenceSites(db);
+  writeReferenceSites(`${raw}.refs`, refs);
   if (opts.incremental) {
-    const patched = await patchIndex(db, projectRoot, lang, indexer, raw, opts);
+    const patched = await patchIndex(db, projectRoot, lang, indexer, raw, opts, refs);
     if (patched) return patched;
   }
 
@@ -173,7 +178,7 @@ export async function produceIndex(
     for (const f of failures) warnings.push(`${f} — its files stay heuristic-only`);
 
     // Compact while combining: one part in memory at a time (see compact.ts).
-    const compact = new Compactor(projectRoot, lang);
+    const compact = new Compactor(projectRoot, lang, refs);
     try {
       for (const p of parts) compact.add(fs.readFileSync(p));
     } catch (err) {
@@ -195,6 +200,7 @@ export async function produceIndex(
     return { status: 'installed', lang, documents: compact.paths.length, resolvedCalls, durationMs, warnings };
   } finally {
     for (const r of all(runs)) fs.rmSync(r.output, { force: true });
+    fs.rmSync(`${raw}.refs`, { force: true });
   }
 }
 
@@ -205,7 +211,8 @@ export async function produceIndex(
  * full run instead.
  */
 async function patchIndex(
-  db: SqliteDatabase, projectRoot: string, lang: ScipLanguage, indexer: ResolvedIndexer, raw: string, opts: ProduceOptions
+  db: SqliteDatabase, projectRoot: string, lang: ScipLanguage, indexer: ResolvedIndexer, raw: string, opts: ProduceOptions,
+  refs: Set<string>
 ): Promise<ProduceResult | null> {
   const final = indexPath(projectRoot, lang);
   const previous = readMeta(projectRoot, lang);
@@ -278,7 +285,7 @@ async function patchIndex(
       docs.set(d.relativePath, d);
       defines(d);
     }
-    const compact = new Compactor(projectRoot, lang);
+    const compact = new Compactor(projectRoot, lang, refs);
     compact.add(Buffer.concat([encodeMetadata(tool), ...[...docs.values()].map(d => encodeDocument(d, s => Buffer.from(s)))]));
     const resolvedCalls = compact.resolvedCalls();
     if (!opts.force && previous.resolvedCalls !== undefined && resolvedCalls < previous.resolvedCalls * (1 - MAX_RESOLUTION_DROP)) {
@@ -298,6 +305,13 @@ async function patchIndex(
     const dir = path.dirname(raw);
     for (const f of fs.readdirSync(dir)) if (f === path.basename(raw) || f.startsWith(`${path.basename(raw)}.`)) fs.rmSync(path.join(dir, f), { force: true });
   }
+}
+
+/** The reference sites as tsgo-index's `--refs` list: `path<TAB>line<TAB>name` per line (1-based lines). */
+function writeReferenceSites(file: string, refs: Set<string>): void {
+  const out: string[] = [];
+  for (const k of refs) { const { source, line, name } = parseSiteKey(k); out.push(`${source}\t${line}\t${name}`); }
+  fs.writeFileSync(file, out.join('\n'));
 }
 
 /**

@@ -231,9 +231,10 @@ describe('typescript adapter: tsgo when installed', () => {
     if ('skip' in r) throw new Error(r.skip);
     expect(r.cmd).toBe(process.execPath);
     expect(r.runs).toHaveLength(1);
-    const [script, tsDir, output, root, ...configs] = r.runs[0]!.args;
+    const [script, tsDir, output, root, refsFlag, refs, ...configs] = r.runs[0]!.args;
     expect(path.basename(script!)).toBe('tsgo-index.js');
     expect([tsDir, output, root]).toEqual([path.join(dir, 'node_modules', 'typescript'), out, dir]);
+    expect([refsFlag, refs]).toEqual(['--refs', `${out}.refs`]); // written by produce.ts
     expect(configs.sort()).toEqual(['pkg/jsconfig.json', 'tsconfig.json']);
 
     fs.writeFileSync(path.join(dir, 'codegraph.json'), JSON.stringify({ scip: { typescript: { cmd: process.execPath } } }));
@@ -304,6 +305,32 @@ describe.runIf(TSGO)('incremental reindex (tsgo, through the CLI)', () => {
     fs.symlinkSync(TSGO!, path.join(dir, 'node_modules', 'typescript')); // what the adapter looks for first
   });
   afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  it('judges codegraph\'s references, in a full run and a patch: a lib type read as a project enum member is removed, a type annotation verified', async () => {
+    const refs = async () => {
+      const cg = await CodeGraph.open(dir);
+      try {
+        return cg.scipReadDb().prepare(`SELECT DISTINCT s.name || '->' || t.qualified_name || ':' || e.line || ':' || IFNULL(e.provenance, '-') AS e
+          FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+          WHERE e.kind = 'references' AND s.file_path = 'src/saver.ts' ORDER BY 1`).all().map(r => (r as { e: string }).e);
+      } finally {
+        cg.close();
+      }
+    };
+    const saver = 'import { Shape2 } from "./kinds";\nexport function save(b: Blob): Blob { return b; }\nexport function use(s: Shape2): Shape2 { return s; }\n';
+    fs.writeFileSync(path.join(dir, 'src', 'kinds.ts'), 'export enum Kind { Blob, Other }\nexport interface Shape2 { x: number }\n');
+    fs.writeFileSync(path.join(dir, 'src', 'saver.ts'), saver);
+    cli('init', '-y', dir);
+    expect(await refs()).toContain('save->Kind::Blob:2:-'); // the heuristic's guess by name
+    // produce.ts hands tsgo-index the reference sites (--refs) and compaction keeps its references there.
+    cli('scip', 'index', dir, '--lang', 'typescript');
+    expect(await refs()).toEqual(['use->Shape2:3:scip']); // `Blob` is lib.dom's
+    fs.writeFileSync(path.join(dir, 'src', 'saver.ts'), `// moved\n${saver}`);
+    cli('sync', dir);
+    slowFullRun();
+    expect(cli('scip', 'index', dir, '--lang', 'typescript', '--changed')).toMatch(/patched|re-indexing/);
+    expect(await refs()).toEqual(['use->Shape2:4:scip']);
+  }, 120_000);
 
   it('re-indexes only the edited file (and its importers), splicing it into the installed index', async () => {
     fs.writeFileSync(path.join(dir, 'src', 'spare.ts'), 'export function spare(): number {\n  return 0;\n}\n'); // called by nothing yet

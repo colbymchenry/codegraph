@@ -84,7 +84,7 @@ On vscode (94 projects, 13.8k files) it indexes in 82 s instead of scip-typescri
 - A project that still fails is reported as a warning, and its files stay heuristic-only. The run fails only if everything fails.
 - `NODE_OPTIONS` with a heap, or `scip.typescript.env`, overrides the heap defaults. `{args}` / `{out}` in an override apply per run.
 
-**Compact indexes.** Parts are combined through a compaction pass (`src/scip/compact.ts`) before install. It keeps definitions of callables and types, and references that read as a call, `new` or struct literal. Locals, parameters, type annotations and imports are dropped. On vscode the index went from 1,103 MB to 176 MB, and the merge's decode from 6.5 s to 0.9 s. The result is still a standard SCIP file. The merge re-checks every call shape against the (hash-gated, identical) source, so compaction changes size and speed, never an outcome. `scip import` compacts too.
+**Compact indexes.** Parts are combined through a compaction pass (`src/scip/compact.ts`) before install. It keeps definitions of callables and types, references that read as a call, `new` or struct literal, and any reference at a site where codegraph has a `references` edge (same file, line and name; see below). Other locals, parameters, type annotations and imports are dropped. On vscode the index went from 1,103 MB to 176 MB, and the merge's decode from 6.5 s to 0.9 s. The result is still a standard SCIP file. The merge re-checks every call shape against the (hash-gated, identical) source, so compaction changes size and speed, never an outcome. `scip import` compacts too.
 
 **Python environments.** A `.venv/` or `venv/` (with `pyvenv.cfg`) is activated for the indexer (`VIRTUAL_ENV`, `PATH`). Its packages are passed to scip-python as an `--environment` manifest read from `*.dist-info/RECORD`, so uv venvs without `pip` work. Without a venv the manifest is empty and `scip index` warns. Project code still resolves; calls into dependencies don't.
 
@@ -153,6 +153,25 @@ Indexers record implementation relationships: class → base class or interface,
 The eval gates are unchanged on all four languages.
 
 MCP output: Flow steps read `↓ calls (compiler-verified)` or `(unverified: …)`. Trail entries get ` [unverified]`.
+
+### `references` edges
+
+codegraph's `references` edges (a type annotation, a value read, a function passed by name) are judged at their own site: the file, line and target name. Unlike calls, they are only verified or deleted, never inserted, since SCIP would add one for every type annotation codegraph left out. A site's key is the file rather than the caller node, which also covers sources like an interface's property that a caller lookup doesn't name.
+
+- **Which references the index keeps.** `produce.ts` reads the sites of codegraph's `references` edges from the graph before indexing. Compaction keeps the indexer's references there and nowhere else, so the index grows by what gets judged (Playwright: 20.0 → 27.9 MB).
+- **tsgo-index** resolves only what the merge reads, so it is told where those sites are (`--refs`, written beside the output) and resolves every identifier on those lines in the same batched call as the call sites. Every identifier, not just the target's name, because an import alias (`Node as SyntaxNode`) names its target differently. A name that is both a type and a value (`interface IFoo` merged with `const IFoo`) yields both symbols, and a global interface the project augments (`declare global { interface Window … }`) yields the project's declarations as well as the lib's.
+- **Verdicts.** Resolved to the edge's target: verified. Resolved to another node, or outside the project (a lib type such as `Blob` read by name as a project enum member): deleted. Resolved to a project symbol with no node (an object-literal property in `{ handler }`, a parameter): unknown, the edge stays unverified. A transient symbol with no declaration (`net.Socket` from `@types/node`) gets no symbol and stays unverified.
+
+Judged against scip-typescript (`scripts/scip-eval/references.ts`; the judge counts an edge right when one of its references there is defined in the target node):
+
+| corpus | precision before → after | verified | deleted |
+|---|---|---|---|
+| Playwright | 91.4% → 97.5% | 26,949 of 32,036 | 2,358 (judged: 1,704 wrong, 0 right; the rest unjudged) |
+| codegraph | 99.2% → 99.6% | 6,630 of 9,920 | 43 (judged: 2 wrong, 0 right) |
+
+Other languages have no independent judge in the eval, so only the merge's counts (own indexer): Django 8,724 verified and 911 deleted of 11,646; cobra 217 and 23 of 339; ripgrep 1,352 and 984 of 2,731. ripgrep's deletions sampled: `Result` linked by name to `ignore`'s type alias where rust-analyzer has `core::result::Result`, `Stats` to a flags struct instead of the printer's, a trait's associated `Error` to globset's. The eval gates (calls) are unchanged on all four languages.
+
+Most remaining "wrong" on Playwright are shorthand properties (`{ queryAll }`): the judge names the object literal's property, codegraph the function passed, which is arguably right.
 
 ### Why edges stay unverified
 
@@ -273,5 +292,5 @@ Known residue: ripgrep's multi-line `const X: T = T { … }` items. codegraph at
 - Phase 3 (Go) and Phase 4 (Rust): done.
 - TS/JS via tsgo (TypeScript ≥ 7.1): done; preferred over scip-typescript when installed.
 - Incremental reindex for tsgo and scip-python indexes: done.
-- Phase 5: `implements`/`extends` and calls through interfaces from SCIP relationships: done (Rust excluded: rust-analyzer emits no relationships). `references` edges were not needed for the gaps found and are not done.
+- Phase 5: `implements`/`extends` and calls through interfaces from SCIP relationships: done (Rust excluded: rust-analyzer emits no relationships). `references` edges: verified or deleted at their own site (see "`references` edges").
 - Next: [`docs/scip-roadmap.md`](docs/scip-roadmap.md).

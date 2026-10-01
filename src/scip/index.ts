@@ -17,7 +17,7 @@ import { Compactor } from './compact';
 import { languageOfTool } from './indexers';
 import { MergeOutcome, markStaleForFiles, merge } from './merge';
 import { ROLE_DEFINITION, ScipDocument, loadScipIndex, scanIndex } from './reader';
-import { heuristicSites, scipSites } from './sites';
+import { heuristicSites, referenceSites, scipSites } from './sites';
 import {
   MergedDocument, ScipLanguage, SCIP_LANGUAGES, availableIndexes, indexPath,
   indexedHashes, installIndex, mergedDocumentCounts, readHashed, recordMergedDocuments,
@@ -118,9 +118,10 @@ function pass(db: SqliteDatabase, projectRoot: string, installed: ReturnType<typ
   // Definitions, implementations and the hash gate stay whole-index: they are what a
   // site's verdict reads. Only which sites get (re-)judged narrows.
   const judged = scope ? affectedFiles(db, indexes, scope, staleDocuments) : null;
-  const scip = scipSites(db, indexes, fresh, judged ?? undefined);
+  const judgedFiles = judged ? [...fresh.keys()].filter(f => judged.has(f)) : [...fresh.keys()];
+  const scip = scipSites(db, indexes, fresh, judged ?? undefined, referenceSites(db, judgedFiles));
   lap('scipSites');
-  const heuristic = heuristicSites(db, judged ? [...fresh.keys()].filter(f => judged.has(f)) : fresh.keys());
+  const heuristic = heuristicSites(db, judgedFiles);
   lap('heuristicSites');
   const outcome = db.transaction(() => {
     const o = merge(db, scip, heuristic, new Set(fresh.keys()), judged ?? undefined);
@@ -187,7 +188,7 @@ export function onSynced(db: SqliteDatabase, projectRoot: string, changedFiles: 
  * edited and reverted before the import still counts — its bytes match.
  */
 export function importScipFile(
-  projectRoot: string, file: string, lang?: ScipLanguage
+  projectRoot: string, file: string, lang?: ScipLanguage, refs?: Set<string>
 ): { lang: ScipLanguage; documents: number; newerThanIndex: string[] } {
   const builtAt = fs.statSync(file).mtimeMs;
   const bytes = fs.readFileSync(file);
@@ -196,7 +197,7 @@ export function importScipFile(
   if (!resolved) {
     throw new Error(`can't tell which language ${file} covers (tool "${toolName}") — pass --lang (${SCIP_LANGUAGES.join('|')})`);
   }
-  const compact = new Compactor(projectRoot, resolved);
+  const compact = new Compactor(projectRoot, resolved, refs);
   compact.add(bytes);
   if (compact.paths.length === 0) throw new Error(`${file} has no documents — the indexer failed or this is not a SCIP index`);
   const hashes: Record<string, string> = {};

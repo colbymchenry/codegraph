@@ -13,11 +13,12 @@ export type LiteralShape = (tail: string, head: string) => boolean;
 export type CallShape = 'call' | 'new' | 'literal';
 
 /**
- * What a site is about: a call, an instantiation, or (`inherits`) a type's
+ * What a site is about: a call, an instantiation, (`inherits`) a type's
  * `implements`/`extends` edge — one key kind for both, since codegraph and the
- * compiler may label the same base differently (`class A implements B` with B a class).
+ * compiler may label the same base differently (`class A implements B` with B a class)
+ * — or a `references` edge (a type annotation, a value read, a function passed by name).
  */
-export type SiteKind = 'calls' | 'instantiates' | 'inherits';
+export type SiteKind = 'calls' | 'instantiates' | 'inherits' | 'references';
 
 /** Symbol kinds a call can target: types (instantiated), methods and values (called). */
 export function isCallTarget(kind: DescriptorKind | undefined): boolean {

@@ -17,7 +17,9 @@
 # language's indexer (FORK.md "Using it"), and npx for the TypeScript judge.
 # TS corpora are judged by scip-typescript's index (an independent compiler,
 # run through the fork's own adapter); the others by their own indexer's.
-# Output: $SCIP_EVAL_DIR/out/<corpus>.log and <corpus>-seed<N>.json.
+# TS corpora also get references.ts: the precision of every `references` edge,
+# before and after the merge, against the same judge.
+# Output: $SCIP_EVAL_DIR/out/<corpus>.log, <corpus>-seed<N>.json and <corpus>-references.json.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -83,6 +85,14 @@ run() {
       const f = m => { const x = j.rows.find(r => r.method === m); return `${Math.round(x.recall * 100)}% / ${x.precision === null ? "-" : Math.round(x.precision * 100) + "%"}`; };
       console.log(`  seed ${j.seed}: ${j.rows.map(r => `${r.method} ${f(r.method)}`).join(" | ")}`);' "$OUT/$name-seed$s.json"
   done
+
+  if [ "$judge" = scip-typescript ]; then
+    (cd "$ROOT" && npx tsx scripts/scip-eval/references.ts "$dir" "$index" --graph "codegraph=$heuristic" --graph "codegraph+SCIP=$merged" \
+      --json 2>>"$log") >"$OUT/$name-references.json"
+    node -e '
+      const j = require(process.argv[1]);
+      console.log(`  references: ${j.rows.map(r => `${r.graph} ${r.precision === null ? "-" : (100 * r.precision).toFixed(1) + "%"} (${r.right + r.wrong} judged)`).join(" | ")}`);' "$OUT/$name-references.json"
+  fi
 }
 
 want=("$@")

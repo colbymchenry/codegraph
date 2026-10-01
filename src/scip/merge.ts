@@ -20,7 +20,7 @@
  */
 
 import type { SqliteDatabase } from '../db/sqlite-adapter';
-import { EXTERNAL, HeuristicSites, ScipSites, parseSiteKey, siteKey, siteKindOfEdge } from './sites';
+import { EXTERNAL, HeuristicSites, ScipSites, parseSiteKey, referenceKey, siteKey, siteKindOfEdge } from './sites';
 
 export interface MergeOutcome {
   agree: number;
@@ -115,7 +115,9 @@ export function merge(
     }
     const { source, line, kind } = parseSiteKey(key);
     let added = 0;
-    for (const { target, col, edgeKind = kind } of resolved.values()) {
+    // A `references` site is keyed by file (sites.ts referenceKey): its edges are verified or
+    // removed, never inserted — SCIP would add one per type annotation codegraph left out.
+    for (const { target, col, edgeKind = kind } of kind === 'references' ? [] : resolved.values()) {
       if (target === EXTERNAL || hs?.has(target)) continue;
       const k = edgeKey(source, target, edgeKind, line);
       if (existing.has(k)) continue;
@@ -179,7 +181,8 @@ function reconcileScipEdges(db: SqliteDatabase, scip: ScipSites, freshFiles: Set
   const drop: number[] = [];
   const stale: number[] = [];
   for (const r of rows) {
-    const key = r.line === null ? null : siteKey(r.source, r.line, r.name, siteKindOfEdge(r.kind));
+    const key = r.line === null ? null
+      : r.kind === 'references' ? referenceKey(r.src_file, r.line, r.name) : siteKey(r.source, r.line, r.name, siteKindOfEdge(r.kind));
     if (key && (scip.sites.get(key)?.has(r.target) || scip.dispatch.get(key)?.has(r.target))) {
       keep.push(r.id);
       kept.add(edgeKey(r.source, r.target, r.kind, r.line!));

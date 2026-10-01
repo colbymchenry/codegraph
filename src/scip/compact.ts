@@ -5,7 +5,9 @@
  * annotations, imports, namespaces. The merge needs two things: definitions
  * of callables and types (to map symbols onto codegraph nodes, and to tell a
  * project symbol from an external one), and references that read as a call,
- * `new`, or struct literal. Everything else is dropped. The result is still a
+ * `new`, or struct literal — and, of the rest, those at a site where codegraph
+ * has a `references` edge (`refs`, sites.ts referenceSites), which the merge
+ * judges too. Everything else is dropped. The result is still a
  * standard SCIP index, a fraction of the size, and it decodes in a fraction of
  * the time on every later merge. Implementation relationships between those
  * symbols (class → base, method → the method it implements) are kept too. The merge re-checks the call shape against
@@ -21,6 +23,7 @@ import { pathToFileURL } from 'url';
 import { INDEXERS } from './indexers';
 import { IndexMeta, ParsedSymbol, ROLE_DEFINITION, ScipOccurrence, encodeDocument, encodeMetadata, parseSymbol, scanIndex } from './reader';
 import type { ScipLanguage } from './store';
+import { referenceKey } from './sites';
 import { callShape, isCallTarget, siteKind } from './syntax';
 
 export class Compactor {
@@ -34,7 +37,7 @@ export class Compactor {
   private symbols = new Map<string, Buffer>();
   private chunks: Buffer[] = [];
 
-  constructor(private readonly projectRoot: string, private readonly lang: ScipLanguage) {}
+  constructor(private readonly projectRoot: string, private readonly lang: ScipLanguage, private readonly refs?: Set<string>) {}
 
   /** Adds one indexer output. A file already added (overlapping projects) keeps its first document. */
   add(index: Buffer): void {
@@ -45,7 +48,16 @@ export class Compactor {
       const lines = readLines(path.join(this.projectRoot, doc.relativePath));
       const kept: ScipOccurrence[] = [];
       for (const o of doc.occurrences) {
-        const kind = this.parse(o.symbol)?.last.kind; // undefined for locals
+        const parsed = this.parse(o.symbol); // null for locals
+        if (this.refs && parsed && !(o.roles & ROLE_DEFINITION)
+          && this.refs.has(referenceKey(doc.relativePath, o.range.startLine + 1, parsed.last.name))) {
+          kept.push(o); // judged as a reference whatever its shape; counted below if it is also a call
+          if (isCallTarget(parsed.last.kind) && lines && siteKind(parsed.last.kind, () => callShape(o, doc.positionEncoding, lines, literal))) {
+            this.callRefs.set(o.symbol, (this.callRefs.get(o.symbol) ?? 0) + 1);
+          }
+          continue;
+        }
+        const kind = parsed?.last.kind;
         if (!isCallTarget(kind)) continue;
         if (o.roles & ROLE_DEFINITION) {
           kept.push(o);
