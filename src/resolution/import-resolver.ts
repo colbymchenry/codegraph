@@ -2014,7 +2014,9 @@ function resolvePythonModuleMember(
     // kinds keep the single-member lookup below.
     if (ref.referenceKind === 'calls' && rest.length > 1) {
       while (rest.length > 1) {
-        const sub = moduleFile(`${modulePath}.${rest[0]}`, resolvedPath);
+        // `modulePath` is spelled from the importer (`.utils.helpers`), so it
+        // resolves from there, not from the module file just reached.
+        const sub = moduleFile(`${modulePath}.${rest[0]}`, ref.filePath);
         if (!sub) break;
         modulePath = `${modulePath}.${rest.shift()}`;
         resolvedPath = sub;

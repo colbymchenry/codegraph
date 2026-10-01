@@ -7704,7 +7704,13 @@ export function matchMethodCall(
   const [, objectOrClass, methodName] = match;
   // A simple `receiver.method` / `receiver:method` / `receiver$method` shape whose
   // receiver type we can try to infer from its local declaration.
-  const inferableReceiver = dotMatch || luaColonMatch || rDollarMatch;
+  // A python attribute receiver (`self.conn`, `cfg.client`) is not one: the
+  // python branch below owns it, and the shared inferrer would answer first by
+  // the assignment's leading name — `self.conn = Pool().acquire()` read as a
+  // `Pool`, `Session` read as the project's class under `from requests import
+  // Session` — skipping that branch's whole-value, rebinding and import checks.
+  const pythonAttrReceiver = ref.language === 'python' && !!dotMatch && objectOrClass!.includes('.');
+  const inferableReceiver = (dotMatch || luaColonMatch || rDollarMatch) && !pythonAttrReceiver;
 
   // Infer the receiver's type from its local declaration/initializer in the
   // enclosing scope, then resolve the method on that type (#1108). C++ keeps its
@@ -7858,7 +7864,7 @@ export function matchMethodCall(
   // this path accepts is the type the class body gives the attribute. A dotted
   // MODULE path (`pkg.mod.func()`) never gets here: import resolution claims it
   // first, through the module the import names.
-  if (ref.language === 'python' && dotMatch && objectOrClass!.includes('.')) {
+  if (pythonAttrReceiver) {
     return matchPythonAttrCall(objectOrClass!, methodName!, ref, context);
   }
 
@@ -8394,6 +8400,55 @@ function pythonJoinedValue(lines: string[], ln: number, first: string, lastLine:
 }
 
 /**
+ * The names `value` calls as a whole expression or conditional arm —
+ * `Client(...)`, `make()` — whose local rebinding would make the evidence
+ * wrong.
+ */
+function pythonValueCallees(value: string): string[] {
+  const arms = pythonConditionalArms(value.trim());
+  if (arms) return arms.flatMap(pythonValueCallees);
+  const shape = pythonExprShape(value.trim().replace(/^await\s+/, ''));
+  const call = shape && /^([A-Za-z_][\w.]*) ?\(\)$/.exec(shape);
+  return call ? [call[1]!] : [];
+}
+
+/**
+ * Whether `name` is rebound inside the `def` on line `defLine`, before line
+ * `upto` — a parameter (unless `params` is false), an assignment, a loop /
+ * `with` / `except` / import target — so a call spelled `name(...)` there is
+ * NOT the module's class or function of that name, and a parameter read there
+ * no longer holds what its annotation says. `Signer = import_string(backend);
+ * return Signer()` constructs whatever the setting names, not the `Signer`
+ * class beside it.
+ */
+function pythonBoundInDef(lines: string[], defLine: number, upto: number, name: string, params = true): boolean {
+  const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  let header = '';
+  let ln = defLine;
+  for (; ln <= upto && ln <= lines.length; ln++) {
+    header += ' ' + (lines[ln - 1] ?? '').trim();
+    if (/\)\s*(?:->[^:]*)?:\s*$/.test(header)) break;
+  }
+  if (params) {
+    const list = /\((.*)\)/.exec(header)?.[1] ?? '';
+    const paramNames = list.split(',').map((p) => p.trim().replace(/^\*{1,2}/, '').split(/[:=]/)[0]!.trim());
+    if (paramNames.includes(name)) return true;
+  }
+  const rebinds = [
+    new RegExp(`^(?:[\\w\\s,*()\\[\\]]*[\\s,(\\[*])?${n}(?:\\s*,[\\w\\s,*()\\[\\]]*)?\\s*(?::[^=]+)?(?:[-+*/%&|^@]|//|\\*\\*|>>|<<)?=(?!=)`),
+    new RegExp(`^(?:async\\s+)?for\\s+[\\w\\s,()]*\\b${n}\\b[\\w\\s,()]*\\bin\\b`),
+    new RegExp(`\\bas\\s+\\(?\\s*${n}\\b`),
+    new RegExp(`^(?:from\\s+\\S+\\s+)?import\\b.*\\b${n}\\b`),
+    new RegExp(`\\(\\s*${n}\\s*:=`),
+  ];
+  for (let k = ln + 1; k < upto; k++) {
+    const text = (lines[k - 1] ?? '').trim();
+    if (text && rebinds.some((r) => r.test(text))) return true;
+  }
+  return false;
+}
+
+/**
  * What `owner`'s body says `attr` holds: a class-level declaration
  * (`registry = Registry()`, `conn: Client`) or an assignment through `self` /
  * `cls` (`self.cap = Capture()`, `self.cap: Capture`, `self.cap = cap` with
@@ -8417,6 +8472,7 @@ function pythonAttrEvidence(owner: Node, attr: string, context: ResolutionContex
   const classLevel = new RegExp(`^${a}\\s*(?::\\s*([^=]+?))?\\s*(?:=\\s*(.+?))?\\s*$`);
   const viaSelf = new RegExp(`\\b(?:self|cls)\\.${a}\\s*(?::\\s*([^=]+?))?\\s*(?:=(?!=)\\s*(.+?))?\\s*$`);
   let signature: string | null = null;
+  let defStart = -1;
   const found = new Set<string>();
 
   for (let ln = owner.startLine + 1; ln <= owner.endLine; ln++) {
@@ -8427,6 +8483,7 @@ function pythonAttrEvidence(owner: Node, attr: string, context: ResolutionContex
     const text = line.trim();
     if (/^(?:async\s+)?def\s/.test(text)) {
       // The enclosing method's signature, possibly over several lines.
+      defStart = ln;
       signature = text;
       for (let k = ln; k < owner.endLine && !/\)\s*(?:->[^:]*)?:\s*$/.test(signature); k++) {
         signature += ' ' + (lines[k] ?? '').trim();
@@ -8435,15 +8492,27 @@ function pythonAttrEvidence(owner: Node, attr: string, context: ResolutionContex
     }
     const m = indent(line) === bodyIndent ? classLevel.exec(text) : viaSelf.exec(text);
     if (!m || (!m[1] && !m[2])) continue;
+    const inDef = indent(line) !== bodyIndent && defStart > 0;
+    const at = ln;
     let value = m[2];
     if (!m[1] && value) {
       const joined = pythonJoinedValue(lines, ln, value, owner.endLine);
       value = joined.text;
       ln = joined.end;
     }
+    // A value read through a name the method rebinds first — `Backend =
+    // load(); self.b = Backend()`, or `box = wrap(box); self.box = box` for a
+    // `box: Box` parameter — is not what the module's class or the annotation
+    // says. That statement is no evidence.
+    if (!m[1] && inDef) {
+      const v = value!.trim();
+      const reads = pythonValueCallees(v).map((c) => c.split('.')[0]!);
+      if (reads.some((c) => pythonBoundInDef(lines, defStart, at, c))) continue;
+      if (/^[A-Za-z_]\w*$/.test(v) && pythonBoundInDef(lines, defStart, at, v, false)) continue;
+    }
     const ev = m[1]
       ? pythonAnnotationEvidence(m[1])
-      : pythonValueEvidence(value!, indent(line) === bodyIndent ? null : signature);
+      : pythonValueEvidence(value!, inDef ? signature : null);
     if (ev) found.add(ev === 'runtime' ? '' : ev.type);
   }
   if (found.size !== 1) return null;
