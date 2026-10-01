@@ -38,6 +38,8 @@ export interface ScipMeta {
   hashes: Record<string, string>;
   /** the regression guard's baseline — see produce.ts */
   resolvedCalls?: number;
+  /** how long the last full run took (indexer runs + compaction), ms: what a patch's estimate is weighed against */
+  fullRunMs?: number;
 }
 
 export function scipDir(projectRoot: string): string {

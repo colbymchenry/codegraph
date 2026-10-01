@@ -59,7 +59,7 @@ export interface ProduceOptions {
   incremental?: boolean;
 }
 
-/** Most files a patch re-indexes; beyond this a full run is cheaper to trust. */
+/** Most files a patch re-indexes, however cheap it looks; beyond this a full run is easier to trust. */
 export const MAX_INCREMENTAL_FILES = 500;
 
 export interface IncrementalPlan {
@@ -67,6 +67,10 @@ export interface IncrementalPlan {
   files: string[];
   /** files the installed index covers that codegraph no longer has */
   deleted: string[];
+  /** the adapter's units covering `files` (IndexerSpec.patch.units) */
+  units: string[];
+  /** the planner's estimate for re-indexing `units`, ms */
+  estimateMs: number;
 }
 
 /**
@@ -74,9 +78,10 @@ export interface IncrementalPlan {
  * differs from the snapshot (edited or new) and, because their calls into an
  * edited file may now resolve differently, the files importing one; plus files
  * that are gone. Null when only a full run will do — no snapshot, an index
- * built by a tool the language can't patch (IndexerSpec.patch), or too many
- * changes. Deeper effects (a type changing two imports away) wait for
- * the next full run.
+ * built by a tool the language can't patch (IndexerSpec.patch), more than
+ * MAX_INCREMENTAL_FILES files, or an estimate of at least half the last full
+ * run (a patch that slow buys little). Deeper effects (a type changing two
+ * imports away) wait for the next full run.
  */
 export function incrementalPlan(db: SqliteDatabase, projectRoot: string, lang: ScipLanguage): IncrementalPlan | null {
   const meta = readMeta(projectRoot, lang);
@@ -92,8 +97,12 @@ export function incrementalPlan(db: SqliteDatabase, projectRoot: string, lang: S
     JOIN edges e ON e.target = t.id AND e.kind = 'imports' JOIN nodes s ON s.id = e.source WHERE t.file_path = ?`);
   for (const c of changed) for (const { p } of importers.all(c) as { p: string }[]) if (current.has(p)) files.add(p);
   const deleted = Object.keys(meta.hashes).filter(p => !current.has(p));
-  if (files.size > (patch.maxFiles ?? MAX_INCREMENTAL_FILES)) return null;
-  return { files: [...files].sort(), deleted };
+  if (files.size > MAX_INCREMENTAL_FILES) return null;
+  const sorted = [...files].sort();
+  const units = sorted.length ? patch.units(projectRoot, sorted) : [];
+  const estimateMs = Math.ceil(units.length / (patch.parallel ? lightConcurrency() : 1)) * patch.unitSeconds * 1000;
+  if (meta.fullRunMs !== undefined && estimateMs >= meta.fullRunMs / 2) return null;
+  return { files: sorted, deleted, units, estimateMs };
 }
 
 export async function produceIndex(
@@ -174,25 +183,27 @@ export async function produceIndex(
         reason: `resolved calls fell from ${previous} to ${resolvedCalls} (>${MAX_RESOLUTION_DROP * 100}% drop) — kept the previous index; fix the build or pass --force`,
       };
     }
+    const durationMs = Date.now() - started;
     installIndex(projectRoot, lang, f => compact.write(f),
-      { tool: compact.meta!.toolName, toolVersion: compact.meta!.toolVersion, producedAt: started, hashes, resolvedCalls });
-    return { status: 'installed', lang, documents: compact.paths.length, resolvedCalls, durationMs: Date.now() - started, warnings };
+      { tool: compact.meta!.toolName, toolVersion: compact.meta!.toolVersion, producedAt: started, hashes, resolvedCalls, fullRunMs: durationMs });
+    return { status: 'installed', lang, documents: compact.paths.length, resolvedCalls, durationMs, warnings };
   } finally {
     for (const r of all(runs)) fs.rmSync(r.output, { force: true });
   }
 }
 
 /**
- * The incremental path of produceIndex: re-index the plan's files with
- * tsgo-index `--only`, splice their documents into the installed index, and
- * install the result under the same guard. Null → do a full run instead.
+ * The incremental path of produceIndex: re-index the plan's units with the
+ * adapter's patch runs (IndexerSpec.patch), splice the plan's documents into the
+ * installed index, and install the result under the same guard. Null → do a
+ * full run instead.
  */
 async function patchIndex(
   db: SqliteDatabase, projectRoot: string, lang: ScipLanguage, indexer: ResolvedIndexer, raw: string, opts: ProduceOptions
 ): Promise<ProduceResult | null> {
   const final = indexPath(projectRoot, lang);
   const patch = INDEXERS[lang].patch;
-  if (!patch || indexer.runs.length !== 1 || !fs.existsSync(final)) return null;
+  if (!patch || !fs.existsSync(final)) return null;
   const plan = incrementalPlan(db, projectRoot, lang);
   const previous = readMeta(projectRoot, lang);
   if (!plan || !previous) return null;
@@ -205,14 +216,15 @@ async function patchIndex(
     if (h) hashes[f] = h;
   }
   const present = Object.keys(hashes); // a file that can't be read now is dropped with the deleted ones
-  const runs = present.length ? patch.runs(indexer.runs[0]!, present, raw) : [];
+  const units = present.length === plan.files.length ? plan.units : present.length ? patch.units(projectRoot, present) : [];
+  const runs = units.length ? patch.runs(indexer.runs, units, raw) : [];
   if (!runs) return null;
   const warnings: string[] = [];
   try {
     let partial: ScipDocument[] = [];
     let tool = { toolName: previous.tool, toolVersion: previous.toolVersion, projectRoot: '' };
     if (runs.length) {
-      opts.log?.(`${lang}: re-indexing ${present.length} changed or dependent file(s)`);
+      opts.log?.(`${lang}: re-indexing ${present.length} changed or dependent file(s) — ${units.length} unit(s), ~${Math.round(plan.estimateMs / 1000)}s`);
       const outputs: string[] = [];
       let failed: string | null = null;
       const one = async (r: IndexerRun) => {
@@ -270,7 +282,7 @@ async function patchIndex(
     for (const f of replaced) delete snapshot[f];
     Object.assign(snapshot, hashes);
     installIndex(projectRoot, lang, f => compact.write(f),
-      { tool: tool.toolName, toolVersion: tool.toolVersion, producedAt: started, hashes: snapshot, resolvedCalls });
+      { tool: tool.toolName, toolVersion: tool.toolVersion, producedAt: started, hashes: snapshot, resolvedCalls, fullRunMs: previous.fullRunMs });
     return {
       status: 'installed', lang, documents: compact.paths.length, resolvedCalls, durationMs: Date.now() - started,
       warnings, incremental: present.length, scope: { files: [...replaced], symbols: [...symbols] },

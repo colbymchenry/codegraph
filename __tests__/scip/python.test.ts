@@ -154,7 +154,9 @@ describe('scip-python adapter', () => {
     const out = path.join(dir, '.codegraph', 'scip', 'out.tmp');
     const r = resolveIndexer(dir, 'python', out);
     if ('skip' in r) throw new Error(r.skip);
-    const runs = pythonIndexer.patch!.runs(r.runs[0]!, ['pkg/a.py', 'pkg/b.py', 'tests/test_a.py'], out)!;
+    const units = pythonIndexer.patch!.units(dir, ['pkg/a.py', 'pkg/b.py', 'tests/test_a.py']);
+    expect(units).toEqual(['pkg', 'tests']);
+    const runs = pythonIndexer.patch!.runs(r.runs, units, out)!;
     expect(runs.map(x => x.args.slice(-2))).toEqual([['--target-only', 'pkg'], ['--target-only', 'tests']]); // a file target omits itself
     expect(runs.map(x => x.args[x.args.indexOf('--output') + 1])).toEqual([`${out}.part0`, `${out}.part1`]);
     expect(runs.every(x => x.light && x.args[0] === '-y')).toBe(true);

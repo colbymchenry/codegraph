@@ -100,14 +100,22 @@ export interface IndexerSpec {
    * Patching an installed index instead of rebuilding it (produce.ts patchIndex).
    * `tools`: whose indexes can be patched — their symbols must be named the same
    * whatever else was indexed, and their documents must define what they declare.
-   * `runs`: the runs re-indexing `files`, derived from the resolved full run; they
-   * may write helper files named `${outFile}.*`. Null → only a full run will do.
+   * The planner (produce.ts incrementalPlan) patches when the estimated time,
+   * ⌈units / parallel runs⌉ × `unitSeconds`, is under half the last full run's.
    */
   patch?: {
     tools: readonly string[];
-    /** most files a patch takes on (default produce.ts MAX_INCREMENTAL_FILES) */
-    maxFiles?: number;
-    runs(full: IndexerRun, files: string[], outFile: string): IndexerRun[] | null;
+    /** the smallest pieces a run re-indexes that cover `files`: a file, its directory, its package, its project */
+    units(projectRoot: string, files: string[]): string[];
+    /** rough seconds to re-index one unit */
+    unitSeconds: number;
+    /** units re-index side by side (light runs) */
+    parallel?: boolean;
+    /**
+     * The runs re-indexing `units`, derived from the resolved full runs; they may
+     * write helper files named `${outFile}.*`. Null → only a full run will do.
+     */
+    runs(full: readonly IndexerRun[], units: string[], outFile: string): IndexerRun[] | null;
   };
 }
 

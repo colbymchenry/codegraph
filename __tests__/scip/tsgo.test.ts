@@ -291,6 +291,12 @@ describe.runIf(TSGO)('incremental reindex (tsgo, through the CLI)', () => {
     }
   };
 
+  /** As if the last full run had taken a minute — a repo big enough for a patch to pay (produce.ts incrementalPlan). */
+  const slowFullRun = () => {
+    const meta = path.join(dir, '.codegraph', 'scip', 'typescript.meta.json');
+    fs.writeFileSync(meta, JSON.stringify({ ...JSON.parse(fs.readFileSync(meta, 'utf8')), fullRunMs: 60_000 }));
+  };
+
   beforeEach(() => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-tsgo-inc-'));
     fs.cpSync(path.join(FIXTURE, 'project'), dir, { recursive: true });
@@ -304,6 +310,7 @@ describe.runIf(TSGO)('incremental reindex (tsgo, through the CLI)', () => {
     cli('init', '-y', dir);
     expect(cli('scip', 'index', dir, '--lang', 'typescript')).not.toMatch(/patched/);
     expect((await edge('sum', 'helper'))?.provenance).toBe('scip');
+    slowFullRun();
 
     fs.appendFileSync(path.join(dir, 'src', 'main.ts'),
       "\nimport { spare } from './spare';\nexport function extra(): number {\n  return helper(3) + spare();\n}\n");
@@ -315,6 +322,18 @@ describe.runIf(TSGO)('incremental reindex (tsgo, through the CLI)', () => {
     expect((await edge('sum', 'helper'))?.provenance).toBe('scip'); // untouched files keep theirs
     expect((await edge('usesOverloads', 'Registry::lookup'))?.provenance).toBe('scip'); // a call into models.ts, which was not re-indexed
     expect(cli('scip', 'index', dir, '--lang', 'typescript', '--changed')).toMatch(/up to date/);
+  }, 60_000);
+
+  it('rebuilds in full when a patch would not save much: its estimate is half the last full run or more', () => {
+    cli('init', '-y', dir);
+    cli('scip', 'index', dir, '--lang', 'typescript'); // the fixture's full run takes well under a second
+    fs.appendFileSync(path.join(dir, 'src', 'main.ts'), '\nexport const x = 1;\n');
+    cli('sync', dir);
+    expect(cli('scip', 'index', dir, '--lang', 'typescript', '--changed')).not.toMatch(/patched/);
+    slowFullRun();
+    fs.appendFileSync(path.join(dir, 'src', 'main.ts'), '\nexport const y = 1;\n');
+    cli('sync', dir);
+    expect(cli('scip', 'index', dir, '--lang', 'typescript', '--changed')).toMatch(/patched: 1 file\(s\) re-indexed/);
   }, 60_000);
 
   it('a repo with no tsconfig is indexed by tsgo, as one inferred program', async () => {
@@ -343,6 +362,7 @@ describe.runIf(TSGO)('incremental reindex (tsgo, through the CLI)', () => {
     fs.writeFileSync(path.join(dir, 'src', 'indirect.ts'), "import { make } from './factory';\nexport function indirect(): number {\n  return make().lookup(1);\n}\n");
     cli('init', '-y', dir);
     cli('scip', 'index', dir, '--lang', 'typescript');
+    slowFullRun();
 
     const models = path.join(dir, 'src', 'models.ts');
     fs.writeFileSync(models, fs.readFileSync(models, 'utf8')

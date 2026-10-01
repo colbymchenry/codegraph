@@ -191,8 +191,10 @@ export const typescriptIndexer: IndexerSpec = {
   },
   patch: {
     tools: ['tsgo-index'],
-    runs(full, files, outFile) {
-      if (path.basename(full.args[0] ?? '') !== 'tsgo-index.js') return null; // only tsgo has a partial mode
+    units: (_root, files) => files, // tsgo-index --only takes files
+    unitSeconds: 0.1,
+    runs([full], files, outFile) {
+      if (!full || path.basename(full.args[0] ?? '') !== 'tsgo-index.js') return null; // only tsgo has a partial mode
       const list = `${outFile}.only`;
       fs.writeFileSync(list, files.join('\n'));
       const args = [...full.args];

@@ -60,8 +60,8 @@ A language adapter (`IndexerSpec`) then only declares its capabilities: detectio
 
 | # | Task | How | Check |
 |---|---|---|---|
-| 2.1 | Indexers declare a re-index unit | `unitOf(file)` (file, directory, package, project or workspace), `runsFor(units)`, rough cost per unit | Unit tests per indexer |
-| 2.2 | Decide patch vs full in one place | The planner maps changed files plus importers to units. Each adapter declares a cost per unit (tsgo ~0.1 s per file, scip-python ~15 s per directory, scip-go per package, measured in 2.3); the index metadata records the last full run's duration. Patch when units × cost < ½ × last full run, never past 500 files | tsgo and Python patch the vscode/Django edits as today; a change too big for a patch falls back to a full run |
+| 2.1 | **Done.** Indexers declare a re-index unit | `unitOf(file)` (file, directory, package, project or workspace), `runsFor(units)`, rough cost per unit | Unit tests per indexer |
+| 2.2 | **Done.** Decide patch vs full in one place | The planner maps changed files plus importers to units. Each adapter declares a cost per unit (tsgo ~0.1 s per file, scip-python ~15 s per directory, scip-go per package, measured in 2.3); the index metadata records the last full run's duration. Patch when units × cost < ½ × last full run, never past 500 files | tsgo and Python patch the vscode/Django edits as today; a change too big for a patch falls back to a full run |
 | 2.3 | Go patching | Unit = package: `scip-go index ./pkg/... --output …` | Patch equals full on cobra and one larger Go repo; time measured |
 | 2.4 | scip-typescript patching | Unit = tsconfig project; small projects take seconds, vscode's `src/` doesn't, so that one stays a full run | Patch equals full on vscode with an edit in a small project |
 | 2.5 | Patch-equals-full as a permanent check | `scripts/scip-eval/patch-equivalence.ts`: edit → patch → full rebuild → diff, per language corpus | Runs in CI on the small fixtures |
