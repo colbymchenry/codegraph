@@ -10,7 +10,7 @@
  * left alone — no surprise indexer runs.
  */
 
-import { runScipPass, ScipHost } from './index';
+import { MergeScope, joinScopes, runScipPass, ScipHost } from './index';
 import { incrementalPlan, produceIndex } from './produce';
 import { availableIndexes, tryReindexLock } from './store';
 
@@ -112,12 +112,15 @@ export class ScipReindexScheduler {
 
   private async reindex(root: string): Promise<void> {
     let installed = 0;
+    /** what the patches changed; null once any index was rebuilt in full */
+    let scopes: MergeScope[] | null = [];
     for (const { lang } of availableIndexes(root)) {
       if (this.abort.signal.aborted) return;
       try {
         const r = await produceIndex(this.host.scipReadDb(), root, lang, { nice: true, incremental: true, signal: this.abort.signal, log: this.log });
         if (r.status === 'installed') {
           installed++;
+          scopes = r.scope && scopes ? [...scopes, r.scope] : null;
           if (r.incremental !== undefined) this.log(`${lang}: patched ${r.incremental} file(s) in ${r.durationMs}ms`);
           for (const w of r.warnings) this.log(`${lang} reindex: ${w}`);
         }
@@ -128,8 +131,8 @@ export class ScipReindexScheduler {
     }
     if (installed === 0 || this.abort.signal.aborted) return;
     try {
-      const report = await this.host.scipWrite((db) => runScipPass(db, root));
-      if (report) this.log(`merged ${report.freshDocuments}/${report.documents} documents in ${report.durationMs}ms`);
+      const report = await this.host.scipWrite((db) => runScipPass(db, root, scopes ? joinScopes(scopes) : undefined));
+      if (report) this.log(`merged ${report.freshDocuments}/${report.documents} documents (${report.judgedDocuments} re-judged) in ${report.durationMs}ms`);
     } catch (err) {
       this.log(`merge after reindex failed: ${err instanceof Error ? err.message : String(err)}`);
     }

@@ -272,4 +272,37 @@ describe.runIf(TSGO)('incremental reindex (tsgo, through the CLI)', () => {
     expect((await edge('usesOverloads', 'Registry::lookup'))?.provenance).toBe('scip'); // a call into models.ts, which was not re-indexed
     expect(cli('scip', 'index', dir, '--lang', 'typescript', '--changed')).toMatch(/up to date/);
   }, 60_000);
+
+  it('merges only what a patch can change, and ends where a full rebuild does', async () => {
+    const graph = async () => {
+      const cg = await CodeGraph.open(dir);
+      try {
+        return (cg.scipReadDb().prepare(`SELECT s.qualified_name AS s, t.qualified_name AS t, e.kind, e.line, IFNULL(e.provenance, '') AS p, IFNULL(e.metadata, '') AS m
+          FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target`).all() as Record<string, unknown>[])
+          .map(r => Object.values(r).join(' ')).sort();
+      } finally {
+        cg.close();
+      }
+    };
+    fs.writeFileSync(path.join(dir, 'src', 'spare.ts'), 'export function spare(): number {\n  return 0;\n}\n');
+    fs.writeFileSync(path.join(dir, 'src', 'gone.ts'), "import { helper } from './models';\nexport function gone(): number {\n  return helper(1);\n}\n");
+    // Calls into models.ts without importing it — through what another module returns — so it is
+    // never in a patch's plan; its edge into models.ts is flagged stale by sync all the same.
+    fs.writeFileSync(path.join(dir, 'src', 'factory.ts'), "import { Registry } from './models';\nexport function make(): Registry {\n  return new Registry();\n}\n");
+    fs.writeFileSync(path.join(dir, 'src', 'indirect.ts'), "import { make } from './factory';\nexport function indirect(): number {\n  return make().lookup(1);\n}\n");
+    cli('init', '-y', dir);
+    cli('scip', 'index', dir, '--lang', 'typescript');
+
+    const models = path.join(dir, 'src', 'models.ts');
+    fs.writeFileSync(models, fs.readFileSync(models, 'utf8')
+      .replace('soloMethod(): number', 'renamed(): number') // main.ts's call loses its target
+      .replace('export class Registry {', 'export class Registry {\n  extra(): number {\n    return 1;\n  }\n')); // Registry's methods move down
+    fs.appendFileSync(path.join(dir, 'src', 'main.ts'), "\nimport { spare } from './spare';\nexport function extra(): number {\n  return spare();\n}\n");
+    fs.rmSync(path.join(dir, 'src', 'gone.ts'));
+    cli('sync', dir);
+    expect(cli('scip', 'index', dir, '--lang', 'typescript', '--changed')).toMatch(/re-judged/);
+    const patched = await graph();
+    cli('scip', 'index', dir, '--lang', 'typescript');
+    expect(patched).toEqual(await graph());
+  }, 60_000);
 });

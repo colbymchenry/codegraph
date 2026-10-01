@@ -16,7 +16,7 @@ import type { SqliteDatabase } from '../db/sqlite-adapter';
 import { Compactor } from './compact';
 import { languageOfTool } from './indexers';
 import { MergeOutcome, markStaleForFiles, merge } from './merge';
-import { loadScipIndex, scanIndex } from './reader';
+import { ROLE_DEFINITION, ScipDocument, loadScipIndex, scanIndex } from './reader';
 import { heuristicSites, scipSites } from './sites';
 import {
   MergedDocument, ScipLanguage, SCIP_LANGUAGES, availableIndexes, indexPath,
@@ -34,10 +34,28 @@ export interface ScipHost {
   scipWrite<T>(fn: (db: SqliteDatabase) => T): Promise<T>;
 }
 
+/**
+ * What a patch changed (produce.ts patchIndex): the merge then re-judges only
+ * the sites that can depend on it, and leaves every other edge as the last
+ * pass judged it.
+ */
+export interface MergeScope {
+  /** files whose documents were replaced or removed */
+  files: string[];
+  /** symbols those documents defined, before and after */
+  symbols: string[];
+}
+
+export function joinScopes(scopes: MergeScope[]): MergeScope {
+  return { files: [...new Set(scopes.flatMap(s => s.files))], symbols: [...new Set(scopes.flatMap(s => s.symbols))] };
+}
+
 export interface ScipPassReport {
   documents: number;
   freshDocuments: number;
   staleDocuments: string[];
+  /** documents whose sites were re-judged: all fresh ones, or a scope's (see MergeScope) */
+  judgedDocuments: number;
   /** diagnostic counters from call-site extraction (see sites.ts) */
   stats: Record<string, number>;
   outcome: MergeOutcome;
@@ -47,10 +65,11 @@ export interface ScipPassReport {
 }
 
 /**
- * Merge all installed indexes. Returns null when the project has none.
- * Must run with the write lock held (the index hooks already hold it).
+ * Merge all installed indexes — after a patch, just what `scope` can affect.
+ * Returns null when the project has none. Must run with the write lock held
+ * (the index hooks already hold it).
  */
-export function runScipPass(db: SqliteDatabase, projectRoot: string): ScipPassReport | null {
+export function runScipPass(db: SqliteDatabase, projectRoot: string, scope?: MergeScope): ScipPassReport | null {
   const installed = availableIndexes(projectRoot);
   if (installed.length === 0) return null;
   // A big pass reads and rewrites hundreds of thousands of rows across a
@@ -58,13 +77,13 @@ export function runScipPass(db: SqliteDatabase, projectRoot: string): ScipPassRe
   const cacheSize = db.pragma('cache_size', { simple: true }) as number;
   db.pragma('cache_size = -524288'); // 512 MB
   try {
-    return pass(db, projectRoot, installed);
+    return pass(db, projectRoot, installed, scope);
   } finally {
     db.pragma(`cache_size = ${cacheSize}`);
   }
 }
 
-function pass(db: SqliteDatabase, projectRoot: string, installed: ReturnType<typeof availableIndexes>): ScipPassReport {
+function pass(db: SqliteDatabase, projectRoot: string, installed: ReturnType<typeof availableIndexes>, scope?: MergeScope): ScipPassReport {
   const started = Date.now();
   const phases: Record<string, number> = {};
   let mark = started;
@@ -96,12 +115,15 @@ function pass(db: SqliteDatabase, projectRoot: string, installed: ReturnType<typ
   }
   lap('hashGate');
 
-  const scip = scipSites(db, indexes, fresh);
+  // Definitions, implementations and the hash gate stay whole-index: they are what a
+  // site's verdict reads. Only which sites get (re-)judged narrows.
+  const judged = scope ? affectedFiles(db, indexes, scope, staleDocuments) : null;
+  const scip = scipSites(db, indexes, fresh, judged ?? undefined);
   lap('scipSites');
-  const heuristic = heuristicSites(db, fresh.keys());
+  const heuristic = heuristicSites(db, judged ? [...fresh.keys()].filter(f => judged.has(f)) : fresh.keys());
   lap('heuristicSites');
   const outcome = db.transaction(() => {
-    const o = merge(db, scip, heuristic, new Set(fresh.keys()));
+    const o = merge(db, scip, heuristic, new Set(fresh.keys()), judged ?? undefined);
     for (const { lang, meta } of indexes) recordMergedDocuments(db, lang, meta, merged.get(lang) ?? []);
     return o;
   })();
@@ -110,11 +132,36 @@ function pass(db: SqliteDatabase, projectRoot: string, installed: ReturnType<typ
     documents: indexes.reduce((n, i) => n + i.docs.length, 0),
     freshDocuments: fresh.size,
     staleDocuments,
+    judgedDocuments: judged ? [...fresh.keys()].filter(f => judged.has(f)).length : fresh.size,
     stats: scip.stats,
     outcome,
     durationMs: Date.now() - started,
     phases,
   };
+}
+
+/**
+ * The files a patch can change verdicts in: its own, the stale ones, and every
+ * file calling into it — by its documents' references to what the patched
+ * documents defined (before or after: a renamed or removed target counts), or
+ * by an edge into it (sync re-attaches those onto the patched files' new nodes).
+ */
+function affectedFiles(
+  db: SqliteDatabase, indexes: Array<{ docs: ScipDocument[] }>, scope: MergeScope, stale: string[]
+): Set<string> {
+  const files = new Set([...scope.files, ...stale]);
+  const symbols = new Set(scope.symbols);
+  for (const { docs } of indexes) {
+    for (const d of docs) {
+      if (files.has(d.relativePath)) continue;
+      if (d.occurrences.some(o => !(o.roles & ROLE_DEFINITION) && symbols.has(o.symbol)) ||
+          d.implementations?.some(i => symbols.has(i.target))) files.add(d.relativePath);
+    }
+  }
+  const callers = db.prepare(`SELECT DISTINCT s.file_path AS f FROM nodes t JOIN edges e ON e.target = t.id JOIN nodes s ON s.id = e.source
+    WHERE t.file_path = ? AND e.kind IN ('calls', 'instantiates', 'implements', 'extends')`);
+  for (const f of scope.files) for (const { f: caller } of callers.all(f) as { f: string }[]) files.add(caller);
+  return files;
 }
 
 /**

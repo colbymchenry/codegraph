@@ -21,10 +21,11 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import type { SqliteDatabase } from '../db/sqlite-adapter';
+import type { MergeScope } from './index';
 import { Compactor } from './compact';
 import { INDEXERS, IndexerRun, RUN_WARNING, ResolvedIndexer, resolveIndexer } from './indexers';
 import {
-  ScipDecodeError, ScipDocument, decodeScipIndex, encodeDocument, encodeMetadata, loadScipIndex,
+  ROLE_DEFINITION, ScipDecodeError, ScipDocument, decodeScipIndex, encodeDocument, encodeMetadata, loadScipIndex,
 } from './reader';
 import { ScipLanguage, indexPath, installIndex, readHashed, readMeta, snapshotHashes } from './store';
 
@@ -38,6 +39,8 @@ export type ProduceResult =
     status: 'installed'; lang: ScipLanguage; documents: number; resolvedCalls: number; durationMs: number; warnings: string[];
     /** files re-indexed, when the index was patched rather than rebuilt */
     incremental?: number;
+    /** what the patch changed, for a merge of just that (see runScipPass) */
+    scope?: MergeScope;
   }
   | { status: 'skipped'; lang: ScipLanguage; reason: string }
   /** incremental: nothing changed since the installed index was built */
@@ -243,9 +246,20 @@ async function patchIndex(
 
     // Splice: the plan's files get their new documents (or none); every other file keeps its
     // installed one. Each document defines everything its file declares, so nothing else moves.
+    // What the replaced documents defined, before and after, is what other files' calls may have changed into.
     const replaced = new Set([...plan.files, ...plan.deleted]);
-    const docs = new Map(loadScipIndex(final).documents.filter(d => !replaced.has(d.relativePath)).map(d => [d.relativePath, d]));
-    for (const d of partial) if (replaced.has(d.relativePath)) docs.set(d.relativePath, d);
+    const symbols = new Set<string>();
+    const defines = (d: ScipDocument) => { for (const o of d.occurrences) if (o.roles & ROLE_DEFINITION) symbols.add(o.symbol); };
+    const docs = new Map<string, ScipDocument>();
+    for (const d of loadScipIndex(final).documents) {
+      if (replaced.has(d.relativePath)) defines(d);
+      else docs.set(d.relativePath, d);
+    }
+    for (const d of partial) {
+      if (!replaced.has(d.relativePath)) continue;
+      docs.set(d.relativePath, d);
+      defines(d);
+    }
     const compact = new Compactor(projectRoot, lang);
     compact.add(Buffer.concat([encodeMetadata(tool), ...[...docs.values()].map(d => encodeDocument(d, s => Buffer.from(s)))]));
     const resolvedCalls = compact.resolvedCalls();
@@ -259,7 +273,7 @@ async function patchIndex(
       { tool: tool.toolName, toolVersion: tool.toolVersion, producedAt: started, hashes: snapshot, resolvedCalls });
     return {
       status: 'installed', lang, documents: compact.paths.length, resolvedCalls, durationMs: Date.now() - started,
-      warnings, incremental: present.length,
+      warnings, incremental: present.length, scope: { files: [...replaced], symbols: [...symbols] },
     };
   } finally {
     // The runs' outputs and helper files, all named after the raw output (IndexerSpec.patch).

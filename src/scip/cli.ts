@@ -7,7 +7,7 @@
  */
 
 import type { Command } from 'commander';
-import { SCIP_LANGUAGES, ScipLanguage, ScipPassReport, importScipFile, runScipPass, scipStatus } from './index';
+import { MergeScope, SCIP_LANGUAGES, ScipLanguage, ScipPassReport, importScipFile, joinScopes, runScipPass, scipStatus } from './index';
 import { produceIndex } from './produce';
 import { scipDir, tryReindexLock } from './store';
 
@@ -32,7 +32,7 @@ function parseLang(raw: string | undefined): ScipLanguage | undefined {
 function describe(r: ScipPassReport): string {
   const o = r.outcome;
   return [
-    `${r.freshDocuments}/${r.documents} documents merged (${r.staleDocuments.length} stale) in ${r.durationMs}ms (${Object.entries(r.phases).map(([k, v]) => `${k} ${v}`).join(', ')})`,
+    `${r.freshDocuments}/${r.documents} documents merged (${r.staleDocuments.length} stale${r.judgedDocuments < r.freshDocuments ? `, ${r.judgedDocuments} re-judged` : ''}) in ${r.durationMs}ms (${Object.entries(r.phases).map(([k, v]) => `${k} ${v}`).join(', ')})`,
     `sites: ${o.agree} agree, ${o.conflict} conflict, ${o.scipOnly} added, ${o.alreadyVerified} already verified, ${o.scipOnlyExternal} external-only, ${o.silent} unverified heuristic edges`,
     `edges: ${o.edgesUpdated} verified, ${o.edgesDeleted} wrong removed, ${o.edgesInserted} missing added` +
       (o.scipEdgesDropped || o.scipEdgesStale ? `, ${o.scipEdgesDropped} outdated dropped, ${o.scipEdgesStale} stale` : ''),
@@ -75,8 +75,8 @@ export function registerScipCommands(program: Command, h: CliHelpers): void {
     }
   };
 
-  const mergeAndReport = async (cg: import('../index').CodeGraph) => {
-    const report = await cg.scipWrite((db) => runScipPass(db, cg.getProjectRoot()));
+  const mergeAndReport = async (cg: import('../index').CodeGraph, scope?: MergeScope) => {
+    const report = await cg.scipWrite((db) => runScipPass(db, cg.getProjectRoot(), scope));
     if (report) h.success(describe(report));
     else h.info('No SCIP index installed — nothing to merge');
   };
@@ -92,10 +92,12 @@ export function registerScipCommands(program: Command, h: CliHelpers): void {
         const only = parseLang(opts.lang);
         let installed = 0;
         let current = 0;
+        let scopes: MergeScope[] | null = []; // null once any index was rebuilt in full
         for (const lang of only ? [only] : SCIP_LANGUAGES) {
           const r = await produceIndex(cg.scipReadDb(), cg.getProjectRoot(), lang, { force: opts.force, incremental: opts.changed, log: h.info });
           if (r.status === 'installed') {
             installed++;
+            scopes = r.scope && scopes ? [...scopes, r.scope] : null;
             const how = r.incremental !== undefined ? ` (patched: ${r.incremental} file(s) re-indexed)` : '';
             h.success(`${lang}: ${r.documents} documents, ${r.resolvedCalls} resolved calls in ${(r.durationMs / 1000).toFixed(1)}s${how}`);
             for (const w of r.warnings) h.warn(`${lang}: ${w}`);
@@ -109,7 +111,7 @@ export function registerScipCommands(program: Command, h: CliHelpers): void {
             h.warn(`${lang}: ${r.status} — ${r.reason}`);
           }
         }
-        if (installed > 0) await mergeAndReport(cg);
+        if (installed > 0) await mergeAndReport(cg, scopes ? joinScopes(scopes) : undefined);
         else if (only && current === 0) process.exitCode = 1;
       })));
 

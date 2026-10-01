@@ -60,20 +60,37 @@ function byIds(db: SqliteDatabase, sqlPrefix: string, ids: number[]): number {
   return changed;
 }
 
-export function merge(db: SqliteDatabase, scip: ScipSites, heuristic: HeuristicSites, freshFiles: Set<string>): MergeOutcome {
+/**
+ * Rows of `sql` (which joins the edge's source as `s` and ends in a WHERE clause),
+ * for sources in `files` — one indexed query per file — or for every edge.
+ */
+function bySource<T>(db: SqliteDatabase, sql: string, files?: Set<string>): T[] {
+  if (!files) return db.prepare(sql).all() as T[];
+  const stmt = db.prepare(`${sql} AND s.file_path = ?`);
+  return [...files].flatMap(f => stmt.all(f) as T[]);
+}
+
+/** `judged`: only sites whose caller is in these files are re-judged (a patch's scope); edges elsewhere stay as they are. */
+export function merge(
+  db: SqliteDatabase, scip: ScipSites, heuristic: HeuristicSites, freshFiles: Set<string>, judged?: Set<string>
+): MergeOutcome {
   const c: MergeOutcome = {
     agree: 0, conflict: 0, scipOnly: 0, dispatchVerified: 0, scipOnlyExternal: 0, alreadyVerified: 0, silent: 0,
     edgesUpdated: 0, edgesDeleted: 0, edgesInserted: 0,
     scipEdgesKept: 0, scipEdgesDropped: 0, scipEdgesStale: 0,
   };
-  db.exec(`UPDATE edges SET ${CLEAR_FLAG('scipSilent')} WHERE metadata LIKE '%scipSilent%'`);
+  if (!judged) db.exec(`UPDATE edges SET ${CLEAR_FLAG('scipSilent')} WHERE metadata LIKE '%scipSilent%'`);
+  else {
+    const flagged = bySource<{ id: number }>(db, `SELECT e.id FROM edges e JOIN nodes s ON s.id = e.source WHERE e.metadata LIKE '%scipSilent%'`, judged);
+    byIds(db, `UPDATE edges SET ${CLEAR_FLAG('scipSilent')} WHERE id IN`, flagged.map(r => r.id));
+  }
   // Column is not part of a site's identity (see sites.ts), so "already there"
   // is judged without it — an earlier import's edge, or a synthesized one at
   // the same site, keeps its own column and is not duplicated.
-  const existing = reconcileScipEdges(db, scip, freshFiles, c);
-  const synthesized = db.prepare(`SELECT source, target, kind, line FROM edges
-    WHERE provenance = 'heuristic' AND kind IN ('calls', 'instantiates', 'implements', 'extends') AND line IS NOT NULL`).all() as
-    Array<{ source: string; target: string; kind: string; line: number }>;
+  const existing = reconcileScipEdges(db, scip, freshFiles, c, judged);
+  const synthesized = bySource<{ source: string; target: string; kind: string; line: number }>(db, `SELECT e.source, e.target, e.kind, e.line
+    FROM edges e JOIN nodes s ON s.id = e.source
+    WHERE e.provenance = 'heuristic' AND e.kind IN ('calls', 'instantiates', 'implements', 'extends') AND e.line IS NOT NULL`, judged);
   for (const e of synthesized) existing.add(edgeKey(e.source, e.target, e.kind, e.line));
 
   const verify: number[] = [];
@@ -149,14 +166,14 @@ export function merge(db: SqliteDatabase, scip: ScipSites, heuristic: HeuristicS
  * rewritten node), the edge can't be re-judged yet — flag it until the next
  * reindex. Returns the keys of the SCIP edges that remain.
  */
-function reconcileScipEdges(db: SqliteDatabase, scip: ScipSites, freshFiles: Set<string>, c: MergeOutcome): Set<string> {
-  const rows = db.prepare(`
+function reconcileScipEdges(db: SqliteDatabase, scip: ScipSites, freshFiles: Set<string>, c: MergeOutcome, judged?: Set<string>): Set<string> {
+  const rows = bySource<{
+    id: number; source: string; target: string; kind: string; line: number | null;
+    name: string; src_file: string; tgt_file: string;
+  }>(db, `
     SELECT e.id, e.source, e.target, e.kind, e.line, t.name AS name, s.file_path AS src_file, t.file_path AS tgt_file
     FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
-    WHERE e.provenance = 'scip'`).all() as Array<{
-      id: number; source: string; target: string; kind: string; line: number | null;
-      name: string; src_file: string; tgt_file: string;
-    }>;
+    WHERE e.provenance = 'scip'`, judged);
   const kept = new Set<string>();
   const keep: number[] = [];
   const drop: number[] = [];

@@ -193,7 +193,9 @@ class FileNodes {
  * never as external.
  */
 export function scipSites(
-  db: SqliteDatabase, indexes: Array<{ lang: ScipLanguage; docs: ScipDocument[] }>, fresh: Map<string, string[]>
+  db: SqliteDatabase, indexes: Array<{ lang: ScipLanguage; docs: ScipDocument[] }>, fresh: Map<string, string[]>,
+  /** only these files' sites (a patch's, see MergeScope); definitions are read from every document */
+  judged?: Set<string>
 ): ScipSites {
   const stats: Record<string, number> = {};
   const bump = (k: string) => { stats[k] = (stats[k] ?? 0) + 1; };
@@ -259,7 +261,7 @@ export function scipSites(
         else implemented.set(symbol, [target]);
         if (parse(symbol)?.last.kind !== 'type' || parse(target)?.last.kind !== 'type') continue;
         const src = symToNode.get(symbol);
-        if (!src) continue;
+        if (!src || (judged && !judged.has(doc.relativePath))) continue;
         const base = symToNode.get(target);
         const key = siteKey(src.id, src.start_line, base?.name ?? parse(target)!.last.name, 'inherits');
         if (base) addTarget(sites, key, base.id, src.start_column, inheritanceKind(src.kind, base.kind));
@@ -297,7 +299,7 @@ export function scipSites(
     const literal = INDEXERS[lang].literalShape;
     for (const doc of docs) {
       const lines = fresh.get(doc.relativePath);
-      if (!lines) continue;
+      if (!lines || (judged && !judged.has(doc.relativePath))) continue;
       for (const o of doc.occurrences) {
         if (o.roles & ROLE_DEFINITION) continue;
         const call = classify(o, doc.positionEncoding, lines, literal, symToNode, parse);
