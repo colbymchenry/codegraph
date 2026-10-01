@@ -2724,13 +2724,22 @@ function kotlinHeadNames(head: string): string[] | null {
  * private `module`.
  */
 function isKotlinMemberReachable(n: Node, ref: UnresolvedRef, context: ResolutionContext): boolean {
+  // A Gradle script's bare calls — `plugins { }`, `dependencies { }`,
+  // `api(projects.core)` — run on the build tool's own types: never a member
+  // of a class the project declares (nowinandroid's `Graph.plugins()`, a lint
+  // registry's `api` property). Build logic's extensions on Gradle's types
+  // (`NamedDomainObjectContainer.createSourceSet(…)`) stay.
+  if (ref.filePath.endsWith('.kts')) {
+    if (n.kind !== 'method' && n.kind !== 'field' && n.kind !== 'property') return true;
+    const cut = n.qualifiedName.lastIndexOf('::');
+    const owner = cut > 0 ? n.qualifiedName.slice(0, cut).split(/::|\./).pop()! : '';
+    return owner !== '' && !context.getNodesByName(owner).some((c) => isMethodOwnerKind(c) || c.kind === 'module');
+  }
   // A Java class's method, too: Kotlin calls it bare only from a subclass or through a static import.
   if (n.kind !== 'method' || (n.language !== 'kotlin' && n.language !== 'java')) return true;
   // `require(n >= 0) { … }`, `check(!closed)`: Kotlin's preconditions, not a
   // member `require(byteCount: Long)` of the type around the call.
   if (isKotlinPreconditionCall(ref, context)) return false;
-  // A Gradle script's DSL blocks run on the build tool's own types.
-  if (ref.filePath.endsWith('.kts')) return true;
   const cut = n.qualifiedName.lastIndexOf('::');
   if (cut <= 0) return true;
   const path = n.qualifiedName.slice(0, cut).split(/::|\./);
