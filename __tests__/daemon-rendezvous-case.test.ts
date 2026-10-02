@@ -30,6 +30,8 @@ import * as os from 'os';
 import * as path from 'path';
 import { canonicalProjectRoot } from '../src/directory';
 import { getDaemonSocketPath } from '../src/mcp/daemon-paths';
+import { acquireProject } from '../src/mcp/project-lifecycle';
+import type CodeGraph from '../src/index';
 
 const tmpDirs: string[] = [];
 function makeDir(): string {
@@ -87,4 +89,35 @@ describe('daemon rendezvous key', () => {
       expect(canonicalProjectRoot(missing)).toBe(canonicalProjectRoot(missing.toUpperCase()));
     },
   );
+});
+
+/** True when the temp filesystem ignores case (default macOS APFS, NTFS). */
+function caseInsensitiveTmp(): boolean {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-CaseProbe-'));
+  try {
+    return fs.existsSync(dir.replace('cg-CaseProbe-', 'cg-caseprobe-'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe('in-process project sharing (#2278)', () => {
+  it.runIf(caseInsensitiveTmp())('opens one graph for two casings of one root', async () => {
+    const root = path.join(makeDir(), 'Repo');
+    fs.mkdirSync(root);
+    let opened = 0;
+    const open = () => {
+      opened++;
+      return { close() {}, isIndexing: () => false } as unknown as CodeGraph;
+    };
+    const a = acquireProject(root, open, {});
+    const b = acquireProject(path.join(path.dirname(root), 'REPO'), open, {});
+    try {
+      expect(opened).toBe(1);
+      expect(b.cg).toBe(a.cg);
+    } finally {
+      await a.release();
+      await b.release();
+    }
+  });
 });

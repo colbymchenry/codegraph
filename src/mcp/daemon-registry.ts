@@ -249,7 +249,7 @@ export async function stopDaemonAt(root: string, options: { preserveUnverified?:
   }
   if (pid == null) {
     const rec = listDaemons({ prune: false }).find(
-      (r) => path.resolve(r.root) === path.resolve(root)
+      (r) => canonicalProjectRoot(r.root) === canonicalProjectRoot(root)
     );
     pid = rec?.pid ?? null;
     if (rec) identity = rec;
