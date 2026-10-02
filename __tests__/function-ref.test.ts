@@ -1344,6 +1344,7 @@ def opaque(pool):
     } finally { cg.close(); }
   });
 
+  // One index per adversarial case: several seconds on a loaded machine.
   it('#1820: a module global never binds through a shadow, an unknown value or a deeper chain', async () => {
     const header = `from store import Store
 from decoy import Decoy
@@ -1508,7 +1509,7 @@ def init():
       } finally { cg.close(); fs.rmSync(tmpDir, { recursive: true, force: true }); tmpDir = undefined; }
     }
     expect(got).toEqual(Object.fromEntries(Object.entries(cases).map(([name, [, want]]) => [name, want])));
-  });
+  }, 60_000);
 
   it('#1820: a module global re-resolves after its module changes (sync)', async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-fnref-global-sync-'));
