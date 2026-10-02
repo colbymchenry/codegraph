@@ -5,16 +5,18 @@
 # compiler's answer. Results and method: FORK.md, "Agent benchmark".
 #
 #   scripts/scip-eval/agent-bench/bench.sh setup <task>          fresh repo copies; B and C build their own graphs
-#   scripts/scip-eval/agent-bench/bench.sh run <task> [arm...]   one run per arm (default A B C), one after another
-#   node scripts/scip-eval/agent-bench/score.js <task> [arm...]  correctness, tool calls, tokens, cost, time
-#   node scripts/scip-eval/agent-bench/calls.js <task> <arm>     the run's tool calls, in order
+#   scripts/scip-eval/agent-bench/bench.sh run <task> [arm...]   BENCH_REPEAT runs per arm (default 1; arms A B C), one after another
+#   node scripts/scip-eval/agent-bench/score.js <task> [arm...]  correctness, tool calls, tokens, cost, time; per run and averaged
+#   node scripts/scip-eval/agent-bench/calls.js <task> <arm> [n] run n's tool calls, in order (default the first)
 #
 # Arms:
 #   A  no codegraph: no MCP server, and the CLI is off PATH and blocked by a hook (agent-eval/no-cli-shim.sh)
 #   B  upstream codegraph @colbymchenry/codegraph@1.6.1 (installed under $BENCH_RUNS/upstream, not globally)
 #   C  the installed fork (`codegraph` on PATH: build the bundle and install it first; FORK.md)
 #   D  this checkout's build (npx tsc -p .) on a copy of C's repo and graph — for trying a change before installing it
-# Each run: Sonnet, effort high, $2 cap, project settings only (no user hooks or plugins), no skills, only that MCP config.
+#   H  C plus the UserPromptSubmit hook a real install has (`codegraph prompt-hook`), on a copy of C's repo and graph
+# Each run: BENCH_MODEL (default sonnet), effort high, $2 cap, project settings only (no user hooks or plugins), no skills,
+# only that MCP config. Logs: <task>-<arm>/run-<n>.jsonl, under <task>-<arm>/<model>/ for a model other than sonnet.
 # Tasks: tasks/<T>/{prompt.txt,truth.txt,corpus}; corpora are corpora.sh's clones under ~/.cache/codegraph-scip-eval.
 # Needs: claude, jq, rsync, node 22/24 on PATH; scripts/scip-eval/corpora.sh run for the task's corpus.
 set -uo pipefail
@@ -42,34 +44,45 @@ setup() {
   "$fork" init -y --scip "$RUNS/$task-C/repo" 2>&1 | grep -E "resolved calls|merged|failed|skipped"
 }
 
+MODEL="${BENCH_MODEL:-sonnet}"
+
 run_arm() {
-  local task=$1 arm=$2 out="$RUNS/$1-$2" cfg s
+  local task=$1 arm=$2 out="$RUNS/$1-$2" cfg s n log fork
   local repo="$out/repo"
-  if [ "$arm" = D ]; then
-    rm -rf "$out" && mkdir -p "$out" && rsync -a --exclude .codegraph/daemon.sock "$RUNS/$task-C/repo/" "$repo/"
+  log="$out$([ "$MODEL" = sonnet ] || echo "/$MODEL")"
+  if [ "$arm" = D ] || [ "$arm" = H ]; then # a fresh copy of C's repo and graph each run; earlier runs' logs stay
+    rm -rf "$repo" && mkdir -p "$out" && rsync -a --exclude .codegraph/daemon.sock "$RUNS/$task-C/repo/" "$repo/"
   fi
   [ -d "$repo" ] || { echo "no $repo: run setup $task first" >&2; return 1; }
+  fork="$(readlink -f "$(command -v codegraph)")"
   case "$arm" in
     A) cfg='{"mcpServers":{}}' ;;
     B) cfg="{\"mcpServers\":{\"codegraph\":{\"command\":\"$UP\",\"args\":[\"serve\",\"--mcp\",\"--path\",\"$repo\"]}}}" ;;
-    C) cfg="{\"mcpServers\":{\"codegraph\":{\"command\":\"$(readlink -f "$(command -v codegraph)")\",\"args\":[\"serve\",\"--mcp\",\"--path\",\"$repo\"]}}}" ;;
+    C|H) cfg="{\"mcpServers\":{\"codegraph\":{\"command\":\"$fork\",\"args\":[\"serve\",\"--mcp\",\"--path\",\"$repo\"]}}}" ;;
     D) cfg="{\"mcpServers\":{\"codegraph\":{\"command\":\"$(command -v node)\",\"args\":[\"$ROOT/dist/bin/codegraph.js\",\"serve\",\"--mcp\",\"--path\",\"$repo\"]}}}" ;;
-    *) echo "arm must be A, B, C or D" >&2; return 2 ;;
+    *) echo "arm must be A, B, C, D or H" >&2; return 2 ;;
   esac
   # shellcheck source=../../agent-eval/no-cli-shim.sh
   . "$ROOT/scripts/agent-eval/no-cli-shim.sh"
   cg_no_cli_setup "$out" || return 1
-  echo "[$task-$arm] start $(date +%T)"
+  if [ "$arm" = H ]; then # the hook runs outside Bash, so the CLI block doesn't reach it; the binary is off PATH, so by its path
+    jq --arg c "$fork prompt-hook" '.hooks.UserPromptSubmit = [{hooks: [{type: "command", command: $c}]}]' "$ARM_SETTINGS" > "$out/h-settings.json"
+    ARM_SETTINGS="$out/h-settings.json"
+  fi
+  mkdir -p "$log"
+  n=1; while [ -e "$log/run-$n.jsonl" ] || { [ $n = 1 ] && [ -e "$log/run.jsonl" ]; }; do n=$((n + 1)); done
+  echo "[$task-$arm $MODEL #$n] start $(date +%T)"
   s=$(date +%s)
   ( cd "$repo" && PATH="$ARM_PATH" CODEGRAPH_NO_UPDATE_CHECK=1 claude -p "$(cat "$HERE/tasks/$task/prompt.txt")" \
-      --output-format stream-json --verbose --permission-mode bypassPermissions --model sonnet --effort high --max-budget-usd 2 \
+      --output-format stream-json --verbose --permission-mode bypassPermissions --model "$MODEL" --effort high --max-budget-usd 2 \
       --setting-sources project --disable-slash-commands --settings "$ARM_SETTINGS" \
-      --strict-mcp-config --mcp-config "$cfg" > "$out/run.jsonl" 2> "$out/run.err" )
-  echo "[$task-$arm] exit $? in $(( $(date +%s) - s )) s"
+      --strict-mcp-config --mcp-config "$cfg" > "$log/run-$n.jsonl" 2> "$log/run-$n.err" )
+  echo "[$task-$arm $MODEL #$n] exit $? in $(( $(date +%s) - s )) s"
 }
 
 case "${1:-}" in
   setup) [ -n "${2:-}" ] || usage; setup "$2" ;;
-  run) [ -n "${2:-}" ] || usage; task=$2; shift 2; for arm in "${@:-A B C}"; do for a in $arm; do run_arm "$task" "$a"; done; done ;;
+  run) [ -n "${2:-}" ] || usage; task=$2; shift 2
+    for _ in $(seq "${BENCH_REPEAT:-1}"); do for arm in "${@:-A B C}"; do for a in $arm; do run_arm "$task" "$a"; done; done; done ;;
   *) usage ;;
 esac
