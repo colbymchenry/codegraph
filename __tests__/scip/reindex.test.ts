@@ -64,6 +64,26 @@ describe('background reindex', () => {
     }
   });
 
+  it('a failed merge is logged, not an unhandled rejection that would take the MCP server down', async () => {
+    fakeIndexer(p.dir, 'index.scip');
+    await produceIndex(p.cg.scipReadDb(), p.dir, 'typescript'); // installed, awaiting its merge
+    const logs: string[] = [];
+    const host = {
+      getProjectRoot: () => p.dir, scipReadDb: () => p.cg.scipReadDb(), scipDbPath: () => p.cg.scipDbPath(),
+      scipWrite: () => Promise.reject(new Error('merge failed')),
+    };
+    const s = new ScipReindexScheduler(host, { idleMs: 10, minIntervalMs: 0, log: m => logs.push(m) });
+    try {
+      s.notifyChange();
+      await settle();
+      await s.idle(); // vitest fails the run on an unhandled rejection
+      expect(logs).toContainEqual(expect.stringMatching(/reindex failed: merge failed/));
+      expect(tryReindexLock(p.dir)?.release()).toBeUndefined(); // released despite the throw
+    } finally {
+      s.stop();
+    }
+  });
+
   it('the reindex lock is exclusive and a dead holder\'s lock is taken over', () => {
     const held = tryReindexLock(p.dir)!;
     expect(held).not.toBeNull();

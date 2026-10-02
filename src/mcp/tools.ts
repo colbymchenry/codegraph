@@ -4960,10 +4960,16 @@ export class ToolHandler {
     ];
     const summaryLineIdx = 2;
 
+    // Naming once: call-sites and the Flow section share resolveNamedSymbolFlow
+    // (via buildFlowFromNamedSymbols). Call-sites used to re-lex the query.
+    await warmBranchGuardGrammars();
+    const flow = this.buildFlowFromNamedSymbols(cg, matchQuery);
+
     // Blast radius (always-on, compact): for the entry symbols, who depends on
     // them + which tests cover them — locations only, no source — so the agent
     // knows what to update/verify before editing without a separate call.
-    const callSites = callSitesSection(cg.scipReadDb(), cg.getProjectRoot(), query, exactNodeIds); // fork: src/scip/callsites.ts
+    const callTargetIds = new Set([...exactNodeIds, ...flow.namedNodeIds]);
+    const callSites = callSitesSection(cg.scipReadDb(), cg.getProjectRoot(), query, callTargetIds); // fork: src/scip/callsites.ts
     if (callSites) lines.push(callSites);
     const blastRadius = this.buildBlastRadiusSection(cg, subgraph, exactNodeIds);
     if (blastRadius) lines.push(blastRadius);
@@ -5004,14 +5010,9 @@ export class ToolHandler {
     }
 
     // Step 4: Read contiguous file sections
-    // Compute the flow spine once — used both to prepend the Flow section (below)
-    // and to gate adaptive source sizing: files on the spine get full source,
-    // off-spine peers skeletonize.
-    // The Flow section labels each hop with its branch conditions; that read
-    // is synchronous, so the grammars it needs are loaded here, once.
-    await warmBranchGuardGrammars();
-    const flow = this.buildFlowFromNamedSymbols(cg, matchQuery);
-
+    // Flow was computed above (shared with call-sites). Used to prepend the Flow
+    // section and to gate adaptive source sizing: files on the spine get full
+    // source, off-spine peers skeletonize.
     // The symbols the question is about: exact targets, the named ones, the spine.
     const questionIds = new Set([...exactNodeIds, ...flow.pathNodeIds, ...flow.namedNodeIds]);
     /**

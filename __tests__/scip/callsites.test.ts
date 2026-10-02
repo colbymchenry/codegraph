@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ToolHandler } from '../../src/mcp/tools';
+import { countUnresolvedOtherCalls } from '../../src/scip/callsites';
 import { FixtureProject, importFixtureIndex, indexedFixture, merge, nodeId } from './helpers';
 
 /** codegraph_explore's "Call sites of" section (src/scip/callsites.ts), on the TypeScript fixture. */
@@ -50,5 +51,42 @@ describe('explore: compiler-verified call sites', () => {
     expect(await listed('Invoice.totalPrice callers')).toEqual(['src/client/models.ts', 'src/models.ts']);
     expect(await listed('Invoice.totalPrice in src/models.ts callers, not Order.totalPrice')).toEqual(['src/models.ts']);
     expect(await listed('callers of `Invoice.totalPrice()` (client/models.ts)')).toEqual(['src/client/models.ts']);
+  });
+
+  it('a stale scip edge (provenance still scip) is marked unverified, same as scipVerdict', async () => {
+    importFixtureIndex(p.dir, 'scip-ts');
+    await merge(p);
+    const db = p.cg.scipReadDb();
+    const target = nodeId(db, 'Invoice::totalPrice');
+    // Keep provenance='scip' but flag scipStale — the old bug counted these as compiler-verified.
+    db.prepare(`UPDATE edges SET metadata = json_set(COALESCE(metadata, '{}'), '$.scipStale', json('true'))
+      WHERE target = ? AND kind = 'calls' AND provenance = 'scip' AND line = 6`).run(target);
+    const text = await explore('Invoice totalPrice callers');
+    expect(text).toMatch(/Call sites of `Invoice::totalPrice`[^]*\d+: \d+ compiler-verified, \d+ not \(marked\)/);
+    expect(text).toMatch(/\n- 6 \[unverified\] —/);
+  });
+});
+
+describe('countUnresolvedOtherCalls', () => {
+  let p: FixtureProject;
+  beforeEach(async () => { p = await indexedFixture('scip-ts'); });
+  afterEach(() => p.close());
+
+  it('matches the old correlated NOT EXISTS count (same exclusion semantics)', async () => {
+    importFixtureIndex(p.dir, 'scip-ts');
+    await merge(p);
+    const db = p.cg.scipReadDb();
+    const t = db.prepare(
+      `SELECT id, name FROM nodes WHERE qualified_name = 'Invoice::totalPrice' AND kind = 'method' LIMIT 1`,
+    ).get() as { id: string; name: string };
+    const sites = db.prepare(`SELECT s.file_path AS file, e.line FROM edges e JOIN nodes s ON s.id = e.source
+      WHERE e.target = ? AND e.kind = 'calls' AND e.line IS NOT NULL`).all(t.id) as { file: string; line: number }[];
+    const fast = countUnresolvedOtherCalls(db, t.name, sites);
+    const slow = (db.prepare(`SELECT COUNT(*) AS n FROM unresolved_refs u
+      WHERE u.status = 'failed' AND u.name_tail = ? AND u.reference_kind = 'calls' AND NOT EXISTS (
+        SELECT 1 FROM edges e JOIN nodes s ON s.id = e.source
+        WHERE e.target = ? AND e.kind = 'calls' AND e.line = u.line AND s.file_path = u.file_path)`
+    ).get(t.name, t.id) as { n: number }).n;
+    expect(fast).toBe(slow);
   });
 });

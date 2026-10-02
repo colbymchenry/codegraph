@@ -9,7 +9,7 @@ import type { Edge } from '../types';
 
 export type ScipVerdict = 'verified' | 'unverified';
 
-export function scipVerdict(edge: Edge | null | undefined): ScipVerdict | null {
+export function scipVerdict(edge: Pick<Edge, 'provenance' | 'metadata'> | null | undefined): ScipVerdict | null {
   if (!edge) return null;
   const m = edge.metadata as Record<string, unknown> | undefined;
   if (m?.scipStale === true || m?.scipSilent === true) return 'unverified';

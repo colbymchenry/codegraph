@@ -32,11 +32,10 @@ import { ROLE_DEFINITION, ScipImplementation, ScipOccurrence, encodeDocument, en
 import { MAX_SOURCE_FILE_SIZE_BYTES } from '../../file-limits';
 import { RUN_WARNING } from './index';
 import { repoFiles } from './repo-files';
-import { packageVersion } from './typescript';
+import { packageVersion, SOURCE } from './typescript';
 
 /** SCIP `PositionEncoding.UTF16CodeUnitOffsetFromLineStart`: the API's positions index JS strings. */
 const POSITION_ENCODING_UTF16 = 2;
-const SOURCE = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
 /** Files indexed between drops of the client-side AST cache. */
 const CACHE_FILES = 1000;
 /** Compiler options for files outside every tsconfig — what an editor infers for a loose file. */

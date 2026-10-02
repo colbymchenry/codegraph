@@ -8,7 +8,7 @@ import type { SqliteDatabase } from '../../src/db/sqlite-adapter';
 import { importScipFile, scipStatus } from '../../src/scip';
 import { scipVerdict } from '../../src/scip/notes';
 import { ROLE_DEFINITION, encodeDocument, encodeMetadata, loadScipIndex } from '../../src/scip/reader';
-import { SILENT_EDGE, indexPath, scipDir } from '../../src/scip/store';
+import { SILENT_EDGE, STALE_EDGE, indexPath, needsMerge, scipDir } from '../../src/scip/store';
 import { FIXTURES, FixtureProject, importFixtureIndex, indexedFixture, merge, nodeId as sharedNodeId } from './helpers';
 
 /** The merge's rules (src/scip/merge.ts, index.ts), `scip import` and `scip status`, on the TypeScript fixture. */
@@ -160,7 +160,12 @@ describe('SCIP merge (TypeScript fixture)', () => {
     expect(flags(edge('sum', 'helper')).scipStale).toBe(true); // re-attached onto the moved node
     expect(flags(edge('make', 'Invoice')).scipStale).toBe(true);
     expect(flags(edge('Service::run', 'Service::step')).scipStale).toBeUndefined(); // untouched file
-    expect(scipStatus(cg.scipReadDb(), dir).edges.stale).toBeGreaterThan(0);
+    const status = scipStatus(cg.scipReadDb(), dir);
+    expect(status.edges.stale).toBeGreaterThan(0);
+    // verified count must not include stale (same rule as scipVerdict / explore call-sites)
+    const allScip = (cg.scipReadDb().prepare(`SELECT COUNT(*) AS n FROM edges WHERE provenance = 'scip'`).get() as { n: number }).n;
+    expect(status.edges.scip + status.edges.stale).toBe(allScip);
+    expect(status.edges.scip).toBe(allScip - status.edges.stale);
 
     fs.writeFileSync(models, original);
     await cg.sync(); // content matches the installed index again → full pass
@@ -173,6 +178,15 @@ describe('SCIP merge (TypeScript fixture)', () => {
     importFixture();
     await cg.indexAll();
     expect(edge('sum', 'Invoice::totalPrice')?.provenance).toBe('scip');
+  });
+
+  it('a re-index whose merge fails leaves the index awaiting a merge, not stamped merged from before', async () => {
+    importFixture();
+    await merge(p);
+    expect(needsMerge(dir)).toBe(false);
+    fs.writeFileSync(indexPath(dir, 'typescript'), 'not a scip index'); // the merge after the index throws
+    await cg.indexAll(); // a failed merge never fails the index
+    expect(needsMerge(dir)).toBe(true); // the next round merges it
   });
 
   it('scip import vouches only for sources not modified after the index was written', async () => {
@@ -266,6 +280,28 @@ describe('SCIP merge (TypeScript fixture)', () => {
     expect(scipStatus(db, dir).edges.silent).toBe(silent);
     const plan = db.prepare(`EXPLAIN QUERY PLAN SELECT COUNT(*) FROM edges WHERE ${SILENT_EDGE}`).all() as { detail: string }[];
     expect(plan.map(r => r.detail).join()).toContain('scip_silent_edges');
+  });
+
+  it('null-metadata scip edges count as verified (SQLite NULL LIKE must not drop them)', async () => {
+    importFixture();
+    await pass();
+    const db = cg.scipReadDb();
+    const existing = db.prepare(
+      `SELECT id FROM edges WHERE provenance = 'scip' AND metadata IS NULL LIMIT 1`,
+    ).get() as { id: number } | undefined;
+    if (!existing) {
+      const e = db.prepare(
+        `SELECT id FROM edges WHERE provenance = 'scip' AND NOT (${SILENT_EDGE}) AND NOT (${STALE_EDGE}) LIMIT 1`,
+      ).get() as { id: number };
+      db.prepare(`UPDATE edges SET metadata = NULL WHERE id = ?`).run(e.id);
+    }
+    const nullMeta = (db.prepare(
+      `SELECT COUNT(*) AS n FROM edges WHERE provenance = 'scip' AND metadata IS NULL`,
+    ).get() as { n: number }).n;
+    expect(nullMeta).toBeGreaterThan(0);
+    const allScip = (db.prepare(`SELECT COUNT(*) AS n FROM edges WHERE provenance = 'scip'`).get() as { n: number }).n;
+    const status = scipStatus(db, dir).edges;
+    expect(status.scip + status.stale).toBe(allScip);
   });
 
 });

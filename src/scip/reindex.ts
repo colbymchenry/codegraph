@@ -11,9 +11,11 @@
  * left alone — no surprise indexer runs.
  */
 
-import { ScipHost, mergeInstalled } from './index';
-import { ProduceResult, incrementalPlan, produceIndex } from './produce';
-import { availableIndexes, tryReindexLock } from './store';
+import { ScipHost } from './index';
+import { incrementalPlan } from './produce';
+import { reindexRound } from './round';
+import { INDEXERS } from './indexers';
+import { availableIndexes, patchDriftExceeded, tryReindexLock } from './store';
 
 export interface ReindexOptions {
   /** quiet time before a full rebuild; also before a patch, unless `patchIdleMs` is given */
@@ -53,9 +55,10 @@ export class ScipReindexScheduler {
 
   /** A sync changed files. */
   notifyChange(): void {
-    if (availableIndexes(this.host.getProjectRoot()).length === 0) return;
+    const installed = availableIndexes(this.host.getProjectRoot());
+    if (installed.length === 0) return;
     this.dirty = true;
-    this.arm(this.quiet());
+    this.arm(this.quiet(installed));
   }
 
   stop(): void {
@@ -92,9 +95,16 @@ export class ScipReindexScheduler {
     });
   }
 
-  /** How long the project must be quiet: short when the next run is a patch. */
-  private quiet(): number {
-    return this.patchable() ? this.patchIdleMs : this.idleMs;
+  /**
+   * How long the project must be quiet: short when the next run is likely a patch.
+   * Runs on every synced save, on the server's event loop, so it reads only the
+   * installed metas — each index's tool can be patched and its drift allows one —
+   * not the full plan (a scan of every file: ~40 ms on vscode). fire() decides.
+   */
+  private quiet(installed = availableIndexes(this.host.getProjectRoot())): number {
+    const likelyPatch = installed.length > 0
+      && installed.every(({ lang, meta }) => INDEXERS[lang].patch?.[meta.tool] !== undefined && !patchDriftExceeded(meta));
+    return likelyPatch ? this.patchIdleMs : this.idleMs;
   }
 
   /** Every installed index can be patched rather than rebuilt. */
@@ -118,33 +128,32 @@ export class ScipReindexScheduler {
     }
     try {
       await this.reindex(root);
+    } catch (err) {
+      // Nothing awaits this run (fire() only chains it): a throw here would be an
+      // unhandled rejection in the MCP server. The index stays pending; the next round merges it.
+      this.log(`reindex failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       lock.release();
     }
   }
 
   private async reindex(root: string): Promise<void> {
-    const results: ProduceResult[] = [];
-    for (const { lang } of availableIndexes(root)) {
-      if (this.abort.signal.aborted) return;
-      try {
-        const r = await produceIndex(this.host.scipReadDb(), root, lang, { nice: true, incremental: true, signal: this.abort.signal, log: this.log });
-        results.push(r);
-        if (r.status === 'installed') {
-          if (r.incremental !== undefined) this.log(`${lang}: patched ${r.incremental} file(s) in ${r.durationMs}ms`);
-          for (const w of r.warnings) this.log(`${lang} reindex: ${w}`);
-        }
-        else if (r.status !== 'current') this.log(`${lang} reindex ${r.status}: ${r.reason}`);
-      } catch (err) {
-        this.log(`${lang} reindex failed: ${err instanceof Error ? err.message : String(err)}`);
+    const langs = availableIndexes(root).map(i => i.lang);
+    const { results, report } = await reindexRound(this.host, {
+      langs,
+      nice: true,
+      incremental: true,
+      signal: this.abort.signal,
+      log: this.log,
+    });
+    for (const r of results) {
+      if (r.status === 'installed') {
+        if (r.incremental !== undefined) this.log(`${r.lang}: patched ${r.incremental} file(s) in ${r.durationMs}ms`);
+        for (const w of r.warnings) this.log(`${r.lang} reindex: ${w}`);
+      } else if (r.status !== 'current' && r.status !== 'skipped') {
+        this.log(`${r.lang} reindex ${r.status}: ${r.reason}`);
       }
     }
-    if (this.abort.signal.aborted) return;
-    try {
-      const report = await mergeInstalled(this.host, results);
-      if (report) this.log(`merged ${report.freshDocuments}/${report.documents} documents (${report.judgedDocuments} re-judged) in ${report.durationMs}ms`);
-    } catch (err) {
-      this.log(`merge after reindex failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    if (report) this.log(`merged ${report.freshDocuments}/${report.documents} documents (${report.judgedDocuments} re-judged) in ${report.durationMs}ms`);
   }
 }

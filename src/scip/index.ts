@@ -24,7 +24,8 @@ import { ROLE_DEFINITION, ScipDocument, loadScipIndex, scanIndex } from './reade
 import { ReferenceSites, heuristicSites, referenceSites, scipDefinitions, scipSites } from './sites';
 import {
   MergedDocument, ScipLanguage, SCIP_LANGUAGES, availableIndexes, indexPath,
-  SILENT_EDGE, indexedHashes, installIndex, mergedDocumentCounts, readHashed, recordMergedDocuments,
+  SILENT_EDGE, STALE_EDGE, indexedHashes, installIndex, markMerged, markUnmerged, metaAfterImport, mergedDocumentCounts, needsMerge,
+  readHashed, readMeta, recordMergedDocuments,
 } from './store';
 
 export { ScipLanguage, SCIP_LANGUAGES } from './store';
@@ -59,15 +60,41 @@ function joinScopes(scopes: MergeScope[]): MergeScope {
 /**
  * The merge after a re-index round (`scip index`, the watcher's reindex, `init
  * --scip`): of just what the patches changed, of everything once any language
- * was rebuilt in full, and none when nothing was installed.
+ * was rebuilt in full, of any index still awaiting a merge (installed then the
+ * round threw / crashed before this ran), and none when nothing needs it.
  */
 export function mergeInstalled(host: ScipHost, results: readonly ProduceResult[]): Promise<ScipPassReport | null> {
   const scopes: Array<MergeScope | undefined> = [];
   for (const r of results) if (r.status === 'installed') scopes.push(r.scope);
-  if (scopes.length === 0) return Promise.resolve(null);
-  const scope = scopes.every((s): s is MergeScope => s !== undefined) ? joinScopes(scopes) : undefined;
   const root = host.getProjectRoot();
-  return host.scipWrite(db => passOffThread(host.scipDbPath(), root, scope) ?? runScipPass(db, root, scope));
+  const pending = needsMerge(root);
+  if (scopes.length === 0 && !pending) return Promise.resolve(null);
+  // Scoped when every install this round was a patch (pending is expected — install
+  // clears mergedAt). Full merge for a full rebuild, or for orphan heal (pending, no installs).
+  const scope = scopes.length > 0 && scopes.every((s): s is MergeScope => s !== undefined)
+    ? joinScopes(scopes) : undefined;
+  return host.scipWrite(db => mergePass(db, host.scipDbPath(), root, scope));
+}
+
+/**
+ * runScipPass off the main thread when it can be (passOffThread), else in
+ * process. Every merge a caller awaits goes through here: a vscode merge
+ * blocks for minutes, which the liveness watchdog (#850) takes for a wedged
+ * process and kills — after `codegraph index`, the graph was left unmerged.
+ * Must run with the write lock held, as runScipPass does.
+ */
+export function mergePass(db: SqliteDatabase, dbPath: string, projectRoot: string, scope?: MergeScope): Promise<ScipPassReport | null> {
+  return passOffThread(dbPath, projectRoot, scope) ?? Promise.resolve(runScipPass(db, projectRoot, scope));
+}
+
+/**
+ * After codegraph rebuilt its graph from scratch (every SCIP edge gone): no
+ * index is merged any more, whatever its stamp says — so a merge that never
+ * finishes is retried by the next round — then the merge.
+ */
+export function mergeRebuiltGraph(db: SqliteDatabase, dbPath: string, projectRoot: string): Promise<ScipPassReport | null> {
+  for (const { lang } of availableIndexes(projectRoot)) markUnmerged(projectRoot, lang);
+  return mergePass(db, dbPath, projectRoot);
 }
 
 /**
@@ -214,6 +241,8 @@ function pass(db: SqliteDatabase, projectRoot: string, installed: ReturnType<typ
     for (const { lang, meta } of indexes) recordMergedDocuments(db, lang, meta, merged.get(lang) ?? []);
     return total;
   })();
+  const mergedAt = Date.now();
+  for (const { lang } of indexes) markMerged(projectRoot, lang, mergedAt);
   lap('merge');
   return {
     documents: indexes.reduce((n, i) => n + i.docs.length, 0),
@@ -256,13 +285,15 @@ function affectedFiles(
  * installed index again — e.g. the background reindex ran before this sync
  * caught up with the edit — in which case the full pass re-verifies it.
  */
-export function onSynced(db: SqliteDatabase, projectRoot: string, changedFiles: readonly string[]): ScipPassReport | null {
+export async function onSynced(
+  db: SqliteDatabase, dbPath: string, projectRoot: string, changedFiles: readonly string[]
+): Promise<ScipPassReport | null> {
   const installed = availableIndexes(projectRoot);
   if (installed.length === 0 || changedFiles.length === 0) return null;
   markStaleForFiles(db, changedFiles);
   const indexed = indexedHashes(db, changedFiles);
   const nowFresh = changedFiles.some(f => installed.some(({ meta }) => meta.hashes[f] !== undefined && meta.hashes[f] === indexed.get(f)));
-  return nowFresh ? runScipPass(db, projectRoot) : null;
+  return nowFresh ? mergePass(db, dbPath, projectRoot) : null;
 }
 
 /**
@@ -302,10 +333,10 @@ export function importScipFile(
     const h = readHashed(projectRoot, p)?.hash;
     if (h) hashes[p] = h;
   }
-  installIndex(projectRoot, resolved, f => compact.write(f), {
+  installIndex(projectRoot, resolved, f => compact.write(f), metaAfterImport(readMeta(projectRoot, resolved), {
     tool: compact.meta!.toolName, toolVersion: compact.meta!.toolVersion, producedAt: builtAt, hashes,
     resolvedCalls: compact.resolvedCalls(), fullAt: builtAt,
-  });
+  }));
   return { lang: resolved, documents: compact.paths.length, newerThanIndex };
 }
 
@@ -324,8 +355,10 @@ export function scipStatus(db: SqliteDatabase, projectRoot: string): ScipStatus 
   return {
     indexes,
     edges: {
-      scip: one(`SELECT COUNT(*) AS n FROM edges WHERE provenance = 'scip'`),
-      stale: one(`SELECT COUNT(*) AS n FROM edges WHERE provenance = 'scip' AND metadata LIKE '%"scipStale":true%'`),
+      // Same rule as scipVerdict: stale/silent are not "compiler-verified".
+      // COALESCE in SILENT_EDGE/STALE_EDGE: null metadata must count as verified.
+      scip: one(`SELECT COUNT(*) AS n FROM edges WHERE provenance = 'scip' AND NOT (${SILENT_EDGE}) AND NOT (${STALE_EDGE})`),
+      stale: one(`SELECT COUNT(*) AS n FROM edges WHERE provenance = 'scip' AND ${STALE_EDGE}`),
       silent: one(`SELECT COUNT(*) AS n FROM edges WHERE ${SILENT_EDGE}`),
     },
   };

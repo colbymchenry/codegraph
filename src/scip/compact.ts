@@ -26,6 +26,14 @@ import type { ScipLanguage } from './store';
 import type { ReferenceSites } from './sites';
 import { callShape, isCallTarget, siteKind } from './syntax';
 
+/**
+ * A fork-private occurrence role: a reference this compaction counted as a call
+ * (resolvedCalls). Kept in the compact index so a patch can count the calls of
+ * the documents it keeps without re-reading their files (addCompacted). Beyond
+ * SCIP's own roles (≤ 0x40); the merge reads only ROLE_DEFINITION.
+ */
+export const ROLE_COUNTED_CALL = 1 << 24;
+
 export class Compactor {
   meta: IndexMeta | null = null;
   /** repo-relative paths of the documents kept, in order */
@@ -45,6 +53,24 @@ export class Compactor {
     this.meta ??= meta;
   }
 
+  /**
+   * Adds documents of an index this class wrote with ROLE_COUNTED_CALL marks (ScipMeta.callMarks):
+   * already compact, so kept as they are — no file read, no shape check — counting the marked calls.
+   */
+  addCompacted(meta: IndexMeta, docs: Iterable<ScipDocument>): void {
+    this.meta ??= meta;
+    for (const doc of docs) {
+      if (this.seen.has(doc.relativePath)) continue;
+      this.seen.add(doc.relativePath);
+      for (const o of doc.occurrences) {
+        if (o.roles & ROLE_DEFINITION) this.defined.add(o.symbol);
+        else if (o.roles & ROLE_COUNTED_CALL) this.callRefs.set(o.symbol, (this.callRefs.get(o.symbol) ?? 0) + 1);
+      }
+      this.chunks.push(encodeDocument(doc, s => this.bytes(s)));
+      this.paths.push(doc.relativePath);
+    }
+  }
+
   /** Adds documents already decoded (and rebased onto the project): a patch's splice. */
   addDocuments(meta: IndexMeta, docs: Iterable<ScipDocument>): void {
     this.meta ??= meta;
@@ -61,9 +87,11 @@ export class Compactor {
     for (const o of doc.occurrences) {
       const parsed = this.parse(o.symbol); // null for locals
       if (parsed && !(o.roles & ROLE_DEFINITION) && fileRefs?.get(o.range.startLine + 1)?.has(parsed.last.name)) {
-        kept.push(o); // judged as a reference whatever its shape; counted below if it is also a call
+        // judged as a reference whatever its shape; counted (and marked) if it is also a call
         if (isCallTarget(parsed.last.kind) && lines && siteKind(parsed.last.kind, () => callShape(o, doc.positionEncoding, lines, literal))) {
-          this.callRefs.set(o.symbol, (this.callRefs.get(o.symbol) ?? 0) + 1);
+          kept.push(this.counted(o));
+        } else {
+          kept.push(o);
         }
         continue;
       }
@@ -80,8 +108,7 @@ export class Compactor {
         continue;
       }
       if (!siteKind(kind, () => callShape(o, doc.positionEncoding, lines, literal))) continue;
-      kept.push(o);
-      this.callRefs.set(o.symbol, (this.callRefs.get(o.symbol) ?? 0) + 1);
+      kept.push(this.counted(o));
     }
     // Class → base/interface and method → the method it implements: what `implements`/`extends`
     // edges and calls made through an interface are judged by (see sites.ts scipDefinitions, scipSites).
@@ -112,6 +139,12 @@ export class Compactor {
     } finally {
       fs.closeSync(fd);
     }
+  }
+
+  /** `o` counted as a call: tallied for resolvedCalls, and marked for a later addCompacted. */
+  private counted(o: ScipOccurrence): ScipOccurrence {
+    this.callRefs.set(o.symbol, (this.callRefs.get(o.symbol) ?? 0) + 1);
+    return { ...o, roles: o.roles | ROLE_COUNTED_CALL };
   }
 
   private parse(symbol: string): ParsedSymbol | null {

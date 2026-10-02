@@ -28,7 +28,7 @@ import { repoFiles } from './repo-files';
 
 const has = (root: string, f: string) => fs.existsSync(path.join(root, f));
 const PROJECT_FILES = new Set(['tsconfig.json', 'jsconfig.json']);
-const SOURCE = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
+export const SOURCE = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
 
 /** Projects with at least this many source files run alone, with the big heap. */
 const HEAVY_FILES = 1500;

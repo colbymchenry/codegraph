@@ -46,6 +46,95 @@ export interface ScipMeta {
   patches?: number;
   /** measured ÷ declared time of this tool's patches, averaged: scales the adapter's `seconds` (produce.ts) */
   patchRatio?: number;
+  /**
+   * When the last successful merge of this installed index finished. Missing or
+   * older than `producedAt` means the index is on disk but not yet in the graph
+   * (install then crash / throw before merge) — the next round must merge it.
+   */
+  mergedAt?: number;
+  /** every call the index counts carries ROLE_COUNTED_CALL (compact.ts): a patch can keep its other documents as they are */
+  callMarks?: boolean;
+}
+
+/** Patches follow importers one level; force a full run after this many, or this long since `fullAt`. */
+export const MAX_PATCHES = 20;
+export const MAX_PATCH_AGE_MS = 12 * 60 * 60_000;
+
+const PATCH_RATIO_MIN = 0.1;
+const PATCH_RATIO_MAX = 2;
+
+/** The ratio a patch that took `measuredMs` leaves: averaged with the previous one, bounded. */
+export function nextPatchRatio(previous: number | undefined, declaredMs: number, measuredMs: number): number | undefined {
+  if (declaredMs <= 0) return previous;
+  const r = measuredMs / declaredMs;
+  return Math.min(PATCH_RATIO_MAX, Math.max(PATCH_RATIO_MIN, previous === undefined ? r : (previous + r) / 2));
+}
+
+/** True when patch count or age says only a full run will do. */
+export function patchDriftExceeded(meta: ScipMeta, now = Date.now()): boolean {
+  return (meta.patches ?? 0) >= MAX_PATCHES
+    || (meta.fullAt !== undefined && now - meta.fullAt > MAX_PATCH_AGE_MS);
+}
+
+/** Meta after a full indexer run (install clears `mergedAt` via {@link installIndex}). */
+export function metaAfterFull(
+  previous: ScipMeta | null,
+  fields: {
+    tool: string; toolVersion: string; producedAt: number; hashes: Record<string, string>;
+    resolvedCalls: number; fullRunMs: number;
+  },
+): ScipMeta {
+  return {
+    ...fields,
+    fullAt: fields.producedAt,
+    patchRatio: previous?.tool === fields.tool ? previous.patchRatio : undefined,
+    callMarks: true,
+  };
+}
+
+/** Meta after a patch: keeps full-run baselines, bumps `patches`, optionally recalibrates `patchRatio`. */
+export function metaAfterPatch(
+  previous: ScipMeta,
+  fields: {
+    tool: string; toolVersion: string; producedAt: number; hashes: Record<string, string>;
+    resolvedCalls: number; durationMs: number; declaredMs: number; unitsMatchPlan: boolean;
+  },
+): ScipMeta {
+  return {
+    tool: fields.tool,
+    toolVersion: fields.toolVersion,
+    producedAt: fields.producedAt,
+    hashes: fields.hashes,
+    resolvedCalls: fields.resolvedCalls,
+    fullRunMs: previous.fullRunMs,
+    fullAt: previous.fullAt,
+    patches: (previous.patches ?? 0) + 1,
+    patchRatio: fields.unitsMatchPlan
+      ? nextPatchRatio(previous.patchRatio, fields.declaredMs, fields.durationMs)
+      : previous.patchRatio,
+    callMarks: true, // kept documents had marks, or were compacted again here (produce.ts patchIndex)
+  };
+}
+
+/**
+ * Meta after `scip import`. Same-tool planner fields (`fullRunMs`, `patchRatio`,
+ * `patches`) carry over so an import cannot silently disable the half-full-run gate.
+ */
+export function metaAfterImport(
+  previous: ScipMeta | null,
+  fields: {
+    tool: string; toolVersion: string; producedAt: number; hashes: Record<string, string>;
+    resolvedCalls: number; fullAt: number;
+  },
+): ScipMeta {
+  const same = previous?.tool === fields.tool;
+  return {
+    ...fields,
+    fullRunMs: same ? previous!.fullRunMs : undefined,
+    patchRatio: same ? previous!.patchRatio : undefined,
+    patches: same ? previous!.patches : undefined,
+    callMarks: true,
+  };
 }
 
 export function scipDir(projectRoot: string): string {
@@ -101,7 +190,35 @@ export function installIndex(projectRoot: string, lang: ScipLanguage, write: (fi
   } finally {
     fs.rmSync(tmp, { force: true });
   }
-  writeFileAtomic(metaPath(projectRoot, lang), JSON.stringify(meta));
+  // A new install is not yet merged — drop any previous mergedAt so a later
+  // "current" produce still triggers mergeInstalled (orphaned-install heal).
+  const { mergedAt: _drop, ...rest } = meta;
+  writeFileAtomic(metaPath(projectRoot, lang), JSON.stringify(rest));
+}
+
+/** Record that `lang`'s installed index has been merged into the graph. */
+export function markMerged(projectRoot: string, lang: ScipLanguage, at = Date.now()): void {
+  const meta = readMeta(projectRoot, lang);
+  if (!meta) return;
+  writeFileAtomic(metaPath(projectRoot, lang), JSON.stringify({ ...meta, mergedAt: at }));
+}
+
+/** `lang`'s installed index is no longer in the graph (the graph was rebuilt): the next round merges it. */
+export function markUnmerged(projectRoot: string, lang: ScipLanguage): void {
+  const meta = readMeta(projectRoot, lang);
+  if (!meta || meta.mergedAt === undefined) return;
+  const { mergedAt: _drop, ...rest } = meta;
+  writeFileAtomic(metaPath(projectRoot, lang), JSON.stringify(rest));
+}
+
+/** This install has been merged into the graph since it was produced. */
+export function isMerged(meta: ScipMeta): boolean {
+  return meta.mergedAt !== undefined && meta.mergedAt >= meta.producedAt;
+}
+
+/** True when any installed index is newer than its last merge (or was never merged). */
+export function needsMerge(projectRoot: string): boolean {
+  return availableIndexes(projectRoot).some(({ meta }) => !isMerged(meta));
 }
 
 /**
@@ -170,8 +287,21 @@ export function indexedHashes(db: SqliteDatabase, paths: Iterable<string>): Map<
   return out;
 }
 
-/** A heuristic edge the compiler could not confirm, as merge.ts flags it (json_set writes it without spaces). */
-export const SILENT_EDGE = `metadata LIKE '%"scipSilent":true%'`;
+/**
+ * An edge carrying merge.ts's `flag` (json_set writes it without spaces). COALESCE so
+ * `NOT (…)` stays true when metadata is NULL — SQLite's `NOT (NULL LIKE …)` is unknown
+ * and would drop verified scip edges from status counts (playwright: ~24k null-meta edges).
+ * `column`: an aliased column (`e.metadata`) where the query joins.
+ */
+export function edgeFlag(flag: 'scipSilent' | 'scipStale', column = 'metadata'): string {
+  return `COALESCE(${column},'') LIKE '%"${flag}":true%'`;
+}
+
+/** A heuristic edge the compiler could not confirm. The partial index scip_silent_edges is defined by this exact text. */
+export const SILENT_EDGE = edgeFlag('scipSilent');
+
+/** A SCIP edge whose ends changed since it was verified. */
+export const STALE_EDGE = edgeFlag('scipStale');
 
 /**
  * The fork's own tables and indexes, outside upstream's migrations. The partial
@@ -186,6 +316,14 @@ function ensureScipSchema(db: SqliteDatabase): void {
     tool_version TEXT NOT NULL,
     imported_at INTEGER NOT NULL
   )`);
+  // Recreate if an older install still has the pre-COALESCE predicate (partial-index
+  // WHERE must match the query expression for SQLite to use it).
+  const idx = db.prepare(
+    `SELECT sql FROM sqlite_master WHERE type='index' AND name='scip_silent_edges'`,
+  ).get() as { sql: string } | undefined;
+  if (idx && !idx.sql.includes('COALESCE(metadata')) {
+    db.exec(`DROP INDEX IF EXISTS scip_silent_edges`);
+  }
   db.exec(`CREATE INDEX IF NOT EXISTS scip_silent_edges ON edges(source) WHERE ${SILENT_EDGE}`);
 }
 

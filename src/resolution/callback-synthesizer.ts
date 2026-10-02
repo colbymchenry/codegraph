@@ -116,9 +116,21 @@ function nuxtComponentName(filePath: string): string | null {
   return out.join('');
 }
 
+/**
+ * The last file's lines: passes slice one file's nodes in a row, and splitting
+ * the whole file per node was an O(nodes × file-size) term (jsxEdges was
+ * 2.3 s of Playwright's 2.7 s synthesis; same fix as c-fnptr's sliceLinesPre).
+ */
+let lastContent: string | null = null;
+let lastLines: string[] = [];
+
 function sliceLines(content: string, startLine?: number, endLine?: number): string | null {
   if (!startLine || !endLine) return null;
-  return content.split('\n').slice(startLine - 1, endLine).join('\n');
+  if (content !== lastContent) {
+    lastContent = content;
+    lastLines = content.split('\n');
+  }
+  return lastLines.slice(startLine - 1, endLine).join('\n');
 }
 
 function registrarField(src: string): string | null {

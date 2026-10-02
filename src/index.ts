@@ -62,7 +62,7 @@ import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
 import { minRefsForPool } from './resolution/resolver-pool';
-import { onSynced, runScipPass } from './scip';
+import { mergeRebuiltGraph, onSynced } from './scip';
 import { ScipReindexScheduler } from './scip/reindex';
 import type { SqliteDatabase } from './db/sqlite-adapter';
 
@@ -570,6 +570,7 @@ export class CodeGraph {
       try {
         const gitState = this.orchestrator.beginGitIndexState(true);
         const before = this.queries.getNodeAndEdgeCount();
+        let scipMergeDue = false; // fork: set once resolution ran, merged after maintenance (below)
         // Mark the index as in-flight BEFORE any writes: a run killed
         // mid-index (OOM, SIGKILL, the #850 liveness watchdog) leaves this
         // marker behind, so `codegraph status` can tell a truncated index
@@ -709,7 +710,7 @@ export class CodeGraph {
           const tDeferred = Date.now();
           await this.resolver.resolveDeferredThisMemberRefs();
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[synth-timing] deferredThisMember: ${Date.now() - tDeferred}ms`);
-          this.scipHook(() => runScipPass(this.db.getDb(), this.projectRoot));
+          scipMergeDue = true;
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
@@ -724,6 +725,13 @@ export class CodeGraph {
           if (walValve) { walValve.stop(); await walValve.drain(); }
           await this.db.runMaintenance();
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] maintenance: ${Date.now() - tMaint}ms`);
+        }
+
+        // SCIP (fork): after the maintenance above, never before — its ANALYZE gives
+        // the planner statistics, and a fresh graph has none: without them the
+        // merge's per-file queries planned badly (Playwright: >2 min instead of 6 s).
+        if (scipMergeDue) {
+          await this.scipHook(() => mergeRebuiltGraph(this.db.getDb(), this.db.getPath(), this.projectRoot));
         }
 
         // The orchestrator only sees extraction-phase counts; resolution and
@@ -1130,7 +1138,7 @@ export class CodeGraph {
 
         if (result.changedFilePaths) {
           const changed = result.changedFilePaths;
-          this.scipHook(() => onSynced(this.db.getDb(), this.projectRoot, changed));
+          await this.scipHook(() => onSynced(this.db.getDb(), this.db.getPath(), this.projectRoot, changed));
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
@@ -1279,10 +1287,14 @@ export class CodeGraph {
     });
   }
 
-  /** A failed SCIP merge must never fail the index or sync that triggered it. */
-  private scipHook(fn: () => unknown): void {
+  /**
+   * A failed SCIP merge must never fail the index or sync that triggered it.
+   * Awaited, so the merge (off-thread when built — see scip/index.ts mergePass)
+   * finishes inside the caller's write lock while the event loop stays free.
+   */
+  private async scipHook(fn: () => Promise<unknown>): Promise<void> {
     try {
-      fn();
+      await fn();
     } catch (err) {
       process.stderr.write(`[CodeGraph SCIP] merge skipped: ${err instanceof Error ? err.message : String(err)}\n`);
     }

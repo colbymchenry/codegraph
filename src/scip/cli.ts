@@ -7,8 +7,8 @@
  */
 
 import type { Command } from 'commander';
-import { SCIP_LANGUAGES, ScipLanguage, ScipPassReport, importScipFile, mergeInstalled, runScipPass, scipStatus } from './index';
-import { ProduceResult, produceIndex } from './produce';
+import { SCIP_LANGUAGES, ScipLanguage, ScipPassReport, importScipFile, mergePass, scipStatus } from './index';
+import { reindexRound } from './round';
 import { referenceSites } from './sites';
 import { scipDir, tryReindexLock } from './store';
 
@@ -77,7 +77,7 @@ export function registerScipCommands(program: Command, h: CliHelpers): void {
   };
 
   const mergeAndReport = async (cg: import('../index').CodeGraph) => {
-    const report = await cg.scipWrite((db) => runScipPass(db, cg.getProjectRoot()));
+    const report = await cg.scipWrite((db) => mergePass(db, cg.scipDbPath(), cg.getProjectRoot()));
     if (report) h.success(describe(report));
     else h.info('No SCIP index installed — nothing to merge');
   };
@@ -91,26 +91,28 @@ export function registerScipCommands(program: Command, h: CliHelpers): void {
     .action((pathArg: string | undefined, opts: { lang?: string; force?: boolean; changed?: boolean }) =>
       withGraph(pathArg, (cg) => exclusively(cg, async () => {
         const only = parseLang(opts.lang);
+        const { results, report } = await reindexRound(cg, {
+          langs: only ? [only] : SCIP_LANGUAGES,
+          force: opts.force,
+          incremental: opts.changed,
+          log: h.info,
+        });
         let current = 0;
-        const results: ProduceResult[] = [];
-        for (const lang of only ? [only] : SCIP_LANGUAGES) {
-          const r = await produceIndex(cg.scipReadDb(), cg.getProjectRoot(), lang, { force: opts.force, incremental: opts.changed, log: h.info });
-          results.push(r);
+        for (const r of results) {
           if (r.status === 'installed') {
             const how = r.incremental !== undefined ? ` (patched: ${r.incremental} file(s) re-indexed)` : '';
-            h.success(`${lang}: ${r.documents} documents, ${r.resolvedCalls} resolved calls in ${(r.durationMs / 1000).toFixed(1)}s${how}`);
-            for (const w of r.warnings) h.warn(`${lang}: ${w}`);
+            h.success(`${r.lang}: ${r.documents} documents, ${r.resolvedCalls} resolved calls in ${(r.durationMs / 1000).toFixed(1)}s${how}`);
+            for (const w of r.warnings) h.warn(`${r.lang}: ${w}`);
           } else if (r.status === 'current') {
-            h.info(`${lang}: up to date`);
+            h.info(`${r.lang}: up to date`);
             if (only) current++;
           } else if (r.status === 'skipped') {
-            if (only) h.warn(`${lang}: skipped — ${r.reason}`);
-            else h.info(`${lang}: skipped — ${r.reason}`);
+            if (only) h.warn(`${r.lang}: skipped — ${r.reason}`);
+            else h.info(`${r.lang}: skipped — ${r.reason}`);
           } else {
-            h.warn(`${lang}: ${r.status} — ${r.reason}`);
+            h.warn(`${r.lang}: ${r.status} — ${r.reason}`);
           }
         }
-        const report = await mergeInstalled(cg, results);
         if (report) h.success(describe(report));
         else if (only && current === 0 && !results.some(r => r.status === 'installed')) process.exitCode = 1;
       })));

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import { nextPatchRatio, produceIndex } from '../../src/scip/produce';
-import { indexPath, scipDir } from '../../src/scip/store';
+import { indexPath, metaAfterImport, scipDir } from '../../src/scip/store';
 import { FIXTURES, FixtureProject, edgesBetween, fakeIndexer, fakeRuns, indexedFixture, merge, writeConfig } from './helpers';
 
 /** Producing an index (src/scip/produce.ts): running the indexer, guarding what it installs, and reporting what it can't do. */
@@ -70,6 +70,19 @@ describe('produceIndex (fake TypeScript indexers)', () => {
     writeConfig(p.dir, { typescript: false });
     expect(await produce()).toMatchObject({ status: 'skipped' });
   });
+
+  it('sweep removes a directory left at the raw output path (no EISDIR masking the real failure)', async () => {
+    // Indexer creates `{out}` as a directory then exits non-zero — before recursive sweep,
+    // finally's rmSync threw EISDIR and hid the exit reason.
+    writeConfig(p.dir, {
+      typescript: {
+        cmd: process.execPath,
+        args: ['-e', 'require("fs").mkdirSync(process.argv[1]); process.exit(2)', '{out}'],
+      },
+    });
+    await expect(produce()).resolves.toMatchObject({ status: 'failed', reason: expect.stringMatching(/exited 2/) });
+    expect(fs.readdirSync(scipDir(p.dir)).filter(f => /\.(tmp|raw)/.test(f) || f.includes('.raw'))).toEqual([]);
+  });
 });
 
 describe('patch ratio', () => {
@@ -79,5 +92,25 @@ describe('patch ratio', () => {
     expect(nextPatchRatio(undefined, 1000, 60_000)).toBe(2);
     expect(nextPatchRatio(undefined, 1000, 1)).toBe(0.1);
     expect(nextPatchRatio(0.7, 0, 900)).toBe(0.7); // only deletions: nothing measured
+  });
+});
+
+describe('metaAfterImport', () => {
+  it('keeps same-tool fullRunMs and patchRatio so an import cannot disable the half-full-run gate', () => {
+    const prev = {
+      tool: 'tsgo-index', toolVersion: '1', producedAt: 1, hashes: { a: '1' },
+      resolvedCalls: 10, fullRunMs: 90_000, fullAt: 1, patches: 3, patchRatio: 0.4,
+    };
+    const next = metaAfterImport(prev, {
+      tool: 'tsgo-index', toolVersion: '2', producedAt: 99, hashes: { a: '2' },
+      resolvedCalls: 11, fullAt: 99,
+    });
+    expect(next.fullRunMs).toBe(90_000);
+    expect(next.patchRatio).toBe(0.4);
+    expect(next.patches).toBe(3);
+    expect(next.producedAt).toBe(99);
+    expect(metaAfterImport(prev, {
+      tool: 'scip-typescript', toolVersion: '1', producedAt: 99, hashes: {}, resolvedCalls: 0, fullAt: 99,
+    }).fullRunMs).toBeUndefined();
   });
 });
