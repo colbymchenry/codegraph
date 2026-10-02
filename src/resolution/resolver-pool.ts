@@ -58,6 +58,23 @@ export function minRefsForPool(): number {
   return 150_000;
 }
 
+/**
+ * Fewest refs still to settle for the batch loop to boot the pool mid-run
+ * from its observed per-ref rate. Booting takes seconds (each worker opens the
+ * database and warms a resolver), only batches of MIN_PARALLEL_BATCH refs fan
+ * out, and synthesis waits for a booting pool. A rate measured on a busy
+ * machine inflates every projection, so with no floor a ten-file project booted
+ * the pool in half its runs under heavy load and paid seconds for nothing.
+ * Repos the adaptive bar is for (Rust-class per-ref cost) have tens of
+ * thousands of refs and still engage.
+ */
+export const ADAPTIVE_ENGAGE_MIN_REFS = 20_000;
+
+/** Whether the resolve loop should boot the pool mid-run (see ADAPTIVE_ENGAGE_MIN_REFS). */
+export function shouldEngageAdaptively(projectedMs: number, remainingRefs: number, barMs: number): boolean {
+  return remainingRefs >= ADAPTIVE_ENGAGE_MIN_REFS && projectedMs >= barMs;
+}
+
 export class ResolverPool {
   private workers: PoolWorker[] = [];
   private nextId = 0;
