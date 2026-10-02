@@ -163,8 +163,8 @@ Tiers (match `corpus.json`): **Small** <~150 files · **Medium** ~150–1500 ·
 **Large** >~1500. Skip repos that are tagged `<lang>` but mostly another
 language. Write one cross-file architecture **question** per repo (the kind that
 needs tracing across files). Add a `"<Language>"` block to
-`.claude/skills/agent-eval/corpus.json` (fields: `name`, `repo`, `size`,
-`files`, `question`) so `/agent-eval` can reuse them.
+`.claude/skills/codegraph-lift/corpus.json` (fields: `name`, `repo`, `size`,
+`files`, `question`) so `/codegraph-lift` can reuse them.
 
 ### Step 8 — Benchmark all 3 (extraction + A/B)
 
@@ -210,7 +210,7 @@ releases go through the GitHub Actions Release workflow.
 ## Notes
 - The A/B spawns real **paid** `claude -p` runs (opus, `--max-budget-usd`),
   2 arms × 3 repos. The corpus dir `/tmp/codegraph-corpus` is shared with
-  `/agent-eval`, so clones are reused across runs.
+  `/codegraph-lift`, so clones are reused across runs.
 - Any new `*.wasm` must live in `src/extraction/wasm/` — `copy-assets` (run by
   `npm run build`) ships it; otherwise it won't be in `dist/`.
 - An index must be served by the **same** binary that built it. Step 8 builds +

@@ -1,6 +1,6 @@
 ---
-name: agent-eval
-description: Benchmark CodeGraph retrieval quality on a real codebase by comparing agent behavior with vs without CodeGraph. Use when the user runs /agent-eval or asks to test, benchmark, audit, or validate a codegraph version (the local dev build or a published npm version) against a language's repo.
+name: codegraph-lift
+description: Benchmark CodeGraph retrieval quality on a real codebase by comparing agent behavior with vs without CodeGraph. Use when the user runs /codegraph-lift or asks to test, benchmark, audit, or validate a codegraph version (the local dev build or a published npm version) against a language's repo.
 ---
 
 # CodeGraph Quality Audit
@@ -10,8 +10,19 @@ codegraph version on a chosen real-world repo. Drives the harness in
 `scripts/agent-eval/`.
 
 ## Prerequisites
-- `tmux` 3+, a logged-in `claude` CLI, `node`, `git` (macOS/Linux).
+- `node`, `git`, a logged-in agent CLI (Claude Code today — see Runners).
+- `tmux` 3+ for the interactive harness only.
 - Run from the codegraph repo root.
+
+## Runners
+
+Headless is the portable arm; the tmux arm drives the Claude TUI specifically.
+
+- Claude Code: `claude -p` with stream-json — native; `parse-run.mjs` / `parse-session.mjs` are built for its formats.
+- opencode: `opencode run --format json` — proven in other panels; needs its own stream parser (follow-up).
+- Cursor: `cursor-agent -p` — proven; avoid `--mode plan` (swallows print output), pass `--trust` headless.
+- Devin: `devin -p` is help-asserted but unverified here.
+- `AskUserQuestion` below means the host's question tool (name varies by host).
 
 ## Workflow
 
@@ -27,12 +38,12 @@ Copy this checklist:
 
 **Step 1 — version.** Ask with `AskUserQuestion`: which codegraph version to test.
 Offer "Local dev build" and "Latest published"; the free-text "Other" lets the
-user type a specific version (e.g. `0.7.10`). Map the answer to a VERSION token:
+user type a specific version. Map the answer to a VERSION token:
 - "Local dev build" → `local`
 - "Latest published" → `latest`
-- a typed version → that string (e.g. `0.7.10`)
+- a typed version → that string
 
-**Step 2 — language.** Read `.claude/skills/agent-eval/corpus.json`. Ask with
+**Step 2 — language.** Read `.claude/skills/codegraph-lift/corpus.json`. Ask with
 `AskUserQuestion` which language to test, listing the languages that have entries.
 
 **Step 3 — repo.** From the chosen language's entries, ask which repo. Label each
@@ -48,7 +59,7 @@ the answer to a MODE token:
 - "Both" → `all` — headless + interactive (4 runs).
 
 **Step 5 — run.** Launch in the background (sets the version, clones if missing,
-wipes + re-indexes, runs the chosen arms — several minutes):
+wipes + re-indexes, runs the chosen arms — several minutes, paid runs):
 ```bash
 scripts/agent-eval/audit.sh <VERSION> <repo-name> <repo-url> "<question>" <MODE>
 ```

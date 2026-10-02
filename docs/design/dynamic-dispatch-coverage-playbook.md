@@ -141,7 +141,7 @@ from adoption.
 
 ### Step 1 — Pick the framework's canonical *flow* question
 Every framework has a signature data/control flow. Pick the "how does X reach/become Y"
-question and a real repo (add to `.claude/skills/agent-eval/corpus.json`). Examples:
+question and a real repo (add to `.claude/skills/codegraph-lift/corpus.json`). Examples:
 - React state→DOM, Vue reactive→render, Svelte store→update
 - Rails request→controller→view, Spring request→`@Controller`→service
 - Express/Koa request→middleware→handler, FastAPI request→route→dependency
