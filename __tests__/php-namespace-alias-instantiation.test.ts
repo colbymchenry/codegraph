@@ -98,4 +98,100 @@ class Personal
       consumer('use App\\Blocks\\Personal\\Fields as Field;', 'new Elsewhere\\FirstName()'));
     expect(await instantiated()).toEqual([]);
   });
+
+  /** Non-`contains` edges out of a file, as `<source> <kind> <target qualifiedName>`. */
+  const edgesFrom = async (file: string): Promise<string[]> => {
+    cg = await CodeGraph.init(dir, { silent: true });
+    await cg.indexAll();
+    const db = (cg as any).db.db;
+    const rows: { s: string; k: string; t: string }[] = db
+      .prepare(
+        `SELECT s.name s, e.kind k, t.qualified_name t FROM edges e
+         JOIN nodes s ON s.id = e.source JOIN nodes t ON t.id = e.target
+         WHERE s.file_path = ? AND e.kind NOT IN ('contains', 'imports')`,
+      )
+      .all(file);
+    return rows.map((r) => `${r.s} ${r.k} ${r.t}`).sort();
+  };
+
+  const fields = `<?php
+namespace App\\Fields;
+
+interface Field {}
+class Base {}
+class FirstName extends Base implements Field
+{
+    public static function make(): self { return new self(); }
+}
+`;
+
+  it('resolves extends, implements and static calls written through a namespace alias', async () => {
+    write('app/Fields/FirstName.php', fields);
+    write('app/Personal.php', `<?php
+namespace App;
+
+use App\\Fields as F;
+
+class Personal extends F\\Base implements F\\Field
+{
+    public function make() { return F\\FirstName::make(); }
+}
+`);
+    expect(await edgesFrom('app/Personal.php')).toEqual([
+      'Personal extends App\\Fields::Base',
+      'Personal implements App\\Fields::Field',
+      'make calls App\\Fields::FirstName::make',
+    ]);
+  });
+
+  it('reads a qualified name without an imported first segment relative to the current namespace', async () => {
+    write('app/Fields/FirstName.php', fields);
+    write('app/Personal.php', `<?php
+namespace App;
+
+class Personal extends Fields\\Base
+{
+    public function a() { return new Fields\\FirstName(); }
+}
+`);
+    expect(await edgesFrom('app/Personal.php')).toEqual([
+      'Personal extends App\\Fields::Base',
+      'a instantiates App\\Fields::FirstName',
+    ]);
+  });
+
+  it('reads a leading backslash as a fully qualified name', async () => {
+    write('app/Fields/FirstName.php', fields);
+    write('app/Other/FirstName.php', firstName('App\\Other'));
+    write('app/Personal.php', `<?php
+namespace App\\Other;
+
+class Personal extends \\App\\Fields\\Base
+{
+    public function a() { return new \\App\\Fields\\FirstName(); }
+    public function b() { return \\App\\Fields\\FirstName::make(); }
+}
+`);
+    expect(await edgesFrom('app/Personal.php')).toEqual([
+      'Personal extends App\\Fields::Base',
+      'a instantiates App\\Fields::FirstName',
+      'b calls App\\Fields::FirstName::make',
+    ]);
+  });
+
+  it('does not bind a qualified name outside the project to a same-named project class', async () => {
+    write('app/Fields/FirstName.php', fields);
+    write('app/Personal.php', `<?php
+namespace App;
+
+use Vendor\\Lib as L;
+
+class Personal extends L\\Base
+{
+    public function a() { return new \\Vendor\\Lib\\FirstName(); }
+    public function b() { return L\\FirstName::make(); }
+}
+`);
+    expect(await edgesFrom('app/Personal.php')).toEqual([]);
+  });
 });

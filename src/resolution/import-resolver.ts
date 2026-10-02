@@ -1550,33 +1550,71 @@ export function isJsPathImportRef(ref: UnresolvedRef): boolean {
   return ref.referenceKind === 'imports' && JS_MODULE_LANGUAGES.has(ref.language) && isJsPathSpecifier(ref.referenceName);
 }
 
+/** PHP reference kinds whose name is a class name, written as in the source. */
+const PHP_CLASS_NAME_REFS: ReadonlySet<string> = new Set(['instantiates', 'extends', 'implements', 'references']);
+
 /**
- * `use App\Fields as Field;` aliases a namespace, so `new Field\FirstName()`
- * names `App\Fields\FirstName`. Both extractors emit the written name
- * ("Field\FirstName") verbatim; expand its first segment through the file's
- * use map and look the class up by its full qualified name.
- * undefined means the name does not start with an imported alias; null means
- * it does but no single project class has the expanded name, so name
- * fallbacks must not guess.
+ * A PHP class name written with a namespace in it (#2256). `use App\Fields as
+ * Field;` aliases a namespace, so `new Field\FirstName()`, `extends Field\Base`
+ * and `Field\FirstName::make()` all name `App\Fields\FirstName`. PHP reads a
+ * qualified name one way: a leading `\` makes it absolute; otherwise a first
+ * segment a `use` imports is replaced by what it imports, and any other name is
+ * relative to the current namespace. Both extractors emit the written name
+ * verbatim, and with no `.` or `::` in it the pre-filter would drop it.
+ * undefined means the ref is not a qualified class name (or names a method the
+ * class inherits); null means it is but no single project class has that name
+ * — it lives outside the project — so name fallbacks must not guess.
  */
-export function resolvePhpNamespaceAliasInstantiation(
+export function resolvePhpQualifiedClassRef(
   ref: UnresolvedRef,
   context: ResolutionContext,
 ): ResolvedRef | null | undefined {
-  if (ref.language !== 'php' || ref.referenceKind !== 'instantiates') return undefined;
-  const separator = ref.referenceName.indexOf('\\');
-  if (separator <= 0) return undefined;
-  const alias = ref.referenceName.slice(0, separator);
-  const imp = context.getImportMappings(ref.filePath, ref.language)
-    .find((i) => i.localName === alias);
-  if (!imp) return undefined;
+  if (ref.language !== 'php') return undefined;
+  let name = ref.referenceName;
+  let member: string | null = null;
+  if (ref.referenceKind === 'calls') {
+    // A static call on the class: `Field\FirstName::make()` is written `Field\FirstName.make`.
+    const call = /^(.*\\[^\\.:]+)(?:\.|::)(\w+)$/.exec(name);
+    if (!call) return undefined;
+    name = call[1]!;
+    member = call[2]!;
+  } else if (!PHP_CLASS_NAME_REFS.has(ref.referenceKind)) {
+    return undefined;
+  }
+  const separator = name.indexOf('\\');
+  if (separator < 0) return undefined;
 
-  const fqn = imp.source.replace(/^\\/, '') + ref.referenceName.slice(separator);
+  let fqn: string;
+  if (separator === 0) {
+    fqn = name.slice(1);
+  } else {
+    const head = name.slice(0, separator);
+    const imp = context.getImportMappings(ref.filePath, ref.language).find((i) => i.localName === head);
+    if (imp) {
+      fqn = imp.source.replace(/^\\/, '') + name.slice(separator);
+    } else {
+      // `namespace App;` applies until the next namespace statement.
+      const namespace = context.getNodesInFile(ref.filePath)
+        .filter((n) => n.kind === 'namespace' && n.startLine <= ref.line)
+        .sort((a, b) => b.startLine - a.startLine)[0];
+      fqn = namespace ? `${namespace.qualifiedName}\\${name}` : name;
+    }
+  }
+
   const cut = fqn.lastIndexOf('\\');
-  const classes = context.getNodesByQualifiedName(`${fqn.slice(0, cut)}::${fqn.slice(cut + 1)}`)
+  const qualifiedName = cut < 0 ? fqn : `${fqn.slice(0, cut)}::${fqn.slice(cut + 1)}`;
+  const classes = context.getNodesByQualifiedName(qualifiedName)
     .filter((n) => n.language === 'php' && STATIC_MEMBER_CONTAINERS.has(n.kind));
-  if (classes.length !== 1) return null;
-  return { original: ref, targetNodeId: classes[0]!.id, confidence: 0.95, resolvedBy: 'import' };
+  // A type mention can name something other than a class (a namespaced
+  // constant or function), so it keeps the ordinary strategies.
+  if (classes.length !== 1) return ref.referenceKind === 'references' ? undefined : null;
+  const owner = classes[0]!;
+  if (!member) return { original: ref, targetNodeId: owner.id, confidence: 0.95, resolvedBy: 'import' };
+  const methods = context.getNodesByQualifiedName(`${owner.qualifiedName}::${member}`)
+    .filter((n) => n.language === 'php' && n.kind === 'method' && n.filePath === owner.filePath);
+  // A method the class inherits is left to the strategies that walk supertypes.
+  if (methods.length !== 1) return undefined;
+  return { original: ref, targetNodeId: methods[0]!.id, confidence: 0.95, resolvedBy: 'import' };
 }
 
 export function resolveViaImport(
