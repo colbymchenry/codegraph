@@ -10,7 +10,8 @@ import { resolveIndexer } from '../../src/scip/indexers';
 import { indexProjects } from '../../src/scip/indexers/tsgo-index';
 import { findTsgo, toolsDir } from '../../src/scip/indexers/typescript';
 import { scipFlowNote } from '../../src/scip/notes';
-import { scipDir } from '../../src/scip/store';
+import { MAX_PATCHES, MAX_PATCH_AGE_MS, nextPatchRatio } from '../../src/scip/produce';
+import { ScipMeta, scipDir } from '../../src/scip/store';
 import { ROLE_DEFINITION, decodeScipIndex } from '../../src/scip/reader';
 import type { Edge } from '../../src/types';
 
@@ -292,6 +293,16 @@ describe('typescript adapter: tsgo when installed', () => {
   });
 });
 
+describe('patch ratio', () => {
+  it('is measured ÷ declared, averaged with the last, bounded so a slow patch cannot price patches out for good', () => {
+    expect(nextPatchRatio(undefined, 1000, 500)).toBe(0.5);
+    expect(nextPatchRatio(0.5, 1000, 1500)).toBe(1);
+    expect(nextPatchRatio(undefined, 1000, 60_000)).toBe(2);
+    expect(nextPatchRatio(undefined, 1000, 1)).toBe(0.1);
+    expect(nextPatchRatio(0.7, 0, 900)).toBe(0.7); // only deletions: nothing measured
+  });
+});
+
 describe.runIf(TSGO)('incremental reindex (tsgo, through the CLI)', () => {
   let dir: string;
   const cli = (...args: string[]) => execFileSync(process.execPath, [path.join(__dirname, '..', '..', 'dist', 'bin', 'codegraph.js'), ...args],
@@ -400,6 +411,40 @@ describe.runIf(TSGO)('incremental reindex (tsgo, through the CLI)', () => {
     cli('sync', dir);
     expect(cli('scip', 'index', dir, '--lang', 'typescript', '--changed')).toMatch(/patched: 1 file\(s\) re-indexed/);
   }, 60_000);
+
+  it('a patch measures its estimate, and a full run is forced after MAX_PATCHES patches or MAX_PATCH_AGE_MS', () => {
+    const metaFile = path.join(dir, '.codegraph', 'scip', 'typescript.meta.json');
+    const meta = () => JSON.parse(fs.readFileSync(metaFile, 'utf8')) as ScipMeta;
+    const setMeta = (m: Partial<ScipMeta>) => fs.writeFileSync(metaFile, JSON.stringify({ ...meta(), ...m }));
+    let n = 0;
+    const edit = () => {
+      fs.appendFileSync(path.join(dir, 'src', 'main.ts'), `\nexport const e${n++} = 1;\n`);
+      cli('sync', dir);
+      return cli('scip', 'index', dir, '--lang', 'typescript', '--changed');
+    };
+    cli('init', '-y', dir);
+    cli('scip', 'index', dir, '--lang', 'typescript');
+    const { fullAt } = meta();
+    expect(fullAt).toBe(meta().producedAt);
+    slowFullRun();
+    expect(edit()).toMatch(/patched/);
+    expect(meta()).toMatchObject({ fullAt, patches: 1, fullRunMs: 60_000 });
+    expect(meta().patchRatio).toBeGreaterThan(0);
+
+    setMeta({ patches: MAX_PATCHES });
+    expect(edit()).not.toMatch(/patched/);
+    const ratio = meta().patchRatio;
+    expect(meta().patches).toBeUndefined(); // the full run starts the count again, and keeps what patches measured
+    expect(meta().patchRatio).toBe(ratio);
+
+    slowFullRun();
+    setMeta({ fullAt: Date.now() - MAX_PATCH_AGE_MS - 1 });
+    expect(edit()).not.toMatch(/patched/);
+
+    slowFullRun();
+    setMeta({ fullRunMs: 4_000, patchRatio: 2 }); // learned: patches cost twice what the adapter declares
+    expect(edit()).not.toMatch(/patched/); // 2 × (1 s + 0.015 s) ≥ half of 4 s
+  }, 120_000);
 
   it('a repo with no tsconfig is indexed by tsgo, as one inferred program', async () => {
     fs.rmSync(path.join(dir, 'tsconfig.json'));

@@ -40,6 +40,12 @@ export interface ScipMeta {
   resolvedCalls?: number;
   /** how long the last full run took (indexer runs + compaction), ms: what a patch's estimate is weighed against */
   fullRunMs?: number;
+  /** when the last full run (or import) was taken; a patch carries it over (produce.ts incrementalPlan bounds the drift) */
+  fullAt?: number;
+  /** patches installed since then */
+  patches?: number;
+  /** measured ÷ declared time of this tool's patches, averaged: scales the adapter's `seconds` (produce.ts) */
+  patchRatio?: number;
 }
 
 export function scipDir(projectRoot: string): string {

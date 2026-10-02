@@ -281,7 +281,7 @@ export function importScipFile(
   }
   installIndex(projectRoot, resolved, f => compact.write(f), {
     tool: compact.meta!.toolName, toolVersion: compact.meta!.toolVersion, producedAt: builtAt, hashes,
-    resolvedCalls: compact.resolvedCalls(),
+    resolvedCalls: compact.resolvedCalls(), fullAt: builtAt,
   });
   return { lang: resolved, documents: compact.paths.length, newerThanIndex };
 }

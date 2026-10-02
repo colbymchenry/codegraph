@@ -66,6 +66,17 @@ const MIN_IMPORT_CONFIDENCE = 0.5;
 /** Most files a patch re-indexes, however cheap it looks; beyond this a full run is easier to trust. */
 export const MAX_INCREMENTAL_FILES = 500;
 
+/**
+ * Patches follow importers one level, so effects further away drift until a
+ * full run: one is forced after this many patches, or this long since the last.
+ */
+export const MAX_PATCHES = 20;
+export const MAX_PATCH_AGE_MS = 12 * 60 * 60_000;
+
+/** Bounds on a learned patch ratio: one slow patch must not price every later one out (no patch, nothing re-measured). */
+const PATCH_RATIO_MIN = 0.1;
+const PATCH_RATIO_MAX = 2;
+
 export interface IncrementalPlan {
   /** files to re-index: changed since the snapshot, plus the files importing them */
   files: string[];
@@ -73,7 +84,9 @@ export interface IncrementalPlan {
   deleted: string[];
   /** the adapter's units covering `files` (IndexerSpec.patch.units) */
   units: string[];
-  /** the planner's estimate for re-indexing `units`, ms */
+  /** the adapter's own estimate for re-indexing `units` (IndexerSpec.patch.seconds), ms */
+  declaredMs: number;
+  /** `declaredMs` scaled by what earlier patches measured (ScipMeta.patchRatio) */
   estimateMs: number;
 }
 
@@ -83,14 +96,15 @@ export interface IncrementalPlan {
  * edited file may now resolve differently, the files importing one; plus files
  * that are gone. Null when only a full run will do — no snapshot, an index
  * built by a tool the language can't patch (IndexerSpec.patch), more than
- * MAX_INCREMENTAL_FILES files, or an estimate of at least half the last full
- * run (a patch that slow buys little). Deeper effects (a type changing two
- * imports away) wait for the next full run.
+ * MAX_INCREMENTAL_FILES files, an estimate of at least half the last full run
+ * (a patch that slow buys little), or MAX_PATCHES / MAX_PATCH_AGE_MS reached.
+ * Deeper effects (a type changing two imports away) wait for that full run.
  */
 export function incrementalPlan(db: SqliteDatabase, projectRoot: string, lang: ScipLanguage): IncrementalPlan | null {
   const meta = readMeta(projectRoot, lang);
   const patch = meta && INDEXERS[lang].patch?.[meta.tool];
   if (!meta || !patch) return null;
+  if ((meta.patches ?? 0) >= MAX_PATCHES || (meta.fullAt !== undefined && Date.now() - meta.fullAt > MAX_PATCH_AGE_MS)) return null;
   const langs = INDEXERS[lang].codegraphLanguages;
   const rows = db.prepare(`SELECT path, content_hash FROM files WHERE language IN (${langs.map(() => '?').join(',')})`)
     .all(...langs) as { path: string; content_hash: string }[];
@@ -107,9 +121,17 @@ export function incrementalPlan(db: SqliteDatabase, projectRoot: string, lang: S
   if (files.size > MAX_INCREMENTAL_FILES) return null;
   const sorted = [...files].sort();
   const units = sorted.length ? patch.units(projectRoot, sorted) : [];
-  const estimateMs = units.length ? patch.seconds(projectRoot, units, lightConcurrency()) * 1000 : 0;
+  const declaredMs = units.length ? patch.seconds(projectRoot, units, lightConcurrency()) * 1000 : 0;
+  const estimateMs = declaredMs * (meta.patchRatio ?? 1);
   if (meta.fullRunMs !== undefined && estimateMs >= meta.fullRunMs / 2) return null;
-  return { files: sorted, deleted, units, estimateMs };
+  return { files: sorted, deleted, units, declaredMs, estimateMs };
+}
+
+/** The ratio a patch that took `measuredMs` leaves: averaged with the previous one, bounded. */
+export function nextPatchRatio(previous: number | undefined, declaredMs: number, measuredMs: number): number | undefined {
+  if (declaredMs <= 0) return previous; // nothing re-indexed (only deletions): nothing measured
+  const r = measuredMs / declaredMs;
+  return Math.min(PATCH_RATIO_MAX, Math.max(PATCH_RATIO_MIN, previous === undefined ? r : (previous + r) / 2));
 }
 
 export async function produceIndex(
@@ -236,7 +258,8 @@ function fullRun(
       }
       if (compact.paths.length === 0) return { status: 'failed', lang, reason: `${indexer.cmd} wrote an index with no documents` };
       const resolvedCalls = compact.resolvedCalls();
-      const previous = fs.existsSync(final) ? readMeta(projectRoot, lang)?.resolvedCalls ?? null : null;
+      const before = fs.existsSync(final) ? readMeta(projectRoot, lang) : null;
+      const previous = before?.resolvedCalls ?? null;
       if (!opts.force && previous !== null && resolvedCalls < previous * (1 - MAX_RESOLUTION_DROP)) {
         return {
           status: 'rejected', lang,
@@ -244,8 +267,10 @@ function fullRun(
         };
       }
       const durationMs = runMs + (Date.now() - compactStart);
-      installIndex(projectRoot, lang, f => compact.write(f),
-        { tool: compact.meta!.toolName, toolVersion: compact.meta!.toolVersion, producedAt: started, hashes, resolvedCalls, fullRunMs: durationMs });
+      installIndex(projectRoot, lang, f => compact.write(f), {
+        tool: compact.meta!.toolName, toolVersion: compact.meta!.toolVersion, producedAt: started, hashes, resolvedCalls,
+        fullRunMs: durationMs, fullAt: started, patchRatio: before?.tool === compact.meta!.toolName ? before.patchRatio : undefined,
+      });
       return { status: 'installed', lang, documents: compact.paths.length, resolvedCalls, durationMs, warnings };
     } finally {
       sweep(raw);
@@ -344,10 +369,15 @@ async function patchIndex(
     const snapshot = { ...previous.hashes };
     for (const f of replaced) delete snapshot[f];
     Object.assign(snapshot, hashes);
-    installIndex(projectRoot, lang, f => compact.write(f),
-      { tool: tool.toolName, toolVersion: tool.toolVersion, producedAt: started, hashes: snapshot, resolvedCalls, fullRunMs: previous.fullRunMs });
+    const durationMs = Date.now() - started;
+    installIndex(projectRoot, lang, f => compact.write(f), {
+      tool: tool.toolName, toolVersion: tool.toolVersion, producedAt: started, hashes: snapshot, resolvedCalls,
+      fullRunMs: previous.fullRunMs, fullAt: previous.fullAt, patches: (previous.patches ?? 0) + 1,
+      // only a run of the plan's own units measures its estimate
+      patchRatio: units === plan.units ? nextPatchRatio(previous.patchRatio, plan.declaredMs, durationMs) : previous.patchRatio,
+    });
     return {
-      status: 'installed', lang, documents: compact.paths.length, resolvedCalls, durationMs: Date.now() - started,
+      status: 'installed', lang, documents: compact.paths.length, resolvedCalls, durationMs,
       warnings, incremental: present.length, scope: { files: [...replaced], symbols: [...symbols] },
     };
   } finally {
