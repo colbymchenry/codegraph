@@ -13,7 +13,7 @@
  * hermetically with no real bundle, network, or registry.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterAll } from 'vitest';
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -23,8 +23,16 @@ const SDK_SRC = path.join(__dirname, '..', 'scripts', 'npm-sdk.js');
 const target = `${process.platform}-${process.arch}`;
 const VERSION = '9.9.9-test';
 
+// Every temp dir the file makes, removed once at the end.
+const tmpDirs: string[] = [];
+afterAll(() => {
+  for (const dir of tmpDirs) fs.rmSync(dir, { recursive: true, force: true });
+});
+
 function mkTmp(label: string): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), `cg-sdk-${label}-`));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `cg-sdk-${label}-`));
+  tmpDirs.push(dir);
+  return dir;
 }
 
 // A temp node_modules with the main package (npm-sdk.js + package.json). The
