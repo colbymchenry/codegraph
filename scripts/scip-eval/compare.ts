@@ -3,7 +3,7 @@
  * Port of the POC's compare.py (random-target mode).
  *
  *   npx tsx scripts/scip-eval/compare.ts <repo> <index.scip> <heuristic.db> <merged.db> \
- *     [--random 50] [--seed 1] [--prefix src/] [--rg-type ts] [--json]
+ *     [--random 50] [--seed 1] [--prefix src/] [--rg-type ts] [--json] [--explain: each caller judged wrong, to stderr]
  *
  * Every candidate call line is labelled by SCIP:
  *   true    — SCIP resolves a call on that line to the target
@@ -29,6 +29,11 @@ interface Target {
   name: string;
   qualifiedName: string;
   filePath: string;
+  /**
+   * Every line SCIP defines the symbol on (each overload's signature): two nodes may share a
+   * qualified name in one file (Rust's `fn check` and `mod tests { fn check }`), overloads are one target.
+   */
+  lines: number[];
   grep: string;
 }
 
@@ -66,11 +71,22 @@ function scipCalls(ix: ScipIndex, repo: string, atChainStart = false): Map<strin
   return out;
 }
 
+/** The target's nodes `n`, bound to (qualifiedName, filePath, JSON of lines). */
+const TARGET = 'n.qualified_name = ? AND n.file_path = ? AND EXISTS (SELECT 1 FROM json_each(?) j WHERE n.start_line <= j.value AND n.end_line >= j.value)';
+
 function randomTargets(ix: ScipIndex, db: SqliteDatabase, calls: Map<string, Set<string>>, n: number, seed: number, prefix: string): Target[] {
   const called = new Map<string, number>();
   for (const syms of calls.values()) for (const s of syms) called.set(s, (called.get(s) ?? 0) + 1);
   const lookup = db.prepare(`SELECT qualified_name FROM nodes WHERE file_path = ? AND name = ? AND kind IN ('function','method')
     AND start_line <= ? AND end_line >= ? ORDER BY end_line - start_line LIMIT 1`);
+  const defLines = new Map<string, number[]>();
+  for (const doc of ix.documents) {
+    for (const o of doc.occurrences) {
+      if (!(o.roles & ROLE_DEFINITION)) continue;
+      const k = `${doc.relativePath}\0${o.symbol}`;
+      defLines.set(k, [...defLines.get(k) ?? [], o.range.startLine + 1]);
+    }
+  }
   const pool: Target[] = [];
   for (const doc of ix.documents) {
     if (!doc.relativePath.startsWith(prefix)) continue;
@@ -84,6 +100,7 @@ function randomTargets(ix: ScipIndex, db: SqliteDatabase, calls: Map<string, Set
       const isMember = p.owner.endsWith('#');
       pool.push({
         symbol: o.symbol, name: p.last.name, qualifiedName: row.qualified_name, filePath: doc.relativePath,
+        lines: defLines.get(`${doc.relativePath}\0${o.symbol}`)!,
         grep: isMember ? `\\.${p.last.name}\\(` : `\\b${p.last.name}\\(`,
       });
     }
@@ -159,10 +176,12 @@ function callSites(ix: ScipIndex, repo: string): { bySymbol: Map<string, CallSit
  * the target (each site's narrowest enclosing function or method, else its file)
  * against the distinct sources of the graph's `calls` edges into it. A graph
  * caller is judged by the calls of the target's name inside its span: one
- * resolved to the target, true; all resolved elsewhere, wrong; none at all (an
- * untyped receiver SCIP could not resolve, or no document), unknown.
+ * resolved to the target, true; else one on a line of its edges resolved
+ * elsewhere, wrong; else unknown (an untyped receiver SCIP could not resolve, or
+ * no document). Other calls of the name in the span say nothing about the edge:
+ * Django's `options.get(…)` (untyped) beside a `dict.get` is not a wrong edge.
  */
-function callerScore(db: SqliteDatabase, t: Target, sites: ReturnType<typeof callSites>) {
+function callerScore(db: SqliteDatabase, t: Target, sites: ReturnType<typeof callSites>, graph: string) {
   const enclosing = db.prepare(`SELECT id FROM nodes WHERE file_path = ? AND kind IN ('function','method')
     AND start_line <= ? AND end_line >= ? ORDER BY end_line - start_line LIMIT 1`);
   const fileNode = db.prepare(`SELECT id FROM nodes WHERE file_path = ? AND kind = 'file'`);
@@ -173,10 +192,10 @@ function callerScore(db: SqliteDatabase, t: Target, sites: ReturnType<typeof cal
   }
   const truth = new Set(truthOf.values());
   const covered = new Set<string>(); // SCIP's callers some graph caller accounts for
-  const callers = db.prepare(`SELECT DISTINCT s.id, s.file_path AS file, s.kind, s.start_line AS start, s.end_line AS end
+  const callers = db.prepare(`SELECT s.id, s.file_path AS file, s.kind, s.start_line AS start, s.end_line AS end, json_group_array(e.line) AS lines
     FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes n ON n.id = e.target
-    WHERE e.kind = 'calls' AND n.qualified_name = ? AND n.file_path = ?`)
-    .all(t.qualifiedName, t.filePath) as { id: string; file: string; kind: string; start: number; end: number }[];
+    WHERE e.kind = 'calls' AND ${TARGET} GROUP BY s.id`)
+    .all(t.qualifiedName, t.filePath, JSON.stringify(t.lines)) as { id: string; file: string; kind: string; start: number; end: number; lines: string }[];
   let tp = 0;
   let wrong = 0;
   let unknown = 0;
@@ -193,15 +212,24 @@ function callerScore(db: SqliteDatabase, t: Target, sites: ReturnType<typeof cal
     if (hits.length > 0) {
       tp++;
       for (const s of hits) covered.add(truthOf.get(s)!);
-    } else if (inside.length > 0) wrong++;
-    else unknown++;
+      continue;
+    }
+    const edgeLines = new Set(JSON.parse(c.lines) as (number | null)[]);
+    const elsewhere = inside.filter(s => edgeLines.has(s.line));
+    if (elsewhere.length > 0) {
+      wrong++;
+      if (process.argv.includes('--explain')) {
+        console.error(`${graph} wrong: ${t.qualifiedName} (${t.filePath}) ← ${c.kind} ${c.file}:${c.start}-${c.end}; its \`${t.name}\` calls resolve to ` +
+          [...new Set(elsewhere.map(s => `${s.line}: ${s.symbol}`))].join(', '));
+      }
+    } else unknown++;
   }
   return { candidates: callers.length, tp, found: covered.size, wrong, unknown, truth: truth.size };
 }
 
 function graphCallers(db: SqliteDatabase, t: Target): Set<Line> {
   const rows = db.prepare(`SELECT s.file_path AS p, e.line AS ln FROM edges e JOIN nodes s ON s.id = e.source JOIN nodes n ON n.id = e.target
-    WHERE e.kind = 'calls' AND n.qualified_name = ? AND n.file_path = ?`).all(t.qualifiedName, t.filePath) as { p: string; ln: number }[];
+    WHERE e.kind = 'calls' AND ${TARGET}`).all(t.qualifiedName, t.filePath, JSON.stringify(t.lines)) as { p: string; ln: number }[];
   return new Set(rows.map(r => `${r.p}:${r.ln}`));
 }
 
@@ -226,7 +254,7 @@ function main(): void {
   const byCaller = new Map<string, Tot>();
   for (const t of targets) {
     for (const [name, db] of [['codegraph', hDb], ['codegraph+SCIP', mDb]] as const) {
-      const s = callerScore(db, t, sites);
+      const s = callerScore(db, t, sites, name);
       let c = byCaller.get(name);
       if (!c) byCaller.set(name, (c = { candidates: 0, true: 0, wrong: 0, unknown: 0, truth: 0, bytes: 0, recalls: [] }));
       c.candidates += s.candidates;
@@ -260,6 +288,12 @@ function main(): void {
       c.truth += truth;
       c.bytes += bytes;
       c.recalls.push(truth ? tp / truth : 1);
+      if (name === 'codegraph+SCIP' && process.argv.includes('--explain')) {
+        for (const [k, syms] of calls) {
+          const line = k.slice(0, k.length - t.name.length - 1);
+          if (k.endsWith(`:${t.name}`) && syms.has(t.symbol) && !hits.has(line)) console.error(`${name} missed: ${t.qualifiedName} (${t.filePath}:${t.lines.join(',')}) ← ${line}`);
+        }
+      }
     }
   }
 

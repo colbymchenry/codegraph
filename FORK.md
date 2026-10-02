@@ -208,7 +208,7 @@ scripts/scip-eval/corpora.sh                      # codegraph, Django, cobra, ri
 npx tsx scripts/scip-eval/compare.ts <repo> <index.scip> <heuristic.db> <merged.db> --random 50 --seed 1 --prefix src/ --rg-type ts
 ```
 
-`corpora.sh` clones, indexes with this checkout, and runs `compare.ts` per seed (corpora and pins are listed in the script). A rerun on 2026-10-01 reproduced every row below.
+`corpora.sh` clones, indexes with this checkout, and runs `compare.ts` per seed (corpora and pins are listed in the script). A rerun on 2026-10-01 reproduced every row below. On 2026-10-02 the judge's target became the node(s) on the symbol's definition lines (see "By caller"); the same DBs re-judged moved the TS (tsgo) and Rust rows as shown, and left the rest unchanged.
 
 Pass bar per language (2 seeds × 50 random targets): precision ≥ 95%, recall ≥ codegraph-only, import ≤ 30 s.
 
@@ -216,27 +216,27 @@ Pass bar per language (2 seeds × 50 random targets): precision ≥ 95%, recall 
 |---|---|---|---|---|---|---|
 | TS | codegraph v1.6.1 `src/` (250 docs) | 1 | 100% / 44% | 90% / 100% | **100% / 100%** | 7.5 s + 0.5 s |
 | TS | same | 2 | 100% / 56% | 90% / 100% | **100% / 100%** | |
-| TS (tsgo) | same, judged by scip-typescript's index | 1 | 100% / 44% | 90% / 100% | **100% / 100%** | 1.4 s + 0.3 s |
-| TS (tsgo) | same | 2 | 100% / 56% | 90% / 100% | **100% / 100%** | |
+| TS (tsgo) | same, judged by scip-typescript's index | 1 | 100% / 44% | 92% / 100% | **100% / 100%** | 1.4 s + 0.3 s |
+| TS (tsgo) | same | 2 | 100% / 56% | 91% / 100% | **100% / 100%** | |
 | Python | Django (`bench-corpus/arm_grep` @ 026b005, 2,928 docs, no venv) | 1 | 99% / 10% | 78% / 82% | **100% / 100%** | 98.5 s + 3.6 s |
 | Python | same | 2 | 100% / 24% | 75% / 96% | **100% / 100%** | |
 | Go | spf13/cobra @ adbc881 (37 docs) | 1 | 100% / 87% | 100% / 99% | **100% / 100%** | 6.5 s + 0.2 s |
 | Go | same | 2 | 100% / 98% | 100% / 99% | **100% / 100%** | |
-| Rust | BurntSushi/ripgrep @ 3fce3b5 (104 docs) | 1 | 100% / 7% | 40% / 84% | **99% / 99%**⁴ | 12.6 s + 1.0 s |
-| Rust | same | 2 | 100% / 22% | 24% / 72% | **100% / 99%** | |
+| Rust | BurntSushi/ripgrep @ 3fce3b5 (104 docs) | 1 | 100% / 7% | 40% / 84% | **99% / 100%**⁴ | 12.6 s + 1.0 s |
+| Rust | same | 2 | 100% / 22% | 23% / 72% | **100% / 100%** | |
 
 The tsgo rows are judged by **scip-typescript's** index. An index can't be checked against itself, and this gives an independent compiler's view. Judged by its own index, tsgo also scores 100% / 100% on both seeds.
 
-**By caller.** The table above keys calls by line with the merge's own code (`site.ts` callLine, `syntax.ts` callShape), so a keying bug in the merge is also in its judge. `compare.ts` therefore prints a second table that shares neither: which functions call the target, with its own call test (the name followed by `(`) and node spans. A graph caller is right when a call inside its span resolves to the target, wrong when every such call resolves elsewhere, and unknown when SCIP resolved none (an untyped receiver). Measured 2026-10-01, same DBs:
+**By caller.** The table above keys calls by line with the merge's own code (`site.ts` callLine, `syntax.ts` callShape), so a keying bug in the merge is also in its judge. `compare.ts` therefore prints a second table that shares neither: which functions call the target, with its own call test (the name followed by `(`) and node spans. A graph caller is right when a call inside its span resolves to the target, wrong when a call of that name on one of its edges' own lines resolves elsewhere, and unknown otherwise (an untyped receiver SCIP resolved nothing for). The target is the node(s) on the lines SCIP defines its symbol: Rust's `fn check` and `mod tests { fn check }` share a qualified name in one file, and an overload's signatures are one target. `--explain` prints each caller judged wrong and each call the merged graph missed. Measured 2026-10-02, same DBs as 2026-10-01:
 
 | corpus | seed | codegraph R / P | codegraph+SCIP R / P |
 |---|---|---|---|
 | codegraph `src/` | 1 / 2 | 89% / 100%, 89% / 100% | 100% / 100%, 100% / 100% |
-| Django | 1 / 2 | 75% / 80%, 78% / 97% | 100% / **98%**, 100% / 100% |
+| Django | 1 / 2 | 75% / 81%, 78% / 97% | 100% / 100%, 100% / 100% |
 | cobra | 1 / 2 | 100% / 99%, 100% / 99% | 100% / 100%, 100% / 100% |
-| ripgrep | 1 / 2 | 55% / 84%, 54% / 68% | 99% / 99%, 100% / 100% |
+| ripgrep | 1 / 2 | 54% / 84%, 53% / 73% | 98% / 100%, 100% / 100% |
 
-Django seed 1's 8 merged callers judged wrong are not examined yet.
+Django seed 1's 8 merged callers the first rule called wrong were the judge's: each was a heuristic edge the merge kept flagged unverified, on an untyped receiver (`model_state.options.get(…)`, `captured_queries[0]["sql"].lower()`), in a function whose other `get` / `lower` calls resolve to `dict.get` / `str.lower`. Ripgrep's 4 were the shared qualified name above: the merged edges went to the right `check`.
 
 **Invariants.** `__tests__/scip/invariants.test.ts` checks, on every language's fixture, that no call is left as a SCIP edge beside an unverified heuristic edge, and that a multi-line chain's call is verified at the line its expression starts on. With `callLine` disabled, 7 of its 8 tests fail. The fixtures' committed indexes are rebuilt with `scripts/scip-eval/fixtures.sh` after their sources change. The eval scripts are typechecked in CI (`tsconfig.scripts.json`).
 
