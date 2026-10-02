@@ -6,11 +6,10 @@ import * as path from 'path';
 import CodeGraph from '../../src/index';
 import { importScipFile, runScipPass } from '../../src/scip';
 import { MAX_SOURCE_FILE_SIZE_BYTES } from '../../src/file-limits';
-import { resolveIndexer } from '../../src/scip/indexers';
 import { indexProjects } from '../../src/scip/indexers/tsgo-index';
-import { findTsgo, toolsDir } from '../../src/scip/indexers/typescript';
+import { findTsgo } from '../../src/scip/indexers/typescript';
 import { scipFlowNote } from '../../src/scip/notes';
-import { MAX_PATCHES, MAX_PATCH_AGE_MS, nextPatchRatio } from '../../src/scip/produce';
+import { MAX_PATCHES, MAX_PATCH_AGE_MS } from '../../src/scip/produce';
 import { ScipMeta, scipDir } from '../../src/scip/store';
 import { ROLE_DEFINITION, decodeScipIndex } from '../../src/scip/reader';
 import type { Edge } from '../../src/types';
@@ -200,107 +199,6 @@ describe.runIf(TSGO)('tsgo indexer (TypeScript fixture)', () => {
     expect(warnings).toEqual([expect.stringMatching(/^missing\/tsconfig\.json: can't open the project/)]);
     expect(documents).toBe(3);
   }, 30_000);
-});
-
-describe('typescript adapter: tsgo when installed', () => {
-  let dir: string;
-  const savedPrefix = process.env.NPM_CONFIG_PREFIX;
-  const savedInstallDir = process.env.CODEGRAPH_INSTALL_DIR;
-  beforeEach(() => {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-tsgo-adapter-'));
-    process.env.NPM_CONFIG_PREFIX = path.join(dir, 'no-global'); // `npm root -g` → an empty prefix: only what the test installs counts
-    process.env.CODEGRAPH_INSTALL_DIR = path.join(dir, 'codegraph-home'); // likewise for codegraph's tools folder
-    fs.writeFileSync(path.join(dir, 'tsconfig.json'), '{}');
-    fs.mkdirSync(path.join(dir, 'pkg'));
-    fs.writeFileSync(path.join(dir, 'pkg', 'jsconfig.json'), '{}');
-    const ts = path.join(dir, 'node_modules', 'typescript');
-    fs.mkdirSync(path.join(ts, 'dist', 'api', 'sync'), { recursive: true });
-    fs.writeFileSync(path.join(ts, 'package.json'), '{"version":"7.1.0"}');
-    fs.writeFileSync(path.join(ts, 'dist', 'api', 'sync', 'api.js'), '');
-  });
-  afterEach(() => {
-    if (savedPrefix === undefined) delete process.env.NPM_CONFIG_PREFIX;
-    else process.env.NPM_CONFIG_PREFIX = savedPrefix;
-    if (savedInstallDir === undefined) delete process.env.CODEGRAPH_INSTALL_DIR;
-    else process.env.CODEGRAPH_INSTALL_DIR = savedInstallDir;
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-  const tsPackage = (json: string) => fs.writeFileSync(path.join(dir, 'node_modules', 'typescript', 'package.json'), json);
-
-  it('runs tsgo-index over every project in one process, unless the command is overridden', () => {
-    const out = path.join(dir, 'out.tmp');
-    const r = resolveIndexer(dir, 'typescript', out);
-    if ('skip' in r) throw new Error(r.skip);
-    expect(r.cmd).toBe(process.execPath);
-    expect(r.runs).toHaveLength(1);
-    const [script, tsDir, output, root, refsFlag, refs, ...configs] = r.runs[0]!.args;
-    expect(path.basename(script!)).toBe('tsgo-index.js');
-    expect([tsDir, output, root]).toEqual([path.join(dir, 'node_modules', 'typescript'), out, dir]);
-    expect([refsFlag, refs]).toEqual(['--refs', `${out}.refs`]); // written by produce.ts
-    expect(configs.sort()).toEqual(['pkg/jsconfig.json', 'tsconfig.json']);
-
-    fs.writeFileSync(path.join(dir, 'codegraph.json'), JSON.stringify({ scip: { typescript: { cmd: process.execPath } } }));
-    const scipTs = resolveIndexer(dir, 'typescript', out);
-    if ('skip' in scipTs) throw new Error(scipTs.skip);
-    expect(scipTs.runs[0]!.args[0]).toBe('index'); // scip-typescript's arguments
-  });
-
-  it('warns when a lockfile has no node_modules beside it, with the command that installs it', () => {
-    const warning = () => {
-      const r = resolveIndexer(dir, 'typescript', path.join(dir, 'out.tmp'));
-      if ('skip' in r) throw new Error(r.skip);
-      return r.warning;
-    };
-    fs.writeFileSync(path.join(dir, 'pnpm-lock.yaml'), '');
-    expect(warning()).toBeUndefined(); // installed
-    fs.renameSync(path.join(dir, 'node_modules'), path.join(dir, 'moved'));
-    fs.writeFileSync(path.join(dir, 'codegraph.json'), JSON.stringify({ scip: { typescript: { cmd: process.execPath } } })); // scip-typescript's path
-    expect(warning()).toMatch(/pnpm-lock\.yaml but no node_modules — .* run `pnpm install` and reindex/);
-  });
-
-  it('finds TypeScript in codegraph\'s tools folder when the project has none', () => {
-    const tools = path.join(toolsDir(), 'node_modules', 'typescript');
-    fs.renameSync(path.join(dir, 'node_modules', 'typescript'), path.join(dir, 'moved'));
-    expect(findTsgo(dir)).toBeNull();
-    fs.mkdirSync(path.dirname(tools), { recursive: true });
-    fs.renameSync(path.join(dir, 'moved'), tools);
-    expect(findTsgo(dir)).toEqual({ dir: tools });
-  });
-
-  it('ignores a TypeScript older than 7.1', () => {
-    tsPackage('{"version":"7.0.2"}');
-    expect(findTsgo(dir)).toBeNull();
-  });
-
-  it.runIf(process.platform !== 'win32')('a TypeScript ≥ 7.1 that can\'t be used is a warning on the scip-typescript run', () => {
-    tsPackage('{"name":"typescript"}'); // no version
-    expect(findTsgo(dir)).toEqual({ unusable: expect.stringMatching(/package\.json has no version/) });
-    tsPackage('{"version":"7.1.0"}');
-    fs.rmSync(path.join(dir, 'node_modules', 'typescript', 'dist'), { recursive: true });
-    const bin = path.join(dir, 'bin');
-    fs.mkdirSync(bin);
-    fs.writeFileSync(path.join(bin, 'scip-typescript'), '#!/bin/sh\n', { mode: 0o755 });
-    const savedPath = process.env.PATH;
-    process.env.PATH = `${bin}${path.delimiter}${savedPath}`;
-    try {
-      const r = resolveIndexer(dir, 'typescript', path.join(dir, 'out.tmp'));
-      if ('skip' in r) throw new Error(r.skip);
-      expect(r.cmd).toBe('scip-typescript');
-      expect(r.warning).toMatch(/TypeScript 7\.1\.0 at .* has no API .* — using scip-typescript/);
-    } finally {
-      process.env.PATH = savedPath;
-    }
-  });
-});
-
-describe('patch ratio', () => {
-  it('is measured ÷ declared, averaged with the last, bounded so a slow patch cannot price patches out for good', () => {
-    expect(nextPatchRatio(undefined, 1000, 500)).toBe(0.5);
-    expect(nextPatchRatio(0.5, 1000, 1500)).toBe(1);
-    expect(nextPatchRatio(undefined, 1000, 60_000)).toBe(2);
-    expect(nextPatchRatio(undefined, 1000, 1)).toBe(0.1);
-    expect(nextPatchRatio(0.7, 0, 900)).toBe(0.7); // only deletions: nothing measured
-  });
 });
 
 describe.runIf(TSGO)('incremental reindex (tsgo, through the CLI)', () => {

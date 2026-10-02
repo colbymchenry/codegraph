@@ -238,7 +238,7 @@ The tsgo rows are judged by **scip-typescript's** index. An index can't be check
 
 Django seed 1's 8 merged callers the first rule called wrong were the judge's: each was a heuristic edge the merge kept flagged unverified, on an untyped receiver (`model_state.options.get(…)`, `captured_queries[0]["sql"].lower()`), in a function whose other `get` / `lower` calls resolve to `dict.get` / `str.lower`. Ripgrep's 4 were the shared qualified name above: the merged edges went to the right `check`.
 
-**Invariants.** `__tests__/scip/invariants.test.ts` checks, on every language's fixture, that no call is left as a SCIP edge beside an unverified heuristic edge, and that a multi-line chain's call is verified at the line its expression starts on. With `callLine` disabled, 7 of its 8 tests fail. The fixtures' committed indexes are rebuilt with `scripts/scip-eval/fixtures.sh` after their sources change. The eval scripts are typechecked in CI (`tsconfig.scripts.json`).
+**Invariants.** `__tests__/scip/languages.test.ts` checks, on every language's fixture, that no call is left as a SCIP edge beside an unverified heuristic edge, and that a multi-line chain's call is verified at the line its expression starts on. With `callLine` disabled, 7 of these 8 tests fail. The fixtures' committed indexes are rebuilt with `scripts/scip-eval/fixtures.sh` after their sources change. The eval scripts are typechecked in CI (`tsconfig.scripts.json`).
 
 **Large repo: vscode** @ 73d5322b (14,054 TS files, 4.4M lines, 94 projects), on a 16 GB / 16-thread machine:
 
