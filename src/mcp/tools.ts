@@ -241,6 +241,16 @@ export function getExploreBudget(fileCount: number): number {
 }
 
 /**
+ * Per-project suffix appended to `codegraph_explore`'s description by
+ * `getTools()`. Claude Code truncates each tool description at 2,048 chars
+ * by default, so the static description plus this suffix must fit —
+ * `__tests__/server-instructions.test.ts` pins it.
+ */
+export function exploreGuidanceSuffix(fileCount: number): string {
+  return ` Exploration guidance — advisory only, NOT a quota: ~${getExploreBudget(fileCount)} focused calls usually cover this project (${fileCount.toLocaleString()} files indexed), and extra calls are never rejected or rate-limited.`;
+}
+
+/**
  * Adaptive output budget for `codegraph_explore`, scaled to project size.
  *
  * Smaller codebases get a tighter total cap, fewer default files, smaller
@@ -1723,7 +1733,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_explore',
-    description: 'PRIMARY TOOL — call FIRST for almost any question OR before an edit: how does X work, architecture, a bug, where/what is X, surveying an area, or the symbols you are about to change. Returns the verbatim source of the relevant symbols grouped by file in ONE capped call (Read-equivalent — treat the shown source as already Read; do NOT re-open those files), plus the call path among them. Query can be a natural-language question OR a bag of symbol/file names. Usually the ONLY call you need — more accurate context, in far fewer tokens and round-trips than a search/Read/Grep loop.',
+    description: 'PRIMARY TOOL — call FIRST for almost any question OR before an edit: how does X work, architecture, a bug, where/what is X, surveying an area, or the symbols you are about to change. Returns the verbatim source of the relevant symbols grouped by file in ONE capped call (Read-equivalent — treat the shown source as already Read; do NOT re-open those files), plus the call path among them. Query can be a natural-language question OR a bag of symbol/file names. Usually the ONLY call you need — more accurate context, in far fewer tokens and round-trips than a search/Read/Grep loop. Named flow endpoints must match exactly (never fuzzy-substituted): query a did-you-mean suggestion explicitly. Matching is lexical, not semantic; an empty result suggests indexed names to retry. Qualified names take `.`, `::` or `/`; an overloaded name returns every definition.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2148,7 +2158,6 @@ export class ToolHandler {
 
     try {
       const stats = this.cg.getStats();
-      const budget = getExploreBudget(stats.fileCount);
 
       // Tiny-repo tool gating: on projects under TINY_REPO_FILE_THRESHOLD
       // files, only expose the core trio (search, node, explore) — one
@@ -2187,7 +2196,7 @@ export class ToolHandler {
         if (tool.name === 'codegraph_explore') {
           return {
             ...tool,
-            description: `${tool.description} Exploration guidance — advisory only, NOT a quota: ~${budget} focused calls usually cover this project (${stats.fileCount.toLocaleString()} files indexed), and extra calls are never rejected or rate-limited.`,
+            description: `${tool.description}${exploreGuidanceSuffix(stats.fileCount)}`,
           };
         }
         return tool;
