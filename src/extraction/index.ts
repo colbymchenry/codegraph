@@ -808,6 +808,15 @@ export function preloadLanguagesForFiles(
       if (!languages.includes(ambiguous)) languages.push(ambiguous);
     }
   }
+  // An `.inc` path-detects as PHP but may read as Pascal (#2279) — unless
+  // codegraph.json maps `.inc` explicitly, which detectLanguage never overrides.
+  if (
+    !languages.includes('pascal') &&
+    !(overrides && overrides['.inc']) &&
+    files.some((f) => f.toLowerCase().endsWith('.inc'))
+  ) {
+    languages.push('pascal');
+  }
   return languages;
 }
 

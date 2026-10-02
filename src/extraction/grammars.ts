@@ -561,7 +561,99 @@ export function detectLanguage(filePath: string, source?: string, overrides?: Re
     if (looksLikeObjc(source)) return 'objc';
   }
 
+  // `.inc` is PHP's include extension (Drupal) and Pascal/Delphi's too
+  // (`{$I defs.inc}`: directive blocks, declaration fragments), so it is
+  // decided per file by content (#2279). An explicit codegraph.json mapping
+  // for `.inc` is the user's answer and is not second-guessed.
+  if (lang === 'php' && ext === '.inc' && source && !(overrides && overrides[ext]) && looksLikePascalInclude(source)) {
+    return 'pascal';
+  }
+
   return lang;
+}
+
+/** A PHP open tag: `<?php` in any case, or the short echo `<?=` (never `<?xml`). */
+const PHP_OPEN_TAG_RE = /<\?(?:php|=)/i;
+
+// Building blocks for the Pascal line shapes below. A line start allows
+// indentation and the BOM Windows editors write (a BOM'd Delphi include must
+// not drop back to PHP). A section keyword's break runs to the end of its line
+// and over blank / comment-only lines, up to the first declaration.
+const PAS_LINE = String.raw`^[ \t\uFEFF]*`;
+const PAS_NAME = String.raw`[a-z_]\w*(?:<[^>\n]*>)?`;
+const PAS_QNAME = String.raw`[a-z_][\w.]*(?:<[^>\n]*>)?`;
+const PAS_COMMENT = String.raw`(?:\/\/[^\n]*|\{[^$}\n][^}\n]*\}[ \t]*)?`;
+const PAS_SECTION_BREAK = String.raw`[ \t]*${PAS_COMMENT}(?:\r?\n[ \t]*${PAS_COMMENT})+`;
+const pascalLine = (shape: string): RegExp => new RegExp(PAS_LINE + shape, 'im');
+
+/**
+ * Line shapes only Pascal writes, any one of which makes an untagged `.inc`
+ * Pascal. Each leans on Pascal's own punctuation, so the dialects that share a
+ * keyword with it stay out: JavaScript `const x = 1;` / `function f() {`,
+ * SourcePawn `function void (int client);`, C++ `const T X::Y = …`, VBScript
+ * `Const X = 1` / `Function F(a)`, Smarty `{$var}`, Makefile `X := y`, prose
+ * with `Begin` on a line of its own. Every pattern stays linear on a long
+ * whitespace run: no run can be split two ways between neighbouring
+ * quantifiers.
+ */
+const PASCAL_INCLUDE_SIGNALS: readonly RegExp[] = [
+  // A compiler directive: a name and an argument (`{$IFDEF X}`, `{$DEFINE X}`,
+  // `{$I file.inc}`, `{$WARN X OFF}`), a bare `{$ELSE}` / `{$ENDIF}` /
+  // `{$IFEND}`, or a switch (`{$R-}`, `{$A+,B-}`) — or the `{%MainUnit x.pp}`
+  // line Lazarus opens its include files with.
+  pascalLine(String.raw`\{(?:\$(?:[a-z]\w*[ \t]+[^\s}]|(?:else|endif|ifend)[ \t]*\}|[a-z][+-][,}])|%MainUnit\b)`),
+  // A routine header, closed by `;`: `procedure Foo;`, `procedure TForm1.Click(Sender: TObject);`,
+  // `class constructor Create;` — and a function's result type after its
+  // parameters (`function Bar(A: Integer): string;`; bare `function Bar;` is
+  // the implementation-section short form). The parameter list stops at any
+  // parenthesis, so a file of unclosed `procedure X(` lines stays linear.
+  pascalLine(
+    String.raw`(?:class[ \t]+)?(?:(?:procedure|constructor|destructor)[ \t]+${PAS_QNAME}[ \t]*(?:\([^()]*\)[ \t]*)?` +
+      String.raw`|function[ \t]+${PAS_QNAME}[ \t]*(?:(?:\([^()]*\)[ \t]*)?:[ \t]*[\w.]+(?:<[^>\n]*>)?[ \t]*)?);`
+  ),
+  // `unit Foo;` and a `uses A, B;` clause.
+  pascalLine(String.raw`unit[ \t]+[a-z_][\w.]*[ \t]*;`),
+  pascalLine(String.raw`uses\s+[a-z_][\w.]*(?:\s*,\s*[a-z_][\w.]*)*\s*;`),
+  // A `const` section, then `X = …` / `X: T = …`; or a typed constant on one
+  // line (`const Max: Integer = 10;`). The type never holds a `:`.
+  pascalLine(
+    String.raw`(?:const|resourcestring)(?:${PAS_SECTION_BREAK}[a-z_]\w*[ \t]*(?::[^=;:\n]+)?=|[ \t]+[a-z_]\w*[ \t]*:[^=;:\n]+=)`
+  ),
+  // A `var` section: `G, H: Integer;`, on the keyword's line or below it.
+  pascalLine(
+    String.raw`(?:var|threadvar)(?:${PAS_SECTION_BREAK}|[ \t]+)[a-z_]\w*(?:[ \t]*,[ \t]*[a-z_]\w*)*[ \t]*:(?!:)[^;\n]*;`
+  ),
+  // A `type` section, then `TFoo =`; or `type TFoo = class…` (record /
+  // interface / set of / array / procedure type) on one line.
+  pascalLine(
+    String.raw`type(?:${PAS_SECTION_BREAK}${PAS_NAME}[ \t]*=|[ \t]+${PAS_NAME}[ \t]*=[ \t]*(?:packed[ \t]+)?` +
+      String.raw`(?:class|record|object|interface|dispinterface|set[ \t]+of|array|reference[ \t]+to|procedure|function)\b)`
+  ),
+];
+
+/** A `begin` … `end;` block: both halves needed, so neither alone flips a file. */
+const PASCAL_BEGIN_RE = pascalLine(String.raw`begin\b`);
+const PASCAL_END_RE = pascalLine(String.raw`end[ \t]*[;.][ \t]*$`);
+
+/**
+ * Whether an `.inc` file is a Pascal include rather than a PHP one (#2279).
+ *
+ * A PHP include always opens a PHP tag somewhere, so a tag anywhere keeps the
+ * file PHP. Without one, a Pascal-only line shape (`PASCAL_INCLUDE_SIGNALS`,
+ * or a `begin` … `end;` pair) makes it Pascal. Anything else keeps the PHP
+ * mapping — untagged text is inline HTML to PHP, so nothing is extracted —
+ * rather than handing a C / assembly / POV-Ray / ASP `.inc` to the Pascal
+ * grammar's error recovery.
+ *
+ * Deliberately per file, not "does this project have `.pas` files": the
+ * answer depends only on the file's own bytes, so a full index, a sync of one
+ * edited include, and a fresh re-index always agree — a project-level gate
+ * would flip an untouched include whenever the last `.pas` file came or went.
+ */
+function looksLikePascalInclude(source: string): boolean {
+  if (PHP_OPEN_TAG_RE.test(source)) return false;
+  if (PASCAL_INCLUDE_SIGNALS.some((re) => re.test(source))) return true;
+  return PASCAL_BEGIN_RE.test(source) && PASCAL_END_RE.test(source);
 }
 
 /** Whether a JavaScript file's leading comments carry Flow's `@flow` pragma (and not `@noflow`). */
