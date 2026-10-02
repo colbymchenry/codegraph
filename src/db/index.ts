@@ -300,7 +300,9 @@ export class DatabaseConnection {
     for (const idx of DatabaseConnection.BULK_PARSE_INDEX_NAMES) {
       const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
       if (!m) throw new Error(`schema.sql: parse index ${idx} not found for bulk-load recreation`);
+      const t = Date.now();
       this.db.exec(m[0]);
+      this.logIndexTiming(idx, t);
       await new Promise((resolve) => setImmediate(resolve));
     }
     await this.endBulkEdgeLoad();
@@ -345,7 +347,9 @@ export class DatabaseConnection {
     for (const idx of DatabaseConnection.BULK_REF_INDEX_NAMES) {
       const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
       if (!m) throw new Error(`schema.sql: ref index ${idx} not found for bulk-load recreation`);
+      const t = Date.now();
       this.db.exec(m[0]);
+      this.logIndexTiming(idx, t);
       await new Promise((resolve) => setImmediate(resolve));
     }
   }
@@ -401,9 +405,19 @@ export class DatabaseConnection {
       if (options.deferSynthesisSite && idx === DatabaseConnection.SYNTHESIS_SITE_INDEX) continue;
       const m = schema.match(new RegExp(`CREATE INDEX IF NOT EXISTS ${idx}\\b[^;]*;`));
       if (!m) throw new Error(`schema.sql: edge index ${idx} not found for bulk-load recreation`);
+      const t = Date.now();
       this.db.exec(m[0]);
+      this.logIndexTiming(idx, t);
       await new Promise((resolve) => setImmediate(resolve));
     }
+  }
+
+  /** One bulk-window index rebuild, with the WAL size it ran against (CODEGRAPH_SYNTH_TIMINGS). */
+  private logIndexTiming(idx: string, startedAt: number): void {
+    if (!process.env.CODEGRAPH_SYNTH_TIMINGS) return;
+    let walMb = -1;
+    try { walMb = Math.round(fs.statSync(`${this.dbPath}-wal`).size / 1e6); } catch { /* no WAL file */ }
+    console.error(`[index-timing] ${idx}: ${Date.now() - startedAt}ms (wal ${walMb} MB)`);
   }
 
   /**
