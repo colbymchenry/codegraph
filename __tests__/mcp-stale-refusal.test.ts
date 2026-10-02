@@ -151,8 +151,10 @@ describe('a degraded index refuses answers from changed files (#1959)', () => {
     expect(result.content[0].text).toContain('validation budget');
     const text = result.content[0].text;
     const total = Number(text.match(/validation budget for (\d+) files/)![1]);
-    // The text is the whole result, so it names every unchecked file.
-    expect(text.split('\n').filter(line => line.startsWith('- '))).toHaveLength(total);
+    // A long unchecked list stays bounded: the first 20 and a count of the rest.
+    expect(total).toBeGreaterThan(20);
+    expect(text.split('\n').filter(line => /^- (?!…)/.test(line))).toHaveLength(20);
+    expect(text).toContain(`- … ${total - 20} more (narrow the query)`);
     expect(result).not.toHaveProperty('structuredContent');
     expect(result.content[0].text).not.toContain('**Impact');
   });

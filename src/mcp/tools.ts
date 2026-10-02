@@ -2806,11 +2806,13 @@ export class ToolHandler {
           }
           if (validation.unchecked.length) {
             lines.push(`Freshness could not be verified within the validation budget for ${validation.unchecked.length} files:`,
-              ...validation.unchecked.map(file => `- ${file}`));
+              ...validation.unchecked.slice(0, 20).map(file => `- ${file}`));
+            if (validation.unchecked.length > 20) lines.push(`- … ${validation.unchecked.length - 20} more (narrow the query)`);
           }
           lines.push('Retry after a successful codegraph sync, or narrow the query.');
           // Text only: Claude Code shows the model a result's structuredContent
-          // in place of its text (#2088), and the text carries every file.
+          // in place of its text (#2088). The text names every stale file and
+          // the first unchecked ones; the rest only need a narrower query.
           return this.textResult(lines.join('\n'));
         }
       }
