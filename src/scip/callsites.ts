@@ -19,6 +19,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { SqliteDatabase } from '../db/sqlite-adapter';
 
+/** A path the query names (`src/x.ts`, `lib.rs`), not a `Type.method`. */
+const SOURCE_FILE = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|py|go|rs|java|kt|cs|rb|php|swift|c|cc|cpp|h|hpp)$/;
+
 /** Symbols per answer, and call sites listed per symbol. */
 const MAX_SYMBOLS = 3;
 const MAX_SITES = 200;
@@ -31,6 +34,12 @@ interface Site { file: string; line: number; caller: string; provenance: string 
  * whose enclosing type is one too (`JSHandle.evaluate`, `Match::start`, "Frame
  * url()"), plus explore's exact targets (`exact`: a qualified name or a line
  * anchor) that are callable.
+ *
+ * A file the query names decides between same-named methods: "server-side
+ * `JSHandle.evaluate()` in server/javascript.ts" is that one, not the client's
+ * `JSHandle::evaluate`, nor a `Frame.evaluate` the query mentions only to rule
+ * out (bench T2: the cap of MAX_SYMBOLS went to those, and the asked-for one was
+ * never listed).
  */
 function targets(db: SqliteDatabase, query: string, exact: Iterable<string>): Target[] {
   const words = new Set(query.split(/[^A-Za-z0-9_$]+/).filter(w => w.length > 1));
@@ -47,7 +56,11 @@ function targets(db: SqliteDatabase, query: string, exact: Iterable<string>): Ta
       if (owner && words.has(owner)) out.set(t.id, t);
     }
   }
-  return [...out.values()];
+  const files = (query.match(/[\w@./-]+/g) ?? []).map(f => f.replace(/^\.\//, '').replace(/\.$/, '')).filter(f => SOURCE_FILE.test(f));
+  const named = (t: Target) => files.some(f => t.file_path === f || t.file_path.endsWith(`/${f}`) || f.endsWith(`/${t.file_path}`));
+  const all = [...out.values()];
+  const namedNames = new Set(all.filter(named).map(t => t.name));
+  return all.filter(t => !namedNames.has(t.name) || named(t));
 }
 
 export function callSitesSection(db: SqliteDatabase, projectRoot: string, query: string, exact: Iterable<string>): string {
@@ -102,18 +115,19 @@ export function callSitesSection(db: SqliteDatabase, projectRoot: string, query:
  * the compiler linked to `t`, which are in the list.
  */
 function otherCalls(db: SqliteDatabase, t: Target): string {
-  const elsewhere = db.prepare(`SELECT n.qualified_name AS qn, SUM(e.provenance = 'scip') AS verified, COUNT(*) AS n
+  // by method and file: a client's and a server's `JSHandle::evaluate` are two answers
+  const elsewhere = db.prepare(`SELECT n.qualified_name AS qn, n.file_path AS file, SUM(e.provenance = 'scip') AS verified, COUNT(*) AS n
     FROM edges e JOIN nodes n ON n.id = e.target
     WHERE n.name = ? AND NOT (n.qualified_name = ? AND n.file_path = ?) AND e.kind = 'calls' -- not its own overloads
-    GROUP BY n.qualified_name ORDER BY n DESC`)
-    .all(t.name, t.qualified_name, t.file_path) as { qn: string; verified: number; n: number }[];
+    GROUP BY n.qualified_name, n.file_path ORDER BY n DESC`)
+    .all(t.name, t.qualified_name, t.file_path) as { qn: string; file: string; verified: number; n: number }[];
   const unresolved = (db.prepare(`SELECT COUNT(*) AS n FROM unresolved_refs u
     WHERE u.status = 'failed' AND u.name_tail = ? AND u.reference_kind = 'calls' AND NOT EXISTS (
       SELECT 1 FROM edges e JOIN nodes s ON s.id = e.source
       WHERE e.target = ? AND e.kind = 'calls' AND e.line = u.line AND s.file_path = u.file_path)`)
     .get(t.name, t.id) as { n: number }).n;
   if (elsewhere.length === 0 && unresolved === 0) return '';
-  const parts = elsewhere.slice(0, 5).map(o => `${o.n} to \`${o.qn}\`${o.verified === o.n ? ' (compiler-verified)' : ''}`);
+  const parts = elsewhere.slice(0, 5).map(o => `${o.n} to \`${o.qn}\` (${o.file}${o.verified === o.n ? ', compiler-verified' : ''})`);
   if (elsewhere.length > 5) parts.push(`${elsewhere.slice(5).reduce((a, o) => a + o.n, 0)} to ${elsewhere.length - 5} other methods`);
   if (unresolved) parts.push(`${unresolved} codegraph resolved to no project symbol (a dependency, the standard library, or untyped)`);
   return `Other calls named \`${t.name}\`, which neither the compiler nor codegraph resolved to this one: ${parts.join('; ')}.`;

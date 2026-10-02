@@ -134,7 +134,23 @@ describe('SCIP merge (TypeScript fixture)', () => {
     expect(text).toContain('`src/main.ts`\n- 6 — `return invoices.reduce((acc, inv) => acc + inv.totalPrice(), 0) + helper(2);` (in `sum`)');
     expect(text).toMatch(/\n- \d+ — `return new Invoice\(4\)` \(in `chained`\)/); // a chain: keyed where its expression starts
     // what a grep for the name would add, accounted for: `o.totalPrice()` on an Order
-    expect(text).toMatch(/Other calls named `totalPrice`, which neither the compiler nor codegraph resolved to this one: \d+ to `Order::totalPrice` \(compiler-verified\)/);
+    expect(text).toMatch(/Other calls named `totalPrice`, which neither the compiler nor codegraph resolved to this one: \d+ to `Order::totalPrice` \(src\/models\.ts, compiler-verified\)/);
+  });
+
+  it('a file the query names picks between same-named methods (bench T2: the client one was listed, the asked-for one not)', async () => {
+    importFixture();
+    await pass();
+    // A second, compiler-verified `Invoice::totalPrice` in another file (as Playwright has a client and a server `JSHandle`).
+    cg.scipReadDb().prepare(`INSERT INTO nodes (id, kind, name, qualified_name, file_path, language, start_line, end_line, start_column, end_column, updated_at)
+      VALUES ('other-total', 'method', 'totalPrice', 'Invoice::totalPrice', 'src/client/models.ts', 'typescript', 1, 3, 0, 1, 0)`).run();
+    cg.scipReadDb().prepare(`INSERT INTO edges (source, target, kind, line, col, provenance) VALUES (?, 'other-total', 'calls', 12, 2, 'scip')`).run(nodeId('make'));
+    const explore = async (query: string) =>
+      ((await new ToolHandler(cg).execute('codegraph_explore', { query })).content[0] as { text: string }).text;
+    const listed = async (query: string) =>
+      [...(await explore(query)).matchAll(/\*\*Call sites of `Invoice::totalPrice` \(([^:]+):/g)].map(m => m[1]).sort();
+    expect(await listed('Invoice.totalPrice callers')).toEqual(['src/client/models.ts', 'src/models.ts']);
+    expect(await listed('Invoice.totalPrice in src/models.ts callers, not Order.totalPrice')).toEqual(['src/models.ts']);
+    expect(await listed('callers of `Invoice.totalPrice()` (client/models.ts)')).toEqual(['src/client/models.ts']);
   });
 
   it('replaces a wrong heuristic target with the compiler-resolved one', async () => {
