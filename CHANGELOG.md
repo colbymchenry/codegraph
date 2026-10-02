@@ -177,6 +177,7 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - On Windows, `codegraph init`, `codegraph index` and the background server's syncs no longer sometimes crash right after parsing on a busy machine (exit code 3221225477, an access violation). Shutting down the parsing threads could stop one while it was still starting up, which took the whole process down; they now finish starting first.
 - On a busy machine, indexing or syncing a small project no longer starts extra background threads for resolving references that it can't use. Under heavy load the slower pace made a ten-file project look big enough to need them, which added seconds to the run and held extra memory.
 - On Windows, the CodeGraph background server no longer sometimes crashes as it shuts down (exit code 3221225477, an access violation) when it stops shortly after starting. Shutting down could stop one of its background threads while that thread was still starting up; it now lets the thread finish starting first.
+- In Claude Code, agents now receive all of CodeGraph's guidance. Claude Code cuts each MCP server's instructions at 2,048 characters, so agents never saw the rules for stale-index warnings or for a project that isn't indexed; the guidance now fits, with those rules first. Thanks @inth3shadows. (#1529)
 
 ## [1.6.1] - 2026-09-29
 
