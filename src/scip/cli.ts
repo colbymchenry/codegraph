@@ -149,7 +149,7 @@ export function registerScipCommands(program: Command, h: CliHelpers): void {
         }
         h.info(`edges: ${s.edges.scip} compiler-verified (${s.edges.stale} stale), ${s.edges.silent} unverified heuristic`);
         if (s.indexes.some(i => i.lang === 'python') && s.edges.silent > 0) {
-          h.info('python: a call on a receiver without type hints stays unverified — the type checker has nothing to resolve it with (Django: 91% of its unverified edges)');
+          h.info('python: a call on a receiver without type hints stays unverified — the type checker has nothing to resolve it with');
         }
       }));
 }

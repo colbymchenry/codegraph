@@ -24,7 +24,14 @@ const SOURCE_FILE = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs|py|go|rs|java|kt|cs|rb|php
 
 /** Symbols per answer, and call sites listed per symbol. */
 const MAX_SYMBOLS = 3;
-const MAX_SITES = 200;
+const MAX_SITES = 1000;
+/**
+ * Past this many chars a symbol's sites are listed as `file: line, line` without
+ * their text: the section sits ahead of explore's source and outside its budget,
+ * so a method called hundreds of times (Playwright's `Page::evaluate`: 2,165)
+ * would otherwise push the source past the output cap.
+ */
+const MAX_DETAILED_CHARS = 8000;
 
 interface Target { id: string; name: string; qualified_name: string; file_path: string; start_line: number; language: string }
 interface Site { file: string; line: number; caller: string; provenance: string | null; metadata: string | null }
@@ -93,11 +100,21 @@ export function callSitesSection(db: SqliteDatabase, projectRoot: string, query:
           (t.language === 'python' ? ' (in Python, mostly receivers without type hints: the type checker has nothing to resolve them with).' : '.')
         : 'Every site here is compiler-verified, and this is every call the compiler resolved to it — treat the list as the answer, no grep needed. Only a call it could not resolve (dynamic or untyped) would be missing.',
     ];
+    const shown = sites.slice(0, MAX_SITES);
+    const detailed: string[] = [];
     let file = '';
-    for (const s of sites.slice(0, MAX_SITES)) {
-      if (s.file !== file) lines.push(`\`${(file = s.file)}\``);
+    for (const s of shown) {
+      if (s.file !== file) detailed.push(`\`${(file = s.file)}\``);
       const mark = s.provenance === 'scip' ? '' : ' [unverified]';
-      lines.push(`- ${s.line}${mark} — \`${lineText(s.file, s.line)}\` (in \`${s.caller}\`)`);
+      detailed.push(`- ${s.line}${mark} — \`${lineText(s.file, s.line)}\` (in \`${s.caller}\`)`);
+    }
+    if (detailed.join('\n').length <= MAX_DETAILED_CHARS) {
+      lines.push(...detailed);
+    } else {
+      const byFile = new Map<string, string[]>();
+      for (const s of shown) byFile.set(s.file, [...byFile.get(s.file) ?? [], `${s.line}${s.provenance === 'scip' ? '' : '?'}`]);
+      lines.push(`Lines per file${unverified ? ' (`?`: unverified)' : ''}; name a file in another codegraph_explore for its source:`);
+      for (const [f, ls] of byFile) lines.push(`- \`${f}\`: ${ls.join(', ')}`);
     }
     if (sites.length > MAX_SITES) lines.push(`- … +${sites.length - MAX_SITES} more`);
     const others = otherCalls(db, t);

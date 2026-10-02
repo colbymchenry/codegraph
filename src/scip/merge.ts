@@ -79,6 +79,7 @@ export function merge(
   db: SqliteDatabase, scip: ScipSites, heuristic: HeuristicSites, freshFiles: Set<string>, judged: Set<string>
 ): MergeOutcome {
   const c = emptyOutcome();
+  // Not store.ts SILENT_EDGE on purpose: that expression would let the planner scan its partial index once per file.
   const flagged = bySource<{ id: number }>(db, `SELECT e.id FROM edges e JOIN nodes s ON s.id = e.source WHERE e.metadata LIKE '%scipSilent%'`, judged);
   byIds(db, `UPDATE edges SET ${CLEAR_FLAG('scipSilent')} WHERE id IN`, flagged.map(r => r.id));
   // Column is not part of a site's identity (see sites.ts), so "already there"

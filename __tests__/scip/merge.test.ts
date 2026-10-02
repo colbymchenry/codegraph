@@ -137,6 +137,18 @@ describe('SCIP merge (TypeScript fixture)', () => {
     expect(text).toMatch(/Other calls named `totalPrice`, which neither the compiler nor codegraph resolved to this one: \d+ to `Order::totalPrice` \(src\/models\.ts, compiler-verified\)/);
   });
 
+  it('a symbol called hundreds of times is listed compactly, every line kept, so explore\'s source still fits', async () => {
+    importFixture();
+    await pass();
+    const ins = cg.scipReadDb().prepare(`INSERT INTO edges (source, target, kind, line, col, provenance) VALUES (?, ?, 'calls', ?, 2, 'scip')`);
+    for (let line = 1000; line < 1500; line++) ins.run(nodeId('make'), nodeId('Invoice::totalPrice'), line);
+    const text = ((await new ToolHandler(cg).execute('codegraph_explore', { query: 'Invoice totalPrice callers' })).content[0] as { text: string }).text;
+    const section = text.slice(text.indexOf('**Call sites of `Invoice::totalPrice`'), text.indexOf('Other calls named `totalPrice`'));
+    expect(section).toContain('Lines per file');
+    expect(section).toMatch(/- `src\/main\.ts`: [\d, ]*1000, 1001, [\d, ]*1499/);
+    expect(section.length).toBeLessThan(5000);
+  });
+
   it('a file the query names picks between same-named methods (bench T2: the client one was listed, the asked-for one not)', async () => {
     importFixture();
     await pass();
