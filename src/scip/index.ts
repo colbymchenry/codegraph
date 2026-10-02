@@ -23,7 +23,7 @@ import { ROLE_DEFINITION, ScipDocument, loadScipIndex, scanIndex } from './reade
 import { ReferenceSites, heuristicSites, referenceSites, scipDefinitions, scipSites } from './sites';
 import {
   MergedDocument, ScipLanguage, SCIP_LANGUAGES, availableIndexes, indexPath,
-  indexedHashes, installIndex, mergedDocumentCounts, readHashed, recordMergedDocuments,
+  SILENT_EDGE, indexedHashes, installIndex, mergedDocumentCounts, readHashed, recordMergedDocuments,
 } from './store';
 
 export { ScipLanguage, SCIP_LANGUAGES } from './store';
@@ -303,7 +303,7 @@ export function scipStatus(db: SqliteDatabase, projectRoot: string): ScipStatus 
     edges: {
       scip: one(`SELECT COUNT(*) AS n FROM edges WHERE provenance = 'scip'`),
       stale: one(`SELECT COUNT(*) AS n FROM edges WHERE provenance = 'scip' AND metadata LIKE '%"scipStale":true%'`),
-      silent: one(`SELECT COUNT(*) AS n FROM edges WHERE metadata LIKE '%"scipSilent":true%'`),
+      silent: one(`SELECT COUNT(*) AS n FROM edges WHERE ${SILENT_EDGE}`),
     },
   };
 }

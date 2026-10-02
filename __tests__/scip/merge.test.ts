@@ -11,7 +11,7 @@ import { produceIndex } from '../../src/scip/produce';
 import { ROLE_DEFINITION, encodeDocument, encodeMetadata, loadScipIndex } from '../../src/scip/reader';
 import { ScipReindexScheduler } from '../../src/scip/reindex';
 import { ToolHandler } from '../../src/mcp/tools';
-import { indexPath, scipDir, tryReindexLock } from '../../src/scip/store';
+import { SILENT_EDGE, indexPath, scipDir, tryReindexLock } from '../../src/scip/store';
 
 const FIXTURE = path.join(__dirname, '..', 'fixtures', 'scip-ts');
 
@@ -147,6 +147,12 @@ describe('SCIP merge (TypeScript fixture)', () => {
     expect(e?.provenance).toBeNull();
     expect(flags(e).scipSilent).toBe(true);
     expect(scipVerdict({ provenance: undefined, metadata: flags(e) } as unknown as Edge)).toBe('unverified');
+    // status counts it through the partial index, not a scan of every edge
+    const db = cg.scipReadDb();
+    const silent = (db.prepare(`SELECT COUNT(*) AS n FROM edges WHERE metadata LIKE '%scipSilent%'`).get() as { n: number }).n;
+    expect(scipStatus(db, dir).edges.silent).toBe(silent);
+    const plan = db.prepare(`EXPLAIN QUERY PLAN SELECT COUNT(*) FROM edges WHERE ${SILENT_EDGE}`).all() as { detail: string }[];
+    expect(plan.map(r => r.detail).join()).toContain('scip_silent_edges');
   });
 
   it('is idempotent', async () => {

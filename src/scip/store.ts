@@ -164,7 +164,14 @@ export function indexedHashes(db: SqliteDatabase, paths: Iterable<string>): Map<
   return out;
 }
 
-export function ensureDocumentsTable(db: SqliteDatabase): void {
+/** A heuristic edge the compiler could not confirm, as merge.ts flags it (json_set writes it without spaces). */
+export const SILENT_EDGE = `metadata LIKE '%"scipSilent":true%'`;
+
+/**
+ * The fork's own tables and indexes, outside upstream's migrations. The partial
+ * index keeps counting unverified edges off a full scan of `edges` (Django: 511 → 2 ms).
+ */
+function ensureScipSchema(db: SqliteDatabase): void {
   db.exec(`CREATE TABLE IF NOT EXISTS scip_documents (
     path TEXT PRIMARY KEY,
     language TEXT NOT NULL,
@@ -173,6 +180,7 @@ export function ensureDocumentsTable(db: SqliteDatabase): void {
     tool_version TEXT NOT NULL,
     imported_at INTEGER NOT NULL
   )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS scip_silent_edges ON edges(source) WHERE ${SILENT_EDGE}`);
 }
 
 export interface MergedDocument {
@@ -185,7 +193,7 @@ export interface MergedDocument {
 export function recordMergedDocuments(
   db: SqliteDatabase, lang: ScipLanguage, meta: ScipMeta, docs: MergedDocument[]
 ): void {
-  ensureDocumentsTable(db);
+  ensureScipSchema(db);
   db.prepare('DELETE FROM scip_documents WHERE language = ?').run(lang);
   const ins = db.prepare(
     'INSERT OR REPLACE INTO scip_documents(path, language, content_hash, tool, tool_version, imported_at) VALUES (?,?,?,?,?,?)'
