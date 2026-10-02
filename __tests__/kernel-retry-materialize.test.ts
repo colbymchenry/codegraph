@@ -56,7 +56,7 @@ describe.skipIf(!kernelBuilt)('kernel buffer-transport storage (#1541)', () => {
   it('storeExtractionResult persists the decoded nodes of a raw kernel result', async () => {
     const source =
       'def target_fn(root, mission_path):\n' +
-      '    return (root, mission_path)\n' +
+      '    return (root, mission_path, "adapter.mission")\n' +
       '\n' +
       'class Adapter:\n' +
       '    def adapt(self):\n' +
@@ -93,6 +93,7 @@ describe.skipIf(!kernelBuilt)('kernel buffer-transport storage (#1541)', () => {
     expect(nodes.length).toBe(raw!.counts.nodes);
     expect(nodes.map((n) => n.name)).toContain('target_fn');
     expect(nodes.map((n) => n.name)).toContain('Adapter');
+    expect(cg.findLiteralSeedIds('"adapter.mission"').map(id => cg.getNode(id)?.name)).toEqual(['target_fn']);
   });
 });
 

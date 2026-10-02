@@ -227,7 +227,7 @@ function stripWrapping(token: string): { path: string; lines: { start: number; e
   for (;;) {
     const last = s[s.length - 1];
     if (!last) break;
-    if ('\'"`>.,;!?'.includes(last)) { s = s.slice(0, -1); continue; }
+    if ('\'"`>.,;!?:'.includes(last)) { s = s.slice(0, -1); continue; }
     if (last === ')' && !s.includes('(')) { s = s.slice(0, -1); continue; }
     if (last === ']' && !s.includes('[')) { s = s.slice(0, -1); continue; }
     if (last === '}' && !s.includes('{')) { s = s.slice(0, -1); continue; }

@@ -51,9 +51,12 @@ calls; a grep/read exploration is dozens.
 
 ## How to query
 
+Storage keys, command-line flags, and event names in a query also match symbols containing those exact string literals. Existing indexes need a full rebuild to capture them.
+
 - **Almost any question — "how does X work", architecture, a bug, "what/where is X", or surveying an area** → \`codegraph_explore\` with a natural-language question or the relevant names. ONE capped call returns the verbatim source grouped by file; most often the ONLY call you need.
 - **"How does X reach/become Y? / the flow / the path from X to Y"** → \`codegraph_explore\`, naming the symbols that span the flow (e.g. \`mutateElement renderScene\`) — it surfaces the call path among them, riding dynamic-dispatch hops, and returns their source.
 - **Reading or editing a file/symbol you can name** → put its name or file path in the \`codegraph_explore\` query — it returns that current line-numbered source (safe to \`Edit\` from) with the call path and blast radius attached, so you don't Read it separately. For an overloaded name it returns every matching definition's body in one call.
+- Requested files include declarations matching the question alongside named bodies, including selectors and cache keys. Requested test files prioritize matching test blocks with their assertions; Vue layout questions reserve space for matching template and style regions. Compound concepts can also return a matching reader/writer with its existing local caller chain; a single named function prioritizes direct callers over unrelated files. These excerpts share the output budget and do not imply additional graph edges.
 - **Need more?** Call \`codegraph_explore\` again with more specific names — treat the source it returns as already Read. Suggested call counts are advisory only, NOT a quota; extra calls are never rejected or rate-limited.
 - Qualified symbol names accept dots, \`::\`, or slashes, including containers whose names contain dots (for example, \`AppWeb.Format.group\`).
 - Named-symbol call paths require exact matches; partial or mistyped names are never silently substituted as flow endpoints. If a graph query reports a missing symbol with did-you-mean suggestions, query the suggested name explicitly.

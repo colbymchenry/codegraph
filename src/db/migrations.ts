@@ -9,7 +9,7 @@ import { SqliteDatabase } from './sqlite-adapter';
 /**
  * Current schema version
  */
-export const CURRENT_SCHEMA_VERSION = 11;
+export const CURRENT_SCHEMA_VERSION = 12;
 
 /**
  * Migration definition
@@ -213,6 +213,26 @@ const migrations: Migration[] = [
         CREATE INDEX idx_edges_synthesis_site
           ON edges(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.registeredAt') END)
           WHERE CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.synthesizedBy') END IS NOT NULL;
+      `);
+    },
+  },
+  {
+    version: 12,
+    description:
+      'Add literals — identifier-like string literal → enclosing symbol, so explore seeds on storage keys and flags',
+    up: (db) => {
+      // DDL only. No backfill: the values come from file CONTENT the migration
+      // cannot see, so the table stays empty until the next full index and
+      // explore behaves exactly as before for those queries. Keep in lockstep
+      // with schema.sql.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS literals (
+          value TEXT NOT NULL,
+          node_id TEXT NOT NULL,
+          file_path TEXT NOT NULL,
+          PRIMARY KEY (value, node_id)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS idx_literals_file ON literals(file_path);
       `);
     },
   },

@@ -65,6 +65,15 @@ describe('queryMightContainPaths — the cheap pre-gate', () => {
 });
 
 describe('extractQueryPaths — resolution and stripping', () => {
+  it('pins prose paths ending in a colon while preserving line references', () => {
+    for (const suffix of [':', ':123', ':12-40', '#L88']) {
+      const out = extractQueryPaths(`src/lib/chat-manager.ts${suffix} locate the handler`, INDEX);
+      expect(out.pinnedFiles).toEqual(['src/lib/chat-manager.ts']);
+      expect(out.strippedQuery).toBe('locate the handler');
+      expect(out.unresolvedPathSpans).toEqual([]);
+    }
+  });
+
   it('resolves a bracketed SvelteKit path and strips it from the query', () => {
     const q = 'auto-scroll logic in src/routes/m/projects/[id]/runs/[runId]/+page.svelte — atBottom tracking';
     const out = extractQueryPaths(q, INDEX);

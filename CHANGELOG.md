@@ -189,6 +189,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New Features
 
+- `codegraph_explore` finds code containing storage keys, command-line flags, and event names; rebuild existing indexes to enable these matches.
+
 - **Codex and Astra read project guidance from `AGENTS.md`.** The canonical agent guide now lives in `AGENTS.md` (with a nested `docs/AGENTS.md` for long validation notes); `CLAUDE.md` is a thin `@AGENTS.md` wrapper for Claude Code. Codex/Astra no longer miss the old CLAUDE-only instructions.
 
 - **Next.js pages and their navigation are in the graph.** App Router pages (`app/(group)/blog/[slug]/page.tsx` → `/blog/:slug`) and Pages Router pages are routes bound to the component they export, and `<Link href>`, an internal `<a href>`, `router.push` / `router.replace` (`next/navigation` and `next/router`), `redirect()` / `permanentRedirect()` and the middleware's `NextResponse.redirect(…)` are `navigates` edges between them. `app/api/**/route.ts` exports (`GET`, `POST`, …) are endpoints bound to their functions, and `pages/api/*` handlers are `ANY /api/…`. Re-index after upgrading.
@@ -221,6 +223,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Dart extension-type getters remain searchable when using the WebAssembly parser.
 
 - Calling a built-in method on an awaited value no longer records a call into an unrelated class that happens to declare a method of the same name, and a variable bound to an awaited call now resolves methods on the type that call returns. Thanks @maxmilian. (#1840)
+- Questions about selectors and cache invalidation now retain matching declarations alongside named source bodies within the existing response limit.
+
+- Questions naming source files, types or tests now preserve more of the requested definitions and assertions, and Vue layout questions include matching template and style code.
+- Broad code questions now retain matching readers and writers, complete test assertions, and more of the requested Vue column and cell source.
 - Spring mappings now include every declared path combination and resolve constants declared in the same file, while unresolved paths no longer appear as false root routes. (#1461)
 - `codegraph node` now accepts a file reference that carries a line number — `src/app.ts:42`, `src/app.ts:42-80`, `src/app.ts#L42`, `src/app.ts#L42-L80` — instead of reporting the file as not indexed; the line range becomes the window that is read, and an `--offset`/`--limit` you pass yourself still wins. A path that really is named that way is still looked up as written. (#1831)
 - `codegraph callers`, `codegraph callees` and `codegraph impact` now resolve qualified names, group results and JSON edges by definition, and accept `--file` to narrow ambiguous names; thanks @ferrine. (#1512, #1656)

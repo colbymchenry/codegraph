@@ -34,7 +34,7 @@ import {
 } from '../sync/worktree';
 import type { PendingFile } from '../sync';
 import type { Node, Edge, SearchResult, Subgraph, NodeKind } from '../types';
-import { isTestFile, normalizeNameToken } from '../search/query-utils';
+import { isDistinctiveIdentifier, isTestFile, normalizeNameToken } from '../search/query-utils';
 import { groupDefinitions, isQualifiedSymbol, lastQualifierPart, matchesSymbol } from '../graph/symbol-lookup';
 import {
   extractQueryPaths,
@@ -61,6 +61,8 @@ import { getUpdateNotice } from '../upgrade/update-check';
 import { measurePendingChanges } from './index-freshness';
 import { validateAnswerFiles, type AnswerFile } from './answer-freshness';
 import { ExploreDiagnostics } from './explore-diagnostics';
+import { requestedSourceRanges } from './explore-source-ranges';
+import { extractSegmentSearchWords, splitIdentifierSegments } from '../search/identifier-segments';
 import {
   EXPLORE_EMISSION_KEY,
   EXPLORE_SESSION_VIEW_ARG,
@@ -737,6 +739,8 @@ export interface ExploreAllocationCandidate {
    * share stands, bounded only by the pool.
    */
   named?: boolean;
+  /** Source needed for named bodies plus the strongest supporting declaration/region. */
+  minChars?: number;
 }
 
 export interface ExploreAllocation {
@@ -839,7 +843,13 @@ export function allocateExploreBudget(
   // remainder is what concentrates a precise one — the top file's slice grows
   // with its weight share, uncapped by any flat per-file limit.
   const ceiling = Math.round(budget.maxOutputChars * A.MAX_SHARE);
-  const floors = Math.min(pool, A.MIN_CHARS * admitted.length);
+  const baseFloor = Math.min(A.MIN_CHARS, Math.floor(pool / admitted.length));
+  const requestedFloors = admitted.map(c => Math.max(baseFloor,
+    Math.min(ceiling, Number.isFinite(c.minChars) ? c.minChars! : baseFloor)));
+  const extraFloor = requestedFloors.reduce((s, n) => s + n - baseFloor, 0);
+  const floorScale = extraFloor > 0 ? Math.min(1, Math.max(0, pool - baseFloor * admitted.length) / extraFloor) : 0;
+  const floorByPath = new Map(admitted.map((c, i) => [c.path, baseFloor + Math.floor((requestedFloors[i]! - baseFloor) * floorScale)]));
+  const floors = [...floorByPath.values()].reduce((s, n) => s + n, 0);
   const remainder = Math.max(0, pool - floors);
   // Both parts FLOOR: a sum of rounded shares can exceed the remainder that fed
   // it (by up to half a char per file), and the reservations must fit the pool
@@ -849,7 +859,7 @@ export function allocateExploreBudget(
   // The valve spares a file the query named (see MAX_SHARE): its share is already
   // a slice of `pool`, so the reservations still fit the pool exactly.
   for (const c of admitted) {
-    const share = Math.floor(floors / admitted.length)
+    const share = floorByPath.get(c.path)!
       + Math.floor((remainder * (weights.get(c.path) ?? 0)) / total);
     allowances.set(c.path, isNamedCandidate(c) ? share : Math.min(share, ceiling));
   }
@@ -4085,7 +4095,7 @@ export class ToolHandler {
     } catch {
       budget = getExploreOutputBudget(Infinity);
     }
-    const maxFiles = clamp((args.maxFiles as number) || budget.defaultMaxFiles, 1, 20);
+    let maxFiles = clamp((args.maxFiles as number) || budget.defaultMaxFiles, 1, 20);
 
     // File paths named in the query become PINNED files: guaranteed admission,
     // top of the rank order, funded first — and their span is REMOVED from the
@@ -4129,6 +4139,19 @@ export class ToolHandler {
       return ` Not pinned: ${which}, which define${s.files.length === 1 ? 's' : ''} none of the named symbols.`;
     }).join('');
     const pinnedSet = new Set(pinnedFiles);
+    // A literal quoted in the query names every file holding it, so the
+    // default file cap (sized for ranked padding) rises to the holder count;
+    // the character budget still bounds the answer, and an explicit maxFiles
+    // stands.
+    const literalSeedIds = cg.findLiteralSeedIds(matchQuery);
+    if (!args.maxFiles && literalSeedIds.length > 0) {
+      const holderFiles = new Set<string>();
+      for (const id of literalSeedIds) {
+        const n = cg.getNode(id);
+        if (n) holderFiles.add(n.filePath);
+      }
+      maxFiles = clamp(Math.max(maxFiles, holderFiles.size), 1, 12);
+    }
     const pinnedOrder = new Map(pinnedFiles.map((p, i) => [p, i]));
 
     // Per-file allocation diagnostic (CG-4). `null` unless CODEGRAPH_EXPLORE_DEBUG
@@ -4202,8 +4225,14 @@ export class ToolHandler {
     for (const fp of pinnedFiles) {
       let fileNodes: Node[] = [];
       try { fileNodes = cg.getNodesInFile(fp); } catch { continue; }
-      fileNodes
-        .filter((n) => n.kind !== 'file' && n.kind !== 'import' && n.kind !== 'export')
+      const seeds = fileNodes.filter((n) => n.kind !== 'file' && n.kind !== 'import' && n.kind !== 'export');
+      // A callback-only test file may have no named definitions. Its indexed
+      // file node still admits the requested source, subject to config guards.
+      if (seeds.length === 0) {
+        const file = fileNodes.find(n => n.kind === 'file' && !CONFIG_LEAF_LANGUAGES.has(n.language));
+        if (file) seeds.push(file);
+      }
+      seeds
         .sort((a, b) => a.startLine - b.startLine)
         .slice(0, PINNED_FILE_NODE_CAP)
         .forEach((n) => { if (!subgraph.nodes.has(n.id)) subgraph.nodes.set(n.id, n); });
@@ -4380,7 +4409,7 @@ export class ToolHandler {
       const callerCount = (n: Node) => { try { return cg.getCallers(n.id).length; } catch { return 0; } };
       const tokens = [...new Set(
         matchQuery.split(/[\s,()[\]]+/)
-          .map((t) => t.replace(FILE_EXT, '').trim())
+          .map((t) => t.replace(/(?<!:):$|[.!?;]+$/g, '').replace(FILE_EXT, '').trim())
           .filter((t) => t.length >= 3 && /^[A-Za-z_$][\w$]*(?:(?:::|\.)[\w$]+)*$/.test(t))
       )].slice(0, 16);
       // PascalCase tokens in the query are type/file disambiguators — when the
@@ -4453,13 +4482,16 @@ export class ToolHandler {
         // files those declarations live in and exempt them from the
         // declaration-only penalty below (CG-28). Only PRECISE tokens count, by
         // the same NL-stopword reasoning as the seeding above: "…the file body…"
-        // must not exempt a `Body` interface it never meant to name. Kept
-        // separate from `namedSeedIds`, which is callable-only by construction —
-        // a type never becomes a named seed, so it cannot be the guard here.
+        // must not exempt a `Body` interface it never meant to name.
+        // Types also need their bodies prioritized, not just their files
+        // exempted from the declaration penalty.
         if (isPreciseToken(t)) {
           for (const n of raw) {
             if (DECLARATION_KINDS.has(n.kind) && n.name.toLowerCase() === t.toLowerCase()) {
               namedTypeFiles.add(n.filePath);
+              subgraph.nodes.set(n.id, n);
+              namedSeedIds.add(n.id);
+              tierSeedIds.add(n.id);
             }
           }
         }
@@ -4476,7 +4508,8 @@ export class ToolHandler {
         // token at a hump boundary or as a prefix.
         // Exact-empty + camel-shaped only (bare words keep the NL-stopword
         // guard below), shortest-first, capped so a hot infix can't flood.
-        if (cands.length === 0 && !isQual && /[a-z][A-Z]/.test(t)) {
+        const namesDeclaration = raw.some(n => DECLARATION_KINDS.has(n.kind) && n.name.toLowerCase() === t.toLowerCase());
+        if (cands.length === 0 && !namesDeclaration && !isQual && /[a-z][A-Z]/.test(t)) {
           const lcToken = t.toLowerCase();
           cands = cg
             .getNodesByNameSubstring(t, {
@@ -4554,6 +4587,13 @@ export class ToolHandler {
         for (const n of tierPicks) {
           if (!isInterfaceOwnedMethod(n)) tierSeedIds.add(n.id);
         }
+      }
+    }
+    // Exact literal holders deserve the same source priority as named symbols.
+    for (const id of literalSeedIds) {
+      if (subgraph.nodes.has(id)) {
+        namedSeedIds.add(id);
+        tierSeedIds.add(id);
       }
     }
 
@@ -4983,6 +5023,19 @@ export class ToolHandler {
     // tier so it isn't buried under files that merely share surface words (#1064).
     for (const fp of changeSurfaceFiles) namedSeedFiles.add(fp);
 
+    // For one exact callable, direct users are stronger supporting evidence
+    // than unrelated search roots. Keep the named definition ahead of both.
+    const directCallerFiles = new Set<string>();
+    if (/^[A-Za-z_$][\w$]*$/.test(matchQuery.trim()) && namedSeedIds.size === 1) {
+      const id = [...namedSeedIds][0]!;
+      const node = subgraph.nodes.get(id);
+      if (node && ['function', 'method'].includes(node.kind)) {
+        for (const caller of cg.getCallers(id)) {
+          if (!isTestFile(caller.node.filePath)) directCallerFiles.add(caller.node.filePath);
+        }
+      }
+    }
+
     // Multi-term corroboration tier: a file that is BOTH (a) an entry/central file
     // (a search root, named seed, or graph-central hub — i.e. structurally part of
     // the answer) AND (b) matched by ≥2 DISTINCT query terms must not be buried by
@@ -5020,6 +5073,8 @@ export class ToolHandler {
       const aNamed = namedSeedFiles.has(a[0]) ? 1 : 0;
       const bNamed = namedSeedFiles.has(b[0]) ? 1 : 0;
       if (aNamed !== bNamed) return bNamed - aNamed;
+      const callerOrder = Number(directCallerFiles.has(b[0])) - Number(directCallerFiles.has(a[0]));
+      if (callerOrder) return callerOrder;
 
       // Corroborated (entry/central + ≥2 terms) tier, above the graph signal.
       const aCorr = isCorroborated(a[0]) ? 1 : 0;
@@ -5186,6 +5241,61 @@ export class ToolHandler {
     // Score-proportional byte allocation (CG-12). Every file's share of the
     // envelope is reserved HERE, before a single byte renders, so the render loop
     // spends a reservation instead of racing for whatever the files above it left.
+    const sourceMinimums = new Map<string, number>();
+    const exactQueryNames = new Set((matchQuery.match(/[A-Za-z_$][\w$]*/g) ?? []).map(name => name.toLowerCase()));
+    const querySegments = new Set(extractSegmentSearchWords(matchQuery));
+    const conceptOnly = /[a-z][A-Z]|_/.test(matchQuery) && ![...namedSeedIds].some(id => {
+      const n = subgraph.nodes.get(id);
+      return n && ['function', 'method', 'component', 'class'].includes(n.kind)
+        && exactQueryNames.has(n.name.toLowerCase()) && isDistinctiveIdentifier(n.name);
+    });
+    const callerSourceIds = new Set<string>();
+    for (const [fp, group] of sortedFiles.slice(0, maxFiles)) {
+      const stem = fp.split('/').pop()!.replace(/\.[^.]+$/, '');
+      const fileNamed = pinnedSet.has(fp) || matchQuery.split(/[^\w$]+/).includes(stem);
+      // A compound concept can identify a reader/writer without spelling its
+      // full name. Keep its already-gathered local callers with the body.
+      const conceptRoots = group.nodes.filter(n => conceptOnly && subgraph.roots.includes(n.id)
+        && ['function', 'method'].includes(n.kind) && !exactQueryNames.has(n.name.toLowerCase())
+        && splitIdentifierSegments(n.name).filter(s => querySegments.has(s)).length >= 2).slice(0, 8);
+      const localCallers = new Set(conceptRoots.map(n => n.id));
+      let frontier = conceptRoots;
+      for (let depth = 0; depth < 2; depth++) {
+        const next = frontier.flatMap(n => cg.getCallers(n.id).map(c => c.node))
+          .filter(n => n.filePath === fp && group.nodes.some(g => g.id === n.id) && !localCallers.has(n.id));
+        frontier = next.slice(0, Math.max(0, 8 - localCallers.size));
+        for (const n of frontier) localCallers.add(n.id);
+      }
+      if (!fileNamed && localCallers.size === 0) continue;
+      try {
+        const absolute = validatePathWithinRoot(projectRoot, fp);
+        if (!absolute) continue;
+        const source = readFileSync(absolute, 'utf8');
+        const sourceLines = source.split('\n');
+        const nodes = cg.getNodesInFile(fp);
+        const requested = fileNamed ? await requestedSourceRanges(fp, source, group.nodes[0]?.language || 'unknown', matchQuery, nodes) : [];
+        const supporting = requested.find(r => r.nodeId && !namedSeedIds.has(r.nodeId));
+        const region = requested.find(r => !r.nodeId);
+        if (!supporting && !region && localCallers.size === 0) continue;
+        const needed = nodes.filter(n => namedSeedIds.has(n.id) && exactQueryNames.has(n.name.toLowerCase())
+          && !['file', 'component', 'module'].includes(n.kind)
+          && n.endLine - n.startLine + 1 <= sourceLines.length / 2)
+          .map(n => ({ start: n.startLine, end: n.endLine }));
+        if (supporting) needed.push(...requested.filter(r => r.nodeId && r.score === supporting.score));
+        if (region) needed.push(...(fp.endsWith('.vue') && !supporting ? requested.filter(r => !r.nodeId) : [region]));
+        for (const n of group.nodes) {
+          if (localCallers.has(n.id) && n.endLine - n.startLine < 200) {
+            needed.push({ start: n.startLine, end: n.endLine });
+            callerSourceIds.add(n.id);
+          }
+        }
+        const chars = mergeRanges(needed).reduce((sum, r) => sum
+          + sourceLines.slice(Math.max(0, r.start - 4), r.end + 3)
+            .reduce((bytes, line, i) => bytes + line.length + String(Math.max(1, r.start - 3) + i).length + 2, 0)
+          + 100, 0);
+        sourceMinimums.set(fp, chars);
+      } catch { /* unreadable source must not fail allocation */ }
+    }
     const allocation = allocateExploreBudget(
       sortedFiles.map(([fp, group]) => ({
         path: fp,
@@ -5200,6 +5310,7 @@ export class ToolHandler {
           || anchorSpans.has(fp),
         pinned: pinnedSet.has(fp),
         named: namedSeedFiles.has(fp),
+        minChars: sourceMinimums.get(fp),
       })),
       budget,
       maxFiles,
@@ -5878,7 +5989,47 @@ export class ToolHandler {
         parts: ReadonlyArray<SectionPart>,
         ceiling: number,
         focusLines: ReadonlyArray<number> = [],
+        requested: ReadonlyArray<ExploreLineRange> = [],
       ): SectionPart[] => {
+        // Fund complete requested bodies before source-order filler. A method's
+        // opening line being visible does not mean its return or assertion is.
+        const protectedRanges: ExploreLineRange[] = [];
+        let protectedChars = 0;
+        for (const r of requested) {
+          if (!parts.some(p => p.range.start <= r.start && p.range.end >= r.end)) continue;
+          if (protectedRanges.some(p => p.start <= r.start && p.end >= r.end)) continue;
+          const cost = renderSpan(r).length + (protectedRanges.length ? GAP_MARKER.length : 0);
+          if (protectedChars + cost > ceiling) continue;
+          protectedRanges.push(r);
+          protectedChars += cost;
+        }
+        if (protectedRanges.length > 0) {
+          const remaining: SectionPart[] = [];
+          for (const p of parts) {
+            let start = p.range.start;
+            for (const kept of mergeRanges(protectedRanges)) {
+              if (kept.end < start || kept.start > p.range.end) continue;
+              if (kept.start > start) {
+                const range = { start, end: kept.start - 1 };
+                remaining.push({ range, text: renderSpan(range) });
+              }
+              start = Math.max(start, kept.end + 1);
+            }
+            if (start <= p.range.end) {
+              const range = { start, end: p.range.end };
+              remaining.push({ range, text: renderSpan(range) });
+            }
+          }
+          const kept = [...protectedRanges];
+          let room = ceiling - protectedChars;
+          for (const p of remaining) {
+            const win = headWindowOf(p.range, room - GAP_MARKER.length);
+            if (!win || win.end - win.start + 1 < MIN_WINDOW_LINES) continue;
+            kept.push(win);
+            room -= GAP_MARKER.length + renderSpan(win).length;
+          }
+          return mergeRanges(kept).map(range => ({ range, text: renderSpan(range) }));
+        }
         const inParts = (line: number) =>
           parts.some((p) => line >= p.range.start && line <= p.range.end);
         const focus = [...new Set(focusLines)]
@@ -6422,13 +6573,17 @@ export class ToolHandler {
       // clusters rank first and get the spine's bounded overshoot (below), so a
       // qualified `SQLCompiler.as_sql` is no longer outranked by a denser cluster
       // around `SQLInsertCompiler.as_sql` that merely matched the bare name.
-      const EXACT_IMPORTANCE = 11;
+      // Sits above the named-seed and requested-source tiers (12 and up, scored
+      // below) so those rank over entries without inheriting exact handling.
+      const EXACT_IMPORTANCE = 1000;
       const ranges: Array<{ start: number; end: number; name: string; kind: string; importance: number; spine: boolean; spineCallLine?: number; qualifiedName?: string }> = [...rangeNodes.values()]
         // Drop whole-file envelope nodes (containers covering >50% of the file).
         .filter(n => !(ENVELOPE_KINDS.has(n.kind) && (n.endLine - n.startLine + 1) > fileLines.length * 0.5))
         .map(n => {
           let importance = 1;
           if (exactNodeIds.has(n.id)) importance = EXACT_IMPORTANCE;
+          else if (namedSeedIds.has(n.id)) importance = 12;
+          else if (callerSourceIds.has(n.id)) importance = 11;
           else if (entryNodeIds.has(n.id)) importance = 10;
           else if (flow.namedNodeIds.has(n.id)) importance = 9; // agent named it → keep its cluster
           else if (glueNodeIds.has(n.id)) importance = 6; // bridging caller/callee of an entry
@@ -6440,6 +6595,32 @@ export class ToolHandler {
           // the agent Read it back — the very thing explore exists to prevent).
           return { start: n.startLine, end: n.endLine, name: n.name, kind: n.kind, importance, spine: flow.pathNodeIds.has(n.id), spineCallLine: flow.spineCallSites.get(n.id), qualifiedName: n.qualifiedName };
         });
+
+      // A path or named component can ask for evidence that has no standalone
+      // symbol: a test callback's assertions, a template cell or a CSS rule.
+      // Supplement only requested files, after the drift guard, and spend the
+      // same cluster budget as indexed source. This never synthesizes an edge.
+      const stem = filePath.split('/').pop()!.replace(/\.[^.]+$/, '');
+      const fileNamed = pinnedSet.has(filePath) || matchQuery.split(/[^\w$]+/).includes(stem);
+      if (fileNamed || group.nodes.some(n => namedSeedIds.has(n.id))) {
+        try {
+          const requested = await requestedSourceRanges(filePath, fileContent, lang || 'unknown', matchQuery, fileNamed ? fileIndexNodes : []);
+          const declarationScore = Math.max(0, ...requested.filter(r => r.nodeId).map(r => r.score));
+          if (declarationScore > 0) {
+            for (const r of ranges) {
+              if (r.importance === 12 && exactQueryNames.has(r.name.toLowerCase())) {
+                r.importance = Math.min(EXACT_IMPORTANCE - 1, 14 + declarationScore);
+              }
+            }
+          }
+          for (const r of requested) {
+            const importance = Math.min(EXACT_IMPORTANCE - 1, 13 + r.score);
+            const existing = r.nodeId && ranges.find(n => n.start === r.start && n.end === r.end);
+            if (existing) existing.importance = Math.max(existing.importance, importance);
+            else ranges.push({ ...r, kind: 'source', spine: false, importance });
+          }
+        } catch { /* an unavailable parser must not fail source retrieval */ }
+      }
 
       // Add edge source locations in this file — captures template references
       // (component usages, event handlers) that aren't nodes themselves.
@@ -6862,7 +7043,10 @@ export class ToolHandler {
           if (!Number.isFinite(ceiling) || sectionText(r.parts).length <= ceiling) return r;
           // Windows are subsets of spans dedupeSpans already cleared, so the record
           // still only ever claims source that was actually sent.
-          const parts = windowToCeiling(r.parts, ceiling, focusLinesOf(c));
+          const requested = c.hasSpine ? [] : c.members
+            .filter(m => m.importance >= 12)
+            .sort((a, b) => b.importance - a.importance || a.start - b.start);
+          const parts = windowToCeiling(r.parts, ceiling, focusLinesOf(c), requested);
           return { parts, covered: r.covered, shrunk: true };
         };
         if (sectionText(base.parts).length <= Math.min(cap, guard ?? Infinity)) {
